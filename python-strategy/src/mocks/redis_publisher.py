@@ -59,6 +59,9 @@ class MockRedisPublisher:
                 payload = candle.model_dump_json()
                 self.redis_client.publish(channel, payload)
                 
+                # Also SET a key for the latest status
+                self.redis_client.set(f"latest_candle:{product_id}", payload)
+                
                 print(f"Published to {channel}: Close={candle.close}")
                 time.sleep(1) # Publish every second
         except KeyboardInterrupt:
