@@ -38,3 +38,16 @@ class Signal(BaseModel):
         json_encoders = {
             Decimal: lambda v: str(v)
         }
+
+class Position(BaseModel):
+    strategy_id: str
+    product_id: str
+    side: str  # "LONG" or "SHORT"
+    quantity: Decimal
+    entry_price: Decimal
+    unrealized_pnl: Decimal
+
+    class Config:
+        json_encoders = {
+            Decimal: lambda v: str(v)
+        }
