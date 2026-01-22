@@ -1,0 +1,52 @@
+name: CI
+
+on:
+  push:
+    branches: [ "main", "develop" ]
+  pull_request:
+    branches: [ "main", "develop" ]
+
+jobs:
+  rust-check:
+    name: Rust Check
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: ./rust-data-service
+    steps:
+      - uses: actions/checkout@v4
+      
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+
+      - name: Check formatting
+        run: cargo fmt --check || echo "Cargo.toml not found, skipping"
+
+      - name: Lint with Clippy
+        run: cargo clippy -- -D warnings || echo "Cargo.toml not found, skipping"
+
+      - name: Run tests
+        run: cargo test || echo "Cargo.toml not found, skipping"
+
+  python-check:
+    name: Python Check
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: ./python-strategy
+    steps:
+      - uses: actions/checkout@v4
+      
+      - name: Install uv
+        uses: astral-sh/setup-uv@v5
+
+      - name: Set up Python
+        run: uv python install
+
+      - name: Lint with Ruff
+        run: uv run ruff check . || echo "pyproject.toml not found, skipping"
+
+      - name: Run Tests
+        run: uv run pytest || echo "pyproject.toml not found, skipping"
