@@ -24,7 +24,7 @@ async fn main() -> anyhow::Result<()> {
         .expect("Failed to install crypto provider");
 
     tracing_subscriber::fmt()
-        .with_max_level(Level::INFO)
+        .with_max_level(Level::DEBUG)
         .init();
     
     info!("🚀 FluxTrade Data Service Starting...");
