@@ -76,8 +76,10 @@ impl ExchangeConnector for BinanceConnector {
 
         info!("Subscribing to Binance trades: {}", streams);
 
+        info!("Subscribing to Binance trades: {}", streams);
+
         tokio::spawn(async move {
-            let res = ws_manager.connect_with_retry(|msg| {
+            let res = ws_manager.connect_with_retry(|ws| async { Ok((ws, Ok(()))) }, |msg| {
                 let tx = tx.clone();
                 let connector = connector.clone();
                 async move {
@@ -133,8 +135,10 @@ impl ExchangeConnector for BinanceConnector {
 
         info!("Subscribing to Binance candles: {}", streams);
 
+        info!("Subscribing to Binance trades: {}", streams);
+
         tokio::spawn(async move {
-            let res = ws_manager.connect_with_retry(|msg| {
+            let res = ws_manager.connect_with_retry(|ws| async { Ok((ws, Ok(()))) }, |msg| {
                 let tx = tx.clone();
                 let connector = connector.clone();
                 async move {

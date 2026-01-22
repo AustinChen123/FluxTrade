@@ -23,16 +23,22 @@ impl WebSocketManager {
     }
 
     #[allow(dead_code)]
-    pub async fn connect_with_retry<F, Fut>(&self, mut on_message: F) -> Result<()>
+    pub async fn connect_with_retry<F, Fut, C, Cut>(
+        &self, 
+        mut on_connect: C,
+        mut on_message: F
+    ) -> Result<()>
     where
         F: FnMut(Message) -> Fut,
         Fut: std::future::Future<Output = Result<()>>,
+        C: FnMut(tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>) -> Cut,
+        Cut: std::future::Future<Output = Result<(tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>, Result<()>)>>,
     {
         let mut retries = 0;
         let mut backoff = self.initial_backoff;
 
         loop {
-            match self.connect_and_loop(&mut on_message).await {
+            match self.connect_and_loop(&mut on_connect, &mut on_message).await {
                 Ok(_) => {
                     info!("Connection closed gracefully");
                     return Ok(());
@@ -54,24 +60,31 @@ impl WebSocketManager {
     }
 
     #[allow(dead_code)]
-    async fn connect_and_loop<F, Fut>(&self, on_message: &mut F) -> Result<()>
+    async fn connect_and_loop<F, Fut, C, Cut>(
+        &self, 
+        on_connect: &mut C,
+        on_message: &mut F
+    ) -> Result<()>
     where
         F: FnMut(Message) -> Fut,
         Fut: std::future::Future<Output = Result<()>>,
+        C: FnMut(tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>) -> Cut,
+        Cut: std::future::Future<Output = Result<(tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>, Result<()>)>>,
     {
-        let (ws_stream, _) = connect_async(&self.url).await?;
+        let ws_stream = connect_async(&self.url).await?.0;
         info!("Successfully connected to {}", self.url);
 
-        let (mut _write, mut read) = ws_stream.split();
+        // Run connection hook
+        let (ws_stream, res) = on_connect(ws_stream).await?;
+        res?;
+
+        let (_write, mut read) = ws_stream.split();
 
         while let Some(message) = read.next().await {
             let message = message?;
             
             match message {
                 Message::Ping(payload) => {
-                    // tungstenite handles pong automatically if using the right abstraction, 
-                    // but let's be explicit if needed or just log.
-                    // For now, on_message will handle it if it wants.
                     on_message(Message::Pong(payload)).await?;
                 }
                 Message::Close(_) => {
@@ -115,7 +128,7 @@ mod tests {
         let (tx, mut rx) = tokio::sync::mpsc::channel(1);
 
         let handle = tokio::spawn(async move {
-            manager.connect_with_retry(|msg| {
+            manager.connect_with_retry(|ws| async move { Ok((ws, Ok(()))) }, |msg| {
                 let tx = tx.clone();
                 async move {
                     if let Message::Text(text) = msg {
@@ -140,7 +153,7 @@ mod tests {
         manager.max_retries = 2;
         manager.initial_backoff = Duration::from_millis(10);
 
-        let result = manager.connect_with_retry(|_| async { Ok(()) }).await;
+        let result = manager.connect_with_retry(|ws| async move { Ok((ws, Ok(()))) }, |_| async { Ok(()) }).await;
         
         // Should fail after 2 retries
         assert!(result.is_err());
