@@ -26,10 +26,14 @@ class ExecutionEngine:
         else:
             print("⚠️  Execution: No API Key found. Running in Mock Mode.")
 
-    def execute_signal(self, signal: Signal):
+    def execute_signal(self, signal: Signal) -> Optional[str]:
+        """
+        Converts Signal to Order and executes it (Mock).
+        Returns the order_id if successful.
+        """
         side = self._determine_side(signal.type)
         if not side:
-            return
+            return None
 
         price = signal.value if signal.value else Decimal("50000")
         
@@ -54,15 +58,11 @@ class ExecutionEngine:
                     amount=float(self.default_quantity)
                 )
                 print(f"✅ Real Order Placed: {response['id']}")
-                
-                # Update DB with real ID
                 self.order_manager.update_exchange_order_id(order, str(response['id']))
-                
-                # For Phase 3 prototype, we leave it as Open.
-                # Dashboard will show it as Open.
-                
+                return order.id
             except Exception as e:
                 print(f"❌ Real Execution Failed: {e}")
+                return None
         else:
             # MOCK EXECUTION (Immediate Fill)
             fill_price = price
@@ -72,6 +72,7 @@ class ExecutionEngine:
                 fill_price=fill_price,
                 fill_quantity=self.default_quantity
             )
+            return order.id
 
     def _determine_side(self, signal_type: SignalType) -> Optional[str]:
         if signal_type == SignalType.LONG:

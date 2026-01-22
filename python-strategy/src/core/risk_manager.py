@@ -17,31 +17,30 @@ class RiskManager:
         self.account_service = account_service
         self.max_exposure_per_product = Decimal("50000.0") # USDT
 
-    def check_risk(self, signal: Signal) -> bool:
+    def check_risk(self, signal: Signal) -> tuple[bool, str]:
         """
         Evaluates the signal against risk rules.
-        Returns True if safe to proceed, False otherwise.
+        Returns (True, "PASS") if safe to proceed, (False, reason) otherwise.
         """
         if signal.type == SignalType.NO_SIGNAL:
-            return True
+            return True, "NO_SIGNAL"
 
         # Rule 1: Zero Balance Protection
-        # Allow EXIT signals even if balance is zero (to close positions)
         is_entry = signal.type in [SignalType.LONG, SignalType.SHORT]
         balance = self.account_service.get_balance()
         
         if is_entry and balance <= 0:
-            print(f"🛑 RISK REJECT: Account balance is {balance} (<= 0). Signal {signal.type} rejected.")
-            return False
+            msg = f"REJECT: Account balance is {balance} (<= 0)"
+            print(f"🛑 RISK {msg}. Signal {signal.type} rejected.")
+            return False, msg
 
-        # Rule 2: Max Exposure Check (Simplified)
-        # In a real system, we'd calculate: current_exposure + new_order_value > max_exposure
-        # Here we just check if we already have a huge position (mock logic)
+        # Rule 2: Max Exposure Check
         position = self.account_service.get_position(signal.strategy_id, signal.product_id)
         if position:
             current_exposure = position.quantity * position.entry_price
             if is_entry and current_exposure >= self.max_exposure_per_product:
-                 print(f"🛑 RISK REJECT: Max exposure reached ({current_exposure} >= {self.max_exposure_per_product}).")
-                 return False
+                 msg = f"REJECT: Max exposure reached ({current_exposure} >= {self.max_exposure_per_product})"
+                 print(f"🛑 RISK {msg}.")
+                 return False, msg
 
-        return True
+        return True, "PASS"

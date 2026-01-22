@@ -9,7 +9,7 @@ st.set_page_config(page_title="FluxTrade Dashboard", layout="wide")
 
 def main():
     st.sidebar.title("FluxTrade Control")
-    page = st.sidebar.selectbox("Choose a page", ["Market Overview", "Trade History", "Risk Monitor"])
+    page = st.sidebar.selectbox("Choose a page", ["Market Overview", "Trade History", "Risk Monitor", "Rule Verification"])
 
     if page == "Market Overview":
         show_market_overview()
@@ -17,6 +17,42 @@ def main():
         show_trade_history()
     elif page == "Risk Monitor":
         show_risk_monitor()
+    elif page == "Rule Verification":
+        show_rule_verification()
+
+def show_rule_verification():
+    st.title("🛡️ Rule Verification")
+    st.write("Detailed audit trail of strategy signals and risk decisions.")
+    
+    df_audit = DataProvider.get_signal_audits()
+    if df_audit.empty:
+        st.info("No signal audits found yet.")
+        return
+
+    # Display summary table
+    st.subheader("Decision History")
+    selected_id = st.selectbox("Select an Audit ID to view details", df_audit['id'].tolist())
+    
+    st.dataframe(df_audit[['id', 'timestamp', 'strategy_id', 'product_id', 'signal_type', 'risk_status', 'risk_message']], use_container_width=True)
+    
+    # Show Details
+    if selected_id:
+        detail_row = df_audit[df_audit['id'] == selected_id].iloc[0]
+        st.divider()
+        st.subheader(f"Details for Audit #{selected_id}")
+        
+        col1, col2 = st.columns(2)
+        with col1:
+            st.json({
+                "Strategy": detail_row['strategy_id'],
+                "Product": detail_row['product_id'],
+                "Signal": detail_row['signal_type'],
+                "Risk": detail_row['risk_status'],
+                "Order ID": detail_row['order_id']
+            })
+        with col2:
+            st.text("Decision Context (Raw JSON):")
+            st.json(detail_row['details_json'])
 
 def show_market_overview():
     st.title("📊 Market Overview")

@@ -4,7 +4,7 @@ from enum import Enum
 from typing import Optional
 import re
 
-PRODUCT_ID_REGEX = r"^[A-Z0-9]+:[A-Z0-9]+-PERP$"
+PRODUCT_ID_REGEX = r"^[A-Z0-9]+:[A-Z0-9_]+-PERP$"
 
 class SignalType(str, Enum):
     LONG = "LONG"

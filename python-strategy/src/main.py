@@ -7,16 +7,20 @@ sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from src.core.consumer import DataConsumer
 from src.core.engine import StrategyEngine
 from src.strategies.example import RandomStrategy
+from src.core.db import SessionLocal
 
 def main():
     print("Starting FluxTrade Strategy Service...")
     
+    # 0. Init DB Session
+    db_session = SessionLocal()
+
     # 1. Initialize Engine
-    engine = StrategyEngine()
+    engine = StrategyEngine(db_session=db_session)
     
     # 2. Register Strategies
-    # Note: In a real app, this might load from DB or Config
-    strategy_1 = RandomStrategy(strategy_id="strat_demo_01", product_id="BINANCE:BTCUSDT-PERP")
+    # Use 'strategy_1' which exists in seed data
+    strategy_1 = RandomStrategy(strategy_id="strategy_1", product_id="BINANCE:BTCUSDT-PERP")
     engine.add_strategy(strategy_1)
     
     # 3. Initialize Data Consumer
@@ -29,6 +33,8 @@ def main():
         consumer.start()
     except KeyboardInterrupt:
         print("Service stopping...")
+    finally:
+        db_session.close()
 
 if __name__ == "__main__":
     main()

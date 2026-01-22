@@ -37,6 +37,11 @@ class DataProvider:
         return pd.read_sql(text(query), engine, params={"limit": limit})
 
     @staticmethod
+    def get_signal_audits(limit=50):
+        query = "SELECT * FROM signal_audit ORDER BY timestamp DESC LIMIT :limit"
+        return pd.read_sql(text(query), engine, params={"limit": limit})
+
+    @staticmethod
     def get_realtime_candle(product_id: str):
         # Redis channel: market_data.BINANCE.BTCUSDT-PERP.1m
         exchange, symbol = product_id.split(':')

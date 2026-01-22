@@ -56,11 +56,43 @@ class Trade(Base):
     timestamp = Column(BigInteger, nullable=False)
 
 class Position(Base):
+
     __tablename__ = 'position'
+
     strategy_id = Column(String, ForeignKey('strategy.id'), primary_key=True)
+
     product_id = Column(String, ForeignKey('product.id'), primary_key=True)
+
     side = Column(String, primary_key=True)
+
     quantity = Column(Numeric, nullable=False)
+
     entry_price = Column(Numeric, nullable=False)
+
     unrealized_pnl = Column(Numeric, nullable=False)
+
     last_update_timestamp = Column(BigInteger, nullable=False)
+
+
+
+class SignalAudit(Base):
+
+    __tablename__ = 'signal_audit'
+
+    id = Column(BigInteger, primary_key=True, autoincrement=True)
+
+    timestamp = Column(BigInteger, nullable=False)
+
+    strategy_id = Column(String, nullable=False)
+
+    product_id = Column(String, nullable=False)
+
+    signal_type = Column(String, nullable=False)
+
+    risk_status = Column(String, nullable=False) # PASS, REJECT
+
+    risk_message = Column(Text, nullable=True)
+
+    order_id = Column(String, nullable=True)
+
+    details_json = Column(Text, nullable=True)
