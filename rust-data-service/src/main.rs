@@ -1,3 +1,4 @@
+mod aggregator;
 mod connector;
 mod model;
 
