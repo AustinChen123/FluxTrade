@@ -215,6 +215,39 @@ impl ExchangeConnector for BybitConnector {
 
         Ok(())
     }
+
+    async fn fetch_recent_candles(&self, symbol: &str, timeframe: &str, limit: u32) -> Result<Vec<Candlestick>> {
+        // Bybit V5: GET /v5/market/kline
+        let bybit_tf = match timeframe {
+            "1m" => "1", "3m" => "3", "5m" => "5", "15m" => "15", "30m" => "30",
+            "1h" => "60", "2h" => "120", "4h" => "240", "6h" => "360", "12h" => "720", "1d" => "D",
+            _ => timeframe,
+        };
+        let url = format!("https://api.bybit.com/v5/market/kline?category=linear&symbol={}&interval={}&limit={}", symbol, bybit_tf, limit);
+        let client = reqwest::Client::new();
+        let res = client.get(url).send().await?.json::<Value>().await?;
+        
+        let mut candles = Vec::new();
+        if let Some(list) = res.get("result").and_then(|r| r.get("list")).and_then(|l| l.as_array()) {
+            for k in list {
+                // Bybit returns: [start, open, high, low, close, volume, turnover]
+                let candle = Candlestick {
+                    product_id: format!("{}:{}-PERP", self.exchange_id, symbol),
+                    timeframe: timeframe.to_string(),
+                    timestamp: k[0].as_str().context("t")?.parse()?,
+                    open: k[1].as_str().context("o")?.parse()?,
+                    high: k[2].as_str().context("h")?.parse()?,
+                    low: k[3].as_str().context("l")?.parse()?,
+                    close: k[4].as_str().context("c")?.parse()?,
+                    volume: k[5].as_str().context("v")?.parse()?,
+                };
+                candles.push(candle);
+            }
+        }
+        // Bybit returns newest first, we want oldest first for consistency
+        candles.reverse();
+        Ok(candles)
+    }
 }
 
 #[cfg(test)]

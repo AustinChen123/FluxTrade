@@ -27,4 +27,7 @@ pub trait ExchangeConnector {
         timeframe: &str,
         tx: mpsc::Sender<Candlestick>,
     ) -> Result<()>;
+
+    // REST API for fetching recent history (catch-up)
+    async fn fetch_recent_candles(&self, symbol: &str, timeframe: &str, limit: u32) -> Result<Vec<Candlestick>>;
 }

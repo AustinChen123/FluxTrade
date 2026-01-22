@@ -173,6 +173,40 @@ impl ExchangeConnector for BackpackConnector {
 
         Ok(())
     }
+
+    async fn fetch_recent_candles(&self, symbol: &str, timeframe: &str, limit: u32) -> Result<Vec<Candlestick>> {
+        // Backpack: GET /api/v1/klines
+        let url = format!("https://api.backpack.exchange/api/v1/klines?symbol={}&interval={}&limit={}", symbol, timeframe, limit);
+        let client = reqwest::Client::new();
+        let res = client.get(url).send().await?.json::<Value>().await?;
+        
+        let mut candles = Vec::new();
+        if let Some(arr) = res.as_array() {
+            for k in arr {
+                // Backpack klines array: [timestamp, open, high, low, close, volume, close_timestamp]
+                // Note: timestamps are ISO strings in REST too? No, usually numbers. 
+                // Let's check docs again or handle both.
+                let ts = if let Some(s) = k[0].as_str() {
+                    BackpackConnector::parse_iso8601_to_ms(s)?
+                } else {
+                    k[0].as_i64().context("t")?
+                };
+
+                let candle = Candlestick {
+                    product_id: format!("{}:{}-PERP", self.exchange_id, symbol),
+                    timeframe: timeframe.to_string(),
+                    timestamp: ts,
+                    open: k[1].as_str().context("o")?.parse()?,
+                    high: k[2].as_str().context("h")?.parse()?,
+                    low: k[3].as_str().context("l")?.parse()?,
+                    close: k[4].as_str().context("c")?.parse()?,
+                    volume: k[5].as_str().context("v")?.parse()?,
+                };
+                candles.push(candle);
+            }
+        }
+        Ok(candles)
+    }
 }
 
 #[cfg(test)]

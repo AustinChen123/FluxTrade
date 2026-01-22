@@ -1,6 +1,7 @@
 mod aggregator;
 mod connector;
 mod model;
+mod publisher;
 
 use tokio_tungstenite::{connect_async, tungstenite::protocol::Message};
 use futures_util::{SinkExt, StreamExt};

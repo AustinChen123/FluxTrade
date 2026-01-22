@@ -132,15 +132,15 @@ impl ExchangeConnector for BinanceConnector {
         let url = format!("wss://fstream.binance.com/stream?streams={}", streams);
         let ws_manager = WebSocketManager::new(&url);
         let connector = self.exchange_id.clone();
+        let timeframe_str = timeframe.to_string();
 
         info!("Subscribing to Binance candles: {}", streams);
-
-        info!("Subscribing to Binance trades: {}", streams);
 
         tokio::spawn(async move {
             let res = ws_manager.connect_with_retry(|ws| async { Ok((ws, Ok(()))) }, |msg| {
                 let tx = tx.clone();
                 let connector = connector.clone();
+                let timeframe_str = timeframe_str.clone();
                 async move {
                     if let Message::Text(text) = msg {
                         let v: Value = serde_json::from_str(&text)?;
@@ -149,7 +149,7 @@ impl ExchangeConnector for BinanceConnector {
                                 let k = data.get("k").context("k")?;
                                 let trade = Candlestick {
                                     product_id: format!("{}:{}-PERP", connector, data.get("s").context("s")?.as_str().context("s")?),
-                                    timeframe: k.get("i").context("i")?.as_str().context("i")?.to_string(),
+                                    timeframe: timeframe_str,
                                     timestamp: k.get("t").context("t")?.as_i64().context("t")?,
                                     open: k.get("o").context("o")?.as_str().context("o")?.parse::<Decimal>()?,
                                     high: k.get("h").context("h")?.as_str().context("h")?.parse::<Decimal>()?,
@@ -175,6 +175,30 @@ impl ExchangeConnector for BinanceConnector {
         });
 
         Ok(())
+    }
+
+    async fn fetch_recent_candles(&self, symbol: &str, timeframe: &str, limit: u32) -> Result<Vec<Candlestick>> {
+        let url = format!("https://fapi.binance.com/fapi/v1/klines?symbol={}&interval={}&limit={}", symbol, timeframe, limit);
+        let client = reqwest::Client::new();
+        let res = client.get(url).send().await?.json::<Value>().await?;
+        
+        let mut candles = Vec::new();
+        if let Some(arr) = res.as_array() {
+            for k in arr {
+                let candle = Candlestick {
+                    product_id: format!("{}:{}-PERP", self.exchange_id, symbol),
+                    timeframe: timeframe.to_string(),
+                    timestamp: k[0].as_i64().context("t")?,
+                    open: k[1].as_str().context("o")?.parse()?,
+                    high: k[2].as_str().context("h")?.parse()?,
+                    low: k[3].as_str().context("l")?.parse()?,
+                    close: k[4].as_str().context("c")?.parse()?,
+                    volume: k[5].as_str().context("v")?.parse()?,
+                };
+                candles.push(candle);
+            }
+        }
+        Ok(candles)
     }
 }
 
