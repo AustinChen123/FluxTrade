@@ -1,17 +1,15 @@
 mod connector;
 mod model;
 
-use crate::connector::binance::BinanceConnector;
-use crate::connector::ExchangeConnector;
-use tokio::sync::mpsc;
+use tokio_tungstenite::{connect_async, tungstenite::protocol::Message};
+use futures_util::{SinkExt, StreamExt};
+use serde_json::json;
 use tracing::{info, error, Level};
-use dotenvy::dotenv;
+use std::time::Duration;
+use tokio::time::timeout;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    dotenv().ok();
-    
-    // Explicitly install CryptoProvider for rustls 0.23+
     rustls::crypto::ring::default_provider().install_default()
         .expect("Failed to install crypto provider");
 
@@ -19,50 +17,42 @@ async fn main() -> anyhow::Result<()> {
         .with_max_level(Level::INFO)
         .init();
     
-    info!("Starting FluxTrade Data Service Test Mode...");
+    let url = "wss://ws.backpack.exchange/";
+    info!("Connecting to Backpack WS: {}", url);
 
-    let api_key = std::env::var("BINANCE_API_KEY").unwrap_or_default();
-    if api_key.is_empty() {
-        error!("BINANCE_API_KEY not found in .env");
-    } else {
-        info!("BINANCE_API_KEY loaded successfully.");
-    }
+    let (mut ws_stream, _) = timeout(Duration::from_secs(10), connect_async(url)).await??;
+    info!("Connected successfully!");
 
-    let mut connector = BinanceConnector::new();
+    // Correcting to "method": "SUBSCRIBE" based on search results
+    let sub = json!({
+        "method": "SUBSCRIBE",
+        "params": ["trade.SOL_USDC", "kline.1m.SOL_USDC"]
+    });
+
+    info!("Sending subscription request: {}", sub);
+    ws_stream.send(Message::Text(sub.to_string().into())).await?;
+
+    info!("Waiting for messages (30s timeout)...");
     
-    let (trade_tx, mut trade_rx) = mpsc::channel(100);
-    let (candle_tx, mut candle_rx) = mpsc::channel(100);
-
-    info!("Subscribing to BTCUSDT trades and 1m candles...");
-    connector.subscribe_trades(&["BTCUSDT".to_string()], trade_tx).await?;
-    connector.subscribe_candles(&["BTCUSDT".to_string()], "1m", candle_tx).await?;
-
     let mut count = 0;
-    let mut timeout = tokio::time::interval(std::time::Duration::from_secs(30));
-    timeout.tick().await; // first tick is immediate
-
     loop {
-        tokio::select! {
-            msg = trade_rx.recv() => {
-                if let Some(trade) = msg {
-                    info!("Received Trade: {} {} @ {}", trade.product_id, trade.quantity, trade.price);
+        match timeout(Duration::from_secs(30), ws_stream.next()).await {
+            Ok(Some(msg)) => {
+                let msg = msg?;
+                if let Message::Text(text) = msg {
+                    info!("Received Data: {}", text);
                     count += 1;
                 }
+                if count >= 3 { break; }
             }
-            msg = candle_rx.recv() => {
-                if let Some(candle) = msg {
-                    info!("Received Candle: {} Close: {}", candle.product_id, candle.close);
-                    count += 1;
-                }
-            }
-            _ = timeout.tick() => {
-                info!("Test timeout reached.");
+            Ok(None) => {
+                info!("Stream closed by server");
                 break;
             }
-        }
-        if count >= 10 {
-            info!("Received 10 messages, test successful!");
-            break;
+            Err(_) => {
+                error!("Timeout waiting for message.");
+                break;
+            }
         }
     }
 

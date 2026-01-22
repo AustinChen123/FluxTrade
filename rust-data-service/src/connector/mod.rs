@@ -2,6 +2,7 @@ use crate::model::{Candlestick, OrderBook, Trade};
 use anyhow::Result;
 pub mod binance;
 pub mod bybit;
+pub mod backpack;
 pub mod ws;
 
 use async_trait::async_trait;
