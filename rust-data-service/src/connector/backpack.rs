@@ -23,18 +23,31 @@ impl BackpackConnector {
         }
     }
 
-    fn parse_iso8601_to_ms(iso: &str) -> Result<i64> {
-        // Backpack returns "2026-01-22T21:19:00" without timezone,
-        // assuming UTC based on typical exchange behavior.
-        // We add 'Z' to make it RFC3339 compatible if it lacks it.
-        let rfc = if iso.ends_with('Z') {
-            iso.to_string()
-        } else {
-            format!("{}Z", iso)
-        };
-        let dt = DateTime::parse_from_rfc3339(&rfc).context("Failed to parse ISO8601 timestamp")?;
-        Ok(dt.timestamp_millis())
-    }
+        fn parse_iso8601_to_ms(iso: &str) -> Result<i64> {
+
+            // Backpack returns "2026-01-22T21:19:00" or similar.
+
+            // We ensure it is treated as UTC.
+
+            let rfc = if iso.contains('Z') || iso.contains('+') { 
+
+                iso.to_string() 
+
+            } else { 
+
+                format!("{}Z", iso) 
+
+            };
+
+            
+
+            let dt = rfc.parse::<DateTime<chrono::Utc>>()
+
+                .context("Failed to parse ISO8601 timestamp")?;
+
+            Ok(dt.timestamp_millis())
+
+        }
 }
 
 #[async_trait]

@@ -3,63 +3,131 @@ mod connector;
 mod model;
 mod publisher;
 
-use futures_util::{SinkExt, StreamExt};
-use serde_json::json;
-use std::time::Duration;
-use tokio::time::timeout;
-use tokio_tungstenite::{connect_async, tungstenite::protocol::Message};
-use tracing::{error, info, Level};
+use crate::connector::binance::BinanceConnector;
+use crate::connector::bybit::BybitConnector;
+use crate::connector::backpack::BackpackConnector;
+use crate::connector::ExchangeConnector;
+use crate::publisher::RedisPublisher;
+use crate::aggregator::CandleAggregator;
+use tokio::sync::mpsc;
+use tracing::{info, error, warn, Level};
+use dotenvy::dotenv;
+use std::sync::Arc;
+use tokio::sync::Mutex;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    rustls::crypto::ring::default_provider()
-        .install_default()
+    dotenv().ok();
+    
+    // Explicitly install CryptoProvider for rustls 0.23+
+    rustls::crypto::ring::default_provider().install_default()
         .expect("Failed to install crypto provider");
 
-    tracing_subscriber::fmt().with_max_level(Level::INFO).init();
+    tracing_subscriber::fmt()
+        .with_max_level(Level::INFO)
+        .init();
+    
+    info!("🚀 FluxTrade Data Service Starting...");
 
-    let url = "wss://ws.backpack.exchange/";
-    info!("Connecting to Backpack WS: {}", url);
+    let redis_url = format!("redis://{}:{}", 
+        std::env::var("REDIS_HOST").unwrap_or_else(|_| "127.0.0.1".into()),
+        std::env::var("REDIS_PORT").unwrap_or_else(|_| "6379".into())
+    );
+    
+    let mut publisher = RedisPublisher::new(&redis_url)?;
+    publisher.connect().await?;
+    let publisher = Arc::new(Mutex::new(publisher));
 
-    let (mut ws_stream, _) = timeout(Duration::from_secs(10), connect_async(url)).await??;
-    info!("Connected successfully!");
+    let (trade_tx, mut trade_rx) = mpsc::channel(1000);
+    let (candle_tx, mut candle_rx) = mpsc::channel(1000);
 
-    // Correcting to "method": "SUBSCRIBE" based on search results
-    let sub = json!({
-        "method": "SUBSCRIBE",
-        "params": ["trade.SOL_USDC", "kline.1m.SOL_USDC"]
-    });
+    // 1. Start Aggregator Task (Optional for now, but wired up)
+    let mut aggregator = CandleAggregator::new();
+    
+    // 2. Start Data Collection Pipeline
+    let enabled_exchanges = std::env::var("EXCHANGE_ENABLED").unwrap_or_else(|_| "binance,bybit,backpack".into());
+    let symbols = vec!["BTCUSDT".to_string(), "SOLUSDC".to_string()]; // Default symbols
 
-    info!("Sending subscription request: {}", sub);
-    ws_stream
-        .send(Message::Text(sub.to_string().into()))
-        .await?;
+    for ex in enabled_exchanges.split(',') {
+        let trade_tx = trade_tx.clone();
+        let candle_tx = candle_tx.clone();
+        let symbols = symbols.clone();
 
-    info!("Waiting for messages (30s timeout)...");
-
-    let mut count = 0;
-    loop {
-        match timeout(Duration::from_secs(30), ws_stream.next()).await {
-            Ok(Some(msg)) => {
-                let msg = msg?;
-                if let Message::Text(text) = msg {
-                    info!("Received Data: {}", text);
-                    count += 1;
-                }
-                if count >= 3 {
-                    break;
-                }
-            }
-            Ok(None) => {
-                info!("Stream closed by server");
-                break;
-            }
-            Err(_) => {
-                error!("Timeout waiting for message.");
-                break;
-            }
+        match ex.trim().to_lowercase().as_str() {
+            "binance" => {
+                tokio::spawn(async move {
+                    let mut conn = BinanceConnector::new();
+                    info!("Starting Binance Connector...");
+                    if let Err(e) = conn.subscribe_trades(&symbols, trade_tx).await {
+                        error!("Binance trades error: {}", e);
+                    }
+                    if let Err(e) = conn.subscribe_candles(&symbols, "1m", candle_tx).await {
+                        error!("Binance candles error: {}", e);
+                    }
+                });
+            },
+            "bybit" => {
+                tokio::spawn(async move {
+                    let mut conn = BybitConnector::new();
+                    info!("Starting Bybit Connector...");
+                    if let Err(e) = conn.subscribe_trades(&symbols, trade_tx).await {
+                        error!("Bybit trades error: {}", e);
+                    }
+                    if let Err(e) = conn.subscribe_candles(&symbols, "1m", candle_tx).await {
+                        error!("Bybit candles error: {}", e);
+                    }
+                });
+            },
+            "backpack" => {
+                tokio::spawn(async move {
+                    let mut conn = BackpackConnector::new();
+                    info!("Starting Backpack Connector...");
+                    // Backpack symbols often use underscore
+                    let backpack_symbols = vec!["BTC_USDC".to_string(), "SOL_USDC".to_string()];
+                    if let Err(e) = conn.subscribe_trades(&backpack_symbols, trade_tx).await {
+                        error!("Backpack trades error: {}", e);
+                    }
+                    if let Err(e) = conn.subscribe_candles(&backpack_symbols, "1m", candle_tx).await {
+                        error!("Backpack candles error: {}", e);
+                    }
+                });
+            },
+            _ => warn!("Unknown exchange in EXCHANGE_ENABLED: {}", ex),
         }
     }
 
-    Ok(())
+    // 3. Main Loop: Forward to Redis and Aggregator
+    loop {
+        tokio::select! {
+            msg = trade_rx.recv() => {
+                if let Some(trade) = msg {
+                    let mut pub_lock = publisher.lock().await;
+                    if let Err(e) = pub_lock.publish_trade(&trade).await {
+                        error!("Failed to publish trade: {}", e);
+                    }
+                }
+            }
+            msg = candle_rx.recv() => {
+                if let Some(candle) = msg {
+                    let mut pub_lock = publisher.lock().await;
+                    // Publish 1m candle
+                    if let Err(e) = pub_lock.publish_candle(&candle).await {
+                        error!("Failed to publish candle: {}", e);
+                    }
+                    
+                    // Aggregate to 5m and 15m
+                    if let Some(c5) = aggregator.add_candle(&candle, "5m") {
+                        if let Err(e) = pub_lock.publish_candle(&c5).await {
+                            error!("Failed to publish 5m candle: {}", e);
+                        }
+                    }
+                    if let Some(c15) = aggregator.add_candle(&candle, "15m") {
+                        if let Err(e) = pub_lock.publish_candle(&c15).await {
+                            error!("Failed to publish 15m candle: {}", e);
+                        }
+                    }
+                }
+            }
+        }
+    }
 }
