@@ -1,6 +1,5 @@
 import os
 import time
-import json
 import random
 import redis
 from decimal import Decimal

@@ -3,7 +3,6 @@ from decimal import Decimal
 from typing import Optional
 from sqlalchemy.orm import Session
 from src.core.models import Signal, SignalType
-from src.core.orm_models import Order
 from src.core.order_manager import OrderManager
 from src.core.exchange_adapter import ExchangeAdapter
 

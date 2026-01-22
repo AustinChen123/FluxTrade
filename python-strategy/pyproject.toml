@@ -14,3 +14,9 @@ dependencies = [
     "redis>=7.1.0",
     "sqlalchemy>=2.0.46",
 ]
+
+[dependency-groups]
+dev = [
+    "pytest>=9.0.2",
+    "ruff>=0.14.13",
+]

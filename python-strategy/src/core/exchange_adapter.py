@@ -1,7 +1,5 @@
 import ccxt
-import os
 from typing import Optional, Dict, Any
-from decimal import Decimal
 
 class ExchangeAdapter:
     def __init__(self, exchange_id: str, api_key: str, secret: str, testnet: bool = True):

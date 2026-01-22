@@ -1,5 +1,4 @@
 import os
-import json
 import redis
 from typing import Callable, List
 from dotenv import load_dotenv

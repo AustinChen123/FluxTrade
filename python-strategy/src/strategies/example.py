@@ -1,5 +1,4 @@
 import random
-from decimal import Decimal
 from src.core.models import Candlestick, Signal, SignalType
 from src.strategies.base import BaseStrategy
 
