@@ -1,4 +1,4 @@
-from sqlalchemy import Column, String, BigInteger, Numeric, ForeignKey, Text
+from sqlalchemy import Column, String, BigInteger, Numeric, ForeignKey, Text, UniqueConstraint
 from sqlalchemy.orm import declarative_base
 
 Base = declarative_base()
@@ -37,6 +37,10 @@ class Order(Base):
     timestamp = Column(BigInteger, nullable=False)
     filled_quantity = Column(Numeric, nullable=True, default=0)
     filled_price = Column(Numeric, nullable=True)
+
+    __table_args__ = (
+        UniqueConstraint('exchange_order_id', 'exchange_id', name='uq_order_exchange_id'),
+    )
 
 class Trade(Base):
     __tablename__ = 'trade'

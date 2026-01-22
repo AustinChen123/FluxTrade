@@ -1,7 +1,10 @@
-from pydantic import BaseModel
+from pydantic import BaseModel, ConfigDict, field_validator
 from decimal import Decimal
 from enum import Enum
 from typing import Optional
+import re
+
+PRODUCT_ID_REGEX = r"^[A-Z0-9]+:[A-Z0-9]+-PERP$"
 
 class SignalType(str, Enum):
     LONG = "LONG"
@@ -10,7 +13,30 @@ class SignalType(str, Enum):
     EXIT_SHORT = "EXIT_SHORT"
     NO_SIGNAL = "NO_SIGNAL"
 
-class Candlestick(BaseModel):
+class BaseFluxModel(BaseModel):
+    """Base model with common configuration"""
+    model_config = ConfigDict(
+        json_encoders={Decimal: str},
+        # Allow population by alias/name
+        populate_by_name=True
+    )
+
+class Trade(BaseFluxModel):
+    id: str
+    product_id: str
+    price: Decimal
+    quantity: Decimal
+    side: str
+    timestamp: int  # Unix timestamp in milliseconds
+
+    @field_validator('product_id')
+    @classmethod
+    def validate_product_id(cls, v: str) -> str:
+        if not re.match(PRODUCT_ID_REGEX, v):
+            raise ValueError(f"Invalid product_id format: {v}. Expected EXCHANGE:SYMBOL-PERP")
+        return v
+
+class Candlestick(BaseFluxModel):
     product_id: str
     timeframe: str
     timestamp: int  # Unix timestamp in milliseconds
@@ -20,12 +46,14 @@ class Candlestick(BaseModel):
     close: Decimal
     volume: Decimal
 
-    class Config:
-        json_encoders = {
-            Decimal: lambda v: str(v)
-        }
+    @field_validator('product_id')
+    @classmethod
+    def validate_product_id(cls, v: str) -> str:
+        if not re.match(PRODUCT_ID_REGEX, v):
+            raise ValueError(f"Invalid product_id format: {v}. Expected EXCHANGE:SYMBOL-PERP")
+        return v
 
-class Signal(BaseModel):
+class Signal(BaseFluxModel):
     strategy_id: str
     product_id: str
     timeframe: str
@@ -34,12 +62,14 @@ class Signal(BaseModel):
     value: Optional[Decimal] = None
     metadata: Optional[dict] = None
 
-    class Config:
-        json_encoders = {
-            Decimal: lambda v: str(v)
-        }
+    @field_validator('product_id')
+    @classmethod
+    def validate_product_id(cls, v: str) -> str:
+        if not re.match(PRODUCT_ID_REGEX, v):
+            raise ValueError(f"Invalid product_id format: {v}. Expected EXCHANGE:SYMBOL-PERP")
+        return v
 
-class Position(BaseModel):
+class Position(BaseFluxModel):
     strategy_id: str
     product_id: str
     side: str  # "LONG" or "SHORT"
@@ -47,7 +77,9 @@ class Position(BaseModel):
     entry_price: Decimal
     unrealized_pnl: Decimal
 
-    class Config:
-        json_encoders = {
-            Decimal: lambda v: str(v)
-        }
+    @field_validator('product_id')
+    @classmethod
+    def validate_product_id(cls, v: str) -> str:
+        if not re.match(PRODUCT_ID_REGEX, v):
+            raise ValueError(f"Invalid product_id format: {v}. Expected EXCHANGE:SYMBOL-PERP")
+        return v

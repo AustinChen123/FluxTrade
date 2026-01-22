@@ -1,5 +1,5 @@
-from typing import List
-from src.core.models import Candlestick, Signal, SignalType
+from typing import List, Union
+from src.core.models import Candlestick, Trade, Signal, SignalType
 from src.strategies.base import BaseStrategy
 from src.core.risk_manager import RiskManager, AccountService
 
@@ -14,10 +14,15 @@ class StrategyEngine:
         self.strategies.append(strategy)
         print(f"Registered strategy: {strategy.strategy_id}")
 
-    def on_market_data(self, candle: Candlestick):
+    def on_market_data(self, data: Union[Candlestick, Trade]):
         """
-        Callback triggered by DataConsumer when new candle arrives.
+        Callback triggered by DataConsumer when new market data arrives.
         """
+        if isinstance(data, Trade):
+            # TODO: Future strategies might use tick data
+            return
+
+        candle = data
         # Dispatch to all strategies
         for strategy in self.strategies:
             try:
