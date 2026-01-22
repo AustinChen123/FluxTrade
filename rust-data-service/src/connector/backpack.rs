@@ -1,15 +1,15 @@
-use crate::connector::ExchangeConnector;
 use crate::connector::ws::WebSocketManager;
-use crate::model::{Candlestick, Trade, OrderBook};
-use anyhow::{Result, Context};
+use crate::connector::ExchangeConnector;
+use crate::model::{Candlestick, OrderBook, Trade};
+use anyhow::{Context, Result};
 use async_trait::async_trait;
+use chrono::DateTime;
+use futures_util::SinkExt;
 use rust_decimal::Decimal;
-use serde_json::{Value, json};
+use serde_json::{json, Value};
 use tokio::sync::mpsc;
 use tokio_tungstenite::tungstenite::protocol::Message;
-use tracing::{info, warn, error};
-use futures_util::SinkExt;
-use chrono::DateTime;
+use tracing::{error, info, warn};
 
 pub struct BackpackConnector {
     exchange_id: String,
@@ -24,12 +24,15 @@ impl BackpackConnector {
     }
 
     fn parse_iso8601_to_ms(iso: &str) -> Result<i64> {
-        // Backpack returns "2026-01-22T21:19:00" without timezone, 
+        // Backpack returns "2026-01-22T21:19:00" without timezone,
         // assuming UTC based on typical exchange behavior.
         // We add 'Z' to make it RFC3339 compatible if it lacks it.
-        let rfc = if iso.ends_with('Z') { iso.to_string() } else { format!("{}Z", iso) };
-        let dt = DateTime::parse_from_rfc3339(&rfc)
-            .context("Failed to parse ISO8601 timestamp")?;
+        let rfc = if iso.ends_with('Z') {
+            iso.to_string()
+        } else {
+            format!("{}Z", iso)
+        };
+        let dt = DateTime::parse_from_rfc3339(&rfc).context("Failed to parse ISO8601 timestamp")?;
         Ok(dt.timestamp_millis())
     }
 }
@@ -40,131 +43,224 @@ impl ExchangeConnector for BackpackConnector {
         Ok(())
     }
 
-    async fn subscribe_trades(&mut self, symbols: &[String], tx: mpsc::Sender<Trade>) -> Result<()> {
+    async fn subscribe_trades(
+        &mut self,
+        symbols: &[String],
+        tx: mpsc::Sender<Trade>,
+    ) -> Result<()> {
         let url = "wss://ws.backpack.exchange/";
         let ws_manager = WebSocketManager::new(url);
         let connector_id = self.exchange_id.clone();
-        
-        let args: Vec<String> = symbols.iter()
-            .map(|s| format!("trade.{}", s))
-            .collect();
+
+        let args: Vec<String> = symbols.iter().map(|s| format!("trade.{}", s)).collect();
 
         info!("Subscribing to Backpack trades: {:?}", args);
 
         tokio::spawn(async move {
-            let res = ws_manager.connect_with_retry(
-                |mut ws| {
-                    let args = args.clone();
-                    async move {
-                        let sub = json!({
-                            "method": "SUBSCRIBE",
-                            "params": args
-                        });
-                        ws.send(Message::Text(sub.to_string().into())).await.map_err(|e| anyhow::anyhow!(e))?;
-                        Ok((ws, Ok(())))
-                    }
-                },
-                |msg| {
-                    let tx = tx.clone();
-                    let connector_id = connector_id.clone();
-                    async move {
-                        if let Message::Text(text) = msg {
-                            let v: Value = serde_json::from_str(&text)?;
-                            if let Some(data) = v.get("data") {
-                                if data.get("e") == Some(&Value::String("trade".to_string())) {
-                                    let trade = Trade {
-                                        id: data.get("t").context("t")?.as_i64().context("t")?.to_string(),
-                                        product_id: format!("{}:{}-PERP", connector_id, data.get("s").context("s")?.as_str().context("s")?),
-                                        price: data.get("p").context("p")?.as_str().context("p")?.parse::<Decimal>()?,
-                                        quantity: data.get("q").context("q")?.as_str().context("q")?.parse::<Decimal>()?,
-                                        side: if data.get("m").context("m")?.as_bool().context("m")? { "sell".to_string() } else { "buy".to_string() },
-                                        timestamp: data.get("T").context("T")?.as_i64().context("T")? / 1000, // micro to milli
-                                    };
-                                    if let Err(e) = trade.validate() {
-                                        warn!("Invalid Backpack trade: {}", e);
-                                    } else {
-                                        tx.send(trade).await.ok();
+            let res = ws_manager
+                .connect_with_retry(
+                    |mut ws| {
+                        let args = args.clone();
+                        async move {
+                            let sub = json!({
+                                "method": "SUBSCRIBE",
+                                "params": args
+                            });
+                            ws.send(Message::Text(sub.to_string().into()))
+                                .await
+                                .map_err(|e| anyhow::anyhow!(e))?;
+                            Ok((ws, Ok(())))
+                        }
+                    },
+                    |msg| {
+                        let tx = tx.clone();
+                        let connector_id = connector_id.clone();
+                        async move {
+                            if let Message::Text(text) = msg {
+                                let v: Value = serde_json::from_str(&text)?;
+                                if let Some(data) = v.get("data") {
+                                    if data.get("e") == Some(&Value::String("trade".to_string())) {
+                                        let trade = Trade {
+                                            id: data
+                                                .get("t")
+                                                .context("t")?
+                                                .as_i64()
+                                                .context("t")?
+                                                .to_string(),
+                                            product_id: format!(
+                                                "{}:{}-PERP",
+                                                connector_id,
+                                                data.get("s")
+                                                    .context("s")?
+                                                    .as_str()
+                                                    .context("s")?
+                                            ),
+                                            price: data
+                                                .get("p")
+                                                .context("p")?
+                                                .as_str()
+                                                .context("p")?
+                                                .parse::<Decimal>()?,
+                                            quantity: data
+                                                .get("q")
+                                                .context("q")?
+                                                .as_str()
+                                                .context("q")?
+                                                .parse::<Decimal>()?,
+                                            side: if data
+                                                .get("m")
+                                                .context("m")?
+                                                .as_bool()
+                                                .context("m")?
+                                            {
+                                                "sell".to_string()
+                                            } else {
+                                                "buy".to_string()
+                                            },
+                                            timestamp: data
+                                                .get("T")
+                                                .context("T")?
+                                                .as_i64()
+                                                .context("T")?
+                                                / 1000, // micro to milli
+                                        };
+                                        if let Err(e) = trade.validate() {
+                                            warn!("Invalid Backpack trade: {}", e);
+                                        } else {
+                                            tx.send(trade).await.ok();
+                                        }
                                     }
                                 }
                             }
+                            Ok(())
                         }
-                        Ok(())
-                    }
-                }
-            ).await;
+                    },
+                )
+                .await;
 
             if let Err(e) = res {
                 error!("Backpack trades subscription failed: {}", e);
             }
         });
-        
+
         Ok(())
     }
 
-    async fn subscribe_orderbook(&mut self, _symbols: &[String], _tx: mpsc::Sender<OrderBook>) -> Result<()> {
+    async fn subscribe_orderbook(
+        &mut self,
+        _symbols: &[String],
+        _tx: mpsc::Sender<OrderBook>,
+    ) -> Result<()> {
         Ok(())
     }
 
-    async fn subscribe_candles(&mut self, symbols: &[String], timeframe: &str, tx: mpsc::Sender<Candlestick>) -> Result<()> {
+    async fn subscribe_candles(
+        &mut self,
+        symbols: &[String],
+        timeframe: &str,
+        tx: mpsc::Sender<Candlestick>,
+    ) -> Result<()> {
         let url = "wss://ws.backpack.exchange/";
         let ws_manager = WebSocketManager::new(url);
         let connector_id = self.exchange_id.clone();
-        
-        let args: Vec<String> = symbols.iter()
+
+        let args: Vec<String> = symbols
+            .iter()
             .map(|s| format!("kline.{}.{}", timeframe, s))
             .collect();
-        
+
         let timeframe_str = timeframe.to_string();
 
         info!("Subscribing to Backpack candles: {:?}", args);
 
         tokio::spawn(async move {
-            let res = ws_manager.connect_with_retry(
-                |mut ws| {
-                    let args = args.clone();
-                    async move {
-                        let sub = json!({
-                            "method": "SUBSCRIBE",
-                            "params": args
-                        });
-                        ws.send(Message::Text(sub.to_string().into())).await.map_err(|e| anyhow::anyhow!(e))?;
-                        Ok((ws, Ok(())))
-                    }
-                },
-                |msg| {
-                    let tx = tx.clone();
-                    let connector_id = connector_id.clone();
-                    let timeframe_str = timeframe_str.clone();
-                    async move {
-                        if let Message::Text(text) = msg {
-                            let v: Value = serde_json::from_str(&text)?;
-                            if let Some(data) = v.get("data") {
-                                if data.get("e") == Some(&Value::String("kline".to_string())) {
-                                    let ts_str = data.get("t").context("t")?.as_str().context("t not str")?;
-                                    let timestamp = BackpackConnector::parse_iso8601_to_ms(ts_str)?;
+            let res = ws_manager
+                .connect_with_retry(
+                    |mut ws| {
+                        let args = args.clone();
+                        async move {
+                            let sub = json!({
+                                "method": "SUBSCRIBE",
+                                "params": args
+                            });
+                            ws.send(Message::Text(sub.to_string().into()))
+                                .await
+                                .map_err(|e| anyhow::anyhow!(e))?;
+                            Ok((ws, Ok(())))
+                        }
+                    },
+                    |msg| {
+                        let tx = tx.clone();
+                        let connector_id = connector_id.clone();
+                        let timeframe_str = timeframe_str.clone();
+                        async move {
+                            if let Message::Text(text) = msg {
+                                let v: Value = serde_json::from_str(&text)?;
+                                if let Some(data) = v.get("data") {
+                                    if data.get("e") == Some(&Value::String("kline".to_string())) {
+                                        let ts_str = data
+                                            .get("t")
+                                            .context("t")?
+                                            .as_str()
+                                            .context("t not str")?;
+                                        let timestamp =
+                                            BackpackConnector::parse_iso8601_to_ms(ts_str)?;
 
-                                    let candle = Candlestick {
-                                        product_id: format!("{}:{}-PERP", connector_id, data.get("s").context("s")?.as_str().context("s")?),
-                                        timeframe: timeframe_str, // Use the cloned String
-                                        timestamp,
-                                        open: data.get("o").context("o")?.as_str().context("o")?.parse::<Decimal>()?,
-                                        high: data.get("h").context("h")?.as_str().context("h")?.parse::<Decimal>()?,
-                                        low: data.get("l").context("l")?.as_str().context("l")?.parse::<Decimal>()?,
-                                        close: data.get("c").context("c")?.as_str().context("c")?.parse::<Decimal>()?,
-                                        volume: data.get("v").context("v")?.as_str().context("v")?.parse::<Decimal>()?,
-                                    };
-                                    if let Err(e) = candle.validate() {
-                                        warn!("Invalid Backpack candle: {}", e);
-                                    } else {
-                                        tx.send(candle).await.ok();
+                                        let candle = Candlestick {
+                                            product_id: format!(
+                                                "{}:{}-PERP",
+                                                connector_id,
+                                                data.get("s")
+                                                    .context("s")?
+                                                    .as_str()
+                                                    .context("s")?
+                                            ),
+                                            timeframe: timeframe_str, // Use the cloned String
+                                            timestamp,
+                                            open: data
+                                                .get("o")
+                                                .context("o")?
+                                                .as_str()
+                                                .context("o")?
+                                                .parse::<Decimal>()?,
+                                            high: data
+                                                .get("h")
+                                                .context("h")?
+                                                .as_str()
+                                                .context("h")?
+                                                .parse::<Decimal>()?,
+                                            low: data
+                                                .get("l")
+                                                .context("l")?
+                                                .as_str()
+                                                .context("l")?
+                                                .parse::<Decimal>()?,
+                                            close: data
+                                                .get("c")
+                                                .context("c")?
+                                                .as_str()
+                                                .context("c")?
+                                                .parse::<Decimal>()?,
+                                            volume: data
+                                                .get("v")
+                                                .context("v")?
+                                                .as_str()
+                                                .context("v")?
+                                                .parse::<Decimal>()?,
+                                        };
+                                        if let Err(e) = candle.validate() {
+                                            warn!("Invalid Backpack candle: {}", e);
+                                        } else {
+                                            tx.send(candle).await.ok();
+                                        }
                                     }
                                 }
                             }
+                            Ok(())
                         }
-                        Ok(())
-                    }
-                }
-            ).await;
+                    },
+                )
+                .await;
 
             if let Err(e) = res {
                 error!("Backpack candles subscription failed: {}", e);
@@ -174,17 +270,25 @@ impl ExchangeConnector for BackpackConnector {
         Ok(())
     }
 
-    async fn fetch_recent_candles(&self, symbol: &str, timeframe: &str, limit: u32) -> Result<Vec<Candlestick>> {
+    async fn fetch_recent_candles(
+        &self,
+        symbol: &str,
+        timeframe: &str,
+        limit: u32,
+    ) -> Result<Vec<Candlestick>> {
         // Backpack: GET /api/v1/klines
-        let url = format!("https://api.backpack.exchange/api/v1/klines?symbol={}&interval={}&limit={}", symbol, timeframe, limit);
+        let url = format!(
+            "https://api.backpack.exchange/api/v1/klines?symbol={}&interval={}&limit={}",
+            symbol, timeframe, limit
+        );
         let client = reqwest::Client::new();
         let res = client.get(url).send().await?.json::<Value>().await?;
-        
+
         let mut candles = Vec::new();
         if let Some(arr) = res.as_array() {
             for k in arr {
                 // Backpack klines array: [timestamp, open, high, low, close, volume, close_timestamp]
-                // Note: timestamps are ISO strings in REST too? No, usually numbers. 
+                // Note: timestamps are ISO strings in REST too? No, usually numbers.
                 // Let's check docs again or handle both.
                 let ts = if let Some(s) = k[0].as_str() {
                     BackpackConnector::parse_iso8601_to_ms(s)?
@@ -236,14 +340,30 @@ mod tests {
             "s": "SOL_USDC",
             "t": 379172947i64
         });
-        
+
         // Mocking the behavior inside subscribe_trades closure
         let trade = Trade {
             id: data.get("t").unwrap().as_i64().unwrap().to_string(),
             product_id: format!("BACKPACK:{}-PERP", data.get("s").unwrap().as_str().unwrap()),
-            price: data.get("p").unwrap().as_str().unwrap().parse::<Decimal>().unwrap(),
-            quantity: data.get("q").unwrap().as_str().unwrap().parse::<Decimal>().unwrap(),
-            side: if data.get("m").unwrap().as_bool().unwrap() { "sell".to_string() } else { "buy".to_string() },
+            price: data
+                .get("p")
+                .unwrap()
+                .as_str()
+                .unwrap()
+                .parse::<Decimal>()
+                .unwrap(),
+            quantity: data
+                .get("q")
+                .unwrap()
+                .as_str()
+                .unwrap()
+                .parse::<Decimal>()
+                .unwrap(),
+            side: if data.get("m").unwrap().as_bool().unwrap() {
+                "sell".to_string()
+            } else {
+                "buy".to_string()
+            },
             timestamp: data.get("T").unwrap().as_i64().unwrap() / 1000,
         };
 

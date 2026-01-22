@@ -1,4 +1,4 @@
-use anyhow::{Result, bail};
+use anyhow::{bail, Result};
 use futures_util::StreamExt;
 use std::time::Duration;
 use tokio::time::sleep;
@@ -24,31 +24,51 @@ impl WebSocketManager {
 
     #[allow(dead_code)]
     pub async fn connect_with_retry<F, Fut, C, Cut>(
-        &self, 
+        &self,
         mut on_connect: C,
-        mut on_message: F
+        mut on_message: F,
     ) -> Result<()>
     where
         F: FnMut(Message) -> Fut,
         Fut: std::future::Future<Output = Result<()>>,
-        C: FnMut(tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>) -> Cut,
-        Cut: std::future::Future<Output = Result<(tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>, Result<()>)>>,
+        C: FnMut(
+            tokio_tungstenite::WebSocketStream<
+                tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
+            >,
+        ) -> Cut,
+        Cut: std::future::Future<
+            Output = Result<(
+                tokio_tungstenite::WebSocketStream<
+                    tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
+                >,
+                Result<()>,
+            )>,
+        >,
     {
         let mut retries = 0;
         let mut backoff = self.initial_backoff;
 
         loop {
-            match self.connect_and_loop(&mut on_connect, &mut on_message).await {
+            match self
+                .connect_and_loop(&mut on_connect, &mut on_message)
+                .await
+            {
                 Ok(_) => {
                     info!("Connection closed gracefully");
                     return Ok(());
                 }
                 Err(e) => {
                     retries += 1;
-                    error!("WebSocket error (attempt {}/{}): {}", retries, self.max_retries, e);
+                    error!(
+                        "WebSocket error (attempt {}/{}): {}",
+                        retries, self.max_retries, e
+                    );
 
                     if retries >= self.max_retries {
-                        bail!("Max retries reached for WebSocket connection to {}", self.url);
+                        bail!(
+                            "Max retries reached for WebSocket connection to {}",
+                            self.url
+                        );
                     }
 
                     warn!("Reconnecting in {:?}", backoff);
@@ -61,15 +81,26 @@ impl WebSocketManager {
 
     #[allow(dead_code)]
     async fn connect_and_loop<F, Fut, C, Cut>(
-        &self, 
+        &self,
         on_connect: &mut C,
-        on_message: &mut F
+        on_message: &mut F,
     ) -> Result<()>
     where
         F: FnMut(Message) -> Fut,
         Fut: std::future::Future<Output = Result<()>>,
-        C: FnMut(tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>) -> Cut,
-        Cut: std::future::Future<Output = Result<(tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>, Result<()>)>>,
+        C: FnMut(
+            tokio_tungstenite::WebSocketStream<
+                tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
+            >,
+        ) -> Cut,
+        Cut: std::future::Future<
+            Output = Result<(
+                tokio_tungstenite::WebSocketStream<
+                    tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
+                >,
+                Result<()>,
+            )>,
+        >,
     {
         let ws_stream = connect_async(&self.url).await?.0;
         info!("Successfully connected to {}", self.url);
@@ -82,7 +113,7 @@ impl WebSocketManager {
 
         while let Some(message) = read.next().await {
             let message = message?;
-            
+
             match message {
                 Message::Ping(payload) => {
                     on_message(Message::Pong(payload)).await?;
@@ -103,9 +134,9 @@ impl WebSocketManager {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use futures_util::SinkExt;
     use tokio::net::TcpListener;
     use tokio_tungstenite::accept_async;
-    use futures_util::SinkExt;
 
     #[tokio::test]
     async fn test_websocket_manager_connect() {
@@ -128,19 +159,26 @@ mod tests {
         let (tx, mut rx) = tokio::sync::mpsc::channel(1);
 
         let handle = tokio::spawn(async move {
-            manager.connect_with_retry(|ws| async move { Ok((ws, Ok(()))) }, |msg| {
-                let tx = tx.clone();
-                async move {
-                    if let Message::Text(text) = msg {
-                        tx.send(text).await.unwrap();
-                    }
-                    Ok(())
-                }
-            }).await
+            manager
+                .connect_with_retry(
+                    |ws| async move { Ok((ws, Ok(()))) },
+                    |msg| {
+                        let tx = tx.clone();
+                        async move {
+                            if let Message::Text(text) = msg {
+                                tx.send(text).await.unwrap();
+                            }
+                            Ok(())
+                        }
+                    },
+                )
+                .await
         });
 
         // 3. Verify message received
-        let msg = tokio::time::timeout(Duration::from_secs(2), rx.recv()).await.unwrap();
+        let msg = tokio::time::timeout(Duration::from_secs(2), rx.recv())
+            .await
+            .unwrap();
         assert_eq!(msg.unwrap(), "hello");
 
         handle.abort();
@@ -153,10 +191,15 @@ mod tests {
         manager.max_retries = 2;
         manager.initial_backoff = Duration::from_millis(10);
 
-        let result = manager.connect_with_retry(|ws| async move { Ok((ws, Ok(()))) }, |_| async { Ok(()) }).await;
-        
+        let result = manager
+            .connect_with_retry(|ws| async move { Ok((ws, Ok(()))) }, |_| async { Ok(()) })
+            .await;
+
         // Should fail after 2 retries
         assert!(result.is_err());
-        assert!(result.unwrap_err().to_string().contains("Max retries reached"));
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("Max retries reached"));
     }
 }

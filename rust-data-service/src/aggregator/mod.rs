@@ -31,21 +31,21 @@ impl CandleAggregator {
 
         let interval_ms = tf_minutes * 60 * 1000;
         let bucket_start = (candle.timestamp / interval_ms) * interval_ms;
-        
+
         let key = (candle.product_id.clone(), target_tf.to_string());
-        
+
         if let Some(mut buffer) = self.buffers.get(&key).cloned() {
             if bucket_start > buffer.timestamp {
                 // Window closed, return buffer and start new one
                 let completed = buffer.clone();
-                
+
                 // Initialize new buffer with current candle
                 let mut new_buffer = candle.clone();
                 new_buffer.timeframe = target_tf.to_string();
                 new_buffer.timestamp = bucket_start;
                 self.buffers.insert(key, new_buffer);
-                
-                return Some(completed);
+
+                Some(completed)
             } else {
                 // Update current buffer
                 buffer.high = buffer.high.max(candle.high);
@@ -95,15 +95,23 @@ mod tests {
             product_id: product.clone(),
             timeframe: "1m".to_string(),
             timestamp: base_ts,
-            open: dec!(100), high: dec!(110), low: dec!(90), close: dec!(105), volume: dec!(10),
+            open: dec!(100),
+            high: dec!(110),
+            low: dec!(90),
+            close: dec!(105),
+            volume: dec!(10),
         };
-        
+
         // 22:04 candle
         let c2 = Candlestick {
             product_id: product.clone(),
             timeframe: "1m".to_string(),
             timestamp: base_ts + 4 * 60 * 1000,
-            open: dec!(105), high: dec!(115), low: dec!(100), close: dec!(112), volume: dec!(10),
+            open: dec!(105),
+            high: dec!(115),
+            low: dec!(100),
+            close: dec!(112),
+            volume: dec!(10),
         };
 
         // 22:05 candle (starts new 5m bucket)
@@ -111,14 +119,20 @@ mod tests {
             product_id: product.clone(),
             timeframe: "1m".to_string(),
             timestamp: base_ts + 5 * 60 * 1000,
-            open: dec!(112), high: dec!(120), low: dec!(110), close: dec!(118), volume: dec!(10),
+            open: dec!(112),
+            high: dec!(120),
+            low: dec!(110),
+            close: dec!(118),
+            volume: dec!(10),
         };
 
         assert!(aggregator.add_candle(&c1, "5m").is_none());
         assert!(aggregator.add_candle(&c2, "5m").is_none());
-        
-        let completed = aggregator.add_candle(&c3, "5m").expect("Should complete 5m candle");
-        
+
+        let completed = aggregator
+            .add_candle(&c3, "5m")
+            .expect("Should complete 5m candle");
+
         assert_eq!(completed.timestamp, base_ts);
         assert_eq!(completed.open, dec!(100));
         assert_eq!(completed.high, dec!(115));

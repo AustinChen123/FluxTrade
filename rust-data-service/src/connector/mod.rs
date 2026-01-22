@@ -1,8 +1,8 @@
 use crate::model::{Candlestick, OrderBook, Trade};
 use anyhow::Result;
+pub mod backpack;
 pub mod binance;
 pub mod bybit;
-pub mod backpack;
 pub mod ws;
 
 use async_trait::async_trait;
@@ -29,5 +29,10 @@ pub trait ExchangeConnector {
     ) -> Result<()>;
 
     // REST API for fetching recent history (catch-up)
-    async fn fetch_recent_candles(&self, symbol: &str, timeframe: &str, limit: u32) -> Result<Vec<Candlestick>>;
+    async fn fetch_recent_candles(
+        &self,
+        symbol: &str,
+        timeframe: &str,
+        limit: u32,
+    ) -> Result<Vec<Candlestick>>;
 }

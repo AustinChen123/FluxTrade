@@ -13,10 +13,7 @@ impl RedisPublisher {
     #[allow(dead_code)]
     pub fn new(url: &str) -> Result<Self> {
         let client = redis::Client::open(url)?;
-        Ok(Self {
-            client,
-            conn: None,
-        } )
+        Ok(Self { client, conn: None })
     }
 
     #[allow(dead_code)]
@@ -34,7 +31,7 @@ impl RedisPublisher {
         let exchange = parts[0].to_lowercase();
         let symbol = parts[1].replace("-PERP", "").to_lowercase();
         let topic = format!("market_data.{}.{}.{}", exchange, symbol, candle.timeframe);
-        
+
         self.publish(&topic, candle).await
     }
 
@@ -44,7 +41,7 @@ impl RedisPublisher {
         let exchange = parts[0].to_lowercase();
         let symbol = parts[1].replace("-PERP", "").to_lowercase();
         let topic = format!("market_data.{}.{}.trades", exchange, symbol);
-        
+
         self.publish(&topic, trade).await
     }
 

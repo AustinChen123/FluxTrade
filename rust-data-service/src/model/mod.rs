@@ -15,7 +15,7 @@ pub struct Candlestick {
 
 impl Candlestick {
     #[allow(dead_code)]
-pub fn validate(&self) -> anyhow::Result<()> {
+    pub fn validate(&self) -> anyhow::Result<()> {
         if self.open <= Decimal::ZERO
             || self.high <= Decimal::ZERO
             || self.low <= Decimal::ZERO
@@ -45,7 +45,7 @@ pub struct Trade {
 
 impl Trade {
     #[allow(dead_code)]
-pub fn validate(&self) -> anyhow::Result<()> {
+    pub fn validate(&self) -> anyhow::Result<()> {
         if self.price <= Decimal::ZERO {
             anyhow::bail!("Price must be positive");
         }
@@ -76,7 +76,7 @@ mod tests {
             close: dec!(50500),
             volume: dec!(10),
         };
-        
+
         assert!(make_valid().validate().is_ok());
 
         let mut invalid_candle = make_valid();
@@ -98,7 +98,7 @@ mod tests {
             side: "buy".to_string(),
             timestamp: 1600000000,
         };
-        
+
         assert!(make_valid().validate().is_ok());
 
         let mut invalid_side_trade = make_valid();

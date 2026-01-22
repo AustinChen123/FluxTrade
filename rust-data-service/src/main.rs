@@ -3,22 +3,21 @@ mod connector;
 mod model;
 mod publisher;
 
-use tokio_tungstenite::{connect_async, tungstenite::protocol::Message};
 use futures_util::{SinkExt, StreamExt};
 use serde_json::json;
-use tracing::{info, error, Level};
 use std::time::Duration;
 use tokio::time::timeout;
+use tokio_tungstenite::{connect_async, tungstenite::protocol::Message};
+use tracing::{error, info, Level};
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    rustls::crypto::ring::default_provider().install_default()
+    rustls::crypto::ring::default_provider()
+        .install_default()
         .expect("Failed to install crypto provider");
 
-    tracing_subscriber::fmt()
-        .with_max_level(Level::INFO)
-        .init();
-    
+    tracing_subscriber::fmt().with_max_level(Level::INFO).init();
+
     let url = "wss://ws.backpack.exchange/";
     info!("Connecting to Backpack WS: {}", url);
 
@@ -32,10 +31,12 @@ async fn main() -> anyhow::Result<()> {
     });
 
     info!("Sending subscription request: {}", sub);
-    ws_stream.send(Message::Text(sub.to_string().into())).await?;
+    ws_stream
+        .send(Message::Text(sub.to_string().into()))
+        .await?;
 
     info!("Waiting for messages (30s timeout)...");
-    
+
     let mut count = 0;
     loop {
         match timeout(Duration::from_secs(30), ws_stream.next()).await {
@@ -45,7 +46,9 @@ async fn main() -> anyhow::Result<()> {
                     info!("Received Data: {}", text);
                     count += 1;
                 }
-                if count >= 3 { break; }
+                if count >= 3 {
+                    break;
+                }
             }
             Ok(None) => {
                 info!("Stream closed by server");
