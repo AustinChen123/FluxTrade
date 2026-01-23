@@ -29,3 +29,17 @@ redis_data/
 
 # Tools
 .gemini/
+.clarify/
+spec/
+work/
+# Python bytecode
+*.pyc
+__pycache__/
+*.pyo
+*.pyd
+.Python
+env/
+venv/
+.venv/
+pip-log.txt
+
