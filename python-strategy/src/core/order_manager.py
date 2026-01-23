@@ -1,14 +1,15 @@
 import uuid
-import time
 from decimal import Decimal
 from typing import Optional
 from sqlalchemy.orm import Session
 from src.core.orm_models import Order, Trade, Position
 from src.core.models import Signal
+from src.core.clock import Clock
 
 class OrderManager:
-    def __init__(self, db_session: Session):
+    def __init__(self, db_session: Session, clock: Clock):
         self.db = db_session
+        self.clock = clock
 
     def create_order(self, signal: Signal, side: str, order_type: str, quantity: Decimal, price: Optional[Decimal] = None) -> Order:
         exchange_id = signal.product_id.split(':')[0]
@@ -25,7 +26,7 @@ class OrderManager:
             price=price,
             quantity=quantity,
             status="open",
-            timestamp=int(time.time() * 1000),
+            timestamp=int(self.clock.now() * 1000),
             filled_quantity=Decimal("0"),
             filled_price=Decimal("0")
         )
@@ -41,7 +42,7 @@ class OrderManager:
         self.db.commit()
 
     def fill_order(self, order: Order, fill_price: Decimal, fill_quantity: Decimal):
-        current_time = int(time.time() * 1000)
+        current_time = int(self.clock.now() * 1000)
         
         # 1. Update Order
         order.status = "closed"

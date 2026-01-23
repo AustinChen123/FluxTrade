@@ -8,6 +8,7 @@ from src.core.consumer import DataConsumer
 from src.core.engine import StrategyEngine
 from src.strategies.example import RandomStrategy
 from src.core.db import SessionLocal
+from src.core.clock import RealtimeClock
 
 def main():
     print("Starting FluxTrade Strategy Service...")
@@ -16,7 +17,8 @@ def main():
     db_session = SessionLocal()
 
     # 1. Initialize Engine
-    engine = StrategyEngine(db_session=db_session)
+    clock = RealtimeClock()
+    engine = StrategyEngine(db_session=db_session, clock=clock)
     
     # 2. Register Strategies
     # Use 'strategy_1' which exists in seed data
