@@ -2,14 +2,17 @@ import os
 from decimal import Decimal
 from typing import Optional
 from sqlalchemy.orm import Session
-from src.core.models import Signal, SignalType
+from src.core.models import Signal, SignalType, Candlestick
 from src.core.order_manager import OrderManager
 from src.core.exchange_adapter import ExchangeAdapter
+from src.core.clock import Clock
+from src.core.simulation import SlippageModel
 
 class ExecutionEngine:
-    def __init__(self, db_session: Session):
-        self.order_manager = OrderManager(db_session)
+    def __init__(self, db_session: Session, clock: Clock):
+        self.order_manager = OrderManager(db_session, clock)
         self.default_quantity = Decimal("0.01")
+        self.slippage_model = SlippageModel()
         self.adapter: Optional[ExchangeAdapter] = None
         
         # Try to initialize Real Exchange Adapter
@@ -26,7 +29,7 @@ class ExecutionEngine:
         else:
             print("⚠️  Execution: No API Key found. Running in Mock Mode.")
 
-    def execute_signal(self, signal: Signal) -> Optional[str]:
+    def execute_signal(self, signal: Signal, candle: Optional[Candlestick] = None) -> Optional[str]:
         """
         Converts Signal to Order and executes it (Mock).
         Returns the order_id if successful.
@@ -35,15 +38,21 @@ class ExecutionEngine:
         if not side:
             return None
 
-        price = signal.value if signal.value else Decimal("50000")
-        
+        # Determine Order Type and Price
+        if signal.value:
+            order_type = "limit"
+            limit_price = signal.value
+        else:
+            order_type = "market"
+            limit_price = None
+
         # 1. Create Order in DB (Open)
         order = self.order_manager.create_order(
             signal=signal,
             side=side,
-            order_type="market",
+            order_type=order_type,
             quantity=self.default_quantity,
-            price=None
+            price=limit_price
         )
 
         # 2. Execute (Real or Mock)
@@ -53,7 +62,7 @@ class ExecutionEngine:
                 # CCXT requires float
                 response = self.adapter.create_order(
                     symbol=signal.product_id,
-                    type='market',
+                    type='market', # Default to market for now
                     side=side,
                     amount=float(self.default_quantity)
                 )
@@ -64,8 +73,25 @@ class ExecutionEngine:
                 print(f"❌ Real Execution Failed: {e}")
                 return None
         else:
-            # MOCK EXECUTION (Immediate Fill)
-            fill_price = price
+            # MOCK EXECUTION
+            fill_price = None
+            
+            if order_type == "limit":
+                if not candle:
+                    print("⚠️ Cannot execute Limit Order without Candle data.")
+                    return None
+                
+                # Check High/Low
+                if candle.low <= limit_price <= candle.high:
+                    fill_price = limit_price
+                else:
+                    print(f"⏳ Limit Order not filled. Price {limit_price} out of range [{candle.low}, {candle.high}]")
+                    return None
+            else:
+                # Market Order
+                base_price = candle.close if candle else (signal.value if signal.value else Decimal("50000"))
+                fill_price = self.slippage_model.calculate_slippage(base_price)
+
             print(f"⚡ Execution: Simulating fill for {order.id} at {fill_price}")
             self.order_manager.fill_order(
                 order=order,

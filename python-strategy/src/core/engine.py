@@ -1,5 +1,4 @@
 import json
-import time
 from typing import List, Union, Optional
 from sqlalchemy.orm import Session
 from src.core.models import Candlestick, Trade, Signal, SignalType
@@ -7,15 +6,17 @@ from src.core.orm_models import SignalAudit, Strategy as StrategyModel
 from src.strategies.base import BaseStrategy
 from src.core.risk_manager import RiskManager, AccountService
 from src.core.execution import ExecutionEngine
+from src.core.clock import Clock
 
 class StrategyEngine:
-    def __init__(self, db_session: Session):
+    def __init__(self, db_session: Session, clock: Clock):
         self.db = db_session
+        self.clock = clock
         self.strategies: List[BaseStrategy] = []
         # Initialize Services
         self.account_service = AccountService()
         self.risk_manager = RiskManager(self.account_service)
-        self.execution_engine = ExecutionEngine(db_session)
+        self.execution_engine = ExecutionEngine(db_session, clock)
 
     def add_strategy(self, strategy: BaseStrategy):
         self.strategies.append(strategy)
@@ -54,12 +55,12 @@ class StrategyEngine:
         # 2. Execution
         if is_passed:
             print(f"✅ SIGNAL ACCEPTED: {signal.type}. Forwarding to Execution Engine...")
-            order_id = self.execution_engine.execute_signal(signal)
+            order_id = self.execution_engine.execute_signal(signal, candle)
         
         # 3. Audit Logging
         try:
             audit = SignalAudit(
-                timestamp=int(time.time() * 1000),
+                timestamp=int(self.clock.now() * 1000),
                 strategy_id=signal.strategy_id,
                 product_id=signal.product_id,
                 signal_type=signal.type.value,

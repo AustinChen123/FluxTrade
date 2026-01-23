@@ -15,6 +15,17 @@ class Product(Base):
     base_asset = Column(String, nullable=False)
     quote_asset = Column(String, nullable=False)
 
+class Candlestick(Base):
+    __tablename__ = 'candlestick'
+    product_id = Column(String, ForeignKey('product.id'), primary_key=True)
+    timeframe = Column(String, primary_key=True)
+    timestamp = Column(BigInteger, primary_key=True)
+    open = Column(Numeric, nullable=False)
+    high = Column(Numeric, nullable=False)
+    low = Column(Numeric, nullable=False)
+    close = Column(Numeric, nullable=False)
+    volume = Column(Numeric, nullable=False)
+
 class Strategy(Base):
     __tablename__ = 'strategy'
     id = Column(String, primary_key=True)
