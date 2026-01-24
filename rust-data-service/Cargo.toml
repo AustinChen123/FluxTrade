@@ -23,3 +23,5 @@ tokio-tungstenite = { version = "0.28", features = ["rustls-tls-webpki-roots"] }
 futures-util = "0.3"
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
 clap = { version = "4.5.54", features = ["derive"] }
+zip = "0.6.6"
+csv = "1.4.0"
