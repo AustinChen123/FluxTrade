@@ -1,4 +1,5 @@
 from abc import ABC, abstractmethod
+import pandas as pd
 from src.core.models import Candlestick, Signal
 
 class BaseStrategy(ABC):
@@ -12,3 +13,10 @@ class BaseStrategy(ABC):
         Process a new candlestick and optionally return a trading signal.
         """
         pass
+
+    def run_vectorized(self, df: pd.DataFrame) -> pd.DataFrame:
+        """
+        Run strategy in vectorized mode using Pandas.
+        Expected to return DataFrame with 'signal' column.
+        """
+        raise NotImplementedError("Vectorized execution not implemented")

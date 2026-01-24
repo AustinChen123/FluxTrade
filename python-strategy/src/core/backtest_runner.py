@@ -8,6 +8,7 @@ from src.core.engine import StrategyEngine
 from src.core.clock import BacktestClock
 from src.strategies.base import BaseStrategy
 from src.core.repositories import BacktestOrderRepository
+from src.core.backtest.loader import get_candles_generator
 
 class BacktestRunner:
     def __init__(self, start_time: int, end_time: int, product_id: str, timeframe: str):
@@ -15,7 +16,8 @@ class BacktestRunner:
         self.end_time = end_time
         self.product_id = product_id
         self.timeframe = timeframe
-        # Separate sessions: one for reading data, one for the engine to write orders
+        
+        # Dual sessions: one for data stream, one for execution writing
         self.data_session = SessionLocal()
         self.db_session = SessionLocal()
         
@@ -40,28 +42,6 @@ class BacktestRunner:
                 self.db_session.add(new_strat)
         self.db_session.commit()
 
-    def fetch_candles(self) -> Generator[Candlestick, None, None]:
-        """Generator that yields Pydantic Candlestick objects using data_session"""
-        query = self.data_session.query(CandlestickORM).filter(
-            CandlestickORM.product_id == self.product_id,
-            CandlestickORM.timeframe == self.timeframe,
-            CandlestickORM.timestamp >= self.start_time,
-            CandlestickORM.timestamp <= self.end_time
-        ).order_by(CandlestickORM.timestamp.asc())
-
-        # Use yield_per for memory efficiency on large datasets
-        for row in query.yield_per(100):
-            yield Candlestick(
-                product_id=row.product_id,
-                timeframe=row.timeframe,
-                timestamp=row.timestamp,
-                open=row.open,
-                high=row.high,
-                low=row.low,
-                close=row.close,
-                volume=row.volume
-            )
-
     def run(self):
         # 0. Registration Check
         self._ensure_strategies_registered()
@@ -70,7 +50,7 @@ class BacktestRunner:
             print("⚠️ No strategies added. Exiting.")
             return
 
-        # 1. Setup Backtest Session
+        # 1. Setup Backtest Session (Isolation)
         primary_strategy_id = self._strategies_buffer[0].strategy_id
         summary = BacktestResultSummary(
             strategy_id=primary_strategy_id,
@@ -83,7 +63,7 @@ class BacktestRunner:
         self.db_session.commit()
         print(f"📝 Backtest Session Created: ID {summary.id}")
 
-        # 2. Setup Engine with Backtest Repo
+        # 2. Setup Engine with Backtest Repo (Repository Pattern)
         repo = BacktestOrderRepository(self.db_session, summary.id)
         self.engine = StrategyEngine(self.db_session, self.clock, order_repository=repo)
         
@@ -92,8 +72,19 @@ class BacktestRunner:
 
         print(f"🚀 Starting Backtest for {self.product_id} [{self.start_time} - {self.end_time}]")
         count = 0
+        
+        # Use Junior's loader if available, otherwise fallback logic could go here
+        # But we assume Junior did his job.
+        candle_gen = get_candles_generator(
+            self.data_session, 
+            self.product_id, 
+            self.timeframe, 
+            self.start_time, 
+            self.end_time
+        )
+
         try:
-            for candle in self.fetch_candles():
+            for candle in candle_gen:
                 # 3. Update Clock
                 self.clock.set_time(candle.timestamp / 1000)
                 
@@ -110,15 +101,13 @@ class BacktestRunner:
 
 if __name__ == "__main__":
     # Example usage
-    # Note: Ensure DB has data before running
     runner = BacktestRunner(
-        start_time=1704067200000, # 2024-01-01
-        end_time=1704153600000,   # 2024-01-02
+        start_time=1704067200000, 
+        end_time=1704153600000,
         product_id="BINANCE:BTCUSDT-PERP",
         timeframe="1m"
     )
-    # Import a strategy to test
-    from src.strategies.example import RandomStrategy
-    strategy = RandomStrategy("backtest_strat", "BINANCE:BTCUSDT-PERP")
+    from src.strategies.golden_cross import GoldenCrossStrategy
+    strategy = GoldenCrossStrategy("backtest_strat", "BINANCE:BTCUSDT-PERP")
     runner.add_strategy(strategy)
     runner.run()
