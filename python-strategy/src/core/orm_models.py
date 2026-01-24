@@ -107,3 +107,27 @@ class SignalAudit(Base):
     order_id = Column(String, nullable=True)
 
     details_json = Column(Text, nullable=True)
+
+
+class BacktestResultSummary(Base):
+    __tablename__ = 'backtest_result_summary'
+    id = Column(BigInteger, primary_key=True, autoincrement=True)
+    strategy_id = Column(String, ForeignKey('strategy.id'), nullable=False)
+    start_time = Column(BigInteger, nullable=False)
+    end_time = Column(BigInteger, nullable=False)
+    total_pnl = Column(Numeric, nullable=False)
+    metrics_json = Column(Text, nullable=True) # Using Text for JSONB compatibility in generic ORM
+
+class BacktestTradeLog(Base):
+    __tablename__ = 'backtest_trade_log'
+    id = Column(String, primary_key=True)
+    session_id = Column(BigInteger, ForeignKey('backtest_result_summary.id'), nullable=False)
+    order_id = Column(String, nullable=False)
+    exchange_trade_id = Column(String, nullable=True)
+    product_id = Column(String, ForeignKey('product.id'), nullable=False)
+    side = Column(String, nullable=False)
+    price = Column(Numeric, nullable=False)
+    quantity = Column(Numeric, nullable=False)
+    fee = Column(Numeric, nullable=True)
+    fee_asset = Column(String, nullable=True)
+    timestamp = Column(BigInteger, nullable=False)
