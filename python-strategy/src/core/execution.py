@@ -7,10 +7,16 @@ from src.core.order_manager import OrderManager
 from src.core.exchange_adapter import ExchangeAdapter
 from src.core.clock import Clock
 from src.core.simulation import SlippageModel
+from src.core.interfaces import IOrderRepository
 
 class ExecutionEngine:
-    def __init__(self, db_session: Session, clock: Clock):
-        self.order_manager = OrderManager(db_session, clock)
+    def __init__(self, db_session: Session, clock: Clock, order_repository: Optional[IOrderRepository] = None):
+        if order_repository:
+            self.order_manager = OrderManager(order_repository, clock)
+        else:
+            from src.core.repositories import LiveOrderRepository
+            self.order_manager = OrderManager(LiveOrderRepository(db_session), clock)
+            
         self.default_quantity = Decimal("0.01")
         self.slippage_model = SlippageModel()
         self.adapter: Optional[ExchangeAdapter] = None

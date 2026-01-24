@@ -1,5 +1,5 @@
 import json
-from typing import List, Union, Optional
+from typing import List, Union, Optional, Dict
 from sqlalchemy.orm import Session
 from src.core.models import Candlestick, Trade, Signal, SignalType
 from src.core.orm_models import SignalAudit, Strategy as StrategyModel
@@ -7,20 +7,23 @@ from src.strategies.base import BaseStrategy
 from src.core.risk_manager import RiskManager, AccountService
 from src.core.execution import ExecutionEngine
 from src.core.clock import Clock
+from src.core.interfaces import IOrderRepository
 
 class StrategyEngine:
-    def __init__(self, db_session: Session, clock: Clock):
+    def __init__(self, db_session: Session, clock: Clock, order_repository: Optional[IOrderRepository] = None):
         self.db = db_session
         self.clock = clock
-        self.strategies: List[BaseStrategy] = []
+        self.strategies: Dict[str, List[BaseStrategy]] = {} # Key: product_id
         # Initialize Services
         self.account_service = AccountService()
         self.risk_manager = RiskManager(self.account_service)
-        self.execution_engine = ExecutionEngine(db_session, clock)
+        self.execution_engine = ExecutionEngine(db_session, clock, order_repository)
 
     def add_strategy(self, strategy: BaseStrategy):
-        self.strategies.append(strategy)
-        print(f"Registered strategy: {strategy.strategy_id}")
+        if strategy.product_id not in self.strategies:
+            self.strategies[strategy.product_id] = []
+        self.strategies[strategy.product_id].append(strategy)
+        print(f"Registered strategy: {strategy.strategy_id} for {strategy.product_id}")
 
     def on_market_data(self, data: Union[Candlestick, Trade]):
         """
@@ -31,8 +34,9 @@ class StrategyEngine:
             return
 
         candle = data
-        # Dispatch to all strategies
-        for strategy in self.strategies:
+        # Dispatch to strategies for this product
+        strategies = self.strategies.get(candle.product_id, [])
+        for strategy in strategies:
             try:
                 signal = strategy.on_candle(candle)
                 self.process_signal(signal, candle)

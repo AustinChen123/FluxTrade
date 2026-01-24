@@ -4,12 +4,11 @@ from src.strategies.base import BaseStrategy
 
 class RandomStrategy(BaseStrategy):
     def __init__(self, strategy_id: str, product_id: str):
-        super().__init__(strategy_id)
-        self.target_product_id = product_id
+        super().__init__(strategy_id, product_id)
 
     def on_candle(self, candle: Candlestick) -> Signal:
         # Only process relevant product
-        if candle.product_id != self.target_product_id:
+        if candle.product_id != self.product_id:
             return Signal(
                 strategy_id=self.strategy_id,
                 product_id=candle.product_id,
