@@ -8,7 +8,7 @@ use tracing::{error, info, warn};
 #[allow(dead_code)]
 pub struct WebSocketManager {
     pub url: String,
-    pub max_retries: u32,
+    pub max_retries: Option<u32>,
     pub initial_backoff: Duration,
 }
 
@@ -17,7 +17,7 @@ impl WebSocketManager {
     pub fn new(url: &str) -> Self {
         Self {
             url: url.to_string(),
-            max_retries: 5,
+            max_retries: None, // Default to infinite retries
             initial_backoff: Duration::from_secs(1),
         }
     }
@@ -60,20 +60,24 @@ impl WebSocketManager {
                 Err(e) => {
                     retries += 1;
                     error!(
-                        "WebSocket error (attempt {}/{}): {}",
-                        retries, self.max_retries, e
+                        "WebSocket error (attempt {}): {}",
+                        retries, e
                     );
 
-                    if retries >= self.max_retries {
-                        bail!(
-                            "Max retries reached for WebSocket connection to {}",
-                            self.url
-                        );
+                    if let Some(max) = self.max_retries {
+                        if retries >= max {
+                            bail!(
+                                "Max retries reached for WebSocket connection to {}",
+                                self.url
+                            );
+                        }
                     }
 
-                    warn!("Reconnecting in {:?}", backoff);
+                    warn!("HealthStatus: Disconnected/Paused. Reconnecting in {:?}", backoff);
                     sleep(backoff).await;
-                    backoff *= 2; // Exponential backoff
+                    if backoff < Duration::from_secs(60) {
+                        backoff *= 2; // Exponential backoff up to 60s cap
+                    }
                 }
             }
         }
@@ -188,7 +192,7 @@ mod tests {
     async fn test_websocket_manager_retry() {
         let url = "ws://127.0.0.1:1"; // Non-existent port to force failure
         let mut manager = WebSocketManager::new(url);
-        manager.max_retries = 2;
+        manager.max_retries = Some(2);
         manager.initial_backoff = Duration::from_millis(10);
 
         let result = manager
