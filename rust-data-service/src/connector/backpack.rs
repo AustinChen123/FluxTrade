@@ -10,6 +10,9 @@ use serde_json::{json, Value};
 use tokio::sync::mpsc;
 use tokio_tungstenite::tungstenite::protocol::Message;
 use tracing::{error, info, warn};
+use ring::signature::Ed25519KeyPair;
+use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 pub struct BackpackConnector {
     exchange_id: String,
@@ -23,7 +26,68 @@ impl BackpackConnector {
         }
     }
 
-        fn parse_iso8601_to_ms(iso: &str) -> Result<i64> {
+    #[allow(dead_code)]
+    pub async fn cancel_all_orders(&self) -> Result<()> {
+        let api_key = std::env::var("EXCHANGE_API_KEY").context("EXCHANGE_API_KEY not set")?;
+        let secret = std::env::var("EXCHANGE_SECRET").context("EXCHANGE_SECRET not set")?;
+
+        let timestamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_millis()
+            .to_string();
+        let window = "5000";
+        let instruction = "cancelAllOrders";
+
+        // Construct payload for signing: alphabetical order
+        // instruction=cancelAllOrders&timestamp=...&window=5000
+        let payload = format!(
+            "instruction={}&timestamp={}&window={}",
+            instruction, timestamp, window
+        );
+
+        // Decode secret
+        let secret_bytes = BASE64.decode(&secret).context("Failed to decode secret")?;
+        
+        // Create KeyPair (Assuming secret is a 32-byte seed or 64-byte keypair)
+        let key_pair = Ed25519KeyPair::from_seed_unchecked(&secret_bytes)
+            .or_else(|_| Ed25519KeyPair::from_pkcs8(&secret_bytes))
+             .map_err(|_| anyhow::anyhow!("Invalid Ed25519 secret key"))?;
+
+        // Sign
+        let signature = key_pair.sign(payload.as_bytes());
+        let signature_base64 = BASE64.encode(signature.as_ref());
+
+        info!("Watchdog: Executing cancelAllOrders on Backpack...");
+
+        let client = reqwest::Client::new();
+        let response = client
+            .delete("https://api.backpack.exchange/api/v1/orders")
+            .query(&[
+                ("instruction", instruction),
+                ("timestamp", &timestamp),
+                ("window", window),
+            ])
+            .header("X-API-Key", api_key)
+            .header("X-Timestamp", timestamp)
+            .header("X-Window", window)
+            .header("X-Signature", signature_base64)
+            .header("Content-Type", "application/json")
+            .send()
+            .await?;
+
+        if response.status().is_success() {
+            info!("Watchdog: Successfully cancelled all orders on Backpack.");
+        } else {
+            let text = response.text().await?;
+            error!("Watchdog: Failed to cancel orders: {}", text);
+            anyhow::bail!("Failed to cancel orders: {}", text);
+        }
+
+        Ok(())
+    }
+
+    fn parse_iso8601_to_ms(iso: &str) -> Result<i64> {
 
             // Backpack returns "2026-01-22T21:19:00" or similar.
 

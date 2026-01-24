@@ -3,6 +3,7 @@ mod connector;
 mod historical;
 mod model;
 mod publisher;
+mod watchdog;
 
 use crate::aggregator::CandleAggregator;
 use crate::connector::backpack::BackpackConnector;
@@ -101,6 +102,15 @@ async fn run_live_mode() -> anyhow::Result<()> {
 
     let (trade_tx, mut trade_rx) = mpsc::channel(1000);
     let (candle_tx, mut candle_rx) = mpsc::channel(1000);
+
+    // Start Watchdog
+    let watchdog_redis_url = redis_url.clone();
+    tokio::spawn(async move {
+        match crate::watchdog::Watchdog::new(&watchdog_redis_url) {
+            Ok(wd) => wd.run().await,
+            Err(e) => error!("Failed to initialize Watchdog: {}", e),
+        }
+    });
 
     // 1. Start Aggregator Task (Optional for now, but wired up)
     let mut aggregator = CandleAggregator::new();

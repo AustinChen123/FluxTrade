@@ -1735,6 +1735,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "async-trait",
+ "base64",
  "chrono",
  "clap",
  "csv",
@@ -1742,6 +1743,7 @@ dependencies = [
  "futures-util",
  "redis",
  "reqwest",
+ "ring",
  "rust_decimal",
  "rust_decimal_macros",
  "rustls 0.23.36",
