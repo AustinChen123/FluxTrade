@@ -1,6 +1,4 @@
-import time
 from typing import Generator
-from sqlalchemy.orm import Session
 from src.core.db import SessionLocal
 from src.core.orm_models import Candlestick as CandlestickORM, Strategy as StrategyORM
 from src.core.models import Candlestick

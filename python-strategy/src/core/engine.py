@@ -1,8 +1,8 @@
 import json
-from typing import List, Union, Optional
+from typing import List, Union
 from sqlalchemy.orm import Session
 from src.core.models import Candlestick, Trade, Signal, SignalType
-from src.core.orm_models import SignalAudit, Strategy as StrategyModel
+from src.core.orm_models import SignalAudit
 from src.strategies.base import BaseStrategy
 from src.core.risk_manager import RiskManager, AccountService
 from src.core.execution import ExecutionEngine
