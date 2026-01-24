@@ -98,7 +98,14 @@ def calculate_metrics(trade_history: List[Trade]) -> Dict:
         equity_curve.append(total_pnl)
 
     # Metrics Calculation
-    win_rate = (wins / (wins + losses)) if (wins + losses) > 0 else 0.0
+    total_trades = wins + losses
+    win_rate = (wins / total_trades) if total_trades > 0 else 0.0
+    
+    # Calculate Profit Factor and Avg Trade
+    gross_profit = sum(p for p in trade_pnls if p > 0)
+    gross_loss = abs(sum(p for p in trade_pnls if p < 0))
+    profit_factor = (gross_profit / gross_loss) if gross_loss > 0 else float('inf')
+    avg_trade = (total_pnl / total_trades) if total_trades > 0 else 0.0
     
     # Max Drawdown
     equity_series = pd.Series(equity_curve)
@@ -106,17 +113,20 @@ def calculate_metrics(trade_history: List[Trade]) -> Dict:
     drawdown = equity_series - rolling_max
     max_drawdown = drawdown.min()
     
-    # Sharpe Ratio (Simplified: Mean Trade PnL / Std Dev Trade PnL)
-    sharpe = 0.0
+    # Trade-based Sharpe Ratio
+    trade_sharpe = 0.0
     if len(trade_pnls) > 1:
         returns = np.array(trade_pnls)
         std_dev = np.std(returns)
         if std_dev != 0:
-            sharpe = np.mean(returns) / std_dev
+            trade_sharpe = np.mean(returns) / std_dev
 
     return {
         "total_pnl": Decimal(f"{total_pnl:.2f}"),
         "max_drawdown": Decimal(f"{max_drawdown:.2f}"),
-        "sharpe_ratio": float(f"{sharpe:.2f}"),
-        "win_rate": float(f"{win_rate:.2f}")
+        "trade_sharpe": float(f"{trade_sharpe:.2f}"),
+        "win_rate": float(f"{win_rate:.2f}"),
+        "profit_factor": float(f"{profit_factor:.2f}"),
+        "avg_trade": float(f"{avg_trade:.2f}"),
+        "total_trades": total_trades
     }

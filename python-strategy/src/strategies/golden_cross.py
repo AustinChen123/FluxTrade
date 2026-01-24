@@ -6,8 +6,7 @@ from src.core.models import Candlestick, Signal, SignalType
 
 class GoldenCrossStrategy(BaseStrategy):
     def __init__(self, strategy_id: str, product_id: str, short_window: int = 50, long_window: int = 200):
-        super().__init__(strategy_id)
-        self.product_id = product_id
+        super().__init__(strategy_id, product_id)
         self.short_window = short_window
         self.long_window = long_window
         # History for Event-Driven
