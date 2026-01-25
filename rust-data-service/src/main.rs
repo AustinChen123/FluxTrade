@@ -28,7 +28,14 @@ struct Cli {
 #[derive(Subcommand)]
 enum Commands {
     /// Runs the real-time data collection service
-    Live,
+    Live {
+        /// Optional: Comma separated exchanges to enable (e.g. binance,backpack)
+        #[arg(short, long)]
+        exchange: Option<String>,
+        /// Optional: Comma separated symbols to subscribe (e.g. BTCUSDT,SOLUSDC)
+        #[arg(short, long)]
+        symbol: Option<String>,
+    },
     /// Downloads historical data
     Backfill {
         /// Exchange to download from (binance, bybit)
@@ -61,8 +68,8 @@ async fn main() -> anyhow::Result<()> {
 
     let cli = Cli::parse();
 
-    match cli.command.unwrap_or(Commands::Live) {
-        Commands::Live => run_live_mode().await?,
+    match cli.command.unwrap_or(Commands::Live { exchange: None, symbol: None }) {
+        Commands::Live { exchange, symbol } => run_live_mode(exchange, symbol).await?,
         Commands::Backfill {
             exchange,
             symbol,
@@ -87,7 +94,7 @@ async fn run_backfill_mode(
     crate::historical::run_backfill(exchange, symbol, start, end).await
 }
 
-async fn run_live_mode() -> anyhow::Result<()> {
+async fn run_live_mode(exchange_opt: Option<String>, symbol_opt: Option<String>) -> anyhow::Result<()> {
     info!("🚀 FluxTrade Data Service Starting (Live Mode)...");
 
     let redis_url = format!(
@@ -116,9 +123,12 @@ async fn run_live_mode() -> anyhow::Result<()> {
     let mut aggregator = CandleAggregator::new();
 
     // 2. Start Data Collection Pipeline
-    let enabled_exchanges =
-        std::env::var("EXCHANGE_ENABLED").unwrap_or_else(|_| "binance,bybit,backpack".into());
-    let symbols = vec!["BTCUSDT".to_string(), "SOLUSDC".to_string()]; // Default symbols
+    let enabled_exchanges = exchange_opt.unwrap_or_else(|| {
+        std::env::var("EXCHANGE_ENABLED").unwrap_or_else(|_| "binance,bybit,backpack".into())
+    });
+    
+    let symbols_str = symbol_opt.unwrap_or_else(|| "BTCUSDT,SOLUSDC".into());
+    let symbols: Vec<String> = symbols_str.split(',').map(|s| s.trim().to_uppercase()).collect();
 
     for ex in enabled_exchanges.split(',') {
         let trade_tx = trade_tx.clone();

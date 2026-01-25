@@ -63,7 +63,7 @@ class OrderManager:
         order.filled_price = fill_price
         self.repo.update_order(order)
         
-        # 2. Atomic Execution via Redis Lua (PY-602)
+        # 2. Atomic Execution via Redis Lua
         # "Atomic Execution (Mandatory)... If Lua script returns error... throw Fatal Exception"
         
         trade_id = str(uuid.uuid4())

@@ -34,7 +34,7 @@ class ExecutionEngine:
                 # 1. REST Adapter
                 self.adapter = ExchangeAdapter(exchange_id, api_key, secret, testnet)
                 
-                # 2. WebSocket Connector (PY-603)
+                # 2. WebSocket Connector
                 self.ws_connector = WebSocketOrderConnector(api_key, secret, exchange_id, testnet)
                 self.ws_connector.start()
                 
@@ -73,30 +73,26 @@ class ExecutionEngine:
         if self.adapter:
             # REAL EXECUTION
             try:
-                # Attempt WebSocket First (PY-603)
+                # Attempt WebSocket First
                 ws_success = False
-                if self.ws_connector and order_type.lower() == 'market':
-                    # WS currently only implemented for Market in this scope logic
-                    ws_success = self.ws_connector.place_order(
-                        symbol=signal.product_id,
-                        side=side,
-                        quantity=float(self.default_quantity),
-                        price=float(limit_price) if limit_price else 0.0,
-                        order_type=order_type
-                    )
+                if self.ws_connector and self.ws_connector.is_connected(exchange_id):
+                    print(f"🚀 Sending order via WebSocket ({exchange_id})...")
+                    if order_type.lower() == 'market':
+                        # WS currently only implemented for Market in this scope logic
+                        ws_success = self.ws_connector.place_order(
+                            symbol=signal.product_id,
+                            side=side,
+                            quantity=float(self.default_quantity),
+                            price=float(limit_price) if limit_price else 0.0,
+                            order_type=order_type
+                        )
                 
                 if ws_success:
-                    print(f"🚀 WS Order Sent: {order.id}")
-                    # Note: WS is async, we don't have exchange_id yet. 
-                    # Real impl would wait for execution report.
-                    # For now, we assume success and update DB.
-                    self.order_manager.update_exchange_order_id(order, f"ws_{order.id[:8]}")
+                    print(f"✅ WS Order success: {order.id}")
                     return order.id
                 else:
-                    # Fallback to REST
-                    if self.ws_connector:
-                        print("⚠️ WS Order failed or not available. Falling back to REST.")
-                    
+                    # FALLBACK TO REST
+                    print(f"🔌 WebSocket unavailable/failed. Falling back to REST for {order.id}")
                     response = self.adapter.create_order(
                         symbol=signal.product_id,
                         type='market', # Default to market for now

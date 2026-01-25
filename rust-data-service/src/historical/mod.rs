@@ -54,10 +54,13 @@ pub async fn run_backfill(
 
     // 4. Setup Downloader
     let client = Client::new();
-    let downloader = match exchange.to_lowercase().as_str() {
+    let downloader: Arc<dyn HistoricalDownloader + Send + Sync> = match exchange.to_lowercase().as_str() {
         "binance" => Arc::new(BinanceDownloader::new(client)),
+        "backpack" => Arc::new(BackpackDownloader::new(client)),
         _ => return Err(anyhow!("Unsupported exchange: {}", exchange)),
     };
+
+    let product_id = format!("{}:{}-PERP", exchange.to_uppercase(), symbol.to_uppercase());
 
     // 5. Hybrid Logic: Determine S3 vs REST
     let now = Utc::now();
@@ -66,8 +69,8 @@ pub async fn run_backfill(
 
     let semaphore = Arc::new(Semaphore::new(5));
 
-    // S3 Backfill (Monthly)
-    if start_ts < s3_boundary_ts {
+    // S3 Backfill (Monthly) - Only supported by Binance for now
+    if exchange.to_lowercase() == "binance" && start_ts < s3_boundary_ts {
         let s3_end = end_ts.min(s3_boundary_ts - 1);
         info!("Starting S3 backfill from {} to {}", start_ts, s3_end);
         
@@ -105,7 +108,7 @@ pub async fn run_backfill(
 
             s3_tasks.push(tokio::spawn(async move {
                 let _permit = semaphore.acquire().await.unwrap();
-                process_s3_month(&downloader, &pool, &symbol, year, month, start_ts, end_ts).await
+                process_s3_month(downloader, pool, symbol, year, month, start_ts, end_ts).await
             }));
 
             // Increment month
@@ -125,8 +128,14 @@ pub async fn run_backfill(
     }
 
     // REST Backfill (Chunks) for the remaining range
-    if end_ts >= s3_boundary_ts {
-        let rest_start = start_ts.max(s3_boundary_ts);
+    // If not Binance, or if range is in the current month
+    let rest_start = if exchange.to_lowercase() == "binance" {
+        start_ts.max(s3_boundary_ts)
+    } else {
+        start_ts
+    };
+
+    if rest_start < end_ts {
         info!("Starting REST backfill from {} to {}", rest_start, end_ts);
 
         let interval_ms = 60000;
@@ -153,7 +162,7 @@ pub async fn run_backfill(
                 
                 tokio::spawn(async move {
                     let _permit = semaphore.acquire().await.unwrap();
-                    process_chunk(&downloader, &pool, &product_id, c_start, c_end).await
+                    process_chunk(downloader, pool, product_id, c_start, c_end).await
                 })
             })
             .buffer_unordered(5);
@@ -171,16 +180,24 @@ pub async fn run_backfill(
     Ok(())
 }
 
+#[async_trait::async_trait]
+trait HistoricalDownloader {
+    async fn fetch_candles(&self, product_id: &str, start_time: i64, end_time: i64) -> Result<Vec<Candlestick>>;
+    async fn fetch_from_s3(&self, _symbol: &str, _year: i32, _month: u32) -> Result<Vec<Candlestick>> {
+        Ok(Vec::new())
+    }
+}
+
 async fn process_s3_month(
-    downloader: &BinanceDownloader,
-    pool: &Pool<Postgres>,
-    symbol: &str,
+    downloader: Arc<dyn HistoricalDownloader + Send + Sync>,
+    pool: Pool<Postgres>,
+    symbol: String,
     year: i32,
     month: u32,
     start_ts: i64,
     end_ts: i64,
 ) -> Result<usize> {
-    let mut candles = downloader.fetch_from_s3(symbol, year, month).await?;
+    let mut candles = downloader.fetch_from_s3(&symbol, year, month).await?;
     if candles.is_empty() {
         return Ok(0);
     }
@@ -192,25 +209,25 @@ async fn process_s3_month(
         return Ok(0);
     }
 
-    insert_candles(pool, &mut candles).await
+    insert_candles(&pool, &mut candles).await
 }
 
 async fn process_chunk(
-    downloader: &BinanceDownloader,
-    pool: &Pool<Postgres>,
-    product_id: &str,
+    downloader: Arc<dyn HistoricalDownloader + Send + Sync>,
+    pool: Pool<Postgres>,
+    product_id: String,
     start_ts: i64,
     end_ts: i64,
 ) -> Result<usize> {
     let mut candles = downloader
-        .fetch_candles(product_id, start_ts, end_ts)
+        .fetch_candles(&product_id, start_ts, end_ts)
         .await?;
     
     if candles.is_empty() {
         return Ok(0);
     }
 
-    insert_candles(pool, &mut candles).await
+    insert_candles(&pool, &mut candles).await
 }
 
 async fn insert_candles(
@@ -296,10 +313,12 @@ impl BinanceDownloader {
             base_url: "https://fapi.binance.com".to_string(),
         }
     }
+}
 
+#[async_trait::async_trait]
+impl HistoricalDownloader for BinanceDownloader {
     async fn fetch_candles(&self, product_id: &str, start_time: i64, end_time: i64) -> Result<Vec<Candlestick>> {
         // product_id is like BINANCE:BTCUSDT-PERP
-        // Extract symbol: BTCUSDT
         let parts: Vec<&str> = product_id.split(':').collect();
         let symbol_part = parts.get(1).ok_or(anyhow!("Invalid product_id"))?;
         let symbol = symbol_part.replace("-PERP", "");
@@ -329,9 +348,7 @@ impl BinanceDownloader {
         
         let mut candles = Vec::new();
         for k in raw_data {
-            // [open_time, open, high, low, close, volume, ...]
             if k.len() < 6 { continue; }
-            
             let timestamp = k[0].as_i64().ok_or(anyhow!("Invalid timestamp"))?;
             let open = Decimal::from_str(k[1].as_str().unwrap_or("0"))?;
             let high = Decimal::from_str(k[2].as_str().unwrap_or("0"))?;
@@ -350,11 +367,10 @@ impl BinanceDownloader {
                 volume,
             });
         }
-
         Ok(candles)
     }
 
-    pub async fn fetch_from_s3(&self, symbol: &str, year: i32, month: u32) -> Result<Vec<Candlestick>> {
+    async fn fetch_from_s3(&self, symbol: &str, year: i32, month: u32) -> Result<Vec<Candlestick>> {
         let url = format!(
             "https://data.binance.vision/data/spot/monthly/klines/{symbol}/1m/{symbol}-1m-{year}-{month:02}.zip",
             symbol = symbol,
@@ -390,7 +406,6 @@ impl BinanceDownloader {
                 for result in rdr.records() {
                     let record = result?;
                     if record.len() < 6 { continue; }
-                    
                     let timestamp = record[0].parse::<i64>()?;
                     let open = Decimal::from_str(&record[1])?;
                     let high = Decimal::from_str(&record[2])?;
@@ -411,9 +426,89 @@ impl BinanceDownloader {
                 }
             }
         }
-        
         Ok(candles)
     }
+}
+
+struct BackpackDownloader {
+    client: Client,
+    base_url: String,
+}
+
+impl BackpackDownloader {
+    fn new(client: Client) -> Self {
+        Self {
+            client,
+            base_url: "https://api.backpack.exchange".to_string(),
+        }
+    }
+}
+
+#[async_trait::async_trait]
+impl HistoricalDownloader for BackpackDownloader {
+    async fn fetch_candles(&self, product_id: &str, start_time: i64, end_time: i64) -> Result<Vec<Candlestick>> {
+        let parts: Vec<&str> = product_id.split(':').collect();
+        let symbol_part = parts.get(1).ok_or(anyhow!("Invalid product_id"))?;
+        let symbol = symbol_part.replace("-PERP", "");
+
+        let url = format!("{}/api/v1/klines", self.base_url);
+        
+        let params = [
+            ("symbol", symbol.as_str()),
+            ("interval", "1m"),
+            ("startTime", &(start_time / 1000).to_string()),
+            ("endTime", &(end_time / 1000).to_string()),
+        ];
+
+        let resp = self.client.get(&url)
+            .query(&params)
+            .send()
+            .await?;
+
+        if !resp.status().is_success() {
+            let status = resp.status();
+            let text = resp.text().await?;
+            return Err(anyhow!("Backpack API Error {}: {}", status, text));
+        }
+
+        let raw_data: Vec<Value> = resp.json().await?;
+        let mut candles = Vec::new();
+        for k in raw_data {
+            let timestamp = if let Some(s) = k.get("start").and_then(|v| v.as_str()) {
+                parse_iso8601_to_ms(s)?
+            } else {
+                continue;
+            };
+
+            let open = Decimal::from_str(k.get("open").and_then(|v| v.as_str()).unwrap_or("0"))?;
+            let high = Decimal::from_str(k.get("high").and_then(|v| v.as_str()).unwrap_or("0"))?;
+            let low = Decimal::from_str(k.get("low").and_then(|v| v.as_str()).unwrap_or("0"))?;
+            let close = Decimal::from_str(k.get("close").and_then(|v| v.as_str()).unwrap_or("0"))?;
+            let volume = Decimal::from_str(k.get("volume").and_then(|v| v.as_str()).unwrap_or("0"))?;
+
+            candles.push(Candlestick {
+                product_id: product_id.to_string(),
+                timeframe: "1m".to_string(),
+                timestamp,
+                open,
+                high,
+                low,
+                close,
+                volume,
+            });
+        }
+        Ok(candles)
+    }
+}
+
+fn parse_iso8601_to_ms(iso: &str) -> Result<i64> {
+    let rfc = if iso.contains('Z') || iso.contains('+') { 
+        iso.to_string() 
+    } else { 
+        format!("{}Z", iso) 
+    };
+    let dt = rfc.parse::<DateTime<Utc>>()?;
+    Ok(dt.timestamp_millis())
 }
 
 async fn ensure_product_exists(

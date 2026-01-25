@@ -14,6 +14,10 @@ class BaseStrategy(ABC):
         """
         pass
 
+    def on_trade(self, trade: Trade) -> Optional[Signal]:
+        """Optional: Strategies can override to react to individual trades."""
+        return None
+
     def run_vectorized(self, df: pd.DataFrame) -> pd.DataFrame:
         """
         Run strategy in vectorized mode using Pandas.

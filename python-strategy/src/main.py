@@ -20,7 +20,7 @@ def main():
     clock = RealtimeClock()
     engine = StrategyEngine(db_session=db_session, clock=clock)
     
-    # PY-603: Run Startup Checks (System State & Heartbeat)
+    # Run Startup Checks (System State & Heartbeat)
     engine.startup()
     
     # 2. Register Strategies
@@ -28,7 +28,7 @@ def main():
     strategy_1 = RandomStrategy(strategy_id="strategy_1", product_id="BINANCE:BTCUSDT-PERP")
     engine.add_strategy(strategy_1)
     
-    # 3. Initialize Data Consumer (PY-601: Redis Streams)
+    # 3. Initialize Data Consumer (Redis Streams)
     # Subscribe to market data streams
     channels = ["stream:market:binance:btcusdt"]
     consumer = DataConsumer(channels=channels, on_message_callback=engine.on_market_data)

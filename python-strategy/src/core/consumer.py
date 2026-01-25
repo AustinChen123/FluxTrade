@@ -55,7 +55,7 @@ class DataConsumer:
                     if not messages:
                         continue
 
-                    # 2. Conflation Logic (PY-601)
+                    # 2. Conflation Logic
                     # Check the timestamp of the *latest* message in this batch
                     # Note: ID format is "timestamp-sequence"
                     last_msg_id, _ = messages[-1]
@@ -65,74 +65,101 @@ class DataConsumer:
                     lag = server_time_ms - last_msg_ts
                     
                     if lag > 100:
-                        # Lag > 100ms: DROP backlog
-                        print(f"⚠️  LAG DETECTED ({lag}ms > 100ms) on {stream_key}. Dropping backlog & Jumping to $. {len(messages)} msgs skipped.")
+                        # Lag > 100ms: CONFLATE backlog
+                        print(f"⚠️  LAG DETECTED ({lag}ms > 100ms) on {stream_key}. Conflating {len(messages)} msgs.")
                         
-                        # ACK all messages in this batch (so they are not pending)
+                        # 1. Ack all
                         msg_ids = [mid for mid, _ in messages]
-                        if msg_ids:
-                            self.redis_client.xack(stream_key, self.group_name, *msg_ids)
+                        self.redis_client.xack(stream_key, self.group_name, *msg_ids)
+                        
+                        # 2. Synthesize Batch
+                        # We take the latest message as the template, but accumulate volume and track H/L
+                        synthesized_model = None
+                        total_qty = Decimal("0")
+                        max_price = Decimal("-Infinity")
+                        min_price = Decimal("Infinity")
+
+                        for _, m_data in messages:
+                            m_model = self._parse_message(stream_key, m_data)
+                            if not m_model: continue
                             
-                        # Reset ID to '$' (latest) to skip any other pending backlog on server
-                        # Note: XREADGROUP with '>' already gives new, but if we are behind, 
-                        # we might want to skip everything currently in the stream.
-                        # However, xgroup_setid affects *future* reads. 
-                        # We just ACK'd the current batch. The 'backlog' might be larger.
-                        # To truly 'jump to $', we set the group id.
+                            if isinstance(m_model, Trade):
+                                total_qty += m_model.quantity
+                                max_price = max(max_price, m_model.price)
+                                min_price = min(min_price, m_model.price)
+                            elif isinstance(m_model, Candlestick):
+                                total_qty += m_model.volume
+                                max_price = max(max_price, m_model.high)
+                                min_price = min(min_price, m_model.low)
+                            
+                            synthesized_model = m_model # Keep latest as base
+
+                        if synthesized_model:
+                            # Update with accumulated values
+                            if isinstance(synthesized_model, Trade):
+                                synthesized_model.quantity = total_qty
+                            elif isinstance(synthesized_model, Candlestick):
+                                synthesized_model.volume = total_qty
+                                synthesized_model.high = max_price
+                                synthesized_model.low = min_price
+                            
+                            self.callback(synthesized_model)
+
+                        # Jump to latest
                         self.redis_client.xgroup_setid(stream_key, self.group_name, '$')
                         continue
 
-                    # 3. Process Messages
+                    # 3. Process Messages Normally
                     for message_id, data in messages:
                         try:
-                            # Map Stream Data to Model
-                            # Expected keys: 'type' (trade/candle), 'data' (json) or fields
-                            # Assuming the producer sends JSON in 'data' field or fields map
-                            # For PY-602 compatibility, we might receive raw fields. 
-                            # But legacy adapter might send 'data'. 
-                            # Let's handle both or assume standard format.
-                            # Instructions say: "Stream Key: stream:market:{exchange}:{symbol}"
-                            
-                            # Auto-detect content
-                            payload = None
-                            if 'data' in data:
-                                payload = data['data']
-                                if stream_key.endswith('.trades') or 'trade' in stream_key:
-                                    model = Trade.model_validate_json(payload)
-                                else:
-                                    model = Candlestick.model_validate_json(payload)
-                            else:
-                                # Handle raw fields (PY-602 XADD format)
-                                # "strategy_id", "product_id", "side", "price", "quantity", "timestamp"
-                                if 'price' in data and 'quantity' in data:
-                                     # This looks like a Trade
-                                     model = Trade(
-                                         id=data.get('trade_id', message_id),
-                                         order_id=data.get('order_id', ''),
-                                         exchange_trade_id=message_id,
-                                         product_id=data.get('product_id', 'unknown'),
-                                         side=data.get('side', 'BUY'),
-                                         price=Decimal(data['price']),
-                                         quantity=Decimal(data['quantity']),
-                                         fee=Decimal("0"),
-                                         fee_asset="USDT",
-                                         timestamp=int(data.get('timestamp', 0))
-                                     )
-                                else:
-                                    # Skip unknown format
-                                    continue
-
-                            self.callback(model)
-                            
-                            # ACK processed message
-                            self.redis_client.xack(stream_key, self.group_name, message_id)
-                            
+                            model = self._parse_message(stream_key, data)
+                            if model:
+                                self.callback(model)
+                                self.redis_client.xack(stream_key, self.group_name, message_id)
                         except Exception as e:
-                            print(f"Error processing {message_id} on {stream_key}: {e}")
+                            print(f"Error processing {message_id}: {e}")
 
         except KeyboardInterrupt:
             self.stop()
         except Exception as e:
             print(f"Stream Consumer Error: {e}")
-            # Crash on critical error (Watchdog will restart)
             raise e
+
+    def _parse_message(self, stream_key: str, data: dict) -> Union[Candlestick, Trade, None]:
+        """Helper to parse raw stream data into models."""
+        try:
+            # Check if JSON payload exists (from Rust XADD)
+            if 'json' in data:
+                payload = data['json']
+                # Determine type by keys in JSON
+                import json
+                parsed = json.loads(payload)
+                if 'open' in parsed:
+                    return Candlestick.model_validate_json(payload)
+                else:
+                    return Trade.model_validate_json(payload)
+            
+            # Handle raw fields (Manual XADD)
+            if 'price' in data and 'quantity' in data:
+                return Trade(
+                    id=data.get('trade_id', 'unknown'),
+                    product_id=data.get('product_id', 'unknown'),
+                    side=data.get('side', 'BUY'),
+                    price=Decimal(data['price']),
+                    quantity=Decimal(data['quantity']),
+                    timestamp=int(data.get('timestamp', 0))
+                )
+            return None
+        except Exception as e:
+            print(f"Parse error: {e}")
+            return None
+
+        def stop(self):
+
+            self.running = False
+
+            self.redis_client.close()
+
+            print("DataConsumer stopped.")
+
+    
