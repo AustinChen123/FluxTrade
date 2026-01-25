@@ -1,4 +1,8 @@
 import json
+import os
+import time
+import threading
+import redis
 from typing import List, Union, Optional, Dict
 from sqlalchemy.orm import Session
 from src.core.models import Candlestick, Trade, Signal, SignalType
@@ -9,6 +13,10 @@ from src.core.execution import ExecutionEngine
 from src.core.clock import Clock
 from src.core.interfaces import IOrderRepository
 
+# Redis Config
+REDIS_HOST = os.getenv('REDIS_HOST', 'localhost')
+REDIS_PORT = int(os.getenv('REDIS_PORT', 6379))
+
 class StrategyEngine:
     def __init__(self, db_session: Session, clock: Clock, order_repository: Optional[IOrderRepository] = None):
         self.db = db_session
@@ -18,6 +26,54 @@ class StrategyEngine:
         self.account_service = AccountService()
         self.risk_manager = RiskManager(self.account_service)
         self.execution_engine = ExecutionEngine(db_session, clock, order_repository)
+        
+        # System State & Heartbeat (PY-603)
+        self.redis_client = redis.Redis(host=REDIS_HOST, port=REDIS_PORT, decode_responses=True)
+        self.running = True
+        self.heartbeat_thread = None
+
+    def startup(self):
+        """
+        Runs startup checks and starts background services.
+        """
+        self._check_system_state()
+        self._start_heartbeat()
+
+    def _check_system_state(self):
+        """
+        Checks 'system:state'. If 'LOCKDOWN', enters a paused loop.
+        """
+        print("🔍 Checking System State...")
+        while True:
+            try:
+                state = self.redis_client.get("system:state")
+                if state == "LOCKDOWN":
+                    print("⚠️  SYSTEM LOCKED (LOCKDOWN). Waiting for manual resume...")
+                    time.sleep(5)
+                else:
+                    print(f"✅ System State: {state or 'OK'}. Proceeding.")
+                    break
+            except Exception as e:
+                print(f"❌ Error checking system state: {e}. Retrying...")
+                time.sleep(2)
+
+    def _start_heartbeat(self):
+        """
+        Starts the heartbeat background thread.
+        """
+        def heartbeat_loop():
+            print("💓 Heartbeat Service Started.")
+            while self.running:
+                try:
+                    # TTL 3 seconds, Update every 1s
+                    self.redis_client.setex("heartbeat:python", 3, "1")
+                    time.sleep(1.0)
+                except Exception as e:
+                    print(f"💓 Heartbeat Failed: {e}")
+                    time.sleep(1.0)
+        
+        self.heartbeat_thread = threading.Thread(target=heartbeat_loop, daemon=True)
+        self.heartbeat_thread.start()
 
     def add_strategy(self, strategy: BaseStrategy):
         if strategy.product_id not in self.strategies:

@@ -5,6 +5,7 @@ from sqlalchemy.orm import Session
 from src.core.models import Signal, SignalType, Candlestick
 from src.core.order_manager import OrderManager
 from src.core.exchange_adapter import ExchangeAdapter
+from src.core.ws_connector import WebSocketOrderConnector
 from src.core.clock import Clock
 from src.core.simulation import SlippageModel
 from src.core.interfaces import IOrderRepository
@@ -20,8 +21,9 @@ class ExecutionEngine:
         self.default_quantity = Decimal("0.01")
         self.slippage_model = SlippageModel()
         self.adapter: Optional[ExchangeAdapter] = None
+        self.ws_connector: Optional[WebSocketOrderConnector] = None
         
-        # Try to initialize Real Exchange Adapter
+        # Try to initialize Real Exchange Adapter & WS Connector
         api_key = os.getenv('EXCHANGE_API_KEY')
         secret = os.getenv('EXCHANGE_SECRET')
         exchange_id = os.getenv('EXCHANGE_ID', 'binance')
@@ -29,15 +31,21 @@ class ExecutionEngine:
         
         if api_key and secret:
             try:
+                # 1. REST Adapter
                 self.adapter = ExchangeAdapter(exchange_id, api_key, secret, testnet)
+                
+                # 2. WebSocket Connector (PY-603)
+                self.ws_connector = WebSocketOrderConnector(api_key, secret, exchange_id, testnet)
+                self.ws_connector.start()
+                
             except Exception as e:
-                print(f"⚠️  Execution: Failed to init ExchangeAdapter ({e}). Fallback to Mock.")
+                print(f"⚠️  Execution: Failed to init Exchange Connectivity ({e}). Fallback to Mock.")
         else:
             print("⚠️  Execution: No API Key found. Running in Mock Mode.")
 
     def execute_signal(self, signal: Signal, candle: Optional[Candlestick] = None) -> Optional[str]:
         """
-        Converts Signal to Order and executes it (Mock).
+        Converts Signal to Order and executes it (WS -> REST -> Mock).
         Returns the order_id if successful.
         """
         side = self._determine_side(signal.type)
@@ -65,16 +73,39 @@ class ExecutionEngine:
         if self.adapter:
             # REAL EXECUTION
             try:
-                # CCXT requires float
-                response = self.adapter.create_order(
-                    symbol=signal.product_id,
-                    type='market', # Default to market for now
-                    side=side,
-                    amount=float(self.default_quantity)
-                )
-                print(f"✅ Real Order Placed: {response['id']}")
-                self.order_manager.update_exchange_order_id(order, str(response['id']))
-                return order.id
+                # Attempt WebSocket First (PY-603)
+                ws_success = False
+                if self.ws_connector and order_type.lower() == 'market':
+                    # WS currently only implemented for Market in this scope logic
+                    ws_success = self.ws_connector.place_order(
+                        symbol=signal.product_id,
+                        side=side,
+                        quantity=float(self.default_quantity),
+                        price=float(limit_price) if limit_price else 0.0,
+                        order_type=order_type
+                    )
+                
+                if ws_success:
+                    print(f"🚀 WS Order Sent: {order.id}")
+                    # Note: WS is async, we don't have exchange_id yet. 
+                    # Real impl would wait for execution report.
+                    # For now, we assume success and update DB.
+                    self.order_manager.update_exchange_order_id(order, f"ws_{order.id[:8]}")
+                    return order.id
+                else:
+                    # Fallback to REST
+                    if self.ws_connector:
+                        print("⚠️ WS Order failed or not available. Falling back to REST.")
+                    
+                    response = self.adapter.create_order(
+                        symbol=signal.product_id,
+                        type='market', # Default to market for now
+                        side=side,
+                        amount=float(self.default_quantity)
+                    )
+                    print(f"✅ REST Order Placed: {response['id']}")
+                    self.order_manager.update_exchange_order_id(order, str(response['id']))
+                    return order.id
             except Exception as e:
                 print(f"❌ Real Execution Failed: {e}")
                 return None
