@@ -47,16 +47,19 @@ pub async fn run_backfill(
 
     info!("Connected to Database");
 
-    // 3. Setup Downloader
+    let product_id = format!("{}:{}-PERP", exchange.to_uppercase(), symbol.to_uppercase());
+
+    // 3. Ensure Product and Exchange exist in DB
+    ensure_product_exists(&pool, &exchange, &symbol, &product_id).await?;
+
+    // 4. Setup Downloader
     let client = Client::new();
     let downloader = match exchange.to_lowercase().as_str() {
         "binance" => Arc::new(BinanceDownloader::new(client)),
         _ => return Err(anyhow!("Unsupported exchange: {}", exchange)),
     };
 
-    let product_id = format!("{}:{}-PERP", exchange.to_uppercase(), symbol.to_uppercase());
-    
-    // 4. Hybrid Logic: Determine S3 vs REST
+    // 5. Hybrid Logic: Determine S3 vs REST
     let now = Utc::now();
     let first_day_current_month = NaiveDate::from_ymd_opt(now.year(), now.month(), 1).unwrap();
     let s3_boundary_ts = Utc.from_utc_datetime(&first_day_current_month.and_hms_opt(0, 0, 0).unwrap()).timestamp_millis();
@@ -411,4 +414,39 @@ impl BinanceDownloader {
         
         Ok(candles)
     }
+}
+
+async fn ensure_product_exists(
+    pool: &Pool<Postgres>,
+    exchange: &str,
+    symbol: &str,
+    product_id: &str,
+) -> Result<()> {
+    // 1. Ensure exchange exists
+    sqlx::query("INSERT INTO exchange (id, name) VALUES ($1, $2) ON CONFLICT (id) DO NOTHING")
+        .bind(exchange.to_uppercase())
+        .bind(exchange.to_lowercase())
+        .execute(pool)
+        .await?;
+
+    // 2. Parse base/quote from symbol
+    let (base, quote) = if symbol.ends_with("USDT") {
+        (symbol.replace("USDT", ""), "USDT".to_string())
+    } else if symbol.ends_with("USDC") {
+        (symbol.replace("USDC", ""), "USDC".to_string())
+    } else {
+        (symbol.to_string(), "USDT".to_string())
+    };
+
+    // 3. Ensure product exists
+    sqlx::query("INSERT INTO product (id, exchange_id, base_asset, quote_asset) VALUES ($1, $2, $3, $4) ON CONFLICT (id) DO NOTHING")
+        .bind(product_id)
+        .bind(exchange.to_uppercase())
+        .bind(base)
+        .bind(quote)
+        .execute(pool)
+        .await?;
+
+    info!("Product verified/registered: {}", product_id);
+    Ok(())
 }
