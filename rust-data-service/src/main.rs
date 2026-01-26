@@ -347,39 +347,57 @@ async fn run_live_mode(exchange_opt: Option<String>, symbol_opt: Option<String>)
 
             }
 
-            "backpack" => {
+                        "backpack" => {
 
-                tokio::spawn(async move {
+                            tokio::spawn(async move {
 
-                    let mut conn = BackpackConnector::new();
+                                let mut conn = BackpackConnector::new();
 
-                    info!("Starting Backpack Connector...");
+                                info!("Starting Backpack Connector...");
 
-                    // Backpack symbols often use underscore
+                                // Backpack symbols often use underscore
 
-                    let backpack_symbols = vec!["BTC_USDC".to_string(), "SOL_USDC".to_string()];
+                                let backpack_symbols = vec!["BTC_USDC".to_string(), "SOL_USDC".to_string()];
 
-                    if let Err(e) = conn.subscribe_trades(&backpack_symbols, trade_tx).await {
+                                if let Err(e) = conn.subscribe_trades(&backpack_symbols, trade_tx).await {
 
-                        error!("Backpack trades error: {}", e);
+                                    error!("Backpack trades error: {}", e);
 
-                    }
+                                }
 
-                    if let Err(e) = conn
+                                if let Err(e) = conn
 
-                        .subscribe_candles(&backpack_symbols, "1m", candle_tx)
+                                    .subscribe_candles(&backpack_symbols, "1m", candle_tx)
 
-                        .await
+                                    .await
 
-                    {
+                                {
 
-                        error!("Backpack candles error: {}", e);
+                                    error!("Backpack candles error: {}", e);
 
-                    }
+                                }
 
-                });
+                                // Start User Stream if API Key is present
 
-            }
+                                if std::env::var("EXCHANGE_API_KEY").is_ok() && std::env::var("EXCHANGE_SECRET").is_ok() {
+
+                                     if let Err(e) = conn.subscribe_user_stream(user_tx).await {
+
+                                         error!("Backpack user stream error: {}", e);
+
+                                     }
+
+                                } else {
+
+                                    info!("Backpack API Key/Secret not found, skipping User Data Stream");
+
+                                }
+
+                            });
+
+                        }
+
+            
 
             _ => warn!("Unknown exchange in EXCHANGE_ENABLED: {}", ex),
 

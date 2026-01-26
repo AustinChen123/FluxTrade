@@ -1,6 +1,6 @@
 use crate::connector::ws::WebSocketManager;
 use crate::connector::ExchangeConnector;
-use crate::model::{Candlestick, OrderBook, Trade};
+use crate::model::{AccountUpdate, Candlestick, OrderBook, PositionUpdate, Trade, UserStreamEvent};
 use anyhow::{Context, Result};
 use async_trait::async_trait;
 use chrono::DateTime;
@@ -26,6 +26,21 @@ impl BackpackConnector {
         }
     }
 
+    fn sign(instruction: &str, timestamp: &str, window: &str, secret: &str) -> Result<String> {
+        let payload = format!(
+            "instruction={}&timestamp={}&window={}",
+            instruction, timestamp, window
+        );
+
+        let secret_bytes = BASE64.decode(secret).context("Failed to decode secret")?;
+        let key_pair = Ed25519KeyPair::from_seed_unchecked(&secret_bytes)
+            .or_else(|_| Ed25519KeyPair::from_pkcs8(&secret_bytes))
+             .map_err(|_| anyhow::anyhow!("Invalid Ed25519 secret key"))?;
+
+        let signature = key_pair.sign(payload.as_bytes());
+        Ok(BASE64.encode(signature.as_ref()))
+    }
+
     #[allow(dead_code)]
     pub async fn cancel_all_orders(&self) -> Result<()> {
         let api_key = std::env::var("EXCHANGE_API_KEY").context("EXCHANGE_API_KEY not set")?;
@@ -39,24 +54,7 @@ impl BackpackConnector {
         let window = "5000";
         let instruction = "cancelAllOrders";
 
-        // Construct payload for signing: alphabetical order
-        // instruction=cancelAllOrders&timestamp=...&window=5000
-        let payload = format!(
-            "instruction={}&timestamp={}&window={}",
-            instruction, timestamp, window
-        );
-
-        // Decode secret
-        let secret_bytes = BASE64.decode(&secret).context("Failed to decode secret")?;
-        
-        // Create KeyPair (Assuming secret is a 32-byte seed or 64-byte keypair)
-        let key_pair = Ed25519KeyPair::from_seed_unchecked(&secret_bytes)
-            .or_else(|_| Ed25519KeyPair::from_pkcs8(&secret_bytes))
-             .map_err(|_| anyhow::anyhow!("Invalid Ed25519 secret key"))?;
-
-        // Sign
-        let signature = key_pair.sign(payload.as_bytes());
-        let signature_base64 = BASE64.encode(signature.as_ref());
+        let signature_base64 = Self::sign(instruction, &timestamp, window, &secret)?;
 
         info!("Watchdog: Executing cancelAllOrders on Backpack...");
 
@@ -83,6 +81,117 @@ impl BackpackConnector {
             error!("Watchdog: Failed to cancel orders: {}", text);
             anyhow::bail!("Failed to cancel orders: {}", text);
         }
+
+        Ok(())
+    }
+
+    #[allow(dead_code)]
+    pub async fn subscribe_user_stream(
+        &self,
+        tx: mpsc::Sender<UserStreamEvent>,
+    ) -> Result<()> {
+        let api_key = std::env::var("EXCHANGE_API_KEY").context("EXCHANGE_API_KEY not set")?;
+        let secret = std::env::var("EXCHANGE_SECRET").context("EXCHANGE_SECRET not set")?;
+
+        let url = "wss://ws.backpack.exchange/";
+        let ws_manager = WebSocketManager::new(url);
+        let connector_id = self.exchange_id.clone();
+
+        info!("Subscribing to Backpack User Stream");
+
+        tokio::spawn(async move {
+            let res = ws_manager
+                .connect_with_retry(
+                    |mut ws| {
+                        let api_key = api_key.clone();
+                        let secret = secret.clone();
+                        async move {
+                            let timestamp = SystemTime::now()
+                                .duration_since(UNIX_EPOCH)
+                                .unwrap()
+                                .as_millis()
+                                .to_string();
+                            let window = "5000";
+                            let instruction = "subscribe";
+                            
+                            let signature = match Self::sign(instruction, &timestamp, window, &secret) {
+                                Ok(s) => s,
+                                Err(e) => return Err(anyhow::anyhow!(e)),
+                            };
+
+                            let sub = json!({
+                                "method": "SUBSCRIBE",
+                                "params": ["account.update"],
+                                "signature": [api_key, signature, timestamp, window]
+                            });
+
+                            ws.send(Message::Text(sub.to_string().into()))
+                                .await
+                                .map_err(|e| anyhow::anyhow!(e))?;
+                            Ok((ws, Ok(())))
+                        }
+                    },
+                    |msg| {
+                        let tx = tx.clone();
+                        let connector_id = connector_id.clone();
+                        async move {
+                            if let Message::Text(text) = msg {
+                                let v: Value = serde_json::from_str(&text)?;
+                                if let Some(data) = v.get("data") {
+                                    if data.get("e") == Some(&Value::String("account.update".to_string())) {
+                                        let timestamp = v.get("T").and_then(|t| t.as_i64()).unwrap_or(0); // Assuming T is common
+
+                                        // Process Balances
+                                        if let Some(balances) = data.get("B").and_then(|b| b.as_object()) {
+                                            for (asset, info) in balances {
+                                                let available = info.get("available").and_then(|v| v.as_str()).unwrap_or("0");
+                                                let locked = info.get("locked").and_then(|v| v.as_str()).unwrap_or("0");
+                                                
+                                                let avail_dec: Decimal = available.parse().unwrap_or(Decimal::ZERO);
+                                                let locked_dec: Decimal = locked.parse().unwrap_or(Decimal::ZERO);
+                                                
+                                                let update = AccountUpdate {
+                                                    exchange: connector_id.clone(),
+                                                    asset: asset.to_string(),
+                                                    balance: avail_dec + locked_dec,
+                                                    timestamp,
+                                                };
+                                                tx.send(UserStreamEvent::Account(update)).await.ok();
+                                            }
+                                        }
+
+                                        // Process Positions
+                                        if let Some(positions) = data.get("P").and_then(|p| p.as_array()) {
+                                            for p in positions {
+                                                let symbol = p.get("s").and_then(|v| v.as_str()).unwrap_or_default();
+                                                let amount = p.get("n").and_then(|v| v.as_str()).unwrap_or("0"); // n = net size
+                                                let entry_price = p.get("e").and_then(|v| v.as_str()).unwrap_or("0"); // e = entry
+                                                let upnl = p.get("u").and_then(|v| v.as_str()).unwrap_or("0"); // u = upnl
+                                                
+                                                let update = PositionUpdate {
+                                                    exchange: connector_id.clone(),
+                                                    symbol: symbol.to_string(),
+                                                    amount: amount.parse().unwrap_or(Decimal::ZERO),
+                                                    entry_price: entry_price.parse().unwrap_or(Decimal::ZERO),
+                                                    unrealized_pnl: upnl.parse().unwrap_or(Decimal::ZERO),
+                                                    timestamp,
+                                                };
+                                                tx.send(UserStreamEvent::Position(update)).await.ok();
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                            Ok(())
+                        }
+                    },
+                )
+                .await;
+
+            if let Err(e) = res {
+                error!("Backpack User Stream failed: {}", e);
+            }
+        });
 
         Ok(())
     }
