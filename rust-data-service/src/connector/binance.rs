@@ -1,10 +1,12 @@
 use crate::connector::ws::WebSocketManager;
 use crate::connector::ExchangeConnector;
-use crate::model::{Candlestick, OrderBook, Trade};
+use crate::model::{AccountUpdate, Candlestick, OrderBook, PositionUpdate, Trade, UserStreamEvent};
 use anyhow::{Context, Result};
 use async_trait::async_trait;
 use rust_decimal::Decimal;
 use serde_json::Value;
+use std::env;
+use std::time::Duration;
 use tokio::sync::mpsc;
 use tokio_tungstenite::tungstenite::protocol::Message;
 use tracing::{error, info, warn};
@@ -13,6 +15,8 @@ use tracing::{error, info, warn};
 pub struct BinanceConnector {
     ws_manager: WebSocketManager,
     exchange_id: String,
+    http_client: reqwest::Client,
+    base_url: String,
 }
 
 impl BinanceConnector {
@@ -21,7 +25,127 @@ impl BinanceConnector {
         Self {
             ws_manager: WebSocketManager::new("wss://fstream.binance.com/ws"),
             exchange_id: "BINANCE".to_string(),
+            http_client: reqwest::Client::new(),
+            base_url: "https://fapi.binance.com".to_string(),
         }
+    }
+
+    async fn get_listen_key(&self, api_key: &str) -> Result<String> {
+        let url = format!("{}/fapi/v1/listenKey", self.base_url);
+        let res = self
+            .http_client
+            .post(&url)
+            .header("X-MBX-APIKEY", api_key)
+            .send()
+            .await?
+            .json::<Value>()
+            .await?;
+
+        res.get("listenKey")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string())
+            .context("Failed to get listenKey from response")
+    }
+
+    #[allow(dead_code)]
+    pub async fn subscribe_user_stream(
+        &self,
+        tx: mpsc::Sender<UserStreamEvent>,
+    ) -> Result<()> {
+        let api_key = env::var("BINANCE_API_KEY").context("BINANCE_API_KEY not set")?;
+        let listen_key = self.get_listen_key(&api_key).await?;
+        info!("Obtained Binance ListenKey: {}", listen_key);
+
+        // Spawn Keep-Alive Task
+        let http_client = self.http_client.clone();
+        let base_url = self.base_url.clone();
+        let api_key_keep = api_key.clone();
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(Duration::from_secs(1800)); // 30 mins
+            loop {
+                interval.tick().await;
+                let url = format!("{}/fapi/v1/listenKey", base_url);
+                match http_client
+                    .put(&url)
+                    .header("X-MBX-APIKEY", &api_key_keep)
+                    .send()
+                    .await
+                {
+                    Ok(_) => info!("Refreshed Binance ListenKey"),
+                    Err(e) => error!("Failed to refresh ListenKey: {}", e),
+                }
+            }
+        });
+
+        // Connect to WS
+        let url = format!("wss://fstream.binance.com/ws/{}", listen_key);
+        let ws_manager = WebSocketManager::new(&url);
+        let exchange_id = self.exchange_id.clone();
+
+        info!("Subscribing to Binance User Stream");
+
+        tokio::spawn(async move {
+            let res = ws_manager
+                .connect_with_retry(
+                    |ws| async { Ok((ws, Ok(()))) },
+                    |msg| {
+                        let tx = tx.clone();
+                        let exchange_id = exchange_id.clone();
+                        async move {
+                            if let Message::Text(text) = msg {
+                                let v: Value = serde_json::from_str(&text)?;
+                                if let Some(event) = v.get("e").and_then(|e| e.as_str()) {
+                                    if event == "ACCOUNT_UPDATE" {
+                                        if let Some(a) = v.get("a") {
+                                            // Process Balances
+                                            if let Some(balances) = a.get("B").and_then(|b| b.as_array()) {
+                                                for b in balances {
+                                                    let asset = b.get("a").and_then(|v| v.as_str()).unwrap_or_default();
+                                                    let wallet_balance = b.get("wb").and_then(|v| v.as_str()).unwrap_or("0");
+                                                    let update = AccountUpdate {
+                                                        exchange: exchange_id.clone(),
+                                                        asset: asset.to_string(),
+                                                        balance: wallet_balance.parse().unwrap_or(Decimal::ZERO),
+                                                        timestamp: v.get("E").and_then(|t| t.as_i64()).unwrap_or(0),
+                                                    };
+                                                    tx.send(UserStreamEvent::Account(update)).await.ok();
+                                                }
+                                            }
+                                            // Process Positions
+                                            if let Some(positions) = a.get("P").and_then(|p| p.as_array()) {
+                                                for p in positions {
+                                                    let symbol = p.get("s").and_then(|v| v.as_str()).unwrap_or_default();
+                                                    let amount = p.get("pa").and_then(|v| v.as_str()).unwrap_or("0");
+                                                    let entry_price = p.get("ep").and_then(|v| v.as_str()).unwrap_or("0");
+                                                    let upnl = p.get("up").and_then(|v| v.as_str()).unwrap_or("0");
+                                                    
+                                                    let update = PositionUpdate {
+                                                        exchange: exchange_id.clone(),
+                                                        symbol: symbol.to_string(),
+                                                        amount: amount.parse().unwrap_or(Decimal::ZERO),
+                                                        entry_price: entry_price.parse().unwrap_or(Decimal::ZERO),
+                                                        unrealized_pnl: upnl.parse().unwrap_or(Decimal::ZERO),
+                                                        timestamp: v.get("E").and_then(|t| t.as_i64()).unwrap_or(0),
+                                                    };
+                                                    tx.send(UserStreamEvent::Position(update)).await.ok();
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                            Ok(())
+                        }
+                    },
+                )
+                .await;
+
+            if let Err(e) = res {
+                error!("Binance User Stream failed: {}", e);
+            }
+        });
+
+        Ok(())
     }
 
     #[allow(dead_code)]
