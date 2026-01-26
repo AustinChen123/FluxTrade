@@ -1,4 +1,4 @@
-use crate::model::{Candlestick, Trade};
+use crate::model::{AccountUpdate, Candlestick, PositionUpdate, Trade};
 use anyhow::Result;
 use redis::AsyncCommands;
 use serde::Serialize;
@@ -20,6 +20,43 @@ impl RedisPublisher {
     pub async fn connect(&mut self) -> Result<()> {
         let conn = self.client.get_multiplexed_async_connection().await?;
         self.conn = Some(conn);
+        Ok(())
+    }
+
+    #[allow(dead_code)]
+    pub async fn update_account_balance(&mut self, update: &AccountUpdate) -> Result<()> {
+        self.ensure_connected().await?;
+        if let Some(conn) = &mut self.conn {
+            let key = format!("account:balance:{}", update.asset);
+            // Set the balance key (String)
+            let _: () = conn.set(&key, update.balance.to_string()).await?;
+            
+            // Also publish to the stream channel
+            let payload = serde_json::to_string(update)?;
+            let _: () = conn.publish("stream.user.updates", payload).await?;
+        }
+        Ok(())
+    }
+
+    #[allow(dead_code)]
+    pub async fn update_position(&mut self, update: &PositionUpdate) -> Result<()> {
+        self.ensure_connected().await?;
+        if let Some(conn) = &mut self.conn {
+            let key = format!("account:positions:{}", update.symbol);
+            // Set the position hash
+            let _: () = conn.hset_multiple(
+                &key,
+                &[
+                    ("size", update.amount.to_string()),
+                    ("entry_price", update.entry_price.to_string()),
+                    ("pnl", update.unrealized_pnl.to_string()),
+                ],
+            ).await?;
+
+            // Also publish to the stream channel
+            let payload = serde_json::to_string(update)?;
+            let _: () = conn.publish("stream.user.updates", payload).await?;
+        }
         Ok(())
     }
 

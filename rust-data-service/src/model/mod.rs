@@ -124,3 +124,27 @@ pub struct Level {
     pub price: Decimal,
     pub quantity: Decimal,
 }
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AccountUpdate {
+    pub exchange: String,
+    pub asset: String,
+    pub balance: Decimal,
+    pub timestamp: i64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PositionUpdate {
+    pub exchange: String,
+    pub symbol: String,
+    pub amount: Decimal,
+    pub entry_price: Decimal,
+    pub unrealized_pnl: Decimal,
+    pub timestamp: i64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum UserStreamEvent {
+    Account(AccountUpdate),
+    Position(PositionUpdate),
+}
