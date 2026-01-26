@@ -1,77 +1,77 @@
 # FluxTrade
 
-FluxTrade 是一個高效能、基於微服務架構的加密貨幣自動交易系統。設計目標為實現低延遲數據處理、靈活的策略執行以及即時的風險控管。
+FluxTrade is a high-performance, microservices-based automated cryptocurrency trading system. It is designed for low-latency data processing, flexible strategy execution, and real-time risk management.
 
-🌍 **Documentation**: [English Developer Guide](docs/en/developer_guide.md) | [繁體中文開發者指南](docs/zh-TW/developer_guide.md) | [快速上手 (User Guide)](docs/user_guide.md)
+🌍 **Documentation**: [繁體中文 README](README.zh-TW.md) | [English Developer Guide](docs/en/developer_guide.md) | [User Guide](docs/user_guide.md)
 
-## ✨ 核心特色 (Features)
+## ✨ Features
 
-*   **🚀 Rust 核心數據引擎**: 極低延遲的 WebSocket 數據攝取與 K 線聚合，確保策略永遠運行在最新數據上。
-*   **🐍 Python 熱插拔策略**: 使用熟悉的 Python 語法編寫策略，支援動態載入與即時回填 (Backfill)，無需重啟系統。
-*   **🛡️ 安全優先風控**: 內建強制市價單防護與即時餘額檢查 (Redis-backed Risk Manager)，保障資金安全。
-*   **📊 完整可觀測性**: 整合 Streamlit 儀表板，提供即時 PnL、持倉監控與策略狀態視覺化。
+*   **🚀 Rust Core Data Engine**: Ultra-low latency WebSocket data ingestion and candlestick aggregation, ensuring strategies always run on the freshest data.
+*   **🐍 Python Hot-Plug Strategies**: Write strategies in familiar Python with support for dynamic loading and automated backfilling—no system restart required.
+*   **🛡️ Safety-First Risk Management**: Built-in forced market order protection and real-time balance checks (Redis-backed Risk Manager) to safeguard your capital.
+*   **📊 Full Observability**: Integrated Streamlit dashboard providing real-time PnL monitoring, position tracking, and strategy status visualization.
 
-## 系統架構
+## System Architecture
 
-系統由三個核心服務組成：
+The system consists of three core services:
 
 1.  **Rust Data Service**: 
-    - 負責與交易所 (Binance, Bybit, Backpack) 建立 WebSocket 連線。
-    - 即時標準化 Market Data (Trades, Candles) 並發布至 Redis Pub/Sub。
-    - 實作高效能的 K 線聚合 (Aggregator)。
+    - Manages WebSocket connections to exchanges (Binance, Bybit, Backpack).
+    - Standardizes real-time market data (Trades, Candles) and publishes to Redis Pub/Sub.
+    - Implements high-performance candlestick aggregation.
 
 2.  **Python Strategy Service**:
-    - 訂閱 Redis 數據流。
-    - 執行交易策略 (Strategy Engine)。
-    - 進行風險檢查 (Risk Manager) 與訂單管理 (Order Manager)。
-    - 支援回測與模擬執行。
+    - Subscribes to Redis data streams.
+    - Runs the Strategy Engine for execution logic.
+    - Performs risk checks (Risk Manager) and order management (Order Manager).
+    - Supports backtesting and simulation modes.
 
 3.  **Dashboard (Python/Streamlit)**:
-    - 提供即時市場概況、交易歷史與風險監控介面。
-    - 用於驗證策略邏輯與視覺化數據。
+    - Provides real-time market overview, trade history, and risk monitoring interface.
+    - Used for visualizing strategy performance and system health.
 
-## 環境設定 (Configuration)
+## Configuration
 
-本專案使用 `.env` 檔案進行環境變數管理。
+This project uses a `.env` file for environment variable management.
 
-1.  **複製範例檔案**：
+1.  **Copy the template**:
     ```bash
     cp .env.example .env
     ```
 
-2.  **設定變數說明**：
-    打開 `.env` 檔案並填入您的配置：
+2.  **Configuration details**:
+    Open the `.env` file and fill in your settings:
 
-    *   **資料庫設定 (PostgreSQL)**
-        *   `POSTGRES_USER`: 資料庫使用者名稱 (預設: fluxtrade)
-        *   `POSTGRES_PASSWORD`: 資料庫密碼
-        *   `POSTGRES_DB`: 資料庫名稱
-        *   `POSTGRES_HOST`: 主機 (本地開發使用 localhost)
+    *   **Database (PostgreSQL)**
+        *   `POSTGRES_USER`: Database username (Default: fluxtrade)
+        *   `POSTGRES_PASSWORD`: Database password
+        *   `POSTGRES_DB`: Database name
+        *   `POSTGRES_HOST`: Host (Use localhost for local dev)
     
-    *   **快取設定 (Redis)**
-        *   `REDIS_HOST`: Redis 主機 (預設: localhost)
+    *   **Cache (Redis)**
+        *   `REDIS_HOST`: Redis host (Default: localhost)
         
-    *   **交易所設定 (Exchange)**
-        *   `EXCHANGE_ID`: 主要交易平台 (例如: binance)
-        *   `EXCHANGE_API_KEY`: 您的 API Key
-        *   `EXCHANGE_SECRET`: 您的 API Secret
-        *   `EXCHANGE_TESTNET`: 是否使用測試網 (true/false)
+    *   **Exchange Settings**
+        *   `EXCHANGE_ID`: Target exchange (e.g., binance)
+        *   `EXCHANGE_API_KEY`: Your API Key
+        *   `EXCHANGE_SECRET`: Your API Secret
+        *   `EXCHANGE_TESTNET`: Use testnet (true/false)
 
-## 快速啟動 (Quick Start)
+## Quick Start
 
-我們推薦使用 Docker Compose 進行一鍵部署。
+We recommend using Docker Compose for a one-click deployment.
 
-1.  **啟動所有服務**
+1.  **Start all services**
     ```bash
     docker-compose -f docker-compose.prod.yml up -d
     ```
 
-2.  **訪問儀表板**
-    打開瀏覽器前往 [http://localhost:8501](http://localhost:8501)
+2.  **Access the Dashboard**
+    Open your browser and navigate to [http://localhost:8501](http://localhost:8501)
 
-3.  **停止服務**
+3.  **Stop services**
     ```bash
     docker-compose -f docker-compose.prod.yml down
     ```
 
-若需手動個別啟動服務，請參考 [使用者指南](docs/user_guide.md)。
+For manual service startup instructions, please refer to the [User Guide](docs/user_guide.md).
