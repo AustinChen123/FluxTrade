@@ -1,10 +1,18 @@
 import random
 from src.core.models import Candlestick, Signal, SignalType
-from src.strategies.base import BaseStrategy
+from src.strategies.base import BaseStrategy, StrategyRequirements
 
 class RandomStrategy(BaseStrategy):
     def __init__(self, strategy_id: str, product_id: str):
         super().__init__(strategy_id, product_id)
+
+    @property
+    def requirements(self) -> StrategyRequirements:
+        return StrategyRequirements(
+            product_id=self.product_id,
+            timeframe="1m",
+            lookback_window=1
+        )
 
     def on_candle(self, candle: Candlestick) -> Signal:
         # Only process relevant product

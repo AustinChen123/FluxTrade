@@ -131,3 +131,12 @@ class BacktestTradeLog(Base):
     fee = Column(Numeric, nullable=True)
     fee_asset = Column(String, nullable=True)
     timestamp = Column(BigInteger, nullable=False)
+
+class StrategyState(Base):
+    __tablename__ = 'strategy_state'
+    strategy_id = Column(String, primary_key=True)
+    status = Column(String, nullable=False)
+    config_json = Column(Text, nullable=True)
+    performance_json = Column(Text, nullable=True)
+    last_heartbeat = Column(BigInteger, nullable=True)
+    uptime_start = Column(BigInteger, nullable=True)

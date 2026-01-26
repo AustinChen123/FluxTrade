@@ -1,7 +1,7 @@
 import pandas as pd
 from typing import Deque
 from collections import deque
-from src.strategies.base import BaseStrategy
+from src.strategies.base import BaseStrategy, StrategyRequirements
 from src.core.models import Candlestick, Signal, SignalType
 
 class GoldenCrossStrategy(BaseStrategy):
@@ -11,6 +11,14 @@ class GoldenCrossStrategy(BaseStrategy):
         self.long_window = long_window
         # History for Event-Driven
         self.close_history: Deque[float] = deque(maxlen=long_window + 1)
+
+    @property
+    def requirements(self) -> StrategyRequirements:
+        return StrategyRequirements(
+            product_id=self.product_id,
+            timeframe="1h",
+            lookback_window=self.long_window
+        )
 
     def run_vectorized(self, df: pd.DataFrame) -> pd.DataFrame:
         """
