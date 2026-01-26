@@ -42,7 +42,9 @@ end
 
 -- 2. Update Position
 local current_pos_qty = tonumber(redis.call("HGET", position_key, "quantity") or "0")
+local current_entry_price = tonumber(redis.call("HGET", position_key, "entry_price") or "0")
 local new_pos_qty = 0
+local new_entry_price = current_entry_price
 
 if side == "BUY" then
     new_pos_qty = current_pos_qty + quantity
@@ -55,7 +57,30 @@ else
     redis.call("HINCRBYFLOAT", balance_key, "used", -release_amt) -- Release lock
 end
 
+-- Calculate Average Entry Price
+if current_pos_qty == 0 then
+    -- Opening new position
+    new_entry_price = price
+elseif (current_pos_qty > 0 and side == "BUY") or (current_pos_qty < 0 and side == "SELL") then
+    -- Increasing size (same side)
+    local total_val = (math.abs(current_pos_qty) * current_entry_price) + (quantity * price)
+    local total_qty = math.abs(current_pos_qty) + quantity
+    new_entry_price = total_val / total_qty
+elseif (current_pos_qty > 0 and side == "SELL") or (current_pos_qty < 0 and side == "BUY") then
+    -- Decreasing size
+    if math.abs(new_pos_qty) < 1e-9 then -- effectively 0
+        new_entry_price = 0
+    elseif (current_pos_qty > 0 and new_pos_qty < 0) or (current_pos_qty < 0 and new_pos_qty > 0) then
+        -- Flipped side
+        new_entry_price = price
+    else
+        -- Reducing only, price stays same
+        new_entry_price = current_entry_price
+    end
+end
+
 redis.call("HSET", position_key, "quantity", new_pos_qty)
+redis.call("HSET", position_key, "entry_price", new_entry_price)
 redis.call("HSET", position_key, "last_update", timestamp)
 
 -- 3. XADD to stream:trades

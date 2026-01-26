@@ -1,16 +1,70 @@
+import os
+import redis
+import json
 from decimal import Decimal
 from typing import Optional
 from src.core.models import Signal, SignalType, Position
 
+# Redis Config
+REDIS_HOST = os.getenv('REDIS_HOST', 'localhost')
+REDIS_PORT = int(os.getenv('REDIS_PORT', 6379))
+
 class AccountService:
-    """Interface for accessing account data. Currently a Mock."""
+    """Interface for accessing account data via Redis."""
+    def __init__(self):
+        try:
+            self.redis = redis.Redis(host=REDIS_HOST, port=REDIS_PORT, decode_responses=True)
+            self.redis.ping() # Check connection
+        except Exception as e:
+            print(f"⚠️ AccountService: Redis connection failed: {e}")
+            self.redis = None
+
     def get_balance(self) -> Decimal:
-        # Mock: Return a positive balance by default
-        return Decimal("10000.0")
+        if not self.redis:
+            return Decimal("0")
+        
+        # Assuming single account 'main' for now as per Lua script usage
+        balance = self.redis.hget("state:balance:main", "free")
+        return Decimal(balance) if balance else Decimal("0")
 
     def get_position(self, strategy_id: str, product_id: str) -> Optional[Position]:
-        # Mock: Return None (no position)
-        return None
+        if not self.redis:
+            return None
+
+        key = f"state:position:{strategy_id}:{product_id}"
+        data = self.redis.hgetall(key)
+        
+        if not data:
+            return None
+
+        qty_str = data.get("quantity", "0")
+        qty = Decimal(qty_str)
+        
+        if qty == 0:
+            return None
+
+        # Determine Side & Abs Quantity
+        if qty > 0:
+            side = "LONG"
+            abs_qty = qty
+        else:
+            side = "SHORT"
+            abs_qty = abs(qty)
+
+        # Entry Price (tracked by Lua or external updater)
+        entry_price = Decimal(data.get("entry_price", "0"))
+        
+        # Unrealized PnL (Not strictly tracked in Redis Hash yet, placeholder)
+        unrealized_pnl = Decimal("0")
+
+        return Position(
+            strategy_id=strategy_id,
+            product_id=product_id,
+            side=side,
+            quantity=abs_qty,
+            entry_price=entry_price,
+            unrealized_pnl=unrealized_pnl
+        )
 
 class RiskManager:
     def __init__(self, account_service: AccountService):
