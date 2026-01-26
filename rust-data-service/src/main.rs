@@ -50,6 +50,9 @@ enum Commands {
         /// End date (YYYY-MM-DD)
         #[arg(long)]
         end: String,
+        /// Timeframe (1m, 5m, 1h, 1d) - Defaults to 1m
+        #[arg(long, default_value = "1m")]
+        timeframe: String,
     },
 }
 
@@ -75,7 +78,8 @@ async fn main() -> anyhow::Result<()> {
             symbol,
             start,
             end,
-        } => run_backfill_mode(exchange, symbol, start, end).await?,
+            timeframe,
+        } => run_backfill_mode(exchange, symbol, start, end, timeframe).await?,
     }
 
     Ok(())
@@ -86,12 +90,13 @@ async fn run_backfill_mode(
     symbol: String,
     start: String,
     end: String,
+    timeframe: String,
 ) -> anyhow::Result<()> {
     info!(
-        "Starting Backfill for {} on {} from {} to {}",
-        symbol, exchange, start, end
+        "Starting Backfill for {} on {} ({}) from {} to {}",
+        symbol, exchange, timeframe, start, end
     );
-    crate::historical::run_backfill(exchange, symbol, start, end).await
+    crate::historical::run_backfill(exchange, symbol, start, end, timeframe).await
 }
 
 async fn run_live_mode(exchange_opt: Option<String>, symbol_opt: Option<String>) -> anyhow::Result<()> {
