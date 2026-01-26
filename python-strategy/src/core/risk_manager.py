@@ -1,0 +1,100 @@
+import os
+import redis
+import json
+from decimal import Decimal
+from typing import Optional
+from src.core.models import Signal, SignalType, Position
+
+# Redis Config
+REDIS_HOST = os.getenv('REDIS_HOST', 'localhost')
+REDIS_PORT = int(os.getenv('REDIS_PORT', 6379))
+
+class AccountService:
+    """Interface for accessing account data via Redis."""
+    def __init__(self):
+        try:
+            self.redis = redis.Redis(host=REDIS_HOST, port=REDIS_PORT, decode_responses=True)
+            self.redis.ping() # Check connection
+        except Exception as e:
+            print(f"⚠️ AccountService: Redis connection failed: {e}")
+            self.redis = None
+
+    def get_balance(self) -> Decimal:
+        if not self.redis:
+            return Decimal("0")
+        
+        # Assuming single account 'main' for now as per Lua script usage
+        balance = self.redis.hget("state:balance:main", "free")
+        return Decimal(balance) if balance else Decimal("0")
+
+    def get_position(self, strategy_id: str, product_id: str) -> Optional[Position]:
+        if not self.redis:
+            return None
+
+        key = f"state:position:{strategy_id}:{product_id}"
+        data = self.redis.hgetall(key)
+        
+        if not data:
+            return None
+
+        qty_str = data.get("quantity", "0")
+        qty = Decimal(qty_str)
+        
+        if qty == 0:
+            return None
+
+        # Determine Side & Abs Quantity
+        if qty > 0:
+            side = "LONG"
+            abs_qty = qty
+        else:
+            side = "SHORT"
+            abs_qty = abs(qty)
+
+        # Entry Price (tracked by Lua or external updater)
+        entry_price = Decimal(data.get("entry_price", "0"))
+        
+        # Unrealized PnL (Not strictly tracked in Redis Hash yet, placeholder)
+        unrealized_pnl = Decimal("0")
+
+        return Position(
+            strategy_id=strategy_id,
+            product_id=product_id,
+            side=side,
+            quantity=abs_qty,
+            entry_price=entry_price,
+            unrealized_pnl=unrealized_pnl
+        )
+
+class RiskManager:
+    def __init__(self, account_service: AccountService):
+        self.account_service = account_service
+        self.max_exposure_per_product = Decimal("50000.0") # USDT
+
+    def check_risk(self, signal: Signal) -> tuple[bool, str]:
+        """
+        Evaluates the signal against risk rules.
+        Returns (True, "PASS") if safe to proceed, (False, reason) otherwise.
+        """
+        if signal.type == SignalType.NO_SIGNAL:
+            return True, "NO_SIGNAL"
+
+        # Rule 1: Zero Balance Protection
+        is_entry = signal.type in [SignalType.LONG, SignalType.SHORT]
+        balance = self.account_service.get_balance()
+        
+        if is_entry and balance <= 0:
+            msg = f"REJECT: Account balance is {balance} (<= 0)"
+            print(f"🛑 RISK {msg}. Signal {signal.type} rejected.")
+            return False, msg
+
+        # Rule 2: Max Exposure Check
+        position = self.account_service.get_position(signal.strategy_id, signal.product_id)
+        if position:
+            current_exposure = position.quantity * position.entry_price
+            if is_entry and current_exposure >= self.max_exposure_per_product:
+                 msg = f"REJECT: Max exposure reached ({current_exposure} >= {self.max_exposure_per_product})"
+                 print(f"🛑 RISK {msg}.")
+                 return False, msg
+
+        return True, "PASS"
