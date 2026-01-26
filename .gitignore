@@ -32,6 +32,7 @@ redis_data/
 .clarify/
 spec/
 work/
+python-strategy/strategies_hot/
 # Python bytecode
 *.pyc
 __pycache__/
