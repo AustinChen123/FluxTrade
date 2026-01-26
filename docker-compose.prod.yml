@@ -1,0 +1,86 @@
+services:
+  redis:
+    image: redis:alpine
+    container_name: fluxtrade-redis
+    restart: always
+    ports:
+      - "6379:6379"
+    command: redis-server --save 60 1 --loglevel warning
+
+  db:
+    image: postgres:15-alpine
+    container_name: fluxtrade-db
+    restart: always
+    environment:
+      POSTGRES_USER: fluxtrade
+      POSTGRES_PASSWORD: fluxtrade
+      POSTGRES_DB: fluxtrade
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+
+  rust-data:
+    build: 
+      context: ./rust-data-service
+      dockerfile: Dockerfile
+    container_name: fluxtrade-rust
+    restart: unless-stopped
+    depends_on:
+      - redis
+      - db
+    environment:
+      REDIS_HOST: redis
+      POSTGRES_HOST: db
+      POSTGRES_PORT: 5432
+      POSTGRES_USER: fluxtrade
+      POSTGRES_PASSWORD: fluxtrade
+      POSTGRES_DB: fluxtrade
+      EXCHANGE_ENABLED: "binance,backpack"
+      EXCHANGE_API_KEY: ${EXCHANGE_API_KEY}
+      EXCHANGE_SECRET: ${EXCHANGE_SECRET}
+    command: ["live", "--exchange", "binance", "--symbol", "BTCUSDT"]
+
+  python-strategy:
+    build:
+      context: ./python-strategy
+      dockerfile: Dockerfile
+    container_name: fluxtrade-python
+    restart: unless-stopped
+    depends_on:
+      - redis
+      - db
+      - rust-data
+    environment:
+      REDIS_HOST: redis
+      POSTGRES_HOST: db
+      POSTGRES_PORT: 5432
+      POSTGRES_USER: fluxtrade
+      POSTGRES_PASSWORD: fluxtrade
+      POSTGRES_DB: fluxtrade
+      BINANCE_API_KEY: ${BINANCE_API_KEY}
+      BINANCE_SECRET: ${BINANCE_SECRET}
+    volumes:
+      - ./python-strategy/strategies_hot:/app/strategies_hot
+
+  dashboard:
+    build:
+      context: ./dashboard
+      dockerfile: Dockerfile
+    container_name: fluxtrade-dashboard
+    restart: always
+    depends_on:
+      - redis
+      - db
+    ports:
+      - "8501:8501"
+    environment:
+      REDIS_HOST: redis
+      POSTGRES_HOST: db
+      POSTGRES_PORT: 5432
+      POSTGRES_USER: fluxtrade
+      POSTGRES_PASSWORD: fluxtrade
+      POSTGRES_DB: fluxtrade
+
+volumes:
+  postgres_data:
