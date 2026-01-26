@@ -313,6 +313,10 @@ class StrategyEngine:
         """
         Callback triggered by DataConsumer when new market data arrives.
         """
+        # Simulation/Backtest: Check for pending order fills
+        if isinstance(data, Candlestick):
+            self.execution_engine.check_open_orders(data)
+
         strategies = self.strategies.get(data.product_id, [])
         for strategy in strategies:
             try:

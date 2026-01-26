@@ -23,6 +23,9 @@ class ExecutionEngine:
         self.adapter: Optional[ExchangeAdapter] = None
         self.ws_connector: Optional[WebSocketOrderConnector] = None
         
+        # Simulation State
+        self.open_orders: list = []
+        
         # Try to initialize Real Exchange Adapter & WS Connector
         api_key = os.getenv('EXCHANGE_API_KEY')
         secret = os.getenv('EXCHANGE_SECRET')
@@ -42,6 +45,32 @@ class ExecutionEngine:
                 print(f"⚠️  Execution: Failed to init Exchange Connectivity ({e}). Fallback to Mock.")
         else:
             print("⚠️  Execution: No API Key found. Running in Mock Mode.")
+
+    def check_open_orders(self, candle: Candlestick):
+        """
+        Checks pending mock orders against the new candle.
+        """
+        if not self.open_orders:
+            return
+
+        filled_orders = []
+        for order in self.open_orders:
+            if order.product_id != candle.product_id:
+                continue
+            
+            # Check Limit Match
+            if candle.low <= order.price <= candle.high:
+                print(f"⚡ Execution: Resting Limit Order {order.id} filled at {order.price}")
+                self.order_manager.fill_order(
+                    order=order,
+                    fill_price=order.price,
+                    fill_quantity=order.quantity
+                )
+                filled_orders.append(order)
+        
+        # Remove filled
+        for order in filled_orders:
+            self.open_orders.remove(order)
 
     def execute_signal(self, signal: Signal, candle: Optional[Candlestick] = None) -> Optional[str]:
         """
@@ -75,8 +104,8 @@ class ExecutionEngine:
             try:
                 # Attempt WebSocket First
                 ws_success = False
-                if self.ws_connector and self.ws_connector.is_connected(exchange_id):
-                    print(f"🚀 Sending order via WebSocket ({exchange_id})...")
+                if self.ws_connector and self.ws_connector.is_connected(os.getenv('EXCHANGE_ID', 'binance')):
+                    print(f"🚀 Sending order via WebSocket...")
                     if order_type.lower() == 'market':
                         # WS currently only implemented for Market in this scope logic
                         ws_success = self.ws_connector.place_order(
@@ -93,12 +122,19 @@ class ExecutionEngine:
                 else:
                     # FALLBACK TO REST
                     print(f"🔌 WebSocket unavailable/failed. Falling back to REST for {order.id}")
-                    response = self.adapter.create_order(
-                        symbol=signal.product_id,
-                        type='market', # Default to market for now
-                        side=side,
-                        amount=float(self.default_quantity)
-                    )
+                    
+                    order_params = {
+                        "symbol": signal.product_id,
+                        "side": side,
+                        "amount": float(self.default_quantity),
+                        "type": order_type
+                    }
+                    if order_type == 'limit':
+                        order_params["price"] = float(limit_price)
+                        order_params["params"] = {"timeInForce": "GTC"}
+
+                    response = self.adapter.create_order(**order_params)
+                    
                     print(f"✅ REST Order Placed: {response['id']}")
                     self.order_manager.update_exchange_order_id(order, str(response['id']))
                     return order.id
@@ -118,8 +154,9 @@ class ExecutionEngine:
                 if candle.low <= limit_price <= candle.high:
                     fill_price = limit_price
                 else:
-                    print(f"⏳ Limit Order not filled. Price {limit_price} out of range [{candle.low}, {candle.high}]")
-                    return None
+                    print(f"⏳ Limit Order {order.id} placed in book. Price {limit_price} (Candle [{candle.low}, {candle.high}])")
+                    self.open_orders.append(order)
+                    return order.id
             else:
                 # Market Order
                 base_price = candle.close if candle else (signal.value if signal.value else Decimal("50000"))
