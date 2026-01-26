@@ -16,11 +16,31 @@ use crate::model::Candlestick;
 
 pub async fn run_backfill(
     exchange: String,
-    symbol: String,
+    raw_symbol: String,
     start_date: String,
     end_date: String,
+    timeframe: String,
 ) -> Result<()> {
-    // 1. Parse Dates
+    // 1. Sanitize Symbol
+    // Remove "BINANCE:" prefix if present (case insensitive)
+    let raw_upper = raw_symbol.trim().to_uppercase();
+    let no_prefix = if raw_upper.starts_with("BINANCE:") {
+        raw_upper.trim_start_matches("BINANCE:").to_string()
+    } else {
+        raw_upper
+    };
+
+    // Remove "-PERP" suffix
+    let no_suffix = no_prefix.replace("-PERP", "");
+
+    // For Binance, remove separators. 
+    let symbol = if exchange.to_lowercase() == "binance" {
+        no_suffix.replace("-", "").replace("_", "")
+    } else {
+        no_suffix
+    };
+    
+    // 1b. Parse Dates
     let start = parse_date(&start_date)?;
     let end = parse_date(&end_date)?;
     let start_ts = start.timestamp_millis();
@@ -70,9 +90,10 @@ pub async fn run_backfill(
     let semaphore = Arc::new(Semaphore::new(5));
 
     // S3 Backfill (Monthly) - Only supported by Binance for now
+    // Only attempt S3 if timeframe is standard (1m, 1h, etc) - though we pass it dynamically
     if exchange.to_lowercase() == "binance" && start_ts < s3_boundary_ts {
         let s3_end = end_ts.min(s3_boundary_ts - 1);
-        info!("Starting S3 backfill from {} to {}", start_ts, s3_end);
+        info!("Starting S3 backfill from {} to {} ({})", start_ts, s3_end, timeframe);
         
         let curr_month_start = NaiveDate::from_ymd_opt(start.year(), start.month(), 1).unwrap();
 
@@ -105,10 +126,11 @@ pub async fn run_backfill(
             let semaphore = semaphore.clone();
             let year = curr.year();
             let month = curr.month();
+            let tf = timeframe.clone();
 
             s3_tasks.push(tokio::spawn(async move {
                 let _permit = semaphore.acquire().await.unwrap();
-                process_s3_month(downloader, pool, symbol, year, month, start_ts, end_ts).await
+                process_s3_month(downloader, pool, symbol, year, month, start_ts, end_ts, &tf).await
             }));
 
             // Increment month
@@ -136,9 +158,20 @@ pub async fn run_backfill(
     };
 
     if rest_start < end_ts {
-        info!("Starting REST backfill from {} to {}", rest_start, end_ts);
+        info!("Starting REST backfill from {} to {} ({})", rest_start, end_ts, timeframe);
 
-        let interval_ms = 60000;
+        // Adjust chunk size based on timeframe to avoid hitting API limits
+        // 1m = 60000ms. If timeframe is larger, duration per candle is larger.
+        // Assuming 1000 candles limit.
+        let interval_ms = match timeframe.as_str() {
+            "1m" => 60000,
+            "5m" => 300000,
+            "15m" => 900000,
+            "1h" => 3600000,
+            "4h" => 14400000,
+            "1d" => 86400000,
+            _ => 60000, // Default to 1m size if unknown, might be inefficient but safe-ish
+        };
         let limit = 1000;
         let chunk_duration = interval_ms * limit;
         
@@ -159,10 +192,11 @@ pub async fn run_backfill(
                 let pool = pool.clone();
                 let product_id = product_id.clone();
                 let semaphore = semaphore.clone();
+                let tf = timeframe.clone();
                 
                 tokio::spawn(async move {
                     let _permit = semaphore.acquire().await.unwrap();
-                    process_chunk(downloader, pool, product_id, c_start, c_end).await
+                    process_chunk(downloader, pool, product_id, c_start, c_end, &tf).await
                 })
             })
             .buffer_unordered(5);
@@ -182,12 +216,13 @@ pub async fn run_backfill(
 
 #[async_trait::async_trait]
 trait HistoricalDownloader {
-    async fn fetch_candles(&self, product_id: &str, start_time: i64, end_time: i64) -> Result<Vec<Candlestick>>;
-    async fn fetch_from_s3(&self, _symbol: &str, _year: i32, _month: u32) -> Result<Vec<Candlestick>> {
+    async fn fetch_candles(&self, product_id: &str, start_time: i64, end_time: i64, timeframe: &str) -> Result<Vec<Candlestick>>;
+    async fn fetch_from_s3(&self, _symbol: &str, _year: i32, _month: u32, _timeframe: &str) -> Result<Vec<Candlestick>> {
         Ok(Vec::new())
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn process_s3_month(
     downloader: Arc<dyn HistoricalDownloader + Send + Sync>,
     pool: Pool<Postgres>,
@@ -196,8 +231,9 @@ async fn process_s3_month(
     month: u32,
     start_ts: i64,
     end_ts: i64,
+    timeframe: &str,
 ) -> Result<usize> {
-    let mut candles = downloader.fetch_from_s3(&symbol, year, month).await?;
+    let mut candles = downloader.fetch_from_s3(&symbol, year, month, timeframe).await?;
     if candles.is_empty() {
         return Ok(0);
     }
@@ -209,7 +245,7 @@ async fn process_s3_month(
         return Ok(0);
     }
 
-    insert_candles(&pool, &mut candles).await
+    insert_candles(&pool, &mut candles, timeframe).await
 }
 
 async fn process_chunk(
@@ -218,43 +254,56 @@ async fn process_chunk(
     product_id: String,
     start_ts: i64,
     end_ts: i64,
+    timeframe: &str,
 ) -> Result<usize> {
     let mut candles = downloader
-        .fetch_candles(&product_id, start_ts, end_ts)
+        .fetch_candles(&product_id, start_ts, end_ts, timeframe)
         .await?;
     
     if candles.is_empty() {
         return Ok(0);
     }
 
-    insert_candles(&pool, &mut candles).await
+    insert_candles(&pool, &mut candles, timeframe).await
 }
 
 async fn insert_candles(
     pool: &Pool<Postgres>,
-    candles: &mut Vec<Candlestick>,
+    candles: &mut [Candlestick],
+    timeframe: &str,
 ) -> Result<usize> {
     if candles.is_empty() {
         return Ok(0);
     }
+
+    // Determine interval in ms
+    let interval_ms = match timeframe {
+        "1m" => 60000,
+        "5m" => 300000,
+        "15m" => 900000,
+        "1h" => 3600000,
+        "4h" => 14400000,
+        "1d" => 86400000,
+        _ => 60000, 
+    };
 
     // Sort and Fill Gaps
     candles.sort_by_key(|c| c.timestamp);
     let mut filled_candles = Vec::new();
     filled_candles.push(candles[0].clone());
     
-    for i in 1..candles.len() {
-        let curr = &candles[i];
+    for curr in candles.iter().skip(1) {
         let (prev_close, last_ts) = {
             let last = filled_candles.last().unwrap();
             (last.close, last.timestamp)
         };
         
-        let mut expected_ts = last_ts + 60000;
-        while expected_ts < curr.timestamp {
+        let mut expected_ts = last_ts + interval_ms;
+        // Safety break to prevent infinite loops if data is weird
+        while expected_ts < curr.timestamp && (curr.timestamp - expected_ts) < (interval_ms * 1000) {
             filled_candles.push(Candlestick {
                 product_id: curr.product_id.clone(),
-                timeframe: "1m".to_string(),
+                timeframe: timeframe.to_string(),
                 timestamp: expected_ts,
                 open: prev_close,
                 high: prev_close,
@@ -262,7 +311,7 @@ async fn insert_candles(
                 close: prev_close,
                 volume: Decimal::ZERO,
             });
-            expected_ts += 60000;
+            expected_ts += interval_ms;
         }
         filled_candles.push(curr.clone());
     }
@@ -296,9 +345,22 @@ async fn insert_candles(
 }
 
 fn parse_date(date_str: &str) -> Result<DateTime<Utc>> {
-    let date = NaiveDate::parse_from_str(date_str, "%Y-%m-%d")?;
-    // Default to midnight UTC
-    Ok(Utc.from_utc_datetime(&date.and_hms_opt(0, 0, 0).unwrap()))
+    // Try YYYY-MM-DD
+    if let Ok(date) = NaiveDate::parse_from_str(date_str, "%Y-%m-%d") {
+        return Ok(Utc.from_utc_datetime(&date.and_hms_opt(0, 0, 0).unwrap()));
+    }
+    // Try YYYY/MM/DD
+    if let Ok(date) = NaiveDate::parse_from_str(date_str, "%Y/%m/%d") {
+        return Ok(Utc.from_utc_datetime(&date.and_hms_opt(0, 0, 0).unwrap()));
+    }
+    // Try Timestamp (ms)
+    if let Ok(ts_ms) = date_str.parse::<i64>() {
+         return Utc.timestamp_millis_opt(ts_ms)
+            .single()
+            .ok_or(anyhow!("Invalid timestamp"));
+    }
+    
+    Err(anyhow!("Invalid date format: '{}'. Expected YYYY-MM-DD, YYYY/MM/DD, or Timestamp(ms).", date_str))
 }
 
 struct BinanceDownloader {
@@ -317,7 +379,7 @@ impl BinanceDownloader {
 
 #[async_trait::async_trait]
 impl HistoricalDownloader for BinanceDownloader {
-    async fn fetch_candles(&self, product_id: &str, start_time: i64, end_time: i64) -> Result<Vec<Candlestick>> {
+    async fn fetch_candles(&self, product_id: &str, start_time: i64, end_time: i64, timeframe: &str) -> Result<Vec<Candlestick>> {
         // product_id is like BINANCE:BTCUSDT-PERP
         let parts: Vec<&str> = product_id.split(':').collect();
         let symbol_part = parts.get(1).ok_or(anyhow!("Invalid product_id"))?;
@@ -327,7 +389,7 @@ impl HistoricalDownloader for BinanceDownloader {
         
         let params = [
             ("symbol", symbol.as_str()),
-            ("interval", "1m"),
+            ("interval", timeframe),
             ("startTime", &start_time.to_string()),
             ("endTime", &end_time.to_string()),
             ("limit", "1500"),
@@ -358,7 +420,7 @@ impl HistoricalDownloader for BinanceDownloader {
 
             candles.push(Candlestick {
                 product_id: product_id.to_string(),
-                timeframe: "1m".to_string(),
+                timeframe: timeframe.to_string(),
                 timestamp,
                 open,
                 high,
@@ -370,10 +432,12 @@ impl HistoricalDownloader for BinanceDownloader {
         Ok(candles)
     }
 
-    async fn fetch_from_s3(&self, symbol: &str, year: i32, month: u32) -> Result<Vec<Candlestick>> {
+    async fn fetch_from_s3(&self, symbol: &str, year: i32, month: u32, timeframe: &str) -> Result<Vec<Candlestick>> {
+        // Example: https://data.binance.vision/data/spot/monthly/klines/BTCUSDT/1m/BTCUSDT-1m-2023-01.zip
         let url = format!(
-            "https://data.binance.vision/data/spot/monthly/klines/{symbol}/1m/{symbol}-1m-{year}-{month:02}.zip",
+            "https://data.binance.vision/data/spot/monthly/klines/{symbol}/{tf}/{symbol}-{tf}-{year}-{month:02}.zip",
             symbol = symbol,
+            tf = timeframe,
             year = year,
             month = month
         );
@@ -415,7 +479,7 @@ impl HistoricalDownloader for BinanceDownloader {
                     
                     candles.push(Candlestick {
                         product_id: product_id.clone(),
-                        timeframe: "1m".to_string(),
+                        timeframe: timeframe.to_string(),
                         timestamp,
                         open,
                         high,
@@ -446,7 +510,7 @@ impl BackpackDownloader {
 
 #[async_trait::async_trait]
 impl HistoricalDownloader for BackpackDownloader {
-    async fn fetch_candles(&self, product_id: &str, start_time: i64, end_time: i64) -> Result<Vec<Candlestick>> {
+    async fn fetch_candles(&self, product_id: &str, start_time: i64, end_time: i64, timeframe: &str) -> Result<Vec<Candlestick>> {
         let parts: Vec<&str> = product_id.split(':').collect();
         let symbol_part = parts.get(1).ok_or(anyhow!("Invalid product_id"))?;
         let symbol = symbol_part.replace("-PERP", "");
@@ -455,7 +519,7 @@ impl HistoricalDownloader for BackpackDownloader {
         
         let params = [
             ("symbol", symbol.as_str()),
-            ("interval", "1m"),
+            ("interval", timeframe),
             ("startTime", &(start_time / 1000).to_string()),
             ("endTime", &(end_time / 1000).to_string()),
         ];
@@ -488,7 +552,7 @@ impl HistoricalDownloader for BackpackDownloader {
 
             candles.push(Candlestick {
                 product_id: product_id.to_string(),
-                timeframe: "1m".to_string(),
+                timeframe: timeframe.to_string(),
                 timestamp,
                 open,
                 high,
