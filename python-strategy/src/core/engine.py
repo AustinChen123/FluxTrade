@@ -18,6 +18,8 @@ from src.core.interfaces import IOrderRepository
 from src.core.strategy_loader import StrategyLoader
 from src.core.data_provider import check_data_availability
 from src.core.db import SessionLocal
+from src.core.adapters.live_binance import LiveBinanceAdapter
+from src.core.adapters.simulated import SimulatedAdapter
 
 # Redis Config
 REDIS_HOST = os.getenv('REDIS_HOST', 'localhost')
@@ -37,7 +39,20 @@ class StrategyEngine:
         # Initialize Services
         self.account_service = account_service if account_service else AccountService()
         self.risk_manager = RiskManager(self.account_service)
-        self.execution_engine = ExecutionEngine(db_session, clock, order_repository, mock_only=execution_mock_only)
+        
+        # Initialize Adapter and Execution Engine
+        if execution_mock_only:
+            adapter = SimulatedAdapter()
+            logger.info("🧪 StrategyEngine: Using SimulatedAdapter")
+        else:
+            try:
+                adapter = LiveBinanceAdapter()
+                logger.info("🔌 StrategyEngine: Using LiveBinanceAdapter")
+            except Exception as e:
+                logger.error(f"❌ Failed to init Live Adapter: {e}. Falling back to Simulation.")
+                adapter = SimulatedAdapter()
+
+        self.execution_engine = ExecutionEngine(db_session, clock, adapter, order_repository)
         
         # System State & Heartbeat
         self.redis_client = redis.Redis(host=REDIS_HOST, port=REDIS_PORT, decode_responses=True)
@@ -315,7 +330,7 @@ class StrategyEngine:
         """
         # Simulation/Backtest: Check for pending order fills
         if isinstance(data, Candlestick):
-            self.execution_engine.check_open_orders(data)
+            self.execution_engine.process_market_data(data)
 
         strategies = self.strategies.get(data.product_id, [])
         for strategy in strategies:
