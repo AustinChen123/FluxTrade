@@ -57,9 +57,13 @@ class Signal(BaseFluxModel):
     strategy_id: str
     product_id: str
     timeframe: str
-    timestamp: int
+    timestamp: int  # Unix timestamp in milliseconds
     type: SignalType
     value: Optional[Decimal] = None
+    quantity: Optional[Decimal] = None
+    price: Optional[Decimal] = None
+    stop_loss: Optional[Decimal] = None
+    take_profit: Optional[Decimal] = None
     metadata: Optional[dict] = None
 
     @field_validator('product_id')

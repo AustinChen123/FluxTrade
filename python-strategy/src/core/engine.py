@@ -27,7 +27,7 @@ HOT_STRATEGIES_PATH = os.getenv('HOT_STRATEGIES_PATH', '/app/strategies_hot')
 logger = logging.getLogger(__name__)
 
 class StrategyEngine:
-    def __init__(self, db_session: Session, clock: Clock, order_repository: Optional[IOrderRepository] = None):
+    def __init__(self, db_session: Session, clock: Clock, order_repository: Optional[IOrderRepository] = None, account_service: Optional[AccountService] = None, execution_mock_only: bool = False):
         self.db = db_session
         self.clock = clock
         self.strategies: Dict[str, List[BaseStrategy]] = {} # Key: product_id (Active instances for dispatch)
@@ -35,9 +35,9 @@ class StrategyEngine:
         self.loaded_classes: Dict[str, Type[BaseStrategy]] = {} # Key: strategy_id (FileName::ClassName)
         
         # Initialize Services
-        self.account_service = AccountService()
+        self.account_service = account_service if account_service else AccountService()
         self.risk_manager = RiskManager(self.account_service)
-        self.execution_engine = ExecutionEngine(db_session, clock, order_repository)
+        self.execution_engine = ExecutionEngine(db_session, clock, order_repository, mock_only=execution_mock_only)
         
         # System State & Heartbeat
         self.redis_client = redis.Redis(host=REDIS_HOST, port=REDIS_PORT, decode_responses=True)

@@ -33,6 +33,15 @@ redis_data/
 spec/
 work/
 python-strategy/strategies_hot/
+python-strategy/src/core/market_structure.py
+REFACTOR_PLAN_V2.md
+
+# Strategies (Keep base and examples, ignore others)
+python-strategy/src/strategies/*
+!python-strategy/src/strategies/base.py
+!python-strategy/src/strategies/example.py
+!python-strategy/src/strategies/golden_cross.py
+
 # Python bytecode
 *.pyc
 __pycache__/

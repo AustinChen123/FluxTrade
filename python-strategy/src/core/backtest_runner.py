@@ -1,21 +1,28 @@
 import time
+import json
 from typing import Generator, List
+from decimal import Decimal
 from sqlalchemy.orm import Session
 from src.core.db import SessionLocal
-from src.core.orm_models import Candlestick as CandlestickORM, Strategy as StrategyORM, BacktestResultSummary
+from src.core.orm_models import Candlestick as CandlestickORM, Strategy as StrategyORM, BacktestResultSummary, BacktestTradeLog
 from src.core.models import Candlestick
 from src.core.engine import StrategyEngine
 from src.core.clock import BacktestClock
 from src.strategies.base import BaseStrategy
 from src.core.repositories import BacktestOrderRepository
 from src.core.backtest.loader import get_candles_generator
+from src.core.analytics import calculate_metrics
+
+from src.core.mocks.account_service import BacktestAccountService
 
 class BacktestRunner:
-    def __init__(self, start_time: int, end_time: int, product_id: str, timeframe: str):
+    def __init__(self, start_time: int, end_time: int, product_id: str, timeframe: str, initial_balance: float = 10000.0, max_drawdown_limit: float = 0.20):
         self.start_time = start_time
         self.end_time = end_time
         self.product_id = product_id
         self.timeframe = timeframe
+        self.initial_balance = initial_balance
+        self.max_drawdown_limit = max_drawdown_limit
         
         # Dual sessions: one for data stream, one for execution writing
         self.data_session = SessionLocal()
@@ -63,18 +70,27 @@ class BacktestRunner:
         self.db_session.commit()
         print(f"📝 Backtest Session Created: ID {summary.id}")
 
-        # 2. Setup Engine with Backtest Repo (Repository Pattern)
-        repo = BacktestOrderRepository(self.db_session, summary.id)
-        self.engine = StrategyEngine(self.db_session, self.clock, order_repository=repo)
+        # 2. Setup Engine with Backtest Repo and Mock Account
+        repo = BacktestOrderRepository(self.db_session, summary.id, initial_balance=Decimal(str(self.initial_balance)))
+        mock_account = BacktestAccountService(repo=repo, initial_balance=Decimal(str(self.initial_balance)))
         
+        self.engine = StrategyEngine(
+            self.db_session, 
+            self.clock, 
+            order_repository=repo, 
+            account_service=mock_account,
+            execution_mock_only=True
+        )
+        
+        # Inject the SAME RiskManager (with Mock Account) into the strategies
         for strat in self._strategies_buffer:
+            if hasattr(strat, 'risk_manager'):
+                strat.risk_manager.account_service = mock_account
             self.engine.add_strategy(strat)
 
         print(f"🚀 Starting Backtest for {self.product_id} [{self.start_time} - {self.end_time}]")
         count = 0
         
-        # Use Junior's loader if available, otherwise fallback logic could go here
-        # But we assume Junior did his job.
         candle_gen = get_candles_generator(
             self.data_session, 
             self.product_id, 
@@ -82,6 +98,8 @@ class BacktestRunner:
             self.start_time, 
             self.end_time
         )
+        
+        stop_threshold = Decimal(str(self.initial_balance)) * Decimal(str(1 - self.max_drawdown_limit))
 
         try:
             for candle in candle_gen:
@@ -91,11 +109,32 @@ class BacktestRunner:
                 # 4. Process Candle
                 self.engine.on_market_data(candle)
                 
+                # 5. Check Circuit Breaker
+                current_balance = mock_account.get_balance()
+                if current_balance < stop_threshold:
+                    print(f"🛑 STOPPING BACKTEST: Max Drawdown Reached! Balance: {current_balance} < {stop_threshold}")
+                    break
+
                 count += 1
                 if count % 1000 == 0:
-                    print(f"Processed {count} candles... Current Time: {candle.timestamp}")
+                    print(f"Processed {count} candles... Current Time: {candle.timestamp} | Bal: {current_balance:.2f}")
         finally:
-            print(f"✅ Backtest Complete. Processed {count} candles.")
+            # Calculate Final PnL
+            final_balance = mock_account.get_balance()
+            total_pnl = final_balance - Decimal(str(self.initial_balance))
+            
+            summary.total_pnl = total_pnl
+            
+            # Metrics
+            trades = self.db_session.query(BacktestTradeLog).filter_by(session_id=summary.id).all()
+            metrics = calculate_metrics(trades)
+            summary.metrics_json = json.dumps(metrics, default=str)
+            
+            self.db_session.commit()
+            
+            print(f"✅ Backtest Complete. Processed {count} candles. Final PnL: {total_pnl}")
+            print(f"📊 Metrics: {metrics}")
+            
             self.db_session.close()
             self.data_session.close()
 

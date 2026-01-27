@@ -134,3 +134,11 @@ class WebSocketOrderConnector:
             # Mock signature logic
             payload["signature"] = "signed_hash"
         pass
+
+    def is_connected(self, exchange_id: str) -> bool:
+        """
+        Checks if the WS connection is active for the given exchange.
+        """
+        # In this simple implementation, we just check if self.ws is not None
+        # and match the exchange_id.
+        return self.running and self.ws is not None and self.exchange_id == exchange_id.lower()

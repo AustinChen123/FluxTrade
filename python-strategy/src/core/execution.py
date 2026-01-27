@@ -11,7 +11,7 @@ from src.core.simulation import SlippageModel
 from src.core.interfaces import IOrderRepository
 
 class ExecutionEngine:
-    def __init__(self, db_session: Session, clock: Clock, order_repository: Optional[IOrderRepository] = None):
+    def __init__(self, db_session: Session, clock: Clock, order_repository: Optional[IOrderRepository] = None, mock_only: bool = False):
         if order_repository:
             self.order_manager = OrderManager(order_repository, clock)
         else:
@@ -22,29 +22,33 @@ class ExecutionEngine:
         self.slippage_model = SlippageModel()
         self.adapter: Optional[ExchangeAdapter] = None
         self.ws_connector: Optional[WebSocketOrderConnector] = None
+        self.mock_only = mock_only
         
         # Simulation State
         self.open_orders: list = []
         
-        # Try to initialize Real Exchange Adapter & WS Connector
-        api_key = os.getenv('EXCHANGE_API_KEY')
-        secret = os.getenv('EXCHANGE_SECRET')
-        exchange_id = os.getenv('EXCHANGE_ID', 'binance')
-        testnet = os.getenv('EXCHANGE_TESTNET', 'true').lower() == 'true'
-        
-        if api_key and secret:
-            try:
-                # 1. REST Adapter
-                self.adapter = ExchangeAdapter(exchange_id, api_key, secret, testnet)
-                
-                # 2. WebSocket Connector
-                self.ws_connector = WebSocketOrderConnector(api_key, secret, exchange_id, testnet)
-                self.ws_connector.start()
-                
-            except Exception as e:
-                print(f"⚠️  Execution: Failed to init Exchange Connectivity ({e}). Fallback to Mock.")
+        if not self.mock_only:
+            # Try to initialize Real Exchange Adapter & WS Connector
+            api_key = os.getenv('EXCHANGE_API_KEY')
+            secret = os.getenv('EXCHANGE_SECRET')
+            exchange_id = os.getenv('EXCHANGE_ID', 'binance')
+            testnet = os.getenv('EXCHANGE_TESTNET', 'true').lower() == 'true'
+            
+            if api_key and secret:
+                try:
+                    # 1. REST Adapter
+                    self.adapter = ExchangeAdapter(exchange_id, api_key, secret, testnet)
+                    
+                    # 2. WebSocket Connector
+                    self.ws_connector = WebSocketOrderConnector(api_key, secret, exchange_id, testnet)
+                    self.ws_connector.start()
+                    
+                except Exception as e:
+                    print(f"⚠️  Execution: Failed to init Exchange Connectivity ({e}). Fallback to Mock.")
+            else:
+                print("⚠️  Execution: No API Key found. Running in Mock Mode.")
         else:
-            print("⚠️  Execution: No API Key found. Running in Mock Mode.")
+             print("🧪 Execution: Running in MOCK ONLY mode (Backtest/Simulation).")
 
     def check_open_orders(self, candle: Candlestick):
         """
@@ -81,8 +85,15 @@ class ExecutionEngine:
         if not side:
             return None
 
+        # Determine Quantity
+        qty = signal.quantity if signal.quantity and signal.quantity > 0 else self.default_quantity
+
         # Determine Order Type and Price
-        if signal.value:
+        # Prioritize signal.price (Entry Price) for Limit Orders
+        if signal.price and signal.price > 0:
+            order_type = "limit"
+            limit_price = signal.price
+        elif signal.value: # Legacy support
             order_type = "limit"
             limit_price = signal.value
         else:
@@ -94,7 +105,7 @@ class ExecutionEngine:
             signal=signal,
             side=side,
             order_type=order_type,
-            quantity=self.default_quantity,
+            quantity=qty,
             price=limit_price
         )
 
@@ -111,7 +122,7 @@ class ExecutionEngine:
                         ws_success = self.ws_connector.place_order(
                             symbol=signal.product_id,
                             side=side,
-                            quantity=float(self.default_quantity),
+                            quantity=float(qty),
                             price=float(limit_price) if limit_price else 0.0,
                             order_type=order_type
                         )
@@ -126,7 +137,7 @@ class ExecutionEngine:
                     order_params = {
                         "symbol": signal.product_id,
                         "side": side,
-                        "amount": float(self.default_quantity),
+                        "amount": float(qty),
                         "type": order_type
                     }
                     if order_type == 'limit':
@@ -159,14 +170,14 @@ class ExecutionEngine:
                     return order.id
             else:
                 # Market Order
-                base_price = candle.close if candle else (signal.value if signal.value else Decimal("50000"))
+                base_price = candle.close if candle else (limit_price if limit_price else Decimal("50000"))
                 fill_price = self.slippage_model.calculate_slippage(base_price)
 
             print(f"⚡ Execution: Simulating fill for {order.id} at {fill_price}")
             self.order_manager.fill_order(
                 order=order,
                 fill_price=fill_price,
-                fill_quantity=self.default_quantity
+                fill_quantity=qty
             )
             return order.id
 
