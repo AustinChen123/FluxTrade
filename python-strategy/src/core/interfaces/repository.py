@@ -13,6 +13,10 @@ class IOrderRepository(ABC):
         pass
 
     @abstractmethod
+    def update_order_exchange_id(self, order: Order, exchange_order_id: str) -> None:
+        pass
+
+    @abstractmethod
     def add_trade(self, trade: Trade) -> None:
         pass
 
