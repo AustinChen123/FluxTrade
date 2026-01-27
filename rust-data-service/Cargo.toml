@@ -3,7 +3,12 @@ name = "rust-data-service"
 version = "0.1.0"
 edition = "2021"
 
+[lib]
+name = "fluxtrade_core"
+crate-type = ["cdylib", "rlib"]
+
 [dependencies]
+pyo3 = { version = "0.24", features = ["extension-module"] }
 ring = "0.17"
 base64 = "0.21"
 anyhow = "1.0"
