@@ -106,19 +106,54 @@ impl PyMatchingEngine {
             unrealized_pnl: 0.0,
         });
 
-        // Simplified Position Logic (Netting Mode)
-        // If side matches or position is flat, add quantity
-        if entry.quantity == 0.0 || entry.side == order.side {
+        // Netting Logic
+        if entry.quantity == 0.0 || entry.side == "FLAT" {
+            // New Position
+            entry.side = order.side.clone();
+            entry.quantity = order.quantity;
+            entry.entry_price = fill_price;
+        } else if entry.side == order.side {
+            // Increase Position (Weighted Average Price)
             let total_cost = entry.quantity * entry.entry_price + order.quantity * fill_price;
             let new_qty = entry.quantity + order.quantity;
-            
-            entry.side = order.side.clone();
             entry.entry_price = total_cost / new_qty;
             entry.quantity = new_qty;
         } else {
-            // Closing position logic would go here
-            // For V2 prototype, we just accumulate for now to prove data flow
-            // Real implementation needs to handle reducing quantity and realizing PnL
+            // Close / Reduce Position
+            let close_qty = if order.quantity >= entry.quantity {
+                entry.quantity
+            } else {
+                order.quantity
+            };
+
+            // Calculate PnL for the closed portion
+            let price_diff = if entry.side == "LONG" {
+                fill_price - entry.entry_price
+            } else {
+                entry.entry_price - fill_price // Short: Entry - Exit
+            };
+            
+            let realized_pnl = price_diff * close_qty;
+            self.balance += realized_pnl;
+
+            // Update Quantity
+            let remaining_qty = entry.quantity - close_qty;
+            let excess_order_qty = order.quantity - close_qty;
+
+            if remaining_qty > 1e-9 {
+                // Partial Close
+                entry.quantity = remaining_qty;
+            } else if excess_order_qty > 1e-9 {
+                // Flip Position (Reverse)
+                entry.side = order.side.clone();
+                entry.quantity = excess_order_qty;
+                entry.entry_price = fill_price;
+            } else {
+                // Flat
+                entry.side = "FLAT".to_string();
+                entry.quantity = 0.0;
+                entry.entry_price = 0.0;
+            }
         }
     }
 }
