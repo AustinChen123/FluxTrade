@@ -38,14 +38,54 @@ impl PyMatchingEngine {
     }
 
     fn on_candle(&mut self, candle: Candlestick) -> PyResult<Vec<FillEvent>> {
+        self.process_candle_logic(candle)
+    }
+
+    fn on_matching_tick(&mut self, candle: Candlestick) -> PyResult<Vec<FillEvent>> {
+        self.process_candle_logic(candle)
+    }
+}
+
+impl PyMatchingEngine {
+    fn process_candle_logic(&mut self, candle: Candlestick) -> PyResult<Vec<FillEvent>> {
         let mut fills = Vec::new();
         let mut remaining_orders = Vec::new();
 
-        // Iterate through all open orders
-        // Note: In a real HFT engine, this would be an OrderBook (B-Tree or similar)
-        // For backtesting iteration, a Vec is acceptable for < 10k orders.
-        let orders: Vec<Order> = self.open_orders.drain(..).collect();
-        for order in orders {
+        // Separate orders into Market and Limit buckets to ensure priority
+        // Market orders must be processed first.
+        let (market_orders, limit_orders): (Vec<Order>, Vec<Order>) = 
+            self.open_orders.drain(..)
+            .partition(|o| o.order_type == "MARKET");
+
+        // 1. Process Market Orders
+        for order in market_orders {
+            let mut matched = false;
+            let mut fill_price = 0.0;
+
+            if order.product_id == candle.product_id {
+                // Market orders fill immediately at Open price
+                matched = true;
+                fill_price = candle.open;
+            }
+
+            if matched {
+                let fill = FillEvent {
+                    order_id: order.id.clone(),
+                    product_id: order.product_id.clone(),
+                    price: fill_price,
+                    quantity: order.quantity,
+                    fee: 0.0,
+                    timestamp: candle.timestamp,
+                };
+                self.update_position(&order, fill_price);
+                fills.push(fill);
+            } else {
+                remaining_orders.push(order);
+            }
+        }
+
+        // 2. Process Limit Orders
+        for order in limit_orders {
             let mut matched = false;
             let mut fill_price = 0.0;
 
@@ -54,8 +94,6 @@ impl PyMatchingEngine {
                 if order.order_type == "LIMIT" {
                     if order.side == "LONG" {
                         // Buy if Low <= Limit Price
-                        // Fill at Limit Price (Conservative backtest assumption) or Open if Open < Limit?
-                        // Standard conservative: Fill at Limit Price.
                         if candle.low <= order.price {
                             matched = true;
                             fill_price = order.price;
@@ -68,7 +106,6 @@ impl PyMatchingEngine {
                         }
                     }
                 } 
-                // TODO: MARKET orders (assume fill at Open or Close)
             }
 
             if matched {
@@ -93,9 +130,7 @@ impl PyMatchingEngine {
         self.open_orders = remaining_orders;
         Ok(fills)
     }
-}
 
-impl PyMatchingEngine {
     fn update_position(&mut self, order: &Order, fill_price: f64) {
         // Get or Create Position
         let entry = self.positions.entry(order.product_id.clone()).or_insert(Position {
