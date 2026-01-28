@@ -88,9 +88,7 @@ class ExecutionEngine:
 
         except Exception as e:
             self.logger.error(f"❌ Execution Failed: {e}")
-            # Optional: Mark order as FAILED in DB? 
-            # Currently OrderManager doesn't expose fail_order easily, 
-            # but create_order sets status="OPEN". Ideally we should set to FAILED.
+            self.order_manager.fail_order(order, str(e))
             return None
 
     def _determine_side(self, signal_type: SignalType) -> Optional[str]:

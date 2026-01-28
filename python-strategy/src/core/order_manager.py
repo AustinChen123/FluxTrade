@@ -62,6 +62,13 @@ class OrderManager:
     def update_exchange_order_id(self, order: Order, exchange_order_id: str):
         self.repo.update_order_exchange_id(order, exchange_order_id)
 
+    def fail_order(self, order: Order, reason: str):
+        """Marks an order as FAILED due to execution errors."""
+        order.status = "failed"
+        # We could verify if there's a specific field for error msg, but for now just status
+        print(f"❌ DB: Order {order.id} marked as FAILED. Reason: {reason}")
+        self.repo.update_order(order)
+
     def fill_order(self, order: Order, fill_price: Decimal, fill_quantity: Decimal):
         current_time = int(self.clock.now() * 1000)
         
