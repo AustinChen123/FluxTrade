@@ -29,8 +29,8 @@ def main():
     engine.add_strategy(strategy_1)
     
     # 3. Initialize Data Consumer (Redis Streams)
-    # Subscribe to market data streams
-    channels = ["stream:market:binance:btcusdt"]
+    # Subscribe to per-timeframe streams derived from strategy requirements
+    channels = engine.build_stream_channels()
     consumer = DataConsumer(channels=channels, on_message_callback=engine.on_market_data)
     
     # 4. Start

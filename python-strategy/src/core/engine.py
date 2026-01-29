@@ -328,6 +328,18 @@ class StrategyEngine:
         self.strategy_instances[strategy.strategy_id] = strategy
         logger.info(f"Registered strategy (legacy): {strategy.strategy_id} for {strategy.product_id}")
 
+    def build_stream_channels(self) -> list:
+        """Derive Redis stream keys from registered strategy requirements."""
+        channels = set()
+        for product_id, strategies in self.strategies.items():
+            parts = product_id.split(":")
+            exchange = parts[0].lower()
+            symbol = parts[1].replace("-PERP", "").lower()
+            for strat in strategies:
+                tf = strat.requirements.timeframe
+                channels.add(f"stream:market:{exchange}:{symbol}:{tf}")
+        return sorted(channels)
+
     def on_market_data(self, data: Union[Candlestick, Trade]):
         """
         Callback triggered by DataConsumer when new market data arrives.
@@ -341,6 +353,10 @@ class StrategyEngine:
             try:
                 if isinstance(data, Trade):
                     signal = strategy.on_trade(data)
+                elif isinstance(data, Candlestick):
+                    if data.timeframe != strategy.requirements.timeframe:
+                        continue
+                    signal = strategy.on_candle(data)
                 else:
                     signal = strategy.on_candle(data)
                 

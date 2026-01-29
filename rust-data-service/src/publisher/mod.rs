@@ -67,7 +67,8 @@ impl RedisPublisher {
         let parts: Vec<&str> = candle.product_id.split(':').collect();
         let exchange = parts[0].to_lowercase();
         let symbol = parts[1].replace("-PERP", "").to_lowercase();
-        let topic = format!("stream:market:{}:{}", exchange, symbol);
+        let tf = candle.timeframe.to_lowercase();
+        let topic = format!("stream:market:{}:{}:{}", exchange, symbol, tf);
 
         self.publish(&topic, candle).await
     }
