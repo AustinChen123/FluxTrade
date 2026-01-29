@@ -1,0 +1,213 @@
+"""
+Tests for src/core/execution.py
+
+Covers:
+- Signal to order conversion
+- Side determination (LONG/SHORT/EXIT)
+- Order type detection (market/limit)
+- Adapter delegation
+- Error handling on execution failure
+- Market data processing for simulated fills
+"""
+
+import pytest
+from decimal import Decimal
+from unittest.mock import MagicMock
+
+from src.core.execution import ExecutionEngine
+from src.core.models import Signal, SignalType, Candlestick
+
+
+@pytest.fixture
+def execution_engine(mock_db_session, mock_clock, mock_exchange_adapter, mock_order_repo):
+    """Provides an ExecutionEngine with mock dependencies."""
+    return ExecutionEngine(
+        db_session=mock_db_session,
+        clock=mock_clock,
+        adapter=mock_exchange_adapter,
+        order_repository=mock_order_repo
+    )
+
+
+class TestSideDetermination:
+    """Tests for signal type to order side mapping."""
+
+    def test_long_signal_becomes_buy(self, execution_engine, signal_factory):
+        """LONG signal should produce a buy order."""
+        signal = signal_factory(signal_type=SignalType.LONG, price=Decimal("42000"))
+        order_id = execution_engine.execute_signal(signal)
+
+        assert order_id is not None
+
+    def test_short_signal_becomes_sell(self, execution_engine, signal_factory):
+        """SHORT signal should produce a sell order."""
+        signal = signal_factory(signal_type=SignalType.SHORT, price=Decimal("42000"))
+        order_id = execution_engine.execute_signal(signal)
+
+        assert order_id is not None
+
+    def test_exit_long_becomes_sell(self, execution_engine, signal_factory):
+        """EXIT_LONG signal should produce a sell order."""
+        signal = signal_factory(signal_type=SignalType.EXIT_LONG, price=Decimal("42000"))
+        order_id = execution_engine.execute_signal(signal)
+
+        assert order_id is not None
+
+    def test_exit_short_becomes_buy(self, execution_engine, signal_factory):
+        """EXIT_SHORT signal should produce a buy order."""
+        signal = signal_factory(signal_type=SignalType.EXIT_SHORT, price=Decimal("42000"))
+        order_id = execution_engine.execute_signal(signal)
+
+        assert order_id is not None
+
+    def test_no_signal_returns_none(self, execution_engine, signal_factory):
+        """NO_SIGNAL should return None (no order created)."""
+        signal = signal_factory(signal_type=SignalType.NO_SIGNAL)
+        order_id = execution_engine.execute_signal(signal)
+
+        assert order_id is None
+
+
+class TestOrderTypeDetection:
+    """Tests for order type (market/limit) detection."""
+
+    def test_signal_with_price_creates_limit(self, execution_engine, signal_factory, mock_exchange_adapter):
+        """Signal with price should create limit order."""
+        signal = signal_factory(price=Decimal("42000"))
+        execution_engine.execute_signal(signal)
+
+        assert len(mock_exchange_adapter.open_orders) == 1
+        assert mock_exchange_adapter.open_orders[0].type == "limit"
+
+    def test_signal_with_value_creates_limit(self, execution_engine, signal_factory, mock_exchange_adapter):
+        """Signal with value (legacy) should create limit order."""
+        signal = signal_factory(price=None, value=Decimal("42000"))
+        execution_engine.execute_signal(signal)
+
+        assert len(mock_exchange_adapter.open_orders) == 1
+        assert mock_exchange_adapter.open_orders[0].type == "limit"
+
+    def test_signal_without_price_creates_market(self, execution_engine, signal_factory, mock_exchange_adapter):
+        """Signal without price should create market order."""
+        signal = signal_factory(price=None, value=None)
+        execution_engine.execute_signal(signal)
+
+        assert len(mock_exchange_adapter.open_orders) == 1
+        assert mock_exchange_adapter.open_orders[0].type == "market"
+
+
+class TestQuantityHandling:
+    """Tests for quantity determination."""
+
+    def test_signal_quantity_used(self, execution_engine, signal_factory, mock_exchange_adapter):
+        """Signal's quantity should be used when provided."""
+        signal = signal_factory(quantity=Decimal("0.5"), price=Decimal("42000"))
+        execution_engine.execute_signal(signal)
+
+        assert mock_exchange_adapter.open_orders[0].quantity == Decimal("0.5")
+
+    def test_default_quantity_when_none(self, execution_engine, signal_factory, mock_exchange_adapter):
+        """Default quantity should be used when signal quantity is None."""
+        signal = signal_factory(quantity=None, price=Decimal("42000"))
+        execution_engine.execute_signal(signal)
+
+        assert mock_exchange_adapter.open_orders[0].quantity == Decimal("0.01")
+
+    def test_default_quantity_when_zero(self, execution_engine, signal_factory, mock_exchange_adapter):
+        """Default quantity should be used when signal quantity is zero."""
+        signal = signal_factory(quantity=Decimal("0"), price=Decimal("42000"))
+        execution_engine.execute_signal(signal)
+
+        assert mock_exchange_adapter.open_orders[0].quantity == Decimal("0.01")
+
+
+class TestAdapterDelegation:
+    """Tests for adapter order placement."""
+
+    def test_order_sent_to_adapter(self, execution_engine, signal_factory, mock_exchange_adapter):
+        """Order should be sent to adapter for execution."""
+        signal = signal_factory(price=Decimal("42000"))
+        execution_engine.execute_signal(signal)
+
+        assert len(mock_exchange_adapter.open_orders) == 1
+
+    def test_exchange_id_recorded(self, execution_engine, signal_factory, mock_order_repo):
+        """Exchange order ID should be recorded after placement."""
+        signal = signal_factory(price=Decimal("42000"))
+        order_id = execution_engine.execute_signal(signal)
+
+        order = mock_order_repo.orders[order_id]
+        assert order.exchange_order_id.startswith("MOCK-")
+
+    def test_multiple_signals_create_multiple_orders(
+        self, execution_engine, signal_factory, mock_exchange_adapter
+    ):
+        """Multiple signals should create independent orders."""
+        for _ in range(3):
+            signal = signal_factory(price=Decimal("42000"))
+            execution_engine.execute_signal(signal)
+
+        assert len(mock_exchange_adapter.open_orders) == 3
+
+
+class TestExecutionErrorHandling:
+    """Tests for error handling during execution."""
+
+    def test_adapter_failure_marks_order_failed(
+        self, execution_engine, signal_factory, mock_exchange_adapter, mock_order_repo
+    ):
+        """Adapter failure should mark order as failed."""
+        mock_exchange_adapter.set_should_fail(True, "Connection timeout")
+
+        signal = signal_factory(price=Decimal("42000"))
+        order_id = execution_engine.execute_signal(signal)
+
+        assert order_id is None
+
+        # Order should be in repo with failed status
+        failed_orders = [o for o in mock_order_repo.orders.values() if o.status == "failed"]
+        assert len(failed_orders) == 1
+
+    def test_adapter_failure_returns_none(
+        self, execution_engine, signal_factory, mock_exchange_adapter
+    ):
+        """Adapter failure should return None."""
+        mock_exchange_adapter.set_should_fail(True, "Insufficient funds")
+
+        signal = signal_factory(price=Decimal("42000"))
+        result = execution_engine.execute_signal(signal)
+
+        assert result is None
+
+
+class TestMarketDataProcessing:
+    """Tests for process_market_data (simulated fills)."""
+
+    def test_market_data_triggers_fills(
+        self, mock_db_session, mock_clock, mock_exchange_adapter, signal_factory, candlestick_factory
+    ):
+        """Market data should trigger fills for pending orders."""
+        from src.core.repositories import BacktestOrderRepository
+        backtest_repo = BacktestOrderRepository(mock_db_session, session_id=1)
+        engine = ExecutionEngine(
+            db_session=mock_db_session,
+            clock=mock_clock,
+            adapter=mock_exchange_adapter,
+            order_repository=backtest_repo
+        )
+
+        signal = signal_factory(price=Decimal("42000"))
+        engine.execute_signal(signal)
+        assert len(mock_exchange_adapter.open_orders) == 1
+
+        candle = candlestick_factory(close=Decimal("42100"))
+        engine.process_market_data(candle)
+
+        # Order should be filled
+        assert len(mock_exchange_adapter.open_orders) == 0
+
+    def test_no_orders_no_fills(self, execution_engine, candlestick_factory):
+        """No fills when no pending orders."""
+        candle = candlestick_factory()
+        # Should not raise
+        execution_engine.process_market_data(candle)
