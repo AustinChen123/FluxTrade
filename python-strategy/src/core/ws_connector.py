@@ -16,6 +16,11 @@ try:
 except ImportError:
     HAS_WEBSOCKETS = False
 
+INITIAL_BACKOFF = 1.0
+MAX_BACKOFF = 300.0
+MAX_RETRIES = 10
+
+
 class WebSocketOrderConnector:
     """
     Persistent WebSocket connection for Order Entry (Binance/Backpack).
@@ -53,7 +58,7 @@ class WebSocketOrderConnector:
         self.running = True
         self.thread = threading.Thread(target=self._run_event_loop, daemon=True)
         self.thread.start()
-        print(f"🔌 WS Order Connector: Starting connection to {self.ws_url}...")
+        self.logger.info("WS Order Connector: Starting connection to %s...", self.ws_url)
 
     def _run_event_loop(self):
         self.loop = asyncio.new_event_loop()
@@ -61,26 +66,38 @@ class WebSocketOrderConnector:
         self.loop.run_until_complete(self._connect_and_listen())
 
     async def _connect_and_listen(self):
+        backoff = INITIAL_BACKOFF
+        attempts = 0
+
         while self.running:
             try:
                 async with websockets.connect(self.ws_url) as ws:
                     self.ws = ws
-                    print("✅ WS Order Connector: Connected.")
+                    self.logger.info("WS Order Connector: Connected.")
+                    # Reset backoff on successful connection
+                    backoff = INITIAL_BACKOFF
+                    attempts = 0
                     await self._authenticate(ws)
-                    
+
                     # Heartbeat & Listen Loop
                     while self.running:
-                        # Listener (for order updates)
                         try:
                             msg = await asyncio.wait_for(ws.recv(), timeout=5.0)
                             self._handle_message(msg)
                         except asyncio.TimeoutError:
-                            # Send Ping/Keepalive if needed
                             continue
             except Exception as e:
-                print(f"❌ WS Connection Error: {e}. Reconnecting in 5s...")
-                await asyncio.sleep(5)
                 self.ws = None
+                attempts += 1
+                if attempts > MAX_RETRIES:
+                    self.logger.error("Max reconnection attempts (%d) exceeded. Stopping.",
+                                     MAX_RETRIES)
+                    self.running = False
+                    return
+                self.logger.warning("WS Connection Error: %s. Reconnecting in %.1fs (attempt %d/%d)",
+                                    e, backoff, attempts, MAX_RETRIES)
+                await asyncio.sleep(backoff)
+                backoff = min(backoff * 2, MAX_BACKOFF)
 
     async def _authenticate(self, ws):
         # Implementation depends on Exchange API
@@ -125,7 +142,7 @@ class WebSocketOrderConnector:
              asyncio.run_coroutine_threadsafe(self.ws.send(json.dumps(payload)), self.loop)
              return True
         except Exception as e:
-            print(f"⚠️ Failed to send WS order: {e}")
+            self.logger.warning("Failed to send WS order: %s", e)
             return False
 
     def _sign_payload(self, payload: Dict[str, Any]):
