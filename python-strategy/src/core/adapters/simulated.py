@@ -121,7 +121,7 @@ class SimulatedAdapter(IExchangeAdapter):
             new_pos = Position(
                 strategy_id=order.strategy_id,
                 product_id=order.product_id,
-                side=order.side.upper(),
+                side="LONG" if order.side.lower() == "buy" else "SHORT",
                 quantity=order.quantity,
                 entry_price=price,
                 unrealized_pnl=Decimal("0")

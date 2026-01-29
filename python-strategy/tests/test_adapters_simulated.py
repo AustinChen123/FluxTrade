@@ -218,16 +218,10 @@ class TestSimulatedPositionTracking:
         pos = adapter.get_position(order.product_id)
         assert pos is not None
         assert pos.quantity == Decimal("0.5")
-        assert pos.side == "BUY"  # Or "LONG" depending on implementation
+        assert pos.side == "LONG"
 
-    @pytest.mark.xfail(reason="Known bug: SimulatedAdapter uses BUY/SELL but netting checks LONG/SHORT")
     def test_position_increases_on_same_direction(self, order_factory, candlestick_factory):
-        """Position should increase when adding in same direction.
-
-        NOTE: SimulatedAdapter._update_position stores side as order.side.upper()
-        (BUY/SELL) but netting logic checks pos.side == "LONG". This mismatch
-        causes incorrect behavior on second fill. Tracked for fix.
-        """
+        """Position should increase when adding in same direction."""
         adapter = SimulatedAdapter()
 
         # First buy
@@ -244,7 +238,6 @@ class TestSimulatedPositionTracking:
         assert pos is not None
         assert pos.quantity == Decimal("1.0")
 
-    @pytest.mark.xfail(reason="Known bug: SimulatedAdapter side mismatch breaks netting")
     def test_position_reduces_on_opposite_direction(self, order_factory, candlestick_factory):
         """Position should reduce when selling partial amount."""
         adapter = SimulatedAdapter()
