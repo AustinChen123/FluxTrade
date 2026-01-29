@@ -18,8 +18,7 @@ from src.core.interfaces import IOrderRepository
 from src.core.strategy_loader import StrategyLoader
 from src.core.data_provider import check_data_availability
 from src.core.db import SessionLocal
-from src.core.adapters.live_binance import LiveBinanceAdapter
-from src.core.adapters.simulated import SimulatedAdapter
+from src.core.adapters import create_adapter
 
 # Redis Config
 REDIS_HOST = os.getenv('REDIS_HOST', 'localhost')
@@ -29,28 +28,33 @@ HOT_STRATEGIES_PATH = os.getenv('HOT_STRATEGIES_PATH', '/app/strategies_hot')
 logger = logging.getLogger(__name__)
 
 class StrategyEngine:
-    def __init__(self, db_session: Session, clock: Clock, order_repository: Optional[IOrderRepository] = None, account_service: Optional[AccountService] = None, execution_mock_only: bool = False):
+    def __init__(
+        self,
+        db_session: Session,
+        clock: Clock,
+        order_repository: Optional[IOrderRepository] = None,
+        account_service: Optional[AccountService] = None,
+        adapter_config: Optional[Dict] = None,
+    ):
         self.db = db_session
         self.clock = clock
-        self.strategies: Dict[str, List[BaseStrategy]] = {} # Key: product_id (Active instances for dispatch)
-        self.strategy_instances: Dict[str, BaseStrategy] = {} # Key: strategy_id
-        self.loaded_classes: Dict[str, Type[BaseStrategy]] = {} # Key: strategy_id (FileName::ClassName)
-        
+        self.strategies: Dict[str, List[BaseStrategy]] = {}
+        self.strategy_instances: Dict[str, BaseStrategy] = {}
+        self.loaded_classes: Dict[str, Type[BaseStrategy]] = {}
+
         # Initialize Services
         self.account_service = account_service if account_service else AccountService()
         self.risk_manager = RiskManager(self.account_service)
-        
-        # Initialize Adapter and Execution Engine
-        if execution_mock_only:
-            adapter = SimulatedAdapter()
-            logger.info("🧪 StrategyEngine: Using SimulatedAdapter")
-        else:
-            try:
-                adapter = LiveBinanceAdapter()
-                logger.info("🔌 StrategyEngine: Using LiveBinanceAdapter")
-            except Exception as e:
-                logger.error(f"❌ Failed to init Live Adapter: {e}. Falling back to Simulation.")
-                adapter = SimulatedAdapter()
+
+        # Initialize Adapter via factory
+        if adapter_config is None:
+            adapter_config = {"mode": "simulated"}
+        try:
+            adapter = create_adapter(adapter_config)
+            logger.info("StrategyEngine: Using %s", type(adapter).__name__)
+        except Exception as e:
+            logger.error("Failed to init adapter: %s. Falling back to simulated.", e)
+            adapter = create_adapter({"mode": "simulated"})
 
         self.execution_engine = ExecutionEngine(db_session, clock, adapter, order_repository)
         

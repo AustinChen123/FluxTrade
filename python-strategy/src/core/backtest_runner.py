@@ -86,11 +86,11 @@ class BacktestRunner:
         mock_account = BacktestAccountService(repo=repo, initial_balance=Decimal(str(self.initial_balance)))
         
         self.engine = StrategyEngine(
-            self.db_session, 
-            self.clock, 
-            order_repository=repo, 
+            self.db_session,
+            self.clock,
+            order_repository=repo,
             account_service=mock_account,
-            execution_mock_only=True
+            adapter_config={"mode": "simulated", "balance": self.initial_balance},
         )
         
         # Inject the SAME RiskManager (with Mock Account) into the strategies
