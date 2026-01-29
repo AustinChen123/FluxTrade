@@ -1,6 +1,6 @@
 import time
 import json
-from typing import Generator, List
+from typing import Generator, List, Optional
 from decimal import Decimal
 from sqlalchemy.orm import Session
 from src.core.db import SessionLocal
@@ -12,22 +12,33 @@ from src.strategies.base import BaseStrategy
 from src.core.repositories import BacktestOrderRepository
 from src.core.backtest.loader import get_candles_generator
 from src.core.analytics import calculate_metrics
+from src.core.interfaces.data_source import IDataSource
 
 from src.core.mocks.account_service import BacktestAccountService
 
 class BacktestRunner:
-    def __init__(self, start_time: int, end_time: int, product_id: str, timeframe: str, initial_balance: float = 10000.0, max_drawdown_limit: float = 0.20):
+    def __init__(
+        self,
+        start_time: int,
+        end_time: int,
+        product_id: str,
+        timeframe: str,
+        initial_balance: float = 10000.0,
+        max_drawdown_limit: float = 0.20,
+        data_source: Optional[IDataSource] = None,
+    ):
         self.start_time = start_time
         self.end_time = end_time
         self.product_id = product_id
         self.timeframe = timeframe
         self.initial_balance = initial_balance
         self.max_drawdown_limit = max_drawdown_limit
-        
-        # Dual sessions: one for data stream, one for execution writing
-        self.data_session = SessionLocal()
+        self.data_source = data_source
+
+        # Data session only needed when no external data_source
+        self.data_session = None if data_source else SessionLocal()
         self.db_session = SessionLocal()
-        
+
         self.clock = BacktestClock(start_time=start_time / 1000) # Clock uses seconds
         self._strategies_buffer: List[BaseStrategy] = []
         self.engine = None
@@ -91,13 +102,21 @@ class BacktestRunner:
         print(f"🚀 Starting Backtest for {self.product_id} [{self.start_time} - {self.end_time}]")
         count = 0
         
-        candle_gen = get_candles_generator(
-            self.data_session, 
-            self.product_id, 
-            self.timeframe, 
-            self.start_time, 
-            self.end_time
-        )
+        if self.data_source:
+            candle_gen = self.data_source.get_candles(
+                self.product_id,
+                self.timeframe,
+                self.start_time,
+                self.end_time,
+            )
+        else:
+            candle_gen = get_candles_generator(
+                self.data_session,
+                self.product_id,
+                self.timeframe,
+                self.start_time,
+                self.end_time,
+            )
         
         stop_threshold = Decimal(str(self.initial_balance)) * Decimal(str(1 - self.max_drawdown_limit))
 
@@ -136,7 +155,8 @@ class BacktestRunner:
             print(f"📊 Metrics: {metrics}")
             
             self.db_session.close()
-            self.data_session.close()
+            if self.data_session:
+                self.data_session.close()
 
 if __name__ == "__main__":
     # Example usage
