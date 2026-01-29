@@ -398,3 +398,22 @@ class StrategyEngine:
         except Exception as e:
             logger.error(f"Failed to log audit trail: {e}")
             self.db.rollback()
+
+    def shutdown(self, timeout: float = 10.0):
+        """Graceful shutdown: stop threads, drain executor, close Redis."""
+        logger.info("StrategyEngine shutting down...")
+        self.running = False
+
+        self.executor.shutdown(wait=True, cancel_futures=False)
+
+        if self.heartbeat_thread and self.heartbeat_thread.is_alive():
+            self.heartbeat_thread.join(timeout=timeout)
+        if self.command_thread and self.command_thread.is_alive():
+            self.command_thread.join(timeout=timeout)
+
+        try:
+            self.redis_client.close()
+        except Exception as e:
+            logger.warning("Error closing Redis: %s", e)
+
+        logger.info("StrategyEngine shutdown complete.")
