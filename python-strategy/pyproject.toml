@@ -22,5 +22,11 @@ dependencies = [
 dev = [
     "maturin>=1.11.5",
     "pytest>=9.0.2",
+    "pytest-cov>=6.0.0",
     "ruff>=0.14.13",
 ]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["."]
+addopts = "-v"
