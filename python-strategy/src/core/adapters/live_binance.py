@@ -5,6 +5,7 @@ from typing import Optional
 import ccxt
 from src.core.interfaces.exchange import IExchangeAdapter, ExchangeError, InsufficientFundsError, NetworkError
 from src.core.exchange_adapter import ExchangeAdapter as CCXTAdapter
+from src.core.product_registry import to_ccxt_symbol
 from src.core.ws_connector import WebSocketOrderConnector
 from src.core.orm_models import Order
 from src.core.models import Position
@@ -94,7 +95,7 @@ class LiveBinanceAdapter(IExchangeAdapter):
         try:
             # ExchangeAdapter wrapper doesn't have cancel_order, use client directly
             # But we need symbol mapping from the wrapper
-            ccxt_symbol = self.ccxt_adapter._map_symbol(product_id)
+            ccxt_symbol = to_ccxt_symbol(product_id)
             self.ccxt_adapter.client.cancel_order(order_id, ccxt_symbol)
             return True
         except Exception as e:
@@ -115,7 +116,7 @@ class LiveBinanceAdapter(IExchangeAdapter):
 
     def get_position(self, product_id: str) -> Optional[Position]:
         try:
-            ccxt_symbol = self.ccxt_adapter._map_symbol(product_id)
+            ccxt_symbol = to_ccxt_symbol(product_id)
             # Fetch positions (Binance specific mostly)
             positions = self.ccxt_adapter.client.fetch_positions([ccxt_symbol])
             

@@ -18,15 +18,7 @@ import ccxt.async_support as ccxt
 from sqlalchemy import text, func
 from src.core.db import SessionLocal
 from src.core.orm_models import Candlestick
-
-
-# Product ID -> CCXT symbol mapping
-PRODUCT_TO_CCXT = {
-    "BINANCE:BTCUSDT-PERP": ("binance", "BTC/USDT:USDT"),
-    "BINANCE:ETHUSDT-PERP": ("binance", "ETH/USDT:USDT"),
-    "BYBIT:BTCUSDT-PERP": ("bybit", "BTC/USDT:USDT"),
-    "BYBIT:ETHUSDT-PERP": ("bybit", "ETH/USDT:USDT"),
-}
+from src.core.product_registry import resolve_exchange
 
 
 def parse_args():
@@ -55,27 +47,6 @@ def get_last_timestamp(session, product_id: str, timeframe: str) -> int | None:
         Candlestick.timeframe == timeframe,
     ).scalar()
     return result
-
-
-def resolve_exchange(product_id: str):
-    """Resolve product ID to CCXT exchange and symbol."""
-    if product_id in PRODUCT_TO_CCXT:
-        return PRODUCT_TO_CCXT[product_id]
-
-    # Generic parsing: EXCHANGE:BASEQUOTE-PERP
-    parts = product_id.split(":")
-    if len(parts) != 2:
-        raise ValueError(f"Invalid product_id format: {product_id}")
-
-    exchange_name = parts[0].lower()
-    symbol_part = parts[1].replace("-PERP", "")
-
-    # Try to split into base/quote (assume USDT quote)
-    if "USDT" in symbol_part:
-        base = symbol_part.replace("USDT", "")
-        return exchange_name, f"{base}/USDT:USDT"
-
-    raise ValueError(f"Cannot resolve CCXT symbol for: {product_id}")
 
 
 async def fetch_and_store(args):
