@@ -1,49 +1,292 @@
+"""
+Tests for src/core/risk_manager.py
+
+Covers:
+- Balance checks (zero, positive, negative scenarios)
+- Position exposure limits
+- Entry vs exit signal handling
+- Position size calculation
+- Edge cases
+"""
+
+import pytest
 from decimal import Decimal
-from src.core.models import Signal, SignalType
-from src.core.risk_manager import RiskManager, AccountService
 
-class MockAccountService(AccountService):
-    def __init__(self, balance=10000.0):
-        self.balance = Decimal(str(balance))
-    
-    def get_balance(self) -> Decimal:
-        return self.balance
-    
-    def get_position(self, strategy_id, product_id):
-        return None
+from src.core.models import Signal, SignalType, Position
+from src.core.risk_manager import RiskManager
 
-def test_risk_rejection_on_zero_balance():
-    # Setup: Balance = 0
-    account_service = MockAccountService(balance=0.0)
-    risk_manager = RiskManager(account_service)
-    
-    # Action: LONG signal
-    signal = Signal(
-        strategy_id="test",
-        product_id="BTC",
-        timeframe="1m",
-        timestamp=1000,
-        type=SignalType.LONG,
-        value=Decimal("50000")
-    )
-    
-    # Assert: Should be rejected
-    assert risk_manager.check_risk(signal) is False
 
-def test_risk_allow_exit_on_zero_balance():
-    # Setup: Balance = 0
-    account_service = MockAccountService(balance=0.0)
-    risk_manager = RiskManager(account_service)
-    
-    # Action: EXIT signal
-    signal = Signal(
-        strategy_id="test",
-        product_id="BTC",
-        timeframe="1m",
-        timestamp=1000,
-        type=SignalType.EXIT_LONG,
-        value=Decimal("50000")
-    )
-    
-    # Assert: Should be accepted (to allow stop loss)
-    assert risk_manager.check_risk(signal) is True
+class TestRiskManagerBalanceChecks:
+    """Tests for balance-related risk checks."""
+
+    def test_reject_entry_on_zero_balance(self, mock_account_service, signal_factory):
+        """Entry signals should be rejected when balance is zero."""
+        mock_account_service.set_balance(Decimal("0"))
+        risk_manager = RiskManager(mock_account_service)
+
+        signal = signal_factory(signal_type=SignalType.LONG)
+        is_allowed, reason = risk_manager.check_risk(signal)
+
+        assert is_allowed is False
+        assert "balance" in reason.lower()
+
+    def test_reject_short_entry_on_zero_balance(self, mock_account_service, signal_factory):
+        """SHORT entry should also be rejected on zero balance."""
+        mock_account_service.set_balance(Decimal("0"))
+        risk_manager = RiskManager(mock_account_service)
+
+        signal = signal_factory(signal_type=SignalType.SHORT)
+        is_allowed, reason = risk_manager.check_risk(signal)
+
+        assert is_allowed is False
+
+    def test_allow_exit_on_zero_balance(self, mock_account_service, signal_factory):
+        """Exit signals should be allowed even with zero balance (stop loss)."""
+        mock_account_service.set_balance(Decimal("0"))
+        risk_manager = RiskManager(mock_account_service)
+
+        signal = signal_factory(signal_type=SignalType.EXIT_LONG)
+        is_allowed, reason = risk_manager.check_risk(signal)
+
+        assert is_allowed is True
+
+    def test_allow_exit_short_on_zero_balance(self, mock_account_service, signal_factory):
+        """EXIT_SHORT should also be allowed on zero balance."""
+        mock_account_service.set_balance(Decimal("0"))
+        risk_manager = RiskManager(mock_account_service)
+
+        signal = signal_factory(signal_type=SignalType.EXIT_SHORT)
+        is_allowed, reason = risk_manager.check_risk(signal)
+
+        assert is_allowed is True
+
+    def test_allow_entry_with_positive_balance(self, mock_account_service, signal_factory):
+        """Entry signals should be allowed with positive balance."""
+        mock_account_service.set_balance(Decimal("10000"))
+        risk_manager = RiskManager(mock_account_service)
+
+        signal = signal_factory(signal_type=SignalType.LONG)
+        is_allowed, reason = risk_manager.check_risk(signal)
+
+        assert is_allowed is True
+        assert reason == "PASS"
+
+    def test_reject_entry_on_negative_balance(self, mock_account_service, signal_factory):
+        """Entry signals should be rejected on negative balance."""
+        mock_account_service.set_balance(Decimal("-100"))
+        risk_manager = RiskManager(mock_account_service)
+
+        signal = signal_factory(signal_type=SignalType.LONG)
+        is_allowed, reason = risk_manager.check_risk(signal)
+
+        assert is_allowed is False
+
+
+class TestRiskManagerExposureChecks:
+    """Tests for position exposure limits."""
+
+    def test_reject_entry_when_max_exposure_reached(
+        self, mock_account_service, signal_factory, position_factory
+    ):
+        """Entry should be rejected when max exposure is already reached."""
+        mock_account_service.set_balance(Decimal("100000"))
+
+        # Set position with high exposure (quantity * entry_price >= max_exposure)
+        # Default max_exposure_per_product is 50000 USDT
+        large_position = position_factory(
+            quantity=Decimal("1.5"),
+            entry_price=Decimal("40000")  # 1.5 * 40000 = 60000 > 50000
+        )
+        mock_account_service.set_position(large_position)
+
+        risk_manager = RiskManager(mock_account_service)
+        signal = signal_factory(signal_type=SignalType.LONG)
+
+        is_allowed, reason = risk_manager.check_risk(signal)
+
+        assert is_allowed is False
+        assert "exposure" in reason.lower()
+
+    def test_allow_entry_when_under_max_exposure(
+        self, mock_account_service, signal_factory, position_factory
+    ):
+        """Entry should be allowed when under max exposure."""
+        mock_account_service.set_balance(Decimal("100000"))
+
+        # Set position with low exposure
+        small_position = position_factory(
+            quantity=Decimal("0.5"),
+            entry_price=Decimal("40000")  # 0.5 * 40000 = 20000 < 50000
+        )
+        mock_account_service.set_position(small_position)
+
+        risk_manager = RiskManager(mock_account_service)
+        signal = signal_factory(signal_type=SignalType.LONG)
+
+        is_allowed, reason = risk_manager.check_risk(signal)
+
+        assert is_allowed is True
+
+    def test_allow_exit_regardless_of_exposure(
+        self, mock_account_service, signal_factory, position_factory
+    ):
+        """Exit signals should be allowed regardless of exposure."""
+        mock_account_service.set_balance(Decimal("100000"))
+
+        large_position = position_factory(
+            quantity=Decimal("2.0"),
+            entry_price=Decimal("40000")
+        )
+        mock_account_service.set_position(large_position)
+
+        risk_manager = RiskManager(mock_account_service)
+        signal = signal_factory(signal_type=SignalType.EXIT_LONG)
+
+        is_allowed, reason = risk_manager.check_risk(signal)
+
+        assert is_allowed is True
+
+
+class TestRiskManagerNoSignal:
+    """Tests for NO_SIGNAL handling."""
+
+    def test_no_signal_always_passes(self, mock_account_service, signal_factory):
+        """NO_SIGNAL should always pass risk check."""
+        mock_account_service.set_balance(Decimal("0"))
+        risk_manager = RiskManager(mock_account_service)
+
+        signal = signal_factory(signal_type=SignalType.NO_SIGNAL)
+        is_allowed, reason = risk_manager.check_risk(signal)
+
+        assert is_allowed is True
+        assert reason == "NO_SIGNAL"
+
+
+class TestPositionSizeCalculation:
+    """Tests for position size calculation."""
+
+    def test_calculate_position_size_basic(self, mock_account_service):
+        """Position size should be calculated based on risk percentage."""
+        mock_account_service.set_balance(Decimal("10000"))
+        risk_manager = RiskManager(mock_account_service)
+
+        # Entry at 42000, SL at 41000 (1000 point risk)
+        # 2% of 10000 = 200 USDT risk
+        # Size = 200 / 1000 = 0.2
+        size = risk_manager.calculate_position_size(
+            entry_price=Decimal("42000"),
+            stop_loss_price=Decimal("41000"),
+            risk_percent=0.02
+        )
+
+        assert size == Decimal("0.2")
+
+    def test_calculate_position_size_custom_risk(self, mock_account_service):
+        """Position size should scale with risk percentage."""
+        mock_account_service.set_balance(Decimal("10000"))
+        risk_manager = RiskManager(mock_account_service)
+
+        # 1% risk = 100 USDT
+        # Size = 100 / 1000 = 0.1
+        size = risk_manager.calculate_position_size(
+            entry_price=Decimal("42000"),
+            stop_loss_price=Decimal("41000"),
+            risk_percent=0.01
+        )
+
+        assert size == Decimal("0.1")
+
+    def test_calculate_position_size_zero_balance(self, mock_account_service):
+        """Position size should be zero when balance is zero."""
+        mock_account_service.set_balance(Decimal("0"))
+        risk_manager = RiskManager(mock_account_service)
+
+        size = risk_manager.calculate_position_size(
+            entry_price=Decimal("42000"),
+            stop_loss_price=Decimal("41000")
+        )
+
+        assert size == Decimal("0")
+
+    def test_calculate_position_size_zero_stop_distance(self, mock_account_service):
+        """Position size should be zero when stop distance is zero."""
+        mock_account_service.set_balance(Decimal("10000"))
+        risk_manager = RiskManager(mock_account_service)
+
+        size = risk_manager.calculate_position_size(
+            entry_price=Decimal("42000"),
+            stop_loss_price=Decimal("42000")  # Same as entry
+        )
+
+        assert size == Decimal("0")
+
+    def test_calculate_position_size_short_position(self, mock_account_service):
+        """Position size calculation should work for short positions."""
+        mock_account_service.set_balance(Decimal("10000"))
+        risk_manager = RiskManager(mock_account_service)
+
+        # Short entry at 42000, SL at 43000 (above entry)
+        # Distance is still 1000
+        size = risk_manager.calculate_position_size(
+            entry_price=Decimal("42000"),
+            stop_loss_price=Decimal("43000"),
+            risk_percent=0.02
+        )
+
+        assert size == Decimal("0.2")
+
+
+class TestRiskManagerEdgeCases:
+    """Edge case tests for RiskManager."""
+
+    def test_very_small_balance(self, mock_account_service, signal_factory):
+        """Risk check should work with very small positive balance."""
+        mock_account_service.set_balance(Decimal("0.01"))
+        risk_manager = RiskManager(mock_account_service)
+
+        signal = signal_factory(signal_type=SignalType.LONG)
+        is_allowed, reason = risk_manager.check_risk(signal)
+
+        # Should be allowed (balance > 0)
+        assert is_allowed is True
+
+    def test_very_large_balance(self, mock_account_service, signal_factory):
+        """Risk check should work with very large balance."""
+        mock_account_service.set_balance(Decimal("1000000000"))  # 1 billion
+        risk_manager = RiskManager(mock_account_service)
+
+        signal = signal_factory(signal_type=SignalType.LONG)
+        is_allowed, reason = risk_manager.check_risk(signal)
+
+        assert is_allowed is True
+
+    def test_no_existing_position(self, mock_account_service, signal_factory):
+        """Entry should be allowed when no position exists."""
+        mock_account_service.set_balance(Decimal("10000"))
+        # No position set
+        risk_manager = RiskManager(mock_account_service)
+
+        signal = signal_factory(signal_type=SignalType.LONG)
+        is_allowed, reason = risk_manager.check_risk(signal)
+
+        assert is_allowed is True
+
+    def test_position_at_exactly_max_exposure(
+        self, mock_account_service, signal_factory, position_factory
+    ):
+        """Entry at exactly max exposure should be rejected."""
+        mock_account_service.set_balance(Decimal("100000"))
+
+        # Position at exactly max exposure (50000)
+        position = position_factory(
+            quantity=Decimal("1.25"),
+            entry_price=Decimal("40000")  # 1.25 * 40000 = 50000
+        )
+        mock_account_service.set_position(position)
+
+        risk_manager = RiskManager(mock_account_service)
+        signal = signal_factory(signal_type=SignalType.LONG)
+
+        is_allowed, reason = risk_manager.check_risk(signal)
+
+        assert is_allowed is False
