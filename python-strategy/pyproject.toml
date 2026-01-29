@@ -25,6 +25,10 @@ dev = [
     "pytest-cov>=6.0.0",
     "ruff>=0.14.13",
 ]
+bench = [
+    "vectorbt>=0.26.2",
+    "backtesting>=0.3.3",
+]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

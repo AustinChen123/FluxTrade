@@ -35,6 +35,7 @@ work/
 python-strategy/strategies_hot/
 python-strategy/src/core/market_structure.py
 REFACTOR_PLAN_V2.md
+COMPILATION_GUIDE.internal.md
 
 # Strategies (Keep base and examples, ignore others)
 python-strategy/src/strategies/*

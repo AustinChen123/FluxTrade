@@ -180,28 +180,36 @@ class PythonMatchingEngine:
 # Benchmark Data Generation
 # ============================================================================
 
-def generate_candles(n: int, product_id: str = "BTCUSDT") -> list[dict]:
-    """Generate synthetic OHLCV candles."""
+def generate_candles(n: int, product_id: str = "BTCUSDT", seed: int = 42) -> list[dict]:
+    """Generate synthetic OHLCV candles with fixed seed for reproducibility.
+
+    Uses Ornstein-Uhlenbeck mean-reversion so price stays in a
+    realistic range regardless of candle count.
+    """
+    rng = random.Random(seed)
     candles = []
-    price = 50000.0
+    mean_price = 50000.0
+    price = mean_price
+    reversion = 0.001  # mean-reversion strength
+    volatility = 100.0
     timestamp = 1704067200000  # 2024-01-01 00:00:00 UTC
 
     for i in range(n):
-        # Random walk
-        change = random.gauss(0, 100)
+        # Ornstein-Uhlenbeck: pull toward mean + random noise
+        change = reversion * (mean_price - price) + rng.gauss(0, volatility)
         open_price = price
         close_price = price + change
-        high = max(open_price, close_price) + abs(random.gauss(0, 50))
-        low = min(open_price, close_price) - abs(random.gauss(0, 50))
+        high = max(open_price, close_price) + abs(rng.gauss(0, 50))
+        low = min(open_price, close_price) - abs(rng.gauss(0, 50))
 
         candles.append({
             "product_id": product_id,
-            "timestamp": timestamp + i * 60000,  # 1 minute candles
+            "timestamp": timestamp + i * 60000,
             "open": open_price,
             "high": high,
             "low": low,
             "close": close_price,
-            "volume": random.uniform(100, 1000)
+            "volume": rng.uniform(100, 1000)
         })
 
         price = close_price
@@ -209,27 +217,62 @@ def generate_candles(n: int, product_id: str = "BTCUSDT") -> list[dict]:
     return candles
 
 
-def generate_orders(candles: list[dict], order_frequency: float = 0.1) -> list[dict]:
-    """Generate orders based on candles (simple moving average crossover)."""
+def generate_orders(
+    candles: list[dict],
+    fast_window: int = 10,
+    slow_window: int = 30,
+    quantity: float = 0.1,
+) -> list[dict]:
+    """Generate orders from SMA crossover signals.
+
+    Uses the same SMA(fast/slow) crossover logic as the vectorbt and
+    backtesting.py benchmarks so that all engines trade the same
+    strategy and results are comparable.
+    """
     orders = []
     order_id = 0
 
-    # Simple strategy: place order on 10% of candles
-    for i, candle in enumerate(candles):
-        if random.random() < order_frequency:
-            order_id += 1
-            side = random.choice(["LONG", "SHORT"])
-            order_type = random.choice(["MARKET", "LIMIT"])
+    if len(candles) < slow_window + 1:
+        return orders
 
+    closes = [c["close"] for c in candles]
+    in_position = False
+
+    for i in range(slow_window, len(candles)):
+        fast_ma = sum(closes[i - fast_window + 1 : i + 1]) / fast_window
+        slow_ma = sum(closes[i - slow_window + 1 : i + 1]) / slow_window
+        prev_fast = sum(closes[i - fast_window : i]) / fast_window
+        prev_slow = sum(closes[i - slow_window : i]) / slow_window
+
+        bullish_now = fast_ma > slow_ma
+        bullish_prev = prev_fast > prev_slow
+
+        if bullish_now and not bullish_prev and not in_position:
+            # Golden cross → buy
+            order_id += 1
             orders.append({
                 "id": f"order_{order_id}",
                 "candle_idx": i,
-                "product_id": candle["product_id"],
-                "side": side,
-                "order_type": order_type,
-                "price": candle["close"] * (0.99 if side == "LONG" else 1.01),
-                "quantity": random.uniform(0.01, 0.1)
+                "product_id": candles[i]["product_id"],
+                "side": "LONG",
+                "order_type": "MARKET",
+                "price": candles[i]["close"],
+                "quantity": quantity,
             })
+            in_position = True
+        elif not bullish_now and bullish_prev and in_position:
+            # Death cross → sell / exit
+            order_id += 1
+            orders.append({
+                "id": f"order_{order_id}",
+                "candle_idx": i,
+                "product_id": candles[i]["product_id"],
+                "side": "SHORT",
+                "order_type": "MARKET",
+                "price": candles[i]["close"],
+                "quantity": quantity,
+            })
+            in_position = False
 
     return orders
 
@@ -353,8 +396,13 @@ def benchmark_python_engine(candles: list[dict], orders: list[dict], iterations:
     }
 
 
-def benchmark_vectorbt(candles: list[dict], iterations: int = 3) -> Optional[dict]:
-    """Benchmark vectorbt (if available)."""
+def benchmark_vectorbt(
+    candles: list[dict],
+    fast_window: int = 10,
+    slow_window: int = 30,
+    iterations: int = 3,
+) -> Optional[dict]:
+    """Benchmark vectorbt with SMA crossover (same windows as engine benchmarks)."""
     try:
         import vectorbt as vbt
         import pandas as pd
@@ -362,7 +410,6 @@ def benchmark_vectorbt(candles: list[dict], iterations: int = 3) -> Optional[dic
     except ImportError:
         return None
 
-    # Convert to DataFrame
     df = pd.DataFrame(candles)
     df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')
     df.set_index('timestamp', inplace=True)
@@ -372,22 +419,20 @@ def benchmark_vectorbt(candles: list[dict], iterations: int = 3) -> Optional[dic
     for _ in range(iterations):
         start = time.perf_counter()
 
-        # Simple SMA crossover backtest
-        fast_ma = df['close'].rolling(10).mean()
-        slow_ma = df['close'].rolling(30).mean()
+        fast_ma = df['close'].rolling(fast_window).mean()
+        slow_ma = df['close'].rolling(slow_window).mean()
 
-        entries = fast_ma > slow_ma
-        exits = fast_ma < slow_ma
+        entries = (fast_ma > slow_ma) & (fast_ma.shift(1) <= slow_ma.shift(1))
+        exits = (fast_ma < slow_ma) & (fast_ma.shift(1) >= slow_ma.shift(1))
 
         pf = vbt.Portfolio.from_signals(
             df['close'],
             entries,
             exits,
-            init_cash=100000,
-            fees=0.001
+            init_cash=100000.0,
+            fees=0.0,
         )
 
-        # Get stats to force computation
         _ = pf.total_return()
 
         elapsed = time.perf_counter() - start
@@ -403,8 +448,13 @@ def benchmark_vectorbt(candles: list[dict], iterations: int = 3) -> Optional[dic
     }
 
 
-def benchmark_backtestingpy(candles: list[dict], iterations: int = 3) -> Optional[dict]:
-    """Benchmark backtesting.py (if available)."""
+def benchmark_backtestingpy(
+    candles: list[dict],
+    fast_window: int = 10,
+    slow_window: int = 30,
+    iterations: int = 3,
+) -> Optional[dict]:
+    """Benchmark backtesting.py with SMA crossover (same windows as engine benchmarks)."""
     try:
         from backtesting import Backtest, Strategy
         from backtesting.lib import crossover
@@ -412,7 +462,6 @@ def benchmark_backtestingpy(candles: list[dict], iterations: int = 3) -> Optiona
     except ImportError:
         return None
 
-    # Convert to DataFrame with required columns
     df = pd.DataFrame(candles)
     df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')
     df.set_index('timestamp', inplace=True)
@@ -420,8 +469,8 @@ def benchmark_backtestingpy(candles: list[dict], iterations: int = 3) -> Optiona
     df = df[['Open', 'High', 'Low', 'Close', 'Volume']]
 
     class SmaCross(Strategy):
-        n1 = 10
-        n2 = 30
+        n1 = fast_window
+        n2 = slow_window
 
         def init(self):
             self.sma1 = self.I(lambda x: pd.Series(x).rolling(self.n1).mean(), self.data.Close)
@@ -429,16 +478,21 @@ def benchmark_backtestingpy(candles: list[dict], iterations: int = 3) -> Optiona
 
         def next(self):
             if crossover(self.sma1, self.sma2):
-                self.buy()
+                if not self.position:
+                    self.buy()
             elif crossover(self.sma2, self.sma1):
-                self.sell()
+                if self.position:
+                    self.position.close()
 
     times = []
 
     for _ in range(iterations):
         start = time.perf_counter()
 
-        bt = Backtest(df, SmaCross, cash=100000, commission=0.001)
+        bt = Backtest(
+            df, SmaCross, cash=100000, commission=0.0,
+            trade_on_close=True, exclusive_orders=True,
+        )
         stats = bt.run()
 
         elapsed = time.perf_counter() - start
@@ -488,19 +542,20 @@ def print_results(results: list[dict], num_candles: int, num_orders: int):
 def main():
     print("FluxTrade Matching Engine Benchmark")
     print("=" * 80)
+    print("Strategy: SMA(10/30) crossover  |  Qty: 0.1  |  Fees: 0  |  Cash: 100K")
+    print("=" * 80)
 
-    # Test configurations
     configs = [
-        (10_000, 0.1),    # 10K candles, 10% order frequency (~1000 orders)
-        (100_000, 0.05),  # 100K candles, 5% order frequency (~5000 orders)
-        (500_000, 0.02),  # 500K candles, 2% order frequency (~10000 orders)
+        10_000,
+        100_000,
+        500_000,
     ]
 
-    for num_candles, order_freq in configs:
-        print(f"\nGenerating {num_candles:,} candles...")
+    for num_candles in configs:
+        print(f"\nGenerating {num_candles:,} candles (seed=42)...")
         candles = generate_candles(num_candles)
-        orders = generate_orders(candles, order_freq)
-        print(f"Generated {len(orders):,} orders")
+        orders = generate_orders(candles)
+        print(f"SMA crossover generated {len(orders):,} orders")
 
         results = []
 
