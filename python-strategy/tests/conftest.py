@@ -429,6 +429,7 @@ def signal_factory():
         price: Optional[Decimal] = None,
         stop_loss: Optional[Decimal] = None,
         take_profit: Optional[Decimal] = None,
+        trailing_distance: Optional[Decimal] = None,
         metadata: Optional[dict] = None
     ) -> Signal:
         return Signal(
@@ -442,6 +443,7 @@ def signal_factory():
             price=price,
             stop_loss=stop_loss,
             take_profit=take_profit,
+            trailing_distance=trailing_distance,
             metadata=metadata
         )
     return _create
@@ -487,7 +489,8 @@ def order_factory():
         status: str = "open",
         timestamp: int = 1704067200000,
         filled_quantity: Decimal = Decimal("0"),
-        filled_price: Decimal = Decimal("0")
+        filled_price: Decimal = Decimal("0"),
+        trigger_price: Optional[Decimal] = None,
     ) -> Order:
         return Order(
             id=order_id or str(uuid.uuid4()),
@@ -498,6 +501,7 @@ def order_factory():
             type=order_type,
             side=side,
             price=price,
+            trigger_price=trigger_price,
             quantity=quantity,
             status=status,
             timestamp=timestamp,
@@ -618,9 +622,13 @@ def order_manager(mock_order_repo, mock_clock):
 
 @pytest.fixture
 def simulated_adapter():
-    """Provides a SimulatedAdapter for backtesting."""
+    """Provides a SimulatedAdapter backed by Rust PyMatchingEngine."""
     from src.core.adapters.simulated import SimulatedAdapter
-    return SimulatedAdapter(initial_balance=DEFAULT_BALANCE)
+    return SimulatedAdapter(
+        initial_balance=DEFAULT_BALANCE,
+        maker_fee=0.0002,
+        taker_fee=0.0006,
+    )
 
 
 @pytest.fixture

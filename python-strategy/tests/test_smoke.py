@@ -8,7 +8,7 @@ Exercises the full signal-to-position pipeline in-memory (no Docker/Redis/Postgr
 import pytest
 from decimal import Decimal
 
-from src.core.models import Signal, SignalType, Candlestick
+from src.core.models import SignalType
 from src.core.execution import ExecutionEngine
 from src.core.risk_manager import RiskManager
 from src.core.adapters.simulated import SimulatedAdapter
@@ -36,7 +36,7 @@ class TestTradingPipeline:
     ):
         """Full round-trip: open LONG -> fill -> close with profit -> PnL realized."""
         engine, adapter, repo = self._build_engine(mock_db_session, mock_clock)
-        initial_balance = repo.balance
+        initial_balance = adapter.get_balance()
 
         # 1. Execute LONG signal
         signal = signal_factory(
@@ -46,14 +46,14 @@ class TestTradingPipeline:
         )
         order_id = engine.execute_signal(signal)
         assert order_id is not None
-        assert len(adapter.open_orders) == 1
+        assert len(adapter._engine.open_orders) == 1
 
         # 2. Market data triggers fill (low touches limit price)
         candle = candlestick_factory(
             low=Decimal("39500"), high=Decimal("41000"), close=Decimal("40500")
         )
         engine.process_market_data(candle)
-        assert len(adapter.open_orders) == 0
+        assert len(adapter._engine.open_orders) == 0
 
         # 3. Position should exist
         pos = adapter.get_position(signal.product_id)
@@ -75,17 +75,16 @@ class TestTradingPipeline:
         )
         engine.process_market_data(exit_candle)
 
-        # 5. Verify PnL realized in repo
-        # BacktestOrderRepository tracks balance changes
+        # 5. Verify PnL realized via adapter (Rust engine tracks balance)
         expected_pnl = (Decimal("42000") - Decimal("40000")) * Decimal("1.0")
-        assert repo.balance == initial_balance + expected_pnl
+        assert adapter.get_balance() == initial_balance + expected_pnl
 
     def test_short_entry_and_exit_with_profit(
         self, mock_db_session, mock_clock, signal_factory, candlestick_factory
     ):
         """Full round-trip: open SHORT -> fill -> close with profit."""
         engine, adapter, repo = self._build_engine(mock_db_session, mock_clock)
-        initial_balance = repo.balance
+        initial_balance = adapter.get_balance()
 
         # 1. SHORT entry
         signal = signal_factory(
@@ -118,12 +117,12 @@ class TestTradingPipeline:
         engine.process_market_data(exit_candle)
 
         expected_pnl = (Decimal("44000") - Decimal("42000")) * Decimal("0.5")
-        assert repo.balance == initial_balance + expected_pnl
+        assert adapter.get_balance() == initial_balance + expected_pnl
 
     def test_market_order_fills_immediately_on_next_candle(
         self, mock_db_session, mock_clock, signal_factory, candlestick_factory
     ):
-        """Market order (no price) fills at close on next candle."""
+        """Market order (no price) fills at open on next candle."""
         engine, adapter, repo = self._build_engine(mock_db_session, mock_clock)
 
         signal = signal_factory(
@@ -134,13 +133,13 @@ class TestTradingPipeline:
         )
         order_id = engine.execute_signal(signal)
         assert order_id is not None
-        assert len(adapter.open_orders) == 1
-        assert adapter.open_orders[0].type == "market"
+        assert len(adapter._engine.open_orders) == 1
+        assert adapter._engine.open_orders[0].order_type == "MARKET"
 
         candle = candlestick_factory(close=Decimal("41000"))
         engine.process_market_data(candle)
 
-        assert len(adapter.open_orders) == 0
+        assert len(adapter._engine.open_orders) == 0
         pos = adapter.get_position(signal.product_id)
         assert pos is not None
 
@@ -154,7 +153,7 @@ class TestTradingPipeline:
         result = engine.execute_signal(signal)
 
         assert result is None
-        assert len(adapter.open_orders) == 0
+        assert len(adapter._engine.open_orders) == 0
 
     def test_adapter_failure_does_not_crash_pipeline(
         self, mock_db_session, mock_clock, signal_factory
@@ -240,15 +239,26 @@ class TestSimulatedAdapterPipeline:
 
 @pytest.mark.smoke
 class TestBacktestRepositoryPipeline:
-    """Verify BacktestOrderRepository tracks positions and PnL."""
+    """Verify balance/PnL via Rust-backed SimulatedAdapter."""
 
-    def test_round_trip_pnl(self, mock_db_session):
-        """Open -> close should calculate correct PnL."""
-        repo = BacktestOrderRepository(
-            mock_db_session, session_id=1, initial_balance=Decimal("10000")
-        )
+    def test_round_trip_pnl(self, order_factory, candlestick_factory):
+        """Open -> close should calculate correct PnL via adapter."""
+        adapter = SimulatedAdapter(initial_balance=Decimal("10000"))
 
-        repo.update_position("s1", "BINANCE:BTCUSDT-PERP", "buy", Decimal("1.0"), Decimal("40000"))
-        repo.update_position("s1", "BINANCE:BTCUSDT-PERP", "sell", Decimal("1.0"), Decimal("42000"))
+        # Buy 1.0 BTC at 40000 (limit)
+        buy = order_factory(order_type="limit", side="buy",
+                            product_id="BINANCE:BTCUSDT-PERP",
+                            price=Decimal("40000"), quantity=Decimal("1.0"))
+        adapter.place_order(buy)
+        adapter.on_market_data(candlestick_factory(
+            low=Decimal("39500"), high=Decimal("41000"), close=Decimal("40500")))
 
-        assert repo.balance == Decimal("12000")
+        # Sell 1.0 BTC at 42000 (limit)
+        sell = order_factory(order_type="limit", side="sell",
+                             product_id="BINANCE:BTCUSDT-PERP",
+                             price=Decimal("42000"), quantity=Decimal("1.0"))
+        adapter.place_order(sell)
+        adapter.on_market_data(candlestick_factory(
+            low=Decimal("41500"), high=Decimal("43000"), close=Decimal("42500")))
+
+        assert adapter.get_balance() == Decimal("12000")

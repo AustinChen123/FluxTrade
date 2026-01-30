@@ -220,7 +220,7 @@ class TestPositionUpdates:
     """Tests for position updates through order manager."""
 
     def test_fill_updates_position_in_backtest(self, mock_clock, mock_db_session, signal_factory):
-        """Fill should update position in backtest mode."""
+        """Fill in backtest mode — position tracked by Rust engine, not repo."""
         from src.core.repositories import BacktestOrderRepository
         backtest_repo = BacktestOrderRepository(mock_db_session, session_id=1)
         order_manager = OrderManager(backtest_repo, mock_clock)
@@ -229,10 +229,10 @@ class TestPositionUpdates:
         order = order_manager.create_order(signal, "buy", "market", Decimal("0.1"))
         order_manager.fill_order(order, Decimal("42000"), Decimal("0.1"))
 
-        # Check position was updated
+        # BacktestOrderRepository delegates position tracking to Rust engine
+        # get_position always returns None in backtest repo
         pos = backtest_repo.get_position(signal.strategy_id, signal.product_id)
-        assert pos is not None
-        assert pos.quantity == Decimal("0.1")
+        assert pos is None
 
 
 class TestOrderManagerEdgeCases:
