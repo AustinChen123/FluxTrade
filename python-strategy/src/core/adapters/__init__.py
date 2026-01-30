@@ -35,7 +35,13 @@ def create_adapter(config: dict) -> IExchangeAdapter:
 
     if mode == "simulated":
         balance = Decimal(str(config.get("balance", 100000)))
-        return SimulatedAdapter(initial_balance=balance)
+        maker_fee = float(config.get("maker_fee", 0.0))
+        taker_fee = float(config.get("taker_fee", 0.0))
+        return SimulatedAdapter(
+            initial_balance=balance,
+            maker_fee=maker_fee,
+            taker_fee=taker_fee,
+        )
 
     exchange_id = config.get("exchange", "binance")
     api_key = config.get("api_key")

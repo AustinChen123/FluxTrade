@@ -16,7 +16,7 @@ class ExecutionEngine:
         else:
             from src.core.repositories import LiveOrderRepository
             self.order_manager = OrderManager(LiveOrderRepository(db_session), clock)
-            
+
         self.default_quantity = Decimal("0.01")
         self.adapter = adapter
         self.logger.info(f"ExecutionEngine initialized with adapter: {type(adapter).__name__}")
@@ -25,26 +25,27 @@ class ExecutionEngine:
         """
         Passes market data to the adapter (if applicable) to check for simulated fills.
         """
-        # Only SimulatedAdapter needs this loop. 
-        # Using hasattr to allow any adapter that implements the simulation hook.
         if hasattr(self.adapter, "on_market_data"):
             fills = self.adapter.on_market_data(candle)
-            
+
             for fill in fills:
                 order = fill['order']
                 price = fill['price']
                 qty = fill['quantity']
-                
-                self.logger.info(f"⚡ Execution: Adapter reported fill for {order.id} at {price}")
+                fee = fill.get('fee')
+
+                self.logger.info(f"Execution: Adapter fill for {order.id} at {price} (fee={fee})")
                 self.order_manager.fill_order(
                     order=order,
                     fill_price=price,
-                    fill_quantity=qty
+                    fill_quantity=qty,
+                    fee=fee,
                 )
 
     def execute_signal(self, signal: Signal, candle: Optional[Candlestick] = None) -> Optional[str]:
         """
         Converts Signal to Order and delegates execution to the Adapter.
+        Also places SL/TP/Trailing orders when specified in the signal.
         Returns the Order ID (Internal) if successful.
         """
         side = self._determine_side(signal.type)
@@ -58,14 +59,14 @@ class ExecutionEngine:
         if signal.price and signal.price > 0:
             order_type = "limit"
             limit_price = signal.price
-        elif signal.value: # Legacy support
+        elif signal.value:
             order_type = "limit"
             limit_price = signal.value
         else:
             order_type = "market"
             limit_price = None
 
-        # 1. Create Order in DB (Open)
+        # 1. Create Entry Order in DB
         order = self.order_manager.create_order(
             signal=signal,
             side=side,
@@ -76,20 +77,84 @@ class ExecutionEngine:
 
         # 2. Execute via Adapter
         try:
-            self.logger.info(f"🚀 Sending Order {order.id} via Adapter...")
+            self.logger.info(f"Sending Order {order.id} via Adapter...")
             exchange_id = self.adapter.place_order(order)
-            
-            # Update with the ID returned by adapter
-            # Note: LiveBinanceAdapter might return "WS-{id}" for async orders
             self.order_manager.update_exchange_order_id(order, exchange_id)
-            
-            self.logger.info(f"✅ Order Placed. Internal: {order.id}, Exchange: {exchange_id}")
-            return order.id
-
+            self.logger.info(f"Order Placed. Internal: {order.id}, Exchange: {exchange_id}")
         except Exception as e:
-            self.logger.error(f"❌ Execution Failed: {e}")
+            self.logger.error(f"Execution Failed: {e}")
             self.order_manager.fail_order(order, str(e))
             return None
+
+        # 3. Place conditional orders (SL/TP/Trailing)
+        if signal.stop_loss or signal.take_profit or signal.trailing_distance:
+            self._place_conditional_orders(signal, order, qty)
+
+        return order.id
+
+    def _place_conditional_orders(self, signal: Signal, entry_order, qty: Decimal):
+        """Submit SL/TP/Trailing orders linked via OCO to each other."""
+        # Closing side is opposite of entry
+        close_side = "sell" if entry_order.side.lower() == "buy" else "buy"
+
+        sl_order = None
+        tp_order = None
+
+        # Create SL order
+        if signal.stop_loss:
+            sl_order = self.order_manager.create_order(
+                signal=signal,
+                side=close_side,
+                order_type="stop_loss",
+                quantity=qty,
+                trigger_price=signal.stop_loss,
+            )
+
+        # Create TP order
+        if signal.take_profit:
+            tp_order = self.order_manager.create_order(
+                signal=signal,
+                side=close_side,
+                order_type="take_profit",
+                quantity=qty,
+                trigger_price=signal.take_profit,
+            )
+
+        # Link OCO: SL and TP cancel each other
+        if sl_order and tp_order:
+            sl_order._linked_order_id = tp_order.id
+            tp_order._linked_order_id = sl_order.id
+
+        # Place orders via adapter
+        if sl_order:
+            try:
+                ex_id = self.adapter.place_order(sl_order)
+                self.order_manager.update_exchange_order_id(sl_order, ex_id)
+            except Exception as e:
+                self.logger.error(f"Failed to place SL order: {e}")
+
+        if tp_order:
+            try:
+                ex_id = self.adapter.place_order(tp_order)
+                self.order_manager.update_exchange_order_id(tp_order, ex_id)
+            except Exception as e:
+                self.logger.error(f"Failed to place TP order: {e}")
+
+        # Create Trailing Stop order
+        if signal.trailing_distance:
+            ts_order = self.order_manager.create_order(
+                signal=signal,
+                side=close_side,
+                order_type="trailing_stop",
+                quantity=qty,
+                trigger_price=signal.stop_loss,
+            )
+            ts_order._trailing_distance = signal.trailing_distance
+            try:
+                ex_id = self.adapter.place_order(ts_order)
+                self.order_manager.update_exchange_order_id(ts_order, ex_id)
+            except Exception as e:
+                self.logger.error(f"Failed to place trailing stop order: {e}")
 
     def _determine_side(self, signal_type: SignalType) -> Optional[str]:
         if signal_type == SignalType.LONG:

@@ -64,6 +64,7 @@ class Signal(BaseFluxModel):
     price: Optional[Decimal] = None
     stop_loss: Optional[Decimal] = None
     take_profit: Optional[Decimal] = None
+    trailing_distance: Optional[Decimal] = None
     metadata: Optional[dict] = None
 
     @field_validator('product_id')

@@ -1,149 +1,177 @@
 import uuid
 from decimal import Decimal
 from typing import Optional, List, Dict
-from src.core.interfaces.exchange import IExchangeAdapter, ExchangeError, InsufficientFundsError
+from src.core.interfaces.exchange import IExchangeAdapter
 from src.core.orm_models import Order
 from src.core.models import Position, Candlestick
-from src.core.simulation import SlippageModel
+
+# Rust PyO3 matching engine
+from fluxtrade_core import (
+    PyMatchingEngine,
+    Order as RustOrder,
+    Candlestick as RustCandlestick,
+)
+
 
 class SimulatedAdapter(IExchangeAdapter):
-    def __init__(self, initial_balance: Decimal = Decimal("100000")):
-        self.balance = {"USDT": initial_balance}
-        self.positions: Dict[str, Position] = {} # product_id -> Position
-        self.open_orders: List[Order] = []
-        self.slippage_model = SlippageModel()
-        self.filled_orders_buffer = [] # Store fills to return to engine
+    """Exchange adapter backed by Rust PyMatchingEngine for backtest.
+
+    All balance, position, and order matching logic is delegated to the
+    Rust engine.  This adapter converts between Python ORM/Pydantic types
+    and the Rust types exposed via PyO3.
+    """
+
+    def __init__(
+        self,
+        initial_balance: Decimal = Decimal("100000"),
+        maker_fee: float = 0.0,
+        taker_fee: float = 0.0,
+    ):
+        self._engine = PyMatchingEngine(
+            float(initial_balance),
+            maker_fee=maker_fee,
+            taker_fee=taker_fee,
+        )
+        # Map order ID → ORM Order so we can return it in fills
+        self._order_map: Dict[str, Order] = {}
+
+    # ── IExchangeAdapter interface ───────────────────────────────
 
     def place_order(self, order: Order) -> str:
-        # Generate a simulated exchange ID
         exchange_id = f"SIM-{uuid.uuid4().hex[:8]}"
-        
-        # Validate Funds (Simple check)
-        cost = order.quantity * (order.price if order.price else Decimal("0")) # Approximation for market
-        # In a real sim, we'd check margin, leverage, etc. 
-        # For now, we assume infinite margin or simple spot-like check if needed.
-        
-        if order.type.lower() == "market":
-            # Market Order: Fills immediately (conceptually)
-            # In simulation loop, we might need the CURRENT price.
-            # Assuming the engine calls place_order with knowledge of current price 
-            # OR we wait for next tick.
-            # However, execute_signal usually has a 'candle' context or we use the latest known.
-            # To strictly follow "Adapter" pattern, we can't fetch external data.
-            # We'll queue it as a "Market" order to be filled at next 'on_market_data' tick 
-            # OR if we want immediate fill, we need the price passed in.
-            # Refactoring decision: Treat Market orders as immediate fills if price provided in order (as strict limit) 
-            # or queue them. 
-            # Existing engine logic: execute_signal calculates fill_price immediately for Market.
-            # Let's Queue it for 'on_market_data' to be realistic? 
-            # No, standard backtest engines often fill on Next Open or Close.
-            # Let's store it and fill in `on_market_data`.
-            order.exchange_order_id = exchange_id
-            self.open_orders.append(order)
-            return exchange_id
 
-        elif order.type.lower() == "limit":
-            order.exchange_order_id = exchange_id
-            self.open_orders.append(order)
-            return exchange_id
-        
-        else:
-            raise ExchangeError(f"Unsupported order type: {order.type}")
+        rust_order = self._to_rust_order(order)
+        self._engine.submit_order(rust_order)
+        order.exchange_order_id = exchange_id
+        self._order_map[order.id] = order
+
+        return exchange_id
 
     def cancel_order(self, order_id: str, product_id: str) -> bool:
-        initial_len = len(self.open_orders)
-        self.open_orders = [o for o in self.open_orders if o.exchange_order_id != order_id]
-        return len(self.open_orders) < initial_len
+        # order_id here is the exchange_order_id; we stored ORM id in Rust
+        # Try to find the internal id for this exchange_order_id
+        for oid, orm_order in self._order_map.items():
+            if orm_order.exchange_order_id == order_id:
+                cancelled = self._engine.cancel_order(oid)
+                if cancelled:
+                    del self._order_map[oid]
+                return cancelled
+        return False
 
-    def get_balance(self, asset: str) -> Decimal:
-        return self.balance.get(asset, Decimal("0"))
+    def get_balance(self, asset: str = "USDT") -> Decimal:
+        return Decimal(str(self._engine.balance))
 
     def get_position(self, product_id: str) -> Optional[Position]:
-        return self.positions.get(product_id)
+        rust_positions = self._engine.positions
+        rust_pos = rust_positions.get(product_id)
+        if not rust_pos or rust_pos.side == "FLAT" or rust_pos.quantity < 1e-9:
+            return None
+        return Position(
+            strategy_id="",
+            product_id=product_id,
+            side=rust_pos.side,
+            quantity=Decimal(str(rust_pos.quantity)),
+            entry_price=Decimal(str(rust_pos.entry_price)),
+            unrealized_pnl=Decimal(str(rust_pos.unrealized_pnl)),
+        )
+
+    # ── Backtest simulation hook ─────────────────────────────────
 
     def on_market_data(self, candle: Candlestick) -> List[Dict]:
-        """
-        Process market data to trigger fills.
-        Returns a list of fill dictionaries {order_id, price, quantity, fee}.
-        """
-        fills = []
-        remaining_orders = []
+        """Process a candle through the Rust matching engine.
 
-        for order in self.open_orders:
-            if order.product_id != candle.product_id:
-                remaining_orders.append(order)
+        Returns a list of fill dicts compatible with ExecutionEngine:
+            {"order": ORM Order, "price": Decimal, "quantity": Decimal,
+             "fee": Decimal, "fill_type": str}
+        """
+        rust_candle = self._to_rust_candle(candle)
+        rust_fills = self._engine.on_candle(rust_candle)
+
+        fills: List[Dict] = []
+        for rf in rust_fills:
+            orm_order = self._order_map.pop(rf.order_id, None)
+            if orm_order is None:
                 continue
+            fills.append({
+                "order": orm_order,
+                "price": Decimal(str(rf.price)),
+                "quantity": Decimal(str(rf.quantity)),
+                "fee": Decimal(str(rf.fee)),
+                "fill_type": rf.fill_type,
+            })
 
-            filled = False
-            fill_price = None
+        # Sync _order_map: remove orders cancelled by Rust (e.g. OCO)
+        if fills:
+            live_ids = {o.id for o in self._engine.open_orders}
+            stale = [oid for oid in self._order_map if oid not in live_ids]
+            for oid in stale:
+                del self._order_map[oid]
 
-            if order.type.lower() == 'market':
-                # Fill at Open or Close? Usually Close of the triggering candle or Open of next.
-                # Simplification: Fill at Close with slippage
-                fill_price = self.slippage_model.calculate_slippage(candle.close)
-                filled = True
-
-            elif order.type.lower() == 'limit':
-                # Check High/Low
-                if candle.low <= order.price <= candle.high:
-                    fill_price = order.price
-                    filled = True
-
-            if filled and fill_price:
-                # Update Internal State (Position)
-                self._update_position(order, fill_price)
-                
-                # Record Fill
-                fills.append({
-                    "order": order,
-                    "price": fill_price,
-                    "quantity": order.quantity
-                })
-            else:
-                remaining_orders.append(order)
-
-        self.open_orders = remaining_orders
         return fills
 
-    def _update_position(self, order: Order, price: Decimal):
-        """
-        Updates the simulated position state.
-        Simple Netting Mode.
-        """
-        pos = self.positions.get(order.product_id)
-        
-        qty = order.quantity
-        if order.side == "sell":
-            qty = -qty
-            
-        if not pos:
-            # New Position
-            new_pos = Position(
-                strategy_id=order.strategy_id,
-                product_id=order.product_id,
-                side="LONG" if order.side.lower() == "buy" else "SHORT",
-                quantity=order.quantity,
-                entry_price=price,
-                unrealized_pnl=Decimal("0")
-            )
-            self.positions[order.product_id] = new_pos
-        else:
-            # Update Existing
-            current_qty = pos.quantity if pos.side == "LONG" else -pos.quantity
-            new_qty = current_qty + qty
-            
-            if new_qty == 0:
-                del self.positions[order.product_id]
-            else:
-                # Update Avg Entry Price logic (simplified)
-                # If increasing position size, average price.
-                # If decreasing, price stays same (Realized PnL logic not fully implemented in state, mostly in Engine)
-                is_increase = (current_qty > 0 and qty > 0) or (current_qty < 0 and qty < 0)
-                
-                if is_increase:
-                    total_cost = (abs(current_qty) * pos.entry_price) + (abs(qty) * price)
-                    new_avg = total_cost / abs(new_qty)
-                    pos.entry_price = new_avg
-                
-                pos.quantity = abs(new_qty)
-                pos.side = "LONG" if new_qty > 0 else "SHORT"
+    # ── Conversion helpers ───────────────────────────────────────
+
+    @staticmethod
+    def _side_to_rust(side: str) -> str:
+        """Convert buy/sell to LONG/SHORT for the Rust engine."""
+        s = side.lower()
+        if s == "buy":
+            return "LONG"
+        if s == "sell":
+            return "SHORT"
+        # Already LONG/SHORT
+        return side.upper()
+
+    @staticmethod
+    def _order_type_to_rust(order_type: str) -> str:
+        """Normalise order type string for Rust."""
+        return order_type.upper().replace(" ", "_")
+
+    def _to_rust_order(self, order: Order) -> RustOrder:
+        side = self._side_to_rust(order.side)
+        order_type = self._order_type_to_rust(order.type)
+
+        # For conditional orders (SL/TP/Trailing), Rust expects 'side' to be the
+        # position side being protected — not the trade direction.
+        # ORM: side="sell" means "sell to close long" → Rust side="LONG"
+        # ORM: side="buy" means "buy to close short" → Rust side="SHORT"
+        if order_type in ("STOP_LOSS", "TAKE_PROFIT", "TRAILING_STOP"):
+            side = "LONG" if side == "SHORT" else "SHORT"
+
+        trigger_price = None
+        if order.trigger_price is not None:
+            trigger_price = float(order.trigger_price)
+
+        trailing_distance = None
+        if hasattr(order, "_trailing_distance") and order._trailing_distance is not None:
+            trailing_distance = float(order._trailing_distance)
+
+        linked_order_id = None
+        if hasattr(order, "_linked_order_id") and order._linked_order_id is not None:
+            linked_order_id = str(order._linked_order_id)
+
+        return RustOrder(
+            id=str(order.id),
+            product_id=order.product_id,
+            side=side,
+            order_type=order_type,
+            price=float(order.price) if order.price else 0.0,
+            quantity=float(order.quantity),
+            timestamp=order.timestamp or 0,
+            trigger_price=trigger_price,
+            trailing_distance=trailing_distance,
+            linked_order_id=linked_order_id,
+        )
+
+    @staticmethod
+    def _to_rust_candle(candle: Candlestick) -> RustCandlestick:
+        return RustCandlestick(
+            product_id=candle.product_id,
+            timeframe=candle.timeframe,
+            timestamp=candle.timestamp,
+            open=float(candle.open),
+            high=float(candle.high),
+            low=float(candle.low),
+            close=float(candle.close),
+            volume=float(candle.volume),
+        )

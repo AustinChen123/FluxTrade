@@ -1,6 +1,5 @@
 import os
 import redis
-import json
 from decimal import Decimal
 from typing import Optional
 from src.core.models import Signal, SignalType, Position
@@ -69,7 +68,7 @@ class AccountService:
 class RiskManager:
     def __init__(self, account_service: AccountService):
         self.account_service = account_service
-        self.max_exposure_per_product = Decimal("50000.0") # USDT
+        self.max_exposure_per_product = Decimal("50000.0")
 
     def check_risk(self, signal: Signal) -> tuple[bool, str]:
         """
@@ -82,7 +81,7 @@ class RiskManager:
         # Rule 1: Zero Balance Protection
         is_entry = signal.type in [SignalType.LONG, SignalType.SHORT]
         balance = self.account_service.get_balance()
-        
+
         if is_entry and balance <= 0:
             msg = f"REJECT: Account balance is {balance} (<= 0)"
             print(f"🛑 RISK {msg}. Signal {signal.type} rejected.")
@@ -119,4 +118,4 @@ class RiskManager:
         
         # Optional: Add rounding logic here based on exchange precision if known
         # For now, return raw Decimal
-        return size
+        return round(size, 4)

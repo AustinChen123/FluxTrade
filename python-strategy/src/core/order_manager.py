@@ -3,7 +3,7 @@ import os
 import redis
 from decimal import Decimal
 from typing import Optional
-from src.core.orm_models import Order, Trade, Position
+from src.core.orm_models import Order, Trade
 from src.core.models import Signal
 from src.core.clock import Clock
 from src.core.interfaces import IOrderRepository
@@ -35,28 +35,37 @@ class OrderManager:
         else:
              print("🧪 OrderManager: Initialized in Backtest Mode (Redis Disabled).")
 
-    def create_order(self, signal: Signal, side: str, order_type: str, quantity: Decimal, price: Optional[Decimal] = None) -> Order:
+    def create_order(
+        self,
+        signal: Signal,
+        side: str,
+        order_type: str,
+        quantity: Decimal,
+        price: Optional[Decimal] = None,
+        trigger_price: Optional[Decimal] = None,
+    ) -> Order:
         exchange_id = signal.product_id.split(':')[0]
         order_id = str(uuid.uuid4())
-        
+
         new_order = Order(
             id=order_id,
-            exchange_order_id=f"sim_{order_id[:8]}", # Default mock ID, will be updated if real
+            exchange_order_id=f"sim_{order_id[:8]}",
             strategy_id=signal.strategy_id,
             product_id=signal.product_id,
             exchange_id=exchange_id,
             type=order_type,
             side=side,
             price=price,
+            trigger_price=trigger_price,
             quantity=quantity,
             status="open",
             timestamp=int(self.clock.now() * 1000),
             filled_quantity=Decimal("0"),
             filled_price=Decimal("0")
         )
-        
+
         self.repo.add_order(new_order)
-        print(f"📝 DB: Order created {new_order.id} ({side} {quantity} {signal.product_id})")
+        print(f"DB: Order created {new_order.id} ({side} {order_type} {quantity} {signal.product_id})")
         return new_order
 
     def update_exchange_order_id(self, order: Order, exchange_order_id: str):
@@ -69,22 +78,22 @@ class OrderManager:
         print(f"❌ DB: Order {order.id} marked as FAILED. Reason: {reason}")
         self.repo.update_order(order)
 
-    def fill_order(self, order: Order, fill_price: Decimal, fill_quantity: Decimal):
+    def fill_order(self, order: Order, fill_price: Decimal, fill_quantity: Decimal, fee: Optional[Decimal] = None):
         current_time = int(self.clock.now() * 1000)
-        
-        # 1. Update Order in DB (Keep for record)
+
+        # 1. Update Order in DB
         order.status = "closed"
         order.filled_quantity = fill_quantity
         order.filled_price = fill_price
         self.repo.update_order(order)
-        
+
         trade_id = str(uuid.uuid4())
-        
+
         # 2. Atomic Execution
         if not self.is_backtest:
-            # Redis Lua
+            # Redis Lua (live mode)
             try:
-                account_id = "main" 
+                account_id = "main"
                 self.update_position_script(
                     args=[
                         account_id,
@@ -98,31 +107,25 @@ class OrderManager:
                         order.id
                     ]
                 )
-                print(f"⚡ Redis: Atomic Position Update Successful (Trade {trade_id})")
-                
+                print(f"Redis: Atomic Position Update Successful (Trade {trade_id})")
+
             except redis.exceptions.ResponseError as e:
-                print(f"🔥 FATAL: Redis Lua Script Error: {e}")
+                print(f"FATAL: Redis Lua Script Error: {e}")
                 raise RuntimeError(f"Critical State Corruption: {e}")
             except Exception as e:
-                print(f"🔥 FATAL: System Error during execution: {e}")
+                print(f"FATAL: System Error during execution: {e}")
                 raise e
         else:
-            # Backtest Mode: Update Mock/In-Memory State via Repository
-            # BacktestOrderRepository handles position tracking internally
+            # Backtest Mode: position/balance managed by Rust matching engine
             self.repo.update_position(
                 strategy_id=order.strategy_id,
                 product_id=order.product_id,
                 side=order.side,
                 fill_quantity=fill_quantity,
                 fill_price=fill_price,
-                position_side="LONG" # Simplified, needs robust netting logic if we want perfect port
             )
-            # Actually, `BacktestOrderRepository.update_position` implements the update.
-            # But wait, `BacktestOrderRepository` logic for side/position_side was a bit simplified in previous `read_file`.
-            # Let's trust it updates the repo's internal dictionary.
-            print(f"🧪 Backtest: Trade Executed {trade_id}")
 
-        # 3. Create Trade (SQL Reflection)
+        # 3. Create Trade record
         new_trade = Trade(
             id=trade_id,
             order_id=order.id,
@@ -131,7 +134,7 @@ class OrderManager:
             side=order.side,
             price=fill_price,
             quantity=fill_quantity,
-            fee=Decimal("0"),
+            fee=fee if fee is not None else Decimal("0"),
             fee_asset="USDT",
             timestamp=current_time
         )

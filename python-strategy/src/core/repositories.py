@@ -1,6 +1,6 @@
 import time
 from decimal import Decimal
-from typing import Optional, Dict, Tuple
+from typing import Optional
 from sqlalchemy.orm import Session
 from src.core.interfaces import IOrderRepository
 from src.core.orm_models import Order, Trade, Position, BacktestTradeLog
@@ -73,22 +73,25 @@ class LiveOrderRepository(IOrderRepository):
 
 
 class BacktestOrderRepository(IOrderRepository):
+    """Order repository for backtest mode.
+
+    Balance and position tracking are delegated to the Rust
+    PyMatchingEngine via BacktestAccountService + SimulatedAdapter.
+    This repository only records trade logs to the database.
+    """
+
     def __init__(self, db_session: Session, session_id: int, initial_balance: Decimal = Decimal("10000")):
         self.db = db_session
         self.session_id = session_id
-        # In-memory positions: Map[(strategy, product, side), Position]
-        self._positions: Dict[Tuple[str, str, str], Position] = {}
-        self.balance = initial_balance
+        self.balance = initial_balance  # kept for backward compatibility
 
     def add_order(self, order: Order) -> None:
-        # Backtest orders are not persisted
         pass
 
     def update_order(self, order: Order) -> None:
         pass
 
     def add_trade(self, trade: Trade) -> None:
-        # Convert Trade to BacktestTradeLog
         bt_log = BacktestTradeLog(
             id=trade.id,
             session_id=self.session_id,
@@ -106,96 +109,12 @@ class BacktestOrderRepository(IOrderRepository):
         self.db.commit()
 
     def update_position(self, strategy_id: str, product_id: str, side: str, fill_quantity: Decimal, fill_price: Decimal, position_side: str = None) -> None:
-        # Key is just (strategy, product) now for Netting
-        key = (strategy_id, product_id)
-        current_time = int(time.time() * 1000)
-        
-        position = self._positions.get(key)
-        
-        # Current Net Qty (Signed)
-        current_net = Decimal("0")
-        avg_entry = Decimal("0")
-        
-        if position:
-            current_net = position.quantity if position.side == 'LONG' else -position.quantity
-            avg_entry = position.entry_price
-        
-        # Trade Qty (Signed)
-        trade_qty = fill_quantity if side.lower() == 'buy' else -fill_quantity
-        
-        # Netting Logic
-        # Check if reducing
-        is_reducing = (current_net > 0 and trade_qty < 0) or (current_net < 0 and trade_qty > 0)
-        
-        if is_reducing:
-            qty_closing = min(abs(current_net), abs(trade_qty))
-            
-            # PnL Calc
-            if current_net > 0: # Closing Long
-                pnl = (fill_price - avg_entry) * qty_closing
-            else: # Closing Short
-                pnl = (avg_entry - fill_price) * qty_closing
-            
-            self.balance += pnl
-            
-            # Update Net
-            # We move current_net towards zero
-            if current_net > 0:
-                current_net -= qty_closing
-            else:
-                current_net += qty_closing
-            
-            # Remainder of trade?
-            remaining_trade = abs(trade_qty) - qty_closing
-            if remaining_trade > 0:
-                # Flip position
-                # New net is remaining_trade with sign of trade
-                current_net = remaining_trade if trade_qty > 0 else -remaining_trade
-                avg_entry = fill_price
-                
-        else:
-            # Increasing or New
-            total_cost = (abs(current_net) * avg_entry) + (abs(trade_qty) * fill_price)
-            new_abs_qty = abs(current_net) + abs(trade_qty)
-            
-            if new_abs_qty > 0:
-                avg_entry = total_cost / new_abs_qty
-            
-            current_net += trade_qty
-            
-        # Update/Create Position Object
-        new_side = "LONG" if current_net >= 0 else "SHORT"
-        new_qty = abs(current_net)
-        
-        if not position:
-            position = Position(
-                strategy_id=strategy_id,
-                product_id=product_id,
-                side=new_side,
-                quantity=new_qty,
-                entry_price=avg_entry,
-                unrealized_pnl=Decimal("0"),
-                last_update_timestamp=current_time
-            )
-            self._positions[key] = position
-        else:
-            position.side = new_side
-            position.quantity = new_qty
-            position.entry_price = avg_entry
-            position.last_update_timestamp = current_time
+        # No-op: position and balance are tracked by Rust PyMatchingEngine
+        pass
 
     def get_position(self, strategy_id: str, product_id: str, side: str = None) -> Optional[Position]:
-        # Ignores 'side' filter usually, returns the net position if it matches or if side is None
-        # But existing code might ask for "LONG" specifically.
-        # If we have SHORT, and they ask for LONG, return None.
-        pos = self._positions.get((strategy_id, product_id))
-        if not pos:
-            return None
-        
-        if side and pos.side != side:
-            return None
-            
-        return pos
-    
+        # Position state lives in Rust engine; accessed via BacktestAccountService
+        return None
+
     def update_order_exchange_id(self, order: Order, exchange_order_id: str) -> None:
         order.exchange_order_id = exchange_order_id

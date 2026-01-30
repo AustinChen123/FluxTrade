@@ -1,11 +1,8 @@
-import time
 import json
-from typing import Generator, List, Optional
+from typing import List, Optional, Dict
 from decimal import Decimal
-from sqlalchemy.orm import Session
 from src.core.db import SessionLocal
-from src.core.orm_models import Candlestick as CandlestickORM, Strategy as StrategyORM, BacktestResultSummary, BacktestTradeLog
-from src.core.models import Candlestick
+from src.core.orm_models import Strategy as StrategyORM, BacktestResultSummary, BacktestTradeLog
 from src.core.engine import StrategyEngine
 from src.core.clock import BacktestClock
 from src.strategies.base import BaseStrategy
@@ -13,8 +10,9 @@ from src.core.repositories import BacktestOrderRepository
 from src.core.backtest.loader import get_candles_generator
 from src.core.analytics import calculate_metrics
 from src.core.interfaces.data_source import IDataSource
-
+from src.core.adapters.simulated import SimulatedAdapter
 from src.core.mocks.account_service import BacktestAccountService
+
 
 class BacktestRunner:
     def __init__(
@@ -26,6 +24,7 @@ class BacktestRunner:
         initial_balance: float = 10000.0,
         max_drawdown_limit: float = 0.20,
         data_source: Optional[IDataSource] = None,
+        fee_config: Optional[Dict[str, float]] = None,
     ):
         self.start_time = start_time
         self.end_time = end_time
@@ -34,12 +33,13 @@ class BacktestRunner:
         self.initial_balance = initial_balance
         self.max_drawdown_limit = max_drawdown_limit
         self.data_source = data_source
+        self.fee_config = fee_config or {}
 
         # Data session only needed when no external data_source
         self.data_session = None if data_source else SessionLocal()
         self.db_session = SessionLocal()
 
-        self.clock = BacktestClock(start_time=start_time / 1000) # Clock uses seconds
+        self.clock = BacktestClock(start_time=start_time / 1000)
         self._strategies_buffer: List[BaseStrategy] = []
         self.engine = None
 
@@ -65,10 +65,10 @@ class BacktestRunner:
         self._ensure_strategies_registered()
 
         if not self._strategies_buffer:
-            print("⚠️ No strategies added. Exiting.")
+            print("No strategies added. Exiting.")
             return
 
-        # 1. Setup Backtest Session (Isolation)
+        # 1. Setup Backtest Session
         primary_strategy_id = self._strategies_buffer[0].strategy_id
         summary = BacktestResultSummary(
             strategy_id=primary_strategy_id,
@@ -79,29 +79,37 @@ class BacktestRunner:
         )
         self.db_session.add(summary)
         self.db_session.commit()
-        print(f"📝 Backtest Session Created: ID {summary.id}")
+        print(f"Backtest Session Created: ID {summary.id}")
 
-        # 2. Setup Engine with Backtest Repo and Mock Account
-        repo = BacktestOrderRepository(self.db_session, summary.id, initial_balance=Decimal(str(self.initial_balance)))
-        mock_account = BacktestAccountService(repo=repo, initial_balance=Decimal(str(self.initial_balance)))
-        
+        # 2. Create Rust-backed adapter with fee config
+        adapter = SimulatedAdapter(
+            initial_balance=Decimal(str(self.initial_balance)),
+            maker_fee=self.fee_config.get("maker", 0.0),
+            taker_fee=self.fee_config.get("taker", 0.0),
+        )
+
+        # 3. Setup repo (trade recording only) and account service
+        repo = BacktestOrderRepository(self.db_session, summary.id)
+        mock_account = BacktestAccountService(adapter=adapter)
+
+        # 4. Setup Engine with pre-created adapter
         self.engine = StrategyEngine(
             self.db_session,
             self.clock,
             order_repository=repo,
             account_service=mock_account,
-            adapter_config={"mode": "simulated", "balance": self.initial_balance},
+            adapter=adapter,
         )
-        
+
         # Inject the SAME RiskManager (with Mock Account) into the strategies
         for strat in self._strategies_buffer:
             if hasattr(strat, 'risk_manager'):
                 strat.risk_manager.account_service = mock_account
             self.engine.add_strategy(strat)
 
-        print(f"🚀 Starting Backtest for {self.product_id} [{self.start_time} - {self.end_time}]")
+        print(f"Starting Backtest for {self.product_id} [{self.start_time} - {self.end_time}]")
         count = 0
-        
+
         if self.data_source:
             candle_gen = self.data_source.get_candles(
                 self.product_id,
@@ -117,21 +125,21 @@ class BacktestRunner:
                 self.start_time,
                 self.end_time,
             )
-        
+
         stop_threshold = Decimal(str(self.initial_balance)) * Decimal(str(1 - self.max_drawdown_limit))
 
         try:
             for candle in candle_gen:
-                # 3. Update Clock
+                # Update Clock
                 self.clock.set_time(candle.timestamp / 1000)
-                
-                # 4. Process Candle
+
+                # Process Candle
                 self.engine.on_market_data(candle)
-                
-                # 5. Check Circuit Breaker
+
+                # Check Circuit Breaker
                 current_balance = mock_account.get_balance()
                 if current_balance < stop_threshold:
-                    print(f"🛑 STOPPING BACKTEST: Max Drawdown Reached! Balance: {current_balance} < {stop_threshold}")
+                    print(f"STOPPING BACKTEST: Max Drawdown Reached! Balance: {current_balance} < {stop_threshold}")
                     break
 
                 count += 1
@@ -141,32 +149,30 @@ class BacktestRunner:
             # Calculate Final PnL
             final_balance = mock_account.get_balance()
             total_pnl = final_balance - Decimal(str(self.initial_balance))
-            
+
             summary.total_pnl = total_pnl
-            
+
             # Metrics
             trades = self.db_session.query(BacktestTradeLog).filter_by(session_id=summary.id).all()
             metrics = calculate_metrics(trades)
             summary.metrics_json = json.dumps(metrics, default=str)
-            
+
             self.db_session.commit()
-            
-            print(f"✅ Backtest Complete. Processed {count} candles. Final PnL: {total_pnl}")
-            print(f"📊 Metrics: {metrics}")
-            
+
+            print(f"Backtest Complete. Processed {count} candles. Final PnL: {total_pnl}")
+            print(f"Metrics: {metrics}")
+
+            result = {
+                "total_pnl": float(total_pnl),
+                "max_drawdown": float(metrics.get("max_drawdown", 0.0)),
+                "win_rate": float(metrics.get("win_rate", 0.0)),
+                "total_trades": int(metrics.get("total_trades", 0)),
+                "trade_sharpe": float(metrics.get("trade_sharpe", 0.0)),
+                "profit_factor": float(metrics.get("profit_factor", 0.0)),
+            }
+
             self.db_session.close()
             if self.data_session:
                 self.data_session.close()
 
-if __name__ == "__main__":
-    # Example usage
-    runner = BacktestRunner(
-        start_time=1704067200000, 
-        end_time=1704153600000,
-        product_id="BINANCE:BTCUSDT-PERP",
-        timeframe="1m"
-    )
-    from src.strategies.golden_cross import GoldenCrossStrategy
-    strategy = GoldenCrossStrategy("backtest_strat", "BINANCE:BTCUSDT-PERP")
-    runner.add_strategy(strategy)
-    runner.run()
+        return result
