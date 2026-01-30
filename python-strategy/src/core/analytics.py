@@ -104,7 +104,7 @@ def calculate_metrics(trade_history: List[Trade]) -> Dict:
     # Calculate Profit Factor and Avg Trade
     gross_profit = sum(p for p in trade_pnls if p > 0)
     gross_loss = abs(sum(p for p in trade_pnls if p < 0))
-    profit_factor = (gross_profit / gross_loss) if gross_loss > 0 else float('inf')
+    profit_factor = (gross_profit / gross_loss) if gross_loss > 0 else (999.0 if gross_profit > 0 else 0.0)
     avg_trade = (total_pnl / total_trades) if total_trades > 0 else 0.0
     
     # Max Drawdown
