@@ -12,6 +12,7 @@ from src.core.analytics import calculate_metrics
 from src.core.interfaces.data_source import IDataSource
 from src.core.adapters.simulated import SimulatedAdapter
 from src.core.mocks.account_service import BacktestAccountService
+from src.core.journal import StrategyJournal
 
 
 class BacktestRunner:
@@ -81,28 +82,33 @@ class BacktestRunner:
         self.db_session.commit()
         print(f"Backtest Session Created: ID {summary.id}")
 
-        # 2. Create Rust-backed adapter with fee config
+        # 2. Create journal for structured event recording
+        journal = StrategyJournal(primary_strategy_id)
+
+        # 3. Create Rust-backed adapter with fee config
         adapter = SimulatedAdapter(
             initial_balance=Decimal(str(self.initial_balance)),
             maker_fee=self.fee_config.get("maker", 0.0),
             taker_fee=self.fee_config.get("taker", 0.0),
         )
 
-        # 3. Setup repo (trade recording only) and account service
+        # 4. Setup repo (trade recording only) and account service
         repo = BacktestOrderRepository(self.db_session, summary.id)
         mock_account = BacktestAccountService(adapter=adapter)
 
-        # 4. Setup Engine with pre-created adapter
+        # 5. Setup Engine with pre-created adapter and journal
         self.engine = StrategyEngine(
             self.db_session,
             self.clock,
             order_repository=repo,
             account_service=mock_account,
             adapter=adapter,
+            journal=journal,
         )
 
-        # Inject the SAME RiskManager (with Mock Account) into the strategies
+        # Inject journal and account service into strategies
         for strat in self._strategies_buffer:
+            strat.journal = journal
             if hasattr(strat, 'risk_manager'):
                 strat.risk_manager.account_service = mock_account
             self.engine.add_strategy(strat)
@@ -169,6 +175,8 @@ class BacktestRunner:
                 "total_trades": int(metrics.get("total_trades", 0)),
                 "trade_sharpe": float(metrics.get("trade_sharpe", 0.0)),
                 "profit_factor": float(metrics.get("profit_factor", 0.0)),
+                "journal": journal.to_dicts(),
+                "journal_count": len(journal),
             }
 
             self.db_session.close()

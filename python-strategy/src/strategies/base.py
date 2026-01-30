@@ -3,6 +3,7 @@ from dataclasses import dataclass
 from typing import Optional, List
 import pandas as pd
 from src.core.models import Candlestick, Signal, Trade
+from src.core.journal import StrategyJournal
 
 @dataclass
 class StrategyRequirements:
@@ -14,6 +15,7 @@ class BaseStrategy(ABC):
     def __init__(self, strategy_id: str, product_id: str):
         self.strategy_id = strategy_id
         self.product_id = product_id
+        self.journal = StrategyJournal(strategy_id)
 
     @property
     @abstractmethod

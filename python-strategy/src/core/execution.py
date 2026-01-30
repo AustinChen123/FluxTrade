@@ -7,9 +7,10 @@ from src.core.order_manager import OrderManager
 from src.core.interfaces.exchange import IExchangeAdapter
 from src.core.clock import Clock
 from src.core.interfaces import IOrderRepository
+from src.core.journal import StrategyJournal
 
 class ExecutionEngine:
-    def __init__(self, db_session: Session, clock: Clock, adapter: IExchangeAdapter, order_repository: Optional[IOrderRepository] = None):
+    def __init__(self, db_session: Session, clock: Clock, adapter: IExchangeAdapter, order_repository: Optional[IOrderRepository] = None, journal: Optional[StrategyJournal] = None):
         self.logger = logging.getLogger("ExecutionEngine")
         if order_repository:
             self.order_manager = OrderManager(order_repository, clock)
@@ -19,6 +20,7 @@ class ExecutionEngine:
 
         self.default_quantity = Decimal("0.01")
         self.adapter = adapter
+        self.journal = journal
         self.logger.info(f"ExecutionEngine initialized with adapter: {type(adapter).__name__}")
 
     def process_market_data(self, candle: Candlestick):
@@ -33,6 +35,7 @@ class ExecutionEngine:
                 price = fill['price']
                 qty = fill['quantity']
                 fee = fill.get('fee')
+                fill_type = fill.get('fill_type', 'MARKET')
 
                 self.logger.info(f"Execution: Adapter fill for {order.id} at {price} (fee={fee})")
                 self.order_manager.fill_order(
@@ -41,6 +44,9 @@ class ExecutionEngine:
                     fill_quantity=qty,
                     fee=fee,
                 )
+
+                if self.journal is not None:
+                    self._journal_fill(order, price, qty, fee, fill_type, candle)
 
     def execute_signal(self, signal: Signal, candle: Optional[Candlestick] = None) -> Optional[str]:
         """
@@ -86,7 +92,25 @@ class ExecutionEngine:
             self.order_manager.fail_order(order, str(e))
             return None
 
-        # 3. Place conditional orders (SL/TP/Trailing)
+        # 3. Journal: record entry
+        if self.journal is not None:
+            self.journal.log(
+                "entry",
+                {
+                    "order_id": str(order.id),
+                    "side": side,
+                    "order_type": order_type,
+                    "quantity": str(qty),
+                    "price": str(limit_price) if limit_price else "market",
+                    "stop_loss": str(signal.stop_loss) if signal.stop_loss else None,
+                    "take_profit": str(signal.take_profit) if signal.take_profit else None,
+                    "trailing_distance": str(signal.trailing_distance) if signal.trailing_distance else None,
+                },
+                timestamp=signal.timestamp,
+                trade_id=str(order.id),
+            )
+
+        # 4. Place conditional orders (SL/TP/Trailing)
         if signal.stop_loss or signal.take_profit or signal.trailing_distance:
             self._place_conditional_orders(signal, order, qty)
 
@@ -155,6 +179,31 @@ class ExecutionEngine:
                 self.order_manager.update_exchange_order_id(ts_order, ex_id)
             except Exception as e:
                 self.logger.error(f"Failed to place trailing stop order: {e}")
+
+    def _journal_fill(self, order, price, qty, fee, fill_type: str, candle: Optional[Candlestick] = None) -> None:
+        """Record a fill event to the journal."""
+        tag_map = {
+            "STOP_LOSS": "sl_hit",
+            "TAKE_PROFIT": "tp_hit",
+            "TRAILING_STOP": "trailing_hit",
+            "MARKET": "fill",
+            "LIMIT": "fill",
+        }
+        tag = tag_map.get(fill_type, "fill")
+        ts = candle.timestamp if candle else 0
+        self.journal.log(
+            tag,
+            {
+                "order_id": str(order.id),
+                "side": order.side,
+                "price": str(price),
+                "quantity": str(qty),
+                "fee": str(fee) if fee else "0",
+                "fill_type": fill_type,
+            },
+            timestamp=ts,
+            trade_id=str(order.id),
+        )
 
     def _determine_side(self, signal_type: SignalType) -> Optional[str]:
         if signal_type == SignalType.LONG:

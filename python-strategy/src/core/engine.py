@@ -19,6 +19,7 @@ from src.core.strategy_loader import StrategyLoader
 from src.core.data_provider import check_data_availability
 from src.core.db import SessionLocal
 from src.core.adapters import create_adapter
+from src.core.journal import StrategyJournal
 
 # Redis Config
 REDIS_HOST = os.getenv('REDIS_HOST', 'localhost')
@@ -36,6 +37,7 @@ class StrategyEngine:
         account_service: Optional[AccountService] = None,
         adapter_config: Optional[Dict] = None,
         adapter=None,
+        journal: Optional[StrategyJournal] = None,
     ):
         self.db = db_session
         self.clock = clock
@@ -60,7 +62,7 @@ class StrategyEngine:
         else:
             logger.info("StrategyEngine: Using provided adapter %s", type(adapter).__name__)
 
-        self.execution_engine = ExecutionEngine(db_session, clock, adapter, order_repository)
+        self.execution_engine = ExecutionEngine(db_session, clock, adapter, order_repository, journal=journal)
         
         # System State & Heartbeat
         self.redis_client = redis.Redis(host=REDIS_HOST, port=REDIS_PORT, decode_responses=True)
