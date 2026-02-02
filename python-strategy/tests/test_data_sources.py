@@ -8,6 +8,7 @@ Covers:
 """
 
 from decimal import Decimal
+from unittest.mock import MagicMock, patch
 
 import pandas as pd
 import pytest
@@ -318,3 +319,211 @@ class TestCsvDataSourceLazyLoad:
         assert ds._df is None  # Not loaded yet
         list(ds.get_candles(PRODUCT, TF, 0, 9999999999999))
         assert ds._df is not None  # Now loaded
+
+
+# =============================================================================
+# DatabaseDataSource
+# =============================================================================
+
+class TestDatabaseDataSource:
+
+    def test_get_candles_yields_from_query(self):
+        """Should yield Candlestick objects from DB rows."""
+        from src.core.data_sources.database import DatabaseDataSource
+
+        mock_row = MagicMock()
+        mock_row.product_id = PRODUCT
+        mock_row.timeframe = TF
+        mock_row.timestamp = 1704067200000
+        mock_row.open = Decimal("42000")
+        mock_row.high = Decimal("42100")
+        mock_row.low = Decimal("41900")
+        mock_row.close = Decimal("42050")
+        mock_row.volume = Decimal("500")
+
+        mock_session = MagicMock()
+        mock_query = mock_session.query.return_value
+        mock_query.filter.return_value.order_by.return_value.yield_per.return_value = [mock_row]
+
+        ds = DatabaseDataSource(session_factory=lambda: mock_session)
+        result = list(ds.get_candles(PRODUCT, TF, 0, 9999999999999))
+
+        assert len(result) == 1
+        assert isinstance(result[0], Candlestick)
+        assert result[0].close == Decimal("42050")
+
+    def test_get_candles_closes_session(self):
+        """Session should be closed after iteration."""
+        from src.core.data_sources.database import DatabaseDataSource
+
+        mock_session = MagicMock()
+        mock_query = mock_session.query.return_value
+        mock_query.filter.return_value.order_by.return_value.yield_per.return_value = []
+
+        ds = DatabaseDataSource(session_factory=lambda: mock_session)
+        list(ds.get_candles(PRODUCT, TF, 0, 9999999999999))
+
+        mock_session.close.assert_called_once()
+
+    def test_get_candles_df_returns_dataframe(self):
+        """Should return a DataFrame from DB query."""
+        from src.core.data_sources.database import DatabaseDataSource
+
+        mock_row = MagicMock()
+        mock_row.timestamp = 1704067200000
+        mock_row.open = Decimal("42000")
+        mock_row.high = Decimal("42100")
+        mock_row.low = Decimal("41900")
+        mock_row.close = Decimal("42050")
+        mock_row.volume = Decimal("500")
+
+        mock_session = MagicMock()
+        mock_query = mock_session.query.return_value
+        mock_query.filter.return_value.order_by.return_value.all.return_value = [mock_row]
+
+        ds = DatabaseDataSource(session_factory=lambda: mock_session)
+        df = ds.get_candles_df(PRODUCT, TF, 0, 9999999999999)
+
+        assert isinstance(df, pd.DataFrame)
+        assert not df.empty
+        assert df.index.name == "timestamp"
+
+    def test_get_candles_df_empty_returns_empty_df(self):
+        """Empty query result should return empty DataFrame."""
+        from src.core.data_sources.database import DatabaseDataSource
+
+        mock_session = MagicMock()
+        mock_query = mock_session.query.return_value
+        mock_query.filter.return_value.order_by.return_value.all.return_value = []
+
+        ds = DatabaseDataSource(session_factory=lambda: mock_session)
+        df = ds.get_candles_df(PRODUCT, TF, 0, 9999999999999)
+
+        assert isinstance(df, pd.DataFrame)
+        assert df.empty
+
+    def test_get_available_range_returns_tuple(self):
+        """Should return (min_ts, max_ts) when data exists."""
+        from src.core.data_sources.database import DatabaseDataSource
+
+        mock_session = MagicMock()
+        # First call returns min, second returns max
+        mock_session.query.return_value.filter.return_value.scalar.side_effect = [
+            1704067200000,
+            1704153600000,
+        ]
+
+        ds = DatabaseDataSource(session_factory=lambda: mock_session)
+        result = ds.get_available_range(PRODUCT, TF)
+
+        assert result == (1704067200000, 1704153600000)
+
+    def test_get_available_range_no_data_returns_none(self):
+        """Should return None when no data exists."""
+        from src.core.data_sources.database import DatabaseDataSource
+
+        mock_session = MagicMock()
+        mock_session.query.return_value.filter.return_value.scalar.side_effect = [None, None]
+
+        ds = DatabaseDataSource(session_factory=lambda: mock_session)
+        result = ds.get_available_range(PRODUCT, TF)
+
+        assert result is None
+
+    def test_validate_success(self):
+        """Should return True when DB connection works."""
+        from src.core.data_sources.database import DatabaseDataSource
+
+        mock_session = MagicMock()
+        ds = DatabaseDataSource(session_factory=lambda: mock_session)
+
+        assert ds.validate() is True
+
+    def test_validate_failure(self):
+        """Should return False when DB connection fails."""
+        from src.core.data_sources.database import DatabaseDataSource
+
+        def failing_factory():
+            raise Exception("DB down")
+
+        ds = DatabaseDataSource(session_factory=failing_factory)
+        assert ds.validate() is False
+
+
+# =============================================================================
+# YahooFinanceDataSource
+# =============================================================================
+
+
+class TestYahooFinanceDataSource:
+
+    def test_unsupported_timeframe_raises(self):
+        """Unsupported timeframe should raise ValueError."""
+        from src.core.data_sources.yahoo import YahooFinanceDataSource
+
+        ds = YahooFinanceDataSource(ticker="BTC-USD")
+
+        with patch.dict("sys.modules", {"yfinance": MagicMock()}):
+            with pytest.raises(ValueError, match="Unsupported timeframe"):
+                ds._download("3m", 0, 9999999999999)
+
+    def test_import_error_when_yfinance_missing(self):
+        """Should raise ImportError when yfinance is not installed."""
+        from src.core.data_sources.yahoo import YahooFinanceDataSource
+
+        ds = YahooFinanceDataSource(ticker="BTC-USD")
+
+        with patch.dict("sys.modules", {"yfinance": None}):
+            with pytest.raises(ImportError, match="yfinance is required"):
+                ds._download("1d", 0, 9999999999999)
+
+    def test_get_available_range_returns_none(self):
+        """Yahoo source should always return None for available range."""
+        from src.core.data_sources.yahoo import YahooFinanceDataSource
+
+        ds = YahooFinanceDataSource()
+        assert ds.get_available_range(PRODUCT, "1d") is None
+
+    def test_download_empty_returns_empty_df(self):
+        """Empty download should produce empty DataFrame."""
+        from src.core.data_sources.yahoo import YahooFinanceDataSource
+
+        mock_yf = MagicMock()
+        mock_yf.download.return_value = pd.DataFrame()
+
+        ds = YahooFinanceDataSource()
+
+        with patch.dict("sys.modules", {"yfinance": mock_yf}):
+            result = ds._download("1d", 1704067200000, 1704153600000)
+
+        assert result.empty
+
+    def test_get_candles_yields_candlesticks(self):
+        """get_candles should yield Candlestick objects from downloaded data."""
+        from src.core.data_sources.yahoo import YahooFinanceDataSource
+
+        ds = YahooFinanceDataSource(ticker="BTC-USD", product_id="YAHOO:BTC-PERP")
+        download_df = pd.DataFrame({
+            "timestamp": [1704067200000, 1704153600000],
+            "open": [42000.0, 42100.0],
+            "high": [42500.0, 42600.0],
+            "low": [41500.0, 41600.0],
+            "close": [42200.0, 42300.0],
+            "volume": [1000.0, 1100.0],
+        })
+
+        with patch.object(ds, "_download", return_value=download_df):
+            result = list(ds.get_candles("YAHOO:BTC-PERP", "1d", 0, 9999999999999))
+
+        assert len(result) == 2
+        assert isinstance(result[0], Candlestick)
+        assert result[0].product_id == "YAHOO:BTC-PERP"
+
+    def test_validate_returns_false_on_error(self):
+        """validate() should return False when yfinance fails."""
+        from src.core.data_sources.yahoo import YahooFinanceDataSource
+
+        ds = YahooFinanceDataSource()
+
+        with patch.dict("sys.modules", {"yfinance": None}):
+            assert ds.validate() is False

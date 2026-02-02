@@ -7,13 +7,14 @@ Covers:
 - Entry vs exit signal handling
 - Position size calculation
 - Edge cases
+- AccountService with Redis mock
 """
 
-import pytest
 from decimal import Decimal
+from unittest.mock import MagicMock, patch
 
-from src.core.models import Signal, SignalType, Position
-from src.core.risk_manager import RiskManager
+from src.core.models import SignalType
+from src.core.risk_manager import RiskManager, AccountService
 
 
 class TestRiskManagerBalanceChecks:
@@ -290,3 +291,174 @@ class TestRiskManagerEdgeCases:
         is_allowed, reason = risk_manager.check_risk(signal)
 
         assert is_allowed is False
+
+    def test_negative_balance_rejects_entry(self, mock_account_service, signal_factory):
+        """Large negative balance should still reject entry."""
+        mock_account_service.set_balance(Decimal("-99999"))
+        risk_manager = RiskManager(mock_account_service)
+
+        signal = signal_factory(signal_type=SignalType.SHORT)
+        is_allowed, reason = risk_manager.check_risk(signal)
+
+        assert is_allowed is False
+        assert "balance" in reason.lower()
+
+    def test_tight_stop_loss_small_size(self, mock_account_service):
+        """Tight SL should produce very small position size."""
+        mock_account_service.set_balance(Decimal("10000"))
+        risk_manager = RiskManager(mock_account_service)
+
+        # 2% risk with 10-point SL on 42000 entry
+        size = risk_manager.calculate_position_size(
+            entry_price=Decimal("42000"),
+            stop_loss_price=Decimal("41990"),
+            risk_percent=0.02,
+        )
+
+        # 200 / 10 = 20 BTC — very large because SL is tight
+        assert size == Decimal("20")
+
+    def test_zero_risk_percent_returns_zero(self, mock_account_service):
+        """0% risk should produce zero position size."""
+        mock_account_service.set_balance(Decimal("10000"))
+        risk_manager = RiskManager(mock_account_service)
+
+        size = risk_manager.calculate_position_size(
+            entry_price=Decimal("42000"),
+            stop_loss_price=Decimal("41000"),
+            risk_percent=0.0,
+        )
+
+        assert size == Decimal("0")
+
+    def test_position_size_rounding(self, mock_account_service):
+        """Position size should be rounded to 4 decimal places."""
+        mock_account_service.set_balance(Decimal("10000"))
+        risk_manager = RiskManager(mock_account_service)
+
+        size = risk_manager.calculate_position_size(
+            entry_price=Decimal("42000"),
+            stop_loss_price=Decimal("41333"),
+            risk_percent=0.02,
+        )
+
+        # Verify result has at most 4 decimal places
+        assert abs(size - round(size, 4)) == 0
+
+
+class TestAccountService:
+    """Tests for the AccountService Redis integration."""
+
+    def test_init_redis_success(self):
+        """AccountService should connect to Redis successfully."""
+        mock_redis = MagicMock()
+        mock_redis.ping.return_value = True
+
+        with patch("src.core.risk_manager.redis.Redis", return_value=mock_redis):
+            service = AccountService()
+
+        assert service.redis is not None
+
+    def test_init_redis_failure_sets_none(self):
+        """Redis connection failure should set redis to None."""
+        with patch("src.core.risk_manager.redis.Redis", side_effect=Exception("conn fail")):
+            service = AccountService()
+
+        assert service.redis is None
+
+    def test_get_balance_returns_decimal(self):
+        """Should return Decimal from Redis hash."""
+        mock_redis = MagicMock()
+        mock_redis.ping.return_value = True
+        mock_redis.hget.return_value = "12345.67"
+
+        with patch("src.core.risk_manager.redis.Redis", return_value=mock_redis):
+            service = AccountService()
+
+        result = service.get_balance()
+        assert result == Decimal("12345.67")
+
+    def test_get_balance_no_redis_returns_zero(self):
+        """Without Redis connection, should return zero."""
+        with patch("src.core.risk_manager.redis.Redis", side_effect=Exception("fail")):
+            service = AccountService()
+
+        assert service.get_balance() == Decimal("0")
+
+    def test_get_balance_no_value_returns_zero(self):
+        """When Redis has no balance value, should return zero."""
+        mock_redis = MagicMock()
+        mock_redis.ping.return_value = True
+        mock_redis.hget.return_value = None
+
+        with patch("src.core.risk_manager.redis.Redis", return_value=mock_redis):
+            service = AccountService()
+
+        assert service.get_balance() == Decimal("0")
+
+    def test_get_position_returns_position(self):
+        """Should return Position from Redis hash data."""
+        mock_redis = MagicMock()
+        mock_redis.ping.return_value = True
+        mock_redis.hgetall.return_value = {
+            "quantity": "0.5",
+            "entry_price": "42000",
+        }
+
+        with patch("src.core.risk_manager.redis.Redis", return_value=mock_redis):
+            service = AccountService()
+
+        pos = service.get_position("strat", "BINANCE:BTCUSDT-PERP")
+        assert pos is not None
+        assert pos.side == "LONG"
+        assert pos.quantity == Decimal("0.5")
+        assert pos.entry_price == Decimal("42000")
+
+    def test_get_position_short_side(self):
+        """Negative quantity should produce SHORT side."""
+        mock_redis = MagicMock()
+        mock_redis.ping.return_value = True
+        mock_redis.hgetall.return_value = {
+            "quantity": "-0.3",
+            "entry_price": "42000",
+        }
+
+        with patch("src.core.risk_manager.redis.Redis", return_value=mock_redis):
+            service = AccountService()
+
+        pos = service.get_position("strat", "BINANCE:BTCUSDT-PERP")
+        assert pos is not None
+        assert pos.side == "SHORT"
+        assert pos.quantity == Decimal("0.3")
+
+    def test_get_position_zero_quantity_returns_none(self):
+        """Zero quantity should return None (no position)."""
+        mock_redis = MagicMock()
+        mock_redis.ping.return_value = True
+        mock_redis.hgetall.return_value = {
+            "quantity": "0",
+            "entry_price": "42000",
+        }
+
+        with patch("src.core.risk_manager.redis.Redis", return_value=mock_redis):
+            service = AccountService()
+
+        assert service.get_position("strat", "BINANCE:BTCUSDT-PERP") is None
+
+    def test_get_position_no_data_returns_none(self):
+        """Empty hash should return None."""
+        mock_redis = MagicMock()
+        mock_redis.ping.return_value = True
+        mock_redis.hgetall.return_value = {}
+
+        with patch("src.core.risk_manager.redis.Redis", return_value=mock_redis):
+            service = AccountService()
+
+        assert service.get_position("strat", "BINANCE:BTCUSDT-PERP") is None
+
+    def test_get_position_no_redis_returns_none(self):
+        """Without Redis connection, should return None."""
+        with patch("src.core.risk_manager.redis.Redis", side_effect=Exception("fail")):
+            service = AccountService()
+
+        assert service.get_position("strat", "BINANCE:BTCUSDT-PERP") is None

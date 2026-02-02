@@ -15,8 +15,9 @@ test_adapters_simulated.py for coverage of those behaviours.
 """
 
 from decimal import Decimal
+from unittest.mock import MagicMock
 
-from src.core.repositories import BacktestOrderRepository
+from src.core.repositories import BacktestOrderRepository, LiveOrderRepository
 from src.core.orm_models import Trade
 
 
@@ -116,3 +117,141 @@ class TestBacktestTradeLogging:
         repo.update_order_exchange_id(order, "SIM-abc123")
 
         assert order.exchange_order_id == "SIM-abc123"
+
+
+# =============================================================================
+# LiveOrderRepository
+# =============================================================================
+
+class TestLiveOrderRepositoryBasics:
+
+    def test_add_order_commits(self, mock_db_session, order_factory):
+        """add_order should add to session and commit."""
+        repo = LiveOrderRepository(mock_db_session)
+        order = order_factory()
+
+        repo.add_order(order)
+
+        mock_db_session.add.assert_called_with(order)
+        mock_db_session.commit.assert_called()
+        mock_db_session.refresh.assert_called_with(order)
+
+    def test_update_order_commits(self, mock_db_session, order_factory):
+        """update_order should add to session and commit."""
+        repo = LiveOrderRepository(mock_db_session)
+        order = order_factory()
+
+        repo.update_order(order)
+
+        mock_db_session.add.assert_called_with(order)
+        mock_db_session.commit.assert_called()
+
+    def test_add_trade_commits(self, mock_db_session):
+        """add_trade should add to session and commit."""
+        repo = LiveOrderRepository(mock_db_session)
+        trade = Trade(
+            order_id="o1",
+            exchange_trade_id="t1",
+            product_id="BINANCE:BTCUSDT-PERP",
+            side="buy",
+            price=Decimal("42000"),
+            quantity=Decimal("1.0"),
+            fee=Decimal("2.52"),
+            fee_asset="USDT",
+            timestamp=1704067200000,
+        )
+
+        repo.add_trade(trade)
+
+        mock_db_session.add.assert_called_with(trade)
+        mock_db_session.commit.assert_called()
+
+    def test_update_order_exchange_id_commits(self, mock_db_session, order_factory):
+        """update_order_exchange_id should set ID and commit."""
+        repo = LiveOrderRepository(mock_db_session)
+        order = order_factory()
+
+        repo.update_order_exchange_id(order, "EX-999")
+
+        assert order.exchange_order_id == "EX-999"
+        mock_db_session.commit.assert_called()
+
+
+class TestLiveOrderRepositoryPositionUpdate:
+
+    def test_buy_creates_new_position(self, mock_db_session):
+        """Buying when no position exists should create a new position."""
+        repo = LiveOrderRepository(mock_db_session)
+        # No existing position
+        mock_db_session.query.return_value.with_for_update.return_value.filter_by.return_value.first.return_value = None
+
+        repo.update_position(
+            strategy_id="test",
+            product_id="BINANCE:BTCUSDT-PERP",
+            side="buy",
+            fill_quantity=Decimal("0.5"),
+            fill_price=Decimal("42000"),
+            position_side="LONG",
+        )
+
+        mock_db_session.add.assert_called()
+        mock_db_session.commit.assert_called()
+
+    def test_sell_without_position_is_noop(self, mock_db_session):
+        """Selling when no position exists should commit and return."""
+        repo = LiveOrderRepository(mock_db_session)
+        mock_db_session.query.return_value.with_for_update.return_value.filter_by.return_value.first.return_value = None
+
+        repo.update_position(
+            strategy_id="test",
+            product_id="BINANCE:BTCUSDT-PERP",
+            side="sell",
+            fill_quantity=Decimal("0.5"),
+            fill_price=Decimal("42000"),
+            position_side="LONG",
+        )
+
+        mock_db_session.add.assert_not_called()
+        mock_db_session.commit.assert_called()
+
+    def test_buy_updates_existing_position(self, mock_db_session):
+        """Buying into existing position should average entry price."""
+        repo = LiveOrderRepository(mock_db_session)
+
+        existing_pos = MagicMock()
+        existing_pos.quantity = Decimal("0.5")
+        existing_pos.entry_price = Decimal("40000")
+        mock_db_session.query.return_value.with_for_update.return_value.filter_by.return_value.first.return_value = existing_pos
+
+        repo.update_position(
+            strategy_id="test",
+            product_id="BINANCE:BTCUSDT-PERP",
+            side="buy",
+            fill_quantity=Decimal("0.5"),
+            fill_price=Decimal("44000"),
+            position_side="LONG",
+        )
+
+        # New avg entry: (0.5*40000 + 0.5*44000) / 1.0 = 42000
+        assert existing_pos.entry_price == Decimal("42000")
+        assert existing_pos.quantity == Decimal("1.0")
+
+    def test_sell_reduces_position(self, mock_db_session):
+        """Selling should reduce position quantity."""
+        repo = LiveOrderRepository(mock_db_session)
+
+        existing_pos = MagicMock()
+        existing_pos.quantity = Decimal("1.0")
+        existing_pos.entry_price = Decimal("42000")
+        mock_db_session.query.return_value.with_for_update.return_value.filter_by.return_value.first.return_value = existing_pos
+
+        repo.update_position(
+            strategy_id="test",
+            product_id="BINANCE:BTCUSDT-PERP",
+            side="sell",
+            fill_quantity=Decimal("0.3"),
+            fill_price=Decimal("43000"),
+            position_side="LONG",
+        )
+
+        assert existing_pos.quantity == Decimal("0.7")

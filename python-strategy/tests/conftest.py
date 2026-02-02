@@ -10,7 +10,7 @@ import uuid
 import time
 from decimal import Decimal
 from typing import Optional, Dict, List
-from unittest.mock import Mock, MagicMock
+from unittest.mock import MagicMock
 
 # Models
 from src.core.models import (
@@ -640,3 +640,66 @@ def backtest_order_repo(mock_db_session):
         session_id=1,
         initial_balance=DEFAULT_BALANCE
     )
+
+
+@pytest.fixture
+def mock_strategy_class():
+    """Concrete BaseStrategy subclass for engine tests."""
+    from src.strategies.base import BaseStrategy, StrategyRequirements
+    from src.core.models import Candlestick, Signal, SignalType
+
+    class StubStrategy(BaseStrategy):
+        def __init__(self, strategy_id: str = "stub", product_id: str = DEFAULT_PRODUCT_ID):
+            super().__init__(strategy_id, product_id)
+            self._signal: Signal | None = None
+
+        @property
+        def requirements(self) -> StrategyRequirements:
+            return StrategyRequirements(
+                product_id=self.product_id,
+                timeframe=DEFAULT_TIMEFRAME,
+                lookback_window=50,
+            )
+
+        def on_candle(self, candle: Candlestick) -> Signal:
+            if self._signal:
+                return self._signal
+            return Signal(
+                strategy_id=self.strategy_id,
+                product_id=self.product_id,
+                timeframe=DEFAULT_TIMEFRAME,
+                timestamp=candle.timestamp,
+                type=SignalType.NO_SIGNAL,
+                value=candle.close,
+            )
+
+    return StubStrategy
+
+
+@pytest.fixture
+def engine_factory(mock_db_session, mock_clock, mock_exchange_adapter):
+    """Factory for StrategyEngine with Redis and DB fully mocked."""
+
+    def _create(**overrides):
+        from src.core.engine import StrategyEngine
+
+        defaults = dict(
+            db_session=mock_db_session,
+            clock=mock_clock,
+            order_repository=MockOrderRepository(),
+            account_service=MockAccountService(),
+            adapter=mock_exchange_adapter,
+        )
+        defaults.update(overrides)
+
+        with patch("src.core.engine.redis.Redis") as mock_redis_cls:
+            mock_redis_inst = MagicMock()
+            mock_redis_inst.ping.return_value = True
+            mock_redis_inst.get.return_value = None
+            mock_redis_cls.return_value = mock_redis_inst
+            engine = StrategyEngine(**defaults)
+            engine.redis_client = mock_redis_inst
+        return engine
+
+    from unittest.mock import patch
+    return _create

@@ -14,7 +14,7 @@ from decimal import Decimal
 from unittest.mock import patch, MagicMock
 
 from src.core.order_manager import OrderManager
-from src.core.models import Signal, SignalType
+from src.core.models import SignalType
 
 
 class TestOrderCreation:
@@ -278,3 +278,72 @@ class TestOrderManagerEdgeCases:
         order = order_manager.create_order(signal, "buy", "market", Decimal("1000000"))
 
         assert order.quantity == Decimal("1000000")
+
+
+class TestOrderManagerLiveMode:
+    """Tests for live mode (non-backtest) OrderManager."""
+
+    def test_lua_file_not_found_raises(self, mock_clock):
+        """Missing Lua script should raise on init."""
+        from src.core.repositories import LiveOrderRepository
+
+        mock_db = MagicMock()
+        repo = LiveOrderRepository(mock_db)
+
+        with patch("src.core.order_manager.redis.Redis") as mock_redis_cls, \
+             patch("builtins.open", side_effect=FileNotFoundError("no lua")):
+            mock_redis_cls.return_value = MagicMock()
+
+            with pytest.raises(FileNotFoundError):
+                OrderManager(repo, mock_clock, is_backtest=False)
+
+    def test_live_fill_calls_lua_script(self, mock_clock, signal_factory):
+        """fill_order in live mode should call Redis Lua script."""
+        from src.core.repositories import LiveOrderRepository
+
+        mock_db = MagicMock()
+        repo = LiveOrderRepository(mock_db)
+
+        mock_redis = MagicMock()
+        mock_script = MagicMock()
+        mock_redis.register_script.return_value = mock_script
+
+        with patch("src.core.order_manager.redis.Redis", return_value=mock_redis), \
+             patch("builtins.open", MagicMock()):
+            om = OrderManager(repo, mock_clock, is_backtest=False)
+
+        signal = signal_factory()
+        order = om.create_order(signal, "buy", "market", Decimal("0.1"))
+        om.fill_order(order, Decimal("42000"), Decimal("0.1"))
+
+        mock_script.assert_called_once()
+        assert order.status == "closed"
+
+    def test_live_fill_lua_error_raises_runtime(self, mock_clock, signal_factory):
+        """Lua script ResponseError should raise RuntimeError."""
+        import redis as redis_lib
+        from src.core.repositories import LiveOrderRepository
+
+        mock_db = MagicMock()
+        repo = LiveOrderRepository(mock_db)
+
+        mock_redis = MagicMock()
+        mock_script = MagicMock()
+        mock_script.side_effect = redis_lib.exceptions.ResponseError("script error")
+        mock_redis.register_script.return_value = mock_script
+
+        with patch("src.core.order_manager.redis.Redis", return_value=mock_redis), \
+             patch("builtins.open", MagicMock()):
+            om = OrderManager(repo, mock_clock, is_backtest=False)
+
+        signal = signal_factory()
+        order = om.create_order(signal, "buy", "market", Decimal("0.1"))
+
+        with pytest.raises(RuntimeError, match="Critical State Corruption"):
+            om.fill_order(order, Decimal("42000"), Decimal("0.1"))
+
+    def test_explicit_backtest_flag_overrides_detection(self, mock_order_repo, mock_clock):
+        """Explicit is_backtest=True should skip Redis init."""
+        om = OrderManager(mock_order_repo, mock_clock, is_backtest=True)
+        assert om.is_backtest is True
+        assert om.redis_client is None
