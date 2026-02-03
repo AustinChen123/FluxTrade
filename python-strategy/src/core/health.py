@@ -2,6 +2,8 @@ import logging
 import time
 from dataclasses import dataclass, field
 from enum import Enum
+
+from sqlalchemy import text
 logger = logging.getLogger(__name__)
 
 
@@ -78,7 +80,7 @@ class HealthChecker:
     def check_database(self) -> CheckResult:
         start = time.monotonic()
         try:
-            self.db_session.execute("SELECT 1")
+            self.db_session.execute(text("SELECT 1"))
             latency = (time.monotonic() - start) * 1000
             return CheckResult(
                 status=ComponentStatus.HEALTHY,
