@@ -14,9 +14,9 @@ class _MockClock(Clock):
 
 def _make_engine():
     """Create a StrategyEngine with mocked dependencies (no real Redis/DB)."""
-    with patch("src.core.engine.redis.Redis") as mock_redis_cls, \
+    with patch("src.core.engine.create_redis_client") as mock_factory, \
          patch("src.core.engine.create_adapter") as mock_create_adapter:
-        mock_redis_cls.return_value = MagicMock()
+        mock_factory.return_value = MagicMock()
         mock_create_adapter.return_value = MagicMock()
 
         from src.core.engine import StrategyEngine

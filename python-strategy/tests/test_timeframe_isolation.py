@@ -54,7 +54,7 @@ class FakeStrategy(BaseStrategy):
 @pytest.fixture
 def engine_with_strategy():
     """Create a StrategyEngine with a FakeStrategy, mocking heavy deps."""
-    with patch("src.core.engine.redis"), \
+    with patch("src.core.engine.create_redis_client"), \
          patch("src.core.engine.create_adapter") as mock_create:
         mock_create.return_value = MagicMock()
 

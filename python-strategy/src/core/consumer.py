@@ -8,12 +8,10 @@ from decimal import Decimal
 from typing import Callable, List, Union
 from dotenv import load_dotenv
 from src.core.models import Candlestick, Trade
+from src.core.redis_factory import create_redis_client
 
 # Load env
 load_dotenv(os.path.join(os.path.dirname(__file__), '../../../.env'))
-
-REDIS_HOST = os.getenv('REDIS_HOST', 'localhost')
-REDIS_PORT = int(os.getenv('REDIS_PORT', 6379))
 
 logger = logging.getLogger(__name__)
 
@@ -28,7 +26,7 @@ class DataConsumer:
         :param channels: List of Redis Stream Keys to consume (e.g., ['stream:market:binance:btcusdt'])
         :param on_message_callback: Function to call when a valid data item is received
         """
-        self.redis_client = redis.Redis(host=REDIS_HOST, port=REDIS_PORT, decode_responses=True)
+        self.redis_client = create_redis_client()
         self.channels = channels
         self.callback = on_message_callback
         self.running = False

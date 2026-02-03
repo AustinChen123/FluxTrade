@@ -290,7 +290,7 @@ class TestOrderManagerLiveMode:
         mock_db = MagicMock()
         repo = LiveOrderRepository(mock_db)
 
-        with patch("src.core.order_manager.redis.Redis") as mock_redis_cls, \
+        with patch("src.core.order_manager.create_redis_client") as mock_redis_cls, \
              patch("builtins.open", side_effect=FileNotFoundError("no lua")):
             mock_redis_cls.return_value = MagicMock()
 
@@ -308,7 +308,7 @@ class TestOrderManagerLiveMode:
         mock_script = MagicMock()
         mock_redis.register_script.return_value = mock_script
 
-        with patch("src.core.order_manager.redis.Redis", return_value=mock_redis), \
+        with patch("src.core.order_manager.create_redis_client", return_value=mock_redis), \
              patch("builtins.open", MagicMock()):
             om = OrderManager(repo, mock_clock, is_backtest=False)
 
@@ -332,7 +332,7 @@ class TestOrderManagerLiveMode:
         mock_script.side_effect = redis_lib.exceptions.ResponseError("script error")
         mock_redis.register_script.return_value = mock_script
 
-        with patch("src.core.order_manager.redis.Redis", return_value=mock_redis), \
+        with patch("src.core.order_manager.create_redis_client", return_value=mock_redis), \
              patch("builtins.open", MagicMock()):
             om = OrderManager(repo, mock_clock, is_backtest=False)
 

@@ -6,7 +6,6 @@ import logging
 import traceback
 from concurrent.futures import ThreadPoolExecutor
 from typing import List, Union, Optional, Dict, Type
-import redis
 from sqlalchemy.orm import Session
 from src.core.models import Candlestick, Trade, Signal, SignalType
 from src.core.orm_models import SignalAudit, StrategyState
@@ -20,10 +19,8 @@ from src.core.data_provider import check_data_availability
 from src.core.db import SessionLocal
 from src.core.adapters import create_adapter
 from src.core.journal import StrategyJournal
+from src.core.redis_factory import create_redis_client
 
-# Redis Config
-REDIS_HOST = os.getenv('REDIS_HOST', 'localhost')
-REDIS_PORT = int(os.getenv('REDIS_PORT', 6379))
 HOT_STRATEGIES_PATH = os.getenv('HOT_STRATEGIES_PATH', '/app/strategies_hot')
 
 logger = logging.getLogger(__name__)
@@ -65,7 +62,7 @@ class StrategyEngine:
         self.execution_engine = ExecutionEngine(db_session, clock, adapter, order_repository, journal=journal)
         
         # System State & Heartbeat
-        self.redis_client = redis.Redis(host=REDIS_HOST, port=REDIS_PORT, decode_responses=True)
+        self.redis_client = create_redis_client()
         self.running = True
         self.heartbeat_thread = None
         self.command_thread = None
@@ -405,7 +402,7 @@ class StrategyEngine:
             logger.error(f"Failed to log audit trail: {e}")
             self.db.rollback()
 
-    def shutdown(self, timeout: float = 10.0):
+    def shutdown(self, timeout: float = 30.0):
         """Graceful shutdown: stop threads, drain executor, close Redis."""
         logger.info("StrategyEngine shutting down...")
         self.running = False

@@ -201,15 +201,12 @@ async fn run_live_mode(exchange_opt: Option<String>, symbol_opt: Option<String>)
 
 
 
-    let redis_url = format!(
-
-        "redis://{}:{}",
-
-        std::env::var("REDIS_HOST").unwrap_or_else(|_| "127.0.0.1".into()),
-
-        std::env::var("REDIS_PORT").unwrap_or_else(|_| "6379".into())
-
-    );
+    let redis_host = std::env::var("REDIS_HOST").unwrap_or_else(|_| "127.0.0.1".into());
+    let redis_port = std::env::var("REDIS_PORT").unwrap_or_else(|_| "6379".into());
+    let redis_url = match std::env::var("REDIS_PASSWORD") {
+        Ok(pw) if !pw.is_empty() => format!("redis://:{}@{}:{}", pw, redis_host, redis_port),
+        _ => format!("redis://{}:{}", redis_host, redis_port),
+    };
 
 
 
@@ -409,9 +406,16 @@ async fn run_live_mode(exchange_opt: Option<String>, symbol_opt: Option<String>)
 
     // 3. Main Loop: Forward to Redis and Aggregator
 
+    info!("Entering main event loop. Press Ctrl+C to shutdown.");
+
     loop {
 
         tokio::select! {
+
+            _ = tokio::signal::ctrl_c() => {
+                info!("Received shutdown signal, draining in-flight messages...");
+                break;
+            }
 
             msg = trade_rx.recv() => {
 
@@ -509,4 +513,10 @@ async fn run_live_mode(exchange_opt: Option<String>, symbol_opt: Option<String>)
 
     }
 
+    // Graceful cleanup
+    info!("Closing Redis publisher...");
+    drop(publisher);
+    info!("FluxTrade Data Service stopped.");
+
+    Ok(())
 }

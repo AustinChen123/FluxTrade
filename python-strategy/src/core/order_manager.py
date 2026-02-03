@@ -7,23 +7,23 @@ from src.core.orm_models import Order, Trade
 from src.core.models import Signal
 from src.core.clock import Clock
 from src.core.interfaces import IOrderRepository
-
-# Redis Config
-REDIS_HOST = os.getenv('REDIS_HOST', 'localhost')
-REDIS_PORT = int(os.getenv('REDIS_PORT', 6379))
+from src.core.redis_factory import create_redis_client
 
 class OrderManager:
-    def __init__(self, repo: IOrderRepository, clock: Clock):
+    def __init__(self, repo: IOrderRepository, clock: Clock, is_backtest: Optional[bool] = None):
         self.repo = repo
         self.clock = clock
         self.redis_client = None
         self.update_position_script = None
-        
-        # Detect Backtest Mode via Repository Type
-        self.is_backtest = "BacktestOrderRepository" in str(type(repo))
-        
+
+        # Detect Backtest Mode: explicit flag > repository type heuristic
+        if is_backtest is not None:
+            self.is_backtest = is_backtest
+        else:
+            self.is_backtest = "BacktestOrderRepository" in str(type(repo))
+
         if not self.is_backtest:
-            self.redis_client = redis.Redis(host=REDIS_HOST, port=REDIS_PORT, decode_responses=True)
+            self.redis_client = create_redis_client()
             # Load Lua Script
             lua_path = os.path.join(os.path.dirname(__file__), '../lua/update_position.lua')
             try:

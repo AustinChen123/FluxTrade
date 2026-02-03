@@ -37,7 +37,7 @@ def mock_redis():
 @pytest.fixture
 def consumer(mock_redis):
     """DataConsumer with mocked Redis client."""
-    with patch("src.core.consumer.redis.Redis", return_value=mock_redis):
+    with patch("src.core.consumer.create_redis_client", return_value=mock_redis):
         c = DataConsumer(
             channels=["stream:market:binance:btcusdt:1m"],
             on_message_callback=MagicMock(),
@@ -88,7 +88,7 @@ class TestEnsureConsumerGroups:
             "stream:market:binance:btcusdt:1m",
             "stream:market:binance:ethusdt:5m",
         ]
-        with patch("src.core.consumer.redis.Redis", return_value=mock_redis):
+        with patch("src.core.consumer.create_redis_client", return_value=mock_redis):
             c = DataConsumer(channels=channels, on_message_callback=MagicMock())
         c.redis_client = mock_redis
 

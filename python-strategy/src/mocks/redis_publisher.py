@@ -1,22 +1,19 @@
 import os
 import time
 import random
-import redis
 from decimal import Decimal
 from dotenv import load_dotenv
 from src.core.models import Candlestick
+from src.core.redis_factory import create_redis_client
 
 # Load env from root
 load_dotenv(os.path.join(os.path.dirname(__file__), '../../../.env'))
 
-REDIS_HOST = os.getenv('REDIS_HOST', 'localhost')
-REDIS_PORT = int(os.getenv('REDIS_PORT', 6379))
-
 class MockRedisPublisher:
     def __init__(self):
-        self.redis_client = redis.Redis(host=REDIS_HOST, port=REDIS_PORT, decode_responses=True)
+        self.redis_client = create_redis_client()
         self.running = True
-        print(f"Connected to Redis at {REDIS_HOST}:{REDIS_PORT}")
+        print("MockRedisPublisher: Connected to Redis")
 
     def generate_fake_candle(self, current_price: Decimal, product_id: str, timestamp: int) -> Candlestick:
         # Random walk

@@ -692,11 +692,11 @@ def engine_factory(mock_db_session, mock_clock, mock_exchange_adapter):
         )
         defaults.update(overrides)
 
-        with patch("src.core.engine.redis.Redis") as mock_redis_cls:
+        with patch("src.core.engine.create_redis_client") as mock_factory:
             mock_redis_inst = MagicMock()
             mock_redis_inst.ping.return_value = True
             mock_redis_inst.get.return_value = None
-            mock_redis_cls.return_value = mock_redis_inst
+            mock_factory.return_value = mock_redis_inst
             engine = StrategyEngine(**defaults)
             engine.redis_client = mock_redis_inst
         return engine

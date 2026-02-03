@@ -354,14 +354,14 @@ class TestAccountService:
         mock_redis = MagicMock()
         mock_redis.ping.return_value = True
 
-        with patch("src.core.risk_manager.redis.Redis", return_value=mock_redis):
+        with patch("src.core.risk_manager.create_redis_client", return_value=mock_redis):
             service = AccountService()
 
         assert service.redis is not None
 
     def test_init_redis_failure_sets_none(self):
         """Redis connection failure should set redis to None."""
-        with patch("src.core.risk_manager.redis.Redis", side_effect=Exception("conn fail")):
+        with patch("src.core.risk_manager.create_redis_client", side_effect=Exception("conn fail")):
             service = AccountService()
 
         assert service.redis is None
@@ -372,7 +372,7 @@ class TestAccountService:
         mock_redis.ping.return_value = True
         mock_redis.hget.return_value = "12345.67"
 
-        with patch("src.core.risk_manager.redis.Redis", return_value=mock_redis):
+        with patch("src.core.risk_manager.create_redis_client", return_value=mock_redis):
             service = AccountService()
 
         result = service.get_balance()
@@ -380,7 +380,7 @@ class TestAccountService:
 
     def test_get_balance_no_redis_returns_zero(self):
         """Without Redis connection, should return zero."""
-        with patch("src.core.risk_manager.redis.Redis", side_effect=Exception("fail")):
+        with patch("src.core.risk_manager.create_redis_client", side_effect=Exception("fail")):
             service = AccountService()
 
         assert service.get_balance() == Decimal("0")
@@ -391,7 +391,7 @@ class TestAccountService:
         mock_redis.ping.return_value = True
         mock_redis.hget.return_value = None
 
-        with patch("src.core.risk_manager.redis.Redis", return_value=mock_redis):
+        with patch("src.core.risk_manager.create_redis_client", return_value=mock_redis):
             service = AccountService()
 
         assert service.get_balance() == Decimal("0")
@@ -405,7 +405,7 @@ class TestAccountService:
             "entry_price": "42000",
         }
 
-        with patch("src.core.risk_manager.redis.Redis", return_value=mock_redis):
+        with patch("src.core.risk_manager.create_redis_client", return_value=mock_redis):
             service = AccountService()
 
         pos = service.get_position("strat", "BINANCE:BTCUSDT-PERP")
@@ -423,7 +423,7 @@ class TestAccountService:
             "entry_price": "42000",
         }
 
-        with patch("src.core.risk_manager.redis.Redis", return_value=mock_redis):
+        with patch("src.core.risk_manager.create_redis_client", return_value=mock_redis):
             service = AccountService()
 
         pos = service.get_position("strat", "BINANCE:BTCUSDT-PERP")
@@ -440,7 +440,7 @@ class TestAccountService:
             "entry_price": "42000",
         }
 
-        with patch("src.core.risk_manager.redis.Redis", return_value=mock_redis):
+        with patch("src.core.risk_manager.create_redis_client", return_value=mock_redis):
             service = AccountService()
 
         assert service.get_position("strat", "BINANCE:BTCUSDT-PERP") is None
@@ -451,14 +451,14 @@ class TestAccountService:
         mock_redis.ping.return_value = True
         mock_redis.hgetall.return_value = {}
 
-        with patch("src.core.risk_manager.redis.Redis", return_value=mock_redis):
+        with patch("src.core.risk_manager.create_redis_client", return_value=mock_redis):
             service = AccountService()
 
         assert service.get_position("strat", "BINANCE:BTCUSDT-PERP") is None
 
     def test_get_position_no_redis_returns_none(self):
         """Without Redis connection, should return None."""
-        with patch("src.core.risk_manager.redis.Redis", side_effect=Exception("fail")):
+        with patch("src.core.risk_manager.create_redis_client", side_effect=Exception("fail")):
             service = AccountService()
 
         assert service.get_position("strat", "BINANCE:BTCUSDT-PERP") is None

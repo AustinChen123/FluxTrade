@@ -5,7 +5,14 @@ services:
     restart: always
     ports:
       - "6379:6379"
-    command: redis-server --save 60 1 --loglevel warning
+    command: >
+      sh -c "if [ -n \"$$REDIS_PASSWORD\" ]; then
+        redis-server --save 60 1 --loglevel warning --requirepass $$REDIS_PASSWORD;
+      else
+        redis-server --save 60 1 --loglevel warning;
+      fi"
+    environment:
+      REDIS_PASSWORD: ${REDIS_PASSWORD:-}
 
   db:
     image: postgres:15-alpine
@@ -31,6 +38,7 @@ services:
       - db
     environment:
       REDIS_HOST: redis
+      REDIS_PASSWORD: ${REDIS_PASSWORD:-}
       POSTGRES_HOST: db
       POSTGRES_PORT: 5432
       POSTGRES_USER: fluxtrade
@@ -53,6 +61,7 @@ services:
       - rust-data
     environment:
       REDIS_HOST: redis
+      REDIS_PASSWORD: ${REDIS_PASSWORD:-}
       POSTGRES_HOST: db
       POSTGRES_PORT: 5432
       POSTGRES_USER: fluxtrade
@@ -76,6 +85,8 @@ services:
       - "8501:8501"
     environment:
       REDIS_HOST: redis
+      REDIS_PASSWORD: ${REDIS_PASSWORD:-}
+      DASHBOARD_PASSWORD: ${DASHBOARD_PASSWORD:-}
       POSTGRES_HOST: db
       POSTGRES_PORT: 5432
       POSTGRES_USER: fluxtrade

@@ -15,9 +15,9 @@ def mock_callback():
 
 @pytest.fixture
 def consumer(mock_callback):
-    with patch("src.core.consumer.redis.Redis") as mock_redis_cls:
+    with patch("src.core.consumer.create_redis_client") as mock_factory:
         mock_client = MagicMock()
-        mock_redis_cls.return_value = mock_client
+        mock_factory.return_value = mock_client
         c = DataConsumer(channels=["stream:test"], on_message_callback=mock_callback)
         yield c
 

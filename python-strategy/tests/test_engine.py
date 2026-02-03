@@ -63,9 +63,9 @@ class TestEngineInit:
 
     def test_default_adapter_simulated(self, mock_db_session, mock_clock):
         """When no adapter_config, should default to simulated mode."""
-        with patch("src.core.engine.redis.Redis") as mock_redis_cls, \
+        with patch("src.core.engine.create_redis_client") as mock_factory, \
              patch("src.core.engine.create_adapter") as mock_create:
-            mock_redis_cls.return_value = MagicMock()
+            mock_factory.return_value = MagicMock()
             mock_adapter = MagicMock()
             mock_create.return_value = mock_adapter
 
@@ -78,9 +78,9 @@ class TestEngineInit:
 
     def test_adapter_config_passed_through(self, mock_db_session, mock_clock):
         """Custom adapter_config should be forwarded to create_adapter."""
-        with patch("src.core.engine.redis.Redis") as mock_redis_cls, \
+        with patch("src.core.engine.create_redis_client") as mock_factory, \
              patch("src.core.engine.create_adapter") as mock_create:
-            mock_redis_cls.return_value = MagicMock()
+            mock_factory.return_value = MagicMock()
             mock_create.return_value = MagicMock()
 
             cfg = {"mode": "live", "exchange": "bybit"}
@@ -94,9 +94,9 @@ class TestEngineInit:
 
     def test_adapter_create_failure_falls_back(self, mock_db_session, mock_clock):
         """If create_adapter fails, should fallback to simulated."""
-        with patch("src.core.engine.redis.Redis") as mock_redis_cls, \
+        with patch("src.core.engine.create_redis_client") as mock_factory, \
              patch("src.core.engine.create_adapter") as mock_create:
-            mock_redis_cls.return_value = MagicMock()
+            mock_factory.return_value = MagicMock()
             mock_create.side_effect = [RuntimeError("boom"), MagicMock()]
 
             StrategyEngine(
@@ -110,9 +110,9 @@ class TestEngineInit:
 
     def test_provided_adapter_used_directly(self, mock_db_session, mock_clock):
         """Pre-created adapter should be used without calling create_adapter."""
-        with patch("src.core.engine.redis.Redis") as mock_redis_cls, \
+        with patch("src.core.engine.create_redis_client") as mock_factory, \
              patch("src.core.engine.create_adapter") as mock_create:
-            mock_redis_cls.return_value = MagicMock()
+            mock_factory.return_value = MagicMock()
             mock_adapter = MagicMock()
 
             StrategyEngine(

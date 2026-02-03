@@ -25,6 +25,14 @@ services:
     image: redis:7-alpine
     container_name: fluxtrade-redis
     restart: always
+    command: >
+      sh -c "if [ -n \"$$REDIS_PASSWORD\" ]; then
+        redis-server --requirepass $$REDIS_PASSWORD;
+      else
+        redis-server;
+      fi"
+    environment:
+      REDIS_PASSWORD: ${REDIS_PASSWORD:-}
     ports:
       - "${REDIS_PORT}:6379"
     volumes:
@@ -32,7 +40,7 @@ services:
     networks:
       - fluxtrade-net
     healthcheck:
-      test: ["CMD", "redis-cli", "ping"]
+      test: ["CMD", "sh", "-c", "if [ -n \"$REDIS_PASSWORD\" ]; then redis-cli -a $REDIS_PASSWORD ping; else redis-cli ping; fi"]
       interval: 5s
       timeout: 5s
       retries: 5

@@ -1,18 +1,13 @@
-import os
-import redis
 from decimal import Decimal
 from typing import Optional
 from src.core.models import Signal, SignalType, Position
-
-# Redis Config
-REDIS_HOST = os.getenv('REDIS_HOST', 'localhost')
-REDIS_PORT = int(os.getenv('REDIS_PORT', 6379))
+from src.core.redis_factory import create_redis_client
 
 class AccountService:
     """Interface for accessing account data via Redis."""
     def __init__(self):
         try:
-            self.redis = redis.Redis(host=REDIS_HOST, port=REDIS_PORT, decode_responses=True)
+            self.redis = create_redis_client()
             self.redis.ping() # Check connection
         except Exception as e:
             print(f"⚠️ AccountService: Redis connection failed: {e}")
