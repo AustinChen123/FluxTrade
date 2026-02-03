@@ -10,13 +10,13 @@ from src.core.interfaces import IOrderRepository
 from src.core.journal import StrategyJournal
 
 class ExecutionEngine:
-    def __init__(self, db_session: Session, clock: Clock, adapter: IExchangeAdapter, order_repository: Optional[IOrderRepository] = None, journal: Optional[StrategyJournal] = None):
+    def __init__(self, db_session: Session, clock: Clock, adapter: IExchangeAdapter, order_repository: Optional[IOrderRepository] = None, journal: Optional[StrategyJournal] = None, is_backtest: Optional[bool] = None):
         self.logger = logging.getLogger("ExecutionEngine")
         if order_repository:
-            self.order_manager = OrderManager(order_repository, clock)
+            self.order_manager = OrderManager(order_repository, clock, is_backtest=is_backtest)
         else:
             from src.core.repositories import LiveOrderRepository
-            self.order_manager = OrderManager(LiveOrderRepository(db_session), clock)
+            self.order_manager = OrderManager(LiveOrderRepository(db_session), clock, is_backtest=is_backtest)
 
         self.default_quantity = Decimal("0.01")
         self.adapter = adapter

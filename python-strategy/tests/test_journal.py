@@ -248,6 +248,7 @@ class TestExecutionEngineJournal:
             mock_exchange_adapter,
             mock_order_repo,
             journal=journal,
+            is_backtest=True,
         )
         return engine, journal
 
@@ -342,6 +343,7 @@ class TestExecutionEngineJournal:
             mock_clock,
             mock_exchange_adapter,
             mock_order_repo,
+            is_backtest=True,
         )
         signal = Signal(
             strategy_id="test_strat",
