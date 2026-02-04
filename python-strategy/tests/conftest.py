@@ -8,6 +8,7 @@ comprehensive testing without external dependencies (Redis, PostgreSQL, Exchange
 import pytest
 import uuid
 import time
+import random
 from decimal import Decimal
 from typing import Optional, Dict, List
 from unittest.mock import MagicMock
@@ -217,6 +218,75 @@ class MockExchangeAdapter(IExchangeAdapter):
         self.positions[product_id] = position
 
 
+class RealisticMockAdapter(MockExchangeAdapter):
+    """Mock adapter with configurable realism: slippage, partial fills, rejections.
+
+    Parameters:
+        fill_ratio: fraction of order quantity to fill (0.0-1.0), default 1.0
+        slippage_bps: slippage in basis points applied to fill price, default 0
+        reject_probability: probability of rejecting an order (0.0-1.0), default 0.0
+        seed: random seed for reproducibility, default None
+    """
+
+    def __init__(
+        self,
+        initial_balance: Decimal = DEFAULT_BALANCE,
+        fill_ratio: float = 1.0,
+        slippage_bps: int = 0,
+        reject_probability: float = 0.0,
+        seed: int | None = None,
+    ):
+        super().__init__(initial_balance)
+        self.fill_ratio = fill_ratio
+        self.slippage_bps = slippage_bps
+        self.reject_probability = reject_probability
+        self._rng = random.Random(seed)
+
+    def place_order(self, order: Order) -> str:
+        if self._rng.random() < self.reject_probability:
+            from src.core.interfaces import ExchangeError
+            raise ExchangeError("Order rejected (simulated)")
+        return super().place_order(order)
+
+    def on_market_data(self, candle: Candlestick) -> List[Dict]:
+        fills = []
+        remaining = []
+
+        for order in self.open_orders:
+            if order.product_id != candle.product_id:
+                remaining.append(order)
+                continue
+
+            base_price = self._next_fill_price or candle.close
+            # Apply slippage
+            slippage_factor = Decimal(str(self.slippage_bps)) / Decimal("10000")
+            if order.side.lower() == "buy":
+                fill_price = base_price * (Decimal("1") + slippage_factor)
+            else:
+                fill_price = base_price * (Decimal("1") - slippage_factor)
+
+            fill_qty = order.quantity * Decimal(str(self.fill_ratio))
+            if fill_qty <= 0:
+                remaining.append(order)
+                continue
+
+            fills.append({
+                "order": order,
+                "price": fill_price,
+                "quantity": fill_qty,
+            })
+
+            # Partial fill: keep remainder as open order
+            unfilled = order.quantity - fill_qty
+            if unfilled > Decimal("0"):
+                order.quantity = unfilled
+                remaining.append(order)
+
+        self.open_orders = remaining
+        self.filled_orders.extend(fills)
+        return fills
+
+
 # =============================================================================
 # Fixture Factories
 # =============================================================================
@@ -251,6 +321,17 @@ def mock_order_repo():
 def mock_exchange_adapter():
     """Provides a MockExchangeAdapter."""
     return MockExchangeAdapter()
+
+
+@pytest.fixture
+def realistic_mock_adapter():
+    """Provides a RealisticMockAdapter with sensible defaults."""
+    return RealisticMockAdapter(
+        fill_ratio=1.0,
+        slippage_bps=5,
+        reject_probability=0.0,
+        seed=42,
+    )
 
 
 @pytest.fixture

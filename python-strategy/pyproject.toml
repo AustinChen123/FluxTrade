@@ -38,4 +38,5 @@ addopts = "-v"
 markers = [
     "smoke: critical path tests for quick validation (select with '-m smoke')",
     "integration: tests requiring external services (Docker, Redis, Postgres)",
+    "rust: tests requiring compiled Rust .so (fluxtrade_core)",
 ]
