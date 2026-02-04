@@ -92,18 +92,19 @@ class TestRiskManagerExposureChecks:
         """Entry should be rejected when max exposure is already reached."""
         mock_account_service.set_balance(Decimal("100000"))
 
-        # Set position with high exposure (quantity * entry_price >= max_exposure)
+        # Set position with high exposure (quantity * current_price >= max_exposure)
         # Default max_exposure_per_product is 50000 USDT
         large_position = position_factory(
             quantity=Decimal("1.5"),
-            entry_price=Decimal("40000")  # 1.5 * 40000 = 60000 > 50000
+            entry_price=Decimal("40000")
         )
         mock_account_service.set_position(large_position)
 
         risk_manager = RiskManager(mock_account_service)
         signal = signal_factory(signal_type=SignalType.LONG)
 
-        is_allowed, reason = risk_manager.check_risk(signal)
+        # current_price=40000 → 1.5 * 40000 = 60000 > 50000
+        is_allowed, reason = risk_manager.check_risk(signal, current_price=Decimal("40000"))
 
         assert is_allowed is False
         assert "exposure" in reason.lower()
@@ -117,16 +118,65 @@ class TestRiskManagerExposureChecks:
         # Set position with low exposure
         small_position = position_factory(
             quantity=Decimal("0.5"),
-            entry_price=Decimal("40000")  # 0.5 * 40000 = 20000 < 50000
+            entry_price=Decimal("40000")
         )
         mock_account_service.set_position(small_position)
 
         risk_manager = RiskManager(mock_account_service)
         signal = signal_factory(signal_type=SignalType.LONG)
 
-        is_allowed, reason = risk_manager.check_risk(signal)
+        # current_price=40000 → 0.5 * 40000 = 20000 < 50000
+        is_allowed, reason = risk_manager.check_risk(signal, current_price=Decimal("40000"))
 
         assert is_allowed is True
+
+    def test_exposure_uses_current_price_not_entry_price(
+        self, mock_account_service, signal_factory, position_factory
+    ):
+        """Exposure should be calculated with current market price, not entry price."""
+        mock_account_service.set_balance(Decimal("100000"))
+
+        # Entry at $100, but current price dropped to $50
+        # entry_notional = 1000 * 100 = 100000 (would reject)
+        # current_exposure = 1000 * 50 = 50000 (borderline, but >= threshold → reject)
+        position = position_factory(
+            quantity=Decimal("1000"),
+            entry_price=Decimal("100")
+        )
+        mock_account_service.set_position(position)
+
+        risk_manager = RiskManager(mock_account_service)
+        signal = signal_factory(signal_type=SignalType.LONG)
+
+        # With current_price=$30, exposure = 1000 * 30 = 30000 < 50000 → PASS
+        is_allowed, _ = risk_manager.check_risk(signal, current_price=Decimal("30"))
+        assert is_allowed is True
+
+        # With current_price=$60, exposure = 1000 * 60 = 60000 >= 50000 → REJECT
+        is_allowed, reason = risk_manager.check_risk(signal, current_price=Decimal("60"))
+        assert is_allowed is False
+        assert "exposure" in reason.lower()
+
+    def test_exposure_falls_back_to_entry_price_when_no_current_price(
+        self, mock_account_service, signal_factory, position_factory
+    ):
+        """Without current_price, exposure should fall back to entry_price."""
+        mock_account_service.set_balance(Decimal("100000"))
+
+        large_position = position_factory(
+            quantity=Decimal("1.5"),
+            entry_price=Decimal("40000")  # 1.5 * 40000 = 60000 > 50000
+        )
+        mock_account_service.set_position(large_position)
+
+        risk_manager = RiskManager(mock_account_service)
+        signal = signal_factory(signal_type=SignalType.LONG)
+
+        # No current_price → fallback to entry_price
+        is_allowed, reason = risk_manager.check_risk(signal)
+
+        assert is_allowed is False
+        assert "exposure" in reason.lower()
 
     def test_allow_exit_regardless_of_exposure(
         self, mock_account_service, signal_factory, position_factory
@@ -143,7 +193,7 @@ class TestRiskManagerExposureChecks:
         risk_manager = RiskManager(mock_account_service)
         signal = signal_factory(signal_type=SignalType.EXIT_LONG)
 
-        is_allowed, reason = risk_manager.check_risk(signal)
+        is_allowed, reason = risk_manager.check_risk(signal, current_price=Decimal("40000"))
 
         assert is_allowed is True
 
@@ -288,7 +338,7 @@ class TestRiskManagerEdgeCases:
         risk_manager = RiskManager(mock_account_service)
         signal = signal_factory(signal_type=SignalType.LONG)
 
-        is_allowed, reason = risk_manager.check_risk(signal)
+        is_allowed, reason = risk_manager.check_risk(signal, current_price=Decimal("40000"))
 
         assert is_allowed is False
 

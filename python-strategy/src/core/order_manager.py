@@ -1,3 +1,4 @@
+import logging
 import uuid
 import os
 import redis
@@ -8,6 +9,8 @@ from src.core.models import Signal
 from src.core.clock import Clock
 from src.core.interfaces import IOrderRepository
 from src.core.redis_factory import create_redis_client
+
+logger = logging.getLogger(__name__)
 
 class OrderManager:
     def __init__(self, repo: IOrderRepository, clock: Clock, is_backtest: Optional[bool] = None):
@@ -30,10 +33,10 @@ class OrderManager:
                 with open(lua_path, 'r') as f:
                     self.update_position_script = self.redis_client.register_script(f.read())
             except Exception as e:
-                print(f"FATAL: Failed to load Lua script: {e}")
+                logger.error("FATAL: Failed to load Lua script: %s", e)
                 raise e
         else:
-             print("🧪 OrderManager: Initialized in Backtest Mode (Redis Disabled).")
+             logger.info("OrderManager: Initialized in Backtest Mode (Redis Disabled).")
 
     def create_order(
         self,
@@ -65,7 +68,7 @@ class OrderManager:
         )
 
         self.repo.add_order(new_order)
-        print(f"DB: Order created {new_order.id} ({side} {order_type} {quantity} {signal.product_id})")
+        logger.info("Order created %s (%s %s %s %s)", new_order.id, side, order_type, quantity, signal.product_id)
         return new_order
 
     def update_exchange_order_id(self, order: Order, exchange_order_id: str):
@@ -75,7 +78,7 @@ class OrderManager:
         """Marks an order as FAILED due to execution errors."""
         order.status = "failed"
         # We could verify if there's a specific field for error msg, but for now just status
-        print(f"❌ DB: Order {order.id} marked as FAILED. Reason: {reason}")
+        logger.error("ORDER_FAILED: Order %s marked as FAILED. Reason: %s", order.id, reason)
         self.repo.update_order(order)
 
     def fill_order(self, order: Order, fill_price: Decimal, fill_quantity: Decimal, fee: Optional[Decimal] = None):
@@ -107,13 +110,13 @@ class OrderManager:
                         order.id
                     ]
                 )
-                print(f"Redis: Atomic Position Update Successful (Trade {trade_id})")
+                logger.info("Redis: Atomic Position Update Successful (Trade %s)", trade_id)
 
             except redis.exceptions.ResponseError as e:
-                print(f"FATAL: Redis Lua Script Error: {e}")
+                logger.error("FATAL: Redis Lua Script Error: %s", e)
                 raise RuntimeError(f"Critical State Corruption: {e}")
             except Exception as e:
-                print(f"FATAL: System Error during execution: {e}")
+                logger.error("FATAL: System Error during execution: %s", e)
                 raise e
         else:
             # Backtest Mode: position/balance managed by Rust matching engine
