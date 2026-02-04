@@ -24,13 +24,13 @@ class SimulatedAdapter(IExchangeAdapter):
     def __init__(
         self,
         initial_balance: Decimal = Decimal("100000"),
-        maker_fee: float = 0.0,
-        taker_fee: float = 0.0,
+        maker_fee: Decimal = Decimal("0"),
+        taker_fee: Decimal = Decimal("0"),
     ):
         self._engine = PyMatchingEngine(
-            float(initial_balance),
-            maker_fee=maker_fee,
-            taker_fee=taker_fee,
+            str(initial_balance),
+            maker_fee=str(maker_fee),
+            taker_fee=str(taker_fee),
         )
         # Map order ID → ORM Order so we can return it in fills
         self._order_map: Dict[str, Order] = {}
@@ -59,20 +59,20 @@ class SimulatedAdapter(IExchangeAdapter):
         return False
 
     def get_balance(self, asset: str = "USDT") -> Decimal:
-        return Decimal(str(self._engine.balance))
+        return Decimal(self._engine.balance)
 
     def get_position(self, product_id: str) -> Optional[Position]:
         rust_positions = self._engine.positions
         rust_pos = rust_positions.get(product_id)
-        if not rust_pos or rust_pos.side == "FLAT" or rust_pos.quantity < 1e-9:
+        if not rust_pos or rust_pos.side == "FLAT" or Decimal(rust_pos.quantity) <= 0:
             return None
         return Position(
             strategy_id="",
             product_id=product_id,
             side=rust_pos.side,
-            quantity=Decimal(str(rust_pos.quantity)),
-            entry_price=Decimal(str(rust_pos.entry_price)),
-            unrealized_pnl=Decimal(str(rust_pos.unrealized_pnl)),
+            quantity=Decimal(rust_pos.quantity),
+            entry_price=Decimal(rust_pos.entry_price),
+            unrealized_pnl=Decimal(rust_pos.unrealized_pnl),
         )
 
     # ── Backtest simulation hook ─────────────────────────────────
@@ -94,9 +94,9 @@ class SimulatedAdapter(IExchangeAdapter):
                 continue
             fills.append({
                 "order": orm_order,
-                "price": Decimal(str(rf.price)),
-                "quantity": Decimal(str(rf.quantity)),
-                "fee": Decimal(str(rf.fee)),
+                "price": Decimal(rf.price),
+                "quantity": Decimal(rf.quantity),
+                "fee": Decimal(rf.fee),
                 "fill_type": rf.fill_type,
             })
 
@@ -140,11 +140,11 @@ class SimulatedAdapter(IExchangeAdapter):
 
         trigger_price = None
         if order.trigger_price is not None:
-            trigger_price = float(order.trigger_price)
+            trigger_price = str(order.trigger_price)
 
         trailing_distance = None
         if hasattr(order, "_trailing_distance") and order._trailing_distance is not None:
-            trailing_distance = float(order._trailing_distance)
+            trailing_distance = str(order._trailing_distance)
 
         linked_order_id = None
         if hasattr(order, "_linked_order_id") and order._linked_order_id is not None:
@@ -155,8 +155,8 @@ class SimulatedAdapter(IExchangeAdapter):
             product_id=order.product_id,
             side=side,
             order_type=order_type,
-            price=float(order.price) if order.price else 0.0,
-            quantity=float(order.quantity),
+            price=str(order.price) if order.price else "0",
+            quantity=str(order.quantity),
             timestamp=order.timestamp or 0,
             trigger_price=trigger_price,
             trailing_distance=trailing_distance,
@@ -169,9 +169,9 @@ class SimulatedAdapter(IExchangeAdapter):
             product_id=candle.product_id,
             timeframe=candle.timeframe,
             timestamp=candle.timestamp,
-            open=float(candle.open),
-            high=float(candle.high),
-            low=float(candle.low),
-            close=float(candle.close),
-            volume=float(candle.volume),
+            open=str(candle.open),
+            high=str(candle.high),
+            low=str(candle.low),
+            close=str(candle.close),
+            volume=str(candle.volume),
         )
