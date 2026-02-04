@@ -13,22 +13,42 @@ services:
       fi"
     environment:
       REDIS_PASSWORD: ${REDIS_PASSWORD:-}
+    deploy:
+      resources:
+        limits:
+          memory: 256M
+          cpus: "0.5"
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
 
   db:
     image: postgres:15-alpine
     container_name: fluxtrade-db
     restart: always
     environment:
-      POSTGRES_USER: fluxtrade
-      POSTGRES_PASSWORD: fluxtrade
-      POSTGRES_DB: fluxtrade
+      POSTGRES_USER: ${POSTGRES_USER:-fluxtrade}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-fluxtrade}
+      POSTGRES_DB: ${POSTGRES_DB:-fluxtrade}
     ports:
       - "5432:5432"
     volumes:
       - postgres_data:/var/lib/postgresql/data
+    deploy:
+      resources:
+        limits:
+          memory: 512M
+          cpus: "1.0"
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
 
   rust-data:
-    build: 
+    build:
       context: ./rust-data-service
       dockerfile: Dockerfile
     container_name: fluxtrade-rust
@@ -41,13 +61,23 @@ services:
       REDIS_PASSWORD: ${REDIS_PASSWORD:-}
       POSTGRES_HOST: db
       POSTGRES_PORT: 5432
-      POSTGRES_USER: fluxtrade
-      POSTGRES_PASSWORD: fluxtrade
-      POSTGRES_DB: fluxtrade
+      POSTGRES_USER: ${POSTGRES_USER:-fluxtrade}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-fluxtrade}
+      POSTGRES_DB: ${POSTGRES_DB:-fluxtrade}
       EXCHANGE_ENABLED: "binance,backpack"
       EXCHANGE_API_KEY: ${EXCHANGE_API_KEY}
       EXCHANGE_SECRET: ${EXCHANGE_SECRET}
     command: ["live", "--exchange", "binance", "--symbol", "BTCUSDT"]
+    deploy:
+      resources:
+        limits:
+          memory: 512M
+          cpus: "1.0"
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "5"
 
   python-strategy:
     build:
@@ -64,13 +94,23 @@ services:
       REDIS_PASSWORD: ${REDIS_PASSWORD:-}
       POSTGRES_HOST: db
       POSTGRES_PORT: 5432
-      POSTGRES_USER: fluxtrade
-      POSTGRES_PASSWORD: fluxtrade
-      POSTGRES_DB: fluxtrade
+      POSTGRES_USER: ${POSTGRES_USER:-fluxtrade}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-fluxtrade}
+      POSTGRES_DB: ${POSTGRES_DB:-fluxtrade}
       BINANCE_API_KEY: ${BINANCE_API_KEY}
       BINANCE_SECRET: ${BINANCE_SECRET}
     volumes:
       - ./python-strategy/strategies_hot:/app/strategies_hot
+    deploy:
+      resources:
+        limits:
+          memory: 1G
+          cpus: "1.5"
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "5"
 
   dashboard:
     build:
@@ -89,9 +129,24 @@ services:
       DASHBOARD_PASSWORD: ${DASHBOARD_PASSWORD:-}
       POSTGRES_HOST: db
       POSTGRES_PORT: 5432
-      POSTGRES_USER: fluxtrade
-      POSTGRES_PASSWORD: fluxtrade
-      POSTGRES_DB: fluxtrade
+      POSTGRES_USER: ${POSTGRES_USER:-fluxtrade}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-fluxtrade}
+      POSTGRES_DB: ${POSTGRES_DB:-fluxtrade}
+    command: >
+      streamlit run app.py
+      --server.enableCORS=false
+      --server.enableXsrfProtection=true
+      --server.address=0.0.0.0
+    deploy:
+      resources:
+        limits:
+          memory: 512M
+          cpus: "0.5"
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
 
 volumes:
   postgres_data:
