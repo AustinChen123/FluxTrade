@@ -49,7 +49,7 @@ class TestSimulatedAdapterBasics:
         assert adapter.get_position(PRODUCT) is None
 
     def test_initialization_custom(self):
-        adapter = SimulatedAdapter(Decimal("50000"), maker_fee=0.001, taker_fee=0.002)
+        adapter = SimulatedAdapter(Decimal("50000"), maker_fee=Decimal("0.001"), taker_fee=Decimal("0.002"))
         assert adapter.get_balance() == Decimal("50000")
 
 
@@ -59,7 +59,7 @@ class TestSimulatedAdapterBasics:
 
 class TestMarketOrders:
     def test_market_buy_fills_at_open(self, order_factory):
-        adapter = SimulatedAdapter(Decimal("10000"), taker_fee=0.0006)
+        adapter = SimulatedAdapter(Decimal("10000"), taker_fee=Decimal("0.0006"))
         order = order_factory(order_type="market", side="buy",
                               product_id=PRODUCT, quantity=Decimal("0.1"))
         adapter.place_order(order)
@@ -99,7 +99,7 @@ class TestMarketOrders:
 
 class TestLimitOrders:
     def test_limit_buy_fills_when_low_touches(self, order_factory):
-        adapter = SimulatedAdapter(Decimal("10000"), maker_fee=0.0002)
+        adapter = SimulatedAdapter(Decimal("10000"), maker_fee=Decimal("0.0002"))
         order = order_factory(order_type="limit", side="buy",
                               product_id=PRODUCT, price=Decimal("49000"),
                               quantity=Decimal("0.1"))
@@ -123,7 +123,7 @@ class TestLimitOrders:
         assert len(fills) == 0
 
     def test_limit_sell_fills_when_high_reaches(self, order_factory):
-        adapter = SimulatedAdapter(Decimal("10000"), maker_fee=0.0002)
+        adapter = SimulatedAdapter(Decimal("10000"), maker_fee=Decimal("0.0002"))
         order = order_factory(order_type="limit", side="sell",
                               product_id=PRODUCT, price=Decimal("51000"),
                               quantity=Decimal("0.1"))
@@ -385,7 +385,7 @@ class TestTrailingStop:
 
 class TestBalanceAccuracy:
     def test_market_fee_deducted(self, order_factory):
-        adapter = SimulatedAdapter(Decimal("10000"), taker_fee=0.0006)
+        adapter = SimulatedAdapter(Decimal("10000"), taker_fee=Decimal("0.0006"))
         order = order_factory(order_type="market", side="buy",
                               product_id=PRODUCT, quantity=Decimal("0.1"))
         adapter.place_order(order)
@@ -395,7 +395,7 @@ class TestBalanceAccuracy:
         assert _approx(adapter.get_balance(), 10000 - 3.0)
 
     def test_pnl_after_tp(self, order_factory):
-        adapter = SimulatedAdapter(Decimal("10000"), taker_fee=0.0006)
+        adapter = SimulatedAdapter(Decimal("10000"), taker_fee=Decimal("0.0006"))
         # open long at 50000
         entry = order_factory(order_type="market", side="buy",
                               product_id=PRODUCT, quantity=Decimal("0.1"))
@@ -416,7 +416,7 @@ class TestBalanceAccuracy:
         assert _approx(adapter.get_balance(), 10193.88)
 
     def test_pnl_after_sl_loss(self, order_factory):
-        adapter = SimulatedAdapter(Decimal("10000"), taker_fee=0.0006)
+        adapter = SimulatedAdapter(Decimal("10000"), taker_fee=Decimal("0.0006"))
         entry = order_factory(order_type="market", side="buy",
                               product_id=PRODUCT, quantity=Decimal("0.1"))
         adapter.place_order(entry)

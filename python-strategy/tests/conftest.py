@@ -623,11 +623,12 @@ def order_manager(mock_order_repo, mock_clock):
 @pytest.fixture
 def simulated_adapter():
     """Provides a SimulatedAdapter backed by Rust PyMatchingEngine."""
+    from decimal import Decimal
     from src.core.adapters.simulated import SimulatedAdapter
     return SimulatedAdapter(
         initial_balance=DEFAULT_BALANCE,
-        maker_fee=0.0002,
-        taker_fee=0.0006,
+        maker_fee=Decimal("0.0002"),
+        taker_fee=Decimal("0.0006"),
     )
 
 
