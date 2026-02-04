@@ -7,7 +7,7 @@ import traceback
 from concurrent.futures import ThreadPoolExecutor
 from typing import List, Union, Optional, Dict, Type
 from sqlalchemy.orm import Session
-from src.core.models import Candlestick, Trade, Signal, SignalType
+from src.core.models import Candlestick, Trade, Signal, SignalType, StrategyStatus
 from src.core.orm_models import SignalAudit, StrategyState
 from src.strategies.base import BaseStrategy
 from src.core.risk_manager import RiskManager, AccountService
@@ -41,6 +41,7 @@ class StrategyEngine:
         self.strategies: Dict[str, List[BaseStrategy]] = {}
         self.strategy_instances: Dict[str, BaseStrategy] = {}
         self.loaded_classes: Dict[str, Type[BaseStrategy]] = {}
+        self._strategy_lock = threading.Lock()
 
         # Initialize Services
         self.account_service = account_service if account_service else AccountService()
@@ -142,14 +143,14 @@ class StrategyEngine:
                 if not state:
                     state = StrategyState(
                         strategy_id=strategy_id,
-                        status="DISCOVERED",
+                        status=StrategyStatus.DISCOVERED,
                         config_json="{}"
                     )
                     db.add(state)
-                
+
                 if isinstance(result, str):
                     # It was a LoadError (traceback string)
-                    state.status = "ERROR"
+                    state.status = StrategyStatus.ERROR
                     state.performance_json = json.dumps({"error": result})
                 
                 db.commit()
@@ -186,19 +187,19 @@ class StrategyEngine:
                 
                 if not is_available:
                     logger.warning(f"⚠️ Insufficient data for {strategy_id}. Command: {backfill_cmd}")
-                    state.status = "WARNING"
+                    state.status = StrategyStatus.WARNING
                     state.performance_json = json.dumps({"backfill_command": backfill_cmd})
                     db.commit()
                     return
 
                 # If OK, update status to READY
-                state.status = "READY"
+                state.status = StrategyStatus.READY
                 db.commit()
                 logger.info(f"✅ Strategy {strategy_id} is READY.")
 
             except Exception as e:
                 error_trace = traceback.format_exc()
-                state.status = "ERROR"
+                state.status = StrategyStatus.ERROR
                 state.performance_json = json.dumps({"error": error_trace})
                 db.commit()
                 logger.error(f"❌ Test Run failed for {strategy_id}: {e}")
@@ -215,7 +216,8 @@ class StrategyEngine:
         with SessionLocal() as db:
             state = db.query(StrategyState).filter(StrategyState.strategy_id == strategy_id).first()
             # Allow READY or WARNING (with manual override implied by START command)
-            if not state or state.status not in ["READY", "WARNING", "STOPPED", "DISCOVERED"]:
+            startable = {StrategyStatus.READY, StrategyStatus.WARNING, StrategyStatus.STOPPED, StrategyStatus.DISCOVERED}
+            if not state or state.status not in startable:
                  logger.error(f"Strategy {strategy_id} is not in startable state (Current: {state.status if state else 'None'})")
                  return
 
@@ -226,19 +228,20 @@ class StrategyEngine:
                 strategy_cls = self.loaded_classes[strategy_id]
                 instance = strategy_cls(strategy_id, product_id)
                 
-                # Register
-                self.strategy_instances[strategy_id] = instance
-                if product_id not in self.strategies:
-                    self.strategies[product_id] = []
-                self.strategies[product_id].append(instance)
+                # Register (thread-safe)
+                with self._strategy_lock:
+                    self.strategy_instances[strategy_id] = instance
+                    if product_id not in self.strategies:
+                        self.strategies[product_id] = []
+                    self.strategies[product_id].append(instance)
                 
-                state.status = "ACTIVE"
+                state.status = StrategyStatus.ACTIVE
                 state.uptime_start = int(time.time() * 1000)
                 db.commit()
                 logger.info(f"🔥 Strategy {strategy_id} is now ACTIVE for {product_id}")
 
             except Exception as e:
-                state.status = "ERROR"
+                state.status = StrategyStatus.ERROR
                 state.performance_json = json.dumps({"error": str(e)})
                 db.commit()
                 logger.error(f"❌ Failed to start {strategy_id}: {e}")
@@ -248,19 +251,20 @@ class StrategyEngine:
         Deactivates an active strategy.
         """
         logger.info(f"🛑 Stopping Strategy: {strategy_id}")
-        if strategy_id not in self.strategy_instances:
-            logger.warning(f"Strategy {strategy_id} is not active.")
-            return
+        with self._strategy_lock:
+            if strategy_id not in self.strategy_instances:
+                logger.warning(f"Strategy {strategy_id} is not active.")
+                return
 
-        instance = self.strategy_instances.pop(strategy_id)
-        product_id = instance.product_id
-        if product_id in self.strategies:
-            self.strategies[product_id] = [s for s in self.strategies[product_id] if s.strategy_id != strategy_id]
+            instance = self.strategy_instances.pop(strategy_id)
+            product_id = instance.product_id
+            if product_id in self.strategies:
+                self.strategies[product_id] = [s for s in self.strategies[product_id] if s.strategy_id != strategy_id]
         
         with SessionLocal() as db:
             state = db.query(StrategyState).filter(StrategyState.strategy_id == strategy_id).first()
             if state:
-                state.status = "STOPPED"
+                state.status = StrategyStatus.STOPPED
                 db.commit()
         
         logger.info(f"✅ Strategy {strategy_id} stopped.")
@@ -305,10 +309,12 @@ class StrategyEngine:
             while self.running:
                 try:
                     self.redis_client.setex("heartbeat:python", 3, "1")
-                    # Update DB heartbeats for active strategies
+                    # Update DB heartbeats for active strategies (snapshot for thread safety)
+                    with self._strategy_lock:
+                        active_sids = list(self.strategy_instances.keys())
                     with SessionLocal() as db:
                         now_ms = int(time.time() * 1000)
-                        for sid in self.strategy_instances:
+                        for sid in active_sids:
                             db.query(StrategyState).filter(StrategyState.strategy_id == sid).update({
                                 "last_heartbeat": now_ms
                             })
@@ -325,10 +331,11 @@ class StrategyEngine:
         """
         Legacy support for static registration.
         """
-        if strategy.product_id not in self.strategies:
-            self.strategies[strategy.product_id] = []
-        self.strategies[strategy.product_id].append(strategy)
-        self.strategy_instances[strategy.strategy_id] = strategy
+        with self._strategy_lock:
+            if strategy.product_id not in self.strategies:
+                self.strategies[strategy.product_id] = []
+            self.strategies[strategy.product_id].append(strategy)
+            self.strategy_instances[strategy.strategy_id] = strategy
         logger.info(f"Registered strategy (legacy): {strategy.strategy_id} for {strategy.product_id}")
 
     def build_stream_channels(self) -> list:
@@ -375,7 +382,8 @@ class StrategyEngine:
         if signal.type == SignalType.NO_SIGNAL:
             return
 
-        is_passed, risk_msg = self.risk_manager.check_risk(signal)
+        current_price = candle.close if candle else None
+        is_passed, risk_msg = self.risk_manager.check_risk(signal, current_price=current_price)
         
         order_id = None
         if is_passed:

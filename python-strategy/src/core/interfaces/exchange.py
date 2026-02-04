@@ -1,8 +1,8 @@
 from abc import ABC, abstractmethod
 from decimal import Decimal
-from typing import Optional
+from typing import Dict, List, Optional
 from src.core.orm_models import Order
-from src.core.models import Position
+from src.core.models import Candlestick, Position
 
 class ExchangeError(Exception):
     """Base exception for all exchange related errors."""
@@ -69,11 +69,26 @@ class IExchangeAdapter(ABC):
     def get_position(self, product_id: str) -> Optional[Position]:
         """
         Retrieves the current open position for a product.
-        
+
         Args:
             product_id: The product/symbol identifier.
-            
+
         Returns:
             Optional[Position]: The position details (Pydantic model) or None if no position.
         """
         pass
+
+    def on_market_data(self, candle: Candlestick) -> List[Dict]:
+        """
+        Processes market data to check for simulated order fills.
+
+        Override in simulated adapters to implement matching logic.
+        Live adapters return empty list (exchange manages SL/TP).
+
+        Args:
+            candle: The latest candlestick data.
+
+        Returns:
+            List of fill dicts with keys: order, price, quantity, fee, fill_type.
+        """
+        return []

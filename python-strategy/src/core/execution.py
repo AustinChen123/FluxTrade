@@ -27,9 +27,9 @@ class ExecutionEngine:
         """
         Passes market data to the adapter (if applicable) to check for simulated fills.
         """
-        if hasattr(self.adapter, "on_market_data"):
-            fills = self.adapter.on_market_data(candle)
+        fills = self.adapter.on_market_data(candle)
 
+        if fills:
             for fill in fills:
                 order = fill['order']
                 price = fill['price']

@@ -13,6 +13,15 @@ class SignalType(str, Enum):
     EXIT_SHORT = "EXIT_SHORT"
     NO_SIGNAL = "NO_SIGNAL"
 
+class StrategyStatus(str, Enum):
+    """Lifecycle states for a hot-pluggable strategy."""
+    DISCOVERED = "DISCOVERED"
+    READY = "READY"
+    WARNING = "WARNING"
+    ACTIVE = "ACTIVE"
+    STOPPED = "STOPPED"
+    ERROR = "ERROR"
+
 class BaseFluxModel(BaseModel):
     """Base model with common configuration"""
     model_config = ConfigDict(
