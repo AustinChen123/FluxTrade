@@ -126,6 +126,7 @@ class OrderManager:
                 side=order.side,
                 fill_quantity=fill_quantity,
                 fill_price=fill_price,
+                position_side=order.side.upper(),
             )
 
         # 3. Create Trade record

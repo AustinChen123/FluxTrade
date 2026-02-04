@@ -12,10 +12,9 @@ Covers:
 
 import pytest
 from decimal import Decimal
-from unittest.mock import MagicMock
 
 from src.core.execution import ExecutionEngine
-from src.core.models import Signal, SignalType, Candlestick
+from src.core.models import SignalType
 
 
 @pytest.fixture

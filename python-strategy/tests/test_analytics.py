@@ -127,18 +127,18 @@ class TestClosedTrades:
         assert len(closed) == 1
         ct = closed[0]
         assert ct.side == "LONG"
-        assert ct.entry_price == 100.0
-        assert ct.exit_price == 110.0
+        assert ct.entry_price == Decimal("100.0")
+        assert ct.exit_price == Decimal("110.0")
         assert ct.entry_time == 1_000_000
         assert ct.exit_time == 2_000_000
-        assert ct.pnl == pytest.approx(1.0, abs=0.01)
+        assert ct.pnl == Decimal("1.00")
 
     def test_short_round_trip(self):
         trades = _round_trip(100.0, 90.0, side="short", entry_ts=1_000_000, exit_ts=2_000_000)
         closed, _, _, _ = _build_closed_trades(trades)
         assert len(closed) == 1
         assert closed[0].side == "SHORT"
-        assert closed[0].pnl == pytest.approx(1.0, abs=0.01)
+        assert closed[0].pnl == Decimal("1.00")
 
     def test_multiple_round_trips(self):
         trades = (
@@ -200,8 +200,8 @@ class TestMonthlyReturns:
         monthly = result["monthly_returns"]
         assert "2024-01" in monthly
         assert "2024-02" in monthly
-        assert monthly["2024-01"] == pytest.approx(1.0, abs=0.01)
-        assert monthly["2024-02"] == pytest.approx(-1.0, abs=0.01)
+        assert monthly["2024-01"] == Decimal("1.00")
+        assert monthly["2024-02"] == Decimal("-1.00")
 
     def test_empty_monthly(self):
         result = calculate_metrics([])

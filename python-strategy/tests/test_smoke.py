@@ -163,7 +163,6 @@ class TestTradingPipeline:
 
         # Force adapter to fail
         adapter._fail = True
-        original_place = adapter.place_order
 
         def failing_place(order):
             from src.core.interfaces.exchange import ExchangeError

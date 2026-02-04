@@ -67,7 +67,7 @@ class TestBacktestPositionDelegation:
 
         # Should not raise and should not change balance
         repo.update_position("test", "BINANCE:BTCUSDT-PERP", "buy",
-                             Decimal("1.0"), Decimal("42000"))
+                             Decimal("1.0"), Decimal("42000"), "BUY")
 
         assert repo.balance == Decimal("10000")
 

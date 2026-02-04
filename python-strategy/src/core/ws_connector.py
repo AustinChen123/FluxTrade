@@ -1,12 +1,8 @@
 import json
 import time
-import hmac
-import hashlib
 import threading
-import os
 import logging
 from typing import Optional, Dict, Any
-from urllib.parse import urlencode
 
 # Try to import websockets, handle if missing
 try:

@@ -111,7 +111,7 @@ class MockOrderRepository(IOrderRepository):
         return pos
 
     def update_position(self, strategy_id: str, product_id: str, side: str,
-                       fill_quantity: Decimal, fill_price: Decimal, position_side: str = None) -> None:
+                       fill_quantity: Decimal, fill_price: Decimal, position_side: str) -> None:
         key = f"{strategy_id}:{product_id}"
         pos = self.positions.get(key)
         current_time = int(time.time() * 1000)

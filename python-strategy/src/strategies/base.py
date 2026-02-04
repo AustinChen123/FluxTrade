@@ -1,6 +1,6 @@
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
-from typing import Optional, List
+from typing import Optional
 import pandas as pd
 from src.core.models import Candlestick, Signal, Trade
 from src.core.journal import StrategyJournal

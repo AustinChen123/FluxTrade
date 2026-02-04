@@ -1,5 +1,6 @@
 import csv
 import json
+import logging
 from pathlib import Path
 from typing import List, Optional, Dict
 from decimal import Decimal
@@ -15,6 +16,8 @@ from src.core.interfaces.data_source import IDataSource
 from src.core.adapters.simulated import SimulatedAdapter
 from src.core.mocks.account_service import BacktestAccountService
 from src.core.journal import StrategyJournal
+
+logger = logging.getLogger(__name__)
 
 DEFAULT_REPORT_CONFIG: Dict = {
     "csv_trades": True,
@@ -41,7 +44,7 @@ def _write_csv_trades(closed_trades: List[ClosedTrade], path: Path) -> None:
             ])
 
 
-def _write_equity_curve(equity_curve: List[float], path: Path) -> None:
+def _write_equity_curve(equity_curve: list, path: Path) -> None:
     """Write equity curve to CSV."""
     with open(path, "w", newline="") as f:
         writer = csv.writer(f)
@@ -164,7 +167,7 @@ class BacktestRunner:
         for strat in self._strategies_buffer:
             exists = self.db_session.query(StrategyORM).filter_by(id=strat.strategy_id).first()
             if not exists:
-                print(f"Registering missing strategy in DB: {strat.strategy_id}")
+                logger.info("Registering missing strategy in DB: %s", strat.strategy_id)
                 new_strat = StrategyORM(
                     id=strat.strategy_id,
                     name=f"Backtest: {strat.strategy_id}",
@@ -194,8 +197,8 @@ class BacktestRunner:
 
         if cfg.get("equity_curve"):
             # Rebuild equity curve from closed trades
-            equity = [0.0]
-            running = 0.0
+            running = Decimal("0")
+            equity = [running]
             for ct in closed_trades:
                 running += ct.pnl
                 equity.append(running)
@@ -224,7 +227,7 @@ class BacktestRunner:
         self._ensure_strategies_registered()
 
         if not self._strategies_buffer:
-            print("No strategies added. Exiting.")
+            logger.warning("No strategies added. Exiting.")
             return
 
         # 1. Setup Backtest Session
@@ -238,7 +241,7 @@ class BacktestRunner:
         )
         self.db_session.add(summary)
         self.db_session.commit()
-        print(f"Backtest Session Created: ID {summary.id}")
+        logger.info("Backtest Session Created: ID %s", summary.id)
 
         # 2. Create journal for structured event recording
         journal = StrategyJournal(primary_strategy_id)
@@ -246,8 +249,8 @@ class BacktestRunner:
         # 3. Create Rust-backed adapter with fee config
         adapter = SimulatedAdapter(
             initial_balance=Decimal(str(self.initial_balance)),
-            maker_fee=self.fee_config.get("maker", 0.0),
-            taker_fee=self.fee_config.get("taker", 0.0),
+            maker_fee=Decimal(str(self.fee_config.get("maker", 0))),
+            taker_fee=Decimal(str(self.fee_config.get("taker", 0))),
         )
 
         # 4. Setup repo (trade recording only) and account service
@@ -271,7 +274,7 @@ class BacktestRunner:
                 strat.risk_manager.account_service = mock_account
             self.engine.add_strategy(strat)
 
-        print(f"Starting Backtest for {self.product_id} [{self.start_time} - {self.end_time}]")
+        logger.info("Starting Backtest for %s [%s - %s]", self.product_id, self.start_time, self.end_time)
         count = 0
 
         if self.data_source:
@@ -303,12 +306,12 @@ class BacktestRunner:
                 # Check Circuit Breaker
                 current_balance = mock_account.get_balance()
                 if current_balance < stop_threshold:
-                    print(f"STOPPING BACKTEST: Max Drawdown Reached! Balance: {current_balance} < {stop_threshold}")
+                    logger.warning("STOPPING BACKTEST: Max Drawdown Reached! Balance: %s < %s", current_balance, stop_threshold)
                     break
 
                 count += 1
                 if count % 1000 == 0:
-                    print(f"Processed {count} candles... Current Time: {candle.timestamp} | Bal: {current_balance:.2f}")
+                    logger.info("Processed %d candles... Current Time: %s | Bal: %.2f", count, candle.timestamp, current_balance)
         finally:
             # Calculate Final PnL
             final_balance = mock_account.get_balance()
@@ -334,10 +337,10 @@ class BacktestRunner:
             # Export reports
             report_dir = self._export_reports(metrics, journal, candle_count=count)
 
-            print(f"Backtest Complete. Processed {count} candles. Final PnL: {total_pnl}")
-            print(f"Metrics: {metrics_for_json}")
+            logger.info("Backtest Complete. Processed %d candles. Final PnL: %s", count, total_pnl)
+            logger.info("Metrics: %s", metrics_for_json)
             if report_dir:
-                print(f"Reports written to: {report_dir}")
+                logger.info("Reports written to: %s", report_dir)
 
             result = {
                 "total_pnl": float(total_pnl),

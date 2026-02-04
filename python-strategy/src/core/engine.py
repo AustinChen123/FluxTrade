@@ -276,7 +276,7 @@ class StrategyEngine:
         """
         logger.info("💰 Reconciling Balance...")
         try:
-            balance = self.account_service.get_balance("USDT")
+            balance = self.account_service.get_balance()
             self.redis_client.set("state:balance:USDT", str(balance))
             logger.info(f"✅ Balance Reconciled: {balance} USDT")
         except Exception as e:

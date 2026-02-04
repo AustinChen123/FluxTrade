@@ -14,8 +14,7 @@ from decimal import Decimal
 from pydantic import ValidationError
 
 from src.core.models import (
-    Signal, SignalType, Candlestick, Position, Trade,
-    PRODUCT_ID_REGEX
+    SignalType, Candlestick, Position, Trade
 )
 
 

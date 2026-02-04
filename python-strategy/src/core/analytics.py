@@ -12,44 +12,46 @@ class ClosedTrade:
 
     entry_time: int  # unix ms
     exit_time: int  # unix ms
-    entry_price: float
-    exit_price: float
+    entry_price: Decimal
+    exit_price: Decimal
     side: str  # "LONG" or "SHORT"
-    quantity: float
-    pnl: float
+    quantity: Decimal
+    pnl: Decimal
 
 
 def _build_closed_trades(trade_history: List[Trade]) -> tuple[
-    list[ClosedTrade], list[float], list[float], float
+    list[ClosedTrade], list[float], list[float], Decimal
 ]:
     """Pair raw trades into closed round-trips using FIFO netting.
 
     Returns (closed_trades, trade_pnls, equity_curve, total_pnl).
+    trade_pnls and equity_curve are float lists for numpy/pandas compatibility.
     """
     trades = []
     for t in trade_history:
         trades.append({
             "timestamp": t.timestamp,
             "side": t.side,
-            "price": float(t.price),
-            "quantity": float(t.quantity),
+            "price": t.price,
+            "quantity": t.quantity,
         })
 
     df = pd.DataFrame(trades)
     df.sort_values("timestamp", inplace=True)
 
-    total_pnl = 0.0
-    net_qty = 0.0
-    avg_entry_price = 0.0
+    _ZERO = Decimal("0")
+    total_pnl = _ZERO
+    net_qty = _ZERO
+    avg_entry_price = _ZERO
     entry_time = 0
 
-    equity_curve = [0.0]
+    equity_curve: list[float] = [0.0]
     trade_pnls: list[float] = []
     closed_trades: list[ClosedTrade] = []
 
     for _, row in df.iterrows():
-        qty = row["quantity"]
-        price = row["price"]
+        qty: Decimal = row["quantity"]
+        price: Decimal = row["price"]
         side = row["side"]
         timestamp = int(row["timestamp"])
 
@@ -70,7 +72,7 @@ def _build_closed_trades(trade_history: List[Trade]) -> tuple[
                 trade_side = "SHORT"
 
             total_pnl += pnl
-            trade_pnls.append(pnl)
+            trade_pnls.append(float(pnl))
 
             closed_trades.append(ClosedTrade(
                 entry_time=entry_time,
@@ -96,7 +98,7 @@ def _build_closed_trades(trade_history: List[Trade]) -> tuple[
                 avg_entry_price = price
                 entry_time = timestamp
         else:
-            if net_qty == 0.0:
+            if net_qty == 0:
                 entry_time = timestamp
             total_cost = (abs(net_qty) * avg_entry_price) + (abs(signed_qty) * price)
             new_qty = abs(net_qty) + abs(signed_qty)
@@ -106,7 +108,7 @@ def _build_closed_trades(trade_history: List[Trade]) -> tuple[
 
             net_qty += signed_qty
 
-        equity_curve.append(total_pnl)
+        equity_curve.append(float(total_pnl))
 
     return closed_trades, trade_pnls, equity_curve, total_pnl
 
@@ -156,7 +158,7 @@ def calculate_metrics(
         if gross_loss > 0
         else (999.0 if gross_profit > 0 else 0.0)
     )
-    avg_trade = (total_pnl / total_trades) if total_trades > 0 else 0.0
+    avg_trade = float(total_pnl / total_trades) if total_trades > 0 else 0.0
 
     # Max Drawdown
     equity_series = pd.Series(equity_curve)
@@ -189,17 +191,17 @@ def calculate_metrics(
         first_ts = closed_trades[0].entry_time
         last_ts = closed_trades[-1].exit_time
         duration_days = max((last_ts - first_ts) / (1000 * 86400), 1.0)
-        annualized_return = (total_pnl / initial_balance) * (
+        annualized_return = (float(total_pnl) / initial_balance) * (
             periods_per_year / duration_days
         )
         calmar_ratio = float(annualized_return / abs(float(max_drawdown) / initial_balance))
 
     # Monthly returns
-    monthly_returns: Dict[str, float] = {}
+    monthly_returns: Dict[str, Decimal] = {}
     if closed_trades:
         for ct in closed_trades:
             month_key = pd.Timestamp(ct.exit_time, unit="ms").strftime("%Y-%m")
-            monthly_returns[month_key] = monthly_returns.get(month_key, 0.0) + ct.pnl
+            monthly_returns[month_key] = monthly_returns.get(month_key, Decimal("0")) + ct.pnl
 
     # Max drawdown duration (in days)
     max_drawdown_days = 0.0

@@ -1,6 +1,6 @@
 import pytest
 from decimal import Decimal
-from src.core.models import Candlestick, Trade
+from src.core.models import Trade
 
 def test_product_id_validation():
     # Valid

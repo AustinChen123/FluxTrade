@@ -108,7 +108,7 @@ class BacktestOrderRepository(IOrderRepository):
         self.db.add(bt_log)
         self.db.commit()
 
-    def update_position(self, strategy_id: str, product_id: str, side: str, fill_quantity: Decimal, fill_price: Decimal, position_side: str = None) -> None:
+    def update_position(self, strategy_id: str, product_id: str, side: str, fill_quantity: Decimal, fill_price: Decimal, position_side: str) -> None:
         # No-op: position and balance are tracked by Rust PyMatchingEngine
         pass
 
