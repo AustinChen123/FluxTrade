@@ -11,9 +11,9 @@ fn fluxtrade_core(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<binding::models::Trade>()?;
     m.add_class::<binding::models::FillEvent>()?;
     m.add_class::<binding::models::Position>()?;
-    
+
     // Core Engine
     m.add_class::<binding::matcher::PyMatchingEngine>()?;
-    
+
     Ok(())
 }

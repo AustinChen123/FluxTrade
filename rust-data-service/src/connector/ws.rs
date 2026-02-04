@@ -59,10 +59,7 @@ impl WebSocketManager {
                 }
                 Err(e) => {
                     retries += 1;
-                    error!(
-                        "WebSocket error (attempt {}): {}",
-                        retries, e
-                    );
+                    error!("WebSocket error (attempt {}): {}", retries, e);
 
                     if let Some(max) = self.max_retries {
                         if retries >= max {
@@ -73,7 +70,10 @@ impl WebSocketManager {
                         }
                     }
 
-                    warn!("HealthStatus: Disconnected/Paused. Reconnecting in {:?}", backoff);
+                    warn!(
+                        "HealthStatus: Disconnected/Paused. Reconnecting in {:?}",
+                        backoff
+                    );
                     sleep(backoff).await;
                     if backoff < Duration::from_secs(60) {
                         backoff *= 2; // Exponential backoff up to 60s cap

@@ -48,10 +48,7 @@ impl BinanceConnector {
     }
 
     #[allow(dead_code)]
-    pub async fn subscribe_user_stream(
-        &self,
-        tx: mpsc::Sender<UserStreamEvent>,
-    ) -> Result<()> {
+    pub async fn subscribe_user_stream(&self, tx: mpsc::Sender<UserStreamEvent>) -> Result<()> {
         let api_key = env::var("BINANCE_API_KEY").context("BINANCE_API_KEY not set")?;
         let listen_key = self.get_listen_key(&api_key).await?;
         info!("Obtained Binance ListenKey: {}", listen_key);
@@ -98,36 +95,76 @@ impl BinanceConnector {
                                     if event == "ACCOUNT_UPDATE" {
                                         if let Some(a) = v.get("a") {
                                             // Process Balances
-                                            if let Some(balances) = a.get("B").and_then(|b| b.as_array()) {
+                                            if let Some(balances) =
+                                                a.get("B").and_then(|b| b.as_array())
+                                            {
                                                 for b in balances {
-                                                    let asset = b.get("a").and_then(|v| v.as_str()).unwrap_or_default();
-                                                    let wallet_balance = b.get("wb").and_then(|v| v.as_str()).unwrap_or("0");
+                                                    let asset = b
+                                                        .get("a")
+                                                        .and_then(|v| v.as_str())
+                                                        .unwrap_or_default();
+                                                    let wallet_balance = b
+                                                        .get("wb")
+                                                        .and_then(|v| v.as_str())
+                                                        .unwrap_or("0");
                                                     let update = AccountUpdate {
                                                         exchange: exchange_id.clone(),
                                                         asset: asset.to_string(),
-                                                        balance: wallet_balance.parse().unwrap_or(Decimal::ZERO),
-                                                        timestamp: v.get("E").and_then(|t| t.as_i64()).unwrap_or(0),
+                                                        balance: wallet_balance
+                                                            .parse()
+                                                            .unwrap_or(Decimal::ZERO),
+                                                        timestamp: v
+                                                            .get("E")
+                                                            .and_then(|t| t.as_i64())
+                                                            .unwrap_or(0),
                                                     };
-                                                    tx.send(UserStreamEvent::Account(update)).await.ok();
+                                                    tx.send(UserStreamEvent::Account(update))
+                                                        .await
+                                                        .ok();
                                                 }
                                             }
                                             // Process Positions
-                                            if let Some(positions) = a.get("P").and_then(|p| p.as_array()) {
+                                            if let Some(positions) =
+                                                a.get("P").and_then(|p| p.as_array())
+                                            {
                                                 for p in positions {
-                                                    let symbol = p.get("s").and_then(|v| v.as_str()).unwrap_or_default();
-                                                    let amount = p.get("pa").and_then(|v| v.as_str()).unwrap_or("0");
-                                                    let entry_price = p.get("ep").and_then(|v| v.as_str()).unwrap_or("0");
-                                                    let upnl = p.get("up").and_then(|v| v.as_str()).unwrap_or("0");
-                                                    
+                                                    let symbol = p
+                                                        .get("s")
+                                                        .and_then(|v| v.as_str())
+                                                        .unwrap_or_default();
+                                                    let amount = p
+                                                        .get("pa")
+                                                        .and_then(|v| v.as_str())
+                                                        .unwrap_or("0");
+                                                    let entry_price = p
+                                                        .get("ep")
+                                                        .and_then(|v| v.as_str())
+                                                        .unwrap_or("0");
+                                                    let upnl = p
+                                                        .get("up")
+                                                        .and_then(|v| v.as_str())
+                                                        .unwrap_or("0");
+
                                                     let update = PositionUpdate {
                                                         exchange: exchange_id.clone(),
                                                         symbol: symbol.to_string(),
-                                                        amount: amount.parse().unwrap_or(Decimal::ZERO),
-                                                        entry_price: entry_price.parse().unwrap_or(Decimal::ZERO),
-                                                        unrealized_pnl: upnl.parse().unwrap_or(Decimal::ZERO),
-                                                        timestamp: v.get("E").and_then(|t| t.as_i64()).unwrap_or(0),
+                                                        amount: amount
+                                                            .parse()
+                                                            .unwrap_or(Decimal::ZERO),
+                                                        entry_price: entry_price
+                                                            .parse()
+                                                            .unwrap_or(Decimal::ZERO),
+                                                        unrealized_pnl: upnl
+                                                            .parse()
+                                                            .unwrap_or(Decimal::ZERO),
+                                                        timestamp: v
+                                                            .get("E")
+                                                            .and_then(|t| t.as_i64())
+                                                            .unwrap_or(0),
                                                     };
-                                                    tx.send(UserStreamEvent::Position(update)).await.ok();
+                                                    tx.send(UserStreamEvent::Position(update))
+                                                        .await
+                                                        .ok();
                                                 }
                                             }
                                         }
