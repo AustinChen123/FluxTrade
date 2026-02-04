@@ -1,4 +1,6 @@
 use ::pyo3::prelude::*;
+use rust_decimal::Decimal;
+use std::str::FromStr;
 
 #[pyclass]
 #[derive(Clone, Debug)]
@@ -9,16 +11,11 @@ pub struct Candlestick {
     pub timeframe: String,
     #[pyo3(get, set)]
     pub timestamp: i64,
-    #[pyo3(get, set)]
-    pub open: f64,
-    #[pyo3(get, set)]
-    pub high: f64,
-    #[pyo3(get, set)]
-    pub low: f64,
-    #[pyo3(get, set)]
-    pub close: f64,
-    #[pyo3(get, set)]
-    pub volume: f64,
+    pub open: Decimal,
+    pub high: Decimal,
+    pub low: Decimal,
+    pub close: Decimal,
+    pub volume: Decimal,
 }
 
 #[pymethods]
@@ -30,22 +27,72 @@ impl Candlestick {
         product_id: String,
         timeframe: String,
         timestamp: i64,
-        open: f64,
-        high: f64,
-        low: f64,
-        close: f64,
-        volume: f64,
-    ) -> Self {
-        Candlestick {
+        open: String,
+        high: String,
+        low: String,
+        close: String,
+        volume: String,
+    ) -> PyResult<Self> {
+        Ok(Candlestick {
             product_id,
             timeframe,
             timestamp,
-            open,
-            high,
-            low,
-            close,
-            volume,
-        }
+            open: parse_decimal(&open, "open")?,
+            high: parse_decimal(&high, "high")?,
+            low: parse_decimal(&low, "low")?,
+            close: parse_decimal(&close, "close")?,
+            volume: parse_decimal(&volume, "volume")?,
+        })
+    }
+
+    #[getter]
+    fn open(&self) -> String {
+        self.open.to_string()
+    }
+    #[setter]
+    fn set_open(&mut self, val: String) -> PyResult<()> {
+        self.open = parse_decimal(&val, "open")?;
+        Ok(())
+    }
+
+    #[getter]
+    fn high(&self) -> String {
+        self.high.to_string()
+    }
+    #[setter]
+    fn set_high(&mut self, val: String) -> PyResult<()> {
+        self.high = parse_decimal(&val, "high")?;
+        Ok(())
+    }
+
+    #[getter]
+    fn low(&self) -> String {
+        self.low.to_string()
+    }
+    #[setter]
+    fn set_low(&mut self, val: String) -> PyResult<()> {
+        self.low = parse_decimal(&val, "low")?;
+        Ok(())
+    }
+
+    #[getter]
+    fn close(&self) -> String {
+        self.close.to_string()
+    }
+    #[setter]
+    fn set_close(&mut self, val: String) -> PyResult<()> {
+        self.close = parse_decimal(&val, "close")?;
+        Ok(())
+    }
+
+    #[getter]
+    fn volume(&self) -> String {
+        self.volume.to_string()
+    }
+    #[setter]
+    fn set_volume(&mut self, val: String) -> PyResult<()> {
+        self.volume = parse_decimal(&val, "volume")?;
+        Ok(())
     }
 }
 
@@ -56,10 +103,8 @@ pub struct Trade {
     pub id: String,
     #[pyo3(get, set)]
     pub product_id: String,
-    #[pyo3(get, set)]
-    pub price: f64,
-    #[pyo3(get, set)]
-    pub quantity: f64,
+    pub price: Decimal,
+    pub quantity: Decimal,
     #[pyo3(get, set)]
     pub side: String,
     #[pyo3(get, set)]
@@ -73,19 +118,39 @@ impl Trade {
     fn new(
         id: String,
         product_id: String,
-        price: f64,
-        quantity: f64,
+        price: String,
+        quantity: String,
         side: String,
         timestamp: i64,
-    ) -> Self {
-        Trade {
+    ) -> PyResult<Self> {
+        Ok(Trade {
             id,
             product_id,
-            price,
-            quantity,
+            price: parse_decimal(&price, "price")?,
+            quantity: parse_decimal(&quantity, "quantity")?,
             side,
             timestamp,
-        }
+        })
+    }
+
+    #[getter]
+    fn price(&self) -> String {
+        self.price.to_string()
+    }
+    #[setter]
+    fn set_price(&mut self, val: String) -> PyResult<()> {
+        self.price = parse_decimal(&val, "price")?;
+        Ok(())
+    }
+
+    #[getter]
+    fn quantity(&self) -> String {
+        self.quantity.to_string()
+    }
+    #[setter]
+    fn set_quantity(&mut self, val: String) -> PyResult<()> {
+        self.quantity = parse_decimal(&val, "quantity")?;
+        Ok(())
     }
 }
 
@@ -109,18 +174,14 @@ pub struct Order {
     #[pyo3(get, set)]
     pub order_type: String,
     /// Limit price (for LIMIT orders)
-    #[pyo3(get, set)]
-    pub price: f64,
-    #[pyo3(get, set)]
-    pub quantity: f64,
+    pub price: Decimal,
+    pub quantity: Decimal,
     #[pyo3(get, set)]
     pub timestamp: i64,
     /// Trigger price for SL/TP conditional orders
-    #[pyo3(get, set)]
-    pub trigger_price: Option<f64>,
+    pub trigger_price: Option<Decimal>,
     /// Distance for trailing stop
-    #[pyo3(get, set)]
-    pub trailing_distance: Option<f64>,
+    pub trailing_distance: Option<Decimal>,
     /// Linked order ID for OCO (one-cancels-other)
     #[pyo3(get, set)]
     pub linked_order_id: Option<String>,
@@ -136,25 +197,65 @@ impl Order {
         product_id: String,
         side: String,
         order_type: String,
-        price: f64,
-        quantity: f64,
+        price: String,
+        quantity: String,
         timestamp: i64,
-        trigger_price: Option<f64>,
-        trailing_distance: Option<f64>,
+        trigger_price: Option<String>,
+        trailing_distance: Option<String>,
         linked_order_id: Option<String>,
-    ) -> Self {
-        Order {
+    ) -> PyResult<Self> {
+        Ok(Order {
             id,
             product_id,
             side,
             order_type,
-            price,
-            quantity,
+            price: parse_decimal(&price, "price")?,
+            quantity: parse_decimal(&quantity, "quantity")?,
             timestamp,
-            trigger_price,
-            trailing_distance,
+            trigger_price: parse_optional_decimal(trigger_price, "trigger_price")?,
+            trailing_distance: parse_optional_decimal(trailing_distance, "trailing_distance")?,
             linked_order_id,
-        }
+        })
+    }
+
+    #[getter]
+    fn price(&self) -> String {
+        self.price.to_string()
+    }
+    #[setter]
+    fn set_price(&mut self, val: String) -> PyResult<()> {
+        self.price = parse_decimal(&val, "price")?;
+        Ok(())
+    }
+
+    #[getter]
+    fn quantity(&self) -> String {
+        self.quantity.to_string()
+    }
+    #[setter]
+    fn set_quantity(&mut self, val: String) -> PyResult<()> {
+        self.quantity = parse_decimal(&val, "quantity")?;
+        Ok(())
+    }
+
+    #[getter]
+    fn trigger_price(&self) -> Option<String> {
+        self.trigger_price.map(|d| d.to_string())
+    }
+    #[setter]
+    fn set_trigger_price(&mut self, val: Option<String>) -> PyResult<()> {
+        self.trigger_price = parse_optional_decimal(val, "trigger_price")?;
+        Ok(())
+    }
+
+    #[getter]
+    fn trailing_distance(&self) -> Option<String> {
+        self.trailing_distance.map(|d| d.to_string())
+    }
+    #[setter]
+    fn set_trailing_distance(&mut self, val: Option<String>) -> PyResult<()> {
+        self.trailing_distance = parse_optional_decimal(val, "trailing_distance")?;
+        Ok(())
     }
 }
 
@@ -165,12 +266,9 @@ pub struct FillEvent {
     pub order_id: String,
     #[pyo3(get, set)]
     pub product_id: String,
-    #[pyo3(get, set)]
-    pub price: f64,
-    #[pyo3(get, set)]
-    pub quantity: f64,
-    #[pyo3(get, set)]
-    pub fee: f64,
+    pub price: Decimal,
+    pub quantity: Decimal,
+    pub fee: Decimal,
     #[pyo3(get, set)]
     pub timestamp: i64,
     /// "MARKET", "LIMIT", "STOP_LOSS", "TAKE_PROFIT", "TRAILING_STOP"
@@ -186,21 +284,51 @@ impl FillEvent {
     fn new(
         order_id: String,
         product_id: String,
-        price: f64,
-        quantity: f64,
-        fee: f64,
+        price: String,
+        quantity: String,
+        fee: String,
         timestamp: i64,
         fill_type: String,
-    ) -> Self {
-        FillEvent {
+    ) -> PyResult<Self> {
+        Ok(FillEvent {
             order_id,
             product_id,
-            price,
-            quantity,
-            fee,
+            price: parse_decimal(&price, "price")?,
+            quantity: parse_decimal(&quantity, "quantity")?,
+            fee: parse_decimal(&fee, "fee")?,
             timestamp,
             fill_type,
-        }
+        })
+    }
+
+    #[getter]
+    fn price(&self) -> String {
+        self.price.to_string()
+    }
+    #[setter]
+    fn set_price(&mut self, val: String) -> PyResult<()> {
+        self.price = parse_decimal(&val, "price")?;
+        Ok(())
+    }
+
+    #[getter]
+    fn quantity(&self) -> String {
+        self.quantity.to_string()
+    }
+    #[setter]
+    fn set_quantity(&mut self, val: String) -> PyResult<()> {
+        self.quantity = parse_decimal(&val, "quantity")?;
+        Ok(())
+    }
+
+    #[getter]
+    fn fee(&self) -> String {
+        self.fee.to_string()
+    }
+    #[setter]
+    fn set_fee(&mut self, val: String) -> PyResult<()> {
+        self.fee = parse_decimal(&val, "fee")?;
+        Ok(())
     }
 }
 
@@ -211,12 +339,9 @@ pub struct Position {
     pub product_id: String,
     #[pyo3(get, set)]
     pub side: String, // "LONG", "SHORT", or "FLAT"
-    #[pyo3(get, set)]
-    pub quantity: f64,
-    #[pyo3(get, set)]
-    pub entry_price: f64,
-    #[pyo3(get, set)]
-    pub unrealized_pnl: f64,
+    pub quantity: Decimal,
+    pub entry_price: Decimal,
+    pub unrealized_pnl: Decimal,
 }
 
 #[pymethods]
@@ -226,23 +351,69 @@ impl Position {
     fn new(
         product_id: String,
         side: String,
-        quantity: f64,
-        entry_price: f64,
-        unrealized_pnl: f64,
-    ) -> Self {
-        Position {
+        quantity: String,
+        entry_price: String,
+        unrealized_pnl: String,
+    ) -> PyResult<Self> {
+        Ok(Position {
             product_id,
             side,
-            quantity,
-            entry_price,
-            unrealized_pnl,
-        }
+            quantity: parse_decimal(&quantity, "quantity")?,
+            entry_price: parse_decimal(&entry_price, "entry_price")?,
+            unrealized_pnl: parse_decimal(&unrealized_pnl, "unrealized_pnl")?,
+        })
+    }
+
+    #[getter]
+    fn quantity(&self) -> String {
+        self.quantity.to_string()
+    }
+    #[setter]
+    fn set_quantity(&mut self, val: String) -> PyResult<()> {
+        self.quantity = parse_decimal(&val, "quantity")?;
+        Ok(())
+    }
+
+    #[getter]
+    fn entry_price(&self) -> String {
+        self.entry_price.to_string()
+    }
+    #[setter]
+    fn set_entry_price(&mut self, val: String) -> PyResult<()> {
+        self.entry_price = parse_decimal(&val, "entry_price")?;
+        Ok(())
+    }
+
+    #[getter]
+    fn unrealized_pnl(&self) -> String {
+        self.unrealized_pnl.to_string()
+    }
+    #[setter]
+    fn set_unrealized_pnl(&mut self, val: String) -> PyResult<()> {
+        self.unrealized_pnl = parse_decimal(&val, "unrealized_pnl")?;
+        Ok(())
+    }
+}
+
+// ── Parsing helpers ─────────────────────────────────────────────
+
+fn parse_decimal(s: &str, field: &str) -> PyResult<Decimal> {
+    Decimal::from_str(s).map_err(|e| {
+        pyo3::exceptions::PyValueError::new_err(format!("Invalid decimal for '{field}': {e}"))
+    })
+}
+
+fn parse_optional_decimal(s: Option<String>, field: &str) -> PyResult<Option<Decimal>> {
+    match s {
+        Some(v) => Ok(Some(parse_decimal(&v, field)?)),
+        None => Ok(None),
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rust_decimal_macros::dec;
 
     #[test]
     fn test_candlestick_construction_and_fields() {
@@ -250,20 +421,20 @@ mod tests {
             product_id: "BINANCE:BTCUSDT-PERP".to_string(),
             timeframe: "15m".to_string(),
             timestamp: 1700000000,
-            open: 50_000.0,
-            high: 51_000.0,
-            low: 49_000.0,
-            close: 50_500.0,
-            volume: 123.45,
+            open: dec!(50000),
+            high: dec!(51000),
+            low: dec!(49000),
+            close: dec!(50500),
+            volume: dec!(123.45),
         };
         assert_eq!(c.product_id, "BINANCE:BTCUSDT-PERP");
         assert_eq!(c.timeframe, "15m");
         assert_eq!(c.timestamp, 1700000000);
-        assert!((c.open - 50_000.0).abs() < f64::EPSILON);
-        assert!((c.high - 51_000.0).abs() < f64::EPSILON);
-        assert!((c.low - 49_000.0).abs() < f64::EPSILON);
-        assert!((c.close - 50_500.0).abs() < f64::EPSILON);
-        assert!((c.volume - 123.45).abs() < f64::EPSILON);
+        assert_eq!(c.open, dec!(50000));
+        assert_eq!(c.high, dec!(51000));
+        assert_eq!(c.low, dec!(49000));
+        assert_eq!(c.close, dec!(50500));
+        assert_eq!(c.volume, dec!(123.45));
     }
 
     #[test]
@@ -272,11 +443,15 @@ mod tests {
             product_id: "TEST".to_string(),
             timeframe: "1m".to_string(),
             timestamp: 1000,
-            open: 1.0, high: 2.0, low: 0.5, close: 1.5, volume: 10.0,
+            open: dec!(1),
+            high: dec!(2),
+            low: dec!(0.5),
+            close: dec!(1.5),
+            volume: dec!(10),
         };
         let c2 = c.clone();
         assert_eq!(c.product_id, c2.product_id);
-        assert!((c.open - c2.open).abs() < f64::EPSILON);
+        assert_eq!(c.open, c2.open);
     }
 
     #[test]
@@ -284,15 +459,15 @@ mod tests {
         let t = Trade {
             id: "t1".to_string(),
             product_id: "BINANCE:ETHUSDT-PERP".to_string(),
-            price: 3_000.0,
-            quantity: 2.5,
+            price: dec!(3000),
+            quantity: dec!(2.5),
             side: "buy".to_string(),
             timestamp: 1700000000,
         };
         assert_eq!(t.id, "t1");
         assert_eq!(t.side, "buy");
-        assert!((t.price - 3_000.0).abs() < f64::EPSILON);
-        assert!((t.quantity - 2.5).abs() < f64::EPSILON);
+        assert_eq!(t.price, dec!(3000));
+        assert_eq!(t.quantity, dec!(2.5));
     }
 
     #[test]
@@ -302,15 +477,15 @@ mod tests {
             product_id: "BINANCE:BTCUSDT-PERP".to_string(),
             side: "LONG".to_string(),
             order_type: "TRAILING_STOP".to_string(),
-            price: 0.0,
-            quantity: 1.0,
+            price: Decimal::ZERO,
+            quantity: dec!(1),
             timestamp: 1000,
-            trigger_price: Some(49_000.0),
-            trailing_distance: Some(1_000.0),
+            trigger_price: Some(dec!(49000)),
+            trailing_distance: Some(dec!(1000)),
             linked_order_id: Some("o2".to_string()),
         };
-        assert_eq!(o.trigger_price, Some(49_000.0));
-        assert_eq!(o.trailing_distance, Some(1_000.0));
+        assert_eq!(o.trigger_price, Some(dec!(49000)));
+        assert_eq!(o.trailing_distance, Some(dec!(1000)));
         assert_eq!(o.linked_order_id.as_deref(), Some("o2"));
     }
 
@@ -321,8 +496,8 @@ mod tests {
             product_id: "BINANCE:BTCUSDT-PERP".to_string(),
             side: "SHORT".to_string(),
             order_type: "MARKET".to_string(),
-            price: 50_000.0,
-            quantity: 0.5,
+            price: dec!(50000),
+            quantity: dec!(0.5),
             timestamp: 2000,
             trigger_price: None,
             trailing_distance: None,
@@ -338,14 +513,14 @@ mod tests {
         let f = FillEvent {
             order_id: "o1".to_string(),
             product_id: "BINANCE:BTCUSDT-PERP".to_string(),
-            price: 50_000.0,
-            quantity: 1.0,
-            fee: 30.0,
+            price: dec!(50000),
+            quantity: dec!(1),
+            fee: dec!(30),
             timestamp: 1000,
             fill_type: "STOP_LOSS".to_string(),
         };
         assert_eq!(f.fill_type, "STOP_LOSS");
-        assert!((f.fee - 30.0).abs() < f64::EPSILON);
+        assert_eq!(f.fee, dec!(30));
     }
 
     #[test]
@@ -353,21 +528,21 @@ mod tests {
         let long = Position {
             product_id: "BINANCE:BTCUSDT-PERP".to_string(),
             side: "LONG".to_string(),
-            quantity: 1.0,
-            entry_price: 50_000.0,
-            unrealized_pnl: 500.0,
+            quantity: dec!(1),
+            entry_price: dec!(50000),
+            unrealized_pnl: dec!(500),
         };
         assert_eq!(long.side, "LONG");
 
         let flat = Position {
             product_id: "BINANCE:BTCUSDT-PERP".to_string(),
             side: "FLAT".to_string(),
-            quantity: 0.0,
-            entry_price: 0.0,
-            unrealized_pnl: 0.0,
+            quantity: Decimal::ZERO,
+            entry_price: Decimal::ZERO,
+            unrealized_pnl: Decimal::ZERO,
         };
         assert_eq!(flat.side, "FLAT");
-        assert!((flat.quantity - 0.0).abs() < f64::EPSILON);
+        assert_eq!(flat.quantity, Decimal::ZERO);
     }
 
     #[test]
@@ -377,20 +552,20 @@ mod tests {
             product_id: "TEST".to_string(),
             side: "LONG".to_string(),
             order_type: "LIMIT".to_string(),
-            price: 100.0,
-            quantity: 1.0,
+            price: dec!(100),
+            quantity: dec!(1),
             timestamp: 1000,
-            trigger_price: Some(90.0),
+            trigger_price: Some(dec!(90)),
             trailing_distance: None,
             linked_order_id: Some("linked".to_string()),
         };
         let mut o2 = o1.clone();
         o2.id = "cloned".to_string();
-        o2.trigger_price = Some(80.0);
+        o2.trigger_price = Some(dec!(80));
 
         assert_eq!(o1.id, "orig");
-        assert_eq!(o1.trigger_price, Some(90.0));
+        assert_eq!(o1.trigger_price, Some(dec!(90)));
         assert_eq!(o2.id, "cloned");
-        assert_eq!(o2.trigger_price, Some(80.0));
+        assert_eq!(o2.trigger_price, Some(dec!(80)));
     }
 }
