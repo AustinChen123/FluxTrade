@@ -1,3 +1,4 @@
+import copy
 import json
 import logging
 import os
@@ -104,7 +105,8 @@ class DataConsumer:
                 # Note: ID format is "timestamp-sequence"
                 last_msg_id, _ = messages[-1]
                 last_msg_ts = int(last_msg_id.split('-')[0])
-                server_time_ms = int(self.redis_client.time()[0] * 1000) + int(self.redis_client.time()[1] / 1000)
+                t = self.redis_client.time()
+                server_time_ms = int(t[0] * 1000) + int(t[1] / 1000)
 
                 lag = server_time_ms - last_msg_ts
 
@@ -140,12 +142,21 @@ class DataConsumer:
                         synthesized_model = m_model  # Keep latest as base
 
                     if synthesized_model:
+                        # Copy to avoid mutating the original parsed object
+                        synthesized_model = copy.copy(synthesized_model)
                         if isinstance(synthesized_model, Trade):
                             synthesized_model.quantity = total_qty
                         elif isinstance(synthesized_model, Candlestick):
                             synthesized_model.volume = total_qty
                             synthesized_model.high = max_price
                             synthesized_model.low = min_price
+                            # OHLC invariant check
+                            if synthesized_model.high < max(synthesized_model.open, synthesized_model.close):
+                                logger.warning("OHLC invariant violated: high < max(open, close)")
+                                synthesized_model.high = max(synthesized_model.open, synthesized_model.close, synthesized_model.high)
+                            if synthesized_model.low > min(synthesized_model.open, synthesized_model.close):
+                                logger.warning("OHLC invariant violated: low > min(open, close)")
+                                synthesized_model.low = min(synthesized_model.open, synthesized_model.close, synthesized_model.low)
 
                         self.callback(synthesized_model)
 
