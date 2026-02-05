@@ -89,8 +89,8 @@ class CcxtExchangeAdapter(IExchangeAdapter):
                 symbol=ccxt_symbol,
                 type=order.type,
                 side=order.side,
-                amount=float(order.quantity),
-                price=float(order.price) if order.price else None,
+                amount=str(order.quantity),
+                price=str(order.price) if order.price else None,
                 params=params,
             )
             return str(response["id"])

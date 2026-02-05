@@ -56,8 +56,8 @@ class LiveBinanceAdapter(CcxtExchangeAdapter):
                 success = self.ws_connector.place_order(
                     symbol=order.product_id,
                     side=order.side,
-                    quantity=float(order.quantity),
-                    price=float(order.price) if order.price else None,
+                    quantity=str(order.quantity),
+                    price=str(order.price) if order.price else None,
                     order_type=order.type,
                 )
                 if success:
