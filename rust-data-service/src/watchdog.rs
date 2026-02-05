@@ -49,7 +49,7 @@ impl Watchdog {
                     if let Ok(ts) = ts_str.parse::<i64>() {
                         let now = SystemTime::now()
                             .duration_since(UNIX_EPOCH)
-                            .unwrap()
+                            .unwrap_or_default()
                             .as_millis() as i64;
 
                         if now - ts > 5000 {

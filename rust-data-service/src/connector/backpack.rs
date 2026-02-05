@@ -48,7 +48,7 @@ impl BackpackConnector {
 
         let timestamp = SystemTime::now()
             .duration_since(UNIX_EPOCH)
-            .unwrap()
+            .unwrap_or_default()
             .as_millis()
             .to_string();
         let window = "5000";
@@ -105,7 +105,7 @@ impl BackpackConnector {
                         async move {
                             let timestamp = SystemTime::now()
                                 .duration_since(UNIX_EPOCH)
-                                .unwrap()
+                                .unwrap_or_default()
                                 .as_millis()
                                 .to_string();
                             let window = "5000";
