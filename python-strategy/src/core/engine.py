@@ -97,7 +97,7 @@ class StrategyEngine:
                         data = json.loads(message['data'])
                         self.executor.submit(self._handle_command, data)
                     except Exception as e:
-                        logger.error(f"Error parsing command: {e}")
+                        logger.error("Error parsing command: %s", e)
         
         self.command_thread = threading.Thread(target=command_loop, daemon=True)
         self.command_thread.start()
@@ -109,7 +109,7 @@ class StrategyEngine:
         cmd = data.get("command")
         params = data.get("params", {})
         
-        logger.info(f"Received Command: {cmd} with params {params}")
+        logger.info("Received Command: %s with params %s", cmd, params)
         
         try:
             if cmd == "SCAN":
@@ -121,15 +121,15 @@ class StrategyEngine:
             elif cmd == "STOP":
                 self.stop_strategy(params.get("id"))
             else:
-                logger.warning(f"Unknown command: {cmd}")
+                logger.warning("Unknown command: %s", cmd)
         except Exception as e:
-            logger.error(f"Error executing command {cmd}: {e}\n{traceback.format_exc()}")
+            logger.error("Error executing command %s: %s\n%s", cmd, e, traceback.format_exc())
 
     def scan_strategies(self):
         """
         Scans for strategy files and syncs with DB.
         """
-        logger.info(f"🔍 Scanning for strategies in {HOT_STRATEGIES_PATH}...")
+        logger.info("🔍 Scanning for strategies in %s...", HOT_STRATEGIES_PATH)
         found = StrategyLoader.scan_directory(HOT_STRATEGIES_PATH)
         
         # Update class registry
@@ -154,21 +154,21 @@ class StrategyEngine:
                     state.performance_json = json.dumps({"error": result})
                 
                 db.commit()
-        logger.info(f"✅ Scan Complete. Total loaded: {len(self.loaded_classes)}")
+        logger.info("✅ Scan Complete. Total loaded: %s", len(self.loaded_classes))
 
     def test_run_strategy(self, strategy_id: str, days: int):
         """
         Performs a test run/warm-up for a strategy.
         """
-        logger.info(f"🧪 Test Run for {strategy_id} (days={days})")
+        logger.info("🧪 Test Run for %s (days=%s)", strategy_id, days)
         if strategy_id not in self.loaded_classes:
-            logger.error(f"Strategy {strategy_id} not loaded.")
+            logger.error("Strategy %s not loaded.", strategy_id)
             return
 
         with SessionLocal() as db:
             state = db.query(StrategyState).filter(StrategyState.strategy_id == strategy_id).first()
             if not state:
-                logger.error(f"Strategy {strategy_id} not in DB.")
+                logger.error("Strategy %s not in DB.", strategy_id)
                 return
 
             try:
@@ -186,7 +186,7 @@ class StrategyEngine:
                 )
                 
                 if not is_available:
-                    logger.warning(f"⚠️ Insufficient data for {strategy_id}. Command: {backfill_cmd}")
+                    logger.warning("⚠️ Insufficient data for %s. Command: %s", strategy_id, backfill_cmd)
                     state.status = StrategyStatus.WARNING
                     state.performance_json = json.dumps({"backfill_command": backfill_cmd})
                     db.commit()
@@ -195,22 +195,22 @@ class StrategyEngine:
                 # If OK, update status to READY
                 state.status = StrategyStatus.READY
                 db.commit()
-                logger.info(f"✅ Strategy {strategy_id} is READY.")
+                logger.info("✅ Strategy %s is READY.", strategy_id)
 
             except Exception as e:
                 error_trace = traceback.format_exc()
                 state.status = StrategyStatus.ERROR
                 state.performance_json = json.dumps({"error": error_trace})
                 db.commit()
-                logger.error(f"❌ Test Run failed for {strategy_id}: {e}")
+                logger.error("❌ Test Run failed for %s: %s", strategy_id, e)
 
     def start_strategy(self, strategy_id: str):
         """
         Activates a strategy for live execution.
         """
-        logger.info(f"🚀 Starting Strategy: {strategy_id}")
+        logger.info("🚀 Starting Strategy: %s", strategy_id)
         if strategy_id not in self.loaded_classes:
-            logger.error(f"Strategy {strategy_id} not loaded.")
+            logger.error("Strategy %s not loaded.", strategy_id)
             return
 
         with SessionLocal() as db:
@@ -218,7 +218,7 @@ class StrategyEngine:
             # Allow READY or WARNING (with manual override implied by START command)
             startable = {StrategyStatus.READY, StrategyStatus.WARNING, StrategyStatus.STOPPED, StrategyStatus.DISCOVERED}
             if not state or state.status not in startable:
-                 logger.error(f"Strategy {strategy_id} is not in startable state (Current: {state.status if state else 'None'})")
+                 logger.error("Strategy %s is not in startable state (Current: %s)", strategy_id, state.status if state else 'None')
                  return
 
             try:
@@ -238,22 +238,22 @@ class StrategyEngine:
                 state.status = StrategyStatus.ACTIVE
                 state.uptime_start = int(time.time() * 1000)
                 db.commit()
-                logger.info(f"🔥 Strategy {strategy_id} is now ACTIVE for {product_id}")
+                logger.info("🔥 Strategy %s is now ACTIVE for %s", strategy_id, product_id)
 
             except Exception as e:
                 state.status = StrategyStatus.ERROR
                 state.performance_json = json.dumps({"error": str(e)})
                 db.commit()
-                logger.error(f"❌ Failed to start {strategy_id}: {e}")
+                logger.error("❌ Failed to start %s: %s", strategy_id, e)
 
     def stop_strategy(self, strategy_id: str):
         """
         Deactivates an active strategy.
         """
-        logger.info(f"🛑 Stopping Strategy: {strategy_id}")
+        logger.info("🛑 Stopping Strategy: %s", strategy_id)
         with self._strategy_lock:
             if strategy_id not in self.strategy_instances:
-                logger.warning(f"Strategy {strategy_id} is not active.")
+                logger.warning("Strategy %s is not active.", strategy_id)
                 return
 
             instance = self.strategy_instances.pop(strategy_id)
@@ -267,7 +267,7 @@ class StrategyEngine:
                 state.status = StrategyStatus.STOPPED
                 db.commit()
         
-        logger.info(f"✅ Strategy {strategy_id} stopped.")
+        logger.info("✅ Strategy %s stopped.", strategy_id)
 
     def _reconcile_balance(self):
         """
@@ -278,9 +278,9 @@ class StrategyEngine:
         try:
             balance = self.account_service.get_balance()
             self.redis_client.set("state:balance:USDT", str(balance))
-            logger.info(f"✅ Balance Reconciled: {balance} USDT")
+            logger.info("✅ Balance Reconciled: %s USDT", balance)
         except Exception as e:
-            logger.warning(f"⚠️ Balance Reconciliation Failed: {e}. Using DB/Redis state.")
+            logger.warning("⚠️ Balance Reconciliation Failed: %s. Using DB/Redis state.", e)
 
     def _check_system_state(self):
         """
@@ -294,10 +294,10 @@ class StrategyEngine:
                     logger.warning("⚠️ SYSTEM LOCKED (LOCKDOWN). Waiting for manual resume...")
                     time.sleep(5)
                 else:
-                    logger.info(f"✅ System State: {state or 'OK'}. Proceeding.")
+                    logger.info("✅ System State: %s. Proceeding.", state or 'OK')
                     break
             except Exception as e:
-                logger.error(f"❌ Error checking system state: {e}. Retrying...")
+                logger.error("❌ Error checking system state: %s. Retrying...", e)
                 time.sleep(2)
 
     def _start_heartbeat(self):
@@ -321,7 +321,7 @@ class StrategyEngine:
                         db.commit()
                     time.sleep(1.0)
                 except Exception as e:
-                    logger.error(f"💓 Heartbeat Failed: {e}")
+                    logger.error("💓 Heartbeat Failed: %s", e)
                     time.sleep(1.0)
         
         self.heartbeat_thread = threading.Thread(target=heartbeat_loop, daemon=True)
@@ -336,7 +336,7 @@ class StrategyEngine:
                 self.strategies[strategy.product_id] = []
             self.strategies[strategy.product_id].append(strategy)
             self.strategy_instances[strategy.strategy_id] = strategy
-        logger.info(f"Registered strategy (legacy): {strategy.strategy_id} for {strategy.product_id}")
+        logger.info("Registered strategy (legacy): %s for %s", strategy.strategy_id, strategy.product_id)
 
     def build_stream_channels(self) -> list:
         """Derive Redis stream keys from registered strategy requirements."""
@@ -358,7 +358,9 @@ class StrategyEngine:
         if isinstance(data, Candlestick):
             self.execution_engine.process_market_data(data)
 
-        strategies = self.strategies.get(data.product_id, [])
+        # Copy strategy list under lock to avoid race with stop_strategy
+        with self._strategy_lock:
+            strategies = list(self.strategies.get(data.product_id, []))
         for strategy in strategies:
             try:
                 if isinstance(data, Trade):
@@ -373,7 +375,7 @@ class StrategyEngine:
                 if signal:
                     self.process_signal(signal, data if isinstance(data, Candlestick) else None)
             except Exception as e:
-                logger.error(f"Error in strategy {strategy.strategy_id}: {e}")
+                logger.error("Error in strategy %s: %s", strategy.strategy_id, e)
 
     def process_signal(self, signal: Signal, candle: Optional[Candlestick]):
         """
@@ -387,7 +389,7 @@ class StrategyEngine:
         
         order_id = None
         if is_passed:
-            logger.info(f"✅ SIGNAL ACCEPTED: {signal.type}. Forwarding to Execution Engine...")
+            logger.info("✅ SIGNAL ACCEPTED: %s. Forwarding to Execution Engine...", signal.type)
             order_id = self.execution_engine.execute_signal(signal, candle)
         
         try:
@@ -407,7 +409,7 @@ class StrategyEngine:
             self.db.add(audit)
             self.db.commit()
         except Exception as e:
-            logger.error(f"Failed to log audit trail: {e}")
+            logger.error("Failed to log audit trail: %s", e)
             self.db.rollback()
 
     def shutdown(self, timeout: float = 30.0):

@@ -48,7 +48,7 @@ class WebSocketOrderConnector:
             return
 
         if not self.ws_url:
-            self.logger.warning(f"⚠️ No WS URL for {self.exchange_id}. WS Order Entry disabled.")
+            self.logger.warning("⚠️ No WS URL for %s. WS Order Entry disabled.", self.exchange_id)
             return
 
         self.running = True

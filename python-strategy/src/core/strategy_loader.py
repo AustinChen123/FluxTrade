@@ -19,7 +19,7 @@ class StrategyLoader:
         """
         strategies = {}
         if not os.path.exists(path):
-            logger.warning(f"Directory {path} does not exist.")
+            logger.warning("Directory %s does not exist.", path)
             return strategies
 
         search_path = os.path.join(path, "*.py")
@@ -45,15 +45,15 @@ class StrategyLoader:
                         
                         strategy_id = f"{file_name}::{name}"
                         strategies[strategy_id] = obj
-                        logger.info(f"Loaded strategy: {strategy_id}")
+                        logger.info("Loaded strategy: %s", strategy_id)
                         found_any = True
                 
                 if not found_any:
-                    logger.debug(f"No BaseStrategy subclass found in {file_name}")
+                    logger.debug("No BaseStrategy subclass found in %s", file_name)
 
             except Exception:
                 error_trace = traceback.format_exc()
-                logger.error(f"Failed to load module {file_path}:\n{error_trace}")
+                logger.error("Failed to load module %s:\n%s", file_path, error_trace)
                 # Use a special key pattern for load errors to satisfy the "special status" requirement
                 strategies[f"{file_name}::LoadError"] = error_trace
         
