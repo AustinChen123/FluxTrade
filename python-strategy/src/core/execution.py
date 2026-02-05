@@ -4,7 +4,7 @@ from typing import Optional
 from sqlalchemy.orm import Session
 from src.core.models import Signal, SignalType, Candlestick
 from src.core.order_manager import OrderManager
-from src.core.interfaces.exchange import IExchangeAdapter
+from src.core.interfaces.exchange import IExchangeAdapter, ExchangeError
 from src.core.clock import Clock
 from src.core.interfaces import IOrderRepository
 from src.core.journal import StrategyJournal
@@ -21,7 +21,7 @@ class ExecutionEngine:
         self.default_quantity = Decimal("0.01")
         self.adapter = adapter
         self.journal = journal
-        self.logger.info(f"ExecutionEngine initialized with adapter: {type(adapter).__name__}")
+        self.logger.info("ExecutionEngine initialized with adapter: %s", type(adapter).__name__)
 
     def process_market_data(self, candle: Candlestick):
         """
@@ -37,7 +37,7 @@ class ExecutionEngine:
                 fee = fill.get('fee')
                 fill_type = fill.get('fill_type', 'MARKET')
 
-                self.logger.info(f"Execution: Adapter fill for {order.id} at {price} (fee={fee})")
+                self.logger.info("Execution: Adapter fill for %s at %s (fee=%s)", order.id, price, fee)
                 self.order_manager.fill_order(
                     order=order,
                     fill_price=price,
@@ -83,12 +83,12 @@ class ExecutionEngine:
 
         # 2. Execute via Adapter
         try:
-            self.logger.info(f"Sending Order {order.id} via Adapter...")
+            self.logger.info("Sending Order %s via Adapter...", order.id)
             exchange_id = self.adapter.place_order(order)
             self.order_manager.update_exchange_order_id(order, exchange_id)
-            self.logger.info(f"Order Placed. Internal: {order.id}, Exchange: {exchange_id}")
-        except Exception as e:
-            self.logger.error(f"Execution Failed: {e}")
+            self.logger.info("Order Placed. Internal: %s, Exchange: %s", order.id, exchange_id)
+        except ExchangeError as e:
+            self.logger.error("Execution Failed: %s", e)
             self.order_manager.fail_order(order, str(e))
             return None
 
@@ -154,15 +154,15 @@ class ExecutionEngine:
             try:
                 ex_id = self.adapter.place_order(sl_order)
                 self.order_manager.update_exchange_order_id(sl_order, ex_id)
-            except Exception as e:
-                self.logger.error(f"Failed to place SL order: {e}")
+            except ExchangeError as e:
+                self.logger.error("Failed to place SL order: %s", e)
 
         if tp_order:
             try:
                 ex_id = self.adapter.place_order(tp_order)
                 self.order_manager.update_exchange_order_id(tp_order, ex_id)
-            except Exception as e:
-                self.logger.error(f"Failed to place TP order: {e}")
+            except ExchangeError as e:
+                self.logger.error("Failed to place TP order: %s", e)
 
         # Create Trailing Stop order
         if signal.trailing_distance:
@@ -177,8 +177,8 @@ class ExecutionEngine:
             try:
                 ex_id = self.adapter.place_order(ts_order)
                 self.order_manager.update_exchange_order_id(ts_order, ex_id)
-            except Exception as e:
-                self.logger.error(f"Failed to place trailing stop order: {e}")
+            except ExchangeError as e:
+                self.logger.error("Failed to place trailing stop order: %s", e)
 
     def _journal_fill(self, order, price, qty, fee, fill_type: str, candle: Optional[Candlestick] = None) -> None:
         """Record a fill event to the journal."""
