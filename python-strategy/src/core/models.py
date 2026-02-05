@@ -1,7 +1,7 @@
-from pydantic import BaseModel, ConfigDict, field_validator
+from pydantic import BaseModel, ConfigDict, field_validator, field_serializer
 from decimal import Decimal
 from enum import Enum
-from typing import Optional
+from typing import Optional, Any
 import re
 
 PRODUCT_ID_REGEX = r"^[A-Z0-9]+:[A-Z0-9_]+-PERP$"
@@ -25,10 +25,17 @@ class StrategyStatus(str, Enum):
 class BaseFluxModel(BaseModel):
     """Base model with common configuration"""
     model_config = ConfigDict(
-        json_encoders={Decimal: str},
         # Allow population by alias/name
         populate_by_name=True
     )
+
+    @field_serializer('*', mode='wrap', when_used='json')
+    @classmethod
+    def serialize_decimal(cls, value: Any, handler: Any) -> Any:
+        """Serialize Decimal fields as strings for JSON compatibility."""
+        if isinstance(value, Decimal):
+            return str(value)
+        return handler(value)
 
 class Trade(BaseFluxModel):
     id: str
