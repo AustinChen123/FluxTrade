@@ -99,7 +99,7 @@ class TestPlaceOrder:
 
         call_kwargs = mock_ccxt_client.create_order.call_args
         assert call_kwargs.kwargs["params"]["timeInForce"] == "GTC"
-        assert call_kwargs.kwargs["price"] == 50000.0
+        assert call_kwargs.kwargs["price"] == "50000"
 
     def test_insufficient_funds_raises(self, adapter, mock_ccxt_client):
         import ccxt as ccxt_lib
