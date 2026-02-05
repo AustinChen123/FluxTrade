@@ -102,7 +102,7 @@ class RiskManager:
 
         return True, "PASS"
 
-    def calculate_position_size(self, entry_price: Decimal, stop_loss_price: Decimal, risk_percent: float = 0.02) -> Decimal:
+    def calculate_position_size(self, entry_price: Decimal, stop_loss_price: Decimal, risk_percent: Decimal = Decimal("0.02")) -> Decimal:
         """
         Calculates position size based on risk percentage and stop loss distance.
         Risk = |Entry - SL| * Size
@@ -112,7 +112,7 @@ class RiskManager:
         if balance <= 0:
             return Decimal("0")
 
-        risk_amount = balance * Decimal(str(risk_percent))
+        risk_amount = balance * risk_percent
         price_diff = abs(entry_price - stop_loss_price)
 
         if price_diff == 0:

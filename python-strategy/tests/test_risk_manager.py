@@ -227,7 +227,7 @@ class TestPositionSizeCalculation:
         size = risk_manager.calculate_position_size(
             entry_price=Decimal("42000"),
             stop_loss_price=Decimal("41000"),
-            risk_percent=0.02
+            risk_percent=Decimal("0.02")
         )
 
         assert size == Decimal("0.2")
@@ -242,7 +242,7 @@ class TestPositionSizeCalculation:
         size = risk_manager.calculate_position_size(
             entry_price=Decimal("42000"),
             stop_loss_price=Decimal("41000"),
-            risk_percent=0.01
+            risk_percent=Decimal("0.01")
         )
 
         assert size == Decimal("0.1")
@@ -281,7 +281,7 @@ class TestPositionSizeCalculation:
         size = risk_manager.calculate_position_size(
             entry_price=Decimal("42000"),
             stop_loss_price=Decimal("43000"),
-            risk_percent=0.02
+            risk_percent=Decimal("0.02")
         )
 
         assert size == Decimal("0.2")
@@ -362,7 +362,7 @@ class TestRiskManagerEdgeCases:
         size = risk_manager.calculate_position_size(
             entry_price=Decimal("42000"),
             stop_loss_price=Decimal("41990"),
-            risk_percent=0.02,
+            risk_percent=Decimal("0.02"),
         )
 
         # 200 / 10 = 20 BTC — very large because SL is tight
@@ -376,7 +376,7 @@ class TestRiskManagerEdgeCases:
         size = risk_manager.calculate_position_size(
             entry_price=Decimal("42000"),
             stop_loss_price=Decimal("41000"),
-            risk_percent=0.0,
+            risk_percent=Decimal("0"),
         )
 
         assert size == Decimal("0")
@@ -389,7 +389,7 @@ class TestRiskManagerEdgeCases:
         size = risk_manager.calculate_position_size(
             entry_price=Decimal("42000"),
             stop_loss_price=Decimal("41333"),
-            risk_percent=0.02,
+            risk_percent=Decimal("0.02"),
         )
 
         # Verify result has at most 4 decimal places
