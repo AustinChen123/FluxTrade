@@ -281,26 +281,26 @@ def calculate_metrics(
                 cur_loss_amt = 0.0
 
     return {
-        # Basic (backward-compatible)
+        # Basic (backward-compatible) - all numeric values as Decimal for precision
         "total_pnl": Decimal(f"{total_pnl:.2f}"),
         "max_drawdown": Decimal(f"{max_drawdown:.2f}"),
-        "trade_sharpe": float(f"{trade_sharpe:.2f}"),
-        "win_rate": float(f"{win_rate:.2f}"),
-        "profit_factor": float(f"{profit_factor:.2f}"),
-        "avg_trade": float(f"{avg_trade:.2f}"),
+        "trade_sharpe": Decimal(f"{trade_sharpe:.2f}"),
+        "win_rate": Decimal(f"{win_rate:.2f}"),
+        "profit_factor": Decimal(f"{profit_factor:.2f}"),
+        "avg_trade": Decimal(f"{avg_trade:.2f}"),
         "total_trades": total_trades,
         # Advanced
-        "sortino_ratio": float(f"{sortino_ratio:.4f}"),
-        "calmar_ratio": float(f"{calmar_ratio:.4f}"),
+        "sortino_ratio": Decimal(f"{sortino_ratio:.4f}"),
+        "calmar_ratio": Decimal(f"{calmar_ratio:.4f}"),
         "monthly_returns": monthly_returns,
-        "max_drawdown_days": float(f"{max_drawdown_days:.2f}"),
-        "trade_frequency_per_day": float(f"{trade_frequency_per_day:.2f}"),
-        "avg_hold_time_hours": float(f"{avg_hold_time_hours:.2f}"),
+        "max_drawdown_days": Decimal(f"{max_drawdown_days:.2f}"),
+        "trade_frequency_per_day": Decimal(f"{trade_frequency_per_day:.2f}"),
+        "avg_hold_time_hours": Decimal(f"{avg_hold_time_hours:.2f}"),
         "max_consecutive_wins": max_consecutive_wins,
         "max_consecutive_losses": max_consecutive_losses,
-        "max_consecutive_win_amount": float(f"{max_consecutive_win_amount:.2f}"),
-        "max_consecutive_loss_amount": float(f"{max_consecutive_loss_amount:.2f}"),
-        "gross_profit": float(f"{gross_profit:.2f}"),
-        "gross_loss": float(f"{gross_loss:.2f}"),
+        "max_consecutive_win_amount": Decimal(f"{max_consecutive_win_amount:.2f}"),
+        "max_consecutive_loss_amount": Decimal(f"{max_consecutive_loss_amount:.2f}"),
+        "gross_profit": Decimal(f"{gross_profit:.2f}"),
+        "gross_loss": Decimal(f"{gross_loss:.2f}"),
         "closed_trades": closed_trades,
     }

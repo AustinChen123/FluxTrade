@@ -343,15 +343,15 @@ class BacktestRunner:
                 logger.info("Reports written to: %s", report_dir)
 
             result = {
-                "total_pnl": float(total_pnl),
-                "max_drawdown": float(metrics.get("max_drawdown", 0.0)),
-                "win_rate": float(metrics.get("win_rate", 0.0)),
+                "total_pnl": total_pnl,
+                "max_drawdown": metrics.get("max_drawdown", Decimal("0")),
+                "win_rate": metrics.get("win_rate", Decimal("0")),
                 "total_trades": int(metrics.get("total_trades", 0)),
-                "trade_sharpe": float(metrics.get("trade_sharpe", 0.0)),
-                "profit_factor": float(metrics.get("profit_factor", 0.0)),
-                "sortino_ratio": float(metrics.get("sortino_ratio", 0.0)),
-                "calmar_ratio": float(metrics.get("calmar_ratio", 0.0)),
-                "avg_hold_time_hours": float(metrics.get("avg_hold_time_hours", 0.0)),
+                "trade_sharpe": metrics.get("trade_sharpe", Decimal("0")),
+                "profit_factor": metrics.get("profit_factor", Decimal("0")),
+                "sortino_ratio": metrics.get("sortino_ratio", Decimal("0")),
+                "calmar_ratio": metrics.get("calmar_ratio", Decimal("0")),
+                "avg_hold_time_hours": metrics.get("avg_hold_time_hours", Decimal("0")),
                 "max_consecutive_wins": int(metrics.get("max_consecutive_wins", 0)),
                 "max_consecutive_losses": int(metrics.get("max_consecutive_losses", 0)),
                 "journal": journal.to_dicts(),

@@ -168,7 +168,7 @@ class TestSortinoRatio:
         )
         result = calculate_metrics(trades)
         # Has both positive and negative → sortino should be nonzero
-        assert isinstance(result["sortino_ratio"], float)
+        assert isinstance(result["sortino_ratio"], Decimal)
 
 
 class TestCalmarRatio:
@@ -179,7 +179,7 @@ class TestCalmarRatio:
             + _round_trip(100.0, 80.0, entry_ts=86_400_000 * 3, exit_ts=86_400_000 * 4)
         )
         result = calculate_metrics(trades, initial_balance=10000.0)
-        assert isinstance(result["calmar_ratio"], float)
+        assert isinstance(result["calmar_ratio"], Decimal)
 
     def test_calmar_no_drawdown(self):
         trades = _round_trip(100.0, 110.0)
@@ -215,7 +215,7 @@ class TestMaxDrawdownDays:
             + _round_trip(100.0, 80.0, entry_ts=3000, exit_ts=4000)
         )
         result = calculate_metrics(trades)
-        assert isinstance(result["max_drawdown_days"], float)
+        assert isinstance(result["max_drawdown_days"], Decimal)
         assert result["max_drawdown_days"] >= 0
 
 
