@@ -21,6 +21,10 @@ RUN uv sync --frozen
 # Copy source code
 COPY src/ ./src/
 
+# Create non-root user and fix ownership
+RUN useradd -m -u 1000 -s /bin/bash trading && chown -R trading:trading /app
+USER trading
+
 # Set Python path and add venv to PATH
 ENV PYTHONPATH=/app
 ENV PATH="/app/.venv/bin:$PATH"

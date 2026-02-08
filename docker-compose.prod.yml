@@ -13,6 +13,12 @@ services:
       fi"
     environment:
       REDIS_PASSWORD: ${REDIS_PASSWORD:-}
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 3s
+      retries: 3
+      start_period: 5s
     deploy:
       resources:
         limits:
@@ -30,12 +36,18 @@ services:
     restart: always
     environment:
       POSTGRES_USER: ${POSTGRES_USER:-fluxtrade}
-      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-fluxtrade}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?POSTGRES_PASSWORD is required}
       POSTGRES_DB: ${POSTGRES_DB:-fluxtrade}
     ports:
       - "5432:5432"
     volumes:
       - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-fluxtrade}"]
+      interval: 10s
+      timeout: 3s
+      retries: 3
+      start_period: 10s
     deploy:
       resources:
         limits:
@@ -54,15 +66,17 @@ services:
     container_name: fluxtrade-rust
     restart: unless-stopped
     depends_on:
-      - redis
-      - db
+      redis:
+        condition: service_healthy
+      db:
+        condition: service_healthy
     environment:
       REDIS_HOST: redis
       REDIS_PASSWORD: ${REDIS_PASSWORD:-}
       POSTGRES_HOST: db
       POSTGRES_PORT: 5432
       POSTGRES_USER: ${POSTGRES_USER:-fluxtrade}
-      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-fluxtrade}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?POSTGRES_PASSWORD is required}
       POSTGRES_DB: ${POSTGRES_DB:-fluxtrade}
       EXCHANGE_ENABLED: "binance,backpack"
       EXCHANGE_API_KEY: ${EXCHANGE_API_KEY}
@@ -86,16 +100,19 @@ services:
     container_name: fluxtrade-python
     restart: unless-stopped
     depends_on:
-      - redis
-      - db
-      - rust-data
+      redis:
+        condition: service_healthy
+      db:
+        condition: service_healthy
+      rust-data:
+        condition: service_started
     environment:
       REDIS_HOST: redis
       REDIS_PASSWORD: ${REDIS_PASSWORD:-}
       POSTGRES_HOST: db
       POSTGRES_PORT: 5432
       POSTGRES_USER: ${POSTGRES_USER:-fluxtrade}
-      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-fluxtrade}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?POSTGRES_PASSWORD is required}
       POSTGRES_DB: ${POSTGRES_DB:-fluxtrade}
       BINANCE_API_KEY: ${BINANCE_API_KEY}
       BINANCE_SECRET: ${BINANCE_SECRET}
@@ -124,8 +141,10 @@ services:
     container_name: fluxtrade-dashboard
     restart: always
     depends_on:
-      - redis
-      - db
+      redis:
+        condition: service_healthy
+      db:
+        condition: service_healthy
     ports:
       - "8501:8501"
     environment:
@@ -135,7 +154,7 @@ services:
       POSTGRES_HOST: db
       POSTGRES_PORT: 5432
       POSTGRES_USER: ${POSTGRES_USER:-fluxtrade}
-      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-fluxtrade}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?POSTGRES_PASSWORD is required}
       POSTGRES_DB: ${POSTGRES_DB:-fluxtrade}
     command: >
       streamlit run app.py
@@ -185,7 +204,7 @@ services:
     ports:
       - "3000:3000"
     environment:
-      GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_PASSWORD:-admin}
+      GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_PASSWORD:?GRAFANA_PASSWORD is required}
     volumes:
       - grafana_data:/var/lib/grafana
       - ./monitoring/grafana/provisioning:/etc/grafana/provisioning:ro
