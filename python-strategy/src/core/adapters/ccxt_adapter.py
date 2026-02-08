@@ -133,7 +133,7 @@ class CcxtExchangeAdapter(IExchangeAdapter):
             if pos.get("symbol") != ccxt_symbol:
                 continue
 
-            contracts = float(pos.get("contracts", 0))
+            contracts = Decimal(str(pos.get("contracts", 0)))
             if contracts == 0:
                 return None
 

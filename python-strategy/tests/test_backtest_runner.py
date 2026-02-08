@@ -8,6 +8,7 @@ Covers:
 - _export_reports integration
 """
 
+from decimal import Decimal
 from unittest.mock import MagicMock, patch
 
 from src.core.backtest_runner import (
@@ -31,10 +32,10 @@ def _make_closed_trade(**overrides) -> ClosedTrade:
         entry_time=1704067200000,
         exit_time=1704067260000,
         side="LONG",
-        entry_price=42000.0,
-        exit_price=42500.0,
-        quantity=0.1,
-        pnl=50.0,
+        entry_price=Decimal("42000.00"),
+        exit_price=Decimal("42500.00"),
+        quantity=Decimal("0.1"),
+        pnl=Decimal("50.0"),
     )
     defaults.update(overrides)
     return ClosedTrade(**defaults)

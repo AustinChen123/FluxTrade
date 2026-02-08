@@ -311,7 +311,7 @@ class BacktestRunner:
 
                 count += 1
                 if count % 1000 == 0:
-                    logger.info("Processed %d candles... Current Time: %s | Bal: %.2f", count, candle.timestamp, current_balance)
+                    logger.info("Processed %d candles... Current Time: %s | Bal: %s", count, candle.timestamp, current_balance)
         finally:
             # Calculate Final PnL
             final_balance = mock_account.get_balance()

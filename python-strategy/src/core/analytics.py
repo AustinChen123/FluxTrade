@@ -248,37 +248,37 @@ def calculate_metrics(
     # Max consecutive wins / losses
     max_consecutive_wins = 0
     max_consecutive_losses = 0
-    max_consecutive_win_amount = 0.0
-    max_consecutive_loss_amount = 0.0
+    max_consecutive_win_amount = Decimal("0")
+    max_consecutive_loss_amount = Decimal("0")
 
     if trade_pnls:
         cur_wins = 0
         cur_losses = 0
-        cur_win_amt = 0.0
-        cur_loss_amt = 0.0
+        cur_win_amt = Decimal("0")
+        cur_loss_amt = Decimal("0")
 
         for pnl in trade_pnls:
             if pnl > 0:
                 cur_wins += 1
-                cur_win_amt += pnl
+                cur_win_amt += Decimal(str(pnl))
                 if cur_wins > max_consecutive_wins:
                     max_consecutive_wins = cur_wins
                     max_consecutive_win_amount = cur_win_amt
                 cur_losses = 0
-                cur_loss_amt = 0.0
+                cur_loss_amt = Decimal("0")
             elif pnl < 0:
                 cur_losses += 1
-                cur_loss_amt += abs(pnl)
+                cur_loss_amt += Decimal(str(abs(pnl)))
                 if cur_losses > max_consecutive_losses:
                     max_consecutive_losses = cur_losses
                     max_consecutive_loss_amount = cur_loss_amt
                 cur_wins = 0
-                cur_win_amt = 0.0
+                cur_win_amt = Decimal("0")
             else:
                 cur_wins = 0
                 cur_losses = 0
-                cur_win_amt = 0.0
-                cur_loss_amt = 0.0
+                cur_win_amt = Decimal("0")
+                cur_loss_amt = Decimal("0")
 
     return {
         # Basic (backward-compatible) - all numeric values as Decimal for precision
