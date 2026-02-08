@@ -4,6 +4,7 @@ import time
 import threading
 import logging
 import traceback
+import uuid
 from concurrent.futures import ThreadPoolExecutor
 from typing import List, Union, Optional, Dict, Type
 from sqlalchemy.orm import Session
@@ -20,6 +21,7 @@ from src.core.db import SessionLocal
 from src.core.adapters import create_adapter
 from src.core.journal import StrategyJournal
 from src.core.redis_factory import create_redis_client
+from src.core.metrics import SIGNALS_TOTAL, ACTIVE_STRATEGIES, BALANCE_USDT
 
 HOT_STRATEGIES_PATH = os.getenv('HOT_STRATEGIES_PATH', '/app/strategies_hot')
 
@@ -234,6 +236,7 @@ class StrategyEngine:
                     if product_id not in self.strategies:
                         self.strategies[product_id] = []
                     self.strategies[product_id].append(instance)
+                    ACTIVE_STRATEGIES.set(len(self.strategy_instances))
                 
                 state.status = StrategyStatus.ACTIVE
                 state.uptime_start = int(time.time() * 1000)
@@ -260,6 +263,7 @@ class StrategyEngine:
             product_id = instance.product_id
             if product_id in self.strategies:
                 self.strategies[product_id] = [s for s in self.strategies[product_id] if s.strategy_id != strategy_id]
+            ACTIVE_STRATEGIES.set(len(self.strategy_instances))
         
         with SessionLocal() as db:
             state = db.query(StrategyState).filter(StrategyState.strategy_id == strategy_id).first()
@@ -309,6 +313,12 @@ class StrategyEngine:
             while self.running:
                 try:
                     self.redis_client.setex("heartbeat:python", 3, "1")
+                    # Expose balance to Prometheus
+                    try:
+                        balance = self.account_service.get_balance()
+                        BALANCE_USDT.set(float(balance))
+                    except Exception:
+                        pass
                     # Update DB heartbeats for active strategies (snapshot for thread safety)
                     with self._strategy_lock:
                         active_sids = list(self.strategy_instances.keys())
@@ -336,6 +346,7 @@ class StrategyEngine:
                 self.strategies[strategy.product_id] = []
             self.strategies[strategy.product_id].append(strategy)
             self.strategy_instances[strategy.strategy_id] = strategy
+            ACTIVE_STRATEGIES.set(len(self.strategy_instances))
         logger.info("Registered strategy (legacy): %s for %s", strategy.strategy_id, strategy.product_id)
 
     def build_stream_channels(self) -> list:
@@ -384,9 +395,19 @@ class StrategyEngine:
         if signal.type == SignalType.NO_SIGNAL:
             return
 
+        import structlog.contextvars
+        structlog.contextvars.bind_contextvars(trace_id=uuid.uuid4().hex[:16])
+
         current_price = candle.close if candle else None
         is_passed, risk_msg = self.risk_manager.check_risk(signal, current_price=current_price)
-        
+
+        risk_status = "PASS" if is_passed else "REJECT"
+        SIGNALS_TOTAL.labels(
+            strategy_id=signal.strategy_id,
+            signal_type=signal.type.value,
+            risk_status=risk_status,
+        ).inc()
+
         order_id = None
         if is_passed:
             logger.info("✅ SIGNAL ACCEPTED: %s. Forwarding to Execution Engine...", signal.type)

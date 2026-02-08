@@ -10,6 +10,7 @@ from typing import Callable, List, Union
 from dotenv import load_dotenv
 from src.core.models import Candlestick, Trade
 from src.core.redis_factory import create_redis_client
+from src.core.metrics import CONSUMER_LAG_MS
 
 # Load env
 load_dotenv(os.path.join(os.path.dirname(__file__), '../../../.env'))
@@ -109,6 +110,7 @@ class DataConsumer:
                 server_time_ms = int(t[0] * 1000) + int(t[1] / 1000)
 
                 lag = server_time_ms - last_msg_ts
+                CONSUMER_LAG_MS.labels(stream_key=stream_key).set(lag)
 
                 if lag > 100:
                     # Lag > 100ms: CONFLATE backlog
