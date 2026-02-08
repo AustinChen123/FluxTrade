@@ -10,20 +10,17 @@ pub struct RedisPublisher {
 }
 
 impl RedisPublisher {
-    #[allow(dead_code)]
     pub fn new(url: &str) -> Result<Self> {
         let client = redis::Client::open(url)?;
         Ok(Self { client, conn: None })
     }
 
-    #[allow(dead_code)]
     pub async fn connect(&mut self) -> Result<()> {
         let conn = self.client.get_multiplexed_async_connection().await?;
         self.conn = Some(conn);
         Ok(())
     }
 
-    #[allow(dead_code)]
     pub async fn update_account_balance(&mut self, update: &AccountUpdate) -> Result<()> {
         self.ensure_connected().await?;
         if let Some(conn) = &mut self.conn {
@@ -38,7 +35,6 @@ impl RedisPublisher {
         Ok(())
     }
 
-    #[allow(dead_code)]
     pub async fn update_position(&mut self, update: &PositionUpdate) -> Result<()> {
         self.ensure_connected().await?;
         if let Some(conn) = &mut self.conn {
@@ -62,7 +58,6 @@ impl RedisPublisher {
         Ok(())
     }
 
-    #[allow(dead_code)]
     pub async fn publish_candle(&mut self, candle: &Candlestick) -> Result<()> {
         // Stream Key: stream:market:{exchange}:{symbol}
         // product_id is "EXCHANGE:SYMBOL-PERP"
@@ -75,7 +70,6 @@ impl RedisPublisher {
         self.publish(&topic, candle).await
     }
 
-    #[allow(dead_code)]
     pub async fn publish_trade(&mut self, trade: &Trade) -> Result<()> {
         let parts: Vec<&str> = trade.product_id.split(':').collect();
         let exchange = parts[0].to_lowercase();

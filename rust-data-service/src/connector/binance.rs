@@ -19,6 +19,51 @@ pub struct BinanceConnector {
     base_url: String,
 }
 
+fn parse_trade_from_json(v: &Value, exchange_id: &str) -> Result<Trade> {
+    let symbol = v
+        .get("s")
+        .context("Missing 's'")?
+        .as_str()
+        .context("s not string")?;
+
+    Ok(Trade {
+        id: v
+            .get("a")
+            .context("Missing 'a'")?
+            .as_i64()
+            .context("a not i64")?
+            .to_string(),
+        product_id: format!("{}:{}-PERP", exchange_id, symbol),
+        price: v
+            .get("p")
+            .context("Missing 'p'")?
+            .as_str()
+            .context("p not string")?
+            .parse::<Decimal>()?,
+        quantity: v
+            .get("q")
+            .context("Missing 'q'")?
+            .as_str()
+            .context("q not string")?
+            .parse::<Decimal>()?,
+        side: if v
+            .get("m")
+            .context("Missing 'm'")?
+            .as_bool()
+            .context("m not bool")?
+        {
+            "sell".to_string()
+        } else {
+            "buy".to_string()
+        },
+        timestamp: v
+            .get("T")
+            .context("Missing 'T'")?
+            .as_i64()
+            .context("T not i64")?,
+    })
+}
+
 impl BinanceConnector {
     #[allow(dead_code)]
     pub fn new() -> Self {
@@ -242,48 +287,7 @@ impl BinanceConnector {
 
     #[allow(dead_code)]
     fn parse_trade(&self, v: &Value) -> Result<Trade> {
-        let symbol = v
-            .get("s")
-            .context("Missing 's'")?
-            .as_str()
-            .context("s not string")?;
-
-        Ok(Trade {
-            id: v
-                .get("a")
-                .context("Missing 'a'")?
-                .as_i64()
-                .context("a not i64")?
-                .to_string(),
-            product_id: format!("{}:{}-PERP", self.exchange_id, symbol),
-            price: v
-                .get("p")
-                .context("Missing 'p'")?
-                .as_str()
-                .context("p not string")?
-                .parse::<Decimal>()?,
-            quantity: v
-                .get("q")
-                .context("Missing 'q'")?
-                .as_str()
-                .context("q not string")?
-                .parse::<Decimal>()?,
-            side: if v
-                .get("m")
-                .context("Missing 'm'")?
-                .as_bool()
-                .context("m not bool")?
-            {
-                "sell".to_string()
-            } else {
-                "buy".to_string()
-            },
-            timestamp: v
-                .get("T")
-                .context("Missing 'T'")?
-                .as_i64()
-                .context("T not i64")?,
-        })
+        parse_trade_from_json(v, &self.exchange_id)
     }
 }
 
@@ -329,44 +333,7 @@ impl ExchangeConnector for BinanceConnector {
                                     // Extract data and use a local logic or helper
                                     if data.get("e") == Some(&Value::String("aggTrade".to_string()))
                                     {
-                                        let symbol =
-                                            data.get("s").context("s")?.as_str().context("s")?;
-                                        let trade = Trade {
-                                            id: data
-                                                .get("a")
-                                                .context("a")?
-                                                .as_i64()
-                                                .context("a")?
-                                                .to_string(),
-                                            product_id: format!("{}:{}-PERP", exchange_id, symbol),
-                                            price: data
-                                                .get("p")
-                                                .context("p")?
-                                                .as_str()
-                                                .context("p")?
-                                                .parse::<Decimal>()?,
-                                            quantity: data
-                                                .get("q")
-                                                .context("q")?
-                                                .as_str()
-                                                .context("q")?
-                                                .parse::<Decimal>()?,
-                                            side: if data
-                                                .get("m")
-                                                .context("m")?
-                                                .as_bool()
-                                                .context("m")?
-                                            {
-                                                "sell".to_string()
-                                            } else {
-                                                "buy".to_string()
-                                            },
-                                            timestamp: data
-                                                .get("T")
-                                                .context("T")?
-                                                .as_i64()
-                                                .context("T")?,
-                                        };
+                                        let trade = parse_trade_from_json(data, &exchange_id)?;
                                         if let Err(e) = trade.validate() {
                                             warn!("Invalid trade received: {}", e);
                                         } else {

@@ -65,7 +65,7 @@ impl PyMatchingEngine {
         let mut fills: Vec<FillEvent> = Vec::new();
         let mut remaining_orders: Vec<Order> = Vec::new();
         // Collect IDs of orders cancelled by OCO during this candle
-        let mut cancelled_ids: Vec<String> = Vec::new();
+        let mut cancelled_ids: std::collections::HashSet<String> = std::collections::HashSet::new();
 
         // Update trailing stops before matching
         self.update_trailing_stops(&candle);
@@ -107,6 +107,7 @@ impl PyMatchingEngine {
                 fill_type: "MARKET".to_string(),
             };
             self.update_position(&order, fill_price);
+            let fee = std::cmp::min(fee, self.balance);
             self.balance -= fee;
             self.cancel_linked(&order, &mut cancelled_ids);
             fills.push(fill);
@@ -141,6 +142,7 @@ impl PyMatchingEngine {
                 fill_type: order.order_type.clone(),
             };
             self.update_position(&order, trigger);
+            let fee = std::cmp::min(fee, self.balance);
             self.balance -= fee;
             self.cancel_linked(&order, &mut cancelled_ids);
             fills.push(fill);
@@ -174,6 +176,7 @@ impl PyMatchingEngine {
                     fill_type: "LIMIT".to_string(),
                 };
                 self.update_position(&order, order.price);
+                let fee = std::cmp::min(fee, self.balance);
                 self.balance -= fee;
                 self.cancel_linked(&order, &mut cancelled_ids);
                 fills.push(fill);
@@ -253,11 +256,9 @@ impl PyMatchingEngine {
     }
 
     /// Mark the linked order (OCO counterpart) for cancellation.
-    fn cancel_linked(&self, filled_order: &Order, cancelled_ids: &mut Vec<String>) {
+    fn cancel_linked(&self, filled_order: &Order, cancelled_ids: &mut std::collections::HashSet<String>) {
         if let Some(ref linked_id) = filled_order.linked_order_id {
-            if !cancelled_ids.contains(linked_id) {
-                cancelled_ids.push(linked_id.clone());
-            }
+            cancelled_ids.insert(linked_id.clone());
         }
     }
 

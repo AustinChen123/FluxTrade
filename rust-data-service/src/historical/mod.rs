@@ -95,7 +95,11 @@ pub async fn run_backfill(
         )
         .timestamp_millis();
 
-    let semaphore = Arc::new(Semaphore::new(5));
+    let max_concurrent: usize = std::env::var("HISTORICAL_MAX_CONCURRENT")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(5);
+    let semaphore = Arc::new(Semaphore::new(max_concurrent));
 
     // S3 Backfill (Monthly) - Only supported by Binance for now
     // Only attempt S3 if timeframe is standard (1m, 1h, etc) - though we pass it dynamically
