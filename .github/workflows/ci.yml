@@ -59,7 +59,7 @@ jobs:
         run: uv run ruff check .
 
       - name: Run unit tests with coverage
-        run: uv run pytest -m "not integration and not rust" --cov=src --cov-report=term-missing --cov-fail-under=75
+        run: uv run pytest -m "not integration and not rust" --cov=src --cov-report=term-missing --cov-fail-under=77
 
   integration-check:
     name: Integration Tests (Rust + Python)
@@ -98,8 +98,8 @@ jobs:
           elif [ -f rust-data-service/target/release/libfluxtrade_core.so ]; then
             cp rust-data-service/target/release/libfluxtrade_core.so python-strategy/src/fluxtrade_core.so
           else
-            echo "::warning::Rust library not found, skipping integration tests"
-            exit 0
+            echo "::error::Rust library not found, cannot run integration tests"
+            exit 1
           fi
 
       - name: Install uv
