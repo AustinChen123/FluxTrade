@@ -14,7 +14,7 @@ from src.strategies.base import BaseStrategy
 from src.core.risk_manager import RiskManager, AccountService
 from src.core.execution import ExecutionEngine
 from src.core.clock import Clock
-from src.core.interfaces import IOrderRepository
+from src.core.interfaces import IExchangeAdapter, IOrderRepository
 from src.core.strategy_loader import StrategyLoader
 from src.core.data_provider import check_data_availability
 from src.core.db import SessionLocal
@@ -35,7 +35,7 @@ class StrategyEngine:
         order_repository: Optional[IOrderRepository] = None,
         account_service: Optional[AccountService] = None,
         adapter_config: Optional[Dict] = None,
-        adapter=None,
+        adapter: Optional[IExchangeAdapter] = None,
         journal: Optional[StrategyJournal] = None,
     ):
         self.db = db_session
@@ -57,8 +57,8 @@ class StrategyEngine:
                 adapter = create_adapter(adapter_config)
                 logger.info("StrategyEngine: Using %s", type(adapter).__name__)
             except Exception as e:
-                logger.error("Failed to init adapter: %s. Falling back to simulated.", e)
-                adapter = create_adapter({"mode": "simulated"})
+                logger.critical("Failed to init adapter: %s. NOT falling back silently.", e)
+                raise
         else:
             logger.info("StrategyEngine: Using provided adapter %s", type(adapter).__name__)
 

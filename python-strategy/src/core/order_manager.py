@@ -12,6 +12,9 @@ from src.core.redis_factory import create_redis_client
 
 logger = logging.getLogger(__name__)
 
+_VALID_SIDES = {"buy", "sell"}
+_VALID_ORDER_TYPES = {"market", "limit", "stop_loss", "take_profit", "trailing_stop"}
+
 class OrderManager:
     def __init__(self, repo: IOrderRepository, clock: Clock, is_backtest: Optional[bool] = None):
         self.repo = repo
@@ -47,6 +50,10 @@ class OrderManager:
         price: Optional[Decimal] = None,
         trigger_price: Optional[Decimal] = None,
     ) -> Order:
+        if side.lower() not in _VALID_SIDES:
+            raise ValueError(f"Invalid order side: {side!r}. Must be one of {_VALID_SIDES}")
+        if order_type.lower() not in _VALID_ORDER_TYPES:
+            raise ValueError(f"Invalid order type: {order_type!r}. Must be one of {_VALID_ORDER_TYPES}")
         exchange_id = signal.product_id.split(':')[0]
         order_id = str(uuid.uuid4())
 

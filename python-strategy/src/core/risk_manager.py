@@ -16,6 +16,10 @@ class AccountService:
             logger.warning("AccountService: Redis connection failed: %s", e)
             self.redis = None
 
+    def close(self):
+        if self.redis:
+            self.redis.close()
+
     def get_balance(self) -> Decimal:
         if not self.redis:
             return Decimal("0")

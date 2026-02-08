@@ -62,7 +62,7 @@ class DataConsumer:
                                e, backoff, attempts, MAX_RETRIES)
                 time.sleep(backoff)
                 backoff = min(backoff * 2, MAX_BACKOFF)
-            except Exception as e:
+            except (ConnectionError, OSError, redis.exceptions.RedisError) as e:
                 attempts += 1
                 if attempts > MAX_RETRIES:
                     logger.error("Max reconnection attempts (%d) exceeded. Giving up.", MAX_RETRIES)
