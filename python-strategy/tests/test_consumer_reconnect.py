@@ -158,15 +158,15 @@ class TestReconnectionBackoff:
         # Should exit without error
         assert consumer.running is False
 
-    def test_general_exception_also_retries(self, consumer):
-        """Non-ConnectionError exceptions should also trigger backoff retry."""
+    def test_os_error_also_retries(self, consumer):
+        """OSError (network-level) should also trigger backoff retry."""
         call_count = 0
 
         def fail_then_stop(*args, **kwargs):
             nonlocal call_count
             call_count += 1
             if call_count == 1:
-                raise RuntimeError("unexpected")
+                raise OSError("network unreachable")
             consumer.running = False
 
         consumer._ensure_consumer_groups = MagicMock()
@@ -176,3 +176,11 @@ class TestReconnectionBackoff:
             consumer.start()
 
         assert call_count == 2
+
+    def test_unexpected_exception_propagates(self, consumer):
+        """Uncaught exception types (e.g. RuntimeError) should propagate immediately."""
+        consumer._ensure_consumer_groups = MagicMock()
+        consumer._consume_loop = MagicMock(side_effect=RuntimeError("unexpected"))
+
+        with pytest.raises(RuntimeError, match="unexpected"):
+            consumer.start()

@@ -1,6 +1,5 @@
 """Tests for the Prometheus metrics module."""
 
-import pytest
 from prometheus_client import Counter, Gauge, Histogram
 
 from src.core.metrics import (

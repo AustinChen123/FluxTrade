@@ -92,21 +92,19 @@ class TestEngineInit:
 
             mock_create.assert_called_once_with(cfg)
 
-    def test_adapter_create_failure_falls_back(self, mock_db_session, mock_clock):
-        """If create_adapter fails, should fallback to simulated."""
+    def test_adapter_create_failure_raises(self, mock_db_session, mock_clock):
+        """If create_adapter fails, should log critical and re-raise."""
         with patch("src.core.engine.create_redis_client") as mock_factory, \
              patch("src.core.engine.create_adapter") as mock_create:
             mock_factory.return_value = MagicMock()
-            mock_create.side_effect = [RuntimeError("boom"), MagicMock()]
+            mock_create.side_effect = RuntimeError("boom")
 
-            StrategyEngine(
-                db_session=mock_db_session,
-                clock=mock_clock,
-                adapter_config={"mode": "live"},
-            )
-
-            assert mock_create.call_count == 2
-            mock_create.assert_called_with({"mode": "simulated"})
+            with pytest.raises(RuntimeError, match="boom"):
+                StrategyEngine(
+                    db_session=mock_db_session,
+                    clock=mock_clock,
+                    adapter_config={"mode": "live"},
+                )
 
     def test_provided_adapter_used_directly(self, mock_db_session, mock_clock):
         """Pre-created adapter should be used without calling create_adapter."""

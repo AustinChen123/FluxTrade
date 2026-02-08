@@ -512,3 +512,18 @@ class TestAccountService:
             service = AccountService()
 
         assert service.get_position("strat", "BINANCE:BTCUSDT-PERP") is None
+
+    def test_close_with_redis(self):
+        """close() should close Redis connection."""
+        mock_redis = MagicMock()
+        mock_redis.ping.return_value = True
+        with patch("src.core.risk_manager.create_redis_client", return_value=mock_redis):
+            service = AccountService()
+        service.close()
+        mock_redis.close.assert_called_once()
+
+    def test_close_without_redis(self):
+        """close() should not raise when redis is None."""
+        with patch("src.core.risk_manager.create_redis_client", side_effect=Exception("fail")):
+            service = AccountService()
+        service.close()  # Should not raise

@@ -210,3 +210,84 @@ class TestMarketDataProcessing:
         candle = candlestick_factory()
         # Should not raise
         execution_engine.process_market_data(candle)
+
+
+class TestConditionalOrderErrorHandling:
+    """Tests for SL/TP/Trailing Stop order placement error paths."""
+
+    def test_sl_order_failure_logs_error(
+        self, execution_engine, signal_factory, mock_exchange_adapter, caplog
+    ):
+        """SL order placement failure should log error but not fail main order."""
+        mock_exchange_adapter.set_fail_on_order_types({"stop_loss"})
+
+        signal = signal_factory(
+            price=Decimal("42000"),
+            stop_loss=Decimal("41000"),
+        )
+        order_id = execution_engine.execute_signal(signal)
+
+        # Main order should succeed
+        assert order_id is not None
+        # Entry order placed, SL order failed
+        assert len(mock_exchange_adapter.open_orders) == 1
+        assert "Failed to place SL order" in caplog.text
+
+    def test_tp_order_failure_logs_error(
+        self, execution_engine, signal_factory, mock_exchange_adapter, caplog
+    ):
+        """TP order placement failure should log error but not fail main order."""
+        mock_exchange_adapter.set_fail_on_order_types({"take_profit"})
+
+        signal = signal_factory(
+            price=Decimal("42000"),
+            take_profit=Decimal("45000"),
+        )
+        order_id = execution_engine.execute_signal(signal)
+
+        # Main order should succeed
+        assert order_id is not None
+        # Entry order placed, TP order failed
+        assert len(mock_exchange_adapter.open_orders) == 1
+        assert "Failed to place TP order" in caplog.text
+
+    def test_trailing_stop_failure_logs_error(
+        self, execution_engine, signal_factory, mock_exchange_adapter, caplog
+    ):
+        """Trailing stop order placement failure should log error."""
+        mock_exchange_adapter.set_fail_on_order_types({"trailing_stop"})
+
+        signal = signal_factory(
+            price=Decimal("42000"),
+            stop_loss=Decimal("41000"),
+            trailing_distance=Decimal("500"),
+        )
+        order_id = execution_engine.execute_signal(signal)
+
+        # Main order should succeed
+        assert order_id is not None
+        assert "Failed to place trailing stop order" in caplog.text
+
+    def test_all_conditional_orders_fail_main_succeeds(
+        self, execution_engine, signal_factory, mock_exchange_adapter, caplog
+    ):
+        """All conditional orders can fail while main order succeeds."""
+        mock_exchange_adapter.set_fail_on_order_types(
+            {"stop_loss", "take_profit", "trailing_stop"}
+        )
+
+        signal = signal_factory(
+            price=Decimal("42000"),
+            stop_loss=Decimal("41000"),
+            take_profit=Decimal("45000"),
+            trailing_distance=Decimal("500"),
+        )
+        order_id = execution_engine.execute_signal(signal)
+
+        # Main order should still succeed
+        assert order_id is not None
+        assert len(mock_exchange_adapter.open_orders) == 1
+        # All conditional order errors logged
+        assert "Failed to place SL order" in caplog.text
+        assert "Failed to place TP order" in caplog.text
+        assert "Failed to place trailing stop order" in caplog.text

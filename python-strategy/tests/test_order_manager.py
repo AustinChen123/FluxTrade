@@ -235,6 +235,34 @@ class TestPositionUpdates:
         assert pos is None
 
 
+class TestOrderValidation:
+    """Tests for order input validation (M6 fix)."""
+
+    def test_invalid_side_raises(self, mock_order_repo, mock_clock, signal_factory):
+        order_manager = OrderManager(mock_order_repo, mock_clock)
+        signal = signal_factory()
+        with pytest.raises(ValueError, match="Invalid order side"):
+            order_manager.create_order(signal, "foobar", "market", Decimal("0.1"))
+
+    def test_invalid_order_type_raises(self, mock_order_repo, mock_clock, signal_factory):
+        order_manager = OrderManager(mock_order_repo, mock_clock)
+        signal = signal_factory()
+        with pytest.raises(ValueError, match="Invalid order type"):
+            order_manager.create_order(signal, "buy", "invalid_type", Decimal("0.1"))
+
+    def test_valid_stop_loss_type_accepted(self, mock_order_repo, mock_clock, signal_factory):
+        order_manager = OrderManager(mock_order_repo, mock_clock)
+        signal = signal_factory()
+        order = order_manager.create_order(signal, "sell", "stop_loss", Decimal("0.1"), trigger_price=Decimal("40000"))
+        assert order.type == "stop_loss"
+
+    def test_case_insensitive_validation(self, mock_order_repo, mock_clock, signal_factory):
+        order_manager = OrderManager(mock_order_repo, mock_clock)
+        signal = signal_factory()
+        order = order_manager.create_order(signal, "BUY", "MARKET", Decimal("0.1"))
+        assert order is not None
+
+
 class TestOrderManagerEdgeCases:
     """Edge case tests for OrderManager."""
 

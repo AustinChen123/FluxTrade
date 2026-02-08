@@ -161,11 +161,17 @@ class MockExchangeAdapter(IExchangeAdapter):
         self._next_fill_price: Optional[Decimal] = None
         self._should_fail: bool = False
         self._fail_reason: str = ""
+        self._fail_on_order_types: set = set()
 
     def place_order(self, order: Order) -> str:
         if self._should_fail:
             from src.core.interfaces import ExchangeError
             raise ExchangeError(self._fail_reason)
+
+        # Fail on specific order types (for testing SL/TP/Trailing error paths)
+        if order.type in self._fail_on_order_types:
+            from src.core.interfaces import ExchangeError
+            raise ExchangeError(f"Mock failure for order type: {order.type}")
 
         exchange_id = f"MOCK-{uuid.uuid4().hex[:8]}"
         order.exchange_order_id = exchange_id
@@ -216,6 +222,10 @@ class MockExchangeAdapter(IExchangeAdapter):
 
     def set_position(self, product_id: str, position: Position):
         self.positions[product_id] = position
+
+    def set_fail_on_order_types(self, order_types: set):
+        """Set order types that should fail when placed (e.g., {'stop_loss', 'take_profit'})."""
+        self._fail_on_order_types = order_types
 
 
 class RealisticMockAdapter(MockExchangeAdapter):
