@@ -1,5 +1,5 @@
 use anyhow::{bail, Result};
-use futures_util::StreamExt;
+use futures_util::{SinkExt, StreamExt};
 use std::time::Duration;
 use tokio::time::sleep;
 use tokio_tungstenite::{connect_async, tungstenite::protocol::Message};
@@ -113,14 +113,18 @@ impl WebSocketManager {
         let (ws_stream, res) = on_connect(ws_stream).await?;
         res?;
 
-        let (_write, mut read) = ws_stream.split();
+        let (mut write, mut read) = ws_stream.split();
 
         while let Some(message) = read.next().await {
             let message = message?;
 
             match message {
                 Message::Ping(payload) => {
-                    on_message(Message::Pong(payload)).await?;
+                    // Send Pong via the write half (proper WebSocket protocol)
+                    if let Err(e) = write.send(Message::Pong(payload)).await {
+                        warn!("Failed to send Pong: {}", e);
+                        return Err(e.into());
+                    }
                 }
                 Message::Close(_) => {
                     return Ok(());
@@ -205,5 +209,73 @@ mod tests {
             .unwrap_err()
             .to_string()
             .contains("Max retries reached"));
+    }
+
+    #[tokio::test]
+    async fn test_websocket_ping_pong_via_write_half() {
+        // Start a mock server that sends a Ping and expects a Pong
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let url = format!("ws://{}", addr);
+
+        let (pong_tx, mut pong_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(1);
+
+        tokio::spawn(async move {
+            if let Ok((stream, _)) = listener.accept().await {
+                if let Ok(ws_stream) = accept_async(stream).await {
+                    let (mut write, mut read) = ws_stream.split();
+                    // Send a Ping
+                    write
+                        .send(Message::Ping(vec![1, 2, 3].into()))
+                        .await
+                        .unwrap();
+                    // Wait for Pong response
+                    while let Some(Ok(msg)) = read.next().await {
+                        if let Message::Pong(payload) = msg {
+                            pong_tx.send(payload.to_vec()).await.unwrap();
+                            break;
+                        }
+                    }
+                    // Send a text message after ping/pong
+                    write.send(Message::Text("done".into())).await.unwrap();
+                    sleep(Duration::from_millis(100)).await;
+                }
+            }
+        });
+
+        let manager = WebSocketManager::new(&url);
+        let (msg_tx, mut msg_rx) = tokio::sync::mpsc::channel::<String>(1);
+
+        let handle = tokio::spawn(async move {
+            manager
+                .connect_with_retry(
+                    |ws| async move { Ok((ws, Ok(()))) },
+                    |msg| {
+                        let msg_tx = msg_tx.clone();
+                        async move {
+                            if let Message::Text(text) = msg {
+                                msg_tx.send(text.to_string()).await.ok();
+                            }
+                            Ok(())
+                        }
+                    },
+                )
+                .await
+        });
+
+        // Verify the server received the Pong with correct payload
+        let pong_payload = tokio::time::timeout(Duration::from_secs(2), pong_rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(pong_payload, vec![1, 2, 3]);
+
+        // Verify the client received the text message after ping/pong
+        let msg = tokio::time::timeout(Duration::from_secs(2), msg_rx.recv())
+            .await
+            .unwrap();
+        assert_eq!(msg.unwrap(), "done");
+
+        handle.abort();
     }
 }
