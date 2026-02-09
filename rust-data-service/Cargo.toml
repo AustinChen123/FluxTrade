@@ -1,5 +1,6 @@
 [package]
 name = "rust-data-service"
+# Keep in sync with /VERSION (use tools/bump_version.sh)
 version = "0.1.0"
 edition = "2021"
 
