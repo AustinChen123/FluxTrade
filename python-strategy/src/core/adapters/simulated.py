@@ -1,3 +1,4 @@
+import inspect
 import uuid
 from decimal import Decimal
 from typing import Optional, List, Dict
@@ -11,6 +12,9 @@ from fluxtrade_core import (
     Order as RustOrder,
     Candlestick as RustCandlestick,
 )
+
+# Detect if Rust engine supports strategy_id parameter
+_RUST_HAS_STRATEGY_ID = "strategy_id" in str(inspect.signature(RustOrder))
 
 
 class SimulatedAdapter(IExchangeAdapter):
@@ -34,6 +38,7 @@ class SimulatedAdapter(IExchangeAdapter):
         )
         # Map order ID → ORM Order so we can return it in fills
         self._order_map: Dict[str, Order] = {}
+        self._rust_supports_strategy_id = _RUST_HAS_STRATEGY_ID
 
     # ── IExchangeAdapter interface ───────────────────────────────
 
@@ -61,13 +66,34 @@ class SimulatedAdapter(IExchangeAdapter):
     def get_balance(self, asset: str = "USDT") -> Decimal:
         return Decimal(self._engine.balance)
 
-    def get_position(self, product_id: str) -> Optional[Position]:
+    def get_position(self, product_id: str, strategy_id: Optional[str] = None) -> Optional[Position]:
         rust_positions = self._engine.positions
-        rust_pos = rust_positions.get(product_id)
+
+        rust_pos = None
+        if strategy_id:
+            # Composite key: "strategy_id:product_id" (Rust engine uses this)
+            composite_key = f"{strategy_id}:{product_id}"
+            rust_pos = rust_positions.get(composite_key)
+            # Fallback to product_id-only key for backward compat with older Rust engine
+            if rust_pos is None:
+                rust_pos = rust_positions.get(product_id)
+        else:
+            # No strategy_id specified: try product_id-only key first, then
+            # scan composite keys ending with the product_id (return first match)
+            rust_pos = rust_positions.get(product_id)
+            if rust_pos is None:
+                suffix = f":{product_id}"
+                for key, pos in rust_positions.items():
+                    if key.endswith(suffix):
+                        rust_pos = pos
+                        break
+
         if not rust_pos or rust_pos.side == "FLAT" or Decimal(rust_pos.quantity) <= 0:
             return None
+
+        resolved_strategy_id = strategy_id or getattr(rust_pos, "strategy_id", "") or ""
         return Position(
-            strategy_id="",
+            strategy_id=resolved_strategy_id,
             product_id=product_id,
             side=PositionSide(rust_pos.side),
             quantity=Decimal(rust_pos.quantity),
@@ -150,7 +176,7 @@ class SimulatedAdapter(IExchangeAdapter):
         if hasattr(order, "_linked_order_id") and order._linked_order_id is not None:
             linked_order_id = str(order._linked_order_id)
 
-        return RustOrder(
+        kwargs: dict = dict(
             id=str(order.id),
             product_id=order.product_id,
             side=side,
@@ -162,6 +188,11 @@ class SimulatedAdapter(IExchangeAdapter):
             trailing_distance=trailing_distance,
             linked_order_id=linked_order_id,
         )
+        # Pass strategy_id if the Rust engine supports it
+        if self._rust_supports_strategy_id:
+            kwargs["strategy_id"] = order.strategy_id or ""
+
+        return RustOrder(**kwargs)
 
     @staticmethod
     def _to_rust_candle(candle: Candlestick) -> RustCandlestick:

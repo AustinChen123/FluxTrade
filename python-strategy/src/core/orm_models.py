@@ -122,6 +122,7 @@ class BacktestTradeLog(Base):
     __tablename__ = 'backtest_trade_log'
     id = Column(String, primary_key=True)
     session_id = Column(BigInteger, ForeignKey('backtest_result_summary.id'), nullable=False)
+    strategy_id = Column(String, nullable=True)
     order_id = Column(String, nullable=False)
     exchange_trade_id = Column(String, nullable=True)
     product_id = Column(String, ForeignKey('product.id'), nullable=False)

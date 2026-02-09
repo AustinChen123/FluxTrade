@@ -1,8 +1,11 @@
 import logging
 from decimal import Decimal
-from typing import Optional
+from typing import TYPE_CHECKING, Optional
 from src.core.models import Signal, SignalType, Position, PositionSide
 from src.core.redis_factory import create_redis_client
+
+if TYPE_CHECKING:
+    from src.core.capital_allocator import CapitalAllocator
 
 logger = logging.getLogger(__name__)
 
@@ -68,9 +71,16 @@ class AccountService:
         )
 
 class RiskManager:
-    def __init__(self, account_service: AccountService):
+    def __init__(
+        self,
+        account_service: AccountService,
+        capital_allocator: Optional["CapitalAllocator"] = None,
+        max_exposure_per_strategy: Optional[Decimal] = None,
+    ):
         self.account_service = account_service
         self.max_exposure_per_product = Decimal("50000.0")
+        self.capital_allocator = capital_allocator
+        self.max_exposure_per_strategy = max_exposure_per_strategy or self.max_exposure_per_product
 
     def check_risk(self, signal: Signal, current_price: Optional[Decimal] = None) -> tuple[bool, str]:
         """
@@ -85,24 +95,45 @@ class RiskManager:
         if signal.type == SignalType.NO_SIGNAL:
             return True, "NO_SIGNAL"
 
-        # Rule 1: Zero Balance Protection
         is_entry = signal.type in [SignalType.LONG, SignalType.SHORT]
-        balance = self.account_service.get_balance()
 
-        if is_entry and balance <= 0:
-            msg = f"REJECT: Account balance is {balance} (<= 0)"
-            logger.warning("RISK_REJECTED: %s signal_type=%s", msg, signal.type)
-            return False, msg
+        # Rule 1: Balance / Capital check
+        if self.capital_allocator is not None:
+            # Per-strategy capital check
+            available = self.capital_allocator.get_available(signal.strategy_id)
+            if is_entry and available <= Decimal("0"):
+                msg = f"REJECT: No available capital for strategy {signal.strategy_id} (available={available})"
+                logger.warning("RISK_REJECTED: %s signal_type=%s", msg, signal.type)
+                return False, msg
+        else:
+            # Global balance check (backward-compatible)
+            balance = self.account_service.get_balance()
+            if is_entry and balance <= 0:
+                msg = f"REJECT: Account balance is {balance} (<= 0)"
+                logger.warning("RISK_REJECTED: %s signal_type=%s", msg, signal.type)
+                return False, msg
 
         # Rule 2: Max Exposure Check (uses current market price)
         position = self.account_service.get_position(signal.strategy_id, signal.product_id)
         if position:
             price_for_exposure = current_price if current_price is not None else position.entry_price
             current_exposure = position.quantity * price_for_exposure
+
+            # Per-product exposure limit (always enforced)
             if is_entry and current_exposure >= self.max_exposure_per_product:
                  msg = f"REJECT: Max exposure reached ({current_exposure} >= {self.max_exposure_per_product})"
                  logger.warning("RISK_REJECTED: %s", msg)
                  return False, msg
+
+            # Per-strategy exposure limit (only when capital_allocator present)
+            if self.capital_allocator is not None and is_entry:
+                if current_exposure >= self.max_exposure_per_strategy:
+                    msg = (
+                        f"REJECT: Strategy {signal.strategy_id} max exposure reached "
+                        f"({current_exposure} >= {self.max_exposure_per_strategy})"
+                    )
+                    logger.warning("RISK_REJECTED: %s", msg)
+                    return False, msg
 
         return True, "PASS"
 

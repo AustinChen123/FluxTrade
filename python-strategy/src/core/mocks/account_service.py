@@ -39,9 +39,13 @@ class BacktestAccountService(AccountService):
 
     def get_position(self, strategy_id: str, product_id: str) -> Optional[Position]:
         if self.adapter:
-            pos = self.adapter.get_position(product_id)
-            if pos:
-                pos.strategy_id = strategy_id
+            try:
+                pos = self.adapter.get_position(product_id, strategy_id=strategy_id)
+            except TypeError:
+                # Adapter doesn't support strategy_id kwarg (e.g., live adapters)
+                pos = self.adapter.get_position(product_id)
+                if pos:
+                    pos.strategy_id = strategy_id
             return pos
         if self.repo:
             return self.repo.get_position(strategy_id, product_id)

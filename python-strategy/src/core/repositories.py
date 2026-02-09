@@ -85,17 +85,22 @@ class BacktestOrderRepository(IOrderRepository):
         self.db = db_session
         self.session_id = session_id
         self.balance = initial_balance  # kept for backward compatibility
+        self._order_strategy_map: dict[str, str] = {}
 
     def add_order(self, order: Order) -> None:
-        pass
+        # Track order → strategy_id for BacktestTradeLog
+        if order.strategy_id:
+            self._order_strategy_map[order.id] = order.strategy_id
 
     def update_order(self, order: Order) -> None:
         pass
 
     def add_trade(self, trade: Trade) -> None:
+        strategy_id = self._order_strategy_map.get(trade.order_id)
         bt_log = BacktestTradeLog(
             id=trade.id,
             session_id=self.session_id,
+            strategy_id=strategy_id,
             order_id=trade.order_id,
             exchange_trade_id=trade.exchange_trade_id,
             product_id=trade.product_id,

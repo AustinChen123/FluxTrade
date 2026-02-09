@@ -527,3 +527,112 @@ class TestAccountService:
         with patch("src.core.risk_manager.create_redis_client", side_effect=Exception("fail")):
             service = AccountService()
         service.close()  # Should not raise
+
+
+class TestRiskManagerWithCapitalAllocator:
+    """Tests for RiskManager with per-strategy CapitalAllocator."""
+
+    def test_reject_entry_when_no_strategy_capital(
+        self, mock_account_service, signal_factory
+    ):
+        """Entry should be rejected when strategy has no allocated capital."""
+        from src.core.capital_allocator import CapitalAllocator
+
+        allocator = CapitalAllocator(Decimal("100000"))
+        # No allocation for test_strategy
+        risk_manager = RiskManager(mock_account_service, capital_allocator=allocator)
+
+        signal = signal_factory(signal_type=SignalType.LONG)
+        is_allowed, reason = risk_manager.check_risk(signal)
+
+        assert is_allowed is False
+        assert "capital" in reason.lower()
+
+    def test_allow_entry_when_strategy_has_capital(
+        self, mock_account_service, signal_factory
+    ):
+        """Entry should be allowed when strategy has allocated capital."""
+        from src.core.capital_allocator import CapitalAllocator
+
+        allocator = CapitalAllocator(Decimal("100000"))
+        allocator.allocate("test_strategy", Decimal("50000"))
+        risk_manager = RiskManager(mock_account_service, capital_allocator=allocator)
+
+        signal = signal_factory(signal_type=SignalType.LONG)
+        is_allowed, reason = risk_manager.check_risk(signal)
+
+        assert is_allowed is True
+
+    def test_reject_entry_when_strategy_capital_exhausted(
+        self, mock_account_service, signal_factory
+    ):
+        """Entry should be rejected when all strategy capital is in use."""
+        from src.core.capital_allocator import CapitalAllocator
+
+        allocator = CapitalAllocator(Decimal("100000"))
+        allocator.allocate("test_strategy", Decimal("50000"))
+        allocator.record_usage("test_strategy", Decimal("50000"))
+        risk_manager = RiskManager(mock_account_service, capital_allocator=allocator)
+
+        signal = signal_factory(signal_type=SignalType.LONG)
+        is_allowed, reason = risk_manager.check_risk(signal)
+
+        assert is_allowed is False
+        assert "capital" in reason.lower()
+
+    def test_allow_exit_even_without_capital(
+        self, mock_account_service, signal_factory
+    ):
+        """Exit signals should always pass even without allocated capital."""
+        from src.core.capital_allocator import CapitalAllocator
+
+        allocator = CapitalAllocator(Decimal("100000"))
+        risk_manager = RiskManager(mock_account_service, capital_allocator=allocator)
+
+        signal = signal_factory(signal_type=SignalType.EXIT_LONG)
+        is_allowed, reason = risk_manager.check_risk(signal)
+
+        assert is_allowed is True
+
+    def test_per_strategy_exposure_limit(
+        self, mock_account_service, signal_factory, position_factory
+    ):
+        """Per-strategy exposure limit should reject when exceeded."""
+        from src.core.capital_allocator import CapitalAllocator
+
+        allocator = CapitalAllocator(Decimal("100000"))
+        allocator.allocate("test_strategy", Decimal("50000"))
+
+        # Set position with exposure below per-product limit (50000)
+        # but above per-strategy limit (20000)
+        position = position_factory(
+            quantity=Decimal("0.5"),
+            entry_price=Decimal("45000")
+        )
+        mock_account_service.set_position(position)
+
+        risk_manager = RiskManager(
+            mock_account_service,
+            capital_allocator=allocator,
+            max_exposure_per_strategy=Decimal("20000"),
+        )
+
+        signal = signal_factory(signal_type=SignalType.LONG)
+        # 0.5 * 45000 = 22500 < 50000 (per-product OK) but >= 20000 (per-strategy REJECT)
+        is_allowed, reason = risk_manager.check_risk(signal, current_price=Decimal("45000"))
+
+        assert is_allowed is False
+        assert "strategy" in reason.lower()
+
+    def test_backward_compat_no_allocator(
+        self, mock_account_service, signal_factory
+    ):
+        """Without CapitalAllocator, RiskManager should behave exactly as before."""
+        mock_account_service.set_balance(Decimal("10000"))
+        risk_manager = RiskManager(mock_account_service)
+
+        signal = signal_factory(signal_type=SignalType.LONG)
+        is_allowed, reason = risk_manager.check_risk(signal)
+
+        assert is_allowed is True
+        assert reason == "PASS"

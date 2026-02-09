@@ -326,10 +326,18 @@ class BacktestRunner:
                 initial_balance=self.initial_balance,
             )
 
+            # Per-strategy metrics
+            per_strategy = self._compute_per_strategy_metrics(trades)
+
             # Serialize metrics (exclude non-serializable closed_trades)
             metrics_for_json = {
                 k: v for k, v in metrics.items() if k != "closed_trades"
             }
+            if per_strategy:
+                metrics_for_json["per_strategy"] = {
+                    sid: {k: v for k, v in m.items() if k != "closed_trades"}
+                    for sid, m in per_strategy.items()
+                }
             summary.metrics_json = json.dumps(metrics_for_json, default=str)
 
             self.db_session.commit()
@@ -357,6 +365,7 @@ class BacktestRunner:
                 "journal": journal.to_dicts(),
                 "journal_count": len(journal),
                 "report_dir": report_dir,
+                "per_strategy": per_strategy,
             }
 
             self.db_session.close()
@@ -364,3 +373,24 @@ class BacktestRunner:
                 self.data_session.close()
 
         return result
+
+    def _compute_per_strategy_metrics(self, trades: list) -> Dict[str, Dict]:
+        """Compute metrics per strategy by filtering trades by strategy_id."""
+        strategy_ids = set()
+        for t in trades:
+            sid = getattr(t, "strategy_id", None)
+            if sid:
+                strategy_ids.add(sid)
+
+        if len(strategy_ids) <= 1:
+            return {}
+
+        per_strategy: Dict[str, Dict] = {}
+        for sid in strategy_ids:
+            strategy_trades = [t for t in trades if getattr(t, "strategy_id", None) == sid]
+            if strategy_trades:
+                per_strategy[sid] = calculate_metrics(
+                    strategy_trades,
+                    initial_balance=self.initial_balance,
+                )
+        return per_strategy
