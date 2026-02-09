@@ -15,7 +15,7 @@ from unittest.mock import MagicMock
 
 # Models
 from src.core.models import (
-    Signal, SignalType, Candlestick, Position, Trade
+    Signal, SignalType, Candlestick, Position, PositionSide, Trade
 )
 from src.core.orm_models import Order, Trade as ORMTrade, Position as ORMPosition
 
@@ -612,7 +612,7 @@ def sample_long_position():
     return Position(
         strategy_id=DEFAULT_STRATEGY_ID,
         product_id=DEFAULT_PRODUCT_ID,
-        side="LONG",
+        side=PositionSide.LONG,
         quantity=Decimal("0.5"),
         entry_price=Decimal("42000.00"),
         unrealized_pnl=Decimal("0")
@@ -625,7 +625,7 @@ def sample_short_position():
     return Position(
         strategy_id=DEFAULT_STRATEGY_ID,
         product_id=DEFAULT_PRODUCT_ID,
-        side="SHORT",
+        side=PositionSide.SHORT,
         quantity=Decimal("0.5"),
         entry_price=Decimal("42000.00"),
         unrealized_pnl=Decimal("0")
@@ -638,7 +638,7 @@ def position_factory():
     def _create(
         strategy_id: str = DEFAULT_STRATEGY_ID,
         product_id: str = DEFAULT_PRODUCT_ID,
-        side: str = "LONG",
+        side: PositionSide = PositionSide.LONG,
         quantity: Decimal = Decimal("0.5"),
         entry_price: Decimal = Decimal("42000.00"),
         unrealized_pnl: Decimal = Decimal("0")

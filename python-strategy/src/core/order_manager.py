@@ -5,14 +5,14 @@ import redis
 from decimal import Decimal
 from typing import Optional
 from src.core.orm_models import Order, Trade
-from src.core.models import Signal
+from src.core.models import Signal, OrderSide
 from src.core.clock import Clock
 from src.core.interfaces import IOrderRepository
 from src.core.redis_factory import create_redis_client
 
 logger = logging.getLogger(__name__)
 
-_VALID_SIDES = {"buy", "sell"}
+_VALID_SIDES = {OrderSide.BUY, OrderSide.SELL, "buy", "sell"}
 _VALID_ORDER_TYPES = {"market", "limit", "stop_loss", "take_profit", "trailing_stop"}
 
 class OrderManager:
@@ -44,7 +44,7 @@ class OrderManager:
     def create_order(
         self,
         signal: Signal,
-        side: str,
+        side: OrderSide,
         order_type: str,
         quantity: Decimal,
         price: Optional[Decimal] = None,

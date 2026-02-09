@@ -3,7 +3,7 @@ from decimal import Decimal
 from typing import List, Dict
 import pandas as pd
 import numpy as np
-from src.core.models import Trade
+from src.core.models import Trade, PositionSide
 
 
 @dataclass(slots=True)
@@ -14,7 +14,7 @@ class ClosedTrade:
     exit_time: int  # unix ms
     entry_price: Decimal
     exit_price: Decimal
-    side: str  # "LONG" or "SHORT"
+    side: PositionSide  # "LONG" or "SHORT"
     quantity: Decimal
     pnl: Decimal
 
@@ -66,10 +66,10 @@ def _build_closed_trades(trade_history: List[Trade]) -> tuple[
 
             if net_qty > 0:
                 pnl = (price - avg_entry_price) * qty_closing
-                trade_side = "LONG"
+                trade_side = PositionSide.LONG
             else:
                 pnl = (avg_entry_price - price) * qty_closing
-                trade_side = "SHORT"
+                trade_side = PositionSide.SHORT
 
             total_pnl += pnl
             trade_pnls.append(float(pnl))

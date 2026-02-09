@@ -3,7 +3,7 @@ from decimal import Decimal
 from typing import Optional, List, Dict
 from src.core.interfaces.exchange import IExchangeAdapter
 from src.core.orm_models import Order
-from src.core.models import Position, Candlestick
+from src.core.models import Position, Candlestick, PositionSide
 
 # Rust PyO3 matching engine
 from fluxtrade_core import (
@@ -69,7 +69,7 @@ class SimulatedAdapter(IExchangeAdapter):
         return Position(
             strategy_id="",
             product_id=product_id,
-            side=rust_pos.side,
+            side=PositionSide(rust_pos.side),
             quantity=Decimal(rust_pos.quantity),
             entry_price=Decimal(rust_pos.entry_price),
             unrealized_pnl=Decimal(rust_pos.unrealized_pnl),
@@ -113,12 +113,12 @@ class SimulatedAdapter(IExchangeAdapter):
 
     @staticmethod
     def _side_to_rust(side: str) -> str:
-        """Convert buy/sell to LONG/SHORT for the Rust engine."""
+        """Convert buy/sell (OrderSide) to LONG/SHORT (PositionSide) for the Rust engine."""
         s = side.lower()
         if s == "buy":
-            return "LONG"
+            return PositionSide.LONG
         if s == "sell":
-            return "SHORT"
+            return PositionSide.SHORT
         # Already LONG/SHORT
         return side.upper()
 
@@ -136,7 +136,7 @@ class SimulatedAdapter(IExchangeAdapter):
         # ORM: side="sell" means "sell to close long" → Rust side="LONG"
         # ORM: side="buy" means "buy to close short" → Rust side="SHORT"
         if order_type in ("STOP_LOSS", "TAKE_PROFIT", "TRAILING_STOP"):
-            side = "LONG" if side == "SHORT" else "SHORT"
+            side = PositionSide.LONG if side == PositionSide.SHORT else PositionSide.SHORT
 
         trigger_price = None
         if order.trigger_price is not None:

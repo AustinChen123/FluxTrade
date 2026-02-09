@@ -10,6 +10,7 @@ from src.core.backtest_runner import (
     DEFAULT_REPORT_CONFIG,
 )
 from src.core.analytics import ClosedTrade
+from src.core.models import PositionSide
 from src.core.journal import StrategyJournal
 
 
@@ -22,7 +23,7 @@ def _sample_closed_trades() -> list[ClosedTrade]:
             exit_time=2_000_000,
             entry_price=100.0,
             exit_price=110.0,
-            side="LONG",
+            side=PositionSide.LONG,
             quantity=0.5,
             pnl=5.0,
         ),
@@ -31,7 +32,7 @@ def _sample_closed_trades() -> list[ClosedTrade]:
             exit_time=4_000_000,
             entry_price=200.0,
             exit_price=190.0,
-            side="SHORT",
+            side=PositionSide.SHORT,
             quantity=0.3,
             pnl=3.0,
         ),

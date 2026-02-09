@@ -191,7 +191,7 @@ class DataConsumer:
                 return Trade(
                     id=data.get('trade_id', 'unknown'),
                     product_id=data.get('product_id', 'unknown'),
-                    side=data.get('side', 'BUY'),
+                    side=data.get('side', 'buy').lower(),
                     price=Decimal(data['price']),
                     quantity=Decimal(data['quantity']),
                     timestamp=int(data.get('timestamp', 0))

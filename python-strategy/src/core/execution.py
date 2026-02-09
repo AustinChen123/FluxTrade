@@ -3,7 +3,7 @@ import time as _time
 from decimal import Decimal
 from typing import Optional
 from sqlalchemy.orm import Session
-from src.core.models import Signal, SignalType, Candlestick
+from src.core.models import Signal, SignalType, Candlestick, OrderSide
 from src.core.order_manager import OrderManager
 from src.core.interfaces.exchange import IExchangeAdapter, ExchangeError
 from src.core.clock import Clock
@@ -125,7 +125,7 @@ class ExecutionEngine:
     def _place_conditional_orders(self, signal: Signal, entry_order, qty: Decimal):
         """Submit SL/TP/Trailing orders linked via OCO to each other."""
         # Closing side is opposite of entry
-        close_side = "sell" if entry_order.side.lower() == "buy" else "buy"
+        close_side = OrderSide.SELL if entry_order.side.lower() == "buy" else OrderSide.BUY
 
         sl_order = None
         tp_order = None
@@ -211,13 +211,13 @@ class ExecutionEngine:
             trade_id=str(order.id),
         )
 
-    def _determine_side(self, signal_type: SignalType) -> Optional[str]:
+    def _determine_side(self, signal_type: SignalType) -> Optional[OrderSide]:
         if signal_type == SignalType.LONG:
-            return "buy"
+            return OrderSide.BUY
         elif signal_type == SignalType.SHORT:
-            return "sell"
+            return OrderSide.SELL
         elif signal_type == SignalType.EXIT_LONG:
-            return "sell"
+            return OrderSide.SELL
         elif signal_type == SignalType.EXIT_SHORT:
-            return "buy"
+            return OrderSide.BUY
         return None

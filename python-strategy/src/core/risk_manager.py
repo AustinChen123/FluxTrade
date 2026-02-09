@@ -1,7 +1,7 @@
 import logging
 from decimal import Decimal
 from typing import Optional
-from src.core.models import Signal, SignalType, Position
+from src.core.models import Signal, SignalType, Position, PositionSide
 from src.core.redis_factory import create_redis_client
 
 logger = logging.getLogger(__name__)
@@ -46,10 +46,10 @@ class AccountService:
 
         # Determine Side & Abs Quantity
         if qty > 0:
-            side = "LONG"
+            side = PositionSide.LONG
             abs_qty = qty
         else:
-            side = "SHORT"
+            side = PositionSide.SHORT
             abs_qty = abs(qty)
 
         # Entry Price (tracked by Lua or external updater)

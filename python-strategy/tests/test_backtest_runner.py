@@ -19,6 +19,7 @@ from src.core.backtest_runner import (
     BacktestRunner,
 )
 from src.core.analytics import ClosedTrade
+from src.core.models import PositionSide
 from src.core.journal import StrategyJournal
 
 
@@ -31,7 +32,7 @@ def _make_closed_trade(**overrides) -> ClosedTrade:
     defaults = dict(
         entry_time=1704067200000,
         exit_time=1704067260000,
-        side="LONG",
+        side=PositionSide.LONG,
         entry_price=Decimal("42000.00"),
         exit_price=Decimal("42500.00"),
         quantity=Decimal("0.1"),

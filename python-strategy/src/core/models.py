@@ -6,6 +6,37 @@ import re
 
 PRODUCT_ID_REGEX = r"^[A-Z0-9]+:[A-Z0-9_]+-PERP$"
 
+class OrderSide(str, Enum):
+    BUY = "buy"
+    SELL = "sell"
+
+    @staticmethod
+    def from_position_side(ps: "PositionSide") -> "OrderSide":
+        """Convert a PositionSide to its corresponding OrderSide."""
+        if ps == PositionSide.LONG:
+            return OrderSide.BUY
+        return OrderSide.SELL
+
+    @staticmethod
+    def closing_side(ps: "PositionSide") -> "OrderSide":
+        """Return the OrderSide that closes a given PositionSide."""
+        if ps == PositionSide.LONG:
+            return OrderSide.SELL
+        return OrderSide.BUY
+
+
+class PositionSide(str, Enum):
+    LONG = "LONG"
+    SHORT = "SHORT"
+
+    @staticmethod
+    def from_order_side(os: "OrderSide") -> "PositionSide":
+        """Convert an OrderSide to its corresponding PositionSide."""
+        if os == OrderSide.BUY:
+            return PositionSide.LONG
+        return PositionSide.SHORT
+
+
 class SignalType(str, Enum):
     LONG = "LONG"
     SHORT = "SHORT"
@@ -42,7 +73,7 @@ class Trade(BaseFluxModel):
     product_id: str
     price: Decimal
     quantity: Decimal
-    side: str
+    side: OrderSide
     timestamp: int  # Unix timestamp in milliseconds
 
     @field_validator('product_id')
@@ -93,7 +124,7 @@ class Signal(BaseFluxModel):
 class Position(BaseFluxModel):
     strategy_id: str
     product_id: str
-    side: str  # "LONG" or "SHORT"
+    side: PositionSide  # "LONG" or "SHORT"
     quantity: Decimal
     entry_price: Decimal
     unrealized_pnl: Decimal

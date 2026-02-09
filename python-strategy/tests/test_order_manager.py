@@ -14,7 +14,7 @@ from decimal import Decimal
 from unittest.mock import patch, MagicMock
 
 from src.core.order_manager import OrderManager
-from src.core.models import SignalType
+from src.core.models import OrderSide, SignalType
 
 
 class TestOrderCreation:
@@ -27,13 +27,13 @@ class TestOrderCreation:
 
         order = order_manager.create_order(
             signal=signal,
-            side="buy",
+            side=OrderSide.BUY,
             order_type="market",
             quantity=Decimal("0.1")
         )
 
         assert order is not None
-        assert order.side == "buy"
+        assert order.side == OrderSide.BUY
         assert order.type == "market"
         assert order.quantity == Decimal("0.1")
         assert order.strategy_id == signal.strategy_id
@@ -47,7 +47,7 @@ class TestOrderCreation:
 
         order = order_manager.create_order(
             signal=signal,
-            side="buy",
+            side=OrderSide.BUY,
             order_type="limit",
             quantity=Decimal("0.1"),
             price=Decimal("42000")
@@ -63,20 +63,20 @@ class TestOrderCreation:
 
         order = order_manager.create_order(
             signal=signal,
-            side="sell",
+            side=OrderSide.SELL,
             order_type="market",
             quantity=Decimal("0.5")
         )
 
-        assert order.side == "sell"
+        assert order.side == OrderSide.SELL
 
     def test_order_has_unique_id(self, mock_order_repo, mock_clock, signal_factory):
         """Each order should have a unique ID."""
         order_manager = OrderManager(mock_order_repo, mock_clock)
         signal = signal_factory()
 
-        order1 = order_manager.create_order(signal, "buy", "market", Decimal("0.1"))
-        order2 = order_manager.create_order(signal, "buy", "market", Decimal("0.1"))
+        order1 = order_manager.create_order(signal, OrderSide.BUY, "market", Decimal("0.1"))
+        order2 = order_manager.create_order(signal, OrderSide.BUY, "market", Decimal("0.1"))
 
         assert order1.id != order2.id
 
@@ -85,7 +85,7 @@ class TestOrderCreation:
         order_manager = OrderManager(mock_order_repo, mock_clock)
         signal = signal_factory()
 
-        order = order_manager.create_order(signal, "buy", "market", Decimal("0.1"))
+        order = order_manager.create_order(signal, OrderSide.BUY, "market", Decimal("0.1"))
 
         assert order.id in mock_order_repo.orders
 
@@ -95,7 +95,7 @@ class TestOrderCreation:
         order_manager = OrderManager(mock_order_repo, mock_clock)
         signal = signal_factory()
 
-        order = order_manager.create_order(signal, "buy", "market", Decimal("0.1"))
+        order = order_manager.create_order(signal, OrderSide.BUY, "market", Decimal("0.1"))
 
         assert order.timestamp == 1704153600000  # milliseconds
 
@@ -104,7 +104,7 @@ class TestOrderCreation:
         order_manager = OrderManager(mock_order_repo, mock_clock)
         signal = signal_factory(product_id="BYBIT:ETHUSDT-PERP")
 
-        order = order_manager.create_order(signal, "buy", "market", Decimal("0.1"))
+        order = order_manager.create_order(signal, OrderSide.BUY, "market", Decimal("0.1"))
 
         assert order.exchange_id == "BYBIT"
 
@@ -119,7 +119,7 @@ class TestOrderStatusUpdates:
         backtest_repo = BacktestOrderRepository(mock_db_session, session_id=1)
         order_manager = OrderManager(backtest_repo, mock_clock)
         signal = signal_factory()
-        order = order_manager.create_order(signal, "buy", "market", Decimal("0.1"))
+        order = order_manager.create_order(signal, OrderSide.BUY, "market", Decimal("0.1"))
 
         order_manager.fill_order(order, Decimal("42100"), Decimal("0.1"))
 
@@ -131,7 +131,7 @@ class TestOrderStatusUpdates:
         backtest_repo = BacktestOrderRepository(mock_db_session, session_id=1)
         order_manager = OrderManager(backtest_repo, mock_clock)
         signal = signal_factory()
-        order = order_manager.create_order(signal, "buy", "market", Decimal("0.1"))
+        order = order_manager.create_order(signal, OrderSide.BUY, "market", Decimal("0.1"))
 
         order_manager.fill_order(order, Decimal("42100.50"), Decimal("0.1"))
 
@@ -143,7 +143,7 @@ class TestOrderStatusUpdates:
         backtest_repo = BacktestOrderRepository(mock_db_session, session_id=1)
         order_manager = OrderManager(backtest_repo, mock_clock)
         signal = signal_factory()
-        order = order_manager.create_order(signal, "buy", "market", Decimal("0.1"))
+        order = order_manager.create_order(signal, OrderSide.BUY, "market", Decimal("0.1"))
 
         order_manager.fill_order(order, Decimal("42100"), Decimal("0.1"))
 
@@ -155,7 +155,7 @@ class TestOrderStatusUpdates:
         backtest_repo = BacktestOrderRepository(mock_db_session, session_id=1)
         order_manager = OrderManager(backtest_repo, mock_clock)
         signal = signal_factory()
-        order = order_manager.create_order(signal, "buy", "market", Decimal("0.1"))
+        order = order_manager.create_order(signal, OrderSide.BUY, "market", Decimal("0.1"))
 
         order_manager.fill_order(order, Decimal("42100"), Decimal("0.1"))
 
@@ -167,7 +167,7 @@ class TestOrderStatusUpdates:
         """Failing an order should update its status to failed."""
         order_manager = OrderManager(mock_order_repo, mock_clock)
         signal = signal_factory()
-        order = order_manager.create_order(signal, "buy", "market", Decimal("0.1"))
+        order = order_manager.create_order(signal, OrderSide.BUY, "market", Decimal("0.1"))
 
         order_manager.fail_order(order, "Insufficient funds")
 
@@ -181,7 +181,7 @@ class TestExchangeOrderId:
         """Should update exchange order ID."""
         order_manager = OrderManager(mock_order_repo, mock_clock)
         signal = signal_factory()
-        order = order_manager.create_order(signal, "buy", "market", Decimal("0.1"))
+        order = order_manager.create_order(signal, OrderSide.BUY, "market", Decimal("0.1"))
 
         order_manager.update_exchange_order_id(order, "BINANCE-12345")
 
@@ -191,7 +191,7 @@ class TestExchangeOrderId:
         """Default exchange order ID should indicate simulation."""
         order_manager = OrderManager(mock_order_repo, mock_clock)
         signal = signal_factory()
-        order = order_manager.create_order(signal, "buy", "market", Decimal("0.1"))
+        order = order_manager.create_order(signal, OrderSide.BUY, "market", Decimal("0.1"))
 
         assert order.exchange_order_id.startswith("sim_")
 
@@ -226,7 +226,7 @@ class TestPositionUpdates:
         order_manager = OrderManager(backtest_repo, mock_clock)
         signal = signal_factory()
 
-        order = order_manager.create_order(signal, "buy", "market", Decimal("0.1"))
+        order = order_manager.create_order(signal, OrderSide.BUY, "market", Decimal("0.1"))
         order_manager.fill_order(order, Decimal("42000"), Decimal("0.1"))
 
         # BacktestOrderRepository delegates position tracking to Rust engine
@@ -248,12 +248,12 @@ class TestOrderValidation:
         order_manager = OrderManager(mock_order_repo, mock_clock)
         signal = signal_factory()
         with pytest.raises(ValueError, match="Invalid order type"):
-            order_manager.create_order(signal, "buy", "invalid_type", Decimal("0.1"))
+            order_manager.create_order(signal, OrderSide.BUY, "invalid_type", Decimal("0.1"))
 
     def test_valid_stop_loss_type_accepted(self, mock_order_repo, mock_clock, signal_factory):
         order_manager = OrderManager(mock_order_repo, mock_clock)
         signal = signal_factory()
-        order = order_manager.create_order(signal, "sell", "stop_loss", Decimal("0.1"), trigger_price=Decimal("40000"))
+        order = order_manager.create_order(signal, OrderSide.SELL, "stop_loss", Decimal("0.1"), trigger_price=Decimal("40000"))
         assert order.type == "stop_loss"
 
     def test_case_insensitive_validation(self, mock_order_repo, mock_clock, signal_factory):
@@ -273,7 +273,7 @@ class TestOrderManagerEdgeCases:
 
         orders = []
         for _ in range(5):
-            order = order_manager.create_order(signal, "buy", "market", Decimal("0.1"))
+            order = order_manager.create_order(signal, OrderSide.BUY, "market", Decimal("0.1"))
             orders.append(order)
 
         # All orders should have unique IDs
@@ -285,7 +285,7 @@ class TestOrderManagerEdgeCases:
         order_manager = OrderManager(mock_order_repo, mock_clock)
         signal = signal_factory()
 
-        order = order_manager.create_order(signal, "buy", "market", Decimal("0"))
+        order = order_manager.create_order(signal, OrderSide.BUY, "market", Decimal("0"))
 
         assert order.quantity == Decimal("0")
 
@@ -294,7 +294,7 @@ class TestOrderManagerEdgeCases:
         order_manager = OrderManager(mock_order_repo, mock_clock)
         signal = signal_factory()
 
-        order = order_manager.create_order(signal, "buy", "market", Decimal("0.00000001"))
+        order = order_manager.create_order(signal, OrderSide.BUY, "market", Decimal("0.00000001"))
 
         assert order.quantity == Decimal("0.00000001")
 
@@ -303,7 +303,7 @@ class TestOrderManagerEdgeCases:
         order_manager = OrderManager(mock_order_repo, mock_clock)
         signal = signal_factory()
 
-        order = order_manager.create_order(signal, "buy", "market", Decimal("1000000"))
+        order = order_manager.create_order(signal, OrderSide.BUY, "market", Decimal("1000000"))
 
         assert order.quantity == Decimal("1000000")
 
@@ -341,7 +341,7 @@ class TestOrderManagerLiveMode:
             om = OrderManager(repo, mock_clock, is_backtest=False)
 
         signal = signal_factory()
-        order = om.create_order(signal, "buy", "market", Decimal("0.1"))
+        order = om.create_order(signal, OrderSide.BUY, "market", Decimal("0.1"))
         om.fill_order(order, Decimal("42000"), Decimal("0.1"))
 
         mock_script.assert_called_once()
@@ -365,7 +365,7 @@ class TestOrderManagerLiveMode:
             om = OrderManager(repo, mock_clock, is_backtest=False)
 
         signal = signal_factory()
-        order = om.create_order(signal, "buy", "market", Decimal("0.1"))
+        order = om.create_order(signal, OrderSide.BUY, "market", Decimal("0.1"))
 
         with pytest.raises(RuntimeError, match="Critical State Corruption"):
             om.fill_order(order, Decimal("42000"), Decimal("0.1"))

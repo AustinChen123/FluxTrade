@@ -216,7 +216,7 @@ class TestRiskManagerIntegration:
             Position(
                 strategy_id="test-strategy",
                 product_id=PRODUCT_ID,
-                side="buy",
+                side="LONG",
                 quantity=Decimal("0.1"),
                 entry_price=Decimal("50000"),
                 unrealized_pnl=Decimal("0"),
@@ -234,7 +234,7 @@ class TestRiskManagerIntegration:
             Position(
                 strategy_id="test-strategy",
                 product_id=PRODUCT_ID,
-                side="buy",
+                side="LONG",
                 quantity=Decimal("100"),
                 entry_price=Decimal("50000"),
                 unrealized_pnl=Decimal("0"),

@@ -4,6 +4,7 @@ from typing import Optional
 from sqlalchemy.orm import Session
 from src.core.interfaces import IOrderRepository
 from src.core.orm_models import Order, Trade, Position, BacktestTradeLog
+from src.core.models import OrderSide
 
 class LiveOrderRepository(IOrderRepository):
     def __init__(self, db_session: Session):
@@ -29,18 +30,18 @@ class LiveOrderRepository(IOrderRepository):
             side=side
         ).first()
 
-    def update_position(self, strategy_id: str, product_id: str, side: str, fill_quantity: Decimal, fill_price: Decimal, position_side: str) -> None:
+    def update_position(self, strategy_id: str, product_id: str, side: OrderSide, fill_quantity: Decimal, fill_price: Decimal, position_side: str) -> None:
         # Use with_for_update for locking
         position = self.db.query(Position).with_for_update().filter_by(
-            strategy_id=strategy_id, 
-            product_id=product_id, 
+            strategy_id=strategy_id,
+            product_id=product_id,
             side=position_side
         ).first()
 
         current_time = int(time.time() * 1000)
 
         if not position:
-            if side == 'buy':
+            if side == OrderSide.BUY:
                 position = Position(
                     strategy_id=strategy_id,
                     product_id=product_id,
@@ -55,15 +56,15 @@ class LiveOrderRepository(IOrderRepository):
                 self.db.commit()
                 return
 
-        if side == 'buy':
+        if side == OrderSide.BUY:
             total_cost = (position.quantity * position.entry_price) + (fill_quantity * fill_price)
             total_qty = position.quantity + fill_quantity
             if total_qty > 0:
                 position.entry_price = total_cost / total_qty
             position.quantity = total_qty
-        elif side == 'sell':
+        elif side == OrderSide.SELL:
             position.quantity = max(Decimal("0"), position.quantity - fill_quantity)
-            
+
         position.last_update_timestamp = current_time
         self.db.commit()
 
