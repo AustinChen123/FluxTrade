@@ -6,6 +6,14 @@ on:
   pull_request:
     branches: [ "main", "develop" ]
 
+# Cancel in-progress runs on the same branch to save CI minutes
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
 jobs:
   rust-check:
     name: Rust Check
@@ -40,6 +48,12 @@ jobs:
       - name: Run tests (pure Rust, no PyO3 extension)
         run: cargo test --no-default-features
 
+      # TODO: Add Rust coverage with cargo-llvm-cov
+      # Steps needed:
+      #   1. Install cargo-llvm-cov: cargo install cargo-llvm-cov
+      #   2. Run: cargo llvm-cov --no-default-features --codecov --output-path codecov.json
+      #   3. Upload artifact or send to Codecov
+
   python-check:
     name: Python Check
     runs-on: ubuntu-latest
@@ -59,7 +73,45 @@ jobs:
         run: uv run ruff check .
 
       - name: Run unit tests with coverage
-        run: uv run pytest -m "not integration and not rust" --cov=src --cov-report=term-missing --cov-fail-under=77
+        run: uv run pytest -m "not integration and not rust" --cov=src --cov-report=term-missing --cov-report=xml:coverage.xml --cov-fail-under=77
+
+      - name: Upload coverage report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: python-coverage-report
+          path: python-strategy/coverage.xml
+          retention-days: 30
+
+      - name: Generate coverage badge JSON
+        if: always()
+        working-directory: ./python-strategy
+        run: |
+          # Extract coverage percentage from the XML report
+          if [ -f coverage.xml ]; then
+            COV_PCT=$(python3 -c "
+          import xml.etree.ElementTree as ET
+          tree = ET.parse('coverage.xml')
+          rate = float(tree.getroot().attrib['line-rate']) * 100
+          print(f'{rate:.1f}')
+          ")
+            echo "{\"schemaVersion\":1,\"label\":\"coverage\",\"message\":\"${COV_PCT}%\",\"color\":\"brightgreen\"}" > coverage-badge.json
+            echo "Coverage: ${COV_PCT}%"
+          else
+            echo "{\"schemaVersion\":1,\"label\":\"coverage\",\"message\":\"unknown\",\"color\":\"red\"}" > coverage-badge.json
+          fi
+
+      - name: Upload coverage badge data
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage-badge
+          path: python-strategy/coverage-badge.json
+          retention-days: 30
+        # To display a dynamic coverage badge in README, you can:
+        # 1. Publish coverage-badge.json to GitHub Pages or a gist
+        # 2. Use shields.io endpoint badge: ![Coverage](https://img.shields.io/endpoint?url=<URL_TO_JSON>)
+        # Or integrate with Codecov/Coveralls for automatic badge generation.
 
   integration-check:
     name: Integration Tests (Rust + Python)

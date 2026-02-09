@@ -1,3 +1,5 @@
+![CI](https://github.com/AustinChen123/FluxTrade/actions/workflows/ci.yml/badge.svg?branch=develop)
+
 # FluxTrade
 
 A microservices-based cryptocurrency trading system built with Rust and Python. Rust handles real-time market data ingestion; Python handles strategy logic, risk management, and backtesting. Services communicate via Redis Streams.
