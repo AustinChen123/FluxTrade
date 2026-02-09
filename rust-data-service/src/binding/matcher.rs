@@ -45,6 +45,12 @@ impl PyMatchingEngine {
         self.positions.clone()
     }
 
+    /// Get position for a specific strategy and product.
+    fn get_position(&self, strategy_id: &str, product_id: &str) -> Option<Position> {
+        let key = format!("{strategy_id}:{product_id}");
+        self.positions.get(&key).cloned()
+    }
+
     fn on_candle(&mut self, candle: Candlestick) -> PyResult<Vec<FillEvent>> {
         self.process_candle_logic(candle)
     }
@@ -100,6 +106,7 @@ impl PyMatchingEngine {
             let fill = FillEvent {
                 order_id: order.id.clone(),
                 product_id: order.product_id.clone(),
+                strategy_id: order.strategy_id.clone(),
                 price: fill_price,
                 quantity: order.quantity,
                 fee,
@@ -135,6 +142,7 @@ impl PyMatchingEngine {
             let fill = FillEvent {
                 order_id: order.id.clone(),
                 product_id: order.product_id.clone(),
+                strategy_id: order.strategy_id.clone(),
                 price: trigger,
                 quantity: order.quantity,
                 fee,
@@ -169,6 +177,7 @@ impl PyMatchingEngine {
                 let fill = FillEvent {
                     order_id: order.id.clone(),
                     product_id: order.product_id.clone(),
+                    strategy_id: order.strategy_id.clone(),
                     price: order.price,
                     quantity: order.quantity,
                     fee,
@@ -271,17 +280,20 @@ impl PyMatchingEngine {
         price * quantity * rate
     }
 
+    fn position_key(strategy_id: &str, product_id: &str) -> String {
+        format!("{strategy_id}:{product_id}")
+    }
+
     fn update_position(&mut self, order: &Order, fill_price: Decimal) {
-        let mut pos = self
-            .positions
-            .remove(&order.product_id)
-            .unwrap_or(Position {
-                product_id: order.product_id.clone(),
-                side: "FLAT".to_string(),
-                quantity: Decimal::ZERO,
-                entry_price: Decimal::ZERO,
-                unrealized_pnl: Decimal::ZERO,
-            });
+        let key = Self::position_key(&order.strategy_id, &order.product_id);
+        let mut pos = self.positions.remove(&key).unwrap_or(Position {
+            product_id: order.product_id.clone(),
+            strategy_id: order.strategy_id.clone(),
+            side: "FLAT".to_string(),
+            quantity: Decimal::ZERO,
+            entry_price: Decimal::ZERO,
+            unrealized_pnl: Decimal::ZERO,
+        });
 
         let is_closing_order = matches!(
             order.order_type.as_str(),
@@ -295,7 +307,7 @@ impl PyMatchingEngine {
         }
 
         if pos.quantity > Decimal::ZERO && pos.side != "FLAT" {
-            self.positions.insert(order.product_id.clone(), pos);
+            self.positions.insert(key, pos);
         }
     }
 
@@ -377,6 +389,11 @@ mod tests {
 
     const PRODUCT: &str = "BINANCE:BTCUSDT-PERP";
     const TF: &str = "1m";
+    const STRATEGY: &str = "test_strategy";
+
+    fn pos_key(strategy_id: &str, product_id: &str) -> String {
+        format!("{strategy_id}:{product_id}")
+    }
 
     fn make_engine(balance: Decimal) -> PyMatchingEngine {
         PyMatchingEngine {
@@ -405,6 +422,7 @@ mod tests {
         Order {
             id: id.to_string(),
             product_id: PRODUCT.to_string(),
+            strategy_id: STRATEGY.to_string(),
             side: side.to_string(),
             order_type: order_type.to_string(),
             price,
@@ -413,6 +431,17 @@ mod tests {
             trigger_price: None,
             trailing_distance: None,
             linked_order_id: None,
+        }
+    }
+
+    fn make_position(product_id: &str, strategy_id: &str, side: &str, qty: Decimal, entry: Decimal) -> Position {
+        Position {
+            product_id: product_id.to_string(),
+            strategy_id: strategy_id.to_string(),
+            side: side.to_string(),
+            quantity: qty,
+            entry_price: entry,
+            unrealized_pnl: Decimal::ZERO,
         }
     }
 
@@ -432,10 +461,12 @@ mod tests {
         assert_eq!(fills[0].price, dec!(50000));
         assert_eq!(fills[0].fill_type, "MARKET");
 
-        let pos = engine.positions.get(PRODUCT).unwrap();
+        let key = pos_key(STRATEGY, PRODUCT);
+        let pos = engine.positions.get(&key).unwrap();
         assert_eq!(pos.side, "LONG");
         assert_eq!(pos.quantity, dec!(1));
         assert_eq!(pos.entry_price, dec!(50000));
+        assert_eq!(pos.strategy_id, STRATEGY);
     }
 
     #[test]
@@ -455,7 +486,8 @@ mod tests {
         assert_eq!(fills.len(), 1);
         assert_eq!(fills[0].price, dec!(48000));
 
-        let pos = engine.positions.get(PRODUCT).unwrap();
+        let key = pos_key(STRATEGY, PRODUCT);
+        let pos = engine.positions.get(&key).unwrap();
         assert_eq!(pos.side, "SHORT");
         assert_eq!(pos.quantity, dec!(0.5));
     }
@@ -553,15 +585,10 @@ mod tests {
     #[test]
     fn test_stop_loss_long_triggers_when_low_hits() {
         let mut engine = make_engine(dec!(100000));
+        let key = pos_key(STRATEGY, PRODUCT);
         engine.positions.insert(
-            PRODUCT.to_string(),
-            Position {
-                product_id: PRODUCT.to_string(),
-                side: "LONG".to_string(),
-                quantity: dec!(1),
-                entry_price: dec!(50000),
-                unrealized_pnl: Decimal::ZERO,
-            },
+            key.clone(),
+            make_position(PRODUCT, STRATEGY, "LONG", dec!(1), dec!(50000)),
         );
 
         let mut sl = make_order("sl1", "LONG", "STOP_LOSS", Decimal::ZERO, dec!(1));
@@ -575,7 +602,7 @@ mod tests {
         assert_eq!(fills[0].fill_type, "STOP_LOSS");
         assert_eq!(fills[0].price, dec!(49000));
 
-        assert!(!engine.positions.contains_key(PRODUCT));
+        assert!(!engine.positions.contains_key(&key));
 
         // PnL: (49000 - 50000) * 1 = -1000
         let expected_balance = dec!(100000) - dec!(1000) - fills[0].fee;
@@ -585,15 +612,10 @@ mod tests {
     #[test]
     fn test_stop_loss_short_triggers_when_high_hits() {
         let mut engine = make_engine(dec!(100000));
+        let key = pos_key(STRATEGY, PRODUCT);
         engine.positions.insert(
-            PRODUCT.to_string(),
-            Position {
-                product_id: PRODUCT.to_string(),
-                side: "SHORT".to_string(),
-                quantity: dec!(1),
-                entry_price: dec!(50000),
-                unrealized_pnl: Decimal::ZERO,
-            },
+            key,
+            make_position(PRODUCT, STRATEGY, "SHORT", dec!(1), dec!(50000)),
         );
 
         let mut sl = make_order("sl2", "SHORT", "STOP_LOSS", Decimal::ZERO, dec!(1));
@@ -614,15 +636,10 @@ mod tests {
     #[test]
     fn test_stop_loss_not_triggered_when_price_doesnt_reach() {
         let mut engine = make_engine(dec!(100000));
+        let key = pos_key(STRATEGY, PRODUCT);
         engine.positions.insert(
-            PRODUCT.to_string(),
-            Position {
-                product_id: PRODUCT.to_string(),
-                side: "LONG".to_string(),
-                quantity: dec!(1),
-                entry_price: dec!(50000),
-                unrealized_pnl: Decimal::ZERO,
-            },
+            key,
+            make_position(PRODUCT, STRATEGY, "LONG", dec!(1), dec!(50000)),
         );
 
         let mut sl = make_order("sl3", "LONG", "STOP_LOSS", Decimal::ZERO, dec!(1));
@@ -641,15 +658,10 @@ mod tests {
     #[test]
     fn test_take_profit_long_triggers_when_high_hits() {
         let mut engine = make_engine(dec!(100000));
+        let key = pos_key(STRATEGY, PRODUCT);
         engine.positions.insert(
-            PRODUCT.to_string(),
-            Position {
-                product_id: PRODUCT.to_string(),
-                side: "LONG".to_string(),
-                quantity: dec!(1),
-                entry_price: dec!(50000),
-                unrealized_pnl: Decimal::ZERO,
-            },
+            key,
+            make_position(PRODUCT, STRATEGY, "LONG", dec!(1), dec!(50000)),
         );
 
         let mut tp = make_order("tp1", "LONG", "TAKE_PROFIT", Decimal::ZERO, dec!(1));
@@ -670,15 +682,10 @@ mod tests {
     #[test]
     fn test_take_profit_short_triggers_when_low_hits() {
         let mut engine = make_engine(dec!(100000));
+        let key = pos_key(STRATEGY, PRODUCT);
         engine.positions.insert(
-            PRODUCT.to_string(),
-            Position {
-                product_id: PRODUCT.to_string(),
-                side: "SHORT".to_string(),
-                quantity: dec!(1),
-                entry_price: dec!(50000),
-                unrealized_pnl: Decimal::ZERO,
-            },
+            key,
+            make_position(PRODUCT, STRATEGY, "SHORT", dec!(1), dec!(50000)),
         );
 
         let mut tp = make_order("tp2", "SHORT", "TAKE_PROFIT", Decimal::ZERO, dec!(1));
@@ -700,15 +707,10 @@ mod tests {
     #[test]
     fn test_trailing_stop_long_updates_and_triggers() {
         let mut engine = make_engine(dec!(100000));
+        let key = pos_key(STRATEGY, PRODUCT);
         engine.positions.insert(
-            PRODUCT.to_string(),
-            Position {
-                product_id: PRODUCT.to_string(),
-                side: "LONG".to_string(),
-                quantity: dec!(1),
-                entry_price: dec!(50000),
-                unrealized_pnl: Decimal::ZERO,
-            },
+            key,
+            make_position(PRODUCT, STRATEGY, "LONG", dec!(1), dec!(50000)),
         );
 
         let mut ts = make_order("ts1", "LONG", "TRAILING_STOP", Decimal::ZERO, dec!(1));
@@ -734,15 +736,10 @@ mod tests {
     #[test]
     fn test_trailing_stop_short_updates_and_triggers() {
         let mut engine = make_engine(dec!(100000));
+        let key = pos_key(STRATEGY, PRODUCT);
         engine.positions.insert(
-            PRODUCT.to_string(),
-            Position {
-                product_id: PRODUCT.to_string(),
-                side: "SHORT".to_string(),
-                quantity: dec!(1),
-                entry_price: dec!(50000),
-                unrealized_pnl: Decimal::ZERO,
-            },
+            key,
+            make_position(PRODUCT, STRATEGY, "SHORT", dec!(1), dec!(50000)),
         );
 
         let mut ts = make_order("ts2", "SHORT", "TRAILING_STOP", Decimal::ZERO, dec!(1));
@@ -786,15 +783,10 @@ mod tests {
     #[test]
     fn test_oco_sl_triggers_cancels_tp() {
         let mut engine = make_engine(dec!(100000));
+        let key = pos_key(STRATEGY, PRODUCT);
         engine.positions.insert(
-            PRODUCT.to_string(),
-            Position {
-                product_id: PRODUCT.to_string(),
-                side: "LONG".to_string(),
-                quantity: dec!(1),
-                entry_price: dec!(50000),
-                unrealized_pnl: Decimal::ZERO,
-            },
+            key,
+            make_position(PRODUCT, STRATEGY, "LONG", dec!(1), dec!(50000)),
         );
 
         let mut sl = make_order("sl_oco", "LONG", "STOP_LOSS", Decimal::ZERO, dec!(1));
@@ -818,15 +810,10 @@ mod tests {
     #[test]
     fn test_oco_tp_triggers_cancels_sl() {
         let mut engine = make_engine(dec!(100000));
+        let key = pos_key(STRATEGY, PRODUCT);
         engine.positions.insert(
-            PRODUCT.to_string(),
-            Position {
-                product_id: PRODUCT.to_string(),
-                side: "LONG".to_string(),
-                quantity: dec!(1),
-                entry_price: dec!(50000),
-                unrealized_pnl: Decimal::ZERO,
-            },
+            key,
+            make_position(PRODUCT, STRATEGY, "LONG", dec!(1), dec!(50000)),
         );
 
         let mut sl = make_order("sl_oco2", "LONG", "STOP_LOSS", Decimal::ZERO, dec!(1));
@@ -866,7 +853,8 @@ mod tests {
         let c2 = make_candle(dec!(52000), dec!(53000), dec!(51000), dec!(52500));
         engine.process_candle_logic(c2).unwrap();
 
-        let pos = engine.positions.get(PRODUCT).unwrap();
+        let key = pos_key(STRATEGY, PRODUCT);
+        let pos = engine.positions.get(&key).unwrap();
         assert_eq!(pos.quantity, dec!(2));
         // avg: (50000*1 + 52000*1) / 2 = 51000
         assert_eq!(pos.entry_price, dec!(51000));
@@ -875,15 +863,10 @@ mod tests {
     #[test]
     fn test_position_partial_close_reduces_quantity() {
         let mut engine = make_engine(dec!(100000));
+        let key = pos_key(STRATEGY, PRODUCT);
         engine.positions.insert(
-            PRODUCT.to_string(),
-            Position {
-                product_id: PRODUCT.to_string(),
-                side: "LONG".to_string(),
-                quantity: dec!(2),
-                entry_price: dec!(50000),
-                unrealized_pnl: Decimal::ZERO,
-            },
+            key.clone(),
+            make_position(PRODUCT, STRATEGY, "LONG", dec!(2), dec!(50000)),
         );
 
         let mut sl = make_order("pc1", "LONG", "STOP_LOSS", Decimal::ZERO, dec!(1));
@@ -893,7 +876,7 @@ mod tests {
         let candle = make_candle(dec!(50000), dec!(50500), dec!(48500), dec!(49200));
         engine.process_candle_logic(candle).unwrap();
 
-        let pos = engine.positions.get(PRODUCT).unwrap();
+        let pos = engine.positions.get(&key).unwrap();
         assert_eq!(pos.quantity, dec!(1));
         assert_eq!(pos.side, "LONG");
     }
@@ -901,15 +884,10 @@ mod tests {
     #[test]
     fn test_position_flip_long_to_short() {
         let mut engine = make_engine(dec!(100000));
+        let key = pos_key(STRATEGY, PRODUCT);
         engine.positions.insert(
-            PRODUCT.to_string(),
-            Position {
-                product_id: PRODUCT.to_string(),
-                side: "LONG".to_string(),
-                quantity: dec!(1),
-                entry_price: dec!(50000),
-                unrealized_pnl: Decimal::ZERO,
-            },
+            key.clone(),
+            make_position(PRODUCT, STRATEGY, "LONG", dec!(1), dec!(50000)),
         );
 
         engine.open_orders.push(make_order(
@@ -925,7 +903,7 @@ mod tests {
 
         assert_eq!(fills.len(), 1);
 
-        let pos = engine.positions.get(PRODUCT).unwrap();
+        let pos = engine.positions.get(&key).unwrap();
         assert_eq!(pos.side, "SHORT");
         assert_eq!(pos.quantity, dec!(1));
         assert_eq!(pos.entry_price, dec!(48000));
@@ -973,15 +951,10 @@ mod tests {
         sl.trigger_price = Some(dec!(49500));
         engine.open_orders.push(sl);
 
+        let key = pos_key(STRATEGY, PRODUCT);
         engine.positions.insert(
-            PRODUCT.to_string(),
-            Position {
-                product_id: PRODUCT.to_string(),
-                side: "LONG".to_string(),
-                quantity: dec!(0.5),
-                entry_price: dec!(50000),
-                unrealized_pnl: Decimal::ZERO,
-            },
+            key,
+            make_position(PRODUCT, STRATEGY, "LONG", dec!(0.5), dec!(50000)),
         );
 
         let candle = make_candle(dec!(50000), dec!(50500), dec!(49000), dec!(49500));
@@ -1035,5 +1008,169 @@ mod tests {
 
         assert_eq!(fills[0].fee, Decimal::ZERO);
         assert_eq!(engine.balance, dec!(100000));
+    }
+
+    // ── Multi-Strategy Position Isolation ──
+
+    #[test]
+    fn test_two_strategies_independent_positions_same_product() {
+        let mut engine = make_engine(dec!(100000));
+
+        // Strategy A goes LONG
+        let mut order_a = make_order("a1", "LONG", "MARKET", Decimal::ZERO, dec!(1));
+        order_a.strategy_id = "strategy_a".to_string();
+        engine.open_orders.push(order_a);
+
+        // Strategy B goes SHORT on the same product
+        let mut order_b = make_order("b1", "SHORT", "MARKET", Decimal::ZERO, dec!(0.5));
+        order_b.strategy_id = "strategy_b".to_string();
+        engine.open_orders.push(order_b);
+
+        let candle = make_candle(dec!(50000), dec!(51000), dec!(49000), dec!(50500));
+        let fills = engine.process_candle_logic(candle).unwrap();
+
+        assert_eq!(fills.len(), 2);
+        assert_eq!(fills[0].strategy_id, "strategy_a");
+        assert_eq!(fills[1].strategy_id, "strategy_b");
+
+        // Verify independent positions
+        let key_a = pos_key("strategy_a", PRODUCT);
+        let key_b = pos_key("strategy_b", PRODUCT);
+
+        let pos_a = engine.positions.get(&key_a).unwrap();
+        assert_eq!(pos_a.side, "LONG");
+        assert_eq!(pos_a.quantity, dec!(1));
+        assert_eq!(pos_a.strategy_id, "strategy_a");
+
+        let pos_b = engine.positions.get(&key_b).unwrap();
+        assert_eq!(pos_b.side, "SHORT");
+        assert_eq!(pos_b.quantity, dec!(0.5));
+        assert_eq!(pos_b.strategy_id, "strategy_b");
+    }
+
+    #[test]
+    fn test_closing_one_strategy_position_doesnt_affect_other() {
+        let mut engine = make_engine(dec!(100000));
+        let key_a = pos_key("strategy_a", PRODUCT);
+        let key_b = pos_key("strategy_b", PRODUCT);
+
+        // Both strategies have LONG positions
+        engine.positions.insert(
+            key_a.clone(),
+            make_position(PRODUCT, "strategy_a", "LONG", dec!(1), dec!(50000)),
+        );
+        engine.positions.insert(
+            key_b.clone(),
+            make_position(PRODUCT, "strategy_b", "LONG", dec!(2), dec!(48000)),
+        );
+
+        // Close strategy A's position via SL
+        let mut sl_a = make_order("sl_a", "LONG", "STOP_LOSS", Decimal::ZERO, dec!(1));
+        sl_a.strategy_id = "strategy_a".to_string();
+        sl_a.trigger_price = Some(dec!(49000));
+        engine.open_orders.push(sl_a);
+
+        let candle = make_candle(dec!(50000), dec!(50500), dec!(48500), dec!(49200));
+        let fills = engine.process_candle_logic(candle).unwrap();
+
+        assert_eq!(fills.len(), 1);
+        assert_eq!(fills[0].strategy_id, "strategy_a");
+
+        // Strategy A's position is closed
+        assert!(!engine.positions.contains_key(&key_a));
+
+        // Strategy B's position is untouched
+        let pos_b = engine.positions.get(&key_b).unwrap();
+        assert_eq!(pos_b.side, "LONG");
+        assert_eq!(pos_b.quantity, dec!(2));
+        assert_eq!(pos_b.entry_price, dec!(48000));
+    }
+
+    #[test]
+    fn test_multi_strategy_shared_balance() {
+        let mut engine = make_engine(dec!(100000));
+        let key_a = pos_key("strategy_a", PRODUCT);
+        let key_b = pos_key("strategy_b", PRODUCT);
+
+        // Strategy A: LONG 1 BTC @ 50000
+        engine.positions.insert(
+            key_a.clone(),
+            make_position(PRODUCT, "strategy_a", "LONG", dec!(1), dec!(50000)),
+        );
+        // Strategy B: SHORT 1 BTC @ 50000
+        engine.positions.insert(
+            key_b.clone(),
+            make_position(PRODUCT, "strategy_b", "SHORT", dec!(1), dec!(50000)),
+        );
+
+        // Strategy A closes with TP at 52000 (+2000 PnL)
+        let mut tp_a = make_order("tp_a", "LONG", "TAKE_PROFIT", Decimal::ZERO, dec!(1));
+        tp_a.strategy_id = "strategy_a".to_string();
+        tp_a.trigger_price = Some(dec!(52000));
+        engine.open_orders.push(tp_a);
+
+        // Strategy B closes with SL at 52000 (-2000 PnL)
+        let mut sl_b = make_order("sl_b", "SHORT", "STOP_LOSS", Decimal::ZERO, dec!(1));
+        sl_b.strategy_id = "strategy_b".to_string();
+        sl_b.trigger_price = Some(dec!(52000));
+        engine.open_orders.push(sl_b);
+
+        let candle = make_candle(dec!(51000), dec!(52500), dec!(50500), dec!(52000));
+        let fills = engine.process_candle_logic(candle).unwrap();
+
+        assert_eq!(fills.len(), 2);
+
+        // Both positions closed
+        assert!(!engine.positions.contains_key(&key_a));
+        assert!(!engine.positions.contains_key(&key_b));
+
+        // Net PnL = +2000 - 2000 = 0, minus fees
+        let total_fees = fills[0].fee + fills[1].fee;
+        assert_eq!(engine.balance, dec!(100000) - total_fees);
+    }
+
+    #[test]
+    fn test_get_position_method() {
+        let mut engine = make_engine(dec!(100000));
+        let key = pos_key("my_strategy", PRODUCT);
+        engine.positions.insert(
+            key,
+            make_position(PRODUCT, "my_strategy", "LONG", dec!(1), dec!(50000)),
+        );
+
+        // Found
+        let pos = engine.get_position("my_strategy", PRODUCT);
+        assert!(pos.is_some());
+        let pos = pos.unwrap();
+        assert_eq!(pos.side, "LONG");
+        assert_eq!(pos.quantity, dec!(1));
+
+        // Not found — wrong strategy
+        assert!(engine.get_position("other_strategy", PRODUCT).is_none());
+
+        // Not found — wrong product
+        assert!(engine.get_position("my_strategy", "OTHER_PRODUCT").is_none());
+    }
+
+    #[test]
+    fn test_positions_property_uses_composite_keys() {
+        let mut engine = make_engine(dec!(100000));
+
+        // Open positions for two strategies
+        let mut order_a = make_order("a1", "LONG", "MARKET", Decimal::ZERO, dec!(1));
+        order_a.strategy_id = "alpha".to_string();
+        engine.open_orders.push(order_a);
+
+        let mut order_b = make_order("b1", "SHORT", "MARKET", Decimal::ZERO, dec!(1));
+        order_b.strategy_id = "beta".to_string();
+        engine.open_orders.push(order_b);
+
+        let candle = make_candle(dec!(50000), dec!(51000), dec!(49000), dec!(50500));
+        engine.process_candle_logic(candle).unwrap();
+
+        let positions = engine.get_positions();
+        assert_eq!(positions.len(), 2);
+        assert!(positions.contains_key(&format!("alpha:{PRODUCT}")));
+        assert!(positions.contains_key(&format!("beta:{PRODUCT}")));
     }
 }

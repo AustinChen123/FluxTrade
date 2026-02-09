@@ -167,6 +167,9 @@ pub struct Order {
     pub id: String,
     #[pyo3(get, set)]
     pub product_id: String,
+    /// Strategy that owns this order (used for per-strategy position tracking)
+    #[pyo3(get, set)]
+    pub strategy_id: String,
     /// "LONG" or "SHORT"
     #[pyo3(get, set)]
     pub side: String,
@@ -191,7 +194,7 @@ pub struct Order {
 impl Order {
     #[new]
     #[allow(clippy::too_many_arguments)]
-    #[pyo3(signature = (id, product_id, side, order_type, price, quantity, timestamp, trigger_price=None, trailing_distance=None, linked_order_id=None))]
+    #[pyo3(signature = (id, product_id, side, order_type, price, quantity, timestamp, trigger_price=None, trailing_distance=None, linked_order_id=None, strategy_id="".to_string()))]
     fn new(
         id: String,
         product_id: String,
@@ -203,10 +206,12 @@ impl Order {
         trigger_price: Option<String>,
         trailing_distance: Option<String>,
         linked_order_id: Option<String>,
+        strategy_id: String,
     ) -> PyResult<Self> {
         Ok(Order {
             id,
             product_id,
+            strategy_id,
             side,
             order_type,
             price: parse_decimal(&price, "price")?,
@@ -266,6 +271,8 @@ pub struct FillEvent {
     pub order_id: String,
     #[pyo3(get, set)]
     pub product_id: String,
+    #[pyo3(get, set)]
+    pub strategy_id: String,
     pub price: Decimal,
     pub quantity: Decimal,
     pub fee: Decimal,
@@ -280,7 +287,7 @@ pub struct FillEvent {
 impl FillEvent {
     #[new]
     #[allow(clippy::too_many_arguments)]
-    #[pyo3(signature = (order_id, product_id, price, quantity, fee, timestamp, fill_type="MARKET".to_string()))]
+    #[pyo3(signature = (order_id, product_id, price, quantity, fee, timestamp, fill_type="MARKET".to_string(), strategy_id="".to_string()))]
     fn new(
         order_id: String,
         product_id: String,
@@ -289,10 +296,12 @@ impl FillEvent {
         fee: String,
         timestamp: i64,
         fill_type: String,
+        strategy_id: String,
     ) -> PyResult<Self> {
         Ok(FillEvent {
             order_id,
             product_id,
+            strategy_id,
             price: parse_decimal(&price, "price")?,
             quantity: parse_decimal(&quantity, "quantity")?,
             fee: parse_decimal(&fee, "fee")?,
@@ -338,6 +347,8 @@ pub struct Position {
     #[pyo3(get, set)]
     pub product_id: String,
     #[pyo3(get, set)]
+    pub strategy_id: String,
+    #[pyo3(get, set)]
     pub side: String, // "LONG", "SHORT", or "FLAT"
     pub quantity: Decimal,
     pub entry_price: Decimal,
@@ -347,16 +358,18 @@ pub struct Position {
 #[pymethods]
 impl Position {
     #[new]
-    #[pyo3(signature = (product_id, side, quantity, entry_price, unrealized_pnl))]
+    #[pyo3(signature = (product_id, side, quantity, entry_price, unrealized_pnl, strategy_id="".to_string()))]
     fn new(
         product_id: String,
         side: String,
         quantity: String,
         entry_price: String,
         unrealized_pnl: String,
+        strategy_id: String,
     ) -> PyResult<Self> {
         Ok(Position {
             product_id,
+            strategy_id,
             side,
             quantity: parse_decimal(&quantity, "quantity")?,
             entry_price: parse_decimal(&entry_price, "entry_price")?,
@@ -475,6 +488,7 @@ mod tests {
         let o = Order {
             id: "o1".to_string(),
             product_id: "BINANCE:BTCUSDT-PERP".to_string(),
+            strategy_id: "test_strategy".to_string(),
             side: "LONG".to_string(),
             order_type: "TRAILING_STOP".to_string(),
             price: Decimal::ZERO,
@@ -487,6 +501,7 @@ mod tests {
         assert_eq!(o.trigger_price, Some(dec!(49000)));
         assert_eq!(o.trailing_distance, Some(dec!(1000)));
         assert_eq!(o.linked_order_id.as_deref(), Some("o2"));
+        assert_eq!(o.strategy_id, "test_strategy");
     }
 
     #[test]
@@ -494,6 +509,7 @@ mod tests {
         let o = Order {
             id: "o3".to_string(),
             product_id: "BINANCE:BTCUSDT-PERP".to_string(),
+            strategy_id: String::new(),
             side: "SHORT".to_string(),
             order_type: "MARKET".to_string(),
             price: dec!(50000),
@@ -513,6 +529,7 @@ mod tests {
         let f = FillEvent {
             order_id: "o1".to_string(),
             product_id: "BINANCE:BTCUSDT-PERP".to_string(),
+            strategy_id: "test_strategy".to_string(),
             price: dec!(50000),
             quantity: dec!(1),
             fee: dec!(30),
@@ -521,21 +538,25 @@ mod tests {
         };
         assert_eq!(f.fill_type, "STOP_LOSS");
         assert_eq!(f.fee, dec!(30));
+        assert_eq!(f.strategy_id, "test_strategy");
     }
 
     #[test]
     fn test_position_construction_and_sides() {
         let long = Position {
             product_id: "BINANCE:BTCUSDT-PERP".to_string(),
+            strategy_id: "test_strategy".to_string(),
             side: "LONG".to_string(),
             quantity: dec!(1),
             entry_price: dec!(50000),
             unrealized_pnl: dec!(500),
         };
         assert_eq!(long.side, "LONG");
+        assert_eq!(long.strategy_id, "test_strategy");
 
         let flat = Position {
             product_id: "BINANCE:BTCUSDT-PERP".to_string(),
+            strategy_id: String::new(),
             side: "FLAT".to_string(),
             quantity: Decimal::ZERO,
             entry_price: Decimal::ZERO,
@@ -550,6 +571,7 @@ mod tests {
         let o1 = Order {
             id: "orig".to_string(),
             product_id: "TEST".to_string(),
+            strategy_id: "s1".to_string(),
             side: "LONG".to_string(),
             order_type: "LIMIT".to_string(),
             price: dec!(100),
