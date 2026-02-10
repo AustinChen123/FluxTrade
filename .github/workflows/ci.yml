@@ -24,9 +24,10 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
+      - name: Install Rust toolchain (from rust-toolchain.toml)
+        uses: dtolnay/rust-toolchain@master
         with:
+          toolchain: "1.82.0"
           components: clippy, rustfmt
 
       - name: Cache cargo registry & build
@@ -120,8 +121,10 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
+      - name: Install Rust toolchain (from rust-toolchain.toml)
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.82.0"
 
       - name: Cache cargo registry & build
         uses: actions/cache@v4
