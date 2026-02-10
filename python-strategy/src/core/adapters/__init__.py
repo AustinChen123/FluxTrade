@@ -5,7 +5,6 @@ Factory function ``create_adapter`` provides config-driven instantiation.
 
 from src.core.adapters.ccxt_adapter import CcxtExchangeAdapter
 from src.core.adapters.live_binance import LiveBinanceAdapter
-from src.core.adapters.simulated import SimulatedAdapter
 from src.core.interfaces.exchange import IExchangeAdapter
 
 __all__ = [
@@ -14,6 +13,15 @@ __all__ = [
     "SimulatedAdapter",
     "create_adapter",
 ]
+
+
+def __getattr__(name: str):
+    """Lazy import for SimulatedAdapter to avoid requiring fluxtrade_core at import time."""
+    if name == "SimulatedAdapter":
+        from src.core.adapters.simulated import SimulatedAdapter
+
+        return SimulatedAdapter
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 
 
 def create_adapter(config: dict) -> IExchangeAdapter:
@@ -34,6 +42,8 @@ def create_adapter(config: dict) -> IExchangeAdapter:
     mode = config.get("mode", "simulated")
 
     if mode == "simulated":
+        from src.core.adapters.simulated import SimulatedAdapter
+
         balance = Decimal(str(config.get("balance", 100000)))
         maker_fee = Decimal(str(config.get("maker_fee", 0)))
         taker_fee = Decimal(str(config.get("taker_fee", 0)))

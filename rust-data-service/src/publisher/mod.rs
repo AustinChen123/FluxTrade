@@ -120,9 +120,7 @@ impl RedisPublisher {
             let result = match msg {
                 PublishMessage::Trade(trade) => self.publish_trade(&trade).await,
                 PublishMessage::Candle(candle) => self.publish_candle(&candle).await,
-                PublishMessage::AccountUpdate(update) => {
-                    self.update_account_balance(&update).await
-                }
+                PublishMessage::AccountUpdate(update) => self.update_account_balance(&update).await,
                 PublishMessage::PositionUpdate(update) => self.update_position(&update).await,
             };
 

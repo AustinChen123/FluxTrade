@@ -11,7 +11,9 @@ use crate::connector::binance::BinanceConnector;
 use crate::connector::bybit::BybitConnector;
 use crate::connector::ExchangeConnector;
 use crate::model::UserStreamEvent;
-use crate::publisher::{create_publish_channel, PublishSender, RedisPublisher, DEFAULT_CHANNEL_CAPACITY};
+use crate::publisher::{
+    create_publish_channel, PublishSender, RedisPublisher, DEFAULT_CHANNEL_CAPACITY,
+};
 
 use clap::{Parser, Subcommand};
 use dotenvy::dotenv;
@@ -244,7 +246,10 @@ async fn run_live_mode(
         };
         (TaskId::Publisher, result)
     });
-    info!("Supervised task spawned: publisher (channel capacity: {})", channel_capacity);
+    info!(
+        "Supervised task spawned: publisher (channel capacity: {})",
+        channel_capacity
+    );
 
     // Spawn Connector tasks
     for ex in enabled_exchanges.split(',') {
@@ -271,7 +276,8 @@ async fn run_live_mode(
             }
             "backpack" => {
                 join_set.spawn(async move {
-                    let result = run_backpack_connector(symbols, trade_tx, candle_tx, user_tx).await;
+                    let result =
+                        run_backpack_connector(symbols, trade_tx, candle_tx, user_tx).await;
                     (TaskId::Connector("backpack".to_string()), result)
                 });
                 info!("Supervised task spawned: connector:backpack");
@@ -294,7 +300,10 @@ async fn run_live_mode(
     info!("Supervised task spawned: event-loop");
 
     // --- Supervisor loop ---
-    info!("Supervisor active. Monitoring {} tasks. Press Ctrl+C to shutdown.", join_set.len());
+    info!(
+        "Supervisor active. Monitoring {} tasks. Press Ctrl+C to shutdown.",
+        join_set.len()
+    );
 
     // Store context needed for task restarts
     let redis_url_for_restart = redis_url.clone();

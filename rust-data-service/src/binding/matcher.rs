@@ -265,7 +265,11 @@ impl PyMatchingEngine {
     }
 
     /// Mark the linked order (OCO counterpart) for cancellation.
-    fn cancel_linked(&self, filled_order: &Order, cancelled_ids: &mut std::collections::HashSet<String>) {
+    fn cancel_linked(
+        &self,
+        filled_order: &Order,
+        cancelled_ids: &mut std::collections::HashSet<String>,
+    ) {
         if let Some(ref linked_id) = filled_order.linked_order_id {
             cancelled_ids.insert(linked_id.clone());
         }
@@ -434,7 +438,13 @@ mod tests {
         }
     }
 
-    fn make_position(product_id: &str, strategy_id: &str, side: &str, qty: Decimal, entry: Decimal) -> Position {
+    fn make_position(
+        product_id: &str,
+        strategy_id: &str,
+        side: &str,
+        qty: Decimal,
+        entry: Decimal,
+    ) -> Position {
         Position {
             product_id: product_id.to_string(),
             strategy_id: strategy_id.to_string(),
@@ -1149,7 +1159,9 @@ mod tests {
         assert!(engine.get_position("other_strategy", PRODUCT).is_none());
 
         // Not found — wrong product
-        assert!(engine.get_position("my_strategy", "OTHER_PRODUCT").is_none());
+        assert!(engine
+            .get_position("my_strategy", "OTHER_PRODUCT")
+            .is_none());
     }
 
     #[test]
