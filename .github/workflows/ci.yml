@@ -64,6 +64,27 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      - name: Install Rust toolchain (for fluxtrade_core.so)
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.82.0"
+
+      - name: Cache cargo registry & build
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            rust-data-service/target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('rust-data-service/Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-cargo-
+
+      - name: Build and install fluxtrade_core.so
+        working-directory: ./rust-data-service
+        run: |
+          cargo build --lib --release
+          cp target/release/libfluxtrade_core.so ../python-strategy/src/fluxtrade_core.so
+
       - name: Install uv
         uses: astral-sh/setup-uv@v5
 
@@ -74,7 +95,7 @@ jobs:
         run: uv run ruff check .
 
       - name: Run unit tests with coverage
-        run: uv run pytest -m "not integration and not rust" --cov=src --cov-report=term-missing --cov-report=xml:coverage.xml --cov-fail-under=77
+        run: uv run pytest -m "not integration" --cov=src --cov-report=term-missing --cov-report=xml:coverage.xml --cov-fail-under=77
 
       - name: Upload coverage report
         if: always()
