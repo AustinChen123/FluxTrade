@@ -42,6 +42,8 @@ python-strategy/src/strategies/*
 !python-strategy/src/strategies/base.py
 !python-strategy/src/strategies/example.py
 !python-strategy/src/strategies/golden_cross.py
+!python-strategy/src/strategies/callable_strategy.py
+!python-strategy/src/strategies/csv_signal_strategy.py
 
 # Python bytecode
 *.pyc
