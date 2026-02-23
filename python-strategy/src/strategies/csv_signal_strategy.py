@@ -6,15 +6,21 @@ from src.strategies.base import BaseStrategy, StrategyRequirements
 from src.core.models import Candlestick, Signal, SignalType
 
 
-def _parse_decimal(value: str) -> Optional[Decimal]:
-    """Parse a CSV field into Decimal, returning None for empty/whitespace."""
+def _parse_decimal(value: str, field_name: str = "") -> Optional[Decimal]:
+    """Parse a CSV field into Decimal, returning None for empty/whitespace.
+
+    Raises ValueError for non-empty invalid values (e.g. 'abc').
+    """
     value = value.strip()
     if not value:
         return None
     try:
         return Decimal(value)
     except InvalidOperation:
-        return None
+        raise ValueError(
+            f"Invalid Decimal value '{value}'"
+            + (f" for field '{field_name}'" if field_name else "")
+        )
 
 
 class CsvSignalStrategy(BaseStrategy):
@@ -64,11 +70,11 @@ class CsvSignalStrategy(BaseStrategy):
                     timeframe=self._timeframe,
                     timestamp=ts,
                     type=signal_type,
-                    price=_parse_decimal(row.get("price", "")),
-                    stop_loss=_parse_decimal(row.get("stop_loss", "")),
-                    take_profit=_parse_decimal(row.get("take_profit", "")),
-                    trailing_distance=_parse_decimal(row.get("trailing_distance", "")),
-                    quantity=_parse_decimal(row.get("quantity", "")),
+                    price=_parse_decimal(row.get("price", ""), "price"),
+                    stop_loss=_parse_decimal(row.get("stop_loss", ""), "stop_loss"),
+                    take_profit=_parse_decimal(row.get("take_profit", ""), "take_profit"),
+                    trailing_distance=_parse_decimal(row.get("trailing_distance", ""), "trailing_distance"),
+                    quantity=_parse_decimal(row.get("quantity", ""), "quantity"),
                 )
 
         if not signals:

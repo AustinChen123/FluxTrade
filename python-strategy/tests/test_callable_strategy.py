@@ -1,4 +1,5 @@
 """Unit tests for CallableStrategy."""
+import pytest
 from decimal import Decimal
 from src.core.models import Candlestick, Signal, SignalType
 from src.strategies.callable_strategy import CallableStrategy
@@ -86,3 +87,12 @@ class TestCallableStrategy:
         sig = strat.on_candle(_make_candle())
         assert sig.stop_loss == Decimal("50500")
         assert sig.take_profit == Decimal("49000")
+
+    def test_predict_fn_exception_propagates(self):
+        """Exception in predict_fn should propagate (fail-fast, not swallowed)."""
+        def bad_predict(candle):
+            raise RuntimeError("Model crashed")
+
+        strat = CallableStrategy("crash", bad_predict, PRODUCT_ID, TIMEFRAME)
+        with pytest.raises(RuntimeError, match="Model crashed"):
+            strat.on_candle(_make_candle())

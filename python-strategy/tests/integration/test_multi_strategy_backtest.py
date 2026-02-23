@@ -73,7 +73,7 @@ def _make_short_strategy(name: str, entry_idx: int = 5, exit_idx: int = 15):
     return CallableStrategy(name, predict, PRODUCT_ID, TIMEFRAME)
 
 
-def _run_backtest_with_strategies(strategies, candle_data, mock_session_local, balance=10000.0):
+def _run_backtest_with_strategies(strategies, candle_data, mock_session_local, balance=Decimal("10000")):
     mock_session = MagicMock()
     mock_session.query.return_value.filter_by.return_value.all.return_value = []
     mock_session_local.return_value = mock_session
@@ -142,3 +142,4 @@ class TestMultiStrategyBacktest:
 
         assert result is not None
         assert isinstance(result["total_pnl"], Decimal)
+        assert result["journal_count"] > 0, "Conflicting strategies should still produce trades"

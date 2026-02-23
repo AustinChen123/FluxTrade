@@ -28,7 +28,7 @@ pytestmark = [
 INTERVAL_MS = 15 * 60 * 1000
 
 
-def _run_stress_backtest(strategy, candle_data, mock_session_local, balance=10000.0):
+def _run_stress_backtest(strategy, candle_data, mock_session_local, balance=Decimal("10000")):
     mock_session = MagicMock()
     mock_session.query.return_value.filter_by.return_value.all.return_value = []
     mock_session_local.return_value = mock_session
@@ -128,7 +128,7 @@ class TestStressBacktest:
             return None
 
         strat = CallableStrategy("volatile", predict, PRODUCT_ID, TIMEFRAME)
-        result = _run_stress_backtest(strat, candle_data, mock_sl, balance=10000.0)
+        result = _run_stress_backtest(strat, candle_data, mock_sl, balance=Decimal("10000"))
 
         assert result is not None
         final_balance = Decimal("10000") + result["total_pnl"]

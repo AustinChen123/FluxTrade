@@ -106,3 +106,10 @@ class TestCsvSignalStrategy:
         path.write_text("timestamp,type\n1700000000000,INVALID_TYPE\n")
         with pytest.raises(ValueError, match="Invalid signal type"):
             CsvSignalStrategy("bad", str(path), PRODUCT_ID, TIMEFRAME)
+
+    def test_invalid_decimal_value_raises(self, tmp_path):
+        """CSV with non-numeric value in Decimal field should raise ValueError."""
+        path = tmp_path / "bad_decimal.csv"
+        path.write_text("timestamp,type,price\n1700000000000,LONG,abc\n")
+        with pytest.raises(ValueError, match="Invalid Decimal value"):
+            CsvSignalStrategy("bad_dec", str(path), PRODUCT_ID, TIMEFRAME)

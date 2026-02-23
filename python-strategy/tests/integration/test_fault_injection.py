@@ -7,6 +7,7 @@ import pytest
 from decimal import Decimal
 from unittest.mock import MagicMock
 
+from sqlalchemy.orm import Session
 from src.core.models import Signal, SignalType
 from src.core.execution import ExecutionEngine
 from src.core.journal import StrategyJournal
@@ -35,7 +36,7 @@ def journal():
 
 
 def _make_engine(clock, adapter, order_repo, journal):
-    db_session = MagicMock()
+    db_session = MagicMock(spec=Session)
     return ExecutionEngine(
         db_session=db_session,
         clock=clock,
@@ -142,3 +143,6 @@ class TestFaultInjection:
 
         # Market order should succeed even if SL conditional fails
         assert order_id is not None
+        # Only the market order should be in open_orders (SL failed to place)
+        assert len(adapter.open_orders) == 1
+        assert adapter.open_orders[0].type == "market"
