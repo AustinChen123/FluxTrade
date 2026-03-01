@@ -1,0 +1,30 @@
+INHERIT: mkdocs.yml
+
+site_name: FluxTrade 文件
+site_description: 高性能加密貨幣交易系統 — 實盤 = 回測
+docs_dir: docs/zh-TW
+
+theme:
+  language: zh-TW
+
+nav:
+  - 首頁: index.md
+  - 入門指南:
+    - 安裝: getting-started/installation.md
+    - 快速開始: getting-started/quickstart.md
+    - 第一個回測: getting-started/first-backtest.md
+  - 使用指南:
+    - 撰寫策略: guide/writing-strategies.md
+    - 回測: guide/backtesting.md
+    - 外部訊號: guide/external-signals.md
+    - 實盤交易: guide/live-trading.md
+    - 設定: guide/configuration.md
+  - 架構:
+    - 概覽: architecture/overview.md
+    - 資料流: architecture/data-flow.md
+    - 適配器模式: architecture/adapter-pattern.md
+    - Rust 搓合引擎: architecture/rust-engine.md
+  - API 參考:
+    - 資料模型: api/models.md
+    - 介面: api/interfaces.md
+    - Rust 綁定: api/rust-bindings.md

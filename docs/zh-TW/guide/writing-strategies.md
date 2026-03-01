@@ -1,22 +1,22 @@
-# Writing Strategies
+# 撰寫策略 (Writing Strategies)
 
-This guide covers how to create custom trading strategies for FluxTrade. Every strategy you write runs identically in both **live trading** and **backtesting** -- no code changes required.
-
----
-
-## Core Concepts
-
-A FluxTrade strategy is a Python class that:
-
-1. Extends `BaseStrategy` (an ABC)
-2. Declares its data requirements via the `requirements` property
-3. Implements `on_candle()` to process each candlestick and return a `Signal`
-
-The system handles everything else: order placement, SL/TP/Trailing Stop management, position tracking, and fee accounting. **Strategies only emit Signals** -- they never interact with the exchange directly.
+本指南涵蓋如何為 FluxTrade 建立自訂交易策略 (Strategy)。你所撰寫的每個策略在**實盤交易 (Live Trading)** 與**回測 (Backtesting)** 中都以完全相同的方式執行——不需要修改任何程式碼。
 
 ---
 
-## The BaseStrategy ABC
+## 核心概念
+
+一個 FluxTrade 策略是一個 Python 類別，它：
+
+1. 繼承 `BaseStrategy`（一個 ABC 抽象基底類別）
+2. 透過 `requirements` 屬性宣告其資料需求
+3. 實作 `on_candle()` 來處理每根 K 線 (Candlestick) 並回傳一個 `Signal`
+
+系統會處理其他所有事情：下單、SL/TP/移動停損 (Trailing Stop) 管理、持倉追蹤，以及手續費計算。**策略只發出 Signal**——它們從不直接與交易所互動。
+
+---
+
+## BaseStrategy ABC
 
 ```python
 # python-strategy/src/strategies/base.py
@@ -48,14 +48,14 @@ class BaseStrategy(ABC):
         raise NotImplementedError("Vectorized execution not implemented")
 ```
 
-Every strategy must implement two things:
+每個策略必須實作兩個項目：
 
-| Member | Purpose |
-|--------|---------|
-| `requirements` (property) | Tells the engine what data to feed the strategy |
-| `on_candle(candle)` | Called once per bar; returns a `Signal` |
-| `on_trade(trade)` | Optional: called on tick-level trade data; returns a `Signal` or `None` |
-| `run_vectorized(df)` | Optional: vectorized execution using a Pandas DataFrame (see below) |
+| 成員 | 用途 |
+|------|------|
+| `requirements`（屬性） | 告知引擎需要餵給策略哪些資料 |
+| `on_candle(candle)` | 每根 K 線呼叫一次；回傳一個 `Signal` |
+| `on_trade(trade)` | 選用：在逐筆成交資料 (Tick-level) 上呼叫；回傳 `Signal` 或 `None` |
+| `run_vectorized(df)` | 選用：使用 Pandas DataFrame 的向量化執行（參見下方） |
 
 ---
 
@@ -66,54 +66,54 @@ from dataclasses import dataclass
 
 @dataclass
 class StrategyRequirements:
-    product_id: str          # e.g. "BINANCE:BTCUSDT-PERP"
-    timeframe: str           # e.g. "15m", "1h", "4h"
-    lookback_window: int     # number of historical bars needed before first signal
+    product_id: str          # 例如 "BINANCE:BTCUSDT-PERP"
+    timeframe: str           # 例如 "15m", "1h", "4h"
+    lookback_window: int     # 在第一個訊號前需要多少根歷史 K 線
 ```
 
-The `lookback_window` tells the engine how many bars the strategy needs to accumulate before it can produce meaningful signals. During those initial bars, your strategy should return `SignalType.NO_SIGNAL`.
+`lookback_window` 告知引擎在策略能產生有意義的訊號之前，需要累積多少根 K 線。在這些初始 K 線期間，你的策略應回傳 `SignalType.NO_SIGNAL`。
 
-!!! tip "Timeframe Channel Isolation"
-    The engine only delivers candles matching the strategy's declared `timeframe`. If your strategy declares `"15m"`, it will never see 1h or 4h candles. This isolation is enforced at the Redis stream level.
+!!! tip "時間框架頻道隔離 (Timeframe Channel Isolation)"
+    引擎僅投遞與策略宣告的 `timeframe` 相符的 K 線。如果你的策略宣告 `"15m"`，它永遠不會收到 1h 或 4h 的 K 線。此隔離在 Redis Stream 層級強制執行。
 
 ---
 
-## Signal Model
+## Signal 模型
 
 ```python
 class Signal(BaseFluxModel):
-    strategy_id: str                         # auto-set by engine
-    product_id: str                          # e.g. "BINANCE:BTCUSDT-PERP"
-    timeframe: str                           # e.g. "15m"
-    timestamp: int                           # Unix ms from the candle
+    strategy_id: str                         # 由引擎自動設定
+    product_id: str                          # 例如 "BINANCE:BTCUSDT-PERP"
+    timeframe: str                           # 例如 "15m"
+    timestamp: int                           # 來自 K 線的 Unix 毫秒時間戳
     type: SignalType                         # LONG, SHORT, EXIT_LONG, EXIT_SHORT, NO_SIGNAL
-    value: Optional[Decimal] = None          # indicator value for logging
-    quantity: Optional[Decimal] = None       # position size
-    price: Optional[Decimal] = None          # limit price (None = market order)
-    stop_loss: Optional[Decimal] = None      # absolute SL price
-    take_profit: Optional[Decimal] = None    # absolute TP price
-    trailing_distance: Optional[Decimal] = None  # trailing stop distance
-    metadata: Optional[dict] = None          # arbitrary extra data
+    value: Optional[Decimal] = None          # 用於記錄的指標數值
+    quantity: Optional[Decimal] = None       # 部位大小
+    price: Optional[Decimal] = None          # 限價 (None = 市價單)
+    stop_loss: Optional[Decimal] = None      # 絕對停損價格
+    take_profit: Optional[Decimal] = None    # 絕對停利價格
+    trailing_distance: Optional[Decimal] = None  # 移動停損距離
+    metadata: Optional[dict] = None          # 任意額外資料
 ```
 
-### SignalType Enum
+### SignalType 列舉
 
-| Value | Meaning |
-|-------|---------|
-| `LONG` | Open a long position (or add to existing) |
-| `SHORT` | Open a short position (or add to existing) |
-| `EXIT_LONG` | Close an existing long position |
-| `EXIT_SHORT` | Close an existing short position |
-| `NO_SIGNAL` | No action this bar |
+| 值 | 意義 |
+|----|------|
+| `LONG` | 開多倉（或加倉） |
+| `SHORT` | 開空倉（或加倉） |
+| `EXIT_LONG` | 平掉現有多倉 |
+| `EXIT_SHORT` | 平掉現有空倉 |
+| `NO_SIGNAL` | 本根 K 線不動作 |
 
-!!! warning "All Prices Must Be Decimal"
-    FluxTrade enforces `Decimal` for all financial values. Never use `float` for prices, quantities, or PnL. Import from `decimal` and construct via string: `Decimal("0.01")`.
+!!! warning "所有價格必須使用 Decimal"
+    FluxTrade 對所有財務數值強制使用 `Decimal`。切勿對價格、數量或損益使用 `float`。從 `decimal` 匯入並透過字串建構：`Decimal("0.01")`。
 
 ---
 
-## Complete Example: SMA Crossover Strategy
+## 完整範例：SMA 交叉策略
 
-This strategy goes long when a fast SMA crosses above a slow SMA, and exits when it crosses below.
+此策略在快速 SMA 上穿慢速 SMA 時做多，在下穿時平倉。
 
 ```python
 from collections import deque
@@ -217,16 +217,16 @@ class SmaCrossStrategy(BaseStrategy):
         return Signal(**kwargs)
 ```
 
-!!! note "SL/TP Management"
-    You only need to set `stop_loss` and `take_profit` on entry signals. The Rust matching engine (`PyMatchingEngine`) handles monitoring and triggering these orders automatically on every subsequent bar. Never implement SL/TP checking logic inside `on_candle()`.
+!!! note "SL/TP 管理"
+    你只需要在進場訊號上設定 `stop_loss` 和 `take_profit`。Rust 撮合引擎 (`PyMatchingEngine`) 會在後續每根 K 線上自動監控並觸發這些委託單。永遠不要在 `on_candle()` 內部實作 SL/TP 檢查邏輯。
 
 ---
 
-## Running Your Strategy
+## 執行你的策略
 
-### Backtesting (recommended starting point)
+### 回測（建議起點）
 
-The most common way to run a strategy is through `BacktestRunner`. This feeds historical candle data through the engine, processes signals via the Rust matching engine, and produces performance metrics:
+最常見的策略執行方式是透過 `BacktestRunner`。它將歷史 K 線資料送入引擎，透過 Rust 撮合引擎處理訊號，並產出績效指標：
 
 ```python
 from src.core.backtest_runner import BacktestRunner
@@ -265,11 +265,11 @@ print(f"Win Rate:  {result['win_rate']}")
 print(f"Sharpe:    {result['trade_sharpe']}")
 ```
 
-See the [Backtesting Guide](backtesting.md) for full details on data sources, fee configuration, report output, and result interpretation.
+完整詳情請參閱[回測指南](backtesting.md)，包含資料來源、手續費配置、報告輸出和結果解讀。
 
-### Live Trading (advanced)
+### 實盤交易（進階）
 
-In production, strategies are registered with the `StrategyEngine`, which connects to the Redis-based market data pipeline and routes signals to a live exchange adapter:
+在正式環境中，策略透過 `StrategyEngine` 註冊，引擎會連接到基於 Redis 的行情資料管線，並將訊號路由到實盤交易所適配器 (Adapter)：
 
 ```python
 from src.core.engine import StrategyEngine
@@ -289,13 +289,13 @@ engine.add_strategy(strategy)
 engine.startup()
 ```
 
-`StrategyEngine.startup()` launches background services (heartbeat, command listener, strategy scanner) and begins processing market data from the Rust data service via Redis streams. See the [Live Trading Guide](live-trading.md) for the full deployment workflow.
+`StrategyEngine.startup()` 會啟動背景服務（心跳、指令監聽器、策略掃描器）並開始透過 Redis Streams 從 Rust 資料服務處理行情資料。完整部署流程請參閱[實盤交易指南](live-trading.md)。
 
 ---
 
-## Testing Strategies with MemoryDataSource
+## 使用 MemoryDataSource 測試策略
 
-You can unit-test your strategy without a database or CSV file by using `MemoryDataSource`:
+你可以不需要資料庫或 CSV 檔案，使用 `MemoryDataSource` 對策略進行單元測試：
 
 ```python
 from decimal import Decimal
@@ -342,7 +342,7 @@ for candle in candles:
 assert any(s.type == SignalType.LONG for s in signals)
 ```
 
-For a full end-to-end backtest with order fills and PnL, use `BacktestRunner` with `MemoryDataSource`:
+若要進行包含訂單成交和損益的完整端到端回測，請搭配 `MemoryDataSource` 使用 `BacktestRunner`：
 
 ```python
 from src.core.backtest_runner import BacktestRunner
@@ -367,9 +367,9 @@ print(f"Win Rate: {result['win_rate']}")
 
 ---
 
-## Vectorized Execution (Optional)
+## 向量化執行 (Vectorized Execution)（選用）
 
-For strategies that benefit from batch computation (e.g., indicator-heavy strategies), you can implement `run_vectorized()`. This method receives a Pandas DataFrame with OHLCV columns and should return a DataFrame with a `signal` column.
+對於受益於批次計算的策略（例如指標密集型策略），你可以實作 `run_vectorized()`。此方法接收包含 OHLCV 欄位的 Pandas DataFrame，並應回傳帶有 `signal` 欄位的 DataFrame。
 
 ```python
 import pandas as pd
@@ -399,30 +399,30 @@ class MyVectorizedStrategy(BaseStrategy):
         return df
 ```
 
-The base class raises `NotImplementedError` by default, so this method is entirely optional. The `BacktestRunner` uses the event-driven `on_candle()` path. `run_vectorized()` is available for custom analysis workflows where you want to compute signals over an entire DataFrame at once.
+基底類別預設會拋出 `NotImplementedError`，因此此方法完全是選用的。`BacktestRunner` 使用事件驅動的 `on_candle()` 路徑。`run_vectorized()` 可用於你想一次對整個 DataFrame 計算訊號的自訂分析工作流程。
 
 ---
 
-## Strategy Design Guidelines
+## 策略設計指南
 
-### Do
+### 應該做的
 
-- Return `SignalType.NO_SIGNAL` when there is no clear setup -- the engine expects a Signal on every bar.
-- Use `Decimal` for all price/quantity calculations.
-- Keep a rolling buffer (e.g., `deque(maxlen=...)`) rather than growing a list indefinitely.
-- Set `lookback_window` honestly -- the engine skips signal processing during warmup.
-- Use `self.journal.log()` for structured event recording during backtests.
+- 當沒有明確的交易設置時回傳 `SignalType.NO_SIGNAL`——引擎預期每根 K 線都有一個 Signal。
+- 對所有價格/數量計算使用 `Decimal`。
+- 使用滾動緩衝區（例如 `deque(maxlen=...)`）而非無限增長的列表。
+- 誠實設定 `lookback_window`——引擎在暖機期間會跳過訊號處理。
+- 使用 `self.journal.log()` 在回測期間進行結構化事件記錄。
 
-### Do Not
+### 不應該做的
 
-- Never call exchange APIs from inside `on_candle()` -- the adapter pattern handles this.
-- Never implement SL/TP/Trailing Stop monitoring in your strategy -- the Rust matching engine does this.
-- Never use `float` for prices or quantities.
-- Never assume whether you are in live or backtest mode -- the same code must work in both.
+- 永遠不要在 `on_candle()` 內部呼叫交易所 API——適配器模式 (Adapter Pattern) 會處理這件事。
+- 永遠不要在策略中實作 SL/TP/移動停損監控——Rust 撮合引擎會負責。
+- 永遠不要對價格或數量使用 `float`。
+- 永遠不要假設你處於實盤或回測模式——相同的程式碼必須在兩者中都能運作。
 
 ---
 
-## Next Steps
+## 下一步
 
-- [External Signals](external-signals.md) -- Integrate ML models or replay pre-computed signals
-- [Backtesting](backtesting.md) -- Run full backtests with metrics and reporting
+- [外部訊號](external-signals.md) -- 整合 ML 模型或重播預先計算的訊號
+- [回測](backtesting.md) -- 執行包含指標和報告的完整回測

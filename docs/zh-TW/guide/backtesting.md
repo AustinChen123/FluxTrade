@@ -1,10 +1,10 @@
-# Backtesting
+# 回測 (Backtesting)
 
-FluxTrade provides a full-featured backtesting framework powered by the Rust matching engine. The same strategy code that runs in live trading runs in backtests -- order matching, SL/TP/Trailing Stops, and fee deduction all happen identically via `PyMatchingEngine`.
+FluxTrade 提供由 Rust 撮合引擎驅動的完整回測框架。在實盤交易中執行的相同策略程式碼也可以在回測中執行——訂單撮合、SL/TP/移動停損 (Trailing Stop)，以及手續費扣除全部透過 `PyMatchingEngine` 以相同方式運作。
 
 ---
 
-## Quick Start
+## 快速開始
 
 ```python
 from decimal import Decimal
@@ -43,41 +43,41 @@ print(f"Max Drawdown: {result['max_drawdown']}")
 
 ---
 
-## BacktestRunner Constructor
+## BacktestRunner 建構子
 
 ```python
 BacktestRunner(
-    start_time: int,                           # start timestamp (Unix ms)
-    end_time: int,                             # end timestamp (Unix ms)
-    product_id: str,                           # e.g. "BINANCE:BTCUSDT-PERP"
-    timeframe: str,                            # e.g. "15m", "1h"
-    initial_balance: float = 10000.0,          # starting account balance (USD)
-    max_drawdown_limit: float = 0.20,          # circuit breaker threshold (0.20 = 20%)
-    data_source: Optional[IDataSource] = None, # candle data provider
-    fee_config: Optional[Dict] = None,         # maker/taker fees
-    report_config: Optional[Dict] = None,      # output file toggles
+    start_time: int,                           # 起始時間戳 (Unix ms)
+    end_time: int,                             # 結束時間戳 (Unix ms)
+    product_id: str,                           # 例如 "BINANCE:BTCUSDT-PERP"
+    timeframe: str,                            # 例如 "15m", "1h"
+    initial_balance: float = 10000.0,          # 起始帳戶餘額 (USD)
+    max_drawdown_limit: float = 0.20,          # 熔斷閾值 (0.20 = 20%)
+    data_source: Optional[IDataSource] = None, # K 線資料提供者
+    fee_config: Optional[Dict] = None,         # maker/taker 手續費
+    report_config: Optional[Dict] = None,      # 輸出檔案開關
 )
 ```
 
-### Parameters in Detail
+### 參數詳細說明
 
-| Parameter | Type | Default | Description |
-|-----------|------|---------|-------------|
-| `start_time` | `int` | required | Backtest start, Unix milliseconds |
-| `end_time` | `int` | required | Backtest end, Unix milliseconds |
-| `product_id` | `str` | required | Trading pair identifier |
-| `timeframe` | `str` | required | Candle interval (`1m`, `5m`, `15m`, `1h`, `4h`, `1d`) |
-| `initial_balance` | `float` | `10000.0` | Starting account balance in USD |
-| `max_drawdown_limit` | `float` | `0.20` | Stop backtest if drawdown exceeds this fraction |
-| `data_source` | `IDataSource` | `None` | Candle data provider (falls back to database if `None`) |
-| `fee_config` | `dict` | `{}` | Maker/taker fee rates |
-| `report_config` | `dict` | see below | Controls which output files are generated |
+| 參數 | 型別 | 預設值 | 說明 |
+|------|------|--------|------|
+| `start_time` | `int` | 必填 | 回測起始時間，Unix 毫秒 |
+| `end_time` | `int` | 必填 | 回測結束時間，Unix 毫秒 |
+| `product_id` | `str` | 必填 | 交易對識別碼 |
+| `timeframe` | `str` | 必填 | K 線間隔（`1m`, `5m`, `15m`, `1h`, `4h`, `1d`） |
+| `initial_balance` | `float` | `10000.0` | 起始帳戶餘額（USD） |
+| `max_drawdown_limit` | `float` | `0.20` | 若回撤超過此比例則停止回測 |
+| `data_source` | `IDataSource` | `None` | K 線資料提供者（若為 `None` 則回退至資料庫） |
+| `fee_config` | `dict` | `{}` | Maker/taker 手續費率 |
+| `report_config` | `dict` | 見下方 | 控制產生哪些輸出檔案 |
 
 ---
 
-## Data Sources
+## 資料來源 (Data Sources)
 
-FluxTrade provides four `IDataSource` implementations. All share the same interface:
+FluxTrade 提供四種 `IDataSource` 實作。它們共享相同的介面：
 
 ```python
 class IDataSource(ABC):
@@ -96,12 +96,12 @@ class IDataSource(ABC):
     def validate(self) -> bool: ...
 ```
 
-!!! warning "`get_candles()` returns a Generator, not a list"
-    `get_candles()` yields `Candlestick` objects one at a time via a Python generator. This is critical for memory efficiency with large datasets. If you need all candles in memory, use `list(ds.get_candles(...))` or use `get_candles_df()` for a DataFrame.
+!!! warning "`get_candles()` 回傳的是 Generator，不是 list"
+    `get_candles()` 透過 Python 產生器逐一產出 `Candlestick` 物件。這對大型資料集的記憶體效率至關重要。若你需要所有 K 線都在記憶體中，請使用 `list(ds.get_candles(...))` 或使用 `get_candles_df()` 取得 DataFrame。
 
 ### CsvDataSource
 
-Reads OHLCV data from a CSV file. Auto-detects column naming conventions from TradingView, Yahoo Finance, and standard formats.
+從 CSV 檔案讀取 OHLCV 資料。自動偵測 TradingView、Yahoo Finance 以及標準格式的欄位命名慣例。
 
 ```python
 from src.core.data_sources.csv_source import CsvDataSource
@@ -113,10 +113,10 @@ ds = CsvDataSource(
 )
 ```
 
-Supported column aliases:
+支援的欄位別名：
 
-| Standard | Also Recognized |
-|----------|-----------------|
+| 標準名稱 | 同時識別 |
+|----------|----------|
 | `timestamp` | `time`, `ts`, `date`, `datetime` |
 | `open` | `Open`, `o` |
 | `high` | `High`, `h` |
@@ -124,12 +124,12 @@ Supported column aliases:
 | `close` | `Close`, `c`, `adj close`, `Adj Close` |
 | `volume` | `Volume`, `vol`, `Vol`, `v` |
 
-!!! tip "Timestamp Formats"
-    `CsvDataSource` handles multiple timestamp formats automatically: Unix seconds, Unix milliseconds, and date strings (e.g., `2024-01-15 08:00:00`). Values below `1e12` are treated as seconds and converted to milliseconds.
+!!! tip "時間戳格式"
+    `CsvDataSource` 自動處理多種時間戳格式：Unix 秒、Unix 毫秒，以及日期字串（例如 `2024-01-15 08:00:00`）。低於 `1e12` 的值會被視為秒並轉換為毫秒。
 
 ### MemoryDataSource
 
-In-memory data source for testing and synthetic data. Accepts a list of `Candlestick` objects.
+用於測試和合成資料的記憶體內資料來源。接受 `Candlestick` 物件列表。
 
 ```python
 from src.core.data_sources.memory import MemoryDataSource
@@ -153,7 +153,7 @@ candles = [
 ds = MemoryDataSource(candles)
 ```
 
-You can also add candles incrementally:
+你也可以逐步新增 K 線：
 
 ```python
 ds = MemoryDataSource()
@@ -163,7 +163,7 @@ ds.add_candles(second_batch)  # auto-sorted by timestamp
 
 ### DatabaseDataSource
 
-Reads candles from the PostgreSQL database. Used in production when historical data has been ingested by the Rust data service.
+從 PostgreSQL 資料庫讀取 K 線。用於正式環境中歷史資料已由 Rust 資料服務匯入的情況。
 
 ```python
 from src.core.data_sources.database import DatabaseDataSource
@@ -173,7 +173,7 @@ ds = DatabaseDataSource()  # uses project DB connection
 
 ### YahooFinanceDataSource
 
-Downloads historical data from Yahoo Finance. Useful for quick prototyping with traditional assets.
+從 Yahoo Finance 下載歷史資料。適用於傳統資產的快速原型開發。
 
 ```python
 from src.core.data_sources.yahoo import YahooFinanceDataSource
@@ -183,9 +183,9 @@ ds = YahooFinanceDataSource(ticker="BTC-USD")
 
 ---
 
-## Fee Configuration
+## 手續費配置 (Fee Configuration)
 
-Fees are applied by the Rust matching engine on every fill. Configure them as `Decimal`-compatible values:
+手續費由 Rust 撮合引擎在每次成交時套用。以相容 `Decimal` 的值進行配置：
 
 ```python
 fee_config = {
@@ -194,22 +194,22 @@ fee_config = {
 }
 ```
 
-!!! warning "Fees Are Not Optional"
-    Backtest results without fees are misleading. Always configure realistic fee rates. Common exchange fees:
+!!! warning "手續費不是選用的"
+    不含手續費的回測結果具有誤導性。務必配置真實的手續費率。常見交易所手續費：
 
-    | Exchange | Maker | Taker |
-    |----------|-------|-------|
+    | 交易所 | Maker | Taker |
+    |--------|-------|-------|
     | Binance Futures | 0.0002 | 0.0005 |
     | Bybit | 0.0001 | 0.0006 |
     | Backpack | 0.0002 | 0.0006 |
 
-The `BacktestRunner` converts these to `Decimal` internally and passes them to the Rust `SimulatedAdapter`.
+`BacktestRunner` 會在內部將這些值轉換為 `Decimal` 並傳遞給 Rust `SimulatedAdapter`。
 
 ---
 
-## Report Configuration
+## 報告配置 (Report Configuration)
 
-Control which output files are generated after the backtest:
+控制回測完成後產生哪些輸出檔案：
 
 ```python
 report_config = {
@@ -221,7 +221,7 @@ report_config = {
 }
 ```
 
-Default values (all enabled):
+預設值（全部啟用）：
 
 ```python
 DEFAULT_REPORT_CONFIG = {
@@ -233,20 +233,20 @@ DEFAULT_REPORT_CONFIG = {
 }
 ```
 
-### Output Files
+### 輸出檔案
 
-| File | Contents |
-|------|----------|
+| 檔案 | 內容 |
+|------|------|
 | `trades.csv` | `entry_time, exit_time, side, entry_price, exit_price, quantity, pnl` |
-| `equity_curve.csv` | `bar, equity` -- cumulative PnL after each closed trade |
-| `report.md` | Markdown table with all metrics, monthly returns, and configuration |
-| `journal.jsonl` | Structured event log (signal emissions, fills, errors) in JSON Lines format |
+| `equity_curve.csv` | `bar, equity` -- 每筆平倉交易後的累計損益 |
+| `report.md` | 包含所有指標、月報酬率和配置的 Markdown 表格 |
+| `journal.jsonl` | 結構化事件記錄（訊號發送、成交、錯誤），JSON Lines 格式 |
 
 ---
 
-## Circuit Breaker
+## 熔斷機制 (Circuit Breaker)
 
-The `max_drawdown_limit` parameter acts as a circuit breaker. If the account balance drops below the threshold, the backtest stops immediately.
+`max_drawdown_limit` 參數作為熔斷機制。如果帳戶餘額跌破閾值，回測會立即停止。
 
 ```python
 runner = BacktestRunner(
@@ -256,20 +256,20 @@ runner = BacktestRunner(
 )
 ```
 
-The threshold is computed as:
+閾值的計算方式為：
 
 ```
 stop_threshold = initial_balance * (1 - max_drawdown_limit)
 ```
 
-!!! note "Circuit Breaker vs Strategy Logic"
-    The circuit breaker is a safety mechanism at the runner level. It does not replace risk management inside your strategy (e.g., position sizing, per-trade risk limits). Both should be used together.
+!!! note "熔斷機制 vs 策略邏輯"
+    熔斷機制是 Runner 層級的安全機制。它不能取代策略內部的風險管理（例如部位大小、單筆交易風險限制）。兩者應一起使用。
 
 ---
 
-## Multi-Strategy Backtesting
+## 多策略回測 (Multi-Strategy Backtesting)
 
-Run multiple strategies in the same backtest to compare performance or test portfolio behavior:
+在同一次回測中執行多個策略，以比較績效或測試投資組合行為：
 
 ```python
 from src.strategies.golden_cross import GoldenCrossStrategy
@@ -302,7 +302,7 @@ runner.add_strategy(strategy_b)
 result = runner.run()
 ```
 
-When multiple strategies are registered, the result includes per-strategy metrics:
+當註冊了多個策略時，結果包含各策略的個別指標：
 
 ```python
 # Aggregate metrics
@@ -317,9 +317,9 @@ for strategy_id, metrics in result["per_strategy"].items():
     print(f"  Sharpe:   {metrics['trade_sharpe']}")
 ```
 
-### Capital Allocation with CapitalAllocator
+### 使用 CapitalAllocator 進行資金分配
 
-When running multiple strategies, use `CapitalAllocator` to partition the account balance and prevent strategies from over-committing shared capital:
+執行多個策略時，使用 `CapitalAllocator` 來劃分帳戶餘額，防止策略過度佔用共享資金：
 
 ```python
 from decimal import Decimal
@@ -343,68 +343,68 @@ allocator.release_usage("sma_fast", Decimal("1000"))
 print(allocator.get_available("sma_fast"))   # Decimal('5000')
 ```
 
-Key `CapitalAllocator` methods:
+`CapitalAllocator` 主要方法：
 
-| Method | Description |
-|--------|-------------|
-| `allocate(strategy_id, amount)` | Reserve capital for a strategy |
-| `deallocate(strategy_id)` | Return capital to the pool (fails if capital still in use) |
-| `get_available(strategy_id)` | Allocated minus used |
-| `get_allocation(strategy_id)` | Total allocated |
-| `get_unallocated()` | Remaining unallocated balance |
-| `record_usage(strategy_id, amount)` | Mark capital as in use (position opened) |
-| `release_usage(strategy_id, amount)` | Mark capital as free (position closed) |
-| `update_total_balance(new_balance)` | Adjust total after PnL changes |
+| 方法 | 說明 |
+|------|------|
+| `allocate(strategy_id, amount)` | 為策略預留資金 |
+| `deallocate(strategy_id)` | 將資金歸還資金池（若資金仍在使用中則失敗） |
+| `get_available(strategy_id)` | 已分配減去已使用 |
+| `get_allocation(strategy_id)` | 總分配金額 |
+| `get_unallocated()` | 剩餘未分配餘額 |
+| `record_usage(strategy_id, amount)` | 標記資金為使用中（開倉時） |
+| `release_usage(strategy_id, amount)` | 標記資金為可用（平倉時） |
+| `update_total_balance(new_balance)` | 損益變動後調整總額 |
 
-!!! warning "Thread Safety"
-    `CapitalAllocator` is thread-safe -- all public methods acquire a lock. All monetary values must be `Decimal`; passing `float` raises `TypeError`.
-
----
-
-## Interpreting Results
-
-The `runner.run()` return value is a dictionary with these keys:
-
-### Core Metrics
-
-| Key | Type | Description |
-|-----|------|-------------|
-| `total_pnl` | `Decimal` | Net profit/loss after fees |
-| `total_trades` | `int` | Number of completed round-trip trades |
-| `win_rate` | `Decimal` | Fraction of profitable trades (0.0 -- 1.0) |
-| `profit_factor` | `Decimal` | Gross profit / gross loss (>1.0 is profitable) |
-| `max_drawdown` | `Decimal` | Largest peak-to-trough decline |
-| `trade_sharpe` | `Decimal` | Sharpe ratio computed from per-trade returns |
-| `sortino_ratio` | `Decimal` | Like Sharpe but only penalizes downside volatility |
-| `calmar_ratio` | `Decimal` | Annualized return / max drawdown |
-
-### Detailed Metrics
-
-| Key | Type | Description |
-|-----|------|-------------|
-| `avg_hold_time_hours` | `Decimal` | Average trade duration in hours |
-| `max_consecutive_wins` | `int` | Longest winning streak |
-| `max_consecutive_losses` | `int` | Longest losing streak |
-| `journal_count` | `int` | Number of structured journal events |
-| `report_dir` | `str` | Path to the output directory (or `None`) |
-| `per_strategy` | `dict` | Per-strategy metrics (only for multi-strategy runs) |
-| `journal` | `list[dict]` | Raw journal entries as dictionaries |
-
-### Understanding Key Ratios
-
-**Sharpe Ratio** measures risk-adjusted return. Values above 1.0 indicate good risk-adjusted performance; above 2.0 is excellent.
-
-**Sortino Ratio** is similar to Sharpe but only considers downside deviation. It does not penalize upside volatility, making it more relevant for strategies with asymmetric returns.
-
-**Calmar Ratio** relates annualized return to maximum drawdown. A Calmar above 1.0 means the annualized return exceeds the worst drawdown.
-
-**Profit Factor** is gross profit divided by gross loss. A value of 1.5 means the strategy earns $1.50 for every $1.00 lost.
-
-**Max Drawdown** is the largest peak-to-trough decline in account equity. Combined with `max_drawdown_limit`, this helps assess whether the strategy stays within acceptable risk bounds.
+!!! warning "執行緒安全 (Thread Safety)"
+    `CapitalAllocator` 是執行緒安全的——所有公開方法都會取得鎖。所有金額值必須是 `Decimal`；傳入 `float` 會拋出 `TypeError`。
 
 ---
 
-## Full Example: End-to-End Backtest
+## 解讀結果
+
+`runner.run()` 的回傳值是一個字典，包含以下鍵值：
+
+### 核心指標
+
+| 鍵 | 型別 | 說明 |
+|----|------|------|
+| `total_pnl` | `Decimal` | 扣除手續費後的淨損益 |
+| `total_trades` | `int` | 已完成的往返交易數 |
+| `win_rate` | `Decimal` | 獲利交易的比例（0.0 -- 1.0） |
+| `profit_factor` | `Decimal` | 總獲利 / 總虧損（>1.0 表示獲利） |
+| `max_drawdown` | `Decimal` | 最大峰谷回撤 |
+| `trade_sharpe` | `Decimal` | 根據每筆交易報酬計算的夏普比率 (Sharpe Ratio) |
+| `sortino_ratio` | `Decimal` | 類似夏普比率但僅懲罰下行波動 |
+| `calmar_ratio` | `Decimal` | 年化報酬 / 最大回撤 |
+
+### 詳細指標
+
+| 鍵 | 型別 | 說明 |
+|----|------|------|
+| `avg_hold_time_hours` | `Decimal` | 平均交易持有時間（小時） |
+| `max_consecutive_wins` | `int` | 最長連續獲利次數 |
+| `max_consecutive_losses` | `int` | 最長連續虧損次數 |
+| `journal_count` | `int` | 結構化日誌事件數量 |
+| `report_dir` | `str` | 輸出目錄路徑（或 `None`） |
+| `per_strategy` | `dict` | 各策略指標（僅多策略執行時） |
+| `journal` | `list[dict]` | 原始日誌條目（字典格式） |
+
+### 理解關鍵比率
+
+**夏普比率 (Sharpe Ratio)** 衡量風險調整後報酬。高於 1.0 的值表示良好的風險調整績效；高於 2.0 為優秀。
+
+**索提諾比率 (Sortino Ratio)** 類似於夏普比率，但僅考慮下行偏差。它不懲罰上行波動，因此對於具有不對稱報酬的策略更為相關。
+
+**卡爾瑪比率 (Calmar Ratio)** 將年化報酬與最大回撤聯繫起來。卡爾瑪比率高於 1.0 意味著年化報酬超過最大回撤。
+
+**獲利因子 (Profit Factor)** 是總獲利除以總虧損。1.5 的值意味著策略每虧損 $1.00 就賺取 $1.50。
+
+**最大回撤 (Max Drawdown)** 是帳戶權益中最大的峰谷跌幅。搭配 `max_drawdown_limit`，這有助於評估策略是否保持在可接受的風險範圍內。
+
+---
+
+## 完整範例：端到端回測
 
 ```python
 from decimal import Decimal
@@ -489,7 +489,7 @@ print(f"Reports:           {result['report_dir']}")
 
 ---
 
-## Next Steps
+## 下一步
 
-- [Writing Strategies](writing-strategies.md) -- Build custom strategies with `BaseStrategy`
-- [External Signals](external-signals.md) -- Integrate ML models and CSV signal replay
+- [撰寫策略](writing-strategies.md) -- 使用 `BaseStrategy` 建立自訂策略
+- [外部訊號](external-signals.md) -- 整合 ML 模型和 CSV 訊號重播

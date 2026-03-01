@@ -142,14 +142,22 @@ The `IDataSource` interface (`src/core/interfaces/data_source.py`) abstracts his
 ```python
 class IDataSource(ABC):
     @abstractmethod
-    def get_candles(self, symbol, timeframe, start, end) -> list[Candlestick]: ...
+    def get_candles(
+        self, product_id: str, timeframe: str, start: int, end: int
+    ) -> Generator[Candlestick, None, None]: ...
 
     @abstractmethod
-    def get_candles_df(self, symbol, timeframe, start, end) -> pd.DataFrame: ...
+    def get_candles_df(
+        self, product_id: str, timeframe: str, start: int, end: int
+    ) -> pd.DataFrame: ...
 
     @abstractmethod
-    def get_available_range(self, symbol, timeframe) -> tuple[datetime, datetime]: ...
+    def get_available_range(
+        self, product_id: str, timeframe: str
+    ) -> Optional[tuple[int, int]]: ...
 ```
+
+Note: `get_candles()` returns a **Generator** (not a list), yielding `Candlestick` objects ordered by timestamp ascending. The `start` and `end` parameters are millisecond timestamps (int), and `get_available_range()` returns `Optional[tuple[int, int]]` (min/max ms timestamps) or `None` if no data exists.
 
 Available implementations:
 
@@ -163,44 +171,34 @@ Available implementations:
 ### BacktestRunner Execution Loop
 
 ```python
-# Simplified backtest loop
-for candle in data_source.get_candles(symbol, tf, start, end):
-    # Feed candle to simulated adapter (ticks Rust matching engine)
-    await adapter.on_market_data(candle)
+# Simplified backtest loop (synchronous, not async)
+stop_threshold = initial_balance * (1 - max_drawdown_limit)
 
-    # Engine dispatches to strategies (identical to live path)
-    await engine.on_market_data(candle)
+for candle in data_source.get_candles(product_id, tf, start, end):
+    # Update simulation clock
+    self.clock.set_time(candle.timestamp / 1000)
 
-    # Circuit breaker: halt if drawdown exceeds threshold
-    if circuit_breaker.should_halt(current_equity):
+    # Engine dispatches to strategies + adapter processes fills
+    self.engine.on_market_data(candle)
+
+    # Circuit breaker: halt if balance drops below threshold
+    current_balance = mock_account.get_balance()
+    if current_balance < stop_threshold:
         break
 ```
 
+The loop is **synchronous** (no `await`). It calls only `engine.on_market_data(candle)`, which internally dispatches to strategies and the adapter. The circuit breaker compares the current balance against a pre-computed `stop_threshold` (initial balance times one minus max drawdown limit) -- there is no `.should_halt()` method.
+
 The `BacktestRunner` wraps this loop with progress tracking, performance measurement, and report generation. After the loop completes, `analytics.py` computes trade-level and portfolio-level metrics.
 
-### Rust Matching Engine (matcher.rs)
+### Rust Matching Engine
 
-The `PyMatchingEngine` processes each candle against all open orders:
-
-```
-process_candle(open, high, low, close, volume, timestamp)
-    |
-    for each open order:
-    |   -> Market order?  Fill at open price
-    |   -> Limit order?   Check if price touched limit
-    |   -> Stop-Loss?     Check if low breached SL level
-    |   -> Take-Profit?   Check if high reached TP level
-    |   -> Trailing Stop?  Adjust stop level, check trigger
-    |   -> OCO?           Cancel paired order on fill
-    |
-    -> Apply maker/taker fees to each fill
-    -> Return list of Fill results (as dicts with String values)
-```
-
-All internal arithmetic uses `rust_decimal::Decimal`. The PyO3 boundary serializes values as `String` to preserve precision when crossing into Python.
+The `SimulatedAdapter` delegates all matching to `PyMatchingEngine` in Rust. For each candle, the engine processes open orders by priority (Market > SL/TP/Trailing > Limit), applies fees, manages positions, and returns fill events.
 
 !!! note "Performance"
-    The Rust matching engine processes ~89,000 candles/second with full order matching and fee calculation. A 100K-candle backtest completes in approximately 1.12 seconds.
+    ~89,000 candles/second with full order matching and fee calculation. A 100K-candle backtest completes in approximately 1.12 seconds.
+
+For detailed matching logic, order types, and position management, see [Rust Matching Engine](rust-engine.md).
 
 ## Monitoring Path
 
@@ -219,12 +217,13 @@ app.py (Streamlit)         Render real-time dashboard
 
 ### Heartbeat Data
 
-The engine publishes periodic heartbeats containing:
+The engine's `_start_heartbeat()` runs a background thread that performs three operations every second:
 
-- Active strategy count and status
-- Current USDT balance (via `BALANCE_USDT` Prometheus gauge)
-- Consumer lag per stream (via `CONSUMER_LAG_MS` gauge)
-- Signal and order counters
+1. **Redis key**: Sets `heartbeat:python` with a 3-second TTL (`self.redis_client.setex("heartbeat:python", 3, "1")`)
+2. **Prometheus gauge**: Updates `BALANCE_USDT` with the current account balance
+3. **DB last_heartbeat**: Updates `StrategyState.last_heartbeat` for all active strategies with the current timestamp
+
+The heartbeat does **not** publish strategy count, consumer lag, or signal counters.
 
 ### Prometheus Metrics
 

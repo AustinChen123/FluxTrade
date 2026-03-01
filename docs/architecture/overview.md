@@ -129,15 +129,56 @@ The Python service contains the trading logic, execution pipeline, risk manageme
 
 Three core abstractions decouple the system:
 
-- **`IExchangeAdapter`**: `place_order()`, `cancel_order()`, `get_balance()`, `on_market_data()`
-- **`IDataSource`**: `get_candles()`, `get_candles_df()`, `get_available_range()`
-- **`IOrderRepository`**: `add_order()`, `update_order()`, `update_position()`
+**IExchangeAdapter** (`interfaces/exchange.py`):
+
+```python
+class IExchangeAdapter(ABC):
+    @abstractmethod
+    def place_order(self, order: Order) -> str: ...
+    @abstractmethod
+    def cancel_order(self, order_id: str, product_id: str) -> bool: ...
+    @abstractmethod
+    def get_balance(self, asset: str) -> Decimal: ...
+    @abstractmethod
+    def get_position(self, product_id: str) -> Optional[Position]: ...
+    def on_market_data(self, candle: Candlestick) -> List[Dict]: ...
+```
+
+**IDataSource** (`interfaces/data_source.py`):
+
+```python
+class IDataSource(ABC):
+    @abstractmethod
+    def get_candles(self, product_id: str, timeframe: str, start: int, end: int) -> Generator[Candlestick, None, None]: ...
+    @abstractmethod
+    def get_candles_df(self, product_id: str, timeframe: str, start: int, end: int) -> pd.DataFrame: ...
+    @abstractmethod
+    def get_available_range(self, product_id: str, timeframe: str) -> Optional[tuple[int, int]]: ...
+```
+
+**IOrderRepository** (`interfaces/repository.py`):
+
+```python
+class IOrderRepository(ABC):
+    @abstractmethod
+    def add_order(self, order: Order) -> None: ...
+    @abstractmethod
+    def update_order(self, order: Order) -> None: ...
+    @abstractmethod
+    def update_order_exchange_id(self, order: Order, exchange_order_id: str) -> None: ...
+    @abstractmethod
+    def add_trade(self, trade: Trade) -> None: ...
+    @abstractmethod
+    def update_position(self, strategy_id: str, product_id: str, side: str, fill_quantity: Decimal, fill_price: Decimal, position_side: str) -> None: ...
+    @abstractmethod
+    def get_position(self, strategy_id: str, product_id: str, side: str) -> Optional[Position]: ...
+```
 
 ### Strategies (`src/strategies/`)
 
 All strategies extend `BaseStrategy` and implement `on_candle()`. They emit `Signal` objects with entry parameters, stop-loss, take-profit, and trailing stop configuration. Strategies never manage order lifecycle directly.
 
-Available strategies: `golden_cross`, `rsi_scalper`, `bb_reversion`, `macd_momentum`, `market_structure_strategy`, `smc_strategy`.
+Available strategies: `golden_cross`, `rsi_scalper`, `bb_reversion`, `macd_momentum`, `market_structure_strategy`, `smc_strategy`, `callable_strategy`, `csv_signal_strategy`.
 
 Hot-pluggable strategies can be loaded at runtime from the `strategies_hot/` directory without system restart.
 
@@ -177,6 +218,6 @@ All financial calculations use `Decimal` (Python) or `rust_decimal::Decimal` (Ru
 
 ## Test Coverage
 
-- **771 total tests**: 654 Python unit + 52 integration + 65 Rust
-- **Python coverage**: 77.07% (CI gate: 77%)
+- **750 total tests**: 616 Python unit + 69 integration + 65 Rust
+- **Python coverage**: 78.26% (CI gate: 77%)
 - **Key test patterns**: Factory-based fixtures via `conftest.py` (700+ lines), `spec`-based mocks, selective failure injection via `MockExchangeAdapter`

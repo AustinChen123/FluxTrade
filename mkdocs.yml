@@ -3,6 +3,7 @@ site_description: High-performance crypto trading system — Live = Backtest
 
 theme:
   name: material
+  language: en
   palette:
     - scheme: slate
       primary: deep purple
@@ -13,6 +14,15 @@ theme:
     - navigation.expand
     - content.code.copy
     - search.suggest
+
+extra:
+  alternate:
+    - name: English
+      link: /
+      lang: en
+    - name: 繁體中文
+      link: /zh-TW/
+      lang: zh-TW
 
 nav:
   - Home: index.md
@@ -31,12 +41,9 @@ nav:
     - Data Flow: architecture/data-flow.md
     - Adapter Pattern: architecture/adapter-pattern.md
     - Rust Engine: architecture/rust-engine.md
-    - Design Decisions: architecture/design-decisions.md
   - API Reference:
-    - Strategies: api/strategies.md
     - Models: api/models.md
     - Interfaces: api/interfaces.md
-    - Engine: api/engine.md
     - Rust Bindings: api/rust-bindings.md
 
 plugins:
