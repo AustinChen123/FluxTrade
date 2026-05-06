@@ -1,4 +1,16 @@
-from sqlalchemy import Column, String, BigInteger, Numeric, ForeignKey, Text, UniqueConstraint
+from sqlalchemy import (
+    BigInteger,
+    CheckConstraint,
+    Column,
+    DateTime,
+    ForeignKey,
+    Numeric,
+    String,
+    Text,
+    UniqueConstraint,
+    func,
+)
+from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.orm import declarative_base
 
 Base = declarative_base()
@@ -48,6 +60,13 @@ class Order(Base):
     timestamp = Column(BigInteger, nullable=False)
     filled_quantity = Column(Numeric, nullable=True, default=0)
     filled_price = Column(Numeric, nullable=True)
+
+    # Migration 5 — idempotency / lifecycle columns.
+    client_order_id = Column(String(128), nullable=True)
+    intent_payload = Column(JSONB, nullable=True)
+    submitted_at = Column(DateTime(timezone=True), nullable=True)
+    acked_at = Column(DateTime(timezone=True), nullable=True)
+    last_reconciled_at = Column(DateTime(timezone=True), nullable=True)
 
     __table_args__ = (
         UniqueConstraint('exchange_order_id', 'exchange_id', name='uq_order_exchange_id'),
@@ -106,7 +125,50 @@ class SignalAudit(Base):
 
     order_id = Column(String, nullable=True)
 
-    details_json = Column(Text, nullable=True)
+    # Migration 5 — TEXT upgraded to JSONB.
+    details_json = Column(JSONB, nullable=True)
+
+    # Migration 5 — Path B audit linkage + multi-signal batch correlation.
+    client_order_id = Column(String(128), nullable=True)
+
+    intent_payload = Column(JSONB, nullable=True)
+
+    outcome_payload = Column(JSONB, nullable=True)
+
+    signal_batch_id = Column(String(64), nullable=True)
+
+
+class SystemEvent(Base):
+    """Cross-cutting system events log (Migration 5).
+
+    Captures reconcile / gene_promote / gene_retire / system_error events
+    so that operational tooling can audit non-trade activity without
+    polluting the trade audit tables. ``related_order_id`` is a string FK
+    because ``order.id`` itself is a string PK in this codebase.
+    """
+
+    __tablename__ = 'system_events'
+
+    id = Column(BigInteger, primary_key=True, autoincrement=True)
+    event_type = Column(String(64), nullable=False)
+    event_subtype = Column(String(64), nullable=True)
+    related_strategy_id = Column(String, ForeignKey('strategy.id'), nullable=True)
+    related_order_id = Column(String, ForeignKey('order.id'), nullable=True)
+    # No FK — gene_records lands in migration 7.
+    related_gene_id = Column(BigInteger, nullable=True)
+    payload = Column(JSONB, nullable=False)
+    created_at = Column(
+        DateTime(timezone=True),
+        nullable=False,
+        server_default=func.now(),
+    )
+
+    __table_args__ = (
+        CheckConstraint(
+            "event_type IN ('reconcile','gene_promote','gene_retire','system_error')",
+            name='chk_system_events_type',
+        ),
+    )
 
 
 class BacktestResultSummary(Base):
