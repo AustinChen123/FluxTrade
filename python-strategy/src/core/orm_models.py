@@ -2,8 +2,10 @@ from sqlalchemy import (
     BigInteger,
     CheckConstraint,
     Column,
+    Date,
     DateTime,
     ForeignKey,
+    Integer,
     Numeric,
     String,
     Text,
@@ -203,3 +205,87 @@ class StrategyState(Base):
     performance_json = Column(Text, nullable=True)
     last_heartbeat = Column(BigInteger, nullable=True)
     uptime_start = Column(BigInteger, nullable=True)
+
+    # Migration 6 — audit / lifecycle metadata + optimistic-lock version.
+    last_error_message = Column(Text, nullable=True)
+    entered_error_at = Column(DateTime(timezone=True), nullable=True)
+    recovered_at = Column(DateTime(timezone=True), nullable=True)
+    stopped_at = Column(DateTime(timezone=True), nullable=True)
+    version = Column(Integer, nullable=False, server_default='0')
+
+    __table_args__ = (
+        CheckConstraint(
+            "status <> 'ERROR' OR "
+            "(entered_error_at IS NOT NULL AND last_error_message IS NOT NULL)",
+            name='chk_error_state',
+        ),
+        CheckConstraint(
+            "status <> 'STOPPED' OR stopped_at IS NOT NULL",
+            name='chk_stopped_state',
+        ),
+    )
+
+
+class StrategyStateTransition(Base):
+    """Append-only audit log of strategy status transitions (Migration 6).
+
+    Each row captures one ``from_status -> to_status`` change so operators
+    can reconstruct the lifecycle of any strategy without relying on the
+    point-in-time ``strategy_state`` row.
+    """
+
+    __tablename__ = 'strategy_state_transitions'
+
+    id = Column(BigInteger, primary_key=True, autoincrement=True)
+    strategy_id = Column(String, ForeignKey('strategy.id'), nullable=False)
+    from_status = Column(String(32), nullable=False)
+    to_status = Column(String(32), nullable=False)
+    transitioned_at = Column(
+        DateTime(timezone=True),
+        nullable=False,
+        server_default=func.now(),
+    )
+    reason = Column(Text, nullable=True)
+    actor = Column(String(64), nullable=True)
+
+
+class DailyNavSnapshot(Base):
+    """End-of-day NAV snapshot per strategy (Migration 6).
+
+    Used to compute realised drawdown / period returns without scanning
+    the trade log. ``nav`` is ``NUMERIC(28, 8)`` — float is forbidden for
+    monetary values per FluxTrade Decimal rules.
+    """
+
+    __tablename__ = 'daily_nav_snapshots'
+
+    id = Column(BigInteger, primary_key=True, autoincrement=True)
+    strategy_id = Column(String, ForeignKey('strategy.id'), nullable=False)
+    snapshot_date = Column(Date, nullable=False)
+    nav = Column(Numeric(28, 8), nullable=False)
+    base_currency = Column(String(16), nullable=False)
+    drawdown = Column(Numeric(10, 8), nullable=True)
+    return_pct = Column(Numeric(10, 8), nullable=True)
+    source = Column(
+        String(32),
+        nullable=False,
+        server_default='eod_snapshot',
+    )
+    recorded_at = Column(
+        DateTime(timezone=True),
+        nullable=False,
+        server_default=func.now(),
+    )
+    notes = Column(Text, nullable=True)
+
+    __table_args__ = (
+        CheckConstraint(
+            "source IN ('eod_snapshot','startup_reconcile','manual')",
+            name='chk_nav_source',
+        ),
+        UniqueConstraint(
+            'strategy_id',
+            'snapshot_date',
+            name='uq_daily_nav_strategy_date',
+        ),
+    )
