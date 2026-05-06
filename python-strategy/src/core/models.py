@@ -53,6 +53,17 @@ class StrategyStatus(str, Enum):
     STOPPED = "STOPPED"
     ERROR = "ERROR"
 
+
+class GeneRole(str, Enum):
+    """Lifecycle role of a GA gene record (Migration 7).
+
+    Values are lower-case to match the DB CHECK constraint ``chk_gene_role``
+    on ``gene_records.role``.
+    """
+    CHALLENGER = "challenger"
+    CHAMPION = "champion"
+    RETIRED = "retired"
+
 class BaseFluxModel(BaseModel):
     """Base model with common configuration"""
     model_config = ConfigDict(

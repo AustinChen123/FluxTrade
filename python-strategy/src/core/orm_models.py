@@ -289,3 +289,87 @@ class DailyNavSnapshot(Base):
             name='uq_daily_nav_strategy_date',
         ),
     )
+
+
+class EvolutionEpoch(Base):
+    """GA evolution epoch record (Migration 7).
+
+    Append-only ledger of every GA run. The four ``eval_*`` columns are
+    mandatory because ``best_score`` is only meaningful when paired with
+    its evaluation context (pair / window / timeframe).
+    """
+
+    __tablename__ = 'evolution_epochs'
+
+    id = Column(String(64), primary_key=True)
+    strategy_id = Column(String, ForeignKey('strategy.id'), nullable=False)
+    started_at = Column(DateTime(timezone=True), nullable=False)
+    finished_at = Column(DateTime(timezone=True), nullable=True)
+    pop_size = Column(Integer, nullable=False)
+    max_generations = Column(Integer, nullable=False)
+    generations_run = Column(Integer, nullable=True)
+    # Numeric (Decimal) — float forbidden for monetary / ratio values.
+    best_score = Column(Numeric(18, 8), nullable=True)
+    seed = Column(BigInteger, nullable=False)
+    config_json = Column(
+        JSONB,
+        nullable=False,
+        server_default="'{}'::jsonb",
+    )
+    status = Column(
+        String(32),
+        nullable=False,
+        server_default='running',
+    )
+    eval_pair = Column(String(32), nullable=False)
+    eval_start_date = Column(Date, nullable=False)
+    eval_end_date = Column(Date, nullable=False)
+    eval_timeframe = Column(String(8), nullable=False)
+    notes = Column(Text, nullable=True)
+
+    __table_args__ = (
+        CheckConstraint(
+            "status IN ('running', 'completed', 'aborted')",
+            name='chk_epoch_status',
+        ),
+    )
+
+
+class GeneRecord(Base):
+    """GA gene record with role lifecycle (Migration 7).
+
+    Role transitions: ``challenger`` -> ``champion`` -> ``retired``. At
+    most one ``champion`` per strategy is enforced by a partial unique
+    index (defined in the migration via raw DDL).
+    """
+
+    __tablename__ = 'gene_records'
+
+    id = Column(BigInteger, primary_key=True, autoincrement=True)
+    strategy_id = Column(String, ForeignKey('strategy.id'), nullable=False)
+    role = Column(String(16), nullable=False)
+    param_pack = Column(JSONB, nullable=False)
+    # Numeric (Decimal) — float forbidden per project rules.
+    score_total = Column(Numeric(18, 8), nullable=False)
+    score_breakdown = Column(JSONB, nullable=False)
+    max_drawdown = Column(Numeric(10, 8), nullable=False)
+    epoch_id = Column(
+        String(64),
+        ForeignKey('evolution_epochs.id'),
+        nullable=False,
+    )
+    created_at = Column(
+        DateTime(timezone=True),
+        nullable=False,
+        server_default=func.now(),
+    )
+    activated_at = Column(DateTime(timezone=True), nullable=True)
+    retired_at = Column(DateTime(timezone=True), nullable=True)
+    notes = Column(Text, nullable=True)
+
+    __table_args__ = (
+        CheckConstraint(
+            "role IN ('challenger', 'champion', 'retired')",
+            name='chk_gene_role',
+        ),
+    )
