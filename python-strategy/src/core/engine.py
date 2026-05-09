@@ -143,8 +143,10 @@ class StrategyEngine:
         """
         Routes commands to specific handlers.
         """
-        cmd = data.get("command")
-        params = data.get("params", {})
+        cmd = str(data.get("command") or data.get("cmd") or "").upper()
+        params = data.get("params") or {}
+        if not isinstance(params, dict):
+            params = {}
         
         logger.info("Received Command: %s with params %s", cmd, params)
         
@@ -153,12 +155,12 @@ class StrategyEngine:
                 self.scan_strategies()
             elif cmd == "TEST_RUN":
                 self.test_run_strategy(params.get("id"), params.get("days", 1))
-            elif cmd == "START":
-                self.start_strategy(params.get("id"))
-            elif cmd == "STOP":
-                self.stop_strategy(params.get("id"))
             else:
-                logger.warning("Unknown command: %s", cmd)
+                result = self._command_router.handle(data)
+                if result.success:
+                    logger.info("Command %s succeeded: %s", cmd, result.message)
+                else:
+                    logger.warning("Command %s failed: %s", cmd, result.message)
         except Exception as e:
             logger.error("Error executing command %s: %s\n%s", cmd, e, traceback.format_exc())
 

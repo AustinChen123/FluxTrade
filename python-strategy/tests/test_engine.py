@@ -476,6 +476,15 @@ class TestHandleCommand:
 
         engine.stop_strategy.assert_called_once_with("strat_1")
 
+    def test_router_command_delegated(self, engine):
+        """Router-owned commands should be delegated to CommandRouter."""
+        engine._command_router.handle = MagicMock()
+
+        data = {"command": "LIST"}
+        engine._handle_command(data)
+
+        engine._command_router.handle.assert_called_once_with(data)
+
     def test_test_run_command(self, engine):
         """TEST_RUN command should call test_run_strategy with id and days."""
         engine.test_run_strategy = MagicMock()
