@@ -126,6 +126,14 @@ class TestEngineInit:
         assert engine.strategies == {}
         assert engine.strategy_instances == {}
 
+    def test_component_scaffold_created(self, engine):
+        """Engine should wire the extracted Phase 1 components."""
+        assert engine._registry.list_active() == []
+        assert engine._health_monitor.registry is engine._registry
+        assert engine._command_router.registry is engine._registry
+        assert engine._signal_processor.registry is engine._registry
+        assert engine._signal_processor.execution_engine is engine.execution_engine
+
 
 # =============================================================================
 # add_strategy (legacy)
@@ -146,6 +154,12 @@ class TestAddStrategy:
         engine.add_strategy(strategy_instance)
 
         assert "test_strat" in engine.strategy_instances
+
+    def test_registers_strategy_in_registry(self, engine, strategy_instance):
+        """Should keep the new registry in sync with legacy dicts."""
+        engine.add_strategy(strategy_instance)
+
+        assert engine._registry.get("test_strat") is strategy_instance
 
     def test_multiple_strategies_same_product(self, engine, mock_strategy_class):
         """Multiple strategies on same product should coexist."""
@@ -179,6 +193,12 @@ class TestBuildStreamChannels:
     def test_empty_when_no_strategies(self, engine):
         """Should return empty list when no strategies registered."""
         assert engine.build_stream_channels() == []
+
+    def test_channels_use_registry(self, engine, strategy_instance):
+        """Stream channels should be derived from StrategyRegistry."""
+        engine._registry.register(strategy_instance)
+
+        assert engine.build_stream_channels() == ["stream:market:binance:btcusdt:1m"]
 
     def test_single_strategy_channel(self, engine, strategy_instance):
         """Should derive correct Redis stream key."""

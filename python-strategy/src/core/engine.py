@@ -22,10 +22,31 @@ from src.core.adapters import create_adapter
 from src.core.journal import StrategyJournal
 from src.core.redis_factory import create_redis_client
 from src.core.metrics import SIGNALS_TOTAL, ACTIVE_STRATEGIES, BALANCE_USDT
+from src.core.command_router import CommandRouter
+from src.core.health_monitor import HealthMonitor
+from src.core.signal_processor import SignalProcessor
+from src.core.strategy_registry import StrategyRegistry
 
 HOT_STRATEGIES_PATH = os.getenv('HOT_STRATEGIES_PATH', '/app/strategies_hot')
 
 logger = logging.getLogger(__name__)
+
+
+class _EngineStateAdapter:
+    """Temporary state-manager adapter until Phase 5 lands."""
+
+    def __init__(self, engine: "StrategyEngine") -> None:
+        self._engine = engine
+
+    def transition_to_running(self, strategy_id: str) -> None:
+        self._engine.start_strategy(strategy_id)
+
+    def transition_to_stopped(self, strategy_id: str) -> None:
+        self._engine.stop_strategy(strategy_id)
+
+    def is_running(self, strategy_id: str) -> bool:
+        return strategy_id in self._engine.strategy_instances
+
 
 class StrategyEngine:
     def __init__(
@@ -44,6 +65,7 @@ class StrategyEngine:
         self.strategy_instances: Dict[str, BaseStrategy] = {}
         self.loaded_classes: Dict[str, Type[BaseStrategy]] = {}
         self._strategy_lock = threading.Lock()
+        self._registry = StrategyRegistry()
 
         # Initialize Services
         self.account_service = account_service if account_service else AccountService()
@@ -63,6 +85,18 @@ class StrategyEngine:
             logger.info("StrategyEngine: Using provided adapter %s", type(adapter).__name__)
 
         self.execution_engine = ExecutionEngine(db_session, clock, adapter, order_repository, journal=journal)
+        self._state_manager = _EngineStateAdapter(self)
+        self._health_monitor = HealthMonitor(self._registry)
+        self._command_router = CommandRouter(
+            self._registry,
+            self._state_manager,
+            self._health_monitor,
+        )
+        self._signal_processor = SignalProcessor(
+            self._registry,
+            self.execution_engine,
+            self._state_manager,
+        )
         
         # System State & Heartbeat
         self.redis_client = create_redis_client()
@@ -346,19 +380,20 @@ class StrategyEngine:
                 self.strategies[strategy.product_id] = []
             self.strategies[strategy.product_id].append(strategy)
             self.strategy_instances[strategy.strategy_id] = strategy
+            self._registry.register(strategy)
             ACTIVE_STRATEGIES.set(len(self.strategy_instances))
         logger.info("Registered strategy (legacy): %s for %s", strategy.strategy_id, strategy.product_id)
 
     def build_stream_channels(self) -> list:
         """Derive Redis stream keys from registered strategy requirements."""
         channels = set()
-        for product_id, strategies in self.strategies.items():
+        for strat in self._registry.list_active():
+            product_id = strat.product_id
             parts = product_id.split(":")
             exchange = parts[0].lower()
             symbol = parts[1].replace("-PERP", "").lower()
-            for strat in strategies:
-                tf = strat.requirements.timeframe
-                channels.add(f"stream:market:{exchange}:{symbol}:{tf}")
+            tf = strat.requirements.timeframe
+            channels.add(f"stream:market:{exchange}:{symbol}:{tf}")
         return sorted(channels)
 
     def on_market_data(self, data: Union[Candlestick, Trade]):
