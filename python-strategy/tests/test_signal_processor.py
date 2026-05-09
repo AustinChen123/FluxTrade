@@ -164,6 +164,19 @@ def test_process_signals_executes_multiple_actionable_signals() -> None:
     execution.execute_signal.assert_any_call(signals[1], candle)
 
 
+def test_process_signals_uses_signal_handler_when_provided() -> None:
+    execution = MagicMock()
+    signal_handler = MagicMock()
+    processor = SignalProcessor(StrategyRegistry(), execution, signal_handler=signal_handler)
+    candle = make_candle()
+    signal = make_signal("s1", SignalType.LONG)
+
+    processor._process_signals("s1", [signal], candle)
+
+    signal_handler.assert_called_once_with(signal, candle)
+    execution.execute_signal.assert_not_called()
+
+
 def test_strategy_exception_does_not_stop_other_strategies() -> None:
     good_signal = make_signal("good")
     failing = DummyStrategy("bad", should_raise=True)

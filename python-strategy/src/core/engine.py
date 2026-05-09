@@ -96,6 +96,7 @@ class StrategyEngine:
             self._registry,
             self.execution_engine,
             self._state_manager,
+            lambda signal, candle: self.process_signal(signal, candle),
         )
         
         # System State & Heartbeat
@@ -400,9 +401,11 @@ class StrategyEngine:
         """
         Callback triggered by DataConsumer when new market data arrives.
         """
-        # Simulation/Backtest: Check for pending order fills
         if isinstance(data, Candlestick):
+            # Simulation/Backtest: check fills before strategy signals can create new orders.
             self.execution_engine.process_market_data(data)
+            self._signal_processor.on_candle(data)
+            return
 
         # Copy strategy list under lock to avoid race with stop_strategy
         with self._strategy_lock:

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+from collections.abc import Callable
 from typing import Any, Optional
 
 from src.core.models import Candlestick, Signal, SignalType
@@ -20,10 +21,12 @@ class SignalProcessor:
         registry: StrategyRegistry,
         execution_engine: Any,
         state_manager: Any | None = None,
+        signal_handler: Callable[[Signal, Optional[Candlestick]], None] | None = None,
     ) -> None:
         self.registry = registry
         self.execution_engine = execution_engine
         self.state_manager = state_manager
+        self.signal_handler = signal_handler
 
     def on_candle(self, candle: Candlestick) -> None:
         """Route a candle to matching, running strategies."""
@@ -80,4 +83,7 @@ class SignalProcessor:
                     strategy_id,
                     signal.strategy_id,
                 )
-            self.execution_engine.execute_signal(signal, candle)
+            if self.signal_handler is not None:
+                self.signal_handler(signal, candle)
+            else:
+                self.execution_engine.execute_signal(signal, candle)
