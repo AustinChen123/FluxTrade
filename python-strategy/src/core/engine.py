@@ -10,7 +10,7 @@ from concurrent.futures import ThreadPoolExecutor
 from typing import Callable, ContextManager, List, Union, Optional, Dict, Type
 from sqlalchemy.orm import Session
 from src.core.models import Candlestick, Trade, Signal, SignalType, StrategyStatus
-from src.core.orm_models import SignalAudit, StrategyState
+from src.core.orm_models import StrategyState
 from src.strategies.base import BaseStrategy
 from src.core.risk_manager import RiskManager, AccountService
 from src.core.execution import ExecutionEngine
@@ -26,6 +26,7 @@ from src.core.command_router import CommandRouter
 from src.core.health_monitor import HealthMonitor
 from src.core.signal_processor import SignalProcessor
 from src.core.strategy_registry import StrategyRegistry
+from src.core.audit_service import build_signal_audit, commit_signal_audit
 
 HOT_STRATEGIES_PATH = os.getenv('HOT_STRATEGIES_PATH', '/app/strategies_hot')
 
@@ -453,26 +454,16 @@ class StrategyEngine:
             logger.info("✅ SIGNAL ACCEPTED: %s. Forwarding to Execution Engine...", signal.type)
             order_id = self.execution_engine.execute_signal(signal, candle)
         
-        audit = SignalAudit(
-            timestamp=int(self.clock.now() * 1000),
-            strategy_id=signal.strategy_id,
-            product_id=signal.product_id,
-            signal_type=signal.type.value,
-            risk_status="PASS" if is_passed else "REJECT",
+        audit = build_signal_audit(
+            clock=self.clock,
+            signal=signal,
+            candle=candle,
+            risk_passed=is_passed,
             risk_message=risk_msg,
             order_id=order_id,
-            details_json=json.dumps({
-                "candle": candle.model_dump(mode='json') if candle else None,
-                "signal_metadata": signal.metadata
-            })
         )
         with self._db_session_factory() as db:
-            try:
-                db.add(audit)
-                db.commit()
-            except Exception:
-                db.rollback()
-                raise
+            commit_signal_audit(db, audit)
 
     def shutdown(self, timeout: float = 30.0):
         """Graceful shutdown: stop threads, drain executor, close Redis."""
