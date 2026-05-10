@@ -5,6 +5,7 @@ Falls back to REST (parent class) when WS is unavailable.
 """
 
 import logging
+import asyncio
 
 from src.core.adapters.ccxt_adapter import CcxtExchangeAdapter
 from src.core.orm_models import Order
@@ -59,8 +60,13 @@ class LiveBinanceAdapter(CcxtExchangeAdapter):
                     quantity=str(order.quantity),
                     price=str(order.price) if order.price else None,
                     order_type=order.type,
+                    client_order_id=getattr(order, "client_order_id", None),
                 )
                 if success:
+                    client_order_id = getattr(order, "client_order_id", None)
+                    if client_order_id:
+                        ack = asyncio.run(self.ws_connector._wait_for_ack(client_order_id))
+                        return ack.exchange_order_id
                     return f"WS-{order.id}"
             except Exception as e:
                 self.logger.warning("WS order failed, falling back to REST: %s", e)

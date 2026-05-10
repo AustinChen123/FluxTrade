@@ -1,4 +1,6 @@
 import asyncio
+import json
+from unittest.mock import MagicMock, patch
 
 import pytest
 
@@ -73,3 +75,33 @@ def test_handle_message_records_ack() -> None:
     )
 
     assert connector._ack_registry["coid-1"] == ExchangeAck("ex-1", "SUBMITTED")
+
+
+def test_place_order_includes_client_order_id() -> None:
+    connector = WebSocketOrderConnector("key", "secret")
+    connector.running = True
+    connector.ws = MagicMock()
+    connector.loop = MagicMock()
+    captured = {}
+
+    async def fake_send(data):
+        captured["payload"] = data
+
+    with patch("src.core.ws_connector.asyncio.run_coroutine_threadsafe") as send:
+        connector.ws.send.side_effect = fake_send
+        result = connector.place_order(
+            symbol="BTCUSDT",
+            side="buy",
+            quantity=0.1,
+            order_type="market",
+            client_order_id="client-123",
+        )
+
+    assert result is True
+    coro = send.call_args.args[0]
+    try:
+        coro.send(None)
+    except StopIteration:
+        pass
+    payload = json.loads(captured["payload"])
+    assert payload["params"]["newClientOrderId"] == "client-123"

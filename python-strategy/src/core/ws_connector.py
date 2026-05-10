@@ -178,7 +178,15 @@ class WebSocketOrderConnector:
             await asyncio.sleep(min(delay, remaining))
             delay = min(delay * 2, 0.25)
 
-    def place_order(self, symbol: str, side: str, quantity: float, price: Optional[float] = None, order_type: str = "MARKET") -> bool:
+    def place_order(
+        self,
+        symbol: str,
+        side: str,
+        quantity: float,
+        price: Optional[float] = None,
+        order_type: str = "MARKET",
+        client_order_id: Optional[str] = None,
+    ) -> bool:
         """
         Sends order via WebSocket. Returns True if sent (async), False if failed/fallback needed.
         """
@@ -201,6 +209,8 @@ class WebSocketOrderConnector:
             },
             "id": int(time.time() * 1000)
         }
+        if client_order_id:
+            payload["params"]["newClientOrderId"] = client_order_id
         
         # Sign payload
         self._sign_payload(payload)

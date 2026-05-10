@@ -28,6 +28,7 @@ def _make_order(**overrides) -> Order:
         "price": None,
         "status": "OPEN",
         "exchange_order_id": None,
+        "client_order_id": None,
     }
     defaults.update(overrides)
     order = MagicMock(spec=Order)
@@ -346,14 +347,47 @@ class TestLiveBinanceWsOrderPath:
             mock_ws_inst = MagicMock()
             mock_ws_inst.is_connected.return_value = True
             mock_ws_inst.place_order.return_value = True
+
+            async def wait_for_ack(client_order_id):
+                return MagicMock(exchange_order_id="WS-123")
+
+            mock_ws_inst._wait_for_ack.side_effect = wait_for_ack
             MockWS.return_value = mock_ws_inst
 
             adapter = LiveBinanceAdapter(api_key="k", secret="s", enable_ws=True)
-            order = _make_order(type="market")
+            order = _make_order(type="market", client_order_id="client-123")
             result = adapter.place_order(order)
 
-            assert result.startswith("WS-")
+            assert result == "WS-123"
             mock_ws_inst.place_order.assert_called_once()
+            assert mock_ws_inst.place_order.call_args.kwargs["client_order_id"] == "client-123"
+            mock_ws_inst._wait_for_ack.assert_called_once_with("client-123")
+
+    def test_ws_ack_timeout_falls_back_to_rest(self):
+        """WS ACK timeout should fall back to REST."""
+        with patch("src.core.adapters.ccxt_adapter.ccxt") as mock_ccxt, \
+             patch("src.core.adapters.live_binance.WebSocketOrderConnector") as MockWS:
+            mock_cls = MagicMock()
+            client = MagicMock()
+            client.apiKey = "k"
+            client.secret = "s"
+            client.create_order.return_value = {"id": "REST-ACK-TIMEOUT"}
+            mock_cls.return_value = client
+            mock_ccxt.binance = mock_cls
+            setattr(mock_ccxt, "binance", mock_cls)
+
+            mock_ws_inst = MagicMock()
+            mock_ws_inst.is_connected.return_value = True
+            mock_ws_inst.place_order.return_value = True
+            mock_ws_inst._wait_for_ack.side_effect = TimeoutError("ack timeout")
+            MockWS.return_value = mock_ws_inst
+
+            adapter = LiveBinanceAdapter(api_key="k", secret="s", enable_ws=True)
+            adapter.client = client
+            order = _make_order(type="market", client_order_id="client-123")
+            result = adapter.place_order(order)
+
+            assert result == "REST-ACK-TIMEOUT"
 
     def test_ws_failure_falls_back_to_rest(self):
         """WS order failure should fall back to REST."""
