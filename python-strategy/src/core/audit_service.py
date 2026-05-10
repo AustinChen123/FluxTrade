@@ -60,6 +60,64 @@ def commit_signal_audit(session: Session, audit: SignalAudit) -> None:
         raise
 
 
+def build_signal_intent_audit(
+    *,
+    clock: Clock,
+    signal: Signal,
+    client_order_id: str,
+    intent_payload: dict[str, Any],
+    signal_batch_id: Optional[str] = None,
+) -> SignalAudit:
+    """Build a committed-intent audit row for external order execution."""
+    return SignalAudit(
+        timestamp=int(clock.now() * 1000),
+        strategy_id=signal.strategy_id,
+        product_id=signal.product_id,
+        signal_type=signal.type.value,
+        risk_status="PASS",
+        risk_message="PASS",
+        client_order_id=client_order_id,
+        intent_payload=serialize_payload_with_decimals(intent_payload),
+        signal_batch_id=signal_batch_id,
+    )
+
+
+def write_signal_audit_intent(session: Session, audit: SignalAudit) -> SignalAudit:
+    """Commit an external-execution intent audit row before the side effect."""
+    try:
+        session.add(audit)
+        session.flush()
+        session.commit()
+    except Exception:
+        session.rollback()
+        raise
+    return audit
+
+
+def write_signal_audit_outcome(
+    session: Session,
+    audit: SignalAudit,
+    *,
+    outcome_payload: dict[str, Any],
+    order_id: Optional[str] = None,
+    risk_message: Optional[str] = None,
+) -> SignalAudit:
+    """Commit an external-execution outcome on an existing audit row."""
+    audit.outcome_payload = serialize_payload_with_decimals(outcome_payload)
+    if order_id is not None:
+        audit.order_id = order_id
+    if risk_message is not None:
+        audit.risk_message = risk_message
+
+    try:
+        session.add(audit)
+        session.commit()
+    except Exception:
+        session.rollback()
+        raise
+    return audit
+
+
 def write_system_event(
     session: Session,
     *,

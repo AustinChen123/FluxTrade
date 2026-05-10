@@ -5,7 +5,10 @@ import pytest
 
 from src.core.audit_service import (
     build_signal_audit,
+    build_signal_intent_audit,
     commit_signal_audit,
+    write_signal_audit_intent,
+    write_signal_audit_outcome,
     write_system_event,
 )
 from src.core.models import Candlestick, Signal, SignalType
@@ -152,3 +155,97 @@ def test_write_system_event_rejects_unknown_type() -> None:
         )
 
     session.add.assert_not_called()
+
+
+def test_build_signal_intent_audit_serializes_payload() -> None:
+    clock = MagicMock()
+    clock.now.return_value = 1704067200.5
+
+    audit = build_signal_intent_audit(
+        clock=clock,
+        signal=_make_signal(),
+        client_order_id="strat-1-abc",
+        signal_batch_id="batch-1",
+        intent_payload={
+            "quantity": Decimal("0.25"),
+            "nested": {"price": Decimal("42000.12")},
+        },
+    )
+
+    assert audit.timestamp == 1704067200500
+    assert audit.strategy_id == "strat-1"
+    assert audit.signal_type == "LONG"
+    assert audit.risk_status == "PASS"
+    assert audit.risk_message == "PASS"
+    assert audit.client_order_id == "strat-1-abc"
+    assert audit.signal_batch_id == "batch-1"
+    assert audit.intent_payload == {
+        "quantity": "0.25",
+        "nested": {"price": "42000.12"},
+    }
+
+
+def test_write_signal_audit_intent_flushes_and_commits() -> None:
+    session = MagicMock()
+    audit = MagicMock()
+
+    result = write_signal_audit_intent(session, audit)
+
+    assert result is audit
+    session.add.assert_called_once_with(audit)
+    session.flush.assert_called_once()
+    session.commit.assert_called_once()
+    session.rollback.assert_not_called()
+
+
+def test_write_signal_audit_intent_rolls_back_and_raises_on_failure() -> None:
+    session = MagicMock()
+    audit = MagicMock()
+    session.flush.side_effect = RuntimeError("intent failed")
+
+    with pytest.raises(RuntimeError, match="intent failed"):
+        write_signal_audit_intent(session, audit)
+
+    session.rollback.assert_called_once()
+
+
+def test_write_signal_audit_outcome_updates_payload_and_commits() -> None:
+    session = MagicMock()
+    audit = MagicMock()
+
+    result = write_signal_audit_outcome(
+        session,
+        audit,
+        order_id="order-1",
+        risk_message="placed",
+        outcome_payload={
+            "exchange_order_id": "ex-1",
+            "fee": Decimal("1.23"),
+        },
+    )
+
+    assert result is audit
+    assert audit.order_id == "order-1"
+    assert audit.risk_message == "placed"
+    assert audit.outcome_payload == {
+        "exchange_order_id": "ex-1",
+        "fee": "1.23",
+    }
+    session.add.assert_called_once_with(audit)
+    session.commit.assert_called_once()
+    session.rollback.assert_not_called()
+
+
+def test_write_signal_audit_outcome_rolls_back_and_raises_on_failure() -> None:
+    session = MagicMock()
+    audit = MagicMock()
+    session.commit.side_effect = RuntimeError("outcome failed")
+
+    with pytest.raises(RuntimeError, match="outcome failed"):
+        write_signal_audit_outcome(
+            session,
+            audit,
+            outcome_payload={"error": "network"},
+        )
+
+    session.rollback.assert_called_once()
