@@ -4,8 +4,6 @@ import inspect
 import re
 from pathlib import Path
 
-import pytest
-
 from src.core.engine import StrategyEngine
 from src.core.execution import ExecutionEngine
 
@@ -27,7 +25,6 @@ def _strip_line_comments(source: str) -> str:
     return "\n".join(line.split("#", 1)[0] for line in source.splitlines())
 
 
-@pytest.mark.xfail(reason="Tasks 2.2-2.5 pending", strict=True)
 def test_no_long_lived_db_session_assignments():
     offenders: list[str] = []
 

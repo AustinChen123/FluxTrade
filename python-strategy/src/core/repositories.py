@@ -93,8 +93,14 @@ class BacktestOrderRepository(IOrderRepository):
     This repository only records trade logs to the database.
     """
 
-    def __init__(self, db_session: Session, session_id: int, initial_balance: Decimal = Decimal("10000")):
-        self.db = db_session
+    def __init__(
+        self,
+        db_session: Session | None,
+        session_id: int,
+        initial_balance: Decimal = Decimal("10000"),
+        db_session_factory: Optional[Callable[[], ContextManager[Session]]] = None,
+    ):
+        self._db_session_factory = db_session_factory or (lambda: nullcontext(db_session))
         self.session_id = session_id
         self.balance = initial_balance  # kept for backward compatibility
         self._order_strategy_map: dict[str, str] = {}
@@ -123,8 +129,9 @@ class BacktestOrderRepository(IOrderRepository):
             fee_asset=trade.fee_asset,
             timestamp=trade.timestamp
         )
-        self.db.add(bt_log)
-        self.db.commit()
+        with self._db_session_factory() as db:
+            db.add(bt_log)
+            db.commit()
 
     def update_position(self, strategy_id: str, product_id: str, side: str, fill_quantity: Decimal, fill_price: Decimal, position_side: str) -> None:
         # No-op: position and balance are tracked by Rust PyMatchingEngine

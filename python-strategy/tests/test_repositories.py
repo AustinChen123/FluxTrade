@@ -31,6 +31,7 @@ class TestBacktestOrderRepositoryBasics:
 
         assert repo.session_id == 1
         assert repo.balance == Decimal("10000")
+        assert not hasattr(repo, "db")
 
     def test_initialization_custom_balance(self, mock_db_session):
         """Should accept custom initial balance."""
@@ -98,6 +99,30 @@ class TestBacktestPositionDelegation:
 
 class TestBacktestTradeLogging:
     """Tests for trade logging in BacktestOrderRepository."""
+
+    def test_accepts_session_factory(self, mock_db_session):
+        """Backtest trade logging should use an injected session factory."""
+        repo = BacktestOrderRepository(
+            None,
+            session_id=42,
+            db_session_factory=lambda: nullcontext(mock_db_session),
+        )
+        trade = Trade(
+            order_id="order-1",
+            exchange_trade_id="sim-trade-001",
+            product_id="BINANCE:BTCUSDT-PERP",
+            side="buy",
+            price=Decimal("42000"),
+            quantity=Decimal("1.0"),
+            fee=Decimal("2.52"),
+            fee_asset="USDT",
+            timestamp=1704067200000,
+        )
+
+        repo.add_trade(trade)
+
+        mock_db_session.add.assert_called()
+        mock_db_session.commit.assert_called()
 
     def test_add_trade_calls_db(self, mock_db_session, order_factory):
         """add_trade should create BacktestTradeLog and commit."""
