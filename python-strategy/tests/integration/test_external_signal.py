@@ -99,6 +99,28 @@ def _run_backtest(strategy, candle_data, mock_session_local):
     return runner.run()
 
 
+def _stable_backtest_snapshot(result):
+    return {
+        "total_pnl": result["total_pnl"],
+        "total_trades": result["total_trades"],
+        "journal_count": result["journal_count"],
+        "journal_tags": [entry["tag"] for entry in result["journal"]],
+    }
+
+
+def _assert_journal_invariants(result):
+    assert result["journal_count"] == len(result["journal"])
+    assert result["journal_count"] > 0
+
+    timestamps = [entry["timestamp"] for entry in result["journal"]]
+    assert timestamps == sorted(timestamps)
+
+    for entry in result["journal"]:
+        quantity = entry["data"].get("quantity")
+        if quantity is not None:
+            assert Decimal(str(quantity)) > 0
+
+
 @pytest.fixture
 def candle_data():
     return make_candle_series(count=200)
@@ -115,6 +137,24 @@ class TestCallableStrategyIntegration:
         assert result is not None
         assert result["journal_count"] > 0, "Callable should generate trades"
         assert isinstance(result["total_pnl"], Decimal)
+
+    @patch("src.core.backtest_runner.SessionLocal")
+    def test_callable_backtest_smoke_is_deterministic(self, mock_sl, candle_data):
+        """Early replay smoke: deterministic input should produce stable outputs."""
+        first = _run_backtest(
+            CallableStrategy("callable_smoke", _simple_predict, PRODUCT_ID, TIMEFRAME),
+            candle_data,
+            mock_sl,
+        )
+        second = _run_backtest(
+            CallableStrategy("callable_smoke", _simple_predict, PRODUCT_ID, TIMEFRAME),
+            candle_data,
+            mock_sl,
+        )
+
+        _assert_journal_invariants(first)
+        _assert_journal_invariants(second)
+        assert _stable_backtest_snapshot(first) == _stable_backtest_snapshot(second)
 
     @patch("src.core.backtest_runner.SessionLocal")
     def test_callable_with_sl_tp(self, mock_sl, candle_data):
