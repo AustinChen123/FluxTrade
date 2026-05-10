@@ -2,8 +2,9 @@
 
 from __future__ import annotations
 
+from contextlib import nullcontext
 from decimal import Decimal
-from unittest.mock import MagicMock, patch
+from unittest.mock import MagicMock
 
 from src.core.models import Candlestick, Signal, SignalType
 from src.strategies.base import BaseStrategy, StrategyRequirements
@@ -89,12 +90,9 @@ def test_health_monitoring_records_strategy_heartbeat(engine_factory):
     engine = engine_factory()
     engine.add_strategy(EmittingStrategy("s1"))
     mock_db = MagicMock()
+    engine._db_session_factory = lambda: nullcontext(mock_db)
 
-    with patch("src.core.engine.SessionLocal") as mock_sl:
-        mock_sl.return_value.__enter__ = MagicMock(return_value=mock_db)
-        mock_sl.return_value.__exit__ = MagicMock(return_value=False)
-
-        engine._record_strategy_heartbeats(["s1"])
+    engine._record_strategy_heartbeats(["s1"])
 
     assert engine._health_monitor.is_healthy("s1") is True
     assert engine._health_monitor.get_uptime("s1") >= 0.0

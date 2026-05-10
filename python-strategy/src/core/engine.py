@@ -18,7 +18,6 @@ from src.core.clock import Clock
 from src.core.interfaces import IExchangeAdapter, IOrderRepository
 from src.core.strategy_loader import StrategyLoader
 from src.core.data_provider import check_data_availability
-from src.core.db import SessionLocal
 from src.core.adapters import create_adapter
 from src.core.journal import StrategyJournal
 from src.core.redis_factory import create_redis_client
@@ -179,7 +178,7 @@ class StrategyEngine:
         self.loaded_classes.update(new_classes)
         
         # Sync with DB
-        with SessionLocal() as db:
+        with self._db_session_factory() as db:
             for strategy_id, result in found.items():
                 state = db.query(StrategyState).filter(StrategyState.strategy_id == strategy_id).first()
                 if not state:
@@ -207,7 +206,7 @@ class StrategyEngine:
             logger.error("Strategy %s not loaded.", strategy_id)
             return
 
-        with SessionLocal() as db:
+        with self._db_session_factory() as db:
             state = db.query(StrategyState).filter(StrategyState.strategy_id == strategy_id).first()
             if not state:
                 logger.error("Strategy %s not in DB.", strategy_id)
@@ -255,7 +254,7 @@ class StrategyEngine:
             logger.error("Strategy %s not loaded.", strategy_id)
             return
 
-        with SessionLocal() as db:
+        with self._db_session_factory() as db:
             state = db.query(StrategyState).filter(StrategyState.strategy_id == strategy_id).first()
             # Allow READY or WARNING (with manual override implied by START command)
             startable = {StrategyStatus.READY, StrategyStatus.WARNING, StrategyStatus.STOPPED, StrategyStatus.DISCOVERED}
@@ -305,7 +304,7 @@ class StrategyEngine:
                 self.strategies[product_id] = [s for s in self.strategies[product_id] if s.strategy_id != strategy_id]
             ACTIVE_STRATEGIES.set(len(self.strategy_instances))
         
-        with SessionLocal() as db:
+        with self._db_session_factory() as db:
             state = db.query(StrategyState).filter(StrategyState.strategy_id == strategy_id).first()
             if state:
                 state.status = StrategyStatus.STOPPED
@@ -373,7 +372,7 @@ class StrategyEngine:
 
     def _record_strategy_heartbeats(self, strategy_ids: list[str]) -> None:
         """Record strategy heartbeat state in HealthMonitor and DB."""
-        with SessionLocal() as db:
+        with self._db_session_factory() as db:
             now_ms = int(time.time() * 1000)
             for sid in strategy_ids:
                 try:

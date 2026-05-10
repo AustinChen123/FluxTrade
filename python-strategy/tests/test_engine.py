@@ -11,6 +11,7 @@ Covers:
 - shutdown
 """
 
+from contextlib import nullcontext
 from decimal import Decimal
 from unittest.mock import MagicMock, call, patch
 
@@ -528,12 +529,9 @@ class TestHeartbeatRecording:
         """Strategy heartbeat recording should update HealthMonitor and DB state."""
         engine._health_monitor.update_heartbeat = MagicMock()
         mock_db = MagicMock()
+        engine._db_session_factory = lambda: nullcontext(mock_db)
 
-        with patch("src.core.engine.SessionLocal") as mock_sl, \
-             patch("src.core.engine.time.time", return_value=100.0):
-            mock_sl.return_value.__enter__ = MagicMock(return_value=mock_db)
-            mock_sl.return_value.__exit__ = MagicMock(return_value=False)
-
+        with patch("src.core.engine.time.time", return_value=100.0):
             engine._record_strategy_heartbeats(["s1", "s2"])
 
         assert engine._health_monitor.update_heartbeat.call_args_list == [
@@ -547,12 +545,9 @@ class TestHeartbeatRecording:
         """DB heartbeat updates should still commit if HealthMonitor update fails."""
         engine._health_monitor.update_heartbeat = MagicMock(side_effect=RuntimeError("boom"))
         mock_db = MagicMock()
+        engine._db_session_factory = lambda: nullcontext(mock_db)
 
-        with patch("src.core.engine.SessionLocal") as mock_sl:
-            mock_sl.return_value.__enter__ = MagicMock(return_value=mock_db)
-            mock_sl.return_value.__exit__ = MagicMock(return_value=False)
-
-            engine._record_strategy_heartbeats(["s1"])
+        engine._record_strategy_heartbeats(["s1"])
 
         mock_db.query.return_value.filter.return_value.update.assert_called_once()
         mock_db.commit.assert_called_once()
@@ -567,13 +562,12 @@ class TestScanStrategies:
 
     def test_scan_updates_loaded_classes(self, engine, mock_strategy_class):
         """scan_strategies should update loaded_classes from StrategyLoader results."""
-        with patch("src.core.engine.StrategyLoader.scan_directory") as mock_scan, \
-             patch("src.core.engine.SessionLocal") as mock_sl:
+        mock_db = MagicMock()
+        mock_db.query.return_value.filter.return_value.first.return_value = None
+        engine._db_session_factory = lambda: nullcontext(mock_db)
+
+        with patch("src.core.engine.StrategyLoader.scan_directory") as mock_scan:
             mock_scan.return_value = {"test.py::MyStrat": mock_strategy_class}
-            mock_db = MagicMock()
-            mock_db.query.return_value.filter.return_value.first.return_value = None
-            mock_sl.return_value.__enter__ = MagicMock(return_value=mock_db)
-            mock_sl.return_value.__exit__ = MagicMock(return_value=False)
 
             engine.scan_strategies()
 
@@ -581,13 +575,12 @@ class TestScanStrategies:
 
     def test_scan_creates_db_state_for_new_strategy(self, engine, mock_strategy_class):
         """Newly discovered strategies should get a StrategyState record."""
-        with patch("src.core.engine.StrategyLoader.scan_directory") as mock_scan, \
-             patch("src.core.engine.SessionLocal") as mock_sl:
+        mock_db = MagicMock()
+        mock_db.query.return_value.filter.return_value.first.return_value = None
+        engine._db_session_factory = lambda: nullcontext(mock_db)
+
+        with patch("src.core.engine.StrategyLoader.scan_directory") as mock_scan:
             mock_scan.return_value = {"new.py::NewStrat": mock_strategy_class}
-            mock_db = MagicMock()
-            mock_db.query.return_value.filter.return_value.first.return_value = None
-            mock_sl.return_value.__enter__ = MagicMock(return_value=mock_db)
-            mock_sl.return_value.__exit__ = MagicMock(return_value=False)
 
             engine.scan_strategies()
 
@@ -596,15 +589,13 @@ class TestScanStrategies:
 
     def test_scan_marks_load_errors(self, engine):
         """Strategy with LoadError should get ERROR status in DB."""
-        with patch("src.core.engine.StrategyLoader.scan_directory") as mock_scan, \
-             patch("src.core.engine.SessionLocal") as mock_sl:
-            mock_scan.return_value = {"bad.py::LoadError": "traceback string"}
-            mock_state = MagicMock()
-            mock_db = MagicMock()
-            mock_db.query.return_value.filter.return_value.first.return_value = mock_state
-            mock_sl.return_value.__enter__ = MagicMock(return_value=mock_db)
-            mock_sl.return_value.__exit__ = MagicMock(return_value=False)
+        mock_state = MagicMock()
+        mock_db = MagicMock()
+        mock_db.query.return_value.filter.return_value.first.return_value = mock_state
+        engine._db_session_factory = lambda: nullcontext(mock_db)
 
+        with patch("src.core.engine.StrategyLoader.scan_directory") as mock_scan:
+            mock_scan.return_value = {"bad.py::LoadError": "traceback string"}
             engine.scan_strategies()
 
         assert mock_state.status == "ERROR"
@@ -626,12 +617,9 @@ class TestStartStrategy:
         mock_state.config_json = "{}"
         mock_db = MagicMock()
         mock_db.query.return_value.filter.return_value.first.return_value = mock_state
+        engine._db_session_factory = lambda: nullcontext(mock_db)
 
-        with patch("src.core.engine.SessionLocal") as mock_sl:
-            mock_sl.return_value.__enter__ = MagicMock(return_value=mock_db)
-            mock_sl.return_value.__exit__ = MagicMock(return_value=False)
-
-            engine.start_strategy("test.py::MyStrat")
+        engine.start_strategy("test.py::MyStrat")
 
         assert "test.py::MyStrat" in engine.strategy_instances
         assert mock_state.status == "ACTIVE"
@@ -644,12 +632,9 @@ class TestStartStrategy:
         mock_state.status = "ERROR"
         mock_db = MagicMock()
         mock_db.query.return_value.filter.return_value.first.return_value = mock_state
+        engine._db_session_factory = lambda: nullcontext(mock_db)
 
-        with patch("src.core.engine.SessionLocal") as mock_sl:
-            mock_sl.return_value.__enter__ = MagicMock(return_value=mock_db)
-            mock_sl.return_value.__exit__ = MagicMock(return_value=False)
-
-            engine.start_strategy("test.py::MyStrat")
+        engine.start_strategy("test.py::MyStrat")
 
         assert "test.py::MyStrat" not in engine.strategy_instances
 
@@ -663,12 +648,9 @@ class TestStopStrategy:
         mock_state = MagicMock()
         mock_db = MagicMock()
         mock_db.query.return_value.filter.return_value.first.return_value = mock_state
+        engine._db_session_factory = lambda: nullcontext(mock_db)
 
-        with patch("src.core.engine.SessionLocal") as mock_sl:
-            mock_sl.return_value.__enter__ = MagicMock(return_value=mock_db)
-            mock_sl.return_value.__exit__ = MagicMock(return_value=False)
-
-            engine.stop_strategy("test_strat")
+        engine.stop_strategy("test_strat")
 
         assert "test_strat" not in engine.strategy_instances
         assert mock_state.status == "STOPPED"
@@ -694,12 +676,9 @@ class TestTestRunStrategy:
         mock_state.config_json = "{}"
         mock_db = MagicMock()
         mock_db.query.return_value.filter.return_value.first.return_value = mock_state
+        engine._db_session_factory = lambda: nullcontext(mock_db)
 
-        with patch("src.core.engine.SessionLocal") as mock_sl, \
-             patch("src.core.engine.check_data_availability", return_value=(True, "")):
-            mock_sl.return_value.__enter__ = MagicMock(return_value=mock_db)
-            mock_sl.return_value.__exit__ = MagicMock(return_value=False)
-
+        with patch("src.core.engine.check_data_availability", return_value=(True, "")):
             engine.test_run_strategy("test.py::MyStrat", 1)
 
         assert mock_state.status == "READY"
@@ -712,12 +691,9 @@ class TestTestRunStrategy:
         mock_state.config_json = "{}"
         mock_db = MagicMock()
         mock_db.query.return_value.filter.return_value.first.return_value = mock_state
+        engine._db_session_factory = lambda: nullcontext(mock_db)
 
-        with patch("src.core.engine.SessionLocal") as mock_sl, \
-             patch("src.core.engine.check_data_availability", return_value=(False, "docker exec ...")):
-            mock_sl.return_value.__enter__ = MagicMock(return_value=mock_db)
-            mock_sl.return_value.__exit__ = MagicMock(return_value=False)
-
+        with patch("src.core.engine.check_data_availability", return_value=(False, "docker exec ...")):
             engine.test_run_strategy("test.py::MyStrat", 1)
 
         assert mock_state.status == "WARNING"
