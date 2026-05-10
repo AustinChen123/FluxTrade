@@ -18,6 +18,7 @@ SESSION_AUDIT_FILES = [
     CORE_DIR / "order_manager.py",
     CORE_DIR / "command_router.py",
     CORE_DIR / "signal_processor.py",
+    CORE_DIR / "repositories.py",
 ]
 LONG_LIVED_SESSION_PATTERN = re.compile(r"\bself\.(?:db|session)\s*=")
 

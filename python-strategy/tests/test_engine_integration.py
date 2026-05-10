@@ -46,7 +46,7 @@ def make_candle(
     )
 
 
-def test_full_lifecycle_routes_signal_through_wired_components(engine_factory):
+def test_full_lifecycle_routes_signal_through_wired_components(engine_factory, mock_db_session):
     engine = engine_factory()
     strategy = EmittingStrategy("s1")
     candle = make_candle()
@@ -62,8 +62,8 @@ def test_full_lifecycle_routes_signal_through_wired_components(engine_factory):
     engine.execution_engine.process_market_data.assert_called_once_with(candle)
     engine.risk_manager.check_risk.assert_called_once()
     engine.execution_engine.execute_signal.assert_called_once()
-    engine.db.add.assert_called_once()
-    engine.db.commit.assert_called_once()
+    mock_db_session.add.assert_called_once()
+    mock_db_session.commit.assert_called_once()
     assert engine.running is False
 
 

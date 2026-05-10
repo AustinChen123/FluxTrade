@@ -403,8 +403,8 @@ class TestProcessSignal:
 
         engine.process_signal(signal, _make_candle())
 
-        engine.db.add.assert_called()
-        engine.db.commit.assert_called()
+        mock_db_session.add.assert_called()
+        mock_db_session.commit.assert_called()
 
     def test_audit_trail_written_on_reject(self, engine, mock_db_session):
         """Audit entry should also be committed on risk reject."""
@@ -422,9 +422,9 @@ class TestProcessSignal:
 
         engine.process_signal(signal, None)
 
-        engine.db.add.assert_called()
+        mock_db_session.add.assert_called()
 
-    def test_audit_db_failure_triggers_rollback(self, engine):
+    def test_audit_db_failure_triggers_rollback(self, engine, mock_db_session):
         """If audit commit fails, should rollback."""
         signal = Signal(
             strategy_id="test",
@@ -436,11 +436,11 @@ class TestProcessSignal:
         )
         engine.risk_manager.check_risk = MagicMock(return_value=(True, "PASS"))
         engine.execution_engine.execute_signal = MagicMock(return_value="order-1")
-        engine.db.commit.side_effect = Exception("DB write fail")
+        mock_db_session.commit.side_effect = Exception("DB write fail")
 
         # Should not raise
         engine.process_signal(signal, _make_candle())
-        engine.db.rollback.assert_called()
+        mock_db_session.rollback.assert_called()
 
 
 # =============================================================================

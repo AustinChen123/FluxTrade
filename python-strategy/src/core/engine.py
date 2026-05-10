@@ -5,8 +5,9 @@ import threading
 import logging
 import traceback
 import uuid
+from contextlib import nullcontext
 from concurrent.futures import ThreadPoolExecutor
-from typing import List, Union, Optional, Dict, Type
+from typing import Callable, ContextManager, List, Union, Optional, Dict, Type
 from sqlalchemy.orm import Session
 from src.core.models import Candlestick, Trade, Signal, SignalType, StrategyStatus
 from src.core.orm_models import SignalAudit, StrategyState
@@ -58,8 +59,9 @@ class StrategyEngine:
         adapter_config: Optional[Dict] = None,
         adapter: Optional[IExchangeAdapter] = None,
         journal: Optional[StrategyJournal] = None,
+        db_session_factory: Optional[Callable[[], ContextManager[Session]]] = None,
     ):
-        self.db = db_session
+        self._db_session_factory = db_session_factory or (lambda: nullcontext(db_session))
         self.clock = clock
         self.strategies: Dict[str, List[BaseStrategy]] = {}
         self.strategy_instances: Dict[str, BaseStrategy] = {}
@@ -459,11 +461,15 @@ class StrategyEngine:
                     "signal_metadata": signal.metadata
                 })
             )
-            self.db.add(audit)
-            self.db.commit()
+            with self._db_session_factory() as db:
+                try:
+                    db.add(audit)
+                    db.commit()
+                except Exception:
+                    db.rollback()
+                    raise
         except Exception as e:
             logger.error("Failed to log audit trail: %s", e)
-            self.db.rollback()
 
     def shutdown(self, timeout: float = 30.0):
         """Graceful shutdown: stop threads, drain executor, close Redis."""
