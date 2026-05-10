@@ -1,5 +1,6 @@
 import logging
 import time as _time
+import uuid
 from decimal import Decimal
 from typing import Callable, ContextManager, Optional
 from sqlalchemy.orm import Session
@@ -10,6 +11,11 @@ from src.core.clock import Clock
 from src.core.interfaces import IOrderRepository
 from src.core.journal import StrategyJournal
 from src.core.metrics import ORDERS_TOTAL, EXECUTION_LATENCY
+from src.core.audit_service import (
+    build_signal_intent_audit,
+    write_signal_audit_intent,
+    write_signal_audit_outcome,
+)
 
 class ExecutionEngine:
     def __init__(
@@ -21,9 +27,12 @@ class ExecutionEngine:
         journal: Optional[StrategyJournal] = None,
         is_backtest: Optional[bool] = None,
         db_session_factory: Optional[Callable[[], ContextManager[Session]]] = None,
+        audit_external_orders: bool = False,
     ):
         self.logger = logging.getLogger("ExecutionEngine")
+        self.clock = clock
         self._db_session_factory = db_session_factory
+        self.audit_external_orders = audit_external_orders
         if order_repository:
             self.order_manager = OrderManager(order_repository, clock, is_backtest=is_backtest)
         else:
@@ -70,6 +79,8 @@ class ExecutionEngine:
         Also places SL/TP/Trailing orders when specified in the signal.
         Returns the Order ID (Internal) if successful.
         """
+        if self.audit_external_orders:
+            return self._execute_signal_with_audit(signal, candle)
         return self._execute_signal_core(signal, candle)
 
     def _execute_signal_core(self, signal: Signal, candle: Optional[Candlestick] = None) -> Optional[str]:
@@ -135,6 +146,109 @@ class ExecutionEngine:
             )
 
         # 4. Place conditional orders (SL/TP/Trailing)
+        if signal.stop_loss or signal.take_profit or signal.trailing_distance:
+            self._place_conditional_orders(signal, order, qty)
+
+        return order.id
+
+    def _execute_signal_with_audit(self, signal: Signal, candle: Optional[Candlestick] = None) -> Optional[str]:
+        """Fail-stop external execution path with committed intent/outcome audits."""
+        if self._db_session_factory is None:
+            raise RuntimeError("audit_external_orders requires db_session_factory")
+
+        side = self._determine_side(signal.type)
+        if not side:
+            return None
+
+        qty = signal.quantity if signal.quantity and signal.quantity > 0 else self.default_quantity
+        if signal.price and signal.price > 0:
+            order_type = "limit"
+            limit_price = signal.price
+        elif signal.value:
+            order_type = "limit"
+            limit_price = signal.value
+        else:
+            order_type = "market"
+            limit_price = None
+
+        client_order_id = f"{signal.strategy_id}_{uuid.uuid4().hex[:12]}"
+        intent_payload = {
+            "signal": signal.model_dump(mode="json"),
+            "order": {
+                "side": side.value,
+                "order_type": order_type,
+                "quantity": qty,
+                "price": limit_price,
+                "client_order_id": client_order_id,
+            },
+        }
+        order = self.order_manager.create_order(
+            signal=signal,
+            side=side,
+            order_type=order_type,
+            quantity=qty,
+            price=limit_price,
+            client_order_id=client_order_id,
+            intent_payload=intent_payload,
+        )
+
+        with self._db_session_factory() as db:
+            audit = build_signal_intent_audit(
+                clock=self.clock,
+                signal=signal,
+                client_order_id=client_order_id,
+                intent_payload=intent_payload,
+            )
+            write_signal_audit_intent(db, audit)
+
+        try:
+            self.logger.info("Sending Order %s via Adapter...", order.id)
+            t0 = _time.monotonic()
+            exchange_id = self.adapter.place_order(order)
+            EXECUTION_LATENCY.observe(_time.monotonic() - t0)
+            self.order_manager.update_exchange_order_id(order, exchange_id)
+            self.logger.info("Order Placed. Internal: %s, Exchange: %s", order.id, exchange_id)
+            ORDERS_TOTAL.labels(order_type=order_type, status="placed").inc()
+        except ExchangeError as e:
+            self.logger.error("Execution Failed: %s", e)
+            self.order_manager.fail_order(order, str(e))
+            ORDERS_TOTAL.labels(order_type=order_type, status="failed").inc()
+            with self._db_session_factory() as db:
+                write_signal_audit_outcome(
+                    db,
+                    audit,
+                    order_id=order.id,
+                    risk_message=str(e),
+                    outcome_payload={"status": "failed", "error": str(e)},
+                )
+            raise
+
+        with self._db_session_factory() as db:
+            write_signal_audit_outcome(
+                db,
+                audit,
+                order_id=order.id,
+                risk_message="placed",
+                outcome_payload={"status": "placed", "exchange_order_id": exchange_id},
+            )
+
+        if self.journal is not None:
+            self.journal.log(
+                "entry",
+                {
+                    "order_id": str(order.id),
+                    "side": side,
+                    "order_type": order_type,
+                    "quantity": str(qty),
+                    "price": str(limit_price) if limit_price else "market",
+                    "stop_loss": str(signal.stop_loss) if signal.stop_loss else None,
+                    "take_profit": str(signal.take_profit) if signal.take_profit else None,
+                    "trailing_distance": str(signal.trailing_distance) if signal.trailing_distance else None,
+                },
+                timestamp=signal.timestamp,
+                trade_id=str(order.id),
+            )
+
         if signal.stop_loss or signal.take_profit or signal.trailing_distance:
             self._place_conditional_orders(signal, order, qty)
 

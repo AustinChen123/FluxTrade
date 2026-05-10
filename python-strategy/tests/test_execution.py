@@ -10,10 +10,13 @@ Covers:
 - Market data processing for simulated fills
 """
 
+from contextlib import nullcontext
+
 import pytest
 from decimal import Decimal
 
 from src.core.execution import ExecutionEngine
+from src.core.interfaces.exchange import ExchangeError
 from src.core.models import SignalType
 
 
@@ -177,6 +180,82 @@ class TestExecutionErrorHandling:
         result = execution_engine.execute_signal(signal)
 
         assert result is None
+
+
+class TestAuditedExecution:
+    """Tests for opt-in fail-stop audit execution path."""
+
+    def test_requires_session_factory(
+        self, mock_db_session, mock_clock, mock_exchange_adapter, mock_order_repo, signal_factory
+    ):
+        engine = ExecutionEngine(
+            db_session=mock_db_session,
+            clock=mock_clock,
+            adapter=mock_exchange_adapter,
+            order_repository=mock_order_repo,
+            audit_external_orders=True,
+        )
+
+        with pytest.raises(RuntimeError, match="requires db_session_factory"):
+            engine.execute_signal(signal_factory(price=Decimal("42000")))
+
+    def test_success_writes_intent_and_outcome(
+        self, mock_db_session, mock_clock, mock_exchange_adapter, mock_order_repo, signal_factory
+    ):
+        audit_session = mock_db_session
+        engine = ExecutionEngine(
+            db_session=mock_db_session,
+            clock=mock_clock,
+            adapter=mock_exchange_adapter,
+            order_repository=mock_order_repo,
+            db_session_factory=lambda: nullcontext(audit_session),
+            audit_external_orders=True,
+        )
+        signal = signal_factory(price=Decimal("42000"), quantity=Decimal("0.25"))
+
+        order_id = engine.execute_signal(signal)
+
+        assert order_id is not None
+        order = mock_order_repo.orders[order_id]
+        assert order.client_order_id.startswith(f"{signal.strategy_id}_")
+        assert order.intent_payload["order"]["quantity"] == "0.25"
+        assert order.intent_payload["order"]["price"] == "42000"
+        audit = audit_session.add.call_args_list[0].args[0]
+        assert audit.client_order_id == order.client_order_id
+        assert audit.intent_payload["order"]["client_order_id"] == order.client_order_id
+        assert audit.outcome_payload["status"] == "placed"
+        assert audit.outcome_payload["exchange_order_id"].startswith("MOCK-")
+        assert audit.order_id == order.id
+        assert audit_session.flush.call_count == 1
+        assert audit_session.commit.call_count == 2
+
+    def test_exchange_failure_writes_outcome_then_raises(
+        self, mock_db_session, mock_clock, mock_exchange_adapter, mock_order_repo, signal_factory
+    ):
+        mock_exchange_adapter.set_should_fail(True, "Connection timeout")
+        audit_session = mock_db_session
+        engine = ExecutionEngine(
+            db_session=mock_db_session,
+            clock=mock_clock,
+            adapter=mock_exchange_adapter,
+            order_repository=mock_order_repo,
+            db_session_factory=lambda: nullcontext(audit_session),
+            audit_external_orders=True,
+        )
+
+        with pytest.raises(ExchangeError, match="Connection timeout"):
+            engine.execute_signal(signal_factory(price=Decimal("42000")))
+
+        failed_orders = [o for o in mock_order_repo.orders.values() if o.status == "failed"]
+        assert len(failed_orders) == 1
+        audit = audit_session.add.call_args_list[0].args[0]
+        assert audit.order_id == failed_orders[0].id
+        assert audit.outcome_payload == {
+            "status": "failed",
+            "error": "Connection timeout",
+        }
+        assert audit_session.flush.call_count == 1
+        assert audit_session.commit.call_count == 2
 
 
 class TestMarketDataProcessing:
