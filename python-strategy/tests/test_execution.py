@@ -257,6 +257,72 @@ class TestAuditedExecution:
         assert audit_session.flush.call_count == 1
         assert audit_session.commit.call_count == 2
 
+    def test_intent_audit_failure_stops_before_external_order(
+        self, mock_db_session, mock_clock, mock_exchange_adapter, mock_order_repo, signal_factory
+    ):
+        mock_db_session.flush.side_effect = RuntimeError("intent audit failed")
+        engine = ExecutionEngine(
+            db_session=mock_db_session,
+            clock=mock_clock,
+            adapter=mock_exchange_adapter,
+            order_repository=mock_order_repo,
+            db_session_factory=lambda: nullcontext(mock_db_session),
+            audit_external_orders=True,
+        )
+
+        with pytest.raises(RuntimeError, match="intent audit failed"):
+            engine.execute_signal(signal_factory(price=Decimal("42000")))
+
+        assert mock_exchange_adapter.open_orders == []
+        mock_db_session.rollback.assert_called_once()
+
+    def test_success_outcome_audit_failure_raises_after_external_order(
+        self, mock_db_session, mock_clock, mock_exchange_adapter, mock_order_repo, signal_factory
+    ):
+        mock_db_session.commit.side_effect = [None, RuntimeError("outcome audit failed")]
+        engine = ExecutionEngine(
+            db_session=mock_db_session,
+            clock=mock_clock,
+            adapter=mock_exchange_adapter,
+            order_repository=mock_order_repo,
+            db_session_factory=lambda: nullcontext(mock_db_session),
+            audit_external_orders=True,
+        )
+
+        with pytest.raises(RuntimeError, match="outcome audit failed"):
+            engine.execute_signal(signal_factory(price=Decimal("42000")))
+
+        assert len(mock_exchange_adapter.open_orders) == 1
+        audit = mock_db_session.add.call_args_list[0].args[0]
+        assert audit.outcome_payload["status"] == "placed"
+        mock_db_session.rollback.assert_called_once()
+
+    def test_exchange_failure_outcome_audit_failure_raises_audit_error(
+        self, mock_db_session, mock_clock, mock_exchange_adapter, mock_order_repo, signal_factory
+    ):
+        mock_exchange_adapter.set_should_fail(True, "Connection timeout")
+        mock_db_session.commit.side_effect = [None, RuntimeError("outcome audit failed")]
+        engine = ExecutionEngine(
+            db_session=mock_db_session,
+            clock=mock_clock,
+            adapter=mock_exchange_adapter,
+            order_repository=mock_order_repo,
+            db_session_factory=lambda: nullcontext(mock_db_session),
+            audit_external_orders=True,
+        )
+
+        with pytest.raises(RuntimeError, match="outcome audit failed"):
+            engine.execute_signal(signal_factory(price=Decimal("42000")))
+
+        failed_orders = [o for o in mock_order_repo.orders.values() if o.status == "failed"]
+        assert len(failed_orders) == 1
+        audit = mock_db_session.add.call_args_list[0].args[0]
+        assert audit.outcome_payload == {
+            "status": "failed",
+            "error": "Connection timeout",
+        }
+        mock_db_session.rollback.assert_called_once()
+
 
 class TestMarketDataProcessing:
     """Tests for process_market_data (simulated fills)."""
