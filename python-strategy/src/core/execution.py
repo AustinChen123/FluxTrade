@@ -28,7 +28,11 @@ class ExecutionEngine:
             self.order_manager = OrderManager(order_repository, clock, is_backtest=is_backtest)
         else:
             from src.core.repositories import LiveOrderRepository
-            self.order_manager = OrderManager(LiveOrderRepository(db_session), clock, is_backtest=is_backtest)
+            self.order_manager = OrderManager(
+                LiveOrderRepository(db_session, db_session_factory=db_session_factory),
+                clock,
+                is_backtest=is_backtest,
+            )
 
         self.default_quantity = Decimal("0.01")
         self.adapter = adapter

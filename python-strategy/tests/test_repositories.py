@@ -14,6 +14,7 @@ handled by the Rust PyMatchingEngine via SimulatedAdapter. See
 test_adapters_simulated.py for coverage of those behaviours.
 """
 
+from contextlib import nullcontext
 from decimal import Decimal
 from unittest.mock import MagicMock
 
@@ -133,6 +134,19 @@ class TestBacktestTradeLogging:
 # =============================================================================
 
 class TestLiveOrderRepositoryBasics:
+
+    def test_accepts_session_factory(self, mock_db_session, order_factory):
+        """Live repository should use an injected session factory."""
+        repo = LiveOrderRepository(
+            db_session_factory=lambda: nullcontext(mock_db_session),
+        )
+        order = order_factory()
+
+        repo.add_order(order)
+
+        assert not hasattr(repo, "db")
+        mock_db_session.add.assert_called_with(order)
+        mock_db_session.commit.assert_called()
 
     def test_add_order_commits(self, mock_db_session, order_factory):
         """add_order should add to session and commit."""
