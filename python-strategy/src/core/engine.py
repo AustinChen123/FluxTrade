@@ -60,6 +60,7 @@ class StrategyEngine:
         adapter: Optional[IExchangeAdapter] = None,
         journal: Optional[StrategyJournal] = None,
         db_session_factory: Optional[Callable[[], ContextManager[Session]]] = None,
+        audit_external_orders: bool = False,
     ):
         self._db_session_factory = db_session_factory or (lambda: nullcontext(db_session))
         self.clock = clock
@@ -93,6 +94,7 @@ class StrategyEngine:
             order_repository,
             journal=journal,
             db_session_factory=self._db_session_factory,
+            audit_external_orders=audit_external_orders,
         )
         self._state_manager = _EngineStateAdapter(self)
         self._health_monitor = HealthMonitor(self._registry)
@@ -453,6 +455,8 @@ class StrategyEngine:
         if is_passed:
             logger.info("✅ SIGNAL ACCEPTED: %s. Forwarding to Execution Engine...", signal.type)
             order_id = self.execution_engine.execute_signal(signal, candle)
+            if self.execution_engine.audit_external_orders:
+                return
         
         audit = build_signal_audit(
             clock=self.clock,

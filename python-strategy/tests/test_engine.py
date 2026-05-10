@@ -138,6 +138,19 @@ class TestEngineInit:
         assert engine._db_session_factory is db_session_factory
         assert engine.execution_engine._db_session_factory is db_session_factory
 
+    def test_audit_external_orders_passed_to_execution_engine(self, mock_db_session, mock_clock):
+        """Accepted-signal audit mode should be delegated to ExecutionEngine."""
+        with patch("src.core.engine.create_redis_client") as mock_factory:
+            mock_factory.return_value = MagicMock()
+            engine = StrategyEngine(
+                db_session=mock_db_session,
+                clock=mock_clock,
+                adapter=MagicMock(),
+                audit_external_orders=True,
+            )
+
+        assert engine.execution_engine.audit_external_orders is True
+
     def test_strategies_start_empty(self, engine):
         """Strategies dicts should start empty."""
         assert engine.strategies == {}
@@ -459,6 +472,46 @@ class TestProcessSignal:
             engine.process_signal(signal, _make_candle())
 
         mock_db_session.rollback.assert_called()
+
+    def test_audited_execution_skips_legacy_pass_audit(self, engine_factory, mock_db_session):
+        """When execution writes intent/outcome, accepted signals should not duplicate audit rows."""
+        engine = engine_factory(audit_external_orders=True)
+        signal = Signal(
+            strategy_id="test",
+            product_id="BINANCE:BTCUSDT-PERP",
+            timeframe="1m",
+            timestamp=1704067200000,
+            type=SignalType.LONG,
+            value=Decimal("42000"),
+        )
+        engine.risk_manager.check_risk = MagicMock(return_value=(True, "PASS"))
+        engine.execution_engine.execute_signal = MagicMock(return_value="order-1")
+
+        engine.process_signal(signal, _make_candle())
+
+        engine.execution_engine.execute_signal.assert_called_once()
+        mock_db_session.add.assert_not_called()
+        mock_db_session.commit.assert_not_called()
+
+    def test_audited_execution_still_audits_risk_reject(self, engine_factory, mock_db_session):
+        """Risk rejects have no external order outcome, so legacy risk audit still applies."""
+        engine = engine_factory(audit_external_orders=True)
+        signal = Signal(
+            strategy_id="test",
+            product_id="BINANCE:BTCUSDT-PERP",
+            timeframe="1m",
+            timestamp=1704067200000,
+            type=SignalType.LONG,
+            value=Decimal("42000"),
+        )
+        engine.risk_manager.check_risk = MagicMock(return_value=(False, "REJECT"))
+        engine.execution_engine.execute_signal = MagicMock()
+
+        engine.process_signal(signal, _make_candle())
+
+        engine.execution_engine.execute_signal.assert_not_called()
+        mock_db_session.add.assert_called_once()
+        mock_db_session.commit.assert_called_once()
 
 
 # =============================================================================
