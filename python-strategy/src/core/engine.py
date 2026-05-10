@@ -453,29 +453,26 @@ class StrategyEngine:
             logger.info("✅ SIGNAL ACCEPTED: %s. Forwarding to Execution Engine...", signal.type)
             order_id = self.execution_engine.execute_signal(signal, candle)
         
-        try:
-            audit = SignalAudit(
-                timestamp=int(self.clock.now() * 1000),
-                strategy_id=signal.strategy_id,
-                product_id=signal.product_id,
-                signal_type=signal.type.value,
-                risk_status="PASS" if is_passed else "REJECT",
-                risk_message=risk_msg,
-                order_id=order_id,
-                details_json=json.dumps({
-                    "candle": candle.model_dump(mode='json') if candle else None,
-                    "signal_metadata": signal.metadata
-                })
-            )
-            with self._db_session_factory() as db:
-                try:
-                    db.add(audit)
-                    db.commit()
-                except Exception:
-                    db.rollback()
-                    raise
-        except Exception as e:
-            logger.error("Failed to log audit trail: %s", e)
+        audit = SignalAudit(
+            timestamp=int(self.clock.now() * 1000),
+            strategy_id=signal.strategy_id,
+            product_id=signal.product_id,
+            signal_type=signal.type.value,
+            risk_status="PASS" if is_passed else "REJECT",
+            risk_message=risk_msg,
+            order_id=order_id,
+            details_json=json.dumps({
+                "candle": candle.model_dump(mode='json') if candle else None,
+                "signal_metadata": signal.metadata
+            })
+        )
+        with self._db_session_factory() as db:
+            try:
+                db.add(audit)
+                db.commit()
+            except Exception:
+                db.rollback()
+                raise
 
     def shutdown(self, timeout: float = 30.0):
         """Graceful shutdown: stop threads, drain executor, close Redis."""

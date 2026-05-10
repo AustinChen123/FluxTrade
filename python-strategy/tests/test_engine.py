@@ -442,7 +442,7 @@ class TestProcessSignal:
         mock_db_session.add.assert_called()
 
     def test_audit_db_failure_triggers_rollback(self, engine, mock_db_session):
-        """If audit commit fails, should rollback."""
+        """If audit commit fails, rollback and raise."""
         signal = Signal(
             strategy_id="test",
             product_id="BINANCE:BTCUSDT-PERP",
@@ -455,8 +455,9 @@ class TestProcessSignal:
         engine.execution_engine.execute_signal = MagicMock(return_value="order-1")
         mock_db_session.commit.side_effect = Exception("DB write fail")
 
-        # Should not raise
-        engine.process_signal(signal, _make_candle())
+        with pytest.raises(Exception, match="DB write fail"):
+            engine.process_signal(signal, _make_candle())
+
         mock_db_session.rollback.assert_called()
 
 
