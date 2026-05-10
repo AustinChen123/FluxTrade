@@ -2,7 +2,10 @@ import json
 import time
 import threading
 import logging
+import hashlib
+import hmac
 from typing import Optional, Dict, Any
+from urllib.parse import urlencode
 
 # Try to import websockets, handle if missing
 try:
@@ -15,6 +18,17 @@ except ImportError:
 INITIAL_BACKOFF = 1.0
 MAX_BACKOFF = 300.0
 MAX_RETRIES = 10
+
+
+def _sign_payload_binance(payload: str | Dict[str, Any], secret: str) -> str:
+    """Return Binance-compatible HMAC-SHA256 signature for a payload."""
+    if isinstance(payload, dict):
+        payload = urlencode(payload, doseq=True)
+    return hmac.new(
+        secret.encode("utf-8"),
+        payload.encode("utf-8"),
+        hashlib.sha256,
+    ).hexdigest()
 
 
 class WebSocketOrderConnector:
