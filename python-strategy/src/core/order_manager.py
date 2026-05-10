@@ -59,10 +59,11 @@ class OrderManager:
             raise ValueError(f"Invalid order type: {order_type!r}. Must be one of {_VALID_ORDER_TYPES}")
         exchange_id = signal.product_id.split(':')[0]
         order_id = str(uuid.uuid4())
+        is_idempotent_order = client_order_id is not None
 
         new_order = Order(
             id=order_id,
-            exchange_order_id=f"sim_{order_id[:8]}",
+            exchange_order_id=None if is_idempotent_order else f"sim_{order_id[:8]}",
             strategy_id=signal.strategy_id,
             product_id=signal.product_id,
             exchange_id=exchange_id,
@@ -71,7 +72,7 @@ class OrderManager:
             price=price,
             trigger_price=trigger_price,
             quantity=quantity,
-            status="open",
+            status=OrderStatus.NEW.value if is_idempotent_order else "open",
             timestamp=int(self.clock.now() * 1000),
             filled_quantity=Decimal("0"),
             filled_price=Decimal("0"),

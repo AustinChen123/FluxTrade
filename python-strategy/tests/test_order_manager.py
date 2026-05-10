@@ -128,6 +128,8 @@ class TestOrderCreation:
         )
 
         assert order.client_order_id == "client-123"
+        assert order.exchange_order_id is None
+        assert order.status == OrderStatus.NEW.value
         assert order.intent_payload == {
             "quantity": "0.1",
             "limits": ["42000.5"],
