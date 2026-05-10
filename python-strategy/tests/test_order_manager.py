@@ -108,6 +108,31 @@ class TestOrderCreation:
 
         assert order.exchange_id == "BYBIT"
 
+    def test_order_accepts_client_order_id_and_intent_payload(
+        self, mock_order_repo, mock_clock, signal_factory
+    ):
+        """Order/audit correlation metadata should be stored on the order."""
+        order_manager = OrderManager(mock_order_repo, mock_clock)
+        signal = signal_factory()
+
+        order = order_manager.create_order(
+            signal=signal,
+            side=OrderSide.BUY,
+            order_type="market",
+            quantity=Decimal("0.1"),
+            client_order_id="client-123",
+            intent_payload={
+                "quantity": Decimal("0.1"),
+                "limits": [Decimal("42000.5")],
+            },
+        )
+
+        assert order.client_order_id == "client-123"
+        assert order.intent_payload == {
+            "quantity": "0.1",
+            "limits": ["42000.5"],
+        }
+
 
 class TestOrderStatusUpdates:
     """Tests for order status updates."""

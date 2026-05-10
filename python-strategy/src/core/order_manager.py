@@ -8,6 +8,7 @@ from src.core.orm_models import Order, Trade
 from src.core.models import Signal, OrderSide
 from src.core.clock import Clock
 from src.core.interfaces import IOrderRepository
+from src.core.jsonb_helpers import serialize_payload_with_decimals
 from src.core.redis_factory import create_redis_client
 
 logger = logging.getLogger(__name__)
@@ -49,6 +50,8 @@ class OrderManager:
         quantity: Decimal,
         price: Optional[Decimal] = None,
         trigger_price: Optional[Decimal] = None,
+        client_order_id: Optional[str] = None,
+        intent_payload: Optional[dict] = None,
     ) -> Order:
         if side.lower() not in _VALID_SIDES:
             raise ValueError(f"Invalid order side: {side!r}. Must be one of {_VALID_SIDES}")
@@ -71,7 +74,13 @@ class OrderManager:
             status="open",
             timestamp=int(self.clock.now() * 1000),
             filled_quantity=Decimal("0"),
-            filled_price=Decimal("0")
+            filled_price=Decimal("0"),
+            client_order_id=client_order_id,
+            intent_payload=(
+                serialize_payload_with_decimals(intent_payload)
+                if intent_payload is not None
+                else None
+            ),
         )
 
         self.repo.add_order(new_order)
