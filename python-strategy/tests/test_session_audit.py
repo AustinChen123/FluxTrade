@@ -39,7 +39,6 @@ def test_no_long_lived_db_session_assignments():
     assert offenders == []
 
 
-@pytest.mark.xfail(reason="Tasks 2.2-2.5 pending", strict=True)
 def test_engine_constructors_accept_session_factory():
     strategy_params = inspect.signature(StrategyEngine.__init__).parameters
     execution_params = inspect.signature(ExecutionEngine.__init__).parameters

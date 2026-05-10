@@ -85,7 +85,14 @@ class StrategyEngine:
         else:
             logger.info("StrategyEngine: Using provided adapter %s", type(adapter).__name__)
 
-        self.execution_engine = ExecutionEngine(db_session, clock, adapter, order_repository, journal=journal)
+        self.execution_engine = ExecutionEngine(
+            db_session,
+            clock,
+            adapter,
+            order_repository,
+            journal=journal,
+            db_session_factory=self._db_session_factory,
+        )
         self._state_manager = _EngineStateAdapter(self)
         self._health_monitor = HealthMonitor(self._registry)
         self._command_router = CommandRouter(

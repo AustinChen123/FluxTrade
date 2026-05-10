@@ -1,7 +1,7 @@
 import logging
 import time as _time
 from decimal import Decimal
-from typing import Optional
+from typing import Callable, ContextManager, Optional
 from sqlalchemy.orm import Session
 from src.core.models import Signal, SignalType, Candlestick, OrderSide
 from src.core.order_manager import OrderManager
@@ -12,8 +12,18 @@ from src.core.journal import StrategyJournal
 from src.core.metrics import ORDERS_TOTAL, EXECUTION_LATENCY
 
 class ExecutionEngine:
-    def __init__(self, db_session: Session, clock: Clock, adapter: IExchangeAdapter, order_repository: Optional[IOrderRepository] = None, journal: Optional[StrategyJournal] = None, is_backtest: Optional[bool] = None):
+    def __init__(
+        self,
+        db_session: Session,
+        clock: Clock,
+        adapter: IExchangeAdapter,
+        order_repository: Optional[IOrderRepository] = None,
+        journal: Optional[StrategyJournal] = None,
+        is_backtest: Optional[bool] = None,
+        db_session_factory: Optional[Callable[[], ContextManager[Session]]] = None,
+    ):
         self.logger = logging.getLogger("ExecutionEngine")
+        self._db_session_factory = db_session_factory
         if order_repository:
             self.order_manager = OrderManager(order_repository, clock, is_backtest=is_backtest)
         else:

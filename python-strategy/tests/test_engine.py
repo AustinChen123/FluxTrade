@@ -122,6 +122,22 @@ class TestEngineInit:
 
             mock_create.assert_not_called()
 
+    def test_db_session_factory_passed_to_execution_engine(self, mock_db_session, mock_clock):
+        """Injected DB session factory should be shared with ExecutionEngine."""
+        db_session_factory = MagicMock()
+
+        with patch("src.core.engine.create_redis_client") as mock_factory:
+            mock_factory.return_value = MagicMock()
+            engine = StrategyEngine(
+                db_session=mock_db_session,
+                clock=mock_clock,
+                adapter=MagicMock(),
+                db_session_factory=db_session_factory,
+            )
+
+        assert engine._db_session_factory is db_session_factory
+        assert engine.execution_engine._db_session_factory is db_session_factory
+
     def test_strategies_start_empty(self, engine):
         """Strategies dicts should start empty."""
         assert engine.strategies == {}
