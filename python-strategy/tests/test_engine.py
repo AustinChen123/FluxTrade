@@ -309,9 +309,7 @@ class TestOnMarketData:
         candle = _make_candle()
         engine.on_market_data(candle)
 
-        # on_candle returns NO_SIGNAL which evaluates as truthy (it's a Signal object)
-        # but process_signal filters NO_SIGNAL internally
-        # So process_signal IS called, but returns early inside
+        engine.process_signal.assert_not_called()
 
     def test_strategy_exception_logged_not_raised(self, engine, strategy_instance):
         """Exception in strategy.on_candle should be caught, not propagate."""

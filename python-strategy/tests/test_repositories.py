@@ -46,16 +46,23 @@ class TestBacktestOrderRepositoryBasics:
         repo = BacktestOrderRepository(mock_db_session, session_id=1)
         order = order_factory()
 
-        # Should not raise
         repo.add_order(order)
+
+        assert repo._order_strategy_map[order.id] == order.strategy_id
+        mock_db_session.add.assert_not_called()
+        mock_db_session.commit.assert_not_called()
+        mock_db_session.refresh.assert_not_called()
 
     def test_update_order_is_noop(self, mock_db_session, order_factory):
         """update_order should be no-op in backtest."""
         repo = BacktestOrderRepository(mock_db_session, session_id=1)
         order = order_factory()
 
-        # Should not raise
         repo.update_order(order)
+
+        mock_db_session.add.assert_not_called()
+        mock_db_session.commit.assert_not_called()
+        mock_db_session.refresh.assert_not_called()
 
 
 class TestBacktestPositionDelegation:
@@ -70,6 +77,8 @@ class TestBacktestPositionDelegation:
                              Decimal("1.0"), Decimal("42000"), "BUY")
 
         assert repo.balance == Decimal("10000")
+        mock_db_session.add.assert_not_called()
+        mock_db_session.commit.assert_not_called()
 
     def test_get_position_returns_none(self, mock_db_session):
         """get_position should return None (position state in Rust engine)."""

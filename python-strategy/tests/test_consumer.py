@@ -64,23 +64,40 @@ class TestEnsureConsumerGroups:
             mkstream=True,
         )
 
-    def test_busygroup_ignored(self, consumer, mock_redis):
+    def test_busygroup_ignored(self, consumer, mock_redis, caplog):
         """BUSYGROUP error (group already exists) should be silently ignored."""
         mock_redis.xgroup_create.side_effect = redis_lib.exceptions.ResponseError(
             "BUSYGROUP Consumer Group name already exists"
         )
 
-        # Should not raise
+        caplog.set_level("ERROR", logger="src.core.consumer")
         consumer._ensure_consumer_groups()
 
-    def test_other_response_error_logged(self, consumer, mock_redis):
+        mock_redis.xgroup_create.assert_called_once_with(
+            "stream:market:binance:btcusdt:1m",
+            consumer.group_name,
+            id='$',
+            mkstream=True,
+        )
+        assert "Error creating group" not in caplog.text
+
+    def test_other_response_error_logged(self, consumer, mock_redis, caplog):
         """Non-BUSYGROUP ResponseError should be logged (not raised in current impl)."""
         mock_redis.xgroup_create.side_effect = redis_lib.exceptions.ResponseError(
             "WRONGTYPE Operation against a key"
         )
 
-        # Should not raise (logged only)
+        caplog.set_level("ERROR", logger="src.core.consumer")
         consumer._ensure_consumer_groups()
+
+        mock_redis.xgroup_create.assert_called_once_with(
+            "stream:market:binance:btcusdt:1m",
+            consumer.group_name,
+            id='$',
+            mkstream=True,
+        )
+        assert "Error creating group for stream:market:binance:btcusdt:1m" in caplog.text
+        assert "WRONGTYPE Operation against a key" in caplog.text
 
     def test_multiple_channels(self, mock_redis):
         """Should create groups for all channels."""
