@@ -18,7 +18,7 @@ from decimal import Decimal
 from src.core.execution import ExecutionEngine
 from src.core.interfaces.exchange import ExchangeError
 from src.core.models import OrderStatus, SignalType
-from src.core.client_order_id import parse_client_order_id
+from src.core.client_order_id import generate_client_order_id, parse_client_order_id
 
 
 @pytest.fixture
@@ -328,6 +328,63 @@ class TestAuditedExecution:
             "error": "Connection timeout",
         }
         mock_db_session.rollback.assert_called_once()
+
+    def test_existing_client_order_id_returns_existing_order_without_resubmit(
+        self, mock_db_session, mock_clock, mock_exchange_adapter, mock_order_repo, signal_factory, order_factory
+    ):
+        client_order_id = generate_client_order_id(
+            "test_strategy",
+            "execution",
+            "long",
+            clock_ns=lambda: 1704067200000000000,
+        )
+        existing_order = order_factory(
+            order_id="existing-order",
+            client_order_id=client_order_id,
+            exchange_order_id="EX-EXISTING",
+        )
+        mock_order_repo.add_order(existing_order)
+        engine = ExecutionEngine(
+            db_session=mock_db_session,
+            clock=mock_clock,
+            adapter=mock_exchange_adapter,
+            order_repository=mock_order_repo,
+            db_session_factory=lambda: nullcontext(mock_db_session),
+            audit_external_orders=True,
+        )
+
+        result = engine.execute_signal(
+            signal_factory(
+                price=Decimal("42000"),
+                metadata={"client_order_id": client_order_id},
+            )
+        )
+
+        assert result == "existing-order"
+        assert mock_exchange_adapter.open_orders == []
+        mock_db_session.add.assert_not_called()
+
+    def test_invalid_metadata_client_order_id_raises(
+        self, mock_db_session, mock_clock, mock_exchange_adapter, mock_order_repo, signal_factory
+    ):
+        engine = ExecutionEngine(
+            db_session=mock_db_session,
+            clock=mock_clock,
+            adapter=mock_exchange_adapter,
+            order_repository=mock_order_repo,
+            db_session_factory=lambda: nullcontext(mock_db_session),
+            audit_external_orders=True,
+        )
+
+        with pytest.raises(ValueError, match="client_order_id"):
+            engine.execute_signal(
+                signal_factory(
+                    price=Decimal("42000"),
+                    metadata={"client_order_id": "not-valid"},
+                )
+            )
+
+        assert mock_exchange_adapter.open_orders == []
 
 
 class TestCancelOrder:

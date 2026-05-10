@@ -15,7 +15,7 @@ from src.core.audit_service import (
     write_signal_audit_intent,
     write_signal_audit_outcome,
 )
-from src.core.client_order_id import generate_client_order_id
+from src.core.client_order_id import generate_client_order_id, parse_client_order_id
 
 class ExecutionEngine:
     def __init__(
@@ -186,11 +186,12 @@ class ExecutionEngine:
             order_type = "market"
             limit_price = None
 
-        client_order_id = generate_client_order_id(
-            signal.strategy_id,
-            "execution",
-            signal.type.value.lower(),
-        )
+        client_order_id = self._client_order_id_for_signal(signal)
+        existing_order = self.order_manager.repo.get_order_by_client_order_id(client_order_id)
+        if existing_order is not None:
+            self.logger.info("Order already exists for client_order_id=%s", client_order_id)
+            return existing_order.id
+
         intent_payload = {
             "signal": signal.model_dump(mode="json"),
             "order": {
@@ -273,6 +274,17 @@ class ExecutionEngine:
             self._place_conditional_orders(signal, order, qty)
 
         return order.id
+
+    def _client_order_id_for_signal(self, signal: Signal) -> str:
+        client_order_id = (signal.metadata or {}).get("client_order_id")
+        if isinstance(client_order_id, str):
+            parse_client_order_id(client_order_id)
+            return client_order_id
+        return generate_client_order_id(
+            signal.strategy_id,
+            "execution",
+            signal.type.value.lower(),
+        )
 
     def _place_conditional_orders(self, signal: Signal, entry_order, qty: Decimal):
         """Submit SL/TP/Trailing orders linked via OCO to each other."""
