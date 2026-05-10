@@ -32,6 +32,14 @@ class IOrderRepository(ABC):
     def get_order_by_client_order_id(self, client_order_id: str) -> Optional[Order]:
         pass
 
+    def list_client_orders_by_statuses(self, statuses: set[str]) -> list[Order]:
+        """Return client-order-id-backed orders whose status is in ``statuses``.
+
+        This is a recovery/reconciliation hook. Implementations that do not
+        persist orders may return an empty list.
+        """
+        return []
+
     @abstractmethod
     def update_order_exchange_id(self, order: Order, exchange_order_id: str) -> None:
         pass

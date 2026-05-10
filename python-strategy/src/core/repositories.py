@@ -34,6 +34,19 @@ class LiveOrderRepository(IOrderRepository):
         with self._db_session_factory() as db:
             return db.query(Order).filter_by(client_order_id=client_order_id).first()
 
+    def list_client_orders_by_statuses(self, statuses: set[str]) -> list[Order]:
+        if not statuses:
+            return []
+        with self._db_session_factory() as db:
+            return (
+                db.query(Order)
+                .filter(
+                    Order.status.in_(statuses),
+                    Order.client_order_id.isnot(None),
+                )
+                .all()
+            )
+
     def add_trade(self, trade: Trade) -> None:
         with self._db_session_factory() as db:
             db.add(trade)
@@ -126,6 +139,9 @@ class BacktestOrderRepository(IOrderRepository):
 
     def get_order_by_client_order_id(self, client_order_id: str) -> Optional[Order]:
         return None
+
+    def list_client_orders_by_statuses(self, statuses: set[str]) -> list[Order]:
+        return []
 
     def add_trade(self, trade: Trade) -> None:
         strategy_id = self._order_strategy_map.get(trade.order_id)

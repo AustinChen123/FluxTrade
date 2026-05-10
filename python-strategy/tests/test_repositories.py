@@ -99,6 +99,12 @@ class TestBacktestOrderRepositoryBasics:
 
         assert repo.get_order_by_client_order_id("client-1") is None
 
+    def test_list_client_orders_by_statuses_returns_empty(self, mock_db_session):
+        """Backtest repo does not persist recoverable client orders locally."""
+        repo = BacktestOrderRepository(mock_db_session, session_id=1)
+
+        assert repo.list_client_orders_by_statuses({"NEW", "SUBMITTED"}) == []
+
 
 class TestBacktestPositionDelegation:
     """Position/balance operations are delegated to Rust engine."""
@@ -252,6 +258,27 @@ class TestLiveOrderRepositoryBasics:
         mock_db_session.query.return_value.filter_by.assert_called_with(
             client_order_id="client-1"
         )
+
+    def test_list_client_orders_by_statuses_filters_status_and_client_id(
+        self, mock_db_session, order_factory
+    ):
+        """Recoverable order query should require target status and client ID."""
+        repo = LiveOrderRepository(mock_db_session)
+        order = order_factory(order_id="order-1", client_order_id="client-1")
+        mock_db_session.query.return_value.filter.return_value.all.return_value = [order]
+
+        result = repo.list_client_orders_by_statuses({"NEW", "SUBMITTED"})
+
+        assert result == [order]
+        mock_db_session.query.assert_called_with(Order)
+        mock_db_session.query.return_value.filter.assert_called_once()
+
+    def test_list_client_orders_by_statuses_skips_empty_statuses(self, mock_db_session):
+        """Empty status sets should not query the DB."""
+        repo = LiveOrderRepository(mock_db_session)
+
+        assert repo.list_client_orders_by_statuses(set()) == []
+        mock_db_session.query.assert_not_called()
 
     def test_add_trade_commits(self, mock_db_session):
         """add_trade should add to session and commit."""
