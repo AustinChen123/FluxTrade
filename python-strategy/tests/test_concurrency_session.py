@@ -14,6 +14,7 @@ from src.core.orm_models import (
     Position,
     Product,
     Strategy,
+    StrategyState,
 )
 from src.core.orm_models import Trade as ORMTrade
 from src.core.repositories import BacktestOrderRepository, LiveOrderRepository
@@ -29,6 +30,7 @@ def _sqlite_session_factory(tmp_path):
         Product.__table__,
         Strategy.__table__,
         Position.__table__,
+        StrategyState.__table__,
         BacktestResultSummary.__table__,
         BacktestTradeLog.__table__,
     ]:
@@ -88,5 +90,40 @@ def test_concurrent_backtest_trade_logs_use_independent_sessions(tmp_path):
 
     with session_factory() as session:
         count = session.scalar(select(func.count()).select_from(BacktestTradeLog))
+
+    assert count == 200
+
+
+def test_concurrent_engine_heartbeat_updates_use_independent_sessions(tmp_path, engine_factory):
+    session_factory = _sqlite_session_factory(tmp_path)
+
+    with session_factory() as session:
+        session.add_all(
+            StrategyState(
+                strategy_id=f"strategy-{index}",
+                status="ACTIVE",
+                config_json="{}",
+            )
+            for index in range(200)
+        )
+        session.commit()
+
+    engine = engine_factory(db_session_factory=session_factory)
+    engine._health_monitor.update_heartbeat = lambda strategy_id: None
+
+    def record_heartbeat(index: int) -> None:
+        engine._record_strategy_heartbeats([f"strategy-{index}"])
+
+    with ThreadPoolExecutor(max_workers=8) as executor:
+        list(executor.map(record_heartbeat, range(200)))
+
+    with session_factory() as session:
+        count = session.scalar(
+            select(func.count())
+            .select_from(StrategyState)
+            .where(StrategyState.last_heartbeat.is_not(None))
+        )
+
+    engine.shutdown(timeout=0.1)
 
     assert count == 200
