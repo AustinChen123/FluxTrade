@@ -3,7 +3,11 @@ from unittest.mock import MagicMock
 
 import pytest
 
-from src.core.audit_service import build_signal_audit, commit_signal_audit
+from src.core.audit_service import (
+    build_signal_audit,
+    commit_signal_audit,
+    write_system_event,
+)
 from src.core.models import Candlestick, Signal, SignalType
 
 
@@ -90,3 +94,61 @@ def test_commit_signal_audit_rolls_back_and_raises_on_failure() -> None:
 
     session.add.assert_called_once_with(audit)
     session.rollback.assert_called_once()
+
+
+def test_write_system_event_adds_decimal_safe_payload() -> None:
+    session = MagicMock()
+
+    event = write_system_event(
+        session,
+        event_type="reconcile",
+        event_subtype="balance",
+        payload={
+            "balance": Decimal("1000.25"),
+            "positions": [{"size": Decimal("0.5")}],
+        },
+        related_strategy_id="strat-1",
+        related_order_id="order-1",
+        related_gene_id=42,
+    )
+
+    assert event.event_type == "reconcile"
+    assert event.event_subtype == "balance"
+    assert event.related_strategy_id == "strat-1"
+    assert event.related_order_id == "order-1"
+    assert event.related_gene_id == 42
+    assert event.payload == {
+        "balance": "1000.25",
+        "positions": [{"size": "0.5"}],
+    }
+    session.add.assert_called_once_with(event)
+    session.commit.assert_not_called()
+
+
+def test_write_system_event_supports_gene_promote() -> None:
+    session = MagicMock()
+
+    event = write_system_event(
+        session,
+        event_type="gene_promote",
+        payload={"fitness": Decimal("1.2345")},
+        related_gene_id=7,
+    )
+
+    assert event.event_type == "gene_promote"
+    assert event.related_gene_id == 7
+    assert event.payload == {"fitness": "1.2345"}
+    session.add.assert_called_once_with(event)
+
+
+def test_write_system_event_rejects_unknown_type() -> None:
+    session = MagicMock()
+
+    with pytest.raises(ValueError, match="unsupported system event type"):
+        write_system_event(
+            session,
+            event_type="unknown",
+            payload={},
+        )
+
+    session.add.assert_not_called()

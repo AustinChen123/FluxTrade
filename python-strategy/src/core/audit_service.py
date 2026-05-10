@@ -2,14 +2,24 @@
 
 from __future__ import annotations
 
-from typing import Optional
+from typing import Any, Optional
 
 from sqlalchemy.orm import Session
 
 from src.core.clock import Clock
 from src.core.jsonb_helpers import serialize_payload_with_decimals
 from src.core.models import Candlestick, Signal
-from src.core.orm_models import SignalAudit
+from src.core.orm_models import SignalAudit, SystemEvent
+
+
+SYSTEM_EVENT_TYPES = frozenset(
+    {
+        "reconcile",
+        "gene_promote",
+        "gene_retire",
+        "system_error",
+    }
+)
 
 
 def build_signal_audit(
@@ -48,3 +58,29 @@ def commit_signal_audit(session: Session, audit: SignalAudit) -> None:
     except Exception:
         session.rollback()
         raise
+
+
+def write_system_event(
+    session: Session,
+    *,
+    event_type: str,
+    payload: dict[str, Any],
+    event_subtype: Optional[str] = None,
+    related_strategy_id: Optional[str] = None,
+    related_order_id: Optional[str] = None,
+    related_gene_id: Optional[int] = None,
+) -> SystemEvent:
+    """Add a system event to the caller-controlled transaction."""
+    if event_type not in SYSTEM_EVENT_TYPES:
+        raise ValueError(f"unsupported system event type: {event_type}")
+
+    event = SystemEvent(
+        event_type=event_type,
+        event_subtype=event_subtype,
+        related_strategy_id=related_strategy_id,
+        related_order_id=related_order_id,
+        related_gene_id=related_gene_id,
+        payload=serialize_payload_with_decimals(payload),
+    )
+    session.add(event)
+    return event
