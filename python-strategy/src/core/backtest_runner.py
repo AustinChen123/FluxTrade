@@ -1,9 +1,11 @@
 import csv
 import json
 import logging
+from contextlib import contextmanager, nullcontext
 from pathlib import Path
-from typing import List, Optional, Dict
+from typing import Callable, ContextManager, Iterable, List, Optional, Dict
 from decimal import Decimal
+from sqlalchemy.orm import Session
 from src.core.db import SessionLocal
 from src.core.orm_models import Strategy as StrategyORM, BacktestResultSummary, BacktestTradeLog
 from src.core.engine import StrategyEngine
@@ -26,6 +28,15 @@ DEFAULT_REPORT_CONFIG: Dict = {
     "journal_export": True,
     "output_dir": "backtest_output/",
 }
+
+
+@contextmanager
+def _sessionlocal_context():
+    session = SessionLocal()
+    try:
+        yield session
+    finally:
+        session.close()
 
 
 def _write_csv_trades(closed_trades: List[ClosedTrade], path: Path) -> None:
@@ -140,6 +151,7 @@ class BacktestRunner:
         data_source: Optional[IDataSource] = None,
         fee_config: Optional[Dict[str, float]] = None,
         report_config: Optional[Dict] = None,
+        db_session_factory: Optional[Callable[[], ContextManager[Session]]] = None,
     ):
         self.start_time = start_time
         self.end_time = end_time
@@ -150,10 +162,7 @@ class BacktestRunner:
         self.data_source = data_source
         self.fee_config = fee_config or {}
         self.report_config = {**DEFAULT_REPORT_CONFIG, **(report_config or {})}
-
-        # Data session only needed when no external data_source
-        self.data_session = None if data_source else SessionLocal()
-        self.db_session = SessionLocal()
+        self._db_session_factory = db_session_factory or _sessionlocal_context
 
         self.clock = BacktestClock(start_time=start_time / 1000)
         self._strategies_buffer: List[BaseStrategy] = []
@@ -162,10 +171,10 @@ class BacktestRunner:
     def add_strategy(self, strategy: BaseStrategy):
         self._strategies_buffer.append(strategy)
 
-    def _ensure_strategies_registered(self):
+    def _ensure_strategies_registered(self, db_session: Session):
         """Register all added strategies in the DB to avoid FK constraints"""
         for strat in self._strategies_buffer:
-            exists = self.db_session.query(StrategyORM).filter_by(id=strat.strategy_id).first()
+            exists = db_session.query(StrategyORM).filter_by(id=strat.strategy_id).first()
             if not exists:
                 logger.info("Registering missing strategy in DB: %s", strat.strategy_id)
                 new_strat = StrategyORM(
@@ -173,8 +182,33 @@ class BacktestRunner:
                     name=f"Backtest: {strat.strategy_id}",
                     configuration_json="{}"
                 )
-                self.db_session.add(new_strat)
-        self.db_session.commit()
+                db_session.add(new_strat)
+        db_session.commit()
+
+    def _process_candles(
+        self,
+        candles: Iterable,
+        mock_account: BacktestAccountService,
+        stop_threshold: Decimal,
+    ) -> int:
+        count = 0
+        for candle in candles:
+            # Update Clock
+            self.clock.set_time(candle.timestamp / 1000)
+
+            # Process Candle
+            self.engine.on_market_data(candle)
+
+            # Check Circuit Breaker
+            current_balance = mock_account.get_balance()
+            if current_balance < stop_threshold:
+                logger.warning("STOPPING BACKTEST: Max Drawdown Reached! Balance: %s < %s", current_balance, stop_threshold)
+                break
+
+            count += 1
+            if count % 1000 == 0:
+                logger.info("Processed %d candles... Current Time: %s | Bal: %s", count, candle.timestamp, current_balance)
+        return count
 
     def _export_reports(
         self,
@@ -224,7 +258,8 @@ class BacktestRunner:
 
     def run(self):
         # 0. Registration Check
-        self._ensure_strategies_registered()
+        with self._db_session_factory() as db_session:
+            self._ensure_strategies_registered(db_session)
 
         if not self._strategies_buffer:
             logger.warning("No strategies added. Exiting.")
@@ -239,9 +274,11 @@ class BacktestRunner:
             total_pnl=0,
             metrics_json="{}"
         )
-        self.db_session.add(summary)
-        self.db_session.commit()
-        logger.info("Backtest Session Created: ID %s", summary.id)
+        with self._db_session_factory() as db_session:
+            db_session.add(summary)
+            db_session.commit()
+            summary_id = summary.id
+        logger.info("Backtest Session Created: ID %s", summary_id)
 
         # 2. Create journal for structured event recording
         journal = StrategyJournal(primary_strategy_id)
@@ -254,17 +291,22 @@ class BacktestRunner:
         )
 
         # 4. Setup repo (trade recording only) and account service
-        repo = BacktestOrderRepository(self.db_session, summary.id)
+        repo = BacktestOrderRepository(
+            None,
+            summary_id,
+            db_session_factory=self._db_session_factory,
+        )
         mock_account = BacktestAccountService(adapter=adapter)
 
         # 5. Setup Engine with pre-created adapter and journal
         self.engine = StrategyEngine(
-            self.db_session,
+            None,
             self.clock,
             order_repository=repo,
             account_service=mock_account,
             adapter=adapter,
             journal=journal,
+            db_session_factory=self._db_session_factory,
         )
 
         # Inject journal and account service into strategies
@@ -275,52 +317,40 @@ class BacktestRunner:
             self.engine.add_strategy(strat)
 
         logger.info("Starting Backtest for %s [%s - %s]", self.product_id, self.start_time, self.end_time)
-        count = 0
-
-        if self.data_source:
-            candle_gen = self.data_source.get_candles(
-                self.product_id,
-                self.timeframe,
-                self.start_time,
-                self.end_time,
-            )
-        else:
-            candle_gen = get_candles_generator(
-                self.data_session,
-                self.product_id,
-                self.timeframe,
-                self.start_time,
-                self.end_time,
-            )
 
         stop_threshold = Decimal(str(self.initial_balance)) * Decimal(str(1 - self.max_drawdown_limit))
 
-        try:
-            for candle in candle_gen:
-                # Update Clock
-                self.clock.set_time(candle.timestamp / 1000)
+        if self.data_source:
+            candle_context = nullcontext(self.data_source.get_candles(
+                self.product_id,
+                self.timeframe,
+                self.start_time,
+                self.end_time,
+            ))
+        else:
+            candle_context = self._db_session_factory()
 
-                # Process Candle
-                self.engine.on_market_data(candle)
+        with candle_context as candle_source:
+            if self.data_source:
+                candle_gen = candle_source
+            else:
+                candle_gen = get_candles_generator(
+                    candle_source,
+                    self.product_id,
+                    self.timeframe,
+                    self.start_time,
+                    self.end_time,
+                )
+            count = self._process_candles(candle_gen, mock_account, stop_threshold)
 
-                # Check Circuit Breaker
-                current_balance = mock_account.get_balance()
-                if current_balance < stop_threshold:
-                    logger.warning("STOPPING BACKTEST: Max Drawdown Reached! Balance: %s < %s", current_balance, stop_threshold)
-                    break
+        # Calculate Final PnL
+        final_balance = mock_account.get_balance()
+        total_pnl = final_balance - Decimal(str(self.initial_balance))
 
-                count += 1
-                if count % 1000 == 0:
-                    logger.info("Processed %d candles... Current Time: %s | Bal: %s", count, candle.timestamp, current_balance)
-        finally:
-            # Calculate Final PnL
-            final_balance = mock_account.get_balance()
-            total_pnl = final_balance - Decimal(str(self.initial_balance))
-
-            summary.total_pnl = total_pnl
-
+        with self._db_session_factory() as db_session:
+            summary = db_session.query(BacktestResultSummary).filter_by(id=summary_id).first()
             # Metrics (with advanced calculations)
-            trades = self.db_session.query(BacktestTradeLog).filter_by(session_id=summary.id).all()
+            trades = db_session.query(BacktestTradeLog).filter_by(session_id=summary_id).all()
             metrics = calculate_metrics(
                 trades,
                 initial_balance=self.initial_balance,
@@ -339,38 +369,35 @@ class BacktestRunner:
                     for sid, m in per_strategy.items()
                 }
             summary.metrics_json = json.dumps(metrics_for_json, default=str)
+            summary.total_pnl = total_pnl
 
-            self.db_session.commit()
+            db_session.commit()
 
-            # Export reports
-            report_dir = self._export_reports(metrics, journal, candle_count=count)
+        # Export reports
+        report_dir = self._export_reports(metrics, journal, candle_count=count)
 
-            logger.info("Backtest Complete. Processed %d candles. Final PnL: %s", count, total_pnl)
-            logger.info("Metrics: %s", metrics_for_json)
-            if report_dir:
-                logger.info("Reports written to: %s", report_dir)
+        logger.info("Backtest Complete. Processed %d candles. Final PnL: %s", count, total_pnl)
+        logger.info("Metrics: %s", metrics_for_json)
+        if report_dir:
+            logger.info("Reports written to: %s", report_dir)
 
-            result = {
-                "total_pnl": total_pnl,
-                "max_drawdown": metrics.get("max_drawdown", Decimal("0")),
-                "win_rate": metrics.get("win_rate", Decimal("0")),
-                "total_trades": int(metrics.get("total_trades", 0)),
-                "trade_sharpe": metrics.get("trade_sharpe", Decimal("0")),
-                "profit_factor": metrics.get("profit_factor", Decimal("0")),
-                "sortino_ratio": metrics.get("sortino_ratio", Decimal("0")),
-                "calmar_ratio": metrics.get("calmar_ratio", Decimal("0")),
-                "avg_hold_time_hours": metrics.get("avg_hold_time_hours", Decimal("0")),
-                "max_consecutive_wins": int(metrics.get("max_consecutive_wins", 0)),
-                "max_consecutive_losses": int(metrics.get("max_consecutive_losses", 0)),
-                "journal": journal.to_dicts(),
-                "journal_count": len(journal),
-                "report_dir": report_dir,
-                "per_strategy": per_strategy,
-            }
-
-            self.db_session.close()
-            if self.data_session:
-                self.data_session.close()
+        result = {
+            "total_pnl": total_pnl,
+            "max_drawdown": metrics.get("max_drawdown", Decimal("0")),
+            "win_rate": metrics.get("win_rate", Decimal("0")),
+            "total_trades": int(metrics.get("total_trades", 0)),
+            "trade_sharpe": metrics.get("trade_sharpe", Decimal("0")),
+            "profit_factor": metrics.get("profit_factor", Decimal("0")),
+            "sortino_ratio": metrics.get("sortino_ratio", Decimal("0")),
+            "calmar_ratio": metrics.get("calmar_ratio", Decimal("0")),
+            "avg_hold_time_hours": metrics.get("avg_hold_time_hours", Decimal("0")),
+            "max_consecutive_wins": int(metrics.get("max_consecutive_wins", 0)),
+            "max_consecutive_losses": int(metrics.get("max_consecutive_losses", 0)),
+            "journal": journal.to_dicts(),
+            "journal_count": len(journal),
+            "report_dir": report_dir,
+            "per_strategy": per_strategy,
+        }
 
         return result
 
