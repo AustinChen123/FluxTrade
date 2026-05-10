@@ -12,7 +12,7 @@ Covers:
 """
 
 from decimal import Decimal
-from unittest.mock import MagicMock, patch
+from unittest.mock import MagicMock, call, patch
 
 import pytest
 
@@ -517,6 +517,47 @@ class TestHandleCommand:
 
         # Should not raise
         engine._handle_command({"command": "SCAN"})
+
+
+# =============================================================================
+# heartbeat recording
+# =============================================================================
+
+
+class TestHeartbeatRecording:
+
+    def test_record_strategy_heartbeats_updates_health_monitor_and_db(self, engine):
+        """Strategy heartbeat recording should update HealthMonitor and DB state."""
+        engine._health_monitor.update_heartbeat = MagicMock()
+        mock_db = MagicMock()
+
+        with patch("src.core.engine.SessionLocal") as mock_sl, \
+             patch("src.core.engine.time.time", return_value=100.0):
+            mock_sl.return_value.__enter__ = MagicMock(return_value=mock_db)
+            mock_sl.return_value.__exit__ = MagicMock(return_value=False)
+
+            engine._record_strategy_heartbeats(["s1", "s2"])
+
+        assert engine._health_monitor.update_heartbeat.call_args_list == [
+            call("s1"),
+            call("s2"),
+        ]
+        assert mock_db.query.return_value.filter.return_value.update.call_count == 2
+        mock_db.commit.assert_called_once()
+
+    def test_record_strategy_heartbeats_commits_when_health_monitor_fails(self, engine):
+        """DB heartbeat updates should still commit if HealthMonitor update fails."""
+        engine._health_monitor.update_heartbeat = MagicMock(side_effect=RuntimeError("boom"))
+        mock_db = MagicMock()
+
+        with patch("src.core.engine.SessionLocal") as mock_sl:
+            mock_sl.return_value.__enter__ = MagicMock(return_value=mock_db)
+            mock_sl.return_value.__exit__ = MagicMock(return_value=False)
+
+            engine._record_strategy_heartbeats(["s1"])
+
+        mock_db.query.return_value.filter.return_value.update.assert_called_once()
+        mock_db.commit.assert_called_once()
 
 
 # =============================================================================

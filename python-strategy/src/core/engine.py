@@ -101,6 +101,7 @@ class StrategyEngine:
         
         # System State & Heartbeat
         self.redis_client = create_redis_client()
+        self._health_monitor.redis_client = self.redis_client
         self.running = True
         self.heartbeat_thread = None
         self.command_thread = None
@@ -359,13 +360,7 @@ class StrategyEngine:
                     # Update DB heartbeats for active strategies (snapshot for thread safety)
                     with self._strategy_lock:
                         active_sids = list(self.strategy_instances.keys())
-                    with SessionLocal() as db:
-                        now_ms = int(time.time() * 1000)
-                        for sid in active_sids:
-                            db.query(StrategyState).filter(StrategyState.strategy_id == sid).update({
-                                "last_heartbeat": now_ms
-                            })
-                        db.commit()
+                    self._record_strategy_heartbeats(active_sids)
                     time.sleep(1.0)
                 except Exception as e:
                     logger.error("💓 Heartbeat Failed: %s", e)
@@ -373,6 +368,20 @@ class StrategyEngine:
         
         self.heartbeat_thread = threading.Thread(target=heartbeat_loop, daemon=True)
         self.heartbeat_thread.start()
+
+    def _record_strategy_heartbeats(self, strategy_ids: list[str]) -> None:
+        """Record strategy heartbeat state in HealthMonitor and DB."""
+        with SessionLocal() as db:
+            now_ms = int(time.time() * 1000)
+            for sid in strategy_ids:
+                try:
+                    self._health_monitor.update_heartbeat(sid)
+                except Exception as e:
+                    logger.warning("Failed to update health monitor for %s: %s", sid, e)
+                db.query(StrategyState).filter(StrategyState.strategy_id == sid).update({
+                    "last_heartbeat": now_ms
+                })
+            db.commit()
 
     def add_strategy(self, strategy: BaseStrategy):
         """
