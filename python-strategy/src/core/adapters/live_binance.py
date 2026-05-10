@@ -8,6 +8,7 @@ import logging
 import asyncio
 
 from src.core.adapters.ccxt_adapter import CcxtExchangeAdapter
+from src.core.client_order_id import to_exchange_format
 from src.core.orm_models import Order
 from src.core.ws_connector import WebSocketOrderConnector
 
@@ -54,18 +55,25 @@ class LiveBinanceAdapter(CcxtExchangeAdapter):
             and order.type.lower() == "market"
         ):
             try:
+                client_order_id = getattr(order, "client_order_id", None)
+                exchange_client_order_id = (
+                    to_exchange_format(client_order_id, "binance")
+                    if client_order_id
+                    else None
+                )
                 success = self.ws_connector.place_order(
                     symbol=order.product_id,
                     side=order.side,
                     quantity=str(order.quantity),
                     price=str(order.price) if order.price else None,
                     order_type=order.type,
-                    client_order_id=getattr(order, "client_order_id", None),
+                    client_order_id=exchange_client_order_id,
                 )
                 if success:
-                    client_order_id = getattr(order, "client_order_id", None)
-                    if client_order_id:
-                        ack = asyncio.run(self.ws_connector._wait_for_ack(client_order_id))
+                    if exchange_client_order_id:
+                        ack = asyncio.run(
+                            self.ws_connector._wait_for_ack(exchange_client_order_id)
+                        )
                         return ack.exchange_order_id
                     return f"WS-{order.id}"
             except Exception as e:

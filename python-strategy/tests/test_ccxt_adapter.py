@@ -9,8 +9,11 @@ from src.core.adapters import create_adapter
 from src.core.adapters.ccxt_adapter import CcxtExchangeAdapter
 from src.core.adapters.live_binance import LiveBinanceAdapter
 from src.core.adapters.simulated import SimulatedAdapter
+from src.core.client_order_id import to_exchange_format
 from src.core.interfaces.exchange import ExchangeError, InsufficientFundsError, NetworkError
 from src.core.orm_models import Order
+
+CANONICAL_CLIENT_ORDER_ID = "strategy_1-worker_a-entry-1704067200000000000"
 
 
 # ---------------------------------------------------------------------------
@@ -104,12 +107,15 @@ class TestPlaceOrder:
 
     def test_binance_order_passes_client_order_id(self, adapter, mock_ccxt_client):
         mock_ccxt_client.create_order.return_value = {"id": "EX-789"}
-        order = _make_order(client_order_id="client-123")
+        order = _make_order(client_order_id=CANONICAL_CLIENT_ORDER_ID)
 
         adapter.place_order(order)
 
         call_kwargs = mock_ccxt_client.create_order.call_args
-        assert call_kwargs.kwargs["params"]["newClientOrderId"] == "client-123"
+        assert call_kwargs.kwargs["params"]["newClientOrderId"] == to_exchange_format(
+            CANONICAL_CLIENT_ORDER_ID,
+            "binance",
+        )
 
     def test_non_binance_order_passes_client_order_id(self, mock_ccxt_client):
         with patch("src.core.adapters.ccxt_adapter.ccxt") as mock_ccxt:
@@ -123,12 +129,15 @@ class TestPlaceOrder:
             )
         adapter.client = mock_ccxt_client
         mock_ccxt_client.create_order.return_value = {"id": "EX-789"}
-        order = _make_order(product_id="BYBIT:BTCUSDT-PERP", client_order_id="client-123")
+        order = _make_order(
+            product_id="BYBIT:BTCUSDT-PERP",
+            client_order_id=CANONICAL_CLIENT_ORDER_ID,
+        )
 
         adapter.place_order(order)
 
         call_kwargs = mock_ccxt_client.create_order.call_args
-        assert call_kwargs.kwargs["params"]["clientOrderId"] == "client-123"
+        assert call_kwargs.kwargs["params"]["clientOrderId"] == CANONICAL_CLIENT_ORDER_ID
 
     def test_insufficient_funds_raises(self, adapter, mock_ccxt_client):
         import ccxt as ccxt_lib
@@ -163,15 +172,19 @@ class TestCancelOrder:
 
     def test_binance_cancel_by_client_order_id(self, adapter, mock_ccxt_client):
         result = adapter.cancel_order_by_client_id(
-            "client-123",
+            CANONICAL_CLIENT_ORDER_ID,
             "BINANCE:BTCUSDT-PERP",
         )
 
+        exchange_client_order_id = to_exchange_format(
+            CANONICAL_CLIENT_ORDER_ID,
+            "binance",
+        )
         assert result is True
         mock_ccxt_client.cancel_order.assert_called_once_with(
-            "client-123",
+            exchange_client_order_id,
             "BTC/USDT:USDT",
-            params={"origClientOrderId": "client-123"},
+            params={"origClientOrderId": exchange_client_order_id},
         )
 
     def test_non_binance_cancel_by_client_order_id(self, mock_ccxt_client):
@@ -186,13 +199,16 @@ class TestCancelOrder:
             )
         adapter.client = mock_ccxt_client
 
-        result = adapter.cancel_order_by_client_id("client-123", "BYBIT:BTCUSDT-PERP")
+        result = adapter.cancel_order_by_client_id(
+            CANONICAL_CLIENT_ORDER_ID,
+            "BYBIT:BTCUSDT-PERP",
+        )
 
         assert result is True
         mock_ccxt_client.cancel_order.assert_called_once_with(
-            "client-123",
+            CANONICAL_CLIENT_ORDER_ID,
             "BTC/USDT:USDT",
-            params={"clientOrderId": "client-123"},
+            params={"clientOrderId": CANONICAL_CLIENT_ORDER_ID},
         )
 
     def test_cancel_order_not_found(self, adapter, mock_ccxt_client):
@@ -389,13 +405,20 @@ class TestLiveBinanceWsOrderPath:
             MockWS.return_value = mock_ws_inst
 
             adapter = LiveBinanceAdapter(api_key="k", secret="s", enable_ws=True)
-            order = _make_order(type="market", client_order_id="client-123")
+            order = _make_order(type="market", client_order_id=CANONICAL_CLIENT_ORDER_ID)
             result = adapter.place_order(order)
 
+            exchange_client_order_id = to_exchange_format(
+                CANONICAL_CLIENT_ORDER_ID,
+                "binance",
+            )
             assert result == "WS-123"
             mock_ws_inst.place_order.assert_called_once()
-            assert mock_ws_inst.place_order.call_args.kwargs["client_order_id"] == "client-123"
-            mock_ws_inst._wait_for_ack.assert_called_once_with("client-123")
+            assert (
+                mock_ws_inst.place_order.call_args.kwargs["client_order_id"]
+                == exchange_client_order_id
+            )
+            mock_ws_inst._wait_for_ack.assert_called_once_with(exchange_client_order_id)
 
     def test_ws_ack_timeout_falls_back_to_rest(self):
         """WS ACK timeout should fall back to REST."""
@@ -418,7 +441,7 @@ class TestLiveBinanceWsOrderPath:
 
             adapter = LiveBinanceAdapter(api_key="k", secret="s", enable_ws=True)
             adapter.client = client
-            order = _make_order(type="market", client_order_id="client-123")
+            order = _make_order(type="market", client_order_id=CANONICAL_CLIENT_ORDER_ID)
             result = adapter.place_order(order)
 
             assert result == "REST-ACK-TIMEOUT"

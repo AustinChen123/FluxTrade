@@ -18,6 +18,7 @@ from src.core.interfaces.exchange import (
     InsufficientFundsError,
     NetworkError,
 )
+from src.core.client_order_id import to_exchange_format
 from src.core.models import Position
 from src.core.orm_models import Order
 from src.core.product_registry import to_ccxt_symbol
@@ -77,10 +78,11 @@ class CcxtExchangeAdapter(IExchangeAdapter):
             params["timeInForce"] = "GTC"
         client_order_id = getattr(order, "client_order_id", None)
         if client_order_id:
+            exchange_client_order_id = to_exchange_format(client_order_id, self.exchange_id)
             if self.exchange_id == "binance":
-                params["newClientOrderId"] = client_order_id
+                params["newClientOrderId"] = exchange_client_order_id
             else:
-                params["clientOrderId"] = client_order_id
+                params["clientOrderId"] = exchange_client_order_id
 
         try:
             self.logger.info(
@@ -122,13 +124,14 @@ class CcxtExchangeAdapter(IExchangeAdapter):
 
     def cancel_order_by_client_id(self, client_order_id: str, product_id: str) -> bool:
         ccxt_symbol = to_ccxt_symbol(product_id)
+        exchange_client_order_id = to_exchange_format(client_order_id, self.exchange_id)
         params = (
-            {"origClientOrderId": client_order_id}
+            {"origClientOrderId": exchange_client_order_id}
             if self.exchange_id == "binance"
-            else {"clientOrderId": client_order_id}
+            else {"clientOrderId": exchange_client_order_id}
         )
         try:
-            self.client.cancel_order(client_order_id, ccxt_symbol, params=params)
+            self.client.cancel_order(exchange_client_order_id, ccxt_symbol, params=params)
             return True
         except ccxt.OrderNotFound:
             self.logger.warning(
