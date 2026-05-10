@@ -14,7 +14,7 @@ from decimal import Decimal
 from pydantic import ValidationError
 
 from src.core.models import (
-    SignalType, Candlestick, Position, Trade
+    SignalType, Candlestick, OrderStatus, Position, Trade
 )
 
 
@@ -229,6 +229,28 @@ class TestSignalModel:
         signal = signal_factory(metadata=metadata)
         assert signal.metadata == metadata
         assert signal.metadata["reason"] == "golden_cross"
+
+
+class TestOrderStatus:
+    """Tests for idempotent order lifecycle status constants."""
+
+    def test_idempotent_order_status_values(self):
+        assert OrderStatus.NEW.value == "NEW"
+        assert OrderStatus.SUBMITTED_UNCONFIRMED.value == "SUBMITTED_UNCONFIRMED"
+        assert OrderStatus.SUBMITTED.value == "SUBMITTED"
+        assert OrderStatus.FILLED.value == "FILLED"
+        assert OrderStatus.CANCELLED.value == "CANCELLED"
+
+    def test_order_status_transition_constants_are_distinct(self):
+        lifecycle = [
+            OrderStatus.NEW,
+            OrderStatus.SUBMITTED_UNCONFIRMED,
+            OrderStatus.SUBMITTED,
+            OrderStatus.FILLED,
+            OrderStatus.CANCELLED,
+        ]
+
+        assert len({status.value for status in lifecycle}) == len(lifecycle)
 
 
 class TestPositionModel:

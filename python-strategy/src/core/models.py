@@ -25,6 +25,15 @@ class OrderSide(str, Enum):
         return OrderSide.BUY
 
 
+class OrderStatus(str, Enum):
+    NEW = "NEW"
+    SUBMITTED_UNCONFIRMED = "SUBMITTED_UNCONFIRMED"
+    SUBMITTED = "SUBMITTED"
+    FILLED = "FILLED"
+    CANCELLED = "CANCELLED"
+    FAILED = "FAILED"
+
+
 class PositionSide(str, Enum):
     LONG = "LONG"
     SHORT = "SHORT"
