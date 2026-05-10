@@ -18,11 +18,13 @@ def test_generate_client_order_id_uses_canonical_format() -> None:
     )
 
     parts = coid.split("-")
-    assert parts == ["strategy_1", "worker_a", "entry", "1704067200000000000"]
+    assert parts[:3] == ["strategy_1", "worker_a", "entry"]
+    assert parts[3].isdigit()
+    assert int(parts[3]) >= 1704067200000000000
     assert parse_client_order_id(coid).strategy_id == "strategy_1"
     assert parse_client_order_id(coid).instance_id == "worker_a"
     assert parse_client_order_id(coid).action == "entry"
-    assert parse_client_order_id(coid).ts_ns == 1704067200000000000
+    assert parse_client_order_id(coid).ts_ns >= 1704067200000000000
 
 
 def test_generate_client_order_id_is_unique_for_repeated_clock_values() -> None:

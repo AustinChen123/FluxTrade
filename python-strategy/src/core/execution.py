@@ -1,6 +1,5 @@
 import logging
 import time as _time
-import uuid
 from decimal import Decimal
 from typing import Callable, ContextManager, Optional
 from sqlalchemy.orm import Session
@@ -16,6 +15,7 @@ from src.core.audit_service import (
     write_signal_audit_intent,
     write_signal_audit_outcome,
 )
+from src.core.client_order_id import generate_client_order_id
 
 class ExecutionEngine:
     def __init__(
@@ -171,7 +171,11 @@ class ExecutionEngine:
             order_type = "market"
             limit_price = None
 
-        client_order_id = f"{signal.strategy_id}_{uuid.uuid4().hex[:12]}"
+        client_order_id = generate_client_order_id(
+            signal.strategy_id,
+            "execution",
+            signal.type.value.lower(),
+        )
         intent_payload = {
             "signal": signal.model_dump(mode="json"),
             "order": {

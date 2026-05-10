@@ -18,6 +18,7 @@ from decimal import Decimal
 from src.core.execution import ExecutionEngine
 from src.core.interfaces.exchange import ExchangeError
 from src.core.models import SignalType
+from src.core.client_order_id import parse_client_order_id
 
 
 @pytest.fixture
@@ -217,7 +218,10 @@ class TestAuditedExecution:
 
         assert order_id is not None
         order = mock_order_repo.orders[order_id]
-        assert order.client_order_id.startswith(f"{signal.strategy_id}_")
+        coid = parse_client_order_id(order.client_order_id)
+        assert coid.strategy_id == signal.strategy_id
+        assert coid.instance_id == "execution"
+        assert coid.action == "long"
         assert order.intent_payload["order"]["quantity"] == "0.25"
         assert order.intent_payload["order"]["price"] == "42000"
         audit = audit_session.add.call_args_list[0].args[0]
