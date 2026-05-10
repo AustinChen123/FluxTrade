@@ -1,9 +1,12 @@
 import logging
 import time
+from contextlib import nullcontext
 from dataclasses import dataclass, field
 from enum import Enum
+from typing import Callable, ContextManager, Optional
 
 from sqlalchemy import text
+from sqlalchemy.orm import Session
 logger = logging.getLogger(__name__)
 
 
@@ -53,9 +56,15 @@ class HealthReport:
 
 
 class HealthChecker:
-    def __init__(self, redis_client, db_session, adapter=None):
+    def __init__(
+        self,
+        redis_client,
+        db_session=None,
+        adapter=None,
+        db_session_factory: Optional[Callable[[], ContextManager[Session]]] = None,
+    ):
         self.redis_client = redis_client
-        self.db_session = db_session
+        self._db_session_factory = db_session_factory or (lambda: nullcontext(db_session))
         self.adapter = adapter
         self._start_time = time.monotonic()
 
@@ -80,7 +89,8 @@ class HealthChecker:
     def check_database(self) -> CheckResult:
         start = time.monotonic()
         try:
-            self.db_session.execute(text("SELECT 1"))
+            with self._db_session_factory() as db_session:
+                db_session.execute(text("SELECT 1"))
             latency = (time.monotonic() - start) * 1000
             return CheckResult(
                 status=ComponentStatus.HEALTHY,

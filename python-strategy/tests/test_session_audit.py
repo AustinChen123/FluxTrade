@@ -18,6 +18,7 @@ SESSION_AUDIT_FILES = [
     CORE_DIR / "signal_processor.py",
     CORE_DIR / "repositories.py",
     CORE_DIR / "backtest_runner.py",
+    CORE_DIR / "health.py",
 ]
 LONG_LIVED_SESSION_PATTERN = re.compile(r"\bself\.(?:db|session)\s*=")
 
