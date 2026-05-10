@@ -101,6 +101,9 @@ class MockOrderRepository(IOrderRepository):
     def update_order(self, order: Order) -> None:
         self.orders[order.id] = order
 
+    def get_order(self, order_id: str) -> Optional[Order]:
+        return self.orders.get(order_id)
+
     def add_trade(self, trade: ORMTrade) -> None:
         self.trades.append(trade)
 

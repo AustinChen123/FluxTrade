@@ -21,7 +21,7 @@ from unittest.mock import MagicMock
 
 from src.core.interfaces.repository import IOrderRepository
 from src.core.repositories import BacktestOrderRepository, LiveOrderRepository
-from src.core.orm_models import Trade
+from src.core.orm_models import Order, Trade
 
 
 class TestOrderRepositoryInterface:
@@ -86,6 +86,12 @@ class TestBacktestOrderRepositoryBasics:
         mock_db_session.add.assert_not_called()
         mock_db_session.commit.assert_not_called()
         mock_db_session.refresh.assert_not_called()
+
+    def test_get_order_returns_none(self, mock_db_session):
+        """Backtest repo does not persist orders locally."""
+        repo = BacktestOrderRepository(mock_db_session, session_id=1)
+
+        assert repo.get_order("order-1") is None
 
 
 class TestBacktestPositionDelegation:
@@ -214,6 +220,18 @@ class TestLiveOrderRepositoryBasics:
 
         mock_db_session.add.assert_called_with(order)
         mock_db_session.commit.assert_called()
+
+    def test_get_order_queries_by_id(self, mock_db_session, order_factory):
+        """get_order should query by primary key string."""
+        repo = LiveOrderRepository(mock_db_session)
+        order = order_factory(order_id="order-1")
+        mock_db_session.query.return_value.filter_by.return_value.first.return_value = order
+
+        result = repo.get_order("order-1")
+
+        assert result is order
+        mock_db_session.query.assert_called_with(Order)
+        mock_db_session.query.return_value.filter_by.assert_called_with(id="order-1")
 
     def test_add_trade_commits(self, mock_db_session):
         """add_trade should add to session and commit."""
