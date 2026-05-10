@@ -70,6 +70,10 @@ class ExecutionEngine:
         Also places SL/TP/Trailing orders when specified in the signal.
         Returns the Order ID (Internal) if successful.
         """
+        return self._execute_signal_core(signal, candle)
+
+    def _execute_signal_core(self, signal: Signal, candle: Optional[Candlestick] = None) -> Optional[str]:
+        """Current non-audited signal execution path."""
         side = self._determine_side(signal.type)
         if not side:
             return None
