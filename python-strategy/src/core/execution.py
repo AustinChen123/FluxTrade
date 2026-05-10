@@ -3,7 +3,7 @@ import time as _time
 from decimal import Decimal
 from typing import Callable, ContextManager, Optional
 from sqlalchemy.orm import Session
-from src.core.models import Signal, SignalType, Candlestick, OrderSide
+from src.core.models import Signal, SignalType, Candlestick, OrderSide, OrderStatus
 from src.core.order_manager import OrderManager
 from src.core.interfaces.exchange import IExchangeAdapter, ExchangeError
 from src.core.clock import Clock
@@ -72,6 +72,21 @@ class ExecutionEngine:
 
                 if self.journal is not None:
                     self._journal_fill(order, price, qty, fee, fill_type, candle)
+
+    def cancel_order(self, order_id: str) -> bool:
+        """Cancel a known order through the exchange adapter."""
+        order = self.order_manager.repo.get_order(order_id)
+        if order is None:
+            return False
+        if order.status == OrderStatus.CANCELLED.value:
+            return True
+
+        exchange_order_id = order.exchange_order_id or order.id
+        if not self.adapter.cancel_order(exchange_order_id, order.product_id):
+            return False
+
+        self.order_manager.mark_cancelled(order)
+        return True
 
     def execute_signal(self, signal: Signal, candle: Optional[Candlestick] = None) -> Optional[str]:
         """

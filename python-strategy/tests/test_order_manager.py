@@ -224,6 +224,17 @@ class TestOrderStatusUpdates:
         assert order.status == OrderStatus.SUBMITTED.value
         assert order.exchange_order_id == "EX-123"
 
+    def test_mark_cancelled_updates_status(self, mock_order_repo, mock_clock, signal_factory):
+        """Cancelled orders should enter terminal cancelled state."""
+        order_manager = OrderManager(mock_order_repo, mock_clock)
+        signal = signal_factory()
+        order = order_manager.create_order(signal, OrderSide.BUY, "market", Decimal("0.1"))
+
+        order_manager.mark_cancelled(order)
+
+        assert order.status == OrderStatus.CANCELLED.value
+        assert mock_order_repo.orders[order.id].status == OrderStatus.CANCELLED.value
+
 
 class TestExchangeOrderId:
     """Tests for exchange order ID handling."""

@@ -330,6 +330,40 @@ class TestAuditedExecution:
         mock_db_session.rollback.assert_called_once()
 
 
+class TestCancelOrder:
+    """Tests for execution-level cancellation."""
+
+    def test_cancel_order_returns_false_when_order_missing(
+        self, execution_engine, mock_exchange_adapter
+    ):
+        assert execution_engine.cancel_order("missing") is False
+        assert mock_exchange_adapter.open_orders == []
+
+    def test_cancel_order_calls_adapter_and_marks_cancelled(
+        self, execution_engine, signal_factory, mock_order_repo, mock_exchange_adapter
+    ):
+        order_id = execution_engine.execute_signal(signal_factory(price=None, value=None))
+        order = mock_order_repo.orders[order_id]
+
+        result = execution_engine.cancel_order(order_id)
+
+        assert result is True
+        assert order.status == OrderStatus.CANCELLED.value
+        assert mock_exchange_adapter.open_orders == []
+
+    def test_cancel_order_is_idempotent_for_cancelled_order(
+        self, execution_engine, signal_factory, mock_order_repo, mock_exchange_adapter
+    ):
+        order_id = execution_engine.execute_signal(signal_factory(price=None, value=None))
+        order = mock_order_repo.orders[order_id]
+        order.status = OrderStatus.CANCELLED.value
+
+        result = execution_engine.cancel_order(order_id)
+
+        assert result is True
+        assert len(mock_exchange_adapter.open_orders) == 1
+
+
 class TestMarketDataProcessing:
     """Tests for process_market_data (simulated fills)."""
 

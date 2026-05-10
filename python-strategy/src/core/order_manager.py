@@ -102,6 +102,10 @@ class OrderManager:
         else:
             self.repo.update_order(order)
 
+    def mark_cancelled(self, order: Order) -> None:
+        """Mark order as cancelled."""
+        self._set_order_status(order, OrderStatus.CANCELLED)
+
     def _set_order_status(self, order: Order, status: OrderStatus) -> None:
         order.status = status.value
         self.repo.update_order(order)
