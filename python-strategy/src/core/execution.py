@@ -48,6 +48,15 @@ class ExecutionEngine:
         self.journal = journal
         self.logger.info("ExecutionEngine initialized with adapter: %s", type(adapter).__name__)
 
+    def list_recoverable_client_orders(self):
+        """Return persisted client orders that need restart reconciliation."""
+        statuses = {
+            OrderStatus.NEW.value,
+            OrderStatus.SUBMITTED_UNCONFIRMED.value,
+            OrderStatus.SUBMITTED.value,
+        }
+        return self.order_manager.repo.list_client_orders_by_statuses(statuses)
+
     def process_market_data(self, candle: Candlestick):
         """
         Passes market data to the adapter (if applicable) to check for simulated fills.

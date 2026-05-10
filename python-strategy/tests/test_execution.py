@@ -386,6 +386,36 @@ class TestAuditedExecution:
 
         assert mock_exchange_adapter.open_orders == []
 
+    def test_list_recoverable_client_orders_returns_inflight_client_orders(
+        self, mock_db_session, mock_clock, mock_exchange_adapter, mock_order_repo, order_factory
+    ):
+        engine = ExecutionEngine(
+            db_session=mock_db_session,
+            clock=mock_clock,
+            adapter=mock_exchange_adapter,
+            order_repository=mock_order_repo,
+        )
+        recoverable = order_factory(
+            order_id="recoverable",
+            client_order_id="client-1",
+            status=OrderStatus.SUBMITTED_UNCONFIRMED.value,
+        )
+        closed = order_factory(
+            order_id="closed",
+            client_order_id="client-2",
+            status="closed",
+        )
+        no_client_id = order_factory(
+            order_id="missing-client-id",
+            client_order_id=None,
+            status=OrderStatus.SUBMITTED.value,
+        )
+        mock_order_repo.add_order(recoverable)
+        mock_order_repo.add_order(closed)
+        mock_order_repo.add_order(no_client_id)
+
+        assert engine.list_recoverable_client_orders() == [recoverable]
+
 
 class TestCancelOrder:
     """Tests for execution-level cancellation."""
