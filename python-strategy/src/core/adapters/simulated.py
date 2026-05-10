@@ -63,6 +63,15 @@ class SimulatedAdapter(IExchangeAdapter):
                 return cancelled
         return False
 
+    def cancel_order_by_client_id(self, client_order_id: str, product_id: str) -> bool:
+        for oid, orm_order in self._order_map.items():
+            if orm_order.client_order_id == client_order_id:
+                cancelled = self._engine.cancel_order(oid)
+                if cancelled:
+                    del self._order_map[oid]
+                return cancelled
+        return False
+
     def get_balance(self, asset: str = "USDT") -> Decimal:
         return Decimal(self._engine.balance)
 

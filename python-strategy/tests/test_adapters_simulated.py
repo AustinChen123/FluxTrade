@@ -449,6 +449,21 @@ class TestCancellation:
         assert adapter.cancel_order(ex_id, PRODUCT) is True
         assert adapter.cancel_order(ex_id, PRODUCT) is False
 
+    def test_cancel_by_client_order_id(self, order_factory):
+        adapter = SimulatedAdapter(Decimal("10000"))
+        order = order_factory(
+            order_type="limit",
+            side="buy",
+            product_id=PRODUCT,
+            price=Decimal("40000"),
+            quantity=Decimal("0.1"),
+            client_order_id="client-123",
+        )
+        adapter.place_order(order)
+
+        assert adapter.cancel_order_by_client_id("client-123", PRODUCT) is True
+        assert adapter.cancel_order_by_client_id("client-123", PRODUCT) is False
+
     def test_cancel_nonexistent(self):
         adapter = SimulatedAdapter(Decimal("10000"))
         assert adapter.cancel_order("NOPE", PRODUCT) is False

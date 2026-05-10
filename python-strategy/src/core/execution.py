@@ -81,6 +81,14 @@ class ExecutionEngine:
         if order.status == OrderStatus.CANCELLED.value:
             return True
 
+        client_order_id = getattr(order, "client_order_id", None)
+        if client_order_id and self.adapter.cancel_order_by_client_id(
+            client_order_id,
+            order.product_id,
+        ):
+            self.order_manager.mark_cancelled(order)
+            return True
+
         exchange_order_id = order.exchange_order_id or order.id
         if not self.adapter.cancel_order(exchange_order_id, order.product_id):
             return False

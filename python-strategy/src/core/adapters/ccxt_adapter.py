@@ -120,6 +120,30 @@ class CcxtExchangeAdapter(IExchangeAdapter):
             self.logger.error("Failed to cancel order %s: %s", order_id, e)
             return False
 
+    def cancel_order_by_client_id(self, client_order_id: str, product_id: str) -> bool:
+        ccxt_symbol = to_ccxt_symbol(product_id)
+        params = (
+            {"origClientOrderId": client_order_id}
+            if self.exchange_id == "binance"
+            else {"clientOrderId": client_order_id}
+        )
+        try:
+            self.client.cancel_order(client_order_id, ccxt_symbol, params=params)
+            return True
+        except ccxt.OrderNotFound:
+            self.logger.warning(
+                "Order with client_order_id %s not found on exchange",
+                client_order_id,
+            )
+            return False
+        except ccxt.BaseError as e:
+            self.logger.error(
+                "Failed to cancel order with client_order_id %s: %s",
+                client_order_id,
+                e,
+            )
+            return False
+
     def get_balance(self, asset: str) -> Decimal:
         try:
             balance = self.client.fetch_balance()

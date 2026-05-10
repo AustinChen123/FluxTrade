@@ -196,6 +196,13 @@ class MockExchangeAdapter(IExchangeAdapter):
         self.open_orders = [o for o in self.open_orders if o.exchange_order_id != order_id]
         return len(self.open_orders) < initial_len
 
+    def cancel_order_by_client_id(self, client_order_id: str, product_id: str) -> bool:
+        initial_len = len(self.open_orders)
+        self.open_orders = [
+            o for o in self.open_orders if o.client_order_id != client_order_id
+        ]
+        return len(self.open_orders) < initial_len
+
     def get_balance(self, asset: str) -> Decimal:
         return self.balance.get(asset, Decimal("0"))
 

@@ -52,6 +52,16 @@ class IExchangeAdapter(ABC):
         """
         pass
 
+    def cancel_order_by_client_id(self, client_order_id: str, product_id: str) -> bool:
+        """Cancel an existing order using the exchange client order ID.
+
+        Adapters that do not have native client-order-id support can fall back
+        to treating the value as an exchange order ID. Execution code should
+        still keep the old exchange-id fallback while this capability is being
+        rolled out across adapters.
+        """
+        return self.cancel_order(client_order_id, product_id)
+
     @abstractmethod
     def get_balance(self, asset: str) -> Decimal:
         """

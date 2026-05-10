@@ -161,6 +161,40 @@ class TestCancelOrder:
         assert result is True
         mock_ccxt_client.cancel_order.assert_called_once_with("EX-123", "BTC/USDT:USDT")
 
+    def test_binance_cancel_by_client_order_id(self, adapter, mock_ccxt_client):
+        result = adapter.cancel_order_by_client_id(
+            "client-123",
+            "BINANCE:BTCUSDT-PERP",
+        )
+
+        assert result is True
+        mock_ccxt_client.cancel_order.assert_called_once_with(
+            "client-123",
+            "BTC/USDT:USDT",
+            params={"origClientOrderId": "client-123"},
+        )
+
+    def test_non_binance_cancel_by_client_order_id(self, mock_ccxt_client):
+        with patch("src.core.adapters.ccxt_adapter.ccxt") as mock_ccxt:
+            mock_exchange_cls = MagicMock(return_value=mock_ccxt_client)
+            mock_ccxt.bybit = mock_exchange_cls
+            setattr(mock_ccxt, "bybit", mock_exchange_cls)
+            adapter = CcxtExchangeAdapter(
+                exchange_id="bybit",
+                api_key="test-key",
+                secret="test-secret",
+            )
+        adapter.client = mock_ccxt_client
+
+        result = adapter.cancel_order_by_client_id("client-123", "BYBIT:BTCUSDT-PERP")
+
+        assert result is True
+        mock_ccxt_client.cancel_order.assert_called_once_with(
+            "client-123",
+            "BTC/USDT:USDT",
+            params={"clientOrderId": "client-123"},
+        )
+
     def test_cancel_order_not_found(self, adapter, mock_ccxt_client):
         import ccxt as ccxt_lib
         mock_ccxt_client.cancel_order.side_effect = ccxt_lib.OrderNotFound("not found")
