@@ -417,25 +417,8 @@ class StrategyEngine:
             self.execution_engine.process_market_data(data)
             self._signal_processor.on_candle(data)
             return
-
-        # Copy strategy list under lock to avoid race with stop_strategy
-        with self._strategy_lock:
-            strategies = list(self.strategies.get(data.product_id, []))
-        for strategy in strategies:
-            try:
-                if isinstance(data, Trade):
-                    signal = strategy.on_trade(data)
-                elif isinstance(data, Candlestick):
-                    if data.timeframe != strategy.requirements.timeframe:
-                        continue
-                    signal = strategy.on_candle(data)
-                else:
-                    signal = strategy.on_candle(data)
-                
-                if signal:
-                    self.process_signal(signal, data if isinstance(data, Candlestick) else None)
-            except Exception as e:
-                logger.error("Error in strategy %s: %s", strategy.strategy_id, e)
+        if isinstance(data, Trade):
+            self._signal_processor.on_trade(data)
 
     def process_signal(self, signal: Signal, candle: Optional[Candlestick]):
         """

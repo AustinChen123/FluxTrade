@@ -6,7 +6,7 @@ import logging
 from collections.abc import Callable
 from typing import Any, Optional
 
-from src.core.models import Candlestick, Signal, SignalType
+from src.core.models import Candlestick, Signal, SignalType, Trade
 from src.core.strategy_registry import StrategyRegistry
 from src.strategies.base import BaseStrategy
 
@@ -47,6 +47,27 @@ class SignalProcessor:
             try:
                 signals = self._dispatch_to_strategy(strategy, candle)
                 self._process_signals(strategy.strategy_id, signals, candle)
+            except Exception:
+                logger.exception("Error processing strategy %s", strategy.strategy_id)
+
+    def on_trade(self, trade: Trade) -> None:
+        """Route a trade to matching, running strategies."""
+        for strategy in self.registry.list_active():
+            if strategy.product_id != trade.product_id:
+                continue
+            if self.state_manager is not None and not self.state_manager.is_running(
+                strategy.strategy_id
+            ):
+                logger.debug(
+                    "Skipping strategy %s because it is not running",
+                    strategy.strategy_id,
+                )
+                continue
+
+            try:
+                signal = strategy.on_trade(trade)
+                if signal is not None:
+                    self._process_signals(strategy.strategy_id, [signal], None)
             except Exception:
                 logger.exception("Error processing strategy %s", strategy.strategy_id)
 

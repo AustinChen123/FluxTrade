@@ -5,7 +5,7 @@ from __future__ import annotations
 from decimal import Decimal
 from unittest.mock import MagicMock
 
-from src.core.models import Candlestick, Signal, SignalType
+from src.core.models import Candlestick, Signal, SignalType, Trade
 from src.core.signal_processor import SignalProcessor
 from src.core.strategy_registry import StrategyRegistry
 from src.strategies.base import BaseStrategy, StrategyRequirements
@@ -18,13 +18,16 @@ class DummyStrategy(BaseStrategy):
         product_id: str = "BINANCE:BTCUSDT-PERP",
         timeframe: str = "1m",
         result=None,
+        trade_result=None,
         should_raise: bool = False,
     ):
         super().__init__(strategy_id, product_id)
         self._timeframe = timeframe
         self.result = result
+        self.trade_result = trade_result
         self.should_raise = should_raise
         self.candles_received: list[Candlestick] = []
+        self.trades_received: list[Trade] = []
 
     @property
     def requirements(self) -> StrategyRequirements:
@@ -35,6 +38,12 @@ class DummyStrategy(BaseStrategy):
         if self.should_raise:
             raise RuntimeError("strategy failed")
         return self.result
+
+    def on_trade(self, trade: Trade):
+        self.trades_received.append(trade)
+        if self.should_raise:
+            raise RuntimeError("strategy failed")
+        return self.trade_result
 
 
 class DummyStateManager:
@@ -58,6 +67,19 @@ def make_candle(
         low=Decimal("41500"),
         close=Decimal("42200"),
         volume=Decimal("100"),
+    )
+
+
+def make_trade(
+    product_id: str = "BINANCE:BTCUSDT-PERP",
+) -> Trade:
+    return Trade(
+        id="t1",
+        product_id=product_id,
+        price=Decimal("42200"),
+        quantity=Decimal("0.1"),
+        side="buy",
+        timestamp=1704067200000,
     )
 
 
@@ -128,6 +150,54 @@ def test_on_candle_skips_stopped_strategy() -> None:
     SignalProcessor(registry, execution, state_manager).on_candle(make_candle())
 
     assert strategy.candles_received == []
+    execution.execute_signal.assert_not_called()
+
+
+def test_on_trade_routes_matching_strategy_without_timeframe_filter() -> None:
+    signal = make_signal()
+    strategy = DummyStrategy("s1", timeframe="15m", trade_result=signal)
+    registry = StrategyRegistry()
+    registry.register(strategy)
+    execution = MagicMock()
+    signal_handler = MagicMock()
+
+    SignalProcessor(
+        registry,
+        execution,
+        signal_handler=signal_handler,
+    ).on_trade(make_trade())
+
+    assert strategy.trades_received == [make_trade()]
+    signal_handler.assert_called_once_with(signal, None)
+    execution.execute_signal.assert_not_called()
+
+
+def test_on_trade_skips_product_mismatch() -> None:
+    strategy = DummyStrategy(
+        "s1",
+        product_id="BINANCE:ETHUSDT-PERP",
+        trade_result=make_signal(),
+    )
+    registry = StrategyRegistry()
+    registry.register(strategy)
+    execution = MagicMock()
+
+    SignalProcessor(registry, execution).on_trade(make_trade())
+
+    assert strategy.trades_received == []
+    execution.execute_signal.assert_not_called()
+
+
+def test_on_trade_skips_stopped_strategy() -> None:
+    strategy = DummyStrategy("s1", trade_result=make_signal())
+    registry = StrategyRegistry()
+    registry.register(strategy)
+    execution = MagicMock()
+    state_manager = DummyStateManager(running=set())
+
+    SignalProcessor(registry, execution, state_manager).on_trade(make_trade())
+
+    assert strategy.trades_received == []
     execution.execute_signal.assert_not_called()
 
 
