@@ -29,6 +29,10 @@ class IOrderRepository(ABC):
         pass
 
     @abstractmethod
+    def get_order_by_client_order_id(self, client_order_id: str) -> Optional[Order]:
+        pass
+
+    @abstractmethod
     def update_order_exchange_id(self, order: Order, exchange_order_id: str) -> None:
         pass
 

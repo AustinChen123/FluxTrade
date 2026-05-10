@@ -30,6 +30,10 @@ class LiveOrderRepository(IOrderRepository):
         with self._db_session_factory() as db:
             return db.query(Order).filter_by(id=order_id).first()
 
+    def get_order_by_client_order_id(self, client_order_id: str) -> Optional[Order]:
+        with self._db_session_factory() as db:
+            return db.query(Order).filter_by(client_order_id=client_order_id).first()
+
     def add_trade(self, trade: Trade) -> None:
         with self._db_session_factory() as db:
             db.add(trade)
@@ -118,6 +122,9 @@ class BacktestOrderRepository(IOrderRepository):
         pass
 
     def get_order(self, order_id: str) -> Optional[Order]:
+        return None
+
+    def get_order_by_client_order_id(self, client_order_id: str) -> Optional[Order]:
         return None
 
     def add_trade(self, trade: Trade) -> None:

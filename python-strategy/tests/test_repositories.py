@@ -93,6 +93,12 @@ class TestBacktestOrderRepositoryBasics:
 
         assert repo.get_order("order-1") is None
 
+    def test_get_order_by_client_order_id_returns_none(self, mock_db_session):
+        """Backtest repo does not persist client order IDs locally."""
+        repo = BacktestOrderRepository(mock_db_session, session_id=1)
+
+        assert repo.get_order_by_client_order_id("client-1") is None
+
 
 class TestBacktestPositionDelegation:
     """Position/balance operations are delegated to Rust engine."""
@@ -232,6 +238,20 @@ class TestLiveOrderRepositoryBasics:
         assert result is order
         mock_db_session.query.assert_called_with(Order)
         mock_db_session.query.return_value.filter_by.assert_called_with(id="order-1")
+
+    def test_get_order_by_client_order_id_queries_by_id(self, mock_db_session, order_factory):
+        """get_order_by_client_order_id should query the idempotency key."""
+        repo = LiveOrderRepository(mock_db_session)
+        order = order_factory(order_id="order-1", client_order_id="client-1")
+        mock_db_session.query.return_value.filter_by.return_value.first.return_value = order
+
+        result = repo.get_order_by_client_order_id("client-1")
+
+        assert result is order
+        mock_db_session.query.assert_called_with(Order)
+        mock_db_session.query.return_value.filter_by.assert_called_with(
+            client_order_id="client-1"
+        )
 
     def test_add_trade_commits(self, mock_db_session):
         """add_trade should add to session and commit."""

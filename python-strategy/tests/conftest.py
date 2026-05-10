@@ -104,6 +104,16 @@ class MockOrderRepository(IOrderRepository):
     def get_order(self, order_id: str) -> Optional[Order]:
         return self.orders.get(order_id)
 
+    def get_order_by_client_order_id(self, client_order_id: str) -> Optional[Order]:
+        return next(
+            (
+                order
+                for order in self.orders.values()
+                if order.client_order_id == client_order_id
+            ),
+            None,
+        )
+
     def add_trade(self, trade: ORMTrade) -> None:
         self.trades.append(trade)
 
@@ -585,6 +595,7 @@ def order_factory():
         filled_quantity: Decimal = Decimal("0"),
         filled_price: Decimal = Decimal("0"),
         trigger_price: Optional[Decimal] = None,
+        client_order_id: Optional[str] = None,
     ) -> Order:
         return Order(
             id=order_id or str(uuid.uuid4()),
@@ -600,7 +611,8 @@ def order_factory():
             status=status,
             timestamp=timestamp,
             filled_quantity=filled_quantity,
-            filled_price=filled_price
+            filled_price=filled_price,
+            client_order_id=client_order_id,
         )
     return _create
 
