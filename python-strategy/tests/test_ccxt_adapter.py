@@ -101,6 +101,34 @@ class TestPlaceOrder:
         assert call_kwargs.kwargs["params"]["timeInForce"] == "GTC"
         assert call_kwargs.kwargs["price"] == "50000"
 
+    def test_binance_order_passes_client_order_id(self, adapter, mock_ccxt_client):
+        mock_ccxt_client.create_order.return_value = {"id": "EX-789"}
+        order = _make_order(client_order_id="client-123")
+
+        adapter.place_order(order)
+
+        call_kwargs = mock_ccxt_client.create_order.call_args
+        assert call_kwargs.kwargs["params"]["newClientOrderId"] == "client-123"
+
+    def test_non_binance_order_passes_client_order_id(self, mock_ccxt_client):
+        with patch("src.core.adapters.ccxt_adapter.ccxt") as mock_ccxt:
+            mock_exchange_cls = MagicMock(return_value=mock_ccxt_client)
+            mock_ccxt.bybit = mock_exchange_cls
+            setattr(mock_ccxt, "bybit", mock_exchange_cls)
+            adapter = CcxtExchangeAdapter(
+                exchange_id="bybit",
+                api_key="test-key",
+                secret="test-secret",
+            )
+        adapter.client = mock_ccxt_client
+        mock_ccxt_client.create_order.return_value = {"id": "EX-789"}
+        order = _make_order(product_id="BYBIT:BTCUSDT-PERP", client_order_id="client-123")
+
+        adapter.place_order(order)
+
+        call_kwargs = mock_ccxt_client.create_order.call_args
+        assert call_kwargs.kwargs["params"]["clientOrderId"] == "client-123"
+
     def test_insufficient_funds_raises(self, adapter, mock_ccxt_client):
         import ccxt as ccxt_lib
         mock_ccxt_client.create_order.side_effect = ccxt_lib.InsufficientFunds("no money")

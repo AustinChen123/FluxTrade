@@ -75,6 +75,12 @@ class CcxtExchangeAdapter(IExchangeAdapter):
         params: dict = {}
         if order.type and order.type.lower() == "limit":
             params["timeInForce"] = "GTC"
+        client_order_id = getattr(order, "client_order_id", None)
+        if client_order_id:
+            if self.exchange_id == "binance":
+                params["newClientOrderId"] = client_order_id
+            else:
+                params["clientOrderId"] = client_order_id
 
         try:
             self.logger.info(
