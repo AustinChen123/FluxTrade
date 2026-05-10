@@ -16,10 +16,31 @@ test_adapters_simulated.py for coverage of those behaviours.
 
 from contextlib import nullcontext
 from decimal import Decimal
+import inspect
 from unittest.mock import MagicMock
 
+from src.core.interfaces.repository import IOrderRepository
 from src.core.repositories import BacktestOrderRepository, LiveOrderRepository
 from src.core.orm_models import Trade
+
+
+class TestOrderRepositoryInterface:
+    """Contract checks for order repository session lifecycle."""
+
+    def test_interface_documents_session_factory_constructor(self):
+        params = inspect.signature(IOrderRepository.__init__).parameters
+
+        assert "db_session_factory" in params
+
+    def test_live_repository_accepts_session_factory_parameter(self):
+        params = inspect.signature(LiveOrderRepository.__init__).parameters
+
+        assert "db_session_factory" in params
+
+    def test_backtest_repository_accepts_session_factory_parameter(self):
+        params = inspect.signature(BacktestOrderRepository.__init__).parameters
+
+        assert "db_session_factory" in params
 
 
 class TestBacktestOrderRepositoryBasics:
