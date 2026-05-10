@@ -17,7 +17,7 @@ from decimal import Decimal
 
 from src.core.execution import ExecutionEngine
 from src.core.interfaces.exchange import ExchangeError
-from src.core.models import SignalType
+from src.core.models import OrderStatus, SignalType
 from src.core.client_order_id import parse_client_order_id
 
 
@@ -224,6 +224,8 @@ class TestAuditedExecution:
         assert coid.action == "long"
         assert order.intent_payload["order"]["quantity"] == "0.25"
         assert order.intent_payload["order"]["price"] == "42000"
+        assert order.status == OrderStatus.SUBMITTED.value
+        assert order.exchange_order_id.startswith("MOCK-")
         audit = audit_session.add.call_args_list[0].args[0]
         assert audit.client_order_id == order.client_order_id
         assert audit.intent_payload["order"]["client_order_id"] == order.client_order_id

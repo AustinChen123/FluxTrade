@@ -206,11 +206,12 @@ class ExecutionEngine:
             write_signal_audit_intent(db, audit)
 
         try:
+            self.order_manager.mark_submitted_unconfirmed(order)
             self.logger.info("Sending Order %s via Adapter...", order.id)
             t0 = _time.monotonic()
             exchange_id = self.adapter.place_order(order)
             EXECUTION_LATENCY.observe(_time.monotonic() - t0)
-            self.order_manager.update_exchange_order_id(order, exchange_id)
+            self.order_manager.mark_submitted(order, exchange_id)
             self.logger.info("Order Placed. Internal: %s, Exchange: %s", order.id, exchange_id)
             ORDERS_TOTAL.labels(order_type=order_type, status="placed").inc()
         except ExchangeError as e:
