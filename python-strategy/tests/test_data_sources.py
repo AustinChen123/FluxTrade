@@ -198,17 +198,43 @@ class TestCsvDataSourceStandard:
         result = list(ds.get_candles(PRODUCT, TF, start, end))
         assert len(result) == 4
 
+    def test_get_candles_filters_product_and_timeframe(self, csv_file):
+        ds = CsvDataSource(csv_file, product_id=PRODUCT, timeframe=TF)
+
+        wrong_product = list(ds.get_candles("BINANCE:ETHUSDT-PERP", TF, 0, 9999999999999))
+        wrong_timeframe = list(ds.get_candles(PRODUCT, "5m", 0, 9999999999999))
+
+        assert wrong_product == []
+        assert wrong_timeframe == []
+
     def test_get_candles_df(self, csv_file):
         ds = CsvDataSource(csv_file, product_id=PRODUCT, timeframe=TF)
         df = ds.get_candles_df(PRODUCT, TF, 0, 9999999999999)
         assert len(df) == 10
         assert df.index.name == "timestamp"
 
+    def test_get_candles_df_filters_product_and_timeframe(self, csv_file):
+        ds = CsvDataSource(csv_file, product_id=PRODUCT, timeframe=TF)
+
+        wrong_product = ds.get_candles_df("BINANCE:ETHUSDT-PERP", TF, 0, 9999999999999)
+        wrong_timeframe = ds.get_candles_df(PRODUCT, "5m", 0, 9999999999999)
+
+        assert wrong_product.empty
+        assert wrong_product.index.name == "timestamp"
+        assert wrong_timeframe.empty
+        assert wrong_timeframe.index.name == "timestamp"
+
     def test_available_range(self, csv_file):
         ds = CsvDataSource(csv_file, product_id=PRODUCT, timeframe=TF)
         rng = ds.get_available_range(PRODUCT, TF)
         base_ts = 1704067200000
         assert rng == (base_ts, base_ts + 9 * 60000)
+
+    def test_available_range_filters_product_and_timeframe(self, csv_file):
+        ds = CsvDataSource(csv_file, product_id=PRODUCT, timeframe=TF)
+
+        assert ds.get_available_range("BINANCE:ETHUSDT-PERP", TF) is None
+        assert ds.get_available_range(PRODUCT, "5m") is None
 
     def test_validate_valid_file(self, csv_file):
         ds = CsvDataSource(csv_file)
@@ -296,7 +322,7 @@ class TestCsvDataSourceMissingColumns:
     def test_missing_volume_raises_on_load(self, tmp_path):
         path = tmp_path / "bad.csv"
         path.write_text("timestamp,open,high,low,close\n1704067200000,42000,42100,41900,42050\n")
-        ds = CsvDataSource(str(path))
+        ds = CsvDataSource(str(path), product_id=PRODUCT, timeframe=TF)
         with pytest.raises(ValueError, match="missing required columns"):
             list(ds.get_candles(PRODUCT, TF, 0, 9999999999999))
 
@@ -315,7 +341,7 @@ class TestCsvDataSourceLazyLoad:
         lines.append("1704067200000,42000,42100,41900,42050,500")
         path.write_text("\n".join(lines))
 
-        ds = CsvDataSource(str(path))
+        ds = CsvDataSource(str(path), product_id=PRODUCT, timeframe=TF)
         assert ds._df is None  # Not loaded yet
         list(ds.get_candles(PRODUCT, TF, 0, 9999999999999))
         assert ds._df is not None  # Now loaded

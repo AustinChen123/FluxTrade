@@ -8,6 +8,7 @@ from decimal import Decimal
 from unittest.mock import patch, MagicMock
 
 from src.core.data_sources.memory import MemoryDataSource
+from src.core.data_sources.csv_source import CsvDataSource
 from src.core.backtest_runner import BacktestRunner
 from src.core.models import Signal, SignalType, Candlestick
 from src.strategies.callable_strategy import CallableStrategy
@@ -78,12 +79,12 @@ def _predict_with_sl_tp(candle: Candlestick):
     return None
 
 
-def _run_backtest(strategy, candle_data, mock_session_local):
+def _run_backtest(strategy, candle_data, mock_session_local, data_source=None):
     mock_session = MagicMock()
     mock_session.query.return_value.filter_by.return_value.all.return_value = []
     mock_session_local.return_value = mock_session
 
-    ds = MemoryDataSource(candle_data)
+    ds = data_source or MemoryDataSource(candle_data)
     runner = BacktestRunner(
         start_time=candle_data[0].timestamp,
         end_time=candle_data[-1].timestamp,
@@ -121,6 +122,16 @@ def _assert_journal_invariants(result):
             assert Decimal(str(quantity)) > 0
 
 
+def _write_candle_csv(path, candle_data):
+    lines = ["timestamp,open,high,low,close,volume"]
+    for candle in candle_data:
+        lines.append(
+            f"{candle.timestamp},{candle.open},{candle.high},"
+            f"{candle.low},{candle.close},{candle.volume}"
+        )
+    path.write_text("\n".join(lines) + "\n")
+
+
 @pytest.fixture
 def candle_data():
     return make_candle_series(count=200)
@@ -155,6 +166,25 @@ class TestCallableStrategyIntegration:
         _assert_journal_invariants(first)
         _assert_journal_invariants(second)
         assert _stable_backtest_snapshot(first) == _stable_backtest_snapshot(second)
+
+    @patch("src.core.backtest_runner.SessionLocal")
+    def test_callable_backtest_smoke_accepts_candle_csv_source(
+        self, mock_sl, candle_data, tmp_path
+    ):
+        """A tiny OHLCV CSV fixture should drive the same backtest pipeline."""
+        csv_path = tmp_path / "candles.csv"
+        _write_candle_csv(csv_path, candle_data)
+        csv_source = CsvDataSource(str(csv_path), product_id=PRODUCT_ID, timeframe=TIMEFRAME)
+
+        result = _run_backtest(
+            CallableStrategy("callable_csv_smoke", _simple_predict, PRODUCT_ID, TIMEFRAME),
+            candle_data,
+            mock_sl,
+            data_source=csv_source,
+        )
+
+        _assert_journal_invariants(result)
+        assert isinstance(result["total_pnl"], Decimal)
 
     @patch("src.core.backtest_runner.SessionLocal")
     def test_callable_with_sl_tp(self, mock_sl, candle_data):

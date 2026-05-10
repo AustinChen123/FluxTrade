@@ -96,6 +96,9 @@ class CsvDataSource(IDataSource):
     def get_candles(
         self, product_id: str, timeframe: str, start: int, end: int
     ) -> Generator[Candlestick, None, None]:
+        if product_id != self._product_id or timeframe != self._timeframe:
+            return
+
         df = self._load()
         mask = (df["timestamp"] >= start) & (df["timestamp"] <= end)
 
@@ -114,6 +117,12 @@ class CsvDataSource(IDataSource):
     def get_candles_df(
         self, product_id: str, timeframe: str, start: int, end: int
     ) -> pd.DataFrame:
+        if product_id != self._product_id or timeframe != self._timeframe:
+            return pd.DataFrame(
+                columns=["open", "high", "low", "close", "volume"],
+                index=pd.Index([], name="timestamp"),
+            )
+
         df = self._load()
         mask = (df["timestamp"] >= start) & (df["timestamp"] <= end)
         result = df.loc[mask, ["timestamp", "open", "high", "low", "close", "volume"]].copy()
@@ -128,6 +137,9 @@ class CsvDataSource(IDataSource):
     def get_available_range(
         self, product_id: str, timeframe: str
     ) -> Optional[tuple[int, int]]:
+        if product_id != self._product_id or timeframe != self._timeframe:
+            return None
+
         df = self._load()
         if df.empty:
             return None
