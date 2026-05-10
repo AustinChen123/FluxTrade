@@ -2,6 +2,7 @@ import logging
 import os
 import signal
 import sys
+from contextlib import contextmanager
 
 import structlog
 
@@ -74,6 +75,22 @@ _setup_logging()
 logger = logging.getLogger(__name__)
 
 
+def _env_flag(name: str, default: bool = False) -> bool:
+    value = os.getenv(name)
+    if value is None:
+        return default
+    return value.lower() in {"1", "true", "yes", "on"}
+
+
+@contextmanager
+def _session_scope():
+    session = SessionLocal()
+    try:
+        yield session
+    finally:
+        session.close()
+
+
 def main():
     logger.info("Starting FluxTrade Strategy Service...")
 
@@ -87,7 +104,12 @@ def main():
 
     # 2. Initialize Engine
     clock = RealtimeClock()
-    engine = StrategyEngine(db_session=db_session, clock=clock)
+    engine = StrategyEngine(
+        db_session=db_session,
+        clock=clock,
+        db_session_factory=_session_scope,
+        audit_external_orders=_env_flag("AUDIT_EXTERNAL_ORDERS"),
+    )
 
     # Run Startup Checks (System State & Heartbeat)
     engine.startup()
