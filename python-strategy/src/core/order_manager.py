@@ -5,7 +5,7 @@ import redis
 from decimal import Decimal
 from typing import Optional
 from src.core.orm_models import Order, Trade
-from src.core.models import Signal, OrderSide
+from src.core.models import Signal, OrderSide, OrderStatus
 from src.core.clock import Clock
 from src.core.interfaces import IOrderRepository
 from src.core.jsonb_helpers import serialize_payload_with_decimals
@@ -89,6 +89,22 @@ class OrderManager:
 
     def update_exchange_order_id(self, order: Order, exchange_order_id: str):
         self.repo.update_order_exchange_id(order, exchange_order_id)
+
+    def mark_submitted_unconfirmed(self, order: Order) -> None:
+        """Mark order as sent to exchange with ACK pending."""
+        self._set_order_status(order, OrderStatus.SUBMITTED_UNCONFIRMED)
+
+    def mark_submitted(self, order: Order, exchange_order_id: Optional[str] = None) -> None:
+        """Mark order as exchange-acknowledged."""
+        order.status = OrderStatus.SUBMITTED.value
+        if exchange_order_id is not None:
+            self.repo.update_order_exchange_id(order, exchange_order_id)
+        else:
+            self.repo.update_order(order)
+
+    def _set_order_status(self, order: Order, status: OrderStatus) -> None:
+        order.status = status.value
+        self.repo.update_order(order)
 
     def fail_order(self, order: Order, reason: str):
         """Marks an order as FAILED due to execution errors."""

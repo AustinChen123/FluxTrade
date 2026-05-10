@@ -14,7 +14,7 @@ from decimal import Decimal
 from unittest.mock import patch, MagicMock
 
 from src.core.order_manager import OrderManager
-from src.core.models import OrderSide, SignalType
+from src.core.models import OrderSide, OrderStatus, SignalType
 
 
 class TestOrderCreation:
@@ -197,6 +197,32 @@ class TestOrderStatusUpdates:
         order_manager.fail_order(order, "Insufficient funds")
 
         assert order.status == "failed"
+
+    def test_mark_submitted_unconfirmed_updates_status(
+        self, mock_order_repo, mock_clock, signal_factory
+    ):
+        """Sent orders should enter ACK-pending state."""
+        order_manager = OrderManager(mock_order_repo, mock_clock)
+        signal = signal_factory()
+        order = order_manager.create_order(signal, OrderSide.BUY, "market", Decimal("0.1"))
+
+        order_manager.mark_submitted_unconfirmed(order)
+
+        assert order.status == OrderStatus.SUBMITTED_UNCONFIRMED.value
+        assert mock_order_repo.orders[order.id].status == OrderStatus.SUBMITTED_UNCONFIRMED.value
+
+    def test_mark_submitted_updates_status_and_exchange_id(
+        self, mock_order_repo, mock_clock, signal_factory
+    ):
+        """ACKed orders should store exchange order id."""
+        order_manager = OrderManager(mock_order_repo, mock_clock)
+        signal = signal_factory()
+        order = order_manager.create_order(signal, OrderSide.BUY, "market", Decimal("0.1"))
+
+        order_manager.mark_submitted(order, "EX-123")
+
+        assert order.status == OrderStatus.SUBMITTED.value
+        assert order.exchange_order_id == "EX-123"
 
 
 class TestExchangeOrderId:
