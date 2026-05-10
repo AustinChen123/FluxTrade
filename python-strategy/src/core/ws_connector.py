@@ -1,3 +1,5 @@
+import asyncio
+from dataclasses import dataclass
 import json
 import time
 import threading
@@ -9,7 +11,6 @@ from urllib.parse import urlencode
 
 # Try to import websockets, handle if missing
 try:
-    import asyncio
     import websockets
     HAS_WEBSOCKETS = True
 except ImportError:
@@ -18,6 +19,16 @@ except ImportError:
 INITIAL_BACKOFF = 1.0
 MAX_BACKOFF = 300.0
 MAX_RETRIES = 10
+
+
+class OrderAckTimeout(TimeoutError):
+    """Raised when an exchange order ACK does not arrive before timeout."""
+
+
+@dataclass(frozen=True)
+class ExchangeAck:
+    exchange_order_id: str
+    ack_type: str
 
 
 def _sign_payload_binance(payload: str | Dict[str, Any], secret: str) -> str:
@@ -47,6 +58,8 @@ class WebSocketOrderConnector:
         self.running = False
         self.thread = None
         self.logger = logging.getLogger("WS_Connector")
+        self._ack_registry: dict[str, ExchangeAck] = {}
+        self._ack_lock = threading.Lock()
 
     def _get_ws_url(self) -> str:
         if self.exchange_id == "binance":
@@ -118,7 +131,52 @@ class WebSocketOrderConnector:
 
     def _handle_message(self, msg: str):
         # Process order updates
-        pass
+        try:
+            data = json.loads(msg)
+        except json.JSONDecodeError:
+            self.logger.warning("Ignoring non-JSON WS message: %s", msg)
+            return
+
+        coid = (
+            data.get("clientOrderId")
+            or data.get("client_order_id")
+            or data.get("c")
+            or data.get("params", {}).get("clientOrderId")
+        )
+        exchange_order_id = (
+            data.get("orderId")
+            or data.get("exchange_order_id")
+            or data.get("i")
+            or data.get("params", {}).get("orderId")
+        )
+        ack_type = (
+            data.get("ack_type")
+            or data.get("status")
+            or data.get("X")
+            or data.get("params", {}).get("status")
+            or "ACK"
+        )
+        if coid and exchange_order_id:
+            self._record_ack(str(coid), ExchangeAck(str(exchange_order_id), str(ack_type)))
+
+    def _record_ack(self, client_order_id: str, ack: ExchangeAck) -> None:
+        with self._ack_lock:
+            self._ack_registry[client_order_id] = ack
+
+    async def _wait_for_ack(self, client_order_id: str, timeout: float = 3.0) -> ExchangeAck:
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + timeout
+        delay = 0.01
+        while True:
+            with self._ack_lock:
+                ack = self._ack_registry.pop(client_order_id, None)
+            if ack is not None:
+                return ack
+            remaining = deadline - loop.time()
+            if remaining <= 0:
+                raise OrderAckTimeout(f"timed out waiting for order ack: {client_order_id}")
+            await asyncio.sleep(min(delay, remaining))
+            delay = min(delay * 2, 0.25)
 
     def place_order(self, symbol: str, side: str, quantity: float, price: Optional[float] = None, order_type: str = "MARKET") -> bool:
         """

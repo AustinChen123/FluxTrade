@@ -1,4 +1,13 @@
-from src.core.ws_connector import _sign_payload_binance
+import asyncio
+
+import pytest
+
+from src.core.ws_connector import (
+    ExchangeAck,
+    OrderAckTimeout,
+    WebSocketOrderConnector,
+    _sign_payload_binance,
+)
 
 
 def test_sign_payload_binance_matches_known_hmac_sha256_vector() -> None:
@@ -37,3 +46,30 @@ def test_sign_payload_binance_changes_when_payload_changes() -> None:
         "timestamp=2",
         secret,
     )
+
+
+def test_wait_for_ack_returns_and_cleans_registry() -> None:
+    connector = WebSocketOrderConnector("key", "secret")
+    connector._record_ack("coid-1", ExchangeAck("ex-1", "ACK"))
+
+    ack = asyncio.run(connector._wait_for_ack("coid-1", timeout=0.1))
+
+    assert ack == ExchangeAck("ex-1", "ACK")
+    assert "coid-1" not in connector._ack_registry
+
+
+def test_wait_for_ack_times_out() -> None:
+    connector = WebSocketOrderConnector("key", "secret")
+
+    with pytest.raises(OrderAckTimeout, match="coid-missing"):
+        asyncio.run(connector._wait_for_ack("coid-missing", timeout=0.01))
+
+
+def test_handle_message_records_ack() -> None:
+    connector = WebSocketOrderConnector("key", "secret")
+
+    connector._handle_message(
+        '{"clientOrderId":"coid-1","orderId":"ex-1","status":"SUBMITTED"}'
+    )
+
+    assert connector._ack_registry["coid-1"] == ExchangeAck("ex-1", "SUBMITTED")
