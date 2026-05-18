@@ -10,6 +10,7 @@ Covers:
 - AccountService with Redis mock
 """
 
+from datetime import date
 from decimal import Decimal
 from unittest.mock import MagicMock, patch
 
@@ -28,6 +29,16 @@ class _FakeOrderRateLimitRule:
     def try_record_order(self, strategy_id):
         self.calls.append(strategy_id)
         return self.status, self.reason
+
+
+class _FakeDailyNavService:
+    def __init__(self, nav):
+        self.nav = nav
+        self.calls = []
+
+    def get_start_nav(self, strategy_id, snapshot_date):
+        self.calls.append((strategy_id, snapshot_date))
+        return self.nav
 
 
 class TestRiskManagerBalanceChecks:
@@ -233,6 +244,48 @@ class TestRiskManagerExposureChecks:
 
         assert is_allowed is False
         assert reason == "REJECT: daily_loss_missing_nav_context"
+
+    def test_daily_loss_uses_snapshot_service_for_start_nav(
+        self, mock_account_service, signal_factory
+    ):
+        """RiskManager should fetch start NAV when current NAV is supplied alone."""
+        mock_account_service.set_balance(Decimal("100000"))
+        daily_nav_service = _FakeDailyNavService(Decimal("100000"))
+        risk_manager = RiskManager(
+            mock_account_service,
+            daily_nav_service=daily_nav_service,
+        )
+        signal = signal_factory(signal_type=SignalType.LONG)
+
+        is_allowed, reason = risk_manager.check_risk(
+            signal,
+            current_nav=Decimal("94990"),
+            snapshot_date=date(2026, 5, 18),
+        )
+
+        assert is_allowed is False
+        assert "daily_loss_circuit_breaker_triggered" in reason
+        assert daily_nav_service.calls == [("test_strategy", date(2026, 5, 18))]
+
+    def test_daily_loss_rejects_when_snapshot_missing(
+        self, mock_account_service, signal_factory
+    ):
+        """Missing daily snapshot should fail closed."""
+        mock_account_service.set_balance(Decimal("100000"))
+        risk_manager = RiskManager(
+            mock_account_service,
+            daily_nav_service=_FakeDailyNavService(None),
+        )
+        signal = signal_factory(signal_type=SignalType.LONG)
+
+        is_allowed, reason = risk_manager.check_risk(
+            signal,
+            current_nav=Decimal("94990"),
+            snapshot_date=date(2026, 5, 18),
+        )
+
+        assert is_allowed is False
+        assert reason == "REJECT: daily_loss_missing_start_nav_snapshot"
 
     def test_order_rate_limit_rejects_after_prior_checks_pass(
         self, mock_account_service, signal_factory

@@ -1,4 +1,5 @@
 import logging
+from datetime import date
 from decimal import Decimal
 from typing import TYPE_CHECKING, Optional, Any
 from src.core.models import Signal, SignalType, Position, PositionSide
@@ -91,6 +92,7 @@ class RiskManager:
         redis_client=None,
         max_position_rule: Optional[MaxPositionNotionalRule] = None,
         state_manager: Optional[Any] = None,
+        daily_nav_service: Optional[Any] = None,
     ):
         self.account_service = account_service
         self.risk_config = risk_config or RiskConfig.from_env()
@@ -107,6 +109,7 @@ class RiskManager:
         self.max_position_rule = max_position_rule or MaxPositionNotionalRule(self.risk_config)
         self.capital_allocator = capital_allocator
         self.state_manager = state_manager
+        self.daily_nav_service = daily_nav_service
         self.max_exposure_per_strategy = (
             max_exposure_per_strategy or self.risk_config.max_position_notional
         )
@@ -120,6 +123,7 @@ class RiskManager:
         best_ask: Optional[Decimal] = None,
         daily_start_nav: Optional[Decimal] = None,
         current_nav: Optional[Decimal] = None,
+        snapshot_date: Optional[date] = None,
     ) -> tuple[bool, str]:
         """
         Evaluates the signal against risk rules.
@@ -162,6 +166,15 @@ class RiskManager:
 
         # Rule 3: Daily loss circuit breaker when NAV context is available.
         if is_entry and (daily_start_nav is not None or current_nav is not None):
+            if daily_start_nav is None and current_nav is not None and self.daily_nav_service is not None:
+                daily_start_nav = self.daily_nav_service.get_start_nav(
+                    signal.strategy_id,
+                    snapshot_date or date.today(),
+                )
+                if daily_start_nav is None:
+                    msg = "REJECT: daily_loss_missing_start_nav_snapshot"
+                    logger.warning("RISK_REJECTED: %s", msg)
+                    return False, msg
             if daily_start_nav is None or current_nav is None:
                 msg = "REJECT: daily_loss_missing_nav_context"
                 logger.warning("RISK_REJECTED: %s", msg)
