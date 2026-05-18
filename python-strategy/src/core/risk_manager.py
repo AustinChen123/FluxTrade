@@ -6,6 +6,7 @@ from src.core.redis_factory import create_redis_client
 from src.core.risk_config import RiskConfig
 from src.core.risk_rules import RuleStatus
 from src.core.risk_rules.max_position_notional import MaxPositionNotionalRule
+from src.core.risk_rules.order_rate_limit import OrderRateLimitRule
 from src.core.risk_rules.price_sanity_check import PriceSanityCheckRule
 from src.core.risk_rules.single_order_notional import SingleOrderNotionalRule
 
@@ -84,12 +85,21 @@ class RiskManager:
         risk_config: Optional[RiskConfig] = None,
         single_order_rule: Optional[SingleOrderNotionalRule] = None,
         price_sanity_rule: Optional[PriceSanityCheckRule] = None,
+        order_rate_limit_rule: Optional[OrderRateLimitRule] = None,
+        redis_client=None,
         max_position_rule: Optional[MaxPositionNotionalRule] = None,
     ):
         self.account_service = account_service
         self.risk_config = risk_config or RiskConfig.from_env()
         self.single_order_rule = single_order_rule or SingleOrderNotionalRule(self.risk_config)
         self.price_sanity_rule = price_sanity_rule or PriceSanityCheckRule(self.risk_config)
+        rate_limit_redis = redis_client or getattr(account_service, "redis", None)
+        self.order_rate_limit_rule = order_rate_limit_rule
+        if self.order_rate_limit_rule is None and rate_limit_redis is not None:
+            self.order_rate_limit_rule = OrderRateLimitRule(
+                self.risk_config,
+                rate_limit_redis,
+            )
         self.max_position_rule = max_position_rule or MaxPositionNotionalRule(self.risk_config)
         self.capital_allocator = capital_allocator
         self.max_exposure_per_strategy = (
@@ -191,6 +201,16 @@ class RiskManager:
                     )
                     logger.warning("RISK_REJECTED: %s", msg)
                     return False, msg
+
+        # Rule 5: Order rate limit. This records only after prior checks pass.
+        if is_entry and self.order_rate_limit_rule is not None:
+            rule_status, rule_reason = self.order_rate_limit_rule.try_record_order(
+                signal.strategy_id,
+            )
+            if rule_status == RuleStatus.REJECT:
+                msg = f"REJECT: {rule_reason}"
+                logger.warning("RISK_REJECTED: %s", msg)
+                return False, msg
 
         return True, "PASS"
 

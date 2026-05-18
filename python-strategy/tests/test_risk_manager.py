@@ -15,7 +15,19 @@ from unittest.mock import MagicMock, patch
 
 from src.core.models import SignalType
 from src.core.risk_config import RiskConfig
+from src.core.risk_rules import RuleStatus
 from src.core.risk_manager import RiskManager, AccountService
+
+
+class _FakeOrderRateLimitRule:
+    def __init__(self, status=RuleStatus.PASS, reason=None):
+        self.status = status
+        self.reason = reason
+        self.calls = []
+
+    def try_record_order(self, strategy_id):
+        self.calls.append(strategy_id)
+        return self.status, self.reason
 
 
 class TestRiskManagerBalanceChecks:
@@ -141,6 +153,49 @@ class TestRiskManagerExposureChecks:
 
         assert is_allowed is True
         assert reason == "PASS"
+
+    def test_order_rate_limit_rejects_after_prior_checks_pass(
+        self, mock_account_service, signal_factory
+    ):
+        """Rate limit should reject and record attempts only after earlier checks pass."""
+        mock_account_service.set_balance(Decimal("100000"))
+        rate_limit = _FakeOrderRateLimitRule(
+            RuleStatus.REJECT,
+            "order_rate_limit_exceeded: 11 > 10",
+        )
+        risk_manager = RiskManager(
+            mock_account_service,
+            order_rate_limit_rule=rate_limit,
+        )
+        signal = signal_factory(signal_type=SignalType.LONG)
+
+        is_allowed, reason = risk_manager.check_risk(signal)
+
+        assert is_allowed is False
+        assert "order_rate_limit_exceeded" in reason
+        assert rate_limit.calls == ["test_strategy"]
+
+    def test_order_rate_limit_not_recorded_when_prior_check_rejects(
+        self, mock_account_service, signal_factory
+    ):
+        """Failed earlier checks should not consume rate-limit slots."""
+        mock_account_service.set_balance(Decimal("100000"))
+        rate_limit = _FakeOrderRateLimitRule()
+        risk_manager = RiskManager(
+            mock_account_service,
+            order_rate_limit_rule=rate_limit,
+        )
+        signal = signal_factory(
+            signal_type=SignalType.LONG,
+            price=Decimal("60000"),
+            quantity=Decimal("0.1"),
+        )
+
+        is_allowed, reason = risk_manager.check_risk(signal)
+
+        assert is_allowed is False
+        assert "single_order_notional_exceeded" in reason
+        assert rate_limit.calls == []
 
     def test_reject_entry_when_max_exposure_reached(
         self, mock_account_service, signal_factory, position_factory
