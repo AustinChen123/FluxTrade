@@ -582,20 +582,63 @@ class TestHandleCommand:
         engine.scan_strategies.assert_called_once()
 
     def test_start_command(self, engine):
-        """START command should call start_strategy with id."""
-        engine.start_strategy = MagicMock()
+        """START command should activate the strategy through lifecycle orchestration."""
+        engine.activate_strategy = MagicMock()
 
         engine._handle_command({"command": "START", "params": {"id": "strat_1"}})
 
-        engine.start_strategy.assert_called_once_with("strat_1")
+        engine.activate_strategy.assert_called_once_with("strat_1")
 
     def test_stop_command(self, engine):
-        """STOP command should call stop_strategy with id."""
-        engine.stop_strategy = MagicMock()
+        """STOP command should deactivate the strategy through lifecycle orchestration."""
+        engine.deactivate_strategy = MagicMock()
 
-        engine._handle_command({"command": "STOP", "params": {"id": "strat_1"}})
+        engine._handle_command({
+            "command": "STOP",
+            "params": {"id": "strat_1", "reason": "maintenance"},
+        })
 
-        engine.stop_strategy.assert_called_once_with("strat_1")
+        engine.deactivate_strategy.assert_called_once_with(
+            "strat_1",
+            actor="operator",
+            reason="maintenance",
+        )
+
+    def test_resume_command_forces_activation(self, engine):
+        """RESUME command should pass force and reason to lifecycle orchestration."""
+        engine.activate_strategy = MagicMock()
+
+        engine._handle_command({
+            "cmd": "RESUME",
+            "strategy_id": "strat_1",
+            "reason": "operator confirmed",
+        })
+
+        engine.activate_strategy.assert_called_once_with(
+            "strat_1",
+            actor="operator",
+            force=True,
+            reason="operator confirmed",
+        )
+
+    def test_force_recover_command_forces_activation(self, engine):
+        """FORCE_RECOVER command should pass force and reason to lifecycle orchestration."""
+        engine.activate_strategy = MagicMock()
+
+        engine._handle_command({
+            "cmd": "FORCE_RECOVER",
+            "params": {
+                "strategy_id": "strat_1",
+                "reason": "manual reset",
+            },
+        })
+
+        engine.activate_strategy.assert_called_once_with(
+            "strat_1",
+            actor="operator",
+            force=True,
+            reason="manual reset",
+        )
 
     def test_router_command_delegated(self, engine):
         """Router-owned commands should be delegated to CommandRouter."""

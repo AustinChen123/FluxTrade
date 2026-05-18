@@ -34,17 +34,17 @@ HOT_STRATEGIES_PATH = os.getenv('HOT_STRATEGIES_PATH', '/app/strategies_hot')
 logger = logging.getLogger(__name__)
 
 
-class _EngineStateAdapter:
-    """Temporary state-manager adapter until Phase 5 lands."""
+class _EngineLifecycleAdapter:
+    """Expose engine lifecycle orchestration through CommandRouter's transition API."""
 
     def __init__(self, engine: "StrategyEngine") -> None:
         self._engine = engine
 
     def transition_to_running(self, strategy_id: str, **kwargs) -> None:
-        self._engine.start_strategy(strategy_id)
+        self._engine.activate_strategy(strategy_id, **kwargs)
 
     def transition_to_stopped(self, strategy_id: str, **kwargs) -> None:
-        self._engine.stop_strategy(strategy_id)
+        self._engine.deactivate_strategy(strategy_id, **kwargs)
 
     def is_running(self, strategy_id: str) -> bool:
         return strategy_id in self._engine.strategy_instances
@@ -98,7 +98,7 @@ class StrategyEngine:
             db_session_factory=self._db_session_factory,
             audit_external_orders=audit_external_orders,
         )
-        self._state_manager = _EngineStateAdapter(self)
+        self._lifecycle_adapter = _EngineLifecycleAdapter(self)
         self._health_monitor = HealthMonitor(self._registry)
         self._strategy_state_manager = StrategyStateManager(
             self._db_session_factory,
@@ -106,7 +106,7 @@ class StrategyEngine:
         )
         self._command_router = CommandRouter(
             self._registry,
-            self._state_manager,
+            self._lifecycle_adapter,
             self._health_monitor,
         )
         self._signal_processor = SignalProcessor(
