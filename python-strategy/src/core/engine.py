@@ -100,6 +100,10 @@ class StrategyEngine:
         )
         self._state_manager = _EngineStateAdapter(self)
         self._health_monitor = HealthMonitor(self._registry)
+        self._strategy_state_manager = StrategyStateManager(
+            self._db_session_factory,
+            self.redis_client,
+        )
         self._command_router = CommandRouter(
             self._registry,
             self._state_manager,
@@ -108,12 +112,8 @@ class StrategyEngine:
         self._signal_processor = SignalProcessor(
             self._registry,
             self.execution_engine,
-            self._state_manager,
+            self._strategy_state_manager,
             lambda signal, candle: self.process_signal(signal, candle),
-        )
-        self._strategy_state_manager = StrategyStateManager(
-            self._db_session_factory,
-            self.redis_client,
         )
         
         # System State & Heartbeat
@@ -426,6 +426,9 @@ class StrategyEngine:
             self.strategies[strategy.product_id].append(strategy)
             self.strategy_instances[strategy.strategy_id] = strategy
             self._registry.register(strategy)
+            self._strategy_state_manager.on_state_change_message(
+                {"strategy_id": strategy.strategy_id, "status": StrategyStatus.ACTIVE.value}
+            )
             ACTIVE_STRATEGIES.set(len(self.strategy_instances))
         logger.info("Registered strategy (legacy): %s for %s", strategy.strategy_id, strategy.product_id)
 

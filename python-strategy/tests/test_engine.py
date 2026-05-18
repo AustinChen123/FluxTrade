@@ -166,6 +166,7 @@ class TestEngineInit:
         assert engine._signal_processor.execution_engine is engine.execution_engine
         assert isinstance(engine._strategy_state_manager, StrategyStateManager)
         assert engine._strategy_state_manager._redis_client is engine.redis_client
+        assert engine._signal_processor.state_manager is engine._strategy_state_manager
 
     def test_startup_initializes_strategy_state_cache(self, engine):
         """Startup should load strategy state into the manager cache."""
@@ -227,6 +228,12 @@ class TestAddStrategy:
         engine.add_strategy(strategy_instance)
 
         assert engine._registry.get("test_strat") is strategy_instance
+
+    def test_registers_strategy_as_active_in_state_cache(self, engine, strategy_instance):
+        """Legacy static registration should keep state guard cache active."""
+        engine.add_strategy(strategy_instance)
+
+        assert engine._strategy_state_manager.is_running("test_strat") is True
 
     def test_multiple_strategies_same_product(self, engine, mock_strategy_class):
         """Multiple strategies on same product should coexist."""
