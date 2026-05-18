@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import logging
 import threading
+import time
 from datetime import UTC, datetime
 from typing import ContextManager, Callable, Optional
 
@@ -34,6 +35,8 @@ class StrategyStateManager:
         self._redis_client = redis_client
         self._cache: dict[str, StrategyStatus] = {}
         self._lock = threading.Lock()
+        self._subscriber_stop = threading.Event()
+        self._subscriber_thread: threading.Thread | None = None
 
     def initialize_cache_from_db(self) -> None:
         """Load all strategy statuses from DB into the local cache."""
@@ -113,6 +116,56 @@ class StrategyStateManager:
 
         with self._lock:
             self._cache[str(strategy_id)] = StrategyStatus(status)
+
+    def start_subscriber(self) -> None:
+        """Start a daemon Redis subscriber for cross-process state changes."""
+        if self._subscriber_thread and self._subscriber_thread.is_alive():
+            return
+
+        self._subscriber_stop.clear()
+        self._subscriber_thread = threading.Thread(
+            target=self._subscriber_loop,
+            name="strategy-state-subscriber",
+            daemon=True,
+        )
+        self._subscriber_thread.start()
+
+    def shutdown(self) -> None:
+        """Stop the subscriber thread if it is running."""
+        self._subscriber_stop.set()
+        if self._subscriber_thread is not None:
+            self._subscriber_thread.join(timeout=5)
+
+    def _subscriber_loop(self) -> None:
+        pubsub = self._redis_client.pubsub()
+        try:
+            pubsub.subscribe(STATE_CHANGE_CHANNEL)
+            while not self._subscriber_stop.is_set():
+                try:
+                    message = pubsub.get_message(timeout=1.0)
+                    if not message or message.get("type") != "message":
+                        continue
+                    payload = self._decode_state_change_message(message.get("data"))
+                    self.on_state_change_message(payload)
+                except json.JSONDecodeError as e:
+                    logger.warning("Ignoring malformed strategy state message: %s", e)
+                except Exception:
+                    logger.exception("Strategy state subscriber failed")
+                    time.sleep(1)
+        finally:
+            close = getattr(pubsub, "close", None)
+            if close is not None:
+                close()
+
+    @staticmethod
+    def _decode_state_change_message(data) -> dict:
+        if isinstance(data, bytes):
+            data = data.decode("utf-8")
+        if isinstance(data, str):
+            return json.loads(data)
+        if isinstance(data, dict):
+            return data
+        raise json.JSONDecodeError("unsupported message payload", str(data), 0)
 
     def _transition(
         self,

@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import json
+import threading
+import time
 from contextlib import nullcontext
 from unittest.mock import MagicMock
 
@@ -167,3 +169,93 @@ def test_on_state_change_message_ignores_malformed_message() -> None:
     manager.on_state_change_message({"strategy_id": "s1"})
 
     assert manager.get_status("s1") is None
+
+
+class _FakePubSub:
+    def __init__(self, messages=None):
+        self.messages = list(messages or [])
+        self.subscribed = threading.Event()
+        self.closed = threading.Event()
+
+    def subscribe(self, channel):
+        self.channel = channel
+        self.subscribed.set()
+
+    def get_message(self, timeout=1.0):
+        if self.messages:
+            return self.messages.pop(0)
+        time.sleep(0.01)
+        return None
+
+    def close(self):
+        self.closed.set()
+
+
+def test_start_subscriber_spawns_daemon_and_subscribes() -> None:
+    db = _FakeSession([])
+    pubsub = _FakePubSub()
+    redis_client = MagicMock()
+    redis_client.pubsub.return_value = pubsub
+    manager = _manager(db, redis_client)
+
+    manager.start_subscriber()
+
+    assert manager._subscriber_thread is not None
+    assert manager._subscriber_thread.daemon is True
+    assert pubsub.subscribed.wait(timeout=1)
+    assert pubsub.channel == STATE_CHANGE_CHANNEL
+
+    manager.shutdown()
+
+    assert pubsub.closed.wait(timeout=1)
+
+
+def test_subscriber_applies_json_state_change_message() -> None:
+    db = _FakeSession([])
+    pubsub = _FakePubSub(
+        [
+            {
+                "type": "message",
+                "data": json.dumps(
+                    {"strategy_id": "s1", "status": StrategyStatus.ACTIVE.value}
+                ),
+            }
+        ]
+    )
+    redis_client = MagicMock()
+    redis_client.pubsub.return_value = pubsub
+    manager = _manager(db, redis_client)
+
+    manager.start_subscriber()
+    deadline = time.time() + 1
+    while manager.get_status("s1") is None and time.time() < deadline:
+        time.sleep(0.01)
+    manager.shutdown()
+
+    assert manager.is_running("s1") is True
+
+
+def test_subscriber_ignores_malformed_json_and_continues() -> None:
+    db = _FakeSession([])
+    pubsub = _FakePubSub(
+        [
+            {"type": "message", "data": "not-json"},
+            {
+                "type": "message",
+                "data": json.dumps(
+                    {"strategy_id": "s1", "status": StrategyStatus.STOPPED.value}
+                ),
+            },
+        ]
+    )
+    redis_client = MagicMock()
+    redis_client.pubsub.return_value = pubsub
+    manager = _manager(db, redis_client)
+
+    manager.start_subscriber()
+    deadline = time.time() + 1
+    while manager.get_status("s1") is None and time.time() < deadline:
+        time.sleep(0.01)
+    manager.shutdown()
+
+    assert manager.is_stopped("s1") is True
