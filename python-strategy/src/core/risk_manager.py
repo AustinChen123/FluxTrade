@@ -3,6 +3,9 @@ from decimal import Decimal
 from typing import TYPE_CHECKING, Optional
 from src.core.models import Signal, SignalType, Position, PositionSide
 from src.core.redis_factory import create_redis_client
+from src.core.risk_config import RiskConfig
+from src.core.risk_rules import RuleStatus
+from src.core.risk_rules.max_position_notional import MaxPositionNotionalRule
 
 if TYPE_CHECKING:
     from src.core.capital_allocator import CapitalAllocator
@@ -76,11 +79,16 @@ class RiskManager:
         account_service: AccountService,
         capital_allocator: Optional["CapitalAllocator"] = None,
         max_exposure_per_strategy: Optional[Decimal] = None,
+        risk_config: Optional[RiskConfig] = None,
+        max_position_rule: Optional[MaxPositionNotionalRule] = None,
     ):
         self.account_service = account_service
-        self.max_exposure_per_product = Decimal("50000.0")
+        self.risk_config = risk_config or RiskConfig.from_env()
+        self.max_position_rule = max_position_rule or MaxPositionNotionalRule(self.risk_config)
         self.capital_allocator = capital_allocator
-        self.max_exposure_per_strategy = max_exposure_per_strategy or self.max_exposure_per_product
+        self.max_exposure_per_strategy = (
+            max_exposure_per_strategy or self.risk_config.max_position_notional
+        )
 
     def check_risk(self, signal: Signal, current_price: Optional[Decimal] = None) -> tuple[bool, str]:
         """
@@ -117,16 +125,31 @@ class RiskManager:
         position = self.account_service.get_position(signal.strategy_id, signal.product_id)
         if position:
             price_for_exposure = current_price if current_price is not None else position.entry_price
-            current_exposure = position.quantity * price_for_exposure
 
-            # Per-product exposure limit (always enforced)
-            if is_entry and current_exposure >= self.max_exposure_per_product:
-                 msg = f"REJECT: Max exposure reached ({current_exposure} >= {self.max_exposure_per_product})"
-                 logger.warning("RISK_REJECTED: %s", msg)
-                 return False, msg
+            if is_entry:
+                if signal.quantity is None:
+                    current_exposure = position.quantity * price_for_exposure
+                    if current_exposure > self.risk_config.max_position_notional:
+                        msg = (
+                            "REJECT: Max exposure reached "
+                            f"({current_exposure} > {self.risk_config.max_position_notional})"
+                        )
+                        logger.warning("RISK_REJECTED: %s", msg)
+                        return False, msg
+                else:
+                    rule_status, rule_reason = self.max_position_rule.evaluate(
+                        signal,
+                        position,
+                        price_for_exposure,
+                    )
+                    if rule_status == RuleStatus.REJECT:
+                        msg = f"REJECT: Max exposure reached ({rule_reason})"
+                        logger.warning("RISK_REJECTED: %s", msg)
+                        return False, msg
 
             # Per-strategy exposure limit (only when capital_allocator present)
             if self.capital_allocator is not None and is_entry:
+                current_exposure = position.quantity * price_for_exposure
                 if current_exposure >= self.max_exposure_per_strategy:
                     msg = (
                         f"REJECT: Strategy {signal.strategy_id} max exposure reached "
