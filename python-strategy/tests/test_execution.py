@@ -416,6 +416,92 @@ class TestAuditedExecution:
 
         assert engine.list_recoverable_client_orders() == [recoverable]
 
+    def test_record_recoverable_order_scan_writes_reconcile_event(
+        self, mock_db_session, mock_clock, mock_exchange_adapter, mock_order_repo, order_factory
+    ):
+        engine = ExecutionEngine(
+            db_session=mock_db_session,
+            clock=mock_clock,
+            adapter=mock_exchange_adapter,
+            order_repository=mock_order_repo,
+            db_session_factory=lambda: nullcontext(mock_db_session),
+        )
+        new_order = order_factory(
+            order_id="new-order",
+            client_order_id="client-new",
+            status=OrderStatus.NEW.value,
+            exchange_order_id=None,
+        )
+        submitted_order = order_factory(
+            order_id="submitted-order",
+            client_order_id="client-submitted",
+            status=OrderStatus.SUBMITTED.value,
+            exchange_order_id="EX-1",
+        )
+        closed_order = order_factory(
+            order_id="closed-order",
+            client_order_id="client-closed",
+            status=OrderStatus.CANCELLED.value,
+        )
+        mock_order_repo.add_order(new_order)
+        mock_order_repo.add_order(submitted_order)
+        mock_order_repo.add_order(closed_order)
+
+        payload = engine.record_recoverable_order_scan()
+
+        assert payload["recoverable_count"] == 2
+        assert payload["status_counts"] == {
+            OrderStatus.NEW.value: 1,
+            OrderStatus.SUBMITTED.value: 1,
+        }
+        assert [order["order_id"] for order in payload["orders"]] == [
+            "new-order",
+            "submitted-order",
+        ]
+        event = mock_db_session.add.call_args.args[0]
+        assert event.event_type == "reconcile"
+        assert event.event_subtype == "startup_recovery_scan"
+        assert event.payload == payload
+        mock_db_session.commit.assert_called_once()
+        mock_db_session.rollback.assert_not_called()
+
+    def test_record_recoverable_order_scan_requires_session_factory(
+        self, mock_db_session, mock_clock, mock_exchange_adapter, mock_order_repo
+    ):
+        engine = ExecutionEngine(
+            db_session=mock_db_session,
+            clock=mock_clock,
+            adapter=mock_exchange_adapter,
+            order_repository=mock_order_repo,
+        )
+
+        with pytest.raises(RuntimeError, match="requires db_session_factory"):
+            engine.record_recoverable_order_scan()
+
+    def test_record_recoverable_order_scan_rolls_back_on_event_failure(
+        self, mock_db_session, mock_clock, mock_exchange_adapter, mock_order_repo, order_factory
+    ):
+        mock_db_session.add.side_effect = RuntimeError("event write failed")
+        engine = ExecutionEngine(
+            db_session=mock_db_session,
+            clock=mock_clock,
+            adapter=mock_exchange_adapter,
+            order_repository=mock_order_repo,
+            db_session_factory=lambda: nullcontext(mock_db_session),
+        )
+        mock_order_repo.add_order(
+            order_factory(
+                order_id="recoverable",
+                client_order_id="client-1",
+                status=OrderStatus.SUBMITTED_UNCONFIRMED.value,
+            )
+        )
+
+        with pytest.raises(RuntimeError, match="event write failed"):
+            engine.record_recoverable_order_scan()
+
+        mock_db_session.rollback.assert_called_once()
+
 
 class TestCancelOrder:
     """Tests for execution-level cancellation."""

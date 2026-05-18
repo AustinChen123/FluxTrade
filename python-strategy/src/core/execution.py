@@ -14,6 +14,7 @@ from src.core.audit_service import (
     build_signal_intent_audit,
     write_signal_audit_intent,
     write_signal_audit_outcome,
+    write_system_event,
 )
 from src.core.client_order_id import generate_client_order_id, parse_client_order_id
 
@@ -56,6 +57,47 @@ class ExecutionEngine:
             OrderStatus.SUBMITTED.value,
         }
         return self.order_manager.repo.list_client_orders_by_statuses(statuses)
+
+    def record_recoverable_order_scan(self) -> dict:
+        """Record a startup scan of client orders that still need reconciliation."""
+        if self._db_session_factory is None:
+            raise RuntimeError("record_recoverable_order_scan requires db_session_factory")
+
+        orders = self.list_recoverable_client_orders()
+        status_counts: dict[str, int] = {}
+        for order in orders:
+            status_counts[order.status] = status_counts.get(order.status, 0) + 1
+
+        payload = {
+            "recoverable_count": len(orders),
+            "status_counts": status_counts,
+            "orders": [
+                {
+                    "order_id": order.id,
+                    "client_order_id": order.client_order_id,
+                    "status": order.status,
+                    "strategy_id": order.strategy_id,
+                    "product_id": order.product_id,
+                    "exchange_order_id": order.exchange_order_id,
+                }
+                for order in orders
+            ],
+        }
+
+        with self._db_session_factory() as db:
+            try:
+                write_system_event(
+                    db,
+                    event_type="reconcile",
+                    event_subtype="startup_recovery_scan",
+                    payload=payload,
+                )
+                db.commit()
+            except Exception:
+                db.rollback()
+                raise
+
+        return payload
 
     def process_market_data(self, candle: Candlestick):
         """
