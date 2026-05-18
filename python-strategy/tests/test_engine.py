@@ -176,6 +176,14 @@ class TestEngineInit:
 
         engine._strategy_state_manager.initialize_cache_from_db.assert_called_once_with()
 
+    def test_startup_starts_strategy_state_subscriber(self, engine):
+        """Startup should subscribe to cross-process strategy state changes."""
+        engine._strategy_state_manager.start_subscriber = MagicMock()
+
+        engine._start_strategy_state_subscriber_on_startup()
+
+        engine._strategy_state_manager.start_subscriber.assert_called_once_with()
+
     def test_startup_reconcile_skipped_when_audit_external_orders_disabled(self, engine):
         """Startup order reconciliation should only run for audited external orders."""
         engine.execution_engine.reconcile_recoverable_client_orders = MagicMock()
@@ -835,6 +843,14 @@ class TestShutdown:
         engine.executor = MagicMock()
         engine.shutdown(timeout=0.1)
         engine.executor.shutdown.assert_called_once()
+
+    def test_shutdown_stops_strategy_state_manager(self, engine):
+        """Shutdown should stop the strategy state subscriber."""
+        engine._strategy_state_manager.shutdown = MagicMock()
+
+        engine.shutdown(timeout=0.1)
+
+        engine._strategy_state_manager.shutdown.assert_called_once_with()
 
     def test_redis_close_error_handled(self, engine):
         """Redis close error should not propagate."""

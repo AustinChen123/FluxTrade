@@ -130,6 +130,7 @@ class StrategyEngine:
         self._check_system_state()
         self._reconcile_balance()
         self._initialize_strategy_state_cache_on_startup()
+        self._start_strategy_state_subscriber_on_startup()
         self._reconcile_recoverable_orders_on_startup()
         self._start_heartbeat()
         self._start_command_listener()
@@ -140,6 +141,10 @@ class StrategyEngine:
     def _initialize_strategy_state_cache_on_startup(self) -> None:
         """Load strategy lifecycle state into the manager cache."""
         self._strategy_state_manager.initialize_cache_from_db()
+
+    def _start_strategy_state_subscriber_on_startup(self) -> None:
+        """Listen for cross-process strategy state updates."""
+        self._strategy_state_manager.start_subscriber()
 
     def _reconcile_recoverable_orders_on_startup(self) -> None:
         """Record startup order reconciliation for audited external orders."""
@@ -505,6 +510,8 @@ class StrategyEngine:
             self.heartbeat_thread.join(timeout=timeout)
         if self.command_thread and self.command_thread.is_alive():
             self.command_thread.join(timeout=timeout)
+
+        self._strategy_state_manager.shutdown()
 
         try:
             self.redis_client.close()
