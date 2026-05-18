@@ -26,6 +26,7 @@ from src.core.command_router import CommandRouter
 from src.core.health_monitor import HealthMonitor
 from src.core.signal_processor import SignalProcessor
 from src.core.strategy_registry import StrategyRegistry
+from src.core.strategy_state_manager import StrategyStateManager
 from src.core.audit_service import build_signal_audit, commit_signal_audit
 
 HOT_STRATEGIES_PATH = os.getenv('HOT_STRATEGIES_PATH', '/app/strategies_hot')
@@ -69,6 +70,7 @@ class StrategyEngine:
         self.loaded_classes: Dict[str, Type[BaseStrategy]] = {}
         self._strategy_lock = threading.Lock()
         self._registry = StrategyRegistry()
+        self.redis_client = create_redis_client()
 
         # Initialize Services
         self.account_service = account_service if account_service else AccountService()
@@ -109,9 +111,12 @@ class StrategyEngine:
             self._state_manager,
             lambda signal, candle: self.process_signal(signal, candle),
         )
+        self._strategy_state_manager = StrategyStateManager(
+            self._db_session_factory,
+            self.redis_client,
+        )
         
         # System State & Heartbeat
-        self.redis_client = create_redis_client()
         self._health_monitor.redis_client = self.redis_client
         self.running = True
         self.heartbeat_thread = None
@@ -124,12 +129,17 @@ class StrategyEngine:
         """
         self._check_system_state()
         self._reconcile_balance()
+        self._initialize_strategy_state_cache_on_startup()
         self._reconcile_recoverable_orders_on_startup()
         self._start_heartbeat()
         self._start_command_listener()
         
         # Initial scan to discover strategies
         self.scan_strategies()
+
+    def _initialize_strategy_state_cache_on_startup(self) -> None:
+        """Load strategy lifecycle state into the manager cache."""
+        self._strategy_state_manager.initialize_cache_from_db()
 
     def _reconcile_recoverable_orders_on_startup(self) -> None:
         """Record startup order reconciliation for audited external orders."""

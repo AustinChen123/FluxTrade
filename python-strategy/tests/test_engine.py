@@ -19,6 +19,7 @@ import pytest
 
 from src.core.models import Candlestick, Signal, SignalType
 from src.core.engine import StrategyEngine
+from src.core.strategy_state_manager import StrategyStateManager
 
 
 # =============================================================================
@@ -163,6 +164,16 @@ class TestEngineInit:
         assert engine._command_router.registry is engine._registry
         assert engine._signal_processor.registry is engine._registry
         assert engine._signal_processor.execution_engine is engine.execution_engine
+        assert isinstance(engine._strategy_state_manager, StrategyStateManager)
+        assert engine._strategy_state_manager._redis_client is engine.redis_client
+
+    def test_startup_initializes_strategy_state_cache(self, engine):
+        """Startup should load strategy state into the manager cache."""
+        engine._strategy_state_manager.initialize_cache_from_db = MagicMock()
+
+        engine._initialize_strategy_state_cache_on_startup()
+
+        engine._strategy_state_manager.initialize_cache_from_db.assert_called_once_with()
 
     def test_startup_reconcile_skipped_when_audit_external_orders_disabled(self, engine):
         """Startup order reconciliation should only run for audited external orders."""
