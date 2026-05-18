@@ -55,10 +55,58 @@ def test_start_delegates_to_state_manager() -> None:
 def test_stop_delegates_to_state_manager() -> None:
     router = CommandRouter(StrategyRegistry(), MagicMock())
 
-    result = router.handle({"command": "STOP", "strategy_id": "s1"})
+    result = router.handle(
+        {"command": "STOP", "strategy_id": "s1", "reason": "maintenance"}
+    )
 
     assert result.success is True
-    router.state_manager.transition_to_stopped.assert_called_once_with("s1")
+    router.state_manager.transition_to_stopped.assert_called_once_with(
+        "s1",
+        actor="operator",
+        reason="maintenance",
+    )
+
+
+def test_resume_delegates_to_forced_running_transition() -> None:
+    router = CommandRouter(StrategyRegistry(), MagicMock())
+
+    result = router.handle(
+        {
+            "cmd": "resume",
+            "strategy_id": "s1",
+            "reason": "operator confirmed",
+        }
+    )
+
+    assert result.success is True
+    router.state_manager.transition_to_running.assert_called_once_with(
+        "s1",
+        actor="operator",
+        force=True,
+        reason="operator confirmed",
+    )
+
+
+def test_force_recover_delegates_to_forced_running_transition() -> None:
+    router = CommandRouter(StrategyRegistry(), MagicMock())
+
+    result = router.handle(
+        {
+            "cmd": "force_recover",
+            "params": {
+                "strategy_id": "s1",
+                "reason": "manual reset",
+            },
+        }
+    )
+
+    assert result.success is True
+    router.state_manager.transition_to_running.assert_called_once_with(
+        "s1",
+        actor="operator",
+        force=True,
+        reason="manual reset",
+    )
 
 
 def test_reload_returns_placeholder_without_registry_reload() -> None:

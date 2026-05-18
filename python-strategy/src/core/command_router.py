@@ -53,6 +53,8 @@ class CommandRouter:
         handlers = {
             "START": self._handle_start,
             "STOP": self._handle_stop,
+            "RESUME": self._handle_resume,
+            "FORCE_RECOVER": self._handle_force_recover,
             "RELOAD": self._handle_reload,
             "LIST": self._handle_list,
             "HEALTH_CHECK": self._handle_health_check,
@@ -61,21 +63,46 @@ class CommandRouter:
         if handler is None:
             return CommandResult(False, f"Unknown command: {command}")
 
-        if command in {"START", "STOP", "RELOAD"}:
+        if command in {"START", "STOP", "RESUME", "FORCE_RECOVER", "RELOAD"}:
             if not strategy_id:
                 return CommandResult(False, f"{command} requires strategy_id")
-            return handler(str(strategy_id))
+            return handler(str(strategy_id), params, message)
         return handler()
 
-    def _handle_start(self, strategy_id: str) -> CommandResult:
+    def _handle_start(self, strategy_id: str, params: dict, message: dict) -> CommandResult:
         self.state_manager.transition_to_running(strategy_id)
         return CommandResult(True, f"Started strategy {strategy_id}")
 
-    def _handle_stop(self, strategy_id: str) -> CommandResult:
-        self.state_manager.transition_to_stopped(strategy_id)
+    def _handle_stop(self, strategy_id: str, params: dict, message: dict) -> CommandResult:
+        reason = params.get("reason") or message.get("reason")
+        self.state_manager.transition_to_stopped(
+            strategy_id,
+            actor="operator",
+            reason=reason,
+        )
         return CommandResult(True, f"Stopped strategy {strategy_id}")
 
-    def _handle_reload(self, strategy_id: str) -> CommandResult:
+    def _handle_resume(self, strategy_id: str, params: dict, message: dict) -> CommandResult:
+        reason = params.get("reason") or message.get("reason")
+        self.state_manager.transition_to_running(
+            strategy_id,
+            actor="operator",
+            force=True,
+            reason=reason,
+        )
+        return CommandResult(True, f"Resumed strategy {strategy_id}")
+
+    def _handle_force_recover(self, strategy_id: str, params: dict, message: dict) -> CommandResult:
+        reason = params.get("reason") or message.get("reason")
+        self.state_manager.transition_to_running(
+            strategy_id,
+            actor="operator",
+            force=True,
+            reason=reason,
+        )
+        return CommandResult(True, f"Force recovered strategy {strategy_id}")
+
+    def _handle_reload(self, strategy_id: str, params: dict, message: dict) -> CommandResult:
         logger.warning("Strategy reload is not implemented yet: %s", strategy_id)
         return CommandResult(
             True,

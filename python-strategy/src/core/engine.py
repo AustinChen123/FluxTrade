@@ -40,10 +40,10 @@ class _EngineStateAdapter:
     def __init__(self, engine: "StrategyEngine") -> None:
         self._engine = engine
 
-    def transition_to_running(self, strategy_id: str) -> None:
+    def transition_to_running(self, strategy_id: str, **kwargs) -> None:
         self._engine.start_strategy(strategy_id)
 
-    def transition_to_stopped(self, strategy_id: str) -> None:
+    def transition_to_stopped(self, strategy_id: str, **kwargs) -> None:
         self._engine.stop_strategy(strategy_id)
 
     def is_running(self, strategy_id: str) -> bool:
