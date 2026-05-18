@@ -111,6 +111,7 @@ class ExecutionEngine:
         orders = self.list_recoverable_client_orders()
         results = []
         result_counts: dict[str, int] = {}
+        decision_counts: dict[str, int] = {}
 
         for order in orders:
             snapshot = self.adapter.get_order_by_client_id(
@@ -123,6 +124,8 @@ class ExecutionEngine:
                 else "exchange_not_found_or_lookup_unsupported"
             )
             result_counts[result] = result_counts.get(result, 0) + 1
+            decision = self._reconcile_decision(order.status, snapshot.status if snapshot else None)
+            decision_counts[decision] = decision_counts.get(decision, 0) + 1
             results.append(
                 {
                     "order_id": order.id,
@@ -132,6 +135,7 @@ class ExecutionEngine:
                     "strategy_id": order.strategy_id,
                     "local_exchange_order_id": order.exchange_order_id,
                     "result": result,
+                    "decision": decision,
                     "exchange_order_id": snapshot.exchange_order_id if snapshot else None,
                     "exchange_status": snapshot.status if snapshot else None,
                 }
@@ -140,6 +144,7 @@ class ExecutionEngine:
         payload = {
             "recoverable_count": len(orders),
             "result_counts": result_counts,
+            "decision_counts": decision_counts,
             "results": results,
         }
 
@@ -157,6 +162,34 @@ class ExecutionEngine:
                 raise
 
         return payload
+
+    @staticmethod
+    def _reconcile_decision(local_status: str, exchange_status: Optional[str]) -> str:
+        if exchange_status is None:
+            if local_status == OrderStatus.NEW.value:
+                return "local_only"
+            return "exchange_unknown"
+
+        normalized_exchange_status = exchange_status.lower()
+        if normalized_exchange_status in {
+            "open",
+            "new",
+            "submitted",
+            "partially_filled",
+            "submitted_unconfirmed",
+        }:
+            return "exchange_open"
+        if normalized_exchange_status in {
+            "closed",
+            "filled",
+            "canceled",
+            "cancelled",
+            "rejected",
+            "expired",
+            "failed",
+        }:
+            return "exchange_closed"
+        return "exchange_unknown"
 
     def process_market_data(self, candle: Candlestick):
         """

@@ -541,6 +541,10 @@ class TestAuditedExecution:
             "exchange_found": 1,
             "exchange_not_found_or_lookup_unsupported": 1,
         }
+        assert payload["decision_counts"] == {
+            "exchange_open": 1,
+            "exchange_unknown": 1,
+        }
         assert payload["results"] == [
             {
                 "order_id": "found-local",
@@ -550,6 +554,7 @@ class TestAuditedExecution:
                 "strategy_id": found_order.strategy_id,
                 "local_exchange_order_id": "EX-LOCAL",
                 "result": "exchange_found",
+                "decision": "exchange_open",
                 "exchange_order_id": "EX-LOCAL",
                 "exchange_status": OrderStatus.SUBMITTED.value,
             },
@@ -561,6 +566,7 @@ class TestAuditedExecution:
                 "strategy_id": missing_order.strategy_id,
                 "local_exchange_order_id": None,
                 "result": "exchange_not_found_or_lookup_unsupported",
+                "decision": "exchange_unknown",
                 "exchange_order_id": None,
                 "exchange_status": None,
             },
@@ -584,6 +590,21 @@ class TestAuditedExecution:
 
         with pytest.raises(RuntimeError, match="requires db_session_factory"):
             engine.reconcile_recoverable_client_orders()
+
+    @pytest.mark.parametrize(
+        ("local_status", "exchange_status", "expected"),
+        [
+            (OrderStatus.NEW.value, None, "local_only"),
+            (OrderStatus.SUBMITTED.value, None, "exchange_unknown"),
+            (OrderStatus.SUBMITTED.value, "open", "exchange_open"),
+            (OrderStatus.SUBMITTED.value, "PARTIALLY_FILLED", "exchange_open"),
+            (OrderStatus.SUBMITTED.value, "closed", "exchange_closed"),
+            (OrderStatus.SUBMITTED.value, "CANCELLED", "exchange_closed"),
+            (OrderStatus.SUBMITTED.value, "mystery", "exchange_unknown"),
+        ],
+    )
+    def test_reconcile_decision_categories(self, local_status, exchange_status, expected):
+        assert ExecutionEngine._reconcile_decision(local_status, exchange_status) == expected
 
 
 class TestCancelOrder:
