@@ -17,6 +17,7 @@ from src.core.risk_manager import RiskManager, AccountService
 from src.core.execution import ExecutionEngine
 from src.core.clock import Clock
 from src.core.interfaces import IExchangeAdapter, IOrderRepository
+from src.core.daily_nav_snapshot import DailyNavSnapshotService
 from src.core.strategy_loader import StrategyLoader
 from src.core.data_provider import check_data_availability
 from src.core.adapters import create_adapter
@@ -76,12 +77,16 @@ class StrategyEngine:
             self._db_session_factory,
             self.redis_client,
         )
+        self._daily_nav_snapshot_service = DailyNavSnapshotService(
+            self._db_session_factory,
+        )
 
         # Initialize Services
         self.account_service = account_service if account_service else AccountService()
         self.risk_manager = RiskManager(
             self.account_service,
             state_manager=self._strategy_state_manager,
+            daily_nav_service=self._daily_nav_snapshot_service,
         )
 
         # Use pre-created adapter or build from config

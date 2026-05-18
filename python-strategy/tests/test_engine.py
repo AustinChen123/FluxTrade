@@ -18,6 +18,7 @@ from unittest.mock import MagicMock, call, patch
 import pytest
 
 from src.core.models import Candlestick, Signal, SignalType
+from src.core.daily_nav_snapshot import DailyNavSnapshotService
 from src.core.engine import StrategyEngine
 from src.core.strategy_state_manager import StrategyStateManager
 
@@ -168,6 +169,8 @@ class TestEngineInit:
         assert engine._strategy_state_manager._redis_client is engine.redis_client
         assert engine._signal_processor.state_manager is engine._strategy_state_manager
         assert engine.risk_manager.state_manager is engine._strategy_state_manager
+        assert isinstance(engine._daily_nav_snapshot_service, DailyNavSnapshotService)
+        assert engine.risk_manager.daily_nav_service is engine._daily_nav_snapshot_service
 
     def test_startup_initializes_strategy_state_cache(self, engine):
         """Startup should load strategy state into the manager cache."""
