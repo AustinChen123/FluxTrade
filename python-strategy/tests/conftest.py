@@ -21,6 +21,7 @@ from src.core.orm_models import Order, Trade as ORMTrade, Position as ORMPositio
 
 # Interfaces
 from src.core.interfaces import IOrderRepository, IExchangeAdapter
+from src.core.interfaces.exchange import ExchangeOrderSnapshot
 
 # Core modules
 from src.core.risk_manager import AccountService
@@ -209,6 +210,21 @@ class MockExchangeAdapter(IExchangeAdapter):
             o for o in self.open_orders if o.client_order_id != client_order_id
         ]
         return len(self.open_orders) < initial_len
+
+    def get_order_by_client_id(
+        self,
+        client_order_id: str,
+        product_id: str,
+    ) -> Optional[ExchangeOrderSnapshot]:
+        for order in self.open_orders:
+            if order.client_order_id == client_order_id and order.product_id == product_id:
+                return ExchangeOrderSnapshot(
+                    client_order_id=client_order_id,
+                    exchange_order_id=order.exchange_order_id,
+                    status=order.status,
+                    raw=None,
+                )
+        return None
 
     def get_balance(self, asset: str) -> Decimal:
         return self.balance.get(asset, Decimal("0"))

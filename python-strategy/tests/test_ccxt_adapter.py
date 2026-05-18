@@ -224,6 +224,90 @@ class TestCancelOrder:
         assert result is False
 
 
+class TestGetOrderByClientId:
+    def test_binance_fetches_order_with_exchange_safe_client_id(self, adapter, mock_ccxt_client):
+        exchange_client_order_id = to_exchange_format(
+            CANONICAL_CLIENT_ORDER_ID,
+            "binance",
+        )
+        mock_ccxt_client.fetch_order.return_value = {
+            "id": "EX-123",
+            "status": "open",
+            "clientOrderId": exchange_client_order_id,
+        }
+
+        snapshot = adapter.get_order_by_client_id(
+            CANONICAL_CLIENT_ORDER_ID,
+            "BINANCE:BTCUSDT-PERP",
+        )
+
+        assert snapshot is not None
+        assert snapshot.client_order_id == CANONICAL_CLIENT_ORDER_ID
+        assert snapshot.exchange_order_id == "EX-123"
+        assert snapshot.status == "open"
+        assert snapshot.raw["clientOrderId"] == exchange_client_order_id
+        mock_ccxt_client.fetch_order.assert_called_once_with(
+            exchange_client_order_id,
+            "BTC/USDT:USDT",
+            params={"origClientOrderId": exchange_client_order_id},
+        )
+
+    def test_non_binance_fetches_order_with_client_order_id(self, mock_ccxt_client):
+        with patch("src.core.adapters.ccxt_adapter.ccxt") as mock_ccxt:
+            mock_exchange_cls = MagicMock(return_value=mock_ccxt_client)
+            mock_ccxt.bybit = mock_exchange_cls
+            setattr(mock_ccxt, "bybit", mock_exchange_cls)
+            adapter = CcxtExchangeAdapter(
+                exchange_id="bybit",
+                api_key="test-key",
+                secret="test-secret",
+            )
+        adapter.client = mock_ccxt_client
+        mock_ccxt_client.fetch_order.return_value = {
+            "id": "EX-456",
+            "status": "closed",
+            "clientOrderId": CANONICAL_CLIENT_ORDER_ID,
+        }
+
+        snapshot = adapter.get_order_by_client_id(
+            CANONICAL_CLIENT_ORDER_ID,
+            "BYBIT:BTCUSDT-PERP",
+        )
+
+        assert snapshot is not None
+        assert snapshot.exchange_order_id == "EX-456"
+        assert snapshot.status == "closed"
+        mock_ccxt_client.fetch_order.assert_called_once_with(
+            CANONICAL_CLIENT_ORDER_ID,
+            "BTC/USDT:USDT",
+            params={"clientOrderId": CANONICAL_CLIENT_ORDER_ID},
+        )
+
+    def test_fetch_order_not_found_returns_none(self, adapter, mock_ccxt_client):
+        import ccxt as ccxt_lib
+
+        mock_ccxt_client.fetch_order.side_effect = ccxt_lib.OrderNotFound("not found")
+
+        assert (
+            adapter.get_order_by_client_id(
+                CANONICAL_CLIENT_ORDER_ID,
+                "BINANCE:BTCUSDT-PERP",
+            )
+            is None
+        )
+
+    def test_fetch_order_error_raises_exchange_error(self, adapter, mock_ccxt_client):
+        import ccxt as ccxt_lib
+
+        mock_ccxt_client.fetch_order.side_effect = ccxt_lib.ExchangeError("fail")
+
+        with pytest.raises(ExchangeError):
+            adapter.get_order_by_client_id(
+                CANONICAL_CLIENT_ORDER_ID,
+                "BINANCE:BTCUSDT-PERP",
+            )
+
+
 class TestGetBalance:
     def test_returns_decimal(self, adapter, mock_ccxt_client):
         mock_ccxt_client.fetch_balance.return_value = {"free": {"USDT": 1234.56}}

@@ -2,7 +2,7 @@ import inspect
 import uuid
 from decimal import Decimal
 from typing import Optional, List, Dict
-from src.core.interfaces.exchange import IExchangeAdapter
+from src.core.interfaces.exchange import ExchangeOrderSnapshot, IExchangeAdapter
 from src.core.orm_models import Order
 from src.core.models import Position, Candlestick, PositionSide
 
@@ -71,6 +71,21 @@ class SimulatedAdapter(IExchangeAdapter):
                     del self._order_map[oid]
                 return cancelled
         return False
+
+    def get_order_by_client_id(
+        self,
+        client_order_id: str,
+        product_id: str,
+    ) -> Optional[ExchangeOrderSnapshot]:
+        for orm_order in self._order_map.values():
+            if orm_order.client_order_id == client_order_id and orm_order.product_id == product_id:
+                return ExchangeOrderSnapshot(
+                    client_order_id=client_order_id,
+                    exchange_order_id=orm_order.exchange_order_id,
+                    status=orm_order.status,
+                    raw=None,
+                )
+        return None
 
     def get_balance(self, asset: str = "USDT") -> Decimal:
         return Decimal(self._engine.balance)

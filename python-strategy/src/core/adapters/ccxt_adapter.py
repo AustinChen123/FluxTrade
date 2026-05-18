@@ -13,6 +13,7 @@ from typing import Optional
 import ccxt
 
 from src.core.interfaces.exchange import (
+    ExchangeOrderSnapshot,
     ExchangeError,
     IExchangeAdapter,
     InsufficientFundsError,
@@ -146,6 +147,44 @@ class CcxtExchangeAdapter(IExchangeAdapter):
                 e,
             )
             return False
+
+    def get_order_by_client_id(
+        self,
+        client_order_id: str,
+        product_id: str,
+    ) -> Optional[ExchangeOrderSnapshot]:
+        ccxt_symbol = to_ccxt_symbol(product_id)
+        exchange_client_order_id = to_exchange_format(client_order_id, self.exchange_id)
+        params = (
+            {"origClientOrderId": exchange_client_order_id}
+            if self.exchange_id == "binance"
+            else {"clientOrderId": exchange_client_order_id}
+        )
+        try:
+            response = self.client.fetch_order(
+                exchange_client_order_id,
+                ccxt_symbol,
+                params=params,
+            )
+        except ccxt.OrderNotFound:
+            self.logger.warning(
+                "Order with client_order_id %s not found on exchange",
+                client_order_id,
+            )
+            return None
+        except ccxt.BaseError as e:
+            raise ExchangeError(
+                f"Failed to fetch order with client_order_id {client_order_id}: {e}"
+            ) from e
+
+        exchange_order_id = response.get("id")
+        status = response.get("status") or "unknown"
+        return ExchangeOrderSnapshot(
+            client_order_id=client_order_id,
+            exchange_order_id=str(exchange_order_id) if exchange_order_id is not None else None,
+            status=str(status),
+            raw=response,
+        )
 
     def get_balance(self, asset: str) -> Decimal:
         try:

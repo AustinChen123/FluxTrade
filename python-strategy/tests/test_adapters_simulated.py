@@ -468,6 +468,31 @@ class TestCancellation:
         adapter = SimulatedAdapter(Decimal("10000"))
         assert adapter.cancel_order("NOPE", PRODUCT) is False
 
+    def test_get_order_by_client_id_returns_snapshot(self, order_factory):
+        adapter = SimulatedAdapter(Decimal("10000"))
+        order = order_factory(
+            order_type="limit",
+            side="buy",
+            product_id=PRODUCT,
+            price=Decimal("40000"),
+            quantity=Decimal("0.1"),
+            status="SUBMITTED",
+            client_order_id="client-123",
+        )
+        exchange_order_id = adapter.place_order(order)
+
+        snapshot = adapter.get_order_by_client_id("client-123", PRODUCT)
+
+        assert snapshot is not None
+        assert snapshot.client_order_id == "client-123"
+        assert snapshot.exchange_order_id == exchange_order_id
+        assert snapshot.status == "SUBMITTED"
+
+    def test_get_order_by_client_id_returns_none_when_missing(self):
+        adapter = SimulatedAdapter(Decimal("10000"))
+
+        assert adapter.get_order_by_client_id("missing", PRODUCT) is None
+
 
 # =================================================================
 # Position tracking

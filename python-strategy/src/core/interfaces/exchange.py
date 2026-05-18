@@ -1,6 +1,7 @@
 from abc import ABC, abstractmethod
+from dataclasses import dataclass
 from decimal import Decimal
-from typing import Dict, List, Optional
+from typing import Any, Dict, List, Optional
 from src.core.orm_models import Order
 from src.core.models import Candlestick, Position
 
@@ -15,6 +16,15 @@ class InsufficientFundsError(ExchangeError):
 class NetworkError(ExchangeError):
     """Raised when there is a network connectivity issue with the exchange."""
     pass
+
+@dataclass(frozen=True)
+class ExchangeOrderSnapshot:
+    """Adapter-neutral view of an exchange order used for recovery checks."""
+
+    client_order_id: str
+    exchange_order_id: Optional[str]
+    status: str
+    raw: Optional[dict[str, Any]] = None
 
 class IExchangeAdapter(ABC):
     """
@@ -61,6 +71,14 @@ class IExchangeAdapter(ABC):
         rolled out across adapters.
         """
         return self.cancel_order(client_order_id, product_id)
+
+    def get_order_by_client_id(
+        self,
+        client_order_id: str,
+        product_id: str,
+    ) -> Optional[ExchangeOrderSnapshot]:
+        """Return an exchange order snapshot by client order ID if supported."""
+        return None
 
     @abstractmethod
     def get_balance(self, asset: str) -> Decimal:
