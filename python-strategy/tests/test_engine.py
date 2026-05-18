@@ -164,6 +164,32 @@ class TestEngineInit:
         assert engine._signal_processor.registry is engine._registry
         assert engine._signal_processor.execution_engine is engine.execution_engine
 
+    def test_startup_reconcile_skipped_when_audit_external_orders_disabled(self, engine):
+        """Startup order reconciliation should only run for audited external orders."""
+        engine.execution_engine.reconcile_recoverable_client_orders = MagicMock()
+
+        engine._reconcile_recoverable_orders_on_startup()
+
+        engine.execution_engine.reconcile_recoverable_client_orders.assert_not_called()
+
+    def test_startup_reconcile_runs_when_audit_external_orders_enabled(self, mock_db_session, mock_clock):
+        """Audited external order mode should reconcile recoverable orders on startup."""
+        with patch("src.core.engine.create_redis_client") as mock_factory:
+            mock_factory.return_value = MagicMock()
+            engine = StrategyEngine(
+                db_session=mock_db_session,
+                clock=mock_clock,
+                adapter=MagicMock(),
+                audit_external_orders=True,
+            )
+        engine.execution_engine.reconcile_recoverable_client_orders = MagicMock(
+            return_value={"recoverable_count": 2}
+        )
+
+        engine._reconcile_recoverable_orders_on_startup()
+
+        engine.execution_engine.reconcile_recoverable_client_orders.assert_called_once_with()
+
 
 # =============================================================================
 # add_strategy (legacy)

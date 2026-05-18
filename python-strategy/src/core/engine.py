@@ -124,11 +124,23 @@ class StrategyEngine:
         """
         self._check_system_state()
         self._reconcile_balance()
+        self._reconcile_recoverable_orders_on_startup()
         self._start_heartbeat()
         self._start_command_listener()
         
         # Initial scan to discover strategies
         self.scan_strategies()
+
+    def _reconcile_recoverable_orders_on_startup(self) -> None:
+        """Record startup order reconciliation for audited external orders."""
+        if not self.execution_engine.audit_external_orders:
+            return
+
+        summary = self.execution_engine.reconcile_recoverable_client_orders()
+        logger.info(
+            "Startup order reconciliation complete: %s recoverable orders",
+            summary["recoverable_count"],
+        )
 
     def _start_command_listener(self):
         """
