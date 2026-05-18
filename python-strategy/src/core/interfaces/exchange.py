@@ -17,6 +17,10 @@ class NetworkError(ExchangeError):
     """Raised when there is a network connectivity issue with the exchange."""
     pass
 
+class ExchangeOrderLookupUnsupported(ExchangeError):
+    """Raised when an adapter cannot query orders by client order ID."""
+    pass
+
 @dataclass(frozen=True)
 class ExchangeOrderSnapshot:
     """Adapter-neutral view of an exchange order used for recovery checks."""
@@ -78,7 +82,9 @@ class IExchangeAdapter(ABC):
         product_id: str,
     ) -> Optional[ExchangeOrderSnapshot]:
         """Return an exchange order snapshot by client order ID if supported."""
-        return None
+        raise ExchangeOrderLookupUnsupported(
+            f"{type(self).__name__} does not support client order lookup"
+        )
 
     @abstractmethod
     def get_balance(self, asset: str) -> Decimal:

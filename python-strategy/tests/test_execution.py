@@ -17,6 +17,7 @@ from decimal import Decimal
 
 from src.core.execution import ExecutionEngine
 from src.core.interfaces.exchange import ExchangeError
+from src.core.interfaces.exchange import ExchangeOrderLookupUnsupported
 from src.core.models import OrderStatus, SignalType
 from src.core.client_order_id import generate_client_order_id, parse_client_order_id
 
@@ -539,7 +540,7 @@ class TestAuditedExecution:
         assert payload["recoverable_count"] == 2
         assert payload["result_counts"] == {
             "exchange_found": 1,
-            "exchange_not_found_or_lookup_unsupported": 1,
+            "exchange_not_found": 1,
         }
         assert payload["decision_counts"] == {
             "exchange_open": 1,
@@ -565,7 +566,7 @@ class TestAuditedExecution:
                 "product_id": missing_order.product_id,
                 "strategy_id": missing_order.strategy_id,
                 "local_exchange_order_id": None,
-                "result": "exchange_not_found_or_lookup_unsupported",
+                "result": "exchange_not_found",
                 "decision": "exchange_unknown",
                 "exchange_order_id": None,
                 "exchange_status": None,
@@ -590,6 +591,34 @@ class TestAuditedExecution:
 
         with pytest.raises(RuntimeError, match="requires db_session_factory"):
             engine.reconcile_recoverable_client_orders()
+
+    def test_reconcile_recoverable_client_orders_distinguishes_unsupported_lookup(
+        self, mock_db_session, mock_clock, mock_exchange_adapter, mock_order_repo, order_factory
+    ):
+        def unsupported_lookup(client_order_id, product_id):
+            raise ExchangeOrderLookupUnsupported("unsupported")
+
+        mock_exchange_adapter.get_order_by_client_id = unsupported_lookup
+        engine = ExecutionEngine(
+            db_session=mock_db_session,
+            clock=mock_clock,
+            adapter=mock_exchange_adapter,
+            order_repository=mock_order_repo,
+            db_session_factory=lambda: nullcontext(mock_db_session),
+        )
+        mock_order_repo.add_order(
+            order_factory(
+                order_id="recoverable",
+                client_order_id="client-1",
+                status=OrderStatus.SUBMITTED.value,
+            )
+        )
+
+        payload = engine.reconcile_recoverable_client_orders()
+
+        assert payload["result_counts"] == {"exchange_lookup_unsupported": 1}
+        assert payload["decision_counts"] == {"exchange_unknown": 1}
+        assert payload["results"][0]["result"] == "exchange_lookup_unsupported"
 
     @pytest.mark.parametrize(
         ("local_status", "exchange_status", "expected"),

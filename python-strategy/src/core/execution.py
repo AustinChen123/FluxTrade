@@ -6,6 +6,7 @@ from sqlalchemy.orm import Session
 from src.core.models import Signal, SignalType, Candlestick, OrderSide, OrderStatus
 from src.core.order_manager import OrderManager
 from src.core.interfaces.exchange import IExchangeAdapter, ExchangeError
+from src.core.interfaces.exchange import ExchangeOrderLookupUnsupported
 from src.core.clock import Clock
 from src.core.interfaces import IOrderRepository
 from src.core.journal import StrategyJournal
@@ -114,15 +115,16 @@ class ExecutionEngine:
         decision_counts: dict[str, int] = {}
 
         for order in orders:
-            snapshot = self.adapter.get_order_by_client_id(
-                order.client_order_id,
-                order.product_id,
-            )
-            result = (
-                "exchange_found"
-                if snapshot is not None
-                else "exchange_not_found_or_lookup_unsupported"
-            )
+            try:
+                snapshot = self.adapter.get_order_by_client_id(
+                    order.client_order_id,
+                    order.product_id,
+                )
+            except ExchangeOrderLookupUnsupported:
+                snapshot = None
+                result = "exchange_lookup_unsupported"
+            else:
+                result = "exchange_found" if snapshot is not None else "exchange_not_found"
             result_counts[result] = result_counts.get(result, 0) + 1
             decision = self._reconcile_decision(order.status, snapshot.status if snapshot else None)
             decision_counts[decision] = decision_counts.get(decision, 0) + 1
