@@ -15,6 +15,7 @@ from src.core.orm_models import StrategyState, StrategyStateTransition
 from src.core.strategy_state_manager import (
     InvalidStrategyStateTransition,
     STATE_CHANGE_CHANNEL,
+    StaleStrategyStateVersion,
     StrategyStateManager,
 )
 
@@ -34,10 +35,23 @@ class _FakeQuery:
         self._strategy_id = kwargs.get("strategy_id")
         return self
 
+    def filter(self, *criteria):
+        return self
+
     def first(self):
         if self._model is StrategyState:
             return self._db.states.get(self._strategy_id)
         return None
+
+    def update(self, values, synchronize_session=False):
+        if self._model is not StrategyState or self._db.force_stale_update:
+            return 0
+        state = self._db.states.get(self._strategy_id)
+        if state is None:
+            return 0
+        for key, value in values.items():
+            setattr(state, key, value)
+        return 1
 
 
 class _FakeSession:
@@ -45,6 +59,8 @@ class _FakeSession:
         self.states = {state.strategy_id: state for state in states}
         self.transitions: list[StrategyStateTransition] = []
         self.commit_count = 0
+        self.rollback_count = 0
+        self.force_stale_update = False
 
     def query(self, model):
         return _FakeQuery(model, self)
@@ -56,9 +72,12 @@ class _FakeSession:
     def commit(self):
         self.commit_count += 1
 
+    def rollback(self):
+        self.rollback_count += 1
+
 
 def _state(strategy_id: str, status: StrategyStatus) -> StrategyState:
-    return StrategyState(strategy_id=strategy_id, status=status.value)
+    return StrategyState(strategy_id=strategy_id, status=status.value, version=0)
 
 
 def _manager(db: _FakeSession, redis_client=None) -> StrategyStateManager:
@@ -96,6 +115,7 @@ def test_transition_to_stopped_updates_db_cache_history_and_pubsub() -> None:
     assert db.states["s1"].stopped_at is not None
     assert manager.is_stopped("s1") is True
     assert db.commit_count == 1
+    assert db.states["s1"].version == 1
     assert len(db.transitions) == 1
     transition = db.transitions[0]
     assert transition.from_status == StrategyStatus.ACTIVE.value
@@ -141,6 +161,22 @@ def test_force_resume_from_error_records_recovered_at() -> None:
     assert manager.is_running("s1") is True
     assert db.transitions[0].to_status == StrategyStatus.ACTIVE.value
     assert db.transitions[0].reason == "operator confirmed"
+
+
+def test_stale_version_rolls_back_and_raises() -> None:
+    redis_client = MagicMock()
+    db = _FakeSession([_state("s1", StrategyStatus.ACTIVE)])
+    db.force_stale_update = True
+    manager = _manager(db, redis_client)
+
+    with pytest.raises(StaleStrategyStateVersion):
+        manager.transition_to_stopped("s1")
+
+    assert db.rollback_count == 1
+    assert db.commit_count == 0
+    assert db.states["s1"].status == StrategyStatus.ACTIVE.value
+    assert db.transitions == []
+    redis_client.publish.assert_not_called()
 
 
 def test_missing_strategy_raises_key_error() -> None:

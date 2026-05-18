@@ -23,6 +23,10 @@ class InvalidStrategyStateTransition(RuntimeError):
     """Raised when a requested strategy state transition is not allowed."""
 
 
+class StaleStrategyStateVersion(RuntimeError):
+    """Raised when optimistic locking detects a concurrent state update."""
+
+
 class StrategyStateManager:
     """Manage strategy lifecycle state with a local O(1) status cache."""
 
@@ -188,14 +192,31 @@ class StrategyStateManager:
                     f"{strategy_id} is in ERROR and requires force=True to resume"
                 )
 
-            state.status = to_status.value
+            expected_version = int(state.version or 0)
+            update_values = {
+                "status": to_status.value,
+                "version": expected_version + 1,
+            }
             if to_status == StrategyStatus.ERROR:
-                state.last_error_message = reason
-                state.entered_error_at = now
+                update_values["last_error_message"] = reason
+                update_values["entered_error_at"] = now
             elif to_status == StrategyStatus.STOPPED:
-                state.stopped_at = now
+                update_values["stopped_at"] = now
             elif to_status == StrategyStatus.ACTIVE:
-                state.recovered_at = now if from_status == StrategyStatus.ERROR else state.recovered_at
+                if from_status == StrategyStatus.ERROR:
+                    update_values["recovered_at"] = now
+
+            updated = (
+                db.query(StrategyState)
+                .filter_by(strategy_id=strategy_id)
+                .filter(StrategyState.version == expected_version)
+                .update(update_values, synchronize_session=False)
+            )
+            if updated != 1:
+                db.rollback()
+                raise StaleStrategyStateVersion(
+                    f"{strategy_id} expected version {expected_version}"
+                )
 
             db.add(
                 StrategyStateTransition(
