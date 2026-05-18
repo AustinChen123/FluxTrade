@@ -87,6 +87,61 @@ class TestRiskManagerBalanceChecks:
 class TestRiskManagerExposureChecks:
     """Tests for position exposure limits."""
 
+    def test_reject_entry_when_single_order_notional_exceeds_nav_limit(
+        self, mock_account_service, signal_factory
+    ):
+        """Single-order notional rule should reject oversized limit entries."""
+        mock_account_service.set_balance(Decimal("100000"))
+        risk_manager = RiskManager(mock_account_service)
+        signal = signal_factory(
+            signal_type=SignalType.LONG,
+            price=Decimal("60000"),
+            quantity=Decimal("0.1"),
+        )
+
+        is_allowed, reason = risk_manager.check_risk(signal)
+
+        assert is_allowed is False
+        assert "single_order_notional_exceeded" in reason
+
+    def test_reject_entry_when_price_sanity_context_fails(
+        self, mock_account_service, signal_factory
+    ):
+        """Price sanity rule should reject outlier prices when bid/ask are supplied."""
+        mock_account_service.set_balance(Decimal("100000"))
+        risk_manager = RiskManager(mock_account_service)
+        signal = signal_factory(
+            signal_type=SignalType.LONG,
+            price=Decimal("103.01"),
+            quantity=Decimal("0.01"),
+        )
+
+        is_allowed, reason = risk_manager.check_risk(
+            signal,
+            best_bid=Decimal("99"),
+            best_ask=Decimal("101"),
+        )
+
+        assert is_allowed is False
+        assert "price_sanity_check_failed" in reason
+
+    def test_price_sanity_is_skipped_without_market_context(
+        self, mock_account_service, signal_factory
+    ):
+        """Existing callers without bid/ask context should remain compatible."""
+        mock_account_service.set_balance(Decimal("100000"))
+        risk_manager = RiskManager(mock_account_service)
+        signal = signal_factory(
+            signal_type=SignalType.LONG,
+            price=Decimal("103.01"),
+            quantity=Decimal("0.01"),
+        )
+
+        is_allowed, reason = risk_manager.check_risk(signal)
+
+        assert is_allowed is True
+        assert reason == "PASS"
+
     def test_reject_entry_when_max_exposure_reached(
         self, mock_account_service, signal_factory, position_factory
     ):
@@ -201,8 +256,8 @@ class TestRiskManagerExposureChecks:
         """Configured rule should reject projected same-side exposure."""
         mock_account_service.set_balance(Decimal("100000"))
         position = position_factory(
-            quantity=Decimal("1.5"),
-            entry_price=Decimal("40000"),
+            quantity=Decimal("1.99"),
+            entry_price=Decimal("50000"),
         )
         mock_account_service.set_position(position)
         risk_manager = RiskManager(
@@ -212,7 +267,7 @@ class TestRiskManagerExposureChecks:
         signal = signal_factory(
             signal_type=SignalType.LONG,
             price=Decimal("50000"),
-            quantity=Decimal("0.6"),
+            quantity=Decimal("0.02"),
         )
 
         is_allowed, reason = risk_manager.check_risk(
@@ -237,7 +292,7 @@ class TestRiskManagerExposureChecks:
         signal = signal_factory(
             signal_type=SignalType.SHORT,
             price=Decimal("50000"),
-            quantity=Decimal("1"),
+            quantity=Decimal("0.05"),
         )
 
         is_allowed, reason = risk_manager.check_risk(

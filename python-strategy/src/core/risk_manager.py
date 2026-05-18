@@ -6,6 +6,8 @@ from src.core.redis_factory import create_redis_client
 from src.core.risk_config import RiskConfig
 from src.core.risk_rules import RuleStatus
 from src.core.risk_rules.max_position_notional import MaxPositionNotionalRule
+from src.core.risk_rules.price_sanity_check import PriceSanityCheckRule
+from src.core.risk_rules.single_order_notional import SingleOrderNotionalRule
 
 if TYPE_CHECKING:
     from src.core.capital_allocator import CapitalAllocator
@@ -80,17 +82,28 @@ class RiskManager:
         capital_allocator: Optional["CapitalAllocator"] = None,
         max_exposure_per_strategy: Optional[Decimal] = None,
         risk_config: Optional[RiskConfig] = None,
+        single_order_rule: Optional[SingleOrderNotionalRule] = None,
+        price_sanity_rule: Optional[PriceSanityCheckRule] = None,
         max_position_rule: Optional[MaxPositionNotionalRule] = None,
     ):
         self.account_service = account_service
         self.risk_config = risk_config or RiskConfig.from_env()
+        self.single_order_rule = single_order_rule or SingleOrderNotionalRule(self.risk_config)
+        self.price_sanity_rule = price_sanity_rule or PriceSanityCheckRule(self.risk_config)
         self.max_position_rule = max_position_rule or MaxPositionNotionalRule(self.risk_config)
         self.capital_allocator = capital_allocator
         self.max_exposure_per_strategy = (
             max_exposure_per_strategy or self.risk_config.max_position_notional
         )
 
-    def check_risk(self, signal: Signal, current_price: Optional[Decimal] = None) -> tuple[bool, str]:
+    def check_risk(
+        self,
+        signal: Signal,
+        current_price: Optional[Decimal] = None,
+        *,
+        best_bid: Optional[Decimal] = None,
+        best_ask: Optional[Decimal] = None,
+    ) -> tuple[bool, str]:
         """
         Evaluates the signal against risk rules.
         Returns (True, "PASS") if safe to proceed, (False, reason) otherwise.
@@ -121,7 +134,28 @@ class RiskManager:
                 logger.warning("RISK_REJECTED: %s signal_type=%s", msg, signal.type)
                 return False, msg
 
-        # Rule 2: Max Exposure Check (uses current market price)
+        # Rule 2: Single-order notional check.
+        if is_entry:
+            nav = self.account_service.get_balance()
+            rule_status, rule_reason = self.single_order_rule.evaluate(signal, nav)
+            if rule_status == RuleStatus.REJECT:
+                msg = f"REJECT: {rule_reason}"
+                logger.warning("RISK_REJECTED: %s", msg)
+                return False, msg
+
+        # Rule 3: Price sanity check when market-depth context is available.
+        if is_entry and (best_bid is not None or best_ask is not None):
+            rule_status, rule_reason = self.price_sanity_rule.evaluate(
+                signal,
+                best_bid=best_bid,
+                best_ask=best_ask,
+            )
+            if rule_status == RuleStatus.REJECT:
+                msg = f"REJECT: {rule_reason}"
+                logger.warning("RISK_REJECTED: %s", msg)
+                return False, msg
+
+        # Rule 4: Max Exposure Check (uses current market price)
         position = self.account_service.get_position(signal.strategy_id, signal.product_id)
         if position:
             price_for_exposure = current_price if current_price is not None else position.entry_price
