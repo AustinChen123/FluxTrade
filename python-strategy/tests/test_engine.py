@@ -731,8 +731,9 @@ class TestStartStrategy:
         assert "nonexistent.py::X" not in engine.strategy_instances
 
     def test_start_loaded_strategy_activates(self, engine, mock_strategy_class):
-        """Starting a loaded strategy should register instance and set ACTIVE."""
+        """Starting a loaded strategy should register instance and transition ACTIVE."""
         engine.loaded_classes["test.py::MyStrat"] = mock_strategy_class
+        engine._strategy_state_manager.transition_to_running = MagicMock()
 
         mock_state = MagicMock()
         mock_state.status = "READY"
@@ -744,7 +745,12 @@ class TestStartStrategy:
         engine.start_strategy("test.py::MyStrat")
 
         assert "test.py::MyStrat" in engine.strategy_instances
-        assert mock_state.status == "ACTIVE"
+        engine._strategy_state_manager.transition_to_running.assert_called_once_with(
+            "test.py::MyStrat",
+            actor="operator",
+            force=False,
+            reason=None,
+        )
 
     def test_start_wrong_state_rejected(self, engine, mock_strategy_class):
         """Strategy in ERROR state should not be started."""
@@ -766,6 +772,7 @@ class TestStopStrategy:
     def test_stop_active_strategy(self, engine, strategy_instance):
         """Stopping an active strategy should remove it from instances."""
         engine.add_strategy(strategy_instance)
+        engine._strategy_state_manager.transition_to_stopped = MagicMock()
 
         mock_state = MagicMock()
         mock_db = MagicMock()
@@ -775,7 +782,11 @@ class TestStopStrategy:
         engine.stop_strategy("test_strat")
 
         assert "test_strat" not in engine.strategy_instances
-        assert mock_state.status == "STOPPED"
+        engine._strategy_state_manager.transition_to_stopped.assert_called_once_with(
+            "test_strat",
+            actor="operator",
+            reason=None,
+        )
 
     def test_stop_inactive_strategy_warns(self, engine):
         """Stopping a non-active strategy should not crash."""

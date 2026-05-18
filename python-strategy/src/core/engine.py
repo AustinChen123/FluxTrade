@@ -282,10 +282,15 @@ class StrategyEngine:
                 db.commit()
                 logger.error("❌ Test Run failed for %s: %s", strategy_id, e)
 
-    def start_strategy(self, strategy_id: str):
-        """
-        Activates a strategy for live execution.
-        """
+    def activate_strategy(
+        self,
+        strategy_id: str,
+        *,
+        actor: str = "operator",
+        reason: Optional[str] = None,
+        force: bool = False,
+    ) -> None:
+        """Instantiate/register a strategy and transition it to ACTIVE."""
         logger.info("🚀 Starting Strategy: %s", strategy_id)
         if strategy_id not in self.loaded_classes:
             logger.error("Strategy %s not loaded.", strategy_id)
@@ -295,7 +300,7 @@ class StrategyEngine:
             state = db.query(StrategyState).filter(StrategyState.strategy_id == strategy_id).first()
             # Allow READY or WARNING (with manual override implied by START command)
             startable = {StrategyStatus.READY, StrategyStatus.WARNING, StrategyStatus.STOPPED, StrategyStatus.DISCOVERED}
-            if not state or state.status not in startable:
+            if not state or (state.status not in startable and not force):
                  logger.error("Strategy %s is not in startable state (Current: %s)", strategy_id, state.status if state else 'None')
                  return
 
@@ -305,49 +310,94 @@ class StrategyEngine:
                 
                 strategy_cls = self.loaded_classes[strategy_id]
                 instance = strategy_cls(strategy_id, product_id)
-                
-                # Register (thread-safe)
-                with self._strategy_lock:
-                    self.strategy_instances[strategy_id] = instance
-                    if product_id not in self.strategies:
-                        self.strategies[product_id] = []
-                    self.strategies[product_id].append(instance)
-                    ACTIVE_STRATEGIES.set(len(self.strategy_instances))
-                
-                state.status = StrategyStatus.ACTIVE
+                self._register_strategy_instance(instance)
                 state.uptime_start = int(time.time() * 1000)
                 db.commit()
                 logger.info("🔥 Strategy %s is now ACTIVE for %s", strategy_id, product_id)
 
             except Exception as e:
-                state.status = StrategyStatus.ERROR
+                self._unregister_strategy_instance(strategy_id)
                 state.performance_json = json.dumps({"error": str(e)})
                 db.commit()
+                self._strategy_state_manager.transition_to_error(
+                    strategy_id,
+                    str(e),
+                    actor="system",
+                )
                 logger.error("❌ Failed to start %s: %s", strategy_id, e)
-
-    def stop_strategy(self, strategy_id: str):
-        """
-        Deactivates an active strategy.
-        """
-        logger.info("🛑 Stopping Strategy: %s", strategy_id)
-        with self._strategy_lock:
-            if strategy_id not in self.strategy_instances:
-                logger.warning("Strategy %s is not active.", strategy_id)
                 return
 
-            instance = self.strategy_instances.pop(strategy_id)
+        try:
+            self._strategy_state_manager.transition_to_running(
+                strategy_id,
+                actor=actor,
+                force=force,
+                reason=reason,
+            )
+        except Exception as e:
+            self._unregister_strategy_instance(strategy_id)
+            logger.error("❌ Failed to transition %s to ACTIVE: %s", strategy_id, e)
+
+    def start_strategy(self, strategy_id: str):
+        """Backward-compatible wrapper for legacy callers."""
+        self.activate_strategy(strategy_id)
+
+    def deactivate_strategy(
+        self,
+        strategy_id: str,
+        *,
+        actor: str = "operator",
+        reason: Optional[str] = None,
+    ) -> None:
+        """Unregister a strategy and transition it to STOPPED."""
+        logger.info("🛑 Stopping Strategy: %s", strategy_id)
+        if not self._unregister_strategy_instance(strategy_id):
+            logger.warning("Strategy %s is not active.", strategy_id)
+            return
+
+        self._strategy_state_manager.transition_to_stopped(
+            strategy_id,
+            actor=actor,
+            reason=reason,
+        )
+
+        logger.info("✅ Strategy %s stopped.", strategy_id)
+
+    def stop_strategy(self, strategy_id: str):
+        """Backward-compatible wrapper for legacy callers."""
+        self.deactivate_strategy(strategy_id)
+
+    def _register_strategy_instance(self, instance: BaseStrategy) -> None:
+        """Register a live strategy instance in runtime-only structures."""
+        with self._strategy_lock:
+            old = self.strategy_instances.get(instance.strategy_id)
+            if old is not None and old.product_id in self.strategies:
+                self.strategies[old.product_id] = [
+                    s for s in self.strategies[old.product_id]
+                    if s.strategy_id != instance.strategy_id
+                ]
+            self.strategy_instances[instance.strategy_id] = instance
+            if instance.product_id not in self.strategies:
+                self.strategies[instance.product_id] = []
+            self.strategies[instance.product_id].append(instance)
+            self._registry.register(instance)
+            ACTIVE_STRATEGIES.set(len(self.strategy_instances))
+
+    def _unregister_strategy_instance(self, strategy_id: str) -> bool:
+        """Remove a live strategy instance from runtime-only structures."""
+        with self._strategy_lock:
+            instance = self.strategy_instances.pop(strategy_id, None)
+            if instance is None:
+                return False
             product_id = instance.product_id
             if product_id in self.strategies:
-                self.strategies[product_id] = [s for s in self.strategies[product_id] if s.strategy_id != strategy_id]
+                self.strategies[product_id] = [
+                    s for s in self.strategies[product_id]
+                    if s.strategy_id != strategy_id
+                ]
+            self._registry.unregister(strategy_id)
             ACTIVE_STRATEGIES.set(len(self.strategy_instances))
-        
-        with self._db_session_factory() as db:
-            state = db.query(StrategyState).filter(StrategyState.strategy_id == strategy_id).first()
-            if state:
-                state.status = StrategyStatus.STOPPED
-                db.commit()
-        
-        logger.info("✅ Strategy %s stopped.", strategy_id)
+            return True
 
     def _reconcile_balance(self):
         """
