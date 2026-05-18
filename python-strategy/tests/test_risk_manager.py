@@ -171,6 +171,53 @@ class TestRiskManagerExposureChecks:
         assert is_allowed is False
         assert "daily_loss_circuit_breaker_triggered" in reason
 
+    def test_daily_loss_circuit_breaker_transitions_strategy_to_error(
+        self, mock_account_service, signal_factory
+    ):
+        """Circuit breaker should move strategy state to ERROR when manager is injected."""
+        mock_account_service.set_balance(Decimal("100000"))
+        state_manager = MagicMock()
+        risk_manager = RiskManager(
+            mock_account_service,
+            state_manager=state_manager,
+        )
+        signal = signal_factory(signal_type=SignalType.LONG)
+
+        is_allowed, reason = risk_manager.check_risk(
+            signal,
+            daily_start_nav=Decimal("100000"),
+            current_nav=Decimal("94990"),
+        )
+
+        assert is_allowed is False
+        state_manager.transition_to_error.assert_called_once_with(
+            "test_strategy",
+            reason.removeprefix("REJECT: "),
+            actor="system",
+        )
+
+    def test_daily_loss_rejects_even_if_state_transition_fails(
+        self, mock_account_service, signal_factory
+    ):
+        """Risk rejection should remain fail-closed if ERROR transition fails."""
+        mock_account_service.set_balance(Decimal("100000"))
+        state_manager = MagicMock()
+        state_manager.transition_to_error.side_effect = RuntimeError("db unavailable")
+        risk_manager = RiskManager(
+            mock_account_service,
+            state_manager=state_manager,
+        )
+        signal = signal_factory(signal_type=SignalType.LONG)
+
+        is_allowed, reason = risk_manager.check_risk(
+            signal,
+            daily_start_nav=Decimal("100000"),
+            current_nav=Decimal("94990"),
+        )
+
+        assert is_allowed is False
+        assert "daily_loss_circuit_breaker_triggered" in reason
+
     def test_daily_loss_requires_complete_nav_context(
         self, mock_account_service, signal_factory
     ):

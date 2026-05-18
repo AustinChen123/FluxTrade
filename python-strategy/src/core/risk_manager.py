@@ -1,6 +1,6 @@
 import logging
 from decimal import Decimal
-from typing import TYPE_CHECKING, Optional
+from typing import TYPE_CHECKING, Optional, Any
 from src.core.models import Signal, SignalType, Position, PositionSide
 from src.core.redis_factory import create_redis_client
 from src.core.risk_config import RiskConfig
@@ -90,6 +90,7 @@ class RiskManager:
         order_rate_limit_rule: Optional[OrderRateLimitRule] = None,
         redis_client=None,
         max_position_rule: Optional[MaxPositionNotionalRule] = None,
+        state_manager: Optional[Any] = None,
     ):
         self.account_service = account_service
         self.risk_config = risk_config or RiskConfig.from_env()
@@ -105,6 +106,7 @@ class RiskManager:
             )
         self.max_position_rule = max_position_rule or MaxPositionNotionalRule(self.risk_config)
         self.capital_allocator = capital_allocator
+        self.state_manager = state_manager
         self.max_exposure_per_strategy = (
             max_exposure_per_strategy or self.risk_config.max_position_notional
         )
@@ -170,6 +172,8 @@ class RiskManager:
             )
             if rule_status in {RuleStatus.REJECT, RuleStatus.CIRCUIT_BREAKER_TRIGGERED}:
                 msg = f"REJECT: {rule_reason}"
+                if rule_status == RuleStatus.CIRCUIT_BREAKER_TRIGGERED:
+                    self._transition_strategy_to_error(signal.strategy_id, rule_reason or msg)
                 logger.warning("RISK_REJECTED: %s", msg)
                 return False, msg
 
@@ -233,6 +237,22 @@ class RiskManager:
                 return False, msg
 
         return True, "PASS"
+
+    def _transition_strategy_to_error(self, strategy_id: str, reason: str) -> None:
+        if self.state_manager is None:
+            return
+        try:
+            self.state_manager.transition_to_error(
+                strategy_id,
+                reason,
+                actor="system",
+            )
+        except Exception as exc:
+            logger.error(
+                "Failed to transition %s to ERROR after risk circuit breaker: %s",
+                strategy_id,
+                exc,
+            )
 
     def calculate_position_size(self, entry_price: Decimal, stop_loss_price: Decimal, risk_percent: Decimal = Decimal("0.02")) -> Decimal:
         """
