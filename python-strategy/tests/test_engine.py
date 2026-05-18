@@ -167,6 +167,7 @@ class TestEngineInit:
         assert isinstance(engine._strategy_state_manager, StrategyStateManager)
         assert engine._strategy_state_manager._redis_client is engine.redis_client
         assert engine._signal_processor.state_manager is engine._strategy_state_manager
+        assert engine.risk_manager.state_manager is engine._strategy_state_manager
 
     def test_startup_initializes_strategy_state_cache(self, engine):
         """Startup should load strategy state into the manager cache."""

@@ -72,10 +72,17 @@ class StrategyEngine:
         self._strategy_lock = threading.Lock()
         self._registry = StrategyRegistry()
         self.redis_client = create_redis_client()
+        self._strategy_state_manager = StrategyStateManager(
+            self._db_session_factory,
+            self.redis_client,
+        )
 
         # Initialize Services
         self.account_service = account_service if account_service else AccountService()
-        self.risk_manager = RiskManager(self.account_service)
+        self.risk_manager = RiskManager(
+            self.account_service,
+            state_manager=self._strategy_state_manager,
+        )
 
         # Use pre-created adapter or build from config
         if adapter is None:
@@ -101,10 +108,6 @@ class StrategyEngine:
         )
         self._lifecycle_adapter = _EngineLifecycleAdapter(self)
         self._health_monitor = HealthMonitor(self._registry)
-        self._strategy_state_manager = StrategyStateManager(
-            self._db_session_factory,
-            self.redis_client,
-        )
         self._command_router = CommandRouter(
             self._registry,
             self._lifecycle_adapter,
