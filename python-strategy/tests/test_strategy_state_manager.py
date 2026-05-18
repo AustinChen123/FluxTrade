@@ -9,9 +9,11 @@ from contextlib import nullcontext
 from unittest.mock import MagicMock
 
 import pytest
+from sqlalchemy import create_engine, select, text
+from sqlalchemy.orm import sessionmaker
 
 from src.core.models import StrategyStatus
-from src.core.orm_models import StrategyState, StrategyStateTransition
+from src.core.orm_models import Strategy, StrategyState, StrategyStateTransition
 from src.core.strategy_state_manager import (
     InvalidStrategyStateTransition,
     STATE_CHANGE_CHANNEL,
@@ -295,3 +297,89 @@ def test_subscriber_ignores_malformed_json_and_continues() -> None:
     manager.shutdown()
 
     assert manager.is_stopped("s1") is True
+
+
+def test_transition_history_persists_append_only_rows_with_sqlite(tmp_path) -> None:
+    engine = create_engine(f"sqlite:///{tmp_path / 'strategy_state.db'}")
+    for table in [
+        Strategy.__table__,
+        StrategyState.__table__,
+    ]:
+        table.create(engine, checkfirst=True)
+    with engine.begin() as connection:
+        connection.execute(
+            text(
+                """
+                CREATE TABLE strategy_state_transitions (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    strategy_id VARCHAR NOT NULL,
+                    from_status VARCHAR(32) NOT NULL,
+                    to_status VARCHAR(32) NOT NULL,
+                    transitioned_at DATETIME NOT NULL,
+                    reason TEXT,
+                    actor VARCHAR(64)
+                )
+                """
+            )
+        )
+    session_factory = sessionmaker(bind=engine)
+    redis_client = MagicMock()
+
+    with session_factory() as session:
+        session.add(Strategy(id="s1", name="Strategy 1"))
+        session.add(
+            StrategyState(
+                strategy_id="s1",
+                status=StrategyStatus.ACTIVE.value,
+                version=0,
+            )
+        )
+        session.commit()
+
+    manager = StrategyStateManager(session_factory, redis_client)
+    manager.initialize_cache_from_db()
+    manager.transition_to_stopped("s1", actor="operator", reason="pause")
+    time.sleep(0.001)
+    manager.transition_to_running("s1", actor="operator", reason="resume")
+    time.sleep(0.001)
+    manager.transition_to_error("s1", "risk circuit breaker", actor="system")
+    time.sleep(0.001)
+    manager.transition_to_running(
+        "s1",
+        actor="operator",
+        force=True,
+        reason="manual recovery",
+    )
+
+    with session_factory() as session:
+        state = session.get(StrategyState, "s1")
+        transitions = list(
+            session.scalars(
+                select(StrategyStateTransition).order_by(StrategyStateTransition.id)
+            )
+        )
+
+    assert state.status == StrategyStatus.ACTIVE.value
+    assert state.version == 4
+    assert manager.is_running("s1") is True
+    assert [
+        (row.from_status, row.to_status, row.reason, row.actor)
+        for row in transitions
+    ] == [
+        (StrategyStatus.ACTIVE.value, StrategyStatus.STOPPED.value, "pause", "operator"),
+        (StrategyStatus.STOPPED.value, StrategyStatus.ACTIVE.value, "resume", "operator"),
+        (
+            StrategyStatus.ACTIVE.value,
+            StrategyStatus.ERROR.value,
+            "risk circuit breaker",
+            "system",
+        ),
+        (
+            StrategyStatus.ERROR.value,
+            StrategyStatus.ACTIVE.value,
+            "manual recovery",
+            "operator",
+        ),
+    ]
+    transitioned_at = [row.transitioned_at for row in transitions]
+    assert transitioned_at == sorted(transitioned_at)
