@@ -764,6 +764,8 @@ class TestScanStrategies:
             engine.scan_strategies()
 
         assert mock_state.status == "ERROR"
+        assert "traceback string" in mock_state.last_error_message
+        assert mock_state.entered_error_at is not None
 
 
 class TestStartStrategy:
@@ -873,6 +875,26 @@ class TestTestRunStrategy:
             engine.test_run_strategy("test.py::MyStrat", 1)
 
         assert mock_state.status == "WARNING"
+
+    def test_test_run_exception_sets_error_metadata(self, engine):
+        """Warm-up failures should satisfy ERROR state metadata constraints."""
+        class FailingStrategy:
+            def __init__(self, strategy_id, product_id):
+                raise RuntimeError("warm-up failed")
+
+        engine.loaded_classes["test.py::FailingStrat"] = FailingStrategy
+
+        mock_state = MagicMock()
+        mock_state.config_json = "{}"
+        mock_db = MagicMock()
+        mock_db.query.return_value.filter.return_value.first.return_value = mock_state
+        engine._db_session_factory = lambda: nullcontext(mock_db)
+
+        engine.test_run_strategy("test.py::FailingStrat", 1)
+
+        assert mock_state.status == "ERROR"
+        assert "warm-up failed" in mock_state.last_error_message
+        assert mock_state.entered_error_at is not None
 
 
 # =============================================================================

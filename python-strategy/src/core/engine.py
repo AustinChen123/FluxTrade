@@ -7,6 +7,7 @@ import traceback
 import uuid
 from contextlib import nullcontext
 from concurrent.futures import ThreadPoolExecutor
+from datetime import UTC, datetime
 from typing import Callable, ContextManager, List, Union, Optional, Dict, Type
 from sqlalchemy.orm import Session
 from src.core.models import Candlestick, Trade, Signal, SignalType, StrategyStatus
@@ -230,6 +231,8 @@ class StrategyEngine:
                     # It was a LoadError (traceback string)
                     state.status = StrategyStatus.ERROR
                     state.performance_json = json.dumps({"error": result})
+                    state.last_error_message = result
+                    state.entered_error_at = datetime.now(UTC)
                 
                 db.commit()
         logger.info("✅ Scan Complete. Total loaded: %s", len(self.loaded_classes))
@@ -279,6 +282,8 @@ class StrategyEngine:
                 error_trace = traceback.format_exc()
                 state.status = StrategyStatus.ERROR
                 state.performance_json = json.dumps({"error": error_trace})
+                state.last_error_message = error_trace
+                state.entered_error_at = datetime.now(UTC)
                 db.commit()
                 logger.error("❌ Test Run failed for %s: %s", strategy_id, e)
 
