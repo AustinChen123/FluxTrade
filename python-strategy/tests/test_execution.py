@@ -502,6 +502,89 @@ class TestAuditedExecution:
 
         mock_db_session.rollback.assert_called_once()
 
+    def test_reconcile_recoverable_client_orders_records_exchange_snapshots(
+        self, mock_db_session, mock_clock, mock_exchange_adapter, mock_order_repo, order_factory
+    ):
+        engine = ExecutionEngine(
+            db_session=mock_db_session,
+            clock=mock_clock,
+            adapter=mock_exchange_adapter,
+            order_repository=mock_order_repo,
+            db_session_factory=lambda: nullcontext(mock_db_session),
+        )
+        found_order = order_factory(
+            order_id="found-local",
+            client_order_id="client-found",
+            status=OrderStatus.SUBMITTED.value,
+            exchange_order_id="EX-LOCAL",
+        )
+        missing_order = order_factory(
+            order_id="missing-local",
+            client_order_id="client-missing",
+            status=OrderStatus.SUBMITTED_UNCONFIRMED.value,
+            exchange_order_id=None,
+        )
+        ignored_order = order_factory(
+            order_id="closed-local",
+            client_order_id="client-closed",
+            status=OrderStatus.CANCELLED.value,
+        )
+        mock_order_repo.add_order(found_order)
+        mock_order_repo.add_order(missing_order)
+        mock_order_repo.add_order(ignored_order)
+        mock_exchange_adapter.open_orders.append(found_order)
+
+        payload = engine.reconcile_recoverable_client_orders()
+
+        assert payload["recoverable_count"] == 2
+        assert payload["result_counts"] == {
+            "exchange_found": 1,
+            "exchange_not_found_or_lookup_unsupported": 1,
+        }
+        assert payload["results"] == [
+            {
+                "order_id": "found-local",
+                "client_order_id": "client-found",
+                "local_status": OrderStatus.SUBMITTED.value,
+                "product_id": found_order.product_id,
+                "strategy_id": found_order.strategy_id,
+                "local_exchange_order_id": "EX-LOCAL",
+                "result": "exchange_found",
+                "exchange_order_id": "EX-LOCAL",
+                "exchange_status": OrderStatus.SUBMITTED.value,
+            },
+            {
+                "order_id": "missing-local",
+                "client_order_id": "client-missing",
+                "local_status": OrderStatus.SUBMITTED_UNCONFIRMED.value,
+                "product_id": missing_order.product_id,
+                "strategy_id": missing_order.strategy_id,
+                "local_exchange_order_id": None,
+                "result": "exchange_not_found_or_lookup_unsupported",
+                "exchange_order_id": None,
+                "exchange_status": None,
+            },
+        ]
+        event = mock_db_session.add.call_args.args[0]
+        assert event.event_type == "reconcile"
+        assert event.event_subtype == "startup_exchange_reconcile"
+        assert event.payload == payload
+        mock_db_session.commit.assert_called_once()
+        mock_db_session.rollback.assert_not_called()
+
+    def test_reconcile_recoverable_client_orders_requires_session_factory(
+        self, mock_db_session, mock_clock, mock_exchange_adapter, mock_order_repo
+    ):
+        engine = ExecutionEngine(
+            db_session=mock_db_session,
+            clock=mock_clock,
+            adapter=mock_exchange_adapter,
+            order_repository=mock_order_repo,
+        )
+
+        with pytest.raises(RuntimeError, match="requires db_session_factory"):
+            engine.reconcile_recoverable_client_orders()
+
 
 class TestCancelOrder:
     """Tests for execution-level cancellation."""

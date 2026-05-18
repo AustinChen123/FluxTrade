@@ -99,6 +99,65 @@ class ExecutionEngine:
 
         return payload
 
+    def reconcile_recoverable_client_orders(self) -> dict:
+        """Compare recoverable local client orders with exchange snapshots.
+
+        This records the reconciliation result only. It intentionally does not
+        mutate local order state or place replacement orders.
+        """
+        if self._db_session_factory is None:
+            raise RuntimeError("reconcile_recoverable_client_orders requires db_session_factory")
+
+        orders = self.list_recoverable_client_orders()
+        results = []
+        result_counts: dict[str, int] = {}
+
+        for order in orders:
+            snapshot = self.adapter.get_order_by_client_id(
+                order.client_order_id,
+                order.product_id,
+            )
+            result = (
+                "exchange_found"
+                if snapshot is not None
+                else "exchange_not_found_or_lookup_unsupported"
+            )
+            result_counts[result] = result_counts.get(result, 0) + 1
+            results.append(
+                {
+                    "order_id": order.id,
+                    "client_order_id": order.client_order_id,
+                    "local_status": order.status,
+                    "product_id": order.product_id,
+                    "strategy_id": order.strategy_id,
+                    "local_exchange_order_id": order.exchange_order_id,
+                    "result": result,
+                    "exchange_order_id": snapshot.exchange_order_id if snapshot else None,
+                    "exchange_status": snapshot.status if snapshot else None,
+                }
+            )
+
+        payload = {
+            "recoverable_count": len(orders),
+            "result_counts": result_counts,
+            "results": results,
+        }
+
+        with self._db_session_factory() as db:
+            try:
+                write_system_event(
+                    db,
+                    event_type="reconcile",
+                    event_subtype="startup_exchange_reconcile",
+                    payload=payload,
+                )
+                db.commit()
+            except Exception:
+                db.rollback()
+                raise
+
+        return payload
+
     def process_market_data(self, candle: Candlestick):
         """
         Passes market data to the adapter (if applicable) to check for simulated fills.
