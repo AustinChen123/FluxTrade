@@ -5,6 +5,7 @@ from src.core.models import Signal, SignalType, Position, PositionSide
 from src.core.redis_factory import create_redis_client
 from src.core.risk_config import RiskConfig
 from src.core.risk_rules import RuleStatus
+from src.core.risk_rules.daily_loss_circuit_breaker import DailyLossCircuitBreakerRule
 from src.core.risk_rules.max_position_notional import MaxPositionNotionalRule
 from src.core.risk_rules.order_rate_limit import OrderRateLimitRule
 from src.core.risk_rules.price_sanity_check import PriceSanityCheckRule
@@ -84,6 +85,7 @@ class RiskManager:
         max_exposure_per_strategy: Optional[Decimal] = None,
         risk_config: Optional[RiskConfig] = None,
         single_order_rule: Optional[SingleOrderNotionalRule] = None,
+        daily_loss_rule: Optional[DailyLossCircuitBreakerRule] = None,
         price_sanity_rule: Optional[PriceSanityCheckRule] = None,
         order_rate_limit_rule: Optional[OrderRateLimitRule] = None,
         redis_client=None,
@@ -92,6 +94,7 @@ class RiskManager:
         self.account_service = account_service
         self.risk_config = risk_config or RiskConfig.from_env()
         self.single_order_rule = single_order_rule or SingleOrderNotionalRule(self.risk_config)
+        self.daily_loss_rule = daily_loss_rule or DailyLossCircuitBreakerRule(self.risk_config)
         self.price_sanity_rule = price_sanity_rule or PriceSanityCheckRule(self.risk_config)
         rate_limit_redis = redis_client or getattr(account_service, "redis", None)
         self.order_rate_limit_rule = order_rate_limit_rule
@@ -113,6 +116,8 @@ class RiskManager:
         *,
         best_bid: Optional[Decimal] = None,
         best_ask: Optional[Decimal] = None,
+        daily_start_nav: Optional[Decimal] = None,
+        current_nav: Optional[Decimal] = None,
     ) -> tuple[bool, str]:
         """
         Evaluates the signal against risk rules.
@@ -153,7 +158,22 @@ class RiskManager:
                 logger.warning("RISK_REJECTED: %s", msg)
                 return False, msg
 
-        # Rule 3: Price sanity check when market-depth context is available.
+        # Rule 3: Daily loss circuit breaker when NAV context is available.
+        if is_entry and (daily_start_nav is not None or current_nav is not None):
+            if daily_start_nav is None or current_nav is None:
+                msg = "REJECT: daily_loss_missing_nav_context"
+                logger.warning("RISK_REJECTED: %s", msg)
+                return False, msg
+            rule_status, rule_reason = self.daily_loss_rule.evaluate(
+                start_nav=daily_start_nav,
+                current_nav=current_nav,
+            )
+            if rule_status in {RuleStatus.REJECT, RuleStatus.CIRCUIT_BREAKER_TRIGGERED}:
+                msg = f"REJECT: {rule_reason}"
+                logger.warning("RISK_REJECTED: %s", msg)
+                return False, msg
+
+        # Rule 4: Price sanity check when market-depth context is available.
         if is_entry and (best_bid is not None or best_ask is not None):
             rule_status, rule_reason = self.price_sanity_rule.evaluate(
                 signal,
@@ -165,7 +185,7 @@ class RiskManager:
                 logger.warning("RISK_REJECTED: %s", msg)
                 return False, msg
 
-        # Rule 4: Max Exposure Check (uses current market price)
+        # Rule 5: Max Exposure Check (uses current market price)
         position = self.account_service.get_position(signal.strategy_id, signal.product_id)
         if position:
             price_for_exposure = current_price if current_price is not None else position.entry_price
@@ -202,7 +222,7 @@ class RiskManager:
                     logger.warning("RISK_REJECTED: %s", msg)
                     return False, msg
 
-        # Rule 5: Order rate limit. This records only after prior checks pass.
+        # Rule 6: Order rate limit. This records only after prior checks pass.
         if is_entry and self.order_rate_limit_rule is not None:
             rule_status, rule_reason = self.order_rate_limit_rule.try_record_order(
                 signal.strategy_id,

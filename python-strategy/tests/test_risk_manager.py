@@ -154,6 +154,39 @@ class TestRiskManagerExposureChecks:
         assert is_allowed is True
         assert reason == "PASS"
 
+    def test_daily_loss_circuit_breaker_rejects_entry(
+        self, mock_account_service, signal_factory
+    ):
+        """Daily-loss circuit breaker should reject entries when NAV loss breaches threshold."""
+        mock_account_service.set_balance(Decimal("100000"))
+        risk_manager = RiskManager(mock_account_service)
+        signal = signal_factory(signal_type=SignalType.LONG)
+
+        is_allowed, reason = risk_manager.check_risk(
+            signal,
+            daily_start_nav=Decimal("100000"),
+            current_nav=Decimal("94990"),
+        )
+
+        assert is_allowed is False
+        assert "daily_loss_circuit_breaker_triggered" in reason
+
+    def test_daily_loss_requires_complete_nav_context(
+        self, mock_account_service, signal_factory
+    ):
+        """Partial NAV context should fail closed instead of silently skipping."""
+        mock_account_service.set_balance(Decimal("100000"))
+        risk_manager = RiskManager(mock_account_service)
+        signal = signal_factory(signal_type=SignalType.LONG)
+
+        is_allowed, reason = risk_manager.check_risk(
+            signal,
+            daily_start_nav=Decimal("100000"),
+        )
+
+        assert is_allowed is False
+        assert reason == "REJECT: daily_loss_missing_nav_context"
+
     def test_order_rate_limit_rejects_after_prior_checks_pass(
         self, mock_account_service, signal_factory
     ):
