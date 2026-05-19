@@ -35,6 +35,7 @@ nav:
     - Backtesting: guide/backtesting.md
     - External Signals: guide/external-signals.md
     - Live Trading: guide/live-trading.md
+    - Control Plane: guide/control-plane.md
     - Configuration: guide/configuration.md
   - Architecture:
     - Overview: architecture/overview.md
