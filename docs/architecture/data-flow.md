@@ -23,16 +23,19 @@ Redis Stream            stream:market:{exchange}:{symbol}:{tf}
 consumer.py             XREADGROUP with consumer group, parse candle from stream
        |
        v
-engine.py               Dispatch candle to registered strategies (thread-safe copy)
+engine.py               Dispatch candle to active strategies (state-guarded)
        |
        v
 strategy.on_candle()    Strategy evaluates indicators, may emit Signal
        |
        v
+signal_processor.py     Block stopped/error strategies before execution
+       |
+       v
 execution.py            Signal -> Order creation (with SL/TP/Trailing conditionals)
        |
        v
-risk_manager.py         Pre-trade validation: balance, position limits, exposure
+risk_manager.py         Rule-based validation: balance, notional, price, rate, daily loss
        |
        v
 ccxt_adapter.py         Convert LONG/SHORT -> buy/sell, call exchange REST API
@@ -82,6 +85,7 @@ The `engine.py` event loop receives parsed candles and dispatches them to all re
 
 - A thread-safe copy of the strategy list is made (prevents mutation during iteration)
 - A timeframe safety guard filters candles that don't match the strategy's declared timeframe (defense-in-depth; the stream key already provides isolation)
+- `StrategyStateManager` state is consulted so stopped/error strategies do not emit executable signals
 
 **6. Strategy -> Execution -> Exchange**
 
@@ -94,6 +98,8 @@ When a strategy returns a `Signal` from `on_candle()`, the execution pipeline:
 5. The adapter converts `LONG/SHORT` to `buy/sell` and calls the exchange API
 
 Execution latency is measured via `time.monotonic()` and recorded to a Prometheus histogram.
+
+Risk validation is rule based. The current checks include balance, single-order notional, daily-loss circuit breaker, optional price sanity, max-position notional, and optional order-rate limiting. Violations return `(False, reason)` and block execution; they do not resize orders silently.
 
 ## Backtest Path
 
@@ -113,6 +119,9 @@ strategy.on_candle()       Same strategy code as live mode
 execution.py               Same Signal -> Order pipeline
        |
        v
+BacktestAccountService     Reads balance/position from SimulatedAdapter
+       |
+       v
 simulated.py               SimulatedAdapter (Python)
        |
        v
@@ -121,7 +130,7 @@ PyMatchingEngine           Rust matching engine via PyO3
        |
        v
 analytics.py               Sharpe, Sortino, Calmar, monthly returns
-                           FIFO trade pairing, all Decimal
+                           average-entry trade pairing, all Decimal
 ```
 
 ### Key Differences from Live Path
@@ -191,6 +200,8 @@ The loop is **synchronous** (no `await`). It calls only `engine.on_market_data(c
 
 The `BacktestRunner` wraps this loop with progress tracking, performance measurement, and report generation. After the loop completes, `analytics.py` computes trade-level and portfolio-level metrics.
 
+In backtests, the Rust matcher is the single source of truth for balances and positions. `BacktestAccountService` reads through `SimulatedAdapter`, and RiskManager checks in backtest mode therefore see the matcher-backed account state. The invariant suite verifies this after fills and during position-limit checks.
+
 ### Rust Matching Engine
 
 The `SimulatedAdapter` delegates all matching to `PyMatchingEngine` in Rust. For each candle, the engine processes open orders by priority (Market > SL/TP/Trailing > Limit), applies fees, manages positions, and returns fill events.
@@ -199,6 +210,8 @@ The `SimulatedAdapter` delegates all matching to `PyMatchingEngine` in Rust. For
     ~89,000 candles/second with full order matching and fee calculation. A 100K-candle backtest completes in approximately 1.12 seconds.
 
 For detailed matching logic, order types, and position management, see [Rust Matching Engine](rust-engine.md).
+
+Backtest PnL currently uses average-entry netting. The matcher balance delta should equal recomputed closed-trade PnL minus fill fees within one satoshi for deterministic fill sequences.
 
 ## Monitoring Path
 

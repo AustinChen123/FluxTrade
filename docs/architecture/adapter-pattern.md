@@ -245,10 +245,28 @@ Side enums:
 Conversion happens **only** at the adapter boundary:
 
 - `SimulatedAdapter._side_to_rust()`: Converts `buy` -> `LONG` and `sell` -> `SHORT` before calling Rust
+- Conditional orders (`STOP_LOSS`, `TAKE_PROFIT`, `TRAILING_STOP`) use the protected position side at the Rust boundary: a Python close-long order with side `sell` becomes Rust side `LONG`, and a close-short order with side `buy` becomes Rust side `SHORT`
 - `CcxtExchangeAdapter`: The ORM `Order` already has `side` as `buy`/`sell` (matching CCXT's expectation), so no conversion is needed
 
 !!! warning "Never Convert in Strategies"
     Strategies emit `Signal` objects with `SignalType.LONG`/`SignalType.SHORT`. The execution pipeline and adapters handle all side conversions. If a strategy references `buy` or `sell` directly, it is violating the abstraction boundary.
+
+### Position Representation
+
+Backtest positions are represented as explicit side plus absolute quantity:
+
+| Position | Representation |
+|----------|----------------|
+| Long 0.2 | `side == LONG`, `quantity == Decimal("0.2")` |
+| Short 0.2 | `side == SHORT`, `quantity == Decimal("0.2")` |
+
+Do not infer short exposure from a negative quantity in the backtest adapter or Python `Position` model. Signed exposure is derived by combining `side` and `quantity` inside risk rules and analytics.
+
+The invariant test suite locks this boundary:
+
+- `tests/test_invariant_position_sign.py` checks entry-side conversion, conditional close-side conversion, and long/short reduce/reverse behavior.
+- `tests/test_invariant_position_consistency.py` checks that `BacktestAccountService` and `RiskManager` read matcher-backed positions from the same source of truth.
+- `tests/test_invariant_pnl_consistency.py` checks matcher balance delta against recomputed realized PnL minus fees.
 
 ## Same Strategy, Both Modes
 
@@ -310,3 +328,4 @@ The strategy class is identical. It emits `Signal` objects; the execution pipeli
 2. **Live/backtest parity is non-negotiable**: Any feature added to backtesting must produce behavior identical to real exchange execution
 3. **Fees must be reflected**: Both `SimulatedAdapter` (via Rust) and `CcxtExchangeAdapter` (via exchange response) include maker/taker fees in fill results
 4. **Signals are the only strategy output**: Strategies emit `Signal` objects with entry, SL, TP, and trailing parameters. The system handles the full order lifecycle from there
+5. **Backtest account state is matcher-backed**: Backtest balance and positions are read through `SimulatedAdapter` / `BacktestAccountService`, not through a separate Python position ledger

@@ -27,9 +27,10 @@
                          | Python Strategy Svc   |
                          |                       |
                          |  consumer.py          |  XREADGROUP consumer
-                         |  engine.py            |  Event-driven core
+                         |  engine.py            |  Event-driven coordinator
+                         |  strategy_state_*     |  Strategy lifecycle guard
                          |  execution.py         |  Signal -> Order -> Fill
-                         |  risk_manager.py      |  Balance/position checks
+                         |  risk_manager.py      |  Rule-based risk checks
                          |  backtest_runner.py   |  Backtesting framework
                          |  analytics.py         |  Sharpe/Sortino/Calmar
                          +---+-------------+-----+
@@ -115,13 +116,21 @@ The Python service contains the trading logic, execution pipeline, risk manageme
 
 | Module | Responsibility |
 |--------|----------------|
-| `engine.py` | Event-driven core: receives market data, dispatches to strategies, manages lifecycle |
+| `engine.py` | Event-driven coordinator: receives market data, dispatches to strategies, owns lifecycle wiring |
+| `strategy_registry.py` | Discovers, loads, and stores runtime strategy instances |
+| `command_router.py` | Handles operator commands for start, stop, resume, and forced recovery |
+| `signal_processor.py` | Applies strategy-state guards before executing emitted signals |
+| `strategy_state_manager.py` | Owns lifecycle transitions, optimistic versioning, Redis cache updates, and transition history |
 | `execution.py` | Signal-to-Order-to-Fill pipeline: creates SL/TP/Trailing conditional orders from signals |
-| `risk_manager.py` | Pre-trade validation: balance checks, position limits, exposure calculation |
+| `risk_manager.py` | Pre-trade validation orchestration: balance, notional limits, price sanity, rate limits, daily-loss circuit breaker |
+| `risk_rules/` | Testable rule modules used by `RiskManager` |
+| `daily_nav_snapshot.py` | Reads or initializes start-of-day NAV snapshots for daily-loss checks |
+| `audit_service.py` | Signal, system-event, intent, and outcome audit helpers with JSONB-safe payloads |
+| `client_order_id.py` | Deterministic client order IDs for idempotent order placement and reconciliation |
 | `order_manager.py` | Order lifecycle management with Redis Lua atomic operations |
 | `consumer.py` | Redis Stream XREADGROUP consumer, candle parsing and timeframe synthesis |
 | `backtest_runner.py` | Backtesting framework: IDataSource -> candle loop -> circuit breaker -> report |
-| `analytics.py` | Post-trade analytics: Sharpe, Sortino, Calmar, monthly returns, FIFO trade pairing |
+| `analytics.py` | Post-trade analytics: Sharpe, Sortino, Calmar, monthly returns, average-entry closed-trade pairing |
 | `models.py` | Pydantic data models (Candlestick, Order, Trade, Signal, Position), all Decimal |
 | `journal.py` | Structured trade event logging to JSONL |
 
@@ -216,8 +225,39 @@ Stream keys encode exchange, symbol, and timeframe, enabling **timeframe channel
 
 All financial calculations use `Decimal` (Python) or `rust_decimal::Decimal` (Rust). Float is **forbidden** for monetary values. The PyO3 boundary uses `String` serialization to preserve precision across the language boundary.
 
+### P0 Architecture Hardening Summary
+
+The current architecture includes the P0 hardening changes from migrations 5-8 and engine/risk decomposition:
+
+| Concern | Owner | Notes |
+|---------|-------|-------|
+| Runtime strategy lifecycle | `StrategyStateManager` | Active/stopped/error transitions, version guard, Redis state-change channel, transition history |
+| Runtime command handling | `CommandRouter` + `StrategyEngine` | Operator commands are routed through engine lifecycle methods and preserve actor/reason metadata |
+| Signal gating | `SignalProcessor` | Signals from stopped/error strategies are blocked before execution |
+| Risk enforcement | `RiskManager` + `risk_rules/` | Rule modules return structured status/reason; violations reject orders instead of silently resizing |
+| Daily loss circuit breaker | `RiskManager` + `DailyNavSnapshotService` | Start NAV can be resolved from `daily_nav_snapshots`; circuit-breaker violations can transition strategy state to ERROR |
+| Idempotent order recovery | `client_order_id.py`, `execution.py`, adapter snapshots | Client order IDs support duplicate suppression and startup reconciliation |
+| Backtest account state | `SimulatedAdapter` + Rust matcher | Balance and position state are read from the matcher-backed adapter through `BacktestAccountService` |
+
+Schema hardening summary:
+
+| Migration | Main changes |
+|-----------|--------------|
+| 5 | Order intent/outcome audit fields, JSONB audit payloads, `system_events`, client-order idempotency support |
+| 6 | Strategy-state lifecycle metadata, transition history, daily NAV snapshots, lifecycle CHECK constraints |
+| 7 | `evolution_epochs` and `gene_records` for genetic-parameter search lineage |
+| 8 | Optional performance indexes after gene registry migration |
+
+Conventions:
+
+- New audit-style payloads use JSONB; Decimal values are serialized as strings at the boundary and restored with `Decimal(str(value))`.
+- New lifecycle/audit timestamps use timezone-aware database timestamps where the migration introduced them; older millisecond integer fields remain as legacy fields unless a migration deliberately changes them.
+- Backtest positions use explicit `side + absolute quantity`; SHORT is represented by `side == SHORT`, not a negative quantity.
+- Realized PnL consistency currently follows average-entry netting, matching the Rust matcher and `analytics._build_closed_trades()`.
+
 ## Test Coverage
 
-- **750 total tests**: 616 Python unit + 69 integration + 65 Rust
-- **Python coverage**: 78.26% (CI gate: 77%)
-- **Key test patterns**: Factory-based fixtures via `conftest.py` (700+ lines), `spec`-based mocks, selective failure injection via `MockExchangeAdapter`
+- Python CI runs Ruff, explicit invariant tests (`tests/test_invariant_*.py`), and non-integration tests with coverage gate `--cov-fail-under=77`.
+- Latest local non-integration run during P0 hardening: `924 passed, 75 deselected`.
+- Invariant coverage includes matcher/account position consistency, RiskManager position-source consistency, side-boundary conversion, and realized PnL recomputation against matcher balance.
+- Key test patterns: factory-based fixtures via `conftest.py`, `spec`-based mocks, selective failure injection via `MockExchangeAdapter`.
