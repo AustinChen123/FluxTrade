@@ -66,6 +66,35 @@ curl http://127.0.0.1:8080/jobs
 curl http://127.0.0.1:8080/jobs/<job_id>
 ```
 
+## Strategy Status And Commands
+
+When the control plane is constructed with a strategy control service, it can
+wrap the existing `CommandRouter` and expose operator controls:
+
+```bash
+curl http://127.0.0.1:8080/strategies
+curl http://127.0.0.1:8080/strategies/health
+```
+
+Submit a strategy command:
+
+```bash
+curl -X POST http://127.0.0.1:8080/strategies/strategy_1/commands \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "command": "STOP",
+    "reason": "operator pause"
+  }'
+```
+
+Supported commands:
+
+- `START`
+- `STOP`
+- `RESUME`
+- `FORCE_RECOVER`
+- `RELOAD`
+
 ## CSV Formats
 
 Candles use the existing `CsvDataSource` format:
@@ -88,6 +117,9 @@ timestamp,type,quantity
 - The default job store is in-memory; jobs are not durable across process restarts.
 - The first job type is CSV-signal backtesting. Parameter search, strategy
   monitoring, and operator controls should be added as follow-up job types.
+- Strategy command endpoints require wiring a live `StrategyControlService` over
+  the running engine's `CommandRouter`; the default standalone server only
+  exposes job endpoints.
 - Authentication and authorization are not yet implemented.
 - Production deployment should use a durable job store and a stronger HTTP
   framework adapter.

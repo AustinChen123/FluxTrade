@@ -7,8 +7,14 @@ from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.ext.compiler import compiles
 from sqlalchemy.orm import sessionmaker
 
-from src.control_plane import BacktestJobExecutor, ControlPlaneApp, InMemoryJobStore
+from src.control_plane import (
+    BacktestJobExecutor,
+    ControlPlaneApp,
+    InMemoryJobStore,
+    StrategyControlService,
+)
 from src.control_plane.models import BacktestJobRequest, JobStatus
+from src.core.command_router import CommandResult
 from src.core.orm_models import (
     BacktestResultSummary,
     BacktestTradeLog,
@@ -120,6 +126,62 @@ def test_control_plane_lists_submitted_jobs_without_framework():
     assert list_response.body["jobs"][0]["id"] == job.id
     assert get_response.status_code == 200
     assert get_response.body["job"]["status"] == JobStatus.QUEUED.value
+
+
+class _FakeCommandRouter:
+    def __init__(self) -> None:
+        self.messages = []
+
+    def handle(self, message):
+        self.messages.append(message)
+        command = message["command"]
+        if command == "LIST":
+            return CommandResult(
+                True,
+                "Listed active strategies",
+                {"strategies": [{"strategy_id": "s1"}]},
+            )
+        if command == "HEALTH_CHECK":
+            return CommandResult(True, "Health check complete", {"healthy": {"s1": True}})
+        if command == "STOP":
+            return CommandResult(True, "Stopped strategy s1")
+        return CommandResult(False, f"Unknown command: {command}")
+
+
+def test_control_plane_routes_strategy_status_and_commands():
+    router = _FakeCommandRouter()
+    app = ControlPlaneApp(
+        BacktestJobExecutor(run_inline=True),
+        strategy_control=StrategyControlService(router),
+    )
+
+    list_response = app.handle("GET", "/strategies")
+    health_response = app.handle("GET", "/strategies/health")
+    command_response = app.handle(
+        "POST",
+        "/strategies/s1/commands",
+        json.dumps({"command": "STOP", "reason": "operator pause"}),
+    )
+
+    assert list_response.status_code == 200
+    assert list_response.body["result"]["data"]["strategies"] == [{"strategy_id": "s1"}]
+    assert health_response.status_code == 200
+    assert health_response.body["result"]["data"]["healthy"] == {"s1": True}
+    assert command_response.status_code == 200
+    assert router.messages[-1] == {
+        "command": "STOP",
+        "strategy_id": "s1",
+        "params": {"strategy_id": "s1", "reason": "operator pause"},
+    }
+
+
+def test_control_plane_reports_unavailable_strategy_control():
+    app = ControlPlaneApp(BacktestJobExecutor(run_inline=True))
+
+    response = app.handle("GET", "/strategies")
+
+    assert response.status_code == 503
+    assert response.body == {"error": "strategy_control_unavailable"}
 
 
 @pytest.mark.rust

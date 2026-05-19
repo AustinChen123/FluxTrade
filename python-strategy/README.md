@@ -40,3 +40,13 @@ Inspect jobs:
 curl http://127.0.0.1:8080/jobs
 curl http://127.0.0.1:8080/jobs/<job_id>
 ```
+
+When the app is wired with a live strategy control service, it can also expose:
+
+```bash
+curl http://127.0.0.1:8080/strategies
+curl http://127.0.0.1:8080/strategies/health
+curl -X POST http://127.0.0.1:8080/strategies/strategy_1/commands \
+  -H 'Content-Type: application/json' \
+  -d '{"command":"STOP","reason":"operator pause"}'
+```

@@ -91,3 +91,11 @@ class JobRecord(BaseModel):
             updated_at=now,
             request=request.model_dump(mode="json"),
         )
+
+
+class StrategyCommandRequest(BaseModel):
+    """Operator command for a strategy instance."""
+
+    command: Literal["START", "STOP", "RESUME", "FORCE_RECOVER", "RELOAD"]
+    reason: str | None = None
+    params: dict[str, Any] = Field(default_factory=dict)
