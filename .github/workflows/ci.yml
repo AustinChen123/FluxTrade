@@ -6,6 +6,14 @@ on:
   pull_request:
     branches: [ "main", "develop" ]
 
+# Cancel in-progress runs on the same branch to save CI minutes
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
 jobs:
   rust-check:
     name: Rust Check
@@ -15,20 +23,37 @@ jobs:
         working-directory: ./rust-data-service
     steps:
       - uses: actions/checkout@v4
-      
-      - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
+
+      - name: Install Rust toolchain (from rust-toolchain.toml)
+        uses: dtolnay/rust-toolchain@master
         with:
+          toolchain: "1.82.0"
           components: clippy, rustfmt
 
+      - name: Cache cargo registry & build
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            rust-data-service/target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('rust-data-service/Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-cargo-
+
       - name: Check formatting
-        run: cargo fmt --check || echo "Cargo.toml not found, skipping"
+        run: cargo fmt --check
 
       - name: Lint with Clippy
-        run: cargo clippy -- -D warnings || echo "Cargo.toml not found, skipping"
+        run: cargo clippy -- -D warnings
 
-      - name: Run tests
-        run: cargo test || echo "Cargo.toml not found, skipping"
+      - name: Run tests (pure Rust, no PyO3 extension)
+        run: cargo test --no-default-features
+
+      # TODO: Add Rust coverage with cargo-llvm-cov
+      # Steps needed:
+      #   1. Install cargo-llvm-cov: cargo install cargo-llvm-cov
+      #   2. Run: cargo llvm-cov --no-default-features --codecov --output-path codecov.json
+      #   3. Upload artifact or send to Codecov
 
   python-check:
     name: Python Check
@@ -38,7 +63,28 @@ jobs:
         working-directory: ./python-strategy
     steps:
       - uses: actions/checkout@v4
-      
+
+      - name: Install Rust toolchain (for fluxtrade_core.so)
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.82.0"
+
+      - name: Cache cargo registry & build
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            rust-data-service/target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('rust-data-service/Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-cargo-
+
+      - name: Build and install fluxtrade_core.so
+        working-directory: ./rust-data-service
+        run: |
+          cargo build --lib --release
+          cp target/release/libfluxtrade_core.so ../python-strategy/src/fluxtrade_core.so
+
       - name: Install uv
         uses: astral-sh/setup-uv@v5
 
@@ -46,7 +92,102 @@ jobs:
         run: uv python install
 
       - name: Lint with Ruff
-        run: uv run ruff check . || echo "pyproject.toml not found, skipping"
+        run: uv run ruff check .
 
-      - name: Run Tests
-        run: uv run pytest || echo "pyproject.toml not found, skipping"
+      - name: Run invariant tests
+        run: uv run pytest tests/test_invariant_*.py -v
+
+      - name: Run unit tests with coverage
+        run: uv run pytest -m "not integration" --cov=src --cov-report=term-missing --cov-report=xml:coverage.xml --cov-fail-under=77
+
+      - name: Upload coverage report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: python-coverage-report
+          path: python-strategy/coverage.xml
+          retention-days: 30
+
+      - name: Generate coverage badge JSON
+        if: always()
+        working-directory: ./python-strategy
+        run: |
+          # Extract coverage percentage from the XML report
+          if [ -f coverage.xml ]; then
+            COV_PCT=$(python3 -c "
+          import xml.etree.ElementTree as ET
+          tree = ET.parse('coverage.xml')
+          rate = float(tree.getroot().attrib['line-rate']) * 100
+          print(f'{rate:.1f}')
+          ")
+            echo "{\"schemaVersion\":1,\"label\":\"coverage\",\"message\":\"${COV_PCT}%\",\"color\":\"brightgreen\"}" > coverage-badge.json
+            echo "Coverage: ${COV_PCT}%"
+          else
+            echo "{\"schemaVersion\":1,\"label\":\"coverage\",\"message\":\"unknown\",\"color\":\"red\"}" > coverage-badge.json
+          fi
+
+      - name: Upload coverage badge data
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage-badge
+          path: python-strategy/coverage-badge.json
+          retention-days: 30
+        # To display a dynamic coverage badge in README, you can:
+        # 1. Publish coverage-badge.json to GitHub Pages or a gist
+        # 2. Use shields.io endpoint badge: ![Coverage](https://img.shields.io/endpoint?url=<URL_TO_JSON>)
+        # Or integrate with Codecov/Coveralls for automatic badge generation.
+
+  integration-check:
+    name: Integration Tests (Rust + Python)
+    runs-on: ubuntu-latest
+    needs: [rust-check, python-check]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain (from rust-toolchain.toml)
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.82.0"
+
+      - name: Cache cargo registry & build
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            rust-data-service/target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('rust-data-service/Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-cargo-
+
+      - name: Build Rust library
+        working-directory: ./rust-data-service
+        run: RUSTFLAGS="-C link-arg=-undefined -C link-arg=dynamic_lookup" cargo build --lib --release
+        if: runner.os == 'macOS'
+
+      - name: Build Rust library (Linux)
+        working-directory: ./rust-data-service
+        run: cargo build --lib --release
+        if: runner.os == 'Linux'
+
+      - name: Copy .so to Python
+        run: |
+          if [ -f rust-data-service/target/release/libfluxtrade_core.dylib ]; then
+            cp rust-data-service/target/release/libfluxtrade_core.dylib python-strategy/src/fluxtrade_core.so
+          elif [ -f rust-data-service/target/release/libfluxtrade_core.so ]; then
+            cp rust-data-service/target/release/libfluxtrade_core.so python-strategy/src/fluxtrade_core.so
+          else
+            echo "::error::Rust library not found, cannot run integration tests"
+            exit 1
+          fi
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v5
+
+      - name: Set up Python
+        working-directory: ./python-strategy
+        run: uv python install
+
+      - name: Run integration tests
+        working-directory: ./python-strategy
+        run: uv run pytest -m "integration or rust" -v

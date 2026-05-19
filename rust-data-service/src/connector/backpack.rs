@@ -3,16 +3,16 @@ use crate::connector::ExchangeConnector;
 use crate::model::{AccountUpdate, Candlestick, OrderBook, PositionUpdate, Trade, UserStreamEvent};
 use anyhow::{Context, Result};
 use async_trait::async_trait;
+use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
 use chrono::DateTime;
 use futures_util::SinkExt;
+use ring::signature::Ed25519KeyPair;
 use rust_decimal::Decimal;
 use serde_json::{json, Value};
+use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::sync::mpsc;
 use tokio_tungstenite::tungstenite::protocol::Message;
 use tracing::{error, info, warn};
-use ring::signature::Ed25519KeyPair;
-use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
-use std::time::{SystemTime, UNIX_EPOCH};
 
 pub struct BackpackConnector {
     exchange_id: String,
@@ -35,7 +35,7 @@ impl BackpackConnector {
         let secret_bytes = BASE64.decode(secret).context("Failed to decode secret")?;
         let key_pair = Ed25519KeyPair::from_seed_unchecked(&secret_bytes)
             .or_else(|_| Ed25519KeyPair::from_pkcs8(&secret_bytes))
-             .map_err(|_| anyhow::anyhow!("Invalid Ed25519 secret key"))?;
+            .map_err(|_| anyhow::anyhow!("Invalid Ed25519 secret key"))?;
 
         let signature = key_pair.sign(payload.as_bytes());
         Ok(BASE64.encode(signature.as_ref()))
@@ -48,7 +48,7 @@ impl BackpackConnector {
 
         let timestamp = SystemTime::now()
             .duration_since(UNIX_EPOCH)
-            .unwrap()
+            .unwrap_or_default()
             .as_millis()
             .to_string();
         let window = "5000";
@@ -86,10 +86,7 @@ impl BackpackConnector {
     }
 
     #[allow(dead_code)]
-    pub async fn subscribe_user_stream(
-        &self,
-        tx: mpsc::Sender<UserStreamEvent>,
-    ) -> Result<()> {
+    pub async fn subscribe_user_stream(&self, tx: mpsc::Sender<UserStreamEvent>) -> Result<()> {
         let api_key = std::env::var("EXCHANGE_API_KEY").context("EXCHANGE_API_KEY not set")?;
         let secret = std::env::var("EXCHANGE_SECRET").context("EXCHANGE_SECRET not set")?;
 
@@ -108,16 +105,17 @@ impl BackpackConnector {
                         async move {
                             let timestamp = SystemTime::now()
                                 .duration_since(UNIX_EPOCH)
-                                .unwrap()
+                                .unwrap_or_default()
                                 .as_millis()
                                 .to_string();
                             let window = "5000";
                             let instruction = "subscribe";
-                            
-                            let signature = match Self::sign(instruction, &timestamp, window, &secret) {
-                                Ok(s) => s,
-                                Err(e) => return Err(anyhow::anyhow!(e)),
-                            };
+
+                            let signature =
+                                match Self::sign(instruction, &timestamp, window, &secret) {
+                                    Ok(s) => s,
+                                    Err(e) => return Err(anyhow::anyhow!(e)),
+                                };
 
                             let sub = json!({
                                 "method": "SUBSCRIBE",
@@ -138,45 +136,80 @@ impl BackpackConnector {
                             if let Message::Text(text) = msg {
                                 let v: Value = serde_json::from_str(&text)?;
                                 if let Some(data) = v.get("data") {
-                                    if data.get("e") == Some(&Value::String("account.update".to_string())) {
-                                        let timestamp = v.get("T").and_then(|t| t.as_i64()).unwrap_or(0); // Assuming T is common
+                                    if data.get("e")
+                                        == Some(&Value::String("account.update".to_string()))
+                                    {
+                                        let timestamp =
+                                            v.get("T").and_then(|t| t.as_i64()).unwrap_or(0); // Assuming T is common
 
                                         // Process Balances
-                                        if let Some(balances) = data.get("B").and_then(|b| b.as_object()) {
+                                        if let Some(balances) =
+                                            data.get("B").and_then(|b| b.as_object())
+                                        {
                                             for (asset, info) in balances {
-                                                let available = info.get("available").and_then(|v| v.as_str()).unwrap_or("0");
-                                                let locked = info.get("locked").and_then(|v| v.as_str()).unwrap_or("0");
-                                                
-                                                let avail_dec: Decimal = available.parse().unwrap_or(Decimal::ZERO);
-                                                let locked_dec: Decimal = locked.parse().unwrap_or(Decimal::ZERO);
-                                                
+                                                let available = info
+                                                    .get("available")
+                                                    .and_then(|v| v.as_str())
+                                                    .unwrap_or("0");
+                                                let locked = info
+                                                    .get("locked")
+                                                    .and_then(|v| v.as_str())
+                                                    .unwrap_or("0");
+
+                                                let avail_dec: Decimal =
+                                                    available.parse().unwrap_or(Decimal::ZERO);
+                                                let locked_dec: Decimal =
+                                                    locked.parse().unwrap_or(Decimal::ZERO);
+
                                                 let update = AccountUpdate {
                                                     exchange: connector_id.clone(),
                                                     asset: asset.to_string(),
                                                     balance: avail_dec + locked_dec,
                                                     timestamp,
                                                 };
-                                                tx.send(UserStreamEvent::Account(update)).await.ok();
+                                                tx.send(UserStreamEvent::Account(update))
+                                                    .await
+                                                    .ok();
                                             }
                                         }
 
                                         // Process Positions
-                                        if let Some(positions) = data.get("P").and_then(|p| p.as_array()) {
+                                        if let Some(positions) =
+                                            data.get("P").and_then(|p| p.as_array())
+                                        {
                                             for p in positions {
-                                                let symbol = p.get("s").and_then(|v| v.as_str()).unwrap_or_default();
-                                                let amount = p.get("n").and_then(|v| v.as_str()).unwrap_or("0"); // n = net size
-                                                let entry_price = p.get("e").and_then(|v| v.as_str()).unwrap_or("0"); // e = entry
-                                                let upnl = p.get("u").and_then(|v| v.as_str()).unwrap_or("0"); // u = upnl
-                                                
+                                                let symbol = p
+                                                    .get("s")
+                                                    .and_then(|v| v.as_str())
+                                                    .unwrap_or_default();
+                                                let amount = p
+                                                    .get("n")
+                                                    .and_then(|v| v.as_str())
+                                                    .unwrap_or("0"); // n = net size
+                                                let entry_price = p
+                                                    .get("e")
+                                                    .and_then(|v| v.as_str())
+                                                    .unwrap_or("0"); // e = entry
+                                                let upnl = p
+                                                    .get("u")
+                                                    .and_then(|v| v.as_str())
+                                                    .unwrap_or("0"); // u = upnl
+
                                                 let update = PositionUpdate {
                                                     exchange: connector_id.clone(),
                                                     symbol: symbol.to_string(),
                                                     amount: amount.parse().unwrap_or(Decimal::ZERO),
-                                                    entry_price: entry_price.parse().unwrap_or(Decimal::ZERO),
-                                                    unrealized_pnl: upnl.parse().unwrap_or(Decimal::ZERO),
+                                                    entry_price: entry_price
+                                                        .parse()
+                                                        .unwrap_or(Decimal::ZERO),
+                                                    unrealized_pnl: upnl
+                                                        .parse()
+                                                        .unwrap_or(Decimal::ZERO),
                                                     timestamp,
                                                 };
-                                                tx.send(UserStreamEvent::Position(update)).await.ok();
+                                                tx.send(UserStreamEvent::Position(update))
+                                                    .await
+                                                    .ok();
                                             }
                                         }
                                     }
@@ -197,30 +230,22 @@ impl BackpackConnector {
     }
 
     fn parse_iso8601_to_ms(iso: &str) -> Result<i64> {
+        // Backpack returns "2026-01-22T21:19:00" or similar.
 
-            // Backpack returns "2026-01-22T21:19:00" or similar.
+        // We ensure it is treated as UTC.
 
-            // We ensure it is treated as UTC.
+        let rfc = if iso.contains('Z') || iso.contains('+') {
+            iso.to_string()
+        } else {
+            format!("{}Z", iso)
+        };
 
-            let rfc = if iso.contains('Z') || iso.contains('+') { 
+        let dt = rfc
+            .parse::<DateTime<chrono::Utc>>()
+            .context("Failed to parse ISO8601 timestamp")?;
 
-                iso.to_string() 
-
-            } else { 
-
-                format!("{}Z", iso) 
-
-            };
-
-            
-
-            let dt = rfc.parse::<DateTime<chrono::Utc>>()
-
-                .context("Failed to parse ISO8601 timestamp")?;
-
-            Ok(dt.timestamp_millis())
-
-        }
+        Ok(dt.timestamp_millis())
+    }
 }
 
 #[async_trait]

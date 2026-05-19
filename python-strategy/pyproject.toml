@@ -1,5 +1,6 @@
 [project]
 name = "python-strategy"
+# Keep in sync with /VERSION (use tools/bump_version.sh)
 version = "0.1.0"
 description = "Add your description here"
 readme = "README.md"
@@ -16,10 +17,35 @@ dependencies = [
     "redis>=7.1.0",
     "sqlalchemy>=2.0.46",
     "websockets>=16.0",
+    "prometheus-client>=0.21.0",
+    "structlog>=24.4.0",
 ]
 
 [dependency-groups]
 dev = [
+    "alembic>=1.18.4",
+    "maturin>=1.11.5",
+    "pyright>=1.1.408",
     "pytest>=9.0.2",
+    "pytest-cov>=6.0.0",
     "ruff>=0.14.13",
+]
+bench = [
+    "vectorbt>=0.26.2",
+    "backtesting>=0.3.3",
+]
+docs = [
+    "mkdocs>=1.6.0",
+    "mkdocs-material>=9.5.0",
+    "mkdocstrings[python]>=0.27.0",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = [".", "src"]
+addopts = "-v"
+markers = [
+    "smoke: critical path tests for quick validation (select with '-m smoke')",
+    "integration: tests requiring external services (Docker, Redis, Postgres)",
+    "rust: tests requiring compiled Rust .so (fluxtrade_core)",
 ]

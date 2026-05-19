@@ -4,6 +4,7 @@ import time
 import plotly.graph_objects as go
 import plotly.express as px
 from src.data_provider import DataProvider, redis_client
+from src.auth import check_auth
 import json
 
 # Page Config
@@ -75,6 +76,9 @@ def render_metric(label, value, delta=None, delta_color="normal"):
     """, unsafe_allow_html=True)
 
 def main():
+    if not check_auth():
+        return
+
     # Sidebar
     st.sidebar.title("⚡ FluxTrade")
     st.sidebar.markdown("---")

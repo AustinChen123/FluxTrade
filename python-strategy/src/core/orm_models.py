@@ -1,7 +1,27 @@
-from sqlalchemy import Column, String, BigInteger, Numeric, ForeignKey, Text, UniqueConstraint
+from sqlalchemy import (
+    BigInteger,
+    CheckConstraint,
+    Column,
+    Date,
+    DateTime,
+    ForeignKey,
+    Integer,
+    Numeric,
+    String,
+    Text,
+    UniqueConstraint,
+    func,
+)
+from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.orm import declarative_base
 
 Base = declarative_base()
+
+
+def _autoincrement_bigint():
+    """Use PostgreSQL BIGINT, but SQLite INTEGER for rowid autoincrement."""
+    return BigInteger().with_variant(Integer, "sqlite")
+
 
 class Exchange(Base):
     __tablename__ = 'exchange'
@@ -49,6 +69,13 @@ class Order(Base):
     filled_quantity = Column(Numeric, nullable=True, default=0)
     filled_price = Column(Numeric, nullable=True)
 
+    # Migration 5 — idempotency / lifecycle columns.
+    client_order_id = Column(String(128), nullable=True)
+    intent_payload = Column(JSONB, nullable=True)
+    submitted_at = Column(DateTime(timezone=True), nullable=True)
+    acked_at = Column(DateTime(timezone=True), nullable=True)
+    last_reconciled_at = Column(DateTime(timezone=True), nullable=True)
+
     __table_args__ = (
         UniqueConstraint('exchange_order_id', 'exchange_id', name='uq_order_exchange_id'),
     )
@@ -90,7 +117,7 @@ class SignalAudit(Base):
 
     __tablename__ = 'signal_audit'
 
-    id = Column(BigInteger, primary_key=True, autoincrement=True)
+    id = Column(_autoincrement_bigint(), primary_key=True, autoincrement=True)
 
     timestamp = Column(BigInteger, nullable=False)
 
@@ -106,12 +133,55 @@ class SignalAudit(Base):
 
     order_id = Column(String, nullable=True)
 
-    details_json = Column(Text, nullable=True)
+    # Migration 5 — TEXT upgraded to JSONB.
+    details_json = Column(JSONB, nullable=True)
+
+    # Migration 5 — Path B audit linkage + multi-signal batch correlation.
+    client_order_id = Column(String(128), nullable=True)
+
+    intent_payload = Column(JSONB, nullable=True)
+
+    outcome_payload = Column(JSONB, nullable=True)
+
+    signal_batch_id = Column(String(64), nullable=True)
+
+
+class SystemEvent(Base):
+    """Cross-cutting system events log (Migration 5).
+
+    Captures reconcile / gene_promote / gene_retire / system_error events
+    so that operational tooling can audit non-trade activity without
+    polluting the trade audit tables. ``related_order_id`` is a string FK
+    because ``order.id`` itself is a string PK in this codebase.
+    """
+
+    __tablename__ = 'system_events'
+
+    id = Column(_autoincrement_bigint(), primary_key=True, autoincrement=True)
+    event_type = Column(String(64), nullable=False)
+    event_subtype = Column(String(64), nullable=True)
+    related_strategy_id = Column(String, ForeignKey('strategy.id'), nullable=True)
+    related_order_id = Column(String, ForeignKey('order.id'), nullable=True)
+    # No FK — gene_records lands in migration 7.
+    related_gene_id = Column(BigInteger, nullable=True)
+    payload = Column(JSONB, nullable=False)
+    created_at = Column(
+        DateTime(timezone=True),
+        nullable=False,
+        server_default=func.now(),
+    )
+
+    __table_args__ = (
+        CheckConstraint(
+            "event_type IN ('reconcile','gene_promote','gene_retire','system_error')",
+            name='chk_system_events_type',
+        ),
+    )
 
 
 class BacktestResultSummary(Base):
     __tablename__ = 'backtest_result_summary'
-    id = Column(BigInteger, primary_key=True, autoincrement=True)
+    id = Column(_autoincrement_bigint(), primary_key=True, autoincrement=True)
     strategy_id = Column(String, ForeignKey('strategy.id'), nullable=False)
     start_time = Column(BigInteger, nullable=False)
     end_time = Column(BigInteger, nullable=False)
@@ -122,6 +192,7 @@ class BacktestTradeLog(Base):
     __tablename__ = 'backtest_trade_log'
     id = Column(String, primary_key=True)
     session_id = Column(BigInteger, ForeignKey('backtest_result_summary.id'), nullable=False)
+    strategy_id = Column(String, nullable=True)
     order_id = Column(String, nullable=False)
     exchange_trade_id = Column(String, nullable=True)
     product_id = Column(String, ForeignKey('product.id'), nullable=False)
@@ -140,3 +211,171 @@ class StrategyState(Base):
     performance_json = Column(Text, nullable=True)
     last_heartbeat = Column(BigInteger, nullable=True)
     uptime_start = Column(BigInteger, nullable=True)
+
+    # Migration 6 — audit / lifecycle metadata + optimistic-lock version.
+    last_error_message = Column(Text, nullable=True)
+    entered_error_at = Column(DateTime(timezone=True), nullable=True)
+    recovered_at = Column(DateTime(timezone=True), nullable=True)
+    stopped_at = Column(DateTime(timezone=True), nullable=True)
+    version = Column(Integer, nullable=False, server_default='0')
+
+    __table_args__ = (
+        CheckConstraint(
+            "status <> 'ERROR' OR "
+            "(entered_error_at IS NOT NULL AND last_error_message IS NOT NULL)",
+            name='chk_error_state',
+        ),
+        CheckConstraint(
+            "status <> 'STOPPED' OR stopped_at IS NOT NULL",
+            name='chk_stopped_state',
+        ),
+    )
+
+
+class StrategyStateTransition(Base):
+    """Append-only audit log of strategy status transitions (Migration 6).
+
+    Each row captures one ``from_status -> to_status`` change so operators
+    can reconstruct the lifecycle of any strategy without relying on the
+    point-in-time ``strategy_state`` row.
+    """
+
+    __tablename__ = 'strategy_state_transitions'
+
+    id = Column(_autoincrement_bigint(), primary_key=True, autoincrement=True)
+    strategy_id = Column(String, ForeignKey('strategy.id'), nullable=False)
+    from_status = Column(String(32), nullable=False)
+    to_status = Column(String(32), nullable=False)
+    transitioned_at = Column(
+        DateTime(timezone=True),
+        nullable=False,
+        server_default=func.now(),
+    )
+    reason = Column(Text, nullable=True)
+    actor = Column(String(64), nullable=True)
+
+
+class DailyNavSnapshot(Base):
+    """End-of-day NAV snapshot per strategy (Migration 6).
+
+    Used to compute realised drawdown / period returns without scanning
+    the trade log. ``nav`` is ``NUMERIC(28, 8)`` — float is forbidden for
+    monetary values per FluxTrade Decimal rules.
+    """
+
+    __tablename__ = 'daily_nav_snapshots'
+
+    id = Column(_autoincrement_bigint(), primary_key=True, autoincrement=True)
+    strategy_id = Column(String, ForeignKey('strategy.id'), nullable=False)
+    snapshot_date = Column(Date, nullable=False)
+    nav = Column(Numeric(28, 8), nullable=False)
+    base_currency = Column(String(16), nullable=False)
+    drawdown = Column(Numeric(10, 8), nullable=True)
+    return_pct = Column(Numeric(10, 8), nullable=True)
+    source = Column(
+        String(32),
+        nullable=False,
+        server_default='eod_snapshot',
+    )
+    recorded_at = Column(
+        DateTime(timezone=True),
+        nullable=False,
+        server_default=func.now(),
+    )
+    notes = Column(Text, nullable=True)
+
+    __table_args__ = (
+        CheckConstraint(
+            "source IN ('eod_snapshot','startup_reconcile','manual')",
+            name='chk_nav_source',
+        ),
+        UniqueConstraint(
+            'strategy_id',
+            'snapshot_date',
+            name='uq_daily_nav_strategy_date',
+        ),
+    )
+
+
+class EvolutionEpoch(Base):
+    """GA evolution epoch record (Migration 7).
+
+    Append-only ledger of every GA run. The four ``eval_*`` columns are
+    mandatory because ``best_score`` is only meaningful when paired with
+    its evaluation context (pair / window / timeframe).
+    """
+
+    __tablename__ = 'evolution_epochs'
+
+    id = Column(String(64), primary_key=True)
+    strategy_id = Column(String, ForeignKey('strategy.id'), nullable=False)
+    started_at = Column(DateTime(timezone=True), nullable=False)
+    finished_at = Column(DateTime(timezone=True), nullable=True)
+    pop_size = Column(Integer, nullable=False)
+    max_generations = Column(Integer, nullable=False)
+    generations_run = Column(Integer, nullable=True)
+    # Numeric (Decimal) — float forbidden for monetary / ratio values.
+    best_score = Column(Numeric(18, 8), nullable=True)
+    seed = Column(BigInteger, nullable=False)
+    config_json = Column(
+        JSONB,
+        nullable=False,
+        server_default="'{}'::jsonb",
+    )
+    status = Column(
+        String(32),
+        nullable=False,
+        server_default='running',
+    )
+    eval_pair = Column(String(32), nullable=False)
+    eval_start_date = Column(Date, nullable=False)
+    eval_end_date = Column(Date, nullable=False)
+    eval_timeframe = Column(String(8), nullable=False)
+    notes = Column(Text, nullable=True)
+
+    __table_args__ = (
+        CheckConstraint(
+            "status IN ('running', 'completed', 'aborted')",
+            name='chk_epoch_status',
+        ),
+    )
+
+
+class GeneRecord(Base):
+    """GA gene record with role lifecycle (Migration 7).
+
+    Role transitions: ``challenger`` -> ``champion`` -> ``retired``. At
+    most one ``champion`` per strategy is enforced by a partial unique
+    index (defined in the migration via raw DDL).
+    """
+
+    __tablename__ = 'gene_records'
+
+    id = Column(_autoincrement_bigint(), primary_key=True, autoincrement=True)
+    strategy_id = Column(String, ForeignKey('strategy.id'), nullable=False)
+    role = Column(String(16), nullable=False)
+    param_pack = Column(JSONB, nullable=False)
+    # Numeric (Decimal) — float forbidden per project rules.
+    score_total = Column(Numeric(18, 8), nullable=False)
+    score_breakdown = Column(JSONB, nullable=False)
+    max_drawdown = Column(Numeric(10, 8), nullable=False)
+    epoch_id = Column(
+        String(64),
+        ForeignKey('evolution_epochs.id'),
+        nullable=False,
+    )
+    created_at = Column(
+        DateTime(timezone=True),
+        nullable=False,
+        server_default=func.now(),
+    )
+    activated_at = Column(DateTime(timezone=True), nullable=True)
+    retired_at = Column(DateTime(timezone=True), nullable=True)
+    notes = Column(Text, nullable=True)
+
+    __table_args__ = (
+        CheckConstraint(
+            "role IN ('challenger', 'champion', 'retired')",
+            name='chk_gene_role',
+        ),
+    )

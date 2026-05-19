@@ -22,12 +22,15 @@ impl Watchdog {
 
     pub async fn run(mut self) {
         info!("⚔️ Watchdog Active: Monitoring heartbeat:python");
-        
+
         // Connect to Redis
         let mut conn = match self.redis_client.get_multiplexed_async_connection().await {
             Ok(c) => c,
             Err(e) => {
-                error!("Watchdog failed to connect to Redis: {}. Exiting Watchdog.", e);
+                error!(
+                    "Watchdog failed to connect to Redis: {}. Exiting Watchdog.",
+                    e
+                );
                 return;
             }
         };
@@ -35,7 +38,8 @@ impl Watchdog {
         loop {
             // 1. Check Heartbeat
             // We expect the value to be a timestamp (ms) string
-            let heartbeat_res: redis::RedisResult<Option<String>> = conn.get("heartbeat:python").await;
+            let heartbeat_res: redis::RedisResult<Option<String>> =
+                conn.get("heartbeat:python").await;
 
             let mut trigger = false;
 
@@ -45,9 +49,9 @@ impl Watchdog {
                     if let Ok(ts) = ts_str.parse::<i64>() {
                         let now = SystemTime::now()
                             .duration_since(UNIX_EPOCH)
-                            .unwrap()
+                            .unwrap_or_default()
                             .as_millis() as i64;
-                        
+
                         if now - ts > 5000 {
                             warn!("Watchdog: Heartbeat stale (age: {}ms)", now - ts);
                             trigger = true;
@@ -61,7 +65,10 @@ impl Watchdog {
                 }
                 Ok(None) => {
                     self.missing_count += 1;
-                    warn!("Watchdog: Heartbeat missing (count: {})", self.missing_count);
+                    warn!(
+                        "Watchdog: Heartbeat missing (count: {})",
+                        self.missing_count
+                    );
                 }
                 Err(e) => {
                     warn!("Watchdog: Redis error reading heartbeat: {}", e);
@@ -78,17 +85,20 @@ impl Watchdog {
 
             if trigger {
                 error!("🚨 WATCHDOG TRIGGERED: Python heartbeat failure!");
-                
+
                 // 1. Lock System
                 if let Err(e) = conn.set::<_, _, ()>("system:state", "LOCKDOWN").await {
-                     error!("Watchdog failed to set system:state: {}", e);
+                    error!("Watchdog failed to set system:state: {}", e);
                 }
-                
+
                 // 2. Alert
-                if let Err(e) = conn.publish::<_, _, ()>("system:alert", "⚠️ Emergency Stop Triggered").await {
+                if let Err(e) = conn
+                    .publish::<_, _, ()>("system:alert", "⚠️ Emergency Stop Triggered")
+                    .await
+                {
                     error!("Watchdog failed to publish alert: {}", e);
                 }
-                
+
                 // 3. KILL (Cancel Orders)
                 // This is the most critical part
                 match self.backpack.cancel_all_orders().await {
@@ -100,7 +110,7 @@ impl Watchdog {
                 sleep(Duration::from_secs(5)).await;
                 // Reset missing count? Or keep triggering until fixed?
                 // If we reset, we re-evaluate.
-                self.missing_count = 0; 
+                self.missing_count = 0;
             }
 
             sleep(Duration::from_secs(1)).await;

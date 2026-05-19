@@ -1,20 +1,46 @@
+import asyncio
+from dataclasses import dataclass
 import json
 import time
-import hmac
-import hashlib
 import threading
-import os
 import logging
+import hashlib
+import hmac
 from typing import Optional, Dict, Any
 from urllib.parse import urlencode
 
 # Try to import websockets, handle if missing
 try:
-    import asyncio
     import websockets
     HAS_WEBSOCKETS = True
 except ImportError:
     HAS_WEBSOCKETS = False
+
+INITIAL_BACKOFF = 1.0
+MAX_BACKOFF = 300.0
+MAX_RETRIES = 10
+
+
+class OrderAckTimeout(TimeoutError):
+    """Raised when an exchange order ACK does not arrive before timeout."""
+
+
+@dataclass(frozen=True)
+class ExchangeAck:
+    exchange_order_id: str
+    ack_type: str
+
+
+def _sign_payload_binance(payload: str | Dict[str, Any], secret: str) -> str:
+    """Return Binance-compatible HMAC-SHA256 signature for a payload."""
+    if isinstance(payload, dict):
+        payload = urlencode(payload, doseq=True)
+    return hmac.new(
+        secret.encode("utf-8"),
+        payload.encode("utf-8"),
+        hashlib.sha256,
+    ).hexdigest()
+
 
 class WebSocketOrderConnector:
     """
@@ -32,6 +58,8 @@ class WebSocketOrderConnector:
         self.running = False
         self.thread = None
         self.logger = logging.getLogger("WS_Connector")
+        self._ack_registry: dict[str, ExchangeAck] = {}
+        self._ack_lock = threading.Lock()
 
     def _get_ws_url(self) -> str:
         if self.exchange_id == "binance":
@@ -47,13 +75,13 @@ class WebSocketOrderConnector:
             return
 
         if not self.ws_url:
-            self.logger.warning(f"⚠️ No WS URL for {self.exchange_id}. WS Order Entry disabled.")
+            self.logger.warning("⚠️ No WS URL for %s. WS Order Entry disabled.", self.exchange_id)
             return
 
         self.running = True
         self.thread = threading.Thread(target=self._run_event_loop, daemon=True)
         self.thread.start()
-        print(f"🔌 WS Order Connector: Starting connection to {self.ws_url}...")
+        self.logger.info("WS Order Connector: Starting connection to %s...", self.ws_url)
 
     def _run_event_loop(self):
         self.loop = asyncio.new_event_loop()
@@ -61,26 +89,38 @@ class WebSocketOrderConnector:
         self.loop.run_until_complete(self._connect_and_listen())
 
     async def _connect_and_listen(self):
+        backoff = INITIAL_BACKOFF
+        attempts = 0
+
         while self.running:
             try:
                 async with websockets.connect(self.ws_url) as ws:
                     self.ws = ws
-                    print("✅ WS Order Connector: Connected.")
+                    self.logger.info("WS Order Connector: Connected.")
+                    # Reset backoff on successful connection
+                    backoff = INITIAL_BACKOFF
+                    attempts = 0
                     await self._authenticate(ws)
-                    
+
                     # Heartbeat & Listen Loop
                     while self.running:
-                        # Listener (for order updates)
                         try:
                             msg = await asyncio.wait_for(ws.recv(), timeout=5.0)
                             self._handle_message(msg)
                         except asyncio.TimeoutError:
-                            # Send Ping/Keepalive if needed
                             continue
             except Exception as e:
-                print(f"❌ WS Connection Error: {e}. Reconnecting in 5s...")
-                await asyncio.sleep(5)
                 self.ws = None
+                attempts += 1
+                if attempts > MAX_RETRIES:
+                    self.logger.error("Max reconnection attempts (%d) exceeded. Stopping.",
+                                     MAX_RETRIES)
+                    self.running = False
+                    return
+                self.logger.warning("WS Connection Error: %s. Reconnecting in %.1fs (attempt %d/%d)",
+                                    e, backoff, attempts, MAX_RETRIES)
+                await asyncio.sleep(backoff)
+                backoff = min(backoff * 2, MAX_BACKOFF)
 
     async def _authenticate(self, ws):
         # Implementation depends on Exchange API
@@ -91,9 +131,62 @@ class WebSocketOrderConnector:
 
     def _handle_message(self, msg: str):
         # Process order updates
-        pass
+        try:
+            data = json.loads(msg)
+        except json.JSONDecodeError:
+            self.logger.warning("Ignoring non-JSON WS message: %s", msg)
+            return
 
-    def place_order(self, symbol: str, side: str, quantity: float, price: Optional[float] = None, order_type: str = "MARKET") -> bool:
+        coid = (
+            data.get("clientOrderId")
+            or data.get("client_order_id")
+            or data.get("c")
+            or data.get("params", {}).get("clientOrderId")
+        )
+        exchange_order_id = (
+            data.get("orderId")
+            or data.get("exchange_order_id")
+            or data.get("i")
+            or data.get("params", {}).get("orderId")
+        )
+        ack_type = (
+            data.get("ack_type")
+            or data.get("status")
+            or data.get("X")
+            or data.get("params", {}).get("status")
+            or "ACK"
+        )
+        if coid and exchange_order_id:
+            self._record_ack(str(coid), ExchangeAck(str(exchange_order_id), str(ack_type)))
+
+    def _record_ack(self, client_order_id: str, ack: ExchangeAck) -> None:
+        with self._ack_lock:
+            self._ack_registry[client_order_id] = ack
+
+    async def _wait_for_ack(self, client_order_id: str, timeout: float = 3.0) -> ExchangeAck:
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + timeout
+        delay = 0.01
+        while True:
+            with self._ack_lock:
+                ack = self._ack_registry.pop(client_order_id, None)
+            if ack is not None:
+                return ack
+            remaining = deadline - loop.time()
+            if remaining <= 0:
+                raise OrderAckTimeout(f"timed out waiting for order ack: {client_order_id}")
+            await asyncio.sleep(min(delay, remaining))
+            delay = min(delay * 2, 0.25)
+
+    def place_order(
+        self,
+        symbol: str,
+        side: str,
+        quantity: float,
+        price: Optional[float] = None,
+        order_type: str = "MARKET",
+        client_order_id: Optional[str] = None,
+    ) -> bool:
         """
         Sends order via WebSocket. Returns True if sent (async), False if failed/fallback needed.
         """
@@ -116,6 +209,8 @@ class WebSocketOrderConnector:
             },
             "id": int(time.time() * 1000)
         }
+        if client_order_id:
+            payload["params"]["newClientOrderId"] = client_order_id
         
         # Sign payload
         self._sign_payload(payload)
@@ -125,7 +220,7 @@ class WebSocketOrderConnector:
              asyncio.run_coroutine_threadsafe(self.ws.send(json.dumps(payload)), self.loop)
              return True
         except Exception as e:
-            print(f"⚠️ Failed to send WS order: {e}")
+            self.logger.warning("Failed to send WS order: %s", e)
             return False
 
     def _sign_payload(self, payload: Dict[str, Any]):
@@ -134,3 +229,11 @@ class WebSocketOrderConnector:
             # Mock signature logic
             payload["signature"] = "signed_hash"
         pass
+
+    def is_connected(self, exchange_id: str) -> bool:
+        """
+        Checks if the WS connection is active for the given exchange.
+        """
+        # In this simple implementation, we just check if self.ws is not None
+        # and match the exchange_id.
+        return self.running and self.ws is not None and self.exchange_id == exchange_id.lower()

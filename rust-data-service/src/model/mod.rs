@@ -23,6 +23,12 @@ impl Candlestick {
         {
             anyhow::bail!("Prices must be positive");
         }
+        if self.high < self.open || self.high < self.close {
+            anyhow::bail!("OHLC invariant violated: high must be >= open and close");
+        }
+        if self.low > self.open || self.low > self.close {
+            anyhow::bail!("OHLC invariant violated: low must be <= open and close");
+        }
         if self.volume < Decimal::ZERO {
             anyhow::bail!("Volume cannot be negative");
         }

@@ -1,0 +1,605 @@
+"""Tests for CcxtExchangeAdapter and adapter factory."""
+
+from decimal import Decimal
+from unittest.mock import MagicMock, patch
+
+import pytest
+
+from src.core.adapters import create_adapter
+from src.core.adapters.ccxt_adapter import CcxtExchangeAdapter
+from src.core.adapters.live_binance import LiveBinanceAdapter
+from src.core.adapters.simulated import SimulatedAdapter
+from src.core.client_order_id import to_exchange_format
+from src.core.interfaces.exchange import ExchangeError, InsufficientFundsError, NetworkError
+from src.core.orm_models import Order
+
+CANONICAL_CLIENT_ORDER_ID = "strategy_1-worker_a-entry-1704067200000000000"
+
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+def _make_order(**overrides) -> Order:
+    defaults = {
+        "id": 1,
+        "strategy_id": "test-strat",
+        "product_id": "BINANCE:BTCUSDT-PERP",
+        "side": "buy",
+        "type": "market",
+        "quantity": Decimal("0.01"),
+        "price": None,
+        "status": "OPEN",
+        "exchange_order_id": None,
+        "client_order_id": None,
+    }
+    defaults.update(overrides)
+    order = MagicMock(spec=Order)
+    for k, v in defaults.items():
+        setattr(order, k, v)
+    return order
+
+
+@pytest.fixture
+def mock_ccxt_client():
+    """A mock CCXT exchange client."""
+    client = MagicMock()
+    client.apiKey = "test-key"
+    client.secret = "test-secret"
+    return client
+
+
+@pytest.fixture
+def adapter(mock_ccxt_client):
+    """CcxtExchangeAdapter with a mocked CCXT client injected."""
+    with patch("src.core.adapters.ccxt_adapter.ccxt") as mock_ccxt:
+        mock_exchange_cls = MagicMock(return_value=mock_ccxt_client)
+        mock_ccxt.binance = mock_exchange_cls
+        setattr(mock_ccxt, "binance", mock_exchange_cls)
+        a = CcxtExchangeAdapter(
+            exchange_id="binance",
+            api_key="test-key",
+            secret="test-secret",
+            testnet=True,
+        )
+    # Ensure client is our mock
+    a.client = mock_ccxt_client
+    return a
+
+
+# ---------------------------------------------------------------------------
+# CcxtExchangeAdapter
+# ---------------------------------------------------------------------------
+
+
+class TestCcxtAdapterInit:
+    def test_invalid_exchange_raises(self):
+        with pytest.raises(ValueError, match="not supported"):
+            CcxtExchangeAdapter(exchange_id="nonexistent_exchange_xyz")
+
+    def test_valid_exchange_creates_adapter(self, adapter):
+        assert adapter.exchange_id == "binance"
+
+
+class TestPlaceOrder:
+    def test_market_order(self, adapter, mock_ccxt_client):
+        mock_ccxt_client.create_order.return_value = {"id": "EX-123"}
+        order = _make_order()
+
+        result = adapter.place_order(order)
+
+        assert result == "EX-123"
+        mock_ccxt_client.create_order.assert_called_once()
+        call_kwargs = mock_ccxt_client.create_order.call_args
+        assert call_kwargs.kwargs["symbol"] == "BTC/USDT:USDT"
+        assert call_kwargs.kwargs["type"] == "market"
+        assert call_kwargs.kwargs["side"] == "buy"
+
+    def test_limit_order_includes_gtc(self, adapter, mock_ccxt_client):
+        mock_ccxt_client.create_order.return_value = {"id": "EX-456"}
+        order = _make_order(type="limit", price=Decimal("50000"))
+
+        adapter.place_order(order)
+
+        call_kwargs = mock_ccxt_client.create_order.call_args
+        assert call_kwargs.kwargs["params"]["timeInForce"] == "GTC"
+        assert call_kwargs.kwargs["price"] == "50000"
+
+    def test_binance_order_passes_client_order_id(self, adapter, mock_ccxt_client):
+        mock_ccxt_client.create_order.return_value = {"id": "EX-789"}
+        order = _make_order(client_order_id=CANONICAL_CLIENT_ORDER_ID)
+
+        adapter.place_order(order)
+
+        call_kwargs = mock_ccxt_client.create_order.call_args
+        assert call_kwargs.kwargs["params"]["newClientOrderId"] == to_exchange_format(
+            CANONICAL_CLIENT_ORDER_ID,
+            "binance",
+        )
+
+    def test_non_binance_order_passes_client_order_id(self, mock_ccxt_client):
+        with patch("src.core.adapters.ccxt_adapter.ccxt") as mock_ccxt:
+            mock_exchange_cls = MagicMock(return_value=mock_ccxt_client)
+            mock_ccxt.bybit = mock_exchange_cls
+            setattr(mock_ccxt, "bybit", mock_exchange_cls)
+            adapter = CcxtExchangeAdapter(
+                exchange_id="bybit",
+                api_key="test-key",
+                secret="test-secret",
+            )
+        adapter.client = mock_ccxt_client
+        mock_ccxt_client.create_order.return_value = {"id": "EX-789"}
+        order = _make_order(
+            product_id="BYBIT:BTCUSDT-PERP",
+            client_order_id=CANONICAL_CLIENT_ORDER_ID,
+        )
+
+        adapter.place_order(order)
+
+        call_kwargs = mock_ccxt_client.create_order.call_args
+        assert call_kwargs.kwargs["params"]["clientOrderId"] == CANONICAL_CLIENT_ORDER_ID
+
+    def test_insufficient_funds_raises(self, adapter, mock_ccxt_client):
+        import ccxt as ccxt_lib
+        mock_ccxt_client.create_order.side_effect = ccxt_lib.InsufficientFunds("no money")
+        order = _make_order()
+
+        with pytest.raises(InsufficientFundsError):
+            adapter.place_order(order)
+
+    def test_network_error_raises(self, adapter, mock_ccxt_client):
+        import ccxt as ccxt_lib
+        mock_ccxt_client.create_order.side_effect = ccxt_lib.NetworkError("timeout")
+        order = _make_order()
+
+        with pytest.raises(NetworkError):
+            adapter.place_order(order)
+
+    def test_generic_ccxt_error_raises_exchange_error(self, adapter, mock_ccxt_client):
+        import ccxt as ccxt_lib
+        mock_ccxt_client.create_order.side_effect = ccxt_lib.ExchangeError("bad request")
+        order = _make_order()
+
+        with pytest.raises(ExchangeError):
+            adapter.place_order(order)
+
+
+class TestCancelOrder:
+    def test_cancel_success(self, adapter, mock_ccxt_client):
+        result = adapter.cancel_order("EX-123", "BINANCE:BTCUSDT-PERP")
+        assert result is True
+        mock_ccxt_client.cancel_order.assert_called_once_with("EX-123", "BTC/USDT:USDT")
+
+    def test_binance_cancel_by_client_order_id(self, adapter, mock_ccxt_client):
+        result = adapter.cancel_order_by_client_id(
+            CANONICAL_CLIENT_ORDER_ID,
+            "BINANCE:BTCUSDT-PERP",
+        )
+
+        exchange_client_order_id = to_exchange_format(
+            CANONICAL_CLIENT_ORDER_ID,
+            "binance",
+        )
+        assert result is True
+        mock_ccxt_client.cancel_order.assert_called_once_with(
+            exchange_client_order_id,
+            "BTC/USDT:USDT",
+            params={"origClientOrderId": exchange_client_order_id},
+        )
+
+    def test_non_binance_cancel_by_client_order_id(self, mock_ccxt_client):
+        with patch("src.core.adapters.ccxt_adapter.ccxt") as mock_ccxt:
+            mock_exchange_cls = MagicMock(return_value=mock_ccxt_client)
+            mock_ccxt.bybit = mock_exchange_cls
+            setattr(mock_ccxt, "bybit", mock_exchange_cls)
+            adapter = CcxtExchangeAdapter(
+                exchange_id="bybit",
+                api_key="test-key",
+                secret="test-secret",
+            )
+        adapter.client = mock_ccxt_client
+
+        result = adapter.cancel_order_by_client_id(
+            CANONICAL_CLIENT_ORDER_ID,
+            "BYBIT:BTCUSDT-PERP",
+        )
+
+        assert result is True
+        mock_ccxt_client.cancel_order.assert_called_once_with(
+            CANONICAL_CLIENT_ORDER_ID,
+            "BTC/USDT:USDT",
+            params={"clientOrderId": CANONICAL_CLIENT_ORDER_ID},
+        )
+
+    def test_cancel_order_not_found(self, adapter, mock_ccxt_client):
+        import ccxt as ccxt_lib
+        mock_ccxt_client.cancel_order.side_effect = ccxt_lib.OrderNotFound("not found")
+        result = adapter.cancel_order("EX-999", "BINANCE:BTCUSDT-PERP")
+        assert result is False
+
+    def test_cancel_generic_error(self, adapter, mock_ccxt_client):
+        import ccxt as ccxt_lib
+        mock_ccxt_client.cancel_order.side_effect = ccxt_lib.ExchangeError("fail")
+        result = adapter.cancel_order("EX-999", "BINANCE:BTCUSDT-PERP")
+        assert result is False
+
+
+class TestGetOrderByClientId:
+    def test_binance_fetches_order_with_exchange_safe_client_id(self, adapter, mock_ccxt_client):
+        exchange_client_order_id = to_exchange_format(
+            CANONICAL_CLIENT_ORDER_ID,
+            "binance",
+        )
+        mock_ccxt_client.fetch_order.return_value = {
+            "id": "EX-123",
+            "status": "open",
+            "clientOrderId": exchange_client_order_id,
+        }
+
+        snapshot = adapter.get_order_by_client_id(
+            CANONICAL_CLIENT_ORDER_ID,
+            "BINANCE:BTCUSDT-PERP",
+        )
+
+        assert snapshot is not None
+        assert snapshot.client_order_id == CANONICAL_CLIENT_ORDER_ID
+        assert snapshot.exchange_order_id == "EX-123"
+        assert snapshot.status == "open"
+        assert snapshot.raw["clientOrderId"] == exchange_client_order_id
+        mock_ccxt_client.fetch_order.assert_called_once_with(
+            exchange_client_order_id,
+            "BTC/USDT:USDT",
+            params={"origClientOrderId": exchange_client_order_id},
+        )
+
+    def test_non_binance_fetches_order_with_client_order_id(self, mock_ccxt_client):
+        with patch("src.core.adapters.ccxt_adapter.ccxt") as mock_ccxt:
+            mock_exchange_cls = MagicMock(return_value=mock_ccxt_client)
+            mock_ccxt.bybit = mock_exchange_cls
+            setattr(mock_ccxt, "bybit", mock_exchange_cls)
+            adapter = CcxtExchangeAdapter(
+                exchange_id="bybit",
+                api_key="test-key",
+                secret="test-secret",
+            )
+        adapter.client = mock_ccxt_client
+        mock_ccxt_client.fetch_order.return_value = {
+            "id": "EX-456",
+            "status": "closed",
+            "clientOrderId": CANONICAL_CLIENT_ORDER_ID,
+        }
+
+        snapshot = adapter.get_order_by_client_id(
+            CANONICAL_CLIENT_ORDER_ID,
+            "BYBIT:BTCUSDT-PERP",
+        )
+
+        assert snapshot is not None
+        assert snapshot.exchange_order_id == "EX-456"
+        assert snapshot.status == "closed"
+        mock_ccxt_client.fetch_order.assert_called_once_with(
+            CANONICAL_CLIENT_ORDER_ID,
+            "BTC/USDT:USDT",
+            params={"clientOrderId": CANONICAL_CLIENT_ORDER_ID},
+        )
+
+    def test_fetch_order_not_found_returns_none(self, adapter, mock_ccxt_client):
+        import ccxt as ccxt_lib
+
+        mock_ccxt_client.fetch_order.side_effect = ccxt_lib.OrderNotFound("not found")
+
+        assert (
+            adapter.get_order_by_client_id(
+                CANONICAL_CLIENT_ORDER_ID,
+                "BINANCE:BTCUSDT-PERP",
+            )
+            is None
+        )
+
+    def test_fetch_order_error_raises_exchange_error(self, adapter, mock_ccxt_client):
+        import ccxt as ccxt_lib
+
+        mock_ccxt_client.fetch_order.side_effect = ccxt_lib.ExchangeError("fail")
+
+        with pytest.raises(ExchangeError):
+            adapter.get_order_by_client_id(
+                CANONICAL_CLIENT_ORDER_ID,
+                "BINANCE:BTCUSDT-PERP",
+            )
+
+
+class TestGetBalance:
+    def test_returns_decimal(self, adapter, mock_ccxt_client):
+        mock_ccxt_client.fetch_balance.return_value = {"free": {"USDT": 1234.56}}
+        result = adapter.get_balance("USDT")
+        assert result == Decimal("1234.56")
+
+    def test_unknown_asset_returns_zero(self, adapter, mock_ccxt_client):
+        mock_ccxt_client.fetch_balance.return_value = {"free": {}}
+        result = adapter.get_balance("ETH")
+        assert result == Decimal("0")
+
+    def test_fetch_error_raises(self, adapter, mock_ccxt_client):
+        import ccxt as ccxt_lib
+        mock_ccxt_client.fetch_balance.side_effect = ccxt_lib.ExchangeError("fail")
+        with pytest.raises(ExchangeError):
+            adapter.get_balance("USDT")
+
+
+class TestGetPosition:
+    def test_long_position(self, adapter, mock_ccxt_client):
+        mock_ccxt_client.fetch_positions.return_value = [
+            {
+                "symbol": "BTC/USDT:USDT",
+                "contracts": 0.5,
+                "entryPrice": 65000,
+                "unrealizedPnl": 100,
+            }
+        ]
+        pos = adapter.get_position("BINANCE:BTCUSDT-PERP")
+        assert pos is not None
+        assert pos.side == "LONG"
+        assert pos.quantity == Decimal("0.5")
+        assert pos.entry_price == Decimal("65000")
+
+    def test_short_position(self, adapter, mock_ccxt_client):
+        mock_ccxt_client.fetch_positions.return_value = [
+            {
+                "symbol": "BTC/USDT:USDT",
+                "contracts": -0.3,
+                "entryPrice": 70000,
+                "unrealizedPnl": -50,
+            }
+        ]
+        pos = adapter.get_position("BINANCE:BTCUSDT-PERP")
+        assert pos is not None
+        assert pos.side == "SHORT"
+        assert pos.quantity == Decimal("0.3")
+
+    def test_no_position_returns_none(self, adapter, mock_ccxt_client):
+        mock_ccxt_client.fetch_positions.return_value = [
+            {"symbol": "BTC/USDT:USDT", "contracts": 0, "entryPrice": 0, "unrealizedPnl": 0}
+        ]
+        assert adapter.get_position("BINANCE:BTCUSDT-PERP") is None
+
+    def test_wrong_symbol_returns_none(self, adapter, mock_ccxt_client):
+        mock_ccxt_client.fetch_positions.return_value = [
+            {"symbol": "ETH/USDT:USDT", "contracts": 1, "entryPrice": 3000, "unrealizedPnl": 0}
+        ]
+        assert adapter.get_position("BINANCE:BTCUSDT-PERP") is None
+
+    def test_fetch_error_raises(self, adapter, mock_ccxt_client):
+        import ccxt as ccxt_lib
+        mock_ccxt_client.fetch_positions.side_effect = ccxt_lib.ExchangeError("fail")
+        with pytest.raises(ExchangeError):
+            adapter.get_position("BINANCE:BTCUSDT-PERP")
+
+
+# ---------------------------------------------------------------------------
+# create_adapter factory
+# ---------------------------------------------------------------------------
+
+
+class TestCreateAdapter:
+    def test_simulated_default(self):
+        a = create_adapter({})
+        assert isinstance(a, SimulatedAdapter)
+
+    def test_simulated_explicit(self):
+        a = create_adapter({"mode": "simulated", "balance": 50000})
+        assert isinstance(a, SimulatedAdapter)
+        assert a.get_balance("USDT") == Decimal("50000")
+
+    def test_live_creates_ccxt_adapter(self):
+        with patch("src.core.adapters.ccxt_adapter.ccxt") as mock_ccxt:
+            mock_cls = MagicMock()
+            mock_cls.return_value = MagicMock()
+            mock_ccxt.bybit = mock_cls
+            setattr(mock_ccxt, "bybit", mock_cls)
+
+            a = create_adapter({
+                "mode": "live",
+                "exchange": "bybit",
+                "api_key": "k",
+                "secret": "s",
+                "testnet": True,
+            })
+            assert isinstance(a, CcxtExchangeAdapter)
+
+    def test_live_binance_with_ws(self):
+        with patch("src.core.adapters.ccxt_adapter.ccxt") as mock_ccxt, \
+             patch("src.core.adapters.live_binance.WebSocketOrderConnector"):
+            mock_cls = MagicMock()
+            client = MagicMock()
+            client.apiKey = "k"
+            client.secret = "s"
+            mock_cls.return_value = client
+            mock_ccxt.binance = mock_cls
+            setattr(mock_ccxt, "binance", mock_cls)
+
+            a = create_adapter({
+                "mode": "live",
+                "exchange": "binance",
+                "enable_ws": True,
+                "api_key": "k",
+                "secret": "s",
+            })
+            assert isinstance(a, LiveBinanceAdapter)
+
+
+# ---------------------------------------------------------------------------
+# LiveBinanceAdapter
+# ---------------------------------------------------------------------------
+
+
+class TestLiveBinanceWsInit:
+
+    def test_ws_init_failure_falls_back_to_rest(self):
+        """WS init failure should set ws_connector to None (REST fallback)."""
+        with patch("src.core.adapters.ccxt_adapter.ccxt") as mock_ccxt, \
+             patch("src.core.adapters.live_binance.WebSocketOrderConnector", side_effect=RuntimeError("ws fail")):
+            mock_cls = MagicMock()
+            client = MagicMock()
+            client.apiKey = "k"
+            client.secret = "s"
+            mock_cls.return_value = client
+            mock_ccxt.binance = mock_cls
+            setattr(mock_ccxt, "binance", mock_cls)
+
+            adapter = LiveBinanceAdapter(api_key="k", secret="s", enable_ws=True)
+            assert adapter.ws_connector is None
+
+    def test_ws_disabled_no_connector(self):
+        """When enable_ws=False, ws_connector should be None."""
+        with patch("src.core.adapters.ccxt_adapter.ccxt") as mock_ccxt:
+            mock_cls = MagicMock()
+            client = MagicMock()
+            client.apiKey = "k"
+            client.secret = "s"
+            mock_cls.return_value = client
+            mock_ccxt.binance = mock_cls
+            setattr(mock_ccxt, "binance", mock_cls)
+
+            adapter = LiveBinanceAdapter(api_key="k", secret="s", enable_ws=False)
+            assert adapter.ws_connector is None
+
+
+class TestLiveBinanceWsOrderPath:
+
+    def test_market_order_via_ws(self):
+        """Market order should use WS fast path when connected."""
+        with patch("src.core.adapters.ccxt_adapter.ccxt") as mock_ccxt, \
+             patch("src.core.adapters.live_binance.WebSocketOrderConnector") as MockWS:
+            mock_cls = MagicMock()
+            client = MagicMock()
+            client.apiKey = "k"
+            client.secret = "s"
+            mock_cls.return_value = client
+            mock_ccxt.binance = mock_cls
+            setattr(mock_ccxt, "binance", mock_cls)
+
+            mock_ws_inst = MagicMock()
+            mock_ws_inst.is_connected.return_value = True
+            mock_ws_inst.place_order.return_value = True
+
+            async def wait_for_ack(client_order_id):
+                return MagicMock(exchange_order_id="WS-123")
+
+            mock_ws_inst._wait_for_ack.side_effect = wait_for_ack
+            MockWS.return_value = mock_ws_inst
+
+            adapter = LiveBinanceAdapter(api_key="k", secret="s", enable_ws=True)
+            order = _make_order(type="market", client_order_id=CANONICAL_CLIENT_ORDER_ID)
+            result = adapter.place_order(order)
+
+            exchange_client_order_id = to_exchange_format(
+                CANONICAL_CLIENT_ORDER_ID,
+                "binance",
+            )
+            assert result == "WS-123"
+            mock_ws_inst.place_order.assert_called_once()
+            assert (
+                mock_ws_inst.place_order.call_args.kwargs["client_order_id"]
+                == exchange_client_order_id
+            )
+            mock_ws_inst._wait_for_ack.assert_called_once_with(exchange_client_order_id)
+
+    def test_ws_ack_timeout_falls_back_to_rest(self):
+        """WS ACK timeout should fall back to REST."""
+        with patch("src.core.adapters.ccxt_adapter.ccxt") as mock_ccxt, \
+             patch("src.core.adapters.live_binance.WebSocketOrderConnector") as MockWS:
+            mock_cls = MagicMock()
+            client = MagicMock()
+            client.apiKey = "k"
+            client.secret = "s"
+            client.create_order.return_value = {"id": "REST-ACK-TIMEOUT"}
+            mock_cls.return_value = client
+            mock_ccxt.binance = mock_cls
+            setattr(mock_ccxt, "binance", mock_cls)
+
+            mock_ws_inst = MagicMock()
+            mock_ws_inst.is_connected.return_value = True
+            mock_ws_inst.place_order.return_value = True
+            mock_ws_inst._wait_for_ack.side_effect = TimeoutError("ack timeout")
+            MockWS.return_value = mock_ws_inst
+
+            adapter = LiveBinanceAdapter(api_key="k", secret="s", enable_ws=True)
+            adapter.client = client
+            order = _make_order(type="market", client_order_id=CANONICAL_CLIENT_ORDER_ID)
+            result = adapter.place_order(order)
+
+            assert result == "REST-ACK-TIMEOUT"
+
+    def test_ws_failure_falls_back_to_rest(self):
+        """WS order failure should fall back to REST."""
+        with patch("src.core.adapters.ccxt_adapter.ccxt") as mock_ccxt, \
+             patch("src.core.adapters.live_binance.WebSocketOrderConnector") as MockWS:
+            mock_cls = MagicMock()
+            client = MagicMock()
+            client.apiKey = "k"
+            client.secret = "s"
+            client.create_order.return_value = {"id": "REST-123"}
+            mock_cls.return_value = client
+            mock_ccxt.binance = mock_cls
+            setattr(mock_ccxt, "binance", mock_cls)
+
+            mock_ws_inst = MagicMock()
+            mock_ws_inst.is_connected.return_value = True
+            mock_ws_inst.place_order.side_effect = RuntimeError("ws order fail")
+            MockWS.return_value = mock_ws_inst
+
+            adapter = LiveBinanceAdapter(api_key="k", secret="s", enable_ws=True)
+            adapter.client = client  # ensure REST uses our mock
+            order = _make_order(type="market")
+            result = adapter.place_order(order)
+
+            assert result == "REST-123"
+
+    def test_limit_order_uses_rest(self):
+        """Limit orders should always use REST path (not WS)."""
+        with patch("src.core.adapters.ccxt_adapter.ccxt") as mock_ccxt, \
+             patch("src.core.adapters.live_binance.WebSocketOrderConnector") as MockWS:
+            mock_cls = MagicMock()
+            client = MagicMock()
+            client.apiKey = "k"
+            client.secret = "s"
+            client.create_order.return_value = {"id": "REST-456"}
+            mock_cls.return_value = client
+            mock_ccxt.binance = mock_cls
+            setattr(mock_ccxt, "binance", mock_cls)
+
+            mock_ws_inst = MagicMock()
+            mock_ws_inst.is_connected.return_value = True
+            MockWS.return_value = mock_ws_inst
+
+            adapter = LiveBinanceAdapter(api_key="k", secret="s", enable_ws=True)
+            adapter.client = client
+            order = _make_order(type="limit", price=Decimal("50000"))
+            result = adapter.place_order(order)
+
+            assert result == "REST-456"
+            mock_ws_inst.place_order.assert_not_called()
+
+    def test_ws_disconnected_uses_rest(self):
+        """When WS is not connected, should fall back to REST."""
+        with patch("src.core.adapters.ccxt_adapter.ccxt") as mock_ccxt, \
+             patch("src.core.adapters.live_binance.WebSocketOrderConnector") as MockWS:
+            mock_cls = MagicMock()
+            client = MagicMock()
+            client.apiKey = "k"
+            client.secret = "s"
+            client.create_order.return_value = {"id": "REST-789"}
+            mock_cls.return_value = client
+            mock_ccxt.binance = mock_cls
+            setattr(mock_ccxt, "binance", mock_cls)
+
+            mock_ws_inst = MagicMock()
+            mock_ws_inst.is_connected.return_value = False
+            MockWS.return_value = mock_ws_inst
+
+            adapter = LiveBinanceAdapter(api_key="k", secret="s", enable_ws=True)
+            adapter.client = client
+            order = _make_order(type="market")
+            result = adapter.place_order(order)
+
+            assert result == "REST-789"

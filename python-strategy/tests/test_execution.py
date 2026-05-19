@@ -1,0 +1,798 @@
+"""
+Tests for src/core/execution.py
+
+Covers:
+- Signal to order conversion
+- Side determination (LONG/SHORT/EXIT)
+- Order type detection (market/limit)
+- Adapter delegation
+- Error handling on execution failure
+- Market data processing for simulated fills
+"""
+
+from contextlib import nullcontext
+
+import pytest
+from decimal import Decimal
+
+from src.core.execution import ExecutionEngine
+from src.core.interfaces.exchange import ExchangeError
+from src.core.interfaces.exchange import ExchangeOrderLookupUnsupported
+from src.core.models import OrderStatus, SignalType
+from src.core.client_order_id import generate_client_order_id, parse_client_order_id
+
+
+@pytest.fixture
+def execution_engine(mock_db_session, mock_clock, mock_exchange_adapter, mock_order_repo):
+    """Provides an ExecutionEngine with mock dependencies."""
+    return ExecutionEngine(
+        db_session=mock_db_session,
+        clock=mock_clock,
+        adapter=mock_exchange_adapter,
+        order_repository=mock_order_repo
+    )
+
+
+class TestSideDetermination:
+    """Tests for signal type to order side mapping."""
+
+    def test_long_signal_becomes_buy(self, execution_engine, signal_factory):
+        """LONG signal should produce a buy order."""
+        signal = signal_factory(signal_type=SignalType.LONG, price=Decimal("42000"))
+        order_id = execution_engine.execute_signal(signal)
+
+        assert order_id is not None
+
+    def test_short_signal_becomes_sell(self, execution_engine, signal_factory):
+        """SHORT signal should produce a sell order."""
+        signal = signal_factory(signal_type=SignalType.SHORT, price=Decimal("42000"))
+        order_id = execution_engine.execute_signal(signal)
+
+        assert order_id is not None
+
+    def test_exit_long_becomes_sell(self, execution_engine, signal_factory):
+        """EXIT_LONG signal should produce a sell order."""
+        signal = signal_factory(signal_type=SignalType.EXIT_LONG, price=Decimal("42000"))
+        order_id = execution_engine.execute_signal(signal)
+
+        assert order_id is not None
+
+    def test_exit_short_becomes_buy(self, execution_engine, signal_factory):
+        """EXIT_SHORT signal should produce a buy order."""
+        signal = signal_factory(signal_type=SignalType.EXIT_SHORT, price=Decimal("42000"))
+        order_id = execution_engine.execute_signal(signal)
+
+        assert order_id is not None
+
+    def test_no_signal_returns_none(self, execution_engine, signal_factory):
+        """NO_SIGNAL should return None (no order created)."""
+        signal = signal_factory(signal_type=SignalType.NO_SIGNAL)
+        order_id = execution_engine.execute_signal(signal)
+
+        assert order_id is None
+
+
+class TestOrderTypeDetection:
+    """Tests for order type (market/limit) detection."""
+
+    def test_signal_with_price_creates_limit(self, execution_engine, signal_factory, mock_exchange_adapter):
+        """Signal with price should create limit order."""
+        signal = signal_factory(price=Decimal("42000"))
+        execution_engine.execute_signal(signal)
+
+        assert len(mock_exchange_adapter.open_orders) == 1
+        assert mock_exchange_adapter.open_orders[0].type == "limit"
+
+    def test_signal_with_value_creates_limit(self, execution_engine, signal_factory, mock_exchange_adapter):
+        """Signal with value (legacy) should create limit order."""
+        signal = signal_factory(price=None, value=Decimal("42000"))
+        execution_engine.execute_signal(signal)
+
+        assert len(mock_exchange_adapter.open_orders) == 1
+        assert mock_exchange_adapter.open_orders[0].type == "limit"
+
+    def test_signal_without_price_creates_market(self, execution_engine, signal_factory, mock_exchange_adapter):
+        """Signal without price should create market order."""
+        signal = signal_factory(price=None, value=None)
+        execution_engine.execute_signal(signal)
+
+        assert len(mock_exchange_adapter.open_orders) == 1
+        assert mock_exchange_adapter.open_orders[0].type == "market"
+
+
+class TestQuantityHandling:
+    """Tests for quantity determination."""
+
+    def test_signal_quantity_used(self, execution_engine, signal_factory, mock_exchange_adapter):
+        """Signal's quantity should be used when provided."""
+        signal = signal_factory(quantity=Decimal("0.5"), price=Decimal("42000"))
+        execution_engine.execute_signal(signal)
+
+        assert mock_exchange_adapter.open_orders[0].quantity == Decimal("0.5")
+
+    def test_default_quantity_when_none(self, execution_engine, signal_factory, mock_exchange_adapter):
+        """Default quantity should be used when signal quantity is None."""
+        signal = signal_factory(quantity=None, price=Decimal("42000"))
+        execution_engine.execute_signal(signal)
+
+        assert mock_exchange_adapter.open_orders[0].quantity == Decimal("0.01")
+
+    def test_default_quantity_when_zero(self, execution_engine, signal_factory, mock_exchange_adapter):
+        """Default quantity should be used when signal quantity is zero."""
+        signal = signal_factory(quantity=Decimal("0"), price=Decimal("42000"))
+        execution_engine.execute_signal(signal)
+
+        assert mock_exchange_adapter.open_orders[0].quantity == Decimal("0.01")
+
+
+class TestAdapterDelegation:
+    """Tests for adapter order placement."""
+
+    def test_order_sent_to_adapter(self, execution_engine, signal_factory, mock_exchange_adapter):
+        """Order should be sent to adapter for execution."""
+        signal = signal_factory(price=Decimal("42000"))
+        execution_engine.execute_signal(signal)
+
+        assert len(mock_exchange_adapter.open_orders) == 1
+
+    def test_exchange_id_recorded(self, execution_engine, signal_factory, mock_order_repo):
+        """Exchange order ID should be recorded after placement."""
+        signal = signal_factory(price=Decimal("42000"))
+        order_id = execution_engine.execute_signal(signal)
+
+        order = mock_order_repo.orders[order_id]
+        assert order.exchange_order_id.startswith("MOCK-")
+
+    def test_multiple_signals_create_multiple_orders(
+        self, execution_engine, signal_factory, mock_exchange_adapter
+    ):
+        """Multiple signals should create independent orders."""
+        for _ in range(3):
+            signal = signal_factory(price=Decimal("42000"))
+            execution_engine.execute_signal(signal)
+
+        assert len(mock_exchange_adapter.open_orders) == 3
+
+
+class TestExecutionErrorHandling:
+    """Tests for error handling during execution."""
+
+    def test_adapter_failure_marks_order_failed(
+        self, execution_engine, signal_factory, mock_exchange_adapter, mock_order_repo
+    ):
+        """Adapter failure should mark order as failed."""
+        mock_exchange_adapter.set_should_fail(True, "Connection timeout")
+
+        signal = signal_factory(price=Decimal("42000"))
+        order_id = execution_engine.execute_signal(signal)
+
+        assert order_id is None
+
+        # Order should be in repo with failed status
+        failed_orders = [o for o in mock_order_repo.orders.values() if o.status == "failed"]
+        assert len(failed_orders) == 1
+
+    def test_adapter_failure_returns_none(
+        self, execution_engine, signal_factory, mock_exchange_adapter
+    ):
+        """Adapter failure should return None."""
+        mock_exchange_adapter.set_should_fail(True, "Insufficient funds")
+
+        signal = signal_factory(price=Decimal("42000"))
+        result = execution_engine.execute_signal(signal)
+
+        assert result is None
+
+
+class TestAuditedExecution:
+    """Tests for opt-in fail-stop audit execution path."""
+
+    def test_requires_session_factory(
+        self, mock_db_session, mock_clock, mock_exchange_adapter, mock_order_repo, signal_factory
+    ):
+        engine = ExecutionEngine(
+            db_session=mock_db_session,
+            clock=mock_clock,
+            adapter=mock_exchange_adapter,
+            order_repository=mock_order_repo,
+            audit_external_orders=True,
+        )
+
+        with pytest.raises(RuntimeError, match="requires db_session_factory"):
+            engine.execute_signal(signal_factory(price=Decimal("42000")))
+
+    def test_success_writes_intent_and_outcome(
+        self, mock_db_session, mock_clock, mock_exchange_adapter, mock_order_repo, signal_factory
+    ):
+        audit_session = mock_db_session
+        engine = ExecutionEngine(
+            db_session=mock_db_session,
+            clock=mock_clock,
+            adapter=mock_exchange_adapter,
+            order_repository=mock_order_repo,
+            db_session_factory=lambda: nullcontext(audit_session),
+            audit_external_orders=True,
+        )
+        signal = signal_factory(price=Decimal("42000"), quantity=Decimal("0.25"))
+
+        order_id = engine.execute_signal(signal)
+
+        assert order_id is not None
+        order = mock_order_repo.orders[order_id]
+        coid = parse_client_order_id(order.client_order_id)
+        assert coid.strategy_id == signal.strategy_id
+        assert coid.instance_id == "execution"
+        assert coid.action == "long"
+        assert order.intent_payload["order"]["quantity"] == "0.25"
+        assert order.intent_payload["order"]["price"] == "42000"
+        assert order.status == OrderStatus.SUBMITTED.value
+        assert order.exchange_order_id.startswith("MOCK-")
+        audit = audit_session.add.call_args_list[0].args[0]
+        assert audit.client_order_id == order.client_order_id
+        assert audit.intent_payload["order"]["client_order_id"] == order.client_order_id
+        assert audit.outcome_payload["status"] == "placed"
+        assert audit.outcome_payload["exchange_order_id"].startswith("MOCK-")
+        assert audit.order_id == order.id
+        assert audit_session.flush.call_count == 1
+        assert audit_session.commit.call_count == 2
+
+    def test_exchange_failure_writes_outcome_then_raises(
+        self, mock_db_session, mock_clock, mock_exchange_adapter, mock_order_repo, signal_factory
+    ):
+        mock_exchange_adapter.set_should_fail(True, "Connection timeout")
+        audit_session = mock_db_session
+        engine = ExecutionEngine(
+            db_session=mock_db_session,
+            clock=mock_clock,
+            adapter=mock_exchange_adapter,
+            order_repository=mock_order_repo,
+            db_session_factory=lambda: nullcontext(audit_session),
+            audit_external_orders=True,
+        )
+
+        with pytest.raises(ExchangeError, match="Connection timeout"):
+            engine.execute_signal(signal_factory(price=Decimal("42000")))
+
+        failed_orders = [o for o in mock_order_repo.orders.values() if o.status == "failed"]
+        assert len(failed_orders) == 1
+        audit = audit_session.add.call_args_list[0].args[0]
+        assert audit.order_id == failed_orders[0].id
+        assert audit.outcome_payload == {
+            "status": "failed",
+            "error": "Connection timeout",
+        }
+        assert audit_session.flush.call_count == 1
+        assert audit_session.commit.call_count == 2
+
+    def test_intent_audit_failure_stops_before_external_order(
+        self, mock_db_session, mock_clock, mock_exchange_adapter, mock_order_repo, signal_factory
+    ):
+        mock_db_session.flush.side_effect = RuntimeError("intent audit failed")
+        engine = ExecutionEngine(
+            db_session=mock_db_session,
+            clock=mock_clock,
+            adapter=mock_exchange_adapter,
+            order_repository=mock_order_repo,
+            db_session_factory=lambda: nullcontext(mock_db_session),
+            audit_external_orders=True,
+        )
+
+        with pytest.raises(RuntimeError, match="intent audit failed"):
+            engine.execute_signal(signal_factory(price=Decimal("42000")))
+
+        assert mock_exchange_adapter.open_orders == []
+        mock_db_session.rollback.assert_called_once()
+
+    def test_success_outcome_audit_failure_raises_after_external_order(
+        self, mock_db_session, mock_clock, mock_exchange_adapter, mock_order_repo, signal_factory
+    ):
+        mock_db_session.commit.side_effect = [None, RuntimeError("outcome audit failed")]
+        engine = ExecutionEngine(
+            db_session=mock_db_session,
+            clock=mock_clock,
+            adapter=mock_exchange_adapter,
+            order_repository=mock_order_repo,
+            db_session_factory=lambda: nullcontext(mock_db_session),
+            audit_external_orders=True,
+        )
+
+        with pytest.raises(RuntimeError, match="outcome audit failed"):
+            engine.execute_signal(signal_factory(price=Decimal("42000")))
+
+        assert len(mock_exchange_adapter.open_orders) == 1
+        audit = mock_db_session.add.call_args_list[0].args[0]
+        assert audit.outcome_payload["status"] == "placed"
+        mock_db_session.rollback.assert_called_once()
+
+    def test_exchange_failure_outcome_audit_failure_raises_audit_error(
+        self, mock_db_session, mock_clock, mock_exchange_adapter, mock_order_repo, signal_factory
+    ):
+        mock_exchange_adapter.set_should_fail(True, "Connection timeout")
+        mock_db_session.commit.side_effect = [None, RuntimeError("outcome audit failed")]
+        engine = ExecutionEngine(
+            db_session=mock_db_session,
+            clock=mock_clock,
+            adapter=mock_exchange_adapter,
+            order_repository=mock_order_repo,
+            db_session_factory=lambda: nullcontext(mock_db_session),
+            audit_external_orders=True,
+        )
+
+        with pytest.raises(RuntimeError, match="outcome audit failed"):
+            engine.execute_signal(signal_factory(price=Decimal("42000")))
+
+        failed_orders = [o for o in mock_order_repo.orders.values() if o.status == "failed"]
+        assert len(failed_orders) == 1
+        audit = mock_db_session.add.call_args_list[0].args[0]
+        assert audit.outcome_payload == {
+            "status": "failed",
+            "error": "Connection timeout",
+        }
+        mock_db_session.rollback.assert_called_once()
+
+    def test_existing_client_order_id_returns_existing_order_without_resubmit(
+        self, mock_db_session, mock_clock, mock_exchange_adapter, mock_order_repo, signal_factory, order_factory
+    ):
+        client_order_id = generate_client_order_id(
+            "test_strategy",
+            "execution",
+            "long",
+            clock_ns=lambda: 1704067200000000000,
+        )
+        existing_order = order_factory(
+            order_id="existing-order",
+            client_order_id=client_order_id,
+            exchange_order_id="EX-EXISTING",
+        )
+        mock_order_repo.add_order(existing_order)
+        engine = ExecutionEngine(
+            db_session=mock_db_session,
+            clock=mock_clock,
+            adapter=mock_exchange_adapter,
+            order_repository=mock_order_repo,
+            db_session_factory=lambda: nullcontext(mock_db_session),
+            audit_external_orders=True,
+        )
+
+        result = engine.execute_signal(
+            signal_factory(
+                price=Decimal("42000"),
+                metadata={"client_order_id": client_order_id},
+            )
+        )
+
+        assert result == "existing-order"
+        assert mock_exchange_adapter.open_orders == []
+        mock_db_session.add.assert_not_called()
+
+    def test_invalid_metadata_client_order_id_raises(
+        self, mock_db_session, mock_clock, mock_exchange_adapter, mock_order_repo, signal_factory
+    ):
+        engine = ExecutionEngine(
+            db_session=mock_db_session,
+            clock=mock_clock,
+            adapter=mock_exchange_adapter,
+            order_repository=mock_order_repo,
+            db_session_factory=lambda: nullcontext(mock_db_session),
+            audit_external_orders=True,
+        )
+
+        with pytest.raises(ValueError, match="client_order_id"):
+            engine.execute_signal(
+                signal_factory(
+                    price=Decimal("42000"),
+                    metadata={"client_order_id": "not-valid"},
+                )
+            )
+
+        assert mock_exchange_adapter.open_orders == []
+
+    def test_list_recoverable_client_orders_returns_inflight_client_orders(
+        self, mock_db_session, mock_clock, mock_exchange_adapter, mock_order_repo, order_factory
+    ):
+        engine = ExecutionEngine(
+            db_session=mock_db_session,
+            clock=mock_clock,
+            adapter=mock_exchange_adapter,
+            order_repository=mock_order_repo,
+        )
+        recoverable = order_factory(
+            order_id="recoverable",
+            client_order_id="client-1",
+            status=OrderStatus.SUBMITTED_UNCONFIRMED.value,
+        )
+        closed = order_factory(
+            order_id="closed",
+            client_order_id="client-2",
+            status="closed",
+        )
+        no_client_id = order_factory(
+            order_id="missing-client-id",
+            client_order_id=None,
+            status=OrderStatus.SUBMITTED.value,
+        )
+        mock_order_repo.add_order(recoverable)
+        mock_order_repo.add_order(closed)
+        mock_order_repo.add_order(no_client_id)
+
+        assert engine.list_recoverable_client_orders() == [recoverable]
+
+    def test_record_recoverable_order_scan_writes_reconcile_event(
+        self, mock_db_session, mock_clock, mock_exchange_adapter, mock_order_repo, order_factory
+    ):
+        engine = ExecutionEngine(
+            db_session=mock_db_session,
+            clock=mock_clock,
+            adapter=mock_exchange_adapter,
+            order_repository=mock_order_repo,
+            db_session_factory=lambda: nullcontext(mock_db_session),
+        )
+        new_order = order_factory(
+            order_id="new-order",
+            client_order_id="client-new",
+            status=OrderStatus.NEW.value,
+            exchange_order_id=None,
+        )
+        submitted_order = order_factory(
+            order_id="submitted-order",
+            client_order_id="client-submitted",
+            status=OrderStatus.SUBMITTED.value,
+            exchange_order_id="EX-1",
+        )
+        closed_order = order_factory(
+            order_id="closed-order",
+            client_order_id="client-closed",
+            status=OrderStatus.CANCELLED.value,
+        )
+        mock_order_repo.add_order(new_order)
+        mock_order_repo.add_order(submitted_order)
+        mock_order_repo.add_order(closed_order)
+
+        payload = engine.record_recoverable_order_scan()
+
+        assert payload["recoverable_count"] == 2
+        assert payload["status_counts"] == {
+            OrderStatus.NEW.value: 1,
+            OrderStatus.SUBMITTED.value: 1,
+        }
+        assert [order["order_id"] for order in payload["orders"]] == [
+            "new-order",
+            "submitted-order",
+        ]
+        event = mock_db_session.add.call_args.args[0]
+        assert event.event_type == "reconcile"
+        assert event.event_subtype == "startup_recovery_scan"
+        assert event.payload == payload
+        mock_db_session.commit.assert_called_once()
+        mock_db_session.rollback.assert_not_called()
+
+    def test_record_recoverable_order_scan_requires_session_factory(
+        self, mock_db_session, mock_clock, mock_exchange_adapter, mock_order_repo
+    ):
+        engine = ExecutionEngine(
+            db_session=mock_db_session,
+            clock=mock_clock,
+            adapter=mock_exchange_adapter,
+            order_repository=mock_order_repo,
+        )
+
+        with pytest.raises(RuntimeError, match="requires db_session_factory"):
+            engine.record_recoverable_order_scan()
+
+    def test_record_recoverable_order_scan_rolls_back_on_event_failure(
+        self, mock_db_session, mock_clock, mock_exchange_adapter, mock_order_repo, order_factory
+    ):
+        mock_db_session.add.side_effect = RuntimeError("event write failed")
+        engine = ExecutionEngine(
+            db_session=mock_db_session,
+            clock=mock_clock,
+            adapter=mock_exchange_adapter,
+            order_repository=mock_order_repo,
+            db_session_factory=lambda: nullcontext(mock_db_session),
+        )
+        mock_order_repo.add_order(
+            order_factory(
+                order_id="recoverable",
+                client_order_id="client-1",
+                status=OrderStatus.SUBMITTED_UNCONFIRMED.value,
+            )
+        )
+
+        with pytest.raises(RuntimeError, match="event write failed"):
+            engine.record_recoverable_order_scan()
+
+        mock_db_session.rollback.assert_called_once()
+
+    def test_reconcile_recoverable_client_orders_records_exchange_snapshots(
+        self, mock_db_session, mock_clock, mock_exchange_adapter, mock_order_repo, order_factory
+    ):
+        engine = ExecutionEngine(
+            db_session=mock_db_session,
+            clock=mock_clock,
+            adapter=mock_exchange_adapter,
+            order_repository=mock_order_repo,
+            db_session_factory=lambda: nullcontext(mock_db_session),
+        )
+        found_order = order_factory(
+            order_id="found-local",
+            client_order_id="client-found",
+            status=OrderStatus.SUBMITTED.value,
+            exchange_order_id="EX-LOCAL",
+        )
+        missing_order = order_factory(
+            order_id="missing-local",
+            client_order_id="client-missing",
+            status=OrderStatus.SUBMITTED_UNCONFIRMED.value,
+            exchange_order_id=None,
+        )
+        ignored_order = order_factory(
+            order_id="closed-local",
+            client_order_id="client-closed",
+            status=OrderStatus.CANCELLED.value,
+        )
+        mock_order_repo.add_order(found_order)
+        mock_order_repo.add_order(missing_order)
+        mock_order_repo.add_order(ignored_order)
+        mock_exchange_adapter.open_orders.append(found_order)
+
+        payload = engine.reconcile_recoverable_client_orders()
+
+        assert payload["recoverable_count"] == 2
+        assert payload["result_counts"] == {
+            "exchange_found": 1,
+            "exchange_not_found": 1,
+        }
+        assert payload["decision_counts"] == {
+            "exchange_open": 1,
+            "exchange_unknown": 1,
+        }
+        assert payload["results"] == [
+            {
+                "order_id": "found-local",
+                "client_order_id": "client-found",
+                "local_status": OrderStatus.SUBMITTED.value,
+                "product_id": found_order.product_id,
+                "strategy_id": found_order.strategy_id,
+                "local_exchange_order_id": "EX-LOCAL",
+                "result": "exchange_found",
+                "decision": "exchange_open",
+                "exchange_order_id": "EX-LOCAL",
+                "exchange_status": OrderStatus.SUBMITTED.value,
+            },
+            {
+                "order_id": "missing-local",
+                "client_order_id": "client-missing",
+                "local_status": OrderStatus.SUBMITTED_UNCONFIRMED.value,
+                "product_id": missing_order.product_id,
+                "strategy_id": missing_order.strategy_id,
+                "local_exchange_order_id": None,
+                "result": "exchange_not_found",
+                "decision": "exchange_unknown",
+                "exchange_order_id": None,
+                "exchange_status": None,
+            },
+        ]
+        event = mock_db_session.add.call_args.args[0]
+        assert event.event_type == "reconcile"
+        assert event.event_subtype == "startup_exchange_reconcile"
+        assert event.payload == payload
+        mock_db_session.commit.assert_called_once()
+        mock_db_session.rollback.assert_not_called()
+
+    def test_reconcile_recoverable_client_orders_requires_session_factory(
+        self, mock_db_session, mock_clock, mock_exchange_adapter, mock_order_repo
+    ):
+        engine = ExecutionEngine(
+            db_session=mock_db_session,
+            clock=mock_clock,
+            adapter=mock_exchange_adapter,
+            order_repository=mock_order_repo,
+        )
+
+        with pytest.raises(RuntimeError, match="requires db_session_factory"):
+            engine.reconcile_recoverable_client_orders()
+
+    def test_reconcile_recoverable_client_orders_distinguishes_unsupported_lookup(
+        self, mock_db_session, mock_clock, mock_exchange_adapter, mock_order_repo, order_factory
+    ):
+        def unsupported_lookup(client_order_id, product_id):
+            raise ExchangeOrderLookupUnsupported("unsupported")
+
+        mock_exchange_adapter.get_order_by_client_id = unsupported_lookup
+        engine = ExecutionEngine(
+            db_session=mock_db_session,
+            clock=mock_clock,
+            adapter=mock_exchange_adapter,
+            order_repository=mock_order_repo,
+            db_session_factory=lambda: nullcontext(mock_db_session),
+        )
+        mock_order_repo.add_order(
+            order_factory(
+                order_id="recoverable",
+                client_order_id="client-1",
+                status=OrderStatus.SUBMITTED.value,
+            )
+        )
+
+        payload = engine.reconcile_recoverable_client_orders()
+
+        assert payload["result_counts"] == {"exchange_lookup_unsupported": 1}
+        assert payload["decision_counts"] == {"exchange_unknown": 1}
+        assert payload["results"][0]["result"] == "exchange_lookup_unsupported"
+
+    @pytest.mark.parametrize(
+        ("local_status", "exchange_status", "expected"),
+        [
+            (OrderStatus.NEW.value, None, "local_only"),
+            (OrderStatus.SUBMITTED.value, None, "exchange_unknown"),
+            (OrderStatus.SUBMITTED.value, "open", "exchange_open"),
+            (OrderStatus.SUBMITTED.value, "PARTIALLY_FILLED", "exchange_open"),
+            (OrderStatus.SUBMITTED.value, "closed", "exchange_closed"),
+            (OrderStatus.SUBMITTED.value, "CANCELLED", "exchange_closed"),
+            (OrderStatus.SUBMITTED.value, "mystery", "exchange_unknown"),
+        ],
+    )
+    def test_reconcile_decision_categories(self, local_status, exchange_status, expected):
+        assert ExecutionEngine._reconcile_decision(local_status, exchange_status) == expected
+
+
+class TestCancelOrder:
+    """Tests for execution-level cancellation."""
+
+    def test_cancel_order_returns_false_when_order_missing(
+        self, execution_engine, mock_exchange_adapter
+    ):
+        assert execution_engine.cancel_order("missing") is False
+        assert mock_exchange_adapter.open_orders == []
+
+    def test_cancel_order_calls_adapter_and_marks_cancelled(
+        self, execution_engine, signal_factory, mock_order_repo, mock_exchange_adapter
+    ):
+        order_id = execution_engine.execute_signal(signal_factory(price=None, value=None))
+        order = mock_order_repo.orders[order_id]
+
+        result = execution_engine.cancel_order(order_id)
+
+        assert result is True
+        assert order.status == OrderStatus.CANCELLED.value
+        assert mock_exchange_adapter.open_orders == []
+
+    def test_cancel_order_prefers_client_order_id(
+        self, execution_engine, signal_factory, mock_order_repo, mock_exchange_adapter
+    ):
+        order_id = execution_engine.execute_signal(signal_factory(price=None, value=None))
+        order = mock_order_repo.orders[order_id]
+        order.client_order_id = "client-123"
+        order.exchange_order_id = "stale-exchange-id"
+
+        result = execution_engine.cancel_order(order_id)
+
+        assert result is True
+        assert order.status == OrderStatus.CANCELLED.value
+        assert mock_exchange_adapter.open_orders == []
+
+    def test_cancel_order_is_idempotent_for_cancelled_order(
+        self, execution_engine, signal_factory, mock_order_repo, mock_exchange_adapter
+    ):
+        order_id = execution_engine.execute_signal(signal_factory(price=None, value=None))
+        order = mock_order_repo.orders[order_id]
+        order.status = OrderStatus.CANCELLED.value
+
+        result = execution_engine.cancel_order(order_id)
+
+        assert result is True
+        assert len(mock_exchange_adapter.open_orders) == 1
+
+
+class TestMarketDataProcessing:
+    """Tests for process_market_data (simulated fills)."""
+
+    def test_market_data_triggers_fills(
+        self, mock_db_session, mock_clock, mock_exchange_adapter, signal_factory, candlestick_factory
+    ):
+        """Market data should trigger fills for pending orders."""
+        from src.core.repositories import BacktestOrderRepository
+        backtest_repo = BacktestOrderRepository(mock_db_session, session_id=1)
+        engine = ExecutionEngine(
+            db_session=mock_db_session,
+            clock=mock_clock,
+            adapter=mock_exchange_adapter,
+            order_repository=backtest_repo
+        )
+
+        signal = signal_factory(price=Decimal("42000"))
+        engine.execute_signal(signal)
+        assert len(mock_exchange_adapter.open_orders) == 1
+
+        candle = candlestick_factory(close=Decimal("42100"))
+        engine.process_market_data(candle)
+
+        # Order should be filled
+        assert len(mock_exchange_adapter.open_orders) == 0
+
+    def test_no_orders_no_fills(self, execution_engine, candlestick_factory):
+        """No fills when no pending orders."""
+        candle = candlestick_factory()
+        # Should not raise
+        execution_engine.process_market_data(candle)
+
+
+class TestConditionalOrderErrorHandling:
+    """Tests for SL/TP/Trailing Stop order placement error paths."""
+
+    def test_sl_order_failure_logs_error(
+        self, execution_engine, signal_factory, mock_exchange_adapter, caplog
+    ):
+        """SL order placement failure should log error but not fail main order."""
+        mock_exchange_adapter.set_fail_on_order_types({"stop_loss"})
+
+        signal = signal_factory(
+            price=Decimal("42000"),
+            stop_loss=Decimal("41000"),
+        )
+        order_id = execution_engine.execute_signal(signal)
+
+        # Main order should succeed
+        assert order_id is not None
+        # Entry order placed, SL order failed
+        assert len(mock_exchange_adapter.open_orders) == 1
+        assert "Failed to place SL order" in caplog.text
+
+    def test_tp_order_failure_logs_error(
+        self, execution_engine, signal_factory, mock_exchange_adapter, caplog
+    ):
+        """TP order placement failure should log error but not fail main order."""
+        mock_exchange_adapter.set_fail_on_order_types({"take_profit"})
+
+        signal = signal_factory(
+            price=Decimal("42000"),
+            take_profit=Decimal("45000"),
+        )
+        order_id = execution_engine.execute_signal(signal)
+
+        # Main order should succeed
+        assert order_id is not None
+        # Entry order placed, TP order failed
+        assert len(mock_exchange_adapter.open_orders) == 1
+        assert "Failed to place TP order" in caplog.text
+
+    def test_trailing_stop_failure_logs_error(
+        self, execution_engine, signal_factory, mock_exchange_adapter, caplog
+    ):
+        """Trailing stop order placement failure should log error."""
+        mock_exchange_adapter.set_fail_on_order_types({"trailing_stop"})
+
+        signal = signal_factory(
+            price=Decimal("42000"),
+            stop_loss=Decimal("41000"),
+            trailing_distance=Decimal("500"),
+        )
+        order_id = execution_engine.execute_signal(signal)
+
+        # Main order should succeed
+        assert order_id is not None
+        assert "Failed to place trailing stop order" in caplog.text
+
+    def test_all_conditional_orders_fail_main_succeeds(
+        self, execution_engine, signal_factory, mock_exchange_adapter, caplog
+    ):
+        """All conditional orders can fail while main order succeeds."""
+        mock_exchange_adapter.set_fail_on_order_types(
+            {"stop_loss", "take_profit", "trailing_stop"}
+        )
+
+        signal = signal_factory(
+            price=Decimal("42000"),
+            stop_loss=Decimal("41000"),
+            take_profit=Decimal("45000"),
+            trailing_distance=Decimal("500"),
+        )
+        order_id = execution_engine.execute_signal(signal)
+
+        # Main order should still succeed
+        assert order_id is not None
+        assert len(mock_exchange_adapter.open_orders) == 1
+        # All conditional order errors logged
+        assert "Failed to place SL order" in caplog.text
+        assert "Failed to place TP order" in caplog.text
+        assert "Failed to place trailing stop order" in caplog.text

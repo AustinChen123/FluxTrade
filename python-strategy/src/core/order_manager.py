@@ -1,104 +1,172 @@
+import logging
 import uuid
 import os
 import redis
 from decimal import Decimal
 from typing import Optional
-from src.core.orm_models import Order, Trade, Position
-from src.core.models import Signal
+from src.core.orm_models import Order, Trade
+from src.core.models import Signal, OrderSide, OrderStatus
 from src.core.clock import Clock
 from src.core.interfaces import IOrderRepository
+from src.core.jsonb_helpers import serialize_payload_with_decimals
+from src.core.redis_factory import create_redis_client
 
-# Redis Config
-REDIS_HOST = os.getenv('REDIS_HOST', 'localhost')
-REDIS_PORT = int(os.getenv('REDIS_PORT', 6379))
+logger = logging.getLogger(__name__)
+
+_VALID_SIDES = {OrderSide.BUY, OrderSide.SELL, "buy", "sell"}
+_VALID_ORDER_TYPES = {"market", "limit", "stop_loss", "take_profit", "trailing_stop"}
 
 class OrderManager:
-    def __init__(self, repo: IOrderRepository, clock: Clock):
+    def __init__(self, repo: IOrderRepository, clock: Clock, is_backtest: Optional[bool] = None):
         self.repo = repo
         self.clock = clock
-        self.redis_client = redis.Redis(host=REDIS_HOST, port=REDIS_PORT, decode_responses=True)
-        
-        # Load Lua Script
-        lua_path = os.path.join(os.path.dirname(__file__), '../lua/update_position.lua')
-        try:
-            with open(lua_path, 'r') as f:
-                self.update_position_script = self.redis_client.register_script(f.read())
-        except Exception as e:
-            print(f"FATAL: Failed to load Lua script: {e}")
-            raise e
+        self.redis_client = None
+        self.update_position_script = None
 
-    def create_order(self, signal: Signal, side: str, order_type: str, quantity: Decimal, price: Optional[Decimal] = None) -> Order:
+        # Detect Backtest Mode: explicit flag > repository type heuristic
+        if is_backtest is not None:
+            self.is_backtest = is_backtest
+        else:
+            self.is_backtest = "BacktestOrderRepository" in str(type(repo))
+
+        if not self.is_backtest:
+            self.redis_client = create_redis_client()
+            # Load Lua Script
+            lua_path = os.path.join(os.path.dirname(__file__), '../lua/update_position.lua')
+            try:
+                with open(lua_path, 'r') as f:
+                    self.update_position_script = self.redis_client.register_script(f.read())
+            except Exception as e:
+                logger.error("FATAL: Failed to load Lua script: %s", e)
+                raise e
+        else:
+             logger.info("OrderManager: Initialized in Backtest Mode (Redis Disabled).")
+
+    def create_order(
+        self,
+        signal: Signal,
+        side: OrderSide,
+        order_type: str,
+        quantity: Decimal,
+        price: Optional[Decimal] = None,
+        trigger_price: Optional[Decimal] = None,
+        client_order_id: Optional[str] = None,
+        intent_payload: Optional[dict] = None,
+    ) -> Order:
+        if side.lower() not in _VALID_SIDES:
+            raise ValueError(f"Invalid order side: {side!r}. Must be one of {_VALID_SIDES}")
+        if order_type.lower() not in _VALID_ORDER_TYPES:
+            raise ValueError(f"Invalid order type: {order_type!r}. Must be one of {_VALID_ORDER_TYPES}")
         exchange_id = signal.product_id.split(':')[0]
         order_id = str(uuid.uuid4())
-        
+        is_idempotent_order = client_order_id is not None
+
         new_order = Order(
             id=order_id,
-            exchange_order_id=f"sim_{order_id[:8]}", # Default mock ID, will be updated if real
+            exchange_order_id=None if is_idempotent_order else f"sim_{order_id[:8]}",
             strategy_id=signal.strategy_id,
             product_id=signal.product_id,
             exchange_id=exchange_id,
             type=order_type,
             side=side,
             price=price,
+            trigger_price=trigger_price,
             quantity=quantity,
-            status="open",
+            status=OrderStatus.NEW.value if is_idempotent_order else "open",
             timestamp=int(self.clock.now() * 1000),
             filled_quantity=Decimal("0"),
-            filled_price=Decimal("0")
+            filled_price=Decimal("0"),
+            client_order_id=client_order_id,
+            intent_payload=(
+                serialize_payload_with_decimals(intent_payload)
+                if intent_payload is not None
+                else None
+            ),
         )
-        
+
         self.repo.add_order(new_order)
-        print(f"📝 DB: Order created {new_order.id} ({side} {quantity} {signal.product_id})")
+        logger.info("Order created %s (%s %s %s %s)", new_order.id, side, order_type, quantity, signal.product_id)
         return new_order
 
     def update_exchange_order_id(self, order: Order, exchange_order_id: str):
         self.repo.update_order_exchange_id(order, exchange_order_id)
 
-    def fill_order(self, order: Order, fill_price: Decimal, fill_quantity: Decimal):
+    def mark_submitted_unconfirmed(self, order: Order) -> None:
+        """Mark order as sent to exchange with ACK pending."""
+        self._set_order_status(order, OrderStatus.SUBMITTED_UNCONFIRMED)
+
+    def mark_submitted(self, order: Order, exchange_order_id: Optional[str] = None) -> None:
+        """Mark order as exchange-acknowledged."""
+        order.status = OrderStatus.SUBMITTED.value
+        if exchange_order_id is not None:
+            self.repo.update_order_exchange_id(order, exchange_order_id)
+        else:
+            self.repo.update_order(order)
+
+    def mark_cancelled(self, order: Order) -> None:
+        """Mark order as cancelled."""
+        self._set_order_status(order, OrderStatus.CANCELLED)
+
+    def _set_order_status(self, order: Order, status: OrderStatus) -> None:
+        order.status = status.value
+        self.repo.update_order(order)
+
+    def fail_order(self, order: Order, reason: str):
+        """Marks an order as FAILED due to execution errors."""
+        order.status = "failed"
+        # We could verify if there's a specific field for error msg, but for now just status
+        logger.error("ORDER_FAILED: Order %s marked as FAILED. Reason: %s", order.id, reason)
+        self.repo.update_order(order)
+
+    def fill_order(self, order: Order, fill_price: Decimal, fill_quantity: Decimal, fee: Optional[Decimal] = None):
         current_time = int(self.clock.now() * 1000)
-        
-        # 1. Update Order in DB (Keep for record)
+
+        # 1. Update Order in DB
         order.status = "closed"
         order.filled_quantity = fill_quantity
         order.filled_price = fill_price
         self.repo.update_order(order)
-        
-        # 2. Atomic Execution via Redis Lua
-        # "Atomic Execution (Mandatory)... If Lua script returns error... throw Fatal Exception"
-        
-        trade_id = str(uuid.uuid4())
-        
-        try:
-            # Lua Args: account_id, strategy_id, product_id, side, quantity, price, timestamp, trade_id, order_id
-            # Assuming account_id is 'default' or passed in context. Using 'main' for now.
-            account_id = "main" 
-            
-            self.update_position_script(
-                args=[
-                    account_id,
-                    order.strategy_id,
-                    order.product_id,
-                    order.side.upper(),
-                    str(fill_quantity),
-                    str(fill_price),
-                    str(current_time),
-                    trade_id,
-                    order.id
-                ]
-            )
-            print(f"⚡ Redis: Atomic Position Update Successful (Trade {trade_id})")
-            
-        except redis.exceptions.ResponseError as e:
-            print(f"🔥 FATAL: Redis Lua Script Error: {e}")
-            # "throw a Fatal Exception and crash the process. Do NOT retry."
-            raise RuntimeError(f"Critical State Corruption: {e}")
-        except Exception as e:
-             print(f"🔥 FATAL: System Error during execution: {e}")
-             raise e
 
-        # 3. Create Trade (SQL Reflection - Optional but good for backup)
-        # Note: In strict HFT, we might skip this or do it async. 
-        # But keeping it for hybrid robustness as per "Postgres is just for backup".
+        trade_id = str(uuid.uuid4())
+
+        # 2. Atomic Execution
+        if not self.is_backtest:
+            # Redis Lua (live mode)
+            try:
+                account_id = "main"
+                self.update_position_script(
+                    args=[
+                        account_id,
+                        order.strategy_id,
+                        order.product_id,
+                        order.side.upper(),
+                        str(fill_quantity),
+                        str(fill_price),
+                        str(current_time),
+                        trade_id,
+                        order.id
+                    ]
+                )
+                logger.info("Redis: Atomic Position Update Successful (Trade %s)", trade_id)
+
+            except redis.exceptions.ResponseError as e:
+                logger.error("FATAL: Redis Lua Script Error: %s", e)
+                raise RuntimeError(f"Critical State Corruption: {e}")
+            except Exception as e:
+                logger.error("FATAL: System Error during execution: %s", e)
+                raise e
+        else:
+            # Backtest Mode: position/balance managed by Rust matching engine
+            self.repo.update_position(
+                strategy_id=order.strategy_id,
+                product_id=order.product_id,
+                side=order.side,
+                fill_quantity=fill_quantity,
+                fill_price=fill_price,
+                position_side=order.side.upper(),
+            )
+
+        # 3. Create Trade record
         new_trade = Trade(
             id=trade_id,
             order_id=order.id,
@@ -107,7 +175,7 @@ class OrderManager:
             side=order.side,
             price=fill_price,
             quantity=fill_quantity,
-            fee=Decimal("0"),
+            fee=fee if fee is not None else Decimal("0"),
             fee_asset="USDT",
             timestamp=current_time
         )
