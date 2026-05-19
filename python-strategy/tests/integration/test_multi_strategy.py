@@ -528,16 +528,42 @@ class TestCapitalAllocator:
 class TestBacktestMultiStrategy:
     """End-to-end backtest with two strategies and the real Rust engine."""
 
+    @staticmethod
+    def _mock_backtest_session():
+        from src.core.orm_models import BacktestResultSummary, BacktestTradeLog
+
+        mock_session = MagicMock()
+        summaries = []
+
+        def add(obj):
+            if isinstance(obj, BacktestResultSummary):
+                obj.id = 1
+                summaries.append(obj)
+
+        def query(model):
+            query_mock = MagicMock()
+            if model is BacktestResultSummary:
+                query_mock.filter_by.return_value.first.side_effect = (
+                    lambda: summaries[0] if summaries else None
+                )
+            elif model is BacktestTradeLog:
+                query_mock.filter_by.return_value.all.return_value = []
+            else:
+                query_mock.filter_by.return_value.first.return_value = None
+                query_mock.filter_by.return_value.all.return_value = []
+            return query_mock
+
+        mock_session.add.side_effect = add
+        mock_session.query.side_effect = query
+        return mock_session
+
     @patch("src.core.backtest_runner.SessionLocal")
     def test_backtest_two_strategies_run_to_completion(self, mock_session_local):
         """BacktestRunner with two strategies completes and returns result."""
         from src.core.backtest_runner import BacktestRunner
         from src.core.data_sources.memory import MemoryDataSource
 
-        mock_session = MagicMock()
-        mock_session.query.return_value.filter_by.return_value.all.return_value = []
-        mock_session.query.return_value.filter_by.return_value.first.return_value = None
-        mock_session_local.return_value = mock_session
+        mock_session_local.return_value = self._mock_backtest_session()
 
         candle_data = make_candle_series(count=50)
 
@@ -579,10 +605,7 @@ class TestBacktestMultiStrategy:
         from src.core.backtest_runner import BacktestRunner
         from src.core.data_sources.memory import MemoryDataSource
 
-        mock_session = MagicMock()
-        mock_session.query.return_value.filter_by.return_value.all.return_value = []
-        mock_session.query.return_value.filter_by.return_value.first.return_value = None
-        mock_session_local.return_value = mock_session
+        mock_session_local.return_value = self._mock_backtest_session()
 
         candle_data = make_candle_series(count=50)
 

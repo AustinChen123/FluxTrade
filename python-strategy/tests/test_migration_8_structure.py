@@ -1,16 +1,17 @@
-"""Structural tests for Alembic migration 8 (optional performance indexes).
+"""Structural tests for Alembic migration 8 (backtest trade strategy index).
 
-Migration 8 introduces no schema or ORM changes — it only adds two
+Migration 8 adds ``backtest_trade_log.strategy_id`` and creates two
 performance indexes via raw DDL (``op.execute``). Real upgrade/downgrade
-behaviour is exercised by Task 0.7's end-to-end round-trip integration
-test against a live PostgreSQL.
+behaviour is exercised by the end-to-end round-trip integration test
+against a live PostgreSQL.
 
 Here we statically validate:
 
 * The migration file exists and is wired correctly into the Alembic
   revision chain (``revision`` / ``down_revision``).
 * It defines ``upgrade`` and ``downgrade`` functions.
-* The DDL it emits names the right tables/indexes and uses the partial
+* The DDL it emits adds the missing nullable strategy column.
+* The DDL names the right tables/indexes and uses the partial
   ``WHERE`` clause where required.
 * The columns referenced by the DDL really exist on the target ORM
   tables — guards against silent schema drift if anyone renames a column
@@ -59,6 +60,14 @@ def test_upgrade_and_downgrade_functions_defined(migration_source: str) -> None:
     assert re.search(r"^def downgrade\(\)\s*->\s*None:", migration_source, re.MULTILINE)
 
 
+def test_upgrade_adds_backtest_trade_strategy_id(migration_source: str) -> None:
+    """Fresh databases need ``backtest_trade_log.strategy_id`` before the
+    partial strategy index can be created."""
+    src = migration_source.lower()
+    assert "alter table backtest_trade_log" in src
+    assert "add column if not exists strategy_id varchar" in src
+
+
 def test_upgrade_creates_both_indexes_with_partial_predicate(
     migration_source: str,
 ) -> None:
@@ -83,10 +92,11 @@ def test_upgrade_creates_both_indexes_with_partial_predicate(
 
 
 def test_downgrade_drops_both_indexes(migration_source: str) -> None:
-    """Downgrade must drop both indexes (idempotent via ``IF EXISTS``)."""
+    """Downgrade must drop indexes and the strategy column idempotently."""
     src = migration_source.lower()
     assert "drop index if exists idx_backtest_trade_log_strategy" in src
     assert "drop index if exists idx_candlestick_product_tf_ts" in src
+    assert "alter table backtest_trade_log drop column if exists strategy_id" in src
 
 
 def test_orm_columns_referenced_by_migration_exist() -> None:

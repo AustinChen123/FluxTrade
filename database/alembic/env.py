@@ -1,5 +1,4 @@
 import os
-import sys
 from logging.config import fileConfig
 
 from sqlalchemy import engine_from_config
@@ -21,7 +20,15 @@ db_password = os.getenv('POSTGRES_PASSWORD')
 db_host = os.getenv('POSTGRES_HOST')
 db_port = os.getenv('POSTGRES_PORT')
 db_name = os.getenv('POSTGRES_DB')
-if db_user and db_password and db_host and db_port and db_name:
+configured_url = config.get_main_option('sqlalchemy.url')
+if (
+    db_user
+    and db_password
+    and db_host
+    and db_port
+    and db_name
+    and configured_url in (None, "", "driver://user:pass@localhost/dbname")
+):
     db_url = f"postgresql://{db_user}:{db_password}@{db_host}:{db_port}/{db_name}"
     config.set_main_option('sqlalchemy.url', db_url)
 

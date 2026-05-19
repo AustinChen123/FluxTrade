@@ -4,9 +4,12 @@ Revision ID: fb8c6e6098e3
 Revises: b34da0d04a78
 Create Date: 2026-05-07 00:00:00.000000
 
-Migration 8 — Phase 0 architecture fixes (optional performance indexes).
+Migration 8 — Phase 0 architecture fixes (backtest trade strategy index).
 
 Changes:
+    * ``backtest_trade_log``: add nullable ``strategy_id``. The ORM uses this
+      field for per-strategy analytics, but the original backtest table
+      migration did not create it.
     * ``candlestick``: add composite index ``idx_candlestick_product_tf_ts``
       on ``(product_id, timeframe, timestamp DESC)`` to accelerate the
       common "latest N bars for a product/timeframe" query path used by
@@ -18,10 +21,9 @@ Changes:
       index keeps the index small and avoids indexing NULL keys we never
       query for.
 
-These are pure additive performance indexes — no schema changes, no ORM
-changes. Indexes are created via ``op.execute()`` raw DDL because the
-DESC ordering hint and the partial ``WHERE`` clause are not first-class
-SQLAlchemy constructs.
+Indexes are created via ``op.execute()`` raw DDL because the DESC ordering
+hint and the partial ``WHERE`` clause are not first-class SQLAlchemy
+constructs.
 """
 from typing import Sequence, Union
 
@@ -36,7 +38,14 @@ depends_on: Union[str, Sequence[str], None] = None
 
 
 def upgrade() -> None:
-    """Create optional performance indexes."""
+    """Add strategy_id to backtest trades and create optional indexes."""
+    op.execute(
+        """
+        ALTER TABLE backtest_trade_log
+            ADD COLUMN IF NOT EXISTS strategy_id VARCHAR
+        """
+    )
+
     # candlestick: composite index for (product_id, timeframe, ts DESC) lookups.
     op.execute(
         """
@@ -57,6 +66,7 @@ def upgrade() -> None:
 
 
 def downgrade() -> None:
-    """Drop optional performance indexes."""
+    """Drop optional indexes and the strategy_id column."""
     op.execute("DROP INDEX IF EXISTS idx_backtest_trade_log_strategy")
     op.execute("DROP INDEX IF EXISTS idx_candlestick_product_tf_ts")
+    op.execute("ALTER TABLE backtest_trade_log DROP COLUMN IF EXISTS strategy_id")

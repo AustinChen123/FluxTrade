@@ -314,8 +314,8 @@ def test_sample_data_insertion_after_upgrade(fresh_pg_db: str) -> None:
             )
             conn.execute(
                 text(
-                    "INSERT INTO product (id, exchange_id, symbol) "
-                    "VALUES ('binance:BTC/USDT', 'binance', 'BTC/USDT')"
+                    "INSERT INTO product (id, exchange_id, base_asset, quote_asset) "
+                    "VALUES ('binance:BTC/USDT', 'binance', 'BTC', 'USDT')"
                 )
             )
             conn.execute(
@@ -349,8 +349,8 @@ def test_sample_data_insertion_after_upgrade(fresh_pg_db: str) -> None:
                 conn.execute(
                     text(
                         "INSERT INTO daily_nav_snapshots "
-                        "(strategy_id, snapshot_date, nav, source) "
-                        "VALUES ('strat-1', DATE '2026-01-01', 1000.0, 'random')"
+                        "(strategy_id, snapshot_date, nav, base_currency, source) "
+                        "VALUES ('strat-1', DATE '2026-01-01', 1000.0, 'USDT', 'random')"
                     )
                 )
 
@@ -359,8 +359,8 @@ def test_sample_data_insertion_after_upgrade(fresh_pg_db: str) -> None:
             conn.execute(
                 text(
                     "INSERT INTO daily_nav_snapshots "
-                    "(strategy_id, snapshot_date, nav) "
-                    "VALUES ('strat-1', DATE '2026-01-02', 1234.56789012)"
+                    "(strategy_id, snapshot_date, nav, base_currency) "
+                    "VALUES ('strat-1', DATE '2026-01-02', 1234.56789012, 'USDT')"
                 )
             )
 
