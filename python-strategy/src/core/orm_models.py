@@ -17,6 +17,12 @@ from sqlalchemy.orm import declarative_base
 
 Base = declarative_base()
 
+
+def _autoincrement_bigint():
+    """Use PostgreSQL BIGINT, but SQLite INTEGER for rowid autoincrement."""
+    return BigInteger().with_variant(Integer, "sqlite")
+
+
 class Exchange(Base):
     __tablename__ = 'exchange'
     id = Column(String, primary_key=True)
@@ -111,7 +117,7 @@ class SignalAudit(Base):
 
     __tablename__ = 'signal_audit'
 
-    id = Column(BigInteger, primary_key=True, autoincrement=True)
+    id = Column(_autoincrement_bigint(), primary_key=True, autoincrement=True)
 
     timestamp = Column(BigInteger, nullable=False)
 
@@ -151,7 +157,7 @@ class SystemEvent(Base):
 
     __tablename__ = 'system_events'
 
-    id = Column(BigInteger, primary_key=True, autoincrement=True)
+    id = Column(_autoincrement_bigint(), primary_key=True, autoincrement=True)
     event_type = Column(String(64), nullable=False)
     event_subtype = Column(String(64), nullable=True)
     related_strategy_id = Column(String, ForeignKey('strategy.id'), nullable=True)
@@ -175,7 +181,7 @@ class SystemEvent(Base):
 
 class BacktestResultSummary(Base):
     __tablename__ = 'backtest_result_summary'
-    id = Column(BigInteger, primary_key=True, autoincrement=True)
+    id = Column(_autoincrement_bigint(), primary_key=True, autoincrement=True)
     strategy_id = Column(String, ForeignKey('strategy.id'), nullable=False)
     start_time = Column(BigInteger, nullable=False)
     end_time = Column(BigInteger, nullable=False)
@@ -236,7 +242,7 @@ class StrategyStateTransition(Base):
 
     __tablename__ = 'strategy_state_transitions'
 
-    id = Column(BigInteger, primary_key=True, autoincrement=True)
+    id = Column(_autoincrement_bigint(), primary_key=True, autoincrement=True)
     strategy_id = Column(String, ForeignKey('strategy.id'), nullable=False)
     from_status = Column(String(32), nullable=False)
     to_status = Column(String(32), nullable=False)
@@ -259,7 +265,7 @@ class DailyNavSnapshot(Base):
 
     __tablename__ = 'daily_nav_snapshots'
 
-    id = Column(BigInteger, primary_key=True, autoincrement=True)
+    id = Column(_autoincrement_bigint(), primary_key=True, autoincrement=True)
     strategy_id = Column(String, ForeignKey('strategy.id'), nullable=False)
     snapshot_date = Column(Date, nullable=False)
     nav = Column(Numeric(28, 8), nullable=False)
@@ -345,7 +351,7 @@ class GeneRecord(Base):
 
     __tablename__ = 'gene_records'
 
-    id = Column(BigInteger, primary_key=True, autoincrement=True)
+    id = Column(_autoincrement_bigint(), primary_key=True, autoincrement=True)
     strategy_id = Column(String, ForeignKey('strategy.id'), nullable=False)
     role = Column(String(16), nullable=False)
     param_pack = Column(JSONB, nullable=False)
