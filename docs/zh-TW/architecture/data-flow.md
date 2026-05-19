@@ -23,16 +23,19 @@ Redis Stream            stream:market:{exchange}:{symbol}:{tf}
 consumer.py             XREADGROUP with consumer group, parse candle from stream
        |
        v
-engine.py               Dispatch candle to registered strategies (thread-safe copy)
+engine.py               Dispatch candle to active strategies (state-guarded)
        |
        v
 strategy.on_candle()    Strategy evaluates indicators, may emit Signal
        |
        v
+signal_processor.py     Block stopped/error strategies before execution
+       |
+       v
 execution.py            Signal -> Order creation (with SL/TP/Trailing conditionals)
        |
        v
-risk_manager.py         Pre-trade validation: balance, position limits, exposure
+risk_manager.py         Rule-based validation: balance, notional, price, rate, daily loss
        |
        v
 ccxt_adapter.py         Convert LONG/SHORT -> buy/sell, call exchange REST API
@@ -82,6 +85,7 @@ Python `consumer.py` 使用 `XREADGROUP` 作為消費者群組的一部分從 Re
 
 - 建立策略列表的執行緒安全複本（防止迭代期間的變異）
 - 時間框架安全防護過濾與策略宣告時間框架不匹配的 K 線（深度防禦 (Defense-in-Depth)；Stream 鍵已提供隔離）
+- 查詢 `StrategyStateManager` 狀態，確保 stopped/error 策略不會發出可執行訊號
 
 **6. 策略 -> 執行 (Execution) -> 交易所**
 
@@ -94,6 +98,8 @@ Python `consumer.py` 使用 `XREADGROUP` 作為消費者群組的一部分從 Re
 5. 適配器將 `LONG/SHORT` 轉換為 `buy/sell` 並呼叫交易所 API
 
 執行延遲透過 `time.monotonic()` 測量，並記錄至 Prometheus 直方圖 (Histogram)。
+
+風控驗證是 rule-based。當前檢查包含餘額、單筆訂單名目金額、每日虧損熔斷、可選價格合理性、最大持倉名目金額，以及可選下單速率限制。違規回傳 `(False, reason)` 並阻擋執行，不會靜默調整訂單。
 
 ## 回測路徑
 
@@ -113,6 +119,9 @@ strategy.on_candle()       Same strategy code as live mode
 execution.py               Same Signal -> Order pipeline
        |
        v
+BacktestAccountService     Reads balance/position from SimulatedAdapter
+       |
+       v
 simulated.py               SimulatedAdapter (Python)
        |
        v
@@ -121,7 +130,7 @@ PyMatchingEngine           Rust matching engine via PyO3
        |
        v
 analytics.py               Sharpe, Sortino, Calmar, monthly returns
-                           FIFO trade pairing, all Decimal
+                           average-entry trade pairing, all Decimal
 ```
 
 ### 與實盤路徑的關鍵差異
@@ -191,6 +200,8 @@ for candle in data_source.get_candles(product_id, tf, start, end):
 
 `BacktestRunner` 將此迴圈封裝進度追蹤、效能測量和報告生成。迴圈完成後，`analytics.py` 計算交易層級和投資組合層級的指標。
 
+在回測中，Rust matcher 是 balance 與 position 的 single source of truth。`BacktestAccountService` 透過 `SimulatedAdapter` 讀取，因此回測模式下 RiskManager 的檢查也會看到 matcher-backed account state。Invariant suite 會在 fills 後與 position-limit checks 中驗證這點。
+
 ### Rust 搓合引擎 (Matching Engine)
 
 `SimulatedAdapter` 將所有搓合委託給 Rust 的 `PyMatchingEngine`。對於每根 K 線，引擎按優先順序處理未結訂單（Market > SL/TP/Trailing > Limit），套用手續費、管理持倉，並返回成交事件。
@@ -199,6 +210,8 @@ for candle in data_source.get_candles(product_id, tf, start, end):
     包含完整訂單搓合和手續費計算，約 89,000 根 K 線/秒。100K 根 K 線的回測大約在 1.12 秒內完成。
 
 搓合邏輯、訂單類型和持倉管理的詳細說明，請參閱 [Rust 搓合引擎](rust-engine.md)。
+
+回測 PnL 目前使用平均成本 netting。對於 deterministic fill sequences，matcher balance delta 應等於重算 closed-trade PnL 扣除 fill fees，容許一 satoshi 誤差。
 
 ## 監控路徑
 

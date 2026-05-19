@@ -245,10 +245,28 @@ FluxTrade 對訂單/持倉方向使用雙重命名慣例：
 轉換**僅**在適配器邊界發生：
 
 - `SimulatedAdapter._side_to_rust()`：在呼叫 Rust 之前將 `buy` 轉換為 `LONG`、`sell` 轉換為 `SHORT`
+- 條件單（`STOP_LOSS`、`TAKE_PROFIT`、`TRAILING_STOP`）在 Rust 邊界使用被保護的持倉方向：Python close-long 的 `sell` 會成為 Rust side `LONG`，close-short 的 `buy` 會成為 Rust side `SHORT`
 - `CcxtExchangeAdapter`：ORM `Order` 的 `side` 已經是 `buy`/`sell`（符合 CCXT 預期），因此不需要轉換
 
 !!! warning "策略中絕不轉換方向"
     策略發出的 `Signal` 物件使用 `SignalType.LONG`/`SignalType.SHORT`。執行管線和適配器負責所有方向轉換。如果策略直接引用 `buy` 或 `sell`，則違反了抽象邊界。
+
+### 持倉表示
+
+回測持倉使用明確方向加絕對數量：
+
+| 持倉 | 表示方式 |
+|------|----------|
+| Long 0.2 | `side == LONG`, `quantity == Decimal("0.2")` |
+| Short 0.2 | `side == SHORT`, `quantity == Decimal("0.2")` |
+
+不要在回測 adapter 或 Python `Position` 模型中用負 quantity 推斷空單曝險。Signed exposure 由風控規則與 analytics 結合 `side` 和 `quantity` 推導。
+
+Invariant test suite 會鎖住這個邊界：
+
+- `tests/test_invariant_position_sign.py` 檢查 entry-side conversion、conditional close-side conversion，以及 long/short reduce/reverse 行為。
+- `tests/test_invariant_position_consistency.py` 檢查 `BacktestAccountService` 和 `RiskManager` 是否從同一個 matcher-backed source of truth 讀取持倉。
+- `tests/test_invariant_pnl_consistency.py` 檢查 matcher balance delta 是否等於重算 realized PnL 扣除 fees。
 
 ## 同一策略，兩種模式
 
@@ -310,3 +328,4 @@ result = runner.run()  # Internally creates SimulatedAdapter -> Rust PyMatchingE
 2. **實盤/回測一致性不可妥協**：任何新增至回測的功能必須產生與真實交易所執行完全一致的行為
 3. **手續費必須反映**：`SimulatedAdapter`（透過 Rust）和 `CcxtExchangeAdapter`（透過交易所回應）都在成交結果中包含 maker/taker 手續費
 4. **訊號是策略的唯一輸出**：策略發出包含進場、SL、TP 和 Trailing 參數的 `Signal` 物件。系統從那裡開始處理完整的訂單生命週期
+5. **回測帳戶狀態由 matcher 支撐**：回測 balance 與 position 透過 `SimulatedAdapter` / `BacktestAccountService` 讀取，不維護另一份 Python position ledger
