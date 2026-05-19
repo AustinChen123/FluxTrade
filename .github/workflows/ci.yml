@@ -22,7 +22,7 @@ jobs:
       run:
         working-directory: ./rust-data-service
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
 
       - name: Install Rust toolchain (from rust-toolchain.toml)
         uses: dtolnay/rust-toolchain@master
@@ -31,7 +31,7 @@ jobs:
           components: clippy, rustfmt
 
       - name: Cache cargo registry & build
-        uses: actions/cache@v4
+        uses: actions/cache@v5
         with:
           path: |
             ~/.cargo/registry
@@ -62,7 +62,7 @@ jobs:
       run:
         working-directory: ./python-strategy
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
 
       - name: Install Rust toolchain (for fluxtrade_core.so)
         uses: dtolnay/rust-toolchain@master
@@ -70,7 +70,7 @@ jobs:
           toolchain: "1.82.0"
 
       - name: Cache cargo registry & build
-        uses: actions/cache@v4
+        uses: actions/cache@v5
         with:
           path: |
             ~/.cargo/registry
@@ -86,7 +86,7 @@ jobs:
           cp target/release/libfluxtrade_core.so ../python-strategy/src/fluxtrade_core.so
 
       - name: Install uv
-        uses: astral-sh/setup-uv@v5
+        uses: astral-sh/setup-uv@v6
 
       - name: Set up Python
         run: uv python install
@@ -102,7 +102,7 @@ jobs:
 
       - name: Upload coverage report
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: python-coverage-report
           path: python-strategy/coverage.xml
@@ -128,7 +128,7 @@ jobs:
 
       - name: Upload coverage badge data
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: coverage-badge
           path: python-strategy/coverage-badge.json
@@ -143,7 +143,7 @@ jobs:
     runs-on: ubuntu-latest
     needs: [rust-check, python-check]
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
 
       - name: Install Rust toolchain (from rust-toolchain.toml)
         uses: dtolnay/rust-toolchain@master
@@ -151,7 +151,7 @@ jobs:
           toolchain: "1.82.0"
 
       - name: Cache cargo registry & build
-        uses: actions/cache@v4
+        uses: actions/cache@v5
         with:
           path: |
             ~/.cargo/registry
@@ -182,7 +182,7 @@ jobs:
           fi
 
       - name: Install uv
-        uses: astral-sh/setup-uv@v5
+        uses: astral-sh/setup-uv@v6
 
       - name: Set up Python
         working-directory: ./python-strategy
