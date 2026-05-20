@@ -28,6 +28,8 @@ class JobStore(Protocol):
 
     def mark_failed(self, job_id: str, error: str) -> JobRecord: ...
 
+    def mark_cancelled(self, job_id: str, reason: str | None = None) -> JobRecord: ...
+
 
 class InMemoryJobStore:
     """Thread-safe in-memory job store for local control-plane operation."""
@@ -81,6 +83,16 @@ class InMemoryJobStore:
             updated_at=now,
             finished_at=now,
             error=error,
+        )
+
+    def mark_cancelled(self, job_id: str, reason: str | None = None) -> JobRecord:
+        now = datetime.now(UTC)
+        return self._update(
+            job_id,
+            status=JobStatus.CANCELLED,
+            updated_at=now,
+            finished_at=now,
+            error=reason,
         )
 
     def _update(self, job_id: str, **changes: Any) -> JobRecord:
@@ -172,6 +184,16 @@ class SqliteJobStore:
             updated_at=now,
             finished_at=now,
             error=error,
+        )
+
+    def mark_cancelled(self, job_id: str, reason: str | None = None) -> JobRecord:
+        now = datetime.now(UTC)
+        return self._update(
+            job_id,
+            status=JobStatus.CANCELLED,
+            updated_at=now,
+            finished_at=now,
+            error=reason,
         )
 
     def _initialize(self) -> None:

@@ -1,14 +1,15 @@
 from __future__ import annotations
 
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import Future, ThreadPoolExecutor
 from contextlib import AbstractContextManager
 from decimal import Decimal
+from threading import Lock
 from typing import Any, Callable
 
 from sqlalchemy.orm import Session
 
 from src.control_plane.jobs import InMemoryJobStore, JobStore
-from src.control_plane.models import BacktestJobRequest, JobRecord
+from src.control_plane.models import BacktestJobRequest, JobRecord, JobStatus
 from src.core.backtest_runner import BacktestRunner
 from src.core.data_sources.csv_source import CsvDataSource
 from src.strategies.csv_signal_strategy import CsvSignalStrategy
@@ -32,26 +33,66 @@ class BacktestJobExecutor:
         self._db_session_factory = db_session_factory
         self._run_inline = run_inline
         self._executor = None if run_inline else ThreadPoolExecutor(max_workers=max_workers)
+        self._futures: dict[str, Future[JobRecord]] = {}
+        self._futures_lock = Lock()
 
     def submit_backtest(self, request: BacktestJobRequest) -> JobRecord:
         job = self.store.create(kind=request.kind, request=request)
         if self._run_inline:
             return self._run_job(job.id, request)
         assert self._executor is not None
-        self._executor.submit(self._run_job, job.id, request)
+        future = self._executor.submit(self._run_job, job.id, request)
+        with self._futures_lock:
+            self._futures[job.id] = future
+            if future.done():
+                self._futures.pop(job.id, None)
         return job
+
+    def cancel_backtest(self, job_id: str, reason: str | None = None) -> JobRecord:
+        job = self.store.get(job_id)
+        if job is None:
+            raise KeyError(job_id)
+        if job.status == JobStatus.RUNNING:
+            raise ValueError("running jobs cannot be cancelled")
+        if job.status != JobStatus.QUEUED:
+            raise ValueError(f"{job.status.value.lower()} jobs cannot be cancelled")
+
+        with self._futures_lock:
+            future = self._futures.pop(job_id, None)
+        if future is not None and not future.cancel():
+            raise ValueError("job already started")
+        return self.store.mark_cancelled(job_id, reason or "cancelled by operator")
+
+    def retry_backtest(self, job_id: str) -> JobRecord:
+        job = self.store.get(job_id)
+        if job is None:
+            raise KeyError(job_id)
+        if job.kind != "csv_signal_backtest":
+            raise ValueError(f"unsupported job kind: {job.kind}")
+        if job.status not in {JobStatus.FAILED, JobStatus.CANCELLED}:
+            raise ValueError(f"{job.status.value.lower()} jobs cannot be retried")
+
+        request = BacktestJobRequest.model_validate(job.request)
+        return self.submit_backtest(request)
 
     def shutdown(self, wait: bool = True) -> None:
         if self._executor is not None:
             self._executor.shutdown(wait=wait, cancel_futures=False)
 
     def _run_job(self, job_id: str, request: BacktestJobRequest) -> JobRecord:
-        self.store.mark_running(job_id)
         try:
-            result = self._run_backtest(request)
-        except Exception as exc:
-            return self.store.mark_failed(job_id, str(exc))
-        return self.store.mark_succeeded(job_id, result)
+            current = self.store.get(job_id)
+            if current is not None and current.status == JobStatus.CANCELLED:
+                return current
+            self.store.mark_running(job_id)
+            try:
+                result = self._run_backtest(request)
+            except Exception as exc:
+                return self.store.mark_failed(job_id, str(exc))
+            return self.store.mark_succeeded(job_id, result)
+        finally:
+            with self._futures_lock:
+                self._futures.pop(job_id, None)
 
     def _run_backtest(self, request: BacktestJobRequest) -> dict[str, Any]:
         data_source = CsvDataSource(

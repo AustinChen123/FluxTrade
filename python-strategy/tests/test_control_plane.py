@@ -158,6 +158,80 @@ def test_sqlite_job_store_persists_job_state_across_instances(tmp_path):
     assert listed[0].id == created.id
 
 
+def test_control_plane_cancels_queued_backtest_job():
+    store = InMemoryJobStore()
+    executor = BacktestJobExecutor(store=store, run_inline=False)
+    request = BacktestJobRequest(
+        strategy_id="queued",
+        product_id=PRODUCT_ID,
+        timeframe=TIMEFRAME,
+        candles_csv_path="/tmp/candles.csv",
+        signals_csv_path="/tmp/signals.csv",
+        start_time=1,
+        end_time=2,
+    )
+    job = store.create(kind=request.kind, request=request)
+    app = ControlPlaneApp(executor)
+
+    response = app.handle(
+        "POST",
+        f"/jobs/{job.id}/cancel",
+        json.dumps({"reason": "no longer needed"}),
+    )
+
+    executor.shutdown(wait=False)
+    assert response.status_code == 200
+    assert response.body["job"]["status"] == JobStatus.CANCELLED.value
+    assert response.body["job"]["error"] == "no longer needed"
+
+
+def test_control_plane_rejects_running_job_cancellation():
+    store = InMemoryJobStore()
+    executor = BacktestJobExecutor(store=store, run_inline=False)
+    request = BacktestJobRequest(
+        strategy_id="running",
+        product_id=PRODUCT_ID,
+        timeframe=TIMEFRAME,
+        candles_csv_path="/tmp/candles.csv",
+        signals_csv_path="/tmp/signals.csv",
+        start_time=1,
+        end_time=2,
+    )
+    job = store.create(kind=request.kind, request=request)
+    store.mark_running(job.id)
+    app = ControlPlaneApp(executor)
+
+    response = app.handle("POST", f"/jobs/{job.id}/cancel")
+
+    executor.shutdown(wait=False)
+    assert response.status_code == 409
+    assert response.body["error"] == "job_action_rejected"
+    assert store.get(job.id).status == JobStatus.RUNNING
+
+
+def test_backtest_executor_retries_cancelled_jobs():
+    store = InMemoryJobStore()
+    executor = BacktestJobExecutor(store=store, run_inline=False)
+    request = BacktestJobRequest(
+        strategy_id="retryable",
+        product_id=PRODUCT_ID,
+        timeframe=TIMEFRAME,
+        candles_csv_path="/tmp/candles.csv",
+        signals_csv_path="/tmp/signals.csv",
+        start_time=1,
+        end_time=2,
+    )
+    original = store.create(kind=request.kind, request=request)
+    store.mark_cancelled(original.id, "cancelled for retry")
+
+    retry = executor.retry_backtest(original.id)
+
+    executor.shutdown(wait=True)
+    assert retry.id != original.id
+    assert retry.status == JobStatus.QUEUED
+    assert retry.request == original.request
+
+
 class _FakeCommandRouter:
     def __init__(self) -> None:
         self.messages = []

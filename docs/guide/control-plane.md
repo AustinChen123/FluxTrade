@@ -69,6 +69,27 @@ curl http://127.0.0.1:8080/jobs
 curl http://127.0.0.1:8080/jobs/<job_id>
 ```
 
+## Cancel Or Retry Jobs
+
+Queued backtest jobs can be cancelled before they start:
+
+```bash
+curl -X POST http://127.0.0.1:8080/jobs/<job_id>/cancel \
+  -H 'Content-Type: application/json' \
+  -d '{"reason":"operator cancelled"}'
+```
+
+Running jobs are not force-stopped by this endpoint. If a job has already
+entered `BacktestRunner`, the control plane returns `409` instead of pretending
+the running work was interrupted.
+
+Failed or cancelled CSV-signal backtest jobs can be retried with the original
+request payload:
+
+```bash
+curl -X POST http://127.0.0.1:8080/jobs/<job_id>/retry
+```
+
 ## Strategy Status And Commands
 
 When the control plane is constructed with a strategy control service, it can
@@ -121,6 +142,9 @@ timestamp,type,quantity
   the built-in SQLite job store for durable local operation.
 - The first job type is CSV-signal backtesting. Parameter search, strategy
   monitoring, and operator controls should be added as follow-up job types.
+- Job cancellation currently applies only to queued jobs. Running backtests need
+  cooperative cancellation inside the runner before safe force-stop semantics
+  can be exposed.
 - Strategy command endpoints require wiring a live `StrategyControlService` over
   the running engine's `CommandRouter`; the default standalone server only
   exposes job endpoints.
