@@ -11,6 +11,7 @@ from src.control_plane import (
     BacktestJobExecutor,
     ControlPlaneApp,
     InMemoryJobStore,
+    SqliteJobStore,
     StrategyControlService,
 )
 from src.control_plane.models import BacktestJobRequest, JobStatus
@@ -126,6 +127,35 @@ def test_control_plane_lists_submitted_jobs_without_framework():
     assert list_response.body["jobs"][0]["id"] == job.id
     assert get_response.status_code == 200
     assert get_response.body["job"]["status"] == JobStatus.QUEUED.value
+
+
+def test_sqlite_job_store_persists_job_state_across_instances(tmp_path):
+    db_path = tmp_path / "jobs.db"
+    request = BacktestJobRequest(
+        strategy_id="durable",
+        product_id=PRODUCT_ID,
+        timeframe=TIMEFRAME,
+        candles_csv_path="/tmp/candles.csv",
+        signals_csv_path="/tmp/signals.csv",
+        start_time=1,
+        end_time=2,
+    )
+    first_store = SqliteJobStore(db_path)
+
+    created = first_store.create(kind=request.kind, request=request)
+    first_store.mark_running(created.id)
+    first_store.mark_succeeded(created.id, {"total_trades": 1, "total_pnl": "10.5"})
+    second_store = SqliteJobStore(db_path)
+
+    restored = second_store.get(created.id)
+    listed = second_store.list()
+
+    assert restored is not None
+    assert restored.status == JobStatus.SUCCEEDED
+    assert restored.result == {"total_trades": 1, "total_pnl": "10.5"}
+    assert restored.started_at is not None
+    assert restored.finished_at is not None
+    assert listed[0].id == created.id
 
 
 class _FakeCommandRouter:

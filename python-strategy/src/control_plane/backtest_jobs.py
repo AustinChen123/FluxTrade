@@ -7,7 +7,7 @@ from typing import Any, Callable
 
 from sqlalchemy.orm import Session
 
-from src.control_plane.jobs import InMemoryJobStore
+from src.control_plane.jobs import InMemoryJobStore, JobStore
 from src.control_plane.models import BacktestJobRequest, JobRecord
 from src.core.backtest_runner import BacktestRunner
 from src.core.data_sources.csv_source import CsvDataSource
@@ -22,7 +22,7 @@ class BacktestJobExecutor:
 
     def __init__(
         self,
-        store: InMemoryJobStore | None = None,
+        store: JobStore | None = None,
         *,
         db_session_factory: SessionFactory | None = None,
         max_workers: int = 2,

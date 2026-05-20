@@ -23,6 +23,7 @@ Environment variables:
 | --- | --- | --- |
 | `CONTROL_PLANE_HOST` | `127.0.0.1` | Bind host |
 | `CONTROL_PLANE_PORT` | `8080` | Bind port |
+| `CONTROL_PLANE_JOB_DB_PATH` | unset | Optional SQLite job database path. When set, job records survive process restarts. |
 
 ## Health Check
 
@@ -57,7 +58,9 @@ curl -X POST http://127.0.0.1:8080/jobs/backtests \
 
 The job response contains the job ID, status, request payload, and result when
 the configured executor runs inline. With the threaded executor, the initial
-response is usually `QUEUED`; poll the job endpoint for completion.
+response is usually `QUEUED`; poll the job endpoint for completion. Set
+`CONTROL_PLANE_JOB_DB_PATH` when local job history needs to persist across
+control-plane restarts.
 
 ## Inspect Jobs
 
@@ -114,12 +117,13 @@ timestamp,type,quantity
 
 ## Current Limitations
 
-- The default job store is in-memory; jobs are not durable across process restarts.
+- The default job store is in-memory. Set `CONTROL_PLANE_JOB_DB_PATH` to use
+  the built-in SQLite job store for durable local operation.
 - The first job type is CSV-signal backtesting. Parameter search, strategy
   monitoring, and operator controls should be added as follow-up job types.
 - Strategy command endpoints require wiring a live `StrategyControlService` over
   the running engine's `CommandRouter`; the default standalone server only
   exposes job endpoints.
 - Authentication and authorization are not yet implemented.
-- Production deployment should use a durable job store and a stronger HTTP
-  framework adapter.
+- Production deployment should use a stronger HTTP framework adapter and review
+  whether SQLite durability is sufficient for the deployment model.

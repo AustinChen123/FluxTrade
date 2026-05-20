@@ -12,6 +12,9 @@ Run locally:
 uv run python -m src.control_plane.main
 ```
 
+Set `CONTROL_PLANE_JOB_DB_PATH=/path/to/jobs.db` to persist control-plane job
+records across local restarts.
+
 Health check:
 
 ```bash
