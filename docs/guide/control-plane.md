@@ -23,6 +23,7 @@ Environment variables:
 | --- | --- | --- |
 | `CONTROL_PLANE_HOST` | `127.0.0.1` | Bind host |
 | `CONTROL_PLANE_PORT` | `8080` | Bind port |
+| `CONTROL_PLANE_JOB_DB_PATH` | unset | Optional SQLite job database path. When set, job records survive process restarts. |
 
 ## Health Check
 
@@ -57,13 +58,38 @@ curl -X POST http://127.0.0.1:8080/jobs/backtests \
 
 The job response contains the job ID, status, request payload, and result when
 the configured executor runs inline. With the threaded executor, the initial
-response is usually `QUEUED`; poll the job endpoint for completion.
+response is usually `QUEUED`; poll the job endpoint for completion. Set
+`CONTROL_PLANE_JOB_DB_PATH` when local job history needs to persist across
+control-plane restarts. On startup with the SQLite store enabled, jobs left in
+`QUEUED` or `RUNNING` from a previous process are marked failed with an
+interruption error so they can be retried explicitly.
 
 ## Inspect Jobs
 
 ```bash
 curl http://127.0.0.1:8080/jobs
 curl http://127.0.0.1:8080/jobs/<job_id>
+```
+
+## Cancel Or Retry Jobs
+
+Queued backtest jobs can be cancelled before they start:
+
+```bash
+curl -X POST http://127.0.0.1:8080/jobs/<job_id>/cancel \
+  -H 'Content-Type: application/json' \
+  -d '{"reason":"operator cancelled"}'
+```
+
+Running jobs are not force-stopped by this endpoint. If a job has already
+entered `BacktestRunner`, the control plane returns `409` instead of pretending
+the running work was interrupted.
+
+Failed or cancelled CSV-signal backtest jobs can be retried with the original
+request payload:
+
+```bash
+curl -X POST http://127.0.0.1:8080/jobs/<job_id>/retry
 ```
 
 ## Strategy Status And Commands
@@ -114,12 +140,16 @@ timestamp,type,quantity
 
 ## Current Limitations
 
-- The default job store is in-memory; jobs are not durable across process restarts.
+- The default job store is in-memory. Set `CONTROL_PLANE_JOB_DB_PATH` to use
+  the built-in SQLite job store for durable local operation.
 - The first job type is CSV-signal backtesting. Parameter search, strategy
   monitoring, and operator controls should be added as follow-up job types.
+- Job cancellation currently applies only to queued jobs. Running backtests need
+  cooperative cancellation inside the runner before safe force-stop semantics
+  can be exposed.
 - Strategy command endpoints require wiring a live `StrategyControlService` over
   the running engine's `CommandRouter`; the default standalone server only
   exposes job endpoints.
 - Authentication and authorization are not yet implemented.
-- Production deployment should use a durable job store and a stronger HTTP
-  framework adapter.
+- Production deployment should use a stronger HTTP framework adapter and review
+  whether SQLite durability is sufficient for the deployment model.

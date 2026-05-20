@@ -50,6 +50,9 @@ class ControlPlaneApp:
         if method == "POST" and clean_path == "/jobs/backtests":
             return self._submit_backtest(body)
 
+        if method == "POST" and clean_path.startswith("/jobs/"):
+            return self._handle_job_action(clean_path, body)
+
         if method == "GET" and clean_path == "/jobs":
             jobs = [self._job_payload(job) for job in self.backtest_executor.store.list()]
             return HttpResponse(200, {"jobs": jobs})
@@ -100,6 +103,44 @@ class ControlPlaneApp:
         job = self.backtest_executor.submit_backtest(request)
         status_code = 200 if job.finished_at is not None else 202
         return HttpResponse(status_code, {"job": self._job_payload(job)})
+
+    def _handle_job_action(
+        self,
+        path: str,
+        body: str | bytes | None,
+    ) -> HttpResponse:
+        if path.endswith("/cancel"):
+            job_id = path.removeprefix("/jobs/")[: -len("/cancel")]
+            if not job_id:
+                return HttpResponse(404, {"error": "not_found"})
+            try:
+                payload = self._parse_json_body(body) if body not in (None, "") else {}
+                reason = payload.get("reason")
+                if reason is not None and not isinstance(reason, str):
+                    return HttpResponse(422, {"error": "validation_error"})
+                job = self.backtest_executor.cancel_backtest(job_id, reason)
+            except json.JSONDecodeError as exc:
+                return HttpResponse(400, {"error": "invalid_json", "detail": str(exc)})
+            except ValueError as exc:
+                return HttpResponse(409, {"error": "job_action_rejected", "detail": str(exc)})
+            except KeyError:
+                return HttpResponse(404, {"error": "job_not_found"})
+            return HttpResponse(200, {"job": self._job_payload(job)})
+
+        if path.endswith("/retry"):
+            job_id = path.removeprefix("/jobs/")[: -len("/retry")]
+            if not job_id:
+                return HttpResponse(404, {"error": "not_found"})
+            try:
+                job = self.backtest_executor.retry_backtest(job_id)
+            except ValueError as exc:
+                return HttpResponse(409, {"error": "job_action_rejected", "detail": str(exc)})
+            except KeyError:
+                return HttpResponse(404, {"error": "job_not_found"})
+            status_code = 200 if job.finished_at is not None else 202
+            return HttpResponse(status_code, {"job": self._job_payload(job)})
+
+        return HttpResponse(404, {"error": "not_found"})
 
     def _submit_strategy_command(
         self,

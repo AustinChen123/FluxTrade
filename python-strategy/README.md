@@ -12,6 +12,9 @@ Run locally:
 uv run python -m src.control_plane.main
 ```
 
+Set `CONTROL_PLANE_JOB_DB_PATH=/path/to/jobs.db` to persist control-plane job
+records across local restarts.
+
 Health check:
 
 ```bash
@@ -39,6 +42,10 @@ Inspect jobs:
 ```bash
 curl http://127.0.0.1:8080/jobs
 curl http://127.0.0.1:8080/jobs/<job_id>
+curl -X POST http://127.0.0.1:8080/jobs/<job_id>/cancel \
+  -H 'Content-Type: application/json' \
+  -d '{"reason":"operator cancelled"}'
+curl -X POST http://127.0.0.1:8080/jobs/<job_id>/retry
 ```
 
 When the app is wired with a live strategy control service, it can also expose:
