@@ -5,12 +5,14 @@ from src.control_plane.backtest_jobs import BacktestJobExecutor
 from src.control_plane.jobs import InMemoryJobStore, JobStatus, JobStore, SqliteJobStore
 from src.control_plane.models import (
     BacktestJobRequest,
+    CsvSignalBacktestEvaluationConfig,
     JobRecord,
     ParameterCandidate,
     ParameterEvaluationResult,
     ParameterSearchJobRequest,
 )
 from src.control_plane.parameter_search import (
+    CsvSignalBacktestParameterEvaluator,
     ParameterSearchEvaluator,
     ParameterSearchJobExecutor,
 )
@@ -20,6 +22,8 @@ __all__ = [
     "BacktestJobExecutor",
     "BacktestJobRequest",
     "ControlPlaneApp",
+    "CsvSignalBacktestEvaluationConfig",
+    "CsvSignalBacktestParameterEvaluator",
     "HttpResponse",
     "InMemoryJobStore",
     "JobRecord",

@@ -3,11 +3,12 @@ from __future__ import annotations
 from concurrent.futures import Future, ThreadPoolExecutor
 from decimal import Decimal
 from threading import Lock
-from typing import Protocol
+from typing import Any, Protocol
 
-from src.control_plane.backtest_jobs import _json_safe
+from src.control_plane.backtest_jobs import BacktestJobExecutor, SessionFactory, _json_safe
 from src.control_plane.jobs import InMemoryJobStore, JobStore
 from src.control_plane.models import (
+    BacktestJobRequest,
     JobRecord,
     JobStatus,
     ParameterCandidate,
@@ -24,6 +25,55 @@ class ParameterSearchEvaluator(Protocol):
         request: ParameterSearchJobRequest,
         candidate: ParameterCandidate,
     ) -> ParameterEvaluationResult: ...
+
+
+class CsvSignalBacktestParameterEvaluator:
+    """Evaluate candidates by running CSV-signal backtests.
+
+    Each candidate must include ``signals_csv_path`` in ``param_pack``. The shared
+    candle CSV and fees live in ``ParameterSearchJobRequest.backtest``.
+    """
+
+    def __init__(self, db_session_factory: SessionFactory | None = None) -> None:
+        self._backtest_executor = BacktestJobExecutor(
+            db_session_factory=db_session_factory,
+            run_inline=True,
+        )
+
+    def evaluate(
+        self,
+        request: ParameterSearchJobRequest,
+        candidate: ParameterCandidate,
+    ) -> ParameterEvaluationResult:
+        if request.backtest is None:
+            raise ValueError("backtest settings are required for CSV-signal evaluation")
+
+        signals_csv_path = candidate.param_pack.get("signals_csv_path")
+        if not isinstance(signals_csv_path, str) or not signals_csv_path.strip():
+            raise ValueError("candidate param_pack.signals_csv_path is required")
+
+        backtest_request = BacktestJobRequest(
+            strategy_id=f"{request.strategy_id}_{candidate.candidate_id}",
+            product_id=request.product_id,
+            timeframe=request.timeframe,
+            candles_csv_path=request.backtest.candles_csv_path,
+            signals_csv_path=signals_csv_path,
+            start_time=request.start_time,
+            end_time=request.end_time,
+            initial_balance=request.backtest.initial_balance,
+            maker_fee=request.backtest.maker_fee,
+            taker_fee=request.backtest.taker_fee,
+            write_reports=request.backtest.write_reports,
+        )
+        result = self._backtest_executor.run_backtest_request(backtest_request)
+        score = _result_decimal(result, "total_pnl")
+        max_drawdown = _result_decimal(result, "max_drawdown")
+        return ParameterEvaluationResult(
+            candidate_id=candidate.candidate_id,
+            score_total=score,
+            max_drawdown=max_drawdown,
+            metrics=result,
+        )
 
 
 class ParameterSearchJobExecutor:
@@ -142,3 +192,8 @@ def _select_best_candidate(
 
 def _decimal_key(value: Decimal) -> Decimal:
     return value
+
+
+def _result_decimal(result: dict[str, Any], key: str) -> Decimal:
+    value = result.get(key, "0")
+    return Decimal(str(value))

@@ -10,6 +10,7 @@ from sqlalchemy.orm import sessionmaker
 from src.control_plane import (
     BacktestJobExecutor,
     ControlPlaneApp,
+    CsvSignalBacktestParameterEvaluator,
     InMemoryJobStore,
     ParameterEvaluationResult,
     ParameterSearchJobExecutor,
@@ -374,6 +375,70 @@ def test_control_plane_reports_unavailable_parameter_search():
 
     assert response.status_code == 503
     assert response.body == {"error": "parameter_search_unavailable"}
+
+
+@pytest.mark.rust
+@pytest.mark.skipif(not HAS_RUST, reason="fluxtrade_core.so not compiled")
+def test_control_plane_runs_parameter_search_with_csv_signal_backtests(tmp_path):
+    session_factory = _sqlite_session_factory(tmp_path)
+    candle_rows = _write_candles(tmp_path / "candles.csv")
+    conservative_signals = tmp_path / "conservative_signals.csv"
+    aggressive_signals = tmp_path / "aggressive_signals.csv"
+    conservative_signals.write_text(
+        "timestamp,type,quantity\n"
+        f"{candle_rows[1][0]},LONG,0.01\n"
+        f"{candle_rows[2][0]},EXIT_LONG,0.01\n"
+    )
+    aggressive_signals.write_text(
+        "timestamp,type,quantity\n"
+        f"{candle_rows[0][0]},LONG,0.01\n"
+        f"{candle_rows[2][0]},EXIT_LONG,0.01\n"
+    )
+    store = InMemoryJobStore()
+    app = ControlPlaneApp(
+        BacktestJobExecutor(store=store, run_inline=True),
+        parameter_search_executor=ParameterSearchJobExecutor(
+            CsvSignalBacktestParameterEvaluator(db_session_factory=session_factory),
+            store=store,
+            run_inline=True,
+        ),
+    )
+
+    response = app.handle(
+        "POST",
+        "/jobs/parameter-searches",
+        json.dumps(
+            {
+                "strategy_id": "csv_search",
+                "product_id": PRODUCT_ID,
+                "timeframe": TIMEFRAME,
+                "start_time": candle_rows[0][0],
+                "end_time": candle_rows[-1][0],
+                "backtest": {
+                    "candles_csv_path": str(tmp_path / "candles.csv"),
+                    "initial_balance": "10000",
+                    "maker_fee": "0",
+                    "taker_fee": "0",
+                },
+                "candidates": [
+                    {
+                        "candidate_id": "conservative",
+                        "param_pack": {"signals_csv_path": str(conservative_signals)},
+                    },
+                    {
+                        "candidate_id": "aggressive",
+                        "param_pack": {"signals_csv_path": str(aggressive_signals)},
+                    },
+                ],
+            }
+        ),
+    )
+
+    assert response.status_code == 200
+    job = response.body["job"]
+    assert job["status"] == JobStatus.SUCCEEDED.value
+    assert job["result"]["best_candidate"]["candidate_id"] == "aggressive"
+    assert Decimal(job["result"]["best_candidate"]["score_total"]) > Decimal("0")
 
 
 class _FakeCommandRouter:

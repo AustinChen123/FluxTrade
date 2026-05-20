@@ -72,6 +72,37 @@ class ParameterCandidate(BaseModel):
     param_pack: dict[str, Any] = Field(default_factory=dict)
 
 
+class CsvSignalBacktestEvaluationConfig(BaseModel):
+    """Backtest settings for CSV-signal parameter candidate evaluation."""
+
+    candles_csv_path: str = Field(min_length=1)
+    initial_balance: Decimal = Decimal("10000")
+    maker_fee: Decimal = Decimal("0")
+    taker_fee: Decimal = Decimal("0")
+    write_reports: bool = False
+
+    @field_validator("candles_csv_path")
+    @classmethod
+    def validate_path(cls, value: str) -> str:
+        if not value.strip():
+            raise ValueError("path cannot be blank")
+        return str(Path(value))
+
+    @field_validator("initial_balance")
+    @classmethod
+    def validate_initial_balance(cls, value: Decimal) -> Decimal:
+        if value <= 0:
+            raise ValueError("initial_balance must be positive")
+        return value
+
+    @field_validator("maker_fee", "taker_fee")
+    @classmethod
+    def validate_fee(cls, value: Decimal) -> Decimal:
+        if value < 0:
+            raise ValueError("fee cannot be negative")
+        return value
+
+
 class ParameterSearchJobRequest(BaseModel):
     """Request payload for evaluating strategy parameter candidates."""
 
@@ -87,6 +118,7 @@ class ParameterSearchJobRequest(BaseModel):
         "minimize_drawdown",
     ] = "maximize_score"
     seed: int | None = None
+    backtest: CsvSignalBacktestEvaluationConfig | None = None
     candidates: list[ParameterCandidate] = Field(min_length=1)
 
     @field_validator("end_time")

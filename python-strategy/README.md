@@ -49,7 +49,8 @@ curl -X POST http://127.0.0.1:8080/jobs/<job_id>/retry
 ```
 
 Parameter search jobs are available when the app is constructed with a
-`ParameterSearchEvaluator`:
+`ParameterSearchEvaluator`. The built-in CSV-signal evaluator expects each
+candidate to provide a `signals_csv_path`:
 
 ```bash
 curl -X POST http://127.0.0.1:8080/jobs/parameter-searches \
@@ -60,9 +61,24 @@ curl -X POST http://127.0.0.1:8080/jobs/parameter-searches \
     "timeframe": "15m",
     "start_time": 1700000000000,
     "end_time": 1700100000000,
+    "backtest": {
+      "candles_csv_path": "/absolute/path/to/candles.csv"
+    },
     "candidates": [
-      {"candidate_id":"a","param_pack":{"rsi_period":14}},
-      {"candidate_id":"b","param_pack":{"rsi_period":21}}
+      {
+        "candidate_id":"a",
+        "param_pack":{
+          "rsi_period":14,
+          "signals_csv_path":"/absolute/path/to/a_signals.csv"
+        }
+      },
+      {
+        "candidate_id":"b",
+        "param_pack":{
+          "rsi_period":21,
+          "signals_csv_path":"/absolute/path/to/b_signals.csv"
+        }
+      }
     ]
   }'
 ```
