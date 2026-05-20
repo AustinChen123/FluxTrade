@@ -82,6 +82,12 @@ class ControlPlaneApp:
         if method == "GET" and clean_path.startswith("/evolution-epochs/"):
             return self._get_epoch(clean_path)
 
+        if method == "GET" and clean_path == "/system-events":
+            return self._list_system_events(query)
+
+        if method == "GET" and clean_path.startswith("/system-events/"):
+            return self._get_system_event(clean_path)
+
         if method == "GET" and clean_path == "/jobs":
             jobs = [self._job_payload(job) for job in self.backtest_executor.store.list()]
             return HttpResponse(200, {"jobs": jobs})
@@ -331,6 +337,38 @@ class ControlPlaneApp:
         except KeyError:
             return HttpResponse(404, {"error": "epoch_not_found"})
         return HttpResponse(200, {"epoch": epoch})
+
+    def _list_system_events(self, query: dict[str, list[str]]) -> HttpResponse:
+        if self.gene_control is None:
+            return HttpResponse(503, {"error": "gene_control_unavailable"})
+        raw_gene_id = _single_query_value(query, "related_gene_id")
+        try:
+            related_gene_id = int(raw_gene_id) if raw_gene_id is not None else None
+        except ValueError:
+            return HttpResponse(422, {"error": "validation_error"})
+        return HttpResponse(
+            200,
+            {
+                "events": self.gene_control.list_system_events(
+                    event_type=_single_query_value(query, "event_type"),
+                    strategy_id=_single_query_value(query, "strategy_id"),
+                    related_gene_id=related_gene_id,
+                )
+            },
+        )
+
+    def _get_system_event(self, path: str) -> HttpResponse:
+        if self.gene_control is None:
+            return HttpResponse(503, {"error": "gene_control_unavailable"})
+        raw_event_id = path.removeprefix("/system-events/")
+        try:
+            event_id = int(raw_event_id)
+            event = self.gene_control.get_system_event(event_id)
+        except ValueError:
+            return HttpResponse(404, {"error": "not_found"})
+        except KeyError:
+            return HttpResponse(404, {"error": "system_event_not_found"})
+        return HttpResponse(200, {"event": event})
 
     @staticmethod
     def _parse_json_body(body: str | bytes | None) -> dict[str, Any]:

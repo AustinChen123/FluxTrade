@@ -7,7 +7,7 @@ from typing import Any
 from src.control_plane.backtest_jobs import SessionFactory
 from src.core.audit_service import write_system_event
 from src.core.models import GeneRole
-from src.core.orm_models import EvolutionEpoch, GeneRecord
+from src.core.orm_models import EvolutionEpoch, GeneRecord, SystemEvent
 
 
 class GeneControlService:
@@ -119,6 +119,31 @@ class GeneControlService:
                 raise KeyError(epoch_id)
             return _epoch_payload(epoch)
 
+    def list_system_events(
+        self,
+        *,
+        event_type: str | None = None,
+        strategy_id: str | None = None,
+        related_gene_id: int | None = None,
+    ) -> list[dict[str, Any]]:
+        with self._db_session_factory() as session:
+            query = session.query(SystemEvent)
+            if event_type is not None:
+                query = query.filter(SystemEvent.event_type == event_type)
+            if strategy_id is not None:
+                query = query.filter(SystemEvent.related_strategy_id == strategy_id)
+            if related_gene_id is not None:
+                query = query.filter(SystemEvent.related_gene_id == related_gene_id)
+            events = query.order_by(SystemEvent.created_at.desc(), SystemEvent.id.desc()).all()
+            return [_system_event_payload(event) for event in events]
+
+    def get_system_event(self, event_id: int) -> dict[str, Any]:
+        with self._db_session_factory() as session:
+            event = session.get(SystemEvent, event_id)
+            if event is None:
+                raise KeyError(event_id)
+            return _system_event_payload(event)
+
 
 def _gene_payload(gene: GeneRecord) -> dict[str, Any]:
     return {
@@ -155,6 +180,19 @@ def _epoch_payload(epoch: EvolutionEpoch) -> dict[str, Any]:
         "eval_end_date": _iso_or_none(epoch.eval_end_date),
         "eval_timeframe": epoch.eval_timeframe,
         "notes": epoch.notes,
+    }
+
+
+def _system_event_payload(event: SystemEvent) -> dict[str, Any]:
+    return {
+        "id": event.id,
+        "event_type": event.event_type,
+        "event_subtype": event.event_subtype,
+        "related_strategy_id": event.related_strategy_id,
+        "related_order_id": event.related_order_id,
+        "related_gene_id": event.related_gene_id,
+        "payload": event.payload,
+        "created_at": _iso_or_none(event.created_at),
     }
 
 

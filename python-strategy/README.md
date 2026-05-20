@@ -102,6 +102,8 @@ curl http://127.0.0.1:8080/genes
 curl 'http://127.0.0.1:8080/genes?strategy_id=rsi_scalper&role=champion'
 curl http://127.0.0.1:8080/evolution-epochs
 curl http://127.0.0.1:8080/evolution-epochs/<epoch_id>
+curl http://127.0.0.1:8080/system-events
+curl 'http://127.0.0.1:8080/system-events?event_type=gene_promote'
 ```
 
 When the app is wired with a live strategy control service, it can also expose:

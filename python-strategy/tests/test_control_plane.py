@@ -625,6 +625,57 @@ def test_control_plane_lists_and_gets_evolution_epochs(tmp_path):
     assert get_response.body["epoch"]["eval_start_date"] == "2026-05-20"
 
 
+def test_control_plane_lists_and_gets_system_events(tmp_path):
+    session_factory = _sqlite_gene_registry_session_factory(tmp_path)
+    with session_factory() as session:
+        event = SystemEvent(
+            event_type="gene_promote",
+            related_strategy_id="searchable",
+            related_gene_id=7,
+            payload={"reason": "best search score"},
+            created_at=datetime(2026, 5, 20, tzinfo=UTC),
+        )
+        other = SystemEvent(
+            event_type="system_error",
+            related_strategy_id="searchable",
+            payload={"message": "ignored by filter"},
+            created_at=datetime(2026, 5, 21, tzinfo=UTC),
+        )
+        session.add_all([event, other])
+        session.commit()
+        event_id = event.id
+
+    app = ControlPlaneApp(
+        BacktestJobExecutor(run_inline=True),
+        gene_control=GeneControlService(session_factory),
+    )
+
+    list_response = app.handle(
+        "GET",
+        "/system-events?event_type=gene_promote&strategy_id=searchable&related_gene_id=7",
+    )
+    get_response = app.handle("GET", f"/system-events/{event_id}")
+
+    assert list_response.status_code == 200
+    assert [event["id"] for event in list_response.body["events"]] == [event_id]
+    assert get_response.status_code == 200
+    assert get_response.body["event"]["event_type"] == "gene_promote"
+    assert get_response.body["event"]["payload"] == {"reason": "best search score"}
+
+
+def test_control_plane_rejects_invalid_system_event_gene_filter(tmp_path):
+    session_factory = _sqlite_gene_registry_session_factory(tmp_path)
+    app = ControlPlaneApp(
+        BacktestJobExecutor(run_inline=True),
+        gene_control=GeneControlService(session_factory),
+    )
+
+    response = app.handle("GET", "/system-events?related_gene_id=bad")
+
+    assert response.status_code == 422
+    assert response.body == {"error": "validation_error"}
+
+
 @pytest.mark.rust
 @pytest.mark.skipif(not HAS_RUST, reason="fluxtrade_core.so not compiled")
 def test_control_plane_runs_parameter_search_with_csv_signal_backtests(tmp_path):

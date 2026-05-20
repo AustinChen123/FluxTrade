@@ -182,6 +182,16 @@ curl 'http://127.0.0.1:8080/evolution-epochs?strategy_id=rsi_scalper'
 curl http://127.0.0.1:8080/evolution-epochs/<epoch_id>
 ```
 
+Inspect system events written by promotion, reconciliation, and operational
+paths:
+
+```bash
+curl http://127.0.0.1:8080/system-events
+curl 'http://127.0.0.1:8080/system-events?event_type=gene_promote&strategy_id=rsi_scalper'
+curl 'http://127.0.0.1:8080/system-events?related_gene_id=123'
+curl http://127.0.0.1:8080/system-events/<event_id>
+```
+
 ## Strategy Status And Commands
 
 When the control plane is constructed with a strategy control service, it can
