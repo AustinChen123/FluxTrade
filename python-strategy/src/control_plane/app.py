@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 from dataclasses import dataclass
+from urllib.parse import parse_qs, urlsplit
 from typing import Any
 
 from pydantic import ValidationError
@@ -50,7 +51,9 @@ class ControlPlaneApp:
         body: str | bytes | None = None,
     ) -> HttpResponse:
         method = method.upper()
-        clean_path = path.rstrip("/") or "/"
+        parsed_url = urlsplit(path)
+        clean_path = parsed_url.path.rstrip("/") or "/"
+        query = parse_qs(parsed_url.query)
 
         if method == "GET" and clean_path == "/health":
             return HttpResponse(200, {"status": "ok"})
@@ -66,6 +69,18 @@ class ControlPlaneApp:
 
         if method == "POST" and clean_path.startswith("/genes/"):
             return self._submit_gene_action(clean_path, body)
+
+        if method == "GET" and clean_path == "/genes":
+            return self._list_genes(query)
+
+        if method == "GET" and clean_path.startswith("/genes/"):
+            return self._get_gene(clean_path)
+
+        if method == "GET" and clean_path == "/evolution-epochs":
+            return self._list_epochs(query)
+
+        if method == "GET" and clean_path.startswith("/evolution-epochs/"):
+            return self._get_epoch(clean_path)
 
         if method == "GET" and clean_path == "/jobs":
             jobs = [self._job_payload(job) for job in self.backtest_executor.store.list()]
@@ -273,6 +288,50 @@ class ControlPlaneApp:
 
         return HttpResponse(200, {"gene": result})
 
+    def _list_genes(self, query: dict[str, list[str]]) -> HttpResponse:
+        if self.gene_control is None:
+            return HttpResponse(503, {"error": "gene_control_unavailable"})
+        strategy_id = _single_query_value(query, "strategy_id")
+        role = _single_query_value(query, "role")
+        return HttpResponse(
+            200,
+            {"genes": self.gene_control.list_genes(strategy_id=strategy_id, role=role)},
+        )
+
+    def _get_gene(self, path: str) -> HttpResponse:
+        if self.gene_control is None:
+            return HttpResponse(503, {"error": "gene_control_unavailable"})
+        raw_gene_id = path.removeprefix("/genes/")
+        try:
+            gene_id = int(raw_gene_id)
+            gene = self.gene_control.get_gene(gene_id)
+        except ValueError:
+            return HttpResponse(404, {"error": "not_found"})
+        except KeyError:
+            return HttpResponse(404, {"error": "gene_not_found"})
+        return HttpResponse(200, {"gene": gene})
+
+    def _list_epochs(self, query: dict[str, list[str]]) -> HttpResponse:
+        if self.gene_control is None:
+            return HttpResponse(503, {"error": "gene_control_unavailable"})
+        strategy_id = _single_query_value(query, "strategy_id")
+        return HttpResponse(
+            200,
+            {"epochs": self.gene_control.list_epochs(strategy_id=strategy_id)},
+        )
+
+    def _get_epoch(self, path: str) -> HttpResponse:
+        if self.gene_control is None:
+            return HttpResponse(503, {"error": "gene_control_unavailable"})
+        epoch_id = path.removeprefix("/evolution-epochs/")
+        if not epoch_id:
+            return HttpResponse(404, {"error": "not_found"})
+        try:
+            epoch = self.gene_control.get_epoch(epoch_id)
+        except KeyError:
+            return HttpResponse(404, {"error": "epoch_not_found"})
+        return HttpResponse(200, {"epoch": epoch})
+
     @staticmethod
     def _parse_json_body(body: str | bytes | None) -> dict[str, Any]:
         if body is None or body == "":
@@ -292,3 +351,10 @@ class ControlPlaneApp:
     def _command_response(result: dict[str, Any]) -> HttpResponse:
         status_code = 200 if result["success"] else 400
         return HttpResponse(status_code, {"result": result})
+
+
+def _single_query_value(query: dict[str, list[str]], key: str) -> str | None:
+    values = query.get(key)
+    if not values:
+        return None
+    return values[0]

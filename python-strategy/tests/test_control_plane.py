@@ -527,6 +527,104 @@ def test_control_plane_promotes_gene_and_retires_previous_champion(tmp_path):
     assert events[-1].payload["reason"] == "best search score"
 
 
+def test_control_plane_lists_and_gets_genes(tmp_path):
+    session_factory = _sqlite_gene_registry_session_factory(tmp_path)
+    with session_factory() as session:
+        epoch = EvolutionEpoch(
+            id="epoch-query",
+            strategy_id="searchable",
+            started_at=datetime(2026, 5, 20, tzinfo=UTC),
+            pop_size=2,
+            max_generations=1,
+            generations_run=1,
+            best_score=Decimal("2.5"),
+            seed=1,
+            config_json={},
+            status="completed",
+            eval_pair=PRODUCT_ID,
+            eval_start_date=date(2026, 5, 20),
+            eval_end_date=date(2026, 5, 20),
+            eval_timeframe=TIMEFRAME,
+        )
+        champion = GeneRecord(
+            strategy_id="searchable",
+            role="champion",
+            param_pack={"score": "2.5"},
+            score_total=Decimal("2.5"),
+            score_breakdown={"total_pnl": "2.5"},
+            max_drawdown=Decimal("0.05"),
+            epoch_id="epoch-query",
+        )
+        challenger = GeneRecord(
+            strategy_id="searchable",
+            role="challenger",
+            param_pack={"score": "1.2"},
+            score_total=Decimal("1.2"),
+            score_breakdown={"total_pnl": "1.2"},
+            max_drawdown=Decimal("0.10"),
+            epoch_id="epoch-query",
+        )
+        session.add(epoch)
+        session.add_all([champion, challenger])
+        session.commit()
+        champion_id = champion.id
+
+    app = ControlPlaneApp(
+        BacktestJobExecutor(run_inline=True),
+        gene_control=GeneControlService(session_factory),
+    )
+
+    list_response = app.handle("GET", "/genes?strategy_id=searchable&role=champion")
+    get_response = app.handle("GET", f"/genes/{champion_id}")
+
+    assert list_response.status_code == 200
+    assert [gene["id"] for gene in list_response.body["genes"]] == [champion_id]
+    assert get_response.status_code == 200
+    assert get_response.body["gene"]["id"] == champion_id
+    assert get_response.body["gene"]["score_total"] == "2.50000000"
+    assert get_response.body["gene"]["param_pack"] == {"score": "2.5"}
+
+
+def test_control_plane_lists_and_gets_evolution_epochs(tmp_path):
+    session_factory = _sqlite_gene_registry_session_factory(tmp_path)
+    with session_factory() as session:
+        session.add(
+            EvolutionEpoch(
+                id="epoch-query",
+                strategy_id="searchable",
+                started_at=datetime(2026, 5, 20, tzinfo=UTC),
+                finished_at=datetime(2026, 5, 20, 1, tzinfo=UTC),
+                pop_size=2,
+                max_generations=1,
+                generations_run=1,
+                best_score=Decimal("2.5"),
+                seed=1,
+                config_json={"objective": "maximize_score"},
+                status="completed",
+                eval_pair=PRODUCT_ID,
+                eval_start_date=date(2026, 5, 20),
+                eval_end_date=date(2026, 5, 20),
+                eval_timeframe=TIMEFRAME,
+            )
+        )
+        session.commit()
+
+    app = ControlPlaneApp(
+        BacktestJobExecutor(run_inline=True),
+        gene_control=GeneControlService(session_factory),
+    )
+
+    list_response = app.handle("GET", "/evolution-epochs?strategy_id=searchable")
+    get_response = app.handle("GET", "/evolution-epochs/epoch-query")
+
+    assert list_response.status_code == 200
+    assert [epoch["id"] for epoch in list_response.body["epochs"]] == ["epoch-query"]
+    assert get_response.status_code == 200
+    assert get_response.body["epoch"]["best_score"] == "2.50000000"
+    assert get_response.body["epoch"]["config_json"] == {"objective": "maximize_score"}
+    assert get_response.body["epoch"]["eval_start_date"] == "2026-05-20"
+
+
 @pytest.mark.rust
 @pytest.mark.skipif(not HAS_RUST, reason="fluxtrade_core.so not compiled")
 def test_control_plane_runs_parameter_search_with_csv_signal_backtests(tmp_path):

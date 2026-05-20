@@ -95,6 +95,15 @@ curl -X POST http://127.0.0.1:8080/genes/<gene_id>/promote \
   -d '{"reason":"best search score","actor":"operator"}'
 ```
 
+Inspect persisted search results:
+
+```bash
+curl http://127.0.0.1:8080/genes
+curl 'http://127.0.0.1:8080/genes?strategy_id=rsi_scalper&role=champion'
+curl http://127.0.0.1:8080/evolution-epochs
+curl http://127.0.0.1:8080/evolution-epochs/<epoch_id>
+```
+
 When the app is wired with a live strategy control service, it can also expose:
 
 ```bash
