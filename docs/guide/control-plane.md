@@ -92,6 +92,84 @@ request payload:
 curl -X POST http://127.0.0.1:8080/jobs/<job_id>/retry
 ```
 
+## Submit A Parameter Search Job
+
+Parameter search is exposed as a control-plane job type. The application
+provides a `ParameterSearchEvaluator`, which turns one candidate parameter pack
+into score, drawdown, and metrics. The first built-in evaluator is
+`CsvSignalBacktestParameterEvaluator`: each candidate points to a signal CSV,
+and the evaluator runs the existing BacktestRunner against a shared candle CSV.
+
+```bash
+curl -X POST http://127.0.0.1:8080/jobs/parameter-searches \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "strategy_id": "rsi_scalper",
+    "product_id": "BINANCE:BTCUSDT-PERP",
+    "timeframe": "15m",
+    "start_time": 1700000000000,
+    "end_time": 1700100000000,
+    "objective": "maximize_score",
+    "seed": 42,
+    "backtest": {
+      "candles_csv_path": "/absolute/path/to/candles.csv",
+      "initial_balance": "10000",
+      "maker_fee": "0.0002",
+      "taker_fee": "0.0006"
+    },
+    "candidates": [
+      {
+        "candidate_id": "candidate_001",
+        "param_pack": {
+          "rsi_period": 14,
+          "entry_threshold": 30,
+          "signals_csv_path": "/absolute/path/to/candidate_001_signals.csv"
+        }
+      },
+      {
+        "candidate_id": "candidate_002",
+        "param_pack": {
+          "rsi_period": 21,
+          "entry_threshold": 25,
+          "signals_csv_path": "/absolute/path/to/candidate_002_signals.csv"
+        }
+      }
+    ]
+  }'
+```
+
+Supported objectives:
+
+- `maximize_score`
+- `maximize_return`
+- `minimize_drawdown`
+
+The default standalone server does not wire a parameter-search evaluator yet,
+so this endpoint returns `503` until the process is constructed with one. The
+CSV-signal evaluator is useful when another process generates candidate signals
+from parameter packs and FluxTrade is responsible for durable evaluation,
+ranking, and job history. When the executor is constructed with a database
+session factory, completed searches also write an `evolution_epochs` row plus
+one `gene_records` challenger row per evaluated candidate; the job result
+includes `epoch_id`.
+
+## Promote A Gene
+
+When the control plane is constructed with `GeneControlService`, an operator can
+promote one candidate gene to champion:
+
+```bash
+curl -X POST http://127.0.0.1:8080/genes/<gene_id>/promote \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "reason": "best search score",
+    "actor": "operator"
+  }'
+```
+
+Promotion retires any existing champion for the same strategy and writes
+`gene_retire` / `gene_promote` system events in the same transaction.
+
 ## Strategy Status And Commands
 
 When the control plane is constructed with a strategy control service, it can
@@ -142,8 +220,11 @@ timestamp,type,quantity
 
 - The default job store is in-memory. Set `CONTROL_PLANE_JOB_DB_PATH` to use
   the built-in SQLite job store for durable local operation.
-- The first job type is CSV-signal backtesting. Parameter search, strategy
-  monitoring, and operator controls should be added as follow-up job types.
+- The first executable backtest job type is CSV-signal backtesting. Parameter
+  search can evaluate candidate signal CSVs through BacktestRunner, but native
+  strategy parameter generation/mutation/crossover is still future work.
+- Gene promotion updates gene lifecycle state and writes audit events, but it
+  does not hot-reload a live strategy yet.
 - Job cancellation currently applies only to queued jobs. Running backtests need
   cooperative cancellation inside the runner before safe force-stop semantics
   can be exposed.

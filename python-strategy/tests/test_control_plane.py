@@ -1,4 +1,5 @@
 import json
+from datetime import UTC, date, datetime
 from decimal import Decimal
 
 import pytest
@@ -10,7 +11,11 @@ from sqlalchemy.orm import sessionmaker
 from src.control_plane import (
     BacktestJobExecutor,
     ControlPlaneApp,
+    CsvSignalBacktestParameterEvaluator,
+    GeneControlService,
     InMemoryJobStore,
+    ParameterEvaluationResult,
+    ParameterSearchJobExecutor,
     SqliteJobStore,
     StrategyControlService,
 )
@@ -19,7 +24,10 @@ from src.core.command_router import CommandResult
 from src.core.orm_models import (
     BacktestResultSummary,
     BacktestTradeLog,
+    EvolutionEpoch,
     Exchange,
+    GeneRecord,
+    SystemEvent,
     Product,
     SignalAudit,
     Strategy,
@@ -68,6 +76,26 @@ def _sqlite_session_factory(tmp_path):
                 quote_asset="USDT",
             )
         )
+        session.commit()
+    return session_factory
+
+
+def _sqlite_gene_registry_session_factory(tmp_path):
+    engine = create_engine(
+        f"sqlite:///{tmp_path / 'control_plane_gene_registry.db'}",
+        connect_args={"check_same_thread": False, "timeout": 30},
+    )
+    for table in [
+        Strategy.__table__,
+        SystemEvent.__table__,
+        EvolutionEpoch.__table__,
+        GeneRecord.__table__,
+    ]:
+        table.create(engine, checkfirst=True)
+
+    session_factory = sessionmaker(bind=engine)
+    with session_factory() as session:
+        session.add(Strategy(id="searchable", name="Searchable Strategy"))
         session.commit()
     return session_factory
 
@@ -261,6 +289,306 @@ def test_backtest_executor_retries_cancelled_jobs():
     assert retry.id != original.id
     assert retry.status == JobStatus.QUEUED
     assert retry.request == original.request
+
+
+class _FakeParameterEvaluator:
+    def __init__(self) -> None:
+        self.evaluated_candidate_ids = []
+
+    def evaluate(self, request, candidate):
+        self.evaluated_candidate_ids.append(candidate.candidate_id)
+        score = Decimal(str(candidate.param_pack["score"]))
+        drawdown = Decimal(str(candidate.param_pack.get("drawdown", "0")))
+        return ParameterEvaluationResult(
+            candidate_id=candidate.candidate_id,
+            score_total=score,
+            max_drawdown=drawdown,
+            metrics={"seed": request.seed, "score": str(score)},
+        )
+
+
+def test_control_plane_runs_parameter_search_job_with_injected_evaluator():
+    store = InMemoryJobStore()
+    evaluator = _FakeParameterEvaluator()
+    app = ControlPlaneApp(
+        BacktestJobExecutor(store=store, run_inline=True),
+        parameter_search_executor=ParameterSearchJobExecutor(
+            evaluator,
+            store=store,
+            run_inline=True,
+        ),
+    )
+
+    response = app.handle(
+        "POST",
+        "/jobs/parameter-searches",
+        json.dumps(
+            {
+                "strategy_id": "searchable",
+                "product_id": PRODUCT_ID,
+                "timeframe": TIMEFRAME,
+                "start_time": 1,
+                "end_time": 2,
+                "seed": 7,
+                "candidates": [
+                    {"candidate_id": "a", "param_pack": {"score": "1.2"}},
+                    {"candidate_id": "b", "param_pack": {"score": "2.5"}},
+                ],
+            }
+        ),
+    )
+
+    assert response.status_code == 200
+    job = response.body["job"]
+    assert job["kind"] == "parameter_search"
+    assert job["status"] == JobStatus.SUCCEEDED.value
+    assert job["result"]["best_candidate"]["candidate_id"] == "b"
+    assert job["result"]["best_candidate"]["score_total"] == "2.5"
+    assert evaluator.evaluated_candidate_ids == ["a", "b"]
+
+
+def test_control_plane_rejects_duplicate_parameter_candidates():
+    store = InMemoryJobStore()
+    app = ControlPlaneApp(
+        BacktestJobExecutor(store=store, run_inline=True),
+        parameter_search_executor=ParameterSearchJobExecutor(
+            _FakeParameterEvaluator(),
+            store=store,
+            run_inline=True,
+        ),
+    )
+
+    response = app.handle(
+        "POST",
+        "/jobs/parameter-searches",
+        json.dumps(
+            {
+                "strategy_id": "searchable",
+                "product_id": PRODUCT_ID,
+                "timeframe": TIMEFRAME,
+                "start_time": 1,
+                "end_time": 2,
+                "candidates": [
+                    {"candidate_id": "same", "param_pack": {"score": "1"}},
+                    {"candidate_id": "same", "param_pack": {"score": "2"}},
+                ],
+            }
+        ),
+    )
+
+    assert response.status_code == 422
+    assert response.body["error"] == "validation_error"
+
+
+def test_control_plane_reports_unavailable_parameter_search():
+    app = ControlPlaneApp(BacktestJobExecutor(run_inline=True))
+
+    response = app.handle(
+        "POST",
+        "/jobs/parameter-searches",
+        json.dumps(
+            {
+                "strategy_id": "searchable",
+                "product_id": PRODUCT_ID,
+                "timeframe": TIMEFRAME,
+                "start_time": 1,
+                "end_time": 2,
+                "candidates": [{"candidate_id": "a", "param_pack": {"score": "1"}}],
+            }
+        ),
+    )
+
+    assert response.status_code == 503
+    assert response.body == {"error": "parameter_search_unavailable"}
+
+
+def test_parameter_search_records_evolution_epoch_and_gene_candidates(tmp_path):
+    store = InMemoryJobStore()
+    session_factory = _sqlite_gene_registry_session_factory(tmp_path)
+    app = ControlPlaneApp(
+        BacktestJobExecutor(store=store, run_inline=True),
+        parameter_search_executor=ParameterSearchJobExecutor(
+            _FakeParameterEvaluator(),
+            store=store,
+            run_inline=True,
+            db_session_factory=session_factory,
+        ),
+    )
+
+    response = app.handle(
+        "POST",
+        "/jobs/parameter-searches",
+        json.dumps(
+            {
+                "strategy_id": "searchable",
+                "product_id": PRODUCT_ID,
+                "timeframe": TIMEFRAME,
+                "start_time": 1_700_000_000_000,
+                "end_time": 1_700_001_800_000,
+                "seed": 11,
+                "candidates": [
+                    {"candidate_id": "a", "param_pack": {"score": "1.2"}},
+                    {"candidate_id": "b", "param_pack": {"score": "2.5"}},
+                ],
+            }
+        ),
+    )
+
+    assert response.status_code == 200
+    epoch_id = response.body["job"]["result"]["epoch_id"]
+    assert epoch_id.startswith("epoch_")
+
+    with session_factory() as session:
+        epoch = session.get(EvolutionEpoch, epoch_id)
+        genes = (
+            session.query(GeneRecord)
+            .filter(GeneRecord.epoch_id == epoch_id)
+            .order_by(GeneRecord.score_total)
+            .all()
+        )
+
+    assert epoch.strategy_id == "searchable"
+    assert epoch.status == "completed"
+    assert epoch.pop_size == 2
+    assert epoch.best_score == Decimal("2.50000000")
+    assert [gene.param_pack for gene in genes] == [{"score": "1.2"}, {"score": "2.5"}]
+    assert [gene.role for gene in genes] == ["challenger", "challenger"]
+
+
+def test_control_plane_promotes_gene_and_retires_previous_champion(tmp_path):
+    session_factory = _sqlite_gene_registry_session_factory(tmp_path)
+    with session_factory() as session:
+        epoch = EvolutionEpoch(
+            id="epoch-promote",
+            strategy_id="searchable",
+            started_at=datetime(2026, 5, 20, tzinfo=UTC),
+            pop_size=2,
+            max_generations=1,
+            generations_run=1,
+            best_score=Decimal("2.5"),
+            seed=1,
+            config_json={},
+            status="completed",
+            eval_pair=PRODUCT_ID,
+            eval_start_date=date(2026, 5, 20),
+            eval_end_date=date(2026, 5, 20),
+            eval_timeframe=TIMEFRAME,
+        )
+        champion = GeneRecord(
+            strategy_id="searchable",
+            role="champion",
+            param_pack={"score": "1.2"},
+            score_total=Decimal("1.2"),
+            score_breakdown={},
+            max_drawdown=Decimal("0.1"),
+            epoch_id="epoch-promote",
+        )
+        challenger = GeneRecord(
+            strategy_id="searchable",
+            role="challenger",
+            param_pack={"score": "2.5"},
+            score_total=Decimal("2.5"),
+            score_breakdown={},
+            max_drawdown=Decimal("0.05"),
+            epoch_id="epoch-promote",
+        )
+        session.add(epoch)
+        session.add_all([champion, challenger])
+        session.commit()
+        champion_id = champion.id
+        challenger_id = challenger.id
+
+    app = ControlPlaneApp(
+        BacktestJobExecutor(run_inline=True),
+        gene_control=GeneControlService(session_factory),
+    )
+
+    response = app.handle(
+        "POST",
+        f"/genes/{challenger_id}/promote",
+        json.dumps({"reason": "best search score", "actor": "operator"}),
+    )
+
+    assert response.status_code == 200
+    assert response.body["gene"]["gene_id"] == challenger_id
+    assert response.body["gene"]["role"] == "champion"
+    assert response.body["gene"]["retired_gene_ids"] == [champion_id]
+
+    with session_factory() as session:
+        old_champion = session.get(GeneRecord, champion_id)
+        new_champion = session.get(GeneRecord, challenger_id)
+        events = session.query(SystemEvent).order_by(SystemEvent.id).all()
+
+    assert old_champion.role == "retired"
+    assert old_champion.retired_at is not None
+    assert new_champion.role == "champion"
+    assert new_champion.activated_at is not None
+    assert [event.event_type for event in events] == ["gene_retire", "gene_promote"]
+    assert events[-1].payload["reason"] == "best search score"
+
+
+@pytest.mark.rust
+@pytest.mark.skipif(not HAS_RUST, reason="fluxtrade_core.so not compiled")
+def test_control_plane_runs_parameter_search_with_csv_signal_backtests(tmp_path):
+    session_factory = _sqlite_session_factory(tmp_path)
+    candle_rows = _write_candles(tmp_path / "candles.csv")
+    conservative_signals = tmp_path / "conservative_signals.csv"
+    aggressive_signals = tmp_path / "aggressive_signals.csv"
+    conservative_signals.write_text(
+        "timestamp,type,quantity\n"
+        f"{candle_rows[1][0]},LONG,0.01\n"
+        f"{candle_rows[2][0]},EXIT_LONG,0.01\n"
+    )
+    aggressive_signals.write_text(
+        "timestamp,type,quantity\n"
+        f"{candle_rows[0][0]},LONG,0.01\n"
+        f"{candle_rows[2][0]},EXIT_LONG,0.01\n"
+    )
+    store = InMemoryJobStore()
+    app = ControlPlaneApp(
+        BacktestJobExecutor(store=store, run_inline=True),
+        parameter_search_executor=ParameterSearchJobExecutor(
+            CsvSignalBacktestParameterEvaluator(db_session_factory=session_factory),
+            store=store,
+            run_inline=True,
+        ),
+    )
+
+    response = app.handle(
+        "POST",
+        "/jobs/parameter-searches",
+        json.dumps(
+            {
+                "strategy_id": "csv_search",
+                "product_id": PRODUCT_ID,
+                "timeframe": TIMEFRAME,
+                "start_time": candle_rows[0][0],
+                "end_time": candle_rows[-1][0],
+                "backtest": {
+                    "candles_csv_path": str(tmp_path / "candles.csv"),
+                    "initial_balance": "10000",
+                    "maker_fee": "0",
+                    "taker_fee": "0",
+                },
+                "candidates": [
+                    {
+                        "candidate_id": "conservative",
+                        "param_pack": {"signals_csv_path": str(conservative_signals)},
+                    },
+                    {
+                        "candidate_id": "aggressive",
+                        "param_pack": {"signals_csv_path": str(aggressive_signals)},
+                    },
+                ],
+            }
+        ),
+    )
+
+    assert response.status_code == 200
+    job = response.body["job"]
+    assert job["status"] == JobStatus.SUCCEEDED.value
+    assert job["result"]["best_candidate"]["candidate_id"] == "aggressive"
+    assert Decimal(job["result"]["best_candidate"]["score_total"]) > Decimal("0")
 
 
 class _FakeCommandRouter:

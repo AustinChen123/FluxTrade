@@ -91,7 +91,7 @@ class BacktestJobExecutor:
                 return current
             self.store.mark_running(job_id)
             try:
-                result = self._run_backtest(request)
+                result = self.run_backtest_request(request)
             except Exception as exc:
                 return self.store.mark_failed(job_id, str(exc))
             return self.store.mark_succeeded(job_id, result)
@@ -99,7 +99,7 @@ class BacktestJobExecutor:
             with self._futures_lock:
                 self._futures.pop(job_id, None)
 
-    def _run_backtest(self, request: BacktestJobRequest) -> dict[str, Any]:
+    def run_backtest_request(self, request: BacktestJobRequest) -> dict[str, Any]:
         data_source = CsvDataSource(
             file_path=request.candles_csv_path,
             product_id=request.product_id,

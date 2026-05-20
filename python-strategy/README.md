@@ -48,6 +48,53 @@ curl -X POST http://127.0.0.1:8080/jobs/<job_id>/cancel \
 curl -X POST http://127.0.0.1:8080/jobs/<job_id>/retry
 ```
 
+Parameter search jobs are available when the app is constructed with a
+`ParameterSearchEvaluator`. The built-in CSV-signal evaluator expects each
+candidate to provide a `signals_csv_path`:
+
+```bash
+curl -X POST http://127.0.0.1:8080/jobs/parameter-searches \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "strategy_id": "rsi_scalper",
+    "product_id": "BINANCE:BTCUSDT-PERP",
+    "timeframe": "15m",
+    "start_time": 1700000000000,
+    "end_time": 1700100000000,
+    "backtest": {
+      "candles_csv_path": "/absolute/path/to/candles.csv"
+    },
+    "candidates": [
+      {
+        "candidate_id":"a",
+        "param_pack":{
+          "rsi_period":14,
+          "signals_csv_path":"/absolute/path/to/a_signals.csv"
+        }
+      },
+      {
+        "candidate_id":"b",
+        "param_pack":{
+          "rsi_period":21,
+          "signals_csv_path":"/absolute/path/to/b_signals.csv"
+        }
+      }
+    ]
+  }'
+```
+
+When the parameter-search executor is constructed with a database session
+factory, completed searches also persist `evolution_epochs` and challenger
+`gene_records` rows.
+
+Promote a persisted gene when `GeneControlService` is wired:
+
+```bash
+curl -X POST http://127.0.0.1:8080/genes/<gene_id>/promote \
+  -H 'Content-Type: application/json' \
+  -d '{"reason":"best search score","actor":"operator"}'
+```
+
 When the app is wired with a live strategy control service, it can also expose:
 
 ```bash

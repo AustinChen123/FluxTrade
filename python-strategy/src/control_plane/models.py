@@ -65,6 +65,91 @@ class BacktestJobRequest(BaseModel):
         return value
 
 
+class ParameterCandidate(BaseModel):
+    """Candidate parameter pack for a parameter-search job."""
+
+    candidate_id: str = Field(min_length=1)
+    param_pack: dict[str, Any] = Field(default_factory=dict)
+
+
+class CsvSignalBacktestEvaluationConfig(BaseModel):
+    """Backtest settings for CSV-signal parameter candidate evaluation."""
+
+    candles_csv_path: str = Field(min_length=1)
+    initial_balance: Decimal = Decimal("10000")
+    maker_fee: Decimal = Decimal("0")
+    taker_fee: Decimal = Decimal("0")
+    write_reports: bool = False
+
+    @field_validator("candles_csv_path")
+    @classmethod
+    def validate_path(cls, value: str) -> str:
+        if not value.strip():
+            raise ValueError("path cannot be blank")
+        return str(Path(value))
+
+    @field_validator("initial_balance")
+    @classmethod
+    def validate_initial_balance(cls, value: Decimal) -> Decimal:
+        if value <= 0:
+            raise ValueError("initial_balance must be positive")
+        return value
+
+    @field_validator("maker_fee", "taker_fee")
+    @classmethod
+    def validate_fee(cls, value: Decimal) -> Decimal:
+        if value < 0:
+            raise ValueError("fee cannot be negative")
+        return value
+
+
+class ParameterSearchJobRequest(BaseModel):
+    """Request payload for evaluating strategy parameter candidates."""
+
+    kind: Literal["parameter_search"] = "parameter_search"
+    strategy_id: str = Field(min_length=1)
+    product_id: str = Field(min_length=1)
+    timeframe: str = Field(min_length=1)
+    start_time: int
+    end_time: int
+    objective: Literal[
+        "maximize_score",
+        "maximize_return",
+        "minimize_drawdown",
+    ] = "maximize_score"
+    seed: int | None = None
+    backtest: CsvSignalBacktestEvaluationConfig | None = None
+    candidates: list[ParameterCandidate] = Field(min_length=1)
+
+    @field_validator("end_time")
+    @classmethod
+    def validate_time_range(cls, value: int, info) -> int:
+        start_time = info.data.get("start_time")
+        if start_time is not None and value < start_time:
+            raise ValueError("end_time must be greater than or equal to start_time")
+        return value
+
+    @field_validator("candidates")
+    @classmethod
+    def validate_unique_candidates(
+        cls,
+        value: list[ParameterCandidate],
+    ) -> list[ParameterCandidate]:
+        candidate_ids = [candidate.candidate_id for candidate in value]
+        if len(candidate_ids) != len(set(candidate_ids)):
+            raise ValueError("candidate_id values must be unique")
+        return value
+
+
+class ParameterEvaluationResult(BaseModel):
+    """Evaluator output for one parameter candidate."""
+
+    candidate_id: str = Field(min_length=1)
+    score_total: Decimal
+    max_drawdown: Decimal = Decimal("0")
+    metrics: dict[str, Any] = Field(default_factory=dict)
+
+
 class JobRecord(BaseModel):
     """Control-plane job state exposed by the API layer."""
 
@@ -100,3 +185,10 @@ class StrategyCommandRequest(BaseModel):
     command: Literal["START", "STOP", "RESUME", "FORCE_RECOVER", "RELOAD"]
     reason: str | None = None
     params: dict[str, Any] = Field(default_factory=dict)
+
+
+class GenePromotionRequest(BaseModel):
+    """Operator request to promote a parameter gene to champion."""
+
+    reason: str | None = None
+    actor: str = "control_plane"

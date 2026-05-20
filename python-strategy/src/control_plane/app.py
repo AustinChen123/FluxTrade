@@ -7,11 +7,15 @@ from typing import Any
 from pydantic import ValidationError
 
 from src.control_plane.backtest_jobs import BacktestJobExecutor
+from src.control_plane.gene_control import GeneControlService
 from src.control_plane.models import (
     BacktestJobRequest,
+    GenePromotionRequest,
     JobRecord,
+    ParameterSearchJobRequest,
     StrategyCommandRequest,
 )
+from src.control_plane.parameter_search import ParameterSearchJobExecutor
 from src.control_plane.strategy_control import StrategyControlService
 
 
@@ -30,9 +34,13 @@ class ControlPlaneApp:
     def __init__(
         self,
         backtest_executor: BacktestJobExecutor,
+        parameter_search_executor: ParameterSearchJobExecutor | None = None,
+        gene_control: GeneControlService | None = None,
         strategy_control: StrategyControlService | None = None,
     ) -> None:
         self.backtest_executor = backtest_executor
+        self.parameter_search_executor = parameter_search_executor
+        self.gene_control = gene_control
         self.strategy_control = strategy_control
 
     def handle(
@@ -50,8 +58,14 @@ class ControlPlaneApp:
         if method == "POST" and clean_path == "/jobs/backtests":
             return self._submit_backtest(body)
 
+        if method == "POST" and clean_path == "/jobs/parameter-searches":
+            return self._submit_parameter_search(body)
+
         if method == "POST" and clean_path.startswith("/jobs/"):
             return self._handle_job_action(clean_path, body)
+
+        if method == "POST" and clean_path.startswith("/genes/"):
+            return self._submit_gene_action(clean_path, body)
 
         if method == "GET" and clean_path == "/jobs":
             jobs = [self._job_payload(job) for job in self.backtest_executor.store.list()]
@@ -104,6 +118,29 @@ class ControlPlaneApp:
         status_code = 200 if job.finished_at is not None else 202
         return HttpResponse(status_code, {"job": self._job_payload(job)})
 
+    def _submit_parameter_search(self, body: str | bytes | None) -> HttpResponse:
+        if self.parameter_search_executor is None:
+            return HttpResponse(503, {"error": "parameter_search_unavailable"})
+        try:
+            payload = self._parse_json_body(body)
+            request = ParameterSearchJobRequest.model_validate(payload)
+        except json.JSONDecodeError as exc:
+            return HttpResponse(400, {"error": "invalid_json", "detail": str(exc)})
+        except ValidationError as exc:
+            return HttpResponse(
+                422,
+                {
+                    "error": "validation_error",
+                    "detail": exc.errors(include_url=False),
+                },
+            )
+        except ValueError as exc:
+            return HttpResponse(400, {"error": "invalid_json", "detail": str(exc)})
+
+        job = self.parameter_search_executor.submit_search(request)
+        status_code = 200 if job.finished_at is not None else 202
+        return HttpResponse(status_code, {"job": self._job_payload(job)})
+
     def _handle_job_action(
         self,
         path: str,
@@ -114,11 +151,19 @@ class ControlPlaneApp:
             if not job_id:
                 return HttpResponse(404, {"error": "not_found"})
             try:
+                existing = self.backtest_executor.store.get(job_id)
+                if existing is None:
+                    return HttpResponse(404, {"error": "job_not_found"})
                 payload = self._parse_json_body(body) if body not in (None, "") else {}
                 reason = payload.get("reason")
                 if reason is not None and not isinstance(reason, str):
                     return HttpResponse(422, {"error": "validation_error"})
-                job = self.backtest_executor.cancel_backtest(job_id, reason)
+                if existing.kind == "parameter_search":
+                    if self.parameter_search_executor is None:
+                        return HttpResponse(503, {"error": "parameter_search_unavailable"})
+                    job = self.parameter_search_executor.cancel_search(job_id, reason)
+                else:
+                    job = self.backtest_executor.cancel_backtest(job_id, reason)
             except json.JSONDecodeError as exc:
                 return HttpResponse(400, {"error": "invalid_json", "detail": str(exc)})
             except ValueError as exc:
@@ -132,7 +177,15 @@ class ControlPlaneApp:
             if not job_id:
                 return HttpResponse(404, {"error": "not_found"})
             try:
-                job = self.backtest_executor.retry_backtest(job_id)
+                existing = self.backtest_executor.store.get(job_id)
+                if existing is None:
+                    return HttpResponse(404, {"error": "job_not_found"})
+                if existing.kind == "parameter_search":
+                    if self.parameter_search_executor is None:
+                        return HttpResponse(503, {"error": "parameter_search_unavailable"})
+                    job = self.parameter_search_executor.retry_search(job_id)
+                else:
+                    job = self.backtest_executor.retry_backtest(job_id)
             except ValueError as exc:
                 return HttpResponse(409, {"error": "job_action_rejected", "detail": str(exc)})
             except KeyError:
@@ -177,6 +230,48 @@ class ControlPlaneApp:
 
         result = self.strategy_control.submit_command(strategy_id, request)
         return self._command_response(result)
+
+    def _submit_gene_action(
+        self,
+        path: str,
+        body: str | bytes | None,
+    ) -> HttpResponse:
+        if self.gene_control is None:
+            return HttpResponse(503, {"error": "gene_control_unavailable"})
+
+        prefix = "/genes/"
+        suffix = "/promote"
+        if not path.endswith(suffix):
+            return HttpResponse(404, {"error": "not_found"})
+
+        raw_gene_id = path.removeprefix(prefix)[: -len(suffix)]
+        try:
+            gene_id = int(raw_gene_id)
+        except ValueError:
+            return HttpResponse(404, {"error": "not_found"})
+
+        try:
+            payload = self._parse_json_body(body) if body not in (None, "") else {}
+            request = GenePromotionRequest.model_validate(payload)
+            result = self.gene_control.promote_gene(
+                gene_id,
+                reason=request.reason,
+                actor=request.actor,
+            )
+        except json.JSONDecodeError as exc:
+            return HttpResponse(400, {"error": "invalid_json", "detail": str(exc)})
+        except ValidationError as exc:
+            return HttpResponse(
+                422,
+                {
+                    "error": "validation_error",
+                    "detail": exc.errors(include_url=False),
+                },
+            )
+        except KeyError:
+            return HttpResponse(404, {"error": "gene_not_found"})
+
+        return HttpResponse(200, {"gene": result})
 
     @staticmethod
     def _parse_json_body(body: str | bytes | None) -> dict[str, Any]:
