@@ -28,8 +28,13 @@ class BacktestJobExecutor:
         db_session_factory: SessionFactory | None = None,
         max_workers: int = 2,
         run_inline: bool = False,
+        recover_interrupted: bool = False,
     ) -> None:
         self.store = store or InMemoryJobStore()
+        if recover_interrupted:
+            self.store.mark_interrupted_active_jobs(
+                "Job interrupted before control plane startup"
+            )
         self._db_session_factory = db_session_factory
         self._run_inline = run_inline
         self._executor = None if run_inline else ThreadPoolExecutor(max_workers=max_workers)

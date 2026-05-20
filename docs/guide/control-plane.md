@@ -60,7 +60,9 @@ The job response contains the job ID, status, request payload, and result when
 the configured executor runs inline. With the threaded executor, the initial
 response is usually `QUEUED`; poll the job endpoint for completion. Set
 `CONTROL_PLANE_JOB_DB_PATH` when local job history needs to persist across
-control-plane restarts.
+control-plane restarts. On startup with the SQLite store enabled, jobs left in
+`QUEUED` or `RUNNING` from a previous process are marked failed with an
+interruption error so they can be retried explicitly.
 
 ## Inspect Jobs
 

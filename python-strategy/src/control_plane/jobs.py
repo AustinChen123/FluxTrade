@@ -30,6 +30,8 @@ class JobStore(Protocol):
 
     def mark_cancelled(self, job_id: str, reason: str | None = None) -> JobRecord: ...
 
+    def mark_interrupted_active_jobs(self, error: str) -> list[JobRecord]: ...
+
 
 class InMemoryJobStore:
     """Thread-safe in-memory job store for local control-plane operation."""
@@ -94,6 +96,18 @@ class InMemoryJobStore:
             finished_at=now,
             error=reason,
         )
+
+    def mark_interrupted_active_jobs(self, error: str) -> list[JobRecord]:
+        interrupted = []
+        with self._lock:
+            job_ids = [
+                job.id
+                for job in self._jobs.values()
+                if job.status in {JobStatus.QUEUED, JobStatus.RUNNING}
+            ]
+        for job_id in job_ids:
+            interrupted.append(self.mark_failed(job_id, error))
+        return interrupted
 
     def _update(self, job_id: str, **changes: Any) -> JobRecord:
         with self._lock:
@@ -195,6 +209,50 @@ class SqliteJobStore:
             finished_at=now,
             error=reason,
         )
+
+    def mark_interrupted_active_jobs(self, error: str) -> list[JobRecord]:
+        now = datetime.now(UTC)
+        with self._lock, self._connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT id, kind, status, created_at, updated_at, started_at,
+                       finished_at, request_json, result_json, error
+                FROM control_plane_jobs
+                WHERE status IN (?, ?)
+                """,
+                (JobStatus.QUEUED.value, JobStatus.RUNNING.value),
+            ).fetchall()
+            if not rows:
+                return []
+            conn.execute(
+                """
+                UPDATE control_plane_jobs
+                SET status = ?, updated_at = ?, finished_at = ?, error = ?
+                WHERE status IN (?, ?)
+                """,
+                (
+                    JobStatus.FAILED.value,
+                    _format_datetime(now),
+                    _format_datetime(now),
+                    error,
+                    JobStatus.QUEUED.value,
+                    JobStatus.RUNNING.value,
+                ),
+            )
+            conn.commit()
+
+        return [
+            JobRecord.model_validate(
+                {
+                    **self._row_to_record(row).model_dump(),
+                    "status": JobStatus.FAILED,
+                    "updated_at": now,
+                    "finished_at": now,
+                    "error": error,
+                }
+            )
+            for row in rows
+        ]
 
     def _initialize(self) -> None:
         self._db_path.parent.mkdir(parents=True, exist_ok=True)
