@@ -148,7 +148,10 @@ The default standalone server does not wire a parameter-search evaluator yet,
 so this endpoint returns `503` until the process is constructed with one. The
 CSV-signal evaluator is useful when another process generates candidate signals
 from parameter packs and FluxTrade is responsible for durable evaluation,
-ranking, and job history.
+ranking, and job history. When the executor is constructed with a database
+session factory, completed searches also write an `evolution_epochs` row plus
+one `gene_records` challenger row per evaluated candidate; the job result
+includes `epoch_id`.
 
 ## Strategy Status And Commands
 

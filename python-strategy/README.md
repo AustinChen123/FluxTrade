@@ -83,6 +83,10 @@ curl -X POST http://127.0.0.1:8080/jobs/parameter-searches \
   }'
 ```
 
+When the parameter-search executor is constructed with a database session
+factory, completed searches also persist `evolution_epochs` and challenger
+`gene_records` rows.
+
 When the app is wired with a live strategy control service, it can also expose:
 
 ```bash

@@ -1,9 +1,12 @@
 from __future__ import annotations
 
 from concurrent.futures import Future, ThreadPoolExecutor
+from datetime import UTC, datetime
 from decimal import Decimal
 from threading import Lock
 from typing import Any, Protocol
+
+from sqlalchemy.orm import Session
 
 from src.control_plane.backtest_jobs import BacktestJobExecutor, SessionFactory, _json_safe
 from src.control_plane.jobs import InMemoryJobStore, JobStore
@@ -15,6 +18,8 @@ from src.control_plane.models import (
     ParameterEvaluationResult,
     ParameterSearchJobRequest,
 )
+from src.core.models import GeneRole
+from src.core.orm_models import EvolutionEpoch, GeneRecord
 
 
 class ParameterSearchEvaluator(Protocol):
@@ -87,6 +92,7 @@ class ParameterSearchJobExecutor:
         max_workers: int = 2,
         run_inline: bool = False,
         recover_interrupted: bool = False,
+        db_session_factory: SessionFactory | None = None,
     ) -> None:
         self.evaluator = evaluator
         self.store = store or InMemoryJobStore()
@@ -98,6 +104,7 @@ class ParameterSearchJobExecutor:
         self._executor = None if run_inline else ThreadPoolExecutor(max_workers=max_workers)
         self._futures: dict[str, Future[JobRecord]] = {}
         self._futures_lock = Lock()
+        self._db_session_factory = db_session_factory
 
     def submit_search(self, request: ParameterSearchJobRequest) -> JobRecord:
         job = self.store.create(kind=request.kind, request=request)
@@ -163,6 +170,14 @@ class ParameterSearchJobExecutor:
             for candidate in request.candidates
         ]
         best = _select_best_candidate(request, evaluations)
+        epoch_id = None
+        if self._db_session_factory is not None:
+            epoch_id = _record_evolution_epoch(
+                self._db_session_factory,
+                request,
+                evaluations,
+                best,
+            )
         return _json_safe(
             {
                 "strategy_id": request.strategy_id,
@@ -170,6 +185,7 @@ class ParameterSearchJobExecutor:
                 "timeframe": request.timeframe,
                 "objective": request.objective,
                 "seed": request.seed,
+                "epoch_id": epoch_id,
                 "evaluations": evaluations,
                 "best_candidate": best,
             }
@@ -197,3 +213,82 @@ def _decimal_key(value: Decimal) -> Decimal:
 def _result_decimal(result: dict[str, Any], key: str) -> Decimal:
     value = result.get(key, "0")
     return Decimal(str(value))
+
+
+def _record_evolution_epoch(
+    session_factory: SessionFactory,
+    request: ParameterSearchJobRequest,
+    evaluations: list[ParameterEvaluationResult],
+    best: ParameterEvaluationResult,
+) -> str:
+    epoch_id = f"epoch_{datetime.now(UTC).strftime('%Y%m%d%H%M%S%f')}"
+    started_at = datetime.now(UTC)
+    finished_at = datetime.now(UTC)
+    with session_factory() as session:
+        _insert_evolution_epoch(
+            session,
+            epoch_id,
+            request,
+            best,
+            started_at,
+            finished_at,
+        )
+        for evaluation in evaluations:
+            candidate = next(
+                candidate
+                for candidate in request.candidates
+                if candidate.candidate_id == evaluation.candidate_id
+            )
+            session.add(
+                GeneRecord(
+                    strategy_id=request.strategy_id,
+                    role=GeneRole.CHALLENGER.value,
+                    param_pack=candidate.param_pack,
+                    score_total=evaluation.score_total,
+                    score_breakdown=evaluation.metrics,
+                    max_drawdown=evaluation.max_drawdown,
+                    epoch_id=epoch_id,
+                )
+            )
+        session.commit()
+    return epoch_id
+
+
+def _insert_evolution_epoch(
+    session: Session,
+    epoch_id: str,
+    request: ParameterSearchJobRequest,
+    best: ParameterEvaluationResult,
+    started_at: datetime,
+    finished_at: datetime,
+) -> None:
+    session.add(
+        EvolutionEpoch(
+            id=epoch_id,
+            strategy_id=request.strategy_id,
+            started_at=started_at,
+            finished_at=finished_at,
+            pop_size=len(request.candidates),
+            max_generations=1,
+            generations_run=1,
+            best_score=best.score_total,
+            seed=request.seed or 0,
+            config_json={
+                "objective": request.objective,
+                "candidate_ids": [
+                    candidate.candidate_id for candidate in request.candidates
+                ],
+            },
+            status="completed",
+            eval_pair=request.product_id,
+            eval_start_date=datetime.fromtimestamp(
+                request.start_time / 1000,
+                tz=UTC,
+            ).date(),
+            eval_end_date=datetime.fromtimestamp(
+                request.end_time / 1000,
+                tz=UTC,
+            ).date(),
+            eval_timeframe=request.timeframe,
+        )
+    )

@@ -22,7 +22,9 @@ from src.core.command_router import CommandResult
 from src.core.orm_models import (
     BacktestResultSummary,
     BacktestTradeLog,
+    EvolutionEpoch,
     Exchange,
+    GeneRecord,
     Product,
     SignalAudit,
     Strategy,
@@ -71,6 +73,25 @@ def _sqlite_session_factory(tmp_path):
                 quote_asset="USDT",
             )
         )
+        session.commit()
+    return session_factory
+
+
+def _sqlite_gene_registry_session_factory(tmp_path):
+    engine = create_engine(
+        f"sqlite:///{tmp_path / 'control_plane_gene_registry.db'}",
+        connect_args={"check_same_thread": False, "timeout": 30},
+    )
+    for table in [
+        Strategy.__table__,
+        EvolutionEpoch.__table__,
+        GeneRecord.__table__,
+    ]:
+        table.create(engine, checkfirst=True)
+
+    session_factory = sessionmaker(bind=engine)
+    with session_factory() as session:
+        session.add(Strategy(id="searchable", name="Searchable Strategy"))
         session.commit()
     return session_factory
 
@@ -375,6 +396,59 @@ def test_control_plane_reports_unavailable_parameter_search():
 
     assert response.status_code == 503
     assert response.body == {"error": "parameter_search_unavailable"}
+
+
+def test_parameter_search_records_evolution_epoch_and_gene_candidates(tmp_path):
+    store = InMemoryJobStore()
+    session_factory = _sqlite_gene_registry_session_factory(tmp_path)
+    app = ControlPlaneApp(
+        BacktestJobExecutor(store=store, run_inline=True),
+        parameter_search_executor=ParameterSearchJobExecutor(
+            _FakeParameterEvaluator(),
+            store=store,
+            run_inline=True,
+            db_session_factory=session_factory,
+        ),
+    )
+
+    response = app.handle(
+        "POST",
+        "/jobs/parameter-searches",
+        json.dumps(
+            {
+                "strategy_id": "searchable",
+                "product_id": PRODUCT_ID,
+                "timeframe": TIMEFRAME,
+                "start_time": 1_700_000_000_000,
+                "end_time": 1_700_001_800_000,
+                "seed": 11,
+                "candidates": [
+                    {"candidate_id": "a", "param_pack": {"score": "1.2"}},
+                    {"candidate_id": "b", "param_pack": {"score": "2.5"}},
+                ],
+            }
+        ),
+    )
+
+    assert response.status_code == 200
+    epoch_id = response.body["job"]["result"]["epoch_id"]
+    assert epoch_id.startswith("epoch_")
+
+    with session_factory() as session:
+        epoch = session.get(EvolutionEpoch, epoch_id)
+        genes = (
+            session.query(GeneRecord)
+            .filter(GeneRecord.epoch_id == epoch_id)
+            .order_by(GeneRecord.score_total)
+            .all()
+        )
+
+    assert epoch.strategy_id == "searchable"
+    assert epoch.status == "completed"
+    assert epoch.pop_size == 2
+    assert epoch.best_score == Decimal("2.50000000")
+    assert [gene.param_pack for gene in genes] == [{"score": "1.2"}, {"score": "2.5"}]
+    assert [gene.role for gene in genes] == ["challenger", "challenger"]
 
 
 @pytest.mark.rust
