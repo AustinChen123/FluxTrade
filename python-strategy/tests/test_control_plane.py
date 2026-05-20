@@ -11,6 +11,8 @@ from src.control_plane import (
     BacktestJobExecutor,
     ControlPlaneApp,
     InMemoryJobStore,
+    ParameterEvaluationResult,
+    ParameterSearchJobExecutor,
     SqliteJobStore,
     StrategyControlService,
 )
@@ -261,6 +263,117 @@ def test_backtest_executor_retries_cancelled_jobs():
     assert retry.id != original.id
     assert retry.status == JobStatus.QUEUED
     assert retry.request == original.request
+
+
+class _FakeParameterEvaluator:
+    def __init__(self) -> None:
+        self.evaluated_candidate_ids = []
+
+    def evaluate(self, request, candidate):
+        self.evaluated_candidate_ids.append(candidate.candidate_id)
+        score = Decimal(str(candidate.param_pack["score"]))
+        drawdown = Decimal(str(candidate.param_pack.get("drawdown", "0")))
+        return ParameterEvaluationResult(
+            candidate_id=candidate.candidate_id,
+            score_total=score,
+            max_drawdown=drawdown,
+            metrics={"seed": request.seed, "score": str(score)},
+        )
+
+
+def test_control_plane_runs_parameter_search_job_with_injected_evaluator():
+    store = InMemoryJobStore()
+    evaluator = _FakeParameterEvaluator()
+    app = ControlPlaneApp(
+        BacktestJobExecutor(store=store, run_inline=True),
+        parameter_search_executor=ParameterSearchJobExecutor(
+            evaluator,
+            store=store,
+            run_inline=True,
+        ),
+    )
+
+    response = app.handle(
+        "POST",
+        "/jobs/parameter-searches",
+        json.dumps(
+            {
+                "strategy_id": "searchable",
+                "product_id": PRODUCT_ID,
+                "timeframe": TIMEFRAME,
+                "start_time": 1,
+                "end_time": 2,
+                "seed": 7,
+                "candidates": [
+                    {"candidate_id": "a", "param_pack": {"score": "1.2"}},
+                    {"candidate_id": "b", "param_pack": {"score": "2.5"}},
+                ],
+            }
+        ),
+    )
+
+    assert response.status_code == 200
+    job = response.body["job"]
+    assert job["kind"] == "parameter_search"
+    assert job["status"] == JobStatus.SUCCEEDED.value
+    assert job["result"]["best_candidate"]["candidate_id"] == "b"
+    assert job["result"]["best_candidate"]["score_total"] == "2.5"
+    assert evaluator.evaluated_candidate_ids == ["a", "b"]
+
+
+def test_control_plane_rejects_duplicate_parameter_candidates():
+    store = InMemoryJobStore()
+    app = ControlPlaneApp(
+        BacktestJobExecutor(store=store, run_inline=True),
+        parameter_search_executor=ParameterSearchJobExecutor(
+            _FakeParameterEvaluator(),
+            store=store,
+            run_inline=True,
+        ),
+    )
+
+    response = app.handle(
+        "POST",
+        "/jobs/parameter-searches",
+        json.dumps(
+            {
+                "strategy_id": "searchable",
+                "product_id": PRODUCT_ID,
+                "timeframe": TIMEFRAME,
+                "start_time": 1,
+                "end_time": 2,
+                "candidates": [
+                    {"candidate_id": "same", "param_pack": {"score": "1"}},
+                    {"candidate_id": "same", "param_pack": {"score": "2"}},
+                ],
+            }
+        ),
+    )
+
+    assert response.status_code == 422
+    assert response.body["error"] == "validation_error"
+
+
+def test_control_plane_reports_unavailable_parameter_search():
+    app = ControlPlaneApp(BacktestJobExecutor(run_inline=True))
+
+    response = app.handle(
+        "POST",
+        "/jobs/parameter-searches",
+        json.dumps(
+            {
+                "strategy_id": "searchable",
+                "product_id": PRODUCT_ID,
+                "timeframe": TIMEFRAME,
+                "start_time": 1,
+                "end_time": 2,
+                "candidates": [{"candidate_id": "a", "param_pack": {"score": "1"}}],
+            }
+        ),
+    )
+
+    assert response.status_code == 503
+    assert response.body == {"error": "parameter_search_unavailable"}
 
 
 class _FakeCommandRouter:

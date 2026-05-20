@@ -48,6 +48,25 @@ curl -X POST http://127.0.0.1:8080/jobs/<job_id>/cancel \
 curl -X POST http://127.0.0.1:8080/jobs/<job_id>/retry
 ```
 
+Parameter search jobs are available when the app is constructed with a
+`ParameterSearchEvaluator`:
+
+```bash
+curl -X POST http://127.0.0.1:8080/jobs/parameter-searches \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "strategy_id": "rsi_scalper",
+    "product_id": "BINANCE:BTCUSDT-PERP",
+    "timeframe": "15m",
+    "start_time": 1700000000000,
+    "end_time": 1700100000000,
+    "candidates": [
+      {"candidate_id":"a","param_pack":{"rsi_period":14}},
+      {"candidate_id":"b","param_pack":{"rsi_period":21}}
+    ]
+  }'
+```
+
 When the app is wired with a live strategy control service, it can also expose:
 
 ```bash
