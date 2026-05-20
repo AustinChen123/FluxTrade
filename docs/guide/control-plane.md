@@ -153,6 +153,23 @@ session factory, completed searches also write an `evolution_epochs` row plus
 one `gene_records` challenger row per evaluated candidate; the job result
 includes `epoch_id`.
 
+## Promote A Gene
+
+When the control plane is constructed with `GeneControlService`, an operator can
+promote one candidate gene to champion:
+
+```bash
+curl -X POST http://127.0.0.1:8080/genes/<gene_id>/promote \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "reason": "best search score",
+    "actor": "operator"
+  }'
+```
+
+Promotion retires any existing champion for the same strategy and writes
+`gene_retire` / `gene_promote` system events in the same transaction.
+
 ## Strategy Status And Commands
 
 When the control plane is constructed with a strategy control service, it can
@@ -206,6 +223,8 @@ timestamp,type,quantity
 - The first executable backtest job type is CSV-signal backtesting. Parameter
   search can evaluate candidate signal CSVs through BacktestRunner, but native
   strategy parameter generation/mutation/crossover is still future work.
+- Gene promotion updates gene lifecycle state and writes audit events, but it
+  does not hot-reload a live strategy yet.
 - Job cancellation currently applies only to queued jobs. Running backtests need
   cooperative cancellation inside the runner before safe force-stop semantics
   can be exposed.

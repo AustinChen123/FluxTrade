@@ -185,3 +185,10 @@ class StrategyCommandRequest(BaseModel):
     command: Literal["START", "STOP", "RESUME", "FORCE_RECOVER", "RELOAD"]
     reason: str | None = None
     params: dict[str, Any] = Field(default_factory=dict)
+
+
+class GenePromotionRequest(BaseModel):
+    """Operator request to promote a parameter gene to champion."""
+
+    reason: str | None = None
+    actor: str = "control_plane"

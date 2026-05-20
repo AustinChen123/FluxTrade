@@ -7,8 +7,10 @@ from typing import Any
 from pydantic import ValidationError
 
 from src.control_plane.backtest_jobs import BacktestJobExecutor
+from src.control_plane.gene_control import GeneControlService
 from src.control_plane.models import (
     BacktestJobRequest,
+    GenePromotionRequest,
     JobRecord,
     ParameterSearchJobRequest,
     StrategyCommandRequest,
@@ -33,10 +35,12 @@ class ControlPlaneApp:
         self,
         backtest_executor: BacktestJobExecutor,
         parameter_search_executor: ParameterSearchJobExecutor | None = None,
+        gene_control: GeneControlService | None = None,
         strategy_control: StrategyControlService | None = None,
     ) -> None:
         self.backtest_executor = backtest_executor
         self.parameter_search_executor = parameter_search_executor
+        self.gene_control = gene_control
         self.strategy_control = strategy_control
 
     def handle(
@@ -59,6 +63,9 @@ class ControlPlaneApp:
 
         if method == "POST" and clean_path.startswith("/jobs/"):
             return self._handle_job_action(clean_path, body)
+
+        if method == "POST" and clean_path.startswith("/genes/"):
+            return self._submit_gene_action(clean_path, body)
 
         if method == "GET" and clean_path == "/jobs":
             jobs = [self._job_payload(job) for job in self.backtest_executor.store.list()]
@@ -223,6 +230,48 @@ class ControlPlaneApp:
 
         result = self.strategy_control.submit_command(strategy_id, request)
         return self._command_response(result)
+
+    def _submit_gene_action(
+        self,
+        path: str,
+        body: str | bytes | None,
+    ) -> HttpResponse:
+        if self.gene_control is None:
+            return HttpResponse(503, {"error": "gene_control_unavailable"})
+
+        prefix = "/genes/"
+        suffix = "/promote"
+        if not path.endswith(suffix):
+            return HttpResponse(404, {"error": "not_found"})
+
+        raw_gene_id = path.removeprefix(prefix)[: -len(suffix)]
+        try:
+            gene_id = int(raw_gene_id)
+        except ValueError:
+            return HttpResponse(404, {"error": "not_found"})
+
+        try:
+            payload = self._parse_json_body(body) if body not in (None, "") else {}
+            request = GenePromotionRequest.model_validate(payload)
+            result = self.gene_control.promote_gene(
+                gene_id,
+                reason=request.reason,
+                actor=request.actor,
+            )
+        except json.JSONDecodeError as exc:
+            return HttpResponse(400, {"error": "invalid_json", "detail": str(exc)})
+        except ValidationError as exc:
+            return HttpResponse(
+                422,
+                {
+                    "error": "validation_error",
+                    "detail": exc.errors(include_url=False),
+                },
+            )
+        except KeyError:
+            return HttpResponse(404, {"error": "gene_not_found"})
+
+        return HttpResponse(200, {"gene": result})
 
     @staticmethod
     def _parse_json_body(body: str | bytes | None) -> dict[str, Any]:

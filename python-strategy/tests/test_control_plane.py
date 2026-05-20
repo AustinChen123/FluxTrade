@@ -1,4 +1,5 @@
 import json
+from datetime import UTC, date, datetime
 from decimal import Decimal
 
 import pytest
@@ -11,6 +12,7 @@ from src.control_plane import (
     BacktestJobExecutor,
     ControlPlaneApp,
     CsvSignalBacktestParameterEvaluator,
+    GeneControlService,
     InMemoryJobStore,
     ParameterEvaluationResult,
     ParameterSearchJobExecutor,
@@ -25,6 +27,7 @@ from src.core.orm_models import (
     EvolutionEpoch,
     Exchange,
     GeneRecord,
+    SystemEvent,
     Product,
     SignalAudit,
     Strategy,
@@ -84,6 +87,7 @@ def _sqlite_gene_registry_session_factory(tmp_path):
     )
     for table in [
         Strategy.__table__,
+        SystemEvent.__table__,
         EvolutionEpoch.__table__,
         GeneRecord.__table__,
     ]:
@@ -449,6 +453,78 @@ def test_parameter_search_records_evolution_epoch_and_gene_candidates(tmp_path):
     assert epoch.best_score == Decimal("2.50000000")
     assert [gene.param_pack for gene in genes] == [{"score": "1.2"}, {"score": "2.5"}]
     assert [gene.role for gene in genes] == ["challenger", "challenger"]
+
+
+def test_control_plane_promotes_gene_and_retires_previous_champion(tmp_path):
+    session_factory = _sqlite_gene_registry_session_factory(tmp_path)
+    with session_factory() as session:
+        epoch = EvolutionEpoch(
+            id="epoch-promote",
+            strategy_id="searchable",
+            started_at=datetime(2026, 5, 20, tzinfo=UTC),
+            pop_size=2,
+            max_generations=1,
+            generations_run=1,
+            best_score=Decimal("2.5"),
+            seed=1,
+            config_json={},
+            status="completed",
+            eval_pair=PRODUCT_ID,
+            eval_start_date=date(2026, 5, 20),
+            eval_end_date=date(2026, 5, 20),
+            eval_timeframe=TIMEFRAME,
+        )
+        champion = GeneRecord(
+            strategy_id="searchable",
+            role="champion",
+            param_pack={"score": "1.2"},
+            score_total=Decimal("1.2"),
+            score_breakdown={},
+            max_drawdown=Decimal("0.1"),
+            epoch_id="epoch-promote",
+        )
+        challenger = GeneRecord(
+            strategy_id="searchable",
+            role="challenger",
+            param_pack={"score": "2.5"},
+            score_total=Decimal("2.5"),
+            score_breakdown={},
+            max_drawdown=Decimal("0.05"),
+            epoch_id="epoch-promote",
+        )
+        session.add(epoch)
+        session.add_all([champion, challenger])
+        session.commit()
+        champion_id = champion.id
+        challenger_id = challenger.id
+
+    app = ControlPlaneApp(
+        BacktestJobExecutor(run_inline=True),
+        gene_control=GeneControlService(session_factory),
+    )
+
+    response = app.handle(
+        "POST",
+        f"/genes/{challenger_id}/promote",
+        json.dumps({"reason": "best search score", "actor": "operator"}),
+    )
+
+    assert response.status_code == 200
+    assert response.body["gene"]["gene_id"] == challenger_id
+    assert response.body["gene"]["role"] == "champion"
+    assert response.body["gene"]["retired_gene_ids"] == [champion_id]
+
+    with session_factory() as session:
+        old_champion = session.get(GeneRecord, champion_id)
+        new_champion = session.get(GeneRecord, challenger_id)
+        events = session.query(SystemEvent).order_by(SystemEvent.id).all()
+
+    assert old_champion.role == "retired"
+    assert old_champion.retired_at is not None
+    assert new_champion.role == "champion"
+    assert new_champion.activated_at is not None
+    assert [event.event_type for event in events] == ["gene_retire", "gene_promote"]
+    assert events[-1].payload["reason"] == "best search score"
 
 
 @pytest.mark.rust

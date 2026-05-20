@@ -87,6 +87,14 @@ When the parameter-search executor is constructed with a database session
 factory, completed searches also persist `evolution_epochs` and challenger
 `gene_records` rows.
 
+Promote a persisted gene when `GeneControlService` is wired:
+
+```bash
+curl -X POST http://127.0.0.1:8080/genes/<gene_id>/promote \
+  -H 'Content-Type: application/json' \
+  -d '{"reason":"best search score","actor":"operator"}'
+```
+
 When the app is wired with a live strategy control service, it can also expose:
 
 ```bash

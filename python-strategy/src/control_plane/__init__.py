@@ -2,10 +2,12 @@
 
 from src.control_plane.app import ControlPlaneApp, HttpResponse
 from src.control_plane.backtest_jobs import BacktestJobExecutor
+from src.control_plane.gene_control import GeneControlService
 from src.control_plane.jobs import InMemoryJobStore, JobStatus, JobStore, SqliteJobStore
 from src.control_plane.models import (
     BacktestJobRequest,
     CsvSignalBacktestEvaluationConfig,
+    GenePromotionRequest,
     JobRecord,
     ParameterCandidate,
     ParameterEvaluationResult,
@@ -24,6 +26,8 @@ __all__ = [
     "ControlPlaneApp",
     "CsvSignalBacktestEvaluationConfig",
     "CsvSignalBacktestParameterEvaluator",
+    "GeneControlService",
+    "GenePromotionRequest",
     "HttpResponse",
     "InMemoryJobStore",
     "JobRecord",
