@@ -89,8 +89,7 @@ class ControlPlaneApp:
             return self._get_system_event(clean_path)
 
         if method == "GET" and clean_path == "/jobs":
-            jobs = [self._job_payload(job) for job in self.backtest_executor.store.list()]
-            return HttpResponse(200, {"jobs": jobs})
+            return self._list_jobs(query)
 
         if method == "GET" and clean_path == "/strategies":
             if self.strategy_control is None:
@@ -297,11 +296,21 @@ class ControlPlaneApp:
     def _list_genes(self, query: dict[str, list[str]]) -> HttpResponse:
         if self.gene_control is None:
             return HttpResponse(503, {"error": "gene_control_unavailable"})
+        pagination = _parse_pagination(query)
+        if isinstance(pagination, HttpResponse):
+            return pagination
+        limit, offset = pagination
         strategy_id = _single_query_value(query, "strategy_id")
         role = _single_query_value(query, "role")
+        genes, total = self.gene_control.list_genes(
+            strategy_id=strategy_id,
+            role=role,
+            limit=limit,
+            offset=offset,
+        )
         return HttpResponse(
             200,
-            {"genes": self.gene_control.list_genes(strategy_id=strategy_id, role=role)},
+            _page_payload("genes", genes, total=total, limit=limit, offset=offset),
         )
 
     def _get_gene(self, path: str) -> HttpResponse:
@@ -320,10 +329,19 @@ class ControlPlaneApp:
     def _list_epochs(self, query: dict[str, list[str]]) -> HttpResponse:
         if self.gene_control is None:
             return HttpResponse(503, {"error": "gene_control_unavailable"})
+        pagination = _parse_pagination(query)
+        if isinstance(pagination, HttpResponse):
+            return pagination
+        limit, offset = pagination
         strategy_id = _single_query_value(query, "strategy_id")
+        epochs, total = self.gene_control.list_epochs(
+            strategy_id=strategy_id,
+            limit=limit,
+            offset=offset,
+        )
         return HttpResponse(
             200,
-            {"epochs": self.gene_control.list_epochs(strategy_id=strategy_id)},
+            _page_payload("epochs", epochs, total=total, limit=limit, offset=offset),
         )
 
     def _get_epoch(self, path: str) -> HttpResponse:
@@ -341,20 +359,25 @@ class ControlPlaneApp:
     def _list_system_events(self, query: dict[str, list[str]]) -> HttpResponse:
         if self.gene_control is None:
             return HttpResponse(503, {"error": "gene_control_unavailable"})
+        pagination = _parse_pagination(query)
+        if isinstance(pagination, HttpResponse):
+            return pagination
+        limit, offset = pagination
         raw_gene_id = _single_query_value(query, "related_gene_id")
         try:
             related_gene_id = int(raw_gene_id) if raw_gene_id is not None else None
         except ValueError:
             return HttpResponse(422, {"error": "validation_error"})
+        events, total = self.gene_control.list_system_events(
+            event_type=_single_query_value(query, "event_type"),
+            strategy_id=_single_query_value(query, "strategy_id"),
+            related_gene_id=related_gene_id,
+            limit=limit,
+            offset=offset,
+        )
         return HttpResponse(
             200,
-            {
-                "events": self.gene_control.list_system_events(
-                    event_type=_single_query_value(query, "event_type"),
-                    strategy_id=_single_query_value(query, "strategy_id"),
-                    related_gene_id=related_gene_id,
-                )
-            },
+            _page_payload("events", events, total=total, limit=limit, offset=offset),
         )
 
     def _get_system_event(self, path: str) -> HttpResponse:
@@ -369,6 +392,24 @@ class ControlPlaneApp:
         except KeyError:
             return HttpResponse(404, {"error": "system_event_not_found"})
         return HttpResponse(200, {"event": event})
+
+    def _list_jobs(self, query: dict[str, list[str]]) -> HttpResponse:
+        pagination = _parse_pagination(query)
+        if isinstance(pagination, HttpResponse):
+            return pagination
+        limit, offset = pagination
+        all_jobs = [self._job_payload(job) for job in self.backtest_executor.store.list()]
+        jobs = all_jobs[offset : offset + limit]
+        return HttpResponse(
+            200,
+            _page_payload(
+                "jobs",
+                jobs,
+                total=len(all_jobs),
+                limit=limit,
+                offset=offset,
+            ),
+        )
 
     @staticmethod
     def _parse_json_body(body: str | bytes | None) -> dict[str, Any]:
@@ -396,3 +437,30 @@ def _single_query_value(query: dict[str, list[str]], key: str) -> str | None:
     if not values:
         return None
     return values[0]
+
+
+def _parse_pagination(query: dict[str, list[str]]) -> tuple[int, int] | HttpResponse:
+    try:
+        limit = int(_single_query_value(query, "limit") or "100")
+        offset = int(_single_query_value(query, "offset") or "0")
+    except ValueError:
+        return HttpResponse(422, {"error": "validation_error"})
+    if limit < 1 or limit > 500 or offset < 0:
+        return HttpResponse(422, {"error": "validation_error"})
+    return limit, offset
+
+
+def _page_payload(
+    key: str,
+    items: list[dict[str, Any]],
+    *,
+    total: int,
+    limit: int,
+    offset: int,
+) -> dict[str, Any]:
+    return {
+        key: items,
+        "total": total,
+        "limit": limit,
+        "offset": offset,
+    }
