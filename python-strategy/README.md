@@ -121,6 +121,7 @@ When `StrategyStateQueryService` is wired, durable strategy state is readable:
 
 ```bash
 curl http://127.0.0.1:8080/strategy-states
+curl 'http://127.0.0.1:8080/strategy-states/summary?stale_after_ms=120000'
 curl http://127.0.0.1:8080/strategy-states/<strategy_id>
 curl 'http://127.0.0.1:8080/strategy-states/<strategy_id>/transitions?limit=50&offset=0'
 ```

@@ -793,6 +793,60 @@ def test_control_plane_lists_and_gets_strategy_states(tmp_path):
     assert get_response.body["state"]["version"] == 2
 
 
+def test_control_plane_summarizes_strategy_states(tmp_path):
+    session_factory = _sqlite_strategy_state_session_factory(tmp_path)
+    with session_factory() as session:
+        session.add_all(
+            [
+                StrategyState(
+                    strategy_id="s1",
+                    status="ACTIVE",
+                    config_json="{}",
+                    performance_json="{}",
+                    last_heartbeat=1,
+                    uptime_start=1,
+                    version=1,
+                ),
+                StrategyState(
+                    strategy_id="s2",
+                    status="STOPPED",
+                    config_json="{}",
+                    performance_json="{}",
+                    stopped_at=datetime(2026, 5, 20, tzinfo=UTC),
+                    version=1,
+                ),
+            ]
+        )
+        session.commit()
+
+    app = ControlPlaneApp(
+        BacktestJobExecutor(run_inline=True),
+        strategy_state_query=StrategyStateQueryService(session_factory),
+    )
+
+    response = app.handle("GET", "/strategy-states/summary?stale_after_ms=1000")
+
+    assert response.status_code == 200
+    assert response.body["summary"]["total"] == 2
+    assert response.body["summary"]["by_status"] == {"ACTIVE": 1, "STOPPED": 1}
+    assert response.body["summary"]["stale_heartbeat_count"] == 1
+    assert response.body["summary"]["stale_after_ms"] == 1000
+    assert isinstance(response.body["summary"]["observed_at_ms"], int)
+
+
+def test_control_plane_rejects_invalid_strategy_state_summary_threshold(tmp_path):
+    session_factory = _sqlite_strategy_state_session_factory(tmp_path)
+    app = ControlPlaneApp(
+        BacktestJobExecutor(run_inline=True),
+        strategy_state_query=StrategyStateQueryService(session_factory),
+    )
+
+    response = app.handle("GET", "/strategy-states/summary?stale_after_ms=-1")
+
+    assert response.status_code == 422
+    assert response.body == {"error": "validation_error"}
+
+
 def test_control_plane_lists_strategy_state_transitions(tmp_path):
     session_factory = _sqlite_strategy_state_session_factory(tmp_path)
     with session_factory() as session:

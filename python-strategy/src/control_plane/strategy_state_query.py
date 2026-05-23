@@ -1,7 +1,10 @@
 from __future__ import annotations
 
 import json
+import time
 from typing import Any
+
+from sqlalchemy import func, or_
 
 from src.control_plane.backtest_jobs import SessionFactory
 from src.core.orm_models import StrategyState, StrategyStateTransition
@@ -39,6 +42,39 @@ class StrategyStateQueryService:
             if state is None:
                 raise KeyError(strategy_id)
             return _state_payload(state)
+
+    def summarize_states(
+        self,
+        *,
+        stale_after_ms: int = 120_000,
+    ) -> dict[str, Any]:
+        now_ms = int(time.time() * 1000)
+        stale_before = now_ms - stale_after_ms
+        with self._db_session_factory() as session:
+            status_rows = (
+                session.query(StrategyState.status, func.count(StrategyState.strategy_id))
+                .group_by(StrategyState.status)
+                .all()
+            )
+            stale_heartbeat_count = (
+                session.query(StrategyState)
+                .filter(StrategyState.status != "STOPPED")
+                .filter(
+                    or_(
+                        StrategyState.last_heartbeat.is_(None),
+                        StrategyState.last_heartbeat < stale_before,
+                    )
+                )
+                .count()
+            )
+            by_status = {status: count for status, count in status_rows}
+            return {
+                "total": sum(by_status.values()),
+                "by_status": by_status,
+                "stale_heartbeat_count": stale_heartbeat_count,
+                "stale_after_ms": stale_after_ms,
+                "observed_at_ms": now_ms,
+            }
 
     def list_transitions(
         self,

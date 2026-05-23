@@ -94,6 +94,9 @@ class ControlPlaneApp:
         if method == "GET" and clean_path == "/strategy-states":
             return self._list_strategy_states(query)
 
+        if method == "GET" and clean_path == "/strategy-states/summary":
+            return self._summarize_strategy_states(query)
+
         if method == "GET" and clean_path.startswith("/strategy-states/"):
             return self._handle_strategy_state_get(clean_path, query)
 
@@ -437,6 +440,17 @@ class ControlPlaneApp:
             _page_payload("states", states, total=total, limit=limit, offset=offset),
         )
 
+    def _summarize_strategy_states(self, query: dict[str, list[str]]) -> HttpResponse:
+        if self.strategy_state_query is None:
+            return HttpResponse(503, {"error": "strategy_state_query_unavailable"})
+        stale_after_ms = _parse_optional_non_negative_int(query, "stale_after_ms")
+        if isinstance(stale_after_ms, HttpResponse):
+            return stale_after_ms
+        summary = self.strategy_state_query.summarize_states(
+            stale_after_ms=120_000 if stale_after_ms is None else stale_after_ms,
+        )
+        return HttpResponse(200, {"summary": summary})
+
     def _handle_strategy_state_get(
         self,
         path: str,
@@ -522,6 +536,22 @@ def _parse_pagination(query: dict[str, list[str]]) -> tuple[int, int] | HttpResp
     if limit < 1 or limit > 500 or offset < 0:
         return HttpResponse(422, {"error": "validation_error"})
     return limit, offset
+
+
+def _parse_optional_non_negative_int(
+    query: dict[str, list[str]],
+    key: str,
+) -> int | None | HttpResponse:
+    raw_value = _single_query_value(query, key)
+    if raw_value is None:
+        return None
+    try:
+        value = int(raw_value)
+    except ValueError:
+        return HttpResponse(422, {"error": "validation_error"})
+    if value < 0:
+        return HttpResponse(422, {"error": "validation_error"})
+    return value
 
 
 def _page_payload(
