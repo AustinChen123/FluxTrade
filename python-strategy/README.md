@@ -41,6 +41,7 @@ Inspect jobs:
 
 ```bash
 curl http://127.0.0.1:8080/jobs
+curl 'http://127.0.0.1:8080/jobs?limit=50&offset=0'
 curl http://127.0.0.1:8080/jobs/<job_id>
 curl -X POST http://127.0.0.1:8080/jobs/<job_id>/cancel \
   -H 'Content-Type: application/json' \
@@ -99,11 +100,11 @@ Inspect persisted search results:
 
 ```bash
 curl http://127.0.0.1:8080/genes
-curl 'http://127.0.0.1:8080/genes?strategy_id=rsi_scalper&role=champion'
+curl 'http://127.0.0.1:8080/genes?strategy_id=rsi_scalper&role=champion&limit=50&offset=0'
 curl http://127.0.0.1:8080/evolution-epochs
 curl http://127.0.0.1:8080/evolution-epochs/<epoch_id>
 curl http://127.0.0.1:8080/system-events
-curl 'http://127.0.0.1:8080/system-events?event_type=gene_promote'
+curl 'http://127.0.0.1:8080/system-events?event_type=gene_promote&limit=50&offset=0'
 ```
 
 When the app is wired with a live strategy control service, it can also expose:

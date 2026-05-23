@@ -84,15 +84,23 @@ class GeneControlService:
         *,
         strategy_id: str | None = None,
         role: str | None = None,
-    ) -> list[dict[str, Any]]:
+        limit: int,
+        offset: int,
+    ) -> tuple[list[dict[str, Any]], int]:
         with self._db_session_factory() as session:
             query = session.query(GeneRecord)
             if strategy_id is not None:
                 query = query.filter(GeneRecord.strategy_id == strategy_id)
             if role is not None:
                 query = query.filter(GeneRecord.role == role)
-            genes = query.order_by(GeneRecord.created_at.desc(), GeneRecord.id.desc()).all()
-            return [_gene_payload(gene) for gene in genes]
+            total = query.count()
+            genes = (
+                query.order_by(GeneRecord.created_at.desc(), GeneRecord.id.desc())
+                .offset(offset)
+                .limit(limit)
+                .all()
+            )
+            return [_gene_payload(gene) for gene in genes], total
 
     def get_gene(self, gene_id: int) -> dict[str, Any]:
         with self._db_session_factory() as session:
@@ -101,16 +109,28 @@ class GeneControlService:
                 raise KeyError(gene_id)
             return _gene_payload(gene)
 
-    def list_epochs(self, *, strategy_id: str | None = None) -> list[dict[str, Any]]:
+    def list_epochs(
+        self,
+        *,
+        strategy_id: str | None = None,
+        limit: int,
+        offset: int,
+    ) -> tuple[list[dict[str, Any]], int]:
         with self._db_session_factory() as session:
             query = session.query(EvolutionEpoch)
             if strategy_id is not None:
                 query = query.filter(EvolutionEpoch.strategy_id == strategy_id)
-            epochs = query.order_by(
-                EvolutionEpoch.started_at.desc(),
-                EvolutionEpoch.id.desc(),
-            ).all()
-            return [_epoch_payload(epoch) for epoch in epochs]
+            total = query.count()
+            epochs = (
+                query.order_by(
+                    EvolutionEpoch.started_at.desc(),
+                    EvolutionEpoch.id.desc(),
+                )
+                .offset(offset)
+                .limit(limit)
+                .all()
+            )
+            return [_epoch_payload(epoch) for epoch in epochs], total
 
     def get_epoch(self, epoch_id: str) -> dict[str, Any]:
         with self._db_session_factory() as session:
@@ -125,7 +145,9 @@ class GeneControlService:
         event_type: str | None = None,
         strategy_id: str | None = None,
         related_gene_id: int | None = None,
-    ) -> list[dict[str, Any]]:
+        limit: int,
+        offset: int,
+    ) -> tuple[list[dict[str, Any]], int]:
         with self._db_session_factory() as session:
             query = session.query(SystemEvent)
             if event_type is not None:
@@ -134,8 +156,14 @@ class GeneControlService:
                 query = query.filter(SystemEvent.related_strategy_id == strategy_id)
             if related_gene_id is not None:
                 query = query.filter(SystemEvent.related_gene_id == related_gene_id)
-            events = query.order_by(SystemEvent.created_at.desc(), SystemEvent.id.desc()).all()
-            return [_system_event_payload(event) for event in events]
+            total = query.count()
+            events = (
+                query.order_by(SystemEvent.created_at.desc(), SystemEvent.id.desc())
+                .offset(offset)
+                .limit(limit)
+                .all()
+            )
+            return [_system_event_payload(event) for event in events], total
 
     def get_system_event(self, event_id: int) -> dict[str, Any]:
         with self._db_session_factory() as session:

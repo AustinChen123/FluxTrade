@@ -157,6 +157,41 @@ def test_control_plane_lists_submitted_jobs_without_framework():
     assert get_response.body["job"]["status"] == JobStatus.QUEUED.value
 
 
+def test_control_plane_paginates_jobs_without_framework():
+    store = InMemoryJobStore()
+    executor = BacktestJobExecutor(store=store, run_inline=False)
+    for index in range(3):
+        request = BacktestJobRequest(
+            strategy_id=f"queued-{index}",
+            product_id=PRODUCT_ID,
+            timeframe=TIMEFRAME,
+            candles_csv_path="/tmp/candles.csv",
+            signals_csv_path="/tmp/signals.csv",
+            start_time=1,
+            end_time=2,
+        )
+        store.create(kind=request.kind, request=request)
+    app = ControlPlaneApp(executor)
+
+    response = app.handle("GET", "/jobs?limit=2&offset=1")
+
+    executor.shutdown(wait=False)
+    assert response.status_code == 200
+    assert len(response.body["jobs"]) == 2
+    assert response.body["total"] == 3
+    assert response.body["limit"] == 2
+    assert response.body["offset"] == 1
+
+
+def test_control_plane_rejects_invalid_pagination():
+    app = ControlPlaneApp(BacktestJobExecutor(run_inline=True))
+
+    response = app.handle("GET", "/jobs?limit=0")
+
+    assert response.status_code == 422
+    assert response.body == {"error": "validation_error"}
+
+
 def test_sqlite_job_store_persists_job_state_across_instances(tmp_path):
     db_path = tmp_path / "jobs.db"
     request = BacktestJobRequest(
@@ -574,11 +609,17 @@ def test_control_plane_lists_and_gets_genes(tmp_path):
         gene_control=GeneControlService(session_factory),
     )
 
-    list_response = app.handle("GET", "/genes?strategy_id=searchable&role=champion")
+    list_response = app.handle(
+        "GET",
+        "/genes?strategy_id=searchable&role=champion&limit=1&offset=0",
+    )
     get_response = app.handle("GET", f"/genes/{champion_id}")
 
     assert list_response.status_code == 200
     assert [gene["id"] for gene in list_response.body["genes"]] == [champion_id]
+    assert list_response.body["total"] == 1
+    assert list_response.body["limit"] == 1
+    assert list_response.body["offset"] == 0
     assert get_response.status_code == 200
     assert get_response.body["gene"]["id"] == champion_id
     assert get_response.body["gene"]["score_total"] == "2.50000000"
@@ -614,11 +655,15 @@ def test_control_plane_lists_and_gets_evolution_epochs(tmp_path):
         gene_control=GeneControlService(session_factory),
     )
 
-    list_response = app.handle("GET", "/evolution-epochs?strategy_id=searchable")
+    list_response = app.handle(
+        "GET",
+        "/evolution-epochs?strategy_id=searchable&limit=5&offset=0",
+    )
     get_response = app.handle("GET", "/evolution-epochs/epoch-query")
 
     assert list_response.status_code == 200
     assert [epoch["id"] for epoch in list_response.body["epochs"]] == ["epoch-query"]
+    assert list_response.body["total"] == 1
     assert get_response.status_code == 200
     assert get_response.body["epoch"]["best_score"] == "2.50000000"
     assert get_response.body["epoch"]["config_json"] == {"objective": "maximize_score"}
@@ -652,12 +697,13 @@ def test_control_plane_lists_and_gets_system_events(tmp_path):
 
     list_response = app.handle(
         "GET",
-        "/system-events?event_type=gene_promote&strategy_id=searchable&related_gene_id=7",
+        "/system-events?event_type=gene_promote&strategy_id=searchable&related_gene_id=7&limit=1&offset=0",
     )
     get_response = app.handle("GET", f"/system-events/{event_id}")
 
     assert list_response.status_code == 200
     assert [event["id"] for event in list_response.body["events"]] == [event_id]
+    assert list_response.body["total"] == 1
     assert get_response.status_code == 200
     assert get_response.body["event"]["event_type"] == "gene_promote"
     assert get_response.body["event"]["payload"] == {"reason": "best search score"}

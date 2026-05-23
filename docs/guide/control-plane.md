@@ -68,6 +68,7 @@ interruption error so they can be retried explicitly.
 
 ```bash
 curl http://127.0.0.1:8080/jobs
+curl 'http://127.0.0.1:8080/jobs?limit=50&offset=0'
 curl http://127.0.0.1:8080/jobs/<job_id>
 ```
 
@@ -174,11 +175,11 @@ Inspect persisted genes and evolution epochs:
 
 ```bash
 curl http://127.0.0.1:8080/genes
-curl 'http://127.0.0.1:8080/genes?strategy_id=rsi_scalper&role=champion'
+curl 'http://127.0.0.1:8080/genes?strategy_id=rsi_scalper&role=champion&limit=50&offset=0'
 curl http://127.0.0.1:8080/genes/<gene_id>
 
 curl http://127.0.0.1:8080/evolution-epochs
-curl 'http://127.0.0.1:8080/evolution-epochs?strategy_id=rsi_scalper'
+curl 'http://127.0.0.1:8080/evolution-epochs?strategy_id=rsi_scalper&limit=50&offset=0'
 curl http://127.0.0.1:8080/evolution-epochs/<epoch_id>
 ```
 
@@ -187,10 +188,13 @@ paths:
 
 ```bash
 curl http://127.0.0.1:8080/system-events
-curl 'http://127.0.0.1:8080/system-events?event_type=gene_promote&strategy_id=rsi_scalper'
-curl 'http://127.0.0.1:8080/system-events?related_gene_id=123'
+curl 'http://127.0.0.1:8080/system-events?event_type=gene_promote&strategy_id=rsi_scalper&limit=50&offset=0'
+curl 'http://127.0.0.1:8080/system-events?related_gene_id=123&limit=50&offset=0'
 curl http://127.0.0.1:8080/system-events/<event_id>
 ```
+
+List endpoints return `total`, `limit`, and `offset`. The default page is
+`limit=100&offset=0`; `limit` must be between 1 and 500.
 
 ## Strategy Status And Commands
 
