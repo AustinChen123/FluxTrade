@@ -14,6 +14,8 @@ uv run python -m src.control_plane.main
 
 Set `CONTROL_PLANE_JOB_DB_PATH=/path/to/jobs.db` to persist control-plane job
 records across local restarts.
+Set `CONTROL_PLANE_API_KEY=...` to require `Authorization: Bearer <key>` or
+`X-API-Key: <key>` on every route except `GET /health`.
 
 Health check:
 

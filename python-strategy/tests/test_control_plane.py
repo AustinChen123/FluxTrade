@@ -219,6 +219,51 @@ def test_control_plane_rejects_invalid_pagination():
     assert response.body == {"error": "validation_error"}
 
 
+def test_control_plane_api_key_auth_allows_health_without_credentials():
+    app = ControlPlaneApp(BacktestJobExecutor(run_inline=True), api_key="secret")
+
+    response = app.handle("GET", "/health")
+
+    assert response.status_code == 200
+    assert response.body == {"status": "ok"}
+
+
+def test_control_plane_api_key_auth_rejects_missing_credentials():
+    app = ControlPlaneApp(BacktestJobExecutor(run_inline=True), api_key="secret")
+
+    response = app.handle("GET", "/jobs")
+
+    assert response.status_code == 401
+    assert response.body == {"error": "unauthorized"}
+
+
+def test_control_plane_api_key_auth_accepts_bearer_token():
+    app = ControlPlaneApp(BacktestJobExecutor(run_inline=True), api_key="secret")
+
+    response = app.handle(
+        "GET",
+        "/jobs",
+        headers={"Authorization": "Bearer secret"},
+    )
+
+    assert response.status_code == 200
+    assert response.body["jobs"] == []
+
+
+def test_control_plane_api_key_auth_accepts_x_api_key_case_insensitive():
+    app = ControlPlaneApp(BacktestJobExecutor(run_inline=True), api_key="secret")
+
+    response = app.handle("GET", "/jobs", headers={"x-api-key": "secret"})
+
+    assert response.status_code == 200
+    assert response.body["jobs"] == []
+
+
+def test_control_plane_rejects_empty_api_key_config():
+    with pytest.raises(ValueError, match="api_key must be non-empty"):
+        ControlPlaneApp(BacktestJobExecutor(run_inline=True), api_key="")
+
+
 def test_sqlite_job_store_persists_job_state_across_instances(tmp_path):
     db_path = tmp_path / "jobs.db"
     request = BacktestJobRequest(
