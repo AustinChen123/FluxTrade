@@ -18,6 +18,7 @@ from src.control_plane import (
     ParameterSearchJobExecutor,
     SqliteJobStore,
     StrategyControlService,
+    StrategyStateQueryService,
 )
 from src.control_plane.models import BacktestJobRequest, JobStatus
 from src.core.command_router import CommandResult
@@ -31,6 +32,8 @@ from src.core.orm_models import (
     Product,
     SignalAudit,
     Strategy,
+    StrategyState,
+    StrategyStateTransition,
 )
 
 try:
@@ -96,6 +99,30 @@ def _sqlite_gene_registry_session_factory(tmp_path):
     session_factory = sessionmaker(bind=engine)
     with session_factory() as session:
         session.add(Strategy(id="searchable", name="Searchable Strategy"))
+        session.commit()
+    return session_factory
+
+
+def _sqlite_strategy_state_session_factory(tmp_path):
+    engine = create_engine(
+        f"sqlite:///{tmp_path / 'control_plane_strategy_state.db'}",
+        connect_args={"check_same_thread": False, "timeout": 30},
+    )
+    for table in [
+        Strategy.__table__,
+        StrategyState.__table__,
+        StrategyStateTransition.__table__,
+    ]:
+        table.create(engine, checkfirst=True)
+
+    session_factory = sessionmaker(bind=engine)
+    with session_factory() as session:
+        session.add_all(
+            [
+                Strategy(id="s1", name="Strategy 1"),
+                Strategy(id="s2", name="Strategy 2"),
+            ]
+        )
         session.commit()
     return session_factory
 
@@ -720,6 +747,163 @@ def test_control_plane_rejects_invalid_system_event_gene_filter(tmp_path):
 
     assert response.status_code == 422
     assert response.body == {"error": "validation_error"}
+
+
+def test_control_plane_lists_and_gets_strategy_states(tmp_path):
+    session_factory = _sqlite_strategy_state_session_factory(tmp_path)
+    with session_factory() as session:
+        session.add_all(
+            [
+                StrategyState(
+                    strategy_id="s1",
+                    status="ACTIVE",
+                    config_json='{"risk":"low"}',
+                    performance_json='{"pnl":"12.3"}',
+                    last_heartbeat=1_700_000_000_000,
+                    uptime_start=1_699_999_000_000,
+                    version=2,
+                ),
+                StrategyState(
+                    strategy_id="s2",
+                    status="STOPPED",
+                    config_json="{}",
+                    performance_json="{}",
+                    stopped_at=datetime(2026, 5, 20, tzinfo=UTC),
+                    version=1,
+                ),
+            ]
+        )
+        session.commit()
+
+    app = ControlPlaneApp(
+        BacktestJobExecutor(run_inline=True),
+        strategy_state_query=StrategyStateQueryService(session_factory),
+    )
+
+    list_response = app.handle("GET", "/strategy-states?status=ACTIVE&limit=5&offset=0")
+    get_response = app.handle("GET", "/strategy-states/s1")
+
+    assert list_response.status_code == 200
+    assert list_response.body["total"] == 1
+    assert [state["strategy_id"] for state in list_response.body["states"]] == ["s1"]
+    assert get_response.status_code == 200
+    assert get_response.body["state"]["status"] == "ACTIVE"
+    assert get_response.body["state"]["config"] == {"risk": "low"}
+    assert get_response.body["state"]["performance"] == {"pnl": "12.3"}
+    assert get_response.body["state"]["version"] == 2
+
+
+def test_control_plane_summarizes_strategy_states(tmp_path):
+    session_factory = _sqlite_strategy_state_session_factory(tmp_path)
+    with session_factory() as session:
+        session.add_all(
+            [
+                StrategyState(
+                    strategy_id="s1",
+                    status="ACTIVE",
+                    config_json="{}",
+                    performance_json="{}",
+                    last_heartbeat=1,
+                    uptime_start=1,
+                    version=1,
+                ),
+                StrategyState(
+                    strategy_id="s2",
+                    status="STOPPED",
+                    config_json="{}",
+                    performance_json="{}",
+                    stopped_at=datetime(2026, 5, 20, tzinfo=UTC),
+                    version=1,
+                ),
+            ]
+        )
+        session.commit()
+
+    app = ControlPlaneApp(
+        BacktestJobExecutor(run_inline=True),
+        strategy_state_query=StrategyStateQueryService(session_factory),
+    )
+
+    response = app.handle("GET", "/strategy-states/summary?stale_after_ms=1000")
+
+    assert response.status_code == 200
+    assert response.body["summary"]["total"] == 2
+    assert response.body["summary"]["by_status"] == {"ACTIVE": 1, "STOPPED": 1}
+    assert response.body["summary"]["stale_heartbeat_count"] == 1
+    assert response.body["summary"]["stale_after_ms"] == 1000
+    assert isinstance(response.body["summary"]["observed_at_ms"], int)
+
+
+def test_control_plane_rejects_invalid_strategy_state_summary_threshold(tmp_path):
+    session_factory = _sqlite_strategy_state_session_factory(tmp_path)
+    app = ControlPlaneApp(
+        BacktestJobExecutor(run_inline=True),
+        strategy_state_query=StrategyStateQueryService(session_factory),
+    )
+
+    response = app.handle("GET", "/strategy-states/summary?stale_after_ms=-1")
+
+    assert response.status_code == 422
+    assert response.body == {"error": "validation_error"}
+
+
+def test_control_plane_lists_strategy_state_transitions(tmp_path):
+    session_factory = _sqlite_strategy_state_session_factory(tmp_path)
+    with session_factory() as session:
+        session.add(
+            StrategyState(
+                strategy_id="s1",
+                status="STOPPED",
+                config_json="{}",
+                performance_json="{}",
+                stopped_at=datetime(2026, 5, 20, tzinfo=UTC),
+                version=2,
+            )
+        )
+        session.add_all(
+            [
+                StrategyStateTransition(
+                    strategy_id="s1",
+                    from_status="ACTIVE",
+                    to_status="ERROR",
+                    transitioned_at=datetime(2026, 5, 20, 1, tzinfo=UTC),
+                    reason="risk breach",
+                    actor="system",
+                ),
+                StrategyStateTransition(
+                    strategy_id="s1",
+                    from_status="ERROR",
+                    to_status="STOPPED",
+                    transitioned_at=datetime(2026, 5, 20, 2, tzinfo=UTC),
+                    reason="operator stop",
+                    actor="operator",
+                ),
+            ]
+        )
+        session.commit()
+
+    app = ControlPlaneApp(
+        BacktestJobExecutor(run_inline=True),
+        strategy_state_query=StrategyStateQueryService(session_factory),
+    )
+
+    response = app.handle("GET", "/strategy-states/s1/transitions?limit=1&offset=0")
+
+    assert response.status_code == 200
+    assert response.body["total"] == 2
+    assert response.body["limit"] == 1
+    assert len(response.body["transitions"]) == 1
+    assert response.body["transitions"][0]["to_status"] == "STOPPED"
+    assert response.body["transitions"][0]["reason"] == "operator stop"
+
+
+def test_control_plane_reports_unavailable_strategy_state_query():
+    app = ControlPlaneApp(BacktestJobExecutor(run_inline=True))
+
+    response = app.handle("GET", "/strategy-states")
+
+    assert response.status_code == 503
+    assert response.body == {"error": "strategy_state_query_unavailable"}
 
 
 @pytest.mark.rust
