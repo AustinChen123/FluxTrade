@@ -116,3 +116,11 @@ curl -X POST http://127.0.0.1:8080/strategies/strategy_1/commands \
   -H 'Content-Type: application/json' \
   -d '{"command":"STOP","reason":"operator pause"}'
 ```
+
+When `StrategyStateQueryService` is wired, durable strategy state is readable:
+
+```bash
+curl http://127.0.0.1:8080/strategy-states
+curl http://127.0.0.1:8080/strategy-states/<strategy_id>
+curl 'http://127.0.0.1:8080/strategy-states/<strategy_id>/transitions?limit=50&offset=0'
+```

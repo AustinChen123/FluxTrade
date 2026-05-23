@@ -225,6 +225,16 @@ Supported commands:
 - `FORCE_RECOVER`
 - `RELOAD`
 
+When the control plane is constructed with `StrategyStateQueryService`, it can
+also expose durable strategy lifecycle state:
+
+```bash
+curl http://127.0.0.1:8080/strategy-states
+curl 'http://127.0.0.1:8080/strategy-states?status=ACTIVE&limit=50&offset=0'
+curl http://127.0.0.1:8080/strategy-states/<strategy_id>
+curl 'http://127.0.0.1:8080/strategy-states/<strategy_id>/transitions?limit=50&offset=0'
+```
+
 ## CSV Formats
 
 Candles use the existing `CsvDataSource` format:
@@ -255,8 +265,8 @@ timestamp,type,quantity
   cooperative cancellation inside the runner before safe force-stop semantics
   can be exposed.
 - Strategy command endpoints require wiring a live `StrategyControlService` over
-  the running engine's `CommandRouter`; the default standalone server only
-  exposes job endpoints.
+  the running engine's `CommandRouter`; durable state endpoints require wiring a
+  `StrategyStateQueryService`.
 - Authentication and authorization are not yet implemented.
 - Production deployment should use a stronger HTTP framework adapter and review
   whether SQLite durability is sufficient for the deployment model.

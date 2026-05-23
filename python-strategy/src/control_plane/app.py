@@ -18,6 +18,7 @@ from src.control_plane.models import (
 )
 from src.control_plane.parameter_search import ParameterSearchJobExecutor
 from src.control_plane.strategy_control import StrategyControlService
+from src.control_plane.strategy_state_query import StrategyStateQueryService
 
 
 @dataclass(frozen=True)
@@ -38,11 +39,13 @@ class ControlPlaneApp:
         parameter_search_executor: ParameterSearchJobExecutor | None = None,
         gene_control: GeneControlService | None = None,
         strategy_control: StrategyControlService | None = None,
+        strategy_state_query: StrategyStateQueryService | None = None,
     ) -> None:
         self.backtest_executor = backtest_executor
         self.parameter_search_executor = parameter_search_executor
         self.gene_control = gene_control
         self.strategy_control = strategy_control
+        self.strategy_state_query = strategy_state_query
 
     def handle(
         self,
@@ -87,6 +90,12 @@ class ControlPlaneApp:
 
         if method == "GET" and clean_path.startswith("/system-events/"):
             return self._get_system_event(clean_path)
+
+        if method == "GET" and clean_path == "/strategy-states":
+            return self._list_strategy_states(query)
+
+        if method == "GET" and clean_path.startswith("/strategy-states/"):
+            return self._handle_strategy_state_get(clean_path, query)
 
         if method == "GET" and clean_path == "/jobs":
             return self._list_jobs(query)
@@ -406,6 +415,71 @@ class ControlPlaneApp:
                 "jobs",
                 jobs,
                 total=len(all_jobs),
+                limit=limit,
+                offset=offset,
+            ),
+        )
+
+    def _list_strategy_states(self, query: dict[str, list[str]]) -> HttpResponse:
+        if self.strategy_state_query is None:
+            return HttpResponse(503, {"error": "strategy_state_query_unavailable"})
+        pagination = _parse_pagination(query)
+        if isinstance(pagination, HttpResponse):
+            return pagination
+        limit, offset = pagination
+        states, total = self.strategy_state_query.list_states(
+            status=_single_query_value(query, "status"),
+            limit=limit,
+            offset=offset,
+        )
+        return HttpResponse(
+            200,
+            _page_payload("states", states, total=total, limit=limit, offset=offset),
+        )
+
+    def _handle_strategy_state_get(
+        self,
+        path: str,
+        query: dict[str, list[str]],
+    ) -> HttpResponse:
+        if self.strategy_state_query is None:
+            return HttpResponse(503, {"error": "strategy_state_query_unavailable"})
+        suffix = "/transitions"
+        if path.endswith(suffix):
+            strategy_id = path.removeprefix("/strategy-states/")[: -len(suffix)]
+            if not strategy_id:
+                return HttpResponse(404, {"error": "not_found"})
+            return self._list_strategy_transitions(strategy_id, query)
+
+        strategy_id = path.removeprefix("/strategy-states/")
+        if not strategy_id:
+            return HttpResponse(404, {"error": "not_found"})
+        try:
+            state = self.strategy_state_query.get_state(strategy_id)
+        except KeyError:
+            return HttpResponse(404, {"error": "strategy_state_not_found"})
+        return HttpResponse(200, {"state": state})
+
+    def _list_strategy_transitions(
+        self,
+        strategy_id: str,
+        query: dict[str, list[str]],
+    ) -> HttpResponse:
+        pagination = _parse_pagination(query)
+        if isinstance(pagination, HttpResponse):
+            return pagination
+        limit, offset = pagination
+        transitions, total = self.strategy_state_query.list_transitions(
+            strategy_id,
+            limit=limit,
+            offset=offset,
+        )
+        return HttpResponse(
+            200,
+            _page_payload(
+                "transitions",
+                transitions,
+                total=total,
                 limit=limit,
                 offset=offset,
             ),

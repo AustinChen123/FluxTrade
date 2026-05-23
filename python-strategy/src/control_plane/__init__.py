@@ -19,6 +19,7 @@ from src.control_plane.parameter_search import (
     ParameterSearchJobExecutor,
 )
 from src.control_plane.strategy_control import StrategyControlService
+from src.control_plane.strategy_state_query import StrategyStateQueryService
 
 __all__ = [
     "BacktestJobExecutor",
@@ -40,4 +41,5 @@ __all__ = [
     "ParameterSearchJobExecutor",
     "SqliteJobStore",
     "StrategyControlService",
+    "StrategyStateQueryService",
 ]
