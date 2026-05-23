@@ -24,6 +24,7 @@ Environment variables:
 | `CONTROL_PLANE_HOST` | `127.0.0.1` | Bind host |
 | `CONTROL_PLANE_PORT` | `8080` | Bind port |
 | `CONTROL_PLANE_JOB_DB_PATH` | unset | Optional SQLite job database path. When set, job records survive process restarts. |
+| `CONTROL_PLANE_API_KEY` | unset | Optional API key. When set, every endpoint except `GET /health` requires `Authorization: Bearer <key>` or `X-API-Key: <key>`. |
 
 ## Health Check
 
@@ -35,6 +36,22 @@ Expected response:
 
 ```json
 {"status":"ok"}
+```
+
+## Authentication
+
+Set `CONTROL_PLANE_API_KEY` when exposing the control plane outside a private
+local shell. `GET /health` remains public for process checks; all other routes
+return `401` without a matching key.
+
+```bash
+export CONTROL_PLANE_API_KEY='replace-with-a-secret'
+
+curl http://127.0.0.1:8080/jobs \
+  -H "Authorization: Bearer ${CONTROL_PLANE_API_KEY}"
+
+curl http://127.0.0.1:8080/jobs \
+  -H "X-API-Key: ${CONTROL_PLANE_API_KEY}"
 ```
 
 ## Submit A Backtest Job

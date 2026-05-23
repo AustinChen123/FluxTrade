@@ -10,9 +10,11 @@ def main() -> None:
     host = os.getenv("CONTROL_PLANE_HOST", "127.0.0.1")
     port = int(os.getenv("CONTROL_PLANE_PORT", "8080"))
     job_db_path = os.getenv("CONTROL_PLANE_JOB_DB_PATH")
+    api_key = os.getenv("CONTROL_PLANE_API_KEY")
     store = SqliteJobStore(job_db_path) if job_db_path else None
     app = ControlPlaneApp(
-        BacktestJobExecutor(store=store, recover_interrupted=store is not None)
+        BacktestJobExecutor(store=store, recover_interrupted=store is not None),
+        api_key=api_key,
     )
     serve(app, host=host, port=port)
 

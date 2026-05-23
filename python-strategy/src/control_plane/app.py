@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import json
+from collections.abc import Mapping
 from dataclasses import dataclass
+from hmac import compare_digest
 from urllib.parse import parse_qs, urlsplit
 from typing import Any
 
@@ -40,18 +42,23 @@ class ControlPlaneApp:
         gene_control: GeneControlService | None = None,
         strategy_control: StrategyControlService | None = None,
         strategy_state_query: StrategyStateQueryService | None = None,
+        api_key: str | None = None,
     ) -> None:
+        if api_key == "":
+            raise ValueError("api_key must be non-empty when provided")
         self.backtest_executor = backtest_executor
         self.parameter_search_executor = parameter_search_executor
         self.gene_control = gene_control
         self.strategy_control = strategy_control
         self.strategy_state_query = strategy_state_query
+        self.api_key = api_key
 
     def handle(
         self,
         method: str,
         path: str,
         body: str | bytes | None = None,
+        headers: Mapping[str, str] | None = None,
     ) -> HttpResponse:
         method = method.upper()
         parsed_url = urlsplit(path)
@@ -60,6 +67,10 @@ class ControlPlaneApp:
 
         if method == "GET" and clean_path == "/health":
             return HttpResponse(200, {"status": "ok"})
+
+        auth_response = self._authorize(headers)
+        if auth_response is not None:
+            return auth_response
 
         if method == "POST" and clean_path == "/jobs/backtests":
             return self._submit_backtest(body)
@@ -519,12 +530,32 @@ class ControlPlaneApp:
         status_code = 200 if result["success"] else 400
         return HttpResponse(status_code, {"result": result})
 
+    def _authorize(self, headers: Mapping[str, str] | None) -> HttpResponse | None:
+        if self.api_key is None:
+            return None
+        supplied = _extract_api_key(headers)
+        if supplied is not None and compare_digest(supplied, self.api_key):
+            return None
+        return HttpResponse(401, {"error": "unauthorized"})
+
 
 def _single_query_value(query: dict[str, list[str]], key: str) -> str | None:
     values = query.get(key)
     if not values:
         return None
     return values[0]
+
+
+def _extract_api_key(headers: Mapping[str, str] | None) -> str | None:
+    if headers is None:
+        return None
+    normalized = {key.lower(): value for key, value in headers.items()}
+    authorization = normalized.get("authorization")
+    if authorization is not None:
+        scheme, _, token = authorization.partition(" ")
+        if scheme.lower() == "bearer" and token:
+            return token
+    return normalized.get("x-api-key")
 
 
 def _parse_pagination(query: dict[str, list[str]]) -> tuple[int, int] | HttpResponse:

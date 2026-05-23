@@ -19,7 +19,7 @@ def make_handler(app: ControlPlaneApp) -> Type[BaseHTTPRequestHandler]:
         def _handle(self) -> None:
             length = int(self.headers.get("Content-Length", "0"))
             body = self.rfile.read(length) if length > 0 else None
-            response = app.handle(self.command, self.path, body)
+            response = app.handle(self.command, self.path, body, self.headers)
             encoded = response.json().encode("utf-8")
             self.send_response(response.status_code)
             self.send_header("Content-Type", "application/json")
