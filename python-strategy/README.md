@@ -1,5 +1,18 @@
 # FluxTrade Python Strategy Service
 
+## Golden Cross Backtest Example
+
+Run the built-in `GoldenCrossStrategy` against a BTC OHLCV CSV and write a full
+BacktestRunner report:
+
+```bash
+uv run python examples/run_golden_cross_btc_backtest.py
+```
+
+The default input is `data/smc/BTCUSDT_5m.csv` when that local dataset exists.
+The script writes `report.md`, `trades.csv`, `equity_curve.csv`, and
+`journal.jsonl` under `backtest_output/golden_cross_btc/`.
+
 ## Control Plane
 
 The control plane provides a backend-facing API layer for operational jobs.
