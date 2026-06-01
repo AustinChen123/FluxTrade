@@ -3,6 +3,7 @@ from __future__ import annotations
 from concurrent.futures import Future, ThreadPoolExecutor
 from datetime import UTC, datetime
 from decimal import Decimal
+from pathlib import Path
 from threading import Lock
 from typing import Any, Callable, Protocol
 
@@ -19,6 +20,7 @@ from src.control_plane.models import (
     ParameterSearchJobRequest,
 )
 from src.core.data_sources.csv_source import CsvDataSource
+from src.core.data_sources.memory import MemoryDataSource
 from src.core.models import GeneRole
 from src.core.orm_models import EvolutionEpoch, GeneRecord
 from src.core.research_backtest_runner import ResearchBacktestRunner
@@ -91,8 +93,15 @@ ResearchStrategyFactory = Callable[[str, str, str, dict[str, Any]], BaseStrategy
 class ResearchBacktestParameterEvaluator:
     """Evaluate candidates with the in-memory research backtest runner."""
 
-    def __init__(self, strategy_factory: ResearchStrategyFactory) -> None:
+    def __init__(
+        self,
+        strategy_factory: ResearchStrategyFactory,
+        *,
+        preload_candles: bool = True,
+    ) -> None:
         self._strategy_factory = strategy_factory
+        self._preload_candles = preload_candles
+        self._candle_cache: dict[tuple, list] = {}
 
     def evaluate(
         self,
@@ -102,11 +111,7 @@ class ResearchBacktestParameterEvaluator:
         if request.backtest is None:
             raise ValueError("backtest settings are required for research evaluation")
 
-        data_source = CsvDataSource(
-            file_path=request.backtest.candles_csv_path,
-            product_id=request.product_id,
-            timeframe=request.timeframe,
-        )
+        data_source = self._data_source_for(request)
         runner = ResearchBacktestRunner(
             start_time=request.start_time,
             end_time=request.end_time,
@@ -140,6 +145,30 @@ class ResearchBacktestParameterEvaluator:
             metrics=_json_safe(metrics),
         )
 
+    def _data_source_for(self, request: ParameterSearchJobRequest):
+        assert request.backtest is not None
+        csv_source = CsvDataSource(
+            file_path=request.backtest.candles_csv_path,
+            product_id=request.product_id,
+            timeframe=request.timeframe,
+        )
+        if not self._preload_candles:
+            return csv_source
+
+        cache_key = _candle_cache_key(request)
+        candles = self._candle_cache.get(cache_key)
+        if candles is None:
+            candles = list(
+                csv_source.get_candles(
+                    request.product_id,
+                    request.timeframe,
+                    request.start_time,
+                    request.end_time,
+                )
+            )
+            self._candle_cache[cache_key] = candles
+        return MemoryDataSource(candles)
+
 
 class GoldenCrossResearchParameterEvaluator(ResearchBacktestParameterEvaluator):
     """Research evaluator for GoldenCrossStrategy parameter packs."""
@@ -167,6 +196,21 @@ def _golden_cross_strategy_factory(
         long_window=long_window,
         timeframe=timeframe,
         quantity=Decimal(str(param_pack.get("quantity", "0.01"))),
+    )
+
+
+def _candle_cache_key(request: ParameterSearchJobRequest) -> tuple:
+    assert request.backtest is not None
+    path = Path(request.backtest.candles_csv_path)
+    stat = path.stat()
+    return (
+        str(path.resolve()),
+        stat.st_mtime_ns,
+        stat.st_size,
+        request.product_id,
+        request.timeframe,
+        request.start_time,
+        request.end_time,
     )
 
 

@@ -1035,10 +1035,11 @@ def test_control_plane_runs_parameter_search_with_csv_signal_backtests(tmp_path)
 def test_control_plane_runs_parameter_search_with_research_backtests(tmp_path):
     candle_rows = _write_research_candles(tmp_path / "research_candles.csv")
     store = InMemoryJobStore()
+    evaluator = GoldenCrossResearchParameterEvaluator()
     app = ControlPlaneApp(
         BacktestJobExecutor(store=store, run_inline=True),
         parameter_search_executor=ParameterSearchJobExecutor(
-            GoldenCrossResearchParameterEvaluator(),
+            evaluator,
             store=store,
             run_inline=True,
         ),
@@ -1091,6 +1092,7 @@ def test_control_plane_runs_parameter_search_with_research_backtests(tmp_path):
     assert evaluations[0]["metrics"]["raw_trade_count"] == 2
     assert "raw_trades" not in evaluations[0]["metrics"]
     assert "closed_trades" not in evaluations[0]["metrics"]
+    assert len(evaluator._candle_cache) == 1
 
 
 class _FakeCommandRouter:
