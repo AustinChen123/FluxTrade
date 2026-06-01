@@ -2,6 +2,7 @@
 
 import pytest
 from decimal import Decimal
+from types import SimpleNamespace
 from src.core.analytics import calculate_metrics, _build_closed_trades
 from src.core.models import Trade
 
@@ -16,6 +17,18 @@ def _make_trade(side: str, price: float, qty: float, ts: int) -> Trade:
         quantity=Decimal(str(qty)),
         side=side,
         timestamp=ts,
+    )
+
+
+def _make_fill(side: str, price: str, qty: str, fee: str, ts: int):
+    return SimpleNamespace(
+        id=f"fill-{ts}-{side}",
+        product_id="BINANCE:BTCUSDT-PERP",
+        price=Decimal(price),
+        quantity=Decimal(qty),
+        side=side,
+        timestamp=ts,
+        fee=Decimal(fee),
     )
 
 
@@ -106,6 +119,20 @@ class TestBasicMetrics:
         )
         result = calculate_metrics(trades)
         assert float(result["max_drawdown"]) == pytest.approx(-0.5, abs=0.01)
+
+    def test_round_trip_pnl_includes_entry_and_exit_fees(self):
+        trades = [
+            _make_fill("buy", "100", "0.1", "0.01", 1000),
+            _make_fill("sell", "110", "0.1", "0.02", 2000),
+        ]
+
+        result = calculate_metrics(trades)
+        closed, _, _, total_pnl = _build_closed_trades(trades)
+
+        assert result["total_pnl"] == Decimal("0.97")
+        assert total_pnl == Decimal("0.97")
+        assert closed[0].pnl == Decimal("0.97")
+        assert closed[0].fee == Decimal("0.03")
 
     def test_trade_sharpe(self):
         trades = (

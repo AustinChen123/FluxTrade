@@ -45,13 +45,13 @@ def _write_csv_trades(closed_trades: List[ClosedTrade], path: Path) -> None:
         writer = csv.writer(f)
         writer.writerow([
             "entry_time", "exit_time", "side", "entry_price",
-            "exit_price", "quantity", "pnl",
+            "exit_price", "quantity", "fee", "pnl",
         ])
         for ct in closed_trades:
             writer.writerow([
                 ct.entry_time, ct.exit_time, ct.side,
                 f"{ct.entry_price:.6f}", f"{ct.exit_price:.6f}",
-                f"{ct.quantity:.6f}", f"{ct.pnl:.2f}",
+                f"{ct.quantity:.6f}", f"{ct.fee:.6f}", f"{ct.pnl:.2f}",
             ])
 
 

@@ -25,6 +25,7 @@ def _sample_closed_trades() -> list[ClosedTrade]:
             exit_price=110.0,
             side=PositionSide.LONG,
             quantity=0.5,
+            fee=0.1,
             pnl=5.0,
         ),
         ClosedTrade(
@@ -34,6 +35,7 @@ def _sample_closed_trades() -> list[ClosedTrade]:
             exit_price=190.0,
             side=PositionSide.SHORT,
             quantity=0.3,
+            fee=0.2,
             pnl=3.0,
         ),
     ]
@@ -77,11 +79,13 @@ class TestWriteCsvTrades:
 
         assert rows[0] == [
             "entry_time", "exit_time", "side", "entry_price",
-            "exit_price", "quantity", "pnl",
+            "exit_price", "quantity", "fee", "pnl",
         ]
         assert len(rows) == 3  # header + 2 trades
         assert rows[1][2] == "LONG"
+        assert rows[1][6] == "0.100000"
         assert rows[2][2] == "SHORT"
+        assert rows[2][6] == "0.200000"
 
     def test_empty_trades(self, tmp_path):
         path = tmp_path / "trades.csv"

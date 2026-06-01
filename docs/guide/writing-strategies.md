@@ -206,11 +206,16 @@ class SmaCrossStrategy(BaseStrategy):
             timeframe=self._timeframe,
             timestamp=candle.timestamp,
             type=signal_type,
-            value=fast_now,  # log the fast SMA value
+            metadata={
+                "fast_sma": str(fast_now),
+                "slow_sma": str(slow_now),
+            },
         )
 
-        if signal_type == SignalType.LONG:
+        if signal_type in {SignalType.LONG, SignalType.EXIT_LONG}:
             kwargs["quantity"] = self._quantity
+
+        if signal_type == SignalType.LONG:
             kwargs["stop_loss"] = candle.close * (Decimal("1") - self._sl_pct)
             kwargs["take_profit"] = candle.close * (Decimal("1") + self._tp_pct)
 
