@@ -13,6 +13,7 @@ from src.control_plane import (
     ControlPlaneApp,
     CsvSignalBacktestParameterEvaluator,
     GeneControlService,
+    GoldenCrossResearchParameterEvaluator,
     InMemoryJobStore,
     ParameterEvaluationResult,
     ParameterSearchJobExecutor,
@@ -148,6 +149,20 @@ def _write_signals(path, timestamps):
         f"{timestamps[0]},LONG,0.01\n"
         f"{timestamps[2]},EXIT_LONG,0.01\n"
     )
+
+
+def _write_research_candles(path):
+    closes = ["100", "100", "100", "110", "120", "90", "80"]
+    rows = []
+    for index, close in enumerate(closes):
+        timestamp = 1_700_000_000_000 + index * 900_000
+        rows.append((timestamp, close, close, close, close, "100"))
+    path.write_text(
+        "timestamp,open,high,low,close,volume\n"
+        + "\n".join(",".join(map(str, row)) for row in rows)
+        + "\n"
+    )
+    return rows
 
 
 def test_control_plane_rejects_invalid_backtest_payload():
@@ -1013,6 +1028,69 @@ def test_control_plane_runs_parameter_search_with_csv_signal_backtests(tmp_path)
     assert job["status"] == JobStatus.SUCCEEDED.value
     assert job["result"]["best_candidate"]["candidate_id"] == "aggressive"
     assert Decimal(job["result"]["best_candidate"]["score_total"]) > Decimal("0")
+
+
+@pytest.mark.rust
+@pytest.mark.skipif(not HAS_RUST, reason="fluxtrade_core.so not compiled")
+def test_control_plane_runs_parameter_search_with_research_backtests(tmp_path):
+    candle_rows = _write_research_candles(tmp_path / "research_candles.csv")
+    store = InMemoryJobStore()
+    app = ControlPlaneApp(
+        BacktestJobExecutor(store=store, run_inline=True),
+        parameter_search_executor=ParameterSearchJobExecutor(
+            GoldenCrossResearchParameterEvaluator(),
+            store=store,
+            run_inline=True,
+        ),
+    )
+
+    response = app.handle(
+        "POST",
+        "/jobs/parameter-searches",
+        json.dumps(
+            {
+                "strategy_id": "golden_cross_search",
+                "product_id": PRODUCT_ID,
+                "timeframe": TIMEFRAME,
+                "start_time": candle_rows[0][0],
+                "end_time": candle_rows[-1][0],
+                "backtest": {
+                    "candles_csv_path": str(tmp_path / "research_candles.csv"),
+                    "initial_balance": "10000",
+                    "maker_fee": "0",
+                    "taker_fee": "0",
+                },
+                "candidates": [
+                    {
+                        "candidate_id": "active",
+                        "param_pack": {
+                            "short_window": 1,
+                            "long_window": 3,
+                            "quantity": "0.01",
+                        },
+                    },
+                    {
+                        "candidate_id": "slow",
+                        "param_pack": {
+                            "short_window": 1,
+                            "long_window": 6,
+                            "quantity": "0.01",
+                        },
+                    },
+                ],
+            }
+        ),
+    )
+
+    assert response.status_code == 200
+    job = response.body["job"]
+    assert job["status"] == JobStatus.SUCCEEDED.value
+    assert job["result"]["best_candidate"]["candidate_id"] == "slow"
+    assert Decimal(job["result"]["best_candidate"]["score_total"]) == Decimal("0")
+    evaluations = job["result"]["evaluations"]
+    assert evaluations[0]["metrics"]["raw_trade_count"] == 2
+    assert "raw_trades" not in evaluations[0]["metrics"]
+    assert "closed_trades" not in evaluations[0]["metrics"]
 
 
 class _FakeCommandRouter:

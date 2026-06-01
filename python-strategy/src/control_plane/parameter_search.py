@@ -4,7 +4,7 @@ from concurrent.futures import Future, ThreadPoolExecutor
 from datetime import UTC, datetime
 from decimal import Decimal
 from threading import Lock
-from typing import Any, Protocol
+from typing import Any, Callable, Protocol
 
 from sqlalchemy.orm import Session
 
@@ -18,8 +18,12 @@ from src.control_plane.models import (
     ParameterEvaluationResult,
     ParameterSearchJobRequest,
 )
+from src.core.data_sources.csv_source import CsvDataSource
 from src.core.models import GeneRole
 from src.core.orm_models import EvolutionEpoch, GeneRecord
+from src.core.research_backtest_runner import ResearchBacktestRunner
+from src.strategies.base import BaseStrategy
+from src.strategies.golden_cross import GoldenCrossStrategy
 
 
 class ParameterSearchEvaluator(Protocol):
@@ -79,6 +83,91 @@ class CsvSignalBacktestParameterEvaluator:
             max_drawdown=max_drawdown,
             metrics=result,
         )
+
+
+ResearchStrategyFactory = Callable[[str, str, str, dict[str, Any]], BaseStrategy]
+
+
+class ResearchBacktestParameterEvaluator:
+    """Evaluate candidates with the in-memory research backtest runner."""
+
+    def __init__(self, strategy_factory: ResearchStrategyFactory) -> None:
+        self._strategy_factory = strategy_factory
+
+    def evaluate(
+        self,
+        request: ParameterSearchJobRequest,
+        candidate: ParameterCandidate,
+    ) -> ParameterEvaluationResult:
+        if request.backtest is None:
+            raise ValueError("backtest settings are required for research evaluation")
+
+        data_source = CsvDataSource(
+            file_path=request.backtest.candles_csv_path,
+            product_id=request.product_id,
+            timeframe=request.timeframe,
+        )
+        runner = ResearchBacktestRunner(
+            start_time=request.start_time,
+            end_time=request.end_time,
+            product_id=request.product_id,
+            timeframe=request.timeframe,
+            initial_balance=float(request.backtest.initial_balance),
+            data_source=data_source,
+            fee_config={
+                "maker": float(request.backtest.maker_fee),
+                "taker": float(request.backtest.taker_fee),
+            },
+        )
+        strategy = self._strategy_factory(
+            f"{request.strategy_id}_{candidate.candidate_id}",
+            request.product_id,
+            request.timeframe,
+            candidate.param_pack,
+        )
+        runner.add_strategy(strategy)
+
+        result = runner.run()
+        metrics = {
+            key: value
+            for key, value in result.items()
+            if key not in {"closed_trades", "raw_trades"}
+        }
+        return ParameterEvaluationResult(
+            candidate_id=candidate.candidate_id,
+            score_total=_result_decimal(result, "total_pnl"),
+            max_drawdown=_result_decimal(result, "max_drawdown"),
+            metrics=_json_safe(metrics),
+        )
+
+
+class GoldenCrossResearchParameterEvaluator(ResearchBacktestParameterEvaluator):
+    """Research evaluator for GoldenCrossStrategy parameter packs."""
+
+    def __init__(self) -> None:
+        super().__init__(_golden_cross_strategy_factory)
+
+
+def _golden_cross_strategy_factory(
+    strategy_id: str,
+    product_id: str,
+    timeframe: str,
+    param_pack: dict[str, Any],
+) -> BaseStrategy:
+    try:
+        short_window = int(param_pack["short_window"])
+        long_window = int(param_pack["long_window"])
+    except KeyError as exc:
+        raise ValueError("candidate param_pack requires short_window and long_window") from exc
+
+    return GoldenCrossStrategy(
+        strategy_id,
+        product_id,
+        short_window=short_window,
+        long_window=long_window,
+        timeframe=timeframe,
+        quantity=Decimal(str(param_pack.get("quantity", "0.01"))),
+    )
 
 
 class ParameterSearchJobExecutor:
