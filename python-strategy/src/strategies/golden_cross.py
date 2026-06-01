@@ -39,6 +39,10 @@ class GoldenCrossStrategy(BaseStrategy):
             raise ValueError("quantity must be positive")
 
         self.close_history: Deque[Decimal] = deque(maxlen=long_window + 1)
+        self._short_values: Deque[Decimal] = deque()
+        self._long_values: Deque[Decimal] = deque()
+        self._short_sum = Decimal("0")
+        self._long_sum = Decimal("0")
         self._in_position = False
 
     @property
@@ -83,18 +87,26 @@ class GoldenCrossStrategy(BaseStrategy):
         """
         Event-driven execution for Golden Cross.
         """
-        self.close_history.append(candle.close)
+        had_previous_long_window = len(self._long_values) == self.long_window
+        prev_sma_short = (
+            self._short_sum / Decimal(self.short_window)
+            if had_previous_long_window
+            else None
+        )
+        prev_sma_long = (
+            self._long_sum / Decimal(self.long_window)
+            if had_previous_long_window
+            else None
+        )
 
-        if len(self.close_history) <= self.long_window:
+        self.close_history.append(candle.close)
+        self._append_close(candle.close)
+
+        if not had_previous_long_window:
             return self._signal(candle, SignalType.NO_SIGNAL)
 
-        history = list(self.close_history)
-        curr_sma_short = _sma(history, self.short_window)
-        curr_sma_long = _sma(history, self.long_window)
-
-        prev_history_list = list(self.close_history)[:-1]
-        prev_sma_short = _sma(prev_history_list, self.short_window)
-        prev_sma_long = _sma(prev_history_list, self.long_window)
+        curr_sma_short = self._short_sum / Decimal(self.short_window)
+        curr_sma_long = self._long_sum / Decimal(self.long_window)
 
         curr_bullish = curr_sma_short > curr_sma_long
         prev_bullish = prev_sma_short > prev_sma_long
@@ -133,6 +145,13 @@ class GoldenCrossStrategy(BaseStrategy):
             metadata=metadata,
         )
 
+    def _append_close(self, close: Decimal) -> None:
+        self._short_values.append(close)
+        self._short_sum += close
+        if len(self._short_values) > self.short_window:
+            self._short_sum -= self._short_values.popleft()
 
-def _sma(values: list[Decimal], window: int) -> Decimal:
-    return sum(values[-window:]) / Decimal(window)
+        self._long_values.append(close)
+        self._long_sum += close
+        if len(self._long_values) > self.long_window:
+            self._long_sum -= self._long_values.popleft()
