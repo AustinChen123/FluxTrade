@@ -64,7 +64,7 @@ class TestWriteCsvTrades:
         _write_csv_trades([_make_closed_trade()], path)
 
         lines = path.read_text().strip().split("\n")
-        assert lines[0] == "entry_time,exit_time,side,entry_price,exit_price,quantity,pnl"
+        assert lines[0] == "entry_time,exit_time,side,entry_price,exit_price,quantity,fee,pnl"
 
     def test_csv_data_row(self, tmp_path):
         """CSV should contain trade data."""

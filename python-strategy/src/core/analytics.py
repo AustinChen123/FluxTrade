@@ -17,6 +17,7 @@ class ClosedTrade:
     side: PositionSide  # "LONG" or "SHORT"
     quantity: Decimal
     pnl: Decimal
+    fee: Decimal = Decimal("0")
 
 
 def _build_closed_trades(trade_history: List[Trade]) -> tuple[
@@ -34,6 +35,7 @@ def _build_closed_trades(trade_history: List[Trade]) -> tuple[
             "side": t.side,
             "price": t.price,
             "quantity": t.quantity,
+            "fee": getattr(t, "fee", Decimal("0")) or Decimal("0"),
         })
 
     df = pd.DataFrame(trades)
@@ -43,6 +45,7 @@ def _build_closed_trades(trade_history: List[Trade]) -> tuple[
     total_pnl = _ZERO
     net_qty = _ZERO
     avg_entry_price = _ZERO
+    open_fee = _ZERO
     entry_time = 0
 
     equity_curve: list[float] = [0.0]
@@ -53,25 +56,36 @@ def _build_closed_trades(trade_history: List[Trade]) -> tuple[
         qty: Decimal = row["quantity"]
         price: Decimal = row["price"]
         side = row["side"]
+        fee: Decimal = row["fee"]
         timestamp = int(row["timestamp"])
 
         signed_qty = qty if side.lower() == "buy" else -qty
+        if fee:
+            total_pnl -= fee
 
         is_reducing = (net_qty > 0 and signed_qty < 0) or (
             net_qty < 0 and signed_qty > 0
         )
 
         if is_reducing:
+            previous_qty = abs(net_qty)
             qty_closing = min(abs(net_qty), abs(signed_qty))
+            entry_fee = (
+                open_fee * qty_closing / previous_qty
+                if previous_qty > _ZERO
+                else _ZERO
+            )
+            exit_fee = fee * qty_closing / abs(signed_qty)
 
             if net_qty > 0:
-                pnl = (price - avg_entry_price) * qty_closing
+                gross_pnl = (price - avg_entry_price) * qty_closing
                 trade_side = PositionSide.LONG
             else:
-                pnl = (avg_entry_price - price) * qty_closing
+                gross_pnl = (avg_entry_price - price) * qty_closing
                 trade_side = PositionSide.SHORT
 
-            total_pnl += pnl
+            pnl = gross_pnl - entry_fee - exit_fee
+            total_pnl += gross_pnl
             trade_pnls.append(float(pnl))
 
             closed_trades.append(ClosedTrade(
@@ -82,9 +96,11 @@ def _build_closed_trades(trade_history: List[Trade]) -> tuple[
                 side=trade_side,
                 quantity=qty_closing,
                 pnl=pnl,
+                fee=entry_fee + exit_fee,
             ))
 
             remaining_after_close = abs(signed_qty) - qty_closing
+            open_fee -= entry_fee
 
             if net_qty > 0:
                 net_qty -= qty_closing
@@ -97,9 +113,11 @@ def _build_closed_trades(trade_history: List[Trade]) -> tuple[
                 )
                 avg_entry_price = price
                 entry_time = timestamp
+                open_fee = fee - exit_fee
         else:
             if net_qty == 0:
                 entry_time = timestamp
+                open_fee = _ZERO
             total_cost = (abs(net_qty) * avg_entry_price) + (abs(signed_qty) * price)
             new_qty = abs(net_qty) + abs(signed_qty)
 
@@ -107,6 +125,7 @@ def _build_closed_trades(trade_history: List[Trade]) -> tuple[
                 avg_entry_price = total_cost / new_qty
 
             net_qty += signed_qty
+            open_fee += fee
 
         equity_curve.append(float(total_pnl))
 
