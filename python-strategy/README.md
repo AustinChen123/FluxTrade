@@ -13,6 +13,27 @@ The default input is `data/smc/BTCUSDT_5m.csv` when that local dataset exists.
 The script writes `report.md`, `trades.csv`, `equity_curve.csv`, and
 `journal.jsonl` under `backtest_output/golden_cross_btc/`.
 
+## Fast Research And Fitness Examples
+
+For parameter-search loops, use the fastest evaluation layer that preserves the
+semantics you need:
+
+- `BacktestRunner`: full replay with DB/audit/report output.
+- `ResearchBacktestRunner`: normal strategy code plus Rust fills, without
+  DB/audit/report overhead.
+- `GoldenCrossFastFitnessEvaluator`: numeric GoldenCross fitness only, for large
+  GoldenCross parameter sweeps.
+
+Run the GoldenCross numeric fitness demo:
+
+```bash
+uv run python examples/run_golden_cross_fast_fitness.py
+```
+
+Fast fitness is strategy-specific. Custom strategies keep using
+`ResearchBacktestRunner` until they provide a dedicated numeric evaluator with
+parity tests.
+
 ## Control Plane
 
 The control plane provides a backend-facing API layer for operational jobs.

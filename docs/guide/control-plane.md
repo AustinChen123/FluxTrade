@@ -163,13 +163,57 @@ Supported objectives:
 - `minimize_drawdown`
 
 The default standalone server does not wire a parameter-search evaluator yet,
-so this endpoint returns `503` until the process is constructed with one. The
-CSV-signal evaluator is useful when another process generates candidate signals
-from parameter packs and FluxTrade is responsible for durable evaluation,
-ranking, and job history. When the executor is constructed with a database
-session factory, completed searches also write an `evolution_epochs` row plus
-one `gene_records` challenger row per evaluated candidate; the job result
-includes `epoch_id`.
+so this endpoint returns `503` until the process is constructed with one.
+Built-in evaluator choices:
+
+| Evaluator | Best for | Notes |
+|-----------|----------|-------|
+| `CsvSignalBacktestParameterEvaluator` | external models or tools that already generate per-candidate signal CSVs | runs the full `BacktestRunner` pipeline |
+| `ResearchBacktestParameterEvaluator` | candidate screening with normal Python strategy code | uses `ResearchBacktestRunner`, skips DB/audit/report work, and can reuse preloaded candles |
+| `GoldenCrossResearchParameterEvaluator` | GoldenCross parameter search with strategy-code parity | creates `GoldenCrossStrategy` from `short_window`, `long_window`, and optional `quantity` |
+| `GoldenCrossFastFitnessParameterEvaluator` | large GoldenCross sweeps | uses the numeric fast fitness path; finalists should still be replayed through research/full backtests |
+
+The CSV-signal evaluator is useful when another process generates candidate
+signals from parameter packs and FluxTrade is responsible for durable
+evaluation, ranking, and job history. Research and fast-fitness evaluators are
+useful when FluxTrade owns the candidate strategy evaluation. When the executor
+is constructed with a database session factory, completed searches also write an
+`evolution_epochs` row plus one `gene_records` challenger row per evaluated
+candidate; the job result includes `epoch_id`.
+
+Example wiring for GoldenCross fast fitness:
+
+```python
+from src.control_plane import (
+    BacktestJobExecutor,
+    ControlPlaneApp,
+    GoldenCrossFastFitnessParameterEvaluator,
+    InMemoryJobStore,
+    ParameterSearchJobExecutor,
+)
+
+store = InMemoryJobStore()
+app = ControlPlaneApp(
+    BacktestJobExecutor(store=store),
+    parameter_search_executor=ParameterSearchJobExecutor(
+        GoldenCrossFastFitnessParameterEvaluator(),
+        store=store,
+    ),
+)
+```
+
+Candidate packs for the fast GoldenCross evaluator use:
+
+```json
+{
+  "candidate_id": "fast_20_80",
+  "param_pack": {
+    "short_window": 20,
+    "long_window": 80,
+    "quantity": "0.01"
+  }
+}
+```
 
 ## Promote A Gene
 

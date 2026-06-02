@@ -21,6 +21,7 @@ from src.control_plane.models import (
 )
 from src.core.data_sources.csv_source import CsvDataSource
 from src.core.data_sources.memory import MemoryDataSource
+from src.core.golden_cross_fast_fitness import GoldenCrossFastFitnessEvaluator
 from src.core.models import GeneRole
 from src.core.orm_models import EvolutionEpoch, GeneRecord
 from src.core.research_backtest_runner import ResearchBacktestRunner
@@ -175,6 +176,72 @@ class GoldenCrossResearchParameterEvaluator(ResearchBacktestParameterEvaluator):
 
     def __init__(self) -> None:
         super().__init__(_golden_cross_strategy_factory)
+
+
+class GoldenCrossFastFitnessParameterEvaluator:
+    """Evaluate GoldenCross candidates through the numeric fitness path."""
+
+    def __init__(self) -> None:
+        self._fitness_cache: dict[tuple, GoldenCrossFastFitnessEvaluator] = {}
+
+    def evaluate(
+        self,
+        request: ParameterSearchJobRequest,
+        candidate: ParameterCandidate,
+    ) -> ParameterEvaluationResult:
+        if request.backtest is None:
+            raise ValueError("backtest settings are required for fast fitness evaluation")
+
+        evaluator = self._evaluator_for(request)
+        result = evaluator.evaluate(
+            short_window=int(candidate.param_pack["short_window"]),
+            long_window=int(candidate.param_pack["long_window"]),
+            quantity=Decimal(str(candidate.param_pack.get("quantity", "0.01"))),
+        )
+        metrics = {
+            "total_pnl": result.total_pnl,
+            "max_drawdown": result.max_drawdown,
+            "total_trades": result.total_trades,
+            "raw_trade_count": result.raw_trade_count,
+            "win_rate": result.win_rate,
+            "profit_factor": result.profit_factor,
+            "gross_profit": result.gross_profit,
+            "gross_loss": result.gross_loss,
+            "fitness_mode": "golden_cross_fast",
+        }
+        return ParameterEvaluationResult(
+            candidate_id=candidate.candidate_id,
+            score_total=result.total_pnl,
+            max_drawdown=result.max_drawdown,
+            metrics=_json_safe(metrics),
+        )
+
+    def _evaluator_for(
+        self,
+        request: ParameterSearchJobRequest,
+    ) -> GoldenCrossFastFitnessEvaluator:
+        assert request.backtest is not None
+        cache_key = _candle_cache_key(request)
+        evaluator = self._fitness_cache.get(cache_key)
+        if evaluator is None:
+            data_source = CsvDataSource(
+                file_path=request.backtest.candles_csv_path,
+                product_id=request.product_id,
+                timeframe=request.timeframe,
+            )
+            df = data_source.get_candles_df(
+                request.product_id,
+                request.timeframe,
+                request.start_time,
+                request.end_time,
+            )
+            evaluator = GoldenCrossFastFitnessEvaluator.from_dataframe(
+                df,
+                initial_balance=request.backtest.initial_balance,
+                taker_fee=request.backtest.taker_fee,
+            )
+            self._fitness_cache[cache_key] = evaluator
+        return evaluator
 
 
 def _golden_cross_strategy_factory(

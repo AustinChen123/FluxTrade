@@ -15,6 +15,7 @@ from src.control_plane.models import (
 )
 from src.control_plane.parameter_search import (
     CsvSignalBacktestParameterEvaluator,
+    GoldenCrossFastFitnessParameterEvaluator,
     GoldenCrossResearchParameterEvaluator,
     ParameterSearchEvaluator,
     ParameterSearchJobExecutor,
@@ -30,6 +31,7 @@ __all__ = [
     "CsvSignalBacktestEvaluationConfig",
     "CsvSignalBacktestParameterEvaluator",
     "GeneControlService",
+    "GoldenCrossFastFitnessParameterEvaluator",
     "GoldenCrossResearchParameterEvaluator",
     "GenePromotionRequest",
     "HttpResponse",

@@ -13,6 +13,7 @@ from src.control_plane import (
     ControlPlaneApp,
     CsvSignalBacktestParameterEvaluator,
     GeneControlService,
+    GoldenCrossFastFitnessParameterEvaluator,
     GoldenCrossResearchParameterEvaluator,
     InMemoryJobStore,
     ParameterEvaluationResult,
@@ -1093,6 +1094,67 @@ def test_control_plane_runs_parameter_search_with_research_backtests(tmp_path):
     assert "raw_trades" not in evaluations[0]["metrics"]
     assert "closed_trades" not in evaluations[0]["metrics"]
     assert len(evaluator._candle_cache) == 1
+
+
+def test_control_plane_runs_parameter_search_with_fast_fitness(tmp_path):
+    candle_rows = _write_research_candles(tmp_path / "fast_fitness_candles.csv")
+    evaluator = GoldenCrossFastFitnessParameterEvaluator()
+    store = InMemoryJobStore()
+    app = ControlPlaneApp(
+        BacktestJobExecutor(store=store, run_inline=True),
+        parameter_search_executor=ParameterSearchJobExecutor(
+            evaluator,
+            store=store,
+            run_inline=True,
+        ),
+    )
+
+    response = app.handle(
+        "POST",
+        "/jobs/parameter-searches",
+        json.dumps(
+            {
+                "strategy_id": "golden_cross_fast_search",
+                "product_id": PRODUCT_ID,
+                "timeframe": TIMEFRAME,
+                "start_time": candle_rows[0][0],
+                "end_time": candle_rows[-1][0],
+                "backtest": {
+                    "candles_csv_path": str(tmp_path / "fast_fitness_candles.csv"),
+                    "initial_balance": "10000",
+                    "maker_fee": "0",
+                    "taker_fee": "0",
+                },
+                "candidates": [
+                    {
+                        "candidate_id": "active",
+                        "param_pack": {
+                            "short_window": 1,
+                            "long_window": 3,
+                            "quantity": "0.01",
+                        },
+                    },
+                    {
+                        "candidate_id": "slow",
+                        "param_pack": {
+                            "short_window": 1,
+                            "long_window": 6,
+                            "quantity": "0.01",
+                        },
+                    },
+                ],
+            }
+        ),
+    )
+
+    assert response.status_code == 200
+    job = response.body["job"]
+    assert job["status"] == JobStatus.SUCCEEDED.value
+    assert job["result"]["best_candidate"]["candidate_id"] == "slow"
+    evaluations = job["result"]["evaluations"]
+    assert evaluations[0]["metrics"]["fitness_mode"] == "golden_cross_fast"
+    assert evaluations[0]["metrics"]["raw_trade_count"] == 2
+    assert len(evaluator._fitness_cache) == 1
 
 
 class _FakeCommandRouter:
