@@ -209,13 +209,14 @@ The `BacktestRunner` converts these to `Decimal` internally and passes them to t
 
 ## Research And Fast Fitness Modes
 
-FluxTrade now has three backtest/evaluation levels. Use the slower levels for
+FluxTrade now has four backtest/evaluation levels. Use the slower levels for
 auditability and the faster levels for large parameter sweeps:
 
 | Mode | Use for | What it keeps | What it skips |
 |------|---------|---------------|---------------|
 | `BacktestRunner` | final reports, audited replays, regression checks | StrategyEngine, RiskManager, SignalAudit, SQLite trade logs, reports, Rust matcher | none |
 | `ResearchBacktestRunner` | candidate screening with normal strategy code | `strategy.on_candle()`, `Signal`, simulated orders, Rust matcher, fee-aware metrics | DB writes, audit rows, journal export, report files |
+| `FastBarReplayRunner` | live-compatible fast strategy loops | `PreparedStrategy.on_bar()`, source-agnostic `MarketTape`, Rust matcher, fee-aware metrics | Pydantic candle/signal/order objects, DB writes, audit rows, reports |
 | Fast fitness evaluators | large parameter searches for supported strategies | cached numeric arrays and strategy-specific fill rules | `Candlestick`, `Signal`, `Order`, adapter objects, advanced reports |
 
 ### ResearchBacktestRunner
@@ -264,6 +265,76 @@ print(result["total_pnl"], result["total_trades"])
 
 This mode is appropriate when you want strategy-code parity before running a
 smaller number of finalists through the full `BacktestRunner`.
+
+### FastBarReplayRunner
+
+`FastBarReplayRunner` is the Python-side fast path for strategies that opt in to
+a lightweight runtime. It still makes one decision per candle and still sends
+orders through the Rust matcher, but it passes a reusable `BarView` instead of
+constructing full `Candlestick` and `Signal` objects in the hot loop.
+
+The interface is intentionally flexible: custom strategies can implement their
+own Python calculations in `prepare_fast()` and return any object with
+`strategy_id` plus `on_bar(bar)`. The framework provides `RollingMean` and
+`SignalIntent` helpers, but strategy-specific indicator logic remains in Python.
+
+```python
+from decimal import Decimal
+from src.core.data_sources.csv_source import CsvDataSource
+from src.core.fast_bar import FastBarReplayRunner, MarketTape
+from src.strategies.golden_cross import GoldenCrossStrategy
+
+ds = CsvDataSource(
+    "data/btcusdt_5m.csv",
+    product_id="BINANCE:BTCUSDT-PERP",
+    timeframe="5m",
+)
+start_time, end_time = ds.get_available_range("BINANCE:BTCUSDT-PERP", "5m")
+
+tape = MarketTape.from_data_source(
+    ds,
+    product_id="BINANCE:BTCUSDT-PERP",
+    timeframe="5m",
+    start_time=start_time,
+    end_time=end_time,
+)
+
+runner = FastBarReplayRunner(
+    tape=tape,
+    strategy=GoldenCrossStrategy(
+        "golden_cross_fast_bar",
+        "BINANCE:BTCUSDT-PERP",
+        short_window=20,
+        long_window=80,
+        timeframe="5m",
+        quantity=Decimal("0.01"),
+    ).prepare_fast(),
+    initial_balance=Decimal("10000"),
+    maker_fee=Decimal("0.0002"),
+    taker_fee=Decimal("0.0006"),
+)
+
+result = runner.run()
+print(result["total_pnl"], result["total_trades"])
+```
+
+For live-style ingestion, build an empty tape and append candles as they arrive:
+
+```python
+from src.core.fast_bar import MarketTape
+
+tape = MarketTape.empty(
+    product_id="BINANCE:BTCUSDT-PERP",
+    timeframe="5m",
+    capacity=1_000,
+)
+tape.append_candle(candle)
+```
+
+`FastBarReplayRunner` is not automatic for arbitrary `on_candle()` strategies.
+Unsupported strategies should use `ResearchBacktestRunner` until they provide a
+`prepare_fast()` implementation and parity tests against the research or full
+replay path.
 
 ### GoldenCrossFastFitnessEvaluator
 

@@ -21,6 +21,9 @@ semantics you need:
 - `BacktestRunner`: full replay with DB/audit/report output.
 - `ResearchBacktestRunner`: normal strategy code plus Rust fills, without
   DB/audit/report overhead.
+- `FastBarReplayRunner`: opt-in Python fast-bar runtime. Strategies implement
+  `prepare_fast()` and custom `on_bar()` calculations while fills still go
+  through the Rust matcher.
 - `GoldenCrossFastFitnessEvaluator`: numeric GoldenCross fitness only, for large
   GoldenCross parameter sweeps.
 
@@ -30,8 +33,10 @@ Run the GoldenCross numeric fitness demo:
 uv run python examples/run_golden_cross_fast_fitness.py
 ```
 
-Fast fitness is strategy-specific. Custom strategies keep using
-`ResearchBacktestRunner` until they provide a dedicated numeric evaluator with
+Fast-bar execution is the live-compatible acceleration path for custom strategy
+logic. Fast fitness is strategy-specific and intended for coarse parameter
+screening; custom strategies keep using `ResearchBacktestRunner` or
+`FastBarReplayRunner` until they provide a dedicated numeric evaluator with
 parity tests.
 
 ## Control Plane

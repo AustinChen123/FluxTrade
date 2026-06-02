@@ -6,6 +6,7 @@ import pandas as pd
 
 from src.core.models import Candlestick, Signal, SignalType
 from src.strategies.base import BaseStrategy, StrategyRequirements
+from src.core.fast_bar import BarView, RollingMean, SignalIntent
 
 
 class GoldenCrossStrategy(BaseStrategy):
@@ -127,6 +128,15 @@ class GoldenCrossStrategy(BaseStrategy):
         }
         return self._signal(candle, signal_type, metadata=metadata)
 
+    def prepare_fast(self) -> "_PreparedGoldenCrossStrategy":
+        """Prepare a live-compatible fast-bar runtime for this strategy."""
+        return _PreparedGoldenCrossStrategy(
+            strategy_id=self.strategy_id,
+            short_window=self.short_window,
+            long_window=self.long_window,
+            quantity=self.quantity,
+        )
+
     def _signal(
         self,
         candle: Candlestick,
@@ -155,3 +165,48 @@ class GoldenCrossStrategy(BaseStrategy):
         self._long_sum += close
         if len(self._long_values) > self.long_window:
             self._long_sum -= self._long_values.popleft()
+
+
+class _PreparedGoldenCrossStrategy:
+    """Fast-bar runtime equivalent of GoldenCrossStrategy.on_candle()."""
+
+    def __init__(
+        self,
+        *,
+        strategy_id: str,
+        short_window: int,
+        long_window: int,
+        quantity: Decimal,
+    ) -> None:
+        self.strategy_id = strategy_id
+        self.short_window = short_window
+        self.long_window = long_window
+        self.quantity = quantity
+        self._short_mean = RollingMean(short_window)
+        self._long_mean = RollingMean(long_window)
+        self._in_position = False
+
+    def on_bar(self, bar: BarView) -> SignalIntent | None:
+        had_previous_long_window = self._long_mean.ready
+        prev_sma_short = self._short_mean.mean if had_previous_long_window else None
+        prev_sma_long = self._long_mean.mean if had_previous_long_window else None
+
+        self._short_mean.append(bar.close_value)
+        self._long_mean.append(bar.close_value)
+
+        if not had_previous_long_window:
+            return None
+
+        curr_sma_short = self._short_mean.mean
+        curr_sma_long = self._long_mean.mean
+
+        curr_bullish = curr_sma_short > curr_sma_long
+        prev_bullish = prev_sma_short > prev_sma_long
+
+        if curr_bullish and not prev_bullish and not self._in_position:
+            self._in_position = True
+            return SignalIntent(SignalType.LONG, quantity=self.quantity)
+        if not curr_bullish and prev_bullish and self._in_position:
+            self._in_position = False
+            return SignalIntent(SignalType.EXIT_LONG, quantity=self.quantity)
+        return None
