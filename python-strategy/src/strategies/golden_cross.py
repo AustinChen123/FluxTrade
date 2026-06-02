@@ -6,6 +6,7 @@ import pandas as pd
 
 from src.core.models import Candlestick, Signal, SignalType
 from src.strategies.base import BaseStrategy, StrategyRequirements
+from src.core.fast_bar import BarView, RollingMean, SignalIntent
 
 
 class GoldenCrossStrategy(BaseStrategy):
@@ -39,6 +40,10 @@ class GoldenCrossStrategy(BaseStrategy):
             raise ValueError("quantity must be positive")
 
         self.close_history: Deque[Decimal] = deque(maxlen=long_window + 1)
+        self._short_values: Deque[Decimal] = deque()
+        self._long_values: Deque[Decimal] = deque()
+        self._short_sum = Decimal("0")
+        self._long_sum = Decimal("0")
         self._in_position = False
 
     @property
@@ -83,18 +88,26 @@ class GoldenCrossStrategy(BaseStrategy):
         """
         Event-driven execution for Golden Cross.
         """
-        self.close_history.append(candle.close)
+        had_previous_long_window = len(self._long_values) == self.long_window
+        prev_sma_short = (
+            self._short_sum / Decimal(self.short_window)
+            if had_previous_long_window
+            else None
+        )
+        prev_sma_long = (
+            self._long_sum / Decimal(self.long_window)
+            if had_previous_long_window
+            else None
+        )
 
-        if len(self.close_history) <= self.long_window:
+        self.close_history.append(candle.close)
+        self._append_close(candle.close)
+
+        if not had_previous_long_window:
             return self._signal(candle, SignalType.NO_SIGNAL)
 
-        history = list(self.close_history)
-        curr_sma_short = _sma(history, self.short_window)
-        curr_sma_long = _sma(history, self.long_window)
-
-        prev_history_list = list(self.close_history)[:-1]
-        prev_sma_short = _sma(prev_history_list, self.short_window)
-        prev_sma_long = _sma(prev_history_list, self.long_window)
+        curr_sma_short = self._short_sum / Decimal(self.short_window)
+        curr_sma_long = self._long_sum / Decimal(self.long_window)
 
         curr_bullish = curr_sma_short > curr_sma_long
         prev_bullish = prev_sma_short > prev_sma_long
@@ -115,6 +128,15 @@ class GoldenCrossStrategy(BaseStrategy):
         }
         return self._signal(candle, signal_type, metadata=metadata)
 
+    def prepare_fast(self) -> "_PreparedGoldenCrossStrategy":
+        """Prepare a live-compatible fast-bar runtime for this strategy."""
+        return _PreparedGoldenCrossStrategy(
+            strategy_id=self.strategy_id,
+            short_window=self.short_window,
+            long_window=self.long_window,
+            quantity=self.quantity,
+        )
+
     def _signal(
         self,
         candle: Candlestick,
@@ -133,6 +155,58 @@ class GoldenCrossStrategy(BaseStrategy):
             metadata=metadata,
         )
 
+    def _append_close(self, close: Decimal) -> None:
+        self._short_values.append(close)
+        self._short_sum += close
+        if len(self._short_values) > self.short_window:
+            self._short_sum -= self._short_values.popleft()
 
-def _sma(values: list[Decimal], window: int) -> Decimal:
-    return sum(values[-window:]) / Decimal(window)
+        self._long_values.append(close)
+        self._long_sum += close
+        if len(self._long_values) > self.long_window:
+            self._long_sum -= self._long_values.popleft()
+
+
+class _PreparedGoldenCrossStrategy:
+    """Fast-bar runtime equivalent of GoldenCrossStrategy.on_candle()."""
+
+    def __init__(
+        self,
+        *,
+        strategy_id: str,
+        short_window: int,
+        long_window: int,
+        quantity: Decimal,
+    ) -> None:
+        self.strategy_id = strategy_id
+        self.short_window = short_window
+        self.long_window = long_window
+        self.quantity = quantity
+        self._short_mean = RollingMean(short_window)
+        self._long_mean = RollingMean(long_window)
+        self._in_position = False
+
+    def on_bar(self, bar: BarView) -> SignalIntent | None:
+        had_previous_long_window = self._long_mean.ready
+        prev_sma_short = self._short_mean.mean if had_previous_long_window else None
+        prev_sma_long = self._long_mean.mean if had_previous_long_window else None
+
+        self._short_mean.append(bar.close_value)
+        self._long_mean.append(bar.close_value)
+
+        if not had_previous_long_window:
+            return None
+
+        curr_sma_short = self._short_mean.mean
+        curr_sma_long = self._long_mean.mean
+
+        curr_bullish = curr_sma_short > curr_sma_long
+        prev_bullish = prev_sma_short > prev_sma_long
+
+        if curr_bullish and not prev_bullish and not self._in_position:
+            self._in_position = True
+            return SignalIntent(SignalType.LONG, quantity=self.quantity)
+        if not curr_bullish and prev_bullish and self._in_position:
+            self._in_position = False
+            return SignalIntent(SignalType.EXIT_LONG, quantity=self.quantity)
+        return None

@@ -15,8 +15,11 @@ from src.control_plane.models import (
 )
 from src.control_plane.parameter_search import (
     CsvSignalBacktestParameterEvaluator,
+    GoldenCrossFastFitnessParameterEvaluator,
+    GoldenCrossResearchParameterEvaluator,
     ParameterSearchEvaluator,
     ParameterSearchJobExecutor,
+    ResearchBacktestParameterEvaluator,
 )
 from src.control_plane.strategy_control import StrategyControlService
 from src.control_plane.strategy_state_query import StrategyStateQueryService
@@ -28,6 +31,8 @@ __all__ = [
     "CsvSignalBacktestEvaluationConfig",
     "CsvSignalBacktestParameterEvaluator",
     "GeneControlService",
+    "GoldenCrossFastFitnessParameterEvaluator",
+    "GoldenCrossResearchParameterEvaluator",
     "GenePromotionRequest",
     "HttpResponse",
     "InMemoryJobStore",
@@ -39,6 +44,7 @@ __all__ = [
     "ParameterSearchJobRequest",
     "ParameterSearchEvaluator",
     "ParameterSearchJobExecutor",
+    "ResearchBacktestParameterEvaluator",
     "SqliteJobStore",
     "StrategyControlService",
     "StrategyStateQueryService",

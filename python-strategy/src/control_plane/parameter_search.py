@@ -3,8 +3,9 @@ from __future__ import annotations
 from concurrent.futures import Future, ThreadPoolExecutor
 from datetime import UTC, datetime
 from decimal import Decimal
+from pathlib import Path
 from threading import Lock
-from typing import Any, Protocol
+from typing import Any, Callable, Protocol
 
 from sqlalchemy.orm import Session
 
@@ -18,8 +19,14 @@ from src.control_plane.models import (
     ParameterEvaluationResult,
     ParameterSearchJobRequest,
 )
+from src.core.data_sources.csv_source import CsvDataSource
+from src.core.data_sources.memory import MemoryDataSource
+from src.core.golden_cross_fast_fitness import GoldenCrossFastFitnessEvaluator
 from src.core.models import GeneRole
 from src.core.orm_models import EvolutionEpoch, GeneRecord
+from src.core.research_backtest_runner import ResearchBacktestRunner
+from src.strategies.base import BaseStrategy
+from src.strategies.golden_cross import GoldenCrossStrategy
 
 
 class ParameterSearchEvaluator(Protocol):
@@ -79,6 +86,199 @@ class CsvSignalBacktestParameterEvaluator:
             max_drawdown=max_drawdown,
             metrics=result,
         )
+
+
+ResearchStrategyFactory = Callable[[str, str, str, dict[str, Any]], BaseStrategy]
+
+
+class ResearchBacktestParameterEvaluator:
+    """Evaluate candidates with the in-memory research backtest runner."""
+
+    def __init__(
+        self,
+        strategy_factory: ResearchStrategyFactory,
+        *,
+        preload_candles: bool = True,
+    ) -> None:
+        self._strategy_factory = strategy_factory
+        self._preload_candles = preload_candles
+        self._candle_cache: dict[tuple, list] = {}
+
+    def evaluate(
+        self,
+        request: ParameterSearchJobRequest,
+        candidate: ParameterCandidate,
+    ) -> ParameterEvaluationResult:
+        if request.backtest is None:
+            raise ValueError("backtest settings are required for research evaluation")
+
+        data_source = self._data_source_for(request)
+        runner = ResearchBacktestRunner(
+            start_time=request.start_time,
+            end_time=request.end_time,
+            product_id=request.product_id,
+            timeframe=request.timeframe,
+            initial_balance=float(request.backtest.initial_balance),
+            data_source=data_source,
+            fee_config={
+                "maker": float(request.backtest.maker_fee),
+                "taker": float(request.backtest.taker_fee),
+            },
+        )
+        strategy = self._strategy_factory(
+            f"{request.strategy_id}_{candidate.candidate_id}",
+            request.product_id,
+            request.timeframe,
+            candidate.param_pack,
+        )
+        runner.add_strategy(strategy)
+
+        result = runner.run()
+        metrics = {
+            key: value
+            for key, value in result.items()
+            if key not in {"closed_trades", "raw_trades"}
+        }
+        return ParameterEvaluationResult(
+            candidate_id=candidate.candidate_id,
+            score_total=_result_decimal(result, "total_pnl"),
+            max_drawdown=_result_decimal(result, "max_drawdown"),
+            metrics=_json_safe(metrics),
+        )
+
+    def _data_source_for(self, request: ParameterSearchJobRequest):
+        assert request.backtest is not None
+        csv_source = CsvDataSource(
+            file_path=request.backtest.candles_csv_path,
+            product_id=request.product_id,
+            timeframe=request.timeframe,
+        )
+        if not self._preload_candles:
+            return csv_source
+
+        cache_key = _candle_cache_key(request)
+        candles = self._candle_cache.get(cache_key)
+        if candles is None:
+            candles = list(
+                csv_source.get_candles(
+                    request.product_id,
+                    request.timeframe,
+                    request.start_time,
+                    request.end_time,
+                )
+            )
+            self._candle_cache[cache_key] = candles
+        return MemoryDataSource(candles)
+
+
+class GoldenCrossResearchParameterEvaluator(ResearchBacktestParameterEvaluator):
+    """Research evaluator for GoldenCrossStrategy parameter packs."""
+
+    def __init__(self) -> None:
+        super().__init__(_golden_cross_strategy_factory)
+
+
+class GoldenCrossFastFitnessParameterEvaluator:
+    """Evaluate GoldenCross candidates through the numeric fitness path."""
+
+    def __init__(self) -> None:
+        self._fitness_cache: dict[tuple, GoldenCrossFastFitnessEvaluator] = {}
+
+    def evaluate(
+        self,
+        request: ParameterSearchJobRequest,
+        candidate: ParameterCandidate,
+    ) -> ParameterEvaluationResult:
+        if request.backtest is None:
+            raise ValueError("backtest settings are required for fast fitness evaluation")
+
+        evaluator = self._evaluator_for(request)
+        result = evaluator.evaluate(
+            short_window=int(candidate.param_pack["short_window"]),
+            long_window=int(candidate.param_pack["long_window"]),
+            quantity=Decimal(str(candidate.param_pack.get("quantity", "0.01"))),
+        )
+        metrics = {
+            "total_pnl": result.total_pnl,
+            "max_drawdown": result.max_drawdown,
+            "total_trades": result.total_trades,
+            "raw_trade_count": result.raw_trade_count,
+            "win_rate": result.win_rate,
+            "profit_factor": result.profit_factor,
+            "gross_profit": result.gross_profit,
+            "gross_loss": result.gross_loss,
+            "fitness_mode": "golden_cross_fast",
+        }
+        return ParameterEvaluationResult(
+            candidate_id=candidate.candidate_id,
+            score_total=result.total_pnl,
+            max_drawdown=result.max_drawdown,
+            metrics=_json_safe(metrics),
+        )
+
+    def _evaluator_for(
+        self,
+        request: ParameterSearchJobRequest,
+    ) -> GoldenCrossFastFitnessEvaluator:
+        assert request.backtest is not None
+        cache_key = _candle_cache_key(request)
+        evaluator = self._fitness_cache.get(cache_key)
+        if evaluator is None:
+            data_source = CsvDataSource(
+                file_path=request.backtest.candles_csv_path,
+                product_id=request.product_id,
+                timeframe=request.timeframe,
+            )
+            df = data_source.get_candles_df(
+                request.product_id,
+                request.timeframe,
+                request.start_time,
+                request.end_time,
+            )
+            evaluator = GoldenCrossFastFitnessEvaluator.from_dataframe(
+                df,
+                initial_balance=request.backtest.initial_balance,
+                taker_fee=request.backtest.taker_fee,
+            )
+            self._fitness_cache[cache_key] = evaluator
+        return evaluator
+
+
+def _golden_cross_strategy_factory(
+    strategy_id: str,
+    product_id: str,
+    timeframe: str,
+    param_pack: dict[str, Any],
+) -> BaseStrategy:
+    try:
+        short_window = int(param_pack["short_window"])
+        long_window = int(param_pack["long_window"])
+    except KeyError as exc:
+        raise ValueError("candidate param_pack requires short_window and long_window") from exc
+
+    return GoldenCrossStrategy(
+        strategy_id,
+        product_id,
+        short_window=short_window,
+        long_window=long_window,
+        timeframe=timeframe,
+        quantity=Decimal(str(param_pack.get("quantity", "0.01"))),
+    )
+
+
+def _candle_cache_key(request: ParameterSearchJobRequest) -> tuple:
+    assert request.backtest is not None
+    path = Path(request.backtest.candles_csv_path)
+    stat = path.stat()
+    return (
+        str(path.resolve()),
+        stat.st_mtime_ns,
+        stat.st_size,
+        request.product_id,
+        request.timeframe,
+        request.start_time,
+        request.end_time,
+    )
 
 
 class ParameterSearchJobExecutor:

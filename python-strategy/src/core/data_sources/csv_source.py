@@ -102,16 +102,16 @@ class CsvDataSource(IDataSource):
         df = self._load()
         mask = (df["timestamp"] >= start) & (df["timestamp"] <= end)
 
-        for _, row in df[mask].iterrows():
+        for row in df.loc[mask, ["timestamp", "open", "high", "low", "close", "volume"]].itertuples(index=False):
             yield Candlestick(
                 product_id=self._product_id,
                 timeframe=self._timeframe,
-                timestamp=int(row["timestamp"]),
-                open=Decimal(str(row["open"])),
-                high=Decimal(str(row["high"])),
-                low=Decimal(str(row["low"])),
-                close=Decimal(str(row["close"])),
-                volume=Decimal(str(row["volume"])),
+                timestamp=int(row.timestamp),
+                open=Decimal(str(row.open)),
+                high=Decimal(str(row.high)),
+                low=Decimal(str(row.low)),
+                close=Decimal(str(row.close)),
+                volume=Decimal(str(row.volume)),
             )
 
     def get_candles_df(

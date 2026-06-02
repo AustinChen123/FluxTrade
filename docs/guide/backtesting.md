@@ -207,6 +207,188 @@ The `BacktestRunner` converts these to `Decimal` internally and passes them to t
 
 ---
 
+## Research And Fast Fitness Modes
+
+FluxTrade now has four backtest/evaluation levels. Use the slower levels for
+auditability and the faster levels for large parameter sweeps:
+
+| Mode | Use for | What it keeps | What it skips |
+|------|---------|---------------|---------------|
+| `BacktestRunner` | final reports, audited replays, regression checks | StrategyEngine, RiskManager, SignalAudit, SQLite trade logs, reports, Rust matcher | none |
+| `ResearchBacktestRunner` | candidate screening with normal strategy code | `strategy.on_candle()`, `Signal`, simulated orders, Rust matcher, fee-aware metrics | DB writes, audit rows, journal export, report files |
+| `FastBarReplayRunner` | live-compatible fast strategy loops | `PreparedStrategy.on_bar()`, source-agnostic `MarketTape`, Rust matcher, fee-aware metrics | Pydantic candle/signal/order objects, DB writes, audit rows, reports |
+| Fast fitness evaluators | large parameter searches for supported strategies | cached numeric arrays and strategy-specific fill rules | `Candlestick`, `Signal`, `Order`, adapter objects, advanced reports |
+
+### ResearchBacktestRunner
+
+`ResearchBacktestRunner` is the safest acceleration path for custom strategies.
+It still calls your strategy's `on_candle()` method and still sends fills
+through the Rust matching engine, but it keeps trades in memory and omits report
+generation and persistence.
+
+```python
+from decimal import Decimal
+from src.core.data_sources.csv_source import CsvDataSource
+from src.core.research_backtest_runner import ResearchBacktestRunner
+from src.strategies.golden_cross import GoldenCrossStrategy
+
+ds = CsvDataSource(
+    "data/btcusdt_5m.csv",
+    product_id="BINANCE:BTCUSDT-PERP",
+    timeframe="5m",
+)
+start_time, end_time = ds.get_available_range("BINANCE:BTCUSDT-PERP", "5m")
+
+runner = ResearchBacktestRunner(
+    start_time=start_time,
+    end_time=end_time,
+    product_id="BINANCE:BTCUSDT-PERP",
+    timeframe="5m",
+    initial_balance=10000.0,
+    data_source=ds,
+    fee_config={"maker": 0.0002, "taker": 0.0006},
+)
+runner.add_strategy(
+    GoldenCrossStrategy(
+        "golden_cross_research",
+        "BINANCE:BTCUSDT-PERP",
+        short_window=20,
+        long_window=80,
+        timeframe="5m",
+        quantity=Decimal("0.01"),
+    )
+)
+
+result = runner.run()
+print(result["total_pnl"], result["total_trades"])
+```
+
+This mode is appropriate when you want strategy-code parity before running a
+smaller number of finalists through the full `BacktestRunner`.
+
+### FastBarReplayRunner
+
+`FastBarReplayRunner` is the Python-side fast path for strategies that opt in to
+a lightweight runtime. It still makes one decision per candle and still sends
+orders through the Rust matcher, but it passes a reusable `BarView` instead of
+constructing full `Candlestick` and `Signal` objects in the hot loop.
+
+The interface is intentionally flexible: custom strategies can implement their
+own Python calculations in `prepare_fast()` and return any object with
+`strategy_id` plus `on_bar(bar)`. The framework provides `RollingMean` and
+`SignalIntent` helpers, but strategy-specific indicator logic remains in Python.
+
+```python
+from decimal import Decimal
+from src.core.data_sources.csv_source import CsvDataSource
+from src.core.fast_bar import FastBarReplayRunner, MarketTape
+from src.strategies.golden_cross import GoldenCrossStrategy
+
+ds = CsvDataSource(
+    "data/btcusdt_5m.csv",
+    product_id="BINANCE:BTCUSDT-PERP",
+    timeframe="5m",
+)
+start_time, end_time = ds.get_available_range("BINANCE:BTCUSDT-PERP", "5m")
+
+tape = MarketTape.from_data_source(
+    ds,
+    product_id="BINANCE:BTCUSDT-PERP",
+    timeframe="5m",
+    start_time=start_time,
+    end_time=end_time,
+)
+
+runner = FastBarReplayRunner(
+    tape=tape,
+    strategy=GoldenCrossStrategy(
+        "golden_cross_fast_bar",
+        "BINANCE:BTCUSDT-PERP",
+        short_window=20,
+        long_window=80,
+        timeframe="5m",
+        quantity=Decimal("0.01"),
+    ).prepare_fast(),
+    initial_balance=Decimal("10000"),
+    maker_fee=Decimal("0.0002"),
+    taker_fee=Decimal("0.0006"),
+)
+
+result = runner.run()
+print(result["total_pnl"], result["total_trades"])
+```
+
+For live-style ingestion, build an empty tape and append candles as they arrive:
+
+```python
+from src.core.fast_bar import MarketTape
+
+tape = MarketTape.empty(
+    product_id="BINANCE:BTCUSDT-PERP",
+    timeframe="5m",
+    capacity=1_000,
+)
+tape.append_candle(candle)
+```
+
+`FastBarReplayRunner` is not automatic for arbitrary `on_candle()` strategies.
+Unsupported strategies should use `ResearchBacktestRunner` until they provide a
+`prepare_fast()` implementation and parity tests against the research or full
+replay path.
+
+### GoldenCrossFastFitnessEvaluator
+
+`GoldenCrossFastFitnessEvaluator` is a strategy-specific numeric path for
+GoldenCross parameter search. It loads the candle CSV as DataFrame/numeric
+arrays, calculates SMA crossovers with vectorized rolling means, and simulates
+only the current GoldenCross market `LONG` / `EXIT_LONG` behavior:
+
+- signal on candle `N`
+- market fill at candle `N + 1` open
+- taker fee deducted on each fill
+- realized PnL uses the same average-entry long-position behavior as the Rust
+  matcher for this strategy shape
+
+```python
+from decimal import Decimal
+from src.core.data_sources.csv_source import CsvDataSource
+from src.core.golden_cross_fast_fitness import GoldenCrossFastFitnessEvaluator
+
+ds = CsvDataSource(
+    "data/btcusdt_5m.csv",
+    product_id="BINANCE:BTCUSDT-PERP",
+    timeframe="5m",
+)
+start_time, end_time = ds.get_available_range("BINANCE:BTCUSDT-PERP", "5m")
+frame = ds.get_candles_df("BINANCE:BTCUSDT-PERP", "5m", start_time, end_time)
+
+evaluator = GoldenCrossFastFitnessEvaluator.from_dataframe(
+    frame,
+    initial_balance=Decimal("10000"),
+    taker_fee=Decimal("0.0006"),
+)
+
+result = evaluator.evaluate(
+    short_window=20,
+    long_window=80,
+    quantity=Decimal("0.01"),
+)
+print(result.total_pnl, result.total_trades, result.max_drawdown)
+```
+
+Run the demo:
+
+```bash
+cd python-strategy
+uv run python examples/run_golden_cross_fast_fitness.py
+```
+
+The fast fitness interface is not automatic for arbitrary strategies. A custom
+strategy can use it only after a dedicated numeric evaluator is implemented and
+covered by parity tests against `ResearchBacktestRunner` or `BacktestRunner`.
+
+---
+
 ## Report Configuration
 
 Control which output files are generated after the backtest:
