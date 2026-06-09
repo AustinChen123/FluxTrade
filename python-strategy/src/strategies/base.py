@@ -4,6 +4,7 @@ from typing import Optional
 import pandas as pd
 from src.core.models import Candlestick, Signal, Trade
 from src.core.journal import StrategyJournal
+from src.core.strategy_context import StrategyContext
 
 @dataclass
 class StrategyRequirements:
@@ -26,9 +27,12 @@ class BaseStrategy(ABC):
         pass
 
     @abstractmethod
-    def on_candle(self, candle: Candlestick) -> Signal:
+    def on_candle(self, candle: Candlestick, context: StrategyContext | None = None) -> Signal:
         """
         Process a new candlestick and optionally return a trading signal.
+
+        The long-term event-driven contract is candle + read-only decision
+        context. Existing strategies may ignore context during migration.
         """
         pass
 

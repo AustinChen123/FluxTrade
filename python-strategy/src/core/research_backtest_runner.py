@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import logging
 import uuid
+import inspect
 from dataclasses import dataclass
 from decimal import Decimal
 from typing import Dict, Iterable, Optional
@@ -22,6 +23,7 @@ from src.core.db import SessionLocal
 from src.core.interfaces.data_source import IDataSource
 from src.core.models import Candlestick, OrderSide, Signal, SignalType
 from src.core.orm_models import Order
+from src.core.strategy_context import StrategyContext
 from src.strategies.base import BaseStrategy
 
 logger = logging.getLogger(__name__)
@@ -90,6 +92,10 @@ class ResearchBacktestRunner:
         )
         trades: list[ResearchTrade] = []
         stop_threshold = self._stop_threshold()
+        context_support = {
+            strategy.strategy_id: _strategy_accepts_context(strategy)
+            for strategy in self._strategies
+        }
 
         candle_count = 0
         for candle in self._iter_candles():
@@ -103,7 +109,17 @@ class ResearchBacktestRunner:
                     continue
                 if strategy.requirements.timeframe != candle.timeframe:
                     continue
-                signals = self._signals_from_strategy(strategy, candle)
+                context = None
+                if context_support[strategy.strategy_id]:
+                    context = adapter.get_strategy_context(
+                        strategy_id=strategy.strategy_id,
+                        product_id=candle.product_id,
+                        timestamp=candle.timestamp,
+                        initial_balance=Decimal(str(self.initial_balance)),
+                        mark_price=candle.close,
+                        latest_fills=fills,
+                    )
+                signals = self._signals_from_strategy(strategy, candle, context)
                 for signal in signals:
                     order = self._order_from_signal(signal, candle)
                     if order is not None:
@@ -175,8 +191,12 @@ class ResearchBacktestRunner:
         self,
         strategy: BaseStrategy,
         candle: Candlestick,
+        context: StrategyContext | None = None,
     ) -> list[Signal]:
-        result = strategy.on_candle(candle)
+        if context is not None:
+            result = strategy.on_candle(candle, context)
+        else:
+            result = strategy.on_candle(candle)
         if result is None:
             return []
         if isinstance(result, Signal):
@@ -256,3 +276,19 @@ class ResearchBacktestRunner:
         if signal_type == SignalType.EXIT_SHORT:
             return OrderSide.BUY
         return None
+
+
+def _strategy_accepts_context(strategy: BaseStrategy) -> bool:
+    signature = inspect.signature(strategy.on_candle)
+    parameters = list(signature.parameters.values())
+    if any(parameter.kind == inspect.Parameter.VAR_KEYWORD for parameter in parameters):
+        return True
+    if "context" in signature.parameters:
+        return True
+    positional = [
+        parameter
+        for parameter in parameters
+        if parameter.kind
+        in (inspect.Parameter.POSITIONAL_ONLY, inspect.Parameter.POSITIONAL_OR_KEYWORD)
+    ]
+    return len(positional) >= 2

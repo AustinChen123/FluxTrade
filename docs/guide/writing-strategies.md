@@ -20,6 +20,7 @@ The system handles everything else: order placement, SL/TP/Trailing Stop managem
 
 ```python
 # python-strategy/src/strategies/base.py
+from src.core.strategy_context import StrategyContext
 
 class BaseStrategy(ABC):
     def __init__(self, strategy_id: str, product_id: str):
@@ -34,7 +35,7 @@ class BaseStrategy(ABC):
         pass
 
     @abstractmethod
-    def on_candle(self, candle: Candlestick) -> Signal:
+    def on_candle(self, candle: Candlestick, context: StrategyContext | None = None) -> Signal:
         """Process a new candlestick and return a trading signal."""
         pass
 
@@ -53,7 +54,7 @@ Every strategy must implement two things:
 | Member | Purpose |
 |--------|---------|
 | `requirements` (property) | Tells the engine what data to feed the strategy |
-| `on_candle(candle)` | Called once per bar; returns a `Signal` |
+| `on_candle(candle, context=None)` | Called once per bar; returns a `Signal` |
 | `on_trade(trade)` | Optional: called on tick-level trade data; returns a `Signal` or `None` |
 | `run_vectorized(df)` | Optional: vectorized execution using a Pandas DataFrame (see below) |
 
@@ -75,6 +76,18 @@ The `lookback_window` tells the engine how many bars the strategy needs to accum
 
 !!! tip "Timeframe Channel Isolation"
     The engine only delivers candles matching the strategy's declared `timeframe`. If your strategy declares `"15m"`, it will never see 1h or 4h candles. This isolation is enforced at the Redis stream level.
+
+## Decision Context
+
+`context` is a read-only decision snapshot built after existing orders are
+matched and account state is updated for the current candle. Context-aware
+strategies can inspect balance, position, latest fills, open orders, and risk
+state before emitting a signal.
+
+Existing strategies may ignore `context` during migration. Strategies whose
+decisions depend on capital state, such as DCA or dynamic sizing strategies,
+should use the context-aware signature so backtests and live trading follow the
+same event sequence.
 
 ---
 
@@ -165,7 +178,7 @@ class SmaCrossStrategy(BaseStrategy):
         window = data[-period:]
         return sum(window) / Decimal(str(period))
 
-    def on_candle(self, candle: Candlestick) -> Signal:
+    def on_candle(self, candle: Candlestick, context=None) -> Signal:
         self._closes.append(candle.close)
 
         # Not enough data yet

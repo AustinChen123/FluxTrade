@@ -4,7 +4,15 @@ from decimal import Decimal
 from typing import Optional, List, Dict
 from src.core.interfaces.exchange import ExchangeOrderSnapshot, IExchangeAdapter
 from src.core.orm_models import Order
-from src.core.models import Position, Candlestick, PositionSide
+from src.core.models import OrderSide, Position, Candlestick, PositionSide
+from src.core.strategy_context import (
+    FillSnapshot,
+    OrderSnapshot,
+    PositionSnapshot,
+    RejectionSnapshot,
+    RiskSnapshot,
+    StrategyContext,
+)
 
 # Rust PyO3 matching engine
 from fluxtrade_core import (
@@ -125,6 +133,65 @@ class SimulatedAdapter(IExchangeAdapter):
             unrealized_pnl=Decimal(rust_pos.unrealized_pnl),
         )
 
+    def get_open_orders(
+        self,
+        product_id: Optional[str] = None,
+        strategy_id: Optional[str] = None,
+    ) -> List[Order]:
+        """Return open ORM orders known to the simulated adapter."""
+        orders = list(self._order_map.values())
+        if product_id is not None:
+            orders = [order for order in orders if order.product_id == product_id]
+        if strategy_id is not None:
+            orders = [order for order in orders if order.strategy_id == strategy_id]
+        return orders
+
+    def get_strategy_context(
+        self,
+        *,
+        strategy_id: str,
+        product_id: str,
+        timestamp: int,
+        initial_balance: Decimal,
+        mark_price: Optional[Decimal] = None,
+        peak_equity: Optional[Decimal] = None,
+        max_drawdown: Decimal = Decimal("0"),
+        latest_fills: Optional[List[Dict]] = None,
+        latest_rejections: tuple[RejectionSnapshot, ...] = (),
+        risk: RiskSnapshot = RiskSnapshot(),
+    ) -> StrategyContext:
+        """Build a read-only decision context from matcher-backed state."""
+        cash = self.get_balance()
+        position = self.get_position(product_id, strategy_id=strategy_id)
+        position_snapshot = _position_snapshot(position, mark_price) if position else None
+        unrealized_pnl = position_snapshot.unrealized_pnl if position_snapshot else Decimal("0")
+        total_equity = cash + unrealized_pnl
+        realized_pnl = total_equity - Decimal(str(initial_balance))
+        if peak_equity is None or peak_equity <= 0:
+            current_drawdown = Decimal("0")
+        else:
+            current_drawdown = total_equity - peak_equity
+
+        return StrategyContext(
+            strategy_id=strategy_id,
+            product_id=product_id,
+            timestamp=timestamp,
+            available_cash=cash,
+            total_equity=total_equity,
+            realized_pnl=realized_pnl,
+            unrealized_pnl=unrealized_pnl,
+            current_drawdown=current_drawdown,
+            max_drawdown=max_drawdown,
+            position=position_snapshot,
+            open_orders=tuple(_order_snapshot(order) for order in self.get_open_orders(product_id, strategy_id)),
+            latest_fills=tuple(
+                _fill_snapshot(fill, timestamp) for fill in latest_fills or []
+                if fill.get("order") is not None
+            ),
+            latest_rejections=latest_rejections,
+            risk=risk,
+        )
+
     # ── Backtest simulation hook ─────────────────────────────────
 
     def on_market_data(self, candle: Candlestick) -> List[Dict]:
@@ -230,3 +297,46 @@ class SimulatedAdapter(IExchangeAdapter):
             close=str(candle.close),
             volume=str(candle.volume),
         )
+
+
+def _position_snapshot(
+    position: Position,
+    mark_price: Optional[Decimal],
+) -> PositionSnapshot:
+    notional = None
+    if mark_price is not None:
+        notional = position.quantity * mark_price
+    return PositionSnapshot(
+        side=position.side,
+        quantity=position.quantity,
+        average_entry_price=position.entry_price,
+        mark_price=mark_price,
+        notional=notional,
+        unrealized_pnl=position.unrealized_pnl,
+    )
+
+
+def _order_snapshot(order: Order) -> OrderSnapshot:
+    return OrderSnapshot(
+        id=order.id,
+        product_id=order.product_id,
+        side=OrderSide(order.side),
+        order_type=order.type,
+        quantity=Decimal(order.quantity),
+        timestamp=order.timestamp,
+        price=Decimal(order.price) if order.price is not None else None,
+        status=order.status,
+    )
+
+
+def _fill_snapshot(fill: Dict, timestamp: int) -> FillSnapshot:
+    order = fill["order"]
+    return FillSnapshot(
+        order_id=order.id,
+        product_id=order.product_id,
+        side=OrderSide(order.side),
+        price=fill["price"],
+        quantity=fill["quantity"],
+        fee=fill.get("fee") or Decimal("0"),
+        timestamp=timestamp,
+    )
