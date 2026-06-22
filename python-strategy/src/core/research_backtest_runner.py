@@ -13,7 +13,7 @@ import uuid
 import inspect
 from dataclasses import dataclass
 from decimal import Decimal
-from typing import Dict, Iterable, Optional
+from typing import Any, Dict, Iterable, Optional, Sequence
 
 from src.core.adapters.simulated import SimulatedAdapter
 from src.core.analytics import calculate_metrics
@@ -23,6 +23,7 @@ from src.core.db import SessionLocal
 from src.core.interfaces.data_source import IDataSource
 from src.core.models import Candlestick, OrderSide, Signal, SignalType
 from src.core.orm_models import Order
+from src.core.precision import PrecisionCodec
 from src.core.strategy_context import StrategyContext
 from src.strategies.base import BaseStrategy
 
@@ -64,6 +65,8 @@ class ResearchBacktestRunner:
         fee_config: Optional[Dict[str, float]] = None,
         max_drawdown_limit: Optional[float] = None,
         balance_check_interval: int = 0,
+        precision_codec: PrecisionCodec | None = None,
+        prepared_scaled_candles: Sequence[Any] | None = None,
     ):
         self.start_time = start_time
         self.end_time = end_time
@@ -74,6 +77,8 @@ class ResearchBacktestRunner:
         self.fee_config = fee_config or {}
         self.max_drawdown_limit = max_drawdown_limit
         self.balance_check_interval = balance_check_interval
+        self.precision_codec = precision_codec
+        self.prepared_scaled_candles = prepared_scaled_candles
         self.clock = BacktestClock(start_time=start_time / 1000)
         self._strategies: list[BaseStrategy] = []
 
@@ -89,6 +94,7 @@ class ResearchBacktestRunner:
             initial_balance=Decimal(str(self.initial_balance)),
             maker_fee=Decimal(str(self.fee_config.get("maker", 0))),
             taker_fee=Decimal(str(self.fee_config.get("taker", 0))),
+            precision_codec=self.precision_codec,
         )
         trades: list[ResearchTrade] = []
         stop_threshold = self._stop_threshold()
@@ -98,10 +104,13 @@ class ResearchBacktestRunner:
         }
 
         candle_count = 0
-        for candle in self._iter_candles():
+        for candle, prepared_candle in self._iter_replay_candles(adapter):
             self.clock.set_time(candle.timestamp / 1000)
 
-            fills = adapter.on_market_data(candle)
+            if prepared_candle is None:
+                fills = adapter.on_market_data(candle)
+            else:
+                fills = adapter.on_prepared_market_data(prepared_candle)
             trades.extend(self._fills_to_trades(fills, candle))
 
             for strategy in self._strategies:
@@ -181,6 +190,40 @@ class ResearchBacktestRunner:
                 session.close()
 
         return generator()
+
+    def _iter_replay_candles(self, adapter: SimulatedAdapter):
+        candles = self._iter_candles()
+        if self.precision_codec is None:
+            for candle in candles:
+                yield candle, None
+            return
+
+        rows = list(candles)
+        prepared = self.prepared_scaled_candles
+        if prepared is None:
+            prepared = [adapter.prepare_scaled_candle(candle) for candle in rows]
+        if len(prepared) != len(rows):
+            raise ValueError("prepared_scaled_candles length must match replay candles")
+        for candle, prepared_candle in zip(rows, prepared):
+            self._validate_prepared_scaled_candle(candle, prepared_candle)
+            yield candle, prepared_candle
+
+    @staticmethod
+    def prepare_scaled_candles(
+        candles: Iterable[Candlestick],
+        precision_codec: PrecisionCodec,
+    ) -> list[Any]:
+        adapter = SimulatedAdapter(precision_codec=precision_codec)
+        return [adapter.prepare_scaled_candle(candle) for candle in candles]
+
+    @staticmethod
+    def _validate_prepared_scaled_candle(candle: Candlestick, prepared_candle: Any) -> None:
+        if getattr(prepared_candle, "product_id", None) != candle.product_id:
+            raise ValueError("prepared_scaled_candles product_id must match replay candles")
+        if getattr(prepared_candle, "timeframe", None) != candle.timeframe:
+            raise ValueError("prepared_scaled_candles timeframe must match replay candles")
+        if getattr(prepared_candle, "timestamp", None) != candle.timestamp:
+            raise ValueError("prepared_scaled_candles timestamp must match replay candles")
 
     def _stop_threshold(self) -> Optional[Decimal]:
         if self.max_drawdown_limit is None:
