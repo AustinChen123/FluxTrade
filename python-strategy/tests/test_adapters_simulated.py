@@ -14,8 +14,11 @@ Covers:
 
 from decimal import Decimal
 
+import pytest
+
 from src.core.adapters.simulated import SimulatedAdapter
 from src.core.models import Candlestick
+from src.core.precision import PrecisionCodec, PrecisionSpec
 
 
 # ── helpers ──────────────────────────────────────────────────────
@@ -91,6 +94,91 @@ class TestMarketOrders:
 
         fills = adapter.on_market_data(_candle(200, 50000, 50500, 49500, 50200))
         assert fills[0]["order"].id == order.id
+
+    def test_scaled_boundary_matches_decimal_boundary_for_market_fill(self, order_factory):
+        fluxtrade_core = pytest.importorskip("fluxtrade_core")
+        if not hasattr(fluxtrade_core.PyMatchingEngine, "on_scaled_candle"):
+            pytest.skip("compiled Rust engine does not support scaled candle matching")
+
+        codec = PrecisionCodec(
+            PrecisionSpec(
+                price_tick=Decimal("0.01"),
+                quantity_step=Decimal("0.001"),
+            )
+        )
+        decimal_adapter = SimulatedAdapter(Decimal("10000"), taker_fee=Decimal("0.0006"))
+        scaled_adapter = SimulatedAdapter(
+            Decimal("10000"),
+            taker_fee=Decimal("0.0006"),
+            precision_codec=codec,
+        )
+        decimal_order = order_factory(
+            order_type="market",
+            side="buy",
+            product_id=PRODUCT,
+            quantity=Decimal("0.1"),
+        )
+        scaled_order = order_factory(
+            order_type="market",
+            side="buy",
+            product_id=PRODUCT,
+            quantity=Decimal("0.1"),
+        )
+        scaled_order.id = decimal_order.id
+        decimal_adapter.place_order(decimal_order)
+        scaled_adapter.place_order(scaled_order)
+
+        candle = _candle(200, "50000.12", "50500.12", "49500.12", "50200.12", "100.123")
+        decimal_fills = decimal_adapter.on_market_data(candle)
+        scaled_fills = scaled_adapter.on_market_data(candle)
+
+        assert len(scaled_fills) == len(decimal_fills) == 1
+        assert scaled_fills[0]["price"] == decimal_fills[0]["price"]
+        assert scaled_fills[0]["fee"] == decimal_fills[0]["fee"]
+        assert scaled_adapter.get_balance() == decimal_adapter.get_balance()
+
+    def test_prepared_scaled_candle_matches_decimal_boundary_for_market_fill(self, order_factory):
+        fluxtrade_core = pytest.importorskip("fluxtrade_core")
+        if not hasattr(fluxtrade_core.PyMatchingEngine, "on_scaled_candle"):
+            pytest.skip("compiled Rust engine does not support scaled candle matching")
+
+        codec = PrecisionCodec(
+            PrecisionSpec(
+                price_tick=Decimal("0.01"),
+                quantity_step=Decimal("0.001"),
+            )
+        )
+        decimal_adapter = SimulatedAdapter(Decimal("10000"), taker_fee=Decimal("0.0006"))
+        scaled_adapter = SimulatedAdapter(
+            Decimal("10000"),
+            taker_fee=Decimal("0.0006"),
+            precision_codec=codec,
+        )
+        decimal_order = order_factory(
+            order_type="market",
+            side="buy",
+            product_id=PRODUCT,
+            quantity=Decimal("0.1"),
+        )
+        scaled_order = order_factory(
+            order_type="market",
+            side="buy",
+            product_id=PRODUCT,
+            quantity=Decimal("0.1"),
+        )
+        scaled_order.id = decimal_order.id
+        decimal_adapter.place_order(decimal_order)
+        scaled_adapter.place_order(scaled_order)
+
+        candle = _candle(200, "50000.12", "50500.12", "49500.12", "50200.12", "100.123")
+        prepared = scaled_adapter.prepare_scaled_candle(candle)
+        decimal_fills = decimal_adapter.on_market_data(candle)
+        scaled_fills = scaled_adapter.on_prepared_market_data(prepared)
+
+        assert len(scaled_fills) == len(decimal_fills) == 1
+        assert scaled_fills[0]["price"] == decimal_fills[0]["price"]
+        assert scaled_fills[0]["fee"] == decimal_fills[0]["fee"]
+        assert scaled_adapter.get_balance() == decimal_adapter.get_balance()
 
 
 # =================================================================

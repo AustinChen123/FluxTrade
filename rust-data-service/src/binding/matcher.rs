@@ -4,6 +4,7 @@ use std::collections::HashMap;
 use std::str::FromStr;
 
 use crate::binding::models::{Candlestick, FillEvent, Order, Position};
+use crate::binding::scaled::ScaledCandlestick;
 
 #[pyclass]
 pub struct PyMatchingEngine {
@@ -14,6 +15,8 @@ pub struct PyMatchingEngine {
     pub open_orders: Vec<Order>,
     maker_fee: Decimal,
     taker_fee: Decimal,
+    scaled_price_tick: Option<Decimal>,
+    scaled_volume_step: Option<Decimal>,
 }
 
 #[pymethods]
@@ -27,6 +30,8 @@ impl PyMatchingEngine {
             open_orders: Vec::new(),
             maker_fee: parse_decimal(&maker_fee, "maker_fee")?,
             taker_fee: parse_decimal(&taker_fee, "taker_fee")?,
+            scaled_price_tick: None,
+            scaled_volume_step: None,
         })
     }
 
@@ -53,6 +58,47 @@ impl PyMatchingEngine {
 
     fn on_candle(&mut self, candle: Candlestick) -> PyResult<Vec<FillEvent>> {
         self.process_candle_logic(candle)
+    }
+
+    fn set_scaled_precision(&mut self, price_tick: String, volume_step: String) -> PyResult<()> {
+        let parsed_price_tick = parse_decimal(&price_tick, "price_tick")?;
+        let parsed_volume_step = parse_decimal(&volume_step, "volume_step")?;
+        if parsed_price_tick <= Decimal::ZERO {
+            return Err(pyo3::exceptions::PyValueError::new_err(
+                "price_tick must be positive",
+            ));
+        }
+        if parsed_volume_step <= Decimal::ZERO {
+            return Err(pyo3::exceptions::PyValueError::new_err(
+                "volume_step must be positive",
+            ));
+        }
+        self.scaled_price_tick = Some(parsed_price_tick);
+        self.scaled_volume_step = Some(parsed_volume_step);
+        Ok(())
+    }
+
+    fn on_scaled_candle(&mut self, candle: ScaledCandlestick) -> PyResult<Vec<FillEvent>> {
+        let price_tick = self.scaled_price_tick.ok_or_else(|| {
+            pyo3::exceptions::PyRuntimeError::new_err(
+                "scaled precision is not configured; call set_scaled_precision() first",
+            )
+        })?;
+        let volume_step = self.scaled_volume_step.ok_or_else(|| {
+            pyo3::exceptions::PyRuntimeError::new_err(
+                "scaled precision is not configured; call set_scaled_precision() first",
+            )
+        })?;
+        self.process_candle_logic(Candlestick {
+            product_id: candle.product_id,
+            timeframe: candle.timeframe,
+            timestamp: candle.timestamp,
+            open: Decimal::from(candle.open_units) * price_tick,
+            high: Decimal::from(candle.high_units) * price_tick,
+            low: Decimal::from(candle.low_units) * price_tick,
+            close: Decimal::from(candle.close_units) * price_tick,
+            volume: Decimal::from(candle.volume_units) * volume_step,
+        })
     }
 
     fn on_matching_tick(&mut self, candle: Candlestick) -> PyResult<Vec<FillEvent>> {
@@ -406,6 +452,8 @@ mod tests {
             open_orders: Vec::new(),
             maker_fee: dec!(0.0002),
             taker_fee: dec!(0.0006),
+            scaled_price_tick: None,
+            scaled_volume_step: None,
         }
     }
 
@@ -477,6 +525,46 @@ mod tests {
         assert_eq!(pos.quantity, dec!(1));
         assert_eq!(pos.entry_price, dec!(50000));
         assert_eq!(pos.strategy_id, STRATEGY);
+    }
+
+    #[test]
+    fn test_scaled_candle_market_order_matches_decimal_candle() {
+        let mut decimal_engine = make_engine(dec!(100000));
+        decimal_engine
+            .open_orders
+            .push(make_order("m1", "LONG", "MARKET", Decimal::ZERO, dec!(1)));
+        let decimal_fills = decimal_engine
+            .process_candle_logic(make_candle(
+                dec!(50000),
+                dec!(51000),
+                dec!(49000),
+                dec!(50500),
+            ))
+            .unwrap();
+
+        let mut scaled_engine = make_engine(dec!(100000));
+        scaled_engine
+            .open_orders
+            .push(make_order("m1", "LONG", "MARKET", Decimal::ZERO, dec!(1)));
+        scaled_engine.scaled_price_tick = Some(dec!(0.01));
+        scaled_engine.scaled_volume_step = Some(dec!(0.001));
+        let scaled_fills = scaled_engine
+            .on_scaled_candle(ScaledCandlestick {
+                product_id: PRODUCT.to_string(),
+                timeframe: TF.to_string(),
+                timestamp: 1000,
+                open_units: 5_000_000,
+                high_units: 5_100_000,
+                low_units: 4_900_000,
+                close_units: 5_050_000,
+                volume_units: 100_000,
+            })
+            .unwrap();
+
+        assert_eq!(scaled_fills.len(), decimal_fills.len());
+        assert_eq!(scaled_fills[0].price, decimal_fills[0].price);
+        assert_eq!(scaled_fills[0].fee, decimal_fills[0].fee);
+        assert_eq!(scaled_engine.balance, decimal_engine.balance);
     }
 
     #[test]
@@ -1008,6 +1096,8 @@ mod tests {
             open_orders: Vec::new(),
             maker_fee: Decimal::ZERO,
             taker_fee: Decimal::ZERO,
+            scaled_price_tick: None,
+            scaled_volume_step: None,
         };
         engine
             .open_orders
