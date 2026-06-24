@@ -5,7 +5,7 @@ from datetime import UTC, datetime
 from decimal import Decimal
 from pathlib import Path
 from threading import Lock
-from typing import Any, Callable, Protocol
+from typing import Any, Callable, Iterable, Protocol
 
 from sqlalchemy.orm import Session
 
@@ -440,7 +440,10 @@ def _select_best_candidate(
     if request.objective == "minimize_drawdown":
         return min(
             evaluations,
-            key=lambda result: (result.max_drawdown, -_decimal_key(result.score_total)),
+            key=lambda result: (
+                _drawdown_risk_key(result.max_drawdown),
+                -_decimal_key(result.score_total),
+            ),
         )
     raise ValueError(f"unsupported objective: {request.objective}")
 
@@ -465,7 +468,7 @@ def _evaluate_candidate_across_datasets(
     return ParameterEvaluationResult(
         candidate_id=candidate.candidate_id,
         score_total=sum(dataset_scores.values(), Decimal("0")),
-        max_drawdown=min(dataset_drawdowns.values(), default=Decimal("0")),
+        max_drawdown=_worst_drawdown(dataset_drawdowns.values()),
         metrics=_json_safe(
             {
                 "evaluation_mode": "evaluation_set",
@@ -476,6 +479,14 @@ def _evaluate_candidate_across_datasets(
             }
         ),
     )
+
+
+def _worst_drawdown(drawdowns: Iterable[Decimal]) -> Decimal:
+    return max(drawdowns, key=_drawdown_risk_key, default=Decimal("0"))
+
+
+def _drawdown_risk_key(drawdown: Decimal) -> Decimal:
+    return abs(drawdown)
 
 
 def _request_for_evaluation_dataset(

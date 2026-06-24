@@ -27,6 +27,8 @@ class _NoopEvaluator:
         else:
             score += Decimal("2")
             drawdown = Decimal("-5")
+        if "drawdown" in candidate.param_pack:
+            drawdown = Decimal(str(candidate.param_pack["drawdown"]))
         return ParameterEvaluationResult(
             candidate_id=candidate.candidate_id,
             score_total=score,
@@ -36,6 +38,18 @@ class _NoopEvaluator:
                 "timeframe": request.timeframe,
                 "start_time": request.start_time,
             },
+        )
+
+
+class _DrawdownEvaluator:
+    def evaluate(self, request, candidate):
+        drawdowns = candidate.param_pack["drawdowns_by_start_time"]
+        drawdown = Decimal(str(drawdowns[str(request.start_time)]))
+        return ParameterEvaluationResult(
+            candidate_id=candidate.candidate_id,
+            score_total=Decimal(str(candidate.param_pack.get("score", "0"))),
+            max_drawdown=drawdown,
+            metrics={"max_drawdown": drawdown},
         )
 
 
@@ -276,6 +290,81 @@ def test_parameter_search_aggregates_candidate_across_evaluation_set():
         "trend": "2",
         "chop": "3",
     }
+
+
+def test_parameter_search_uses_worst_positive_drawdown_across_evaluation_set():
+    payload = _base_search_request()
+    payload["backtest"] = {
+        "candles_csv_path": "data/BTCUSDT_5m.csv",
+    }
+    payload["candidates"] = [
+        {
+            "candidate_id": "risk_positive",
+            "param_pack": {
+                "score": 1,
+                "drawdowns_by_start_time": {"10": "0.02", "20": "0.30"},
+            },
+        },
+    ]
+    payload["evaluation_set"] = {
+        "datasets": [
+            {
+                "dataset_id": "trend",
+                "product_id": PRODUCT_ID,
+                "timeframe": "5m",
+                "start_time": 10,
+                "end_time": 20,
+            },
+            {
+                "dataset_id": "selloff",
+                "product_id": PRODUCT_ID,
+                "timeframe": "5m",
+                "start_time": 20,
+                "end_time": 30,
+            },
+        ],
+    }
+    request = ParameterSearchJobRequest.model_validate(payload)
+    executor = ParameterSearchJobExecutor(
+        evaluator=_DrawdownEvaluator(),
+        run_inline=True,
+    )
+
+    job = executor.submit_search(request)
+
+    assert job.status.value == "SUCCEEDED"
+    assert job.result is not None
+    assert job.result["best_candidate"]["max_drawdown"] == "0.30"
+    assert job.result["evaluations"][0]["metrics"]["dataset_drawdowns"] == {
+        "trend": "0.02",
+        "selloff": "0.30",
+    }
+
+
+def test_parameter_search_minimizes_drawdown_magnitude_for_negative_values():
+    payload = _base_search_request()
+    payload["objective"] = "minimize_drawdown"
+    payload["candidates"] = [
+        {
+            "candidate_id": "small_loss",
+            "param_pack": {"score": 1, "drawdown": "-0.02"},
+        },
+        {
+            "candidate_id": "large_loss",
+            "param_pack": {"score": 100, "drawdown": "-0.30"},
+        },
+    ]
+    request = ParameterSearchJobRequest.model_validate(payload)
+    executor = ParameterSearchJobExecutor(
+        evaluator=_NoopEvaluator(),
+        run_inline=True,
+    )
+
+    job = executor.submit_search(request)
+
+    assert job.status.value == "SUCCEEDED"
+    assert job.result is not None
+    assert job.result["best_candidate"]["candidate_id"] == "small_loss"
 
 
 def test_parameter_search_rejects_evaluation_dataset_without_backtest_settings():
