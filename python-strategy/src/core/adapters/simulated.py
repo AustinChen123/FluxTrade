@@ -5,6 +5,7 @@ from typing import Optional, List, Dict
 from src.core.interfaces.exchange import ExchangeOrderSnapshot, IExchangeAdapter
 from src.core.orm_models import Order
 from src.core.models import OrderSide, Position, Candlestick, PositionSide
+from src.core.precision import PrecisionCodec
 from src.core.strategy_context import (
     FillSnapshot,
     OrderSnapshot,
@@ -20,6 +21,11 @@ from fluxtrade_core import (
     Order as RustOrder,
     Candlestick as RustCandlestick,
 )
+
+try:
+    from fluxtrade_core import ScaledCandlestick as RustScaledCandlestick
+except ImportError:  # pragma: no cover - depends on local extension build
+    RustScaledCandlestick = None
 
 # Detect if Rust engine supports strategy_id parameter
 _RUST_HAS_STRATEGY_ID = "strategy_id" in str(inspect.signature(RustOrder))
@@ -38,12 +44,21 @@ class SimulatedAdapter(IExchangeAdapter):
         initial_balance: Decimal = Decimal("100000"),
         maker_fee: Decimal = Decimal("0"),
         taker_fee: Decimal = Decimal("0"),
+        precision_codec: PrecisionCodec | None = None,
     ):
         self._engine = PyMatchingEngine(
             str(initial_balance),
             maker_fee=str(maker_fee),
             taker_fee=str(taker_fee),
         )
+        self._precision_codec = precision_codec
+        if precision_codec is not None:
+            if RustScaledCandlestick is None or not hasattr(self._engine, "on_scaled_candle"):
+                raise RuntimeError("compiled Rust engine does not support scaled candle matching")
+            self._engine.set_scaled_precision(
+                str(precision_codec.spec.price_tick),
+                str(precision_codec.spec.quantity_step),
+            )
         # Map order ID → ORM Order so we can return it in fills
         self._order_map: Dict[str, Order] = {}
         self._rust_supports_strategy_id = _RUST_HAS_STRATEGY_ID
@@ -202,8 +217,25 @@ class SimulatedAdapter(IExchangeAdapter):
              "fee": Decimal, "fill_type": str}
         """
         rust_candle = self._to_rust_candle(candle)
-        rust_fills = self._engine.on_candle(rust_candle)
+        if self._precision_codec is not None:
+            rust_fills = self._engine.on_scaled_candle(rust_candle)
+        else:
+            rust_fills = self._engine.on_candle(rust_candle)
 
+        return self._fills_from_rust(rust_fills)
+
+    def prepare_scaled_candle(self, candle: Candlestick):
+        """Convert a Decimal candle to scaled units outside the replay hot loop."""
+        return self._to_scaled_rust_candle(candle)
+
+    def on_prepared_market_data(self, scaled_candle) -> List[Dict]:
+        """Process a pre-encoded scaled candle through the Rust matching engine."""
+        if self._precision_codec is None:
+            raise RuntimeError("precision codec is required for prepared scaled candles")
+        rust_fills = self._engine.on_scaled_candle(scaled_candle)
+        return self._fills_from_rust(rust_fills)
+
+    def _fills_from_rust(self, rust_fills) -> List[Dict]:
         fills: List[Dict] = []
         for rf in rust_fills:
             orm_order = self._order_map.pop(rf.order_id, None)
@@ -285,8 +317,9 @@ class SimulatedAdapter(IExchangeAdapter):
 
         return RustOrder(**kwargs)
 
-    @staticmethod
-    def _to_rust_candle(candle: Candlestick) -> RustCandlestick:
+    def _to_rust_candle(self, candle: Candlestick) -> RustCandlestick:
+        if self._precision_codec is not None:
+            return self._to_scaled_rust_candle(candle)
         return RustCandlestick(
             product_id=candle.product_id,
             timeframe=candle.timeframe,
@@ -296,6 +329,23 @@ class SimulatedAdapter(IExchangeAdapter):
             low=str(candle.low),
             close=str(candle.close),
             volume=str(candle.volume),
+        )
+
+    def _to_scaled_rust_candle(self, candle: Candlestick):
+        if RustScaledCandlestick is None:
+            raise RuntimeError("compiled Rust engine does not support scaled candles")
+        codec = self._precision_codec
+        if codec is None:
+            raise RuntimeError("precision codec is not configured")
+        return RustScaledCandlestick(
+            product_id=candle.product_id,
+            timeframe=candle.timeframe,
+            timestamp=candle.timestamp,
+            open_units=codec.encode_price(candle.open),
+            high_units=codec.encode_price(candle.high),
+            low_units=codec.encode_price(candle.low),
+            close_units=codec.encode_price(candle.close),
+            volume_units=codec.encode_quantity(candle.volume),
         )
 
 

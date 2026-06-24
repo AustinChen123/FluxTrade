@@ -26,6 +26,7 @@ from src.core.orm_models import (
     SignalAudit,
     Strategy,
 )
+from src.core.precision import PrecisionCodec, PrecisionSpec
 from src.core.research_backtest_runner import ResearchBacktestRunner
 from src.strategies.callable_strategy import CallableStrategy
 
@@ -169,3 +170,192 @@ def test_research_backtest_matches_full_runner_core_metrics(tmp_path):
     assert research_result["total_trades"] == metrics["total_trades"]
     assert research_result["total_pnl"] == full_result["total_pnl"]
     assert research_result["profit_factor"] == full_result["profit_factor"]
+
+
+def test_research_backtest_prepared_scaled_path_matches_decimal_path():
+    candles = make_candle_series(count=600)
+    fee_config = {"maker": 0.0002, "taker": 0.0006}
+    codec = PrecisionCodec(
+        PrecisionSpec(
+            price_tick=Decimal("0.01"),
+            quantity_step=Decimal("0.001"),
+        )
+    )
+
+    decimal_runner = ResearchBacktestRunner(
+        start_time=candles[0].timestamp,
+        end_time=candles[-1].timestamp,
+        product_id=PRODUCT_ID,
+        timeframe=TIMEFRAME,
+        initial_balance=10_000.0,
+        data_source=MemoryDataSource(candles),
+        fee_config=fee_config,
+    )
+    decimal_runner.add_strategy(
+        CallableStrategy(
+            "research_scaled_parity",
+            _signal_factory("research_scaled_parity", candles),
+            PRODUCT_ID,
+            TIMEFRAME,
+        )
+    )
+
+    scaled_runner = ResearchBacktestRunner(
+        start_time=candles[0].timestamp,
+        end_time=candles[-1].timestamp,
+        product_id=PRODUCT_ID,
+        timeframe=TIMEFRAME,
+        initial_balance=10_000.0,
+        data_source=MemoryDataSource(candles),
+        fee_config=fee_config,
+        precision_codec=codec,
+    )
+    scaled_runner.add_strategy(
+        CallableStrategy(
+            "research_scaled_parity",
+            _signal_factory("research_scaled_parity", candles),
+            PRODUCT_ID,
+            TIMEFRAME,
+        )
+    )
+
+    decimal_result = decimal_runner.run()
+    scaled_result = scaled_runner.run()
+
+    assert scaled_result["candle_count"] == decimal_result["candle_count"] == len(candles)
+    assert scaled_result["raw_trade_count"] == decimal_result["raw_trade_count"]
+    assert scaled_result["total_trades"] == decimal_result["total_trades"]
+    assert scaled_result["total_pnl"] == decimal_result["total_pnl"]
+    assert scaled_result["profit_factor"] == decimal_result["profit_factor"]
+    assert [
+        (trade.side, trade.price, trade.quantity, trade.fee, trade.timestamp)
+        for trade in scaled_result["raw_trades"]
+    ] == [
+        (trade.side, trade.price, trade.quantity, trade.fee, trade.timestamp)
+        for trade in decimal_result["raw_trades"]
+    ]
+
+
+def test_research_backtest_reuses_prepared_scaled_candles():
+    candles = make_candle_series(count=600)
+    fee_config = {"maker": 0.0002, "taker": 0.0006}
+    codec = PrecisionCodec(
+        PrecisionSpec(
+            price_tick=Decimal("0.01"),
+            quantity_step=Decimal("0.001"),
+        )
+    )
+    prepared = ResearchBacktestRunner.prepare_scaled_candles(candles, codec)
+
+    decimal_runner = ResearchBacktestRunner(
+        start_time=candles[0].timestamp,
+        end_time=candles[-1].timestamp,
+        product_id=PRODUCT_ID,
+        timeframe=TIMEFRAME,
+        initial_balance=10_000.0,
+        data_source=MemoryDataSource(candles),
+        fee_config=fee_config,
+    )
+    decimal_runner.add_strategy(
+        CallableStrategy(
+            "research_prepared_scaled",
+            _signal_factory("research_prepared_scaled", candles),
+            PRODUCT_ID,
+            TIMEFRAME,
+        )
+    )
+
+    scaled_runner = ResearchBacktestRunner(
+        start_time=candles[0].timestamp,
+        end_time=candles[-1].timestamp,
+        product_id=PRODUCT_ID,
+        timeframe=TIMEFRAME,
+        initial_balance=10_000.0,
+        data_source=MemoryDataSource(candles),
+        fee_config=fee_config,
+        precision_codec=codec,
+        prepared_scaled_candles=prepared,
+    )
+    scaled_runner.add_strategy(
+        CallableStrategy(
+            "research_prepared_scaled",
+            _signal_factory("research_prepared_scaled", candles),
+            PRODUCT_ID,
+            TIMEFRAME,
+        )
+    )
+
+    decimal_result = decimal_runner.run()
+    scaled_result = scaled_runner.run()
+
+    assert scaled_result["total_pnl"] == decimal_result["total_pnl"]
+    assert scaled_result["raw_trade_count"] == decimal_result["raw_trade_count"]
+    assert [
+        (trade.side, trade.price, trade.quantity, trade.fee, trade.timestamp)
+        for trade in scaled_result["raw_trades"]
+    ] == [
+        (trade.side, trade.price, trade.quantity, trade.fee, trade.timestamp)
+        for trade in decimal_result["raw_trades"]
+    ]
+
+
+def test_research_backtest_rejects_misaligned_prepared_scaled_candles():
+    candles = make_candle_series(count=10)
+    codec = PrecisionCodec(
+        PrecisionSpec(
+            price_tick=Decimal("0.01"),
+            quantity_step=Decimal("0.001"),
+        )
+    )
+    runner = ResearchBacktestRunner(
+        start_time=candles[0].timestamp,
+        end_time=candles[-1].timestamp,
+        product_id=PRODUCT_ID,
+        timeframe=TIMEFRAME,
+        data_source=MemoryDataSource(candles),
+        precision_codec=codec,
+        prepared_scaled_candles=[],
+    )
+    runner.add_strategy(
+        CallableStrategy(
+            "research_misaligned_scaled",
+            _signal_factory("research_misaligned_scaled", candles),
+            PRODUCT_ID,
+            TIMEFRAME,
+        )
+    )
+
+    with pytest.raises(ValueError, match="prepared_scaled_candles length"):
+        runner.run()
+
+
+def test_research_backtest_rejects_out_of_order_prepared_scaled_candles():
+    candles = make_candle_series(count=10)
+    codec = PrecisionCodec(
+        PrecisionSpec(
+            price_tick=Decimal("0.01"),
+            quantity_step=Decimal("0.001"),
+        )
+    )
+    prepared = ResearchBacktestRunner.prepare_scaled_candles(candles, codec)
+    prepared[0], prepared[1] = prepared[1], prepared[0]
+    runner = ResearchBacktestRunner(
+        start_time=candles[0].timestamp,
+        end_time=candles[-1].timestamp,
+        product_id=PRODUCT_ID,
+        timeframe=TIMEFRAME,
+        data_source=MemoryDataSource(candles),
+        precision_codec=codec,
+        prepared_scaled_candles=prepared,
+    )
+    runner.add_strategy(
+        CallableStrategy(
+            "research_out_of_order_scaled",
+            _signal_factory("research_out_of_order_scaled", candles),
+            PRODUCT_ID,
+            TIMEFRAME,
+        )
+    )
+
+    with pytest.raises(ValueError, match="prepared_scaled_candles timestamp"):
+        runner.run()
