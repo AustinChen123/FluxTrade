@@ -19,6 +19,7 @@ from src.control_plane.models import (
     ParameterEvaluationResult,
     ParameterSearchJobRequest,
 )
+from src.control_plane.search_space import resolve_parameter_candidates
 from src.core.data_sources.csv_source import CsvDataSource
 from src.core.data_sources.memory import MemoryDataSource
 from src.core.golden_cross_fast_fitness import GoldenCrossFastFitnessEvaluator
@@ -384,9 +385,10 @@ class ParameterSearchJobExecutor:
                 self._futures.pop(job_id, None)
 
     def _run_search(self, request: ParameterSearchJobRequest) -> dict[str, object]:
+        candidates = resolve_parameter_candidates(request)
         evaluations = [
             self.evaluator.evaluate(request, candidate)
-            for candidate in request.candidates
+            for candidate in candidates
         ]
         best = _select_best_candidate(request, evaluations)
         epoch_id = None
@@ -394,6 +396,7 @@ class ParameterSearchJobExecutor:
             epoch_id = _record_evolution_epoch(
                 self._db_session_factory,
                 request,
+                candidates,
                 evaluations,
                 best,
             )
@@ -437,6 +440,7 @@ def _result_decimal(result: dict[str, Any], key: str) -> Decimal:
 def _record_evolution_epoch(
     session_factory: SessionFactory,
     request: ParameterSearchJobRequest,
+    candidates: list[ParameterCandidate],
     evaluations: list[ParameterEvaluationResult],
     best: ParameterEvaluationResult,
 ) -> str:
@@ -448,6 +452,7 @@ def _record_evolution_epoch(
             session,
             epoch_id,
             request,
+            candidates,
             best,
             started_at,
             finished_at,
@@ -455,7 +460,7 @@ def _record_evolution_epoch(
         for evaluation in evaluations:
             candidate = next(
                 candidate
-                for candidate in request.candidates
+                for candidate in candidates
                 if candidate.candidate_id == evaluation.candidate_id
             )
             session.add(
@@ -477,6 +482,7 @@ def _insert_evolution_epoch(
     session: Session,
     epoch_id: str,
     request: ParameterSearchJobRequest,
+    candidates: list[ParameterCandidate],
     best: ParameterEvaluationResult,
     started_at: datetime,
     finished_at: datetime,
@@ -487,7 +493,7 @@ def _insert_evolution_epoch(
             strategy_id=request.strategy_id,
             started_at=started_at,
             finished_at=finished_at,
-            pop_size=len(request.candidates),
+            pop_size=len(candidates),
             max_generations=1,
             generations_run=1,
             best_score=best.score_total,
@@ -495,7 +501,7 @@ def _insert_evolution_epoch(
             config_json={
                 "objective": request.objective,
                 "candidate_ids": [
-                    candidate.candidate_id for candidate in request.candidates
+                    candidate.candidate_id for candidate in candidates
                 ],
             },
             status="completed",
