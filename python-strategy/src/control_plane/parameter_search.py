@@ -24,6 +24,7 @@ from src.core.data_sources.memory import MemoryDataSource
 from src.core.golden_cross_fast_fitness import GoldenCrossFastFitnessEvaluator
 from src.core.models import GeneRole
 from src.core.orm_models import EvolutionEpoch, GeneRecord
+from src.core.precision import PrecisionCodec
 from src.core.research_backtest_runner import ResearchBacktestRunner
 from src.strategies.base import BaseStrategy
 from src.strategies.golden_cross import GoldenCrossStrategy
@@ -99,10 +100,13 @@ class ResearchBacktestParameterEvaluator:
         strategy_factory: ResearchStrategyFactory,
         *,
         preload_candles: bool = True,
+        precision_codec: PrecisionCodec | None = None,
     ) -> None:
         self._strategy_factory = strategy_factory
         self._preload_candles = preload_candles
+        self._precision_codec = precision_codec
         self._candle_cache: dict[tuple, list] = {}
+        self._prepared_scaled_cache: dict[tuple, list] = {}
 
     def evaluate(
         self,
@@ -112,7 +116,7 @@ class ResearchBacktestParameterEvaluator:
         if request.backtest is None:
             raise ValueError("backtest settings are required for research evaluation")
 
-        data_source = self._data_source_for(request)
+        data_source, prepared_scaled_candles = self._replay_inputs_for(request)
         runner = ResearchBacktestRunner(
             start_time=request.start_time,
             end_time=request.end_time,
@@ -124,6 +128,8 @@ class ResearchBacktestParameterEvaluator:
                 "maker": float(request.backtest.maker_fee),
                 "taker": float(request.backtest.taker_fee),
             },
+            precision_codec=self._precision_codec,
+            prepared_scaled_candles=prepared_scaled_candles,
         )
         strategy = self._strategy_factory(
             f"{request.strategy_id}_{candidate.candidate_id}",
@@ -146,7 +152,7 @@ class ResearchBacktestParameterEvaluator:
             metrics=_json_safe(metrics),
         )
 
-    def _data_source_for(self, request: ParameterSearchJobRequest):
+    def _replay_inputs_for(self, request: ParameterSearchJobRequest):
         assert request.backtest is not None
         csv_source = CsvDataSource(
             file_path=request.backtest.candles_csv_path,
@@ -154,7 +160,7 @@ class ResearchBacktestParameterEvaluator:
             timeframe=request.timeframe,
         )
         if not self._preload_candles:
-            return csv_source
+            return csv_source, None
 
         cache_key = _candle_cache_key(request)
         candles = self._candle_cache.get(cache_key)
@@ -168,14 +174,27 @@ class ResearchBacktestParameterEvaluator:
                 )
             )
             self._candle_cache[cache_key] = candles
-        return MemoryDataSource(candles)
+
+        prepared_scaled_candles = None
+        if self._precision_codec is not None:
+            prepared_scaled_candles = self._prepared_scaled_cache.get(cache_key)
+            if prepared_scaled_candles is None:
+                prepared_scaled_candles = ResearchBacktestRunner.prepare_scaled_candles(
+                    candles,
+                    self._precision_codec,
+                )
+                self._prepared_scaled_cache[cache_key] = prepared_scaled_candles
+        return MemoryDataSource(candles), prepared_scaled_candles
 
 
 class GoldenCrossResearchParameterEvaluator(ResearchBacktestParameterEvaluator):
     """Research evaluator for GoldenCrossStrategy parameter packs."""
 
-    def __init__(self) -> None:
-        super().__init__(_golden_cross_strategy_factory)
+    def __init__(self, precision_codec: PrecisionCodec | None = None) -> None:
+        super().__init__(
+            _golden_cross_strategy_factory,
+            precision_codec=precision_codec,
+        )
 
 
 class GoldenCrossFastFitnessParameterEvaluator:
