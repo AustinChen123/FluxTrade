@@ -487,11 +487,6 @@ def _request_for_evaluation_dataset(
         raise ValueError(
             f"evaluation dataset {dataset.dataset_id} requires backtest settings"
         )
-    if dataset.warmup_start_time is not None:
-        raise ValueError(
-            f"evaluation dataset {dataset.dataset_id} warmup replay is not implemented yet"
-        )
-
     return request.model_copy(
         update={
             "product_id": dataset.product_id,

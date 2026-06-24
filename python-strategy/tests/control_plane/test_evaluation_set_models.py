@@ -73,7 +73,6 @@ def test_parameter_search_accepts_evaluation_set_payload():
                 "timeframe": "5m",
                 "start_time": 1_700_086_400_000,
                 "end_time": 1_700_172_800_000,
-                "warmup_start_time": 1_700_000_000_000,
                 "metadata": {"regime": "chop"},
             },
         ],
@@ -86,7 +85,7 @@ def test_parameter_search_accepts_evaluation_set_payload():
         "trend",
         "chop",
     ]
-    assert request.evaluation_set.datasets[1].warmup_start_time == 1_700_000_000_000
+    assert request.evaluation_set.datasets[1].metadata["regime"] == "chop"
 
 
 def test_evaluation_set_config_converts_to_core_model():
@@ -154,6 +153,31 @@ def test_evaluation_dataset_rejects_invalid_warmup_range():
                 ],
             }
         )
+
+
+def test_parameter_search_rejects_warmup_datasets_before_job_creation():
+    payload = _base_search_request()
+    payload["evaluation_set"] = {
+        "datasets": [
+            {
+                "dataset_id": "with_warmup",
+                "product_id": PRODUCT_ID,
+                "timeframe": "5m",
+                "start_time": 10,
+                "end_time": 20,
+                "warmup_start_time": 5,
+            },
+        ],
+    }
+
+    with pytest.raises(
+        ValidationError,
+        match=(
+            "parameter_search evaluation_set does not support "
+            "warmup_start_time yet: with_warmup"
+        ),
+    ):
+        ParameterSearchJobRequest.model_validate(payload)
 
 
 def test_parameter_search_accepts_shared_backtest_with_evaluation_set():

@@ -291,6 +291,18 @@ class ParameterSearchJobRequest(BaseModel):
             raise ValueError("candidate_sample_count requires search_space")
         if has_search_space and self.candidate_sample_count is None:
             raise ValueError("candidate_sample_count is required with search_space")
+        if self.evaluation_set is not None:
+            warmup_dataset_ids = [
+                dataset.dataset_id
+                for dataset in self.evaluation_set.datasets
+                if dataset.warmup_start_time is not None
+            ]
+            if warmup_dataset_ids:
+                datasets = ", ".join(warmup_dataset_ids)
+                raise ValueError(
+                    "parameter_search evaluation_set does not support "
+                    f"warmup_start_time yet: {datasets}"
+                )
         return self
 
 
