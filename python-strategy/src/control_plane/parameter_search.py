@@ -482,9 +482,9 @@ def _record_evolution_epoch(
                 GeneRecord(
                     strategy_id=request.strategy_id,
                     role=GeneRole.CHALLENGER.value,
-                    param_pack=candidate.param_pack,
+                    param_pack=_json_safe(candidate.param_pack),
                     score_total=evaluation.score_total,
-                    score_breakdown=evaluation.metrics,
+                    score_breakdown=_json_safe(evaluation.metrics),
                     max_drawdown=evaluation.max_drawdown,
                     epoch_id=epoch_id,
                 )

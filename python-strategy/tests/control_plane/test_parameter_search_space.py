@@ -4,6 +4,10 @@ from decimal import Decimal
 
 import pytest
 from pydantic import ValidationError
+from sqlalchemy import create_engine
+from sqlalchemy.dialects.postgresql import JSONB
+from sqlalchemy.ext.compiler import compiles
+from sqlalchemy.orm import sessionmaker
 
 from src.control_plane import (
     InMemoryJobStore,
@@ -12,6 +16,12 @@ from src.control_plane import (
 )
 from src.control_plane.models import ParameterCandidate, ParameterSearchJobRequest
 from src.control_plane.search_space import generate_parameter_candidates
+from src.core.orm_models import EvolutionEpoch, GeneRecord, Strategy, SystemEvent
+
+
+@compiles(JSONB, "sqlite")
+def _compile_jsonb_for_sqlite(type_, compiler, **kw):
+    return "JSON"
 
 
 class _ScoreFromWindowEvaluator:
@@ -31,6 +41,26 @@ class _ScoreFromWindowEvaluator:
             score_total=score,
             metrics={"score": str(score)},
         )
+
+
+def _sqlite_gene_registry_session_factory(tmp_path):
+    engine = create_engine(
+        f"sqlite:///{tmp_path / 'parameter_search_space_gene_registry.db'}",
+        connect_args={"check_same_thread": False, "timeout": 30},
+    )
+    for table in [
+        Strategy.__table__,
+        SystemEvent.__table__,
+        EvolutionEpoch.__table__,
+        GeneRecord.__table__,
+    ]:
+        table.create(engine, checkfirst=True)
+
+    session_factory = sessionmaker(bind=engine)
+    with session_factory() as session:
+        session.add(Strategy(id="golden_cross", name="Golden Cross"))
+        session.commit()
+    return session_factory
 
 
 def test_parameter_search_generates_full_grid_candidates_in_order():
@@ -250,3 +280,68 @@ def test_parameter_search_integer_dimension_rejects_boolean_bounds():
 
     with pytest.raises(ValidationError, match="cannot be boolean"):
         ParameterSearchJobRequest.model_validate(payload)
+
+
+def test_parameter_search_records_generated_decimal_param_packs(tmp_path):
+    session_factory = _sqlite_gene_registry_session_factory(tmp_path)
+    executor = ParameterSearchJobExecutor(
+        _ScoreFromWindowEvaluator(),
+        store=InMemoryJobStore(),
+        run_inline=True,
+        db_session_factory=session_factory,
+    )
+    request = ParameterSearchJobRequest.model_validate(
+        {
+            "strategy_id": "golden_cross",
+            "product_id": "BINANCE:BTCUSDT-PERP",
+            "timeframe": "15m",
+            "start_time": 1_700_000_000_000,
+            "end_time": 1_700_001_800_000,
+            "search_space": {
+                "parameters": {
+                    "short_window": {
+                        "type": "integer",
+                        "min": 5,
+                        "max": 5,
+                        "step": 1,
+                    },
+                    "quantity": {
+                        "type": "decimal",
+                        "min": "0.01",
+                        "max": "0.02",
+                        "step": "0.01",
+                    },
+                }
+            },
+            "candidate_sample_count": 2,
+        }
+    )
+
+    job = executor.submit_search(request)
+
+    assert job.status.value == "SUCCEEDED"
+    assert job.result is not None
+    assert job.result["epoch_id"].startswith("epoch_")
+    assert job.result["resolved_candidates"] == [
+        {
+            "candidate_id": "generated_000001",
+            "param_pack": {"short_window": 5, "quantity": "0.01"},
+        },
+        {
+            "candidate_id": "generated_000002",
+            "param_pack": {"short_window": 5, "quantity": "0.02"},
+        },
+    ]
+
+    with session_factory() as session:
+        genes = (
+            session.query(GeneRecord)
+            .filter(GeneRecord.epoch_id == job.result["epoch_id"])
+            .order_by(GeneRecord.id)
+            .all()
+        )
+
+    assert [gene.param_pack for gene in genes] == [
+        {"short_window": 5, "quantity": "0.01"},
+        {"short_window": 5, "quantity": "0.02"},
+    ]
