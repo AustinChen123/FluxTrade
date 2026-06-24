@@ -385,6 +385,9 @@ class ParameterSearchJobExecutor:
                 self._futures.pop(job_id, None)
 
     def _run_search(self, request: ParameterSearchJobRequest) -> dict[str, object]:
+        if request.evaluation_set is not None:
+            raise ValueError("evaluation_set parameter search is not implemented yet")
+
         candidates = resolve_parameter_candidates(request)
         evaluations = [
             self.evaluator.evaluate(request, candidate)

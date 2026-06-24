@@ -7,6 +7,8 @@ from src.control_plane.jobs import InMemoryJobStore, JobStatus, JobStore, Sqlite
 from src.control_plane.models import (
     BacktestJobRequest,
     CsvSignalBacktestEvaluationConfig,
+    EvaluationDatasetConfig,
+    EvaluationSetConfig,
     GenePromotionRequest,
     JobRecord,
     ParameterCandidate,
@@ -32,6 +34,8 @@ __all__ = [
     "ControlPlaneApp",
     "CsvSignalBacktestEvaluationConfig",
     "CsvSignalBacktestParameterEvaluator",
+    "EvaluationDatasetConfig",
+    "EvaluationSetConfig",
     "GeneControlService",
     "GoldenCrossFastFitnessParameterEvaluator",
     "GoldenCrossResearchParameterEvaluator",
