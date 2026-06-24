@@ -37,6 +37,7 @@ from src.core.orm_models import (
     StrategyState,
     StrategyStateTransition,
 )
+from src.core.precision import PrecisionCodec, PrecisionSpec
 
 try:
     import fluxtrade_core  # noqa: F401
@@ -1094,6 +1095,76 @@ def test_control_plane_runs_parameter_search_with_research_backtests(tmp_path):
     assert "raw_trades" not in evaluations[0]["metrics"]
     assert "closed_trades" not in evaluations[0]["metrics"]
     assert len(evaluator._candle_cache) == 1
+
+
+@pytest.mark.rust
+@pytest.mark.skipif(not HAS_RUST, reason="fluxtrade_core.so not compiled")
+def test_research_parameter_search_reuses_prepared_scaled_candles(tmp_path):
+    candle_rows = _write_research_candles(tmp_path / "research_scaled_candles.csv")
+    codec = PrecisionCodec(
+        PrecisionSpec(
+            price_tick=Decimal("0.01"),
+            quantity_step=Decimal("0.001"),
+        )
+    )
+    evaluator = GoldenCrossResearchParameterEvaluator(precision_codec=codec)
+    store = InMemoryJobStore()
+    app = ControlPlaneApp(
+        BacktestJobExecutor(store=store, run_inline=True),
+        parameter_search_executor=ParameterSearchJobExecutor(
+            evaluator,
+            store=store,
+            run_inline=True,
+        ),
+    )
+
+    response = app.handle(
+        "POST",
+        "/jobs/parameter-searches",
+        json.dumps(
+            {
+                "strategy_id": "golden_cross_scaled_search",
+                "product_id": PRODUCT_ID,
+                "timeframe": TIMEFRAME,
+                "start_time": candle_rows[0][0],
+                "end_time": candle_rows[-1][0],
+                "backtest": {
+                    "candles_csv_path": str(tmp_path / "research_scaled_candles.csv"),
+                    "initial_balance": "10000",
+                    "maker_fee": "0",
+                    "taker_fee": "0",
+                },
+                "candidates": [
+                    {
+                        "candidate_id": "active",
+                        "param_pack": {
+                            "short_window": 1,
+                            "long_window": 3,
+                            "quantity": "0.01",
+                        },
+                    },
+                    {
+                        "candidate_id": "slow",
+                        "param_pack": {
+                            "short_window": 1,
+                            "long_window": 6,
+                            "quantity": "0.01",
+                        },
+                    },
+                ],
+            }
+        ),
+    )
+
+    assert response.status_code == 200
+    job = response.body["job"]
+    assert job["status"] == JobStatus.SUCCEEDED.value
+    assert job["result"]["best_candidate"]["candidate_id"] == "slow"
+    assert Decimal(job["result"]["best_candidate"]["score_total"]) == Decimal("0")
+    assert len(evaluator._candle_cache) == 1
+    assert len(evaluator._prepared_scaled_cache) == 1
+    prepared = next(iter(evaluator._prepared_scaled_cache.values()))
+    assert len(prepared) == len(candle_rows)
 
 
 def test_control_plane_runs_parameter_search_with_fast_fitness(tmp_path):

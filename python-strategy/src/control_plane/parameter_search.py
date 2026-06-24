@@ -19,11 +19,13 @@ from src.control_plane.models import (
     ParameterEvaluationResult,
     ParameterSearchJobRequest,
 )
+from src.control_plane.search_space import resolve_parameter_candidates
 from src.core.data_sources.csv_source import CsvDataSource
 from src.core.data_sources.memory import MemoryDataSource
 from src.core.golden_cross_fast_fitness import GoldenCrossFastFitnessEvaluator
 from src.core.models import GeneRole
 from src.core.orm_models import EvolutionEpoch, GeneRecord
+from src.core.precision import PrecisionCodec
 from src.core.research_backtest_runner import ResearchBacktestRunner
 from src.strategies.base import BaseStrategy
 from src.strategies.golden_cross import GoldenCrossStrategy
@@ -99,10 +101,13 @@ class ResearchBacktestParameterEvaluator:
         strategy_factory: ResearchStrategyFactory,
         *,
         preload_candles: bool = True,
+        precision_codec: PrecisionCodec | None = None,
     ) -> None:
         self._strategy_factory = strategy_factory
         self._preload_candles = preload_candles
+        self._precision_codec = precision_codec
         self._candle_cache: dict[tuple, list] = {}
+        self._prepared_scaled_cache: dict[tuple, list] = {}
 
     def evaluate(
         self,
@@ -112,7 +117,7 @@ class ResearchBacktestParameterEvaluator:
         if request.backtest is None:
             raise ValueError("backtest settings are required for research evaluation")
 
-        data_source = self._data_source_for(request)
+        data_source, prepared_scaled_candles = self._replay_inputs_for(request)
         runner = ResearchBacktestRunner(
             start_time=request.start_time,
             end_time=request.end_time,
@@ -124,6 +129,8 @@ class ResearchBacktestParameterEvaluator:
                 "maker": float(request.backtest.maker_fee),
                 "taker": float(request.backtest.taker_fee),
             },
+            precision_codec=self._precision_codec,
+            prepared_scaled_candles=prepared_scaled_candles,
         )
         strategy = self._strategy_factory(
             f"{request.strategy_id}_{candidate.candidate_id}",
@@ -146,7 +153,7 @@ class ResearchBacktestParameterEvaluator:
             metrics=_json_safe(metrics),
         )
 
-    def _data_source_for(self, request: ParameterSearchJobRequest):
+    def _replay_inputs_for(self, request: ParameterSearchJobRequest):
         assert request.backtest is not None
         csv_source = CsvDataSource(
             file_path=request.backtest.candles_csv_path,
@@ -154,7 +161,7 @@ class ResearchBacktestParameterEvaluator:
             timeframe=request.timeframe,
         )
         if not self._preload_candles:
-            return csv_source
+            return csv_source, None
 
         cache_key = _candle_cache_key(request)
         candles = self._candle_cache.get(cache_key)
@@ -168,14 +175,27 @@ class ResearchBacktestParameterEvaluator:
                 )
             )
             self._candle_cache[cache_key] = candles
-        return MemoryDataSource(candles)
+
+        prepared_scaled_candles = None
+        if self._precision_codec is not None:
+            prepared_scaled_candles = self._prepared_scaled_cache.get(cache_key)
+            if prepared_scaled_candles is None:
+                prepared_scaled_candles = ResearchBacktestRunner.prepare_scaled_candles(
+                    candles,
+                    self._precision_codec,
+                )
+                self._prepared_scaled_cache[cache_key] = prepared_scaled_candles
+        return MemoryDataSource(candles), prepared_scaled_candles
 
 
 class GoldenCrossResearchParameterEvaluator(ResearchBacktestParameterEvaluator):
     """Research evaluator for GoldenCrossStrategy parameter packs."""
 
-    def __init__(self) -> None:
-        super().__init__(_golden_cross_strategy_factory)
+    def __init__(self, precision_codec: PrecisionCodec | None = None) -> None:
+        super().__init__(
+            _golden_cross_strategy_factory,
+            precision_codec=precision_codec,
+        )
 
 
 class GoldenCrossFastFitnessParameterEvaluator:
@@ -365,9 +385,10 @@ class ParameterSearchJobExecutor:
                 self._futures.pop(job_id, None)
 
     def _run_search(self, request: ParameterSearchJobRequest) -> dict[str, object]:
+        candidates = resolve_parameter_candidates(request)
         evaluations = [
             self.evaluator.evaluate(request, candidate)
-            for candidate in request.candidates
+            for candidate in candidates
         ]
         best = _select_best_candidate(request, evaluations)
         epoch_id = None
@@ -375,6 +396,7 @@ class ParameterSearchJobExecutor:
             epoch_id = _record_evolution_epoch(
                 self._db_session_factory,
                 request,
+                candidates,
                 evaluations,
                 best,
             )
@@ -386,8 +408,13 @@ class ParameterSearchJobExecutor:
                 "objective": request.objective,
                 "seed": request.seed,
                 "epoch_id": epoch_id,
+                "resolved_candidates": candidates,
                 "evaluations": evaluations,
                 "best_candidate": best,
+                "best_candidate_param_pack": _param_pack_for_candidate(
+                    candidates,
+                    best.candidate_id,
+                ),
             }
         )
 
@@ -415,9 +442,20 @@ def _result_decimal(result: dict[str, Any], key: str) -> Decimal:
     return Decimal(str(value))
 
 
+def _param_pack_for_candidate(
+    candidates: list[ParameterCandidate],
+    candidate_id: str,
+) -> dict[str, Any]:
+    for candidate in candidates:
+        if candidate.candidate_id == candidate_id:
+            return candidate.param_pack
+    raise ValueError(f"missing parameter pack for candidate: {candidate_id}")
+
+
 def _record_evolution_epoch(
     session_factory: SessionFactory,
     request: ParameterSearchJobRequest,
+    candidates: list[ParameterCandidate],
     evaluations: list[ParameterEvaluationResult],
     best: ParameterEvaluationResult,
 ) -> str:
@@ -429,6 +467,7 @@ def _record_evolution_epoch(
             session,
             epoch_id,
             request,
+            candidates,
             best,
             started_at,
             finished_at,
@@ -436,16 +475,16 @@ def _record_evolution_epoch(
         for evaluation in evaluations:
             candidate = next(
                 candidate
-                for candidate in request.candidates
+                for candidate in candidates
                 if candidate.candidate_id == evaluation.candidate_id
             )
             session.add(
                 GeneRecord(
                     strategy_id=request.strategy_id,
                     role=GeneRole.CHALLENGER.value,
-                    param_pack=candidate.param_pack,
+                    param_pack=_json_safe(candidate.param_pack),
                     score_total=evaluation.score_total,
-                    score_breakdown=evaluation.metrics,
+                    score_breakdown=_json_safe(evaluation.metrics),
                     max_drawdown=evaluation.max_drawdown,
                     epoch_id=epoch_id,
                 )
@@ -458,6 +497,7 @@ def _insert_evolution_epoch(
     session: Session,
     epoch_id: str,
     request: ParameterSearchJobRequest,
+    candidates: list[ParameterCandidate],
     best: ParameterEvaluationResult,
     started_at: datetime,
     finished_at: datetime,
@@ -468,7 +508,7 @@ def _insert_evolution_epoch(
             strategy_id=request.strategy_id,
             started_at=started_at,
             finished_at=finished_at,
-            pop_size=len(request.candidates),
+            pop_size=len(candidates),
             max_generations=1,
             generations_run=1,
             best_score=best.score_total,
@@ -476,7 +516,7 @@ def _insert_evolution_epoch(
             config_json={
                 "objective": request.objective,
                 "candidate_ids": [
-                    candidate.candidate_id for candidate in request.candidates
+                    candidate.candidate_id for candidate in candidates
                 ],
             },
             status="completed",

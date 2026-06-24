@@ -6,7 +6,7 @@ from enum import Enum
 from pathlib import Path
 from typing import Any, Literal
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 
 class JobStatus(str, Enum):
@@ -72,6 +72,71 @@ class ParameterCandidate(BaseModel):
     param_pack: dict[str, Any] = Field(default_factory=dict)
 
 
+class ParameterSearchDimension(BaseModel):
+    """One parameter dimension for generated parameter-search candidates."""
+
+    type: Literal["integer", "decimal", "categorical"]
+    min: int | Decimal | None = None
+    max: int | Decimal | None = None
+    step: int | Decimal | None = None
+    choices: list[int | Decimal | str | bool] | None = None
+
+    @field_validator("min", "max", "step", mode="before")
+    @classmethod
+    def reject_boolean_bounds(cls, value):
+        if isinstance(value, bool):
+            raise ValueError("numeric dimension bounds cannot be boolean")
+        return value
+
+    @model_validator(mode="after")
+    def validate_dimension(self) -> "ParameterSearchDimension":
+        if self.type == "categorical":
+            if not self.choices:
+                raise ValueError("categorical dimensions require non-empty choices")
+            return self
+
+        if self.min is None or self.max is None or self.step is None:
+            raise ValueError(f"{self.type} dimensions require min, max, and step")
+        if self.choices is not None:
+            raise ValueError(f"{self.type} dimensions cannot define choices")
+
+        if self.type == "integer":
+            min_value = _require_int(self.min, "min")
+            max_value = _require_int(self.max, "max")
+            step_value = _require_int(self.step, "step")
+            if step_value <= 0:
+                raise ValueError("integer dimension step must be positive")
+            if min_value > max_value:
+                raise ValueError("integer dimension min must be less than or equal to max")
+            return self
+
+        min_decimal = Decimal(str(self.min))
+        max_decimal = Decimal(str(self.max))
+        step_decimal = Decimal(str(self.step))
+        if step_decimal <= 0:
+            raise ValueError("decimal dimension step must be positive")
+        if min_decimal > max_decimal:
+            raise ValueError("decimal dimension min must be less than or equal to max")
+        return self
+
+
+class ParameterSearchSpace(BaseModel):
+    """Parameter dimensions used to generate candidate parameter packs."""
+
+    parameters: dict[str, ParameterSearchDimension] = Field(min_length=1)
+
+    @field_validator("parameters")
+    @classmethod
+    def validate_parameter_names(
+        cls,
+        value: dict[str, ParameterSearchDimension],
+    ) -> dict[str, ParameterSearchDimension]:
+        for name in value:
+            if not name.strip():
+                raise ValueError("parameter names cannot be blank")
+        return value
+
+
 class CsvSignalBacktestEvaluationConfig(BaseModel):
     """Backtest settings for CSV-signal parameter candidate evaluation."""
 
@@ -119,7 +184,9 @@ class ParameterSearchJobRequest(BaseModel):
     ] = "maximize_score"
     seed: int | None = None
     backtest: CsvSignalBacktestEvaluationConfig | None = None
-    candidates: list[ParameterCandidate] = Field(min_length=1)
+    candidates: list[ParameterCandidate] | None = Field(default=None, min_length=1)
+    search_space: ParameterSearchSpace | None = None
+    candidate_sample_count: int | None = Field(default=None, ge=1, le=10_000)
 
     @field_validator("end_time")
     @classmethod
@@ -133,12 +200,35 @@ class ParameterSearchJobRequest(BaseModel):
     @classmethod
     def validate_unique_candidates(
         cls,
-        value: list[ParameterCandidate],
-    ) -> list[ParameterCandidate]:
+        value: list[ParameterCandidate] | None,
+    ) -> list[ParameterCandidate] | None:
+        if value is None:
+            return value
         candidate_ids = [candidate.candidate_id for candidate in value]
         if len(candidate_ids) != len(set(candidate_ids)):
             raise ValueError("candidate_id values must be unique")
         return value
+
+    @model_validator(mode="after")
+    def validate_candidate_source(self) -> "ParameterSearchJobRequest":
+        has_candidates = self.candidates is not None
+        has_search_space = self.search_space is not None
+        if has_candidates == has_search_space:
+            raise ValueError("provide exactly one of candidates or search_space")
+        if has_candidates and self.candidate_sample_count is not None:
+            raise ValueError("candidate_sample_count requires search_space")
+        if has_search_space and self.candidate_sample_count is None:
+            raise ValueError("candidate_sample_count is required with search_space")
+        return self
+
+
+def _require_int(value: int | Decimal, field_name: str) -> int:
+    if isinstance(value, bool):
+        raise ValueError(f"integer dimension {field_name} must be an integer")
+    decimal_value = Decimal(str(value))
+    if decimal_value != decimal_value.to_integral_value():
+        raise ValueError(f"integer dimension {field_name} must be an integer")
+    return int(decimal_value)
 
 
 class ParameterEvaluationResult(BaseModel):
