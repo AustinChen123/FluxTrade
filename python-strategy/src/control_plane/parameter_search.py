@@ -408,8 +408,13 @@ class ParameterSearchJobExecutor:
                 "objective": request.objective,
                 "seed": request.seed,
                 "epoch_id": epoch_id,
+                "resolved_candidates": candidates,
                 "evaluations": evaluations,
                 "best_candidate": best,
+                "best_candidate_param_pack": _param_pack_for_candidate(
+                    candidates,
+                    best.candidate_id,
+                ),
             }
         )
 
@@ -435,6 +440,16 @@ def _decimal_key(value: Decimal) -> Decimal:
 def _result_decimal(result: dict[str, Any], key: str) -> Decimal:
     value = result.get(key, "0")
     return Decimal(str(value))
+
+
+def _param_pack_for_candidate(
+    candidates: list[ParameterCandidate],
+    candidate_id: str,
+) -> dict[str, Any]:
+    for candidate in candidates:
+        if candidate.candidate_id == candidate_id:
+            return candidate.param_pack
+    raise ValueError(f"missing parameter pack for candidate: {candidate_id}")
 
 
 def _record_evolution_epoch(

@@ -81,6 +81,13 @@ class ParameterSearchDimension(BaseModel):
     step: int | Decimal | None = None
     choices: list[int | Decimal | str | bool] | None = None
 
+    @field_validator("min", "max", "step", mode="before")
+    @classmethod
+    def reject_boolean_bounds(cls, value):
+        if isinstance(value, bool):
+            raise ValueError("numeric dimension bounds cannot be boolean")
+        return value
+
     @model_validator(mode="after")
     def validate_dimension(self) -> "ParameterSearchDimension":
         if self.type == "categorical":

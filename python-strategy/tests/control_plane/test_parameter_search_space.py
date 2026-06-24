@@ -208,7 +208,45 @@ def test_parameter_search_executor_evaluates_generated_candidates():
     assert job.status.value == "SUCCEEDED"
     assert job.result is not None
     assert job.result["best_candidate"]["candidate_id"] == "generated_000002"
+    assert job.result["best_candidate_param_pack"] == {
+        "short_window": 10,
+        "long_window": 20,
+    }
+    assert job.result["resolved_candidates"] == [
+        {
+            "candidate_id": "generated_000001",
+            "param_pack": {"short_window": 5, "long_window": 20},
+        },
+        {
+            "candidate_id": "generated_000002",
+            "param_pack": {"short_window": 10, "long_window": 20},
+        },
+    ]
     assert evaluator.param_packs == [
         {"short_window": 5, "long_window": 20},
         {"short_window": 10, "long_window": 20},
     ]
+
+
+def test_parameter_search_integer_dimension_rejects_boolean_bounds():
+    payload = {
+        "strategy_id": "golden_cross",
+        "product_id": "BINANCE:BTCUSDT-PERP",
+        "timeframe": "15m",
+        "start_time": 1,
+        "end_time": 2,
+        "search_space": {
+            "parameters": {
+                "short_window": {
+                    "type": "integer",
+                    "min": True,
+                    "max": 10,
+                    "step": 1,
+                }
+            }
+        },
+        "candidate_sample_count": 1,
+    }
+
+    with pytest.raises(ValidationError, match="cannot be boolean"):
+        ParameterSearchJobRequest.model_validate(payload)
