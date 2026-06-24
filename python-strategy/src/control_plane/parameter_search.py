@@ -13,6 +13,7 @@ from src.control_plane.backtest_jobs import BacktestJobExecutor, SessionFactory,
 from src.control_plane.jobs import InMemoryJobStore, JobStore
 from src.control_plane.models import (
     BacktestJobRequest,
+    EvaluationDatasetConfig,
     JobRecord,
     JobStatus,
     ParameterCandidate,
@@ -385,14 +386,21 @@ class ParameterSearchJobExecutor:
                 self._futures.pop(job_id, None)
 
     def _run_search(self, request: ParameterSearchJobRequest) -> dict[str, object]:
-        if request.evaluation_set is not None:
-            raise ValueError("evaluation_set parameter search is not implemented yet")
-
         candidates = resolve_parameter_candidates(request)
-        evaluations = [
-            self.evaluator.evaluate(request, candidate)
-            for candidate in candidates
-        ]
+        if request.evaluation_set is not None:
+            evaluations = [
+                _evaluate_candidate_across_datasets(
+                    self.evaluator,
+                    request,
+                    candidate,
+                )
+                for candidate in candidates
+            ]
+        else:
+            evaluations = [
+                self.evaluator.evaluate(request, candidate)
+                for candidate in candidates
+            ]
         best = _select_best_candidate(request, evaluations)
         epoch_id = None
         if self._db_session_factory is not None:
@@ -411,6 +419,7 @@ class ParameterSearchJobExecutor:
                 "objective": request.objective,
                 "seed": request.seed,
                 "epoch_id": epoch_id,
+                "evaluation_set": _evaluation_set_result_payload(request),
                 "resolved_candidates": candidates,
                 "evaluations": evaluations,
                 "best_candidate": best,
@@ -434,6 +443,87 @@ def _select_best_candidate(
             key=lambda result: (result.max_drawdown, -_decimal_key(result.score_total)),
         )
     raise ValueError(f"unsupported objective: {request.objective}")
+
+
+def _evaluate_candidate_across_datasets(
+    evaluator: ParameterSearchEvaluator,
+    request: ParameterSearchJobRequest,
+    candidate: ParameterCandidate,
+) -> ParameterEvaluationResult:
+    assert request.evaluation_set is not None
+    dataset_results: dict[str, dict[str, Any]] = {}
+    dataset_scores: dict[str, Decimal] = {}
+    dataset_drawdowns: dict[str, Decimal] = {}
+
+    for dataset in request.evaluation_set.datasets:
+        dataset_request = _request_for_evaluation_dataset(request, dataset)
+        evaluation = evaluator.evaluate(dataset_request, candidate)
+        dataset_results[dataset.dataset_id] = evaluation.metrics
+        dataset_scores[dataset.dataset_id] = evaluation.score_total
+        dataset_drawdowns[dataset.dataset_id] = evaluation.max_drawdown
+
+    return ParameterEvaluationResult(
+        candidate_id=candidate.candidate_id,
+        score_total=sum(dataset_scores.values(), Decimal("0")),
+        max_drawdown=min(dataset_drawdowns.values(), default=Decimal("0")),
+        metrics=_json_safe(
+            {
+                "evaluation_mode": "evaluation_set",
+                "aggregation": "sum_score_worst_drawdown",
+                "dataset_scores": dataset_scores,
+                "dataset_drawdowns": dataset_drawdowns,
+                "datasets": dataset_results,
+            }
+        ),
+    )
+
+
+def _request_for_evaluation_dataset(
+    request: ParameterSearchJobRequest,
+    dataset: EvaluationDatasetConfig,
+) -> ParameterSearchJobRequest:
+    backtest = dataset.backtest or request.backtest
+    if backtest is None:
+        raise ValueError(
+            f"evaluation dataset {dataset.dataset_id} requires backtest settings"
+        )
+    if dataset.warmup_start_time is not None:
+        raise ValueError(
+            f"evaluation dataset {dataset.dataset_id} warmup replay is not implemented yet"
+        )
+
+    return request.model_copy(
+        update={
+            "product_id": dataset.product_id,
+            "timeframe": dataset.timeframe,
+            "start_time": dataset.start_time,
+            "end_time": dataset.end_time,
+            "backtest": backtest,
+            "evaluation_set": None,
+        },
+        deep=True,
+    )
+
+
+def _evaluation_set_result_payload(
+    request: ParameterSearchJobRequest,
+) -> dict[str, Any] | None:
+    if request.evaluation_set is None:
+        return None
+    return {
+        "datasets": [
+            {
+                "dataset_id": dataset.dataset_id,
+                "product_id": dataset.product_id,
+                "timeframe": dataset.timeframe,
+                "start_time": dataset.start_time,
+                "end_time": dataset.end_time,
+                "warmup_start_time": dataset.warmup_start_time,
+                "metadata": dataset.metadata,
+            }
+            for dataset in request.evaluation_set.datasets
+        ]
+    }
 
 
 def _decimal_key(value: Decimal) -> Decimal:
@@ -521,6 +611,7 @@ def _insert_evolution_epoch(
                 "candidate_ids": [
                     candidate.candidate_id for candidate in candidates
                 ],
+                "evaluation_set": _evaluation_set_result_payload(request),
             },
             status="completed",
             eval_pair=request.product_id,

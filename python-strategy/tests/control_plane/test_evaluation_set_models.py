@@ -15,10 +15,27 @@ PRODUCT_ID = "BINANCE:BTCUSDT-PERP"
 
 
 class _NoopEvaluator:
+    def __init__(self):
+        self.requests = []
+
     def evaluate(self, request, candidate):
+        self.requests.append((request, candidate))
+        score = Decimal(str(candidate.param_pack["score"]))
+        if request.start_time == 10:
+            score += Decimal("1")
+            drawdown = Decimal("-2")
+        else:
+            score += Decimal("2")
+            drawdown = Decimal("-5")
         return ParameterEvaluationResult(
             candidate_id=candidate.candidate_id,
-            score_total=Decimal("0"),
+            score_total=score,
+            max_drawdown=drawdown,
+            metrics={
+                "product_id": request.product_id,
+                "timeframe": request.timeframe,
+                "start_time": request.start_time,
+            },
         )
 
 
@@ -32,7 +49,7 @@ def _base_search_request() -> dict:
         "candidates": [
             {
                 "candidate_id": "baseline",
-                "param_pack": {"short_window": 5, "long_window": 20},
+                "param_pack": {"short_window": 5, "long_window": 20, "score": 1},
             },
         ],
     }
@@ -139,7 +156,7 @@ def test_evaluation_dataset_rejects_invalid_warmup_range():
         )
 
 
-def test_parameter_search_rejects_backtest_and_evaluation_set_together():
+def test_parameter_search_accepts_shared_backtest_with_evaluation_set():
     payload = _base_search_request()
     payload["backtest"] = {
         "candles_csv_path": "data/BTCUSDT_5m.csv",
@@ -156,11 +173,88 @@ def test_parameter_search_rejects_backtest_and_evaluation_set_together():
         ],
     }
 
-    with pytest.raises(ValidationError, match="provide either backtest or evaluation_set"):
-        ParameterSearchJobRequest.model_validate(payload)
+    request = ParameterSearchJobRequest.model_validate(payload)
+
+    assert request.backtest is not None
+    assert request.evaluation_set is not None
 
 
-def test_parameter_search_reports_evaluation_set_runtime_as_unsupported():
+def test_parameter_search_aggregates_candidate_across_evaluation_set():
+    payload = _base_search_request()
+    payload["backtest"] = {
+        "candles_csv_path": "data/BTCUSDT_5m.csv",
+    }
+    payload["candidates"] = [
+        {
+            "candidate_id": "candidate_a",
+            "param_pack": {"short_window": 5, "long_window": 20, "score": 1},
+        },
+        {
+            "candidate_id": "candidate_b",
+            "param_pack": {"short_window": 10, "long_window": 30, "score": 3},
+        },
+    ]
+    payload["evaluation_set"] = {
+        "datasets": [
+            {
+                "dataset_id": "trend",
+                "product_id": PRODUCT_ID,
+                "timeframe": "5m",
+                "start_time": 10,
+                "end_time": 20,
+            },
+            {
+                "dataset_id": "chop",
+                "product_id": PRODUCT_ID,
+                "timeframe": "5m",
+                "start_time": 20,
+                "end_time": 30,
+            },
+        ],
+    }
+    request = ParameterSearchJobRequest.model_validate(payload)
+    evaluator = _NoopEvaluator()
+    executor = ParameterSearchJobExecutor(
+        evaluator=evaluator,
+        run_inline=True,
+    )
+
+    job = executor.submit_search(request)
+
+    assert job.status.value == "SUCCEEDED"
+    assert len(evaluator.requests) == 4
+    assert job.result is not None
+    assert job.result["best_candidate"]["candidate_id"] == "candidate_b"
+    assert job.result["best_candidate"]["score_total"] == "9"
+    assert job.result["best_candidate"]["max_drawdown"] == "-5"
+    assert job.result["evaluation_set"]["datasets"] == [
+        {
+            "dataset_id": "trend",
+            "product_id": PRODUCT_ID,
+            "timeframe": "5m",
+            "start_time": 10,
+            "end_time": 20,
+            "warmup_start_time": None,
+            "metadata": {},
+        },
+        {
+            "dataset_id": "chop",
+            "product_id": PRODUCT_ID,
+            "timeframe": "5m",
+            "start_time": 20,
+            "end_time": 30,
+            "warmup_start_time": None,
+            "metadata": {},
+        },
+    ]
+    assert job.result["evaluations"][0]["metrics"]["evaluation_mode"] == "evaluation_set"
+    assert job.result["evaluations"][0]["metrics"]["dataset_scores"] == {
+        "trend": "2",
+        "chop": "3",
+    }
+
+
+def test_parameter_search_rejects_evaluation_dataset_without_backtest_settings():
     payload = _base_search_request()
     payload["evaluation_set"] = {
         "datasets": [
@@ -182,4 +276,4 @@ def test_parameter_search_reports_evaluation_set_runtime_as_unsupported():
     job = executor.submit_search(request)
 
     assert job.status.value == "FAILED"
-    assert job.error == "evaluation_set parameter search is not implemented yet"
+    assert job.error == "evaluation dataset full_history requires backtest settings"

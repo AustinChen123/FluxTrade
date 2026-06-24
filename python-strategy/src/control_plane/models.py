@@ -179,6 +179,7 @@ class EvaluationDatasetConfig(BaseModel):
     start_time: int
     end_time: int
     warmup_start_time: int | None = None
+    backtest: CsvSignalBacktestEvaluationConfig | None = None
     metadata: dict[str, Any] = Field(default_factory=dict)
 
     @field_validator("dataset_id", "product_id", "timeframe")
@@ -290,8 +291,6 @@ class ParameterSearchJobRequest(BaseModel):
             raise ValueError("candidate_sample_count requires search_space")
         if has_search_space and self.candidate_sample_count is None:
             raise ValueError("candidate_sample_count is required with search_space")
-        if self.backtest is not None and self.evaluation_set is not None:
-            raise ValueError("provide either backtest or evaluation_set, not both")
         return self
 
 
