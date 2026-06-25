@@ -2,6 +2,10 @@ from decimal import Decimal
 
 import pytest
 from pydantic import ValidationError
+from sqlalchemy import create_engine
+from sqlalchemy.dialects.postgresql import JSONB
+from sqlalchemy.ext.compiler import compiles
+from sqlalchemy.orm import sessionmaker
 
 from src.control_plane.models import (
     EvaluationSetConfig,
@@ -9,9 +13,15 @@ from src.control_plane.models import (
     ParameterSearchJobRequest,
 )
 from src.control_plane.parameter_search import ParameterSearchJobExecutor
+from src.core.orm_models import EvolutionEpoch, GeneRecord, Strategy, SystemEvent
 
 
 PRODUCT_ID = "BINANCE:BTCUSDT-PERP"
+
+
+@compiles(JSONB, "sqlite")
+def _compile_jsonb_for_sqlite(type_, compiler, **kw):
+    return "JSON"
 
 
 class _NoopEvaluator:
@@ -68,6 +78,26 @@ def _base_search_request() -> dict:
             },
         ],
     }
+
+
+def _sqlite_gene_registry_session_factory(tmp_path):
+    engine = create_engine(
+        f"sqlite:///{tmp_path / 'evaluation_set_gene_registry.db'}",
+        connect_args={"check_same_thread": False, "timeout": 30},
+    )
+    for table in [
+        Strategy.__table__,
+        SystemEvent.__table__,
+        EvolutionEpoch.__table__,
+        GeneRecord.__table__,
+    ]:
+        table.create(engine, checkfirst=True)
+
+    session_factory = sessionmaker(bind=engine)
+    with session_factory() as session:
+        session.add(Strategy(id="golden_cross", name="Golden Cross"))
+        session.commit()
+    return session_factory
 
 
 def test_parameter_search_accepts_evaluation_set_payload():
@@ -346,6 +376,85 @@ def test_parameter_search_aggregates_candidate_across_evaluation_set():
         "trend": "2",
         "chop": "5",
     }
+
+
+def test_parameter_search_persists_evaluation_set_traceability(tmp_path):
+    session_factory = _sqlite_gene_registry_session_factory(tmp_path)
+    payload = _base_search_request()
+    payload["backtest"] = {
+        "candles_csv_path": "data/BTCUSDT_5m.csv",
+    }
+    payload["evaluation_set"] = {
+        "datasets": [
+            {
+                "dataset_id": "trend",
+                "product_id": PRODUCT_ID,
+                "timeframe": "5m",
+                "start_time": 10,
+                "end_time": 20,
+                "metadata": {"regime": "trend"},
+            },
+            {
+                "dataset_id": "selloff",
+                "product_id": PRODUCT_ID,
+                "timeframe": "5m",
+                "start_time": 20,
+                "end_time": 30,
+                "metadata": {"regime": "selloff"},
+            },
+        ],
+    }
+    request = ParameterSearchJobRequest.model_validate(payload)
+    executor = ParameterSearchJobExecutor(
+        evaluator=_NoopEvaluator(),
+        run_inline=True,
+        db_session_factory=session_factory,
+    )
+
+    job = executor.submit_search(request)
+
+    assert job.status.value == "SUCCEEDED"
+    assert job.result is not None
+    assert job.result["epoch_id"].startswith("epoch_")
+    with session_factory() as session:
+        epoch = session.get(EvolutionEpoch, job.result["epoch_id"])
+        gene = (
+            session.query(GeneRecord)
+            .filter(GeneRecord.epoch_id == job.result["epoch_id"])
+            .one()
+        )
+
+    assert epoch.config_json["evaluation_set"]["datasets"] == [
+        {
+            "dataset_id": "trend",
+            "product_id": PRODUCT_ID,
+            "timeframe": "5m",
+            "start_time": 10,
+            "end_time": 20,
+            "warmup_start_time": None,
+            "metadata": {"regime": "trend"},
+        },
+        {
+            "dataset_id": "selloff",
+            "product_id": PRODUCT_ID,
+            "timeframe": "5m",
+            "start_time": 20,
+            "end_time": 30,
+            "warmup_start_time": None,
+            "metadata": {"regime": "selloff"},
+        },
+    ]
+    assert gene.max_drawdown == Decimal("5.00000000")
+    assert gene.score_breakdown["evaluation_mode"] == "evaluation_set"
+    assert gene.score_breakdown["dataset_scores"] == {
+        "trend": "2",
+        "selloff": "3",
+    }
+    assert gene.score_breakdown["dataset_drawdowns"] == {
+        "trend": "2",
+        "selloff": "5",
+    }
+    assert gene.score_breakdown["datasets"]["trend"]["max_drawdown"] == "2"
 
 
 def test_parameter_search_uses_worst_positive_drawdown_across_evaluation_set():
