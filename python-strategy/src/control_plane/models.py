@@ -170,6 +170,39 @@ class CsvSignalBacktestEvaluationConfig(BaseModel):
         return value
 
 
+class PartialCsvSignalBacktestEvaluationConfig(BaseModel):
+    """Per-dataset backtest overrides merged with shared settings."""
+
+    candles_csv_path: str | None = None
+    initial_balance: Decimal | None = None
+    maker_fee: Decimal | None = None
+    taker_fee: Decimal | None = None
+    write_reports: bool | None = None
+
+    @field_validator("candles_csv_path")
+    @classmethod
+    def validate_path(cls, value: str | None) -> str | None:
+        if value is None:
+            return value
+        if not value.strip():
+            raise ValueError("path cannot be blank")
+        return str(Path(value))
+
+    @field_validator("initial_balance")
+    @classmethod
+    def validate_initial_balance(cls, value: Decimal | None) -> Decimal | None:
+        if value is not None and value <= 0:
+            raise ValueError("initial_balance must be positive")
+        return value
+
+    @field_validator("maker_fee", "taker_fee")
+    @classmethod
+    def validate_fee(cls, value: Decimal | None) -> Decimal | None:
+        if value is not None and value < 0:
+            raise ValueError("fee cannot be negative")
+        return value
+
+
 class EvaluationDatasetConfig(BaseModel):
     """One dataset interval for multi-regime parameter evaluation."""
 
@@ -179,7 +212,7 @@ class EvaluationDatasetConfig(BaseModel):
     start_time: int
     end_time: int
     warmup_start_time: int | None = None
-    backtest: CsvSignalBacktestEvaluationConfig | None = None
+    backtest: PartialCsvSignalBacktestEvaluationConfig | None = None
     metadata: dict[str, Any] = Field(default_factory=dict)
 
     @field_validator("dataset_id", "product_id", "timeframe")
@@ -303,6 +336,19 @@ class ParameterSearchJobRequest(BaseModel):
                     "parameter_search evaluation_set does not support "
                     f"warmup_start_time yet: {datasets}"
                 )
+            if self.backtest is None:
+                missing_backtest_dataset_ids = [
+                    dataset.dataset_id
+                    for dataset in self.evaluation_set.datasets
+                    if dataset.backtest is None
+                    or dataset.backtest.candles_csv_path is None
+                ]
+                if missing_backtest_dataset_ids:
+                    datasets = ", ".join(missing_backtest_dataset_ids)
+                    raise ValueError(
+                        "evaluation_set datasets require candles_csv_path when "
+                        f"shared backtest is not provided: {datasets}"
+                    )
         return self
 
 

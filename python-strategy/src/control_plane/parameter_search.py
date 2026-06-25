@@ -13,6 +13,7 @@ from src.control_plane.backtest_jobs import BacktestJobExecutor, SessionFactory,
 from src.control_plane.jobs import InMemoryJobStore, JobStore
 from src.control_plane.models import (
     BacktestJobRequest,
+    CsvSignalBacktestEvaluationConfig,
     EvaluationDatasetConfig,
     JobRecord,
     JobStatus,
@@ -550,11 +551,13 @@ def _request_for_evaluation_dataset(
 def _backtest_for_evaluation_dataset(
     request: ParameterSearchJobRequest,
     dataset: EvaluationDatasetConfig,
-):
+) -> CsvSignalBacktestEvaluationConfig | None:
     if dataset.backtest is None:
         return request.backtest
     if request.backtest is None:
-        return dataset.backtest
+        return CsvSignalBacktestEvaluationConfig.model_validate(
+            dataset.backtest.model_dump(exclude_unset=True)
+        )
 
     return request.backtest.model_copy(
         update=dataset.backtest.model_dump(exclude_unset=True)
@@ -576,10 +579,30 @@ def _evaluation_set_result_payload(
                 "end_time": dataset.end_time,
                 "warmup_start_time": dataset.warmup_start_time,
                 "metadata": dataset.metadata,
+                "backtest": _dataset_backtest_override_payload(dataset),
+                "resolved_backtest": _resolved_dataset_backtest_payload(request, dataset),
             }
             for dataset in request.evaluation_set.datasets
         ]
     }
+
+
+def _dataset_backtest_override_payload(
+    dataset: EvaluationDatasetConfig,
+) -> dict[str, Any] | None:
+    if dataset.backtest is None:
+        return None
+    return _json_safe(dataset.backtest.model_dump(exclude_unset=True))
+
+
+def _resolved_dataset_backtest_payload(
+    request: ParameterSearchJobRequest,
+    dataset: EvaluationDatasetConfig,
+) -> dict[str, Any] | None:
+    backtest = _backtest_for_evaluation_dataset(request, dataset)
+    if backtest is None:
+        return None
+    return _json_safe(backtest.model_dump(mode="json"))
 
 
 def _decimal_key(value: Decimal) -> Decimal:

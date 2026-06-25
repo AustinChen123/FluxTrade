@@ -100,8 +100,33 @@ def _sqlite_gene_registry_session_factory(tmp_path):
     return session_factory
 
 
+def _dataset_payload(
+    dataset_id: str,
+    *,
+    start_time: int,
+    end_time: int,
+    metadata: dict | None = None,
+    backtest: dict | None = None,
+    resolved_backtest: dict | None = None,
+) -> dict:
+    return {
+        "dataset_id": dataset_id,
+        "product_id": PRODUCT_ID,
+        "timeframe": "5m",
+        "start_time": start_time,
+        "end_time": end_time,
+        "warmup_start_time": None,
+        "metadata": metadata or {},
+        "backtest": backtest,
+        "resolved_backtest": resolved_backtest,
+    }
+
+
 def test_parameter_search_accepts_evaluation_set_payload():
     payload = _base_search_request()
+    payload["backtest"] = {
+        "candles_csv_path": "data/BTCUSDT_5m.csv",
+    }
     payload["evaluation_set"] = {
         "datasets": [
             {
@@ -274,6 +299,8 @@ def test_parameter_search_merges_dataset_backtest_overrides_with_shared_settings
                 "end_time": 30,
                 "backtest": {
                     "candles_csv_path": "data/override.csv",
+                    "maker_fee": "0.0004",
+                    "write_reports": False,
                 },
             },
         ],
@@ -294,9 +321,78 @@ def test_parameter_search_merges_dataset_backtest_overrides_with_shared_settings
     assert shared_request.backtest.candles_csv_path == "data/shared.csv"
     assert override_request.backtest.candles_csv_path == "data/override.csv"
     assert override_request.backtest.initial_balance == Decimal("25000")
-    assert override_request.backtest.maker_fee == Decimal("0.0002")
+    assert override_request.backtest.maker_fee == Decimal("0.0004")
     assert override_request.backtest.taker_fee == Decimal("0.0006")
-    assert override_request.backtest.write_reports is True
+    assert override_request.backtest.write_reports is False
+
+
+def test_parameter_search_allows_non_path_dataset_backtest_overrides():
+    payload = _base_search_request()
+    payload["backtest"] = {
+        "candles_csv_path": "data/shared.csv",
+        "initial_balance": "25000",
+        "maker_fee": "0.0002",
+        "taker_fee": "0.0006",
+    }
+    payload["evaluation_set"] = {
+        "datasets": [
+            {
+                "dataset_id": "fee_override",
+                "product_id": PRODUCT_ID,
+                "timeframe": "5m",
+                "start_time": 10,
+                "end_time": 20,
+                "backtest": {
+                    "maker_fee": "0.0008",
+                    "write_reports": True,
+                },
+            },
+        ],
+    }
+
+    request = ParameterSearchJobRequest.model_validate(payload)
+    evaluator = _NoopEvaluator()
+    executor = ParameterSearchJobExecutor(
+        evaluator=evaluator,
+        run_inline=True,
+    )
+
+    job = executor.submit_search(request)
+
+    assert job.status.value == "SUCCEEDED"
+    dataset_request = evaluator.requests[0][0]
+    assert dataset_request.backtest.candles_csv_path == "data/shared.csv"
+    assert dataset_request.backtest.initial_balance == Decimal("25000")
+    assert dataset_request.backtest.maker_fee == Decimal("0.0008")
+    assert dataset_request.backtest.taker_fee == Decimal("0.0006")
+    assert dataset_request.backtest.write_reports is True
+
+
+def test_parameter_search_rejects_partial_dataset_backtest_without_shared_path():
+    payload = _base_search_request()
+    payload["evaluation_set"] = {
+        "datasets": [
+            {
+                "dataset_id": "missing_path",
+                "product_id": PRODUCT_ID,
+                "timeframe": "5m",
+                "start_time": 10,
+                "end_time": 20,
+                "backtest": {
+                    "maker_fee": "0.0008",
+                },
+            },
+        ],
+    }
+
+    with pytest.raises(
+        ValidationError,
+        match=(
+            "evaluation_set datasets require candles_csv_path when shared "
+            "backtest is not provided: missing_path"
+        ),
+    ):
+        ParameterSearchJobRequest.model_validate(payload)
 
 
 def test_parameter_search_aggregates_candidate_across_evaluation_set():
@@ -347,25 +443,26 @@ def test_parameter_search_aggregates_candidate_across_evaluation_set():
     assert job.result["best_candidate"]["candidate_id"] == "candidate_b"
     assert job.result["best_candidate"]["score_total"] == "9"
     assert job.result["best_candidate"]["max_drawdown"] == "5"
+    resolved_backtest = {
+        "candles_csv_path": "data/BTCUSDT_5m.csv",
+        "initial_balance": "10000",
+        "maker_fee": "0",
+        "taker_fee": "0",
+        "write_reports": False,
+    }
     assert job.result["evaluation_set"]["datasets"] == [
-        {
-            "dataset_id": "trend",
-            "product_id": PRODUCT_ID,
-            "timeframe": "5m",
-            "start_time": 10,
-            "end_time": 20,
-            "warmup_start_time": None,
-            "metadata": {},
-        },
-        {
-            "dataset_id": "chop",
-            "product_id": PRODUCT_ID,
-            "timeframe": "5m",
-            "start_time": 20,
-            "end_time": 30,
-            "warmup_start_time": None,
-            "metadata": {},
-        },
+        _dataset_payload(
+            "trend",
+            start_time=10,
+            end_time=20,
+            resolved_backtest=resolved_backtest,
+        ),
+        _dataset_payload(
+            "chop",
+            start_time=20,
+            end_time=30,
+            resolved_backtest=resolved_backtest,
+        ),
     ]
     assert job.result["evaluations"][0]["metrics"]["evaluation_mode"] == "evaluation_set"
     assert job.result["evaluations"][0]["metrics"]["dataset_scores"] == {
@@ -383,6 +480,10 @@ def test_parameter_search_persists_evaluation_set_traceability(tmp_path):
     payload = _base_search_request()
     payload["backtest"] = {
         "candles_csv_path": "data/BTCUSDT_5m.csv",
+        "initial_balance": "25000",
+        "maker_fee": "0.0002",
+        "taker_fee": "0.0006",
+        "write_reports": True,
     }
     payload["evaluation_set"] = {
         "datasets": [
@@ -401,6 +502,11 @@ def test_parameter_search_persists_evaluation_set_traceability(tmp_path):
                 "start_time": 20,
                 "end_time": 30,
                 "metadata": {"regime": "selloff"},
+                "backtest": {
+                    "candles_csv_path": "data/selloff.csv",
+                    "maker_fee": "0.0004",
+                    "write_reports": False,
+                },
             },
         ],
     }
@@ -424,25 +530,38 @@ def test_parameter_search_persists_evaluation_set_traceability(tmp_path):
             .one()
         )
 
+    trend_resolved_backtest = {
+        "candles_csv_path": "data/BTCUSDT_5m.csv",
+        "initial_balance": "25000",
+        "maker_fee": "0.0002",
+        "taker_fee": "0.0006",
+        "write_reports": True,
+    }
+    selloff_backtest_override = {
+        "candles_csv_path": "data/selloff.csv",
+        "maker_fee": "0.0004",
+        "write_reports": False,
+    }
+    selloff_resolved_backtest = {
+        **trend_resolved_backtest,
+        **selloff_backtest_override,
+    }
     assert epoch.config_json["evaluation_set"]["datasets"] == [
-        {
-            "dataset_id": "trend",
-            "product_id": PRODUCT_ID,
-            "timeframe": "5m",
-            "start_time": 10,
-            "end_time": 20,
-            "warmup_start_time": None,
-            "metadata": {"regime": "trend"},
-        },
-        {
-            "dataset_id": "selloff",
-            "product_id": PRODUCT_ID,
-            "timeframe": "5m",
-            "start_time": 20,
-            "end_time": 30,
-            "warmup_start_time": None,
-            "metadata": {"regime": "selloff"},
-        },
+        _dataset_payload(
+            "trend",
+            start_time=10,
+            end_time=20,
+            metadata={"regime": "trend"},
+            resolved_backtest=trend_resolved_backtest,
+        ),
+        _dataset_payload(
+            "selloff",
+            start_time=20,
+            end_time=30,
+            metadata={"regime": "selloff"},
+            backtest=selloff_backtest_override,
+            resolved_backtest=selloff_resolved_backtest,
+        ),
     ]
     assert gene.max_drawdown == Decimal("5.00000000")
     assert gene.score_breakdown["evaluation_mode"] == "evaluation_set"
@@ -569,13 +688,12 @@ def test_parameter_search_rejects_evaluation_dataset_without_backtest_settings()
             },
         ],
     }
-    request = ParameterSearchJobRequest.model_validate(payload)
-    executor = ParameterSearchJobExecutor(
-        evaluator=_NoopEvaluator(),
-        run_inline=True,
-    )
 
-    job = executor.submit_search(request)
-
-    assert job.status.value == "FAILED"
-    assert job.error == "evaluation dataset full_history requires backtest settings"
+    with pytest.raises(
+        ValidationError,
+        match=(
+            "evaluation_set datasets require candles_csv_path when shared "
+            "backtest is not provided: full_history"
+        ),
+    ):
+        ParameterSearchJobRequest.model_validate(payload)
