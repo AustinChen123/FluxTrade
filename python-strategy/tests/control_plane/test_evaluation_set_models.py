@@ -37,6 +37,7 @@ class _NoopEvaluator:
                 "product_id": request.product_id,
                 "timeframe": request.timeframe,
                 "start_time": request.start_time,
+                "max_drawdown": drawdown,
             },
         )
 
@@ -264,7 +265,7 @@ def test_parameter_search_aggregates_candidate_across_evaluation_set():
     assert job.result is not None
     assert job.result["best_candidate"]["candidate_id"] == "candidate_b"
     assert job.result["best_candidate"]["score_total"] == "9"
-    assert job.result["best_candidate"]["max_drawdown"] == "-5"
+    assert job.result["best_candidate"]["max_drawdown"] == "5"
     assert job.result["evaluation_set"]["datasets"] == [
         {
             "dataset_id": "trend",
@@ -289,6 +290,10 @@ def test_parameter_search_aggregates_candidate_across_evaluation_set():
     assert job.result["evaluations"][0]["metrics"]["dataset_scores"] == {
         "trend": "2",
         "chop": "3",
+    }
+    assert job.result["evaluations"][0]["metrics"]["dataset_drawdowns"] == {
+        "trend": "2",
+        "chop": "5",
     }
 
 
@@ -365,6 +370,30 @@ def test_parameter_search_minimizes_drawdown_magnitude_for_negative_values():
     assert job.status.value == "SUCCEEDED"
     assert job.result is not None
     assert job.result["best_candidate"]["candidate_id"] == "small_loss"
+    assert job.result["best_candidate"]["max_drawdown"] == "0.02"
+
+
+def test_parameter_search_normalizes_single_dataset_drawdown_boundary():
+    payload = _base_search_request()
+    payload["candidates"] = [
+        {
+            "candidate_id": "signed_loss",
+            "param_pack": {"score": 1, "drawdown": "-0.40"},
+        },
+    ]
+    request = ParameterSearchJobRequest.model_validate(payload)
+    executor = ParameterSearchJobExecutor(
+        evaluator=_NoopEvaluator(),
+        run_inline=True,
+    )
+
+    job = executor.submit_search(request)
+
+    assert job.status.value == "SUCCEEDED"
+    assert job.result is not None
+    assert job.result["best_candidate"]["max_drawdown"] == "0.40"
+    assert job.result["evaluations"][0]["max_drawdown"] == "0.40"
+    assert job.result["evaluations"][0]["metrics"]["max_drawdown"] == "0.40"
 
 
 def test_parameter_search_rejects_evaluation_dataset_without_backtest_settings():

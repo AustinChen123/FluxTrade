@@ -86,8 +86,8 @@ class CsvSignalBacktestParameterEvaluator:
         return ParameterEvaluationResult(
             candidate_id=candidate.candidate_id,
             score_total=score,
-            max_drawdown=max_drawdown,
-            metrics=result,
+            max_drawdown=_drawdown_loss_magnitude(max_drawdown),
+            metrics=_normalize_metrics_drawdown(result),
         )
 
 
@@ -150,8 +150,10 @@ class ResearchBacktestParameterEvaluator:
         return ParameterEvaluationResult(
             candidate_id=candidate.candidate_id,
             score_total=_result_decimal(result, "total_pnl"),
-            max_drawdown=_result_decimal(result, "max_drawdown"),
-            metrics=_json_safe(metrics),
+            max_drawdown=_drawdown_loss_magnitude(
+                _result_decimal(result, "max_drawdown")
+            ),
+            metrics=_normalize_metrics_drawdown(metrics),
         )
 
     def _replay_inputs_for(self, request: ParameterSearchJobRequest):
@@ -233,8 +235,8 @@ class GoldenCrossFastFitnessParameterEvaluator:
         return ParameterEvaluationResult(
             candidate_id=candidate.candidate_id,
             score_total=result.total_pnl,
-            max_drawdown=result.max_drawdown,
-            metrics=_json_safe(metrics),
+            max_drawdown=_drawdown_loss_magnitude(result.max_drawdown),
+            metrics=_normalize_metrics_drawdown(metrics),
         )
 
     def _evaluator_for(
@@ -398,7 +400,9 @@ class ParameterSearchJobExecutor:
             ]
         else:
             evaluations = [
-                self.evaluator.evaluate(request, candidate)
+                _normalize_evaluation_result(
+                    self.evaluator.evaluate(request, candidate)
+                )
                 for candidate in candidates
             ]
         best = _select_best_candidate(request, evaluations)
@@ -460,7 +464,9 @@ def _evaluate_candidate_across_datasets(
 
     for dataset in request.evaluation_set.datasets:
         dataset_request = _request_for_evaluation_dataset(request, dataset)
-        evaluation = evaluator.evaluate(dataset_request, candidate)
+        evaluation = _normalize_evaluation_result(
+            evaluator.evaluate(dataset_request, candidate)
+        )
         dataset_results[dataset.dataset_id] = evaluation.metrics
         dataset_scores[dataset.dataset_id] = evaluation.score_total
         dataset_drawdowns[dataset.dataset_id] = evaluation.max_drawdown
@@ -485,7 +491,37 @@ def _worst_drawdown(drawdowns: Iterable[Decimal]) -> Decimal:
     return max(drawdowns, key=_drawdown_risk_key, default=Decimal("0"))
 
 
+def _normalize_evaluation_result(
+    evaluation: ParameterEvaluationResult,
+) -> ParameterEvaluationResult:
+    max_drawdown = _drawdown_loss_magnitude(evaluation.max_drawdown)
+    metrics = _normalize_metrics_drawdown(evaluation.metrics)
+    if max_drawdown == evaluation.max_drawdown and metrics == evaluation.metrics:
+        return evaluation
+    return evaluation.model_copy(
+        update={
+            "max_drawdown": max_drawdown,
+            "metrics": metrics,
+        }
+    )
+
+
+def _normalize_metrics_drawdown(metrics: dict[str, Any]) -> dict[str, Any]:
+    if "max_drawdown" not in metrics:
+        return _json_safe(metrics)
+
+    normalized = dict(metrics)
+    normalized["max_drawdown"] = _drawdown_loss_magnitude(
+        Decimal(str(normalized["max_drawdown"]))
+    )
+    return _json_safe(normalized)
+
+
 def _drawdown_risk_key(drawdown: Decimal) -> Decimal:
+    return abs(drawdown)
+
+
+def _drawdown_loss_magnitude(drawdown: Decimal) -> Decimal:
     return abs(drawdown)
 
 
