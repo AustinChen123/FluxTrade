@@ -218,6 +218,57 @@ def test_parameter_search_accepts_shared_backtest_with_evaluation_set():
     assert request.evaluation_set is not None
 
 
+def test_parameter_search_merges_dataset_backtest_overrides_with_shared_settings():
+    payload = _base_search_request()
+    payload["backtest"] = {
+        "candles_csv_path": "data/shared.csv",
+        "initial_balance": "25000",
+        "maker_fee": "0.0002",
+        "taker_fee": "0.0006",
+        "write_reports": True,
+    }
+    payload["evaluation_set"] = {
+        "datasets": [
+            {
+                "dataset_id": "shared_file",
+                "product_id": PRODUCT_ID,
+                "timeframe": "5m",
+                "start_time": 10,
+                "end_time": 20,
+            },
+            {
+                "dataset_id": "override_file",
+                "product_id": PRODUCT_ID,
+                "timeframe": "5m",
+                "start_time": 20,
+                "end_time": 30,
+                "backtest": {
+                    "candles_csv_path": "data/override.csv",
+                },
+            },
+        ],
+    }
+    request = ParameterSearchJobRequest.model_validate(payload)
+    evaluator = _NoopEvaluator()
+    executor = ParameterSearchJobExecutor(
+        evaluator=evaluator,
+        run_inline=True,
+    )
+
+    job = executor.submit_search(request)
+
+    assert job.status.value == "SUCCEEDED"
+    assert len(evaluator.requests) == 2
+    shared_request = evaluator.requests[0][0]
+    override_request = evaluator.requests[1][0]
+    assert shared_request.backtest.candles_csv_path == "data/shared.csv"
+    assert override_request.backtest.candles_csv_path == "data/override.csv"
+    assert override_request.backtest.initial_balance == Decimal("25000")
+    assert override_request.backtest.maker_fee == Decimal("0.0002")
+    assert override_request.backtest.taker_fee == Decimal("0.0006")
+    assert override_request.backtest.write_reports is True
+
+
 def test_parameter_search_aggregates_candidate_across_evaluation_set():
     payload = _base_search_request()
     payload["backtest"] = {

@@ -529,7 +529,7 @@ def _request_for_evaluation_dataset(
     request: ParameterSearchJobRequest,
     dataset: EvaluationDatasetConfig,
 ) -> ParameterSearchJobRequest:
-    backtest = dataset.backtest or request.backtest
+    backtest = _backtest_for_evaluation_dataset(request, dataset)
     if backtest is None:
         raise ValueError(
             f"evaluation dataset {dataset.dataset_id} requires backtest settings"
@@ -544,6 +544,20 @@ def _request_for_evaluation_dataset(
             "evaluation_set": None,
         },
         deep=True,
+    )
+
+
+def _backtest_for_evaluation_dataset(
+    request: ParameterSearchJobRequest,
+    dataset: EvaluationDatasetConfig,
+):
+    if dataset.backtest is None:
+        return request.backtest
+    if request.backtest is None:
+        return dataset.backtest
+
+    return request.backtest.model_copy(
+        update=dataset.backtest.model_dump(exclude_unset=True)
     )
 
 
