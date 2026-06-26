@@ -185,7 +185,7 @@ class SimulatedAdapter(IExchangeAdapter):
         if peak_equity is None or peak_equity <= 0:
             current_drawdown = Decimal("0")
         else:
-            current_drawdown = total_equity - peak_equity
+            current_drawdown = max(peak_equity - total_equity, Decimal("0"))
 
         return StrategyContext(
             strategy_id=strategy_id,
