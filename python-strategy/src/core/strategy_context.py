@@ -71,7 +71,15 @@ class RiskSnapshot:
 
 @dataclass(frozen=True, slots=True)
 class StrategyContext:
-    """Read-only account/position/risk snapshot for one strategy decision."""
+    """Read-only account/position/risk snapshot for one strategy decision.
+
+    Account fields are a research/control-plane boundary contract:
+    ``available_cash`` is the matcher-backed cash balance exposed by the
+    adapter, ``total_equity`` is ``available_cash + unrealized_pnl``, and
+    ``realized_pnl`` is ``total_equity - initial_balance``. Drawdown fields are
+    non-negative loss magnitudes. This context does not yet model reserved cash,
+    isolated per-strategy capital, margin, or a full portfolio NAV.
+    """
 
     strategy_id: str
     product_id: str

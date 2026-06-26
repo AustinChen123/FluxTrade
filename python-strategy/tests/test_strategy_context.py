@@ -112,6 +112,51 @@ def test_strategy_context_drawdown_is_loss_magnitude():
     assert context.max_drawdown == Decimal("1000")
 
 
+@pytest.mark.rust
+@pytest.mark.skipif(not HAS_RUST, reason="fluxtrade_core.so not compiled")
+def test_strategy_context_account_fields_follow_research_contract():
+    candles = make_candle_series(count=2)
+    adapter = SimulatedAdapter(
+        initial_balance=Decimal("10000"),
+        maker_fee=Decimal("0.0002"),
+        taker_fee=Decimal("0.0006"),
+    )
+
+    empty_context = adapter.get_strategy_context(
+        strategy_id="ctx_strategy",
+        product_id=PRODUCT_ID,
+        timestamp=candles[0].timestamp,
+        initial_balance=Decimal("10000"),
+        mark_price=candles[0].close,
+    )
+
+    assert empty_context.available_cash == Decimal("10000")
+    assert empty_context.unrealized_pnl == Decimal("0")
+    assert empty_context.total_equity == (
+        empty_context.available_cash + empty_context.unrealized_pnl
+    )
+    assert empty_context.realized_pnl == Decimal("0")
+
+    adapter.place_order(_market_order("ctx_account", timestamp=candles[0].timestamp))
+    fills = adapter.on_market_data(candles[1])
+    filled_context = adapter.get_strategy_context(
+        strategy_id="ctx_strategy",
+        product_id=PRODUCT_ID,
+        timestamp=candles[1].timestamp,
+        initial_balance=Decimal("10000"),
+        mark_price=candles[1].close,
+        latest_fills=fills,
+    )
+
+    assert filled_context.available_cash < Decimal("10000")
+    assert filled_context.total_equity == (
+        filled_context.available_cash + filled_context.unrealized_pnl
+    )
+    assert filled_context.realized_pnl == (
+        filled_context.total_equity - Decimal("10000")
+    )
+
+
 class ContextProbeStrategy(BaseStrategy):
     def __init__(self) -> None:
         super().__init__("ctx_strategy", PRODUCT_ID)
