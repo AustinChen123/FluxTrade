@@ -145,6 +145,8 @@ class ResearchBacktestRunner:
                     )
                 signals = self._signals_from_strategy(strategy, candle, context)
                 for signal in signals:
+                    if self._capital_rejects_entry(signal, candle):
+                        continue
                     order = self._order_from_signal(signal, candle)
                     if order is not None:
                         adapter.place_order(order)
@@ -330,6 +332,32 @@ class ResearchBacktestRunner:
             raise TypeError("strategy.on_candle() must return None, Signal, or list[Signal]")
         return [signal for signal in signals if signal.type != SignalType.NO_SIGNAL]
 
+    def _capital_rejects_entry(
+        self,
+        signal: Signal,
+        candle: Candlestick,
+    ) -> bool:
+        if self.capital_allocator is None:
+            return False
+        if signal.type not in (SignalType.LONG, SignalType.SHORT):
+            return False
+
+        quantity = signal.quantity if signal.quantity and signal.quantity > 0 else Decimal("0.01")
+        price = self._signal_execution_price(signal, candle)
+        required = abs(quantity * price)
+        available = self.capital_allocator.get_available(signal.strategy_id)
+        if required <= available:
+            return False
+
+        logger.info(
+            "Research entry rejected by capital allocation: strategy_id=%s "
+            "required=%s available=%s",
+            signal.strategy_id,
+            required,
+            available,
+        )
+        return True
+
     def _order_from_signal(
         self,
         signal: Signal,
@@ -367,6 +395,14 @@ class ResearchBacktestRunner:
             filled_quantity=Decimal("0"),
             filled_price=Decimal("0"),
         )
+
+    @staticmethod
+    def _signal_execution_price(signal: Signal, candle: Candlestick) -> Decimal:
+        if signal.price and signal.price > 0:
+            return signal.price
+        if signal.value and signal.value > 0:
+            return signal.value
+        return candle.close
 
     def _fills_to_trades(self, fills: list[dict], candle: Candlestick) -> list[ResearchTrade]:
         trades: list[ResearchTrade] = []

@@ -153,12 +153,14 @@ class TestUsageTracking:
         assert allocator.get_used("strat_a") == Decimal("0")
         assert allocator.get_available("strat_a") == Decimal("30000")
 
-    def test_set_usage_exceeds_allocation_raises(self):
+    def test_set_usage_can_record_mark_to_market_over_allocation(self):
         allocator = CapitalAllocator(Decimal("100000"))
         allocator.allocate("strat_a", Decimal("30000"))
 
-        with pytest.raises(ValueError, match="only 30000 allocated"):
-            allocator.set_usage("strat_a", Decimal("30001"))
+        allocator.set_usage("strat_a", Decimal("30001"))
+
+        assert allocator.get_used("strat_a") == Decimal("30001")
+        assert allocator.get_available("strat_a") == Decimal("-1")
 
     def test_record_usage_exceeds_available_raises(self):
         allocator = CapitalAllocator(Decimal("100000"))

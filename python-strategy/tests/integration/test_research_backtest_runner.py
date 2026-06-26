@@ -155,6 +155,37 @@ class CapitalLifecycleProbeStrategy(BaseStrategy):
         return None
 
 
+class CapitalGatedEntryStrategy(BaseStrategy):
+    def __init__(self) -> None:
+        super().__init__("capital_gated_entry", PRODUCT_ID)
+        self.contexts: list[StrategyContext] = []
+        self._sent = False
+
+    @property
+    def requirements(self) -> StrategyRequirements:
+        return StrategyRequirements(PRODUCT_ID, TIMEFRAME, 1)
+
+    def on_candle(
+        self,
+        candle: Candlestick,
+        context: StrategyContext | None = None,
+    ) -> Signal | None:
+        if context is None:
+            raise AssertionError("capital gating test requires context")
+        self.contexts.append(context)
+        if self._sent:
+            return None
+        self._sent = True
+        return Signal(
+            strategy_id=self.strategy_id,
+            product_id=PRODUCT_ID,
+            timeframe=TIMEFRAME,
+            timestamp=candle.timestamp,
+            type=SignalType.LONG,
+            quantity=Decimal("0.01"),
+        )
+
+
 @pytest.mark.smoke
 def test_research_backtest_matches_full_runner_core_metrics(tmp_path):
     session_factory = _sqlite_backtest_session_factory(tmp_path)
@@ -250,6 +281,31 @@ def test_research_backtest_syncs_capital_lifecycle_after_fills():
     assert strategy.contexts[2].capital is not None
     assert strategy.contexts[2].capital.used == Decimal("0")
     assert strategy.contexts[2].capital.available == Decimal("5000")
+    assert allocator.get_used(strategy.strategy_id) == Decimal("0")
+
+
+def test_research_backtest_rejects_entry_over_available_capital():
+    candles = make_candle_series(count=3)
+    strategy = CapitalGatedEntryStrategy()
+    allocator = CapitalAllocator(Decimal("100000"))
+    allocator.allocate(strategy.strategy_id, Decimal("100"))
+    runner = ResearchBacktestRunner(
+        start_time=candles[0].timestamp,
+        end_time=candles[-1].timestamp,
+        product_id=PRODUCT_ID,
+        timeframe=TIMEFRAME,
+        initial_balance=10_000.0,
+        data_source=MemoryDataSource(candles),
+        capital_allocator=allocator,
+    )
+    runner.add_strategy(strategy)
+
+    result = runner.run()
+
+    assert result["raw_trade_count"] == 0
+    assert result["total_trades"] == 0
+    assert strategy.contexts[0].capital is not None
+    assert strategy.contexts[0].capital.available == Decimal("100")
     assert allocator.get_used(strategy.strategy_id) == Decimal("0")
 
 
