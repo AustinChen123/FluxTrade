@@ -102,6 +102,15 @@ class ResearchBacktestRunner:
             strategy.strategy_id: _strategy_accepts_context(strategy)
             for strategy in self._strategies
         }
+        initial_equity = Decimal(str(self.initial_balance))
+        peak_equity_by_strategy = {
+            strategy.strategy_id: initial_equity
+            for strategy in self._strategies
+        }
+        max_drawdown_by_strategy = {
+            strategy.strategy_id: Decimal("0")
+            for strategy in self._strategies
+        }
 
         candle_count = 0
         for candle, prepared_candle in self._iter_replay_candles(adapter):
@@ -120,13 +129,13 @@ class ResearchBacktestRunner:
                     continue
                 context = None
                 if context_support[strategy.strategy_id]:
-                    context = adapter.get_strategy_context(
-                        strategy_id=strategy.strategy_id,
-                        product_id=candle.product_id,
-                        timestamp=candle.timestamp,
-                        initial_balance=Decimal(str(self.initial_balance)),
-                        mark_price=candle.close,
+                    context = self._strategy_context(
+                        adapter=adapter,
+                        strategy=strategy,
+                        candle=candle,
                         latest_fills=fills,
+                        peak_equity_by_strategy=peak_equity_by_strategy,
+                        max_drawdown_by_strategy=max_drawdown_by_strategy,
                     )
                 signals = self._signals_from_strategy(strategy, candle, context)
                 for signal in signals:
@@ -229,6 +238,53 @@ class ResearchBacktestRunner:
         if self.max_drawdown_limit is None:
             return None
         return Decimal(str(self.initial_balance)) * Decimal(str(1 - self.max_drawdown_limit))
+
+    def _strategy_context(
+        self,
+        *,
+        adapter: SimulatedAdapter,
+        strategy: BaseStrategy,
+        candle: Candlestick,
+        latest_fills: list[dict],
+        peak_equity_by_strategy: dict[str, Decimal],
+        max_drawdown_by_strategy: dict[str, Decimal],
+    ) -> StrategyContext:
+        strategy_id = strategy.strategy_id
+        initial_balance = Decimal(str(self.initial_balance))
+        context = adapter.get_strategy_context(
+            strategy_id=strategy_id,
+            product_id=candle.product_id,
+            timestamp=candle.timestamp,
+            initial_balance=initial_balance,
+            mark_price=candle.close,
+            peak_equity=peak_equity_by_strategy[strategy_id],
+            max_drawdown=max_drawdown_by_strategy[strategy_id],
+            latest_fills=latest_fills,
+        )
+
+        peak_equity = max(peak_equity_by_strategy[strategy_id], context.total_equity)
+        current_drawdown = max(peak_equity - context.total_equity, Decimal("0"))
+        max_drawdown = max(max_drawdown_by_strategy[strategy_id], current_drawdown)
+        peak_equity_by_strategy[strategy_id] = peak_equity
+        max_drawdown_by_strategy[strategy_id] = max_drawdown
+
+        if (
+            peak_equity == context.total_equity
+            and context.current_drawdown == current_drawdown
+            and context.max_drawdown == max_drawdown
+        ):
+            return context
+
+        return adapter.get_strategy_context(
+            strategy_id=strategy_id,
+            product_id=candle.product_id,
+            timestamp=candle.timestamp,
+            initial_balance=initial_balance,
+            mark_price=candle.close,
+            peak_equity=peak_equity,
+            max_drawdown=max_drawdown,
+            latest_fills=latest_fills,
+        )
 
     def _signals_from_strategy(
         self,
