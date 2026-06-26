@@ -84,6 +84,7 @@ class ResearchBacktestRunner:
         self.precision_codec = precision_codec
         self.prepared_scaled_candles = prepared_scaled_candles
         self.capital_allocator = capital_allocator
+        self._reserved_entry_capital: dict[str, tuple[str, Decimal]] = {}
         self.clock = BacktestClock(start_time=start_time / 1000)
         self._strategies: list[BaseStrategy] = []
 
@@ -95,6 +96,7 @@ class ResearchBacktestRunner:
             logger.warning("No strategies added. Exiting.")
             return {}
 
+        self._reserved_entry_capital = {}
         adapter = SimulatedAdapter(
             initial_balance=Decimal(str(self.initial_balance)),
             maker_fee=Decimal(str(self.fee_config.get("maker", 0))),
@@ -150,6 +152,7 @@ class ResearchBacktestRunner:
                     order = self._order_from_signal(signal, candle)
                     if order is not None:
                         adapter.place_order(order)
+                        self._reserve_entry_capital(signal, order, candle)
 
             candle_count += 1
             if (
@@ -303,6 +306,12 @@ class ResearchBacktestRunner:
     ) -> None:
         if self.capital_allocator is None:
             return
+        open_order_ids = {order.id for order in adapter.get_open_orders()}
+        self._reserved_entry_capital = {
+            order_id: reservation
+            for order_id, reservation in self._reserved_entry_capital.items()
+            if order_id in open_order_ids
+        }
         for strategy in self._strategies:
             if strategy.product_id != candle.product_id:
                 continue
@@ -310,6 +319,11 @@ class ResearchBacktestRunner:
             used = Decimal("0")
             if position is not None:
                 used = abs(position.quantity) * candle.close
+            used += sum(
+                reserved
+                for strategy_id, reserved in self._reserved_entry_capital.values()
+                if strategy_id == strategy.strategy_id
+            )
             self.capital_allocator.set_usage(strategy.strategy_id, used)
 
     def _signals_from_strategy(
@@ -342,9 +356,7 @@ class ResearchBacktestRunner:
         if signal.type not in (SignalType.LONG, SignalType.SHORT):
             return False
 
-        quantity = signal.quantity if signal.quantity and signal.quantity > 0 else Decimal("0.01")
-        price = self._signal_execution_price(signal, candle)
-        required = abs(quantity * price)
+        required = self._entry_required_capital(signal, candle)
         available = self.capital_allocator.get_available(signal.strategy_id)
         if required <= available:
             return False
@@ -357,6 +369,22 @@ class ResearchBacktestRunner:
             available,
         )
         return True
+
+    def _reserve_entry_capital(
+        self,
+        signal: Signal,
+        order: Order,
+        candle: Candlestick,
+    ) -> None:
+        if self.capital_allocator is None:
+            return
+        if signal.type not in (SignalType.LONG, SignalType.SHORT):
+            return
+
+        required = self._entry_required_capital(signal, candle)
+        self._reserved_entry_capital[order.id] = (signal.strategy_id, required)
+        current_used = self.capital_allocator.get_used(signal.strategy_id)
+        self.capital_allocator.set_usage(signal.strategy_id, current_used + required)
 
     def _order_from_signal(
         self,
@@ -395,6 +423,11 @@ class ResearchBacktestRunner:
             filled_quantity=Decimal("0"),
             filled_price=Decimal("0"),
         )
+
+    def _entry_required_capital(self, signal: Signal, candle: Candlestick) -> Decimal:
+        quantity = signal.quantity if signal.quantity and signal.quantity > 0 else Decimal("0.01")
+        price = self._signal_execution_price(signal, candle)
+        return abs(quantity * price)
 
     @staticmethod
     def _signal_execution_price(signal: Signal, candle: Candlestick) -> Decimal:

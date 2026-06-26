@@ -272,6 +272,87 @@ class SingleEntryStrategy(BaseStrategy):
         )
 
 
+class MultiEntryStrategy(BaseStrategy):
+    def __init__(self, quantity: Decimal = Decimal("0.006")) -> None:
+        super().__init__("multi_entry", PRODUCT_ID)
+        self.quantity = quantity
+        self.contexts: list[StrategyContext] = []
+        self._sent = False
+
+    @property
+    def requirements(self) -> StrategyRequirements:
+        return StrategyRequirements(PRODUCT_ID, "15m", 1)
+
+    def on_candle(
+        self,
+        candle: Candlestick,
+        context: StrategyContext | None = None,
+    ) -> list[Signal] | None:
+        if context is not None:
+            self.contexts.append(context)
+        if self._sent:
+            return None
+        self._sent = True
+        return [
+            Signal(
+                strategy_id=self.strategy_id,
+                product_id=PRODUCT_ID,
+                timeframe="15m",
+                timestamp=candle.timestamp,
+                type=SignalType.LONG,
+                quantity=self.quantity,
+            ),
+            Signal(
+                strategy_id=self.strategy_id,
+                product_id=PRODUCT_ID,
+                timeframe="15m",
+                timestamp=candle.timestamp,
+                type=SignalType.LONG,
+                quantity=self.quantity,
+            ),
+        ]
+
+
+class PendingLimitThenEntryStrategy(BaseStrategy):
+    def __init__(self) -> None:
+        super().__init__("pending_limit_then_entry", PRODUCT_ID)
+        self.contexts: list[StrategyContext] = []
+        self._count = 0
+
+    @property
+    def requirements(self) -> StrategyRequirements:
+        return StrategyRequirements(PRODUCT_ID, "15m", 1)
+
+    def on_candle(
+        self,
+        candle: Candlestick,
+        context: StrategyContext | None = None,
+    ) -> Signal | None:
+        if context is not None:
+            self.contexts.append(context)
+        self._count += 1
+        if self._count == 1:
+            return Signal(
+                strategy_id=self.strategy_id,
+                product_id=PRODUCT_ID,
+                timeframe="15m",
+                timestamp=candle.timestamp,
+                type=SignalType.LONG,
+                quantity=Decimal("0.006"),
+                price=Decimal("49000"),
+            )
+        if self._count == 2:
+            return Signal(
+                strategy_id=self.strategy_id,
+                product_id=PRODUCT_ID,
+                timeframe="15m",
+                timestamp=candle.timestamp,
+                type=SignalType.LONG,
+                quantity=Decimal("0.006"),
+            )
+        return None
+
+
 @pytest.mark.rust
 @pytest.mark.skipif(not HAS_RUST, reason="fluxtrade_core.so not compiled")
 def test_research_runner_passes_context_after_existing_fills():
@@ -490,6 +571,58 @@ def test_research_runner_allows_entry_when_capital_is_sufficient():
 
     assert result["raw_trade_count"] == 1
     assert allocator.get_used(strategy.strategy_id) == Decimal("0.01") * candles[-1].close
+
+
+@pytest.mark.rust
+@pytest.mark.skipif(not HAS_RUST, reason="fluxtrade_core.so not compiled")
+def test_research_runner_reserves_capital_between_same_candle_entries():
+    candles = make_candle_series(count=3)
+    strategy = MultiEntryStrategy(quantity=Decimal("0.006"))
+    allocator = CapitalAllocator(Decimal("100000"))
+    allocator.allocate(strategy.strategy_id, Decimal("500"))
+    runner = ResearchBacktestRunner(
+        start_time=candles[0].timestamp,
+        end_time=candles[-1].timestamp,
+        product_id=PRODUCT_ID,
+        timeframe="15m",
+        initial_balance=10_000.0,
+        data_source=MemoryDataSource(candles),
+        capital_allocator=allocator,
+    )
+    runner.add_strategy(strategy)
+
+    result = runner.run()
+
+    assert result["raw_trade_count"] == 1
+    assert allocator.get_used(strategy.strategy_id) == Decimal("0.006") * candles[-1].close
+
+
+@pytest.mark.rust
+@pytest.mark.skipif(not HAS_RUST, reason="fluxtrade_core.so not compiled")
+def test_research_runner_reserves_capital_for_pending_entry_orders():
+    candles = make_candle_series(count=3)
+    strategy = PendingLimitThenEntryStrategy()
+    allocator = CapitalAllocator(Decimal("100000"))
+    allocator.allocate(strategy.strategy_id, Decimal("500"))
+    runner = ResearchBacktestRunner(
+        start_time=candles[0].timestamp,
+        end_time=candles[-1].timestamp,
+        product_id=PRODUCT_ID,
+        timeframe="15m",
+        initial_balance=10_000.0,
+        data_source=MemoryDataSource(candles),
+        capital_allocator=allocator,
+    )
+    runner.add_strategy(strategy)
+
+    result = runner.run()
+
+    assert result["raw_trade_count"] == 0
+    assert allocator.get_used(strategy.strategy_id) == Decimal("0.006") * Decimal("49000")
+    assert strategy.contexts[1].capital is not None
+    assert strategy.contexts[1].capital.available == (
+        Decimal("500") - Decimal("0.006") * Decimal("49000")
+    )
 
 
 @pytest.mark.rust
