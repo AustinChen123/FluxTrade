@@ -4,11 +4,12 @@ import pytest
 
 from integration.conftest import PRODUCT_ID, make_candle_series
 from src.core.adapters.simulated import SimulatedAdapter
+from src.core.capital_allocator import CapitalAllocator
 from src.core.data_sources.memory import MemoryDataSource
 from src.core.models import OrderSide, PositionSide
 from src.core.orm_models import Order
 from src.core.research_backtest_runner import ResearchBacktestRunner
-from src.core.strategy_context import RiskSnapshot, StrategyContext
+from src.core.strategy_context import CapitalSnapshot, RiskSnapshot, StrategyContext
 from src.core.models import Candlestick, Signal, SignalType
 from src.strategies.base import BaseStrategy, StrategyRequirements
 
@@ -18,6 +19,34 @@ try:
     HAS_RUST = True
 except ImportError:
     HAS_RUST = False
+
+
+def test_strategy_context_capital_defaults_to_none():
+    context = StrategyContext(
+        strategy_id="ctx_strategy",
+        product_id=PRODUCT_ID,
+        timestamp=1,
+        available_cash=Decimal("10000"),
+        total_equity=Decimal("10000"),
+        realized_pnl=Decimal("0"),
+        unrealized_pnl=Decimal("0"),
+        current_drawdown=Decimal("0"),
+        max_drawdown=Decimal("0"),
+    )
+
+    assert context.capital is None
+
+
+def test_capital_snapshot_is_immutable():
+    snapshot = CapitalSnapshot(
+        allocated=Decimal("5000"),
+        used=Decimal("1500"),
+        available=Decimal("3500"),
+        unallocated=Decimal("95000"),
+    )
+
+    with pytest.raises(AttributeError):
+        snapshot.available = Decimal("0")  # type: ignore[misc]
 
 
 def _market_order(order_id: str, *, timestamp: int) -> Order:
@@ -157,6 +186,32 @@ def test_strategy_context_account_fields_follow_research_contract():
     )
 
 
+@pytest.mark.rust
+@pytest.mark.skipif(not HAS_RUST, reason="fluxtrade_core.so not compiled")
+def test_strategy_context_exposes_capital_snapshot_without_redefining_cash():
+    candles = make_candle_series(count=1)
+    allocator = CapitalAllocator(Decimal("100000"))
+    allocator.allocate("ctx_strategy", Decimal("5000"))
+    allocator.record_usage("ctx_strategy", Decimal("1500"))
+    adapter = SimulatedAdapter(initial_balance=Decimal("10000"))
+
+    context = adapter.get_strategy_context(
+        strategy_id="ctx_strategy",
+        product_id=PRODUCT_ID,
+        timestamp=candles[0].timestamp,
+        initial_balance=Decimal("10000"),
+        mark_price=candles[0].close,
+        capital_allocator=allocator,
+    )
+
+    assert context.available_cash == Decimal("10000")
+    assert context.capital is not None
+    assert context.capital.allocated == Decimal("5000")
+    assert context.capital.used == Decimal("1500")
+    assert context.capital.available == Decimal("3500")
+    assert context.capital.unallocated == Decimal("95000")
+
+
 class ContextProbeStrategy(BaseStrategy):
     def __init__(self) -> None:
         super().__init__("ctx_strategy", PRODUCT_ID)
@@ -291,3 +346,32 @@ def test_research_runner_strategy_can_use_context_to_change_decisions():
     assert strategy.decisions == ["enter", "exit"]
     assert result["raw_trade_count"] == 2
     assert result["total_trades"] == 1
+
+
+@pytest.mark.rust
+@pytest.mark.skipif(not HAS_RUST, reason="fluxtrade_core.so not compiled")
+def test_research_runner_passes_capital_snapshot_to_context_strategy():
+    candles = make_candle_series(count=2)
+    strategy = ContextProbeStrategy()
+    allocator = CapitalAllocator(Decimal("100000"))
+    allocator.allocate(strategy.strategy_id, Decimal("5000"))
+    allocator.record_usage(strategy.strategy_id, Decimal("1000"))
+    runner = ResearchBacktestRunner(
+        start_time=candles[0].timestamp,
+        end_time=candles[-1].timestamp,
+        product_id=PRODUCT_ID,
+        timeframe="15m",
+        initial_balance=10_000.0,
+        data_source=MemoryDataSource(candles),
+        capital_allocator=allocator,
+    )
+    runner.add_strategy(strategy)
+
+    runner.run()
+
+    assert strategy.contexts
+    assert strategy.contexts[0].available_cash == Decimal("10000")
+    assert strategy.contexts[0].capital is not None
+    assert strategy.contexts[0].capital.allocated == Decimal("5000")
+    assert strategy.contexts[0].capital.used == Decimal("1000")
+    assert strategy.contexts[0].capital.available == Decimal("4000")

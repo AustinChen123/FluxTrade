@@ -79,6 +79,11 @@ class CapitalAllocator:
         with self._lock:
             return self._allocations.get(strategy_id, Decimal("0"))
 
+    def get_used(self, strategy_id: str) -> Decimal:
+        """Get capital currently marked as used for a strategy."""
+        with self._lock:
+            return self._used.get(strategy_id, Decimal("0"))
+
     def get_unallocated(self) -> Decimal:
         """Get remaining unallocated balance."""
         with self._lock:

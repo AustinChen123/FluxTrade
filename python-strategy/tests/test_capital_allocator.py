@@ -217,6 +217,12 @@ class TestQueryMethods:
         allocator.record_usage("strat_a", Decimal("20000"))
         assert allocator.get_available("strat_a") == Decimal("30000")
 
+    def test_get_used_reflects_usage(self):
+        allocator = CapitalAllocator(Decimal("100000"))
+        allocator.allocate("strat_a", Decimal("50000"))
+        allocator.record_usage("strat_a", Decimal("20000"))
+        assert allocator.get_used("strat_a") == Decimal("20000")
+
 
 class TestBalanceUpdates:
     """Tests for update_total_balance."""

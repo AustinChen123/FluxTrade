@@ -13,7 +13,7 @@ import uuid
 import inspect
 from dataclasses import dataclass
 from decimal import Decimal
-from typing import Any, Dict, Iterable, Optional, Sequence
+from typing import TYPE_CHECKING, Any, Dict, Iterable, Optional, Sequence
 
 from src.core.adapters.simulated import SimulatedAdapter
 from src.core.analytics import calculate_metrics
@@ -26,6 +26,9 @@ from src.core.orm_models import Order
 from src.core.precision import PrecisionCodec
 from src.core.strategy_context import StrategyContext
 from src.strategies.base import BaseStrategy
+
+if TYPE_CHECKING:
+    from src.core.capital_allocator import CapitalAllocator
 
 logger = logging.getLogger(__name__)
 
@@ -67,6 +70,7 @@ class ResearchBacktestRunner:
         balance_check_interval: int = 0,
         precision_codec: PrecisionCodec | None = None,
         prepared_scaled_candles: Sequence[Any] | None = None,
+        capital_allocator: CapitalAllocator | None = None,
     ):
         self.start_time = start_time
         self.end_time = end_time
@@ -79,6 +83,7 @@ class ResearchBacktestRunner:
         self.balance_check_interval = balance_check_interval
         self.precision_codec = precision_codec
         self.prepared_scaled_candles = prepared_scaled_candles
+        self.capital_allocator = capital_allocator
         self.clock = BacktestClock(start_time=start_time / 1000)
         self._strategies: list[BaseStrategy] = []
 
@@ -260,6 +265,7 @@ class ResearchBacktestRunner:
             peak_equity=peak_equity_by_strategy[strategy_id],
             max_drawdown=max_drawdown_by_strategy[strategy_id],
             latest_fills=latest_fills,
+            capital_allocator=self.capital_allocator,
         )
 
         peak_equity = max(peak_equity_by_strategy[strategy_id], context.total_equity)
@@ -284,6 +290,7 @@ class ResearchBacktestRunner:
             peak_equity=peak_equity,
             max_drawdown=max_drawdown,
             latest_fills=latest_fills,
+            capital_allocator=self.capital_allocator,
         )
 
     def _signals_from_strategy(

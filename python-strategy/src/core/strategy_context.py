@@ -70,6 +70,16 @@ class RiskSnapshot:
 
 
 @dataclass(frozen=True, slots=True)
+class CapitalSnapshot:
+    """Read-only per-strategy capital allocation view."""
+
+    allocated: Decimal
+    used: Decimal
+    available: Decimal
+    unallocated: Decimal
+
+
+@dataclass(frozen=True, slots=True)
 class StrategyContext:
     """Read-only account/position/risk snapshot for one strategy decision.
 
@@ -77,8 +87,10 @@ class StrategyContext:
     ``available_cash`` is the matcher-backed cash balance exposed by the
     adapter, ``total_equity`` is ``available_cash + unrealized_pnl``, and
     ``realized_pnl`` is ``total_equity - initial_balance``. Drawdown fields are
-    non-negative loss magnitudes. This context does not yet model reserved cash,
-    isolated per-strategy capital, margin, or a full portfolio NAV.
+    non-negative loss magnitudes. ``capital`` is an optional per-strategy
+    allocation view; it does not change the matcher-backed cash semantics.
+    This context does not yet model reserved cash, margin, or a full portfolio
+    NAV.
     """
 
     strategy_id: str
@@ -95,3 +107,4 @@ class StrategyContext:
     latest_fills: tuple[FillSnapshot, ...] = ()
     latest_rejections: tuple[RejectionSnapshot, ...] = ()
     risk: RiskSnapshot = RiskSnapshot()
+    capital: CapitalSnapshot | None = None
