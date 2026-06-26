@@ -126,6 +126,7 @@ class ResearchBacktestRunner:
             else:
                 fills = adapter.on_prepared_market_data(prepared_candle)
             trades.extend(self._fills_to_trades(fills, candle))
+            self._sync_capital_usage(adapter, candle)
 
             for strategy in self._strategies:
                 if strategy.product_id != candle.product_id:
@@ -292,6 +293,22 @@ class ResearchBacktestRunner:
             latest_fills=latest_fills,
             capital_allocator=self.capital_allocator,
         )
+
+    def _sync_capital_usage(
+        self,
+        adapter: SimulatedAdapter,
+        candle: Candlestick,
+    ) -> None:
+        if self.capital_allocator is None:
+            return
+        for strategy in self._strategies:
+            if strategy.product_id != candle.product_id:
+                continue
+            position = adapter.get_position(candle.product_id, strategy_id=strategy.strategy_id)
+            used = Decimal("0")
+            if position is not None:
+                used = abs(position.quantity) * candle.close
+            self.capital_allocator.set_usage(strategy.strategy_id, used)
 
     def _signals_from_strategy(
         self,

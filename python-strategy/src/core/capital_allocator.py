@@ -108,6 +108,26 @@ class CapitalAllocator:
                 )
             self._used[strategy_id] = current_used + amount
 
+    def set_usage(self, strategy_id: str, amount: Decimal) -> None:
+        """Set capital currently used by a strategy.
+
+        This is useful for replay paths that derive usage from the current
+        position snapshot after matching instead of applying fill deltas.
+        """
+        if not isinstance(amount, Decimal):
+            raise TypeError("amount must be Decimal")
+        if amount < Decimal("0"):
+            raise ValueError("amount must be non-negative")
+
+        with self._lock:
+            allocated = self._allocations.get(strategy_id, Decimal("0"))
+            if amount > allocated:
+                raise ValueError(
+                    f"Cannot use {amount} for strategy {strategy_id}: "
+                    f"only {allocated} allocated"
+                )
+            self._used[strategy_id] = amount
+
     def release_usage(self, strategy_id: str, amount: Decimal) -> None:
         """Release used capital (e.g., when closing a position)."""
         if not isinstance(amount, Decimal):
