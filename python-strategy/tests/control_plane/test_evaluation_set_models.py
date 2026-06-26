@@ -368,6 +368,61 @@ def test_parameter_search_allows_non_path_dataset_backtest_overrides():
     assert dataset_request.backtest.write_reports is True
 
 
+def test_parameter_search_ignores_null_dataset_backtest_overrides():
+    payload = _base_search_request()
+    payload["backtest"] = {
+        "candles_csv_path": "data/shared.csv",
+        "initial_balance": "25000",
+        "maker_fee": "0.0002",
+        "taker_fee": "0.0006",
+        "write_reports": True,
+    }
+    payload["evaluation_set"] = {
+        "datasets": [
+            {
+                "dataset_id": "null_override",
+                "product_id": PRODUCT_ID,
+                "timeframe": "5m",
+                "start_time": 10,
+                "end_time": 20,
+                "backtest": {
+                    "candles_csv_path": None,
+                    "initial_balance": None,
+                    "maker_fee": "0.0008",
+                    "write_reports": None,
+                },
+            },
+        ],
+    }
+    request = ParameterSearchJobRequest.model_validate(payload)
+    evaluator = _NoopEvaluator()
+    executor = ParameterSearchJobExecutor(
+        evaluator=evaluator,
+        run_inline=True,
+    )
+
+    job = executor.submit_search(request)
+
+    assert job.status.value == "SUCCEEDED"
+    assert job.result is not None
+    dataset_request = evaluator.requests[0][0]
+    assert dataset_request.backtest.candles_csv_path == "data/shared.csv"
+    assert dataset_request.backtest.initial_balance == Decimal("25000")
+    assert dataset_request.backtest.maker_fee == Decimal("0.0008")
+    assert dataset_request.backtest.taker_fee == Decimal("0.0006")
+    assert dataset_request.backtest.write_reports is True
+    assert job.result["evaluation_set"]["datasets"][0]["backtest"] == {
+        "maker_fee": "0.0008",
+    }
+    assert job.result["evaluation_set"]["datasets"][0]["resolved_backtest"] == {
+        "candles_csv_path": "data/shared.csv",
+        "initial_balance": "25000",
+        "maker_fee": "0.0008",
+        "taker_fee": "0.0006",
+        "write_reports": True,
+    }
+
+
 def test_parameter_search_rejects_partial_dataset_backtest_without_shared_path():
     payload = _base_search_request()
     payload["evaluation_set"] = {

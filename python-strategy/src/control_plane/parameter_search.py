@@ -554,13 +554,15 @@ def _backtest_for_evaluation_dataset(
 ) -> CsvSignalBacktestEvaluationConfig | None:
     if dataset.backtest is None:
         return request.backtest
+    overrides = _dataset_backtest_override_values(dataset)
     if request.backtest is None:
-        return CsvSignalBacktestEvaluationConfig.model_validate(
-            dataset.backtest.model_dump(exclude_unset=True)
-        )
+        return CsvSignalBacktestEvaluationConfig.model_validate(overrides)
 
-    return request.backtest.model_copy(
-        update=dataset.backtest.model_dump(exclude_unset=True)
+    return CsvSignalBacktestEvaluationConfig.model_validate(
+        {
+            **request.backtest.model_dump(),
+            **overrides,
+        }
     )
 
 
@@ -592,7 +594,15 @@ def _dataset_backtest_override_payload(
 ) -> dict[str, Any] | None:
     if dataset.backtest is None:
         return None
-    return _json_safe(dataset.backtest.model_dump(exclude_unset=True))
+    return _json_safe(_dataset_backtest_override_values(dataset))
+
+
+def _dataset_backtest_override_values(
+    dataset: EvaluationDatasetConfig,
+) -> dict[str, Any]:
+    if dataset.backtest is None:
+        return {}
+    return dataset.backtest.model_dump(exclude_unset=True, exclude_none=True)
 
 
 def _resolved_dataset_backtest_payload(
