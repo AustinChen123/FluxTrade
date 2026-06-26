@@ -8,6 +8,8 @@ from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
+from src.core.evaluation_set import EvaluationDataset, EvaluationSet
+
 
 class JobStatus(str, Enum):
     QUEUED = "QUEUED"
@@ -168,6 +170,108 @@ class CsvSignalBacktestEvaluationConfig(BaseModel):
         return value
 
 
+class PartialCsvSignalBacktestEvaluationConfig(BaseModel):
+    """Per-dataset backtest overrides merged with shared settings."""
+
+    candles_csv_path: str | None = None
+    initial_balance: Decimal | None = None
+    maker_fee: Decimal | None = None
+    taker_fee: Decimal | None = None
+    write_reports: bool | None = None
+
+    @field_validator("candles_csv_path")
+    @classmethod
+    def validate_path(cls, value: str | None) -> str | None:
+        if value is None:
+            return value
+        if not value.strip():
+            raise ValueError("path cannot be blank")
+        return str(Path(value))
+
+    @field_validator("initial_balance")
+    @classmethod
+    def validate_initial_balance(cls, value: Decimal | None) -> Decimal | None:
+        if value is not None and value <= 0:
+            raise ValueError("initial_balance must be positive")
+        return value
+
+    @field_validator("maker_fee", "taker_fee")
+    @classmethod
+    def validate_fee(cls, value: Decimal | None) -> Decimal | None:
+        if value is not None and value < 0:
+            raise ValueError("fee cannot be negative")
+        return value
+
+
+class EvaluationDatasetConfig(BaseModel):
+    """One dataset interval for multi-regime parameter evaluation."""
+
+    dataset_id: str = Field(min_length=1)
+    product_id: str = Field(min_length=1)
+    timeframe: str = Field(min_length=1)
+    start_time: int
+    end_time: int
+    warmup_start_time: int | None = None
+    backtest: PartialCsvSignalBacktestEvaluationConfig | None = None
+    metadata: dict[str, Any] = Field(default_factory=dict)
+
+    @field_validator("dataset_id", "product_id", "timeframe")
+    @classmethod
+    def strip_required_string(cls, value: str) -> str:
+        stripped = value.strip()
+        if not stripped:
+            raise ValueError("field cannot be blank")
+        return stripped
+
+    @field_validator("end_time")
+    @classmethod
+    def validate_time_range(cls, value: int, info) -> int:
+        start_time = info.data.get("start_time")
+        if start_time is not None and value <= start_time:
+            raise ValueError("end_time must be greater than start_time")
+        return value
+
+    @model_validator(mode="after")
+    def validate_warmup_range(self) -> "EvaluationDatasetConfig":
+        if (
+            self.warmup_start_time is not None
+            and self.warmup_start_time > self.start_time
+        ):
+            raise ValueError("warmup_start_time must be <= start_time")
+        return self
+
+    def to_core_dataset(self) -> EvaluationDataset:
+        return EvaluationDataset(
+            dataset_id=self.dataset_id,
+            product_id=self.product_id,
+            timeframe=self.timeframe,
+            start_time=self.start_time,
+            end_time=self.end_time,
+            warmup_start_time=self.warmup_start_time,
+            metadata=self.metadata,
+        )
+
+
+class EvaluationSetConfig(BaseModel):
+    """Control-plane payload for a group of evaluation datasets."""
+
+    datasets: list[EvaluationDatasetConfig] = Field(min_length=1)
+
+    @field_validator("datasets")
+    @classmethod
+    def validate_unique_dataset_ids(
+        cls,
+        value: list[EvaluationDatasetConfig],
+    ) -> list[EvaluationDatasetConfig]:
+        dataset_ids = [dataset.dataset_id for dataset in value]
+        if len(dataset_ids) != len(set(dataset_ids)):
+            raise ValueError("dataset_id values must be unique")
+        return value
+
+    def to_core_evaluation_set(self) -> EvaluationSet:
+        return EvaluationSet(dataset.to_core_dataset() for dataset in self.datasets)
+
+
 class ParameterSearchJobRequest(BaseModel):
     """Request payload for evaluating strategy parameter candidates."""
 
@@ -184,6 +288,7 @@ class ParameterSearchJobRequest(BaseModel):
     ] = "maximize_score"
     seed: int | None = None
     backtest: CsvSignalBacktestEvaluationConfig | None = None
+    evaluation_set: EvaluationSetConfig | None = None
     candidates: list[ParameterCandidate] | None = Field(default=None, min_length=1)
     search_space: ParameterSearchSpace | None = None
     candidate_sample_count: int | None = Field(default=None, ge=1, le=10_000)
@@ -219,6 +324,31 @@ class ParameterSearchJobRequest(BaseModel):
             raise ValueError("candidate_sample_count requires search_space")
         if has_search_space and self.candidate_sample_count is None:
             raise ValueError("candidate_sample_count is required with search_space")
+        if self.evaluation_set is not None:
+            warmup_dataset_ids = [
+                dataset.dataset_id
+                for dataset in self.evaluation_set.datasets
+                if dataset.warmup_start_time is not None
+            ]
+            if warmup_dataset_ids:
+                datasets = ", ".join(warmup_dataset_ids)
+                raise ValueError(
+                    "parameter_search evaluation_set does not support "
+                    f"warmup_start_time yet: {datasets}"
+                )
+            if self.backtest is None:
+                missing_backtest_dataset_ids = [
+                    dataset.dataset_id
+                    for dataset in self.evaluation_set.datasets
+                    if dataset.backtest is None
+                    or dataset.backtest.candles_csv_path is None
+                ]
+                if missing_backtest_dataset_ids:
+                    datasets = ", ".join(missing_backtest_dataset_ids)
+                    raise ValueError(
+                        "evaluation_set datasets require candles_csv_path when "
+                        f"shared backtest is not provided: {datasets}"
+                    )
         return self
 
 

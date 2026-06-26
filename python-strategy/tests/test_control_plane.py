@@ -551,8 +551,14 @@ def test_parameter_search_records_evolution_epoch_and_gene_candidates(tmp_path):
                 "end_time": 1_700_001_800_000,
                 "seed": 11,
                 "candidates": [
-                    {"candidate_id": "a", "param_pack": {"score": "1.2"}},
-                    {"candidate_id": "b", "param_pack": {"score": "2.5"}},
+                    {
+                        "candidate_id": "a",
+                        "param_pack": {"score": "1.2", "drawdown": "-0.40"},
+                    },
+                    {
+                        "candidate_id": "b",
+                        "param_pack": {"score": "2.5", "drawdown": "-0.10"},
+                    },
                 ],
             }
         ),
@@ -575,7 +581,14 @@ def test_parameter_search_records_evolution_epoch_and_gene_candidates(tmp_path):
     assert epoch.status == "completed"
     assert epoch.pop_size == 2
     assert epoch.best_score == Decimal("2.50000000")
-    assert [gene.param_pack for gene in genes] == [{"score": "1.2"}, {"score": "2.5"}]
+    assert [gene.param_pack for gene in genes] == [
+        {"score": "1.2", "drawdown": "-0.40"},
+        {"score": "2.5", "drawdown": "-0.10"},
+    ]
+    assert [gene.max_drawdown for gene in genes] == [
+        Decimal("0.40000000"),
+        Decimal("0.10000000"),
+    ]
     assert [gene.role for gene in genes] == ["challenger", "challenger"]
 
 

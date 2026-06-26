@@ -5,7 +5,7 @@ from datetime import UTC, datetime
 from decimal import Decimal
 from pathlib import Path
 from threading import Lock
-from typing import Any, Callable, Protocol
+from typing import Any, Callable, Iterable, Protocol
 
 from sqlalchemy.orm import Session
 
@@ -13,6 +13,8 @@ from src.control_plane.backtest_jobs import BacktestJobExecutor, SessionFactory,
 from src.control_plane.jobs import InMemoryJobStore, JobStore
 from src.control_plane.models import (
     BacktestJobRequest,
+    CsvSignalBacktestEvaluationConfig,
+    EvaluationDatasetConfig,
     JobRecord,
     JobStatus,
     ParameterCandidate,
@@ -85,8 +87,8 @@ class CsvSignalBacktestParameterEvaluator:
         return ParameterEvaluationResult(
             candidate_id=candidate.candidate_id,
             score_total=score,
-            max_drawdown=max_drawdown,
-            metrics=result,
+            max_drawdown=_drawdown_loss_magnitude(max_drawdown),
+            metrics=_normalize_metrics_drawdown(result),
         )
 
 
@@ -149,8 +151,10 @@ class ResearchBacktestParameterEvaluator:
         return ParameterEvaluationResult(
             candidate_id=candidate.candidate_id,
             score_total=_result_decimal(result, "total_pnl"),
-            max_drawdown=_result_decimal(result, "max_drawdown"),
-            metrics=_json_safe(metrics),
+            max_drawdown=_drawdown_loss_magnitude(
+                _result_decimal(result, "max_drawdown")
+            ),
+            metrics=_normalize_metrics_drawdown(metrics),
         )
 
     def _replay_inputs_for(self, request: ParameterSearchJobRequest):
@@ -232,8 +236,8 @@ class GoldenCrossFastFitnessParameterEvaluator:
         return ParameterEvaluationResult(
             candidate_id=candidate.candidate_id,
             score_total=result.total_pnl,
-            max_drawdown=result.max_drawdown,
-            metrics=_json_safe(metrics),
+            max_drawdown=_drawdown_loss_magnitude(result.max_drawdown),
+            metrics=_normalize_metrics_drawdown(metrics),
         )
 
     def _evaluator_for(
@@ -386,10 +390,22 @@ class ParameterSearchJobExecutor:
 
     def _run_search(self, request: ParameterSearchJobRequest) -> dict[str, object]:
         candidates = resolve_parameter_candidates(request)
-        evaluations = [
-            self.evaluator.evaluate(request, candidate)
-            for candidate in candidates
-        ]
+        if request.evaluation_set is not None:
+            evaluations = [
+                _evaluate_candidate_across_datasets(
+                    self.evaluator,
+                    request,
+                    candidate,
+                )
+                for candidate in candidates
+            ]
+        else:
+            evaluations = [
+                _normalize_evaluation_result(
+                    self.evaluator.evaluate(request, candidate)
+                )
+                for candidate in candidates
+            ]
         best = _select_best_candidate(request, evaluations)
         epoch_id = None
         if self._db_session_factory is not None:
@@ -408,6 +424,7 @@ class ParameterSearchJobExecutor:
                 "objective": request.objective,
                 "seed": request.seed,
                 "epoch_id": epoch_id,
+                "evaluation_set": _evaluation_set_result_payload(request),
                 "resolved_candidates": candidates,
                 "evaluations": evaluations,
                 "best_candidate": best,
@@ -428,9 +445,174 @@ def _select_best_candidate(
     if request.objective == "minimize_drawdown":
         return min(
             evaluations,
-            key=lambda result: (result.max_drawdown, -_decimal_key(result.score_total)),
+            key=lambda result: (
+                _drawdown_risk_key(result.max_drawdown),
+                -_decimal_key(result.score_total),
+            ),
         )
     raise ValueError(f"unsupported objective: {request.objective}")
+
+
+def _evaluate_candidate_across_datasets(
+    evaluator: ParameterSearchEvaluator,
+    request: ParameterSearchJobRequest,
+    candidate: ParameterCandidate,
+) -> ParameterEvaluationResult:
+    assert request.evaluation_set is not None
+    dataset_results: dict[str, dict[str, Any]] = {}
+    dataset_scores: dict[str, Decimal] = {}
+    dataset_drawdowns: dict[str, Decimal] = {}
+
+    for dataset in request.evaluation_set.datasets:
+        dataset_request = _request_for_evaluation_dataset(request, dataset)
+        evaluation = _normalize_evaluation_result(
+            evaluator.evaluate(dataset_request, candidate)
+        )
+        dataset_results[dataset.dataset_id] = evaluation.metrics
+        dataset_scores[dataset.dataset_id] = evaluation.score_total
+        dataset_drawdowns[dataset.dataset_id] = evaluation.max_drawdown
+
+    return ParameterEvaluationResult(
+        candidate_id=candidate.candidate_id,
+        score_total=sum(dataset_scores.values(), Decimal("0")),
+        max_drawdown=_worst_drawdown(dataset_drawdowns.values()),
+        metrics=_json_safe(
+            {
+                "evaluation_mode": "evaluation_set",
+                "aggregation": "sum_score_worst_drawdown",
+                "dataset_scores": dataset_scores,
+                "dataset_drawdowns": dataset_drawdowns,
+                "datasets": dataset_results,
+            }
+        ),
+    )
+
+
+def _worst_drawdown(drawdowns: Iterable[Decimal]) -> Decimal:
+    return max(drawdowns, key=_drawdown_risk_key, default=Decimal("0"))
+
+
+def _normalize_evaluation_result(
+    evaluation: ParameterEvaluationResult,
+) -> ParameterEvaluationResult:
+    max_drawdown = _drawdown_loss_magnitude(evaluation.max_drawdown)
+    metrics = _normalize_metrics_drawdown(evaluation.metrics)
+    if max_drawdown == evaluation.max_drawdown and metrics == evaluation.metrics:
+        return evaluation
+    return evaluation.model_copy(
+        update={
+            "max_drawdown": max_drawdown,
+            "metrics": metrics,
+        }
+    )
+
+
+def _normalize_metrics_drawdown(metrics: dict[str, Any]) -> dict[str, Any]:
+    if "max_drawdown" not in metrics:
+        return _json_safe(metrics)
+
+    normalized = dict(metrics)
+    normalized["max_drawdown"] = _drawdown_loss_magnitude(
+        Decimal(str(normalized["max_drawdown"]))
+    )
+    return _json_safe(normalized)
+
+
+def _drawdown_risk_key(drawdown: Decimal) -> Decimal:
+    return abs(drawdown)
+
+
+def _drawdown_loss_magnitude(drawdown: Decimal) -> Decimal:
+    return abs(drawdown)
+
+
+def _request_for_evaluation_dataset(
+    request: ParameterSearchJobRequest,
+    dataset: EvaluationDatasetConfig,
+) -> ParameterSearchJobRequest:
+    backtest = _backtest_for_evaluation_dataset(request, dataset)
+    if backtest is None:
+        raise ValueError(
+            f"evaluation dataset {dataset.dataset_id} requires backtest settings"
+        )
+    return request.model_copy(
+        update={
+            "product_id": dataset.product_id,
+            "timeframe": dataset.timeframe,
+            "start_time": dataset.start_time,
+            "end_time": dataset.end_time,
+            "backtest": backtest,
+            "evaluation_set": None,
+        },
+        deep=True,
+    )
+
+
+def _backtest_for_evaluation_dataset(
+    request: ParameterSearchJobRequest,
+    dataset: EvaluationDatasetConfig,
+) -> CsvSignalBacktestEvaluationConfig | None:
+    if dataset.backtest is None:
+        return request.backtest
+    overrides = _dataset_backtest_override_values(dataset)
+    if request.backtest is None:
+        return CsvSignalBacktestEvaluationConfig.model_validate(overrides)
+
+    return CsvSignalBacktestEvaluationConfig.model_validate(
+        {
+            **request.backtest.model_dump(),
+            **overrides,
+        }
+    )
+
+
+def _evaluation_set_result_payload(
+    request: ParameterSearchJobRequest,
+) -> dict[str, Any] | None:
+    if request.evaluation_set is None:
+        return None
+    return {
+        "datasets": [
+            {
+                "dataset_id": dataset.dataset_id,
+                "product_id": dataset.product_id,
+                "timeframe": dataset.timeframe,
+                "start_time": dataset.start_time,
+                "end_time": dataset.end_time,
+                "warmup_start_time": dataset.warmup_start_time,
+                "metadata": dataset.metadata,
+                "backtest": _dataset_backtest_override_payload(dataset),
+                "resolved_backtest": _resolved_dataset_backtest_payload(request, dataset),
+            }
+            for dataset in request.evaluation_set.datasets
+        ]
+    }
+
+
+def _dataset_backtest_override_payload(
+    dataset: EvaluationDatasetConfig,
+) -> dict[str, Any] | None:
+    if dataset.backtest is None:
+        return None
+    return _json_safe(_dataset_backtest_override_values(dataset))
+
+
+def _dataset_backtest_override_values(
+    dataset: EvaluationDatasetConfig,
+) -> dict[str, Any]:
+    if dataset.backtest is None:
+        return {}
+    return dataset.backtest.model_dump(exclude_unset=True, exclude_none=True)
+
+
+def _resolved_dataset_backtest_payload(
+    request: ParameterSearchJobRequest,
+    dataset: EvaluationDatasetConfig,
+) -> dict[str, Any] | None:
+    backtest = _backtest_for_evaluation_dataset(request, dataset)
+    if backtest is None:
+        return None
+    return _json_safe(backtest.model_dump(mode="json"))
 
 
 def _decimal_key(value: Decimal) -> Decimal:
@@ -518,6 +700,7 @@ def _insert_evolution_epoch(
                 "candidate_ids": [
                     candidate.candidate_id for candidate in candidates
                 ],
+                "evaluation_set": _evaluation_set_result_payload(request),
             },
             status="completed",
             eval_pair=request.product_id,
