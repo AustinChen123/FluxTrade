@@ -547,6 +547,12 @@ def test_research_runner_rejects_entry_when_capital_is_insufficient():
     assert allocator.get_used(strategy.strategy_id) == Decimal("0")
     assert strategy.contexts[0].capital is not None
     assert strategy.contexts[0].capital.available == Decimal("100")
+    assert strategy.contexts[0].latest_rejections == ()
+    assert len(strategy.contexts[1].latest_rejections) == 1
+    assert "capital_allocation_rejected" in strategy.contexts[1].latest_rejections[0].reason
+    assert "required=" in strategy.contexts[1].latest_rejections[0].reason
+    assert "available=100" in strategy.contexts[1].latest_rejections[0].reason
+    assert strategy.contexts[2].latest_rejections == ()
 
 
 @pytest.mark.rust
@@ -595,6 +601,8 @@ def test_research_runner_reserves_capital_between_same_candle_entries():
 
     assert result["raw_trade_count"] == 1
     assert allocator.get_used(strategy.strategy_id) == Decimal("0.006") * candles[-1].close
+    assert len(strategy.contexts[1].latest_rejections) == 1
+    assert "capital_allocation_rejected" in strategy.contexts[1].latest_rejections[0].reason
 
 
 @pytest.mark.rust
@@ -623,6 +631,9 @@ def test_research_runner_reserves_capital_for_pending_entry_orders():
     assert strategy.contexts[1].capital.available == (
         Decimal("500") - Decimal("0.006") * Decimal("49000")
     )
+    assert strategy.contexts[1].latest_rejections == ()
+    assert len(strategy.contexts[2].latest_rejections) == 1
+    assert "capital_allocation_rejected" in strategy.contexts[2].latest_rejections[0].reason
 
 
 @pytest.mark.rust

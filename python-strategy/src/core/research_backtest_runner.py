@@ -24,7 +24,7 @@ from src.core.interfaces.data_source import IDataSource
 from src.core.models import Candlestick, OrderSide, Signal, SignalType
 from src.core.orm_models import Order
 from src.core.precision import PrecisionCodec
-from src.core.strategy_context import StrategyContext
+from src.core.strategy_context import RejectionSnapshot, StrategyContext
 from src.strategies.base import BaseStrategy
 
 if TYPE_CHECKING:
@@ -85,6 +85,7 @@ class ResearchBacktestRunner:
         self.prepared_scaled_candles = prepared_scaled_candles
         self.capital_allocator = capital_allocator
         self._reserved_entry_capital: dict[str, tuple[str, Decimal]] = {}
+        self._latest_rejections: dict[str, tuple[RejectionSnapshot, ...]] = {}
         self.clock = BacktestClock(start_time=start_time / 1000)
         self._strategies: list[BaseStrategy] = []
 
@@ -97,6 +98,7 @@ class ResearchBacktestRunner:
             return {}
 
         self._reserved_entry_capital = {}
+        self._latest_rejections = {}
         adapter = SimulatedAdapter(
             initial_balance=Decimal(str(self.initial_balance)),
             maker_fee=Decimal(str(self.fee_config.get("maker", 0))),
@@ -148,6 +150,7 @@ class ResearchBacktestRunner:
                 signals = self._signals_from_strategy(strategy, candle, context)
                 for signal in signals:
                     if self._capital_rejects_entry(signal, candle):
+                        self._record_capital_rejection(signal, candle)
                         continue
                     order = self._order_from_signal(signal, candle)
                     if order is not None:
@@ -262,6 +265,7 @@ class ResearchBacktestRunner:
     ) -> StrategyContext:
         strategy_id = strategy.strategy_id
         initial_balance = Decimal(str(self.initial_balance))
+        latest_rejections = self._pop_latest_rejections(strategy_id)
         context = adapter.get_strategy_context(
             strategy_id=strategy_id,
             product_id=candle.product_id,
@@ -271,6 +275,7 @@ class ResearchBacktestRunner:
             peak_equity=peak_equity_by_strategy[strategy_id],
             max_drawdown=max_drawdown_by_strategy[strategy_id],
             latest_fills=latest_fills,
+            latest_rejections=latest_rejections,
             capital_allocator=self.capital_allocator,
         )
 
@@ -296,6 +301,7 @@ class ResearchBacktestRunner:
             peak_equity=peak_equity,
             max_drawdown=max_drawdown,
             latest_fills=latest_fills,
+            latest_rejections=latest_rejections,
             capital_allocator=self.capital_allocator,
         )
 
@@ -369,6 +375,24 @@ class ResearchBacktestRunner:
             available,
         )
         return True
+
+    def _record_capital_rejection(self, signal: Signal, candle: Candlestick) -> None:
+        if self.capital_allocator is None:
+            return
+        required = self._entry_required_capital(signal, candle)
+        available = self.capital_allocator.get_available(signal.strategy_id)
+        rejection = RejectionSnapshot(
+            reason=(
+                "capital_allocation_rejected: "
+                f"required={required} available={available} strategy_id={signal.strategy_id}"
+            ),
+            timestamp=candle.timestamp,
+        )
+        existing = self._latest_rejections.get(signal.strategy_id, ())
+        self._latest_rejections[signal.strategy_id] = existing + (rejection,)
+
+    def _pop_latest_rejections(self, strategy_id: str) -> tuple[RejectionSnapshot, ...]:
+        return self._latest_rejections.pop(strategy_id, ())
 
     def _reserve_entry_capital(
         self,

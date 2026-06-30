@@ -306,6 +306,9 @@ def test_research_backtest_rejects_entry_over_available_capital():
     assert result["total_trades"] == 0
     assert strategy.contexts[0].capital is not None
     assert strategy.contexts[0].capital.available == Decimal("100")
+    assert strategy.contexts[0].latest_rejections == ()
+    assert len(strategy.contexts[1].latest_rejections) == 1
+    assert "capital_allocation_rejected" in strategy.contexts[1].latest_rejections[0].reason
     assert allocator.get_used(strategy.strategy_id) == Decimal("0")
 
 
