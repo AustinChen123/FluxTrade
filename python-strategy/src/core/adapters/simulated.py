@@ -67,6 +67,11 @@ class SimulatedAdapter(IExchangeAdapter):
         self._order_map: Dict[str, Order] = {}
         self._rust_supports_strategy_id = _RUST_HAS_STRATEGY_ID
 
+    @property
+    def supports_strategy_positions(self) -> bool:
+        """Whether Rust positions are isolated by strategy_id."""
+        return self._rust_supports_strategy_id
+
     # ── IExchangeAdapter interface ───────────────────────────────
 
     def place_order(self, order: Order) -> str:

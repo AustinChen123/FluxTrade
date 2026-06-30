@@ -321,10 +321,11 @@ class ResearchBacktestRunner:
         for strategy in self._strategies:
             if strategy.product_id != candle.product_id:
                 continue
-            position = adapter.get_position(candle.product_id, strategy_id=strategy.strategy_id)
             used = Decimal("0")
-            if position is not None:
-                used = abs(position.quantity) * candle.close
+            if adapter.supports_strategy_positions:
+                position = adapter.get_position(candle.product_id, strategy_id=strategy.strategy_id)
+                if position is not None:
+                    used = abs(position.quantity) * candle.close
             used += sum(
                 reserved
                 for strategy_id, reserved in self._reserved_entry_capital.values()

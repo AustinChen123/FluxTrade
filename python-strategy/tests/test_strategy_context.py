@@ -49,6 +49,36 @@ def test_capital_snapshot_is_immutable():
         snapshot.available = Decimal("0")  # type: ignore[misc]
 
 
+def test_research_runner_does_not_sync_product_position_without_strategy_support():
+    class LegacyPositionAdapter:
+        supports_strategy_positions = False
+
+        def get_open_orders(self):
+            return []
+
+        def get_position(self, product_id: str, strategy_id: str | None = None):
+            raise AssertionError("legacy product-level positions must not be used")
+
+    candles = make_candle_series(count=1)
+    strategy = SingleEntryStrategy()
+    allocator = CapitalAllocator(Decimal("100000"))
+    allocator.allocate(strategy.strategy_id, Decimal("5000"))
+    allocator.set_usage(strategy.strategy_id, Decimal("1000"))
+    runner = ResearchBacktestRunner(
+        start_time=candles[0].timestamp,
+        end_time=candles[0].timestamp,
+        product_id=PRODUCT_ID,
+        timeframe="15m",
+        data_source=MemoryDataSource(candles),
+        capital_allocator=allocator,
+    )
+    runner.add_strategy(strategy)
+
+    runner._sync_capital_usage(LegacyPositionAdapter(), candles[0])  # type: ignore[arg-type]
+
+    assert allocator.get_used(strategy.strategy_id) == Decimal("0")
+
+
 def _market_order(order_id: str, *, timestamp: int) -> Order:
     return Order(
         id=order_id,
