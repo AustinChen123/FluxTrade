@@ -301,6 +301,34 @@ class SingleEntryStrategy(BaseStrategy):
         )
 
 
+class RejectedEntryThenExitStrategy(BaseStrategy):
+    def __init__(self, quantity: Decimal = Decimal("0.01")) -> None:
+        super().__init__("rejected_entry_then_exit", PRODUCT_ID)
+        self.quantity = quantity
+        self._index = 0
+
+    @property
+    def requirements(self) -> StrategyRequirements:
+        return StrategyRequirements(PRODUCT_ID, "15m", 1)
+
+    def on_candle(self, candle: Candlestick) -> Signal | None:
+        self._index += 1
+        if self._index == 1:
+            signal_type = SignalType.LONG
+        elif self._index == 2:
+            signal_type = SignalType.EXIT_LONG
+        else:
+            return None
+        return Signal(
+            strategy_id=self.strategy_id,
+            product_id=PRODUCT_ID,
+            timeframe="15m",
+            timestamp=candle.timestamp,
+            type=signal_type,
+            quantity=self.quantity,
+        )
+
+
 class MultiEntryStrategy(BaseStrategy):
     def __init__(self, quantity: Decimal = Decimal("0.006")) -> None:
         super().__init__("multi_entry", PRODUCT_ID)
@@ -582,6 +610,30 @@ def test_research_runner_rejects_entry_when_capital_is_insufficient():
     assert "required=" in strategy.contexts[1].latest_rejections[0].reason
     assert "available=100" in strategy.contexts[1].latest_rejections[0].reason
     assert strategy.contexts[2].latest_rejections == ()
+
+
+@pytest.mark.rust
+@pytest.mark.skipif(not HAS_RUST, reason="fluxtrade_core.so not compiled")
+def test_research_runner_skips_exit_when_rejected_entry_left_no_position():
+    candles = make_candle_series(count=3)
+    strategy = RejectedEntryThenExitStrategy(quantity=Decimal("0.01"))
+    allocator = CapitalAllocator(Decimal("100000"))
+    allocator.allocate(strategy.strategy_id, Decimal("100"))
+    runner = ResearchBacktestRunner(
+        start_time=candles[0].timestamp,
+        end_time=candles[-1].timestamp,
+        product_id=PRODUCT_ID,
+        timeframe="15m",
+        initial_balance=10_000.0,
+        data_source=MemoryDataSource(candles),
+        capital_allocator=allocator,
+    )
+    runner.add_strategy(strategy)
+
+    result = runner.run()
+
+    assert result["raw_trade_count"] == 0
+    assert allocator.get_used(strategy.strategy_id) == Decimal("0")
 
 
 @pytest.mark.rust
