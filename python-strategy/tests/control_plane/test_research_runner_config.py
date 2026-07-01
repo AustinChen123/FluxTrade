@@ -110,6 +110,55 @@ def test_research_parameter_search_creates_isolated_capital_allocators(
     assert second_allocator.get_allocation("golden_cross_b") == Decimal("100")
 
 
+def test_research_parameter_search_isolates_capital_allocators_per_dataset(
+    tmp_path,
+    monkeypatch,
+):
+    monkeypatch.setattr(parameter_search, "ResearchBacktestRunner", _RecordingRunner)
+    _RecordingRunner.instances = []
+    evaluator = ResearchBacktestParameterEvaluator(
+        _strategy_factory,
+        preload_candles=False,
+    )
+    request = ParameterSearchJobRequest.model_validate(
+        {
+            **_request_payload(tmp_path),
+            "evaluation_set": {
+                "datasets": [
+                    {
+                        "dataset_id": "trend",
+                        "product_id": "BINANCE:BTCUSDT-PERP",
+                        "timeframe": "5m",
+                        "start_time": 1_700_000_000_000,
+                        "end_time": 1_700_000_060_000,
+                    },
+                    {
+                        "dataset_id": "chop",
+                        "product_id": "BINANCE:BTCUSDT-PERP",
+                        "timeframe": "5m",
+                        "start_time": 1_700_000_060_000,
+                        "end_time": 1_700_000_120_000,
+                    },
+                ],
+            },
+        }
+    )
+    executor = ParameterSearchJobExecutor(
+        evaluator,
+        run_inline=True,
+    )
+
+    job = executor.submit_search(request)
+
+    assert job.status.value == "SUCCEEDED"
+    assert len(_RecordingRunner.instances) == 2
+    first_allocator = _RecordingRunner.instances[0].capital_allocator
+    second_allocator = _RecordingRunner.instances[1].capital_allocator
+    assert first_allocator is not second_allocator
+    assert first_allocator.get_allocation("golden_cross_a") == Decimal("100")
+    assert second_allocator.get_allocation("golden_cross_a") == Decimal("100")
+
+
 def test_research_runner_capital_allocation_rejects_non_positive_values(tmp_path):
     payload = _request_payload(tmp_path)
     payload["research_runner"]["capital_allocation"] = "0"
