@@ -449,6 +449,7 @@ class ParameterSearchJobExecutor:
                 "objective": request.objective,
                 "seed": request.seed,
                 "epoch_id": epoch_id,
+                "research_runner": _research_runner_result_payload(request),
                 "evaluation_set": _evaluation_set_result_payload(request),
                 "resolved_candidates": candidates,
                 "evaluations": evaluations,
@@ -614,6 +615,14 @@ def _evaluation_set_result_payload(
     }
 
 
+def _research_runner_result_payload(
+    request: ParameterSearchJobRequest,
+) -> dict[str, Any] | None:
+    if request.research_runner is None:
+        return None
+    return _json_safe(request.research_runner.model_dump(mode="json", exclude_none=True))
+
+
 def _dataset_backtest_override_payload(
     dataset: EvaluationDatasetConfig,
 ) -> dict[str, Any] | None:
@@ -725,6 +734,7 @@ def _insert_evolution_epoch(
                 "candidate_ids": [
                     candidate.candidate_id for candidate in candidates
                 ],
+                "research_runner": _research_runner_result_payload(request),
                 "evaluation_set": _evaluation_set_result_payload(request),
             },
             status="completed",

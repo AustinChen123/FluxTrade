@@ -4,8 +4,15 @@ from types import SimpleNamespace
 import pytest
 from pydantic import ValidationError
 
-from src.control_plane.models import ParameterCandidate, ParameterSearchJobRequest
-from src.control_plane.parameter_search import ResearchBacktestParameterEvaluator
+from src.control_plane.models import (
+    ParameterCandidate,
+    ParameterEvaluationResult,
+    ParameterSearchJobRequest,
+)
+from src.control_plane.parameter_search import (
+    ParameterSearchJobExecutor,
+    ResearchBacktestParameterEvaluator,
+)
 import src.control_plane.parameter_search as parameter_search
 
 
@@ -29,6 +36,16 @@ class _RecordingRunner:
             "raw_trade_count": 0,
             "candle_count": 0,
         }
+
+
+class _NoopEvaluator:
+    def evaluate(self, request, candidate):
+        return ParameterEvaluationResult(
+            candidate_id=candidate.candidate_id,
+            score_total=Decimal("1"),
+            max_drawdown=Decimal("0"),
+            metrics={},
+        )
 
 
 def _strategy_factory(strategy_id, product_id, timeframe, param_pack):
@@ -119,3 +136,15 @@ def test_research_evaluator_rejects_allocation_above_initial_balance(
             request,
             ParameterCandidate(candidate_id="a", param_pack={}),
         )
+
+
+def test_parameter_search_result_includes_research_runner_config(tmp_path):
+    executor = ParameterSearchJobExecutor(
+        _NoopEvaluator(),
+        run_inline=True,
+    )
+    request = ParameterSearchJobRequest.model_validate(_request_payload(tmp_path))
+
+    job = executor.submit_search(request)
+
+    assert job.result["research_runner"] == {"capital_allocation": "100"}
