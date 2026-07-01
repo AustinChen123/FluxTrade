@@ -203,6 +203,19 @@ class PartialCsvSignalBacktestEvaluationConfig(BaseModel):
         return value
 
 
+class ResearchRunnerEvaluationConfig(BaseModel):
+    """Research-runner settings for parameter candidate evaluation."""
+
+    capital_allocation: Decimal | None = None
+
+    @field_validator("capital_allocation")
+    @classmethod
+    def validate_capital_allocation(cls, value: Decimal | None) -> Decimal | None:
+        if value is not None and value <= 0:
+            raise ValueError("capital_allocation must be positive")
+        return value
+
+
 class EvaluationDatasetConfig(BaseModel):
     """One dataset interval for multi-regime parameter evaluation."""
 
@@ -288,6 +301,7 @@ class ParameterSearchJobRequest(BaseModel):
     ] = "maximize_score"
     seed: int | None = None
     backtest: CsvSignalBacktestEvaluationConfig | None = None
+    research_runner: ResearchRunnerEvaluationConfig | None = None
     evaluation_set: EvaluationSetConfig | None = None
     candidates: list[ParameterCandidate] | None = Field(default=None, min_length=1)
     search_space: ParameterSearchSpace | None = None

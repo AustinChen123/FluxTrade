@@ -22,6 +22,7 @@ from src.control_plane.models import (
     ParameterSearchJobRequest,
 )
 from src.control_plane.search_space import resolve_parameter_candidates
+from src.core.capital_allocator import CapitalAllocator
 from src.core.data_sources.csv_source import CsvDataSource
 from src.core.data_sources.memory import MemoryDataSource
 from src.core.golden_cross_fast_fitness import GoldenCrossFastFitnessEvaluator
@@ -120,6 +121,13 @@ class ResearchBacktestParameterEvaluator:
             raise ValueError("backtest settings are required for research evaluation")
 
         data_source, prepared_scaled_candles = self._replay_inputs_for(request)
+        strategy = self._strategy_factory(
+            f"{request.strategy_id}_{candidate.candidate_id}",
+            request.product_id,
+            request.timeframe,
+            candidate.param_pack,
+        )
+        capital_allocator = _capital_allocator_for(request, strategy.strategy_id)
         runner = ResearchBacktestRunner(
             start_time=request.start_time,
             end_time=request.end_time,
@@ -133,12 +141,7 @@ class ResearchBacktestParameterEvaluator:
             },
             precision_codec=self._precision_codec,
             prepared_scaled_candles=prepared_scaled_candles,
-        )
-        strategy = self._strategy_factory(
-            f"{request.strategy_id}_{candidate.candidate_id}",
-            request.product_id,
-            request.timeframe,
-            candidate.param_pack,
+            capital_allocator=capital_allocator,
         )
         runner.add_strategy(strategy)
 
@@ -303,6 +306,28 @@ def _candle_cache_key(request: ParameterSearchJobRequest) -> tuple:
         request.start_time,
         request.end_time,
     )
+
+
+def _capital_allocator_for(
+    request: ParameterSearchJobRequest,
+    strategy_id: str,
+) -> CapitalAllocator | None:
+    if request.research_runner is None:
+        return None
+    capital_allocation = request.research_runner.capital_allocation
+    if capital_allocation is None:
+        return None
+    if request.backtest is None:
+        raise ValueError("backtest settings are required for capital allocation")
+    initial_balance = request.backtest.initial_balance
+    if capital_allocation > initial_balance:
+        raise ValueError(
+            "research_runner.capital_allocation cannot exceed backtest.initial_balance"
+        )
+
+    allocator = CapitalAllocator(total_balance=initial_balance)
+    allocator.allocate(strategy_id, capital_allocation)
+    return allocator
 
 
 class ParameterSearchJobExecutor:
