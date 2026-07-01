@@ -598,6 +598,39 @@ def test_research_runner_reports_bar_level_drawdown_for_open_positions():
 
 @pytest.mark.rust
 @pytest.mark.skipif(not HAS_RUST, reason="fluxtrade_core.so not compiled")
+def test_research_runner_stops_on_bar_level_open_position_drawdown():
+    base_ts = 1_700_000_000_000
+    interval_ms = 15 * 60 * 1000
+    candles = [
+        make_candle(base_ts, Decimal("100"), Decimal("100"), Decimal("100"), Decimal("100")),
+        make_candle(base_ts + interval_ms, Decimal("100"), Decimal("100"), Decimal("100"), Decimal("100")),
+        make_candle(base_ts + 2 * interval_ms, Decimal("60"), Decimal("60"), Decimal("60"), Decimal("60")),
+        make_candle(base_ts + 3 * interval_ms, Decimal("105"), Decimal("105"), Decimal("105"), Decimal("105")),
+    ]
+    strategy = SingleEntryStrategy(quantity=Decimal("1"))
+    runner = ResearchBacktestRunner(
+        start_time=candles[0].timestamp,
+        end_time=candles[-1].timestamp,
+        product_id=PRODUCT_ID,
+        timeframe="15m",
+        initial_balance=10_000.0,
+        data_source=MemoryDataSource(candles),
+        max_drawdown_limit=0.004,
+        balance_check_interval=1,
+    )
+    runner.add_strategy(strategy)
+
+    result = runner.run()
+
+    assert result["candle_count"] == 3
+    assert result["raw_trade_count"] == 1
+    assert result["max_drawdown"] == Decimal("40")
+    assert len(strategy.contexts) == 3
+    assert strategy.contexts[-1].current_drawdown == Decimal("40")
+
+
+@pytest.mark.rust
+@pytest.mark.skipif(not HAS_RUST, reason="fluxtrade_core.so not compiled")
 def test_research_runner_passes_capital_snapshot_to_context_strategy():
     candles = make_candle_series(count=2)
     strategy = ContextProbeStrategy()

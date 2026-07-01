@@ -107,7 +107,7 @@ class ResearchBacktestRunner:
         )
         self._ensure_capital_allocator_supported(adapter)
         trades: list[ResearchTrade] = []
-        stop_threshold = self._stop_threshold()
+        stop_drawdown_amount = self._stop_drawdown_amount()
         context_support = {
             strategy.strategy_id: _strategy_accepts_context(strategy)
             for strategy in self._strategies
@@ -163,10 +163,11 @@ class ResearchBacktestRunner:
 
             candle_count += 1
             if (
-                stop_threshold is not None
+                stop_drawdown_amount is not None
                 and self.balance_check_interval > 0
                 and candle_count % self.balance_check_interval == 0
-                and adapter.get_balance() < stop_threshold
+                and max(max_drawdown_by_strategy.values(), default=Decimal("0"))
+                >= stop_drawdown_amount
             ):
                 logger.warning("Stopping research backtest at drawdown threshold")
                 break
@@ -256,10 +257,10 @@ class ResearchBacktestRunner:
         if getattr(prepared_candle, "timestamp", None) != candle.timestamp:
             raise ValueError("prepared_scaled_candles timestamp must match replay candles")
 
-    def _stop_threshold(self) -> Optional[Decimal]:
+    def _stop_drawdown_amount(self) -> Optional[Decimal]:
         if self.max_drawdown_limit is None:
             return None
-        return Decimal(str(self.initial_balance)) * Decimal(str(1 - self.max_drawdown_limit))
+        return Decimal(str(self.initial_balance)) * Decimal(str(self.max_drawdown_limit))
 
     def _strategy_context(
         self,
