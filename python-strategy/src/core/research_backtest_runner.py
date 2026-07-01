@@ -138,17 +138,18 @@ class ResearchBacktestRunner:
                     continue
                 if strategy.requirements.timeframe != candle.timeframe:
                     continue
-                context = None
+                context = self._strategy_context(
+                    adapter=adapter,
+                    strategy=strategy,
+                    candle=candle,
+                    latest_fills=fills,
+                    peak_equity_by_strategy=peak_equity_by_strategy,
+                    max_drawdown_by_strategy=max_drawdown_by_strategy,
+                )
+                decision_context = None
                 if context_support[strategy.strategy_id]:
-                    context = self._strategy_context(
-                        adapter=adapter,
-                        strategy=strategy,
-                        candle=candle,
-                        latest_fills=fills,
-                        peak_equity_by_strategy=peak_equity_by_strategy,
-                        max_drawdown_by_strategy=max_drawdown_by_strategy,
-                    )
-                signals = self._signals_from_strategy(strategy, candle, context)
+                    decision_context = context
+                signals = self._signals_from_strategy(strategy, candle, decision_context)
                 for signal in signals:
                     if self._capital_rejects_entry(signal, candle):
                         self._record_capital_rejection(signal, candle)
@@ -173,9 +174,13 @@ class ResearchBacktestRunner:
         final_balance = adapter.get_balance()
         total_pnl = final_balance - Decimal(str(self.initial_balance))
         metrics = calculate_metrics(trades, initial_balance=self.initial_balance)
+        bar_max_drawdown = max(
+            max_drawdown_by_strategy.values(),
+            default=Decimal("0"),
+        )
         return {
             "total_pnl": total_pnl,
-            "max_drawdown": metrics.get("max_drawdown", Decimal("0")),
+            "max_drawdown": bar_max_drawdown,
             "win_rate": metrics.get("win_rate", 0.0),
             "total_trades": int(metrics.get("total_trades", 0)),
             "trade_sharpe": metrics.get("trade_sharpe", Decimal("0")),

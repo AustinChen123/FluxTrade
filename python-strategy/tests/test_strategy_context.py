@@ -2,7 +2,7 @@ from decimal import Decimal
 
 import pytest
 
-from integration.conftest import PRODUCT_ID, make_candle_series
+from integration.conftest import PRODUCT_ID, make_candle, make_candle_series
 from src.core.adapters.simulated import SimulatedAdapter
 from src.core.capital_allocator import CapitalAllocator
 from src.core.data_sources.memory import MemoryDataSource
@@ -496,6 +496,52 @@ class ContextDrivenExitStrategy(BaseStrategy):
         return None
 
 
+class ContextDrawdownRoundTripStrategy(BaseStrategy):
+    def __init__(self) -> None:
+        super().__init__("ctx_drawdown_round_trip", PRODUCT_ID)
+        self.contexts: list[StrategyContext] = []
+        self._entered = False
+        self._exited = False
+
+    @property
+    def requirements(self) -> StrategyRequirements:
+        return StrategyRequirements(PRODUCT_ID, "15m", 1)
+
+    def on_candle(
+        self,
+        candle: Candlestick,
+        context: StrategyContext | None = None,
+    ) -> Signal | None:
+        if context is None:
+            raise AssertionError("context-aware strategy must receive context")
+        self.contexts.append(context)
+        if not self._entered:
+            self._entered = True
+            return Signal(
+                strategy_id=self.strategy_id,
+                product_id=PRODUCT_ID,
+                timeframe="15m",
+                timestamp=candle.timestamp,
+                type=SignalType.LONG,
+                quantity=Decimal("0.01"),
+            )
+        if (
+            not self._exited
+            and context.position is not None
+            and candle.close >= Decimal("105")
+        ):
+            self._exited = True
+            return Signal(
+                strategy_id=self.strategy_id,
+                product_id=PRODUCT_ID,
+                timeframe="15m",
+                timestamp=candle.timestamp,
+                type=SignalType.EXIT_LONG,
+                quantity=context.position.quantity,
+            )
+        return None
+
+
 @pytest.mark.rust
 @pytest.mark.skipif(not HAS_RUST, reason="fluxtrade_core.so not compiled")
 def test_research_runner_strategy_can_use_context_to_change_decisions():
@@ -517,6 +563,37 @@ def test_research_runner_strategy_can_use_context_to_change_decisions():
     assert strategy.decisions == ["enter", "exit"]
     assert result["raw_trade_count"] == 2
     assert result["total_trades"] == 1
+
+
+@pytest.mark.rust
+@pytest.mark.skipif(not HAS_RUST, reason="fluxtrade_core.so not compiled")
+def test_research_runner_reports_bar_level_drawdown_for_open_positions():
+    base_ts = 1_700_000_000_000
+    interval_ms = 15 * 60 * 1000
+    candles = [
+        make_candle(base_ts, Decimal("100"), Decimal("100"), Decimal("100"), Decimal("100")),
+        make_candle(base_ts + interval_ms, Decimal("100"), Decimal("100"), Decimal("100"), Decimal("100")),
+        make_candle(base_ts + 2 * interval_ms, Decimal("60"), Decimal("60"), Decimal("60"), Decimal("60")),
+        make_candle(base_ts + 3 * interval_ms, Decimal("105"), Decimal("105"), Decimal("105"), Decimal("105")),
+        make_candle(base_ts + 4 * interval_ms, Decimal("105"), Decimal("105"), Decimal("105"), Decimal("105")),
+    ]
+    strategy = ContextDrawdownRoundTripStrategy()
+    runner = ResearchBacktestRunner(
+        start_time=candles[0].timestamp,
+        end_time=candles[-1].timestamp,
+        product_id=PRODUCT_ID,
+        timeframe="15m",
+        initial_balance=10_000.0,
+        data_source=MemoryDataSource(candles),
+    )
+    runner.add_strategy(strategy)
+
+    result = runner.run()
+
+    assert result["raw_trade_count"] == 2
+    assert result["total_pnl"] > Decimal("0")
+    assert result["max_drawdown"] == Decimal("0.40")
+    assert max(context.max_drawdown for context in strategy.contexts) == Decimal("0.40")
 
 
 @pytest.mark.rust
