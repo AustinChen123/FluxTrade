@@ -18,6 +18,7 @@ from src.core.interfaces.data_source import IDataSource
 from src.core.adapters.simulated import SimulatedAdapter
 from src.core.mocks.account_service import BacktestAccountService
 from src.core.journal import StrategyJournal
+from src.core.models import PositionSide
 
 logger = logging.getLogger(__name__)
 
@@ -189,9 +190,11 @@ class BacktestRunner:
         self,
         candles: Iterable,
         mock_account: BacktestAccountService,
-        stop_threshold: Decimal,
+        stop_drawdown_amount: Decimal,
     ) -> int:
         count = 0
+        peak_equity = Decimal(str(self.initial_balance))
+        max_drawdown = Decimal("0")
         for candle in candles:
             # Update Clock
             self.clock.set_time(candle.timestamp / 1000)
@@ -200,15 +203,39 @@ class BacktestRunner:
             self.engine.on_market_data(candle)
 
             # Check Circuit Breaker
-            current_balance = mock_account.get_balance()
-            if current_balance < stop_threshold:
-                logger.warning("STOPPING BACKTEST: Max Drawdown Reached! Balance: %s < %s", current_balance, stop_threshold)
+            current_equity = self._account_equity(mock_account, candle)
+            peak_equity = max(peak_equity, current_equity)
+            max_drawdown = max(max_drawdown, peak_equity - current_equity)
+            count += 1
+            if max_drawdown >= stop_drawdown_amount:
+                logger.warning(
+                    "STOPPING BACKTEST: Max Drawdown Reached! Drawdown: %s >= %s",
+                    max_drawdown,
+                    stop_drawdown_amount,
+                )
                 break
 
-            count += 1
             if count % 1000 == 0:
-                logger.info("Processed %d candles... Current Time: %s | Bal: %s", count, candle.timestamp, current_balance)
+                logger.info(
+                    "Processed %d candles... Current Time: %s | Equity: %s",
+                    count,
+                    candle.timestamp,
+                    current_equity,
+                )
         return count
+
+    def _account_equity(
+        self,
+        mock_account: BacktestAccountService,
+        candle,
+    ) -> Decimal:
+        cash = mock_account.get_balance()
+        if mock_account.adapter is None:
+            return cash
+        position = mock_account.adapter.get_position(self.product_id)
+        if position is None:
+            return cash
+        return cash + _unrealized_pnl_at_mark(position, candle.close)
 
     def _export_reports(
         self,
@@ -318,7 +345,7 @@ class BacktestRunner:
 
         logger.info("Starting Backtest for %s [%s - %s]", self.product_id, self.start_time, self.end_time)
 
-        stop_threshold = Decimal(str(self.initial_balance)) * Decimal(str(1 - self.max_drawdown_limit))
+        stop_drawdown_amount = Decimal(str(self.initial_balance)) * Decimal(str(self.max_drawdown_limit))
 
         if self.data_source:
             candle_context = nullcontext(self.data_source.get_candles(
@@ -341,7 +368,7 @@ class BacktestRunner:
                     self.start_time,
                     self.end_time,
                 )
-            count = self._process_candles(candle_gen, mock_account, stop_threshold)
+            count = self._process_candles(candle_gen, mock_account, stop_drawdown_amount)
 
         # Calculate Final PnL
         final_balance = mock_account.get_balance()
@@ -395,6 +422,7 @@ class BacktestRunner:
             "max_consecutive_losses": int(metrics.get("max_consecutive_losses", 0)),
             "journal": journal.to_dicts(),
             "journal_count": len(journal),
+            "candle_count": count,
             "report_dir": report_dir,
             "per_strategy": per_strategy,
         }
@@ -421,3 +449,11 @@ class BacktestRunner:
                     initial_balance=self.initial_balance,
                 )
         return per_strategy
+
+
+def _unrealized_pnl_at_mark(position, mark_price: Decimal) -> Decimal:
+    if position.side == PositionSide.LONG:
+        return (mark_price - position.entry_price) * position.quantity
+    if position.side == PositionSide.SHORT:
+        return (position.entry_price - mark_price) * position.quantity
+    return Decimal("0")
