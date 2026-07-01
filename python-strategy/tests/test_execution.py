@@ -18,7 +18,7 @@ from decimal import Decimal
 from src.core.execution import ExecutionEngine
 from src.core.interfaces.exchange import ExchangeError
 from src.core.interfaces.exchange import ExchangeOrderLookupUnsupported
-from src.core.models import OrderStatus, SignalType
+from src.core.models import OrderStatus, Position, PositionSide, SignalType
 from src.core.client_order_id import generate_client_order_id, parse_client_order_id
 
 
@@ -123,6 +123,33 @@ class TestQuantityHandling:
         execution_engine.execute_signal(signal)
 
         assert mock_exchange_adapter.open_orders[0].quantity == Decimal("0.01")
+
+    def test_exit_without_quantity_closes_current_position(
+        self,
+        execution_engine,
+        signal_factory,
+        mock_exchange_adapter,
+    ):
+        """EXIT signals without quantity should use the current position size."""
+        product_id = "BINANCE:BTCUSDT-PERP"
+        mock_exchange_adapter.positions[product_id] = Position(
+            strategy_id="test-strategy",
+            product_id=product_id,
+            side=PositionSide.LONG,
+            quantity=Decimal("0.25"),
+            entry_price=Decimal("42000"),
+            unrealized_pnl=Decimal("0"),
+        )
+        signal = signal_factory(
+            signal_type=SignalType.EXIT_LONG,
+            product_id=product_id,
+            quantity=None,
+            price=Decimal("42000"),
+        )
+
+        execution_engine.execute_signal(signal)
+
+        assert mock_exchange_adapter.open_orders[0].quantity == Decimal("0.25")
 
 
 class TestAdapterDelegation:

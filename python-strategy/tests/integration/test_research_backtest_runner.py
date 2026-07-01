@@ -284,6 +284,56 @@ def test_research_backtest_syncs_capital_lifecycle_after_fills():
     assert allocator.get_used(strategy.strategy_id) == Decimal("0")
 
 
+def test_research_backtest_exit_without_quantity_closes_current_position():
+    candles = make_candle_series(count=4)
+
+    def predict(candle):
+        index = (candle.timestamp - candles[0].timestamp) // INTERVAL_MS
+        if index == 0:
+            return Signal(
+                strategy_id="research_exit_full",
+                product_id=PRODUCT_ID,
+                timeframe=TIMEFRAME,
+                timestamp=candle.timestamp,
+                type=SignalType.LONG,
+                quantity=Decimal("0.03"),
+            )
+        if index == 2:
+            return Signal(
+                strategy_id="research_exit_full",
+                product_id=PRODUCT_ID,
+                timeframe=TIMEFRAME,
+                timestamp=candle.timestamp,
+                type=SignalType.EXIT_LONG,
+                quantity=None,
+            )
+        return None
+
+    runner = ResearchBacktestRunner(
+        start_time=candles[0].timestamp,
+        end_time=candles[-1].timestamp,
+        product_id=PRODUCT_ID,
+        timeframe=TIMEFRAME,
+        initial_balance=10_000.0,
+        data_source=MemoryDataSource(candles),
+    )
+    runner.add_strategy(
+        CallableStrategy(
+            "research_exit_full",
+            predict,
+            PRODUCT_ID,
+            TIMEFRAME,
+        )
+    )
+
+    result = runner.run()
+
+    assert result["raw_trade_count"] == 2
+    assert result["raw_trades"][0].quantity == Decimal("0.03")
+    assert result["raw_trades"][1].quantity == Decimal("0.03")
+    assert result["total_trades"] == 1
+
+
 def test_research_backtest_rejects_entry_over_available_capital():
     candles = make_candle_series(count=3)
     strategy = CapitalGatedEntryStrategy()

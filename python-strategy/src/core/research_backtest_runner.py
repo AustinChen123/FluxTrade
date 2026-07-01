@@ -156,7 +156,7 @@ class ResearchBacktestRunner:
                         continue
                     if self._exit_without_position(signal, adapter):
                         continue
-                    order = self._order_from_signal(signal, candle)
+                    order = self._order_from_signal(signal, candle, adapter)
                     if order is not None:
                         adapter.place_order(order)
                         self._reserve_entry_capital(signal, order, candle)
@@ -449,12 +449,13 @@ class ResearchBacktestRunner:
         self,
         signal: Signal,
         candle: Candlestick,
+        adapter: SimulatedAdapter,
     ) -> Optional[Order]:
         side = self._determine_side(signal.type)
         if side is None:
             return None
 
-        quantity = signal.quantity if signal.quantity and signal.quantity > 0 else Decimal("0.01")
+        quantity = self._quantity_for_signal(signal, adapter)
         if signal.price and signal.price > 0:
             order_type = "limit"
             limit_price = signal.price
@@ -482,6 +483,29 @@ class ResearchBacktestRunner:
             filled_quantity=Decimal("0"),
             filled_price=Decimal("0"),
         )
+
+    def _quantity_for_signal(self, signal: Signal, adapter: SimulatedAdapter) -> Decimal:
+        if signal.quantity and signal.quantity > 0:
+            return signal.quantity
+        if signal.type in (SignalType.EXIT_LONG, SignalType.EXIT_SHORT):
+            position = self._position_for_exit_signal(signal, adapter)
+            if position is not None and position.quantity > 0:
+                return position.quantity
+        return Decimal("0.01")
+
+    def _position_for_exit_signal(self, signal: Signal, adapter: SimulatedAdapter):
+        position = adapter.get_position(
+            signal.product_id,
+            strategy_id=signal.strategy_id,
+        )
+        if position is None:
+            return None
+        position_side = getattr(position.side, "value", position.side)
+        if signal.type == SignalType.EXIT_LONG and position_side == "LONG":
+            return position
+        if signal.type == SignalType.EXIT_SHORT and position_side == "SHORT":
+            return position
+        return None
 
     def _entry_required_capital(self, signal: Signal, candle: Candlestick) -> Decimal:
         quantity = signal.quantity if signal.quantity and signal.quantity > 0 else Decimal("0.01")

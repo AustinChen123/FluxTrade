@@ -3,7 +3,7 @@ import time as _time
 from decimal import Decimal
 from typing import Callable, ContextManager, Optional
 from sqlalchemy.orm import Session
-from src.core.models import Signal, SignalType, Candlestick, OrderSide, OrderStatus
+from src.core.models import Signal, SignalType, Candlestick, OrderSide, OrderStatus, PositionSide
 from src.core.order_manager import OrderManager
 from src.core.interfaces.exchange import IExchangeAdapter, ExchangeError
 from src.core.interfaces.exchange import ExchangeOrderLookupUnsupported
@@ -258,7 +258,7 @@ class ExecutionEngine:
             return None
 
         # Determine Quantity
-        qty = signal.quantity if signal.quantity and signal.quantity > 0 else self.default_quantity
+        qty = self._quantity_for_signal(signal)
 
         # Determine Order Type and Price
         if signal.price and signal.price > 0:
@@ -328,7 +328,7 @@ class ExecutionEngine:
         if not side:
             return None
 
-        qty = signal.quantity if signal.quantity and signal.quantity > 0 else self.default_quantity
+        qty = self._quantity_for_signal(signal)
         if signal.price and signal.price > 0:
             order_type = "limit"
             limit_price = signal.price
@@ -438,6 +438,33 @@ class ExecutionEngine:
             "execution",
             signal.type.value.lower(),
         )
+
+    def _quantity_for_signal(self, signal: Signal) -> Decimal:
+        if signal.quantity and signal.quantity > 0:
+            return signal.quantity
+        if signal.type in (SignalType.EXIT_LONG, SignalType.EXIT_SHORT):
+            position = self._position_for_exit_signal(signal)
+            if position is not None and position.quantity > 0:
+                return position.quantity
+        return self.default_quantity
+
+    def _position_for_exit_signal(self, signal: Signal):
+        try:
+            position = self.adapter.get_position(
+                signal.product_id,
+                strategy_id=signal.strategy_id,
+            )
+        except TypeError:
+            position = self.adapter.get_position(signal.product_id)
+        if position is None:
+            return None
+
+        position_side = getattr(position.side, "value", position.side)
+        if signal.type == SignalType.EXIT_LONG and position_side == PositionSide.LONG.value:
+            return position
+        if signal.type == SignalType.EXIT_SHORT and position_side == PositionSide.SHORT.value:
+            return position
+        return None
 
     def _place_conditional_orders(self, signal: Signal, entry_order, qty: Decimal):
         """Submit SL/TP/Trailing orders linked via OCO to each other."""
