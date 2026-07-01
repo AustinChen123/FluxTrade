@@ -49,7 +49,7 @@ def test_capital_snapshot_is_immutable():
         snapshot.available = Decimal("0")  # type: ignore[misc]
 
 
-def test_research_runner_does_not_sync_product_position_without_strategy_support():
+def test_research_runner_rejects_capital_allocator_without_strategy_positions():
     class LegacyPositionAdapter:
         supports_strategy_positions = False
 
@@ -74,9 +74,8 @@ def test_research_runner_does_not_sync_product_position_without_strategy_support
     )
     runner.add_strategy(strategy)
 
-    runner._sync_capital_usage(LegacyPositionAdapter(), candles[0])  # type: ignore[arg-type]
-
-    assert allocator.get_used(strategy.strategy_id) == Decimal("0")
+    with pytest.raises(RuntimeError, match="strategy-scoped positions"):
+        runner._sync_capital_usage(LegacyPositionAdapter(), candles[0])  # type: ignore[arg-type]
 
 
 def _market_order(order_id: str, *, timestamp: int) -> Order:

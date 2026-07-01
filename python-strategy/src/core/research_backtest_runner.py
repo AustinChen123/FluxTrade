@@ -105,6 +105,7 @@ class ResearchBacktestRunner:
             taker_fee=Decimal(str(self.fee_config.get("taker", 0))),
             precision_codec=self.precision_codec,
         )
+        self._ensure_capital_allocator_supported(adapter)
         trades: list[ResearchTrade] = []
         stop_threshold = self._stop_threshold()
         context_support = {
@@ -312,6 +313,7 @@ class ResearchBacktestRunner:
     ) -> None:
         if self.capital_allocator is None:
             return
+        self._ensure_capital_allocator_supported(adapter)
         open_order_ids = {order.id for order in adapter.get_open_orders()}
         self._reserved_entry_capital = {
             order_id: reservation
@@ -332,6 +334,15 @@ class ResearchBacktestRunner:
                 if strategy_id == strategy.strategy_id
             )
             self.capital_allocator.set_usage(strategy.strategy_id, used)
+
+    def _ensure_capital_allocator_supported(self, adapter: SimulatedAdapter) -> None:
+        if self.capital_allocator is None:
+            return
+        if adapter.supports_strategy_positions:
+            return
+        raise RuntimeError(
+            "capital_allocator requires a Rust engine with strategy-scoped positions"
+        )
 
     def _signals_from_strategy(
         self,
