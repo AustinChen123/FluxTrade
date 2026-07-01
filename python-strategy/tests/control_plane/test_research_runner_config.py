@@ -3,6 +3,10 @@ from types import SimpleNamespace
 
 import pytest
 from pydantic import ValidationError
+from sqlalchemy import create_engine
+from sqlalchemy.dialects.postgresql import JSONB
+from sqlalchemy.ext.compiler import compiles
+from sqlalchemy.orm import sessionmaker
 
 from src.control_plane.models import (
     ParameterCandidate,
@@ -15,7 +19,13 @@ from src.control_plane.parameter_search import (
     ParameterSearchJobExecutor,
     ResearchBacktestParameterEvaluator,
 )
+from src.core.orm_models import EvolutionEpoch, GeneRecord, Strategy, SystemEvent
 import src.control_plane.parameter_search as parameter_search
+
+
+@compiles(JSONB, "sqlite")
+def _compile_jsonb_for_sqlite(type_, compiler, **kw):
+    return "JSON"
 
 
 class _RecordingRunner:
@@ -79,6 +89,26 @@ def _request_payload(tmp_path):
             {"candidate_id": "a", "param_pack": {"score": 1}},
         ],
     }
+
+
+def _sqlite_gene_registry_session_factory(tmp_path):
+    engine = create_engine(
+        f"sqlite:///{tmp_path / 'research_runner_gene_registry.db'}",
+        connect_args={"check_same_thread": False, "timeout": 30},
+    )
+    for table in [
+        Strategy.__table__,
+        SystemEvent.__table__,
+        EvolutionEpoch.__table__,
+        GeneRecord.__table__,
+    ]:
+        table.create(engine, checkfirst=True)
+
+    session_factory = sessionmaker(bind=engine)
+    with session_factory() as session:
+        session.add(Strategy(id="golden_cross", name="Golden Cross"))
+        session.commit()
+    return session_factory
 
 
 def test_research_parameter_search_creates_isolated_capital_allocators(
@@ -199,6 +229,25 @@ def test_parameter_search_result_includes_research_runner_config(tmp_path):
     job = executor.submit_search(request)
 
     assert job.result["research_runner"] == {"capital_allocation": "100"}
+
+
+def test_parameter_search_persists_research_runner_config_in_epoch(tmp_path):
+    session_factory = _sqlite_gene_registry_session_factory(tmp_path)
+    executor = ParameterSearchJobExecutor(
+        _NoopEvaluator(),
+        run_inline=True,
+        db_session_factory=session_factory,
+    )
+    request = ParameterSearchJobRequest.model_validate(_request_payload(tmp_path))
+
+    job = executor.submit_search(request)
+
+    assert job.status.value == "SUCCEEDED"
+    assert job.result is not None
+    with session_factory() as session:
+        epoch = session.get(EvolutionEpoch, job.result["epoch_id"])
+    assert epoch is not None
+    assert epoch.config_json["research_runner"] == {"capital_allocation": "100"}
 
 
 def test_csv_signal_evaluator_rejects_research_runner_config(tmp_path):
