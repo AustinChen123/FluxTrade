@@ -62,6 +62,7 @@ class CsvSignalBacktestParameterEvaluator:
         request: ParameterSearchJobRequest,
         candidate: ParameterCandidate,
     ) -> ParameterEvaluationResult:
+        _reject_research_runner_settings(request, "CSV-signal evaluation")
         if request.backtest is None:
             raise ValueError("backtest settings are required for CSV-signal evaluation")
 
@@ -216,6 +217,7 @@ class GoldenCrossFastFitnessParameterEvaluator:
         request: ParameterSearchJobRequest,
         candidate: ParameterCandidate,
     ) -> ParameterEvaluationResult:
+        _reject_research_runner_settings(request, "fast fitness evaluation")
         if request.backtest is None:
             raise ValueError("backtest settings are required for fast fitness evaluation")
 
@@ -328,6 +330,18 @@ def _capital_allocator_for(
     allocator = CapitalAllocator(total_balance=initial_balance)
     allocator.allocate(strategy_id, capital_allocation)
     return allocator
+
+
+def _reject_research_runner_settings(
+    request: ParameterSearchJobRequest,
+    evaluator_name: str,
+) -> None:
+    if request.research_runner is None:
+        return
+    raise ValueError(
+        "research_runner settings require ResearchBacktestParameterEvaluator; "
+        f"{evaluator_name} does not support them"
+    )
 
 
 class ParameterSearchJobExecutor:

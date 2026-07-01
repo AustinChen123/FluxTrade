@@ -10,6 +10,8 @@ from src.control_plane.models import (
     ParameterSearchJobRequest,
 )
 from src.control_plane.parameter_search import (
+    CsvSignalBacktestParameterEvaluator,
+    GoldenCrossFastFitnessParameterEvaluator,
     ParameterSearchJobExecutor,
     ResearchBacktestParameterEvaluator,
 )
@@ -197,3 +199,34 @@ def test_parameter_search_result_includes_research_runner_config(tmp_path):
     job = executor.submit_search(request)
 
     assert job.result["research_runner"] == {"capital_allocation": "100"}
+
+
+def test_csv_signal_evaluator_rejects_research_runner_config(tmp_path):
+    request = ParameterSearchJobRequest.model_validate(_request_payload(tmp_path))
+    evaluator = CsvSignalBacktestParameterEvaluator()
+
+    with pytest.raises(
+        ValueError,
+        match="research_runner settings require ResearchBacktestParameterEvaluator",
+    ):
+        evaluator.evaluate(
+            request,
+            ParameterCandidate(candidate_id="a", param_pack={}),
+        )
+
+
+def test_fast_fitness_evaluator_rejects_research_runner_config(tmp_path):
+    request = ParameterSearchJobRequest.model_validate(_request_payload(tmp_path))
+    evaluator = GoldenCrossFastFitnessParameterEvaluator()
+
+    with pytest.raises(
+        ValueError,
+        match="research_runner settings require ResearchBacktestParameterEvaluator",
+    ):
+        evaluator.evaluate(
+            request,
+            ParameterCandidate(
+                candidate_id="a",
+                param_pack={"short_window": 1, "long_window": 2},
+            ),
+        )
