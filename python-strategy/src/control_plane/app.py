@@ -19,6 +19,7 @@ from src.control_plane.models import (
     StrategyCommandRequest,
 )
 from src.control_plane.parameter_search import ParameterSearchJobExecutor
+from src.control_plane.presets import GoldenCrossParameterSearchPreset
 from src.control_plane.strategy_control import StrategyControlService
 from src.control_plane.strategy_state_query import StrategyStateQueryService
 
@@ -77,6 +78,12 @@ class ControlPlaneApp:
 
         if method == "POST" and clean_path == "/jobs/parameter-searches":
             return self._submit_parameter_search(body)
+
+        if (
+            method == "POST"
+            and clean_path == "/jobs/parameter-search-presets/golden-cross"
+        ):
+            return self._submit_golden_cross_parameter_search_preset(body)
 
         if method == "POST" and clean_path.startswith("/jobs/"):
             return self._handle_job_action(clean_path, body)
@@ -167,6 +174,33 @@ class ControlPlaneApp:
         try:
             payload = self._parse_json_body(body)
             request = ParameterSearchJobRequest.model_validate(payload)
+        except json.JSONDecodeError as exc:
+            return HttpResponse(400, {"error": "invalid_json", "detail": str(exc)})
+        except ValidationError as exc:
+            return HttpResponse(
+                422,
+                {
+                    "error": "validation_error",
+                    "detail": exc.errors(include_url=False),
+                },
+            )
+        except ValueError as exc:
+            return HttpResponse(400, {"error": "invalid_json", "detail": str(exc)})
+
+        job = self.parameter_search_executor.submit_search(request)
+        status_code = 200 if job.finished_at is not None else 202
+        return HttpResponse(status_code, {"job": self._job_payload(job)})
+
+    def _submit_golden_cross_parameter_search_preset(
+        self,
+        body: str | bytes | None,
+    ) -> HttpResponse:
+        if self.parameter_search_executor is None:
+            return HttpResponse(503, {"error": "parameter_search_unavailable"})
+        try:
+            payload = self._parse_json_body(body)
+            preset = GoldenCrossParameterSearchPreset.model_validate(payload)
+            request = preset.to_parameter_search_request()
         except json.JSONDecodeError as exc:
             return HttpResponse(400, {"error": "invalid_json", "detail": str(exc)})
         except ValidationError as exc:

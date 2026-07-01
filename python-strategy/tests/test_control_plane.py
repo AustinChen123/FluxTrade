@@ -431,6 +431,20 @@ class _FakeParameterEvaluator:
         )
 
 
+class _WindowParameterEvaluator:
+    def __init__(self) -> None:
+        self.evaluated_candidate_ids = []
+
+    def evaluate(self, request, candidate):
+        self.evaluated_candidate_ids.append(candidate.candidate_id)
+        score = Decimal(str(candidate.param_pack["short_window"]))
+        return ParameterEvaluationResult(
+            candidate_id=candidate.candidate_id,
+            score_total=score,
+            metrics={"seed": request.seed, "score": str(score)},
+        )
+
+
 def test_control_plane_runs_parameter_search_job_with_injected_evaluator():
     store = InMemoryJobStore()
     evaluator = _FakeParameterEvaluator()
@@ -524,6 +538,133 @@ def test_control_plane_reports_unavailable_parameter_search():
 
     assert response.status_code == 503
     assert response.body == {"error": "parameter_search_unavailable"}
+
+
+def test_control_plane_runs_golden_cross_parameter_search_preset():
+    store = InMemoryJobStore()
+    evaluator = _WindowParameterEvaluator()
+    app = ControlPlaneApp(
+        BacktestJobExecutor(store=store, run_inline=True),
+        parameter_search_executor=ParameterSearchJobExecutor(
+            evaluator,
+            store=store,
+            run_inline=True,
+        ),
+    )
+
+    response = app.handle(
+        "POST",
+        "/jobs/parameter-search-presets/golden-cross",
+        json.dumps(
+            {
+                "strategy_id": "golden_cross_easy",
+                "product_id": PRODUCT_ID,
+                "timeframe": TIMEFRAME,
+                "start_time": 1,
+                "end_time": 2,
+                "short_window": {"min": 5, "max": 10, "step": 5},
+                "long_window": {"min": 20, "max": 20, "step": 5},
+                "quantity": {"min": "0.01", "max": "0.01", "step": "0.01"},
+                "candidate_sample_count": 2,
+                "seed": 7,
+                "backtest": {
+                    "candles_csv_path": "data/BTCUSDT_15m.csv",
+                    "initial_balance": "10000",
+                    "maker_fee": "0",
+                    "taker_fee": "0",
+                },
+                "research_runner": {
+                    "capital_allocation": "1000",
+                },
+            }
+        ),
+    )
+
+    assert response.status_code == 200
+    job = response.body["job"]
+    assert job["kind"] == "parameter_search"
+    assert job["status"] == JobStatus.SUCCEEDED.value
+    assert job["result"]["strategy_id"] == "golden_cross_easy"
+    assert job["result"]["seed"] == 7
+    assert job["result"]["research_runner"] == {"capital_allocation": "1000"}
+    assert job["result"]["resolved_candidates"] == [
+        {
+            "candidate_id": "generated_000001",
+            "param_pack": {
+                "short_window": 5,
+                "long_window": 20,
+                "quantity": "0.01",
+            },
+        },
+        {
+            "candidate_id": "generated_000002",
+            "param_pack": {
+                "short_window": 10,
+                "long_window": 20,
+                "quantity": "0.01",
+            },
+        },
+    ]
+    assert evaluator.evaluated_candidate_ids == [
+        "generated_000001",
+        "generated_000002",
+    ]
+
+
+def test_control_plane_reports_unavailable_parameter_search_preset():
+    app = ControlPlaneApp(BacktestJobExecutor(run_inline=True))
+
+    response = app.handle(
+        "POST",
+        "/jobs/parameter-search-presets/golden-cross",
+        json.dumps(
+            {
+                "strategy_id": "golden_cross_easy",
+                "product_id": PRODUCT_ID,
+                "timeframe": TIMEFRAME,
+                "start_time": 1,
+                "end_time": 2,
+                "short_window": {"min": 5, "max": 10, "step": 5},
+                "long_window": {"min": 20, "max": 20, "step": 5},
+                "candidate_sample_count": 2,
+            }
+        ),
+    )
+
+    assert response.status_code == 503
+    assert response.body == {"error": "parameter_search_unavailable"}
+
+
+def test_control_plane_rejects_invalid_golden_cross_parameter_search_preset():
+    store = InMemoryJobStore()
+    app = ControlPlaneApp(
+        BacktestJobExecutor(store=store, run_inline=True),
+        parameter_search_executor=ParameterSearchJobExecutor(
+            _FakeParameterEvaluator(),
+            store=store,
+            run_inline=True,
+        ),
+    )
+
+    response = app.handle(
+        "POST",
+        "/jobs/parameter-search-presets/golden-cross",
+        json.dumps(
+            {
+                "strategy_id": "golden_cross_easy",
+                "product_id": PRODUCT_ID,
+                "timeframe": TIMEFRAME,
+                "start_time": 1,
+                "end_time": 2,
+                "short_window": {"min": 5, "max": 20, "step": 5},
+                "long_window": {"min": 20, "max": 40, "step": 5},
+                "candidate_sample_count": 2,
+            }
+        ),
+    )
+
+    assert response.status_code == 422
+    assert response.body["error"] == "validation_error"
 
 
 def test_parameter_search_records_evolution_epoch_and_gene_candidates(tmp_path):
