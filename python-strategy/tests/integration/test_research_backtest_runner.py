@@ -16,8 +16,9 @@ from sqlalchemy.orm import sessionmaker
 
 from integration.conftest import PRODUCT_ID, TIMEFRAME, make_candle_series
 from src.core.backtest_runner import BacktestRunner
+from src.core.capital_allocator import CapitalAllocator
 from src.core.data_sources.memory import MemoryDataSource
-from src.core.models import Signal, SignalType
+from src.core.models import Candlestick, Signal, SignalType
 from src.core.orm_models import (
     BacktestResultSummary,
     BacktestTradeLog,
@@ -28,6 +29,8 @@ from src.core.orm_models import (
 )
 from src.core.precision import PrecisionCodec, PrecisionSpec
 from src.core.research_backtest_runner import ResearchBacktestRunner
+from src.core.strategy_context import StrategyContext
+from src.strategies.base import BaseStrategy, StrategyRequirements
 from src.strategies.callable_strategy import CallableStrategy
 
 try:
@@ -107,6 +110,82 @@ def _signal_factory(strategy_id: str, candles: list):
     return predict
 
 
+class CapitalLifecycleProbeStrategy(BaseStrategy):
+    def __init__(self) -> None:
+        super().__init__("capital_lifecycle_probe", PRODUCT_ID)
+        self.contexts: list[StrategyContext] = []
+        self.decisions: list[str] = []
+        self._entered = False
+        self._exited = False
+
+    @property
+    def requirements(self) -> StrategyRequirements:
+        return StrategyRequirements(PRODUCT_ID, TIMEFRAME, 1)
+
+    def on_candle(
+        self,
+        candle: Candlestick,
+        context: StrategyContext | None = None,
+    ) -> Signal | None:
+        if context is None:
+            raise AssertionError("capital lifecycle test requires context")
+        self.contexts.append(context)
+        if not self._entered and context.position is None:
+            self._entered = True
+            self.decisions.append("enter")
+            return Signal(
+                strategy_id=self.strategy_id,
+                product_id=PRODUCT_ID,
+                timeframe=TIMEFRAME,
+                timestamp=candle.timestamp,
+                type=SignalType.LONG,
+                quantity=Decimal("0.01"),
+            )
+        if self._entered and not self._exited and context.position is not None:
+            self._exited = True
+            self.decisions.append("exit")
+            return Signal(
+                strategy_id=self.strategy_id,
+                product_id=PRODUCT_ID,
+                timeframe=TIMEFRAME,
+                timestamp=candle.timestamp,
+                type=SignalType.EXIT_LONG,
+                quantity=context.position.quantity,
+            )
+        return None
+
+
+class CapitalGatedEntryStrategy(BaseStrategy):
+    def __init__(self) -> None:
+        super().__init__("capital_gated_entry", PRODUCT_ID)
+        self.contexts: list[StrategyContext] = []
+        self._sent = False
+
+    @property
+    def requirements(self) -> StrategyRequirements:
+        return StrategyRequirements(PRODUCT_ID, TIMEFRAME, 1)
+
+    def on_candle(
+        self,
+        candle: Candlestick,
+        context: StrategyContext | None = None,
+    ) -> Signal | None:
+        if context is None:
+            raise AssertionError("capital gating test requires context")
+        self.contexts.append(context)
+        if self._sent:
+            return None
+        self._sent = True
+        return Signal(
+            strategy_id=self.strategy_id,
+            product_id=PRODUCT_ID,
+            timeframe=TIMEFRAME,
+            timestamp=candle.timestamp,
+            type=SignalType.LONG,
+            quantity=Decimal("0.01"),
+        )
+
+
 @pytest.mark.smoke
 def test_research_backtest_matches_full_runner_core_metrics(tmp_path):
     session_factory = _sqlite_backtest_session_factory(tmp_path)
@@ -170,6 +249,67 @@ def test_research_backtest_matches_full_runner_core_metrics(tmp_path):
     assert research_result["total_trades"] == metrics["total_trades"]
     assert research_result["total_pnl"] == full_result["total_pnl"]
     assert research_result["profit_factor"] == full_result["profit_factor"]
+
+
+def test_research_backtest_syncs_capital_lifecycle_after_fills():
+    candles = make_candle_series(count=4)
+    strategy = CapitalLifecycleProbeStrategy()
+    allocator = CapitalAllocator(Decimal("100000"))
+    allocator.allocate(strategy.strategy_id, Decimal("5000"))
+    runner = ResearchBacktestRunner(
+        start_time=candles[0].timestamp,
+        end_time=candles[-1].timestamp,
+        product_id=PRODUCT_ID,
+        timeframe=TIMEFRAME,
+        initial_balance=10_000.0,
+        data_source=MemoryDataSource(candles),
+        capital_allocator=allocator,
+    )
+    runner.add_strategy(strategy)
+
+    result = runner.run()
+
+    assert result["raw_trade_count"] == 2
+    assert strategy.decisions == ["enter", "exit"]
+    assert strategy.contexts[0].capital is not None
+    assert strategy.contexts[0].capital.used == Decimal("0")
+    assert strategy.contexts[1].capital is not None
+    assert strategy.contexts[1].capital.used == Decimal("0.01") * candles[1].close
+    assert strategy.contexts[1].capital.available == (
+        Decimal("5000") - strategy.contexts[1].capital.used
+    )
+    assert strategy.contexts[2].capital is not None
+    assert strategy.contexts[2].capital.used == Decimal("0")
+    assert strategy.contexts[2].capital.available == Decimal("5000")
+    assert allocator.get_used(strategy.strategy_id) == Decimal("0")
+
+
+def test_research_backtest_rejects_entry_over_available_capital():
+    candles = make_candle_series(count=3)
+    strategy = CapitalGatedEntryStrategy()
+    allocator = CapitalAllocator(Decimal("100000"))
+    allocator.allocate(strategy.strategy_id, Decimal("100"))
+    runner = ResearchBacktestRunner(
+        start_time=candles[0].timestamp,
+        end_time=candles[-1].timestamp,
+        product_id=PRODUCT_ID,
+        timeframe=TIMEFRAME,
+        initial_balance=10_000.0,
+        data_source=MemoryDataSource(candles),
+        capital_allocator=allocator,
+    )
+    runner.add_strategy(strategy)
+
+    result = runner.run()
+
+    assert result["raw_trade_count"] == 0
+    assert result["total_trades"] == 0
+    assert strategy.contexts[0].capital is not None
+    assert strategy.contexts[0].capital.available == Decimal("100")
+    assert strategy.contexts[0].latest_rejections == ()
+    assert len(strategy.contexts[1].latest_rejections) == 1
+    assert "capital_allocation_rejected" in strategy.contexts[1].latest_rejections[0].reason
+    assert allocator.get_used(strategy.strategy_id) == Decimal("0")
 
 
 def test_research_backtest_prepared_scaled_path_matches_decimal_path():

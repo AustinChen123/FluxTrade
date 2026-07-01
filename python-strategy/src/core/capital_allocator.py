@@ -79,6 +79,11 @@ class CapitalAllocator:
         with self._lock:
             return self._allocations.get(strategy_id, Decimal("0"))
 
+    def get_used(self, strategy_id: str) -> Decimal:
+        """Get capital currently marked as used for a strategy."""
+        with self._lock:
+            return self._used.get(strategy_id, Decimal("0"))
+
     def get_unallocated(self) -> Decimal:
         """Get remaining unallocated balance."""
         with self._lock:
@@ -102,6 +107,23 @@ class CapitalAllocator:
                     f"only {allocated - current_used} available"
                 )
             self._used[strategy_id] = current_used + amount
+
+    def set_usage(self, strategy_id: str, amount: Decimal) -> None:
+        """Set capital currently used by a strategy.
+
+        This is useful for replay paths that derive usage from the current
+        position snapshot after matching instead of applying fill deltas. Unlike
+        ``record_usage()``, this accepts mark-to-market over-allocation so a
+        profitable or volatile position can be represented as negative
+        available capital instead of failing replay.
+        """
+        if not isinstance(amount, Decimal):
+            raise TypeError("amount must be Decimal")
+        if amount < Decimal("0"):
+            raise ValueError("amount must be non-negative")
+
+        with self._lock:
+            self._used[strategy_id] = amount
 
     def release_usage(self, strategy_id: str, amount: Decimal) -> None:
         """Release used capital (e.g., when closing a position)."""

@@ -133,6 +133,35 @@ class TestUsageTracking:
         allocator.record_usage("strat_a", Decimal("30000"))
         assert allocator.get_available("strat_a") == Decimal("0")
 
+    def test_set_usage_replaces_current_usage(self):
+        allocator = CapitalAllocator(Decimal("100000"))
+        allocator.allocate("strat_a", Decimal("30000"))
+        allocator.record_usage("strat_a", Decimal("10000"))
+
+        allocator.set_usage("strat_a", Decimal("5000"))
+
+        assert allocator.get_used("strat_a") == Decimal("5000")
+        assert allocator.get_available("strat_a") == Decimal("25000")
+
+    def test_set_usage_to_zero_releases_current_usage(self):
+        allocator = CapitalAllocator(Decimal("100000"))
+        allocator.allocate("strat_a", Decimal("30000"))
+        allocator.record_usage("strat_a", Decimal("10000"))
+
+        allocator.set_usage("strat_a", Decimal("0"))
+
+        assert allocator.get_used("strat_a") == Decimal("0")
+        assert allocator.get_available("strat_a") == Decimal("30000")
+
+    def test_set_usage_can_record_mark_to_market_over_allocation(self):
+        allocator = CapitalAllocator(Decimal("100000"))
+        allocator.allocate("strat_a", Decimal("30000"))
+
+        allocator.set_usage("strat_a", Decimal("30001"))
+
+        assert allocator.get_used("strat_a") == Decimal("30001")
+        assert allocator.get_available("strat_a") == Decimal("-1")
+
     def test_record_usage_exceeds_available_raises(self):
         allocator = CapitalAllocator(Decimal("100000"))
         allocator.allocate("strat_a", Decimal("30000"))
@@ -216,6 +245,12 @@ class TestQueryMethods:
         allocator.allocate("strat_a", Decimal("50000"))
         allocator.record_usage("strat_a", Decimal("20000"))
         assert allocator.get_available("strat_a") == Decimal("30000")
+
+    def test_get_used_reflects_usage(self):
+        allocator = CapitalAllocator(Decimal("100000"))
+        allocator.allocate("strat_a", Decimal("50000"))
+        allocator.record_usage("strat_a", Decimal("20000"))
+        assert allocator.get_used("strat_a") == Decimal("20000")
 
 
 class TestBalanceUpdates:

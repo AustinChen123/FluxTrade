@@ -4,11 +4,12 @@ import pytest
 
 from integration.conftest import PRODUCT_ID, make_candle_series
 from src.core.adapters.simulated import SimulatedAdapter
+from src.core.capital_allocator import CapitalAllocator
 from src.core.data_sources.memory import MemoryDataSource
 from src.core.models import OrderSide, PositionSide
 from src.core.orm_models import Order
 from src.core.research_backtest_runner import ResearchBacktestRunner
-from src.core.strategy_context import RiskSnapshot, StrategyContext
+from src.core.strategy_context import CapitalSnapshot, RiskSnapshot, StrategyContext
 from src.core.models import Candlestick, Signal, SignalType
 from src.strategies.base import BaseStrategy, StrategyRequirements
 
@@ -18,6 +19,63 @@ try:
     HAS_RUST = True
 except ImportError:
     HAS_RUST = False
+
+
+def test_strategy_context_capital_defaults_to_none():
+    context = StrategyContext(
+        strategy_id="ctx_strategy",
+        product_id=PRODUCT_ID,
+        timestamp=1,
+        available_cash=Decimal("10000"),
+        total_equity=Decimal("10000"),
+        realized_pnl=Decimal("0"),
+        unrealized_pnl=Decimal("0"),
+        current_drawdown=Decimal("0"),
+        max_drawdown=Decimal("0"),
+    )
+
+    assert context.capital is None
+
+
+def test_capital_snapshot_is_immutable():
+    snapshot = CapitalSnapshot(
+        allocated=Decimal("5000"),
+        used=Decimal("1500"),
+        available=Decimal("3500"),
+        unallocated=Decimal("95000"),
+    )
+
+    with pytest.raises(AttributeError):
+        snapshot.available = Decimal("0")  # type: ignore[misc]
+
+
+def test_research_runner_rejects_capital_allocator_without_strategy_positions():
+    class LegacyPositionAdapter:
+        supports_strategy_positions = False
+
+        def get_open_orders(self):
+            return []
+
+        def get_position(self, product_id: str, strategy_id: str | None = None):
+            raise AssertionError("legacy product-level positions must not be used")
+
+    candles = make_candle_series(count=1)
+    strategy = SingleEntryStrategy()
+    allocator = CapitalAllocator(Decimal("100000"))
+    allocator.allocate(strategy.strategy_id, Decimal("5000"))
+    allocator.set_usage(strategy.strategy_id, Decimal("1000"))
+    runner = ResearchBacktestRunner(
+        start_time=candles[0].timestamp,
+        end_time=candles[0].timestamp,
+        product_id=PRODUCT_ID,
+        timeframe="15m",
+        data_source=MemoryDataSource(candles),
+        capital_allocator=allocator,
+    )
+    runner.add_strategy(strategy)
+
+    with pytest.raises(RuntimeError, match="strategy-scoped positions"):
+        runner._sync_capital_usage(LegacyPositionAdapter(), candles[0])  # type: ignore[arg-type]
 
 
 def _market_order(order_id: str, *, timestamp: int) -> Order:
@@ -157,6 +215,32 @@ def test_strategy_context_account_fields_follow_research_contract():
     )
 
 
+@pytest.mark.rust
+@pytest.mark.skipif(not HAS_RUST, reason="fluxtrade_core.so not compiled")
+def test_strategy_context_exposes_capital_snapshot_without_redefining_cash():
+    candles = make_candle_series(count=1)
+    allocator = CapitalAllocator(Decimal("100000"))
+    allocator.allocate("ctx_strategy", Decimal("5000"))
+    allocator.record_usage("ctx_strategy", Decimal("1500"))
+    adapter = SimulatedAdapter(initial_balance=Decimal("10000"))
+
+    context = adapter.get_strategy_context(
+        strategy_id="ctx_strategy",
+        product_id=PRODUCT_ID,
+        timestamp=candles[0].timestamp,
+        initial_balance=Decimal("10000"),
+        mark_price=candles[0].close,
+        capital_allocator=allocator,
+    )
+
+    assert context.available_cash == Decimal("10000")
+    assert context.capital is not None
+    assert context.capital.allocated == Decimal("5000")
+    assert context.capital.used == Decimal("1500")
+    assert context.capital.available == Decimal("3500")
+    assert context.capital.unallocated == Decimal("95000")
+
+
 class ContextProbeStrategy(BaseStrategy):
     def __init__(self) -> None:
         super().__init__("ctx_strategy", PRODUCT_ID)
@@ -182,6 +266,118 @@ class ContextProbeStrategy(BaseStrategy):
                 timestamp=candle.timestamp,
                 type=SignalType.LONG,
                 quantity=Decimal("0.01"),
+            )
+        return None
+
+
+class SingleEntryStrategy(BaseStrategy):
+    def __init__(self, quantity: Decimal = Decimal("0.01")) -> None:
+        super().__init__("single_entry", PRODUCT_ID)
+        self.quantity = quantity
+        self.contexts: list[StrategyContext] = []
+        self._sent = False
+
+    @property
+    def requirements(self) -> StrategyRequirements:
+        return StrategyRequirements(PRODUCT_ID, "15m", 1)
+
+    def on_candle(
+        self,
+        candle: Candlestick,
+        context: StrategyContext | None = None,
+    ) -> Signal | None:
+        if context is not None:
+            self.contexts.append(context)
+        if self._sent:
+            return None
+        self._sent = True
+        return Signal(
+            strategy_id=self.strategy_id,
+            product_id=PRODUCT_ID,
+            timeframe="15m",
+            timestamp=candle.timestamp,
+            type=SignalType.LONG,
+            quantity=self.quantity,
+        )
+
+
+class MultiEntryStrategy(BaseStrategy):
+    def __init__(self, quantity: Decimal = Decimal("0.006")) -> None:
+        super().__init__("multi_entry", PRODUCT_ID)
+        self.quantity = quantity
+        self.contexts: list[StrategyContext] = []
+        self._sent = False
+
+    @property
+    def requirements(self) -> StrategyRequirements:
+        return StrategyRequirements(PRODUCT_ID, "15m", 1)
+
+    def on_candle(
+        self,
+        candle: Candlestick,
+        context: StrategyContext | None = None,
+    ) -> list[Signal] | None:
+        if context is not None:
+            self.contexts.append(context)
+        if self._sent:
+            return None
+        self._sent = True
+        return [
+            Signal(
+                strategy_id=self.strategy_id,
+                product_id=PRODUCT_ID,
+                timeframe="15m",
+                timestamp=candle.timestamp,
+                type=SignalType.LONG,
+                quantity=self.quantity,
+            ),
+            Signal(
+                strategy_id=self.strategy_id,
+                product_id=PRODUCT_ID,
+                timeframe="15m",
+                timestamp=candle.timestamp,
+                type=SignalType.LONG,
+                quantity=self.quantity,
+            ),
+        ]
+
+
+class PendingLimitThenEntryStrategy(BaseStrategy):
+    def __init__(self) -> None:
+        super().__init__("pending_limit_then_entry", PRODUCT_ID)
+        self.contexts: list[StrategyContext] = []
+        self._count = 0
+
+    @property
+    def requirements(self) -> StrategyRequirements:
+        return StrategyRequirements(PRODUCT_ID, "15m", 1)
+
+    def on_candle(
+        self,
+        candle: Candlestick,
+        context: StrategyContext | None = None,
+    ) -> Signal | None:
+        if context is not None:
+            self.contexts.append(context)
+        self._count += 1
+        if self._count == 1:
+            return Signal(
+                strategy_id=self.strategy_id,
+                product_id=PRODUCT_ID,
+                timeframe="15m",
+                timestamp=candle.timestamp,
+                type=SignalType.LONG,
+                quantity=Decimal("0.006"),
+                price=Decimal("49000"),
+            )
+        if self._count == 2:
+            return Signal(
+                strategy_id=self.strategy_id,
+                product_id=PRODUCT_ID,
+                timeframe="15m",
+                timestamp=candle.timestamp,
+                type=SignalType.LONG,
+                quantity=Decimal("0.006"),
             )
         return None
 
@@ -222,6 +418,7 @@ class ContextDrivenExitStrategy(BaseStrategy):
     def __init__(self) -> None:
         super().__init__("ctx_driven_exit", PRODUCT_ID)
         self.decisions: list[str] = []
+        self.contexts: list[StrategyContext] = []
         self._entered = False
         self._exited = False
 
@@ -236,6 +433,7 @@ class ContextDrivenExitStrategy(BaseStrategy):
     ) -> Signal | None:
         if context is None:
             raise AssertionError("context-aware strategy must receive context")
+        self.contexts.append(context)
         if (
             not self._entered
             and context.position is None
@@ -291,3 +489,204 @@ def test_research_runner_strategy_can_use_context_to_change_decisions():
     assert strategy.decisions == ["enter", "exit"]
     assert result["raw_trade_count"] == 2
     assert result["total_trades"] == 1
+
+
+@pytest.mark.rust
+@pytest.mark.skipif(not HAS_RUST, reason="fluxtrade_core.so not compiled")
+def test_research_runner_passes_capital_snapshot_to_context_strategy():
+    candles = make_candle_series(count=2)
+    strategy = ContextProbeStrategy()
+    allocator = CapitalAllocator(Decimal("100000"))
+    allocator.allocate(strategy.strategy_id, Decimal("5000"))
+    runner = ResearchBacktestRunner(
+        start_time=candles[0].timestamp,
+        end_time=candles[-1].timestamp,
+        product_id=PRODUCT_ID,
+        timeframe="15m",
+        initial_balance=10_000.0,
+        data_source=MemoryDataSource(candles),
+        capital_allocator=allocator,
+    )
+    runner.add_strategy(strategy)
+
+    runner.run()
+
+    assert strategy.contexts
+    assert strategy.contexts[0].available_cash == Decimal("10000")
+    assert strategy.contexts[0].capital is not None
+    assert strategy.contexts[0].capital.allocated == Decimal("5000")
+    assert strategy.contexts[0].capital.used == Decimal("0")
+    assert strategy.contexts[0].capital.available == Decimal("5000")
+
+
+@pytest.mark.rust
+@pytest.mark.skipif(not HAS_RUST, reason="fluxtrade_core.so not compiled")
+def test_research_runner_syncs_capital_usage_from_positions():
+    candles = make_candle_series(count=4)
+    strategy = ContextDrivenExitStrategy()
+    allocator = CapitalAllocator(Decimal("100000"))
+    allocator.allocate(strategy.strategy_id, Decimal("5000"))
+    runner = ResearchBacktestRunner(
+        start_time=candles[0].timestamp,
+        end_time=candles[-1].timestamp,
+        product_id=PRODUCT_ID,
+        timeframe="15m",
+        initial_balance=10_000.0,
+        data_source=MemoryDataSource(candles),
+        capital_allocator=allocator,
+    )
+    runner.add_strategy(strategy)
+
+    result = runner.run()
+
+    assert result["raw_trade_count"] == 2
+    assert strategy.decisions == ["enter", "exit"]
+    assert strategy.contexts[1].capital is not None
+    assert strategy.contexts[1].capital.used == Decimal("0.01") * candles[1].close
+    assert strategy.contexts[1].capital.available == (
+        Decimal("5000") - strategy.contexts[1].capital.used
+    )
+    assert strategy.contexts[2].capital is not None
+    assert strategy.contexts[2].capital.used == Decimal("0")
+    assert strategy.contexts[2].capital.available == Decimal("5000")
+    assert allocator.get_used(strategy.strategy_id) == Decimal("0")
+
+
+@pytest.mark.rust
+@pytest.mark.skipif(not HAS_RUST, reason="fluxtrade_core.so not compiled")
+def test_research_runner_rejects_entry_when_capital_is_insufficient():
+    candles = make_candle_series(count=3)
+    strategy = SingleEntryStrategy(quantity=Decimal("0.01"))
+    allocator = CapitalAllocator(Decimal("100000"))
+    allocator.allocate(strategy.strategy_id, Decimal("100"))
+    runner = ResearchBacktestRunner(
+        start_time=candles[0].timestamp,
+        end_time=candles[-1].timestamp,
+        product_id=PRODUCT_ID,
+        timeframe="15m",
+        initial_balance=10_000.0,
+        data_source=MemoryDataSource(candles),
+        capital_allocator=allocator,
+    )
+    runner.add_strategy(strategy)
+
+    result = runner.run()
+
+    assert result["raw_trade_count"] == 0
+    assert allocator.get_used(strategy.strategy_id) == Decimal("0")
+    assert strategy.contexts[0].capital is not None
+    assert strategy.contexts[0].capital.available == Decimal("100")
+    assert strategy.contexts[0].latest_rejections == ()
+    assert len(strategy.contexts[1].latest_rejections) == 1
+    assert "capital_allocation_rejected" in strategy.contexts[1].latest_rejections[0].reason
+    assert "required=" in strategy.contexts[1].latest_rejections[0].reason
+    assert "available=100" in strategy.contexts[1].latest_rejections[0].reason
+    assert strategy.contexts[2].latest_rejections == ()
+
+
+@pytest.mark.rust
+@pytest.mark.skipif(not HAS_RUST, reason="fluxtrade_core.so not compiled")
+def test_research_runner_allows_entry_when_capital_is_sufficient():
+    candles = make_candle_series(count=3)
+    strategy = SingleEntryStrategy(quantity=Decimal("0.01"))
+    allocator = CapitalAllocator(Decimal("100000"))
+    allocator.allocate(strategy.strategy_id, Decimal("1000"))
+    runner = ResearchBacktestRunner(
+        start_time=candles[0].timestamp,
+        end_time=candles[-1].timestamp,
+        product_id=PRODUCT_ID,
+        timeframe="15m",
+        initial_balance=10_000.0,
+        data_source=MemoryDataSource(candles),
+        capital_allocator=allocator,
+    )
+    runner.add_strategy(strategy)
+
+    result = runner.run()
+
+    assert result["raw_trade_count"] == 1
+    assert allocator.get_used(strategy.strategy_id) == Decimal("0.01") * candles[-1].close
+
+
+@pytest.mark.rust
+@pytest.mark.skipif(not HAS_RUST, reason="fluxtrade_core.so not compiled")
+def test_research_runner_reserves_capital_between_same_candle_entries():
+    candles = make_candle_series(count=3)
+    strategy = MultiEntryStrategy(quantity=Decimal("0.006"))
+    allocator = CapitalAllocator(Decimal("100000"))
+    allocator.allocate(strategy.strategy_id, Decimal("500"))
+    runner = ResearchBacktestRunner(
+        start_time=candles[0].timestamp,
+        end_time=candles[-1].timestamp,
+        product_id=PRODUCT_ID,
+        timeframe="15m",
+        initial_balance=10_000.0,
+        data_source=MemoryDataSource(candles),
+        capital_allocator=allocator,
+    )
+    runner.add_strategy(strategy)
+
+    result = runner.run()
+
+    assert result["raw_trade_count"] == 1
+    assert allocator.get_used(strategy.strategy_id) == Decimal("0.006") * candles[-1].close
+    assert len(strategy.contexts[1].latest_rejections) == 1
+    assert "capital_allocation_rejected" in strategy.contexts[1].latest_rejections[0].reason
+
+
+@pytest.mark.rust
+@pytest.mark.skipif(not HAS_RUST, reason="fluxtrade_core.so not compiled")
+def test_research_runner_reserves_capital_for_pending_entry_orders():
+    candles = make_candle_series(count=3)
+    strategy = PendingLimitThenEntryStrategy()
+    allocator = CapitalAllocator(Decimal("100000"))
+    allocator.allocate(strategy.strategy_id, Decimal("500"))
+    runner = ResearchBacktestRunner(
+        start_time=candles[0].timestamp,
+        end_time=candles[-1].timestamp,
+        product_id=PRODUCT_ID,
+        timeframe="15m",
+        initial_balance=10_000.0,
+        data_source=MemoryDataSource(candles),
+        capital_allocator=allocator,
+    )
+    runner.add_strategy(strategy)
+
+    result = runner.run()
+
+    assert result["raw_trade_count"] == 0
+    assert allocator.get_used(strategy.strategy_id) == Decimal("0.006") * Decimal("49000")
+    assert strategy.contexts[1].capital is not None
+    assert strategy.contexts[1].capital.available == (
+        Decimal("500") - Decimal("0.006") * Decimal("49000")
+    )
+    assert strategy.contexts[1].latest_rejections == ()
+    assert len(strategy.contexts[2].latest_rejections) == 1
+    assert "capital_allocation_rejected" in strategy.contexts[2].latest_rejections[0].reason
+
+
+@pytest.mark.rust
+@pytest.mark.skipif(not HAS_RUST, reason="fluxtrade_core.so not compiled")
+def test_research_runner_allows_exit_when_capital_is_exhausted():
+    candles = make_candle_series(count=4)
+    strategy = ContextDrivenExitStrategy()
+    allocator = CapitalAllocator(Decimal("100000"))
+    allocator.allocate(strategy.strategy_id, Decimal("501"))
+    runner = ResearchBacktestRunner(
+        start_time=candles[0].timestamp,
+        end_time=candles[-1].timestamp,
+        product_id=PRODUCT_ID,
+        timeframe="15m",
+        initial_balance=10_000.0,
+        data_source=MemoryDataSource(candles),
+        capital_allocator=allocator,
+    )
+    runner.add_strategy(strategy)
+
+    result = runner.run()
+
+    assert strategy.decisions == ["enter", "exit"]
+    assert result["raw_trade_count"] == 2
+    assert strategy.contexts[1].capital is not None
+    assert strategy.contexts[1].capital.available < Decimal("0")
+    assert allocator.get_used(strategy.strategy_id) == Decimal("0")

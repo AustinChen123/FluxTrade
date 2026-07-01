@@ -1,12 +1,13 @@
 import inspect
 import uuid
 from decimal import Decimal
-from typing import Optional, List, Dict
+from typing import TYPE_CHECKING, Optional, List, Dict
 from src.core.interfaces.exchange import ExchangeOrderSnapshot, IExchangeAdapter
 from src.core.orm_models import Order
 from src.core.models import OrderSide, Position, Candlestick, PositionSide
 from src.core.precision import PrecisionCodec
 from src.core.strategy_context import (
+    CapitalSnapshot,
     FillSnapshot,
     OrderSnapshot,
     PositionSnapshot,
@@ -26,6 +27,9 @@ try:
     from fluxtrade_core import ScaledCandlestick as RustScaledCandlestick
 except ImportError:  # pragma: no cover - depends on local extension build
     RustScaledCandlestick = None
+
+if TYPE_CHECKING:
+    from src.core.capital_allocator import CapitalAllocator
 
 # Detect if Rust engine supports strategy_id parameter
 _RUST_HAS_STRATEGY_ID = "strategy_id" in str(inspect.signature(RustOrder))
@@ -62,6 +66,11 @@ class SimulatedAdapter(IExchangeAdapter):
         # Map order ID → ORM Order so we can return it in fills
         self._order_map: Dict[str, Order] = {}
         self._rust_supports_strategy_id = _RUST_HAS_STRATEGY_ID
+
+    @property
+    def supports_strategy_positions(self) -> bool:
+        """Whether Rust positions are isolated by strategy_id."""
+        return self._rust_supports_strategy_id
 
     # ── IExchangeAdapter interface ───────────────────────────────
 
@@ -174,6 +183,7 @@ class SimulatedAdapter(IExchangeAdapter):
         latest_fills: Optional[List[Dict]] = None,
         latest_rejections: tuple[RejectionSnapshot, ...] = (),
         risk: RiskSnapshot = RiskSnapshot(),
+        capital_allocator: Optional["CapitalAllocator"] = None,
     ) -> StrategyContext:
         """Build a read-only decision context from matcher-backed state."""
         cash = self.get_balance()
@@ -205,6 +215,7 @@ class SimulatedAdapter(IExchangeAdapter):
             ),
             latest_rejections=latest_rejections,
             risk=risk,
+            capital=_capital_snapshot(capital_allocator, strategy_id),
         )
 
     # ── Backtest simulation hook ─────────────────────────────────
@@ -389,4 +400,18 @@ def _fill_snapshot(fill: Dict, timestamp: int) -> FillSnapshot:
         quantity=fill["quantity"],
         fee=fill.get("fee") or Decimal("0"),
         timestamp=timestamp,
+    )
+
+
+def _capital_snapshot(
+    capital_allocator: Optional["CapitalAllocator"],
+    strategy_id: str,
+) -> CapitalSnapshot | None:
+    if capital_allocator is None:
+        return None
+    return CapitalSnapshot(
+        allocated=capital_allocator.get_allocation(strategy_id),
+        used=capital_allocator.get_used(strategy_id),
+        available=capital_allocator.get_available(strategy_id),
+        unallocated=capital_allocator.get_unallocated(),
     )
