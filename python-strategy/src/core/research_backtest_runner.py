@@ -153,6 +153,8 @@ class ResearchBacktestRunner:
                     if self._capital_rejects_entry(signal, candle):
                         self._record_capital_rejection(signal, candle)
                         continue
+                    if self._exit_without_position(signal, adapter):
+                        continue
                     order = self._order_from_signal(signal, candle)
                     if order is not None:
                         adapter.place_order(order)
@@ -402,6 +404,21 @@ class ResearchBacktestRunner:
         )
         existing = self._latest_rejections.get(signal.strategy_id, ())
         self._latest_rejections[signal.strategy_id] = existing + (rejection,)
+
+    @staticmethod
+    def _exit_without_position(signal: Signal, adapter: SimulatedAdapter) -> bool:
+        if signal.type not in (SignalType.EXIT_LONG, SignalType.EXIT_SHORT):
+            return False
+        position = adapter.get_position(
+            signal.product_id,
+            strategy_id=signal.strategy_id,
+        )
+        if position is None:
+            return True
+        position_side = getattr(position.side, "value", position.side)
+        if signal.type == SignalType.EXIT_LONG:
+            return position_side != "LONG"
+        return position_side != "SHORT"
 
     def _pop_latest_rejections(self, strategy_id: str) -> tuple[RejectionSnapshot, ...]:
         return self._latest_rejections.pop(strategy_id, ())

@@ -17,6 +17,7 @@ from src.control_plane.models import (
     ParameterSearchJobRequest,
     ParameterSearchDimension,
     ParameterSearchSpace,
+    ResearchRunnerEvaluationConfig,
 )
 from src.control_plane.parameter_search import (
     CsvSignalBacktestParameterEvaluator,
@@ -55,6 +56,7 @@ __all__ = [
     "ParameterSearchJobExecutor",
     "ParameterSearchSpace",
     "ResearchBacktestParameterEvaluator",
+    "ResearchRunnerEvaluationConfig",
     "SqliteJobStore",
     "StrategyControlService",
     "StrategyStateQueryService",

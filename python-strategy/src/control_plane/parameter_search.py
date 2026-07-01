@@ -22,6 +22,7 @@ from src.control_plane.models import (
     ParameterSearchJobRequest,
 )
 from src.control_plane.search_space import resolve_parameter_candidates
+from src.core.capital_allocator import CapitalAllocator
 from src.core.data_sources.csv_source import CsvDataSource
 from src.core.data_sources.memory import MemoryDataSource
 from src.core.golden_cross_fast_fitness import GoldenCrossFastFitnessEvaluator
@@ -61,6 +62,7 @@ class CsvSignalBacktestParameterEvaluator:
         request: ParameterSearchJobRequest,
         candidate: ParameterCandidate,
     ) -> ParameterEvaluationResult:
+        _reject_research_runner_settings(request, "CSV-signal evaluation")
         if request.backtest is None:
             raise ValueError("backtest settings are required for CSV-signal evaluation")
 
@@ -120,6 +122,13 @@ class ResearchBacktestParameterEvaluator:
             raise ValueError("backtest settings are required for research evaluation")
 
         data_source, prepared_scaled_candles = self._replay_inputs_for(request)
+        strategy = self._strategy_factory(
+            f"{request.strategy_id}_{candidate.candidate_id}",
+            request.product_id,
+            request.timeframe,
+            candidate.param_pack,
+        )
+        capital_allocator = _capital_allocator_for(request, strategy.strategy_id)
         runner = ResearchBacktestRunner(
             start_time=request.start_time,
             end_time=request.end_time,
@@ -133,12 +142,7 @@ class ResearchBacktestParameterEvaluator:
             },
             precision_codec=self._precision_codec,
             prepared_scaled_candles=prepared_scaled_candles,
-        )
-        strategy = self._strategy_factory(
-            f"{request.strategy_id}_{candidate.candidate_id}",
-            request.product_id,
-            request.timeframe,
-            candidate.param_pack,
+            capital_allocator=capital_allocator,
         )
         runner.add_strategy(strategy)
 
@@ -213,6 +217,7 @@ class GoldenCrossFastFitnessParameterEvaluator:
         request: ParameterSearchJobRequest,
         candidate: ParameterCandidate,
     ) -> ParameterEvaluationResult:
+        _reject_research_runner_settings(request, "fast fitness evaluation")
         if request.backtest is None:
             raise ValueError("backtest settings are required for fast fitness evaluation")
 
@@ -302,6 +307,40 @@ def _candle_cache_key(request: ParameterSearchJobRequest) -> tuple:
         request.timeframe,
         request.start_time,
         request.end_time,
+    )
+
+
+def _capital_allocator_for(
+    request: ParameterSearchJobRequest,
+    strategy_id: str,
+) -> CapitalAllocator | None:
+    if request.research_runner is None:
+        return None
+    capital_allocation = request.research_runner.capital_allocation
+    if capital_allocation is None:
+        return None
+    if request.backtest is None:
+        raise ValueError("backtest settings are required for capital allocation")
+    initial_balance = request.backtest.initial_balance
+    if capital_allocation > initial_balance:
+        raise ValueError(
+            "research_runner.capital_allocation cannot exceed backtest.initial_balance"
+        )
+
+    allocator = CapitalAllocator(total_balance=initial_balance)
+    allocator.allocate(strategy_id, capital_allocation)
+    return allocator
+
+
+def _reject_research_runner_settings(
+    request: ParameterSearchJobRequest,
+    evaluator_name: str,
+) -> None:
+    if request.research_runner is None:
+        return
+    raise ValueError(
+        "research_runner settings require ResearchBacktestParameterEvaluator; "
+        f"{evaluator_name} does not support them"
     )
 
 
@@ -424,6 +463,7 @@ class ParameterSearchJobExecutor:
                 "objective": request.objective,
                 "seed": request.seed,
                 "epoch_id": epoch_id,
+                "research_runner": _research_runner_result_payload(request),
                 "evaluation_set": _evaluation_set_result_payload(request),
                 "resolved_candidates": candidates,
                 "evaluations": evaluations,
@@ -589,6 +629,14 @@ def _evaluation_set_result_payload(
     }
 
 
+def _research_runner_result_payload(
+    request: ParameterSearchJobRequest,
+) -> dict[str, Any] | None:
+    if request.research_runner is None:
+        return None
+    return _json_safe(request.research_runner.model_dump(mode="json", exclude_none=True))
+
+
 def _dataset_backtest_override_payload(
     dataset: EvaluationDatasetConfig,
 ) -> dict[str, Any] | None:
@@ -700,6 +748,7 @@ def _insert_evolution_epoch(
                 "candidate_ids": [
                     candidate.candidate_id for candidate in candidates
                 ],
+                "research_runner": _research_runner_result_payload(request),
                 "evaluation_set": _evaluation_set_result_payload(request),
             },
             status="completed",

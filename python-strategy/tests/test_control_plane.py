@@ -1112,6 +1112,64 @@ def test_control_plane_runs_parameter_search_with_research_backtests(tmp_path):
 
 @pytest.mark.rust
 @pytest.mark.skipif(not HAS_RUST, reason="fluxtrade_core.so not compiled")
+def test_control_plane_runs_research_parameter_search_with_capital_allocation(
+    tmp_path,
+):
+    candle_rows = _write_research_candles(tmp_path / "capital_research_candles.csv")
+    store = InMemoryJobStore()
+    evaluator = GoldenCrossResearchParameterEvaluator()
+    app = ControlPlaneApp(
+        BacktestJobExecutor(store=store, run_inline=True),
+        parameter_search_executor=ParameterSearchJobExecutor(
+            evaluator,
+            store=store,
+            run_inline=True,
+        ),
+    )
+
+    response = app.handle(
+        "POST",
+        "/jobs/parameter-searches",
+        json.dumps(
+            {
+                "strategy_id": "capital_golden_cross_search",
+                "product_id": PRODUCT_ID,
+                "timeframe": TIMEFRAME,
+                "start_time": candle_rows[0][0],
+                "end_time": candle_rows[-1][0],
+                "backtest": {
+                    "candles_csv_path": str(tmp_path / "capital_research_candles.csv"),
+                    "initial_balance": "10000",
+                    "maker_fee": "0",
+                    "taker_fee": "0",
+                },
+                "research_runner": {
+                    "capital_allocation": "0.5",
+                },
+                "candidates": [
+                    {
+                        "candidate_id": "active",
+                        "param_pack": {
+                            "short_window": 1,
+                            "long_window": 3,
+                            "quantity": "0.01",
+                        },
+                    },
+                ],
+            }
+        ),
+    )
+
+    assert response.status_code == 200
+    job = response.body["job"]
+    assert job["status"] == JobStatus.SUCCEEDED.value
+    assert job["result"]["research_runner"] == {"capital_allocation": "0.5"}
+    assert job["result"]["evaluations"][0]["metrics"]["raw_trade_count"] == 0
+    assert len(evaluator._candle_cache) == 1
+
+
+@pytest.mark.rust
+@pytest.mark.skipif(not HAS_RUST, reason="fluxtrade_core.so not compiled")
 def test_research_parameter_search_reuses_prepared_scaled_candles(tmp_path):
     candle_rows = _write_research_candles(tmp_path / "research_scaled_candles.csv")
     codec = PrecisionCodec(
