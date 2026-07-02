@@ -187,6 +187,7 @@ class OrderManager:
         fill_price: Decimal,
         fill_quantity: Decimal,
         cumulative_filled_quantity: Decimal,
+        cumulative_average_price: Decimal,
         fee: Optional[Decimal] = None,
     ) -> None:
         """Record a non-terminal exchange fill while keeping the order tracked."""
@@ -194,7 +195,7 @@ class OrderManager:
 
         order.status = OrderStatus.SUBMITTED.value
         order.filled_quantity = cumulative_filled_quantity
-        order.filled_price = fill_price
+        order.filled_price = cumulative_average_price
         self.repo.update_order(order)
 
         trade_id = str(uuid.uuid4())

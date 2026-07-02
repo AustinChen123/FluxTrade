@@ -686,7 +686,7 @@ class TestAuditedExecution:
         assert order.status == OrderStatus.SUBMITTED.value
         assert order.exchange_order_id == "EX-PARTIAL"
         assert order.filled_quantity == Decimal("0.25")
-        assert order.filled_price == Decimal("200")
+        assert order.filled_price == Decimal("160")
         assert len(mock_order_repo.trades) == 1
         assert mock_order_repo.trades[0].quantity == Decimal("0.15")
         assert mock_order_repo.trades[0].price == Decimal("200")
@@ -834,7 +834,7 @@ class TestAuditedExecution:
 
         assert order.status == "closed"
         assert order.filled_quantity == Decimal("0.25")
-        assert order.filled_price == Decimal("200")
+        assert order.filled_price == Decimal("160")
         assert len(mock_order_repo.trades) == 1
         assert mock_order_repo.trades[0].quantity == Decimal("0.15")
         assert mock_order_repo.trades[0].price == Decimal("200")

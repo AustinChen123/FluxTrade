@@ -215,6 +215,7 @@ class ExecutionEngine:
                         fee=terminal_fill["fee"],
                     )
                     order.filled_quantity = snapshot.filled_quantity
+                    order.filled_price = snapshot.average_price
                     self.order_manager.repo.update_order(order)
                     self._mark_reconciled(order)
                     return {"action": "filled_from_exchange_snapshot"}
@@ -289,6 +290,7 @@ class ExecutionEngine:
             fill_delta["price"],
             fill_delta["quantity"],
             snapshot.filled_quantity,
+            snapshot.average_price,
             fee=fill_delta["fee"],
         )
         return {"action": "recorded_partial_fill_and_restored_tracking"}
