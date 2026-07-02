@@ -16,6 +16,7 @@ import pytest
 from decimal import Decimal
 
 from src.core.execution import ExecutionEngine
+from src.core.interfaces.exchange import ExchangeOrderSnapshot
 from src.core.interfaces.exchange import ExchangeError
 from src.core.interfaces.exchange import ExchangeOrderLookupUnsupported
 from src.core.models import OrderStatus, Position, PositionSide, SignalType
@@ -573,38 +574,259 @@ class TestAuditedExecution:
             "exchange_open": 1,
             "exchange_unknown": 1,
         }
-        assert payload["results"] == [
-            {
-                "order_id": "found-local",
-                "client_order_id": "client-found",
-                "local_status": OrderStatus.SUBMITTED.value,
-                "product_id": found_order.product_id,
-                "strategy_id": found_order.strategy_id,
-                "local_exchange_order_id": "EX-LOCAL",
-                "result": "exchange_found",
-                "decision": "exchange_open",
-                "exchange_order_id": "EX-LOCAL",
-                "exchange_status": OrderStatus.SUBMITTED.value,
-            },
-            {
-                "order_id": "missing-local",
-                "client_order_id": "client-missing",
-                "local_status": OrderStatus.SUBMITTED_UNCONFIRMED.value,
-                "product_id": missing_order.product_id,
-                "strategy_id": missing_order.strategy_id,
-                "local_exchange_order_id": None,
-                "result": "exchange_not_found",
-                "decision": "exchange_unknown",
-                "exchange_order_id": None,
-                "exchange_status": None,
-            },
-        ]
+        assert payload["results"][0] == {
+            "order_id": "found-local",
+            "client_order_id": "client-found",
+            "local_status": OrderStatus.SUBMITTED.value,
+            "product_id": found_order.product_id,
+            "strategy_id": found_order.strategy_id,
+            "local_exchange_order_id": "EX-LOCAL",
+            "result": "exchange_found",
+            "decision": "exchange_open",
+            "exchange_order_id": "EX-LOCAL",
+            "exchange_status": OrderStatus.SUBMITTED.value,
+            "repair_action": "restored_tracking",
+            "repair_reason": None,
+        }
+        assert payload["results"][1] == {
+            "order_id": "missing-local",
+            "client_order_id": "client-missing",
+            "local_status": OrderStatus.SUBMITTED_UNCONFIRMED.value,
+            "product_id": missing_order.product_id,
+            "strategy_id": missing_order.strategy_id,
+            "local_exchange_order_id": None,
+            "result": "exchange_not_found",
+            "decision": "exchange_unknown",
+            "exchange_order_id": None,
+            "exchange_status": None,
+            "repair_action": "none",
+            "repair_reason": "exchange_snapshot_unavailable",
+        }
         event = mock_db_session.add.call_args.args[0]
         assert event.event_type == "reconcile"
         assert event.event_subtype == "startup_exchange_reconcile"
         assert event.payload == payload
         mock_db_session.commit.assert_called_once()
         mock_db_session.rollback.assert_not_called()
+
+    def test_reconcile_recoverable_client_orders_restores_exchange_open_order(
+        self, mock_db_session, mock_clock, mock_exchange_adapter, mock_order_repo, order_factory
+    ):
+        engine = ExecutionEngine(
+            db_session=mock_db_session,
+            clock=mock_clock,
+            adapter=mock_exchange_adapter,
+            order_repository=mock_order_repo,
+            db_session_factory=lambda: nullcontext(mock_db_session),
+            is_backtest=True,
+            audit_external_orders=True,
+        )
+        order = order_factory(
+            order_id="recoverable-open",
+            client_order_id="client-open",
+            status=OrderStatus.SUBMITTED_UNCONFIRMED.value,
+            exchange_order_id=None,
+        )
+        mock_order_repo.add_order(order)
+
+        mock_exchange_adapter.get_order_by_client_id = lambda client_order_id, product_id: (
+            ExchangeOrderSnapshot(
+                client_order_id=client_order_id,
+                exchange_order_id="EX-OPEN",
+                status="open",
+            )
+        )
+
+        payload = engine.reconcile_recoverable_client_orders()
+
+        assert order.status == OrderStatus.SUBMITTED.value
+        assert order.exchange_order_id == "EX-OPEN"
+        assert order.last_reconciled_at is not None
+        assert payload["decision_counts"] == {"exchange_open": 1}
+        assert payload["results"][0]["repair_action"] == "restored_tracking"
+
+    def test_startup_reconcile_after_restart_restores_tracking_without_resubmit(
+        self, mock_db_session, mock_clock, mock_exchange_adapter, mock_order_repo, signal_factory
+    ):
+        client_order_id = generate_client_order_id(
+            "test_strategy",
+            "execution",
+            "long",
+            clock_ns=lambda: 1704067200000000000,
+        )
+        signal = signal_factory(
+            signal_type=SignalType.LONG,
+            price=Decimal("42000"),
+            metadata={"client_order_id": client_order_id},
+        )
+        first_engine = ExecutionEngine(
+            db_session=mock_db_session,
+            clock=mock_clock,
+            adapter=mock_exchange_adapter,
+            order_repository=mock_order_repo,
+            db_session_factory=lambda: nullcontext(mock_db_session),
+            is_backtest=True,
+            audit_external_orders=True,
+        )
+        order_id = first_engine.execute_signal(signal)
+        persisted_order = mock_order_repo.get_order(order_id)
+        assert persisted_order is not None
+        assert len(mock_exchange_adapter.open_orders) == 1
+
+        restarted_adapter = type(mock_exchange_adapter)()
+        restarted_adapter.get_order_by_client_id = lambda client_order_id, product_id: (
+            ExchangeOrderSnapshot(
+                client_order_id=client_order_id,
+                exchange_order_id=persisted_order.exchange_order_id,
+                status="open",
+            )
+        )
+        restarted_engine = ExecutionEngine(
+            db_session=mock_db_session,
+            clock=mock_clock,
+            adapter=restarted_adapter,
+            order_repository=mock_order_repo,
+            db_session_factory=lambda: nullcontext(mock_db_session),
+            is_backtest=True,
+            audit_external_orders=True,
+        )
+
+        payload = restarted_engine.reconcile_recoverable_client_orders()
+        repeated_result = restarted_engine.execute_signal(signal)
+
+        assert payload["decision_counts"] == {"exchange_open": 1}
+        assert payload["results"][0]["repair_action"] == "restored_tracking"
+        assert persisted_order.status == OrderStatus.SUBMITTED.value
+        assert repeated_result == order_id
+        assert restarted_adapter.open_orders == []
+
+    def test_reconcile_recoverable_client_orders_fills_from_closed_exchange_snapshot(
+        self, mock_db_session, mock_clock, mock_exchange_adapter, mock_order_repo, order_factory
+    ):
+        engine = ExecutionEngine(
+            db_session=mock_db_session,
+            clock=mock_clock,
+            adapter=mock_exchange_adapter,
+            order_repository=mock_order_repo,
+            db_session_factory=lambda: nullcontext(mock_db_session),
+            is_backtest=True,
+            audit_external_orders=True,
+        )
+        order = order_factory(
+            order_id="recoverable-filled",
+            client_order_id="client-filled",
+            status=OrderStatus.SUBMITTED.value,
+            exchange_order_id="EX-LOCAL",
+            quantity=Decimal("0.25"),
+        )
+        mock_order_repo.add_order(order)
+
+        mock_exchange_adapter.get_order_by_client_id = lambda client_order_id, product_id: (
+            ExchangeOrderSnapshot(
+                client_order_id=client_order_id,
+                exchange_order_id="EX-FILLED",
+                status="closed",
+                filled_quantity=Decimal("0.25"),
+                average_price=Decimal("42010.5"),
+                fee=Decimal("0.11"),
+            )
+        )
+
+        payload = engine.reconcile_recoverable_client_orders()
+
+        assert order.status == "closed"
+        assert order.filled_quantity == Decimal("0.25")
+        assert order.filled_price == Decimal("42010.5")
+        assert len(mock_order_repo.trades) == 1
+        assert mock_order_repo.trades[0].fee == Decimal("0.11")
+        assert payload["decision_counts"] == {"exchange_closed": 1}
+        assert payload["results"][0]["repair_action"] == "filled_from_exchange_snapshot"
+
+    def test_reconcile_recoverable_client_orders_marks_closed_without_fake_fill(
+        self, mock_db_session, mock_clock, mock_exchange_adapter, mock_order_repo, order_factory
+    ):
+        engine = ExecutionEngine(
+            db_session=mock_db_session,
+            clock=mock_clock,
+            adapter=mock_exchange_adapter,
+            order_repository=mock_order_repo,
+            db_session_factory=lambda: nullcontext(mock_db_session),
+            is_backtest=True,
+        )
+        order = order_factory(
+            order_id="recoverable-no-fill",
+            client_order_id="client-no-fill",
+            status=OrderStatus.SUBMITTED.value,
+            exchange_order_id="EX-LOCAL",
+        )
+        mock_order_repo.add_order(order)
+
+        mock_exchange_adapter.get_order_by_client_id = lambda client_order_id, product_id: (
+            ExchangeOrderSnapshot(
+                client_order_id=client_order_id,
+                exchange_order_id="EX-CLOSED",
+                status="closed",
+            )
+        )
+
+        payload = engine.reconcile_recoverable_client_orders()
+
+        assert order.status == OrderStatus.FILLED.value
+        assert order.filled_quantity in (None, Decimal("0"))
+        assert mock_order_repo.trades == []
+        assert payload["results"][0]["repair_action"] == "marked_filled_without_fill"
+        assert (
+            payload["results"][0]["repair_reason"]
+            == "exchange_snapshot_missing_fill_details"
+        )
+
+    def test_reconcile_recoverable_client_orders_fails_local_only_order_and_prevents_resubmit(
+        self,
+        mock_db_session,
+        mock_clock,
+        mock_exchange_adapter,
+        mock_order_repo,
+        order_factory,
+        signal_factory,
+    ):
+        client_order_id = generate_client_order_id(
+            "test_strategy",
+            "execution",
+            "long",
+            clock_ns=lambda: 1704067200000000000,
+        )
+        order = order_factory(
+            order_id="recoverable-local-only",
+            client_order_id=client_order_id,
+            status=OrderStatus.NEW.value,
+            exchange_order_id=None,
+        )
+        mock_order_repo.add_order(order)
+        engine = ExecutionEngine(
+            db_session=mock_db_session,
+            clock=mock_clock,
+            adapter=mock_exchange_adapter,
+            order_repository=mock_order_repo,
+            db_session_factory=lambda: nullcontext(mock_db_session),
+            is_backtest=True,
+            audit_external_orders=True,
+        )
+
+        payload = engine.reconcile_recoverable_client_orders()
+        assert mock_order_repo.get_order_by_client_order_id(client_order_id) is order
+        signal = signal_factory(
+            signal_type=SignalType.LONG,
+            price=Decimal("42000"),
+            metadata={"client_order_id": client_order_id},
+        )
+        result = engine.execute_signal(signal)
+
+        assert order.status == "failed"
+        assert order.last_reconciled_at is not None
+        assert payload["decision_counts"] == {"local_only": 1}
+        assert payload["results"][0]["repair_action"] == "marked_failed"
+        assert result == "recoverable-local-only"
+        assert mock_exchange_adapter.open_orders == []
 
     def test_reconcile_recoverable_client_orders_requires_session_factory(
         self, mock_db_session, mock_clock, mock_exchange_adapter, mock_order_repo

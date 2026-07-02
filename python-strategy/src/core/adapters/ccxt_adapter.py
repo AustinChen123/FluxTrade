@@ -179,10 +179,19 @@ class CcxtExchangeAdapter(IExchangeAdapter):
 
         exchange_order_id = response.get("id")
         status = response.get("status") or "unknown"
+        fee = response.get("fee") or {}
+        fee_cost = fee.get("cost") if isinstance(fee, dict) else None
+        filled_quantity = response.get("filled")
+        average_price = response.get("average") or response.get("price")
         return ExchangeOrderSnapshot(
             client_order_id=client_order_id,
             exchange_order_id=str(exchange_order_id) if exchange_order_id is not None else None,
             status=str(status),
+            filled_quantity=(
+                Decimal(str(filled_quantity)) if filled_quantity is not None else None
+            ),
+            average_price=Decimal(str(average_price)) if average_price is not None else None,
+            fee=Decimal(str(fee_cost)) if fee_cost is not None else None,
             raw=response,
         )
 

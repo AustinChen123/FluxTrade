@@ -234,6 +234,9 @@ class TestGetOrderByClientId:
             "id": "EX-123",
             "status": "open",
             "clientOrderId": exchange_client_order_id,
+            "filled": "0.25",
+            "average": "42000.5",
+            "fee": {"cost": "0.12"},
         }
 
         snapshot = adapter.get_order_by_client_id(
@@ -245,6 +248,9 @@ class TestGetOrderByClientId:
         assert snapshot.client_order_id == CANONICAL_CLIENT_ORDER_ID
         assert snapshot.exchange_order_id == "EX-123"
         assert snapshot.status == "open"
+        assert snapshot.filled_quantity == Decimal("0.25")
+        assert snapshot.average_price == Decimal("42000.5")
+        assert snapshot.fee == Decimal("0.12")
         assert snapshot.raw["clientOrderId"] == exchange_client_order_id
         mock_ccxt_client.fetch_order.assert_called_once_with(
             exchange_client_order_id,

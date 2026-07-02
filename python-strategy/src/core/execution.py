@@ -1,5 +1,6 @@
 import logging
 import time as _time
+from datetime import datetime, timezone
 from decimal import Decimal
 from typing import Callable, ContextManager, Optional
 from sqlalchemy.orm import Session
@@ -103,8 +104,8 @@ class ExecutionEngine:
     def reconcile_recoverable_client_orders(self) -> dict:
         """Compare recoverable local client orders with exchange snapshots.
 
-        This records the reconciliation result only. It intentionally does not
-        mutate local order state or place replacement orders.
+        This repairs local order state when the exchange lookup gives enough
+        information. It never places replacement orders during startup.
         """
         if self._db_session_factory is None:
             raise RuntimeError("reconcile_recoverable_client_orders requires db_session_factory")
@@ -128,6 +129,7 @@ class ExecutionEngine:
             result_counts[result] = result_counts.get(result, 0) + 1
             decision = self._reconcile_decision(order.status, snapshot.status if snapshot else None)
             decision_counts[decision] = decision_counts.get(decision, 0) + 1
+            repair = self._repair_reconciled_order(order, decision, snapshot)
             results.append(
                 {
                     "order_id": order.id,
@@ -140,6 +142,8 @@ class ExecutionEngine:
                     "decision": decision,
                     "exchange_order_id": snapshot.exchange_order_id if snapshot else None,
                     "exchange_status": snapshot.status if snapshot else None,
+                    "repair_action": repair["action"],
+                    "repair_reason": repair.get("reason"),
                 }
             )
 
@@ -164,6 +168,64 @@ class ExecutionEngine:
                 raise
 
         return payload
+
+    def _repair_reconciled_order(self, order, decision: str, snapshot) -> dict[str, Optional[str]]:
+        if decision == "local_only":
+            self.order_manager.fail_order(order, "startup reconciliation: local order not found on exchange")
+            self._mark_reconciled(order)
+            return {"action": "marked_failed"}
+
+        if snapshot is None:
+            return {"action": "none", "reason": "exchange_snapshot_unavailable"}
+
+        if decision == "exchange_open":
+            self.order_manager.mark_submitted(order, snapshot.exchange_order_id)
+            self._mark_reconciled(order)
+            return {"action": "restored_tracking"}
+
+        if decision == "exchange_closed":
+            normalized_status = snapshot.status.lower()
+            if normalized_status in {"closed", "filled"}:
+                if (
+                    snapshot.filled_quantity is not None
+                    and snapshot.filled_quantity > 0
+                    and snapshot.average_price is not None
+                ):
+                    self.order_manager.fill_order(
+                        order,
+                        snapshot.average_price,
+                        snapshot.filled_quantity,
+                        fee=snapshot.fee,
+                    )
+                    self._mark_reconciled(order)
+                    return {"action": "filled_from_exchange_snapshot"}
+
+                order.status = OrderStatus.FILLED.value
+                self.order_manager.repo.update_order(order)
+                self._mark_reconciled(order)
+                return {
+                    "action": "marked_filled_without_fill",
+                    "reason": "exchange_snapshot_missing_fill_details",
+                }
+
+            if normalized_status in {"canceled", "cancelled"}:
+                self.order_manager.mark_cancelled(order)
+                self._mark_reconciled(order)
+                return {"action": "marked_cancelled"}
+
+            if normalized_status in {"rejected", "expired", "failed"}:
+                self.order_manager.fail_order(
+                    order,
+                    f"startup reconciliation: exchange status {snapshot.status}",
+                )
+                self._mark_reconciled(order)
+                return {"action": "marked_failed"}
+
+        return {"action": "none", "reason": "decision_not_repairable"}
+
+    def _mark_reconciled(self, order) -> None:
+        order.last_reconciled_at = datetime.fromtimestamp(self.clock.now(), timezone.utc)
+        self.order_manager.repo.update_order(order)
 
     @staticmethod
     def _reconcile_decision(local_status: str, exchange_status: Optional[str]) -> str:
