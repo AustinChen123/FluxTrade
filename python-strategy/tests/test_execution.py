@@ -666,6 +666,7 @@ class TestAuditedExecution:
             exchange_order_id=None,
             quantity=Decimal("0.50"),
             filled_quantity=Decimal("0.10"),
+            filled_price=Decimal("100"),
         )
         mock_order_repo.add_order(order)
 
@@ -675,7 +676,7 @@ class TestAuditedExecution:
                 exchange_order_id="EX-PARTIAL",
                 status="open",
                 filled_quantity=Decimal("0.25"),
-                average_price=Decimal("42005"),
+                average_price=Decimal("160"),
                 fee=Decimal("0.08"),
             )
         )
@@ -685,9 +686,10 @@ class TestAuditedExecution:
         assert order.status == OrderStatus.SUBMITTED.value
         assert order.exchange_order_id == "EX-PARTIAL"
         assert order.filled_quantity == Decimal("0.25")
-        assert order.filled_price == Decimal("42005")
+        assert order.filled_price == Decimal("200")
         assert len(mock_order_repo.trades) == 1
         assert mock_order_repo.trades[0].quantity == Decimal("0.15")
+        assert mock_order_repo.trades[0].price == Decimal("200")
         assert mock_order_repo.trades[0].fee == Decimal("0")
         assert payload["decision_counts"] == {"exchange_open": 1}
         assert payload["results"][0]["local_status"] == OrderStatus.SUBMITTED_UNCONFIRMED.value
@@ -813,6 +815,7 @@ class TestAuditedExecution:
             exchange_order_id="EX-LOCAL",
             quantity=Decimal("0.25"),
             filled_quantity=Decimal("0.10"),
+            filled_price=Decimal("100"),
         )
         mock_order_repo.add_order(order)
 
@@ -822,7 +825,7 @@ class TestAuditedExecution:
                 exchange_order_id="EX-FILLED",
                 status="closed",
                 filled_quantity=Decimal("0.25"),
-                average_price=Decimal("42010.5"),
+                average_price=Decimal("160"),
                 fee=Decimal("0.05"),
             )
         )
@@ -831,10 +834,11 @@ class TestAuditedExecution:
 
         assert order.status == "closed"
         assert order.filled_quantity == Decimal("0.25")
-        assert order.filled_price == Decimal("42010.5")
+        assert order.filled_price == Decimal("200")
         assert len(mock_order_repo.trades) == 1
         assert mock_order_repo.trades[0].quantity == Decimal("0.15")
-        assert mock_order_repo.trades[0].fee == Decimal("0.05")
+        assert mock_order_repo.trades[0].price == Decimal("200")
+        assert mock_order_repo.trades[0].fee == Decimal("0")
         assert payload["decision_counts"] == {"exchange_closed": 1}
         assert payload["results"][0]["repair_action"] == "filled_from_exchange_snapshot"
 
@@ -951,19 +955,22 @@ class TestAuditedExecution:
             order_repository=mock_order_repo,
             db_session_factory=lambda: nullcontext(mock_db_session),
         )
-        mock_order_repo.add_order(
-            order_factory(
-                order_id="recoverable",
-                client_order_id="client-1",
-                status=OrderStatus.SUBMITTED.value,
-            )
+        order = order_factory(
+            order_id="recoverable",
+            client_order_id="client-1",
+            status=OrderStatus.NEW.value,
         )
+        mock_order_repo.add_order(order)
 
         payload = engine.reconcile_recoverable_client_orders()
 
+        assert order.status == OrderStatus.NEW.value
+        assert order.last_reconciled_at is None
         assert payload["result_counts"] == {"exchange_lookup_unsupported": 1}
         assert payload["decision_counts"] == {"exchange_unknown": 1}
         assert payload["results"][0]["result"] == "exchange_lookup_unsupported"
+        assert payload["results"][0]["repair_action"] == "none"
+        assert payload["results"][0]["repair_reason"] == "exchange_lookup_unsupported"
 
     @pytest.mark.parametrize(
         ("local_status", "exchange_status", "expected"),

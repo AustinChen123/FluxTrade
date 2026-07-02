@@ -129,9 +129,16 @@ class ExecutionEngine:
             else:
                 result = "exchange_found" if snapshot is not None else "exchange_not_found"
             result_counts[result] = result_counts.get(result, 0) + 1
-            decision = self._reconcile_decision(order.status, snapshot.status if snapshot else None)
+            if result == "exchange_lookup_unsupported":
+                decision = "exchange_unknown"
+                repair = {
+                    "action": "none",
+                    "reason": "exchange_lookup_unsupported",
+                }
+            else:
+                decision = self._reconcile_decision(order.status, snapshot.status if snapshot else None)
+                repair = self._repair_reconciled_order(order, decision, snapshot)
             decision_counts[decision] = decision_counts.get(decision, 0) + 1
-            repair = self._repair_reconciled_order(order, decision, snapshot)
             results.append(
                 {
                     "order_id": order.id,
@@ -191,9 +198,9 @@ class ExecutionEngine:
         if decision == "exchange_closed":
             normalized_status = snapshot.status.lower()
             if normalized_status in {"closed", "filled"}:
-                terminal_fill_delta = self._terminal_snapshot_fill_delta(order, snapshot)
-                if terminal_fill_delta is not None and terminal_fill_delta > 0:
-                    if snapshot.average_price is None:
+                terminal_fill = self._snapshot_fill_delta(order, snapshot)
+                if terminal_fill is not None and terminal_fill["quantity"] > 0:
+                    if terminal_fill["price"] is None:
                         order.status = OrderStatus.FILLED.value
                         self.order_manager.repo.update_order(order)
                         self._mark_reconciled(order)
@@ -203,9 +210,9 @@ class ExecutionEngine:
                         }
                     self.order_manager.fill_order(
                         order,
-                        snapshot.average_price,
-                        terminal_fill_delta,
-                        fee=snapshot.fee,
+                        terminal_fill["price"],
+                        terminal_fill["quantity"],
+                        fee=terminal_fill["fee"],
                     )
                     order.filled_quantity = snapshot.filled_quantity
                     self.order_manager.repo.update_order(order)
@@ -235,22 +242,43 @@ class ExecutionEngine:
 
         return {"action": "none", "reason": "decision_not_repairable"}
 
-    def _terminal_snapshot_fill_delta(self, order, snapshot) -> Optional[Decimal]:
+    def _snapshot_fill_delta(self, order, snapshot) -> Optional[dict[str, Optional[Decimal]]]:
         if snapshot.filled_quantity is None or snapshot.filled_quantity <= 0:
             return None
         local_filled_quantity = order.filled_quantity or Decimal("0")
-        return snapshot.filled_quantity - local_filled_quantity
-
-    def _record_open_snapshot_fill_delta(self, order, snapshot) -> dict[str, Optional[str]]:
-        if snapshot.filled_quantity is None or snapshot.filled_quantity <= 0:
-            return {"action": "none"}
-
-        local_filled_quantity = order.filled_quantity or Decimal("0")
         fill_delta = snapshot.filled_quantity - local_filled_quantity
         if fill_delta <= 0:
+            return {
+                "quantity": fill_delta,
+                "price": snapshot.average_price,
+                "fee": None,
+            }
+        if snapshot.average_price is None:
+            return {"quantity": fill_delta, "price": None, "fee": None}
+        if local_filled_quantity <= 0:
+            return {
+                "quantity": fill_delta,
+                "price": snapshot.average_price,
+                "fee": snapshot.fee,
+            }
+
+        local_average_price = order.filled_price
+        if local_average_price is None or local_average_price <= 0:
+            return {"quantity": fill_delta, "price": None, "fee": None}
+
+        exchange_notional = snapshot.filled_quantity * snapshot.average_price
+        local_notional = local_filled_quantity * local_average_price
+        delta_price = (exchange_notional - local_notional) / fill_delta
+        return {"quantity": fill_delta, "price": delta_price, "fee": None}
+
+    def _record_open_snapshot_fill_delta(self, order, snapshot) -> dict[str, Optional[str]]:
+        fill_delta = self._snapshot_fill_delta(order, snapshot)
+        if fill_delta is None:
+            return {"action": "none"}
+        if fill_delta["quantity"] <= 0:
             return {"action": "none", "reason": "exchange_fill_already_recorded"}
 
-        if snapshot.average_price is None:
+        if fill_delta["price"] is None:
             return {
                 "action": "restored_tracking_without_partial_fill",
                 "reason": "exchange_snapshot_missing_fill_price",
@@ -258,10 +286,10 @@ class ExecutionEngine:
 
         self.order_manager.record_partial_fill(
             order,
-            snapshot.average_price,
-            fill_delta,
+            fill_delta["price"],
+            fill_delta["quantity"],
             snapshot.filled_quantity,
-            fee=snapshot.fee if local_filled_quantity == 0 else None,
+            fee=fill_delta["fee"],
         )
         return {"action": "recorded_partial_fill_and_restored_tracking"}
 
