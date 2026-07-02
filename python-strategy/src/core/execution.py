@@ -144,12 +144,14 @@ class ExecutionEngine:
                 repair = self._repair_result(
                     "none",
                     reason="exchange_lookup_unsupported",
+                    verification_blocked=True,
                 )
             else:
                 decision = self._reconcile_decision(order.status, snapshot.status if snapshot else None)
                 repair = self._repair_reconciled_order(order, decision, snapshot)
             decision_counts[decision] = decision_counts.get(decision, 0) + 1
             unresolved = bool(repair["unresolved"])
+            verification_blocked = bool(repair["verification_blocked"])
             results.append(
                 {
                     "order_id": order.id,
@@ -165,6 +167,7 @@ class ExecutionEngine:
                     "repair_action": repair["action"],
                     "repair_reason": repair.get("reason"),
                     "unresolved": unresolved,
+                    "verification_blocked": verification_blocked,
                 }
             )
 
@@ -173,12 +176,20 @@ class ExecutionEngine:
             "result_counts": result_counts,
             "decision_counts": decision_counts,
             "unresolved_count": sum(1 for result in results if result["unresolved"]),
+            "verification_blocked_count": sum(
+                1 for result in results if result["verification_blocked"]
+            ),
             "results": results,
         }
         if payload["unresolved_count"] > 0:
             self.logger.error(
                 "Startup reconciliation has %s unresolved repair(s)",
                 payload["unresolved_count"],
+            )
+        if payload["verification_blocked_count"] > 0:
+            self.logger.warning(
+                "Startup reconciliation has %s verification-blocked order(s)",
+                payload["verification_blocked_count"],
             )
 
         with self._db_session_factory() as db:
@@ -203,7 +214,11 @@ class ExecutionEngine:
             return self._repair_result("marked_failed")
 
         if snapshot is None:
-            return self._repair_result("none", reason="exchange_snapshot_unavailable")
+            return self._repair_result(
+                "none",
+                reason="exchange_snapshot_unavailable",
+                verification_blocked=True,
+            )
 
         if decision == "exchange_open":
             partial_repair = self._record_open_snapshot_fill_delta(order, snapshot)
@@ -271,11 +286,20 @@ class ExecutionEngine:
         *,
         reason: Optional[str] = None,
         unresolved: bool = False,
+        verification_blocked: bool = False,
     ) -> dict[str, object]:
+        """Build a reconciliation repair result.
+
+        unresolved means an exchange snapshot proved an order/fill accounting
+        mismatch that could not be repaired automatically. verification_blocked
+        means reconciliation could not verify exchange state, so operators must
+        resolve or explicitly waive the unknown state before production gates.
+        """
         return {
             "action": action,
             "reason": reason,
             "unresolved": unresolved,
+            "verification_blocked": verification_blocked,
         }
 
     @staticmethod

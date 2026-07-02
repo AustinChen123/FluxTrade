@@ -575,6 +575,7 @@ class TestAuditedExecution:
             "exchange_unknown": 1,
         }
         assert payload["unresolved_count"] == 0
+        assert payload["verification_blocked_count"] == 1
         assert payload["results"][0] == {
             "order_id": "found-local",
             "client_order_id": "client-found",
@@ -589,6 +590,7 @@ class TestAuditedExecution:
             "repair_action": "restored_tracking",
             "repair_reason": None,
             "unresolved": False,
+            "verification_blocked": False,
         }
         assert payload["results"][1] == {
             "order_id": "missing-local",
@@ -604,6 +606,7 @@ class TestAuditedExecution:
             "repair_action": "none",
             "repair_reason": "exchange_snapshot_unavailable",
             "unresolved": False,
+            "verification_blocked": True,
         }
         event = mock_db_session.add.call_args.args[0]
         assert event.event_type == "reconcile"
@@ -1312,9 +1315,11 @@ class TestAuditedExecution:
         assert order.last_reconciled_at is None
         assert payload["result_counts"] == {"exchange_lookup_unsupported": 1}
         assert payload["decision_counts"] == {"exchange_unknown": 1}
+        assert payload["verification_blocked_count"] == 1
         assert payload["results"][0]["result"] == "exchange_lookup_unsupported"
         assert payload["results"][0]["repair_action"] == "none"
         assert payload["results"][0]["repair_reason"] == "exchange_lookup_unsupported"
+        assert payload["results"][0]["verification_blocked"] is True
 
     @pytest.mark.parametrize(
         ("local_status", "exchange_status", "expected"),
