@@ -702,6 +702,106 @@ class TestAuditedExecution:
             == "recorded_partial_fill_and_restored_tracking"
         )
 
+    def test_reconcile_recoverable_client_orders_flags_open_missing_price_partial_unresolved(
+        self, mock_db_session, mock_clock, mock_exchange_adapter, mock_order_repo, order_factory
+    ):
+        engine = ExecutionEngine(
+            db_session=mock_db_session,
+            clock=mock_clock,
+            adapter=mock_exchange_adapter,
+            order_repository=mock_order_repo,
+            db_session_factory=lambda: nullcontext(mock_db_session),
+            is_backtest=True,
+            audit_external_orders=True,
+        )
+        order = order_factory(
+            order_id="recoverable-open-missing-price",
+            client_order_id="client-open-missing-price",
+            status=OrderStatus.SUBMITTED_UNCONFIRMED.value,
+            exchange_order_id=None,
+            quantity=Decimal("0.50"),
+            filled_quantity=Decimal("0.10"),
+            filled_price=Decimal("100"),
+        )
+        mock_order_repo.add_order(order)
+
+        mock_exchange_adapter.get_order_by_client_id = lambda client_order_id, product_id: (
+            ExchangeOrderSnapshot(
+                client_order_id=client_order_id,
+                exchange_order_id="EX-OPEN-MISSING-PRICE",
+                status="open",
+                filled_quantity=Decimal("0.25"),
+                average_price=None,
+            )
+        )
+
+        payload = engine.reconcile_recoverable_client_orders()
+
+        assert order.status == OrderStatus.SUBMITTED.value
+        assert order.exchange_order_id == "EX-OPEN-MISSING-PRICE"
+        assert order.last_reconciled_at is None
+        assert mock_order_repo.trades == []
+        assert payload["unresolved_count"] == 1
+        assert payload["results"][0]["unresolved"] is True
+        assert (
+            payload["results"][0]["repair_action"]
+            == "unresolved_open_missing_fill_price"
+        )
+        assert (
+            payload["results"][0]["repair_reason"]
+            == "exchange_snapshot_missing_fill_price"
+        )
+
+    def test_reconcile_recoverable_client_orders_flags_open_local_overfill_unresolved(
+        self, mock_db_session, mock_clock, mock_exchange_adapter, mock_order_repo, order_factory
+    ):
+        engine = ExecutionEngine(
+            db_session=mock_db_session,
+            clock=mock_clock,
+            adapter=mock_exchange_adapter,
+            order_repository=mock_order_repo,
+            db_session_factory=lambda: nullcontext(mock_db_session),
+            is_backtest=True,
+            audit_external_orders=True,
+        )
+        order = order_factory(
+            order_id="recoverable-open-local-overfill",
+            client_order_id="client-open-local-overfill",
+            status=OrderStatus.SUBMITTED.value,
+            exchange_order_id="EX-LOCAL",
+            quantity=Decimal("0.50"),
+            filled_quantity=Decimal("0.25"),
+            filled_price=Decimal("160"),
+        )
+        mock_order_repo.add_order(order)
+
+        mock_exchange_adapter.get_order_by_client_id = lambda client_order_id, product_id: (
+            ExchangeOrderSnapshot(
+                client_order_id=client_order_id,
+                exchange_order_id="EX-OPEN-LESS-FILLED",
+                status="open",
+                filled_quantity=Decimal("0.10"),
+                average_price=Decimal("100"),
+            )
+        )
+
+        payload = engine.reconcile_recoverable_client_orders()
+
+        assert order.status == OrderStatus.SUBMITTED.value
+        assert order.exchange_order_id == "EX-OPEN-LESS-FILLED"
+        assert order.last_reconciled_at is None
+        assert mock_order_repo.trades == []
+        assert payload["unresolved_count"] == 1
+        assert payload["results"][0]["unresolved"] is True
+        assert (
+            payload["results"][0]["repair_action"]
+            == "unresolved_open_local_fill_exceeds_exchange"
+        )
+        assert (
+            payload["results"][0]["repair_reason"]
+            == "exchange_filled_quantity_less_than_local"
+        )
+
     def test_startup_reconcile_after_restart_restores_tracking_without_resubmit(
         self, mock_db_session, mock_clock, mock_exchange_adapter, mock_order_repo, signal_factory
     ):

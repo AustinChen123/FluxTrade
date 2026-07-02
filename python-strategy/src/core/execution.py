@@ -131,15 +131,15 @@ class ExecutionEngine:
             result_counts[result] = result_counts.get(result, 0) + 1
             if result == "exchange_lookup_unsupported":
                 decision = "exchange_unknown"
-                repair = {
-                    "action": "none",
-                    "reason": "exchange_lookup_unsupported",
-                }
+                repair = self._repair_result(
+                    "none",
+                    reason="exchange_lookup_unsupported",
+                )
             else:
                 decision = self._reconcile_decision(order.status, snapshot.status if snapshot else None)
                 repair = self._repair_reconciled_order(order, decision, snapshot)
             decision_counts[decision] = decision_counts.get(decision, 0) + 1
-            unresolved = repair["action"].startswith("unresolved_")
+            unresolved = bool(repair["unresolved"])
             results.append(
                 {
                     "order_id": order.id,
@@ -165,6 +165,11 @@ class ExecutionEngine:
             "unresolved_count": sum(1 for result in results if result["unresolved"]),
             "results": results,
         }
+        if payload["unresolved_count"] > 0:
+            self.logger.error(
+                "Startup reconciliation has %s unresolved repair(s)",
+                payload["unresolved_count"],
+            )
 
         with self._db_session_factory() as db:
             try:
@@ -181,36 +186,40 @@ class ExecutionEngine:
 
         return payload
 
-    def _repair_reconciled_order(self, order, decision: str, snapshot) -> dict[str, Optional[str]]:
+    def _repair_reconciled_order(self, order, decision: str, snapshot) -> dict[str, object]:
         if decision == "local_only":
             self.order_manager.fail_order(order, "startup reconciliation: local order not found on exchange")
             self._mark_reconciled(order)
-            return {"action": "marked_failed"}
+            return self._repair_result("marked_failed")
 
         if snapshot is None:
-            return {"action": "none", "reason": "exchange_snapshot_unavailable"}
+            return self._repair_result("none", reason="exchange_snapshot_unavailable")
 
         if decision == "exchange_open":
             partial_repair = self._record_open_snapshot_fill_delta(order, snapshot)
             self.order_manager.mark_submitted(order, snapshot.exchange_order_id)
-            self._mark_reconciled(order)
-            if partial_repair["action"] != "none":
+            if partial_repair["unresolved"]:
                 return partial_repair
-            return {"action": "restored_tracking"}
+            if partial_repair["action"] != "none":
+                self._mark_reconciled(order)
+                return partial_repair
+            self._mark_reconciled(order)
+            return self._repair_result("restored_tracking")
 
         if decision == "exchange_closed":
             normalized_status = snapshot.status.lower()
             terminal_status = self._terminal_order_status(normalized_status)
             if terminal_status is None:
-                return {"action": "none", "reason": "decision_not_repairable"}
+                return self._repair_result("none", reason="decision_not_repairable")
 
             terminal_fill = self._snapshot_fill_delta(order, snapshot)
             if terminal_fill is not None and terminal_fill["quantity"] > 0:
                 if terminal_fill["price"] is None:
-                    return {
-                        "action": "unresolved_missing_fill_price",
-                        "reason": "exchange_snapshot_missing_fill_price",
-                    }
+                    return self._repair_result(
+                        "unresolved_missing_fill_price",
+                        reason="exchange_snapshot_missing_fill_price",
+                        unresolved=True,
+                    )
                 self.order_manager.record_fill_delta(
                     order,
                     terminal_fill["price"],
@@ -221,23 +230,36 @@ class ExecutionEngine:
                     fee=terminal_fill["fee"],
                 )
                 self._mark_reconciled(order)
-                return {
-                    "action": self._filled_terminal_repair_action(terminal_status),
-                }
+                return self._repair_result(
+                    self._filled_terminal_repair_action(terminal_status),
+                )
 
             order.status = terminal_status.value
             self.order_manager.repo.update_order(order)
             self._mark_reconciled(order)
-            return {
-                "action": self._terminal_repair_action(terminal_status),
-                "reason": (
+            return self._repair_result(
+                self._terminal_repair_action(terminal_status),
+                reason=(
                     "exchange_snapshot_missing_fill_details"
                     if normalized_status in {"closed", "filled"}
                     else None
                 ),
-            }
+            )
 
-        return {"action": "none", "reason": "decision_not_repairable"}
+        return self._repair_result("none", reason="decision_not_repairable")
+
+    @staticmethod
+    def _repair_result(
+        action: str,
+        *,
+        reason: Optional[str] = None,
+        unresolved: bool = False,
+    ) -> dict[str, object]:
+        return {
+            "action": action,
+            "reason": reason,
+            "unresolved": unresolved,
+        }
 
     @staticmethod
     def _terminal_order_status(normalized_exchange_status: str) -> Optional[OrderStatus]:
@@ -294,18 +316,28 @@ class ExecutionEngine:
         delta_price = (exchange_notional - local_notional) / fill_delta
         return {"quantity": fill_delta, "price": delta_price, "fee": None}
 
-    def _record_open_snapshot_fill_delta(self, order, snapshot) -> dict[str, Optional[str]]:
+    def _record_open_snapshot_fill_delta(self, order, snapshot) -> dict[str, object]:
         fill_delta = self._snapshot_fill_delta(order, snapshot)
         if fill_delta is None:
-            return {"action": "none"}
+            return self._repair_result("none")
         if fill_delta["quantity"] <= 0:
-            return {"action": "none", "reason": "exchange_fill_already_recorded"}
+            if fill_delta["quantity"] < 0:
+                return self._repair_result(
+                    "unresolved_open_local_fill_exceeds_exchange",
+                    reason="exchange_filled_quantity_less_than_local",
+                    unresolved=True,
+                )
+            return self._repair_result(
+                "none",
+                reason="exchange_fill_already_recorded",
+            )
 
         if fill_delta["price"] is None:
-            return {
-                "action": "restored_tracking_without_partial_fill",
-                "reason": "exchange_snapshot_missing_fill_price",
-            }
+            return self._repair_result(
+                "unresolved_open_missing_fill_price",
+                reason="exchange_snapshot_missing_fill_price",
+                unresolved=True,
+            )
 
         self.order_manager.record_partial_fill(
             order,
@@ -315,7 +347,7 @@ class ExecutionEngine:
             snapshot.average_price,
             fee=fill_delta["fee"],
         )
-        return {"action": "recorded_partial_fill_and_restored_tracking"}
+        return self._repair_result("recorded_partial_fill_and_restored_tracking")
 
     def _mark_reconciled(self, order) -> None:
         order.last_reconciled_at = datetime.fromtimestamp(self.clock.now(), timezone.utc)
