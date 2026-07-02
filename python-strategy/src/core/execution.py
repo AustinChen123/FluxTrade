@@ -191,17 +191,24 @@ class ExecutionEngine:
         if decision == "exchange_closed":
             normalized_status = snapshot.status.lower()
             if normalized_status in {"closed", "filled"}:
-                if (
-                    snapshot.filled_quantity is not None
-                    and snapshot.filled_quantity > 0
-                    and snapshot.average_price is not None
-                ):
+                terminal_fill_delta = self._terminal_snapshot_fill_delta(order, snapshot)
+                if terminal_fill_delta is not None and terminal_fill_delta > 0:
+                    if snapshot.average_price is None:
+                        order.status = OrderStatus.FILLED.value
+                        self.order_manager.repo.update_order(order)
+                        self._mark_reconciled(order)
+                        return {
+                            "action": "marked_filled_without_fill",
+                            "reason": "exchange_snapshot_missing_fill_price",
+                        }
                     self.order_manager.fill_order(
                         order,
                         snapshot.average_price,
-                        snapshot.filled_quantity,
+                        terminal_fill_delta,
                         fee=snapshot.fee,
                     )
+                    order.filled_quantity = snapshot.filled_quantity
+                    self.order_manager.repo.update_order(order)
                     self._mark_reconciled(order)
                     return {"action": "filled_from_exchange_snapshot"}
 
@@ -227,6 +234,12 @@ class ExecutionEngine:
                 return {"action": "marked_failed"}
 
         return {"action": "none", "reason": "decision_not_repairable"}
+
+    def _terminal_snapshot_fill_delta(self, order, snapshot) -> Optional[Decimal]:
+        if snapshot.filled_quantity is None or snapshot.filled_quantity <= 0:
+            return None
+        local_filled_quantity = order.filled_quantity or Decimal("0")
+        return snapshot.filled_quantity - local_filled_quantity
 
     def _record_open_snapshot_fill_delta(self, order, snapshot) -> dict[str, Optional[str]]:
         if snapshot.filled_quantity is None or snapshot.filled_quantity <= 0:

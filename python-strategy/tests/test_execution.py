@@ -794,6 +794,50 @@ class TestAuditedExecution:
         assert payload["decision_counts"] == {"exchange_closed": 1}
         assert payload["results"][0]["repair_action"] == "filled_from_exchange_snapshot"
 
+    def test_reconcile_recoverable_client_orders_fills_only_terminal_delta(
+        self, mock_db_session, mock_clock, mock_exchange_adapter, mock_order_repo, order_factory
+    ):
+        engine = ExecutionEngine(
+            db_session=mock_db_session,
+            clock=mock_clock,
+            adapter=mock_exchange_adapter,
+            order_repository=mock_order_repo,
+            db_session_factory=lambda: nullcontext(mock_db_session),
+            is_backtest=True,
+            audit_external_orders=True,
+        )
+        order = order_factory(
+            order_id="recoverable-terminal-delta",
+            client_order_id="client-terminal-delta",
+            status=OrderStatus.SUBMITTED.value,
+            exchange_order_id="EX-LOCAL",
+            quantity=Decimal("0.25"),
+            filled_quantity=Decimal("0.10"),
+        )
+        mock_order_repo.add_order(order)
+
+        mock_exchange_adapter.get_order_by_client_id = lambda client_order_id, product_id: (
+            ExchangeOrderSnapshot(
+                client_order_id=client_order_id,
+                exchange_order_id="EX-FILLED",
+                status="closed",
+                filled_quantity=Decimal("0.25"),
+                average_price=Decimal("42010.5"),
+                fee=Decimal("0.05"),
+            )
+        )
+
+        payload = engine.reconcile_recoverable_client_orders()
+
+        assert order.status == "closed"
+        assert order.filled_quantity == Decimal("0.25")
+        assert order.filled_price == Decimal("42010.5")
+        assert len(mock_order_repo.trades) == 1
+        assert mock_order_repo.trades[0].quantity == Decimal("0.15")
+        assert mock_order_repo.trades[0].fee == Decimal("0.05")
+        assert payload["decision_counts"] == {"exchange_closed": 1}
+        assert payload["results"][0]["repair_action"] == "filled_from_exchange_snapshot"
+
     def test_reconcile_recoverable_client_orders_marks_closed_without_fake_fill(
         self, mock_db_session, mock_clock, mock_exchange_adapter, mock_order_repo, order_factory
     ):
