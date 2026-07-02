@@ -574,6 +574,7 @@ class TestAuditedExecution:
             "exchange_open": 1,
             "exchange_unknown": 1,
         }
+        assert payload["unresolved_count"] == 0
         assert payload["results"][0] == {
             "order_id": "found-local",
             "client_order_id": "client-found",
@@ -587,6 +588,7 @@ class TestAuditedExecution:
             "exchange_status": OrderStatus.SUBMITTED.value,
             "repair_action": "restored_tracking",
             "repair_reason": None,
+            "unresolved": False,
         }
         assert payload["results"][1] == {
             "order_id": "missing-local",
@@ -601,6 +603,7 @@ class TestAuditedExecution:
             "exchange_status": None,
             "repair_action": "none",
             "repair_reason": "exchange_snapshot_unavailable",
+            "unresolved": False,
         }
         event = mock_db_session.add.call_args.args[0]
         assert event.event_type == "reconcile"
@@ -788,7 +791,7 @@ class TestAuditedExecution:
 
         payload = engine.reconcile_recoverable_client_orders()
 
-        assert order.status == "closed"
+        assert order.status == OrderStatus.FILLED.value
         assert order.filled_quantity == Decimal("0.25")
         assert order.filled_price == Decimal("42010.5")
         assert len(mock_order_repo.trades) == 1
@@ -832,7 +835,7 @@ class TestAuditedExecution:
 
         payload = engine.reconcile_recoverable_client_orders()
 
-        assert order.status == "closed"
+        assert order.status == OrderStatus.FILLED.value
         assert order.filled_quantity == Decimal("0.25")
         assert order.filled_price == Decimal("160")
         assert len(mock_order_repo.trades) == 1
@@ -879,6 +882,167 @@ class TestAuditedExecution:
             payload["results"][0]["repair_reason"]
             == "exchange_snapshot_missing_fill_details"
         )
+
+    @pytest.mark.parametrize(
+        ("exchange_status", "expected_status", "expected_action"),
+        [
+            ("filled", OrderStatus.FILLED.value, "filled_from_exchange_snapshot"),
+            ("closed", OrderStatus.FILLED.value, "filled_from_exchange_snapshot"),
+            ("canceled", OrderStatus.CANCELLED.value, "filled_delta_and_marked_cancelled"),
+            ("cancelled", OrderStatus.CANCELLED.value, "filled_delta_and_marked_cancelled"),
+            ("rejected", OrderStatus.FAILED.value, "filled_delta_and_marked_failed"),
+            ("expired", OrderStatus.FAILED.value, "filled_delta_and_marked_failed"),
+            ("failed", OrderStatus.FAILED.value, "filled_delta_and_marked_failed"),
+        ],
+    )
+    def test_reconcile_recoverable_client_orders_records_terminal_partial_fill(
+        self,
+        mock_db_session,
+        mock_clock,
+        mock_exchange_adapter,
+        mock_order_repo,
+        order_factory,
+        exchange_status,
+        expected_status,
+        expected_action,
+    ):
+        engine = ExecutionEngine(
+            db_session=mock_db_session,
+            clock=mock_clock,
+            adapter=mock_exchange_adapter,
+            order_repository=mock_order_repo,
+            db_session_factory=lambda: nullcontext(mock_db_session),
+            is_backtest=True,
+            audit_external_orders=True,
+        )
+        order = order_factory(
+            order_id=f"recoverable-{exchange_status}",
+            client_order_id=f"client-{exchange_status}",
+            status=OrderStatus.SUBMITTED.value,
+            exchange_order_id="EX-LOCAL",
+            quantity=Decimal("0.50"),
+            filled_quantity=Decimal("0.10"),
+            filled_price=Decimal("100"),
+        )
+        mock_order_repo.add_order(order)
+
+        mock_exchange_adapter.get_order_by_client_id = lambda client_order_id, product_id: (
+            ExchangeOrderSnapshot(
+                client_order_id=client_order_id,
+                exchange_order_id=f"EX-{exchange_status.upper()}",
+                status=exchange_status,
+                filled_quantity=Decimal("0.25"),
+                average_price=Decimal("160"),
+                fee=Decimal("0.08"),
+            )
+        )
+
+        payload = engine.reconcile_recoverable_client_orders()
+
+        assert order.status == expected_status
+        assert order.filled_quantity == Decimal("0.25")
+        assert order.filled_price == Decimal("160")
+        assert len(mock_order_repo.trades) == 1
+        assert mock_order_repo.trades[0].quantity == Decimal("0.15")
+        assert mock_order_repo.trades[0].price == Decimal("200")
+        assert mock_order_repo.trades[0].fee == Decimal("0")
+        assert payload["decision_counts"] == {"exchange_closed": 1}
+        assert payload["unresolved_count"] == 0
+        assert payload["results"][0]["repair_action"] == expected_action
+
+    @pytest.mark.parametrize("exchange_status", ["closed", "cancelled", "expired"])
+    def test_reconcile_recoverable_client_orders_leaves_missing_price_partial_unresolved(
+        self,
+        mock_db_session,
+        mock_clock,
+        mock_exchange_adapter,
+        mock_order_repo,
+        order_factory,
+        exchange_status,
+    ):
+        engine = ExecutionEngine(
+            db_session=mock_db_session,
+            clock=mock_clock,
+            adapter=mock_exchange_adapter,
+            order_repository=mock_order_repo,
+            db_session_factory=lambda: nullcontext(mock_db_session),
+            is_backtest=True,
+            audit_external_orders=True,
+        )
+        order = order_factory(
+            order_id="recoverable-cancelled-missing-price",
+            client_order_id="client-cancelled-missing-price",
+            status=OrderStatus.SUBMITTED.value,
+            exchange_order_id="EX-LOCAL",
+            quantity=Decimal("0.50"),
+            filled_quantity=Decimal("0.10"),
+            filled_price=Decimal("100"),
+        )
+        mock_order_repo.add_order(order)
+
+        mock_exchange_adapter.get_order_by_client_id = lambda client_order_id, product_id: (
+            ExchangeOrderSnapshot(
+                client_order_id=client_order_id,
+                exchange_order_id=f"EX-{exchange_status.upper()}",
+                status=exchange_status,
+                filled_quantity=Decimal("0.25"),
+                average_price=None,
+            )
+        )
+
+        payload = engine.reconcile_recoverable_client_orders()
+
+        assert order.status == OrderStatus.SUBMITTED.value
+        assert order.last_reconciled_at is None
+        assert mock_order_repo.trades == []
+        assert payload["unresolved_count"] == 1
+        assert payload["results"][0]["unresolved"] is True
+        assert payload["results"][0]["repair_action"] == "unresolved_missing_fill_price"
+        assert (
+            payload["results"][0]["repair_reason"]
+            == "exchange_snapshot_missing_fill_price"
+        )
+
+    def test_reconcile_recoverable_client_orders_is_idempotent_for_terminal_partial_fill(
+        self, mock_db_session, mock_clock, mock_exchange_adapter, mock_order_repo, order_factory
+    ):
+        engine = ExecutionEngine(
+            db_session=mock_db_session,
+            clock=mock_clock,
+            adapter=mock_exchange_adapter,
+            order_repository=mock_order_repo,
+            db_session_factory=lambda: nullcontext(mock_db_session),
+            is_backtest=True,
+            audit_external_orders=True,
+        )
+        order = order_factory(
+            order_id="recoverable-cancelled-idempotent",
+            client_order_id="client-cancelled-idempotent",
+            status=OrderStatus.SUBMITTED.value,
+            exchange_order_id="EX-LOCAL",
+            quantity=Decimal("0.50"),
+            filled_quantity=Decimal("0.10"),
+            filled_price=Decimal("100"),
+        )
+        mock_order_repo.add_order(order)
+
+        mock_exchange_adapter.get_order_by_client_id = lambda client_order_id, product_id: (
+            ExchangeOrderSnapshot(
+                client_order_id=client_order_id,
+                exchange_order_id="EX-CANCELLED",
+                status="cancelled",
+                filled_quantity=Decimal("0.25"),
+                average_price=Decimal("160"),
+            )
+        )
+
+        first_payload = engine.reconcile_recoverable_client_orders()
+        second_payload = engine.reconcile_recoverable_client_orders()
+
+        assert order.status == OrderStatus.CANCELLED.value
+        assert len(mock_order_repo.trades) == 1
+        assert first_payload["results"][0]["repair_action"] == "filled_delta_and_marked_cancelled"
+        assert second_payload["recoverable_count"] == 0
 
     def test_reconcile_recoverable_client_orders_fails_local_only_order_and_prevents_resubmit(
         self,

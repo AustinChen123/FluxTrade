@@ -139,6 +139,7 @@ class ExecutionEngine:
                 decision = self._reconcile_decision(order.status, snapshot.status if snapshot else None)
                 repair = self._repair_reconciled_order(order, decision, snapshot)
             decision_counts[decision] = decision_counts.get(decision, 0) + 1
+            unresolved = repair["action"].startswith("unresolved_")
             results.append(
                 {
                     "order_id": order.id,
@@ -153,6 +154,7 @@ class ExecutionEngine:
                     "exchange_status": snapshot.status if snapshot else None,
                     "repair_action": repair["action"],
                     "repair_reason": repair.get("reason"),
+                    "unresolved": unresolved,
                 }
             )
 
@@ -160,6 +162,7 @@ class ExecutionEngine:
             "recoverable_count": len(orders),
             "result_counts": result_counts,
             "decision_counts": decision_counts,
+            "unresolved_count": sum(1 for result in results if result["unresolved"]),
             "results": results,
         }
 
@@ -197,51 +200,70 @@ class ExecutionEngine:
 
         if decision == "exchange_closed":
             normalized_status = snapshot.status.lower()
-            if normalized_status in {"closed", "filled"}:
-                terminal_fill = self._snapshot_fill_delta(order, snapshot)
-                if terminal_fill is not None and terminal_fill["quantity"] > 0:
-                    if terminal_fill["price"] is None:
-                        order.status = OrderStatus.FILLED.value
-                        self.order_manager.repo.update_order(order)
-                        self._mark_reconciled(order)
-                        return {
-                            "action": "marked_filled_without_fill",
-                            "reason": "exchange_snapshot_missing_fill_price",
-                        }
-                    self.order_manager.fill_order(
-                        order,
-                        terminal_fill["price"],
-                        terminal_fill["quantity"],
-                        fee=terminal_fill["fee"],
-                    )
-                    order.filled_quantity = snapshot.filled_quantity
-                    order.filled_price = snapshot.average_price
-                    self.order_manager.repo.update_order(order)
-                    self._mark_reconciled(order)
-                    return {"action": "filled_from_exchange_snapshot"}
+            terminal_status = self._terminal_order_status(normalized_status)
+            if terminal_status is None:
+                return {"action": "none", "reason": "decision_not_repairable"}
 
-                order.status = OrderStatus.FILLED.value
-                self.order_manager.repo.update_order(order)
-                self._mark_reconciled(order)
-                return {
-                    "action": "marked_filled_without_fill",
-                    "reason": "exchange_snapshot_missing_fill_details",
-                }
-
-            if normalized_status in {"canceled", "cancelled"}:
-                self.order_manager.mark_cancelled(order)
-                self._mark_reconciled(order)
-                return {"action": "marked_cancelled"}
-
-            if normalized_status in {"rejected", "expired", "failed"}:
-                self.order_manager.fail_order(
+            terminal_fill = self._snapshot_fill_delta(order, snapshot)
+            if terminal_fill is not None and terminal_fill["quantity"] > 0:
+                if terminal_fill["price"] is None:
+                    return {
+                        "action": "unresolved_missing_fill_price",
+                        "reason": "exchange_snapshot_missing_fill_price",
+                    }
+                self.order_manager.record_fill_delta(
                     order,
-                    f"startup reconciliation: exchange status {snapshot.status}",
+                    terminal_fill["price"],
+                    terminal_fill["quantity"],
+                    snapshot.filled_quantity,
+                    snapshot.average_price,
+                    terminal_status=terminal_status,
+                    fee=terminal_fill["fee"],
                 )
                 self._mark_reconciled(order)
-                return {"action": "marked_failed"}
+                return {
+                    "action": self._filled_terminal_repair_action(terminal_status),
+                }
+
+            order.status = terminal_status.value
+            self.order_manager.repo.update_order(order)
+            self._mark_reconciled(order)
+            return {
+                "action": self._terminal_repair_action(terminal_status),
+                "reason": (
+                    "exchange_snapshot_missing_fill_details"
+                    if normalized_status in {"closed", "filled"}
+                    else None
+                ),
+            }
 
         return {"action": "none", "reason": "decision_not_repairable"}
+
+    @staticmethod
+    def _terminal_order_status(normalized_exchange_status: str) -> Optional[OrderStatus]:
+        if normalized_exchange_status in {"closed", "filled"}:
+            return OrderStatus.FILLED
+        if normalized_exchange_status in {"canceled", "cancelled"}:
+            return OrderStatus.CANCELLED
+        if normalized_exchange_status in {"rejected", "expired", "failed"}:
+            return OrderStatus.FAILED
+        return None
+
+    @staticmethod
+    def _terminal_repair_action(status: OrderStatus) -> str:
+        if status == OrderStatus.CANCELLED:
+            return "marked_cancelled"
+        if status == OrderStatus.FAILED:
+            return "marked_failed"
+        return "marked_filled_without_fill"
+
+    @staticmethod
+    def _filled_terminal_repair_action(status: OrderStatus) -> str:
+        if status == OrderStatus.CANCELLED:
+            return "filled_delta_and_marked_cancelled"
+        if status == OrderStatus.FAILED:
+            return "filled_delta_and_marked_failed"
+        return "filled_from_exchange_snapshot"
 
     def _snapshot_fill_delta(self, order, snapshot) -> Optional[dict[str, Optional[Decimal]]]:
         if snapshot.filled_quantity is None or snapshot.filled_quantity <= 0:

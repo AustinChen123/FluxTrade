@@ -118,68 +118,23 @@ class OrderManager:
         logger.error("ORDER_FAILED: Order %s marked as FAILED. Reason: %s", order.id, reason)
         self.repo.update_order(order)
 
-    def fill_order(self, order: Order, fill_price: Decimal, fill_quantity: Decimal, fee: Optional[Decimal] = None):
-        current_time = int(self.clock.now() * 1000)
-
-        # 1. Update Order in DB
+    def fill_order(
+        self,
+        order: Order,
+        fill_price: Decimal,
+        fill_quantity: Decimal,
+        fee: Optional[Decimal] = None,
+    ):
         order.status = "closed"
         order.filled_quantity = fill_quantity
         order.filled_price = fill_price
-        self.repo.update_order(order)
-
-        trade_id = str(uuid.uuid4())
-
-        # 2. Atomic Execution
-        if not self.is_backtest:
-            # Redis Lua (live mode)
-            try:
-                account_id = "main"
-                self.update_position_script(
-                    args=[
-                        account_id,
-                        order.strategy_id,
-                        order.product_id,
-                        order.side.upper(),
-                        str(fill_quantity),
-                        str(fill_price),
-                        str(current_time),
-                        trade_id,
-                        order.id
-                    ]
-                )
-                logger.info("Redis: Atomic Position Update Successful (Trade %s)", trade_id)
-
-            except redis.exceptions.ResponseError as e:
-                logger.error("FATAL: Redis Lua Script Error: %s", e)
-                raise RuntimeError(f"Critical State Corruption: {e}")
-            except Exception as e:
-                logger.error("FATAL: System Error during execution: %s", e)
-                raise e
-        else:
-            # Backtest Mode: position/balance managed by Rust matching engine
-            self.repo.update_position(
-                strategy_id=order.strategy_id,
-                product_id=order.product_id,
-                side=order.side,
-                fill_quantity=fill_quantity,
-                fill_price=fill_price,
-                position_side=order.side.upper(),
-            )
-
-        # 3. Create Trade record
-        new_trade = Trade(
-            id=trade_id,
-            order_id=order.id,
-            exchange_trade_id=f"trd_{trade_id[:8]}",
-            product_id=order.product_id,
-            side=order.side,
-            price=fill_price,
-            quantity=fill_quantity,
-            fee=fee if fee is not None else Decimal("0"),
-            fee_asset="USDT",
-            timestamp=current_time
+        self._record_fill_trade(
+            order,
+            fill_price,
+            fill_quantity,
+            fee=fee,
+            log_label="Position Update",
         )
-        self.repo.add_trade(new_trade)
 
     def record_partial_fill(
         self,
@@ -191,11 +146,53 @@ class OrderManager:
         fee: Optional[Decimal] = None,
     ) -> None:
         """Record a non-terminal exchange fill while keeping the order tracked."""
-        current_time = int(self.clock.now() * 1000)
-
         order.status = OrderStatus.SUBMITTED.value
         order.filled_quantity = cumulative_filled_quantity
         order.filled_price = cumulative_average_price
+        self._record_fill_trade(
+            order,
+            fill_price,
+            fill_quantity,
+            fee=fee,
+            log_label="Partial Position Update",
+        )
+
+    def record_fill_delta(
+        self,
+        order: Order,
+        fill_price: Decimal,
+        fill_quantity: Decimal,
+        cumulative_filled_quantity: Decimal,
+        cumulative_average_price: Decimal,
+        terminal_status: OrderStatus | None = None,
+        fee: Optional[Decimal] = None,
+    ) -> None:
+        """Record a recovered exchange fill delta and set the desired order status."""
+        order.status = (
+            terminal_status.value
+            if terminal_status is not None
+            else OrderStatus.SUBMITTED.value
+        )
+        order.filled_quantity = cumulative_filled_quantity
+        order.filled_price = cumulative_average_price
+        self._record_fill_trade(
+            order,
+            fill_price,
+            fill_quantity,
+            fee=fee,
+            log_label="Recovered Position Update",
+        )
+
+    def _record_fill_trade(
+        self,
+        order: Order,
+        fill_price: Decimal,
+        fill_quantity: Decimal,
+        *,
+        fee: Optional[Decimal] = None,
+        log_label: str,
+    ) -> None:
+        current_time = int(self.clock.now() * 1000)
         self.repo.update_order(order)
 
         trade_id = str(uuid.uuid4())
@@ -216,12 +213,12 @@ class OrderManager:
                         order.id
                     ]
                 )
-                logger.info("Redis: Atomic Partial Position Update Successful (Trade %s)", trade_id)
+                logger.info("Redis: Atomic %s Successful (Trade %s)", log_label, trade_id)
             except redis.exceptions.ResponseError as e:
                 logger.error("FATAL: Redis Lua Script Error: %s", e)
                 raise RuntimeError(f"Critical State Corruption: {e}")
             except Exception as e:
-                logger.error("FATAL: System Error during partial execution: %s", e)
+                logger.error("FATAL: System Error during fill recording: %s", e)
                 raise e
         else:
             self.repo.update_position(
