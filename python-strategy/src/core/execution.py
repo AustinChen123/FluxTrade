@@ -2,6 +2,7 @@ import logging
 import time as _time
 from datetime import datetime, timezone
 from decimal import Decimal
+from enum import Enum
 from typing import Callable, ContextManager, Optional
 from sqlalchemy.orm import Session
 from src.core.models import Signal, SignalType, Candlestick, OrderSide, OrderStatus, PositionSide
@@ -19,6 +20,15 @@ from src.core.audit_service import (
     write_system_event,
 )
 from src.core.client_order_id import generate_client_order_id, parse_client_order_id
+
+
+class FillDeltaState(str, Enum):
+    NO_FILL = "no_fill"
+    CONVERGED = "converged"
+    DELTA_PRICED = "delta_priced"
+    DELTA_UNPRICED = "delta_unpriced"
+    LOCAL_OVERSTATED = "local_overstated"
+
 
 class ExecutionEngine:
     def __init__(
@@ -212,14 +222,22 @@ class ExecutionEngine:
             if terminal_status is None:
                 return self._repair_result("none", reason="decision_not_repairable")
 
-            terminal_fill = self._snapshot_fill_delta(order, snapshot)
-            if terminal_fill is not None and terminal_fill["quantity"] > 0:
-                if terminal_fill["price"] is None:
-                    return self._repair_result(
-                        "unresolved_missing_fill_price",
-                        reason="exchange_snapshot_missing_fill_price",
-                        unresolved=True,
-                    )
+            fill_state, terminal_fill = self._classify_fill_delta(order, snapshot)
+            if fill_state == FillDeltaState.LOCAL_OVERSTATED:
+                return self._repair_result(
+                    "unresolved_terminal_local_fill_exceeds_exchange",
+                    reason="exchange_filled_quantity_less_than_local",
+                    unresolved=True,
+                )
+
+            if fill_state == FillDeltaState.DELTA_UNPRICED:
+                return self._repair_result(
+                    "unresolved_missing_fill_price",
+                    reason="exchange_snapshot_missing_fill_price",
+                    unresolved=True,
+                )
+
+            if fill_state == FillDeltaState.DELTA_PRICED:
                 self.order_manager.record_fill_delta(
                     order,
                     terminal_fill["price"],
@@ -239,10 +257,9 @@ class ExecutionEngine:
             self._mark_reconciled(order)
             return self._repair_result(
                 self._terminal_repair_action(terminal_status),
-                reason=(
-                    "exchange_snapshot_missing_fill_details"
-                    if normalized_status in {"closed", "filled"}
-                    else None
+                reason=self._terminal_no_delta_reason(
+                    normalized_status,
+                    fill_state,
                 ),
             )
 
@@ -287,6 +304,17 @@ class ExecutionEngine:
             return "filled_delta_and_marked_failed"
         return "filled_from_exchange_snapshot"
 
+    @staticmethod
+    def _terminal_no_delta_reason(
+        normalized_exchange_status: str,
+        fill_state: FillDeltaState,
+    ) -> Optional[str]:
+        if fill_state == FillDeltaState.CONVERGED:
+            return "exchange_fill_already_recorded"
+        if normalized_exchange_status in {"closed", "filled"}:
+            return "exchange_snapshot_missing_fill_details"
+        return None
+
     def _snapshot_fill_delta(self, order, snapshot) -> Optional[dict[str, Optional[Decimal]]]:
         if snapshot.filled_quantity is None or snapshot.filled_quantity <= 0:
             return None
@@ -316,23 +344,39 @@ class ExecutionEngine:
         delta_price = (exchange_notional - local_notional) / fill_delta
         return {"quantity": fill_delta, "price": delta_price, "fee": None}
 
-    def _record_open_snapshot_fill_delta(self, order, snapshot) -> dict[str, object]:
+    def _classify_fill_delta(
+        self,
+        order,
+        snapshot,
+    ) -> tuple[FillDeltaState, Optional[dict[str, Optional[Decimal]]]]:
         fill_delta = self._snapshot_fill_delta(order, snapshot)
         if fill_delta is None:
+            return FillDeltaState.NO_FILL, None
+        if fill_delta["quantity"] < 0:
+            return FillDeltaState.LOCAL_OVERSTATED, fill_delta
+        if fill_delta["quantity"] == 0:
+            return FillDeltaState.CONVERGED, fill_delta
+        if fill_delta["price"] is None:
+            return FillDeltaState.DELTA_UNPRICED, fill_delta
+        return FillDeltaState.DELTA_PRICED, fill_delta
+
+    def _record_open_snapshot_fill_delta(self, order, snapshot) -> dict[str, object]:
+        fill_state, fill_delta = self._classify_fill_delta(order, snapshot)
+        if fill_state == FillDeltaState.NO_FILL:
             return self._repair_result("none")
-        if fill_delta["quantity"] <= 0:
-            if fill_delta["quantity"] < 0:
-                return self._repair_result(
-                    "unresolved_open_local_fill_exceeds_exchange",
-                    reason="exchange_filled_quantity_less_than_local",
-                    unresolved=True,
-                )
+        if fill_state == FillDeltaState.LOCAL_OVERSTATED:
+            return self._repair_result(
+                "unresolved_open_local_fill_exceeds_exchange",
+                reason="exchange_filled_quantity_less_than_local",
+                unresolved=True,
+            )
+        if fill_state == FillDeltaState.CONVERGED:
             return self._repair_result(
                 "none",
                 reason="exchange_fill_already_recorded",
             )
 
-        if fill_delta["price"] is None:
+        if fill_state == FillDeltaState.DELTA_UNPRICED:
             return self._repair_result(
                 "unresolved_open_missing_fill_price",
                 reason="exchange_snapshot_missing_fill_price",
