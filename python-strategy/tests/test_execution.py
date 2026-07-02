@@ -643,7 +643,59 @@ class TestAuditedExecution:
         assert order.exchange_order_id == "EX-OPEN"
         assert order.last_reconciled_at is not None
         assert payload["decision_counts"] == {"exchange_open": 1}
+        assert payload["results"][0]["local_status"] == OrderStatus.SUBMITTED_UNCONFIRMED.value
+        assert payload["results"][0]["local_exchange_order_id"] is None
         assert payload["results"][0]["repair_action"] == "restored_tracking"
+
+    def test_reconcile_recoverable_client_orders_records_open_partial_fill_delta(
+        self, mock_db_session, mock_clock, mock_exchange_adapter, mock_order_repo, order_factory
+    ):
+        engine = ExecutionEngine(
+            db_session=mock_db_session,
+            clock=mock_clock,
+            adapter=mock_exchange_adapter,
+            order_repository=mock_order_repo,
+            db_session_factory=lambda: nullcontext(mock_db_session),
+            is_backtest=True,
+            audit_external_orders=True,
+        )
+        order = order_factory(
+            order_id="recoverable-partial",
+            client_order_id="client-partial",
+            status=OrderStatus.SUBMITTED_UNCONFIRMED.value,
+            exchange_order_id=None,
+            quantity=Decimal("0.50"),
+            filled_quantity=Decimal("0.10"),
+        )
+        mock_order_repo.add_order(order)
+
+        mock_exchange_adapter.get_order_by_client_id = lambda client_order_id, product_id: (
+            ExchangeOrderSnapshot(
+                client_order_id=client_order_id,
+                exchange_order_id="EX-PARTIAL",
+                status="open",
+                filled_quantity=Decimal("0.25"),
+                average_price=Decimal("42005"),
+                fee=Decimal("0.08"),
+            )
+        )
+
+        payload = engine.reconcile_recoverable_client_orders()
+
+        assert order.status == OrderStatus.SUBMITTED.value
+        assert order.exchange_order_id == "EX-PARTIAL"
+        assert order.filled_quantity == Decimal("0.25")
+        assert order.filled_price == Decimal("42005")
+        assert len(mock_order_repo.trades) == 1
+        assert mock_order_repo.trades[0].quantity == Decimal("0.15")
+        assert mock_order_repo.trades[0].fee == Decimal("0")
+        assert payload["decision_counts"] == {"exchange_open": 1}
+        assert payload["results"][0]["local_status"] == OrderStatus.SUBMITTED_UNCONFIRMED.value
+        assert payload["results"][0]["local_exchange_order_id"] is None
+        assert (
+            payload["results"][0]["repair_action"]
+            == "recorded_partial_fill_and_restored_tracking"
+        )
 
     def test_startup_reconcile_after_restart_restores_tracking_without_resubmit(
         self, mock_db_session, mock_clock, mock_exchange_adapter, mock_order_repo, signal_factory

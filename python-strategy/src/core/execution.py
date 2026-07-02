@@ -116,6 +116,8 @@ class ExecutionEngine:
         decision_counts: dict[str, int] = {}
 
         for order in orders:
+            local_status = order.status
+            local_exchange_order_id = order.exchange_order_id
             try:
                 snapshot = self.adapter.get_order_by_client_id(
                     order.client_order_id,
@@ -134,10 +136,10 @@ class ExecutionEngine:
                 {
                     "order_id": order.id,
                     "client_order_id": order.client_order_id,
-                    "local_status": order.status,
+                    "local_status": local_status,
                     "product_id": order.product_id,
                     "strategy_id": order.strategy_id,
-                    "local_exchange_order_id": order.exchange_order_id,
+                    "local_exchange_order_id": local_exchange_order_id,
                     "result": result,
                     "decision": decision,
                     "exchange_order_id": snapshot.exchange_order_id if snapshot else None,
@@ -179,8 +181,11 @@ class ExecutionEngine:
             return {"action": "none", "reason": "exchange_snapshot_unavailable"}
 
         if decision == "exchange_open":
+            partial_repair = self._record_open_snapshot_fill_delta(order, snapshot)
             self.order_manager.mark_submitted(order, snapshot.exchange_order_id)
             self._mark_reconciled(order)
+            if partial_repair["action"] != "none":
+                return partial_repair
             return {"action": "restored_tracking"}
 
         if decision == "exchange_closed":
@@ -222,6 +227,30 @@ class ExecutionEngine:
                 return {"action": "marked_failed"}
 
         return {"action": "none", "reason": "decision_not_repairable"}
+
+    def _record_open_snapshot_fill_delta(self, order, snapshot) -> dict[str, Optional[str]]:
+        if snapshot.filled_quantity is None or snapshot.filled_quantity <= 0:
+            return {"action": "none"}
+
+        local_filled_quantity = order.filled_quantity or Decimal("0")
+        fill_delta = snapshot.filled_quantity - local_filled_quantity
+        if fill_delta <= 0:
+            return {"action": "none", "reason": "exchange_fill_already_recorded"}
+
+        if snapshot.average_price is None:
+            return {
+                "action": "restored_tracking_without_partial_fill",
+                "reason": "exchange_snapshot_missing_fill_price",
+            }
+
+        self.order_manager.record_partial_fill(
+            order,
+            snapshot.average_price,
+            fill_delta,
+            snapshot.filled_quantity,
+            fee=snapshot.fee if local_filled_quantity == 0 else None,
+        )
+        return {"action": "recorded_partial_fill_and_restored_tracking"}
 
     def _mark_reconciled(self, order) -> None:
         order.last_reconciled_at = datetime.fromtimestamp(self.clock.now(), timezone.utc)

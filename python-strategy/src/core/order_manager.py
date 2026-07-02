@@ -180,3 +180,68 @@ class OrderManager:
             timestamp=current_time
         )
         self.repo.add_trade(new_trade)
+
+    def record_partial_fill(
+        self,
+        order: Order,
+        fill_price: Decimal,
+        fill_quantity: Decimal,
+        cumulative_filled_quantity: Decimal,
+        fee: Optional[Decimal] = None,
+    ) -> None:
+        """Record a non-terminal exchange fill while keeping the order tracked."""
+        current_time = int(self.clock.now() * 1000)
+
+        order.status = OrderStatus.SUBMITTED.value
+        order.filled_quantity = cumulative_filled_quantity
+        order.filled_price = fill_price
+        self.repo.update_order(order)
+
+        trade_id = str(uuid.uuid4())
+
+        if not self.is_backtest:
+            try:
+                account_id = "main"
+                self.update_position_script(
+                    args=[
+                        account_id,
+                        order.strategy_id,
+                        order.product_id,
+                        order.side.upper(),
+                        str(fill_quantity),
+                        str(fill_price),
+                        str(current_time),
+                        trade_id,
+                        order.id
+                    ]
+                )
+                logger.info("Redis: Atomic Partial Position Update Successful (Trade %s)", trade_id)
+            except redis.exceptions.ResponseError as e:
+                logger.error("FATAL: Redis Lua Script Error: %s", e)
+                raise RuntimeError(f"Critical State Corruption: {e}")
+            except Exception as e:
+                logger.error("FATAL: System Error during partial execution: %s", e)
+                raise e
+        else:
+            self.repo.update_position(
+                strategy_id=order.strategy_id,
+                product_id=order.product_id,
+                side=order.side,
+                fill_quantity=fill_quantity,
+                fill_price=fill_price,
+                position_side=order.side.upper(),
+            )
+
+        new_trade = Trade(
+            id=trade_id,
+            order_id=order.id,
+            exchange_trade_id=f"trd_{trade_id[:8]}",
+            product_id=order.product_id,
+            side=order.side,
+            price=fill_price,
+            quantity=fill_quantity,
+            fee=fee if fee is not None else Decimal("0"),
+            fee_asset="USDT",
+            timestamp=current_time
+        )
+        self.repo.add_trade(new_trade)
