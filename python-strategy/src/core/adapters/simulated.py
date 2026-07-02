@@ -365,15 +365,20 @@ def _position_snapshot(
     mark_price: Optional[Decimal],
 ) -> PositionSnapshot:
     notional = None
+    unrealized_pnl = position.unrealized_pnl
     if mark_price is not None:
         notional = position.quantity * mark_price
+        if position.side == PositionSide.LONG:
+            unrealized_pnl = (mark_price - position.entry_price) * position.quantity
+        elif position.side == PositionSide.SHORT:
+            unrealized_pnl = (position.entry_price - mark_price) * position.quantity
     return PositionSnapshot(
         side=position.side,
         quantity=position.quantity,
         average_entry_price=position.entry_price,
         mark_price=mark_price,
         notional=notional,
-        unrealized_pnl=position.unrealized_pnl,
+        unrealized_pnl=unrealized_pnl,
     )
 
 

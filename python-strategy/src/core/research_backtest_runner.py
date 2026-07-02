@@ -107,7 +107,7 @@ class ResearchBacktestRunner:
         )
         self._ensure_capital_allocator_supported(adapter)
         trades: list[ResearchTrade] = []
-        stop_threshold = self._stop_threshold()
+        stop_drawdown_amount = self._stop_drawdown_amount()
         context_support = {
             strategy.strategy_id: _strategy_accepts_context(strategy)
             for strategy in self._strategies
@@ -138,34 +138,36 @@ class ResearchBacktestRunner:
                     continue
                 if strategy.requirements.timeframe != candle.timeframe:
                     continue
-                context = None
+                context = self._strategy_context(
+                    adapter=adapter,
+                    strategy=strategy,
+                    candle=candle,
+                    latest_fills=fills,
+                    peak_equity_by_strategy=peak_equity_by_strategy,
+                    max_drawdown_by_strategy=max_drawdown_by_strategy,
+                )
+                decision_context = None
                 if context_support[strategy.strategy_id]:
-                    context = self._strategy_context(
-                        adapter=adapter,
-                        strategy=strategy,
-                        candle=candle,
-                        latest_fills=fills,
-                        peak_equity_by_strategy=peak_equity_by_strategy,
-                        max_drawdown_by_strategy=max_drawdown_by_strategy,
-                    )
-                signals = self._signals_from_strategy(strategy, candle, context)
+                    decision_context = context
+                signals = self._signals_from_strategy(strategy, candle, decision_context)
                 for signal in signals:
                     if self._capital_rejects_entry(signal, candle):
                         self._record_capital_rejection(signal, candle)
                         continue
                     if self._exit_without_position(signal, adapter):
                         continue
-                    order = self._order_from_signal(signal, candle)
+                    order = self._order_from_signal(signal, candle, adapter)
                     if order is not None:
                         adapter.place_order(order)
                         self._reserve_entry_capital(signal, order, candle)
 
             candle_count += 1
             if (
-                stop_threshold is not None
+                stop_drawdown_amount is not None
                 and self.balance_check_interval > 0
                 and candle_count % self.balance_check_interval == 0
-                and adapter.get_balance() < stop_threshold
+                and max(max_drawdown_by_strategy.values(), default=Decimal("0"))
+                >= stop_drawdown_amount
             ):
                 logger.warning("Stopping research backtest at drawdown threshold")
                 break
@@ -173,9 +175,13 @@ class ResearchBacktestRunner:
         final_balance = adapter.get_balance()
         total_pnl = final_balance - Decimal(str(self.initial_balance))
         metrics = calculate_metrics(trades, initial_balance=self.initial_balance)
+        bar_max_drawdown = max(
+            max_drawdown_by_strategy.values(),
+            default=Decimal("0"),
+        )
         return {
             "total_pnl": total_pnl,
-            "max_drawdown": metrics.get("max_drawdown", Decimal("0")),
+            "max_drawdown": bar_max_drawdown,
             "win_rate": metrics.get("win_rate", 0.0),
             "total_trades": int(metrics.get("total_trades", 0)),
             "trade_sharpe": metrics.get("trade_sharpe", Decimal("0")),
@@ -251,10 +257,10 @@ class ResearchBacktestRunner:
         if getattr(prepared_candle, "timestamp", None) != candle.timestamp:
             raise ValueError("prepared_scaled_candles timestamp must match replay candles")
 
-    def _stop_threshold(self) -> Optional[Decimal]:
+    def _stop_drawdown_amount(self) -> Optional[Decimal]:
         if self.max_drawdown_limit is None:
             return None
-        return Decimal(str(self.initial_balance)) * Decimal(str(1 - self.max_drawdown_limit))
+        return Decimal(str(self.initial_balance)) * Decimal(str(self.max_drawdown_limit))
 
     def _strategy_context(
         self,
@@ -443,12 +449,13 @@ class ResearchBacktestRunner:
         self,
         signal: Signal,
         candle: Candlestick,
+        adapter: SimulatedAdapter,
     ) -> Optional[Order]:
         side = self._determine_side(signal.type)
         if side is None:
             return None
 
-        quantity = signal.quantity if signal.quantity and signal.quantity > 0 else Decimal("0.01")
+        quantity = self._quantity_for_signal(signal, adapter)
         if signal.price and signal.price > 0:
             order_type = "limit"
             limit_price = signal.price
@@ -476,6 +483,29 @@ class ResearchBacktestRunner:
             filled_quantity=Decimal("0"),
             filled_price=Decimal("0"),
         )
+
+    def _quantity_for_signal(self, signal: Signal, adapter: SimulatedAdapter) -> Decimal:
+        if signal.quantity and signal.quantity > 0:
+            return signal.quantity
+        if signal.type in (SignalType.EXIT_LONG, SignalType.EXIT_SHORT):
+            position = self._position_for_exit_signal(signal, adapter)
+            if position is not None and position.quantity > 0:
+                return position.quantity
+        return Decimal("0.01")
+
+    def _position_for_exit_signal(self, signal: Signal, adapter: SimulatedAdapter):
+        position = adapter.get_position(
+            signal.product_id,
+            strategy_id=signal.strategy_id,
+        )
+        if position is None:
+            return None
+        position_side = getattr(position.side, "value", position.side)
+        if signal.type == SignalType.EXIT_LONG and position_side == "LONG":
+            return position
+        if signal.type == SignalType.EXIT_SHORT and position_side == "SHORT":
+            return position
+        return None
 
     def _entry_required_capital(self, signal: Signal, candle: Candlestick) -> Decimal:
         quantity = signal.quantity if signal.quantity and signal.quantity > 0 else Decimal("0.01")

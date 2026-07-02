@@ -12,7 +12,7 @@ from src.core.data_sources.memory import MemoryDataSource
 from src.core.backtest_runner import BacktestRunner
 from src.strategies.base import BaseStrategy, StrategyRequirements
 from src.core.models import Candlestick, Signal, SignalType
-from integration.conftest import PRODUCT_ID, TIMEFRAME, make_candle_series
+from integration.conftest import PRODUCT_ID, TIMEFRAME, make_candle, make_candle_series
 
 # Skip if Rust .so is not available
 try:
@@ -74,6 +74,43 @@ class AlwaysLongStrategy(BaseStrategy):
             timestamp=candle.timestamp,
             type=SignalType.NO_SIGNAL,
             value=candle.close,
+        )
+
+
+class OneShotLongStrategy(BaseStrategy):
+    """Opens one long position and leaves it open."""
+
+    def __init__(self, strategy_id: str = "one-shot-long", product_id: str = PRODUCT_ID):
+        super().__init__(strategy_id, product_id)
+        self._sent = False
+
+    @property
+    def requirements(self) -> StrategyRequirements:
+        return StrategyRequirements(
+            product_id=self.product_id,
+            timeframe=TIMEFRAME,
+            lookback_window=1,
+        )
+
+    def on_candle(self, candle: Candlestick) -> Signal:
+        if self._sent:
+            return Signal(
+                strategy_id=self.strategy_id,
+                product_id=self.product_id,
+                timeframe=TIMEFRAME,
+                timestamp=candle.timestamp,
+                type=SignalType.NO_SIGNAL,
+                value=candle.close,
+            )
+        self._sent = True
+        return Signal(
+            strategy_id=self.strategy_id,
+            product_id=self.product_id,
+            timeframe=TIMEFRAME,
+            timestamp=candle.timestamp,
+            type=SignalType.LONG,
+            value=candle.close,
+            quantity=Decimal("1"),
         )
 
 
@@ -236,3 +273,38 @@ class TestBacktestE2E:
 
         # Should have stopped early (not processed all 200 candles)
         assert result is not None
+
+    @patch("src.core.backtest_runner.SessionLocal")
+    def test_backtest_circuit_breaker_uses_open_position_drawdown(self, mock_session_local):
+        """Backtest should stop on unrealized drawdown before a trade closes."""
+        mock_session = MagicMock()
+        mock_session.query.return_value.filter_by.return_value.all.return_value = []
+        mock_session_local.return_value = mock_session
+
+        base_ts = 1_700_000_000_000
+        interval_ms = 15 * 60 * 1000
+        candles = [
+            make_candle(base_ts, Decimal("100"), Decimal("100"), Decimal("100"), Decimal("100")),
+            make_candle(base_ts + interval_ms, Decimal("100"), Decimal("100"), Decimal("100"), Decimal("100")),
+            make_candle(base_ts + 2 * interval_ms, Decimal("60"), Decimal("60"), Decimal("60"), Decimal("60")),
+            make_candle(base_ts + 3 * interval_ms, Decimal("105"), Decimal("105"), Decimal("105"), Decimal("105")),
+        ]
+        data_source = MemoryDataSource(candles)
+        runner = BacktestRunner(
+            start_time=candles[0].timestamp,
+            end_time=candles[-1].timestamp,
+            product_id=PRODUCT_ID,
+            timeframe=TIMEFRAME,
+            initial_balance=10000.0,
+            max_drawdown_limit=0.004,
+            data_source=data_source,
+            report_config={"csv_trades": False, "equity_curve": False,
+                           "markdown_report": False, "journal": False},
+        )
+
+        runner.add_strategy(OneShotLongStrategy())
+        result = runner.run()
+
+        assert result is not None
+        assert result["candle_count"] == 3
+        assert result["journal_count"] >= 1
