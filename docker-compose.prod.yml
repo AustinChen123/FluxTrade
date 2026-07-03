@@ -3,18 +3,12 @@ services:
     image: redis:alpine
     container_name: fluxtrade-redis
     restart: always
-    ports:
-      - "6379:6379"
     command: >
-      sh -c "if [ -n \"$$REDIS_PASSWORD\" ]; then
-        redis-server --save 60 1 --loglevel warning --requirepass $$REDIS_PASSWORD;
-      else
-        redis-server --save 60 1 --loglevel warning;
-      fi"
+      sh -c "redis-server --save 60 1 --loglevel warning --requirepass \"$$REDIS_PASSWORD\""
     environment:
-      REDIS_PASSWORD: ${REDIS_PASSWORD:-}
+      REDIS_PASSWORD: ${REDIS_PASSWORD:?REDIS_PASSWORD is required}
     healthcheck:
-      test: ["CMD", "redis-cli", "ping"]
+      test: ["CMD-SHELL", "redis-cli -a \"$$REDIS_PASSWORD\" ping"]
       interval: 10s
       timeout: 3s
       retries: 3
@@ -38,8 +32,6 @@ services:
       POSTGRES_USER: ${POSTGRES_USER:-fluxtrade}
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?POSTGRES_PASSWORD is required}
       POSTGRES_DB: ${POSTGRES_DB:-fluxtrade}
-    ports:
-      - "5432:5432"
     volumes:
       - postgres_data:/var/lib/postgresql/data
     healthcheck:
@@ -72,7 +64,7 @@ services:
         condition: service_healthy
     environment:
       REDIS_HOST: redis
-      REDIS_PASSWORD: ${REDIS_PASSWORD:-}
+      REDIS_PASSWORD: ${REDIS_PASSWORD:?REDIS_PASSWORD is required}
       POSTGRES_HOST: db
       POSTGRES_PORT: 5432
       POSTGRES_USER: ${POSTGRES_USER:-fluxtrade}
@@ -108,7 +100,8 @@ services:
         condition: service_started
     environment:
       REDIS_HOST: redis
-      REDIS_PASSWORD: ${REDIS_PASSWORD:-}
+      REDIS_PASSWORD: ${REDIS_PASSWORD:?REDIS_PASSWORD is required}
+      CONTROL_PLANE_API_KEY: ${CONTROL_PLANE_API_KEY:?CONTROL_PLANE_API_KEY is required}
       POSTGRES_HOST: db
       POSTGRES_PORT: 5432
       POSTGRES_USER: ${POSTGRES_USER:-fluxtrade}
@@ -149,8 +142,9 @@ services:
       - "8501:8501"
     environment:
       REDIS_HOST: redis
-      REDIS_PASSWORD: ${REDIS_PASSWORD:-}
-      DASHBOARD_PASSWORD: ${DASHBOARD_PASSWORD:-}
+      REDIS_PASSWORD: ${REDIS_PASSWORD:?REDIS_PASSWORD is required}
+      DASHBOARD_PASSWORD: ${DASHBOARD_PASSWORD:?DASHBOARD_PASSWORD is required}
+      DASHBOARD_AUTH_REQUIRED: "true"
       POSTGRES_HOST: db
       POSTGRES_PORT: 5432
       POSTGRES_USER: ${POSTGRES_USER:-fluxtrade}
