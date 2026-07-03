@@ -29,6 +29,7 @@ def _make_order(**overrides) -> Order:
         "type": "market",
         "quantity": Decimal("0.01"),
         "price": None,
+        "trigger_price": None,
         "status": "OPEN",
         "exchange_order_id": None,
         "client_order_id": None,
@@ -46,6 +47,7 @@ def mock_ccxt_client():
     client = MagicMock()
     client.apiKey = "test-key"
     client.secret = "test-secret"
+    client.load_markets.return_value = {}
     return client
 
 
@@ -104,6 +106,157 @@ class TestPlaceOrder:
         call_kwargs = mock_ccxt_client.create_order.call_args
         assert call_kwargs.kwargs["params"]["timeInForce"] == "GTC"
         assert call_kwargs.kwargs["price"] == "50000"
+
+    def test_fetches_instrument_spec_from_binance_filters(self, adapter, mock_ccxt_client):
+        mock_ccxt_client.load_markets.return_value = {
+            "BTC/USDT:USDT": {
+                "limits": {
+                    "amount": {"min": "0.001"},
+                    "cost": {"min": "5"},
+                },
+                "info": {
+                    "filters": [
+                        {
+                            "filterType": "PRICE_FILTER",
+                            "tickSize": "0.10",
+                        },
+                        {
+                            "filterType": "LOT_SIZE",
+                            "minQty": "0.001",
+                            "stepSize": "0.001",
+                        },
+                        {
+                            "filterType": "MIN_NOTIONAL",
+                            "minNotional": "10",
+                        },
+                    ],
+                },
+            },
+        }
+
+        spec = adapter.get_instrument_spec("BINANCE:BTCUSDT-PERP")
+
+        assert spec.quantity_step == Decimal("0.001")
+        assert spec.price_tick == Decimal("0.10")
+        assert spec.min_quantity == Decimal("0.001")
+        assert spec.min_notional == Decimal("10")
+        assert spec.multiplier is None
+        assert spec.tick_value is None
+        assert spec.fee_model is None
+        assert spec.session_calendar_id is None
+
+    def test_warms_instrument_specs_for_known_products(self, adapter, mock_ccxt_client):
+        mock_ccxt_client.load_markets.return_value = {
+            "BTC/USDT:USDT": {
+                "info": {
+                    "filters": [
+                        {"filterType": "PRICE_FILTER", "tickSize": "0.10"},
+                        {"filterType": "LOT_SIZE", "stepSize": "0.001"},
+                    ],
+                },
+            },
+        }
+        mock_ccxt_client.create_order.return_value = {"id": "EX-456"}
+
+        adapter.warm_instrument_specs(["BINANCE:BTCUSDT-PERP"])
+        adapter.place_order(
+            _make_order(
+                type="limit",
+                quantity=Decimal("0.0109"),
+                price=Decimal("50123.456"),
+            )
+        )
+
+        mock_ccxt_client.load_markets.assert_called_once()
+
+    def test_quantizes_order_before_placing(self, adapter, mock_ccxt_client):
+        mock_ccxt_client.load_markets.return_value = {
+            "BTC/USDT:USDT": {
+                "info": {
+                    "filters": [
+                        {"filterType": "PRICE_FILTER", "tickSize": "0.10"},
+                        {"filterType": "LOT_SIZE", "stepSize": "0.001"},
+                        {"filterType": "MIN_NOTIONAL", "minNotional": "10"},
+                    ],
+                },
+            },
+        }
+        mock_ccxt_client.create_order.return_value = {"id": "EX-456"}
+        order = _make_order(
+            type="limit",
+            quantity=Decimal("0.0109"),
+            price=Decimal("50123.456"),
+        )
+
+        adapter.place_order(order)
+
+        call_kwargs = mock_ccxt_client.create_order.call_args
+        assert order.quantity == Decimal("0.010")
+        assert order.price == Decimal("50123.40")
+        assert call_kwargs.kwargs["amount"] == "0.010"
+        assert call_kwargs.kwargs["price"] == "50123.40"
+
+    def test_quantizes_trigger_price_before_placing_conditional_order(
+        self, adapter, mock_ccxt_client
+    ):
+        mock_ccxt_client.load_markets.return_value = {
+            "BTC/USDT:USDT": {
+                "info": {
+                    "filters": [
+                        {"filterType": "PRICE_FILTER", "tickSize": "0.10"},
+                        {"filterType": "LOT_SIZE", "stepSize": "0.001"},
+                        {"filterType": "MIN_NOTIONAL", "minNotional": "10"},
+                    ],
+                },
+            },
+        }
+        mock_ccxt_client.create_order.return_value = {"id": "EX-SL"}
+        order = _make_order(
+            type="stop_loss",
+            quantity=Decimal("0.0109"),
+            price=None,
+            trigger_price=Decimal("49999.987"),
+        )
+
+        adapter.place_order(order)
+
+        assert order.quantity == Decimal("0.010")
+        assert order.trigger_price == Decimal("49999.90")
+        mock_ccxt_client.create_order.assert_called_once()
+
+    def test_rejects_order_below_min_notional(self, adapter, mock_ccxt_client):
+        mock_ccxt_client.load_markets.return_value = {
+            "BTC/USDT:USDT": {
+                "info": {
+                    "filters": [
+                        {"filterType": "PRICE_FILTER", "tickSize": "0.10"},
+                        {"filterType": "LOT_SIZE", "stepSize": "0.001"},
+                        {"filterType": "MIN_NOTIONAL", "minNotional": "10"},
+                    ],
+                },
+            },
+        }
+        order = _make_order(
+            type="limit",
+            quantity=Decimal("0.001"),
+            price=Decimal("5000"),
+        )
+
+        with pytest.raises(ExchangeError, match="min_notional_not_met"):
+            adapter.place_order(order)
+
+        mock_ccxt_client.create_order.assert_not_called()
+
+    def test_market_rule_load_error_raises_exchange_error(self, adapter, mock_ccxt_client):
+        import ccxt as ccxt_lib
+
+        mock_ccxt_client.load_markets.side_effect = ccxt_lib.ExchangeError("rules unavailable")
+        order = _make_order()
+
+        with pytest.raises(ExchangeError, match="Failed to load market rules"):
+            adapter.place_order(order)
+
+        mock_ccxt_client.create_order.assert_not_called()
 
     def test_binance_order_passes_client_order_id(self, adapter, mock_ccxt_client):
         mock_ccxt_client.create_order.return_value = {"id": "EX-789"}

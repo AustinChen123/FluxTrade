@@ -22,7 +22,13 @@ from src.core.interfaces.exchange import (
 from src.core.client_order_id import to_exchange_format
 from src.core.models import Position
 from src.core.orm_models import Order
-from src.core.product_registry import to_ccxt_symbol
+from src.core.product_registry import (
+    InstrumentSpec,
+    instrument_spec_from_ccxt_market,
+    quantize_order_values,
+    to_ccxt_symbol,
+    validate_min_notional,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -66,6 +72,8 @@ class CcxtExchangeAdapter(IExchangeAdapter):
         if testnet:
             self.client.set_sandbox_mode(True)
 
+        self._instrument_specs: dict[str, InstrumentSpec] = {}
+
         self.logger.info(
             "Connected to %s (%s)", self.exchange_id, "testnet" if testnet else "live"
         )
@@ -74,6 +82,7 @@ class CcxtExchangeAdapter(IExchangeAdapter):
 
     def place_order(self, order: Order) -> str:
         ccxt_symbol = to_ccxt_symbol(order.product_id)
+        self._quantize_order(order)
         params: dict = {}
         if order.type and order.type.lower() == "limit":
             params["timeInForce"] = "GTC"
@@ -110,6 +119,57 @@ class CcxtExchangeAdapter(IExchangeAdapter):
             raise NetworkError(f"Network error: {e}") from e
         except ccxt.BaseError as e:
             raise ExchangeError(f"Order placement failed: {e}") from e
+
+    def get_instrument_spec(self, product_id: str) -> InstrumentSpec:
+        spec = self._instrument_specs.get(product_id)
+        if spec is not None:
+            return spec
+
+        ccxt_symbol = to_ccxt_symbol(product_id)
+        try:
+            markets = self.client.load_markets()
+        except ccxt.BaseError as e:
+            raise ExchangeError(f"Failed to load market rules for {product_id}: {e}") from e
+        market = markets.get(ccxt_symbol) if isinstance(markets, dict) else None
+        spec = instrument_spec_from_ccxt_market(product_id, market)
+        self._instrument_specs[product_id] = spec
+        return spec
+
+    def warm_instrument_specs(self, product_ids: list[str]) -> None:
+        """Fetch and cache instrument specs for known live products."""
+        for product_id in product_ids:
+            self.get_instrument_spec(product_id)
+
+    def _quantize_order(self, order: Order) -> None:
+        spec = self.get_instrument_spec(order.product_id)
+        quantized = quantize_order_values(
+            quantity=order.quantity,
+            price=order.price,
+            trigger_price=order.trigger_price,
+            spec=spec,
+        )
+        notional_price = quantized.price or quantized.trigger_price
+        try:
+            validate_min_notional(
+                quantity=quantized.quantity,
+                price=notional_price,
+                spec=spec,
+            )
+        except ValueError as e:
+            raise ExchangeError(str(e)) from e
+        if quantized.changed:
+            self.logger.info(
+                "Quantized order %s for %s: quantity %s -> %s, price %s -> %s",
+                order.id,
+                order.product_id,
+                order.quantity,
+                quantized.quantity,
+                order.price,
+                quantized.price,
+            )
+            order.quantity = quantized.quantity
+            order.price = quantized.price
+            order.trigger_price = quantized.trigger_price
 
     def cancel_order(self, order_id: str, product_id: str) -> bool:
         ccxt_symbol = to_ccxt_symbol(product_id)
