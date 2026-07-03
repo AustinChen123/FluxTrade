@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
 import subprocess
 from pathlib import Path
 
@@ -28,21 +29,60 @@ def _required_env() -> dict[str, str]:
     }
 
 
-def _compose_config() -> dict:
-    env = os.environ.copy()
-    env.update(_required_env())
+def _compose_base_command() -> list[str]:
+    docker = shutil.which("docker")
+    if docker is None:
+        pytest.skip("Docker Compose CLI is required")
+
     result = subprocess.run(
-        ["docker", "compose", "-f", str(PROD_COMPOSE), "config", "--format", "json"],
+        [docker, "compose", "version"],
+        capture_output=True,
+        text=True,
+    )
+    if result.returncode != 0:
+        pytest.skip("Docker Compose CLI is required")
+    return [docker, "compose"]
+
+
+def _write_env_file(path: Path, values: dict[str, str]) -> None:
+    path.write_text(
+        "\n".join(f"{name}={value}" for name, value in sorted(values.items())) + "\n"
+    )
+
+
+def _compose_env() -> dict[str, str]:
+    env = os.environ.copy()
+    for name in _required_env():
+        env.pop(name, None)
+    return env
+
+
+def _compose_config(tmp_path: Path) -> dict:
+    env_file = tmp_path / "compose.env"
+    _write_env_file(env_file, _required_env())
+    result = subprocess.run(
+        [
+            *_compose_base_command(),
+            "--env-file",
+            str(env_file),
+            "-f",
+            str(PROD_COMPOSE),
+            "config",
+            "--format",
+            "json",
+        ],
         check=True,
         capture_output=True,
-        env=env,
+        cwd=tmp_path,
+        env=_compose_env(),
         text=True,
     )
     return json.loads(result.stdout)
 
 
-def test_production_compose_does_not_publish_datastores():
-    config = _compose_config()
+@pytest.mark.integration
+def test_production_compose_does_not_publish_datastores(tmp_path: Path):
+    config = _compose_config(tmp_path)
     services = config["services"]
 
     assert services["redis"].get("ports") in (None, [])
@@ -61,15 +101,28 @@ def test_production_compose_requires_sensitive_env_vars():
     "env_name",
     ["REDIS_PASSWORD", "DASHBOARD_PASSWORD", "CONTROL_PLANE_API_KEY"],
 )
-def test_production_compose_rejects_missing_sensitive_env_vars(env_name: str):
-    env = os.environ.copy()
-    env.update(_required_env())
-    env.pop(env_name)
+@pytest.mark.integration
+def test_production_compose_rejects_missing_sensitive_env_vars(
+    tmp_path: Path,
+    env_name: str,
+):
+    env_file = tmp_path / "compose.env"
+    compose_env = _required_env()
+    compose_env.pop(env_name)
+    _write_env_file(env_file, compose_env)
 
     result = subprocess.run(
-        ["docker", "compose", "-f", str(PROD_COMPOSE), "config"],
+        [
+            *_compose_base_command(),
+            "--env-file",
+            str(env_file),
+            "-f",
+            str(PROD_COMPOSE),
+            "config",
+        ],
         capture_output=True,
-        env=env,
+        cwd=tmp_path,
+        env=_compose_env(),
         text=True,
     )
 
@@ -77,8 +130,9 @@ def test_production_compose_rejects_missing_sensitive_env_vars(env_name: str):
     assert f"{env_name} is required" in result.stderr
 
 
-def test_production_compose_passes_required_auth_to_services():
-    config = _compose_config()
+@pytest.mark.integration
+def test_production_compose_passes_required_auth_to_services(tmp_path: Path):
+    config = _compose_config(tmp_path)
     services = config["services"]
     redis_command = " ".join(services["redis"]["command"])
     redis_healthcheck = " ".join(services["redis"]["healthcheck"]["test"])
