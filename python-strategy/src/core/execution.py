@@ -220,6 +220,13 @@ class ExecutionEngine:
                 verification_blocked=True,
             )
 
+        if decision == "exchange_unknown":
+            return self._repair_result(
+                "none",
+                reason="exchange_status_unrecognized",
+                verification_blocked=True,
+            )
+
         if decision == "exchange_open":
             partial_repair = self._record_open_snapshot_fill_delta(order, snapshot)
             self.order_manager.mark_submitted(order, snapshot.exchange_order_id)

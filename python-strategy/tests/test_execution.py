@@ -828,6 +828,8 @@ class TestAuditedExecution:
         snapshot_average,
         expected_unresolved,
     ):
+        local_filled = Decimal("0.10")
+        local_average = Decimal("100")
         engine = ExecutionEngine(
             db_session=mock_db_session,
             clock=mock_clock,
@@ -843,8 +845,8 @@ class TestAuditedExecution:
             status=OrderStatus.SUBMITTED.value,
             exchange_order_id="EX-LOCAL",
             quantity=Decimal("0.50"),
-            filled_quantity=Decimal("0.10"),
-            filled_price=Decimal("100"),
+            filled_quantity=local_filled,
+            filled_price=local_average,
         )
         mock_order_repo.add_order(order)
 
@@ -867,7 +869,7 @@ class TestAuditedExecution:
         assert (first_payload["unresolved_count"] == 1) is expected_unresolved
         assert first_payload["unresolved_count"] in {0, 1}
 
-        unrecorded_exchange_fill = snapshot_filled > Decimal("0.10") and trade_count_after_first == 0
+        unrecorded_exchange_fill = snapshot_filled > local_filled and trade_count_after_first == 0
         if unrecorded_exchange_fill:
             assert first_result["unresolved"] is True
 
@@ -1319,6 +1321,43 @@ class TestAuditedExecution:
         assert payload["results"][0]["result"] == "exchange_lookup_unsupported"
         assert payload["results"][0]["repair_action"] == "none"
         assert payload["results"][0]["repair_reason"] == "exchange_lookup_unsupported"
+        assert payload["results"][0]["verification_blocked"] is True
+
+    def test_reconcile_recoverable_client_orders_flags_unknown_exchange_status_blocked(
+        self, mock_db_session, mock_clock, mock_exchange_adapter, mock_order_repo, order_factory
+    ):
+        engine = ExecutionEngine(
+            db_session=mock_db_session,
+            clock=mock_clock,
+            adapter=mock_exchange_adapter,
+            order_repository=mock_order_repo,
+            db_session_factory=lambda: nullcontext(mock_db_session),
+        )
+        order = order_factory(
+            order_id="recoverable-weird-status",
+            client_order_id="client-weird-status",
+            status=OrderStatus.SUBMITTED.value,
+            exchange_order_id="EX-LOCAL",
+        )
+        mock_order_repo.add_order(order)
+
+        mock_exchange_adapter.get_order_by_client_id = lambda client_order_id, product_id: (
+            ExchangeOrderSnapshot(
+                client_order_id=client_order_id,
+                exchange_order_id="EX-WEIRD",
+                status="weird_status",
+            )
+        )
+
+        payload = engine.reconcile_recoverable_client_orders()
+
+        assert order.status == OrderStatus.SUBMITTED.value
+        assert order.last_reconciled_at is None
+        assert payload["unresolved_count"] == 0
+        assert payload["verification_blocked_count"] == 1
+        assert payload["results"][0]["decision"] == "exchange_unknown"
+        assert payload["results"][0]["repair_action"] == "none"
+        assert payload["results"][0]["repair_reason"] == "exchange_status_unrecognized"
         assert payload["results"][0]["verification_blocked"] is True
 
     @pytest.mark.parametrize(
