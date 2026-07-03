@@ -14,7 +14,9 @@ from contextlib import nullcontext
 
 import pytest
 from decimal import Decimal
+from unittest.mock import MagicMock, patch
 
+from src.core.adapters.ccxt_adapter import CcxtExchangeAdapter
 from src.core.execution import ExecutionEngine
 from src.core.interfaces.exchange import ExchangeOrderSnapshot
 from src.core.interfaces.exchange import ExchangeError
@@ -32,6 +34,45 @@ def execution_engine(mock_db_session, mock_clock, mock_exchange_adapter, mock_or
         adapter=mock_exchange_adapter,
         order_repository=mock_order_repo
     )
+
+
+def _binance_btcusdt_market_rules(min_notional: str = "10") -> dict:
+    return {
+        "BTC/USDT:USDT": {
+            "info": {
+                "filters": [
+                    {"filterType": "PRICE_FILTER", "tickSize": "0.10"},
+                    {
+                        "filterType": "LOT_SIZE",
+                        "minQty": "0.001",
+                        "stepSize": "0.001",
+                    },
+                    {
+                        "filterType": "MIN_NOTIONAL",
+                        "minNotional": min_notional,
+                    },
+                ],
+            },
+        },
+    }
+
+
+def _ccxt_adapter_with_market_rules(markets: dict) -> tuple[CcxtExchangeAdapter, MagicMock]:
+    client = MagicMock()
+    client.load_markets.return_value = markets
+    client.create_order.return_value = {"id": "EX-quantized"}
+    with patch("src.core.adapters.ccxt_adapter.ccxt") as mock_ccxt:
+        exchange_cls = MagicMock(return_value=client)
+        mock_ccxt.binance = exchange_cls
+        setattr(mock_ccxt, "binance", exchange_cls)
+        adapter = CcxtExchangeAdapter(
+            exchange_id="binance",
+            api_key="test-key",
+            secret="test-secret",
+            testnet=False,
+        )
+    adapter.client = client
+    return adapter, client
 
 
 class TestSideDetermination:
@@ -180,6 +221,69 @@ class TestAdapterDelegation:
             execution_engine.execute_signal(signal)
 
         assert len(mock_exchange_adapter.open_orders) == 3
+
+
+class TestExecutionTradingRules:
+    """Regression coverage for exchange trading rules at execution entrypoints."""
+
+    def test_quantizes_order_before_external_placement(
+        self, mock_db_session, mock_clock, mock_order_repo, signal_factory
+    ):
+        adapter, client = _ccxt_adapter_with_market_rules(_binance_btcusdt_market_rules())
+        engine = ExecutionEngine(
+            db_session=mock_db_session,
+            clock=mock_clock,
+            adapter=adapter,
+            order_repository=mock_order_repo,
+        )
+        signal = signal_factory(
+            product_id="BINANCE:BTCUSDT-PERP",
+            price=Decimal("50123.456"),
+            quantity=Decimal("0.0109"),
+        )
+
+        order_id = engine.execute_signal(signal)
+
+        assert order_id is not None
+        order = mock_order_repo.orders[order_id]
+        assert order.exchange_order_id == "EX-quantized"
+        assert order.quantity == Decimal("0.010")
+        assert order.price == Decimal("50123.40")
+        client.create_order.assert_called_once()
+        call = client.create_order.call_args
+        assert call.kwargs["amount"] == "0.010"
+        assert call.kwargs["price"] == "50123.40"
+
+    def test_min_notional_rejection_fails_local_order_and_audit(
+        self, mock_db_session, mock_clock, mock_order_repo, signal_factory
+    ):
+        adapter, client = _ccxt_adapter_with_market_rules(_binance_btcusdt_market_rules())
+        engine = ExecutionEngine(
+            db_session=mock_db_session,
+            clock=mock_clock,
+            adapter=adapter,
+            order_repository=mock_order_repo,
+            db_session_factory=lambda: nullcontext(mock_db_session),
+            audit_external_orders=True,
+        )
+        signal = signal_factory(
+            product_id="BINANCE:BTCUSDT-PERP",
+            price=Decimal("5000.00"),
+            quantity=Decimal("0.001"),
+        )
+
+        with pytest.raises(ExchangeError, match="min_notional_not_met"):
+            engine.execute_signal(signal)
+
+        client.create_order.assert_not_called()
+        failed_orders = [o for o in mock_order_repo.orders.values() if o.status == "failed"]
+        assert len(failed_orders) == 1
+        audit = mock_db_session.add.call_args_list[0].args[0]
+        assert audit.order_id == failed_orders[0].id
+        assert audit.risk_message is not None
+        assert "min_notional_not_met" in audit.risk_message
+        assert audit.outcome_payload["status"] == "failed"
+        assert "min_notional_not_met" in audit.outcome_payload["error"]
 
 
 class TestExecutionErrorHandling:
