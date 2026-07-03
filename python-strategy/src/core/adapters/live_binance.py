@@ -55,6 +55,7 @@ class LiveBinanceAdapter(CcxtExchangeAdapter):
             and order.type.lower() == "market"
         ):
             try:
+                self._quantize_order(order)
                 client_order_id = getattr(order, "client_order_id", None)
                 exchange_client_order_id = (
                     to_exchange_format(client_order_id, "binance")

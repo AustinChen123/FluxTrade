@@ -49,20 +49,25 @@ def create_adapter(config: dict) -> IExchangeAdapter:
     testnet = config.get("testnet", True)
     enable_ws = config.get("enable_ws", False)
     extra_config = config.get("extra_config")
+    instrument_product_ids = config.get("instrument_product_ids") or []
 
     # Use Binance-specific adapter if WS requested and exchange is binance
     if exchange_id == "binance" and enable_ws:
-        return LiveBinanceAdapter(
+        adapter = LiveBinanceAdapter(
             api_key=api_key,
             secret=secret,
             testnet=testnet,
             enable_ws=True,
         )
+        adapter.warm_instrument_specs(instrument_product_ids)
+        return adapter
 
-    return CcxtExchangeAdapter(
+    adapter = CcxtExchangeAdapter(
         exchange_id=exchange_id,
         api_key=api_key,
         secret=secret,
         testnet=testnet,
         extra_config=extra_config,
     )
+    adapter.warm_instrument_specs(instrument_product_ids)
+    return adapter

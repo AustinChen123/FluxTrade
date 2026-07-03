@@ -612,6 +612,35 @@ class TestCreateAdapter:
             })
             assert isinstance(a, CcxtExchangeAdapter)
 
+    def test_live_adapter_warms_configured_instrument_specs(self):
+        with patch("src.core.adapters.ccxt_adapter.ccxt") as mock_ccxt:
+            mock_cls = MagicMock()
+            client = MagicMock()
+            client.load_markets.return_value = {
+                "BTC/USDT:USDT": {
+                    "info": {
+                        "filters": [
+                            {"filterType": "LOT_SIZE", "stepSize": "0.001"},
+                        ],
+                    },
+                },
+            }
+            mock_cls.return_value = client
+            mock_ccxt.bybit = mock_cls
+            setattr(mock_ccxt, "bybit", mock_cls)
+
+            adapter = create_adapter({
+                "mode": "live",
+                "exchange": "bybit",
+                "api_key": "k",
+                "secret": "s",
+                "instrument_product_ids": ["BYBIT:BTCUSDT-PERP"],
+            })
+
+        assert isinstance(adapter, CcxtExchangeAdapter)
+        assert adapter.get_instrument_spec("BYBIT:BTCUSDT-PERP").quantity_step == Decimal("0.001")
+        client.load_markets.assert_called_once()
+
     def test_live_binance_with_ws(self):
         with patch("src.core.adapters.ccxt_adapter.ccxt") as mock_ccxt, \
              patch("src.core.adapters.live_binance.WebSocketOrderConnector"):
@@ -619,6 +648,15 @@ class TestCreateAdapter:
             client = MagicMock()
             client.apiKey = "k"
             client.secret = "s"
+            client.load_markets.return_value = {
+                "BTC/USDT:USDT": {
+                    "info": {
+                        "filters": [
+                            {"filterType": "LOT_SIZE", "stepSize": "0.001"},
+                        ],
+                    },
+                },
+            }
             mock_cls.return_value = client
             mock_ccxt.binance = mock_cls
             setattr(mock_ccxt, "binance", mock_cls)
@@ -648,6 +686,15 @@ class TestLiveBinanceWsInit:
             client = MagicMock()
             client.apiKey = "k"
             client.secret = "s"
+            client.load_markets.return_value = {
+                "BTC/USDT:USDT": {
+                    "info": {
+                        "filters": [
+                            {"filterType": "LOT_SIZE", "stepSize": "0.001"},
+                        ],
+                    },
+                },
+            }
             mock_cls.return_value = client
             mock_ccxt.binance = mock_cls
             setattr(mock_ccxt, "binance", mock_cls)
@@ -680,6 +727,15 @@ class TestLiveBinanceWsOrderPath:
             client = MagicMock()
             client.apiKey = "k"
             client.secret = "s"
+            client.load_markets.return_value = {
+                "BTC/USDT:USDT": {
+                    "info": {
+                        "filters": [
+                            {"filterType": "LOT_SIZE", "stepSize": "0.001"},
+                        ],
+                    },
+                },
+            }
             mock_cls.return_value = client
             mock_ccxt.binance = mock_cls
             setattr(mock_ccxt, "binance", mock_cls)
@@ -695,7 +751,11 @@ class TestLiveBinanceWsOrderPath:
             MockWS.return_value = mock_ws_inst
 
             adapter = LiveBinanceAdapter(api_key="k", secret="s", enable_ws=True)
-            order = _make_order(type="market", client_order_id=CANONICAL_CLIENT_ORDER_ID)
+            order = _make_order(
+                type="market",
+                quantity=Decimal("0.0109"),
+                client_order_id=CANONICAL_CLIENT_ORDER_ID,
+            )
             result = adapter.place_order(order)
 
             exchange_client_order_id = to_exchange_format(
@@ -708,6 +768,7 @@ class TestLiveBinanceWsOrderPath:
                 mock_ws_inst.place_order.call_args.kwargs["client_order_id"]
                 == exchange_client_order_id
             )
+            assert mock_ws_inst.place_order.call_args.kwargs["quantity"] == "0.010"
             mock_ws_inst._wait_for_ack.assert_called_once_with(exchange_client_order_id)
 
     def test_ws_ack_timeout_falls_back_to_rest(self):
