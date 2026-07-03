@@ -28,6 +28,9 @@ class ExchangeOrderSnapshot:
     client_order_id: str
     exchange_order_id: Optional[str]
     status: str
+    filled_quantity: Optional[Decimal] = None
+    average_price: Optional[Decimal] = None
+    fee: Optional[Decimal] = None
     raw: Optional[dict[str, Any]] = None
 
 class IExchangeAdapter(ABC):

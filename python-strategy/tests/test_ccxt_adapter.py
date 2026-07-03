@@ -234,6 +234,9 @@ class TestGetOrderByClientId:
             "id": "EX-123",
             "status": "open",
             "clientOrderId": exchange_client_order_id,
+            "filled": "0.25",
+            "average": "42000.5",
+            "fee": {"cost": "0.12"},
         }
 
         snapshot = adapter.get_order_by_client_id(
@@ -245,6 +248,9 @@ class TestGetOrderByClientId:
         assert snapshot.client_order_id == CANONICAL_CLIENT_ORDER_ID
         assert snapshot.exchange_order_id == "EX-123"
         assert snapshot.status == "open"
+        assert snapshot.filled_quantity == Decimal("0.25")
+        assert snapshot.average_price == Decimal("42000.5")
+        assert snapshot.fee == Decimal("0.12")
         assert snapshot.raw["clientOrderId"] == exchange_client_order_id
         mock_ccxt_client.fetch_order.assert_called_once_with(
             exchange_client_order_id,
@@ -282,6 +288,53 @@ class TestGetOrderByClientId:
             "BTC/USDT:USDT",
             params={"clientOrderId": CANONICAL_CLIENT_ORDER_ID},
         )
+
+    def test_fetch_order_does_not_use_limit_price_as_average(self, adapter, mock_ccxt_client):
+        exchange_client_order_id = to_exchange_format(
+            CANONICAL_CLIENT_ORDER_ID,
+            "binance",
+        )
+        mock_ccxt_client.fetch_order.return_value = {
+            "id": "EX-123",
+            "status": "open",
+            "clientOrderId": exchange_client_order_id,
+            "filled": "0.25",
+            "average": None,
+            "price": "43000",
+        }
+
+        snapshot = adapter.get_order_by_client_id(
+            CANONICAL_CLIENT_ORDER_ID,
+            "BINANCE:BTCUSDT-PERP",
+        )
+
+        assert snapshot is not None
+        assert snapshot.filled_quantity == Decimal("0.25")
+        assert snapshot.average_price is None
+
+    def test_fetch_order_derives_average_from_cost_when_available(self, adapter, mock_ccxt_client):
+        exchange_client_order_id = to_exchange_format(
+            CANONICAL_CLIENT_ORDER_ID,
+            "binance",
+        )
+        mock_ccxt_client.fetch_order.return_value = {
+            "id": "EX-123",
+            "status": "open",
+            "clientOrderId": exchange_client_order_id,
+            "filled": "0.25",
+            "average": None,
+            "price": "43000",
+            "cost": "10500",
+        }
+
+        snapshot = adapter.get_order_by_client_id(
+            CANONICAL_CLIENT_ORDER_ID,
+            "BINANCE:BTCUSDT-PERP",
+        )
+
+        assert snapshot is not None
+        assert snapshot.filled_quantity == Decimal("0.25")
+        assert snapshot.average_price == Decimal("42000")
 
     def test_fetch_order_not_found_returns_none(self, adapter, mock_ccxt_client):
         import ccxt as ccxt_lib
