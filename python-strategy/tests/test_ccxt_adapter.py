@@ -1,7 +1,7 @@
 """Tests for CcxtExchangeAdapter and adapter factory."""
 
 from decimal import Decimal
-from unittest.mock import MagicMock, patch
+from unittest.mock import MagicMock, call, patch
 
 import pytest
 
@@ -1083,6 +1083,10 @@ class TestCreateAdapter:
             })
 
         assert isinstance(adapter, CcxtExchangeAdapter)
+        assert (
+            client.mock_calls.index(call.load_markets())
+            < client.mock_calls.index(call.set_position_mode(False, "BTC/USDT:USDT"))
+        )
         client.set_position_mode.assert_called_once_with(False, "BTC/USDT:USDT")
         client.fetch_position_mode.assert_called_once_with("BTC/USDT:USDT")
         client.set_margin_mode.assert_called_once_with(

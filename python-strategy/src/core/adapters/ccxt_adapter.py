@@ -268,6 +268,13 @@ class CcxtExchangeAdapter(IExchangeAdapter):
         Binance and Bybit; fetch_position_mode() returns ``hedged`` for
         verification on those venues.
         """
+        try:
+            self.client.load_markets()
+        except ccxt.BaseError as e:
+            raise ExchangeError(
+                f"account_initialization_load_markets_failed: {e}"
+            ) from e
+
         for product_id in config.product_ids:
             symbol = to_ccxt_symbol(product_id)
             self._ensure_one_way_position_mode(symbol)
