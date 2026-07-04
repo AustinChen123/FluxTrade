@@ -385,6 +385,79 @@ class TestExecutionTradingRules:
 
         client.create_order.assert_not_called()
 
+    def test_trailing_only_signal_prevalidates_and_places_protective_order(
+        self,
+        mock_db_session,
+        mock_clock,
+        mock_order_repo,
+        signal_factory,
+        candlestick_factory,
+    ):
+        adapter, client = _ccxt_adapter_with_market_rules(_binance_btcusdt_market_rules())
+        engine = ExecutionEngine(
+            db_session=mock_db_session,
+            clock=mock_clock,
+            adapter=adapter,
+            order_repository=mock_order_repo,
+            db_session_factory=lambda: nullcontext(mock_db_session),
+            audit_external_orders=True,
+        )
+        signal = signal_factory(
+            product_id="BINANCE:BTCUSDT-PERP",
+            price=None,
+            value=None,
+            quantity=Decimal("0.001"),
+            trailing_distance=Decimal("100"),
+        )
+        candle = candlestick_factory(
+            product_id="BINANCE:BTCUSDT-PERP",
+            close=Decimal("12000"),
+        )
+
+        order_id = engine.execute_signal(signal, candle=candle)
+
+        assert order_id is not None
+        assert client.create_order.call_count == 2
+        orders = list(mock_order_repo.orders.values())
+        assert {order.type for order in orders} == {"market", "trailing_stop"}
+        trailing_order = next(order for order in orders if order.type == "trailing_stop")
+        assert getattr(trailing_order, "min_notional_reference_price") == Decimal("12000")
+
+    def test_trailing_validation_failure_blocks_entry_order(
+        self,
+        mock_db_session,
+        mock_clock,
+        mock_order_repo,
+        signal_factory,
+        candlestick_factory,
+    ):
+        adapter, client = _ccxt_adapter_with_market_rules(_binance_btcusdt_market_rules())
+        engine = ExecutionEngine(
+            db_session=mock_db_session,
+            clock=mock_clock,
+            adapter=adapter,
+            order_repository=mock_order_repo,
+            db_session_factory=lambda: nullcontext(mock_db_session),
+            audit_external_orders=True,
+        )
+        signal = signal_factory(
+            product_id="BINANCE:BTCUSDT-PERP",
+            price=Decimal("12000"),
+            quantity=Decimal("0.001"),
+            trailing_distance=Decimal("100"),
+        )
+        candle = candlestick_factory(
+            product_id="BINANCE:BTCUSDT-PERP",
+            close=Decimal("5000"),
+        )
+
+        with pytest.raises(ExchangeError, match="min_notional_not_met"):
+            engine.execute_signal(signal, candle=candle)
+
+        client.create_order.assert_not_called()
+        failed_orders = [o for o in mock_order_repo.orders.values() if o.status == "failed"]
+        assert len(failed_orders) == 2
+
 
 class TestExecutionErrorHandling:
     """Tests for error handling during execution."""

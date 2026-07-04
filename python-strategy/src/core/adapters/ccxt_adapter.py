@@ -121,6 +121,10 @@ class CcxtExchangeAdapter(IExchangeAdapter):
         except ccxt.BaseError as e:
             raise ExchangeError(f"Order placement failed: {e}") from e
 
+    def validate_order(self, order: Order) -> None:
+        """Validate and quantize an outbound order without placing it."""
+        self._quantize_order(order)
+
     def get_instrument_spec(self, product_id: str) -> InstrumentSpec:
         spec = self._instrument_specs.get(product_id)
         if spec is not None:
