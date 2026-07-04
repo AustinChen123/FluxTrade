@@ -124,6 +124,7 @@ class OrderManager:
         fill_price: Decimal,
         fill_quantity: Decimal,
         fee: Optional[Decimal] = None,
+        fee_asset: Optional[str] = None,
     ):
         order.status = "closed"
         order.filled_quantity = fill_quantity
@@ -133,6 +134,7 @@ class OrderManager:
             fill_price,
             fill_quantity,
             fee=fee,
+            fee_asset=fee_asset,
             log_label="Position Update",
         )
 
@@ -144,6 +146,7 @@ class OrderManager:
         cumulative_filled_quantity: Decimal,
         cumulative_average_price: Decimal,
         fee: Optional[Decimal] = None,
+        fee_asset: Optional[str] = None,
     ) -> None:
         """Record a non-terminal exchange fill while keeping the order tracked."""
         order.status = OrderStatus.SUBMITTED.value
@@ -154,6 +157,7 @@ class OrderManager:
             fill_price,
             fill_quantity,
             fee=fee,
+            fee_asset=fee_asset,
             log_label="Partial Position Update",
         )
 
@@ -166,6 +170,7 @@ class OrderManager:
         cumulative_average_price: Decimal,
         terminal_status: OrderStatus | None = None,
         fee: Optional[Decimal] = None,
+        fee_asset: Optional[str] = None,
     ) -> None:
         """Record a recovered exchange fill delta and set the desired order status."""
         order.status = (
@@ -180,6 +185,7 @@ class OrderManager:
             fill_price,
             fill_quantity,
             fee=fee,
+            fee_asset=fee_asset,
             log_label="Recovered Position Update",
         )
 
@@ -190,6 +196,7 @@ class OrderManager:
         fill_quantity: Decimal,
         *,
         fee: Optional[Decimal] = None,
+        fee_asset: Optional[str] = None,
         log_label: str,
     ) -> None:
         current_time = int(self.clock.now() * 1000)
@@ -239,7 +246,7 @@ class OrderManager:
             price=fill_price,
             quantity=fill_quantity,
             fee=fee if fee is not None else Decimal("0"),
-            fee_asset="USDT",
+            fee_asset=fee_asset or "USDT",
             timestamp=current_time
         )
         self.repo.add_trade(new_trade)

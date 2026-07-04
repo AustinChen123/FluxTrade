@@ -115,6 +115,16 @@ class MockOrderRepository(IOrderRepository):
             None,
         )
 
+    def get_order_by_exchange_order_id(self, exchange_order_id: str) -> Optional[Order]:
+        return next(
+            (
+                order
+                for order in self.orders.values()
+                if order.exchange_order_id == exchange_order_id
+            ),
+            None,
+        )
+
     def list_client_orders_by_statuses(self, statuses: set[str]) -> list[Order]:
         return [
             order
