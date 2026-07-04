@@ -132,6 +132,11 @@ class CcxtExchangeAdapter(IExchangeAdapter):
         except ccxt.BaseError as e:
             raise ExchangeError(f"Failed to load market rules for {product_id}: {e}") from e
         market = markets.get(ccxt_symbol) if isinstance(markets, dict) else None
+        if market is None:
+            raise ExchangeError(
+                f"market_not_found: {ccxt_symbol} for {product_id}; "
+                "refusing to build InstrumentSpec"
+            )
         spec = instrument_spec_from_ccxt_market(
             product_id,
             market,

@@ -394,15 +394,19 @@ def _step_from_precision(
 
     text = str(value)
     decimal = Decimal(text)
-    if decimal <= 0:
-        return None
 
     if precision_mode == PrecisionMode.TICK_SIZE:
+        if decimal <= 0:
+            logger.warning(
+                "Ignoring non-positive TICK_SIZE precision value: value=%s",
+                value,
+            )
+            return None
         return decimal
 
     if precision_mode == PrecisionMode.DECIMAL_PLACES:
         is_integer_text = "." not in text and "e" not in text.lower()
-        if decimal >= 0 and decimal == decimal.to_integral_value() and is_integer_text:
+        if decimal == decimal.to_integral_value() and is_integer_text:
             return Decimal(1).scaleb(-int(decimal))
         logger.warning(
             "Ignoring non-integer DECIMAL_PLACES precision value: value=%s",

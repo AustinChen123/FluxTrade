@@ -42,13 +42,17 @@ def _make_order(**overrides) -> Order:
     return order
 
 
+def _empty_btc_market() -> dict:
+    return {"BTC/USDT:USDT": {}}
+
+
 @pytest.fixture
 def mock_ccxt_client():
     """A mock CCXT exchange client."""
     client = MagicMock()
     client.apiKey = "test-key"
     client.secret = "test-secret"
-    client.load_markets.return_value = {}
+    client.load_markets.return_value = _empty_btc_market()
     return client
 
 
@@ -235,6 +239,41 @@ class TestPlaceOrder:
         assert spec.price_tick is None
         assert "without supported precisionMode" in caplog.text
 
+    @pytest.mark.parametrize(
+        ("precision_mode", "value", "expected_step"),
+        [
+            (PrecisionMode.DECIMAL_PLACES, -1, Decimal("10")),
+            (PrecisionMode.DECIMAL_PLACES, 0, Decimal("1")),
+            (PrecisionMode.DECIMAL_PLACES, "0", Decimal("1")),
+            (PrecisionMode.DECIMAL_PLACES, 3, Decimal("0.001")),
+            (PrecisionMode.DECIMAL_PLACES, "0.001", None),
+            (PrecisionMode.TICK_SIZE, -1, None),
+            (PrecisionMode.TICK_SIZE, 0, None),
+            (PrecisionMode.TICK_SIZE, "0", None),
+            (PrecisionMode.TICK_SIZE, 3, Decimal("3")),
+            (PrecisionMode.TICK_SIZE, "0.001", Decimal("0.001")),
+            (PrecisionMode.SIGNIFICANT_DIGITS, -1, None),
+            (PrecisionMode.SIGNIFICANT_DIGITS, 0, None),
+            (PrecisionMode.SIGNIFICANT_DIGITS, "0", None),
+            (PrecisionMode.SIGNIFICANT_DIGITS, 3, None),
+            (PrecisionMode.SIGNIFICANT_DIGITS, "0.001", None),
+        ],
+    )
+    def test_ccxt_precision_mode_value_matrix(
+        self, precision_mode, value, expected_step
+    ):
+        spec = instrument_spec_from_ccxt_market(
+            "BYBIT:BTCUSDT-PERP",
+            {
+                "precision": {
+                    "amount": value,
+                },
+            },
+            precision_mode=precision_mode,
+        )
+
+        assert spec.quantity_step == expected_step
+
     def test_fetches_instrument_spec_from_bybit_filters(
         self, adapter, mock_ccxt_client
     ):
@@ -296,6 +335,23 @@ class TestPlaceOrder:
         assert adapter._precision_mode() == PrecisionMode.SIGNIFICANT_DIGITS
         mock_ccxt_client.precisionMode = 4
         assert adapter._precision_mode() == PrecisionMode.TICK_SIZE
+
+    def test_missing_market_rules_fail_safe_without_caching(
+        self, adapter, mock_ccxt_client
+    ):
+        mock_ccxt_client.load_markets.return_value = {
+            "BTC/USDT:USDT": {
+                "precision": {"amount": "0.001", "price": "0.10"},
+            },
+        }
+
+        with pytest.raises(ExchangeError, match="market_not_found"):
+            adapter.get_instrument_spec("BINANCE:ETHUSDT-PERP")
+        assert "BINANCE:ETHUSDT-PERP" not in adapter._instrument_specs
+
+        with pytest.raises(ExchangeError, match="market_not_found"):
+            adapter.get_instrument_spec("BINANCE:ETHUSDT-PERP")
+        assert mock_ccxt_client.load_markets.call_count == 2
 
     def test_warms_instrument_specs_for_known_products(self, adapter, mock_ccxt_client):
         mock_ccxt_client.load_markets.return_value = {
@@ -961,6 +1017,7 @@ class TestLiveBinanceWsOrderPath:
             client.apiKey = "k"
             client.secret = "s"
             client.create_order.return_value = {"id": "REST-ACK-TIMEOUT"}
+            client.load_markets.return_value = _empty_btc_market()
             mock_cls.return_value = client
             mock_ccxt.binance = mock_cls
             setattr(mock_ccxt, "binance", mock_cls)
@@ -987,6 +1044,7 @@ class TestLiveBinanceWsOrderPath:
             client.apiKey = "k"
             client.secret = "s"
             client.create_order.return_value = {"id": "REST-123"}
+            client.load_markets.return_value = _empty_btc_market()
             mock_cls.return_value = client
             mock_ccxt.binance = mock_cls
             setattr(mock_ccxt, "binance", mock_cls)
@@ -1012,6 +1070,7 @@ class TestLiveBinanceWsOrderPath:
             client.apiKey = "k"
             client.secret = "s"
             client.create_order.return_value = {"id": "REST-456"}
+            client.load_markets.return_value = _empty_btc_market()
             mock_cls.return_value = client
             mock_ccxt.binance = mock_cls
             setattr(mock_ccxt, "binance", mock_cls)
@@ -1037,6 +1096,7 @@ class TestLiveBinanceWsOrderPath:
             client.apiKey = "k"
             client.secret = "s"
             client.create_order.return_value = {"id": "REST-789"}
+            client.load_markets.return_value = _empty_btc_market()
             mock_cls.return_value = client
             mock_ccxt.binance = mock_cls
             setattr(mock_ccxt, "binance", mock_cls)
