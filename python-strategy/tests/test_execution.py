@@ -254,6 +254,34 @@ class TestExecutionTradingRules:
         assert call.kwargs["amount"] == "0.010"
         assert call.kwargs["price"] == "50123.40"
 
+    def test_entry_journal_records_quantized_values(
+        self, mock_db_session, mock_clock, mock_order_repo, signal_factory
+    ):
+        """Journal must log what was actually submitted, not pre-quantization locals."""
+        adapter, _client = _ccxt_adapter_with_market_rules(_binance_btcusdt_market_rules())
+        journal = MagicMock()
+        engine = ExecutionEngine(
+            db_session=mock_db_session,
+            clock=mock_clock,
+            adapter=adapter,
+            order_repository=mock_order_repo,
+            journal=journal,
+        )
+        signal = signal_factory(
+            product_id="BINANCE:BTCUSDT-PERP",
+            price=Decimal("50123.456"),
+            quantity=Decimal("0.0109"),
+        )
+
+        order_id = engine.execute_signal(signal)
+
+        assert order_id is not None
+        entry_calls = [c for c in journal.log.call_args_list if c.args[0] == "entry"]
+        assert len(entry_calls) == 1
+        payload = entry_calls[0].args[1]
+        assert payload["quantity"] == "0.010"
+        assert payload["price"] == "50123.40"
+
     def test_min_notional_rejection_fails_local_order_and_audit(
         self, mock_db_session, mock_clock, mock_order_repo, signal_factory
     ):

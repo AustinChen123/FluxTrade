@@ -579,8 +579,10 @@ class ExecutionEngine:
                     "order_id": str(order.id),
                     "side": side,
                     "order_type": order_type,
-                    "quantity": str(qty),
-                    "price": str(limit_price) if limit_price else "market",
+                    # Post-placement order fields: quantization may have adjusted
+                    # the submitted values away from the pre-validation locals.
+                    "quantity": str(order.quantity),
+                    "price": str(order.price) if order.price else "market",
                     "stop_loss": str(signal.stop_loss) if signal.stop_loss else None,
                     "take_profit": str(signal.take_profit) if signal.take_profit else None,
                     "trailing_distance": str(signal.trailing_distance) if signal.trailing_distance else None,
@@ -695,8 +697,10 @@ class ExecutionEngine:
                     "order_id": str(order.id),
                     "side": side,
                     "order_type": order_type,
-                    "quantity": str(qty),
-                    "price": str(limit_price) if limit_price else "market",
+                    # Post-placement order fields: quantization may have adjusted
+                    # the submitted values away from the pre-validation locals.
+                    "quantity": str(order.quantity),
+                    "price": str(order.price) if order.price else "market",
                     "stop_loss": str(signal.stop_loss) if signal.stop_loss else None,
                     "take_profit": str(signal.take_profit) if signal.take_profit else None,
                     "trailing_distance": str(signal.trailing_distance) if signal.trailing_distance else None,
