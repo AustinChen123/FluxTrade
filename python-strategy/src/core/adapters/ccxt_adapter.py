@@ -271,13 +271,22 @@ class CcxtExchangeAdapter(IExchangeAdapter):
         for product_id in config.product_ids:
             symbol = to_ccxt_symbol(product_id)
             self._ensure_one_way_position_mode(symbol)
+            margin_mode_accepted = False
             if config.margin_mode is not None:
-                self._set_margin_mode(config.margin_mode, symbol, config)
+                margin_mode_accepted = self._set_margin_mode(
+                    config.margin_mode,
+                    symbol,
+                    config,
+                )
             if config.leverage is not None:
                 self._set_leverage(config.leverage, symbol)
                 self._verify_leverage(config.leverage, symbol)
             if config.margin_mode is not None:
-                self._verify_margin_mode(config.margin_mode, symbol)
+                self._verify_margin_mode(
+                    config.margin_mode,
+                    symbol,
+                    allow_unsupported=margin_mode_accepted,
+                )
 
     def _ensure_one_way_position_mode(self, symbol: str) -> None:
         set_position_mode = getattr(self.client, "set_position_mode", None)
@@ -326,7 +335,7 @@ class CcxtExchangeAdapter(IExchangeAdapter):
         margin_mode: str,
         symbol: str,
         config: AccountInitializationConfig,
-    ) -> None:
+    ) -> bool:
         set_margin_mode = getattr(self.client, "set_margin_mode", None)
         if not callable(set_margin_mode):
             raise ExchangeError(
@@ -342,6 +351,7 @@ class CcxtExchangeAdapter(IExchangeAdapter):
                 raise ExchangeError(
                     f"account_margin_mode_set_failed: symbol={symbol} error={e}"
                 ) from e
+        return True
 
     def _set_leverage(self, leverage: int, symbol: str) -> None:
         set_leverage = getattr(self.client, "set_leverage", None)
@@ -365,8 +375,26 @@ class CcxtExchangeAdapter(IExchangeAdapter):
                 f"symbol={symbol} expected={expected_leverage} actual={leverage}"
             )
 
-    def _verify_margin_mode(self, expected_margin_mode: str, symbol: str) -> None:
-        margin_mode = self._fetch_margin_mode_value(symbol)
+    def _verify_margin_mode(
+        self,
+        expected_margin_mode: str,
+        symbol: str,
+        *,
+        allow_unsupported: bool,
+    ) -> None:
+        try:
+            margin_mode = self._fetch_margin_mode_value(symbol)
+        except ExchangeError as e:
+            if allow_unsupported and str(e).startswith(
+                "account_margin_mode_verification_unsupported"
+            ):
+                self.logger.warning(
+                    "Margin mode verification unsupported for %s on %s after accepted set_margin_mode",
+                    symbol,
+                    self.exchange_id,
+                )
+                return
+            raise
         if margin_mode != expected_margin_mode:
             raise ExchangeError(
                 "account_margin_mode_not_configured: "
