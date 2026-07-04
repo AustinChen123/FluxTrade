@@ -94,6 +94,8 @@ def _adapter_config_from_env() -> dict:
     mode = mode.lower()
     if mode == "simulated":
         return {"mode": "simulated"}
+    if mode != "live":
+        raise ValueError(f"unsupported_adapter_mode: mode={mode}")
 
     product_ids = _env_csv("INSTRUMENT_PRODUCT_IDS", ["BINANCE:BTCUSDT-PERP"])
     account_initialization = {

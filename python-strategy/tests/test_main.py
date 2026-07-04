@@ -1,5 +1,7 @@
 from unittest.mock import MagicMock, patch
 
+import pytest
+
 from src import main as strategy_main
 
 
@@ -47,6 +49,13 @@ def test_adapter_config_from_env_wires_live_account_initialization(monkeypatch) 
             "margin_mode": "isolated",
         },
     }
+
+
+def test_adapter_config_from_env_rejects_unknown_mode(monkeypatch) -> None:
+    monkeypatch.setenv("ADAPTER_MODE", "simulation")
+
+    with pytest.raises(ValueError, match="unsupported_adapter_mode"):
+        strategy_main._adapter_config_from_env()
 
 
 def test_main_wires_session_factory_and_audit_flag(monkeypatch) -> None:
