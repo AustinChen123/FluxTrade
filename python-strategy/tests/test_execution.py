@@ -1267,6 +1267,204 @@ class TestLiveOrderEventSync:
         assert mock_order_repo.orders == {}
         assert mock_order_repo.trades == []
 
+    def test_resync_recoverable_order_events_applies_snapshot_through_event_sync_idempotently(
+        self,
+        mock_db_session,
+        mock_clock,
+        mock_exchange_adapter,
+        mock_order_repo,
+        order_factory,
+    ):
+        engine = self._engine(
+            mock_db_session,
+            mock_clock,
+            mock_exchange_adapter,
+            mock_order_repo,
+        )
+        order = order_factory(
+            client_order_id="strategy-worker-entry-1704067200000000000",
+            exchange_order_id="EX-resync",
+            status=OrderStatus.PARTIALLY_FILLED.value,
+            quantity=Decimal("0.10"),
+            filled_quantity=Decimal("0.04"),
+            filled_price=Decimal("100"),
+        )
+        mock_order_repo.add_order(order)
+        snapshot = ExchangeOrderSnapshot(
+            client_order_id=order.client_order_id,
+            exchange_order_id="EX-resync",
+            status="open",
+            filled_quantity=Decimal("0.06"),
+            average_price=Decimal("102"),
+            fee=Decimal("0.01"),
+        )
+        mock_exchange_adapter.get_order_by_client_id = MagicMock(return_value=snapshot)
+
+        first_payload = engine.resync_recoverable_order_events()
+        second_payload = engine.resync_recoverable_order_events()
+
+        assert first_payload["recoverable_count"] == 1
+        assert first_payload["applied_count"] == 1
+        assert first_payload["unresolved_count"] == 0
+        assert first_payload["verification_blocked_count"] == 0
+        assert second_payload["recoverable_count"] == 1
+        assert second_payload["applied_count"] == 1
+        assert second_payload["unresolved_count"] == 0
+        assert order.status == OrderStatus.PARTIALLY_FILLED.value
+        assert order.filled_quantity == Decimal("0.06")
+        assert order.filled_price == Decimal("102")
+        assert len(mock_order_repo.trades) == 1
+        assert mock_order_repo.trades[0].quantity == Decimal("0.02")
+        assert mock_order_repo.trades[0].price == Decimal("106")
+        assert mock_order_repo.trades[0].fee == Decimal("0.01")
+
+    @pytest.mark.parametrize(
+        ("snapshot", "expected_action"),
+        [
+            (
+                ExchangeOrderSnapshot(
+                    client_order_id="client-resync",
+                    exchange_order_id="EX-resync-unresolved",
+                    status="filled",
+                    filled_quantity=Decimal("0.10"),
+                    average_price=None,
+                ),
+                "unresolved_missing_fill_price",
+            ),
+            (
+                ExchangeOrderSnapshot(
+                    client_order_id="client-resync",
+                    exchange_order_id="EX-resync-unresolved",
+                    status="filled",
+                    filled_quantity=Decimal("0.04"),
+                    average_price=Decimal("100"),
+                ),
+                "unresolved_terminal_fill_quantity_below_order_quantity",
+            ),
+        ],
+    )
+    def test_resync_recoverable_order_events_surfaces_unresolved_snapshots(
+        self,
+        mock_db_session,
+        mock_clock,
+        mock_exchange_adapter,
+        mock_order_repo,
+        order_factory,
+        snapshot,
+        expected_action,
+    ):
+        engine = self._engine(
+            mock_db_session,
+            mock_clock,
+            mock_exchange_adapter,
+            mock_order_repo,
+        )
+        order = order_factory(
+            client_order_id="client-resync",
+            exchange_order_id="EX-resync-unresolved",
+            status=OrderStatus.PARTIALLY_FILLED.value,
+            quantity=Decimal("0.10"),
+            filled_quantity=Decimal("0.04"),
+            filled_price=Decimal("100"),
+        )
+        mock_order_repo.add_order(order)
+        mock_exchange_adapter.get_order_by_client_id = MagicMock(return_value=snapshot)
+
+        payload = engine.resync_recoverable_order_events()
+
+        assert payload["recoverable_count"] == 1
+        assert payload["applied_count"] == 0
+        assert payload["unresolved_count"] == 1
+        assert payload["verification_blocked_count"] == 0
+        assert payload["results"][0]["action"] == expected_action
+        assert order.status == OrderStatus.PARTIALLY_FILLED.value
+        assert order.filled_quantity == Decimal("0.04")
+        assert mock_order_repo.trades == []
+
+    def test_resync_recoverable_order_events_counts_unknown_status_as_verification_blocked(
+        self,
+        mock_db_session,
+        mock_clock,
+        mock_exchange_adapter,
+        mock_order_repo,
+        order_factory,
+    ):
+        engine = self._engine(
+            mock_db_session,
+            mock_clock,
+            mock_exchange_adapter,
+            mock_order_repo,
+        )
+        order = order_factory(
+            client_order_id="client-resync-unknown-status",
+            exchange_order_id="EX-resync-unknown-status",
+            status=OrderStatus.SUBMITTED.value,
+        )
+        mock_order_repo.add_order(order)
+        mock_exchange_adapter.get_order_by_client_id = MagicMock(
+            return_value=ExchangeOrderSnapshot(
+                client_order_id=order.client_order_id,
+                exchange_order_id=order.exchange_order_id,
+                status="weird_status",
+            )
+        )
+
+        payload = engine.resync_recoverable_order_events()
+
+        assert payload["recoverable_count"] == 1
+        assert payload["applied_count"] == 0
+        assert payload["unresolved_count"] == 0
+        assert payload["verification_blocked_count"] == 1
+        assert payload["results"][0]["action"] == "unknown_status"
+        assert payload["results"][0]["verification_blocked"] is True
+        assert order.status == OrderStatus.SUBMITTED.value
+        assert mock_order_repo.trades == []
+
+    @pytest.mark.parametrize(
+        ("lookup_result", "expected_action"),
+        [
+            (None, "verification_blocked_order_snapshot_missing"),
+            (ExchangeOrderLookupUnsupported("unsupported"), "verification_blocked_order_lookup_unsupported"),
+            (ExchangeError("network down"), "verification_blocked_order_lookup_failed"),
+        ],
+    )
+    def test_resync_recoverable_order_events_surfaces_verification_blocked_lookup(
+        self,
+        mock_db_session,
+        mock_clock,
+        mock_exchange_adapter,
+        mock_order_repo,
+        order_factory,
+        lookup_result,
+        expected_action,
+    ):
+        engine = self._engine(
+            mock_db_session,
+            mock_clock,
+            mock_exchange_adapter,
+            mock_order_repo,
+        )
+        order = order_factory(
+            client_order_id="client-resync-blocked",
+            exchange_order_id="EX-resync-blocked",
+            status=OrderStatus.SUBMITTED.value,
+        )
+        mock_order_repo.add_order(order)
+        if isinstance(lookup_result, Exception):
+            mock_exchange_adapter.get_order_by_client_id = MagicMock(side_effect=lookup_result)
+        else:
+            mock_exchange_adapter.get_order_by_client_id = MagicMock(return_value=lookup_result)
+
+        payload = engine.resync_recoverable_order_events()
+
+        assert payload["recoverable_count"] == 1
+        assert payload["applied_count"] == 0
+        assert payload["unresolved_count"] == 0
+        assert payload["verification_blocked_count"] == 1
+        assert payload["results"][0]["action"] == expected_action
+        assert order.status == OrderStatus.SUBMITTED.value
+        assert mock_order_repo.trades == []
+
 
 class TestExecutionErrorHandling:
     """Tests for error handling during execution."""
