@@ -209,6 +209,96 @@ class ExecutionEngine:
 
         return payload
 
+    def resync_recoverable_order_events(self) -> dict[str, object]:
+        """Resync recoverable live orders through the order-event state machine.
+
+        This is intended for disconnect recovery. It converts REST order
+        snapshots into ``ExchangeOrderEvent`` instances, then delegates all
+        fill/status accounting to ``process_exchange_order_event`` so live
+        stream replay and REST catch-up cannot drift into separate semantics.
+        """
+        orders = self.list_recoverable_client_orders()
+        results: list[dict[str, object]] = []
+        for order in orders:
+            try:
+                snapshot = self.adapter.get_order_by_client_id(
+                    order.client_order_id,
+                    order.product_id,
+                )
+            except ExchangeOrderLookupUnsupported:
+                results.append(
+                    {
+                        "order_id": order.id,
+                        "client_order_id": order.client_order_id,
+                        "action": "verification_blocked_order_lookup_unsupported",
+                        "verification_blocked": True,
+                        "unresolved": False,
+                    }
+                )
+                continue
+            except ExchangeError as e:
+                results.append(
+                    {
+                        "order_id": order.id,
+                        "client_order_id": order.client_order_id,
+                        "action": "verification_blocked_order_lookup_failed",
+                        "reason": str(e),
+                        "verification_blocked": True,
+                        "unresolved": False,
+                    }
+                )
+                continue
+
+            if snapshot is None:
+                results.append(
+                    {
+                        "order_id": order.id,
+                        "client_order_id": order.client_order_id,
+                        "action": "verification_blocked_order_snapshot_missing",
+                        "verification_blocked": True,
+                        "unresolved": False,
+                    }
+                )
+                continue
+
+            event = self._exchange_snapshot_to_order_event(order.product_id, snapshot)
+            result = self.process_exchange_order_event(event)
+            result["verification_blocked"] = self._resync_action_verification_blocked(
+                str(result["action"])
+            )
+            result["unresolved"] = str(result["action"]).startswith("unresolved_")
+            results.append(result)
+
+        return {
+            "recoverable_count": len(orders),
+            "applied_count": sum(1 for result in results if result["action"] == "applied"),
+            "unresolved_count": sum(1 for result in results if result["unresolved"]),
+            "verification_blocked_count": sum(
+                1 for result in results if result["verification_blocked"]
+            ),
+            "results": results,
+        }
+
+    @staticmethod
+    def _exchange_snapshot_to_order_event(
+        product_id: str,
+        snapshot,
+    ) -> ExchangeOrderEvent:
+        return ExchangeOrderEvent(
+            status=snapshot.status,
+            product_id=product_id,
+            client_order_id=snapshot.client_order_id,
+            exchange_order_id=snapshot.exchange_order_id,
+            cumulative_filled_quantity=snapshot.filled_quantity,
+            cumulative_average_price=snapshot.average_price,
+            fee=snapshot.fee,
+            raw=snapshot.raw,
+        )
+
+    @staticmethod
+    def _resync_action_verification_blocked(action: str) -> bool:
+        return action in {"unknown_order", "unknown_status"}
+
     def _repair_reconciled_order(self, order, decision: str, snapshot) -> dict[str, object]:
         if decision == "local_only":
             self.order_manager.fail_order(order, "startup reconciliation: local order not found on exchange")

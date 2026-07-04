@@ -14,7 +14,12 @@ from src.core.adapters.ccxt_adapter import (
 from src.core.adapters.live_binance import LiveBinanceAdapter
 from src.core.adapters.simulated import SimulatedAdapter
 from src.core.client_order_id import to_exchange_format
-from src.core.interfaces.exchange import ExchangeError, InsufficientFundsError, NetworkError
+from src.core.interfaces.exchange import (
+    ExchangeError,
+    ExchangeUserStreamUnsupported,
+    InsufficientFundsError,
+    NetworkError,
+)
 from src.core.orm_models import Order
 from src.core.product_registry import (
     PrecisionMode,
@@ -913,6 +918,55 @@ class TestGetOrderByClientId:
                 CANONICAL_CLIENT_ORDER_ID,
                 "BINANCE:BTCUSDT-PERP",
             )
+
+
+class TestUserStreamListenKey:
+    def test_binance_creates_user_stream_listen_key(self, adapter, mock_ccxt_client):
+        mock_ccxt_client.fapiPrivatePostListenKey.return_value = {
+            "listenKey": "listen-key-1",
+        }
+
+        assert adapter.create_user_stream_listen_key() == "listen-key-1"
+
+        mock_ccxt_client.fapiPrivatePostListenKey.assert_called_once_with()
+
+    def test_binance_create_user_stream_requires_listen_key_in_response(
+        self,
+        adapter,
+        mock_ccxt_client,
+    ):
+        mock_ccxt_client.fapiPrivatePostListenKey.return_value = {}
+
+        with pytest.raises(ExchangeError, match="user_stream_listen_key_missing"):
+            adapter.create_user_stream_listen_key()
+
+    def test_binance_keepalive_user_stream(self, adapter, mock_ccxt_client):
+        adapter.keepalive_user_stream("listen-key-1")
+
+        mock_ccxt_client.fapiPrivatePutListenKey.assert_called_once_with(
+            {"listenKey": "listen-key-1"}
+        )
+
+    def test_binance_keepalive_requires_listen_key(self, adapter):
+        with pytest.raises(ExchangeError, match="requires_listen_key"):
+            adapter.keepalive_user_stream("")
+
+    def test_non_binance_user_stream_listen_key_is_unsupported(self, mock_ccxt_client):
+        with patch("src.core.adapters.ccxt_adapter.ccxt") as mock_ccxt:
+            mock_exchange_cls = MagicMock(return_value=mock_ccxt_client)
+            mock_ccxt.bybit = mock_exchange_cls
+            setattr(mock_ccxt, "bybit", mock_exchange_cls)
+            adapter = CcxtExchangeAdapter(
+                exchange_id="bybit",
+                api_key="test-key",
+                secret="test-secret",
+            )
+        adapter.client = mock_ccxt_client
+
+        with pytest.raises(ExchangeUserStreamUnsupported):
+            adapter.create_user_stream_listen_key()
+        with pytest.raises(ExchangeUserStreamUnsupported):
+            adapter.keepalive_user_stream("listen-key-1")
 
 
 class TestGetBalance:

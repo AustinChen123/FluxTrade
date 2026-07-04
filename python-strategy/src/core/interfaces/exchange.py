@@ -21,6 +21,10 @@ class ExchangeOrderLookupUnsupported(ExchangeError):
     """Raised when an adapter cannot query orders by client order ID."""
     pass
 
+class ExchangeUserStreamUnsupported(ExchangeError):
+    """Raised when an adapter cannot manage exchange user-data streams."""
+    pass
+
 @dataclass(frozen=True)
 class ExchangeOrderSnapshot:
     """Adapter-neutral view of an exchange order used for recovery checks."""
@@ -107,6 +111,18 @@ class IExchangeAdapter(ABC):
         """Return an exchange order snapshot by client order ID if supported."""
         raise ExchangeOrderLookupUnsupported(
             f"{type(self).__name__} does not support client order lookup"
+        )
+
+    def create_user_stream_listen_key(self) -> str:
+        """Create a user-data stream listen key when supported."""
+        raise ExchangeUserStreamUnsupported(
+            f"{type(self).__name__} does not support user stream listen keys"
+        )
+
+    def keepalive_user_stream(self, listen_key: str) -> None:
+        """Refresh an existing user-data stream listen key when supported."""
+        raise ExchangeUserStreamUnsupported(
+            f"{type(self).__name__} does not support user stream listen keys"
         )
 
     @abstractmethod

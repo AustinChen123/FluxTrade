@@ -17,6 +17,7 @@ import ccxt
 from src.core.interfaces.exchange import (
     ExchangeOrderSnapshot,
     ExchangeError,
+    ExchangeUserStreamUnsupported,
     IExchangeAdapter,
     InsufficientFundsError,
     NetworkError,
@@ -628,6 +629,44 @@ class CcxtExchangeAdapter(IExchangeAdapter):
             fee=Decimal(str(fee_cost)) if fee_cost is not None else None,
             raw=response,
         )
+
+    def create_user_stream_listen_key(self) -> str:
+        """Create a Binance USD-M Futures user-data stream listen key.
+
+        CCXT 4.5.34 exposes Binance USD-M Futures listen-key endpoints as
+        ``fapiPrivatePostListenKey`` / ``fapiPrivatePutListenKey``.
+        """
+        if self.exchange_id != "binance" or not hasattr(
+            self.client,
+            "fapiPrivatePostListenKey",
+        ):
+            raise ExchangeUserStreamUnsupported(
+                f"user_stream_listen_key_unsupported: exchange={self.exchange_id}"
+            )
+        try:
+            response = self.client.fapiPrivatePostListenKey()
+        except ccxt.BaseError as e:
+            raise ExchangeError(f"user_stream_listen_key_create_failed: {e}") from e
+        listen_key = response.get("listenKey") if isinstance(response, dict) else None
+        if not listen_key:
+            raise ExchangeError("user_stream_listen_key_missing")
+        return str(listen_key)
+
+    def keepalive_user_stream(self, listen_key: str) -> None:
+        """Keep a Binance USD-M Futures user-data stream listen key alive."""
+        if self.exchange_id != "binance" or not hasattr(
+            self.client,
+            "fapiPrivatePutListenKey",
+        ):
+            raise ExchangeUserStreamUnsupported(
+                f"user_stream_keepalive_unsupported: exchange={self.exchange_id}"
+            )
+        if not listen_key:
+            raise ExchangeError("user_stream_keepalive_requires_listen_key")
+        try:
+            self.client.fapiPrivatePutListenKey({"listenKey": listen_key})
+        except ccxt.BaseError as e:
+            raise ExchangeError(f"user_stream_keepalive_failed: {e}") from e
 
     def get_balance(self, asset: str) -> Decimal:
         try:
