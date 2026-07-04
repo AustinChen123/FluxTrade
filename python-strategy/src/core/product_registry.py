@@ -90,6 +90,12 @@ class PrecisionMode(str, Enum):
     TICK_SIZE = "tick_size"
 
 
+class TriggerPricePolicy(str, Enum):
+    REQUIRE_ON_TICK = "require_on_tick"
+    ROUND_DOWN = "round_down"
+    ROUND_UP = "round_up"
+
+
 def _parse_product_id(product_id: str) -> dict:
     """Parse product_id into components using generic rules.
 
@@ -304,6 +310,7 @@ def quantize_order_values(
     quantity: Decimal,
     price: Decimal | None,
     side: str | None = None,
+    order_type: str | None = None,
     trigger_price: Decimal | None = None,
     spec: InstrumentSpec,
 ) -> QuantizedOrder:
@@ -314,7 +321,12 @@ def quantize_order_values(
         else None
     )
     quantized_trigger_price = (
-        _require_on_step("trigger_price", trigger_price, spec.price_tick)
+        _quantize_trigger_price(
+            trigger_price,
+            spec.price_tick,
+            side=side,
+            order_type=order_type,
+        )
         if trigger_price is not None
         else None
     )
@@ -395,6 +407,43 @@ def _require_on_step(label: str, value: Decimal, step: Decimal | None) -> Decima
     if step is None or step <= 0 or _floor_to_step(value, step) == value:
         return value
     raise ValueError(f"{label}_off_tick: {label}={value} tick={step}")
+
+
+def _quantize_trigger_price(
+    trigger_price: Decimal,
+    tick: Decimal | None,
+    *,
+    side: str | None,
+    order_type: str | None,
+) -> Decimal:
+    if tick is None or tick <= 0 or _floor_to_step(trigger_price, tick) == trigger_price:
+        return trigger_price
+
+    policy = _trigger_price_policy(order_type=order_type, side=side)
+    if policy == TriggerPricePolicy.ROUND_DOWN:
+        return _floor_to_step(trigger_price, tick)
+    if policy == TriggerPricePolicy.ROUND_UP:
+        return _ceil_to_step(trigger_price, tick)
+    return _require_on_step("trigger_price", trigger_price, tick)
+
+
+def _trigger_price_policy(
+    *,
+    order_type: str | None,
+    side: str | None,
+) -> TriggerPricePolicy:
+    normalized_type = order_type.lower() if order_type is not None else None
+    normalized_side = side.lower() if side is not None else None
+    if normalized_type in {"stop_loss", "take_profit", "trailing_stop"}:
+        if normalized_side == "buy":
+            return TriggerPricePolicy.ROUND_DOWN
+        if normalized_side == "sell":
+            return TriggerPricePolicy.ROUND_UP
+        raise ValueError(
+            "trigger_price_off_tick_without_side: "
+            f"order_type={order_type}"
+        )
+    return TriggerPricePolicy.REQUIRE_ON_TICK
 
 
 def _step_from_precision(
