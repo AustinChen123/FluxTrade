@@ -24,6 +24,7 @@ from src.core.models import Position
 from src.core.orm_models import Order
 from src.core.product_registry import (
     InstrumentSpec,
+    PrecisionMode,
     instrument_spec_from_ccxt_market,
     quantize_order_values,
     to_ccxt_symbol,
@@ -131,9 +132,48 @@ class CcxtExchangeAdapter(IExchangeAdapter):
         except ccxt.BaseError as e:
             raise ExchangeError(f"Failed to load market rules for {product_id}: {e}") from e
         market = markets.get(ccxt_symbol) if isinstance(markets, dict) else None
-        spec = instrument_spec_from_ccxt_market(product_id, market)
+        spec = instrument_spec_from_ccxt_market(
+            product_id,
+            market,
+            precision_mode=self._precision_mode(),
+        )
+        missing_rules = []
+        if spec.quantity_step is None:
+            missing_rules.append("quantity_step")
+        if spec.price_tick is None:
+            missing_rules.append("price_tick")
+        if missing_rules:
+            self.logger.warning(
+                "Instrument spec for %s is missing %s; order quantization may be incomplete",
+                product_id,
+                ", ".join(missing_rules),
+            )
         self._instrument_specs[product_id] = spec
         return spec
+
+    def _precision_mode(self) -> PrecisionMode | None:
+        raw_mode = getattr(self.client, "precisionMode", None)
+        constants = {
+            getattr(ccxt, "DECIMAL_PLACES", 2): PrecisionMode.DECIMAL_PLACES,
+            getattr(ccxt, "SIGNIFICANT_DIGITS", 3): PrecisionMode.SIGNIFICANT_DIGITS,
+            getattr(ccxt, "TICK_SIZE", 4): PrecisionMode.TICK_SIZE,
+            2: PrecisionMode.DECIMAL_PLACES,
+            3: PrecisionMode.SIGNIFICANT_DIGITS,
+            4: PrecisionMode.TICK_SIZE,
+        }
+        mode = constants.get(raw_mode)
+        if mode is not None:
+            return mode
+
+        if isinstance(raw_mode, str):
+            normalized = raw_mode.lower()
+            return {
+                "decimal_places": PrecisionMode.DECIMAL_PLACES,
+                "significant_digits": PrecisionMode.SIGNIFICANT_DIGITS,
+                "tick_size": PrecisionMode.TICK_SIZE,
+            }.get(normalized)
+
+        return None
 
     def warm_instrument_specs(self, product_ids: list[str]) -> None:
         """Fetch and cache instrument specs for known live products."""

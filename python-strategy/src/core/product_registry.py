@@ -7,10 +7,14 @@ Product ID format: EXCHANGE:BASEQUOTE-PERP
   e.g. BINANCE:BTCUSDT-PERP, BYBIT:ETHUSDT-PERP
 """
 
+import logging
 import re
 from dataclasses import dataclass
 from decimal import Decimal, ROUND_DOWN, ROUND_UP
+from enum import Enum
 from typing import Any
+
+logger = logging.getLogger(__name__)
 
 
 # Known product mappings with exchange-specific overrides.
@@ -76,6 +80,14 @@ class QuantizedOrder:
     price: Decimal | None
     trigger_price: Decimal | None
     changed: bool
+
+
+class PrecisionMode(str, Enum):
+    """CCXT precision modes translated at the adapter boundary."""
+
+    DECIMAL_PLACES = "decimal_places"
+    SIGNIFICANT_DIGITS = "significant_digits"
+    TICK_SIZE = "tick_size"
 
 
 def _parse_product_id(product_id: str) -> dict:
@@ -204,6 +216,8 @@ def instrument_spec_from_product(
 def instrument_spec_from_ccxt_market(
     product_id: str,
     market: dict[str, Any] | None,
+    *,
+    precision_mode: PrecisionMode | None,
 ) -> InstrumentSpec:
     quantity_step = None
     price_tick = None
@@ -218,8 +232,14 @@ def instrument_spec_from_ccxt_market(
         min_notional = _decimal_or_none(cost_limits.get("min"))
         precision = market.get("precision") or {}
         if isinstance(precision, dict):
-            quantity_step = _step_from_precision(precision.get("amount"))
-            price_tick = _step_from_precision(precision.get("price"))
+            quantity_step = _step_from_precision(
+                precision.get("amount"),
+                precision_mode,
+            )
+            price_tick = _step_from_precision(
+                precision.get("price"),
+                precision_mode,
+            )
 
         info = market.get("info") or {}
         if isinstance(info, dict):
@@ -365,23 +385,40 @@ def _require_on_step(label: str, value: Decimal, step: Decimal | None) -> Decima
     raise ValueError(f"{label}_off_tick: {label}={value} tick={step}")
 
 
-def _step_from_precision(value: Any) -> Decimal | None:
+def _step_from_precision(
+    value: Any,
+    precision_mode: PrecisionMode | None,
+) -> Decimal | None:
     if value is None or value == "":
         return None
-    if isinstance(value, int):
-        if value < 0:
-            return None
-        return Decimal(1).scaleb(-value)
 
     text = str(value)
     decimal = Decimal(text)
     if decimal <= 0:
         return None
-    if decimal < 1:
+
+    if precision_mode == PrecisionMode.TICK_SIZE:
         return decimal
-    if decimal == decimal.to_integral_value() and "." not in text and "e" not in text.lower():
-        return Decimal(1).scaleb(-int(decimal))
-    return decimal
+
+    if precision_mode == PrecisionMode.DECIMAL_PLACES:
+        is_integer_text = "." not in text and "e" not in text.lower()
+        if decimal >= 0 and decimal == decimal.to_integral_value() and is_integer_text:
+            return Decimal(1).scaleb(-int(decimal))
+        logger.warning(
+            "Ignoring non-integer DECIMAL_PLACES precision value: value=%s",
+            value,
+        )
+        return None
+
+    if precision_mode == PrecisionMode.SIGNIFICANT_DIGITS:
+        return None
+
+    logger.warning(
+        "Ignoring precision value without supported precisionMode: value=%s precision_mode=%s",
+        value,
+        precision_mode,
+    )
+    return None
 
 
 def _decimal_or_none(value: Any, fallback: Decimal | None = None) -> Decimal | None:

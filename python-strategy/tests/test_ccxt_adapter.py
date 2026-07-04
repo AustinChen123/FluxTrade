@@ -12,6 +12,7 @@ from src.core.adapters.simulated import SimulatedAdapter
 from src.core.client_order_id import to_exchange_format
 from src.core.interfaces.exchange import ExchangeError, InsufficientFundsError, NetworkError
 from src.core.orm_models import Order
+from src.core.product_registry import PrecisionMode, instrument_spec_from_ccxt_market
 
 CANONICAL_CLIENT_ORDER_ID = "strategy_1-worker_a-entry-1704067200000000000"
 
@@ -148,11 +149,12 @@ class TestPlaceOrder:
     def test_fetches_instrument_spec_from_ccxt_precision(
         self, adapter, mock_ccxt_client
     ):
+        mock_ccxt_client.precisionMode = 2
         mock_ccxt_client.load_markets.return_value = {
             "BTC/USDT:USDT": {
                 "precision": {
                     "amount": 3,
-                    "price": "0.10",
+                    "price": 1,
                 },
                 "limits": {
                     "amount": {"min": "0.001"},
@@ -167,6 +169,71 @@ class TestPlaceOrder:
         assert spec.price_tick == Decimal("0.10")
         assert spec.min_quantity == Decimal("0.001")
         assert spec.min_notional == Decimal("5")
+
+    def test_ccxt_precision_mode_tick_size_treats_integer_as_step(self):
+        spec = instrument_spec_from_ccxt_market(
+            "BYBIT:BTCUSDT-PERP",
+            {
+                "precision": {
+                    "amount": 3,
+                    "price": 1,
+                },
+            },
+            precision_mode=PrecisionMode.TICK_SIZE,
+        )
+
+        assert spec.quantity_step == Decimal("3")
+        assert spec.price_tick == Decimal("1")
+
+    def test_ccxt_precision_mode_tick_size_accepts_fractional_step(self):
+        spec = instrument_spec_from_ccxt_market(
+            "BYBIT:BTCUSDT-PERP",
+            {
+                "precision": {
+                    "amount": "0.001",
+                    "price": "0.10",
+                },
+            },
+            precision_mode=PrecisionMode.TICK_SIZE,
+        )
+
+        assert spec.quantity_step == Decimal("0.001")
+        assert spec.price_tick == Decimal("0.10")
+
+    def test_ccxt_precision_mode_significant_digits_uses_filters(self):
+        spec = instrument_spec_from_ccxt_market(
+            "BYBIT:BTCUSDT-PERP",
+            {
+                "precision": {
+                    "amount": 3,
+                    "price": 2,
+                },
+                "info": {
+                    "lotSizeFilter": {"qtyStep": "0.001"},
+                    "priceFilter": {"tickSize": "0.10"},
+                },
+            },
+            precision_mode=PrecisionMode.SIGNIFICANT_DIGITS,
+        )
+
+        assert spec.quantity_step == Decimal("0.001")
+        assert spec.price_tick == Decimal("0.10")
+
+    def test_ccxt_precision_without_mode_is_ignored_with_warning(self, caplog):
+        spec = instrument_spec_from_ccxt_market(
+            "BYBIT:BTCUSDT-PERP",
+            {
+                "precision": {
+                    "amount": 3,
+                    "price": "0.10",
+                },
+            },
+            precision_mode=None,
+        )
+
+        assert spec.quantity_step is None
+        assert spec.price_tick is None
+        assert "without supported precisionMode" in caplog.text
 
     def test_fetches_instrument_spec_from_bybit_filters(
         self, adapter, mock_ccxt_client
@@ -194,6 +261,7 @@ class TestPlaceOrder:
         assert spec.min_notional == Decimal("5")
 
     def test_quantizes_order_from_non_binance_precision(self, adapter, mock_ccxt_client):
+        mock_ccxt_client.precisionMode = 4
         mock_ccxt_client.load_markets.return_value = {
             "BTC/USDT:USDT": {
                 "precision": {
@@ -220,6 +288,14 @@ class TestPlaceOrder:
         assert order.price == Decimal("50123.40")
         assert call_kwargs.kwargs["amount"] == "0.010"
         assert call_kwargs.kwargs["price"] == "50123.40"
+
+    def test_maps_ccxt_precision_mode_constants(self, adapter, mock_ccxt_client):
+        mock_ccxt_client.precisionMode = 2
+        assert adapter._precision_mode() == PrecisionMode.DECIMAL_PLACES
+        mock_ccxt_client.precisionMode = 3
+        assert adapter._precision_mode() == PrecisionMode.SIGNIFICANT_DIGITS
+        mock_ccxt_client.precisionMode = 4
+        assert adapter._precision_mode() == PrecisionMode.TICK_SIZE
 
     def test_warms_instrument_specs_for_known_products(self, adapter, mock_ccxt_client):
         mock_ccxt_client.load_markets.return_value = {
