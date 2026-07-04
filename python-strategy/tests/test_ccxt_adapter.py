@@ -145,6 +145,82 @@ class TestPlaceOrder:
         assert spec.fee_model is None
         assert spec.session_calendar_id is None
 
+    def test_fetches_instrument_spec_from_ccxt_precision(
+        self, adapter, mock_ccxt_client
+    ):
+        mock_ccxt_client.load_markets.return_value = {
+            "BTC/USDT:USDT": {
+                "precision": {
+                    "amount": 3,
+                    "price": "0.10",
+                },
+                "limits": {
+                    "amount": {"min": "0.001"},
+                    "cost": {"min": "5"},
+                },
+            },
+        }
+
+        spec = adapter.get_instrument_spec("BYBIT:BTCUSDT-PERP")
+
+        assert spec.quantity_step == Decimal("0.001")
+        assert spec.price_tick == Decimal("0.10")
+        assert spec.min_quantity == Decimal("0.001")
+        assert spec.min_notional == Decimal("5")
+
+    def test_fetches_instrument_spec_from_bybit_filters(
+        self, adapter, mock_ccxt_client
+    ):
+        mock_ccxt_client.load_markets.return_value = {
+            "BTC/USDT:USDT": {
+                "info": {
+                    "lotSizeFilter": {
+                        "qtyStep": "0.001",
+                        "minOrderQty": "0.001",
+                        "minNotionalValue": "5",
+                    },
+                    "priceFilter": {
+                        "tickSize": "0.10",
+                    },
+                },
+            },
+        }
+
+        spec = adapter.get_instrument_spec("BYBIT:BTCUSDT-PERP")
+
+        assert spec.quantity_step == Decimal("0.001")
+        assert spec.price_tick == Decimal("0.10")
+        assert spec.min_quantity == Decimal("0.001")
+        assert spec.min_notional == Decimal("5")
+
+    def test_quantizes_order_from_non_binance_precision(self, adapter, mock_ccxt_client):
+        mock_ccxt_client.load_markets.return_value = {
+            "BTC/USDT:USDT": {
+                "precision": {
+                    "amount": "0.001",
+                    "price": "0.10",
+                },
+                "limits": {
+                    "cost": {"min": "10"},
+                },
+            },
+        }
+        mock_ccxt_client.create_order.return_value = {"id": "EX-BYBIT"}
+        order = _make_order(
+            product_id="BYBIT:BTCUSDT-PERP",
+            type="limit",
+            quantity=Decimal("0.0109"),
+            price=Decimal("50123.456"),
+        )
+
+        adapter.place_order(order)
+
+        call_kwargs = mock_ccxt_client.create_order.call_args
+        assert order.quantity == Decimal("0.010")
+        assert order.price == Decimal("50123.40")
+        assert call_kwargs.kwargs["amount"] == "0.010"
+        assert call_kwargs.kwargs["price"] == "50123.40"
+
     def test_warms_instrument_specs_for_known_products(self, adapter, mock_ccxt_client):
         mock_ccxt_client.load_markets.return_value = {
             "BTC/USDT:USDT": {

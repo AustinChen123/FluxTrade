@@ -216,20 +216,53 @@ def instrument_spec_from_ccxt_market(
         cost_limits = limits.get("cost") or {}
         min_quantity = _decimal_or_none(amount_limits.get("min"))
         min_notional = _decimal_or_none(cost_limits.get("min"))
+        precision = market.get("precision") or {}
+        if isinstance(precision, dict):
+            quantity_step = _step_from_precision(precision.get("amount"))
+            price_tick = _step_from_precision(precision.get("price"))
 
         info = market.get("info") or {}
-        filters = info.get("filters") or []
+        if isinstance(info, dict):
+            lot_size_filter = info.get("lotSizeFilter") or {}
+            if isinstance(lot_size_filter, dict):
+                quantity_step = _decimal_or_none(
+                    lot_size_filter.get("qtyStep"),
+                    fallback=quantity_step,
+                )
+                min_quantity = _decimal_or_none(
+                    lot_size_filter.get("minOrderQty"),
+                    fallback=min_quantity,
+                )
+                min_notional = _decimal_or_none(
+                    lot_size_filter.get("minNotionalValue"),
+                    fallback=min_notional,
+                )
+            price_filter = info.get("priceFilter") or {}
+            if isinstance(price_filter, dict):
+                price_tick = _decimal_or_none(
+                    price_filter.get("tickSize"),
+                    fallback=price_tick,
+                )
+
+        filters = info.get("filters") if isinstance(info, dict) else []
+        filters = filters or []
         if isinstance(filters, list):
             for exchange_filter in filters:
                 filter_type = exchange_filter.get("filterType")
                 if filter_type == "LOT_SIZE":
-                    quantity_step = _decimal_or_none(exchange_filter.get("stepSize"))
+                    quantity_step = _decimal_or_none(
+                        exchange_filter.get("stepSize"),
+                        fallback=quantity_step,
+                    )
                     min_quantity = _decimal_or_none(
                         exchange_filter.get("minQty"),
                         fallback=min_quantity,
                     )
                 elif filter_type == "PRICE_FILTER":
-                    price_tick = _decimal_or_none(exchange_filter.get("tickSize"))
+                    price_tick = _decimal_or_none(
+                        exchange_filter.get("tickSize"),
+                        fallback=price_tick,
+                    )
                 elif filter_type in {"MIN_NOTIONAL", "NOTIONAL"}:
                     min_notional = _decimal_or_none(
                         exchange_filter.get("minNotional")
@@ -330,6 +363,25 @@ def _require_on_step(label: str, value: Decimal, step: Decimal | None) -> Decima
     if step is None or step <= 0 or _floor_to_step(value, step) == value:
         return value
     raise ValueError(f"{label}_off_tick: {label}={value} tick={step}")
+
+
+def _step_from_precision(value: Any) -> Decimal | None:
+    if value is None or value == "":
+        return None
+    if isinstance(value, int):
+        if value < 0:
+            return None
+        return Decimal(1).scaleb(-value)
+
+    text = str(value)
+    decimal = Decimal(text)
+    if decimal <= 0:
+        return None
+    if decimal < 1:
+        return decimal
+    if decimal == decimal.to_integral_value() and "." not in text and "e" not in text.lower():
+        return Decimal(1).scaleb(-int(decimal))
+    return decimal
 
 
 def _decimal_or_none(value: Any, fallback: Decimal | None = None) -> Decimal | None:
