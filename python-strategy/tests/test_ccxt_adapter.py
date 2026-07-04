@@ -1,12 +1,16 @@
 """Tests for CcxtExchangeAdapter and adapter factory."""
 
 from decimal import Decimal
-from unittest.mock import MagicMock, patch
+from unittest.mock import MagicMock, call, patch
 
 import pytest
 
 from src.core.adapters import create_adapter
-from src.core.adapters.ccxt_adapter import CcxtExchangeAdapter
+from src.core.adapters.ccxt_adapter import (
+    AccountInitializationConfig,
+    AccountPositionMode,
+    CcxtExchangeAdapter,
+)
 from src.core.adapters.live_binance import LiveBinanceAdapter
 from src.core.adapters.simulated import SimulatedAdapter
 from src.core.client_order_id import to_exchange_format
@@ -1037,6 +1041,253 @@ class TestCreateAdapter:
         assert isinstance(adapter, CcxtExchangeAdapter)
         assert adapter.get_instrument_spec("BYBIT:BTCUSDT-PERP").quantity_step == Decimal("0.001")
         client.load_markets.assert_called_once()
+
+    def test_live_adapter_initializes_account_before_warming_specs(self):
+        with patch("src.core.adapters.ccxt_adapter.ccxt") as mock_ccxt:
+            mock_ccxt.BaseError = Exception
+            mock_cls = MagicMock()
+            client = MagicMock()
+            client.fetch_position_mode.side_effect = Exception(
+                "bybit fetchPositionMode() is not supported yet"
+            )
+            client.fetch_leverage.return_value = {
+                "longLeverage": 3,
+                "shortLeverage": 3,
+                "marginMode": "isolated",
+            }
+            client.fetch_margin_mode.return_value = {"marginMode": "isolated"}
+            client.load_markets.return_value = {
+                "BTC/USDT:USDT": {
+                    "info": {
+                        "filters": [
+                            {"filterType": "LOT_SIZE", "stepSize": "0.001"},
+                        ],
+                    },
+                },
+            }
+            mock_cls.return_value = client
+            mock_ccxt.bybit = mock_cls
+            setattr(mock_ccxt, "bybit", mock_cls)
+
+            adapter = create_adapter({
+                "mode": "live",
+                "exchange": "bybit",
+                "api_key": "k",
+                "secret": "s",
+                "instrument_product_ids": ["BYBIT:BTCUSDT-PERP"],
+                "account_initialization": {
+                    "leverage": 3,
+                    "margin_mode": "isolated",
+                    "position_mode": "one_way",
+                },
+            })
+
+        assert isinstance(adapter, CcxtExchangeAdapter)
+        assert (
+            client.mock_calls.index(call.load_markets())
+            < client.mock_calls.index(call.set_position_mode(False, "BTC/USDT:USDT"))
+        )
+        client.set_position_mode.assert_called_once_with(False, "BTC/USDT:USDT")
+        client.fetch_position_mode.assert_called_once_with("BTC/USDT:USDT")
+        client.set_margin_mode.assert_called_once_with(
+            "isolated",
+            "BTC/USDT:USDT",
+            {"leverage": "3"},
+        )
+        client.set_leverage.assert_called_once_with(3, "BTC/USDT:USDT")
+        client.fetch_leverage.assert_called_once_with("BTC/USDT:USDT")
+        client.fetch_margin_mode.assert_called_once_with("BTC/USDT:USDT")
+
+    def test_bybit_account_initialization_allows_unsupported_position_mode_fetch(
+        self,
+    ):
+        with patch("src.core.adapters.ccxt_adapter.ccxt") as mock_ccxt:
+            mock_ccxt.BaseError = Exception
+            mock_cls = MagicMock()
+            client = MagicMock()
+            client.fetch_position_mode.side_effect = Exception(
+                "bybit fetchPositionMode() is not supported yet"
+            )
+            client.fetch_leverage.return_value = {
+                "longLeverage": 3,
+                "shortLeverage": 3,
+                "marginMode": "cross",
+            }
+            client.fetch_margin_mode.return_value = {"marginMode": "cross"}
+            client.load_markets.return_value = {
+                "BTC/USDT:USDT": {
+                    "info": {
+                        "filters": [
+                            {"filterType": "LOT_SIZE", "stepSize": "0.001"},
+                        ],
+                    },
+                },
+            }
+            mock_cls.return_value = client
+            mock_ccxt.bybit = mock_cls
+            setattr(mock_ccxt, "bybit", mock_cls)
+
+            adapter = create_adapter({
+                "mode": "live",
+                "exchange": "bybit",
+                "api_key": "k",
+                "secret": "s",
+                "instrument_product_ids": ["BYBIT:BTCUSDT-PERP"],
+                "account_initialization": {
+                    "leverage": 3,
+                    "margin_mode": "cross",
+                    "position_mode": "one_way",
+                },
+            })
+
+        assert isinstance(adapter, CcxtExchangeAdapter)
+        client.set_position_mode.assert_called_once_with(False, "BTC/USDT:USDT")
+        client.fetch_position_mode.assert_called_once_with("BTC/USDT:USDT")
+        client.set_margin_mode.assert_called_once_with(
+            "cross",
+            "BTC/USDT:USDT",
+            {"leverage": "3"},
+        )
+        client.set_leverage.assert_called_once_with(3, "BTC/USDT:USDT")
+
+    def test_bybit_account_initialization_allows_unsupported_margin_mode_verification(
+        self,
+    ):
+        with patch("src.core.adapters.ccxt_adapter.ccxt") as mock_ccxt:
+            mock_ccxt.BaseError = Exception
+            mock_cls = MagicMock()
+            client = MagicMock()
+            client.fetch_position_mode.side_effect = Exception(
+                "bybit fetchPositionMode() is not supported yet"
+            )
+            client.fetch_margin_mode.side_effect = Exception(
+                "bybit fetchMarginMode() is not supported yet"
+            )
+            client.fetch_leverage.return_value = {
+                "longLeverage": 3,
+                "shortLeverage": 3,
+                "marginMode": None,
+            }
+            client.load_markets.return_value = {
+                "BTC/USDT:USDT": {
+                    "info": {
+                        "filters": [
+                            {"filterType": "LOT_SIZE", "stepSize": "0.001"},
+                        ],
+                    },
+                },
+            }
+            mock_cls.return_value = client
+            mock_ccxt.bybit = mock_cls
+            setattr(mock_ccxt, "bybit", mock_cls)
+
+            adapter = create_adapter({
+                "mode": "live",
+                "exchange": "bybit",
+                "api_key": "k",
+                "secret": "s",
+                "instrument_product_ids": ["BYBIT:BTCUSDT-PERP"],
+                "account_initialization": {
+                    "leverage": 3,
+                    "margin_mode": "cross",
+                    "position_mode": "one_way",
+                },
+            })
+
+        assert isinstance(adapter, CcxtExchangeAdapter)
+        client.set_margin_mode.assert_called_once_with(
+            "cross",
+            "BTC/USDT:USDT",
+            {"leverage": "3"},
+        )
+        client.fetch_margin_mode.assert_called_once_with("BTC/USDT:USDT")
+        assert client.fetch_leverage.call_count == 2
+
+    def test_live_adapter_rejects_when_position_mode_not_one_way(self):
+        with patch("src.core.adapters.ccxt_adapter.ccxt") as mock_ccxt:
+            mock_cls = MagicMock()
+            client = MagicMock()
+            client.fetch_position_mode.return_value = {"hedged": True}
+            mock_cls.return_value = client
+            mock_ccxt.binance = mock_cls
+            setattr(mock_ccxt, "binance", mock_cls)
+
+            with pytest.raises(ExchangeError, match="account_position_mode_not_one_way"):
+                create_adapter({
+                    "mode": "live",
+                    "exchange": "binance",
+                    "api_key": "k",
+                    "secret": "s",
+                    "instrument_product_ids": ["BINANCE:BTCUSDT-PERP"],
+                    "account_initialization": {
+                        "leverage": 2,
+                        "margin_mode": "cross",
+                    },
+                })
+
+        client.set_margin_mode.assert_not_called()
+        client.set_leverage.assert_not_called()
+
+    def test_live_adapter_rejects_when_leverage_verification_fails(self):
+        with patch("src.core.adapters.ccxt_adapter.ccxt") as mock_ccxt:
+            mock_cls = MagicMock()
+            client = MagicMock()
+            client.fetch_position_mode.return_value = {"hedged": False}
+            client.fetch_leverage.return_value = {
+                "longLeverage": 1,
+                "shortLeverage": 1,
+            }
+            mock_cls.return_value = client
+            mock_ccxt.binance = mock_cls
+            setattr(mock_ccxt, "binance", mock_cls)
+
+            with pytest.raises(ExchangeError, match="account_leverage_not_configured"):
+                create_adapter({
+                    "mode": "live",
+                    "exchange": "binance",
+                    "api_key": "k",
+                    "secret": "s",
+                    "instrument_product_ids": ["BINANCE:BTCUSDT-PERP"],
+                    "account_initialization": {
+                        "leverage": 2,
+                    },
+                })
+
+        client.set_leverage.assert_called_once_with(2, "BTC/USDT:USDT")
+
+    def test_account_initialization_config_requires_product_ids(self):
+        with pytest.raises(ExchangeError, match="account_initialization_requires_products"):
+            AccountInitializationConfig.from_config(
+                {"leverage": 2},
+                default_product_ids=[],
+            )
+
+    def test_account_initialization_config_rejects_hedge_mode(self):
+        with pytest.raises(ExchangeError, match="unsupported_account_position_mode"):
+            AccountInitializationConfig.from_config(
+                {
+                    "product_ids": ["BINANCE:BTCUSDT-PERP"],
+                    "position_mode": "hedge",
+                },
+                default_product_ids=[],
+            )
+
+    def test_account_initialization_config_accepts_one_way(self):
+        config = AccountInitializationConfig.from_config(
+            {
+                "product_ids": ["BINANCE:BTCUSDT-PERP"],
+                "leverage": "5",
+                "margin_mode": "cross",
+                "position_mode": "one_way",
+            },
+            default_product_ids=[],
+        )
+
+        assert config is not None
+        assert config.product_ids == ("BINANCE:BTCUSDT-PERP",)
+        assert config.leverage == 5
+        assert config.margin_mode == "cross"
+        assert config.position_mode == AccountPositionMode.ONE_WAY
 
     def test_live_binance_with_ws(self):
         with patch("src.core.adapters.ccxt_adapter.ccxt") as mock_ccxt, \

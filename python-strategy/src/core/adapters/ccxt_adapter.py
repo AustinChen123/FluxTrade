@@ -7,7 +7,9 @@ implement IExchangeAdapter and only wrapped create_order.
 
 import logging
 import os
+from dataclasses import dataclass
 from decimal import Decimal
+from enum import Enum
 from typing import Optional
 
 import ccxt
@@ -32,6 +34,76 @@ from src.core.product_registry import (
 )
 
 logger = logging.getLogger(__name__)
+
+
+class AccountPositionMode(str, Enum):
+    ONE_WAY = "one_way"
+
+
+@dataclass(frozen=True)
+class AccountInitializationConfig:
+    """Live account settings that must be applied before trading starts."""
+
+    product_ids: tuple[str, ...]
+    leverage: int | None = None
+    margin_mode: str | None = None
+    position_mode: AccountPositionMode = AccountPositionMode.ONE_WAY
+
+    @classmethod
+    def from_config(
+        cls,
+        raw_config: dict | None,
+        *,
+        default_product_ids: list[str],
+    ) -> "AccountInitializationConfig | None":
+        if not raw_config:
+            return None
+
+        product_ids = tuple(
+            raw_config.get("product_ids")
+            or raw_config.get("instrument_product_ids")
+            or default_product_ids
+        )
+        if not product_ids:
+            raise ExchangeError(
+                "account_initialization_requires_products: "
+                "configure account_initialization.product_ids or instrument_product_ids"
+            )
+
+        position_mode = raw_config.get("position_mode", AccountPositionMode.ONE_WAY.value)
+        if position_mode != AccountPositionMode.ONE_WAY.value:
+            raise ExchangeError(
+                "unsupported_account_position_mode: "
+                f"position_mode={position_mode}"
+            )
+
+        leverage = raw_config.get("leverage")
+        if leverage is not None:
+            try:
+                leverage = int(leverage)
+            except (TypeError, ValueError) as e:
+                raise ExchangeError(
+                    f"invalid_account_leverage: leverage={leverage}"
+                ) from e
+            if leverage < 1:
+                raise ExchangeError(
+                    f"invalid_account_leverage: leverage={leverage}"
+                )
+
+        margin_mode = raw_config.get("margin_mode")
+        if margin_mode is not None:
+            margin_mode = str(margin_mode).lower()
+            if margin_mode not in {"cross", "isolated"}:
+                raise ExchangeError(
+                    f"invalid_account_margin_mode: margin_mode={margin_mode}"
+                )
+
+        return cls(
+            product_ids=product_ids,
+            leverage=leverage,
+            margin_mode=margin_mode,
+            position_mode=AccountPositionMode.ONE_WAY,
+        )
 
 
 class CcxtExchangeAdapter(IExchangeAdapter):
@@ -188,6 +260,247 @@ class CcxtExchangeAdapter(IExchangeAdapter):
         """Fetch and cache instrument specs for known live products."""
         for product_id in product_ids:
             self.get_instrument_spec(product_id)
+
+    def initialize_account(self, config: AccountInitializationConfig) -> None:
+        """Apply fail-safe account settings before live trading starts.
+
+        CCXT source defines set_position_mode(hedged=False) as one-way mode for
+        Binance and Bybit; fetch_position_mode() returns ``hedged`` for
+        verification on those venues.
+        """
+        try:
+            self.client.load_markets()
+        except ccxt.BaseError as e:
+            raise ExchangeError(
+                f"account_initialization_load_markets_failed: {e}"
+            ) from e
+
+        for product_id in config.product_ids:
+            symbol = to_ccxt_symbol(product_id)
+            self._ensure_one_way_position_mode(symbol)
+            margin_mode_accepted = False
+            if config.margin_mode is not None:
+                margin_mode_accepted = self._set_margin_mode(
+                    config.margin_mode,
+                    symbol,
+                    config,
+                )
+            if config.leverage is not None:
+                self._set_leverage(config.leverage, symbol)
+                self._verify_leverage(config.leverage, symbol)
+            if config.margin_mode is not None:
+                self._verify_margin_mode(
+                    config.margin_mode,
+                    symbol,
+                    allow_unsupported=margin_mode_accepted,
+                )
+
+    def _ensure_one_way_position_mode(self, symbol: str) -> None:
+        set_position_mode = getattr(self.client, "set_position_mode", None)
+        if not callable(set_position_mode):
+            raise ExchangeError(
+                "account_position_mode_unsupported: "
+                f"exchange={self.exchange_id}"
+            )
+        set_accepted = False
+        try:
+            set_position_mode(False, symbol)
+            set_accepted = True
+        except ccxt.BaseError as e:
+            if not self._is_account_setting_no_change_error(e):
+                raise ExchangeError(
+                    f"account_position_mode_set_failed: symbol={symbol} error={e}"
+                ) from e
+            set_accepted = True
+
+        fetch_position_mode = getattr(self.client, "fetch_position_mode", None)
+        if not callable(fetch_position_mode):
+            if set_accepted:
+                return
+            raise ExchangeError(
+                "account_position_mode_verification_unsupported: "
+                f"exchange={self.exchange_id}"
+            )
+        try:
+            result = fetch_position_mode(symbol)
+        except ccxt.BaseError as e:
+            if set_accepted and self._is_position_mode_verification_unsupported(e):
+                return
+            raise ExchangeError(
+                f"account_position_mode_verify_failed: symbol={symbol} error={e}"
+            ) from e
+
+        hedged = result.get("hedged") if isinstance(result, dict) else None
+        if hedged is not False:
+            raise ExchangeError(
+                "account_position_mode_not_one_way: "
+                f"symbol={symbol} hedged={hedged}"
+            )
+
+    def _set_margin_mode(
+        self,
+        margin_mode: str,
+        symbol: str,
+        config: AccountInitializationConfig,
+    ) -> bool:
+        set_margin_mode = getattr(self.client, "set_margin_mode", None)
+        if not callable(set_margin_mode):
+            raise ExchangeError(
+                f"account_margin_mode_unsupported: exchange={self.exchange_id}"
+            )
+        params = {}
+        if config.leverage is not None:
+            params["leverage"] = str(config.leverage)
+        try:
+            set_margin_mode(margin_mode, symbol, params)
+        except ccxt.BaseError as e:
+            if not self._is_account_setting_no_change_error(e):
+                raise ExchangeError(
+                    f"account_margin_mode_set_failed: symbol={symbol} error={e}"
+                ) from e
+        return True
+
+    def _set_leverage(self, leverage: int, symbol: str) -> None:
+        set_leverage = getattr(self.client, "set_leverage", None)
+        if not callable(set_leverage):
+            raise ExchangeError(
+                f"account_leverage_unsupported: exchange={self.exchange_id}"
+            )
+        try:
+            set_leverage(leverage, symbol)
+        except ccxt.BaseError as e:
+            if not self._is_account_setting_no_change_error(e):
+                raise ExchangeError(
+                    f"account_leverage_set_failed: symbol={symbol} error={e}"
+                ) from e
+
+    def _verify_leverage(self, expected_leverage: int, symbol: str) -> None:
+        leverage = self._fetch_leverage_value(symbol)
+        if leverage != expected_leverage:
+            raise ExchangeError(
+                "account_leverage_not_configured: "
+                f"symbol={symbol} expected={expected_leverage} actual={leverage}"
+            )
+
+    def _verify_margin_mode(
+        self,
+        expected_margin_mode: str,
+        symbol: str,
+        *,
+        allow_unsupported: bool,
+    ) -> None:
+        try:
+            margin_mode = self._fetch_margin_mode_value(symbol)
+        except ExchangeError as e:
+            if allow_unsupported and str(e).startswith(
+                "account_margin_mode_verification_unsupported"
+            ):
+                self.logger.warning(
+                    "Margin mode verification unsupported for %s on %s after accepted set_margin_mode",
+                    symbol,
+                    self.exchange_id,
+                )
+                return
+            raise
+        if margin_mode != expected_margin_mode:
+            raise ExchangeError(
+                "account_margin_mode_not_configured: "
+                f"symbol={symbol} expected={expected_margin_mode} actual={margin_mode}"
+            )
+
+    def _fetch_leverage_value(self, symbol: str) -> int | None:
+        fetch_leverage = getattr(self.client, "fetch_leverage", None)
+        if callable(fetch_leverage):
+            try:
+                leverage = self._leverage_value_from_result(fetch_leverage(symbol))
+                if leverage is not None:
+                    return leverage
+            except ccxt.BaseError:
+                pass
+
+        fetch_leverages = getattr(self.client, "fetch_leverages", None)
+        if callable(fetch_leverages):
+            try:
+                leverages = fetch_leverages([symbol])
+                result = leverages.get(symbol) if isinstance(leverages, dict) else None
+                leverage = self._leverage_value_from_result(result)
+                if leverage is not None:
+                    return leverage
+            except ccxt.BaseError:
+                pass
+
+        raise ExchangeError(
+            "account_leverage_verification_unsupported: "
+            f"exchange={self.exchange_id}"
+        )
+
+    @staticmethod
+    def _leverage_value_from_result(result) -> int | None:
+        if not isinstance(result, dict):
+            return None
+        long_leverage = result.get("longLeverage")
+        short_leverage = result.get("shortLeverage")
+        if long_leverage is not None and short_leverage is not None:
+            if int(long_leverage) == int(short_leverage):
+                return int(long_leverage)
+            return None
+        leverage = result.get("leverage")
+        return int(leverage) if leverage is not None else None
+
+    def _fetch_margin_mode_value(self, symbol: str) -> str | None:
+        fetch_margin_mode = getattr(self.client, "fetch_margin_mode", None)
+        if callable(fetch_margin_mode):
+            try:
+                margin_mode = self._margin_mode_from_result(fetch_margin_mode(symbol))
+                if margin_mode is not None:
+                    return margin_mode
+            except ccxt.BaseError:
+                pass
+
+        fetch_leverage = getattr(self.client, "fetch_leverage", None)
+        if callable(fetch_leverage):
+            try:
+                margin_mode = self._margin_mode_from_result(fetch_leverage(symbol))
+                if margin_mode is not None:
+                    return margin_mode
+            except ccxt.BaseError:
+                pass
+
+        raise ExchangeError(
+            "account_margin_mode_verification_unsupported: "
+            f"exchange={self.exchange_id}"
+        )
+
+    @staticmethod
+    def _margin_mode_from_result(result) -> str | None:
+        if not isinstance(result, dict):
+            return None
+        margin_mode = result.get("marginMode") or result.get("marginType")
+        return str(margin_mode).lower() if margin_mode is not None else None
+
+    @staticmethod
+    def _is_account_setting_no_change_error(error: ccxt.BaseError) -> bool:
+        message = str(error).lower()
+        return (
+            "no need to change" in message
+            or "not modified" in message
+            or "-4059" in message
+            or "110025" in message
+            or "110026" in message
+            or "110043" in message
+            or "140025" in message
+            or "140026" in message
+            or "140043" in message
+            or "34036" in message
+        )
+
+    @staticmethod
+    def _is_position_mode_verification_unsupported(error: ccxt.BaseError) -> bool:
+        message = str(error).lower()
+        return (
+            "fetchpositionmode" in message
+            and "not supported" in message
+        )
 
     def _quantize_order(self, order: Order) -> None:
         spec = self.get_instrument_spec(order.product_id)

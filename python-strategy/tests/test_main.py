@@ -1,5 +1,7 @@
 from unittest.mock import MagicMock, patch
 
+import pytest
+
 from src import main as strategy_main
 
 
@@ -11,8 +13,55 @@ def test_env_flag_parses_truthy_values(monkeypatch) -> None:
     assert strategy_main._env_flag("AUDIT_EXTERNAL_ORDERS") is False
 
 
+def test_adapter_config_from_env_defaults_to_simulated(monkeypatch) -> None:
+    monkeypatch.delenv("ADAPTER_MODE", raising=False)
+    monkeypatch.delenv("EXCHANGE_MODE", raising=False)
+
+    assert strategy_main._adapter_config_from_env() == {"mode": "simulated"}
+
+
+def test_adapter_config_from_env_wires_live_account_initialization(monkeypatch) -> None:
+    monkeypatch.setenv("ADAPTER_MODE", "live")
+    monkeypatch.setenv("EXCHANGE_ID", "binance")
+    monkeypatch.setenv("EXCHANGE_API_KEY", "key")
+    monkeypatch.setenv("EXCHANGE_SECRET", "secret")
+    monkeypatch.setenv("EXCHANGE_TESTNET", "true")
+    monkeypatch.setenv("EXCHANGE_ENABLE_WS", "false")
+    monkeypatch.setenv("INSTRUMENT_PRODUCT_IDS", "BINANCE:BTCUSDT-PERP")
+    monkeypatch.setenv("ACCOUNT_LEVERAGE", "3")
+    monkeypatch.setenv("ACCOUNT_MARGIN_MODE", "isolated")
+    monkeypatch.setenv("ACCOUNT_POSITION_MODE", "one_way")
+
+    config = strategy_main._adapter_config_from_env()
+
+    assert config == {
+        "mode": "live",
+        "exchange": "binance",
+        "api_key": "key",
+        "secret": "secret",
+        "testnet": True,
+        "enable_ws": False,
+        "instrument_product_ids": ["BINANCE:BTCUSDT-PERP"],
+        "account_initialization": {
+            "product_ids": ["BINANCE:BTCUSDT-PERP"],
+            "position_mode": "one_way",
+            "leverage": "3",
+            "margin_mode": "isolated",
+        },
+    }
+
+
+def test_adapter_config_from_env_rejects_unknown_mode(monkeypatch) -> None:
+    monkeypatch.setenv("ADAPTER_MODE", "simulation")
+
+    with pytest.raises(ValueError, match="unsupported_adapter_mode"):
+        strategy_main._adapter_config_from_env()
+
+
 def test_main_wires_session_factory_and_audit_flag(monkeypatch) -> None:
     monkeypatch.setenv("AUDIT_EXTERNAL_ORDERS", "true")
+    monkeypatch.delenv("ADAPTER_MODE", raising=False)
+    monkeypatch.delenv("EXCHANGE_MODE", raising=False)
     db_session = MagicMock()
     engine = MagicMock()
     engine.build_stream_channels.return_value = []
@@ -27,6 +76,7 @@ def test_main_wires_session_factory_and_audit_flag(monkeypatch) -> None:
 
     kwargs = engine_cls.call_args.kwargs
     assert kwargs["db_session"] is db_session
+    assert kwargs["adapter_config"] == {"mode": "simulated"}
     assert callable(kwargs["db_session_factory"])
     assert kwargs["audit_external_orders"] is True
     consumer.start.assert_called_once()
