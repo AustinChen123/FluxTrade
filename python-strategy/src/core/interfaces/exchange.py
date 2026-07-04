@@ -33,6 +33,26 @@ class ExchangeOrderSnapshot:
     fee: Optional[Decimal] = None
     raw: Optional[dict[str, Any]] = None
 
+
+@dataclass(frozen=True)
+class ExchangeOrderEvent:
+    """Adapter-neutral live order event from user-data streams or polling."""
+
+    status: str
+    product_id: str
+    client_order_id: Optional[str] = None
+    exchange_order_id: Optional[str] = None
+    cumulative_filled_quantity: Optional[Decimal] = None
+    cumulative_average_price: Optional[Decimal] = None
+    last_fill_quantity: Optional[Decimal] = None
+    last_fill_price: Optional[Decimal] = None
+    fee: Optional[Decimal] = None
+    fee_asset: Optional[str] = None
+    event_timestamp: Optional[int] = None
+    reason: Optional[str] = None
+    raw: Optional[dict[str, Any]] = None
+
+
 class IExchangeAdapter(ABC):
     """
     Interface for exchange adapters (Real and Simulated).
