@@ -68,6 +68,7 @@ class ExecutionEngine:
             OrderStatus.NEW.value,
             OrderStatus.SUBMITTED_UNCONFIRMED.value,
             OrderStatus.SUBMITTED.value,
+            OrderStatus.PARTIALLY_FILLED.value,
         }
         return self.order_manager.repo.list_client_orders_by_statuses(statuses)
 
@@ -351,30 +352,14 @@ class ExecutionEngine:
         if snapshot.filled_quantity is None or snapshot.filled_quantity <= 0:
             return None
         local_filled_quantity = order.filled_quantity or Decimal("0")
-        fill_delta = snapshot.filled_quantity - local_filled_quantity
-        if fill_delta <= 0:
-            return {
-                "quantity": fill_delta,
-                "price": snapshot.average_price,
-                "fee": None,
-            }
-        if snapshot.average_price is None:
-            return {"quantity": fill_delta, "price": None, "fee": None}
-        if local_filled_quantity <= 0:
-            return {
-                "quantity": fill_delta,
-                "price": snapshot.average_price,
-                "fee": snapshot.fee,
-            }
-
-        local_average_price = order.filled_price
-        if local_average_price is None or local_average_price <= 0:
-            return {"quantity": fill_delta, "price": None, "fee": None}
-
-        exchange_notional = snapshot.filled_quantity * snapshot.average_price
-        local_notional = local_filled_quantity * local_average_price
-        delta_price = (exchange_notional - local_notional) / fill_delta
-        return {"quantity": fill_delta, "price": delta_price, "fee": None}
+        fill_delta = self._fill_delta_from_cumulative(
+            local_filled=local_filled_quantity,
+            local_average_price=order.filled_price,
+            cumulative_filled=snapshot.filled_quantity,
+            cumulative_average_price=snapshot.average_price,
+        )
+        fill_delta["fee"] = snapshot.fee if local_filled_quantity <= 0 else None
+        return fill_delta
 
     def _classify_fill_delta(
         self,
@@ -503,6 +488,12 @@ class ExecutionEngine:
                 "order_id": order.id,
                 "status": event.status,
             }
+        if self._has_non_idempotent_last_fill_only(event):
+            return {
+                "action": "unresolved_last_fill_without_cumulative_quantity",
+                "order_id": order.id,
+                "status": event.status,
+            }
 
         fill_delta = self._exchange_order_event_fill_delta(order, event)
         if fill_delta["quantity"] < 0:
@@ -514,6 +505,27 @@ class ExecutionEngine:
         if fill_delta["quantity"] > 0 and fill_delta["price"] is None:
             return {
                 "action": "unresolved_missing_fill_price",
+                "order_id": order.id,
+                "status": event.status,
+            }
+        if self._event_fill_exceeds_order_quantity(order, event):
+            return {
+                "action": "unresolved_exchange_fill_exceeds_order_quantity",
+                "order_id": order.id,
+                "status": event.status,
+            }
+        if (
+            fill_delta["quantity"] == 0
+            and self._requires_terminal_fill_quantity(order, event, event_state)
+        ):
+            return {
+                "action": "unresolved_missing_terminal_fill_quantity",
+                "order_id": order.id,
+                "status": event.status,
+            }
+        if self._terminal_event_underfills_order(order, event, event_state, fill_delta):
+            return {
+                "action": "unresolved_terminal_fill_quantity_below_order_quantity",
                 "order_id": order.id,
                 "status": event.status,
             }
@@ -542,7 +554,7 @@ class ExecutionEngine:
                     fill_delta["quantity"],
                 )
         else:
-            self._apply_exchange_order_event_status(order, event_state)
+            self._apply_exchange_order_event_status(order, event_state, event)
 
         return {
             "action": "applied",
@@ -560,10 +572,19 @@ class ExecutionEngine:
             if order is not None:
                 return order
         if event.exchange_order_id:
+            exchange_id = self._exchange_id_for_order_event(event)
             return self.order_manager.repo.get_order_by_exchange_order_id(
-                event.exchange_order_id
+                event.exchange_order_id,
+                exchange_id=exchange_id,
+                product_id=event.product_id,
             )
         return None
+
+    @staticmethod
+    def _exchange_id_for_order_event(event: ExchangeOrderEvent) -> str | None:
+        if ":" not in event.product_id:
+            return None
+        return event.product_id.split(":", 1)[0]
 
     @staticmethod
     def _classify_exchange_order_event_status(status: str) -> str:
@@ -610,8 +631,6 @@ class ExecutionEngine:
     ) -> dict[str, Decimal | None]:
         local_filled = order.filled_quantity or Decimal("0")
         cumulative = event.cumulative_filled_quantity
-        if cumulative is None and event.last_fill_quantity is not None:
-            cumulative = local_filled + event.last_fill_quantity
         if cumulative is None:
             return {"quantity": Decimal("0"), "price": None}
 
@@ -620,15 +639,127 @@ class ExecutionEngine:
             return {"quantity": delta, "price": None}
 
         price = None
-        if event.last_fill_price is not None:
+        if (
+            event.last_fill_price is not None
+            and event.last_fill_quantity == delta
+        ):
             price = event.last_fill_price
         elif event.cumulative_average_price is not None:
-            price = event.cumulative_average_price
+            price = self._fill_delta_from_cumulative(
+                local_filled=local_filled,
+                local_average_price=order.filled_price,
+                cumulative_filled=cumulative,
+                cumulative_average_price=event.cumulative_average_price,
+            )["price"]
         return {"quantity": delta, "price": price}
 
-    def _apply_exchange_order_event_status(self, order, event_state: str) -> None:
+    @staticmethod
+    def _has_non_idempotent_last_fill_only(event: ExchangeOrderEvent) -> bool:
+        return (
+            event.cumulative_filled_quantity is None
+            and event.last_fill_quantity is not None
+            and event.last_fill_quantity > 0
+        )
+
+    @staticmethod
+    def _fill_delta_from_cumulative(
+        *,
+        local_filled: Decimal,
+        local_average_price: Decimal | None,
+        cumulative_filled: Decimal,
+        cumulative_average_price: Decimal | None,
+    ) -> dict[str, Decimal | None]:
+        delta = cumulative_filled - local_filled
+        if delta <= 0:
+            return {"quantity": delta, "price": cumulative_average_price}
+        if cumulative_average_price is None:
+            return {"quantity": delta, "price": None}
+        return {
+            "quantity": delta,
+            "price": ExecutionEngine._delta_price_from_cumulative_average(
+                local_filled=local_filled,
+                local_average_price=local_average_price,
+                cumulative_filled=cumulative_filled,
+                cumulative_average_price=cumulative_average_price,
+                delta=delta,
+            ),
+        }
+
+    @staticmethod
+    def _delta_price_from_cumulative_average(
+        *,
+        local_filled: Decimal,
+        local_average_price: Decimal | None,
+        cumulative_filled: Decimal,
+        cumulative_average_price: Decimal,
+        delta: Decimal,
+    ) -> Decimal | None:
+        if local_filled <= 0:
+            return cumulative_average_price
+        if local_average_price is None or local_average_price <= 0:
+            return None
+        cumulative_cost = cumulative_filled * cumulative_average_price
+        local_cost = local_filled * local_average_price
+        return (cumulative_cost - local_cost) / delta
+
+    @staticmethod
+    def _requires_terminal_fill_quantity(
+        order,
+        event: ExchangeOrderEvent,
+        event_state: str,
+    ) -> bool:
+        if event_state not in {"filled", "liquidated"}:
+            return False
+        has_fill_quantity = (
+            event.cumulative_filled_quantity is not None
+            or (
+                event.last_fill_quantity is not None
+                and event.last_fill_quantity > 0
+            )
+        )
+        if has_fill_quantity:
+            return False
+        local_filled = order.filled_quantity or Decimal("0")
+        order_quantity = order.quantity or Decimal("0")
+        return local_filled < order_quantity
+
+    @staticmethod
+    def _event_fill_exceeds_order_quantity(order, event: ExchangeOrderEvent) -> bool:
+        order_quantity = order.quantity or Decimal("0")
+        if order_quantity <= 0 or event.cumulative_filled_quantity is None:
+            return False
+        return event.cumulative_filled_quantity > order_quantity
+
+    @staticmethod
+    def _terminal_event_underfills_order(
+        order,
+        event: ExchangeOrderEvent,
+        event_state: str,
+        fill_delta: dict[str, Decimal | None],
+    ) -> bool:
+        if event_state not in {"filled", "liquidated"}:
+            return False
+        order_quantity = order.quantity or Decimal("0")
+        if order_quantity <= 0:
+            return False
+        local_filled = order.filled_quantity or Decimal("0")
+        effective_filled = event.cumulative_filled_quantity
+        if effective_filled is None:
+            effective_filled = local_filled + (fill_delta["quantity"] or Decimal("0"))
+        return effective_filled < order_quantity
+
+    def _apply_exchange_order_event_status(
+        self,
+        order,
+        event_state: str,
+        event: ExchangeOrderEvent,
+    ) -> None:
         if event_state == "open":
-            self.order_manager.mark_submitted(order)
+            if self._has_exchange_order_event_fill_progress(order, event):
+                order.status = OrderStatus.PARTIALLY_FILLED.value
+                self.order_manager.repo.update_order(order)
+            else:
+                self.order_manager.mark_submitted(order)
         elif event_state == "partial":
             order.status = OrderStatus.PARTIALLY_FILLED.value
             self.order_manager.repo.update_order(order)
@@ -642,6 +773,16 @@ class ExecutionEngine:
         elif event_state == "liquidated":
             order.status = OrderStatus.LIQUIDATED.value
             self.order_manager.repo.update_order(order)
+
+    @staticmethod
+    def _has_exchange_order_event_fill_progress(
+        order,
+        event: ExchangeOrderEvent,
+    ) -> bool:
+        return (
+            (order.filled_quantity or Decimal("0")) > 0
+            or (event.cumulative_filled_quantity or Decimal("0")) > 0
+        )
 
     def cancel_order(self, order_id: str) -> bool:
         """Cancel a known order through the exchange adapter."""

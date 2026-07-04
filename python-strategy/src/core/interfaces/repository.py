@@ -32,8 +32,13 @@ class IOrderRepository(ABC):
     def get_order_by_client_order_id(self, client_order_id: str) -> Optional[Order]:
         pass
 
-    def get_order_by_exchange_order_id(self, exchange_order_id: str) -> Optional[Order]:
-        """Return an order by exchange order ID when the repository supports it."""
+    def get_order_by_exchange_order_id(
+        self,
+        exchange_order_id: str,
+        exchange_id: str | None = None,
+        product_id: str | None = None,
+    ) -> Optional[Order]:
+        """Return an order by scoped exchange order ID when supported."""
         return None
 
     def list_client_orders_by_statuses(self, statuses: set[str]) -> list[Order]:

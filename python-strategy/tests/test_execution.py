@@ -641,12 +641,339 @@ class TestLiveOrderEventSync:
         assert payload["quantity"] == "0.06"
         assert payload["fee_asset"] == "USDT"
 
+    def test_live_order_event_recomputes_delta_price_from_cumulative_average(
+        self,
+        mock_db_session,
+        mock_clock,
+        mock_exchange_adapter,
+        mock_order_repo,
+        order_factory,
+    ):
+        engine = self._engine(
+            mock_db_session,
+            mock_clock,
+            mock_exchange_adapter,
+            mock_order_repo,
+        )
+        order = order_factory(
+            exchange_order_id="EX-cumulative-average",
+            status=OrderStatus.PARTIALLY_FILLED.value,
+            quantity=Decimal("0.10"),
+            filled_quantity=Decimal("0.04"),
+            filled_price=Decimal("100"),
+        )
+        mock_order_repo.add_order(order)
+
+        result = engine.process_exchange_order_event(
+            ExchangeOrderEvent(
+                status="filled",
+                product_id=order.product_id,
+                exchange_order_id="EX-cumulative-average",
+                cumulative_filled_quantity=Decimal("0.10"),
+                cumulative_average_price=Decimal("102.4"),
+            )
+        )
+
+        assert result["action"] == "applied"
+        assert result["fill_quantity"] == Decimal("0.06")
+        assert order.status == OrderStatus.FILLED.value
+        assert order.filled_quantity == Decimal("0.10")
+        assert order.filled_price == Decimal("102.4")
+        assert len(mock_order_repo.trades) == 1
+        assert mock_order_repo.trades[0].quantity == Decimal("0.06")
+        assert mock_order_repo.trades[0].price == Decimal("104")
+
+    def test_live_order_event_does_not_price_catch_up_delta_with_last_fill_price(
+        self,
+        mock_db_session,
+        mock_clock,
+        mock_exchange_adapter,
+        mock_order_repo,
+        order_factory,
+    ):
+        engine = self._engine(
+            mock_db_session,
+            mock_clock,
+            mock_exchange_adapter,
+            mock_order_repo,
+        )
+        order = order_factory(
+            exchange_order_id="EX-catch-up-delta",
+            status=OrderStatus.PARTIALLY_FILLED.value,
+            quantity=Decimal("0.10"),
+            filled_quantity=Decimal("0.04"),
+            filled_price=Decimal("100"),
+        )
+        mock_order_repo.add_order(order)
+
+        result = engine.process_exchange_order_event(
+            ExchangeOrderEvent(
+                status="filled",
+                product_id=order.product_id,
+                exchange_order_id="EX-catch-up-delta",
+                cumulative_filled_quantity=Decimal("0.10"),
+                cumulative_average_price=Decimal("102.4"),
+                last_fill_quantity=Decimal("0.02"),
+                last_fill_price=Decimal("110"),
+            )
+        )
+
+        assert result["action"] == "applied"
+        assert order.status == OrderStatus.FILLED.value
+        assert len(mock_order_repo.trades) == 1
+        assert mock_order_repo.trades[0].quantity == Decimal("0.06")
+        assert mock_order_repo.trades[0].price == Decimal("104")
+
+    @pytest.mark.parametrize("exchange_status", ["partial", "filled", "liquidated"])
+    def test_live_order_event_catch_up_delta_without_cumulative_average_is_unresolved(
+        self,
+        mock_db_session,
+        mock_clock,
+        mock_exchange_adapter,
+        mock_order_repo,
+        order_factory,
+        exchange_status,
+    ):
+        engine = self._engine(
+            mock_db_session,
+            mock_clock,
+            mock_exchange_adapter,
+            mock_order_repo,
+        )
+        order = order_factory(
+            exchange_order_id=f"EX-catch-up-unpriced-{exchange_status}",
+            status=OrderStatus.PARTIALLY_FILLED.value,
+            quantity=Decimal("0.10"),
+            filled_quantity=Decimal("0.04"),
+            filled_price=Decimal("100"),
+        )
+        mock_order_repo.add_order(order)
+
+        result = engine.process_exchange_order_event(
+            ExchangeOrderEvent(
+                status=exchange_status,
+                product_id=order.product_id,
+                exchange_order_id=f"EX-catch-up-unpriced-{exchange_status}",
+                cumulative_filled_quantity=Decimal("0.10"),
+                last_fill_quantity=Decimal("0.02"),
+                last_fill_price=Decimal("110"),
+            )
+        )
+
+        assert result["action"] == "unresolved_missing_fill_price"
+        assert order.status == OrderStatus.PARTIALLY_FILLED.value
+        assert order.filled_quantity == Decimal("0.04")
+        assert mock_order_repo.trades == []
+
+    @pytest.mark.parametrize("exchange_status", ["partial", "filled", "liquidated"])
+    def test_live_order_event_cumulative_fill_above_order_quantity_is_unresolved(
+        self,
+        mock_db_session,
+        mock_clock,
+        mock_exchange_adapter,
+        mock_order_repo,
+        order_factory,
+        exchange_status,
+    ):
+        engine = self._engine(
+            mock_db_session,
+            mock_clock,
+            mock_exchange_adapter,
+            mock_order_repo,
+        )
+        order = order_factory(
+            exchange_order_id=f"EX-overfilled-{exchange_status}",
+            status=OrderStatus.PARTIALLY_FILLED.value,
+            quantity=Decimal("0.10"),
+            filled_quantity=Decimal("0.04"),
+            filled_price=Decimal("100"),
+        )
+        mock_order_repo.add_order(order)
+
+        result = engine.process_exchange_order_event(
+            ExchangeOrderEvent(
+                status=exchange_status,
+                product_id=order.product_id,
+                exchange_order_id=f"EX-overfilled-{exchange_status}",
+                cumulative_filled_quantity=Decimal("0.12"),
+                cumulative_average_price=Decimal("101"),
+            )
+        )
+
+        assert result["action"] == "unresolved_exchange_fill_exceeds_order_quantity"
+        assert order.status == OrderStatus.PARTIALLY_FILLED.value
+        assert order.filled_quantity == Decimal("0.04")
+        assert mock_order_repo.trades == []
+
+    @pytest.mark.parametrize("exchange_status", ["open", "submitted", "accepted"])
+    @pytest.mark.parametrize(
+        ("local_filled", "cumulative_filled", "initial_status", "expected_status"),
+        [
+            (
+                Decimal("0"),
+                Decimal("0"),
+                OrderStatus.SUBMITTED_UNCONFIRMED.value,
+                OrderStatus.SUBMITTED.value,
+            ),
+            (
+                Decimal("0.04"),
+                Decimal("0.04"),
+                OrderStatus.PARTIALLY_FILLED.value,
+                OrderStatus.PARTIALLY_FILLED.value,
+            ),
+        ],
+    )
+    def test_open_live_order_event_status_preserves_partial_fill_progress(
+        self,
+        mock_db_session,
+        mock_clock,
+        mock_exchange_adapter,
+        mock_order_repo,
+        order_factory,
+        exchange_status,
+        local_filled,
+        cumulative_filled,
+        initial_status,
+        expected_status,
+    ):
+        engine = self._engine(
+            mock_db_session,
+            mock_clock,
+            mock_exchange_adapter,
+            mock_order_repo,
+        )
+        order = order_factory(
+            exchange_order_id=f"EX-open-{exchange_status}-{local_filled}",
+            status=initial_status,
+            quantity=Decimal("0.10"),
+            filled_quantity=local_filled,
+            filled_price=Decimal("100"),
+        )
+        mock_order_repo.add_order(order)
+
+        result = engine.process_exchange_order_event(
+            ExchangeOrderEvent(
+                status=exchange_status,
+                product_id=order.product_id,
+                exchange_order_id=f"EX-open-{exchange_status}-{local_filled}",
+                cumulative_filled_quantity=cumulative_filled,
+            )
+        )
+        second_result = engine.process_exchange_order_event(
+            ExchangeOrderEvent(
+                status=exchange_status,
+                product_id=order.product_id,
+                exchange_order_id=f"EX-open-{exchange_status}-{local_filled}",
+                cumulative_filled_quantity=cumulative_filled,
+            )
+        )
+
+        assert result["action"] == "applied"
+        assert second_result["action"] == "applied"
+        assert order.status == expected_status
+        assert order.filled_quantity == local_filled
+        assert mock_order_repo.trades == []
+
+    @pytest.mark.parametrize(
+        "exchange_status",
+        ["open", "partially_filled", "filled", "canceled", "liquidated"],
+    )
+    def test_last_fill_only_live_order_events_are_unresolved_and_idempotent(
+        self,
+        mock_db_session,
+        mock_clock,
+        mock_exchange_adapter,
+        mock_order_repo,
+        order_factory,
+        exchange_status,
+    ):
+        engine = self._engine(
+            mock_db_session,
+            mock_clock,
+            mock_exchange_adapter,
+            mock_order_repo,
+        )
+        order = order_factory(
+            exchange_order_id=f"EX-last-only-{exchange_status}",
+            status=OrderStatus.PARTIALLY_FILLED.value,
+            quantity=Decimal("0.10"),
+            filled_quantity=Decimal("0.04"),
+            filled_price=Decimal("100"),
+        )
+        mock_order_repo.add_order(order)
+        event = ExchangeOrderEvent(
+            status=exchange_status,
+            product_id=order.product_id,
+            exchange_order_id=f"EX-last-only-{exchange_status}",
+            last_fill_quantity=Decimal("0.02"),
+            last_fill_price=Decimal("101"),
+        )
+
+        first_result = engine.process_exchange_order_event(event)
+        second_result = engine.process_exchange_order_event(event)
+
+        assert first_result["action"] == "unresolved_last_fill_without_cumulative_quantity"
+        assert second_result["action"] == "unresolved_last_fill_without_cumulative_quantity"
+        assert order.status == OrderStatus.PARTIALLY_FILLED.value
+        assert order.filled_quantity == Decimal("0.04")
+        assert order.filled_price == Decimal("100")
+        assert mock_order_repo.trades == []
+
+    def test_live_order_event_exchange_lookup_is_scoped_to_event_product(
+        self,
+        mock_db_session,
+        mock_clock,
+        mock_exchange_adapter,
+        mock_order_repo,
+        order_factory,
+    ):
+        engine = self._engine(
+            mock_db_session,
+            mock_clock,
+            mock_exchange_adapter,
+            mock_order_repo,
+        )
+        binance_order = order_factory(
+            order_id="binance-order",
+            exchange_order_id="reused-exchange-id",
+            exchange_id="BINANCE",
+            product_id="BINANCE:BTCUSDT-PERP",
+            status=OrderStatus.SUBMITTED.value,
+            quantity=Decimal("0.10"),
+        )
+        bybit_order = order_factory(
+            order_id="bybit-order",
+            exchange_order_id="reused-exchange-id",
+            exchange_id="BYBIT",
+            product_id="BYBIT:BTCUSDT-PERP",
+            status=OrderStatus.SUBMITTED.value,
+            quantity=Decimal("0.10"),
+        )
+        mock_order_repo.add_order(binance_order)
+        mock_order_repo.add_order(bybit_order)
+
+        result = engine.process_exchange_order_event(
+            ExchangeOrderEvent(
+                status="filled",
+                product_id="BYBIT:BTCUSDT-PERP",
+                exchange_order_id="reused-exchange-id",
+                cumulative_filled_quantity=Decimal("0.10"),
+                cumulative_average_price=Decimal("101"),
+            )
+        )
+
+        assert result["action"] == "applied"
+        assert result["order_id"] == "bybit-order"
+        assert bybit_order.status == OrderStatus.FILLED.value
+        assert bybit_order.filled_quantity == Decimal("0.10")
+        assert binance_order.status == OrderStatus.SUBMITTED.value
+        assert binance_order.filled_quantity == Decimal("0")
+
     @pytest.mark.parametrize(
         ("exchange_status", "expected_status"),
         [
             ("canceled", OrderStatus.CANCELLED.value),
             ("expired", OrderStatus.FAILED.value),
-            ("liquidated", OrderStatus.LIQUIDATED.value),
         ],
     )
     def test_terminal_live_order_event_records_fill_before_terminal_status(
@@ -691,6 +1018,113 @@ class TestLiveOrderEventSync:
         assert order.filled_quantity == Decimal("0.03")
         assert len(mock_order_repo.trades) == 1
         assert mock_order_repo.trades[0].fee_asset == "BTC"
+
+    @pytest.mark.parametrize("exchange_status", ["filled", "liquidated"])
+    def test_terminal_filled_live_order_event_with_partial_cumulative_is_unresolved(
+        self,
+        mock_db_session,
+        mock_clock,
+        mock_exchange_adapter,
+        mock_order_repo,
+        order_factory,
+        exchange_status,
+    ):
+        engine = self._engine(
+            mock_db_session,
+            mock_clock,
+            mock_exchange_adapter,
+            mock_order_repo,
+        )
+        order = order_factory(
+            exchange_order_id=f"EX-underfilled-terminal-{exchange_status}",
+            status=OrderStatus.PARTIALLY_FILLED.value,
+            quantity=Decimal("0.10"),
+            filled_quantity=Decimal("0.04"),
+            filled_price=Decimal("100"),
+        )
+        mock_order_repo.add_order(order)
+
+        result = engine.process_exchange_order_event(
+            ExchangeOrderEvent(
+                status=exchange_status,
+                product_id=order.product_id,
+                exchange_order_id=f"EX-underfilled-terminal-{exchange_status}",
+                cumulative_filled_quantity=Decimal("0.04"),
+                cumulative_average_price=Decimal("100"),
+            )
+        )
+
+        assert result["action"] == "unresolved_terminal_fill_quantity_below_order_quantity"
+        assert order.status == OrderStatus.PARTIALLY_FILLED.value
+        assert order.filled_quantity == Decimal("0.04")
+        assert mock_order_repo.trades == []
+
+    @pytest.mark.parametrize("exchange_status", ["filled", "liquidated"])
+    @pytest.mark.parametrize(
+        "event_kwargs",
+        [
+            {},
+            {"last_fill_quantity": Decimal("0")},
+        ],
+    )
+    def test_terminal_filled_live_order_event_without_fill_quantity_is_unresolved_until_full(
+        self,
+        mock_db_session,
+        mock_clock,
+        mock_exchange_adapter,
+        mock_order_repo,
+        order_factory,
+        exchange_status,
+        event_kwargs,
+    ):
+        engine = self._engine(
+            mock_db_session,
+            mock_clock,
+            mock_exchange_adapter,
+            mock_order_repo,
+        )
+        order = order_factory(
+            exchange_order_id=f"EX-{exchange_status}",
+            status=OrderStatus.PARTIALLY_FILLED.value,
+            quantity=Decimal("0.10"),
+            filled_quantity=Decimal("0.04"),
+            filled_price=Decimal("100"),
+        )
+        mock_order_repo.add_order(order)
+
+        result = engine.process_exchange_order_event(
+            ExchangeOrderEvent(
+                status=exchange_status,
+                product_id=order.product_id,
+                exchange_order_id=f"EX-{exchange_status}",
+                **event_kwargs,
+            )
+        )
+
+        assert result["action"] == "unresolved_missing_terminal_fill_quantity"
+        assert order.status == OrderStatus.PARTIALLY_FILLED.value
+        assert order.filled_quantity == Decimal("0.04")
+        assert mock_order_repo.trades == []
+
+        order.filled_quantity = Decimal("0.10")
+        result = engine.process_exchange_order_event(
+            ExchangeOrderEvent(
+                status=exchange_status,
+                product_id=order.product_id,
+                exchange_order_id=f"EX-{exchange_status}",
+                **event_kwargs,
+            )
+        )
+
+        assert result["action"] == "applied"
+        expected_status = (
+            OrderStatus.FILLED.value
+            if exchange_status == "filled"
+            else OrderStatus.LIQUIDATED.value
+        )
+        assert order.status == expected_status
+        assert order.filled_quantity == Decimal("0.10")
+        assert mock_order_repo.trades == []
 
     @pytest.mark.parametrize(
         ("exchange_status", "expected_status"),
@@ -1107,6 +1541,11 @@ class TestAuditedExecution:
             client_order_id="client-1",
             status=OrderStatus.SUBMITTED_UNCONFIRMED.value,
         )
+        partially_filled = order_factory(
+            order_id="partially-filled",
+            client_order_id="client-partial",
+            status=OrderStatus.PARTIALLY_FILLED.value,
+        )
         closed = order_factory(
             order_id="closed",
             client_order_id="client-2",
@@ -1118,10 +1557,11 @@ class TestAuditedExecution:
             status=OrderStatus.SUBMITTED.value,
         )
         mock_order_repo.add_order(recoverable)
+        mock_order_repo.add_order(partially_filled)
         mock_order_repo.add_order(closed)
         mock_order_repo.add_order(no_client_id)
 
-        assert engine.list_recoverable_client_orders() == [recoverable]
+        assert engine.list_recoverable_client_orders() == [recoverable, partially_filled]
 
     def test_record_recoverable_order_scan_writes_reconcile_event(
         self, mock_db_session, mock_clock, mock_exchange_adapter, mock_order_repo, order_factory

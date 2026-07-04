@@ -115,12 +115,19 @@ class MockOrderRepository(IOrderRepository):
             None,
         )
 
-    def get_order_by_exchange_order_id(self, exchange_order_id: str) -> Optional[Order]:
+    def get_order_by_exchange_order_id(
+        self,
+        exchange_order_id: str,
+        exchange_id: str | None = None,
+        product_id: str | None = None,
+    ) -> Optional[Order]:
         return next(
             (
                 order
                 for order in self.orders.values()
                 if order.exchange_order_id == exchange_order_id
+                and (exchange_id is None or order.exchange_id == exchange_id)
+                and (product_id is None or order.product_id == product_id)
             ),
             None,
         )

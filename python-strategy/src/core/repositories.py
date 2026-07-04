@@ -34,9 +34,19 @@ class LiveOrderRepository(IOrderRepository):
         with self._db_session_factory() as db:
             return db.query(Order).filter_by(client_order_id=client_order_id).first()
 
-    def get_order_by_exchange_order_id(self, exchange_order_id: str) -> Optional[Order]:
+    def get_order_by_exchange_order_id(
+        self,
+        exchange_order_id: str,
+        exchange_id: str | None = None,
+        product_id: str | None = None,
+    ) -> Optional[Order]:
         with self._db_session_factory() as db:
-            return db.query(Order).filter_by(exchange_order_id=exchange_order_id).first()
+            query = db.query(Order).filter_by(exchange_order_id=exchange_order_id)
+            if exchange_id is not None:
+                query = query.filter_by(exchange_id=exchange_id)
+            if product_id is not None:
+                query = query.filter_by(product_id=product_id)
+            return query.first()
 
     def list_client_orders_by_statuses(self, statuses: set[str]) -> list[Order]:
         if not statuses:
@@ -144,7 +154,12 @@ class BacktestOrderRepository(IOrderRepository):
     def get_order_by_client_order_id(self, client_order_id: str) -> Optional[Order]:
         return None
 
-    def get_order_by_exchange_order_id(self, exchange_order_id: str) -> Optional[Order]:
+    def get_order_by_exchange_order_id(
+        self,
+        exchange_order_id: str,
+        exchange_id: str | None = None,
+        product_id: str | None = None,
+    ) -> Optional[Order]:
         return None
 
     def list_client_orders_by_statuses(self, statuses: set[str]) -> list[Order]:
