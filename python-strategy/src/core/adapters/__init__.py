@@ -3,12 +3,16 @@
 Factory function ``create_adapter`` provides config-driven instantiation.
 """
 
-from src.core.adapters.ccxt_adapter import CcxtExchangeAdapter
+from src.core.adapters.ccxt_adapter import (
+    AccountInitializationConfig,
+    CcxtExchangeAdapter,
+)
 from src.core.adapters.live_binance import LiveBinanceAdapter
 from src.core.adapters.simulated import SimulatedAdapter
 from src.core.interfaces.exchange import IExchangeAdapter
 
 __all__ = [
+    "AccountInitializationConfig",
     "CcxtExchangeAdapter",
     "LiveBinanceAdapter",
     "SimulatedAdapter",
@@ -28,6 +32,7 @@ def create_adapter(config: dict) -> IExchangeAdapter:
         balance: initial balance    (simulated only, default: 100000)
         enable_ws: bool             (live only, default: False)
         extra_config: dict          (extra CCXT config, optional)
+        account_initialization: dict (live account settings, optional)
     """
     from decimal import Decimal
 
@@ -50,6 +55,10 @@ def create_adapter(config: dict) -> IExchangeAdapter:
     enable_ws = config.get("enable_ws", False)
     extra_config = config.get("extra_config")
     instrument_product_ids = config.get("instrument_product_ids") or []
+    account_initialization = AccountInitializationConfig.from_config(
+        config.get("account_initialization"),
+        default_product_ids=instrument_product_ids,
+    )
 
     # Use Binance-specific adapter if WS requested and exchange is binance
     if exchange_id == "binance" and enable_ws:
@@ -59,6 +68,8 @@ def create_adapter(config: dict) -> IExchangeAdapter:
             testnet=testnet,
             enable_ws=True,
         )
+        if account_initialization is not None:
+            adapter.initialize_account(account_initialization)
         adapter.warm_instrument_specs(instrument_product_ids)
         return adapter
 
@@ -69,5 +80,7 @@ def create_adapter(config: dict) -> IExchangeAdapter:
         testnet=testnet,
         extra_config=extra_config,
     )
+    if account_initialization is not None:
+        adapter.initialize_account(account_initialization)
     adapter.warm_instrument_specs(instrument_product_ids)
     return adapter

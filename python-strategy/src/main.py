@@ -82,6 +82,43 @@ def _env_flag(name: str, default: bool = False) -> bool:
     return value.lower() in {"1", "true", "yes", "on"}
 
 
+def _env_csv(name: str, default: list[str] | None = None) -> list[str]:
+    value = os.getenv(name)
+    if value is None:
+        return list(default or [])
+    return [item.strip() for item in value.split(",") if item.strip()]
+
+
+def _adapter_config_from_env() -> dict:
+    mode = os.getenv("ADAPTER_MODE") or os.getenv("EXCHANGE_MODE") or "simulated"
+    mode = mode.lower()
+    if mode == "simulated":
+        return {"mode": "simulated"}
+
+    product_ids = _env_csv("INSTRUMENT_PRODUCT_IDS", ["BINANCE:BTCUSDT-PERP"])
+    account_initialization = {
+        "product_ids": product_ids,
+        "position_mode": os.getenv("ACCOUNT_POSITION_MODE", "one_way"),
+    }
+    leverage = os.getenv("ACCOUNT_LEVERAGE")
+    if leverage:
+        account_initialization["leverage"] = leverage
+    margin_mode = os.getenv("ACCOUNT_MARGIN_MODE")
+    if margin_mode:
+        account_initialization["margin_mode"] = margin_mode
+
+    return {
+        "mode": "live",
+        "exchange": os.getenv("EXCHANGE_ID", "binance"),
+        "api_key": os.getenv("EXCHANGE_API_KEY"),
+        "secret": os.getenv("EXCHANGE_SECRET"),
+        "testnet": _env_flag("EXCHANGE_TESTNET", True),
+        "enable_ws": _env_flag("EXCHANGE_ENABLE_WS", False),
+        "instrument_product_ids": product_ids,
+        "account_initialization": account_initialization,
+    }
+
+
 @contextmanager
 def _session_scope():
     session = SessionLocal()
@@ -107,6 +144,7 @@ def main():
     engine = StrategyEngine(
         db_session=db_session,
         clock=clock,
+        adapter_config=_adapter_config_from_env(),
         db_session_factory=_session_scope,
         audit_external_orders=_env_flag("AUDIT_EXTERNAL_ORDERS"),
     )
