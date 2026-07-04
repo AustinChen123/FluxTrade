@@ -1577,7 +1577,133 @@ class TestAuditedExecution:
     def test_exchange_failure_writes_outcome_then_raises(
         self, mock_db_session, mock_clock, mock_exchange_adapter, mock_order_repo, signal_factory
     ):
+        mock_exchange_adapter.set_should_fail(True, "Order rejected")
+        audit_session = mock_db_session
+        engine = ExecutionEngine(
+            db_session=mock_db_session,
+            clock=mock_clock,
+            adapter=mock_exchange_adapter,
+            order_repository=mock_order_repo,
+            db_session_factory=lambda: nullcontext(audit_session),
+            audit_external_orders=True,
+        )
+
+        with pytest.raises(ExchangeError, match="Order rejected"):
+            engine.execute_signal(signal_factory(price=Decimal("42000")))
+
+        failed_orders = [o for o in mock_order_repo.orders.values() if o.status == "failed"]
+        assert len(failed_orders) == 1
+        audit = audit_session.add.call_args_list[0].args[0]
+        assert audit.order_id == failed_orders[0].id
+        assert audit.outcome_payload == {
+            "status": "failed",
+            "error": "Order rejected",
+        }
+        assert audit_session.flush.call_count == 1
+        assert audit_session.commit.call_count == 2
+
+    def test_ambiguous_submit_error_adopts_exchange_order_by_client_id(
+        self, mock_db_session, mock_clock, mock_exchange_adapter, mock_order_repo, signal_factory
+    ):
         mock_exchange_adapter.set_should_fail(True, "Connection timeout")
+
+        def lookup(client_order_id, product_id):
+            return ExchangeOrderSnapshot(
+                client_order_id=client_order_id,
+                exchange_order_id="EX-ADOPTED",
+                status="open",
+                filled_quantity=Decimal("0"),
+                average_price=None,
+            )
+
+        mock_exchange_adapter.get_order_by_client_id = MagicMock(side_effect=lookup)
+        audit_session = mock_db_session
+        engine = ExecutionEngine(
+            db_session=mock_db_session,
+            clock=mock_clock,
+            adapter=mock_exchange_adapter,
+            order_repository=mock_order_repo,
+            db_session_factory=lambda: nullcontext(audit_session),
+            audit_external_orders=True,
+        )
+
+        order_id = engine.execute_signal(signal_factory(price=Decimal("42000")))
+
+        order = mock_order_repo.orders[order_id]
+        assert order.status == OrderStatus.SUBMITTED.value
+        assert order.exchange_order_id == "EX-ADOPTED"
+        assert len(mock_exchange_adapter.open_orders) == 0
+        audit = audit_session.add.call_args_list[0].args[0]
+        assert audit.outcome_payload == {
+            "status": "placed",
+            "exchange_order_id": "EX-ADOPTED",
+        }
+        mock_exchange_adapter.get_order_by_client_id.assert_called_once_with(
+            order.client_order_id,
+            order.product_id,
+        )
+
+    def test_ambiguous_validation_error_does_not_attempt_submit_adoption(
+        self, mock_db_session, mock_clock, mock_exchange_adapter, mock_order_repo, signal_factory
+    ):
+        audit_session = mock_db_session
+        engine = ExecutionEngine(
+            db_session=mock_db_session,
+            clock=mock_clock,
+            adapter=mock_exchange_adapter,
+            order_repository=mock_order_repo,
+            db_session_factory=lambda: nullcontext(audit_session),
+            audit_external_orders=True,
+        )
+        engine._validate_order_group = MagicMock(
+            side_effect=ExchangeError("Connection timeout before submit")
+        )
+        mock_exchange_adapter.get_order_by_client_id = MagicMock()
+
+        with pytest.raises(ExchangeError, match="Connection timeout before submit"):
+            engine.execute_signal(signal_factory(price=Decimal("42000")))
+
+        order = next(iter(mock_order_repo.orders.values()))
+        assert order.status == "failed"
+        assert order.exchange_order_id is None
+        assert mock_exchange_adapter.open_orders == []
+        mock_exchange_adapter.get_order_by_client_id.assert_not_called()
+        audit = audit_session.add.call_args_list[0].args[0]
+        assert audit.outcome_payload == {
+            "status": "failed",
+            "error": "Connection timeout before submit",
+        }
+
+    @pytest.mark.parametrize(
+        ("lookup_result", "expected_action"),
+        [
+            (None, "verification_blocked_order_snapshot_missing"),
+            (
+                ExchangeOrderLookupUnsupported("unsupported"),
+                "verification_blocked_order_lookup_unsupported",
+            ),
+            (ExchangeError("lookup failed"), "verification_blocked_order_lookup_failed"),
+        ],
+    )
+    def test_ambiguous_submit_error_without_adoption_keeps_order_recoverable(
+        self,
+        mock_db_session,
+        mock_clock,
+        mock_exchange_adapter,
+        mock_order_repo,
+        signal_factory,
+        lookup_result,
+        expected_action,
+    ):
+        mock_exchange_adapter.set_should_fail(True, "Connection timeout")
+        if isinstance(lookup_result, Exception):
+            mock_exchange_adapter.get_order_by_client_id = MagicMock(
+                side_effect=lookup_result
+            )
+        else:
+            mock_exchange_adapter.get_order_by_client_id = MagicMock(
+                return_value=lookup_result
+            )
         audit_session = mock_db_session
         engine = ExecutionEngine(
             db_session=mock_db_session,
@@ -1591,16 +1717,95 @@ class TestAuditedExecution:
         with pytest.raises(ExchangeError, match="Connection timeout"):
             engine.execute_signal(signal_factory(price=Decimal("42000")))
 
-        failed_orders = [o for o in mock_order_repo.orders.values() if o.status == "failed"]
-        assert len(failed_orders) == 1
+        orders = list(mock_order_repo.orders.values())
+        assert len(orders) == 1
+        order = orders[0]
+        assert order.status == OrderStatus.SUBMITTED_UNCONFIRMED.value
+        assert order.exchange_order_id is None
+        assert engine.list_recoverable_client_orders() == [order]
         audit = audit_session.add.call_args_list[0].args[0]
-        assert audit.order_id == failed_orders[0].id
-        assert audit.outcome_payload == {
-            "status": "failed",
-            "error": "Connection timeout",
-        }
-        assert audit_session.flush.call_count == 1
-        assert audit_session.commit.call_count == 2
+        assert audit.outcome_payload["status"] == "verification_blocked"
+        assert audit.outcome_payload["adoption"]["action"] == expected_action
+
+    def test_ambiguous_submit_error_with_unresolved_snapshot_keeps_order_recoverable(
+        self, mock_db_session, mock_clock, mock_exchange_adapter, mock_order_repo, signal_factory
+    ):
+        mock_exchange_adapter.set_should_fail(True, "Connection timeout")
+
+        def lookup(client_order_id, product_id):
+            return ExchangeOrderSnapshot(
+                client_order_id=client_order_id,
+                exchange_order_id="EX-UNRESOLVED",
+                status="filled",
+                filled_quantity=Decimal("0.10"),
+                average_price=None,
+            )
+
+        mock_exchange_adapter.get_order_by_client_id = MagicMock(side_effect=lookup)
+        audit_session = mock_db_session
+        engine = ExecutionEngine(
+            db_session=mock_db_session,
+            clock=mock_clock,
+            adapter=mock_exchange_adapter,
+            order_repository=mock_order_repo,
+            db_session_factory=lambda: nullcontext(audit_session),
+            audit_external_orders=True,
+        )
+
+        with pytest.raises(ExchangeError, match="Connection timeout"):
+            engine.execute_signal(signal_factory(price=Decimal("42000")))
+
+        order = next(iter(mock_order_repo.orders.values()))
+        assert order.status == OrderStatus.SUBMITTED_UNCONFIRMED.value
+        assert order.exchange_order_id == "EX-UNRESOLVED"
+        assert engine.list_recoverable_client_orders() == [order]
+        assert mock_order_repo.trades == []
+        audit = audit_session.add.call_args_list[0].args[0]
+        assert audit.outcome_payload["status"] == "unresolved"
+        assert audit.outcome_payload["adoption"]["action"] == "unresolved_missing_fill_price"
+
+    def test_ambiguous_submit_error_with_terminal_snapshot_does_not_place_protection(
+        self, mock_db_session, mock_clock, mock_exchange_adapter, mock_order_repo, signal_factory
+    ):
+        mock_exchange_adapter.set_should_fail(True, "Connection timeout")
+
+        def lookup(client_order_id, product_id):
+            return ExchangeOrderSnapshot(
+                client_order_id=client_order_id,
+                exchange_order_id="EX-CANCELED",
+                status="canceled",
+                filled_quantity=Decimal("0"),
+                average_price=None,
+            )
+
+        mock_exchange_adapter.get_order_by_client_id = MagicMock(side_effect=lookup)
+        audit_session = mock_db_session
+        engine = ExecutionEngine(
+            db_session=mock_db_session,
+            clock=mock_clock,
+            adapter=mock_exchange_adapter,
+            order_repository=mock_order_repo,
+            db_session_factory=lambda: nullcontext(audit_session),
+            audit_external_orders=True,
+        )
+
+        with pytest.raises(ExchangeError, match="Connection timeout"):
+            engine.execute_signal(
+                signal_factory(
+                    price=Decimal("42000"),
+                    stop_loss=Decimal("41000"),
+                )
+            )
+
+        orders = list(mock_order_repo.orders.values())
+        entry = next(order for order in orders if order.type == "limit")
+        conditional = next(order for order in orders if order.type == "stop_loss")
+        assert entry.status == OrderStatus.CANCELLED.value
+        assert entry.exchange_order_id == "EX-CANCELED"
+        assert conditional.status == "failed"
+        audit = audit_session.add.call_args_list[0].args[0]
+        assert audit.outcome_payload["status"] == "terminal_after_submit_error"
+        assert audit.outcome_payload["adoption"]["action"] == "terminal_after_submit_error"
 
     def test_intent_audit_failure_stops_before_external_order(
         self, mock_db_session, mock_clock, mock_exchange_adapter, mock_order_repo, signal_factory
@@ -1645,7 +1850,7 @@ class TestAuditedExecution:
     def test_exchange_failure_outcome_audit_failure_raises_audit_error(
         self, mock_db_session, mock_clock, mock_exchange_adapter, mock_order_repo, signal_factory
     ):
-        mock_exchange_adapter.set_should_fail(True, "Connection timeout")
+        mock_exchange_adapter.set_should_fail(True, "Order rejected")
         mock_db_session.commit.side_effect = [None, RuntimeError("outcome audit failed")]
         engine = ExecutionEngine(
             db_session=mock_db_session,
@@ -1664,7 +1869,7 @@ class TestAuditedExecution:
         audit = mock_db_session.add.call_args_list[0].args[0]
         assert audit.outcome_payload == {
             "status": "failed",
-            "error": "Connection timeout",
+            "error": "Order rejected",
         }
         mock_db_session.rollback.assert_called_once()
 
