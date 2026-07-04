@@ -142,14 +142,15 @@ class CcxtExchangeAdapter(IExchangeAdapter):
 
     def _quantize_order(self, order: Order) -> None:
         spec = self.get_instrument_spec(order.product_id)
-        quantized = quantize_order_values(
-            quantity=order.quantity,
-            price=order.price,
-            trigger_price=order.trigger_price,
-            spec=spec,
-        )
-        notional_price = quantized.price or quantized.trigger_price
         try:
+            quantized = quantize_order_values(
+                quantity=order.quantity,
+                price=order.price,
+                side=order.side,
+                trigger_price=order.trigger_price,
+                spec=spec,
+            )
+            notional_price = quantized.price or quantized.trigger_price
             validate_min_notional(
                 quantity=quantized.quantity,
                 price=notional_price,

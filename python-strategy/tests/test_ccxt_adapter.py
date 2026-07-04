@@ -196,7 +196,37 @@ class TestPlaceOrder:
         assert call_kwargs.kwargs["amount"] == "0.010"
         assert call_kwargs.kwargs["price"] == "50123.40"
 
-    def test_quantizes_trigger_price_before_placing_conditional_order(
+    def test_quantizes_sell_limit_price_up_before_placing(
+        self, adapter, mock_ccxt_client
+    ):
+        mock_ccxt_client.load_markets.return_value = {
+            "BTC/USDT:USDT": {
+                "info": {
+                    "filters": [
+                        {"filterType": "PRICE_FILTER", "tickSize": "0.10"},
+                        {"filterType": "LOT_SIZE", "stepSize": "0.001"},
+                        {"filterType": "MIN_NOTIONAL", "minNotional": "10"},
+                    ],
+                },
+            },
+        }
+        mock_ccxt_client.create_order.return_value = {"id": "EX-SELL"}
+        order = _make_order(
+            side="sell",
+            type="limit",
+            quantity=Decimal("0.0109"),
+            price=Decimal("50123.456"),
+        )
+
+        adapter.place_order(order)
+
+        call_kwargs = mock_ccxt_client.create_order.call_args
+        assert order.quantity == Decimal("0.010")
+        assert order.price == Decimal("50123.50")
+        assert call_kwargs.kwargs["amount"] == "0.010"
+        assert call_kwargs.kwargs["price"] == "50123.50"
+
+    def test_rejects_off_tick_trigger_price_before_placing_conditional_order(
         self, adapter, mock_ccxt_client
     ):
         mock_ccxt_client.load_markets.return_value = {
@@ -218,11 +248,10 @@ class TestPlaceOrder:
             trigger_price=Decimal("49999.987"),
         )
 
-        adapter.place_order(order)
+        with pytest.raises(ExchangeError, match="trigger_price_off_tick"):
+            adapter.place_order(order)
 
-        assert order.quantity == Decimal("0.010")
-        assert order.trigger_price == Decimal("49999.90")
-        mock_ccxt_client.create_order.assert_called_once()
+        mock_ccxt_client.create_order.assert_not_called()
 
     def test_rejects_order_below_min_notional(self, adapter, mock_ccxt_client):
         mock_ccxt_client.load_markets.return_value = {

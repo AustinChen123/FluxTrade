@@ -9,7 +9,7 @@ Product ID format: EXCHANGE:BASEQUOTE-PERP
 
 import re
 from dataclasses import dataclass
-from decimal import Decimal, ROUND_DOWN
+from decimal import Decimal, ROUND_DOWN, ROUND_UP
 from typing import Any
 
 
@@ -250,17 +250,18 @@ def quantize_order_values(
     *,
     quantity: Decimal,
     price: Decimal | None,
+    side: str | None = None,
     trigger_price: Decimal | None = None,
     spec: InstrumentSpec,
 ) -> QuantizedOrder:
     quantized_quantity = _floor_to_step(quantity, spec.quantity_step)
     quantized_price = (
-        _floor_to_step(price, spec.price_tick)
+        _quantize_limit_price(price, spec.price_tick, side)
         if price is not None
         else None
     )
     quantized_trigger_price = (
-        _floor_to_step(trigger_price, spec.price_tick)
+        _require_on_step("trigger_price", trigger_price, spec.price_tick)
         if trigger_price is not None
         else None
     )
@@ -301,6 +302,34 @@ def _floor_to_step(value: Decimal, step: Decimal | None) -> Decimal:
     if step is None or step <= 0:
         return value
     return (value / step).to_integral_value(rounding=ROUND_DOWN) * step
+
+
+def _ceil_to_step(value: Decimal, step: Decimal | None) -> Decimal:
+    if step is None or step <= 0:
+        return value
+    return (value / step).to_integral_value(rounding=ROUND_UP) * step
+
+
+def _quantize_limit_price(
+    price: Decimal,
+    tick: Decimal | None,
+    side: str | None,
+) -> Decimal:
+    if tick is None or tick <= 0 or _floor_to_step(price, tick) == price:
+        return price
+
+    normalized_side = side.lower() if side is not None else None
+    if normalized_side == "buy":
+        return _floor_to_step(price, tick)
+    if normalized_side == "sell":
+        return _ceil_to_step(price, tick)
+    raise ValueError(f"price_off_tick_without_side: price={price} tick={tick}")
+
+
+def _require_on_step(label: str, value: Decimal, step: Decimal | None) -> Decimal:
+    if step is None or step <= 0 or _floor_to_step(value, step) == value:
+        return value
+    raise ValueError(f"{label}_off_tick: {label}={value} tick={step}")
 
 
 def _decimal_or_none(value: Any, fallback: Decimal | None = None) -> Decimal | None:
