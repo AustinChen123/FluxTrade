@@ -7,7 +7,14 @@ Product ID format: EXCHANGE:BASEQUOTE-PERP
   e.g. BINANCE:BTCUSDT-PERP, BYBIT:ETHUSDT-PERP
 """
 
+import logging
 import re
+from dataclasses import dataclass
+from decimal import Decimal, ROUND_DOWN, ROUND_UP
+from enum import Enum
+from typing import Any
+
+logger = logging.getLogger(__name__)
 
 
 # Known product mappings with exchange-specific overrides.
@@ -46,6 +53,41 @@ _KNOWN_PRODUCTS: dict[str, dict] = {
 }
 
 _PRODUCT_ID_PATTERN = re.compile(r"^([A-Z0-9]+):([A-Z0-9]+)(USDT|USDC|BUSD)-PERP$")
+
+
+@dataclass(frozen=True)
+class InstrumentSpec:
+    """Venue-neutral instrument trading rules for outbound order validation."""
+
+    product_id: str
+    exchange: str
+    symbol: str
+    base: str
+    quote: str
+    quantity_step: Decimal | None = None
+    price_tick: Decimal | None = None
+    min_notional: Decimal | None = None
+    min_quantity: Decimal | None = None
+    multiplier: Decimal | None = None
+    tick_value: Decimal | None = None
+    fee_model: str | None = None
+    session_calendar_id: str | None = None
+
+
+@dataclass(frozen=True)
+class QuantizedOrder:
+    quantity: Decimal
+    price: Decimal | None
+    trigger_price: Decimal | None
+    changed: bool
+
+
+class PrecisionMode(str, Enum):
+    """CCXT precision modes translated at the adapter boundary."""
+
+    DECIMAL_PLACES = "decimal_places"
+    SIGNIFICANT_DIGITS = "significant_digits"
+    TICK_SIZE = "tick_size"
 
 
 def _parse_product_id(product_id: str) -> dict:
@@ -139,3 +181,266 @@ def resolve_exchange(product_id: str) -> tuple[str, str]:
 def list_known_products() -> list[str]:
     """Return all explicitly registered product IDs."""
     return list(_KNOWN_PRODUCTS.keys())
+
+
+def instrument_spec_from_product(
+    product_id: str,
+    *,
+    quantity_step: Decimal | None = None,
+    price_tick: Decimal | None = None,
+    min_notional: Decimal | None = None,
+    min_quantity: Decimal | None = None,
+    multiplier: Decimal | None = None,
+    tick_value: Decimal | None = None,
+    fee_model: str | None = None,
+    session_calendar_id: str | None = None,
+) -> InstrumentSpec:
+    info = _parse_product_id(product_id)
+    return InstrumentSpec(
+        product_id=product_id,
+        exchange=info["exchange"],
+        symbol=info["ccxt"],
+        base=info["base"],
+        quote=info["quote"],
+        quantity_step=quantity_step,
+        price_tick=price_tick,
+        min_notional=min_notional,
+        min_quantity=min_quantity,
+        multiplier=multiplier,
+        tick_value=tick_value,
+        fee_model=fee_model,
+        session_calendar_id=session_calendar_id,
+    )
+
+
+def instrument_spec_from_ccxt_market(
+    product_id: str,
+    market: dict[str, Any] | None,
+    *,
+    precision_mode: PrecisionMode | None,
+) -> InstrumentSpec:
+    quantity_step = None
+    price_tick = None
+    min_notional = None
+    min_quantity = None
+
+    if market:
+        limits = market.get("limits") or {}
+        amount_limits = limits.get("amount") or {}
+        cost_limits = limits.get("cost") or {}
+        min_quantity = _decimal_or_none(amount_limits.get("min"))
+        min_notional = _decimal_or_none(cost_limits.get("min"))
+        precision = market.get("precision") or {}
+        if isinstance(precision, dict):
+            quantity_step = _step_from_precision(
+                precision.get("amount"),
+                precision_mode,
+            )
+            price_tick = _step_from_precision(
+                precision.get("price"),
+                precision_mode,
+            )
+
+        info = market.get("info") or {}
+        if isinstance(info, dict):
+            lot_size_filter = info.get("lotSizeFilter") or {}
+            if isinstance(lot_size_filter, dict):
+                quantity_step = _decimal_or_none(
+                    lot_size_filter.get("qtyStep"),
+                    fallback=quantity_step,
+                )
+                min_quantity = _decimal_or_none(
+                    lot_size_filter.get("minOrderQty"),
+                    fallback=min_quantity,
+                )
+                min_notional = _decimal_or_none(
+                    lot_size_filter.get("minNotionalValue"),
+                    fallback=min_notional,
+                )
+            price_filter = info.get("priceFilter") or {}
+            if isinstance(price_filter, dict):
+                price_tick = _decimal_or_none(
+                    price_filter.get("tickSize"),
+                    fallback=price_tick,
+                )
+
+        filters = info.get("filters") if isinstance(info, dict) else []
+        filters = filters or []
+        if isinstance(filters, list):
+            for exchange_filter in filters:
+                filter_type = exchange_filter.get("filterType")
+                if filter_type == "LOT_SIZE":
+                    quantity_step = _decimal_or_none(
+                        exchange_filter.get("stepSize"),
+                        fallback=quantity_step,
+                    )
+                    min_quantity = _decimal_or_none(
+                        exchange_filter.get("minQty"),
+                        fallback=min_quantity,
+                    )
+                elif filter_type == "PRICE_FILTER":
+                    price_tick = _decimal_or_none(
+                        exchange_filter.get("tickSize"),
+                        fallback=price_tick,
+                    )
+                elif filter_type in {"MIN_NOTIONAL", "NOTIONAL"}:
+                    min_notional = _decimal_or_none(
+                        exchange_filter.get("minNotional")
+                        or exchange_filter.get("notional"),
+                        fallback=min_notional,
+                    )
+
+    return instrument_spec_from_product(
+        product_id,
+        quantity_step=quantity_step,
+        price_tick=price_tick,
+        min_notional=min_notional,
+        min_quantity=min_quantity,
+    )
+
+
+def quantize_order_values(
+    *,
+    quantity: Decimal,
+    price: Decimal | None,
+    side: str | None = None,
+    trigger_price: Decimal | None = None,
+    spec: InstrumentSpec,
+) -> QuantizedOrder:
+    quantized_quantity = _floor_to_step(quantity, spec.quantity_step)
+    quantized_price = (
+        _quantize_limit_price(price, spec.price_tick, side)
+        if price is not None
+        else None
+    )
+    quantized_trigger_price = (
+        _require_on_step("trigger_price", trigger_price, spec.price_tick)
+        if trigger_price is not None
+        else None
+    )
+    return QuantizedOrder(
+        quantity=quantized_quantity,
+        price=quantized_price,
+        trigger_price=quantized_trigger_price,
+        changed=(
+            quantized_quantity != quantity
+            or quantized_price != price
+            or quantized_trigger_price != trigger_price
+        ),
+    )
+
+
+def validate_min_notional(
+    *,
+    quantity: Decimal,
+    price: Decimal | None,
+    reference_price: Decimal | None = None,
+    spec: InstrumentSpec,
+) -> None:
+    """Validate min notional using order price or an execution reference price.
+
+    Reference price is an estimate for market orders; the exchange remains the
+    final rejection point if the execution price moves through the threshold.
+    """
+    if quantity <= 0:
+        raise ValueError(f"quantity_must_be_positive: quantity={quantity}")
+    if spec.min_quantity is not None and quantity < spec.min_quantity:
+        raise ValueError(
+            f"quantity_below_min: quantity={quantity} min_quantity={spec.min_quantity}"
+        )
+    if spec.min_notional is None:
+        return
+    effective_price = price if price is not None else reference_price
+    if effective_price is None:
+        raise ValueError(
+            "min_notional_unverifiable: market order without reference price, "
+            f"min_notional={spec.min_notional}"
+        )
+    notional = quantity * effective_price
+    if notional < spec.min_notional:
+        raise ValueError(
+            f"min_notional_not_met: notional={notional} min_notional={spec.min_notional}"
+        )
+
+
+def _floor_to_step(value: Decimal, step: Decimal | None) -> Decimal:
+    if step is None or step <= 0:
+        return value
+    return (value / step).to_integral_value(rounding=ROUND_DOWN) * step
+
+
+def _ceil_to_step(value: Decimal, step: Decimal | None) -> Decimal:
+    if step is None or step <= 0:
+        return value
+    return (value / step).to_integral_value(rounding=ROUND_UP) * step
+
+
+def _quantize_limit_price(
+    price: Decimal,
+    tick: Decimal | None,
+    side: str | None,
+) -> Decimal:
+    if tick is None or tick <= 0 or _floor_to_step(price, tick) == price:
+        return price
+
+    normalized_side = side.lower() if side is not None else None
+    if normalized_side == "buy":
+        return _floor_to_step(price, tick)
+    if normalized_side == "sell":
+        return _ceil_to_step(price, tick)
+    raise ValueError(f"price_off_tick_without_side: price={price} tick={tick}")
+
+
+def _require_on_step(label: str, value: Decimal, step: Decimal | None) -> Decimal:
+    if step is None or step <= 0 or _floor_to_step(value, step) == value:
+        return value
+    raise ValueError(f"{label}_off_tick: {label}={value} tick={step}")
+
+
+def _step_from_precision(
+    value: Any,
+    precision_mode: PrecisionMode | None,
+) -> Decimal | None:
+    if value is None or value == "":
+        return None
+
+    text = str(value)
+    decimal = Decimal(text)
+
+    if precision_mode == PrecisionMode.TICK_SIZE:
+        if decimal <= 0:
+            logger.warning(
+                "Ignoring non-positive TICK_SIZE precision value: value=%s",
+                value,
+            )
+            return None
+        return decimal
+
+    if precision_mode == PrecisionMode.DECIMAL_PLACES:
+        is_integer_text = "." not in text and "e" not in text.lower()
+        if decimal == decimal.to_integral_value() and is_integer_text:
+            return Decimal(1).scaleb(-int(decimal))
+        logger.warning(
+            "Ignoring non-integer DECIMAL_PLACES precision value: value=%s",
+            value,
+        )
+        return None
+
+    if precision_mode == PrecisionMode.SIGNIFICANT_DIGITS:
+        return None
+
+    logger.warning(
+        "Ignoring precision value without supported precisionMode: value=%s precision_mode=%s",
+        value,
+        precision_mode,
+    )
+    return None
+
+
+def _decimal_or_none(value: Any, fallback: Decimal | None = None) -> Decimal | None:
+    if value is None or value == "":
+        return fallback
+    decimal = Decimal(str(value))
+    if decimal <= 0:
+        return fallback
+    return decimal

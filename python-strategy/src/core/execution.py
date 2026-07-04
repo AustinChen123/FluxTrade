@@ -542,6 +542,17 @@ class ExecutionEngine:
             quantity=qty,
             price=limit_price
         )
+        self._attach_min_notional_reference_price(order, candle)
+        conditional_orders = self._create_conditional_orders(signal, order, qty, candle)
+        try:
+            self._validate_order_group([order, *conditional_orders])
+        except ExchangeError as e:
+            self.logger.error("Execution validation failed: %s", e)
+            self.order_manager.fail_order(order, str(e))
+            for conditional_order in conditional_orders:
+                self.order_manager.fail_order(conditional_order, str(e))
+            ORDERS_TOTAL.labels(order_type=order_type, status="failed").inc()
+            return None
 
         # 2. Execute via Adapter
         try:
@@ -555,6 +566,8 @@ class ExecutionEngine:
         except ExchangeError as e:
             self.logger.error("Execution Failed: %s", e)
             self.order_manager.fail_order(order, str(e))
+            for conditional_order in conditional_orders:
+                self.order_manager.fail_order(conditional_order, "entry_placement_failed")
             ORDERS_TOTAL.labels(order_type=order_type, status="failed").inc()
             return None
 
@@ -566,8 +579,10 @@ class ExecutionEngine:
                     "order_id": str(order.id),
                     "side": side,
                     "order_type": order_type,
-                    "quantity": str(qty),
-                    "price": str(limit_price) if limit_price else "market",
+                    # Post-placement order fields: quantization may have adjusted
+                    # the submitted values away from the pre-validation locals.
+                    "quantity": str(order.quantity),
+                    "price": str(order.price) if order.price else "market",
                     "stop_loss": str(signal.stop_loss) if signal.stop_loss else None,
                     "take_profit": str(signal.take_profit) if signal.take_profit else None,
                     "trailing_distance": str(signal.trailing_distance) if signal.trailing_distance else None,
@@ -577,8 +592,8 @@ class ExecutionEngine:
             )
 
         # 4. Place conditional orders (SL/TP/Trailing)
-        if signal.stop_loss or signal.take_profit or signal.trailing_distance:
-            self._place_conditional_orders(signal, order, qty)
+        if conditional_orders:
+            self._place_conditional_orders(conditional_orders)
 
         return order.id
 
@@ -615,6 +630,7 @@ class ExecutionEngine:
                 "order_type": order_type,
                 "quantity": qty,
                 "price": limit_price,
+                "min_notional_reference_price": candle.close if candle else None,
                 "client_order_id": client_order_id,
             },
         }
@@ -627,6 +643,8 @@ class ExecutionEngine:
             client_order_id=client_order_id,
             intent_payload=intent_payload,
         )
+        self._attach_min_notional_reference_price(order, candle)
+        conditional_orders = self._create_conditional_orders(signal, order, qty, candle)
 
         with self._db_session_factory() as db:
             audit = build_signal_intent_audit(
@@ -638,6 +656,7 @@ class ExecutionEngine:
             write_signal_audit_intent(db, audit)
 
         try:
+            self._validate_order_group([order, *conditional_orders])
             self.order_manager.mark_submitted_unconfirmed(order)
             self.logger.info("Sending Order %s via Adapter...", order.id)
             t0 = _time.monotonic()
@@ -649,6 +668,8 @@ class ExecutionEngine:
         except ExchangeError as e:
             self.logger.error("Execution Failed: %s", e)
             self.order_manager.fail_order(order, str(e))
+            for conditional_order in conditional_orders:
+                self.order_manager.fail_order(conditional_order, str(e))
             ORDERS_TOTAL.labels(order_type=order_type, status="failed").inc()
             with self._db_session_factory() as db:
                 write_signal_audit_outcome(
@@ -676,8 +697,10 @@ class ExecutionEngine:
                     "order_id": str(order.id),
                     "side": side,
                     "order_type": order_type,
-                    "quantity": str(qty),
-                    "price": str(limit_price) if limit_price else "market",
+                    # Post-placement order fields: quantization may have adjusted
+                    # the submitted values away from the pre-validation locals.
+                    "quantity": str(order.quantity),
+                    "price": str(order.price) if order.price else "market",
                     "stop_loss": str(signal.stop_loss) if signal.stop_loss else None,
                     "take_profit": str(signal.take_profit) if signal.take_profit else None,
                     "trailing_distance": str(signal.trailing_distance) if signal.trailing_distance else None,
@@ -686,10 +709,18 @@ class ExecutionEngine:
                 trade_id=str(order.id),
             )
 
-        if signal.stop_loss or signal.take_profit or signal.trailing_distance:
-            self._place_conditional_orders(signal, order, qty)
+        if conditional_orders:
+            self._place_conditional_orders(conditional_orders)
 
         return order.id
+
+    def _attach_min_notional_reference_price(
+        self,
+        order,
+        candle: Optional[Candlestick],
+    ) -> None:
+        if candle is not None:
+            order.min_notional_reference_price = candle.close
 
     def _client_order_id_for_signal(self, signal: Signal) -> str:
         client_order_id = (signal.metadata or {}).get("client_order_id")
@@ -729,13 +760,20 @@ class ExecutionEngine:
             return position
         return None
 
-    def _place_conditional_orders(self, signal: Signal, entry_order, qty: Decimal):
-        """Submit SL/TP/Trailing orders linked via OCO to each other."""
+    def _create_conditional_orders(
+        self,
+        signal: Signal,
+        entry_order,
+        qty: Decimal,
+        candle: Optional[Candlestick],
+    ) -> list:
+        """Create SL/TP/Trailing orders linked via OCO before external placement."""
         # Closing side is opposite of entry
         close_side = OrderSide.SELL if entry_order.side.lower() == "buy" else OrderSide.BUY
 
         sl_order = None
         tp_order = None
+        conditional_orders = []
 
         # Create SL order
         if signal.stop_loss:
@@ -746,6 +784,8 @@ class ExecutionEngine:
                 quantity=qty,
                 trigger_price=signal.stop_loss,
             )
+            self._attach_min_notional_reference_price(sl_order, candle)
+            conditional_orders.append(sl_order)
 
         # Create TP order
         if signal.take_profit:
@@ -756,26 +796,13 @@ class ExecutionEngine:
                 quantity=qty,
                 trigger_price=signal.take_profit,
             )
+            self._attach_min_notional_reference_price(tp_order, candle)
+            conditional_orders.append(tp_order)
 
         # Link OCO: SL and TP cancel each other
         if sl_order and tp_order:
             sl_order._linked_order_id = tp_order.id
             tp_order._linked_order_id = sl_order.id
-
-        # Place orders via adapter
-        if sl_order:
-            try:
-                ex_id = self.adapter.place_order(sl_order)
-                self.order_manager.update_exchange_order_id(sl_order, ex_id)
-            except ExchangeError as e:
-                self.logger.error("Failed to place SL order: %s", e)
-
-        if tp_order:
-            try:
-                ex_id = self.adapter.place_order(tp_order)
-                self.order_manager.update_exchange_order_id(tp_order, ex_id)
-            except ExchangeError as e:
-                self.logger.error("Failed to place TP order: %s", e)
 
         # Create Trailing Stop order
         if signal.trailing_distance:
@@ -787,11 +814,31 @@ class ExecutionEngine:
                 trigger_price=signal.stop_loss,
             )
             ts_order._trailing_distance = signal.trailing_distance
+            self._attach_min_notional_reference_price(ts_order, candle)
+            conditional_orders.append(ts_order)
+
+        return conditional_orders
+
+    def _validate_order_group(self, orders: list) -> None:
+        validate_order = getattr(self.adapter, "validate_order", None)
+        if validate_order is None:
+            return
+        for order in orders:
+            validate_order(order)
+
+    def _place_conditional_orders(self, conditional_orders: list):
+        """Submit prevalidated SL/TP/Trailing orders linked via OCO to each other."""
+        for order in conditional_orders:
             try:
-                ex_id = self.adapter.place_order(ts_order)
-                self.order_manager.update_exchange_order_id(ts_order, ex_id)
+                ex_id = self.adapter.place_order(order)
+                self.order_manager.update_exchange_order_id(order, ex_id)
             except ExchangeError as e:
-                self.logger.error("Failed to place trailing stop order: %s", e)
+                label = {
+                    "stop_loss": "SL",
+                    "take_profit": "TP",
+                    "trailing_stop": "trailing stop",
+                }.get(order.type, order.type)
+                self.logger.error("Failed to place %s order: %s", label, e)
 
     def _journal_fill(self, order, price, qty, fee, fill_type: str, candle: Optional[Candlestick] = None) -> None:
         """Record a fill event to the journal."""
