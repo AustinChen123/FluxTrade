@@ -566,6 +566,8 @@ class ExecutionEngine:
         except ExchangeError as e:
             self.logger.error("Execution Failed: %s", e)
             self.order_manager.fail_order(order, str(e))
+            for conditional_order in conditional_orders:
+                self.order_manager.fail_order(conditional_order, "entry_placement_failed")
             ORDERS_TOTAL.labels(order_type=order_type, status="failed").inc()
             return None
 

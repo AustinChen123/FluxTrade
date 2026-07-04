@@ -477,6 +477,32 @@ class TestExecutionErrorHandling:
         failed_orders = [o for o in mock_order_repo.orders.values() if o.status == "failed"]
         assert len(failed_orders) == 1
 
+    def test_adapter_failure_fails_precreated_conditional_orders(
+        self, execution_engine, signal_factory, mock_exchange_adapter, mock_order_repo
+    ):
+        """Entry placement failure must not leave pre-created SL/TP/trailing orders non-terminal."""
+        mock_exchange_adapter.set_should_fail(True, "Connection timeout")
+
+        signal = signal_factory(
+            price=Decimal("42000"),
+            stop_loss=Decimal("41000"),
+            take_profit=Decimal("43000"),
+            trailing_distance=Decimal("100"),
+        )
+        result = execution_engine.execute_signal(signal)
+
+        assert result is None
+        orders = list(mock_order_repo.orders.values())
+        assert {order.type for order in orders} == {
+            "limit",
+            "stop_loss",
+            "take_profit",
+            "trailing_stop",
+        }
+        assert all(order.status == "failed" for order in orders)
+        conditional_orders = [o for o in orders if o.type != "limit"]
+        assert len(conditional_orders) == 3
+
     def test_adapter_failure_returns_none(
         self, execution_engine, signal_factory, mock_exchange_adapter
     ):
