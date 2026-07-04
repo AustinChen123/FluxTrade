@@ -12,7 +12,12 @@ from src.core.adapters.simulated import SimulatedAdapter
 from src.core.client_order_id import to_exchange_format
 from src.core.interfaces.exchange import ExchangeError, InsufficientFundsError, NetworkError
 from src.core.orm_models import Order
-from src.core.product_registry import PrecisionMode, instrument_spec_from_ccxt_market
+from src.core.product_registry import (
+    PrecisionMode,
+    instrument_spec_from_ccxt_market,
+    instrument_spec_from_product,
+    validate_min_notional,
+)
 
 CANONICAL_CLIENT_ORDER_ID = "strategy_1-worker_a-entry-1704067200000000000"
 
@@ -483,6 +488,116 @@ class TestPlaceOrder:
             adapter.place_order(order)
 
         mock_ccxt_client.create_order.assert_not_called()
+
+    def test_rejects_market_order_when_min_notional_has_no_reference_price(
+        self, adapter, mock_ccxt_client
+    ):
+        mock_ccxt_client.load_markets.return_value = {
+            "BTC/USDT:USDT": {
+                "info": {
+                    "filters": [
+                        {"filterType": "LOT_SIZE", "stepSize": "0.001"},
+                        {"filterType": "MIN_NOTIONAL", "minNotional": "10"},
+                    ],
+                },
+            },
+        }
+        order = _make_order(
+            type="market",
+            quantity=Decimal("0.001"),
+            price=None,
+        )
+
+        with pytest.raises(ExchangeError, match="min_notional_unverifiable"):
+            adapter.place_order(order)
+
+        mock_ccxt_client.create_order.assert_not_called()
+
+    def test_checks_market_min_notional_with_reference_price(
+        self, adapter, mock_ccxt_client
+    ):
+        mock_ccxt_client.load_markets.return_value = {
+            "BTC/USDT:USDT": {
+                "info": {
+                    "filters": [
+                        {"filterType": "LOT_SIZE", "stepSize": "0.001"},
+                        {"filterType": "MIN_NOTIONAL", "minNotional": "10"},
+                    ],
+                },
+            },
+        }
+        mock_ccxt_client.create_order.return_value = {"id": "EX-MARKET"}
+        order = _make_order(
+            type="market",
+            quantity=Decimal("0.001"),
+            price=None,
+        )
+        order.min_notional_reference_price = Decimal("12000")
+
+        result = adapter.place_order(order)
+
+        assert result == "EX-MARKET"
+        mock_ccxt_client.create_order.assert_called_once()
+
+    def test_rejects_market_min_notional_with_low_reference_price(
+        self, adapter, mock_ccxt_client
+    ):
+        mock_ccxt_client.load_markets.return_value = {
+            "BTC/USDT:USDT": {
+                "info": {
+                    "filters": [
+                        {"filterType": "LOT_SIZE", "stepSize": "0.001"},
+                        {"filterType": "MIN_NOTIONAL", "minNotional": "10"},
+                    ],
+                },
+            },
+        }
+        order = _make_order(
+            type="market",
+            quantity=Decimal("0.001"),
+            price=None,
+        )
+        order.min_notional_reference_price = Decimal("5000")
+
+        with pytest.raises(ExchangeError, match="min_notional_not_met"):
+            adapter.place_order(order)
+
+        mock_ccxt_client.create_order.assert_not_called()
+
+    @pytest.mark.parametrize(
+        ("min_notional", "price", "reference_price", "raises"),
+        [
+            (None, None, None, None),
+            (Decimal("10"), None, None, "min_notional_unverifiable"),
+            (Decimal("10"), Decimal("5000"), None, "min_notional_not_met"),
+            (Decimal("10"), Decimal("12000"), None, None),
+            (Decimal("10"), None, Decimal("5000"), "min_notional_not_met"),
+            (Decimal("10"), None, Decimal("12000"), None),
+        ],
+    )
+    def test_min_notional_validation_matrix(
+        self, min_notional, price, reference_price, raises
+    ):
+        spec = instrument_spec_from_product(
+            "BINANCE:BTCUSDT-PERP",
+            min_notional=min_notional,
+        )
+
+        if raises is None:
+            validate_min_notional(
+                quantity=Decimal("0.001"),
+                price=price,
+                reference_price=reference_price,
+                spec=spec,
+            )
+        else:
+            with pytest.raises(ValueError, match=raises):
+                validate_min_notional(
+                    quantity=Decimal("0.001"),
+                    price=price,
+                    reference_price=reference_price,
+                    spec=spec,
+                )
 
     def test_market_rule_load_error_raises_exchange_error(self, adapter, mock_ccxt_client):
         import ccxt as ccxt_lib

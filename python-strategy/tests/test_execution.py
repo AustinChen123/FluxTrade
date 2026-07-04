@@ -285,6 +285,106 @@ class TestExecutionTradingRules:
         assert audit.outcome_payload["status"] == "failed"
         assert "min_notional_not_met" in audit.outcome_payload["error"]
 
+    def test_market_min_notional_without_reference_price_fails_local_order_and_audit(
+        self, mock_db_session, mock_clock, mock_order_repo, signal_factory
+    ):
+        adapter, client = _ccxt_adapter_with_market_rules(_binance_btcusdt_market_rules())
+        engine = ExecutionEngine(
+            db_session=mock_db_session,
+            clock=mock_clock,
+            adapter=adapter,
+            order_repository=mock_order_repo,
+            db_session_factory=lambda: nullcontext(mock_db_session),
+            audit_external_orders=True,
+        )
+        signal = signal_factory(
+            product_id="BINANCE:BTCUSDT-PERP",
+            price=None,
+            value=None,
+            quantity=Decimal("0.001"),
+        )
+
+        with pytest.raises(ExchangeError, match="min_notional_unverifiable"):
+            engine.execute_signal(signal)
+
+        client.create_order.assert_not_called()
+        failed_orders = [o for o in mock_order_repo.orders.values() if o.status == "failed"]
+        assert len(failed_orders) == 1
+        audit = mock_db_session.add.call_args_list[0].args[0]
+        assert audit.order_id == failed_orders[0].id
+        assert audit.risk_message is not None
+        assert "min_notional_unverifiable" in audit.risk_message
+        assert audit.outcome_payload["status"] == "failed"
+        assert "min_notional_unverifiable" in audit.outcome_payload["error"]
+
+    def test_market_min_notional_uses_candle_close_reference_price(
+        self,
+        mock_db_session,
+        mock_clock,
+        mock_order_repo,
+        signal_factory,
+        candlestick_factory,
+    ):
+        adapter, client = _ccxt_adapter_with_market_rules(_binance_btcusdt_market_rules())
+        engine = ExecutionEngine(
+            db_session=mock_db_session,
+            clock=mock_clock,
+            adapter=adapter,
+            order_repository=mock_order_repo,
+            db_session_factory=lambda: nullcontext(mock_db_session),
+            audit_external_orders=True,
+        )
+        signal = signal_factory(
+            product_id="BINANCE:BTCUSDT-PERP",
+            price=None,
+            value=None,
+            quantity=Decimal("0.001"),
+        )
+        candle = candlestick_factory(
+            product_id="BINANCE:BTCUSDT-PERP",
+            close=Decimal("12000"),
+        )
+
+        order_id = engine.execute_signal(signal, candle=candle)
+
+        assert order_id is not None
+        order = mock_order_repo.orders[order_id]
+        assert getattr(order, "min_notional_reference_price") == Decimal("12000")
+        client.create_order.assert_called_once()
+
+    def test_market_min_notional_rejects_low_candle_close_reference_price(
+        self,
+        mock_db_session,
+        mock_clock,
+        mock_order_repo,
+        signal_factory,
+        candlestick_factory,
+    ):
+        adapter, client = _ccxt_adapter_with_market_rules(_binance_btcusdt_market_rules())
+        engine = ExecutionEngine(
+            db_session=mock_db_session,
+            clock=mock_clock,
+            adapter=adapter,
+            order_repository=mock_order_repo,
+            db_session_factory=lambda: nullcontext(mock_db_session),
+            audit_external_orders=True,
+        )
+        signal = signal_factory(
+            product_id="BINANCE:BTCUSDT-PERP",
+            price=None,
+            value=None,
+            quantity=Decimal("0.001"),
+        )
+        candle = candlestick_factory(
+            product_id="BINANCE:BTCUSDT-PERP",
+            close=Decimal("5000"),
+        )
+
+        with pytest.raises(ExchangeError, match="min_notional_not_met"):
+            engine.execute_signal(signal, candle=candle)
+
+        client.create_order.assert_not_called()
+
 
 class TestExecutionErrorHandling:
     """Tests for error handling during execution."""

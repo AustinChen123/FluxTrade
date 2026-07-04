@@ -199,6 +199,7 @@ class CcxtExchangeAdapter(IExchangeAdapter):
             validate_min_notional(
                 quantity=quantized.quantity,
                 price=notional_price,
+                reference_price=getattr(order, "min_notional_reference_price", None),
                 spec=spec,
             )
         except ValueError as e:

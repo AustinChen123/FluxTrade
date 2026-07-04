@@ -542,6 +542,7 @@ class ExecutionEngine:
             quantity=qty,
             price=limit_price
         )
+        self._attach_min_notional_reference_price(order, candle)
 
         # 2. Execute via Adapter
         try:
@@ -615,6 +616,7 @@ class ExecutionEngine:
                 "order_type": order_type,
                 "quantity": qty,
                 "price": limit_price,
+                "min_notional_reference_price": candle.close if candle else None,
                 "client_order_id": client_order_id,
             },
         }
@@ -627,6 +629,7 @@ class ExecutionEngine:
             client_order_id=client_order_id,
             intent_payload=intent_payload,
         )
+        self._attach_min_notional_reference_price(order, candle)
 
         with self._db_session_factory() as db:
             audit = build_signal_intent_audit(
@@ -690,6 +693,14 @@ class ExecutionEngine:
             self._place_conditional_orders(signal, order, qty)
 
         return order.id
+
+    def _attach_min_notional_reference_price(
+        self,
+        order,
+        candle: Optional[Candlestick],
+    ) -> None:
+        if candle is not None:
+            order.min_notional_reference_price = candle.close
 
     def _client_order_id_for_signal(self, signal: Signal) -> str:
         client_order_id = (signal.metadata or {}).get("client_order_id")

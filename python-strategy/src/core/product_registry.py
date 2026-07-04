@@ -334,17 +334,29 @@ def validate_min_notional(
     *,
     quantity: Decimal,
     price: Decimal | None,
+    reference_price: Decimal | None = None,
     spec: InstrumentSpec,
 ) -> None:
+    """Validate min notional using order price or an execution reference price.
+
+    Reference price is an estimate for market orders; the exchange remains the
+    final rejection point if the execution price moves through the threshold.
+    """
     if quantity <= 0:
         raise ValueError(f"quantity_must_be_positive: quantity={quantity}")
     if spec.min_quantity is not None and quantity < spec.min_quantity:
         raise ValueError(
             f"quantity_below_min: quantity={quantity} min_quantity={spec.min_quantity}"
         )
-    if price is None or spec.min_notional is None:
+    if spec.min_notional is None:
         return
-    notional = quantity * price
+    effective_price = price if price is not None else reference_price
+    if effective_price is None:
+        raise ValueError(
+            "min_notional_unverifiable: market order without reference price, "
+            f"min_notional={spec.min_notional}"
+        )
+    notional = quantity * effective_price
     if notional < spec.min_notional:
         raise ValueError(
             f"min_notional_not_met: notional={notional} min_notional={spec.min_notional}"
