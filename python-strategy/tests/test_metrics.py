@@ -60,7 +60,7 @@ class TestMetricsIncrement:
         ).inc()
 
     def test_orders_total_inc(self):
-        ORDERS_TOTAL.labels(order_type="market", status="placed").inc()
+        ORDERS_TOTAL.labels(order_type="market", status="placed", reason="none").inc()
 
     def test_execution_latency_observe(self):
         EXECUTION_LATENCY.observe(0.042)

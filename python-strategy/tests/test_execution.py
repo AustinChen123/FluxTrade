@@ -22,6 +22,7 @@ from src.core.interfaces.exchange import ExchangeOrderSnapshot
 from src.core.interfaces.exchange import ExchangeError
 from src.core.interfaces.exchange import ExchangeOrderLookupUnsupported
 from src.core.models import OrderStatus, Position, PositionSide, SignalType
+from src.core.orm_models import SystemEvent
 from src.core.client_order_id import generate_client_order_id, parse_client_order_id
 
 
@@ -254,6 +255,46 @@ class TestExecutionTradingRules:
         assert call.kwargs["amount"] == "0.010"
         assert call.kwargs["price"] == "50123.40"
 
+    def test_quantizes_protective_trigger_and_persists_prevalidated_values(
+        self, mock_db_session, mock_clock, mock_order_repo, signal_factory
+    ):
+        adapter, client = _ccxt_adapter_with_market_rules(_binance_btcusdt_market_rules())
+        updated_order_ids = []
+        original_update_order = mock_order_repo.update_order
+
+        def track_update_order(order):
+            updated_order_ids.append(order.id)
+            original_update_order(order)
+
+        mock_order_repo.update_order = track_update_order
+        engine = ExecutionEngine(
+            db_session=mock_db_session,
+            clock=mock_clock,
+            adapter=adapter,
+            order_repository=mock_order_repo,
+        )
+        signal = signal_factory(
+            product_id="BINANCE:BTCUSDT-PERP",
+            price=Decimal("50123.456"),
+            quantity=Decimal("0.0109"),
+            stop_loss=Decimal("49999.987"),
+        )
+
+        order_id = engine.execute_signal(signal)
+
+        assert order_id is not None
+        assert client.create_order.call_count == 2
+        entry_order = mock_order_repo.orders[order_id]
+        stop_order = next(
+            order for order in mock_order_repo.orders.values() if order.type == "stop_loss"
+        )
+        assert entry_order.quantity == Decimal("0.010")
+        assert entry_order.price == Decimal("50123.40")
+        assert stop_order.quantity == Decimal("0.010")
+        assert stop_order.trigger_price == Decimal("50000.00")
+        assert entry_order.id in updated_order_ids
+        assert stop_order.id in updated_order_ids
+
     def test_entry_journal_records_quantized_values(
         self, mock_db_session, mock_clock, mock_order_repo, signal_factory
     ):
@@ -312,6 +353,17 @@ class TestExecutionTradingRules:
         assert "min_notional_not_met" in audit.risk_message
         assert audit.outcome_payload["status"] == "failed"
         assert "min_notional_not_met" in audit.outcome_payload["error"]
+        events = [
+            call.args[0]
+            for call in mock_db_session.add.call_args_list
+            if isinstance(call.args[0], SystemEvent)
+        ]
+        assert len(events) == 1
+        assert events[0].event_type == "system_error"
+        assert events[0].event_subtype == "order_rejected"
+        assert events[0].related_order_id == failed_orders[0].id
+        assert events[0].payload["reason"] == "min_notional_not_met"
+        assert events[0].payload["phase"] == "audited_execution"
 
     def test_market_min_notional_without_reference_price_fails_local_order_and_audit(
         self, mock_db_session, mock_clock, mock_order_repo, signal_factory

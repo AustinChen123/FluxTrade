@@ -23,7 +23,7 @@ SIGNALS_TOTAL = Counter(
 ORDERS_TOTAL = Counter(
     "fluxtrade_orders_total",
     "Total orders submitted to exchange adapter",
-    ["order_type", "status"],
+    ["order_type", "status", "reason"],
 )
 
 EXECUTION_LATENCY = Histogram(

@@ -439,8 +439,25 @@ class TestPlaceOrder:
         assert call_kwargs.kwargs["amount"] == "0.010"
         assert call_kwargs.kwargs["price"] == "50123.50"
 
-    def test_rejects_off_tick_trigger_price_before_placing_conditional_order(
-        self, adapter, mock_ccxt_client
+    @pytest.mark.parametrize(
+        ("order_type", "side", "trigger_price", "expected_trigger_price"),
+        [
+            ("stop_loss", "sell", Decimal("49999.987"), Decimal("50000.00")),
+            ("stop_loss", "buy", Decimal("49999.987"), Decimal("49999.90")),
+            ("take_profit", "sell", Decimal("50123.456"), Decimal("50123.50")),
+            ("take_profit", "buy", Decimal("50123.456"), Decimal("50123.40")),
+            ("trailing_stop", "sell", Decimal("49999.987"), Decimal("50000.00")),
+            ("trailing_stop", "buy", Decimal("49999.987"), Decimal("49999.90")),
+        ],
+    )
+    def test_quantizes_protective_trigger_price_directionally_before_placing(
+        self,
+        adapter,
+        mock_ccxt_client,
+        order_type,
+        side,
+        trigger_price,
+        expected_trigger_price,
     ):
         mock_ccxt_client.load_markets.return_value = {
             "BTC/USDT:USDT": {
@@ -455,8 +472,36 @@ class TestPlaceOrder:
         }
         mock_ccxt_client.create_order.return_value = {"id": "EX-SL"}
         order = _make_order(
-            type="stop_loss",
+            side=side,
+            type=order_type,
             quantity=Decimal("0.0109"),
+            price=None,
+            trigger_price=trigger_price,
+        )
+
+        adapter.place_order(order)
+
+        assert order.quantity == Decimal("0.010")
+        assert order.trigger_price == expected_trigger_price
+        mock_ccxt_client.create_order.assert_called_once()
+
+    def test_rejects_unknown_off_tick_trigger_price_policy(
+        self, adapter, mock_ccxt_client
+    ):
+        mock_ccxt_client.load_markets.return_value = {
+            "BTC/USDT:USDT": {
+                "info": {
+                    "filters": [
+                        {"filterType": "PRICE_FILTER", "tickSize": "0.10"},
+                        {"filterType": "LOT_SIZE", "stepSize": "0.001"},
+                        {"filterType": "MIN_NOTIONAL", "minNotional": "10"},
+                    ],
+                },
+            },
+        }
+        order = _make_order(
+            type="conditional",
+            quantity=Decimal("0.010"),
             price=None,
             trigger_price=Decimal("49999.987"),
         )

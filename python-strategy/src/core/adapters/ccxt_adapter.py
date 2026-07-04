@@ -196,6 +196,7 @@ class CcxtExchangeAdapter(IExchangeAdapter):
                 quantity=order.quantity,
                 price=order.price,
                 side=order.side,
+                order_type=order.type,
                 trigger_price=order.trigger_price,
                 spec=spec,
             )

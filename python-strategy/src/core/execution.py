@@ -551,7 +551,12 @@ class ExecutionEngine:
             self.order_manager.fail_order(order, str(e))
             for conditional_order in conditional_orders:
                 self.order_manager.fail_order(conditional_order, str(e))
-            ORDERS_TOTAL.labels(order_type=order_type, status="failed").inc()
+            self._record_order_rejection(
+                order=order,
+                order_type=order_type,
+                error=e,
+                phase="validation",
+            )
             return None
 
         # 2. Execute via Adapter
@@ -562,13 +567,22 @@ class ExecutionEngine:
             EXECUTION_LATENCY.observe(_time.monotonic() - t0)
             self.order_manager.update_exchange_order_id(order, exchange_id)
             self.logger.info("Order Placed. Internal: %s, Exchange: %s", order.id, exchange_id)
-            ORDERS_TOTAL.labels(order_type=order_type, status="placed").inc()
+            ORDERS_TOTAL.labels(
+                order_type=order_type,
+                status="placed",
+                reason="none",
+            ).inc()
         except ExchangeError as e:
             self.logger.error("Execution Failed: %s", e)
             self.order_manager.fail_order(order, str(e))
             for conditional_order in conditional_orders:
                 self.order_manager.fail_order(conditional_order, "entry_placement_failed")
-            ORDERS_TOTAL.labels(order_type=order_type, status="failed").inc()
+            self._record_order_rejection(
+                order=order,
+                order_type=order_type,
+                error=e,
+                phase="entry_placement",
+            )
             return None
 
         # 3. Journal: record entry
@@ -664,14 +678,32 @@ class ExecutionEngine:
             EXECUTION_LATENCY.observe(_time.monotonic() - t0)
             self.order_manager.mark_submitted(order, exchange_id)
             self.logger.info("Order Placed. Internal: %s, Exchange: %s", order.id, exchange_id)
-            ORDERS_TOTAL.labels(order_type=order_type, status="placed").inc()
+            ORDERS_TOTAL.labels(
+                order_type=order_type,
+                status="placed",
+                reason="none",
+            ).inc()
         except ExchangeError as e:
             self.logger.error("Execution Failed: %s", e)
             self.order_manager.fail_order(order, str(e))
             for conditional_order in conditional_orders:
                 self.order_manager.fail_order(conditional_order, str(e))
-            ORDERS_TOTAL.labels(order_type=order_type, status="failed").inc()
+            reason = self._record_order_rejection(
+                order=order,
+                order_type=order_type,
+                error=e,
+                phase="audited_execution",
+                write_event=False,
+            )
             with self._db_session_factory() as db:
+                self._write_order_rejection_event(
+                    db,
+                    order=order,
+                    order_type=order_type,
+                    reason=reason,
+                    error=e,
+                    phase="audited_execution",
+                )
                 write_signal_audit_outcome(
                     db,
                     audit,
@@ -825,6 +857,93 @@ class ExecutionEngine:
             return
         for order in orders:
             validate_order(order)
+            self.order_manager.repo.update_order(order)
+
+    def _record_order_rejection(
+        self,
+        *,
+        order,
+        order_type: str,
+        error: ExchangeError,
+        phase: str,
+        write_event: bool = True,
+    ) -> str:
+        reason = self._order_rejection_reason(error)
+        ORDERS_TOTAL.labels(
+            order_type=order_type,
+            status="failed",
+            reason=reason,
+        ).inc()
+        if write_event:
+            self._try_write_order_rejection_event(
+                order=order,
+                order_type=order_type,
+                reason=reason,
+                error=error,
+                phase=phase,
+            )
+        return reason
+
+    @staticmethod
+    def _order_rejection_reason(error: ExchangeError) -> str:
+        message = str(error)
+        token = message.split(":", 1)[0].strip()
+        normalized = "".join(
+            char if char.isalnum() else "_"
+            for char in token.lower()
+        ).strip("_")
+        return normalized or "exchange_error"
+
+    def _try_write_order_rejection_event(
+        self,
+        *,
+        order,
+        order_type: str,
+        reason: str,
+        error: ExchangeError,
+        phase: str,
+    ) -> None:
+        if self._db_session_factory is None:
+            return
+        try:
+            with self._db_session_factory() as db:
+                self._write_order_rejection_event(
+                    db,
+                    order=order,
+                    order_type=order_type,
+                    reason=reason,
+                    error=error,
+                    phase=phase,
+                )
+                db.commit()
+        except Exception:
+            self.logger.exception("Failed to write order rejection system event")
+
+    def _write_order_rejection_event(
+        self,
+        db: Session,
+        *,
+        order,
+        order_type: str,
+        reason: str,
+        error: ExchangeError,
+        phase: str,
+    ) -> None:
+        write_system_event(
+            db,
+            event_type="system_error",
+            event_subtype="order_rejected",
+            related_strategy_id=order.strategy_id,
+            related_order_id=str(order.id),
+            payload={
+                "order_id": str(order.id),
+                "product_id": order.product_id,
+                "order_type": order_type,
+                "phase": phase,
+                "reason": reason,
+                "error": str(error),
+            },
+        )
 
     def _place_conditional_orders(self, conditional_orders: list):
         """Submit prevalidated SL/TP/Trailing orders linked via OCO to each other."""
