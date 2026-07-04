@@ -286,16 +286,21 @@ class CcxtExchangeAdapter(IExchangeAdapter):
                 "account_position_mode_unsupported: "
                 f"exchange={self.exchange_id}"
             )
+        set_accepted = False
         try:
             set_position_mode(False, symbol)
+            set_accepted = True
         except ccxt.BaseError as e:
             if not self._is_account_setting_no_change_error(e):
                 raise ExchangeError(
                     f"account_position_mode_set_failed: symbol={symbol} error={e}"
                 ) from e
+            set_accepted = True
 
         fetch_position_mode = getattr(self.client, "fetch_position_mode", None)
         if not callable(fetch_position_mode):
+            if set_accepted:
+                return
             raise ExchangeError(
                 "account_position_mode_verification_unsupported: "
                 f"exchange={self.exchange_id}"
@@ -303,6 +308,8 @@ class CcxtExchangeAdapter(IExchangeAdapter):
         try:
             result = fetch_position_mode(symbol)
         except ccxt.BaseError as e:
+            if set_accepted and self._is_position_mode_verification_unsupported(e):
+                return
             raise ExchangeError(
                 f"account_position_mode_verify_failed: symbol={symbol} error={e}"
             ) from e
@@ -450,6 +457,14 @@ class CcxtExchangeAdapter(IExchangeAdapter):
             or "140026" in message
             or "140043" in message
             or "34036" in message
+        )
+
+    @staticmethod
+    def _is_position_mode_verification_unsupported(error: ccxt.BaseError) -> bool:
+        message = str(error).lower()
+        return (
+            "fetchpositionmode" in message
+            and "not supported" in message
         )
 
     def _quantize_order(self, order: Order) -> None:
