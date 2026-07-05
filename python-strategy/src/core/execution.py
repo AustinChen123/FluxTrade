@@ -663,6 +663,24 @@ class ExecutionEngine:
                     "exchange_order_id": order.exchange_order_id,
                     "failures": placement_failures,
                 }
+            protective_partial_failure = (
+                self._protective_partial_fill_requires_resize(order, event_state)
+            )
+            if protective_partial_failure is not None:
+                self._try_write_conditional_order_event_warning(
+                    event_subtype="protective_partial_fill_requires_resize",
+                    order=order,
+                    failures=[protective_partial_failure],
+                )
+                return {
+                    "action": "unresolved_protective_partial_fill_requires_resize",
+                    "order_id": order.id,
+                    "status": event.status,
+                    "state": event_state,
+                    "fill_quantity": fill_delta["quantity"],
+                    "exchange_order_id": order.exchange_order_id,
+                    "failure": protective_partial_failure,
+                }
             cancel_failure = self._cancel_linked_conditional_order_for_protection_fill(order)
             if cancel_failure is not None:
                 self._try_write_conditional_order_event_warning(
@@ -1561,6 +1579,24 @@ class ExecutionEngine:
             order.quantity = protected_quantity
             self.order_manager.repo.update_order(order)
         return self._place_conditional_orders(pending)
+
+    @staticmethod
+    def _protective_partial_fill_requires_resize(order, event_state: str) -> dict | None:
+        if order.type not in {"stop_loss", "take_profit", "trailing_stop"}:
+            return None
+        if event_state in {"filled", "liquidated"}:
+            return None
+        if not isinstance(order.intent_payload, dict):
+            return None
+        linked_order_id = order.intent_payload.get("linked_order_id")
+        if not linked_order_id:
+            return None
+        return {
+            "order_id": str(order.id),
+            "order_type": order.type,
+            "linked_order_id": str(linked_order_id),
+            "reason": "protective_partial_fill_requires_resize",
+        }
 
     def _cancel_linked_conditional_order_for_protection_fill(self, order) -> dict | None:
         if order.type not in {"stop_loss", "take_profit", "trailing_stop"}:

@@ -2249,7 +2249,7 @@ class TestAuditedExecution:
         assert take_profit.status == OrderStatus.CANCELLED.value
         assert take_profit not in mock_exchange_adapter.open_orders
 
-    def test_partial_protective_fill_cancels_linked_sibling(
+    def test_partial_protective_fill_keeps_linked_sibling_and_reports_unresolved(
         self, mock_db_session, mock_clock, mock_exchange_adapter, mock_order_repo, signal_factory
     ):
         audit_session = mock_db_session
@@ -2296,10 +2296,18 @@ class TestAuditedExecution:
             )
         )
 
-        assert result["action"] == "applied"
+        assert result["action"] == "unresolved_protective_partial_fill_requires_resize"
         assert stop_loss.status == OrderStatus.PARTIALLY_FILLED.value
-        assert take_profit.status == OrderStatus.CANCELLED.value
-        assert take_profit not in mock_exchange_adapter.open_orders
+        assert take_profit.status == OrderStatus.SUBMITTED.value
+        assert take_profit in mock_exchange_adapter.open_orders
+        event = next(
+            call.args[0]
+            for call in audit_session.add.call_args_list
+            if isinstance(call.args[0], SystemEvent)
+            and call.args[0].event_subtype
+            == "protective_partial_fill_requires_resize"
+        )
+        assert event.related_order_id == stop_loss.id
 
     def test_filled_protective_order_reports_unresolved_when_sibling_cancel_fails(
         self, mock_db_session, mock_clock, mock_exchange_adapter, mock_order_repo, signal_factory
