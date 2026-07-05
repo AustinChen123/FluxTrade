@@ -2053,6 +2053,99 @@ class TestAuditedExecution:
         }
         assert all(order.exchange_order_id for order in conditional_orders)
 
+    def test_partial_entry_fill_places_protection_for_filled_quantity(
+        self, mock_db_session, mock_clock, mock_exchange_adapter, mock_order_repo, signal_factory
+    ):
+        audit_session = mock_db_session
+        engine = ExecutionEngine(
+            db_session=mock_db_session,
+            clock=mock_clock,
+            adapter=mock_exchange_adapter,
+            order_repository=mock_order_repo,
+            db_session_factory=lambda: nullcontext(audit_session),
+            audit_external_orders=True,
+            is_backtest=True,
+        )
+        order_id = engine.execute_signal(
+            signal_factory(
+                price=Decimal("42000"),
+                quantity=Decimal("0.10"),
+                stop_loss=Decimal("41000"),
+                take_profit=Decimal("43000"),
+            )
+        )
+        entry = mock_order_repo.orders[order_id]
+
+        result = engine.process_exchange_order_event(
+            ExchangeOrderEvent(
+                status="partially_filled",
+                product_id=entry.product_id,
+                exchange_order_id=entry.exchange_order_id,
+                cumulative_filled_quantity=Decimal("0.04"),
+                cumulative_average_price=entry.price,
+            )
+        )
+
+        conditional_orders = [
+            order for order in mock_order_repo.orders.values() if order.id != order_id
+        ]
+        assert result["action"] == "applied"
+        assert entry.status == OrderStatus.PARTIALLY_FILLED.value
+        assert {order.status for order in conditional_orders} == {
+            OrderStatus.SUBMITTED.value
+        }
+        assert {order.quantity for order in conditional_orders} == {Decimal("0.04")}
+
+    def test_entry_fill_increment_after_protection_reports_unresolved_resize(
+        self, mock_db_session, mock_clock, mock_exchange_adapter, mock_order_repo, signal_factory
+    ):
+        audit_session = mock_db_session
+        engine = ExecutionEngine(
+            db_session=mock_db_session,
+            clock=mock_clock,
+            adapter=mock_exchange_adapter,
+            order_repository=mock_order_repo,
+            db_session_factory=lambda: nullcontext(audit_session),
+            audit_external_orders=True,
+            is_backtest=True,
+        )
+        order_id = engine.execute_signal(
+            signal_factory(
+                price=Decimal("42000"),
+                quantity=Decimal("0.10"),
+                stop_loss=Decimal("41000"),
+                take_profit=Decimal("43000"),
+            )
+        )
+        entry = mock_order_repo.orders[order_id]
+        engine.process_exchange_order_event(
+            ExchangeOrderEvent(
+                status="partially_filled",
+                product_id=entry.product_id,
+                exchange_order_id=entry.exchange_order_id,
+                cumulative_filled_quantity=Decimal("0.04"),
+                cumulative_average_price=entry.price,
+            )
+        )
+
+        result = engine.process_exchange_order_event(
+            ExchangeOrderEvent(
+                status="filled",
+                product_id=entry.product_id,
+                exchange_order_id=entry.exchange_order_id,
+                cumulative_filled_quantity=Decimal("0.10"),
+                cumulative_average_price=entry.price,
+            )
+        )
+
+        assert result["action"] == "unresolved_conditional_order_placement_failed"
+        assert {
+            failure["reason"] for failure in result["failures"]
+        } == {"conditional_order_resize_required_after_entry_fill"}
+        assert {
+            failure["required_quantity"] for failure in result["failures"]
+        } == {"0.10"}
+
     def test_entry_fill_reports_unresolved_when_protective_order_placement_fails(
         self, mock_db_session, mock_clock, mock_exchange_adapter, mock_order_repo, signal_factory
     ):
@@ -2153,6 +2246,58 @@ class TestAuditedExecution:
         )
 
         assert stop_loss.status == OrderStatus.FILLED.value
+        assert take_profit.status == OrderStatus.CANCELLED.value
+        assert take_profit not in mock_exchange_adapter.open_orders
+
+    def test_partial_protective_fill_cancels_linked_sibling(
+        self, mock_db_session, mock_clock, mock_exchange_adapter, mock_order_repo, signal_factory
+    ):
+        audit_session = mock_db_session
+        engine = ExecutionEngine(
+            db_session=mock_db_session,
+            clock=mock_clock,
+            adapter=mock_exchange_adapter,
+            order_repository=mock_order_repo,
+            db_session_factory=lambda: nullcontext(audit_session),
+            audit_external_orders=True,
+            is_backtest=True,
+        )
+        order_id = engine.execute_signal(
+            signal_factory(
+                price=Decimal("42000"),
+                stop_loss=Decimal("41000"),
+                take_profit=Decimal("43000"),
+            )
+        )
+        entry = mock_order_repo.orders[order_id]
+        engine.process_exchange_order_event(
+            ExchangeOrderEvent(
+                status="filled",
+                product_id=entry.product_id,
+                exchange_order_id=entry.exchange_order_id,
+                cumulative_filled_quantity=entry.quantity,
+                cumulative_average_price=entry.price,
+            )
+        )
+        stop_loss = next(
+            order for order in mock_order_repo.orders.values() if order.type == "stop_loss"
+        )
+        take_profit = next(
+            order for order in mock_order_repo.orders.values() if order.type == "take_profit"
+        )
+
+        result = engine.process_exchange_order_event(
+            ExchangeOrderEvent(
+                status="partially_filled",
+                product_id=stop_loss.product_id,
+                exchange_order_id=stop_loss.exchange_order_id,
+                cumulative_filled_quantity=stop_loss.quantity / Decimal("2"),
+                cumulative_average_price=stop_loss.trigger_price,
+            )
+        )
+
+        assert result["action"] == "applied"
+        assert stop_loss.status == OrderStatus.PARTIALLY_FILLED.value
         assert take_profit.status == OrderStatus.CANCELLED.value
         assert take_profit not in mock_exchange_adapter.open_orders
 

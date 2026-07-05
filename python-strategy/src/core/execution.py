@@ -646,7 +646,7 @@ class ExecutionEngine:
         else:
             self._apply_exchange_order_event_status(order, event_state, event)
 
-        if event_state == "filled":
+        if fill_delta["quantity"] > 0:
             placement_failures = self._place_pending_conditional_orders_for_entry(order)
             if placement_failures:
                 self._try_write_conditional_order_event_warning(
@@ -1521,16 +1521,45 @@ class ExecutionEngine:
     def _place_pending_conditional_orders_for_entry(self, entry_order) -> list[dict]:
         if entry_order.type not in {"market", "limit"}:
             return []
-        pending = [
+        protected_quantity = entry_order.filled_quantity or Decimal("0")
+        if protected_quantity <= 0:
+            return []
+        related_orders = [
             order
             for order in self.order_manager.repo.list_orders_by_statuses(
-                {OrderStatus.NEW.value}
+                {
+                    OrderStatus.NEW.value,
+                    OrderStatus.SUBMITTED.value,
+                    OrderStatus.PARTIALLY_FILLED.value,
+                }
             )
             if isinstance(order.intent_payload, dict)
             and order.intent_payload.get("pending_entry_order_id") == str(entry_order.id)
         ]
+        pending = [
+            order for order in related_orders if order.status == OrderStatus.NEW.value
+        ]
         if not pending:
+            underprotected = [
+                order
+                for order in related_orders
+                if (order.quantity or Decimal("0")) < protected_quantity
+            ]
+            if underprotected:
+                return [
+                    {
+                        "order_id": str(order.id),
+                        "order_type": order.type,
+                        "reason": "conditional_order_resize_required_after_entry_fill",
+                        "current_quantity": str(order.quantity),
+                        "required_quantity": str(protected_quantity),
+                    }
+                    for order in underprotected
+                ]
             return []
+        for order in pending:
+            order.quantity = protected_quantity
+            self.order_manager.repo.update_order(order)
         return self._place_conditional_orders(pending)
 
     def _cancel_linked_conditional_order_for_protection_fill(self, order) -> dict | None:
