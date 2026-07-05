@@ -2520,6 +2520,46 @@ class TestAuditedExecution:
             order.status == OrderStatus.SUBMITTED.value for order in conditionals
         )
 
+    def test_startup_reconcile_counts_pending_protection_failures_as_unresolved(
+        self, mock_db_session, mock_clock, mock_exchange_adapter, mock_order_repo, signal_factory
+    ):
+        audit_session = mock_db_session
+        engine = ExecutionEngine(
+            db_session=mock_db_session,
+            clock=mock_clock,
+            adapter=mock_exchange_adapter,
+            order_repository=mock_order_repo,
+            db_session_factory=lambda: nullcontext(audit_session),
+            audit_external_orders=True,
+            is_backtest=True,
+        )
+        order_id = engine.execute_signal(
+            signal_factory(
+                price=Decimal("42000"),
+                stop_loss=Decimal("41000"),
+                take_profit=Decimal("43000"),
+            )
+        )
+        entry = mock_order_repo.orders[order_id]
+        mock_exchange_adapter.set_fail_on_order_types({"stop_loss", "take_profit"})
+        engine.process_exchange_order_event(
+            ExchangeOrderEvent(
+                status="filled",
+                product_id=entry.product_id,
+                exchange_order_id=entry.exchange_order_id,
+                cumulative_filled_quantity=entry.quantity,
+                cumulative_average_price=entry.price,
+            )
+        )
+
+        payload = engine.reconcile_recoverable_client_orders()
+
+        assert payload["protection_recovery"]["entries_attempted"] == 1
+        assert len(payload["protection_recovery"]["failures"]) == 2
+        assert payload["reconciliation_unresolved_count"] == 0
+        assert payload["protection_unresolved_count"] == 2
+        assert payload["unresolved_count"] == 2
+
     def test_replayed_protective_fill_event_retries_sibling_cancel(
         self, mock_db_session, mock_clock, mock_exchange_adapter, mock_order_repo, signal_factory
     ):

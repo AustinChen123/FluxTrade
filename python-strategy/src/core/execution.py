@@ -178,12 +178,20 @@ class ExecutionEngine:
             )
 
         protection_recovery = self.place_pending_protection_for_filled_entries()
+        reconciliation_unresolved_count = sum(
+            1 for result in results if result["unresolved"]
+        )
+        protection_unresolved_count = len(protection_recovery["failures"])
 
         payload = {
             "recoverable_count": len(orders),
             "result_counts": result_counts,
             "decision_counts": decision_counts,
-            "unresolved_count": sum(1 for result in results if result["unresolved"]),
+            "unresolved_count": (
+                reconciliation_unresolved_count + protection_unresolved_count
+            ),
+            "reconciliation_unresolved_count": reconciliation_unresolved_count,
+            "protection_unresolved_count": protection_unresolved_count,
             "verification_blocked_count": sum(
                 1 for result in results if result["verification_blocked"]
             ),
