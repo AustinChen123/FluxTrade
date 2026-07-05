@@ -126,6 +126,92 @@ class TestPlaceOrder:
         assert call_kwargs.kwargs["params"]["timeInForce"] == "GTC"
         assert call_kwargs.kwargs["price"] == "50000"
 
+    @pytest.mark.parametrize(
+        ("order_type", "trigger_param", "ccxt_type"),
+        [
+            ("stop_loss", "stopLossPrice", "STOP_MARKET"),
+            ("take_profit", "takeProfitPrice", "TAKE_PROFIT_MARKET"),
+        ],
+    )
+    def test_binance_protective_orders_use_futures_conditional_mapping(
+        self,
+        adapter,
+        mock_ccxt_client,
+        order_type,
+        trigger_param,
+        ccxt_type,
+    ):
+        mock_ccxt_client.create_order.return_value = {"id": "EX-COND"}
+        order = _make_order(
+            side="sell",
+            type=order_type,
+            quantity=Decimal("0.01"),
+            trigger_price=Decimal("41000"),
+            client_order_id=CANONICAL_CLIENT_ORDER_ID,
+        )
+
+        adapter.place_order(order)
+
+        call_kwargs = mock_ccxt_client.create_order.call_args
+        assert call_kwargs.kwargs["type"] == ccxt_type
+        assert call_kwargs.kwargs["price"] is None
+        assert call_kwargs.kwargs["params"][trigger_param] == "41000"
+        assert call_kwargs.kwargs["params"]["reduceOnly"] is True
+        assert call_kwargs.kwargs["params"]["clientAlgoId"] == to_exchange_format(
+            CANONICAL_CLIENT_ORDER_ID,
+            "binance",
+        )
+
+    def test_non_binance_protective_order_mapping_fails_closed(
+        self, adapter, mock_ccxt_client
+    ):
+        adapter.exchange_id = "bybit"
+        order = _make_order(
+            product_id="BYBIT:BTCUSDT-PERP",
+            side="sell",
+            type="stop_loss",
+            quantity=Decimal("0.01"),
+            trigger_price=Decimal("41000"),
+        )
+
+        with pytest.raises(ExchangeError, match="conditional_order_mapping_unsupported"):
+            adapter.place_order(order)
+
+        mock_ccxt_client.create_order.assert_not_called()
+
+    def test_validate_order_rejects_unsupported_protective_mapping_before_submit(
+        self, adapter, mock_ccxt_client
+    ):
+        adapter.exchange_id = "bybit"
+        order = _make_order(
+            product_id="BYBIT:BTCUSDT-PERP",
+            side="sell",
+            type="take_profit",
+            quantity=Decimal("0.01"),
+            trigger_price=Decimal("43000"),
+        )
+
+        with pytest.raises(ExchangeError, match="conditional_order_mapping_unsupported"):
+            adapter.validate_order(order)
+
+        mock_ccxt_client.create_order.assert_not_called()
+
+    @pytest.mark.parametrize("order_type", ["trailing_stop", "iceberg_stop"])
+    def test_validate_order_rejects_unmapped_order_types_before_submit(
+        self, adapter, mock_ccxt_client, order_type
+    ):
+        order = _make_order(
+            side="sell",
+            type=order_type,
+            quantity=Decimal("0.01"),
+            trigger_price=Decimal("41000"),
+        )
+
+        with pytest.raises(ExchangeError, match="mapping_unsupported"):
+            adapter.validate_order(order)
+
+        mock_ccxt_client.create_order.assert_not_called()
+
     def test_fetches_instrument_spec_from_binance_filters(self, adapter, mock_ccxt_client):
         mock_ccxt_client.load_markets.return_value = {
             "BTC/USDT:USDT": {
@@ -455,8 +541,6 @@ class TestPlaceOrder:
             ("stop_loss", "buy", Decimal("49999.987"), Decimal("49999.90")),
             ("take_profit", "sell", Decimal("50123.456"), Decimal("50123.50")),
             ("take_profit", "buy", Decimal("50123.456"), Decimal("50123.40")),
-            ("trailing_stop", "sell", Decimal("49999.987"), Decimal("50000.00")),
-            ("trailing_stop", "buy", Decimal("49999.987"), Decimal("49999.90")),
         ],
     )
     def test_quantizes_protective_trigger_price_directionally_before_placing(
@@ -781,6 +865,116 @@ class TestCancelOrder:
         mock_ccxt_client.cancel_order.side_effect = ccxt_lib.ExchangeError("fail")
         result = adapter.cancel_order("EX-999", "BINANCE:BTCUSDT-PERP")
         assert result is False
+
+
+class TestConditionalOrderIdRouting:
+    """Binance futures conditional (algo) orders live in a separate id
+    namespace; ccxt only routes cancel/fetch to the algo endpoints when the
+    trigger/conditional param is present (ccxt binance.py cancel_order /
+    fetch_order). Regression for the OCO sibling staying live after cancel."""
+
+    @pytest.mark.parametrize("order_type", ["stop_loss", "take_profit"])
+    def test_cancel_conditional_order_passes_trigger_param(
+        self, adapter, mock_ccxt_client, order_type
+    ):
+        result = adapter.cancel_order(
+            "ALGO-123",
+            "BINANCE:BTCUSDT-PERP",
+            order_type=order_type,
+        )
+
+        assert result is True
+        mock_ccxt_client.cancel_order.assert_called_once_with(
+            "ALGO-123",
+            "BTC/USDT:USDT",
+            params={"trigger": True},
+        )
+
+    @pytest.mark.parametrize("order_type", [None, "market", "limit"])
+    def test_cancel_regular_order_does_not_pass_trigger_param(
+        self, adapter, mock_ccxt_client, order_type
+    ):
+        result = adapter.cancel_order(
+            "EX-123",
+            "BINANCE:BTCUSDT-PERP",
+            order_type=order_type,
+        )
+
+        assert result is True
+        mock_ccxt_client.cancel_order.assert_called_once_with("EX-123", "BTC/USDT:USDT")
+
+    def test_cancel_conditional_by_client_id_uses_client_algo_id(
+        self, adapter, mock_ccxt_client
+    ):
+        exchange_client_order_id = to_exchange_format(
+            CANONICAL_CLIENT_ORDER_ID,
+            "binance",
+        )
+
+        result = adapter.cancel_order_by_client_id(
+            CANONICAL_CLIENT_ORDER_ID,
+            "BINANCE:BTCUSDT-PERP",
+            order_type="stop_loss",
+        )
+
+        assert result is True
+        mock_ccxt_client.cancel_order.assert_called_once_with(
+            exchange_client_order_id,
+            "BTC/USDT:USDT",
+            params={"clientAlgoId": exchange_client_order_id, "trigger": True},
+        )
+
+    def test_fetch_conditional_by_client_id_uses_client_algo_id(
+        self, adapter, mock_ccxt_client
+    ):
+        exchange_client_order_id = to_exchange_format(
+            CANONICAL_CLIENT_ORDER_ID,
+            "binance",
+        )
+        mock_ccxt_client.fetch_order.return_value = {
+            "id": "ALGO-123",
+            "status": "open",
+            "filled": "0",
+        }
+
+        snapshot = adapter.get_order_by_client_id(
+            CANONICAL_CLIENT_ORDER_ID,
+            "BINANCE:BTCUSDT-PERP",
+            order_type="take_profit",
+        )
+
+        assert snapshot is not None
+        mock_ccxt_client.fetch_order.assert_called_once_with(
+            exchange_client_order_id,
+            "BTC/USDT:USDT",
+            params={"clientAlgoId": exchange_client_order_id, "trigger": True},
+        )
+
+    def test_non_binance_conditional_cancel_does_not_use_binance_algo_params(
+        self, mock_ccxt_client
+    ):
+        with patch("src.core.adapters.ccxt_adapter.ccxt") as mock_ccxt:
+            mock_exchange_cls = MagicMock(return_value=mock_ccxt_client)
+            setattr(mock_ccxt, "bybit", mock_exchange_cls)
+            adapter = CcxtExchangeAdapter(
+                exchange_id="bybit",
+                api_key="test-key",
+                secret="test-secret",
+            )
+        adapter.client = mock_ccxt_client
+
+        result = adapter.cancel_order_by_client_id(
+            CANONICAL_CLIENT_ORDER_ID,
+            "BYBIT:BTCUSDT-PERP",
+            order_type="stop_loss",
+        )
+
+        assert result is True
+        mock_ccxt_client.cancel_order.assert_called_once_with(
+            CANONICAL_CLIENT_ORDER_ID,
+            "BTC/USDT:USDT",
+            params={"clientOrderId": CANONICAL_CLIENT_ORDER_ID},
+        )
 
 
 class TestGetOrderByClientId:

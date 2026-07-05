@@ -61,6 +61,12 @@ class LiveOrderRepository(IOrderRepository):
                 .all()
             )
 
+    def list_orders_by_statuses(self, statuses: set[str]) -> list[Order]:
+        if not statuses:
+            return []
+        with self._db_session_factory() as db:
+            return db.query(Order).filter(Order.status.in_(statuses)).all()
+
     def add_trade(self, trade: Trade) -> None:
         with self._db_session_factory() as db:
             db.add(trade)
@@ -163,6 +169,9 @@ class BacktestOrderRepository(IOrderRepository):
         return None
 
     def list_client_orders_by_statuses(self, statuses: set[str]) -> list[Order]:
+        return []
+
+    def list_orders_by_statuses(self, statuses: set[str]) -> list[Order]:
         return []
 
     def add_trade(self, trade: Trade) -> None:

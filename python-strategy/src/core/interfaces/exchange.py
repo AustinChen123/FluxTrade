@@ -80,20 +80,35 @@ class IExchangeAdapter(ABC):
         pass
 
     @abstractmethod
-    def cancel_order(self, order_id: str, product_id: str) -> bool:
+    def cancel_order(
+        self,
+        order_id: str,
+        product_id: str,
+        *,
+        order_type: Optional[str] = None,
+    ) -> bool:
         """
         Cancels an existing order.
-        
+
         Args:
             order_id: The exchange's order ID (not internal DB ID).
             product_id: The product/symbol identifier (e.g., BINANCE:BTCUSDT-PERP).
-            
+            order_type: Internal order type (e.g., stop_loss). Venues that keep
+                conditional orders in a separate id namespace (Binance futures
+                algo orders) need it to route the request correctly.
+
         Returns:
             bool: True if cancellation was successful, False otherwise.
         """
         pass
 
-    def cancel_order_by_client_id(self, client_order_id: str, product_id: str) -> bool:
+    def cancel_order_by_client_id(
+        self,
+        client_order_id: str,
+        product_id: str,
+        *,
+        order_type: Optional[str] = None,
+    ) -> bool:
         """Cancel an existing order using the exchange client order ID.
 
         Adapters that do not have native client-order-id support can fall back
@@ -101,12 +116,14 @@ class IExchangeAdapter(ABC):
         still keep the old exchange-id fallback while this capability is being
         rolled out across adapters.
         """
-        return self.cancel_order(client_order_id, product_id)
+        return self.cancel_order(client_order_id, product_id, order_type=order_type)
 
     def get_order_by_client_id(
         self,
         client_order_id: str,
         product_id: str,
+        *,
+        order_type: Optional[str] = None,
     ) -> Optional[ExchangeOrderSnapshot]:
         """Return an exchange order snapshot by client order ID if supported."""
         raise ExchangeOrderLookupUnsupported(

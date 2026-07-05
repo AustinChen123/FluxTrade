@@ -49,6 +49,10 @@ class IOrderRepository(ABC):
         """
         return []
 
+    def list_orders_by_statuses(self, statuses: set[str]) -> list[Order]:
+        """Return orders whose status is in ``statuses`` when supported."""
+        return []
+
     @abstractmethod
     def update_order_exchange_id(self, order: Order, exchange_order_id: str) -> None:
         pass

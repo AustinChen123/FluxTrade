@@ -139,6 +139,13 @@ class MockOrderRepository(IOrderRepository):
             if order.client_order_id is not None and order.status in statuses
         ]
 
+    def list_orders_by_statuses(self, statuses: set[str]) -> list[Order]:
+        return [
+            order
+            for order in self.orders.values()
+            if order.status in statuses
+        ]
+
     def add_trade(self, trade: ORMTrade) -> None:
         self.trades.append(trade)
 
@@ -216,12 +223,24 @@ class MockExchangeAdapter(IExchangeAdapter):
         self.open_orders.append(order)
         return exchange_id
 
-    def cancel_order(self, order_id: str, product_id: str) -> bool:
+    def cancel_order(
+        self,
+        order_id: str,
+        product_id: str,
+        *,
+        order_type: str | None = None,
+    ) -> bool:
         initial_len = len(self.open_orders)
         self.open_orders = [o for o in self.open_orders if o.exchange_order_id != order_id]
         return len(self.open_orders) < initial_len
 
-    def cancel_order_by_client_id(self, client_order_id: str, product_id: str) -> bool:
+    def cancel_order_by_client_id(
+        self,
+        client_order_id: str,
+        product_id: str,
+        *,
+        order_type: str | None = None,
+    ) -> bool:
         initial_len = len(self.open_orders)
         self.open_orders = [
             o for o in self.open_orders if o.client_order_id != client_order_id
@@ -232,6 +251,8 @@ class MockExchangeAdapter(IExchangeAdapter):
         self,
         client_order_id: str,
         product_id: str,
+        *,
+        order_type: str | None = None,
     ) -> Optional[ExchangeOrderSnapshot]:
         for order in self.open_orders:
             if order.client_order_id == client_order_id and order.product_id == product_id:

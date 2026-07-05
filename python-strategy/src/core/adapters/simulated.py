@@ -84,7 +84,15 @@ class SimulatedAdapter(IExchangeAdapter):
 
         return exchange_id
 
-    def cancel_order(self, order_id: str, product_id: str) -> bool:
+    def cancel_order(
+        self,
+        order_id: str,
+        product_id: str,
+        *,
+        order_type: Optional[str] = None,
+    ) -> bool:
+        # order_type is only needed by venues with a separate conditional-order
+        # id namespace; the simulated matcher has a single namespace.
         # order_id here is the exchange_order_id; we stored ORM id in Rust
         # Try to find the internal id for this exchange_order_id
         for oid, orm_order in self._order_map.items():
@@ -95,7 +103,13 @@ class SimulatedAdapter(IExchangeAdapter):
                 return cancelled
         return False
 
-    def cancel_order_by_client_id(self, client_order_id: str, product_id: str) -> bool:
+    def cancel_order_by_client_id(
+        self,
+        client_order_id: str,
+        product_id: str,
+        *,
+        order_type: Optional[str] = None,
+    ) -> bool:
         for oid, orm_order in self._order_map.items():
             if orm_order.client_order_id == client_order_id:
                 cancelled = self._engine.cancel_order(oid)
@@ -108,6 +122,8 @@ class SimulatedAdapter(IExchangeAdapter):
         self,
         client_order_id: str,
         product_id: str,
+        *,
+        order_type: Optional[str] = None,
     ) -> Optional[ExchangeOrderSnapshot]:
         for orm_order in self._order_map.values():
             if orm_order.client_order_id == client_order_id and orm_order.product_id == product_id:

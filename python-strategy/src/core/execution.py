@@ -20,7 +20,10 @@ from src.core.audit_service import (
     write_signal_audit_outcome,
     write_system_event,
 )
-from src.core.client_order_id import generate_client_order_id, parse_client_order_id
+from src.core.client_order_id import (
+    generate_client_order_id,
+    parse_client_order_id,
+)
 
 
 class FillDeltaState(str, Enum):
@@ -117,7 +120,10 @@ class ExecutionEngine:
         """Compare recoverable local client orders with exchange snapshots.
 
         This repairs local order state when the exchange lookup gives enough
-        information. It never places replacement orders during startup.
+        information. It never places replacement orders during startup, with
+        one deliberate exception: NEW pending protective orders whose entry
+        already has fills are first placements (not replacements) and leaving
+        them unplaced keeps a live position naked across restarts.
         """
         if self._db_session_factory is None:
             raise RuntimeError("reconcile_recoverable_client_orders requires db_session_factory")
@@ -127,13 +133,22 @@ class ExecutionEngine:
         result_counts: dict[str, int] = {}
         decision_counts: dict[str, int] = {}
 
+        # Decide skips on the scan snapshot up front: repairing an entry can
+        # fail its pending conditionals mid-loop, and a status-based check on
+        # the mutated order would stop skipping them.
+        pending_protective_ids = {
+            order.id for order in orders if self._is_pending_protective_order(order)
+        }
         for order in orders:
+            if order.id in pending_protective_ids:
+                continue
             local_status = order.status
             local_exchange_order_id = order.exchange_order_id
             try:
                 snapshot = self.adapter.get_order_by_client_id(
                     order.client_order_id,
                     order.product_id,
+                    order_type=order.type,
                 )
             except ExchangeOrderLookupUnsupported:
                 snapshot = None
@@ -173,15 +188,27 @@ class ExecutionEngine:
                 }
             )
 
+        protection_recovery = self.place_pending_protection_for_filled_entries()
+        reconciliation_unresolved_count = sum(
+            1 for result in results if result["unresolved"]
+        )
+        protection_unresolved_count = len(protection_recovery["failures"])
+
         payload = {
             "recoverable_count": len(orders),
             "result_counts": result_counts,
             "decision_counts": decision_counts,
-            "unresolved_count": sum(1 for result in results if result["unresolved"]),
+            "unresolved_count": (
+                reconciliation_unresolved_count + protection_unresolved_count
+            ),
+            "reconciliation_unresolved_count": reconciliation_unresolved_count,
+            "protection_unresolved_count": protection_unresolved_count,
             "verification_blocked_count": sum(
                 1 for result in results if result["verification_blocked"]
             ),
             "results": results,
+            "protection_recovery": protection_recovery,
+            "skipped_pending_protection_count": len(pending_protective_ids),
         }
         if payload["unresolved_count"] > 0:
             self.logger.error(
@@ -209,6 +236,68 @@ class ExecutionEngine:
 
         return payload
 
+    def _fail_pending_conditional_orders_for_terminal_entry(self, entry_order) -> None:
+        """Clear pending protection for an entry that terminated with zero fills.
+
+        No fill means no position, so the NEW conditional orders will never be
+        placed; leaving them pollutes the recoverable scan and resync forever.
+        Callers must only invoke this for CANCELLED/FAILED terminals — a FILLED
+        entry with missing fill details still has a live position and must keep
+        its pending protection.
+        """
+        if entry_order.type not in {"market", "limit"}:
+            return
+        if (entry_order.filled_quantity or Decimal("0")) > 0:
+            return
+        for order in self.order_manager.repo.list_orders_by_statuses(
+            {OrderStatus.NEW.value}
+        ):
+            if (
+                isinstance(order.intent_payload, dict)
+                and order.intent_payload.get("pending_entry_order_id")
+                == str(entry_order.id)
+            ):
+                self.order_manager.fail_order(order, "entry_terminal_without_fill")
+
+    def _protective_terminal_without_fill_failure(self, order) -> dict | None:
+        """A protective leg terminating with zero fill while its entry holds a
+        filled position is a protection gap -- unless the OCO sibling closed the
+        position (FILLED/LIQUIDATED), which makes the cancellation expected."""
+        if order.type not in {"stop_loss", "take_profit", "trailing_stop"}:
+            return None
+        if (order.filled_quantity or Decimal("0")) > 0:
+            return None
+        if not isinstance(order.intent_payload, dict):
+            return None
+        entry_order_id = order.intent_payload.get("pending_entry_order_id")
+        if not entry_order_id:
+            return None
+        entry = self.order_manager.repo.get_order(str(entry_order_id))
+        if entry is None or (entry.filled_quantity or Decimal("0")) <= 0:
+            return None
+        linked_order_id = order.intent_payload.get("linked_order_id")
+        if linked_order_id:
+            sibling = self.order_manager.repo.get_order(str(linked_order_id))
+            if sibling is not None and sibling.status in {
+                OrderStatus.FILLED.value,
+                OrderStatus.LIQUIDATED.value,
+            }:
+                return None
+        return {
+            "order_id": str(order.id),
+            "order_type": order.type,
+            "entry_order_id": str(entry_order_id),
+            "reason": "protective_terminal_without_fill",
+        }
+
+    @staticmethod
+    def _is_pending_protective_order(order) -> bool:
+        return (
+            order.status == OrderStatus.NEW.value
+            and isinstance(order.intent_payload, dict)
+            and bool(order.intent_payload.get("pending_entry_order_id"))
+        )
+
     def resync_recoverable_order_events(self) -> dict[str, object]:
         """Resync recoverable live orders through the order-event state machine.
 
@@ -219,11 +308,17 @@ class ExecutionEngine:
         """
         orders = self.list_recoverable_client_orders()
         results: list[dict[str, object]] = []
+        pending_protective_ids = {
+            order.id for order in orders if self._is_pending_protective_order(order)
+        }
         for order in orders:
+            if order.id in pending_protective_ids:
+                continue
             try:
                 snapshot = self.adapter.get_order_by_client_id(
                     order.client_order_id,
                     order.product_id,
+                    order_type=order.type,
                 )
             except ExchangeOrderLookupUnsupported:
                 results.append(
@@ -276,6 +371,7 @@ class ExecutionEngine:
             "verification_blocked_count": sum(
                 1 for result in results if result["verification_blocked"]
             ),
+            "skipped_pending_protection_count": len(pending_protective_ids),
             "results": results,
         }
 
@@ -302,6 +398,7 @@ class ExecutionEngine:
     def _repair_reconciled_order(self, order, decision: str, snapshot) -> dict[str, object]:
         if decision == "local_only":
             self.order_manager.fail_order(order, "startup reconciliation: local order not found on exchange")
+            self._fail_pending_conditional_orders_for_terminal_entry(order)
             self._mark_reconciled(order)
             return self._repair_result("marked_failed")
 
@@ -320,6 +417,16 @@ class ExecutionEngine:
             )
 
         if decision == "exchange_open":
+            stale_protective = self._cancel_protective_order_when_sibling_closed(order)
+            if stale_protective is not None:
+                if stale_protective["cancelled"]:
+                    self._mark_reconciled(order)
+                    return self._repair_result("cancelled_stale_protective_leg")
+                return self._repair_result(
+                    "unresolved_linked_conditional_cancel_failed",
+                    reason="stale_protective_leg_cancel_failed",
+                    unresolved=True,
+                )
             partial_repair = self._record_open_snapshot_fill_delta(order, snapshot)
             self.order_manager.mark_submitted(order, snapshot.exchange_order_id)
             if partial_repair["unresolved"]:
@@ -361,6 +468,15 @@ class ExecutionEngine:
                     terminal_status=terminal_status,
                     fee=terminal_fill["fee"],
                 )
+                cancel_failure = (
+                    self._cancel_linked_conditional_order_for_protection_fill(order)
+                )
+                if cancel_failure is not None:
+                    return self._repair_result(
+                        "unresolved_linked_conditional_cancel_failed",
+                        reason="sibling_cancel_failed_after_reconciled_protective_fill",
+                        unresolved=True,
+                    )
                 self._mark_reconciled(order)
                 return self._repair_result(
                     self._filled_terminal_repair_action(terminal_status),
@@ -368,6 +484,16 @@ class ExecutionEngine:
 
             order.status = terminal_status.value
             self.order_manager.repo.update_order(order)
+            if terminal_status in {OrderStatus.CANCELLED, OrderStatus.FAILED}:
+                self._fail_pending_conditional_orders_for_terminal_entry(order)
+                protective_failure = self._protective_terminal_without_fill_failure(order)
+                if protective_failure is not None:
+                    self._mark_reconciled(order)
+                    return self._repair_result(
+                        "unresolved_protective_terminal_without_fill",
+                        reason="protective_terminal_without_fill",
+                        unresolved=True,
+                    )
             self._mark_reconciled(order)
             return self._repair_result(
                 self._terminal_repair_action(terminal_status),
@@ -646,6 +772,81 @@ class ExecutionEngine:
         else:
             self._apply_exchange_order_event_status(order, event_state, event)
 
+        if event_state in {"cancelled", "rejected", "expired", "failed"}:
+            self._fail_pending_conditional_orders_for_terminal_entry(order)
+            protective_failure = self._protective_terminal_without_fill_failure(order)
+            if protective_failure is not None:
+                self._try_write_conditional_order_event_warning(
+                    event_subtype="protective_order_terminal_without_fill",
+                    order=order,
+                    failures=[protective_failure],
+                )
+                return {
+                    "action": "unresolved_protective_terminal_without_fill",
+                    "order_id": order.id,
+                    "status": event.status,
+                    "state": event_state,
+                    "fill_quantity": fill_delta["quantity"],
+                    "exchange_order_id": order.exchange_order_id,
+                    "failure": protective_failure,
+                }
+
+        # Post-fill actions key off persisted state, not the event delta:
+        # a replayed event (crash recovery, resync, duplicate stream message)
+        # carries the same cumulative quantity (delta == 0) and must still
+        # retry pending protection placement and sibling cancellation.
+        if (order.filled_quantity or Decimal("0")) > 0:
+            placement_failures = self._place_pending_conditional_orders_for_entry(order)
+            if placement_failures:
+                self._try_write_conditional_order_event_warning(
+                    event_subtype="conditional_order_placement_failed_after_entry_fill",
+                    order=order,
+                    failures=placement_failures,
+                )
+                return {
+                    "action": "unresolved_conditional_order_placement_failed",
+                    "order_id": order.id,
+                    "status": event.status,
+                    "state": event_state,
+                    "fill_quantity": fill_delta["quantity"],
+                    "exchange_order_id": order.exchange_order_id,
+                    "failures": placement_failures,
+                }
+            protective_partial_failure = (
+                self._protective_partial_fill_requires_resize(order, event_state)
+            )
+            if protective_partial_failure is not None:
+                self._try_write_conditional_order_event_warning(
+                    event_subtype="protective_partial_fill_requires_resize",
+                    order=order,
+                    failures=[protective_partial_failure],
+                )
+                return {
+                    "action": "unresolved_protective_partial_fill_requires_resize",
+                    "order_id": order.id,
+                    "status": event.status,
+                    "state": event_state,
+                    "fill_quantity": fill_delta["quantity"],
+                    "exchange_order_id": order.exchange_order_id,
+                    "failure": protective_partial_failure,
+                }
+            cancel_failure = self._cancel_linked_conditional_order_for_protection_fill(order)
+            if cancel_failure is not None:
+                self._try_write_conditional_order_event_warning(
+                    event_subtype="linked_conditional_order_cancel_failed",
+                    order=order,
+                    failures=[cancel_failure],
+                )
+                return {
+                    "action": "unresolved_linked_conditional_cancel_failed",
+                    "order_id": order.id,
+                    "status": event.status,
+                    "state": event_state,
+                    "fill_quantity": fill_delta["quantity"],
+                    "exchange_order_id": order.exchange_order_id,
+                    "failure": cancel_failure,
+                }
+
         return {
             "action": "applied",
             "order_id": order.id,
@@ -887,12 +1088,17 @@ class ExecutionEngine:
         if client_order_id and self.adapter.cancel_order_by_client_id(
             client_order_id,
             order.product_id,
+            order_type=order.type,
         ):
             self.order_manager.mark_cancelled(order)
             return True
 
         exchange_order_id = order.exchange_order_id or order.id
-        if not self.adapter.cancel_order(exchange_order_id, order.product_id):
+        if not self.adapter.cancel_order(
+            exchange_order_id,
+            order.product_id,
+            order_type=order.type,
+        ):
             return False
 
         self.order_manager.mark_cancelled(order)
@@ -1220,9 +1426,6 @@ class ExecutionEngine:
                 trade_id=str(order.id),
             )
 
-        if conditional_orders:
-            self._place_conditional_orders(conditional_orders)
-
         return order.id
 
     def _adopt_order_after_ambiguous_submit_error(
@@ -1251,6 +1454,7 @@ class ExecutionEngine:
             snapshot = self.adapter.get_order_by_client_id(
                 order.client_order_id,
                 order.product_id,
+                order_type=order.type,
             )
         except ExchangeOrderLookupUnsupported:
             return {
@@ -1360,15 +1564,25 @@ class ExecutionEngine:
         conditional_orders: list,
         adoption: dict[str, object],
     ) -> None:
+        """Keep pending legs recoverable after an uncertain entry submit.
+
+        Adoption may already have placed some legs; anything not NEW has live
+        or terminal exchange state and must keep its status, exchange id, and
+        payload untouched.
+        """
         for conditional_order in conditional_orders:
-            conditional_order.status = OrderStatus.NEW.value
-            conditional_order.exchange_order_id = None
-            conditional_order.intent_payload = {
-                "pending_entry_order_id": str(entry_order.id),
-                "pending_client_order_id": entry_order.client_order_id,
-                "pending_reason": "entry_submit_outcome_uncertain",
-                "adoption_action": str(adoption["action"]),
-            }
+            if conditional_order.status != OrderStatus.NEW.value:
+                continue
+            payload = dict(conditional_order.intent_payload or {})
+            payload.update(
+                {
+                    "pending_entry_order_id": str(entry_order.id),
+                    "pending_client_order_id": entry_order.client_order_id,
+                    "pending_reason": "entry_submit_outcome_uncertain",
+                    "adoption_action": str(adoption["action"]),
+                }
+            )
+            conditional_order.intent_payload = payload
             self.order_manager.repo.update_order(conditional_order)
 
     def _attach_min_notional_reference_price(
@@ -1440,6 +1654,10 @@ class ExecutionEngine:
                 order_type="stop_loss",
                 quantity=qty,
                 trigger_price=signal.stop_loss,
+                client_order_id=self._conditional_client_order_id(
+                    entry_order.client_order_id,
+                    "sl",
+                ),
             )
             self._attach_min_notional_reference_price(sl_order, candle)
             conditional_orders.append(sl_order)
@@ -1452,6 +1670,10 @@ class ExecutionEngine:
                 order_type="take_profit",
                 quantity=qty,
                 trigger_price=signal.take_profit,
+                client_order_id=self._conditional_client_order_id(
+                    entry_order.client_order_id,
+                    "tp",
+                ),
             )
             self._attach_min_notional_reference_price(tp_order, candle)
             conditional_orders.append(tp_order)
@@ -1469,12 +1691,256 @@ class ExecutionEngine:
                 order_type="trailing_stop",
                 quantity=qty,
                 trigger_price=signal.stop_loss,
+                client_order_id=self._conditional_client_order_id(
+                    entry_order.client_order_id,
+                    "tr",
+                ),
             )
             ts_order._trailing_distance = signal.trailing_distance
             self._attach_min_notional_reference_price(ts_order, candle)
             conditional_orders.append(ts_order)
 
+        for conditional_order in conditional_orders:
+            linked_order_id = getattr(conditional_order, "_linked_order_id", None)
+            conditional_order.status = OrderStatus.NEW.value
+            conditional_order.exchange_order_id = None
+            conditional_order.intent_payload = {
+                "pending_entry_order_id": str(entry_order.id),
+                "linked_order_id": str(linked_order_id) if linked_order_id else None,
+                "placement_mode": "place-after-fill",
+            }
+            self.order_manager.repo.update_order(conditional_order)
+
         return conditional_orders
+
+    @staticmethod
+    def _conditional_client_order_id(
+        entry_client_order_id: str | None,
+        suffix: str,
+    ) -> str | None:
+        if not entry_client_order_id:
+            return None
+        parts = parse_client_order_id(entry_client_order_id)
+        conditional_id = (
+            f"{parts.strategy_id}-{parts.instance_id}-{suffix}-{parts.ts_ns}"
+        )
+        parse_client_order_id(conditional_id)
+        return conditional_id
+
+    def _place_pending_conditional_orders_for_entry(self, entry_order) -> list[dict]:
+        if entry_order.type not in {"market", "limit"}:
+            return []
+        protected_quantity = entry_order.filled_quantity or Decimal("0")
+        if protected_quantity <= 0:
+            return []
+        related_orders = [
+            order
+            for order in self.order_manager.repo.list_orders_by_statuses(
+                {
+                    OrderStatus.NEW.value,
+                    OrderStatus.SUBMITTED_UNCONFIRMED.value,
+                    OrderStatus.SUBMITTED.value,
+                    OrderStatus.PARTIALLY_FILLED.value,
+                }
+            )
+            if isinstance(order.intent_payload, dict)
+            and order.intent_payload.get("pending_entry_order_id") == str(entry_order.id)
+        ]
+        pending = [
+            order for order in related_orders if order.status == OrderStatus.NEW.value
+        ]
+        failures = self._underprotected_conditional_order_failures(
+            related_orders,
+            protected_quantity,
+            pending_statuses={OrderStatus.NEW.value},
+        )
+        if not pending:
+            if failures:
+                return failures
+            return []
+        for order in pending:
+            order.quantity = protected_quantity
+            self.order_manager.repo.update_order(order)
+        placement_candidates = []
+        for order in pending:
+            lookup_failure = self._adopt_pending_conditional_order_before_submit(order)
+            if lookup_failure is None:
+                if order.status == OrderStatus.NEW.value:
+                    placement_candidates.append(order)
+                continue
+            failures.append(lookup_failure)
+        if placement_candidates:
+            failures.extend(self._place_conditional_orders(placement_candidates))
+        return failures
+
+    @staticmethod
+    def _underprotected_conditional_order_failures(
+        related_orders: list,
+        protected_quantity: Decimal,
+        *,
+        pending_statuses: set[str],
+    ) -> list[dict]:
+        return [
+            {
+                "order_id": str(order.id),
+                "order_type": order.type,
+                "reason": "conditional_order_resize_required_after_entry_fill",
+                "current_quantity": str(order.quantity),
+                "required_quantity": str(protected_quantity),
+            }
+            for order in related_orders
+            if order.status not in pending_statuses
+            and (order.quantity or Decimal("0")) < protected_quantity
+        ]
+
+    def _adopt_pending_conditional_order_before_submit(self, order) -> dict | None:
+        if not order.client_order_id:
+            return None
+        try:
+            snapshot = self.adapter.get_order_by_client_id(
+                order.client_order_id,
+                order.product_id,
+                order_type=order.type,
+            )
+        except ExchangeOrderLookupUnsupported:
+            return {
+                "order_id": str(order.id),
+                "order_type": order.type,
+                "reason": "verification_blocked_order_lookup_unsupported",
+            }
+        except ExchangeError as e:
+            return {
+                "order_id": str(order.id),
+                "order_type": order.type,
+                "reason": "verification_blocked_order_lookup_failed",
+                "error": str(e),
+            }
+        if snapshot is None:
+            return None
+
+        event_result = self.process_exchange_order_event(
+            self._exchange_snapshot_to_order_event(order.product_id, snapshot)
+        )
+        if event_result["action"] == "applied":
+            return None
+        return {
+            "order_id": str(order.id),
+            "order_type": order.type,
+            "reason": str(event_result["action"]),
+            "event_result": event_result,
+        }
+
+    def place_pending_protection_for_filled_entries(self) -> dict[str, object]:
+        """Retry NEW pending protective orders whose entry already has fills.
+
+        Crash/replay safety net: entry fills are persisted before protective
+        placement, so a crash between the two steps leaves NEW conditional
+        orders behind while no further fill delta will ever re-trigger
+        placement (a fully filled entry drops out of the recoverable scan).
+        Placing protection is the fail-safe direction for a naked position.
+        """
+        pending = [
+            order
+            for order in self.order_manager.repo.list_orders_by_statuses(
+                {OrderStatus.NEW.value}
+            )
+            if isinstance(order.intent_payload, dict)
+            and order.intent_payload.get("pending_entry_order_id")
+        ]
+        entry_ids = {
+            str(order.intent_payload["pending_entry_order_id"]) for order in pending
+        }
+        attempted = 0
+        failures: list[dict] = []
+        for entry_id in sorted(entry_ids):
+            entry = self.order_manager.repo.get_order(entry_id)
+            if entry is None or (entry.filled_quantity or Decimal("0")) <= 0:
+                continue
+            attempted += 1
+            entry_failures = self._place_pending_conditional_orders_for_entry(entry)
+            if entry_failures:
+                failures.extend(entry_failures)
+                self._try_write_conditional_order_event_warning(
+                    event_subtype="conditional_order_placement_failed_after_entry_fill",
+                    order=entry,
+                    failures=entry_failures,
+                )
+        if failures:
+            self.logger.error(
+                "Pending protection recovery has %s placement failure(s)",
+                len(failures),
+            )
+        return {
+            "pending_count": len(pending),
+            "entries_attempted": attempted,
+            "failures": failures,
+        }
+
+    @staticmethod
+    def _protective_partial_fill_requires_resize(order, event_state: str) -> dict | None:
+        if order.type not in {"stop_loss", "take_profit", "trailing_stop"}:
+            return None
+        if event_state in {"filled", "liquidated"}:
+            return None
+        if not isinstance(order.intent_payload, dict):
+            return None
+        linked_order_id = order.intent_payload.get("linked_order_id")
+        if not linked_order_id:
+            return None
+        return {
+            "order_id": str(order.id),
+            "order_type": order.type,
+            "linked_order_id": str(linked_order_id),
+            "reason": "protective_partial_fill_requires_resize",
+        }
+
+    def _cancel_linked_conditional_order_for_protection_fill(self, order) -> dict | None:
+        if order.type not in {"stop_loss", "take_profit", "trailing_stop"}:
+            return None
+        if not isinstance(order.intent_payload, dict):
+            return None
+        linked_order_id = order.intent_payload.get("linked_order_id")
+        if not linked_order_id:
+            return None
+        linked_order = self.order_manager.repo.get_order(str(linked_order_id))
+        if linked_order is None:
+            return None
+        if linked_order.status in {
+            OrderStatus.CANCELLED.value,
+            OrderStatus.FILLED.value,
+            OrderStatus.FAILED.value,
+            OrderStatus.LIQUIDATED.value,
+        }:
+            return None
+        if self.cancel_order(str(linked_order.id)):
+            return None
+        return {
+            "order_id": str(linked_order.id),
+            "order_type": linked_order.type,
+            "exchange_order_id": linked_order.exchange_order_id,
+            "reason": "cancel_order_returned_false",
+        }
+
+    def _cancel_protective_order_when_sibling_closed(self, order) -> dict | None:
+        """Inverse of the protection-fill cancel: an open protective leg whose
+        OCO sibling already closed the position must be cancelled, not have
+        its tracking restored."""
+        if order.type not in {"stop_loss", "take_profit", "trailing_stop"}:
+            return None
+        if not isinstance(order.intent_payload, dict):
+            return None
+        linked_order_id = order.intent_payload.get("linked_order_id")
+        if not linked_order_id:
+            return None
+        sibling = self.order_manager.repo.get_order(str(linked_order_id))
+        if sibling is None or sibling.status not in {
+            OrderStatus.FILLED.value,
+            OrderStatus.LIQUIDATED.value,
+        }:
+            return None
+        if self.cancel_order(str(order.id)):
+            return {"cancelled": True}
+        return {"cancelled": False}
 
     def _validate_order_group(self, orders: list) -> None:
         validate_order = getattr(self.adapter, "validate_order", None)
@@ -1570,12 +2036,18 @@ class ExecutionEngine:
             },
         )
 
-    def _place_conditional_orders(self, conditional_orders: list):
+    def _place_conditional_orders(self, conditional_orders: list) -> list[dict]:
         """Submit prevalidated SL/TP/Trailing orders linked via OCO to each other."""
+        failures = []
         for order in conditional_orders:
+            submit_attempted = False
             try:
+                if order.client_order_id:
+                    self.order_manager.mark_submitted_unconfirmed(order)
+                submit_attempted = True
                 ex_id = self.adapter.place_order(order)
-                self.order_manager.update_exchange_order_id(order, ex_id)
+                self.order_manager.mark_submitted(order, ex_id)
+                ORDERS_TOTAL.labels(order_type=order.type, status="placed", reason="none").inc()
             except ExchangeError as e:
                 label = {
                     "stop_loss": "SL",
@@ -1583,6 +2055,105 @@ class ExecutionEngine:
                     "trailing_stop": "trailing stop",
                 }.get(order.type, order.type)
                 self.logger.error("Failed to place %s order: %s", label, e)
+                failures.extend(
+                    self._handle_conditional_order_placement_error(
+                        order,
+                        e,
+                        submit_attempted=submit_attempted,
+                    )
+                )
+        return failures
+
+    def _handle_conditional_order_placement_error(
+        self,
+        order,
+        error: ExchangeError,
+        *,
+        submit_attempted: bool,
+    ) -> list[dict]:
+        adoption = self._adopt_order_after_ambiguous_submit_error(
+            order,
+            error,
+            submit_attempted=submit_attempted,
+        )
+        if (
+            submit_attempted
+            and adoption["action"] == "verification_blocked_missing_client_order_id"
+        ):
+            self.order_manager.mark_submitted_unconfirmed(order)
+            ORDERS_TOTAL.labels(order_type=order.type, status="failed", reason="verification_blocked_missing_client_order_id").inc()
+            return [
+                {
+                    "order_id": str(order.id),
+                    "order_type": order.type,
+                    "reason": "verification_blocked_missing_client_order_id",
+                    "adoption": adoption,
+                    "operator_action": (
+                        "conditional_submit_outcome_uncertain_without_client_id; "
+                        "verify exchange manually"
+                    ),
+                }
+            ]
+        if adoption["action"] == "adopted":
+            ORDERS_TOTAL.labels(order_type=order.type, status="placed", reason="adopted_after_submit_error").inc()
+            return []
+        if adoption.get("terminal"):
+            ORDERS_TOTAL.labels(order_type=order.type, status="failed", reason="terminal_after_submit_error").inc()
+            return [
+                {
+                    "order_id": str(order.id),
+                    "order_type": order.type,
+                    "reason": "terminal_after_submit_error",
+                    "adoption": adoption,
+                }
+            ]
+        if adoption.get("verification_blocked") or adoption.get("unresolved"):
+            ORDERS_TOTAL.labels(order_type=order.type, status="failed", reason=str(adoption["action"])).inc()
+            return [
+                {
+                    "order_id": str(order.id),
+                    "order_type": order.type,
+                    "reason": str(adoption["action"]),
+                    "adoption": adoption,
+                }
+            ]
+        self.order_manager.fail_order(order, str(error))
+        ORDERS_TOTAL.labels(order_type=order.type, status="failed", reason=self._order_rejection_reason(error)).inc()
+        return [
+            {
+                "order_id": str(order.id),
+                "order_type": order.type,
+                "reason": str(error),
+                "adoption": adoption,
+            }
+        ]
+
+    def _try_write_conditional_order_event_warning(
+        self,
+        *,
+        event_subtype: str,
+        order,
+        failures: list[dict],
+    ) -> None:
+        if self._db_session_factory is None:
+            return
+        try:
+            with self._db_session_factory() as db:
+                write_system_event(
+                    db,
+                    event_type="system_error",
+                    event_subtype=event_subtype,
+                    related_strategy_id=order.strategy_id,
+                    related_order_id=str(order.id),
+                    payload={
+                        "order_id": str(order.id),
+                        "product_id": order.product_id,
+                        "failures": failures,
+                    },
+                )
+                db.commit()
+        except Exception:
+            self.logger.exception("Failed to write conditional order warning event")
 
     def _journal_fill(self, order, price, qty, fee, fill_type: str, candle: Optional[Candlestick] = None) -> None:
         """Record a fill event to the journal."""

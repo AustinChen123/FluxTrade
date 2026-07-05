@@ -17,6 +17,8 @@ import pytest
 from decimal import Decimal
 from unittest.mock import MagicMock, patch
 
+from prometheus_client import REGISTRY
+
 from src.core.adapters.ccxt_adapter import CcxtExchangeAdapter
 from src.core.execution import ExecutionEngine
 from src.core.interfaces.exchange import ExchangeOrderSnapshot
@@ -356,6 +358,31 @@ class TestExecutionTradingRules:
         assert payload["quantity"] == "0.010"
         assert payload["price"] == "50123.40"
 
+    def test_trailing_stop_validation_rejects_group_before_entry_submit(
+        self, mock_db_session, mock_clock, mock_order_repo, signal_factory
+    ):
+        adapter, client = _ccxt_adapter_with_market_rules(_binance_btcusdt_market_rules())
+        engine = ExecutionEngine(
+            db_session=mock_db_session,
+            clock=mock_clock,
+            adapter=adapter,
+            order_repository=mock_order_repo,
+        )
+        signal = signal_factory(
+            product_id="BINANCE:BTCUSDT-PERP",
+            price=Decimal("50123.40"),
+            quantity=Decimal("0.010"),
+            trailing_distance=Decimal("100"),
+        )
+
+        order_id = engine.execute_signal(signal)
+
+        assert order_id is None
+        client.create_order.assert_not_called()
+        orders = list(mock_order_repo.orders.values())
+        assert {order.type for order in orders} == {"limit", "trailing_stop"}
+        assert all(order.status == "failed" for order in orders)
+
     def test_min_notional_rejection_fails_local_order_and_audit(
         self, mock_db_session, mock_clock, mock_order_repo, signal_factory
     ):
@@ -498,7 +525,7 @@ class TestExecutionTradingRules:
 
         client.create_order.assert_not_called()
 
-    def test_trailing_only_signal_prevalidates_and_places_protective_order(
+    def test_trailing_only_signal_fails_closed_before_audited_entry_submit(
         self,
         mock_db_session,
         mock_clock,
@@ -527,14 +554,13 @@ class TestExecutionTradingRules:
             close=Decimal("12000"),
         )
 
-        order_id = engine.execute_signal(signal, candle=candle)
+        with pytest.raises(ExchangeError, match="trailing_stop_mapping_unsupported"):
+            engine.execute_signal(signal, candle=candle)
 
-        assert order_id is not None
-        assert client.create_order.call_count == 2
+        client.create_order.assert_not_called()
         orders = list(mock_order_repo.orders.values())
         assert {order.type for order in orders} == {"market", "trailing_stop"}
-        trailing_order = next(order for order in orders if order.type == "trailing_stop")
-        assert getattr(trailing_order, "min_notional_reference_price") == Decimal("12000")
+        assert all(order.status == "failed" for order in orders)
 
     def test_trailing_validation_failure_blocks_entry_order(
         self,
@@ -1641,7 +1667,7 @@ class TestAuditedExecution:
             side_effect=NetworkError("Connection timeout")
         )
 
-        def lookup(client_order_id, product_id):
+        def lookup(client_order_id, product_id, *, order_type=None):
             return ExchangeOrderSnapshot(
                 client_order_id=client_order_id,
                 exchange_order_id="EX-ADOPTED",
@@ -1675,6 +1701,7 @@ class TestAuditedExecution:
         mock_exchange_adapter.get_order_by_client_id.assert_called_once_with(
             order.client_order_id,
             order.product_id,
+            order_type=order.type,
         )
 
     def test_ambiguous_submit_error_adoption_audits_detached_repo_exchange_id(
@@ -1685,7 +1712,7 @@ class TestAuditedExecution:
             side_effect=NetworkError("Connection timeout")
         )
 
-        def lookup(client_order_id, product_id):
+        def lookup(client_order_id, product_id, *, order_type=None):
             return ExchangeOrderSnapshot(
                 client_order_id=client_order_id,
                 exchange_order_id="EX-DETACHED",
@@ -1838,7 +1865,7 @@ class TestAuditedExecution:
             side_effect=NetworkError("Connection timeout")
         )
 
-        def lookup(client_order_id, product_id):
+        def lookup(client_order_id, product_id, *, order_type=None):
             return ExchangeOrderSnapshot(
                 client_order_id=client_order_id,
                 exchange_order_id="EX-UNRESOLVED",
@@ -1877,7 +1904,7 @@ class TestAuditedExecution:
             side_effect=NetworkError("Connection timeout")
         )
 
-        def lookup(client_order_id, product_id):
+        def lookup(client_order_id, product_id, *, order_type=None):
             return ExchangeOrderSnapshot(
                 client_order_id=client_order_id,
                 exchange_order_id=None,
@@ -1967,7 +1994,7 @@ class TestAuditedExecution:
             side_effect=NetworkError("Connection timeout")
         )
 
-        def lookup(client_order_id, product_id):
+        def lookup(client_order_id, product_id, *, order_type=None):
             return ExchangeOrderSnapshot(
                 client_order_id=client_order_id,
                 exchange_order_id="EX-CANCELED",
@@ -2004,6 +2031,1126 @@ class TestAuditedExecution:
         audit = audit_session.add.call_args_list[0].args[0]
         assert audit.outcome_payload["status"] == "terminal_after_submit_error"
         assert audit.outcome_payload["adoption"]["action"] == "terminal_after_submit_error"
+
+    def test_audited_conditional_orders_place_after_entry_fill(
+        self, mock_db_session, mock_clock, mock_exchange_adapter, mock_order_repo, signal_factory
+    ):
+        audit_session = mock_db_session
+        engine = ExecutionEngine(
+            db_session=mock_db_session,
+            clock=mock_clock,
+            adapter=mock_exchange_adapter,
+            order_repository=mock_order_repo,
+            db_session_factory=lambda: nullcontext(audit_session),
+            audit_external_orders=True,
+            is_backtest=True,
+        )
+
+        order_id = engine.execute_signal(
+            signal_factory(
+                price=Decimal("42000"),
+                stop_loss=Decimal("41000"),
+                take_profit=Decimal("43000"),
+            )
+        )
+
+        entry = mock_order_repo.orders[order_id]
+        conditional_orders = [
+            order for order in mock_order_repo.orders.values() if order.id != order_id
+        ]
+        assert len(mock_exchange_adapter.open_orders) == 1
+        assert {order.status for order in conditional_orders} == {OrderStatus.NEW.value}
+        assert {order.exchange_order_id for order in conditional_orders} == {None}
+
+        engine.process_exchange_order_event(
+            ExchangeOrderEvent(
+                status="filled",
+                product_id=entry.product_id,
+                exchange_order_id=entry.exchange_order_id,
+                cumulative_filled_quantity=entry.quantity,
+                cumulative_average_price=entry.price,
+            )
+        )
+
+        assert len(mock_exchange_adapter.open_orders) == 3
+        assert {order.status for order in conditional_orders} == {
+            OrderStatus.SUBMITTED.value
+        }
+        assert all(order.exchange_order_id for order in conditional_orders)
+
+    def test_partial_entry_fill_places_protection_for_filled_quantity(
+        self, mock_db_session, mock_clock, mock_exchange_adapter, mock_order_repo, signal_factory
+    ):
+        audit_session = mock_db_session
+        engine = ExecutionEngine(
+            db_session=mock_db_session,
+            clock=mock_clock,
+            adapter=mock_exchange_adapter,
+            order_repository=mock_order_repo,
+            db_session_factory=lambda: nullcontext(audit_session),
+            audit_external_orders=True,
+            is_backtest=True,
+        )
+        order_id = engine.execute_signal(
+            signal_factory(
+                price=Decimal("42000"),
+                quantity=Decimal("0.10"),
+                stop_loss=Decimal("41000"),
+                take_profit=Decimal("43000"),
+            )
+        )
+        entry = mock_order_repo.orders[order_id]
+
+        result = engine.process_exchange_order_event(
+            ExchangeOrderEvent(
+                status="partially_filled",
+                product_id=entry.product_id,
+                exchange_order_id=entry.exchange_order_id,
+                cumulative_filled_quantity=Decimal("0.04"),
+                cumulative_average_price=entry.price,
+            )
+        )
+
+        conditional_orders = [
+            order for order in mock_order_repo.orders.values() if order.id != order_id
+        ]
+        assert result["action"] == "applied"
+        assert entry.status == OrderStatus.PARTIALLY_FILLED.value
+        assert {order.status for order in conditional_orders} == {
+            OrderStatus.SUBMITTED.value
+        }
+        assert {order.quantity for order in conditional_orders} == {Decimal("0.04")}
+
+    def test_entry_fill_increment_after_protection_reports_unresolved_resize(
+        self, mock_db_session, mock_clock, mock_exchange_adapter, mock_order_repo, signal_factory
+    ):
+        audit_session = mock_db_session
+        engine = ExecutionEngine(
+            db_session=mock_db_session,
+            clock=mock_clock,
+            adapter=mock_exchange_adapter,
+            order_repository=mock_order_repo,
+            db_session_factory=lambda: nullcontext(audit_session),
+            audit_external_orders=True,
+            is_backtest=True,
+        )
+        order_id = engine.execute_signal(
+            signal_factory(
+                price=Decimal("42000"),
+                quantity=Decimal("0.10"),
+                stop_loss=Decimal("41000"),
+                take_profit=Decimal("43000"),
+            )
+        )
+        entry = mock_order_repo.orders[order_id]
+        engine.process_exchange_order_event(
+            ExchangeOrderEvent(
+                status="partially_filled",
+                product_id=entry.product_id,
+                exchange_order_id=entry.exchange_order_id,
+                cumulative_filled_quantity=Decimal("0.04"),
+                cumulative_average_price=entry.price,
+            )
+        )
+
+        result = engine.process_exchange_order_event(
+            ExchangeOrderEvent(
+                status="filled",
+                product_id=entry.product_id,
+                exchange_order_id=entry.exchange_order_id,
+                cumulative_filled_quantity=Decimal("0.10"),
+                cumulative_average_price=entry.price,
+            )
+        )
+
+        assert result["action"] == "unresolved_conditional_order_placement_failed"
+        assert {
+            failure["reason"] for failure in result["failures"]
+        } == {"conditional_order_resize_required_after_entry_fill"}
+        assert {
+            failure["required_quantity"] for failure in result["failures"]
+        } == {"0.10"}
+
+    def test_entry_fill_reports_unresolved_when_protective_order_placement_fails(
+        self, mock_db_session, mock_clock, mock_exchange_adapter, mock_order_repo, signal_factory
+    ):
+        audit_session = mock_db_session
+        engine = ExecutionEngine(
+            db_session=mock_db_session,
+            clock=mock_clock,
+            adapter=mock_exchange_adapter,
+            order_repository=mock_order_repo,
+            db_session_factory=lambda: nullcontext(audit_session),
+            audit_external_orders=True,
+            is_backtest=True,
+        )
+        order_id = engine.execute_signal(
+            signal_factory(
+                price=Decimal("42000"),
+                stop_loss=Decimal("41000"),
+                take_profit=Decimal("43000"),
+            )
+        )
+        entry = mock_order_repo.orders[order_id]
+        mock_exchange_adapter.set_fail_on_order_types({"stop_loss"})
+
+        result = engine.process_exchange_order_event(
+            ExchangeOrderEvent(
+                status="filled",
+                product_id=entry.product_id,
+                exchange_order_id=entry.exchange_order_id,
+                cumulative_filled_quantity=entry.quantity,
+                cumulative_average_price=entry.price,
+            )
+        )
+
+        stop_loss = next(
+            order for order in mock_order_repo.orders.values() if order.type == "stop_loss"
+        )
+        take_profit = next(
+            order for order in mock_order_repo.orders.values() if order.type == "take_profit"
+        )
+        assert result["action"] == "unresolved_conditional_order_placement_failed"
+        assert result["failures"][0]["order_id"] == stop_loss.id
+        assert stop_loss.status == "failed"
+        assert take_profit.status == OrderStatus.SUBMITTED.value
+        event = next(
+            call.args[0]
+            for call in audit_session.add.call_args_list
+            if isinstance(call.args[0], SystemEvent)
+            and call.args[0].event_subtype
+            == "conditional_order_placement_failed_after_entry_fill"
+        )
+        assert event.related_order_id == entry.id
+
+    def test_non_idempotent_ambiguous_conditional_submit_is_not_retried(
+        self, mock_db_session, mock_clock, mock_exchange_adapter, mock_order_repo, signal_factory
+    ):
+        engine = ExecutionEngine(
+            db_session=mock_db_session,
+            clock=mock_clock,
+            adapter=mock_exchange_adapter,
+            order_repository=mock_order_repo,
+            is_backtest=True,
+        )
+        original_place_order = mock_exchange_adapter.place_order
+
+        def place_order(order):
+            if order.type == "stop_loss":
+                raise NetworkError("request timed out")
+            return original_place_order(order)
+
+        mock_exchange_adapter.place_order = MagicMock(side_effect=place_order)
+        order_id = engine.execute_signal(
+            signal_factory(
+                price=Decimal("42000"),
+                stop_loss=Decimal("41000"),
+            )
+        )
+        entry = mock_order_repo.orders[order_id]
+        stop_loss = next(
+            order for order in mock_order_repo.orders.values() if order.type == "stop_loss"
+        )
+
+        assert stop_loss.client_order_id is None
+        assert stop_loss.status == OrderStatus.SUBMITTED_UNCONFIRMED.value
+
+        result = engine.process_exchange_order_event(
+            ExchangeOrderEvent(
+                status="filled",
+                product_id=entry.product_id,
+                exchange_order_id=entry.exchange_order_id,
+                cumulative_filled_quantity=entry.quantity,
+                cumulative_average_price=entry.price,
+            )
+        )
+
+        assert result["action"] == "applied"
+        stop_loss_place_calls = [
+            call for call in mock_exchange_adapter.place_order.call_args_list
+            if call.args[0].type == "stop_loss"
+        ]
+        assert len(stop_loss_place_calls) == 1
+
+    def test_filled_protective_order_cancels_linked_sibling(
+        self, mock_db_session, mock_clock, mock_exchange_adapter, mock_order_repo, signal_factory
+    ):
+        audit_session = mock_db_session
+        engine = ExecutionEngine(
+            db_session=mock_db_session,
+            clock=mock_clock,
+            adapter=mock_exchange_adapter,
+            order_repository=mock_order_repo,
+            db_session_factory=lambda: nullcontext(audit_session),
+            audit_external_orders=True,
+            is_backtest=True,
+        )
+        order_id = engine.execute_signal(
+            signal_factory(
+                price=Decimal("42000"),
+                stop_loss=Decimal("41000"),
+                take_profit=Decimal("43000"),
+            )
+        )
+        entry = mock_order_repo.orders[order_id]
+        engine.process_exchange_order_event(
+            ExchangeOrderEvent(
+                status="filled",
+                product_id=entry.product_id,
+                exchange_order_id=entry.exchange_order_id,
+                cumulative_filled_quantity=entry.quantity,
+                cumulative_average_price=entry.price,
+            )
+        )
+        stop_loss = next(
+            order for order in mock_order_repo.orders.values() if order.type == "stop_loss"
+        )
+        take_profit = next(
+            order for order in mock_order_repo.orders.values() if order.type == "take_profit"
+        )
+
+        engine.process_exchange_order_event(
+            ExchangeOrderEvent(
+                status="filled",
+                product_id=stop_loss.product_id,
+                exchange_order_id=stop_loss.exchange_order_id,
+                cumulative_filled_quantity=stop_loss.quantity,
+                cumulative_average_price=stop_loss.trigger_price,
+            )
+        )
+
+        assert stop_loss.status == OrderStatus.FILLED.value
+        assert take_profit.status == OrderStatus.CANCELLED.value
+        assert take_profit not in mock_exchange_adapter.open_orders
+
+    def test_sibling_cancel_passes_conditional_order_type_to_adapter(
+        self, mock_db_session, mock_clock, mock_exchange_adapter, mock_order_repo, signal_factory
+    ):
+        audit_session = mock_db_session
+        engine = ExecutionEngine(
+            db_session=mock_db_session,
+            clock=mock_clock,
+            adapter=mock_exchange_adapter,
+            order_repository=mock_order_repo,
+            db_session_factory=lambda: nullcontext(audit_session),
+            audit_external_orders=True,
+            is_backtest=True,
+        )
+        order_id = engine.execute_signal(
+            signal_factory(
+                price=Decimal("42000"),
+                stop_loss=Decimal("41000"),
+                take_profit=Decimal("43000"),
+            )
+        )
+        entry = mock_order_repo.orders[order_id]
+        engine.process_exchange_order_event(
+            ExchangeOrderEvent(
+                status="filled",
+                product_id=entry.product_id,
+                exchange_order_id=entry.exchange_order_id,
+                cumulative_filled_quantity=entry.quantity,
+                cumulative_average_price=entry.price,
+            )
+        )
+        stop_loss = next(
+            order for order in mock_order_repo.orders.values() if order.type == "stop_loss"
+        )
+        take_profit = next(
+            order for order in mock_order_repo.orders.values() if order.type == "take_profit"
+        )
+        mock_exchange_adapter.cancel_order_by_client_id = MagicMock(
+            wraps=mock_exchange_adapter.cancel_order_by_client_id
+        )
+
+        engine.process_exchange_order_event(
+            ExchangeOrderEvent(
+                status="filled",
+                product_id=stop_loss.product_id,
+                exchange_order_id=stop_loss.exchange_order_id,
+                cumulative_filled_quantity=stop_loss.quantity,
+                cumulative_average_price=stop_loss.trigger_price,
+            )
+        )
+
+        assert take_profit.status == OrderStatus.CANCELLED.value
+        mock_exchange_adapter.cancel_order_by_client_id.assert_called_once_with(
+            take_profit.client_order_id,
+            take_profit.product_id,
+            order_type="take_profit",
+        )
+
+    def test_partial_protective_fill_keeps_linked_sibling_and_reports_unresolved(
+        self, mock_db_session, mock_clock, mock_exchange_adapter, mock_order_repo, signal_factory
+    ):
+        audit_session = mock_db_session
+        engine = ExecutionEngine(
+            db_session=mock_db_session,
+            clock=mock_clock,
+            adapter=mock_exchange_adapter,
+            order_repository=mock_order_repo,
+            db_session_factory=lambda: nullcontext(audit_session),
+            audit_external_orders=True,
+            is_backtest=True,
+        )
+        order_id = engine.execute_signal(
+            signal_factory(
+                price=Decimal("42000"),
+                stop_loss=Decimal("41000"),
+                take_profit=Decimal("43000"),
+            )
+        )
+        entry = mock_order_repo.orders[order_id]
+        engine.process_exchange_order_event(
+            ExchangeOrderEvent(
+                status="filled",
+                product_id=entry.product_id,
+                exchange_order_id=entry.exchange_order_id,
+                cumulative_filled_quantity=entry.quantity,
+                cumulative_average_price=entry.price,
+            )
+        )
+        stop_loss = next(
+            order for order in mock_order_repo.orders.values() if order.type == "stop_loss"
+        )
+        take_profit = next(
+            order for order in mock_order_repo.orders.values() if order.type == "take_profit"
+        )
+
+        result = engine.process_exchange_order_event(
+            ExchangeOrderEvent(
+                status="partially_filled",
+                product_id=stop_loss.product_id,
+                exchange_order_id=stop_loss.exchange_order_id,
+                cumulative_filled_quantity=stop_loss.quantity / Decimal("2"),
+                cumulative_average_price=stop_loss.trigger_price,
+            )
+        )
+
+        assert result["action"] == "unresolved_protective_partial_fill_requires_resize"
+        assert stop_loss.status == OrderStatus.PARTIALLY_FILLED.value
+        assert take_profit.status == OrderStatus.SUBMITTED.value
+        assert take_profit in mock_exchange_adapter.open_orders
+        event = next(
+            call.args[0]
+            for call in audit_session.add.call_args_list
+            if isinstance(call.args[0], SystemEvent)
+            and call.args[0].event_subtype
+            == "protective_partial_fill_requires_resize"
+        )
+        assert event.related_order_id == stop_loss.id
+
+    def test_filled_protective_order_reports_unresolved_when_sibling_cancel_fails(
+        self, mock_db_session, mock_clock, mock_exchange_adapter, mock_order_repo, signal_factory
+    ):
+        audit_session = mock_db_session
+        engine = ExecutionEngine(
+            db_session=mock_db_session,
+            clock=mock_clock,
+            adapter=mock_exchange_adapter,
+            order_repository=mock_order_repo,
+            db_session_factory=lambda: nullcontext(audit_session),
+            audit_external_orders=True,
+            is_backtest=True,
+        )
+        order_id = engine.execute_signal(
+            signal_factory(
+                price=Decimal("42000"),
+                stop_loss=Decimal("41000"),
+                take_profit=Decimal("43000"),
+            )
+        )
+        entry = mock_order_repo.orders[order_id]
+        engine.process_exchange_order_event(
+            ExchangeOrderEvent(
+                status="filled",
+                product_id=entry.product_id,
+                exchange_order_id=entry.exchange_order_id,
+                cumulative_filled_quantity=entry.quantity,
+                cumulative_average_price=entry.price,
+            )
+        )
+        stop_loss = next(
+            order for order in mock_order_repo.orders.values() if order.type == "stop_loss"
+        )
+        take_profit = next(
+            order for order in mock_order_repo.orders.values() if order.type == "take_profit"
+        )
+        mock_exchange_adapter.cancel_order_by_client_id = MagicMock(return_value=False)
+        mock_exchange_adapter.cancel_order = MagicMock(return_value=False)
+
+        result = engine.process_exchange_order_event(
+            ExchangeOrderEvent(
+                status="filled",
+                product_id=stop_loss.product_id,
+                exchange_order_id=stop_loss.exchange_order_id,
+                cumulative_filled_quantity=stop_loss.quantity,
+                cumulative_average_price=stop_loss.trigger_price,
+            )
+        )
+
+        assert result["action"] == "unresolved_linked_conditional_cancel_failed"
+        assert result["failure"]["order_id"] == take_profit.id
+        assert take_profit.status == OrderStatus.SUBMITTED.value
+        event = next(
+            call.args[0]
+            for call in audit_session.add.call_args_list
+            if isinstance(call.args[0], SystemEvent)
+            and call.args[0].event_subtype == "linked_conditional_order_cancel_failed"
+        )
+        assert event.related_order_id == stop_loss.id
+
+    def test_replayed_entry_fill_event_does_not_resubmit_unconfirmed_protection(
+        self, mock_db_session, mock_clock, mock_exchange_adapter, mock_order_repo, signal_factory
+    ):
+        audit_session = mock_db_session
+        engine = ExecutionEngine(
+            db_session=mock_db_session,
+            clock=mock_clock,
+            adapter=mock_exchange_adapter,
+            order_repository=mock_order_repo,
+            db_session_factory=lambda: nullcontext(audit_session),
+            audit_external_orders=True,
+            is_backtest=True,
+        )
+        order_id = engine.execute_signal(
+            signal_factory(
+                price=Decimal("42000"),
+                stop_loss=Decimal("41000"),
+                take_profit=Decimal("43000"),
+            )
+        )
+        entry = mock_order_repo.orders[order_id]
+        fill_event = ExchangeOrderEvent(
+            status="filled",
+            product_id=entry.product_id,
+            exchange_order_id=entry.exchange_order_id,
+            cumulative_filled_quantity=entry.quantity,
+            cumulative_average_price=entry.price,
+        )
+        def place_order(order):
+            if order.type in {"stop_loss", "take_profit"}:
+                raise NetworkError("request timed out")
+            return f"EX-{order.type}"
+
+        mock_exchange_adapter.place_order = MagicMock(side_effect=place_order)
+        mock_exchange_adapter.get_order_by_client_id = MagicMock(return_value=None)
+        first = engine.process_exchange_order_event(fill_event)
+        assert first["action"] == "unresolved_conditional_order_placement_failed"
+        conditionals = [
+            order
+            for order in mock_order_repo.orders.values()
+            if order.type in {"stop_loss", "take_profit"}
+        ]
+        assert all(
+            order.status == OrderStatus.SUBMITTED_UNCONFIRMED.value
+            for order in conditionals
+        )
+
+        replay = engine.process_exchange_order_event(fill_event)
+
+        assert replay["action"] == "applied"
+        assert replay["fill_quantity"] == Decimal("0")
+        assert all(
+            order.status == OrderStatus.SUBMITTED_UNCONFIRMED.value
+            for order in conditionals
+        )
+        conditional_place_calls = [
+            call for call in mock_exchange_adapter.place_order.call_args_list
+            if call.args[0].type in {"stop_loss", "take_profit"}
+        ]
+        assert len(conditional_place_calls) == 2
+
+    def test_conditional_orders_derive_stable_client_order_ids(
+        self, mock_db_session, mock_clock, mock_exchange_adapter, mock_order_repo, signal_factory
+    ):
+        engine = ExecutionEngine(
+            db_session=mock_db_session,
+            clock=mock_clock,
+            adapter=mock_exchange_adapter,
+            order_repository=mock_order_repo,
+            db_session_factory=lambda: nullcontext(mock_db_session),
+            audit_external_orders=True,
+            is_backtest=True,
+        )
+        entry_client_id = "strategy-worker-entry-1704067200000000000"
+
+        engine.execute_signal(
+            signal_factory(
+                price=Decimal("42000"),
+                stop_loss=Decimal("41000"),
+                take_profit=Decimal("43000"),
+                trailing_distance=Decimal("100"),
+                metadata={"client_order_id": entry_client_id},
+            )
+        )
+
+        conditionals = {
+            order.type: order
+            for order in mock_order_repo.orders.values()
+            if order.type in {"stop_loss", "take_profit", "trailing_stop"}
+        }
+        assert conditionals["stop_loss"].client_order_id == (
+            "strategy-worker-sl-1704067200000000000"
+        )
+        assert conditionals["take_profit"].client_order_id == (
+            "strategy-worker-tp-1704067200000000000"
+        )
+        assert conditionals["trailing_stop"].client_order_id == (
+            "strategy-worker-tr-1704067200000000000"
+        )
+        for order in conditionals.values():
+            parse_client_order_id(order.client_order_id)
+
+    def test_ambiguous_conditional_submit_adopts_exchange_order_without_replay_duplicate(
+        self, mock_db_session, mock_clock, mock_exchange_adapter, mock_order_repo, signal_factory
+    ):
+        engine = ExecutionEngine(
+            db_session=mock_db_session,
+            clock=mock_clock,
+            adapter=mock_exchange_adapter,
+            order_repository=mock_order_repo,
+            db_session_factory=lambda: nullcontext(mock_db_session),
+            audit_external_orders=True,
+            is_backtest=True,
+        )
+        order_id = engine.execute_signal(
+            signal_factory(
+                price=Decimal("42000"),
+                stop_loss=Decimal("41000"),
+            )
+        )
+        entry = mock_order_repo.orders[order_id]
+        stop_loss = next(
+            order for order in mock_order_repo.orders.values() if order.type == "stop_loss"
+        )
+        accepted: dict[str, str] = {}
+        original_place_order = mock_exchange_adapter.place_order
+
+        def place_order(order):
+            if order.type == "stop_loss":
+                exchange_order_id = "EX-stop-loss"
+                order.exchange_order_id = exchange_order_id
+                accepted[order.client_order_id] = exchange_order_id
+                mock_exchange_adapter.open_orders.append(order)
+                raise NetworkError("request timed out")
+            return original_place_order(order)
+
+        def lookup(client_order_id, product_id, *, order_type=None):
+            exchange_order_id = accepted.get(client_order_id)
+            if exchange_order_id is None:
+                return None
+            return ExchangeOrderSnapshot(
+                client_order_id=client_order_id,
+                exchange_order_id=exchange_order_id,
+                status="open",
+            )
+
+        mock_exchange_adapter.place_order = MagicMock(side_effect=place_order)
+        mock_exchange_adapter.get_order_by_client_id = MagicMock(side_effect=lookup)
+        fill_event = ExchangeOrderEvent(
+            status="filled",
+            product_id=entry.product_id,
+            exchange_order_id=entry.exchange_order_id,
+            cumulative_filled_quantity=entry.quantity,
+            cumulative_average_price=entry.price,
+        )
+
+        first = engine.process_exchange_order_event(fill_event)
+        replay = engine.process_exchange_order_event(fill_event)
+
+        assert first["action"] == "applied"
+        assert replay["action"] == "applied"
+        assert stop_loss.status == OrderStatus.SUBMITTED.value
+        assert stop_loss.exchange_order_id == "EX-stop-loss"
+        stop_loss_place_calls = [
+            call for call in mock_exchange_adapter.place_order.call_args_list
+            if call.args[0].type == "stop_loss"
+        ]
+        assert len(stop_loss_place_calls) == 1
+        assert [
+            order for order in mock_exchange_adapter.open_orders
+            if order.client_order_id == stop_loss.client_order_id
+        ] == [stop_loss]
+
+    def test_ambiguous_conditional_submit_missing_snapshot_stays_unconfirmed(
+        self, mock_db_session, mock_clock, mock_exchange_adapter, mock_order_repo, signal_factory
+    ):
+        engine = ExecutionEngine(
+            db_session=mock_db_session,
+            clock=mock_clock,
+            adapter=mock_exchange_adapter,
+            order_repository=mock_order_repo,
+            db_session_factory=lambda: nullcontext(mock_db_session),
+            audit_external_orders=True,
+            is_backtest=True,
+        )
+        order_id = engine.execute_signal(
+            signal_factory(
+                price=Decimal("42000"),
+                stop_loss=Decimal("41000"),
+            )
+        )
+        entry = mock_order_repo.orders[order_id]
+        stop_loss = next(
+            order for order in mock_order_repo.orders.values() if order.type == "stop_loss"
+        )
+
+        def place_order(order):
+            if order.type == "stop_loss":
+                raise NetworkError("request timed out")
+            return f"EX-{order.type}"
+
+        mock_exchange_adapter.place_order = MagicMock(side_effect=place_order)
+        mock_exchange_adapter.get_order_by_client_id = MagicMock(return_value=None)
+        fill_event = ExchangeOrderEvent(
+            status="filled",
+            product_id=entry.product_id,
+            exchange_order_id=entry.exchange_order_id,
+            cumulative_filled_quantity=entry.quantity,
+            cumulative_average_price=entry.price,
+        )
+
+        first = engine.process_exchange_order_event(fill_event)
+        replay = engine.process_exchange_order_event(fill_event)
+
+        assert first["action"] == "unresolved_conditional_order_placement_failed"
+        assert first["failures"][0]["reason"] == (
+            "verification_blocked_order_snapshot_missing"
+        )
+        assert replay["action"] == "applied"
+        assert stop_loss.status == OrderStatus.SUBMITTED_UNCONFIRMED.value
+        assert stop_loss.exchange_order_id is None
+        stop_loss_place_calls = [
+            call for call in mock_exchange_adapter.place_order.call_args_list
+            if call.args[0].type == "stop_loss"
+        ]
+        assert len(stop_loss_place_calls) == 1
+        assert stop_loss in engine.list_recoverable_client_orders()
+
+    def test_mixed_pending_and_submitted_protection_reports_underprotected_order(
+        self, mock_db_session, mock_clock, mock_exchange_adapter, mock_order_repo, signal_factory
+    ):
+        engine = ExecutionEngine(
+            db_session=mock_db_session,
+            clock=mock_clock,
+            adapter=mock_exchange_adapter,
+            order_repository=mock_order_repo,
+            db_session_factory=lambda: nullcontext(mock_db_session),
+            audit_external_orders=True,
+            is_backtest=True,
+        )
+        order_id = engine.execute_signal(
+            signal_factory(
+                price=Decimal("42000"),
+                quantity=Decimal("0.02"),
+                stop_loss=Decimal("41000"),
+                take_profit=Decimal("43000"),
+            )
+        )
+        entry = mock_order_repo.orders[order_id]
+        entry.filled_quantity = Decimal("0.02")
+        entry.filled_price = entry.price
+        mock_order_repo.update_order(entry)
+        stop_loss = next(
+            order for order in mock_order_repo.orders.values() if order.type == "stop_loss"
+        )
+        take_profit = next(
+            order for order in mock_order_repo.orders.values() if order.type == "take_profit"
+        )
+        stop_loss.quantity = Decimal("0.01")
+        stop_loss.status = OrderStatus.SUBMITTED.value
+        stop_loss.exchange_order_id = "EX-stop-loss"
+        mock_order_repo.update_order(stop_loss)
+        take_profit.quantity = Decimal("0.01")
+        take_profit.status = OrderStatus.NEW.value
+        mock_order_repo.update_order(take_profit)
+
+        result = engine.process_exchange_order_event(
+            ExchangeOrderEvent(
+                status="open",
+                product_id=entry.product_id,
+                exchange_order_id=entry.exchange_order_id,
+                cumulative_filled_quantity=Decimal("0.02"),
+                cumulative_average_price=entry.price,
+            )
+        )
+
+        assert result["action"] == "unresolved_conditional_order_placement_failed"
+        assert {
+            failure["reason"] for failure in result["failures"]
+        } == {"conditional_order_resize_required_after_entry_fill"}
+        assert result["failures"][0]["order_id"] == stop_loss.id
+        assert result["failures"][0]["current_quantity"] == "0.01"
+        assert result["failures"][0]["required_quantity"] == "0.02"
+        assert stop_loss.status == OrderStatus.SUBMITTED.value
+        assert take_profit.status == OrderStatus.SUBMITTED.value
+        assert take_profit.quantity == Decimal("0.02")
+
+    def test_startup_reconcile_places_pending_protection_for_filled_entry(
+        self, mock_db_session, mock_clock, mock_exchange_adapter, mock_order_repo, signal_factory
+    ):
+        audit_session = mock_db_session
+        engine = ExecutionEngine(
+            db_session=mock_db_session,
+            clock=mock_clock,
+            adapter=mock_exchange_adapter,
+            order_repository=mock_order_repo,
+            db_session_factory=lambda: nullcontext(audit_session),
+            audit_external_orders=True,
+            is_backtest=True,
+        )
+        order_id = engine.execute_signal(
+            signal_factory(
+                price=Decimal("42000"),
+                stop_loss=Decimal("41000"),
+                take_profit=Decimal("43000"),
+            )
+        )
+        entry = mock_order_repo.orders[order_id]
+        entry.status = OrderStatus.FILLED.value
+        entry.filled_quantity = entry.quantity
+        entry.filled_price = entry.price
+        mock_order_repo.update_order(entry)
+        conditionals = [
+            order
+            for order in mock_order_repo.orders.values()
+            if order.type in {"stop_loss", "take_profit"}
+        ]
+        assert all(order.status == OrderStatus.NEW.value for order in conditionals)
+        mock_exchange_adapter.set_fail_on_order_types(set())
+
+        payload = engine.reconcile_recoverable_client_orders()
+
+        assert payload["protection_recovery"]["entries_attempted"] == 1
+        assert payload["protection_recovery"]["failures"] == []
+        assert all(
+            order.status == OrderStatus.SUBMITTED.value for order in conditionals
+        )
+
+    def test_startup_reconcile_places_pending_protection_after_entry_fill_repair(
+        self, mock_db_session, mock_clock, mock_exchange_adapter, mock_order_repo, signal_factory
+    ):
+        audit_session = mock_db_session
+        engine = ExecutionEngine(
+            db_session=mock_db_session,
+            clock=mock_clock,
+            adapter=mock_exchange_adapter,
+            order_repository=mock_order_repo,
+            db_session_factory=lambda: nullcontext(audit_session),
+            audit_external_orders=True,
+            is_backtest=True,
+        )
+        order_id = engine.execute_signal(
+            signal_factory(
+                price=Decimal("42000"),
+                stop_loss=Decimal("41000"),
+                take_profit=Decimal("43000"),
+            )
+        )
+        entry = mock_order_repo.orders[order_id]
+        conditionals = [
+            order
+            for order in mock_order_repo.orders.values()
+            if order.type in {"stop_loss", "take_profit"}
+        ]
+        assert entry.filled_quantity == Decimal("0")
+        assert all(order.status == OrderStatus.NEW.value for order in conditionals)
+
+        def lookup(client_order_id, product_id, *, order_type=None):
+            if client_order_id == entry.client_order_id:
+                return ExchangeOrderSnapshot(
+                    client_order_id=client_order_id,
+                    exchange_order_id="EX-entry",
+                    status="closed",
+                    filled_quantity=entry.quantity,
+                    average_price=entry.price,
+                )
+            return None
+
+        mock_exchange_adapter.get_order_by_client_id = MagicMock(side_effect=lookup)
+
+        payload = engine.reconcile_recoverable_client_orders()
+
+        assert payload["protection_recovery"]["entries_attempted"] == 1
+        assert payload["protection_recovery"]["failures"] == []
+        assert payload["decision_counts"] == {"exchange_closed": 1}
+        assert payload["protection_unresolved_count"] == 0
+        assert entry.filled_quantity == entry.quantity
+        assert all(
+            order.status == OrderStatus.SUBMITTED.value for order in conditionals
+        )
+        assert all(order.exchange_order_id is not None for order in conditionals)
+
+    def test_startup_reconcile_counts_pending_protection_failures_as_unresolved(
+        self, mock_db_session, mock_clock, mock_exchange_adapter, mock_order_repo, signal_factory
+    ):
+        audit_session = mock_db_session
+        engine = ExecutionEngine(
+            db_session=mock_db_session,
+            clock=mock_clock,
+            adapter=mock_exchange_adapter,
+            order_repository=mock_order_repo,
+            db_session_factory=lambda: nullcontext(audit_session),
+            audit_external_orders=True,
+            is_backtest=True,
+        )
+        order_id = engine.execute_signal(
+            signal_factory(
+                price=Decimal("42000"),
+                stop_loss=Decimal("41000"),
+                take_profit=Decimal("43000"),
+            )
+        )
+        entry = mock_order_repo.orders[order_id]
+        entry.status = OrderStatus.FILLED.value
+        entry.filled_quantity = entry.quantity
+        entry.filled_price = entry.price
+        mock_order_repo.update_order(entry)
+        mock_exchange_adapter.set_fail_on_order_types({"stop_loss", "take_profit"})
+
+        payload = engine.reconcile_recoverable_client_orders()
+
+        assert payload["protection_recovery"]["entries_attempted"] == 1
+        assert len(payload["protection_recovery"]["failures"]) == 2
+        assert payload["reconciliation_unresolved_count"] == 0
+        assert payload["protection_unresolved_count"] == 2
+        assert payload["unresolved_count"] == 2
+
+    def test_replayed_protective_fill_event_retries_sibling_cancel(
+        self, mock_db_session, mock_clock, mock_exchange_adapter, mock_order_repo, signal_factory
+    ):
+        audit_session = mock_db_session
+        engine = ExecutionEngine(
+            db_session=mock_db_session,
+            clock=mock_clock,
+            adapter=mock_exchange_adapter,
+            order_repository=mock_order_repo,
+            db_session_factory=lambda: nullcontext(audit_session),
+            audit_external_orders=True,
+            is_backtest=True,
+        )
+        order_id = engine.execute_signal(
+            signal_factory(
+                price=Decimal("42000"),
+                stop_loss=Decimal("41000"),
+                take_profit=Decimal("43000"),
+            )
+        )
+        entry = mock_order_repo.orders[order_id]
+        engine.process_exchange_order_event(
+            ExchangeOrderEvent(
+                status="filled",
+                product_id=entry.product_id,
+                exchange_order_id=entry.exchange_order_id,
+                cumulative_filled_quantity=entry.quantity,
+                cumulative_average_price=entry.price,
+            )
+        )
+        stop_loss = next(
+            order for order in mock_order_repo.orders.values() if order.type == "stop_loss"
+        )
+        take_profit = next(
+            order for order in mock_order_repo.orders.values() if order.type == "take_profit"
+        )
+        original_cancel_by_client_id = mock_exchange_adapter.cancel_order_by_client_id
+        mock_exchange_adapter.cancel_order_by_client_id = MagicMock(return_value=False)
+        mock_exchange_adapter.cancel_order = MagicMock(return_value=False)
+        protective_fill_event = ExchangeOrderEvent(
+            status="filled",
+            product_id=stop_loss.product_id,
+            exchange_order_id=stop_loss.exchange_order_id,
+            cumulative_filled_quantity=stop_loss.quantity,
+            cumulative_average_price=stop_loss.trigger_price,
+        )
+        first = engine.process_exchange_order_event(protective_fill_event)
+        assert first["action"] == "unresolved_linked_conditional_cancel_failed"
+        assert take_profit.status == OrderStatus.SUBMITTED.value
+
+        mock_exchange_adapter.cancel_order_by_client_id = original_cancel_by_client_id
+        mock_exchange_adapter.cancel_order = MagicMock(
+            wraps=mock_exchange_adapter.cancel_order
+        )
+        replay = engine.process_exchange_order_event(protective_fill_event)
+
+        assert replay["action"] == "applied"
+        assert take_profit.status == OrderStatus.CANCELLED.value
+
+    def test_resync_skips_pending_protective_orders(
+        self, mock_db_session, mock_clock, mock_exchange_adapter, mock_order_repo, signal_factory
+    ):
+        audit_session = mock_db_session
+        engine = ExecutionEngine(
+            db_session=mock_db_session,
+            clock=mock_clock,
+            adapter=mock_exchange_adapter,
+            order_repository=mock_order_repo,
+            db_session_factory=lambda: nullcontext(audit_session),
+            audit_external_orders=True,
+            is_backtest=True,
+        )
+        order_id = engine.execute_signal(
+            signal_factory(
+                price=Decimal("42000"),
+                stop_loss=Decimal("41000"),
+                take_profit=Decimal("43000"),
+            )
+        )
+        entry = mock_order_repo.orders[order_id]
+
+        def lookup(client_order_id, product_id, *, order_type=None):
+            assert client_order_id == entry.client_order_id, (
+                "resync must not look up pending protective orders"
+            )
+            return ExchangeOrderSnapshot(
+                client_order_id=client_order_id,
+                exchange_order_id=entry.exchange_order_id,
+                status="open",
+                filled_quantity=Decimal("0"),
+                average_price=None,
+            )
+
+        mock_exchange_adapter.get_order_by_client_id = MagicMock(side_effect=lookup)
+
+        summary = engine.resync_recoverable_order_events()
+
+        assert summary["verification_blocked_count"] == 0
+        assert summary["unresolved_count"] == 0
+
+    def test_entry_cancelled_without_fill_fails_pending_protection(
+        self, mock_db_session, mock_clock, mock_exchange_adapter, mock_order_repo, signal_factory
+    ):
+        audit_session = mock_db_session
+        engine = ExecutionEngine(
+            db_session=mock_db_session,
+            clock=mock_clock,
+            adapter=mock_exchange_adapter,
+            order_repository=mock_order_repo,
+            db_session_factory=lambda: nullcontext(audit_session),
+            audit_external_orders=True,
+            is_backtest=True,
+        )
+        order_id = engine.execute_signal(
+            signal_factory(
+                price=Decimal("42000"),
+                stop_loss=Decimal("41000"),
+                take_profit=Decimal("43000"),
+            )
+        )
+        entry = mock_order_repo.orders[order_id]
+
+        result = engine.process_exchange_order_event(
+            ExchangeOrderEvent(
+                status="canceled",
+                product_id=entry.product_id,
+                exchange_order_id=entry.exchange_order_id,
+            )
+        )
+
+        assert result["action"] == "applied"
+        assert entry.status == OrderStatus.CANCELLED.value
+        conditionals = [
+            order
+            for order in mock_order_repo.orders.values()
+            if order.type in {"stop_loss", "take_profit"}
+        ]
+        assert len(conditionals) == 2
+        assert all(order.status == "failed" for order in conditionals)
+
+    def test_entry_cancelled_with_partial_fill_keeps_pending_protection(
+        self, mock_db_session, mock_clock, mock_exchange_adapter, mock_order_repo, signal_factory
+    ):
+        audit_session = mock_db_session
+        engine = ExecutionEngine(
+            db_session=mock_db_session,
+            clock=mock_clock,
+            adapter=mock_exchange_adapter,
+            order_repository=mock_order_repo,
+            db_session_factory=lambda: nullcontext(audit_session),
+            audit_external_orders=True,
+            is_backtest=True,
+        )
+        order_id = engine.execute_signal(
+            signal_factory(
+                price=Decimal("42000"),
+                stop_loss=Decimal("41000"),
+                take_profit=Decimal("43000"),
+            )
+        )
+        entry = mock_order_repo.orders[order_id]
+        engine.process_exchange_order_event(
+            ExchangeOrderEvent(
+                status="partially_filled",
+                product_id=entry.product_id,
+                exchange_order_id=entry.exchange_order_id,
+                cumulative_filled_quantity=entry.quantity / Decimal("2"),
+                cumulative_average_price=entry.price,
+            )
+        )
+
+        engine.process_exchange_order_event(
+            ExchangeOrderEvent(
+                status="canceled",
+                product_id=entry.product_id,
+                exchange_order_id=entry.exchange_order_id,
+                cumulative_filled_quantity=entry.quantity / Decimal("2"),
+                cumulative_average_price=entry.price,
+            )
+        )
+
+        conditionals = [
+            order
+            for order in mock_order_repo.orders.values()
+            if order.type in {"stop_loss", "take_profit"}
+        ]
+        assert len(conditionals) == 2
+        assert all(
+            order.status == OrderStatus.SUBMITTED.value for order in conditionals
+        )
+
+    def test_reconcile_fails_pending_protection_for_entry_cancelled_on_exchange(
+        self, mock_db_session, mock_clock, mock_exchange_adapter, mock_order_repo, signal_factory
+    ):
+        audit_session = mock_db_session
+        engine = ExecutionEngine(
+            db_session=mock_db_session,
+            clock=mock_clock,
+            adapter=mock_exchange_adapter,
+            order_repository=mock_order_repo,
+            db_session_factory=lambda: nullcontext(audit_session),
+            audit_external_orders=True,
+            is_backtest=True,
+        )
+        order_id = engine.execute_signal(
+            signal_factory(
+                price=Decimal("42000"),
+                stop_loss=Decimal("41000"),
+                take_profit=Decimal("43000"),
+            )
+        )
+        entry = mock_order_repo.orders[order_id]
+
+        def lookup(client_order_id, product_id, *, order_type=None):
+            return ExchangeOrderSnapshot(
+                client_order_id=client_order_id,
+                exchange_order_id=entry.exchange_order_id,
+                status="canceled",
+                filled_quantity=Decimal("0"),
+                average_price=None,
+            )
+
+        mock_exchange_adapter.get_order_by_client_id = MagicMock(side_effect=lookup)
+
+        payload = engine.reconcile_recoverable_client_orders()
+
+        assert entry.status == OrderStatus.CANCELLED.value
+        conditionals = [
+            order
+            for order in mock_order_repo.orders.values()
+            if order.type in {"stop_loss", "take_profit"}
+        ]
+        assert all(order.status == "failed" for order in conditionals)
+        assert payload["protection_recovery"]["entries_attempted"] == 0
 
     def test_intent_audit_failure_stops_before_external_order(
         self, mock_db_session, mock_clock, mock_exchange_adapter, mock_order_repo, signal_factory
@@ -2354,7 +3501,7 @@ class TestAuditedExecution:
         )
         mock_order_repo.add_order(order)
 
-        mock_exchange_adapter.get_order_by_client_id = lambda client_order_id, product_id: (
+        mock_exchange_adapter.get_order_by_client_id = lambda client_order_id, product_id, *, order_type=None: (
             ExchangeOrderSnapshot(
                 client_order_id=client_order_id,
                 exchange_order_id="EX-OPEN",
@@ -2395,7 +3542,7 @@ class TestAuditedExecution:
         )
         mock_order_repo.add_order(order)
 
-        mock_exchange_adapter.get_order_by_client_id = lambda client_order_id, product_id: (
+        mock_exchange_adapter.get_order_by_client_id = lambda client_order_id, product_id, *, order_type=None: (
             ExchangeOrderSnapshot(
                 client_order_id=client_order_id,
                 exchange_order_id="EX-PARTIAL",
@@ -2447,7 +3594,7 @@ class TestAuditedExecution:
         )
         mock_order_repo.add_order(order)
 
-        mock_exchange_adapter.get_order_by_client_id = lambda client_order_id, product_id: (
+        mock_exchange_adapter.get_order_by_client_id = lambda client_order_id, product_id, *, order_type=None: (
             ExchangeOrderSnapshot(
                 client_order_id=client_order_id,
                 exchange_order_id="EX-OPEN-MISSING-PRICE",
@@ -2497,7 +3644,7 @@ class TestAuditedExecution:
         )
         mock_order_repo.add_order(order)
 
-        mock_exchange_adapter.get_order_by_client_id = lambda client_order_id, product_id: (
+        mock_exchange_adapter.get_order_by_client_id = lambda client_order_id, product_id, *, order_type=None: (
             ExchangeOrderSnapshot(
                 client_order_id=client_order_id,
                 exchange_order_id="EX-OPEN-LESS-FILLED",
@@ -2569,7 +3716,7 @@ class TestAuditedExecution:
         )
         mock_order_repo.add_order(order)
 
-        mock_exchange_adapter.get_order_by_client_id = lambda client_order_id, product_id: (
+        mock_exchange_adapter.get_order_by_client_id = lambda client_order_id, product_id, *, order_type=None: (
             ExchangeOrderSnapshot(
                 client_order_id=client_order_id,
                 exchange_order_id=f"EX-{exchange_status.upper()}-{fill_state.upper()}",
@@ -2635,7 +3782,7 @@ class TestAuditedExecution:
         assert len(mock_exchange_adapter.open_orders) == 1
 
         restarted_adapter = type(mock_exchange_adapter)()
-        restarted_adapter.get_order_by_client_id = lambda client_order_id, product_id: (
+        restarted_adapter.get_order_by_client_id = lambda client_order_id, product_id, *, order_type=None: (
             ExchangeOrderSnapshot(
                 client_order_id=client_order_id,
                 exchange_order_id=persisted_order.exchange_order_id,
@@ -2682,7 +3829,7 @@ class TestAuditedExecution:
         )
         mock_order_repo.add_order(order)
 
-        mock_exchange_adapter.get_order_by_client_id = lambda client_order_id, product_id: (
+        mock_exchange_adapter.get_order_by_client_id = lambda client_order_id, product_id, *, order_type=None: (
             ExchangeOrderSnapshot(
                 client_order_id=client_order_id,
                 exchange_order_id="EX-FILLED",
@@ -2726,7 +3873,7 @@ class TestAuditedExecution:
         )
         mock_order_repo.add_order(order)
 
-        mock_exchange_adapter.get_order_by_client_id = lambda client_order_id, product_id: (
+        mock_exchange_adapter.get_order_by_client_id = lambda client_order_id, product_id, *, order_type=None: (
             ExchangeOrderSnapshot(
                 client_order_id=client_order_id,
                 exchange_order_id="EX-FILLED",
@@ -2768,7 +3915,7 @@ class TestAuditedExecution:
         )
         mock_order_repo.add_order(order)
 
-        mock_exchange_adapter.get_order_by_client_id = lambda client_order_id, product_id: (
+        mock_exchange_adapter.get_order_by_client_id = lambda client_order_id, product_id, *, order_type=None: (
             ExchangeOrderSnapshot(
                 client_order_id=client_order_id,
                 exchange_order_id="EX-CLOSED",
@@ -2830,7 +3977,7 @@ class TestAuditedExecution:
         )
         mock_order_repo.add_order(order)
 
-        mock_exchange_adapter.get_order_by_client_id = lambda client_order_id, product_id: (
+        mock_exchange_adapter.get_order_by_client_id = lambda client_order_id, product_id, *, order_type=None: (
             ExchangeOrderSnapshot(
                 client_order_id=client_order_id,
                 exchange_order_id=f"EX-{exchange_status.upper()}",
@@ -2884,7 +4031,7 @@ class TestAuditedExecution:
         )
         mock_order_repo.add_order(order)
 
-        mock_exchange_adapter.get_order_by_client_id = lambda client_order_id, product_id: (
+        mock_exchange_adapter.get_order_by_client_id = lambda client_order_id, product_id, *, order_type=None: (
             ExchangeOrderSnapshot(
                 client_order_id=client_order_id,
                 exchange_order_id=f"EX-{exchange_status.upper()}",
@@ -2930,7 +4077,7 @@ class TestAuditedExecution:
         )
         mock_order_repo.add_order(order)
 
-        mock_exchange_adapter.get_order_by_client_id = lambda client_order_id, product_id: (
+        mock_exchange_adapter.get_order_by_client_id = lambda client_order_id, product_id, *, order_type=None: (
             ExchangeOrderSnapshot(
                 client_order_id=client_order_id,
                 exchange_order_id="EX-CANCELLED",
@@ -3012,7 +4159,7 @@ class TestAuditedExecution:
     def test_reconcile_recoverable_client_orders_distinguishes_unsupported_lookup(
         self, mock_db_session, mock_clock, mock_exchange_adapter, mock_order_repo, order_factory
     ):
-        def unsupported_lookup(client_order_id, product_id):
+        def unsupported_lookup(client_order_id, product_id, *, order_type=None):
             raise ExchangeOrderLookupUnsupported("unsupported")
 
         mock_exchange_adapter.get_order_by_client_id = unsupported_lookup
@@ -3060,7 +4207,7 @@ class TestAuditedExecution:
         )
         mock_order_repo.add_order(order)
 
-        mock_exchange_adapter.get_order_by_client_id = lambda client_order_id, product_id: (
+        mock_exchange_adapter.get_order_by_client_id = lambda client_order_id, product_id, *, order_type=None: (
             ExchangeOrderSnapshot(
                 client_order_id=client_order_id,
                 exchange_order_id="EX-WEIRD",
@@ -3093,6 +4240,637 @@ class TestAuditedExecution:
     )
     def test_reconcile_decision_categories(self, local_status, exchange_status, expected):
         assert ExecutionEngine._reconcile_decision(local_status, exchange_status) == expected
+
+    def test_skipped_pending_protection_count_reported_in_resync_and_reconcile(
+        self, mock_db_session, mock_clock, mock_exchange_adapter, mock_order_repo, signal_factory
+    ):
+        """Fix 1: resync and reconcile payloads expose skipped_pending_protection_count."""
+        audit_session = mock_db_session
+        engine = ExecutionEngine(
+            db_session=mock_db_session,
+            clock=mock_clock,
+            adapter=mock_exchange_adapter,
+            order_repository=mock_order_repo,
+            db_session_factory=lambda: nullcontext(audit_session),
+            audit_external_orders=True,
+            is_backtest=True,
+        )
+        order_id = engine.execute_signal(
+            signal_factory(
+                price=Decimal("42000"),
+                stop_loss=Decimal("41000"),
+                take_profit=Decimal("43000"),
+            )
+        )
+        entry = mock_order_repo.orders[order_id]
+
+        def lookup(client_order_id, product_id, *, order_type=None):
+            assert client_order_id == entry.client_order_id, (
+                "resync/reconcile must not look up pending protective orders"
+            )
+            return ExchangeOrderSnapshot(
+                client_order_id=client_order_id,
+                exchange_order_id=entry.exchange_order_id,
+                status="open",
+                filled_quantity=Decimal("0"),
+                average_price=None,
+            )
+
+        mock_exchange_adapter.get_order_by_client_id = MagicMock(side_effect=lookup)
+
+        resync_summary = engine.resync_recoverable_order_events()
+        assert resync_summary["skipped_pending_protection_count"] == 2
+
+        reconcile_summary = engine.reconcile_recoverable_client_orders()
+        assert reconcile_summary["skipped_pending_protection_count"] == 2
+
+    def test_conditional_order_placement_increments_orders_total(
+        self, mock_db_session, mock_clock, mock_exchange_adapter, mock_order_repo, signal_factory
+    ):
+        """Fix 2: successful SL/TP placement increments ORDERS_TOTAL with status=placed reason=none."""
+        audit_session = mock_db_session
+        engine = ExecutionEngine(
+            db_session=mock_db_session,
+            clock=mock_clock,
+            adapter=mock_exchange_adapter,
+            order_repository=mock_order_repo,
+            db_session_factory=lambda: nullcontext(audit_session),
+            audit_external_orders=True,
+            is_backtest=True,
+        )
+
+        labels_sl = {"order_type": "stop_loss", "status": "placed", "reason": "none"}
+        labels_tp = {"order_type": "take_profit", "status": "placed", "reason": "none"}
+        before_sl = REGISTRY.get_sample_value("fluxtrade_orders_total", labels_sl) or 0.0
+        before_tp = REGISTRY.get_sample_value("fluxtrade_orders_total", labels_tp) or 0.0
+
+        order_id = engine.execute_signal(
+            signal_factory(
+                price=Decimal("42000"),
+                stop_loss=Decimal("41000"),
+                take_profit=Decimal("43000"),
+            )
+        )
+        entry = mock_order_repo.orders[order_id]
+        engine.process_exchange_order_event(
+            ExchangeOrderEvent(
+                status="filled",
+                product_id=entry.product_id,
+                exchange_order_id=entry.exchange_order_id,
+                cumulative_filled_quantity=entry.quantity,
+                cumulative_average_price=entry.price,
+            )
+        )
+
+        after_sl = REGISTRY.get_sample_value("fluxtrade_orders_total", labels_sl) or 0.0
+        after_tp = REGISTRY.get_sample_value("fluxtrade_orders_total", labels_tp) or 0.0
+
+        assert after_sl - before_sl == 1.0
+        assert after_tp - before_tp == 1.0
+
+    # ---------------------------------------------------------------------------
+    # Protective terminal without fill — protection gap detection
+    # ---------------------------------------------------------------------------
+
+    def _setup_engine_with_filled_entry(
+        self, mock_db_session, mock_clock, mock_exchange_adapter, mock_order_repo, signal_factory
+    ):
+        """Return (engine, entry, stop_loss, take_profit) after entry fill event."""
+        audit_session = mock_db_session
+        engine = ExecutionEngine(
+            db_session=mock_db_session,
+            clock=mock_clock,
+            adapter=mock_exchange_adapter,
+            order_repository=mock_order_repo,
+            db_session_factory=lambda: nullcontext(audit_session),
+            audit_external_orders=True,
+            is_backtest=True,
+        )
+        order_id = engine.execute_signal(
+            signal_factory(
+                price=Decimal("42000"),
+                stop_loss=Decimal("41000"),
+                take_profit=Decimal("43000"),
+            )
+        )
+        entry = mock_order_repo.orders[order_id]
+        engine.process_exchange_order_event(
+            ExchangeOrderEvent(
+                status="filled",
+                product_id=entry.product_id,
+                exchange_order_id=entry.exchange_order_id,
+                cumulative_filled_quantity=entry.quantity,
+                cumulative_average_price=entry.price,
+            )
+        )
+        stop_loss = next(
+            o for o in mock_order_repo.orders.values() if o.type == "stop_loss"
+        )
+        take_profit = next(
+            o for o in mock_order_repo.orders.values() if o.type == "take_profit"
+        )
+        return engine, entry, stop_loss, take_profit
+
+    def test_protective_cancel_without_fill_reports_gap(
+        self, mock_db_session, mock_clock, mock_exchange_adapter, mock_order_repo, signal_factory
+    ):
+        """A stop_loss cancelled with zero fill while entry is filled → unresolved gap."""
+        engine, entry, stop_loss, take_profit = self._setup_engine_with_filled_entry(
+            mock_db_session, mock_clock, mock_exchange_adapter, mock_order_repo, signal_factory
+        )
+
+        result = engine.process_exchange_order_event(
+            ExchangeOrderEvent(
+                status="canceled",
+                product_id=stop_loss.product_id,
+                exchange_order_id=stop_loss.exchange_order_id,
+            )
+        )
+
+        assert result["action"] == "unresolved_protective_terminal_without_fill"
+        assert stop_loss.status == OrderStatus.CANCELLED.value
+        assert take_profit.status == OrderStatus.SUBMITTED.value
+        system_event = next(
+            call.args[0]
+            for call in mock_db_session.add.call_args_list
+            if isinstance(call.args[0], SystemEvent)
+            and call.args[0].event_subtype == "protective_order_terminal_without_fill"
+        )
+        assert system_event.related_order_id == stop_loss.id
+
+    def test_oco_sibling_cancel_after_fill_not_reported_as_gap(
+        self, mock_db_session, mock_clock, mock_exchange_adapter, mock_order_repo, signal_factory
+    ):
+        """Exchange cancel for OCO sibling after the other leg filled → action 'applied', no gap."""
+        engine, entry, stop_loss, take_profit = self._setup_engine_with_filled_entry(
+            mock_db_session, mock_clock, mock_exchange_adapter, mock_order_repo, signal_factory
+        )
+        # SL fills — this cancels TP locally
+        engine.process_exchange_order_event(
+            ExchangeOrderEvent(
+                status="filled",
+                product_id=stop_loss.product_id,
+                exchange_order_id=stop_loss.exchange_order_id,
+                cumulative_filled_quantity=stop_loss.quantity,
+                cumulative_average_price=stop_loss.trigger_price,
+            )
+        )
+        assert stop_loss.status == OrderStatus.FILLED.value
+        assert take_profit.status == OrderStatus.CANCELLED.value
+
+        # Exchange confirms the TP cancel we requested
+        result = engine.process_exchange_order_event(
+            ExchangeOrderEvent(
+                status="canceled",
+                product_id=take_profit.product_id,
+                exchange_order_id=take_profit.exchange_order_id,
+            )
+        )
+
+        assert result["action"] == "applied"
+
+    def test_protective_terminal_without_fill_helper_returns_none_when_entry_unfilled(
+        self, mock_db_session, mock_clock, mock_exchange_adapter, mock_order_repo, signal_factory
+    ):
+        """Helper returns None when the entry has no fill (no position to protect)."""
+        engine, _entry, stop_loss, _take_profit = self._setup_engine_with_filled_entry(
+            mock_db_session, mock_clock, mock_exchange_adapter, mock_order_repo, signal_factory
+        )
+        # Manually clear entry fill to simulate unfilled entry
+        entry = next(
+            o for o in mock_order_repo.orders.values() if o.type == "limit"
+        )
+        entry.filled_quantity = Decimal("0")
+        mock_order_repo.update_order(entry)
+
+        assert engine._protective_terminal_without_fill_failure(stop_loss) is None
+
+    def test_reconcile_reports_gap_for_protective_cancelled_without_fill(
+        self, mock_db_session, mock_clock, mock_exchange_adapter, mock_order_repo, signal_factory
+    ):
+        """Reconcile path: SUBMITTED protective cancelled by exchange with no fill → unresolved."""
+        audit_session = mock_db_session
+        engine = ExecutionEngine(
+            db_session=mock_db_session,
+            clock=mock_clock,
+            adapter=mock_exchange_adapter,
+            order_repository=mock_order_repo,
+            db_session_factory=lambda: nullcontext(audit_session),
+            audit_external_orders=True,
+            is_backtest=True,
+        )
+        order_id = engine.execute_signal(
+            signal_factory(
+                price=Decimal("42000"),
+                stop_loss=Decimal("41000"),
+                take_profit=Decimal("43000"),
+            )
+        )
+        entry = mock_order_repo.orders[order_id]
+        # Fill the entry via event so SL/TP are placed (SUBMITTED)
+        engine.process_exchange_order_event(
+            ExchangeOrderEvent(
+                status="filled",
+                product_id=entry.product_id,
+                exchange_order_id=entry.exchange_order_id,
+                cumulative_filled_quantity=entry.quantity,
+                cumulative_average_price=entry.price,
+            )
+        )
+
+        def lookup(client_order_id, product_id, *, order_type=None):
+            order = next(
+                (o for o in mock_order_repo.orders.values()
+                 if o.client_order_id == client_order_id),
+                None,
+            )
+            if order is None:
+                return None
+            if order.type in ("limit", "market"):
+                return ExchangeOrderSnapshot(
+                    client_order_id=client_order_id,
+                    exchange_order_id=order.exchange_order_id,
+                    status="closed",
+                    filled_quantity=order.quantity,
+                    average_price=order.price,
+                )
+            # Protective orders come back as canceled with zero fill
+            return ExchangeOrderSnapshot(
+                client_order_id=client_order_id,
+                exchange_order_id=order.exchange_order_id,
+                status="canceled",
+                filled_quantity=Decimal("0"),
+                average_price=None,
+            )
+
+        mock_exchange_adapter.get_order_by_client_id = MagicMock(side_effect=lookup)
+
+        payload = engine.reconcile_recoverable_client_orders()
+
+        assert payload["unresolved_count"] >= 1
+        assert any(
+            r["repair_action"] == "unresolved_protective_terminal_without_fill"
+            for r in payload["results"]
+        )
+
+    def test_uncertain_submit_preserves_submitted_leg_and_marks_pending_new_leg(
+        self, mock_db_session, mock_clock, mock_exchange_adapter, mock_order_repo, signal_factory
+    ):
+        """Partial success: SL placed (SUBMITTED), TP lookup failed (stays NEW).
+
+        The helper must skip the SUBMITTED SL and only merge payload into the
+        still-NEW TP.  With the old code the SL would be destructively reset to
+        NEW and its exchange_order_id would be nulled — an orphan on the exchange.
+        """
+        def place_order_side_effect(order):
+            if order.type == "limit":
+                raise NetworkError("Connection timeout")
+            if order.type == "stop_loss":
+                # mark_submitted(order, ex_id) called by engine after this return
+                return "MOCK-SL-1"
+            # take_profit branch: never reached in this scenario (TP excluded
+            # from placement_candidates because lookup raises below)
+            raise ExchangeError("tp placement failed")
+
+        mock_exchange_adapter.place_order = MagicMock(side_effect=place_order_side_effect)
+
+        def lookup(client_order_id, product_id, *, order_type=None):
+            if order_type == "limit":
+                # Entry was filled on the exchange
+                return ExchangeOrderSnapshot(
+                    client_order_id=client_order_id,
+                    exchange_order_id="EX-ENTRY-FILLED",
+                    status="filled",
+                    filled_quantity=Decimal("0.01"),
+                    average_price=Decimal("42000"),
+                )
+            if order_type == "take_profit":
+                # Pre-submit adoption lookup for TP fails → TP stays NEW,
+                # excluded from placement_candidates; failures list non-empty
+                # → event returns unresolved → helper is called
+                raise ExchangeError("boom")
+            # stop_loss pre-submit lookup: no existing exchange order
+            return None
+
+        mock_exchange_adapter.get_order_by_client_id = MagicMock(side_effect=lookup)
+        audit_session = mock_db_session
+        engine = ExecutionEngine(
+            db_session=mock_db_session,
+            clock=mock_clock,
+            adapter=mock_exchange_adapter,
+            order_repository=mock_order_repo,
+            db_session_factory=lambda: nullcontext(audit_session),
+            audit_external_orders=True,
+            is_backtest=True,  # fill recording uses repo.update_position, not Redis
+        )
+
+        with pytest.raises(NetworkError, match="Connection timeout"):
+            engine.execute_signal(
+                signal_factory(
+                    price=Decimal("42000"),
+                    stop_loss=Decimal("41000"),
+                    take_profit=Decimal("43000"),
+                )
+            )
+
+        orders = list(mock_order_repo.orders.values())
+        sl_order = next(o for o in orders if o.type == "stop_loss")
+        tp_order = next(o for o in orders if o.type == "take_profit")
+
+        # SL was placed on the exchange; the helper must leave it untouched
+        assert sl_order.status == OrderStatus.SUBMITTED.value
+        assert sl_order.exchange_order_id == "MOCK-SL-1"
+        assert sl_order.intent_payload.get("linked_order_id") == str(tp_order.id)
+
+        # TP was never submitted (pre-submit lookup failed); the helper merges
+        # pending_reason into the existing payload without destroying linked_order_id
+        assert tp_order.status == OrderStatus.NEW.value
+        assert tp_order.exchange_order_id is None
+        assert tp_order.intent_payload.get("linked_order_id") == str(sl_order.id)
+        assert tp_order.intent_payload.get("pending_reason") == "entry_submit_outcome_uncertain"
+
+    def test_uncertain_submit_merges_pending_payload_without_replacing_it(
+        self, mock_db_session, mock_clock, mock_exchange_adapter, mock_order_repo, signal_factory
+    ):
+        """No-placement case: lookup returns None → verification_blocked.
+
+        Both conditionals remain NEW.  The helper must MERGE the pending keys
+        into the existing payload so that linked_order_id and placement_mode
+        survive alongside the new pending_reason.
+        """
+        mock_exchange_adapter.place_order = MagicMock(
+            side_effect=NetworkError("Connection timeout")
+        )
+        mock_exchange_adapter.get_order_by_client_id = MagicMock(return_value=None)
+        audit_session = mock_db_session
+        engine = ExecutionEngine(
+            db_session=mock_db_session,
+            clock=mock_clock,
+            adapter=mock_exchange_adapter,
+            order_repository=mock_order_repo,
+            db_session_factory=lambda: nullcontext(audit_session),
+            audit_external_orders=True,
+        )
+
+        with pytest.raises(NetworkError, match="Connection timeout"):
+            engine.execute_signal(
+                signal_factory(
+                    price=Decimal("42000"),
+                    stop_loss=Decimal("41000"),
+                    take_profit=Decimal("43000"),
+                )
+            )
+
+        orders = list(mock_order_repo.orders.values())
+        conditional_orders = [o for o in orders if o.type != "limit"]
+        assert len(conditional_orders) == 2
+
+        for order in conditional_orders:
+            assert order.status == OrderStatus.NEW.value
+            assert order.exchange_order_id is None
+            # linked_order_id must survive (merge, not replace)
+            assert order.intent_payload.get("linked_order_id") is not None
+            # pending_reason must be added alongside the original keys
+            assert order.intent_payload.get("pending_reason") == "entry_submit_outcome_uncertain"
+
+    # ------------------------------------------------------------------
+    # OCO sibling cancellation during startup reconciliation (P1 fix)
+    # ------------------------------------------------------------------
+
+    def test_reconcile_offline_protective_fill_cancels_sibling(
+        self, mock_db_session, mock_clock, mock_exchange_adapter, mock_order_repo, signal_factory
+    ):
+        """Gap 1: SL fills while service is offline.
+
+        After restart, reconcile sees SL closed (filled) and TP still open.
+        The fix must cancel TP and NOT leave the stale leg live.
+        """
+        audit_session = mock_db_session
+        engine = ExecutionEngine(
+            db_session=mock_db_session,
+            clock=mock_clock,
+            adapter=mock_exchange_adapter,
+            order_repository=mock_order_repo,
+            db_session_factory=lambda: nullcontext(audit_session),
+            audit_external_orders=True,
+            is_backtest=True,
+        )
+        order_id = engine.execute_signal(
+            signal_factory(
+                price=Decimal("42000"),
+                stop_loss=Decimal("41000"),
+                take_profit=Decimal("43000"),
+            )
+        )
+        entry = mock_order_repo.orders[order_id]
+        # Bring entry to FILLED via live event (SL/TP become SUBMITTED)
+        engine.process_exchange_order_event(
+            ExchangeOrderEvent(
+                status="filled",
+                product_id=entry.product_id,
+                exchange_order_id=entry.exchange_order_id,
+                cumulative_filled_quantity=entry.quantity,
+                cumulative_average_price=entry.price,
+            )
+        )
+        stop_loss = next(
+            o for o in mock_order_repo.orders.values() if o.type == "stop_loss"
+        )
+        take_profit = next(
+            o for o in mock_order_repo.orders.values() if o.type == "take_profit"
+        )
+
+        # Simulate offline fill: exchange reports SL filled, TP still open
+        def lookup(client_order_id, product_id, *, order_type=None):
+            if client_order_id == entry.client_order_id:
+                return ExchangeOrderSnapshot(
+                    client_order_id=client_order_id,
+                    exchange_order_id=entry.exchange_order_id,
+                    status="filled",
+                    filled_quantity=entry.quantity,
+                    average_price=entry.price,
+                )
+            if client_order_id == stop_loss.client_order_id:
+                return ExchangeOrderSnapshot(
+                    client_order_id=client_order_id,
+                    exchange_order_id=stop_loss.exchange_order_id,
+                    status="filled",
+                    filled_quantity=stop_loss.quantity,
+                    average_price=stop_loss.trigger_price,
+                )
+            if client_order_id == take_profit.client_order_id:
+                return ExchangeOrderSnapshot(
+                    client_order_id=client_order_id,
+                    exchange_order_id=take_profit.exchange_order_id,
+                    status="open",
+                    filled_quantity=Decimal("0"),
+                    average_price=None,
+                )
+            return None
+
+        mock_exchange_adapter.get_order_by_client_id = MagicMock(side_effect=lookup)
+
+        payload = engine.reconcile_recoverable_client_orders()
+
+        # SL must be recorded as filled; TP must be cancelled (stale OCO leg)
+        assert stop_loss.status == OrderStatus.FILLED.value
+        assert take_profit.status == OrderStatus.CANCELLED.value
+        # At least one result should reflect the SL fill reconciliation
+        repair_actions = [r["repair_action"] for r in payload["results"]]
+        assert "filled_from_exchange_snapshot" in repair_actions
+
+    def test_reconcile_crash_window_stale_protective_leg_cancelled(
+        self, mock_db_session, mock_clock, mock_exchange_adapter, mock_order_repo, signal_factory
+    ):
+        """Gap 2: crash after recording SL FILLED but before cancelling TP.
+
+        Simulate by directly setting SL status to FILLED in the repo.
+        Reconcile sees TP as 'open' on exchange — it must cancel, not restore.
+        """
+        audit_session = mock_db_session
+        engine = ExecutionEngine(
+            db_session=mock_db_session,
+            clock=mock_clock,
+            adapter=mock_exchange_adapter,
+            order_repository=mock_order_repo,
+            db_session_factory=lambda: nullcontext(audit_session),
+            audit_external_orders=True,
+            is_backtest=True,
+        )
+        order_id = engine.execute_signal(
+            signal_factory(
+                price=Decimal("42000"),
+                stop_loss=Decimal("41000"),
+                take_profit=Decimal("43000"),
+            )
+        )
+        entry = mock_order_repo.orders[order_id]
+        # Bring entry to FILLED via live event (SL/TP become SUBMITTED)
+        engine.process_exchange_order_event(
+            ExchangeOrderEvent(
+                status="filled",
+                product_id=entry.product_id,
+                exchange_order_id=entry.exchange_order_id,
+                cumulative_filled_quantity=entry.quantity,
+                cumulative_average_price=entry.price,
+            )
+        )
+        stop_loss = next(
+            o for o in mock_order_repo.orders.values() if o.type == "stop_loss"
+        )
+        take_profit = next(
+            o for o in mock_order_repo.orders.values() if o.type == "take_profit"
+        )
+
+        # Simulate crash window: SL was recorded as FILLED but sibling cancel
+        # never happened.  Manually set SL to FILLED in the repo.
+        stop_loss.status = OrderStatus.FILLED.value
+        stop_loss.filled_quantity = stop_loss.quantity
+        mock_order_repo.update_order(stop_loss)
+        # Remove SL from open_orders (exchange already executed it)
+        mock_exchange_adapter.open_orders = [
+            o for o in mock_exchange_adapter.open_orders if o.id != stop_loss.id
+        ]
+
+        # Exchange still shows TP open; entry is terminal (not in scan)
+        def lookup(client_order_id, product_id, *, order_type=None):
+            if client_order_id == take_profit.client_order_id:
+                return ExchangeOrderSnapshot(
+                    client_order_id=client_order_id,
+                    exchange_order_id=take_profit.exchange_order_id,
+                    status="open",
+                    filled_quantity=Decimal("0"),
+                    average_price=None,
+                )
+            return None
+
+        mock_exchange_adapter.get_order_by_client_id = MagicMock(side_effect=lookup)
+
+        payload = engine.reconcile_recoverable_client_orders()
+
+        # TP must be cancelled — NOT restored as an active tracking order
+        assert take_profit.status == OrderStatus.CANCELLED.value
+        repair_actions = [r["repair_action"] for r in payload["results"]]
+        assert "cancelled_stale_protective_leg" in repair_actions
+        assert "restored_tracking" not in repair_actions
+
+    def test_reconcile_offline_protective_fill_sibling_cancel_failure_unresolved(
+        self, mock_db_session, mock_clock, mock_exchange_adapter, mock_order_repo, signal_factory
+    ):
+        """Cancel failure during sibling cancellation after offline protective fill
+        must yield an unresolved result, not silently drop the failure.
+        """
+        audit_session = mock_db_session
+        engine = ExecutionEngine(
+            db_session=mock_db_session,
+            clock=mock_clock,
+            adapter=mock_exchange_adapter,
+            order_repository=mock_order_repo,
+            db_session_factory=lambda: nullcontext(audit_session),
+            audit_external_orders=True,
+            is_backtest=True,
+        )
+        order_id = engine.execute_signal(
+            signal_factory(
+                price=Decimal("42000"),
+                stop_loss=Decimal("41000"),
+                take_profit=Decimal("43000"),
+            )
+        )
+        entry = mock_order_repo.orders[order_id]
+        engine.process_exchange_order_event(
+            ExchangeOrderEvent(
+                status="filled",
+                product_id=entry.product_id,
+                exchange_order_id=entry.exchange_order_id,
+                cumulative_filled_quantity=entry.quantity,
+                cumulative_average_price=entry.price,
+            )
+        )
+        stop_loss = next(
+            o for o in mock_order_repo.orders.values() if o.type == "stop_loss"
+        )
+        take_profit = next(
+            o for o in mock_order_repo.orders.values() if o.type == "take_profit"
+        )
+
+        def lookup(client_order_id, product_id, *, order_type=None):
+            if client_order_id == entry.client_order_id:
+                return ExchangeOrderSnapshot(
+                    client_order_id=client_order_id,
+                    exchange_order_id=entry.exchange_order_id,
+                    status="filled",
+                    filled_quantity=entry.quantity,
+                    average_price=entry.price,
+                )
+            if client_order_id == stop_loss.client_order_id:
+                return ExchangeOrderSnapshot(
+                    client_order_id=client_order_id,
+                    exchange_order_id=stop_loss.exchange_order_id,
+                    status="filled",
+                    filled_quantity=stop_loss.quantity,
+                    average_price=stop_loss.trigger_price,
+                )
+            if client_order_id == take_profit.client_order_id:
+                return ExchangeOrderSnapshot(
+                    client_order_id=client_order_id,
+                    exchange_order_id=take_profit.exchange_order_id,
+                    status="open",
+                    filled_quantity=Decimal("0"),
+                    average_price=None,
+                )
+            return None
+
+        mock_exchange_adapter.get_order_by_client_id = MagicMock(side_effect=lookup)
+        # Force cancel to always fail so the sibling cancel returns failure
+        mock_exchange_adapter.cancel_order = MagicMock(return_value=False)
+        mock_exchange_adapter.cancel_order_by_client_id = MagicMock(return_value=False)
+
+        payload = engine.reconcile_recoverable_client_orders()
+
+        assert payload["unresolved_count"] >= 1
+        repair_actions = [r["repair_action"] for r in payload["results"]]
+        assert "unresolved_linked_conditional_cancel_failed" in repair_actions
 
 
 class TestCancelOrder:
