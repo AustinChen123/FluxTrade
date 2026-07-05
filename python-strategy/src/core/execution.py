@@ -2,7 +2,6 @@ import logging
 import time as _time
 from datetime import datetime, timezone
 from decimal import Decimal
-from enum import Enum
 from typing import Callable, ContextManager, Optional
 from sqlalchemy.orm import Session
 from src.core.models import Signal, SignalType, Candlestick, OrderSide, OrderStatus, PositionSide
@@ -24,14 +23,13 @@ from src.core.client_order_id import (
     generate_client_order_id,
     parse_client_order_id,
 )
-
-
-class FillDeltaState(str, Enum):
-    NO_FILL = "no_fill"
-    CONVERGED = "converged"
-    DELTA_PRICED = "delta_priced"
-    DELTA_UNPRICED = "delta_unpriced"
-    LOCAL_OVERSTATED = "local_overstated"
+from src.core.fill_delta import (
+    FillDeltaState,
+    classify_fill_delta,
+    delta_price_from_cumulative_average,
+    fill_delta_from_cumulative,
+    snapshot_fill_delta,
+)
 
 
 class ExecutionEngine:
@@ -565,33 +563,26 @@ class ExecutionEngine:
         return None
 
     def _snapshot_fill_delta(self, order, snapshot) -> Optional[dict[str, Optional[Decimal]]]:
-        if snapshot.filled_quantity is None or snapshot.filled_quantity <= 0:
-            return None
-        local_filled_quantity = order.filled_quantity or Decimal("0")
-        fill_delta = self._fill_delta_from_cumulative(
-            local_filled=local_filled_quantity,
+        return snapshot_fill_delta(
+            local_filled=order.filled_quantity or Decimal("0"),
             local_average_price=order.filled_price,
             cumulative_filled=snapshot.filled_quantity,
             cumulative_average_price=snapshot.average_price,
+            cumulative_fee=snapshot.fee,
         )
-        fill_delta["fee"] = snapshot.fee if local_filled_quantity <= 0 else None
-        return fill_delta
 
     def _classify_fill_delta(
         self,
         order,
         snapshot,
     ) -> tuple[FillDeltaState, Optional[dict[str, Optional[Decimal]]]]:
-        fill_delta = self._snapshot_fill_delta(order, snapshot)
-        if fill_delta is None:
-            return FillDeltaState.NO_FILL, None
-        if fill_delta["quantity"] < 0:
-            return FillDeltaState.LOCAL_OVERSTATED, fill_delta
-        if fill_delta["quantity"] == 0:
-            return FillDeltaState.CONVERGED, fill_delta
-        if fill_delta["price"] is None:
-            return FillDeltaState.DELTA_UNPRICED, fill_delta
-        return FillDeltaState.DELTA_PRICED, fill_delta
+        return classify_fill_delta(
+            local_filled=order.filled_quantity or Decimal("0"),
+            local_average_price=order.filled_price,
+            cumulative_filled=snapshot.filled_quantity,
+            cumulative_average_price=snapshot.average_price,
+            cumulative_fee=snapshot.fee,
+        )
 
     def _record_open_snapshot_fill_delta(self, order, snapshot) -> dict[str, object]:
         fill_state, fill_delta = self._classify_fill_delta(order, snapshot)
@@ -961,21 +952,12 @@ class ExecutionEngine:
         cumulative_filled: Decimal,
         cumulative_average_price: Decimal | None,
     ) -> dict[str, Decimal | None]:
-        delta = cumulative_filled - local_filled
-        if delta <= 0:
-            return {"quantity": delta, "price": cumulative_average_price}
-        if cumulative_average_price is None:
-            return {"quantity": delta, "price": None}
-        return {
-            "quantity": delta,
-            "price": ExecutionEngine._delta_price_from_cumulative_average(
-                local_filled=local_filled,
-                local_average_price=local_average_price,
-                cumulative_filled=cumulative_filled,
-                cumulative_average_price=cumulative_average_price,
-                delta=delta,
-            ),
-        }
+        return fill_delta_from_cumulative(
+            local_filled=local_filled,
+            local_average_price=local_average_price,
+            cumulative_filled=cumulative_filled,
+            cumulative_average_price=cumulative_average_price,
+        )
 
     @staticmethod
     def _delta_price_from_cumulative_average(
@@ -986,13 +968,13 @@ class ExecutionEngine:
         cumulative_average_price: Decimal,
         delta: Decimal,
     ) -> Decimal | None:
-        if local_filled <= 0:
-            return cumulative_average_price
-        if local_average_price is None or local_average_price <= 0:
-            return None
-        cumulative_cost = cumulative_filled * cumulative_average_price
-        local_cost = local_filled * local_average_price
-        return (cumulative_cost - local_cost) / delta
+        return delta_price_from_cumulative_average(
+            local_filled=local_filled,
+            local_average_price=local_average_price,
+            cumulative_filled=cumulative_filled,
+            cumulative_average_price=cumulative_average_price,
+            delta=delta,
+        )
 
     @staticmethod
     def _requires_terminal_fill_quantity(
