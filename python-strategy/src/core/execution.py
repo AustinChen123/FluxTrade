@@ -259,6 +259,37 @@ class ExecutionEngine:
             ):
                 self.order_manager.fail_order(order, "entry_terminal_without_fill")
 
+    def _protective_terminal_without_fill_failure(self, order) -> dict | None:
+        """A protective leg terminating with zero fill while its entry holds a
+        filled position is a protection gap -- unless the OCO sibling closed the
+        position (FILLED/LIQUIDATED), which makes the cancellation expected."""
+        if order.type not in {"stop_loss", "take_profit", "trailing_stop"}:
+            return None
+        if (order.filled_quantity or Decimal("0")) > 0:
+            return None
+        if not isinstance(order.intent_payload, dict):
+            return None
+        entry_order_id = order.intent_payload.get("pending_entry_order_id")
+        if not entry_order_id:
+            return None
+        entry = self.order_manager.repo.get_order(str(entry_order_id))
+        if entry is None or (entry.filled_quantity or Decimal("0")) <= 0:
+            return None
+        linked_order_id = order.intent_payload.get("linked_order_id")
+        if linked_order_id:
+            sibling = self.order_manager.repo.get_order(str(linked_order_id))
+            if sibling is not None and sibling.status in {
+                OrderStatus.FILLED.value,
+                OrderStatus.LIQUIDATED.value,
+            }:
+                return None
+        return {
+            "order_id": str(order.id),
+            "order_type": order.type,
+            "entry_order_id": str(entry_order_id),
+            "reason": "protective_terminal_without_fill",
+        }
+
     @staticmethod
     def _is_pending_protective_order(order) -> bool:
         return (
@@ -436,6 +467,14 @@ class ExecutionEngine:
             self.order_manager.repo.update_order(order)
             if terminal_status in {OrderStatus.CANCELLED, OrderStatus.FAILED}:
                 self._fail_pending_conditional_orders_for_terminal_entry(order)
+                protective_failure = self._protective_terminal_without_fill_failure(order)
+                if protective_failure is not None:
+                    self._mark_reconciled(order)
+                    return self._repair_result(
+                        "unresolved_protective_terminal_without_fill",
+                        reason="protective_terminal_without_fill",
+                        unresolved=True,
+                    )
             self._mark_reconciled(order)
             return self._repair_result(
                 self._terminal_repair_action(terminal_status),
@@ -716,6 +755,22 @@ class ExecutionEngine:
 
         if event_state in {"cancelled", "rejected", "expired", "failed"}:
             self._fail_pending_conditional_orders_for_terminal_entry(order)
+            protective_failure = self._protective_terminal_without_fill_failure(order)
+            if protective_failure is not None:
+                self._try_write_conditional_order_event_warning(
+                    event_subtype="protective_order_terminal_without_fill",
+                    order=order,
+                    failures=[protective_failure],
+                )
+                return {
+                    "action": "unresolved_protective_terminal_without_fill",
+                    "order_id": order.id,
+                    "status": event.status,
+                    "state": event_state,
+                    "fill_quantity": fill_delta["quantity"],
+                    "exchange_order_id": order.exchange_order_id,
+                    "failure": protective_failure,
+                }
 
         # Post-fill actions key off persisted state, not the event delta:
         # a replayed event (crash recovery, resync, duplicate stream message)
