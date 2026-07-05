@@ -1602,6 +1602,7 @@ class ExecutionEngine:
             for order in self.order_manager.repo.list_orders_by_statuses(
                 {
                     OrderStatus.NEW.value,
+                    OrderStatus.SUBMITTED_UNCONFIRMED.value,
                     OrderStatus.SUBMITTED.value,
                     OrderStatus.PARTIALLY_FILLED.value,
                 }
@@ -1612,28 +1613,18 @@ class ExecutionEngine:
         pending = [
             order for order in related_orders if order.status == OrderStatus.NEW.value
         ]
+        failures = self._underprotected_conditional_order_failures(
+            related_orders,
+            protected_quantity,
+            pending_statuses={OrderStatus.NEW.value},
+        )
         if not pending:
-            underprotected = [
-                order
-                for order in related_orders
-                if (order.quantity or Decimal("0")) < protected_quantity
-            ]
-            if underprotected:
-                return [
-                    {
-                        "order_id": str(order.id),
-                        "order_type": order.type,
-                        "reason": "conditional_order_resize_required_after_entry_fill",
-                        "current_quantity": str(order.quantity),
-                        "required_quantity": str(protected_quantity),
-                    }
-                    for order in underprotected
-                ]
+            if failures:
+                return failures
             return []
         for order in pending:
             order.quantity = protected_quantity
             self.order_manager.repo.update_order(order)
-        failures: list[dict] = []
         placement_candidates = []
         for order in pending:
             lookup_failure = self._adopt_pending_conditional_order_before_submit(order)
@@ -1645,6 +1636,26 @@ class ExecutionEngine:
         if placement_candidates:
             failures.extend(self._place_conditional_orders(placement_candidates))
         return failures
+
+    @staticmethod
+    def _underprotected_conditional_order_failures(
+        related_orders: list,
+        protected_quantity: Decimal,
+        *,
+        pending_statuses: set[str],
+    ) -> list[dict]:
+        return [
+            {
+                "order_id": str(order.id),
+                "order_type": order.type,
+                "reason": "conditional_order_resize_required_after_entry_fill",
+                "current_quantity": str(order.quantity),
+                "required_quantity": str(protected_quantity),
+            }
+            for order in related_orders
+            if order.status not in pending_statuses
+            and (order.quantity or Decimal("0")) < protected_quantity
+        ]
 
     def _adopt_pending_conditional_order_before_submit(self, order) -> dict | None:
         if not order.client_order_id:

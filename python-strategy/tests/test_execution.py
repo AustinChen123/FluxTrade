@@ -2655,6 +2655,65 @@ class TestAuditedExecution:
         assert len(stop_loss_place_calls) == 1
         assert stop_loss in engine.list_recoverable_client_orders()
 
+    def test_mixed_pending_and_submitted_protection_reports_underprotected_order(
+        self, mock_db_session, mock_clock, mock_exchange_adapter, mock_order_repo, signal_factory
+    ):
+        engine = ExecutionEngine(
+            db_session=mock_db_session,
+            clock=mock_clock,
+            adapter=mock_exchange_adapter,
+            order_repository=mock_order_repo,
+            db_session_factory=lambda: nullcontext(mock_db_session),
+            audit_external_orders=True,
+            is_backtest=True,
+        )
+        order_id = engine.execute_signal(
+            signal_factory(
+                price=Decimal("42000"),
+                quantity=Decimal("0.02"),
+                stop_loss=Decimal("41000"),
+                take_profit=Decimal("43000"),
+            )
+        )
+        entry = mock_order_repo.orders[order_id]
+        entry.filled_quantity = Decimal("0.02")
+        entry.filled_price = entry.price
+        mock_order_repo.update_order(entry)
+        stop_loss = next(
+            order for order in mock_order_repo.orders.values() if order.type == "stop_loss"
+        )
+        take_profit = next(
+            order for order in mock_order_repo.orders.values() if order.type == "take_profit"
+        )
+        stop_loss.quantity = Decimal("0.01")
+        stop_loss.status = OrderStatus.SUBMITTED.value
+        stop_loss.exchange_order_id = "EX-stop-loss"
+        mock_order_repo.update_order(stop_loss)
+        take_profit.quantity = Decimal("0.01")
+        take_profit.status = OrderStatus.NEW.value
+        mock_order_repo.update_order(take_profit)
+
+        result = engine.process_exchange_order_event(
+            ExchangeOrderEvent(
+                status="open",
+                product_id=entry.product_id,
+                exchange_order_id=entry.exchange_order_id,
+                cumulative_filled_quantity=Decimal("0.02"),
+                cumulative_average_price=entry.price,
+            )
+        )
+
+        assert result["action"] == "unresolved_conditional_order_placement_failed"
+        assert {
+            failure["reason"] for failure in result["failures"]
+        } == {"conditional_order_resize_required_after_entry_fill"}
+        assert result["failures"][0]["order_id"] == stop_loss.id
+        assert result["failures"][0]["current_quantity"] == "0.01"
+        assert result["failures"][0]["required_quantity"] == "0.02"
+        assert stop_loss.status == OrderStatus.SUBMITTED.value
+        assert take_profit.status == OrderStatus.SUBMITTED.value
+        assert take_profit.quantity == Decimal("0.02")
+
     def test_startup_reconcile_places_pending_protection_for_filled_entry(
         self, mock_db_session, mock_clock, mock_exchange_adapter, mock_order_repo, signal_factory
     ):
