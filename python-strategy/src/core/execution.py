@@ -7,7 +7,7 @@ from typing import Callable, ContextManager, Optional
 from sqlalchemy.orm import Session
 from src.core.models import Signal, SignalType, Candlestick, OrderSide, OrderStatus, PositionSide
 from src.core.order_manager import OrderManager
-from src.core.interfaces.exchange import IExchangeAdapter, ExchangeError
+from src.core.interfaces.exchange import IExchangeAdapter, ExchangeError, NetworkError
 from src.core.interfaces.exchange import ExchangeOrderEvent
 from src.core.interfaces.exchange import ExchangeOrderLookupUnsupported
 from src.core.clock import Clock
@@ -652,6 +652,7 @@ class ExecutionEngine:
             "status": event.status,
             "state": event_state,
             "fill_quantity": fill_delta["quantity"],
+            "exchange_order_id": order.exchange_order_id,
         }
 
     def _resolve_order_event_order(self, event: ExchangeOrderEvent):
@@ -1062,11 +1063,13 @@ class ExecutionEngine:
             )
             write_signal_audit_intent(db, audit)
 
+        submit_attempted = False
         try:
             self._validate_order_group([order, *conditional_orders])
             self.order_manager.mark_submitted_unconfirmed(order)
             self.logger.info("Sending Order %s via Adapter...", order.id)
             t0 = _time.monotonic()
+            submit_attempted = True
             exchange_id = self.adapter.place_order(order)
             EXECUTION_LATENCY.observe(_time.monotonic() - t0)
             self.order_manager.mark_submitted(order, exchange_id)
@@ -1078,33 +1081,116 @@ class ExecutionEngine:
             ).inc()
         except ExchangeError as e:
             self.logger.error("Execution Failed: %s", e)
-            self.order_manager.fail_order(order, str(e))
-            for conditional_order in conditional_orders:
-                self.order_manager.fail_order(conditional_order, str(e))
-            reason = self._record_order_rejection(
-                order=order,
-                order_type=order_type,
-                error=e,
-                phase="audited_execution",
-                write_event=False,
+            adoption = self._adopt_order_after_ambiguous_submit_error(
+                order,
+                e,
+                submit_attempted=submit_attempted,
             )
-            with self._db_session_factory() as db:
-                self._write_order_rejection_event(
-                    db,
+            if adoption["action"] == "adopted":
+                exchange_id = str(adoption["exchange_order_id"])
+                order.exchange_order_id = exchange_id
+                ORDERS_TOTAL.labels(
+                    order_type=order_type,
+                    status="placed",
+                    reason="adopted_after_submit_error",
+                ).inc()
+            elif adoption.get("terminal"):
+                for conditional_order in conditional_orders:
+                    self.order_manager.fail_order(
+                        conditional_order,
+                        "entry_placement_terminal_after_submit_error",
+                    )
+                ORDERS_TOTAL.labels(
+                    order_type=order_type,
+                    status="failed",
+                    reason="terminal_after_submit_error",
+                ).inc()
+                with self._db_session_factory() as db:
+                    write_signal_audit_outcome(
+                        db,
+                        audit,
+                        order_id=order.id,
+                        risk_message=str(e),
+                        outcome_payload={
+                            "status": "terminal_after_submit_error",
+                            "error": str(e),
+                            "adoption": adoption,
+                        },
+                    )
+                raise
+            elif adoption["verification_blocked"] or adoption.get("unresolved"):
+                self._mark_conditional_orders_pending_after_uncertain_submit(
+                    entry_order=order,
+                    conditional_orders=conditional_orders,
+                    adoption=adoption,
+                )
+                reason = self._record_order_rejection(
                     order=order,
                     order_type=order_type,
-                    reason=reason,
                     error=e,
                     phase="audited_execution",
+                    write_event=False,
                 )
-                write_signal_audit_outcome(
-                    db,
-                    audit,
-                    order_id=order.id,
-                    risk_message=str(e),
-                    outcome_payload={"status": "failed", "error": str(e)},
+                with self._db_session_factory() as db:
+                    self._write_order_rejection_event(
+                        db,
+                        order=order,
+                        order_type=order_type,
+                        reason=reason,
+                        error=e,
+                        phase="audited_execution",
+                    )
+                    self._write_pending_protection_warning(
+                        db,
+                        entry_order=order,
+                        conditional_orders=conditional_orders,
+                        adoption=adoption,
+                        error=e,
+                    )
+                    write_signal_audit_outcome(
+                        db,
+                        audit,
+                        order_id=order.id,
+                        risk_message=str(e),
+                        outcome_payload={
+                            "status": (
+                                "unresolved"
+                                if adoption.get("unresolved")
+                                else "verification_blocked"
+                            ),
+                            "error": str(e),
+                            "adoption": adoption,
+                        },
+                    )
+                raise
+            else:
+                self.order_manager.fail_order(order, str(e))
+                for conditional_order in conditional_orders:
+                    self.order_manager.fail_order(conditional_order, str(e))
+                reason = self._record_order_rejection(
+                    order=order,
+                    order_type=order_type,
+                    error=e,
+                    phase="audited_execution",
+                    write_event=False,
                 )
-            raise
+                with self._db_session_factory() as db:
+                    self._write_order_rejection_event(
+                        db,
+                        order=order,
+                        order_type=order_type,
+                        reason=reason,
+                        error=e,
+                        phase="audited_execution",
+                    )
+                    write_signal_audit_outcome(
+                        db,
+                        audit,
+                        order_id=order.id,
+                        risk_message=str(e),
+                        outcome_payload={"status": "failed", "error": str(e)},
+                    )
+                raise
 
         with self._db_session_factory() as db:
             write_signal_audit_outcome(
@@ -1138,6 +1224,152 @@ class ExecutionEngine:
             self._place_conditional_orders(conditional_orders)
 
         return order.id
+
+    def _adopt_order_after_ambiguous_submit_error(
+        self,
+        order,
+        error: ExchangeError,
+        *,
+        submit_attempted: bool,
+    ) -> dict[str, object]:
+        if not submit_attempted:
+            return {
+                "action": "submit_not_attempted",
+                "verification_blocked": False,
+            }
+        if not self._is_ambiguous_submit_error(error):
+            return {
+                "action": "not_ambiguous",
+                "verification_blocked": False,
+            }
+        if not order.client_order_id:
+            return {
+                "action": "verification_blocked_missing_client_order_id",
+                "verification_blocked": True,
+            }
+        try:
+            snapshot = self.adapter.get_order_by_client_id(
+                order.client_order_id,
+                order.product_id,
+            )
+        except ExchangeOrderLookupUnsupported:
+            return {
+                "action": "verification_blocked_order_lookup_unsupported",
+                "verification_blocked": True,
+            }
+        except ExchangeError as lookup_error:
+            return {
+                "action": "verification_blocked_order_lookup_failed",
+                "reason": str(lookup_error),
+                "verification_blocked": True,
+            }
+
+        if snapshot is None:
+            return {
+                "action": "verification_blocked_order_snapshot_missing",
+                "verification_blocked": True,
+            }
+
+        event_result = self.process_exchange_order_event(
+            self._exchange_snapshot_to_order_event(order.product_id, snapshot)
+        )
+        if event_result["action"] != "applied":
+            return {
+                "action": event_result["action"],
+                "event_result": event_result,
+                "verification_blocked": self._resync_action_verification_blocked(
+                    str(event_result["action"])
+                ),
+                "unresolved": str(event_result["action"]).startswith("unresolved_"),
+            }
+        if event_result.get("state") in {
+            "cancelled",
+            "rejected",
+            "expired",
+            "failed",
+            "liquidated",
+        }:
+            return {
+                "action": "terminal_after_submit_error",
+                "event_result": event_result,
+                "exchange_order_id": event_result.get("exchange_order_id")
+                or snapshot.exchange_order_id,
+                "verification_blocked": False,
+                "terminal": True,
+            }
+        exchange_order_id = event_result.get("exchange_order_id") or snapshot.exchange_order_id
+        if exchange_order_id is None:
+            return {
+                "action": "verification_blocked_order_snapshot_missing_exchange_order_id",
+                "event_result": event_result,
+                "verification_blocked": True,
+            }
+        return {
+            "action": "adopted",
+            "event_result": event_result,
+            "exchange_order_id": exchange_order_id,
+            "verification_blocked": False,
+        }
+
+    @staticmethod
+    def _is_ambiguous_submit_error(error: ExchangeError) -> bool:
+        return isinstance(error, NetworkError)
+
+    def _write_pending_protection_warning(
+        self,
+        db: Session,
+        *,
+        entry_order,
+        conditional_orders: list,
+        adoption: dict[str, object],
+        error: ExchangeError,
+    ) -> None:
+        if not conditional_orders:
+            return
+        write_system_event(
+            db,
+            event_type="system_error",
+            event_subtype="protective_orders_pending_after_submit_uncertainty",
+            related_strategy_id=entry_order.strategy_id,
+            related_order_id=str(entry_order.id),
+            payload={
+                "entry_order_id": str(entry_order.id),
+                "client_order_id": entry_order.client_order_id,
+                "product_id": entry_order.product_id,
+                "conditional_order_ids": [
+                    str(conditional_order.id)
+                    for conditional_order in conditional_orders
+                ],
+                "conditional_order_statuses": {
+                    str(conditional_order.id): conditional_order.status
+                    for conditional_order in conditional_orders
+                },
+                "adoption_action": adoption["action"],
+                "error": str(error),
+                "operator_action": (
+                    "entry_submit_outcome_uncertain; verify exchange position "
+                    "and place or cancel pending protective orders manually"
+                ),
+            },
+        )
+
+    def _mark_conditional_orders_pending_after_uncertain_submit(
+        self,
+        *,
+        entry_order,
+        conditional_orders: list,
+        adoption: dict[str, object],
+    ) -> None:
+        for conditional_order in conditional_orders:
+            conditional_order.status = OrderStatus.NEW.value
+            conditional_order.exchange_order_id = None
+            conditional_order.intent_payload = {
+                "pending_entry_order_id": str(entry_order.id),
+                "pending_client_order_id": entry_order.client_order_id,
+                "pending_reason": "entry_submit_outcome_uncertain",
+                "adoption_action": str(adoption["action"]),
+            }
+            self.order_manager.repo.update_order(conditional_order)
 
     def _attach_min_notional_reference_price(
         self,
