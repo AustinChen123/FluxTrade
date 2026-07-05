@@ -128,13 +128,14 @@ class ExecutionEngine:
         if self._db_session_factory is None:
             raise RuntimeError("reconcile_recoverable_client_orders requires db_session_factory")
 
-        protection_recovery = self.place_pending_protection_for_filled_entries()
         orders = self.list_recoverable_client_orders()
         results = []
         result_counts: dict[str, int] = {}
         decision_counts: dict[str, int] = {}
 
         for order in orders:
+            if self._is_pending_protective_order(order):
+                continue
             local_status = order.status
             local_exchange_order_id = order.exchange_order_id
             try:
@@ -181,6 +182,7 @@ class ExecutionEngine:
                 }
             )
 
+        protection_recovery = self.place_pending_protection_for_filled_entries()
         reconciliation_unresolved_count = sum(
             1 for result in results if result["unresolved"]
         )
@@ -226,6 +228,14 @@ class ExecutionEngine:
                 raise
 
         return payload
+
+    @staticmethod
+    def _is_pending_protective_order(order) -> bool:
+        return (
+            order.status == OrderStatus.NEW.value
+            and isinstance(order.intent_payload, dict)
+            and bool(order.intent_payload.get("pending_entry_order_id"))
+        )
 
     def resync_recoverable_order_events(self) -> dict[str, object]:
         """Resync recoverable live orders through the order-event state machine.

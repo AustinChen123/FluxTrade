@@ -2826,6 +2826,60 @@ class TestAuditedExecution:
             order.status == OrderStatus.SUBMITTED.value for order in conditionals
         )
 
+    def test_startup_reconcile_places_pending_protection_after_entry_fill_repair(
+        self, mock_db_session, mock_clock, mock_exchange_adapter, mock_order_repo, signal_factory
+    ):
+        audit_session = mock_db_session
+        engine = ExecutionEngine(
+            db_session=mock_db_session,
+            clock=mock_clock,
+            adapter=mock_exchange_adapter,
+            order_repository=mock_order_repo,
+            db_session_factory=lambda: nullcontext(audit_session),
+            audit_external_orders=True,
+            is_backtest=True,
+        )
+        order_id = engine.execute_signal(
+            signal_factory(
+                price=Decimal("42000"),
+                stop_loss=Decimal("41000"),
+                take_profit=Decimal("43000"),
+            )
+        )
+        entry = mock_order_repo.orders[order_id]
+        conditionals = [
+            order
+            for order in mock_order_repo.orders.values()
+            if order.type in {"stop_loss", "take_profit"}
+        ]
+        assert entry.filled_quantity == Decimal("0")
+        assert all(order.status == OrderStatus.NEW.value for order in conditionals)
+
+        def lookup(client_order_id, product_id, *, order_type=None):
+            if client_order_id == entry.client_order_id:
+                return ExchangeOrderSnapshot(
+                    client_order_id=client_order_id,
+                    exchange_order_id="EX-entry",
+                    status="closed",
+                    filled_quantity=entry.quantity,
+                    average_price=entry.price,
+                )
+            return None
+
+        mock_exchange_adapter.get_order_by_client_id = MagicMock(side_effect=lookup)
+
+        payload = engine.reconcile_recoverable_client_orders()
+
+        assert payload["protection_recovery"]["entries_attempted"] == 1
+        assert payload["protection_recovery"]["failures"] == []
+        assert payload["decision_counts"] == {"exchange_closed": 1}
+        assert payload["protection_unresolved_count"] == 0
+        assert entry.filled_quantity == entry.quantity
+        assert all(
+            order.status == OrderStatus.SUBMITTED.value for order in conditionals
+        )
+        assert all(order.exchange_order_id is not None for order in conditionals)
+
     def test_startup_reconcile_counts_pending_protection_failures_as_unresolved(
         self, mock_db_session, mock_clock, mock_exchange_adapter, mock_order_repo, signal_factory
     ):
