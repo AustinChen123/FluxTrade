@@ -17,6 +17,8 @@ import pytest
 from decimal import Decimal
 from unittest.mock import MagicMock, patch
 
+from prometheus_client import REGISTRY
+
 from src.core.adapters.ccxt_adapter import CcxtExchangeAdapter
 from src.core.execution import ExecutionEngine
 from src.core.interfaces.exchange import ExchangeOrderSnapshot
@@ -4238,6 +4240,93 @@ class TestAuditedExecution:
     )
     def test_reconcile_decision_categories(self, local_status, exchange_status, expected):
         assert ExecutionEngine._reconcile_decision(local_status, exchange_status) == expected
+
+    def test_skipped_pending_protection_count_reported_in_resync_and_reconcile(
+        self, mock_db_session, mock_clock, mock_exchange_adapter, mock_order_repo, signal_factory
+    ):
+        """Fix 1: resync and reconcile payloads expose skipped_pending_protection_count."""
+        audit_session = mock_db_session
+        engine = ExecutionEngine(
+            db_session=mock_db_session,
+            clock=mock_clock,
+            adapter=mock_exchange_adapter,
+            order_repository=mock_order_repo,
+            db_session_factory=lambda: nullcontext(audit_session),
+            audit_external_orders=True,
+            is_backtest=True,
+        )
+        order_id = engine.execute_signal(
+            signal_factory(
+                price=Decimal("42000"),
+                stop_loss=Decimal("41000"),
+                take_profit=Decimal("43000"),
+            )
+        )
+        entry = mock_order_repo.orders[order_id]
+
+        def lookup(client_order_id, product_id, *, order_type=None):
+            assert client_order_id == entry.client_order_id, (
+                "resync/reconcile must not look up pending protective orders"
+            )
+            return ExchangeOrderSnapshot(
+                client_order_id=client_order_id,
+                exchange_order_id=entry.exchange_order_id,
+                status="open",
+                filled_quantity=Decimal("0"),
+                average_price=None,
+            )
+
+        mock_exchange_adapter.get_order_by_client_id = MagicMock(side_effect=lookup)
+
+        resync_summary = engine.resync_recoverable_order_events()
+        assert resync_summary["skipped_pending_protection_count"] == 2
+
+        reconcile_summary = engine.reconcile_recoverable_client_orders()
+        assert reconcile_summary["skipped_pending_protection_count"] == 2
+
+    def test_conditional_order_placement_increments_orders_total(
+        self, mock_db_session, mock_clock, mock_exchange_adapter, mock_order_repo, signal_factory
+    ):
+        """Fix 2: successful SL/TP placement increments ORDERS_TOTAL with status=placed reason=none."""
+        audit_session = mock_db_session
+        engine = ExecutionEngine(
+            db_session=mock_db_session,
+            clock=mock_clock,
+            adapter=mock_exchange_adapter,
+            order_repository=mock_order_repo,
+            db_session_factory=lambda: nullcontext(audit_session),
+            audit_external_orders=True,
+            is_backtest=True,
+        )
+
+        labels_sl = {"order_type": "stop_loss", "status": "placed", "reason": "none"}
+        labels_tp = {"order_type": "take_profit", "status": "placed", "reason": "none"}
+        before_sl = REGISTRY.get_sample_value("fluxtrade_orders_total", labels_sl) or 0.0
+        before_tp = REGISTRY.get_sample_value("fluxtrade_orders_total", labels_tp) or 0.0
+
+        order_id = engine.execute_signal(
+            signal_factory(
+                price=Decimal("42000"),
+                stop_loss=Decimal("41000"),
+                take_profit=Decimal("43000"),
+            )
+        )
+        entry = mock_order_repo.orders[order_id]
+        engine.process_exchange_order_event(
+            ExchangeOrderEvent(
+                status="filled",
+                product_id=entry.product_id,
+                exchange_order_id=entry.exchange_order_id,
+                cumulative_filled_quantity=entry.quantity,
+                cumulative_average_price=entry.price,
+            )
+        )
+
+        after_sl = REGISTRY.get_sample_value("fluxtrade_orders_total", labels_sl) or 0.0
+        after_tp = REGISTRY.get_sample_value("fluxtrade_orders_total", labels_tp) or 0.0
+
+        assert after_sl - before_sl == 1.0
+        assert after_tp - before_tp == 1.0
 
 
 class TestCancelOrder:

@@ -208,6 +208,7 @@ class ExecutionEngine:
             ),
             "results": results,
             "protection_recovery": protection_recovery,
+            "skipped_pending_protection_count": len(pending_protective_ids),
         }
         if payload["unresolved_count"] > 0:
             self.logger.error(
@@ -339,6 +340,7 @@ class ExecutionEngine:
             "verification_blocked_count": sum(
                 1 for result in results if result["verification_blocked"]
             ),
+            "skipped_pending_protection_count": len(pending_protective_ids),
             "results": results,
         }
 
@@ -1940,6 +1942,7 @@ class ExecutionEngine:
                 submit_attempted = True
                 ex_id = self.adapter.place_order(order)
                 self.order_manager.mark_submitted(order, ex_id)
+                ORDERS_TOTAL.labels(order_type=order.type, status="placed", reason="none").inc()
             except ExchangeError as e:
                 label = {
                     "stop_loss": "SL",
@@ -1973,6 +1976,7 @@ class ExecutionEngine:
             and adoption["action"] == "verification_blocked_missing_client_order_id"
         ):
             self.order_manager.mark_submitted_unconfirmed(order)
+            ORDERS_TOTAL.labels(order_type=order.type, status="failed", reason="verification_blocked_missing_client_order_id").inc()
             return [
                 {
                     "order_id": str(order.id),
@@ -1986,8 +1990,10 @@ class ExecutionEngine:
                 }
             ]
         if adoption["action"] == "adopted":
+            ORDERS_TOTAL.labels(order_type=order.type, status="placed", reason="adopted_after_submit_error").inc()
             return []
         if adoption.get("terminal"):
+            ORDERS_TOTAL.labels(order_type=order.type, status="failed", reason="terminal_after_submit_error").inc()
             return [
                 {
                     "order_id": str(order.id),
@@ -1997,6 +2003,7 @@ class ExecutionEngine:
                 }
             ]
         if adoption.get("verification_blocked") or adoption.get("unresolved"):
+            ORDERS_TOTAL.labels(order_type=order.type, status="failed", reason=str(adoption["action"])).inc()
             return [
                 {
                     "order_id": str(order.id),
@@ -2006,6 +2013,7 @@ class ExecutionEngine:
                 }
             ]
         self.order_manager.fail_order(order, str(error))
+        ORDERS_TOTAL.labels(order_type=order.type, status="failed", reason=self._order_rejection_reason(error)).inc()
         return [
             {
                 "order_id": str(order.id),
