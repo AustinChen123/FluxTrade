@@ -4513,6 +4513,126 @@ class TestAuditedExecution:
             for r in payload["results"]
         )
 
+    def test_uncertain_submit_preserves_submitted_leg_and_marks_pending_new_leg(
+        self, mock_db_session, mock_clock, mock_exchange_adapter, mock_order_repo, signal_factory
+    ):
+        """Partial success: SL placed (SUBMITTED), TP lookup failed (stays NEW).
+
+        The helper must skip the SUBMITTED SL and only merge payload into the
+        still-NEW TP.  With the old code the SL would be destructively reset to
+        NEW and its exchange_order_id would be nulled — an orphan on the exchange.
+        """
+        def place_order_side_effect(order):
+            if order.type == "limit":
+                raise NetworkError("Connection timeout")
+            if order.type == "stop_loss":
+                # mark_submitted(order, ex_id) called by engine after this return
+                return "MOCK-SL-1"
+            # take_profit branch: never reached in this scenario (TP excluded
+            # from placement_candidates because lookup raises below)
+            raise ExchangeError("tp placement failed")
+
+        mock_exchange_adapter.place_order = MagicMock(side_effect=place_order_side_effect)
+
+        def lookup(client_order_id, product_id, *, order_type=None):
+            if order_type == "limit":
+                # Entry was filled on the exchange
+                return ExchangeOrderSnapshot(
+                    client_order_id=client_order_id,
+                    exchange_order_id="EX-ENTRY-FILLED",
+                    status="filled",
+                    filled_quantity=Decimal("0.01"),
+                    average_price=Decimal("42000"),
+                )
+            if order_type == "take_profit":
+                # Pre-submit adoption lookup for TP fails → TP stays NEW,
+                # excluded from placement_candidates; failures list non-empty
+                # → event returns unresolved → helper is called
+                raise ExchangeError("boom")
+            # stop_loss pre-submit lookup: no existing exchange order
+            return None
+
+        mock_exchange_adapter.get_order_by_client_id = MagicMock(side_effect=lookup)
+        audit_session = mock_db_session
+        engine = ExecutionEngine(
+            db_session=mock_db_session,
+            clock=mock_clock,
+            adapter=mock_exchange_adapter,
+            order_repository=mock_order_repo,
+            db_session_factory=lambda: nullcontext(audit_session),
+            audit_external_orders=True,
+            is_backtest=True,  # fill recording uses repo.update_position, not Redis
+        )
+
+        with pytest.raises(NetworkError, match="Connection timeout"):
+            engine.execute_signal(
+                signal_factory(
+                    price=Decimal("42000"),
+                    stop_loss=Decimal("41000"),
+                    take_profit=Decimal("43000"),
+                )
+            )
+
+        orders = list(mock_order_repo.orders.values())
+        sl_order = next(o for o in orders if o.type == "stop_loss")
+        tp_order = next(o for o in orders if o.type == "take_profit")
+
+        # SL was placed on the exchange; the helper must leave it untouched
+        assert sl_order.status == OrderStatus.SUBMITTED.value
+        assert sl_order.exchange_order_id == "MOCK-SL-1"
+        assert sl_order.intent_payload.get("linked_order_id") == str(tp_order.id)
+
+        # TP was never submitted (pre-submit lookup failed); the helper merges
+        # pending_reason into the existing payload without destroying linked_order_id
+        assert tp_order.status == OrderStatus.NEW.value
+        assert tp_order.exchange_order_id is None
+        assert tp_order.intent_payload.get("linked_order_id") == str(sl_order.id)
+        assert tp_order.intent_payload.get("pending_reason") == "entry_submit_outcome_uncertain"
+
+    def test_uncertain_submit_merges_pending_payload_without_replacing_it(
+        self, mock_db_session, mock_clock, mock_exchange_adapter, mock_order_repo, signal_factory
+    ):
+        """No-placement case: lookup returns None → verification_blocked.
+
+        Both conditionals remain NEW.  The helper must MERGE the pending keys
+        into the existing payload so that linked_order_id and placement_mode
+        survive alongside the new pending_reason.
+        """
+        mock_exchange_adapter.place_order = MagicMock(
+            side_effect=NetworkError("Connection timeout")
+        )
+        mock_exchange_adapter.get_order_by_client_id = MagicMock(return_value=None)
+        audit_session = mock_db_session
+        engine = ExecutionEngine(
+            db_session=mock_db_session,
+            clock=mock_clock,
+            adapter=mock_exchange_adapter,
+            order_repository=mock_order_repo,
+            db_session_factory=lambda: nullcontext(audit_session),
+            audit_external_orders=True,
+        )
+
+        with pytest.raises(NetworkError, match="Connection timeout"):
+            engine.execute_signal(
+                signal_factory(
+                    price=Decimal("42000"),
+                    stop_loss=Decimal("41000"),
+                    take_profit=Decimal("43000"),
+                )
+            )
+
+        orders = list(mock_order_repo.orders.values())
+        conditional_orders = [o for o in orders if o.type != "limit"]
+        assert len(conditional_orders) == 2
+
+        for order in conditional_orders:
+            assert order.status == OrderStatus.NEW.value
+            assert order.exchange_order_id is None
+            # linked_order_id must survive (merge, not replace)
+            assert order.intent_payload.get("linked_order_id") is not None
+            # pending_reason must be added alongside the original keys
+            assert order.intent_payload.get("pending_reason") == "entry_submit_outcome_uncertain"
+
 
 class TestCancelOrder:
     """Tests for execution-level cancellation."""

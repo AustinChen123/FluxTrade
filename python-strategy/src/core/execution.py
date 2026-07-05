@@ -1545,15 +1545,25 @@ class ExecutionEngine:
         conditional_orders: list,
         adoption: dict[str, object],
     ) -> None:
+        """Keep pending legs recoverable after an uncertain entry submit.
+
+        Adoption may already have placed some legs; anything not NEW has live
+        or terminal exchange state and must keep its status, exchange id, and
+        payload untouched.
+        """
         for conditional_order in conditional_orders:
-            conditional_order.status = OrderStatus.NEW.value
-            conditional_order.exchange_order_id = None
-            conditional_order.intent_payload = {
-                "pending_entry_order_id": str(entry_order.id),
-                "pending_client_order_id": entry_order.client_order_id,
-                "pending_reason": "entry_submit_outcome_uncertain",
-                "adoption_action": str(adoption["action"]),
-            }
+            if conditional_order.status != OrderStatus.NEW.value:
+                continue
+            payload = dict(conditional_order.intent_payload or {})
+            payload.update(
+                {
+                    "pending_entry_order_id": str(entry_order.id),
+                    "pending_client_order_id": entry_order.client_order_id,
+                    "pending_reason": "entry_submit_outcome_uncertain",
+                    "adoption_action": str(adoption["action"]),
+                }
+            )
+            conditional_order.intent_payload = payload
             self.order_manager.repo.update_order(conditional_order)
 
     def _attach_min_notional_reference_price(
