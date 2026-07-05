@@ -117,7 +117,10 @@ class ExecutionEngine:
         """Compare recoverable local client orders with exchange snapshots.
 
         This repairs local order state when the exchange lookup gives enough
-        information. It never places replacement orders during startup.
+        information. It never places replacement orders during startup, with
+        one deliberate exception: NEW pending protective orders whose entry
+        already has fills are first placements (not replacements) and leaving
+        them unplaced keeps a live position naked across restarts.
         """
         if self._db_session_factory is None:
             raise RuntimeError("reconcile_recoverable_client_orders requires db_session_factory")
@@ -174,6 +177,8 @@ class ExecutionEngine:
                 }
             )
 
+        protection_recovery = self.place_pending_protection_for_filled_entries()
+
         payload = {
             "recoverable_count": len(orders),
             "result_counts": result_counts,
@@ -183,6 +188,7 @@ class ExecutionEngine:
                 1 for result in results if result["verification_blocked"]
             ),
             "results": results,
+            "protection_recovery": protection_recovery,
         }
         if payload["unresolved_count"] > 0:
             self.logger.error(
@@ -648,7 +654,11 @@ class ExecutionEngine:
         else:
             self._apply_exchange_order_event_status(order, event_state, event)
 
-        if fill_delta["quantity"] > 0:
+        # Post-fill actions key off persisted state, not the event delta:
+        # a replayed event (crash recovery, resync, duplicate stream message)
+        # carries the same cumulative quantity (delta == 0) and must still
+        # retry pending protection placement and sibling cancellation.
+        if (order.filled_quantity or Decimal("0")) > 0:
             placement_failures = self._place_pending_conditional_orders_for_entry(order)
             if placement_failures:
                 self._try_write_conditional_order_event_warning(
@@ -1587,6 +1597,52 @@ class ExecutionEngine:
             order.quantity = protected_quantity
             self.order_manager.repo.update_order(order)
         return self._place_conditional_orders(pending)
+
+    def place_pending_protection_for_filled_entries(self) -> dict[str, object]:
+        """Retry NEW pending protective orders whose entry already has fills.
+
+        Crash/replay safety net: entry fills are persisted before protective
+        placement, so a crash between the two steps leaves NEW conditional
+        orders behind while no further fill delta will ever re-trigger
+        placement (a fully filled entry drops out of the recoverable scan).
+        Placing protection is the fail-safe direction for a naked position.
+        """
+        pending = [
+            order
+            for order in self.order_manager.repo.list_orders_by_statuses(
+                {OrderStatus.NEW.value}
+            )
+            if isinstance(order.intent_payload, dict)
+            and order.intent_payload.get("pending_entry_order_id")
+        ]
+        entry_ids = {
+            str(order.intent_payload["pending_entry_order_id"]) for order in pending
+        }
+        attempted = 0
+        failures: list[dict] = []
+        for entry_id in sorted(entry_ids):
+            entry = self.order_manager.repo.get_order(entry_id)
+            if entry is None or (entry.filled_quantity or Decimal("0")) <= 0:
+                continue
+            attempted += 1
+            entry_failures = self._place_pending_conditional_orders_for_entry(entry)
+            if entry_failures:
+                failures.extend(entry_failures)
+                self._try_write_conditional_order_event_warning(
+                    event_subtype="conditional_order_placement_failed_after_entry_fill",
+                    order=entry,
+                    failures=entry_failures,
+                )
+        if failures:
+            self.logger.error(
+                "Pending protection recovery has %s placement failure(s)",
+                len(failures),
+            )
+        return {
+            "pending_count": len(pending),
+            "entries_attempted": attempted,
+            "failures": failures,
+        }
 
     @staticmethod
     def _protective_partial_fill_requires_resize(order, event_state: str) -> dict | None:
