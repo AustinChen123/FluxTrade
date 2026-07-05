@@ -2053,6 +2053,58 @@ class TestAuditedExecution:
         }
         assert all(order.exchange_order_id for order in conditional_orders)
 
+    def test_entry_fill_reports_unresolved_when_protective_order_placement_fails(
+        self, mock_db_session, mock_clock, mock_exchange_adapter, mock_order_repo, signal_factory
+    ):
+        audit_session = mock_db_session
+        engine = ExecutionEngine(
+            db_session=mock_db_session,
+            clock=mock_clock,
+            adapter=mock_exchange_adapter,
+            order_repository=mock_order_repo,
+            db_session_factory=lambda: nullcontext(audit_session),
+            audit_external_orders=True,
+            is_backtest=True,
+        )
+        order_id = engine.execute_signal(
+            signal_factory(
+                price=Decimal("42000"),
+                stop_loss=Decimal("41000"),
+                take_profit=Decimal("43000"),
+            )
+        )
+        entry = mock_order_repo.orders[order_id]
+        mock_exchange_adapter.set_fail_on_order_types({"stop_loss"})
+
+        result = engine.process_exchange_order_event(
+            ExchangeOrderEvent(
+                status="filled",
+                product_id=entry.product_id,
+                exchange_order_id=entry.exchange_order_id,
+                cumulative_filled_quantity=entry.quantity,
+                cumulative_average_price=entry.price,
+            )
+        )
+
+        stop_loss = next(
+            order for order in mock_order_repo.orders.values() if order.type == "stop_loss"
+        )
+        take_profit = next(
+            order for order in mock_order_repo.orders.values() if order.type == "take_profit"
+        )
+        assert result["action"] == "unresolved_conditional_order_placement_failed"
+        assert result["failures"][0]["order_id"] == stop_loss.id
+        assert stop_loss.status == OrderStatus.NEW.value
+        assert take_profit.status == OrderStatus.SUBMITTED.value
+        event = next(
+            call.args[0]
+            for call in audit_session.add.call_args_list
+            if isinstance(call.args[0], SystemEvent)
+            and call.args[0].event_subtype
+            == "conditional_order_placement_failed_after_entry_fill"
+        )
+        assert event.related_order_id == entry.id
+
     def test_filled_protective_order_cancels_linked_sibling(
         self, mock_db_session, mock_clock, mock_exchange_adapter, mock_order_repo, signal_factory
     ):
@@ -2103,6 +2155,65 @@ class TestAuditedExecution:
         assert stop_loss.status == OrderStatus.FILLED.value
         assert take_profit.status == OrderStatus.CANCELLED.value
         assert take_profit not in mock_exchange_adapter.open_orders
+
+    def test_filled_protective_order_reports_unresolved_when_sibling_cancel_fails(
+        self, mock_db_session, mock_clock, mock_exchange_adapter, mock_order_repo, signal_factory
+    ):
+        audit_session = mock_db_session
+        engine = ExecutionEngine(
+            db_session=mock_db_session,
+            clock=mock_clock,
+            adapter=mock_exchange_adapter,
+            order_repository=mock_order_repo,
+            db_session_factory=lambda: nullcontext(audit_session),
+            audit_external_orders=True,
+            is_backtest=True,
+        )
+        order_id = engine.execute_signal(
+            signal_factory(
+                price=Decimal("42000"),
+                stop_loss=Decimal("41000"),
+                take_profit=Decimal("43000"),
+            )
+        )
+        entry = mock_order_repo.orders[order_id]
+        engine.process_exchange_order_event(
+            ExchangeOrderEvent(
+                status="filled",
+                product_id=entry.product_id,
+                exchange_order_id=entry.exchange_order_id,
+                cumulative_filled_quantity=entry.quantity,
+                cumulative_average_price=entry.price,
+            )
+        )
+        stop_loss = next(
+            order for order in mock_order_repo.orders.values() if order.type == "stop_loss"
+        )
+        take_profit = next(
+            order for order in mock_order_repo.orders.values() if order.type == "take_profit"
+        )
+        mock_exchange_adapter.cancel_order = MagicMock(return_value=False)
+
+        result = engine.process_exchange_order_event(
+            ExchangeOrderEvent(
+                status="filled",
+                product_id=stop_loss.product_id,
+                exchange_order_id=stop_loss.exchange_order_id,
+                cumulative_filled_quantity=stop_loss.quantity,
+                cumulative_average_price=stop_loss.trigger_price,
+            )
+        )
+
+        assert result["action"] == "unresolved_linked_conditional_cancel_failed"
+        assert result["failure"]["order_id"] == take_profit.id
+        assert take_profit.status == OrderStatus.SUBMITTED.value
+        event = next(
+            call.args[0]
+            for call in audit_session.add.call_args_list
+            if isinstance(call.args[0], SystemEvent)
+            and call.args[0].event_subtype == "linked_conditional_order_cancel_failed"
+        )
+        assert event.related_order_id == stop_loss.id
 
     def test_intent_audit_failure_stops_before_external_order(
         self, mock_db_session, mock_clock, mock_exchange_adapter, mock_order_repo, signal_factory

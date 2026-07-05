@@ -179,6 +179,23 @@ class TestPlaceOrder:
 
         mock_ccxt_client.create_order.assert_not_called()
 
+    def test_validate_order_rejects_unsupported_protective_mapping_before_submit(
+        self, adapter, mock_ccxt_client
+    ):
+        adapter.exchange_id = "bybit"
+        order = _make_order(
+            product_id="BYBIT:BTCUSDT-PERP",
+            side="sell",
+            type="take_profit",
+            quantity=Decimal("0.01"),
+            trigger_price=Decimal("43000"),
+        )
+
+        with pytest.raises(ExchangeError, match="conditional_order_mapping_unsupported"):
+            adapter.validate_order(order)
+
+        mock_ccxt_client.create_order.assert_not_called()
+
     def test_fetches_instrument_spec_from_binance_filters(self, adapter, mock_ccxt_client):
         mock_ccxt_client.load_markets.return_value = {
             "BTC/USDT:USDT": {

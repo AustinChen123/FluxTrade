@@ -647,8 +647,38 @@ class ExecutionEngine:
             self._apply_exchange_order_event_status(order, event_state, event)
 
         if event_state == "filled":
-            self._place_pending_conditional_orders_for_entry(order)
-            self._cancel_linked_conditional_order_for_protection_fill(order)
+            placement_failures = self._place_pending_conditional_orders_for_entry(order)
+            if placement_failures:
+                self._try_write_conditional_order_event_warning(
+                    event_subtype="conditional_order_placement_failed_after_entry_fill",
+                    order=order,
+                    failures=placement_failures,
+                )
+                return {
+                    "action": "unresolved_conditional_order_placement_failed",
+                    "order_id": order.id,
+                    "status": event.status,
+                    "state": event_state,
+                    "fill_quantity": fill_delta["quantity"],
+                    "exchange_order_id": order.exchange_order_id,
+                    "failures": placement_failures,
+                }
+            cancel_failure = self._cancel_linked_conditional_order_for_protection_fill(order)
+            if cancel_failure is not None:
+                self._try_write_conditional_order_event_warning(
+                    event_subtype="linked_conditional_order_cancel_failed",
+                    order=order,
+                    failures=[cancel_failure],
+                )
+                return {
+                    "action": "unresolved_linked_conditional_cancel_failed",
+                    "order_id": order.id,
+                    "status": event.status,
+                    "state": event_state,
+                    "fill_quantity": fill_delta["quantity"],
+                    "exchange_order_id": order.exchange_order_id,
+                    "failure": cancel_failure,
+                }
 
         return {
             "action": "applied",
@@ -1488,9 +1518,9 @@ class ExecutionEngine:
 
         return conditional_orders
 
-    def _place_pending_conditional_orders_for_entry(self, entry_order) -> None:
+    def _place_pending_conditional_orders_for_entry(self, entry_order) -> list[dict]:
         if entry_order.type not in {"market", "limit"}:
-            return
+            return []
         pending = [
             order
             for order in self.order_manager.repo.list_orders_by_statuses(
@@ -1499,28 +1529,36 @@ class ExecutionEngine:
             if isinstance(order.intent_payload, dict)
             and order.intent_payload.get("pending_entry_order_id") == str(entry_order.id)
         ]
-        if pending:
-            self._place_conditional_orders(pending)
+        if not pending:
+            return []
+        return self._place_conditional_orders(pending)
 
-    def _cancel_linked_conditional_order_for_protection_fill(self, order) -> None:
+    def _cancel_linked_conditional_order_for_protection_fill(self, order) -> dict | None:
         if order.type not in {"stop_loss", "take_profit", "trailing_stop"}:
-            return
+            return None
         if not isinstance(order.intent_payload, dict):
-            return
+            return None
         linked_order_id = order.intent_payload.get("linked_order_id")
         if not linked_order_id:
-            return
+            return None
         linked_order = self.order_manager.repo.get_order(str(linked_order_id))
         if linked_order is None:
-            return
+            return None
         if linked_order.status in {
             OrderStatus.CANCELLED.value,
             OrderStatus.FILLED.value,
             OrderStatus.FAILED.value,
             OrderStatus.LIQUIDATED.value,
         }:
-            return
-        self.cancel_order(str(linked_order.id))
+            return None
+        if self.cancel_order(str(linked_order.id)):
+            return None
+        return {
+            "order_id": str(linked_order.id),
+            "order_type": linked_order.type,
+            "exchange_order_id": linked_order.exchange_order_id,
+            "reason": "cancel_order_returned_false",
+        }
 
     def _validate_order_group(self, orders: list) -> None:
         validate_order = getattr(self.adapter, "validate_order", None)
@@ -1616,8 +1654,9 @@ class ExecutionEngine:
             },
         )
 
-    def _place_conditional_orders(self, conditional_orders: list):
+    def _place_conditional_orders(self, conditional_orders: list) -> list[dict]:
         """Submit prevalidated SL/TP/Trailing orders linked via OCO to each other."""
+        failures = []
         for order in conditional_orders:
             try:
                 ex_id = self.adapter.place_order(order)
@@ -1629,6 +1668,41 @@ class ExecutionEngine:
                     "trailing_stop": "trailing stop",
                 }.get(order.type, order.type)
                 self.logger.error("Failed to place %s order: %s", label, e)
+                failures.append(
+                    {
+                        "order_id": str(order.id),
+                        "order_type": order.type,
+                        "reason": str(e),
+                    }
+                )
+        return failures
+
+    def _try_write_conditional_order_event_warning(
+        self,
+        *,
+        event_subtype: str,
+        order,
+        failures: list[dict],
+    ) -> None:
+        if self._db_session_factory is None:
+            return
+        try:
+            with self._db_session_factory() as db:
+                write_system_event(
+                    db,
+                    event_type="system_error",
+                    event_subtype=event_subtype,
+                    related_strategy_id=order.strategy_id,
+                    related_order_id=str(order.id),
+                    payload={
+                        "order_id": str(order.id),
+                        "product_id": order.product_id,
+                        "failures": failures,
+                    },
+                )
+                db.commit()
+        except Exception:
+            self.logger.exception("Failed to write conditional order warning event")
 
     def _journal_fill(self, order, price, qty, fee, fill_type: str, candle: Optional[Candlestick] = None) -> None:
         """Record a fill event to the journal."""

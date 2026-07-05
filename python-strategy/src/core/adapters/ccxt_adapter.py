@@ -224,6 +224,7 @@ class CcxtExchangeAdapter(IExchangeAdapter):
     def validate_order(self, order: Order) -> None:
         """Validate and quantize an outbound order without placing it."""
         self._quantize_order(order)
+        self._ccxt_order_type_and_params(order)
 
     def get_instrument_spec(self, product_id: str) -> InstrumentSpec:
         spec = self._instrument_specs.get(product_id)
