@@ -139,6 +139,13 @@ class MockOrderRepository(IOrderRepository):
             if order.client_order_id is not None and order.status in statuses
         ]
 
+    def list_orders_by_statuses(self, statuses: set[str]) -> list[Order]:
+        return [
+            order
+            for order in self.orders.values()
+            if order.status in statuses
+        ]
+
     def add_trade(self, trade: ORMTrade) -> None:
         self.trades.append(trade)
 

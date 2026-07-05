@@ -157,13 +157,18 @@ class CcxtExchangeAdapter(IExchangeAdapter):
     def place_order(self, order: Order) -> str:
         ccxt_symbol = to_ccxt_symbol(order.product_id)
         self._quantize_order(order)
-        params: dict = {}
-        if order.type and order.type.lower() == "limit":
+        order_type, params = self._ccxt_order_type_and_params(order)
+        if order_type == "limit":
             params["timeInForce"] = "GTC"
         client_order_id = getattr(order, "client_order_id", None)
         if client_order_id:
             exchange_client_order_id = to_exchange_format(client_order_id, self.exchange_id)
-            if self.exchange_id == "binance":
+            if self.exchange_id == "binance" and order_type in {
+                "STOP_MARKET",
+                "TAKE_PROFIT_MARKET",
+            }:
+                params["clientAlgoId"] = exchange_client_order_id
+            elif self.exchange_id == "binance":
                 params["newClientOrderId"] = exchange_client_order_id
             else:
                 params["clientOrderId"] = exchange_client_order_id
@@ -179,7 +184,7 @@ class CcxtExchangeAdapter(IExchangeAdapter):
             )
             response = self.client.create_order(
                 symbol=ccxt_symbol,
-                type=order.type,
+                type=order_type,
                 side=order.side,
                 amount=str(order.quantity),
                 price=str(order.price) if order.price else None,
@@ -193,6 +198,28 @@ class CcxtExchangeAdapter(IExchangeAdapter):
             raise NetworkError(f"Network error: {e}") from e
         except ccxt.BaseError as e:
             raise ExchangeError(f"Order placement failed: {e}") from e
+
+    def _ccxt_order_type_and_params(self, order: Order) -> tuple[str, dict]:
+        order_type = (order.type or "").lower()
+        if order_type in {"stop_loss", "take_profit"} and self.exchange_id != "binance":
+            raise ExchangeError(
+                f"conditional_order_mapping_unsupported: exchange={self.exchange_id}"
+            )
+        if order_type == "stop_loss":
+            if order.trigger_price is None:
+                raise ExchangeError("stop_loss_requires_trigger_price")
+            return "STOP_MARKET", {
+                "stopLossPrice": str(order.trigger_price),
+                "reduceOnly": True,
+            }
+        if order_type == "take_profit":
+            if order.trigger_price is None:
+                raise ExchangeError("take_profit_requires_trigger_price")
+            return "TAKE_PROFIT_MARKET", {
+                "takeProfitPrice": str(order.trigger_price),
+                "reduceOnly": True,
+            }
+        return order_type, {}
 
     def validate_order(self, order: Order) -> None:
         """Validate and quantize an outbound order without placing it."""

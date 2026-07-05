@@ -126,6 +126,59 @@ class TestPlaceOrder:
         assert call_kwargs.kwargs["params"]["timeInForce"] == "GTC"
         assert call_kwargs.kwargs["price"] == "50000"
 
+    @pytest.mark.parametrize(
+        ("order_type", "trigger_param", "ccxt_type"),
+        [
+            ("stop_loss", "stopLossPrice", "STOP_MARKET"),
+            ("take_profit", "takeProfitPrice", "TAKE_PROFIT_MARKET"),
+        ],
+    )
+    def test_binance_protective_orders_use_futures_conditional_mapping(
+        self,
+        adapter,
+        mock_ccxt_client,
+        order_type,
+        trigger_param,
+        ccxt_type,
+    ):
+        mock_ccxt_client.create_order.return_value = {"id": "EX-COND"}
+        order = _make_order(
+            side="sell",
+            type=order_type,
+            quantity=Decimal("0.01"),
+            trigger_price=Decimal("41000"),
+            client_order_id=CANONICAL_CLIENT_ORDER_ID,
+        )
+
+        adapter.place_order(order)
+
+        call_kwargs = mock_ccxt_client.create_order.call_args
+        assert call_kwargs.kwargs["type"] == ccxt_type
+        assert call_kwargs.kwargs["price"] is None
+        assert call_kwargs.kwargs["params"][trigger_param] == "41000"
+        assert call_kwargs.kwargs["params"]["reduceOnly"] is True
+        assert call_kwargs.kwargs["params"]["clientAlgoId"] == to_exchange_format(
+            CANONICAL_CLIENT_ORDER_ID,
+            "binance",
+        )
+
+    def test_non_binance_protective_order_mapping_fails_closed(
+        self, adapter, mock_ccxt_client
+    ):
+        adapter.exchange_id = "bybit"
+        order = _make_order(
+            product_id="BYBIT:BTCUSDT-PERP",
+            side="sell",
+            type="stop_loss",
+            quantity=Decimal("0.01"),
+            trigger_price=Decimal("41000"),
+        )
+
+        with pytest.raises(ExchangeError, match="conditional_order_mapping_unsupported"):
+            adapter.place_order(order)
+
+        mock_ccxt_client.create_order.assert_not_called()
+
     def test_fetches_instrument_spec_from_binance_filters(self, adapter, mock_ccxt_client):
         mock_ccxt_client.load_markets.return_value = {
             "BTC/USDT:USDT": {

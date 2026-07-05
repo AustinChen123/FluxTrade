@@ -646,6 +646,10 @@ class ExecutionEngine:
         else:
             self._apply_exchange_order_event_status(order, event_state, event)
 
+        if event_state == "filled":
+            self._place_pending_conditional_orders_for_entry(order)
+            self._cancel_linked_conditional_order_for_protection_fill(order)
+
         return {
             "action": "applied",
             "order_id": order.id,
@@ -1220,9 +1224,6 @@ class ExecutionEngine:
                 trade_id=str(order.id),
             )
 
-        if conditional_orders:
-            self._place_conditional_orders(conditional_orders)
-
         return order.id
 
     def _adopt_order_after_ambiguous_submit_error(
@@ -1474,7 +1475,52 @@ class ExecutionEngine:
             self._attach_min_notional_reference_price(ts_order, candle)
             conditional_orders.append(ts_order)
 
+        for conditional_order in conditional_orders:
+            linked_order_id = getattr(conditional_order, "_linked_order_id", None)
+            conditional_order.status = OrderStatus.NEW.value
+            conditional_order.exchange_order_id = None
+            conditional_order.intent_payload = {
+                "pending_entry_order_id": str(entry_order.id),
+                "linked_order_id": str(linked_order_id) if linked_order_id else None,
+                "placement_mode": "place-after-fill",
+            }
+            self.order_manager.repo.update_order(conditional_order)
+
         return conditional_orders
+
+    def _place_pending_conditional_orders_for_entry(self, entry_order) -> None:
+        if entry_order.type not in {"market", "limit"}:
+            return
+        pending = [
+            order
+            for order in self.order_manager.repo.list_orders_by_statuses(
+                {OrderStatus.NEW.value}
+            )
+            if isinstance(order.intent_payload, dict)
+            and order.intent_payload.get("pending_entry_order_id") == str(entry_order.id)
+        ]
+        if pending:
+            self._place_conditional_orders(pending)
+
+    def _cancel_linked_conditional_order_for_protection_fill(self, order) -> None:
+        if order.type not in {"stop_loss", "take_profit", "trailing_stop"}:
+            return
+        if not isinstance(order.intent_payload, dict):
+            return
+        linked_order_id = order.intent_payload.get("linked_order_id")
+        if not linked_order_id:
+            return
+        linked_order = self.order_manager.repo.get_order(str(linked_order_id))
+        if linked_order is None:
+            return
+        if linked_order.status in {
+            OrderStatus.CANCELLED.value,
+            OrderStatus.FILLED.value,
+            OrderStatus.FAILED.value,
+            OrderStatus.LIQUIDATED.value,
+        }:
+            return
+        self.cancel_order(str(linked_order.id))
 
     def _validate_order_group(self, orders: list) -> None:
         validate_order = getattr(self.adapter, "validate_order", None)
@@ -1575,7 +1621,7 @@ class ExecutionEngine:
         for order in conditional_orders:
             try:
                 ex_id = self.adapter.place_order(order)
-                self.order_manager.update_exchange_order_id(order, ex_id)
+                self.order_manager.mark_submitted(order, ex_id)
             except ExchangeError as e:
                 label = {
                     "stop_loss": "SL",
