@@ -133,8 +133,14 @@ class ExecutionEngine:
         result_counts: dict[str, int] = {}
         decision_counts: dict[str, int] = {}
 
+        # Decide skips on the scan snapshot up front: repairing an entry can
+        # fail its pending conditionals mid-loop, and a status-based check on
+        # the mutated order would stop skipping them.
+        pending_protective_ids = {
+            order.id for order in orders if self._is_pending_protective_order(order)
+        }
         for order in orders:
-            if self._is_pending_protective_order(order):
+            if order.id in pending_protective_ids:
                 continue
             local_status = order.status
             local_exchange_order_id = order.exchange_order_id
@@ -229,6 +235,29 @@ class ExecutionEngine:
 
         return payload
 
+    def _fail_pending_conditional_orders_for_terminal_entry(self, entry_order) -> None:
+        """Clear pending protection for an entry that terminated with zero fills.
+
+        No fill means no position, so the NEW conditional orders will never be
+        placed; leaving them pollutes the recoverable scan and resync forever.
+        Callers must only invoke this for CANCELLED/FAILED terminals — a FILLED
+        entry with missing fill details still has a live position and must keep
+        its pending protection.
+        """
+        if entry_order.type not in {"market", "limit"}:
+            return
+        if (entry_order.filled_quantity or Decimal("0")) > 0:
+            return
+        for order in self.order_manager.repo.list_orders_by_statuses(
+            {OrderStatus.NEW.value}
+        ):
+            if (
+                isinstance(order.intent_payload, dict)
+                and order.intent_payload.get("pending_entry_order_id")
+                == str(entry_order.id)
+            ):
+                self.order_manager.fail_order(order, "entry_terminal_without_fill")
+
     @staticmethod
     def _is_pending_protective_order(order) -> bool:
         return (
@@ -247,7 +276,12 @@ class ExecutionEngine:
         """
         orders = self.list_recoverable_client_orders()
         results: list[dict[str, object]] = []
+        pending_protective_ids = {
+            order.id for order in orders if self._is_pending_protective_order(order)
+        }
         for order in orders:
+            if order.id in pending_protective_ids:
+                continue
             try:
                 snapshot = self.adapter.get_order_by_client_id(
                     order.client_order_id,
@@ -331,6 +365,7 @@ class ExecutionEngine:
     def _repair_reconciled_order(self, order, decision: str, snapshot) -> dict[str, object]:
         if decision == "local_only":
             self.order_manager.fail_order(order, "startup reconciliation: local order not found on exchange")
+            self._fail_pending_conditional_orders_for_terminal_entry(order)
             self._mark_reconciled(order)
             return self._repair_result("marked_failed")
 
@@ -397,6 +432,8 @@ class ExecutionEngine:
 
             order.status = terminal_status.value
             self.order_manager.repo.update_order(order)
+            if terminal_status in {OrderStatus.CANCELLED, OrderStatus.FAILED}:
+                self._fail_pending_conditional_orders_for_terminal_entry(order)
             self._mark_reconciled(order)
             return self._repair_result(
                 self._terminal_repair_action(terminal_status),
@@ -674,6 +711,9 @@ class ExecutionEngine:
                 )
         else:
             self._apply_exchange_order_event_status(order, event_state, event)
+
+        if event_state in {"cancelled", "rejected", "expired", "failed"}:
+            self._fail_pending_conditional_orders_for_terminal_entry(order)
 
         # Post-fill actions key off persisted state, not the event delta:
         # a replayed event (crash recovery, resync, duplicate stream message)
