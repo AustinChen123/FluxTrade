@@ -4633,6 +4633,245 @@ class TestAuditedExecution:
             # pending_reason must be added alongside the original keys
             assert order.intent_payload.get("pending_reason") == "entry_submit_outcome_uncertain"
 
+    # ------------------------------------------------------------------
+    # OCO sibling cancellation during startup reconciliation (P1 fix)
+    # ------------------------------------------------------------------
+
+    def test_reconcile_offline_protective_fill_cancels_sibling(
+        self, mock_db_session, mock_clock, mock_exchange_adapter, mock_order_repo, signal_factory
+    ):
+        """Gap 1: SL fills while service is offline.
+
+        After restart, reconcile sees SL closed (filled) and TP still open.
+        The fix must cancel TP and NOT leave the stale leg live.
+        """
+        audit_session = mock_db_session
+        engine = ExecutionEngine(
+            db_session=mock_db_session,
+            clock=mock_clock,
+            adapter=mock_exchange_adapter,
+            order_repository=mock_order_repo,
+            db_session_factory=lambda: nullcontext(audit_session),
+            audit_external_orders=True,
+            is_backtest=True,
+        )
+        order_id = engine.execute_signal(
+            signal_factory(
+                price=Decimal("42000"),
+                stop_loss=Decimal("41000"),
+                take_profit=Decimal("43000"),
+            )
+        )
+        entry = mock_order_repo.orders[order_id]
+        # Bring entry to FILLED via live event (SL/TP become SUBMITTED)
+        engine.process_exchange_order_event(
+            ExchangeOrderEvent(
+                status="filled",
+                product_id=entry.product_id,
+                exchange_order_id=entry.exchange_order_id,
+                cumulative_filled_quantity=entry.quantity,
+                cumulative_average_price=entry.price,
+            )
+        )
+        stop_loss = next(
+            o for o in mock_order_repo.orders.values() if o.type == "stop_loss"
+        )
+        take_profit = next(
+            o for o in mock_order_repo.orders.values() if o.type == "take_profit"
+        )
+
+        # Simulate offline fill: exchange reports SL filled, TP still open
+        def lookup(client_order_id, product_id, *, order_type=None):
+            if client_order_id == entry.client_order_id:
+                return ExchangeOrderSnapshot(
+                    client_order_id=client_order_id,
+                    exchange_order_id=entry.exchange_order_id,
+                    status="filled",
+                    filled_quantity=entry.quantity,
+                    average_price=entry.price,
+                )
+            if client_order_id == stop_loss.client_order_id:
+                return ExchangeOrderSnapshot(
+                    client_order_id=client_order_id,
+                    exchange_order_id=stop_loss.exchange_order_id,
+                    status="filled",
+                    filled_quantity=stop_loss.quantity,
+                    average_price=stop_loss.trigger_price,
+                )
+            if client_order_id == take_profit.client_order_id:
+                return ExchangeOrderSnapshot(
+                    client_order_id=client_order_id,
+                    exchange_order_id=take_profit.exchange_order_id,
+                    status="open",
+                    filled_quantity=Decimal("0"),
+                    average_price=None,
+                )
+            return None
+
+        mock_exchange_adapter.get_order_by_client_id = MagicMock(side_effect=lookup)
+
+        payload = engine.reconcile_recoverable_client_orders()
+
+        # SL must be recorded as filled; TP must be cancelled (stale OCO leg)
+        assert stop_loss.status == OrderStatus.FILLED.value
+        assert take_profit.status == OrderStatus.CANCELLED.value
+        # At least one result should reflect the SL fill reconciliation
+        repair_actions = [r["repair_action"] for r in payload["results"]]
+        assert "filled_from_exchange_snapshot" in repair_actions
+
+    def test_reconcile_crash_window_stale_protective_leg_cancelled(
+        self, mock_db_session, mock_clock, mock_exchange_adapter, mock_order_repo, signal_factory
+    ):
+        """Gap 2: crash after recording SL FILLED but before cancelling TP.
+
+        Simulate by directly setting SL status to FILLED in the repo.
+        Reconcile sees TP as 'open' on exchange — it must cancel, not restore.
+        """
+        audit_session = mock_db_session
+        engine = ExecutionEngine(
+            db_session=mock_db_session,
+            clock=mock_clock,
+            adapter=mock_exchange_adapter,
+            order_repository=mock_order_repo,
+            db_session_factory=lambda: nullcontext(audit_session),
+            audit_external_orders=True,
+            is_backtest=True,
+        )
+        order_id = engine.execute_signal(
+            signal_factory(
+                price=Decimal("42000"),
+                stop_loss=Decimal("41000"),
+                take_profit=Decimal("43000"),
+            )
+        )
+        entry = mock_order_repo.orders[order_id]
+        # Bring entry to FILLED via live event (SL/TP become SUBMITTED)
+        engine.process_exchange_order_event(
+            ExchangeOrderEvent(
+                status="filled",
+                product_id=entry.product_id,
+                exchange_order_id=entry.exchange_order_id,
+                cumulative_filled_quantity=entry.quantity,
+                cumulative_average_price=entry.price,
+            )
+        )
+        stop_loss = next(
+            o for o in mock_order_repo.orders.values() if o.type == "stop_loss"
+        )
+        take_profit = next(
+            o for o in mock_order_repo.orders.values() if o.type == "take_profit"
+        )
+
+        # Simulate crash window: SL was recorded as FILLED but sibling cancel
+        # never happened.  Manually set SL to FILLED in the repo.
+        stop_loss.status = OrderStatus.FILLED.value
+        stop_loss.filled_quantity = stop_loss.quantity
+        mock_order_repo.update_order(stop_loss)
+        # Remove SL from open_orders (exchange already executed it)
+        mock_exchange_adapter.open_orders = [
+            o for o in mock_exchange_adapter.open_orders if o.id != stop_loss.id
+        ]
+
+        # Exchange still shows TP open; entry is terminal (not in scan)
+        def lookup(client_order_id, product_id, *, order_type=None):
+            if client_order_id == take_profit.client_order_id:
+                return ExchangeOrderSnapshot(
+                    client_order_id=client_order_id,
+                    exchange_order_id=take_profit.exchange_order_id,
+                    status="open",
+                    filled_quantity=Decimal("0"),
+                    average_price=None,
+                )
+            return None
+
+        mock_exchange_adapter.get_order_by_client_id = MagicMock(side_effect=lookup)
+
+        payload = engine.reconcile_recoverable_client_orders()
+
+        # TP must be cancelled — NOT restored as an active tracking order
+        assert take_profit.status == OrderStatus.CANCELLED.value
+        repair_actions = [r["repair_action"] for r in payload["results"]]
+        assert "cancelled_stale_protective_leg" in repair_actions
+        assert "restored_tracking" not in repair_actions
+
+    def test_reconcile_offline_protective_fill_sibling_cancel_failure_unresolved(
+        self, mock_db_session, mock_clock, mock_exchange_adapter, mock_order_repo, signal_factory
+    ):
+        """Cancel failure during sibling cancellation after offline protective fill
+        must yield an unresolved result, not silently drop the failure.
+        """
+        audit_session = mock_db_session
+        engine = ExecutionEngine(
+            db_session=mock_db_session,
+            clock=mock_clock,
+            adapter=mock_exchange_adapter,
+            order_repository=mock_order_repo,
+            db_session_factory=lambda: nullcontext(audit_session),
+            audit_external_orders=True,
+            is_backtest=True,
+        )
+        order_id = engine.execute_signal(
+            signal_factory(
+                price=Decimal("42000"),
+                stop_loss=Decimal("41000"),
+                take_profit=Decimal("43000"),
+            )
+        )
+        entry = mock_order_repo.orders[order_id]
+        engine.process_exchange_order_event(
+            ExchangeOrderEvent(
+                status="filled",
+                product_id=entry.product_id,
+                exchange_order_id=entry.exchange_order_id,
+                cumulative_filled_quantity=entry.quantity,
+                cumulative_average_price=entry.price,
+            )
+        )
+        stop_loss = next(
+            o for o in mock_order_repo.orders.values() if o.type == "stop_loss"
+        )
+        take_profit = next(
+            o for o in mock_order_repo.orders.values() if o.type == "take_profit"
+        )
+
+        def lookup(client_order_id, product_id, *, order_type=None):
+            if client_order_id == entry.client_order_id:
+                return ExchangeOrderSnapshot(
+                    client_order_id=client_order_id,
+                    exchange_order_id=entry.exchange_order_id,
+                    status="filled",
+                    filled_quantity=entry.quantity,
+                    average_price=entry.price,
+                )
+            if client_order_id == stop_loss.client_order_id:
+                return ExchangeOrderSnapshot(
+                    client_order_id=client_order_id,
+                    exchange_order_id=stop_loss.exchange_order_id,
+                    status="filled",
+                    filled_quantity=stop_loss.quantity,
+                    average_price=stop_loss.trigger_price,
+                )
+            if client_order_id == take_profit.client_order_id:
+                return ExchangeOrderSnapshot(
+                    client_order_id=client_order_id,
+                    exchange_order_id=take_profit.exchange_order_id,
+                    status="open",
+                    filled_quantity=Decimal("0"),
+                    average_price=None,
+                )
+            return None
+
+        mock_exchange_adapter.get_order_by_client_id = MagicMock(side_effect=lookup)
+        # Force cancel to always fail so the sibling cancel returns failure
+        mock_exchange_adapter.cancel_order = MagicMock(return_value=False)
+        mock_exchange_adapter.cancel_order_by_client_id = MagicMock(return_value=False)
+
+        payload = engine.reconcile_recoverable_client_orders()
+
+        assert payload["unresolved_count"] >= 1
+        repair_actions = [r["repair_action"] for r in payload["results"]]
+        assert "unresolved_linked_conditional_cancel_failed" in repair_actions
+
 
 class TestCancelOrder:
     """Tests for execution-level cancellation."""

@@ -417,6 +417,16 @@ class ExecutionEngine:
             )
 
         if decision == "exchange_open":
+            stale_protective = self._cancel_protective_order_when_sibling_closed(order)
+            if stale_protective is not None:
+                if stale_protective["cancelled"]:
+                    self._mark_reconciled(order)
+                    return self._repair_result("cancelled_stale_protective_leg")
+                return self._repair_result(
+                    "unresolved_linked_conditional_cancel_failed",
+                    reason="stale_protective_leg_cancel_failed",
+                    unresolved=True,
+                )
             partial_repair = self._record_open_snapshot_fill_delta(order, snapshot)
             self.order_manager.mark_submitted(order, snapshot.exchange_order_id)
             if partial_repair["unresolved"]:
@@ -458,6 +468,15 @@ class ExecutionEngine:
                     terminal_status=terminal_status,
                     fee=terminal_fill["fee"],
                 )
+                cancel_failure = (
+                    self._cancel_linked_conditional_order_for_protection_fill(order)
+                )
+                if cancel_failure is not None:
+                    return self._repair_result(
+                        "unresolved_linked_conditional_cancel_failed",
+                        reason="sibling_cancel_failed_after_reconciled_protective_fill",
+                        unresolved=True,
+                    )
                 self._mark_reconciled(order)
                 return self._repair_result(
                     self._filled_terminal_repair_action(terminal_status),
@@ -1901,6 +1920,27 @@ class ExecutionEngine:
             "exchange_order_id": linked_order.exchange_order_id,
             "reason": "cancel_order_returned_false",
         }
+
+    def _cancel_protective_order_when_sibling_closed(self, order) -> dict | None:
+        """Inverse of the protection-fill cancel: an open protective leg whose
+        OCO sibling already closed the position must be cancelled, not have
+        its tracking restored."""
+        if order.type not in {"stop_loss", "take_profit", "trailing_stop"}:
+            return None
+        if not isinstance(order.intent_payload, dict):
+            return None
+        linked_order_id = order.intent_payload.get("linked_order_id")
+        if not linked_order_id:
+            return None
+        sibling = self.order_manager.repo.get_order(str(linked_order_id))
+        if sibling is None or sibling.status not in {
+            OrderStatus.FILLED.value,
+            OrderStatus.LIQUIDATED.value,
+        }:
+            return None
+        if self.cancel_order(str(order.id)):
+            return {"cancelled": True}
+        return {"cancelled": False}
 
     def _validate_order_group(self, orders: list) -> None:
         validate_order = getattr(self.adapter, "validate_order", None)
