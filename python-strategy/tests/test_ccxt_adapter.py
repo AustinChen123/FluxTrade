@@ -853,6 +853,116 @@ class TestCancelOrder:
         assert result is False
 
 
+class TestConditionalOrderIdRouting:
+    """Binance futures conditional (algo) orders live in a separate id
+    namespace; ccxt only routes cancel/fetch to the algo endpoints when the
+    trigger/conditional param is present (ccxt binance.py cancel_order /
+    fetch_order). Regression for the OCO sibling staying live after cancel."""
+
+    @pytest.mark.parametrize("order_type", ["stop_loss", "take_profit"])
+    def test_cancel_conditional_order_passes_trigger_param(
+        self, adapter, mock_ccxt_client, order_type
+    ):
+        result = adapter.cancel_order(
+            "ALGO-123",
+            "BINANCE:BTCUSDT-PERP",
+            order_type=order_type,
+        )
+
+        assert result is True
+        mock_ccxt_client.cancel_order.assert_called_once_with(
+            "ALGO-123",
+            "BTC/USDT:USDT",
+            params={"trigger": True},
+        )
+
+    @pytest.mark.parametrize("order_type", [None, "market", "limit"])
+    def test_cancel_regular_order_does_not_pass_trigger_param(
+        self, adapter, mock_ccxt_client, order_type
+    ):
+        result = adapter.cancel_order(
+            "EX-123",
+            "BINANCE:BTCUSDT-PERP",
+            order_type=order_type,
+        )
+
+        assert result is True
+        mock_ccxt_client.cancel_order.assert_called_once_with("EX-123", "BTC/USDT:USDT")
+
+    def test_cancel_conditional_by_client_id_uses_client_algo_id(
+        self, adapter, mock_ccxt_client
+    ):
+        exchange_client_order_id = to_exchange_format(
+            CANONICAL_CLIENT_ORDER_ID,
+            "binance",
+        )
+
+        result = adapter.cancel_order_by_client_id(
+            CANONICAL_CLIENT_ORDER_ID,
+            "BINANCE:BTCUSDT-PERP",
+            order_type="stop_loss",
+        )
+
+        assert result is True
+        mock_ccxt_client.cancel_order.assert_called_once_with(
+            exchange_client_order_id,
+            "BTC/USDT:USDT",
+            params={"clientAlgoId": exchange_client_order_id, "trigger": True},
+        )
+
+    def test_fetch_conditional_by_client_id_uses_client_algo_id(
+        self, adapter, mock_ccxt_client
+    ):
+        exchange_client_order_id = to_exchange_format(
+            CANONICAL_CLIENT_ORDER_ID,
+            "binance",
+        )
+        mock_ccxt_client.fetch_order.return_value = {
+            "id": "ALGO-123",
+            "status": "open",
+            "filled": "0",
+        }
+
+        snapshot = adapter.get_order_by_client_id(
+            CANONICAL_CLIENT_ORDER_ID,
+            "BINANCE:BTCUSDT-PERP",
+            order_type="take_profit",
+        )
+
+        assert snapshot is not None
+        mock_ccxt_client.fetch_order.assert_called_once_with(
+            exchange_client_order_id,
+            "BTC/USDT:USDT",
+            params={"clientAlgoId": exchange_client_order_id, "trigger": True},
+        )
+
+    def test_non_binance_conditional_cancel_does_not_use_binance_algo_params(
+        self, mock_ccxt_client
+    ):
+        with patch("src.core.adapters.ccxt_adapter.ccxt") as mock_ccxt:
+            mock_exchange_cls = MagicMock(return_value=mock_ccxt_client)
+            setattr(mock_ccxt, "bybit", mock_exchange_cls)
+            adapter = CcxtExchangeAdapter(
+                exchange_id="bybit",
+                api_key="test-key",
+                secret="test-secret",
+            )
+        adapter.client = mock_ccxt_client
+
+        result = adapter.cancel_order_by_client_id(
+            CANONICAL_CLIENT_ORDER_ID,
+            "BYBIT:BTCUSDT-PERP",
+            order_type="stop_loss",
+        )
+
+        assert result is True
+        mock_ccxt_client.cancel_order.assert_called_once_with(
+            CANONICAL_CLIENT_ORDER_ID,
+            "BTC/USDT:USDT",
+            params={"clientOrderId": CANONICAL_CLIENT_ORDER_ID},
+        )
+
+
 class TestGetOrderByClientId:
     def test_binance_fetches_order_with_exchange_safe_client_id(self, adapter, mock_ccxt_client):
         exchange_client_order_id = to_exchange_format(

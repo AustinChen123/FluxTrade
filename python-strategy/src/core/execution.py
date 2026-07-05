@@ -134,6 +134,7 @@ class ExecutionEngine:
                 snapshot = self.adapter.get_order_by_client_id(
                     order.client_order_id,
                     order.product_id,
+                    order_type=order.type,
                 )
             except ExchangeOrderLookupUnsupported:
                 snapshot = None
@@ -224,6 +225,7 @@ class ExecutionEngine:
                 snapshot = self.adapter.get_order_by_client_id(
                     order.client_order_id,
                     order.product_id,
+                    order_type=order.type,
                 )
             except ExchangeOrderLookupUnsupported:
                 results.append(
@@ -939,12 +941,17 @@ class ExecutionEngine:
         if client_order_id and self.adapter.cancel_order_by_client_id(
             client_order_id,
             order.product_id,
+            order_type=order.type,
         ):
             self.order_manager.mark_cancelled(order)
             return True
 
         exchange_order_id = order.exchange_order_id or order.id
-        if not self.adapter.cancel_order(exchange_order_id, order.product_id):
+        if not self.adapter.cancel_order(
+            exchange_order_id,
+            order.product_id,
+            order_type=order.type,
+        ):
             return False
 
         self.order_manager.mark_cancelled(order)
@@ -1300,6 +1307,7 @@ class ExecutionEngine:
             snapshot = self.adapter.get_order_by_client_id(
                 order.client_order_id,
                 order.product_id,
+                order_type=order.type,
             )
         except ExchangeOrderLookupUnsupported:
             return {

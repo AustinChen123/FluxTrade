@@ -1643,7 +1643,7 @@ class TestAuditedExecution:
             side_effect=NetworkError("Connection timeout")
         )
 
-        def lookup(client_order_id, product_id):
+        def lookup(client_order_id, product_id, *, order_type=None):
             return ExchangeOrderSnapshot(
                 client_order_id=client_order_id,
                 exchange_order_id="EX-ADOPTED",
@@ -1677,6 +1677,7 @@ class TestAuditedExecution:
         mock_exchange_adapter.get_order_by_client_id.assert_called_once_with(
             order.client_order_id,
             order.product_id,
+            order_type=order.type,
         )
 
     def test_ambiguous_submit_error_adoption_audits_detached_repo_exchange_id(
@@ -1687,7 +1688,7 @@ class TestAuditedExecution:
             side_effect=NetworkError("Connection timeout")
         )
 
-        def lookup(client_order_id, product_id):
+        def lookup(client_order_id, product_id, *, order_type=None):
             return ExchangeOrderSnapshot(
                 client_order_id=client_order_id,
                 exchange_order_id="EX-DETACHED",
@@ -1840,7 +1841,7 @@ class TestAuditedExecution:
             side_effect=NetworkError("Connection timeout")
         )
 
-        def lookup(client_order_id, product_id):
+        def lookup(client_order_id, product_id, *, order_type=None):
             return ExchangeOrderSnapshot(
                 client_order_id=client_order_id,
                 exchange_order_id="EX-UNRESOLVED",
@@ -1879,7 +1880,7 @@ class TestAuditedExecution:
             side_effect=NetworkError("Connection timeout")
         )
 
-        def lookup(client_order_id, product_id):
+        def lookup(client_order_id, product_id, *, order_type=None):
             return ExchangeOrderSnapshot(
                 client_order_id=client_order_id,
                 exchange_order_id=None,
@@ -1969,7 +1970,7 @@ class TestAuditedExecution:
             side_effect=NetworkError("Connection timeout")
         )
 
-        def lookup(client_order_id, product_id):
+        def lookup(client_order_id, product_id, *, order_type=None):
             return ExchangeOrderSnapshot(
                 client_order_id=client_order_id,
                 exchange_order_id="EX-CANCELED",
@@ -2248,6 +2249,63 @@ class TestAuditedExecution:
         assert stop_loss.status == OrderStatus.FILLED.value
         assert take_profit.status == OrderStatus.CANCELLED.value
         assert take_profit not in mock_exchange_adapter.open_orders
+
+    def test_sibling_cancel_passes_conditional_order_type_to_adapter(
+        self, mock_db_session, mock_clock, mock_exchange_adapter, mock_order_repo, signal_factory
+    ):
+        audit_session = mock_db_session
+        engine = ExecutionEngine(
+            db_session=mock_db_session,
+            clock=mock_clock,
+            adapter=mock_exchange_adapter,
+            order_repository=mock_order_repo,
+            db_session_factory=lambda: nullcontext(audit_session),
+            audit_external_orders=True,
+            is_backtest=True,
+        )
+        order_id = engine.execute_signal(
+            signal_factory(
+                price=Decimal("42000"),
+                stop_loss=Decimal("41000"),
+                take_profit=Decimal("43000"),
+            )
+        )
+        entry = mock_order_repo.orders[order_id]
+        engine.process_exchange_order_event(
+            ExchangeOrderEvent(
+                status="filled",
+                product_id=entry.product_id,
+                exchange_order_id=entry.exchange_order_id,
+                cumulative_filled_quantity=entry.quantity,
+                cumulative_average_price=entry.price,
+            )
+        )
+        stop_loss = next(
+            order for order in mock_order_repo.orders.values() if order.type == "stop_loss"
+        )
+        take_profit = next(
+            order for order in mock_order_repo.orders.values() if order.type == "take_profit"
+        )
+        mock_exchange_adapter.cancel_order = MagicMock(
+            wraps=mock_exchange_adapter.cancel_order
+        )
+
+        engine.process_exchange_order_event(
+            ExchangeOrderEvent(
+                status="filled",
+                product_id=stop_loss.product_id,
+                exchange_order_id=stop_loss.exchange_order_id,
+                cumulative_filled_quantity=stop_loss.quantity,
+                cumulative_average_price=stop_loss.trigger_price,
+            )
+        )
+
+        assert take_profit.status == OrderStatus.CANCELLED.value
+        mock_exchange_adapter.cancel_order.assert_called_once_with(
+            take_profit.exchange_order_id,
+            take_profit.product_id,
+            order_type="take_profit",
+        )
 
     def test_partial_protective_fill_keeps_linked_sibling_and_reports_unresolved(
         self, mock_db_session, mock_clock, mock_exchange_adapter, mock_order_repo, signal_factory
@@ -2717,7 +2775,7 @@ class TestAuditedExecution:
         )
         mock_order_repo.add_order(order)
 
-        mock_exchange_adapter.get_order_by_client_id = lambda client_order_id, product_id: (
+        mock_exchange_adapter.get_order_by_client_id = lambda client_order_id, product_id, *, order_type=None: (
             ExchangeOrderSnapshot(
                 client_order_id=client_order_id,
                 exchange_order_id="EX-OPEN",
@@ -2758,7 +2816,7 @@ class TestAuditedExecution:
         )
         mock_order_repo.add_order(order)
 
-        mock_exchange_adapter.get_order_by_client_id = lambda client_order_id, product_id: (
+        mock_exchange_adapter.get_order_by_client_id = lambda client_order_id, product_id, *, order_type=None: (
             ExchangeOrderSnapshot(
                 client_order_id=client_order_id,
                 exchange_order_id="EX-PARTIAL",
@@ -2810,7 +2868,7 @@ class TestAuditedExecution:
         )
         mock_order_repo.add_order(order)
 
-        mock_exchange_adapter.get_order_by_client_id = lambda client_order_id, product_id: (
+        mock_exchange_adapter.get_order_by_client_id = lambda client_order_id, product_id, *, order_type=None: (
             ExchangeOrderSnapshot(
                 client_order_id=client_order_id,
                 exchange_order_id="EX-OPEN-MISSING-PRICE",
@@ -2860,7 +2918,7 @@ class TestAuditedExecution:
         )
         mock_order_repo.add_order(order)
 
-        mock_exchange_adapter.get_order_by_client_id = lambda client_order_id, product_id: (
+        mock_exchange_adapter.get_order_by_client_id = lambda client_order_id, product_id, *, order_type=None: (
             ExchangeOrderSnapshot(
                 client_order_id=client_order_id,
                 exchange_order_id="EX-OPEN-LESS-FILLED",
@@ -2932,7 +2990,7 @@ class TestAuditedExecution:
         )
         mock_order_repo.add_order(order)
 
-        mock_exchange_adapter.get_order_by_client_id = lambda client_order_id, product_id: (
+        mock_exchange_adapter.get_order_by_client_id = lambda client_order_id, product_id, *, order_type=None: (
             ExchangeOrderSnapshot(
                 client_order_id=client_order_id,
                 exchange_order_id=f"EX-{exchange_status.upper()}-{fill_state.upper()}",
@@ -2998,7 +3056,7 @@ class TestAuditedExecution:
         assert len(mock_exchange_adapter.open_orders) == 1
 
         restarted_adapter = type(mock_exchange_adapter)()
-        restarted_adapter.get_order_by_client_id = lambda client_order_id, product_id: (
+        restarted_adapter.get_order_by_client_id = lambda client_order_id, product_id, *, order_type=None: (
             ExchangeOrderSnapshot(
                 client_order_id=client_order_id,
                 exchange_order_id=persisted_order.exchange_order_id,
@@ -3045,7 +3103,7 @@ class TestAuditedExecution:
         )
         mock_order_repo.add_order(order)
 
-        mock_exchange_adapter.get_order_by_client_id = lambda client_order_id, product_id: (
+        mock_exchange_adapter.get_order_by_client_id = lambda client_order_id, product_id, *, order_type=None: (
             ExchangeOrderSnapshot(
                 client_order_id=client_order_id,
                 exchange_order_id="EX-FILLED",
@@ -3089,7 +3147,7 @@ class TestAuditedExecution:
         )
         mock_order_repo.add_order(order)
 
-        mock_exchange_adapter.get_order_by_client_id = lambda client_order_id, product_id: (
+        mock_exchange_adapter.get_order_by_client_id = lambda client_order_id, product_id, *, order_type=None: (
             ExchangeOrderSnapshot(
                 client_order_id=client_order_id,
                 exchange_order_id="EX-FILLED",
@@ -3131,7 +3189,7 @@ class TestAuditedExecution:
         )
         mock_order_repo.add_order(order)
 
-        mock_exchange_adapter.get_order_by_client_id = lambda client_order_id, product_id: (
+        mock_exchange_adapter.get_order_by_client_id = lambda client_order_id, product_id, *, order_type=None: (
             ExchangeOrderSnapshot(
                 client_order_id=client_order_id,
                 exchange_order_id="EX-CLOSED",
@@ -3193,7 +3251,7 @@ class TestAuditedExecution:
         )
         mock_order_repo.add_order(order)
 
-        mock_exchange_adapter.get_order_by_client_id = lambda client_order_id, product_id: (
+        mock_exchange_adapter.get_order_by_client_id = lambda client_order_id, product_id, *, order_type=None: (
             ExchangeOrderSnapshot(
                 client_order_id=client_order_id,
                 exchange_order_id=f"EX-{exchange_status.upper()}",
@@ -3247,7 +3305,7 @@ class TestAuditedExecution:
         )
         mock_order_repo.add_order(order)
 
-        mock_exchange_adapter.get_order_by_client_id = lambda client_order_id, product_id: (
+        mock_exchange_adapter.get_order_by_client_id = lambda client_order_id, product_id, *, order_type=None: (
             ExchangeOrderSnapshot(
                 client_order_id=client_order_id,
                 exchange_order_id=f"EX-{exchange_status.upper()}",
@@ -3293,7 +3351,7 @@ class TestAuditedExecution:
         )
         mock_order_repo.add_order(order)
 
-        mock_exchange_adapter.get_order_by_client_id = lambda client_order_id, product_id: (
+        mock_exchange_adapter.get_order_by_client_id = lambda client_order_id, product_id, *, order_type=None: (
             ExchangeOrderSnapshot(
                 client_order_id=client_order_id,
                 exchange_order_id="EX-CANCELLED",
@@ -3375,7 +3433,7 @@ class TestAuditedExecution:
     def test_reconcile_recoverable_client_orders_distinguishes_unsupported_lookup(
         self, mock_db_session, mock_clock, mock_exchange_adapter, mock_order_repo, order_factory
     ):
-        def unsupported_lookup(client_order_id, product_id):
+        def unsupported_lookup(client_order_id, product_id, *, order_type=None):
             raise ExchangeOrderLookupUnsupported("unsupported")
 
         mock_exchange_adapter.get_order_by_client_id = unsupported_lookup
@@ -3423,7 +3481,7 @@ class TestAuditedExecution:
         )
         mock_order_repo.add_order(order)
 
-        mock_exchange_adapter.get_order_by_client_id = lambda client_order_id, product_id: (
+        mock_exchange_adapter.get_order_by_client_id = lambda client_order_id, product_id, *, order_type=None: (
             ExchangeOrderSnapshot(
                 client_order_id=client_order_id,
                 exchange_order_id="EX-WEIRD",
