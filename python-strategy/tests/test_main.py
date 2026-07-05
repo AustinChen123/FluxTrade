@@ -58,6 +58,43 @@ def test_adapter_config_from_env_rejects_unknown_mode(monkeypatch) -> None:
         strategy_main._adapter_config_from_env()
 
 
+def test_validate_runtime_config_rejects_live_without_audit() -> None:
+    with pytest.raises(ValueError, match="live_adapter_requires_audit_external_orders"):
+        strategy_main._validate_runtime_config(
+            {"mode": "live"},
+            audit_external_orders=False,
+        )
+
+
+def test_validate_runtime_config_allows_simulated_without_audit() -> None:
+    strategy_main._validate_runtime_config(
+        {"mode": "simulated"},
+        audit_external_orders=False,
+    )
+
+
+def test_validate_runtime_config_allows_live_with_audit() -> None:
+    strategy_main._validate_runtime_config(
+        {"mode": "live"},
+        audit_external_orders=True,
+    )
+
+
+def test_main_rejects_live_without_audit_before_initialization(monkeypatch) -> None:
+    monkeypatch.setenv("ADAPTER_MODE", "live")
+    monkeypatch.setenv("AUDIT_EXTERNAL_ORDERS", "false")
+
+    with patch("src.main.configure_metrics") as configure_metrics, \
+         patch("src.main.SessionLocal") as session_local, \
+         patch("src.main.StrategyEngine") as engine_cls:
+        with pytest.raises(ValueError, match="live_adapter_requires_audit_external_orders"):
+            strategy_main.main()
+
+    configure_metrics.assert_not_called()
+    session_local.assert_not_called()
+    engine_cls.assert_not_called()
+
+
 def test_main_wires_session_factory_and_audit_flag(monkeypatch) -> None:
     monkeypatch.setenv("AUDIT_EXTERNAL_ORDERS", "true")
     monkeypatch.delenv("ADAPTER_MODE", raising=False)

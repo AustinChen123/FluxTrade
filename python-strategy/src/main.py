@@ -121,6 +121,14 @@ def _adapter_config_from_env() -> dict:
     }
 
 
+def _validate_runtime_config(adapter_config: dict, *, audit_external_orders: bool) -> None:
+    if adapter_config.get("mode") == "live" and not audit_external_orders:
+        raise ValueError(
+            "live_adapter_requires_audit_external_orders: "
+            "set AUDIT_EXTERNAL_ORDERS=true for live trading"
+        )
+
+
 @contextmanager
 def _session_scope():
     session = SessionLocal()
@@ -132,6 +140,12 @@ def _session_scope():
 
 def main():
     logger.info("Starting FluxTrade Strategy Service...")
+    adapter_config = _adapter_config_from_env()
+    audit_external_orders = _env_flag("AUDIT_EXTERNAL_ORDERS")
+    _validate_runtime_config(
+        adapter_config,
+        audit_external_orders=audit_external_orders,
+    )
 
     # 0. Metrics
     metrics_enabled = os.getenv("METRICS_ENABLED", "true").lower() == "true"
@@ -146,9 +160,9 @@ def main():
     engine = StrategyEngine(
         db_session=db_session,
         clock=clock,
-        adapter_config=_adapter_config_from_env(),
+        adapter_config=adapter_config,
         db_session_factory=_session_scope,
-        audit_external_orders=_env_flag("AUDIT_EXTERNAL_ORDERS"),
+        audit_external_orders=audit_external_orders,
     )
 
     # Run Startup Checks (System State & Heartbeat)

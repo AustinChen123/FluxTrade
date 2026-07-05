@@ -196,6 +196,22 @@ class TestPlaceOrder:
 
         mock_ccxt_client.create_order.assert_not_called()
 
+    @pytest.mark.parametrize("order_type", ["trailing_stop", "iceberg_stop"])
+    def test_validate_order_rejects_unmapped_order_types_before_submit(
+        self, adapter, mock_ccxt_client, order_type
+    ):
+        order = _make_order(
+            side="sell",
+            type=order_type,
+            quantity=Decimal("0.01"),
+            trigger_price=Decimal("41000"),
+        )
+
+        with pytest.raises(ExchangeError, match="mapping_unsupported"):
+            adapter.validate_order(order)
+
+        mock_ccxt_client.create_order.assert_not_called()
+
     def test_fetches_instrument_spec_from_binance_filters(self, adapter, mock_ccxt_client):
         mock_ccxt_client.load_markets.return_value = {
             "BTC/USDT:USDT": {
@@ -525,8 +541,6 @@ class TestPlaceOrder:
             ("stop_loss", "buy", Decimal("49999.987"), Decimal("49999.90")),
             ("take_profit", "sell", Decimal("50123.456"), Decimal("50123.50")),
             ("take_profit", "buy", Decimal("50123.456"), Decimal("50123.40")),
-            ("trailing_stop", "sell", Decimal("49999.987"), Decimal("50000.00")),
-            ("trailing_stop", "buy", Decimal("49999.987"), Decimal("49999.90")),
         ],
     )
     def test_quantizes_protective_trigger_price_directionally_before_placing(

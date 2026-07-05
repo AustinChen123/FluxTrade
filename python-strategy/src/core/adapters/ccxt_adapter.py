@@ -197,6 +197,7 @@ class CcxtExchangeAdapter(IExchangeAdapter):
             raise ExchangeError(f"Order placement failed: {e}") from e
 
     _BINANCE_ALGO_ORDER_TYPES = frozenset({"stop_loss", "take_profit"})
+    _SUPPORTED_PLAIN_ORDER_TYPES = frozenset({"market", "limit"})
 
     def _uses_algo_order_endpoints(self, order_type: Optional[str]) -> bool:
         """Binance USDT-M conditional orders live in the algo order id namespace.
@@ -218,6 +219,10 @@ class CcxtExchangeAdapter(IExchangeAdapter):
             raise ExchangeError(
                 f"conditional_order_mapping_unsupported: exchange={self.exchange_id}"
             )
+        if order_type == "trailing_stop":
+            raise ExchangeError(
+                f"trailing_stop_mapping_unsupported: exchange={self.exchange_id}"
+            )
         if order_type == "stop_loss":
             if order.trigger_price is None:
                 raise ExchangeError("stop_loss_requires_trigger_price")
@@ -232,7 +237,9 @@ class CcxtExchangeAdapter(IExchangeAdapter):
                 "takeProfitPrice": str(order.trigger_price),
                 "reduceOnly": True,
             }
-        return order_type, {}
+        if order_type in self._SUPPORTED_PLAIN_ORDER_TYPES:
+            return order_type, {}
+        raise ExchangeError(f"order_type_mapping_unsupported: order_type={order_type}")
 
     def validate_order(self, order: Order) -> None:
         """Validate and quantize an outbound order without placing it."""

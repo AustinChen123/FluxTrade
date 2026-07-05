@@ -1918,6 +1918,23 @@ class ExecutionEngine:
             error,
             submit_attempted=submit_attempted,
         )
+        if (
+            submit_attempted
+            and adoption["action"] == "verification_blocked_missing_client_order_id"
+        ):
+            self.order_manager.mark_submitted_unconfirmed(order)
+            return [
+                {
+                    "order_id": str(order.id),
+                    "order_type": order.type,
+                    "reason": "verification_blocked_missing_client_order_id",
+                    "adoption": adoption,
+                    "operator_action": (
+                        "conditional_submit_outcome_uncertain_without_client_id; "
+                        "verify exchange manually"
+                    ),
+                }
+            ]
         if adoption["action"] == "adopted":
             return []
         if adoption.get("terminal"):

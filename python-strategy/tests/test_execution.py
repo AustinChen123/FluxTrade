@@ -356,6 +356,31 @@ class TestExecutionTradingRules:
         assert payload["quantity"] == "0.010"
         assert payload["price"] == "50123.40"
 
+    def test_trailing_stop_validation_rejects_group_before_entry_submit(
+        self, mock_db_session, mock_clock, mock_order_repo, signal_factory
+    ):
+        adapter, client = _ccxt_adapter_with_market_rules(_binance_btcusdt_market_rules())
+        engine = ExecutionEngine(
+            db_session=mock_db_session,
+            clock=mock_clock,
+            adapter=adapter,
+            order_repository=mock_order_repo,
+        )
+        signal = signal_factory(
+            product_id="BINANCE:BTCUSDT-PERP",
+            price=Decimal("50123.40"),
+            quantity=Decimal("0.010"),
+            trailing_distance=Decimal("100"),
+        )
+
+        order_id = engine.execute_signal(signal)
+
+        assert order_id is None
+        client.create_order.assert_not_called()
+        orders = list(mock_order_repo.orders.values())
+        assert {order.type for order in orders} == {"limit", "trailing_stop"}
+        assert all(order.status == "failed" for order in orders)
+
     def test_min_notional_rejection_fails_local_order_and_audit(
         self, mock_db_session, mock_clock, mock_order_repo, signal_factory
     ):
@@ -498,7 +523,7 @@ class TestExecutionTradingRules:
 
         client.create_order.assert_not_called()
 
-    def test_trailing_only_signal_prevalidates_and_keeps_protective_order_pending(
+    def test_trailing_only_signal_fails_closed_before_audited_entry_submit(
         self,
         mock_db_session,
         mock_clock,
@@ -527,16 +552,13 @@ class TestExecutionTradingRules:
             close=Decimal("12000"),
         )
 
-        order_id = engine.execute_signal(signal, candle=candle)
+        with pytest.raises(ExchangeError, match="trailing_stop_mapping_unsupported"):
+            engine.execute_signal(signal, candle=candle)
 
-        assert order_id is not None
-        assert client.create_order.call_count == 1
+        client.create_order.assert_not_called()
         orders = list(mock_order_repo.orders.values())
         assert {order.type for order in orders} == {"market", "trailing_stop"}
-        trailing_order = next(order for order in orders if order.type == "trailing_stop")
-        assert trailing_order.status == OrderStatus.NEW.value
-        assert trailing_order.exchange_order_id is None
-        assert getattr(trailing_order, "min_notional_reference_price") == Decimal("12000")
+        assert all(order.status == "failed" for order in orders)
 
     def test_trailing_validation_failure_blocks_entry_order(
         self,
@@ -2198,6 +2220,55 @@ class TestAuditedExecution:
             == "conditional_order_placement_failed_after_entry_fill"
         )
         assert event.related_order_id == entry.id
+
+    def test_non_idempotent_ambiguous_conditional_submit_is_not_retried(
+        self, mock_db_session, mock_clock, mock_exchange_adapter, mock_order_repo, signal_factory
+    ):
+        engine = ExecutionEngine(
+            db_session=mock_db_session,
+            clock=mock_clock,
+            adapter=mock_exchange_adapter,
+            order_repository=mock_order_repo,
+            is_backtest=True,
+        )
+        original_place_order = mock_exchange_adapter.place_order
+
+        def place_order(order):
+            if order.type == "stop_loss":
+                raise NetworkError("request timed out")
+            return original_place_order(order)
+
+        mock_exchange_adapter.place_order = MagicMock(side_effect=place_order)
+        order_id = engine.execute_signal(
+            signal_factory(
+                price=Decimal("42000"),
+                stop_loss=Decimal("41000"),
+            )
+        )
+        entry = mock_order_repo.orders[order_id]
+        stop_loss = next(
+            order for order in mock_order_repo.orders.values() if order.type == "stop_loss"
+        )
+
+        assert stop_loss.client_order_id is None
+        assert stop_loss.status == OrderStatus.SUBMITTED_UNCONFIRMED.value
+
+        result = engine.process_exchange_order_event(
+            ExchangeOrderEvent(
+                status="filled",
+                product_id=entry.product_id,
+                exchange_order_id=entry.exchange_order_id,
+                cumulative_filled_quantity=entry.quantity,
+                cumulative_average_price=entry.price,
+            )
+        )
+
+        assert result["action"] == "applied"
+        stop_loss_place_calls = [
+            call for call in mock_exchange_adapter.place_order.call_args_list
+            if call.args[0].type == "stop_loss"
+        ]
+        assert len(stop_loss_place_calls) == 1
 
     def test_filled_protective_order_cancels_linked_sibling(
         self, mock_db_session, mock_clock, mock_exchange_adapter, mock_order_repo, signal_factory
