@@ -2188,7 +2188,7 @@ class TestAuditedExecution:
         )
         assert result["action"] == "unresolved_conditional_order_placement_failed"
         assert result["failures"][0]["order_id"] == stop_loss.id
-        assert stop_loss.status == OrderStatus.NEW.value
+        assert stop_loss.status == "failed"
         assert take_profit.status == OrderStatus.SUBMITTED.value
         event = next(
             call.args[0]
@@ -2286,8 +2286,8 @@ class TestAuditedExecution:
         take_profit = next(
             order for order in mock_order_repo.orders.values() if order.type == "take_profit"
         )
-        mock_exchange_adapter.cancel_order = MagicMock(
-            wraps=mock_exchange_adapter.cancel_order
+        mock_exchange_adapter.cancel_order_by_client_id = MagicMock(
+            wraps=mock_exchange_adapter.cancel_order_by_client_id
         )
 
         engine.process_exchange_order_event(
@@ -2301,8 +2301,8 @@ class TestAuditedExecution:
         )
 
         assert take_profit.status == OrderStatus.CANCELLED.value
-        mock_exchange_adapter.cancel_order.assert_called_once_with(
-            take_profit.exchange_order_id,
+        mock_exchange_adapter.cancel_order_by_client_id.assert_called_once_with(
+            take_profit.client_order_id,
             take_profit.product_id,
             order_type="take_profit",
         )
@@ -2403,6 +2403,7 @@ class TestAuditedExecution:
         take_profit = next(
             order for order in mock_order_repo.orders.values() if order.type == "take_profit"
         )
+        mock_exchange_adapter.cancel_order_by_client_id = MagicMock(return_value=False)
         mock_exchange_adapter.cancel_order = MagicMock(return_value=False)
 
         result = engine.process_exchange_order_event(
@@ -2426,7 +2427,7 @@ class TestAuditedExecution:
         )
         assert event.related_order_id == stop_loss.id
 
-    def test_replayed_entry_fill_event_retries_pending_protection_placement(
+    def test_replayed_entry_fill_event_does_not_resubmit_unconfirmed_protection(
         self, mock_db_session, mock_clock, mock_exchange_adapter, mock_order_repo, signal_factory
     ):
         audit_session = mock_db_session
@@ -2454,7 +2455,13 @@ class TestAuditedExecution:
             cumulative_filled_quantity=entry.quantity,
             cumulative_average_price=entry.price,
         )
-        mock_exchange_adapter.set_fail_on_order_types({"stop_loss", "take_profit"})
+        def place_order(order):
+            if order.type in {"stop_loss", "take_profit"}:
+                raise NetworkError("request timed out")
+            return f"EX-{order.type}"
+
+        mock_exchange_adapter.place_order = MagicMock(side_effect=place_order)
+        mock_exchange_adapter.get_order_by_client_id = MagicMock(return_value=None)
         first = engine.process_exchange_order_event(fill_event)
         assert first["action"] == "unresolved_conditional_order_placement_failed"
         conditionals = [
@@ -2462,16 +2469,191 @@ class TestAuditedExecution:
             for order in mock_order_repo.orders.values()
             if order.type in {"stop_loss", "take_profit"}
         ]
-        assert all(order.status == OrderStatus.NEW.value for order in conditionals)
+        assert all(
+            order.status == OrderStatus.SUBMITTED_UNCONFIRMED.value
+            for order in conditionals
+        )
 
-        mock_exchange_adapter.set_fail_on_order_types(set())
         replay = engine.process_exchange_order_event(fill_event)
 
         assert replay["action"] == "applied"
         assert replay["fill_quantity"] == Decimal("0")
         assert all(
-            order.status == OrderStatus.SUBMITTED.value for order in conditionals
+            order.status == OrderStatus.SUBMITTED_UNCONFIRMED.value
+            for order in conditionals
         )
+        conditional_place_calls = [
+            call for call in mock_exchange_adapter.place_order.call_args_list
+            if call.args[0].type in {"stop_loss", "take_profit"}
+        ]
+        assert len(conditional_place_calls) == 2
+
+    def test_conditional_orders_derive_stable_client_order_ids(
+        self, mock_db_session, mock_clock, mock_exchange_adapter, mock_order_repo, signal_factory
+    ):
+        engine = ExecutionEngine(
+            db_session=mock_db_session,
+            clock=mock_clock,
+            adapter=mock_exchange_adapter,
+            order_repository=mock_order_repo,
+            db_session_factory=lambda: nullcontext(mock_db_session),
+            audit_external_orders=True,
+            is_backtest=True,
+        )
+        entry_client_id = "strategy-worker-entry-1704067200000000000"
+
+        engine.execute_signal(
+            signal_factory(
+                price=Decimal("42000"),
+                stop_loss=Decimal("41000"),
+                take_profit=Decimal("43000"),
+                trailing_distance=Decimal("100"),
+                metadata={"client_order_id": entry_client_id},
+            )
+        )
+
+        conditionals = {
+            order.type: order
+            for order in mock_order_repo.orders.values()
+            if order.type in {"stop_loss", "take_profit", "trailing_stop"}
+        }
+        assert conditionals["stop_loss"].client_order_id == (
+            "strategy-worker-sl-1704067200000000000"
+        )
+        assert conditionals["take_profit"].client_order_id == (
+            "strategy-worker-tp-1704067200000000000"
+        )
+        assert conditionals["trailing_stop"].client_order_id == (
+            "strategy-worker-tr-1704067200000000000"
+        )
+        for order in conditionals.values():
+            parse_client_order_id(order.client_order_id)
+
+    def test_ambiguous_conditional_submit_adopts_exchange_order_without_replay_duplicate(
+        self, mock_db_session, mock_clock, mock_exchange_adapter, mock_order_repo, signal_factory
+    ):
+        engine = ExecutionEngine(
+            db_session=mock_db_session,
+            clock=mock_clock,
+            adapter=mock_exchange_adapter,
+            order_repository=mock_order_repo,
+            db_session_factory=lambda: nullcontext(mock_db_session),
+            audit_external_orders=True,
+            is_backtest=True,
+        )
+        order_id = engine.execute_signal(
+            signal_factory(
+                price=Decimal("42000"),
+                stop_loss=Decimal("41000"),
+            )
+        )
+        entry = mock_order_repo.orders[order_id]
+        stop_loss = next(
+            order for order in mock_order_repo.orders.values() if order.type == "stop_loss"
+        )
+        accepted: dict[str, str] = {}
+        original_place_order = mock_exchange_adapter.place_order
+
+        def place_order(order):
+            if order.type == "stop_loss":
+                exchange_order_id = "EX-stop-loss"
+                order.exchange_order_id = exchange_order_id
+                accepted[order.client_order_id] = exchange_order_id
+                mock_exchange_adapter.open_orders.append(order)
+                raise NetworkError("request timed out")
+            return original_place_order(order)
+
+        def lookup(client_order_id, product_id, *, order_type=None):
+            exchange_order_id = accepted.get(client_order_id)
+            if exchange_order_id is None:
+                return None
+            return ExchangeOrderSnapshot(
+                client_order_id=client_order_id,
+                exchange_order_id=exchange_order_id,
+                status="open",
+            )
+
+        mock_exchange_adapter.place_order = MagicMock(side_effect=place_order)
+        mock_exchange_adapter.get_order_by_client_id = MagicMock(side_effect=lookup)
+        fill_event = ExchangeOrderEvent(
+            status="filled",
+            product_id=entry.product_id,
+            exchange_order_id=entry.exchange_order_id,
+            cumulative_filled_quantity=entry.quantity,
+            cumulative_average_price=entry.price,
+        )
+
+        first = engine.process_exchange_order_event(fill_event)
+        replay = engine.process_exchange_order_event(fill_event)
+
+        assert first["action"] == "applied"
+        assert replay["action"] == "applied"
+        assert stop_loss.status == OrderStatus.SUBMITTED.value
+        assert stop_loss.exchange_order_id == "EX-stop-loss"
+        stop_loss_place_calls = [
+            call for call in mock_exchange_adapter.place_order.call_args_list
+            if call.args[0].type == "stop_loss"
+        ]
+        assert len(stop_loss_place_calls) == 1
+        assert [
+            order for order in mock_exchange_adapter.open_orders
+            if order.client_order_id == stop_loss.client_order_id
+        ] == [stop_loss]
+
+    def test_ambiguous_conditional_submit_missing_snapshot_stays_unconfirmed(
+        self, mock_db_session, mock_clock, mock_exchange_adapter, mock_order_repo, signal_factory
+    ):
+        engine = ExecutionEngine(
+            db_session=mock_db_session,
+            clock=mock_clock,
+            adapter=mock_exchange_adapter,
+            order_repository=mock_order_repo,
+            db_session_factory=lambda: nullcontext(mock_db_session),
+            audit_external_orders=True,
+            is_backtest=True,
+        )
+        order_id = engine.execute_signal(
+            signal_factory(
+                price=Decimal("42000"),
+                stop_loss=Decimal("41000"),
+            )
+        )
+        entry = mock_order_repo.orders[order_id]
+        stop_loss = next(
+            order for order in mock_order_repo.orders.values() if order.type == "stop_loss"
+        )
+
+        def place_order(order):
+            if order.type == "stop_loss":
+                raise NetworkError("request timed out")
+            return f"EX-{order.type}"
+
+        mock_exchange_adapter.place_order = MagicMock(side_effect=place_order)
+        mock_exchange_adapter.get_order_by_client_id = MagicMock(return_value=None)
+        fill_event = ExchangeOrderEvent(
+            status="filled",
+            product_id=entry.product_id,
+            exchange_order_id=entry.exchange_order_id,
+            cumulative_filled_quantity=entry.quantity,
+            cumulative_average_price=entry.price,
+        )
+
+        first = engine.process_exchange_order_event(fill_event)
+        replay = engine.process_exchange_order_event(fill_event)
+
+        assert first["action"] == "unresolved_conditional_order_placement_failed"
+        assert first["failures"][0]["reason"] == (
+            "verification_blocked_order_snapshot_missing"
+        )
+        assert replay["action"] == "applied"
+        assert stop_loss.status == OrderStatus.SUBMITTED_UNCONFIRMED.value
+        assert stop_loss.exchange_order_id is None
+        stop_loss_place_calls = [
+            call for call in mock_exchange_adapter.place_order.call_args_list
+            if call.args[0].type == "stop_loss"
+        ]
+        assert len(stop_loss_place_calls) == 1
+        assert stop_loss in engine.list_recoverable_client_orders()
 
     def test_startup_reconcile_places_pending_protection_for_filled_entry(
         self, mock_db_session, mock_clock, mock_exchange_adapter, mock_order_repo, signal_factory
@@ -2494,16 +2676,10 @@ class TestAuditedExecution:
             )
         )
         entry = mock_order_repo.orders[order_id]
-        mock_exchange_adapter.set_fail_on_order_types({"stop_loss", "take_profit"})
-        engine.process_exchange_order_event(
-            ExchangeOrderEvent(
-                status="filled",
-                product_id=entry.product_id,
-                exchange_order_id=entry.exchange_order_id,
-                cumulative_filled_quantity=entry.quantity,
-                cumulative_average_price=entry.price,
-            )
-        )
+        entry.status = OrderStatus.FILLED.value
+        entry.filled_quantity = entry.quantity
+        entry.filled_price = entry.price
+        mock_order_repo.update_order(entry)
         conditionals = [
             order
             for order in mock_order_repo.orders.values()
@@ -2541,16 +2717,11 @@ class TestAuditedExecution:
             )
         )
         entry = mock_order_repo.orders[order_id]
+        entry.status = OrderStatus.FILLED.value
+        entry.filled_quantity = entry.quantity
+        entry.filled_price = entry.price
+        mock_order_repo.update_order(entry)
         mock_exchange_adapter.set_fail_on_order_types({"stop_loss", "take_profit"})
-        engine.process_exchange_order_event(
-            ExchangeOrderEvent(
-                status="filled",
-                product_id=entry.product_id,
-                exchange_order_id=entry.exchange_order_id,
-                cumulative_filled_quantity=entry.quantity,
-                cumulative_average_price=entry.price,
-            )
-        )
 
         payload = engine.reconcile_recoverable_client_orders()
 
@@ -2596,7 +2767,8 @@ class TestAuditedExecution:
         take_profit = next(
             order for order in mock_order_repo.orders.values() if order.type == "take_profit"
         )
-        original_cancel = mock_exchange_adapter.cancel_order
+        original_cancel_by_client_id = mock_exchange_adapter.cancel_order_by_client_id
+        mock_exchange_adapter.cancel_order_by_client_id = MagicMock(return_value=False)
         mock_exchange_adapter.cancel_order = MagicMock(return_value=False)
         protective_fill_event = ExchangeOrderEvent(
             status="filled",
@@ -2609,7 +2781,10 @@ class TestAuditedExecution:
         assert first["action"] == "unresolved_linked_conditional_cancel_failed"
         assert take_profit.status == OrderStatus.SUBMITTED.value
 
-        mock_exchange_adapter.cancel_order = original_cancel
+        mock_exchange_adapter.cancel_order_by_client_id = original_cancel_by_client_id
+        mock_exchange_adapter.cancel_order = MagicMock(
+            wraps=mock_exchange_adapter.cancel_order
+        )
         replay = engine.process_exchange_order_event(protective_fill_event)
 
         assert replay["action"] == "applied"

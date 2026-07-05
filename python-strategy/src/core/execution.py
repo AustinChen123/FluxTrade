@@ -20,7 +20,10 @@ from src.core.audit_service import (
     write_signal_audit_outcome,
     write_system_event,
 )
-from src.core.client_order_id import generate_client_order_id, parse_client_order_id
+from src.core.client_order_id import (
+    generate_client_order_id,
+    parse_client_order_id,
+)
 
 
 class FillDeltaState(str, Enum):
@@ -125,6 +128,7 @@ class ExecutionEngine:
         if self._db_session_factory is None:
             raise RuntimeError("reconcile_recoverable_client_orders requires db_session_factory")
 
+        protection_recovery = self.place_pending_protection_for_filled_entries()
         orders = self.list_recoverable_client_orders()
         results = []
         result_counts: dict[str, int] = {}
@@ -177,7 +181,6 @@ class ExecutionEngine:
                 }
             )
 
-        protection_recovery = self.place_pending_protection_for_filled_entries()
         reconciliation_unresolved_count = sum(
             1 for result in results if result["unresolved"]
         )
@@ -1515,6 +1518,10 @@ class ExecutionEngine:
                 order_type="stop_loss",
                 quantity=qty,
                 trigger_price=signal.stop_loss,
+                client_order_id=self._conditional_client_order_id(
+                    entry_order.client_order_id,
+                    "sl",
+                ),
             )
             self._attach_min_notional_reference_price(sl_order, candle)
             conditional_orders.append(sl_order)
@@ -1527,6 +1534,10 @@ class ExecutionEngine:
                 order_type="take_profit",
                 quantity=qty,
                 trigger_price=signal.take_profit,
+                client_order_id=self._conditional_client_order_id(
+                    entry_order.client_order_id,
+                    "tp",
+                ),
             )
             self._attach_min_notional_reference_price(tp_order, candle)
             conditional_orders.append(tp_order)
@@ -1544,6 +1555,10 @@ class ExecutionEngine:
                 order_type="trailing_stop",
                 quantity=qty,
                 trigger_price=signal.stop_loss,
+                client_order_id=self._conditional_client_order_id(
+                    entry_order.client_order_id,
+                    "tr",
+                ),
             )
             ts_order._trailing_distance = signal.trailing_distance
             self._attach_min_notional_reference_price(ts_order, candle)
@@ -1561,6 +1576,20 @@ class ExecutionEngine:
             self.order_manager.repo.update_order(conditional_order)
 
         return conditional_orders
+
+    @staticmethod
+    def _conditional_client_order_id(
+        entry_client_order_id: str | None,
+        suffix: str,
+    ) -> str | None:
+        if not entry_client_order_id:
+            return None
+        parts = parse_client_order_id(entry_client_order_id)
+        conditional_id = (
+            f"{parts.strategy_id}-{parts.instance_id}-{suffix}-{parts.ts_ns}"
+        )
+        parse_client_order_id(conditional_id)
+        return conditional_id
 
     def _place_pending_conditional_orders_for_entry(self, entry_order) -> list[dict]:
         if entry_order.type not in {"market", "limit"}:
@@ -1604,7 +1633,55 @@ class ExecutionEngine:
         for order in pending:
             order.quantity = protected_quantity
             self.order_manager.repo.update_order(order)
-        return self._place_conditional_orders(pending)
+        failures: list[dict] = []
+        placement_candidates = []
+        for order in pending:
+            lookup_failure = self._adopt_pending_conditional_order_before_submit(order)
+            if lookup_failure is None:
+                if order.status == OrderStatus.NEW.value:
+                    placement_candidates.append(order)
+                continue
+            failures.append(lookup_failure)
+        if placement_candidates:
+            failures.extend(self._place_conditional_orders(placement_candidates))
+        return failures
+
+    def _adopt_pending_conditional_order_before_submit(self, order) -> dict | None:
+        if not order.client_order_id:
+            return None
+        try:
+            snapshot = self.adapter.get_order_by_client_id(
+                order.client_order_id,
+                order.product_id,
+                order_type=order.type,
+            )
+        except ExchangeOrderLookupUnsupported:
+            return {
+                "order_id": str(order.id),
+                "order_type": order.type,
+                "reason": "verification_blocked_order_lookup_unsupported",
+            }
+        except ExchangeError as e:
+            return {
+                "order_id": str(order.id),
+                "order_type": order.type,
+                "reason": "verification_blocked_order_lookup_failed",
+                "error": str(e),
+            }
+        if snapshot is None:
+            return None
+
+        event_result = self.process_exchange_order_event(
+            self._exchange_snapshot_to_order_event(order.product_id, snapshot)
+        )
+        if event_result["action"] == "applied":
+            return None
+        return {
+            "order_id": str(order.id),
+            "order_type": order.type,
+            "reason": str(event_result["action"]),
+            "event_result": event_result,
+        }
 
     def place_pending_protection_for_filled_entries(self) -> dict[str, object]:
         """Retry NEW pending protective orders whose entry already has fills.
@@ -1795,7 +1872,11 @@ class ExecutionEngine:
         """Submit prevalidated SL/TP/Trailing orders linked via OCO to each other."""
         failures = []
         for order in conditional_orders:
+            submit_attempted = False
             try:
+                if order.client_order_id:
+                    self.order_manager.mark_submitted_unconfirmed(order)
+                submit_attempted = True
                 ex_id = self.adapter.place_order(order)
                 self.order_manager.mark_submitted(order, ex_id)
             except ExchangeError as e:
@@ -1805,14 +1886,56 @@ class ExecutionEngine:
                     "trailing_stop": "trailing stop",
                 }.get(order.type, order.type)
                 self.logger.error("Failed to place %s order: %s", label, e)
-                failures.append(
-                    {
-                        "order_id": str(order.id),
-                        "order_type": order.type,
-                        "reason": str(e),
-                    }
+                failures.extend(
+                    self._handle_conditional_order_placement_error(
+                        order,
+                        e,
+                        submit_attempted=submit_attempted,
+                    )
                 )
         return failures
+
+    def _handle_conditional_order_placement_error(
+        self,
+        order,
+        error: ExchangeError,
+        *,
+        submit_attempted: bool,
+    ) -> list[dict]:
+        adoption = self._adopt_order_after_ambiguous_submit_error(
+            order,
+            error,
+            submit_attempted=submit_attempted,
+        )
+        if adoption["action"] == "adopted":
+            return []
+        if adoption.get("terminal"):
+            return [
+                {
+                    "order_id": str(order.id),
+                    "order_type": order.type,
+                    "reason": "terminal_after_submit_error",
+                    "adoption": adoption,
+                }
+            ]
+        if adoption.get("verification_blocked") or adoption.get("unresolved"):
+            return [
+                {
+                    "order_id": str(order.id),
+                    "order_type": order.type,
+                    "reason": str(adoption["action"]),
+                    "adoption": adoption,
+                }
+            ]
+        self.order_manager.fail_order(order, str(error))
+        return [
+            {
+                "order_id": str(order.id),
+                "order_type": order.type,
+                "reason": str(error),
+                "adoption": adoption,
+            }
+        ]
 
     def _try_write_conditional_order_event_warning(
         self,
