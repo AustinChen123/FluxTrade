@@ -416,7 +416,25 @@ class StrategyEngine:
             for row in rows
         ]
         self._signal_processor.warm_up(instance, candles)
+        self._sync_strategy_position_state(instance)
         return len(candles)
+
+    def _sync_strategy_position_state(self, instance: BaseStrategy) -> None:
+        """Align warmed strategy trade flags with the current account position."""
+        try:
+            position = self.account_service.get_position(
+                instance.strategy_id,
+                instance.product_id,
+            )
+        except Exception as e:
+            logger.warning(
+                "Could not sync strategy position state for %s: %s",
+                instance.strategy_id,
+                e,
+            )
+            return
+        position_side = None if position is None else getattr(position.side, "value", position.side)
+        self._signal_processor.set_position_state(instance, position_side)
 
     def start_strategy(self, strategy_id: str):
         """Backward-compatible wrapper for legacy callers."""

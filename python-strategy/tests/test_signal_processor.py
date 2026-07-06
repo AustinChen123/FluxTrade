@@ -131,6 +131,56 @@ def test_warm_up_routes_target_strategy_without_emitting_signals() -> None:
     execution.execute_signal.assert_not_called()
 
 
+def test_warm_up_restores_trade_state_after_dropped_signals() -> None:
+    class StatefulStrategy(DummyStrategy):
+        def __init__(self):
+            super().__init__("s1")
+            self.position = 0
+            self._in_position = False
+
+        def on_candle(self, candle: Candlestick):
+            self.candles_received.append(candle)
+            self.position = 1
+            self._in_position = True
+            return make_signal("s1", SignalType.LONG)
+
+    strategy = StatefulStrategy()
+    registry = StrategyRegistry()
+    registry.register(strategy)
+    execution = MagicMock()
+    processor = SignalProcessor(registry, execution)
+
+    processor.warm_up(strategy, [make_candle()])
+
+    assert strategy.candles_received == [make_candle()]
+    assert strategy.position == 0
+    assert strategy._in_position is False
+    execution.execute_signal.assert_not_called()
+
+
+def test_set_position_state_maps_common_strategy_flags() -> None:
+    class StatefulStrategy(DummyStrategy):
+        def __init__(self):
+            super().__init__("s1")
+            self.position = 99
+            self._in_position = True
+
+    processor = SignalProcessor(StrategyRegistry(), MagicMock())
+
+    cases = [
+        (None, 0, False),
+        ("LONG", 1, True),
+        ("SHORT", -1, True),
+    ]
+    for position_side, expected_position, expected_in_position in cases:
+        strategy = StatefulStrategy()
+
+        processor.set_position_state(strategy, position_side)
+
+        assert strategy.position == expected_position
+        assert strategy._in_position is expected_in_position
+
+
 def test_on_candle_skips_timeframe_mismatch() -> None:
     strategy = DummyStrategy("s1", timeframe="5m", result=make_signal())
     registry = StrategyRegistry()

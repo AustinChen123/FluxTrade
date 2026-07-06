@@ -995,6 +995,8 @@ class TestStrategyWarmup:
                 self.product_id = product_id
                 self._requirements = StrategyRequirements(product_id, "1m", 2)
                 self.candles_received = []
+                self.position = 0
+                self._in_position = False
 
             @property
             def requirements(self):
@@ -1002,6 +1004,8 @@ class TestStrategyWarmup:
 
             def on_candle(self, candle):
                 self.candles_received.append(candle)
+                self.position = 1
+                self._in_position = True
                 return Signal(
                     strategy_id=self.strategy_id,
                     product_id=self.product_id,
@@ -1071,8 +1075,35 @@ class TestStrategyWarmup:
             1704067200000,
             1704067260000,
         ]
+        assert instance.position == 0
+        assert instance._in_position is False
         engine.process_signal.assert_not_called()
         engine._strategy_state_manager.transition_to_running.assert_called_once()
+
+    def test_warmup_syncs_strategy_trade_state_to_existing_position(self, engine):
+        """A restarted strategy should reflect the real position after warm-up."""
+        class StatefulStrategy:
+            strategy_id = "test"
+            product_id = "BINANCE:BTCUSDT-PERP"
+            position = 0
+            _in_position = False
+
+        strategy = StatefulStrategy()
+        engine.account_service.set_position(
+            Position(
+                strategy_id="test",
+                product_id="BINANCE:BTCUSDT-PERP",
+                side=PositionSide.LONG,
+                quantity=Decimal("0.01"),
+                entry_price=Decimal("42000"),
+                unrealized_pnl=Decimal("0"),
+            )
+        )
+
+        engine._sync_strategy_position_state(strategy)
+
+        assert strategy.position == 1
+        assert strategy._in_position is True
 
 
 # =============================================================================
