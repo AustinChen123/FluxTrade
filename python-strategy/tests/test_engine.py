@@ -481,8 +481,8 @@ class TestProcessSignal:
 
         engine.execution_engine.execute_signal.assert_called_once()
 
-    def test_same_direction_entry_with_existing_position_is_blocked(self, engine):
-        """Restart-replayed entry should not duplicate an existing position."""
+    def test_same_direction_entry_with_existing_position_still_uses_risk(self, engine):
+        """Scale-ins are normal live signals and stay under risk-manager control."""
         signal = Signal(
             strategy_id="test",
             product_id="BINANCE:BTCUSDT-PERP",
@@ -506,8 +506,8 @@ class TestProcessSignal:
 
         engine.process_signal(signal, _make_candle())
 
-        engine.risk_manager.check_risk.assert_not_called()
-        engine.execution_engine.execute_signal.assert_not_called()
+        engine.risk_manager.check_risk.assert_called_once()
+        engine.execution_engine.execute_signal.assert_called_once()
 
     def test_exit_signal_with_existing_position_still_executes(self, engine):
         """Restart idempotency only blocks duplicate entries, not exits."""

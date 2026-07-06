@@ -10,7 +10,7 @@ from concurrent.futures import ThreadPoolExecutor
 from datetime import UTC, datetime
 from typing import Callable, ContextManager, List, Union, Optional, Dict, Type
 from sqlalchemy.orm import Session
-from src.core.models import Candlestick, Trade, Signal, SignalType, StrategyStatus, PositionSide
+from src.core.models import Candlestick, Trade, Signal, SignalType, StrategyStatus
 from src.core.orm_models import Candlestick as ORMCandlestick
 from src.core.orm_models import StrategyState
 from src.strategies.base import BaseStrategy
@@ -415,7 +415,7 @@ class StrategyEngine:
             )
             for row in rows
         ]
-        self._signal_processor.warm_up(candles)
+        self._signal_processor.warm_up(instance, candles)
         return len(candles)
 
     def start_strategy(self, strategy_id: str):
@@ -602,14 +602,10 @@ class StrategyEngine:
         structlog.contextvars.bind_contextvars(trace_id=uuid.uuid4().hex[:16])
 
         current_price = candle.close if candle else None
-        duplicate_reason = self._same_direction_entry_reason(signal)
-        if duplicate_reason is not None:
-            is_passed, risk_msg = False, duplicate_reason
-        else:
-            is_passed, risk_msg = self.risk_manager.check_risk(
-                signal,
-                current_price=current_price,
-            )
+        is_passed, risk_msg = self.risk_manager.check_risk(
+            signal,
+            current_price=current_price,
+        )
 
         risk_status = "PASS" if is_passed else "REJECT"
         SIGNALS_TOTAL.labels(
@@ -635,38 +631,6 @@ class StrategyEngine:
         )
         with self._db_session_factory() as db:
             commit_signal_audit(db, audit)
-
-    def _same_direction_entry_reason(self, signal: Signal) -> str | None:
-        """Reject restart-replayed entries when the position already exists."""
-        expected_side: PositionSide | None = None
-        if signal.type == SignalType.LONG:
-            expected_side = PositionSide.LONG
-        elif signal.type == SignalType.SHORT:
-            expected_side = PositionSide.SHORT
-        else:
-            return None
-
-        try:
-            position = self.account_service.get_position(
-                signal.strategy_id,
-                signal.product_id,
-            )
-        except Exception as e:
-            logger.warning(
-                "Could not check existing position for restart idempotency: %s",
-                e,
-            )
-            return None
-        if position is None or position.quantity <= 0:
-            return None
-
-        position_side = getattr(position.side, "value", position.side)
-        if position_side != expected_side.value:
-            return None
-        return (
-            "REJECT: restart_idempotency_existing_position "
-            f"side={position_side} quantity={position.quantity}"
-        )
 
     def shutdown(self, timeout: float = 30.0):
         """Graceful shutdown: stop threads, drain executor, close Redis."""

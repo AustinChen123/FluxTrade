@@ -63,10 +63,17 @@ class SignalProcessor:
             except Exception:
                 logger.exception("Error processing strategy %s", strategy.strategy_id)
 
-    def warm_up(self, candles: list[Candlestick]) -> None:
-        """Replay candles through strategies without emitting orders."""
+    def warm_up(self, strategy: BaseStrategy, candles: list[Candlestick]) -> None:
+        """Replay candles through one strategy without emitting orders."""
         for candle in candles:
-            self.on_candle(candle, emit_signals=False, respect_state=False)
+            if strategy.product_id != candle.product_id:
+                continue
+            if strategy.requirements.timeframe != candle.timeframe:
+                continue
+            try:
+                self._dispatch_to_strategy(strategy, candle)
+            except Exception:
+                logger.exception("Error warming up strategy %s", strategy.strategy_id)
 
     def on_trade(self, trade: Trade) -> None:
         """Route a trade to matching, running strategies."""

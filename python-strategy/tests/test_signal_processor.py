@@ -112,19 +112,22 @@ def test_on_candle_routes_matching_strategy() -> None:
     execution.execute_signal.assert_called_once_with(signal, candle)
 
 
-def test_warm_up_routes_candles_without_emitting_signals() -> None:
+def test_warm_up_routes_target_strategy_without_emitting_signals() -> None:
     signal = make_signal()
     strategy = DummyStrategy("s1", result=signal)
+    other = DummyStrategy("s2", result=make_signal("s2"))
     registry = StrategyRegistry()
     registry.register(strategy)
+    registry.register(other)
     execution = MagicMock()
     state_manager = DummyStateManager(running=set())
     processor = SignalProcessor(registry, execution, state_manager)
     candle = make_candle()
 
-    processor.warm_up([candle])
+    processor.warm_up(strategy, [candle])
 
     assert strategy.candles_received == [candle]
+    assert other.candles_received == []
     execution.execute_signal.assert_not_called()
 
 
