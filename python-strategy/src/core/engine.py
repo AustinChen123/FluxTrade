@@ -396,11 +396,10 @@ class StrategyEngine:
         )
         rows = sorted(rows, key=lambda row: row.timestamp)
         if len(rows) < lookback:
-            logger.warning(
-                "Warm-up replay for %s has %s/%s candles",
-                instance.strategy_id,
-                len(rows),
-                lookback,
+            raise RuntimeError(
+                "warmup_insufficient_candles: "
+                f"strategy_id={instance.strategy_id} "
+                f"available={len(rows)} required={lookback}"
             )
         candles = [
             Candlestick(
@@ -434,7 +433,13 @@ class StrategyEngine:
             )
             return
         position_side = None if position is None else getattr(position.side, "value", position.side)
-        self._signal_processor.set_position_state(instance, position_side)
+        applied = self._signal_processor.set_position_state(instance, position_side)
+        if position_side is not None and not applied:
+            logger.warning(
+                "Strategy %s has live position side=%s but no position-state sync hook",
+                instance.strategy_id,
+                position_side,
+            )
 
     def start_strategy(self, strategy_id: str):
         """Backward-compatible wrapper for legacy callers."""

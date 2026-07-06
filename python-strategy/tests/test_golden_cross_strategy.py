@@ -91,6 +91,22 @@ def test_golden_cross_strategy_uses_configured_timeframe_requirement():
     assert requirements.lookback_window == 3
 
 
+def test_golden_cross_strategy_syncs_position_state_explicitly():
+    strategy = GoldenCrossStrategy(
+        strategy_id="golden",
+        product_id=PRODUCT_ID,
+        short_window=2,
+        long_window=3,
+        timeframe=TIMEFRAME,
+    )
+
+    assert strategy.sync_position_state("LONG") is True
+    assert strategy._in_position is True
+
+    assert strategy.sync_position_state(None) is True
+    assert strategy._in_position is False
+
+
 def test_golden_cross_strategy_rejects_invalid_parameters():
     with pytest.raises(ValueError, match="short_window must be smaller"):
         GoldenCrossStrategy(

@@ -872,10 +872,12 @@ class TestStartStrategy:
         mock_db = MagicMock()
         mock_db.query.return_value.filter.return_value.first.return_value = mock_state
         engine._db_session_factory = lambda: nullcontext(mock_db)
+        engine._warm_up_strategy_instance = MagicMock(return_value=0)
 
         engine.start_strategy("test.py::MyStrat")
 
         assert "test.py::MyStrat" in engine.strategy_instances
+        engine._warm_up_strategy_instance.assert_called_once()
         engine._strategy_state_manager.transition_to_running.assert_called_once_with(
             "test.py::MyStrat",
             actor="operator",
@@ -1125,6 +1127,58 @@ class TestStrategyWarmup:
         engine._strategy_state_manager.transition_to_running.assert_not_called()
         engine._strategy_state_manager.transition_to_error.assert_called_once()
         assert "warm-up replay failed" in state.performance_json
+
+    def test_activate_strategy_fails_closed_when_warmup_data_is_insufficient(self, engine):
+        """Warm-up must have the declared lookback before activation."""
+        class WarmupStrategy:
+            def __init__(self, strategy_id, product_id):
+                from src.strategies.base import StrategyRequirements
+
+                self.strategy_id = strategy_id
+                self.product_id = product_id
+                self._requirements = StrategyRequirements(product_id, "1m", 2)
+
+            @property
+            def requirements(self):
+                return self._requirements
+
+            def on_candle(self, candle):
+                return Signal(
+                    strategy_id=self.strategy_id,
+                    product_id=self.product_id,
+                    timeframe="1m",
+                    timestamp=candle.timestamp,
+                    type=SignalType.NO_SIGNAL,
+                )
+
+        state = MagicMock()
+        state.status = StrategyStatus.READY
+        state.config_json = "{}"
+        rows = [
+            ORMCandlestick(
+                product_id="BINANCE:BTCUSDT-PERP",
+                timeframe="1m",
+                timestamp=1704067200000,
+                open=Decimal("41900"),
+                high=Decimal("42100"),
+                low=Decimal("41800"),
+                close=Decimal("42000"),
+                volume=Decimal("10"),
+            )
+        ]
+        mock_db = MagicMock()
+        mock_db.query.side_effect = lambda model: self._FakeQuery(model, state, rows)
+        engine._db_session_factory = lambda: nullcontext(mock_db)
+        engine.loaded_classes["test.py::WarmupStrategy"] = WarmupStrategy
+        engine._strategy_state_manager.transition_to_running = MagicMock()
+        engine._strategy_state_manager.transition_to_error = MagicMock()
+
+        engine.activate_strategy("test.py::WarmupStrategy")
+
+        assert "test.py::WarmupStrategy" not in engine.strategy_instances
+        engine._strategy_state_manager.transition_to_running.assert_not_called()
+        engine._strategy_state_manager.transition_to_error.assert_called_once()
+        assert "warmup_insufficient_candles" in state.performance_json
 
     def test_warmup_syncs_strategy_trade_state_to_existing_position(self, engine):
         """A restarted strategy should reflect the real position after warm-up."""

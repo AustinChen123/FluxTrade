@@ -76,11 +76,17 @@ class SignalProcessor:
         finally:
             self._restore_trade_state(strategy, trade_state)
 
-    def set_position_state(self, strategy: BaseStrategy, position_side: str | None) -> None:
+    def set_position_state(self, strategy: BaseStrategy, position_side: str | None) -> bool:
         """Align common strategy trade-state flags with actual account position."""
+        sync_hook = getattr(strategy, "sync_position_state", None)
+        if callable(sync_hook) and sync_hook(position_side):
+            return True
+
+        applied = False
         normalized_side = position_side.upper() if position_side else None
         if hasattr(strategy, "_in_position"):
             setattr(strategy, "_in_position", normalized_side is not None)
+            applied = True
         if hasattr(strategy, "position"):
             if normalized_side == "LONG":
                 setattr(strategy, "position", 1)
@@ -88,6 +94,8 @@ class SignalProcessor:
                 setattr(strategy, "position", -1)
             else:
                 setattr(strategy, "position", 0)
+            applied = True
+        return applied
 
     @staticmethod
     def _snapshot_trade_state(strategy: BaseStrategy) -> dict[str, Any]:

@@ -40,6 +40,14 @@ class BaseStrategy(ABC):
         """Optional: Strategies can override to react to individual trades."""
         return None
 
+    def sync_position_state(self, position_side: str | None) -> bool:
+        """Optional hook to align internal trade-state after restart warm-up.
+
+        Return True when the strategy consumed the position state. The default
+        is a no-op so existing strategies remain source-compatible.
+        """
+        return False
+
     def run_vectorized(self, df: pd.DataFrame) -> pd.DataFrame:
         """
         Run strategy in vectorized mode using Pandas.

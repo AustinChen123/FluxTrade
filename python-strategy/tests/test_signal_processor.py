@@ -208,6 +208,27 @@ def test_set_position_state_maps_common_strategy_flags() -> None:
         assert strategy._in_position is expected_in_position
 
 
+def test_set_position_state_prefers_explicit_strategy_hook() -> None:
+    class HookStrategy(DummyStrategy):
+        def __init__(self):
+            super().__init__("s1")
+            self.position = 99
+            self.synced_side = None
+
+        def sync_position_state(self, position_side: str | None) -> bool:
+            self.synced_side = position_side
+            return True
+
+    strategy = HookStrategy()
+    processor = SignalProcessor(StrategyRegistry(), MagicMock())
+
+    applied = processor.set_position_state(strategy, "LONG")
+
+    assert applied is True
+    assert strategy.synced_side == "LONG"
+    assert strategy.position == 99
+
+
 def test_on_candle_skips_timeframe_mismatch() -> None:
     strategy = DummyStrategy("s1", timeframe="5m", result=make_signal())
     registry = StrategyRegistry()

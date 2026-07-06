@@ -137,6 +137,10 @@ class GoldenCrossStrategy(BaseStrategy):
             quantity=self.quantity,
         )
 
+    def sync_position_state(self, position_side: str | None) -> bool:
+        self._in_position = position_side == "LONG"
+        return True
+
     def _signal(
         self,
         candle: Candlestick,
