@@ -10,7 +10,8 @@ from concurrent.futures import ThreadPoolExecutor
 from datetime import UTC, datetime
 from typing import Callable, ContextManager, List, Union, Optional, Dict, Type
 from sqlalchemy.orm import Session
-from src.core.models import Candlestick, Trade, Signal, SignalType, StrategyStatus
+from src.core.models import Candlestick, Trade, Signal, SignalType, StrategyStatus, PositionSide
+from src.core.orm_models import Candlestick as ORMCandlestick
 from src.core.orm_models import StrategyState
 from src.strategies.base import BaseStrategy
 from src.core.risk_manager import RiskManager, AccountService
@@ -146,6 +147,7 @@ class StrategyEngine:
         
         # Initial scan to discover strategies
         self.scan_strategies()
+        self._restore_active_strategies_on_startup()
 
     def _initialize_strategy_state_cache_on_startup(self) -> None:
         """Load strategy lifecycle state into the manager cache."""
@@ -245,6 +247,29 @@ class StrategyEngine:
                 db.commit()
         logger.info("✅ Scan Complete. Total loaded: %s", len(self.loaded_classes))
 
+    def _restore_active_strategies_on_startup(self) -> None:
+        """Re-instantiate strategies that were ACTIVE before process restart."""
+        with self._db_session_factory() as db:
+            active_states = (
+                db.query(StrategyState)
+                .filter(StrategyState.status == StrategyStatus.ACTIVE.value)
+                .all()
+            )
+
+        for state in active_states:
+            if state.strategy_id not in self.loaded_classes:
+                logger.warning(
+                    "Skipping startup restore for %s: strategy class not loaded",
+                    state.strategy_id,
+                )
+                continue
+            self.activate_strategy(
+                state.strategy_id,
+                actor="system",
+                reason="startup_restore",
+                force=True,
+            )
+
     def test_run_strategy(self, strategy_id: str, days: int):
         """
         Performs a test run/warm-up for a strategy.
@@ -324,6 +349,7 @@ class StrategyEngine:
                 strategy_cls = self.loaded_classes[strategy_id]
                 instance = strategy_cls(strategy_id, product_id)
                 self._register_strategy_instance(instance)
+                self._warm_up_strategy_instance(db, instance)
                 state.uptime_start = int(time.time() * 1000)
                 db.commit()
                 logger.info("🔥 Strategy %s is now ACTIVE for %s", strategy_id, product_id)
@@ -350,6 +376,47 @@ class StrategyEngine:
         except Exception as e:
             self._unregister_strategy_instance(strategy_id)
             logger.error("❌ Failed to transition %s to ACTIVE: %s", strategy_id, e)
+
+    def _warm_up_strategy_instance(self, db: Session, instance: BaseStrategy) -> int:
+        """Replay recent candles into a strategy without emitting signals."""
+        reqs = instance.requirements
+        lookback = max(int(reqs.lookback_window), 0)
+        if lookback == 0:
+            return 0
+
+        rows = (
+            db.query(ORMCandlestick)
+            .filter(
+                ORMCandlestick.product_id == reqs.product_id,
+                ORMCandlestick.timeframe == reqs.timeframe,
+            )
+            .order_by(ORMCandlestick.timestamp.desc())
+            .limit(lookback)
+            .all()
+        )
+        rows = sorted(rows, key=lambda row: row.timestamp)
+        if len(rows) < lookback:
+            logger.warning(
+                "Warm-up replay for %s has %s/%s candles",
+                instance.strategy_id,
+                len(rows),
+                lookback,
+            )
+        candles = [
+            Candlestick(
+                product_id=row.product_id,
+                timeframe=row.timeframe,
+                timestamp=row.timestamp,
+                open=row.open,
+                high=row.high,
+                low=row.low,
+                close=row.close,
+                volume=row.volume,
+            )
+            for row in rows
+        ]
+        self._signal_processor.warm_up(candles)
+        return len(candles)
 
     def start_strategy(self, strategy_id: str):
         """Backward-compatible wrapper for legacy callers."""
@@ -535,7 +602,14 @@ class StrategyEngine:
         structlog.contextvars.bind_contextvars(trace_id=uuid.uuid4().hex[:16])
 
         current_price = candle.close if candle else None
-        is_passed, risk_msg = self.risk_manager.check_risk(signal, current_price=current_price)
+        duplicate_reason = self._same_direction_entry_reason(signal)
+        if duplicate_reason is not None:
+            is_passed, risk_msg = False, duplicate_reason
+        else:
+            is_passed, risk_msg = self.risk_manager.check_risk(
+                signal,
+                current_price=current_price,
+            )
 
         risk_status = "PASS" if is_passed else "REJECT"
         SIGNALS_TOTAL.labels(
@@ -561,6 +635,38 @@ class StrategyEngine:
         )
         with self._db_session_factory() as db:
             commit_signal_audit(db, audit)
+
+    def _same_direction_entry_reason(self, signal: Signal) -> str | None:
+        """Reject restart-replayed entries when the position already exists."""
+        expected_side: PositionSide | None = None
+        if signal.type == SignalType.LONG:
+            expected_side = PositionSide.LONG
+        elif signal.type == SignalType.SHORT:
+            expected_side = PositionSide.SHORT
+        else:
+            return None
+
+        try:
+            position = self.account_service.get_position(
+                signal.strategy_id,
+                signal.product_id,
+            )
+        except Exception as e:
+            logger.warning(
+                "Could not check existing position for restart idempotency: %s",
+                e,
+            )
+            return None
+        if position is None or position.quantity <= 0:
+            return None
+
+        position_side = getattr(position.side, "value", position.side)
+        if position_side != expected_side.value:
+            return None
+        return (
+            "REJECT: restart_idempotency_existing_position "
+            f"side={position_side} quantity={position.quantity}"
+        )
 
     def shutdown(self, timeout: float = 30.0):
         """Graceful shutdown: stop threads, drain executor, close Redis."""

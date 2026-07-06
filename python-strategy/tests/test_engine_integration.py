@@ -11,6 +11,7 @@ from sqlalchemy import create_engine, select, text
 from sqlalchemy.orm import sessionmaker
 
 from src.core.models import Candlestick, Signal, SignalType, StrategyStatus
+from src.core.orm_models import Candlestick as ORMCandlestick
 from src.core.orm_models import Strategy, StrategyState, StrategyStateTransition
 from src.strategies.base import BaseStrategy, StrategyRequirements
 
@@ -55,6 +56,7 @@ def make_candle(
 def _sqlite_lifecycle_session_factory(tmp_path):
     engine = create_engine(f"sqlite:///{tmp_path / 'engine_lifecycle.db'}")
     for table in [
+        ORMCandlestick.__table__,
         Strategy.__table__,
         StrategyState.__table__,
     ]:

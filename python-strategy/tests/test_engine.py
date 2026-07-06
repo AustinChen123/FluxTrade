@@ -17,7 +17,8 @@ from unittest.mock import MagicMock, call, patch
 
 import pytest
 
-from src.core.models import Candlestick, Signal, SignalType
+from src.core.models import Candlestick, Position, PositionSide, Signal, SignalType, StrategyStatus
+from src.core.orm_models import Candlestick as ORMCandlestick, StrategyState
 from src.core.daily_nav_snapshot import DailyNavSnapshotService
 from src.core.engine import StrategyEngine
 from src.core.strategy_state_manager import StrategyStateManager
@@ -213,6 +214,31 @@ class TestEngineInit:
         engine._reconcile_recoverable_orders_on_startup()
 
         engine.execution_engine.reconcile_recoverable_client_orders.assert_called_once_with()
+
+    def test_startup_restores_loaded_active_strategies(self, engine):
+        """Restart should re-instantiate previously ACTIVE strategies."""
+        active_state = MagicMock()
+        active_state.strategy_id = "test.py::ActiveStrategy"
+        missing_state = MagicMock()
+        missing_state.strategy_id = "test.py::MissingStrategy"
+
+        mock_db = MagicMock()
+        mock_db.query.return_value.filter.return_value.all.return_value = [
+            active_state,
+            missing_state,
+        ]
+        engine._db_session_factory = lambda: nullcontext(mock_db)
+        engine.loaded_classes["test.py::ActiveStrategy"] = MagicMock()
+        engine.activate_strategy = MagicMock()
+
+        engine._restore_active_strategies_on_startup()
+
+        engine.activate_strategy.assert_called_once_with(
+            "test.py::ActiveStrategy",
+            actor="system",
+            reason="startup_restore",
+            force=True,
+        )
 
 
 # =============================================================================
@@ -453,6 +479,62 @@ class TestProcessSignal:
 
         engine.process_signal(signal, _make_candle())
 
+        engine.execution_engine.execute_signal.assert_called_once()
+
+    def test_same_direction_entry_with_existing_position_is_blocked(self, engine):
+        """Restart-replayed entry should not duplicate an existing position."""
+        signal = Signal(
+            strategy_id="test",
+            product_id="BINANCE:BTCUSDT-PERP",
+            timeframe="1m",
+            timestamp=1704067200000,
+            type=SignalType.LONG,
+            value=Decimal("42000"),
+        )
+        engine.account_service.set_position(
+            Position(
+                strategy_id="test",
+                product_id="BINANCE:BTCUSDT-PERP",
+                side=PositionSide.LONG,
+                quantity=Decimal("0.01"),
+                entry_price=Decimal("42000"),
+                unrealized_pnl=Decimal("0"),
+            )
+        )
+        engine.risk_manager.check_risk = MagicMock(return_value=(True, "PASS"))
+        engine.execution_engine.execute_signal = MagicMock()
+
+        engine.process_signal(signal, _make_candle())
+
+        engine.risk_manager.check_risk.assert_not_called()
+        engine.execution_engine.execute_signal.assert_not_called()
+
+    def test_exit_signal_with_existing_position_still_executes(self, engine):
+        """Restart idempotency only blocks duplicate entries, not exits."""
+        signal = Signal(
+            strategy_id="test",
+            product_id="BINANCE:BTCUSDT-PERP",
+            timeframe="1m",
+            timestamp=1704067200000,
+            type=SignalType.EXIT_LONG,
+            value=Decimal("42000"),
+        )
+        engine.account_service.set_position(
+            Position(
+                strategy_id="test",
+                product_id="BINANCE:BTCUSDT-PERP",
+                side=PositionSide.LONG,
+                quantity=Decimal("0.01"),
+                entry_price=Decimal("42000"),
+                unrealized_pnl=Decimal("0"),
+            )
+        )
+        engine.risk_manager.check_risk = MagicMock(return_value=(True, "PASS"))
+        engine.execution_engine.execute_signal = MagicMock(return_value="order-123")
+
+        engine.process_signal(signal, _make_candle())
+
+        engine.risk_manager.check_risk.assert_called_once()
         engine.execution_engine.execute_signal.assert_called_once()
 
     def test_risk_reject_skips_execution(self, engine):
@@ -899,6 +981,98 @@ class TestTestRunStrategy:
         assert mock_state.status == "ERROR"
         assert "warm-up failed" in mock_state.last_error_message
         assert mock_state.entered_error_at is not None
+
+
+class TestStrategyWarmup:
+
+    def test_activate_strategy_replays_recent_candles_without_orders(self, engine):
+        """Activation warm-up rebuilds strategy memory before live signals."""
+        class WarmupStrategy:
+            def __init__(self, strategy_id, product_id):
+                from src.strategies.base import StrategyRequirements
+
+                self.strategy_id = strategy_id
+                self.product_id = product_id
+                self._requirements = StrategyRequirements(product_id, "1m", 2)
+                self.candles_received = []
+
+            @property
+            def requirements(self):
+                return self._requirements
+
+            def on_candle(self, candle):
+                self.candles_received.append(candle)
+                return Signal(
+                    strategy_id=self.strategy_id,
+                    product_id=self.product_id,
+                    timeframe="1m",
+                    timestamp=candle.timestamp,
+                    type=SignalType.LONG,
+                    value=candle.close,
+                )
+
+        class FakeQuery:
+            def __init__(self, model, state, candles):
+                self.model = model
+                self.state = state
+                self.candles = candles
+
+            def filter(self, *args, **kwargs):
+                return self
+
+            def order_by(self, *args, **kwargs):
+                return self
+
+            def limit(self, *args, **kwargs):
+                return self
+
+            def first(self):
+                return self.state if self.model is StrategyState else None
+
+            def all(self):
+                return self.candles if self.model is ORMCandlestick else []
+
+        state = MagicMock()
+        state.status = StrategyStatus.READY
+        state.config_json = "{}"
+        rows = [
+            ORMCandlestick(
+                product_id="BINANCE:BTCUSDT-PERP",
+                timeframe="1m",
+                timestamp=1704067200000,
+                open=Decimal("41900"),
+                high=Decimal("42100"),
+                low=Decimal("41800"),
+                close=Decimal("42000"),
+                volume=Decimal("10"),
+            ),
+            ORMCandlestick(
+                product_id="BINANCE:BTCUSDT-PERP",
+                timeframe="1m",
+                timestamp=1704067260000,
+                open=Decimal("42000"),
+                high=Decimal("42200"),
+                low=Decimal("41900"),
+                close=Decimal("42100"),
+                volume=Decimal("11"),
+            ),
+        ]
+        mock_db = MagicMock()
+        mock_db.query.side_effect = lambda model: FakeQuery(model, state, rows)
+        engine._db_session_factory = lambda: nullcontext(mock_db)
+        engine.loaded_classes["test.py::WarmupStrategy"] = WarmupStrategy
+        engine.process_signal = MagicMock()
+        engine._strategy_state_manager.transition_to_running = MagicMock()
+
+        engine.activate_strategy("test.py::WarmupStrategy")
+
+        instance = engine.strategy_instances["test.py::WarmupStrategy"]
+        assert [c.timestamp for c in instance.candles_received] == [
+            1704067200000,
+            1704067260000,
+        ]
+        engine.process_signal.assert_not_called()
+        engine._strategy_state_manager.transition_to_running.assert_called_once()
 
 
 # =============================================================================

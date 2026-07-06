@@ -28,15 +28,27 @@ class SignalProcessor:
         self.state_manager = state_manager
         self.signal_handler = signal_handler
 
-    def on_candle(self, candle: Candlestick) -> None:
-        """Route a candle to matching, running strategies."""
+    def on_candle(
+        self,
+        candle: Candlestick,
+        *,
+        emit_signals: bool = True,
+        respect_state: bool = True,
+    ) -> None:
+        """Route a candle to matching, running strategies.
+
+        ``emit_signals=False`` is used for startup warm-up replay: strategy
+        memory is rebuilt from candles, but any generated signals are ignored.
+        """
         for strategy in self.registry.list_active():
             if strategy.product_id != candle.product_id:
                 continue
             if strategy.requirements.timeframe != candle.timeframe:
                 continue
-            if self.state_manager is not None and not self.state_manager.is_running(
-                strategy.strategy_id
+            if (
+                respect_state
+                and self.state_manager is not None
+                and not self.state_manager.is_running(strategy.strategy_id)
             ):
                 logger.debug(
                     "Skipping strategy %s because it is not running",
@@ -46,9 +58,15 @@ class SignalProcessor:
 
             try:
                 signals = self._dispatch_to_strategy(strategy, candle)
-                self._process_signals(strategy.strategy_id, signals, candle)
+                if emit_signals:
+                    self._process_signals(strategy.strategy_id, signals, candle)
             except Exception:
                 logger.exception("Error processing strategy %s", strategy.strategy_id)
+
+    def warm_up(self, candles: list[Candlestick]) -> None:
+        """Replay candles through strategies without emitting orders."""
+        for candle in candles:
+            self.on_candle(candle, emit_signals=False, respect_state=False)
 
     def on_trade(self, trade: Trade) -> None:
         """Route a trade to matching, running strategies."""
