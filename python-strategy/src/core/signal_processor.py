@@ -72,10 +72,7 @@ class SignalProcessor:
                     continue
                 if strategy.requirements.timeframe != candle.timeframe:
                     continue
-                try:
-                    self._dispatch_to_strategy(strategy, candle)
-                except Exception:
-                    logger.exception("Error warming up strategy %s", strategy.strategy_id)
+                self._dispatch_to_strategy(strategy, candle)
         finally:
             self._restore_trade_state(strategy, trade_state)
 

@@ -985,6 +985,27 @@ class TestTestRunStrategy:
 
 class TestStrategyWarmup:
 
+    class _FakeQuery:
+        def __init__(self, model, state, candles):
+            self.model = model
+            self.state = state
+            self.candles = candles
+
+        def filter(self, *args, **kwargs):
+            return self
+
+        def order_by(self, *args, **kwargs):
+            return self
+
+        def limit(self, *args, **kwargs):
+            return self
+
+        def first(self):
+            return self.state if self.model is StrategyState else None
+
+        def all(self):
+            return self.candles if self.model is ORMCandlestick else []
+
     def test_activate_strategy_replays_recent_candles_without_orders(self, engine):
         """Activation warm-up rebuilds strategy memory before live signals."""
         class WarmupStrategy:
@@ -1015,27 +1036,6 @@ class TestStrategyWarmup:
                     value=candle.close,
                 )
 
-        class FakeQuery:
-            def __init__(self, model, state, candles):
-                self.model = model
-                self.state = state
-                self.candles = candles
-
-            def filter(self, *args, **kwargs):
-                return self
-
-            def order_by(self, *args, **kwargs):
-                return self
-
-            def limit(self, *args, **kwargs):
-                return self
-
-            def first(self):
-                return self.state if self.model is StrategyState else None
-
-            def all(self):
-                return self.candles if self.model is ORMCandlestick else []
-
         state = MagicMock()
         state.status = StrategyStatus.READY
         state.config_json = "{}"
@@ -1062,7 +1062,7 @@ class TestStrategyWarmup:
             ),
         ]
         mock_db = MagicMock()
-        mock_db.query.side_effect = lambda model: FakeQuery(model, state, rows)
+        mock_db.query.side_effect = lambda model: self._FakeQuery(model, state, rows)
         engine._db_session_factory = lambda: nullcontext(mock_db)
         engine.loaded_classes["test.py::WarmupStrategy"] = WarmupStrategy
         engine.process_signal = MagicMock()
@@ -1079,6 +1079,52 @@ class TestStrategyWarmup:
         assert instance._in_position is False
         engine.process_signal.assert_not_called()
         engine._strategy_state_manager.transition_to_running.assert_called_once()
+
+    def test_activate_strategy_fails_closed_when_warmup_replay_fails(self, engine):
+        """Incomplete warm-up state must not transition a strategy to running."""
+        class FailingWarmupStrategy:
+            def __init__(self, strategy_id, product_id):
+                from src.strategies.base import StrategyRequirements
+
+                self.strategy_id = strategy_id
+                self.product_id = product_id
+                self._requirements = StrategyRequirements(product_id, "1m", 1)
+
+            @property
+            def requirements(self):
+                return self._requirements
+
+            def on_candle(self, candle):
+                raise RuntimeError("warm-up replay failed")
+
+        state = MagicMock()
+        state.status = StrategyStatus.READY
+        state.config_json = "{}"
+        rows = [
+            ORMCandlestick(
+                product_id="BINANCE:BTCUSDT-PERP",
+                timeframe="1m",
+                timestamp=1704067200000,
+                open=Decimal("41900"),
+                high=Decimal("42100"),
+                low=Decimal("41800"),
+                close=Decimal("42000"),
+                volume=Decimal("10"),
+            ),
+        ]
+        mock_db = MagicMock()
+        mock_db.query.side_effect = lambda model: self._FakeQuery(model, state, rows)
+        engine._db_session_factory = lambda: nullcontext(mock_db)
+        engine.loaded_classes["test.py::FailingWarmupStrategy"] = FailingWarmupStrategy
+        engine._strategy_state_manager.transition_to_running = MagicMock()
+        engine._strategy_state_manager.transition_to_error = MagicMock()
+
+        engine.activate_strategy("test.py::FailingWarmupStrategy")
+
+        assert "test.py::FailingWarmupStrategy" not in engine.strategy_instances
+        engine._strategy_state_manager.transition_to_running.assert_not_called()
+        engine._strategy_state_manager.transition_to_error.assert_called_once()
+        assert "warm-up replay failed" in state.performance_json
 
     def test_warmup_syncs_strategy_trade_state_to_existing_position(self, engine):
         """A restarted strategy should reflect the real position after warm-up."""

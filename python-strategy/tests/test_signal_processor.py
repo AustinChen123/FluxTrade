@@ -158,6 +158,33 @@ def test_warm_up_restores_trade_state_after_dropped_signals() -> None:
     execution.execute_signal.assert_not_called()
 
 
+def test_warm_up_failure_restores_trade_state_and_propagates() -> None:
+    class FailingWarmupStrategy(DummyStrategy):
+        def __init__(self):
+            super().__init__("s1")
+            self.position = 0
+            self._in_position = False
+
+        def on_candle(self, candle: Candlestick):
+            self.candles_received.append(candle)
+            self.position = 1
+            self._in_position = True
+            raise RuntimeError("warm-up replay failed")
+
+    strategy = FailingWarmupStrategy()
+    processor = SignalProcessor(StrategyRegistry(), MagicMock())
+
+    try:
+        processor.warm_up(strategy, [make_candle()])
+    except RuntimeError as exc:
+        assert str(exc) == "warm-up replay failed"
+    else:
+        raise AssertionError("warm-up failure should propagate")
+
+    assert strategy.position == 0
+    assert strategy._in_position is False
+
+
 def test_set_position_state_maps_common_strategy_flags() -> None:
     class StatefulStrategy(DummyStrategy):
         def __init__(self):
