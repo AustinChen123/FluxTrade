@@ -109,7 +109,9 @@ class RiskManager:
                 rate_limit_redis,
             )
         self.max_position_rule = max_position_rule or MaxPositionNotionalRule(self.risk_config)
-        self.existing_position_entry_rule = existing_position_entry_rule
+        self.existing_position_entry_rule = (
+            existing_position_entry_rule or ExistingPositionEntryRule()
+        )
         self.capital_allocator = capital_allocator
         self.state_manager = state_manager
         self.daily_nav_service = daily_nav_service

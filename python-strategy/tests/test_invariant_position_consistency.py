@@ -94,12 +94,18 @@ def test_backtest_account_position_matches_rust_after_each_fill(order_factory) -
 def test_risk_manager_position_limit_uses_matcher_backed_account(order_factory) -> None:
     adapter = SimulatedAdapter(Decimal("100000"))
     account = BacktestAccountService(adapter=adapter)
+    class _PassEntryRule:
+        def evaluate(self, signal, current_position):
+            from src.core.risk_rules import RuleStatus
+            return RuleStatus.PASS, None
+
     risk_manager = RiskManager(
         account,
         risk_config=RiskConfig(
             max_single_order_notional_pct=Decimal("1"),
             max_position_notional=Decimal("20000"),
         ),
+        existing_position_entry_rule=_PassEntryRule(),
     )
 
     _place_market_order(adapter, order_factory, side="buy", quantity="0.3", ts=10)

@@ -42,6 +42,16 @@ class _FakeDailyNavService:
         return self.nav
 
 
+
+class _PassExistingPositionEntryRule:
+    """Permissive stub so exposure tests exercise exposure semantics, not the
+    default-on duplicate-entry rule."""
+
+    def evaluate(self, signal, current_position):
+        from src.core.risk_rules import RuleStatus
+        return RuleStatus.PASS, None
+
+
 class TestRiskManagerBalanceChecks:
     """Tests for balance-related risk checks."""
 
@@ -344,7 +354,10 @@ class TestRiskManagerExposureChecks:
         )
         mock_account_service.set_position(large_position)
 
-        risk_manager = RiskManager(mock_account_service)
+        risk_manager = RiskManager(
+            mock_account_service,
+            existing_position_entry_rule=_PassExistingPositionEntryRule(),
+        )
         signal = signal_factory(signal_type=SignalType.LONG)
 
         # current_price=40000 -> 3 * 40000 = 120000 > default 100000
@@ -405,10 +418,10 @@ class TestRiskManagerExposureChecks:
         assert is_allowed is False
         assert "existing_position_entry_duplicate" in reason
 
-    def test_same_side_entry_defaults_to_exposure_rules(
+    def test_same_side_entry_rejected_by_default(
         self, mock_account_service, signal_factory, position_factory
     ):
-        """RiskManager does not globally reject legitimate scale-ins by default."""
+        """ExistingPositionEntryRule is active by default; same-side entries are rejected."""
         mock_account_service.set_balance(Decimal("100000"))
         position = position_factory(
             quantity=Decimal("0.5"),
@@ -425,8 +438,35 @@ class TestRiskManagerExposureChecks:
 
         is_allowed, reason = risk_manager.check_risk(signal, current_price=Decimal("40000"))
 
-        assert is_allowed is True
-        assert reason == "PASS"
+        assert is_allowed is False
+        assert "existing_position_entry_duplicate" in reason
+
+    def test_default_construction_rejects_duplicate_long_entry(
+        self, mock_account_service, signal_factory, position_factory
+    ):
+        """Regression: default RiskManager (no explicit rule) must reject same-side entry.
+
+        This test exercises the DEFAULT construction path — do NOT inject the rule
+        manually. It must FAIL if someone reverts the default wiring in risk_manager.py.
+        """
+        mock_account_service.set_balance(Decimal("100000"))
+        position = position_factory(
+            quantity=Decimal("1"),
+            entry_price=Decimal("50000"),
+            side=PositionSide.LONG,
+        )
+        mock_account_service.set_position(position)
+        risk_manager = RiskManager(mock_account_service)  # no existing_position_entry_rule arg
+        signal = signal_factory(
+            signal_type=SignalType.LONG,
+            price=Decimal("50000"),
+            quantity=Decimal("0.01"),
+        )
+
+        is_allowed, reason = risk_manager.check_risk(signal, current_price=Decimal("50000"))
+
+        assert is_allowed is False
+        assert "existing_position_entry_duplicate" in reason
 
     def test_exposure_uses_current_price_not_entry_price(
         self, mock_account_service, signal_factory, position_factory
@@ -441,14 +481,18 @@ class TestRiskManagerExposureChecks:
         )
         mock_account_service.set_position(position)
 
-        risk_manager = RiskManager(mock_account_service)
+        risk_manager = RiskManager(
+            mock_account_service,
+            existing_position_entry_rule=_PassExistingPositionEntryRule(),
+        )
         signal = signal_factory(signal_type=SignalType.LONG)
 
-        # With current_price=$90, exposure = 1000 * 90 = 90000 < 100000 -> PASS
-        is_allowed, _ = risk_manager.check_risk(signal, current_price=Decimal("90"))
+        # current 90 -> exposure 90000 < 100000: allowed
+        is_allowed, reason = risk_manager.check_risk(signal, current_price=Decimal("90"))
         assert is_allowed is True
+        assert reason == "PASS"
 
-        # With current_price=$120, exposure = 1000 * 120 = 120000 > 100000 -> REJECT
+        # current 120 -> exposure 120000 > 100000: rejected by exposure
         is_allowed, reason = risk_manager.check_risk(signal, current_price=Decimal("120"))
         assert is_allowed is False
         assert "exposure" in reason.lower()
@@ -465,10 +509,12 @@ class TestRiskManagerExposureChecks:
         )
         mock_account_service.set_position(large_position)
 
-        risk_manager = RiskManager(mock_account_service)
+        risk_manager = RiskManager(
+            mock_account_service,
+            existing_position_entry_rule=_PassExistingPositionEntryRule(),
+        )
         signal = signal_factory(signal_type=SignalType.LONG)
 
-        # No current_price → fallback to entry_price
         is_allowed, reason = risk_manager.check_risk(signal)
 
         assert is_allowed is False
@@ -685,7 +731,10 @@ class TestRiskManagerEdgeCases:
         )
         mock_account_service.set_position(position)
 
-        risk_manager = RiskManager(mock_account_service)
+        risk_manager = RiskManager(
+            mock_account_service,
+            existing_position_entry_rule=_PassExistingPositionEntryRule(),
+        )
         signal = signal_factory(signal_type=SignalType.LONG)
 
         is_allowed, reason = risk_manager.check_risk(signal, current_price=Decimal("40000"))
@@ -965,10 +1014,10 @@ class TestRiskManagerWithCapitalAllocator:
             mock_account_service,
             capital_allocator=allocator,
             max_exposure_per_strategy=Decimal("20000"),
+            existing_position_entry_rule=_PassExistingPositionEntryRule(),
         )
 
         signal = signal_factory(signal_type=SignalType.LONG)
-        # 0.5 * 45000 = 22500 < 100000 (position OK) but >= 20000 (strategy REJECT)
         is_allowed, reason = risk_manager.check_risk(signal, current_price=Decimal("45000"))
 
         assert is_allowed is False

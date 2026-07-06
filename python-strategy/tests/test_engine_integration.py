@@ -13,7 +13,6 @@ from sqlalchemy.orm import sessionmaker
 from src.core.models import Candlestick, Position, PositionSide, Signal, SignalType, StrategyStatus
 from src.core.orm_models import Candlestick as ORMCandlestick
 from src.core.orm_models import SignalAudit, Strategy, StrategyState, StrategyStateTransition
-from src.core.risk_rules.existing_position_entry import ExistingPositionEntryRule
 from src.strategies.base import BaseStrategy, StrategyRequirements
 
 
@@ -285,7 +284,6 @@ def test_restart_restore_warms_and_blocks_duplicate_entry_with_real_session(
         db_session_factory=session_factory,
         account_service=RestartAccountService(position),
     )
-    engine.risk_manager.existing_position_entry_rule = ExistingPositionEntryRule()
     engine.loaded_classes["s1"] = EmittingStrategy
     engine.execution_engine.execute_signal = MagicMock(return_value="order-1")
 
