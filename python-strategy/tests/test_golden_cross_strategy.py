@@ -124,3 +124,35 @@ def test_golden_cross_strategy_rejects_invalid_parameters():
             long_window=3,
             quantity=Decimal("0"),
         )
+
+
+@pytest.mark.parametrize(
+    "side, expected_return, pre_in_position, expected_in_position",
+    [
+        (None, True, False, False),
+        ("LONG", True, False, True),
+        # SHORT must be rejected: return False and must NOT mutate _in_position.
+        ("SHORT", False, True, True),
+    ],
+    ids=["flat-none", "long-accepted", "short-rejected"],
+)
+def test_golden_cross_sync_position_state_parametrized(
+    side, expected_return, pre_in_position, expected_in_position
+):
+    """sync_position_state must accept None/LONG and reject SHORT without mutation."""
+    strategy = GoldenCrossStrategy(
+        strategy_id="golden",
+        product_id=PRODUCT_ID,
+        short_window=2,
+        long_window=3,
+        timeframe=TIMEFRAME,
+    )
+    strategy._in_position = pre_in_position
+
+    result = strategy.sync_position_state(side)
+
+    assert result is expected_return
+    assert strategy._in_position is expected_in_position, (
+        f"side={side!r}: _in_position mutated unexpectedly "
+        f"(expected {expected_in_position}, got {strategy._in_position})"
+    )

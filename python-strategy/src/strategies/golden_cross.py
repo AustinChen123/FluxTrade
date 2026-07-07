@@ -138,6 +138,8 @@ class GoldenCrossStrategy(BaseStrategy):
         )
 
     def sync_position_state(self, position_side: str | None) -> bool:
+        if position_side not in (None, "LONG"):
+            return False
         self._in_position = position_side == "LONG"
         return True
 

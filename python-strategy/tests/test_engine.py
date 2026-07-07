@@ -1317,6 +1317,75 @@ class TestStrategyWarmup:
     # covers the flat/no-position happy path: account_service returns None, position_side
     # is None, set_position_state returns True → activation succeeds.  No duplicate needed.
 
+    def test_warm_up_precedes_register_during_activation(self, engine):
+        """warm-up must complete before the instance is registered as live.
+
+        Rationale: on restart-restore the lifecycle cache is already ACTIVE, so a
+        registered instance is immediately visible to on_market_data.  Registering
+        before warm-up is complete would allow signals to be emitted from partial state.
+        """
+        call_order: list[str] = []
+
+        class OrderTrackingStrategy:
+            def __init__(self, strategy_id, product_id):
+                from src.strategies.base import StrategyRequirements
+
+                self.strategy_id = strategy_id
+                self.product_id = product_id
+                self._requirements = StrategyRequirements(product_id, "1m", 1)
+                self.position = 0
+                self._in_position = False
+
+            @property
+            def requirements(self):
+                return self._requirements
+
+            def on_candle(self, candle):
+                return None
+
+        state = MagicMock()
+        state.status = StrategyStatus.READY
+        state.config_json = "{}"
+        rows = [
+            ORMCandlestick(
+                product_id="BINANCE:BTCUSDT-PERP",
+                timeframe="1m",
+                timestamp=1704067200000,
+                open=Decimal("41900"),
+                high=Decimal("42100"),
+                low=Decimal("41800"),
+                close=Decimal("42000"),
+                volume=Decimal("10"),
+            )
+        ]
+        mock_db = MagicMock()
+        mock_db.query.side_effect = lambda model: self._FakeQuery(model, state, rows)
+        engine._db_session_factory = lambda: nullcontext(mock_db)
+        engine.loaded_classes["test.py::OrderTrackingStrategy"] = OrderTrackingStrategy
+        engine._strategy_state_manager.transition_to_running = MagicMock()
+
+        original_warmup = engine._warm_up_strategy_instance
+        original_register = engine._register_strategy_instance
+
+        def tracking_warmup(db, instance):
+            call_order.append("warm_up")
+            return original_warmup(db, instance)
+
+        def tracking_register(instance):
+            call_order.append("register")
+            return original_register(instance)
+
+        engine._warm_up_strategy_instance = tracking_warmup
+        engine._register_strategy_instance = tracking_register
+
+        engine.activate_strategy("test.py::OrderTrackingStrategy")
+
+        assert call_order == ["warm_up", "register"], (
+            f"Expected warm_up before register, got: {call_order}"
+        )
+        assert "test.py::OrderTrackingStrategy" in engine.strategy_instances
+        engine._strategy_state_manager.transition_to_running.assert_called_once()
+
 
 # =============================================================================
 # shutdown

@@ -348,8 +348,11 @@ class StrategyEngine:
                 
                 strategy_cls = self.loaded_classes[strategy_id]
                 instance = strategy_cls(strategy_id, product_id)
-                self._register_strategy_instance(instance)
                 self._warm_up_strategy_instance(db, instance)
+                # Registration must follow warm-up — on restart-restore the lifecycle
+                # cache is already ACTIVE, so a registered instance is immediately
+                # live to on_market_data and could emit signals from partial state.
+                self._register_strategy_instance(instance)
                 state.uptime_start = int(time.time() * 1000)
                 db.commit()
                 logger.info("🔥 Strategy %s is now ACTIVE for %s", strategy_id, product_id)
