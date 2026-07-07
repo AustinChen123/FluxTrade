@@ -81,3 +81,22 @@ def test_risk_config_from_env_rejects_invalid_integer(monkeypatch) -> None:
 
     with pytest.raises(ValueError, match="RISK_MAX_ORDERS_PER_MINUTE"):
         RiskConfig.from_env()
+
+
+def test_risk_config_from_env_same_side_reentry_true(monkeypatch) -> None:
+    monkeypatch.setenv("RISK_ALLOW_SAME_SIDE_REENTRY", "true")
+
+    assert RiskConfig.from_env().allow_same_side_reentry is True
+
+
+@pytest.mark.parametrize("value", ["0", "false", "FALSE", "no"])
+def test_risk_config_from_env_same_side_reentry_false(monkeypatch, value) -> None:
+    monkeypatch.setenv("RISK_ALLOW_SAME_SIDE_REENTRY", value)
+
+    assert RiskConfig.from_env().allow_same_side_reentry is False
+
+
+def test_risk_config_from_env_same_side_reentry_unset(monkeypatch) -> None:
+    monkeypatch.delenv("RISK_ALLOW_SAME_SIDE_REENTRY", raising=False)
+
+    assert RiskConfig.from_env().allow_same_side_reentry is False

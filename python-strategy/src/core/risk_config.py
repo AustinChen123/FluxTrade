@@ -66,6 +66,12 @@ class RiskConfig:
                 "RISK_MAX_POSITION_NOTIONAL",
                 cls.max_position_notional,
             ),
+            allow_same_side_reentry=os.getenv(
+                "RISK_ALLOW_SAME_SIDE_REENTRY", "false"
+            )
+            .strip()
+            .lower()
+            in {"1", "true"},
         )
 
 
