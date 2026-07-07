@@ -426,19 +426,16 @@ class StrategyEngine:
                 instance.product_id,
             )
         except Exception as e:
-            logger.warning(
-                "Could not sync strategy position state for %s: %s",
-                instance.strategy_id,
-                e,
-            )
-            return
+            raise RuntimeError(
+                "position_state_sync_failed: "
+                f"strategy_id={instance.strategy_id} error={e}"
+            ) from e
         position_side = None if position is None else getattr(position.side, "value", position.side)
         applied = self._signal_processor.set_position_state(instance, position_side)
         if position_side is not None and not applied:
-            logger.warning(
-                "Strategy %s has live position side=%s but no position-state sync hook",
-                instance.strategy_id,
-                position_side,
+            raise RuntimeError(
+                "position_state_sync_unsupported: "
+                f"strategy_id={instance.strategy_id} side={position_side}"
             )
 
     def start_strategy(self, strategy_id: str):

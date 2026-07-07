@@ -1205,6 +1205,118 @@ class TestStrategyWarmup:
         assert strategy.position == 1
         assert strategy._in_position is True
 
+    def _make_warmup_db(self, state, rows):
+        """Helper: return a mock DB factory that yields one candle row and the given state."""
+        mock_db = MagicMock()
+        mock_db.query.side_effect = lambda model: self._FakeQuery(model, state, rows)
+        return lambda: nullcontext(mock_db)
+
+    def test_activation_fails_closed_when_get_position_raises(self, engine):
+        """get_position error during sync must land the strategy in ERROR, not RUNNING."""
+        class MinimalStrategy:
+            def __init__(self, strategy_id, product_id):
+                from src.strategies.base import StrategyRequirements
+                self.strategy_id = strategy_id
+                self.product_id = product_id
+                self._requirements = StrategyRequirements(product_id, "1m", 1)
+                self.position = 0
+                self._in_position = False
+
+            @property
+            def requirements(self):
+                return self._requirements
+
+            def on_candle(self, candle):
+                return None
+
+        state = MagicMock()
+        state.status = StrategyStatus.READY
+        state.config_json = "{}"
+        rows = [
+            ORMCandlestick(
+                product_id="BINANCE:BTCUSDT-PERP",
+                timeframe="1m",
+                timestamp=1704067200000,
+                open=Decimal("41900"),
+                high=Decimal("42100"),
+                low=Decimal("41800"),
+                close=Decimal("42000"),
+                volume=Decimal("10"),
+            )
+        ]
+        engine._db_session_factory = self._make_warmup_db(state, rows)
+        engine.account_service.get_position = MagicMock(
+            side_effect=ConnectionError("db down")
+        )
+        engine.loaded_classes["test.py::MinimalStrategy"] = MinimalStrategy
+        engine._strategy_state_manager.transition_to_running = MagicMock()
+        engine._strategy_state_manager.transition_to_error = MagicMock()
+
+        engine.activate_strategy("test.py::MinimalStrategy")
+
+        assert "test.py::MinimalStrategy" not in engine.strategy_instances
+        engine._strategy_state_manager.transition_to_running.assert_not_called()
+        engine._strategy_state_manager.transition_to_error.assert_called_once()
+        assert "position_state_sync_failed" in state.performance_json
+
+    def test_activation_fails_closed_when_live_position_has_no_sync_hook(self, engine):
+        """Live position + strategy with no sync attrs/hook must land in ERROR, not RUNNING."""
+        class NoSyncStrategy:
+            """A strategy with no _in_position, position, or sync_position_state."""
+            def __init__(self, strategy_id, product_id):
+                from src.strategies.base import StrategyRequirements
+                self.strategy_id = strategy_id
+                self.product_id = product_id
+                self._requirements = StrategyRequirements(product_id, "1m", 1)
+
+            @property
+            def requirements(self):
+                return self._requirements
+
+            def on_candle(self, candle):
+                return None
+
+        state = MagicMock()
+        state.status = StrategyStatus.READY
+        state.config_json = "{}"
+        rows = [
+            ORMCandlestick(
+                product_id="BINANCE:BTCUSDT-PERP",
+                timeframe="1m",
+                timestamp=1704067200000,
+                open=Decimal("41900"),
+                high=Decimal("42100"),
+                low=Decimal("41800"),
+                close=Decimal("42000"),
+                volume=Decimal("10"),
+            )
+        ]
+        engine._db_session_factory = self._make_warmup_db(state, rows)
+        engine.account_service.set_position(
+            Position(
+                strategy_id="test.py::NoSyncStrategy",
+                product_id="BINANCE:BTCUSDT-PERP",
+                side=PositionSide.LONG,
+                quantity=Decimal("0.01"),
+                entry_price=Decimal("42000"),
+                unrealized_pnl=Decimal("0"),
+            )
+        )
+        engine.loaded_classes["test.py::NoSyncStrategy"] = NoSyncStrategy
+        engine._strategy_state_manager.transition_to_running = MagicMock()
+        engine._strategy_state_manager.transition_to_error = MagicMock()
+
+        engine.activate_strategy("test.py::NoSyncStrategy")
+
+        assert "test.py::NoSyncStrategy" not in engine.strategy_instances
+        engine._strategy_state_manager.transition_to_running.assert_not_called()
+        engine._strategy_state_manager.transition_to_error.assert_called_once()
+        assert "position_state_sync_unsupported" in state.performance_json
+
+    # test_activate_strategy_replays_recent_candles_without_orders (line ~1011) already
+    # covers the flat/no-position happy path: account_service returns None, position_side
+    # is None, set_position_state returns True → activation succeeds.  No duplicate needed.
+
 
 # =============================================================================
 # shutdown

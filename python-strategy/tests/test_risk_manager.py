@@ -593,6 +593,38 @@ class TestRiskManagerExposureChecks:
         assert is_allowed is True
         assert reason == "PASS"
 
+    def test_allow_same_side_reentry_when_flag_is_true(
+        self, mock_account_service, signal_factory, position_factory
+    ):
+        """RiskManager with allow_same_side_reentry=True lets scale-in through to exposure checks."""
+        mock_account_service.set_balance(Decimal("100000"))
+        position = position_factory(
+            quantity=Decimal("0.5"),
+            entry_price=Decimal("50000"),
+        )
+        mock_account_service.set_position(position)
+        risk_manager = RiskManager(
+            mock_account_service,
+            risk_config=RiskConfig(
+                max_position_notional=Decimal("100000"),
+                allow_same_side_reentry=True,
+            ),
+            existing_position_entry_rule=ExistingPositionEntryRule(),
+        )
+        signal = signal_factory(
+            signal_type=SignalType.LONG,
+            price=Decimal("50000"),
+            quantity=Decimal("0.02"),
+        )
+
+        is_allowed, reason = risk_manager.check_risk(
+            signal,
+            current_price=Decimal("50000"),
+        )
+
+        assert is_allowed is True
+        assert reason == "PASS"
+
 
 class TestRiskManagerNoSignal:
     """Tests for NO_SIGNAL handling."""

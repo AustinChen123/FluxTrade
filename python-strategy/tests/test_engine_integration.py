@@ -25,6 +25,10 @@ class EmittingStrategy(BaseStrategy):
     def requirements(self) -> StrategyRequirements:
         return StrategyRequirements(self.product_id, "1m", 10)
 
+    def sync_position_state(self, position_side: str | None) -> bool:
+        """Accept the position sync unconditionally — required for restart integration test."""
+        return True
+
     def on_candle(self, candle: Candlestick) -> Signal:
         self.candles_received.append(candle)
         return Signal(

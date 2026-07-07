@@ -213,7 +213,10 @@ class RiskManager:
             price_for_exposure = current_price if current_price is not None else position.entry_price
 
             if is_entry:
-                if self.existing_position_entry_rule is not None:
+                if (
+                    not self.risk_config.allow_same_side_reentry
+                    and self.existing_position_entry_rule is not None
+                ):
                     rule_status, rule_reason = self.existing_position_entry_rule.evaluate(
                         signal,
                         position,
