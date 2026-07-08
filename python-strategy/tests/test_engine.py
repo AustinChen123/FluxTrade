@@ -230,6 +230,7 @@ class TestEngineInit:
         engine._db_session_factory = lambda: nullcontext(mock_db)
         engine.loaded_classes["test.py::ActiveStrategy"] = MagicMock()
         engine.activate_strategy = MagicMock()
+        engine._strategy_state_manager.transition_to_error = MagicMock()
 
         engine._restore_active_strategies_on_startup()
 
@@ -238,6 +239,11 @@ class TestEngineInit:
             actor="system",
             reason="startup_restore",
             force=True,
+        )
+        engine._strategy_state_manager.transition_to_error.assert_called_once_with(
+            "test.py::MissingStrategy",
+            "startup_restore_class_missing",
+            actor="system",
         )
 
 
@@ -1385,6 +1391,73 @@ class TestStrategyWarmup:
         )
         assert "test.py::OrderTrackingStrategy" in engine.strategy_instances
         engine._strategy_state_manager.transition_to_running.assert_called_once()
+
+
+# =============================================================================
+# Restore active strategies — matrix tests
+# =============================================================================
+
+
+class TestRestoreActiveStrategiesMatrix:
+    """Decision-table tests for _restore_active_strategies_on_startup."""
+
+    def _make_state(self, strategy_id: str):
+        s = MagicMock()
+        s.strategy_id = strategy_id
+        return s
+
+    def _db_ctx(self, states):
+        mock_db = MagicMock()
+        mock_db.query.return_value.filter.return_value.all.return_value = states
+        return lambda: nullcontext(mock_db)
+
+    def test_class_missing_transitions_to_error_not_activated(self, engine):
+        """Missing class → transition_to_error called, strategy NOT activated (P2 cell)."""
+        state = self._make_state("test.py::MissingStrategy")
+        engine._db_session_factory = self._db_ctx([state])
+        engine.activate_strategy = MagicMock()
+        engine._strategy_state_manager.transition_to_error = MagicMock()
+
+        engine._restore_active_strategies_on_startup()
+
+        engine._strategy_state_manager.transition_to_error.assert_called_once_with(
+            "test.py::MissingStrategy",
+            "startup_restore_class_missing",
+            actor="system",
+        )
+        engine.activate_strategy.assert_not_called()
+        assert "test.py::MissingStrategy" not in engine.strategy_instances
+
+    def test_per_strategy_isolation_first_raises_second_succeeds(self, engine):
+        """activate_strategy raising for A must not prevent B from restoring (isolation cell)."""
+        state_a = self._make_state("test.py::StratA")
+        state_b = self._make_state("test.py::StratB")
+        engine._db_session_factory = self._db_ctx([state_a, state_b])
+
+        # Both classes are loaded; A's activation raises, B's does not.
+        engine.loaded_classes["test.py::StratA"] = MagicMock()
+        engine.loaded_classes["test.py::StratB"] = MagicMock()
+
+        activate_calls = []
+
+        def _activate(strategy_id, *, actor, reason, force):
+            activate_calls.append(strategy_id)
+            if strategy_id == "test.py::StratA":
+                raise RuntimeError("StratA boom")
+
+        engine.activate_strategy = _activate
+        engine._strategy_state_manager.transition_to_error = MagicMock()
+
+        engine._restore_active_strategies_on_startup()
+
+        # A → transitioned to error
+        engine._strategy_state_manager.transition_to_error.assert_called_once()
+        error_args = engine._strategy_state_manager.transition_to_error.call_args
+        assert error_args[0][0] == "test.py::StratA"
+        assert "startup_restore_failed" in error_args[0][1]
+
+        # B → activate_strategy was reached
+        assert "test.py::StratB" in activate_calls
 
 
 # =============================================================================

@@ -77,17 +77,30 @@ class SignalProcessor:
             self._restore_trade_state(strategy, trade_state)
 
     def set_position_state(self, strategy: BaseStrategy, position_side: str | None) -> bool:
-        """Align common strategy trade-state flags with actual account position."""
-        sync_hook = getattr(strategy, "sync_position_state", None)
-        if callable(sync_hook) and sync_hook(position_side):
-            return True
+        """Align strategy trade-state with the actual account position.
 
-        applied = False
+        Hook contract: True = synced, False = side unsupported (caller fails
+        closed), None = not handled -> generic attribute fallback. The
+        fallback only accepts a non-flat side for strategies exposing a
+        direction-aware ``position`` attribute; ``_in_position``-only
+        strategies cannot represent direction and may only sync flat state.
+        """
+        sync_hook = getattr(strategy, "sync_position_state", None)
+        if callable(sync_hook):
+            hook_result = sync_hook(position_side)
+            if hook_result is not None:
+                return bool(hook_result)
+
         normalized_side = position_side.upper() if position_side else None
+        has_direction_attr = hasattr(strategy, "position")
+        if normalized_side is not None and not has_direction_attr:
+            # _in_position alone cannot represent LONG vs SHORT safely.
+            return False
+        applied = False
         if hasattr(strategy, "_in_position"):
             setattr(strategy, "_in_position", normalized_side is not None)
             applied = True
-        if hasattr(strategy, "position"):
+        if has_direction_attr:
             if normalized_side == "LONG":
                 setattr(strategy, "position", 1)
             elif normalized_side == "SHORT":

@@ -40,13 +40,14 @@ class BaseStrategy(ABC):
         """Optional: Strategies can override to react to individual trades."""
         return None
 
-    def sync_position_state(self, position_side: str | None) -> bool:
+    def sync_position_state(self, position_side: str | None) -> bool | None:
         """Optional hook to align internal trade-state after restart warm-up.
 
-        Return True when the strategy consumed the position state. The default
-        is a no-op so existing strategies remain source-compatible.
+        Return True when the position state was consumed, False when the side
+        is UNSUPPORTED by this strategy (activation fails closed), or None
+        (default) to let the engine try the generic attribute fallback.
         """
-        return False
+        return None
 
     def run_vectorized(self, df: pd.DataFrame) -> pd.DataFrame:
         """

@@ -258,17 +258,33 @@ class StrategyEngine:
 
         for state in active_states:
             if state.strategy_id not in self.loaded_classes:
-                logger.warning(
-                    "Skipping startup restore for %s: strategy class not loaded",
+                logger.error(
+                    "Startup restore: strategy class not loaded for %s — marking ERROR",
                     state.strategy_id,
                 )
+                self._strategy_state_manager.transition_to_error(
+                    state.strategy_id,
+                    "startup_restore_class_missing",
+                    actor="system",
+                )
                 continue
-            self.activate_strategy(
-                state.strategy_id,
-                actor="system",
-                reason="startup_restore",
-                force=True,
-            )
+            try:
+                self.activate_strategy(
+                    state.strategy_id,
+                    actor="system",
+                    reason="startup_restore",
+                    force=True,
+                )
+            except Exception as e:
+                logger.exception(
+                    "Startup restore: failed to activate %s — marking ERROR",
+                    state.strategy_id,
+                )
+                self._strategy_state_manager.transition_to_error(
+                    state.strategy_id,
+                    f"startup_restore_failed: {e}",
+                    actor="system",
+                )
 
     def test_run_strategy(self, strategy_id: str, days: int):
         """
