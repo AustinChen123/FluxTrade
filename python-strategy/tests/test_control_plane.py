@@ -1620,3 +1620,32 @@ def test_kill_switch_reason_forwarded_in_publish():
     _, raw_payload = redis.publish.call_args.args
     published = json.loads(raw_payload)
     assert published["params"].get("reason") == "eod_risk_drill"
+
+
+def test_control_plane_main_wires_redis_client_for_kill_switch(monkeypatch):
+    from unittest.mock import MagicMock
+
+    from src.control_plane import main as control_plane_main
+
+    redis = MagicMock()
+    captured = {}
+
+    class CapturingControlPlaneApp:
+        def __init__(self, executor, *, api_key=None, redis_client=None):
+            captured["executor"] = executor
+            captured["api_key"] = api_key
+            captured["redis_client"] = redis_client
+
+    monkeypatch.setattr(control_plane_main, "ControlPlaneApp", CapturingControlPlaneApp)
+    monkeypatch.setattr(control_plane_main, "create_redis_client", lambda: redis)
+    monkeypatch.setattr(
+        control_plane_main,
+        "serve",
+        lambda app, *, host, port: captured.update(
+            {"served_app": app, "host": host, "port": port}
+        ),
+    )
+
+    control_plane_main.main()
+
+    assert captured["redis_client"] is redis
