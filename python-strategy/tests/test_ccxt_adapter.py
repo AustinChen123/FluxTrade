@@ -1244,6 +1244,40 @@ class TestGetPosition:
         with pytest.raises(ExchangeError):
             adapter.get_position("BINANCE:BTCUSDT-PERP")
 
+    def test_get_all_positions_returns_non_flat_exchange_positions(
+        self, adapter, mock_ccxt_client
+    ):
+        mock_ccxt_client.fetch_positions.return_value = [
+            {
+                "symbol": "BTC/USDT:USDT",
+                "contracts": 0.5,
+                "side": "long",
+                "entryPrice": 65000,
+                "unrealizedPnl": 100,
+            },
+            {
+                "symbol": "ETH/USDT:USDT",
+                "contracts": 0,
+                "side": "long",
+                "entryPrice": 3000,
+                "unrealizedPnl": 0,
+            },
+            {
+                "symbol": "XRP/USDT:USDT",
+                "contracts": 20,
+                "side": "short",
+                "entryPrice": 1,
+                "unrealizedPnl": -2,
+            },
+        ]
+
+        positions = adapter.get_all_positions()
+
+        assert [(pos.product_id, pos.side, pos.quantity) for pos in positions] == [
+            ("BINANCE:BTCUSDT-PERP", "LONG", Decimal("0.5")),
+            ("BINANCE:XRPUSDT-PERP", "SHORT", Decimal("20")),
+        ]
+
 
 # ---------------------------------------------------------------------------
 # create_adapter factory

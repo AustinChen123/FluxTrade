@@ -100,6 +100,7 @@ class RecordingExecutionEngine:
         self._cancel_results = cancel_results or {}
         self._flatten_results = flatten_results or {}
         self.order_manager = _FakeOrderManager(orders_by_status or {})
+        self.adapter = None
 
     def cancel_order(self, order_id: str) -> bool:
         self.calls.append(("cancel_order", order_id))
@@ -176,6 +177,21 @@ def _make_service(
     return service, fake_engine, fake_account
 
 
+class FakeExchangePositionAdapter:
+    def __init__(
+        self,
+        positions: list[Position] | None = None,
+        error: Exception | None = None,
+    ) -> None:
+        self._positions = positions or []
+        self._error = error
+
+    def get_all_positions(self) -> list[Position]:
+        if self._error is not None:
+            raise self._error
+        return list(self._positions)
+
+
 # =============================================================================
 # A. OpsSafetyService.kill_switch tests
 # =============================================================================
@@ -194,6 +210,36 @@ class TestKillSwitchIdempotency:
         assert result["cancel_failures"] == []
         assert result["flattened_positions"] == 0
         assert result["flatten_failures"] == []
+
+    def test_local_empty_exchange_position_is_flattened(self):
+        """Kill switch must not treat an empty local cache as flat."""
+        exchange_pos = _make_position(strategy_id="LIVE", quantity=Decimal("0.75"))
+        service, engine, _ = _make_service(positions=[])
+        engine.adapter = FakeExchangePositionAdapter(positions=[exchange_pos])
+
+        result = service.kill_switch(actor="ops", reason="stale_redis")
+
+        assert result["already_flat"] is False
+        assert result["flattened_positions"] == 1
+        assert (
+            "flatten_position",
+            "LIVE",
+            PRODUCT_ID,
+        ) in engine.calls
+
+    def test_exchange_position_enumeration_failure_is_not_reported_flat(self):
+        """If live exposure cannot be enumerated, kill switch must fail closed."""
+        service, engine, _ = _make_service(positions=[])
+        engine.adapter = FakeExchangePositionAdapter(
+            error=RuntimeError("exchange unavailable")
+        )
+
+        result = service.kill_switch(actor="ops", reason="drill")
+
+        assert result["already_flat"] is False
+        assert result["flattened_positions"] == 0
+        assert result["flatten_failures"]
+        assert "exchange unavailable" in result["flatten_failures"][0]["reason"]
 
     def test_already_flat_audit_event_still_written(self):
         """Audit event must be written even when already flat."""

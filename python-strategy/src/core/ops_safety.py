@@ -101,7 +101,18 @@ class OpsSafetyService:
                     {"order_id": order_id, "reason": str(exc)}
                 )
 
-        positions = self._positions()
+        try:
+            positions = self._positions()
+        except Exception as exc:
+            self._logger.exception("Kill switch failed to enumerate live positions")
+            result["flatten_failures"].append(
+                {
+                    "strategy_id": "unknown",
+                    "product_id": "unknown",
+                    "reason": str(exc),
+                }
+            )
+            positions = []
         for position in positions:
             strategy_id = position.strategy_id
             product_id = position.product_id
@@ -158,6 +169,14 @@ class OpsSafetyService:
         )
 
     def _positions(self) -> list[Any]:
+        adapter = getattr(self._execution_engine, "adapter", None)
+        if adapter is not None:
+            get_all_positions = getattr(adapter, "get_all_positions", None)
+            if callable(get_all_positions):
+                return list(get_all_positions())
+            list_positions = getattr(adapter, "list_positions", None)
+            if callable(list_positions):
+                return list(list_positions())
         return list(self._account_service.get_all_positions())
 
     def _write_event(self, *, actor: str, reason: str | None, result: dict) -> None:

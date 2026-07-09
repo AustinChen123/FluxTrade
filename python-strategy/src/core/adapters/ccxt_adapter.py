@@ -773,3 +773,46 @@ class CcxtExchangeAdapter(IExchangeAdapter):
             )
 
         return None
+
+    def get_all_positions(self) -> list[Position]:
+        try:
+            positions = self.client.fetch_positions()
+        except ccxt.BaseError as e:
+            raise ExchangeError(f"Failed to fetch positions: {e}") from e
+
+        result: list[Position] = []
+        for raw_position in positions:
+            position = self._position_from_ccxt(raw_position)
+            if position is not None:
+                result.append(position)
+        return result
+
+    def _position_from_ccxt(self, raw_position: dict) -> Optional[Position]:
+        product_id = self._product_id_from_ccxt_symbol(raw_position.get("symbol"))
+        if product_id is None:
+            return None
+
+        contracts = Decimal(str(raw_position.get("contracts") or 0))
+        if contracts == 0:
+            return None
+
+        side_value = str(raw_position.get("side") or "").lower()
+        side = "SHORT" if side_value == "short" or contracts < 0 else "LONG"
+        return Position(
+            strategy_id="LIVE",
+            product_id=product_id,
+            side=side,
+            quantity=abs(contracts),
+            entry_price=Decimal(str(raw_position.get("entryPrice") or 0)),
+            unrealized_pnl=Decimal(str(raw_position.get("unrealizedPnl") or 0)),
+        )
+
+    def _product_id_from_ccxt_symbol(self, symbol: Optional[str]) -> Optional[str]:
+        if not symbol or "/" not in symbol:
+            return None
+        pair = symbol.split(":", 1)[0]
+        try:
+            base, quote = pair.split("/", 1)
+        except ValueError:
+            return None
+        return f"{self.exchange_id.upper()}:{base}{quote}-PERP"
