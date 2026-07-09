@@ -94,17 +94,19 @@ class StrategyEngine:
         )
 
         # Use pre-created adapter or build from config
+        effective_adapter_config = adapter_config or {"mode": "simulated"}
         if adapter is None:
-            if adapter_config is None:
-                adapter_config = {"mode": "simulated"}
             try:
-                adapter = create_adapter(adapter_config)
+                adapter = create_adapter(effective_adapter_config)
                 logger.info("StrategyEngine: Using %s", type(adapter).__name__)
             except Exception as e:
                 logger.critical("Failed to init adapter: %s. NOT falling back silently.", e)
                 raise
         else:
             logger.info("StrategyEngine: Using provided adapter %s", type(adapter).__name__)
+        self._runtime_reconciliation_enabled = (
+            effective_adapter_config.get("mode") == "live"
+        )
 
         self.execution_engine = ExecutionEngine(
             db_session,
@@ -144,8 +146,8 @@ class StrategyEngine:
                 os.getenv("RECONCILE_BALANCE_DRIFT_THRESHOLD", "0.01")
             ),
             product_ids=(
-                (adapter_config or {}).get("instrument_product_ids")
-                or (adapter_config or {}).get("product_ids")
+                effective_adapter_config.get("instrument_product_ids")
+                or effective_adapter_config.get("product_ids")
                 or []
             ),
         )
@@ -169,7 +171,8 @@ class StrategyEngine:
         self._start_strategy_state_subscriber_on_startup()
         self._reconcile_recoverable_orders_on_startup()
         self._start_heartbeat()
-        self._start_runtime_reconciliation()
+        if self._runtime_reconciliation_enabled:
+            self._start_runtime_reconciliation()
         self._start_command_listener()
         
         # Initial scan to discover strategies

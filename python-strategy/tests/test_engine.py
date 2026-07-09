@@ -1526,6 +1526,61 @@ class TestRestoreActiveStrategiesMatrix:
 
 
 class TestRuntimeReconciliationThread:
+    def test_startup_skips_runtime_reconciliation_for_simulated_mode(self, engine):
+        """Runtime reconciliation is live-only; simulated runs must not emit false drift."""
+        startup_steps = [
+            "_check_system_state",
+            "_reconcile_balance",
+            "_initialize_strategy_state_cache_on_startup",
+            "_start_strategy_state_subscriber_on_startup",
+            "_reconcile_recoverable_orders_on_startup",
+            "_start_heartbeat",
+            "_start_command_listener",
+            "scan_strategies",
+            "_restore_active_strategies_on_startup",
+        ]
+        for name in startup_steps:
+            setattr(engine, name, MagicMock())
+        engine._start_runtime_reconciliation = MagicMock()
+
+        engine.startup()
+
+        engine._start_runtime_reconciliation.assert_not_called()
+
+    def test_startup_starts_runtime_reconciliation_for_live_mode(
+        self, mock_db_session, mock_clock
+    ):
+        """Live runs should start periodic runtime reconciliation."""
+        with patch("src.core.engine.create_redis_client") as mock_factory, patch(
+            "src.core.engine.create_adapter"
+        ) as mock_create:
+            mock_factory.return_value = MagicMock()
+            mock_create.return_value = MagicMock()
+            engine = StrategyEngine(
+                db_session=mock_db_session,
+                clock=mock_clock,
+                adapter_config={"mode": "live"},
+            )
+
+        startup_steps = [
+            "_check_system_state",
+            "_reconcile_balance",
+            "_initialize_strategy_state_cache_on_startup",
+            "_start_strategy_state_subscriber_on_startup",
+            "_reconcile_recoverable_orders_on_startup",
+            "_start_heartbeat",
+            "_start_command_listener",
+            "scan_strategies",
+            "_restore_active_strategies_on_startup",
+        ]
+        for name in startup_steps:
+            setattr(engine, name, MagicMock())
+        engine._start_runtime_reconciliation = MagicMock()
+
+        engine.startup()
+
+        engine._start_runtime_reconciliation.assert_called_once()
+
     def test_start_runtime_reconciliation_runs_job_in_daemon_thread(self, engine):
         """Runtime reconciliation should run in a daemon background loop."""
         engine.runtime_reconciliation_job = MagicMock()
