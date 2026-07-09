@@ -1502,6 +1502,34 @@ class TestRestoreActiveStrategiesMatrix:
         assert "test.py::StratB" in activate_calls
 
 
+class TestRuntimeReconciliationThread:
+    def test_start_runtime_reconciliation_runs_job_in_daemon_thread(self, engine):
+        """Runtime reconciliation should run in a daemon background loop."""
+        engine.runtime_reconciliation_job = MagicMock()
+        created_threads = []
+
+        class ImmediateThread:
+            def __init__(self, *, target, daemon):
+                self.target = target
+                self.daemon = daemon
+                created_threads.append(self)
+
+            def start(self):
+                self.target()
+
+        def stop_after_sleep(_seconds):
+            engine.running = False
+
+        with patch("src.core.engine.threading.Thread", ImmediateThread), patch(
+            "src.core.engine.time.sleep",
+            side_effect=stop_after_sleep,
+        ):
+            engine._start_runtime_reconciliation()
+
+        assert created_threads[0].daemon is True
+        engine.runtime_reconciliation_job.run_once.assert_called_once()
+
+
 # =============================================================================
 # shutdown
 # =============================================================================

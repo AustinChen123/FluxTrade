@@ -8,6 +8,7 @@ import uuid
 from contextlib import nullcontext
 from concurrent.futures import ThreadPoolExecutor
 from datetime import UTC, datetime
+from decimal import Decimal
 from typing import Callable, ContextManager, List, Union, Optional, Dict, Type
 from sqlalchemy.orm import Session
 from src.core.models import Candlestick, Trade, Signal, SignalType, StrategyStatus
@@ -28,6 +29,7 @@ from src.core.metrics import SIGNALS_TOTAL, ACTIVE_STRATEGIES, BALANCE_USDT
 from src.core.command_router import CommandRouter
 from src.core.health_monitor import HealthMonitor
 from src.core.ops_safety import OpsSafetyService
+from src.core.runtime_reconcile import RuntimeReconciliationJob
 from src.core.signal_processor import SignalProcessor
 from src.core.strategy_registry import StrategyRegistry
 from src.core.strategy_state_manager import StrategyStateManager
@@ -131,12 +133,24 @@ class StrategyEngine:
             self.account_service,
             self._db_session_factory,
         )
+        self.runtime_reconciliation_job = RuntimeReconciliationJob(
+            account_service=self.account_service,
+            adapter=adapter,
+            db_session_factory=self._db_session_factory,
+            quantity_drift_threshold=Decimal(
+                os.getenv("RECONCILE_QTY_DRIFT_THRESHOLD", "0.00000001")
+            ),
+            balance_drift_threshold=Decimal(
+                os.getenv("RECONCILE_BALANCE_DRIFT_THRESHOLD", "0.01")
+            ),
+        )
         
         # System State & Heartbeat
         self._health_monitor.redis_client = self.redis_client
         self.running = True
         self.heartbeat_thread = None
         self.command_thread = None
+        self.runtime_reconcile_thread = None
         self.executor = ThreadPoolExecutor(max_workers=5)
 
     def startup(self):
@@ -149,6 +163,7 @@ class StrategyEngine:
         self._start_strategy_state_subscriber_on_startup()
         self._reconcile_recoverable_orders_on_startup()
         self._start_heartbeat()
+        self._start_runtime_reconciliation()
         self._start_command_listener()
         
         # Initial scan to discover strategies
@@ -589,6 +604,25 @@ class StrategyEngine:
         
         self.heartbeat_thread = threading.Thread(target=heartbeat_loop, daemon=True)
         self.heartbeat_thread.start()
+
+    def _start_runtime_reconciliation(self):
+        """Start periodic runtime reconciliation in a daemon thread."""
+        interval = float(os.getenv("RUNTIME_RECONCILE_INTERVAL_SECONDS", "3600"))
+
+        def reconcile_loop():
+            logger.info("Runtime reconciliation service started.")
+            while self.running:
+                try:
+                    self.runtime_reconciliation_job.run_once()
+                except Exception as e:
+                    logger.error("Runtime reconciliation loop failed: %s", e)
+                time.sleep(interval)
+
+        self.runtime_reconcile_thread = threading.Thread(
+            target=reconcile_loop,
+            daemon=True,
+        )
+        self.runtime_reconcile_thread.start()
 
     def _record_strategy_heartbeats(self, strategy_ids: list[str]) -> None:
         """Record strategy heartbeat state in HealthMonitor and DB."""

@@ -79,6 +79,21 @@ class AccountService:
             unrealized_pnl=unrealized_pnl
         )
 
+    def get_all_positions(self) -> list[Position]:
+        if not getattr(self, "redis", None):
+            return []
+
+        positions: list[Position] = []
+        for key in self.redis.scan_iter("state:position:*"):
+            parts = str(key).split(":", 3)
+            if len(parts) != 4:
+                continue
+            _, _, strategy_id, product_id = parts
+            position = self.get_position(strategy_id, product_id)
+            if position is not None:
+                positions.append(position)
+        return positions
+
 class RiskManager:
     def __init__(
         self,
