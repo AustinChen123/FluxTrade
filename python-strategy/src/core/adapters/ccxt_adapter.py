@@ -160,6 +160,9 @@ class CcxtExchangeAdapter(IExchangeAdapter):
         order_type, params = self._ccxt_order_type_and_params(order)
         if order_type == "limit":
             params["timeInForce"] = "GTC"
+        intent_payload = getattr(order, "intent_payload", None)
+        if isinstance(intent_payload, dict) and intent_payload.get("reduce_only") is True:
+            params["reduceOnly"] = True
         client_order_id = getattr(order, "client_order_id", None)
         if client_order_id:
             exchange_client_order_id = to_exchange_format(client_order_id, self.exchange_id)

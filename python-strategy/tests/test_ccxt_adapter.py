@@ -116,6 +116,21 @@ class TestPlaceOrder:
         assert call_kwargs.kwargs["type"] == "market"
         assert call_kwargs.kwargs["side"] == "buy"
 
+    def test_market_reduce_only_intent_passes_reduce_only_param(
+        self, adapter, mock_ccxt_client
+    ):
+        mock_ccxt_client.create_order.return_value = {"id": "EX-FLAT"}
+        order = _make_order(
+            side="sell",
+            type="market",
+            intent_payload={"reduce_only": True, "source": "kill_switch"},
+        )
+
+        adapter.place_order(order)
+
+        call_kwargs = mock_ccxt_client.create_order.call_args
+        assert call_kwargs.kwargs["params"]["reduceOnly"] is True
+
     def test_limit_order_includes_gtc(self, adapter, mock_ccxt_client):
         mock_ccxt_client.create_order.return_value = {"id": "EX-456"}
         order = _make_order(type="limit", price=Decimal("50000"))
