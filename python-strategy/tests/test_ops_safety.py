@@ -20,7 +20,7 @@ from sqlalchemy import create_engine, event, text
 from sqlalchemy.orm import sessionmaker
 
 from src.core.execution import ExecutionEngine
-from src.core.models import OrderStatus, Position, PositionSide
+from src.core.models import Candlestick, OrderStatus, Position, PositionSide, Signal, SignalType
 from src.core.ops_safety import OpsSafetyService
 from src.core.orm_models import Exchange, Order, Product, Strategy
 from src.core.repositories import LiveOrderRepository
@@ -723,7 +723,48 @@ class TestFlattenPosition:
             strategy = session.get(Strategy, "__ops_kill_switch__")
             assert strategy is not None
             order = session.get(Order, order_id)
-            assert order.strategy_id == "__ops_kill_switch__"
+        assert order.strategy_id == "__ops_kill_switch__"
+
+
+class TestKillSwitchHalting:
+    def test_kill_switch_halts_followup_strategy_signals(self, engine_factory):
+        engine = engine_factory()
+        engine.ops_safety.kill_switch = MagicMock(
+            return_value={
+                "cancelled_orders": 0,
+                "cancel_failures": [],
+                "flattened_positions": 0,
+                "flatten_failures": [],
+                "already_flat": True,
+            }
+        )
+        engine.risk_manager.check_risk = MagicMock(return_value=(True, "ok"))
+        engine.execution_engine.execute_signal = MagicMock(return_value="order-1")
+
+        engine._handle_command({"command": "KILL_SWITCH", "params": {"actor": "ops"}})
+        engine.process_signal(
+            Signal(
+                strategy_id=STRATEGY_ID,
+                product_id=PRODUCT_ID,
+                timeframe="1m",
+                timestamp=1_700_000_000_000,
+                type=SignalType.LONG,
+                quantity=Decimal("0.1"),
+            ),
+            Candlestick(
+                product_id=PRODUCT_ID,
+                timeframe="1m",
+                timestamp=1_700_000_000_000,
+                open=Decimal("100"),
+                high=Decimal("101"),
+                low=Decimal("99"),
+                close=Decimal("100"),
+                volume=Decimal("1"),
+            ),
+        )
+
+        engine.risk_manager.check_risk.assert_not_called()
+        engine.execution_engine.execute_signal.assert_not_called()
 
 
 # =============================================================================
