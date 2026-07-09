@@ -1319,6 +1319,48 @@ class TestStrategyWarmup:
         engine._strategy_state_manager.transition_to_error.assert_called_once()
         assert "position_state_sync_unsupported" in state.performance_json
 
+    def test_zero_lookback_strategy_still_syncs_position_state(self, engine):
+        """lookback_window == 0 skips candle warm-up but must not skip position sync."""
+        class ZeroLookbackNoSyncStrategy:
+            """No warm-up needed, and no sync hook/attrs — live position must fail closed."""
+            def __init__(self, strategy_id, product_id):
+                from src.strategies.base import StrategyRequirements
+                self.strategy_id = strategy_id
+                self.product_id = product_id
+                self._requirements = StrategyRequirements(product_id, "1m", 0)
+
+            @property
+            def requirements(self):
+                return self._requirements
+
+            def on_candle(self, candle):
+                return None
+
+        state = MagicMock()
+        state.status = StrategyStatus.READY
+        state.config_json = "{}"
+        engine._db_session_factory = self._make_warmup_db(state, [])
+        engine.account_service.set_position(
+            Position(
+                strategy_id="test.py::ZeroLookbackNoSyncStrategy",
+                product_id="BINANCE:BTCUSDT-PERP",
+                side=PositionSide.LONG,
+                quantity=Decimal("0.01"),
+                entry_price=Decimal("42000"),
+                unrealized_pnl=Decimal("0"),
+            )
+        )
+        engine.loaded_classes["test.py::ZeroLookbackNoSyncStrategy"] = ZeroLookbackNoSyncStrategy
+        engine._strategy_state_manager.transition_to_running = MagicMock()
+        engine._strategy_state_manager.transition_to_error = MagicMock()
+
+        engine.activate_strategy("test.py::ZeroLookbackNoSyncStrategy")
+
+        assert "test.py::ZeroLookbackNoSyncStrategy" not in engine.strategy_instances
+        engine._strategy_state_manager.transition_to_running.assert_not_called()
+        engine._strategy_state_manager.transition_to_error.assert_called_once()
+        assert "position_state_sync_unsupported" in state.performance_json
+
     # test_activate_strategy_replays_recent_candles_without_orders (line ~1011) already
     # covers the flat/no-position happy path: account_service returns None, position_side
     # is None, set_position_state returns True → activation succeeds.  No duplicate needed.

@@ -401,6 +401,9 @@ class StrategyEngine:
         reqs = instance.requirements
         lookback = max(int(reqs.lookback_window), 0)
         if lookback == 0:
+            # No candle warm-up needed, but restored live positions must still
+            # be synced or the strategy activates with flat internal state.
+            self._sync_strategy_position_state(instance)
             return 0
 
         rows = (
