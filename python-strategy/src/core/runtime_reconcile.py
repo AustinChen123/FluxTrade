@@ -96,36 +96,35 @@ class RuntimeReconciliationJob:
         }
 
         local_positions = self._local_positions(result)
+        local_positions_by_product = self._positions_by_product(local_positions)
         exchange_positions = self._exchange_positions_by_product(result)
+        result["checked_positions"] = len(local_positions)
         products = set(exchange_positions.keys())
-        products.update(position.product_id for position in local_positions)
+        products.update(local_positions_by_product.keys())
 
         for product_id in sorted(products):
-            local_position = next(
-                (pos for pos in local_positions if pos.product_id == product_id),
-                None,
-            )
-            if local_position is not None:
-                result["checked_positions"] += 1
-            exchange_position = exchange_positions.get(product_id)
+            local_product_positions = local_positions_by_product.get(product_id, [])
+            exchange_product_positions = exchange_positions.get(product_id)
             if product_id not in exchange_positions:
                 try:
                     exchange_position = self._adapter.get_position(product_id)
+                    exchange_product_positions = (
+                        [exchange_position] if exchange_position is not None else []
+                    )
                 except Exception as exc:
                     result["errors"].append(
                         {"scope": "positions", "reason": str(exc)}
                     )
                     continue
 
-            local_quantity = self._quantity(local_position)
-            exchange_quantity = self._quantity(exchange_position)
+            local_quantity = self._signed_total(local_product_positions)
+            exchange_quantity = self._signed_total(exchange_product_positions or [])
             if abs(local_quantity - exchange_quantity) > self._quantity_drift_threshold:
                 result["position_drifts"].append(
                     {
-                        "strategy_id": (
-                            local_position.strategy_id
-                            if local_position is not None
-                            else exchange_position.strategy_id
+                        "strategy_id": self._drift_strategy_id(
+                            local_product_positions,
+                            exchange_product_positions or [],
                         ),
                         "product_id": product_id,
                         "local_quantity": local_quantity,
@@ -144,31 +143,49 @@ class RuntimeReconciliationJob:
             result["errors"].append({"scope": "positions", "reason": str(exc)})
             return []
 
-    def _exchange_positions_by_product(self, result: dict) -> dict[str, Any]:
+    def _exchange_positions_by_product(self, result: dict) -> dict[str, list[Any]]:
         try:
             if hasattr(self._adapter, "get_all_positions"):
-                return {
-                    position.product_id: position
-                    for position in self._adapter.get_all_positions()
-                }
+                return self._positions_by_product(self._adapter.get_all_positions())
             if hasattr(self._adapter, "list_positions"):
-                return {
-                    position.product_id: position
-                    for position in self._adapter.list_positions()
-                }
+                return self._positions_by_product(self._adapter.list_positions())
             positions = getattr(self._adapter, "_positions", None)
             if isinstance(positions, dict):
-                return dict(positions)
+                return {
+                    product_id: [position] if position is not None else []
+                    for product_id, position in positions.items()
+                }
         except Exception as exc:
             result["errors"].append({"scope": "positions", "reason": str(exc)})
         return {}
 
     @staticmethod
-    def _quantity(position: Any | None) -> Decimal:
-        if position is None:
-            return Decimal("0")
+    def _positions_by_product(positions: list[Any]) -> dict[str, list[Any]]:
+        grouped: dict[str, list[Any]] = {}
+        for position in positions:
+            grouped.setdefault(position.product_id, []).append(position)
+        return grouped
+
+    def _signed_total(self, positions: list[Any]) -> Decimal:
+        return sum((self._signed_quantity(position) for position in positions), Decimal("0"))
+
+    @staticmethod
+    def _signed_quantity(position: Any) -> Decimal:
         quantity = position.quantity
-        return quantity if isinstance(quantity, Decimal) else Decimal(str(quantity))
+        decimal_quantity = quantity if isinstance(quantity, Decimal) else Decimal(str(quantity))
+        side = getattr(position, "side", None)
+        side_value = getattr(side, "value", side)
+        return -decimal_quantity if str(side_value).upper() == "SHORT" else decimal_quantity
+
+    @staticmethod
+    def _drift_strategy_id(local_positions: list[Any], exchange_positions: list[Any]) -> str:
+        if len(local_positions) == 1:
+            return str(local_positions[0].strategy_id)
+        if len(local_positions) > 1:
+            return "multiple"
+        if exchange_positions:
+            return str(exchange_positions[0].strategy_id)
+        return "unknown"
 
     def _check_balance(self, result: dict) -> None:
         try:

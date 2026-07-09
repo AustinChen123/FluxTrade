@@ -252,6 +252,24 @@ class TestRunOnceQuantityDrift:
         assert "position_drifts" in payload
         assert len(payload["position_drifts"]) >= 1
 
+    def test_same_product_local_positions_are_aggregated_before_compare(self):
+        local_positions = [
+            _make_position(strategy_id="strat_a", quantity=Decimal("0.4")),
+            _make_position(strategy_id="strat_b", quantity=Decimal("0.6")),
+        ]
+        exchange_pos = _make_position(strategy_id="exchange", quantity=Decimal("1.0"))
+        job, _, _ = _make_job(
+            local_positions=local_positions,
+            exchange_positions={PRODUCT_ID: exchange_pos},
+        )
+
+        with patch("src.core.runtime_reconcile.write_system_event") as mock_write:
+            result = job.run_once()
+            mock_write.assert_not_called()
+
+        assert result["checked_positions"] == 2
+        assert result["position_drifts"] == []
+
 
 class TestRunOnceAsymmetricDrift:
     """Matrix items 3 & 4: asymmetric presence (one side missing)."""
