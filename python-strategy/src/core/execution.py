@@ -1,4 +1,5 @@
 import logging
+import threading
 import time as _time
 from decimal import Decimal
 from typing import Callable, ContextManager, Optional
@@ -111,6 +112,12 @@ class ExecutionEngine:
             ),
             logger=self.logger,
         )
+        # Submission drain gate: halts new order submissions and waits for
+        # in-flight ones to finish before a kill switch snapshot.
+        self._submission_gate = threading.Condition()
+        self._submissions_halted = False
+        self._submissions_in_flight = 0
+
         self.logger.info("ExecutionEngine initialized with adapter: %s", type(adapter).__name__)
 
     def list_recoverable_client_orders(self):
@@ -410,15 +417,45 @@ class ExecutionEngine:
             return
         ensure(self._db_session)
 
+    def halt_and_drain(self, timeout: float = 30.0) -> bool:
+        """Halt new submissions and wait for in-flight ones to complete.
+
+        Sets the submission gate so that any subsequent call to execute_signal
+        or _place_pending_conditional_orders_for_entry is rejected immediately.
+        Then waits up to *timeout* seconds for in-flight submissions to finish.
+
+        Returns True if all in-flight submissions completed within the timeout,
+        False if the timeout was reached with work still in flight.
+        """
+        with self._submission_gate:
+            self._submissions_halted = True
+            return self._submission_gate.wait_for(
+                lambda: self._submissions_in_flight == 0,
+                timeout=timeout,
+            )
+
     def execute_signal(self, signal: Signal, candle: Optional[Candlestick] = None) -> Optional[str]:
         """
         Converts Signal to Order and delegates execution to the Adapter.
         Also places SL/TP/Trailing orders when specified in the signal.
         Returns the Order ID (Internal) if successful.
         """
-        if self.audit_external_orders:
-            return self._execute_signal_with_audit(signal, candle)
-        return self._execute_signal_core(signal, candle)
+        # Gate: reject if the submission gate has been halted by a kill switch.
+        with self._submission_gate:
+            if self._submissions_halted:
+                self.logger.warning(
+                    "execute_signal rejected: submission gate is halted (kill switch active)"
+                )
+                return None
+            self._submissions_in_flight += 1
+        try:
+            if self.audit_external_orders:
+                return self._execute_signal_with_audit(signal, candle)
+            return self._execute_signal_core(signal, candle)
+        finally:
+            with self._submission_gate:
+                self._submissions_in_flight -= 1
+                self._submission_gate.notify_all()
 
     def _execute_signal_core(self, signal: Signal, candle: Optional[Candlestick] = None) -> Optional[str]:
         """Current non-audited signal execution path."""
@@ -1034,6 +1071,29 @@ class ExecutionEngine:
         return conditional_id
 
     def _place_pending_conditional_orders_for_entry(self, entry_order) -> list[dict]:
+        # Gate: reject conditional placement if the submission gate is halted.
+        with self._submission_gate:
+            if self._submissions_halted:
+                self.logger.warning(
+                    "Conditional order placement rejected for entry %s: kill switch active",
+                    getattr(entry_order, "id", "?"),
+                )
+                return [
+                    {
+                        "order_id": str(getattr(entry_order, "id", "?")),
+                        "order_type": getattr(entry_order, "type", "?"),
+                        "reason": "kill_switch_halted",
+                    }
+                ]
+            self._submissions_in_flight += 1
+        try:
+            return self._place_pending_conditional_orders_for_entry_impl(entry_order)
+        finally:
+            with self._submission_gate:
+                self._submissions_in_flight -= 1
+                self._submission_gate.notify_all()
+
+    def _place_pending_conditional_orders_for_entry_impl(self, entry_order) -> list[dict]:
         if entry_order.type not in {"market", "limit"}:
             return []
         protected_quantity = entry_order.filled_quantity or Decimal("0")

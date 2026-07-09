@@ -876,3 +876,390 @@ class TestEngineKillSwitchCommand:
         engine._handle_command(data)
 
         engine._command_router.handle.assert_called_once_with(data)
+
+
+# =============================================================================
+# D. Fix 1 — _positions() local fetch failure isolation
+# =============================================================================
+
+
+class FakeFailingAccountService:
+    """Account service whose get_all_positions always raises."""
+
+    def __init__(self, exc: Exception | None = None) -> None:
+        self._exc = exc or RuntimeError("Redis connection refused")
+
+    def get_balance(self) -> Decimal:
+        return Decimal("0")
+
+    def get_all_positions(self) -> list:
+        raise self._exc
+
+
+def _make_service_with_failing_account(
+    *,
+    adapter: object | None = None,
+    exc: Exception | None = None,
+) -> tuple[OpsSafetyService, RecordingExecutionEngine]:
+    fake_engine = RecordingExecutionEngine()
+    fake_engine.adapter = adapter
+    account = FakeFailingAccountService(exc=exc)
+    db_factory = _make_null_db_session_factory()
+    service = OpsSafetyService(fake_engine, account, db_factory)
+    return service, fake_engine
+
+
+class TestLocalFetchFailureIsolation:
+    """Fix 1: local position fetch failure must not suppress adapter flatten."""
+
+    def test_local_raises_adapter_has_positions_all_flattened(self):
+        """account_service raises + adapter has positions → every exchange position is flattened."""
+        exc = RuntimeError("Redis down")
+        exchange_pos = _make_position(strategy_id="LIVE", quantity=Decimal("1.5"))
+        service, engine = _make_service_with_failing_account(
+            adapter=FakeExchangePositionAdapter(positions=[exchange_pos]),
+            exc=exc,
+        )
+
+        result = service.kill_switch(actor="ops")
+
+        assert result["flattened_positions"] == 1
+        assert any(c[0] == "flatten_position" for c in engine.calls)
+
+    def test_local_raises_adapter_has_positions_flatten_failures_contains_unavailable_entry(self):
+        """flatten_failures must include a local_positions_unavailable entry."""
+        exc = RuntimeError("Redis down")
+        exchange_pos = _make_position(strategy_id="LIVE", quantity=Decimal("1.5"))
+        service, engine = _make_service_with_failing_account(
+            adapter=FakeExchangePositionAdapter(positions=[exchange_pos]),
+            exc=exc,
+        )
+
+        result = service.kill_switch(actor="ops")
+
+        unavailable = [
+            f for f in result["flatten_failures"]
+            if "local_positions_unavailable" in f.get("reason", "")
+        ]
+        assert unavailable, (
+            "Expected a local_positions_unavailable entry in flatten_failures"
+        )
+
+    def test_local_raises_adapter_has_positions_already_flat_false(self):
+        """already_flat must be False when local fetch failed (cannot confirm flat state)."""
+        exchange_pos = _make_position(strategy_id="LIVE", quantity=Decimal("1.5"))
+        service, _ = _make_service_with_failing_account(
+            adapter=FakeExchangePositionAdapter(positions=[exchange_pos]),
+        )
+
+        result = service.kill_switch(actor="ops")
+
+        assert result["already_flat"] is False
+
+    def test_local_raises_adapter_no_enumeration_failure_recorded(self):
+        """account_service raises + adapter has no enumeration method → failure recorded."""
+
+        class NoEnumAdapter:
+            """Adapter without get_all_positions or list_positions."""
+
+        service, _ = _make_service_with_failing_account(adapter=NoEnumAdapter())
+
+        result = service.kill_switch(actor="ops")
+
+        assert result["flatten_failures"], (
+            "Expected a flatten_failure entry when both local and adapter enumeration fail"
+        )
+
+    def test_local_raises_adapter_no_enumeration_already_flat_false(self):
+        """already_flat must be False when enumeration is completely unavailable."""
+
+        class NoEnumAdapter:
+            pass
+
+        service, _ = _make_service_with_failing_account(adapter=NoEnumAdapter())
+
+        result = service.kill_switch(actor="ops")
+
+        assert result["already_flat"] is False
+
+    def test_local_raises_adapter_no_enumeration_no_flatten_attempted(self):
+        """No flatten should be attempted when the position list cannot be determined."""
+
+        class NoEnumAdapter:
+            pass
+
+        service, engine = _make_service_with_failing_account(adapter=NoEnumAdapter())
+
+        result = service.kill_switch(actor="ops")
+
+        assert result["flattened_positions"] == 0
+        assert not any(c[0] == "flatten_position" for c in engine.calls)
+
+
+@pytest.mark.parametrize(
+    "local_ok, adapter_has_enum, expected_flattened, expect_local_error_entry",
+    [
+        # local ok + adapter has get_all_positions → attributed flatten, no local error entry
+        (True, True, 1, False),
+        # local ok + no adapter → uses local positions, no local error entry
+        (True, False, 1, False),
+        # local error + adapter has get_all_positions → adapter flatten, local_error entry
+        (False, True, 1, True),
+        # local error + no adapter → no flatten, failure recorded, no "local_positions_unavailable" entry
+        #   (the re-raised exc is caught as a generic enumeration failure)
+        (False, False, 0, False),
+    ],
+    ids=["ok/enum", "ok/none", "error/enum", "error/none"],
+)
+def test_positions_fetch_matrix(
+    local_ok: bool,
+    adapter_has_enum: bool,
+    expected_flattened: int,
+    expect_local_error_entry: bool,
+):
+    """2×2 matrix: local {ok, error} × adapter {has get_all_positions, has neither}."""
+    exchange_pos = _make_position(strategy_id="LIVE", quantity=Decimal("1.0"))
+    local_pos = _make_position(strategy_id=STRATEGY_ID, quantity=Decimal("1.0"))
+
+    if adapter_has_enum:
+        adapter: object = FakeExchangePositionAdapter(positions=[exchange_pos])
+    else:
+        # No adapter attached — positions come from local only (or fail entirely)
+        adapter = None
+
+    if local_ok:
+        account = FakeAccountService(positions=[local_pos])
+        fake_engine = RecordingExecutionEngine()
+        fake_engine.adapter = adapter
+        service = OpsSafetyService(fake_engine, account, _make_null_db_session_factory())
+    else:
+        fake_engine = RecordingExecutionEngine()
+        fake_engine.adapter = adapter
+        account = FakeFailingAccountService()
+        service = OpsSafetyService(fake_engine, account, _make_null_db_session_factory())
+
+    result = service.kill_switch(actor="ops")
+
+    assert result["flattened_positions"] == expected_flattened, (
+        f"Expected flattened={expected_flattened}, got {result['flattened_positions']}"
+    )
+
+    if expect_local_error_entry:
+        unavailable = [
+            f for f in result["flatten_failures"]
+            if "local_positions_unavailable" in f.get("reason", "")
+        ]
+        assert unavailable, "Expected local_positions_unavailable entry in flatten_failures"
+    else:
+        unavailable = [
+            f for f in result["flatten_failures"]
+            if "local_positions_unavailable" in f.get("reason", "")
+        ]
+        assert not unavailable, (
+            "Did not expect local_positions_unavailable entry in flatten_failures"
+        )
+
+
+# =============================================================================
+# E. Fix 2 — Submission drain gate
+# =============================================================================
+
+import threading  # noqa: E402 — stdlib, safe to import here
+
+
+class BlockingAdapter:
+    """Adapter whose place_order blocks until released."""
+
+    def __init__(self) -> None:
+        self._block = threading.Event()
+        self._placed = threading.Event()
+
+    def release(self) -> None:
+        self._block.set()
+
+    def place_order(self, order) -> str:
+        self._placed.set()
+        self._block.wait()
+        order.exchange_order_id = "BLOCKED-EX-001"
+        return "BLOCKED-EX-001"
+
+    def get_order_by_client_id(self, client_order_id, product_id, *, order_type=None):
+        return None
+
+
+def _make_drain_engine(adapter=None, mock_db_session=None, mock_clock=None):
+    """Build a real ExecutionEngine with an in-memory repo for drain tests."""
+    from tests.conftest import MockOrderRepository, MockClock
+    from unittest.mock import MagicMock
+
+    repo = MockOrderRepository()
+    clk = mock_clock if mock_clock is not None else MockClock()
+    db = mock_db_session if mock_db_session is not None else MagicMock()
+    adp = adapter if adapter is not None else MagicMock()
+    return ExecutionEngine(
+        db_session=db,
+        clock=clk,
+        adapter=adp,
+        order_repository=repo,
+    )
+
+
+def _make_signal(
+    strategy_id: str = STRATEGY_ID,
+    product_id: str = PRODUCT_ID,
+    quantity: Decimal = Decimal("0.1"),
+) -> Signal:
+    return Signal(
+        strategy_id=strategy_id,
+        product_id=product_id,
+        timeframe="1m",
+        timestamp=1_700_000_000_000,
+        type=SignalType.LONG,
+        quantity=quantity,
+    )
+
+
+class TestSubmissionDrainGate:
+    """Fix 2: drain gate prevents TOCTOU between execute_signal and kill_switch."""
+
+    def test_post_halt_execute_signal_returns_none_without_calling_adapter(self):
+        """After halt_and_drain, execute_signal must return None immediately."""
+        from unittest.mock import patch
+
+        eng = _make_drain_engine()
+        eng.halt_and_drain(timeout=0.01)
+
+        signal = _make_signal()
+        with patch.object(eng, "_execute_signal_core", wraps=eng._execute_signal_core) as mock_core:
+            result = eng.execute_signal(signal)
+
+        assert result is None
+        mock_core.assert_not_called()
+
+    def test_inflight_drain_waits_for_order_before_snapshot(self):
+        """kill_switch waits until an in-flight execute_signal completes."""
+        blocking_adapter = BlockingAdapter()
+        eng = _make_drain_engine(adapter=blocking_adapter)
+
+        signal = _make_signal()
+
+        # Start execute_signal in a background thread.
+        submit_thread = threading.Thread(target=eng.execute_signal, args=(signal,), daemon=True)
+        submit_thread.start()
+
+        # Wait until the adapter's place_order is actually blocking.
+        placed = blocking_adapter._placed.wait(timeout=2.0)
+        assert placed, "place_order was never called — test setup issue"
+
+        # Call halt_and_drain; it must block until we release the adapter.
+        drain_done = threading.Event()
+        drain_result: list[bool] = []
+
+        def do_drain():
+            drain_result.append(eng.halt_and_drain(timeout=5.0))
+            drain_done.set()
+
+        drain_thread = threading.Thread(target=do_drain, daemon=True)
+        drain_thread.start()
+
+        # Give drain a moment to start waiting.
+        import time
+        time.sleep(0.05)
+        # Drain must still be waiting (in_flight > 0).
+        assert not drain_done.is_set(), "halt_and_drain returned before order was placed"
+
+        # Release the adapter; the submit thread completes; drain returns.
+        blocking_adapter.release()
+        submit_thread.join(timeout=2.0)
+        drain_done.wait(timeout=2.0)
+
+        assert drain_result == [True], "Expected drained=True after releasing the adapter"
+
+        # The order should exist in the repo now.
+        assert eng.order_manager.repo.orders, "Order must be in the repo after drain"
+
+    def test_drain_timeout_result_has_drain_timeout_true(self):
+        """When place_order never returns, kill_switch records drain_timeout=True."""
+        blocking_adapter = BlockingAdapter()
+        eng = _make_drain_engine(adapter=blocking_adapter)
+
+        signal = _make_signal()
+
+        submit_thread = threading.Thread(target=eng.execute_signal, args=(signal,), daemon=True)
+        submit_thread.start()
+
+        # Wait until place_order is blocking.
+        blocking_adapter._placed.wait(timeout=2.0)
+
+        fake_account = FakeAccountService(positions=[])
+        service = OpsSafetyService(
+            eng, fake_account, _make_null_db_session_factory(), drain_timeout=0.1
+        )
+        result = service.kill_switch(actor="ops")
+
+        assert result.get("drain_timeout") is True, (
+            f"Expected drain_timeout=True in result, got: {result}"
+        )
+
+        # Cleanup: release so the thread can exit.
+        blocking_adapter.release()
+        submit_thread.join(timeout=2.0)
+
+    def test_gated_conditional_placement_after_halt_returns_halted_failure(self):
+        """_place_pending_conditional_orders_for_entry must report kill_switch_halted after halt."""
+        eng = _make_drain_engine()
+        eng.halt_and_drain(timeout=0.01)
+
+        entry = Order()
+        entry.id = "entry-001"
+        entry.type = "market"
+        entry.filled_quantity = Decimal("1.0")
+
+        failures = eng._place_pending_conditional_orders_for_entry(entry)
+
+        assert any(f.get("reason") == "kill_switch_halted" for f in failures), (
+            f"Expected kill_switch_halted failure entry, got: {failures}"
+        )
+
+    def test_invariant_no_cancellable_orders_after_clean_drain(self):
+        """After a kill_switch with a clean drain, no non-ops orders remain in cancellable statuses."""
+        repo_eng = _make_drain_engine()
+
+        # Pre-populate repo with a submitted order as if a previous execute_signal ran.
+        submitted_order = _make_order("submitted-001", OrderStatus.SUBMITTED.value)
+        repo_eng.order_manager.repo.orders[submitted_order.id] = submitted_order
+
+        fake_account = FakeAccountService(positions=[])
+        service = OpsSafetyService(
+            repo_eng, fake_account, _make_null_db_session_factory(), drain_timeout=5.0
+        )
+
+        # Patch cancel_order on the engine (it's called by kill_switch for SUBMITTED orders).
+        cancelled: list[str] = []
+
+        def fake_cancel(order_id: str) -> bool:
+            submitted_order.status = OrderStatus.CANCELLED.value
+            repo_eng.order_manager.repo.orders[submitted_order.id] = submitted_order
+            cancelled.append(order_id)
+            return True
+
+        repo_eng.cancel_order = fake_cancel
+
+        result = service.kill_switch(actor="ops")
+
+        assert result.get("drain_timeout") is False or "drain_timeout" not in result or not result["drain_timeout"]
+
+        cancellable = {
+            OrderStatus.NEW.value,
+            OrderStatus.SUBMITTED_UNCONFIRMED.value,
+            OrderStatus.SUBMITTED.value,
+            OrderStatus.PARTIALLY_FILLED.value,
+        }
+        ops_strategy = "__ops_kill_switch__"
+        remaining = [
+            o for o in repo_eng.order_manager.repo.orders.values()
+            if o.status in cancellable and o.strategy_id != ops_strategy
+        ]
+        assert not remaining, (
+            f"Non-ops orders in cancellable statuses after kill_switch: {[o.id for o in remaining]}"
+        )

@@ -25,6 +25,8 @@ from src.core.models import OrderStatus
 
 OPS_KILL_SWITCH_STRATEGY_ID = "__ops_kill_switch__"
 
+_DRAIN_TIMEOUT_DEFAULT = 30.0
+
 
 class OpsSafetyService:
     """Kill-switch and ops-safety façade for live trading.
@@ -40,11 +42,13 @@ class OpsSafetyService:
         account_service: Any,
         db_session_factory: Callable[[], ContextManager[Session]],
         logger: logging.Logger | None = None,
+        drain_timeout: float = _DRAIN_TIMEOUT_DEFAULT,
     ) -> None:
         self._execution_engine = execution_engine
         self._account_service = account_service
         self._db_session_factory = db_session_factory
         self._logger = logger or logging.getLogger(__name__)
+        self._drain_timeout = drain_timeout
 
     def kill_switch(self, *, actor: str, reason: str | None = None) -> dict:
         """Cancel all open orders, then flatten all positions.
@@ -81,7 +85,22 @@ class OpsSafetyService:
             "flattened_positions": 0,
             "flatten_failures": [],
             "already_flat": False,
+            "drain_timeout": False,
         }
+
+        # Drain in-flight order submissions before snapshotting state.
+        halt_and_drain = getattr(self._execution_engine, "halt_and_drain", None)
+        if callable(halt_and_drain):
+            drained = halt_and_drain(self._drain_timeout)
+            if not drained:
+                in_flight = getattr(self._execution_engine, "_submissions_in_flight", None)
+                self._logger.warning(
+                    "Kill switch drain timed out after %.1fs; %s submissions still in flight",
+                    self._drain_timeout,
+                    in_flight,
+                )
+                result["drain_timeout"] = True
+                result["drain_in_flight"] = in_flight
 
         orders = self._open_orders()
         for order in orders:
@@ -104,7 +123,7 @@ class OpsSafetyService:
                 )
 
         try:
-            positions = self._positions()
+            positions, local_fetch_error = self._positions()
         except Exception as exc:
             self._logger.exception("Kill switch failed to enumerate live positions")
             result["flatten_failures"].append(
@@ -115,6 +134,18 @@ class OpsSafetyService:
                 }
             )
             positions = []
+            local_fetch_error = None
+        else:
+            if local_fetch_error is not None:
+                # Local state was unavailable but adapter positions were retrieved;
+                # surface the local failure so already_flat stays False.
+                result["flatten_failures"].append(
+                    {
+                        "strategy_id": "unknown",
+                        "product_id": "unknown",
+                        "reason": f"local_positions_unavailable: {local_fetch_error}",
+                    }
+                )
         for position in positions:
             strategy_id = position.strategy_id
             product_id = position.product_id
@@ -181,23 +212,58 @@ class OpsSafetyService:
             self._execution_engine.order_manager.repo.list_orders_by_statuses(statuses)
         )
 
-    def _positions(self) -> list[Any]:
-        local_positions = list(self._account_service.get_all_positions())
+    def _positions(self) -> tuple[list[Any], Exception | None]:
+        """Return (positions, local_error_or_None).
+
+        Fetches local positions for owner attribution first, then queries the
+        adapter for authoritative exchange positions.  The adapter path runs
+        regardless of whether the local fetch succeeded so that live exchange
+        exposure is always flattened.
+
+        Raises only when the adapter has no enumeration method AND the local
+        fetch failed — there is nothing to flatten and we must not silently
+        return an empty list (which would cause kill_switch to report
+        already_flat=True).
+        """
+        local_error: Exception | None = None
+        try:
+            local_positions: list[Any] = list(self._account_service.get_all_positions())
+        except Exception as exc:
+            self._logger.warning(
+                "Kill switch: local position fetch failed, proceeding with adapter query: %s",
+                exc,
+            )
+            local_error = exc
+            local_positions = []
+
         adapter = getattr(self._execution_engine, "adapter", None)
         if adapter is not None:
             get_all_positions = getattr(adapter, "get_all_positions", None)
             if callable(get_all_positions):
-                return self._assign_local_position_owners(
-                    list(get_all_positions()),
-                    local_positions,
+                return (
+                    self._assign_local_position_owners(
+                        list(get_all_positions()),
+                        local_positions,
+                    ),
+                    local_error,
                 )
             list_positions = getattr(adapter, "list_positions", None)
             if callable(list_positions):
-                return self._assign_local_position_owners(
-                    list(list_positions()),
-                    local_positions,
+                return (
+                    self._assign_local_position_owners(
+                        list(list_positions()),
+                        local_positions,
+                    ),
+                    local_error,
                 )
-        return local_positions
+
+        if local_error is not None:
+            # No adapter enumeration method and local fetch failed: we cannot
+            # determine exposure, so re-raise to let kill_switch record the
+            # failure rather than falsely reporting already_flat.
+            raise local_error
+
+        return local_positions, None
 
     @staticmethod
     def _assign_local_position_owners(
