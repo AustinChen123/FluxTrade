@@ -7,6 +7,7 @@ from src.core.redis_factory import create_redis_client
 from src.core.risk_config import RiskConfig
 from src.core.risk_rules import RuleStatus
 from src.core.risk_rules.daily_loss_circuit_breaker import DailyLossCircuitBreakerRule
+from src.core.risk_rules.existing_position_entry import ExistingPositionEntryRule
 from src.core.risk_rules.max_position_notional import MaxPositionNotionalRule
 from src.core.risk_rules.order_rate_limit import OrderRateLimitRule
 from src.core.risk_rules.price_sanity_check import PriceSanityCheckRule
@@ -91,6 +92,7 @@ class RiskManager:
         order_rate_limit_rule: Optional[OrderRateLimitRule] = None,
         redis_client=None,
         max_position_rule: Optional[MaxPositionNotionalRule] = None,
+        existing_position_entry_rule: Optional[ExistingPositionEntryRule] = None,
         state_manager: Optional[Any] = None,
         daily_nav_service: Optional[Any] = None,
     ):
@@ -107,6 +109,9 @@ class RiskManager:
                 rate_limit_redis,
             )
         self.max_position_rule = max_position_rule or MaxPositionNotionalRule(self.risk_config)
+        self.existing_position_entry_rule = (
+            existing_position_entry_rule or ExistingPositionEntryRule()
+        )
         self.capital_allocator = capital_allocator
         self.state_manager = state_manager
         self.daily_nav_service = daily_nav_service
@@ -208,6 +213,19 @@ class RiskManager:
             price_for_exposure = current_price if current_price is not None else position.entry_price
 
             if is_entry:
+                if (
+                    not self.risk_config.allow_same_side_reentry
+                    and self.existing_position_entry_rule is not None
+                ):
+                    rule_status, rule_reason = self.existing_position_entry_rule.evaluate(
+                        signal,
+                        position,
+                    )
+                    if rule_status == RuleStatus.REJECT:
+                        msg = f"REJECT: {rule_reason}"
+                        logger.warning("RISK_REJECTED: %s", msg)
+                        return False, msg
+
                 if signal.quantity is None:
                     current_exposure = position.quantity * price_for_exposure
                     if current_exposure > self.risk_config.max_position_notional:

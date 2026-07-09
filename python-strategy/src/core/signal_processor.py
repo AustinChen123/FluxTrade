@@ -28,15 +28,27 @@ class SignalProcessor:
         self.state_manager = state_manager
         self.signal_handler = signal_handler
 
-    def on_candle(self, candle: Candlestick) -> None:
-        """Route a candle to matching, running strategies."""
+    def on_candle(
+        self,
+        candle: Candlestick,
+        *,
+        emit_signals: bool = True,
+        respect_state: bool = True,
+    ) -> None:
+        """Route a candle to matching, running strategies.
+
+        ``emit_signals=False`` is used for startup warm-up replay: strategy
+        memory is rebuilt from candles, but any generated signals are ignored.
+        """
         for strategy in self.registry.list_active():
             if strategy.product_id != candle.product_id:
                 continue
             if strategy.requirements.timeframe != candle.timeframe:
                 continue
-            if self.state_manager is not None and not self.state_manager.is_running(
-                strategy.strategy_id
+            if (
+                respect_state
+                and self.state_manager is not None
+                and not self.state_manager.is_running(strategy.strategy_id)
             ):
                 logger.debug(
                     "Skipping strategy %s because it is not running",
@@ -46,9 +58,70 @@ class SignalProcessor:
 
             try:
                 signals = self._dispatch_to_strategy(strategy, candle)
-                self._process_signals(strategy.strategy_id, signals, candle)
+                if emit_signals:
+                    self._process_signals(strategy.strategy_id, signals, candle)
             except Exception:
                 logger.exception("Error processing strategy %s", strategy.strategy_id)
+
+    def warm_up(self, strategy: BaseStrategy, candles: list[Candlestick]) -> None:
+        """Replay candles through one strategy without emitting orders."""
+        trade_state = self._snapshot_trade_state(strategy)
+        try:
+            for candle in candles:
+                if strategy.product_id != candle.product_id:
+                    continue
+                if strategy.requirements.timeframe != candle.timeframe:
+                    continue
+                self._dispatch_to_strategy(strategy, candle)
+        finally:
+            self._restore_trade_state(strategy, trade_state)
+
+    def set_position_state(self, strategy: BaseStrategy, position_side: str | None) -> bool:
+        """Align strategy trade-state with the actual account position.
+
+        Hook contract: True = synced, False = side unsupported (caller fails
+        closed), None = not handled -> generic attribute fallback. The
+        fallback only accepts a non-flat side for strategies exposing a
+        direction-aware ``position`` attribute; ``_in_position``-only
+        strategies cannot represent direction and may only sync flat state.
+        """
+        sync_hook = getattr(strategy, "sync_position_state", None)
+        if callable(sync_hook):
+            hook_result = sync_hook(position_side)
+            if hook_result is not None:
+                return bool(hook_result)
+
+        normalized_side = position_side.upper() if position_side else None
+        has_direction_attr = hasattr(strategy, "position")
+        if normalized_side is not None and not has_direction_attr:
+            # _in_position alone cannot represent LONG vs SHORT safely.
+            return False
+        applied = False
+        if hasattr(strategy, "_in_position"):
+            setattr(strategy, "_in_position", normalized_side is not None)
+            applied = True
+        if has_direction_attr:
+            if normalized_side == "LONG":
+                setattr(strategy, "position", 1)
+            elif normalized_side == "SHORT":
+                setattr(strategy, "position", -1)
+            else:
+                setattr(strategy, "position", 0)
+            applied = True
+        return applied
+
+    @staticmethod
+    def _snapshot_trade_state(strategy: BaseStrategy) -> dict[str, Any]:
+        return {
+            attr: getattr(strategy, attr)
+            for attr in ("_in_position", "position")
+            if hasattr(strategy, attr)
+        }
+
+    @staticmethod
+    def _restore_trade_state(strategy: BaseStrategy, state: dict[str, Any]) -> None:
+        for attr, value in state.items():
+            setattr(strategy, attr, value)
 
     def on_trade(self, trade: Trade) -> None:
         """Route a trade to matching, running strategies."""

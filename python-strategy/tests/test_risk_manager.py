@@ -14,9 +14,10 @@ from datetime import date
 from decimal import Decimal
 from unittest.mock import MagicMock, patch
 
-from src.core.models import SignalType
+from src.core.models import PositionSide, SignalType
 from src.core.risk_config import RiskConfig
 from src.core.risk_rules import RuleStatus
+from src.core.risk_rules.existing_position_entry import ExistingPositionEntryRule
 from src.core.risk_manager import RiskManager, AccountService
 
 
@@ -39,6 +40,16 @@ class _FakeDailyNavService:
     def get_start_nav(self, strategy_id, snapshot_date):
         self.calls.append((strategy_id, snapshot_date))
         return self.nav
+
+
+
+class _PassExistingPositionEntryRule:
+    """Permissive stub so exposure tests exercise exposure semantics, not the
+    default-on duplicate-entry rule."""
+
+    def evaluate(self, signal, current_position):
+        from src.core.risk_rules import RuleStatus
+        return RuleStatus.PASS, None
 
 
 class TestRiskManagerBalanceChecks:
@@ -343,7 +354,10 @@ class TestRiskManagerExposureChecks:
         )
         mock_account_service.set_position(large_position)
 
-        risk_manager = RiskManager(mock_account_service)
+        risk_manager = RiskManager(
+            mock_account_service,
+            existing_position_entry_rule=_PassExistingPositionEntryRule(),
+        )
         signal = signal_factory(signal_type=SignalType.LONG)
 
         # current_price=40000 -> 3 * 40000 = 120000 > default 100000
@@ -352,26 +366,107 @@ class TestRiskManagerExposureChecks:
         assert is_allowed is False
         assert "exposure" in reason.lower()
 
-    def test_allow_entry_when_under_max_exposure(
+    def test_reject_same_side_entry_when_position_already_exists(
         self, mock_account_service, signal_factory, position_factory
     ):
-        """Entry should be allowed when under max exposure."""
+        """Duplicate same-side entries are rejected for restart idempotency."""
         mock_account_service.set_balance(Decimal("100000"))
-
-        # Set position with low exposure
-        small_position = position_factory(
+        position = position_factory(
             quantity=Decimal("0.5"),
-            entry_price=Decimal("40000")
+            entry_price=Decimal("40000"),
+            side=PositionSide.LONG,
         )
-        mock_account_service.set_position(small_position)
+        mock_account_service.set_position(position)
+        risk_manager = RiskManager(
+            mock_account_service,
+            existing_position_entry_rule=ExistingPositionEntryRule(),
+        )
+        signal = signal_factory(
+            signal_type=SignalType.LONG,
+            price=Decimal("40000"),
+            quantity=Decimal("0.01"),
+        )
 
-        risk_manager = RiskManager(mock_account_service)
-        signal = signal_factory(signal_type=SignalType.LONG)
-
-        # current_price=40000 -> 0.5 * 40000 = 20000 < default 100000
         is_allowed, reason = risk_manager.check_risk(signal, current_price=Decimal("40000"))
 
-        assert is_allowed is True
+        assert is_allowed is False
+        assert "existing_position_entry_duplicate" in reason
+
+    def test_reject_same_side_short_entry_when_position_already_exists(
+        self, mock_account_service, signal_factory, position_factory
+    ):
+        """Duplicate SHORT entries are rejected symmetrically."""
+        mock_account_service.set_balance(Decimal("100000"))
+        position = position_factory(
+            quantity=Decimal("0.5"),
+            entry_price=Decimal("40000"),
+            side=PositionSide.SHORT,
+        )
+        mock_account_service.set_position(position)
+        risk_manager = RiskManager(
+            mock_account_service,
+            existing_position_entry_rule=ExistingPositionEntryRule(),
+        )
+        signal = signal_factory(
+            signal_type=SignalType.SHORT,
+            price=Decimal("40000"),
+            quantity=Decimal("0.01"),
+        )
+
+        is_allowed, reason = risk_manager.check_risk(signal, current_price=Decimal("40000"))
+
+        assert is_allowed is False
+        assert "existing_position_entry_duplicate" in reason
+
+    def test_same_side_entry_rejected_by_default(
+        self, mock_account_service, signal_factory, position_factory
+    ):
+        """ExistingPositionEntryRule is active by default; same-side entries are rejected."""
+        mock_account_service.set_balance(Decimal("100000"))
+        position = position_factory(
+            quantity=Decimal("0.5"),
+            entry_price=Decimal("40000"),
+            side=PositionSide.LONG,
+        )
+        mock_account_service.set_position(position)
+        risk_manager = RiskManager(mock_account_service)
+        signal = signal_factory(
+            signal_type=SignalType.LONG,
+            price=Decimal("40000"),
+            quantity=Decimal("0.01"),
+        )
+
+        is_allowed, reason = risk_manager.check_risk(signal, current_price=Decimal("40000"))
+
+        assert is_allowed is False
+        assert "existing_position_entry_duplicate" in reason
+
+    def test_default_construction_rejects_duplicate_long_entry(
+        self, mock_account_service, signal_factory, position_factory
+    ):
+        """Regression: default RiskManager (no explicit rule) must reject same-side entry.
+
+        This test exercises the DEFAULT construction path — do NOT inject the rule
+        manually. It must FAIL if someone reverts the default wiring in risk_manager.py.
+        """
+        mock_account_service.set_balance(Decimal("100000"))
+        position = position_factory(
+            quantity=Decimal("1"),
+            entry_price=Decimal("50000"),
+            side=PositionSide.LONG,
+        )
+        mock_account_service.set_position(position)
+        risk_manager = RiskManager(mock_account_service)  # no existing_position_entry_rule arg
+        signal = signal_factory(
+            signal_type=SignalType.LONG,
+            price=Decimal("50000"),
+            quantity=Decimal("0.01"),
+        )
+
+        is_allowed, reason = risk_manager.check_risk(signal, current_price=Decimal("50000"))
+
+        assert is_allowed is False
+        assert "existing_position_entry_duplicate" in reason
 
     def test_exposure_uses_current_price_not_entry_price(
         self, mock_account_service, signal_factory, position_factory
@@ -386,14 +481,18 @@ class TestRiskManagerExposureChecks:
         )
         mock_account_service.set_position(position)
 
-        risk_manager = RiskManager(mock_account_service)
+        risk_manager = RiskManager(
+            mock_account_service,
+            existing_position_entry_rule=_PassExistingPositionEntryRule(),
+        )
         signal = signal_factory(signal_type=SignalType.LONG)
 
-        # With current_price=$90, exposure = 1000 * 90 = 90000 < 100000 -> PASS
-        is_allowed, _ = risk_manager.check_risk(signal, current_price=Decimal("90"))
+        # current 90 -> exposure 90000 < 100000: allowed
+        is_allowed, reason = risk_manager.check_risk(signal, current_price=Decimal("90"))
         assert is_allowed is True
+        assert reason == "PASS"
 
-        # With current_price=$120, exposure = 1000 * 120 = 120000 > 100000 -> REJECT
+        # current 120 -> exposure 120000 > 100000: rejected by exposure
         is_allowed, reason = risk_manager.check_risk(signal, current_price=Decimal("120"))
         assert is_allowed is False
         assert "exposure" in reason.lower()
@@ -410,10 +509,12 @@ class TestRiskManagerExposureChecks:
         )
         mock_account_service.set_position(large_position)
 
-        risk_manager = RiskManager(mock_account_service)
+        risk_manager = RiskManager(
+            mock_account_service,
+            existing_position_entry_rule=_PassExistingPositionEntryRule(),
+        )
         signal = signal_factory(signal_type=SignalType.LONG)
 
-        # No current_price → fallback to entry_price
         is_allowed, reason = risk_manager.check_risk(signal)
 
         assert is_allowed is False
@@ -438,10 +539,10 @@ class TestRiskManagerExposureChecks:
 
         assert is_allowed is True
 
-    def test_reject_entry_when_projected_position_exceeds_config(
+    def test_reject_same_side_entry_before_projected_position_check(
         self, mock_account_service, signal_factory, position_factory
     ):
-        """Configured rule should reject projected same-side exposure."""
+        """The idempotency guard owns duplicate same-side entry rejection."""
         mock_account_service.set_balance(Decimal("100000"))
         position = position_factory(
             quantity=Decimal("1.99"),
@@ -451,6 +552,7 @@ class TestRiskManagerExposureChecks:
         risk_manager = RiskManager(
             mock_account_service,
             risk_config=RiskConfig(max_position_notional=Decimal("100000")),
+            existing_position_entry_rule=ExistingPositionEntryRule(),
         )
         signal = signal_factory(
             signal_type=SignalType.LONG,
@@ -464,7 +566,7 @@ class TestRiskManagerExposureChecks:
         )
 
         assert is_allowed is False
-        assert "max_position_notional_exceeded" in reason
+        assert "existing_position_entry_duplicate" in reason
 
     def test_allow_opposite_entry_that_reduces_exposure(
         self, mock_account_service, signal_factory, position_factory
@@ -481,6 +583,38 @@ class TestRiskManagerExposureChecks:
             signal_type=SignalType.SHORT,
             price=Decimal("50000"),
             quantity=Decimal("0.05"),
+        )
+
+        is_allowed, reason = risk_manager.check_risk(
+            signal,
+            current_price=Decimal("50000"),
+        )
+
+        assert is_allowed is True
+        assert reason == "PASS"
+
+    def test_allow_same_side_reentry_when_flag_is_true(
+        self, mock_account_service, signal_factory, position_factory
+    ):
+        """RiskManager with allow_same_side_reentry=True lets scale-in through to exposure checks."""
+        mock_account_service.set_balance(Decimal("100000"))
+        position = position_factory(
+            quantity=Decimal("0.5"),
+            entry_price=Decimal("50000"),
+        )
+        mock_account_service.set_position(position)
+        risk_manager = RiskManager(
+            mock_account_service,
+            risk_config=RiskConfig(
+                max_position_notional=Decimal("100000"),
+                allow_same_side_reentry=True,
+            ),
+            existing_position_entry_rule=ExistingPositionEntryRule(),
+        )
+        signal = signal_factory(
+            signal_type=SignalType.LONG,
+            price=Decimal("50000"),
+            quantity=Decimal("0.02"),
         )
 
         is_allowed, reason = risk_manager.check_risk(
@@ -629,7 +763,10 @@ class TestRiskManagerEdgeCases:
         )
         mock_account_service.set_position(position)
 
-        risk_manager = RiskManager(mock_account_service)
+        risk_manager = RiskManager(
+            mock_account_service,
+            existing_position_entry_rule=_PassExistingPositionEntryRule(),
+        )
         signal = signal_factory(signal_type=SignalType.LONG)
 
         is_allowed, reason = risk_manager.check_risk(signal, current_price=Decimal("40000"))
@@ -909,10 +1046,10 @@ class TestRiskManagerWithCapitalAllocator:
             mock_account_service,
             capital_allocator=allocator,
             max_exposure_per_strategy=Decimal("20000"),
+            existing_position_entry_rule=_PassExistingPositionEntryRule(),
         )
 
         signal = signal_factory(signal_type=SignalType.LONG)
-        # 0.5 * 45000 = 22500 < 100000 (position OK) but >= 20000 (strategy REJECT)
         is_allowed, reason = risk_manager.check_risk(signal, current_price=Decimal("45000"))
 
         assert is_allowed is False

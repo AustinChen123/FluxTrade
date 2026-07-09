@@ -11,6 +11,7 @@ from datetime import UTC, datetime
 from typing import Callable, ContextManager, List, Union, Optional, Dict, Type
 from sqlalchemy.orm import Session
 from src.core.models import Candlestick, Trade, Signal, SignalType, StrategyStatus
+from src.core.orm_models import Candlestick as ORMCandlestick
 from src.core.orm_models import StrategyState
 from src.strategies.base import BaseStrategy
 from src.core.risk_manager import RiskManager, AccountService
@@ -146,6 +147,7 @@ class StrategyEngine:
         
         # Initial scan to discover strategies
         self.scan_strategies()
+        self._restore_active_strategies_on_startup()
 
     def _initialize_strategy_state_cache_on_startup(self) -> None:
         """Load strategy lifecycle state into the manager cache."""
@@ -245,6 +247,45 @@ class StrategyEngine:
                 db.commit()
         logger.info("✅ Scan Complete. Total loaded: %s", len(self.loaded_classes))
 
+    def _restore_active_strategies_on_startup(self) -> None:
+        """Re-instantiate strategies that were ACTIVE before process restart."""
+        with self._db_session_factory() as db:
+            active_states = (
+                db.query(StrategyState)
+                .filter(StrategyState.status == StrategyStatus.ACTIVE.value)
+                .all()
+            )
+
+        for state in active_states:
+            if state.strategy_id not in self.loaded_classes:
+                logger.error(
+                    "Startup restore: strategy class not loaded for %s — marking ERROR",
+                    state.strategy_id,
+                )
+                self._strategy_state_manager.transition_to_error(
+                    state.strategy_id,
+                    "startup_restore_class_missing",
+                    actor="system",
+                )
+                continue
+            try:
+                self.activate_strategy(
+                    state.strategy_id,
+                    actor="system",
+                    reason="startup_restore",
+                    force=True,
+                )
+            except Exception as e:
+                logger.exception(
+                    "Startup restore: failed to activate %s — marking ERROR",
+                    state.strategy_id,
+                )
+                self._strategy_state_manager.transition_to_error(
+                    state.strategy_id,
+                    f"startup_restore_failed: {e}",
+                    actor="system",
+                )
+
     def test_run_strategy(self, strategy_id: str, days: int):
         """
         Performs a test run/warm-up for a strategy.
@@ -323,6 +364,10 @@ class StrategyEngine:
                 
                 strategy_cls = self.loaded_classes[strategy_id]
                 instance = strategy_cls(strategy_id, product_id)
+                self._warm_up_strategy_instance(db, instance)
+                # Registration must follow warm-up — on restart-restore the lifecycle
+                # cache is already ACTIVE, so a registered instance is immediately
+                # live to on_market_data and could emit signals from partial state.
                 self._register_strategy_instance(instance)
                 state.uptime_start = int(time.time() * 1000)
                 db.commit()
@@ -350,6 +395,70 @@ class StrategyEngine:
         except Exception as e:
             self._unregister_strategy_instance(strategy_id)
             logger.error("❌ Failed to transition %s to ACTIVE: %s", strategy_id, e)
+
+    def _warm_up_strategy_instance(self, db: Session, instance: BaseStrategy) -> int:
+        """Replay recent candles into a strategy without emitting signals."""
+        reqs = instance.requirements
+        lookback = max(int(reqs.lookback_window), 0)
+        if lookback == 0:
+            # No candle warm-up needed, but restored live positions must still
+            # be synced or the strategy activates with flat internal state.
+            self._sync_strategy_position_state(instance)
+            return 0
+
+        rows = (
+            db.query(ORMCandlestick)
+            .filter(
+                ORMCandlestick.product_id == reqs.product_id,
+                ORMCandlestick.timeframe == reqs.timeframe,
+            )
+            .order_by(ORMCandlestick.timestamp.desc())
+            .limit(lookback)
+            .all()
+        )
+        rows = sorted(rows, key=lambda row: row.timestamp)
+        if len(rows) < lookback:
+            raise RuntimeError(
+                "warmup_insufficient_candles: "
+                f"strategy_id={instance.strategy_id} "
+                f"available={len(rows)} required={lookback}"
+            )
+        candles = [
+            Candlestick(
+                product_id=row.product_id,
+                timeframe=row.timeframe,
+                timestamp=row.timestamp,
+                open=row.open,
+                high=row.high,
+                low=row.low,
+                close=row.close,
+                volume=row.volume,
+            )
+            for row in rows
+        ]
+        self._signal_processor.warm_up(instance, candles)
+        self._sync_strategy_position_state(instance)
+        return len(candles)
+
+    def _sync_strategy_position_state(self, instance: BaseStrategy) -> None:
+        """Align warmed strategy trade flags with the current account position."""
+        try:
+            position = self.account_service.get_position(
+                instance.strategy_id,
+                instance.product_id,
+            )
+        except Exception as e:
+            raise RuntimeError(
+                "position_state_sync_failed: "
+                f"strategy_id={instance.strategy_id} error={e}"
+            ) from e
+        position_side = None if position is None else getattr(position.side, "value", position.side)
+        applied = self._signal_processor.set_position_state(instance, position_side)
+        if position_side is not None and not applied:
+            raise RuntimeError(
+                "position_state_sync_unsupported: "
+                f"strategy_id={instance.strategy_id} side={position_side}"
+            )
 
     def start_strategy(self, strategy_id: str):
         """Backward-compatible wrapper for legacy callers."""
@@ -535,7 +644,10 @@ class StrategyEngine:
         structlog.contextvars.bind_contextvars(trace_id=uuid.uuid4().hex[:16])
 
         current_price = candle.close if candle else None
-        is_passed, risk_msg = self.risk_manager.check_risk(signal, current_price=current_price)
+        is_passed, risk_msg = self.risk_manager.check_risk(
+            signal,
+            current_price=current_price,
+        )
 
         risk_status = "PASS" if is_passed else "REJECT"
         SIGNALS_TOTAL.labels(

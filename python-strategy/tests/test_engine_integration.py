@@ -10,8 +10,9 @@ from unittest.mock import MagicMock
 from sqlalchemy import create_engine, select, text
 from sqlalchemy.orm import sessionmaker
 
-from src.core.models import Candlestick, Signal, SignalType, StrategyStatus
-from src.core.orm_models import Strategy, StrategyState, StrategyStateTransition
+from src.core.models import Candlestick, Position, PositionSide, Signal, SignalType, StrategyStatus
+from src.core.orm_models import Candlestick as ORMCandlestick
+from src.core.orm_models import SignalAudit, Strategy, StrategyState, StrategyStateTransition
 from src.strategies.base import BaseStrategy, StrategyRequirements
 
 
@@ -24,6 +25,10 @@ class EmittingStrategy(BaseStrategy):
     def requirements(self) -> StrategyRequirements:
         return StrategyRequirements(self.product_id, "1m", 10)
 
+    def sync_position_state(self, position_side: str | None) -> bool:
+        """Accept the position sync unconditionally — required for restart integration test."""
+        return True
+
     def on_candle(self, candle: Candlestick) -> Signal:
         self.candles_received.append(candle)
         return Signal(
@@ -34,6 +39,21 @@ class EmittingStrategy(BaseStrategy):
             type=SignalType.LONG,
             value=candle.close,
         )
+
+
+class RestartAccountService:
+    def __init__(self, position: Position | None = None):
+        self.position = position
+
+    def get_balance(self) -> Decimal:
+        return Decimal("100000")
+
+    def get_position(self, strategy_id: str, product_id: str):
+        if self.position is None:
+            return None
+        if self.position.strategy_id != strategy_id or self.position.product_id != product_id:
+            return None
+        return self.position
 
 
 def make_candle(
@@ -52,9 +72,26 @@ def make_candle(
     )
 
 
+def make_orm_candles(count: int = 10) -> list[ORMCandlestick]:
+    return [
+        ORMCandlestick(
+            product_id="BINANCE:BTCUSDT-PERP",
+            timeframe="1m",
+            timestamp=1704067200000 + i * 60_000,
+            open=Decimal("42000"),
+            high=Decimal("42500"),
+            low=Decimal("41500"),
+            close=Decimal("42200") + Decimal(i),
+            volume=Decimal("100"),
+        )
+        for i in range(count)
+    ]
+
+
 def _sqlite_lifecycle_session_factory(tmp_path):
     engine = create_engine(f"sqlite:///{tmp_path / 'engine_lifecycle.db'}")
     for table in [
+        ORMCandlestick.__table__,
         Strategy.__table__,
         StrategyState.__table__,
     ]:
@@ -71,6 +108,27 @@ def _sqlite_lifecycle_session_factory(tmp_path):
                     transitioned_at DATETIME NOT NULL,
                     reason TEXT,
                     actor VARCHAR(64)
+                )
+                """
+            )
+        )
+        connection.execute(
+            text(
+                """
+                CREATE TABLE signal_audit (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    timestamp BIGINT NOT NULL,
+                    strategy_id VARCHAR NOT NULL,
+                    product_id VARCHAR NOT NULL,
+                    signal_type VARCHAR NOT NULL,
+                    risk_status VARCHAR NOT NULL,
+                    risk_message TEXT,
+                    order_id VARCHAR,
+                    details_json TEXT,
+                    client_order_id VARCHAR(128),
+                    intent_payload TEXT,
+                    outcome_payload TEXT,
+                    signal_batch_id VARCHAR(64)
                 )
                 """
             )
@@ -137,6 +195,7 @@ def test_commands_update_lifecycle_state_with_real_state_manager(
     session_factory = _sqlite_lifecycle_session_factory(tmp_path)
     with session_factory() as session:
         session.add(Strategy(id="s1", name="Strategy 1"))
+        session.add_all(make_orm_candles())
         session.add(
             StrategyState(
                 strategy_id="s1",
@@ -197,3 +256,49 @@ def test_commands_update_lifecycle_state_with_real_state_manager(
             "operator",
         ),
     ]
+
+
+def test_restart_restore_warms_and_blocks_duplicate_entry_with_real_session(
+    tmp_path,
+    engine_factory,
+):
+    session_factory = _sqlite_lifecycle_session_factory(tmp_path)
+    with session_factory() as session:
+        session.add(Strategy(id="s1", name="Strategy 1"))
+        session.add_all(make_orm_candles())
+        session.add(
+            StrategyState(
+                strategy_id="s1",
+                status=StrategyStatus.ACTIVE.value,
+                config_json="{}",
+                version=0,
+            )
+        )
+        session.commit()
+
+    position = Position(
+        strategy_id="s1",
+        product_id="BINANCE:BTCUSDT-PERP",
+        side=PositionSide.LONG,
+        quantity=Decimal("0.01"),
+        entry_price=Decimal("42200"),
+        unrealized_pnl=Decimal("0"),
+    )
+    engine = engine_factory(
+        db_session_factory=session_factory,
+        account_service=RestartAccountService(position),
+    )
+    engine.loaded_classes["s1"] = EmittingStrategy
+    engine.execution_engine.execute_signal = MagicMock(return_value="order-1")
+
+    engine._restore_active_strategies_on_startup()
+    restored = engine.strategy_instances["s1"]
+    engine.on_market_data(make_candle())
+
+    assert len(restored.candles_received) == 11
+    engine.execution_engine.execute_signal.assert_not_called()
+    with session_factory() as session:
+        audits = list(session.scalars(select(SignalAudit)))
+    assert len(audits) == 1
+    assert audits[0].risk_status == "REJECT"
+    assert "existing_position_entry_duplicate" in audits[0].risk_message

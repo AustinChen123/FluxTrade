@@ -16,6 +16,9 @@ class RiskConfig:
     max_orders_per_minute: int = 10
     max_price_deviation_from_mid_pct: Decimal = Decimal("0.03")
     max_position_notional: Decimal = Decimal("100000")
+    # Same-side re-entry is rejected by default for restart idempotency (MVP
+    # swing strategies); DCA/grid strategies must set this to True.
+    allow_same_side_reentry: bool = False
 
     def __post_init__(self) -> None:
         _validate_pct(
@@ -63,6 +66,12 @@ class RiskConfig:
                 "RISK_MAX_POSITION_NOTIONAL",
                 cls.max_position_notional,
             ),
+            allow_same_side_reentry=os.getenv(
+                "RISK_ALLOW_SAME_SIDE_REENTRY", "false"
+            )
+            .strip()
+            .lower()
+            in {"1", "true"},
         )
 
 
