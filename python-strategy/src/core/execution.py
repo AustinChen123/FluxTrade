@@ -4,6 +4,7 @@ from decimal import Decimal
 from typing import Callable, ContextManager, Optional
 from sqlalchemy.orm import Session
 from src.core.models import Signal, SignalType, Candlestick, OrderSide, OrderStatus, PositionSide
+from src.core.orm_models import Strategy
 from src.core.order_manager import OrderManager
 from src.core.interfaces.exchange import IExchangeAdapter, ExchangeError, NetworkError
 from src.core.interfaces.exchange import ExchangeOrderEvent
@@ -32,6 +33,8 @@ from src.core.order_event_sync import (
 )
 from src.core.order_reconciliation import OrderReconciler
 
+OPS_KILL_SWITCH_STRATEGY_ID = "__ops_kill_switch__"
+
 
 class ExecutionEngine:
     def __init__(
@@ -48,6 +51,7 @@ class ExecutionEngine:
         self.logger = logging.getLogger("ExecutionEngine")
         self.clock = clock
         self._db_session_factory = db_session_factory
+        self._db_session = db_session
         self.audit_external_orders = audit_external_orders
         if order_repository:
             self.order_manager = OrderManager(order_repository, clock, is_backtest=is_backtest)
@@ -315,8 +319,9 @@ class ExecutionEngine:
             self.logger.error("Cannot flatten non-positive quantity: %s", quantity)
             return None
 
+        order_strategy_id = self._flatten_order_strategy_id(strategy_id)
         signal = Signal(
-            strategy_id=strategy_id,
+            strategy_id=order_strategy_id,
             product_id=product_id,
             timeframe="ops",
             timestamp=int(self.clock.now() * 1000),
@@ -330,6 +335,7 @@ class ExecutionEngine:
             quantity=quantity,
             intent_payload={"reduce_only": True, "source": "kill_switch"},
         )
+        order_id = str(order.id)
         try:
             exchange_id = self.adapter.place_order(order)
             self.order_manager.update_exchange_order_id(order, exchange_id)
@@ -338,7 +344,7 @@ class ExecutionEngine:
                 status="placed",
                 reason="kill_switch_flatten",
             ).inc()
-            return str(order.id)
+            return order_id
         except ExchangeError as e:
             self.logger.error("Flatten order failed: %s", e)
             self.order_manager.fail_order(order, str(e))
@@ -349,6 +355,30 @@ class ExecutionEngine:
                 phase="kill_switch_flatten",
             )
             return None
+
+    def _flatten_order_strategy_id(self, strategy_id: str) -> str:
+        if strategy_id != "LIVE":
+            return strategy_id
+        self._ensure_ops_strategy()
+        return OPS_KILL_SWITCH_STRATEGY_ID
+
+    def _ensure_ops_strategy(self) -> None:
+        def ensure(session: Session) -> None:
+            if session.get(Strategy, OPS_KILL_SWITCH_STRATEGY_ID) is None:
+                session.add(
+                    Strategy(
+                        id=OPS_KILL_SWITCH_STRATEGY_ID,
+                        name="Kill Switch Ops",
+                        configuration_json="{}",
+                    )
+                )
+                session.commit()
+
+        if self._db_session_factory is not None:
+            with self._db_session_factory() as session:
+                ensure(session)
+            return
+        ensure(self._db_session)
 
     def execute_signal(self, signal: Signal, candle: Optional[Candlestick] = None) -> Optional[str]:
         """

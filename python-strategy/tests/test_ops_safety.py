@@ -16,11 +16,14 @@ from decimal import Decimal
 from unittest.mock import MagicMock, patch
 
 import pytest
+from sqlalchemy import create_engine, event, text
+from sqlalchemy.orm import sessionmaker
 
 from src.core.execution import ExecutionEngine
 from src.core.models import OrderStatus, Position, PositionSide
 from src.core.ops_safety import OpsSafetyService
-from src.core.orm_models import Order
+from src.core.orm_models import Exchange, Order, Product, Strategy
+from src.core.repositories import LiveOrderRepository
 
 
 # =============================================================================
@@ -224,6 +227,21 @@ class TestKillSwitchIdempotency:
         assert (
             "flatten_position",
             "LIVE",
+            PRODUCT_ID,
+        ) in engine.calls
+
+    def test_exchange_position_uses_local_owner_when_available(self):
+        """Exchange snapshots should flatten against the local strategy owner when known."""
+        local_pos = _make_position(strategy_id=STRATEGY_ID, quantity=Decimal("0.75"))
+        exchange_pos = _make_position(strategy_id="LIVE", quantity=Decimal("0.75"))
+        service, engine, _ = _make_service(positions=[local_pos])
+        engine.adapter = FakeExchangePositionAdapter(positions=[exchange_pos])
+
+        service.kill_switch(actor="ops", reason="stale_redis")
+
+        assert (
+            "flatten_position",
+            STRATEGY_ID,
             PRODUCT_ID,
         ) in engine.calls
 
@@ -628,6 +646,84 @@ class TestFlattenPosition:
             o for o in mock_order_repo.orders.values() if o.status in terminal_statuses
         ]
         assert len(orders_in_terminal) >= 1
+
+    def test_live_position_uses_reserved_ops_strategy_with_real_fk(
+        self,
+        tmp_path,
+        mock_clock,
+    ):
+        """Exchange-only LIVE positions must persist flatten orders in a real DB."""
+        engine = create_engine(f"sqlite:///{tmp_path / 'ops_flatten.db'}")
+
+        @event.listens_for(engine, "connect")
+        def _enable_fk(dbapi_connection, _connection_record):
+            dbapi_connection.execute("PRAGMA foreign_keys=ON")
+
+        for table in [Exchange.__table__, Product.__table__, Strategy.__table__]:
+            table.create(engine, checkfirst=True)
+        with engine.begin() as connection:
+            connection.execute(
+                text(
+                    """
+                    CREATE TABLE "order" (
+                        id VARCHAR PRIMARY KEY,
+                        exchange_order_id VARCHAR,
+                        strategy_id VARCHAR NOT NULL REFERENCES strategy(id),
+                        product_id VARCHAR NOT NULL REFERENCES product(id),
+                        exchange_id VARCHAR NOT NULL REFERENCES exchange(id),
+                        type VARCHAR NOT NULL,
+                        side VARCHAR NOT NULL,
+                        price NUMERIC,
+                        trigger_price NUMERIC,
+                        quantity NUMERIC NOT NULL,
+                        status VARCHAR NOT NULL,
+                        timestamp BIGINT NOT NULL,
+                        filled_quantity NUMERIC,
+                        filled_price NUMERIC,
+                        client_order_id VARCHAR(128),
+                        intent_payload TEXT,
+                        submitted_at DATETIME,
+                        acked_at DATETIME,
+                        last_reconciled_at DATETIME,
+                        UNIQUE(exchange_order_id, exchange_id)
+                    )
+                    """
+                )
+            )
+        Session = sessionmaker(bind=engine)
+        with Session() as session:
+            session.add(Exchange(id="BINANCE", name="Binance"))
+            session.add(
+                Product(
+                    id=PRODUCT_ID,
+                    exchange_id="BINANCE",
+                    base_asset="BTC",
+                    quote_asset="USDT",
+                )
+            )
+            session.commit()
+
+        class AcceptingAdapter:
+            def place_order(self, order):
+                return "EX-FLAT"
+
+        session_factory = sessionmaker(bind=engine)
+        eng = ExecutionEngine(
+            db_session=Session(),
+            clock=mock_clock,
+            adapter=AcceptingAdapter(),
+            order_repository=LiveOrderRepository(db_session_factory=session_factory),
+            is_backtest=True,
+        )
+
+        order_id = eng.flatten_position("LIVE", PRODUCT_ID, "LONG", Decimal("1.0"))
+
+        assert order_id is not None
+        with Session() as session:
+            strategy = session.get(Strategy, "__ops_kill_switch__")
+            assert strategy is not None
+            order = session.get(Order, order_id)
+            assert order.strategy_id == "__ops_kill_switch__"
 
 
 # =============================================================================

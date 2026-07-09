@@ -23,6 +23,8 @@ from sqlalchemy.orm import Session
 from src.core.audit_service import write_system_event
 from src.core.models import OrderStatus
 
+OPS_KILL_SWITCH_STRATEGY_ID = "__ops_kill_switch__"
+
 
 class OpsSafetyService:
     """Kill-switch and ops-safety façade for live trading.
@@ -169,15 +171,44 @@ class OpsSafetyService:
         )
 
     def _positions(self) -> list[Any]:
+        local_positions = list(self._account_service.get_all_positions())
         adapter = getattr(self._execution_engine, "adapter", None)
         if adapter is not None:
             get_all_positions = getattr(adapter, "get_all_positions", None)
             if callable(get_all_positions):
-                return list(get_all_positions())
+                return self._assign_local_position_owners(
+                    list(get_all_positions()),
+                    local_positions,
+                )
             list_positions = getattr(adapter, "list_positions", None)
             if callable(list_positions):
-                return list(list_positions())
-        return list(self._account_service.get_all_positions())
+                return self._assign_local_position_owners(
+                    list(list_positions()),
+                    local_positions,
+                )
+        return local_positions
+
+    @staticmethod
+    def _assign_local_position_owners(
+        exchange_positions: list[Any],
+        local_positions: list[Any],
+    ) -> list[Any]:
+        local_by_product: dict[str, list[Any]] = {}
+        for position in local_positions:
+            local_by_product.setdefault(position.product_id, []).append(position)
+
+        resolved = []
+        for position in exchange_positions:
+            local_matches = local_by_product.get(position.product_id, [])
+            if str(getattr(position, "strategy_id", "")) == "LIVE" and len(local_matches) == 1:
+                resolved.append(
+                    position.model_copy(
+                        update={"strategy_id": local_matches[0].strategy_id}
+                    )
+                )
+                continue
+            resolved.append(position)
+        return resolved
 
     def _write_event(self, *, actor: str, reason: str | None, result: dict) -> None:
         payload = dict(result)
