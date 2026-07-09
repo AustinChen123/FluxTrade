@@ -967,6 +967,28 @@ class TestAccountService:
         assert positions[0].product_id == "BINANCE:BTCUSDT-PERP"
         assert positions[0].quantity == Decimal("0.5")
 
+    def test_get_all_positions_preserves_strategy_ids_with_colons(self):
+        """Redis position keys must parse from the product suffix, not the left."""
+        mock_redis = MagicMock()
+        mock_redis.ping.return_value = True
+        mock_redis.scan_iter.return_value = [
+            "state:position:test.py::StratB:BINANCE:BTCUSDT-PERP",
+        ]
+        mock_redis.hgetall.return_value = {
+            "quantity": "0.25",
+            "entry_price": "42000",
+        }
+
+        with patch("src.core.risk_manager.create_redis_client", return_value=mock_redis):
+            service = AccountService()
+
+        positions = service.get_all_positions()
+
+        assert len(positions) == 1
+        assert positions[0].strategy_id == "test.py::StratB"
+        assert positions[0].product_id == "BINANCE:BTCUSDT-PERP"
+        assert positions[0].quantity == Decimal("0.25")
+
     def test_close_with_redis(self):
         """close() should close Redis connection."""
         mock_redis = MagicMock()

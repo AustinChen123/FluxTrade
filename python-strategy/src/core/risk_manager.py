@@ -85,10 +85,15 @@ class AccountService:
 
         positions: list[Position] = []
         for key in self.redis.scan_iter("state:position:*"):
-            parts = str(key).split(":", 3)
-            if len(parts) != 4:
+            key_text = key.decode() if isinstance(key, bytes) else str(key)
+            prefix = "state:position:"
+            if not key_text.startswith(prefix):
                 continue
-            _, _, strategy_id, product_id = parts
+            try:
+                strategy_id, exchange, symbol = key_text[len(prefix):].rsplit(":", 2)
+            except ValueError:
+                continue
+            product_id = f"{exchange}:{symbol}"
             position = self.get_position(strategy_id, product_id)
             if position is not None:
                 positions.append(position)
