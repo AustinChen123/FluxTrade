@@ -47,8 +47,15 @@ class LiveBinanceAdapter(CcxtExchangeAdapter):
                 self.ws_connector = None
 
     def place_order(self, order: Order) -> str:
+        intent_payload = getattr(order, "intent_payload", None)
+        reduce_only = (
+            isinstance(intent_payload, dict)
+            and intent_payload.get("reduce_only") is True
+        )
         # Try WS fast path for market orders
         if (
+            not reduce_only
+            and
             self.ws_connector
             and self.ws_connector.is_connected("binance")
             and order.type

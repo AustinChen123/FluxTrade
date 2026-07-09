@@ -1716,6 +1716,37 @@ class TestLiveBinanceWsOrderPath:
             assert mock_ws_inst.place_order.call_args.kwargs["quantity"] == "0.010"
             mock_ws_inst._wait_for_ack.assert_called_once_with(exchange_client_order_id)
 
+    def test_reduce_only_market_order_uses_rest_not_ws(self):
+        """Reduce-only flatten orders must use the REST path that sends reduceOnly."""
+        with patch("src.core.adapters.ccxt_adapter.ccxt") as mock_ccxt, \
+             patch("src.core.adapters.live_binance.WebSocketOrderConnector") as MockWS:
+            mock_cls = MagicMock()
+            client = MagicMock()
+            client.apiKey = "k"
+            client.secret = "s"
+            client.create_order.return_value = {"id": "REST-REDUCE"}
+            client.load_markets.return_value = _empty_btc_market()
+            mock_cls.return_value = client
+            mock_ccxt.binance = mock_cls
+            setattr(mock_ccxt, "binance", mock_cls)
+
+            mock_ws_inst = MagicMock()
+            mock_ws_inst.is_connected.return_value = True
+            MockWS.return_value = mock_ws_inst
+
+            adapter = LiveBinanceAdapter(api_key="k", secret="s", enable_ws=True)
+            adapter.client = client
+            order = _make_order(
+                type="market",
+                side="sell",
+                intent_payload={"reduce_only": True, "source": "kill_switch"},
+            )
+            result = adapter.place_order(order)
+
+            assert result == "REST-REDUCE"
+            mock_ws_inst.place_order.assert_not_called()
+            assert client.create_order.call_args.kwargs["params"]["reduceOnly"] is True
+
     def test_ws_ack_timeout_falls_back_to_rest(self):
         """WS ACK timeout should fall back to REST."""
         with patch("src.core.adapters.ccxt_adapter.ccxt") as mock_ccxt, \
