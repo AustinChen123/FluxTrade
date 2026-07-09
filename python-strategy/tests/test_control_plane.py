@@ -1538,3 +1538,85 @@ def test_control_plane_runs_csv_signal_backtest_job(tmp_path):
 
     assert trade_count == 2
     assert audit_count == 2
+
+
+# =============================================================================
+# L6 kill-switch endpoint — POST /ops/kill-switch
+# =============================================================================
+#
+# Matrix:
+#   1. auth-fail: missing key  → 401
+#   2. auth-fail: wrong key    → 401
+#   3. happy-path: valid key   → 202 + publish to Redis with correct shape
+#   4. reason forwarded        → reason appears in published payload params
+#
+# Tests 1 & 2 rely on the existing auth middleware (trivially green once the
+# route exists and auth is enforced).  Tests 3 & 4 are RED until the stub is
+# implemented.
+
+
+def _kill_switch_app(*, api_key: str = "secret", redis_client=None) -> ControlPlaneApp:
+    from unittest.mock import MagicMock
+
+    return ControlPlaneApp(
+        BacktestJobExecutor(run_inline=True),
+        api_key=api_key,
+        redis_client=redis_client or MagicMock(),
+    )
+
+
+def test_kill_switch_rejects_missing_api_key():
+    app = _kill_switch_app()
+    response = app.handle("POST", "/ops/kill-switch")
+    assert response.status_code == 401
+    assert response.body.get("error") == "unauthorized"
+
+
+def test_kill_switch_rejects_wrong_api_key():
+    app = _kill_switch_app()
+    response = app.handle(
+        "POST", "/ops/kill-switch", headers={"x-api-key": "wrong-key"}
+    )
+    assert response.status_code == 401
+    assert response.body.get("error") == "unauthorized"
+
+
+def test_kill_switch_happy_path_returns_202_and_publishes():
+    from unittest.mock import MagicMock
+
+    redis = MagicMock()
+    app = _kill_switch_app(redis_client=redis)
+
+    response = app.handle(
+        "POST",
+        "/ops/kill-switch",
+        headers={"x-api-key": "secret"},
+    )
+
+    assert response.status_code == 202
+    assert response.body == {"status": "accepted"}
+
+    redis.publish.assert_called_once()
+    channel, raw_payload = redis.publish.call_args.args
+    assert channel == "cmd:strategy:control"
+    published = json.loads(raw_payload)
+    assert published["command"] == "KILL_SWITCH"
+    assert "params" in published
+
+
+def test_kill_switch_reason_forwarded_in_publish():
+    from unittest.mock import MagicMock
+
+    redis = MagicMock()
+    app = _kill_switch_app(redis_client=redis)
+
+    app.handle(
+        "POST",
+        "/ops/kill-switch",
+        body=json.dumps({"reason": "eod_risk_drill"}),
+        headers={"x-api-key": "secret"},
+    )
+
+    _, raw_payload = redis.publish.call_args.args
+    published = json.loads(raw_payload)
+    assert published["params"].get("reason") == "eod_risk_drill"
