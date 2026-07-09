@@ -120,12 +120,23 @@ class OpsSafetyService:
             product_id = position.product_id
             side = getattr(position.side, "value", position.side)
             try:
-                flattened_id = self._execution_engine.flatten_position(
-                    strategy_id,
-                    product_id,
-                    side,
-                    position.quantity,
-                )
+                try:
+                    flattened_id = self._execution_engine.flatten_position(
+                        strategy_id,
+                        product_id,
+                        side,
+                        position.quantity,
+                        reference_price=getattr(position, "entry_price", None),
+                    )
+                except TypeError as exc:
+                    if "reference_price" not in str(exc):
+                        raise
+                    flattened_id = self._execution_engine.flatten_position(
+                        strategy_id,
+                        product_id,
+                        side,
+                        position.quantity,
+                    )
                 if flattened_id is not None:
                     result["flattened_positions"] += 1
                 else:

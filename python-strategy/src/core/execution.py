@@ -288,6 +288,7 @@ class ExecutionEngine:
         product_id: str,
         side: str,
         quantity: Decimal,
+        reference_price: Optional[Decimal] = None,
     ) -> Optional[str]:
         """Close a live position with a reduce-only market order, bypassing
         strategy signal flow.
@@ -335,6 +336,8 @@ class ExecutionEngine:
             quantity=quantity,
             intent_payload={"reduce_only": True, "source": "kill_switch"},
         )
+        if reference_price is not None:
+            order.min_notional_reference_price = reference_price
         order_id = str(order.id)
         try:
             exchange_id = self.adapter.place_order(order)

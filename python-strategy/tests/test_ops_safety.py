@@ -104,6 +104,7 @@ class RecordingExecutionEngine:
         self._flatten_results = flatten_results or {}
         self.order_manager = _FakeOrderManager(orders_by_status or {})
         self.adapter = None
+        self.flatten_reference_prices: list[Decimal | None] = []
 
     def cancel_order(self, order_id: str) -> bool:
         self.calls.append(("cancel_order", order_id))
@@ -115,8 +116,10 @@ class RecordingExecutionEngine:
         product_id: str,
         side: str,
         quantity: Decimal,
+        reference_price: Decimal | None = None,
     ) -> str | None:
         self.calls.append(("flatten_position", strategy_id, product_id))
+        self.flatten_reference_prices.append(reference_price)
         return self._flatten_results.get((strategy_id, product_id), "flat-order-id")
 
 
@@ -564,6 +567,14 @@ class TestKillSwitchFlattenPositions:
 
         assert result["flattened_positions"] == 1
 
+    def test_flatten_uses_position_entry_price_as_reference_price(self):
+        pos = _make_position(quantity=Decimal("0.75"))
+        service, engine, _ = _make_service(positions=[pos])
+
+        service.kill_switch(actor="ops")
+
+        assert engine.flatten_reference_prices == [pos.entry_price]
+
 
 # =============================================================================
 # B. ExecutionEngine.flatten_position tests
@@ -624,6 +635,24 @@ class TestFlattenPosition:
         """Order must be recorded via order_manager before adapter placement."""
         eng.flatten_position(STRATEGY_ID, PRODUCT_ID, "LONG", Decimal("1.0"))
         assert len(mock_order_repo.orders) >= 1
+
+    def test_reference_price_attached_to_flatten_order(
+        self, eng, mock_exchange_adapter
+    ):
+        """Market flatten orders need a min-notional reference price."""
+        eng.flatten_position(
+            STRATEGY_ID,
+            PRODUCT_ID,
+            "LONG",
+            Decimal("1.0"),
+            reference_price=Decimal("50000"),
+        )
+
+        placed_order = (
+            mock_exchange_adapter.open_orders + mock_exchange_adapter.filled_orders
+        )[-1]
+        order_obj = placed_order if isinstance(placed_order, Order) else placed_order.get("order")
+        assert order_obj.min_notional_reference_price == Decimal("50000")
 
     def test_adapter_error_returns_none(self, eng, mock_exchange_adapter):
         """Adapter exception → returns None, does not propagate."""
