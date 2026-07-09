@@ -343,7 +343,7 @@ class ControlPlaneApp:
             },
         }
         try:
-            self.redis_client.publish(
+            subscribers = self.redis_client.publish(
                 "cmd:strategy:control",
                 json.dumps(command, separators=(",", ":")),
             )
@@ -352,6 +352,8 @@ class ControlPlaneApp:
                 503,
                 {"error": "redis_publish_failed", "detail": str(exc)},
             )
+        if subscribers == 0:
+            return HttpResponse(503, {"error": "kill_switch_no_listener"})
         return HttpResponse(202, {"status": "accepted"})
 
     def _submit_gene_action(
