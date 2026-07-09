@@ -334,14 +334,22 @@ class ExecutionEngine:
             side=order_side,
             order_type="market",
             quantity=quantity,
+            client_order_id=generate_client_order_id(
+                order_strategy_id,
+                "ops",
+                "flatten",
+            ),
             intent_payload={"reduce_only": True, "source": "kill_switch"},
         )
         if reference_price is not None:
             order.min_notional_reference_price = reference_price
         order_id = str(order.id)
+        submit_attempted = False
         try:
+            self.order_manager.mark_submitted_unconfirmed(order)
+            submit_attempted = True
             exchange_id = self.adapter.place_order(order)
-            self.order_manager.update_exchange_order_id(order, exchange_id)
+            self.order_manager.mark_submitted(order, exchange_id)
             ORDERS_TOTAL.labels(
                 order_type="market",
                 status="placed",
@@ -350,6 +358,25 @@ class ExecutionEngine:
             return order_id
         except ExchangeError as e:
             self.logger.error("Flatten order failed: %s", e)
+            adoption = self._adopt_order_after_ambiguous_submit_error(
+                order,
+                e,
+                submit_attempted=submit_attempted,
+            )
+            if adoption["action"] == "adopted":
+                ORDERS_TOTAL.labels(
+                    order_type="market",
+                    status="placed",
+                    reason="kill_switch_flatten_adopted_after_submit_error",
+                ).inc()
+                return order_id
+            if adoption.get("verification_blocked") or adoption.get("unresolved"):
+                ORDERS_TOTAL.labels(
+                    order_type="market",
+                    status="failed",
+                    reason=str(adoption["action"]),
+                ).inc()
+                return None
             self.order_manager.fail_order(order, str(e))
             self._record_order_rejection(
                 order=order,

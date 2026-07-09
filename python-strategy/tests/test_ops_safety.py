@@ -20,6 +20,7 @@ from sqlalchemy import create_engine, event, text
 from sqlalchemy.orm import sessionmaker
 
 from src.core.execution import ExecutionEngine
+from src.core.interfaces.exchange import NetworkError
 from src.core.models import Candlestick, OrderStatus, Position, PositionSide, Signal, SignalType
 from src.core.ops_safety import OpsSafetyService
 from src.core.orm_models import Exchange, Order, Product, Strategy
@@ -675,6 +676,33 @@ class TestFlattenPosition:
             o for o in mock_order_repo.orders.values() if o.status in terminal_statuses
         ]
         assert len(orders_in_terminal) >= 1
+
+    def test_ambiguous_submit_leaves_flatten_order_recoverable(
+        self, eng, mock_order_repo
+    ):
+        """Timeout-like flatten errors must not mark the local order failed."""
+
+        class TimeoutAdapter:
+            def place_order(self, order):
+                raise NetworkError("timeout after submit")
+
+            def get_order_by_client_id(self, client_order_id, product_id, *, order_type=None):
+                return None
+
+        eng.adapter = TimeoutAdapter()
+
+        result = eng.flatten_position(
+            STRATEGY_ID,
+            PRODUCT_ID,
+            "LONG",
+            Decimal("1.0"),
+            reference_price=Decimal("50000"),
+        )
+
+        assert result is None
+        order = next(iter(mock_order_repo.orders.values()))
+        assert order.client_order_id is not None
+        assert order.status == OrderStatus.SUBMITTED_UNCONFIRMED.value
 
     def test_live_position_uses_reserved_ops_strategy_with_real_fk(
         self,
