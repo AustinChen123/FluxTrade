@@ -27,6 +27,7 @@ from src.core.redis_factory import create_redis_client
 from src.core.metrics import SIGNALS_TOTAL, ACTIVE_STRATEGIES, BALANCE_USDT
 from src.core.command_router import CommandRouter
 from src.core.health_monitor import HealthMonitor
+from src.core.ops_safety import OpsSafetyService
 from src.core.signal_processor import SignalProcessor
 from src.core.strategy_registry import StrategyRegistry
 from src.core.strategy_state_manager import StrategyStateManager
@@ -125,6 +126,11 @@ class StrategyEngine:
             self._strategy_state_manager,
             lambda signal, candle: self.process_signal(signal, candle),
         )
+        self.ops_safety = OpsSafetyService(
+            self.execution_engine,
+            self.account_service,
+            self._db_session_factory,
+        )
         
         # System State & Heartbeat
         self._health_monitor.redis_client = self.redis_client
@@ -205,6 +211,11 @@ class StrategyEngine:
                 self.scan_strategies()
             elif cmd == "TEST_RUN":
                 self.test_run_strategy(params.get("id"), params.get("days", 1))
+            elif cmd == "KILL_SWITCH":
+                self.ops_safety.kill_switch(
+                    actor=params.get("actor", "operator"),
+                    reason=params.get("reason"),
+                )
             else:
                 result = self._command_router.handle(data)
                 if result.success:

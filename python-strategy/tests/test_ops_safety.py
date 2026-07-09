@@ -1,0 +1,638 @@
+"""RED test matrix for L6 live-ops safety features.
+
+Covers:
+A. OpsSafetyService.kill_switch — cancel scope, ordering, isolation, idempotency, audit
+B. ExecutionEngine.flatten_position — LONG/SHORT dispatch, adapter failure
+C. StrategyEngine._handle_command — KILL_SWITCH routing, unknown-command regression
+
+All tests in this file must FAIL (NotImplementedError or AssertionError) until
+the implementer fills in the stubs.  Do NOT modify these tests.
+"""
+
+from __future__ import annotations
+
+from contextlib import contextmanager
+from decimal import Decimal
+from unittest.mock import MagicMock, patch
+
+import pytest
+
+from src.core.execution import ExecutionEngine
+from src.core.models import OrderStatus, Position, PositionSide
+from src.core.ops_safety import OpsSafetyService
+from src.core.orm_models import Order
+
+
+# =============================================================================
+# Helpers / fakes
+# =============================================================================
+
+PRODUCT_ID = "BINANCE:BTCUSDT-PERP"
+STRATEGY_ID = "strat_alpha"
+
+
+def _make_order(
+    order_id: str,
+    status: str,
+    strategy_id: str = STRATEGY_ID,
+    product_id: str = PRODUCT_ID,
+    side: str = "BUY",
+) -> Order:
+    o = Order()
+    o.id = order_id
+    o.strategy_id = strategy_id
+    o.product_id = product_id
+    o.exchange_id = "BINANCE"
+    o.type = "market"
+    o.side = side
+    o.quantity = Decimal("1.0")
+    o.status = status
+    o.timestamp = 1_700_000_000_000
+    o.exchange_order_id = None if status == OrderStatus.NEW.value else f"EX-{order_id}"
+    o.client_order_id = f"cli-{order_id}"
+    return o
+
+
+def _make_position(
+    strategy_id: str = STRATEGY_ID,
+    product_id: str = PRODUCT_ID,
+    side: PositionSide = PositionSide.LONG,
+    quantity: Decimal = Decimal("2.0"),
+) -> Position:
+    return Position(
+        strategy_id=strategy_id,
+        product_id=product_id,
+        side=side,
+        quantity=quantity,
+        entry_price=Decimal("50000"),
+        unrealized_pnl=Decimal("0"),
+    )
+
+
+class FakeAccountService:
+    """Minimal fake that exposes get_all_positions() for ops-safety tests."""
+
+    def __init__(
+        self,
+        positions: list[Position] | None = None,
+        balance: Decimal = Decimal("100000"),
+    ) -> None:
+        self._positions: list[Position] = positions or []
+        self._balance = balance
+
+    def get_balance(self) -> Decimal:
+        return self._balance
+
+    def get_all_positions(self) -> list[Position]:
+        return list(self._positions)
+
+
+class RecordingExecutionEngine:
+    """Fake ExecutionEngine that records calls in order for sequencing tests."""
+
+    def __init__(
+        self,
+        cancel_results: dict[str, bool] | None = None,
+        flatten_results: dict[tuple[str, str], str | None] | None = None,
+        orders_by_status: dict[str, list[Order]] | None = None,
+    ) -> None:
+        self.calls: list[tuple] = []
+        self._cancel_results = cancel_results or {}
+        self._flatten_results = flatten_results or {}
+        self.order_manager = _FakeOrderManager(orders_by_status or {})
+
+    def cancel_order(self, order_id: str) -> bool:
+        self.calls.append(("cancel_order", order_id))
+        return self._cancel_results.get(order_id, True)
+
+    def flatten_position(
+        self,
+        strategy_id: str,
+        product_id: str,
+        side: str,
+        quantity: Decimal,
+    ) -> str | None:
+        self.calls.append(("flatten_position", strategy_id, product_id))
+        return self._flatten_results.get((strategy_id, product_id), "flat-order-id")
+
+
+class _FakeOrderManager:
+    """Minimal order_manager fake for OpsSafetyService tests."""
+
+    def __init__(self, orders_by_status: dict[str, list[Order]]) -> None:
+        self._orders_by_status = orders_by_status
+        self.failed_orders: list[tuple[Order, str]] = []
+
+        # Build flat orders list for repo.list_orders_by_statuses
+        all_orders: list[Order] = []
+        for orders in orders_by_status.values():
+            all_orders.extend(orders)
+        self.repo = _FakeOrderRepo(all_orders)
+
+    def fail_order(self, order: Order, reason: str) -> None:
+        self.failed_orders.append((order, reason))
+
+
+class _FakeOrderRepo:
+    def __init__(self, orders: list[Order]) -> None:
+        self._orders = orders
+
+    def list_orders_by_statuses(self, statuses: set[str]) -> list[Order]:
+        return [o for o in self._orders if o.status in statuses]
+
+
+def _make_null_db_session_factory():
+    """Returns a context-manager factory that yields a MagicMock session."""
+
+    @contextmanager
+    def factory():
+        session = MagicMock()
+        session.__enter__ = MagicMock(return_value=session)
+        session.__exit__ = MagicMock(return_value=False)
+        yield session
+
+    return factory
+
+
+def _make_service(
+    *,
+    orders: list[Order] | None = None,
+    positions: list[Position] | None = None,
+    cancel_results: dict[str, bool] | None = None,
+    flatten_results: dict[tuple[str, str], str | None] | None = None,
+) -> tuple[OpsSafetyService, RecordingExecutionEngine, FakeAccountService]:
+    orders_by_status: dict[str, list[Order]] = {}
+    for o in orders or []:
+        orders_by_status.setdefault(o.status, []).append(o)
+
+    fake_engine = RecordingExecutionEngine(
+        cancel_results=cancel_results,
+        flatten_results=flatten_results,
+        orders_by_status=orders_by_status,
+    )
+    fake_account = FakeAccountService(positions=positions)
+    db_factory = _make_null_db_session_factory()
+    service = OpsSafetyService(fake_engine, fake_account, db_factory)
+    return service, fake_engine, fake_account
+
+
+# =============================================================================
+# A. OpsSafetyService.kill_switch tests
+# =============================================================================
+
+
+class TestKillSwitchIdempotency:
+    """Matrix item 6: no open orders + no positions → already_flat=True."""
+
+    def test_already_flat_returns_correct_shape(self):
+        service, _, _ = _make_service()
+
+        result = service.kill_switch(actor="ops", reason="drill")
+
+        assert result["already_flat"] is True
+        assert result["cancelled_orders"] == 0
+        assert result["cancel_failures"] == []
+        assert result["flattened_positions"] == 0
+        assert result["flatten_failures"] == []
+
+    def test_already_flat_audit_event_still_written(self):
+        """Audit event must be written even when already flat."""
+        db_factory = _make_null_db_session_factory()
+        fake_engine = RecordingExecutionEngine()
+        fake_account = FakeAccountService()
+        service = OpsSafetyService(fake_engine, fake_account, db_factory)
+
+        with patch("src.core.ops_safety.write_system_event") as mock_write:
+            service.kill_switch(actor="ops", reason=None)
+            mock_write.assert_called_once()
+            kwargs = mock_write.call_args.kwargs
+            assert kwargs["event_type"] == "ops"
+            assert kwargs["event_subtype"] == "kill_switch"
+
+
+class TestKillSwitchCancelScope:
+    """Matrix items 2 & 9: cancel scope covers correct statuses."""
+
+    def test_submitted_order_cancelled_via_engine(self):
+        order = _make_order("o1", OrderStatus.SUBMITTED.value)
+        service, engine, _ = _make_service(orders=[order])
+
+        service.kill_switch(actor="ops")
+
+        assert any(c == ("cancel_order", "o1") for c in engine.calls)
+
+    def test_submitted_unconfirmed_cancelled_via_engine(self):
+        order = _make_order("o2", OrderStatus.SUBMITTED_UNCONFIRMED.value)
+        service, engine, _ = _make_service(orders=[order])
+
+        service.kill_switch(actor="ops")
+
+        assert any(c == ("cancel_order", "o2") for c in engine.calls)
+
+    def test_partially_filled_cancelled_via_engine(self):
+        order = _make_order("o3", OrderStatus.PARTIALLY_FILLED.value)
+        service, engine, _ = _make_service(orders=[order])
+
+        service.kill_switch(actor="ops")
+
+        assert any(c == ("cancel_order", "o3") for c in engine.calls)
+
+    def test_new_order_failed_locally_not_via_cancel(self):
+        """NEW orders are failed locally via order_manager.fail_order."""
+        order = _make_order("o-new", OrderStatus.NEW.value)
+        service, engine, _ = _make_service(orders=[order])
+
+        service.kill_switch(actor="ops")
+
+        # fail_order must be called, cancel_order must NOT be called for NEW
+        failed_ids = [o.id for o, _ in engine.order_manager.failed_orders]
+        assert "o-new" in failed_ids
+        assert all(c != ("cancel_order", "o-new") for c in engine.calls)
+
+    def test_new_order_fail_reason_is_kill_switch(self):
+        order = _make_order("o-new2", OrderStatus.NEW.value)
+        service, engine, _ = _make_service(orders=[order])
+
+        service.kill_switch(actor="ops")
+
+        reasons = [reason for o, reason in engine.order_manager.failed_orders if o.id == "o-new2"]
+        assert reasons == ["kill_switch"]
+
+    def test_filled_orders_not_cancelled(self):
+        """FILLED orders are terminal and must be ignored."""
+        order = _make_order("o-filled", OrderStatus.FILLED.value)
+        service, engine, _ = _make_service(orders=[order])
+
+        service.kill_switch(actor="ops")
+
+        assert all(c[1] != "o-filled" for c in engine.calls if c[0] == "cancel_order")
+
+    def test_cancelled_orders_not_re_cancelled(self):
+        order = _make_order("o-already-cancelled", OrderStatus.CANCELLED.value)
+        service, engine, _ = _make_service(orders=[order])
+
+        service.kill_switch(actor="ops")
+
+        assert all(c[1] != "o-already-cancelled" for c in engine.calls if c[0] == "cancel_order")
+
+    def test_result_counts_only_successful_cancels(self):
+        o1 = _make_order("o-ok", OrderStatus.SUBMITTED.value)
+        o2 = _make_order("o-fail", OrderStatus.SUBMITTED.value)
+        service, _, _ = _make_service(
+            orders=[o1, o2],
+            cancel_results={"o-ok": True, "o-fail": False},
+        )
+
+        result = service.kill_switch(actor="ops")
+
+        assert result["cancelled_orders"] == 1
+
+
+class TestKillSwitchOrdering:
+    """Matrix item 1: all cancellations complete before any flatten."""
+
+    def test_all_cancels_precede_all_flattens(self):
+        order = _make_order("ord-1", OrderStatus.SUBMITTED.value)
+        pos = _make_position()
+        service, engine, _ = _make_service(orders=[order], positions=[pos])
+
+        service.kill_switch(actor="ops")
+
+        cancel_indices = [i for i, c in enumerate(engine.calls) if c[0] == "cancel_order"]
+        flatten_indices = [i for i, c in enumerate(engine.calls) if c[0] == "flatten_position"]
+
+        assert cancel_indices, "no cancel_order calls recorded"
+        assert flatten_indices, "no flatten_position calls recorded"
+        assert max(cancel_indices) < min(flatten_indices), (
+            "at least one flatten_position call occurred before all cancel_order calls"
+        )
+
+
+class TestKillSwitchCancelFailureIsolation:
+    """Matrix item 3: one cancel failure → others attempted, flatten proceeds."""
+
+    def test_cancel_failure_recorded_in_result(self):
+        o1 = _make_order("o-good", OrderStatus.SUBMITTED.value)
+        o2 = _make_order("o-bad", OrderStatus.SUBMITTED.value)
+        service, _, _ = _make_service(
+            orders=[o1, o2],
+            cancel_results={"o-good": True, "o-bad": False},
+        )
+
+        result = service.kill_switch(actor="ops")
+
+        failed_ids = [f["order_id"] for f in result["cancel_failures"]]
+        assert "o-bad" in failed_ids
+
+    def test_cancel_failure_does_not_stop_remaining_cancels(self):
+        o1 = _make_order("o-bad", OrderStatus.SUBMITTED.value)
+        o2 = _make_order("o-good", OrderStatus.SUBMITTED.value)
+        service, engine, _ = _make_service(
+            orders=[o1, o2],
+            cancel_results={"o-bad": False, "o-good": True},
+        )
+
+        service.kill_switch(actor="ops")
+
+        cancel_targets = {c[1] for c in engine.calls if c[0] == "cancel_order"}
+        assert "o-good" in cancel_targets
+
+    def test_cancel_exception_recorded_and_flatten_proceeds(self):
+        """cancel_order raising an exception must not abort flatten."""
+        order = _make_order("o-exc", OrderStatus.SUBMITTED.value)
+        pos = _make_position()
+        service, engine, _ = _make_service(orders=[order], positions=[pos])
+        engine.cancel_order = lambda oid: (_ for _ in ()).throw(RuntimeError("boom"))  # type: ignore[assignment]
+
+        # Monkeypatch so cancel raises but flatten is a proper recording
+        flatten_calls: list = []
+        engine.flatten_position = lambda sid, pid, side, qty: flatten_calls.append((sid, pid)) or "flat-id"  # type: ignore[assignment]
+
+        result = service.kill_switch(actor="ops")
+
+        assert len(result["cancel_failures"]) >= 1
+        assert len(flatten_calls) >= 1, "flatten must proceed even after cancel exception"
+
+    def test_cancel_failure_includes_reason(self):
+        """cancel_failures entries must include both order_id and reason."""
+        order = _make_order("o-fail", OrderStatus.SUBMITTED.value)
+        service, engine, _ = _make_service(
+            orders=[order], cancel_results={"o-fail": False}
+        )
+
+        result = service.kill_switch(actor="ops")
+
+        entry = next((f for f in result["cancel_failures"] if f["order_id"] == "o-fail"), None)
+        assert entry is not None
+        assert "reason" in entry
+
+
+class TestKillSwitchFlattenFailureIsolation:
+    """Matrix item 5: one flatten failure → others attempted."""
+
+    def test_flatten_failure_recorded_in_result(self):
+        pos1 = _make_position(strategy_id="strat_a", product_id=PRODUCT_ID)
+        pos2 = _make_position(
+            strategy_id="strat_b",
+            product_id="BINANCE:ETHUSDT-PERP",
+        )
+        service, _, _ = _make_service(
+            positions=[pos1, pos2],
+            flatten_results={("strat_b", "BINANCE:ETHUSDT-PERP"): None},
+        )
+
+        result = service.kill_switch(actor="ops")
+
+        failed = result["flatten_failures"]
+        assert any(f["strategy_id"] == "strat_b" for f in failed)
+
+    def test_flatten_failure_does_not_stop_other_flattens(self):
+        pos1 = _make_position(strategy_id="strat_a", product_id=PRODUCT_ID)
+        pos2 = _make_position(
+            strategy_id="strat_b",
+            product_id="BINANCE:ETHUSDT-PERP",
+        )
+        service, engine, _ = _make_service(
+            positions=[pos1, pos2],
+            flatten_results={("strat_a", PRODUCT_ID): None},
+        )
+
+        service.kill_switch(actor="ops")
+
+        flatten_calls = [(c[1], c[2]) for c in engine.calls if c[0] == "flatten_position"]
+        assert ("strat_b", "BINANCE:ETHUSDT-PERP") in flatten_calls
+
+    def test_flatten_failure_result_includes_strategy_id_and_product_id(self):
+        pos = _make_position()
+        service, _, _ = _make_service(
+            positions=[pos],
+            flatten_results={(STRATEGY_ID, PRODUCT_ID): None},
+        )
+
+        result = service.kill_switch(actor="ops")
+
+        entry = next(
+            (f for f in result["flatten_failures"] if f["strategy_id"] == STRATEGY_ID),
+            None,
+        )
+        assert entry is not None
+        assert entry["product_id"] == PRODUCT_ID
+        assert "reason" in entry
+
+
+class TestKillSwitchAuditAlways:
+    """Matrix item 7: audit event written ALWAYS."""
+
+    def test_audit_written_on_partial_cancel_failure(self):
+        order = _make_order("o-fail", OrderStatus.SUBMITTED.value)
+        db_factory = _make_null_db_session_factory()
+        fake_engine = RecordingExecutionEngine(
+            cancel_results={"o-fail": False},
+            orders_by_status={OrderStatus.SUBMITTED.value: [order]},
+        )
+        fake_account = FakeAccountService()
+        service = OpsSafetyService(fake_engine, fake_account, db_factory)
+
+        with patch("src.core.ops_safety.write_system_event") as mock_write:
+            service.kill_switch(actor="ops")
+            mock_write.assert_called_once()
+            kwargs = mock_write.call_args.kwargs
+            assert kwargs["event_type"] == "ops"
+            assert kwargs["event_subtype"] == "kill_switch"
+
+    def test_audit_payload_includes_actor_and_reason(self):
+        db_factory = _make_null_db_session_factory()
+        fake_engine = RecordingExecutionEngine()
+        fake_account = FakeAccountService()
+        service = OpsSafetyService(fake_engine, fake_account, db_factory)
+
+        with patch("src.core.ops_safety.write_system_event") as mock_write:
+            service.kill_switch(actor="compliance_team", reason="eod_drill")
+            kwargs = mock_write.call_args.kwargs
+            payload = kwargs["payload"]
+            assert payload["actor"] == "compliance_team"
+            assert payload["reason"] == "eod_drill"
+
+    def test_audit_payload_includes_full_result(self):
+        db_factory = _make_null_db_session_factory()
+        fake_engine = RecordingExecutionEngine()
+        fake_account = FakeAccountService()
+        service = OpsSafetyService(fake_engine, fake_account, db_factory)
+
+        with patch("src.core.ops_safety.write_system_event") as mock_write:
+            service.kill_switch(actor="ops")
+            payload = mock_write.call_args.kwargs["payload"]
+            for key in ("cancelled_orders", "cancel_failures", "flattened_positions",
+                        "flatten_failures", "already_flat"):
+                assert key in payload, f"payload missing key: {key}"
+
+
+class TestKillSwitchFlattenPositions:
+    """Matrix item 4: flatten places opposite-side call per position."""
+
+    def test_long_position_triggers_flatten(self):
+        pos = _make_position(side=PositionSide.LONG, quantity=Decimal("3.0"))
+        service, engine, _ = _make_service(positions=[pos])
+
+        service.kill_switch(actor="ops")
+
+        flatten_calls = [c for c in engine.calls if c[0] == "flatten_position"]
+        assert len(flatten_calls) == 1
+        assert flatten_calls[0][1] == STRATEGY_ID
+        assert flatten_calls[0][2] == PRODUCT_ID
+
+    def test_multiple_positions_all_flattened(self):
+        pos1 = _make_position(strategy_id="s1", product_id=PRODUCT_ID)
+        pos2 = _make_position(strategy_id="s2", product_id="BINANCE:ETHUSDT-PERP")
+        service, engine, _ = _make_service(positions=[pos1, pos2])
+
+        service.kill_switch(actor="ops")
+
+        flatten_calls = [(c[1], c[2]) for c in engine.calls if c[0] == "flatten_position"]
+        assert ("s1", PRODUCT_ID) in flatten_calls
+        assert ("s2", "BINANCE:ETHUSDT-PERP") in flatten_calls
+
+    def test_result_counts_successful_flattens(self):
+        pos = _make_position()
+        service, _, _ = _make_service(positions=[pos])
+
+        result = service.kill_switch(actor="ops")
+
+        assert result["flattened_positions"] == 1
+
+
+# =============================================================================
+# B. ExecutionEngine.flatten_position tests
+# =============================================================================
+
+
+class TestFlattenPosition:
+    """Matrix items for ExecutionEngine.flatten_position."""
+
+    @pytest.fixture()
+    def eng(self, mock_db_session, mock_clock, mock_exchange_adapter, mock_order_repo):
+        return ExecutionEngine(
+            db_session=mock_db_session,
+            clock=mock_clock,
+            adapter=mock_exchange_adapter,
+            order_repository=mock_order_repo,
+        )
+
+    def test_long_position_places_sell_market_order(
+        self, eng, mock_exchange_adapter, mock_order_repo
+    ):
+        """LONG position → BUY order on adapter (sell direction), type=market."""
+        result = eng.flatten_position(
+            STRATEGY_ID, PRODUCT_ID, "LONG", Decimal("2.5")
+        )
+
+        # Must return an order id (non-None)
+        assert result is not None
+
+        # Adapter must have received exactly one order
+        placed = mock_exchange_adapter.filled_orders or mock_exchange_adapter.open_orders
+        assert len(placed) >= 1
+
+        # The placed order must be a market SELL (flatten LONG = sell)
+        placed_order = (mock_exchange_adapter.open_orders + mock_exchange_adapter.filled_orders)[-1]
+        order_obj = placed_order if isinstance(placed_order, Order) else placed_order.get("order")
+        assert order_obj is not None
+        assert order_obj.type == "market"
+        # Side convention: flatten LONG → place SELL (buy/sell convention from adapter boundary)
+        assert order_obj.side.lower() in ("sell", "short")
+
+    def test_short_position_places_buy_market_order(
+        self, eng, mock_exchange_adapter
+    ):
+        """SHORT position → market BUY (flatten direction)."""
+        result = eng.flatten_position(
+            STRATEGY_ID, PRODUCT_ID, "SHORT", Decimal("1.0")
+        )
+
+        assert result is not None
+        placed_order = (mock_exchange_adapter.open_orders + mock_exchange_adapter.filled_orders)[-1]
+        order_obj = placed_order if isinstance(placed_order, Order) else placed_order.get("order")
+        assert order_obj is not None
+        assert order_obj.type == "market"
+        assert order_obj.side.lower() in ("buy", "long")
+
+    def test_order_persisted_in_order_repo(self, eng, mock_order_repo):
+        """Order must be recorded via order_manager before adapter placement."""
+        eng.flatten_position(STRATEGY_ID, PRODUCT_ID, "LONG", Decimal("1.0"))
+        assert len(mock_order_repo.orders) >= 1
+
+    def test_adapter_error_returns_none(self, eng, mock_exchange_adapter):
+        """Adapter exception → returns None, does not propagate."""
+        mock_exchange_adapter.set_should_fail(True, reason="exchange offline")
+
+        result = eng.flatten_position(STRATEGY_ID, PRODUCT_ID, "LONG", Decimal("1.0"))
+
+        assert result is None
+
+    def test_adapter_error_local_order_marked_failed(
+        self, eng, mock_exchange_adapter, mock_order_repo
+    ):
+        """When adapter raises, the local order must be in a terminal (FAILED/CANCELLED) state."""
+        mock_exchange_adapter.set_should_fail(True, reason="exchange offline")
+
+        eng.flatten_position(STRATEGY_ID, PRODUCT_ID, "LONG", Decimal("1.0"))
+
+        terminal_statuses = {OrderStatus.FAILED.value, OrderStatus.CANCELLED.value, "failed"}
+        orders_in_terminal = [
+            o for o in mock_order_repo.orders.values() if o.status in terminal_statuses
+        ]
+        assert len(orders_in_terminal) >= 1
+
+
+# =============================================================================
+# C. StrategyEngine._handle_command — KILL_SWITCH routing
+# =============================================================================
+
+
+class TestEngineKillSwitchCommand:
+    """Matrix items for engine._handle_command routing of KILL_SWITCH."""
+
+    def test_kill_switch_command_routes_to_ops_safety(self, engine_factory):
+        """KILL_SWITCH dispatches to self.ops_safety.kill_switch with correct kwargs."""
+        engine = engine_factory()
+        mock_ops_safety = MagicMock()
+        mock_ops_safety.kill_switch.return_value = {
+            "cancelled_orders": 0,
+            "cancel_failures": [],
+            "flattened_positions": 0,
+            "flatten_failures": [],
+            "already_flat": True,
+        }
+        engine.ops_safety = mock_ops_safety
+
+        engine._handle_command(
+            {"command": "KILL_SWITCH", "params": {"actor": "ops", "reason": "drill"}}
+        )
+
+        mock_ops_safety.kill_switch.assert_called_once_with(actor="ops", reason="drill")
+
+    def test_kill_switch_default_actor_when_not_provided(self, engine_factory):
+        """When actor absent, default to 'operator'."""
+        engine = engine_factory()
+        mock_ops_safety = MagicMock()
+        mock_ops_safety.kill_switch.return_value = {
+            "cancelled_orders": 0, "cancel_failures": [],
+            "flattened_positions": 0, "flatten_failures": [], "already_flat": True,
+        }
+        engine.ops_safety = mock_ops_safety
+
+        engine._handle_command({"command": "KILL_SWITCH", "params": {}})
+
+        mock_ops_safety.kill_switch.assert_called_once_with(actor="operator", reason=None)
+
+    def test_unknown_command_delegated_to_command_router(self, engine_factory):
+        """Regression: unknown commands must still reach _command_router.handle()."""
+        engine = engine_factory()
+        engine._command_router.handle = MagicMock(
+            return_value=MagicMock(success=True, message="ok")
+        )
+
+        data = {"command": "SOME_FUTURE_COMMAND"}
+        engine._handle_command(data)
+
+        engine._command_router.handle.assert_called_once_with(data)

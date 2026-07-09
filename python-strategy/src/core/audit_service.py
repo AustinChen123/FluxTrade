@@ -17,6 +17,7 @@ SYSTEM_EVENT_TYPES = frozenset(
         "reconcile",
         "gene_promote",
         "gene_retire",
+        "ops",
         "system_error",
     }
 )

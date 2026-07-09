@@ -278,6 +278,78 @@ class ExecutionEngine:
         self.order_manager.mark_cancelled(order)
         return True
 
+    def flatten_position(
+        self,
+        strategy_id: str,
+        product_id: str,
+        side: str,
+        quantity: Decimal,
+    ) -> Optional[str]:
+        """Close a live position with a reduce-only market order, bypassing
+        strategy signal flow.
+
+        Places a market order in the OPPOSITE direction for the full quantity.
+        The order is persisted via order_manager before adapter placement so
+        that a crash after placement leaves an auditable record.
+
+        Args:
+            strategy_id: owning strategy identifier.
+            product_id: product to flatten (e.g. "BINANCE:BTCUSDT-PERP").
+            side: current position side — "LONG" or "SHORT".
+            quantity: absolute quantity to close (Decimal, positive).
+
+        Returns:
+            Internal order id string on success, or None on failure.
+        """
+        normalized_side = str(side).upper()
+        if normalized_side == PositionSide.LONG.value:
+            order_side = OrderSide.SELL
+            signal_type = SignalType.EXIT_LONG
+        elif normalized_side == PositionSide.SHORT.value:
+            order_side = OrderSide.BUY
+            signal_type = SignalType.EXIT_SHORT
+        else:
+            self.logger.error("Cannot flatten unsupported position side: %s", side)
+            return None
+        if quantity <= 0:
+            self.logger.error("Cannot flatten non-positive quantity: %s", quantity)
+            return None
+
+        signal = Signal(
+            strategy_id=strategy_id,
+            product_id=product_id,
+            timeframe="ops",
+            timestamp=int(self.clock.now() * 1000),
+            type=signal_type,
+            quantity=quantity,
+        )
+        order = self.order_manager.create_order(
+            signal=signal,
+            side=order_side,
+            order_type="market",
+            quantity=quantity,
+            intent_payload={"reduce_only": True, "source": "kill_switch"},
+        )
+        try:
+            exchange_id = self.adapter.place_order(order)
+            self.order_manager.update_exchange_order_id(order, exchange_id)
+            ORDERS_TOTAL.labels(
+                order_type="market",
+                status="placed",
+                reason="kill_switch_flatten",
+            ).inc()
+            return str(order.id)
+        except ExchangeError as e:
+            self.logger.error("Flatten order failed: %s", e)
+            self.order_manager.fail_order(order, str(e))
+            self._record_order_rejection(
+                order=order,
+                order_type="market",
+                error=e,
+                phase="kill_switch_flatten",
+            )
+            return None
+
     def execute_signal(self, signal: Signal, candle: Optional[Candlestick] = None) -> Optional[str]:
         """
         Converts Signal to Order and delegates execution to the Adapter.
