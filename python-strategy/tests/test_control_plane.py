@@ -1622,6 +1622,24 @@ def test_kill_switch_reason_forwarded_in_publish():
     assert published["params"].get("reason") == "eod_risk_drill"
 
 
+def test_kill_switch_publish_failure_returns_503():
+    from unittest.mock import MagicMock
+
+    redis = MagicMock()
+    redis.publish.side_effect = RuntimeError("redis down")
+    app = _kill_switch_app(redis_client=redis)
+
+    response = app.handle(
+        "POST",
+        "/ops/kill-switch",
+        headers={"x-api-key": "secret"},
+    )
+
+    assert response.status_code == 503
+    assert response.body["error"] == "redis_publish_failed"
+    assert "redis down" in response.body["detail"]
+
+
 def test_control_plane_main_wires_redis_client_for_kill_switch(monkeypatch):
     from unittest.mock import MagicMock
 

@@ -342,10 +342,16 @@ class ControlPlaneApp:
                 "reason": reason,
             },
         }
-        self.redis_client.publish(
-            "cmd:strategy:control",
-            json.dumps(command, separators=(",", ":")),
-        )
+        try:
+            self.redis_client.publish(
+                "cmd:strategy:control",
+                json.dumps(command, separators=(",", ":")),
+            )
+        except Exception as exc:
+            return HttpResponse(
+                503,
+                {"error": "redis_publish_failed", "detail": str(exc)},
+            )
         return HttpResponse(202, {"status": "accepted"})
 
     def _submit_gene_action(
