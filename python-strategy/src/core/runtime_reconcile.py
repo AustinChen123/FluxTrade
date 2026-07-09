@@ -46,6 +46,7 @@ class RuntimeReconciliationJob:
         *,
         quantity_drift_threshold: Decimal,
         balance_drift_threshold: Decimal,
+        product_ids: list[str] | tuple[str, ...] | None = None,
         logger: logging.Logger | None = None,
     ) -> None:
         self._account_service = account_service
@@ -53,6 +54,7 @@ class RuntimeReconciliationJob:
         self._db_session_factory = db_session_factory
         self._quantity_drift_threshold = quantity_drift_threshold
         self._balance_drift_threshold = balance_drift_threshold
+        self._product_ids = tuple(product_ids or ())
         self._logger = logger or logging.getLogger(__name__)
 
     def run_once(self) -> dict:
@@ -101,6 +103,7 @@ class RuntimeReconciliationJob:
         result["checked_positions"] = len(local_positions)
         products = set(exchange_positions.keys())
         products.update(local_positions_by_product.keys())
+        products.update(self._product_ids)
 
         for product_id in sorted(products):
             local_product_positions = local_positions_by_product.get(product_id, [])

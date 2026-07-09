@@ -89,6 +89,26 @@ class FakeAdapter:
         return self._balance
 
 
+class ProductScopedAdapter:
+    """Adapter shape matching live CCXT: no list API, only get_position(product)."""
+
+    def __init__(
+        self,
+        positions: dict[str, Position | None],
+        balance: Decimal = Decimal("10000"),
+    ) -> None:
+        self._position_map = positions
+        self._balance = balance
+        self.get_position_calls: list[str] = []
+
+    def get_position(self, product_id: str) -> Position | None:
+        self.get_position_calls.append(product_id)
+        return self._position_map.get(product_id)
+
+    def get_balance(self, asset: str) -> Decimal:
+        return self._balance
+
+
 def _make_null_db_factory():
     @contextmanager
     def factory():
@@ -307,6 +327,34 @@ class TestRunOnceAsymmetricDrift:
             mock_write.assert_called_once()
 
         assert len(result["position_drifts"]) >= 1
+
+    def test_configured_product_universe_detects_exchange_only_position(self):
+        """Live CCXT-style adapters need a configured product universe to scan."""
+        exchange_pos = _make_position(strategy_id="LIVE", quantity=Decimal("2.0"))
+        account = FakeAccountService(positions=[])
+        adapter = ProductScopedAdapter({PRODUCT_ID: exchange_pos})
+        job = RuntimeReconciliationJob(
+            account_service=account,
+            adapter=adapter,
+            db_session_factory=_make_null_db_factory(),
+            quantity_drift_threshold=THRESHOLD_QTY,
+            balance_drift_threshold=THRESHOLD_BAL,
+            product_ids=[PRODUCT_ID],
+        )
+
+        with patch("src.core.runtime_reconcile.write_system_event") as mock_write:
+            result = job.run_once()
+            mock_write.assert_called_once()
+
+        assert adapter.get_position_calls == [PRODUCT_ID]
+        assert result["position_drifts"] == [
+            {
+                "strategy_id": "LIVE",
+                "product_id": PRODUCT_ID,
+                "local_quantity": Decimal("0"),
+                "exchange_quantity": Decimal("2.0"),
+            }
+        ]
 
 
 class TestRunOnceBalanceDrift:

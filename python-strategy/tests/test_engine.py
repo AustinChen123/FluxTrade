@@ -96,6 +96,29 @@ class TestEngineInit:
 
             mock_create.assert_called_once_with(cfg)
 
+    def test_runtime_reconciliation_uses_configured_product_universe(
+        self, mock_db_session, mock_clock
+    ):
+        """Runtime reconciliation must scan configured products even when local is flat."""
+        with patch("src.core.engine.create_redis_client") as mock_factory, \
+             patch("src.core.engine.create_adapter") as mock_create:
+            mock_factory.return_value = MagicMock()
+            mock_create.return_value = MagicMock()
+
+            engine = StrategyEngine(
+                db_session=mock_db_session,
+                clock=mock_clock,
+                adapter_config={
+                    "mode": "live",
+                    "exchange": "binance",
+                    "instrument_product_ids": ["BINANCE:BTCUSDT-PERP"],
+                },
+            )
+
+        assert engine.runtime_reconciliation_job._product_ids == (
+            "BINANCE:BTCUSDT-PERP",
+        )
+
     def test_adapter_create_failure_raises(self, mock_db_session, mock_clock):
         """If create_adapter fails, should log critical and re-raise."""
         with patch("src.core.engine.create_redis_client") as mock_factory, \

@@ -143,6 +143,11 @@ class StrategyEngine:
             balance_drift_threshold=Decimal(
                 os.getenv("RECONCILE_BALANCE_DRIFT_THRESHOLD", "0.01")
             ),
+            product_ids=(
+                (adapter_config or {}).get("instrument_product_ids")
+                or (adapter_config or {}).get("product_ids")
+                or []
+            ),
         )
         
         # System State & Heartbeat
