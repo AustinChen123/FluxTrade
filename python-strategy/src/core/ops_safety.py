@@ -100,6 +100,8 @@ class OpsSafetyService:
                     in_flight,
                 )
                 result["drain_timeout"] = True
+                self._write_event(actor=actor, reason=reason, result=result)
+                return result
 
         orders = self._open_orders()
         for order in orders:

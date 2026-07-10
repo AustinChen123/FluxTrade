@@ -1192,8 +1192,8 @@ class TestSubmissionDrainGate:
         assert len(cancelled) == 1
         assert eng.order_manager.repo.get_order(cancelled[0]).status == OrderStatus.CANCELLED.value
 
-    def test_drain_timeout_result_has_drain_timeout_true(self):
-        """When place_order never returns, kill_switch records drain_timeout=True."""
+    def test_drain_timeout_aborts_before_snapshot_cancel_and_flatten(self):
+        """An unstable submission set must stop kill-switch state mutation."""
         blocking_adapter = BlockingAdapter()
         eng = _make_drain_engine(adapter=blocking_adapter)
 
@@ -1209,11 +1209,22 @@ class TestSubmissionDrainGate:
         service = OpsSafetyService(
             eng, fake_account, _make_null_db_session_factory(), drain_timeout=0.1
         )
-        result = service.kill_switch(actor="ops")
+        with (
+            patch.object(service, "_open_orders", wraps=service._open_orders) as open_orders,
+            patch.object(service, "_positions", wraps=service._positions) as positions,
+            patch.object(eng, "cancel_order", wraps=eng.cancel_order) as cancel_order,
+            patch.object(eng, "flatten_position", wraps=eng.flatten_position) as flatten,
+            patch.object(service, "_write_event", wraps=service._write_event) as write_event,
+        ):
+            result = service.kill_switch(actor="ops")
 
-        assert result.get("drain_timeout") is True, (
-            f"Expected drain_timeout=True in result, got: {result}"
-        )
+        assert result["drain_timeout"] is True
+        assert result["already_flat"] is False
+        open_orders.assert_not_called()
+        positions.assert_not_called()
+        cancel_order.assert_not_called()
+        flatten.assert_not_called()
+        write_event.assert_called_once()
 
         # Cleanup: release so the thread can exit.
         blocking_adapter.release()
