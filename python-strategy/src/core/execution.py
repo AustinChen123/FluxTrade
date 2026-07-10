@@ -117,6 +117,7 @@ class ExecutionEngine:
         self._submission_gate = threading.Condition()
         self._submissions_halted = False
         self._submissions_in_flight = 0
+        self._drain_callbacks: list[Callable[[], None]] = []
 
         self.logger.info("ExecutionEngine initialized with adapter: %s", type(adapter).__name__)
 
@@ -457,6 +458,26 @@ class ExecutionEngine:
                 timeout=timeout,
             )
 
+    def run_when_submissions_drained(self, callback: Callable[[], None]) -> None:
+        with self._submission_gate:
+            if self._submissions_in_flight > 0:
+                self._drain_callbacks.append(callback)
+                return
+        callback()
+
+    def _finish_submission(self) -> None:
+        callbacks: list[Callable[[], None]] = []
+        with self._submission_gate:
+            self._submissions_in_flight -= 1
+            if self._submissions_in_flight == 0:
+                callbacks, self._drain_callbacks = self._drain_callbacks, []
+            self._submission_gate.notify_all()
+        for callback in callbacks:
+            try:
+                callback()
+            except Exception:
+                self.logger.exception("Submission drain callback failed")
+
     def execute_signal(self, signal: Signal, candle: Optional[Candlestick] = None) -> Optional[str]:
         """
         Converts Signal to Order and delegates execution to the Adapter.
@@ -476,9 +497,7 @@ class ExecutionEngine:
                 return self._execute_signal_with_audit(signal, candle)
             return self._execute_signal_core(signal, candle)
         finally:
-            with self._submission_gate:
-                self._submissions_in_flight -= 1
-                self._submission_gate.notify_all()
+            self._finish_submission()
 
     def _execute_signal_core(self, signal: Signal, candle: Optional[Candlestick] = None) -> Optional[str]:
         """Current non-audited signal execution path."""
@@ -1112,9 +1131,7 @@ class ExecutionEngine:
         try:
             return self._place_pending_conditional_orders_for_entry_impl(entry_order)
         finally:
-            with self._submission_gate:
-                self._submissions_in_flight -= 1
-                self._submission_gate.notify_all()
+            self._finish_submission()
 
     def _place_pending_conditional_orders_for_entry_impl(self, entry_order) -> list[dict]:
         if entry_order.type not in {"market", "limit"}:

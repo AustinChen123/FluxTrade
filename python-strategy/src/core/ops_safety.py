@@ -15,6 +15,7 @@ Implementation notes for the implementer:
 
 from __future__ import annotations
 
+from copy import deepcopy
 import logging
 import threading
 from typing import Any, Callable, ContextManager
@@ -51,12 +52,44 @@ class OpsSafetyService:
         self._logger = logger or logging.getLogger(__name__)
         self._drain_timeout = drain_timeout
         self._kill_switch_lock = threading.Lock()
+        self._recovery_pending = False
+        self._recovery_result: dict | None = None
+        self._recovery_actor = "system"
+        self._recovery_reason: str | None = None
 
     def kill_switch(self, *, actor: str, reason: str | None = None) -> dict:
         with self._kill_switch_lock:
-            return self._run_kill_switch(actor=actor, reason=reason)
+            if self._recovery_pending:
+                return deepcopy(self._recovery_result)
+            result, recovery_pending = self._run_kill_switch(
+                actor=actor,
+                reason=reason,
+            )
+            if recovery_pending:
+                self._recovery_pending = True
+                self._recovery_result = deepcopy(result)
+                self._recovery_actor = actor
+                self._recovery_reason = reason
 
-    def _run_kill_switch(self, *, actor: str, reason: str | None = None) -> dict:
+        if recovery_pending:
+            run_when_drained = getattr(
+                self._execution_engine,
+                "run_when_submissions_drained",
+                None,
+            )
+            if callable(run_when_drained):
+                run_when_drained(self._recover_after_submission_drain)
+            else:
+                self._logger.error("Kill switch recovery callback is unavailable")
+        return result
+
+    def _run_kill_switch(
+        self,
+        *,
+        actor: str,
+        reason: str | None = None,
+        result: dict | None = None,
+    ) -> tuple[dict, bool]:
         """Cancel all open orders, then flatten all positions.
 
         Returns:
@@ -85,7 +118,7 @@ class OpsSafetyService:
         Idempotency: no open orders and no positions → already_flat=True with
         zero counts; audit event is still written.
         """
-        result = {
+        result = result or {
             "cancelled_orders": 0,
             "cancel_failures": [],
             "flattened_positions": 0,
@@ -97,24 +130,16 @@ class OpsSafetyService:
         # Drain in-flight order submissions before snapshotting state.
         halt_and_drain = getattr(self._execution_engine, "halt_and_drain", None)
         drained = not callable(halt_and_drain) or halt_and_drain(self._drain_timeout)
-        had_drain_timeout = False
-        pending_event_written = False
-        while not drained:
-            had_drain_timeout = True
-            if not pending_event_written:
-                result["drain_timeout"] = True
-                self._write_event(
-                    actor=actor,
-                    reason=reason,
-                    result=result,
-                    event_subtype="kill_switch_pending",
-                )
-                pending_event_written = True
+        if not drained:
+            result["drain_timeout"] = True
+            self._write_event(
+                actor=actor,
+                reason=reason,
+                result=result,
+                event_subtype="kill_switch_pending",
+            )
             self._log_drain_timeout()
-            self._mitigate_visible_state(result, flatten_positions=False)
-            drained = halt_and_drain(self._drain_timeout)
 
-        result["drain_timeout"] = had_drain_timeout
         orders, positions = self._mitigate_visible_state(result)
 
         result["already_flat"] = (
@@ -123,8 +148,21 @@ class OpsSafetyService:
             and not result["cancel_failures"]
             and not result["flatten_failures"]
         )
-        self._write_event(actor=actor, reason=reason, result=result)
-        return result
+        if drained:
+            self._write_event(actor=actor, reason=reason, result=result)
+        return result, not drained
+
+    def _recover_after_submission_drain(self) -> None:
+        with self._kill_switch_lock:
+            if not self._recovery_pending or self._recovery_result is None:
+                return
+            result, recovery_pending = self._run_kill_switch(
+                actor=self._recovery_actor,
+                reason=self._recovery_reason,
+                result=deepcopy(self._recovery_result),
+            )
+            self._recovery_pending = recovery_pending
+            self._recovery_result = deepcopy(result) if recovery_pending else None
 
     def _log_drain_timeout(self) -> None:
         in_flight = getattr(self._execution_engine, "_submissions_in_flight", None)

@@ -1170,6 +1170,7 @@ class SequencedDrainEngine(RecordingExecutionEngine):
         self._drain_results = iter(drain_results)
         self._late_order = late_order
         self.drain_calls = 0
+        self.drain_callback = None
 
     def halt_and_drain(self, timeout: float) -> bool:
         self.drain_calls += 1
@@ -1185,6 +1186,14 @@ class SequencedDrainEngine(RecordingExecutionEngine):
                 order.status = OrderStatus.CANCELLED.value
                 return True
         return False
+
+    def run_when_submissions_drained(self, callback) -> None:
+        self.drain_callback = callback
+
+    def complete_submission(self) -> None:
+        callback = self.drain_callback
+        self.drain_callback = None
+        callback()
 
 
 class BlockingFirstAccountService(FakeAccountService):
@@ -1310,13 +1319,32 @@ class TestSubmissionDrainGate:
         assert len(cancelled) == 1
         assert eng.order_manager.repo.get_order(cancelled[0]).status == OrderStatus.CANCELLED.value
 
-    def test_repeated_drain_timeouts_keep_cleaning_until_submission_converges(self):
-        """Late submissions are cancelled before the invocation may return."""
+    def test_execution_engine_runs_callback_only_after_submission_drains(self):
+        blocking_adapter = BlockingAdapter()
+        eng = _make_drain_engine(adapter=blocking_adapter)
+        submit_thread = threading.Thread(
+            target=eng.execute_signal,
+            args=(_make_signal(),),
+            daemon=True,
+        )
+        submit_thread.start()
+        assert blocking_adapter._placed.wait(timeout=1.0)
+
+        callback_ran = threading.Event()
+        eng.run_when_submissions_drained(callback_ran.set)
+        assert not callback_ran.is_set()
+
+        blocking_adapter.release()
+        submit_thread.join(timeout=1.0)
+        assert callback_ran.wait(timeout=1.0)
+
+    def test_drain_timeout_returns_bounded_then_callback_finishes_cleanup(self):
+        """Late submissions are cleaned by the one-shot drain callback."""
         order = _make_order("known-order", OrderStatus.SUBMITTED.value)
         late_order = _make_order("late-order", OrderStatus.SUBMITTED.value)
         position = _make_position()
         eng = SequencedDrainEngine(
-            [False, False, True],
+            [False, True],
             orders=[order],
             late_order=late_order,
         )
@@ -1340,19 +1368,33 @@ class TestSubmissionDrainGate:
         ):
             result = service.kill_switch(actor="ops")
 
+            assert result["drain_timeout"] is True
+            assert eng.drain_calls == 1
+            assert [subtype for subtype, _ in audit_events] == [
+                "kill_switch_pending",
+            ]
+            repeated_result = service.kill_switch(actor="ops")
+            assert repeated_result == result
+            assert eng.drain_calls == 1
+
+            service._account_service._positions = []
+            eng.complete_submission()
+
         assert result["drain_timeout"] is True
         assert result["already_flat"] is False
-        assert result["cancelled_orders"] == 2
+        assert result["cancelled_orders"] == 1
         assert result["flattened_positions"] == 1
         assert ("cancel_order", "late-order") in eng.calls
-        assert eng.drain_calls == 3
+        assert eng.drain_calls == 2
         assert [subtype for subtype, _ in audit_events] == [
             "kill_switch_pending",
             "kill_switch",
         ]
         assert audit_events[0][1]["drain_timeout"] is True
         assert audit_events[0][1]["flattened_positions"] == 0
-        assert audit_events[1][1] == result
+        assert audit_events[1][1]["cancelled_orders"] == 2
+        assert audit_events[1][1]["flattened_positions"] == 1
+        assert audit_events[1][1]["drain_timeout"] is True
 
     def test_retry_after_timeout_catches_late_order_before_success(self):
         """A converged retry runs a second pass that catches the late submission."""
@@ -1368,15 +1410,16 @@ class TestSubmissionDrainGate:
         result = service.kill_switch(actor="ops")
 
         assert result["drain_timeout"] is True
-        assert result["already_flat"] is False
-        assert result["cancelled_orders"] == 1
+        assert result["already_flat"] is True
+        assert result["cancelled_orders"] == 0
+        eng.complete_submission()
         assert ("cancel_order", "late-order") in eng.calls
         assert eng.drain_calls == 2
 
     @pytest.mark.parametrize(
         "drain_results",
-        [[True], [False, True], [False, False, True]],
-        ids=["drained", "retry-converged", "retry-twice"],
+        [[True], [False, True]],
+        ids=["drained", "recovery-pending"],
     )
     def test_each_position_is_flattened_once_per_invocation(self, drain_results):
         eng = SequencedDrainEngine(drain_results)
