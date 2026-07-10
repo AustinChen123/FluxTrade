@@ -1340,7 +1340,7 @@ class TestSubmissionDrainGate:
         ):
             result = service.kill_switch(actor="ops")
 
-        assert result["drain_timeout"] is False
+        assert result["drain_timeout"] is True
         assert result["already_flat"] is False
         assert result["cancelled_orders"] == 2
         assert result["flattened_positions"] == 1
@@ -1367,7 +1367,8 @@ class TestSubmissionDrainGate:
 
         result = service.kill_switch(actor="ops")
 
-        assert result["drain_timeout"] is False
+        assert result["drain_timeout"] is True
+        assert result["already_flat"] is False
         assert result["cancelled_orders"] == 1
         assert ("cancel_order", "late-order") in eng.calls
         assert eng.drain_calls == 2

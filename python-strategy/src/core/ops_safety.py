@@ -97,8 +97,10 @@ class OpsSafetyService:
         # Drain in-flight order submissions before snapshotting state.
         halt_and_drain = getattr(self._execution_engine, "halt_and_drain", None)
         drained = not callable(halt_and_drain) or halt_and_drain(self._drain_timeout)
+        had_drain_timeout = False
         pending_event_written = False
         while not drained:
+            had_drain_timeout = True
             if not pending_event_written:
                 result["drain_timeout"] = True
                 self._write_event(
@@ -112,12 +114,11 @@ class OpsSafetyService:
             self._mitigate_visible_state(result, flatten_positions=False)
             drained = halt_and_drain(self._drain_timeout)
 
-        result["drain_timeout"] = False
+        result["drain_timeout"] = had_drain_timeout
         orders, positions = self._mitigate_visible_state(result)
 
         result["already_flat"] = (
-            not result["drain_timeout"]
-            and not orders
+            not orders
             and not positions
             and not result["cancel_failures"]
             and not result["flatten_failures"]
