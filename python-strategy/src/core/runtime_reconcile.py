@@ -98,6 +98,11 @@ class RuntimeReconciliationJob:
         }
 
         local_positions = self._local_positions(result)
+        if local_positions is None:
+            self._check_balance(result)
+            self._emit_events(result)
+            return result
+
         local_positions_by_product = self._positions_by_product(local_positions)
         exchange_positions = self._exchange_positions_by_product(result)
         result["checked_positions"] = len(local_positions)
@@ -139,12 +144,12 @@ class RuntimeReconciliationJob:
         self._emit_events(result)
         return result
 
-    def _local_positions(self, result: dict) -> list[Any]:
+    def _local_positions(self, result: dict) -> list[Any] | None:
         try:
             return list(self._account_service.get_all_positions())
         except Exception as exc:
             result["errors"].append({"scope": "positions", "reason": str(exc)})
-            return []
+            return None
 
     def _exchange_positions_by_product(self, result: dict) -> dict[str, list[Any]]:
         try:

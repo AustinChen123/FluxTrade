@@ -413,6 +413,22 @@ class TestRunOnceAdapterError:
         assert "scope" in err
         assert "reason" in err
 
+    def test_local_position_error_skips_exchange_position_drift(self):
+        exchange_position = _make_position(quantity=Decimal("2.0"))
+        job, account, _ = _make_job(
+            exchange_positions={PRODUCT_ID: exchange_position},
+        )
+        account.get_all_positions = MagicMock(side_effect=RuntimeError("Redis down"))
+
+        with patch("src.core.runtime_reconcile.write_system_event") as write_event:
+            result = job.run_once()
+
+        assert result["checked_positions"] == 0
+        assert result["position_drifts"] == []
+        assert result["errors"] == [{"scope": "positions", "reason": "Redis down"}]
+        write_event.assert_called_once()
+        assert write_event.call_args.kwargs["event_subtype"] == "runtime_reconcile_error"
+
     def test_adapter_error_scope_identifies_positions(self):
         local_pos = _make_position()
         job, _, _ = _make_job(
