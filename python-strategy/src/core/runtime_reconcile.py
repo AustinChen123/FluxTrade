@@ -23,6 +23,7 @@ Implementation notes for the implementer:
 from __future__ import annotations
 
 import logging
+import threading
 from decimal import Decimal
 from typing import Any, Callable, ContextManager
 
@@ -56,8 +57,13 @@ class RuntimeReconciliationJob:
         self._balance_drift_threshold = balance_drift_threshold
         self._product_ids = tuple(product_ids or ())
         self._logger = logger or logging.getLogger(__name__)
+        self._run_lock = threading.Lock()
 
     def run_once(self) -> dict:
+        with self._run_lock:
+            return self._run_once()
+
+    def _run_once(self) -> dict:
         """Compare local positions/balance against the exchange.
 
         Returns:

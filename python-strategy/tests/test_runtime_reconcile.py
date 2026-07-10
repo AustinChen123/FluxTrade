@@ -17,6 +17,8 @@ from __future__ import annotations
 
 from contextlib import contextmanager
 from decimal import Decimal
+import threading
+import time
 from unittest.mock import MagicMock, patch
 
 from src.core.models import Position, PositionSide
@@ -65,6 +67,24 @@ class FakeAccountService:
 
     def get_balance(self) -> Decimal:
         return self._balance
+
+
+class BlockingFirstAccountService(FakeAccountService):
+    def __init__(self) -> None:
+        super().__init__()
+        self.entered = threading.Event()
+        self.release = threading.Event()
+        self.calls = 0
+        self._calls_lock = threading.Lock()
+
+    def get_all_positions(self) -> list[Position]:
+        with self._calls_lock:
+            self.calls += 1
+            call_number = self.calls
+        if call_number == 1:
+            self.entered.set()
+            self.release.wait(timeout=2.0)
+        return []
 
 
 class FakeAdapter:
@@ -162,6 +182,29 @@ class TestRunOnceResultShape:
 
         for key in ("checked_positions", "position_drifts", "balance_drift", "errors"):
             assert key in result, f"result missing key: {key}"
+
+    def test_concurrent_runs_are_serialized(self):
+        account = BlockingFirstAccountService()
+        job = RuntimeReconciliationJob(
+            account_service=account,
+            adapter=FakeAdapter(),
+            db_session_factory=_make_null_db_factory(),
+            quantity_drift_threshold=THRESHOLD_QTY,
+            balance_drift_threshold=THRESHOLD_BAL,
+        )
+        first = threading.Thread(target=job.run_once, daemon=True)
+        second = threading.Thread(target=job.run_once, daemon=True)
+
+        first.start()
+        assert account.entered.wait(timeout=1.0)
+        second.start()
+        time.sleep(0.05)
+        assert account.calls == 1
+
+        account.release.set()
+        first.join(timeout=1.0)
+        second.join(timeout=1.0)
+        assert account.calls == 2
 
     def test_checked_positions_is_int(self):
         local_pos = _make_position()
