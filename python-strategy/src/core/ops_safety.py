@@ -16,6 +16,7 @@ Implementation notes for the implementer:
 from __future__ import annotations
 
 import logging
+import threading
 from typing import Any, Callable, ContextManager
 
 from sqlalchemy.orm import Session
@@ -49,8 +50,13 @@ class OpsSafetyService:
         self._db_session_factory = db_session_factory
         self._logger = logger or logging.getLogger(__name__)
         self._drain_timeout = drain_timeout
+        self._kill_switch_lock = threading.Lock()
 
     def kill_switch(self, *, actor: str, reason: str | None = None) -> dict:
+        with self._kill_switch_lock:
+            return self._run_kill_switch(actor=actor, reason=reason)
+
+    def _run_kill_switch(self, *, actor: str, reason: str | None = None) -> dict:
         """Cancel all open orders, then flatten all positions.
 
         Returns:
@@ -94,19 +100,13 @@ class OpsSafetyService:
         result["drain_timeout"] = not drained
         if not drained:
             self._log_drain_timeout()
-
-        attempts = 1 if drained else 2
-        orders: list[Any] = []
-        positions: list[Any] = []
-        for _ in range(attempts):
-            orders, positions = self._mitigate_visible_state(result)
-            if drained:
-                break
+            self._mitigate_visible_state(result, flatten_positions=False)
             drained = halt_and_drain(self._drain_timeout)
             result["drain_timeout"] = not drained
             if not drained:
                 self._log_drain_timeout()
-                break
+
+        orders, positions = self._mitigate_visible_state(result)
 
         result["already_flat"] = (
             not result["drain_timeout"]
@@ -126,7 +126,12 @@ class OpsSafetyService:
             in_flight,
         )
 
-    def _mitigate_visible_state(self, result: dict) -> tuple[list[Any], list[Any]]:
+    def _mitigate_visible_state(
+        self,
+        result: dict,
+        *,
+        flatten_positions: bool = True,
+    ) -> tuple[list[Any], list[Any]]:
         orders = self._open_orders()
         for order in orders:
             order_id = str(order.id)
@@ -146,6 +151,9 @@ class OpsSafetyService:
                 result["cancel_failures"].append(
                     {"order_id": order_id, "reason": str(exc)}
                 )
+
+        if not flatten_positions:
+            return orders, []
 
         try:
             positions, local_fetch_error = self._positions()

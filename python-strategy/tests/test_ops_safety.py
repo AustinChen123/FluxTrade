@@ -1119,6 +1119,24 @@ class SequencedDrainEngine(RecordingExecutionEngine):
         return False
 
 
+class BlockingFirstAccountService(FakeAccountService):
+    def __init__(self) -> None:
+        super().__init__(positions=[])
+        self.entered = threading.Event()
+        self.release = threading.Event()
+        self.calls = 0
+        self._calls_lock = threading.Lock()
+
+    def get_all_positions(self) -> list[Position]:
+        with self._calls_lock:
+            self.calls += 1
+            call_number = self.calls
+        if call_number == 1:
+            self.entered.set()
+            self.release.wait(timeout=2.0)
+        return []
+
+
 def _make_drain_engine(
     adapter=None,
     mock_db_session=None,
@@ -1261,6 +1279,67 @@ class TestSubmissionDrainGate:
         assert result["cancelled_orders"] == 1
         assert ("cancel_order", "late-order") in eng.calls
         assert eng.drain_calls == 2
+
+    @pytest.mark.parametrize(
+        "drain_results",
+        [[True], [False, True], [False, False]],
+        ids=["drained", "retry-converged", "retry-timeout"],
+    )
+    def test_each_position_is_flattened_once_per_invocation(self, drain_results):
+        eng = SequencedDrainEngine(drain_results)
+        service = OpsSafetyService(
+            eng,
+            FakeAccountService(positions=[_make_position()]),
+            _make_null_db_session_factory(),
+            drain_timeout=0.1,
+        )
+
+        service.kill_switch(actor="ops")
+
+        flatten_calls = [call for call in eng.calls if call[0] == "flatten_position"]
+        assert len(flatten_calls) == 1
+
+    def test_concurrent_kill_switch_calls_are_serialized(self):
+        account = BlockingFirstAccountService()
+        service = OpsSafetyService(
+            RecordingExecutionEngine(),
+            account,
+            _make_null_db_session_factory(),
+        )
+        first = threading.Thread(
+            target=service.kill_switch,
+            kwargs={"actor": "first"},
+            daemon=True,
+        )
+        second = threading.Thread(
+            target=service.kill_switch,
+            kwargs={"actor": "second"},
+            daemon=True,
+        )
+
+        first.start()
+        assert account.entered.wait(timeout=1.0)
+        second.start()
+        time.sleep(0.05)
+        assert account.calls == 1
+
+        account.release.set()
+        first.join(timeout=1.0)
+        second.join(timeout=1.0)
+        assert account.calls == 2
+
+    def test_kill_switch_lock_releases_after_exception(self):
+        service, _, _ = _make_service()
+        with patch.object(
+            service,
+            "_write_event",
+            side_effect=[RuntimeError("audit failed"), None],
+        ):
+            with pytest.raises(RuntimeError, match="audit failed"):
+                service.kill_switch(actor="first")
+            result = service.kill_switch(actor="second")
+
+        assert result["already_flat"] is True
 
     def test_gated_conditional_placement_after_halt_returns_halted_failure(self):
         """_place_pending_conditional_orders_for_entry must report kill_switch_halted after halt."""
