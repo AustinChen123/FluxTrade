@@ -13,6 +13,8 @@ from __future__ import annotations
 
 from contextlib import contextmanager
 from decimal import Decimal
+import threading
+import time
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -1064,8 +1066,6 @@ def test_positions_fetch_matrix(
 # E. Fix 2 — Submission drain gate
 # =============================================================================
 
-import threading  # noqa: E402 — stdlib, safe to import here
-
 
 class BlockingAdapter:
     """Adapter whose place_order blocks until released."""
@@ -1087,7 +1087,13 @@ class BlockingAdapter:
         return None
 
 
-def _make_drain_engine(adapter=None, mock_db_session=None, mock_clock=None):
+def _make_drain_engine(
+    adapter=None,
+    mock_db_session=None,
+    mock_clock=None,
+    *,
+    audit_external_orders=False,
+):
     """Build a real ExecutionEngine with an in-memory repo for drain tests."""
     from tests.conftest import MockOrderRepository, MockClock
     from unittest.mock import MagicMock
@@ -1101,6 +1107,8 @@ def _make_drain_engine(adapter=None, mock_db_session=None, mock_clock=None):
         clock=clk,
         adapter=adp,
         order_repository=repo,
+        db_session_factory=_make_null_db_session_factory(),
+        audit_external_orders=audit_external_orders,
     )
 
 
@@ -1136,47 +1144,53 @@ class TestSubmissionDrainGate:
         assert result is None
         mock_core.assert_not_called()
 
-    def test_inflight_drain_waits_for_order_before_snapshot(self):
-        """kill_switch waits until an in-flight execute_signal completes."""
+    def test_kill_switch_drains_inflight_order_before_snapshot_and_cancel(self):
+        """Kill switch snapshots and cancels only after an in-flight submit completes."""
         blocking_adapter = BlockingAdapter()
-        eng = _make_drain_engine(adapter=blocking_adapter)
+        eng = _make_drain_engine(
+            adapter=blocking_adapter,
+            audit_external_orders=True,
+        )
 
         signal = _make_signal()
-
-        # Start execute_signal in a background thread.
         submit_thread = threading.Thread(target=eng.execute_signal, args=(signal,), daemon=True)
         submit_thread.start()
+        assert blocking_adapter._placed.wait(timeout=2.0), "place_order was never called"
 
-        # Wait until the adapter's place_order is actually blocking.
-        placed = blocking_adapter._placed.wait(timeout=2.0)
-        assert placed, "place_order was never called — test setup issue"
+        cancelled: list[str] = []
 
-        # Call halt_and_drain; it must block until we release the adapter.
-        drain_done = threading.Event()
-        drain_result: list[bool] = []
+        def cancel_order(order_id: str) -> bool:
+            cancelled.append(order_id)
+            order = eng.order_manager.repo.get_order(order_id)
+            eng.order_manager.mark_cancelled(order)
+            return True
 
-        def do_drain():
-            drain_result.append(eng.halt_and_drain(timeout=5.0))
-            drain_done.set()
+        eng.cancel_order = cancel_order
+        service = OpsSafetyService(
+            eng,
+            FakeAccountService(positions=[]),
+            _make_null_db_session_factory(),
+            drain_timeout=5.0,
+        )
+        result: list[dict] = []
+        kill_thread = threading.Thread(
+            target=lambda: result.append(service.kill_switch(actor="ops")),
+            daemon=True,
+        )
+        kill_thread.start()
 
-        drain_thread = threading.Thread(target=do_drain, daemon=True)
-        drain_thread.start()
-
-        # Give drain a moment to start waiting.
-        import time
         time.sleep(0.05)
-        # Drain must still be waiting (in_flight > 0).
-        assert not drain_done.is_set(), "halt_and_drain returned before order was placed"
+        assert kill_thread.is_alive(), "kill_switch returned before submit completed"
+        assert cancelled == []
 
-        # Release the adapter; the submit thread completes; drain returns.
         blocking_adapter.release()
         submit_thread.join(timeout=2.0)
-        drain_done.wait(timeout=2.0)
+        kill_thread.join(timeout=2.0)
 
-        assert drain_result == [True], "Expected drained=True after releasing the adapter"
-
-        # The order should exist in the repo now.
-        assert eng.order_manager.repo.orders, "Order must be in the repo after drain"
+        assert not kill_thread.is_alive()
+        assert result[0]["drain_timeout"] is False
+        assert len(cancelled) == 1
+        assert eng.order_manager.repo.get_order(cancelled[0]).status == OrderStatus.CANCELLED.value
 
     def test_drain_timeout_result_has_drain_timeout_true(self):
         """When place_order never returns, kill_switch records drain_timeout=True."""
