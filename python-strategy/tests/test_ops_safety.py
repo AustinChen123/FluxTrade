@@ -1281,11 +1281,16 @@ class TestSubmissionDrainGate:
             drain_timeout=0.1,
         )
 
-        audit_results: list[dict] = []
+        audit_events: list[tuple[str, dict]] = []
         with patch.object(
             service,
             "_write_event",
-            side_effect=lambda **kwargs: audit_results.append(dict(kwargs["result"])),
+            side_effect=lambda **kwargs: audit_events.append(
+                (
+                    kwargs.get("event_subtype", "kill_switch"),
+                    dict(kwargs["result"]),
+                )
+            ),
         ):
             result = service.kill_switch(actor="ops")
 
@@ -1295,8 +1300,13 @@ class TestSubmissionDrainGate:
         assert result["flattened_positions"] == 1
         assert ("cancel_order", "late-order") in eng.calls
         assert eng.drain_calls == 3
-        assert len(audit_results) == 1
-        assert audit_results[0]["drain_timeout"] is True
+        assert [subtype for subtype, _ in audit_events] == [
+            "kill_switch_pending",
+            "kill_switch",
+        ]
+        assert audit_events[0][1]["drain_timeout"] is True
+        assert audit_events[0][1]["flattened_positions"] == 0
+        assert audit_events[1][1] == result
 
     def test_retry_after_timeout_catches_late_order_before_success(self):
         """A converged retry runs a second pass that catches the late submission."""

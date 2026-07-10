@@ -97,12 +97,17 @@ class OpsSafetyService:
         # Drain in-flight order submissions before snapshotting state.
         halt_and_drain = getattr(self._execution_engine, "halt_and_drain", None)
         drained = not callable(halt_and_drain) or halt_and_drain(self._drain_timeout)
-        event_written = False
+        pending_event_written = False
         while not drained:
-            if not event_written:
+            if not pending_event_written:
                 result["drain_timeout"] = True
-                self._write_event(actor=actor, reason=reason, result=result)
-                event_written = True
+                self._write_event(
+                    actor=actor,
+                    reason=reason,
+                    result=result,
+                    event_subtype="kill_switch_pending",
+                )
+                pending_event_written = True
             self._log_drain_timeout()
             self._mitigate_visible_state(result, flatten_positions=False)
             drained = halt_and_drain(self._drain_timeout)
@@ -117,8 +122,7 @@ class OpsSafetyService:
             and not result["cancel_failures"]
             and not result["flatten_failures"]
         )
-        if not event_written:
-            self._write_event(actor=actor, reason=reason, result=result)
+        self._write_event(actor=actor, reason=reason, result=result)
         return result
 
     def _log_drain_timeout(self) -> None:
@@ -330,7 +334,14 @@ class OpsSafetyService:
             resolved.append(position)
         return resolved
 
-    def _write_event(self, *, actor: str, reason: str | None, result: dict) -> None:
+    def _write_event(
+        self,
+        *,
+        actor: str,
+        reason: str | None,
+        result: dict,
+        event_subtype: str = "kill_switch",
+    ) -> None:
         payload = dict(result)
         payload["actor"] = actor
         payload["reason"] = reason
@@ -338,7 +349,7 @@ class OpsSafetyService:
             write_system_event(
                 session,
                 event_type="ops",
-                event_subtype="kill_switch",
+                event_subtype=event_subtype,
                 payload=payload,
             )
             commit = getattr(session, "commit", None)
