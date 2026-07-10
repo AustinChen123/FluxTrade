@@ -156,7 +156,7 @@ class OpsSafetyService:
             return orders, []
 
         try:
-            positions, local_fetch_error = self._positions()
+            positions, position_fetch_error = self._positions()
         except Exception as exc:
             self._logger.exception("Kill switch failed to enumerate live positions")
             result["flatten_failures"].append(
@@ -167,16 +167,14 @@ class OpsSafetyService:
                 }
             )
             positions = []
-            local_fetch_error = None
+            position_fetch_error = None
         else:
-            if local_fetch_error is not None:
-                # Local state was unavailable but adapter positions were retrieved;
-                # surface the local failure so already_flat stays False.
+            if position_fetch_error is not None:
                 result["flatten_failures"].append(
                     {
                         "strategy_id": "unknown",
                         "product_id": "unknown",
-                        "reason": f"local_positions_unavailable: {local_fetch_error}",
+                        "reason": position_fetch_error,
                     }
                 )
         for position in positions:
@@ -238,8 +236,8 @@ class OpsSafetyService:
             self._execution_engine.order_manager.repo.list_orders_by_statuses(statuses)
         )
 
-    def _positions(self) -> tuple[list[Any], Exception | None]:
-        """Return (positions, local_error_or_None).
+    def _positions(self) -> tuple[list[Any], str | None]:
+        """Return positions and any degraded-source reason.
 
         Fetches local positions for owner attribution first, then queries the
         adapter for authoritative exchange positions.  The adapter path runs
@@ -262,26 +260,42 @@ class OpsSafetyService:
             local_error = exc
             local_positions = []
 
+        adapter_errors: list[Exception] = []
         adapter = getattr(self._execution_engine, "adapter", None)
         if adapter is not None:
-            get_all_positions = getattr(adapter, "get_all_positions", None)
-            if callable(get_all_positions):
+            for method_name in ("get_all_positions", "list_positions"):
+                method = getattr(adapter, method_name, None)
+                if not callable(method):
+                    continue
+                try:
+                    exchange_positions = list(method())
+                except Exception as exc:
+                    adapter_errors.append(exc)
+                    continue
+                degraded_reason = (
+                    f"local_positions_unavailable: {local_error}"
+                    if local_error is not None
+                    else None
+                )
                 return (
                     self._assign_local_position_owners(
-                        list(get_all_positions()),
+                        exchange_positions,
                         local_positions,
                     ),
-                    local_error,
+                    degraded_reason,
                 )
-            list_positions = getattr(adapter, "list_positions", None)
-            if callable(list_positions):
+
+        if adapter_errors:
+            exchange_reason = "; ".join(str(error) for error in adapter_errors)
+            if local_error is None:
                 return (
-                    self._assign_local_position_owners(
-                        list(list_positions()),
-                        local_positions,
-                    ),
-                    local_error,
+                    local_positions,
+                    f"exchange_positions_unavailable: {exchange_reason}",
                 )
+            raise RuntimeError(
+                f"local_positions_unavailable: {local_error}; "
+                f"exchange_positions_unavailable: {exchange_reason}"
+            )
 
         if local_error is not None:
             # No adapter enumeration method and local fetch failed: we cannot
