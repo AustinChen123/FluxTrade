@@ -1584,6 +1584,9 @@ class TestRuntimeReconciliationThread:
     def test_start_runtime_reconciliation_runs_job_in_daemon_thread(self, engine):
         """Runtime reconciliation should run in a daemon background loop."""
         engine.runtime_reconciliation_job = MagicMock()
+        engine._runtime_reconcile_stop = MagicMock()
+        engine._runtime_reconcile_stop.is_set.return_value = False
+        engine._runtime_reconcile_stop.wait.return_value = True
         created_threads = []
 
         class ImmediateThread:
@@ -1595,17 +1598,15 @@ class TestRuntimeReconciliationThread:
             def start(self):
                 self.target()
 
-        def stop_after_sleep(_seconds):
-            engine.running = False
-
         with patch("src.core.engine.threading.Thread", ImmediateThread), patch(
             "src.core.engine.time.sleep",
-            side_effect=stop_after_sleep,
+            side_effect=AssertionError("runtime reconciliation sleep must be interruptible"),
         ):
             engine._start_runtime_reconciliation()
 
         assert created_threads[0].daemon is True
         engine.runtime_reconciliation_job.run_once.assert_called_once()
+        engine._runtime_reconcile_stop.wait.assert_called_once()
 
 
 # =============================================================================
@@ -1614,6 +1615,17 @@ class TestRuntimeReconciliationThread:
 
 
 class TestShutdown:
+
+    def test_stops_and_joins_runtime_reconciliation_before_redis_close(self, engine):
+        engine._runtime_reconcile_stop = MagicMock()
+        engine.runtime_reconcile_thread = MagicMock()
+        engine.runtime_reconcile_thread.is_alive.return_value = True
+
+        engine.shutdown(timeout=0.1)
+
+        engine._runtime_reconcile_stop.set.assert_called_once()
+        engine.runtime_reconcile_thread.join.assert_called_once_with(timeout=0.1)
+        engine.redis_client.close.assert_called_once()
 
     def test_sets_running_false(self, engine):
         """Shutdown should set running to False."""

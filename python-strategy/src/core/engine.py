@@ -159,6 +159,7 @@ class StrategyEngine:
         self.heartbeat_thread = None
         self.command_thread = None
         self.runtime_reconcile_thread = None
+        self._runtime_reconcile_stop = threading.Event()
         self.executor = ThreadPoolExecutor(max_workers=5)
 
     def startup(self):
@@ -618,15 +619,17 @@ class StrategyEngine:
     def _start_runtime_reconciliation(self):
         """Start periodic runtime reconciliation in a daemon thread."""
         interval = float(os.getenv("RUNTIME_RECONCILE_INTERVAL_SECONDS", "3600"))
+        self._runtime_reconcile_stop.clear()
 
         def reconcile_loop():
             logger.info("Runtime reconciliation service started.")
-            while self.running:
+            while self.running and not self._runtime_reconcile_stop.is_set():
                 try:
                     self.runtime_reconciliation_job.run_once()
                 except Exception as e:
                     logger.error("Runtime reconciliation loop failed: %s", e)
-                time.sleep(interval)
+                if self._runtime_reconcile_stop.wait(interval):
+                    break
 
         self.runtime_reconcile_thread = threading.Thread(
             target=reconcile_loop,
@@ -740,6 +743,7 @@ class StrategyEngine:
         """Graceful shutdown: stop threads, drain executor, close Redis."""
         logger.info("StrategyEngine shutting down...")
         self.running = False
+        self._runtime_reconcile_stop.set()
 
         self.executor.shutdown(wait=True, cancel_futures=False)
 
@@ -747,6 +751,8 @@ class StrategyEngine:
             self.heartbeat_thread.join(timeout=timeout)
         if self.command_thread and self.command_thread.is_alive():
             self.command_thread.join(timeout=timeout)
+        if self.runtime_reconcile_thread and self.runtime_reconcile_thread.is_alive():
+            self.runtime_reconcile_thread.join(timeout=timeout)
 
         self._strategy_state_manager.shutdown()
 
