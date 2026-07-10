@@ -294,14 +294,13 @@ class OpsSafetyService:
 
         if adapter_errors:
             exchange_reason = "; ".join(str(error) for error in adapter_errors)
-            if local_error is None:
-                return (
-                    local_positions,
-                    f"exchange_positions_unavailable: {exchange_reason}",
-                )
-            raise RuntimeError(
+            local_reason = (
                 f"local_positions_unavailable: {local_error}; "
-                f"exchange_positions_unavailable: {exchange_reason}"
+                if local_error is not None
+                else ""
+            )
+            raise RuntimeError(
+                f"{local_reason}exchange_positions_unavailable: {exchange_reason}"
             )
 
         if local_error is not None:

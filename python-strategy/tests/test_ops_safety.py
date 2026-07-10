@@ -265,8 +265,8 @@ class TestKillSwitchIdempotency:
         assert result["flatten_failures"]
         assert "exchange unavailable" in result["flatten_failures"][0]["reason"]
 
-    def test_exchange_enumeration_failure_flattens_known_local_positions(self):
-        """Known local exposure remains actionable when exchange listing fails."""
+    def test_exchange_enumeration_failure_does_not_flatten_local_positions(self):
+        """Local exposure is not authoritative enough to place a flatten order."""
         local_position = _make_position(quantity=Decimal("0.75"))
         service, engine, _ = _make_service(positions=[local_position])
         engine.adapter = FakeExchangePositionAdapter(
@@ -276,12 +276,8 @@ class TestKillSwitchIdempotency:
         result = service.kill_switch(actor="ops", reason="degraded_exchange")
 
         assert result["already_flat"] is False
-        assert result["flattened_positions"] == 1
-        assert (
-            "flatten_position",
-            STRATEGY_ID,
-            PRODUCT_ID,
-        ) in engine.calls
+        assert result["flattened_positions"] == 0
+        assert not any(call[0] == "flatten_position" for call in engine.calls)
         assert any(
             "exchange_positions_unavailable" in failure["reason"]
             for failure in result["flatten_failures"]
