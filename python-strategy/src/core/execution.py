@@ -327,6 +327,15 @@ class ExecutionEngine:
             self.logger.error("Cannot flatten non-positive quantity: %s", quantity)
             return None
 
+        active_flatten = self._active_flatten_order(product_id)
+        if active_flatten is not None:
+            self.logger.warning(
+                "Reusing active kill-switch flatten order %s for %s",
+                active_flatten.id,
+                product_id,
+            )
+            return str(active_flatten.id)
+
         order_strategy_id = self._flatten_order_strategy_id(strategy_id)
         signal = Signal(
             strategy_id=order_strategy_id,
@@ -383,7 +392,7 @@ class ExecutionEngine:
                     status="failed",
                     reason=str(adoption["action"]),
                 ).inc()
-                return None
+                return order_id
             self.order_manager.fail_order(order, str(e))
             self._record_order_rejection(
                 order=order,
@@ -392,6 +401,20 @@ class ExecutionEngine:
                 phase="kill_switch_flatten",
             )
             return None
+
+    def _active_flatten_order(self, product_id: str):
+        active_statuses = {
+            OrderStatus.SUBMITTED_UNCONFIRMED.value,
+            OrderStatus.SUBMITTED.value,
+            OrderStatus.PARTIALLY_FILLED.value,
+        }
+        for order in self.order_manager.repo.list_orders_by_statuses(active_statuses):
+            if order.product_id != product_id:
+                continue
+            payload = order.intent_payload
+            if isinstance(payload, dict) and payload.get("source") == "kill_switch":
+                return order
+        return None
 
     def _flatten_order_strategy_id(self, strategy_id: str) -> str:
         if strategy_id != "LIVE":

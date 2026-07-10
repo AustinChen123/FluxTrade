@@ -704,16 +704,67 @@ class TestFlattenPosition:
     def test_ambiguous_submit_leaves_flatten_order_recoverable(
         self, eng, mock_order_repo
     ):
-        """Timeout-like flatten errors must not mark the local order failed."""
+        """Timeout-like flatten errors remain recoverable and idempotent."""
 
         class TimeoutAdapter:
+            def __init__(self):
+                self.place_calls = 0
+
             def place_order(self, order):
+                self.place_calls += 1
                 raise NetworkError("timeout after submit")
 
             def get_order_by_client_id(self, client_order_id, product_id, *, order_type=None):
                 return None
 
-        eng.adapter = TimeoutAdapter()
+        adapter = TimeoutAdapter()
+        eng.adapter = adapter
+
+        first_result = eng.flatten_position(
+            STRATEGY_ID,
+            PRODUCT_ID,
+            "LONG",
+            Decimal("1.0"),
+            reference_price=Decimal("50000"),
+        )
+        second_result = eng.flatten_position(
+            STRATEGY_ID,
+            PRODUCT_ID,
+            "LONG",
+            Decimal("1.0"),
+            reference_price=Decimal("50000"),
+        )
+
+        assert first_result is not None
+        assert second_result == first_result
+        assert adapter.place_calls == 1
+        assert len(mock_order_repo.orders) == 1
+        order = next(iter(mock_order_repo.orders.values()))
+        assert order.client_order_id is not None
+        assert order.status == OrderStatus.SUBMITTED_UNCONFIRMED.value
+
+    @pytest.mark.parametrize(
+        "status, expected_reused",
+        [
+            (OrderStatus.SUBMITTED_UNCONFIRMED.value, True),
+            (OrderStatus.SUBMITTED.value, True),
+            (OrderStatus.PARTIALLY_FILLED.value, True),
+            (OrderStatus.CANCELLED.value, False),
+            (OrderStatus.FAILED.value, False),
+            (OrderStatus.FILLED.value, False),
+        ],
+    )
+    def test_flatten_reuses_only_active_ops_orders(
+        self,
+        eng,
+        mock_exchange_adapter,
+        mock_order_repo,
+        status,
+        expected_reused,
+    ):
+        existing = _make_order("existing-flatten", status, product_id=PRODUCT_ID)
+        existing.intent_payload = {"reduce_only": True, "source": "kill_switch"}
+        mock_order_repo.orders[existing.id] = existing
 
         result = eng.flatten_position(
             STRATEGY_ID,
@@ -723,10 +774,9 @@ class TestFlattenPosition:
             reference_price=Decimal("50000"),
         )
 
-        assert result is None
-        order = next(iter(mock_order_repo.orders.values()))
-        assert order.client_order_id is not None
-        assert order.status == OrderStatus.SUBMITTED_UNCONFIRMED.value
+        assert (result == existing.id) is expected_reused
+        placed = mock_exchange_adapter.open_orders + mock_exchange_adapter.filled_orders
+        assert bool(placed) is (not expected_reused)
 
     def test_live_position_uses_reserved_ops_strategy_with_real_fk(
         self,
