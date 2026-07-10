@@ -361,6 +361,19 @@ class ExecutionEngine:
         if reference_price is not None:
             order.min_notional_reference_price = reference_price
         order_id = str(order.id)
+        try:
+            self._validate_order_group([order])
+        except ExchangeError as e:
+            self.logger.error("Flatten order validation failed: %s", e)
+            self.order_manager.fail_order(order, str(e))
+            self._record_order_rejection(
+                order=order,
+                order_type="market",
+                error=e,
+                phase="kill_switch_validation",
+            )
+            return None
+
         submit_attempted = False
         try:
             self.order_manager.mark_submitted_unconfirmed(order)

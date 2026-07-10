@@ -22,7 +22,7 @@ from sqlalchemy import create_engine, event, text
 from sqlalchemy.orm import sessionmaker
 
 from src.core.execution import ExecutionEngine
-from src.core.interfaces.exchange import NetworkError
+from src.core.interfaces.exchange import ExchangeError, NetworkError
 from src.core.models import Candlestick, OrderStatus, Position, PositionSide, Signal, SignalType
 from src.core.ops_safety import OpsSafetyService
 from src.core.orm_models import Exchange, Order, Product, Strategy
@@ -674,6 +674,52 @@ class TestFlattenPosition:
         )[-1]
         order_obj = placed_order if isinstance(placed_order, Order) else placed_order.get("order")
         assert order_obj.min_notional_reference_price == Decimal("50000")
+
+    def test_flatten_persists_and_submits_validated_quantity(
+        self, eng, mock_order_repo
+    ):
+        adapter = MagicMock()
+        adapter.place_order.return_value = "exchange-flatten-id"
+
+        def quantize(order):
+            order.quantity = Decimal("0.9")
+
+        adapter.validate_order.side_effect = quantize
+        eng.adapter = adapter
+
+        result = eng.flatten_position(
+            STRATEGY_ID,
+            PRODUCT_ID,
+            "LONG",
+            Decimal("1.0"),
+            reference_price=Decimal("50000"),
+        )
+
+        assert result is not None
+        submitted_order = adapter.place_order.call_args.args[0]
+        persisted_order = mock_order_repo.get_order(result)
+        assert submitted_order.quantity == Decimal("0.9")
+        assert persisted_order.quantity == submitted_order.quantity
+
+    def test_flatten_validation_rejection_never_submits_and_fails_order(
+        self, eng, mock_order_repo
+    ):
+        adapter = MagicMock()
+        adapter.validate_order.side_effect = ExchangeError("min_notional_not_met")
+        eng.adapter = adapter
+
+        result = eng.flatten_position(
+            STRATEGY_ID,
+            PRODUCT_ID,
+            "LONG",
+            Decimal("0.0001"),
+            reference_price=Decimal("50000"),
+        )
+
+        assert result is None
+        adapter.place_order.assert_not_called()
+        order = next(iter(mock_order_repo.orders.values()))
+        assert order.status in {OrderStatus.FAILED.value, "failed"}
 
     def test_adapter_error_returns_none(self, eng, mock_exchange_adapter):
         """Adapter exception → returns None, does not propagate."""
