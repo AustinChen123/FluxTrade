@@ -1087,6 +1087,38 @@ class BlockingAdapter:
         return None
 
 
+class SequencedDrainEngine(RecordingExecutionEngine):
+    def __init__(
+        self,
+        drain_results: list[bool],
+        *,
+        orders: list[Order] | None = None,
+        late_order: Order | None = None,
+    ) -> None:
+        orders_by_status: dict[str, list[Order]] = {}
+        for order in orders or []:
+            orders_by_status.setdefault(order.status, []).append(order)
+        super().__init__(orders_by_status=orders_by_status)
+        self._drain_results = iter(drain_results)
+        self._late_order = late_order
+        self.drain_calls = 0
+
+    def halt_and_drain(self, timeout: float) -> bool:
+        self.drain_calls += 1
+        drained = next(self._drain_results)
+        if self.drain_calls == 2 and self._late_order is not None:
+            self.order_manager.repo._orders.append(self._late_order)
+        return drained
+
+    def cancel_order(self, order_id: str) -> bool:
+        self.calls.append(("cancel_order", order_id))
+        for order in self.order_manager.repo._orders:
+            if str(order.id) == order_id:
+                order.status = OrderStatus.CANCELLED.value
+                return True
+        return False
+
+
 def _make_drain_engine(
     adapter=None,
     mock_db_session=None,
@@ -1192,43 +1224,43 @@ class TestSubmissionDrainGate:
         assert len(cancelled) == 1
         assert eng.order_manager.repo.get_order(cancelled[0]).status == OrderStatus.CANCELLED.value
 
-    def test_drain_timeout_aborts_before_snapshot_cancel_and_flatten(self):
-        """An unstable submission set must stop kill-switch state mutation."""
-        blocking_adapter = BlockingAdapter()
-        eng = _make_drain_engine(adapter=blocking_adapter)
-
-        signal = _make_signal()
-
-        submit_thread = threading.Thread(target=eng.execute_signal, args=(signal,), daemon=True)
-        submit_thread.start()
-
-        # Wait until place_order is blocking.
-        blocking_adapter._placed.wait(timeout=2.0)
-
-        fake_account = FakeAccountService(positions=[])
+    def test_repeated_drain_timeout_mitigates_visible_state_but_stays_incomplete(self):
+        """A persistent timeout still mitigates known exposure without claiming success."""
+        order = _make_order("known-order", OrderStatus.SUBMITTED.value)
+        position = _make_position()
+        eng = SequencedDrainEngine([False, False], orders=[order])
         service = OpsSafetyService(
-            eng, fake_account, _make_null_db_session_factory(), drain_timeout=0.1
+            eng,
+            FakeAccountService(positions=[position]),
+            _make_null_db_session_factory(),
+            drain_timeout=0.1,
         )
-        with (
-            patch.object(service, "_open_orders", wraps=service._open_orders) as open_orders,
-            patch.object(service, "_positions", wraps=service._positions) as positions,
-            patch.object(eng, "cancel_order", wraps=eng.cancel_order) as cancel_order,
-            patch.object(eng, "flatten_position", wraps=eng.flatten_position) as flatten,
-            patch.object(service, "_write_event", wraps=service._write_event) as write_event,
-        ):
-            result = service.kill_switch(actor="ops")
+
+        result = service.kill_switch(actor="ops")
 
         assert result["drain_timeout"] is True
         assert result["already_flat"] is False
-        open_orders.assert_not_called()
-        positions.assert_not_called()
-        cancel_order.assert_not_called()
-        flatten.assert_not_called()
-        write_event.assert_called_once()
+        assert result["cancelled_orders"] == 1
+        assert result["flattened_positions"] == 1
+        assert eng.drain_calls == 2
 
-        # Cleanup: release so the thread can exit.
-        blocking_adapter.release()
-        submit_thread.join(timeout=2.0)
+    def test_retry_after_timeout_catches_late_order_before_success(self):
+        """A converged retry runs a second pass that catches the late submission."""
+        late_order = _make_order("late-order", OrderStatus.SUBMITTED.value)
+        eng = SequencedDrainEngine([False, True], late_order=late_order)
+        service = OpsSafetyService(
+            eng,
+            FakeAccountService(positions=[]),
+            _make_null_db_session_factory(),
+            drain_timeout=0.1,
+        )
+
+        result = service.kill_switch(actor="ops")
+
+        assert result["drain_timeout"] is False
+        assert result["cancelled_orders"] == 1
+        assert ("cancel_order", "late-order") in eng.calls
+        assert eng.drain_calls == 2
 
     def test_gated_conditional_placement_after_halt_returns_halted_failure(self):
         """_place_pending_conditional_orders_for_entry must report kill_switch_halted after halt."""

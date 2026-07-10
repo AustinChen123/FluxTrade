@@ -90,19 +90,43 @@ class OpsSafetyService:
 
         # Drain in-flight order submissions before snapshotting state.
         halt_and_drain = getattr(self._execution_engine, "halt_and_drain", None)
-        if callable(halt_and_drain):
-            drained = halt_and_drain(self._drain_timeout)
-            if not drained:
-                in_flight = getattr(self._execution_engine, "_submissions_in_flight", None)
-                self._logger.warning(
-                    "Kill switch drain timed out after %.1fs; %s submissions still in flight",
-                    self._drain_timeout,
-                    in_flight,
-                )
-                result["drain_timeout"] = True
-                self._write_event(actor=actor, reason=reason, result=result)
-                return result
+        drained = not callable(halt_and_drain) or halt_and_drain(self._drain_timeout)
+        result["drain_timeout"] = not drained
+        if not drained:
+            self._log_drain_timeout()
 
+        attempts = 1 if drained else 2
+        orders: list[Any] = []
+        positions: list[Any] = []
+        for _ in range(attempts):
+            orders, positions = self._mitigate_visible_state(result)
+            if drained:
+                break
+            drained = halt_and_drain(self._drain_timeout)
+            result["drain_timeout"] = not drained
+            if not drained:
+                self._log_drain_timeout()
+                break
+
+        result["already_flat"] = (
+            not result["drain_timeout"]
+            and not orders
+            and not positions
+            and not result["cancel_failures"]
+            and not result["flatten_failures"]
+        )
+        self._write_event(actor=actor, reason=reason, result=result)
+        return result
+
+    def _log_drain_timeout(self) -> None:
+        in_flight = getattr(self._execution_engine, "_submissions_in_flight", None)
+        self._logger.warning(
+            "Kill switch drain timed out after %.1fs; %s submissions still in flight",
+            self._drain_timeout,
+            in_flight,
+        )
+
+    def _mitigate_visible_state(self, result: dict) -> tuple[list[Any], list[Any]]:
         orders = self._open_orders()
         for order in orders:
             order_id = str(order.id)
@@ -193,14 +217,7 @@ class OpsSafetyService:
                     }
                 )
 
-        result["already_flat"] = (
-            not orders
-            and not positions
-            and not result["cancel_failures"]
-            and not result["flatten_failures"]
-        )
-        self._write_event(actor=actor, reason=reason, result=result)
-        return result
+        return orders, positions
 
     def _open_orders(self) -> list[Any]:
         statuses = {
