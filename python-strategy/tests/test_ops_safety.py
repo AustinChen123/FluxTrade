@@ -1264,11 +1264,16 @@ class TestSubmissionDrainGate:
         assert len(cancelled) == 1
         assert eng.order_manager.repo.get_order(cancelled[0]).status == OrderStatus.CANCELLED.value
 
-    def test_repeated_drain_timeout_mitigates_visible_state_but_stays_incomplete(self):
-        """A persistent timeout still mitigates known exposure without claiming success."""
+    def test_repeated_drain_timeouts_keep_cleaning_until_submission_converges(self):
+        """Late submissions are cancelled before the invocation may return."""
         order = _make_order("known-order", OrderStatus.SUBMITTED.value)
+        late_order = _make_order("late-order", OrderStatus.SUBMITTED.value)
         position = _make_position()
-        eng = SequencedDrainEngine([False, False], orders=[order])
+        eng = SequencedDrainEngine(
+            [False, False, True],
+            orders=[order],
+            late_order=late_order,
+        )
         service = OpsSafetyService(
             eng,
             FakeAccountService(positions=[position]),
@@ -1276,13 +1281,22 @@ class TestSubmissionDrainGate:
             drain_timeout=0.1,
         )
 
-        result = service.kill_switch(actor="ops")
+        audit_results: list[dict] = []
+        with patch.object(
+            service,
+            "_write_event",
+            side_effect=lambda **kwargs: audit_results.append(dict(kwargs["result"])),
+        ):
+            result = service.kill_switch(actor="ops")
 
-        assert result["drain_timeout"] is True
+        assert result["drain_timeout"] is False
         assert result["already_flat"] is False
-        assert result["cancelled_orders"] == 1
+        assert result["cancelled_orders"] == 2
         assert result["flattened_positions"] == 1
-        assert eng.drain_calls == 2
+        assert ("cancel_order", "late-order") in eng.calls
+        assert eng.drain_calls == 3
+        assert len(audit_results) == 1
+        assert audit_results[0]["drain_timeout"] is True
 
     def test_retry_after_timeout_catches_late_order_before_success(self):
         """A converged retry runs a second pass that catches the late submission."""
@@ -1304,8 +1318,8 @@ class TestSubmissionDrainGate:
 
     @pytest.mark.parametrize(
         "drain_results",
-        [[True], [False, True], [False, False]],
-        ids=["drained", "retry-converged", "retry-timeout"],
+        [[True], [False, True], [False, False, True]],
+        ids=["drained", "retry-converged", "retry-twice"],
     )
     def test_each_position_is_flattened_once_per_invocation(self, drain_results):
         eng = SequencedDrainEngine(drain_results)
