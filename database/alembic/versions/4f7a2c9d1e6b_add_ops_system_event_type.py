@@ -25,12 +25,24 @@ _WITHOUT_OPS = (
     "event_type IN "
     "('reconcile','gene_promote','gene_retire','system_error')"
 )
+_WRAPPER_KEY = "__migration_4f7a2c9d1e6b_ops_event"
 
 
 def upgrade() -> None:
     op.execute(
         "ALTER TABLE system_events "
         "DROP CONSTRAINT IF EXISTS chk_system_events_type"
+    )
+    op.execute(
+        "UPDATE system_events "
+        "SET event_type = 'ops', "
+        f"payload = payload -> '{_WRAPPER_KEY}' -> 'payload' "
+        "WHERE event_type = 'system_error' "
+        "AND jsonb_typeof(payload) = 'object' "
+        f"AND payload ? '{_WRAPPER_KEY}' "
+        f"AND (payload -> '{_WRAPPER_KEY}') ? 'payload' "
+        f"AND payload -> '{_WRAPPER_KEY}' ->> 'migration' = '{revision}' "
+        f"AND payload -> '{_WRAPPER_KEY}' ->> 'event_type' = 'ops'"
     )
     op.execute(
         "ALTER TABLE system_events "
@@ -42,6 +54,16 @@ def downgrade() -> None:
     op.execute(
         "ALTER TABLE system_events "
         "DROP CONSTRAINT IF EXISTS chk_system_events_type"
+    )
+    op.execute(
+        "UPDATE system_events "
+        "SET event_type = 'system_error', "
+        "payload = jsonb_build_object("
+        f"'{_WRAPPER_KEY}', jsonb_build_object("
+        f"'migration', '{revision}', "
+        "'event_type', 'ops', "
+        "'payload', payload)) "
+        "WHERE event_type = 'ops'"
     )
     op.execute(
         "ALTER TABLE system_events "
