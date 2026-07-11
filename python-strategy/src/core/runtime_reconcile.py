@@ -77,6 +77,12 @@ class RuntimeReconciliationJob:
                         "exchange_quantity": Decimal,
                     }
                 ],
+                "unverified_positions": [
+                    {
+                        "product_id": str,
+                        "exchange_quantity": Decimal,
+                    }
+                ],
                 "balance_drift": {"local": Decimal, "exchange": Decimal} | None,
                 "errors": [{"scope": str, "reason": str}],
             }
@@ -99,12 +105,14 @@ class RuntimeReconciliationJob:
         result = {
             "checked_positions": 0,
             "position_drifts": [],
+            "unverified_positions": [],
             "balance_drift": None,
             "errors": [],
         }
 
         local_positions = self._local_positions(result)
         if local_positions is None:
+            self._record_unverified_exchange_positions(result)
             self._check_balance(result)
             self._emit_events(result)
             return result
@@ -149,6 +157,30 @@ class RuntimeReconciliationJob:
         self._check_balance(result)
         self._emit_events(result)
         return result
+
+    def _record_unverified_exchange_positions(self, result: dict) -> None:
+        exchange_positions = self._exchange_positions_by_product(result)
+        for product_id in self._product_ids:
+            if product_id in exchange_positions:
+                continue
+            try:
+                position = self._adapter.get_position(product_id)
+            except Exception as exc:
+                result["errors"].append(
+                    {"scope": "positions", "reason": str(exc)}
+                )
+                continue
+            exchange_positions[product_id] = [position] if position is not None else []
+
+        for product_id in sorted(exchange_positions):
+            exchange_quantity = self._signed_total(exchange_positions[product_id])
+            if exchange_quantity != 0:
+                result["unverified_positions"].append(
+                    {
+                        "product_id": product_id,
+                        "exchange_quantity": exchange_quantity,
+                    }
+                )
 
     def _local_positions(self, result: dict) -> list[Any] | None:
         try:

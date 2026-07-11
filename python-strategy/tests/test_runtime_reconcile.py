@@ -468,9 +468,48 @@ class TestRunOnceAdapterError:
 
         assert result["checked_positions"] == 0
         assert result["position_drifts"] == []
+        assert result["unverified_positions"] == [
+            {
+                "product_id": PRODUCT_ID,
+                "exchange_quantity": Decimal("2.0"),
+            }
+        ]
         assert result["errors"] == [{"scope": "positions", "reason": "Redis down"}]
         write_event.assert_called_once()
         assert write_event.call_args.kwargs["event_subtype"] == "runtime_reconcile_error"
+
+    def test_local_position_error_with_exchange_flat_reports_no_fake_drift(self):
+        job, account, _ = _make_job(exchange_positions={PRODUCT_ID: None})
+        account.get_all_positions = MagicMock(side_effect=RuntimeError("Redis down"))
+
+        result = job.run_once()
+
+        assert result["position_drifts"] == []
+        assert result["unverified_positions"] == []
+
+    def test_local_position_error_queries_configured_product_universe(self):
+        exchange_position = _make_position(quantity=Decimal("3.0"))
+        account = FakeAccountService()
+        account.get_all_positions = MagicMock(side_effect=RuntimeError("Redis down"))
+        adapter = ProductScopedAdapter({PRODUCT_ID: exchange_position})
+        job = RuntimeReconciliationJob(
+            account_service=account,
+            adapter=adapter,
+            db_session_factory=_make_null_db_factory(),
+            quantity_drift_threshold=THRESHOLD_QTY,
+            balance_drift_threshold=THRESHOLD_BAL,
+            product_ids=[PRODUCT_ID],
+        )
+
+        result = job.run_once()
+
+        assert adapter.get_position_calls == [PRODUCT_ID]
+        assert result["unverified_positions"] == [
+            {
+                "product_id": PRODUCT_ID,
+                "exchange_quantity": Decimal("3.0"),
+            }
+        ]
 
     def test_adapter_error_scope_identifies_positions(self):
         local_pos = _make_position()
