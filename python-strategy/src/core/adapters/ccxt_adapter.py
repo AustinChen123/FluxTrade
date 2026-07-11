@@ -160,6 +160,9 @@ class CcxtExchangeAdapter(IExchangeAdapter):
         order_type, params = self._ccxt_order_type_and_params(order)
         if order_type == "limit":
             params["timeInForce"] = "GTC"
+        intent_payload = getattr(order, "intent_payload", None)
+        if isinstance(intent_payload, dict) and intent_payload.get("reduce_only") is True:
+            params["reduceOnly"] = True
         client_order_id = getattr(order, "client_order_id", None)
         if client_order_id:
             exchange_client_order_id = to_exchange_format(client_order_id, self.exchange_id)
@@ -563,10 +566,21 @@ class CcxtExchangeAdapter(IExchangeAdapter):
                 spec=spec,
             )
             notional_price = quantized.price or quantized.trigger_price
+            reference_price = getattr(order, "min_notional_reference_price", None)
+            if (
+                spec.min_notional is not None
+                and notional_price is None
+                and reference_price is None
+                and order.type.lower() == "market"
+                and isinstance(getattr(order, "intent_payload", None), dict)
+                and order.intent_payload.get("reduce_only") is True
+            ):
+                reference_price = self._market_order_reference_price(order)
+                order.min_notional_reference_price = reference_price
             validate_min_notional(
                 quantity=quantized.quantity,
                 price=notional_price,
-                reference_price=getattr(order, "min_notional_reference_price", None),
+                reference_price=reference_price,
                 spec=spec,
             )
         except ValueError as e:
@@ -584,6 +598,25 @@ class CcxtExchangeAdapter(IExchangeAdapter):
             order.quantity = quantized.quantity
             order.price = quantized.price
             order.trigger_price = quantized.trigger_price
+
+    def _market_order_reference_price(self, order: Order) -> Decimal:
+        ccxt_symbol = to_ccxt_symbol(order.product_id)
+        try:
+            ticker = self.client.fetch_ticker(ccxt_symbol)
+        except ccxt.BaseError as exc:
+            raise ExchangeError(
+                f"market_reference_price_unavailable: {exc}"
+            ) from exc
+
+        side = order.side.lower()
+        if side not in {"buy", "sell"}:
+            raise ExchangeError(f"market_reference_side_unsupported: side={order.side}")
+        value = ticker.get("ask" if side == "buy" else "bid") or ticker.get("last")
+        if value is None or Decimal(str(value)) <= 0:
+            raise ExchangeError(
+                f"market_reference_price_unavailable: symbol={ccxt_symbol} side={side}"
+            )
+        return Decimal(str(value))
 
     def cancel_order(
         self,
@@ -770,3 +803,46 @@ class CcxtExchangeAdapter(IExchangeAdapter):
             )
 
         return None
+
+    def get_all_positions(self) -> list[Position]:
+        try:
+            positions = self.client.fetch_positions()
+        except ccxt.BaseError as e:
+            raise ExchangeError(f"Failed to fetch positions: {e}") from e
+
+        result: list[Position] = []
+        for raw_position in positions:
+            position = self._position_from_ccxt(raw_position)
+            if position is not None:
+                result.append(position)
+        return result
+
+    def _position_from_ccxt(self, raw_position: dict) -> Optional[Position]:
+        product_id = self._product_id_from_ccxt_symbol(raw_position.get("symbol"))
+        if product_id is None:
+            return None
+
+        contracts = Decimal(str(raw_position.get("contracts") or 0))
+        if contracts == 0:
+            return None
+
+        side_value = str(raw_position.get("side") or "").lower()
+        side = "SHORT" if side_value == "short" or contracts < 0 else "LONG"
+        return Position(
+            strategy_id="LIVE",
+            product_id=product_id,
+            side=side,
+            quantity=abs(contracts),
+            entry_price=Decimal(str(raw_position.get("entryPrice") or 0)),
+            unrealized_pnl=Decimal(str(raw_position.get("unrealizedPnl") or 0)),
+        )
+
+    def _product_id_from_ccxt_symbol(self, symbol: Optional[str]) -> Optional[str]:
+        if not symbol or "/" not in symbol:
+            return None
+        pair = symbol.split(":", 1)[0]
+        try:
+            base, quote = pair.split("/", 1)
+        except ValueError:
+            return None
+        return f"{self.exchange_id.upper()}:{base}{quote}-PERP"

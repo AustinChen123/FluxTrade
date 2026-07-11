@@ -79,6 +79,26 @@ class AccountService:
             unrealized_pnl=unrealized_pnl
         )
 
+    def get_all_positions(self) -> list[Position]:
+        if not getattr(self, "redis", None):
+            return []
+
+        positions: list[Position] = []
+        for key in self.redis.scan_iter("state:position:*"):
+            key_text = key.decode() if isinstance(key, bytes) else str(key)
+            prefix = "state:position:"
+            if not key_text.startswith(prefix):
+                continue
+            try:
+                strategy_id, exchange, symbol = key_text[len(prefix):].rsplit(":", 2)
+            except ValueError:
+                continue
+            product_id = f"{exchange}:{symbol}"
+            position = self.get_position(strategy_id, product_id)
+            if position is not None:
+                positions.append(position)
+        return positions
+
 class RiskManager:
     def __init__(
         self,

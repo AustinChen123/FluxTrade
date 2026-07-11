@@ -1,4 +1,5 @@
 import json
+import math
 import os
 import time
 import threading
@@ -8,6 +9,7 @@ import uuid
 from contextlib import nullcontext
 from concurrent.futures import ThreadPoolExecutor
 from datetime import UTC, datetime
+from decimal import Decimal
 from typing import Callable, ContextManager, List, Union, Optional, Dict, Type
 from sqlalchemy.orm import Session
 from src.core.models import Candlestick, Trade, Signal, SignalType, StrategyStatus
@@ -21,20 +23,49 @@ from src.core.interfaces import IExchangeAdapter, IOrderRepository
 from src.core.daily_nav_snapshot import DailyNavSnapshotService
 from src.core.strategy_loader import StrategyLoader
 from src.core.data_provider import check_data_availability
-from src.core.adapters import create_adapter
+from src.core.adapters import CcxtExchangeAdapter, SimulatedAdapter, create_adapter
 from src.core.journal import StrategyJournal
 from src.core.redis_factory import create_redis_client
 from src.core.metrics import SIGNALS_TOTAL, ACTIVE_STRATEGIES, BALANCE_USDT
 from src.core.command_router import CommandRouter
 from src.core.health_monitor import HealthMonitor
+from src.core.ops_safety import OpsSafetyService
+from src.core.runtime_reconcile import RuntimeReconciliationJob
 from src.core.signal_processor import SignalProcessor
 from src.core.strategy_registry import StrategyRegistry
 from src.core.strategy_state_manager import StrategyStateManager
 from src.core.audit_service import build_signal_audit, commit_signal_audit
 
 HOT_STRATEGIES_PATH = os.getenv('HOT_STRATEGIES_PATH', '/app/strategies_hot')
+SYSTEM_STATE_KEY = "system:state"
+SYSTEM_BOOT_STATE_KEY = "system:engine_boot_state"
+SYSTEM_STATE_LOCKDOWN = "LOCKDOWN"
+SYSTEM_STATE_OK = "OK"
 
 logger = logging.getLogger(__name__)
+
+
+def _is_runtime_reconciliation_enabled(
+    adapter: IExchangeAdapter,
+    adapter_config: Optional[Dict],
+) -> bool:
+    if isinstance(adapter, SimulatedAdapter):
+        return False
+    if isinstance(adapter, CcxtExchangeAdapter):
+        return True
+    return bool(adapter_config and adapter_config.get("mode") == "live")
+
+
+def _runtime_reconciliation_interval_from_env() -> float:
+    name = "RUNTIME_RECONCILE_INTERVAL_SECONDS"
+    raw_value = os.getenv(name, "3600")
+    try:
+        interval = float(raw_value)
+    except ValueError as exc:
+        raise ValueError(f"{name} must be a finite number greater than zero") from exc
+    if not math.isfinite(interval) or interval <= 0:
+        raise ValueError(f"{name} must be a finite number greater than zero")
+    return interval
 
 
 class _EngineLifecycleAdapter:
@@ -72,6 +103,9 @@ class StrategyEngine:
         self.strategy_instances: Dict[str, BaseStrategy] = {}
         self.loaded_classes: Dict[str, Type[BaseStrategy]] = {}
         self._strategy_lock = threading.Lock()
+        self._ops_command_lock = threading.Lock()
+        self._boot_id = uuid.uuid4().hex
+        self._boot_started = False
         self._registry = StrategyRegistry()
         self.redis_client = create_redis_client()
         self._strategy_state_manager = StrategyStateManager(
@@ -91,17 +125,25 @@ class StrategyEngine:
         )
 
         # Use pre-created adapter or build from config
+        effective_adapter_config = adapter_config or {"mode": "simulated"}
         if adapter is None:
-            if adapter_config is None:
-                adapter_config = {"mode": "simulated"}
             try:
-                adapter = create_adapter(adapter_config)
+                adapter = create_adapter(effective_adapter_config)
                 logger.info("StrategyEngine: Using %s", type(adapter).__name__)
             except Exception as e:
                 logger.critical("Failed to init adapter: %s. NOT falling back silently.", e)
                 raise
         else:
             logger.info("StrategyEngine: Using provided adapter %s", type(adapter).__name__)
+        self._runtime_reconciliation_enabled = _is_runtime_reconciliation_enabled(
+            adapter,
+            adapter_config,
+        )
+        self._runtime_reconcile_interval = (
+            _runtime_reconciliation_interval_from_env()
+            if self._runtime_reconciliation_enabled
+            else None
+        )
 
         self.execution_engine = ExecutionEngine(
             db_session,
@@ -125,29 +167,67 @@ class StrategyEngine:
             self._strategy_state_manager,
             lambda signal, candle: self.process_signal(signal, candle),
         )
+        self.ops_safety = OpsSafetyService(
+            self.execution_engine,
+            self.account_service,
+            self._db_session_factory,
+        )
+        self.runtime_reconciliation_job = RuntimeReconciliationJob(
+            account_service=self.account_service,
+            adapter=adapter,
+            db_session_factory=self._db_session_factory,
+            quantity_drift_threshold=Decimal(
+                os.getenv("RECONCILE_QTY_DRIFT_THRESHOLD", "0.00000001")
+            ),
+            balance_drift_threshold=Decimal(
+                os.getenv("RECONCILE_BALANCE_DRIFT_THRESHOLD", "0.01")
+            ),
+            product_ids=(
+                effective_adapter_config.get("instrument_product_ids")
+                or effective_adapter_config.get("product_ids")
+                or []
+            ),
+        )
         
         # System State & Heartbeat
         self._health_monitor.redis_client = self.redis_client
         self.running = True
+        self._kill_switch_halted = False
         self.heartbeat_thread = None
         self.command_thread = None
+        self.runtime_reconcile_thread = None
+        self._runtime_reconcile_stop = threading.Event()
         self.executor = ThreadPoolExecutor(max_workers=5)
 
     def startup(self):
         """
         Runs startup checks and starts background services.
         """
-        self._check_system_state()
+        # Start fail-closed so the command listener can accept a manual clear
+        # while startup waits on a persisted LOCKDOWN state.
+        self._halt_for_kill_switch()
+        self._start_command_listener()
+        with self._ops_command_lock:
+            persisted_lockdown = self._check_system_state()
         self._reconcile_balance()
         self._initialize_strategy_state_cache_on_startup()
         self._start_strategy_state_subscriber_on_startup()
         self._reconcile_recoverable_orders_on_startup()
+        if persisted_lockdown:
+            with self._ops_command_lock:
+                if self._kill_switch_halted:
+                    self.ops_safety.kill_switch(
+                        actor="startup_recovery",
+                        reason="persisted_lockdown",
+                    )
         self._start_heartbeat()
-        self._start_command_listener()
+        if self._runtime_reconciliation_enabled:
+            self._start_runtime_reconciliation()
         
         # Initial scan to discover strategies
         self.scan_strategies()
-        self._restore_active_strategies_on_startup()
+        if not self._kill_switch_halted:
+            self._restore_active_strategies_on_startup()
 
     def _initialize_strategy_state_cache_on_startup(self) -> None:
         """Load strategy lifecycle state into the manager cache."""
@@ -205,6 +285,55 @@ class StrategyEngine:
                 self.scan_strategies()
             elif cmd == "TEST_RUN":
                 self.test_run_strategy(params.get("id"), params.get("days", 1))
+            elif cmd == "KILL_SWITCH":
+                with self._ops_command_lock:
+                    self._halt_for_kill_switch()
+                    actor = params.get("actor", "operator")
+                    reason = params.get("reason")
+                    try:
+                        self.ops_safety.persist_kill_switch_state(
+                            SYSTEM_STATE_LOCKDOWN,
+                            actor=actor,
+                            reason=reason,
+                        )
+                    except Exception:
+                        logger.exception(
+                            "Failed to persist kill switch state to database"
+                        )
+                    try:
+                        self.redis_client.set(SYSTEM_STATE_KEY, SYSTEM_STATE_LOCKDOWN)
+                    except Exception:
+                        logger.exception(
+                            "Failed to persist kill switch state; local halt remains active"
+                        )
+                    self.ops_safety.kill_switch(
+                        actor=actor,
+                        reason=reason,
+                    )
+                    self._kill_switch_halted = True
+            elif cmd == "CLEAR_KILL_SWITCH":
+                with self._ops_command_lock:
+                    actor = params.get("actor", "operator")
+                    reason = params.get("reason")
+
+                    def persist_clear() -> None:
+                        self.ops_safety.persist_kill_switch_state(
+                            SYSTEM_STATE_OK,
+                            actor=actor,
+                            reason=reason,
+                        )
+                        self.redis_client.set(SYSTEM_STATE_KEY, SYSTEM_STATE_OK)
+
+                    result = self.ops_safety.clear_kill_switch(
+                        persist_clear=persist_clear,
+                    )
+                    if result["cleared"]:
+                        self._kill_switch_halted = False
+                    else:
+                        logger.warning(
+                            "Kill switch clear rejected: %s",
+                            result["reason"],
+                        )
             else:
                 result = self._command_router.handle(data)
                 if result.success:
@@ -534,23 +663,107 @@ class StrategyEngine:
         except Exception as e:
             logger.warning("⚠️ Balance Reconciliation Failed: %s. Using DB/Redis state.", e)
 
-    def _check_system_state(self):
+    def _check_system_state(self) -> bool:
         """
         Checks 'system:state'. If 'LOCKDOWN', enters a paused loop.
         """
         logger.info("🔍 Checking System State...")
-        while True:
-            try:
-                state = self.redis_client.get("system:state")
-                if state == "LOCKDOWN":
-                    logger.warning("⚠️ SYSTEM LOCKED (LOCKDOWN). Waiting for manual resume...")
-                    time.sleep(5)
-                else:
-                    logger.info("✅ System State: %s. Proceeding.", state or 'OK')
-                    break
-            except Exception as e:
-                logger.error("❌ Error checking system state: %s. Retrying...", e)
-                time.sleep(2)
+        self._boot_started = True
+        read_failed = False
+        try:
+            db_state = self.ops_safety.latest_kill_switch_state()
+            redis_state = self.redis_client.get(SYSTEM_STATE_KEY)
+            if isinstance(redis_state, bytes):
+                redis_state = redis_state.decode("utf-8")
+            db_boot = self.ops_safety.latest_engine_boot_state()
+            redis_boot = self._decode_boot_state(
+                self.redis_client.get(SYSTEM_BOOT_STATE_KEY)
+            )
+        except Exception as exc:
+            logger.error("System state unavailable; starting in LOCKDOWN: %s", exc)
+            read_failed = True
+            db_state = redis_state = None
+            db_boot = redis_boot = None
+
+        boot_marker_persisted = self._persist_engine_boot_state("UNCLEAN")
+
+        states_disagree = db_state != redis_state
+        state = db_state if db_state is not None else redis_state
+        kill_state_clear = (
+            db_state == SYSTEM_STATE_OK and redis_state == SYSTEM_STATE_OK
+        )
+        previous_boot_clean = (
+            db_boot is not None
+            and db_boot == redis_boot
+            and db_boot.get("state") == "CLEAN"
+        )
+        if (
+            read_failed
+            or not boot_marker_persisted
+            or states_disagree
+            or not kill_state_clear
+            or not previous_boot_clean
+        ):
+            self._halt_for_kill_switch()
+            logger.warning(
+                "SYSTEM LOCKED (db=%s redis=%s db_boot=%s redis_boot=%s); "
+                "startup recovery required",
+                db_state,
+                redis_state,
+                db_boot,
+                redis_boot,
+            )
+            return True
+
+        self._resume_after_kill_switch()
+        logger.info("System State: %s. Proceeding.", state or SYSTEM_STATE_OK)
+        return False
+
+    @staticmethod
+    def _decode_boot_state(value: object) -> dict[str, str] | None:
+        if isinstance(value, bytes):
+            value = value.decode("utf-8")
+        if not isinstance(value, str):
+            return None
+        try:
+            payload = json.loads(value)
+        except (TypeError, ValueError):
+            return None
+        if not isinstance(payload, dict):
+            return None
+        state = payload.get("state")
+        boot_id = payload.get("boot_id")
+        if state not in {"CLEAN", "UNCLEAN"} or not isinstance(boot_id, str):
+            return None
+        return {"state": state, "boot_id": boot_id}
+
+    def _persist_engine_boot_state(self, state: str) -> bool:
+        db_persisted = redis_persisted = False
+        try:
+            self.ops_safety.persist_engine_boot_state(state, boot_id=self._boot_id)
+            db_persisted = True
+        except Exception:
+            logger.exception("Failed to persist engine boot state to database")
+        try:
+            self.redis_client.set(
+                SYSTEM_BOOT_STATE_KEY,
+                json.dumps(
+                    {"state": state, "boot_id": self._boot_id},
+                    separators=(",", ":"),
+                ),
+            )
+            redis_persisted = True
+        except Exception:
+            logger.exception("Failed to persist engine boot state to Redis")
+        return db_persisted or redis_persisted
+
+    def _halt_for_kill_switch(self) -> None:
+        self._kill_switch_halted = True
+        self.execution_engine.halt_and_drain(timeout=0)
+
+    def _resume_after_kill_switch(self) -> None:
+        self.execution_engine.resume_submissions()
+        self._kill_switch_halted = False
 
     def _start_heartbeat(self):
         """
@@ -578,6 +791,31 @@ class StrategyEngine:
         
         self.heartbeat_thread = threading.Thread(target=heartbeat_loop, daemon=True)
         self.heartbeat_thread.start()
+
+    def _start_runtime_reconciliation(self):
+        """Start periodic runtime reconciliation in a daemon thread."""
+        interval = (
+            self._runtime_reconcile_interval
+            if self._runtime_reconcile_interval is not None
+            else _runtime_reconciliation_interval_from_env()
+        )
+        self._runtime_reconcile_stop.clear()
+
+        def reconcile_loop():
+            logger.info("Runtime reconciliation service started.")
+            while self.running and not self._runtime_reconcile_stop.is_set():
+                try:
+                    self.runtime_reconciliation_job.run_once()
+                except Exception as e:
+                    logger.error("Runtime reconciliation loop failed: %s", e)
+                if self._runtime_reconcile_stop.wait(interval):
+                    break
+
+        self.runtime_reconcile_thread = threading.Thread(
+            target=reconcile_loop,
+            daemon=True,
+        )
+        self.runtime_reconcile_thread.start()
 
     def _record_strategy_heartbeats(self, strategy_ids: list[str]) -> None:
         """Record strategy heartbeat state in HealthMonitor and DB."""
@@ -639,6 +877,13 @@ class StrategyEngine:
         """
         if signal.type == SignalType.NO_SIGNAL:
             return
+        if self._kill_switch_halted:
+            logger.warning(
+                "Signal rejected because kill switch is active: strategy=%s type=%s",
+                signal.strategy_id,
+                signal.type,
+            )
+            return
 
         import structlog.contextvars
         structlog.contextvars.bind_contextvars(trace_id=uuid.uuid4().hex[:16])
@@ -678,6 +923,7 @@ class StrategyEngine:
         """Graceful shutdown: stop threads, drain executor, close Redis."""
         logger.info("StrategyEngine shutting down...")
         self.running = False
+        self._runtime_reconcile_stop.set()
 
         self.executor.shutdown(wait=True, cancel_futures=False)
 
@@ -685,8 +931,17 @@ class StrategyEngine:
             self.heartbeat_thread.join(timeout=timeout)
         if self.command_thread and self.command_thread.is_alive():
             self.command_thread.join(timeout=timeout)
+        if self.runtime_reconcile_thread and self.runtime_reconcile_thread.is_alive():
+            self.runtime_reconcile_thread.join(timeout=timeout)
 
         self._strategy_state_manager.shutdown()
+
+        if (
+            self._boot_started
+            and not self._kill_switch_halted
+            and not self.ops_safety.recovery_pending
+        ):
+            self._persist_engine_boot_state("CLEAN")
 
         try:
             self.redis_client.close()

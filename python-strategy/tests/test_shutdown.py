@@ -79,3 +79,29 @@ class TestEngineShutdown:
         # Should not raise
         engine.shutdown()
         assert engine.running is False
+
+    def test_safe_started_boot_is_marked_clean_before_redis_close(self):
+        engine = _make_engine()
+        engine._boot_started = True
+        engine._kill_switch_halted = False
+        engine.ops_safety._recovery_pending = False
+        engine.ops_safety.persist_engine_boot_state = MagicMock()
+
+        engine.shutdown()
+
+        engine.ops_safety.persist_engine_boot_state.assert_called_once_with(
+            "CLEAN",
+            boot_id=engine._boot_id,
+        )
+
+    def test_halted_or_recovery_pending_boot_is_never_marked_clean(self):
+        for halted, recovery_pending in ((True, False), (False, True)):
+            engine = _make_engine()
+            engine._boot_started = True
+            engine._kill_switch_halted = halted
+            engine.ops_safety._recovery_pending = recovery_pending
+            engine.ops_safety.persist_engine_boot_state = MagicMock()
+
+            engine.shutdown()
+
+            engine.ops_safety.persist_engine_boot_state.assert_not_called()

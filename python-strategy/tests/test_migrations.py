@@ -25,6 +25,7 @@ Marked ``integration`` to keep it out of unit-only runs.
 
 from __future__ import annotations
 
+import json
 import os
 import time
 from collections.abc import Iterator
@@ -466,6 +467,82 @@ def test_full_downgrade_to_base(fresh_pg_db: str) -> None:
         residual = tables - {"alembic_version"}
         assert residual == set(), (
             f"Unexpected residual tables after full downgrade: {residual}"
+        )
+    finally:
+        engine.dispose()
+
+
+def test_ops_events_survive_downgrade_and_reupgrade(fresh_pg_db: str) -> None:
+    _upgrade(fresh_pg_db, "4f7a2c9d1e6b")
+    engine = sa.create_engine(_target_url(fresh_pg_db))
+    payloads = [
+        '{"reason":"risk"}',
+        '["operator",42]',
+        '"scalar-payload"',
+    ]
+    try:
+        with engine.begin() as conn:
+            for index, payload in enumerate(payloads):
+                conn.execute(
+                    text(
+                        "INSERT INTO system_events "
+                        "(event_type, event_subtype, payload) "
+                        "VALUES ('ops', :subtype, CAST(:payload AS jsonb))"
+                    ),
+                    {"subtype": f"kill_switch_{index}", "payload": payload},
+                )
+            conn.execute(
+                text(
+                    "INSERT INTO system_events "
+                    "(event_type, event_subtype, payload) "
+                    "VALUES ('system_error', 'existing_error', "
+                    "CAST(:payload AS jsonb))"
+                ),
+                {"payload": '{"message":"existing"}'},
+            )
+        with engine.connect() as conn:
+            original_identity = [
+                tuple(row)
+                for row in conn.execute(
+                    text("SELECT id, event_subtype FROM system_events ORDER BY id")
+                )
+            ]
+
+        _downgrade(fresh_pg_db, "fb8c6e6098e3")
+        with engine.connect() as conn:
+            downgraded = conn.execute(
+                text(
+                    "SELECT id, event_type, event_subtype, payload "
+                    "FROM system_events ORDER BY id"
+                )
+            ).mappings().all()
+        assert [row["event_type"] for row in downgraded] == ["system_error"] * 4
+        assert all(
+            "__migration_4f7a2c9d1e6b_ops_event" in row["payload"]
+            for row in downgraded[:3]
+        )
+        assert downgraded[3]["payload"] == {"message": "existing"}
+        assert [(row["id"], row["event_subtype"]) for row in downgraded] == (
+            original_identity
+        )
+
+        _upgrade(fresh_pg_db, "4f7a2c9d1e6b")
+        with engine.connect() as conn:
+            restored = conn.execute(
+                text(
+                    "SELECT id, event_type, event_subtype, payload::text AS payload "
+                    "FROM system_events ORDER BY id"
+                )
+            ).mappings().all()
+        assert [row["event_type"] for row in restored] == ["ops"] * 3 + [
+            "system_error"
+        ]
+        assert [json.loads(row["payload"]) for row in restored[:3]] == [
+            json.loads(payload) for payload in payloads
+        ]
+        assert json.loads(restored[3]["payload"]) == {"message": "existing"}
+        assert [(row["id"], row["event_subtype"]) for row in restored] == (
+            original_identity
         )
     finally:
         engine.dispose()

@@ -944,6 +944,51 @@ class TestAccountService:
 
         assert service.get_position("strat", "BINANCE:BTCUSDT-PERP") is None
 
+    def test_get_all_positions_enumerates_redis_position_keys(self):
+        """Should enumerate Redis position hashes and return non-flat positions."""
+        mock_redis = MagicMock()
+        mock_redis.ping.return_value = True
+        mock_redis.scan_iter.return_value = [
+            "state:position:strat_a:BINANCE:BTCUSDT-PERP",
+            "state:position:strat_b:BINANCE:ETHUSDT-PERP",
+        ]
+        mock_redis.hgetall.side_effect = [
+            {"quantity": "0.5", "entry_price": "42000"},
+            {"quantity": "0", "entry_price": "3000"},
+        ]
+
+        with patch("src.core.risk_manager.create_redis_client", return_value=mock_redis):
+            service = AccountService()
+
+        positions = service.get_all_positions()
+
+        assert len(positions) == 1
+        assert positions[0].strategy_id == "strat_a"
+        assert positions[0].product_id == "BINANCE:BTCUSDT-PERP"
+        assert positions[0].quantity == Decimal("0.5")
+
+    def test_get_all_positions_preserves_strategy_ids_with_colons(self):
+        """Redis position keys must parse from the product suffix, not the left."""
+        mock_redis = MagicMock()
+        mock_redis.ping.return_value = True
+        mock_redis.scan_iter.return_value = [
+            "state:position:test.py::StratB:BINANCE:BTCUSDT-PERP",
+        ]
+        mock_redis.hgetall.return_value = {
+            "quantity": "0.25",
+            "entry_price": "42000",
+        }
+
+        with patch("src.core.risk_manager.create_redis_client", return_value=mock_redis):
+            service = AccountService()
+
+        positions = service.get_all_positions()
+
+        assert len(positions) == 1
+        assert positions[0].strategy_id == "test.py::StratB"
+        assert positions[0].product_id == "BINANCE:BTCUSDT-PERP"
+        assert positions[0].quantity == Decimal("0.25")
+
     def test_close_with_redis(self):
         """close() should close Redis connection."""
         mock_redis = MagicMock()

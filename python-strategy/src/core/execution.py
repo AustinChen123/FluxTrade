@@ -1,9 +1,12 @@
 import logging
+import threading
 import time as _time
+from dataclasses import dataclass
 from decimal import Decimal
 from typing import Callable, ContextManager, Optional
 from sqlalchemy.orm import Session
 from src.core.models import Signal, SignalType, Candlestick, OrderSide, OrderStatus, PositionSide
+from src.core.orm_models import Strategy
 from src.core.order_manager import OrderManager
 from src.core.interfaces.exchange import IExchangeAdapter, ExchangeError, NetworkError
 from src.core.interfaces.exchange import ExchangeOrderEvent
@@ -32,6 +35,14 @@ from src.core.order_event_sync import (
 )
 from src.core.order_reconciliation import OrderReconciler
 
+OPS_KILL_SWITCH_STRATEGY_ID = "__ops_kill_switch__"
+
+
+@dataclass(frozen=True)
+class FlattenPending:
+    order_id: str
+    reason: str
+
 
 class ExecutionEngine:
     def __init__(
@@ -48,6 +59,7 @@ class ExecutionEngine:
         self.logger = logging.getLogger("ExecutionEngine")
         self.clock = clock
         self._db_session_factory = db_session_factory
+        self._db_session = db_session
         self.audit_external_orders = audit_external_orders
         if order_repository:
             self.order_manager = OrderManager(order_repository, clock, is_backtest=is_backtest)
@@ -107,6 +119,13 @@ class ExecutionEngine:
             ),
             logger=self.logger,
         )
+        # Submission drain gate: halts new order submissions and waits for
+        # in-flight ones to finish before a kill switch snapshot.
+        self._submission_gate = threading.Condition()
+        self._submissions_halted = False
+        self._submissions_in_flight = 0
+        self._drain_callbacks: list[Callable[[], None]] = []
+
         self.logger.info("ExecutionEngine initialized with adapter: %s", type(adapter).__name__)
 
     def list_recoverable_client_orders(self):
@@ -278,15 +297,237 @@ class ExecutionEngine:
         self.order_manager.mark_cancelled(order)
         return True
 
+    def flatten_position(
+        self,
+        strategy_id: str,
+        product_id: str,
+        side: str,
+        quantity: Decimal,
+        reference_price: Optional[Decimal] = None,
+    ) -> Optional[str] | FlattenPending:
+        """Close a live position with a reduce-only market order, bypassing
+        strategy signal flow.
+
+        Places a market order in the OPPOSITE direction for the full quantity.
+        The order is persisted via order_manager before adapter placement so
+        that a crash after placement leaves an auditable record.
+
+        Args:
+            strategy_id: owning strategy identifier.
+            product_id: product to flatten (e.g. "BINANCE:BTCUSDT-PERP").
+            side: current position side — "LONG" or "SHORT".
+            quantity: absolute quantity to close (Decimal, positive).
+
+        Returns:
+            Internal order id string on success, or None on failure.
+        """
+        normalized_side = str(side).upper()
+        if normalized_side == PositionSide.LONG.value:
+            order_side = OrderSide.SELL
+            signal_type = SignalType.EXIT_LONG
+        elif normalized_side == PositionSide.SHORT.value:
+            order_side = OrderSide.BUY
+            signal_type = SignalType.EXIT_SHORT
+        else:
+            self.logger.error("Cannot flatten unsupported position side: %s", side)
+            return None
+        if quantity <= 0:
+            self.logger.error("Cannot flatten non-positive quantity: %s", quantity)
+            return None
+
+        active_flatten = self._active_flatten_order(product_id)
+        if active_flatten is not None:
+            self.logger.warning(
+                "Reusing active kill-switch flatten order %s for %s",
+                active_flatten.id,
+                product_id,
+            )
+            if active_flatten.status == OrderStatus.SUBMITTED_UNCONFIRMED.value:
+                return FlattenPending(
+                    str(active_flatten.id),
+                    "submission_unconfirmed",
+                )
+            return str(active_flatten.id)
+
+        order_strategy_id = self._flatten_order_strategy_id(strategy_id)
+        signal = Signal(
+            strategy_id=order_strategy_id,
+            product_id=product_id,
+            timeframe="ops",
+            timestamp=int(self.clock.now() * 1000),
+            type=signal_type,
+            quantity=quantity,
+        )
+        order = self.order_manager.create_order(
+            signal=signal,
+            side=order_side,
+            order_type="market",
+            quantity=quantity,
+            client_order_id=generate_client_order_id(
+                order_strategy_id,
+                "ops",
+                "flatten",
+            ),
+            intent_payload={"reduce_only": True, "source": "kill_switch"},
+        )
+        if reference_price is not None:
+            order.min_notional_reference_price = reference_price
+        order_id = str(order.id)
+        try:
+            self._validate_order_group([order])
+        except ExchangeError as e:
+            self.logger.error("Flatten order validation failed: %s", e)
+            self.order_manager.fail_order(order, str(e))
+            self._record_order_rejection(
+                order=order,
+                order_type="market",
+                error=e,
+                phase="kill_switch_validation",
+            )
+            return None
+
+        submit_attempted = False
+        try:
+            self.order_manager.mark_submitted_unconfirmed(order)
+            submit_attempted = True
+            exchange_id = self.adapter.place_order(order)
+            self.order_manager.mark_submitted(order, exchange_id)
+            ORDERS_TOTAL.labels(
+                order_type="market",
+                status="placed",
+                reason="kill_switch_flatten",
+            ).inc()
+            return order_id
+        except ExchangeError as e:
+            self.logger.error("Flatten order failed: %s", e)
+            adoption = self._adopt_order_after_ambiguous_submit_error(
+                order,
+                e,
+                submit_attempted=submit_attempted,
+            )
+            if adoption["action"] == "adopted":
+                ORDERS_TOTAL.labels(
+                    order_type="market",
+                    status="placed",
+                    reason="kill_switch_flatten_adopted_after_submit_error",
+                ).inc()
+                return order_id
+            if adoption.get("verification_blocked") or adoption.get("unresolved"):
+                ORDERS_TOTAL.labels(
+                    order_type="market",
+                    status="failed",
+                    reason=str(adoption["action"]),
+                ).inc()
+                return FlattenPending(order_id, str(adoption["action"]))
+            self.order_manager.fail_order(order, str(e))
+            self._record_order_rejection(
+                order=order,
+                order_type="market",
+                error=e,
+                phase="kill_switch_flatten",
+            )
+            return None
+
+    def _active_flatten_order(self, product_id: str):
+        active_statuses = {
+            OrderStatus.SUBMITTED_UNCONFIRMED.value,
+            OrderStatus.SUBMITTED.value,
+            OrderStatus.PARTIALLY_FILLED.value,
+        }
+        for order in self.order_manager.repo.list_orders_by_statuses(active_statuses):
+            if order.product_id != product_id:
+                continue
+            payload = order.intent_payload
+            if isinstance(payload, dict) and payload.get("source") == "kill_switch":
+                return order
+        return None
+
+    def _flatten_order_strategy_id(self, strategy_id: str) -> str:
+        if strategy_id != "LIVE":
+            return strategy_id
+        self._ensure_ops_strategy()
+        return OPS_KILL_SWITCH_STRATEGY_ID
+
+    def _ensure_ops_strategy(self) -> None:
+        def ensure(session: Session) -> None:
+            if session.get(Strategy, OPS_KILL_SWITCH_STRATEGY_ID) is None:
+                session.add(
+                    Strategy(
+                        id=OPS_KILL_SWITCH_STRATEGY_ID,
+                        name="Kill Switch Ops",
+                        configuration_json="{}",
+                    )
+                )
+                session.commit()
+
+        if self._db_session_factory is not None:
+            with self._db_session_factory() as session:
+                ensure(session)
+            return
+        ensure(self._db_session)
+
+    def halt_and_drain(self, timeout: float = 30.0) -> bool:
+        """Halt new submissions and wait for in-flight ones to complete.
+
+        Sets the submission gate so that any subsequent call to execute_signal
+        or _place_pending_conditional_orders_for_entry is rejected immediately.
+        Then waits up to *timeout* seconds for in-flight submissions to finish.
+
+        Returns True if all in-flight submissions completed within the timeout,
+        False if the timeout was reached with work still in flight.
+        """
+        with self._submission_gate:
+            self._submissions_halted = True
+            return self._submission_gate.wait_for(
+                lambda: self._submissions_in_flight == 0,
+                timeout=timeout,
+            )
+
+    def run_when_submissions_drained(self, callback: Callable[[], None]) -> None:
+        with self._submission_gate:
+            if self._submissions_in_flight > 0:
+                self._drain_callbacks.append(callback)
+                return
+        callback()
+
+    def resume_submissions(self) -> None:
+        with self._submission_gate:
+            self._submissions_halted = False
+            self._submission_gate.notify_all()
+
+    def _finish_submission(self) -> None:
+        callbacks: list[Callable[[], None]] = []
+        with self._submission_gate:
+            self._submissions_in_flight -= 1
+            if self._submissions_in_flight == 0:
+                callbacks, self._drain_callbacks = self._drain_callbacks, []
+            self._submission_gate.notify_all()
+        for callback in callbacks:
+            try:
+                callback()
+            except Exception:
+                self.logger.exception("Submission drain callback failed")
+
     def execute_signal(self, signal: Signal, candle: Optional[Candlestick] = None) -> Optional[str]:
         """
         Converts Signal to Order and delegates execution to the Adapter.
         Also places SL/TP/Trailing orders when specified in the signal.
         Returns the Order ID (Internal) if successful.
         """
-        if self.audit_external_orders:
-            return self._execute_signal_with_audit(signal, candle)
-        return self._execute_signal_core(signal, candle)
+        # Gate: reject if the submission gate has been halted by a kill switch.
+        with self._submission_gate:
+            if self._submissions_halted:
+                self.logger.warning(
+                    "execute_signal rejected: submission gate is halted (kill switch active)"
+                )
+                return None
+            self._submissions_in_flight += 1
+        try:
+            if self.audit_external_orders:
+                return self._execute_signal_with_audit(signal, candle)
+            return self._execute_signal_core(signal, candle)
+        finally:
+            self._finish_submission()
 
     def _execute_signal_core(self, signal: Signal, candle: Optional[Candlestick] = None) -> Optional[str]:
         """Current non-audited signal execution path."""
@@ -902,6 +1143,27 @@ class ExecutionEngine:
         return conditional_id
 
     def _place_pending_conditional_orders_for_entry(self, entry_order) -> list[dict]:
+        # Gate: reject conditional placement if the submission gate is halted.
+        with self._submission_gate:
+            if self._submissions_halted:
+                self.logger.warning(
+                    "Conditional order placement rejected for entry %s: kill switch active",
+                    getattr(entry_order, "id", "?"),
+                )
+                return [
+                    {
+                        "order_id": str(getattr(entry_order, "id", "?")),
+                        "order_type": getattr(entry_order, "type", "?"),
+                        "reason": "kill_switch_halted",
+                    }
+                ]
+            self._submissions_in_flight += 1
+        try:
+            return self._place_pending_conditional_orders_for_entry_impl(entry_order)
+        finally:
+            self._finish_submission()
+
+    def _place_pending_conditional_orders_for_entry_impl(self, entry_order) -> list[dict]:
         if entry_order.type not in {"market", "limit"}:
             return []
         protected_quantity = entry_order.filled_quantity or Decimal("0")

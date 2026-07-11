@@ -4,6 +4,7 @@ import os
 
 from src.control_plane import BacktestJobExecutor, ControlPlaneApp, SqliteJobStore
 from src.control_plane.server import serve
+from src.core.redis_factory import create_redis_client
 
 
 def main() -> None:
@@ -15,6 +16,7 @@ def main() -> None:
     app = ControlPlaneApp(
         BacktestJobExecutor(store=store, recover_interrupted=store is not None),
         api_key=api_key,
+        redis_client=create_redis_client(),
     )
     serve(app, host=host, port=port)
 

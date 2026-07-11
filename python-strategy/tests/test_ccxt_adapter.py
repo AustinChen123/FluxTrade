@@ -116,6 +116,21 @@ class TestPlaceOrder:
         assert call_kwargs.kwargs["type"] == "market"
         assert call_kwargs.kwargs["side"] == "buy"
 
+    def test_market_reduce_only_intent_passes_reduce_only_param(
+        self, adapter, mock_ccxt_client
+    ):
+        mock_ccxt_client.create_order.return_value = {"id": "EX-FLAT"}
+        order = _make_order(
+            side="sell",
+            type="market",
+            intent_payload={"reduce_only": True, "source": "kill_switch"},
+        )
+
+        adapter.place_order(order)
+
+        call_kwargs = mock_ccxt_client.create_order.call_args
+        assert call_kwargs.kwargs["params"]["reduceOnly"] is True
+
     def test_limit_order_includes_gtc(self, adapter, mock_ccxt_client):
         mock_ccxt_client.create_order.return_value = {"id": "EX-456"}
         order = _make_order(type="limit", price=Decimal("50000"))
@@ -647,6 +662,70 @@ class TestPlaceOrder:
         )
 
         with pytest.raises(ExchangeError, match="min_notional_unverifiable"):
+            adapter.place_order(order)
+
+        mock_ccxt_client.create_order.assert_not_called()
+
+    @pytest.mark.parametrize(
+        ("side", "ticker", "expected_reference"),
+        [
+            ("sell", {"bid": 12000, "ask": 12010, "last": 12005}, Decimal("12000")),
+            ("buy", {"bid": 12000, "ask": 12010, "last": 12005}, Decimal("12010")),
+            ("sell", {"bid": None, "last": 12005}, Decimal("12005")),
+        ],
+        ids=["sell-bid", "buy-ask", "missing-side-last"],
+    )
+    def test_reduce_only_market_order_uses_current_ticker_reference(
+        self, adapter, mock_ccxt_client, side, ticker, expected_reference
+    ):
+        mock_ccxt_client.load_markets.return_value = {
+            "BTC/USDT:USDT": {
+                "info": {
+                    "filters": [
+                        {"filterType": "LOT_SIZE", "stepSize": "0.001"},
+                        {"filterType": "MIN_NOTIONAL", "minNotional": "10"},
+                    ],
+                },
+            },
+        }
+        mock_ccxt_client.fetch_ticker.return_value = ticker
+        mock_ccxt_client.create_order.return_value = {"id": "EX-FLATTEN"}
+        order = _make_order(
+            type="market",
+            side=side,
+            quantity=Decimal("0.001"),
+            price=None,
+        )
+        order.intent_payload = {"reduce_only": True, "source": "kill_switch"}
+
+        adapter.place_order(order)
+
+        assert order.min_notional_reference_price == expected_reference
+        mock_ccxt_client.fetch_ticker.assert_called_once_with("BTC/USDT:USDT")
+
+    def test_reduce_only_market_order_rejects_missing_current_price(
+        self, adapter, mock_ccxt_client
+    ):
+        mock_ccxt_client.load_markets.return_value = {
+            "BTC/USDT:USDT": {
+                "info": {
+                    "filters": [
+                        {"filterType": "LOT_SIZE", "stepSize": "0.001"},
+                        {"filterType": "MIN_NOTIONAL", "minNotional": "10"},
+                    ],
+                },
+            },
+        }
+        mock_ccxt_client.fetch_ticker.return_value = {}
+        order = _make_order(
+            type="market",
+            side="sell",
+            quantity=Decimal("0.001"),
+            price=None,
+        )
+        order.intent_payload = {"reduce_only": True, "source": "kill_switch"}
+
+        with pytest.raises(ExchangeError, match="market_reference_price_unavailable"):
             adapter.place_order(order)
 
         mock_ccxt_client.create_order.assert_not_called()
@@ -1229,6 +1308,40 @@ class TestGetPosition:
         with pytest.raises(ExchangeError):
             adapter.get_position("BINANCE:BTCUSDT-PERP")
 
+    def test_get_all_positions_returns_non_flat_exchange_positions(
+        self, adapter, mock_ccxt_client
+    ):
+        mock_ccxt_client.fetch_positions.return_value = [
+            {
+                "symbol": "BTC/USDT:USDT",
+                "contracts": 0.5,
+                "side": "long",
+                "entryPrice": 65000,
+                "unrealizedPnl": 100,
+            },
+            {
+                "symbol": "ETH/USDT:USDT",
+                "contracts": 0,
+                "side": "long",
+                "entryPrice": 3000,
+                "unrealizedPnl": 0,
+            },
+            {
+                "symbol": "XRP/USDT:USDT",
+                "contracts": 20,
+                "side": "short",
+                "entryPrice": 1,
+                "unrealizedPnl": -2,
+            },
+        ]
+
+        positions = adapter.get_all_positions()
+
+        assert [(pos.product_id, pos.side, pos.quantity) for pos in positions] == [
+            ("BINANCE:BTCUSDT-PERP", "LONG", Decimal("0.5")),
+            ("BINANCE:XRPUSDT-PERP", "SHORT", Decimal("20")),
+        ]
+
 
 # ---------------------------------------------------------------------------
 # create_adapter factory
@@ -1666,6 +1779,37 @@ class TestLiveBinanceWsOrderPath:
             )
             assert mock_ws_inst.place_order.call_args.kwargs["quantity"] == "0.010"
             mock_ws_inst._wait_for_ack.assert_called_once_with(exchange_client_order_id)
+
+    def test_reduce_only_market_order_uses_rest_not_ws(self):
+        """Reduce-only flatten orders must use the REST path that sends reduceOnly."""
+        with patch("src.core.adapters.ccxt_adapter.ccxt") as mock_ccxt, \
+             patch("src.core.adapters.live_binance.WebSocketOrderConnector") as MockWS:
+            mock_cls = MagicMock()
+            client = MagicMock()
+            client.apiKey = "k"
+            client.secret = "s"
+            client.create_order.return_value = {"id": "REST-REDUCE"}
+            client.load_markets.return_value = _empty_btc_market()
+            mock_cls.return_value = client
+            mock_ccxt.binance = mock_cls
+            setattr(mock_ccxt, "binance", mock_cls)
+
+            mock_ws_inst = MagicMock()
+            mock_ws_inst.is_connected.return_value = True
+            MockWS.return_value = mock_ws_inst
+
+            adapter = LiveBinanceAdapter(api_key="k", secret="s", enable_ws=True)
+            adapter.client = client
+            order = _make_order(
+                type="market",
+                side="sell",
+                intent_payload={"reduce_only": True, "source": "kill_switch"},
+            )
+            result = adapter.place_order(order)
+
+            assert result == "REST-REDUCE"
+            mock_ws_inst.place_order.assert_not_called()
+            assert client.create_order.call_args.kwargs["params"]["reduceOnly"] is True
 
     def test_ws_ack_timeout_falls_back_to_rest(self):
         """WS ACK timeout should fall back to REST."""

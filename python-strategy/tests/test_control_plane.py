@@ -1538,3 +1538,208 @@ def test_control_plane_runs_csv_signal_backtest_job(tmp_path):
 
     assert trade_count == 2
     assert audit_count == 2
+
+
+# =============================================================================
+# L6 kill-switch endpoint — POST /ops/kill-switch
+# =============================================================================
+#
+# Matrix:
+#   1. auth-fail: missing key  → 401
+#   2. auth-fail: wrong key    → 401
+#   3. happy-path: valid key   → 202 + publish to Redis with correct shape
+#   4. reason forwarded        → reason appears in published payload params
+#
+# Tests 1 & 2 rely on the existing auth middleware (trivially green once the
+# route exists and auth is enforced).  Tests 3 & 4 are RED until the stub is
+# implemented.
+
+
+def _kill_switch_app(*, api_key: str = "secret", redis_client=None) -> ControlPlaneApp:
+    from unittest.mock import MagicMock
+
+    return ControlPlaneApp(
+        BacktestJobExecutor(run_inline=True),
+        api_key=api_key,
+        redis_client=redis_client or MagicMock(),
+    )
+
+
+def test_kill_switch_rejects_missing_api_key():
+    app = _kill_switch_app()
+    response = app.handle("POST", "/ops/kill-switch")
+    assert response.status_code == 401
+    assert response.body.get("error") == "unauthorized"
+
+
+def test_kill_switch_rejects_wrong_api_key():
+    app = _kill_switch_app()
+    response = app.handle(
+        "POST", "/ops/kill-switch", headers={"x-api-key": "wrong-key"}
+    )
+    assert response.status_code == 401
+    assert response.body.get("error") == "unauthorized"
+
+
+def test_kill_switch_happy_path_returns_202_and_publishes():
+    from unittest.mock import MagicMock
+
+    redis = MagicMock()
+    app = _kill_switch_app(redis_client=redis)
+
+    response = app.handle(
+        "POST",
+        "/ops/kill-switch",
+        headers={"x-api-key": "secret"},
+    )
+
+    assert response.status_code == 202
+    assert response.body == {"status": "accepted"}
+
+    redis.publish.assert_called_once()
+    channel, raw_payload = redis.publish.call_args.args
+    assert channel == "cmd:strategy:control"
+    published = json.loads(raw_payload)
+    assert published["command"] == "KILL_SWITCH"
+    assert "params" in published
+
+
+def test_kill_switch_reason_forwarded_in_publish():
+    from unittest.mock import MagicMock
+
+    redis = MagicMock()
+    app = _kill_switch_app(redis_client=redis)
+
+    app.handle(
+        "POST",
+        "/ops/kill-switch",
+        body=json.dumps({"reason": "eod_risk_drill"}),
+        headers={"x-api-key": "secret"},
+    )
+
+    _, raw_payload = redis.publish.call_args.args
+    published = json.loads(raw_payload)
+    assert published["params"].get("reason") == "eod_risk_drill"
+
+
+def test_clear_kill_switch_returns_202_and_publishes_manual_release():
+    from unittest.mock import MagicMock
+
+    redis = MagicMock()
+    redis.publish.return_value = 1
+    app = _kill_switch_app(redis_client=redis)
+
+    response = app.handle(
+        "POST",
+        "/ops/kill-switch/clear",
+        headers={"x-api-key": "secret"},
+    )
+
+    assert response.status_code == 202
+    _, raw_payload = redis.publish.call_args.args
+    assert json.loads(raw_payload) == {
+        "command": "CLEAR_KILL_SWITCH",
+        "params": {"actor": "operator"},
+    }
+
+
+@pytest.mark.parametrize("payload", [[], None, "reason", 1, True])
+def test_kill_switch_rejects_non_object_json(payload):
+    from unittest.mock import MagicMock
+
+    redis = MagicMock()
+    app = _kill_switch_app(redis_client=redis)
+
+    response = app.handle(
+        "POST",
+        "/ops/kill-switch",
+        body=json.dumps(payload),
+        headers={"x-api-key": "secret"},
+    )
+
+    assert response.status_code == 400
+    assert response.body["error"] == "invalid_json"
+    redis.publish.assert_not_called()
+
+
+@pytest.mark.parametrize("reason", [[], {}, 1, True])
+def test_kill_switch_rejects_non_string_reason(reason):
+    from unittest.mock import MagicMock
+
+    redis = MagicMock()
+    app = _kill_switch_app(redis_client=redis)
+
+    response = app.handle(
+        "POST",
+        "/ops/kill-switch",
+        body=json.dumps({"reason": reason}),
+        headers={"x-api-key": "secret"},
+    )
+
+    assert response.status_code == 422
+    assert response.body == {"error": "validation_error"}
+    redis.publish.assert_not_called()
+
+
+def test_kill_switch_publish_failure_returns_503():
+    from unittest.mock import MagicMock
+
+    redis = MagicMock()
+    redis.publish.side_effect = RuntimeError("redis down")
+    app = _kill_switch_app(redis_client=redis)
+
+    response = app.handle(
+        "POST",
+        "/ops/kill-switch",
+        headers={"x-api-key": "secret"},
+    )
+
+    assert response.status_code == 503
+    assert response.body["error"] == "redis_publish_failed"
+    assert "redis down" in response.body["detail"]
+
+
+def test_kill_switch_publish_without_subscriber_returns_503():
+    from unittest.mock import MagicMock
+
+    redis = MagicMock()
+    redis.publish.return_value = 0
+    app = _kill_switch_app(redis_client=redis)
+
+    response = app.handle(
+        "POST",
+        "/ops/kill-switch",
+        headers={"x-api-key": "secret"},
+    )
+
+    assert response.status_code == 503
+    assert response.body == {"error": "kill_switch_no_listener"}
+
+
+def test_control_plane_main_wires_redis_client_for_kill_switch(monkeypatch):
+    from unittest.mock import MagicMock
+
+    from src.control_plane import main as control_plane_main
+
+    redis = MagicMock()
+    captured = {}
+
+    class CapturingControlPlaneApp:
+        def __init__(self, executor, *, api_key=None, redis_client=None):
+            captured["executor"] = executor
+            captured["api_key"] = api_key
+            captured["redis_client"] = redis_client
+
+    monkeypatch.setattr(control_plane_main, "ControlPlaneApp", CapturingControlPlaneApp)
+    monkeypatch.setattr(control_plane_main, "create_redis_client", lambda: redis)
+    monkeypatch.setattr(
+        control_plane_main,
+        "serve",
+        lambda app, *, host, port: captured.update(
+            {"served_app": app, "host": host, "port": port}
+        ),
+    )
+
+    control_plane_main.main()
+
+    assert captured["redis_client"] is redis

@@ -44,6 +44,7 @@ class ControlPlaneApp:
         strategy_control: StrategyControlService | None = None,
         strategy_state_query: StrategyStateQueryService | None = None,
         api_key: str | None = None,
+        redis_client: Any | None = None,
     ) -> None:
         if api_key == "":
             raise ValueError("api_key must be non-empty when provided")
@@ -53,6 +54,7 @@ class ControlPlaneApp:
         self.strategy_control = strategy_control
         self.strategy_state_query = strategy_state_query
         self.api_key = api_key
+        self.redis_client = redis_client
 
     def handle(
         self,
@@ -144,6 +146,14 @@ class ControlPlaneApp:
             if job is None:
                 return HttpResponse(404, {"error": "job_not_found"})
             return HttpResponse(200, {"job": self._job_payload(job)})
+
+        if method == "POST" and clean_path == "/ops/kill-switch/clear":
+            return self._publish_ops_command(
+                {"command": "CLEAR_KILL_SWITCH", "params": {"actor": "operator"}}
+            )
+
+        if method == "POST" and clean_path == "/ops/kill-switch":
+            return self._handle_kill_switch(body)
 
         return HttpResponse(404, {"error": "not_found"})
 
@@ -307,6 +317,54 @@ class ControlPlaneApp:
 
         result = self.strategy_control.submit_command(strategy_id, request)
         return self._command_response(result)
+
+    def _handle_kill_switch(self, body: str | bytes | None) -> HttpResponse:
+        """Publish a KILL_SWITCH command to the strategy engine via Redis.
+
+        Parses optional {"reason": str} from the request body, publishes
+        {"command": "KILL_SWITCH", "params": {"actor": "operator", "reason": ...}}
+        to the Redis channel ``cmd:strategy:control``, and returns 202.
+
+        Implementer must:
+        - Ensure self.redis_client is set (injected at construction time).
+        - Parse body JSON; "reason" key is optional.
+        - Publish JSON-encoded command to "cmd:strategy:control".
+        - Return HttpResponse(202, {"status": "accepted"}).
+        """
+        try:
+            payload = self._parse_json_body(body)
+        except json.JSONDecodeError as exc:
+            return HttpResponse(400, {"error": "invalid_json", "detail": str(exc)})
+        except ValueError as exc:
+            return HttpResponse(400, {"error": "invalid_json", "detail": str(exc)})
+        reason = payload.get("reason")
+        if reason is not None and not isinstance(reason, str):
+            return HttpResponse(422, {"error": "validation_error"})
+        command = {
+            "command": "KILL_SWITCH",
+            "params": {
+                "actor": "operator",
+                "reason": reason,
+            },
+        }
+        return self._publish_ops_command(command)
+
+    def _publish_ops_command(self, command: dict[str, Any]) -> HttpResponse:
+        if self.redis_client is None:
+            return HttpResponse(503, {"error": "redis_unavailable"})
+        try:
+            subscribers = self.redis_client.publish(
+                "cmd:strategy:control",
+                json.dumps(command, separators=(",", ":")),
+            )
+        except Exception as exc:
+            return HttpResponse(
+                503,
+                {"error": "redis_publish_failed", "detail": str(exc)},
+            )
+        if subscribers == 0:
+            return HttpResponse(503, {"error": "kill_switch_no_listener"})
+        return HttpResponse(202, {"status": "accepted"})
 
     def _submit_gene_action(
         self,

@@ -173,7 +173,7 @@ class SystemEvent(Base):
 
     __table_args__ = (
         CheckConstraint(
-            "event_type IN ('reconcile','gene_promote','gene_retire','system_error')",
+            "event_type IN ('reconcile','gene_promote','gene_retire','ops','system_error')",
             name='chk_system_events_type',
         ),
     )
