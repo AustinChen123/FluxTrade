@@ -21,7 +21,7 @@ import pytest
 from sqlalchemy import create_engine, event, text
 from sqlalchemy.orm import sessionmaker
 
-from src.core.execution import ExecutionEngine
+from src.core.execution import ExecutionEngine, FlattenPending
 from src.core.interfaces.exchange import ExchangeError, NetworkError
 from src.core.models import Candlestick, OrderStatus, Position, PositionSide, Signal, SignalType
 from src.core.ops_safety import OpsSafetyService
@@ -333,6 +333,43 @@ class TestKillSwitchIdempotency:
             assert kwargs["event_subtype"] == "kill_switch"
 
 
+class TestKillSwitchClear:
+    def test_recovery_pending_cannot_clear(self):
+        service, engine, _ = _make_service()
+        service._recovery_pending = True
+        engine._submissions_halted = True
+        persist = MagicMock()
+
+        result = service.clear_kill_switch(persist_clear=persist)
+
+        assert result == {"cleared": False, "reason": "recovery_pending"}
+        persist.assert_not_called()
+        assert engine._submissions_halted is True
+
+    def test_open_position_cannot_clear(self):
+        service, engine, _ = _make_service(positions=[_make_position()])
+        engine._submissions_halted = True
+        persist = MagicMock()
+
+        result = service.clear_kill_switch(persist_clear=persist)
+
+        assert result == {"cleared": False, "reason": "exposure_not_flat"}
+        persist.assert_not_called()
+        assert engine._submissions_halted is True
+
+    def test_verified_flat_persists_before_resume(self):
+        service, engine, _ = _make_service(positions=[])
+        engine._submissions_halted = True
+        calls = []
+        persist = MagicMock(side_effect=lambda: calls.append("persist"))
+        engine.resume_submissions = MagicMock(side_effect=lambda: calls.append("resume"))
+
+        result = service.clear_kill_switch(persist_clear=persist)
+
+        assert result == {"cleared": True, "reason": None}
+        assert calls == ["persist", "resume"]
+
+
 class TestKillSwitchCancelScope:
     """Matrix items 2 & 9: cancel scope covers correct statuses."""
 
@@ -623,6 +660,26 @@ class TestKillSwitchFlattenPositions:
 
         assert result["flattened_positions"] == 1
 
+    def test_ambiguous_flatten_is_reported_pending_not_successful(self):
+        pending = FlattenPending("flatten-order", "verification_blocked")
+        position = _make_position()
+        service, _, _ = _make_service(
+            positions=[position],
+            flatten_results={(position.strategy_id, position.product_id): pending},
+        )
+
+        result = service.kill_switch(actor="ops")
+
+        assert result["flattened_positions"] == 0
+        assert result["flatten_pending"] == [
+            {
+                "strategy_id": position.strategy_id,
+                "product_id": position.product_id,
+                "order_id": "flatten-order",
+                "reason": "verification_blocked",
+            }
+        ]
+
     def test_flatten_does_not_use_position_entry_price_as_reference_price(self):
         pos = _make_position(quantity=Decimal("0.75"))
         service, engine, _ = _make_service(positions=[pos])
@@ -812,8 +869,9 @@ class TestFlattenPosition:
             reference_price=Decimal("50000"),
         )
 
-        assert first_result is not None
-        assert second_result == first_result
+        assert isinstance(first_result, FlattenPending)
+        assert isinstance(second_result, FlattenPending)
+        assert second_result.order_id == first_result.order_id
         assert adapter.place_calls == 1
         assert len(mock_order_repo.orders) == 1
         order = next(iter(mock_order_repo.orders.values()))
@@ -851,7 +909,11 @@ class TestFlattenPosition:
             reference_price=Decimal("50000"),
         )
 
-        assert (result == existing.id) is expected_reused
+        if status == OrderStatus.SUBMITTED_UNCONFIRMED.value:
+            assert isinstance(result, FlattenPending)
+            assert result.order_id == existing.id
+        else:
+            assert (result == existing.id) is expected_reused
         placed = mock_exchange_adapter.open_orders + mock_exchange_adapter.filled_orders
         assert bool(placed) is (not expected_reused)
 
@@ -1021,20 +1083,32 @@ class TestEngineKillSwitchCommand:
         engine = engine_factory()
         engine.redis_client.set.side_effect = RuntimeError("redis unavailable")
         engine.ops_safety.kill_switch = MagicMock(return_value={})
+        engine.ops_safety.persist_kill_switch_state = MagicMock()
 
         engine._handle_command({"command": "KILL_SWITCH", "params": {}})
 
         assert engine._kill_switch_halted is True
         assert engine.execution_engine._submissions_halted is True
+        engine.ops_safety.persist_kill_switch_state.assert_called_once_with(
+            "LOCKDOWN",
+            actor="operator",
+            reason=None,
+        )
         engine.ops_safety.kill_switch.assert_called_once()
 
     def test_clear_kill_switch_persists_before_resuming(self, engine_factory):
         engine = engine_factory()
         engine._kill_switch_halted = True
         engine.execution_engine._submissions_halted = True
+        engine.ops_safety.persist_kill_switch_state = MagicMock()
 
         engine._handle_command({"command": "CLEAR_KILL_SWITCH", "params": {}})
 
+        engine.ops_safety.persist_kill_switch_state.assert_called_once_with(
+            "OK",
+            actor="operator",
+            reason=None,
+        )
         engine.redis_client.set.assert_any_call("system:state", "OK")
         assert engine._kill_switch_halted is False
         assert engine.execution_engine._submissions_halted is False
@@ -1051,6 +1125,43 @@ class TestEngineKillSwitchCommand:
 
         assert engine._kill_switch_halted is True
         assert engine.execution_engine._submissions_halted is True
+
+    def test_clear_waits_for_in_progress_kill_switch(self, engine_factory):
+        engine = engine_factory()
+        entered = threading.Event()
+        release = threading.Event()
+
+        def blocking_kill_switch(**_kwargs):
+            entered.set()
+            release.wait(timeout=2)
+            return {}
+
+        engine.ops_safety.kill_switch = blocking_kill_switch
+        engine.ops_safety.clear_kill_switch = MagicMock(
+            return_value={"cleared": True, "reason": None}
+        )
+        kill_thread = threading.Thread(
+            target=engine._handle_command,
+            args=({"command": "KILL_SWITCH", "params": {}},),
+        )
+        clear_thread = threading.Thread(
+            target=engine._handle_command,
+            args=({"command": "CLEAR_KILL_SWITCH", "params": {}},),
+        )
+
+        kill_thread.start()
+        assert entered.wait(timeout=1)
+        clear_thread.start()
+        time.sleep(0.05)
+
+        assert clear_thread.is_alive()
+        assert engine._kill_switch_halted is True
+        release.set()
+        kill_thread.join(timeout=1)
+        clear_thread.join(timeout=1)
+
+        assert not kill_thread.is_alive()
+        assert not clear_thread.is_alive()
 
     def test_unknown_command_delegated_to_command_router(self, engine_factory):
         """Regression: unknown commands must still reach _command_router.handle()."""
@@ -1493,14 +1604,17 @@ class TestSubmissionDrainGate:
             repeated_result = service.kill_switch(actor="ops")
             assert repeated_result == result
             assert eng.drain_calls == 1
+            assert result["cancelled_orders"] == 0
+            assert result["flattened_positions"] == 0
+            assert not any(call[0] == "cancel_order" for call in eng.calls)
+            assert not any(call[0] == "flatten_position" for call in eng.calls)
 
-            service._account_service._positions = []
             eng.complete_submission()
 
         assert result["drain_timeout"] is True
         assert result["already_flat"] is False
-        assert result["cancelled_orders"] == 1
-        assert result["flattened_positions"] == 1
+        assert result["cancelled_orders"] == 0
+        assert result["flattened_positions"] == 0
         assert ("cancel_order", "late-order") in eng.calls
         assert eng.drain_calls == 2
         assert [subtype for subtype, _ in audit_events] == [
@@ -1531,8 +1645,9 @@ class TestSubmissionDrainGate:
             result = service.kill_switch(actor="ops")
 
         assert result["drain_timeout"] is True
-        assert result["cancelled_orders"] == 1
-        assert result["flattened_positions"] == 1
+        assert result["cancelled_orders"] == 0
+        assert result["flattened_positions"] == 0
+        assert eng.drain_callback is not None
 
     def test_retry_after_timeout_catches_late_order_before_success(self):
         """A converged retry runs a second pass that catches the late submission."""
@@ -1548,7 +1663,7 @@ class TestSubmissionDrainGate:
         result = service.kill_switch(actor="ops")
 
         assert result["drain_timeout"] is True
-        assert result["already_flat"] is True
+        assert result["already_flat"] is False
         assert result["cancelled_orders"] == 0
         eng.complete_submission()
         assert ("cancel_order", "late-order") in eng.calls
@@ -1570,8 +1685,36 @@ class TestSubmissionDrainGate:
 
         service.kill_switch(actor="ops")
 
+        if drain_results[0] is False:
+            eng.complete_submission()
+
         flatten_calls = [call for call in eng.calls if call[0] == "flatten_position"]
         assert len(flatten_calls) == 1
+
+    @pytest.mark.parametrize("registration_mode", ["missing", "raises"])
+    def test_drain_callback_registration_failure_stays_pending(
+        self, registration_mode
+    ):
+        eng = SequencedDrainEngine([False])
+        if registration_mode == "missing":
+            eng.run_when_submissions_drained = None
+        else:
+            eng.run_when_submissions_drained = MagicMock(
+                side_effect=RuntimeError("callback registration failed")
+            )
+        service = OpsSafetyService(
+            eng,
+            FakeAccountService(positions=[_make_position()]),
+            _make_null_db_session_factory(),
+            drain_timeout=0.1,
+        )
+
+        result = service.kill_switch(actor="ops")
+
+        assert result["already_flat"] is False
+        assert result["recovery_failures"]
+        assert service._recovery_pending is True
+        assert not any(call[0] == "flatten_position" for call in eng.calls)
 
     def test_concurrent_kill_switch_calls_are_serialized(self):
         account = BlockingFirstAccountService()

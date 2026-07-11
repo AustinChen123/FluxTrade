@@ -13,6 +13,7 @@ Covers:
 
 from contextlib import nullcontext
 from decimal import Decimal
+import json
 from unittest.mock import MagicMock, call, patch
 
 import pytest
@@ -22,7 +23,11 @@ from src.core.orm_models import Candlestick as ORMCandlestick, StrategyState
 from src.core.daily_nav_snapshot import DailyNavSnapshotService
 from src.core.adapters.ccxt_adapter import CcxtExchangeAdapter
 from src.core.adapters.simulated import SimulatedAdapter
-from src.core.engine import StrategyEngine, _is_runtime_reconciliation_enabled
+from src.core.engine import (
+    SYSTEM_BOOT_STATE_KEY,
+    StrategyEngine,
+    _is_runtime_reconciliation_enabled,
+)
 from src.core.strategy_state_manager import StrategyStateManager
 
 
@@ -82,6 +87,30 @@ class TestEngineInit:
         self, adapter, adapter_config, expected
     ):
         assert _is_runtime_reconciliation_enabled(adapter, adapter_config) is expected
+
+    @pytest.mark.parametrize(
+        "interval",
+        ["0", "-1", "nan", "inf", "-inf", "", "not-a-number"],
+    )
+    def test_live_engine_rejects_invalid_runtime_reconciliation_interval(
+        self, mock_db_session, mock_clock, monkeypatch, interval
+    ):
+        monkeypatch.setenv("RUNTIME_RECONCILE_INTERVAL_SECONDS", interval)
+        with patch("src.core.engine.create_redis_client") as redis_factory, patch(
+            "src.core.engine.create_adapter"
+        ) as create_adapter:
+            redis_factory.return_value = MagicMock()
+            create_adapter.return_value = MagicMock()
+
+            with pytest.raises(
+                ValueError,
+                match="RUNTIME_RECONCILE_INTERVAL_SECONDS",
+            ):
+                StrategyEngine(
+                    db_session=mock_db_session,
+                    clock=mock_clock,
+                    adapter_config={"mode": "live"},
+                )
 
     def test_default_adapter_simulated(self, mock_db_session, mock_clock):
         """When no adapter_config, should default to simulated mode."""
@@ -1544,6 +1573,96 @@ class TestRestoreActiveStrategiesMatrix:
 
 
 class TestPersistentKillSwitchState:
+    def test_db_lockdown_overrides_stale_redis_ok(self, engine):
+        engine.redis_client.get.return_value = "OK"
+        engine.ops_safety.latest_kill_switch_state = MagicMock(
+            return_value="LOCKDOWN"
+        )
+
+        locked = engine._check_system_state()
+
+        assert locked is True
+        assert engine._kill_switch_halted is True
+
+    def test_db_redis_state_disagreement_fails_closed(self, engine):
+        engine.redis_client.get.return_value = "LOCKDOWN"
+        engine.ops_safety.latest_kill_switch_state = MagicMock(return_value="OK")
+
+        assert engine._check_system_state() is True
+
+    def test_matching_db_and_redis_clear_state_resumes(self, engine):
+        previous_boot = {"state": "CLEAN", "boot_id": "previous-boot"}
+        engine.redis_client.get.side_effect = lambda key: (
+            "OK" if key == "system:state" else json.dumps(previous_boot)
+        )
+        engine.ops_safety.latest_kill_switch_state = MagicMock(return_value="OK")
+        engine.ops_safety.latest_engine_boot_state = MagicMock(
+            return_value=previous_boot
+        )
+        engine.ops_safety.persist_engine_boot_state = MagicMock()
+
+        assert engine._check_system_state() is False
+        assert engine._kill_switch_halted is False
+        engine.ops_safety.persist_engine_boot_state.assert_called_once_with(
+            "UNCLEAN",
+            boot_id=engine._boot_id,
+        )
+        redis_boot = json.loads(
+            next(
+                call.args[1]
+                for call in engine.redis_client.set.call_args_list
+                if call.args[0] == SYSTEM_BOOT_STATE_KEY
+            )
+        )
+        assert redis_boot == {"state": "UNCLEAN", "boot_id": engine._boot_id}
+
+    @pytest.mark.parametrize(
+        "db_boot, redis_boot",
+        [
+            (None, None),
+            (
+                {"state": "UNCLEAN", "boot_id": "previous"},
+                {"state": "UNCLEAN", "boot_id": "previous"},
+            ),
+            (
+                {"state": "CLEAN", "boot_id": "db-boot"},
+                {"state": "CLEAN", "boot_id": "redis-boot"},
+            ),
+        ],
+        ids=["missing", "unclean", "disagree"],
+    )
+    def test_untrusted_previous_boot_fails_closed(
+        self, engine, db_boot, redis_boot
+    ):
+        engine.redis_client.get.side_effect = lambda key: (
+            "OK"
+            if key == "system:state"
+            else json.dumps(redis_boot) if redis_boot is not None else None
+        )
+        engine.ops_safety.latest_kill_switch_state = MagicMock(return_value="OK")
+        engine.ops_safety.latest_engine_boot_state = MagicMock(return_value=db_boot)
+        engine.ops_safety.persist_engine_boot_state = MagicMock()
+
+        assert engine._check_system_state() is True
+        assert engine._kill_switch_halted is True
+
+    def test_current_boot_marker_dual_write_failure_fails_closed(self, engine):
+        previous_boot = {"state": "CLEAN", "boot_id": "previous"}
+        engine.redis_client.get.side_effect = lambda key: (
+            "OK" if key == "system:state" else json.dumps(previous_boot)
+        )
+        engine.redis_client.set.side_effect = RuntimeError("redis unavailable")
+        engine.ops_safety.latest_kill_switch_state = MagicMock(return_value="OK")
+        engine.ops_safety.latest_engine_boot_state = MagicMock(
+            return_value=previous_boot
+        )
+        engine.ops_safety.persist_engine_boot_state = MagicMock(
+            side_effect=RuntimeError("database unavailable")
+        )
+
+        assert engine._check_system_state() is True
+        assert engine._kill_switch_halted is True
+
     def test_startup_opens_command_listener_before_waiting_on_persisted_state(
         self, engine
     ):
@@ -1569,24 +1688,57 @@ class TestPersistentKillSwitchState:
 
         assert calls == ["listener", "state"]
 
-    def test_startup_waits_halted_until_operator_clears_lockdown(self, engine):
-        states = iter(["LOCKDOWN", "OK"])
+    def test_persisted_lockdown_keeps_both_submission_gates_halted(self, engine):
+        engine.redis_client.get.return_value = "LOCKDOWN"
 
-        def next_state(_key):
-            state = next(states)
-            if state == "OK":
-                assert engine._kill_switch_halted is True
-                assert engine.execution_engine._submissions_halted is True
-            return state
+        locked = engine._check_system_state()
 
-        engine.redis_client.get.side_effect = next_state
+        assert locked is True
+        assert engine._kill_switch_halted is True
+        assert engine.execution_engine._submissions_halted is True
 
-        with patch("src.core.engine.time.sleep"):
-            engine._check_system_state()
+    def test_startup_recovers_lockdown_without_restoring_strategies(self, engine):
+        engine.redis_client.get.return_value = "LOCKDOWN"
+        engine.ops_safety.kill_switch = MagicMock(return_value={})
+        engine._reconcile_balance = MagicMock()
+        engine._initialize_strategy_state_cache_on_startup = MagicMock()
+        engine._start_strategy_state_subscriber_on_startup = MagicMock()
+        engine._reconcile_recoverable_orders_on_startup = MagicMock()
+        engine._start_heartbeat = MagicMock()
+        engine._start_command_listener = MagicMock()
+        engine.scan_strategies = MagicMock()
+        engine._restore_active_strategies_on_startup = MagicMock()
 
-        assert engine.redis_client.get.call_count == 2
-        assert engine._kill_switch_halted is False
-        assert engine.execution_engine._submissions_halted is False
+        engine.startup()
+
+        engine.ops_safety.kill_switch.assert_called_once_with(
+            actor="startup_recovery",
+            reason="persisted_lockdown",
+        )
+        engine._restore_active_strategies_on_startup.assert_not_called()
+
+    def test_startup_does_not_recover_after_concurrent_manual_clear(self, engine):
+        def cleared_after_read():
+            engine._kill_switch_halted = False
+            return True
+
+        engine._check_system_state = MagicMock(side_effect=cleared_after_read)
+        engine.ops_safety.kill_switch = MagicMock(return_value={})
+        for name in (
+            "_reconcile_balance",
+            "_initialize_strategy_state_cache_on_startup",
+            "_start_strategy_state_subscriber_on_startup",
+            "_reconcile_recoverable_orders_on_startup",
+            "_start_heartbeat",
+            "_start_command_listener",
+            "scan_strategies",
+            "_restore_active_strategies_on_startup",
+        ):
+            setattr(engine, name, MagicMock())
+
+        engine.startup()
+
+        engine.ops_safety.kill_switch.assert_not_called()
 
 
 class TestRuntimeReconciliationThread:
@@ -1670,7 +1822,7 @@ class TestRuntimeReconciliationThread:
 
         assert created_threads[0].daemon is True
         engine.runtime_reconciliation_job.run_once.assert_called_once()
-        engine._runtime_reconcile_stop.wait.assert_called_once()
+        engine._runtime_reconcile_stop.wait.assert_called_once_with(3600.0)
 
 
 # =============================================================================

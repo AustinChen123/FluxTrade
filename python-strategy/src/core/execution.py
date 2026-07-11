@@ -1,6 +1,7 @@
 import logging
 import threading
 import time as _time
+from dataclasses import dataclass
 from decimal import Decimal
 from typing import Callable, ContextManager, Optional
 from sqlalchemy.orm import Session
@@ -35,6 +36,12 @@ from src.core.order_event_sync import (
 from src.core.order_reconciliation import OrderReconciler
 
 OPS_KILL_SWITCH_STRATEGY_ID = "__ops_kill_switch__"
+
+
+@dataclass(frozen=True)
+class FlattenPending:
+    order_id: str
+    reason: str
 
 
 class ExecutionEngine:
@@ -297,7 +304,7 @@ class ExecutionEngine:
         side: str,
         quantity: Decimal,
         reference_price: Optional[Decimal] = None,
-    ) -> Optional[str]:
+    ) -> Optional[str] | FlattenPending:
         """Close a live position with a reduce-only market order, bypassing
         strategy signal flow.
 
@@ -335,6 +342,11 @@ class ExecutionEngine:
                 active_flatten.id,
                 product_id,
             )
+            if active_flatten.status == OrderStatus.SUBMITTED_UNCONFIRMED.value:
+                return FlattenPending(
+                    str(active_flatten.id),
+                    "submission_unconfirmed",
+                )
             return str(active_flatten.id)
 
         order_strategy_id = self._flatten_order_strategy_id(strategy_id)
@@ -406,7 +418,7 @@ class ExecutionEngine:
                     status="failed",
                     reason=str(adoption["action"]),
                 ).inc()
-                return order_id
+                return FlattenPending(order_id, str(adoption["action"]))
             self.order_manager.fail_order(order, str(e))
             self._record_order_rejection(
                 order=order,

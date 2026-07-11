@@ -20,10 +20,13 @@ import logging
 import threading
 from typing import Any, Callable, ContextManager
 
+from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from src.core.audit_service import write_system_event
+from src.core.execution import FlattenPending
 from src.core.models import OrderStatus
+from src.core.orm_models import SystemEvent
 
 OPS_KILL_SWITCH_STRATEGY_ID = "__ops_kill_switch__"
 
@@ -78,10 +81,104 @@ class OpsSafetyService:
                 None,
             )
             if callable(run_when_drained):
-                run_when_drained(self._recover_after_submission_drain)
+                try:
+                    run_when_drained(self._recover_after_submission_drain)
+                except Exception as exc:
+                    self._record_recovery_failure(
+                        result,
+                        f"submission_drain_callback_registration_failed: {exc}",
+                    )
             else:
-                self._logger.error("Kill switch recovery callback is unavailable")
+                self._record_recovery_failure(
+                    result,
+                    "submission_drain_callback_unavailable",
+                )
         return result
+
+    def _record_recovery_failure(self, result: dict, reason: str) -> None:
+        self._logger.error("Kill switch recovery failed: %s", reason)
+        failure = {"reason": reason}
+        with self._kill_switch_lock:
+            result["recovery_failures"].append(failure)
+            if self._recovery_result is not None:
+                self._recovery_result["recovery_failures"].append(dict(failure))
+
+    def clear_kill_switch(self, *, persist_clear: Callable[[], None]) -> dict:
+        with self._kill_switch_lock:
+            if self._recovery_pending:
+                return {"cleared": False, "reason": "recovery_pending"}
+            try:
+                positions, degraded_reason = self._positions()
+                orders = self._open_orders()
+            except Exception as exc:
+                return {"cleared": False, "reason": f"verification_failed: {exc}"}
+            if degraded_reason is not None:
+                return {"cleared": False, "reason": "verification_degraded"}
+            if positions or orders:
+                return {"cleared": False, "reason": "exposure_not_flat"}
+
+            persist_clear()
+            self._execution_engine.resume_submissions()
+            return {"cleared": True, "reason": None}
+
+    def persist_kill_switch_state(
+        self,
+        state: str,
+        *,
+        actor: str,
+        reason: str | None,
+    ) -> None:
+        self._write_event(
+            actor=actor,
+            reason=reason,
+            result={"state": state},
+            event_subtype="kill_switch_state",
+        )
+
+    def latest_kill_switch_state(self) -> str | None:
+        payload = self._latest_state_payload("kill_switch_state")
+        if payload is None:
+            return None
+        state = payload.get("state")
+        return state if state in {"LOCKDOWN", "OK"} else None
+
+    def persist_engine_boot_state(self, state: str, *, boot_id: str) -> None:
+        self._write_event(
+            actor="engine",
+            reason=None,
+            result={"state": state, "boot_id": boot_id},
+            event_subtype="engine_boot_state",
+        )
+
+    def latest_engine_boot_state(self) -> dict[str, str] | None:
+        payload = self._latest_state_payload("engine_boot_state")
+        if payload is None:
+            return None
+        state = payload.get("state")
+        boot_id = payload.get("boot_id")
+        if state not in {"CLEAN", "UNCLEAN"} or not isinstance(boot_id, str):
+            return None
+        return {"state": state, "boot_id": boot_id}
+
+    def _latest_state_payload(self, event_subtype: str) -> dict | None:
+        with self._db_session_factory() as session:
+            event = session.execute(
+                select(SystemEvent)
+                .where(
+                    SystemEvent.event_type == "ops",
+                    SystemEvent.event_subtype == event_subtype,
+                )
+                .order_by(SystemEvent.id.desc())
+                .limit(1)
+            ).scalar_one_or_none()
+        if not isinstance(event, SystemEvent) or not isinstance(event.payload, dict):
+            return None
+        return event.payload
+
+    @property
+    def recovery_pending(self) -> bool:
+        with self._kill_switch_lock:
+            return self._recovery_pending
 
     def _run_kill_switch(
         self,
@@ -122,7 +219,9 @@ class OpsSafetyService:
             "cancelled_orders": 0,
             "cancel_failures": [],
             "flattened_positions": 0,
+            "flatten_pending": [],
             "flatten_failures": [],
+            "recovery_failures": [],
             "already_flat": False,
             "drain_timeout": False,
         }
@@ -139,6 +238,7 @@ class OpsSafetyService:
                 event_subtype="kill_switch_pending",
             )
             self._log_drain_timeout()
+            return result, True
 
         orders, positions = self._mitigate_visible_state(result)
 
@@ -146,7 +246,9 @@ class OpsSafetyService:
             not orders
             and not positions
             and not result["cancel_failures"]
+            and not result["flatten_pending"]
             and not result["flatten_failures"]
+            and not result["recovery_failures"]
         )
         if drained:
             self._write_event_best_effort(actor=actor, reason=reason, result=result)
@@ -234,7 +336,16 @@ class OpsSafetyService:
                     side,
                     position.quantity,
                 )
-                if flattened_id is not None:
+                if isinstance(flattened_id, FlattenPending):
+                    result["flatten_pending"].append(
+                        {
+                            "strategy_id": strategy_id,
+                            "product_id": product_id,
+                            "order_id": flattened_id.order_id,
+                            "reason": flattened_id.reason,
+                        }
+                    )
+                elif flattened_id is not None:
                     result["flattened_positions"] += 1
                 else:
                     result["flatten_failures"].append(
