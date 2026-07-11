@@ -201,6 +201,17 @@ class FakeExchangePositionAdapter:
         return list(self._positions)
 
 
+class FailingEnumerationScopedPositionAdapter(FakeExchangePositionAdapter):
+    def __init__(self, scoped_result) -> None:
+        super().__init__(error=RuntimeError("exchange enumeration unavailable"))
+        self._scoped_result = scoped_result
+
+    def get_position(self, product_id: str) -> Position | None:
+        if isinstance(self._scoped_result, Exception):
+            raise self._scoped_result
+        return self._scoped_result
+
+
 # =============================================================================
 # A. OpsSafetyService.kill_switch tests
 # =============================================================================
@@ -278,6 +289,30 @@ class TestKillSwitchIdempotency:
         assert result["already_flat"] is False
         assert result["flattened_positions"] == 0
         assert not any(call[0] == "flatten_position" for call in engine.calls)
+        assert any(
+            "exchange_positions_unavailable" in failure["reason"]
+            for failure in result["flatten_failures"]
+        )
+
+    @pytest.mark.parametrize(
+        ("scoped_result", "expected_flattened"),
+        [
+            (_make_position(strategy_id="LIVE", quantity=Decimal("0.5")), 1),
+            (None, 0),
+            (RuntimeError("scoped lookup unavailable"), 0),
+        ],
+        ids=["position", "flat", "error"],
+    )
+    def test_exchange_enumeration_failure_uses_authoritative_scoped_lookup(
+        self, scoped_result, expected_flattened
+    ):
+        local_position = _make_position(quantity=Decimal("0.75"))
+        service, engine, _ = _make_service(positions=[local_position])
+        engine.adapter = FailingEnumerationScopedPositionAdapter(scoped_result)
+
+        result = service.kill_switch(actor="ops", reason="degraded_exchange")
+
+        assert result["flattened_positions"] == expected_flattened
         assert any(
             "exchange_positions_unavailable" in failure["reason"]
             for failure in result["flatten_failures"]
@@ -588,13 +623,13 @@ class TestKillSwitchFlattenPositions:
 
         assert result["flattened_positions"] == 1
 
-    def test_flatten_uses_position_entry_price_as_reference_price(self):
+    def test_flatten_does_not_use_position_entry_price_as_reference_price(self):
         pos = _make_position(quantity=Decimal("0.75"))
         service, engine, _ = _make_service(positions=[pos])
 
         service.kill_switch(actor="ops")
 
-        assert engine.flatten_reference_prices == [pos.entry_price]
+        assert engine.flatten_reference_prices == [None]
 
 
 # =============================================================================
@@ -966,6 +1001,7 @@ class TestEngineKillSwitchCommand:
         )
 
         mock_ops_safety.kill_switch.assert_called_once_with(actor="ops", reason="drill")
+        engine.redis_client.set.assert_any_call("system:state", "LOCKDOWN")
 
     def test_kill_switch_default_actor_when_not_provided(self, engine_factory):
         """When actor absent, default to 'operator'."""
@@ -980,6 +1016,41 @@ class TestEngineKillSwitchCommand:
         engine._handle_command({"command": "KILL_SWITCH", "params": {}})
 
         mock_ops_safety.kill_switch.assert_called_once_with(actor="operator", reason=None)
+
+    def test_kill_switch_stays_halted_when_persistence_fails(self, engine_factory):
+        engine = engine_factory()
+        engine.redis_client.set.side_effect = RuntimeError("redis unavailable")
+        engine.ops_safety.kill_switch = MagicMock(return_value={})
+
+        engine._handle_command({"command": "KILL_SWITCH", "params": {}})
+
+        assert engine._kill_switch_halted is True
+        assert engine.execution_engine._submissions_halted is True
+        engine.ops_safety.kill_switch.assert_called_once()
+
+    def test_clear_kill_switch_persists_before_resuming(self, engine_factory):
+        engine = engine_factory()
+        engine._kill_switch_halted = True
+        engine.execution_engine._submissions_halted = True
+
+        engine._handle_command({"command": "CLEAR_KILL_SWITCH", "params": {}})
+
+        engine.redis_client.set.assert_any_call("system:state", "OK")
+        assert engine._kill_switch_halted is False
+        assert engine.execution_engine._submissions_halted is False
+
+    def test_clear_kill_switch_does_not_resume_when_persistence_fails(
+        self, engine_factory
+    ):
+        engine = engine_factory()
+        engine._kill_switch_halted = True
+        engine.execution_engine._submissions_halted = True
+        engine.redis_client.set.side_effect = RuntimeError("redis unavailable")
+
+        engine._handle_command({"command": "CLEAR_KILL_SWITCH", "params": {}})
+
+        assert engine._kill_switch_halted is True
+        assert engine.execution_engine._submissions_halted is True
 
     def test_unknown_command_delegated_to_command_router(self, engine_factory):
         """Regression: unknown commands must still reach _command_router.handle()."""
@@ -1442,6 +1513,27 @@ class TestSubmissionDrainGate:
         assert audit_events[1][1]["flattened_positions"] == 1
         assert audit_events[1][1]["drain_timeout"] is True
 
+    def test_pending_audit_failure_does_not_block_timeout_mitigation(self):
+        order = _make_order("known-order", OrderStatus.SUBMITTED.value)
+        eng = SequencedDrainEngine([False], orders=[order])
+        service = OpsSafetyService(
+            eng,
+            FakeAccountService(positions=[_make_position()]),
+            _make_null_db_session_factory(),
+            drain_timeout=0.1,
+        )
+
+        with patch.object(
+            service,
+            "_write_event",
+            side_effect=RuntimeError("database unavailable"),
+        ):
+            result = service.kill_switch(actor="ops")
+
+        assert result["drain_timeout"] is True
+        assert result["cancelled_orders"] == 1
+        assert result["flattened_positions"] == 1
+
     def test_retry_after_timeout_catches_late_order_before_success(self):
         """A converged retry runs a second pass that catches the late submission."""
         late_order = _make_order("late-order", OrderStatus.SUBMITTED.value)
@@ -1510,18 +1602,22 @@ class TestSubmissionDrainGate:
         second.join(timeout=1.0)
         assert account.calls == 2
 
-    def test_kill_switch_lock_releases_after_exception(self):
-        service, _, _ = _make_service()
+    def test_audit_failure_does_not_block_emergency_mitigation(self):
+        order = _make_order("open-order", OrderStatus.SUBMITTED.value)
+        service, engine, _ = _make_service(
+            orders=[order],
+            positions=[_make_position()],
+        )
         with patch.object(
             service,
             "_write_event",
-            side_effect=[RuntimeError("audit failed"), None],
+            side_effect=RuntimeError("audit failed"),
         ):
-            with pytest.raises(RuntimeError, match="audit failed"):
-                service.kill_switch(actor="first")
-            result = service.kill_switch(actor="second")
+            result = service.kill_switch(actor="ops")
 
-        assert result["already_flat"] is True
+        assert result["cancelled_orders"] == 1
+        assert result["flattened_positions"] == 1
+        assert ("cancel_order", "open-order") in engine.calls
 
     def test_gated_conditional_placement_after_halt_returns_halted_failure(self):
         """_place_pending_conditional_orders_for_entry must report kill_switch_halted after halt."""

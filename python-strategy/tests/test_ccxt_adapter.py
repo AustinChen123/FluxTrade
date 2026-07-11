@@ -666,6 +666,70 @@ class TestPlaceOrder:
 
         mock_ccxt_client.create_order.assert_not_called()
 
+    @pytest.mark.parametrize(
+        ("side", "ticker", "expected_reference"),
+        [
+            ("sell", {"bid": 12000, "ask": 12010, "last": 12005}, Decimal("12000")),
+            ("buy", {"bid": 12000, "ask": 12010, "last": 12005}, Decimal("12010")),
+            ("sell", {"bid": None, "last": 12005}, Decimal("12005")),
+        ],
+        ids=["sell-bid", "buy-ask", "missing-side-last"],
+    )
+    def test_reduce_only_market_order_uses_current_ticker_reference(
+        self, adapter, mock_ccxt_client, side, ticker, expected_reference
+    ):
+        mock_ccxt_client.load_markets.return_value = {
+            "BTC/USDT:USDT": {
+                "info": {
+                    "filters": [
+                        {"filterType": "LOT_SIZE", "stepSize": "0.001"},
+                        {"filterType": "MIN_NOTIONAL", "minNotional": "10"},
+                    ],
+                },
+            },
+        }
+        mock_ccxt_client.fetch_ticker.return_value = ticker
+        mock_ccxt_client.create_order.return_value = {"id": "EX-FLATTEN"}
+        order = _make_order(
+            type="market",
+            side=side,
+            quantity=Decimal("0.001"),
+            price=None,
+        )
+        order.intent_payload = {"reduce_only": True, "source": "kill_switch"}
+
+        adapter.place_order(order)
+
+        assert order.min_notional_reference_price == expected_reference
+        mock_ccxt_client.fetch_ticker.assert_called_once_with("BTC/USDT:USDT")
+
+    def test_reduce_only_market_order_rejects_missing_current_price(
+        self, adapter, mock_ccxt_client
+    ):
+        mock_ccxt_client.load_markets.return_value = {
+            "BTC/USDT:USDT": {
+                "info": {
+                    "filters": [
+                        {"filterType": "LOT_SIZE", "stepSize": "0.001"},
+                        {"filterType": "MIN_NOTIONAL", "minNotional": "10"},
+                    ],
+                },
+            },
+        }
+        mock_ccxt_client.fetch_ticker.return_value = {}
+        order = _make_order(
+            type="market",
+            side="sell",
+            quantity=Decimal("0.001"),
+            price=None,
+        )
+        order.intent_payload = {"reduce_only": True, "source": "kill_switch"}
+
+        with pytest.raises(ExchangeError, match="market_reference_price_unavailable"):
+            adapter.place_order(order)
+
+        mock_ccxt_client.create_order.assert_not_called()
+
     def test_checks_market_min_notional_with_reference_price(
         self, adapter, mock_ccxt_client
     ):

@@ -566,10 +566,21 @@ class CcxtExchangeAdapter(IExchangeAdapter):
                 spec=spec,
             )
             notional_price = quantized.price or quantized.trigger_price
+            reference_price = getattr(order, "min_notional_reference_price", None)
+            if (
+                spec.min_notional is not None
+                and notional_price is None
+                and reference_price is None
+                and order.type.lower() == "market"
+                and isinstance(getattr(order, "intent_payload", None), dict)
+                and order.intent_payload.get("reduce_only") is True
+            ):
+                reference_price = self._market_order_reference_price(order)
+                order.min_notional_reference_price = reference_price
             validate_min_notional(
                 quantity=quantized.quantity,
                 price=notional_price,
-                reference_price=getattr(order, "min_notional_reference_price", None),
+                reference_price=reference_price,
                 spec=spec,
             )
         except ValueError as e:
@@ -587,6 +598,25 @@ class CcxtExchangeAdapter(IExchangeAdapter):
             order.quantity = quantized.quantity
             order.price = quantized.price
             order.trigger_price = quantized.trigger_price
+
+    def _market_order_reference_price(self, order: Order) -> Decimal:
+        ccxt_symbol = to_ccxt_symbol(order.product_id)
+        try:
+            ticker = self.client.fetch_ticker(ccxt_symbol)
+        except ccxt.BaseError as exc:
+            raise ExchangeError(
+                f"market_reference_price_unavailable: {exc}"
+            ) from exc
+
+        side = order.side.lower()
+        if side not in {"buy", "sell"}:
+            raise ExchangeError(f"market_reference_side_unsupported: side={order.side}")
+        value = ticker.get("ask" if side == "buy" else "bid") or ticker.get("last")
+        if value is None or Decimal(str(value)) <= 0:
+            raise ExchangeError(
+                f"market_reference_price_unavailable: symbol={ccxt_symbol} side={side}"
+            )
+        return Decimal(str(value))
 
     def cancel_order(
         self,

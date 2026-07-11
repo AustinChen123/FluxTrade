@@ -22,7 +22,7 @@ from src.core.interfaces import IExchangeAdapter, IOrderRepository
 from src.core.daily_nav_snapshot import DailyNavSnapshotService
 from src.core.strategy_loader import StrategyLoader
 from src.core.data_provider import check_data_availability
-from src.core.adapters import create_adapter
+from src.core.adapters import CcxtExchangeAdapter, SimulatedAdapter, create_adapter
 from src.core.journal import StrategyJournal
 from src.core.redis_factory import create_redis_client
 from src.core.metrics import SIGNALS_TOTAL, ACTIVE_STRATEGIES, BALANCE_USDT
@@ -36,8 +36,22 @@ from src.core.strategy_state_manager import StrategyStateManager
 from src.core.audit_service import build_signal_audit, commit_signal_audit
 
 HOT_STRATEGIES_PATH = os.getenv('HOT_STRATEGIES_PATH', '/app/strategies_hot')
+SYSTEM_STATE_KEY = "system:state"
+SYSTEM_STATE_LOCKDOWN = "LOCKDOWN"
+SYSTEM_STATE_OK = "OK"
 
 logger = logging.getLogger(__name__)
+
+
+def _is_runtime_reconciliation_enabled(
+    adapter: IExchangeAdapter,
+    adapter_config: Optional[Dict],
+) -> bool:
+    if isinstance(adapter, SimulatedAdapter):
+        return False
+    if isinstance(adapter, CcxtExchangeAdapter):
+        return True
+    return bool(adapter_config and adapter_config.get("mode") == "live")
 
 
 class _EngineLifecycleAdapter:
@@ -104,8 +118,9 @@ class StrategyEngine:
                 raise
         else:
             logger.info("StrategyEngine: Using provided adapter %s", type(adapter).__name__)
-        self._runtime_reconciliation_enabled = (
-            effective_adapter_config.get("mode") == "live"
+        self._runtime_reconciliation_enabled = _is_runtime_reconciliation_enabled(
+            adapter,
+            adapter_config,
         )
 
         self.execution_engine = ExecutionEngine(
@@ -166,6 +181,10 @@ class StrategyEngine:
         """
         Runs startup checks and starts background services.
         """
+        # Start fail-closed so the command listener can accept a manual clear
+        # while startup waits on a persisted LOCKDOWN state.
+        self._halt_for_kill_switch()
+        self._start_command_listener()
         self._check_system_state()
         self._reconcile_balance()
         self._initialize_strategy_state_cache_on_startup()
@@ -174,7 +193,6 @@ class StrategyEngine:
         self._start_heartbeat()
         if self._runtime_reconciliation_enabled:
             self._start_runtime_reconciliation()
-        self._start_command_listener()
         
         # Initial scan to discover strategies
         self.scan_strategies()
@@ -237,11 +255,20 @@ class StrategyEngine:
             elif cmd == "TEST_RUN":
                 self.test_run_strategy(params.get("id"), params.get("days", 1))
             elif cmd == "KILL_SWITCH":
-                self._kill_switch_halted = True
+                self._halt_for_kill_switch()
+                try:
+                    self.redis_client.set(SYSTEM_STATE_KEY, SYSTEM_STATE_LOCKDOWN)
+                except Exception:
+                    logger.exception(
+                        "Failed to persist kill switch state; local halt remains active"
+                    )
                 self.ops_safety.kill_switch(
                     actor=params.get("actor", "operator"),
                     reason=params.get("reason"),
                 )
+            elif cmd == "CLEAR_KILL_SWITCH":
+                self.redis_client.set(SYSTEM_STATE_KEY, SYSTEM_STATE_OK)
+                self._resume_after_kill_switch()
             else:
                 result = self._command_router.handle(data)
                 if result.success:
@@ -578,16 +605,28 @@ class StrategyEngine:
         logger.info("🔍 Checking System State...")
         while True:
             try:
-                state = self.redis_client.get("system:state")
-                if state == "LOCKDOWN":
+                state = self.redis_client.get(SYSTEM_STATE_KEY)
+                if isinstance(state, bytes):
+                    state = state.decode("utf-8")
+                if state == SYSTEM_STATE_LOCKDOWN:
+                    self._halt_for_kill_switch()
                     logger.warning("⚠️ SYSTEM LOCKED (LOCKDOWN). Waiting for manual resume...")
                     time.sleep(5)
                 else:
+                    self._resume_after_kill_switch()
                     logger.info("✅ System State: %s. Proceeding.", state or 'OK')
                     break
             except Exception as e:
                 logger.error("❌ Error checking system state: %s. Retrying...", e)
                 time.sleep(2)
+
+    def _halt_for_kill_switch(self) -> None:
+        self._kill_switch_halted = True
+        self.execution_engine.halt_and_drain(timeout=0)
+
+    def _resume_after_kill_switch(self) -> None:
+        self.execution_engine.resume_submissions()
+        self._kill_switch_halted = False
 
     def _start_heartbeat(self):
         """

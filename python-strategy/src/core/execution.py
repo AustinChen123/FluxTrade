@@ -478,6 +478,11 @@ class ExecutionEngine:
                 return
         callback()
 
+    def resume_submissions(self) -> None:
+        with self._submission_gate:
+            self._submissions_halted = False
+            self._submission_gate.notify_all()
+
     def _finish_submission(self) -> None:
         callbacks: list[Callable[[], None]] = []
         with self._submission_gate:

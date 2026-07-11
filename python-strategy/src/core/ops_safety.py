@@ -112,8 +112,8 @@ class OpsSafetyService:
         Failure isolation: a failure on one order/position is recorded and
         processing continues for the rest.
 
-        Audit: ONE system_event(event_type="ops", event_subtype="kill_switch")
-        is written ALWAYS — even when cancellations or flattens fail.
+        Audit: a system_event(event_type="ops", event_subtype="kill_switch")
+        is always attempted. Audit failures never block emergency mitigation.
 
         Idempotency: no open orders and no positions → already_flat=True with
         zero counts; audit event is still written.
@@ -132,7 +132,7 @@ class OpsSafetyService:
         drained = not callable(halt_and_drain) or halt_and_drain(self._drain_timeout)
         if not drained:
             result["drain_timeout"] = True
-            self._write_event(
+            self._write_event_best_effort(
                 actor=actor,
                 reason=reason,
                 result=result,
@@ -149,7 +149,7 @@ class OpsSafetyService:
             and not result["flatten_failures"]
         )
         if drained:
-            self._write_event(actor=actor, reason=reason, result=result)
+            self._write_event_best_effort(actor=actor, reason=reason, result=result)
         return result, not drained
 
     def _recover_after_submission_drain(self) -> None:
@@ -228,23 +228,12 @@ class OpsSafetyService:
             product_id = position.product_id
             side = getattr(position.side, "value", position.side)
             try:
-                try:
-                    flattened_id = self._execution_engine.flatten_position(
-                        strategy_id,
-                        product_id,
-                        side,
-                        position.quantity,
-                        reference_price=getattr(position, "entry_price", None),
-                    )
-                except TypeError as exc:
-                    if "reference_price" not in str(exc):
-                        raise
-                    flattened_id = self._execution_engine.flatten_position(
-                        strategy_id,
-                        product_id,
-                        side,
-                        position.quantity,
-                    )
+                flattened_id = self._execution_engine.flatten_position(
+                    strategy_id,
+                    product_id,
+                    side,
+                    position.quantity,
+                )
                 if flattened_id is not None:
                     result["flattened_positions"] += 1
                 else:
@@ -333,6 +322,40 @@ class OpsSafetyService:
 
         if adapter_errors:
             exchange_reason = "; ".join(str(error) for error in adapter_errors)
+            get_position = getattr(adapter, "get_position", None)
+            if local_positions and callable(get_position):
+                exchange_positions = []
+                scoped_errors = []
+                scoped_succeeded = False
+                for product_id in dict.fromkeys(
+                    position.product_id for position in local_positions
+                ):
+                    try:
+                        position = get_position(product_id)
+                    except Exception as exc:
+                        scoped_errors.append(f"{product_id}: {exc}")
+                        continue
+                    scoped_succeeded = True
+                    if position is not None:
+                        exchange_positions.append(position)
+
+                if scoped_succeeded:
+                    degraded_reason = (
+                        f"exchange_positions_unavailable: {exchange_reason}"
+                    )
+                    if scoped_errors:
+                        degraded_reason += (
+                            "; scoped_positions_unavailable: "
+                            + "; ".join(scoped_errors)
+                        )
+                    return (
+                        self._assign_local_position_owners(
+                            exchange_positions,
+                            local_positions,
+                        ),
+                        degraded_reason,
+                    )
+
             local_reason = (
                 f"local_positions_unavailable: {local_error}; "
                 if local_error is not None
@@ -393,3 +416,13 @@ class OpsSafetyService:
             commit = getattr(session, "commit", None)
             if callable(commit):
                 commit()
+
+    def _write_event_best_effort(self, **kwargs: Any) -> bool:
+        try:
+            self._write_event(**kwargs)
+        except Exception:
+            self._logger.exception(
+                "Kill switch audit write failed; emergency mitigation continues"
+            )
+            return False
+        return True

@@ -20,7 +20,9 @@ import pytest
 from src.core.models import Candlestick, Position, PositionSide, Signal, SignalType, StrategyStatus
 from src.core.orm_models import Candlestick as ORMCandlestick, StrategyState
 from src.core.daily_nav_snapshot import DailyNavSnapshotService
-from src.core.engine import StrategyEngine
+from src.core.adapters.ccxt_adapter import CcxtExchangeAdapter
+from src.core.adapters.simulated import SimulatedAdapter
+from src.core.engine import StrategyEngine, _is_runtime_reconciliation_enabled
 from src.core.strategy_state_manager import StrategyStateManager
 
 
@@ -64,6 +66,22 @@ def _make_candle(
 
 
 class TestEngineInit:
+
+    @pytest.mark.parametrize(
+        ("adapter", "adapter_config", "expected"),
+        [
+            (object.__new__(SimulatedAdapter), None, False),
+            (object.__new__(CcxtExchangeAdapter), None, True),
+            (object.__new__(SimulatedAdapter), {"mode": "live"}, False),
+            (object.__new__(CcxtExchangeAdapter), {"mode": "simulated"}, True),
+            (MagicMock(), {"mode": "live"}, True),
+            (MagicMock(), None, False),
+        ],
+    )
+    def test_runtime_reconciliation_mode_uses_actual_adapter(
+        self, adapter, adapter_config, expected
+    ):
+        assert _is_runtime_reconciliation_enabled(adapter, adapter_config) is expected
 
     def test_default_adapter_simulated(self, mock_db_session, mock_clock):
         """When no adapter_config, should default to simulated mode."""
@@ -1523,6 +1541,52 @@ class TestRestoreActiveStrategiesMatrix:
 
         # B → activate_strategy was reached
         assert "test.py::StratB" in activate_calls
+
+
+class TestPersistentKillSwitchState:
+    def test_startup_opens_command_listener_before_waiting_on_persisted_state(
+        self, engine
+    ):
+        calls = []
+        engine._start_command_listener = MagicMock(
+            side_effect=lambda: calls.append("listener")
+        )
+        engine._check_system_state = MagicMock(
+            side_effect=lambda: calls.append("state")
+        )
+        for name in (
+            "_reconcile_balance",
+            "_initialize_strategy_state_cache_on_startup",
+            "_start_strategy_state_subscriber_on_startup",
+            "_reconcile_recoverable_orders_on_startup",
+            "_start_heartbeat",
+            "scan_strategies",
+            "_restore_active_strategies_on_startup",
+        ):
+            setattr(engine, name, MagicMock())
+
+        engine.startup()
+
+        assert calls == ["listener", "state"]
+
+    def test_startup_waits_halted_until_operator_clears_lockdown(self, engine):
+        states = iter(["LOCKDOWN", "OK"])
+
+        def next_state(_key):
+            state = next(states)
+            if state == "OK":
+                assert engine._kill_switch_halted is True
+                assert engine.execution_engine._submissions_halted is True
+            return state
+
+        engine.redis_client.get.side_effect = next_state
+
+        with patch("src.core.engine.time.sleep"):
+            engine._check_system_state()
+
+        assert engine.redis_client.get.call_count == 2
+        assert engine._kill_switch_halted is False
+        assert engine.execution_engine._submissions_halted is False
 
 
 class TestRuntimeReconciliationThread:
