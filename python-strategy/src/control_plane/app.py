@@ -147,6 +147,11 @@ class ControlPlaneApp:
                 return HttpResponse(404, {"error": "job_not_found"})
             return HttpResponse(200, {"job": self._job_payload(job)})
 
+        if method == "POST" and clean_path == "/ops/kill-switch/clear":
+            return self._publish_ops_command(
+                {"command": "CLEAR_KILL_SWITCH", "params": {"actor": "operator"}}
+            )
+
         if method == "POST" and clean_path == "/ops/kill-switch":
             return self._handle_kill_switch(body)
 
@@ -326,8 +331,6 @@ class ControlPlaneApp:
         - Publish JSON-encoded command to "cmd:strategy:control".
         - Return HttpResponse(202, {"status": "accepted"}).
         """
-        if self.redis_client is None:
-            return HttpResponse(503, {"error": "redis_unavailable"})
         try:
             payload = self._parse_json_body(body)
         except json.JSONDecodeError as exc:
@@ -335,6 +338,8 @@ class ControlPlaneApp:
         except ValueError as exc:
             return HttpResponse(400, {"error": "invalid_json", "detail": str(exc)})
         reason = payload.get("reason")
+        if reason is not None and not isinstance(reason, str):
+            return HttpResponse(422, {"error": "validation_error"})
         command = {
             "command": "KILL_SWITCH",
             "params": {
@@ -342,6 +347,11 @@ class ControlPlaneApp:
                 "reason": reason,
             },
         }
+        return self._publish_ops_command(command)
+
+    def _publish_ops_command(self, command: dict[str, Any]) -> HttpResponse:
+        if self.redis_client is None:
+            return HttpResponse(503, {"error": "redis_unavailable"})
         try:
             subscribers = self.redis_client.publish(
                 "cmd:strategy:control",

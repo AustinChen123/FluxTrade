@@ -1622,6 +1622,65 @@ def test_kill_switch_reason_forwarded_in_publish():
     assert published["params"].get("reason") == "eod_risk_drill"
 
 
+def test_clear_kill_switch_returns_202_and_publishes_manual_release():
+    from unittest.mock import MagicMock
+
+    redis = MagicMock()
+    redis.publish.return_value = 1
+    app = _kill_switch_app(redis_client=redis)
+
+    response = app.handle(
+        "POST",
+        "/ops/kill-switch/clear",
+        headers={"x-api-key": "secret"},
+    )
+
+    assert response.status_code == 202
+    _, raw_payload = redis.publish.call_args.args
+    assert json.loads(raw_payload) == {
+        "command": "CLEAR_KILL_SWITCH",
+        "params": {"actor": "operator"},
+    }
+
+
+@pytest.mark.parametrize("payload", [[], None, "reason", 1, True])
+def test_kill_switch_rejects_non_object_json(payload):
+    from unittest.mock import MagicMock
+
+    redis = MagicMock()
+    app = _kill_switch_app(redis_client=redis)
+
+    response = app.handle(
+        "POST",
+        "/ops/kill-switch",
+        body=json.dumps(payload),
+        headers={"x-api-key": "secret"},
+    )
+
+    assert response.status_code == 400
+    assert response.body["error"] == "invalid_json"
+    redis.publish.assert_not_called()
+
+
+@pytest.mark.parametrize("reason", [[], {}, 1, True])
+def test_kill_switch_rejects_non_string_reason(reason):
+    from unittest.mock import MagicMock
+
+    redis = MagicMock()
+    app = _kill_switch_app(redis_client=redis)
+
+    response = app.handle(
+        "POST",
+        "/ops/kill-switch",
+        body=json.dumps({"reason": reason}),
+        headers={"x-api-key": "secret"},
+    )
+
+    assert response.status_code == 422
+    assert response.body == {"error": "validation_error"}
+    redis.publish.assert_not_called()
+
+
 def test_kill_switch_publish_failure_returns_503():
     from unittest.mock import MagicMock
 
