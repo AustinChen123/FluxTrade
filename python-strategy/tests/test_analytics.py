@@ -92,6 +92,25 @@ class TestBasicMetrics:
         assert result["total_pnl"] == Decimal("1.00")
         assert result["win_rate"] == 1.0
 
+    @pytest.mark.parametrize("side", ["long", "short"])
+    def test_mnq_contract_multiplier_applies_to_pnl(self, side):
+        exit_price = 110.0 if side == "long" else 90.0
+        result = calculate_metrics(
+            _round_trip(100.0, exit_price, qty=1.0, side=side),
+            contract_multiplier=Decimal("2"),
+        )
+
+        assert result["total_pnl"] == Decimal("20.0")
+        assert result["closed_trades"][0].pnl == Decimal("20.0")
+
+    @pytest.mark.parametrize("multiplier", [Decimal("0"), Decimal("-1")])
+    def test_non_positive_contract_multiplier_is_rejected(self, multiplier):
+        with pytest.raises(ValueError, match="contract_multiplier must be positive"):
+            calculate_metrics(
+                _round_trip(100.0, 110.0),
+                contract_multiplier=multiplier,
+            )
+
     def test_mixed_trades(self):
         trades = (
             _round_trip(100.0, 120.0, entry_ts=1000, exit_ts=2000)

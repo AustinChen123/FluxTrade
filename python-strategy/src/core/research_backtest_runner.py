@@ -24,6 +24,11 @@ from src.core.interfaces.data_source import IDataSource
 from src.core.models import Candlestick, OrderSide, Signal, SignalType
 from src.core.orm_models import Order
 from src.core.precision import PrecisionCodec
+from src.core.product_registry import (
+    InstrumentSpec,
+    calculate_required_capital,
+    resolve_contract_multiplier,
+)
 from src.core.strategy_context import RejectionSnapshot, StrategyContext
 from src.strategies.base import BaseStrategy
 
@@ -71,6 +76,7 @@ class ResearchBacktestRunner:
         precision_codec: PrecisionCodec | None = None,
         prepared_scaled_candles: Sequence[Any] | None = None,
         capital_allocator: CapitalAllocator | None = None,
+        instrument_spec: InstrumentSpec | None = None,
     ):
         self.start_time = start_time
         self.end_time = end_time
@@ -84,6 +90,8 @@ class ResearchBacktestRunner:
         self.precision_codec = precision_codec
         self.prepared_scaled_candles = prepared_scaled_candles
         self.capital_allocator = capital_allocator
+        self.instrument_spec = instrument_spec
+        self.contract_multiplier = resolve_contract_multiplier(instrument_spec)
         self._reserved_entry_capital: dict[str, tuple[str, Decimal]] = {}
         self._latest_rejections: dict[str, tuple[RejectionSnapshot, ...]] = {}
         self.clock = BacktestClock(start_time=start_time / 1000)
@@ -104,6 +112,7 @@ class ResearchBacktestRunner:
             maker_fee=Decimal(str(self.fee_config.get("maker", 0))),
             taker_fee=Decimal(str(self.fee_config.get("taker", 0))),
             precision_codec=self.precision_codec,
+            instrument_spec=self.instrument_spec,
         )
         self._ensure_capital_allocator_supported(adapter)
         trades: list[ResearchTrade] = []
@@ -174,7 +183,11 @@ class ResearchBacktestRunner:
 
         final_balance = adapter.get_balance()
         total_pnl = final_balance - Decimal(str(self.initial_balance))
-        metrics = calculate_metrics(trades, initial_balance=self.initial_balance)
+        metrics = calculate_metrics(
+            trades,
+            initial_balance=self.initial_balance,
+            contract_multiplier=self.contract_multiplier,
+        )
         bar_max_drawdown = max(
             max_drawdown_by_strategy.values(),
             default=Decimal("0"),
@@ -335,7 +348,11 @@ class ResearchBacktestRunner:
             if adapter.supports_strategy_positions:
                 position = adapter.get_position(candle.product_id, strategy_id=strategy.strategy_id)
                 if position is not None:
-                    used = abs(position.quantity) * candle.close
+                    used = calculate_required_capital(
+                        position.quantity,
+                        candle.close,
+                        self.instrument_spec,
+                    )
             used += sum(
                 reserved
                 for strategy_id, reserved in self._reserved_entry_capital.values()
@@ -510,7 +527,7 @@ class ResearchBacktestRunner:
     def _entry_required_capital(self, signal: Signal, candle: Candlestick) -> Decimal:
         quantity = signal.quantity if signal.quantity and signal.quantity > 0 else Decimal("0.01")
         price = self._signal_execution_price(signal, candle)
-        return abs(quantity * price)
+        return calculate_required_capital(quantity, price, self.instrument_spec)
 
     @staticmethod
     def _signal_execution_price(signal: Signal, candle: Candlestick) -> Decimal:

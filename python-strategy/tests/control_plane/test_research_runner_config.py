@@ -33,6 +33,7 @@ class _RecordingRunner:
 
     def __init__(self, *args, capital_allocator=None, **kwargs):
         self.capital_allocator = capital_allocator
+        self.kwargs = kwargs
         self.strategies = []
         _RecordingRunner.instances.append(self)
 
@@ -140,6 +141,30 @@ def test_research_parameter_search_creates_isolated_capital_allocators(
     assert first_allocator.get_allocation("golden_cross_b") == Decimal("0")
     assert second_allocator.get_allocation("golden_cross_a") == Decimal("0")
     assert second_allocator.get_allocation("golden_cross_b") == Decimal("100")
+
+
+def test_research_parameter_search_propagates_instrument_spec(tmp_path, monkeypatch):
+    monkeypatch.setattr(parameter_search, "ResearchBacktestRunner", _RecordingRunner)
+    _RecordingRunner.instances = []
+    payload = _request_payload(tmp_path)
+    payload["backtest"]["instrument"] = {
+        "multiplier": "2",
+        "fee_model": "per_contract",
+        "capital_model": "per_contract",
+        "capital_per_contract": "2500",
+    }
+    request = ParameterSearchJobRequest.model_validate(payload)
+
+    ResearchBacktestParameterEvaluator(
+        _strategy_factory,
+        preload_candles=False,
+    ).evaluate(request, ParameterCandidate(candidate_id="a", param_pack={}))
+
+    spec = _RecordingRunner.instances[0].kwargs["instrument_spec"]
+    assert spec.multiplier == Decimal("2")
+    assert spec.fee_model.value == "per_contract"
+    assert spec.capital_model.value == "per_contract"
+    assert spec.capital_per_contract == Decimal("2500")
 
 
 def test_research_parameter_search_isolates_capital_allocators_per_dataset(
@@ -279,3 +304,50 @@ def test_fast_fitness_evaluator_rejects_research_runner_config(tmp_path):
                 param_pack={"short_window": 1, "long_window": 2},
             ),
         )
+
+
+def test_fast_fitness_propagates_instrument_spec(tmp_path):
+    payload = _request_payload(tmp_path)
+    payload.pop("research_runner")
+    payload["backtest"]["instrument"] = {
+        "multiplier": "2",
+        "fee_model": "per_contract",
+        "capital_model": "per_contract",
+        "capital_per_contract": "2500",
+    }
+    candle_path = tmp_path / "candles.csv"
+    candle_path.write_text(
+        "timestamp,open,high,low,close,volume\n"
+        "1700000000000,100,101,99,100,10\n"
+        "1700000060000,101,102,100,101,10\n"
+    )
+    request = ParameterSearchJobRequest.model_validate(payload)
+
+    evaluator = GoldenCrossFastFitnessParameterEvaluator()._evaluator_for(request)
+
+    assert evaluator.contract_multiplier == 2.0
+    assert evaluator.fee_model.value == "per_contract"
+
+
+def test_fast_fitness_cache_separates_instrument_accounting(tmp_path):
+    payload = _request_payload(tmp_path)
+    payload.pop("research_runner")
+    candle_path = tmp_path / "candles.csv"
+    candle_path.write_text(
+        "timestamp,open,high,low,close,volume\n"
+        "1700000000000,100,101,99,100,10\n"
+        "1700000060000,101,102,100,101,10\n"
+    )
+    evaluator = GoldenCrossFastFitnessParameterEvaluator()
+    first = evaluator._evaluator_for(ParameterSearchJobRequest.model_validate(payload))
+    payload["backtest"]["instrument"] = {
+        "multiplier": "2",
+        "fee_model": "per_contract",
+        "capital_model": "per_contract",
+        "capital_per_contract": "2500",
+    }
+    second = evaluator._evaluator_for(ParameterSearchJobRequest.model_validate(payload))
+
+    assert first is not second
+    assert first.contract_multiplier == 1.0
+    assert second.contract_multiplier == 2.0

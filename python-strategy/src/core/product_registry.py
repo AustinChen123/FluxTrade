@@ -70,8 +70,20 @@ class InstrumentSpec:
     min_quantity: Decimal | None = None
     multiplier: Decimal | None = None
     tick_value: Decimal | None = None
-    fee_model: str | None = None
+    fee_model: "FeeModel | None" = None
+    capital_model: "CapitalModel | None" = None
+    capital_per_contract: Decimal | None = None
     session_calendar_id: str | None = None
+
+
+def resolve_contract_multiplier(spec: InstrumentSpec | None) -> Decimal:
+    """Return the authoritative positive contract multiplier for an instrument."""
+    multiplier = spec.multiplier if spec is not None else None
+    if multiplier is None:
+        return Decimal("1")
+    if multiplier <= 0:
+        raise ValueError("instrument multiplier must be positive")
+    return multiplier
 
 
 @dataclass(frozen=True)
@@ -88,6 +100,37 @@ class PrecisionMode(str, Enum):
     DECIMAL_PLACES = "decimal_places"
     SIGNIFICANT_DIGITS = "significant_digits"
     TICK_SIZE = "tick_size"
+
+
+class FeeModel(str, Enum):
+    PERCENTAGE_NOTIONAL = "percentage_notional"
+    PER_CONTRACT = "per_contract"
+
+
+class CapitalModel(str, Enum):
+    NOTIONAL = "notional"
+    PER_CONTRACT = "per_contract"
+
+
+def resolve_fee_model(spec: InstrumentSpec | None) -> FeeModel:
+    if spec is None or spec.fee_model is None:
+        return FeeModel.PERCENTAGE_NOTIONAL
+    return FeeModel(spec.fee_model)
+
+
+def calculate_required_capital(
+    quantity: Decimal,
+    price: Decimal,
+    spec: InstrumentSpec | None,
+) -> Decimal:
+    """Calculate non-negative capital usage from one explicit instrument model."""
+    model = CapitalModel(spec.capital_model) if spec and spec.capital_model else CapitalModel.NOTIONAL
+    if model == CapitalModel.PER_CONTRACT:
+        capital_per_contract = spec.capital_per_contract if spec else None
+        if capital_per_contract is None or capital_per_contract <= 0:
+            raise ValueError("capital_per_contract must be positive for per_contract capital")
+        return abs(quantity) * capital_per_contract
+    return abs(quantity * price * resolve_contract_multiplier(spec))
 
 
 class TriggerPricePolicy(str, Enum):

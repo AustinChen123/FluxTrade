@@ -19,6 +19,12 @@ from src.core.adapters.simulated import SimulatedAdapter
 from src.core.mocks.account_service import BacktestAccountService
 from src.core.journal import StrategyJournal
 from src.core.models import PositionSide
+from src.core.product_registry import (
+    FeeModel,
+    InstrumentSpec,
+    resolve_contract_multiplier,
+    resolve_fee_model,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -81,6 +87,7 @@ def _write_markdown_report(
     start_time: int,
     end_time: int,
     fee_config: Dict,
+    fee_model: FeeModel = FeeModel.PERCENTAGE_NOTIONAL,
     candle_count: int,
     path: Path,
 ) -> None:
@@ -100,8 +107,12 @@ def _write_markdown_report(
     lines.append(f"| End | {end_time} |")
     lines.append(f"| Candles | {candle_count} |")
     if fee_config:
-        lines.append(f"| Maker Fee | {fee_config.get('maker', 0):.4%} |")
-        lines.append(f"| Taker Fee | {fee_config.get('taker', 0):.4%} |")
+        if fee_model == FeeModel.PER_CONTRACT:
+            lines.append(f"| Maker Fee / Contract | {fee_config.get('maker', 0)} |")
+            lines.append(f"| Taker Fee / Contract | {fee_config.get('taker', 0)} |")
+        else:
+            lines.append(f"| Maker Fee | {fee_config.get('maker', 0):.4%} |")
+            lines.append(f"| Taker Fee | {fee_config.get('taker', 0):.4%} |")
     lines.append("")
 
     lines.append("## Performance Summary")
@@ -153,6 +164,7 @@ class BacktestRunner:
         fee_config: Optional[Dict[str, float]] = None,
         report_config: Optional[Dict] = None,
         db_session_factory: Optional[Callable[[], ContextManager[Session]]] = None,
+        instrument_spec: InstrumentSpec | None = None,
     ):
         self.start_time = start_time
         self.end_time = end_time
@@ -164,6 +176,9 @@ class BacktestRunner:
         self.fee_config = fee_config or {}
         self.report_config = {**DEFAULT_REPORT_CONFIG, **(report_config or {})}
         self._db_session_factory = db_session_factory or _sessionlocal_context
+        self.instrument_spec = instrument_spec
+        self.contract_multiplier = resolve_contract_multiplier(instrument_spec)
+        self.fee_model = resolve_fee_model(instrument_spec)
 
         self.clock = BacktestClock(start_time=start_time / 1000)
         self._strategies_buffer: List[BaseStrategy] = []
@@ -235,7 +250,11 @@ class BacktestRunner:
         position = mock_account.adapter.get_position(self.product_id)
         if position is None:
             return cash
-        return cash + _unrealized_pnl_at_mark(position, candle.close)
+        return cash + _unrealized_pnl_at_mark(
+            position,
+            candle.close,
+            self.contract_multiplier,
+        )
 
     def _export_reports(
         self,
@@ -277,6 +296,7 @@ class BacktestRunner:
                 start_time=self.start_time,
                 end_time=self.end_time,
                 fee_config=self.fee_config,
+                fee_model=self.fee_model,
                 candle_count=candle_count,
                 path=output_dir / "report.md",
             )
@@ -315,6 +335,7 @@ class BacktestRunner:
             initial_balance=Decimal(str(self.initial_balance)),
             maker_fee=Decimal(str(self.fee_config.get("maker", 0))),
             taker_fee=Decimal(str(self.fee_config.get("taker", 0))),
+            instrument_spec=self.instrument_spec,
         )
 
         # 4. Setup repo (trade recording only) and account service
@@ -381,6 +402,7 @@ class BacktestRunner:
             metrics = calculate_metrics(
                 trades,
                 initial_balance=self.initial_balance,
+                contract_multiplier=self.contract_multiplier,
             )
 
             # Per-strategy metrics
@@ -447,13 +469,26 @@ class BacktestRunner:
                 per_strategy[sid] = calculate_metrics(
                     strategy_trades,
                     initial_balance=self.initial_balance,
+                    contract_multiplier=self.contract_multiplier,
                 )
         return per_strategy
 
 
-def _unrealized_pnl_at_mark(position, mark_price: Decimal) -> Decimal:
+def _unrealized_pnl_at_mark(
+    position,
+    mark_price: Decimal,
+    contract_multiplier: Decimal = Decimal("1"),
+) -> Decimal:
     if position.side == PositionSide.LONG:
-        return (mark_price - position.entry_price) * position.quantity
+        return (
+            (mark_price - position.entry_price)
+            * position.quantity
+            * contract_multiplier
+        )
     if position.side == PositionSide.SHORT:
-        return (position.entry_price - mark_price) * position.quantity
+        return (
+            (position.entry_price - mark_price)
+            * position.quantity
+            * contract_multiplier
+        )
     return Decimal("0")

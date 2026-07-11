@@ -3,6 +3,24 @@ use rust_decimal::Decimal;
 use std::collections::HashMap;
 use std::str::FromStr;
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum FeeModel {
+    PercentageNotional,
+    PerContract,
+}
+
+impl FeeModel {
+    fn parse(value: &str) -> PyResult<Self> {
+        match value {
+            "percentage_notional" => Ok(Self::PercentageNotional),
+            "per_contract" => Ok(Self::PerContract),
+            _ => Err(pyo3::exceptions::PyValueError::new_err(format!(
+                "unsupported fee_model: {value}"
+            ))),
+        }
+    }
+}
+
 use crate::binding::models::{Candlestick, FillEvent, Order, Position};
 use crate::binding::scaled::ScaledCandlestick;
 
@@ -15,6 +33,8 @@ pub struct PyMatchingEngine {
     pub open_orders: Vec<Order>,
     maker_fee: Decimal,
     taker_fee: Decimal,
+    contract_multiplier: Decimal,
+    fee_model: FeeModel,
     scaled_price_tick: Option<Decimal>,
     scaled_volume_step: Option<Decimal>,
 }
@@ -22,14 +42,28 @@ pub struct PyMatchingEngine {
 #[pymethods]
 impl PyMatchingEngine {
     #[new]
-    #[pyo3(signature = (initial_balance, maker_fee="0".to_string(), taker_fee="0".to_string()))]
-    fn new(initial_balance: String, maker_fee: String, taker_fee: String) -> PyResult<Self> {
+    #[pyo3(signature = (initial_balance, maker_fee="0".to_string(), taker_fee="0".to_string(), contract_multiplier="1".to_string(), fee_model="percentage_notional".to_string()))]
+    fn new(
+        initial_balance: String,
+        maker_fee: String,
+        taker_fee: String,
+        contract_multiplier: String,
+        fee_model: String,
+    ) -> PyResult<Self> {
+        let contract_multiplier = parse_decimal(&contract_multiplier, "contract_multiplier")?;
+        if contract_multiplier <= Decimal::ZERO {
+            return Err(pyo3::exceptions::PyValueError::new_err(
+                "contract_multiplier must be positive",
+            ));
+        }
         Ok(PyMatchingEngine {
             balance: parse_decimal(&initial_balance, "initial_balance")?,
             positions: HashMap::new(),
             open_orders: Vec::new(),
             maker_fee: parse_decimal(&maker_fee, "maker_fee")?,
             taker_fee: parse_decimal(&taker_fee, "taker_fee")?,
+            contract_multiplier,
+            fee_model: FeeModel::parse(&fee_model)?,
             scaled_price_tick: None,
             scaled_volume_step: None,
         })
@@ -322,12 +356,15 @@ impl PyMatchingEngine {
     }
 
     fn calculate_fee(&self, price: Decimal, quantity: Decimal, is_taker: bool) -> Decimal {
-        let rate = if is_taker {
+        let fee = if is_taker {
             self.taker_fee
         } else {
             self.maker_fee
         };
-        price * quantity * rate
+        match self.fee_model {
+            FeeModel::PercentageNotional => price * quantity * self.contract_multiplier * fee,
+            FeeModel::PerContract => quantity * fee,
+        }
     }
 
     fn position_key(strategy_id: &str, product_id: &str) -> String {
@@ -373,7 +410,7 @@ impl PyMatchingEngine {
         } else {
             pos.entry_price - fill_price
         };
-        let realized_pnl = price_diff * close_qty;
+        let realized_pnl = price_diff * close_qty * self.contract_multiplier;
         self.balance += realized_pnl;
 
         let remaining = pos.quantity - close_qty;
@@ -404,7 +441,7 @@ impl PyMatchingEngine {
             } else {
                 pos.entry_price - fill_price
             };
-            let realized_pnl = price_diff * close_qty;
+            let realized_pnl = price_diff * close_qty * self.contract_multiplier;
             self.balance += realized_pnl;
 
             let remaining = pos.quantity - close_qty;
@@ -452,6 +489,8 @@ mod tests {
             open_orders: Vec::new(),
             maker_fee: dec!(0.0002),
             taker_fee: dec!(0.0006),
+            contract_multiplier: Decimal::ONE,
+            fee_model: FeeModel::PercentageNotional,
             scaled_price_tick: None,
             scaled_volume_step: None,
         }
@@ -603,6 +642,43 @@ mod tests {
         let expected_fee = dec!(50000) * dec!(1) * dec!(0.0006);
         assert_eq!(fills[0].fee, expected_fee);
         assert!(engine.balance < dec!(100000));
+    }
+
+    #[test]
+    fn test_percentage_fee_uses_contract_multiplier() {
+        let mut engine = make_engine(dec!(100000));
+        engine.contract_multiplier = dec!(2);
+        engine.maker_fee = dec!(0.001);
+        engine.taker_fee = dec!(0.002);
+
+        assert_eq!(engine.calculate_fee(dec!(100), dec!(3), false), dec!(0.6));
+        assert_eq!(engine.calculate_fee(dec!(100), dec!(3), true), dec!(1.2));
+    }
+
+    #[test]
+    fn test_per_contract_fee_ignores_price_and_multiplier() {
+        let mut engine = make_engine(dec!(100000));
+        engine.fee_model = FeeModel::PerContract;
+        engine.contract_multiplier = dec!(2);
+        engine.maker_fee = dec!(1.25);
+        engine.taker_fee = dec!(1.75);
+
+        assert_eq!(engine.calculate_fee(dec!(100), dec!(3), false), dec!(3.75));
+        assert_eq!(engine.calculate_fee(dec!(100), dec!(3), true), dec!(5.25));
+    }
+
+    #[test]
+    fn test_unknown_fee_model_is_rejected() {
+        let error = PyMatchingEngine::new(
+            "100000".to_string(),
+            "0".to_string(),
+            "0".to_string(),
+            "1".to_string(),
+            "unknown".to_string(),
+        )
+        .err()
+        .expect("unknown fee model must fail");
+        assert!(error.to_string().contains("unsupported fee_model"));
     }
 
     #[test]
@@ -1096,6 +1172,8 @@ mod tests {
             open_orders: Vec::new(),
             maker_fee: Decimal::ZERO,
             taker_fee: Decimal::ZERO,
+            contract_multiplier: Decimal::ONE,
+            fee_model: FeeModel::PercentageNotional,
             scaled_price_tick: None,
             scaled_volume_step: None,
         };
@@ -1108,6 +1186,53 @@ mod tests {
 
         assert_eq!(fills[0].fee, Decimal::ZERO);
         assert_eq!(engine.balance, dec!(100000));
+    }
+
+    #[test]
+    fn test_contract_multiplier_applies_to_conditional_close() {
+        let mut engine = make_engine(dec!(100000));
+        engine.maker_fee = Decimal::ZERO;
+        engine.taker_fee = Decimal::ZERO;
+        engine.contract_multiplier = dec!(2);
+        let mut position = make_position(PRODUCT, STRATEGY, "LONG", dec!(1), dec!(100));
+        let order = make_order("mnq_tp", "LONG", "TAKE_PROFIT", Decimal::ZERO, dec!(1));
+
+        engine.close_position(&mut position, &order, dec!(110));
+
+        assert_eq!(engine.balance, dec!(100020));
+    }
+
+    #[test]
+    fn test_contract_multiplier_applies_to_opposite_side_reduction() {
+        let mut engine = make_engine(dec!(100000));
+        engine.maker_fee = Decimal::ZERO;
+        engine.taker_fee = Decimal::ZERO;
+        engine.contract_multiplier = dec!(2);
+        let mut position = make_position(PRODUCT, STRATEGY, "SHORT", dec!(2), dec!(100));
+        let order = make_order("mnq_reduce", "LONG", "MARKET", Decimal::ZERO, dec!(1));
+
+        engine.apply_position_change(&mut position, &order, dec!(90));
+
+        assert_eq!(engine.balance, dec!(100020));
+        assert_eq!(position.quantity, dec!(1));
+    }
+
+    #[test]
+    fn test_non_positive_contract_multiplier_is_rejected() {
+        for multiplier in ["0", "-1"] {
+            let error = PyMatchingEngine::new(
+                "100000".to_string(),
+                "0".to_string(),
+                "0".to_string(),
+                multiplier.to_string(),
+                "percentage_notional".to_string(),
+            )
+            .err()
+            .expect("non-positive multiplier must fail");
+            assert!(error
+                .to_string()
+                .contains("contract_multiplier must be positive"));
+        }
     }
 
     // ── Multi-Strategy Position Isolation ──

@@ -17,6 +17,11 @@ import numpy as np
 from src.core.analytics import calculate_metrics
 from src.core.interfaces.data_source import IDataSource
 from src.core.models import Candlestick, OrderSide, SignalType
+from src.core.product_registry import (
+    InstrumentSpec,
+    resolve_contract_multiplier,
+    resolve_fee_model,
+)
 from src.core.research_backtest_runner import ResearchTrade
 from src.strategies.base import BaseStrategy
 
@@ -309,12 +314,15 @@ class FastBarReplayRunner:
         initial_balance: Decimal = Decimal("10000"),
         maker_fee: Decimal = Decimal("0"),
         taker_fee: Decimal = Decimal("0"),
+        instrument_spec: InstrumentSpec | None = None,
     ) -> None:
         self.tape = tape
         self.strategy = strategy
         self.initial_balance = Decimal(str(initial_balance))
         self.maker_fee = Decimal(str(maker_fee))
         self.taker_fee = Decimal(str(taker_fee))
+        self.contract_multiplier = resolve_contract_multiplier(instrument_spec)
+        self.fee_model = resolve_fee_model(instrument_spec)
 
     def run(self) -> dict:
         from fluxtrade_core import Candlestick as RustCandlestick
@@ -325,6 +333,8 @@ class FastBarReplayRunner:
             str(self.initial_balance),
             maker_fee=str(self.maker_fee),
             taker_fee=str(self.taker_fee),
+            contract_multiplier=str(self.contract_multiplier),
+            fee_model=self.fee_model.value,
         )
         bar = BarView(self.tape)
         trades: list[ResearchTrade] = []
@@ -397,7 +407,11 @@ class FastBarReplayRunner:
             )
 
         final_balance = Decimal(engine.balance)
-        metrics = calculate_metrics(trades, initial_balance=float(self.initial_balance))
+        metrics = calculate_metrics(
+            trades,
+            initial_balance=float(self.initial_balance),
+            contract_multiplier=self.contract_multiplier,
+        )
         return {
             "total_pnl": final_balance - self.initial_balance,
             "max_drawdown": metrics.get("max_drawdown", Decimal("0")),

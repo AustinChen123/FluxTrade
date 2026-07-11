@@ -81,6 +81,7 @@ class CsvSignalBacktestParameterEvaluator:
             initial_balance=request.backtest.initial_balance,
             maker_fee=request.backtest.maker_fee,
             taker_fee=request.backtest.taker_fee,
+            instrument=request.backtest.instrument,
             write_reports=request.backtest.write_reports,
         )
         result = self._backtest_executor.run_backtest_request(backtest_request)
@@ -143,6 +144,11 @@ class ResearchBacktestParameterEvaluator:
             precision_codec=self._precision_codec,
             prepared_scaled_candles=prepared_scaled_candles,
             capital_allocator=capital_allocator,
+            instrument_spec=(
+                request.backtest.instrument.to_instrument_spec(request.product_id)
+                if request.backtest.instrument is not None
+                else None
+            ),
         )
         runner.add_strategy(strategy)
 
@@ -250,7 +256,7 @@ class GoldenCrossFastFitnessParameterEvaluator:
         request: ParameterSearchJobRequest,
     ) -> GoldenCrossFastFitnessEvaluator:
         assert request.backtest is not None
-        cache_key = _candle_cache_key(request)
+        cache_key = _fitness_cache_key(request)
         evaluator = self._fitness_cache.get(cache_key)
         if evaluator is None:
             data_source = CsvDataSource(
@@ -268,6 +274,11 @@ class GoldenCrossFastFitnessParameterEvaluator:
                 df,
                 initial_balance=request.backtest.initial_balance,
                 taker_fee=request.backtest.taker_fee,
+                instrument_spec=(
+                    request.backtest.instrument.to_instrument_spec(request.product_id)
+                    if request.backtest.instrument is not None
+                    else None
+                ),
             )
             self._fitness_cache[cache_key] = evaluator
         return evaluator
@@ -307,6 +318,20 @@ def _candle_cache_key(request: ParameterSearchJobRequest) -> tuple:
         request.timeframe,
         request.start_time,
         request.end_time,
+    )
+
+
+def _fitness_cache_key(request: ParameterSearchJobRequest) -> tuple:
+    assert request.backtest is not None
+    instrument = request.backtest.instrument
+    return (
+        _candle_cache_key(request),
+        request.backtest.initial_balance,
+        request.backtest.taker_fee,
+        instrument.multiplier if instrument is not None else None,
+        instrument.fee_model if instrument is not None else None,
+        instrument.capital_model if instrument is not None else None,
+        instrument.capital_per_contract if instrument is not None else None,
     )
 
 
@@ -660,7 +685,7 @@ def _resolved_dataset_backtest_payload(
     backtest = _backtest_for_evaluation_dataset(request, dataset)
     if backtest is None:
         return None
-    return _json_safe(backtest.model_dump(mode="json"))
+    return _json_safe(backtest.model_dump(mode="json", exclude_none=True))
 
 
 def _decimal_key(value: Decimal) -> Decimal:

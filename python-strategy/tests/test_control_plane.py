@@ -23,6 +23,8 @@ from src.control_plane import (
     StrategyStateQueryService,
 )
 from src.control_plane.models import BacktestJobRequest, JobStatus
+from src.core.product_registry import FeeModel
+import src.control_plane.backtest_jobs as backtest_jobs
 from src.core.command_router import CommandResult
 from src.core.orm_models import (
     BacktestResultSummary,
@@ -174,6 +176,76 @@ def test_control_plane_rejects_invalid_backtest_payload():
 
     assert response.status_code == 422
     assert response.body["error"] == "validation_error"
+
+
+def test_backtest_request_rejects_invalid_instrument_metadata():
+    with pytest.raises(ValueError, match="multiplier must be positive"):
+        BacktestJobRequest(
+            strategy_id="invalid-instrument",
+            product_id=PRODUCT_ID,
+            timeframe=TIMEFRAME,
+            candles_csv_path="/tmp/candles.csv",
+            signals_csv_path="/tmp/signals.csv",
+            start_time=1,
+            end_time=2,
+            instrument={"multiplier": "0", "fee_model": "per_contract"},
+        )
+
+    with pytest.raises(ValueError, match="capital_per_contract must be positive"):
+        BacktestJobRequest(
+            strategy_id="invalid-capital",
+            product_id=PRODUCT_ID,
+            timeframe=TIMEFRAME,
+            candles_csv_path="/tmp/candles.csv",
+            signals_csv_path="/tmp/signals.csv",
+            start_time=1,
+            end_time=2,
+            instrument={
+                "multiplier": "2",
+                "capital_model": "per_contract",
+            },
+        )
+
+
+def test_backtest_executor_propagates_instrument_spec(monkeypatch, tmp_path):
+    captured = {}
+
+    class RecordingRunner:
+        def __init__(self, **kwargs):
+            captured.update(kwargs)
+
+        def add_strategy(self, strategy):
+            pass
+
+        def run(self):
+            return {"total_pnl": Decimal("0")}
+
+    monkeypatch.setattr(backtest_jobs, "BacktestRunner", RecordingRunner)
+    signals_path = tmp_path / "signals.csv"
+    signals_path.write_text("timestamp,type,quantity\n1,LONG,1\n")
+    request = BacktestJobRequest(
+        strategy_id="mnq",
+        product_id=PRODUCT_ID,
+        timeframe="1m",
+        candles_csv_path="/tmp/candles.csv",
+        signals_csv_path=str(signals_path),
+        start_time=1,
+        end_time=2,
+        instrument={
+            "multiplier": "2",
+            "fee_model": "per_contract",
+            "capital_model": "per_contract",
+            "capital_per_contract": "2500",
+        },
+    )
+
+    BacktestJobExecutor(run_inline=True).run_backtest_request(request)
+
+    spec = captured["instrument_spec"]
+    assert spec.multiplier == Decimal("2")
+    assert spec.fee_model == FeeModel.PER_CONTRACT
+    assert spec.capital_model.value == "per_contract"
+    assert spec.capital_per_contract == Decimal("2500")
 
 
 def test_control_plane_lists_submitted_jobs_without_framework():

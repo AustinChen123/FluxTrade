@@ -126,6 +126,11 @@ class BacktestJobExecutor:
                 "maker": float(request.maker_fee),
                 "taker": float(request.taker_fee),
             },
+            instrument_spec=(
+                request.instrument.to_instrument_spec(request.product_id)
+                if request.instrument is not None
+                else None
+            ),
             report_config={
                 "csv_trades": request.write_reports,
                 "markdown_report": request.write_reports,

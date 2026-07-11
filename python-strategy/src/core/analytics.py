@@ -20,7 +20,11 @@ class ClosedTrade:
     fee: Decimal = Decimal("0")
 
 
-def _build_closed_trades(trade_history: List[Trade]) -> tuple[
+def _build_closed_trades(
+    trade_history: List[Trade],
+    *,
+    contract_multiplier: Decimal = Decimal("1"),
+) -> tuple[
     list[ClosedTrade], list[float], list[float], Decimal
 ]:
     """Pair raw trades into closed round-trips using FIFO netting.
@@ -28,6 +32,8 @@ def _build_closed_trades(trade_history: List[Trade]) -> tuple[
     Returns (closed_trades, trade_pnls, equity_curve, total_pnl).
     trade_pnls and equity_curve are float lists for numpy/pandas compatibility.
     """
+    if contract_multiplier <= 0:
+        raise ValueError("contract_multiplier must be positive")
     trades = []
     for t in trade_history:
         trades.append({
@@ -78,10 +84,10 @@ def _build_closed_trades(trade_history: List[Trade]) -> tuple[
             exit_fee = fee * qty_closing / abs(signed_qty)
 
             if net_qty > 0:
-                gross_pnl = (price - avg_entry_price) * qty_closing
+                gross_pnl = (price - avg_entry_price) * qty_closing * contract_multiplier
                 trade_side = PositionSide.LONG
             else:
-                gross_pnl = (avg_entry_price - price) * qty_closing
+                gross_pnl = (avg_entry_price - price) * qty_closing * contract_multiplier
                 trade_side = PositionSide.SHORT
 
             pnl = gross_pnl - entry_fee - exit_fee
@@ -138,6 +144,7 @@ def calculate_metrics(
     initial_balance: float = 10000.0,
     risk_free_rate: float = 0.0,
     periods_per_year: int = 365,
+    contract_multiplier: Decimal = Decimal("1"),
 ) -> Dict:
     """Calculate performance metrics from a list of trades.
 
@@ -161,7 +168,8 @@ def calculate_metrics(
         }
 
     closed_trades, trade_pnls, equity_curve, total_pnl = _build_closed_trades(
-        trade_history
+        trade_history,
+        contract_multiplier=contract_multiplier,
     )
 
     # --- Basic metrics (backward-compatible) ---

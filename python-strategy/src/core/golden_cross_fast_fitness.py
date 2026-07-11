@@ -13,6 +13,13 @@ from decimal import Decimal
 import numpy as np
 import pandas as pd
 
+from src.core.product_registry import (
+    FeeModel,
+    InstrumentSpec,
+    resolve_contract_multiplier,
+    resolve_fee_model,
+)
+
 
 @dataclass(frozen=True, slots=True)
 class GoldenCrossFastFitnessResult:
@@ -37,6 +44,7 @@ class GoldenCrossFastFitnessEvaluator:
         *,
         initial_balance: Decimal = Decimal("10000"),
         taker_fee: Decimal = Decimal("0"),
+        instrument_spec: InstrumentSpec | None = None,
     ) -> None:
         if len(timestamps) != len(opens) or len(opens) != len(closes):
             raise ValueError("timestamps, opens, and closes must have equal length")
@@ -45,6 +53,8 @@ class GoldenCrossFastFitnessEvaluator:
         self.closes = closes.astype(np.float64, copy=False)
         self.initial_balance = float(initial_balance)
         self.taker_fee = float(taker_fee)
+        self.contract_multiplier = float(resolve_contract_multiplier(instrument_spec))
+        self.fee_model = resolve_fee_model(instrument_spec)
 
     @classmethod
     def from_dataframe(
@@ -53,6 +63,7 @@ class GoldenCrossFastFitnessEvaluator:
         *,
         initial_balance: Decimal = Decimal("10000"),
         taker_fee: Decimal = Decimal("0"),
+        instrument_spec: InstrumentSpec | None = None,
     ) -> "GoldenCrossFastFitnessEvaluator":
         if "timestamp" in df.columns:
             timestamps = df["timestamp"].to_numpy(dtype=np.int64)
@@ -64,6 +75,7 @@ class GoldenCrossFastFitnessEvaluator:
             closes=df["close"].to_numpy(dtype=np.float64),
             initial_balance=initial_balance,
             taker_fee=taker_fee,
+            instrument_spec=instrument_spec,
         )
 
     def evaluate(
@@ -110,7 +122,7 @@ class GoldenCrossFastFitnessEvaluator:
             is_entry = bool(entries[signal_index])
             is_exit = bool(exits[signal_index])
             fill_price = float(self.opens[fill_index])
-            fee = fill_price * qty * self.taker_fee
+            fee = self._fee(fill_price, qty)
 
             if is_entry and net_qty == 0.0:
                 net_qty = qty
@@ -119,8 +131,12 @@ class GoldenCrossFastFitnessEvaluator:
                 equity_curve.append(total_pnl)
                 raw_trade_count += 1
             elif is_exit and net_qty > 0.0:
-                entry_fee = entry_price * net_qty * self.taker_fee
-                gross_pnl = (fill_price - entry_price) * net_qty
+                entry_fee = self._fee(entry_price, net_qty)
+                gross_pnl = (
+                    (fill_price - entry_price)
+                    * net_qty
+                    * self.contract_multiplier
+                )
                 trade_pnl = gross_pnl - entry_fee - fee
                 total_pnl += gross_pnl - fee
                 trade_pnls.append(trade_pnl)
@@ -130,6 +146,11 @@ class GoldenCrossFastFitnessEvaluator:
                 entry_price = 0.0
 
         return _result_from_pnls(total_pnl, equity_curve, trade_pnls, raw_trade_count)
+
+    def _fee(self, price: float, quantity: float) -> float:
+        if self.fee_model == FeeModel.PER_CONTRACT:
+            return quantity * self.taker_fee
+        return price * quantity * self.contract_multiplier * self.taker_fee
 
 
 def _rolling_mean(values: np.ndarray, window: int) -> np.ndarray:

@@ -6,6 +6,11 @@ from src.core.interfaces.exchange import ExchangeOrderSnapshot, IExchangeAdapter
 from src.core.orm_models import Order
 from src.core.models import OrderSide, Position, Candlestick, PositionSide
 from src.core.precision import PrecisionCodec
+from src.core.product_registry import (
+    InstrumentSpec,
+    resolve_contract_multiplier,
+    resolve_fee_model,
+)
 from src.core.strategy_context import (
     CapitalSnapshot,
     FillSnapshot,
@@ -49,12 +54,18 @@ class SimulatedAdapter(IExchangeAdapter):
         maker_fee: Decimal = Decimal("0"),
         taker_fee: Decimal = Decimal("0"),
         precision_codec: PrecisionCodec | None = None,
+        instrument_spec: InstrumentSpec | None = None,
     ):
+        contract_multiplier = resolve_contract_multiplier(instrument_spec)
+        fee_model = resolve_fee_model(instrument_spec)
         self._engine = PyMatchingEngine(
             str(initial_balance),
             maker_fee=str(maker_fee),
             taker_fee=str(taker_fee),
+            contract_multiplier=str(contract_multiplier),
+            fee_model=fee_model.value,
         )
+        self._contract_multiplier = contract_multiplier
         self._precision_codec = precision_codec
         if precision_codec is not None:
             if RustScaledCandlestick is None or not hasattr(self._engine, "on_scaled_candle"):
@@ -204,7 +215,11 @@ class SimulatedAdapter(IExchangeAdapter):
         """Build a read-only decision context from matcher-backed state."""
         cash = self.get_balance()
         position = self.get_position(product_id, strategy_id=strategy_id)
-        position_snapshot = _position_snapshot(position, mark_price) if position else None
+        position_snapshot = (
+            _position_snapshot(position, mark_price, self._contract_multiplier)
+            if position
+            else None
+        )
         unrealized_pnl = position_snapshot.unrealized_pnl if position_snapshot else Decimal("0")
         total_equity = cash + unrealized_pnl
         realized_pnl = total_equity - Decimal(str(initial_balance))
@@ -379,15 +394,24 @@ class SimulatedAdapter(IExchangeAdapter):
 def _position_snapshot(
     position: Position,
     mark_price: Optional[Decimal],
+    contract_multiplier: Decimal = Decimal("1"),
 ) -> PositionSnapshot:
     notional = None
     unrealized_pnl = position.unrealized_pnl
     if mark_price is not None:
-        notional = position.quantity * mark_price
+        notional = abs(position.quantity * mark_price * contract_multiplier)
         if position.side == PositionSide.LONG:
-            unrealized_pnl = (mark_price - position.entry_price) * position.quantity
+            unrealized_pnl = (
+                (mark_price - position.entry_price)
+                * position.quantity
+                * contract_multiplier
+            )
         elif position.side == PositionSide.SHORT:
-            unrealized_pnl = (position.entry_price - mark_price) * position.quantity
+            unrealized_pnl = (
+                (position.entry_price - mark_price)
+                * position.quantity
+                * contract_multiplier
+            )
     return PositionSnapshot(
         side=position.side,
         quantity=position.quantity,

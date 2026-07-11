@@ -6,6 +6,7 @@ from integration.conftest import PRODUCT_ID, TIMEFRAME, make_candle_series
 from src.core.data_sources.memory import MemoryDataSource
 from src.core.fast_bar import FastBarReplayRunner, MarketTape, RollingMean, prepare_fast_strategy
 from src.core.research_backtest_runner import ResearchBacktestRunner
+from src.core.product_registry import InstrumentSpec
 from src.strategies.callable_strategy import CallableStrategy
 from src.strategies.golden_cross import GoldenCrossStrategy
 
@@ -140,3 +141,35 @@ def test_fast_bar_golden_cross_matches_research_runner_core_metrics():
     assert fast_result["total_trades"] == research_result["total_trades"]
     assert fast_result["total_pnl"] == research_result["total_pnl"]
     assert fast_result["max_drawdown"] == research_result["max_drawdown"]
+
+
+@pytest.mark.skipif(not HAS_RUST, reason="fluxtrade_core.so not compiled")
+def test_fast_bar_uses_instrument_multiplier():
+    candles = make_candle_series(count=2_000)
+    spec = InstrumentSpec(
+        product_id=PRODUCT_ID,
+        exchange="test",
+        symbol="MNQ",
+        base="MNQ",
+        quote="USD",
+        multiplier=Decimal("2"),
+    )
+    tape = MarketTape.from_candles(candles, product_id=PRODUCT_ID, timeframe=TIMEFRAME)
+    def strategy():
+        return GoldenCrossStrategy(
+            "fast_bar_multiplier",
+            PRODUCT_ID,
+            short_window=20,
+            long_window=80,
+            timeframe=TIMEFRAME,
+            quantity=Decimal("1"),
+        ).prepare_fast()
+
+    default_result = FastBarReplayRunner(tape=tape, strategy=strategy()).run()
+    multiplied_result = FastBarReplayRunner(
+        tape=tape,
+        strategy=strategy(),
+        instrument_spec=spec,
+    ).run()
+
+    assert multiplied_result["total_pnl"] == default_result["total_pnl"] * 2
