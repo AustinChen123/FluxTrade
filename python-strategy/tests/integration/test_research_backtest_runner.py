@@ -28,6 +28,7 @@ from src.core.orm_models import (
     Strategy,
 )
 from src.core.precision import PrecisionCodec, PrecisionSpec
+from src.core.product_registry import CapitalModel, InstrumentSpec
 from src.core.research_backtest_runner import ResearchBacktestRunner
 from src.core.strategy_context import StrategyContext
 from src.strategies.base import BaseStrategy, StrategyRequirements
@@ -281,6 +282,61 @@ def test_research_backtest_syncs_capital_lifecycle_after_fills():
     assert strategy.contexts[2].capital is not None
     assert strategy.contexts[2].capital.used == Decimal("0")
     assert strategy.contexts[2].capital.available == Decimal("5000")
+    assert allocator.get_used(strategy.strategy_id) == Decimal("0")
+
+
+@pytest.mark.parametrize(
+    ("spec", "expected_usage"),
+    [
+        (
+            InstrumentSpec(
+                product_id=PRODUCT_ID,
+                exchange="test",
+                symbol="MNQ",
+                base="MNQ",
+                quote="USD",
+                multiplier=Decimal("2"),
+                capital_model=CapitalModel.NOTIONAL,
+            ),
+            lambda candle: Decimal("0.01") * candle.close * Decimal("2"),
+        ),
+        (
+            InstrumentSpec(
+                product_id=PRODUCT_ID,
+                exchange="test",
+                symbol="MNQ",
+                base="MNQ",
+                quote="USD",
+                multiplier=Decimal("2"),
+                capital_model=CapitalModel.PER_CONTRACT,
+                capital_per_contract=Decimal("2500"),
+            ),
+            lambda candle: Decimal("25"),
+        ),
+    ],
+)
+def test_research_backtest_capital_models_cover_full_lifecycle(spec, expected_usage):
+    candles = make_candle_series(count=4)
+    strategy = CapitalLifecycleProbeStrategy()
+    allocator = CapitalAllocator(Decimal("100000"))
+    allocator.allocate(strategy.strategy_id, Decimal("5000"))
+    runner = ResearchBacktestRunner(
+        start_time=candles[0].timestamp,
+        end_time=candles[-1].timestamp,
+        product_id=PRODUCT_ID,
+        timeframe=TIMEFRAME,
+        initial_balance=10_000.0,
+        data_source=MemoryDataSource(candles),
+        capital_allocator=allocator,
+        instrument_spec=spec,
+    )
+    runner.add_strategy(strategy)
+
+    result = runner.run()
+
+    assert result["raw_trade_count"] == 2
+    assert strategy.contexts[1].capital.used == expected_usage(candles[1])
+    assert strategy.contexts[2].capital.used == Decimal("0")
     assert allocator.get_used(strategy.strategy_id) == Decimal("0")
 
 

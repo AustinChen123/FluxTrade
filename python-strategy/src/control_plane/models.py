@@ -9,6 +9,7 @@ from typing import Any, Literal
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 from src.core.evaluation_set import EvaluationDataset, EvaluationSet
+from src.core.product_registry import CapitalModel, FeeModel, InstrumentSpec
 
 
 class JobStatus(str, Enum):
@@ -17,6 +18,46 @@ class JobStatus(str, Enum):
     SUCCEEDED = "SUCCEEDED"
     FAILED = "FAILED"
     CANCELLED = "CANCELLED"
+
+
+class BacktestInstrumentConfig(BaseModel):
+    """Instrument accounting metadata required by non-spot backtests."""
+
+    multiplier: Decimal = Decimal("1")
+    fee_model: FeeModel = FeeModel.PERCENTAGE_NOTIONAL
+    capital_model: CapitalModel = CapitalModel.NOTIONAL
+    capital_per_contract: Decimal | None = None
+
+    @field_validator("multiplier")
+    @classmethod
+    def validate_multiplier(cls, value: Decimal) -> Decimal:
+        if value <= 0:
+            raise ValueError("multiplier must be positive")
+        return value
+
+    @model_validator(mode="after")
+    def validate_capital_model(self) -> "BacktestInstrumentConfig":
+        if self.capital_model == CapitalModel.PER_CONTRACT:
+            if self.capital_per_contract is None or self.capital_per_contract <= 0:
+                raise ValueError(
+                    "capital_per_contract must be positive for per_contract capital"
+                )
+        elif self.capital_per_contract is not None:
+            raise ValueError("capital_per_contract requires per_contract capital_model")
+        return self
+
+    def to_instrument_spec(self, product_id: str) -> InstrumentSpec:
+        return InstrumentSpec(
+            product_id=product_id,
+            exchange=product_id.partition(":")[0].lower(),
+            symbol=product_id,
+            base=product_id,
+            quote="",
+            multiplier=self.multiplier,
+            fee_model=self.fee_model,
+            capital_model=self.capital_model,
+            capital_per_contract=self.capital_per_contract,
+        )
 
 
 class BacktestJobRequest(BaseModel):
@@ -35,6 +76,7 @@ class BacktestJobRequest(BaseModel):
     initial_balance: Decimal = Decimal("10000")
     maker_fee: Decimal = Decimal("0")
     taker_fee: Decimal = Decimal("0")
+    instrument: BacktestInstrumentConfig | None = None
     write_reports: bool = False
 
     @field_validator("end_time")
@@ -146,6 +188,7 @@ class CsvSignalBacktestEvaluationConfig(BaseModel):
     initial_balance: Decimal = Decimal("10000")
     maker_fee: Decimal = Decimal("0")
     taker_fee: Decimal = Decimal("0")
+    instrument: BacktestInstrumentConfig | None = None
     write_reports: bool = False
 
     @field_validator("candles_csv_path")
@@ -177,6 +220,7 @@ class PartialCsvSignalBacktestEvaluationConfig(BaseModel):
     initial_balance: Decimal | None = None
     maker_fee: Decimal | None = None
     taker_fee: Decimal | None = None
+    instrument: BacktestInstrumentConfig | None = None
     write_reports: bool | None = None
 
     @field_validator("candles_csv_path")

@@ -7,6 +7,8 @@ from integration.conftest import PRODUCT_ID, TIMEFRAME, make_candle_series
 from src.core.data_sources.memory import MemoryDataSource
 from src.core.golden_cross_fast_fitness import GoldenCrossFastFitnessEvaluator
 from src.core.research_backtest_runner import ResearchBacktestRunner
+from src.core.product_registry import InstrumentSpec
+from src.core.product_registry import FeeModel
 from src.strategies.golden_cross import GoldenCrossStrategy
 
 try:
@@ -83,3 +85,55 @@ def test_golden_cross_fast_fitness_matches_research_runner_core_metrics():
     assert fast_result.raw_trade_count == research_result["raw_trade_count"]
     assert abs(fast_result.total_pnl - research_result["total_pnl"]) <= Decimal("0.01")
     assert abs(fast_result.max_drawdown - research_result["max_drawdown"]) <= Decimal("0.01")
+
+
+def test_golden_cross_fast_fitness_uses_instrument_multiplier():
+    candles = make_candle_series(count=2_000)
+    df = _candles_df(candles)
+    spec = InstrumentSpec(
+        product_id=PRODUCT_ID,
+        exchange="test",
+        symbol="MNQ",
+        base="MNQ",
+        quote="USD",
+        multiplier=Decimal("2"),
+    )
+
+    default_result = GoldenCrossFastFitnessEvaluator.from_dataframe(df).evaluate(
+        short_window=20,
+        long_window=80,
+        quantity=Decimal("1"),
+    )
+    multiplied_result = GoldenCrossFastFitnessEvaluator.from_dataframe(
+        df,
+        instrument_spec=spec,
+    ).evaluate(short_window=20, long_window=80, quantity=Decimal("1"))
+
+    assert multiplied_result.total_pnl == default_result.total_pnl * 2
+
+
+@pytest.mark.parametrize(
+    ("fee_model", "expected"),
+    [
+        (FeeModel.PERCENTAGE_NOTIONAL, 6.0),
+        (FeeModel.PER_CONTRACT, 3.0),
+    ],
+)
+def test_golden_cross_fast_fitness_fee_modes(fee_model, expected):
+    candles = make_candle_series(count=10)
+    spec = InstrumentSpec(
+        product_id=PRODUCT_ID,
+        exchange="test",
+        symbol="MNQ",
+        base="MNQ",
+        quote="USD",
+        multiplier=Decimal("2"),
+        fee_model=fee_model,
+    )
+    evaluator = GoldenCrossFastFitnessEvaluator.from_dataframe(
+        _candles_df(candles),
+        taker_fee=Decimal("1") if fee_model == FeeModel.PER_CONTRACT else Decimal("0.01"),
+        instrument_spec=spec,
+    )
+
+    assert evaluator._fee(100.0, 3.0) == expected

@@ -2,6 +2,7 @@
 
 import csv
 import json
+from decimal import Decimal
 from src.core.backtest_runner import (
     _write_csv_trades,
     _write_equity_curve,
@@ -9,6 +10,7 @@ from src.core.backtest_runner import (
     _write_markdown_report,
     DEFAULT_REPORT_CONFIG,
 )
+from src.core.product_registry import FeeModel
 from src.core.analytics import ClosedTrade
 from src.core.models import PositionSide
 from src.core.journal import StrategyJournal
@@ -168,6 +170,25 @@ class TestWriteMarkdownReport:
         assert "Sortino" in content
         assert "Calmar" in content
         assert "2024-01" in content
+
+    def test_labels_per_contract_fees(self, tmp_path):
+        path = tmp_path / "report.md"
+        _write_markdown_report(
+            _sample_metrics(),
+            product_id="BINANCE:BTCUSDT-PERP",
+            timeframe="1m",
+            initial_balance=10000.0,
+            start_time=1000,
+            end_time=2000,
+            fee_config={"maker": Decimal("1.25"), "taker": Decimal("1.75")},
+            fee_model=FeeModel.PER_CONTRACT,
+            candle_count=2,
+            path=path,
+        )
+
+        content = path.read_text()
+        assert "Maker Fee / Contract | 1.25" in content
+        assert "Taker Fee / Contract | 1.75" in content
 
     def test_no_monthly_section_when_empty(self, tmp_path):
         path = tmp_path / "report.md"
