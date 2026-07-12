@@ -49,7 +49,9 @@ def _parse_timestamp(df: pd.DataFrame) -> pd.DataFrame:
     else:
         # Parse date string → epoch ms
         df["timestamp"] = (
-            pd.to_datetime(df["timestamp"]).astype("int64") // 10**6
+            pd.to_datetime(df["timestamp"], utc=True)
+            .dt.as_unit("ms")
+            .astype("int64")
         )
 
     return df
