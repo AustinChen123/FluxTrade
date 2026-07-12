@@ -9,7 +9,12 @@ from typing import Any, Literal
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 from src.core.evaluation_set import EvaluationDataset, EvaluationSet
-from src.core.product_registry import CapitalModel, FeeModel, InstrumentSpec
+from src.core.product_registry import (
+    CapitalModel,
+    FeeModel,
+    InstrumentSpec,
+    is_dated_future_product_id,
+)
 
 
 class JobStatus(str, Enum):
@@ -24,6 +29,8 @@ class BacktestInstrumentConfig(BaseModel):
     """Instrument accounting metadata required by non-spot backtests."""
 
     multiplier: Decimal = Decimal("1")
+    quantity_step: Decimal | None = None
+    price_tick: Decimal | None = None
     fee_model: FeeModel = FeeModel.PERCENTAGE_NOTIONAL
     capital_model: CapitalModel = CapitalModel.NOTIONAL
     capital_per_contract: Decimal | None = None
@@ -33,6 +40,16 @@ class BacktestInstrumentConfig(BaseModel):
     def validate_multiplier(cls, value: Decimal) -> Decimal:
         if value <= 0:
             raise ValueError("multiplier must be positive")
+        return value
+
+    @field_validator("quantity_step", "price_tick")
+    @classmethod
+    def validate_optional_positive_decimal(
+        cls,
+        value: Decimal | None,
+    ) -> Decimal | None:
+        if value is not None and value <= 0:
+            raise ValueError("value must be positive")
         return value
 
     @model_validator(mode="after")
@@ -53,6 +70,8 @@ class BacktestInstrumentConfig(BaseModel):
             symbol=product_id,
             base=product_id,
             quote="",
+            quantity_step=self.quantity_step,
+            price_tick=self.price_tick,
             multiplier=self.multiplier,
             fee_model=self.fee_model,
             capital_model=self.capital_model,
@@ -64,11 +83,18 @@ class PartialBacktestInstrumentConfig(BaseModel):
     """Per-dataset instrument fields validated after merging with shared settings."""
 
     multiplier: Decimal | None = None
+    quantity_step: Decimal | None = None
+    price_tick: Decimal | None = None
     fee_model: FeeModel | None = None
     capital_model: CapitalModel | None = None
     capital_per_contract: Decimal | None = None
 
-    @field_validator("multiplier", "capital_per_contract")
+    @field_validator(
+        "multiplier",
+        "quantity_step",
+        "price_tick",
+        "capital_per_contract",
+    )
     @classmethod
     def validate_positive_decimal(
         cls,
@@ -126,6 +152,16 @@ class BacktestJobRequest(BaseModel):
         if value < 0:
             raise ValueError("fee cannot be negative")
         return value
+
+    @model_validator(mode="after")
+    def validate_dated_future_rules(self) -> "BacktestJobRequest":
+        _require_dated_future_rules(
+            self.product_id,
+            instrument_configured=self.instrument is not None,
+            quantity_step=self.instrument.quantity_step if self.instrument else None,
+            price_tick=self.instrument.price_tick if self.instrument else None,
+        )
+        return self
 
 
 class ParameterCandidate(BaseModel):
@@ -426,7 +462,59 @@ class ParameterSearchJobRequest(BaseModel):
                         "evaluation_set datasets require candles_csv_path when "
                         f"shared backtest is not provided: {datasets}"
                     )
+            for dataset in self.evaluation_set.datasets:
+                override = dataset.backtest.instrument if dataset.backtest else None
+                shared = self.backtest.instrument if self.backtest else None
+                _require_dated_future_rules(
+                    dataset.product_id,
+                    instrument_configured=shared is not None or override is not None,
+                    quantity_step=(
+                        override.quantity_step
+                        if override and override.quantity_step is not None
+                        else shared.quantity_step if shared else None
+                    ),
+                    price_tick=(
+                        override.price_tick
+                        if override and override.price_tick is not None
+                        else shared.price_tick if shared else None
+                    ),
+                )
+        else:
+            instrument = self.backtest.instrument if self.backtest else None
+            _require_dated_future_rules(
+                self.product_id,
+                instrument_configured=instrument is not None,
+                quantity_step=instrument.quantity_step if instrument else None,
+                price_tick=instrument.price_tick if instrument else None,
+            )
         return self
+
+
+def _require_dated_future_rules(
+    product_id: str,
+    *,
+    instrument_configured: bool,
+    quantity_step: Decimal | None,
+    price_tick: Decimal | None,
+) -> None:
+    if not is_dated_future_product_id(product_id):
+        return
+    if not instrument_configured:
+        raise ValueError(
+            f"dated future {product_id} requires instrument configuration"
+        )
+    missing = [
+        name
+        for name, value in (
+            ("quantity_step", quantity_step),
+            ("price_tick", price_tick),
+        )
+        if value is None
+    ]
+    if missing:
+        raise ValueError(
+            f"dated future {product_id} requires {', '.join(missing)}"
+        )
 
 
 def _require_int(value: int | Decimal, field_name: str) -> int:

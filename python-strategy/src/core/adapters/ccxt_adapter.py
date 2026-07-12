@@ -566,6 +566,7 @@ class CcxtExchangeAdapter(IExchangeAdapter):
                 side=order.side,
                 order_type=order.type,
                 trigger_price=order.trigger_price,
+                trailing_distance=getattr(order, "_trailing_distance", None),
                 spec=spec,
             )
             notional_price = quantized.price or quantized.trigger_price

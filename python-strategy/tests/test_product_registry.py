@@ -20,6 +20,7 @@ from src.core.product_registry import (
     calculate_notional_exposure,
     instrument_spec_from_product,
     validate_product_id,
+    quantize_order_values,
 )
 
 
@@ -203,6 +204,182 @@ def test_instrument_spec_symbol_matrix(product_id, expected_symbol):
 def test_instrument_spec_rejects_unmapped_generic_perpetual():
     with pytest.raises(ValueError, match="Instrument symbol mapping is unavailable"):
         instrument_spec_from_product("YAHOO:BTC-PERP")
+
+
+def _mnq_spec(**overrides):
+    values = {
+        "product_id": "RITHMIC:MNQ-202509",
+        "exchange": "rithmic",
+        "symbol": "MNQ-202509",
+        "base": "MNQ",
+        "quote": "USD",
+        "quantity_step": Decimal("1"),
+        "price_tick": Decimal("0.25"),
+    }
+    values.update(overrides)
+    return InstrumentSpec(**values)
+
+
+@pytest.mark.parametrize(
+    ("quantity", "price", "trigger_price"),
+    [
+        ("1", "20000.00", None),
+        ("3", "20000.25", "19999.75"),
+        ("2", None, None),
+    ],
+)
+def test_dated_future_order_values_pass_unchanged(quantity, price, trigger_price):
+    result = quantize_order_values(
+        quantity=Decimal(quantity),
+        price=Decimal(price) if price is not None else None,
+        trigger_price=Decimal(trigger_price) if trigger_price is not None else None,
+        spec=_mnq_spec(),
+    )
+
+    assert result.quantity == Decimal(quantity)
+    assert result.price == (Decimal(price) if price is not None else None)
+    assert result.trigger_price == (
+        Decimal(trigger_price) if trigger_price is not None else None
+    )
+    assert result.changed is False
+
+
+@pytest.mark.parametrize(
+    ("quantity", "price", "trigger_price", "error"),
+    [
+        ("0", "20000.00", None, "must_be_positive"),
+        ("-1", "20000.00", None, "must_be_positive"),
+        ("1.5", "20000.00", None, "quantity_off_step"),
+        ("NaN", "20000.00", None, "must_be_positive"),
+        ("1", "20000.10", None, "price_off_tick"),
+        ("1", "20000.00", "19999.90", "trigger_price_off_tick"),
+        ("1", "0", None, "price_must_be_positive"),
+        ("1", "NaN", None, "price_must_be_positive"),
+    ],
+)
+def test_dated_future_order_values_reject_invalid_intent(
+    quantity, price, trigger_price, error
+):
+    with pytest.raises(ValueError, match=error):
+        quantize_order_values(
+            quantity=Decimal(quantity),
+            price=Decimal(price) if price is not None else None,
+            trigger_price=Decimal(trigger_price) if trigger_price is not None else None,
+            spec=_mnq_spec(),
+        )
+
+
+@pytest.mark.parametrize(
+    ("spec", "error"),
+    [
+        (_mnq_spec(quantity_step=None), "quantity_step"),
+        (_mnq_spec(quantity_step=Decimal("0")), "quantity_step"),
+        (_mnq_spec(quantity_step=Decimal("NaN")), "quantity_step"),
+        (_mnq_spec(price_tick=None), "price_tick"),
+        (_mnq_spec(price_tick=Decimal("NaN")), "price_tick"),
+    ],
+)
+def test_dated_future_order_values_require_complete_metadata(spec, error):
+    with pytest.raises(ValueError, match=error):
+        quantize_order_values(
+            quantity=Decimal("1"),
+            price=Decimal("20000"),
+            spec=spec,
+        )
+
+
+def test_dated_future_market_order_does_not_require_price_tick():
+    result = quantize_order_values(
+        quantity=Decimal("1"),
+        price=None,
+        trigger_price=None,
+        spec=_mnq_spec(price_tick=None),
+    )
+
+    assert result.quantity == Decimal("1")
+    assert result.price is None
+    assert result.trigger_price is None
+    assert result.changed is False
+
+
+@pytest.mark.parametrize(
+    ("distance", "accepted"),
+    [("0.25", True), ("1.00", True), ("0.10", False)],
+)
+def test_dated_future_trailing_distance_uses_price_tick(distance, accepted):
+    kwargs = {
+        "quantity": Decimal("1"),
+        "price": None,
+        "trigger_price": None,
+        "trailing_distance": Decimal(distance),
+        "spec": _mnq_spec(),
+    }
+    if not accepted:
+        with pytest.raises(ValueError, match="trailing_distance_off_tick"):
+            quantize_order_values(**kwargs)
+        return
+
+    result = quantize_order_values(**kwargs)
+    assert result.changed is False
+
+
+def test_dated_future_trailing_distance_requires_price_tick():
+    with pytest.raises(ValueError, match="futures_price_tick_must_be_positive"):
+        quantize_order_values(
+            quantity=Decimal("1"),
+            price=None,
+            trigger_price=None,
+            trailing_distance=Decimal("1"),
+            spec=_mnq_spec(price_tick=None),
+        )
+
+
+def test_crypto_perpetual_order_values_keep_directional_quantization():
+    spec = instrument_spec_from_product(
+        "BINANCE:BTCUSDT-PERP",
+        quantity_step=Decimal("0.001"),
+        price_tick=Decimal("0.10"),
+    )
+
+    result = quantize_order_values(
+        quantity=Decimal("0.0109"),
+        price=Decimal("50123.456"),
+        side="buy",
+        spec=spec,
+    )
+
+    assert result.quantity == Decimal("0.010")
+    assert result.price == Decimal("50123.40")
+    assert result.changed is True
+
+
+@pytest.mark.parametrize(
+    ("quantity", "accepted"),
+    [
+        ("0.001", True),
+        ("0.002", True),
+        ("0.0015", False),
+    ],
+)
+def test_fractional_dated_future_uses_instrument_quantity_step(quantity, accepted):
+    spec = _mnq_spec(quantity_step=Decimal("0.001"))
+
+    if not accepted:
+        with pytest.raises(ValueError, match="quantity_off_step"):
+            quantize_order_values(
+                quantity=Decimal(quantity),
+                price=Decimal("20000"),
+                spec=spec,
+            )
+        return
+
+    result = quantize_order_values(
+        quantity=Decimal(quantity),
+        price=Decimal("20000"),
+        spec=spec,
+    )
+    assert result.quantity == Decimal(quantity)
+    assert result.changed is False
 
 
 class TestToExchangeName:

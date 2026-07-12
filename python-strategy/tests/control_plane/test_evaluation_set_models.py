@@ -273,6 +273,44 @@ def test_parameter_search_accepts_shared_backtest_with_evaluation_set():
     assert request.evaluation_set is not None
 
 
+def test_dated_future_parameter_search_requires_complete_resolved_rules():
+    payload = _base_search_request()
+    payload["product_id"] = "RITHMIC:MNQ-202509"
+    payload["backtest"] = {
+        "candles_csv_path": "data/mnq.csv",
+        "instrument": {"quantity_step": "1"},
+    }
+
+    with pytest.raises(ValidationError, match="requires price_tick"):
+        ParameterSearchJobRequest.model_validate(payload)
+
+
+def test_dated_future_dataset_merges_shared_and_override_rules():
+    payload = _base_search_request()
+    payload["backtest"] = {
+        "candles_csv_path": "data/mnq.csv",
+        "instrument": {"quantity_step": "1"},
+    }
+    payload["evaluation_set"] = {
+        "datasets": [
+            {
+                "dataset_id": "mnq",
+                "product_id": "RITHMIC:MNQ-202509",
+                "timeframe": "1m",
+                "start_time": 10,
+                "end_time": 20,
+                "backtest": {"instrument": {"price_tick": "0.25"}},
+            },
+        ],
+    }
+
+    request = ParameterSearchJobRequest.model_validate(payload)
+
+    assert request.evaluation_set.datasets[0].backtest.instrument.price_tick == Decimal(
+        "0.25"
+    )
+
+
 def test_parameter_search_merges_dataset_backtest_overrides_with_shared_settings():
     payload = _base_search_request()
     payload["backtest"] = {
