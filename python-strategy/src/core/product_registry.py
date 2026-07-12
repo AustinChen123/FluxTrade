@@ -10,7 +10,7 @@ Product ID format: EXCHANGE:BASEQUOTE-PERP
 import logging
 import re
 from dataclasses import dataclass
-from decimal import Decimal, ROUND_DOWN, ROUND_UP
+from decimal import Decimal, InvalidOperation, ROUND_DOWN, ROUND_UP
 from enum import Enum
 from typing import Any
 
@@ -130,6 +130,15 @@ def calculate_required_capital(
         if capital_per_contract is None or capital_per_contract <= 0:
             raise ValueError("capital_per_contract must be positive for per_contract capital")
         return abs(quantity) * capital_per_contract
+    return abs(quantity * price * resolve_contract_multiplier(spec))
+
+
+def calculate_notional_exposure(
+    quantity: Decimal,
+    price: Decimal,
+    spec: InstrumentSpec | None,
+) -> Decimal:
+    """Return absolute economic exposure independent of fee or capital models."""
     return abs(quantity * price * resolve_contract_multiplier(spec))
 
 
@@ -272,8 +281,10 @@ def instrument_spec_from_ccxt_market(
     price_tick = None
     min_notional = None
     min_quantity = None
+    multiplier = None
 
-    if market:
+    if market is not None:
+        multiplier = _contract_multiplier_from_ccxt_market(market)
         limits = market.get("limits") or {}
         amount_limits = limits.get("amount") or {}
         cost_limits = limits.get("cost") or {}
@@ -345,7 +356,26 @@ def instrument_spec_from_ccxt_market(
         price_tick=price_tick,
         min_notional=min_notional,
         min_quantity=min_quantity,
+        multiplier=multiplier,
     )
+
+
+def _contract_multiplier_from_ccxt_market(market: dict[str, Any]) -> Decimal | None:
+    is_contract = market.get("contract")
+    if is_contract is False:
+        return None
+    if is_contract is not True:
+        raise ValueError("CCXT market is missing an explicit contract classification")
+    if market.get("linear") is not True or market.get("inverse") is True:
+        raise ValueError("only linear CCXT contracts are supported")
+
+    try:
+        multiplier = Decimal(str(market.get("contractSize")))
+    except (InvalidOperation, ValueError):
+        multiplier = None
+    if multiplier is None or not multiplier.is_finite() or multiplier <= 0:
+        raise ValueError("linear CCXT contractSize must be positive")
+    return multiplier
 
 
 def quantize_order_values(

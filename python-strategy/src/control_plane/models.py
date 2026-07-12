@@ -60,6 +60,25 @@ class BacktestInstrumentConfig(BaseModel):
         )
 
 
+class PartialBacktestInstrumentConfig(BaseModel):
+    """Per-dataset instrument fields validated after merging with shared settings."""
+
+    multiplier: Decimal | None = None
+    fee_model: FeeModel | None = None
+    capital_model: CapitalModel | None = None
+    capital_per_contract: Decimal | None = None
+
+    @field_validator("multiplier", "capital_per_contract")
+    @classmethod
+    def validate_positive_decimal(
+        cls,
+        value: Decimal | None,
+    ) -> Decimal | None:
+        if value is not None and value <= 0:
+            raise ValueError("value must be positive")
+        return value
+
+
 class BacktestJobRequest(BaseModel):
     """Request payload for a CSV-signal backtest job."""
 
@@ -220,7 +239,7 @@ class PartialCsvSignalBacktestEvaluationConfig(BaseModel):
     initial_balance: Decimal | None = None
     maker_fee: Decimal | None = None
     taker_fee: Decimal | None = None
-    instrument: BacktestInstrumentConfig | None = None
+    instrument: PartialBacktestInstrumentConfig | None = None
     write_reports: bool | None = None
 
     @field_validator("candles_csv_path")

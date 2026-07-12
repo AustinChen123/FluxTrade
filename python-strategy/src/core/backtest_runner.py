@@ -362,6 +362,7 @@ class BacktestRunner:
             strat.journal = journal
             if hasattr(strat, 'risk_manager'):
                 strat.risk_manager.account_service = mock_account
+                strat.risk_manager.instrument_spec_resolver = self._resolve_instrument_spec
             self.engine.add_strategy(strat)
 
         logger.info("Starting Backtest for %s [%s - %s]", self.product_id, self.start_time, self.end_time)
@@ -450,6 +451,11 @@ class BacktestRunner:
         }
 
         return result
+
+    def _resolve_instrument_spec(self, product_id: str) -> InstrumentSpec | None:
+        if self.instrument_spec is None or self.instrument_spec.product_id != product_id:
+            return None
+        return self.instrument_spec
 
     def _compute_per_strategy_metrics(self, trades: list) -> Dict[str, Dict]:
         """Compute metrics per strategy by filtering trades by strategy_id."""

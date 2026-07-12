@@ -58,6 +58,7 @@ class SimulatedAdapter(IExchangeAdapter):
     ):
         contract_multiplier = resolve_contract_multiplier(instrument_spec)
         fee_model = resolve_fee_model(instrument_spec)
+        self._instrument_spec = instrument_spec
         self._engine = PyMatchingEngine(
             str(initial_balance),
             maker_fee=str(maker_fee),
@@ -82,6 +83,11 @@ class SimulatedAdapter(IExchangeAdapter):
     def supports_strategy_positions(self) -> bool:
         """Whether Rust positions are isolated by strategy_id."""
         return self._rust_supports_strategy_id
+
+    def get_instrument_spec(self, product_id: str) -> InstrumentSpec | None:
+        if self._instrument_spec is None or self._instrument_spec.product_id != product_id:
+            return None
+        return self._instrument_spec
 
     # ── IExchangeAdapter interface ───────────────────────────────
 

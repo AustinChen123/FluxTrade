@@ -57,7 +57,24 @@ def _make_order(**overrides) -> Order:
 
 
 def _empty_btc_market() -> dict:
-    return {"BTC/USDT:USDT": {}}
+    return {
+        "BTC/USDT:USDT": {
+            "contract": True,
+            "linear": True,
+            "inverse": False,
+            "contractSize": "1",
+        }
+    }
+
+
+def _linear_contract_market(**market) -> dict:
+    return {
+        "contract": True,
+        "linear": True,
+        "inverse": False,
+        "contractSize": "1",
+        **market,
+    }
 
 
 @pytest.fixture
@@ -67,6 +84,14 @@ def mock_ccxt_client():
     client.apiKey = "test-key"
     client.secret = "test-secret"
     client.load_markets.return_value = _empty_btc_market()
+
+    def load_markets():
+        return {
+            symbol: _linear_contract_market(**market)
+            for symbol, market in client.load_markets.return_value.items()
+        }
+
+    client.load_markets.side_effect = load_markets
     return client
 
 
@@ -260,7 +285,7 @@ class TestPlaceOrder:
         assert spec.price_tick == Decimal("0.10")
         assert spec.min_quantity == Decimal("0.001")
         assert spec.min_notional == Decimal("10")
-        assert spec.multiplier is None
+        assert spec.multiplier == Decimal("1")
         assert spec.tick_value is None
         assert spec.fee_model is None
         assert spec.session_calendar_id is None
@@ -289,15 +314,69 @@ class TestPlaceOrder:
         assert spec.min_quantity == Decimal("0.001")
         assert spec.min_notional == Decimal("5")
 
+    @pytest.mark.parametrize(
+        ("market", "expected_multiplier", "error"),
+        [
+            ({"contract": False}, None, None),
+            (_linear_contract_market(contractSize="2"), Decimal("2"), None),
+            ({"contract": True, "linear": True, "inverse": False}, None, "contractSize"),
+            (_linear_contract_market(contractSize="0"), None, "contractSize"),
+            (_linear_contract_market(contractSize="-1"), None, "contractSize"),
+            (_linear_contract_market(contractSize="NaN"), None, "contractSize"),
+            (
+                {"contract": True, "linear": False, "inverse": True, "contractSize": "1"},
+                None,
+                "only linear",
+            ),
+            ({"contract": True, "contractSize": "1"}, None, "only linear"),
+            ({}, None, "explicit contract classification"),
+        ],
+    )
+    def test_ccxt_contract_metadata_matrix(
+        self, market, expected_multiplier, error
+    ):
+        if error:
+            with pytest.raises(ValueError, match=error):
+                instrument_spec_from_ccxt_market(
+                    "BINANCE:BTCUSDT-PERP",
+                    market,
+                    precision_mode=PrecisionMode.TICK_SIZE,
+                )
+            return
+
+        spec = instrument_spec_from_ccxt_market(
+            "BINANCE:BTCUSDT-PERP",
+            market,
+            precision_mode=PrecisionMode.TICK_SIZE,
+        )
+        assert spec.multiplier == expected_multiplier
+
+    def test_invalid_contract_metadata_fails_closed_without_caching(
+        self, adapter, mock_ccxt_client
+    ):
+        mock_ccxt_client.load_markets.side_effect = None
+        mock_ccxt_client.load_markets.return_value = {
+            "BTC/USDT:USDT": {
+                "contract": True,
+                "linear": True,
+                "inverse": False,
+            }
+        }
+
+        with pytest.raises(ExchangeError, match="invalid_contract_metadata"):
+            adapter.get_instrument_spec("BINANCE:BTCUSDT-PERP")
+
+        assert "BINANCE:BTCUSDT-PERP" not in adapter._instrument_specs
+
     def test_ccxt_precision_mode_tick_size_treats_integer_as_step(self):
         spec = instrument_spec_from_ccxt_market(
             "BYBIT:BTCUSDT-PERP",
-            {
-                "precision": {
+            _linear_contract_market(
+                precision={
                     "amount": 3,
                     "price": 1,
                 },
-            },
+            ),
             precision_mode=PrecisionMode.TICK_SIZE,
         )
 
@@ -307,12 +386,12 @@ class TestPlaceOrder:
     def test_ccxt_precision_mode_tick_size_accepts_fractional_step(self):
         spec = instrument_spec_from_ccxt_market(
             "BYBIT:BTCUSDT-PERP",
-            {
-                "precision": {
+            _linear_contract_market(
+                precision={
                     "amount": "0.001",
                     "price": "0.10",
                 },
-            },
+            ),
             precision_mode=PrecisionMode.TICK_SIZE,
         )
 
@@ -322,16 +401,16 @@ class TestPlaceOrder:
     def test_ccxt_precision_mode_significant_digits_uses_filters(self):
         spec = instrument_spec_from_ccxt_market(
             "BYBIT:BTCUSDT-PERP",
-            {
-                "precision": {
+            _linear_contract_market(
+                precision={
                     "amount": 3,
                     "price": 2,
                 },
-                "info": {
+                info={
                     "lotSizeFilter": {"qtyStep": "0.001"},
                     "priceFilter": {"tickSize": "0.10"},
                 },
-            },
+            ),
             precision_mode=PrecisionMode.SIGNIFICANT_DIGITS,
         )
 
@@ -341,12 +420,12 @@ class TestPlaceOrder:
     def test_ccxt_precision_without_mode_is_ignored_with_warning(self, caplog):
         spec = instrument_spec_from_ccxt_market(
             "BYBIT:BTCUSDT-PERP",
-            {
-                "precision": {
+            _linear_contract_market(
+                precision={
                     "amount": 3,
                     "price": "0.10",
                 },
-            },
+            ),
             precision_mode=None,
         )
 
@@ -379,11 +458,11 @@ class TestPlaceOrder:
     ):
         spec = instrument_spec_from_ccxt_market(
             "BYBIT:BTCUSDT-PERP",
-            {
-                "precision": {
+            _linear_contract_market(
+                precision={
                     "amount": value,
                 },
-            },
+            ),
             precision_mode=precision_mode,
         )
 
@@ -1380,6 +1459,7 @@ class TestCreateAdapter:
             client = MagicMock()
             client.load_markets.return_value = {
                 "BTC/USDT:USDT": {
+                    **_linear_contract_market(),
                     "info": {
                         "filters": [
                             {"filterType": "LOT_SIZE", "stepSize": "0.001"},
@@ -1419,6 +1499,7 @@ class TestCreateAdapter:
             client.fetch_margin_mode.return_value = {"marginMode": "isolated"}
             client.load_markets.return_value = {
                 "BTC/USDT:USDT": {
+                    **_linear_contract_market(),
                     "info": {
                         "filters": [
                             {"filterType": "LOT_SIZE", "stepSize": "0.001"},
@@ -1477,6 +1558,7 @@ class TestCreateAdapter:
             client.fetch_margin_mode.return_value = {"marginMode": "cross"}
             client.load_markets.return_value = {
                 "BTC/USDT:USDT": {
+                    **_linear_contract_market(),
                     "info": {
                         "filters": [
                             {"filterType": "LOT_SIZE", "stepSize": "0.001"},
@@ -1531,6 +1613,7 @@ class TestCreateAdapter:
             }
             client.load_markets.return_value = {
                 "BTC/USDT:USDT": {
+                    **_linear_contract_market(),
                     "info": {
                         "filters": [
                             {"filterType": "LOT_SIZE", "stepSize": "0.001"},
@@ -1738,6 +1821,7 @@ class TestLiveBinanceWsOrderPath:
             client.secret = "s"
             client.load_markets.return_value = {
                 "BTC/USDT:USDT": {
+                    **_linear_contract_market(),
                     "info": {
                         "filters": [
                             {"filterType": "LOT_SIZE", "stepSize": "0.001"},

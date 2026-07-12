@@ -6,6 +6,10 @@ from decimal import Decimal
 from typing import Optional
 
 from src.core.models import Position, PositionSide, Signal, SignalType
+from src.core.product_registry import (
+    InstrumentSpec,
+    calculate_notional_exposure,
+)
 from src.core.risk_config import RiskConfig
 from src.core.risk_rules import RuleStatus
 
@@ -21,6 +25,7 @@ class MaxPositionNotionalRule:
         signal: Signal,
         current_position: Optional[Position],
         mid_price: Decimal,
+        instrument_spec: InstrumentSpec | None = None,
     ) -> tuple[RuleStatus, Optional[str]]:
         if signal.type in {SignalType.NO_SIGNAL, SignalType.EXIT_LONG, SignalType.EXIT_SHORT}:
             return RuleStatus.PASS, None
@@ -30,8 +35,12 @@ class MaxPositionNotionalRule:
             return RuleStatus.REJECT, f"max_position_notional_invalid_mid_price: {mid_price}"
 
         order_price = signal.price if signal.price is not None else mid_price
-        current_notional = _signed_position_notional(current_position, mid_price)
-        order_notional = _signed_order_notional(signal, order_price)
+        current_notional = _signed_position_notional(
+            current_position,
+            mid_price,
+            instrument_spec,
+        )
+        order_notional = _signed_order_notional(signal, order_price, instrument_spec)
         total_notional = abs(current_notional + order_notional)
 
         if total_notional > self.config.max_position_notional:
@@ -49,13 +58,26 @@ class MaxPositionNotionalRule:
 def _signed_position_notional(
     current_position: Optional[Position],
     mid_price: Decimal,
+    instrument_spec: InstrumentSpec | None = None,
 ) -> Decimal:
     if current_position is None:
         return Decimal("0")
     sign = Decimal("1") if current_position.side == PositionSide.LONG else Decimal("-1")
-    return sign * current_position.quantity * mid_price
+    return sign * calculate_notional_exposure(
+        current_position.quantity,
+        mid_price,
+        instrument_spec,
+    )
 
 
-def _signed_order_notional(signal: Signal, order_price: Decimal) -> Decimal:
+def _signed_order_notional(
+    signal: Signal,
+    order_price: Decimal,
+    instrument_spec: InstrumentSpec | None = None,
+) -> Decimal:
     sign = Decimal("1") if signal.type == SignalType.LONG else Decimal("-1")
-    return sign * signal.quantity * order_price
+    return sign * calculate_notional_exposure(
+        signal.quantity,
+        order_price,
+        instrument_spec,
+    )

@@ -17,6 +17,7 @@ from src.core.product_registry import (
     resolve_contract_multiplier,
     resolve_fee_model,
     calculate_required_capital,
+    calculate_notional_exposure,
 )
 
 
@@ -101,6 +102,22 @@ def test_per_contract_capital_requires_positive_amount(capital_per_contract):
     )
     with pytest.raises(ValueError, match="capital_per_contract must be positive"):
         calculate_required_capital(Decimal("1"), Decimal("100"), spec)
+
+
+def test_notional_exposure_ignores_capital_and_fee_models():
+    spec = InstrumentSpec(
+        product_id="TEST:MNQ",
+        exchange="test",
+        symbol="MNQ",
+        base="MNQ",
+        quote="USD",
+        multiplier=Decimal("2"),
+        fee_model=FeeModel.PER_CONTRACT,
+        capital_model=CapitalModel.PER_CONTRACT,
+        capital_per_contract=Decimal("2500"),
+    )
+
+    assert calculate_notional_exposure(Decimal("3"), Decimal("100"), spec) == Decimal("600")
 
 
 class TestToCcxtSymbol:

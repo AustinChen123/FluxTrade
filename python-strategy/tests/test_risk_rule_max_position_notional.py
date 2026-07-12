@@ -8,6 +8,7 @@ from src.core.models import PositionSide, SignalType
 from src.core.risk_config import RiskConfig
 from src.core.risk_rules import RuleStatus
 from src.core.risk_rules.max_position_notional import MaxPositionNotionalRule
+from src.core.product_registry import InstrumentSpec
 
 
 def _rule() -> MaxPositionNotionalRule:
@@ -157,3 +158,43 @@ def test_max_position_notional_rejects_invalid_mid_price(signal_factory) -> None
 
     assert status == RuleStatus.REJECT
     assert reason == "max_position_notional_invalid_mid_price: 0"
+
+
+def test_max_position_notional_multiplier_covers_add_reduce_and_flip(
+    signal_factory,
+    position_factory,
+) -> None:
+    spec = InstrumentSpec(
+        product_id="BINANCE:BTCUSDT-PERP",
+        exchange="test",
+        symbol="MNQ",
+        base="MNQ",
+        quote="USD",
+        multiplier=Decimal("2"),
+    )
+    position = position_factory(
+        side=PositionSide.LONG,
+        quantity=Decimal("1"),
+        entry_price=Decimal("25000"),
+    )
+
+    cases = [
+        (SignalType.LONG, Decimal("1"), RuleStatus.PASS),
+        (SignalType.LONG, Decimal("1.01"), RuleStatus.REJECT),
+        (SignalType.SHORT, Decimal("1"), RuleStatus.PASS),
+        (SignalType.SHORT, Decimal("3"), RuleStatus.PASS),
+        (SignalType.SHORT, Decimal("3.01"), RuleStatus.REJECT),
+    ]
+    for signal_type, quantity, expected in cases:
+        signal = signal_factory(
+            signal_type=signal_type,
+            price=Decimal("25000"),
+            quantity=quantity,
+        )
+        status, _ = _rule().evaluate(
+            signal,
+            position,
+            mid_price=Decimal("25000"),
+            instrument_spec=spec,
+        )
+        assert status == expected

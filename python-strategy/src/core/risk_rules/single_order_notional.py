@@ -6,6 +6,7 @@ from decimal import Decimal
 from typing import Optional
 
 from src.core.models import Signal
+from src.core.product_registry import InstrumentSpec, calculate_notional_exposure
 from src.core.risk_config import RiskConfig
 from src.core.risk_rules import RuleStatus
 
@@ -16,7 +17,12 @@ class SingleOrderNotionalRule:
     def __init__(self, config: RiskConfig) -> None:
         self.config = config
 
-    def evaluate(self, signal: Signal, nav: Decimal) -> tuple[RuleStatus, Optional[str]]:
+    def evaluate(
+        self,
+        signal: Signal,
+        nav: Decimal,
+        instrument_spec: InstrumentSpec | None = None,
+    ) -> tuple[RuleStatus, Optional[str]]:
         if signal.price is None:
             return RuleStatus.PASS, None
         if signal.quantity is None:
@@ -24,7 +30,11 @@ class SingleOrderNotionalRule:
         if nav <= 0:
             return RuleStatus.REJECT, f"single_order_notional_invalid_nav: {nav}"
 
-        notional = signal.price * signal.quantity
+        notional = calculate_notional_exposure(
+            signal.quantity,
+            signal.price,
+            instrument_spec,
+        )
         limit_notional = nav * self.config.max_single_order_notional_pct
         if notional > limit_notional:
             return (

@@ -45,6 +45,10 @@ def execution_engine(mock_db_session, mock_clock, mock_exchange_adapter, mock_or
 def _binance_btcusdt_market_rules(min_notional: str = "10") -> dict:
     return {
         "BTC/USDT:USDT": {
+            "contract": True,
+            "linear": True,
+            "inverse": False,
+            "contractSize": "1",
             "info": {
                 "filters": [
                     {"filterType": "PRICE_FILTER", "tickSize": "0.10"},

@@ -14,11 +14,14 @@ from datetime import date
 from decimal import Decimal
 from unittest.mock import MagicMock, patch
 
+import pytest
+
 from src.core.models import PositionSide, SignalType
 from src.core.risk_config import RiskConfig
 from src.core.risk_rules import RuleStatus
 from src.core.risk_rules.existing_position_entry import ExistingPositionEntryRule
 from src.core.risk_manager import RiskManager, AccountService
+from src.core.product_registry import InstrumentSpec
 
 
 class _FakeOrderRateLimitRule:
@@ -95,6 +98,43 @@ class TestRiskManagerBalanceChecks:
         is_allowed, reason = risk_manager.check_risk(signal)
 
         assert is_allowed is True
+
+    @pytest.mark.parametrize(
+        "signal_type",
+        [SignalType.NO_SIGNAL, SignalType.EXIT_LONG, SignalType.EXIT_SHORT],
+    )
+    def test_risk_reducing_signals_do_not_resolve_instrument_metadata(
+        self, mock_account_service, signal_factory, signal_type
+    ):
+        def fail_if_called(product_id):
+            raise RuntimeError(f"metadata unavailable for {product_id}")
+
+        risk_manager = RiskManager(
+            mock_account_service,
+            instrument_spec_resolver=fail_if_called,
+        )
+
+        allowed, reason = risk_manager.check_risk(
+            signal_factory(signal_type=signal_type)
+        )
+
+        assert allowed is True
+        assert reason in {"NO_SIGNAL", "PASS"}
+
+    @pytest.mark.parametrize("signal_type", [SignalType.LONG, SignalType.SHORT])
+    def test_entry_signals_fail_closed_when_instrument_metadata_is_unavailable(
+        self, mock_account_service, signal_factory, signal_type
+    ):
+        def fail_if_called(product_id):
+            raise RuntimeError(f"metadata unavailable for {product_id}")
+
+        risk_manager = RiskManager(
+            mock_account_service,
+            instrument_spec_resolver=fail_if_called,
+        )
+
+        with pytest.raises(RuntimeError, match="metadata unavailable"):
+            risk_manager.check_risk(signal_factory(signal_type=signal_type))
 
     def test_allow_entry_with_positive_balance(self, mock_account_service, signal_factory):
         """Entry signals should be allowed with positive balance."""
@@ -1112,3 +1152,36 @@ class TestRiskManagerWithCapitalAllocator:
 
         assert is_allowed is True
         assert reason == "PASS"
+
+    def test_per_strategy_exposure_applies_contract_multiplier(
+        self, mock_account_service, signal_factory, position_factory
+    ):
+        from src.core.capital_allocator import CapitalAllocator
+
+        allocator = CapitalAllocator(Decimal("100000"))
+        allocator.allocate("test_strategy", Decimal("50000"))
+        position = position_factory(quantity=Decimal("0.25"), entry_price=Decimal("40000"))
+        mock_account_service.set_position(position)
+        spec = InstrumentSpec(
+            product_id=position.product_id,
+            exchange="test",
+            symbol="MNQ",
+            base="MNQ",
+            quote="USD",
+            multiplier=Decimal("2"),
+        )
+        risk_manager = RiskManager(
+            mock_account_service,
+            capital_allocator=allocator,
+            max_exposure_per_strategy=Decimal("15000"),
+            existing_position_entry_rule=_PassExistingPositionEntryRule(),
+            instrument_spec_resolver=lambda product_id: spec,
+        )
+
+        allowed, reason = risk_manager.check_risk(
+            signal_factory(signal_type=SignalType.LONG),
+            current_price=Decimal("40000"),
+        )
+
+        assert allowed is False
+        assert "20000" in reason
