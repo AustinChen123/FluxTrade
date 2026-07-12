@@ -230,6 +230,21 @@ class TestCsvDataSourceStandard:
         base_ts = 1704067200000
         assert rng == (base_ts, base_ts + 9 * 60000)
 
+    def test_iso_utc_timestamps_are_parsed_as_epoch_milliseconds(self, tmp_path):
+        path = tmp_path / "iso_utc.csv"
+        path.write_text(
+            "timestamp,open,high,low,close,volume\n"
+            "2024-07-11T00:00:00Z,1,1,1,1,1\n"
+            "2024-07-11T00:01:00Z,1,1,1,1,1\n"
+        )
+
+        ds = CsvDataSource(str(path), product_id=PRODUCT, timeframe=TF)
+
+        assert ds.get_available_range(PRODUCT, TF) == (
+            1_720_656_000_000,
+            1_720_656_060_000,
+        )
+
     def test_available_range_filters_product_and_timeframe(self, csv_file):
         ds = CsvDataSource(csv_file, product_id=PRODUCT, timeframe=TF)
 
