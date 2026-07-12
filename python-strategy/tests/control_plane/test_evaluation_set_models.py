@@ -326,6 +326,67 @@ def test_parameter_search_merges_dataset_backtest_overrides_with_shared_settings
     assert override_request.backtest.write_reports is False
 
 
+def test_parameter_search_merges_partial_instrument_overrides_by_field():
+    payload = _base_search_request()
+    payload["backtest"] = {
+        "candles_csv_path": "data/shared.csv",
+        "instrument": {
+            "multiplier": "5",
+            "fee_model": "per_contract",
+            "capital_model": "per_contract",
+            "capital_per_contract": "500",
+        },
+    }
+    payload["evaluation_set"] = {
+        "datasets": [
+            {
+                "dataset_id": "multiplier",
+                "product_id": PRODUCT_ID,
+                "timeframe": "5m",
+                "start_time": 10,
+                "end_time": 20,
+                "backtest": {"instrument": {"multiplier": "2"}},
+            },
+            {
+                "dataset_id": "capital",
+                "product_id": PRODUCT_ID,
+                "timeframe": "5m",
+                "start_time": 20,
+                "end_time": 30,
+                "backtest": {"instrument": {"capital_per_contract": "750"}},
+            },
+            {
+                "dataset_id": "notional",
+                "product_id": PRODUCT_ID,
+                "timeframe": "5m",
+                "start_time": 30,
+                "end_time": 40,
+                "backtest": {"instrument": {"capital_model": "notional"}},
+            },
+        ],
+    }
+    evaluator = _NoopEvaluator()
+    executor = ParameterSearchJobExecutor(evaluator=evaluator, run_inline=True)
+
+    job = executor.submit_search(ParameterSearchJobRequest.model_validate(payload))
+
+    assert job.status.value == "SUCCEEDED"
+    multiplier, capital, notional = [
+        request.backtest.instrument for request, _ in evaluator.requests
+    ]
+    assert multiplier.multiplier == Decimal("2")
+    assert multiplier.fee_model.value == "per_contract"
+    assert multiplier.capital_model.value == "per_contract"
+    assert multiplier.capital_per_contract == Decimal("500")
+    assert capital.multiplier == Decimal("5")
+    assert capital.capital_model.value == "per_contract"
+    assert capital.capital_per_contract == Decimal("750")
+    assert notional.multiplier == Decimal("5")
+    assert notional.fee_model.value == "per_contract"
+    assert notional.capital_model.value == "notional"
+    assert notional.capital_per_contract is None
+
+
 def test_parameter_search_allows_non_path_dataset_backtest_overrides():
     payload = _base_search_request()
     payload["backtest"] = {

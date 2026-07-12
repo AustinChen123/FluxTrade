@@ -135,6 +135,11 @@ class StrategyEngine:
                 raise
         else:
             logger.info("StrategyEngine: Using provided adapter %s", type(adapter).__name__)
+        self.risk_manager.instrument_spec_resolver = getattr(
+            adapter,
+            "get_instrument_spec",
+            None,
+        )
         self._runtime_reconciliation_enabled = _is_runtime_reconciliation_enabled(
             adapter,
             adapter_config,

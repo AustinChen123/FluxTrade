@@ -23,6 +23,7 @@ from src.core.orm_models import Candlestick as ORMCandlestick, StrategyState
 from src.core.daily_nav_snapshot import DailyNavSnapshotService
 from src.core.adapters.ccxt_adapter import CcxtExchangeAdapter
 from src.core.adapters.simulated import SimulatedAdapter
+from src.core.product_registry import InstrumentSpec
 from src.core.engine import (
     SYSTEM_BOOT_STATE_KEY,
     StrategyEngine,
@@ -71,6 +72,21 @@ def _make_candle(
 
 
 class TestEngineInit:
+
+    def test_risk_manager_uses_adapter_instrument_specs(self, engine_factory):
+        spec = InstrumentSpec(
+            product_id="BINANCE:BTCUSDT-PERP",
+            exchange="test",
+            symbol="MNQ",
+            base="MNQ",
+            quote="USD",
+            multiplier=Decimal("2"),
+        )
+        adapter = SimulatedAdapter(instrument_spec=spec)
+
+        engine = engine_factory(adapter=adapter)
+
+        assert engine.risk_manager.instrument_spec_resolver(spec.product_id) is spec
 
     @pytest.mark.parametrize(
         ("adapter", "adapter_config", "expected"),

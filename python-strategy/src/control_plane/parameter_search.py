@@ -29,6 +29,7 @@ from src.core.golden_cross_fast_fitness import GoldenCrossFastFitnessEvaluator
 from src.core.models import GeneRole
 from src.core.orm_models import EvolutionEpoch, GeneRecord
 from src.core.precision import PrecisionCodec
+from src.core.product_registry import CapitalModel
 from src.core.research_backtest_runner import ResearchBacktestRunner
 from src.strategies.base import BaseStrategy
 from src.strategies.golden_cross import GoldenCrossStrategy
@@ -623,9 +624,23 @@ def _backtest_for_evaluation_dataset(
     if request.backtest is None:
         return CsvSignalBacktestEvaluationConfig.model_validate(overrides)
 
+    shared = request.backtest.model_dump()
+    instrument_overrides = overrides.pop("instrument", None)
+    if instrument_overrides is not None:
+        instrument = {
+            **(shared.get("instrument") or {}),
+            **instrument_overrides,
+        }
+        if (
+            instrument_overrides.get("capital_model") == CapitalModel.NOTIONAL
+            and "capital_per_contract" not in instrument_overrides
+        ):
+            instrument["capital_per_contract"] = None
+        shared["instrument"] = instrument
+
     return CsvSignalBacktestEvaluationConfig.model_validate(
         {
-            **request.backtest.model_dump(),
+            **shared,
             **overrides,
         }
     )

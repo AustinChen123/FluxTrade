@@ -7,6 +7,7 @@ from decimal import Decimal
 from src.core.risk_config import RiskConfig
 from src.core.risk_rules import RuleStatus
 from src.core.risk_rules.single_order_notional import SingleOrderNotionalRule
+from src.core.product_registry import InstrumentSpec
 
 
 def _rule() -> SingleOrderNotionalRule:
@@ -67,3 +68,33 @@ def test_single_order_notional_rejects_non_positive_nav(signal_factory) -> None:
 
     assert status == RuleStatus.REJECT
     assert reason == "single_order_notional_invalid_nav: 0"
+
+
+def test_single_order_notional_applies_contract_multiplier(signal_factory) -> None:
+    signal = signal_factory(price=Decimal("2500"), quantity=Decimal("1"))
+    spec = InstrumentSpec(
+        product_id=signal.product_id,
+        exchange="test",
+        symbol="MNQ",
+        base="MNQ",
+        quote="USD",
+        multiplier=Decimal("2"),
+    )
+
+    status, reason = _rule().evaluate(
+        signal,
+        nav=Decimal("100000"),
+        instrument_spec=spec,
+    )
+
+    assert status == RuleStatus.PASS
+    assert reason is None
+
+    signal.price = Decimal("2500.01")
+    status, reason = _rule().evaluate(
+        signal,
+        nav=Decimal("100000"),
+        instrument_spec=spec,
+    )
+    assert status == RuleStatus.REJECT
+    assert reason == "single_order_notional_exceeded: 5000.02 > 5000.00"

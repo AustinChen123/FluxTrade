@@ -19,6 +19,7 @@ import pytest
 from src.core.adapters.simulated import SimulatedAdapter
 from src.core.models import Candlestick
 from src.core.precision import PrecisionCodec, PrecisionSpec
+from src.core.product_registry import InstrumentSpec
 
 
 # ── helpers ──────────────────────────────────────────────────────
@@ -54,6 +55,20 @@ class TestSimulatedAdapterBasics:
     def test_initialization_custom(self):
         adapter = SimulatedAdapter(Decimal("50000"), maker_fee=Decimal("0.001"), taker_fee=Decimal("0.002"))
         assert adapter.get_balance() == Decimal("50000")
+
+    def test_exposes_only_configured_instrument_spec(self):
+        spec = InstrumentSpec(
+            product_id=PRODUCT,
+            exchange="test",
+            symbol="MNQ",
+            base="MNQ",
+            quote="USD",
+            multiplier=Decimal("2"),
+        )
+        adapter = SimulatedAdapter(instrument_spec=spec)
+
+        assert adapter.get_instrument_spec(PRODUCT) is spec
+        assert adapter.get_instrument_spec("BINANCE:ETHUSDT-PERP") is None
 
 
 # =================================================================

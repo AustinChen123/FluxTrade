@@ -1,7 +1,7 @@
 import logging
 from datetime import date
 from decimal import Decimal
-from typing import TYPE_CHECKING, Optional, Any
+from typing import TYPE_CHECKING, Optional, Any, Callable
 from src.core.models import Signal, SignalType, Position, PositionSide
 from src.core.redis_factory import create_redis_client
 from src.core.risk_config import RiskConfig
@@ -12,6 +12,7 @@ from src.core.risk_rules.max_position_notional import MaxPositionNotionalRule
 from src.core.risk_rules.order_rate_limit import OrderRateLimitRule
 from src.core.risk_rules.price_sanity_check import PriceSanityCheckRule
 from src.core.risk_rules.single_order_notional import SingleOrderNotionalRule
+from src.core.product_registry import InstrumentSpec, calculate_notional_exposure
 
 if TYPE_CHECKING:
     from src.core.capital_allocator import CapitalAllocator
@@ -115,6 +116,9 @@ class RiskManager:
         existing_position_entry_rule: Optional[ExistingPositionEntryRule] = None,
         state_manager: Optional[Any] = None,
         daily_nav_service: Optional[Any] = None,
+        instrument_spec_resolver: Optional[
+            Callable[[str], InstrumentSpec | None]
+        ] = None,
     ):
         self.account_service = account_service
         self.risk_config = risk_config or RiskConfig.from_env()
@@ -135,6 +139,7 @@ class RiskManager:
         self.capital_allocator = capital_allocator
         self.state_manager = state_manager
         self.daily_nav_service = daily_nav_service
+        self.instrument_spec_resolver = instrument_spec_resolver
         self.max_exposure_per_strategy = (
             max_exposure_per_strategy or self.risk_config.max_position_notional
         )
@@ -163,6 +168,7 @@ class RiskManager:
             return True, "NO_SIGNAL"
 
         is_entry = signal.type in [SignalType.LONG, SignalType.SHORT]
+        instrument_spec = self._instrument_spec(signal.product_id) if is_entry else None
 
         # Rule 1: Balance / Capital check
         if self.capital_allocator is not None:
@@ -183,7 +189,11 @@ class RiskManager:
         # Rule 2: Single-order notional check.
         if is_entry:
             nav = self.account_service.get_balance()
-            rule_status, rule_reason = self.single_order_rule.evaluate(signal, nav)
+            rule_status, rule_reason = self.single_order_rule.evaluate(
+                signal,
+                nav,
+                instrument_spec,
+            )
             if rule_status == RuleStatus.REJECT:
                 msg = f"REJECT: {rule_reason}"
                 logger.warning("RISK_REJECTED: %s", msg)
@@ -247,7 +257,11 @@ class RiskManager:
                         return False, msg
 
                 if signal.quantity is None:
-                    current_exposure = position.quantity * price_for_exposure
+                    current_exposure = calculate_notional_exposure(
+                        position.quantity,
+                        price_for_exposure,
+                        instrument_spec,
+                    )
                     if current_exposure > self.risk_config.max_position_notional:
                         msg = (
                             "REJECT: Max exposure reached "
@@ -260,6 +274,7 @@ class RiskManager:
                         signal,
                         position,
                         price_for_exposure,
+                        instrument_spec,
                     )
                     if rule_status == RuleStatus.REJECT:
                         msg = f"REJECT: Max exposure reached ({rule_reason})"
@@ -268,7 +283,11 @@ class RiskManager:
 
             # Per-strategy exposure limit (only when capital_allocator present)
             if self.capital_allocator is not None and is_entry:
-                current_exposure = position.quantity * price_for_exposure
+                current_exposure = calculate_notional_exposure(
+                    position.quantity,
+                    price_for_exposure,
+                    instrument_spec,
+                )
                 if current_exposure >= self.max_exposure_per_strategy:
                     msg = (
                         f"REJECT: Strategy {signal.strategy_id} max exposure reached "
@@ -288,6 +307,11 @@ class RiskManager:
                 return False, msg
 
         return True, "PASS"
+
+    def _instrument_spec(self, product_id: str) -> InstrumentSpec | None:
+        if self.instrument_spec_resolver is None:
+            return None
+        return self.instrument_spec_resolver(product_id)
 
     def _transition_strategy_to_error(self, strategy_id: str, reason: str) -> None:
         if self.state_manager is None:

@@ -265,11 +265,14 @@ class CcxtExchangeAdapter(IExchangeAdapter):
                 f"market_not_found: {ccxt_symbol} for {product_id}; "
                 "refusing to build InstrumentSpec"
             )
-        spec = instrument_spec_from_ccxt_market(
-            product_id,
-            market,
-            precision_mode=self._precision_mode(),
-        )
+        try:
+            spec = instrument_spec_from_ccxt_market(
+                product_id,
+                market,
+                precision_mode=self._precision_mode(),
+            )
+        except ValueError as e:
+            raise ExchangeError(f"invalid_contract_metadata: {product_id}: {e}") from e
         missing_rules = []
         if spec.quantity_step is None:
             missing_rules.append("quantity_step")
