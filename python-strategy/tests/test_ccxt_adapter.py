@@ -314,6 +314,15 @@ class TestPlaceOrder:
         assert spec.min_quantity == Decimal("0.001")
         assert spec.min_notional == Decimal("5")
 
+    def test_dynamic_perpetual_instrument_spec_keeps_ccxt_symbol(self):
+        spec = instrument_spec_from_ccxt_market(
+            "BINANCE:SOLUSDT-PERP",
+            _linear_contract_market(contractSize="1"),
+            precision_mode=PrecisionMode.TICK_SIZE,
+        )
+
+        assert spec.symbol == "SOL/USDT:USDT"
+
     @pytest.mark.parametrize(
         ("market", "expected_multiplier", "error"),
         [

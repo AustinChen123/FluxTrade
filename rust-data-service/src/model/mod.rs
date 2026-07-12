@@ -1,6 +1,45 @@
 use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
 
+pub fn validate_product_id(product_id: &str) -> anyhow::Result<()> {
+    let (venue, instrument) = product_id
+        .split_once(':')
+        .filter(|(_, instrument)| !instrument.contains(':'))
+        .ok_or_else(|| anyhow::anyhow!("Invalid product_id format: {product_id}"))?;
+    if venue.is_empty()
+        || !venue
+            .chars()
+            .all(|c| c.is_ascii_uppercase() || c.is_ascii_digit())
+    {
+        anyhow::bail!("Invalid product_id format: {product_id}");
+    }
+
+    if let Some(symbol) = instrument.strip_suffix("-PERP") {
+        if !symbol.is_empty()
+            && symbol
+                .chars()
+                .all(|c| c.is_ascii_uppercase() || c.is_ascii_digit() || c == '_')
+        {
+            return Ok(());
+        }
+    } else if let Some((root, expiry)) = instrument.rsplit_once('-') {
+        let month = expiry.get(4..6).and_then(|value| value.parse::<u8>().ok());
+        if !root.is_empty()
+            && root.starts_with(|c: char| c.is_ascii_uppercase())
+            && root
+                .chars()
+                .all(|c| c.is_ascii_uppercase() || c.is_ascii_digit())
+            && expiry.len() == 6
+            && expiry.chars().all(|c| c.is_ascii_digit())
+            && month.is_some_and(|value| (1..=12).contains(&value))
+        {
+            return Ok(());
+        }
+    }
+
+    anyhow::bail!("Invalid product_id format: {product_id}")
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Candlestick {
     pub product_id: String,
@@ -32,9 +71,7 @@ impl Candlestick {
         if self.volume < Decimal::ZERO {
             anyhow::bail!("Volume cannot be negative");
         }
-        if !self.product_id.contains(':') || !self.product_id.ends_with("-PERP") {
-            anyhow::bail!("Invalid product_id format: {}", self.product_id);
-        }
+        validate_product_id(&self.product_id)?;
         Ok(())
     }
 }
@@ -52,6 +89,7 @@ pub struct Trade {
 impl Trade {
     #[allow(dead_code)]
     pub fn validate(&self) -> anyhow::Result<()> {
+        validate_product_id(&self.product_id)?;
         if self.price <= Decimal::ZERO {
             anyhow::bail!("Price must be positive");
         }
@@ -92,6 +130,30 @@ mod tests {
         let mut zero_price_candle = make_valid();
         zero_price_candle.open = dec!(0);
         assert!(zero_price_candle.validate().is_err());
+    }
+
+    #[test]
+    fn product_id_validation_matrix() {
+        for product_id in [
+            "BINANCE:BTCUSDT-PERP",
+            "BACKPACK:SOL_USDC-PERP",
+            "RITHMIC:MNQ-202509",
+            "CME:ES-202512",
+        ] {
+            assert!(validate_product_id(product_id).is_ok(), "{product_id}");
+        }
+
+        for product_id in [
+            "RITHMIC:MNQ",
+            "RITHMIC:MNQ-202500",
+            "RITHMIC:MNQ-202513",
+            "RITHMIC:MNQ-20259",
+            "rithmic:MNQ-202509",
+            "RITHMIC:mnq-202509",
+            "RITHMIC::MNQ-202509",
+        ] {
+            assert!(validate_product_id(product_id).is_err(), "{product_id}");
+        }
     }
 
     #[test]

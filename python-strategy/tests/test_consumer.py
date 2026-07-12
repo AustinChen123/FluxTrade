@@ -156,6 +156,26 @@ class TestParseMessage:
 
         assert isinstance(result, Trade)
 
+    def test_parse_rithmic_dated_future_without_rewriting_product_id(self, consumer):
+        payload = json.dumps({
+            "product_id": "RITHMIC:MNQ-202509",
+            "timeframe": "1m",
+            "timestamp": 1704067200000,
+            "open": "20000.00",
+            "high": "20000.25",
+            "low": "19999.75",
+            "close": "20000.00",
+            "volume": "10",
+        })
+
+        result = consumer._parse_message(
+            "stream:market:rithmic:mnq-202509:1m",
+            {"json": payload},
+        )
+
+        assert isinstance(result, Candlestick)
+        assert result.product_id == "RITHMIC:MNQ-202509"
+
     def test_parse_raw_trade_keys(self, consumer):
         """Should parse raw key-value data with price/quantity as Trade."""
         data = {
@@ -179,7 +199,7 @@ class TestParseMessage:
 
         result = consumer._parse_message("stream:key", data)
 
-        # 'unknown' doesn't match EXCHANGE:SYMBOL-PERP regex, so validation fails
+        # 'unknown' is not a canonical product ID, so validation fails.
         # _parse_message catches the exception and returns None
         assert result is None
 

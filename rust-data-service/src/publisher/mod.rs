@@ -1,4 +1,4 @@
-use crate::model::{AccountUpdate, Candlestick, PositionUpdate, Trade};
+use crate::model::{validate_product_id, AccountUpdate, Candlestick, PositionUpdate, Trade};
 use anyhow::Result;
 use redis::AsyncCommands;
 use serde::Serialize;
@@ -191,22 +191,13 @@ impl RedisPublisher {
     }
 
     pub async fn publish_candle(&mut self, candle: &Candlestick) -> Result<()> {
-        // Stream Key: stream:market:{exchange}:{symbol}
-        // product_id is "EXCHANGE:SYMBOL-PERP"
-        let parts: Vec<&str> = candle.product_id.split(':').collect();
-        let exchange = parts[0].to_lowercase();
-        let symbol = parts[1].replace("-PERP", "").to_lowercase();
-        let tf = candle.timeframe.to_lowercase();
-        let topic = format!("stream:market:{}:{}:{}", exchange, symbol, tf);
+        let topic = market_stream_key(&candle.product_id, Some(&candle.timeframe))?;
 
         self.publish(&topic, candle).await
     }
 
     pub async fn publish_trade(&mut self, trade: &Trade) -> Result<()> {
-        let parts: Vec<&str> = trade.product_id.split(':').collect();
-        let exchange = parts[0].to_lowercase();
-        let symbol = parts[1].replace("-PERP", "").to_lowercase();
-        let topic = format!("stream:market:{}:{}", exchange, symbol);
+        let topic = market_stream_key(&trade.product_id, None)?;
 
         self.publish(&topic, trade).await
     }
@@ -247,6 +238,22 @@ impl RedisPublisher {
     }
 }
 
+fn market_stream_key(product_id: &str, timeframe: Option<&str>) -> Result<String> {
+    validate_product_id(product_id)?;
+    let (venue, instrument) = product_id.split_once(':').expect("validated product_id");
+    let symbol = instrument.strip_suffix("-PERP").unwrap_or(instrument);
+    let mut key = format!(
+        "stream:market:{}:{}",
+        venue.to_ascii_lowercase(),
+        symbol.to_ascii_lowercase()
+    );
+    if let Some(timeframe) = timeframe {
+        key.push(':');
+        key.push_str(&timeframe.to_ascii_lowercase());
+    }
+    Ok(key)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -256,6 +263,28 @@ mod tests {
         let (sender, _rx) = create_publish_channel(100);
         // Sender should be cloneable
         let _sender2 = sender.clone();
+    }
+
+    #[test]
+    fn dated_future_stream_key_and_payload_preserve_product_id() {
+        let candle = Candlestick {
+            product_id: "RITHMIC:MNQ-202509".to_string(),
+            timeframe: "1m".to_string(),
+            timestamp: 1_704_067_200_000,
+            open: rust_decimal_macros::dec!(20000),
+            high: rust_decimal_macros::dec!(20000.25),
+            low: rust_decimal_macros::dec!(19999.75),
+            close: rust_decimal_macros::dec!(20000),
+            volume: rust_decimal_macros::dec!(10),
+        };
+
+        assert_eq!(
+            market_stream_key(&candle.product_id, Some(&candle.timeframe)).unwrap(),
+            "stream:market:rithmic:mnq-202509:1m"
+        );
+        let payload = serde_json::to_string(&candle).unwrap();
+        let decoded: Candlestick = serde_json::from_str(&payload).unwrap();
+        assert_eq!(decoded.product_id, "RITHMIC:MNQ-202509");
     }
 
     #[tokio::test]

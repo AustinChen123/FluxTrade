@@ -2,9 +2,8 @@ from pydantic import BaseModel, ConfigDict, field_validator, field_serializer
 from decimal import Decimal
 from enum import Enum
 from typing import Optional, Any
-import re
 
-PRODUCT_ID_REGEX = r"^[A-Z0-9]+:[A-Z0-9_]+-PERP$"
+from src.core.product_registry import validate_product_id
 
 class OrderSide(str, Enum):
     BUY = "buy"
@@ -101,9 +100,7 @@ class Trade(BaseFluxModel):
     @field_validator('product_id')
     @classmethod
     def validate_product_id(cls, v: str) -> str:
-        if not re.match(PRODUCT_ID_REGEX, v):
-            raise ValueError(f"Invalid product_id format: {v}. Expected EXCHANGE:SYMBOL-PERP")
-        return v
+        return validate_product_id(v)
 
 class Candlestick(BaseFluxModel):
     product_id: str
@@ -118,9 +115,7 @@ class Candlestick(BaseFluxModel):
     @field_validator('product_id')
     @classmethod
     def validate_product_id(cls, v: str) -> str:
-        if not re.match(PRODUCT_ID_REGEX, v):
-            raise ValueError(f"Invalid product_id format: {v}. Expected EXCHANGE:SYMBOL-PERP")
-        return v
+        return validate_product_id(v)
 
 class Signal(BaseFluxModel):
     strategy_id: str
@@ -139,9 +134,7 @@ class Signal(BaseFluxModel):
     @field_validator('product_id')
     @classmethod
     def validate_product_id(cls, v: str) -> str:
-        if not re.match(PRODUCT_ID_REGEX, v):
-            raise ValueError(f"Invalid product_id format: {v}. Expected EXCHANGE:SYMBOL-PERP")
-        return v
+        return validate_product_id(v)
 
 class Position(BaseFluxModel):
     strategy_id: str
@@ -154,6 +147,4 @@ class Position(BaseFluxModel):
     @field_validator('product_id')
     @classmethod
     def validate_product_id(cls, v: str) -> str:
-        if not re.match(PRODUCT_ID_REGEX, v):
-            raise ValueError(f"Invalid product_id format: {v}. Expected EXCHANGE:SYMBOL-PERP")
-        return v
+        return validate_product_id(v)
