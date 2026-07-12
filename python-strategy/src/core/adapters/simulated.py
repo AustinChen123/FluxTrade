@@ -2,12 +2,14 @@ import inspect
 import uuid
 from decimal import Decimal
 from typing import TYPE_CHECKING, Optional, List, Dict
-from src.core.interfaces.exchange import ExchangeOrderSnapshot, IExchangeAdapter
+from src.core.interfaces.exchange import ExchangeError, ExchangeOrderSnapshot, IExchangeAdapter
 from src.core.orm_models import Order
 from src.core.models import OrderSide, Position, Candlestick, PositionSide
 from src.core.precision import PrecisionCodec
 from src.core.product_registry import (
     InstrumentSpec,
+    is_dated_future_product_id,
+    quantize_order_values,
     resolve_contract_multiplier,
     resolve_fee_model,
 )
@@ -92,6 +94,7 @@ class SimulatedAdapter(IExchangeAdapter):
     # ── IExchangeAdapter interface ───────────────────────────────
 
     def place_order(self, order: Order) -> str:
+        self.validate_order(order)
         exchange_id = f"SIM-{uuid.uuid4().hex[:8]}"
 
         rust_order = self._to_rust_order(order)
@@ -100,6 +103,38 @@ class SimulatedAdapter(IExchangeAdapter):
         self._order_map[order.id] = order
 
         return exchange_id
+
+    def validate_order(self, order: Order) -> None:
+        if self._instrument_spec is None:
+            if is_dated_future_product_id(order.product_id):
+                raise ExchangeError(
+                    "instrument_spec_required_for_dated_future: "
+                    f"product_id={order.product_id}"
+                )
+            return
+        instrument_spec = self.get_instrument_spec(order.product_id)
+        if instrument_spec is None:
+            raise ExchangeError(
+                "instrument_spec_product_mismatch: "
+                f"configured={self._instrument_spec.product_id} "
+                f"order={order.product_id}"
+            )
+        try:
+            quantized = quantize_order_values(
+                quantity=order.quantity,
+                price=order.price,
+                side=order.side,
+                order_type=order.type,
+                trigger_price=order.trigger_price,
+                trailing_distance=getattr(order, "_trailing_distance", None),
+                spec=instrument_spec,
+            )
+        except ValueError as exc:
+            raise ExchangeError(str(exc)) from exc
+        if quantized.changed:
+            order.quantity = quantized.quantity
+            order.price = quantized.price
+            order.trigger_price = quantized.trigger_price
 
     def cancel_order(
         self,

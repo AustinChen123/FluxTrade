@@ -215,6 +215,12 @@ def validate_product_id(product_id: str) -> str:
     return product_id
 
 
+def is_dated_future_product_id(product_id: str) -> bool:
+    """Return whether a canonical product ID identifies an expiring contract."""
+    validate_product_id(product_id)
+    return _DATED_FUTURE_PRODUCT_ID_PATTERN.fullmatch(product_id) is not None
+
+
 def to_ccxt_symbol(product_id: str) -> str:
     """Convert product_id to CCXT symbol.
 
@@ -430,8 +436,18 @@ def quantize_order_values(
     side: str | None = None,
     order_type: str | None = None,
     trigger_price: Decimal | None = None,
+    trailing_distance: Decimal | None = None,
     spec: InstrumentSpec,
 ) -> QuantizedOrder:
+    if _DATED_FUTURE_PRODUCT_ID_PATTERN.fullmatch(spec.product_id):
+        return _validate_dated_future_order_values(
+            quantity=quantity,
+            price=price,
+            trigger_price=trigger_price,
+            trailing_distance=trailing_distance,
+            spec=spec,
+        )
+
     quantized_quantity = _floor_to_step(quantity, spec.quantity_step)
     quantized_price = (
         _quantize_limit_price(price, spec.price_tick, side)
@@ -457,6 +473,60 @@ def quantize_order_values(
             or quantized_price != price
             or quantized_trigger_price != trigger_price
         ),
+    )
+
+
+def _validate_dated_future_order_values(
+    *,
+    quantity: Decimal,
+    price: Decimal | None,
+    trigger_price: Decimal | None,
+    trailing_distance: Decimal | None,
+    spec: InstrumentSpec,
+) -> QuantizedOrder:
+    if (
+        spec.quantity_step is None
+        or not spec.quantity_step.is_finite()
+        or spec.quantity_step <= 0
+    ):
+        raise ValueError("futures_quantity_step_must_be_positive")
+    if (
+        not quantity.is_finite()
+        or quantity <= 0
+    ):
+        raise ValueError(f"futures_quantity_must_be_positive: quantity={quantity}")
+    if _floor_to_step(quantity, spec.quantity_step) != quantity:
+        raise ValueError(
+            "futures_quantity_off_step: "
+            f"quantity={quantity} step={spec.quantity_step}"
+        )
+
+    has_price = any(
+        value is not None for value in (price, trigger_price, trailing_distance)
+    )
+    if has_price and (
+        spec.price_tick is None
+        or not spec.price_tick.is_finite()
+        or spec.price_tick <= 0
+    ):
+        raise ValueError("futures_price_tick_must_be_positive")
+
+    for label, value in (
+        ("price", price),
+        ("trigger_price", trigger_price),
+        ("trailing_distance", trailing_distance),
+    ):
+        if value is None:
+            continue
+        if not value.is_finite() or value <= 0:
+            raise ValueError(f"{label}_must_be_positive: {label}={value}")
+        _require_on_step(label, value, spec.price_tick)
+
+    return QuantizedOrder(
+        quantity=quantity,
+        price=price,
+        trigger_price=trigger_price,
+        changed=False,
     )
 
 

@@ -19,6 +19,7 @@ import pytest
 from src.core.adapters.simulated import SimulatedAdapter
 from src.core.models import Candlestick
 from src.core.precision import PrecisionCodec, PrecisionSpec
+from src.core.interfaces.exchange import ExchangeError
 from src.core.product_registry import InstrumentSpec
 
 
@@ -69,6 +70,268 @@ class TestSimulatedAdapterBasics:
 
         assert adapter.get_instrument_spec(PRODUCT) is spec
         assert adapter.get_instrument_spec("BINANCE:ETHUSDT-PERP") is None
+
+    @pytest.mark.parametrize(
+        ("configured_product", "order_product"),
+        [
+            ("RITHMIC:MNQ-202509", "BINANCE:BTCUSDT-PERP"),
+            ("BINANCE:BTCUSDT-PERP", "RITHMIC:MNQ-202509"),
+        ],
+    )
+    def test_configured_instrument_rejects_other_products_before_submission(
+        self, order_factory, configured_product, order_product
+    ):
+        spec = InstrumentSpec(
+            product_id=configured_product,
+            exchange=configured_product.partition(":")[0].lower(),
+            symbol=configured_product,
+            base=configured_product,
+            quote="",
+            quantity_step=Decimal("1"),
+            price_tick=Decimal("0.25"),
+        )
+        adapter = SimulatedAdapter(instrument_spec=spec)
+        order = order_factory(
+            product_id=order_product,
+            order_type="market",
+            quantity=Decimal("1"),
+            price=None,
+        )
+
+        with pytest.raises(ExchangeError, match="instrument_spec_product_mismatch"):
+            adapter.place_order(order)
+
+        assert adapter.get_open_orders(order_product) == []
+
+    def test_unconfigured_adapter_keeps_legacy_multi_product_submission(
+        self, order_factory
+    ):
+        adapter = SimulatedAdapter()
+        orders = [
+            order_factory(product_id="BINANCE:BTCUSDT-PERP"),
+            order_factory(product_id="BINANCE:ETHUSDT-PERP"),
+        ]
+
+        for order in orders:
+            adapter.place_order(order)
+
+        assert len(adapter.get_open_orders()) == 2
+
+    def test_unconfigured_adapter_rejects_dated_future_before_submission(
+        self, order_factory
+    ):
+        product_id = "RITHMIC:MNQ-202509"
+        adapter = SimulatedAdapter()
+        order = order_factory(
+            product_id=product_id,
+            order_type="market",
+            quantity=Decimal("1"),
+            price=None,
+        )
+
+        with pytest.raises(
+            ExchangeError,
+            match="instrument_spec_required_for_dated_future",
+        ):
+            adapter.place_order(order)
+
+        assert adapter.get_open_orders(product_id) == []
+
+    @pytest.mark.parametrize(
+        (
+            "order_type",
+            "side",
+            "price",
+            "trigger_price",
+            "expected_price",
+            "expected_trigger",
+        ),
+        [
+            ("limit", "buy", "50123.456", None, "50123.40", None),
+            ("limit", "sell", "50123.456", None, "50123.50", None),
+            ("stop_loss", "sell", None, "50123.456", None, "50123.50"),
+            ("take_profit", "buy", None, "50123.456", None, "50123.40"),
+        ],
+    )
+    def test_configured_crypto_submits_quantized_values_to_matcher(
+        self,
+        order_factory,
+        order_type,
+        side,
+        price,
+        trigger_price,
+        expected_price,
+        expected_trigger,
+    ):
+        spec = InstrumentSpec(
+            product_id=PRODUCT,
+            exchange="binance",
+            symbol="BTC/USDT:USDT",
+            base="BTC",
+            quote="USDT",
+            quantity_step=Decimal("0.001"),
+            price_tick=Decimal("0.10"),
+        )
+        adapter = SimulatedAdapter(instrument_spec=spec)
+        order = order_factory(
+            product_id=PRODUCT,
+            order_type=order_type,
+            side=side,
+            quantity=Decimal("0.0109"),
+            price=Decimal(price) if price is not None else None,
+            trigger_price=(
+                Decimal(trigger_price) if trigger_price is not None else None
+            ),
+        )
+        original_to_rust_order = adapter._to_rust_order
+        submitted_values = []
+
+        def capture_to_rust_order(submitted_order):
+            submitted_values.append(
+                (
+                    submitted_order.quantity,
+                    submitted_order.price,
+                    submitted_order.trigger_price,
+                )
+            )
+            return original_to_rust_order(submitted_order)
+
+        adapter._to_rust_order = capture_to_rust_order
+
+        adapter.validate_order(order)
+        adapter.validate_order(order)
+        adapter.place_order(order)
+
+        expected = (
+            Decimal("0.010"),
+            Decimal(expected_price) if expected_price is not None else None,
+            Decimal(expected_trigger) if expected_trigger is not None else None,
+        )
+        assert (order.quantity, order.price, order.trigger_price) == expected
+        assert submitted_values == [expected]
+        assert adapter.get_open_orders(PRODUCT) == [order]
+
+    @pytest.mark.parametrize(
+        ("quantity", "price", "error"),
+        [
+            ("1.5", "20000.00", "quantity_off_step"),
+            ("1", "20000.10", "price_off_tick"),
+        ],
+    )
+    def test_dated_future_order_validation_blocks_submission(
+        self, order_factory, quantity, price, error
+    ):
+        product_id = "RITHMIC:MNQ-202509"
+        spec = InstrumentSpec(
+            product_id=product_id,
+            exchange="rithmic",
+            symbol="MNQ-202509",
+            base="MNQ",
+            quote="USD",
+            quantity_step=Decimal("1"),
+            price_tick=Decimal("0.25"),
+        )
+        adapter = SimulatedAdapter(instrument_spec=spec)
+        order = order_factory(
+            product_id=product_id,
+            quantity=Decimal(quantity),
+            price=Decimal(price),
+        )
+
+        with pytest.raises(ExchangeError, match=error):
+            adapter.place_order(order)
+
+        assert adapter.get_open_orders(product_id) == []
+
+    @pytest.mark.parametrize("order_type", ["stop_loss", "take_profit"])
+    def test_dated_future_off_tick_protection_blocks_submission(
+        self, order_factory, order_type
+    ):
+        product_id = "RITHMIC:MNQ-202509"
+        spec = InstrumentSpec(
+            product_id=product_id,
+            exchange="rithmic",
+            symbol="MNQ-202509",
+            base="MNQ",
+            quote="USD",
+            quantity_step=Decimal("1"),
+            price_tick=Decimal("0.25"),
+        )
+        adapter = SimulatedAdapter(instrument_spec=spec)
+        order = order_factory(
+            product_id=product_id,
+            order_type=order_type,
+            quantity=Decimal("1"),
+            trigger_price=Decimal("19999.90"),
+        )
+
+        with pytest.raises(ExchangeError, match="trigger_price_off_tick"):
+            adapter.place_order(order)
+
+        assert adapter.get_open_orders(product_id) == []
+
+    def test_dated_future_market_order_does_not_require_price_tick(
+        self, order_factory
+    ):
+        product_id = "RITHMIC:MNQ-202509"
+        spec = InstrumentSpec(
+            product_id=product_id,
+            exchange="rithmic",
+            symbol="MNQ-202509",
+            base="MNQ",
+            quote="USD",
+            quantity_step=Decimal("1"),
+        )
+        adapter = SimulatedAdapter(instrument_spec=spec)
+        order = order_factory(
+            product_id=product_id,
+            order_type="market",
+            quantity=Decimal("1"),
+            price=None,
+            trigger_price=None,
+        )
+
+        exchange_order_id = adapter.place_order(order)
+
+        assert exchange_order_id.startswith("SIM-")
+        assert adapter.get_open_orders(product_id) == [order]
+
+    @pytest.mark.parametrize(
+        ("distance", "accepted"),
+        [("0.25", True), ("0.10", False)],
+    )
+    def test_dated_future_trailing_distance_validation(
+        self, order_factory, distance, accepted
+    ):
+        product_id = "RITHMIC:MNQ-202509"
+        spec = InstrumentSpec(
+            product_id=product_id,
+            exchange="rithmic",
+            symbol="MNQ-202509",
+            base="MNQ",
+            quote="USD",
+            quantity_step=Decimal("1"),
+            price_tick=Decimal("0.25"),
+        )
+        adapter = SimulatedAdapter(instrument_spec=spec)
+        order = order_factory(
+            product_id=product_id,
+            order_type="trailing_stop",
+            quantity=Decimal("1"),
+            price=None,
+            trigger_price=None,
+        )
+        order._trailing_distance = Decimal(distance)
+
+        if not accepted:
+            with pytest.raises(ExchangeError, match="trailing_distance_off_tick"):
+                adapter.place_order(order)
+            assert order._trailing_distance == Decimal(distance)
+            assert adapter.get_open_orders(product_id) == []
+            return
+
+        adapter.place_order(order)
+        assert adapter.get_open_orders(product_id) == [order]
 
 
 # =================================================================

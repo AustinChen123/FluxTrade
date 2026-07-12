@@ -191,6 +191,44 @@ def test_backtest_request_rejects_invalid_instrument_metadata():
             instrument={"multiplier": "0", "fee_model": "per_contract"},
         )
 
+
+@pytest.mark.parametrize(
+    ("instrument", "error"),
+    [
+        (None, "requires instrument configuration"),
+        ({"quantity_step": "1"}, "requires price_tick"),
+        ({"price_tick": "0.25"}, "requires quantity_step"),
+    ],
+)
+def test_dated_future_backtest_request_requires_complete_rules(instrument, error):
+    with pytest.raises(ValueError, match=error):
+        BacktestJobRequest(
+            strategy_id="mnq",
+            product_id="RITHMIC:MNQ-202509",
+            timeframe="1m",
+            candles_csv_path="/tmp/candles.csv",
+            signals_csv_path="/tmp/signals.csv",
+            start_time=1,
+            end_time=2,
+            instrument=instrument,
+        )
+
+
+def test_dated_future_backtest_request_accepts_complete_rules():
+    request = BacktestJobRequest(
+        strategy_id="mnq",
+        product_id="RITHMIC:MNQ-202509",
+        timeframe="1m",
+        candles_csv_path="/tmp/candles.csv",
+        signals_csv_path="/tmp/signals.csv",
+        start_time=1,
+        end_time=2,
+        instrument={"quantity_step": "1", "price_tick": "0.25"},
+    )
+
+    assert request.instrument.quantity_step == Decimal("1")
+    assert request.instrument.price_tick == Decimal("0.25")
+
     with pytest.raises(ValueError, match="capital_per_contract must be positive"):
         BacktestJobRequest(
             strategy_id="invalid-capital",
@@ -233,6 +271,8 @@ def test_backtest_executor_propagates_instrument_spec(monkeypatch, tmp_path):
         end_time=2,
         instrument={
             "multiplier": "2",
+            "quantity_step": "1",
+            "price_tick": "0.25",
             "fee_model": "per_contract",
             "capital_model": "per_contract",
             "capital_per_contract": "2500",
@@ -244,6 +284,8 @@ def test_backtest_executor_propagates_instrument_spec(monkeypatch, tmp_path):
     spec = captured["instrument_spec"]
     assert spec.multiplier == Decimal("2")
     assert spec.fee_model == FeeModel.PER_CONTRACT
+    assert spec.quantity_step == Decimal("1")
+    assert spec.price_tick == Decimal("0.25")
     assert spec.capital_model.value == "per_contract"
     assert spec.capital_per_contract == Decimal("2500")
 
