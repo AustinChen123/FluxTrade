@@ -79,6 +79,29 @@ class TestProductIdValidation:
             )
         assert "product_id" in str(exc_info.value)
 
+    def test_dated_future_id_survives_all_domain_models(
+        self,
+        candlestick_factory,
+        signal_factory,
+        position_factory,
+    ):
+        product_id = "RITHMIC:MNQ-202509"
+        models = [
+            Trade(
+                id="1",
+                product_id=product_id,
+                price=Decimal("20000"),
+                quantity=Decimal("1"),
+                side="buy",
+                timestamp=1000,
+            ),
+            candlestick_factory(product_id=product_id),
+            signal_factory(product_id=product_id),
+            position_factory(product_id=product_id),
+        ]
+
+        assert [model.product_id for model in models] == [product_id] * 4
+
 
 class TestTradeModel:
     """Tests for Trade model."""

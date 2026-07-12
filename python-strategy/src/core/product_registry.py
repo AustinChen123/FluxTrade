@@ -3,8 +3,9 @@
 Replaces ad-hoc _map_symbol() in ExchangeAdapter and PRODUCT_TO_CCXT
 in fetch_real_data.py with a single registry.
 
-Product ID format: EXCHANGE:BASEQUOTE-PERP
-  e.g. BINANCE:BTCUSDT-PERP, BYBIT:ETHUSDT-PERP
+Product ID formats:
+  - perpetual: EXCHANGE:SYMBOL-PERP (e.g. BINANCE:BTCUSDT-PERP)
+  - dated future: EXCHANGE:ROOT-YYYYMM (e.g. RITHMIC:MNQ-202509)
 """
 
 import logging
@@ -52,7 +53,10 @@ _KNOWN_PRODUCTS: dict[str, dict] = {
     },
 }
 
-_PRODUCT_ID_PATTERN = re.compile(r"^([A-Z0-9]+):([A-Z0-9]+)(USDT|USDC|BUSD)-PERP$")
+_PERPETUAL_PRODUCT_ID_PATTERN = re.compile(r"^([A-Z0-9]+):([A-Z0-9_]+)-PERP$")
+_DATED_FUTURE_PRODUCT_ID_PATTERN = re.compile(
+    r"^([A-Z0-9]+):([A-Z][A-Z0-9]*)-([0-9]{4})([0-9]{2})$"
+)
 
 
 @dataclass(frozen=True)
@@ -159,23 +163,56 @@ def _parse_product_id(product_id: str) -> dict:
     if product_id in _KNOWN_PRODUCTS:
         return _KNOWN_PRODUCTS[product_id]
 
-    m = _PRODUCT_ID_PATTERN.match(product_id)
-    if not m:
-        raise ValueError(
-            f"Cannot parse product_id: {product_id}. "
-            f"Expected EXCHANGE:BASEQUOTE-PERP (e.g. BINANCE:BTCUSDT-PERP)"
+    perpetual = _PERPETUAL_PRODUCT_ID_PATTERN.fullmatch(product_id)
+    if perpetual:
+        exchange = perpetual.group(1).lower()
+        symbol = perpetual.group(2)
+        quote = next(
+            (
+                candidate
+                for candidate in ("USDT", "USDC", "BUSD")
+                if len(symbol) > len(candidate) and symbol.endswith(candidate)
+            ),
+            "",
         )
+        base = symbol[: -len(quote)] if quote else symbol
+        if base.endswith("_"):
+            base = symbol
+            quote = ""
+        return {
+            "exchange": exchange,
+            "ccxt": f"{base}/{quote}:{quote}" if quote else None,
+            "stream_symbol": symbol.lower(),
+            "base": base,
+            "quote": quote,
+        }
 
-    exchange = m.group(1).lower()
-    base = m.group(2)
-    quote = m.group(3)
+    dated_future = _DATED_FUTURE_PRODUCT_ID_PATTERN.fullmatch(product_id)
+    if dated_future:
+        month = int(dated_future.group(4))
+        if 1 <= month <= 12:
+            exchange = dated_future.group(1).lower()
+            root = dated_future.group(2)
+            contract = f"{root}-{dated_future.group(3)}{dated_future.group(4)}"
+            return {
+                "exchange": exchange,
+                "ccxt": None,
+                "symbol": contract,
+                "stream_symbol": contract.lower(),
+                "base": root,
+                "quote": "USD",
+            }
 
-    return {
-        "exchange": exchange,
-        "ccxt": f"{base}/{quote}:{quote}",
-        "base": base,
-        "quote": quote,
-    }
+    raise ValueError(
+        f"Cannot parse product_id: {product_id}. Expected "
+        "EXCHANGE:BASEQUOTE-PERP or EXCHANGE:ROOT-YYYYMM"
+    )
+
+
+def validate_product_id(product_id: str) -> str:
+    """Validate and return one canonical product ID unchanged."""
+    _parse_product_id(product_id)
+    return product_id
 
 
 def to_ccxt_symbol(product_id: str) -> str:
@@ -187,7 +224,10 @@ def to_ccxt_symbol(product_id: str) -> str:
         >>> to_ccxt_symbol("BYBIT:ETHUSDT-PERP")
         'ETH/USDT:USDT'
     """
-    return _parse_product_id(product_id)["ccxt"]
+    symbol = _parse_product_id(product_id)["ccxt"]
+    if symbol is None:
+        raise ValueError(f"CCXT symbol mapping is unavailable for {product_id}")
+    return symbol
 
 
 def to_exchange_name(product_id: str) -> str:
@@ -219,8 +259,8 @@ def to_stream_key(product_id: str, timeframe: str) -> str:
         'stream:market:binance:btcusdt:15m'
     """
     info = _parse_product_id(product_id)
-    symbol_flat = f"{info['base']}{info['quote']}".lower()
-    return f"stream:market:{info['exchange']}:{symbol_flat}:{timeframe}"
+    stream_symbol = info.get("stream_symbol") or f"{info['base']}{info['quote']}".lower()
+    return f"stream:market:{info['exchange']}:{stream_symbol}:{timeframe}"
 
 
 def resolve_exchange(product_id: str) -> tuple[str, str]:
@@ -233,6 +273,8 @@ def resolve_exchange(product_id: str) -> tuple[str, str]:
         ('binance', 'BTC/USDT:USDT')
     """
     info = _parse_product_id(product_id)
+    if info["ccxt"] is None:
+        raise ValueError(f"CCXT exchange resolution is unavailable for {product_id}")
     return info["exchange"], info["ccxt"]
 
 
@@ -254,10 +296,13 @@ def instrument_spec_from_product(
     session_calendar_id: str | None = None,
 ) -> InstrumentSpec:
     info = _parse_product_id(product_id)
+    symbol = info.get("symbol") or info.get("ccxt")
+    if symbol is None:
+        raise ValueError(f"Instrument symbol mapping is unavailable for {product_id}")
     return InstrumentSpec(
         product_id=product_id,
         exchange=info["exchange"],
-        symbol=info["ccxt"],
+        symbol=symbol,
         base=info["base"],
         quote=info["quote"],
         quantity_step=quantity_step,
