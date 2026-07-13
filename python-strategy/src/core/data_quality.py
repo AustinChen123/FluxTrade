@@ -8,6 +8,7 @@ from dataclasses import dataclass, field
 from typing import List
 import numpy as np
 from src.core.models import Candlestick
+from src.core.session_calendar import SessionCalendar
 
 
 # Timeframe durations in milliseconds
@@ -76,6 +77,7 @@ def check_gaps(
     candles: List[Candlestick],
     timeframe: str,
     tolerance: float = 1.5,
+    session_calendar: SessionCalendar | None = None,
 ) -> List[QualityIssue]:
     """Detect gaps in candle timestamps.
 
@@ -101,7 +103,29 @@ def check_gaps(
     for i in range(1, len(candles)):
         delta = candles[i].timestamp - candles[i - 1].timestamp
         if delta > threshold:
-            missing = int(delta / expected_ms) - 1
+            expected_timestamps = range(
+                candles[i - 1].timestamp + expected_ms,
+                candles[i].timestamp,
+                expected_ms,
+            )
+            missing = (
+                sum(
+                    1
+                    for timestamp in expected_timestamps
+                    if session_calendar.has_open_time(
+                        timestamp,
+                        min(timestamp + expected_ms, candles[i].timestamp),
+                    )
+                )
+                if session_calendar is not None
+                else len(expected_timestamps)
+            )
+            if (
+                session_calendar is not None
+                and len(expected_timestamps) > 0
+                and missing == 0
+            ):
+                continue
             issues.append(QualityIssue(
                 severity="warning",
                 category="gap",
@@ -197,6 +221,7 @@ def validate(
     *,
     z_threshold: float = 4.0,
     gap_tolerance: float = 1.5,
+    session_calendar: SessionCalendar | None = None,
 ) -> QualityReport:
     """Run all quality checks and return an aggregated report."""
     report = QualityReport(total_candles=len(candles))
@@ -204,7 +229,12 @@ def validate(
     if not candles:
         return report
 
-    gap_issues = check_gaps(candles, timeframe, tolerance=gap_tolerance)
+    gap_issues = check_gaps(
+        candles,
+        timeframe,
+        tolerance=gap_tolerance,
+        session_calendar=session_calendar,
+    )
     ohlc_issues = check_ohlc(candles)
     outlier_issues = check_outliers(candles, z_threshold=z_threshold)
 
