@@ -9,6 +9,9 @@ pub(crate) mod protocol {
 #[allow(dead_code)]
 mod session;
 
+#[allow(dead_code)]
+mod transport;
+
 #[cfg(test)]
 mod tests {
     use super::protocol::{RequestHeartbeat, RequestLogin};
