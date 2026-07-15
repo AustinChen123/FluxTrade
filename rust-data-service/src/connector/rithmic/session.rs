@@ -44,6 +44,7 @@ pub(crate) enum SessionState {
     Failed,
 }
 
+#[derive(Clone)]
 pub(crate) struct LoginParameters {
     user: String,
     password: String,
