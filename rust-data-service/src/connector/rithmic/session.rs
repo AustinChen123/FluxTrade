@@ -210,6 +210,17 @@ impl RithmicSession {
         self.finish_response(result, SessionState::Active)
     }
 
+    pub(crate) fn accept_control(&mut self, frame: &[u8]) -> Result<bool> {
+        match codec::template_id(frame)? {
+            HEARTBEAT_RESPONSE => {
+                self.accept_heartbeat(frame)?;
+                Ok(true)
+            }
+            REJECT | FORCED_LOGOUT => self.accept_terminal(frame).map(|()| true),
+            _ => Ok(false),
+        }
+    }
+
     pub(crate) fn begin_logout(&mut self) -> Result<Vec<u8>> {
         self.require_state(SessionState::Active)?;
         let frame = codec::encode(&protocol::RequestLogout {
