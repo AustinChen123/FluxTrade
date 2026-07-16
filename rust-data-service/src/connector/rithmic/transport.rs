@@ -1,4 +1,4 @@
-use super::session::{LoginParameters, RithmicSession};
+use super::session::{is_fatal_session_error, LoginParameters, RithmicSession};
 use anyhow::{bail, ensure, Context, Result};
 use futures_util::{SinkExt, StreamExt};
 use std::error::Error;
@@ -64,43 +64,153 @@ pub(crate) async fn run_with_reconnect(
     login: LoginParameters,
     response_timeout: Duration,
     policy: ReconnectPolicy,
+    startup_payloads: Vec<Vec<u8>>,
     payload_tx: mpsc::Sender<Vec<u8>>,
 ) -> Result<()> {
-    let mut backoff = policy.initial_backoff;
+    let mut backoffs = ReconnectBackoffs::new(policy);
+    let mut pending_payload = None;
 
     loop {
-        match connect(url, login.clone(), response_timeout).await {
-            Ok(mut connection) => loop {
-                match connection.next_event().await {
-                    Ok(ConnectionEvent::HeartbeatConfirmed) => {
-                        backoff = policy.initial_backoff;
-                    }
-                    Ok(ConnectionEvent::Payload(payload)) => {
-                        forward_payload(&payload_tx, payload)?;
-                    }
-                    Err(error) => {
-                        warn!(%error, "Rithmic connection lost; reconnecting");
-                        break;
-                    }
-                }
-            },
-            Err(error) => warn!(%error, "Rithmic connection failed; reconnecting"),
+        if let Some(payload) = pending_payload.take() {
+            payload_tx
+                .send(payload)
+                .await
+                .context("Rithmic payload consumer closed")?;
+            backoffs.payload_delivered();
         }
 
-        tokio::time::sleep(backoff).await;
-        backoff = next_backoff(backoff, policy.max_backoff);
+        let retry_cause = match connect(url, login.clone(), response_timeout).await {
+            Ok(mut connection) => {
+                let mut startup_pending = true;
+                let mut heartbeat_confirmations = 0_u32;
+                'connected: loop {
+                    match connection.next_event().await {
+                        Ok(ConnectionEvent::HeartbeatConfirmed) => {
+                            heartbeat_confirmations = heartbeat_confirmations.saturating_add(1);
+                            if startup_pending {
+                                for payload in &startup_payloads {
+                                    if let Err(error) =
+                                        connection.send_payload(payload.clone()).await
+                                    {
+                                        warn!(%error, "Rithmic startup write failed; reconnecting");
+                                        break 'connected RetryCause::Transport;
+                                    }
+                                }
+                                startup_pending = false;
+                            }
+                            if heartbeat_establishes_stability(heartbeat_confirmations) {
+                                backoffs.connection_stable();
+                            }
+                        }
+                        Ok(ConnectionEvent::Payload(payload)) => {
+                            match forward_payload(&payload_tx, payload) {
+                                PayloadDelivery::Delivered => {
+                                    backoffs.payload_delivered();
+                                }
+                                PayloadDelivery::Full(payload) => {
+                                    warn!("Rithmic payload channel is full; reconnecting");
+                                    pending_payload = Some(payload);
+                                    break 'connected RetryCause::Backpressure;
+                                }
+                                PayloadDelivery::Closed(_) => {
+                                    bail!("Rithmic payload consumer closed");
+                                }
+                            }
+                        }
+                        Err(error) => {
+                            break 'connected classify_connection_error(
+                                error,
+                                "fatal Rithmic session failure",
+                                "Rithmic connection lost; reconnecting",
+                            )?;
+                        }
+                    }
+                }
+            }
+            Err(error) => classify_connection_error(
+                error,
+                "fatal Rithmic handshake failure",
+                "Rithmic connection failed; reconnecting",
+            )?,
+        };
+
+        let delay = backoffs.next_delay(retry_cause);
+        tokio::time::sleep(delay).await;
     }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum RetryCause {
+    Transport,
+    Backpressure,
+}
+
+struct ReconnectBackoffs {
+    policy: ReconnectPolicy,
+    transport: Duration,
+    backpressure: Duration,
+}
+
+impl ReconnectBackoffs {
+    fn new(policy: ReconnectPolicy) -> Self {
+        Self {
+            transport: policy.initial_backoff,
+            backpressure: policy.initial_backoff,
+            policy,
+        }
+    }
+
+    fn connection_stable(&mut self) {
+        self.transport = self.policy.initial_backoff;
+    }
+
+    fn payload_delivered(&mut self) {
+        self.backpressure = self.policy.initial_backoff;
+    }
+
+    fn next_delay(&mut self, cause: RetryCause) -> Duration {
+        let backoff = match cause {
+            RetryCause::Transport => &mut self.transport,
+            RetryCause::Backpressure => &mut self.backpressure,
+        };
+        let delay = *backoff;
+        *backoff = next_backoff(*backoff, self.policy.max_backoff);
+        delay
+    }
+}
+
+fn classify_connection_error(
+    error: anyhow::Error,
+    fatal_context: &str,
+    retry_message: &str,
+) -> Result<RetryCause> {
+    if is_fatal_session_error(&error) {
+        return Err(error.context(fatal_context.to_string()));
+    }
+    warn!(%error, "{retry_message}");
+    Ok(RetryCause::Transport)
 }
 
 fn next_backoff(current: Duration, maximum: Duration) -> Duration {
     current.saturating_mul(2).min(maximum)
 }
 
-fn forward_payload(payload_tx: &mpsc::Sender<Vec<u8>>, payload: Vec<u8>) -> Result<()> {
+fn heartbeat_establishes_stability(confirmations: u32) -> bool {
+    confirmations >= 2
+}
+
+#[derive(Debug, PartialEq)]
+enum PayloadDelivery {
+    Delivered,
+    Full(Vec<u8>),
+    Closed(Vec<u8>),
+}
+
+fn forward_payload(payload_tx: &mpsc::Sender<Vec<u8>>, payload: Vec<u8>) -> PayloadDelivery {
     match payload_tx.try_send(payload) {
-        Ok(()) => Ok(()),
-        Err(mpsc::error::TrySendError::Full(_)) => bail!("Rithmic payload channel is full"),
-        Err(mpsc::error::TrySendError::Closed(_)) => bail!("Rithmic payload consumer closed"),
+        Ok(()) => PayloadDelivery::Delivered,
+        Err(mpsc::error::TrySendError::Full(payload)) => PayloadDelivery::Full(payload),
+        Err(mpsc::error::TrySendError::Closed(payload)) => PayloadDelivery::Closed(payload),
     }
 }
 
@@ -121,6 +231,7 @@ pub(crate) async fn connect(
     )
     .await?;
     let response = receive_binary(&mut discovery, response_timeout).await?;
+    session.reject_terminal(&response)?;
     session.accept_system_info(&response)?;
     drop(discovery);
 
@@ -130,6 +241,7 @@ pub(crate) async fn connect(
     session.mark_reconnected()?;
     send_binary(&mut socket, session.begin_login()?, response_timeout).await?;
     let response = receive_binary(&mut socket, response_timeout).await?;
+    session.reject_terminal(&response)?;
     let initial_heartbeat = session.accept_login(&response)?;
     send_binary(&mut socket, initial_heartbeat, response_timeout).await?;
 
@@ -143,6 +255,10 @@ pub(crate) async fn connect(
 }
 
 impl RithmicConnection {
+    pub(crate) async fn send_payload(&mut self, payload: Vec<u8>) -> Result<()> {
+        send_binary(&mut self.socket, payload, self.response_timeout).await
+    }
+
     pub(crate) async fn next_event(&mut self) -> Result<ConnectionEvent> {
         loop {
             let message = tokio::select! {
@@ -258,7 +374,7 @@ fn classify_message(message: Message) -> Result<IncomingMessage> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::connector::rithmic::session::{Plant, SessionState};
+    use crate::connector::rithmic::session::{Plant, RithmicSession, SessionState};
     use crate::connector::rithmic::{codec, protocol};
     use tokio::net::TcpListener;
     use tokio_tungstenite::accept_async;
@@ -395,23 +511,79 @@ mod tests {
             next_backoff(Duration::from_secs(8), Duration::from_secs(10)),
             Duration::from_secs(10)
         );
+        assert!(!heartbeat_establishes_stability(1));
+        assert!(heartbeat_establishes_stability(2));
+    }
+
+    #[test]
+    fn reconnect_backoff_state_matrix() {
+        let policy = ReconnectPolicy::new(Duration::from_secs(1), Duration::from_secs(8)).unwrap();
+        let mut backoffs = ReconnectBackoffs::new(policy);
+
+        assert_eq!(
+            backoffs.next_delay(RetryCause::Transport),
+            Duration::from_secs(1)
+        );
+        backoffs.payload_delivered();
+        assert_eq!(
+            backoffs.next_delay(RetryCause::Transport),
+            Duration::from_secs(2)
+        );
+        assert_eq!(
+            backoffs.next_delay(RetryCause::Backpressure),
+            Duration::from_secs(1)
+        );
+        assert_eq!(
+            backoffs.next_delay(RetryCause::Backpressure),
+            Duration::from_secs(2)
+        );
+        backoffs.payload_delivered();
+        assert_eq!(
+            backoffs.next_delay(RetryCause::Backpressure),
+            Duration::from_secs(1)
+        );
+        backoffs.connection_stable();
+        assert_eq!(
+            backoffs.next_delay(RetryCause::Transport),
+            Duration::from_secs(1)
+        );
+    }
+
+    #[test]
+    fn connection_error_classification_matrix() {
+        let mut session = RithmicSession::new(login());
+        session.begin_system_info().unwrap();
+        let fatal_response = codec::encode(&protocol::ResponseRithmicSystemInfo {
+            template_id: 17,
+            rp_code: vec!["9".to_string()],
+            system_name: vec!["test-system".to_string()],
+            ..Default::default()
+        })
+        .unwrap();
+        let fatal = session.accept_system_info(&fatal_response).unwrap_err();
+
+        assert!(classify_connection_error(fatal, "fatal", "retry").is_err());
+        assert_eq!(
+            classify_connection_error(anyhow::anyhow!("network"), "fatal", "retry").unwrap(),
+            RetryCause::Transport
+        );
     }
 
     #[test]
     fn payload_channel_state_matrix_is_fail_closed() {
         let (tx, mut rx) = mpsc::channel(1);
-        forward_payload(&tx, vec![1]).unwrap();
-        assert!(forward_payload(&tx, vec![2])
-            .unwrap_err()
-            .to_string()
-            .contains("channel is full"));
+        assert_eq!(forward_payload(&tx, vec![1]), PayloadDelivery::Delivered);
+        assert_eq!(
+            forward_payload(&tx, vec![2]),
+            PayloadDelivery::Full(vec![2])
+        );
         assert_eq!(rx.try_recv().unwrap(), vec![1]);
 
         drop(rx);
-        assert!(forward_payload(&tx, vec![3])
-            .unwrap_err()
-            .to_string()
-            .contains("consumer closed"));
+        assert_eq!(
+            forward_payload(&tx, vec![3]),
+            PayloadDelivery::Closed(vec![3])
+        );
     }
 
     #[tokio::test]
@@ -450,7 +622,7 @@ mod tests {
             ReconnectPolicy::new(Duration::from_millis(1), Duration::from_millis(10)).unwrap();
         let (tx, mut rx) = mpsc::channel(1);
         let supervisor = tokio::spawn(async move {
-            run_with_reconnect(&url, login(), Duration::from_secs(1), policy, tx).await
+            run_with_reconnect(&url, login(), Duration::from_secs(1), policy, vec![], tx).await
         });
 
         let payload = timeout(Duration::from_secs(2), rx.recv())
@@ -458,6 +630,82 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(codec::template_id(&payload).unwrap(), 12);
+
+        supervisor.abort();
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn temporary_backpressure_reconnects_and_recovers_delivery() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("ws://{}", listener.local_addr().unwrap());
+        let (overflow_tx, overflow_rx) = tokio::sync::oneshot::channel();
+        let (reconnected_tx, reconnected_rx) = tokio::sync::oneshot::channel();
+        let server = tokio::spawn(async move {
+            let mut first = serve_handshake(&listener, 30.0).await;
+            send_heartbeat_response(&mut first).await;
+            assert_template(first.next().await.unwrap().unwrap(), 100);
+            send_test_payload(&mut first, 12).await;
+            send_test_payload(&mut first, 13).await;
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            overflow_tx.send(()).unwrap();
+
+            let mut second = serve_handshake(&listener, 30.0).await;
+            send_heartbeat_response(&mut second).await;
+            assert_template(second.next().await.unwrap().unwrap(), 100);
+            reconnected_tx.send(()).unwrap();
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            send_test_payload(&mut second, 14).await;
+        });
+        let policy =
+            ReconnectPolicy::new(Duration::from_millis(1), Duration::from_millis(10)).unwrap();
+        let (tx, mut rx) = mpsc::channel(1);
+        let startup_payload = codec::encode(&protocol::RequestMarketDataUpdate {
+            template_id: 100,
+            ..Default::default()
+        })
+        .unwrap();
+        let supervisor = tokio::spawn(async move {
+            run_with_reconnect(
+                &url,
+                login(),
+                Duration::from_secs(1),
+                policy,
+                vec![startup_payload],
+                tx,
+            )
+            .await
+        });
+
+        timeout(Duration::from_secs(2), overflow_rx)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(codec::template_id(&rx.recv().await.unwrap()).unwrap(), 12);
+        assert_eq!(
+            codec::template_id(
+                &timeout(Duration::from_secs(1), rx.recv())
+                    .await
+                    .unwrap()
+                    .unwrap()
+            )
+            .unwrap(),
+            13
+        );
+        timeout(Duration::from_secs(2), reconnected_rx)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            codec::template_id(
+                &timeout(Duration::from_secs(1), rx.recv())
+                    .await
+                    .unwrap()
+                    .unwrap()
+            )
+            .unwrap(),
+            14
+        );
 
         supervisor.abort();
         server.await.unwrap();
@@ -523,6 +771,35 @@ mod tests {
             .unwrap();
         assert_template(login.next().await.unwrap().unwrap(), 18);
         login
+    }
+
+    async fn send_heartbeat_response(socket: &mut WebSocketStream<TcpStream>) {
+        socket
+            .send(Message::Binary(
+                codec::encode(&protocol::ResponseHeartbeat {
+                    template_id: 19,
+                    rp_code: vec!["0".to_string()],
+                    ..Default::default()
+                })
+                .unwrap()
+                .into(),
+            ))
+            .await
+            .unwrap();
+    }
+
+    async fn send_test_payload(socket: &mut WebSocketStream<TcpStream>, template_id: i32) {
+        socket
+            .send(Message::Binary(
+                codec::encode(&protocol::RequestLogout {
+                    template_id,
+                    ..Default::default()
+                })
+                .unwrap()
+                .into(),
+            ))
+            .await
+            .unwrap();
     }
 
     fn assert_template(message: Message, expected: i32) {

@@ -1,6 +1,9 @@
 #[allow(dead_code)]
 mod codec;
 
+#[allow(dead_code)]
+mod market;
+
 #[allow(dead_code, clippy::enum_variant_names, clippy::tabs_in_doc_comments)]
 pub(crate) mod protocol {
     include!(concat!(env!("OUT_DIR"), "/rti.rs"));

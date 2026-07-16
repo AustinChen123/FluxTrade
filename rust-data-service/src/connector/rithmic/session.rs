@@ -4,6 +4,14 @@ use anyhow::{bail, ensure, Context, Result};
 
 use super::{codec, protocol};
 
+#[derive(Debug, thiserror::Error)]
+#[error("{0}")]
+struct FatalSessionError(String);
+
+pub(crate) fn is_fatal_session_error(error: &anyhow::Error) -> bool {
+    error.downcast_ref::<FatalSessionError>().is_some()
+}
+
 const SYSTEM_INFO_REQUEST: i32 = 16;
 const SYSTEM_INFO_RESPONSE: i32 = 17;
 const LOGIN_REQUEST: i32 = 10;
@@ -118,11 +126,13 @@ impl RithmicSession {
         let result = (|| {
             expect_template(frame, SYSTEM_INFO_RESPONSE)?;
             let response: protocol::ResponseRithmicSystemInfo = codec::decode(frame)?;
-            ensure_success(&response.rp_code)?;
-            ensure!(
-                response.system_name.contains(&self.login.system_name),
-                "configured Rithmic system is unavailable"
-            );
+            ensure_handshake_success(&response.rp_code)?;
+            if !response.system_name.contains(&self.login.system_name) {
+                return Err(FatalSessionError(
+                    "configured Rithmic system is unavailable".to_string(),
+                )
+                .into());
+            }
             Ok(())
         })();
         self.finish_response(result, SessionState::AwaitingReconnect)
@@ -160,20 +170,25 @@ impl RithmicSession {
         let result = (|| {
             expect_template(frame, LOGIN_RESPONSE)?;
             let response: protocol::ResponseLogin = codec::decode(frame)?;
-            ensure_success(&response.rp_code)?;
-            let seconds = response
-                .heartbeat_interval
-                .context("Rithmic login response omitted heartbeat_interval")?;
-            ensure!(
-                seconds.is_finite() && seconds > 0.0,
-                "Rithmic heartbeat_interval must be finite and positive"
-            );
-            let interval = Duration::try_from_secs_f64(seconds)
-                .context("Rithmic heartbeat_interval is out of range")?;
-            ensure!(
-                !interval.is_zero(),
-                "Rithmic heartbeat_interval is below timer resolution"
-            );
+            ensure_handshake_success(&response.rp_code)?;
+            let seconds = response.heartbeat_interval.ok_or_else(|| {
+                FatalSessionError("Rithmic login response omitted heartbeat_interval".to_string())
+            })?;
+            if !seconds.is_finite() || seconds <= 0.0 {
+                return Err(FatalSessionError(
+                    "Rithmic heartbeat_interval must be finite and positive".to_string(),
+                )
+                .into());
+            }
+            let interval = Duration::try_from_secs_f64(seconds).map_err(|_| {
+                FatalSessionError("Rithmic heartbeat_interval is out of range".to_string())
+            })?;
+            if interval.is_zero() {
+                return Err(FatalSessionError(
+                    "Rithmic heartbeat_interval is below timer resolution".to_string(),
+                )
+                .into());
+            }
             self.heartbeat_interval = Some(interval);
             codec::encode(&heartbeat_request())
         })();
@@ -222,6 +237,13 @@ impl RithmicSession {
         }
     }
 
+    pub(crate) fn reject_terminal(&mut self, frame: &[u8]) -> Result<()> {
+        match codec::template_id(frame)? {
+            REJECT | FORCED_LOGOUT => self.accept_terminal(frame),
+            _ => Ok(()),
+        }
+    }
+
     pub(crate) fn begin_logout(&mut self) -> Result<Vec<u8>> {
         self.require_state(SessionState::Active)?;
         let frame = codec::encode(&protocol::RequestLogout {
@@ -248,15 +270,16 @@ impl RithmicSession {
             REJECT => {
                 let response: protocol::Reject = codec::decode(frame)?;
                 self.state = SessionState::Failed;
-                bail!(
+                Err(FatalSessionError(format!(
                     "Rithmic rejected the session: {}",
                     response.rp_code.join(",")
-                );
+                ))
+                .into())
             }
             FORCED_LOGOUT => {
                 let _: protocol::ForcedLogout = codec::decode(frame)?;
                 self.state = SessionState::Failed;
-                bail!("Rithmic forced the session to log out");
+                Err(FatalSessionError("Rithmic forced the session to log out".to_string()).into())
             }
             _ => bail!("Rithmic message {template_id} is not terminal"),
         }
@@ -301,11 +324,21 @@ fn expect_template(frame: &[u8], expected: i32) -> Result<()> {
     Ok(())
 }
 
-fn ensure_success(rp_codes: &[String]) -> Result<()> {
+pub(super) fn ensure_success(rp_codes: &[String]) -> Result<()> {
     let code = rp_codes
         .first()
         .context("Rithmic response omitted rp_code")?;
     ensure!(code == "0", "Rithmic response code {code}");
+    Ok(())
+}
+
+fn ensure_handshake_success(rp_codes: &[String]) -> Result<()> {
+    let code = rp_codes.first().ok_or_else(|| {
+        FatalSessionError("Rithmic handshake response omitted rp_code".to_string())
+    })?;
+    if code != "0" {
+        return Err(FatalSessionError(format!("Rithmic handshake response code {code}")).into());
+    }
     Ok(())
 }
 
@@ -447,9 +480,10 @@ mod tests {
         let mut session = RithmicSession::new(login(Plant::Ticker));
         session.begin_system_info().unwrap();
 
-        assert!(session
+        let error = session
             .accept_system_info(&system_info(&["another-system"], "0"))
-            .is_err());
+            .unwrap_err();
+        assert!(is_fatal_session_error(&error));
         assert_eq!(session.state(), SessionState::Failed);
     }
 
@@ -458,9 +492,22 @@ mod tests {
         let mut session = RithmicSession::new(login(Plant::Ticker));
         session.begin_system_info().unwrap();
 
-        assert!(session
+        let error = session
             .accept_system_info(&system_info(&["test-system"], "9"))
-            .is_err());
+            .unwrap_err();
+        assert!(is_fatal_session_error(&error));
+        assert_eq!(session.state(), SessionState::Failed);
+    }
+
+    #[test]
+    fn heartbeat_failure_remains_retryable() {
+        let mut session = activate(Plant::Ticker);
+
+        let error = session
+            .accept_heartbeat(&heartbeat_response("9"))
+            .unwrap_err();
+
+        assert!(!is_fatal_session_error(&error));
         assert_eq!(session.state(), SessionState::Failed);
     }
 
@@ -536,9 +583,10 @@ mod tests {
             session.mark_reconnected().unwrap();
             session.begin_login().unwrap();
 
-            assert!(session
+            let error = session
                 .accept_login(&login_response(interval, "0"))
-                .is_err());
+                .unwrap_err();
+            assert!(is_fatal_session_error(&error));
             assert_eq!(session.state(), SessionState::Failed);
         }
     }
@@ -560,8 +608,44 @@ mod tests {
 
         for frame in cases {
             let mut session = activate(Plant::Ticker);
-            assert!(session.accept_terminal(&frame).is_err());
+            let error = session.accept_terminal(&frame).unwrap_err();
+            assert!(is_fatal_session_error(&error));
             assert_eq!(session.state(), SessionState::Failed);
+        }
+    }
+
+    #[test]
+    fn terminal_message_handshake_phase_matrix_is_fatal() {
+        let terminal_frames = [
+            codec::encode(&protocol::Reject {
+                template_id: REJECT,
+                user_msg: vec![],
+                rp_code: vec!["permission-denied".to_string()],
+            })
+            .unwrap(),
+            codec::encode(&protocol::ForcedLogout {
+                template_id: FORCED_LOGOUT,
+            })
+            .unwrap(),
+        ];
+
+        for frame in terminal_frames {
+            let mut discovery_session = RithmicSession::new(login(Plant::Ticker));
+            discovery_session.begin_system_info().unwrap();
+            let error = discovery_session.reject_terminal(&frame).unwrap_err();
+            assert!(is_fatal_session_error(&error));
+            assert_eq!(discovery_session.state(), SessionState::Failed);
+
+            let mut login_session = RithmicSession::new(login(Plant::Ticker));
+            login_session.begin_system_info().unwrap();
+            login_session
+                .accept_system_info(&system_info(&["test-system"], "0"))
+                .unwrap();
+            login_session.mark_reconnected().unwrap();
+            login_session.begin_login().unwrap();
+            let error = login_session.reject_terminal(&frame).unwrap_err();
+            assert!(is_fatal_session_error(&error));
+            assert_eq!(login_session.state(), SessionState::Failed);
         }
     }
 
