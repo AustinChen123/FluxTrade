@@ -1,4 +1,7 @@
 #[allow(dead_code)]
+mod bar;
+
+#[allow(dead_code)]
 mod codec;
 
 #[allow(dead_code)]

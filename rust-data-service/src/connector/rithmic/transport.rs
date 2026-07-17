@@ -5,7 +5,6 @@ use std::error::Error;
 use std::future::Future;
 use std::time::Duration;
 use tokio::net::TcpStream;
-use tokio::sync::mpsc;
 use tokio::time::{sleep_until, timeout, Instant};
 use tokio_tungstenite::{
     connect_async, tungstenite::protocol::Message, MaybeTlsStream, WebSocketStream,
@@ -59,26 +58,20 @@ impl ReconnectPolicy {
     }
 }
 
-pub(crate) async fn run_with_reconnect(
+pub(crate) async fn run_with_reconnect<F>(
     url: &str,
     login: LoginParameters,
     response_timeout: Duration,
     policy: ReconnectPolicy,
     startup_payloads: Vec<Vec<u8>>,
-    payload_tx: mpsc::Sender<Vec<u8>>,
-) -> Result<()> {
+    mut handle_payload: F,
+) -> Result<()>
+where
+    F: FnMut(Vec<u8>) -> Result<()>,
+{
     let mut backoffs = ReconnectBackoffs::new(policy);
-    let mut pending_payload = None;
 
     loop {
-        if let Some(payload) = pending_payload.take() {
-            payload_tx
-                .send(payload)
-                .await
-                .context("Rithmic payload consumer closed")?;
-            backoffs.payload_delivered();
-        }
-
         let retry_cause = match connect(url, login.clone(), response_timeout).await {
             Ok(mut connection) => {
                 let mut startup_pending = true;
@@ -103,19 +96,7 @@ pub(crate) async fn run_with_reconnect(
                             }
                         }
                         Ok(ConnectionEvent::Payload(payload)) => {
-                            match forward_payload(&payload_tx, payload) {
-                                PayloadDelivery::Delivered => {
-                                    backoffs.payload_delivered();
-                                }
-                                PayloadDelivery::Full(payload) => {
-                                    warn!("Rithmic payload channel is full; reconnecting");
-                                    pending_payload = Some(payload);
-                                    break 'connected RetryCause::Backpressure;
-                                }
-                                PayloadDelivery::Closed(_) => {
-                                    bail!("Rithmic payload consumer closed");
-                                }
-                            }
+                            handle_payload(payload).context("Rithmic payload handler failed")?;
                         }
                         Err(error) => {
                             break 'connected classify_connection_error(
@@ -142,20 +123,17 @@ pub(crate) async fn run_with_reconnect(
 #[derive(Clone, Copy, Debug, PartialEq)]
 enum RetryCause {
     Transport,
-    Backpressure,
 }
 
 struct ReconnectBackoffs {
     policy: ReconnectPolicy,
     transport: Duration,
-    backpressure: Duration,
 }
 
 impl ReconnectBackoffs {
     fn new(policy: ReconnectPolicy) -> Self {
         Self {
             transport: policy.initial_backoff,
-            backpressure: policy.initial_backoff,
             policy,
         }
     }
@@ -164,14 +142,9 @@ impl ReconnectBackoffs {
         self.transport = self.policy.initial_backoff;
     }
 
-    fn payload_delivered(&mut self) {
-        self.backpressure = self.policy.initial_backoff;
-    }
-
     fn next_delay(&mut self, cause: RetryCause) -> Duration {
         let backoff = match cause {
             RetryCause::Transport => &mut self.transport,
-            RetryCause::Backpressure => &mut self.backpressure,
         };
         let delay = *backoff;
         *backoff = next_backoff(*backoff, self.policy.max_backoff);
@@ -197,21 +170,6 @@ fn next_backoff(current: Duration, maximum: Duration) -> Duration {
 
 fn heartbeat_establishes_stability(confirmations: u32) -> bool {
     confirmations >= 2
-}
-
-#[derive(Debug, PartialEq)]
-enum PayloadDelivery {
-    Delivered,
-    Full(Vec<u8>),
-    Closed(Vec<u8>),
-}
-
-fn forward_payload(payload_tx: &mpsc::Sender<Vec<u8>>, payload: Vec<u8>) -> PayloadDelivery {
-    match payload_tx.try_send(payload) {
-        Ok(()) => PayloadDelivery::Delivered,
-        Err(mpsc::error::TrySendError::Full(payload)) => PayloadDelivery::Full(payload),
-        Err(mpsc::error::TrySendError::Closed(payload)) => PayloadDelivery::Closed(payload),
-    }
 }
 
 pub(crate) async fn connect(
@@ -249,7 +207,7 @@ pub(crate) async fn connect(
         socket,
         session,
         response_timeout,
-        heartbeat_deadline: Instant::now() + response_timeout,
+        heartbeat_deadline: deadline_after(response_timeout)?,
         awaiting_heartbeat: true,
     })
 }
@@ -277,7 +235,7 @@ impl RithmicConnection {
                             );
                             self.awaiting_heartbeat = false;
                             self.heartbeat_deadline =
-                                Instant::now() + self.session.heartbeat_interval()?;
+                                deadline_after(self.session.heartbeat_interval()?)?;
                             return Ok(ConnectionEvent::HeartbeatConfirmed);
                         }
                         return Ok(ConnectionEvent::Payload(payload));
@@ -306,7 +264,7 @@ impl RithmicConnection {
             )
             .await?;
             self.awaiting_heartbeat = true;
-            self.heartbeat_deadline = Instant::now() + self.response_timeout;
+            self.heartbeat_deadline = deadline_after(self.response_timeout)?;
         }
     }
 
@@ -314,6 +272,12 @@ impl RithmicConnection {
     fn state(&self) -> super::session::SessionState {
         self.session.state()
     }
+}
+
+fn deadline_after(delay: Duration) -> Result<Instant> {
+    Instant::now()
+        .checked_add(delay)
+        .context("Rithmic timer delay exceeds Instant range")
 }
 
 async fn send_binary(socket: &mut RithmicSocket, payload: Vec<u8>, wait: Duration) -> Result<()> {
@@ -376,6 +340,7 @@ mod tests {
     use super::*;
     use crate::connector::rithmic::session::{Plant, RithmicSession, SessionState};
     use crate::connector::rithmic::{codec, protocol};
+    use std::sync::{Arc, Mutex};
     use tokio::net::TcpListener;
     use tokio_tungstenite::accept_async;
 
@@ -516,6 +481,13 @@ mod tests {
     }
 
     #[test]
+    fn deadline_range_matrix_fails_closed() {
+        assert!(deadline_after(Duration::ZERO).is_ok());
+        assert!(deadline_after(Duration::from_secs(30)).is_ok());
+        assert!(deadline_after(Duration::MAX).is_err());
+    }
+
+    #[test]
     fn reconnect_backoff_state_matrix() {
         let policy = ReconnectPolicy::new(Duration::from_secs(1), Duration::from_secs(8)).unwrap();
         let mut backoffs = ReconnectBackoffs::new(policy);
@@ -524,23 +496,9 @@ mod tests {
             backoffs.next_delay(RetryCause::Transport),
             Duration::from_secs(1)
         );
-        backoffs.payload_delivered();
         assert_eq!(
             backoffs.next_delay(RetryCause::Transport),
             Duration::from_secs(2)
-        );
-        assert_eq!(
-            backoffs.next_delay(RetryCause::Backpressure),
-            Duration::from_secs(1)
-        );
-        assert_eq!(
-            backoffs.next_delay(RetryCause::Backpressure),
-            Duration::from_secs(2)
-        );
-        backoffs.payload_delivered();
-        assert_eq!(
-            backoffs.next_delay(RetryCause::Backpressure),
-            Duration::from_secs(1)
         );
         backoffs.connection_stable();
         assert_eq!(
@@ -566,23 +524,6 @@ mod tests {
         assert_eq!(
             classify_connection_error(anyhow::anyhow!("network"), "fatal", "retry").unwrap(),
             RetryCause::Transport
-        );
-    }
-
-    #[test]
-    fn payload_channel_state_matrix_is_fail_closed() {
-        let (tx, mut rx) = mpsc::channel(1);
-        assert_eq!(forward_payload(&tx, vec![1]), PayloadDelivery::Delivered);
-        assert_eq!(
-            forward_payload(&tx, vec![2]),
-            PayloadDelivery::Full(vec![2])
-        );
-        assert_eq!(rx.try_recv().unwrap(), vec![1]);
-
-        drop(rx);
-        assert_eq!(
-            forward_payload(&tx, vec![3]),
-            PayloadDelivery::Closed(vec![3])
         );
     }
 
@@ -620,46 +561,55 @@ mod tests {
         });
         let policy =
             ReconnectPolicy::new(Duration::from_millis(1), Duration::from_millis(10)).unwrap();
-        let (tx, mut rx) = mpsc::channel(1);
+        let payloads = Arc::new(Mutex::new(Vec::new()));
+        let handled = Arc::new(tokio::sync::Notify::new());
+        let handler_payloads = Arc::clone(&payloads);
+        let handler_handled = Arc::clone(&handled);
         let supervisor = tokio::spawn(async move {
-            run_with_reconnect(&url, login(), Duration::from_secs(1), policy, vec![], tx).await
+            run_with_reconnect(
+                &url,
+                login(),
+                Duration::from_secs(1),
+                policy,
+                vec![],
+                move |payload| {
+                    handler_payloads.lock().unwrap().push(payload);
+                    handler_handled.notify_one();
+                    Ok(())
+                },
+            )
+            .await
         });
 
-        let payload = timeout(Duration::from_secs(2), rx.recv())
+        timeout(Duration::from_secs(2), handled.notified())
             .await
-            .unwrap()
             .unwrap();
-        assert_eq!(codec::template_id(&payload).unwrap(), 12);
+        assert_eq!(
+            codec::template_id(&payloads.lock().unwrap()[0]).unwrap(),
+            12
+        );
 
         supervisor.abort();
         server.await.unwrap();
     }
 
     #[tokio::test]
-    async fn temporary_backpressure_reconnects_and_recovers_delivery() {
+    async fn burst_payloads_are_handled_inline_without_backpressure() {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let url = format!("ws://{}", listener.local_addr().unwrap());
-        let (overflow_tx, overflow_rx) = tokio::sync::oneshot::channel();
-        let (reconnected_tx, reconnected_rx) = tokio::sync::oneshot::channel();
         let server = tokio::spawn(async move {
-            let mut first = serve_handshake(&listener, 30.0).await;
-            send_heartbeat_response(&mut first).await;
-            assert_template(first.next().await.unwrap().unwrap(), 100);
-            send_test_payload(&mut first, 12).await;
-            send_test_payload(&mut first, 13).await;
-            tokio::time::sleep(Duration::from_millis(20)).await;
-            overflow_tx.send(()).unwrap();
-
-            let mut second = serve_handshake(&listener, 30.0).await;
-            send_heartbeat_response(&mut second).await;
-            assert_template(second.next().await.unwrap().unwrap(), 100);
-            reconnected_tx.send(()).unwrap();
-            tokio::time::sleep(Duration::from_millis(20)).await;
-            send_test_payload(&mut second, 14).await;
+            let mut socket = serve_handshake(&listener, 30.0).await;
+            send_heartbeat_response(&mut socket).await;
+            assert_template(socket.next().await.unwrap().unwrap(), 100);
+            send_test_payload(&mut socket, 12).await;
+            send_test_payload(&mut socket, 13).await;
+            send_test_payload(&mut socket, 14).await;
+            tokio::time::sleep(Duration::from_millis(100)).await;
         });
         let policy =
             ReconnectPolicy::new(Duration::from_millis(1), Duration::from_millis(10)).unwrap();
-        let (tx, mut rx) = mpsc::channel(1);
+        let payloads = Arc::new(Mutex::new(Vec::new()));
+        let handler_payloads = Arc::clone(&payloads);
         let startup_payload = codec::encode(&protocol::RequestMarketDataUpdate {
             template_id: 100,
             ..Default::default()
@@ -672,40 +622,85 @@ mod tests {
                 Duration::from_secs(1),
                 policy,
                 vec![startup_payload],
-                tx,
+                move |payload| {
+                    handler_payloads.lock().unwrap().push(payload);
+                    Ok(())
+                },
             )
             .await
         });
 
-        timeout(Duration::from_secs(2), overflow_rx)
-            .await
+        timeout(Duration::from_secs(1), async {
+            while payloads.lock().unwrap().len() < 3 {
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+        })
+        .await
+        .unwrap();
+        let templates: Vec<_> = payloads
+            .lock()
             .unwrap()
-            .unwrap();
-        assert_eq!(codec::template_id(&rx.recv().await.unwrap()).unwrap(), 12);
-        assert_eq!(
-            codec::template_id(
-                &timeout(Duration::from_secs(1), rx.recv())
-                    .await
+            .iter()
+            .map(|payload| codec::template_id(payload).unwrap())
+            .collect();
+        assert_eq!(templates, [12, 13, 14]);
+
+        supervisor.abort();
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn active_reject_reaches_handler_and_connection_continues() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("ws://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move {
+            let mut socket = serve_handshake(&listener, 30.0).await;
+            send_heartbeat_response(&mut socket).await;
+            socket
+                .send(Message::Binary(
+                    codec::encode(&protocol::Reject {
+                        template_id: 75,
+                        user_msg: vec!["subscription".to_string()],
+                        rp_code: vec!["permission-denied".to_string()],
+                    })
                     .unwrap()
-                    .unwrap()
+                    .into(),
+                ))
+                .await
+                .unwrap();
+            send_test_payload(&mut socket, 12).await;
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        });
+        let policy =
+            ReconnectPolicy::new(Duration::from_millis(1), Duration::from_millis(10)).unwrap();
+        let templates = Arc::new(Mutex::new(Vec::new()));
+        let handler_templates = Arc::clone(&templates);
+        let supervisor = tokio::spawn(async move {
+            run_with_reconnect(
+                &url,
+                login(),
+                Duration::from_secs(1),
+                policy,
+                vec![],
+                move |payload| {
+                    handler_templates
+                        .lock()
+                        .unwrap()
+                        .push(codec::template_id(&payload)?);
+                    Ok(())
+                },
             )
-            .unwrap(),
-            13
-        );
-        timeout(Duration::from_secs(2), reconnected_rx)
             .await
-            .unwrap()
-            .unwrap();
-        assert_eq!(
-            codec::template_id(
-                &timeout(Duration::from_secs(1), rx.recv())
-                    .await
-                    .unwrap()
-                    .unwrap()
-            )
-            .unwrap(),
-            14
-        );
+        });
+
+        timeout(Duration::from_secs(1), async {
+            while templates.lock().unwrap().len() < 2 {
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(*templates.lock().unwrap(), [75, 12]);
 
         supervisor.abort();
         server.await.unwrap();

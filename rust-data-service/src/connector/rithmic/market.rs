@@ -7,6 +7,7 @@ const MARKET_DATA_REQUEST: i32 = 100;
 const MARKET_DATA_RESPONSE: i32 = 101;
 const LAST_TRADE: i32 = 150;
 const LAST_TRADE_PRESENT: u32 = 1;
+const REJECT: i32 = 75;
 
 #[derive(Clone, Copy)]
 pub(crate) enum SubscriptionAction {
@@ -27,8 +28,18 @@ pub(crate) struct LastTradeUpdate {
     pub price: Decimal,
     pub quantity: Decimal,
     pub aggressor: Option<Aggressor>,
-    pub ssboe: i32,
-    pub usecs: i32,
+    pub timestamp: i64,
+    pub is_snapshot: bool,
+}
+
+#[derive(Debug, PartialEq)]
+pub(crate) enum MarketDataEvent {
+    SubscriptionAccepted,
+    LastTrade(LastTradeUpdate),
+    Rejected {
+        user_messages: Vec<String>,
+        response_codes: Vec<String>,
+    },
 }
 
 pub(crate) fn last_trade_request(
@@ -115,15 +126,37 @@ pub(crate) fn decode_last_trade(payload: &[u8]) -> Result<LastTradeUpdate> {
             }
             Some(_) => anyhow::bail!("unknown Rithmic trade aggressor"),
         },
-        ssboe,
-        usecs,
+        timestamp: epoch_millis(ssboe, usecs),
+        is_snapshot: trade.is_snapshot.unwrap_or(false),
     })
+}
+
+pub(crate) fn decode_market_data_event(payload: &[u8]) -> Result<MarketDataEvent> {
+    match codec::template_id(payload)? {
+        MARKET_DATA_RESPONSE => {
+            accept_market_data_response(payload)?;
+            Ok(MarketDataEvent::SubscriptionAccepted)
+        }
+        LAST_TRADE => decode_last_trade(payload).map(MarketDataEvent::LastTrade),
+        REJECT => {
+            let reject: protocol::Reject = codec::decode(payload)?;
+            Ok(MarketDataEvent::Rejected {
+                user_messages: reject.user_msg,
+                response_codes: reject.rp_code,
+            })
+        }
+        template_id => anyhow::bail!("unsupported Rithmic market-data template {template_id}"),
+    }
 }
 
 fn required_text(value: Option<String>, field: &str) -> Result<String> {
     value
         .filter(|value| !value.trim().is_empty())
         .with_context(|| format!("missing Rithmic trade {field}"))
+}
+
+fn epoch_millis(ssboe: i32, usecs: i32) -> i64 {
+    i64::from(ssboe) * 1_000 + i64::from(usecs) / 1_000
 }
 
 #[cfg(test)]
@@ -189,10 +222,64 @@ mod tests {
                 price: dec!(29784.75),
                 quantity: dec!(2),
                 aggressor: Some(Aggressor::Buy),
-                ssboe: 1_784_243_600,
-                usecs: 123_456,
+                timestamp: 1_784_243_600_123,
+                is_snapshot: false,
             }
         );
+    }
+
+    #[test]
+    fn market_data_event_template_matrix() {
+        let accepted = codec::encode(&protocol::ResponseMarketDataUpdate {
+            template_id: MARKET_DATA_RESPONSE,
+            rp_code: vec!["0".to_string()],
+            ..Default::default()
+        })
+        .unwrap();
+        assert_eq!(
+            decode_market_data_event(&accepted).unwrap(),
+            MarketDataEvent::SubscriptionAccepted
+        );
+        assert!(matches!(
+            decode_market_data_event(&last_trade_payload()).unwrap(),
+            MarketDataEvent::LastTrade(_)
+        ));
+        let rejected = codec::encode(&protocol::Reject {
+            template_id: REJECT,
+            user_msg: vec!["subscription".to_string()],
+            rp_code: vec!["permission-denied".to_string()],
+        })
+        .unwrap();
+        assert_eq!(
+            decode_market_data_event(&rejected).unwrap(),
+            MarketDataEvent::Rejected {
+                user_messages: vec!["subscription".to_string()],
+                response_codes: vec!["permission-denied".to_string()],
+            }
+        );
+
+        for payload in [
+            codec::encode(&protocol::ResponseMarketDataUpdate {
+                template_id: MARKET_DATA_RESPONSE,
+                rp_code: vec!["9".to_string()],
+                ..Default::default()
+            })
+            .unwrap(),
+            codec::encode(&protocol::RequestLogout {
+                template_id: 12,
+                ..Default::default()
+            })
+            .unwrap(),
+        ] {
+            assert!(decode_market_data_event(&payload).is_err());
+        }
+    }
+
+    #[test]
+    fn epoch_timestamp_conversion_truncates_sub_millisecond_precision() {
+        assert_eq!(epoch_millis(0, 0), 0);
+        assert_eq!(epoch_millis(1_784_243_600, 123_456), 1_784_243_600_123);
+        assert_eq!(epoch_millis(i32::MAX, 999_999), 2_147_483_647_999);
     }
 
     #[test]

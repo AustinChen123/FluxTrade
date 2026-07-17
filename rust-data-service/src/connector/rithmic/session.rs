@@ -1,6 +1,6 @@
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
-use anyhow::{bail, ensure, Context, Result};
+use anyhow::{ensure, Context, Result};
 
 use super::{codec, protocol};
 
@@ -174,21 +174,7 @@ impl RithmicSession {
             let seconds = response.heartbeat_interval.ok_or_else(|| {
                 FatalSessionError("Rithmic login response omitted heartbeat_interval".to_string())
             })?;
-            if !seconds.is_finite() || seconds <= 0.0 {
-                return Err(FatalSessionError(
-                    "Rithmic heartbeat_interval must be finite and positive".to_string(),
-                )
-                .into());
-            }
-            let interval = Duration::try_from_secs_f64(seconds).map_err(|_| {
-                FatalSessionError("Rithmic heartbeat_interval is out of range".to_string())
-            })?;
-            if interval.is_zero() {
-                return Err(FatalSessionError(
-                    "Rithmic heartbeat_interval is below timer resolution".to_string(),
-                )
-                .into());
-            }
+            let interval = validated_heartbeat_interval(seconds)?;
             self.heartbeat_interval = Some(interval);
             codec::encode(&heartbeat_request())
         })();
@@ -232,14 +218,15 @@ impl RithmicSession {
                 self.accept_heartbeat(frame)?;
                 Ok(true)
             }
-            REJECT | FORCED_LOGOUT => self.accept_terminal(frame).map(|()| true),
+            FORCED_LOGOUT => self.accept_forced_logout(frame).map(|()| true),
             _ => Ok(false),
         }
     }
 
     pub(crate) fn reject_terminal(&mut self, frame: &[u8]) -> Result<()> {
         match codec::template_id(frame)? {
-            REJECT | FORCED_LOGOUT => self.accept_terminal(frame),
+            REJECT => self.accept_handshake_reject(frame),
+            FORCED_LOGOUT => self.accept_forced_logout(frame),
             _ => Ok(()),
         }
     }
@@ -264,25 +251,22 @@ impl RithmicSession {
         self.finish_response(result, SessionState::Closed)
     }
 
-    pub(crate) fn accept_terminal(&mut self, frame: &[u8]) -> Result<()> {
-        let template_id = codec::template_id(frame)?;
-        match template_id {
-            REJECT => {
-                let response: protocol::Reject = codec::decode(frame)?;
-                self.state = SessionState::Failed;
-                Err(FatalSessionError(format!(
-                    "Rithmic rejected the session: {}",
-                    response.rp_code.join(",")
-                ))
-                .into())
-            }
-            FORCED_LOGOUT => {
-                let _: protocol::ForcedLogout = codec::decode(frame)?;
-                self.state = SessionState::Failed;
-                Err(FatalSessionError("Rithmic forced the session to log out".to_string()).into())
-            }
-            _ => bail!("Rithmic message {template_id} is not terminal"),
-        }
+    fn accept_handshake_reject(&mut self, frame: &[u8]) -> Result<()> {
+        expect_template(frame, REJECT)?;
+        let response: protocol::Reject = codec::decode(frame)?;
+        self.state = SessionState::Failed;
+        Err(FatalSessionError(format!(
+            "Rithmic rejected the session: {}",
+            response.rp_code.join(",")
+        ))
+        .into())
+    }
+
+    fn accept_forced_logout(&mut self, frame: &[u8]) -> Result<()> {
+        expect_template(frame, FORCED_LOGOUT)?;
+        let _: protocol::ForcedLogout = codec::decode(frame)?;
+        self.state = SessionState::Failed;
+        Err(FatalSessionError("Rithmic forced the session to log out".to_string()).into())
     }
 
     fn require_state(&self, expected: SessionState) -> Result<()> {
@@ -313,6 +297,29 @@ fn heartbeat_request() -> protocol::RequestHeartbeat {
         template_id: HEARTBEAT_REQUEST,
         ..Default::default()
     }
+}
+
+fn validated_heartbeat_interval(seconds: f64) -> Result<Duration> {
+    if !seconds.is_finite() || seconds <= 0.0 {
+        return Err(FatalSessionError(
+            "Rithmic heartbeat_interval must be finite and positive".to_string(),
+        )
+        .into());
+    }
+    let interval = Duration::try_from_secs_f64(seconds)
+        .map_err(|_| FatalSessionError("Rithmic heartbeat_interval is out of range".to_string()))?;
+    if interval.is_zero() {
+        return Err(FatalSessionError(
+            "Rithmic heartbeat_interval is below timer resolution".to_string(),
+        )
+        .into());
+    }
+    Instant::now().checked_add(interval).ok_or_else(|| {
+        anyhow::Error::new(FatalSessionError(
+            "Rithmic heartbeat_interval exceeds timer range".to_string(),
+        ))
+    })?;
+    Ok(interval)
 }
 
 fn expect_template(frame: &[u8], expected: i32) -> Result<()> {
@@ -573,6 +580,7 @@ mod tests {
             Some(f64::NAN),
             Some(f64::INFINITY),
             Some(f64::MAX),
+            Some(seconds_beyond_instant_range()),
             Some(f64::MIN_POSITIVE),
         ] {
             let mut session = RithmicSession::new(login(Plant::Ticker));
@@ -591,27 +599,39 @@ mod tests {
         }
     }
 
-    #[test]
-    fn reject_and_forced_logout_fail_closed() {
-        let cases = [
-            codec::encode(&protocol::Reject {
-                template_id: REJECT,
-                user_msg: vec![],
-                rp_code: vec!["permission-denied".to_string()],
-            })
-            .unwrap(),
-            codec::encode(&protocol::ForcedLogout {
-                template_id: FORCED_LOGOUT,
-            })
-            .unwrap(),
-        ];
-
-        for frame in cases {
-            let mut session = activate(Plant::Ticker);
-            let error = session.accept_terminal(&frame).unwrap_err();
-            assert!(is_fatal_session_error(&error));
-            assert_eq!(session.state(), SessionState::Failed);
+    fn seconds_beyond_instant_range() -> f64 {
+        let mut seconds = u64::MAX as f64;
+        loop {
+            if let Ok(duration) = Duration::try_from_secs_f64(seconds) {
+                if Instant::now().checked_add(duration).is_none() {
+                    return seconds;
+                }
+            }
+            seconds /= 2.0;
+            assert!(seconds >= 1.0, "platform Instant has no finite upper bound");
         }
+    }
+
+    #[test]
+    fn active_reject_is_payload_but_forced_logout_is_fatal() {
+        let reject = codec::encode(&protocol::Reject {
+            template_id: REJECT,
+            user_msg: vec![],
+            rp_code: vec!["permission-denied".to_string()],
+        })
+        .unwrap();
+        let mut rejected_request = activate(Plant::Ticker);
+        assert!(!rejected_request.accept_control(&reject).unwrap());
+        assert_eq!(rejected_request.state(), SessionState::Active);
+
+        let forced_logout = codec::encode(&protocol::ForcedLogout {
+            template_id: FORCED_LOGOUT,
+        })
+        .unwrap();
+        let mut terminated = activate(Plant::Ticker);
+        let error = terminated.accept_control(&forced_logout).unwrap_err();
+        assert!(is_fatal_session_error(&error));
+        assert_eq!(terminated.state(), SessionState::Failed);
     }
 
     #[test]
