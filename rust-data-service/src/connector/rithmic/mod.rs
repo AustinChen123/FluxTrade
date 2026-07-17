@@ -5,6 +5,9 @@ mod bar;
 mod codec;
 
 #[allow(dead_code)]
+mod history;
+
+#[allow(dead_code)]
 mod market;
 
 #[allow(dead_code, clippy::enum_variant_names, clippy::tabs_in_doc_comments)]
