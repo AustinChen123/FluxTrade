@@ -3,6 +3,8 @@ use anyhow::Result;
 pub mod backpack;
 pub mod binance;
 pub mod bybit;
+#[cfg(feature = "rithmic")]
+pub mod rithmic;
 pub mod ws;
 
 use async_trait::async_trait;
