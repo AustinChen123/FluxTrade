@@ -106,6 +106,10 @@ impl HistoryPageDecoder {
         })
     }
 
+    pub(crate) fn reset(&mut self) {
+        self.last_marker = None;
+    }
+
     pub(crate) fn decode(&mut self, payload: &[u8]) -> Result<HistoryEvent> {
         ensure!(
             codec::template_id(payload)? == TIME_BAR_REPLAY_RESPONSE,
@@ -292,6 +296,17 @@ mod tests {
             .unwrap()
             .decode(&codec::encode(&wrong_exchange).unwrap())
             .is_err());
+    }
+
+    #[test]
+    fn reset_allows_replay_from_the_original_marker() {
+        let payload = response(vec![], vec!["0"], Some(120));
+        let mut decoder = HistoryPageDecoder::new("page", "CME", "NQU6", 300).unwrap();
+
+        assert!(decoder.decode(&payload).is_ok());
+        assert!(decoder.decode(&payload).is_err());
+        decoder.reset();
+        assert!(decoder.decode(&payload).is_ok());
     }
 
     fn response(rp_code: Vec<&str>, handler_code: Vec<&str>, marker: Option<i32>) -> Vec<u8> {

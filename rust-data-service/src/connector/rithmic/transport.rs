@@ -58,16 +58,18 @@ impl ReconnectPolicy {
     }
 }
 
-pub(crate) async fn run_with_reconnect<F>(
+pub(crate) async fn run_with_reconnect<F, P>(
     url: &str,
     login: LoginParameters,
     response_timeout: Duration,
     policy: ReconnectPolicy,
     startup_payloads: Vec<Vec<u8>>,
+    mut prepare_startup: P,
     mut handle_payload: F,
 ) -> Result<()>
 where
     F: FnMut(Vec<u8>) -> Result<()>,
+    P: FnMut() -> Result<()>,
 {
     let mut backoffs = ReconnectBackoffs::new(policy);
 
@@ -81,6 +83,7 @@ where
                         Ok(ConnectionEvent::HeartbeatConfirmed) => {
                             heartbeat_confirmations = heartbeat_confirmations.saturating_add(1);
                             if startup_pending {
+                                prepare_startup().context("Rithmic startup preparation failed")?;
                                 for payload in &startup_payloads {
                                     if let Err(error) =
                                         connection.send_payload(payload.clone()).await
@@ -532,62 +535,62 @@ mod tests {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let url = format!("ws://{}", listener.local_addr().unwrap());
         let server = tokio::spawn(async move {
-            drop(serve_handshake(&listener, 30.0).await);
+            let mut socket = serve_handshake(&listener, 30.0).await;
+            send_heartbeat_response(&mut socket).await;
+            assert_template(socket.next().await.unwrap().unwrap(), 100);
+            send_test_payload(&mut socket, 12).await;
+            drop(socket);
 
             let mut socket = serve_handshake(&listener, 30.0).await;
-            socket
-                .send(Message::Binary(
-                    codec::encode(&protocol::ResponseHeartbeat {
-                        template_id: 19,
-                        rp_code: vec!["0".to_string()],
-                        ..Default::default()
-                    })
-                    .unwrap()
-                    .into(),
-                ))
-                .await
-                .unwrap();
-            socket
-                .send(Message::Binary(
-                    codec::encode(&protocol::RequestLogout {
-                        template_id: 12,
-                        ..Default::default()
-                    })
-                    .unwrap()
-                    .into(),
-                ))
-                .await
-                .unwrap();
+            send_heartbeat_response(&mut socket).await;
+            assert_template(socket.next().await.unwrap().unwrap(), 100);
+            send_test_payload(&mut socket, 13).await;
         });
         let policy =
             ReconnectPolicy::new(Duration::from_millis(1), Duration::from_millis(10)).unwrap();
         let payloads = Arc::new(Mutex::new(Vec::new()));
-        let handled = Arc::new(tokio::sync::Notify::new());
         let handler_payloads = Arc::clone(&payloads);
-        let handler_handled = Arc::clone(&handled);
+        let preparations = Arc::new(Mutex::new(0_u32));
+        let startup_preparations = Arc::clone(&preparations);
+        let startup_payload = codec::encode(&protocol::RequestMarketDataUpdate {
+            template_id: 100,
+            ..Default::default()
+        })
+        .unwrap();
         let supervisor = tokio::spawn(async move {
             run_with_reconnect(
                 &url,
                 login(),
                 Duration::from_secs(1),
                 policy,
-                vec![],
+                vec![startup_payload],
+                move || {
+                    *startup_preparations.lock().unwrap() += 1;
+                    Ok(())
+                },
                 move |payload| {
                     handler_payloads.lock().unwrap().push(payload);
-                    handler_handled.notify_one();
                     Ok(())
                 },
             )
             .await
         });
 
-        timeout(Duration::from_secs(2), handled.notified())
-            .await
-            .unwrap();
-        assert_eq!(
-            codec::template_id(&payloads.lock().unwrap()[0]).unwrap(),
-            12
-        );
+        timeout(Duration::from_secs(2), async {
+            while payloads.lock().unwrap().len() < 2 {
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+        })
+        .await
+        .unwrap();
+        let templates: Vec<_> = payloads
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|payload| codec::template_id(payload).unwrap())
+            .collect();
+        assert_eq!(templates, [12, 13]);
+        assert_eq!(*preparations.lock().unwrap(), 2);
 
         supervisor.abort();
         server.await.unwrap();
@@ -622,6 +625,7 @@ mod tests {
                 Duration::from_secs(1),
                 policy,
                 vec![startup_payload],
+                || Ok(()),
                 move |payload| {
                     handler_payloads.lock().unwrap().push(payload);
                     Ok(())
@@ -682,6 +686,7 @@ mod tests {
                 Duration::from_secs(1),
                 policy,
                 vec![],
+                || Ok(()),
                 move |payload| {
                     handler_templates
                         .lock()
