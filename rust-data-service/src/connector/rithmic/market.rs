@@ -36,6 +36,7 @@ pub(crate) struct LastTradeUpdate {
 pub(crate) enum MarketDataEvent {
     SubscriptionAccepted,
     LastTrade(LastTradeUpdate),
+    LastTradeCleared,
     Rejected {
         user_messages: Vec<String>,
         response_codes: Vec<String>,
@@ -82,12 +83,15 @@ pub(crate) fn accept_market_data_response(payload: &[u8]) -> Result<()> {
     ensure_success(&response.rp_code)
 }
 
-pub(crate) fn decode_last_trade(payload: &[u8]) -> Result<LastTradeUpdate> {
+pub(crate) fn decode_last_trade(payload: &[u8]) -> Result<Option<LastTradeUpdate>> {
     ensure!(
         codec::template_id(payload)? == LAST_TRADE,
         "unexpected Rithmic last-trade template"
     );
     let trade: protocol::LastTrade = codec::decode(payload)?;
+    if trade.clear_bits.unwrap_or_default() & LAST_TRADE_PRESENT != 0 {
+        return Ok(None);
+    }
     ensure!(
         trade.presence_bits.unwrap_or_default() & LAST_TRADE_PRESENT != 0,
         "Rithmic update does not contain a last trade"
@@ -111,7 +115,7 @@ pub(crate) fn decode_last_trade(payload: &[u8]) -> Result<LastTradeUpdate> {
         "invalid Rithmic trade usecs"
     );
 
-    Ok(LastTradeUpdate {
+    Ok(Some(LastTradeUpdate {
         exchange,
         symbol,
         price,
@@ -128,7 +132,7 @@ pub(crate) fn decode_last_trade(payload: &[u8]) -> Result<LastTradeUpdate> {
         },
         timestamp: epoch_millis(ssboe, usecs),
         is_snapshot: trade.is_snapshot.unwrap_or(false),
-    })
+    }))
 }
 
 pub(crate) fn decode_market_data_event(payload: &[u8]) -> Result<MarketDataEvent> {
@@ -137,7 +141,10 @@ pub(crate) fn decode_market_data_event(payload: &[u8]) -> Result<MarketDataEvent
             accept_market_data_response(payload)?;
             Ok(MarketDataEvent::SubscriptionAccepted)
         }
-        LAST_TRADE => decode_last_trade(payload).map(MarketDataEvent::LastTrade),
+        LAST_TRADE => Ok(match decode_last_trade(payload)? {
+            Some(trade) => MarketDataEvent::LastTrade(trade),
+            None => MarketDataEvent::LastTradeCleared,
+        }),
         REJECT => {
             let reject: protocol::Reject = codec::decode(payload)?;
             Ok(MarketDataEvent::Rejected {
@@ -216,7 +223,7 @@ mod tests {
 
         assert_eq!(
             decode_last_trade(&payload).unwrap(),
-            LastTradeUpdate {
+            Some(LastTradeUpdate {
                 exchange: "CME".to_string(),
                 symbol: "NQU6".to_string(),
                 price: dec!(29784.75),
@@ -224,7 +231,7 @@ mod tests {
                 aggressor: Some(Aggressor::Buy),
                 timestamp: 1_784_243_600_123,
                 is_snapshot: false,
-            }
+            })
         );
     }
 
@@ -244,6 +251,17 @@ mod tests {
             decode_market_data_event(&last_trade_payload()).unwrap(),
             MarketDataEvent::LastTrade(_)
         ));
+        let cleared = codec::encode(&protocol::LastTrade {
+            template_id: LAST_TRADE,
+            presence_bits: Some(LAST_TRADE_PRESENT),
+            clear_bits: Some(LAST_TRADE_PRESENT),
+            ..Default::default()
+        })
+        .unwrap();
+        assert_eq!(
+            decode_market_data_event(&cleared).unwrap(),
+            MarketDataEvent::LastTradeCleared
+        );
         let rejected = codec::encode(&protocol::Reject {
             template_id: REJECT,
             user_msg: vec!["subscription".to_string()],
@@ -351,6 +369,21 @@ mod tests {
         for trade in invalid {
             let payload = codec::encode(&trade).unwrap();
             assert!(decode_last_trade(&payload).is_err());
+        }
+    }
+
+    #[test]
+    fn last_trade_clear_bit_skips_absent_trade_fields() {
+        for presence_bits in [0, LAST_TRADE_PRESENT] {
+            let payload = codec::encode(&protocol::LastTrade {
+                template_id: LAST_TRADE,
+                presence_bits: Some(presence_bits),
+                clear_bits: Some(LAST_TRADE_PRESENT),
+                ..Default::default()
+            })
+            .unwrap();
+
+            assert_eq!(decode_last_trade(&payload).unwrap(), None);
         }
     }
 

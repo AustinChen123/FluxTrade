@@ -5,6 +5,9 @@ mod bar;
 mod codec;
 
 #[allow(dead_code)]
+mod front_month;
+
+#[allow(dead_code)]
 mod history;
 
 #[allow(dead_code)]

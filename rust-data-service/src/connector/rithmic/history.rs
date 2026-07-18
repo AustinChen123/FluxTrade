@@ -1,4 +1,4 @@
-use super::{codec, protocol};
+use super::{codec, protocol, session::ensure_success};
 use anyhow::{ensure, Context, Result};
 use rust_decimal::Decimal;
 use std::str::FromStr;
@@ -70,22 +70,37 @@ pub(crate) fn minute_bar_replay_request(
 
 pub(crate) struct HistoryPageDecoder {
     request_key: String,
+    exchange: String,
+    symbol: String,
     finish_index: i32,
     last_marker: Option<i32>,
 }
 
 impl HistoryPageDecoder {
-    pub(crate) fn new(request_key: String, finish_index: i32) -> Result<Self> {
-        ensure!(
-            !request_key.trim().is_empty(),
-            "Rithmic history request key must not be empty"
-        );
+    pub(crate) fn new(
+        request_key: &str,
+        exchange: &str,
+        symbol: &str,
+        finish_index: i32,
+    ) -> Result<Self> {
+        for (name, value) in [
+            ("request key", request_key),
+            ("exchange", exchange),
+            ("symbol", symbol),
+        ] {
+            ensure!(
+                !value.trim().is_empty(),
+                "Rithmic history {name} must not be empty"
+            );
+        }
         ensure!(
             finish_index >= 0,
             "Rithmic history finish index must not be negative"
         );
         Ok(Self {
-            request_key,
+            request_key: request_key.to_string(),
+            exchange: exchange.to_string(),
+            symbol: symbol.to_string(),
             finish_index,
             last_marker: None,
         })
@@ -102,9 +117,12 @@ impl HistoryPageDecoder {
             "Rithmic history response request key mismatch"
         );
 
-        if response.rp_code.first().is_some_and(|code| code == "0")
-            || (response.rp_code.is_empty() && response.rq_handler_rp_code.is_empty())
-        {
+        if !response.rp_code.is_empty() {
+            ensure!(
+                response.rq_handler_rp_code.is_empty(),
+                "Rithmic history response has conflicting status codes"
+            );
+            ensure_success(&response.rp_code)?;
             let next_start = self
                 .last_marker
                 .filter(|marker| *marker < self.finish_index)
@@ -141,6 +159,17 @@ impl HistoryPageDecoder {
         let high = decimal(response.high_price, "high")?;
         let low = decimal(response.low_price, "low")?;
         let close = decimal(response.close_price, "close")?;
+        let exchange = required_text(response.exchange, "exchange")?;
+        let symbol = required_text(response.symbol, "symbol")?;
+        ensure!(
+            exchange == self.exchange,
+            "Rithmic history response exchange mismatch"
+        );
+        ensure!(
+            symbol == self.symbol,
+            "Rithmic history response symbol mismatch"
+        );
+        let volume = Decimal::from(response.volume.context("missing Rithmic history volume")?);
         ensure!(
             high >= open && high >= close && low <= open && low <= close,
             "invalid Rithmic history OHLC"
@@ -148,14 +177,14 @@ impl HistoryPageDecoder {
         self.last_marker = Some(marker);
 
         Ok(HistoryEvent::Bar(HistoryMinuteBar {
-            exchange: required_text(response.exchange, "exchange")?,
-            symbol: required_text(response.symbol, "symbol")?,
+            exchange,
+            symbol,
             end_timestamp: i64::from(marker) * 1_000,
             open,
             high,
             low,
             close,
-            volume: Decimal::from(response.volume.context("missing Rithmic history volume")?),
+            volume,
         }))
     }
 }
@@ -189,13 +218,13 @@ mod tests {
         assert_eq!(request.start_index, Some(100));
         assert_eq!(request.finish_index, Some(300));
 
-        let mut decoder = HistoryPageDecoder::new("page".to_string(), 300).unwrap();
-        let bar = response(vec!["working"], vec!["0"], Some(120));
+        let mut decoder = HistoryPageDecoder::new("page", "CME", "NQU6", 300).unwrap();
+        let bar = response(vec![], vec!["0"], Some(120));
         assert!(matches!(
             decoder.decode(&bar).unwrap(),
             HistoryEvent::Bar(_)
         ));
-        let page_end = response(vec!["0"], vec!["0"], None);
+        let page_end = response(vec!["0"], vec![], None);
         assert_eq!(
             decoder.decode(&page_end).unwrap(),
             HistoryEvent::PageEnded {
@@ -206,23 +235,23 @@ mod tests {
 
     #[test]
     fn completed_range_and_invalid_response_matrix() {
-        let mut decoder = HistoryPageDecoder::new("page".to_string(), 120).unwrap();
+        let mut decoder = HistoryPageDecoder::new("page", "CME", "NQU6", 120).unwrap();
         assert!(matches!(
             decoder
-                .decode(&response(vec!["working"], vec!["0"], Some(120)))
+                .decode(&response(vec![], vec!["0"], Some(120)))
                 .unwrap(),
             HistoryEvent::Bar(_)
         ));
         assert_eq!(
-            decoder
-                .decode(&response(vec!["0"], vec!["0"], None))
-                .unwrap(),
+            decoder.decode(&response(vec!["0"], vec![], None)).unwrap(),
             HistoryEvent::PageEnded { next_start: None }
         );
 
         for payload in [
             response(vec!["error"], vec!["9"], None),
             response(vec!["9"], vec![], None),
+            response(vec![], vec![], None),
+            response(vec!["0"], vec!["0"], None),
             codec::encode(&protocol::ResponseTimeBarReplay {
                 template_id: 204,
                 user_msg: vec!["page".to_string()],
@@ -236,11 +265,33 @@ mod tests {
             })
             .unwrap(),
         ] {
-            assert!(HistoryPageDecoder::new("page".to_string(), 120)
+            assert!(HistoryPageDecoder::new("page", "CME", "NQU6", 120)
                 .unwrap()
                 .decode(&payload)
                 .is_err());
         }
+    }
+
+    #[test]
+    fn instrument_mismatch_does_not_advance_page_state() {
+        let valid = response(vec![], vec!["0"], Some(120));
+        let mut wrong_symbol: protocol::ResponseTimeBarReplay = codec::decode(&valid).unwrap();
+        wrong_symbol.symbol = Some("ESU6".to_string());
+        let wrong_symbol = codec::encode(&wrong_symbol).unwrap();
+
+        let mut decoder = HistoryPageDecoder::new("page", "CME", "NQU6", 300).unwrap();
+        assert!(decoder.decode(&wrong_symbol).is_err());
+        assert!(matches!(
+            decoder.decode(&valid).unwrap(),
+            HistoryEvent::Bar(_)
+        ));
+
+        let mut wrong_exchange: protocol::ResponseTimeBarReplay = codec::decode(&valid).unwrap();
+        wrong_exchange.exchange = Some("CBOT".to_string());
+        assert!(HistoryPageDecoder::new("page", "CME", "NQU6", 300)
+            .unwrap()
+            .decode(&codec::encode(&wrong_exchange).unwrap())
+            .is_err());
     }
 
     fn response(rp_code: Vec<&str>, handler_code: Vec<&str>, marker: Option<i32>) -> Vec<u8> {
@@ -266,9 +317,9 @@ mod tests {
 
     #[test]
     fn decoded_bar_preserves_decimal_and_end_timestamp() {
-        let mut decoder = HistoryPageDecoder::new("page".to_string(), 300).unwrap();
+        let mut decoder = HistoryPageDecoder::new("page", "CME", "NQU6", 300).unwrap();
         let HistoryEvent::Bar(bar) = decoder
-            .decode(&response(vec!["working"], vec!["0"], Some(120)))
+            .decode(&response(vec![], vec!["0"], Some(120)))
             .unwrap()
         else {
             panic!("expected history bar");
