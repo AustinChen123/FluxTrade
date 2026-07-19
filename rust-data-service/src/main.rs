@@ -474,7 +474,7 @@ async fn run_live_mode(
                                 info!("Task '{}' completed normally", task_id);
                             }
                             Err(ref e) => {
-                                error!("Task '{}' failed: {}", task_id, e);
+                                error!("Task '{}' failed: {:#}", task_id, e);
                                 if task_exit_requires_shutdown(&task_id) {
                                     join_set.shutdown().await;
                                     return Err(anyhow::anyhow!(

@@ -108,7 +108,7 @@ pub(crate) fn decode_last_trade(payload: &[u8]) -> Result<Option<LastTradeUpdate
     let quantity = trade.trade_size.context("missing Rithmic trade size")?;
     ensure!(quantity > 0, "invalid Rithmic trade size");
     let ssboe = trade.ssboe.context("missing Rithmic trade ssboe")?;
-    let usecs = trade.usecs.context("missing Rithmic trade usecs")?;
+    let usecs = trade.usecs.unwrap_or_default();
     ensure!(ssboe >= 0, "invalid Rithmic trade ssboe");
     ensure!(
         (0..1_000_000).contains(&usecs),
@@ -298,6 +298,20 @@ mod tests {
         assert_eq!(epoch_millis(0, 0), 0);
         assert_eq!(epoch_millis(1_784_243_600, 123_456), 1_784_243_600_123);
         assert_eq!(epoch_millis(i32::MAX, 999_999), 2_147_483_647_999);
+    }
+
+    #[test]
+    fn missing_optional_trade_usecs_defaults_to_zero() {
+        let payload = codec::encode(&protocol::LastTrade {
+            usecs: None,
+            ..codec::decode::<protocol::LastTrade>(&last_trade_payload()).unwrap()
+        })
+        .unwrap();
+
+        assert_eq!(
+            decode_last_trade(&payload).unwrap().unwrap().timestamp,
+            1_784_243_600_000
+        );
     }
 
     #[test]
