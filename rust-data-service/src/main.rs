@@ -15,6 +15,8 @@ use crate::publisher::{
     create_publish_channel, PublishSender, RedisPublisher, DEFAULT_CHANNEL_CAPACITY,
 };
 
+#[cfg(feature = "rithmic")]
+use anyhow::Context;
 use clap::{Parser, Subcommand};
 use dotenvy::dotenv;
 use std::time::Duration;
@@ -49,6 +51,29 @@ enum Commands {
         /// Optional: Comma separated symbols to subscribe (e.g. BTCUSDT,SOLUSDC)
         #[arg(short, long)]
         symbol: Option<String>,
+
+        #[cfg(feature = "rithmic")]
+        /// Credential profile under [rithmic.<profile>]
+        #[arg(
+            long,
+            requires_all = ["rithmic_product_id", "rithmic_exchange", "rithmic_symbol"]
+        )]
+        rithmic_profile: Option<String>,
+
+        #[cfg(feature = "rithmic")]
+        /// Canonical dated product ID (e.g. RITHMIC:NQ-202609)
+        #[arg(long, requires = "rithmic_profile")]
+        rithmic_product_id: Option<String>,
+
+        #[cfg(feature = "rithmic")]
+        /// Rithmic exchange code (e.g. CME)
+        #[arg(long, requires = "rithmic_profile")]
+        rithmic_exchange: Option<String>,
+
+        #[cfg(feature = "rithmic")]
+        /// Exact Rithmic native contract symbol (e.g. NQU6)
+        #[arg(long, requires = "rithmic_profile")]
+        rithmic_symbol: Option<String>,
     },
 
     /// Downloads historical data
@@ -93,8 +118,41 @@ async fn main() -> anyhow::Result<()> {
     match cli.command.unwrap_or(Commands::Live {
         exchange: None,
         symbol: None,
+        #[cfg(feature = "rithmic")]
+        rithmic_profile: None,
+        #[cfg(feature = "rithmic")]
+        rithmic_product_id: None,
+        #[cfg(feature = "rithmic")]
+        rithmic_exchange: None,
+        #[cfg(feature = "rithmic")]
+        rithmic_symbol: None,
     }) {
-        Commands::Live { exchange, symbol } => run_live_mode(exchange, symbol).await?,
+        Commands::Live {
+            exchange,
+            symbol,
+            #[cfg(feature = "rithmic")]
+            rithmic_profile,
+            #[cfg(feature = "rithmic")]
+            rithmic_product_id,
+            #[cfg(feature = "rithmic")]
+            rithmic_exchange,
+            #[cfg(feature = "rithmic")]
+            rithmic_symbol,
+        } => {
+            run_live_mode(
+                exchange,
+                symbol,
+                #[cfg(feature = "rithmic")]
+                rithmic_profile,
+                #[cfg(feature = "rithmic")]
+                rithmic_product_id,
+                #[cfg(feature = "rithmic")]
+                rithmic_exchange,
+                #[cfg(feature = "rithmic")]
+                rithmic_symbol,
+            )
+            .await?
+        }
 
         Commands::Backfill {
             exchange,
@@ -143,10 +201,54 @@ impl std::fmt::Display for TaskId {
     }
 }
 
+fn task_exit_requires_shutdown(task_id: &TaskId) -> bool {
+    matches!(task_id, TaskId::Connector(name) if name == "rithmic")
+}
+
 /// Track failure counts per task for restart decisions.
 struct TaskFailureTracker {
     failures: std::collections::HashMap<String, u32>,
     max_failures: u32,
+}
+
+#[cfg(feature = "rithmic")]
+struct RithmicLiveArgs {
+    profile: String,
+    product_id: String,
+    exchange: String,
+    symbol: String,
+}
+
+#[cfg(feature = "rithmic")]
+fn resolve_rithmic_live_args(
+    enabled_exchanges: &str,
+    profile: Option<String>,
+    product_id: Option<String>,
+    exchange: Option<String>,
+    symbol: Option<String>,
+) -> anyhow::Result<Option<RithmicLiveArgs>> {
+    let enabled_count = enabled_exchanges
+        .split(',')
+        .filter(|value| value.trim().eq_ignore_ascii_case("rithmic"))
+        .count();
+    anyhow::ensure!(
+        enabled_count <= 1,
+        "Rithmic exchange must not be enabled more than once"
+    );
+    if enabled_count == 0 {
+        anyhow::ensure!(
+            profile.is_none() && product_id.is_none() && exchange.is_none() && symbol.is_none(),
+            "Rithmic options require --exchange rithmic"
+        );
+        return Ok(None);
+    }
+
+    Ok(Some(RithmicLiveArgs {
+        profile: profile.context("--rithmic-profile is required")?,
+        product_id: product_id.context("--rithmic-product-id is required")?,
+        exchange: exchange.context("--rithmic-exchange is required")?,
+        symbol: symbol.context("--rithmic-symbol is required")?,
+    }))
 }
 
 impl TaskFailureTracker {
@@ -187,6 +289,10 @@ impl TaskFailureTracker {
 async fn run_live_mode(
     exchange_opt: Option<String>,
     symbol_opt: Option<String>,
+    #[cfg(feature = "rithmic")] rithmic_profile: Option<String>,
+    #[cfg(feature = "rithmic")] rithmic_product_id: Option<String>,
+    #[cfg(feature = "rithmic")] rithmic_exchange: Option<String>,
+    #[cfg(feature = "rithmic")] rithmic_symbol: Option<String>,
 ) -> anyhow::Result<()> {
     info!("FluxTrade Data Service Starting (Live Mode)...");
 
@@ -212,6 +318,26 @@ async fn run_live_mode(
     let enabled_exchanges = exchange_opt.unwrap_or_else(|| {
         std::env::var("EXCHANGE_ENABLED").unwrap_or_else(|_| "binance,bybit,backpack".into())
     });
+
+    #[cfg(feature = "rithmic")]
+    let rithmic_args = resolve_rithmic_live_args(
+        &enabled_exchanges,
+        rithmic_profile,
+        rithmic_product_id,
+        rithmic_exchange,
+        rithmic_symbol,
+    )?;
+    #[cfg(feature = "rithmic")]
+    let mut rithmic_config = rithmic_args
+        .map(|args| {
+            crate::connector::rithmic::live::configure(
+                &args.profile,
+                args.product_id,
+                args.exchange,
+                args.symbol,
+            )
+        })
+        .transpose()?;
 
     let symbols_str = symbol_opt.unwrap_or_else(|| "BTCUSDT,SOLUSDC".into());
     let symbols: Vec<String> = symbols_str
@@ -282,6 +408,15 @@ async fn run_live_mode(
                 });
                 info!("Supervised task spawned: connector:backpack");
             }
+            #[cfg(feature = "rithmic")]
+            "rithmic" => {
+                let config = rithmic_config.take().expect("Rithmic configuration loaded");
+                join_set.spawn(async move {
+                    let result = crate::connector::rithmic::live::run(config, candle_tx).await;
+                    (TaskId::Connector("rithmic".to_string()), result)
+                });
+                info!("Supervised task spawned: connector:rithmic");
+            }
             _ => warn!("Unknown exchange in EXCHANGE_ENABLED: {}", ex),
         }
     }
@@ -328,10 +463,26 @@ async fn run_live_mode(
                     Some(Ok((task_id, task_result))) => {
                         match task_result {
                             Ok(()) => {
+                                if task_exit_requires_shutdown(&task_id) {
+                                    error!("Critical task '{}' exited unexpectedly", task_id);
+                                    join_set.shutdown().await;
+                                    return Err(anyhow::anyhow!(
+                                        "Critical task '{}' exited unexpectedly",
+                                        task_id
+                                    ));
+                                }
                                 info!("Task '{}' completed normally", task_id);
                             }
                             Err(ref e) => {
                                 error!("Task '{}' failed: {}", task_id, e);
+                                if task_exit_requires_shutdown(&task_id) {
+                                    join_set.shutdown().await;
+                                    return Err(anyhow::anyhow!(
+                                        "Critical task '{}' failed: {}",
+                                        task_id,
+                                        e
+                                    ));
+                                }
                                 let task_key = task_id.to_string();
                                 let should_restart = tracker.record_failure(&task_key);
                                 let failures = tracker.get_failures(&task_key);
@@ -640,6 +791,52 @@ mod tests {
             TaskId::Connector("binance".to_string()).to_string(),
             "connector:binance"
         );
+    }
+
+    #[test]
+    fn rithmic_task_exit_policy_fails_closed() {
+        for task_id in [
+            TaskId::Watchdog,
+            TaskId::Publisher,
+            TaskId::EventLoop,
+            TaskId::Connector("binance".to_string()),
+        ] {
+            assert!(!task_exit_requires_shutdown(&task_id));
+        }
+        assert!(task_exit_requires_shutdown(&TaskId::Connector(
+            "rithmic".to_string()
+        )));
+    }
+
+    #[cfg(feature = "rithmic")]
+    #[test]
+    fn rithmic_live_arguments_fail_closed_before_startup() {
+        assert!(resolve_rithmic_live_args("binance", None, None, None, None)
+            .unwrap()
+            .is_none());
+        assert!(resolve_rithmic_live_args(
+            "rithmic",
+            Some("lucid".to_string()),
+            Some("RITHMIC:NQ-202609".to_string()),
+            Some("CME".to_string()),
+            Some("NQU6".to_string()),
+        )
+        .unwrap()
+        .is_some());
+
+        for args in [
+            ("rithmic", None, None, None, None),
+            ("rithmic,rithmic", None, None, None, None),
+            (
+                "binance",
+                Some("lucid".to_string()),
+                Some("RITHMIC:NQ-202609".to_string()),
+                Some("CME".to_string()),
+                Some("NQU6".to_string()),
+            ),
+        ] {
+            assert!(resolve_rithmic_live_args(args.0, args.1, args.2, args.3, args.4).is_err());
+        }
     }
 
     #[test]
