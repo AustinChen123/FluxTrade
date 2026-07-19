@@ -13,6 +13,8 @@ mod front_month;
 #[allow(dead_code)]
 mod history;
 
+pub(crate) mod history_runtime;
+
 pub(crate) mod live;
 
 #[allow(dead_code)]

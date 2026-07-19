@@ -5,6 +5,13 @@ target
 *.pdb
 **/mutants.out*/
 
+# Rithmic Dev Kit (proprietary — MUST NEVER be committed; kept outside the work
+# tree at $HOME/rithmic-devkit). These rules are belt-and-suspenders in case the
+# Dev Kit is ever copied back into the repo for convenience.
+/0.89.0.0/
+**/RProtocolAPI/
+**/*.proto
+
 # Python
 __pycache__/
 *.py[cod]
