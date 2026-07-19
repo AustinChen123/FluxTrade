@@ -16,6 +16,7 @@ use tokio::sync::mpsc;
 const RESPONSE_TIMEOUT: Duration = Duration::from_secs(10);
 const INITIAL_BACKOFF: Duration = Duration::from_secs(1);
 const MAX_BACKOFF: Duration = Duration::from_secs(30);
+const FORWARD_QUEUE_CAPACITY: usize = 60;
 
 pub(crate) struct LiveConfig {
     runtime: config::RuntimeConfig,
@@ -48,7 +49,7 @@ pub(crate) fn configure(
 }
 
 pub(crate) async fn run(config: LiveConfig, candle_tx: mpsc::Sender<Candlestick>) -> Result<()> {
-    let (forward_tx, forward_rx) = mpsc::unbounded_channel();
+    let (forward_tx, forward_rx) = mpsc::channel(FORWARD_QUEUE_CAPACITY);
     let handler = Arc::new(Mutex::new(LivePayloadHandler {
         builder: MinuteBarBuilder::new(config.product_id, config.exchange, config.symbol)?,
         candle_tx: forward_tx,
@@ -85,7 +86,7 @@ pub(crate) async fn run(config: LiveConfig, candle_tx: mpsc::Sender<Candlestick>
 
 struct LivePayloadHandler {
     builder: MinuteBarBuilder,
-    candle_tx: mpsc::UnboundedSender<Candlestick>,
+    candle_tx: mpsc::Sender<Candlestick>,
 }
 
 impl LivePayloadHandler {
@@ -98,8 +99,15 @@ impl LivePayloadHandler {
             MarketDataEvent::LastTrade(trade) => {
                 if let Some(candle) = self.builder.push(&trade)? {
                     self.candle_tx
-                        .send(candle)
-                        .context("Rithmic candle channel is unavailable")?;
+                        .try_send(candle)
+                        .map_err(|error| match error {
+                            mpsc::error::TrySendError::Full(_) => {
+                                anyhow::anyhow!("Rithmic candle forwarding queue exhausted")
+                            }
+                            mpsc::error::TrySendError::Closed(_) => {
+                                anyhow::anyhow!("Rithmic candle forwarding queue closed")
+                            }
+                        })?;
                 }
                 Ok(())
             }
@@ -112,7 +120,7 @@ impl LivePayloadHandler {
 }
 
 async fn forward_candles(
-    mut source: mpsc::UnboundedReceiver<Candlestick>,
+    mut source: mpsc::Receiver<Candlestick>,
     destination: mpsc::Sender<Candlestick>,
 ) -> Result<()> {
     while let Some(candle) = source.recv().await {
@@ -200,10 +208,10 @@ mod tests {
 
     #[tokio::test]
     async fn forwarder_waits_for_bounded_destination_capacity() {
-        let (source_tx, source_rx) = mpsc::unbounded_channel();
+        let (source_tx, source_rx) = mpsc::channel(1);
         let (destination_tx, mut destination_rx) = mpsc::channel(1);
         destination_tx.send(candle(1)).await.unwrap();
-        source_tx.send(candle(2)).unwrap();
+        source_tx.send(candle(2)).await.unwrap();
 
         let forwarder = tokio::spawn(forward_candles(source_rx, destination_tx));
         tokio::task::yield_now().await;
@@ -215,8 +223,24 @@ mod tests {
         assert!(forwarder.await.unwrap().is_err());
     }
 
-    fn handler() -> (LivePayloadHandler, mpsc::UnboundedReceiver<Candlestick>) {
-        let (candle_tx, candle_rx) = mpsc::unbounded_channel();
+    #[test]
+    fn full_forwarding_queue_fails_closed_without_dropping_buffered_candle() {
+        let (mut handler, mut candle_rx) = handler_with_capacity(1);
+        handler.handle(&last_trade(1_800_000_001)).unwrap();
+        handler.handle(&last_trade(1_800_000_061)).unwrap();
+
+        let error = handler.handle(&last_trade(1_800_000_121)).unwrap_err();
+        assert!(error.to_string().contains("queue exhausted"));
+        assert_eq!(candle_rx.try_recv().unwrap().timestamp, 1_800_000_000_000);
+        assert!(candle_rx.try_recv().is_err());
+    }
+
+    fn handler() -> (LivePayloadHandler, mpsc::Receiver<Candlestick>) {
+        handler_with_capacity(FORWARD_QUEUE_CAPACITY)
+    }
+
+    fn handler_with_capacity(capacity: usize) -> (LivePayloadHandler, mpsc::Receiver<Candlestick>) {
+        let (candle_tx, candle_rx) = mpsc::channel(capacity);
         (
             LivePayloadHandler {
                 builder: MinuteBarBuilder::new(

@@ -50,9 +50,13 @@ fn parse(contents: &str, profile: &str, plant: Plant) -> Result<RuntimeConfig> {
         profile.user,
         profile.password,
         profile.system_name,
-        profile.app_name.unwrap_or_else(|| "FluxTrade".to_string()),
+        profile
+            .app_name
+            .filter(|value| !value.trim().is_empty())
+            .unwrap_or_else(|| "FluxTrade".to_string()),
         profile
             .app_version
+            .filter(|value| !value.trim().is_empty())
             .unwrap_or_else(|| env!("CARGO_PKG_VERSION").to_string()),
         plant,
     )?;
@@ -88,6 +92,12 @@ url = "example.invalid:443"
     fn profile_maps_to_tls_runtime_config_without_exposing_secrets() {
         let config = parse(VALID, "test", Plant::Ticker).unwrap();
         assert_eq!(config.url, "wss://example.invalid:443");
+    }
+
+    #[test]
+    fn blank_optional_app_identity_uses_defaults() {
+        let contents = format!("{VALID}\napp_name = ' '\napp_version = ''");
+        assert!(parse(&contents, "test", Plant::Ticker).is_ok());
     }
 
     #[test]

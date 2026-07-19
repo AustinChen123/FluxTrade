@@ -606,12 +606,15 @@ async fn run_event_loop(
     pub_sender: PublishSender,
 ) -> anyhow::Result<()> {
     let mut aggregator = CandleAggregator::new();
+    let mut trade_open = true;
+    let mut candle_open = true;
+    let mut user_open = true;
 
     info!("Event loop started");
 
     loop {
         tokio::select! {
-            msg = trade_rx.recv() => {
+            msg = trade_rx.recv(), if trade_open => {
                 match msg {
                     Some(trade) => {
                         if let Err(e) = pub_sender.publish_trade(&trade).await {
@@ -619,13 +622,13 @@ async fn run_event_loop(
                         }
                     }
                     None => {
-                        info!("Trade channel closed, event loop exiting");
-                        return Ok(());
+                        info!("Trade channel closed");
+                        trade_open = false;
                     }
                 }
             }
 
-            msg = candle_rx.recv() => {
+            msg = candle_rx.recv(), if candle_open => {
                 match msg {
                     Some(candle) => {
                         // Publish 1m candle
@@ -647,13 +650,13 @@ async fn run_event_loop(
                         }
                     }
                     None => {
-                        info!("Candle channel closed, event loop exiting");
-                        return Ok(());
+                        info!("Candle channel closed");
+                        candle_open = false;
                     }
                 }
             }
 
-            msg = user_rx.recv() => {
+            msg = user_rx.recv(), if user_open => {
                 match msg {
                     Some(event) => {
                         match event {
@@ -670,11 +673,16 @@ async fn run_event_loop(
                         }
                     }
                     None => {
-                        info!("User stream channel closed, event loop exiting");
-                        return Ok(());
+                        info!("User stream channel closed");
+                        user_open = false;
                     }
                 }
             }
+        }
+
+        if !trade_open && !candle_open && !user_open {
+            info!("All event channels closed, event loop exiting");
+            return Ok(());
         }
     }
 }
@@ -932,5 +940,37 @@ mod tests {
 
         assert!(result.is_ok());
         assert!(result.unwrap().is_ok());
+    }
+
+    #[tokio::test]
+    async fn event_loop_keeps_serving_remaining_channels() {
+        let (trade_tx, trade_rx) = mpsc::channel(1);
+        let (candle_tx, candle_rx) = mpsc::channel(1);
+        let (user_tx, user_rx) = mpsc::channel(1);
+        let (pub_sender, mut pub_rx) = create_publish_channel(1);
+        drop(trade_tx);
+        drop(user_tx);
+
+        let event_loop = tokio::spawn(run_event_loop(trade_rx, candle_rx, user_rx, pub_sender));
+        candle_tx
+            .send(model::Candlestick {
+                product_id: "RITHMIC:NQ-202609".to_string(),
+                timeframe: "1m".to_string(),
+                timestamp: 1_800_000_000_000,
+                open: rust_decimal_macros::dec!(100),
+                high: rust_decimal_macros::dec!(101),
+                low: rust_decimal_macros::dec!(99),
+                close: rust_decimal_macros::dec!(100),
+                volume: rust_decimal_macros::dec!(1),
+            })
+            .await
+            .unwrap();
+
+        assert!(matches!(
+            pub_rx.recv().await,
+            Some(crate::publisher::PublishMessage::Candle(_))
+        ));
+        drop(candle_tx);
+        assert!(event_loop.await.unwrap().is_ok());
     }
 }
