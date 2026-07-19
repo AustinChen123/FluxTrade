@@ -131,6 +131,7 @@ impl HistoryPageDecoder {
                 .last_marker
                 .filter(|marker| *marker < self.finish_index)
                 .and_then(|marker| marker.checked_add(1));
+            self.last_marker = None;
             return Ok(HistoryEvent::PageEnded { next_start });
         }
         ensure!(
@@ -155,8 +156,9 @@ impl HistoryPageDecoder {
             "Rithmic history response is not a minute bar"
         );
         ensure!(
-            response.period.as_deref() == Some("1"),
-            "Rithmic history period is not one minute"
+            response.period.as_deref() == Some("60"),
+            "Rithmic history period is not one minute: {:?}",
+            response.period
         );
 
         let open = decimal(response.open_price, "open")?;
@@ -235,6 +237,10 @@ mod tests {
                 next_start: Some(121)
             }
         );
+        assert_eq!(
+            decoder.decode(&page_end).unwrap(),
+            HistoryEvent::PageEnded { next_start: None }
+        );
     }
 
     #[test]
@@ -265,6 +271,23 @@ mod tests {
             codec::encode(&protocol::ResponseTimeBarReplay {
                 template_id: TIME_BAR_REPLAY_RESPONSE,
                 user_msg: vec!["other".to_string()],
+                ..Default::default()
+            })
+            .unwrap(),
+            codec::encode(&protocol::ResponseTimeBarReplay {
+                template_id: TIME_BAR_REPLAY_RESPONSE,
+                user_msg: vec!["page".to_string()],
+                rq_handler_rp_code: vec!["0".to_string()],
+                symbol: Some("NQU6".to_string()),
+                exchange: Some("CME".to_string()),
+                r#type: Some(protocol::response_time_bar_replay::BarType::MinuteBar as i32),
+                period: Some("1".to_string()),
+                marker: Some(120),
+                volume: Some(10),
+                open_price: Some(100.0),
+                high_price: Some(101.0),
+                low_price: Some(99.0),
+                close_price: Some(100.5),
                 ..Default::default()
             })
             .unwrap(),
@@ -318,7 +341,7 @@ mod tests {
             symbol: marker.map(|_| "NQU6".to_string()),
             exchange: marker.map(|_| "CME".to_string()),
             r#type: marker.map(|_| protocol::response_time_bar_replay::BarType::MinuteBar as i32),
-            period: marker.map(|_| "1".to_string()),
+            period: marker.map(|_| "60".to_string()),
             marker,
             volume: marker.map(|_| 10),
             open_price: marker.map(|_| 100.0),

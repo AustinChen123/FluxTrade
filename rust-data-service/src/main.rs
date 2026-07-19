@@ -98,6 +98,25 @@ enum Commands {
         #[arg(long, default_value = "1m")]
         timeframe: String,
     },
+
+    #[cfg(feature = "rithmic")]
+    /// Downloads exact Rithmic 1m bars into the candle database.
+    RithmicHistory {
+        #[arg(long)]
+        profile: String,
+        #[arg(long)]
+        product_id: String,
+        #[arg(long)]
+        exchange: String,
+        #[arg(long)]
+        symbol: String,
+        /// Inclusive UTC epoch milliseconds, aligned to a minute boundary.
+        #[arg(long)]
+        start_ms: i64,
+        /// Exclusive UTC epoch milliseconds, aligned to a minute boundary.
+        #[arg(long)]
+        end_ms: i64,
+    },
 }
 
 #[tokio::main]
@@ -161,6 +180,27 @@ async fn main() -> anyhow::Result<()> {
             end,
             timeframe,
         } => run_backfill_mode(exchange, symbol, start, end, timeframe).await?,
+
+        #[cfg(feature = "rithmic")]
+        Commands::RithmicHistory {
+            profile,
+            product_id,
+            exchange,
+            symbol,
+            start_ms,
+            end_ms,
+        } => {
+            let inserted = crate::connector::rithmic::history_runtime::run(
+                &profile,
+                &product_id,
+                &exchange,
+                &symbol,
+                start_ms,
+                end_ms,
+            )
+            .await?;
+            info!(inserted, "Rithmic history backfill completed");
+        }
     }
 
     Ok(())
