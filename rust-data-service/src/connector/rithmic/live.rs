@@ -152,7 +152,13 @@ fn validate_instrument(product_id: &str, exchange: &str, symbol: &str) -> Result
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::connector::rithmic::{codec, protocol};
+    use crate::connector::rithmic::{
+        codec, config::RuntimeConfig, protocol, session::LoginParameters,
+    };
+    use futures_util::{SinkExt, StreamExt};
+    use tokio::net::{TcpListener, TcpStream};
+    use tokio::time::timeout;
+    use tokio_tungstenite::{accept_async, tungstenite::protocol::Message, WebSocketStream};
 
     #[test]
     fn explicit_instrument_identity_validation_matrix() {
@@ -204,6 +210,71 @@ mod tests {
 
         handler.handle(&last_trade(1_800_000_121)).unwrap();
         assert_eq!(candle_rx.try_recv().unwrap().timestamp, 1_800_000_060_000);
+    }
+
+    #[tokio::test]
+    async fn reconnect_replays_subscription_and_discards_pre_disconnect_partial_minute() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("ws://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move {
+            for attempt in 0..2 {
+                let mut socket = serve_handshake(&listener).await;
+                send(&mut socket, heartbeat_response()).await;
+                assert_template(socket.next().await.unwrap().unwrap(), 100);
+                send(
+                    &mut socket,
+                    codec::encode(&protocol::ResponseMarketDataUpdate {
+                        template_id: 101,
+                        rp_code: vec!["0".to_string()],
+                        ..Default::default()
+                    })
+                    .unwrap(),
+                )
+                .await;
+
+                if attempt == 0 {
+                    send(&mut socket, last_trade(1_800_000_001)).await;
+                } else {
+                    send(&mut socket, last_trade(1_800_000_061)).await;
+                    send(&mut socket, last_trade(1_800_000_121)).await;
+                    tokio::time::sleep(Duration::from_millis(50)).await;
+                }
+            }
+        });
+        let startup =
+            market::last_trade_request("CME", "NQU6", SubscriptionAction::Subscribe).unwrap();
+        let config = LiveConfig {
+            runtime: RuntimeConfig {
+                url,
+                login: LoginParameters::new(
+                    "test-user".to_string(),
+                    "test-password".to_string(),
+                    "test-system".to_string(),
+                    "FluxTrade".to_string(),
+                    "0.1.0".to_string(),
+                    Plant::Ticker,
+                )
+                .unwrap(),
+            },
+            startup,
+            policy: ReconnectPolicy::new(Duration::from_millis(1), Duration::from_millis(10))
+                .unwrap(),
+            product_id: "RITHMIC:NQ-202609".to_string(),
+            exchange: "CME".to_string(),
+            symbol: "NQU6".to_string(),
+        };
+        let (candle_tx, mut candle_rx) = mpsc::channel(2);
+        let connector = tokio::spawn(run(config, candle_tx));
+
+        let candle = timeout(Duration::from_secs(2), candle_rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(candle.timestamp, 1_800_000_060_000);
+        assert!(candle_rx.try_recv().is_err());
+
+        connector.abort();
+        server.await.unwrap();
     }
 
     #[tokio::test]
@@ -281,5 +352,59 @@ mod tests {
             ..Default::default()
         })
         .unwrap()
+    }
+
+    async fn serve_handshake(listener: &TcpListener) -> WebSocketStream<TcpStream> {
+        let (stream, _) = listener.accept().await.unwrap();
+        let mut discovery = accept_async(stream).await.unwrap();
+        assert_template(discovery.next().await.unwrap().unwrap(), 16);
+        send(
+            &mut discovery,
+            codec::encode(&protocol::ResponseRithmicSystemInfo {
+                template_id: 17,
+                rp_code: vec!["0".to_string()],
+                system_name: vec!["test-system".to_string()],
+                ..Default::default()
+            })
+            .unwrap(),
+        )
+        .await;
+
+        let (stream, _) = listener.accept().await.unwrap();
+        let mut login = accept_async(stream).await.unwrap();
+        assert_template(login.next().await.unwrap().unwrap(), 10);
+        send(
+            &mut login,
+            codec::encode(&protocol::ResponseLogin {
+                template_id: 11,
+                rp_code: vec!["0".to_string()],
+                heartbeat_interval: Some(30.0),
+                ..Default::default()
+            })
+            .unwrap(),
+        )
+        .await;
+        assert_template(login.next().await.unwrap().unwrap(), 18);
+        login
+    }
+
+    fn heartbeat_response() -> Vec<u8> {
+        codec::encode(&protocol::ResponseHeartbeat {
+            template_id: 19,
+            rp_code: vec!["0".to_string()],
+            ..Default::default()
+        })
+        .unwrap()
+    }
+
+    async fn send(socket: &mut WebSocketStream<TcpStream>, payload: Vec<u8>) {
+        socket.send(Message::Binary(payload.into())).await.unwrap();
+    }
+
+    fn assert_template(message: Message, expected: i32) {
+        let Message::Binary(payload) = message else {
+            panic!("expected binary Rithmic message");
+        };
+        assert_eq!(codec::template_id(&payload).unwrap(), expected);
     }
 }
