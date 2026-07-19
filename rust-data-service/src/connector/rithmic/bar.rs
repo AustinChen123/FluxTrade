@@ -69,6 +69,10 @@ impl MinuteBarBuilder {
         current.volume += trade.quantity;
         Ok(None)
     }
+
+    pub(crate) fn reset(&mut self) {
+        self.current = None;
+    }
 }
 
 #[cfg(test)]
