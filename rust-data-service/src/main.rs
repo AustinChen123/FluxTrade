@@ -118,6 +118,15 @@ enum Commands {
         #[arg(long)]
         end_ms: i64,
     },
+
+    #[cfg(feature = "rithmic")]
+    /// Reads remote ORDER/PNL ledger snapshots without changing orders.
+    RithmicLedgerSnapshot {
+        #[arg(long)]
+        profile: String,
+        #[arg(long)]
+        account_id: Option<String>,
+    },
 }
 
 #[tokio::main]
@@ -201,6 +210,23 @@ async fn main() -> anyhow::Result<()> {
             )
             .await?;
             info!(inserted, "Rithmic history backfill completed");
+        }
+
+        #[cfg(feature = "rithmic")]
+        Commands::RithmicLedgerSnapshot {
+            profile,
+            account_id,
+        } => {
+            let snapshot =
+                crate::connector::rithmic::ledger_runtime::run(&profile, account_id.as_deref())
+                    .await?;
+            info!(
+                account_currency = snapshot.account.currency.as_deref().unwrap_or("unknown"),
+                orders = snapshot.orders.len(),
+                positions = snapshot.positions.len(),
+                has_account_summary = snapshot.account_summary.is_some(),
+                "Rithmic remote ledger snapshot completed"
+            );
         }
     }
 
