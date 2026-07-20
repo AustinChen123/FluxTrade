@@ -17,6 +17,7 @@ PROD_COMPOSE = REPO_ROOT / "docker-compose.prod.yml"
 
 def _required_env() -> dict[str, str]:
     return {
+        "FLUXTRADE_ENVIRONMENT": "live",
         "REDIS_PASSWORD": "redis-secret",
         "POSTGRES_PASSWORD": "postgres-secret",
         "DASHBOARD_PASSWORD": "dashboard-secret",
@@ -95,11 +96,17 @@ def test_production_compose_requires_sensitive_env_vars():
     assert "${REDIS_PASSWORD:?REDIS_PASSWORD is required}" in text
     assert "${DASHBOARD_PASSWORD:?DASHBOARD_PASSWORD is required}" in text
     assert "${CONTROL_PLANE_API_KEY:?CONTROL_PLANE_API_KEY is required}" in text
+    assert "${FLUXTRADE_ENVIRONMENT:?FLUXTRADE_ENVIRONMENT is required}" in text
 
 
 @pytest.mark.parametrize(
     "env_name",
-    ["REDIS_PASSWORD", "DASHBOARD_PASSWORD", "CONTROL_PLANE_API_KEY"],
+    [
+        "REDIS_PASSWORD",
+        "DASHBOARD_PASSWORD",
+        "CONTROL_PLANE_API_KEY",
+        "FLUXTRADE_ENVIRONMENT",
+    ],
 )
 @pytest.mark.integration
 def test_production_compose_rejects_missing_sensitive_env_vars(
@@ -145,4 +152,9 @@ def test_production_compose_passes_required_auth_to_services(tmp_path: Path):
     assert (
         services["python-strategy"]["environment"]["CONTROL_PLANE_API_KEY"]
         == "control-plane-secret"
+    )
+    assert services["rust-data"]["environment"]["FLUXTRADE_ENVIRONMENT"] == "live"
+    assert (
+        services["python-strategy"]["environment"]["FLUXTRADE_ENVIRONMENT"]
+        == "live"
     )
