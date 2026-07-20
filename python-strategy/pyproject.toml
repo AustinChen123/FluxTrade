@@ -10,6 +10,7 @@ dependencies = [
     "hiredis>=3.3.0",
     "orjson>=3.11.5",
     "pandas>=2.3.3",
+    "pandas-market-calendars>=5.4.0,<6",
     "pandas-ta>=0.4.71b0",
     "psycopg2-binary>=2.9.11",
     "pydantic>=2.12.5",
