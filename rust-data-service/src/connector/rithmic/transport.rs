@@ -1,4 +1,7 @@
-use super::session::{is_fatal_session_error, LoginParameters, RithmicSession};
+use super::{
+    codec,
+    session::{is_fatal_session_error, LoginParameters, RithmicSession},
+};
 use anyhow::{bail, ensure, Context, Result};
 use futures_util::{SinkExt, StreamExt};
 use std::error::Error;
@@ -9,7 +12,7 @@ use tokio::time::{sleep_until, timeout, Instant};
 use tokio_tungstenite::{
     connect_async, tungstenite::protocol::Message, MaybeTlsStream, WebSocketStream,
 };
-use tracing::warn;
+use tracing::{info, warn};
 
 type RithmicSocket = WebSocketStream<MaybeTlsStream<TcpStream>>;
 
@@ -85,12 +88,19 @@ where
                             if startup_pending {
                                 prepare_startup().context("Rithmic startup preparation failed")?;
                                 for payload in &startup_payloads {
+                                    let template_id = codec::template_id(payload)
+                                        .context("invalid Rithmic startup payload")?;
                                     if let Err(error) =
                                         connection.send_payload(payload.clone()).await
                                     {
                                         warn!(%error, "Rithmic startup write failed; reconnecting");
                                         break 'connected RetryCause::Transport;
                                     }
+                                    info!(
+                                        template_id,
+                                        payload_len = payload.len(),
+                                        "Rithmic startup payload sent"
+                                    );
                                 }
                                 startup_pending = false;
                             }

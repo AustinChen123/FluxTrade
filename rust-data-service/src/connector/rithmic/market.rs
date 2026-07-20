@@ -37,6 +37,7 @@ pub(crate) enum MarketDataEvent {
     SubscriptionAccepted,
     LastTrade(LastTradeUpdate),
     LastTradeCleared,
+    LastTradeUnchanged,
     Rejected {
         user_messages: Vec<String>,
         response_codes: Vec<String>,
@@ -83,19 +84,21 @@ pub(crate) fn accept_market_data_response(payload: &[u8]) -> Result<()> {
     ensure_success(&response.rp_code)
 }
 
-pub(crate) fn decode_last_trade(payload: &[u8]) -> Result<Option<LastTradeUpdate>> {
+pub(crate) fn decode_last_trade(payload: &[u8]) -> Result<MarketDataEvent> {
     ensure!(
         codec::template_id(payload)? == LAST_TRADE,
         "unexpected Rithmic last-trade template"
     );
     let trade: protocol::LastTrade = codec::decode(payload)?;
     if trade.clear_bits.unwrap_or_default() & LAST_TRADE_PRESENT != 0 {
-        return Ok(None);
+        return Ok(MarketDataEvent::LastTradeCleared);
     }
-    ensure!(
-        trade.presence_bits.unwrap_or_default() & LAST_TRADE_PRESENT != 0,
-        "Rithmic update does not contain a last trade"
-    );
+    let presence_bits = trade
+        .presence_bits
+        .context("missing Rithmic trade presence bits")?;
+    if presence_bits & LAST_TRADE_PRESENT == 0 {
+        return Ok(MarketDataEvent::LastTradeUnchanged);
+    }
 
     let exchange = required_text(trade.exchange, "exchange")?;
     let symbol = required_text(trade.symbol, "symbol")?;
@@ -115,7 +118,7 @@ pub(crate) fn decode_last_trade(payload: &[u8]) -> Result<Option<LastTradeUpdate
         "invalid Rithmic trade usecs"
     );
 
-    Ok(Some(LastTradeUpdate {
+    Ok(MarketDataEvent::LastTrade(LastTradeUpdate {
         exchange,
         symbol,
         price,
@@ -141,10 +144,7 @@ pub(crate) fn decode_market_data_event(payload: &[u8]) -> Result<MarketDataEvent
             accept_market_data_response(payload)?;
             Ok(MarketDataEvent::SubscriptionAccepted)
         }
-        LAST_TRADE => Ok(match decode_last_trade(payload)? {
-            Some(trade) => MarketDataEvent::LastTrade(trade),
-            None => MarketDataEvent::LastTradeCleared,
-        }),
+        LAST_TRADE => decode_last_trade(payload),
         REJECT => {
             let reject: protocol::Reject = codec::decode(payload)?;
             Ok(MarketDataEvent::Rejected {
@@ -223,7 +223,7 @@ mod tests {
 
         assert_eq!(
             decode_last_trade(&payload).unwrap(),
-            Some(LastTradeUpdate {
+            MarketDataEvent::LastTrade(LastTradeUpdate {
                 exchange: "CME".to_string(),
                 symbol: "NQU6".to_string(),
                 price: dec!(29784.75),
@@ -309,8 +309,14 @@ mod tests {
         .unwrap();
 
         assert_eq!(
-            decode_last_trade(&payload).unwrap().unwrap().timestamp,
-            1_784_243_600_000
+            decode_last_trade(&payload).unwrap(),
+            MarketDataEvent::LastTrade(LastTradeUpdate {
+                timestamp: 1_784_243_600_000,
+                ..match decode_last_trade(&last_trade_payload()).unwrap() {
+                    MarketDataEvent::LastTrade(trade) => trade,
+                    event => panic!("expected last trade, got {event:?}"),
+                }
+            })
         );
     }
 
@@ -335,7 +341,7 @@ mod tests {
                 ..valid()
             },
             protocol::LastTrade {
-                presence_bits: Some(0),
+                presence_bits: None,
                 ..valid()
             },
             protocol::LastTrade {
@@ -397,7 +403,33 @@ mod tests {
             })
             .unwrap();
 
-            assert_eq!(decode_last_trade(&payload).unwrap(), None);
+            assert_eq!(
+                decode_last_trade(&payload).unwrap(),
+                MarketDataEvent::LastTradeCleared
+            );
+        }
+    }
+
+    #[test]
+    fn last_trade_without_last_trade_presence_is_unchanged() {
+        for presence_bits in [
+            0,
+            protocol::last_trade::PresenceBits::Volume as u32,
+            protocol::last_trade::PresenceBits::NetChange as u32
+                | protocol::last_trade::PresenceBits::Vwap as u32,
+        ] {
+            let payload = codec::encode(&protocol::LastTrade {
+                template_id: LAST_TRADE,
+                presence_bits: Some(presence_bits),
+                clear_bits: Some(0),
+                ..Default::default()
+            })
+            .unwrap();
+
+            assert_eq!(
+                decode_last_trade(&payload).unwrap(),
+                MarketDataEvent::LastTradeUnchanged
+            );
         }
     }
 

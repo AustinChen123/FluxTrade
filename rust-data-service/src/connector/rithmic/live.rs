@@ -12,6 +12,7 @@ use std::{
     time::Duration,
 };
 use tokio::sync::mpsc;
+use tracing::info;
 
 const RESPONSE_TIMEOUT: Duration = Duration::from_secs(10);
 const INITIAL_BACKOFF: Duration = Duration::from_secs(1);
@@ -53,6 +54,7 @@ pub(crate) async fn run(config: LiveConfig, candle_tx: mpsc::Sender<Candlestick>
     let handler = Arc::new(Mutex::new(LivePayloadHandler {
         builder: MinuteBarBuilder::new(config.product_id, config.exchange, config.symbol)?,
         candle_tx: forward_tx,
+        observed_last_trade: false,
     }));
     let reconnect_handler = Arc::clone(&handler);
     let payload_handler = Arc::clone(&handler);
@@ -87,17 +89,30 @@ pub(crate) async fn run(config: LiveConfig, candle_tx: mpsc::Sender<Candlestick>
 struct LivePayloadHandler {
     builder: MinuteBarBuilder,
     candle_tx: mpsc::Sender<Candlestick>,
+    observed_last_trade: bool,
 }
 
 impl LivePayloadHandler {
     fn reset(&mut self) {
         self.builder.reset();
+        self.observed_last_trade = false;
     }
 
     fn handle(&mut self, payload: &[u8]) -> Result<()> {
         match market::decode_market_data_event(payload)? {
             MarketDataEvent::LastTrade(trade) => {
+                if !self.observed_last_trade {
+                    info!(
+                        is_snapshot = trade.is_snapshot,
+                        "Rithmic first LastTrade update received"
+                    );
+                    self.observed_last_trade = true;
+                }
                 if let Some(candle) = self.builder.push(&trade)? {
+                    info!(
+                        timestamp = candle.timestamp,
+                        "Rithmic completed minute candle"
+                    );
                     self.candle_tx
                         .try_send(candle)
                         .map_err(|error| match error {
@@ -111,9 +126,16 @@ impl LivePayloadHandler {
                 }
                 Ok(())
             }
-            MarketDataEvent::SubscriptionAccepted | MarketDataEvent::LastTradeCleared => Ok(()),
-            MarketDataEvent::Rejected { .. } => {
-                anyhow::bail!("Rithmic market-data subscription was rejected")
+            MarketDataEvent::SubscriptionAccepted => {
+                info!("Rithmic market-data subscription accepted");
+                Ok(())
+            }
+            MarketDataEvent::LastTradeCleared | MarketDataEvent::LastTradeUnchanged => Ok(()),
+            MarketDataEvent::Rejected { response_codes, .. } => {
+                anyhow::bail!(
+                    "Rithmic market-data subscription was rejected: {}",
+                    response_codes.join(",")
+                )
             }
         }
     }
@@ -321,6 +343,7 @@ mod tests {
                 )
                 .unwrap(),
                 candle_tx,
+                observed_last_trade: false,
             },
             candle_rx,
         )
