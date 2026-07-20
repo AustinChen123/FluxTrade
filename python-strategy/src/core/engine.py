@@ -35,10 +35,12 @@ from src.core.signal_processor import SignalProcessor
 from src.core.strategy_registry import StrategyRegistry
 from src.core.strategy_state_manager import StrategyStateManager
 from src.core.audit_service import build_signal_audit, commit_signal_audit
+from src.core.runtime_environment import RuntimeEnvironment
 
 HOT_STRATEGIES_PATH = os.getenv('HOT_STRATEGIES_PATH', '/app/strategies_hot')
-SYSTEM_STATE_KEY = "system:state"
-SYSTEM_BOOT_STATE_KEY = "system:engine_boot_state"
+_DEFAULT_RUNTIME_ENVIRONMENT = RuntimeEnvironment("live")
+SYSTEM_STATE_KEY = _DEFAULT_RUNTIME_ENVIRONMENT.key("system:state")
+SYSTEM_BOOT_STATE_KEY = _DEFAULT_RUNTIME_ENVIRONMENT.key("system:engine_boot_state")
 SYSTEM_STATE_LOCKDOWN = "LOCKDOWN"
 SYSTEM_STATE_OK = "OK"
 
@@ -106,6 +108,12 @@ class StrategyEngine:
         self._ops_command_lock = threading.Lock()
         self._boot_id = uuid.uuid4().hex
         self._boot_started = False
+        self.runtime_environment = RuntimeEnvironment.from_env()
+        self._system_state_key = self.runtime_environment.key("system:state")
+        self._system_boot_state_key = self.runtime_environment.key(
+            "system:engine_boot_state"
+        )
+        self._heartbeat_key = self.runtime_environment.key("heartbeat:python")
         self._registry = StrategyRegistry()
         self.redis_client = create_redis_client()
         self._strategy_state_manager = StrategyStateManager(
@@ -306,7 +314,10 @@ class StrategyEngine:
                             "Failed to persist kill switch state to database"
                         )
                     try:
-                        self.redis_client.set(SYSTEM_STATE_KEY, SYSTEM_STATE_LOCKDOWN)
+                        self.redis_client.set(
+                            self._system_state_key,
+                            SYSTEM_STATE_LOCKDOWN,
+                        )
                     except Exception:
                         logger.exception(
                             "Failed to persist kill switch state; local halt remains active"
@@ -327,7 +338,7 @@ class StrategyEngine:
                             actor=actor,
                             reason=reason,
                         )
-                        self.redis_client.set(SYSTEM_STATE_KEY, SYSTEM_STATE_OK)
+                        self.redis_client.set(self._system_state_key, SYSTEM_STATE_OK)
 
                     result = self.ops_safety.clear_kill_switch(
                         persist_clear=persist_clear,
@@ -677,12 +688,12 @@ class StrategyEngine:
         read_failed = False
         try:
             db_state = self.ops_safety.latest_kill_switch_state()
-            redis_state = self.redis_client.get(SYSTEM_STATE_KEY)
+            redis_state = self.redis_client.get(self._system_state_key)
             if isinstance(redis_state, bytes):
                 redis_state = redis_state.decode("utf-8")
             db_boot = self.ops_safety.latest_engine_boot_state()
             redis_boot = self._decode_boot_state(
-                self.redis_client.get(SYSTEM_BOOT_STATE_KEY)
+                self.redis_client.get(self._system_boot_state_key)
             )
         except Exception as exc:
             logger.error("System state unavailable; starting in LOCKDOWN: %s", exc)
@@ -751,7 +762,7 @@ class StrategyEngine:
             logger.exception("Failed to persist engine boot state to database")
         try:
             self.redis_client.set(
-                SYSTEM_BOOT_STATE_KEY,
+                self._system_boot_state_key,
                 json.dumps(
                     {"state": state, "boot_id": self._boot_id},
                     separators=(",", ":"),
@@ -778,7 +789,11 @@ class StrategyEngine:
             logger.info("💓 Heartbeat Service Started.")
             while self.running:
                 try:
-                    self.redis_client.setex("heartbeat:python", 3, "1")
+                    self.redis_client.setex(
+                        self._heartbeat_key,
+                        3,
+                        str(int(time.time() * 1000)),
+                    )
                     # Expose balance to Prometheus
                     try:
                         balance = self.account_service.get_balance()

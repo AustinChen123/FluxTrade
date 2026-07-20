@@ -63,6 +63,7 @@ services:
       db:
         condition: service_healthy
     environment:
+      FLUXTRADE_ENVIRONMENT: ${FLUXTRADE_ENVIRONMENT:?FLUXTRADE_ENVIRONMENT is required}
       REDIS_HOST: redis
       REDIS_PASSWORD: ${REDIS_PASSWORD:?REDIS_PASSWORD is required}
       POSTGRES_HOST: db
@@ -99,6 +100,7 @@ services:
       rust-data:
         condition: service_started
     environment:
+      FLUXTRADE_ENVIRONMENT: ${FLUXTRADE_ENVIRONMENT:?FLUXTRADE_ENVIRONMENT is required}
       REDIS_HOST: redis
       REDIS_PASSWORD: ${REDIS_PASSWORD:?REDIS_PASSWORD is required}
       CONTROL_PLANE_API_KEY: ${CONTROL_PLANE_API_KEY:?CONTROL_PLANE_API_KEY is required}

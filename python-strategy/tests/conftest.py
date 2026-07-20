@@ -5,6 +5,8 @@ Provides mock services, factory fixtures, and test adapters to enable
 comprehensive testing without external dependencies (Redis, PostgreSQL, Exchange APIs).
 """
 
+import os
+
 import pytest
 import uuid
 import time
@@ -26,6 +28,9 @@ from src.core.interfaces.exchange import ExchangeOrderSnapshot
 # Core modules
 from src.core.risk_manager import AccountService
 from src.core.clock import Clock
+
+
+os.environ.setdefault("FLUXTRADE_ENVIRONMENT", "live")
 
 
 # =============================================================================

@@ -8,6 +8,18 @@ from sqlalchemy import create_engine, text
 # Config
 REDIS_HOST = "localhost"
 REDIS_PORT = 6379
+ENVIRONMENT = os.environ.get("FLUXTRADE_ENVIRONMENT")
+if ENVIRONMENT is None:
+    raise RuntimeError("FLUXTRADE_ENVIRONMENT must be set explicitly")
+if (
+    not ENVIRONMENT.isascii()
+    or not ENVIRONMENT
+    or not ENVIRONMENT[0].isalnum()
+    or not ENVIRONMENT[-1].isalnum()
+    or not all(c.islower() or c.isdigit() or c == "-" for c in ENVIRONMENT)
+):
+    raise RuntimeError("FLUXTRADE_ENVIRONMENT is invalid")
+SYSTEM_STATE_KEY = f"fluxtrade:{ENVIRONMENT}:system:state"
 DB_URL = "postgresql://fluxtrade:fluxtrade@localhost:5432/fluxtrade"
 STRATEGY_DIR = "python-strategy/strategies_hot"
 STRATEGY_FILE = os.path.join(STRATEGY_DIR, "smoke_strategy.py")
@@ -70,7 +82,7 @@ def main():
     # Unlock System (Reset Redis State from previous crash)
     redis_cmd("SYSTEM_RESET") # This command might not exist, better set key directly
     r = redis.Redis(host=REDIS_HOST, port=REDIS_PORT)
-    r.delete("system:state")
+    r.delete(SYSTEM_STATE_KEY)
     print("🔓 System Unlocked.")
 
     # Restart Python Engine to pick up DB changes and recover from crash
@@ -79,14 +91,14 @@ def main():
     # Aggressively clear lockdown state to prevent Watchdog race condition
     # Watchdog might re-lock it while Python is restarting
     for _ in range(5):
-        r.delete("system:state")
+        r.delete(SYSTEM_STATE_KEY)
         time.sleep(1)
         
     run_cmd("docker restart fluxtrade-python")
     
     # Keep clearing it for a few seconds after restart
     for _ in range(5):
-        r.delete("system:state")
+        r.delete(SYSTEM_STATE_KEY)
         time.sleep(1)
         
     print("⏳ Waiting 10s for Engine to initialize...")

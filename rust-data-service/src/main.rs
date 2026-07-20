@@ -1,5 +1,6 @@
 mod aggregator;
 mod connector;
+mod environment;
 mod historical;
 mod model;
 mod publisher;
@@ -242,7 +243,10 @@ impl std::fmt::Display for TaskId {
 }
 
 fn task_exit_requires_shutdown(task_id: &TaskId) -> bool {
-    matches!(task_id, TaskId::Connector(name) if name == "rithmic")
+    matches!(
+        task_id,
+        TaskId::Watchdog | TaskId::Publisher | TaskId::EventLoop
+    ) || matches!(task_id, TaskId::Connector(name) if name == "rithmic")
 }
 
 /// Track failure counts per task for restart decisions.
@@ -335,6 +339,11 @@ async fn run_live_mode(
     #[cfg(feature = "rithmic")] rithmic_symbol: Option<String>,
 ) -> anyhow::Result<()> {
     info!("FluxTrade Data Service Starting (Live Mode)...");
+    let runtime_environment = crate::environment::RuntimeEnvironment::from_env()?;
+    info!(
+        environment = runtime_environment.identity(),
+        "Runtime environment identity resolved"
+    );
 
     let redis_host = std::env::var("REDIS_HOST").unwrap_or_else(|_| "127.0.0.1".into());
     let redis_port = std::env::var("REDIS_PORT").unwrap_or_else(|_| "6379".into());
@@ -391,12 +400,11 @@ async fn run_live_mode(
 
     // Spawn Watchdog task
     let watchdog_redis_url = redis_url.clone();
+    let watchdog_environment = runtime_environment.clone();
     join_set.spawn(async move {
-        let result = match crate::watchdog::Watchdog::new(&watchdog_redis_url) {
-            Ok(wd) => {
-                wd.run().await;
-                Ok(())
-            }
+        let result = match crate::watchdog::Watchdog::new(&watchdog_redis_url, watchdog_environment)
+        {
+            Ok(wd) => wd.run().await,
             Err(e) => Err(anyhow::anyhow!("Failed to initialize Watchdog: {}", e)),
         };
         (TaskId::Watchdog, result)
@@ -482,6 +490,7 @@ async fn run_live_mode(
 
     // Store context needed for task restarts
     let redis_url_for_restart = redis_url.clone();
+    let environment_for_restart = runtime_environment;
     let symbols_for_restart = symbols;
     let exchanges_for_restart = enabled_exchanges;
 
@@ -540,6 +549,7 @@ async fn run_live_mode(
                                         &task_id,
                                         &mut join_set,
                                         &redis_url_for_restart,
+                                        &environment_for_restart,
                                         &pub_sender,
                                         &symbols_for_restart,
                                         &exchanges_for_restart,
@@ -592,6 +602,7 @@ fn restart_task(
     task_id: &TaskId,
     join_set: &mut JoinSet<(TaskId, anyhow::Result<()>)>,
     redis_url: &str,
+    environment: &crate::environment::RuntimeEnvironment,
     _pub_sender: &PublishSender,
     _symbols: &[String],
     _exchanges: &str,
@@ -599,12 +610,10 @@ fn restart_task(
     match task_id {
         TaskId::Watchdog => {
             let redis_url = redis_url.to_string();
+            let environment = environment.clone();
             join_set.spawn(async move {
-                let result = match crate::watchdog::Watchdog::new(&redis_url) {
-                    Ok(wd) => {
-                        wd.run().await;
-                        Ok(())
-                    }
+                let result = match crate::watchdog::Watchdog::new(&redis_url, environment) {
+                    Ok(wd) => wd.run().await,
                     Err(e) => Err(anyhow::anyhow!("Watchdog init failed: {}", e)),
                 };
                 (TaskId::Watchdog, result)
@@ -843,13 +852,11 @@ mod tests {
 
     #[test]
     fn rithmic_task_exit_policy_fails_closed() {
-        for task_id in [
-            TaskId::Watchdog,
-            TaskId::Publisher,
-            TaskId::EventLoop,
-            TaskId::Connector("binance".to_string()),
-        ] {
+        for task_id in [TaskId::Connector("binance".to_string())] {
             assert!(!task_exit_requires_shutdown(&task_id));
+        }
+        for task_id in [TaskId::Watchdog, TaskId::Publisher, TaskId::EventLoop] {
+            assert!(task_exit_requires_shutdown(&task_id));
         }
         assert!(task_exit_requires_shutdown(&TaskId::Connector(
             "rithmic".to_string()

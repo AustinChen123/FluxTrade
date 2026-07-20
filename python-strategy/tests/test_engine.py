@@ -26,6 +26,7 @@ from src.core.adapters.simulated import SimulatedAdapter
 from src.core.product_registry import InstrumentSpec
 from src.core.engine import (
     SYSTEM_BOOT_STATE_KEY,
+    SYSTEM_STATE_KEY,
     StrategyEngine,
     _is_runtime_reconciliation_enabled,
 )
@@ -1609,7 +1610,7 @@ class TestPersistentKillSwitchState:
     def test_matching_db_and_redis_clear_state_resumes(self, engine):
         previous_boot = {"state": "CLEAN", "boot_id": "previous-boot"}
         engine.redis_client.get.side_effect = lambda key: (
-            "OK" if key == "system:state" else json.dumps(previous_boot)
+            "OK" if key == SYSTEM_STATE_KEY else json.dumps(previous_boot)
         )
         engine.ops_safety.latest_kill_switch_state = MagicMock(return_value="OK")
         engine.ops_safety.latest_engine_boot_state = MagicMock(
@@ -1652,7 +1653,7 @@ class TestPersistentKillSwitchState:
     ):
         engine.redis_client.get.side_effect = lambda key: (
             "OK"
-            if key == "system:state"
+            if key == SYSTEM_STATE_KEY
             else json.dumps(redis_boot) if redis_boot is not None else None
         )
         engine.ops_safety.latest_kill_switch_state = MagicMock(return_value="OK")
@@ -1665,7 +1666,7 @@ class TestPersistentKillSwitchState:
     def test_current_boot_marker_dual_write_failure_fails_closed(self, engine):
         previous_boot = {"state": "CLEAN", "boot_id": "previous"}
         engine.redis_client.get.side_effect = lambda key: (
-            "OK" if key == "system:state" else json.dumps(previous_boot)
+            "OK" if key == SYSTEM_STATE_KEY else json.dumps(previous_boot)
         )
         engine.redis_client.set.side_effect = RuntimeError("redis unavailable")
         engine.ops_safety.latest_kill_switch_state = MagicMock(return_value="OK")
