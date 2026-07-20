@@ -1,6 +1,6 @@
 use std::{env, path::PathBuf};
 
-const RITHMIC_V2_PROTOS: &[&str] = &[
+const RITHMIC_PROTOS: &[&str] = &[
     "request_rithmic_system_info.proto",
     "response_rithmic_system_info.proto",
     "request_login.proto",
@@ -20,6 +20,17 @@ const RITHMIC_V2_PROTOS: &[&str] = &[
     "request_time_bar_replay.proto",
     "response_time_bar_replay.proto",
     "time_bar.proto",
+    "request_login_info.proto",
+    "response_login_info.proto",
+    "request_account_list.proto",
+    "response_account_list.proto",
+    "request_show_orders.proto",
+    "response_show_orders.proto",
+    "exchange_order_notification.proto",
+    "request_pnl_position_snapshot.proto",
+    "response_pnl_position_snapshot.proto",
+    "instrument_pnl_position_update.proto",
+    "account_pnl_position_update.proto",
 ];
 
 fn main() {
@@ -33,7 +44,7 @@ fn main() {
         .map(PathBuf::from)
         .filter(|path| path.is_dir())
         .expect("RITHMIC_PROTO_DIR must point to the local Rithmic proto directory");
-    let protos: Vec<_> = RITHMIC_V2_PROTOS
+    let protos: Vec<_> = RITHMIC_PROTOS
         .iter()
         .map(|name| proto_dir.join(name))
         .collect();

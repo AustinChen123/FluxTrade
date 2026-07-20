@@ -27,14 +27,18 @@ const TEMPLATE_VERSION: &str = "3.9";
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Plant {
     Ticker,
+    Order,
     History,
+    Pnl,
 }
 
 impl Plant {
     fn protocol_value(self) -> i32 {
         match self {
             Self::Ticker => protocol::request_login::SysInfraType::TickerPlant as i32,
+            Self::Order => protocol::request_login::SysInfraType::OrderPlant as i32,
             Self::History => protocol::request_login::SysInfraType::HistoryPlant as i32,
+            Self::Pnl => protocol::request_login::SysInfraType::PnlPlant as i32,
         }
     }
 }
@@ -411,7 +415,7 @@ mod tests {
 
     #[test]
     fn login_heartbeat_logout_lifecycle_matrix() {
-        for plant in [Plant::Ticker, Plant::History] {
+        for plant in [Plant::Ticker, Plant::Order, Plant::History, Plant::Pnl] {
             let mut session = activate(plant);
             assert_eq!(session.state(), SessionState::Active);
             assert_eq!(
@@ -456,16 +460,21 @@ mod tests {
     }
 
     #[test]
-    fn login_request_maps_each_v2_plant() {
+    fn login_request_maps_each_plant() {
         for (plant, expected) in [
             (
                 Plant::Ticker,
                 protocol::request_login::SysInfraType::TickerPlant,
             ),
             (
+                Plant::Order,
+                protocol::request_login::SysInfraType::OrderPlant,
+            ),
+            (
                 Plant::History,
                 protocol::request_login::SysInfraType::HistoryPlant,
             ),
+            (Plant::Pnl, protocol::request_login::SysInfraType::PnlPlant),
         ] {
             let mut session = RithmicSession::new(login(plant));
             session.begin_system_info().unwrap();
