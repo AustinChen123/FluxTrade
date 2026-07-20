@@ -27,9 +27,7 @@ pub(crate) struct RemoteLedgerSnapshot {
 }
 
 pub(crate) async fn run(profile: &str, account_id: Option<&str>) -> Result<RemoteLedgerSnapshot> {
-    let account_id = account_id
-        .map(str::trim)
-        .filter(|account_id| !account_id.is_empty());
+    let account_id = normalize_account_id(account_id)?;
 
     let order_runtime = config::load(profile, Plant::Order)?;
     let mut order_connection =
@@ -93,6 +91,19 @@ pub(crate) async fn run(profile: &str, account_id: Option<&str>) -> Result<Remot
         positions,
         account_summary,
     })
+}
+
+fn normalize_account_id(account_id: Option<&str>) -> Result<Option<&str>> {
+    account_id
+        .map(|account_id| {
+            let account_id = account_id.trim();
+            ensure!(
+                !account_id.is_empty(),
+                "Rithmic ledger account ID must not be empty"
+            );
+            Ok(account_id)
+        })
+        .transpose()
 }
 
 async fn wait_for_heartbeat(connection: &mut RithmicConnection, plant: &str) -> Result<()> {
@@ -337,6 +348,17 @@ mod tests {
                 accepted
             );
         }
+    }
+
+    #[test]
+    fn optional_account_id_matrix_is_explicit() {
+        assert_eq!(normalize_account_id(None).unwrap(), None);
+        assert_eq!(
+            normalize_account_id(Some(" ACCOUNT ")).unwrap(),
+            Some("ACCOUNT")
+        );
+        assert!(normalize_account_id(Some("")).is_err());
+        assert!(normalize_account_id(Some("  ")).is_err());
     }
 
     #[test]

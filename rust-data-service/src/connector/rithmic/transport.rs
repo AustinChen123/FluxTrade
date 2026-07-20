@@ -350,9 +350,9 @@ fn classify_message(message: Message) -> Result<IncomingMessage> {
 
 #[cfg(test)]
 mod tests {
+    use super::super::session::{Plant, RithmicSession, SessionState};
+    use super::super::{codec, protocol};
     use super::*;
-    use crate::connector::rithmic::session::{Plant, RithmicSession, SessionState};
-    use crate::connector::rithmic::{codec, protocol};
     use std::sync::{Arc, Mutex};
     use tokio::net::TcpListener;
     use tokio_tungstenite::accept_async;
