@@ -262,6 +262,20 @@ class TestCheckGaps:
 
         assert issues == []
 
+    def test_market_calendar_holiday_early_close_is_not_a_gap(self):
+        candles = [
+            _candle(_timestamp_ms("2026-09-07T16:59:00")),
+            _candle(_timestamp_ms("2026-09-07T22:00:00")),
+        ]
+
+        issues = check_gaps(
+            candles,
+            "1m",
+            session_calendar=CmeEquityIndexCalendar(),
+        )
+
+        assert issues == []
+
 
 # ── OHLC validation ─────────────────────────────────────────────
 

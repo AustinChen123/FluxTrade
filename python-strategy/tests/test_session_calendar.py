@@ -46,6 +46,30 @@ def test_cme_maintenance_tracks_chicago_dst(closed_timestamp, reopen_timestamp):
     assert calendar.is_open(_timestamp_ms(reopen_timestamp))
 
 
+@pytest.mark.parametrize(
+    ("utc_timestamp", "expected"),
+    [
+        ("2021-06-25T20:20:00", False),
+        ("2021-06-28T20:20:00", True),
+        ("2026-07-20T20:20:00", True),
+        ("2026-07-31T20:20:00", False),
+    ],
+)
+def test_cme_equity_pause_cutover_and_month_end(utc_timestamp, expected):
+    calendar = CmeEquityIndexCalendar()
+
+    assert calendar.is_open(_timestamp_ms(utc_timestamp)) is expected
+
+
+def test_cme_labor_day_early_close_uses_market_calendar():
+    calendar = CmeEquityIndexCalendar()
+
+    assert calendar.is_open(_timestamp_ms("2026-09-07T16:59:00"))
+    assert not calendar.is_open(_timestamp_ms("2026-09-07T17:00:00"))
+    assert not calendar.is_open(_timestamp_ms("2026-09-07T21:59:00"))
+    assert calendar.is_open(_timestamp_ms("2026-09-07T22:00:00"))
+
+
 def test_explicit_closure_overrides_regular_session():
     closure = SessionClosure(
         _timestamp_ms("2026-07-03T17:00:00"),
