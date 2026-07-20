@@ -25,8 +25,8 @@ pub(super) fn template_id(payload: &[u8]) -> Result<i32> {
 
 #[cfg(test)]
 mod tests {
+    use super::super::protocol::RequestHeartbeat;
     use super::*;
-    use crate::connector::rithmic::protocol::RequestHeartbeat;
 
     #[test]
     fn websocket_payload_matches_raw_protobuf_wire_format() {
