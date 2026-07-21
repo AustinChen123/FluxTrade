@@ -22,6 +22,7 @@ from src.core.models import Candlestick, Position, PositionSide, Signal, SignalT
 from src.core.orm_models import Candlestick as ORMCandlestick, StrategyState
 from src.core.daily_nav_snapshot import DailyNavSnapshotService
 from src.core.adapters.ccxt_adapter import CcxtExchangeAdapter
+from src.core.adapters.rithmic_adapter import RithmicExchangeAdapter
 from src.core.adapters.simulated import SimulatedAdapter
 from src.core.product_registry import InstrumentSpec
 from src.core.engine import (
@@ -30,6 +31,7 @@ from src.core.engine import (
     StrategyEngine,
     _is_runtime_reconciliation_enabled,
 )
+from src.core.interfaces.exchange import ExchangeError, NetworkError
 from src.core.strategy_state_manager import StrategyStateManager
 
 
@@ -1949,6 +1951,156 @@ class TestRuntimeReconciliationThread:
         assert created_threads[0].daemon is True
         engine.runtime_reconciliation_job.run_once.assert_called_once()
         engine._runtime_reconcile_stop.wait.assert_called_once_with(3600.0)
+
+
+class TestExchangeOrderEventThread:
+    def test_rithmic_runtime_reconciliation_waits_for_pnl_support(self):
+        adapter = RithmicExchangeAdapter(
+            profile="test",
+            account_id="ACCOUNT",
+            instruments={
+                "RITHMIC:NQ-202609": {
+                    "exchange": "CME",
+                    "quantity_step": "1",
+                    "price_tick": "0.25",
+                }
+            },
+            client_factory=MagicMock(),
+        )
+
+        assert _is_runtime_reconciliation_enabled(
+            adapter,
+            {"mode": "live"},
+        ) is False
+
+    def test_rithmic_engine_requires_owned_order_audit(
+        self,
+        mock_db_session,
+        mock_clock,
+    ):
+        adapter = RithmicExchangeAdapter(
+            profile="test",
+            account_id="ACCOUNT",
+            instruments={
+                "RITHMIC:NQ-202609": {
+                    "exchange": "CME",
+                    "quantity_step": "1",
+                    "price_tick": "0.25",
+                }
+            },
+            client_factory=MagicMock(),
+        )
+
+        with patch("src.core.engine.create_redis_client", return_value=MagicMock()):
+            with pytest.raises(
+                ValueError,
+                match="Rithmic live trading requires audit_external_orders",
+            ):
+                StrategyEngine(
+                    db_session=mock_db_session,
+                    clock=mock_clock,
+                    adapter=adapter,
+                )
+
+    def test_rithmic_startup_stays_halted_when_recovery_is_not_safe(
+        self,
+        engine_factory,
+    ):
+        adapter = RithmicExchangeAdapter(
+            profile="test",
+            account_id="ACCOUNT",
+            instruments={
+                "RITHMIC:NQ-202609": {
+                    "exchange": "CME",
+                    "quantity_step": "1",
+                    "price_tick": "0.25",
+                }
+            },
+            client_factory=MagicMock(),
+        )
+        engine = engine_factory(adapter=adapter, audit_external_orders=True)
+        engine._check_system_state = MagicMock(return_value=False)
+        engine._reconcile_recoverable_orders_on_startup = MagicMock(
+            return_value={"auto_resume_safe": False}
+        )
+        engine._start_exchange_order_event_stream = MagicMock()
+        engine._halt_for_kill_switch = MagicMock(
+            side_effect=lambda: setattr(engine, "_kill_switch_halted", True)
+        )
+        for name in (
+            "_start_command_listener",
+            "_reconcile_balance",
+            "_initialize_strategy_state_cache_on_startup",
+            "_start_strategy_state_subscriber_on_startup",
+            "_start_heartbeat",
+            "scan_strategies",
+            "_restore_active_strategies_on_startup",
+        ):
+            setattr(engine, name, MagicMock())
+
+        engine.startup()
+
+        assert engine._halt_for_kill_switch.call_count == 2
+        engine._restore_active_strategies_on_startup.assert_not_called()
+        assert engine._startup_lock_cause == "rithmic_reconciliation_blocked"
+
+    def test_event_stream_starts_and_applies_events(self, engine):
+        adapter = MagicMock()
+        remote_event = MagicMock()
+        engine.execution_engine.adapter = adapter
+        engine.execution_engine.process_exchange_order_event = MagicMock()
+
+        def poll_once():
+            engine._order_event_stop.set()
+            return remote_event
+
+        adapter.poll_order_event.side_effect = poll_once
+
+        class ImmediateThread:
+            def __init__(self, *, target, name, daemon):
+                self.target = target
+                self.name = name
+                self.daemon = daemon
+
+            def start(self):
+                self.target()
+
+        with patch("src.core.engine.threading.Thread", ImmediateThread):
+            engine._start_exchange_order_event_stream()
+
+        adapter.start_order_event_stream.assert_called_once_with()
+        engine.execution_engine.process_exchange_order_event.assert_called_once_with(
+            remote_event
+        )
+
+    def test_event_stream_start_failure_halts_before_propagating(self, engine):
+        adapter = MagicMock()
+        adapter.start_order_event_stream.side_effect = NetworkError("offline")
+        engine.execution_engine.adapter = adapter
+        engine._halt_for_kill_switch = MagicMock()
+
+        with pytest.raises(NetworkError, match="offline"):
+            engine._start_exchange_order_event_stream()
+
+        engine._halt_for_kill_switch.assert_called_once_with()
+
+    def test_event_stream_failure_halts_local_submissions(self, engine):
+        adapter = MagicMock()
+        adapter.poll_order_event.side_effect = ExchangeError("invalid event")
+        engine.execution_engine.adapter = adapter
+        engine._halt_for_kill_switch = MagicMock()
+
+        class ImmediateThread:
+            def __init__(self, *, target, name, daemon):
+                self.target = target
+
+            def start(self):
+                self.target()
+
+        with patch("src.core.engine.threading.Thread", ImmediateThread):
+            engine._start_exchange_order_event_stream()
+
+        engine._halt_for_kill_switch.assert_called_once_with()
 
 
 # =============================================================================

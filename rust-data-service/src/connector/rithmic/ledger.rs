@@ -266,6 +266,10 @@ pub(crate) fn decode_order_snapshot_event(
     }
 }
 
+pub(crate) fn is_order_snapshot_response(template_id: i32) -> bool {
+    template_id == SHOW_ORDERS_RESPONSE
+}
+
 fn order_snapshot_from_notification(
     response: protocol::ExchangeOrderNotification,
     expected_account: &AccountIdentity,

@@ -4,13 +4,9 @@ use crate::rithmic_ledger::{
         TransactionType,
     },
     ledger_runtime::{RecoveryQuery, RemoteLedgerSnapshot},
+    profile_lock::ProfileLease,
 };
 use pyo3::{exceptions::PyRuntimeError, exceptions::PyValueError, prelude::*};
-use std::sync::Mutex;
-
-// Recovery snapshots are low frequency. Use per-profile locks only if concurrent
-// account recovery becomes necessary.
-static SNAPSHOT_LOCK: Mutex<()> = Mutex::new(());
 
 #[pyclass(frozen, name = "RithmicLedgerOrder")]
 #[derive(Clone)]
@@ -174,9 +170,7 @@ pub fn rithmic_ledger_snapshot(
     };
     let _ = rustls::crypto::ring::default_provider().install_default();
     py.allow_threads(|| {
-        let _guard = SNAPSHOT_LOCK
-            .lock()
-            .map_err(|_| PyRuntimeError::new_err("Rithmic ledger snapshot lock is unavailable"))?;
+        let _lease = ProfileLease::acquire(profile).map_err(runtime_error)?;
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
@@ -307,7 +301,6 @@ mod tests {
     use super::*;
     use crate::rithmic_ledger::ledger::{Account, AccountIdentity};
     use rust_decimal_macros::dec;
-    use std::sync::TryLockError;
 
     fn account() -> AccountIdentity {
         AccountIdentity {
@@ -401,14 +394,12 @@ mod tests {
     }
 
     #[test]
-    fn snapshot_calls_are_process_serialized() {
-        let guard = SNAPSHOT_LOCK.lock().unwrap();
-        assert!(matches!(
-            SNAPSHOT_LOCK.try_lock(),
-            Err(TryLockError::WouldBlock)
-        ));
-        drop(guard);
-        assert!(SNAPSHOT_LOCK.try_lock().is_ok());
+    fn snapshot_calls_are_process_serialized_by_profile() {
+        let first = ProfileLease::acquire("snapshot-serialization-test").unwrap();
+        assert!(ProfileLease::acquire("snapshot-serialization-test").is_err());
+        assert!(ProfileLease::acquire("another-profile").is_ok());
+        drop(first);
+        assert!(ProfileLease::acquire("snapshot-serialization-test").is_ok());
     }
 
     #[test]

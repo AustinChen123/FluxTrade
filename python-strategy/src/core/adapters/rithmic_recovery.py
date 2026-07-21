@@ -3,6 +3,7 @@ from decimal import Decimal
 from typing import Callable, Iterable
 
 from src.core.interfaces.exchange import ExchangeOrderEvent
+from src.core.product_registry import to_rithmic_symbol
 
 
 @dataclass(frozen=True)
@@ -387,15 +388,7 @@ def _symbol_matches_product(product_id: str, symbol: str) -> bool:
 
 
 def _product_symbol(product_id: str) -> str:
-    venue, contract = product_id.split(":", 1)
-    root, year_month = contract.rsplit("-", 1)
-    if venue.upper() != "RITHMIC" or len(year_month) != 6 or not year_month.isdigit():
-        raise ValueError("invalid Rithmic product ID")
-    month = int(year_month[4:])
-    if not 1 <= month <= 12:
-        raise ValueError("invalid Rithmic contract month")
-    month_code = "FGHJKMNQUVXZ"[month - 1]
-    return f"{root}{month_code}{year_month[3]}".upper()
+    return to_rithmic_symbol(product_id)
 
 
 def _decimal(value) -> Decimal:

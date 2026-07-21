@@ -23,7 +23,12 @@ from src.core.interfaces import IExchangeAdapter, IOrderRepository
 from src.core.daily_nav_snapshot import DailyNavSnapshotService
 from src.core.strategy_loader import StrategyLoader
 from src.core.data_provider import check_data_availability
-from src.core.adapters import CcxtExchangeAdapter, SimulatedAdapter, create_adapter
+from src.core.adapters import (
+    CcxtExchangeAdapter,
+    RithmicExchangeAdapter,
+    SimulatedAdapter,
+    create_adapter,
+)
 from src.core.journal import StrategyJournal
 from src.core.redis_factory import create_redis_client
 from src.core.metrics import SIGNALS_TOTAL, ACTIVE_STRATEGIES, BALANCE_USDT
@@ -55,6 +60,8 @@ def _is_runtime_reconciliation_enabled(
         return False
     if isinstance(adapter, CcxtExchangeAdapter):
         return True
+    if isinstance(adapter, RithmicExchangeAdapter):
+        return False
     return bool(adapter_config and adapter_config.get("mode") == "live")
 
 
@@ -136,10 +143,10 @@ class StrategyEngine:
         effective_adapter_config = adapter_config or {"mode": "simulated"}
         self._rithmic_recovery_profile = effective_adapter_config.get(
             "rithmic_recovery_profile"
-        )
+        ) or effective_adapter_config.get("rithmic_profile")
         self._rithmic_recovery_account_id = effective_adapter_config.get(
             "rithmic_recovery_account_id"
-        )
+        ) or effective_adapter_config.get("account_id")
         self._startup_auto_recovery_allowed = False
         self._startup_lock_cause: str | None = None
         if adapter is None:
@@ -151,6 +158,15 @@ class StrategyEngine:
                 raise
         else:
             logger.info("StrategyEngine: Using provided adapter %s", type(adapter).__name__)
+        if isinstance(adapter, RithmicExchangeAdapter):
+            if not audit_external_orders:
+                raise ValueError("Rithmic live trading requires audit_external_orders")
+            self._rithmic_recovery_profile = (
+                self._rithmic_recovery_profile or adapter.profile
+            )
+            self._rithmic_recovery_account_id = (
+                self._rithmic_recovery_account_id or adapter.account_id
+            )
         self.risk_manager.instrument_spec_resolver = getattr(
             adapter,
             "get_instrument_spec",
@@ -227,6 +243,8 @@ class StrategyEngine:
         self.command_thread = None
         self.runtime_reconcile_thread = None
         self._runtime_reconcile_stop = threading.Event()
+        self.order_event_thread = None
+        self._order_event_stop = threading.Event()
         self.executor = ThreadPoolExecutor(max_workers=5)
 
     def startup(self):
@@ -243,6 +261,13 @@ class StrategyEngine:
         self._initialize_strategy_state_cache_on_startup()
         self._start_strategy_state_subscriber_on_startup()
         reconciliation = self._reconcile_recoverable_orders_on_startup()
+        self._start_exchange_order_event_stream()
+        if isinstance(self.execution_engine.adapter, RithmicExchangeAdapter) and not (
+            reconciliation and reconciliation.get("auto_resume_safe") is True
+        ):
+            self._halt_for_kill_switch()
+            self._startup_lock_cause = "rithmic_reconciliation_blocked"
+            persisted_lockdown = True
         if persisted_lockdown:
             if self._can_auto_resume_after_startup_recovery(reconciliation):
                 self._resume_after_kill_switch()
@@ -271,6 +296,42 @@ class StrategyEngine:
     def _start_strategy_state_subscriber_on_startup(self) -> None:
         """Listen for cross-process strategy state updates."""
         self._strategy_state_manager.start_subscriber()
+
+    def _start_exchange_order_event_stream(self) -> None:
+        adapter = self.execution_engine.adapter
+        start = getattr(adapter, "start_order_event_stream", None)
+        poll = getattr(adapter, "poll_order_event", None)
+        if not callable(start) or not callable(poll):
+            return
+
+        try:
+            start()
+        except Exception:
+            self._halt_for_kill_switch()
+            raise
+        self._order_event_stop.clear()
+
+        def order_event_loop() -> None:
+            while self.running and not self._order_event_stop.is_set():
+                try:
+                    event = poll()
+                    if event is None:
+                        self._order_event_stop.wait(0.05)
+                        continue
+                    self.execution_engine.process_exchange_order_event(event)
+                except Exception:
+                    logger.exception(
+                        "Exchange order event stream failed; submissions remain halted"
+                    )
+                    self._halt_for_kill_switch()
+                    return
+
+        self.order_event_thread = threading.Thread(
+            target=order_event_loop,
+            name="exchange-order-events",
+            daemon=True,
+        )
+        self.order_event_thread.start()
 
     def _reconcile_recoverable_orders_on_startup(self) -> dict | None:
         """Record startup order reconciliation for audited external orders."""
@@ -1003,6 +1064,7 @@ class StrategyEngine:
         logger.info("StrategyEngine shutting down...")
         self.running = False
         self._runtime_reconcile_stop.set()
+        self._order_event_stop.set()
 
         self.executor.shutdown(wait=True, cancel_futures=False)
 
@@ -1012,6 +1074,12 @@ class StrategyEngine:
             self.command_thread.join(timeout=timeout)
         if self.runtime_reconcile_thread and self.runtime_reconcile_thread.is_alive():
             self.runtime_reconcile_thread.join(timeout=timeout)
+        if self.order_event_thread and self.order_event_thread.is_alive():
+            self.order_event_thread.join(timeout=timeout)
+
+        close_adapter = getattr(self.execution_engine.adapter, "close", None)
+        if callable(close_adapter):
+            close_adapter()
 
         self._strategy_state_manager.shutdown()
 

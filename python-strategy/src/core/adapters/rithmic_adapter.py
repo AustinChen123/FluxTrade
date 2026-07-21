@@ -1,0 +1,339 @@
+import logging
+import threading
+from decimal import Decimal, InvalidOperation
+from typing import Callable
+
+from src.core.interfaces.exchange import (
+    ExchangeError,
+    ExchangeOrderEvent,
+    ExchangeOrderSnapshot,
+    IExchangeAdapter,
+    NetworkError,
+)
+from src.core.models import Position
+from src.core.orm_models import Order
+from src.core.product_registry import (
+    InstrumentSpec,
+    instrument_spec_from_product,
+    quantize_order_values,
+    to_rithmic_symbol,
+)
+
+
+class RithmicExchangeAdapter(IExchangeAdapter):
+    """Rithmic ORDER adapter with explicit startup after ledger recovery."""
+
+    def __init__(
+        self,
+        *,
+        profile: str,
+        account_id: str | None,
+        instruments: dict[str, dict],
+        client_factory: Callable | None = None,
+    ):
+        if not profile.strip():
+            raise ExchangeError("rithmic_profile_required")
+        if not isinstance(account_id, str) or not account_id.strip():
+            raise ExchangeError("rithmic_account_id_required")
+        if not instruments:
+            raise ExchangeError("rithmic_instruments_required")
+        self.profile = profile
+        self.account_id = account_id.strip()
+        self.logger = logging.getLogger("RithmicAdapter")
+        self._client_factory = client_factory
+        self._client = None
+        self._client_order_ids_lock = threading.Lock()
+        self._submitted_client_order_ids: set[str] = set()
+        self._instrument_specs: dict[str, InstrumentSpec] = {}
+        self._route_exchanges: dict[str, str] = {}
+        self._products_by_native_identity: dict[tuple[str, str], str] = {}
+        for product_id, raw in instruments.items():
+            route_exchange = str(raw.get("exchange") or "").strip().upper()
+            if not route_exchange:
+                raise ExchangeError(
+                    f"rithmic_instrument_exchange_required: product_id={product_id}"
+                )
+            try:
+                spec = instrument_spec_from_product(
+                    product_id,
+                    quantity_step=_required_decimal(raw, "quantity_step", product_id),
+                    price_tick=_required_decimal(raw, "price_tick", product_id),
+                    multiplier=_optional_decimal(raw, "multiplier", product_id),
+                    tick_value=_optional_decimal(raw, "tick_value", product_id),
+                    session_calendar_id=raw.get("session_calendar_id"),
+                )
+                native_symbol = to_rithmic_symbol(product_id)
+            except ValueError as error:
+                raise ExchangeError(
+                    f"invalid_rithmic_instrument: product_id={product_id}: {error}"
+                ) from error
+            identity = (route_exchange, native_symbol)
+            if identity in self._products_by_native_identity:
+                raise ExchangeError(
+                    f"duplicate_rithmic_native_instrument: exchange={route_exchange} "
+                    f"symbol={native_symbol}"
+                )
+            self._instrument_specs[product_id] = spec
+            self._route_exchanges[product_id] = route_exchange
+            self._products_by_native_identity[identity] = product_id
+
+    @classmethod
+    def from_config(cls, config: dict) -> "RithmicExchangeAdapter":
+        return cls(
+            profile=str(config.get("rithmic_profile") or ""),
+            account_id=config.get("account_id"),
+            instruments=config.get("rithmic_instruments") or {},
+        )
+
+    def start_order_event_stream(self) -> None:
+        if self._client is not None:
+            return
+        factory = self._client_factory
+        if factory is None:
+            from fluxtrade_core import RithmicOrderClient
+
+            factory = RithmicOrderClient
+        try:
+            self._client = factory(self.profile, self.account_id)
+        except RuntimeError as error:
+            raise NetworkError(f"rithmic_order_start_failed: {error}") from error
+
+    def close(self) -> None:
+        self._client = None
+
+    def place_order(self, order: Order) -> str:
+        client = self._require_client()
+        spec = self.get_instrument_spec(order.product_id)
+        order_type = str(order.type or "").lower()
+        if order_type not in {"market", "limit"}:
+            raise ExchangeError(
+                f"rithmic_order_type_unsupported: order_type={order_type}"
+            )
+        if not order.client_order_id:
+            raise ExchangeError("rithmic_client_order_id_required")
+        try:
+            values = quantize_order_values(
+                quantity=Decimal(str(order.quantity)),
+                price=Decimal(str(order.price)) if order.price is not None else None,
+                side=str(order.side),
+                order_type=order_type,
+                spec=spec,
+            )
+        except ValueError as error:
+            raise ExchangeError(f"rithmic_order_validation_failed: {error}") from error
+        order.quantity = values.quantity
+        order.price = values.price
+        client_order_id = str(order.client_order_id)
+        with self._client_order_ids_lock:
+            if client_order_id in self._submitted_client_order_ids:
+                raise ExchangeError(
+                    f"duplicate_rithmic_client_order_id: {client_order_id}"
+                )
+            self._submitted_client_order_ids.add(client_order_id)
+        try:
+            ack = client.submit(
+                client_order_id,
+                self._route_exchanges[order.product_id],
+                to_rithmic_symbol(order.product_id),
+                str(order.quantity),
+                str(order.side).lower(),
+                order_type,
+                str(order.price) if order.price is not None else None,
+            )
+        except RuntimeError as error:
+            mapped = _map_runtime_error("rithmic_order_submit_failed", error)
+            if not isinstance(mapped, NetworkError):
+                with self._client_order_ids_lock:
+                    self._submitted_client_order_ids.discard(client_order_id)
+            raise mapped from error
+        return str(ack.basket_id)
+
+    def cancel_order(
+        self,
+        order_id: str,
+        product_id: str,
+        *,
+        order_type: str | None = None,
+    ) -> bool:
+        self.get_instrument_spec(product_id)
+        try:
+            return bool(self._require_client().cancel(str(order_id)))
+        except RuntimeError as error:
+            raise _map_runtime_error("rithmic_order_cancel_failed", error) from error
+
+    def cancel_order_by_client_id(
+        self,
+        client_order_id: str,
+        product_id: str,
+        *,
+        order_type: str | None = None,
+    ) -> bool:
+        snapshot = self.get_order_by_client_id(
+            client_order_id,
+            product_id,
+            order_type=order_type,
+        )
+        if snapshot is None:
+            return False
+        if snapshot.status in {"filled", "cancelled", "rejected"}:
+            return False
+        return self.cancel_order(
+            snapshot.exchange_order_id,
+            product_id,
+            order_type=order_type,
+        )
+
+    def get_order_by_client_id(
+        self,
+        client_order_id: str,
+        product_id: str,
+        *,
+        order_type: str | None = None,
+    ) -> ExchangeOrderSnapshot | None:
+        self.get_instrument_spec(product_id)
+        try:
+            remote = self._require_client().lookup(
+                str(client_order_id),
+                self._route_exchanges[product_id],
+                to_rithmic_symbol(product_id),
+            )
+        except RuntimeError as error:
+            raise _map_runtime_error("rithmic_order_lookup_failed", error) from error
+        if remote is None:
+            return None
+        quantity = Decimal(str(remote.quantity))
+        filled_quantity = _event_decimal(remote.filled_quantity) or Decimal("0")
+        status = _normalize_snapshot_status(
+            str(remote.status),
+            filled_quantity,
+            quantity,
+        )
+        return ExchangeOrderSnapshot(
+            client_order_id=str(remote.client_order_id),
+            exchange_order_id=str(remote.basket_id),
+            status=status,
+            filled_quantity=filled_quantity,
+            average_price=_event_decimal(remote.average_fill_price),
+            raw={
+                "basket_id": str(remote.basket_id),
+                "exchange_order_id": remote.exchange_order_id,
+                "quantity": str(remote.quantity),
+                "account_id": self.account_id,
+            },
+        )
+
+    def poll_order_event(self) -> ExchangeOrderEvent | None:
+        try:
+            event = self._require_client().poll_event()
+        except RuntimeError as error:
+            raise _map_runtime_error("rithmic_order_event_failed", error) from error
+        if event is None:
+            return None
+        identity = (str(event.exchange).upper(), str(event.symbol).upper())
+        product_id = self._products_by_native_identity.get(identity)
+        if product_id is None:
+            raise ExchangeError(
+                "unknown_rithmic_order_event_instrument: "
+                f"exchange={identity[0]} symbol={identity[1]}"
+            )
+        return ExchangeOrderEvent(
+            status=str(event.status),
+            product_id=product_id,
+            client_order_id=event.client_order_id,
+            exchange_order_id=str(event.basket_id),
+            cumulative_filled_quantity=_event_decimal(
+                event.cumulative_filled_quantity
+            ),
+            cumulative_average_price=_event_decimal(event.cumulative_average_price),
+            last_fill_quantity=_event_decimal(event.last_fill_quantity),
+            last_fill_price=_event_decimal(event.last_fill_price),
+            event_timestamp=event.timestamp_ms,
+            raw={
+                "basket_id": str(event.basket_id),
+                "exchange_order_id": event.exchange_order_id,
+                "account_id": event.account_id,
+            },
+        )
+
+    def get_instrument_spec(self, product_id: str) -> InstrumentSpec:
+        try:
+            return self._instrument_specs[product_id]
+        except KeyError as error:
+            raise ExchangeError(
+                f"rithmic_instrument_not_configured: product_id={product_id}"
+            ) from error
+
+    def get_balance(self, asset: str) -> Decimal:
+        raise ExchangeError("rithmic_live_balance_unavailable")
+
+    def get_position(self, product_id: str) -> Position | None:
+        self.get_instrument_spec(product_id)
+        raise ExchangeError("rithmic_live_position_unavailable")
+
+    def _require_client(self):
+        if self._client is None:
+            raise NetworkError("rithmic_order_stream_not_started")
+        return self._client
+
+
+def _required_decimal(raw: dict, field: str, product_id: str) -> Decimal:
+    value = _optional_decimal(raw, field, product_id)
+    if value is None or value <= 0:
+        raise ValueError(f"{field}_must_be_positive")
+    return value
+
+
+def _optional_decimal(raw: dict, field: str, product_id: str) -> Decimal | None:
+    value = raw.get(field)
+    if value is None:
+        return None
+    try:
+        parsed = Decimal(str(value))
+    except (InvalidOperation, TypeError, ValueError) as error:
+        raise ValueError(f"invalid_{field}: product_id={product_id}") from error
+    if not parsed.is_finite():
+        raise ValueError(f"invalid_{field}: product_id={product_id}")
+    return parsed
+
+
+def _event_decimal(value) -> Decimal | None:
+    return Decimal(str(value)) if value is not None else None
+
+
+def _normalize_snapshot_status(
+    status: str,
+    filled_quantity: Decimal,
+    quantity: Decimal,
+) -> str:
+    normalized = status.strip().lower().replace("-", "_").replace(" ", "_")
+    if quantity <= 0 or filled_quantity < 0 or filled_quantity > quantity:
+        raise ExchangeError("invalid_rithmic_order_snapshot_quantities")
+    if normalized in {"open", "open_pending", "new", "submitted", "accepted"}:
+        return "partially_filled" if filled_quantity > 0 else "open"
+    if normalized in {"partial", "partially_filled", "partiallyfilled"}:
+        if Decimal("0") < filled_quantity < quantity:
+            return "partially_filled"
+    elif normalized in {"complete", "completed", "filled"}:
+        if filled_quantity == quantity:
+            return "filled"
+    elif normalized in {"cancel", "canceled", "cancelled"}:
+        return "cancelled"
+    elif normalized in {"reject", "rejected", "failed", "expired"}:
+        return "rejected"
+    raise ExchangeError(
+        f"unsupported_rithmic_order_snapshot_status: status={normalized}"
+    )
+
+
+def _map_runtime_error(prefix: str, error: RuntimeError) -> ExchangeError:
+    message = str(error)
+    ambiguous_markers = (
+        "ambiguous",
+        "disconnected",
+        "reconnecting",
+        "timed out",
+        "stopped",
+    )
+    if any(marker in message.lower() for marker in ambiguous_markers):
+        return NetworkError(f"{prefix}: {message}")
+    return ExchangeError(f"{prefix}: {message}")

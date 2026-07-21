@@ -10,6 +10,15 @@ pub(crate) mod ledger;
 #[path = "connector/rithmic/ledger_runtime.rs"]
 pub(crate) mod ledger_runtime;
 
+#[path = "connector/rithmic/order.rs"]
+pub(crate) mod order;
+
+#[path = "connector/rithmic/order_runtime.rs"]
+pub(crate) mod order_runtime;
+
+#[path = "connector/rithmic/profile_lock.rs"]
+pub(crate) mod profile_lock;
+
 #[allow(dead_code, clippy::enum_variant_names, clippy::tabs_in_doc_comments)]
 pub(crate) mod protocol {
     include!(concat!(env!("OUT_DIR"), "/rti.rs"));

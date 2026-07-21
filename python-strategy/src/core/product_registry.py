@@ -236,6 +236,16 @@ def to_ccxt_symbol(product_id: str) -> str:
     return symbol
 
 
+def to_rithmic_symbol(product_id: str) -> str:
+    """Convert one canonical Rithmic dated future to its native contract symbol."""
+    match = _DATED_FUTURE_PRODUCT_ID_PATTERN.fullmatch(product_id)
+    if match is None or match.group(1) != "RITHMIC":
+        raise ValueError(f"Rithmic symbol mapping is unavailable for {product_id}")
+    month = int(match.group(4))
+    month_code = "FGHJKMNQUVXZ"[month - 1]
+    return f"{match.group(2)}{month_code}{match.group(3)[-1]}"
+
+
 def to_exchange_name(product_id: str) -> str:
     """Extract exchange name from product_id.
 

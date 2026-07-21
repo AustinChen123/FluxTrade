@@ -20,6 +20,14 @@ mod ledger;
 
 pub(crate) mod ledger_runtime;
 
+#[allow(dead_code)]
+mod order;
+
+#[allow(dead_code)]
+pub(crate) mod order_runtime;
+
+mod profile_lock;
+
 pub(crate) mod live;
 
 #[allow(dead_code)]
