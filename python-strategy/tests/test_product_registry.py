@@ -9,6 +9,7 @@ from src.core.product_registry import (
     InstrumentSpec,
     FeeModel,
     to_ccxt_symbol,
+    to_rithmic_symbol,
     to_exchange_name,
     to_base_quote,
     to_stream_key,
@@ -144,9 +145,27 @@ class TestToCcxtSymbol:
         with pytest.raises(ValueError, match="Cannot parse"):
             to_ccxt_symbol("BINANCE:BTCUSDT")
 
-    def test_dated_future_has_no_ccxt_mapping(self):
-        with pytest.raises(ValueError, match="CCXT symbol mapping is unavailable"):
-            to_ccxt_symbol("RITHMIC:MNQ-202509")
+def test_dated_future_has_no_ccxt_mapping():
+    with pytest.raises(ValueError, match="CCXT symbol mapping is unavailable"):
+        to_ccxt_symbol("RITHMIC:MNQ-202509")
+
+
+@pytest.mark.parametrize(
+    ("product_id", "symbol"),
+    [
+        ("RITHMIC:MNQ-202409", "MNQU4"),
+        ("RITHMIC:MNQ-202603", "MNQH6"),
+        ("RITHMIC:MNQ-202609", "MNQU6"),
+        ("RITHMIC:ES-202612", "ESZ6"),
+    ],
+)
+def test_rithmic_symbol_mapping_uses_contract_month_and_year(product_id, symbol):
+    assert to_rithmic_symbol(product_id) == symbol
+
+
+def test_rithmic_symbol_mapping_rejects_other_venues():
+    with pytest.raises(ValueError, match="Rithmic symbol mapping is unavailable"):
+        to_rithmic_symbol("CME:MNQ-202609")
 
 
 @pytest.mark.parametrize(

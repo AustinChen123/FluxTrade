@@ -62,25 +62,7 @@ pub(crate) async fn run_with_recovery(
         transport::connect(&order_runtime.url, order_runtime.login, RESPONSE_TIMEOUT).await?;
     wait_for_heartbeat(&mut order_connection, "ORDER").await?;
 
-    order_connection
-        .send_payload(ledger::login_info_request(LOGIN_INFO_KEY)?)
-        .await?;
-    let login_info = tokio::time::timeout(SNAPSHOT_TIMEOUT, async {
-        let payload = next_payload(&mut order_connection).await?;
-        ledger::decode_login_info(&payload, LOGIN_INFO_KEY)
-    })
-    .await
-    .context("Rithmic login-info snapshot timed out")??;
-
-    order_connection
-        .send_payload(ledger::account_list_request(ACCOUNT_LIST_KEY, &login_info)?)
-        .await?;
-    let account = tokio::time::timeout(
-        SNAPSHOT_TIMEOUT,
-        collect_account(&mut order_connection, &login_info, account_id),
-    )
-    .await
-    .context("Rithmic account-list snapshot timed out")??;
+    let account = discover_order_account(&mut order_connection, account_id).await?;
 
     order_connection
         .send_payload(ledger::show_orders_request(
@@ -194,7 +176,7 @@ fn validate_recovery_query(query: &RecoveryQuery<'_>) -> Result<()> {
     Ok(())
 }
 
-fn normalize_account_id(account_id: Option<&str>) -> Result<Option<&str>> {
+pub(crate) fn normalize_account_id(account_id: Option<&str>) -> Result<Option<&str>> {
     account_id
         .map(|account_id| {
             let account_id = account_id.trim();
@@ -207,7 +189,10 @@ fn normalize_account_id(account_id: Option<&str>) -> Result<Option<&str>> {
         .transpose()
 }
 
-async fn wait_for_heartbeat(connection: &mut RithmicConnection, plant: &str) -> Result<()> {
+pub(crate) async fn wait_for_heartbeat(
+    connection: &mut RithmicConnection,
+    plant: &str,
+) -> Result<()> {
     let event = tokio::time::timeout(RESPONSE_TIMEOUT, connection.next_event())
         .await
         .with_context(|| format!("Rithmic {plant} heartbeat timed out"))??;
@@ -218,13 +203,38 @@ async fn wait_for_heartbeat(connection: &mut RithmicConnection, plant: &str) -> 
     Ok(())
 }
 
-async fn next_payload(connection: &mut RithmicConnection) -> Result<Vec<u8>> {
+pub(crate) async fn next_payload(connection: &mut RithmicConnection) -> Result<Vec<u8>> {
     loop {
         match connection.next_event().await? {
             ConnectionEvent::HeartbeatConfirmed => {}
             ConnectionEvent::Payload(payload) => return Ok(payload),
         }
     }
+}
+
+pub(crate) async fn discover_order_account(
+    connection: &mut RithmicConnection,
+    account_id: Option<&str>,
+) -> Result<Account> {
+    connection
+        .send_payload(ledger::login_info_request(LOGIN_INFO_KEY)?)
+        .await?;
+    let login_info = tokio::time::timeout(SNAPSHOT_TIMEOUT, async {
+        let payload = next_payload(connection).await?;
+        ledger::decode_login_info(&payload, LOGIN_INFO_KEY)
+    })
+    .await
+    .context("Rithmic login-info snapshot timed out")??;
+
+    connection
+        .send_payload(ledger::account_list_request(ACCOUNT_LIST_KEY, &login_info)?)
+        .await?;
+    tokio::time::timeout(
+        SNAPSHOT_TIMEOUT,
+        collect_account(connection, &login_info, account_id),
+    )
+    .await
+    .context("Rithmic account-list snapshot timed out")?
 }
 
 async fn collect_account(

@@ -40,6 +40,48 @@ def test_classify_exchange_order_event_status(status, expected):
     assert OrderEventApplier._classify_exchange_order_event_status(status) == expected
 
 
+def test_client_order_id_collision_for_different_product_is_not_applied(
+    mock_clock,
+    mock_order_repo,
+    order_factory,
+):
+    order_manager = OrderManager(mock_order_repo, mock_clock, is_backtest=True)
+    applier = _applier(order_manager)
+    order = order_factory(
+        client_order_id="shared-client-id",
+        exchange_order_id=None,
+        status=OrderStatus.SUBMITTED.value,
+        quantity=Decimal("1"),
+    )
+    mock_order_repo.add_order(order)
+    state_before = (
+        order.exchange_order_id,
+        order.status,
+        order.filled_quantity,
+        order.filled_price,
+    )
+
+    result = applier.process_exchange_order_event(
+        ExchangeOrderEvent(
+            status="filled",
+            product_id="RITHMIC:ES-202609",
+            client_order_id=order.client_order_id,
+            exchange_order_id="EX-FOREIGN",
+            cumulative_filled_quantity=Decimal("1"),
+            cumulative_average_price=Decimal("6500.25"),
+        )
+    )
+
+    assert result["action"] == "unknown_order"
+    assert (
+        order.exchange_order_id,
+        order.status,
+        order.filled_quantity,
+        order.filled_price,
+    ) == state_before
+    assert mock_order_repo.trades == []
+
+
 def test_process_exchange_order_event_recomputes_catch_up_delta_price(
     mock_clock,
     mock_order_repo,

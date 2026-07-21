@@ -85,6 +85,7 @@ class ExecutionEngine:
         self.default_quantity = Decimal("0.01")
         self.adapter = adapter
         self.journal = journal
+        self._order_event_apply_lock = threading.RLock()
         self._order_event_applier = OrderEventApplier(
             order_manager=self.order_manager,
             journal_fill=(
@@ -140,6 +141,11 @@ class ExecutionEngine:
         # in-flight ones to finish before a kill switch snapshot.
         self._submission_gate = threading.Condition()
         self._submissions_halted = False
+        # Independent gate raised while owned-order reconciliation runs after an
+        # order-session reconnect. Kept separate from the kill-switch halt so a
+        # reconcile resume can never clear an active kill-switch halt, and vice
+        # versa. Submissions are rejected while either flag is set.
+        self._reconcile_halt = False
         self._submissions_in_flight = 0
         self._drain_callbacks: list[Callable[[], None]] = []
 
@@ -308,10 +314,30 @@ class ExecutionEngine:
         *,
         allow_remote_side_effects: bool = True,
     ) -> dict[str, object]:
-        return self._order_event_applier.process_exchange_order_event(
-            event,
-            allow_remote_side_effects=allow_remote_side_effects,
-        )
+        with self._order_event_apply_lock:
+            return self._order_event_applier.process_exchange_order_event(
+                event,
+                allow_remote_side_effects=allow_remote_side_effects,
+            )
+
+    def _record_order_ack(
+        self,
+        order,
+        exchange_order_id: str,
+        *,
+        order_id: str | None = None,
+    ) -> None:
+        with self._order_event_apply_lock:
+            current = self.order_manager.repo.get_order(
+                order_id or str(order.id)
+            ) or order
+            if (
+                current.status == OrderStatus.SUBMITTED_UNCONFIRMED.value
+                or not current.client_order_id
+            ):
+                self.order_manager.mark_submitted(current, exchange_order_id)
+            elif not current.exchange_order_id:
+                self.order_manager.update_exchange_order_id(current, exchange_order_id)
 
     @staticmethod
     def _fill_delta_from_cumulative(
@@ -467,7 +493,7 @@ class ExecutionEngine:
             self.order_manager.mark_submitted_unconfirmed(order)
             submit_attempted = True
             exchange_id = self.adapter.place_order(order)
-            self.order_manager.mark_submitted(order, exchange_id)
+            self._record_order_ack(order, exchange_id, order_id=order_id)
             ORDERS_TOTAL.labels(
                 order_type="market",
                 status="placed",
@@ -571,6 +597,26 @@ class ExecutionEngine:
             self._submissions_halted = False
             self._submission_gate.notify_all()
 
+    def halt_for_reconcile(self, timeout: float = 0.0) -> bool:
+        """Raise the independent reconcile gate and drain in-flight submissions.
+
+        Separate from the kill-switch halt so that resuming after reconcile can
+        never clear an active kill-switch halt. Returns True if no submissions
+        were in flight within *timeout*.
+        """
+        with self._submission_gate:
+            self._reconcile_halt = True
+            return self._submission_gate.wait_for(
+                lambda: self._submissions_in_flight == 0,
+                timeout=timeout,
+            )
+
+    def resume_after_reconcile(self) -> None:
+        """Clear only the reconcile gate; leaves any kill-switch halt untouched."""
+        with self._submission_gate:
+            self._reconcile_halt = False
+            self._submission_gate.notify_all()
+
     def _finish_submission(self) -> None:
         callbacks: list[Callable[[], None]] = []
         with self._submission_gate:
@@ -590,11 +636,13 @@ class ExecutionEngine:
         Also places SL/TP/Trailing orders when specified in the signal.
         Returns the Order ID (Internal) if successful.
         """
-        # Gate: reject if the submission gate has been halted by a kill switch.
+        # Gate: reject if the submission gate has been halted by a kill switch
+        # or while owned-order reconciliation runs after a reconnect.
         with self._submission_gate:
-            if self._submissions_halted:
+            if self._submissions_halted or self._reconcile_halt:
+                cause = "kill switch active" if self._submissions_halted else "reconnect reconcile"
                 self.logger.warning(
-                    "execute_signal rejected: submission gate is halted (kill switch active)"
+                    "execute_signal rejected: submission gate is halted (%s)", cause
                 )
                 return None
             self._submissions_in_flight += 1
@@ -748,6 +796,7 @@ class ExecutionEngine:
             client_order_id=client_order_id,
             intent_payload=intent_payload,
         )
+        order_id = str(order.id)
         self._attach_min_notional_reference_price(order, candle)
         conditional_orders = self._create_conditional_orders(signal, order, qty, candle)
 
@@ -769,7 +818,7 @@ class ExecutionEngine:
             submit_attempted = True
             exchange_id = self.adapter.place_order(order)
             EXECUTION_LATENCY.observe(_time.monotonic() - t0)
-            self.order_manager.mark_submitted(order, exchange_id)
+            self._record_order_ack(order, exchange_id, order_id=order_id)
             self.logger.info("Order Placed. Internal: %s, Exchange: %s", order.id, exchange_id)
             ORDERS_TOTAL.labels(
                 order_type=order_type,
@@ -1219,18 +1268,21 @@ class ExecutionEngine:
         return conditional_id
 
     def _place_pending_conditional_orders_for_entry(self, entry_order) -> list[dict]:
-        # Gate: reject conditional placement if the submission gate is halted.
+        # Gate: reject conditional placement if the submission gate is halted by
+        # a kill switch or while reconnect owned-order reconciliation runs.
         with self._submission_gate:
-            if self._submissions_halted:
+            if self._submissions_halted or self._reconcile_halt:
+                reason = "kill_switch_halted" if self._submissions_halted else "reconcile_halted"
                 self.logger.warning(
-                    "Conditional order placement rejected for entry %s: kill switch active",
+                    "Conditional order placement rejected for entry %s: submission gate halted (%s)",
                     getattr(entry_order, "id", "?"),
+                    reason,
                 )
                 return [
                     {
                         "order_id": str(getattr(entry_order, "id", "?")),
                         "order_type": getattr(entry_order, "type", "?"),
-                        "reason": "kill_switch_halted",
+                        "reason": reason,
                     }
                 ]
             self._submissions_in_flight += 1
@@ -1552,13 +1604,14 @@ class ExecutionEngine:
         """Submit prevalidated SL/TP/Trailing orders linked via OCO to each other."""
         failures = []
         for order in conditional_orders:
+            order_id = str(order.id)
             submit_attempted = False
             try:
                 if order.client_order_id:
                     self.order_manager.mark_submitted_unconfirmed(order)
                 submit_attempted = True
                 ex_id = self.adapter.place_order(order)
-                self.order_manager.mark_submitted(order, ex_id)
+                self._record_order_ack(order, ex_id, order_id=order_id)
                 ORDERS_TOTAL.labels(order_type=order.type, status="placed", reason="none").inc()
             except ExchangeError as e:
                 label = {

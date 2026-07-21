@@ -22,6 +22,10 @@ from src.core.models import Candlestick, Position, PositionSide, Signal, SignalT
 from src.core.orm_models import Candlestick as ORMCandlestick, StrategyState
 from src.core.daily_nav_snapshot import DailyNavSnapshotService
 from src.core.adapters.ccxt_adapter import CcxtExchangeAdapter
+from src.core.adapters.rithmic_adapter import (
+    RithmicExchangeAdapter,
+    RithmicUnmappedOrderEvent,
+)
 from src.core.adapters.simulated import SimulatedAdapter
 from src.core.product_registry import InstrumentSpec
 from src.core.engine import (
@@ -30,6 +34,7 @@ from src.core.engine import (
     StrategyEngine,
     _is_runtime_reconciliation_enabled,
 )
+from src.core.interfaces.exchange import ExchangeError, ExchangeOrderEvent, NetworkError
 from src.core.strategy_state_manager import StrategyStateManager
 
 
@@ -1876,6 +1881,10 @@ class TestRuntimeReconciliationThread:
             "_initialize_strategy_state_cache_on_startup",
             "_start_strategy_state_subscriber_on_startup",
             "_reconcile_recoverable_orders_on_startup",
+            # Must be mocked: otherwise live startup leaks a real order-event
+            # daemon thread that spins on the MagicMock adapter's poll and hangs
+            # later tests in the same process.
+            "_start_exchange_order_event_stream",
             "_start_heartbeat",
             "_start_command_listener",
             "scan_strategies",
@@ -1910,6 +1919,10 @@ class TestRuntimeReconciliationThread:
             "_initialize_strategy_state_cache_on_startup",
             "_start_strategy_state_subscriber_on_startup",
             "_reconcile_recoverable_orders_on_startup",
+            # Must be mocked: otherwise live startup leaks a real order-event
+            # daemon thread that spins on the MagicMock adapter's poll and hangs
+            # later tests in the same process.
+            "_start_exchange_order_event_stream",
             "_start_heartbeat",
             "_start_command_listener",
             "scan_strategies",
@@ -1949,6 +1962,618 @@ class TestRuntimeReconciliationThread:
         assert created_threads[0].daemon is True
         engine.runtime_reconciliation_job.run_once.assert_called_once()
         engine._runtime_reconcile_stop.wait.assert_called_once_with(3600.0)
+
+
+class TestExchangeOrderEventThread:
+    def test_rithmic_runtime_reconciliation_waits_for_pnl_support(self):
+        adapter = RithmicExchangeAdapter(
+            profile="test",
+            account_id="ACCOUNT",
+            instruments={
+                "RITHMIC:NQ-202609": {
+                    "exchange": "CME",
+                    "quantity_step": "1",
+                    "price_tick": "0.25",
+                }
+            },
+            client_factory=MagicMock(),
+        )
+
+        assert _is_runtime_reconciliation_enabled(
+            adapter,
+            {"mode": "live"},
+        ) is False
+
+    def test_rithmic_engine_requires_owned_order_audit(
+        self,
+        mock_db_session,
+        mock_clock,
+    ):
+        adapter = RithmicExchangeAdapter(
+            profile="test",
+            account_id="ACCOUNT",
+            instruments={
+                "RITHMIC:NQ-202609": {
+                    "exchange": "CME",
+                    "quantity_step": "1",
+                    "price_tick": "0.25",
+                }
+            },
+            client_factory=MagicMock(),
+        )
+
+        with patch("src.core.engine.create_redis_client", return_value=MagicMock()):
+            with pytest.raises(
+                ValueError,
+                match="Rithmic live trading requires audit_external_orders",
+            ):
+                StrategyEngine(
+                    db_session=mock_db_session,
+                    clock=mock_clock,
+                    adapter=adapter,
+                )
+
+    def test_rithmic_startup_stays_halted_when_recovery_is_not_safe(
+        self,
+        engine_factory,
+    ):
+        adapter = RithmicExchangeAdapter(
+            profile="test",
+            account_id="ACCOUNT",
+            instruments={
+                "RITHMIC:NQ-202609": {
+                    "exchange": "CME",
+                    "quantity_step": "1",
+                    "price_tick": "0.25",
+                }
+            },
+            client_factory=MagicMock(),
+        )
+        engine = engine_factory(adapter=adapter, audit_external_orders=True)
+        engine._check_system_state = MagicMock(return_value=False)
+        engine._reconcile_recoverable_orders_on_startup = MagicMock(
+            return_value={"auto_resume_safe": False}
+        )
+        engine._start_exchange_order_event_stream = MagicMock()
+        engine._halt_for_kill_switch = MagicMock(
+            side_effect=lambda: setattr(engine, "_kill_switch_halted", True)
+        )
+        for name in (
+            "_start_command_listener",
+            "_reconcile_balance",
+            "_initialize_strategy_state_cache_on_startup",
+            "_start_strategy_state_subscriber_on_startup",
+            "_start_heartbeat",
+            "scan_strategies",
+            "_restore_active_strategies_on_startup",
+        ):
+            setattr(engine, name, MagicMock())
+
+        engine.startup()
+
+        assert engine._halt_for_kill_switch.call_count == 2
+        engine._restore_active_strategies_on_startup.assert_not_called()
+        assert engine._startup_lock_cause == "rithmic_reconciliation_blocked"
+
+    def test_event_stream_starts_and_applies_events(self, engine):
+        adapter = MagicMock()
+        remote_event = MagicMock()
+        engine.execution_engine.adapter = adapter
+        engine.execution_engine.process_exchange_order_event = MagicMock()
+
+        def poll_once():
+            engine._order_event_stop.set()
+            return remote_event
+
+        adapter.poll_order_event.side_effect = poll_once
+
+        class ImmediateThread:
+            def __init__(self, *, target, name, daemon):
+                self.target = target
+                self.name = name
+                self.daemon = daemon
+
+            def start(self):
+                self.target()
+
+        with patch("src.core.engine.threading.Thread", ImmediateThread):
+            engine._start_exchange_order_event_stream()
+
+        adapter.start_order_event_stream.assert_called_once_with()
+        engine.execution_engine.process_exchange_order_event.assert_called_once_with(
+            remote_event
+        )
+
+    def test_event_stream_start_failure_halts_before_propagating(self, engine):
+        adapter = MagicMock()
+        adapter.start_order_event_stream.side_effect = NetworkError("offline")
+        engine.execution_engine.adapter = adapter
+        engine._halt_for_kill_switch = MagicMock()
+
+        with pytest.raises(NetworkError, match="offline"):
+            engine._start_exchange_order_event_stream()
+
+        engine._halt_for_kill_switch.assert_called_once_with()
+
+    def test_event_stream_failure_halts_local_submissions(self, engine):
+        adapter = MagicMock()
+        adapter.poll_order_event.side_effect = ExchangeError("invalid event")
+        engine.execution_engine.adapter = adapter
+        engine._halt_for_kill_switch = MagicMock()
+
+        class ImmediateThread:
+            def __init__(self, *, target, name, daemon):
+                self.target = target
+
+            def start(self):
+                self.target()
+
+        with patch("src.core.engine.threading.Thread", ImmediateThread):
+            engine._start_exchange_order_event_stream()
+
+        engine._halt_for_kill_switch.assert_called_once_with()
+
+    @pytest.mark.parametrize(
+        ("action", "requires_reconciliation"),
+        [
+            ("applied", False),
+            ("unknown_order", True),
+            ("unknown_status", True),
+            ("unresolved_last_fill_without_cumulative_quantity", True),
+            ("unresolved_local_fill_exceeds_exchange", True),
+            ("unresolved_missing_fill_price", True),
+            ("unresolved_exchange_fill_exceeds_order_quantity", True),
+            ("unresolved_missing_terminal_fill_quantity", True),
+            ("unresolved_terminal_fill_quantity_below_order_quantity", True),
+            ("unresolved_protective_terminal_without_fill", True),
+            ("unresolved_remote_actions_suppressed", True),
+            ("unresolved_conditional_order_placement_failed", True),
+            ("unresolved_protective_partial_fill_requires_resize", True),
+            ("unresolved_linked_conditional_cancel_failed", True),
+            ("unexpected_future_action", True),
+            (None, True),
+        ],
+    )
+    def test_rithmic_order_event_action_matrix_fails_closed(
+        self,
+        action,
+        requires_reconciliation,
+    ):
+        result = {} if action is None else {"action": action}
+
+        assert (
+            StrategyEngine._rithmic_order_event_requires_reconciliation(result)
+            is requires_reconciliation
+        )
+
+    @pytest.mark.parametrize("flag", ["verification_blocked", "unresolved"])
+    def test_rithmic_applied_event_with_unsafe_flag_fails_closed(self, flag):
+        assert StrategyEngine._rithmic_order_event_requires_reconciliation(
+            {"action": "applied", flag: True}
+        )
+
+    def test_rithmic_unresolved_order_event_locks_down_and_keeps_streaming(self, engine):
+        adapter = RithmicExchangeAdapter(
+            profile="test",
+            account_id="ACCOUNT",
+            instruments={
+                "RITHMIC:NQ-202609": {
+                    "exchange": "CME",
+                    "quantity_step": "1",
+                    "price_tick": "0.25",
+                }
+            },
+            client_factory=MagicMock(return_value=MagicMock()),
+        )
+        remote_event = ExchangeOrderEvent(
+            status="partially_filled",
+            product_id="RITHMIC:NQ-202609",
+            client_order_id="owned-order",
+            exchange_order_id="basket-1",
+        )
+        poll_count = 0
+
+        def poll_event():
+            nonlocal poll_count
+            poll_count += 1
+            if poll_count == 1:
+                return remote_event
+            engine._order_event_stop.set()
+            return None
+
+        adapter.poll_order_event = MagicMock(side_effect=poll_event)
+        engine.execution_engine.adapter = adapter
+        engine.execution_engine.process_exchange_order_event = MagicMock(
+            return_value={"action": "unresolved_missing_fill_price"}
+        )
+        engine._reconcile_owned_orders_on_reconnect = MagicMock(return_value=True)
+        engine._lockdown_for_rithmic_order_event = MagicMock()
+
+        class ImmediateThread:
+            def __init__(self, *, target, name, daemon):
+                self.target = target
+
+            def start(self):
+                self.target()
+
+        with patch("src.core.engine.threading.Thread", ImmediateThread):
+            engine._start_exchange_order_event_stream()
+
+        assert adapter.poll_order_event.call_count == 2
+        engine._lockdown_for_rithmic_order_event.assert_called_once_with(
+            action="unresolved_missing_fill_price",
+            event=remote_event,
+        )
+
+    @pytest.mark.parametrize(
+        "poll_error",
+        [
+            None,
+            RithmicUnmappedOrderEvent(
+                account_id="ACCOUNT",
+                exchange="CME",
+                symbol="ESZ6",
+            ),
+        ],
+        ids=["configured-external-order", "unmapped-external-order"],
+    )
+    def test_rithmic_external_order_locks_down_without_stopping_stream(
+        self,
+        engine,
+        poll_error,
+    ):
+        adapter = RithmicExchangeAdapter(
+            profile="test",
+            account_id="ACCOUNT",
+            instruments={
+                "RITHMIC:NQ-202609": {
+                    "exchange": "CME",
+                    "quantity_step": "1",
+                    "price_tick": "0.25",
+                }
+            },
+            client_factory=MagicMock(return_value=MagicMock()),
+        )
+        external_event = ExchangeOrderEvent(
+            status="open",
+            product_id="RITHMIC:NQ-202609",
+            client_order_id="manual-order",
+            exchange_order_id="basket-manual",
+            raw={"account_id": "ACCOUNT", "exchange": "CME", "symbol": "NQU6"},
+        )
+
+        poll_count = 0
+
+        def poll_event():
+            nonlocal poll_count
+            poll_count += 1
+            if poll_count == 1:
+                if poll_error is not None:
+                    raise poll_error
+                return external_event
+            engine._order_event_stop.set()
+            return None
+
+        adapter.poll_order_event = MagicMock(side_effect=poll_event)
+        engine.execution_engine.adapter = adapter
+        engine.execution_engine.process_exchange_order_event = MagicMock(
+            return_value={"action": "unknown_order"}
+        )
+        engine._reconcile_owned_orders_on_reconnect = MagicMock(return_value=True)
+        engine._halt_for_kill_switch = MagicMock(
+            side_effect=lambda: setattr(engine, "_kill_switch_halted", True)
+        )
+        engine.ops_safety.persist_kill_switch_state = MagicMock()
+
+        class ImmediateThread:
+            def __init__(self, *, target, name, daemon):
+                self.target = target
+
+            def start(self):
+                self.target()
+
+        with patch("src.core.engine.threading.Thread", ImmediateThread):
+            engine._start_exchange_order_event_stream()
+
+        assert adapter.poll_order_event.call_count == 2
+        assert engine._rithmic_external_order_drift_pending is True
+        assert engine._kill_switch_halted is True
+        engine.ops_safety.persist_kill_switch_state.assert_called_once()
+        engine.redis_client.set.assert_called_with(SYSTEM_STATE_KEY, "LOCKDOWN")
+        if poll_error is None:
+            engine.execution_engine.process_exchange_order_event.assert_called_once_with(
+                external_event
+            )
+        else:
+            engine.execution_engine.process_exchange_order_event.assert_not_called()
+
+    @pytest.mark.parametrize(
+        ("summary", "expected"),
+        [
+            ({"recoverable_count": 0, "auto_resume_safe": True}, (True, 0)),
+            ({"recoverable_count": 1, "auto_resume_safe": False}, (False, None)),
+            ({"recoverable_count": 1}, (False, None)),
+        ],
+    )
+    @pytest.mark.parametrize("drift_pending", [False, True])
+    def test_rithmic_clear_uses_fresh_ledger_snapshot_and_restarts_stream(
+        self,
+        engine,
+        summary,
+        expected,
+        drift_pending,
+    ):
+        adapter = _rithmic_adapter_for_reconnect_test()
+        adapter.start_order_event_stream()
+        adapter.close = MagicMock(wraps=adapter.close)
+        engine.execution_engine.adapter = adapter
+        engine._rithmic_recovery_profile = "test"
+        engine._rithmic_recovery_account_id = "ACCOUNT"
+        engine._rithmic_external_order_drift_pending = drift_pending
+        engine.order_event_thread = MagicMock()
+        engine.order_event_thread.is_alive.side_effect = [True, False]
+        engine.execution_engine.halt_for_reconcile = MagicMock(return_value=True)
+        engine.execution_engine.resume_after_reconcile = MagicMock()
+        engine.execution_engine.reconcile_rithmic_owned_orders = MagicMock(
+            side_effect=lambda *_: (
+                summary
+                if adapter._client is None
+                else pytest.fail("ledger recovery started before ORDER runtime closed")
+            )
+        )
+        engine._start_exchange_order_event_stream = MagicMock()
+
+        assert engine._prepare_rithmic_kill_switch_clear() == expected
+
+        engine.order_event_thread.join.assert_called_once_with(timeout=30.0)
+        engine.execution_engine.halt_for_reconcile.assert_called_once_with(timeout=30.0)
+        engine.execution_engine.reconcile_rithmic_owned_orders.assert_called_once_with(
+            "test", "ACCOUNT"
+        )
+        engine._start_exchange_order_event_stream.assert_called_once_with()
+        if expected[0]:
+            engine.execution_engine.resume_after_reconcile.assert_not_called()
+        else:
+            engine.execution_engine.resume_after_reconcile.assert_called_once_with()
+        assert engine._rithmic_external_order_drift_pending is drift_pending
+
+    def test_external_order_clear_reconcile_failure_restarts_stream_and_stays_locked(
+        self,
+        engine,
+    ):
+        adapter = _rithmic_adapter_for_reconnect_test()
+        engine.execution_engine.adapter = adapter
+        engine._rithmic_external_order_drift_pending = True
+        engine.execution_engine.halt_for_reconcile = MagicMock(return_value=True)
+        engine.execution_engine.reconcile_rithmic_owned_orders = MagicMock(
+            side_effect=RuntimeError("ledger offline")
+        )
+        engine.execution_engine.resume_after_reconcile = MagicMock()
+        engine._start_exchange_order_event_stream = MagicMock()
+
+        assert engine._prepare_rithmic_kill_switch_clear() == (False, None)
+
+        engine._start_exchange_order_event_stream.assert_called_once_with()
+        engine.execution_engine.resume_after_reconcile.assert_called_once_with()
+        assert engine._rithmic_external_order_drift_pending is True
+
+    def test_external_order_clear_restart_failure_keeps_reconcile_gate(self, engine):
+        adapter = _rithmic_adapter_for_reconnect_test()
+        engine.execution_engine.adapter = adapter
+        engine._rithmic_external_order_drift_pending = True
+        engine.execution_engine.halt_for_reconcile = MagicMock(return_value=True)
+        engine.execution_engine.reconcile_rithmic_owned_orders = MagicMock(
+            return_value={"recoverable_count": 0, "auto_resume_safe": True}
+        )
+        engine.execution_engine.resume_after_reconcile = MagicMock()
+        engine._start_exchange_order_event_stream = MagicMock(
+            side_effect=NetworkError("offline")
+        )
+
+        assert engine._prepare_rithmic_kill_switch_clear() == (False, None)
+
+        engine.execution_engine.resume_after_reconcile.assert_not_called()
+        assert engine._rithmic_external_order_drift_pending is True
+
+    def test_external_order_clear_stop_timeout_keeps_event_stream_running(self, engine):
+        adapter = _rithmic_adapter_for_reconnect_test()
+        engine.execution_engine.adapter = adapter
+        engine._rithmic_external_order_drift_pending = True
+        engine.order_event_thread = MagicMock()
+        engine.order_event_thread.is_alive.return_value = True
+        engine.execution_engine.halt_for_reconcile = MagicMock()
+
+        assert engine._prepare_rithmic_kill_switch_clear() == (False, None)
+
+        assert engine._order_event_stop.is_set() is False
+        engine.execution_engine.halt_for_reconcile.assert_not_called()
+
+    def test_external_order_clear_drain_timeout_restarts_stream_but_stays_locked(
+        self,
+        engine,
+    ):
+        adapter = _rithmic_adapter_for_reconnect_test()
+        engine.execution_engine.adapter = adapter
+        engine._rithmic_external_order_drift_pending = True
+        engine.execution_engine.halt_for_reconcile = MagicMock(return_value=False)
+        engine.execution_engine.resume_after_reconcile = MagicMock()
+        engine._start_exchange_order_event_stream = MagicMock()
+
+        assert engine._prepare_rithmic_kill_switch_clear() == (False, None)
+
+        engine._start_exchange_order_event_stream.assert_called_once_with()
+        engine.execution_engine.resume_after_reconcile.assert_called_once_with()
+        assert engine._rithmic_external_order_drift_pending is True
+
+    @pytest.mark.parametrize(
+        ("prepared", "cleared", "expected_pending"),
+        [
+            ((False, None), None, True),
+            ((True, 0), False, True),
+            ((True, 0), True, False),
+        ],
+    )
+    def test_external_order_drift_blocks_clear_until_both_checks_pass(
+        self,
+        engine,
+        prepared,
+        cleared,
+        expected_pending,
+    ):
+        engine._rithmic_external_order_drift_pending = True
+        engine._kill_switch_halted = True
+        engine._prepare_rithmic_kill_switch_clear = MagicMock(
+            return_value=prepared
+        )
+        engine.execution_engine.resume_after_reconcile = MagicMock()
+        engine.ops_safety.clear_kill_switch = MagicMock(
+            return_value={"cleared": cleared, "reason": "still_open"}
+        )
+
+        engine._handle_command({"command": "CLEAR_KILL_SWITCH", "params": {}})
+
+        if prepared[0]:
+            engine.ops_safety.clear_kill_switch.assert_called_once()
+            engine.execution_engine.resume_after_reconcile.assert_called_once_with()
+        else:
+            engine.ops_safety.clear_kill_switch.assert_not_called()
+            engine.execution_engine.resume_after_reconcile.assert_not_called()
+        assert engine._rithmic_external_order_drift_pending is expected_pending
+
+    def test_non_rithmic_clear_does_not_run_ledger_reconciliation(self, engine):
+        engine._kill_switch_halted = True
+        engine.execution_engine.reconcile_rithmic_owned_orders = MagicMock()
+        engine.execution_engine.halt_for_reconcile = MagicMock()
+        engine.execution_engine.resume_after_reconcile = MagicMock()
+        engine.ops_safety.clear_kill_switch = MagicMock(
+            return_value={"cleared": True, "reason": "cleared"}
+        )
+
+        engine._handle_command({"command": "CLEAR_KILL_SWITCH", "params": {}})
+
+        assert engine._kill_switch_halted is False
+        engine.execution_engine.reconcile_rithmic_owned_orders.assert_not_called()
+        engine.execution_engine.halt_for_reconcile.assert_not_called()
+        engine.execution_engine.resume_after_reconcile.assert_not_called()
+
+    def test_rithmic_clear_reasserts_lockdown_when_new_drift_is_detected(self, engine):
+        engine._rithmic_external_order_drift_pending = True
+        engine._kill_switch_halted = True
+        engine._prepare_rithmic_kill_switch_clear = MagicMock(return_value=(True, 0))
+        engine.execution_engine.resume_after_reconcile = MagicMock()
+        engine._halt_for_kill_switch = MagicMock(
+            side_effect=lambda: setattr(engine, "_kill_switch_halted", True)
+        )
+        engine.ops_safety.persist_kill_switch_state = MagicMock()
+
+        def clear_kill_switch(*, persist_clear):
+            persist_clear()
+            engine._lockdown_for_external_order(
+                account_id="ACCOUNT",
+                exchange="CME",
+                symbol="NQU6",
+                exchange_order_id="manual-order",
+            )
+            return {"cleared": True, "reason": "cleared"}
+
+        engine.ops_safety.clear_kill_switch = MagicMock(side_effect=clear_kill_switch)
+
+        engine._handle_command({"command": "CLEAR_KILL_SWITCH", "params": {}})
+
+        assert engine._rithmic_external_order_drift_generation == 1
+        assert engine._rithmic_external_order_drift_pending is True
+        assert engine._kill_switch_halted is True
+        assert engine.redis_client.set.call_args_list[-1] == call(
+            SYSTEM_STATE_KEY,
+            "LOCKDOWN",
+        )
+        assert engine.ops_safety.persist_kill_switch_state.call_args_list[-1] == call(
+            "LOCKDOWN",
+            actor="rithmic_order_stream",
+            reason="rithmic_external_order_detected_during_clear",
+        )
+        engine.execution_engine.resume_after_reconcile.assert_called_once_with()
+
+    def test_external_order_generation_and_submission_halt_are_atomic(self, engine):
+        def halt_while_generation_lock_is_held():
+            acquired = engine._rithmic_external_order_drift_lock.acquire(blocking=False)
+            if acquired:
+                engine._rithmic_external_order_drift_lock.release()
+                pytest.fail("external-order generation published before submission halt")
+            engine._kill_switch_halted = True
+
+        engine._halt_for_kill_switch = MagicMock(
+            side_effect=halt_while_generation_lock_is_held
+        )
+        engine.ops_safety.persist_kill_switch_state = MagicMock()
+
+        engine._lockdown_for_external_order(
+            account_id="ACCOUNT",
+            exchange="CME",
+            symbol="NQU6",
+        )
+
+        assert engine._rithmic_external_order_drift_generation == 1
+        assert engine._rithmic_external_order_drift_pending is True
+        assert engine._kill_switch_halted is True
+
+    def test_rithmic_clear_releases_reconcile_gate_after_final_clean_decision(self, engine):
+        engine._rithmic_external_order_drift_pending = True
+        engine._kill_switch_halted = True
+        engine._prepare_rithmic_kill_switch_clear = MagicMock(return_value=(True, 0))
+        engine.ops_safety.clear_kill_switch = MagicMock(
+            return_value={"cleared": True, "reason": "cleared"}
+        )
+        engine.execution_engine.resume_after_reconcile = MagicMock(
+            side_effect=lambda: (
+                engine._kill_switch_halted is False
+                or pytest.fail("reconcile gate released before clear decision")
+            )
+        )
+
+        engine._handle_command({"command": "CLEAR_KILL_SWITCH", "params": {}})
+
+        assert engine._rithmic_external_order_drift_pending is False
+        assert engine._kill_switch_halted is False
+        engine.execution_engine.resume_after_reconcile.assert_called_once_with()
+
+    def test_rithmic_clear_exception_releases_only_reconcile_gate(self, engine):
+        engine._rithmic_external_order_drift_pending = True
+        engine._kill_switch_halted = True
+        engine._prepare_rithmic_kill_switch_clear = MagicMock(return_value=(True, 0))
+        engine._halt_for_kill_switch = MagicMock(
+            side_effect=lambda: setattr(engine, "_kill_switch_halted", True)
+        )
+        engine.ops_safety.persist_kill_switch_state = MagicMock()
+
+        def fail_after_partial_clear(*, persist_clear):
+            persist_clear()
+            engine._lockdown_for_external_order(
+                account_id="ACCOUNT",
+                exchange="CME",
+                symbol="NQU6",
+            )
+            raise RuntimeError("database unavailable")
+
+        engine.ops_safety.clear_kill_switch = MagicMock(
+            side_effect=fail_after_partial_clear
+        )
+        engine.execution_engine.resume_after_reconcile = MagicMock()
+
+        engine._handle_command({"command": "CLEAR_KILL_SWITCH", "params": {}})
+
+        assert engine._rithmic_external_order_drift_pending is True
+        assert engine._kill_switch_halted is True
+        assert engine.redis_client.set.call_args_list[-1] == call(
+            SYSTEM_STATE_KEY,
+            "LOCKDOWN",
+        )
+        assert engine.ops_safety.persist_kill_switch_state.call_args_list[-1] == call(
+            "LOCKDOWN",
+            actor="rithmic_order_stream",
+            reason="rithmic_external_order_detected_during_clear",
+        )
+        engine.execution_engine.resume_after_reconcile.assert_called_once_with()
 
 
 # =============================================================================
@@ -1998,3 +2623,273 @@ class TestShutdown:
         engine.redis_client.close.side_effect = Exception("close fail")
         # Should not raise
         engine.shutdown(timeout=0.1)
+
+
+def _rithmic_adapter_for_reconnect_test():
+    return RithmicExchangeAdapter(
+        profile="test",
+        account_id="ACCOUNT",
+        instruments={
+            "RITHMIC:NQ-202609": {
+                "exchange": "CME",
+                "quantity_step": "1",
+                "price_tick": "0.25",
+            }
+        },
+        client_factory=MagicMock(),
+    )
+
+
+def test_reconnect_triggers_owned_order_reconcile_and_gates(engine):
+    """A generation bump closes the old runtime before safe recovery/restart."""
+    adapter = _rithmic_adapter_for_reconnect_test()
+    adapter.connection_generation = MagicMock(return_value=1)
+    engine.execution_engine.adapter = adapter
+    engine.execution_engine.audit_external_orders = True
+    engine._rithmic_recovery_profile = "test"
+    engine._rithmic_recovery_account_id = "ACCOUNT"
+    engine.execution_engine.reconcile_rithmic_owned_orders = MagicMock(
+        side_effect=lambda *_: (
+            {"recoverable_count": 0, "auto_resume_safe": True}
+            if adapter._client is None
+            else pytest.fail("ledger recovery started before ORDER runtime closed")
+        )
+    )
+    engine.execution_engine.halt_for_reconcile = MagicMock(return_value=True)
+    engine.execution_engine.resume_after_reconcile = MagicMock()
+
+    adapter.start_order_event_stream()
+    engine._last_order_generation = 1
+    assert engine._last_order_generation == 1
+
+    adapter.connection_generation.return_value = 2
+    assert engine._reconcile_owned_orders_on_reconnect() is True
+
+    engine.execution_engine.halt_for_reconcile.assert_called_once_with(timeout=30.0)
+    engine.execution_engine.reconcile_rithmic_owned_orders.assert_called_once_with(
+        "test", "ACCOUNT"
+    )
+    engine.execution_engine.resume_after_reconcile.assert_called_once()
+    assert adapter._client is not None
+    assert engine._last_order_generation == 1
+    assert engine._pending_order_reconnect_generation is None
+
+
+def test_reconnect_reconcile_failure_keeps_gate_and_retries(engine):
+    """If the reconnect reconcile fails, submissions stay gated and it retries."""
+    adapter = _rithmic_adapter_for_reconnect_test()
+    adapter.connection_generation = MagicMock(return_value=2)
+    engine.execution_engine.adapter = adapter
+    engine.execution_engine.audit_external_orders = True
+    engine._rithmic_recovery_profile = "test"
+    engine._rithmic_recovery_account_id = "ACCOUNT"
+    engine._last_order_generation = 1  # already baselined; 2 is a reconnect
+    engine.execution_engine.reconcile_rithmic_owned_orders = MagicMock(
+        side_effect=RuntimeError("boom")
+    )
+    engine.execution_engine.halt_for_reconcile = MagicMock(return_value=True)
+    engine.execution_engine.resume_after_reconcile = MagicMock()
+
+    assert engine._reconcile_owned_orders_on_reconnect() is False
+
+    engine.execution_engine.halt_for_reconcile.assert_called_once_with(timeout=30.0)
+    # Fail-safe: never resume against an unreconciled book, and do not advance
+    # the generation so the next tick retries.
+    engine.execution_engine.resume_after_reconcile.assert_not_called()
+    assert engine._last_order_generation == 1
+    assert engine._pending_order_reconnect_generation == 2
+    assert adapter._client is None
+
+    engine.execution_engine.reconcile_rithmic_owned_orders.side_effect = None
+    engine.execution_engine.reconcile_rithmic_owned_orders.return_value = {
+        "recoverable_count": 0,
+        "auto_resume_safe": True,
+    }
+
+    assert engine._reconcile_owned_orders_on_reconnect() is True
+    assert adapter._client is not None
+    assert engine._pending_order_reconnect_generation is None
+    engine.execution_engine.resume_after_reconcile.assert_called_once_with()
+
+
+def test_reconnect_waits_for_submission_drain_before_closing_runtime(engine):
+    adapter = _rithmic_adapter_for_reconnect_test()
+    adapter.connection_generation = MagicMock(return_value=2)
+    adapter.close = MagicMock(wraps=adapter.close)
+    engine.execution_engine.adapter = adapter
+    engine._last_order_generation = 1
+    engine.execution_engine.halt_for_reconcile = MagicMock(return_value=False)
+    engine.execution_engine.reconcile_rithmic_owned_orders = MagicMock()
+
+    assert engine._reconcile_owned_orders_on_reconnect() is False
+
+    adapter.close.assert_not_called()
+    engine.execution_engine.reconcile_rithmic_owned_orders.assert_not_called()
+    assert engine._pending_order_reconnect_generation == 2
+
+
+def test_generation_read_failure_reconciles_fail_closed(engine):
+    adapter = _rithmic_adapter_for_reconnect_test()
+    adapter.connection_generation = MagicMock(side_effect=RuntimeError("old binding"))
+    engine.execution_engine.adapter = adapter
+    engine.execution_engine.audit_external_orders = True
+    engine._rithmic_recovery_profile = "test"
+    engine._rithmic_recovery_account_id = "ACCOUNT"
+    engine._last_order_generation = 1
+    engine.execution_engine.halt_for_reconcile = MagicMock(return_value=True)
+    engine.execution_engine.reconcile_rithmic_owned_orders = MagicMock(
+        return_value={"recoverable_count": 0, "auto_resume_safe": True}
+    )
+    engine.execution_engine.resume_after_reconcile = MagicMock()
+
+    assert engine._reconcile_owned_orders_on_reconnect() is True
+
+    engine.execution_engine.reconcile_rithmic_owned_orders.assert_called_once_with(
+        "test", "ACCOUNT"
+    )
+    engine.execution_engine.resume_after_reconcile.assert_called_once_with()
+
+
+@pytest.mark.parametrize(
+    "summary",
+    [
+        {"recoverable_count": 1, "auto_resume_safe": False},
+        {"recoverable_count": 1},
+    ],
+)
+def test_reconnect_unresolved_summary_stays_closed_and_gated(engine, summary):
+    adapter = _rithmic_adapter_for_reconnect_test()
+    adapter.connection_generation = MagicMock(return_value=2)
+    engine.execution_engine.adapter = adapter
+    engine.execution_engine.audit_external_orders = True
+    engine._rithmic_recovery_profile = "test"
+    engine._rithmic_recovery_account_id = "ACCOUNT"
+    engine._last_order_generation = 1
+    engine.execution_engine.halt_for_reconcile = MagicMock(return_value=True)
+    engine.execution_engine.reconcile_rithmic_owned_orders = MagicMock(
+        return_value=summary
+    )
+    engine.execution_engine.resume_after_reconcile = MagicMock()
+
+    assert engine._reconcile_owned_orders_on_reconnect() is False
+
+    assert adapter._client is None
+    assert engine._pending_order_reconnect_generation == 2
+    engine.execution_engine.resume_after_reconcile.assert_not_called()
+
+
+def test_rithmic_event_loop_checks_reconnect_without_runtime_reconcile_service(engine):
+    adapter = _rithmic_adapter_for_reconnect_test()
+    client = MagicMock()
+    client.poll_event.side_effect = lambda: engine._order_event_stop.set()
+    adapter._client_factory.return_value = client
+    engine.execution_engine.adapter = adapter
+    engine._reconcile_owned_orders_on_reconnect = MagicMock(return_value=True)
+
+    class ImmediateThread:
+        def __init__(self, *, target, name, daemon):
+            self.target = target
+
+        def start(self):
+            self.target()
+
+    with patch("src.core.engine.threading.Thread", ImmediateThread):
+        engine._start_exchange_order_event_stream()
+
+    engine._reconcile_owned_orders_on_reconnect.assert_called_once_with()
+    assert engine._last_order_generation == 1
+
+
+def test_rithmic_event_loop_reconciles_and_restarts_before_polling(engine):
+    """The real event loop closes, reconciles, restarts, then resumes polling."""
+    first_client = MagicMock()
+    first_client.connection_generation.return_value = 2
+    second_client = MagicMock()
+    second_client.connection_generation.return_value = 1
+    second_client.poll_event.side_effect = lambda: engine._order_event_stop.set()
+    factory = MagicMock(side_effect=[first_client, second_client])
+    adapter = RithmicExchangeAdapter(
+        profile="test",
+        account_id="ACCOUNT",
+        instruments={
+            "RITHMIC:NQ-202609": {
+                "exchange": "CME",
+                "quantity_step": "1",
+                "price_tick": "0.25",
+            }
+        },
+        client_factory=factory,
+    )
+    engine.execution_engine.adapter = adapter
+    engine.execution_engine.audit_external_orders = True
+    engine._rithmic_recovery_profile = "test"
+    engine._rithmic_recovery_account_id = "ACCOUNT"
+    engine.execution_engine.reconcile_rithmic_owned_orders = MagicMock(
+        side_effect=lambda *_: (
+            {"recoverable_count": 0, "auto_resume_safe": True}
+            if adapter._client is None
+            else pytest.fail("ledger recovery started before ORDER runtime closed")
+        )
+    )
+
+    class ImmediateThread:
+        def __init__(self, *, target, name, daemon):
+            self.target = target
+
+        def start(self):
+            self.target()
+
+    with patch("src.core.engine.threading.Thread", ImmediateThread):
+        engine._start_exchange_order_event_stream()
+
+    assert factory.call_count == 2
+    engine.execution_engine.reconcile_rithmic_owned_orders.assert_called_once_with(
+        "test", "ACCOUNT"
+    )
+    second_client.poll_event.assert_called_once_with()
+    assert engine.execution_engine._reconcile_halt is False
+    assert engine._pending_order_reconnect_generation is None
+    assert engine._last_order_generation == 1
+
+
+def test_reconnect_stream_restart_failure_stays_gated_then_retries(engine):
+    """A failed runtime restart remains gated and a later tick may recover."""
+    first_client = MagicMock()
+    first_client.connection_generation.return_value = 2
+    recovered_client = MagicMock()
+    factory = MagicMock(
+        side_effect=[first_client, RuntimeError("offline"), recovered_client]
+    )
+    adapter = RithmicExchangeAdapter(
+        profile="test",
+        account_id="ACCOUNT",
+        instruments={
+            "RITHMIC:NQ-202609": {
+                "exchange": "CME",
+                "quantity_step": "1",
+                "price_tick": "0.25",
+            }
+        },
+        client_factory=factory,
+    )
+    engine.execution_engine.adapter = adapter
+    engine.execution_engine.audit_external_orders = True
+    engine._rithmic_recovery_profile = "test"
+    engine._rithmic_recovery_account_id = "ACCOUNT"
+    engine._last_order_generation = 1
+    engine.execution_engine.reconcile_rithmic_owned_orders = MagicMock(
+        return_value={"recoverable_count": 0, "auto_resume_safe": True}
+    )
+    adapter.start_order_event_stream()
+
+    assert engine._reconcile_owned_orders_on_reconnect() is False
+    assert adapter._client is None
+    assert engine.execution_engine._reconcile_halt is True
+    assert engine._pending_order_reconnect_generation == 2
+
+    assert engine._reconcile_owned_orders_on_reconnect() is True
+    assert adapter._client is recovered_client
+    assert engine.execution_engine._reconcile_halt is False
+    assert engine._pending_order_reconnect_generation is None
+    assert engine._last_order_generation == 1
+    assert engine.execution_engine.reconcile_rithmic_owned_orders.call_count == 2

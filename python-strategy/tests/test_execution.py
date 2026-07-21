@@ -12,6 +12,7 @@ Covers:
 
 from contextlib import nullcontext
 from copy import copy
+import threading
 
 import pytest
 from decimal import Decimal
@@ -20,6 +21,7 @@ from unittest.mock import MagicMock, patch
 from prometheus_client import REGISTRY
 
 from src.core.adapters.ccxt_adapter import CcxtExchangeAdapter
+from src.core.adapters.rithmic_adapter import RithmicExchangeAdapter
 from src.core.execution import ExecutionEngine
 from src.core.interfaces.exchange import ExchangeOrderSnapshot
 from src.core.interfaces.exchange import ExchangeOrderEvent
@@ -112,6 +114,9 @@ def _make_order_repo_return_detached_instances(mock_order_repo):
 
     mock_order_repo.update_order = update_order
     mock_order_repo.update_order_exchange_id = update_order_exchange_id
+    mock_order_repo.get_order = lambda order_id: clone_order(
+        mock_order_repo.orders.get(order_id)
+    )
     mock_order_repo.get_order_by_client_order_id = get_order_by_client_order_id
 
 
@@ -386,6 +391,131 @@ class TestExecutionTradingRules:
         orders = list(mock_order_repo.orders.values())
         assert {order.type for order in orders} == {"limit", "trailing_stop"}
         assert all(order.status == "failed" for order in orders)
+
+    @pytest.mark.parametrize(
+        "protection",
+        [
+            {"stop_loss": Decimal("19900.00")},
+            {"take_profit": Decimal("20100.00")},
+            {"trailing_distance": Decimal("25.00")},
+        ],
+        ids=["stop-loss", "take-profit", "trailing-stop"],
+    )
+    def test_rithmic_rejects_unsupported_protection_before_entry_submit(
+        self,
+        mock_db_session,
+        mock_clock,
+        mock_order_repo,
+        signal_factory,
+        protection,
+    ):
+        client = MagicMock()
+        adapter = RithmicExchangeAdapter(
+            profile="test",
+            account_id="ACCOUNT",
+            instruments={
+                "RITHMIC:NQ-202609": {
+                    "exchange": "CME",
+                    "quantity_step": "1",
+                    "price_tick": "0.25",
+                }
+            },
+            client_factory=MagicMock(return_value=client),
+        )
+        engine = ExecutionEngine(
+            db_session=mock_db_session,
+            clock=mock_clock,
+            adapter=adapter,
+            order_repository=mock_order_repo,
+            db_session_factory=lambda: nullcontext(mock_db_session),
+            audit_external_orders=True,
+            is_backtest=True,
+        )
+        signal = signal_factory(
+            product_id="RITHMIC:NQ-202609",
+            price=Decimal("20000.25"),
+            quantity=Decimal("1"),
+            **protection,
+        )
+
+        with pytest.raises(ExchangeError, match="rithmic_order_type_unsupported"):
+            engine.execute_signal(signal)
+
+        client.submit.assert_not_called()
+        assert all(
+            order.status == "failed"
+            for order in mock_order_repo.orders.values()
+        )
+
+    def test_fast_fill_event_cannot_be_regressed_by_late_submit_ack(
+        self,
+        mock_db_session,
+        mock_clock,
+        mock_exchange_adapter,
+        mock_order_repo,
+        signal_factory,
+    ):
+        _make_order_repo_return_detached_instances(mock_order_repo)
+        engine = ExecutionEngine(
+            db_session=mock_db_session,
+            clock=mock_clock,
+            adapter=mock_exchange_adapter,
+            order_repository=mock_order_repo,
+            db_session_factory=lambda: nullcontext(mock_db_session),
+            audit_external_orders=True,
+            is_backtest=True,
+        )
+        event_applied = threading.Event()
+        event_threads = []
+
+        def place_order(order):
+            def apply_fill():
+                engine.process_exchange_order_event(
+                    ExchangeOrderEvent(
+                        status="filled",
+                        product_id=order.product_id,
+                        client_order_id=order.client_order_id,
+                        exchange_order_id="EX-FAST-FILL",
+                        cumulative_filled_quantity=order.quantity,
+                        cumulative_average_price=order.price,
+                    )
+                )
+                event_applied.set()
+
+            thread = threading.Thread(target=apply_fill)
+            event_threads.append(thread)
+            thread.start()
+            assert event_applied.wait(1.0)
+            return "EX-FAST-FILL"
+
+        mock_exchange_adapter.place_order = MagicMock(side_effect=place_order)
+
+        order_id = engine.execute_signal(
+            signal_factory(price=Decimal("42000"), quantity=Decimal("0.01"))
+        )
+        for thread in event_threads:
+            thread.join(timeout=1.0)
+
+        order = mock_order_repo.orders[order_id]
+        assert order.status == OrderStatus.FILLED.value
+        assert order.exchange_order_id == "EX-FAST-FILL"
+
+    def test_ack_without_client_order_id_preserves_legacy_submitted_transition(
+        self,
+        execution_engine,
+        signal_factory,
+    ):
+        order = execution_engine.order_manager.create_order(
+            signal=signal_factory(),
+            side="buy",
+            order_type="market",
+            quantity=Decimal("0.01"),
+        )
+
+        execution_engine._record_order_ack(order, "EX-LEGACY")
+
+        assert order.status == OrderStatus.SUBMITTED.value
+        assert order.exchange_order_id == "EX-LEGACY"
 
     def test_min_notional_rejection_fails_local_order_and_audit(
         self, mock_db_session, mock_clock, mock_order_repo, signal_factory
@@ -5037,3 +5167,29 @@ class TestConditionalOrderErrorHandling:
         assert "Failed to place SL order" in caplog.text
         assert "Failed to place TP order" in caplog.text
         assert "Failed to place trailing stop order" in caplog.text
+
+
+def test_reconcile_gate_is_independent_of_kill_switch(execution_engine):
+    """Reconnect reconcile gate and kill-switch halt must never clear each other.
+
+    This is the core safety property: resuming after a reconnect reconcile must
+    not lift an active kill-switch halt, and clearing the kill switch must not
+    lift an in-progress reconcile gate. Submissions are blocked while either is
+    raised.
+    """
+    # Both gates raised.
+    execution_engine.halt_and_drain(timeout=0)
+    execution_engine.halt_for_reconcile(timeout=0)
+    assert execution_engine._submissions_halted is True
+    assert execution_engine._reconcile_halt is True
+
+    # Resuming after reconcile clears ONLY the reconcile gate; kill switch stays.
+    execution_engine.resume_after_reconcile()
+    assert execution_engine._reconcile_halt is False
+    assert execution_engine._submissions_halted is True
+
+    # And vice versa: clearing the kill switch leaves an active reconcile gate.
+    execution_engine.halt_for_reconcile(timeout=0)
+    execution_engine.resume_submissions()
+    assert execution_engine._submissions_halted is False
+    assert execution_engine._reconcile_halt is True

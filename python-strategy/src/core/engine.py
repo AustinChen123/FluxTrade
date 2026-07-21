@@ -23,7 +23,13 @@ from src.core.interfaces import IExchangeAdapter, IOrderRepository
 from src.core.daily_nav_snapshot import DailyNavSnapshotService
 from src.core.strategy_loader import StrategyLoader
 from src.core.data_provider import check_data_availability
-from src.core.adapters import CcxtExchangeAdapter, SimulatedAdapter, create_adapter
+from src.core.adapters import (
+    CcxtExchangeAdapter,
+    RithmicExchangeAdapter,
+    RithmicUnmappedOrderEvent,
+    SimulatedAdapter,
+    create_adapter,
+)
 from src.core.journal import StrategyJournal
 from src.core.redis_factory import create_redis_client
 from src.core.metrics import SIGNALS_TOTAL, ACTIVE_STRATEGIES, BALANCE_USDT
@@ -43,6 +49,7 @@ SYSTEM_STATE_KEY = _DEFAULT_RUNTIME_ENVIRONMENT.key("system:state")
 SYSTEM_BOOT_STATE_KEY = _DEFAULT_RUNTIME_ENVIRONMENT.key("system:engine_boot_state")
 SYSTEM_STATE_LOCKDOWN = "LOCKDOWN"
 SYSTEM_STATE_OK = "OK"
+_RITHMIC_SAFE_ORDER_EVENT_ACTIONS = frozenset({"applied"})
 
 logger = logging.getLogger(__name__)
 
@@ -55,6 +62,8 @@ def _is_runtime_reconciliation_enabled(
         return False
     if isinstance(adapter, CcxtExchangeAdapter):
         return True
+    if isinstance(adapter, RithmicExchangeAdapter):
+        return False
     return bool(adapter_config and adapter_config.get("mode") == "live")
 
 
@@ -136,10 +145,10 @@ class StrategyEngine:
         effective_adapter_config = adapter_config or {"mode": "simulated"}
         self._rithmic_recovery_profile = effective_adapter_config.get(
             "rithmic_recovery_profile"
-        )
+        ) or effective_adapter_config.get("rithmic_profile")
         self._rithmic_recovery_account_id = effective_adapter_config.get(
             "rithmic_recovery_account_id"
-        )
+        ) or effective_adapter_config.get("account_id")
         self._startup_auto_recovery_allowed = False
         self._startup_lock_cause: str | None = None
         if adapter is None:
@@ -151,6 +160,15 @@ class StrategyEngine:
                 raise
         else:
             logger.info("StrategyEngine: Using provided adapter %s", type(adapter).__name__)
+        if isinstance(adapter, RithmicExchangeAdapter):
+            if not audit_external_orders:
+                raise ValueError("Rithmic live trading requires audit_external_orders")
+            self._rithmic_recovery_profile = (
+                self._rithmic_recovery_profile or adapter.profile
+            )
+            self._rithmic_recovery_account_id = (
+                self._rithmic_recovery_account_id or adapter.account_id
+            )
         self.risk_manager.instrument_spec_resolver = getattr(
             adapter,
             "get_instrument_spec",
@@ -227,6 +245,15 @@ class StrategyEngine:
         self.command_thread = None
         self.runtime_reconcile_thread = None
         self._runtime_reconcile_stop = threading.Event()
+        # Last observed order-session connection generation; a bump means the
+        # order session reconnected and owned orders must be reconciled.
+        self._last_order_generation: int | None = None
+        self._pending_order_reconnect_generation: int | None = None
+        self._rithmic_external_order_drift_pending = False
+        self._rithmic_external_order_drift_generation = 0
+        self._rithmic_external_order_drift_lock = threading.Lock()
+        self.order_event_thread = None
+        self._order_event_stop = threading.Event()
         self.executor = ThreadPoolExecutor(max_workers=5)
 
     def startup(self):
@@ -243,6 +270,13 @@ class StrategyEngine:
         self._initialize_strategy_state_cache_on_startup()
         self._start_strategy_state_subscriber_on_startup()
         reconciliation = self._reconcile_recoverable_orders_on_startup()
+        self._start_exchange_order_event_stream()
+        if isinstance(self.execution_engine.adapter, RithmicExchangeAdapter) and not (
+            reconciliation and reconciliation.get("auto_resume_safe") is True
+        ):
+            self._halt_for_kill_switch()
+            self._startup_lock_cause = "rithmic_reconciliation_blocked"
+            persisted_lockdown = True
         if persisted_lockdown:
             if self._can_auto_resume_after_startup_recovery(reconciliation):
                 self._resume_after_kill_switch()
@@ -272,6 +306,203 @@ class StrategyEngine:
         """Listen for cross-process strategy state updates."""
         self._strategy_state_manager.start_subscriber()
 
+    def _start_exchange_order_event_stream(self) -> None:
+        adapter = self.execution_engine.adapter
+        start = getattr(adapter, "start_order_event_stream", None)
+        poll = getattr(adapter, "poll_order_event", None)
+        if not callable(start) or not callable(poll):
+            return
+
+        try:
+            start()
+        except Exception:
+            self._halt_for_kill_switch()
+            raise
+        if isinstance(adapter, RithmicExchangeAdapter):
+            # A newly created runtime always publishes generation 1 before its
+            # constructor returns. Starting from that known value means a fast
+            # reconnect cannot disappear into a delayed first observation.
+            self._last_order_generation = 1
+            self._pending_order_reconnect_generation = None
+        self._order_event_stop.clear()
+
+        def order_event_loop() -> None:
+            while self.running and not self._order_event_stop.is_set():
+                try:
+                    if isinstance(adapter, RithmicExchangeAdapter):
+                        if not self._reconcile_owned_orders_on_reconnect():
+                            self._order_event_stop.wait(1.0)
+                            continue
+                    event = poll()
+                    if event is None:
+                        self._order_event_stop.wait(0.05)
+                        continue
+                    result = self.execution_engine.process_exchange_order_event(event)
+                    if isinstance(adapter, RithmicExchangeAdapter):
+                        action = str(result.get("action") or "")
+                        if action == "unknown_order":
+                            self._lockdown_for_external_order(
+                                account_id=str((event.raw or {}).get("account_id") or ""),
+                                exchange=str((event.raw or {}).get("exchange") or ""),
+                                symbol=str(
+                                    (event.raw or {}).get("symbol") or event.product_id
+                                ),
+                                client_order_id=event.client_order_id,
+                                exchange_order_id=event.exchange_order_id,
+                            )
+                        elif self._rithmic_order_event_requires_reconciliation(result):
+                            self._lockdown_for_rithmic_order_event(
+                                action=action or "missing_action",
+                                event=event,
+                            )
+                except RithmicUnmappedOrderEvent as error:
+                    self._lockdown_for_external_order(
+                        account_id=error.account_id,
+                        exchange=error.exchange,
+                        symbol=error.symbol,
+                    )
+                    continue
+                except Exception:
+                    logger.exception(
+                        "Exchange order event stream failed; submissions remain halted"
+                    )
+                    self._halt_for_kill_switch()
+                    return
+
+        self.order_event_thread = threading.Thread(
+            target=order_event_loop,
+            name="exchange-order-events",
+            daemon=True,
+        )
+        self.order_event_thread.start()
+
+    def _lockdown_for_external_order(
+        self,
+        *,
+        account_id: str,
+        exchange: str,
+        symbol: str,
+        client_order_id: str | None = None,
+        exchange_order_id: str | None = None,
+    ) -> None:
+        reason = (
+            "rithmic_external_order_detected: "
+            f"account_id={account_id or 'unknown'} "
+            f"exchange={exchange or 'unknown'} symbol={symbol or 'unknown'} "
+            f"client_order_id={client_order_id or 'unknown'} "
+            f"exchange_order_id={exchange_order_id or 'unknown'}"
+        )
+        self._lockdown_for_rithmic_order_drift(reason)
+
+    @staticmethod
+    def _rithmic_order_event_requires_reconciliation(result: dict) -> bool:
+        return (
+            result.get("action") not in _RITHMIC_SAFE_ORDER_EVENT_ACTIONS
+            or bool(result.get("verification_blocked"))
+            or bool(result.get("unresolved"))
+        )
+
+    def _lockdown_for_rithmic_order_event(
+        self,
+        *,
+        action: str,
+        event,
+    ) -> None:
+        self._lockdown_for_rithmic_order_drift(
+            "rithmic_order_event_requires_reconciliation: "
+            f"action={action} product_id={event.product_id} "
+            f"client_order_id={event.client_order_id or 'unknown'} "
+            f"exchange_order_id={event.exchange_order_id or 'unknown'}"
+        )
+
+    def _lockdown_for_rithmic_order_drift(self, reason: str) -> None:
+        with self._rithmic_external_order_drift_lock:
+            first_detection = not self._rithmic_external_order_drift_pending
+            self._rithmic_external_order_drift_pending = True
+            self._rithmic_external_order_drift_generation += 1
+            # Publish the generation and raise the submission gate atomically
+            # with respect to a concurrent clear decision.
+            self._halt_for_kill_switch()
+        logger.error("%s; submissions locked pending authoritative reconciliation", reason)
+        if not first_detection:
+            return
+        self._persist_rithmic_external_order_lockdown(reason)
+
+    def _persist_rithmic_external_order_lockdown(self, reason: str) -> None:
+        try:
+            self.ops_safety.persist_kill_switch_state(
+                SYSTEM_STATE_LOCKDOWN,
+                actor="rithmic_order_stream",
+                reason=reason,
+            )
+        except Exception:
+            logger.exception("Failed to persist external-order lockdown to database")
+        try:
+            self.redis_client.set(self._system_state_key, SYSTEM_STATE_LOCKDOWN)
+        except Exception:
+            logger.exception(
+                "Failed to persist external-order lockdown to Redis; local halt remains active"
+            )
+
+    def _prepare_rithmic_kill_switch_clear(self) -> tuple[bool, int | None]:
+        adapter = self.execution_engine.adapter
+        if not isinstance(adapter, RithmicExchangeAdapter):
+            return True, None
+
+        self._order_event_stop.set()
+        thread = self.order_event_thread
+        if thread is not None and thread.is_alive():
+            thread.join(timeout=30.0)
+            if thread.is_alive():
+                logger.error(
+                    "Rithmic clear reconciliation timed out stopping the order event stream"
+                )
+                self._order_event_stop.clear()
+                return False, None
+
+        if not self.execution_engine.halt_for_reconcile(timeout=30.0):
+            logger.error(
+                "Rithmic clear reconciliation timed out draining in-flight submissions"
+            )
+            try:
+                self._start_exchange_order_event_stream()
+            except Exception:
+                logger.exception(
+                    "Order stream restart failed after reconciliation drain timeout"
+                )
+                return False, None
+            self.execution_engine.resume_after_reconcile()
+            return False, None
+
+        adapter.close()
+        summary = None
+        try:
+            summary = self.execution_engine.reconcile_rithmic_owned_orders(
+                self._rithmic_recovery_profile,
+                self._rithmic_recovery_account_id,
+            )
+        except Exception:
+            logger.exception("Rithmic clear reconciliation failed")
+
+        with self._rithmic_external_order_drift_lock:
+            drift_generation = self._rithmic_external_order_drift_generation
+
+        try:
+            self._start_exchange_order_event_stream()
+        except Exception:
+            logger.exception(
+                "Order stream restart failed after external-order reconciliation"
+            )
+            return False, None
+
+        if not summary or summary.get("auto_resume_safe") is not True:
+            self.execution_engine.resume_after_reconcile()
+            logger.error(
+                "Rithmic clear reconciliation is unresolved; lockdown remains active"
+            )
+            return False, None
+        return True, drift_generation
+
     def _reconcile_recoverable_orders_on_startup(self) -> dict | None:
         """Record startup order reconciliation for audited external orders."""
         if not self.execution_engine.audit_external_orders:
@@ -298,6 +529,97 @@ class StrategyEngine:
             summary["recoverable_count"],
         )
         return summary
+
+    def _reconcile_owned_orders_on_reconnect(self) -> bool:
+        """Reconcile owned orders whenever the order session reconnects.
+
+        The order runtime exposes a monotonic connection generation; a bump
+        since the last observation means a mid-session reconnect happened, so a
+        fresh authoritative snapshot (orders + history + fills) is reconciled —
+        the same path as startup — to catch fills/cancels that occurred while
+        disconnected. Submissions are gated for the duration via the independent
+        reconcile gate (never touching a kill-switch halt). Fail-safe: if the
+        reconcile fails, submissions stay gated and the generation is not
+        advanced, so it retries on the next tick rather than trading against an
+        unreconciled book.
+        """
+        adapter = self.execution_engine.adapter
+        if not isinstance(adapter, RithmicExchangeAdapter):
+            return True
+        if self._pending_order_reconnect_generation is None:
+            if self._last_order_generation is None:
+                self._last_order_generation = 1
+            try:
+                generation = adapter.connection_generation()
+            except Exception:
+                logger.exception(
+                    "Order connection generation unavailable; reconciling fail closed"
+                )
+                generation = self._last_order_generation + 1
+            if generation <= self._last_order_generation:
+                return True
+            self._pending_order_reconnect_generation = generation
+
+        generation = self._pending_order_reconnect_generation
+
+        logger.info(
+            "Order session reconnected (generation %s -> %s); reconciling owned orders",
+            self._last_order_generation,
+            generation,
+        )
+        if not self.execution_engine.halt_for_reconcile(timeout=30.0):
+            logger.error(
+                "Reconnect order reconciliation waiting for in-flight submissions"
+            )
+            return False
+
+        # The ORDER runtime owns the profile lease for its whole lifetime.
+        # Closing it before the ledger snapshot is therefore part of the
+        # reconciliation boundary, not optional cleanup.
+        adapter.close()
+        if (
+            not self.execution_engine.audit_external_orders
+            or not self._rithmic_recovery_profile
+        ):
+            logger.error(
+                "Reconnect order reconciliation is unavailable; submissions remain gated"
+            )
+            return False
+        try:
+            summary = self.execution_engine.reconcile_rithmic_owned_orders(
+                self._rithmic_recovery_profile,
+                self._rithmic_recovery_account_id,
+            )
+        except Exception:
+            logger.exception(
+                "Reconnect order reconciliation failed; submissions remain gated"
+            )
+            # Stay gated and do not advance the generation: retry next tick.
+            return False
+        if summary.get("auto_resume_safe") is not True:
+            logger.error(
+                "Reconnect order reconciliation is unresolved; submissions remain gated"
+            )
+            return False
+        try:
+            adapter.start_order_event_stream()
+        except Exception:
+            logger.exception(
+                "Reconnect order stream restart failed; submissions remain gated"
+            )
+            adapter.close()
+            return False
+
+        # This is a new runtime, whose first successful connection is generation
+        # 1. Any subsequent bump is another reconnect and will be observed here.
+        self._last_order_generation = 1
+        self._pending_order_reconnect_generation = None
+        self.execution_engine.resume_after_reconcile()
+        logger.info(
+            "Reconnect order reconciliation complete: %s recoverable orders",
+            summary["recoverable_count"],
+        )
+        return True
 
     def _can_auto_resume_after_startup_recovery(self, summary: dict | None) -> bool:
         return bool(
@@ -377,6 +699,13 @@ class StrategyEngine:
                     actor = params.get("actor", "operator")
                     reason = params.get("reason")
 
+                    verified, drift_generation = self._prepare_rithmic_kill_switch_clear()
+                    if not verified:
+                        logger.warning(
+                            "Kill switch clear rejected: rithmic_reconciliation_required"
+                        )
+                        return
+
                     def persist_clear() -> None:
                         self.ops_safety.persist_kill_switch_state(
                             SYSTEM_STATE_OK,
@@ -385,16 +714,37 @@ class StrategyEngine:
                         )
                         self.redis_client.set(self._system_state_key, SYSTEM_STATE_OK)
 
-                    result = self.ops_safety.clear_kill_switch(
-                        persist_clear=persist_clear,
-                    )
-                    if result["cleared"]:
-                        self._kill_switch_halted = False
-                    else:
-                        logger.warning(
-                            "Kill switch clear rejected: %s",
-                            result["reason"],
+                    clear_succeeded = False
+                    try:
+                        result = self.ops_safety.clear_kill_switch(
+                            persist_clear=persist_clear,
                         )
+                        clear_succeeded = bool(result["cleared"])
+                        if drift_generation is None and clear_succeeded:
+                            self._kill_switch_halted = False
+                        elif not clear_succeeded:
+                            logger.warning(
+                                "Kill switch clear rejected: %s",
+                                result["reason"],
+                            )
+                    finally:
+                        if drift_generation is not None:
+                            with self._rithmic_external_order_drift_lock:
+                                drift_advanced = (
+                                    self._rithmic_external_order_drift_generation
+                                    != drift_generation
+                                )
+                                if clear_succeeded and not drift_advanced:
+                                    self._rithmic_external_order_drift_pending = False
+                                    self._kill_switch_halted = False
+                                elif drift_advanced:
+                                    self._rithmic_external_order_drift_pending = True
+                                    self._halt_for_kill_switch()
+                            if drift_advanced:
+                                self._persist_rithmic_external_order_lockdown(
+                                    "rithmic_external_order_detected_during_clear"
+                                )
+                            self.execution_engine.resume_after_reconcile()
             else:
                 result = self._command_router.handle(data)
                 if result.success:
@@ -1003,6 +1353,7 @@ class StrategyEngine:
         logger.info("StrategyEngine shutting down...")
         self.running = False
         self._runtime_reconcile_stop.set()
+        self._order_event_stop.set()
 
         self.executor.shutdown(wait=True, cancel_futures=False)
 
@@ -1012,6 +1363,12 @@ class StrategyEngine:
             self.command_thread.join(timeout=timeout)
         if self.runtime_reconcile_thread and self.runtime_reconcile_thread.is_alive():
             self.runtime_reconcile_thread.join(timeout=timeout)
+        if self.order_event_thread and self.order_event_thread.is_alive():
+            self.order_event_thread.join(timeout=timeout)
+
+        close_adapter = getattr(self.execution_engine.adapter, "close", None)
+        if callable(close_adapter):
+            close_adapter()
 
         self._strategy_state_manager.shutdown()
 

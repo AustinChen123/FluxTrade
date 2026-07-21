@@ -8,6 +8,10 @@ from src.core.adapters.ccxt_adapter import (
     CcxtExchangeAdapter,
 )
 from src.core.adapters.live_binance import LiveBinanceAdapter
+from src.core.adapters.rithmic_adapter import (
+    RithmicExchangeAdapter,
+    RithmicUnmappedOrderEvent,
+)
 from src.core.adapters.simulated import SimulatedAdapter
 from src.core.interfaces.exchange import IExchangeAdapter
 
@@ -15,6 +19,8 @@ __all__ = [
     "AccountInitializationConfig",
     "CcxtExchangeAdapter",
     "LiveBinanceAdapter",
+    "RithmicExchangeAdapter",
+    "RithmicUnmappedOrderEvent",
     "SimulatedAdapter",
     "create_adapter",
 ]
@@ -49,6 +55,8 @@ def create_adapter(config: dict) -> IExchangeAdapter:
         )
 
     exchange_id = config.get("exchange", "binance")
+    if str(exchange_id).lower() == "rithmic":
+        return RithmicExchangeAdapter.from_config(config)
     api_key = config.get("api_key")
     secret = config.get("secret")
     testnet = config.get("testnet", True)
