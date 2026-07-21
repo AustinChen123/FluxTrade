@@ -247,6 +247,36 @@ class OrderReconciler:
             for order in self.list_recoverable_client_orders()
             if str(order.exchange_id).lower() == "rithmic"
         ]
+        if (
+            not isinstance(profile, str)
+            or not profile.strip()
+            or not isinstance(account_id, str)
+            or not account_id.strip()
+        ):
+            return self._write_rithmic_identity_failure_audit(
+                orders,
+                "configured_account_identity_missing",
+            )
+        profile = profile.strip()
+        account_id = account_id.strip()
+        identity_failures = {
+            str(order.id): reason
+            for order in orders
+            if (
+                reason := self._rithmic_order_identity_failure(
+                    order,
+                    profile,
+                    account_id,
+                )
+            )
+            is not None
+        }
+        if identity_failures:
+            return self._write_rithmic_identity_failure_audit(
+                orders,
+                "account_identity_batch_blocked",
+                identity_failures=identity_failures,
+            )
         try:
             snapshot = load_rithmic_recovery_snapshot(
                 profile,
@@ -343,6 +373,53 @@ class OrderReconciler:
             ledger_verification,
         )
         return self._write_rithmic_recovery_audit(payload, phase="completed")
+
+    def _write_rithmic_identity_failure_audit(
+        self,
+        orders,
+        reason: str,
+        *,
+        identity_failures: dict[str, str] | None = None,
+    ) -> dict[str, object]:
+        return self._write_rithmic_recovery_audit(
+            {
+                "recoverable_count": len(orders),
+                "matched_count": 0,
+                "repaired_count": 0,
+                "external_count": 0,
+                "unresolved_count": max(1, len(orders)),
+                "verification_blocked_count": max(1, len(orders)),
+                "auto_resume_safe": False,
+                "results": [
+                    {
+                        "order_id": str(order.id),
+                        "classification": "unresolved",
+                        "reason": (identity_failures or {}).get(str(order.id), reason),
+                        "verification_blocked": True,
+                        "unresolved": True,
+                    }
+                    for order in orders
+                ],
+                "external_orders": [],
+                "ledger_verification": None,
+            }
+        )
+
+    @staticmethod
+    def _rithmic_order_identity_failure(
+        order,
+        profile: str,
+        account_id: str,
+    ) -> str | None:
+        if not getattr(order, "account_profile", None):
+            return "local_account_profile_missing"
+        if not getattr(order, "account_id", None):
+            return "local_account_id_missing"
+        if order.account_profile != profile:
+            return "local_account_profile_mismatch"
+        if order.account_id != account_id:
+            return "local_account_id_mismatch"
+        return None
 
     @staticmethod
     def _rithmic_recovery_payload(

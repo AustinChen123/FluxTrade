@@ -175,6 +175,14 @@ class StrategyEngine:
             db_session_factory=self._db_session_factory,
             audit_external_orders=audit_external_orders,
             account_service=self.account_service,
+            rithmic_account_profile=self._rithmic_recovery_profile,
+            rithmic_account_id=self._rithmic_recovery_account_id,
+        )
+        self._rithmic_recovery_profile = (
+            self.execution_engine.order_manager.rithmic_account_profile
+        )
+        self._rithmic_recovery_account_id = (
+            self.execution_engine.order_manager.rithmic_account_id
         )
         self._lifecycle_adapter = _EngineLifecycleAdapter(self)
         self._health_monitor = HealthMonitor(self._registry)

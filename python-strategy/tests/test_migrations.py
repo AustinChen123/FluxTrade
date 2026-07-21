@@ -245,7 +245,7 @@ def test_full_upgrade_to_head(fresh_pg_db: str) -> None:
             f"P0 tables missing after upgrade: {P0_NEW_TABLES - tables}"
         )
 
-        # ``order`` must carry the 5 new idempotency / audit columns.
+        # ``order`` must carry idempotency, audit, and account identity columns.
         order_cols = _column_names(engine, "order")
         for col in (
             "client_order_id",
@@ -253,6 +253,8 @@ def test_full_upgrade_to_head(fresh_pg_db: str) -> None:
             "submitted_at",
             "acked_at",
             "last_reconciled_at",
+            "account_profile",
+            "account_id",
         ):
             assert col in order_cols, f"order.{col} missing after upgrade"
 
@@ -297,6 +299,9 @@ def test_full_upgrade_to_head(fresh_pg_db: str) -> None:
         assert "chk_nav_source" in _check_constraint_names(engine, "daily_nav_snapshots")
         assert "chk_gene_role" in _check_constraint_names(engine, "gene_records")
         assert "chk_epoch_status" in _check_constraint_names(engine, "evolution_epochs")
+        assert "chk_order_account_identity_complete" in _check_constraint_names(
+            engine, "order"
+        )
     finally:
         engine.dispose()
 
@@ -326,6 +331,21 @@ def test_sample_data_insertion_after_upgrade(fresh_pg_db: str) -> None:
                 )
             )
 
+            for order_id, profile, account_id in (
+                ("order-no-identity", None, None),
+                ("order-with-identity", "test", "ACCOUNT"),
+            ):
+                conn.execute(
+                    text(
+                        'INSERT INTO "order" '
+                        "(id, strategy_id, product_id, exchange_id, account_profile, "
+                        "account_id, type, side, quantity, status, timestamp) "
+                        "VALUES (:id, 'strat-1', 'binance:BTC/USDT', 'binance', "
+                        ":profile, :account_id, 'market', 'buy', 1, 'open', 1)"
+                    ),
+                    {"id": order_id, "profile": profile, "account_id": account_id},
+                )
+
             # Positive system_events insert.
             conn.execute(
                 text(
@@ -343,6 +363,32 @@ def test_sample_data_insertion_after_upgrade(fresh_pg_db: str) -> None:
                         "VALUES ('invalid_type', '{}'::jsonb)"
                     )
                 )
+
+        for index, (profile, account_id) in enumerate(
+            (
+                ("test", None),
+                (None, "ACCOUNT"),
+                ("", "ACCOUNT"),
+                ("test", " "),
+            )
+        ):
+            with pytest.raises(sa.exc.IntegrityError):
+                with engine.begin() as conn:
+                    conn.execute(
+                        text(
+                            'INSERT INTO "order" '
+                            "(id, strategy_id, product_id, exchange_id, "
+                            "account_profile, account_id, type, side, quantity, "
+                            "status, timestamp) "
+                            "VALUES (:id, 'strat-1', 'binance:BTC/USDT', 'binance', "
+                            ":profile, :account_id, 'market', 'buy', 1, 'open', 1)"
+                        ),
+                        {
+                            "id": f"invalid-account-identity-{index}",
+                            "profile": profile,
+                            "account_id": account_id,
+                        },
+                    )
 
         # Negative CHECK: daily_nav_snapshots.source must be in whitelist.
         with pytest.raises(sa.exc.IntegrityError):

@@ -60,8 +60,8 @@ def test_adapter_config_from_env_rejects_unknown_mode(monkeypatch) -> None:
 
 def test_adapter_config_from_env_wires_optional_rithmic_recovery(monkeypatch) -> None:
     monkeypatch.setenv("ADAPTER_MODE", "live")
-    monkeypatch.setenv("RITHMIC_RECOVERY_PROFILE", "test")
-    monkeypatch.setenv("RITHMIC_ACCOUNT_ID", "ACCOUNT")
+    monkeypatch.setenv("RITHMIC_RECOVERY_PROFILE", " test ")
+    monkeypatch.setenv("RITHMIC_ACCOUNT_ID", " ACCOUNT ")
 
     config = strategy_main._adapter_config_from_env()
 
@@ -89,6 +89,41 @@ def test_validate_runtime_config_allows_live_with_audit() -> None:
         {"mode": "live"},
         audit_external_orders=True,
     )
+
+
+def test_validate_runtime_config_requires_rithmic_account_id() -> None:
+    with pytest.raises(ValueError, match="rithmic_recovery_requires_account_id"):
+        strategy_main._validate_runtime_config(
+            {
+                "mode": "live",
+                "rithmic_recovery_profile": "test",
+            },
+            audit_external_orders=True,
+        )
+
+
+def test_adapter_config_preserves_incomplete_identity_for_validation(monkeypatch) -> None:
+    monkeypatch.setenv("ADAPTER_MODE", "live")
+    monkeypatch.delenv("RITHMIC_RECOVERY_PROFILE", raising=False)
+    monkeypatch.setenv("RITHMIC_ACCOUNT_ID", "ACCOUNT")
+
+    config = strategy_main._adapter_config_from_env()
+
+    assert config["rithmic_recovery_account_id"] == "ACCOUNT"
+    with pytest.raises(ValueError, match="rithmic_account_id_requires_recovery_profile"):
+        strategy_main._validate_runtime_config(
+            config,
+            audit_external_orders=True,
+        )
+
+    with pytest.raises(ValueError, match="rithmic_account_id_requires_recovery_profile"):
+        strategy_main._validate_runtime_config(
+            {
+                "mode": "live",
+                "rithmic_recovery_account_id": "ACCOUNT",
+            },
+            audit_external_orders=True,
+        )
 
 
 def test_main_rejects_live_without_audit_before_initialization(monkeypatch) -> None:

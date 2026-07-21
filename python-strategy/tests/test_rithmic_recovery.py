@@ -19,6 +19,8 @@ def local_order(**overrides):
         "client_order_id": "flux-1",
         "exchange_order_id": "basket-1",
         "exchange_id": "rithmic",
+        "account_profile": "test",
+        "account_id": "ACCOUNT",
         "product_id": "RITHMIC:NQ-202609",
         "side": "buy",
         "quantity": Decimal("2"),
@@ -469,6 +471,7 @@ def test_reconciler_snapshot_failure_blocks_every_owned_order_without_mutation()
 
     result = reconciler.reconcile_rithmic_owned_orders(
         "test",
+        "ACCOUNT",
         snapshot_loader=Mock(side_effect=RuntimeError("unavailable")),
     )
 
@@ -506,6 +509,124 @@ def test_reconciler_snapshot_failure_blocks_without_recoverable_orders():
     assert result["unresolved_count"] == 1
     assert result["verification_blocked_count"] == 1
     assert result["auto_resume_safe"] is False
+
+
+@pytest.mark.parametrize(
+    ("order_overrides", "reason"),
+    [
+        ({"account_profile": None}, "local_account_profile_missing"),
+        ({"account_id": None}, "local_account_id_missing"),
+        ({"account_profile": "lucid"}, "local_account_profile_mismatch"),
+        ({"account_id": "OTHER"}, "local_account_id_mismatch"),
+    ],
+)
+def test_reconciler_blocks_untrusted_local_account_identity(
+    order_overrides,
+    reason,
+):
+    repo = MagicMock()
+    repo.list_client_orders_by_statuses.return_value = [local_order(**order_overrides)]
+    loader = Mock(return_value=snapshot())
+    reconciler = OrderReconciler(
+        adapter=MagicMock(),
+        order_manager=SimpleNamespace(repo=repo),
+        clock=SimpleNamespace(now=lambda: 1_700_000_200),
+        db_session_factory=lambda: nullcontext(MagicMock()),
+        process_exchange_order_event=Mock(),
+        place_pending_protection_for_filled_entries=Mock(),
+        fail_pending_conditionals_for_terminal_entry=Mock(),
+        protective_terminal_without_fill_failure=Mock(),
+        cancel_protective_order_when_sibling_closed=Mock(),
+        cancel_linked_conditional_for_protection_fill=Mock(),
+        local_positions_loader=lambda: [],
+    )
+
+    result = reconciler.reconcile_rithmic_owned_orders(
+        "test",
+        "ACCOUNT",
+        snapshot_loader=loader,
+    )
+
+    loader.assert_not_called()
+    assert result["auto_resume_safe"] is False
+    assert result["results"][0]["reason"] == reason
+
+
+@pytest.mark.parametrize(
+    ("profile", "account_id", "orders"),
+    [
+        (None, "ACCOUNT", []),
+        ("test", None, [local_order()]),
+    ],
+)
+def test_reconciler_blocks_missing_configured_account_identity(
+    profile,
+    account_id,
+    orders,
+):
+    repo = MagicMock()
+    repo.list_client_orders_by_statuses.return_value = orders
+    loader = Mock(return_value=snapshot())
+    reconciler = OrderReconciler(
+        adapter=MagicMock(),
+        order_manager=SimpleNamespace(repo=repo),
+        clock=SimpleNamespace(now=lambda: 1_700_000_200),
+        db_session_factory=lambda: nullcontext(MagicMock()),
+        process_exchange_order_event=Mock(),
+        place_pending_protection_for_filled_entries=Mock(),
+        fail_pending_conditionals_for_terminal_entry=Mock(),
+        protective_terminal_without_fill_failure=Mock(),
+        cancel_protective_order_when_sibling_closed=Mock(),
+        cancel_linked_conditional_for_protection_fill=Mock(),
+        local_positions_loader=lambda: [],
+    )
+
+    result = reconciler.reconcile_rithmic_owned_orders(
+        profile,
+        account_id,
+        snapshot_loader=loader,
+    )
+
+    loader.assert_not_called()
+    assert result["unresolved_count"] == max(1, len(orders))
+    assert result["verification_blocked_count"] == max(1, len(orders))
+    assert result["auto_resume_safe"] is False
+
+
+def test_reconciler_blocks_entire_mixed_account_identity_batch():
+    matching = local_order(id="matching")
+    mismatched = local_order(id="mismatched", account_id="OTHER")
+    repo = MagicMock()
+    repo.list_client_orders_by_statuses.return_value = [matching, mismatched]
+    loader = Mock(return_value=snapshot())
+    reconciler = OrderReconciler(
+        adapter=MagicMock(),
+        order_manager=SimpleNamespace(repo=repo),
+        clock=SimpleNamespace(now=lambda: 1_700_000_200),
+        db_session_factory=lambda: nullcontext(MagicMock()),
+        process_exchange_order_event=Mock(),
+        place_pending_protection_for_filled_entries=Mock(),
+        fail_pending_conditionals_for_terminal_entry=Mock(),
+        protective_terminal_without_fill_failure=Mock(),
+        cancel_protective_order_when_sibling_closed=Mock(),
+        cancel_linked_conditional_for_protection_fill=Mock(),
+        local_positions_loader=lambda: [],
+    )
+
+    result = reconciler.reconcile_rithmic_owned_orders(
+        "test",
+        "ACCOUNT",
+        snapshot_loader=loader,
+    )
+
+    loader.assert_not_called()
+    assert result["unresolved_count"] == 2
+    assert result["verification_blocked_count"] == 2
+    assert result["auto_resume_safe"] is False
+    assert [item["reason"] for item in result["results"]] == [
+        "account_identity_batch_blocked",
+        "local_account_id_mismatch",
+    ]
 
 
 def test_reconciler_checks_remote_exposure_even_without_recoverable_orders():

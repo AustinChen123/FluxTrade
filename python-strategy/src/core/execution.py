@@ -56,6 +56,8 @@ class ExecutionEngine:
         db_session_factory: Optional[Callable[[], ContextManager[Session]]] = None,
         audit_external_orders: bool = False,
         account_service=None,
+        rithmic_account_profile: str | None = None,
+        rithmic_account_id: str | None = None,
     ):
         self.logger = logging.getLogger("ExecutionEngine")
         self.clock = clock
@@ -63,13 +65,21 @@ class ExecutionEngine:
         self._db_session = db_session
         self.audit_external_orders = audit_external_orders
         if order_repository:
-            self.order_manager = OrderManager(order_repository, clock, is_backtest=is_backtest)
+            self.order_manager = OrderManager(
+                order_repository,
+                clock,
+                is_backtest=is_backtest,
+                rithmic_account_profile=rithmic_account_profile,
+                rithmic_account_id=rithmic_account_id,
+            )
         else:
             from src.core.repositories import LiveOrderRepository
             self.order_manager = OrderManager(
                 LiveOrderRepository(db_session, db_session_factory=db_session_factory),
                 clock,
                 is_backtest=is_backtest,
+                rithmic_account_profile=rithmic_account_profile,
+                rithmic_account_id=rithmic_account_id,
             )
 
         self.default_quantity = Decimal("0.01")
