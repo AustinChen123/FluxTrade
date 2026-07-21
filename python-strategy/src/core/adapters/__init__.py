@@ -8,7 +8,10 @@ from src.core.adapters.ccxt_adapter import (
     CcxtExchangeAdapter,
 )
 from src.core.adapters.live_binance import LiveBinanceAdapter
-from src.core.adapters.rithmic_adapter import RithmicExchangeAdapter
+from src.core.adapters.rithmic_adapter import (
+    RithmicExchangeAdapter,
+    RithmicUnmappedOrderEvent,
+)
 from src.core.adapters.simulated import SimulatedAdapter
 from src.core.interfaces.exchange import IExchangeAdapter
 
@@ -17,6 +20,7 @@ __all__ = [
     "CcxtExchangeAdapter",
     "LiveBinanceAdapter",
     "RithmicExchangeAdapter",
+    "RithmicUnmappedOrderEvent",
     "SimulatedAdapter",
     "create_adapter",
 ]

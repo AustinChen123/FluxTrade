@@ -20,6 +20,19 @@ from src.core.product_registry import (
 )
 
 
+class RithmicUnmappedOrderEvent(ExchangeError):
+    """Account-level order event whose instrument is not locally configured."""
+
+    def __init__(self, *, account_id: str, exchange: str, symbol: str):
+        self.account_id = account_id
+        self.exchange = exchange
+        self.symbol = symbol
+        super().__init__(
+            "unknown_rithmic_order_event_instrument: "
+            f"account_id={account_id} exchange={exchange} symbol={symbol}"
+        )
+
+
 class RithmicExchangeAdapter(IExchangeAdapter):
     """Rithmic ORDER adapter with explicit startup after ledger recovery."""
 
@@ -42,6 +55,7 @@ class RithmicExchangeAdapter(IExchangeAdapter):
         self.logger = logging.getLogger("RithmicAdapter")
         self._client_factory = client_factory
         self._client = None
+        self._client_lock = threading.Lock()
         self._client_order_ids_lock = threading.Lock()
         self._submitted_client_order_ids: set[str] = set()
         self._instrument_specs: dict[str, InstrumentSpec] = {}
@@ -86,23 +100,58 @@ class RithmicExchangeAdapter(IExchangeAdapter):
         )
 
     def start_order_event_stream(self) -> None:
-        if self._client is not None:
-            return
-        factory = self._client_factory
-        if factory is None:
-            from fluxtrade_core import RithmicOrderClient
+        with self._client_lock:
+            if self._client is not None:
+                return
+            factory = self._client_factory
+            if factory is None:
+                from fluxtrade_core import RithmicOrderClient
 
-            factory = RithmicOrderClient
-        try:
-            self._client = factory(self.profile, self.account_id)
-        except RuntimeError as error:
-            raise NetworkError(f"rithmic_order_start_failed: {error}") from error
+                factory = RithmicOrderClient
+            try:
+                self._client = factory(self.profile, self.account_id)
+            except RuntimeError as error:
+                raise NetworkError(f"rithmic_order_start_failed: {error}") from error
 
     def close(self) -> None:
-        self._client = None
+        with self._client_lock:
+            self._client = None
 
     def place_order(self, order: Order) -> str:
-        client = self._require_client()
+        self.validate_order(order)
+        client_order_id = str(order.client_order_id)
+        with self._client_order_ids_lock:
+            if client_order_id in self._submitted_client_order_ids:
+                raise ExchangeError(
+                    f"duplicate_rithmic_client_order_id: {client_order_id}"
+                )
+            self._submitted_client_order_ids.add(client_order_id)
+        try:
+            with self._client_lock:
+                ack = self._require_client().submit(
+                    client_order_id,
+                    self._route_exchanges[order.product_id],
+                    to_rithmic_symbol(order.product_id),
+                    str(order.quantity),
+                    str(order.side).lower(),
+                    str(order.type).lower(),
+                    str(order.price) if order.price is not None else None,
+                )
+        except RuntimeError as error:
+            mapped = _map_runtime_error("rithmic_order_submit_failed", error)
+            if not isinstance(mapped, NetworkError):
+                with self._client_order_ids_lock:
+                    self._submitted_client_order_ids.discard(client_order_id)
+            raise mapped from error
+        return str(ack.basket_id)
+
+    def validate_order(self, order: Order) -> None:
+        intent_payload = getattr(order, "intent_payload", None)
+        if (
+            isinstance(intent_payload, dict)
+            and intent_payload.get("reduce_only") is True
+        ):
+            raise ExchangeError("rithmic_reduce_only_unsupported")
         spec = self.get_instrument_spec(order.product_id)
         order_type = str(order.type or "").lower()
         if order_type not in {"market", "limit"}:
@@ -123,30 +172,6 @@ class RithmicExchangeAdapter(IExchangeAdapter):
             raise ExchangeError(f"rithmic_order_validation_failed: {error}") from error
         order.quantity = values.quantity
         order.price = values.price
-        client_order_id = str(order.client_order_id)
-        with self._client_order_ids_lock:
-            if client_order_id in self._submitted_client_order_ids:
-                raise ExchangeError(
-                    f"duplicate_rithmic_client_order_id: {client_order_id}"
-                )
-            self._submitted_client_order_ids.add(client_order_id)
-        try:
-            ack = client.submit(
-                client_order_id,
-                self._route_exchanges[order.product_id],
-                to_rithmic_symbol(order.product_id),
-                str(order.quantity),
-                str(order.side).lower(),
-                order_type,
-                str(order.price) if order.price is not None else None,
-            )
-        except RuntimeError as error:
-            mapped = _map_runtime_error("rithmic_order_submit_failed", error)
-            if not isinstance(mapped, NetworkError):
-                with self._client_order_ids_lock:
-                    self._submitted_client_order_ids.discard(client_order_id)
-            raise mapped from error
-        return str(ack.basket_id)
 
     def cancel_order(
         self,
@@ -157,7 +182,8 @@ class RithmicExchangeAdapter(IExchangeAdapter):
     ) -> bool:
         self.get_instrument_spec(product_id)
         try:
-            return bool(self._require_client().cancel(str(order_id)))
+            with self._client_lock:
+                return bool(self._require_client().cancel(str(order_id)))
         except RuntimeError as error:
             raise _map_runtime_error("rithmic_order_cancel_failed", error) from error
 
@@ -192,11 +218,12 @@ class RithmicExchangeAdapter(IExchangeAdapter):
     ) -> ExchangeOrderSnapshot | None:
         self.get_instrument_spec(product_id)
         try:
-            remote = self._require_client().lookup(
-                str(client_order_id),
-                self._route_exchanges[product_id],
-                to_rithmic_symbol(product_id),
-            )
+            with self._client_lock:
+                remote = self._require_client().lookup(
+                    str(client_order_id),
+                    self._route_exchanges[product_id],
+                    to_rithmic_symbol(product_id),
+                )
         except RuntimeError as error:
             raise _map_runtime_error("rithmic_order_lookup_failed", error) from error
         if remote is None:
@@ -224,7 +251,8 @@ class RithmicExchangeAdapter(IExchangeAdapter):
 
     def poll_order_event(self) -> ExchangeOrderEvent | None:
         try:
-            event = self._require_client().poll_event()
+            with self._client_lock:
+                event = self._require_client().poll_event()
         except RuntimeError as error:
             raise _map_runtime_error("rithmic_order_event_failed", error) from error
         if event is None:
@@ -232,9 +260,10 @@ class RithmicExchangeAdapter(IExchangeAdapter):
         identity = (str(event.exchange).upper(), str(event.symbol).upper())
         product_id = self._products_by_native_identity.get(identity)
         if product_id is None:
-            raise ExchangeError(
-                "unknown_rithmic_order_event_instrument: "
-                f"exchange={identity[0]} symbol={identity[1]}"
+            raise RithmicUnmappedOrderEvent(
+                account_id=self.account_id,
+                exchange=identity[0],
+                symbol=identity[1],
             )
         return ExchangeOrderEvent(
             status=str(event.status),
@@ -252,6 +281,8 @@ class RithmicExchangeAdapter(IExchangeAdapter):
                 "basket_id": str(event.basket_id),
                 "exchange_order_id": event.exchange_order_id,
                 "account_id": event.account_id,
+                "exchange": identity[0],
+                "symbol": identity[1],
             },
         )
 
@@ -269,6 +300,16 @@ class RithmicExchangeAdapter(IExchangeAdapter):
     def get_position(self, product_id: str) -> Position | None:
         self.get_instrument_spec(product_id)
         raise ExchangeError("rithmic_live_position_unavailable")
+
+    def connection_generation(self) -> int:
+        """Successful (re)connect count of the order session.
+
+        A strictly higher value than a previously observed one means the order
+        session reconnected in between; the engine uses this to trigger
+        owned-order reconciliation after a mid-session disconnect.
+        """
+        with self._client_lock:
+            return self._require_client().connection_generation()
 
     def _require_client(self):
         if self._client is None:

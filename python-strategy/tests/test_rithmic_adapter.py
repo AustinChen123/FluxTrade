@@ -1,3 +1,5 @@
+import threading
+from concurrent.futures import ThreadPoolExecutor
 from decimal import Decimal
 from types import SimpleNamespace
 from unittest.mock import Mock
@@ -5,7 +7,10 @@ from unittest.mock import Mock
 import pytest
 
 from src.core.adapters import create_adapter
-from src.core.adapters.rithmic_adapter import RithmicExchangeAdapter
+from src.core.adapters.rithmic_adapter import (
+    RithmicExchangeAdapter,
+    RithmicUnmappedOrderEvent,
+)
 from src.core.interfaces.exchange import ExchangeError, NetworkError
 
 
@@ -102,6 +107,36 @@ def test_runtime_start_is_explicit_and_idempotent(client):
     factory.assert_called_once_with("test", "ACCOUNT")
 
 
+def test_close_waits_for_active_order_client_call(adapter, client):
+    call_started = threading.Event()
+    release_call = threading.Event()
+    close_finished = threading.Event()
+
+    def blocking_submit(*_args):
+        call_started.set()
+        assert release_call.wait(1.0)
+        return SimpleNamespace(basket_id="basket-1")
+
+    client.submit.side_effect = blocking_submit
+    adapter.start_order_event_stream()
+
+    def close_adapter():
+        adapter.close()
+        close_finished.set()
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        submit_future = executor.submit(adapter.place_order, order())
+        assert call_started.wait(1.0)
+        close_future = executor.submit(close_adapter)
+        assert not close_finished.wait(0.05)
+        release_call.set()
+        assert submit_future.result(timeout=1.0) == "basket-1"
+        close_future.result(timeout=1.0)
+
+    assert close_finished.is_set()
+    assert adapter._client is None
+
+
 def test_limit_order_uses_native_contract_and_decimal_strings(adapter, client):
     adapter.start_order_event_stream()
 
@@ -111,6 +146,18 @@ def test_limit_order_uses_native_contract_and_decimal_strings(adapter, client):
     client.submit.assert_called_once_with(
         "client-1", "CME", "NQU6", "1", "buy", "limit", "20000.25"
     )
+
+
+def test_reduce_only_order_fails_before_submit(adapter, client):
+    adapter.start_order_event_stream()
+
+    with pytest.raises(ExchangeError, match="rithmic_reduce_only_unsupported"):
+        adapter.place_order(
+            order(intent_payload={"reduce_only": True, "source": "kill_switch"})
+        )
+
+    client.submit.assert_not_called()
+    assert adapter._submitted_client_order_ids == set()
 
 
 @pytest.mark.parametrize(
@@ -234,8 +281,15 @@ def test_unknown_order_event_instrument_fails_closed(adapter, client):
     adapter.start_order_event_stream()
     client.poll_event.return_value = event(symbol="ESZ6")
 
-    with pytest.raises(ExchangeError, match="unknown_rithmic_order_event_instrument"):
+    with pytest.raises(
+        RithmicUnmappedOrderEvent,
+        match="unknown_rithmic_order_event_instrument",
+    ) as caught:
         adapter.poll_order_event()
+
+    assert caught.value.account_id == "ACCOUNT"
+    assert caught.value.exchange == "CME"
+    assert caught.value.symbol == "ESZ6"
 
 
 def test_account_queries_remain_explicitly_unavailable(adapter):
