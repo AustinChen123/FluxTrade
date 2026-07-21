@@ -135,6 +135,89 @@ class TestOrderCreation:
             "limits": ["42000.5"],
         }
 
+    def test_rithmic_live_order_persists_account_identity_before_submission(
+        self,
+        mock_order_repo,
+        mock_clock,
+        signal_factory,
+    ):
+        order_manager = OrderManager(
+            mock_order_repo,
+            mock_clock,
+            is_backtest=False,
+            rithmic_account_profile=" test ",
+            rithmic_account_id=" ACCOUNT ",
+        )
+
+        order = order_manager.create_order(
+            signal_factory(product_id="RITHMIC:NQ-202609"),
+            OrderSide.BUY,
+            "limit",
+            Decimal("1"),
+            price=Decimal("20000"),
+            client_order_id="flux-1",
+        )
+
+        assert order.account_profile == "test"
+        assert order.account_id == "ACCOUNT"
+        assert mock_order_repo.orders[order.id].account_id == "ACCOUNT"
+
+    def test_rithmic_live_order_rejects_missing_account_identity(
+        self,
+        mock_order_repo,
+        mock_clock,
+        signal_factory,
+    ):
+        order_manager = OrderManager(mock_order_repo, mock_clock, is_backtest=False)
+
+        with pytest.raises(RuntimeError, match="require account profile and account ID"):
+            order_manager.create_order(
+                signal_factory(product_id="RITHMIC:NQ-202609"),
+                OrderSide.BUY,
+                "market",
+                Decimal("1"),
+            )
+
+        assert mock_order_repo.orders == {}
+
+    def test_account_identity_is_not_attached_to_backtests_or_other_venues(
+        self,
+        mock_order_repo,
+        mock_clock,
+        signal_factory,
+    ):
+        live_manager = OrderManager(
+            mock_order_repo,
+            mock_clock,
+            is_backtest=False,
+            rithmic_account_profile="test",
+            rithmic_account_id="ACCOUNT",
+        )
+        binance_order = live_manager.create_order(
+            signal_factory(product_id="BINANCE:BTCUSDT-PERP"),
+            OrderSide.BUY,
+            "market",
+            Decimal("0.1"),
+        )
+        backtest_manager = OrderManager(
+            mock_order_repo,
+            mock_clock,
+            is_backtest=True,
+            rithmic_account_profile="test",
+            rithmic_account_id="ACCOUNT",
+        )
+        rithmic_backtest_order = backtest_manager.create_order(
+            signal_factory(product_id="RITHMIC:NQ-202609"),
+            OrderSide.BUY,
+            "market",
+            Decimal("1"),
+        )
+
+        assert binance_order.account_profile is None
+        assert binance_order.account_id is None
+        assert rithmic_backtest_order.account_profile is None
+        assert rithmic_backtest_order.account_id is None
+
 
 class TestOrderStatusUpdates:
     """Tests for order status updates."""

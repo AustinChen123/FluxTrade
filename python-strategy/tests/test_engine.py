@@ -302,6 +302,33 @@ class TestEngineInit:
 
         engine.execution_engine.reconcile_recoverable_client_orders.assert_called_once_with()
 
+    def test_startup_reconcile_uses_rithmic_owned_recovery_when_configured(
+        self,
+        engine_factory,
+    ):
+        engine = engine_factory(
+            audit_external_orders=True,
+            adapter_config={
+                "mode": "live",
+                "rithmic_recovery_profile": "test",
+                "rithmic_recovery_account_id": "ACCOUNT",
+            },
+        )
+        engine.execution_engine.reconcile_rithmic_owned_orders = MagicMock(
+            return_value={
+                "recoverable_count": 1,
+                "unresolved_count": 0,
+                "verification_blocked_count": 0,
+            }
+        )
+
+        engine._reconcile_recoverable_orders_on_startup()
+
+        engine.execution_engine.reconcile_rithmic_owned_orders.assert_called_once_with(
+            "test",
+            "ACCOUNT",
+        )
+
     def test_startup_restores_loaded_active_strategies(self, engine):
         """Restart should re-instantiate previously ACTIVE strategies."""
         active_state = MagicMock()
@@ -1662,6 +1689,88 @@ class TestPersistentKillSwitchState:
 
         assert engine._check_system_state() is True
         assert engine._kill_switch_halted is True
+
+    def test_unclean_boot_with_clear_kill_state_allows_automatic_recovery(self, engine):
+        previous_boot = {"state": "UNCLEAN", "boot_id": "previous"}
+        engine.redis_client.get.side_effect = lambda key: (
+            "OK" if key == SYSTEM_STATE_KEY else json.dumps(previous_boot)
+        )
+        engine.ops_safety.latest_kill_switch_state = MagicMock(return_value="OK")
+        engine.ops_safety.latest_engine_boot_state = MagicMock(
+            return_value=previous_boot
+        )
+        engine.ops_safety.persist_engine_boot_state = MagicMock()
+
+        assert engine._check_system_state() is True
+        assert engine._startup_auto_recovery_allowed is True
+        assert engine._startup_lock_cause == "unclean_boot"
+
+    @pytest.mark.parametrize(
+        "summary, resumes",
+        [
+            (
+                {
+                    "recoverable_count": 1,
+                    "unresolved_count": 0,
+                    "verification_blocked_count": 0,
+                    "auto_resume_safe": True,
+                },
+                True,
+            ),
+            (
+                {
+                    "recoverable_count": 1,
+                    "unresolved_count": 1,
+                    "verification_blocked_count": 1,
+                    "auto_resume_safe": False,
+                },
+                False,
+            ),
+        ],
+    )
+    def test_unclean_startup_only_auto_resumes_after_clean_reconciliation(
+        self,
+        engine,
+        summary,
+        resumes,
+    ):
+        engine._check_system_state = MagicMock(return_value=True)
+        engine._startup_auto_recovery_allowed = True
+        engine._startup_lock_cause = "unclean_boot"
+        engine._reconcile_recoverable_orders_on_startup = MagicMock(
+            return_value=summary
+        )
+        engine._resume_after_kill_switch = MagicMock(
+            side_effect=lambda: setattr(engine, "_kill_switch_halted", False)
+        )
+        engine.ops_safety.kill_switch = MagicMock()
+        for name in (
+            "_start_command_listener",
+            "_reconcile_balance",
+            "_initialize_strategy_state_cache_on_startup",
+            "_start_strategy_state_subscriber_on_startup",
+            "_start_heartbeat",
+            "scan_strategies",
+            "_restore_active_strategies_on_startup",
+        ):
+            setattr(engine, name, MagicMock())
+
+        engine.startup()
+
+        assert engine._resume_after_kill_switch.called is resumes
+        engine.ops_safety.kill_switch.assert_not_called()
+        assert engine._restore_active_strategies_on_startup.called is resumes
+
+    def test_generic_reconciliation_cannot_auto_resume_unclean_startup(self, engine):
+        engine._startup_auto_recovery_allowed = True
+
+        assert engine._can_auto_resume_after_startup_recovery(
+            {
+                "recoverable_count": 0,
+                "unresolved_count": 0,
+                "verification_blocked_count": 0,
+            }
+        ) is False
 
     def test_current_boot_marker_dual_write_failure_fails_closed(self, engine):
         previous_boot = {"state": "CLEAN", "boot_id": "previous"}

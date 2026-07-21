@@ -13,6 +13,11 @@ from src.core.interfaces.exchange import (
 )
 from src.core.models import OrderStatus
 from src.core.order_event_sync import exchange_snapshot_to_order_event
+from src.core.adapters.rithmic_recovery import (
+    build_rithmic_recovery_plan,
+    compare_rithmic_positions,
+    load_rithmic_recovery_snapshot,
+)
 
 
 class OrderReconciler:
@@ -29,6 +34,7 @@ class OrderReconciler:
         protective_terminal_without_fill_failure: Callable[[object], dict | None],
         cancel_protective_order_when_sibling_closed: Callable[[object], dict | None],
         cancel_linked_conditional_for_protection_fill: Callable[[object], dict | None],
+        local_positions_loader: Callable[[], list[object]] | None = None,
         logger: Optional[logging.Logger] = None,
     ) -> None:
         self.adapter = adapter
@@ -51,6 +57,7 @@ class OrderReconciler:
         self.cancel_linked_conditional_for_protection_fill = (
             cancel_linked_conditional_for_protection_fill
         )
+        self.local_positions_loader = local_positions_loader
         self.logger = logger or logging.getLogger("OrderReconciler")
 
     def list_recoverable_client_orders(self):
@@ -222,6 +229,315 @@ class OrderReconciler:
                 db.rollback()
                 raise
 
+        return payload
+
+    def reconcile_rithmic_owned_orders(
+        self,
+        profile: str,
+        account_id: str | None = None,
+        *,
+        snapshot_loader=None,
+    ) -> dict[str, object]:
+        """Repair recent FluxTrade-owned Rithmic orders from one remote snapshot."""
+        if self._db_session_factory is None:
+            raise RuntimeError("reconcile_rithmic_owned_orders requires db_session_factory")
+
+        orders = [
+            order
+            for order in self.list_recoverable_client_orders()
+            if str(order.exchange_id).lower() == "rithmic"
+        ]
+        if (
+            not isinstance(profile, str)
+            or not profile.strip()
+            or not isinstance(account_id, str)
+            or not account_id.strip()
+        ):
+            return self._write_rithmic_identity_failure_audit(
+                orders,
+                "configured_account_identity_missing",
+            )
+        profile = profile.strip()
+        account_id = account_id.strip()
+        identity_failures = {
+            str(order.id): reason
+            for order in orders
+            if (
+                reason := self._rithmic_order_identity_failure(
+                    order,
+                    profile,
+                    account_id,
+                )
+            )
+            is not None
+        }
+        if identity_failures:
+            return self._write_rithmic_identity_failure_audit(
+                orders,
+                "account_identity_batch_blocked",
+                identity_failures=identity_failures,
+            )
+        try:
+            snapshot = load_rithmic_recovery_snapshot(
+                profile,
+                account_id,
+                orders,
+                int(self.clock.now()),
+                snapshot_loader,
+            )
+        except Exception as exc:
+            return self._write_rithmic_recovery_audit(
+                {
+                    "recoverable_count": len(orders),
+                    "matched_count": 0,
+                    "repaired_count": 0,
+                    "external_count": 0,
+                    "unresolved_count": max(1, len(orders)),
+                    "verification_blocked_count": max(1, len(orders)),
+                    "auto_resume_safe": False,
+                    "results": [
+                        {
+                            "order_id": str(order.id),
+                            "classification": "unresolved",
+                            "reason": "remote_snapshot_failed",
+                            "verification_blocked": True,
+                            "unresolved": True,
+                        }
+                        for order in orders
+                    ],
+                    "external_orders": [],
+                    "snapshot_error_type": type(exc).__name__,
+                }
+            )
+
+        if account_id is not None and snapshot.account_id != account_id:
+            recovery_plan = []
+            plan = [
+                {
+                    "order_id": str(order.id),
+                    "classification": "unresolved",
+                    "reason": "remote_account_id_mismatch",
+                    "verification_blocked": True,
+                    "unresolved": True,
+                }
+                for order in orders
+            ]
+            external_orders = []
+        else:
+            recovery_plan, external_orders = build_rithmic_recovery_plan(orders, snapshot)
+            plan = [
+                {
+                    "order_id": str(item.order.id),
+                    "client_order_id": item.order.client_order_id,
+                    "classification": item.classification,
+                    "reason": item.reason,
+                    "repair_action": "pending" if item.event is not None else "none",
+                    "verification_blocked": item.verification_blocked,
+                    "unresolved": item.unresolved,
+                }
+                for item in recovery_plan
+            ]
+
+        planned_payload = self._rithmic_recovery_payload(orders, plan, external_orders)
+        if any(item.event is not None for item in recovery_plan):
+            self._write_rithmic_recovery_audit(planned_payload, phase="planned")
+            for item, result in zip(recovery_plan, plan, strict=True):
+                if item.event is None:
+                    continue
+                applied = self.process_exchange_order_event(
+                    item.event,
+                    allow_remote_side_effects=False,
+                )
+                action = str(applied["action"])
+                result["repair_action"] = action
+                if action not in {"applied", "unresolved_remote_actions_suppressed"}:
+                    result["classification"] = "unresolved"
+                    result["reason"] = f"event_application_{action}"
+                    result["verification_blocked"] = True
+                    result["unresolved"] = True
+                else:
+                    result["unresolved"] = (
+                        item.unresolved
+                        or action == "unresolved_remote_actions_suppressed"
+                    )
+
+        ledger_verification = self._verify_rithmic_ledger(
+            orders,
+            snapshot,
+            expected_account_id=account_id,
+        )
+        payload = self._rithmic_recovery_payload(
+            orders,
+            plan,
+            external_orders,
+            ledger_verification,
+        )
+        return self._write_rithmic_recovery_audit(payload, phase="completed")
+
+    def _write_rithmic_identity_failure_audit(
+        self,
+        orders,
+        reason: str,
+        *,
+        identity_failures: dict[str, str] | None = None,
+    ) -> dict[str, object]:
+        return self._write_rithmic_recovery_audit(
+            {
+                "recoverable_count": len(orders),
+                "matched_count": 0,
+                "repaired_count": 0,
+                "external_count": 0,
+                "unresolved_count": max(1, len(orders)),
+                "verification_blocked_count": max(1, len(orders)),
+                "auto_resume_safe": False,
+                "results": [
+                    {
+                        "order_id": str(order.id),
+                        "classification": "unresolved",
+                        "reason": (identity_failures or {}).get(str(order.id), reason),
+                        "verification_blocked": True,
+                        "unresolved": True,
+                    }
+                    for order in orders
+                ],
+                "external_orders": [],
+                "ledger_verification": None,
+            }
+        )
+
+    @staticmethod
+    def _rithmic_order_identity_failure(
+        order,
+        profile: str,
+        account_id: str,
+    ) -> str | None:
+        if not getattr(order, "account_profile", None):
+            return "local_account_profile_missing"
+        if not getattr(order, "account_id", None):
+            return "local_account_id_missing"
+        if order.account_profile != profile:
+            return "local_account_profile_mismatch"
+        if order.account_id != account_id:
+            return "local_account_id_mismatch"
+        return None
+
+    @staticmethod
+    def _rithmic_recovery_payload(
+        orders,
+        plan,
+        external_orders,
+        ledger_verification=None,
+    ) -> dict[str, object]:
+        ledger_blocked = bool(
+            ledger_verification and ledger_verification["verification_blocked"]
+        )
+        external_count = len(external_orders)
+        unresolved_count = sum(bool(result["unresolved"]) for result in plan)
+        verification_blocked_count = sum(
+            bool(result["verification_blocked"]) for result in plan
+        )
+        return {
+            "recoverable_count": len(orders),
+            "matched_count": sum(
+                result["classification"] == "matched" for result in plan
+            ),
+            "repaired_count": sum(
+                result["classification"] in {"repaired", "repaired_partial"}
+                for result in plan
+            ),
+            "external_count": external_count,
+            "unresolved_count": (
+                unresolved_count + int(ledger_blocked) + external_count
+            ),
+            "verification_blocked_count": (
+                verification_blocked_count + int(ledger_blocked) + external_count
+            ),
+            "auto_resume_safe": bool(
+                ledger_verification is not None
+                and not ledger_blocked
+                and unresolved_count == 0
+                and verification_blocked_count == 0
+                and external_count == 0
+            ),
+            "results": plan,
+            "external_orders": external_orders,
+            "ledger_verification": ledger_verification,
+        }
+
+    def _verify_rithmic_ledger(
+        self,
+        orders,
+        snapshot,
+        *,
+        expected_account_id: str | None,
+    ) -> dict[str, object]:
+        account_summary = snapshot.account_summary
+        account_state = (
+            {
+                field: getattr(account_summary, field, None)
+                for field in (
+                    "account_balance",
+                    "cash_on_hand",
+                    "available_buying_power",
+                    "day_pnl",
+                    "net_quantity",
+                    "timestamp_ms",
+                )
+            }
+            if account_summary is not None
+            else None
+        )
+        result = {
+            "account_id": snapshot.account_id,
+            "account_currency": snapshot.account_currency,
+            "account_summary": account_state,
+            "position_drifts": [],
+            "errors": [],
+            "verification_blocked": False,
+        }
+        if not snapshot.account_currency:
+            result["errors"].append("remote_account_currency_missing")
+        if expected_account_id is not None and snapshot.account_id != expected_account_id:
+            result["errors"].append("remote_account_id_mismatch")
+        if account_state is None:
+            result["errors"].append("remote_account_summary_missing")
+        elif not any(value is not None for value in account_state.values()):
+            result["errors"].append("remote_account_summary_empty")
+        if self.local_positions_loader is None:
+            result["errors"].append("local_positions_loader_missing")
+        else:
+            try:
+                result["position_drifts"] = compare_rithmic_positions(
+                    orders,
+                    self.local_positions_loader(),
+                    snapshot.positions,
+                )
+            except Exception as exc:
+                self.logger.error("Rithmic position verification failed: %s", exc)
+                result["errors"].append("position_verification_failed")
+        result["verification_blocked"] = bool(
+            result["errors"] or result["position_drifts"]
+        )
+        return result
+
+    def _write_rithmic_recovery_audit(
+        self,
+        payload: dict[str, object],
+        *,
+        phase: str = "completed",
+    ) -> dict[str, object]:
+        with self._db_session_factory() as db:
+            try:
+                write_system_event(
+                    db,
+                    event_type="reconcile",
+                    event_subtype="rithmic_owned_order_recovery",
+                    payload={**payload, "phase": phase},
+                )
+                db.commit()
+            except Exception:
+                db.rollback()
+                raise
         return payload
 
     def resync_recoverable_order_events(self) -> dict[str, object]:

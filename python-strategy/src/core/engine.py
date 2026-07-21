@@ -134,6 +134,14 @@ class StrategyEngine:
 
         # Use pre-created adapter or build from config
         effective_adapter_config = adapter_config or {"mode": "simulated"}
+        self._rithmic_recovery_profile = effective_adapter_config.get(
+            "rithmic_recovery_profile"
+        )
+        self._rithmic_recovery_account_id = effective_adapter_config.get(
+            "rithmic_recovery_account_id"
+        )
+        self._startup_auto_recovery_allowed = False
+        self._startup_lock_cause: str | None = None
         if adapter is None:
             try:
                 adapter = create_adapter(effective_adapter_config)
@@ -166,6 +174,15 @@ class StrategyEngine:
             journal=journal,
             db_session_factory=self._db_session_factory,
             audit_external_orders=audit_external_orders,
+            account_service=self.account_service,
+            rithmic_account_profile=self._rithmic_recovery_profile,
+            rithmic_account_id=self._rithmic_recovery_account_id,
+        )
+        self._rithmic_recovery_profile = (
+            self.execution_engine.order_manager.rithmic_account_profile
+        )
+        self._rithmic_recovery_account_id = (
+            self.execution_engine.order_manager.rithmic_account_id
         )
         self._lifecycle_adapter = _EngineLifecycleAdapter(self)
         self._health_monitor = HealthMonitor(self._registry)
@@ -225,14 +242,19 @@ class StrategyEngine:
         self._reconcile_balance()
         self._initialize_strategy_state_cache_on_startup()
         self._start_strategy_state_subscriber_on_startup()
-        self._reconcile_recoverable_orders_on_startup()
+        reconciliation = self._reconcile_recoverable_orders_on_startup()
         if persisted_lockdown:
-            with self._ops_command_lock:
-                if self._kill_switch_halted:
-                    self.ops_safety.kill_switch(
-                        actor="startup_recovery",
-                        reason="persisted_lockdown",
-                    )
+            if self._can_auto_resume_after_startup_recovery(reconciliation):
+                self._resume_after_kill_switch()
+                persisted_lockdown = False
+                logger.info("Startup reconciliation passed; submissions resumed automatically")
+            elif self._startup_lock_cause == "explicit_lockdown":
+                with self._ops_command_lock:
+                    if self._kill_switch_halted:
+                        self.ops_safety.kill_switch(
+                            actor="startup_recovery",
+                            reason="persisted_lockdown",
+                        )
         self._start_heartbeat()
         if self._runtime_reconciliation_enabled:
             self._start_runtime_reconciliation()
@@ -250,15 +272,38 @@ class StrategyEngine:
         """Listen for cross-process strategy state updates."""
         self._strategy_state_manager.start_subscriber()
 
-    def _reconcile_recoverable_orders_on_startup(self) -> None:
+    def _reconcile_recoverable_orders_on_startup(self) -> dict | None:
         """Record startup order reconciliation for audited external orders."""
         if not self.execution_engine.audit_external_orders:
-            return
+            return None
 
-        summary = self.execution_engine.reconcile_recoverable_client_orders()
+        try:
+            if self._rithmic_recovery_profile:
+                summary = self.execution_engine.reconcile_rithmic_owned_orders(
+                    self._rithmic_recovery_profile,
+                    self._rithmic_recovery_account_id,
+                )
+            else:
+                summary = self.execution_engine.reconcile_recoverable_client_orders()
+        except Exception:
+            logger.exception("Startup order reconciliation failed")
+            return {
+                "recoverable_count": 0,
+                "unresolved_count": 1,
+                "verification_blocked_count": 1,
+                "auto_resume_safe": False,
+            }
         logger.info(
             "Startup order reconciliation complete: %s recoverable orders",
             summary["recoverable_count"],
+        )
+        return summary
+
+    def _can_auto_resume_after_startup_recovery(self, summary: dict | None) -> bool:
+        return bool(
+            self._startup_auto_recovery_allowed
+            and summary is not None
+            and summary.get("auto_resume_safe") is True
         )
 
     def _start_command_listener(self):
@@ -713,6 +758,19 @@ class StrategyEngine:
             and db_boot == redis_boot
             and db_boot.get("state") == "CLEAN"
         )
+        self._startup_auto_recovery_allowed = bool(
+            not read_failed
+            and boot_marker_persisted
+            and not states_disagree
+            and kill_state_clear
+            and not previous_boot_clean
+        )
+        if SYSTEM_STATE_LOCKDOWN in {db_state, redis_state}:
+            self._startup_lock_cause = "explicit_lockdown"
+        elif self._startup_auto_recovery_allowed:
+            self._startup_lock_cause = "unclean_boot"
+        else:
+            self._startup_lock_cause = "state_verification_failed"
         if (
             read_failed
             or not boot_marker_persisted
@@ -732,6 +790,7 @@ class StrategyEngine:
             return True
 
         self._resume_after_kill_switch()
+        self._startup_lock_cause = None
         logger.info("System State: %s. Proceeding.", state or SYSTEM_STATE_OK)
         return False
 

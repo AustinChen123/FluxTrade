@@ -59,6 +59,8 @@ class Order(Base):
     strategy_id = Column(String, ForeignKey('strategy.id'), nullable=False)
     product_id = Column(String, ForeignKey('product.id'), nullable=False)
     exchange_id = Column(String, ForeignKey('exchange.id'), nullable=False)
+    account_profile = Column(String(128), nullable=True)
+    account_id = Column(String(128), nullable=True)
     type = Column(String, nullable=False)
     side = Column(String, nullable=False)
     price = Column(Numeric, nullable=True)
@@ -78,6 +80,12 @@ class Order(Base):
 
     __table_args__ = (
         UniqueConstraint('exchange_order_id', 'exchange_id', name='uq_order_exchange_id'),
+        CheckConstraint(
+            "(account_profile IS NULL AND account_id IS NULL) OR "
+            "(account_profile IS NOT NULL AND account_id IS NOT NULL AND "
+            "TRIM(account_profile) <> '' AND TRIM(account_id) <> '')",
+            name='chk_order_account_identity_complete',
+        ),
     )
 
 class Trade(Base):

@@ -1,8 +1,11 @@
 use crate::rithmic_ledger::{
-    ledger::{AccountSummarySnapshot, InstrumentPositionSnapshot, OrderSnapshot, TransactionType},
-    ledger_runtime::RemoteLedgerSnapshot,
+    ledger::{
+        AccountSummarySnapshot, FillSnapshot, InstrumentPositionSnapshot, OrderSnapshot,
+        TransactionType,
+    },
+    ledger_runtime::{RecoveryQuery, RemoteLedgerSnapshot},
 };
-use pyo3::{exceptions::PyRuntimeError, prelude::*};
+use pyo3::{exceptions::PyRuntimeError, exceptions::PyValueError, prelude::*};
 use std::sync::Mutex;
 
 // Recovery snapshots are low frequency. Use per-profile locks only if concurrent
@@ -57,6 +60,33 @@ pub struct PyLedgerPosition {
     pub timestamp_ms: Option<i64>,
 }
 
+#[pyclass(frozen, name = "RithmicLedgerFill")]
+#[derive(Clone)]
+pub struct PyLedgerFill {
+    #[pyo3(get)]
+    pub basket_id: String,
+    #[pyo3(get)]
+    pub exchange_order_id: Option<String>,
+    #[pyo3(get)]
+    pub fill_id: String,
+    #[pyo3(get)]
+    pub exchange: String,
+    #[pyo3(get)]
+    pub symbol: String,
+    #[pyo3(get)]
+    pub transaction_type: String,
+    #[pyo3(get)]
+    pub fill_quantity: String,
+    #[pyo3(get)]
+    pub fill_price: String,
+    #[pyo3(get)]
+    pub cumulative_filled_quantity: Option<String>,
+    #[pyo3(get)]
+    pub cumulative_average_price: Option<String>,
+    #[pyo3(get)]
+    pub timestamp_ms: Option<i64>,
+}
+
 #[pyclass(frozen, name = "RithmicLedgerAccountSummary")]
 #[derive(Clone)]
 pub struct PyLedgerAccountSummary {
@@ -81,6 +111,8 @@ pub struct PyLedgerSnapshot {
     #[pyo3(get)]
     pub account_currency: Option<String>,
     orders: Vec<PyLedgerOrder>,
+    order_history: Vec<PyLedgerOrder>,
+    fills: Vec<PyLedgerFill>,
     positions: Vec<PyLedgerPosition>,
     account_summary: Option<PyLedgerAccountSummary>,
 }
@@ -90,6 +122,16 @@ impl PyLedgerSnapshot {
     #[getter]
     fn orders(&self) -> Vec<PyLedgerOrder> {
         self.orders.clone()
+    }
+
+    #[getter]
+    fn order_history(&self) -> Vec<PyLedgerOrder> {
+        self.order_history.clone()
+    }
+
+    #[getter]
+    fn fills(&self) -> Vec<PyLedgerFill> {
+        self.fills.clone()
     }
 
     #[getter]
@@ -104,12 +146,32 @@ impl PyLedgerSnapshot {
 }
 
 #[pyfunction]
-#[pyo3(signature = (profile, account_id=None))]
+#[pyo3(signature = (profile, account_id=None, *, recovery_basket_ids=None, fill_start_index=None, fill_finish_index=None))]
 pub fn rithmic_ledger_snapshot(
     py: Python<'_>,
     profile: &str,
     account_id: Option<&str>,
+    recovery_basket_ids: Option<Vec<String>>,
+    fill_start_index: Option<i32>,
+    fill_finish_index: Option<i32>,
 ) -> PyResult<PyLedgerSnapshot> {
+    let recovery = match (
+        recovery_basket_ids.as_ref(),
+        fill_start_index,
+        fill_finish_index,
+    ) {
+        (None, None, None) => None,
+        (Some(basket_ids), Some(start), Some(finish)) => Some(RecoveryQuery {
+            basket_ids,
+            fill_start_index: start,
+            fill_finish_index: finish,
+        }),
+        _ => {
+            return Err(PyValueError::new_err(
+                "recovery_basket_ids, fill_start_index, and fill_finish_index must be provided together",
+            ));
+        }
+    };
     let _ = rustls::crypto::ring::default_provider().install_default();
     py.allow_threads(|| {
         let _guard = SNAPSHOT_LOCK
@@ -119,12 +181,19 @@ pub fn rithmic_ledger_snapshot(
             .enable_all()
             .build()
             .map_err(runtime_error)?;
-        runtime
-            .block_on(crate::rithmic_ledger::ledger_runtime::run(
+        let snapshot = match recovery {
+            Some(recovery) => {
+                runtime.block_on(crate::rithmic_ledger::ledger_runtime::run_with_recovery(
+                    profile,
+                    account_id,
+                    Some(recovery),
+                ))
+            }
+            None => runtime.block_on(crate::rithmic_ledger::ledger_runtime::run(
                 profile, account_id,
-            ))
-            .map(PyLedgerSnapshot::from)
-            .map_err(runtime_error)
+            )),
+        };
+        snapshot.map(PyLedgerSnapshot::from).map_err(runtime_error)
     })
 }
 
@@ -138,12 +207,38 @@ impl From<RemoteLedgerSnapshot> for PyLedgerSnapshot {
                 .into_iter()
                 .map(PyLedgerOrder::from)
                 .collect(),
+            order_history: snapshot
+                .order_history
+                .into_iter()
+                .map(PyLedgerOrder::from)
+                .collect(),
+            fills: snapshot.fills.into_iter().map(PyLedgerFill::from).collect(),
             positions: snapshot
                 .positions
                 .into_iter()
                 .map(PyLedgerPosition::from)
                 .collect(),
             account_summary: snapshot.account_summary.map(PyLedgerAccountSummary::from),
+        }
+    }
+}
+
+impl From<FillSnapshot> for PyLedgerFill {
+    fn from(fill: FillSnapshot) -> Self {
+        Self {
+            basket_id: fill.basket_id,
+            exchange_order_id: fill.exchange_order_id,
+            fill_id: fill.fill_id,
+            exchange: fill.exchange,
+            symbol: fill.symbol,
+            transaction_type: fill.transaction_type,
+            fill_quantity: fill.fill_quantity.to_string(),
+            fill_price: fill.fill_price.to_string(),
+            cumulative_filled_quantity: fill
+                .cumulative_filled_quantity
+                .map(|value| value.to_string()),
+            cumulative_average_price: fill.cumulative_average_price.map(|value| value.to_string()),
+            timestamp_ms: fill.timestamp_ms,
         }
     }
 }
@@ -246,6 +341,21 @@ mod tests {
                 average_fill_price: Some(dec!(20000.25)),
                 timestamp_ms: Some(1_700_000_000_123),
             }],
+            order_history: Vec::new(),
+            fills: vec![FillSnapshot {
+                account: account.clone(),
+                basket_id: "BASKET".to_string(),
+                exchange_order_id: Some("EXCHANGE".to_string()),
+                fill_id: "FILL".to_string(),
+                exchange: "CME".to_string(),
+                symbol: "NQU6".to_string(),
+                transaction_type: "BUY".to_string(),
+                fill_quantity: dec!(1),
+                fill_price: dec!(20000.25),
+                cumulative_filled_quantity: Some(dec!(1)),
+                cumulative_average_price: Some(dec!(20000.25)),
+                timestamp_ms: Some(1_700_000_000_123),
+            }],
             positions: vec![InstrumentPositionSnapshot {
                 account: account.clone(),
                 exchange: "CME".to_string(),
@@ -272,6 +382,9 @@ mod tests {
         assert_eq!(snapshot.orders[0].client_order_id, None);
         assert_eq!(snapshot.orders[0].basket_id, "BASKET");
         assert_eq!(snapshot.orders[0].transaction_type, "SHORT_SELL");
+        assert_eq!(snapshot.fills[0].fill_quantity, "1");
+        assert_eq!(snapshot.fills[0].fill_price, "20000.25");
+        assert_eq!(snapshot.fills[0].transaction_type, "BUY");
         assert_eq!(
             snapshot.orders[0].average_fill_price.as_deref(),
             Some("20000.25")

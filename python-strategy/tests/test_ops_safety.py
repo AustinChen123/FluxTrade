@@ -942,6 +942,8 @@ class TestFlattenPosition:
                         strategy_id VARCHAR NOT NULL REFERENCES strategy(id),
                         product_id VARCHAR NOT NULL REFERENCES product(id),
                         exchange_id VARCHAR NOT NULL REFERENCES exchange(id),
+                        account_profile VARCHAR(128),
+                        account_id VARCHAR(128),
                         type VARCHAR NOT NULL,
                         side VARCHAR NOT NULL,
                         price NUMERIC,

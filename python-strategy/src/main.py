@@ -109,7 +109,7 @@ def _adapter_config_from_env() -> dict:
     if margin_mode:
         account_initialization["margin_mode"] = margin_mode
 
-    return {
+    config = {
         "mode": "live",
         "exchange": os.getenv("EXCHANGE_ID", "binance"),
         "api_key": os.getenv("EXCHANGE_API_KEY"),
@@ -119,6 +119,13 @@ def _adapter_config_from_env() -> dict:
         "instrument_product_ids": product_ids,
         "account_initialization": account_initialization,
     }
+    rithmic_profile = (os.getenv("RITHMIC_RECOVERY_PROFILE") or "").strip()
+    account_id = (os.getenv("RITHMIC_ACCOUNT_ID") or "").strip()
+    if rithmic_profile:
+        config["rithmic_recovery_profile"] = rithmic_profile
+    if account_id:
+        config["rithmic_recovery_account_id"] = account_id
+    return config
 
 
 def _validate_runtime_config(adapter_config: dict, *, audit_external_orders: bool) -> None:
@@ -127,6 +134,14 @@ def _validate_runtime_config(adapter_config: dict, *, audit_external_orders: boo
             "live_adapter_requires_audit_external_orders: "
             "set AUDIT_EXTERNAL_ORDERS=true for live trading"
         )
+    if adapter_config.get("rithmic_recovery_profile") and not adapter_config.get(
+        "rithmic_recovery_account_id"
+    ):
+        raise ValueError("rithmic_recovery_requires_account_id")
+    if adapter_config.get("rithmic_recovery_account_id") and not adapter_config.get(
+        "rithmic_recovery_profile"
+    ):
+        raise ValueError("rithmic_account_id_requires_recovery_profile")
 
 
 @contextmanager
