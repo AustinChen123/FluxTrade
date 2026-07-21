@@ -9,6 +9,7 @@ use super::{
 };
 use anyhow::{bail, ensure, Context, Result};
 use std::{
+    future::Future,
     sync::{
         atomic::{AtomicBool, AtomicU64, Ordering},
         mpsc as std_mpsc, Arc,
@@ -50,6 +51,12 @@ enum Command {
     Shutdown,
 }
 
+impl Command {
+    fn is_submission(&self) -> bool {
+        matches!(self, Self::Submit { .. })
+    }
+}
+
 enum Pending {
     Submit {
         request_key: String,
@@ -80,6 +87,10 @@ pub(crate) struct OrderRuntimeHandle {
     commands: mpsc::Sender<Command>,
     events: std_mpsc::Receiver<Result<OrderEvent>>,
     connected: Arc<AtomicBool>,
+    // Monotonic counter incremented on every successful (re)connect. Lets the
+    // Python owned-order recovery detect a reconnect without missing a fast
+    // disconnect/reconnect flap the way a momentary `connected` bool would.
+    generation: Arc<AtomicU64>,
     thread: Option<JoinHandle<()>>,
 }
 
@@ -91,6 +102,8 @@ impl OrderRuntimeHandle {
         let (ready_tx, ready_rx) = std_mpsc::sync_channel(1);
         let connected = Arc::new(AtomicBool::new(false));
         let thread_connected = Arc::clone(&connected);
+        let generation = Arc::new(AtomicU64::new(0));
+        let thread_generation = Arc::clone(&generation);
         let thread = thread::Builder::new()
             .name("rithmic-order-runtime".to_string())
             .spawn(move || {
@@ -105,6 +118,7 @@ impl OrderRuntimeHandle {
                         command_rx,
                         event_tx,
                         thread_connected,
+                        thread_generation,
                         ready_tx,
                     )),
                     Err(error) => {
@@ -130,12 +144,19 @@ impl OrderRuntimeHandle {
             commands: command_tx,
             events: event_rx,
             connected,
+            generation,
             thread: Some(thread),
         })
     }
 
     pub(crate) fn is_connected(&self) -> bool {
         self.connected.load(Ordering::Acquire)
+    }
+
+    /// Number of successful (re)connects so far. A strictly increasing value
+    /// between two observations means the session reconnected in between.
+    pub(crate) fn connection_generation(&self) -> u64 {
+        self.generation.load(Ordering::Acquire)
     }
 
     pub(crate) fn submit(&self, order: NewOrder) -> Result<OrderAck> {
@@ -201,26 +222,66 @@ impl Drop for OrderRuntimeHandle {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn run(
     profile: String,
     account_id: Option<String>,
     _lease: ProfileLease,
+    commands: mpsc::Receiver<Command>,
+    events: std_mpsc::Sender<Result<OrderEvent>>,
+    connected: Arc<AtomicBool>,
+    generation: Arc<AtomicU64>,
+    ready: Reply<()>,
+) {
+    run_with_connector(
+        _lease,
+        commands,
+        events,
+        connected,
+        generation,
+        ready,
+        move || {
+            let profile = profile.clone();
+            let account_id = account_id.clone();
+            async move { connect_and_prepare(&profile, account_id.as_deref()).await }
+        },
+    )
+    .await;
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn run_with_connector<C, F>(
+    _lease: ProfileLease,
     mut commands: mpsc::Receiver<Command>,
     events: std_mpsc::Sender<Result<OrderEvent>>,
     connected: Arc<AtomicBool>,
+    generation: Arc<AtomicU64>,
     ready: Reply<()>,
-) {
+    mut connect: C,
+) where
+    C: FnMut() -> F,
+    F: Future<Output = Result<(RithmicConnection, AccountIdentity, Vec<TradeRoute>)>>,
+{
     let mut ready = Some(ready);
     let mut backoff = RECONNECT_INITIAL;
     loop {
-        match connect_and_prepare(&profile, account_id.as_deref()).await {
+        match connect().await {
             Ok((mut connection, account, routes)) => {
                 connected.store(true, Ordering::Release);
+                let submissions_allowed = generation.fetch_add(1, Ordering::Release) == 0;
                 backoff = RECONNECT_INITIAL;
                 if let Some(ready) = ready.take() {
                     let _ = ready.send(Ok(()));
                 }
-                if !run_connected(&mut connection, &account, &routes, &mut commands, &events).await
+                if !run_connected(
+                    &mut connection,
+                    &account,
+                    &routes,
+                    &mut commands,
+                    &events,
+                    submissions_allowed,
+                )
+                .await
                 {
                     connected.store(false, Ordering::Release);
                     return;
@@ -255,6 +316,13 @@ async fn connect_and_prepare(
     account_id: Option<&str>,
 ) -> Result<(RithmicConnection, AccountIdentity, Vec<TradeRoute>)> {
     let runtime = config::load(profile, Plant::Order)?;
+    connect_and_prepare_runtime(runtime, account_id).await
+}
+
+async fn connect_and_prepare_runtime(
+    runtime: config::RuntimeConfig,
+    account_id: Option<&str>,
+) -> Result<(RithmicConnection, AccountIdentity, Vec<TradeRoute>)> {
     let mut connection = transport::connect(&runtime.url, runtime.login, RESPONSE_TIMEOUT).await?;
     wait_for_heartbeat(&mut connection, "ORDER").await?;
     let account = discover_order_account(&mut connection, account_id)
@@ -299,6 +367,7 @@ async fn run_connected(
     routes: &[TradeRoute],
     commands: &mut mpsc::Receiver<Command>,
     events: &std_mpsc::Sender<Result<OrderEvent>>,
+    submissions_allowed: bool,
 ) -> bool {
     let sequence = AtomicU64::new(1);
     let mut pending = None;
@@ -310,6 +379,13 @@ async fn run_connected(
                     return false;
                 }
                 Some(command) => {
+                    if !submissions_allowed && command.is_submission() {
+                        reject_command(
+                            command,
+                            "Rithmic order submission is blocked until reconciliation",
+                        );
+                        continue;
+                    }
                     if pending.is_some() {
                         reject_command(command, "Rithmic order runtime is busy");
                         continue;
@@ -774,9 +850,289 @@ fn validate_lookup_identity(client_order_id: &str, exchange: &str, symbol: &str)
 #[cfg(test)]
 mod tests {
     use super::super::ledger::TransactionType;
-    use super::super::{codec, protocol};
+    use super::super::{codec, config::RuntimeConfig, protocol, session::LoginParameters};
     use super::*;
+    use futures_util::{SinkExt, StreamExt};
     use rust_decimal_macros::dec;
+    use tokio::net::{TcpListener, TcpStream};
+    use tokio::time::timeout;
+    use tokio_tungstenite::{accept_async, tungstenite::protocol::Message, WebSocketStream};
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn reconnect_increments_generation_after_full_order_startup() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("ws://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move {
+            let mut unexpected_template = None;
+            for attempt in 0..2 {
+                let mut socket = serve_order_startup(&listener).await;
+                if attempt == 0 {
+                    drop(socket);
+                } else if let Ok(Some(Ok(Message::Binary(payload)))) =
+                    timeout(Duration::from_secs(2), socket.next()).await
+                {
+                    unexpected_template = Some(codec::template_id(&payload).unwrap());
+                }
+            }
+            unexpected_template
+        });
+
+        let login = LoginParameters::new(
+            "test-user".to_string(),
+            "test-password".to_string(),
+            "test-system".to_string(),
+            "FluxTrade".to_string(),
+            "0.1.0".to_string(),
+            Plant::Order,
+        )
+        .unwrap();
+        let (command_tx, command_rx) = mpsc::channel(1);
+        let (event_tx, _event_rx) = std_mpsc::channel();
+        let connected = Arc::new(AtomicBool::new(false));
+        let generation = Arc::new(AtomicU64::new(0));
+        let (ready_tx, _ready_rx) = std_mpsc::sync_channel(1);
+        let lease = ProfileLease::acquire("order-generation-loopback").unwrap();
+        let runtime_generation = Arc::clone(&generation);
+        let runtime = tokio::spawn(run_with_connector(
+            lease,
+            command_rx,
+            event_tx,
+            Arc::clone(&connected),
+            runtime_generation,
+            ready_tx,
+            move || {
+                let runtime = RuntimeConfig {
+                    url: url.clone(),
+                    login: login.clone(),
+                };
+                async move { connect_and_prepare_runtime(runtime, Some("ACCOUNT")).await }
+            },
+        ));
+
+        timeout(Duration::from_secs(4), async {
+            while generation.load(Ordering::Acquire) < 2 {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+
+        let (submit_tx, submit_rx) = std_mpsc::sync_channel(1);
+        command_tx
+            .send(Command::Submit {
+                order: NewOrder {
+                    client_order_id: "blocked-after-reconnect".to_string(),
+                    ..test_order()
+                },
+                deadline: Instant::now() + COMMAND_TIMEOUT,
+                reply: submit_tx,
+            })
+            .await
+            .unwrap();
+        let error = submit_rx
+            .recv_timeout(Duration::from_secs(1))
+            .unwrap()
+            .unwrap_err();
+        assert!(error.to_string().contains("blocked until reconciliation"));
+
+        command_tx.send(Command::Shutdown).await.unwrap();
+        timeout(Duration::from_secs(2), runtime)
+            .await
+            .unwrap()
+            .unwrap();
+        let unexpected_template = server.await.unwrap();
+
+        assert_eq!(generation.load(Ordering::Acquire), 2);
+        assert!(!connected.load(Ordering::Acquire));
+        assert_eq!(unexpected_template, None);
+    }
+
+    #[test]
+    fn reconnect_gate_blocks_only_submit_commands() {
+        let (submit_tx, _) = std_mpsc::sync_channel(1);
+        let (cancel_tx, _) = std_mpsc::sync_channel(1);
+        let (lookup_tx, _) = std_mpsc::sync_channel(1);
+        let commands = [
+            Command::Submit {
+                order: test_order(),
+                deadline: Instant::now() + COMMAND_TIMEOUT,
+                reply: submit_tx,
+            },
+            Command::Cancel {
+                basket_id: "basket-1".to_string(),
+                deadline: Instant::now() + COMMAND_TIMEOUT,
+                reply: cancel_tx,
+            },
+            Command::Lookup {
+                client_order_id: "client-1".to_string(),
+                exchange: "CME".to_string(),
+                symbol: "NQU6".to_string(),
+                deadline: Instant::now() + COMMAND_TIMEOUT,
+                reply: lookup_tx,
+            },
+            Command::Shutdown,
+        ];
+
+        assert_eq!(
+            commands.map(|command| command.is_submission()),
+            [true, false, false, false]
+        );
+    }
+
+    async fn serve_order_startup(listener: &TcpListener) -> WebSocketStream<TcpStream> {
+        let mut socket = serve_handshake(listener).await;
+        send(&mut socket, heartbeat_response()).await;
+
+        assert_template(socket.next().await.unwrap().unwrap(), 300);
+        send(
+            &mut socket,
+            codec::encode(&protocol::ResponseLoginInfo {
+                template_id: 301,
+                user_msg: vec!["fluxtrade-ledger-login".to_string()],
+                rp_code: vec!["0".to_string()],
+                fcm_id: Some("FCM".to_string()),
+                ib_id: Some("IB".to_string()),
+                user_type: Some(3),
+                ..Default::default()
+            })
+            .unwrap(),
+        )
+        .await;
+
+        assert_template(socket.next().await.unwrap().unwrap(), 302);
+        send(
+            &mut socket,
+            codec::encode(&protocol::ResponseAccountList {
+                template_id: 303,
+                user_msg: vec!["fluxtrade-ledger-accounts".to_string()],
+                rq_handler_rp_code: vec!["0".to_string()],
+                fcm_id: Some("FCM".to_string()),
+                ib_id: Some("IB".to_string()),
+                account_id: Some("ACCOUNT".to_string()),
+                ..Default::default()
+            })
+            .unwrap(),
+        )
+        .await;
+        send(
+            &mut socket,
+            codec::encode(&protocol::ResponseAccountList {
+                template_id: 303,
+                user_msg: vec!["fluxtrade-ledger-accounts".to_string()],
+                rp_code: vec!["0".to_string()],
+                ..Default::default()
+            })
+            .unwrap(),
+        )
+        .await;
+
+        assert_template(socket.next().await.unwrap().unwrap(), 310);
+        send(
+            &mut socket,
+            codec::encode(&protocol::ResponseTradeRoutes {
+                template_id: 311,
+                user_msg: vec![TRADE_ROUTES_KEY.to_string()],
+                rq_handler_rp_code: vec!["0".to_string()],
+                exchange: Some("CME".to_string()),
+                trade_route: Some("route".to_string()),
+                status: Some("open".to_string()),
+                is_default: Some(true),
+                ..Default::default()
+            })
+            .unwrap(),
+        )
+        .await;
+        send(
+            &mut socket,
+            codec::encode(&protocol::ResponseTradeRoutes {
+                template_id: 311,
+                user_msg: vec![TRADE_ROUTES_KEY.to_string()],
+                rp_code: vec!["0".to_string()],
+                ..Default::default()
+            })
+            .unwrap(),
+        )
+        .await;
+
+        assert_template(socket.next().await.unwrap().unwrap(), 308);
+        send(
+            &mut socket,
+            codec::encode(&protocol::ResponseSubscribeForOrderUpdates {
+                template_id: 309,
+                user_msg: vec![SUBSCRIBE_KEY.to_string()],
+                rp_code: vec!["0".to_string()],
+            })
+            .unwrap(),
+        )
+        .await;
+        socket
+    }
+
+    async fn serve_handshake(listener: &TcpListener) -> WebSocketStream<TcpStream> {
+        let (stream, _) = listener.accept().await.unwrap();
+        let mut discovery = accept_async(stream).await.unwrap();
+        assert_template(discovery.next().await.unwrap().unwrap(), 16);
+        send(
+            &mut discovery,
+            codec::encode(&protocol::ResponseRithmicSystemInfo {
+                template_id: 17,
+                rp_code: vec!["0".to_string()],
+                system_name: vec!["test-system".to_string()],
+                ..Default::default()
+            })
+            .unwrap(),
+        )
+        .await;
+
+        let (stream, _) = listener.accept().await.unwrap();
+        let mut login = accept_async(stream).await.unwrap();
+        assert_template(login.next().await.unwrap().unwrap(), 10);
+        send(
+            &mut login,
+            codec::encode(&protocol::ResponseLogin {
+                template_id: 11,
+                rp_code: vec!["0".to_string()],
+                heartbeat_interval: Some(30.0),
+                ..Default::default()
+            })
+            .unwrap(),
+        )
+        .await;
+        assert_template(login.next().await.unwrap().unwrap(), 18);
+        login
+    }
+
+    fn heartbeat_response() -> Vec<u8> {
+        codec::encode(&protocol::ResponseHeartbeat {
+            template_id: 19,
+            rp_code: vec!["0".to_string()],
+            ..Default::default()
+        })
+        .unwrap()
+    }
+
+    async fn send(socket: &mut WebSocketStream<TcpStream>, payload: Vec<u8>) {
+        socket.send(Message::Binary(payload.into())).await.unwrap();
+    }
+
+    fn assert_template(message: Message, expected: i32) {
+        let Message::Binary(payload) = message else {
+            panic!("expected binary Rithmic message");
+        };
+        assert_eq!(codec::template_id(&payload).unwrap(), expected);
+    }
+
+    fn test_order() -> NewOrder {
+        NewOrder {
+            client_order_id: "client-1".to_string(),
+            exchange: "CME".to_string(),
+            symbol: "NQU6".to_string(),
+            quantity: dec!(1),
+            price: Some(dec!(20000.25)),
+            side: order::OrderSide::Buy,
+            order_type: order::OrderType::Limit,
+        }
+    }
 
     fn route(exchange: &str, name: &str, is_default: bool) -> TradeRoute {
         TradeRoute {

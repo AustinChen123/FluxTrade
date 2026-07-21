@@ -102,6 +102,13 @@ impl PyOrderClient {
         Ok(self.lock_runtime()?.is_connected())
     }
 
+    /// Successful (re)connect count. A strictly higher value than a previously
+    /// observed one means the order session reconnected in between, which the
+    /// engine uses to trigger owned-order reconciliation.
+    fn connection_generation(&self) -> PyResult<u64> {
+        Ok(self.lock_runtime()?.connection_generation())
+    }
+
     #[allow(clippy::too_many_arguments)]
     #[pyo3(signature = (client_order_id, exchange, symbol, quantity, side, order_type, price=None))]
     fn submit(
