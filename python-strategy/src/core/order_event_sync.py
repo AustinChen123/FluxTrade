@@ -243,6 +243,8 @@ class OrderEventApplier:
                 event.client_order_id
             )
             if order is not None:
+                if order.product_id != event.product_id:
+                    return None
                 return order
         if event.exchange_order_id:
             exchange_id = self._exchange_id_for_order_event(event)
