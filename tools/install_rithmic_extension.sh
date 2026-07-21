@@ -29,6 +29,7 @@ import fluxtrade_core
 required = (
     "rithmic_ledger_snapshot",
     "RithmicLedgerOrder",
+    "RithmicLedgerFill",
     "RithmicLedgerPosition",
     "RithmicLedgerAccountSummary",
     "RithmicLedgerSnapshot",

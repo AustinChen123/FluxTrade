@@ -9,7 +9,11 @@ const ACCOUNT_LIST_REQUEST: i32 = 302;
 const ACCOUNT_LIST_RESPONSE: i32 = 303;
 const SHOW_ORDERS_REQUEST: i32 = 320;
 const SHOW_ORDERS_RESPONSE: i32 = 321;
+const SHOW_ORDER_HISTORY_REQUEST: i32 = 322;
+const SHOW_ORDER_HISTORY_RESPONSE: i32 = 323;
 const EXCHANGE_ORDER_NOTIFICATION: i32 = 352;
+const SHOW_FILL_HISTORY_REQUEST: i32 = 3512;
+const SHOW_FILL_HISTORY_RESPONSE: i32 = 3513;
 const PNL_POSITION_SNAPSHOT_REQUEST: i32 = 402;
 const PNL_POSITION_SNAPSHOT_RESPONSE: i32 = 403;
 const INSTRUMENT_PNL_POSITION_UPDATE: i32 = 450;
@@ -98,6 +102,34 @@ pub(crate) struct OrderSnapshot {
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) enum OrderSnapshotEvent {
     Snapshot(Box<OrderSnapshot>),
+    RequestCompleted,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum OrderHistoryEvent {
+    Notification(Box<OrderSnapshot>),
+    RequestCompleted,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) struct FillSnapshot {
+    pub(crate) account: AccountIdentity,
+    pub(crate) basket_id: String,
+    pub(crate) exchange_order_id: Option<String>,
+    pub(crate) fill_id: String,
+    pub(crate) exchange: String,
+    pub(crate) symbol: String,
+    pub(crate) transaction_type: String,
+    pub(crate) fill_quantity: Decimal,
+    pub(crate) fill_price: Decimal,
+    pub(crate) cumulative_filled_quantity: Option<Decimal>,
+    pub(crate) cumulative_average_price: Option<Decimal>,
+    pub(crate) timestamp_ms: Option<i64>,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum FillHistoryEvent {
+    Fill(Box<FillSnapshot>),
     RequestCompleted,
 }
 
@@ -226,40 +258,174 @@ pub(crate) fn decode_order_snapshot_event(
         }
         EXCHANGE_ORDER_NOTIFICATION => {
             let response: protocol::ExchangeOrderNotification = codec::decode(payload)?;
-            ensure!(
-                response.is_snapshot == Some(true),
-                "Rithmic order response is not a snapshot"
-            );
-            let account = account_identity(response.fcm_id, response.ib_id, response.account_id)?;
-            ensure!(
-                account == *expected_account,
-                "Rithmic order snapshot account mismatch"
-            );
-            let quantity = positive_quantity(response.quantity, "order quantity")?;
-            Ok(OrderSnapshotEvent::Snapshot(Box::new(OrderSnapshot {
-                account,
-                client_order_id: optional_text(response.user_tag),
-                basket_id: required_text(response.basket_id, "basket_id")?,
-                exchange_order_id: optional_text(response.exchange_order_id),
-                exchange: required_text(response.exchange, "exchange")?,
-                symbol: required_text(response.symbol, "symbol")?,
-                status: required_text(response.status, "status")?,
-                transaction_type: transaction_type(response.transaction_type)?,
-                quantity,
-                filled_quantity: optional_quantity(response.total_fill_size, "total_fill_size")?,
-                unfilled_quantity: optional_quantity(
-                    response.total_unfilled_size,
-                    "total_unfilled_size",
-                )?,
-                average_fill_price: optional_nonnegative_decimal(
-                    response.avg_fill_price,
-                    "average fill price",
-                )?,
-                timestamp_ms: optional_epoch_millis(response.ssboe, response.usecs)?,
-            })))
+            Ok(OrderSnapshotEvent::Snapshot(Box::new(
+                order_snapshot_from_notification(response, expected_account, true)?,
+            )))
         }
         template_id => anyhow::bail!("unsupported Rithmic order snapshot template {template_id}"),
     }
+}
+
+fn order_snapshot_from_notification(
+    response: protocol::ExchangeOrderNotification,
+    expected_account: &AccountIdentity,
+    require_snapshot: bool,
+) -> Result<OrderSnapshot> {
+    if require_snapshot {
+        ensure!(
+            response.is_snapshot == Some(true),
+            "Rithmic order response is not a snapshot"
+        );
+    }
+    let account = account_identity(response.fcm_id, response.ib_id, response.account_id)?;
+    ensure!(
+        account == *expected_account,
+        "Rithmic order response account mismatch"
+    );
+    Ok(OrderSnapshot {
+        account,
+        client_order_id: optional_text(response.user_tag),
+        basket_id: required_text(response.basket_id, "basket_id")?,
+        exchange_order_id: optional_text(response.exchange_order_id),
+        exchange: required_text(response.exchange, "exchange")?,
+        symbol: required_text(response.symbol, "symbol")?,
+        status: required_text(response.status, "status")?,
+        transaction_type: transaction_type(response.transaction_type)?,
+        quantity: positive_quantity(response.quantity, "order quantity")?,
+        filled_quantity: optional_quantity(response.total_fill_size, "total_fill_size")?,
+        unfilled_quantity: optional_quantity(response.total_unfilled_size, "total_unfilled_size")?,
+        average_fill_price: optional_nonnegative_decimal(
+            response.avg_fill_price,
+            "average fill price",
+        )?,
+        timestamp_ms: optional_epoch_millis(response.ssboe, response.usecs)?,
+    })
+}
+
+pub(crate) fn show_order_history_request(
+    request_key: &str,
+    account: &AccountIdentity,
+    basket_id: &str,
+) -> Result<Vec<u8>> {
+    validate_request_key(request_key)?;
+    validate_account(account)?;
+    let basket_id = required_text(Some(basket_id.to_string()), "basket_id")?;
+    codec::encode(&protocol::RequestShowOrderHistory {
+        template_id: SHOW_ORDER_HISTORY_REQUEST,
+        user_msg: vec![request_key.to_string()],
+        fcm_id: Some(account.fcm_id.clone()),
+        ib_id: Some(account.ib_id.clone()),
+        account_id: Some(account.account_id.clone()),
+        basket_id: Some(basket_id),
+    })
+}
+
+pub(crate) fn decode_order_history_event(
+    payload: &[u8],
+    request_key: &str,
+    expected_account: &AccountIdentity,
+    expected_basket_id: &str,
+) -> Result<OrderHistoryEvent> {
+    validate_request_key(request_key)?;
+    validate_account(expected_account)?;
+    match codec::template_id(payload)? {
+        SHOW_ORDER_HISTORY_RESPONSE => {
+            let response: protocol::ResponseShowOrderHistory = codec::decode(payload)?;
+            ensure_request_key(&response.user_msg, request_key)?;
+            ensure_success(&response.rp_code)?;
+            Ok(OrderHistoryEvent::RequestCompleted)
+        }
+        EXCHANGE_ORDER_NOTIFICATION => {
+            let response: protocol::ExchangeOrderNotification = codec::decode(payload)?;
+            let order = order_snapshot_from_notification(response, expected_account, false)?;
+            ensure!(
+                order.basket_id == expected_basket_id,
+                "Rithmic order-history basket ID mismatch"
+            );
+            Ok(OrderHistoryEvent::Notification(Box::new(order)))
+        }
+        template_id => anyhow::bail!("unsupported Rithmic order-history template {template_id}"),
+    }
+}
+
+pub(crate) fn show_fill_history_request(
+    request_key: &str,
+    account: &AccountIdentity,
+    start_index: i32,
+    finish_index: i32,
+    max_record_count: i32,
+) -> Result<Vec<u8>> {
+    validate_request_key(request_key)?;
+    validate_account(account)?;
+    ensure!(start_index >= 0, "invalid Rithmic fill-history start index");
+    ensure!(
+        finish_index >= start_index,
+        "invalid Rithmic fill-history finish index"
+    );
+    ensure!(
+        (1..=10_000).contains(&max_record_count),
+        "invalid Rithmic fill-history max record count"
+    );
+    codec::encode(&protocol::RequestShowFillHistory {
+        template_id: SHOW_FILL_HISTORY_REQUEST,
+        user_msg: vec![request_key.to_string()],
+        fcm_id: Some(account.fcm_id.clone()),
+        ib_id: Some(account.ib_id.clone()),
+        account_id: Some(account.account_id.clone()),
+        index_format: Some("ssboe".to_string()),
+        start_index: Some(start_index),
+        finish_index: Some(finish_index),
+        max_record_count: Some(max_record_count),
+    })
+}
+
+pub(crate) fn decode_fill_history_event(
+    payload: &[u8],
+    request_key: &str,
+    expected_account: &AccountIdentity,
+) -> Result<FillHistoryEvent> {
+    validate_request_key(request_key)?;
+    validate_account(expected_account)?;
+    ensure_template(payload, SHOW_FILL_HISTORY_RESPONSE)?;
+    let response: protocol::ResponseShowFillHistory = codec::decode(payload)?;
+    ensure_request_key(&response.user_msg, request_key)?;
+
+    if !response.rp_code.is_empty() {
+        ensure!(
+            response.rq_handler_rp_code.is_empty(),
+            "Rithmic fill-history response has conflicting status codes"
+        );
+        ensure_success(&response.rp_code)?;
+        return Ok(FillHistoryEvent::RequestCompleted);
+    }
+    ensure_processing(&response.rq_handler_rp_code, "fill-history")?;
+    let account = account_identity(response.fcm_id, response.ib_id, response.account_id)?;
+    ensure!(
+        account == *expected_account,
+        "Rithmic fill-history account mismatch"
+    );
+    let fill_quantity = positive_u64_quantity(response.fill_size, "fill_size")?;
+    let fill_price = required_nonnegative_decimal(response.fill_price, "fill price")?;
+    Ok(FillHistoryEvent::Fill(Box::new(FillSnapshot {
+        account,
+        basket_id: required_text(response.basket_id, "basket_id")?,
+        exchange_order_id: optional_text(response.exchange_order_id),
+        fill_id: required_text(response.fill_id, "fill_id")?,
+        exchange: required_text(response.exchange, "exchange")?,
+        symbol: required_text(response.symbol, "symbol")?,
+        transaction_type: required_text(response.transaction_type, "transaction_type")?,
+        fill_quantity,
+        fill_price,
+        cumulative_filled_quantity: optional_u64_quantity(
+            response.total_fill_size,
+            "total_fill_size",
+        )?,
+        cumulative_average_price: optional_nonnegative_decimal(
+            response.avg_fill_price,
+            "average fill price",
+        )?,
+        timestamp_ms: optional_epoch_millis(response.ssboe, response.usecs)?,
+    })))
 }
 
 pub(crate) fn pnl_position_snapshot_request(
@@ -449,6 +615,20 @@ fn optional_quantity(value: Option<i32>, field: &str) -> Result<Option<Decimal>>
         .transpose()
 }
 
+fn positive_u64_quantity(value: Option<u64>, field: &str) -> Result<Decimal> {
+    let value = value.with_context(|| format!("missing Rithmic {field}"))?;
+    ensure!(value > 0, "invalid Rithmic {field}");
+    Ok(Decimal::from(value))
+}
+
+fn optional_u64_quantity(value: Option<u64>, _field: &str) -> Result<Option<Decimal>> {
+    Ok(value.map(Decimal::from))
+}
+
+fn required_nonnegative_decimal(value: Option<f64>, field: &str) -> Result<Decimal> {
+    optional_nonnegative_decimal(value, field)?.with_context(|| format!("missing Rithmic {field}"))
+}
+
 fn optional_nonnegative_decimal(value: Option<f64>, field: &str) -> Result<Option<Decimal>> {
     value
         .map(|value| {
@@ -530,11 +710,135 @@ mod tests {
         assert_eq!(order_request.template_id, SHOW_ORDERS_REQUEST);
         assert_eq!(order_request.account_id.as_deref(), Some("ACCOUNT"));
 
+        let history_payload =
+            show_order_history_request("history", &account(), "basket-1").unwrap();
+        let history_request: protocol::RequestShowOrderHistory =
+            codec::decode(&history_payload).unwrap();
+        assert_eq!(history_request.template_id, SHOW_ORDER_HISTORY_REQUEST);
+        assert_eq!(history_request.basket_id.as_deref(), Some("basket-1"));
+
+        let fills_payload =
+            show_fill_history_request("fills", &account(), 1_700_000_000, 1_700_000_100, 10_000)
+                .unwrap();
+        let fills_request: protocol::RequestShowFillHistory =
+            codec::decode(&fills_payload).unwrap();
+        assert_eq!(fills_request.template_id, SHOW_FILL_HISTORY_REQUEST);
+        assert_eq!(fills_request.index_format.as_deref(), Some("ssboe"));
+        assert_eq!(fills_request.max_record_count, Some(10_000));
+
         let pnl_payload = pnl_position_snapshot_request("pnl", &account()).unwrap();
         let pnl_request: protocol::RequestPnLPositionSnapshot =
             codec::decode(&pnl_payload).unwrap();
         assert_eq!(pnl_request.template_id, PNL_POSITION_SNAPSHOT_REQUEST);
         assert_eq!(pnl_request.account_id.as_deref(), Some("ACCOUNT"));
+    }
+
+    #[test]
+    fn order_history_requires_matching_basket_and_explicit_completion() {
+        let notification = codec::encode(&protocol::ExchangeOrderNotification {
+            template_id: EXCHANGE_ORDER_NOTIFICATION,
+            is_snapshot: Some(false),
+            fcm_id: Some("FCM".to_string()),
+            ib_id: Some("IB".to_string()),
+            account_id: Some("ACCOUNT".to_string()),
+            basket_id: Some("basket-1".to_string()),
+            exchange: Some("CME".to_string()),
+            symbol: Some("NQU6".to_string()),
+            status: Some("CANCELLED".to_string()),
+            transaction_type: Some(
+                protocol::exchange_order_notification::TransactionType::Buy as i32,
+            ),
+            quantity: Some(1),
+            total_fill_size: Some(0),
+            total_unfilled_size: Some(0),
+            ..Default::default()
+        })
+        .unwrap();
+        let OrderHistoryEvent::Notification(order) =
+            decode_order_history_event(&notification, "history", &account(), "basket-1").unwrap()
+        else {
+            panic!("expected order-history notification");
+        };
+        assert_eq!(order.status, "CANCELLED");
+        assert!(
+            decode_order_history_event(&notification, "history", &account(), "other-basket",)
+                .is_err()
+        );
+
+        let completed = codec::encode(&protocol::ResponseShowOrderHistory {
+            template_id: SHOW_ORDER_HISTORY_RESPONSE,
+            user_msg: vec!["history".to_string()],
+            rp_code: vec!["0".to_string()],
+        })
+        .unwrap();
+        assert_eq!(
+            decode_order_history_event(&completed, "history", &account(), "basket-1").unwrap(),
+            OrderHistoryEvent::RequestCompleted
+        );
+    }
+
+    #[test]
+    fn fill_history_follows_processing_then_completion_semantics() {
+        let fill = codec::encode(&protocol::ResponseShowFillHistory {
+            template_id: SHOW_FILL_HISTORY_RESPONSE,
+            user_msg: vec!["fills".to_string()],
+            rq_handler_rp_code: vec!["0".to_string()],
+            fcm_id: Some("FCM".to_string()),
+            ib_id: Some("IB".to_string()),
+            account_id: Some("ACCOUNT".to_string()),
+            basket_id: Some("basket-1".to_string()),
+            exchange_order_id: Some("exchange-1".to_string()),
+            fill_id: Some("fill-1".to_string()),
+            exchange: Some("CME".to_string()),
+            symbol: Some("NQU6".to_string()),
+            transaction_type: Some("BUY".to_string()),
+            fill_size: Some(1),
+            fill_price: Some(20_000.25),
+            total_fill_size: Some(1),
+            avg_fill_price: Some(20_000.25),
+            ssboe: Some(1_700_000_000),
+            usecs: Some(123_000),
+            ..Default::default()
+        })
+        .unwrap();
+        let FillHistoryEvent::Fill(fill) =
+            decode_fill_history_event(&fill, "fills", &account()).unwrap()
+        else {
+            panic!("expected fill-history row");
+        };
+        assert_eq!(fill.fill_quantity, dec!(1));
+        assert_eq!(fill.fill_price, dec!(20000.25));
+        assert_eq!(fill.timestamp_ms, Some(1_700_000_000_123));
+
+        let completed = codec::encode(&protocol::ResponseShowFillHistory {
+            template_id: SHOW_FILL_HISTORY_RESPONSE,
+            user_msg: vec!["fills".to_string()],
+            rp_code: vec!["0".to_string()],
+            ..Default::default()
+        })
+        .unwrap();
+        assert_eq!(
+            decode_fill_history_event(&completed, "fills", &account()).unwrap(),
+            FillHistoryEvent::RequestCompleted
+        );
+    }
+
+    #[test]
+    fn recovery_request_boundary_matrix_fails_closed() {
+        for (start, finish, max_count, succeeds) in [
+            (0, 0, 1, true),
+            (1, 2, 10_000, true),
+            (-1, 2, 1, false),
+            (2, 1, 1, false),
+            (1, 2, 0, false),
+            (1, 2, 10_001, false),
+        ] {
+            assert_eq!(
+                show_fill_history_request("fills", &account(), start, finish, max_count).is_ok(),
+                succeeds
+            );
+        }
+        assert!(show_order_history_request("history", &account(), " ").is_err());
     }
 
     #[test]

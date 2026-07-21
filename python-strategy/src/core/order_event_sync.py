@@ -18,6 +18,7 @@ class OrderEventApplier:
         place_pending_conditionals_for_entry: Callable[[object], list[dict]],
         protective_partial_fill_requires_resize: Callable[[object, str], dict | None],
         cancel_linked_conditional_for_protection_fill: Callable[[object], dict | None],
+        remote_follow_up_required: Callable[[object, str], bool] | None = None,
     ) -> None:
         self.order_manager = order_manager
         self.journal_fill = journal_fill
@@ -35,8 +36,16 @@ class OrderEventApplier:
         self.cancel_linked_conditional_for_protection_fill = (
             cancel_linked_conditional_for_protection_fill
         )
+        self.remote_follow_up_required = remote_follow_up_required or (
+            lambda _order, _event_state: True
+        )
 
-    def process_exchange_order_event(self, event: ExchangeOrderEvent) -> dict[str, object]:
+    def process_exchange_order_event(
+        self,
+        event: ExchangeOrderEvent,
+        *,
+        allow_remote_side_effects: bool = True,
+    ) -> dict[str, object]:
         """Apply a live exchange order event to local order, trade, and position state."""
         order = self._resolve_order_event_order(event)
         if order is None:
@@ -149,6 +158,24 @@ class OrderEventApplier:
         # carries the same cumulative quantity (delta == 0) and must still
         # retry pending protection placement and sibling cancellation.
         if (order.filled_quantity or Decimal("0")) > 0:
+            if not allow_remote_side_effects:
+                if self.remote_follow_up_required(order, event_state):
+                    return {
+                        "action": "unresolved_remote_actions_suppressed",
+                        "order_id": order.id,
+                        "status": event.status,
+                        "state": event_state,
+                        "fill_quantity": fill_delta["quantity"],
+                        "exchange_order_id": order.exchange_order_id,
+                    }
+                return {
+                    "action": "applied",
+                    "order_id": order.id,
+                    "status": event.status,
+                    "state": event_state,
+                    "fill_quantity": fill_delta["quantity"],
+                    "exchange_order_id": order.exchange_order_id,
+                }
             placement_failures = self.place_pending_conditionals_for_entry(order)
             if placement_failures:
                 self.write_conditional_warning(

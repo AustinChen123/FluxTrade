@@ -58,6 +58,17 @@ def test_adapter_config_from_env_rejects_unknown_mode(monkeypatch) -> None:
         strategy_main._adapter_config_from_env()
 
 
+def test_adapter_config_from_env_wires_optional_rithmic_recovery(monkeypatch) -> None:
+    monkeypatch.setenv("ADAPTER_MODE", "live")
+    monkeypatch.setenv("RITHMIC_RECOVERY_PROFILE", "test")
+    monkeypatch.setenv("RITHMIC_ACCOUNT_ID", "ACCOUNT")
+
+    config = strategy_main._adapter_config_from_env()
+
+    assert config["rithmic_recovery_profile"] == "test"
+    assert config["rithmic_recovery_account_id"] == "ACCOUNT"
+
+
 def test_validate_runtime_config_rejects_live_without_audit() -> None:
     with pytest.raises(ValueError, match="live_adapter_requires_audit_external_orders"):
         strategy_main._validate_runtime_config(

@@ -55,6 +55,7 @@ class ExecutionEngine:
         is_backtest: Optional[bool] = None,
         db_session_factory: Optional[Callable[[], ContextManager[Session]]] = None,
         audit_external_orders: bool = False,
+        account_service=None,
     ):
         self.logger = logging.getLogger("ExecutionEngine")
         self.clock = clock
@@ -95,6 +96,7 @@ class ExecutionEngine:
             cancel_linked_conditional_for_protection_fill=(
                 self._cancel_linked_conditional_order_for_protection_fill
             ),
+            remote_follow_up_required=self._remote_follow_up_required,
         )
         self._order_reconciler = OrderReconciler(
             adapter=self.adapter,
@@ -117,6 +119,11 @@ class ExecutionEngine:
             cancel_linked_conditional_for_protection_fill=(
                 self._cancel_linked_conditional_order_for_protection_fill
             ),
+            local_positions_loader=(
+                getattr(account_service, "get_all_positions", None)
+                if account_service is not None
+                else None
+            ),
             logger=self.logger,
         )
         # Submission drain gate: halts new order submissions and waits for
@@ -136,6 +143,19 @@ class ExecutionEngine:
 
     def reconcile_recoverable_client_orders(self) -> dict:
         return self._order_reconciler.reconcile_recoverable_client_orders()
+
+    def reconcile_rithmic_owned_orders(
+        self,
+        profile: str,
+        account_id: str | None = None,
+        *,
+        snapshot_loader=None,
+    ) -> dict[str, object]:
+        return self._order_reconciler.reconcile_rithmic_owned_orders(
+            profile,
+            account_id,
+            snapshot_loader=snapshot_loader,
+        )
 
     def _fail_pending_conditional_orders_for_terminal_entry(self, entry_order) -> None:
         """Clear pending protection for an entry that terminated with zero fills.
@@ -191,6 +211,44 @@ class ExecutionEngine:
             "reason": "protective_terminal_without_fill",
         }
 
+    def _remote_follow_up_required(self, order, event_state: str) -> bool:
+        if order.type in {"market", "limit"}:
+            protected_quantity = order.filled_quantity or Decimal("0")
+            related = [
+                candidate
+                for candidate in self.order_manager.repo.list_orders_by_statuses(
+                    {
+                        OrderStatus.NEW.value,
+                        OrderStatus.SUBMITTED_UNCONFIRMED.value,
+                        OrderStatus.SUBMITTED.value,
+                        OrderStatus.PARTIALLY_FILLED.value,
+                    }
+                )
+                if isinstance(candidate.intent_payload, dict)
+                and candidate.intent_payload.get("pending_entry_order_id") == str(order.id)
+            ]
+            return any(
+                candidate.status == OrderStatus.NEW.value
+                or (candidate.quantity or Decimal("0")) < protected_quantity
+                for candidate in related
+            )
+        if self._protective_partial_fill_requires_resize(order, event_state) is not None:
+            return True
+        if event_state not in {"filled", "liquidated"}:
+            return False
+        if not isinstance(order.intent_payload, dict):
+            return False
+        linked_order_id = order.intent_payload.get("linked_order_id")
+        if not linked_order_id:
+            return False
+        linked = self.order_manager.repo.get_order(str(linked_order_id))
+        return linked is not None and linked.status not in {
+            OrderStatus.CANCELLED.value,
+            OrderStatus.FILLED.value,
+            OrderStatus.FAILED.value,
+            OrderStatus.LIQUIDATED.value,
+        }
+
     def resync_recoverable_order_events(self) -> dict[str, object]:
         return self._order_reconciler.resync_recoverable_order_events()
 
@@ -234,8 +292,16 @@ class ExecutionEngine:
                 if self.journal is not None:
                     self._journal_fill(order, price, qty, fee, fill_type, candle)
 
-    def process_exchange_order_event(self, event: ExchangeOrderEvent) -> dict[str, object]:
-        return self._order_event_applier.process_exchange_order_event(event)
+    def process_exchange_order_event(
+        self,
+        event: ExchangeOrderEvent,
+        *,
+        allow_remote_side_effects: bool = True,
+    ) -> dict[str, object]:
+        return self._order_event_applier.process_exchange_order_event(
+            event,
+            allow_remote_side_effects=allow_remote_side_effects,
+        )
 
     @staticmethod
     def _fill_delta_from_cumulative(

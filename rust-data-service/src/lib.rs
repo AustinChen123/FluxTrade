@@ -18,6 +18,7 @@ fn fluxtrade_core(m: &Bound<'_, PyModule>) -> PyResult<()> {
     #[cfg(feature = "rithmic")]
     {
         m.add_class::<binding::rithmic_ledger::PyLedgerOrder>()?;
+        m.add_class::<binding::rithmic_ledger::PyLedgerFill>()?;
         m.add_class::<binding::rithmic_ledger::PyLedgerPosition>()?;
         m.add_class::<binding::rithmic_ledger::PyLedgerAccountSummary>()?;
         m.add_class::<binding::rithmic_ledger::PyLedgerSnapshot>()?;
@@ -45,6 +46,7 @@ mod tests {
 
             for name in [
                 "RithmicLedgerOrder",
+                "RithmicLedgerFill",
                 "RithmicLedgerPosition",
                 "RithmicLedgerAccountSummary",
                 "RithmicLedgerSnapshot",
