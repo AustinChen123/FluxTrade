@@ -2,7 +2,7 @@ use super::{
     codec,
     ledger::{AccountIdentity, TransactionType},
     protocol,
-    session::ensure_success,
+    session::{classify_response_codes, ensure_success, ResponseDisposition},
 };
 use anyhow::{ensure, Context, Result};
 use rust_decimal::{prelude::ToPrimitive, Decimal};
@@ -61,6 +61,12 @@ pub(crate) struct OrderAck {
     pub(crate) basket_id: String,
 }
 
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) struct MutationResponse {
+    pub(crate) disposition: ResponseDisposition,
+    pub(crate) basket_id: Option<String>,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct OrderEvent {
     pub(crate) account: AccountIdentity,
@@ -96,19 +102,17 @@ pub(crate) fn decode_trade_route_event(
     ensure_template(payload, TRADE_ROUTES_RESPONSE)?;
     let response: protocol::ResponseTradeRoutes = codec::decode(payload)?;
     ensure_request_key(&response.user_msg, request_key)?;
-    if !response.rp_code.is_empty() {
-        ensure!(
-            response.rq_handler_rp_code.is_empty(),
-            "Rithmic trade-route response has conflicting status codes"
-        );
-        ensure_success(&response.rp_code)?;
-        return Ok(TradeRouteEvent::Completed);
+    match classify_response_codes(&response.rq_handler_rp_code, &response.rp_code)? {
+        ResponseDisposition::Succeeded => return Ok(TradeRouteEvent::Completed),
+        ResponseDisposition::Failed(codes) => {
+            anyhow::bail!("Rithmic trade-route response failed: {}", codes.join(","))
+        }
+        ResponseDisposition::Processing => {}
     }
-    ensure_processing(&response.rq_handler_rp_code, "trade-route")?;
     let status = required_text(response.status, "trade route status")?;
     ensure!(
-        status.eq_ignore_ascii_case("open"),
-        "Rithmic trade route is not open"
+        status.eq_ignore_ascii_case("up"),
+        "Rithmic trade route is not up"
     );
     Ok(TradeRouteEvent::Route(TradeRoute {
         exchange: required_text(response.exchange, "trade route exchange")?,
@@ -200,21 +204,20 @@ pub(crate) fn decode_new_order_response(
     payload: &[u8],
     request_key: &str,
     expected_client_order_id: &str,
-) -> Result<OrderAck> {
+) -> Result<MutationResponse> {
     validate_request_key(request_key)?;
     ensure_template(payload, NEW_ORDER_RESPONSE)?;
     let response: protocol::ResponseNewOrder = codec::decode(payload)?;
     ensure_request_key(&response.user_msg, request_key)?;
-    ensure_success(&response.rp_code)?;
     if let Some(user_tag) = optional_text(response.user_tag) {
         ensure!(
             user_tag == expected_client_order_id,
             "Rithmic new-order client ID mismatch"
         );
     }
-    Ok(OrderAck {
-        client_order_id: expected_client_order_id.to_string(),
-        basket_id: required_text(response.basket_id, "basket ID")?,
+    Ok(MutationResponse {
+        disposition: classify_response_codes(&response.rq_handler_rp_code, &response.rp_code)?,
+        basket_id: optional_text(response.basket_id),
     })
 }
 
@@ -242,17 +245,22 @@ pub(crate) fn decode_cancel_order_response(
     payload: &[u8],
     request_key: &str,
     expected_basket_id: &str,
-) -> Result<()> {
+) -> Result<MutationResponse> {
     validate_request_key(request_key)?;
     ensure_template(payload, CANCEL_ORDER_RESPONSE)?;
     let response: protocol::ResponseCancelOrder = codec::decode(payload)?;
     ensure_request_key(&response.user_msg, request_key)?;
-    ensure_success(&response.rp_code)?;
-    ensure!(
-        required_text(response.basket_id, "basket ID")? == expected_basket_id,
-        "Rithmic cancel-order basket ID mismatch"
-    );
-    Ok(())
+    let basket_id = optional_text(response.basket_id);
+    if let Some(basket_id) = basket_id.as_deref() {
+        ensure!(
+            basket_id == expected_basket_id,
+            "Rithmic cancel-order basket ID mismatch"
+        );
+    }
+    Ok(MutationResponse {
+        disposition: classify_response_codes(&response.rq_handler_rp_code, &response.rp_code)?,
+        basket_id,
+    })
 }
 
 pub(crate) fn decode_request_reject(payload: &[u8]) -> Result<(String, String)> {
@@ -297,9 +305,11 @@ pub(crate) fn decode_order_event(
         optional_nonnegative_quantity(response.total_fill_size, "total fill size")?;
     let unfilled_quantity =
         optional_nonnegative_quantity(response.total_unfilled_size, "total unfilled size")?;
+    let quantity = positive_quantity(response.quantity, "order quantity")?;
     let status = classify_status(
         notify_type,
         response.status.as_deref(),
+        quantity,
         cumulative_filled_quantity,
         unfilled_quantity,
     )?;
@@ -312,7 +322,7 @@ pub(crate) fn decode_order_event(
         symbol: required_text(response.symbol, "symbol")?,
         status,
         transaction_type: transaction_type(response.transaction_type)?,
-        quantity: positive_quantity(response.quantity, "order quantity")?,
+        quantity,
         last_fill_quantity: optional_positive_quantity(response.fill_size, "fill size")?,
         last_fill_price: optional_nonnegative_decimal(response.fill_price, "fill price")?,
         cumulative_filled_quantity,
@@ -353,17 +363,35 @@ pub(crate) fn is_reject(template_id: i32) -> bool {
 fn classify_status(
     notify_type: protocol::exchange_order_notification::NotifyType,
     raw_status: Option<&str>,
+    quantity: Decimal,
     cumulative_filled: Option<Decimal>,
     unfilled: Option<Decimal>,
 ) -> Result<String> {
     use protocol::exchange_order_notification::NotifyType;
+    if let Some(filled) = cumulative_filled {
+        ensure!(
+            filled <= quantity,
+            "Rithmic cumulative fill exceeds order quantity"
+        );
+    }
+    if let Some(unfilled) = unfilled {
+        ensure!(
+            unfilled <= quantity,
+            "Rithmic unfilled size exceeds order quantity"
+        );
+    }
     let status = match notify_type {
         NotifyType::Fill => {
-            ensure!(
-                cumulative_filled.is_some(),
-                "Rithmic fill event omitted cumulative fill size"
-            );
-            if unfilled == Some(Decimal::ZERO) {
+            let filled = cumulative_filled
+                .filter(|filled| *filled > Decimal::ZERO)
+                .context("Rithmic fill event omitted positive cumulative fill size")?;
+            if let Some(unfilled) = unfilled {
+                ensure!(
+                    filled + unfilled == quantity,
+                    "Rithmic fill totals do not match order quantity"
+                );
+            }
+            if filled == quantity {
                 "filled"
             } else {
                 "partially_filled"
@@ -373,14 +401,18 @@ fn classify_status(
         NotifyType::Reject => "rejected",
         NotifyType::NotCancelled => "cancel_rejected",
         NotifyType::Status | NotifyType::Modify | NotifyType::Trigger | NotifyType::Generic => {
-            return normalize_status(raw_status);
+            return normalize_status(raw_status, quantity, cumulative_filled);
         }
         NotifyType::NotModified => "modify_rejected",
     };
     Ok(status.to_string())
 }
 
-fn normalize_status(raw_status: Option<&str>) -> Result<String> {
+fn normalize_status(
+    raw_status: Option<&str>,
+    quantity: Decimal,
+    cumulative_filled: Option<Decimal>,
+) -> Result<String> {
     let normalized = raw_status
         .map(str::trim)
         .filter(|status| !status.is_empty())
@@ -388,9 +420,27 @@ fn normalize_status(raw_status: Option<&str>) -> Result<String> {
         .to_ascii_lowercase()
         .replace([' ', '-'], "_");
     let status = match normalized.as_str() {
-        "open" | "open_pending" | "submitted" | "accepted" => "open",
-        "partial" | "partially_filled" | "partiallyfilled" => "partially_filled",
-        "complete" | "completed" | "filled" => "filled",
+        "open" | "open_pending" | "submitted" | "accepted" => match cumulative_filled {
+            None => "open",
+            Some(filled) if filled.is_zero() => "open",
+            Some(filled) if filled < quantity => "partially_filled",
+            Some(_) => anyhow::bail!("Rithmic open status conflicts with cumulative fill"),
+        },
+        "partial" | "partially_filled" | "partiallyfilled" => {
+            ensure!(
+                cumulative_filled
+                    .is_some_and(|filled| { filled > Decimal::ZERO && filled < quantity }),
+                "Rithmic partial status conflicts with cumulative fill"
+            );
+            "partially_filled"
+        }
+        "complete" | "completed" | "filled" => {
+            ensure!(
+                cumulative_filled == Some(quantity),
+                "Rithmic complete status is not fully filled"
+            );
+            "filled"
+        }
         "cancel" | "canceled" | "cancelled" => "cancelled",
         "reject" | "rejected" => "rejected",
         other => anyhow::bail!("unsupported Rithmic order status {other}"),
@@ -451,14 +501,6 @@ fn ensure_template(payload: &[u8], expected: i32) -> Result<()> {
     ensure!(
         codec::template_id(payload)? == expected,
         "unexpected Rithmic order response template"
-    );
-    Ok(())
-}
-
-fn ensure_processing(codes: &[String], response: &str) -> Result<()> {
-    ensure!(
-        codes.first().is_some_and(|code| code == "0"),
-        "Rithmic {response} response failed"
     );
     Ok(())
 }
@@ -608,6 +650,35 @@ mod tests {
     }
 
     #[test]
+    fn trade_route_service_state_matrix_fails_closed() {
+        for (status, succeeds) in [
+            (Some("UP"), true),
+            (Some("up"), true),
+            (Some("DOWN"), false),
+            (Some("open"), false),
+            (None, false),
+        ] {
+            let payload = codec::encode(&protocol::ResponseTradeRoutes {
+                template_id: TRADE_ROUTES_RESPONSE,
+                user_msg: vec!["routes".to_string()],
+                rq_handler_rp_code: vec!["0".to_string()],
+                exchange: Some("CME".to_string()),
+                trade_route: Some("globex".to_string()),
+                status: status.map(str::to_string),
+                is_default: Some(true),
+                ..Default::default()
+            })
+            .unwrap();
+
+            assert_eq!(
+                decode_trade_route_event(&payload, "routes").is_ok(),
+                succeeds,
+                "status={status:?}",
+            );
+        }
+    }
+
+    #[test]
     fn order_request_validation_matrix_fails_closed() {
         for (quantity, price, order_type, succeeds) in [
             (dec!(1), None, OrderType::Market, true),
@@ -648,9 +719,9 @@ mod tests {
                 "client-1"
             )
             .unwrap(),
-            OrderAck {
-                client_order_id: "client-1".to_string(),
-                basket_id: "basket-1".to_string(),
+            MutationResponse {
+                disposition: ResponseDisposition::Succeeded,
+                basket_id: Some("basket-1".to_string()),
             }
         );
         assert!(decode_new_order_response(
@@ -665,10 +736,70 @@ mod tests {
             "client-1"
         )
         .is_err());
-        assert!(decode_new_order_response(
-            &response("new", "client-1", "basket-1", "9"),
-            "new",
-            "client-1"
+        assert_eq!(
+            decode_new_order_response(
+                &response("new", "client-1", "basket-1", "9"),
+                "new",
+                "client-1"
+            )
+            .unwrap(),
+            MutationResponse {
+                disposition: ResponseDisposition::Failed(vec!["9".to_string()]),
+                basket_id: Some("basket-1".to_string()),
+            }
+        );
+
+        let processing = codec::encode(&protocol::ResponseNewOrder {
+            template_id: NEW_ORDER_RESPONSE,
+            user_msg: vec!["new".to_string()],
+            user_tag: Some("client-1".to_string()),
+            basket_id: Some("basket-1".to_string()),
+            rq_handler_rp_code: vec!["0".to_string()],
+            ..Default::default()
+        })
+        .unwrap();
+        assert_eq!(
+            decode_new_order_response(&processing, "new", "client-1").unwrap(),
+            MutationResponse {
+                disposition: ResponseDisposition::Processing,
+                basket_id: Some("basket-1".to_string()),
+            }
+        );
+    }
+
+    #[test]
+    fn cancel_response_phase_and_identity_are_explicit() {
+        let response = |handler: &[&str], terminal: &[&str], basket_id: Option<&str>| {
+            codec::encode(&protocol::ResponseCancelOrder {
+                template_id: CANCEL_ORDER_RESPONSE,
+                user_msg: vec!["cancel".to_string()],
+                basket_id: basket_id.map(str::to_string),
+                rq_handler_rp_code: handler.iter().map(|code| (*code).to_string()).collect(),
+                rp_code: terminal.iter().map(|code| (*code).to_string()).collect(),
+                ..Default::default()
+            })
+            .unwrap()
+        };
+        assert_eq!(
+            decode_cancel_order_response(
+                &response(&["0"], &[], Some("basket-1")),
+                "cancel",
+                "basket-1",
+            )
+            .unwrap()
+            .disposition,
+            ResponseDisposition::Processing,
+        );
+        assert_eq!(
+            decode_cancel_order_response(&response(&[], &["0"], None), "cancel", "basket-1")
+                .unwrap()
+                .disposition,
+            ResponseDisposition::Succeeded,
+        );
+        assert!(decode_cancel_order_response(
+            &response(&[], &["0"], Some("other")),
+            "cancel",
+            "basket-1",
         )
         .is_err());
     }
@@ -677,11 +808,16 @@ mod tests {
     fn live_event_state_matrix_uses_notify_type_and_fill_totals() {
         use protocol::exchange_order_notification::NotifyType;
         for (notify_type, raw_status, filled, unfilled, expected) in [
-            (NotifyType::Status, "OPEN", 0, 1, "open"),
+            (NotifyType::Status, "OPEN", 0, 2, "open"),
+            (NotifyType::Status, "OPEN", 1, 1, "partially_filled"),
+            (NotifyType::Modify, "OPEN", 0, 2, "open"),
+            (NotifyType::Trigger, "OPEN", 0, 2, "open"),
+            (NotifyType::Generic, "OPEN", 0, 2, "open"),
             (NotifyType::Fill, "OPEN", 1, 1, "partially_filled"),
             (NotifyType::Fill, "COMPLETE", 2, 0, "filled"),
             (NotifyType::Cancel, "COMPLETE", 0, 0, "cancelled"),
             (NotifyType::Reject, "COMPLETE", 0, 0, "rejected"),
+            (NotifyType::NotModified, "OPEN", 0, 2, "modify_rejected"),
             (NotifyType::NotCancelled, "OPEN", 0, 1, "cancel_rejected"),
         ] {
             let payload = codec::encode(&protocol::ExchangeOrderNotification {
@@ -753,6 +889,42 @@ mod tests {
             },
         ] {
             let payload = codec::encode(&invalid).unwrap();
+            assert!(decode_order_event(&payload, &account()).is_err());
+        }
+    }
+
+    #[test]
+    fn live_event_fill_totals_fail_closed() {
+        use protocol::exchange_order_notification::NotifyType;
+        let event = |notify_type, status: &str, filled, unfilled| {
+            codec::encode(&protocol::ExchangeOrderNotification {
+                template_id: EXCHANGE_ORDER_NOTIFICATION,
+                notify_type: Some(notify_type as i32),
+                is_snapshot: Some(false),
+                fcm_id: Some("FCM".to_string()),
+                ib_id: Some("IB".to_string()),
+                account_id: Some("ACCOUNT".to_string()),
+                basket_id: Some("basket-1".to_string()),
+                exchange: Some("CME".to_string()),
+                symbol: Some("NQU6".to_string()),
+                status: Some(status.to_string()),
+                transaction_type: Some(
+                    protocol::exchange_order_notification::TransactionType::Buy as i32,
+                ),
+                quantity: Some(2),
+                total_fill_size: Some(filled),
+                total_unfilled_size: Some(unfilled),
+                ..Default::default()
+            })
+            .unwrap()
+        };
+
+        for payload in [
+            event(NotifyType::Status, "COMPLETE", 0, 0),
+            event(NotifyType::Fill, "OPEN", 0, 2),
+            event(NotifyType::Fill, "OPEN", 1, 0),
+            event(NotifyType::Fill, "OPEN", 3, 0),
+        ] {
             assert!(decode_order_event(&payload, &account()).is_err());
         }
     }

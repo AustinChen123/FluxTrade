@@ -25,7 +25,12 @@ pub(crate) fn request(request_key: &str, root_symbol: &str, exchange: &str) -> R
     })
 }
 
-pub(crate) fn decode_response(payload: &[u8], request_key: &str) -> Result<String> {
+pub(crate) fn decode_response(
+    payload: &[u8],
+    request_key: &str,
+    root_symbol: &str,
+    exchange: &str,
+) -> Result<String> {
     ensure!(
         codec::template_id(payload)? == FRONT_MONTH_RESPONSE,
         "unexpected Rithmic front-month response template"
@@ -36,8 +41,29 @@ pub(crate) fn decode_response(payload: &[u8], request_key: &str) -> Result<Strin
         "Rithmic front-month response request key mismatch"
     );
     ensure_success(&response.rp_code)?;
+    ensure_optional_identity(response.symbol.as_deref(), root_symbol, "root symbol")?;
+    ensure_optional_identity(response.exchange.as_deref(), exchange, "exchange")?;
+    ensure_optional_identity(
+        response.trading_exchange.as_deref(),
+        exchange,
+        "trading exchange",
+    )?;
 
     required_text(response.trading_symbol, "trading symbol")
+}
+
+fn ensure_optional_identity(actual: Option<&str>, expected: &str, field: &str) -> Result<()> {
+    ensure!(
+        !expected.trim().is_empty(),
+        "missing expected Rithmic {field}"
+    );
+    if let Some(actual) = actual {
+        ensure!(
+            actual.eq_ignore_ascii_case(expected),
+            "Rithmic front-month {field} mismatch"
+        );
+    }
+    Ok(())
 }
 
 fn required_text(value: Option<String>, field: &str) -> Result<String> {
@@ -65,7 +91,10 @@ mod tests {
     #[test]
     fn response_validation_matrix_fails_closed() {
         let valid = response(FRONT_MONTH_RESPONSE, "front-month", vec!["0"], Some("NQU6"));
-        assert_eq!(decode_response(&valid, "front-month").unwrap(), "NQU6");
+        assert_eq!(
+            decode_response(&valid, "front-month", "NQ", "CME").unwrap(),
+            "NQU6"
+        );
 
         for payload in [
             response(115, "front-month", vec!["0"], Some("NQU6")),
@@ -74,7 +103,28 @@ mod tests {
             response(FRONT_MONTH_RESPONSE, "front-month", vec!["7"], None),
             response(FRONT_MONTH_RESPONSE, "front-month", vec!["0"], None),
         ] {
-            assert!(decode_response(&payload, "front-month").is_err());
+            assert!(decode_response(&payload, "front-month", "NQ", "CME").is_err());
+        }
+        assert!(decode_response(&valid, "front-month", "", "CME").is_err());
+        assert!(decode_response(&valid, "front-month", "NQ", "").is_err());
+
+        for (symbol, exchange, trading_exchange) in [
+            (Some("ES"), Some("CME"), Some("CME")),
+            (Some("NQ"), Some("NYMEX"), Some("CME")),
+            (Some("NQ"), Some("CME"), Some("NYMEX")),
+        ] {
+            let payload = codec::encode(&protocol::ResponseFrontMonthContract {
+                template_id: FRONT_MONTH_RESPONSE,
+                user_msg: vec!["front-month".to_string()],
+                rp_code: vec!["0".to_string()],
+                symbol: symbol.map(str::to_string),
+                exchange: exchange.map(str::to_string),
+                trading_exchange: trading_exchange.map(str::to_string),
+                trading_symbol: Some("NQU6".to_string()),
+                ..Default::default()
+            })
+            .unwrap();
+            assert!(decode_response(&payload, "front-month", "NQ", "CME").is_err());
         }
     }
 

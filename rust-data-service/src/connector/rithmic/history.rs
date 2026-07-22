@@ -1,4 +1,7 @@
-use super::{codec, protocol, session::ensure_success};
+use super::{
+    codec, protocol,
+    session::{classify_response_codes, ResponseDisposition},
+};
 use anyhow::{ensure, Context, Result};
 use rust_decimal::Decimal;
 use std::str::FromStr;
@@ -121,26 +124,20 @@ impl HistoryPageDecoder {
             "Rithmic history response request key mismatch"
         );
 
-        if !response.rp_code.is_empty() {
-            ensure!(
-                response.rq_handler_rp_code.is_empty(),
-                "Rithmic history response has conflicting status codes"
-            );
-            ensure_success(&response.rp_code)?;
-            let next_start = self
-                .last_marker
-                .filter(|marker| *marker < self.finish_index)
-                .and_then(|marker| marker.checked_add(1));
-            self.last_marker = None;
-            return Ok(HistoryEvent::PageEnded { next_start });
+        match classify_response_codes(&response.rq_handler_rp_code, &response.rp_code)? {
+            ResponseDisposition::Succeeded => {
+                let next_start = self
+                    .last_marker
+                    .filter(|marker| *marker < self.finish_index)
+                    .and_then(|marker| marker.checked_add(1));
+                self.last_marker = None;
+                return Ok(HistoryEvent::PageEnded { next_start });
+            }
+            ResponseDisposition::Failed(codes) => {
+                anyhow::bail!("Rithmic history response failed: {}", codes.join(","))
+            }
+            ResponseDisposition::Processing => {}
         }
-        ensure!(
-            response
-                .rq_handler_rp_code
-                .first()
-                .is_some_and(|code| code == "0"),
-            "Rithmic history response failed"
-        );
 
         let marker = response.marker.context("missing Rithmic history marker")?;
         ensure!(

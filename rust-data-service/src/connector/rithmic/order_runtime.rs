@@ -4,7 +4,7 @@ use super::{
     ledger_runtime::{discover_order_account, next_payload, wait_for_heartbeat},
     order::{self, NewOrder, OrderAck, OrderEvent, TradeRoute, TradeRouteEvent},
     profile_lock::ProfileLease,
-    session::Plant,
+    session::{Plant, ResponseDisposition},
     transport::{self, ConnectionEvent, RithmicConnection},
 };
 use anyhow::{bail, ensure, Context, Result};
@@ -61,6 +61,7 @@ enum Pending {
     Submit {
         request_key: String,
         client_order_id: String,
+        basket_id: Option<String>,
         deadline: Instant,
         reply: Reply<OrderAck>,
     },
@@ -470,6 +471,7 @@ async fn begin_command(
             Ok(Some(Pending::Submit {
                 request_key,
                 client_order_id,
+                basket_id: None,
                 deadline,
                 reply,
             }))
@@ -571,11 +573,49 @@ fn handle_payload(
         Some(Pending::Submit {
             request_key,
             client_order_id,
-            deadline: _,
+            mut basket_id,
+            deadline,
             reply,
         }) if order::is_new_order_response(template_id) => {
-            let result = order::decode_new_order_response(&payload, &request_key, &client_order_id);
-            let _ = reply.send(result);
+            match order::decode_new_order_response(&payload, &request_key, &client_order_id) {
+                Ok(response) => {
+                    if let Err(error) = merge_basket_id(&mut basket_id, response.basket_id) {
+                        let _ =
+                            reply.send(Err(error.context("Rithmic new-order result is ambiguous")));
+                        return Ok(());
+                    }
+                    match response.disposition {
+                        ResponseDisposition::Processing => {
+                            *pending = Some(Pending::Submit {
+                                request_key,
+                                client_order_id,
+                                basket_id,
+                                deadline,
+                                reply,
+                            });
+                        }
+                        ResponseDisposition::Succeeded => {
+                            let result = basket_id
+                                .context("Rithmic new-order response omitted basket ID")
+                                .map(|basket_id| OrderAck {
+                                    client_order_id,
+                                    basket_id,
+                                })
+                                .context("Rithmic new-order result is ambiguous");
+                            let _ = reply.send(result);
+                        }
+                        ResponseDisposition::Failed(codes) => {
+                            let _ = reply.send(Err(anyhow::anyhow!(
+                                "Rithmic new-order response failed: {}",
+                                codes.join(",")
+                            )));
+                        }
+                    }
+                }
+                Err(error) => {
+                    let _ = reply.send(Err(error.context("Rithmic new-order result is ambiguous")));
+                }
+            }
         }
         Some(Pending::Cancel {
             request_key,
@@ -585,19 +625,57 @@ fn handle_payload(
             deadline,
             reply,
         }) if order::is_cancel_order_response(template_id) => {
-            order::decode_cancel_order_response(&payload, &request_key, &basket_id)?;
-            response_accepted = true;
-            complete_or_restore_cancel(
-                pending,
-                request_key,
-                basket_id,
-                response_accepted,
-                terminal_seen,
-                deadline,
-                reply,
-            );
+            match order::decode_cancel_order_response(&payload, &request_key, &basket_id) {
+                Ok(response) => match response.disposition {
+                    ResponseDisposition::Processing => {
+                        *pending = Some(Pending::Cancel {
+                            request_key,
+                            basket_id,
+                            response_accepted,
+                            terminal_seen,
+                            deadline,
+                            reply,
+                        });
+                    }
+                    ResponseDisposition::Succeeded => {
+                        response_accepted = true;
+                        complete_or_restore_cancel(
+                            pending,
+                            request_key,
+                            basket_id,
+                            response_accepted,
+                            terminal_seen,
+                            deadline,
+                            reply,
+                        );
+                    }
+                    ResponseDisposition::Failed(codes) => {
+                        let _ = reply.send(Err(anyhow::anyhow!(
+                            "Rithmic cancel-order response failed: {}",
+                            codes.join(",")
+                        )));
+                    }
+                },
+                Err(error) => {
+                    let _ = reply.send(Err(
+                        error.context("Rithmic cancel-order result is ambiguous")
+                    ));
+                }
+            }
         }
         current => *pending = current,
+    }
+    Ok(())
+}
+
+fn merge_basket_id(current: &mut Option<String>, candidate: Option<String>) -> Result<()> {
+    let Some(candidate) = candidate else {
+        return Ok(());
+    };
+    if let Some(current) = current.as_deref() {
+        ensure!(current == candidate, "Rithmic response basket ID changed");
+    } else {
+        *current = Some(candidate);
     }
     Ok(())
 }
@@ -1035,7 +1113,7 @@ mod tests {
                 rq_handler_rp_code: vec!["0".to_string()],
                 exchange: Some("CME".to_string()),
                 trade_route: Some("route".to_string()),
-                status: Some("open".to_string()),
+                status: Some("UP".to_string()),
                 is_default: Some(true),
                 ..Default::default()
             })
@@ -1180,6 +1258,20 @@ mod tests {
         )
     }
 
+    fn pending_submit() -> (Option<Pending>, std_mpsc::Receiver<Result<OrderAck>>) {
+        let (tx, rx) = std_mpsc::sync_channel(1);
+        (
+            Some(Pending::Submit {
+                request_key: "new-1".to_string(),
+                client_order_id: "client-1".to_string(),
+                basket_id: None,
+                deadline: Instant::now() + COMMAND_TIMEOUT,
+                reply: tx,
+            }),
+            rx,
+        )
+    }
+
     fn pending_lookup() -> (
         Option<Pending>,
         std_mpsc::Receiver<Result<Option<OrderSnapshot>>>,
@@ -1278,6 +1370,107 @@ mod tests {
             assert_eq!(rx.recv().unwrap().is_ok(), expected);
             assert!(pending.is_none());
         }
+    }
+
+    #[test]
+    fn submit_waits_for_terminal_response_and_preserves_basket_id() {
+        let response = |handler: &[&str], terminal: &[&str], basket_id: Option<&str>| {
+            codec::encode(&protocol::ResponseNewOrder {
+                template_id: 313,
+                user_msg: vec!["new-1".to_string()],
+                user_tag: Some("client-1".to_string()),
+                basket_id: basket_id.map(str::to_string),
+                rq_handler_rp_code: handler.iter().map(|code| (*code).to_string()).collect(),
+                rp_code: terminal.iter().map(|code| (*code).to_string()).collect(),
+                ..Default::default()
+            })
+            .unwrap()
+        };
+        let (mut pending, rx) = pending_submit();
+        let (events, _) = std_mpsc::channel();
+        let account = event("open", "basket-1").account;
+
+        handle_payload(
+            response(&["0"], &[], Some("basket-1")),
+            &account,
+            &mut pending,
+            &events,
+        )
+        .unwrap();
+        assert!(rx.try_recv().is_err());
+        assert!(matches!(pending, Some(Pending::Submit { .. })));
+
+        handle_payload(response(&[], &["0"], None), &account, &mut pending, &events).unwrap();
+        assert_eq!(rx.recv().unwrap().unwrap().basket_id, "basket-1");
+        assert!(pending.is_none());
+    }
+
+    #[test]
+    fn submit_rejects_conflicting_basket_ids_as_ambiguous() {
+        let response = |handler: &[&str], terminal: &[&str], basket_id: &str| {
+            codec::encode(&protocol::ResponseNewOrder {
+                template_id: 313,
+                user_msg: vec!["new-1".to_string()],
+                user_tag: Some("client-1".to_string()),
+                basket_id: Some(basket_id.to_string()),
+                rq_handler_rp_code: handler.iter().map(|code| (*code).to_string()).collect(),
+                rp_code: terminal.iter().map(|code| (*code).to_string()).collect(),
+                ..Default::default()
+            })
+            .unwrap()
+        };
+        let (mut pending, rx) = pending_submit();
+        let (events, _) = std_mpsc::channel();
+        let account = event("open", "basket-1").account;
+
+        handle_payload(
+            response(&["0"], &[], "basket-1"),
+            &account,
+            &mut pending,
+            &events,
+        )
+        .unwrap();
+        handle_payload(
+            response(&[], &["0"], "basket-2"),
+            &account,
+            &mut pending,
+            &events,
+        )
+        .unwrap();
+
+        assert!(rx
+            .recv()
+            .unwrap()
+            .unwrap_err()
+            .to_string()
+            .contains("ambiguous"));
+        assert!(pending.is_none());
+    }
+
+    #[test]
+    fn cancel_processing_response_does_not_complete_request() {
+        let response = |handler: &[&str], terminal: &[&str]| {
+            codec::encode(&protocol::ResponseCancelOrder {
+                template_id: 317,
+                user_msg: vec!["cancel-1".to_string()],
+                basket_id: Some("basket-1".to_string()),
+                rq_handler_rp_code: handler.iter().map(|code| (*code).to_string()).collect(),
+                rp_code: terminal.iter().map(|code| (*code).to_string()).collect(),
+                ..Default::default()
+            })
+            .unwrap()
+        };
+        let (mut pending, rx) = pending_cancel();
+        let (events, _) = std_mpsc::channel();
+        let account = event("open", "basket-1").account;
+
+        handle_payload(response(&["0"], &[]), &account, &mut pending, &events).unwrap();
+        assert!(rx.try_recv().is_err());
+        handle_payload(response(&[], &["0"]), &account, &mut pending, &events).unwrap();
+        assert!(rx.try_recv().is_err());
+        update_pending_from_event(&mut pending, &event("cancelled", "basket-1")).unwrap();
+        assert!(rx.recv().unwrap().is_ok());
+        assert!(pending.is_none());
     }
 
     #[test]
