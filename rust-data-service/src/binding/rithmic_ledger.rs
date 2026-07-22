@@ -24,6 +24,12 @@ pub struct PyLedgerOrder {
     #[pyo3(get)]
     pub status: String,
     #[pyo3(get)]
+    pub notification_type: Option<String>,
+    #[pyo3(get)]
+    pub completion_reason: Option<String>,
+    #[pyo3(get)]
+    pub report_text: Option<String>,
+    #[pyo3(get)]
     pub transaction_type: String,
     #[pyo3(get)]
     pub quantity: String,
@@ -246,6 +252,9 @@ impl From<OrderSnapshot> for PyLedgerOrder {
             exchange: order.exchange,
             symbol: order.symbol,
             status: order.status,
+            notification_type: order.notification_type,
+            completion_reason: order.completion_reason,
+            report_text: order.report_text,
             transaction_type: match order.transaction_type {
                 TransactionType::Buy => "BUY",
                 TransactionType::Sell => "SELL",
@@ -327,6 +336,9 @@ mod tests {
                 exchange: "CME".to_string(),
                 symbol: "NQU6".to_string(),
                 status: "OPEN".to_string(),
+                notification_type: Some("STATUS".to_string()),
+                completion_reason: None,
+                report_text: None,
                 transaction_type: TransactionType::ShortSell,
                 quantity: dec!(2),
                 filled_quantity: Some(dec!(1)),
@@ -374,6 +386,10 @@ mod tests {
         assert_eq!(snapshot.account_currency.as_deref(), Some("USD"));
         assert_eq!(snapshot.orders[0].client_order_id, None);
         assert_eq!(snapshot.orders[0].basket_id, "BASKET");
+        assert_eq!(
+            snapshot.orders[0].notification_type.as_deref(),
+            Some("STATUS")
+        );
         assert_eq!(snapshot.orders[0].transaction_type, "SHORT_SELL");
         assert_eq!(snapshot.fills[0].fill_quantity, "1");
         assert_eq!(snapshot.fills[0].fill_price, "20000.25");

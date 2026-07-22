@@ -11,6 +11,7 @@ const SHOW_ORDERS_REQUEST: i32 = 320;
 const SHOW_ORDERS_RESPONSE: i32 = 321;
 const SHOW_ORDER_HISTORY_REQUEST: i32 = 322;
 const SHOW_ORDER_HISTORY_RESPONSE: i32 = 323;
+const RITHMIC_ORDER_NOTIFICATION: i32 = 351;
 const EXCHANGE_ORDER_NOTIFICATION: i32 = 352;
 const SHOW_FILL_HISTORY_REQUEST: i32 = 3512;
 const SHOW_FILL_HISTORY_RESPONSE: i32 = 3513;
@@ -91,6 +92,9 @@ pub(crate) struct OrderSnapshot {
     pub(crate) exchange: String,
     pub(crate) symbol: String,
     pub(crate) status: String,
+    pub(crate) notification_type: Option<String>,
+    pub(crate) completion_reason: Option<String>,
+    pub(crate) report_text: Option<String>,
     pub(crate) transaction_type: TransactionType,
     pub(crate) quantity: Decimal,
     pub(crate) filled_quantity: Option<Decimal>,
@@ -294,6 +298,12 @@ fn order_snapshot_from_notification(
         exchange: required_text(response.exchange, "exchange")?,
         symbol: required_text(response.symbol, "symbol")?,
         status: required_text(response.status, "status")?,
+        notification_type: response
+            .notify_type
+            .map(exchange_notification_type)
+            .transpose()?,
+        completion_reason: None,
+        report_text: optional_text(response.report_text),
         transaction_type: transaction_type(response.transaction_type)?,
         quantity: positive_quantity(response.quantity, "order quantity")?,
         filled_quantity: optional_quantity(response.total_fill_size, "total_fill_size")?,
@@ -348,8 +358,53 @@ pub(crate) fn decode_order_history_event(
             );
             Ok(OrderHistoryEvent::Notification(Box::new(order)))
         }
+        RITHMIC_ORDER_NOTIFICATION => {
+            let response: protocol::RithmicOrderNotification = codec::decode(payload)?;
+            let order = rithmic_order_snapshot(response, expected_account)?;
+            ensure!(
+                order.basket_id == expected_basket_id,
+                "Rithmic order-history basket ID mismatch"
+            );
+            Ok(OrderHistoryEvent::Notification(Box::new(order)))
+        }
         template_id => anyhow::bail!("unsupported Rithmic order-history template {template_id}"),
     }
+}
+
+fn rithmic_order_snapshot(
+    response: protocol::RithmicOrderNotification,
+    expected_account: &AccountIdentity,
+) -> Result<OrderSnapshot> {
+    let account = account_identity(response.fcm_id, response.ib_id, response.account_id)?;
+    ensure!(
+        account == *expected_account,
+        "Rithmic order-history account mismatch"
+    );
+    Ok(OrderSnapshot {
+        account,
+        client_order_id: optional_text(response.user_tag),
+        basket_id: required_text(response.basket_id, "basket_id")?,
+        exchange_order_id: optional_text(response.exchange_order_id),
+        exchange: required_text(response.exchange, "exchange")?,
+        symbol: required_text(response.symbol, "symbol")?,
+        status: required_text(response.status, "status")?,
+        notification_type: Some(rithmic_notification_type(
+            response
+                .notify_type
+                .context("missing Rithmic order-history notify type")?,
+        )?),
+        completion_reason: optional_text(response.completion_reason),
+        report_text: optional_text(response.report_text),
+        transaction_type: transaction_type_value(response.transaction_type)?,
+        quantity: positive_quantity(response.quantity, "order quantity")?,
+        filled_quantity: optional_quantity(response.total_fill_size, "total_fill_size")?,
+        unfilled_quantity: optional_quantity(response.total_unfilled_size, "total_unfilled_size")?,
+        average_fill_price: optional_nonnegative_decimal(
+            response.avg_fill_price,
+            "average fill price",
+        )?,
+        timestamp_ms: optional_epoch_millis(response.ssboe, response.usecs)?,
+    })
 }
 
 pub(crate) fn show_fill_history_request(
@@ -583,25 +638,29 @@ fn optional_text(value: Option<String>) -> Option<String> {
 }
 
 fn transaction_type(value: Option<i32>) -> Result<TransactionType> {
+    transaction_type_value(value)
+}
+
+fn transaction_type_value(value: Option<i32>) -> Result<TransactionType> {
     match value {
-        Some(value)
-            if value == protocol::exchange_order_notification::TransactionType::Buy as i32 =>
-        {
-            Ok(TransactionType::Buy)
-        }
-        Some(value)
-            if value == protocol::exchange_order_notification::TransactionType::Sell as i32 =>
-        {
-            Ok(TransactionType::Sell)
-        }
-        Some(value)
-            if value == protocol::exchange_order_notification::TransactionType::Ss as i32 =>
-        {
-            Ok(TransactionType::ShortSell)
-        }
+        Some(1) => Ok(TransactionType::Buy),
+        Some(2) => Ok(TransactionType::Sell),
+        Some(3) => Ok(TransactionType::ShortSell),
         Some(_) => anyhow::bail!("unknown Rithmic order transaction type"),
         None => anyhow::bail!("missing Rithmic order transaction type"),
     }
+}
+
+fn exchange_notification_type(value: i32) -> Result<String> {
+    protocol::exchange_order_notification::NotifyType::try_from(value)
+        .context("unknown Rithmic exchange-order notify type")
+        .map(|value| value.as_str_name().to_string())
+}
+
+fn rithmic_notification_type(value: i32) -> Result<String> {
+    protocol::rithmic_order_notification::NotifyType::try_from(value)
+        .context("unknown Rithmic order-history notify type")
+        .map(|value| value.as_str_name().to_string())
 }
 
 fn positive_quantity(value: Option<i32>, field: &str) -> Result<Decimal> {
@@ -779,6 +838,84 @@ mod tests {
             decode_order_history_event(&completed, "history", &account(), "basket-1").unwrap(),
             OrderHistoryEvent::RequestCompleted
         );
+    }
+
+    #[test]
+    fn order_notification_type_matrices_are_complete() {
+        let rithmic_names = [
+            "ORDER_RCVD_FROM_CLNT",
+            "MODIFY_RCVD_FROM_CLNT",
+            "CANCEL_RCVD_FROM_CLNT",
+            "OPEN_PENDING",
+            "MODIFY_PENDING",
+            "CANCEL_PENDING",
+            "ORDER_RCVD_BY_EXCH_GTWY",
+            "MODIFY_RCVD_BY_EXCH_GTWY",
+            "CANCEL_RCVD_BY_EXCH_GTWY",
+            "ORDER_SENT_TO_EXCH",
+            "MODIFY_SENT_TO_EXCH",
+            "CANCEL_SENT_TO_EXCH",
+            "OPEN",
+            "MODIFIED",
+            "COMPLETE",
+            "MODIFICATION_FAILED",
+            "CANCELLATION_FAILED",
+            "TRIGGER_PENDING",
+            "GENERIC",
+            "LINK_ORDERS_FAILED",
+        ];
+        for (notify_type, expected) in (1..=20).zip(rithmic_names) {
+            let payload = codec::encode(&protocol::RithmicOrderNotification {
+                template_id: RITHMIC_ORDER_NOTIFICATION,
+                notify_type: Some(notify_type),
+                fcm_id: Some("FCM".to_string()),
+                ib_id: Some("IB".to_string()),
+                account_id: Some("ACCOUNT".to_string()),
+                basket_id: Some("basket-1".to_string()),
+                exchange: Some("CME".to_string()),
+                symbol: Some("NQU6".to_string()),
+                status: Some("COMPLETE".to_string()),
+                completion_reason: Some("reason".to_string()),
+                report_text: Some("report".to_string()),
+                transaction_type: Some(1),
+                quantity: Some(1),
+                total_fill_size: Some(0),
+                total_unfilled_size: Some(0),
+                ..Default::default()
+            })
+            .unwrap();
+            let OrderHistoryEvent::Notification(order) =
+                decode_order_history_event(&payload, "history", &account(), "basket-1").unwrap()
+            else {
+                panic!("expected order-history notification");
+            };
+            assert_eq!(order.notification_type.as_deref(), Some(expected));
+            assert_eq!(order.status, "COMPLETE");
+            assert_eq!(order.completion_reason.as_deref(), Some("reason"));
+            assert_eq!(order.report_text.as_deref(), Some("report"));
+        }
+
+        for (notify_type, expected) in [
+            "STATUS",
+            "MODIFY",
+            "CANCEL",
+            "TRIGGER",
+            "FILL",
+            "REJECT",
+            "NOT_MODIFIED",
+            "NOT_CANCELLED",
+            "GENERIC",
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            assert_eq!(
+                exchange_notification_type((notify_type + 1) as i32).unwrap(),
+                expected
+            );
+        }
+        assert!(rithmic_notification_type(21).is_err());
+        assert!(exchange_notification_type(10).is_err());
     }
 
     #[test]
