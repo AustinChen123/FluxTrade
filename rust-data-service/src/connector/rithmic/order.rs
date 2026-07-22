@@ -305,9 +305,11 @@ pub(crate) fn decode_order_event(
         optional_nonnegative_quantity(response.total_fill_size, "total fill size")?;
     let unfilled_quantity =
         optional_nonnegative_quantity(response.total_unfilled_size, "total unfilled size")?;
+    let quantity = positive_quantity(response.quantity, "order quantity")?;
     let status = classify_status(
         notify_type,
         response.status.as_deref(),
+        quantity,
         cumulative_filled_quantity,
         unfilled_quantity,
     )?;
@@ -320,7 +322,7 @@ pub(crate) fn decode_order_event(
         symbol: required_text(response.symbol, "symbol")?,
         status,
         transaction_type: transaction_type(response.transaction_type)?,
-        quantity: positive_quantity(response.quantity, "order quantity")?,
+        quantity,
         last_fill_quantity: optional_positive_quantity(response.fill_size, "fill size")?,
         last_fill_price: optional_nonnegative_decimal(response.fill_price, "fill price")?,
         cumulative_filled_quantity,
@@ -361,17 +363,35 @@ pub(crate) fn is_reject(template_id: i32) -> bool {
 fn classify_status(
     notify_type: protocol::exchange_order_notification::NotifyType,
     raw_status: Option<&str>,
+    quantity: Decimal,
     cumulative_filled: Option<Decimal>,
     unfilled: Option<Decimal>,
 ) -> Result<String> {
     use protocol::exchange_order_notification::NotifyType;
+    if let Some(filled) = cumulative_filled {
+        ensure!(
+            filled <= quantity,
+            "Rithmic cumulative fill exceeds order quantity"
+        );
+    }
+    if let Some(unfilled) = unfilled {
+        ensure!(
+            unfilled <= quantity,
+            "Rithmic unfilled size exceeds order quantity"
+        );
+    }
     let status = match notify_type {
         NotifyType::Fill => {
-            ensure!(
-                cumulative_filled.is_some(),
-                "Rithmic fill event omitted cumulative fill size"
-            );
-            if unfilled == Some(Decimal::ZERO) {
+            let filled = cumulative_filled
+                .filter(|filled| *filled > Decimal::ZERO)
+                .context("Rithmic fill event omitted positive cumulative fill size")?;
+            if let Some(unfilled) = unfilled {
+                ensure!(
+                    filled + unfilled == quantity,
+                    "Rithmic fill totals do not match order quantity"
+                );
+            }
+            if filled == quantity {
                 "filled"
             } else {
                 "partially_filled"
@@ -381,14 +401,18 @@ fn classify_status(
         NotifyType::Reject => "rejected",
         NotifyType::NotCancelled => "cancel_rejected",
         NotifyType::Status | NotifyType::Modify | NotifyType::Trigger | NotifyType::Generic => {
-            return normalize_status(raw_status);
+            return normalize_status(raw_status, quantity, cumulative_filled);
         }
         NotifyType::NotModified => "modify_rejected",
     };
     Ok(status.to_string())
 }
 
-fn normalize_status(raw_status: Option<&str>) -> Result<String> {
+fn normalize_status(
+    raw_status: Option<&str>,
+    quantity: Decimal,
+    cumulative_filled: Option<Decimal>,
+) -> Result<String> {
     let normalized = raw_status
         .map(str::trim)
         .filter(|status| !status.is_empty())
@@ -396,9 +420,27 @@ fn normalize_status(raw_status: Option<&str>) -> Result<String> {
         .to_ascii_lowercase()
         .replace([' ', '-'], "_");
     let status = match normalized.as_str() {
-        "open" | "open_pending" | "submitted" | "accepted" => "open",
-        "partial" | "partially_filled" | "partiallyfilled" => "partially_filled",
-        "complete" | "completed" | "filled" => "filled",
+        "open" | "open_pending" | "submitted" | "accepted" => match cumulative_filled {
+            None => "open",
+            Some(filled) if filled.is_zero() => "open",
+            Some(filled) if filled < quantity => "partially_filled",
+            Some(_) => anyhow::bail!("Rithmic open status conflicts with cumulative fill"),
+        },
+        "partial" | "partially_filled" | "partiallyfilled" => {
+            ensure!(
+                cumulative_filled
+                    .is_some_and(|filled| { filled > Decimal::ZERO && filled < quantity }),
+                "Rithmic partial status conflicts with cumulative fill"
+            );
+            "partially_filled"
+        }
+        "complete" | "completed" | "filled" => {
+            ensure!(
+                cumulative_filled == Some(quantity),
+                "Rithmic complete status is not fully filled"
+            );
+            "filled"
+        }
         "cancel" | "canceled" | "cancelled" => "cancelled",
         "reject" | "rejected" => "rejected",
         other => anyhow::bail!("unsupported Rithmic order status {other}"),
@@ -766,11 +808,16 @@ mod tests {
     fn live_event_state_matrix_uses_notify_type_and_fill_totals() {
         use protocol::exchange_order_notification::NotifyType;
         for (notify_type, raw_status, filled, unfilled, expected) in [
-            (NotifyType::Status, "OPEN", 0, 1, "open"),
+            (NotifyType::Status, "OPEN", 0, 2, "open"),
+            (NotifyType::Status, "OPEN", 1, 1, "partially_filled"),
+            (NotifyType::Modify, "OPEN", 0, 2, "open"),
+            (NotifyType::Trigger, "OPEN", 0, 2, "open"),
+            (NotifyType::Generic, "OPEN", 0, 2, "open"),
             (NotifyType::Fill, "OPEN", 1, 1, "partially_filled"),
             (NotifyType::Fill, "COMPLETE", 2, 0, "filled"),
             (NotifyType::Cancel, "COMPLETE", 0, 0, "cancelled"),
             (NotifyType::Reject, "COMPLETE", 0, 0, "rejected"),
+            (NotifyType::NotModified, "OPEN", 0, 2, "modify_rejected"),
             (NotifyType::NotCancelled, "OPEN", 0, 1, "cancel_rejected"),
         ] {
             let payload = codec::encode(&protocol::ExchangeOrderNotification {
@@ -842,6 +889,42 @@ mod tests {
             },
         ] {
             let payload = codec::encode(&invalid).unwrap();
+            assert!(decode_order_event(&payload, &account()).is_err());
+        }
+    }
+
+    #[test]
+    fn live_event_fill_totals_fail_closed() {
+        use protocol::exchange_order_notification::NotifyType;
+        let event = |notify_type, status: &str, filled, unfilled| {
+            codec::encode(&protocol::ExchangeOrderNotification {
+                template_id: EXCHANGE_ORDER_NOTIFICATION,
+                notify_type: Some(notify_type as i32),
+                is_snapshot: Some(false),
+                fcm_id: Some("FCM".to_string()),
+                ib_id: Some("IB".to_string()),
+                account_id: Some("ACCOUNT".to_string()),
+                basket_id: Some("basket-1".to_string()),
+                exchange: Some("CME".to_string()),
+                symbol: Some("NQU6".to_string()),
+                status: Some(status.to_string()),
+                transaction_type: Some(
+                    protocol::exchange_order_notification::TransactionType::Buy as i32,
+                ),
+                quantity: Some(2),
+                total_fill_size: Some(filled),
+                total_unfilled_size: Some(unfilled),
+                ..Default::default()
+            })
+            .unwrap()
+        };
+
+        for payload in [
+            event(NotifyType::Status, "COMPLETE", 0, 0),
+            event(NotifyType::Fill, "OPEN", 0, 2),
+            event(NotifyType::Fill, "OPEN", 1, 0),
+            event(NotifyType::Fill, "OPEN", 3, 0),
+        ] {
             assert!(decode_order_event(&payload, &account()).is_err());
         }
     }
