@@ -107,8 +107,8 @@ pub(crate) fn decode_trade_route_event(
     ensure_processing(&response.rq_handler_rp_code, "trade-route")?;
     let status = required_text(response.status, "trade route status")?;
     ensure!(
-        status.eq_ignore_ascii_case("open"),
-        "Rithmic trade route is not open"
+        status.eq_ignore_ascii_case("up"),
+        "Rithmic trade route is not up"
     );
     Ok(TradeRouteEvent::Route(TradeRoute {
         exchange: required_text(response.exchange, "trade route exchange")?,
@@ -605,6 +605,35 @@ mod tests {
         let cancel: protocol::RequestCancelOrder = codec::decode(&cancel).unwrap();
         assert_eq!(cancel.template_id, CANCEL_ORDER_REQUEST);
         assert_eq!(cancel.basket_id.as_deref(), Some("basket-1"));
+    }
+
+    #[test]
+    fn trade_route_service_state_matrix_fails_closed() {
+        for (status, succeeds) in [
+            (Some("UP"), true),
+            (Some("up"), true),
+            (Some("DOWN"), false),
+            (Some("open"), false),
+            (None, false),
+        ] {
+            let payload = codec::encode(&protocol::ResponseTradeRoutes {
+                template_id: TRADE_ROUTES_RESPONSE,
+                user_msg: vec!["routes".to_string()],
+                rq_handler_rp_code: vec!["0".to_string()],
+                exchange: Some("CME".to_string()),
+                trade_route: Some("globex".to_string()),
+                status: status.map(str::to_string),
+                is_default: Some(true),
+                ..Default::default()
+            })
+            .unwrap();
+
+            assert_eq!(
+                decode_trade_route_event(&payload, "routes").is_ok(),
+                succeeds,
+                "status={status:?}",
+            );
+        }
     }
 
     #[test]

@@ -1035,7 +1035,7 @@ mod tests {
                 rq_handler_rp_code: vec!["0".to_string()],
                 exchange: Some("CME".to_string()),
                 trade_route: Some("route".to_string()),
-                status: Some("open".to_string()),
+                status: Some("UP".to_string()),
                 is_default: Some(true),
                 ..Default::default()
             })
