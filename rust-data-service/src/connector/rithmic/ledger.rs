@@ -1,4 +1,7 @@
-use super::{codec, protocol, session::ensure_success};
+use super::{
+    codec, protocol,
+    session::{classify_response_codes, ensure_success, ResponseDisposition},
+};
 use anyhow::{ensure, Context, Result};
 use rust_decimal::Decimal;
 use std::str::FromStr;
@@ -213,15 +216,13 @@ pub(crate) fn decode_account_list_event(
     let response: protocol::ResponseAccountList = codec::decode(payload)?;
     ensure_request_key(&response.user_msg, request_key)?;
 
-    if !response.rp_code.is_empty() {
-        ensure!(
-            response.rq_handler_rp_code.is_empty(),
-            "Rithmic account-list response has conflicting status codes"
-        );
-        ensure_success(&response.rp_code)?;
-        return Ok(AccountListEvent::Completed);
+    match classify_response_codes(&response.rq_handler_rp_code, &response.rp_code)? {
+        ResponseDisposition::Succeeded => return Ok(AccountListEvent::Completed),
+        ResponseDisposition::Failed(codes) => {
+            anyhow::bail!("Rithmic account-list response failed: {}", codes.join(","))
+        }
+        ResponseDisposition::Processing => {}
     }
-    ensure_processing(&response.rq_handler_rp_code, "account-list")?;
 
     Ok(AccountListEvent::Account(Account {
         identity: AccountIdentity {
@@ -449,15 +450,13 @@ pub(crate) fn decode_fill_history_event(
     let response: protocol::ResponseShowFillHistory = codec::decode(payload)?;
     ensure_request_key(&response.user_msg, request_key)?;
 
-    if !response.rp_code.is_empty() {
-        ensure!(
-            response.rq_handler_rp_code.is_empty(),
-            "Rithmic fill-history response has conflicting status codes"
-        );
-        ensure_success(&response.rp_code)?;
-        return Ok(FillHistoryEvent::RequestCompleted);
+    match classify_response_codes(&response.rq_handler_rp_code, &response.rp_code)? {
+        ResponseDisposition::Succeeded => return Ok(FillHistoryEvent::RequestCompleted),
+        ResponseDisposition::Failed(codes) => {
+            anyhow::bail!("Rithmic fill-history response failed: {}", codes.join(","))
+        }
+        ResponseDisposition::Processing => {}
     }
-    ensure_processing(&response.rq_handler_rp_code, "fill-history")?;
     let account = account_identity(response.fcm_id, response.ib_id, response.account_id)?;
     ensure!(
         account == *expected_account,
@@ -588,14 +587,6 @@ fn ensure_template(payload: &[u8], expected: i32) -> Result<()> {
     ensure!(
         codec::template_id(payload)? == expected,
         "unexpected Rithmic ledger response template"
-    );
-    Ok(())
-}
-
-fn ensure_processing(codes: &[String], response: &str) -> Result<()> {
-    ensure!(
-        codes.first().is_some_and(|code| code == "0"),
-        "Rithmic {response} response failed"
     );
     Ok(())
 }
