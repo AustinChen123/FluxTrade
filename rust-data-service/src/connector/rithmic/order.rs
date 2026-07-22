@@ -2,7 +2,7 @@ use super::{
     codec,
     ledger::{AccountIdentity, TransactionType},
     protocol,
-    session::ensure_success,
+    session::{classify_response_codes, ensure_success, ResponseDisposition},
 };
 use anyhow::{ensure, Context, Result};
 use rust_decimal::{prelude::ToPrimitive, Decimal};
@@ -61,6 +61,12 @@ pub(crate) struct OrderAck {
     pub(crate) basket_id: String,
 }
 
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) struct MutationResponse {
+    pub(crate) disposition: ResponseDisposition,
+    pub(crate) basket_id: Option<String>,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct OrderEvent {
     pub(crate) account: AccountIdentity,
@@ -96,15 +102,13 @@ pub(crate) fn decode_trade_route_event(
     ensure_template(payload, TRADE_ROUTES_RESPONSE)?;
     let response: protocol::ResponseTradeRoutes = codec::decode(payload)?;
     ensure_request_key(&response.user_msg, request_key)?;
-    if !response.rp_code.is_empty() {
-        ensure!(
-            response.rq_handler_rp_code.is_empty(),
-            "Rithmic trade-route response has conflicting status codes"
-        );
-        ensure_success(&response.rp_code)?;
-        return Ok(TradeRouteEvent::Completed);
+    match classify_response_codes(&response.rq_handler_rp_code, &response.rp_code)? {
+        ResponseDisposition::Succeeded => return Ok(TradeRouteEvent::Completed),
+        ResponseDisposition::Failed(codes) => {
+            anyhow::bail!("Rithmic trade-route response failed: {}", codes.join(","))
+        }
+        ResponseDisposition::Processing => {}
     }
-    ensure_processing(&response.rq_handler_rp_code, "trade-route")?;
     let status = required_text(response.status, "trade route status")?;
     ensure!(
         status.eq_ignore_ascii_case("up"),
@@ -200,21 +204,20 @@ pub(crate) fn decode_new_order_response(
     payload: &[u8],
     request_key: &str,
     expected_client_order_id: &str,
-) -> Result<OrderAck> {
+) -> Result<MutationResponse> {
     validate_request_key(request_key)?;
     ensure_template(payload, NEW_ORDER_RESPONSE)?;
     let response: protocol::ResponseNewOrder = codec::decode(payload)?;
     ensure_request_key(&response.user_msg, request_key)?;
-    ensure_success(&response.rp_code)?;
     if let Some(user_tag) = optional_text(response.user_tag) {
         ensure!(
             user_tag == expected_client_order_id,
             "Rithmic new-order client ID mismatch"
         );
     }
-    Ok(OrderAck {
-        client_order_id: expected_client_order_id.to_string(),
-        basket_id: required_text(response.basket_id, "basket ID")?,
+    Ok(MutationResponse {
+        disposition: classify_response_codes(&response.rq_handler_rp_code, &response.rp_code)?,
+        basket_id: optional_text(response.basket_id),
     })
 }
 
@@ -242,17 +245,22 @@ pub(crate) fn decode_cancel_order_response(
     payload: &[u8],
     request_key: &str,
     expected_basket_id: &str,
-) -> Result<()> {
+) -> Result<MutationResponse> {
     validate_request_key(request_key)?;
     ensure_template(payload, CANCEL_ORDER_RESPONSE)?;
     let response: protocol::ResponseCancelOrder = codec::decode(payload)?;
     ensure_request_key(&response.user_msg, request_key)?;
-    ensure_success(&response.rp_code)?;
-    ensure!(
-        required_text(response.basket_id, "basket ID")? == expected_basket_id,
-        "Rithmic cancel-order basket ID mismatch"
-    );
-    Ok(())
+    let basket_id = optional_text(response.basket_id);
+    if let Some(basket_id) = basket_id.as_deref() {
+        ensure!(
+            basket_id == expected_basket_id,
+            "Rithmic cancel-order basket ID mismatch"
+        );
+    }
+    Ok(MutationResponse {
+        disposition: classify_response_codes(&response.rq_handler_rp_code, &response.rp_code)?,
+        basket_id,
+    })
 }
 
 pub(crate) fn decode_request_reject(payload: &[u8]) -> Result<(String, String)> {
@@ -451,14 +459,6 @@ fn ensure_template(payload: &[u8], expected: i32) -> Result<()> {
     ensure!(
         codec::template_id(payload)? == expected,
         "unexpected Rithmic order response template"
-    );
-    Ok(())
-}
-
-fn ensure_processing(codes: &[String], response: &str) -> Result<()> {
-    ensure!(
-        codes.first().is_some_and(|code| code == "0"),
-        "Rithmic {response} response failed"
     );
     Ok(())
 }
@@ -677,9 +677,9 @@ mod tests {
                 "client-1"
             )
             .unwrap(),
-            OrderAck {
-                client_order_id: "client-1".to_string(),
-                basket_id: "basket-1".to_string(),
+            MutationResponse {
+                disposition: ResponseDisposition::Succeeded,
+                basket_id: Some("basket-1".to_string()),
             }
         );
         assert!(decode_new_order_response(
@@ -694,10 +694,70 @@ mod tests {
             "client-1"
         )
         .is_err());
-        assert!(decode_new_order_response(
-            &response("new", "client-1", "basket-1", "9"),
-            "new",
-            "client-1"
+        assert_eq!(
+            decode_new_order_response(
+                &response("new", "client-1", "basket-1", "9"),
+                "new",
+                "client-1"
+            )
+            .unwrap(),
+            MutationResponse {
+                disposition: ResponseDisposition::Failed(vec!["9".to_string()]),
+                basket_id: Some("basket-1".to_string()),
+            }
+        );
+
+        let processing = codec::encode(&protocol::ResponseNewOrder {
+            template_id: NEW_ORDER_RESPONSE,
+            user_msg: vec!["new".to_string()],
+            user_tag: Some("client-1".to_string()),
+            basket_id: Some("basket-1".to_string()),
+            rq_handler_rp_code: vec!["0".to_string()],
+            ..Default::default()
+        })
+        .unwrap();
+        assert_eq!(
+            decode_new_order_response(&processing, "new", "client-1").unwrap(),
+            MutationResponse {
+                disposition: ResponseDisposition::Processing,
+                basket_id: Some("basket-1".to_string()),
+            }
+        );
+    }
+
+    #[test]
+    fn cancel_response_phase_and_identity_are_explicit() {
+        let response = |handler: &[&str], terminal: &[&str], basket_id: Option<&str>| {
+            codec::encode(&protocol::ResponseCancelOrder {
+                template_id: CANCEL_ORDER_RESPONSE,
+                user_msg: vec!["cancel".to_string()],
+                basket_id: basket_id.map(str::to_string),
+                rq_handler_rp_code: handler.iter().map(|code| (*code).to_string()).collect(),
+                rp_code: terminal.iter().map(|code| (*code).to_string()).collect(),
+                ..Default::default()
+            })
+            .unwrap()
+        };
+        assert_eq!(
+            decode_cancel_order_response(
+                &response(&["0"], &[], Some("basket-1")),
+                "cancel",
+                "basket-1",
+            )
+            .unwrap()
+            .disposition,
+            ResponseDisposition::Processing,
+        );
+        assert_eq!(
+            decode_cancel_order_response(&response(&[], &["0"], None), "cancel", "basket-1")
+                .unwrap()
+                .disposition,
+            ResponseDisposition::Succeeded,
+        );
+        assert!(decode_cancel_order_response(
+            &response(&[], &["0"], Some("other")),
+            "cancel",
+            "basket-1",
         )
         .is_err());
     }

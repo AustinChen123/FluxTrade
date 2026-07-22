@@ -56,6 +56,13 @@ pub(crate) enum SessionState {
     Failed,
 }
 
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum ResponseDisposition {
+    Processing,
+    Succeeded,
+    Failed(Vec<String>),
+}
+
 #[derive(Clone)]
 pub(crate) struct LoginParameters {
     user: String,
@@ -341,6 +348,31 @@ pub(super) fn ensure_success(rp_codes: &[String]) -> Result<()> {
         .context("Rithmic response omitted rp_code")?;
     ensure!(code == "0", "Rithmic response code {code}");
     Ok(())
+}
+
+pub(super) fn classify_response_codes(
+    rq_handler_rp_codes: &[String],
+    rp_codes: &[String],
+) -> Result<ResponseDisposition> {
+    ensure!(
+        rq_handler_rp_codes.is_empty() || rp_codes.is_empty(),
+        "Rithmic response has conflicting status codes"
+    );
+    if let Some(code) = rq_handler_rp_codes.first() {
+        return if code == "0" {
+            Ok(ResponseDisposition::Processing)
+        } else {
+            Ok(ResponseDisposition::Failed(rq_handler_rp_codes.to_vec()))
+        };
+    }
+    if let Some(code) = rp_codes.first() {
+        return if code == "0" {
+            Ok(ResponseDisposition::Succeeded)
+        } else {
+            Ok(ResponseDisposition::Failed(rp_codes.to_vec()))
+        };
+    }
+    anyhow::bail!("Rithmic response omitted status codes")
 }
 
 fn ensure_handshake_success(rp_codes: &[String]) -> Result<()> {
@@ -675,6 +707,40 @@ mod tests {
             let error = login_session.reject_terminal(&frame).unwrap_err();
             assert!(is_fatal_session_error(&error));
             assert_eq!(login_session.state(), SessionState::Failed);
+        }
+    }
+
+    #[test]
+    fn response_code_phase_matrix_is_explicit() {
+        for (handler, terminal, expected) in [
+            (vec!["0"], vec![], Some(ResponseDisposition::Processing)),
+            (vec![], vec!["0"], Some(ResponseDisposition::Succeeded)),
+            (
+                vec!["9", "handler failed"],
+                vec![],
+                Some(ResponseDisposition::Failed(vec![
+                    "9".to_string(),
+                    "handler failed".to_string(),
+                ])),
+            ),
+            (
+                vec![],
+                vec!["7", "no data"],
+                Some(ResponseDisposition::Failed(vec![
+                    "7".to_string(),
+                    "no data".to_string(),
+                ])),
+            ),
+            (vec!["0"], vec!["0"], None),
+            (vec![], vec![], None),
+        ] {
+            let handler = handler.into_iter().map(str::to_string).collect::<Vec<_>>();
+            let terminal = terminal.into_iter().map(str::to_string).collect::<Vec<_>>();
+            let actual = classify_response_codes(&handler, &terminal);
+            match expected {
+                Some(expected) => assert_eq!(actual.unwrap(), expected),
+                None => assert!(actual.is_err()),
+            }
         }
     }
 
