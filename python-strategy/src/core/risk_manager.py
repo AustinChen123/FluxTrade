@@ -100,6 +100,59 @@ class AccountService:
                 positions.append(position)
         return positions
 
+    def replace_positions_for_products(
+        self,
+        positions: list[Position],
+        product_ids: list[str] | tuple[str, ...],
+        *,
+        timestamp_ms: int,
+    ) -> dict[str, int]:
+        """Atomically replace a scoped local cache from authoritative positions."""
+        products = {str(product_id) for product_id in product_ids if str(product_id)}
+        if not products:
+            return {"removed": 0, "written": 0}
+        if not self.redis:
+            raise RuntimeError("authoritative_position_cache_unavailable")
+
+        keys = []
+        prefix = "state:position:"
+        for key in self.redis.scan_iter(f"{prefix}*"):
+            key_text = key.decode() if isinstance(key, bytes) else str(key)
+            if not key_text.startswith(prefix):
+                continue
+            try:
+                _, exchange, symbol = key_text[len(prefix):].rsplit(":", 2)
+            except ValueError:
+                continue
+            if f"{exchange}:{symbol}" in products:
+                keys.append(key)
+
+        pipeline = self.redis.pipeline(transaction=True)
+        if keys:
+            pipeline.delete(*keys)
+        seen = set()
+        for position in positions:
+            if position.product_id not in products:
+                raise ValueError("authoritative_position_product_out_of_scope")
+            if position.product_id in seen:
+                raise ValueError("duplicate_authoritative_position_product")
+            seen.add(position.product_id)
+            quantity = (
+                -position.quantity
+                if position.side == PositionSide.SHORT
+                else position.quantity
+            )
+            pipeline.hset(
+                f"state:position:LIVE:{position.product_id}",
+                mapping={
+                    "quantity": str(quantity),
+                    "entry_price": str(position.entry_price),
+                    "last_update": str(timestamp_ms),
+                },
+            )
+        pipeline.execute()
+        return {"removed": len(keys), "written": len(positions)}
+
 class RiskManager:
     def __init__(
         self,

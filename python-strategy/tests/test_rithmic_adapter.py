@@ -12,6 +12,7 @@ from src.core.adapters.rithmic_adapter import (
     RithmicUnmappedOrderEvent,
 )
 from src.core.interfaces.exchange import ExchangeError, NetworkError
+from src.core.models import PositionSide
 
 
 PRODUCT_ID = "RITHMIC:NQ-202609"
@@ -78,6 +79,26 @@ def snapshot(**overrides):
     return SimpleNamespace(**values)
 
 
+def ledger_snapshot(*, positions, account_id="ACCOUNT", orders=None):
+    return SimpleNamespace(
+        account_id=account_id,
+        positions=positions,
+        orders=orders or [],
+    )
+
+
+def ledger_position(**overrides):
+    values = {
+        "exchange": "CME",
+        "symbol": "NQU6",
+        "net_quantity": "1",
+        "average_open_fill_price": "20000.25",
+        "open_pnl": "10.50",
+    }
+    values.update(overrides)
+    return SimpleNamespace(**values)
+
+
 @pytest.fixture
 def client():
     client = Mock()
@@ -85,6 +106,7 @@ def client():
     client.submit_bracket.return_value = SimpleNamespace(basket_id="parent-1")
     client.modify_protection.return_value = True
     client.cancel.return_value = True
+    client.exit_position.return_value = True
     client.poll_event.return_value = None
     client.lookup.return_value = None
     return client
@@ -114,6 +136,82 @@ def test_runtime_start_is_explicit_and_idempotent(client):
     adapter.start_order_event_stream()
 
     factory.assert_called_once_with("test", "ACCOUNT")
+
+def test_exit_position_uses_native_instrument_identity(adapter, client):
+    adapter.start_order_event_stream()
+
+    assert adapter.exit_position(PRODUCT_ID) is True
+
+    client.exit_position.assert_called_once_with("CME", "NQU6")
+    assert adapter.configured_product_ids == (PRODUCT_ID,)
+
+
+def test_exit_position_maps_ambiguous_runtime_failure(adapter, client):
+    adapter.start_order_event_stream()
+    client.exit_position.side_effect = RuntimeError(
+        "Rithmic exit-position result is ambiguous"
+    )
+
+    with pytest.raises(NetworkError, match="rithmic_exit_position_failed"):
+        adapter.exit_position(PRODUCT_ID)
+
+
+@pytest.mark.parametrize(
+    ("net_quantity", "expected_side", "expected_quantity"),
+    [
+        ("2", PositionSide.LONG, Decimal("2")),
+        ("-3", PositionSide.SHORT, Decimal("3")),
+    ],
+)
+def test_ledger_positions_are_authoritative_signed_positions(
+    adapter,
+    net_quantity,
+    expected_side,
+    expected_quantity,
+):
+    positions = adapter.positions_from_ledger_snapshot(
+        ledger_snapshot(
+            positions=[ledger_position(net_quantity=net_quantity)]
+        )
+    )
+
+    assert len(positions) == 1
+    assert positions[0].strategy_id == "LIVE"
+    assert positions[0].product_id == PRODUCT_ID
+    assert positions[0].side == expected_side
+    assert positions[0].quantity == expected_quantity
+
+
+def test_ledger_zero_position_is_omitted(adapter):
+    positions = adapter.positions_from_ledger_snapshot(
+        ledger_snapshot(positions=[ledger_position(net_quantity="0")])
+    )
+
+    assert positions == []
+
+
+@pytest.mark.parametrize(
+    ("snapshot_value", "error"),
+    [
+        (
+            ledger_snapshot(positions=[], account_id="OTHER"),
+            "rithmic_ledger_account_id_mismatch",
+        ),
+        (
+            ledger_snapshot(positions=[ledger_position(symbol="ESU6")]),
+            "rithmic_ledger_position_instrument_unmapped",
+        ),
+        (
+            ledger_snapshot(
+                positions=[ledger_position(net_quantity="not-a-number")]
+            ),
+            "rithmic_ledger_position_value_invalid",
+        ),
+    ],
+)
+def test_ledger_position_conversion_fails_closed(adapter, snapshot_value, error):
+    with pytest.raises(ExchangeError, match=error):
+        adapter.positions_from_ledger_snapshot(snapshot_value)
 
 
 def test_close_waits_for_active_order_client_call(adapter, client):

@@ -74,6 +74,25 @@ class MockAccountService(AccountService):
         """Test helper to clear all positions."""
         self._positions.clear()
 
+    def replace_positions_for_products(
+        self,
+        positions,
+        product_ids,
+        *,
+        timestamp_ms,
+    ) -> dict[str, int]:
+        products = set(product_ids)
+        keys = [
+            key
+            for key, position in self._positions.items()
+            if position.product_id in products
+        ]
+        for key in keys:
+            del self._positions[key]
+        for position in positions:
+            self.set_position(position)
+        return {"removed": len(keys), "written": len(positions)}
+
 
 class MockClock(Clock):
     """Mock clock for deterministic time in tests."""

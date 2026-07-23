@@ -540,10 +540,8 @@ class ExecutionEngine:
         quantity: Decimal,
         reference_price: Optional[Decimal] = None,
     ) -> Optional[str] | FlattenPending:
-        """Close a live position with a reduce-only market order, bypassing
-        strategy signal flow.
+        """Close a live position with a reduce-only market order.
 
-        Places a market order in the OPPOSITE direction for the full quantity.
         The order is persisted via order_manager before adapter placement so
         that a crash after placement leaves an auditable record.
 
@@ -662,6 +660,28 @@ class ExecutionEngine:
                 phase="kill_switch_flatten",
             )
             return None
+
+    def exit_authoritative_position(
+        self,
+        product_id: str,
+        *,
+        account_id: str,
+    ) -> bool:
+        """Exit one server-side position without deriving side or quantity locally."""
+        if (
+            getattr(self.adapter, "authoritative_position_exit_authority", None)
+            != "rithmic_exit_position"
+        ):
+            raise ExchangeError("adapter_authoritative_position_exit_unsupported")
+        adapter_account_id = str(getattr(self.adapter, "account_id", "")).strip()
+        if adapter_account_id != account_id.strip():
+            raise ExchangeError("authoritative_position_exit_account_mismatch")
+        exit_position = getattr(self.adapter, "exit_position", None)
+        if not callable(exit_position):
+            raise ExchangeError("adapter_authoritative_position_exit_unavailable")
+        if not exit_position(product_id):
+            raise ExchangeError("authoritative_position_exit_returned_false")
+        return True
 
     def _active_flatten_order(self, product_id: str):
         active_statuses = {
