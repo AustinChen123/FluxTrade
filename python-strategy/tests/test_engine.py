@@ -2971,6 +2971,50 @@ def test_rithmic_kill_switch_waits_for_accepted_exit_working_order(engine):
     )
 
 
+def test_rithmic_kill_switch_ignores_terminal_remote_order_rows(engine):
+    adapter = _rithmic_adapter_for_reconnect_test()
+    adapter.start_order_event_stream()
+    engine.execution_engine.adapter = adapter
+    engine._rithmic_recovery_profile = "test"
+    engine._rithmic_recovery_account_id = "ACCOUNT"
+    engine._start_exchange_order_event_stream = MagicMock()
+    engine.execution_engine.reconcile_rithmic_owned_orders = MagicMock(
+        return_value={"auto_resume_safe": True}
+    )
+    terminal_order = SimpleNamespace(
+        status="complete",
+        notification_type="CANCEL",
+        quantity="1",
+        filled_quantity="0",
+    )
+
+    def exit_position(**kwargs):
+        assert kwargs["position_loader"]()
+        return _kill_switch_result()
+
+    engine.ops_safety.kill_switch_with_authoritative_positions = MagicMock(
+        side_effect=exit_position
+    )
+
+    with patch(
+        "src.core.engine.load_rithmic_recovery_snapshot",
+        side_effect=[
+            _rithmic_emergency_snapshot(
+                net_quantity="1",
+                orders=[terminal_order],
+            ),
+            _rithmic_emergency_snapshot(orders=[terminal_order]),
+        ],
+    ):
+        result = engine._run_ops_kill_switch(actor="ops", reason="drill")
+
+    assert result["authoritative_flatten_verified"] is True
+    (
+        engine.ops_safety.kill_switch_with_authoritative_positions
+        .assert_called_once()
+    )
+
+
 def test_rithmic_kill_switch_does_not_retry_unreconciled_residual(engine):
     adapter = _rithmic_adapter_for_reconnect_test()
     adapter.start_order_event_stream()

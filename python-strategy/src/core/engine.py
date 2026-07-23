@@ -30,7 +30,10 @@ from src.core.adapters import (
     SimulatedAdapter,
     create_adapter,
 )
-from src.core.adapters.rithmic_recovery import load_rithmic_recovery_snapshot
+from src.core.adapters.rithmic_recovery import (
+    load_rithmic_recovery_snapshot,
+    rithmic_order_may_be_working,
+)
 from src.core.journal import StrategyJournal
 from src.core.redis_factory import create_redis_client
 from src.core.metrics import SIGNALS_TOTAL, ACTIVE_STRATEGIES, BALANCE_USDT
@@ -599,7 +602,7 @@ class StrategyEngine:
 
         def load_positions() -> list:
             snapshot = load_snapshot()
-            if snapshot.orders:
+            if any(rithmic_order_may_be_working(order) for order in snapshot.orders):
                 raise RuntimeError(
                     "rithmic_emergency_flatten_working_orders_remain"
                 )
@@ -640,7 +643,11 @@ class StrategyEngine:
                 remaining_positions = adapter.positions_from_ledger_snapshot(
                     snapshot
                 )
-                if not snapshot.orders:
+                working_orders_remain = any(
+                    rithmic_order_may_be_working(order)
+                    for order in snapshot.orders
+                )
+                if not working_orders_remain:
                     self.account_service.replace_positions_for_products(
                         remaining_positions,
                         adapter.configured_product_ids,
@@ -659,7 +666,7 @@ class StrategyEngine:
                     ):
                         return finalize(True)
 
-                if snapshot.orders:
+                if working_orders_remain:
                     if exit_failed:
                         break
                     submit_exit = False

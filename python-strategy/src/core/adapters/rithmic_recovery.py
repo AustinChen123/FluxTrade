@@ -98,7 +98,7 @@ def build_rithmic_recovery_plan(
             "status": remote.status,
         }
         for remote in snapshot.orders
-        if _remote_may_be_working(remote)
+        if rithmic_order_may_be_working(remote)
         if not _is_expected_native_child(
             remote,
             expected_native_children,
@@ -395,7 +395,7 @@ def _normalize_transaction_type(value: str) -> str | None:
     return None
 
 
-def _remote_may_be_working(remote) -> bool:
+def rithmic_order_may_be_working(remote) -> bool:
     notification = str(getattr(remote, "notification_type", None) or "").strip().upper()
     quantity = _decimal(getattr(remote, "quantity", None))
     filled = _decimal(getattr(remote, "filled_quantity", None))
