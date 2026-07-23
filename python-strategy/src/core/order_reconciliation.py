@@ -278,6 +278,13 @@ class OrderReconciler:
                 identity_failures=identity_failures,
             )
         try:
+            self.adapter.restore_order_groups(orders)
+        except ExchangeError as exc:
+            return self._write_rithmic_identity_failure_audit(
+                orders,
+                f"native_order_group_restore_failed:{exc}",
+            )
+        try:
             snapshot = load_rithmic_recovery_snapshot(
                 profile,
                 account_id,

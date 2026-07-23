@@ -45,6 +45,8 @@ def remote_order(**overrides):
         "filled_quantity": "0",
         "average_fill_price": None,
         "timestamp_ms": 1_700_000_124_000,
+        "original_basket_id": None,
+        "price_type": None,
     }
     values.update(overrides)
     return SimpleNamespace(**values)
@@ -306,6 +308,226 @@ def test_snapshot_loader_is_called_once_with_bounded_owned_window():
         fill_start_index=1_700_000_122,
         fill_finish_index=1_700_000_201,
     )
+
+
+def test_snapshot_loader_includes_persisted_native_parent_basket():
+    loader = Mock(return_value=snapshot())
+    child = local_order(
+        exchange_order_id="child-stop-1",
+        intent_payload={"native_parent_basket_id": "parent-1"},
+    )
+
+    load_rithmic_recovery_snapshot(
+        "test",
+        "ACCOUNT",
+        [child],
+        1_700_000_200,
+        loader,
+    )
+
+    assert loader.call_args.kwargs["recovery_basket_ids"] == [
+        "child-stop-1",
+        "parent-1",
+    ]
+
+
+def test_native_child_is_recovered_without_parent_in_local_active_set():
+    child = local_order(
+        id="stop-1",
+        client_order_id="strategy-execution-sl-123",
+        exchange_order_id="child-stop-1",
+        side="sell",
+        quantity=Decimal("1"),
+        type="stop_loss",
+        intent_payload={
+            "placement_mode": "attach-at-entry",
+            "native_leg_type": "stop_loss",
+            "native_parent_basket_id": "parent-1",
+            "native_parent_client_order_id": "strategy-execution-long-123",
+        },
+    )
+    remote = remote_order(
+        client_order_id="strategy-execution-long-123",
+        basket_id="child-stop-1",
+        original_basket_id="parent-1",
+        price_type="stop_market",
+        transaction_type="SELL",
+        quantity="1",
+        trigger_price="19998.25",
+        bracket_type="stop_only_static",
+    )
+
+    plan, external = build_rithmic_recovery_plan([child], snapshot(orders=[remote]))
+
+    assert external == []
+    assert plan[0].classification == "matched"
+    assert plan[0].event.raw["trigger_price"] == "19998.25"
+    assert plan[0].event.raw["price_type"] == "stop_market"
+
+
+def test_native_child_with_wrong_parent_is_blocked_and_reported_external():
+    child = local_order(
+        id="stop-1",
+        client_order_id="strategy-execution-sl-123",
+        exchange_order_id="child-stop-1",
+        side="sell",
+        quantity=Decimal("1"),
+        type="stop_loss",
+        intent_payload={
+            "placement_mode": "attach-at-entry",
+            "native_parent_basket_id": "parent-1",
+            "native_parent_client_order_id": "strategy-execution-long-123",
+        },
+    )
+    remote = remote_order(
+        client_order_id="strategy-execution-long-123",
+        basket_id="child-stop-1",
+        original_basket_id="other-parent",
+        price_type="stop_market",
+        transaction_type="SELL",
+        quantity="1",
+    )
+
+    plan, external = build_rithmic_recovery_plan([child], snapshot(orders=[remote]))
+
+    assert plan[0].reason == "native_parent_basket_id_mismatch"
+    assert external == [
+        {
+            "basket_id": "child-stop-1",
+            "client_order_id": "strategy-execution-long-123",
+            "status": "OPEN",
+        }
+    ]
+
+
+@pytest.mark.parametrize(
+    ("original_basket_id", "price_type", "reason"),
+    [
+        ("other-parent", "stop_market", "native_parent_basket_id_mismatch"),
+        ("parent-1", "limit", "native_bracket_leg_mismatch"),
+    ],
+)
+def test_terminal_native_child_history_requires_parent_and_leg_identity(
+    original_basket_id,
+    price_type,
+    reason,
+):
+    child = local_order(
+        id="stop-1",
+        client_order_id="strategy-execution-sl-123",
+        exchange_order_id="child-stop-1",
+        side="sell",
+        quantity=Decimal("1"),
+        type="stop_loss",
+        intent_payload={
+            "placement_mode": "attach-at-entry",
+            "native_parent_basket_id": "parent-1",
+            "native_parent_client_order_id": "strategy-execution-long-123",
+        },
+    )
+    terminal = remote_order(
+        client_order_id="strategy-execution-long-123",
+        basket_id="child-stop-1",
+        original_basket_id=original_basket_id,
+        price_type=price_type,
+        transaction_type="SELL",
+        quantity="1",
+        status="CANCELLED",
+    )
+
+    plan, _ = build_rithmic_recovery_plan(
+        [child], snapshot(order_history=[terminal])
+    )
+
+    assert plan[0].reason == reason
+
+
+def test_unexpected_extra_native_leg_is_reported_external():
+    parent_client_id = "strategy-execution-long-123"
+    parent = local_order(
+        client_order_id=parent_client_id,
+        exchange_order_id="parent-1",
+        quantity=Decimal("1"),
+        intent_payload={
+            "native_protection": {
+                "legs": {"stop_loss": {"client_order_id": "strategy-execution-sl-123"}}
+            }
+        },
+    )
+    remotes = [
+        remote_order(client_order_id=parent_client_id, basket_id="parent-1", quantity="1"),
+        remote_order(
+            client_order_id=parent_client_id,
+            basket_id="child-stop-1",
+            original_basket_id="parent-1",
+            price_type="stop_market",
+            transaction_type="SELL",
+            quantity="1",
+        ),
+        remote_order(
+            client_order_id=parent_client_id,
+            basket_id="child-target-1",
+            original_basket_id="parent-1",
+            price_type="limit",
+            transaction_type="SELL",
+            quantity="1",
+        ),
+    ]
+
+    _, external = build_rithmic_recovery_plan([parent], snapshot(orders=remotes))
+
+    assert external == [
+        {
+            "basket_id": "child-target-1",
+            "client_order_id": parent_client_id,
+            "status": "OPEN",
+        }
+    ]
+
+
+def test_native_children_sharing_parent_user_tag_do_not_duplicate_parent_identity():
+    parent_client_id = "strategy-execution-long-123"
+    parent = local_order(
+        client_order_id=parent_client_id,
+        exchange_order_id="parent-1",
+        quantity=Decimal("1"),
+        intent_payload={
+            "native_protection": {
+                "legs": {
+                    "stop_loss": {"client_order_id": "strategy-execution-sl-123"},
+                    "take_profit": {"client_order_id": "strategy-execution-tp-123"},
+                }
+            }
+        },
+    )
+    remotes = [
+        remote_order(
+            client_order_id=parent_client_id,
+            basket_id="parent-1",
+            quantity="1",
+        ),
+        remote_order(
+            client_order_id=parent_client_id,
+            basket_id="child-stop-1",
+            original_basket_id="parent-1",
+            price_type="stop_market",
+            transaction_type="SELL",
+            quantity="1",
+        ),
+        remote_order(
+            client_order_id=parent_client_id,
+            basket_id="child-target-1",
+            original_basket_id="parent-1",
+            price_type="limit",
+            transaction_type="SELL",
+            quantity="1",
+        ),
+    ]
+
+    plan, external = build_rithmic_recovery_plan([parent], snapshot(orders=remotes))
+
+    assert external == []
+    assert plan[0].classification == "matched"
 
 
 def test_position_comparison_covers_recovered_and_locally_held_products():
