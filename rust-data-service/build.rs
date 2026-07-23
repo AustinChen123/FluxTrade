@@ -36,6 +36,8 @@ const RITHMIC_PROTOS: &[&str] = &[
     "response_modify_order.proto",
     "request_cancel_order.proto",
     "response_cancel_order.proto",
+    "request_exit_position.proto",
+    "response_exit_position.proto",
     "request_show_orders.proto",
     "response_show_orders.proto",
     "request_show_order_history.proto",

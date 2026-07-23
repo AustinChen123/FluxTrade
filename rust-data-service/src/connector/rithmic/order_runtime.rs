@@ -3,8 +3,8 @@ use super::{
     ledger::{self, AccountIdentity, OrderSnapshot, OrderSnapshotEvent, UserType},
     ledger_runtime::{discover_order_account_with_login, next_payload, wait_for_heartbeat},
     order::{
-        self, BracketOrder, NewOrder, OrderAck, OrderEvent, ProtectionModification, TradeRoute,
-        TradeRouteEvent,
+        self, BracketOrder, ExitPosition, NewOrder, OrderAck, OrderEvent, ProtectionModification,
+        TradeRoute, TradeRouteEvent,
     },
     profile_lock::ProfileLease,
     session::{Plant, ResponseDisposition},
@@ -54,6 +54,11 @@ enum Command {
         deadline: Instant,
         reply: Reply<()>,
     },
+    ExitPosition {
+        position: ExitPosition,
+        deadline: Instant,
+        reply: Reply<()>,
+    },
     Lookup {
         client_order_id: String,
         exchange: String,
@@ -68,7 +73,10 @@ impl Command {
     fn is_submission(&self) -> bool {
         matches!(
             self,
-            Self::Submit { .. } | Self::SubmitBracket { .. } | Self::Modify { .. }
+            Self::Submit { .. }
+                | Self::SubmitBracket { .. }
+                | Self::Modify { .. }
+                | Self::ExitPosition { .. }
         )
     }
 }
@@ -110,6 +118,12 @@ enum Pending {
         modification: ProtectionModification,
         response_accepted: bool,
         event_seen: bool,
+        deadline: Instant,
+        reply: Reply<()>,
+    },
+    ExitPosition {
+        request_key: String,
+        position: ExitPosition,
         deadline: Instant,
         reply: Reply<()>,
     },
@@ -227,6 +241,14 @@ impl OrderRuntimeHandle {
     pub(crate) fn cancel(&self, basket_id: String) -> Result<()> {
         self.request(|deadline, reply| Command::Cancel {
             basket_id,
+            deadline,
+            reply,
+        })
+    }
+
+    pub(crate) fn exit_position(&self, position: ExitPosition) -> Result<()> {
+        self.request(|deadline, reply| Command::ExitPosition {
+            position,
             deadline,
             reply,
         })
@@ -672,6 +694,38 @@ async fn begin_command(
                 reply,
             }))
         }
+        Command::ExitPosition {
+            position,
+            deadline,
+            reply,
+        } => {
+            if Instant::now() >= deadline {
+                let _ = reply.send(Err(anyhow::anyhow!(
+                    "Rithmic exit-position command expired"
+                )));
+                return Ok(None);
+            }
+            let request_key = request_key("exit-position", sequence);
+            let payload = match order::exit_position_request(&request_key, account, &position) {
+                Ok(payload) => payload,
+                Err(error) => {
+                    let _ = reply.send(Err(error));
+                    return Ok(None);
+                }
+            };
+            if let Err(error) = connection.send_payload(payload).await {
+                let _ = reply.send(Err(anyhow::anyhow!(
+                    "Rithmic exit-position result is ambiguous: {error}"
+                )));
+                return Err(error);
+            }
+            Ok(Some(Pending::ExitPosition {
+                request_key,
+                position,
+                deadline,
+                reply,
+            }))
+        }
         Command::Lookup {
             client_order_id,
             exchange,
@@ -888,6 +942,37 @@ fn handle_payload(
                 Err(error) => {
                     let _ = reply.send(Err(
                         error.context("Rithmic modify-order result is ambiguous")
+                    ));
+                }
+            }
+        }
+        Some(Pending::ExitPosition {
+            request_key,
+            position,
+            deadline,
+            reply,
+        }) if order::is_exit_position_response(template_id) => {
+            match order::decode_exit_position_response(&payload, &request_key, &position) {
+                Ok(ResponseDisposition::Processing) => {
+                    *pending = Some(Pending::ExitPosition {
+                        request_key,
+                        position,
+                        deadline,
+                        reply,
+                    });
+                }
+                Ok(ResponseDisposition::Succeeded) => {
+                    let _ = reply.send(Ok(()));
+                }
+                Ok(ResponseDisposition::Failed(codes)) => {
+                    let _ = reply.send(Err(anyhow::anyhow!(
+                        "Rithmic exit-position response failed: {}",
+                        codes.join(",")
+                    )));
+                }
+                Err(error) => {
+                    let _ = reply.send(Err(
+                        error.context("Rithmic exit-position result is ambiguous")
                     ));
                 }
             }
@@ -1175,6 +1260,10 @@ fn reject_matching_pending(pending: &mut Option<Pending>, request_key: &str, cod
             request_key: expected,
             ..
         })
+        | Some(Pending::ExitPosition {
+            request_key: expected,
+            ..
+        })
         | Some(Pending::Lookup {
             request_key: expected,
             ..
@@ -1216,6 +1305,7 @@ fn pending_expired(pending: &Pending) -> bool {
         Pending::Submit { deadline, .. }
         | Pending::Cancel { deadline, .. }
         | Pending::Modify { deadline, .. }
+        | Pending::ExitPosition { deadline, .. }
         | Pending::Lookup { deadline, .. } => deadline,
     };
     Instant::now() >= *deadline
@@ -1227,6 +1317,9 @@ fn reject_command(command: Command, message: &str) {
             let _ = reply.send(Err(anyhow::anyhow!(message.to_string())));
         }
         Command::Modify { reply, .. } | Command::Cancel { reply, .. } => {
+            let _ = reply.send(Err(anyhow::anyhow!(message.to_string())));
+        }
+        Command::ExitPosition { reply, .. } => {
             let _ = reply.send(Err(anyhow::anyhow!(message.to_string())));
         }
         Command::Lookup { reply, .. } => {
@@ -1246,6 +1339,9 @@ fn fail_pending(pending: &mut Option<Pending>, message: &str) {
                 let _ = reply.send(Err(anyhow::anyhow!(message.to_string())));
             }
             Pending::Modify { reply, .. } => {
+                let _ = reply.send(Err(anyhow::anyhow!(message.to_string())));
+            }
+            Pending::ExitPosition { reply, .. } => {
                 let _ = reply.send(Err(anyhow::anyhow!(message.to_string())));
             }
             Pending::Lookup { reply, .. } => {
@@ -1680,6 +1776,22 @@ mod tests {
         )
     }
 
+    fn pending_exit_position() -> (Option<Pending>, std_mpsc::Receiver<Result<()>>) {
+        let (tx, rx) = std_mpsc::sync_channel(1);
+        (
+            Some(Pending::ExitPosition {
+                request_key: "exit-position-1".to_string(),
+                position: ExitPosition {
+                    exchange: "CME".to_string(),
+                    symbol: "NQU6".to_string(),
+                },
+                deadline: Instant::now() + COMMAND_TIMEOUT,
+                reply: tx,
+            }),
+            rx,
+        )
+    }
+
     fn pending_lookup() -> (
         Option<Pending>,
         std_mpsc::Receiver<Result<Option<OrderSnapshot>>>,
@@ -1727,6 +1839,36 @@ mod tests {
             "CME"
         )
         .is_err());
+    }
+
+    #[test]
+    fn exit_position_waits_for_terminal_response_and_fails_closed() {
+        let response = |handler: &[&str], terminal: &[&str]| {
+            codec::encode(&protocol::ResponseExitPosition {
+                template_id: 3505,
+                user_msg: vec!["exit-position-1".to_string()],
+                rq_handler_rp_code: handler.iter().map(|code| (*code).to_string()).collect(),
+                rp_code: terminal.iter().map(|code| (*code).to_string()).collect(),
+                exchange: Some("CME".to_string()),
+                symbol: Some("NQU6".to_string()),
+            })
+            .unwrap()
+        };
+        let account = event("open", "basket-1").account;
+        let (events, _event_rx) = std_mpsc::channel();
+
+        let (mut pending, rx) = pending_exit_position();
+        handle_payload(response(&["0"], &[]), &account, &mut pending, &events).unwrap();
+        assert!(matches!(pending, Some(Pending::ExitPosition { .. })));
+        assert!(matches!(rx.try_recv(), Err(std_mpsc::TryRecvError::Empty)));
+        handle_payload(response(&[], &["0"]), &account, &mut pending, &events).unwrap();
+        assert!(pending.is_none());
+        assert!(rx.recv().unwrap().is_ok());
+
+        let (mut pending, rx) = pending_exit_position();
+        handle_payload(response(&[], &["9"]), &account, &mut pending, &events).unwrap();
+        assert!(pending.is_none());
+        assert!(rx.recv().unwrap().unwrap_err().to_string().contains("9"));
     }
 
     #[test]
