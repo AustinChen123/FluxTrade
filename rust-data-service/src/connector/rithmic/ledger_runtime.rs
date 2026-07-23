@@ -216,6 +216,15 @@ pub(crate) async fn discover_order_account(
     connection: &mut RithmicConnection,
     account_id: Option<&str>,
 ) -> Result<Account> {
+    discover_order_account_with_login(connection, account_id)
+        .await
+        .map(|(account, _)| account)
+}
+
+pub(crate) async fn discover_order_account_with_login(
+    connection: &mut RithmicConnection,
+    account_id: Option<&str>,
+) -> Result<(Account, LoginInfo)> {
     connection
         .send_payload(ledger::login_info_request(LOGIN_INFO_KEY)?)
         .await?;
@@ -229,12 +238,13 @@ pub(crate) async fn discover_order_account(
     connection
         .send_payload(ledger::account_list_request(ACCOUNT_LIST_KEY, &login_info)?)
         .await?;
-    tokio::time::timeout(
+    let account = tokio::time::timeout(
         SNAPSHOT_TIMEOUT,
         collect_account(connection, &login_info, account_id),
     )
     .await
-    .context("Rithmic account-list snapshot timed out")?
+    .context("Rithmic account-list snapshot timed out")??;
+    Ok((account, login_info))
 }
 
 async fn collect_account(
@@ -421,6 +431,7 @@ fn ensure_login_identity(account: &AccountIdentity, login_info: &LoginInfo) -> R
 mod tests {
     use super::*;
     use rust_decimal::Decimal;
+    use rust_decimal_macros::dec;
 
     fn login_info() -> LoginInfo {
         LoginInfo {
@@ -451,6 +462,8 @@ mod tests {
             account: identity("FCM", "IB"),
             client_order_id: None,
             basket_id: "BASKET".to_string(),
+            original_basket_id: None,
+            linked_basket_ids: None,
             exchange_order_id: None,
             exchange: "CME".to_string(),
             symbol: "NQU6".to_string(),
@@ -460,6 +473,10 @@ mod tests {
             report_text: None,
             transaction_type: ledger::TransactionType::Buy,
             quantity: Decimal::ONE,
+            price: Some(dec!(20000.25)),
+            trigger_price: None,
+            price_type: Some("limit".to_string()),
+            bracket_type: None,
             filled_quantity: None,
             unfilled_quantity: Some(Decimal::ONE),
             average_fill_price: None,

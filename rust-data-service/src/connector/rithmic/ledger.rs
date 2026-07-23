@@ -91,6 +91,8 @@ pub(crate) struct OrderSnapshot {
     pub(crate) account: AccountIdentity,
     pub(crate) client_order_id: Option<String>,
     pub(crate) basket_id: String,
+    pub(crate) original_basket_id: Option<String>,
+    pub(crate) linked_basket_ids: Option<String>,
     pub(crate) exchange_order_id: Option<String>,
     pub(crate) exchange: String,
     pub(crate) symbol: String,
@@ -100,6 +102,10 @@ pub(crate) struct OrderSnapshot {
     pub(crate) report_text: Option<String>,
     pub(crate) transaction_type: TransactionType,
     pub(crate) quantity: Decimal,
+    pub(crate) price: Option<Decimal>,
+    pub(crate) trigger_price: Option<Decimal>,
+    pub(crate) price_type: Option<String>,
+    pub(crate) bracket_type: Option<String>,
     pub(crate) filled_quantity: Option<Decimal>,
     pub(crate) unfilled_quantity: Option<Decimal>,
     pub(crate) average_fill_price: Option<Decimal>,
@@ -295,6 +301,8 @@ fn order_snapshot_from_notification(
         account,
         client_order_id: optional_text(response.user_tag),
         basket_id: required_text(response.basket_id, "basket_id")?,
+        original_basket_id: optional_text(response.original_basket_id),
+        linked_basket_ids: optional_text(response.linked_basket_ids),
         exchange_order_id: optional_text(response.exchange_order_id),
         exchange: required_text(response.exchange, "exchange")?,
         symbol: required_text(response.symbol, "symbol")?,
@@ -307,6 +315,10 @@ fn order_snapshot_from_notification(
         report_text: optional_text(response.report_text),
         transaction_type: transaction_type(response.transaction_type)?,
         quantity: positive_quantity(response.quantity, "order quantity")?,
+        price: optional_nonnegative_decimal(response.price, "order price")?,
+        trigger_price: optional_nonnegative_decimal(response.trigger_price, "trigger price")?,
+        price_type: exchange_price_type(response.price_type)?,
+        bracket_type: exchange_bracket_type(response.bracket_type)?,
         filled_quantity: optional_quantity(response.total_fill_size, "total_fill_size")?,
         unfilled_quantity: optional_quantity(response.total_unfilled_size, "total_unfilled_size")?,
         average_fill_price: optional_nonnegative_decimal(
@@ -385,6 +397,8 @@ fn rithmic_order_snapshot(
         account,
         client_order_id: optional_text(response.user_tag),
         basket_id: required_text(response.basket_id, "basket_id")?,
+        original_basket_id: optional_text(response.original_basket_id),
+        linked_basket_ids: optional_text(response.linked_basket_ids),
         exchange_order_id: optional_text(response.exchange_order_id),
         exchange: required_text(response.exchange, "exchange")?,
         symbol: required_text(response.symbol, "symbol")?,
@@ -398,6 +412,10 @@ fn rithmic_order_snapshot(
         report_text: optional_text(response.report_text),
         transaction_type: transaction_type_value(response.transaction_type)?,
         quantity: positive_quantity(response.quantity, "order quantity")?,
+        price: optional_nonnegative_decimal(response.price, "order price")?,
+        trigger_price: optional_nonnegative_decimal(response.trigger_price, "trigger price")?,
+        price_type: rithmic_price_type(response.price_type)?,
+        bracket_type: rithmic_bracket_type(response.bracket_type)?,
         filled_quantity: optional_quantity(response.total_fill_size, "total_fill_size")?,
         unfilled_quantity: optional_quantity(response.total_unfilled_size, "total_unfilled_size")?,
         average_fill_price: optional_nonnegative_decimal(
@@ -642,6 +660,46 @@ fn transaction_type_value(value: Option<i32>) -> Result<TransactionType> {
     }
 }
 
+fn exchange_price_type(value: Option<i32>) -> Result<Option<String>> {
+    value
+        .map(|value| {
+            protocol::exchange_order_notification::PriceType::try_from(value)
+                .context("unknown Rithmic exchange-order price type")
+                .map(|value| value.as_str_name().to_ascii_lowercase())
+        })
+        .transpose()
+}
+
+fn rithmic_price_type(value: Option<i32>) -> Result<Option<String>> {
+    value
+        .map(|value| {
+            protocol::rithmic_order_notification::PriceType::try_from(value)
+                .context("unknown Rithmic order-history price type")
+                .map(|value| value.as_str_name().to_ascii_lowercase())
+        })
+        .transpose()
+}
+
+fn exchange_bracket_type(value: Option<i32>) -> Result<Option<String>> {
+    value
+        .map(|value| {
+            protocol::exchange_order_notification::BracketType::try_from(value)
+                .context("unknown Rithmic exchange-order bracket type")
+                .map(|value| value.as_str_name().to_ascii_lowercase())
+        })
+        .transpose()
+}
+
+fn rithmic_bracket_type(value: Option<i32>) -> Result<Option<String>> {
+    value
+        .map(|value| {
+            protocol::rithmic_order_notification::BracketType::try_from(value)
+                .context("unknown Rithmic order-history bracket type")
+                .map(|value| value.as_str_name().to_ascii_lowercase())
+        })
+        .transpose()
+}
+
 fn exchange_notification_type(value: i32) -> Result<String> {
     protocol::exchange_order_notification::NotifyType::try_from(value)
         .context("unknown Rithmic exchange-order notify type")
@@ -870,6 +928,14 @@ mod tests {
                 report_text: Some("report".to_string()),
                 transaction_type: Some(1),
                 quantity: Some(1),
+                price: Some(20_001.25),
+                trigger_price: Some(19_999.25),
+                price_type: Some(
+                    protocol::rithmic_order_notification::PriceType::StopMarket as i32,
+                ),
+                bracket_type: Some(
+                    protocol::rithmic_order_notification::BracketType::StopOnlyStatic as i32,
+                ),
                 total_fill_size: Some(0),
                 total_unfilled_size: Some(0),
                 ..Default::default()
@@ -884,6 +950,10 @@ mod tests {
             assert_eq!(order.status, "COMPLETE");
             assert_eq!(order.completion_reason.as_deref(), Some("reason"));
             assert_eq!(order.report_text.as_deref(), Some("report"));
+            assert_eq!(order.price, Some(dec!(20001.25)));
+            assert_eq!(order.trigger_price, Some(dec!(19999.25)));
+            assert_eq!(order.price_type.as_deref(), Some("stop_market"));
+            assert_eq!(order.bracket_type.as_deref(), Some("stop_only_static"));
         }
 
         for (notify_type, expected) in [
@@ -1045,6 +1115,12 @@ mod tests {
                 protocol::exchange_order_notification::TransactionType::Buy as i32,
             ),
             quantity: Some(2),
+            price: Some(21_001.25),
+            trigger_price: Some(20_999.25),
+            price_type: Some(protocol::exchange_order_notification::PriceType::StopMarket as i32),
+            bracket_type: Some(
+                protocol::exchange_order_notification::BracketType::StopOnlyStatic as i32,
+            ),
             total_fill_size: Some(1),
             total_unfilled_size: Some(1),
             avg_fill_price: Some(21_000.25),
@@ -1061,6 +1137,10 @@ mod tests {
         };
         assert_eq!(snapshot.client_order_id, None);
         assert_eq!(snapshot.quantity, dec!(2));
+        assert_eq!(snapshot.price, Some(dec!(21001.25)));
+        assert_eq!(snapshot.trigger_price, Some(dec!(20999.25)));
+        assert_eq!(snapshot.price_type.as_deref(), Some("stop_market"));
+        assert_eq!(snapshot.bracket_type.as_deref(), Some("stop_only_static"));
         assert_eq!(snapshot.filled_quantity, Some(dec!(1)));
         assert_eq!(snapshot.unfilled_quantity, Some(dec!(1)));
         assert_eq!(snapshot.average_fill_price, Some(dec!(21000.25)));

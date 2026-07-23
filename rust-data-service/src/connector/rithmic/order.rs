@@ -1,6 +1,6 @@
 use super::{
     codec,
-    ledger::{AccountIdentity, TransactionType},
+    ledger::{AccountIdentity, TransactionType, UserType},
     protocol,
     session::{classify_response_codes, ensure_success, ResponseDisposition},
 };
@@ -14,6 +14,10 @@ const SUBSCRIBE_ORDER_UPDATES_REQUEST: i32 = 308;
 const SUBSCRIBE_ORDER_UPDATES_RESPONSE: i32 = 309;
 const NEW_ORDER_REQUEST: i32 = 312;
 const NEW_ORDER_RESPONSE: i32 = 313;
+const BRACKET_ORDER_REQUEST: i32 = 330;
+const BRACKET_ORDER_RESPONSE: i32 = 331;
+const MODIFY_ORDER_REQUEST: i32 = 314;
+const MODIFY_ORDER_RESPONSE: i32 = 315;
 const CANCEL_ORDER_REQUEST: i32 = 316;
 const CANCEL_ORDER_RESPONSE: i32 = 317;
 const EXCHANGE_ORDER_NOTIFICATION: i32 = 352;
@@ -56,6 +60,29 @@ pub(crate) struct NewOrder {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct BracketOrder {
+    pub(crate) entry: NewOrder,
+    pub(crate) stop_ticks: Option<i32>,
+    pub(crate) target_ticks: Option<i32>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ProtectionLeg {
+    StopLoss,
+    TakeProfit,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct ProtectionModification {
+    pub(crate) basket_id: String,
+    pub(crate) exchange: String,
+    pub(crate) symbol: String,
+    pub(crate) quantity: Decimal,
+    pub(crate) leg: ProtectionLeg,
+    pub(crate) price: Decimal,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct OrderAck {
     pub(crate) client_order_id: String,
     pub(crate) basket_id: String,
@@ -72,12 +99,19 @@ pub(crate) struct OrderEvent {
     pub(crate) account: AccountIdentity,
     pub(crate) client_order_id: Option<String>,
     pub(crate) basket_id: String,
+    pub(crate) original_basket_id: Option<String>,
+    pub(crate) linked_basket_ids: Option<String>,
     pub(crate) exchange_order_id: Option<String>,
     pub(crate) exchange: String,
     pub(crate) symbol: String,
     pub(crate) status: String,
+    pub(crate) notification_type: String,
     pub(crate) transaction_type: TransactionType,
     pub(crate) quantity: Decimal,
+    pub(crate) price: Option<Decimal>,
+    pub(crate) trigger_price: Option<Decimal>,
+    pub(crate) price_type: Option<String>,
+    pub(crate) bracket_type: Option<String>,
     pub(crate) last_fill_quantity: Option<Decimal>,
     pub(crate) last_fill_price: Option<Decimal>,
     pub(crate) cumulative_filled_quantity: Option<Decimal>,
@@ -155,23 +189,8 @@ pub(crate) fn new_order_request(
 ) -> Result<Vec<u8>> {
     validate_request_key(request_key)?;
     validate_account(account)?;
-    let client_order_id = required_text(Some(order.client_order_id.clone()), "client order ID")?;
-    let exchange = required_text(Some(order.exchange.clone()), "exchange")?;
-    let symbol = required_text(Some(order.symbol.clone()), "symbol")?;
     let trade_route = required_text(Some(trade_route.to_string()), "trade route")?;
-    let quantity = decimal_quantity_to_i32(order.quantity)?;
-    let price = match order.order_type {
-        OrderType::Market => {
-            ensure!(
-                order.price.is_none(),
-                "Rithmic market order cannot include price"
-            );
-            None
-        }
-        OrderType::Limit => Some(decimal_price_to_f64(
-            order.price.context("Rithmic limit order requires price")?,
-        )?),
-    };
+    let fields = validate_wire_order(order)?;
     let transaction_type = match order.side {
         OrderSide::Buy => protocol::request_new_order::TransactionType::Buy as i32,
         OrderSide::Sell => protocol::request_new_order::TransactionType::Sell as i32,
@@ -183,19 +202,125 @@ pub(crate) fn new_order_request(
     codec::encode(&protocol::RequestNewOrder {
         template_id: NEW_ORDER_REQUEST,
         user_msg: vec![request_key.to_string()],
-        user_tag: Some(client_order_id),
+        user_tag: Some(fields.client_order_id),
         fcm_id: Some(account.fcm_id.clone()),
         ib_id: Some(account.ib_id.clone()),
         account_id: Some(account.account_id.clone()),
-        symbol: Some(symbol),
-        exchange: Some(exchange),
-        quantity: Some(quantity),
-        price,
+        symbol: Some(fields.symbol),
+        exchange: Some(fields.exchange),
+        quantity: Some(fields.quantity),
+        price: fields.price,
         transaction_type: Some(transaction_type),
         duration: Some(protocol::request_new_order::Duration::Day as i32),
         price_type: Some(price_type),
         trade_route: Some(trade_route),
         manual_or_auto: Some(protocol::request_new_order::OrderPlacement::Auto as i32),
+        ..Default::default()
+    })
+}
+
+pub(crate) fn bracket_order_request(
+    request_key: &str,
+    account: &AccountIdentity,
+    user_type: UserType,
+    trade_route: &str,
+    order: &BracketOrder,
+) -> Result<Vec<u8>> {
+    validate_request_key(request_key)?;
+    validate_account(account)?;
+    let trade_route = required_text(Some(trade_route.to_string()), "trade route")?;
+    let fields = validate_wire_order(&order.entry)?;
+    let stop_ticks = positive_ticks(order.stop_ticks, "stop ticks")?;
+    let target_ticks = positive_ticks(order.target_ticks, "target ticks")?;
+    ensure!(
+        stop_ticks.is_some() || target_ticks.is_some(),
+        "Rithmic bracket order requires stop or target ticks"
+    );
+    let bracket_type = match (stop_ticks, target_ticks) {
+        (Some(_), Some(_)) => protocol::request_bracket_order::BracketType::TargetAndStopStatic,
+        (Some(_), None) => protocol::request_bracket_order::BracketType::StopOnlyStatic,
+        (None, Some(_)) => protocol::request_bracket_order::BracketType::TargetOnlyStatic,
+        (None, None) => unreachable!("validated bracket has at least one protective leg"),
+    } as i32;
+    let transaction_type = match order.entry.side {
+        OrderSide::Buy => protocol::request_bracket_order::TransactionType::Buy as i32,
+        OrderSide::Sell => protocol::request_bracket_order::TransactionType::Sell as i32,
+    };
+    let price_type = match order.entry.order_type {
+        OrderType::Market => protocol::request_bracket_order::PriceType::Market as i32,
+        OrderType::Limit => protocol::request_bracket_order::PriceType::Limit as i32,
+    };
+    let user_type = match user_type {
+        UserType::Admin => protocol::request_bracket_order::UserType::Admin as i32,
+        UserType::Fcm => protocol::request_bracket_order::UserType::Fcm as i32,
+        UserType::Ib => protocol::request_bracket_order::UserType::Ib as i32,
+        UserType::Trader => protocol::request_bracket_order::UserType::Trader as i32,
+    };
+
+    codec::encode(&protocol::RequestBracketOrder {
+        template_id: BRACKET_ORDER_REQUEST,
+        user_msg: vec![request_key.to_string()],
+        user_tag: Some(fields.client_order_id),
+        fcm_id: Some(account.fcm_id.clone()),
+        ib_id: Some(account.ib_id.clone()),
+        account_id: Some(account.account_id.clone()),
+        symbol: Some(fields.symbol),
+        exchange: Some(fields.exchange),
+        quantity: Some(fields.quantity),
+        price: fields.price,
+        transaction_type: Some(transaction_type),
+        duration: Some(protocol::request_bracket_order::Duration::Day as i32),
+        price_type: Some(price_type),
+        trade_route: Some(trade_route),
+        manual_or_auto: Some(protocol::request_bracket_order::OrderPlacement::Auto as i32),
+        user_type: Some(user_type),
+        bracket_type: Some(bracket_type),
+        target_quantity: target_ticks.map(|_| fields.quantity).into_iter().collect(),
+        target_ticks: target_ticks.into_iter().collect(),
+        stop_quantity: stop_ticks.map(|_| fields.quantity).into_iter().collect(),
+        stop_ticks: stop_ticks.into_iter().collect(),
+        ..Default::default()
+    })
+}
+
+pub(crate) fn modify_order_request(
+    request_key: &str,
+    account: &AccountIdentity,
+    modification: &ProtectionModification,
+) -> Result<Vec<u8>> {
+    validate_request_key(request_key)?;
+    validate_account(account)?;
+    let basket_id = required_text(Some(modification.basket_id.clone()), "basket ID")?;
+    let exchange = required_text(Some(modification.exchange.clone()), "exchange")?;
+    let symbol = required_text(Some(modification.symbol.clone()), "symbol")?;
+    let quantity = decimal_quantity_to_i32(modification.quantity)?;
+    let price = decimal_price_to_f64(modification.price)?;
+    let (price_type, limit_price, trigger_price) = match modification.leg {
+        ProtectionLeg::StopLoss => (
+            protocol::request_modify_order::PriceType::StopMarket as i32,
+            None,
+            Some(price),
+        ),
+        ProtectionLeg::TakeProfit => (
+            protocol::request_modify_order::PriceType::Limit as i32,
+            Some(price),
+            None,
+        ),
+    };
+    codec::encode(&protocol::RequestModifyOrder {
+        template_id: MODIFY_ORDER_REQUEST,
+        user_msg: vec![request_key.to_string()],
+        fcm_id: Some(account.fcm_id.clone()),
+        ib_id: Some(account.ib_id.clone()),
+        account_id: Some(account.account_id.clone()),
+        basket_id: Some(basket_id),
+        symbol: Some(symbol),
+        exchange: Some(exchange),
+        quantity: Some(quantity),
+        price: limit_price,
+        trigger_price,
+        price_type: Some(price_type),
+        manual_or_auto: Some(protocol::request_modify_order::OrderPlacement::Auto as i32),
         ..Default::default()
     })
 }
@@ -218,6 +343,49 @@ pub(crate) fn decode_new_order_response(
     Ok(MutationResponse {
         disposition: classify_response_codes(&response.rq_handler_rp_code, &response.rp_code)?,
         basket_id: optional_text(response.basket_id),
+    })
+}
+
+pub(crate) fn decode_bracket_order_response(
+    payload: &[u8],
+    request_key: &str,
+    expected_client_order_id: &str,
+) -> Result<MutationResponse> {
+    validate_request_key(request_key)?;
+    ensure_template(payload, BRACKET_ORDER_RESPONSE)?;
+    let response: protocol::ResponseBracketOrder = codec::decode(payload)?;
+    ensure_request_key(&response.user_msg, request_key)?;
+    if let Some(user_tag) = optional_text(response.user_tag) {
+        ensure!(
+            user_tag == expected_client_order_id,
+            "Rithmic bracket-order client ID mismatch"
+        );
+    }
+    Ok(MutationResponse {
+        disposition: classify_response_codes(&response.rq_handler_rp_code, &response.rp_code)?,
+        basket_id: optional_text(response.basket_id),
+    })
+}
+
+pub(crate) fn decode_modify_order_response(
+    payload: &[u8],
+    request_key: &str,
+    expected_basket_id: &str,
+) -> Result<MutationResponse> {
+    validate_request_key(request_key)?;
+    ensure_template(payload, MODIFY_ORDER_RESPONSE)?;
+    let response: protocol::ResponseModifyOrder = codec::decode(payload)?;
+    ensure_request_key(&response.user_msg, request_key)?;
+    let basket_id = optional_text(response.basket_id);
+    if let Some(basket_id) = basket_id.as_deref() {
+        ensure!(
+            basket_id == expected_basket_id,
+            "Rithmic modify-order basket ID mismatch"
+        );
+    }
+    Ok(MutationResponse {
+        disposition: classify_response_codes(&response.rq_handler_rp_code, &response.rp_code)?,
+        basket_id,
     })
 }
 
@@ -317,12 +485,19 @@ pub(crate) fn decode_order_event(
         account,
         client_order_id: optional_text(response.user_tag),
         basket_id: required_text(response.basket_id, "basket ID")?,
+        original_basket_id: optional_text(response.original_basket_id),
+        linked_basket_ids: optional_text(response.linked_basket_ids),
         exchange_order_id: optional_text(response.exchange_order_id),
         exchange: required_text(response.exchange, "exchange")?,
         symbol: required_text(response.symbol, "symbol")?,
         status,
+        notification_type: notify_type.as_str_name().to_ascii_lowercase(),
         transaction_type: transaction_type(response.transaction_type)?,
         quantity,
+        price: optional_nonnegative_decimal(response.price, "order price")?,
+        trigger_price: optional_nonnegative_decimal(response.trigger_price, "trigger price")?,
+        price_type: optional_exchange_price_type(response.price_type)?,
+        bracket_type: optional_exchange_bracket_type(response.bracket_type)?,
         last_fill_quantity: optional_positive_quantity(response.fill_size, "fill size")?,
         last_fill_price: optional_nonnegative_decimal(response.fill_price, "fill price")?,
         cumulative_filled_quantity,
@@ -340,6 +515,14 @@ pub(crate) fn template_id(payload: &[u8]) -> Result<i32> {
 
 pub(crate) fn is_new_order_response(template_id: i32) -> bool {
     template_id == NEW_ORDER_RESPONSE
+}
+
+pub(crate) fn is_bracket_order_response(template_id: i32) -> bool {
+    template_id == BRACKET_ORDER_RESPONSE
+}
+
+pub(crate) fn is_modify_order_response(template_id: i32) -> bool {
+    template_id == MODIFY_ORDER_RESPONSE
 }
 
 pub(crate) fn is_cancel_order_response(template_id: i32) -> bool {
@@ -556,6 +739,41 @@ fn transaction_type(value: Option<i32>) -> Result<TransactionType> {
     }
 }
 
+fn optional_exchange_price_type(value: Option<i32>) -> Result<Option<String>> {
+    use protocol::exchange_order_notification::PriceType;
+    value
+        .map(|value| {
+            let value = PriceType::try_from(value).context("unknown Rithmic order price type")?;
+            Ok(match value {
+                PriceType::Limit => "limit",
+                PriceType::Market => "market",
+                PriceType::StopLimit => "stop_limit",
+                PriceType::StopMarket => "stop_market",
+            }
+            .to_string())
+        })
+        .transpose()
+}
+
+fn optional_exchange_bracket_type(value: Option<i32>) -> Result<Option<String>> {
+    use protocol::exchange_order_notification::BracketType;
+    value
+        .map(|value| {
+            let value =
+                BracketType::try_from(value).context("unknown Rithmic order bracket type")?;
+            Ok(match value {
+                BracketType::StopOnly => "stop_only",
+                BracketType::TargetOnly => "target_only",
+                BracketType::TargetAndStop => "target_and_stop",
+                BracketType::StopOnlyStatic => "stop_only_static",
+                BracketType::TargetOnlyStatic => "target_only_static",
+                BracketType::TargetAndStopStatic => "target_and_stop_static",
+            }
+            .to_string())
+        })
+        .transpose()
+}
+
 fn positive_quantity(value: Option<i32>, field: &str) -> Result<Decimal> {
     let value = value.with_context(|| format!("missing Rithmic {field}"))?;
     ensure!(value > 0, "invalid Rithmic {field}");
@@ -586,6 +804,49 @@ fn optional_nonnegative_decimal(value: Option<f64>, field: &str) -> Result<Optio
             ensure!(value.is_finite() && value >= 0.0, "invalid Rithmic {field}");
             Decimal::from_str(&value.to_string())
                 .with_context(|| format!("invalid Rithmic {field}"))
+        })
+        .transpose()
+}
+
+struct WireOrderFields {
+    client_order_id: String,
+    exchange: String,
+    symbol: String,
+    quantity: i32,
+    price: Option<f64>,
+}
+
+fn validate_wire_order(order: &NewOrder) -> Result<WireOrderFields> {
+    let client_order_id = required_text(Some(order.client_order_id.clone()), "client order ID")?;
+    let exchange = required_text(Some(order.exchange.clone()), "exchange")?;
+    let symbol = required_text(Some(order.symbol.clone()), "symbol")?;
+    let quantity = decimal_quantity_to_i32(order.quantity)?;
+    let price = match order.order_type {
+        OrderType::Market => {
+            ensure!(
+                order.price.is_none(),
+                "Rithmic market order cannot include price"
+            );
+            None
+        }
+        OrderType::Limit => Some(decimal_price_to_f64(
+            order.price.context("Rithmic limit order requires price")?,
+        )?),
+    };
+    Ok(WireOrderFields {
+        client_order_id,
+        exchange,
+        symbol,
+        quantity,
+        price,
+    })
+}
+
+fn positive_ticks(value: Option<i32>, field: &str) -> Result<Option<i32>> {
+    value
+        .map(|value| {
+            ensure!(value > 0, "invalid Rithmic {field}");
+            Ok(value)
         })
         .transpose()
 }
@@ -647,6 +908,134 @@ mod tests {
         let cancel: protocol::RequestCancelOrder = codec::decode(&cancel).unwrap();
         assert_eq!(cancel.template_id, CANCEL_ORDER_REQUEST);
         assert_eq!(cancel.basket_id.as_deref(), Some("basket-1"));
+    }
+
+    #[test]
+    fn bracket_request_maps_static_protection_matrix() {
+        use protocol::request_bracket_order::BracketType;
+
+        for (stop_ticks, target_ticks, bracket_type) in [
+            (Some(8), None, BracketType::StopOnlyStatic),
+            (None, Some(12), BracketType::TargetOnlyStatic),
+            (Some(8), Some(12), BracketType::TargetAndStopStatic),
+        ] {
+            let payload = bracket_order_request(
+                "bracket-1",
+                &account(),
+                UserType::Trader,
+                "route",
+                &BracketOrder {
+                    entry: order(OrderType::Limit),
+                    stop_ticks,
+                    target_ticks,
+                },
+            )
+            .unwrap();
+            let request: protocol::RequestBracketOrder = codec::decode(&payload).unwrap();
+
+            assert_eq!(request.template_id, BRACKET_ORDER_REQUEST);
+            assert_eq!(request.user_msg, ["bracket-1"]);
+            assert_eq!(request.user_tag.as_deref(), Some("client-1"));
+            assert_eq!(request.quantity, Some(1));
+            assert_eq!(request.price, Some(20000.25));
+            assert_eq!(request.trade_route.as_deref(), Some("route"));
+            assert_eq!(request.user_type, Some(3));
+            assert_eq!(request.bracket_type, Some(bracket_type as i32));
+            assert_eq!(
+                request.stop_ticks,
+                stop_ticks.into_iter().collect::<Vec<_>>()
+            );
+            assert_eq!(
+                request.stop_quantity,
+                stop_ticks.map(|_| 1).into_iter().collect::<Vec<_>>()
+            );
+            assert_eq!(
+                request.target_ticks,
+                target_ticks.into_iter().collect::<Vec<_>>()
+            );
+            assert_eq!(
+                request.target_quantity,
+                target_ticks.map(|_| 1).into_iter().collect::<Vec<_>>()
+            );
+        }
+    }
+
+    #[test]
+    fn bracket_request_validation_matrix_fails_closed() {
+        for (stop_ticks, target_ticks, succeeds) in [
+            (Some(1), None, true),
+            (None, Some(1), true),
+            (Some(1), Some(1), true),
+            (None, None, false),
+            (Some(0), None, false),
+            (Some(-1), None, false),
+            (None, Some(0), false),
+            (None, Some(-1), false),
+        ] {
+            assert_eq!(
+                bracket_order_request(
+                    "bracket",
+                    &account(),
+                    UserType::Trader,
+                    "route",
+                    &BracketOrder {
+                        entry: order(OrderType::Market),
+                        stop_ticks,
+                        target_ticks,
+                    },
+                )
+                .is_ok(),
+                succeeds,
+                "stop_ticks={stop_ticks:?} target_ticks={target_ticks:?}",
+            );
+        }
+    }
+
+    #[test]
+    fn modify_protection_request_maps_stop_and_target_fields() {
+        use protocol::request_modify_order::PriceType;
+
+        for (leg, price_type, price, trigger_price) in [
+            (
+                ProtectionLeg::StopLoss,
+                PriceType::StopMarket,
+                None,
+                Some(19999.0),
+            ),
+            (
+                ProtectionLeg::TakeProfit,
+                PriceType::Limit,
+                Some(20003.0),
+                None,
+            ),
+        ] {
+            let payload = modify_order_request(
+                "modify-1",
+                &account(),
+                &ProtectionModification {
+                    basket_id: "child-1".to_string(),
+                    exchange: "CME".to_string(),
+                    symbol: "NQU6".to_string(),
+                    quantity: dec!(1),
+                    leg,
+                    price: if leg == ProtectionLeg::StopLoss {
+                        dec!(19999.0)
+                    } else {
+                        dec!(20003.0)
+                    },
+                },
+            )
+            .unwrap();
+            let request: protocol::RequestModifyOrder = codec::decode(&payload).unwrap();
+
+            assert_eq!(request.template_id, 314);
+            assert_eq!(request.user_msg, ["modify-1"]);
+            assert_eq!(request.basket_id.as_deref(), Some("child-1"));
+            assert_eq!(request.quantity, Some(1));
+            assert_eq!(request.price_type, Some(price_type as i32));
+            assert_eq!(request.price, price);
+            assert_eq!(request.trigger_price, trigger_price);
+        }
     }
 
     #[test]
@@ -768,6 +1157,104 @@ mod tests {
     }
 
     #[test]
+    fn bracket_response_phase_and_identity_are_strict() {
+        let response = |request_key: &str, user_tag: &str, handler: &[&str], terminal: &[&str]| {
+            codec::encode(&protocol::ResponseBracketOrder {
+                template_id: BRACKET_ORDER_RESPONSE,
+                user_msg: vec![request_key.to_string()],
+                user_tag: Some(user_tag.to_string()),
+                basket_id: Some("basket-1".to_string()),
+                rq_handler_rp_code: handler.iter().map(|code| (*code).to_string()).collect(),
+                rp_code: terminal.iter().map(|code| (*code).to_string()).collect(),
+                ..Default::default()
+            })
+            .unwrap()
+        };
+
+        assert_eq!(
+            decode_bracket_order_response(
+                &response("bracket", "client-1", &["0"], &[]),
+                "bracket",
+                "client-1",
+            )
+            .unwrap()
+            .disposition,
+            ResponseDisposition::Processing,
+        );
+        assert_eq!(
+            decode_bracket_order_response(
+                &response("bracket", "client-1", &[], &["0"]),
+                "bracket",
+                "client-1",
+            )
+            .unwrap()
+            .disposition,
+            ResponseDisposition::Succeeded,
+        );
+        assert!(decode_bracket_order_response(
+            &response("other", "client-1", &[], &["0"]),
+            "bracket",
+            "client-1",
+        )
+        .is_err());
+        assert!(decode_bracket_order_response(
+            &response("bracket", "other", &[], &["0"]),
+            "bracket",
+            "client-1",
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn modify_response_phase_and_basket_identity_are_strict() {
+        let response =
+            |request_key: &str, basket_id: Option<&str>, handler: &[&str], terminal: &[&str]| {
+                codec::encode(&protocol::ResponseModifyOrder {
+                    template_id: 315,
+                    user_msg: vec![request_key.to_string()],
+                    basket_id: basket_id.map(str::to_string),
+                    rq_handler_rp_code: handler.iter().map(|code| (*code).to_string()).collect(),
+                    rp_code: terminal.iter().map(|code| (*code).to_string()).collect(),
+                    ..Default::default()
+                })
+                .unwrap()
+            };
+
+        assert_eq!(
+            decode_modify_order_response(
+                &response("modify", Some("child-1"), &["0"], &[]),
+                "modify",
+                "child-1",
+            )
+            .unwrap()
+            .disposition,
+            ResponseDisposition::Processing,
+        );
+        assert_eq!(
+            decode_modify_order_response(
+                &response("modify", Some("child-1"), &[], &["0"]),
+                "modify",
+                "child-1",
+            )
+            .unwrap()
+            .disposition,
+            ResponseDisposition::Succeeded,
+        );
+        assert!(decode_modify_order_response(
+            &response("other", Some("child-1"), &[], &["0"]),
+            "modify",
+            "child-1",
+        )
+        .is_err());
+        assert!(decode_modify_order_response(
+            &response("modify", Some("other-child"), &[], &["0"]),
+            "modify",
+            "child-1",
+        )
+        .is_err());
+    }
+
+    #[test]
     fn cancel_response_phase_and_identity_are_explicit() {
         let response = |handler: &[&str], terminal: &[&str], basket_id: Option<&str>| {
             codec::encode(&protocol::ResponseCancelOrder {
@@ -849,6 +1336,50 @@ mod tests {
                 expected
             );
         }
+    }
+
+    #[test]
+    fn live_event_preserves_bracket_identity_and_decimal_prices() {
+        let payload = codec::encode(&protocol::ExchangeOrderNotification {
+            template_id: EXCHANGE_ORDER_NOTIFICATION,
+            notify_type: Some(protocol::exchange_order_notification::NotifyType::Status as i32),
+            is_snapshot: Some(false),
+            user_tag: Some("client-1".to_string()),
+            fcm_id: Some("FCM".to_string()),
+            ib_id: Some("IB".to_string()),
+            account_id: Some("ACCOUNT".to_string()),
+            basket_id: Some("child-1".to_string()),
+            original_basket_id: Some("parent-1".to_string()),
+            linked_basket_ids: Some("child-2".to_string()),
+            exchange: Some("CME".to_string()),
+            symbol: Some("NQU6".to_string()),
+            status: Some("OPEN".to_string()),
+            transaction_type: Some(
+                protocol::exchange_order_notification::TransactionType::Sell as i32,
+            ),
+            quantity: Some(1),
+            price: Some(20002.25),
+            trigger_price: Some(19998.25),
+            price_type: Some(protocol::exchange_order_notification::PriceType::StopMarket as i32),
+            bracket_type: Some(
+                protocol::exchange_order_notification::BracketType::TargetAndStopStatic as i32,
+            ),
+            total_fill_size: Some(0),
+            total_unfilled_size: Some(1),
+            ..Default::default()
+        })
+        .unwrap();
+
+        let event = decode_order_event(&payload, &account()).unwrap();
+        assert_eq!(event.original_basket_id.as_deref(), Some("parent-1"));
+        assert_eq!(event.linked_basket_ids.as_deref(), Some("child-2"));
+        assert_eq!(event.price, Some(dec!(20002.25)));
+        assert_eq!(event.trigger_price, Some(dec!(19998.25)));
+        assert_eq!(event.price_type.as_deref(), Some("stop_market"));
+        assert_eq!(
+            event.bracket_type.as_deref(),
+            Some("target_and_stop_static")
+        );
     }
 
     #[test]

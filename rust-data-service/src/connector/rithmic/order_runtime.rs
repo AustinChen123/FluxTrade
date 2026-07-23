@@ -1,8 +1,11 @@
 use super::{
     config,
-    ledger::{self, AccountIdentity, OrderSnapshot, OrderSnapshotEvent},
-    ledger_runtime::{discover_order_account, next_payload, wait_for_heartbeat},
-    order::{self, NewOrder, OrderAck, OrderEvent, TradeRoute, TradeRouteEvent},
+    ledger::{self, AccountIdentity, OrderSnapshot, OrderSnapshotEvent, UserType},
+    ledger_runtime::{discover_order_account_with_login, next_payload, wait_for_heartbeat},
+    order::{
+        self, BracketOrder, NewOrder, OrderAck, OrderEvent, ProtectionModification, TradeRoute,
+        TradeRouteEvent,
+    },
     profile_lock::ProfileLease,
     session::{Plant, ResponseDisposition},
     transport::{self, ConnectionEvent, RithmicConnection},
@@ -36,6 +39,16 @@ enum Command {
         deadline: Instant,
         reply: Reply<OrderAck>,
     },
+    SubmitBracket {
+        order: BracketOrder,
+        deadline: Instant,
+        reply: Reply<OrderAck>,
+    },
+    Modify {
+        modification: ProtectionModification,
+        deadline: Instant,
+        reply: Reply<()>,
+    },
     Cancel {
         basket_id: String,
         deadline: Instant,
@@ -53,12 +66,31 @@ enum Command {
 
 impl Command {
     fn is_submission(&self) -> bool {
-        matches!(self, Self::Submit { .. })
+        matches!(
+            self,
+            Self::Submit { .. } | Self::SubmitBracket { .. } | Self::Modify { .. }
+        )
+    }
+}
+
+#[derive(Clone, Copy)]
+enum SubmitKind {
+    Plain,
+    Bracket,
+}
+
+impl SubmitKind {
+    fn is_response(self, template_id: i32) -> bool {
+        match self {
+            Self::Plain => order::is_new_order_response(template_id),
+            Self::Bracket => order::is_bracket_order_response(template_id),
+        }
     }
 }
 
 enum Pending {
     Submit {
+        kind: SubmitKind,
         request_key: String,
         client_order_id: String,
         basket_id: Option<String>,
@@ -70,6 +102,14 @@ enum Pending {
         basket_id: String,
         response_accepted: bool,
         terminal_seen: bool,
+        deadline: Instant,
+        reply: Reply<()>,
+    },
+    Modify {
+        request_key: String,
+        modification: ProtectionModification,
+        response_accepted: bool,
+        event_seen: bool,
         deadline: Instant,
         reply: Reply<()>,
     },
@@ -168,6 +208,22 @@ impl OrderRuntimeHandle {
         })
     }
 
+    pub(crate) fn submit_bracket(&self, order: BracketOrder) -> Result<OrderAck> {
+        self.request(|deadline, reply| Command::SubmitBracket {
+            order,
+            deadline,
+            reply,
+        })
+    }
+
+    pub(crate) fn modify(&self, modification: ProtectionModification) -> Result<()> {
+        self.request(|deadline, reply| Command::Modify {
+            modification,
+            deadline,
+            reply,
+        })
+    }
+
     pub(crate) fn cancel(&self, basket_id: String) -> Result<()> {
         self.request(|deadline, reply| Command::Cancel {
             basket_id,
@@ -261,13 +317,20 @@ async fn run_with_connector<C, F>(
     mut connect: C,
 ) where
     C: FnMut() -> F,
-    F: Future<Output = Result<(RithmicConnection, AccountIdentity, Vec<TradeRoute>)>>,
+    F: Future<
+        Output = Result<(
+            RithmicConnection,
+            AccountIdentity,
+            UserType,
+            Vec<TradeRoute>,
+        )>,
+    >,
 {
     let mut ready = Some(ready);
     let mut backoff = RECONNECT_INITIAL;
     loop {
         match connect().await {
-            Ok((mut connection, account, routes)) => {
+            Ok((mut connection, account, user_type, routes)) => {
                 connected.store(true, Ordering::Release);
                 let submissions_allowed = generation.fetch_add(1, Ordering::Release) == 0;
                 backoff = RECONNECT_INITIAL;
@@ -277,6 +340,7 @@ async fn run_with_connector<C, F>(
                 if !run_connected(
                     &mut connection,
                     &account,
+                    user_type,
                     &routes,
                     &mut commands,
                     &events,
@@ -315,7 +379,12 @@ async fn run_with_connector<C, F>(
 async fn connect_and_prepare(
     profile: &str,
     account_id: Option<&str>,
-) -> Result<(RithmicConnection, AccountIdentity, Vec<TradeRoute>)> {
+) -> Result<(
+    RithmicConnection,
+    AccountIdentity,
+    UserType,
+    Vec<TradeRoute>,
+)> {
     let runtime = config::load(profile, Plant::Order)?;
     connect_and_prepare_runtime(runtime, account_id).await
 }
@@ -323,12 +392,17 @@ async fn connect_and_prepare(
 async fn connect_and_prepare_runtime(
     runtime: config::RuntimeConfig,
     account_id: Option<&str>,
-) -> Result<(RithmicConnection, AccountIdentity, Vec<TradeRoute>)> {
+) -> Result<(
+    RithmicConnection,
+    AccountIdentity,
+    UserType,
+    Vec<TradeRoute>,
+)> {
     let mut connection = transport::connect(&runtime.url, runtime.login, RESPONSE_TIMEOUT).await?;
     wait_for_heartbeat(&mut connection, "ORDER").await?;
-    let account = discover_order_account(&mut connection, account_id)
-        .await?
-        .identity;
+    let (account, login_info) =
+        discover_order_account_with_login(&mut connection, account_id).await?;
+    let account = account.identity;
 
     connection
         .send_payload(order::trade_routes_request(TRADE_ROUTES_KEY)?)
@@ -346,7 +420,7 @@ async fn connect_and_prepare_runtime(
         .await
         .context("Rithmic order-update subscription timed out")??;
     order::decode_subscribe_order_updates_response(&payload, SUBSCRIBE_KEY)?;
-    Ok((connection, account, routes))
+    Ok((connection, account, login_info.user_type, routes))
 }
 
 async fn collect_trade_routes(connection: &mut RithmicConnection) -> Result<Vec<TradeRoute>> {
@@ -365,6 +439,7 @@ async fn collect_trade_routes(connection: &mut RithmicConnection) -> Result<Vec<
 async fn run_connected(
     connection: &mut RithmicConnection,
     account: &AccountIdentity,
+    user_type: UserType,
     routes: &[TradeRoute],
     commands: &mut mpsc::Receiver<Command>,
     events: &std_mpsc::Sender<Result<OrderEvent>>,
@@ -391,7 +466,16 @@ async fn run_connected(
                         reject_command(command, "Rithmic order runtime is busy");
                         continue;
                     }
-                    match begin_command(connection, account, routes, &sequence, command).await {
+                    match begin_command(
+                        connection,
+                        account,
+                        user_type,
+                        routes,
+                        &sequence,
+                        command,
+                    )
+                    .await
+                    {
                         Ok(next) => pending = next,
                         Err(error) => {
                             warn!(%error, "Rithmic order command write failed");
@@ -432,6 +516,7 @@ async fn run_connected(
 async fn begin_command(
     connection: &mut RithmicConnection,
     account: &AccountIdentity,
+    user_type: UserType,
     routes: &[TradeRoute],
     sequence: &AtomicU64,
     command: Command,
@@ -469,9 +554,88 @@ async fn begin_command(
                 return Err(error);
             }
             Ok(Some(Pending::Submit {
+                kind: SubmitKind::Plain,
                 request_key,
                 client_order_id,
                 basket_id: None,
+                deadline,
+                reply,
+            }))
+        }
+        Command::SubmitBracket {
+            order: bracket_order,
+            deadline,
+            reply,
+        } => {
+            if Instant::now() >= deadline {
+                let _ = reply.send(Err(anyhow::anyhow!("Rithmic bracket command expired")));
+                return Ok(None);
+            }
+            let route = match select_trade_route(routes, &bracket_order.entry.exchange) {
+                Ok(route) => route,
+                Err(error) => {
+                    let _ = reply.send(Err(error));
+                    return Ok(None);
+                }
+            };
+            let request_key = request_key("bracket", sequence);
+            let payload = match order::bracket_order_request(
+                &request_key,
+                account,
+                user_type,
+                route,
+                &bracket_order,
+            ) {
+                Ok(payload) => payload,
+                Err(error) => {
+                    let _ = reply.send(Err(error));
+                    return Ok(None);
+                }
+            };
+            let client_order_id = bracket_order.entry.client_order_id;
+            if let Err(error) = connection.send_payload(payload).await {
+                let _ = reply.send(Err(anyhow::anyhow!(
+                    "Rithmic bracket-order result is ambiguous: {error}"
+                )));
+                return Err(error);
+            }
+            Ok(Some(Pending::Submit {
+                kind: SubmitKind::Bracket,
+                request_key,
+                client_order_id,
+                basket_id: None,
+                deadline,
+                reply,
+            }))
+        }
+        Command::Modify {
+            modification,
+            deadline,
+            reply,
+        } => {
+            if Instant::now() >= deadline {
+                let _ = reply.send(Err(anyhow::anyhow!("Rithmic modify command expired")));
+                return Ok(None);
+            }
+            let request_key = request_key("modify", sequence);
+            let payload = match order::modify_order_request(&request_key, account, &modification) {
+                Ok(payload) => payload,
+                Err(error) => {
+                    let _ = reply.send(Err(error));
+                    return Ok(None);
+                }
+            };
+            if let Err(error) = connection.send_payload(payload).await {
+                let _ = reply.send(Err(anyhow::anyhow!(
+                    "Rithmic modify-order result is ambiguous: {error}"
+                )));
+                return Err(error);
+            }
+            Ok(Some(Pending::Modify {
+                request_key,
+                modification,
+                response_accepted: false,
+                event_seen: false,
                 deadline,
                 reply,
             }))
@@ -571,13 +735,22 @@ fn handle_payload(
     }
     match pending.take() {
         Some(Pending::Submit {
+            kind,
             request_key,
             client_order_id,
             mut basket_id,
             deadline,
             reply,
-        }) if order::is_new_order_response(template_id) => {
-            match order::decode_new_order_response(&payload, &request_key, &client_order_id) {
+        }) if kind.is_response(template_id) => {
+            let response = match kind {
+                SubmitKind::Plain => {
+                    order::decode_new_order_response(&payload, &request_key, &client_order_id)
+                }
+                SubmitKind::Bracket => {
+                    order::decode_bracket_order_response(&payload, &request_key, &client_order_id)
+                }
+            };
+            match response {
                 Ok(response) => {
                     if let Err(error) = merge_basket_id(&mut basket_id, response.basket_id) {
                         let _ =
@@ -587,6 +760,7 @@ fn handle_payload(
                     match response.disposition {
                         ResponseDisposition::Processing => {
                             *pending = Some(Pending::Submit {
+                                kind,
                                 request_key,
                                 client_order_id,
                                 basket_id,
@@ -659,6 +833,61 @@ fn handle_payload(
                 Err(error) => {
                     let _ = reply.send(Err(
                         error.context("Rithmic cancel-order result is ambiguous")
+                    ));
+                }
+            }
+        }
+        Some(Pending::Modify {
+            request_key,
+            modification,
+            mut response_accepted,
+            event_seen,
+            deadline,
+            reply,
+        }) if order::is_modify_order_response(template_id) => {
+            match order::decode_modify_order_response(
+                &payload,
+                &request_key,
+                &modification.basket_id,
+            ) {
+                Ok(response) => match response.disposition {
+                    ResponseDisposition::Processing => {
+                        *pending = Some(Pending::Modify {
+                            request_key,
+                            modification,
+                            response_accepted,
+                            event_seen,
+                            deadline,
+                            reply,
+                        });
+                    }
+                    ResponseDisposition::Succeeded => {
+                        response_accepted = true;
+                        complete_or_restore_modify(
+                            pending,
+                            request_key,
+                            modification,
+                            response_accepted,
+                            event_seen,
+                            deadline,
+                            reply,
+                        );
+                    }
+                    ResponseDisposition::Failed(codes) => {
+                        let message = if event_seen {
+                            format!(
+                                "Rithmic modify-order result is ambiguous: event succeeded but response failed: {}",
+                                codes.join(",")
+                            )
+                        } else {
+                            format!("Rithmic modify-order response failed: {}", codes.join(","))
+                        };
+                        let _ = reply.send(Err(anyhow::anyhow!(message)));
+                    }
+                },
+                Err(error) => {
+                    let _ = reply.send(Err(
+                        error.context("Rithmic modify-order result is ambiguous")
                     ));
                 }
             }
@@ -751,56 +980,159 @@ fn update_pending_from_event(pending: &mut Option<Pending>, event: &OrderEvent) 
     let Some(current) = pending.take() else {
         return Ok(());
     };
-    let Pending::Cancel {
-        request_key,
-        basket_id,
-        response_accepted,
-        terminal_seen,
-        deadline,
-        reply,
-    } = current
-    else {
-        *pending = Some(current);
-        return Ok(());
-    };
-    if event.basket_id != basket_id {
-        *pending = Some(Pending::Cancel {
+    match current {
+        Pending::Modify {
+            request_key,
+            modification,
+            response_accepted,
+            event_seen,
+            deadline,
+            reply,
+        } => {
+            if event.basket_id != modification.basket_id {
+                *pending = Some(Pending::Modify {
+                    request_key,
+                    modification,
+                    response_accepted,
+                    event_seen,
+                    deadline,
+                    reply,
+                });
+            } else if event.status == "modify_rejected" {
+                let _ = reply.send(Err(anyhow::anyhow!("Rithmic modify was rejected")));
+            } else if event.notification_type == "modify" {
+                match validate_modify_event(event, &modification) {
+                    Ok(()) => complete_or_restore_modify(
+                        pending,
+                        request_key,
+                        modification,
+                        response_accepted,
+                        true,
+                        deadline,
+                        reply,
+                    ),
+                    Err(error) => {
+                        let _ = reply.send(Err(error.context(
+                            "Rithmic modify-order result is ambiguous: conflicting modify event",
+                        )));
+                    }
+                }
+            } else {
+                *pending = Some(Pending::Modify {
+                    request_key,
+                    modification,
+                    response_accepted,
+                    event_seen,
+                    deadline,
+                    reply,
+                });
+            }
+            Ok(())
+        }
+        Pending::Cancel {
             request_key,
             basket_id,
             response_accepted,
             terminal_seen,
             deadline,
             reply,
-        });
-        return Ok(());
+        } => {
+            if event.basket_id != basket_id {
+                *pending = Some(Pending::Cancel {
+                    request_key,
+                    basket_id,
+                    response_accepted,
+                    terminal_seen,
+                    deadline,
+                    reply,
+                });
+                return Ok(());
+            }
+            match event.status.as_str() {
+                "cancelled" => complete_or_restore_cancel(
+                    pending,
+                    request_key,
+                    basket_id,
+                    response_accepted,
+                    true,
+                    deadline,
+                    reply,
+                ),
+                "cancel_rejected" => {
+                    let _ = reply.send(Err(anyhow::anyhow!("Rithmic cancel was rejected")));
+                }
+                "filled" | "rejected" => {
+                    let _ = reply.send(Err(anyhow::anyhow!(
+                        "Rithmic order became terminal before cancellation"
+                    )));
+                }
+                _ => {
+                    *pending = Some(Pending::Cancel {
+                        request_key,
+                        basket_id,
+                        response_accepted,
+                        terminal_seen,
+                        deadline,
+                        reply,
+                    });
+                }
+            }
+            Ok(())
+        }
+        other => {
+            *pending = Some(other);
+            Ok(())
+        }
     }
-    match event.status.as_str() {
-        "cancelled" => complete_or_restore_cancel(
-            pending,
+}
+
+fn complete_or_restore_modify(
+    pending: &mut Option<Pending>,
+    request_key: String,
+    modification: ProtectionModification,
+    response_accepted: bool,
+    event_seen: bool,
+    deadline: Instant,
+    reply: Reply<()>,
+) {
+    if response_accepted && event_seen {
+        let _ = reply.send(Ok(()));
+    } else {
+        *pending = Some(Pending::Modify {
             request_key,
-            basket_id,
+            modification,
             response_accepted,
-            true,
+            event_seen,
             deadline,
             reply,
-        ),
-        "cancel_rejected" => {
-            let _ = reply.send(Err(anyhow::anyhow!("Rithmic cancel was rejected")));
+        });
+    }
+}
+
+fn validate_modify_event(event: &OrderEvent, modification: &ProtectionModification) -> Result<()> {
+    ensure!(
+        event.exchange.eq_ignore_ascii_case(&modification.exchange)
+            && event.symbol == modification.symbol,
+        "Rithmic modify event instrument mismatch"
+    );
+    ensure!(
+        event.quantity == modification.quantity,
+        "Rithmic modify event quantity mismatch"
+    );
+    match modification.leg {
+        order::ProtectionLeg::StopLoss => {
+            ensure!(
+                event.price_type.as_deref() == Some("stop_market")
+                    && event.trigger_price == Some(modification.price),
+                "Rithmic stop modification event mismatch"
+            );
         }
-        "filled" | "rejected" => {
-            let _ = reply.send(Err(anyhow::anyhow!(
-                "Rithmic order became terminal before cancellation"
-            )));
-        }
-        _ => {
-            *pending = Some(Pending::Cancel {
-                request_key,
-                basket_id,
-                response_accepted,
-                terminal_seen,
-                deadline,
-                reply,
-            });
+        order::ProtectionLeg::TakeProfit => {
+            ensure!(
+                event.price_type.as_deref() == Some("limit")
+                    && event.price == Some(modification.price),
+                "Rithmic target modification event mismatch"
+            );
         }
     }
     Ok(())
@@ -836,6 +1168,10 @@ fn reject_matching_pending(pending: &mut Option<Pending>, request_key: &str, cod
             ..
         })
         | Some(Pending::Cancel {
+            request_key: expected,
+            ..
+        })
+        | Some(Pending::Modify {
             request_key: expected,
             ..
         })
@@ -879,6 +1215,7 @@ fn pending_expired(pending: &Pending) -> bool {
     let deadline = match pending {
         Pending::Submit { deadline, .. }
         | Pending::Cancel { deadline, .. }
+        | Pending::Modify { deadline, .. }
         | Pending::Lookup { deadline, .. } => deadline,
     };
     Instant::now() >= *deadline
@@ -886,10 +1223,10 @@ fn pending_expired(pending: &Pending) -> bool {
 
 fn reject_command(command: Command, message: &str) {
     match command {
-        Command::Submit { reply, .. } => {
+        Command::Submit { reply, .. } | Command::SubmitBracket { reply, .. } => {
             let _ = reply.send(Err(anyhow::anyhow!(message.to_string())));
         }
-        Command::Cancel { reply, .. } => {
+        Command::Modify { reply, .. } | Command::Cancel { reply, .. } => {
             let _ = reply.send(Err(anyhow::anyhow!(message.to_string())));
         }
         Command::Lookup { reply, .. } => {
@@ -906,6 +1243,9 @@ fn fail_pending(pending: &mut Option<Pending>, message: &str) {
                 let _ = reply.send(Err(anyhow::anyhow!(message.to_string())));
             }
             Pending::Cancel { reply, .. } => {
+                let _ = reply.send(Err(anyhow::anyhow!(message.to_string())));
+            }
+            Pending::Modify { reply, .. } => {
                 let _ = reply.send(Err(anyhow::anyhow!(message.to_string())));
             }
             Pending::Lookup { reply, .. } => {
@@ -1028,6 +1368,8 @@ mod tests {
     #[test]
     fn reconnect_gate_blocks_only_submit_commands() {
         let (submit_tx, _) = std_mpsc::sync_channel(1);
+        let (bracket_tx, _) = std_mpsc::sync_channel(1);
+        let (modify_tx, _) = std_mpsc::sync_channel(1);
         let (cancel_tx, _) = std_mpsc::sync_channel(1);
         let (lookup_tx, _) = std_mpsc::sync_channel(1);
         let commands = [
@@ -1035,6 +1377,27 @@ mod tests {
                 order: test_order(),
                 deadline: Instant::now() + COMMAND_TIMEOUT,
                 reply: submit_tx,
+            },
+            Command::SubmitBracket {
+                order: BracketOrder {
+                    entry: test_order(),
+                    stop_ticks: Some(8),
+                    target_ticks: Some(12),
+                },
+                deadline: Instant::now() + COMMAND_TIMEOUT,
+                reply: bracket_tx,
+            },
+            Command::Modify {
+                modification: ProtectionModification {
+                    basket_id: "child-1".to_string(),
+                    exchange: "CME".to_string(),
+                    symbol: "NQU6".to_string(),
+                    quantity: dec!(1),
+                    leg: order::ProtectionLeg::StopLoss,
+                    price: dec!(19999.0),
+                },
+                deadline: Instant::now() + COMMAND_TIMEOUT,
+                reply: modify_tx,
             },
             Command::Cancel {
                 basket_id: "basket-1".to_string(),
@@ -1053,7 +1416,7 @@ mod tests {
 
         assert_eq!(
             commands.map(|command| command.is_submission()),
-            [true, false, false, false]
+            [true, true, true, false, false, false]
         );
     }
 
@@ -1229,12 +1592,19 @@ mod tests {
             },
             client_order_id: Some("client-1".to_string()),
             basket_id: basket_id.to_string(),
+            original_basket_id: None,
+            linked_basket_ids: None,
             exchange_order_id: None,
             exchange: "CME".to_string(),
             symbol: "MNQU6".to_string(),
             status: status.to_string(),
+            notification_type: "status".to_string(),
             transaction_type: TransactionType::Buy,
             quantity: dec!(1),
+            price: None,
+            trigger_price: None,
+            price_type: None,
+            bracket_type: None,
             last_fill_quantity: None,
             last_fill_price: None,
             cumulative_filled_quantity: None,
@@ -1262,9 +1632,47 @@ mod tests {
         let (tx, rx) = std_mpsc::sync_channel(1);
         (
             Some(Pending::Submit {
+                kind: SubmitKind::Plain,
                 request_key: "new-1".to_string(),
                 client_order_id: "client-1".to_string(),
                 basket_id: None,
+                deadline: Instant::now() + COMMAND_TIMEOUT,
+                reply: tx,
+            }),
+            rx,
+        )
+    }
+
+    fn pending_bracket() -> (Option<Pending>, std_mpsc::Receiver<Result<OrderAck>>) {
+        let (tx, rx) = std_mpsc::sync_channel(1);
+        (
+            Some(Pending::Submit {
+                kind: SubmitKind::Bracket,
+                request_key: "bracket-1".to_string(),
+                client_order_id: "client-1".to_string(),
+                basket_id: None,
+                deadline: Instant::now() + COMMAND_TIMEOUT,
+                reply: tx,
+            }),
+            rx,
+        )
+    }
+
+    fn pending_modify() -> (Option<Pending>, std_mpsc::Receiver<Result<()>>) {
+        let (tx, rx) = std_mpsc::sync_channel(1);
+        (
+            Some(Pending::Modify {
+                request_key: "modify-1".to_string(),
+                modification: ProtectionModification {
+                    basket_id: "child-1".to_string(),
+                    exchange: "CME".to_string(),
+                    symbol: "MNQU6".to_string(),
+                    quantity: dec!(1),
+                    leg: order::ProtectionLeg::StopLoss,
+                    price: dec!(19999),
+                },
+                response_accepted: false,
+                event_seen: false,
                 deadline: Instant::now() + COMMAND_TIMEOUT,
                 reply: tx,
             }),
@@ -1406,6 +1814,141 @@ mod tests {
     }
 
     #[test]
+    fn bracket_submit_uses_the_same_terminal_response_lifecycle() {
+        let response = |handler: &[&str], terminal: &[&str], basket_id: Option<&str>| {
+            codec::encode(&protocol::ResponseBracketOrder {
+                template_id: 331,
+                user_msg: vec!["bracket-1".to_string()],
+                user_tag: Some("client-1".to_string()),
+                basket_id: basket_id.map(str::to_string),
+                rq_handler_rp_code: handler.iter().map(|code| (*code).to_string()).collect(),
+                rp_code: terminal.iter().map(|code| (*code).to_string()).collect(),
+                ..Default::default()
+            })
+            .unwrap()
+        };
+        let (mut pending, rx) = pending_bracket();
+        let (events, _) = std_mpsc::channel();
+        let account = event("open", "basket-1").account;
+
+        handle_payload(
+            response(&["0"], &[], Some("basket-1")),
+            &account,
+            &mut pending,
+            &events,
+        )
+        .unwrap();
+        assert!(rx.try_recv().is_err());
+        assert!(matches!(pending, Some(Pending::Submit { .. })));
+
+        handle_payload(response(&[], &["0"], None), &account, &mut pending, &events).unwrap();
+        assert_eq!(rx.recv().unwrap().unwrap().basket_id, "basket-1");
+        assert!(pending.is_none());
+    }
+
+    #[test]
+    fn modify_completion_requires_success_response_and_modify_event_in_either_order() {
+        let response = codec::encode(&protocol::ResponseModifyOrder {
+            template_id: 315,
+            user_msg: vec!["modify-1".to_string()],
+            basket_id: Some("child-1".to_string()),
+            rp_code: vec!["0".to_string()],
+            ..Default::default()
+        })
+        .unwrap();
+        let (events, _) = std_mpsc::channel();
+        let account = event("open", "child-1").account;
+
+        for response_first in [true, false] {
+            let (mut pending, rx) = pending_modify();
+            let mut modify_event = event("open", "child-1");
+            modify_event.notification_type = "modify".to_string();
+            modify_event.price_type = Some("stop_market".to_string());
+            modify_event.trigger_price = Some(dec!(19999));
+            if response_first {
+                handle_payload(response.clone(), &account, &mut pending, &events).unwrap();
+                assert!(rx.try_recv().is_err());
+                update_pending_from_event(&mut pending, &modify_event).unwrap();
+            } else {
+                update_pending_from_event(&mut pending, &modify_event).unwrap();
+                assert!(rx.try_recv().is_err());
+                handle_payload(response.clone(), &account, &mut pending, &events).unwrap();
+            }
+            assert!(rx.recv().unwrap().is_ok());
+            assert!(pending.is_none());
+        }
+    }
+
+    #[test]
+    fn modify_rejection_completes_without_waiting_for_event() {
+        let response = codec::encode(&protocol::ResponseModifyOrder {
+            template_id: 315,
+            user_msg: vec!["modify-1".to_string()],
+            basket_id: Some("child-1".to_string()),
+            rp_code: vec!["9".to_string()],
+            ..Default::default()
+        })
+        .unwrap();
+        let (mut pending, rx) = pending_modify();
+        let (events, _) = std_mpsc::channel();
+        let account = event("open", "child-1").account;
+
+        handle_payload(response, &account, &mut pending, &events).unwrap();
+
+        assert!(rx.recv().unwrap().is_err());
+        assert!(pending.is_none());
+    }
+
+    #[test]
+    fn modify_rejects_a_conflicting_event_as_ambiguous() {
+        let (mut pending, rx) = pending_modify();
+        let mut modify_event = event("open", "child-1");
+        modify_event.notification_type = "modify".to_string();
+        modify_event.price_type = Some("stop_market".to_string());
+        modify_event.trigger_price = Some(dec!(19998));
+
+        update_pending_from_event(&mut pending, &modify_event).unwrap();
+
+        assert!(rx
+            .recv()
+            .unwrap()
+            .unwrap_err()
+            .to_string()
+            .contains("ambiguous"));
+        assert!(pending.is_none());
+    }
+
+    #[test]
+    fn modify_rejects_event_and_response_contradiction_as_ambiguous() {
+        let response = codec::encode(&protocol::ResponseModifyOrder {
+            template_id: 315,
+            user_msg: vec!["modify-1".to_string()],
+            basket_id: Some("child-1".to_string()),
+            rp_code: vec!["9".to_string()],
+            ..Default::default()
+        })
+        .unwrap();
+        let (mut pending, rx) = pending_modify();
+        let (events, _) = std_mpsc::channel();
+        let account = event("open", "child-1").account;
+        let mut modify_event = event("open", "child-1");
+        modify_event.notification_type = "modify".to_string();
+        modify_event.price_type = Some("stop_market".to_string());
+        modify_event.trigger_price = Some(dec!(19999));
+
+        update_pending_from_event(&mut pending, &modify_event).unwrap();
+        handle_payload(response, &account, &mut pending, &events).unwrap();
+
+        assert!(rx
+            .recv()
+            .unwrap()
+            .unwrap_err()
+            .to_string()
+            .contains("ambiguous"));
+        assert!(pending.is_none());
+    }
+
+    #[test]
     fn submit_rejects_conflicting_basket_ids_as_ambiguous() {
         let response = |handler: &[&str], terminal: &[&str], basket_id: &str| {
             codec::encode(&protocol::ResponseNewOrder {
@@ -1539,7 +2082,6 @@ mod tests {
             template_id: 321,
             user_msg: vec!["lookup-1".to_string()],
             rp_code: vec!["0".to_string()],
-            ..Default::default()
         })
         .unwrap();
 
