@@ -43,10 +43,16 @@ def event(**overrides):
         "account_id": "ACCOUNT",
         "client_order_id": "client-1",
         "basket_id": "basket-1",
+        "original_basket_id": None,
+        "linked_basket_ids": None,
         "exchange_order_id": "exchange-1",
         "exchange": "CME",
         "symbol": "NQU6",
         "status": "partially_filled",
+        "price": "20000.25",
+        "trigger_price": None,
+        "price_type": "limit",
+        "bracket_type": None,
         "cumulative_filled_quantity": "1",
         "cumulative_average_price": "20000.25",
         "last_fill_quantity": "1",
@@ -75,6 +81,8 @@ def snapshot(**overrides):
 def client():
     client = Mock()
     client.submit.return_value = SimpleNamespace(basket_id="basket-1")
+    client.submit_bracket.return_value = SimpleNamespace(basket_id="parent-1")
+    client.modify_protection.return_value = True
     client.cancel.return_value = True
     client.poll_event.return_value = None
     client.lookup.return_value = None
@@ -146,6 +154,460 @@ def test_limit_order_uses_native_contract_and_decimal_strings(adapter, client):
     client.submit.assert_called_once_with(
         "client-1", "CME", "NQU6", "1", "buy", "limit", "20000.25"
     )
+
+
+def bracket_orders(*, side="buy", entry_type="limit", quantity=Decimal("1")):
+    entry_client_id = "strategy-execution-long-123"
+    entry = order(
+        id="entry-1",
+        client_order_id=entry_client_id,
+        side=side,
+        type=entry_type,
+        quantity=quantity,
+        price=Decimal("20000.25") if entry_type == "limit" else None,
+        intent_payload={},
+        min_notional_reference_price=Decimal("20000.25"),
+    )
+    close_side = "sell" if side == "buy" else "buy"
+    stop_price = Decimal("19998.25") if side == "buy" else Decimal("20002.25")
+    target_price = Decimal("20003.25") if side == "buy" else Decimal("19997.25")
+    stop = order(
+        id="stop-1",
+        client_order_id="strategy-execution-sl-123",
+        side=close_side,
+        type="stop_loss",
+        quantity=quantity,
+        price=None,
+        trigger_price=stop_price,
+        intent_payload={"pending_entry_order_id": "entry-1"},
+    )
+    target = order(
+        id="target-1",
+        client_order_id="strategy-execution-tp-123",
+        side=close_side,
+        type="take_profit",
+        quantity=quantity,
+        price=None,
+        trigger_price=target_price,
+        intent_payload={"pending_entry_order_id": "entry-1"},
+    )
+    return entry, stop, target
+
+
+@pytest.mark.parametrize("side", ["buy", "sell"])
+@pytest.mark.parametrize("entry_type", ["market", "limit"])
+@pytest.mark.parametrize(
+    ("leg_types", "stop_ticks", "target_ticks", "bracket_type"),
+    [
+        (("stop_loss",), 8, None, "stop_only_static"),
+        (("take_profit",), None, 12, "target_only_static"),
+        (
+            ("stop_loss", "take_profit"),
+            8,
+            12,
+            "target_and_stop_static",
+        ),
+    ],
+)
+def test_native_bracket_submits_one_atomic_single_contract_request(
+    adapter,
+    client,
+    side,
+    entry_type,
+    leg_types,
+    stop_ticks,
+    target_ticks,
+    bracket_type,
+):
+    adapter.start_order_event_stream()
+    entry, stop, target = bracket_orders(side=side, entry_type=entry_type)
+    legs = {"stop_loss": stop, "take_profit": target}
+    orders = [entry, *(legs[leg_type] for leg_type in leg_types)]
+
+    adapter.validate_order_group(orders)
+    basket_id = adapter.place_order_group(orders)
+
+    assert basket_id == "parent-1"
+    client.submit.assert_not_called()
+    client.submit_bracket.assert_called_once_with(
+        entry.client_order_id,
+        "CME",
+        "NQU6",
+        "1",
+        side,
+        entry_type,
+        str(entry.price) if entry.price is not None else None,
+        stop_ticks,
+        target_ticks,
+    )
+    native = entry.intent_payload["native_protection"]
+    assert native["reference_price"] == "20000.25"
+    assert native["bracket_type"] == bracket_type
+    assert set(native["legs"]) == set(leg_types)
+    for leg_type in leg_types:
+        leg = legs[leg_type]
+        assert leg.intent_payload["placement_mode"] == "attach-at-entry"
+        assert leg.intent_payload["native_parent_client_order_id"] == entry.client_order_id
+
+
+@pytest.mark.parametrize(
+    ("mutate", "message"),
+    [
+        (lambda entry, stop, target: setattr(entry, "quantity", Decimal("2")), "single_contract"),
+        (lambda entry, stop, target: setattr(stop, "quantity", Decimal("2")), "single_contract"),
+        (lambda entry, stop, target: setattr(stop, "trigger_price", Decimal("19998.30")), "distance_off_tick"),
+        (lambda entry, stop, target: setattr(stop, "trigger_price", Decimal("20001")), "wrong_side"),
+        (lambda entry, stop, target: setattr(target, "side", "buy"), "close_side_mismatch"),
+        (lambda entry, stop, target: setattr(target, "product_id", "RITHMIC:ES-202609"), "product_mismatch"),
+        (lambda entry, stop, target: setattr(stop, "client_order_id", "strategy-execution-wrong-123"), "client_order_id_mismatch"),
+        (lambda entry, stop, target: setattr(stop, "type", "trailing_stop"), "leg_unsupported"),
+    ],
+)
+def test_native_bracket_validation_fails_before_remote_submission(
+    adapter, client, mutate, message
+):
+    adapter.start_order_event_stream()
+    entry, stop, target = bracket_orders()
+    mutate(entry, stop, target)
+
+    with pytest.raises(ExchangeError, match=message):
+        adapter.place_order_group([entry, stop, target])
+
+    client.submit.assert_not_called()
+    client.submit_bracket.assert_not_called()
+    assert adapter._submitted_client_order_ids == set()
+
+
+def test_native_market_bracket_requires_a_reference_price(adapter, client):
+    adapter.start_order_event_stream()
+    entry, stop, target = bracket_orders(entry_type="market")
+    entry.min_notional_reference_price = None
+
+    with pytest.raises(ExchangeError, match="reference_price_required"):
+        adapter.place_order_group([entry, stop, target])
+
+    client.submit_bracket.assert_not_called()
+
+
+def test_native_bracket_child_event_maps_to_local_leg_identity(adapter, client):
+    adapter.start_order_event_stream()
+    entry, stop, target = bracket_orders()
+    adapter.place_order_group([entry, stop, target])
+    client.poll_event.return_value = event(
+        client_order_id=entry.client_order_id,
+        basket_id="child-stop-1",
+        original_basket_id="parent-1",
+        price_type="stop_market",
+    )
+
+    mapped = adapter.poll_order_event()
+
+    assert mapped.client_order_id == stop.client_order_id
+    assert mapped.raw["native_parent_client_order_id"] == entry.client_order_id
+
+
+@pytest.mark.parametrize(
+    ("basket_id", "remote_client_order_id", "expected_client_order_id"),
+    [
+        ("parent-1", "strategy-execution-long-123", "strategy-execution-long-123"),
+        ("parent-1", None, "strategy-execution-long-123"),
+        ("child-without-parent-1", "strategy-execution-long-123", None),
+    ],
+)
+def test_native_bracket_event_without_parent_uses_only_exact_parent_basket(
+    adapter,
+    client,
+    basket_id,
+    remote_client_order_id,
+    expected_client_order_id,
+):
+    adapter.start_order_event_stream()
+    entry, stop, target = bracket_orders()
+    adapter.place_order_group([entry, stop, target])
+    client.poll_event.return_value = event(
+        client_order_id=remote_client_order_id,
+        basket_id=basket_id,
+        original_basket_id=None,
+    )
+
+    mapped = adapter.poll_order_event()
+
+    assert mapped.client_order_id == expected_client_order_id
+
+
+def test_native_bracket_parent_basket_rejects_conflicting_client_identity(
+    adapter,
+    client,
+):
+    adapter.start_order_event_stream()
+    entry, stop, target = bracket_orders()
+    adapter.place_order_group([entry, stop, target])
+    client.poll_event.return_value = event(
+        client_order_id=stop.client_order_id,
+        basket_id="parent-1",
+        original_basket_id=None,
+    )
+
+    with pytest.raises(ExchangeError, match="parent_client_id_mismatch"):
+        adapter.poll_order_event()
+
+
+def test_ambiguous_bracket_submit_keeps_parent_tag_from_claiming_child(
+    adapter,
+    client,
+):
+    adapter.start_order_event_stream()
+    entry, stop, target = bracket_orders()
+    client.submit_bracket.side_effect = RuntimeError("order result is ambiguous")
+
+    with pytest.raises(NetworkError, match="ambiguous"):
+        adapter.place_order_group([entry, stop, target])
+
+    client.submit_bracket.side_effect = None
+    client.poll_event.return_value = event(
+        client_order_id=entry.client_order_id,
+        basket_id="child-stop-1",
+        original_basket_id=None,
+        price_type="stop_market",
+    )
+
+    assert adapter.poll_order_event().client_order_id is None
+
+
+def test_explicit_bracket_rejection_allows_safe_same_id_retry(adapter, client):
+    adapter.start_order_event_stream()
+    entry, stop, target = bracket_orders()
+    client.submit_bracket.side_effect = [
+        RuntimeError("request rejected"),
+        SimpleNamespace(basket_id="parent-1"),
+    ]
+
+    with pytest.raises(ExchangeError, match="request rejected"):
+        adapter.place_order_group([entry, stop, target])
+
+    assert adapter.place_order_group([entry, stop, target]) == "parent-1"
+
+
+def test_unknown_bracket_parent_cannot_claim_local_child_identity(adapter, client):
+    adapter.start_order_event_stream()
+    client.poll_event.return_value = event(
+        client_order_id="strategy-execution-long-123",
+        basket_id="child-stop-1",
+        original_basket_id="unknown-parent",
+        price_type="stop_market",
+    )
+
+    mapped = adapter.poll_order_event()
+
+    assert mapped.client_order_id is None
+
+
+def test_native_bracket_child_identity_restores_from_persisted_parent(client):
+    original = RithmicExchangeAdapter(
+        profile="test",
+        account_id="ACCOUNT",
+        instruments=INSTRUMENTS,
+        client_factory=Mock(return_value=client),
+    )
+    entry, stop, target = bracket_orders()
+    original.validate_order_group([entry, stop, target])
+    entry.exchange_order_id = "parent-1"
+    restored = RithmicExchangeAdapter(
+        profile="test",
+        account_id="ACCOUNT",
+        instruments=INSTRUMENTS,
+        client_factory=Mock(return_value=client),
+    )
+    restored.restore_order_groups([entry, stop, target])
+    restored.start_order_event_stream()
+    client.poll_event.return_value = event(
+        client_order_id=entry.client_order_id,
+        basket_id="child-target-1",
+        original_basket_id="parent-1",
+        price_type="limit",
+    )
+
+    mapped = restored.poll_order_event()
+
+    assert mapped.client_order_id == target.client_order_id
+
+
+def test_native_bracket_child_identity_restores_without_terminal_parent(client):
+    original = RithmicExchangeAdapter(
+        profile="test",
+        account_id="ACCOUNT",
+        instruments=INSTRUMENTS,
+        client_factory=Mock(return_value=client),
+    )
+    entry, stop, target = bracket_orders()
+    original.validate_order_group([entry, stop, target])
+    for leg in (stop, target):
+        leg.intent_payload["native_parent_basket_id"] = "parent-1"
+    restored = RithmicExchangeAdapter(
+        profile="test",
+        account_id="ACCOUNT",
+        instruments=INSTRUMENTS,
+        client_factory=Mock(return_value=client),
+    )
+
+    restored.restore_order_groups([stop, target])
+    restored.start_order_event_stream()
+    client.poll_event.return_value = event(
+        client_order_id=entry.client_order_id,
+        basket_id="child-stop-1",
+        original_basket_id="parent-1",
+        price_type="stop_market",
+    )
+
+    assert restored.poll_order_event().client_order_id == stop.client_order_id
+
+
+def test_restored_bracket_parent_tag_cannot_claim_unknown_child(client):
+    original = RithmicExchangeAdapter(
+        profile="test",
+        account_id="ACCOUNT",
+        instruments=INSTRUMENTS,
+        client_factory=Mock(return_value=client),
+    )
+    entry, stop, target = bracket_orders()
+    original.validate_order_group([entry, stop, target])
+    entry.exchange_order_id = "parent-1"
+    restored = RithmicExchangeAdapter(
+        profile="test",
+        account_id="ACCOUNT",
+        instruments=INSTRUMENTS,
+        client_factory=Mock(return_value=client),
+    )
+    restored.restore_order_groups([entry, stop, target])
+    restored.start_order_event_stream()
+    client.poll_event.return_value = event(
+        client_order_id=entry.client_order_id,
+        basket_id="unknown-child-1",
+        original_basket_id=None,
+        price_type="stop_market",
+    )
+
+    assert restored.poll_order_event().client_order_id is None
+
+
+def test_native_bracket_restore_merges_parent_with_partial_active_children(client):
+    entry, stop, target = bracket_orders()
+    adapter = RithmicExchangeAdapter(
+        profile="test",
+        account_id="ACCOUNT",
+        instruments=INSTRUMENTS,
+        client_factory=Mock(return_value=client),
+    )
+    adapter.validate_order_group([entry, stop, target])
+    entry.exchange_order_id = "parent-1"
+    stop.intent_payload["native_parent_basket_id"] = "parent-1"
+
+    adapter.restore_order_groups([entry, stop])
+
+    assert adapter._native_brackets_by_parent["parent-1"] == {
+        "entry": entry.client_order_id,
+        "stop_loss": stop.client_order_id,
+        "take_profit": target.client_order_id,
+    }
+
+
+def test_native_bracket_restore_preserves_existing_legs_on_partial_replay(
+    adapter,
+    client,
+):
+    adapter.start_order_event_stream()
+    entry, stop, target = bracket_orders()
+    adapter.place_order_group([entry, stop, target])
+    stop.intent_payload["native_parent_basket_id"] = "parent-1"
+
+    adapter.restore_order_groups([stop])
+
+    assert adapter._native_brackets_by_parent["parent-1"] == {
+        "entry": entry.client_order_id,
+        "stop_loss": stop.client_order_id,
+        "take_profit": target.client_order_id,
+    }
+
+
+def test_native_bracket_restore_conflict_is_atomic(adapter, client):
+    adapter.start_order_event_stream()
+    entry, stop, target = bracket_orders()
+    adapter.place_order_group([entry, stop, target])
+    before_groups = {
+        parent_basket_id: dict(group)
+        for parent_basket_id, group in adapter._native_brackets_by_parent.items()
+    }
+    before_parent_ids = set(adapter._native_bracket_parent_client_order_ids)
+    stop.intent_payload["native_parent_basket_id"] = "parent-1"
+    stop.intent_payload["native_parent_client_order_id"] = "other-parent-client"
+
+    with pytest.raises(ExchangeError, match="restore_metadata_conflict"):
+        adapter.restore_order_groups([stop])
+
+    assert adapter._native_brackets_by_parent == before_groups
+    assert adapter._native_bracket_parent_client_order_ids == before_parent_ids
+
+
+def test_modify_native_protection_uses_known_child_basket(adapter, client):
+    adapter.start_order_event_stream()
+    entry, stop, target = bracket_orders()
+    adapter.validate_order_group([entry, stop, target])
+    stop.exchange_order_id = "child-stop-1"
+    stop.intent_payload["actual_entry_fill_price"] = "20000.75"
+
+    assert adapter.modify_protection(stop, trigger_price=Decimal("19999.00"))
+
+    client.modify_protection.assert_called_once_with(
+        "child-stop-1",
+        "CME",
+        "NQU6",
+        "1",
+        "stop_loss",
+        "19999.00",
+    )
+
+
+@pytest.mark.parametrize(
+    ("mutate", "message"),
+    [
+        (lambda stop: setattr(stop, "exchange_order_id", None), "basket_id_required"),
+        (
+            lambda stop: setattr(stop, "trigger_price", Decimal("19998.30")),
+            "price_off_tick",
+        ),
+        (
+            lambda stop: setattr(stop, "intent_payload", {}),
+            "identity_required",
+        ),
+    ],
+)
+def test_modify_native_protection_validation_fails_before_remote_call(
+    adapter, client, mutate, message
+):
+    adapter.start_order_event_stream()
+    entry, stop, target = bracket_orders()
+    adapter.validate_order_group([entry, stop, target])
+    stop.exchange_order_id = "child-stop-1"
+    mutate(stop)
+    requested = getattr(stop, "trigger_price", Decimal("19999.00"))
+
+    with pytest.raises(ExchangeError, match=message):
+        adapter.modify_protection(stop, trigger_price=requested)
+
+    client.modify_protection.assert_not_called()
+
+
+def test_ambiguous_modify_failure_maps_to_network_error(adapter, client):
+    adapter.start_order_event_stream()
+    entry, stop, target = bracket_orders()
+    adapter.validate_order_group([entry, stop, target])
+    stop.exchange_order_id = "child-stop-1"
+    client.modify_protection.side_effect = RuntimeError(
+        "Rithmic modify-order result is ambiguous: disconnected"
+    )
+
+    with pytest.raises(NetworkError, match="ambiguous"):
+        adapter.modify_protection(stop, trigger_price=Decimal("19999.00"))
 
 
 def test_reduce_only_order_fails_before_submit(adapter, client):
@@ -267,7 +729,13 @@ def test_lookup_rejects_inconsistent_terminal_snapshot(adapter, client):
 
 def test_order_event_maps_native_identity_and_decimal_fields(adapter, client):
     adapter.start_order_event_stream()
-    client.poll_event.return_value = event()
+    client.poll_event.return_value = event(
+        original_basket_id="parent-1",
+        linked_basket_ids="stop-1,target-1",
+        trigger_price="19998.25",
+        price_type="stop_market",
+        bracket_type="target_and_stop_static",
+    )
 
     mapped = adapter.poll_order_event()
 
@@ -275,6 +743,11 @@ def test_order_event_maps_native_identity_and_decimal_fields(adapter, client):
     assert mapped.exchange_order_id == "basket-1"
     assert mapped.cumulative_filled_quantity == Decimal("1")
     assert mapped.last_fill_price == Decimal("20000.25")
+    assert mapped.raw["original_basket_id"] == "parent-1"
+    assert mapped.raw["linked_basket_ids"] == "stop-1,target-1"
+    assert mapped.raw["trigger_price"] == "19998.25"
+    assert mapped.raw["price_type"] == "stop_market"
+    assert mapped.raw["bracket_type"] == "target_and_stop_static"
 
 
 def test_unknown_order_event_instrument_fails_closed(adapter, client):

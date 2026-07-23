@@ -70,6 +70,15 @@ def parse_client_order_id(client_order_id: str) -> ClientOrderIdParts:
     )
 
 
+def linked_client_order_id(client_order_id: str, action: str) -> str:
+    """Return a deterministic sibling ID in the same execution identity."""
+    parts = parse_client_order_id(client_order_id)
+    _validate_component("action", action)
+    linked = f"{parts.strategy_id}-{parts.instance_id}-{action}-{parts.ts_ns}"
+    parse_client_order_id(linked)
+    return linked
+
+
 def is_valid_client_order_id(client_order_id: str) -> bool:
     """Return True when the ID matches FluxTrade's canonical format."""
     try:
