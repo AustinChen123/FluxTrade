@@ -32,6 +32,7 @@ def _applier(order_manager: OrderManager) -> OrderEventApplier:
         ("rejected", "rejected"),
         ("expired", "expired"),
         ("failed", "failed"),
+        ("modify_rejected", "modify_rejected"),
         ("force_closed", "liquidated"),
         ("weird_status", "unknown"),
     ],
@@ -80,6 +81,34 @@ def test_client_order_id_collision_for_different_product_is_not_applied(
         order.filled_price,
     ) == state_before
     assert mock_order_repo.trades == []
+
+
+def test_modify_rejection_preserves_existing_protection_state(
+    mock_clock,
+    mock_order_repo,
+    order_factory,
+):
+    order_manager = OrderManager(mock_order_repo, mock_clock, is_backtest=True)
+    applier = _applier(order_manager)
+    order = order_factory(
+        exchange_order_id="CHILD-1",
+        status=OrderStatus.SUBMITTED.value,
+        trigger_price=Decimal("19998.25"),
+    )
+    mock_order_repo.add_order(order)
+
+    result = applier.process_exchange_order_event(
+        ExchangeOrderEvent(
+            status="modify_rejected",
+            product_id=order.product_id,
+            exchange_order_id="CHILD-1",
+        )
+    )
+
+    assert result["action"] == "applied"
+    assert result["state"] == "modify_rejected"
+    assert order.status == OrderStatus.SUBMITTED.value
+    assert order.trigger_price == Decimal("19998.25")
 
 
 def test_process_exchange_order_event_recomputes_catch_up_delta_price(
