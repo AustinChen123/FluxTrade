@@ -40,9 +40,11 @@ def remote_order(**overrides):
         "basket_id": "basket-1",
         "symbol": "NQU6",
         "status": "OPEN",
+        "notification_type": "OPEN",
         "transaction_type": "BUY",
         "quantity": "2",
         "filled_quantity": "0",
+        "unfilled_quantity": "2",
         "average_fill_price": None,
         "timestamp_ms": 1_700_000_124_000,
         "original_basket_id": None,
@@ -112,6 +114,36 @@ def snapshot(*, orders=(), order_history=(), fills=(), positions=(), account_sum
             "filled",
             False,
         ),
+        (
+            [],
+            [
+                remote_order(
+                    status="complete",
+                    notification_type="CANCEL",
+                    filled_quantity="0",
+                    unfilled_quantity="2",
+                )
+            ],
+            [],
+            "repaired",
+            "cancelled",
+            False,
+        ),
+        (
+            [],
+            [
+                remote_order(
+                    status="complete",
+                    notification_type="REJECT",
+                    filled_quantity="0",
+                    unfilled_quantity="2",
+                )
+            ],
+            [],
+            "repaired",
+            "failed",
+            False,
+        ),
     ],
 )
 def test_owned_order_recovery_state_matrix(
@@ -133,12 +165,55 @@ def test_owned_order_recovery_state_matrix(
     assert plan[0].unresolved is unresolved
 
 
+def test_recovery_matches_cloned_python_snapshot_rows_by_stable_identity():
+    class CloningSnapshot:
+        account_id = "ACCOUNT"
+        account_currency = "USD"
+        order_history = []
+        fills = []
+        positions = []
+        account_summary = SimpleNamespace(account_balance="100000")
+
+        @property
+        def orders(self):
+            return [
+                remote_order(
+                    status="complete",
+                    notification_type="CANCEL",
+                    filled_quantity="0",
+                    unfilled_quantity="2",
+                )
+            ]
+
+    plan, external = build_rithmic_recovery_plan(
+        [local_order()],
+        CloningSnapshot(),
+    )
+
+    assert external == []
+    assert plan[0].classification == "repaired"
+    assert plan[0].event.status == "cancelled"
+
+
 @pytest.mark.parametrize(
     ("remote_snapshot", "reason"),
     [
         (snapshot(), "no_authoritative_remote_evidence"),
         (
             snapshot(order_history=[remote_order(status="COMPLETE", filled_quantity="1")]),
+            "unknown_rithmic_order_status",
+        ),
+        (
+            snapshot(
+                order_history=[
+                    remote_order(
+                        status="COMPLETE",
+                        notification_type="COMPLETE",
+                        filled_quantity="0",
+                        unfilled_quantity="2",
+                    )
+                ]
+            ),
             "unknown_rithmic_order_status",
         ),
         (
@@ -283,6 +358,125 @@ def test_remote_only_working_order_is_reported_without_adoption():
     assert external == [
         {"basket_id": "manual-1", "client_order_id": None, "status": "OPEN"}
     ]
+
+
+def test_remote_only_terminal_orders_do_not_trigger_external_order_lockdown():
+    _, external = build_rithmic_recovery_plan(
+        [local_order()],
+        snapshot(
+            orders=[
+                remote_order(),
+                remote_order(
+                    basket_id="cancelled-1",
+                    client_order_id=None,
+                    status="complete",
+                    notification_type="CANCEL",
+                    filled_quantity="0",
+                ),
+                remote_order(
+                    basket_id="rejected-1",
+                    client_order_id=None,
+                    status="complete",
+                    notification_type="REJECT",
+                    filled_quantity="0",
+                ),
+                remote_order(
+                    basket_id="filled-1",
+                    client_order_id=None,
+                    status="complete",
+                    notification_type="FILL",
+                    filled_quantity="2",
+                ),
+                remote_order(
+                    basket_id="status-cancelled-1",
+                    client_order_id=None,
+                    status="cancelled",
+                    notification_type="STATUS",
+                    filled_quantity="0",
+                ),
+                remote_order(
+                    basket_id="inconsistent-filled-1",
+                    client_order_id=None,
+                    status="filled",
+                    notification_type="STATUS",
+                    filled_quantity="0",
+                ),
+                remote_order(
+                    basket_id="inconsistent-open-full-1",
+                    client_order_id=None,
+                    status="OPEN",
+                    notification_type="STATUS",
+                    filled_quantity="2",
+                ),
+                remote_order(
+                    basket_id="inconsistent-cancel-full-1",
+                    client_order_id=None,
+                    status="complete",
+                    notification_type="CANCEL",
+                    filled_quantity="2",
+                ),
+                remote_order(
+                    basket_id="inconsistent-reject-full-1",
+                    client_order_id=None,
+                    status="complete",
+                    notification_type="REJECT",
+                    filled_quantity="2",
+                ),
+            ]
+        ),
+    )
+
+    assert external == [
+        {
+            "basket_id": "inconsistent-filled-1",
+            "client_order_id": None,
+            "status": "filled",
+        },
+        {
+            "basket_id": "inconsistent-open-full-1",
+            "client_order_id": None,
+            "status": "OPEN",
+        },
+        {
+            "basket_id": "inconsistent-cancel-full-1",
+            "client_order_id": None,
+            "status": "complete",
+        },
+        {
+            "basket_id": "inconsistent-reject-full-1",
+            "client_order_id": None,
+            "status": "complete",
+        },
+    ]
+
+
+@pytest.mark.parametrize("status", ["expired", "failed"])
+@pytest.mark.parametrize(
+    ("filled_quantity", "is_external"),
+    [("0", False), ("1", False), ("2", True)],
+)
+def test_remote_only_failed_terminal_fill_matrix(
+    status,
+    filled_quantity,
+    is_external,
+):
+    _, external = build_rithmic_recovery_plan(
+        [local_order()],
+        snapshot(
+            orders=[
+                remote_order(),
+                remote_order(
+                    basket_id=f"{status}-{filled_quantity}",
+                    client_order_id=None,
+                    status=status,
+                    notification_type="STATUS",
+                    filled_quantity=filled_quantity,
+                ),
+            ]
+        ),
+    )
+
+    assert bool(external) is is_external
 
 
 def test_snapshot_loader_is_called_once_with_bounded_owned_window():

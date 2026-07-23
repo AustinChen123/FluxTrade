@@ -69,6 +69,7 @@ def snapshot(**overrides):
         "basket_id": "basket-1",
         "exchange_order_id": "exchange-1",
         "status": "OPEN",
+        "notification_type": "STATUS",
         "quantity": "2",
         "filled_quantity": "1",
         "average_fill_price": "20000.25",
@@ -724,6 +725,62 @@ def test_lookup_rejects_inconsistent_terminal_snapshot(adapter, client):
     client.lookup.return_value = snapshot(status="COMPLETE", filled_quantity="1")
 
     with pytest.raises(ExchangeError, match="unsupported_rithmic_order_snapshot_status"):
+        adapter.get_order_by_client_id("client-1", PRODUCT_ID)
+
+
+def test_lookup_uses_cancel_notification_to_disambiguate_complete_status(
+    adapter,
+    client,
+):
+    adapter.start_order_event_stream()
+    client.lookup.return_value = snapshot(
+        status="COMPLETE",
+        notification_type="CANCEL",
+        filled_quantity="0",
+    )
+
+    result = adapter.get_order_by_client_id("client-1", PRODUCT_ID)
+
+    assert result.status == "cancelled"
+
+
+def test_lookup_rejects_cancel_notification_after_a_full_fill(adapter, client):
+    adapter.start_order_event_stream()
+    client.lookup.return_value = snapshot(
+        status="COMPLETE",
+        notification_type="CANCEL",
+        filled_quantity="2",
+    )
+
+    with pytest.raises(ExchangeError, match="invalid_rithmic_cancel_snapshot_quantities"):
+        adapter.get_order_by_client_id("client-1", PRODUCT_ID)
+
+
+def test_lookup_uses_reject_notification_to_disambiguate_complete_status(
+    adapter,
+    client,
+):
+    adapter.start_order_event_stream()
+    client.lookup.return_value = snapshot(
+        status="COMPLETE",
+        notification_type="REJECT",
+        filled_quantity="0",
+    )
+
+    result = adapter.get_order_by_client_id("client-1", PRODUCT_ID)
+
+    assert result.status == "rejected"
+
+
+def test_lookup_rejects_reject_notification_after_a_full_fill(adapter, client):
+    adapter.start_order_event_stream()
+    client.lookup.return_value = snapshot(
+        status="COMPLETE",
+        notification_type="REJECT",
+        filled_quantity="2",
+    )
+
+    with pytest.raises(ExchangeError, match="invalid_rithmic_reject_snapshot_quantities"):
         adapter.get_order_by_client_id("client-1", PRODUCT_ID)
 
 

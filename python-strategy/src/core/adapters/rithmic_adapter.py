@@ -556,6 +556,7 @@ class RithmicExchangeAdapter(IExchangeAdapter):
             str(remote.status),
             filled_quantity,
             quantity,
+            notification_type=getattr(remote, "notification_type", None),
         )
         return ExchangeOrderSnapshot(
             client_order_id=str(remote.client_order_id),
@@ -746,10 +747,21 @@ def _normalize_snapshot_status(
     status: str,
     filled_quantity: Decimal,
     quantity: Decimal,
+    *,
+    notification_type: str | None = None,
 ) -> str:
     normalized = status.strip().lower().replace("-", "_").replace(" ", "_")
+    notification = str(notification_type or "").strip().upper()
     if quantity <= 0 or filled_quantity < 0 or filled_quantity > quantity:
         raise ExchangeError("invalid_rithmic_order_snapshot_quantities")
+    if notification == "CANCEL":
+        if filled_quantity == quantity:
+            raise ExchangeError("invalid_rithmic_cancel_snapshot_quantities")
+        return "cancelled"
+    if notification == "REJECT":
+        if filled_quantity == quantity:
+            raise ExchangeError("invalid_rithmic_reject_snapshot_quantities")
+        return "rejected"
     if normalized in {"open", "open_pending", "new", "submitted", "accepted"}:
         return "partially_filled" if filled_quantity > 0 else "open"
     if normalized in {"partial", "partially_filled", "partiallyfilled"}:

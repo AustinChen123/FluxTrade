@@ -98,6 +98,7 @@ def build_rithmic_recovery_plan(
             "status": remote.status,
         }
         for remote in snapshot.orders
+        if _remote_may_be_working(remote)
         if not _is_expected_native_child(
             remote,
             expected_native_children,
@@ -148,7 +149,11 @@ def build_rithmic_recovery_plan(
                 continue
             if candidates:
                 by_basket = candidates[0]
-        if by_basket is not None and by_client is not None and by_basket is not by_client:
+        if (
+            by_basket is not None
+            and by_client is not None
+            and str(by_basket.basket_id) != str(by_client.basket_id)
+        ):
             results.append(_blocked(order, "conflicting_remote_identity"))
             continue
         remote = by_basket or by_client
@@ -296,7 +301,12 @@ def _classify_order(order, remote, fills: list[object]) -> RithmicRecoveryItem:
             status = "partially_filled"
             unresolved = True
     else:
-        status = _normalize_status(remote.status, cumulative_quantity, order_quantity)
+        status = _normalize_status(
+            remote.status,
+            cumulative_quantity,
+            order_quantity,
+            notification_type=getattr(remote, "notification_type", None),
+        )
         if status is None:
             return _blocked(order, "unknown_rithmic_order_status")
         unresolved = False
@@ -346,8 +356,15 @@ def _normalize_status(
     status: str,
     cumulative_quantity: Decimal,
     order_quantity: Decimal,
+    *,
+    notification_type: str | None = None,
 ) -> str | None:
     normalized = (status or "").strip().lower()
+    notification = str(notification_type or "").strip().upper()
+    if notification == "CANCEL":
+        return "cancelled" if cumulative_quantity < order_quantity else None
+    if notification == "REJECT":
+        return "failed" if cumulative_quantity < order_quantity else None
     if normalized in {"open", "new", "submitted", "accepted", "modified"}:
         if cumulative_quantity >= order_quantity:
             return None
@@ -364,8 +381,8 @@ def _normalize_status(
         return "cancelled"
     if normalized in {"rejected", "expired", "failed"}:
         return "failed"
-    if normalized == "complete" and cumulative_quantity == order_quantity:
-        return "filled"
+    if normalized == "complete":
+        return "filled" if cumulative_quantity == order_quantity else None
     return None
 
 
@@ -376,6 +393,29 @@ def _normalize_transaction_type(value: str) -> str | None:
     if normalized in {"SELL", "SS"}:
         return "sell"
     return None
+
+
+def _remote_may_be_working(remote) -> bool:
+    notification = str(getattr(remote, "notification_type", None) or "").strip().upper()
+    quantity = _decimal(getattr(remote, "quantity", None))
+    filled = _decimal(getattr(remote, "filled_quantity", None))
+    status = str(getattr(remote, "status", None) or "").strip().lower()
+    if notification in {"CANCEL", "REJECT"} or status in {
+        "cancel",
+        "canceled",
+        "cancelled",
+        "reject",
+        "rejected",
+        "expired",
+        "failed",
+    }:
+        return not (quantity > 0 and filled < quantity)
+    if quantity > 0 and filled == quantity:
+        return not (
+            notification == "FILL"
+            or status in {"complete", "completed", "filled", "closed"}
+        )
+    return True
 
 
 def _event_matches_local(order, event: ExchangeOrderEvent) -> bool:
