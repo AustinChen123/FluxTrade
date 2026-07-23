@@ -18,6 +18,10 @@ pub struct PyLedgerOrder {
     #[pyo3(get)]
     pub basket_id: String,
     #[pyo3(get)]
+    pub original_basket_id: Option<String>,
+    #[pyo3(get)]
+    pub linked_basket_ids: Option<String>,
+    #[pyo3(get)]
     pub exchange: String,
     #[pyo3(get)]
     pub symbol: String,
@@ -33,6 +37,14 @@ pub struct PyLedgerOrder {
     pub transaction_type: String,
     #[pyo3(get)]
     pub quantity: String,
+    #[pyo3(get)]
+    pub price: Option<String>,
+    #[pyo3(get)]
+    pub trigger_price: Option<String>,
+    #[pyo3(get)]
+    pub price_type: Option<String>,
+    #[pyo3(get)]
+    pub bracket_type: Option<String>,
     #[pyo3(get)]
     pub filled_quantity: Option<String>,
     #[pyo3(get)]
@@ -249,6 +261,8 @@ impl From<OrderSnapshot> for PyLedgerOrder {
             client_order_id: order.client_order_id,
             exchange_order_id: order.exchange_order_id,
             basket_id: order.basket_id,
+            original_basket_id: order.original_basket_id,
+            linked_basket_ids: order.linked_basket_ids,
             exchange: order.exchange,
             symbol: order.symbol,
             status: order.status,
@@ -262,6 +276,10 @@ impl From<OrderSnapshot> for PyLedgerOrder {
             }
             .to_string(),
             quantity: order.quantity.to_string(),
+            price: order.price.map(|value| value.to_string()),
+            trigger_price: order.trigger_price.map(|value| value.to_string()),
+            price_type: order.price_type,
+            bracket_type: order.bracket_type,
             filled_quantity: order.filled_quantity.map(|value| value.to_string()),
             unfilled_quantity: order.unfilled_quantity.map(|value| value.to_string()),
             average_fill_price: order.average_fill_price.map(|value| value.to_string()),
@@ -332,6 +350,8 @@ mod tests {
                 account: account.clone(),
                 client_order_id: None,
                 basket_id: "BASKET".to_string(),
+                original_basket_id: None,
+                linked_basket_ids: None,
                 exchange_order_id: Some("EXCHANGE".to_string()),
                 exchange: "CME".to_string(),
                 symbol: "NQU6".to_string(),
@@ -341,6 +361,10 @@ mod tests {
                 report_text: None,
                 transaction_type: TransactionType::ShortSell,
                 quantity: dec!(2),
+                price: Some(dec!(20001.25)),
+                trigger_price: Some(dec!(19999.25)),
+                price_type: Some("limit".to_string()),
+                bracket_type: Some("target_and_stop_static".to_string()),
                 filled_quantity: Some(dec!(1)),
                 unfilled_quantity: Some(dec!(1)),
                 average_fill_price: Some(dec!(20000.25)),
@@ -391,6 +415,16 @@ mod tests {
             Some("STATUS")
         );
         assert_eq!(snapshot.orders[0].transaction_type, "SHORT_SELL");
+        assert_eq!(snapshot.orders[0].price.as_deref(), Some("20001.25"));
+        assert_eq!(
+            snapshot.orders[0].trigger_price.as_deref(),
+            Some("19999.25")
+        );
+        assert_eq!(snapshot.orders[0].price_type.as_deref(), Some("limit"));
+        assert_eq!(
+            snapshot.orders[0].bracket_type.as_deref(),
+            Some("target_and_stop_static")
+        );
         assert_eq!(snapshot.fills[0].fill_quantity, "1");
         assert_eq!(snapshot.fills[0].fill_price, "20000.25");
         assert_eq!(snapshot.fills[0].transaction_type, "BUY");

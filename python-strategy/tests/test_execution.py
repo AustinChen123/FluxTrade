@@ -13,6 +13,7 @@ Covers:
 from contextlib import nullcontext
 from copy import copy
 import threading
+from types import SimpleNamespace
 
 import pytest
 from decimal import Decimal
@@ -392,22 +393,12 @@ class TestExecutionTradingRules:
         assert {order.type for order in orders} == {"limit", "trailing_stop"}
         assert all(order.status == "failed" for order in orders)
 
-    @pytest.mark.parametrize(
-        "protection",
-        [
-            {"stop_loss": Decimal("19900.00")},
-            {"take_profit": Decimal("20100.00")},
-            {"trailing_distance": Decimal("25.00")},
-        ],
-        ids=["stop-loss", "take-profit", "trailing-stop"],
-    )
-    def test_rithmic_rejects_unsupported_protection_before_entry_submit(
+    def test_rithmic_rejects_trailing_protection_before_entry_submit(
         self,
         mock_db_session,
         mock_clock,
         mock_order_repo,
         signal_factory,
-        protection,
     ):
         client = MagicMock()
         adapter = RithmicExchangeAdapter(
@@ -435,17 +426,570 @@ class TestExecutionTradingRules:
             product_id="RITHMIC:NQ-202609",
             price=Decimal("20000.25"),
             quantity=Decimal("1"),
-            **protection,
+            trailing_distance=Decimal("25.00"),
         )
 
-        with pytest.raises(ExchangeError, match="rithmic_order_type_unsupported"):
+        with pytest.raises(ExchangeError, match="native_bracket_leg_unsupported"):
             engine.execute_signal(signal)
 
         client.submit.assert_not_called()
+        client.submit_bracket.assert_not_called()
         assert all(
             order.status == "failed"
             for order in mock_order_repo.orders.values()
         )
+
+    def test_rithmic_native_bracket_is_atomic_and_not_resubmitted_after_entry_fill(
+        self,
+        mock_db_session,
+        mock_clock,
+        mock_order_repo,
+        signal_factory,
+    ):
+        client = MagicMock()
+        client.submit_bracket.return_value = SimpleNamespace(basket_id="parent-1")
+        adapter = RithmicExchangeAdapter(
+            profile="test",
+            account_id="ACCOUNT",
+            instruments={
+                "RITHMIC:NQ-202609": {
+                    "exchange": "CME",
+                    "quantity_step": "1",
+                    "price_tick": "0.25",
+                }
+            },
+            client_factory=MagicMock(return_value=client),
+        )
+        adapter.start_order_event_stream()
+        engine = ExecutionEngine(
+            db_session=mock_db_session,
+            clock=mock_clock,
+            adapter=adapter,
+            order_repository=mock_order_repo,
+            db_session_factory=lambda: nullcontext(mock_db_session),
+            audit_external_orders=True,
+            is_backtest=True,
+            rithmic_account_profile="test",
+            rithmic_account_id="ACCOUNT",
+        )
+
+        order_id = engine.execute_signal(
+            signal_factory(
+                product_id="RITHMIC:NQ-202609",
+                price=Decimal("20000.25"),
+                quantity=Decimal("1"),
+                stop_loss=Decimal("19998.25"),
+                take_profit=Decimal("20003.25"),
+            )
+        )
+
+        entry = mock_order_repo.orders[order_id]
+        protections = [
+            order
+            for order in mock_order_repo.orders.values()
+            if order.type in {"stop_loss", "take_profit"}
+        ]
+        client.submit.assert_not_called()
+        client.submit_bracket.assert_called_once()
+        assert entry.exchange_order_id == "parent-1"
+        assert all(order.status == OrderStatus.SUBMITTED.value for order in protections)
+        assert all(
+            order.intent_payload["placement_mode"] == "attach-at-entry"
+            for order in protections
+        )
+
+        result = engine.process_exchange_order_event(
+            ExchangeOrderEvent(
+                status="filled",
+                product_id=entry.product_id,
+                client_order_id=entry.client_order_id,
+                exchange_order_id="parent-1",
+                cumulative_filled_quantity=Decimal("1"),
+                cumulative_average_price=Decimal("20000.25"),
+            )
+        )
+
+        assert result["action"] == "applied"
+        client.submit_bracket.assert_called_once()
+        client.submit.assert_not_called()
+        assert {
+            order.type: order.intent_payload["expected_effective_price"]
+            for order in protections
+        } == {"stop_loss": "19998.25", "take_profit": "20003.25"}
+        assert all(
+            order.intent_payload["protection_confirmation"] == "pending_remote_event"
+            for order in protections
+        )
+        for order in protections:
+            is_stop = order.type == "stop_loss"
+            result = engine.process_exchange_order_event(
+                ExchangeOrderEvent(
+                    status="open",
+                    product_id=entry.product_id,
+                    client_order_id=order.client_order_id,
+                    exchange_order_id=f"child-{order.type}",
+                    raw={
+                        "original_basket_id": "parent-1",
+                        "price_type": "stop_market" if is_stop else "limit",
+                        "trigger_price": "19998.25" if is_stop else None,
+                        "price": None if is_stop else "20003.25",
+                        "bracket_type": "target_and_stop_static",
+                    },
+                )
+            )
+            assert result["action"] == "applied"
+        assert {
+            order.type: order.intent_payload["effective_price"]
+            for order in protections
+        } == {"stop_loss": "19998.25", "take_profit": "20003.25"}
+        stop = next(order for order in protections if order.type == "stop_loss")
+        result = engine.process_exchange_order_event(
+            ExchangeOrderEvent(
+                status="open",
+                product_id=entry.product_id,
+                client_order_id=stop.client_order_id,
+                exchange_order_id="unexpected-child",
+                raw={"original_basket_id": "parent-1"},
+            )
+        )
+        assert result["action"] == "unresolved_native_protection_basket_mismatch"
+        assert stop.exchange_order_id == "child-stop_loss"
+        result = engine.process_exchange_order_event(
+            ExchangeOrderEvent(
+                status="open",
+                product_id=entry.product_id,
+                client_order_id=stop.client_order_id,
+                exchange_order_id="child-stop_loss",
+                raw={
+                    "original_basket_id": "parent-1",
+                    "price_type": "stop_market",
+                    "trigger_price": "19998.00",
+                    "bracket_type": "target_and_stop_static",
+                },
+            )
+        )
+        assert result["action"] == "unresolved_native_protection_price_mismatch"
+        assert stop.trigger_price == Decimal("19998.25")
+        assert stop.intent_payload["protection_confirmation"] == "conflict"
+
+    def test_rithmic_native_bracket_fill_drift_is_audited_without_lockdown(
+        self,
+        mock_db_session,
+        mock_clock,
+        mock_order_repo,
+        signal_factory,
+    ):
+        client = MagicMock()
+        client.submit_bracket.return_value = SimpleNamespace(basket_id="parent-1")
+        adapter = RithmicExchangeAdapter(
+            profile="test",
+            account_id="ACCOUNT",
+            instruments={
+                "RITHMIC:NQ-202609": {
+                    "exchange": "CME",
+                    "quantity_step": "1",
+                    "price_tick": "0.25",
+                }
+            },
+            client_factory=MagicMock(return_value=client),
+        )
+        adapter.start_order_event_stream()
+        engine = ExecutionEngine(
+            db_session=mock_db_session,
+            clock=mock_clock,
+            adapter=adapter,
+            order_repository=mock_order_repo,
+            db_session_factory=lambda: nullcontext(mock_db_session),
+            audit_external_orders=True,
+            is_backtest=True,
+            rithmic_account_profile="test",
+            rithmic_account_id="ACCOUNT",
+        )
+        order_id = engine.execute_signal(
+            signal_factory(
+                product_id="RITHMIC:NQ-202609",
+                price=Decimal("20000.25"),
+                quantity=Decimal("1"),
+                stop_loss=Decimal("19998.25"),
+            )
+        )
+        entry = mock_order_repo.orders[order_id]
+
+        result = engine.process_exchange_order_event(
+            ExchangeOrderEvent(
+                status="filled",
+                product_id=entry.product_id,
+                client_order_id=entry.client_order_id,
+                exchange_order_id="parent-1",
+                cumulative_filled_quantity=Decimal("1"),
+                cumulative_average_price=Decimal("20000.75"),
+            )
+        )
+
+        protection = next(
+            order
+            for order in mock_order_repo.orders.values()
+            if order.type == "stop_loss"
+        )
+        assert result["action"] == "applied"
+        assert protection.status == OrderStatus.SUBMITTED.value
+        assert protection.trigger_price == Decimal("19998.25")
+        assert protection.intent_payload["requested_price"] == "19998.25"
+        assert protection.intent_payload["expected_effective_price"] == "19998.75"
+        assert protection.intent_payload["protection_confirmation"] == "pending_remote_event"
+        assert protection.intent_payload["price_drift"] == "0.50"
+        result = engine.process_exchange_order_event(
+            ExchangeOrderEvent(
+                status="open",
+                product_id=entry.product_id,
+                client_order_id=protection.client_order_id,
+                exchange_order_id="child-stop-1",
+                raw={
+                    "original_basket_id": "parent-1",
+                    "price_type": "stop_market",
+                    "trigger_price": "19998.75",
+                    "bracket_type": "stop_only_static",
+                },
+            )
+        )
+        assert result["action"] == "applied"
+        assert protection.trigger_price == Decimal("19998.75")
+        assert protection.intent_payload["effective_price"] == "19998.75"
+        assert protection.intent_payload["protection_confirmation"] == "confirmed"
+        client.cancel.assert_not_called()
+
+    def test_rithmic_native_protection_modify_commits_only_after_confirmation(
+        self,
+        mock_db_session,
+        mock_clock,
+        mock_order_repo,
+        signal_factory,
+    ):
+        client = MagicMock()
+        client.submit_bracket.return_value = SimpleNamespace(basket_id="parent-1")
+        client.modify_protection.return_value = True
+        adapter = RithmicExchangeAdapter(
+            profile="test",
+            account_id="ACCOUNT",
+            instruments={
+                "RITHMIC:NQ-202609": {
+                    "exchange": "CME",
+                    "quantity_step": "1",
+                    "price_tick": "0.25",
+                }
+            },
+            client_factory=MagicMock(return_value=client),
+        )
+        adapter.start_order_event_stream()
+        engine = ExecutionEngine(
+            db_session=mock_db_session,
+            clock=mock_clock,
+            adapter=adapter,
+            order_repository=mock_order_repo,
+            db_session_factory=lambda: nullcontext(mock_db_session),
+            audit_external_orders=True,
+            is_backtest=True,
+            rithmic_account_profile="test",
+            rithmic_account_id="ACCOUNT",
+        )
+        entry_id = engine.execute_signal(
+            signal_factory(
+                product_id="RITHMIC:NQ-202609",
+                price=Decimal("20000.25"),
+                quantity=Decimal("1"),
+                stop_loss=Decimal("19998.25"),
+            )
+        )
+        stop = next(
+            order for order in mock_order_repo.orders.values() if order.type == "stop_loss"
+        )
+        stop.exchange_order_id = "child-stop-1"
+        mock_order_repo.update_order(stop)
+
+        result = engine.modify_protection(
+            entry_id,
+            stop_loss=Decimal("19999.00"),
+        )
+
+        stored = mock_order_repo.orders[stop.id]
+        assert result["effective_price"] == "19999.00"
+        assert stored.trigger_price == Decimal("19999.00")
+        assert stored.intent_payload["modifications"][-1]["requested_price"] == "19999.00"
+        assert stored.intent_payload["modifications"][-1]["status"] == "confirmed"
+        event_result = engine.process_exchange_order_event(
+            ExchangeOrderEvent(
+                status="modify_rejected",
+                product_id=stored.product_id,
+                client_order_id=stored.client_order_id,
+                exchange_order_id="child-stop-1",
+            )
+        )
+        assert event_result["action"] == "applied"
+        assert stored.trigger_price == Decimal("19999.00")
+
+    @pytest.mark.parametrize(
+        ("result", "error", "reconcile_halted", "fail_ambiguous_persistence"),
+        [
+            (False, ExchangeError, False, False),
+            (
+                RuntimeError("Rithmic modify-order result is ambiguous: disconnected"),
+                NetworkError,
+                True,
+                False,
+            ),
+            (
+                RuntimeError("Rithmic modify-order result is ambiguous: disconnected"),
+                RuntimeError,
+                True,
+                True,
+            ),
+        ],
+    )
+    def test_rithmic_native_protection_modify_failure_keeps_previous_price(
+        self,
+        mock_db_session,
+        mock_clock,
+        mock_order_repo,
+        signal_factory,
+        result,
+        error,
+        reconcile_halted,
+        fail_ambiguous_persistence,
+    ):
+        client = MagicMock()
+        client.submit_bracket.return_value = SimpleNamespace(basket_id="parent-1")
+        if isinstance(result, Exception):
+            client.modify_protection.side_effect = result
+        else:
+            client.modify_protection.return_value = result
+        adapter = RithmicExchangeAdapter(
+            profile="test",
+            account_id="ACCOUNT",
+            instruments={
+                "RITHMIC:NQ-202609": {
+                    "exchange": "CME",
+                    "quantity_step": "1",
+                    "price_tick": "0.25",
+                }
+            },
+            client_factory=MagicMock(return_value=client),
+        )
+        adapter.start_order_event_stream()
+        engine = ExecutionEngine(
+            db_session=mock_db_session,
+            clock=mock_clock,
+            adapter=adapter,
+            order_repository=mock_order_repo,
+            db_session_factory=lambda: nullcontext(mock_db_session),
+            audit_external_orders=True,
+            is_backtest=True,
+            rithmic_account_profile="test",
+            rithmic_account_id="ACCOUNT",
+        )
+        entry_id = engine.execute_signal(
+            signal_factory(
+                product_id="RITHMIC:NQ-202609",
+                price=Decimal("20000.25"),
+                quantity=Decimal("1"),
+                stop_loss=Decimal("19998.25"),
+            )
+        )
+        stop = next(
+            order for order in mock_order_repo.orders.values() if order.type == "stop_loss"
+        )
+        stop.exchange_order_id = "child-stop-1"
+        mock_order_repo.update_order(stop)
+        if fail_ambiguous_persistence:
+            update_order = mock_order_repo.update_order
+
+            def fail_ambiguous_attempt(order):
+                attempts = (order.intent_payload or {}).get("modifications") or []
+                if attempts and attempts[-1]["status"] == "ambiguous":
+                    raise RuntimeError("database unavailable")
+                update_order(order)
+
+            mock_order_repo.update_order = fail_ambiguous_attempt
+
+        with pytest.raises(error):
+            engine.modify_protection(entry_id, stop_loss=Decimal("19999.00"))
+
+        assert mock_order_repo.orders[stop.id].trigger_price == Decimal("19998.25")
+        expected_status = "ambiguous" if reconcile_halted else "rejected"
+        assert (
+            mock_order_repo.orders[stop.id].intent_payload["modifications"][-1]["status"]
+            == expected_status
+        )
+        assert engine._reconcile_halt is reconcile_halted
+
+    def test_ambiguous_native_bracket_submit_requires_authoritative_reconciliation(
+        self,
+        mock_db_session,
+        mock_clock,
+        mock_order_repo,
+        signal_factory,
+    ):
+        client = MagicMock()
+        client.submit_bracket.side_effect = RuntimeError(
+            "Rithmic bracket-order result is ambiguous: disconnected"
+        )
+        adapter = RithmicExchangeAdapter(
+            profile="test",
+            account_id="ACCOUNT",
+            instruments={
+                "RITHMIC:NQ-202609": {
+                    "exchange": "CME",
+                    "quantity_step": "1",
+                    "price_tick": "0.25",
+                }
+            },
+            client_factory=MagicMock(return_value=client),
+        )
+        adapter.start_order_event_stream()
+        engine = ExecutionEngine(
+            db_session=mock_db_session,
+            clock=mock_clock,
+            adapter=adapter,
+            order_repository=mock_order_repo,
+            db_session_factory=lambda: nullcontext(mock_db_session),
+            audit_external_orders=True,
+            is_backtest=True,
+            rithmic_account_profile="test",
+            rithmic_account_id="ACCOUNT",
+        )
+
+        with pytest.raises(NetworkError, match="ambiguous"):
+            engine.execute_signal(
+                signal_factory(
+                    product_id="RITHMIC:NQ-202609",
+                    price=Decimal("20000.25"),
+                    quantity=Decimal("1"),
+                    stop_loss=Decimal("19998.25"),
+                )
+            )
+
+        assert engine._reconcile_halt is True
+        assert {
+            order.status for order in mock_order_repo.orders.values()
+        } == {OrderStatus.SUBMITTED_UNCONFIRMED.value}
+
+    def test_native_bracket_post_ack_persistence_failure_halts_for_reconcile(
+        self,
+        mock_db_session,
+        mock_clock,
+        mock_order_repo,
+        signal_factory,
+    ):
+        client = MagicMock()
+        client.submit_bracket.return_value = SimpleNamespace(basket_id="parent-1")
+        adapter = RithmicExchangeAdapter(
+            profile="test",
+            account_id="ACCOUNT",
+            instruments={
+                "RITHMIC:NQ-202609": {
+                    "exchange": "CME",
+                    "quantity_step": "1",
+                    "price_tick": "0.25",
+                }
+            },
+            client_factory=MagicMock(return_value=client),
+        )
+        adapter.start_order_event_stream()
+        engine = ExecutionEngine(
+            db_session=mock_db_session,
+            clock=mock_clock,
+            adapter=adapter,
+            order_repository=mock_order_repo,
+            db_session_factory=lambda: nullcontext(mock_db_session),
+            audit_external_orders=True,
+            is_backtest=True,
+            rithmic_account_profile="test",
+            rithmic_account_id="ACCOUNT",
+        )
+        update_order = mock_order_repo.update_order
+
+        def fail_after_remote_ack(order):
+            if client.submit_bracket.called and order.type == "stop_loss":
+                raise RuntimeError("database unavailable")
+            update_order(order)
+
+        mock_order_repo.update_order = fail_after_remote_ack
+
+        with pytest.raises(RuntimeError, match="database unavailable"):
+            engine.execute_signal(
+                signal_factory(
+                    product_id="RITHMIC:NQ-202609",
+                    price=Decimal("20000.25"),
+                    quantity=Decimal("1"),
+                    stop_loss=Decimal("19998.25"),
+                )
+            )
+
+        client.submit_bracket.assert_called_once()
+        assert engine._reconcile_halt is True
+
+    def test_native_modify_post_confirmation_persistence_failure_stays_pending(
+        self,
+        mock_db_session,
+        mock_clock,
+        mock_order_repo,
+        signal_factory,
+    ):
+        client = MagicMock()
+        client.submit_bracket.return_value = SimpleNamespace(basket_id="parent-1")
+        client.modify_protection.return_value = True
+        adapter = RithmicExchangeAdapter(
+            profile="test",
+            account_id="ACCOUNT",
+            instruments={
+                "RITHMIC:NQ-202609": {
+                    "exchange": "CME",
+                    "quantity_step": "1",
+                    "price_tick": "0.25",
+                }
+            },
+            client_factory=MagicMock(return_value=client),
+        )
+        adapter.start_order_event_stream()
+        engine = ExecutionEngine(
+            db_session=mock_db_session,
+            clock=mock_clock,
+            adapter=adapter,
+            order_repository=mock_order_repo,
+            db_session_factory=lambda: nullcontext(mock_db_session),
+            audit_external_orders=True,
+            is_backtest=True,
+            rithmic_account_profile="test",
+            rithmic_account_id="ACCOUNT",
+        )
+        entry_id = engine.execute_signal(
+            signal_factory(
+                product_id="RITHMIC:NQ-202609",
+                price=Decimal("20000.25"),
+                quantity=Decimal("1"),
+                stop_loss=Decimal("19998.25"),
+            )
+        )
+        stop = next(
+            order for order in mock_order_repo.orders.values() if order.type == "stop_loss"
+        )
+        stop.exchange_order_id = "child-stop-1"
+        mock_order_repo.update_order(stop)
+        update_order = mock_order_repo.update_order
+
+        def fail_confirmed_modify(order):
+            attempts = (order.intent_payload or {}).get("modifications") or []
+            if attempts and attempts[-1]["status"] == "confirmed":
+                raise RuntimeError("database unavailable")
+            update_order(order)
+
+        mock_order_repo.update_order = fail_confirmed_modify
+
+        with pytest.raises(RuntimeError, match="database unavailable"):
+            engine.modify_protection(entry_id, stop_loss=Decimal("19999.00"))
+
+        assert stop.trigger_price == Decimal("19998.25")
+        assert stop.intent_payload["modifications"][-1]["status"] == "pending"
+        assert engine._reconcile_halt is True
 
     def test_fast_fill_event_cannot_be_regressed_by_late_submit_ack(
         self,

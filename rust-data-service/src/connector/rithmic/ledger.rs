@@ -91,6 +91,8 @@ pub(crate) struct OrderSnapshot {
     pub(crate) account: AccountIdentity,
     pub(crate) client_order_id: Option<String>,
     pub(crate) basket_id: String,
+    pub(crate) original_basket_id: Option<String>,
+    pub(crate) linked_basket_ids: Option<String>,
     pub(crate) exchange_order_id: Option<String>,
     pub(crate) exchange: String,
     pub(crate) symbol: String,
@@ -100,6 +102,10 @@ pub(crate) struct OrderSnapshot {
     pub(crate) report_text: Option<String>,
     pub(crate) transaction_type: TransactionType,
     pub(crate) quantity: Decimal,
+    pub(crate) price: Option<Decimal>,
+    pub(crate) trigger_price: Option<Decimal>,
+    pub(crate) price_type: Option<String>,
+    pub(crate) bracket_type: Option<String>,
     pub(crate) filled_quantity: Option<Decimal>,
     pub(crate) unfilled_quantity: Option<Decimal>,
     pub(crate) average_fill_price: Option<Decimal>,
@@ -115,6 +121,9 @@ pub(crate) enum OrderSnapshotEvent {
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) enum OrderHistoryEvent {
     Notification(Box<OrderSnapshot>),
+    NonStateChange,
+    Supplemental,
+    TerminalSupplemental(String),
     RequestCompleted,
 }
 
@@ -258,7 +267,9 @@ pub(crate) fn decode_order_snapshot_event(
         SHOW_ORDERS_RESPONSE => {
             let response: protocol::ResponseShowOrders = codec::decode(payload)?;
             ensure_request_key(&response.user_msg, request_key)?;
-            ensure_success(&response.rp_code)?;
+            if !is_no_data(&response.rp_code) {
+                ensure_success(&response.rp_code)?;
+            }
             Ok(OrderSnapshotEvent::RequestCompleted)
         }
         EXCHANGE_ORDER_NOTIFICATION => {
@@ -295,6 +306,8 @@ fn order_snapshot_from_notification(
         account,
         client_order_id: optional_text(response.user_tag),
         basket_id: required_text(response.basket_id, "basket_id")?,
+        original_basket_id: optional_text(response.original_basket_id),
+        linked_basket_ids: optional_text(response.linked_basket_ids),
         exchange_order_id: optional_text(response.exchange_order_id),
         exchange: required_text(response.exchange, "exchange")?,
         symbol: required_text(response.symbol, "symbol")?,
@@ -307,6 +320,10 @@ fn order_snapshot_from_notification(
         report_text: optional_text(response.report_text),
         transaction_type: transaction_type(response.transaction_type)?,
         quantity: positive_quantity(response.quantity, "order quantity")?,
+        price: optional_nonnegative_decimal(response.price, "order price")?,
+        trigger_price: optional_nonnegative_decimal(response.trigger_price, "trigger price")?,
+        price_type: exchange_price_type(response.price_type)?,
+        bracket_type: exchange_bracket_type(response.bracket_type)?,
         filled_quantity: optional_quantity(response.total_fill_size, "total_fill_size")?,
         unfilled_quantity: optional_quantity(response.total_unfilled_size, "total_unfilled_size")?,
         average_fill_price: optional_nonnegative_decimal(
@@ -347,21 +364,46 @@ pub(crate) fn decode_order_history_event(
         SHOW_ORDER_HISTORY_RESPONSE => {
             let response: protocol::ResponseShowOrderHistory = codec::decode(payload)?;
             ensure_request_key(&response.user_msg, request_key)?;
-            ensure_success(&response.rp_code)?;
+            if !is_no_data(&response.rp_code) {
+                ensure_success(&response.rp_code)?;
+            }
             Ok(OrderHistoryEvent::RequestCompleted)
         }
         EXCHANGE_ORDER_NOTIFICATION => {
             let response: protocol::ExchangeOrderNotification = codec::decode(payload)?;
-            let order = order_snapshot_from_notification(response, expected_account, false)?;
-            ensure!(
-                order.basket_id == expected_basket_id,
-                "Rithmic order-history basket ID mismatch"
-            );
-            Ok(OrderHistoryEvent::Notification(Box::new(order)))
+            ensure_exchange_history_identity(&response, expected_account, expected_basket_id)?;
+            let notify_type = protocol::exchange_order_notification::NotifyType::try_from(
+                response
+                    .notify_type
+                    .context("missing Rithmic exchange order-history notify type")?,
+            )
+            .context("unknown Rithmic exchange order-history notify type")?;
+            if matches!(
+                notify_type,
+                protocol::exchange_order_notification::NotifyType::Cancel
+                    | protocol::exchange_order_notification::NotifyType::Reject
+            ) {
+                return Ok(OrderHistoryEvent::TerminalSupplemental(
+                    notify_type.as_str_name().to_string(),
+                ));
+            }
+            Ok(OrderHistoryEvent::Supplemental)
         }
         RITHMIC_ORDER_NOTIFICATION => {
             let response: protocol::RithmicOrderNotification = codec::decode(payload)?;
-            let order = rithmic_order_snapshot(response, expected_account)?;
+            if is_non_state_change_order_history_notification(response.notify_type)? {
+                ensure_history_identity(&response, expected_account, expected_basket_id)?;
+                return Ok(OrderHistoryEvent::NonStateChange);
+            }
+            let diagnostic = format!(
+                "Rithmic order-history notification notify_type={:?} status={:?} basket_id={:?} has_quantity={}",
+                response.notify_type,
+                response.status,
+                response.basket_id,
+                response.quantity.is_some(),
+            );
+            let order =
+                rithmic_order_snapshot(response, expected_account).with_context(|| diagnostic)?;
             ensure!(
                 order.basket_id == expected_basket_id,
                 "Rithmic order-history basket ID mismatch"
@@ -370,6 +412,73 @@ pub(crate) fn decode_order_history_event(
         }
         template_id => anyhow::bail!("unsupported Rithmic order-history template {template_id}"),
     }
+}
+
+fn is_non_state_change_order_history_notification(notify_type: Option<i32>) -> Result<bool> {
+    use protocol::rithmic_order_notification::NotifyType;
+    let notify_type =
+        NotifyType::try_from(notify_type.context("missing Rithmic order-history notify type")?)
+            .context("unknown Rithmic order-history notify type")?;
+    Ok(matches!(
+        notify_type,
+        NotifyType::OrderRcvdFromClnt
+            | NotifyType::ModifyRcvdFromClnt
+            | NotifyType::CancelRcvdFromClnt
+            | NotifyType::OpenPending
+            | NotifyType::ModifyPending
+            | NotifyType::CancelPending
+            | NotifyType::OrderRcvdByExchGtwy
+            | NotifyType::ModifyRcvdByExchGtwy
+            | NotifyType::CancelRcvdByExchGtwy
+            | NotifyType::OrderSentToExch
+            | NotifyType::ModifySentToExch
+            | NotifyType::CancelSentToExch
+            | NotifyType::ModificationFailed
+            | NotifyType::CancellationFailed
+            | NotifyType::TriggerPending
+    ))
+}
+
+fn ensure_history_identity(
+    response: &protocol::RithmicOrderNotification,
+    expected_account: &AccountIdentity,
+    expected_basket_id: &str,
+) -> Result<()> {
+    let account = account_identity(
+        response.fcm_id.clone(),
+        response.ib_id.clone(),
+        response.account_id.clone(),
+    )?;
+    ensure!(
+        account == *expected_account,
+        "Rithmic order-history account mismatch"
+    );
+    ensure!(
+        required_text(response.basket_id.clone(), "basket_id")? == expected_basket_id,
+        "Rithmic order-history basket ID mismatch"
+    );
+    Ok(())
+}
+
+fn ensure_exchange_history_identity(
+    response: &protocol::ExchangeOrderNotification,
+    expected_account: &AccountIdentity,
+    expected_basket_id: &str,
+) -> Result<()> {
+    let account = account_identity(
+        response.fcm_id.clone(),
+        response.ib_id.clone(),
+        response.account_id.clone(),
+    )?;
+    ensure!(
+        account == *expected_account,
+        "Rithmic exchange order-history account mismatch"
+    );
+    ensure!(
+        required_text(response.basket_id.clone(), "basket_id")? == expected_basket_id,
+        "Rithmic order-history basket ID mismatch"
+    );
+    Ok(())
 }
 
 fn rithmic_order_snapshot(
@@ -385,6 +494,8 @@ fn rithmic_order_snapshot(
         account,
         client_order_id: optional_text(response.user_tag),
         basket_id: required_text(response.basket_id, "basket_id")?,
+        original_basket_id: optional_text(response.original_basket_id),
+        linked_basket_ids: optional_text(response.linked_basket_ids),
         exchange_order_id: optional_text(response.exchange_order_id),
         exchange: required_text(response.exchange, "exchange")?,
         symbol: required_text(response.symbol, "symbol")?,
@@ -398,6 +509,10 @@ fn rithmic_order_snapshot(
         report_text: optional_text(response.report_text),
         transaction_type: transaction_type_value(response.transaction_type)?,
         quantity: positive_quantity(response.quantity, "order quantity")?,
+        price: optional_nonnegative_decimal(response.price, "order price")?,
+        trigger_price: optional_nonnegative_decimal(response.trigger_price, "trigger price")?,
+        price_type: rithmic_price_type(response.price_type)?,
+        bracket_type: rithmic_bracket_type(response.bracket_type)?,
         filled_quantity: optional_quantity(response.total_fill_size, "total_fill_size")?,
         unfilled_quantity: optional_quantity(response.total_unfilled_size, "total_unfilled_size")?,
         average_fill_price: optional_nonnegative_decimal(
@@ -452,6 +567,9 @@ pub(crate) fn decode_fill_history_event(
 
     match classify_response_codes(&response.rq_handler_rp_code, &response.rp_code)? {
         ResponseDisposition::Succeeded => return Ok(FillHistoryEvent::RequestCompleted),
+        ResponseDisposition::Failed(codes) if is_no_data(&codes) => {
+            return Ok(FillHistoryEvent::RequestCompleted);
+        }
         ResponseDisposition::Failed(codes) => {
             anyhow::bail!("Rithmic fill-history response failed: {}", codes.join(","))
         }
@@ -484,6 +602,10 @@ pub(crate) fn decode_fill_history_event(
         )?,
         timestamp_ms: optional_epoch_millis(response.ssboe, response.usecs)?,
     })))
+}
+
+fn is_no_data(codes: &[String]) -> bool {
+    codes.first().is_some_and(|code| code == "7")
 }
 
 pub(crate) fn pnl_position_snapshot_request(
@@ -642,6 +764,46 @@ fn transaction_type_value(value: Option<i32>) -> Result<TransactionType> {
     }
 }
 
+fn exchange_price_type(value: Option<i32>) -> Result<Option<String>> {
+    value
+        .map(|value| {
+            protocol::exchange_order_notification::PriceType::try_from(value)
+                .context("unknown Rithmic exchange-order price type")
+                .map(|value| value.as_str_name().to_ascii_lowercase())
+        })
+        .transpose()
+}
+
+fn rithmic_price_type(value: Option<i32>) -> Result<Option<String>> {
+    value
+        .map(|value| {
+            protocol::rithmic_order_notification::PriceType::try_from(value)
+                .context("unknown Rithmic order-history price type")
+                .map(|value| value.as_str_name().to_ascii_lowercase())
+        })
+        .transpose()
+}
+
+fn exchange_bracket_type(value: Option<i32>) -> Result<Option<String>> {
+    value
+        .map(|value| {
+            protocol::exchange_order_notification::BracketType::try_from(value)
+                .context("unknown Rithmic exchange-order bracket type")
+                .map(|value| value.as_str_name().to_ascii_lowercase())
+        })
+        .transpose()
+}
+
+fn rithmic_bracket_type(value: Option<i32>) -> Result<Option<String>> {
+    value
+        .map(|value| {
+            protocol::rithmic_order_notification::BracketType::try_from(value)
+                .context("unknown Rithmic order-history bracket type")
+                .map(|value| value.as_str_name().to_ascii_lowercase())
+        })
+        .transpose()
+}
+
 fn exchange_notification_type(value: i32) -> Result<String> {
     protocol::exchange_order_notification::NotifyType::try_from(value)
         .context("unknown Rithmic exchange-order notify type")
@@ -791,6 +953,7 @@ mod tests {
     fn order_history_requires_matching_basket_and_explicit_completion() {
         let notification = codec::encode(&protocol::ExchangeOrderNotification {
             template_id: EXCHANGE_ORDER_NOTIFICATION,
+            notify_type: Some(protocol::exchange_order_notification::NotifyType::Cancel as i32),
             is_snapshot: Some(false),
             fcm_id: Some("FCM".to_string()),
             ib_id: Some("IB".to_string()),
@@ -808,12 +971,10 @@ mod tests {
             ..Default::default()
         })
         .unwrap();
-        let OrderHistoryEvent::Notification(order) =
-            decode_order_history_event(&notification, "history", &account(), "basket-1").unwrap()
-        else {
-            panic!("expected order-history notification");
-        };
-        assert_eq!(order.status, "CANCELLED");
+        assert_eq!(
+            decode_order_history_event(&notification, "history", &account(), "basket-1").unwrap(),
+            OrderHistoryEvent::TerminalSupplemental("CANCEL".to_string()),
+        );
         assert!(
             decode_order_history_event(&notification, "history", &account(), "other-basket",)
                 .is_err()
@@ -870,20 +1031,36 @@ mod tests {
                 report_text: Some("report".to_string()),
                 transaction_type: Some(1),
                 quantity: Some(1),
+                price: Some(20_001.25),
+                trigger_price: Some(19_999.25),
+                price_type: Some(
+                    protocol::rithmic_order_notification::PriceType::StopMarket as i32,
+                ),
+                bracket_type: Some(
+                    protocol::rithmic_order_notification::BracketType::StopOnlyStatic as i32,
+                ),
                 total_fill_size: Some(0),
                 total_unfilled_size: Some(0),
                 ..Default::default()
             })
             .unwrap();
-            let OrderHistoryEvent::Notification(order) =
-                decode_order_history_event(&payload, "history", &account(), "basket-1").unwrap()
-            else {
-                panic!("expected order-history notification");
+            let event =
+                decode_order_history_event(&payload, "history", &account(), "basket-1").unwrap();
+            if matches!(notify_type, 1..=12 | 16..=18) {
+                assert_eq!(event, OrderHistoryEvent::NonStateChange);
+                continue;
+            }
+            let OrderHistoryEvent::Notification(order) = event else {
+                panic!("expected state-bearing order-history notification");
             };
             assert_eq!(order.notification_type.as_deref(), Some(expected));
             assert_eq!(order.status, "COMPLETE");
             assert_eq!(order.completion_reason.as_deref(), Some("reason"));
             assert_eq!(order.report_text.as_deref(), Some("report"));
+            assert_eq!(order.price, Some(dec!(20001.25)));
+            assert_eq!(order.trigger_price, Some(dec!(19999.25)));
+            assert_eq!(order.price_type.as_deref(), Some("stop_market"));
+            assert_eq!(order.bracket_type.as_deref(), Some("stop_only_static"));
         }
 
         for (notify_type, expected) in [
@@ -907,6 +1084,124 @@ mod tests {
         }
         assert!(rithmic_notification_type(21).is_err());
         assert!(exchange_notification_type(10).is_err());
+    }
+
+    #[test]
+    fn sparse_order_history_intermediates_preserve_identity_and_are_not_snapshots() {
+        let sparse = |notify_type, account_id: &str, basket_id: &str| {
+            codec::encode(&protocol::RithmicOrderNotification {
+                template_id: RITHMIC_ORDER_NOTIFICATION,
+                notify_type: Some(notify_type),
+                fcm_id: Some("FCM".to_string()),
+                ib_id: Some("IB".to_string()),
+                account_id: Some(account_id.to_string()),
+                basket_id: Some(basket_id.to_string()),
+                ..Default::default()
+            })
+            .unwrap()
+        };
+
+        for notify_type in 1..=12 {
+            assert_eq!(
+                decode_order_history_event(
+                    &sparse(notify_type, "ACCOUNT", "basket-1"),
+                    "history",
+                    &account(),
+                    "basket-1",
+                )
+                .unwrap(),
+                OrderHistoryEvent::NonStateChange,
+            );
+        }
+        for notify_type in [16, 17, 18] {
+            assert_eq!(
+                decode_order_history_event(
+                    &sparse(notify_type, "ACCOUNT", "basket-1"),
+                    "history",
+                    &account(),
+                    "basket-1",
+                )
+                .unwrap(),
+                OrderHistoryEvent::NonStateChange,
+            );
+        }
+        assert!(decode_order_history_event(
+            &sparse(1, "OTHER", "basket-1"),
+            "history",
+            &account(),
+            "basket-1",
+        )
+        .is_err());
+        assert!(decode_order_history_event(
+            &sparse(1, "ACCOUNT", "other-basket"),
+            "history",
+            &account(),
+            "basket-1",
+        )
+        .is_err());
+        for state_bearing in 13..=15 {
+            assert!(decode_order_history_event(
+                &sparse(state_bearing, "ACCOUNT", "basket-1"),
+                "history",
+                &account(),
+                "basket-1",
+            )
+            .is_err());
+        }
+        for state_bearing in 19..=20 {
+            assert!(decode_order_history_event(
+                &sparse(state_bearing, "ACCOUNT", "basket-1"),
+                "history",
+                &account(),
+                "basket-1",
+            )
+            .is_err());
+        }
+    }
+
+    #[test]
+    fn exchange_order_history_events_are_supplemental_not_snapshots() {
+        let event = |notify_type, account_id: &str, basket_id: &str, is_snapshot| {
+            codec::encode(&protocol::ExchangeOrderNotification {
+                template_id: EXCHANGE_ORDER_NOTIFICATION,
+                notify_type,
+                is_snapshot,
+                fcm_id: Some("FCM".to_string()),
+                ib_id: Some("IB".to_string()),
+                account_id: Some(account_id.to_string()),
+                basket_id: Some(basket_id.to_string()),
+                ..Default::default()
+            })
+            .unwrap()
+        };
+
+        for notify_type in 1..=9 {
+            let expected = match notify_type {
+                3 => OrderHistoryEvent::TerminalSupplemental("CANCEL".to_string()),
+                6 => OrderHistoryEvent::TerminalSupplemental("REJECT".to_string()),
+                _ => OrderHistoryEvent::Supplemental,
+            };
+            assert_eq!(
+                decode_order_history_event(
+                    &event(Some(notify_type), "ACCOUNT", "basket-1", Some(false)),
+                    "history",
+                    &account(),
+                    "basket-1",
+                )
+                .unwrap(),
+                expected,
+            );
+        }
+        for payload in [
+            event(None, "ACCOUNT", "basket-1", Some(false)),
+            event(Some(10), "ACCOUNT", "basket-1", Some(false)),
+            event(Some(3), "OTHER", "basket-1", Some(false)),
+            event(Some(3), "ACCOUNT", "other-basket", Some(false)),
+        ] {
+            assert!(
+                decode_order_history_event(&payload, "history", &account(), "basket-1",).is_err()
+            );
+        }
     }
 
     #[test]
@@ -953,6 +1248,51 @@ mod tests {
             decode_fill_history_event(&completed, "fills", &account()).unwrap(),
             FillHistoryEvent::RequestCompleted
         );
+
+        let no_data = codec::encode(&protocol::ResponseShowFillHistory {
+            template_id: SHOW_FILL_HISTORY_RESPONSE,
+            user_msg: vec!["fills".to_string()],
+            rp_code: vec!["7".to_string(), "no data".to_string()],
+            ..Default::default()
+        })
+        .unwrap();
+        assert_eq!(
+            decode_fill_history_event(&no_data, "fills", &account()).unwrap(),
+            FillHistoryEvent::RequestCompleted
+        );
+    }
+
+    #[test]
+    fn no_data_is_empty_only_for_collection_queries() {
+        let orders = codec::encode(&protocol::ResponseShowOrders {
+            template_id: SHOW_ORDERS_RESPONSE,
+            user_msg: vec!["orders".to_string()],
+            rp_code: vec!["7".to_string(), "no data".to_string()],
+        })
+        .unwrap();
+        assert_eq!(
+            decode_order_snapshot_event(&orders, "orders", &account()).unwrap(),
+            OrderSnapshotEvent::RequestCompleted,
+        );
+
+        let history = codec::encode(&protocol::ResponseShowOrderHistory {
+            template_id: SHOW_ORDER_HISTORY_RESPONSE,
+            user_msg: vec!["history".to_string()],
+            rp_code: vec!["7".to_string(), "no data".to_string()],
+        })
+        .unwrap();
+        assert_eq!(
+            decode_order_history_event(&history, "history", &account(), "basket-1").unwrap(),
+            OrderHistoryEvent::RequestCompleted,
+        );
+
+        let pnl = codec::encode(&protocol::ResponsePnLPositionSnapshot {
+            template_id: PNL_POSITION_SNAPSHOT_RESPONSE,
+            user_msg: vec!["pnl".to_string()],
+            rp_code: vec!["7".to_string(), "no data".to_string()],
+        })
+        .unwrap();
+        assert!(decode_pnl_snapshot_event(&pnl, "pnl", &account()).is_err());
     }
 
     #[test]
@@ -1045,6 +1385,12 @@ mod tests {
                 protocol::exchange_order_notification::TransactionType::Buy as i32,
             ),
             quantity: Some(2),
+            price: Some(21_001.25),
+            trigger_price: Some(20_999.25),
+            price_type: Some(protocol::exchange_order_notification::PriceType::StopMarket as i32),
+            bracket_type: Some(
+                protocol::exchange_order_notification::BracketType::StopOnlyStatic as i32,
+            ),
             total_fill_size: Some(1),
             total_unfilled_size: Some(1),
             avg_fill_price: Some(21_000.25),
@@ -1061,6 +1407,10 @@ mod tests {
         };
         assert_eq!(snapshot.client_order_id, None);
         assert_eq!(snapshot.quantity, dec!(2));
+        assert_eq!(snapshot.price, Some(dec!(21001.25)));
+        assert_eq!(snapshot.trigger_price, Some(dec!(20999.25)));
+        assert_eq!(snapshot.price_type.as_deref(), Some("stop_market"));
+        assert_eq!(snapshot.bracket_type.as_deref(), Some("stop_only_static"));
         assert_eq!(snapshot.filled_quantity, Some(dec!(1)));
         assert_eq!(snapshot.unfilled_quantity, Some(dec!(1)));
         assert_eq!(snapshot.average_fill_price, Some(dec!(21000.25)));

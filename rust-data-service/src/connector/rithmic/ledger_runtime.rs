@@ -216,6 +216,15 @@ pub(crate) async fn discover_order_account(
     connection: &mut RithmicConnection,
     account_id: Option<&str>,
 ) -> Result<Account> {
+    discover_order_account_with_login(connection, account_id)
+        .await
+        .map(|(account, _)| account)
+}
+
+pub(crate) async fn discover_order_account_with_login(
+    connection: &mut RithmicConnection,
+    account_id: Option<&str>,
+) -> Result<(Account, LoginInfo)> {
     connection
         .send_payload(ledger::login_info_request(LOGIN_INFO_KEY)?)
         .await?;
@@ -229,12 +238,13 @@ pub(crate) async fn discover_order_account(
     connection
         .send_payload(ledger::account_list_request(ACCOUNT_LIST_KEY, &login_info)?)
         .await?;
-    tokio::time::timeout(
+    let account = tokio::time::timeout(
         SNAPSHOT_TIMEOUT,
         collect_account(connection, &login_info, account_id),
     )
     .await
-    .context("Rithmic account-list snapshot timed out")?
+    .context("Rithmic account-list snapshot timed out")??;
+    Ok((account, login_info))
 }
 
 async fn collect_account(
@@ -281,13 +291,56 @@ async fn collect_order_history(
     request_key: &str,
 ) -> Result<Vec<OrderSnapshot>> {
     let mut history = Vec::new();
+    let mut terminal_notification = None;
     loop {
         let payload = next_payload(connection).await?;
-        match ledger::decode_order_history_event(&payload, request_key, account, basket_id)? {
-            OrderHistoryEvent::Notification(order) => history.push(*order),
-            OrderHistoryEvent::RequestCompleted => return Ok(history),
+        if accept_order_history_event(
+            &mut history,
+            &mut terminal_notification,
+            ledger::decode_order_history_event(&payload, request_key, account, basket_id)?,
+        )? {
+            return Ok(history);
         }
     }
+}
+
+fn accept_order_history_event(
+    history: &mut Vec<OrderSnapshot>,
+    terminal_notification: &mut Option<String>,
+    event: OrderHistoryEvent,
+) -> Result<bool> {
+    match event {
+        OrderHistoryEvent::Notification(order) => history.push(*order),
+        OrderHistoryEvent::NonStateChange | OrderHistoryEvent::Supplemental => {}
+        OrderHistoryEvent::TerminalSupplemental(notification) => {
+            if let Some(existing) = terminal_notification.as_ref() {
+                ensure!(
+                    existing == &notification,
+                    "conflicting Rithmic terminal order-history notifications"
+                );
+            } else {
+                *terminal_notification = Some(notification);
+            }
+        }
+        OrderHistoryEvent::RequestCompleted => {
+            if let Some(notification) = terminal_notification.take() {
+                let mut found_complete = false;
+                for order in history
+                    .iter_mut()
+                    .filter(|order| order.notification_type.as_deref() == Some("COMPLETE"))
+                {
+                    found_complete = true;
+                    order.notification_type = Some(notification.clone());
+                }
+                ensure!(
+                    found_complete,
+                    "Rithmic terminal order history omitted COMPLETE state"
+                );
+            }
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }
 
 async fn collect_fills(
@@ -421,6 +474,7 @@ fn ensure_login_identity(account: &AccountIdentity, login_info: &LoginInfo) -> R
 mod tests {
     use super::*;
     use rust_decimal::Decimal;
+    use rust_decimal_macros::dec;
 
     fn login_info() -> LoginInfo {
         LoginInfo {
@@ -451,6 +505,8 @@ mod tests {
             account: identity("FCM", "IB"),
             client_order_id: None,
             basket_id: "BASKET".to_string(),
+            original_basket_id: None,
+            linked_basket_ids: None,
             exchange_order_id: None,
             exchange: "CME".to_string(),
             symbol: "NQU6".to_string(),
@@ -460,6 +516,10 @@ mod tests {
             report_text: None,
             transaction_type: ledger::TransactionType::Buy,
             quantity: Decimal::ONE,
+            price: Some(dec!(20000.25)),
+            trigger_price: None,
+            price_type: Some("limit".to_string()),
+            bracket_type: None,
             filled_quantity: None,
             unfilled_quantity: Some(Decimal::ONE),
             average_fill_price: None,
@@ -610,6 +670,94 @@ mod tests {
             OrderSnapshotEvent::Snapshot(Box::new(order())),
         )
         .is_err());
+    }
+
+    #[test]
+    fn terminal_order_history_merge_is_order_independent() {
+        for (terminal, terminal_first) in [
+            ("CANCEL", false),
+            ("CANCEL", true),
+            ("REJECT", false),
+            ("REJECT", true),
+        ] {
+            let mut history = Vec::new();
+            let mut terminal_notification = None;
+            let mut complete = order();
+            complete.status = "COMPLETE".to_string();
+            complete.notification_type = Some("COMPLETE".to_string());
+
+            let mut events = vec![
+                OrderHistoryEvent::Notification(Box::new(complete)),
+                OrderHistoryEvent::TerminalSupplemental(terminal.to_string()),
+            ];
+            if terminal_first {
+                events.reverse();
+            }
+            for event in events {
+                assert!(!accept_order_history_event(
+                    &mut history,
+                    &mut terminal_notification,
+                    event,
+                )
+                .unwrap());
+            }
+            assert!(accept_order_history_event(
+                &mut history,
+                &mut terminal_notification,
+                OrderHistoryEvent::RequestCompleted,
+            )
+            .unwrap());
+            assert_eq!(history[0].notification_type.as_deref(), Some(terminal));
+        }
+    }
+
+    #[test]
+    fn terminal_order_history_ambiguity_fails_closed() {
+        let mut history = Vec::new();
+        let mut terminal_notification = None;
+        assert!(!accept_order_history_event(
+            &mut history,
+            &mut terminal_notification,
+            OrderHistoryEvent::TerminalSupplemental("CANCEL".to_string()),
+        )
+        .unwrap());
+        assert!(!accept_order_history_event(
+            &mut history,
+            &mut terminal_notification,
+            OrderHistoryEvent::TerminalSupplemental("CANCEL".to_string()),
+        )
+        .unwrap());
+        assert!(accept_order_history_event(
+            &mut history,
+            &mut terminal_notification,
+            OrderHistoryEvent::TerminalSupplemental("REJECT".to_string()),
+        )
+        .is_err());
+
+        let mut missing_complete_history = vec![order()];
+        let mut cancel = Some("CANCEL".to_string());
+        assert!(accept_order_history_event(
+            &mut missing_complete_history,
+            &mut cancel,
+            OrderHistoryEvent::RequestCompleted,
+        )
+        .is_err());
+
+        let mut first = order();
+        first.notification_type = Some("COMPLETE".to_string());
+        let mut second = order();
+        second.notification_type = Some("COMPLETE".to_string());
+        let mut multiple_complete_history = vec![first, second];
+        let mut cancel = Some("CANCEL".to_string());
+        assert!(accept_order_history_event(
+            &mut multiple_complete_history,
+            &mut cancel,
+            OrderHistoryEvent::RequestCompleted,
+        )
+        .unwrap());
+        assert!(multiple_complete_history
+            .iter()
+            .all(|order| order.notification_type.as_deref() == Some("CANCEL")));
     }
 
     #[test]

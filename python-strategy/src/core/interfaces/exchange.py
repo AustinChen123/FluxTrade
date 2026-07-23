@@ -79,6 +79,30 @@ class IExchangeAdapter(ABC):
         """
         pass
 
+    def validate_order_group(self, orders: list[Order]) -> None:
+        """Validate a complete entry/protection group before any submission."""
+        validate_order = getattr(self, "validate_order", None)
+        if validate_order is None:
+            return
+        for order in orders:
+            validate_order(order)
+
+    def supports_atomic_order_group(self, orders: list[Order]) -> bool:
+        """Whether this exact group must be submitted as one venue request."""
+        return False
+
+    def place_order_group(self, orders: list[Order]) -> str:
+        """Submit a previously validated group as one venue-side operation."""
+        raise ExchangeError(f"{type(self).__name__} does not support atomic order groups")
+
+    def restore_order_groups(self, orders: list[Order]) -> None:
+        """Restore adapter-side identity indexes from persisted local orders."""
+        return None
+
+    def modify_protection(self, order: Order, *, trigger_price: Decimal) -> bool:
+        """Modify one already-live protective leg without cancelling it first."""
+        raise ExchangeError(f"{type(self).__name__} does not support protection modification")
+
     @abstractmethod
     def cancel_order(
         self,

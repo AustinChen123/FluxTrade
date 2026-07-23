@@ -278,6 +278,8 @@ class OrderEventApplier:
             return "expired"
         if normalized in {"failed"}:
             return "failed"
+        if normalized == "modify_rejected":
+            return "modify_rejected"
         if normalized in {"liquidated", "adl", "force_closed", "forced_liquidation"}:
             return "liquidated"
         return "unknown"
@@ -407,6 +409,10 @@ class OrderEventApplier:
         elif event_state == "liquidated":
             order.status = OrderStatus.LIQUIDATED.value
             self.order_manager.repo.update_order(order)
+        elif event_state == "modify_rejected":
+            # The existing protection remains active when a modify is explicitly
+            # rejected, so the order's persisted state must not be downgraded.
+            return
 
     @staticmethod
     def _has_exchange_order_event_fill_progress(

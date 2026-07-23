@@ -1,7 +1,10 @@
 use super::rithmic_ledger::PyLedgerOrder;
 use crate::rithmic_ledger::{
     ledger::TransactionType,
-    order::{NewOrder, OrderAck, OrderEvent, OrderSide, OrderType},
+    order::{
+        BracketOrder, NewOrder, OrderAck, OrderEvent, OrderSide, OrderType, ProtectionLeg,
+        ProtectionModification,
+    },
     order_runtime::OrderRuntimeHandle,
 };
 use pyo3::{exceptions::PyRuntimeError, exceptions::PyValueError, prelude::*};
@@ -34,6 +37,10 @@ pub struct PyOrderEvent {
     #[pyo3(get)]
     pub basket_id: String,
     #[pyo3(get)]
+    pub original_basket_id: Option<String>,
+    #[pyo3(get)]
+    pub linked_basket_ids: Option<String>,
+    #[pyo3(get)]
     pub exchange_order_id: Option<String>,
     #[pyo3(get)]
     pub exchange: String,
@@ -42,9 +49,19 @@ pub struct PyOrderEvent {
     #[pyo3(get)]
     pub status: String,
     #[pyo3(get)]
+    pub notification_type: String,
+    #[pyo3(get)]
     pub transaction_type: String,
     #[pyo3(get)]
-    pub quantity: String,
+    pub quantity: Option<String>,
+    #[pyo3(get)]
+    pub price: Option<String>,
+    #[pyo3(get)]
+    pub trigger_price: Option<String>,
+    #[pyo3(get)]
+    pub price_type: Option<String>,
+    #[pyo3(get)]
+    pub bracket_type: Option<String>,
     #[pyo3(get)]
     pub last_fill_quantity: Option<String>,
     #[pyo3(get)]
@@ -63,12 +80,19 @@ impl From<OrderEvent> for PyOrderEvent {
             account_id: value.account.account_id,
             client_order_id: value.client_order_id,
             basket_id: value.basket_id,
+            original_basket_id: value.original_basket_id,
+            linked_basket_ids: value.linked_basket_ids,
             exchange_order_id: value.exchange_order_id,
             exchange: value.exchange,
             symbol: value.symbol,
             status: value.status,
+            notification_type: value.notification_type,
             transaction_type: transaction_type_name(value.transaction_type).to_string(),
-            quantity: value.quantity.to_string(),
+            quantity: value.quantity.map(|quantity| quantity.to_string()),
+            price: decimal_text(value.price),
+            trigger_price: decimal_text(value.trigger_price),
+            price_type: value.price_type,
+            bracket_type: value.bracket_type,
             last_fill_quantity: decimal_text(value.last_fill_quantity),
             last_fill_price: decimal_text(value.last_fill_price),
             cumulative_filled_quantity: decimal_text(value.cumulative_filled_quantity),
@@ -139,6 +163,91 @@ impl PyOrderClient {
                 .submit(order)
         })
         .map(PyOrderAck::from)
+        .map_err(runtime_error)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    #[pyo3(signature = (
+        client_order_id,
+        exchange,
+        symbol,
+        quantity,
+        side,
+        order_type,
+        price=None,
+        stop_ticks=None,
+        target_ticks=None
+    ))]
+    fn submit_bracket(
+        &self,
+        py: Python<'_>,
+        client_order_id: String,
+        exchange: String,
+        symbol: String,
+        quantity: &str,
+        side: &str,
+        order_type: &str,
+        price: Option<&str>,
+        stop_ticks: Option<i32>,
+        target_ticks: Option<i32>,
+    ) -> PyResult<PyOrderAck> {
+        let order = BracketOrder {
+            entry: NewOrder {
+                client_order_id,
+                exchange,
+                symbol,
+                quantity: decimal(quantity, "quantity")?,
+                price: price.map(|value| decimal(value, "price")).transpose()?,
+                side: parse_side(side)?,
+                order_type: parse_order_type(order_type)?,
+            },
+            stop_ticks,
+            target_ticks,
+        };
+        let runtime = &self.runtime;
+        py.allow_threads(|| {
+            runtime
+                .lock()
+                .map_err(|_| anyhow::anyhow!("Rithmic order runtime lock is unavailable"))?
+                .submit_bracket(order)
+        })
+        .map(PyOrderAck::from)
+        .map_err(runtime_error)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    #[pyo3(signature = (basket_id, exchange, symbol, quantity, leg_type, price))]
+    fn modify_protection(
+        &self,
+        py: Python<'_>,
+        basket_id: String,
+        exchange: String,
+        symbol: String,
+        quantity: &str,
+        leg_type: &str,
+        price: &str,
+    ) -> PyResult<bool> {
+        let leg = match leg_type.trim().to_ascii_lowercase().as_str() {
+            "stop_loss" => ProtectionLeg::StopLoss,
+            "take_profit" => ProtectionLeg::TakeProfit,
+            _ => return Err(PyValueError::new_err("unsupported Rithmic protection leg")),
+        };
+        let modification = ProtectionModification {
+            basket_id,
+            exchange,
+            symbol,
+            quantity: decimal(quantity, "quantity")?,
+            leg,
+            price: decimal(price, "price")?,
+        };
+        let runtime = &self.runtime;
+        py.allow_threads(|| {
+            runtime
+                .lock()
+                .map_err(|_| anyhow::anyhow!("Rithmic order runtime lock is unavailable"))?
+                .modify(modification)
+        })
+        .map(|()| true)
         .map_err(runtime_error)
     }
 

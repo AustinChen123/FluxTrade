@@ -2,7 +2,7 @@ import logging
 import threading
 import time as _time
 from dataclasses import dataclass
-from decimal import Decimal
+from decimal import Decimal, InvalidOperation
 from typing import Callable, ContextManager, Optional
 from sqlalchemy.orm import Session
 from src.core.models import Signal, SignalType, Candlestick, OrderSide, OrderStatus, PositionSide
@@ -23,6 +23,7 @@ from src.core.audit_service import (
 )
 from src.core.client_order_id import (
     generate_client_order_id,
+    linked_client_order_id,
     parse_client_order_id,
 )
 from src.core.fill_delta import (
@@ -187,12 +188,16 @@ class ExecutionEngine:
         if (entry_order.filled_quantity or Decimal("0")) > 0:
             return
         for order in self.order_manager.repo.list_orders_by_statuses(
-            {OrderStatus.NEW.value}
+            {OrderStatus.NEW.value, OrderStatus.SUBMITTED_UNCONFIRMED.value, OrderStatus.SUBMITTED.value}
         ):
             if (
                 isinstance(order.intent_payload, dict)
                 and order.intent_payload.get("pending_entry_order_id")
                 == str(entry_order.id)
+                and (
+                    order.status == OrderStatus.NEW.value
+                    or order.intent_payload.get("placement_mode") == "attach-at-entry"
+                )
             ):
                 self.order_manager.fail_order(order, "entry_terminal_without_fill")
 
@@ -315,10 +320,138 @@ class ExecutionEngine:
         allow_remote_side_effects: bool = True,
     ) -> dict[str, object]:
         with self._order_event_apply_lock:
-            return self._order_event_applier.process_exchange_order_event(
+            identity_failure = self._native_protection_identity_failure(event)
+            if identity_failure is not None:
+                return identity_failure
+            result = self._order_event_applier.process_exchange_order_event(
                 event,
                 allow_remote_side_effects=allow_remote_side_effects,
             )
+            return self._verify_native_protection_event(event, result)
+
+    def _native_protection_identity_failure(
+        self,
+        event: ExchangeOrderEvent,
+    ) -> dict[str, object] | None:
+        if not event.client_order_id:
+            return None
+        order = self.order_manager.repo.get_order_by_client_order_id(
+            event.client_order_id
+        )
+        payload = dict(getattr(order, "intent_payload", None) or {})
+        if (
+            order is None
+            or order.type not in {"stop_loss", "take_profit"}
+            or payload.get("placement_mode") != "attach-at-entry"
+        ):
+            return None
+        raw = event.raw or {}
+        expected_parent = payload.get("native_parent_basket_id")
+        remote_parent = raw.get("original_basket_id")
+        if (
+            expected_parent
+            and remote_parent is not None
+            and str(remote_parent) != str(expected_parent)
+        ):
+            return {
+                "action": "unresolved_native_protection_parent_mismatch",
+                "order_id": str(order.id),
+                "status": event.status,
+            }
+        if (
+            order.exchange_order_id
+            and event.exchange_order_id
+            and str(order.exchange_order_id) != str(event.exchange_order_id)
+        ):
+            return {
+                "action": "unresolved_native_protection_basket_mismatch",
+                "order_id": str(order.id),
+                "status": event.status,
+            }
+        return None
+
+    def _verify_native_protection_event(
+        self,
+        event: ExchangeOrderEvent,
+        result: dict[str, object],
+    ) -> dict[str, object]:
+        if result.get("action") != "applied" or result.get("state") != "open":
+            return result
+        order_id = result.get("order_id")
+        order = self.order_manager.repo.get_order(str(order_id)) if order_id else None
+        payload = dict(getattr(order, "intent_payload", None) or {})
+        raw = event.raw or {}
+        if (
+            order is None
+            or order.type not in {"stop_loss", "take_profit"}
+            or payload.get("placement_mode") != "attach-at-entry"
+            or not raw.get("original_basket_id")
+        ):
+            return result
+
+        expected_price_type = "stop_market" if order.type == "stop_loss" else "limit"
+        if str(raw.get("price_type") or "").lower() != expected_price_type:
+            return {
+                **result,
+                "action": "unresolved_native_protection_price_type_mismatch",
+            }
+        expected_bracket_type = payload.get("native_bracket_type")
+        remote_bracket_type = raw.get("bracket_type")
+        if remote_bracket_type and remote_bracket_type != expected_bracket_type:
+            return {
+                **result,
+                "action": "unresolved_native_protection_bracket_type_mismatch",
+            }
+        raw_price = (
+            raw.get("trigger_price")
+            if order.type == "stop_loss"
+            else raw.get("price")
+        )
+        try:
+            remote_price = Decimal(str(raw_price))
+        except (InvalidOperation, TypeError, ValueError):
+            remote_price = Decimal("NaN")
+        if not remote_price.is_finite() or remote_price <= 0:
+            return {
+                **result,
+                "action": "unresolved_native_protection_price_missing",
+            }
+
+        payload.update(
+            {
+                "remote_effective_price": str(remote_price),
+                "remote_price_type": expected_price_type,
+                "remote_bracket_type": remote_bracket_type,
+            }
+        )
+        expected_raw = payload.get("expected_effective_price")
+        if expected_raw is None:
+            payload["protection_confirmation"] = "observed_pending_entry_fill"
+        else:
+            try:
+                expected_price = Decimal(str(expected_raw))
+            except (InvalidOperation, TypeError, ValueError):
+                expected_price = Decimal("NaN")
+            if not expected_price.is_finite() or expected_price != remote_price:
+                payload["protection_confirmation"] = "conflict"
+                order.intent_payload = payload
+                self.order_manager.repo.update_order(order)
+                return {
+                    **result,
+                    "action": "unresolved_native_protection_price_mismatch",
+                    "expected_price": str(expected_raw),
+                    "remote_price": str(remote_price),
+                }
+            payload.update(
+                {
+                    "effective_price": str(remote_price),
+                    "protection_confirmation": "confirmed",
+                }
+            )
+            order.trigger_price = remote_price
+        order.intent_payload = payload
+        self.order_manager.repo.update_order(order)
+        return result
 
     def _record_order_ack(
         self,
@@ -617,6 +750,121 @@ class ExecutionEngine:
             self._reconcile_halt = False
             self._submission_gate.notify_all()
 
+    def modify_protection(
+        self,
+        entry_order_id: str,
+        *,
+        stop_loss: Decimal | None = None,
+        take_profit: Decimal | None = None,
+    ) -> dict[str, str]:
+        requested = [
+            ("stop_loss", stop_loss),
+            ("take_profit", take_profit),
+        ]
+        requested = [(leg_type, price) for leg_type, price in requested if price is not None]
+        if len(requested) != 1:
+            raise ExchangeError("modify_protection_requires_exactly_one_leg")
+        with self._submission_gate:
+            if self._submissions_halted or self._reconcile_halt:
+                raise ExchangeError("modify_protection_submission_gate_halted")
+            self._submissions_in_flight += 1
+        try:
+            leg_type, price = requested[0]
+            entry = self.order_manager.repo.get_order(str(entry_order_id))
+            if entry is None or entry.type not in {"market", "limit"}:
+                raise ExchangeError("modify_protection_entry_not_found")
+            candidates = [
+                order
+                for order in self.order_manager.repo.list_orders_by_statuses(
+                    {
+                        OrderStatus.SUBMITTED_UNCONFIRMED.value,
+                        OrderStatus.SUBMITTED.value,
+                        OrderStatus.PARTIALLY_FILLED.value,
+                    }
+                )
+                if order.type == leg_type
+                and isinstance(order.intent_payload, dict)
+                and order.intent_payload.get("pending_entry_order_id") == str(entry.id)
+                and order.intent_payload.get("placement_mode") == "attach-at-entry"
+            ]
+            if len(candidates) != 1:
+                raise ExchangeError("modify_protection_leg_identity_ambiguous")
+            order = candidates[0]
+            with self._order_event_apply_lock:
+                payload = dict(order.intent_payload or {})
+                previous_trigger_price = order.trigger_price
+                modifications = list(payload.get("modifications") or [])
+                attempt = {
+                    "previous_effective_price": payload.get("effective_price"),
+                    "requested_price": str(price),
+                    "started_at_ms": int(self.clock.now() * 1000),
+                    "status": "pending",
+                }
+                modifications.append(attempt)
+                payload["modifications"] = modifications
+                order.intent_payload = payload
+                self.order_manager.repo.update_order(order)
+                try:
+                    confirmed = self.adapter.modify_protection(
+                        order,
+                        trigger_price=price,
+                    )
+                except NetworkError:
+                    self.halt_for_reconcile()
+                    attempt["status"] = "ambiguous"
+                    attempt["finished_at_ms"] = int(self.clock.now() * 1000)
+                    order.intent_payload = payload
+                    self.order_manager.repo.update_order(order)
+                    raise
+                except ExchangeError:
+                    attempt["status"] = "rejected"
+                    attempt["finished_at_ms"] = int(self.clock.now() * 1000)
+                    order.intent_payload = payload
+                    self.order_manager.repo.update_order(order)
+                    raise
+                if not confirmed:
+                    attempt["status"] = "rejected"
+                    attempt["finished_at_ms"] = int(self.clock.now() * 1000)
+                    order.intent_payload = payload
+                    self.order_manager.repo.update_order(order)
+                    raise ExchangeError("modify_protection_not_confirmed")
+                confirmed_attempt = {
+                    **attempt,
+                    "status": "confirmed",
+                    "finished_at_ms": int(self.clock.now() * 1000),
+                }
+                confirmed_payload = {
+                    **payload,
+                    "requested_price": str(price),
+                    "expected_effective_price": str(price),
+                    "effective_price": str(price),
+                    "price_drift": "0",
+                    "modification_mode": "absolute",
+                    "protection_confirmation": "confirmed",
+                    "modifications": [*modifications[:-1], confirmed_attempt],
+                }
+                order.trigger_price = price
+                order.intent_payload = confirmed_payload
+                try:
+                    self.order_manager.repo.update_order(order)
+                except Exception:
+                    order.trigger_price = previous_trigger_price
+                    order.intent_payload = payload
+                    self.halt_for_reconcile()
+                    raise
+            return {
+                "entry_order_id": str(entry.id),
+                "order_id": str(order.id),
+                "leg_type": leg_type,
+                "effective_price": str(price),
+            }
+        except NetworkError:
+            with self._submission_gate:
+                self._reconcile_halt = True
+            raise
+        finally:
+            self._finish_submission()
+
     def _finish_submission(self) -> None:
         callbacks: list[Callable[[], None]] = []
         with self._submission_gate:
@@ -702,9 +950,13 @@ class ExecutionEngine:
         try:
             self.logger.info("Sending Order %s via Adapter...", order.id)
             t0 = _time.monotonic()
-            exchange_id = self.adapter.place_order(order)
+            exchange_id, atomic_group = self._place_entry_order(
+                order,
+                conditional_orders,
+            )
             EXECUTION_LATENCY.observe(_time.monotonic() - t0)
-            self.order_manager.update_exchange_order_id(order, exchange_id)
+            if not atomic_group:
+                self.order_manager.update_exchange_order_id(order, exchange_id)
             self.logger.info("Order Placed. Internal: %s, Exchange: %s", order.id, exchange_id)
             ORDERS_TOTAL.labels(
                 order_type=order_type,
@@ -745,7 +997,7 @@ class ExecutionEngine:
             )
 
         # 4. Place conditional orders (SL/TP/Trailing)
-        if conditional_orders:
+        if conditional_orders and not atomic_group:
             self._place_conditional_orders(conditional_orders)
 
         return order.id
@@ -810,15 +1062,23 @@ class ExecutionEngine:
             write_signal_audit_intent(db, audit)
 
         submit_attempted = False
+        atomic_group = False
         try:
             self._validate_order_group([order, *conditional_orders])
+            atomic_group = self._supports_atomic_order_group(
+                [order, *conditional_orders]
+            )
             self.order_manager.mark_submitted_unconfirmed(order)
             self.logger.info("Sending Order %s via Adapter...", order.id)
             t0 = _time.monotonic()
             submit_attempted = True
-            exchange_id = self.adapter.place_order(order)
+            exchange_id, atomic_group = self._place_entry_order(
+                order,
+                conditional_orders,
+            )
             EXECUTION_LATENCY.observe(_time.monotonic() - t0)
-            self._record_order_ack(order, exchange_id, order_id=order_id)
+            if not atomic_group:
+                self._record_order_ack(order, exchange_id, order_id=order_id)
             self.logger.info("Order Placed. Internal: %s, Exchange: %s", order.id, exchange_id)
             ORDERS_TOTAL.labels(
                 order_type=order_type,
@@ -827,11 +1087,20 @@ class ExecutionEngine:
             ).inc()
         except ExchangeError as e:
             self.logger.error("Execution Failed: %s", e)
-            adoption = self._adopt_order_after_ambiguous_submit_error(
-                order,
-                e,
-                submit_attempted=submit_attempted,
-            )
+            if atomic_group and isinstance(e, NetworkError):
+                with self._submission_gate:
+                    self._reconcile_halt = True
+                adoption = {
+                    "action": "verification_blocked_native_bracket_submit",
+                    "verification_blocked": True,
+                    "unresolved": True,
+                }
+            else:
+                adoption = self._adopt_order_after_ambiguous_submit_error(
+                    order,
+                    e,
+                    submit_attempted=submit_attempted,
+                )
             if adoption["action"] == "adopted":
                 exchange_id = str(adoption["exchange_order_id"])
                 order.exchange_order_id = exchange_id
@@ -1125,6 +1394,43 @@ class ExecutionEngine:
             conditional_order.intent_payload = payload
             self.order_manager.repo.update_order(conditional_order)
 
+    def _place_entry_order(self, entry_order, conditional_orders: list) -> tuple[str, bool]:
+        orders = [entry_order, *conditional_orders]
+        atomic_group = self._supports_atomic_order_group(orders)
+        if not atomic_group:
+            return self.adapter.place_order(entry_order), False
+
+        with self._order_event_apply_lock:
+            for order in orders:
+                if order.client_order_id:
+                    self.order_manager.mark_submitted_unconfirmed(order)
+            exchange_id = self.adapter.place_order_group(orders)
+            try:
+                self._record_order_ack(
+                    entry_order,
+                    exchange_id,
+                    order_id=str(entry_order.id),
+                )
+                for conditional_order in conditional_orders:
+                    current = self.order_manager.repo.get_order(
+                        str(conditional_order.id)
+                    ) or conditional_order
+                    payload = dict(current.intent_payload or {})
+                    payload.update(
+                        {
+                            "native_parent_basket_id": str(exchange_id),
+                            "native_parent_client_order_id": str(entry_order.client_order_id),
+                        }
+                    )
+                    current.intent_payload = payload
+                    self.order_manager.repo.update_order(current)
+                    if current.status == OrderStatus.SUBMITTED_UNCONFIRMED.value:
+                        self.order_manager.mark_submitted(current)
+            except Exception:
+                self.halt_for_reconcile()
+                raise
+            return exchange_id, True
+
     def _attach_min_notional_reference_price(
         self,
         order,
@@ -1260,12 +1566,7 @@ class ExecutionEngine:
     ) -> str | None:
         if not entry_client_order_id:
             return None
-        parts = parse_client_order_id(entry_client_order_id)
-        conditional_id = (
-            f"{parts.strategy_id}-{parts.instance_id}-{suffix}-{parts.ts_ns}"
-        )
-        parse_client_order_id(conditional_id)
-        return conditional_id
+        return linked_client_order_id(entry_client_order_id, suffix)
 
     def _place_pending_conditional_orders_for_entry(self, entry_order) -> list[dict]:
         # Gate: reject conditional placement if the submission gate is halted by
@@ -1310,6 +1611,21 @@ class ExecutionEngine:
             if isinstance(order.intent_payload, dict)
             and order.intent_payload.get("pending_entry_order_id") == str(entry_order.id)
         ]
+        native_orders = [
+            order
+            for order in related_orders
+            if order.intent_payload.get("placement_mode") == "attach-at-entry"
+        ]
+        if native_orders:
+            if len(native_orders) != len(related_orders):
+                return [
+                    {
+                        "order_id": str(entry_order.id),
+                        "order_type": entry_order.type,
+                        "reason": "mixed_native_and_deferred_protection",
+                    }
+                ]
+            return self._audit_native_bracket_fill(entry_order, native_orders)
         pending = [
             order for order in related_orders if order.status == OrderStatus.NEW.value
         ]
@@ -1335,6 +1651,100 @@ class ExecutionEngine:
             failures.append(lookup_failure)
         if placement_candidates:
             failures.extend(self._place_conditional_orders(placement_candidates))
+        return failures
+
+    def _audit_native_bracket_fill(self, entry_order, native_orders: list) -> list[dict]:
+        fill_price = entry_order.filled_price
+        if fill_price is None or fill_price <= 0:
+            return [
+                {
+                    "order_id": str(entry_order.id),
+                    "order_type": entry_order.type,
+                    "reason": "native_bracket_entry_fill_price_missing",
+                }
+            ]
+        failures = []
+        for order in native_orders:
+            payload = dict(order.intent_payload or {})
+            try:
+                tick = Decimal(str(payload["price_tick"]))
+                distance_ticks = Decimal(str(payload["ticks"]))
+                requested_price = Decimal(str(payload["requested_price"]))
+            except (KeyError, InvalidOperation, TypeError, ValueError):
+                failures.append(
+                    {
+                        "order_id": str(order.id),
+                        "order_type": order.type,
+                        "reason": "native_bracket_audit_metadata_invalid",
+                    }
+                )
+                continue
+            if (
+                not all(
+                    value.is_finite()
+                    for value in (tick, distance_ticks, requested_price)
+                )
+                or tick <= 0
+                or distance_ticks <= 0
+                or requested_price <= 0
+            ):
+                failures.append(
+                    {
+                        "order_id": str(order.id),
+                        "order_type": order.type,
+                        "reason": "native_bracket_audit_metadata_invalid",
+                    }
+                )
+                continue
+            away_from_entry = (
+                (
+                    getattr(entry_order.side, "value", entry_order.side) == "buy"
+                    and order.type == "take_profit"
+                )
+                or (
+                    getattr(entry_order.side, "value", entry_order.side) == "sell"
+                    and order.type == "stop_loss"
+                )
+            )
+            expected_price = (
+                fill_price + distance_ticks * tick
+                if away_from_entry
+                else fill_price - distance_ticks * tick
+            )
+            drift = (expected_price - requested_price).copy_abs()
+            payload.update(
+                {
+                    "actual_entry_fill_price": str(fill_price),
+                    "expected_effective_price": str(expected_price),
+                    "price_drift": str(drift),
+                }
+            )
+            remote_raw = payload.get("remote_effective_price")
+            try:
+                remote_price = Decimal(str(remote_raw))
+            except (InvalidOperation, TypeError, ValueError):
+                remote_price = None
+            if remote_price is None:
+                payload["protection_confirmation"] = "pending_remote_event"
+            elif not remote_price.is_finite() or remote_price != expected_price:
+                payload["protection_confirmation"] = "conflict"
+                failures.append(
+                    {
+                        "order_id": str(order.id),
+                        "order_type": order.type,
+                        "reason": "native_bracket_remote_price_mismatch",
+                    }
+                )
+            else:
+                payload.update(
+                    {
+                        "effective_price": str(remote_price),
+                        "protection_confirmation": "confirmed",
+                    }
+                )
+                order.trigger_price = remote_price
+            order.intent_payload = payload
+            self.order_manager.repo.update_order(order)
         return failures
 
     @staticmethod
@@ -1463,6 +1873,8 @@ class ExecutionEngine:
             return None
         if not isinstance(order.intent_payload, dict):
             return None
+        if order.intent_payload.get("placement_mode") == "attach-at-entry":
+            return None
         linked_order_id = order.intent_payload.get("linked_order_id")
         if not linked_order_id:
             return None
@@ -1507,12 +1919,22 @@ class ExecutionEngine:
         return {"cancelled": False}
 
     def _validate_order_group(self, orders: list) -> None:
+        validate_group = getattr(type(self.adapter), "validate_order_group", None)
+        if validate_group is not None:
+            validate_group(self.adapter, orders)
+            for order in orders:
+                self.order_manager.repo.update_order(order)
+            return
         validate_order = getattr(self.adapter, "validate_order", None)
         if validate_order is None:
             return
         for order in orders:
             validate_order(order)
             self.order_manager.repo.update_order(order)
+
+    def _supports_atomic_order_group(self, orders: list) -> bool:
+        supports_group = getattr(type(self.adapter), "supports_atomic_order_group", None)
+        return bool(supports_group and supports_group(self.adapter, orders))
 
     def _record_order_rejection(
         self,
