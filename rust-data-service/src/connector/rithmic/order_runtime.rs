@@ -1116,7 +1116,7 @@ fn validate_modify_event(event: &OrderEvent, modification: &ProtectionModificati
         "Rithmic modify event instrument mismatch"
     );
     ensure!(
-        event.quantity == modification.quantity,
+        event.quantity == Some(modification.quantity),
         "Rithmic modify event quantity mismatch"
     );
     match modification.leg {
@@ -1600,7 +1600,7 @@ mod tests {
             status: status.to_string(),
             notification_type: "status".to_string(),
             transaction_type: TransactionType::Buy,
-            quantity: dec!(1),
+            quantity: Some(dec!(1)),
             price: None,
             trigger_price: None,
             price_type: None,

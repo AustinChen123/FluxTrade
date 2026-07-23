@@ -291,13 +291,56 @@ async fn collect_order_history(
     request_key: &str,
 ) -> Result<Vec<OrderSnapshot>> {
     let mut history = Vec::new();
+    let mut terminal_notification = None;
     loop {
         let payload = next_payload(connection).await?;
-        match ledger::decode_order_history_event(&payload, request_key, account, basket_id)? {
-            OrderHistoryEvent::Notification(order) => history.push(*order),
-            OrderHistoryEvent::RequestCompleted => return Ok(history),
+        if accept_order_history_event(
+            &mut history,
+            &mut terminal_notification,
+            ledger::decode_order_history_event(&payload, request_key, account, basket_id)?,
+        )? {
+            return Ok(history);
         }
     }
+}
+
+fn accept_order_history_event(
+    history: &mut Vec<OrderSnapshot>,
+    terminal_notification: &mut Option<String>,
+    event: OrderHistoryEvent,
+) -> Result<bool> {
+    match event {
+        OrderHistoryEvent::Notification(order) => history.push(*order),
+        OrderHistoryEvent::NonStateChange | OrderHistoryEvent::Supplemental => {}
+        OrderHistoryEvent::TerminalSupplemental(notification) => {
+            if let Some(existing) = terminal_notification.as_ref() {
+                ensure!(
+                    existing == &notification,
+                    "conflicting Rithmic terminal order-history notifications"
+                );
+            } else {
+                *terminal_notification = Some(notification);
+            }
+        }
+        OrderHistoryEvent::RequestCompleted => {
+            if let Some(notification) = terminal_notification.take() {
+                let mut found_complete = false;
+                for order in history
+                    .iter_mut()
+                    .filter(|order| order.notification_type.as_deref() == Some("COMPLETE"))
+                {
+                    found_complete = true;
+                    order.notification_type = Some(notification.clone());
+                }
+                ensure!(
+                    found_complete,
+                    "Rithmic terminal order history omitted COMPLETE state"
+                );
+            }
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }
 
 async fn collect_fills(
@@ -627,6 +670,94 @@ mod tests {
             OrderSnapshotEvent::Snapshot(Box::new(order())),
         )
         .is_err());
+    }
+
+    #[test]
+    fn terminal_order_history_merge_is_order_independent() {
+        for (terminal, terminal_first) in [
+            ("CANCEL", false),
+            ("CANCEL", true),
+            ("REJECT", false),
+            ("REJECT", true),
+        ] {
+            let mut history = Vec::new();
+            let mut terminal_notification = None;
+            let mut complete = order();
+            complete.status = "COMPLETE".to_string();
+            complete.notification_type = Some("COMPLETE".to_string());
+
+            let mut events = vec![
+                OrderHistoryEvent::Notification(Box::new(complete)),
+                OrderHistoryEvent::TerminalSupplemental(terminal.to_string()),
+            ];
+            if terminal_first {
+                events.reverse();
+            }
+            for event in events {
+                assert!(!accept_order_history_event(
+                    &mut history,
+                    &mut terminal_notification,
+                    event,
+                )
+                .unwrap());
+            }
+            assert!(accept_order_history_event(
+                &mut history,
+                &mut terminal_notification,
+                OrderHistoryEvent::RequestCompleted,
+            )
+            .unwrap());
+            assert_eq!(history[0].notification_type.as_deref(), Some(terminal));
+        }
+    }
+
+    #[test]
+    fn terminal_order_history_ambiguity_fails_closed() {
+        let mut history = Vec::new();
+        let mut terminal_notification = None;
+        assert!(!accept_order_history_event(
+            &mut history,
+            &mut terminal_notification,
+            OrderHistoryEvent::TerminalSupplemental("CANCEL".to_string()),
+        )
+        .unwrap());
+        assert!(!accept_order_history_event(
+            &mut history,
+            &mut terminal_notification,
+            OrderHistoryEvent::TerminalSupplemental("CANCEL".to_string()),
+        )
+        .unwrap());
+        assert!(accept_order_history_event(
+            &mut history,
+            &mut terminal_notification,
+            OrderHistoryEvent::TerminalSupplemental("REJECT".to_string()),
+        )
+        .is_err());
+
+        let mut missing_complete_history = vec![order()];
+        let mut cancel = Some("CANCEL".to_string());
+        assert!(accept_order_history_event(
+            &mut missing_complete_history,
+            &mut cancel,
+            OrderHistoryEvent::RequestCompleted,
+        )
+        .is_err());
+
+        let mut first = order();
+        first.notification_type = Some("COMPLETE".to_string());
+        let mut second = order();
+        second.notification_type = Some("COMPLETE".to_string());
+        let mut multiple_complete_history = vec![first, second];
+        let mut cancel = Some("CANCEL".to_string());
+        assert!(accept_order_history_event(
+            &mut multiple_complete_history,
+            &mut cancel,
+            OrderHistoryEvent::RequestCompleted,
+        )
+        .unwrap());
+        assert!(multiple_complete_history
+            .iter()
+            .all(|order| order.notification_type.as_deref() == Some("CANCEL")));
     }
 
     #[test]

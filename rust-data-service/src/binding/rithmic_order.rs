@@ -53,7 +53,7 @@ pub struct PyOrderEvent {
     #[pyo3(get)]
     pub transaction_type: String,
     #[pyo3(get)]
-    pub quantity: String,
+    pub quantity: Option<String>,
     #[pyo3(get)]
     pub price: Option<String>,
     #[pyo3(get)]
@@ -88,7 +88,7 @@ impl From<OrderEvent> for PyOrderEvent {
             status: value.status,
             notification_type: value.notification_type,
             transaction_type: transaction_type_name(value.transaction_type).to_string(),
-            quantity: value.quantity.to_string(),
+            quantity: value.quantity.map(|quantity| quantity.to_string()),
             price: decimal_text(value.price),
             trigger_price: decimal_text(value.trigger_price),
             price_type: value.price_type,
