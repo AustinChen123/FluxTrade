@@ -20,6 +20,8 @@ const MODIFY_ORDER_REQUEST: i32 = 314;
 const MODIFY_ORDER_RESPONSE: i32 = 315;
 const CANCEL_ORDER_REQUEST: i32 = 316;
 const CANCEL_ORDER_RESPONSE: i32 = 317;
+const EXIT_POSITION_REQUEST: i32 = 3504;
+const EXIT_POSITION_RESPONSE: i32 = 3505;
 const EXCHANGE_ORDER_NOTIFICATION: i32 = 352;
 const REJECT: i32 = 75;
 
@@ -80,6 +82,12 @@ pub(crate) struct ProtectionModification {
     pub(crate) quantity: Decimal,
     pub(crate) leg: ProtectionLeg,
     pub(crate) price: Decimal,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct ExitPosition {
+    pub(crate) exchange: String,
+    pub(crate) symbol: String,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -431,6 +439,52 @@ pub(crate) fn decode_cancel_order_response(
     })
 }
 
+pub(crate) fn exit_position_request(
+    request_key: &str,
+    account: &AccountIdentity,
+    position: &ExitPosition,
+) -> Result<Vec<u8>> {
+    validate_request_key(request_key)?;
+    validate_account(account)?;
+    let exchange = required_text(Some(position.exchange.clone()), "exchange")?;
+    let symbol = required_text(Some(position.symbol.clone()), "symbol")?;
+    codec::encode(&protocol::RequestExitPosition {
+        template_id: EXIT_POSITION_REQUEST,
+        user_msg: vec![request_key.to_string()],
+        fcm_id: Some(account.fcm_id.clone()),
+        ib_id: Some(account.ib_id.clone()),
+        account_id: Some(account.account_id.clone()),
+        symbol: Some(symbol),
+        exchange: Some(exchange),
+        manual_or_auto: Some(protocol::request_exit_position::OrderPlacement::Auto as i32),
+        ..Default::default()
+    })
+}
+
+pub(crate) fn decode_exit_position_response(
+    payload: &[u8],
+    request_key: &str,
+    expected: &ExitPosition,
+) -> Result<ResponseDisposition> {
+    validate_request_key(request_key)?;
+    ensure_template(payload, EXIT_POSITION_RESPONSE)?;
+    let response: protocol::ResponseExitPosition = codec::decode(payload)?;
+    ensure_request_key(&response.user_msg, request_key)?;
+    if let Some(exchange) = optional_text(response.exchange) {
+        ensure!(
+            exchange.eq_ignore_ascii_case(&expected.exchange),
+            "Rithmic exit-position exchange mismatch"
+        );
+    }
+    if let Some(symbol) = optional_text(response.symbol) {
+        ensure!(
+            symbol == expected.symbol,
+            "Rithmic exit-position symbol mismatch"
+        );
+    }
+    classify_response_codes(&response.rq_handler_rp_code, &response.rp_code)
+}
+
 pub(crate) fn decode_request_reject(payload: &[u8]) -> Result<(String, String)> {
     ensure_template(payload, REJECT)?;
     let response: protocol::Reject = codec::decode(payload)?;
@@ -527,6 +581,10 @@ pub(crate) fn is_modify_order_response(template_id: i32) -> bool {
 
 pub(crate) fn is_cancel_order_response(template_id: i32) -> bool {
     template_id == CANCEL_ORDER_RESPONSE
+}
+
+pub(crate) fn is_exit_position_response(template_id: i32) -> bool {
+    template_id == EXIT_POSITION_RESPONSE
 }
 
 pub(crate) fn is_order_event(template_id: i32) -> bool {
@@ -1081,6 +1139,97 @@ mod tests {
             assert_eq!(request.price_type, Some(price_type as i32));
             assert_eq!(request.price, price);
             assert_eq!(request.trigger_price, trigger_price);
+        }
+    }
+
+    #[test]
+    fn exit_position_request_and_response_validate_instrument_identity() {
+        let position = ExitPosition {
+            exchange: "CME".to_string(),
+            symbol: "NQU6".to_string(),
+        };
+        let payload = exit_position_request("exit-1", &account(), &position).unwrap();
+        let request: protocol::RequestExitPosition = codec::decode(&payload).unwrap();
+        assert_eq!(request.template_id, EXIT_POSITION_REQUEST);
+        assert_eq!(request.user_msg, ["exit-1"]);
+        assert_eq!(request.account_id.as_deref(), Some("ACCOUNT"));
+        assert_eq!(request.exchange.as_deref(), Some("CME"));
+        assert_eq!(request.symbol.as_deref(), Some("NQU6"));
+        assert_eq!(
+            request.manual_or_auto,
+            Some(protocol::request_exit_position::OrderPlacement::Auto as i32)
+        );
+
+        let response = |exchange: &str, symbol: &str, code: &str| {
+            codec::encode(&protocol::ResponseExitPosition {
+                template_id: EXIT_POSITION_RESPONSE,
+                user_msg: vec!["exit-1".to_string()],
+                rp_code: vec![code.to_string()],
+                exchange: Some(exchange.to_string()),
+                symbol: Some(symbol.to_string()),
+                ..Default::default()
+            })
+            .unwrap()
+        };
+        assert_eq!(
+            decode_exit_position_response(&response("CME", "NQU6", "0"), "exit-1", &position)
+                .unwrap(),
+            ResponseDisposition::Succeeded
+        );
+        let response_without_optional_identity = codec::encode(&protocol::ResponseExitPosition {
+            template_id: EXIT_POSITION_RESPONSE,
+            user_msg: vec!["exit-1".to_string()],
+            rp_code: vec!["0".to_string()],
+            ..Default::default()
+        })
+        .unwrap();
+        assert_eq!(
+            decode_exit_position_response(
+                &response_without_optional_identity,
+                "exit-1",
+                &position,
+            )
+            .unwrap(),
+            ResponseDisposition::Succeeded
+        );
+        assert!(decode_exit_position_response(
+            &response("OTHER", "NQU6", "0"),
+            "exit-1",
+            &position
+        )
+        .is_err());
+        assert!(
+            decode_exit_position_response(&response("CME", "ESU6", "0"), "exit-1", &position)
+                .is_err()
+        );
+        assert_eq!(
+            decode_exit_position_response(&response("CME", "NQU6", "9"), "exit-1", &position)
+                .unwrap(),
+            ResponseDisposition::Failed(vec!["9".to_string()])
+        );
+    }
+
+    #[test]
+    fn exit_position_request_rejects_incomplete_instrument_identity() {
+        for (exchange, symbol, succeeds) in [
+            ("CME", "NQU6", true),
+            ("", "NQU6", false),
+            ("CME", "", false),
+            (" ", "NQU6", false),
+            ("CME", " ", false),
+        ] {
+            assert_eq!(
+                exit_position_request(
+                    "exit",
+                    &account(),
+                    &ExitPosition {
+                        exchange: exchange.to_string(),
+                        symbol: symbol.to_string(),
+                    },
+                )
+                .is_ok(),
+                succeeds
+            );
         }
     }
 

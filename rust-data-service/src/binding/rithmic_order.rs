@@ -2,8 +2,8 @@ use super::rithmic_ledger::PyLedgerOrder;
 use crate::rithmic_ledger::{
     ledger::TransactionType,
     order::{
-        BracketOrder, NewOrder, OrderAck, OrderEvent, OrderSide, OrderType, ProtectionLeg,
-        ProtectionModification,
+        BracketOrder, ExitPosition, NewOrder, OrderAck, OrderEvent, OrderSide, OrderType,
+        ProtectionLeg, ProtectionModification,
     },
     order_runtime::OrderRuntimeHandle,
 };
@@ -258,6 +258,19 @@ impl PyOrderClient {
                 .lock()
                 .map_err(|_| anyhow::anyhow!("Rithmic order runtime lock is unavailable"))?
                 .cancel(basket_id)
+        })
+        .map(|()| true)
+        .map_err(runtime_error)
+    }
+
+    fn exit_position(&self, py: Python<'_>, exchange: String, symbol: String) -> PyResult<bool> {
+        let position = ExitPosition { exchange, symbol };
+        let runtime = &self.runtime;
+        py.allow_threads(|| {
+            runtime
+                .lock()
+                .map_err(|_| anyhow::anyhow!("Rithmic order runtime lock is unavailable"))?
+                .exit_position(position)
         })
         .map(|()| true)
         .map_err(runtime_error)

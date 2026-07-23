@@ -109,6 +109,7 @@ class RecordingExecutionEngine:
         self.order_manager = _FakeOrderManager(orders_by_status or {})
         self.adapter = None
         self.flatten_reference_prices: list[Decimal | None] = []
+        self.authoritative_exits: list[tuple[str, str]] = []
 
     def cancel_order(self, order_id: str) -> bool:
         self.calls.append(("cancel_order", order_id))
@@ -125,6 +126,11 @@ class RecordingExecutionEngine:
         self.calls.append(("flatten_position", strategy_id, product_id))
         self.flatten_reference_prices.append(reference_price)
         return self._flatten_results.get((strategy_id, product_id), "flat-order-id")
+
+    def exit_authoritative_position(self, product_id: str, *, account_id: str) -> bool:
+        self.calls.append(("exit_authoritative_position", product_id))
+        self.authoritative_exits.append((product_id, account_id))
+        return True
 
 
 class _FakeOrderManager:
@@ -689,6 +695,31 @@ class TestKillSwitchFlattenPositions:
 
         assert engine.flatten_reference_prices == [None]
 
+    def test_authoritative_loader_and_account_are_forwarded_together(self):
+        position = _make_position(strategy_id="LIVE")
+        service, engine, _ = _make_service(positions=[])
+        service._write_event_best_effort = MagicMock()
+
+        result = service.kill_switch_with_authoritative_positions(
+            actor="ops",
+            reason="drill",
+            position_loader=lambda: [position],
+            account_id="ACCOUNT",
+        )
+
+        assert result["flattened_positions"] == 1
+        assert ("exit_authoritative_position", PRODUCT_ID) in engine.calls
+        assert engine.authoritative_exits == [(PRODUCT_ID, "ACCOUNT")]
+        service._write_event_best_effort.assert_not_called()
+
+        service.record_kill_switch_result(
+            actor="ops",
+            reason="drill",
+            result={**result, "authoritative_flatten_verified": True},
+        )
+
+        service._write_event_best_effort.assert_called_once()
+
 
 # =============================================================================
 # B. ExecutionEngine.flatten_position tests
@@ -767,6 +798,71 @@ class TestFlattenPosition:
         )[-1]
         order_obj = placed_order if isinstance(placed_order, Order) else placed_order.get("order")
         assert order_obj.min_notional_reference_price == Decimal("50000")
+
+    def test_authoritative_exit_uses_server_side_adapter_operation(
+        self,
+        eng,
+        mock_exchange_adapter,
+        mock_order_repo,
+    ):
+        mock_exchange_adapter.account_id = "ACCOUNT"
+        mock_exchange_adapter.authoritative_position_exit_authority = (
+            "rithmic_exit_position"
+        )
+        mock_exchange_adapter.exit_position = MagicMock(return_value=True)
+
+        assert eng.exit_authoritative_position(
+            PRODUCT_ID,
+            account_id="ACCOUNT",
+        ) is True
+
+        mock_exchange_adapter.exit_position.assert_called_once_with(PRODUCT_ID)
+        assert mock_order_repo.orders == {}
+
+    def test_authoritative_exit_rejects_account_mismatch(
+        self,
+        eng,
+        mock_exchange_adapter,
+        mock_order_repo,
+    ):
+        mock_exchange_adapter.account_id = "OTHER"
+        mock_exchange_adapter.authoritative_position_exit_authority = (
+            "rithmic_exit_position"
+        )
+        mock_exchange_adapter.exit_position = MagicMock()
+
+        with pytest.raises(ExchangeError, match="account_mismatch"):
+            eng.exit_authoritative_position(PRODUCT_ID, account_id="ACCOUNT")
+
+        assert mock_order_repo.orders == {}
+        mock_exchange_adapter.exit_position.assert_not_called()
+
+    def test_authoritative_exit_requires_explicit_adapter_capability(
+        self,
+        eng,
+        mock_exchange_adapter,
+        mock_order_repo,
+    ):
+        mock_exchange_adapter.account_id = "ACCOUNT"
+
+        with pytest.raises(ExchangeError, match="unsupported"):
+            eng.exit_authoritative_position(PRODUCT_ID, account_id="ACCOUNT")
+
+        assert mock_order_repo.orders == {}
+
+    def test_authoritative_exit_rejects_false_adapter_result(
+        self,
+        eng,
+        mock_exchange_adapter,
+    ):
+        mock_exchange_adapter.account_id = "ACCOUNT"
+        mock_exchange_adapter.authoritative_position_exit_authority = (
+            "rithmic_exit_position"
+        )
+        mock_exchange_adapter.exit_position = MagicMock(return_value=False)
+
+        with pytest.raises(ExchangeError, match="returned_false"):
+            eng.exit_authoritative_position(PRODUCT_ID, account_id="ACCOUNT")
 
     def test_flatten_persists_and_submits_validated_quantity(
         self, eng, mock_order_repo

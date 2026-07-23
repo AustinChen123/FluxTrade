@@ -14,6 +14,7 @@ Covers:
 from contextlib import nullcontext
 from decimal import Decimal
 import json
+from types import SimpleNamespace
 from unittest.mock import MagicMock, call, patch
 
 import pytest
@@ -2625,7 +2626,7 @@ class TestShutdown:
         engine.shutdown(timeout=0.1)
 
 
-def _rithmic_adapter_for_reconnect_test():
+def _rithmic_adapter_for_reconnect_test(client=None):
     return RithmicExchangeAdapter(
         profile="test",
         account_id="ACCOUNT",
@@ -2636,7 +2637,488 @@ def _rithmic_adapter_for_reconnect_test():
                 "price_tick": "0.25",
             }
         },
-        client_factory=MagicMock(),
+        client_factory=MagicMock(return_value=client or MagicMock()),
+    )
+
+
+def _rithmic_emergency_snapshot(*, net_quantity=None, orders=None):
+    positions = []
+    if net_quantity is not None:
+        positions.append(
+            SimpleNamespace(
+                exchange="CME",
+                symbol="NQU6",
+                net_quantity=str(net_quantity),
+                average_open_fill_price="20000",
+                open_pnl="0",
+            )
+        )
+    return SimpleNamespace(
+        account_id="ACCOUNT",
+        positions=positions,
+        orders=orders or [],
+    )
+
+
+def _kill_switch_result(**overrides):
+    result = {
+        "cancelled_orders": 0,
+        "cancel_failures": [],
+        "flattened_positions": 1,
+        "flatten_pending": [],
+        "flatten_failures": [],
+        "recovery_failures": [],
+        "already_flat": False,
+        "drain_timeout": False,
+    }
+    result.update(overrides)
+    return result
+
+
+def test_rithmic_kill_switch_uses_and_verifies_authoritative_positions(engine):
+    adapter = _rithmic_adapter_for_reconnect_test()
+    adapter.start_order_event_stream()
+    engine.execution_engine.adapter = adapter
+    engine._rithmic_recovery_profile = "test"
+    engine._rithmic_recovery_account_id = "ACCOUNT"
+    engine._start_exchange_order_event_stream = MagicMock()
+    engine.execution_engine.reconcile_rithmic_owned_orders = MagicMock(
+        return_value={"auto_resume_safe": True}
+    )
+    engine.account_service.replace_positions_for_products = MagicMock()
+    engine.ops_safety.record_kill_switch_result = MagicMock()
+    flatten_order = SimpleNamespace(exchange_id="RITHMIC")
+    engine.execution_engine.list_recoverable_client_orders = MagicMock(
+        side_effect=[[], [flatten_order]]
+    )
+
+    def flatten(**kwargs):
+        positions = kwargs["position_loader"]()
+        assert positions[0].side == PositionSide.LONG
+        assert positions[0].quantity == Decimal("1")
+        assert kwargs["account_id"] == "ACCOUNT"
+        return _kill_switch_result()
+
+    engine.ops_safety.kill_switch_with_authoritative_positions = MagicMock(
+        side_effect=flatten
+    )
+    snapshots = [
+        _rithmic_emergency_snapshot(net_quantity="1"),
+        _rithmic_emergency_snapshot(),
+    ]
+
+    with patch(
+        "src.core.engine.load_rithmic_recovery_snapshot",
+        side_effect=snapshots,
+    ) as snapshot_loader:
+        result = engine._run_ops_kill_switch(actor="ops", reason="drill")
+
+    assert result["authoritative_flatten_verified"] is True
+    recorded = engine.ops_safety.record_kill_switch_result.call_args.kwargs[
+        "result"
+    ]
+    assert recorded["authoritative_flatten_verified"] is True
+    assert snapshot_loader.call_args_list[1].args[2] == [flatten_order]
+    assert engine.execution_engine.reconcile_rithmic_owned_orders.call_count == 2
+    engine.account_service.replace_positions_for_products.assert_called_once_with(
+        [],
+        ("RITHMIC:NQ-202609",),
+        timestamp_ms=1704067200000,
+    )
+    engine._start_exchange_order_event_stream.assert_called_once_with()
+
+def test_rithmic_kill_switch_real_path_uses_native_exit_not_market_submit(engine):
+    order_client = MagicMock()
+    order_client.exit_position.return_value = True
+    adapter = _rithmic_adapter_for_reconnect_test(order_client)
+    adapter.start_order_event_stream()
+    engine.execution_engine.adapter = adapter
+    engine._rithmic_recovery_profile = "test"
+    engine._rithmic_recovery_account_id = "ACCOUNT"
+    engine._start_exchange_order_event_stream = MagicMock()
+    engine.execution_engine.reconcile_rithmic_owned_orders = MagicMock(
+        return_value={"auto_resume_safe": True}
+    )
+    engine.account_service.replace_positions_for_products = MagicMock()
+
+    with patch(
+        "src.core.engine.load_rithmic_recovery_snapshot",
+        side_effect=[
+            _rithmic_emergency_snapshot(net_quantity="1"),
+            _rithmic_emergency_snapshot(),
+        ],
+    ):
+        result = engine._run_ops_kill_switch(actor="ops", reason="drill")
+
+    assert result["authoritative_flatten_verified"] is True
+    order_client.exit_position.assert_called_once_with("CME", "NQU6")
+    order_client.submit.assert_not_called()
+
+@pytest.mark.parametrize(
+    ("post_quantity", "verified"),
+    [(None, True), ("1", False)],
+)
+def test_rithmic_kill_switch_ambiguous_native_exit_never_resubmits(
+    engine,
+    post_quantity,
+    verified,
+):
+    order_client = MagicMock()
+    order_client.exit_position.side_effect = RuntimeError(
+        "Rithmic exit-position result is ambiguous"
+    )
+    adapter = _rithmic_adapter_for_reconnect_test(order_client)
+    adapter.start_order_event_stream()
+    engine.execution_engine.adapter = adapter
+    engine._rithmic_recovery_profile = "test"
+    engine._rithmic_recovery_account_id = "ACCOUNT"
+    engine._start_exchange_order_event_stream = MagicMock()
+    engine.execution_engine.reconcile_rithmic_owned_orders = MagicMock(
+        return_value={"auto_resume_safe": True}
+    )
+    engine.account_service.replace_positions_for_products = MagicMock()
+
+    with patch(
+        "src.core.engine.load_rithmic_recovery_snapshot",
+        side_effect=[
+            _rithmic_emergency_snapshot(net_quantity="1"),
+            _rithmic_emergency_snapshot(net_quantity=post_quantity),
+        ],
+    ):
+        result = engine._run_ops_kill_switch(actor="ops", reason="drill")
+
+    assert result["authoritative_flatten_verified"] is verified
+    order_client.exit_position.assert_called_once_with("CME", "NQU6")
+    order_client.submit.assert_not_called()
+
+
+def test_rithmic_kill_switch_does_not_snapshot_after_drain_timeout(engine):
+    adapter = _rithmic_adapter_for_reconnect_test()
+    engine.execution_engine.adapter = adapter
+    engine._rithmic_recovery_profile = "test"
+    engine._rithmic_recovery_account_id = "ACCOUNT"
+    engine._start_exchange_order_event_stream = MagicMock()
+    engine.ops_safety.record_kill_switch_result = MagicMock()
+    engine.execution_engine.reconcile_rithmic_owned_orders = MagicMock()
+    engine.ops_safety.kill_switch_with_authoritative_positions = MagicMock(
+        return_value=_kill_switch_result(
+            flattened_positions=0,
+            drain_timeout=True,
+        )
+    )
+
+    with patch(
+        "src.core.engine.load_rithmic_recovery_snapshot"
+    ) as snapshot_loader:
+        result = engine._run_ops_kill_switch(actor="ops", reason="drill")
+
+    assert result["authoritative_flatten_verified"] is False
+    recorded = engine.ops_safety.record_kill_switch_result.call_args.kwargs[
+        "result"
+    ]
+    assert recorded["authoritative_flatten_verified"] is False
+    snapshot_loader.assert_not_called()
+    engine.execution_engine.reconcile_rithmic_owned_orders.assert_not_called()
+
+
+def test_rithmic_kill_switch_audits_verification_failure_before_raising(engine):
+    adapter = _rithmic_adapter_for_reconnect_test()
+    adapter.start_order_event_stream()
+    engine.execution_engine.adapter = adapter
+    engine._rithmic_recovery_profile = "test"
+    engine._rithmic_recovery_account_id = "ACCOUNT"
+    engine._start_exchange_order_event_stream = MagicMock()
+    engine.ops_safety.record_kill_switch_result = MagicMock()
+    engine.ops_safety.kill_switch_with_authoritative_positions = MagicMock(
+        side_effect=lambda **kwargs: kwargs["position_loader"]()
+    )
+
+    with (
+        patch(
+            "src.core.engine.load_rithmic_recovery_snapshot",
+            side_effect=RuntimeError("ledger unavailable"),
+        ),
+        pytest.raises(RuntimeError, match="ledger unavailable"),
+    ):
+        engine._run_ops_kill_switch(actor="ops", reason="drill")
+
+    recorded = engine.ops_safety.record_kill_switch_result.call_args.kwargs[
+        "result"
+    ]
+    assert recorded["authoritative_flatten_verified"] is False
+    assert recorded["flatten_failures"][-1]["reason"].endswith(
+        ":RuntimeError"
+    )
+    engine._start_exchange_order_event_stream.assert_called_once_with()
+
+
+def test_rithmic_kill_switch_audits_event_stream_stop_timeout(engine):
+    engine.execution_engine.adapter = _rithmic_adapter_for_reconnect_test()
+    engine.order_event_thread = MagicMock()
+    engine.order_event_thread.is_alive.return_value = True
+    engine.ops_safety.record_kill_switch_result = MagicMock()
+    engine.ops_safety.kill_switch_with_authoritative_positions = MagicMock()
+
+    with pytest.raises(
+        RuntimeError,
+        match="rithmic_emergency_flatten_event_stream_stop_timeout",
+    ):
+        engine._run_ops_kill_switch(actor="ops", reason="drill")
+
+    recorded = engine.ops_safety.record_kill_switch_result.call_args.kwargs[
+        "result"
+    ]
+    assert recorded["authoritative_flatten_verified"] is False
+    assert engine._order_event_stop.is_set() is False
+    engine.ops_safety.kill_switch_with_authoritative_positions.assert_not_called()
+
+
+def test_rithmic_kill_switch_retries_only_from_fresh_residual_position(engine):
+    adapter = _rithmic_adapter_for_reconnect_test()
+    adapter.start_order_event_stream()
+    engine.execution_engine.adapter = adapter
+    engine._rithmic_recovery_profile = "test"
+    engine._rithmic_recovery_account_id = "ACCOUNT"
+    engine._start_exchange_order_event_stream = MagicMock()
+    engine.execution_engine.reconcile_rithmic_owned_orders = MagicMock(
+        side_effect=[
+            {"auto_resume_safe": False},
+            {"auto_resume_safe": True},
+            {"auto_resume_safe": False},
+            {"auto_resume_safe": True},
+        ]
+    )
+    engine.account_service.set_position(
+        Position(
+            strategy_id="strategy-a",
+            product_id="RITHMIC:NQ-202609",
+            side=PositionSide.LONG,
+            quantity=Decimal("2"),
+            entry_price=Decimal("20000"),
+            unrealized_pnl=Decimal("0"),
+        )
+    )
+
+    def flatten(**kwargs):
+        assert kwargs["position_loader"]()
+        return _kill_switch_result()
+
+    engine.ops_safety.kill_switch_with_authoritative_positions = MagicMock(
+        side_effect=flatten
+    )
+    snapshots = [
+        _rithmic_emergency_snapshot(net_quantity="2"),
+        _rithmic_emergency_snapshot(net_quantity="1"),
+        _rithmic_emergency_snapshot(net_quantity="1"),
+        _rithmic_emergency_snapshot(),
+    ]
+
+    with patch(
+        "src.core.engine.load_rithmic_recovery_snapshot",
+        side_effect=snapshots,
+    ):
+        result = engine._run_ops_kill_switch(actor="ops", reason="drill")
+
+    assert result["authoritative_flatten_verified"] is True
+    assert result["flattened_positions"] == 2
+    assert (
+        engine.ops_safety.kill_switch_with_authoritative_positions.call_count
+        == 2
+    )
+    assert engine.account_service.get_all_positions() == []
+
+def test_rithmic_kill_switch_waits_for_accepted_exit_working_order(engine):
+    adapter = _rithmic_adapter_for_reconnect_test()
+    adapter.start_order_event_stream()
+    engine.execution_engine.adapter = adapter
+    engine._rithmic_recovery_profile = "test"
+    engine._rithmic_recovery_account_id = "ACCOUNT"
+    engine._start_exchange_order_event_stream = MagicMock()
+    engine.execution_engine.reconcile_rithmic_owned_orders = MagicMock(
+        return_value={"auto_resume_safe": True}
+    )
+    engine.account_service.replace_positions_for_products = MagicMock()
+
+    def exit_position(**kwargs):
+        assert kwargs["position_loader"]()
+        return _kill_switch_result()
+
+    engine.ops_safety.kill_switch_with_authoritative_positions = MagicMock(
+        side_effect=exit_position
+    )
+    working = SimpleNamespace(basket_id="native-exit-1")
+
+    with patch(
+        "src.core.engine.load_rithmic_recovery_snapshot",
+        side_effect=[
+            _rithmic_emergency_snapshot(net_quantity="1"),
+            _rithmic_emergency_snapshot(net_quantity="1", orders=[working]),
+            _rithmic_emergency_snapshot(),
+        ],
+    ):
+        result = engine._run_ops_kill_switch(actor="ops", reason="drill")
+
+    assert result["authoritative_flatten_verified"] is True
+    (
+        engine.ops_safety.kill_switch_with_authoritative_positions
+        .assert_called_once()
+    )
+    assert engine.execution_engine.reconcile_rithmic_owned_orders.call_count == 3
+    engine.account_service.replace_positions_for_products.assert_called_once_with(
+        [],
+        ("RITHMIC:NQ-202609",),
+        timestamp_ms=1704067200000,
+    )
+
+
+def test_rithmic_kill_switch_ignores_terminal_remote_order_rows(engine):
+    adapter = _rithmic_adapter_for_reconnect_test()
+    adapter.start_order_event_stream()
+    engine.execution_engine.adapter = adapter
+    engine._rithmic_recovery_profile = "test"
+    engine._rithmic_recovery_account_id = "ACCOUNT"
+    engine._start_exchange_order_event_stream = MagicMock()
+    engine.execution_engine.reconcile_rithmic_owned_orders = MagicMock(
+        return_value={"auto_resume_safe": True}
+    )
+    terminal_order = SimpleNamespace(
+        status="complete",
+        notification_type="CANCEL",
+        quantity="1",
+        filled_quantity="0",
+    )
+
+    def exit_position(**kwargs):
+        assert kwargs["position_loader"]()
+        return _kill_switch_result()
+
+    engine.ops_safety.kill_switch_with_authoritative_positions = MagicMock(
+        side_effect=exit_position
+    )
+
+    with patch(
+        "src.core.engine.load_rithmic_recovery_snapshot",
+        side_effect=[
+            _rithmic_emergency_snapshot(
+                net_quantity="1",
+                orders=[terminal_order],
+            ),
+            _rithmic_emergency_snapshot(orders=[terminal_order]),
+        ],
+    ):
+        result = engine._run_ops_kill_switch(actor="ops", reason="drill")
+
+    assert result["authoritative_flatten_verified"] is True
+    (
+        engine.ops_safety.kill_switch_with_authoritative_positions
+        .assert_called_once()
+    )
+
+
+def test_rithmic_kill_switch_does_not_retry_unreconciled_residual(engine):
+    adapter = _rithmic_adapter_for_reconnect_test()
+    adapter.start_order_event_stream()
+    engine.execution_engine.adapter = adapter
+    engine._rithmic_recovery_profile = "test"
+    engine._rithmic_recovery_account_id = "ACCOUNT"
+    engine._start_exchange_order_event_stream = MagicMock()
+    engine.execution_engine.reconcile_rithmic_owned_orders = MagicMock(
+        return_value={"auto_resume_safe": False}
+    )
+
+    def flatten(**kwargs):
+        assert kwargs["position_loader"]()
+        return _kill_switch_result()
+
+    engine.ops_safety.kill_switch_with_authoritative_positions = MagicMock(
+        side_effect=flatten
+    )
+
+    with patch(
+        "src.core.engine.load_rithmic_recovery_snapshot",
+        side_effect=[
+            _rithmic_emergency_snapshot(net_quantity="1"),
+            _rithmic_emergency_snapshot(net_quantity="1"),
+        ],
+    ):
+        result = engine._run_ops_kill_switch(actor="ops", reason="drill")
+
+    assert result["authoritative_flatten_verified"] is False
+    (
+        engine.ops_safety.kill_switch_with_authoritative_positions
+        .assert_called_once()
+    )
+
+
+def test_rithmic_kill_switch_blocks_when_remote_working_order_remains(engine):
+    adapter = _rithmic_adapter_for_reconnect_test()
+    adapter.start_order_event_stream()
+    order_client = adapter._client
+    engine.execution_engine.adapter = adapter
+    engine._rithmic_recovery_profile = "test"
+    engine._rithmic_recovery_account_id = "ACCOUNT"
+    engine._start_exchange_order_event_stream = MagicMock()
+    engine.execution_engine.reconcile_rithmic_owned_orders = MagicMock(
+        return_value={"auto_resume_safe": False}
+    )
+    engine.ops_safety._write_event_best_effort = MagicMock()
+    working = SimpleNamespace(basket_id="external-1")
+
+    with patch(
+        "src.core.engine.load_rithmic_recovery_snapshot",
+        side_effect=[
+            _rithmic_emergency_snapshot(
+                net_quantity="1",
+                orders=[working],
+            ),
+            _rithmic_emergency_snapshot(
+                net_quantity="1",
+                orders=[working],
+            ),
+        ],
+    ):
+        result = engine._run_ops_kill_switch(actor="ops", reason="drill")
+
+    assert result["authoritative_flatten_verified"] is False
+    assert any(
+        "working_orders_remain" in failure["reason"]
+        for failure in result["flatten_failures"]
+    )
+    order_client.submit.assert_not_called()
+    order_client.exit_position.assert_not_called()
+
+
+def test_rithmic_kill_switch_preserves_primary_error_when_restart_also_fails(
+    engine,
+):
+    adapter = _rithmic_adapter_for_reconnect_test()
+    adapter.start_order_event_stream()
+    engine.execution_engine.adapter = adapter
+    engine._rithmic_recovery_profile = "test"
+    engine._rithmic_recovery_account_id = "ACCOUNT"
+    engine._start_exchange_order_event_stream = MagicMock(
+        side_effect=RuntimeError("restart failed")
+    )
+    engine.ops_safety.record_kill_switch_result = MagicMock()
+    engine.ops_safety.kill_switch_with_authoritative_positions = MagicMock(
+        side_effect=lambda **kwargs: kwargs["position_loader"]()
+    )
+
+    with (
+        patch(
+            "src.core.engine.load_rithmic_recovery_snapshot",
+            side_effect=RuntimeError("ledger unavailable"),
+        ),
+        pytest.raises(RuntimeError, match="ledger unavailable"),
+    ):
+        engine._run_ops_kill_switch(actor="ops", reason="drill")
+
+    recorded = engine.ops_safety.record_kill_switch_result.call_args.kwargs[
+        "result"
+    ]
+    assert recorded["authoritative_flatten_verified"] is False
+    assert recorded["recovery_failures"][-1]["reason"].endswith(
+        ":RuntimeError"
     )
 
 

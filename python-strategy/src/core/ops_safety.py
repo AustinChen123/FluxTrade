@@ -61,20 +61,68 @@ class OpsSafetyService:
         self._recovery_reason: str | None = None
 
     def kill_switch(self, *, actor: str, reason: str | None = None) -> dict:
+        return self._kill_switch(
+            actor=actor,
+            reason=reason,
+        )
+
+    def kill_switch_with_authoritative_positions(
+        self,
+        *,
+        actor: str,
+        reason: str | None,
+        position_loader: Callable[[], list[Any]],
+        account_id: str,
+    ) -> dict:
+        return self._kill_switch(
+            actor=actor,
+            reason=reason,
+            position_loader=position_loader,
+            authoritative_account_id=account_id,
+            allow_async_recovery=False,
+            write_audit=False,
+        )
+
+    def record_kill_switch_result(
+        self,
+        *,
+        actor: str,
+        reason: str | None,
+        result: dict,
+    ) -> None:
+        self._write_event_best_effort(
+            actor=actor,
+            reason=reason,
+            result=result,
+        )
+
+    def _kill_switch(
+        self,
+        *,
+        actor: str,
+        reason: str | None,
+        position_loader: Callable[[], list[Any]] | None = None,
+        authoritative_account_id: str | None = None,
+        allow_async_recovery: bool = True,
+        write_audit: bool = True,
+    ) -> dict:
         with self._kill_switch_lock:
             if self._recovery_pending:
                 return deepcopy(self._recovery_result)
             result, recovery_pending = self._run_kill_switch(
                 actor=actor,
                 reason=reason,
+                position_loader=position_loader,
+                authoritative_account_id=authoritative_account_id,
+                write_audit=write_audit,
             )
-            if recovery_pending:
+            if recovery_pending and allow_async_recovery:
                 self._recovery_pending = True
                 self._recovery_result = deepcopy(result)
                 self._recovery_actor = actor
                 self._recovery_reason = reason
 
-        if recovery_pending:
+        if recovery_pending and allow_async_recovery:
             run_when_drained = getattr(
                 self._execution_engine,
                 "run_when_submissions_drained",
@@ -186,6 +234,9 @@ class OpsSafetyService:
         actor: str,
         reason: str | None = None,
         result: dict | None = None,
+        position_loader: Callable[[], list[Any]] | None = None,
+        authoritative_account_id: str | None = None,
+        write_audit: bool = True,
     ) -> tuple[dict, bool]:
         """Cancel all open orders, then flatten all positions.
 
@@ -209,8 +260,9 @@ class OpsSafetyService:
         Failure isolation: a failure on one order/position is recorded and
         processing continues for the rest.
 
-        Audit: a system_event(event_type="ops", event_subtype="kill_switch")
-        is always attempted. Audit failures never block emergency mitigation.
+        Audit: the generic path attempts a system event here; authoritative
+        callers defer it until their final remote verification. Audit failures
+        never block emergency mitigation.
 
         Idempotency: no open orders and no positions → already_flat=True with
         zero counts; audit event is still written.
@@ -231,16 +283,21 @@ class OpsSafetyService:
         drained = not callable(halt_and_drain) or halt_and_drain(self._drain_timeout)
         if not drained:
             result["drain_timeout"] = True
-            self._write_event_best_effort(
-                actor=actor,
-                reason=reason,
-                result=result,
-                event_subtype="kill_switch_pending",
-            )
+            if write_audit:
+                self._write_event_best_effort(
+                    actor=actor,
+                    reason=reason,
+                    result=result,
+                    event_subtype="kill_switch_pending",
+                )
             self._log_drain_timeout()
             return result, True
 
-        orders, positions = self._mitigate_visible_state(result)
+        orders, positions = self._mitigate_visible_state(
+            result,
+            position_loader=position_loader,
+            authoritative_account_id=authoritative_account_id,
+        )
 
         result["already_flat"] = (
             not orders
@@ -250,7 +307,7 @@ class OpsSafetyService:
             and not result["flatten_failures"]
             and not result["recovery_failures"]
         )
-        if drained:
+        if drained and write_audit:
             self._write_event_best_effort(actor=actor, reason=reason, result=result)
         return result, not drained
 
@@ -279,6 +336,8 @@ class OpsSafetyService:
         result: dict,
         *,
         flatten_positions: bool = True,
+        position_loader: Callable[[], list[Any]] | None = None,
+        authoritative_account_id: str | None = None,
     ) -> tuple[list[Any], list[Any]]:
         orders = self._open_orders()
         for order in orders:
@@ -304,7 +363,11 @@ class OpsSafetyService:
             return orders, []
 
         try:
-            positions, position_fetch_error = self._positions()
+            if position_loader is None:
+                positions, position_fetch_error = self._positions()
+            else:
+                positions = list(position_loader())
+                position_fetch_error = None
         except Exception as exc:
             self._logger.exception("Kill switch failed to enumerate live positions")
             result["flatten_failures"].append(
@@ -330,12 +393,22 @@ class OpsSafetyService:
             product_id = position.product_id
             side = getattr(position.side, "value", position.side)
             try:
-                flattened_id = self._execution_engine.flatten_position(
-                    strategy_id,
-                    product_id,
-                    side,
-                    position.quantity,
-                )
+                if authoritative_account_id is not None:
+                    flattened_id = (
+                        product_id
+                        if self._execution_engine.exit_authoritative_position(
+                            product_id,
+                            account_id=authoritative_account_id,
+                        )
+                        else None
+                    )
+                else:
+                    flattened_id = self._execution_engine.flatten_position(
+                        strategy_id,
+                        product_id,
+                        side,
+                        position.quantity,
+                    )
                 if isinstance(flattened_id, FlattenPending):
                     result["flatten_pending"].append(
                         {

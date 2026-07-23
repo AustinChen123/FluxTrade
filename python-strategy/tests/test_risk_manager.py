@@ -16,7 +16,7 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
-from src.core.models import PositionSide, SignalType
+from src.core.models import Position, PositionSide, SignalType
 from src.core.risk_config import RiskConfig
 from src.core.risk_rules import RuleStatus
 from src.core.risk_rules.existing_position_entry import ExistingPositionEntryRule
@@ -1028,6 +1028,77 @@ class TestAccountService:
         assert positions[0].strategy_id == "test.py::StratB"
         assert positions[0].product_id == "BINANCE:BTCUSDT-PERP"
         assert positions[0].quantity == Decimal("0.25")
+
+    @pytest.mark.parametrize(
+        ("side", "expected_quantity"),
+        [
+            (PositionSide.LONG, "1.5"),
+            (PositionSide.SHORT, "-1.5"),
+        ],
+    )
+    def test_replace_positions_for_products_replaces_only_authoritative_scope(
+        self,
+        side,
+        expected_quantity,
+    ):
+        mock_redis = MagicMock()
+        mock_redis.ping.return_value = True
+        mock_redis.scan_iter.return_value = [
+            "state:position:strat_a:RITHMIC:NQ-202609",
+            "state:position:test.py::StratB:RITHMIC:NQ-202609",
+            "state:position:strat_c:BINANCE:BTCUSDT-PERP",
+        ]
+        pipeline = mock_redis.pipeline.return_value
+
+        with patch("src.core.risk_manager.create_redis_client", return_value=mock_redis):
+            service = AccountService()
+
+        position = Position(
+            strategy_id="LIVE",
+            product_id="RITHMIC:NQ-202609",
+            side=side,
+            quantity=Decimal("1.5"),
+            entry_price=Decimal("20000.25"),
+            unrealized_pnl=Decimal("0"),
+        )
+        result = service.replace_positions_for_products(
+            [position],
+            ("RITHMIC:NQ-202609",),
+            timestamp_ms=1704067200000,
+        )
+
+        assert result == {"removed": 2, "written": 1}
+        mock_redis.pipeline.assert_called_once_with(transaction=True)
+        pipeline.delete.assert_called_once_with(
+            "state:position:strat_a:RITHMIC:NQ-202609",
+            "state:position:test.py::StratB:RITHMIC:NQ-202609",
+        )
+        pipeline.hset.assert_called_once_with(
+            "state:position:LIVE:RITHMIC:NQ-202609",
+            mapping={
+                "quantity": expected_quantity,
+                "entry_price": "20000.25",
+                "last_update": "1704067200000",
+            },
+        )
+        pipeline.execute.assert_called_once_with()
+
+    def test_replace_positions_for_products_requires_redis_when_scope_nonempty(self):
+        with patch(
+            "src.core.risk_manager.create_redis_client",
+            side_effect=Exception("fail"),
+        ):
+            service = AccountService()
+
+        with pytest.raises(
+            RuntimeError,
+            match="authoritative_position_cache_unavailable",
+        ):
+            service.replace_positions_for_products(
+                [],
+                ("RITHMIC:NQ-202609",),
+                timestamp_ms=1704067200000,
+            )
 
     def test_close_with_redis(self):
         """close() should close Redis connection."""

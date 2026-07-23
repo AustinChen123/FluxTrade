@@ -30,6 +30,10 @@ from src.core.adapters import (
     SimulatedAdapter,
     create_adapter,
 )
+from src.core.adapters.rithmic_recovery import (
+    load_rithmic_recovery_snapshot,
+    rithmic_order_may_be_working,
+)
 from src.core.journal import StrategyJournal
 from src.core.redis_factory import create_redis_client
 from src.core.metrics import SIGNALS_TOTAL, ACTIVE_STRATEGIES, BALANCE_USDT
@@ -52,6 +56,27 @@ SYSTEM_STATE_OK = "OK"
 _RITHMIC_SAFE_ORDER_EVENT_ACTIONS = frozenset({"applied"})
 
 logger = logging.getLogger(__name__)
+
+
+def _merge_kill_switch_results(current: dict | None, update: dict) -> dict:
+    if current is None:
+        return dict(update)
+    for key in ("cancelled_orders", "flattened_positions"):
+        current[key] = int(current.get(key, 0)) + int(update.get(key, 0))
+    for key in (
+        "cancel_failures",
+        "flatten_pending",
+        "flatten_failures",
+        "recovery_failures",
+    ):
+        current.setdefault(key, []).extend(update.get(key, []))
+    current["drain_timeout"] = bool(
+        current.get("drain_timeout") or update.get("drain_timeout")
+    )
+    current["already_flat"] = bool(
+        current.get("already_flat") and update.get("already_flat")
+    )
+    return current
 
 
 def _is_runtime_reconciliation_enabled(
@@ -285,7 +310,7 @@ class StrategyEngine:
             elif self._startup_lock_cause == "explicit_lockdown":
                 with self._ops_command_lock:
                     if self._kill_switch_halted:
-                        self.ops_safety.kill_switch(
+                        self._run_ops_kill_switch(
                             actor="startup_recovery",
                             reason="persisted_lockdown",
                         )
@@ -503,6 +528,204 @@ class StrategyEngine:
             return False, None
         return True, drift_generation
 
+    def _run_ops_kill_switch(
+        self,
+        *,
+        actor: str,
+        reason: str | None,
+    ) -> dict:
+        adapter = self.execution_engine.adapter
+        if not isinstance(adapter, RithmicExchangeAdapter):
+            return self.ops_safety.kill_switch(actor=actor, reason=reason)
+
+        aggregate = None
+        operation_failed = False
+
+        def finalize(
+            verified: bool,
+            failure_reason: str | None = None,
+        ) -> dict:
+            nonlocal aggregate
+            aggregate = aggregate or {
+                "cancelled_orders": 0,
+                "cancel_failures": [],
+                "flattened_positions": 0,
+                "flatten_pending": [],
+                "flatten_failures": [],
+                "recovery_failures": [],
+                "already_flat": False,
+                "drain_timeout": False,
+            }
+            aggregate["authoritative_flatten_verified"] = verified
+            if failure_reason is not None:
+                aggregate["flatten_failures"].append(
+                    {
+                        "strategy_id": "LIVE",
+                        "product_id": "unknown",
+                        "reason": failure_reason,
+                    }
+                )
+            self.ops_safety.record_kill_switch_result(
+                actor=actor,
+                reason=reason,
+                result=aggregate,
+            )
+            return aggregate
+
+        self._order_event_stop.set()
+        thread = self.order_event_thread
+        if thread is not None and thread.is_alive():
+            thread.join(timeout=30.0)
+            if thread.is_alive():
+                self._order_event_stop.clear()
+                finalize(
+                    False,
+                    "rithmic_emergency_flatten_event_stream_stop_timeout",
+                )
+                raise RuntimeError(
+                    "rithmic_emergency_flatten_event_stream_stop_timeout"
+                )
+
+        def load_snapshot():
+            adapter.close()
+            recoverable_orders = [
+                order
+                for order in self.execution_engine.list_recoverable_client_orders()
+                if str(order.exchange_id).lower() == "rithmic"
+            ]
+            return load_rithmic_recovery_snapshot(
+                self._rithmic_recovery_profile,
+                self._rithmic_recovery_account_id,
+                recoverable_orders,
+                int(self.execution_engine.clock.now()),
+            )
+
+        def load_positions() -> list:
+            snapshot = load_snapshot()
+            if any(rithmic_order_may_be_working(order) for order in snapshot.orders):
+                raise RuntimeError(
+                    "rithmic_emergency_flatten_working_orders_remain"
+                )
+            positions = adapter.positions_from_ledger_snapshot(snapshot)
+            adapter.start_order_event_stream()
+            return positions
+
+        try:
+            exit_attempts = 0
+            exit_failed = False
+            submit_exit = True
+            for _verification_attempt in range(6):
+                if submit_exit:
+                    result = (
+                        self.ops_safety.kill_switch_with_authoritative_positions(
+                            actor=actor,
+                            reason=reason,
+                            position_loader=load_positions,
+                            account_id=adapter.account_id,
+                        )
+                    )
+                    aggregate = _merge_kill_switch_results(aggregate, result)
+                    exit_attempts += 1
+                    exit_failed = bool(
+                        result.get("drain_timeout")
+                        or result.get("flatten_pending")
+                        or result.get("flatten_failures")
+                    )
+                    if result.get("drain_timeout"):
+                        break
+
+                snapshot = load_snapshot()
+                reconciliation = self.execution_engine.reconcile_rithmic_owned_orders(
+                    self._rithmic_recovery_profile,
+                    self._rithmic_recovery_account_id,
+                    snapshot_loader=lambda *_args, **_kwargs: snapshot,
+                )
+                remaining_positions = adapter.positions_from_ledger_snapshot(
+                    snapshot
+                )
+                working_orders_remain = any(
+                    rithmic_order_may_be_working(order)
+                    for order in snapshot.orders
+                )
+                if not working_orders_remain:
+                    self.account_service.replace_positions_for_products(
+                        remaining_positions,
+                        adapter.configured_product_ids,
+                        timestamp_ms=int(self.execution_engine.clock.now() * 1000),
+                    )
+                    reconciliation = (
+                        self.execution_engine.reconcile_rithmic_owned_orders(
+                            self._rithmic_recovery_profile,
+                            self._rithmic_recovery_account_id,
+                            snapshot_loader=lambda *_args, **_kwargs: snapshot,
+                        )
+                    )
+                    if (
+                        not remaining_positions
+                        and reconciliation.get("auto_resume_safe") is True
+                    ):
+                        return finalize(True)
+
+                if working_orders_remain:
+                    if exit_failed:
+                        break
+                    submit_exit = False
+                    continue
+                if (
+                    exit_failed
+                    or exit_attempts >= 3
+                    or reconciliation.get("auto_resume_safe") is not True
+                ):
+                    break
+
+                adapter.start_order_event_stream()
+                submit_exit = True
+
+            return finalize(
+                False,
+                "rithmic_authoritative_flatten_not_verified",
+            )
+        except Exception as exc:
+            operation_failed = True
+            finalize(
+                False,
+                "rithmic_authoritative_flatten_failed:"
+                f"{type(exc).__name__}",
+            )
+            raise
+        finally:
+            try:
+                self._start_exchange_order_event_stream()
+            except Exception as restart_error:
+                aggregate = aggregate or {
+                    "cancelled_orders": 0,
+                    "cancel_failures": [],
+                    "flattened_positions": 0,
+                    "flatten_pending": [],
+                    "flatten_failures": [],
+                    "recovery_failures": [],
+                    "already_flat": False,
+                    "drain_timeout": False,
+                    "authoritative_flatten_verified": False,
+                }
+                aggregate["recovery_failures"].append(
+                    {
+                        "reason": "rithmic_order_stream_restart_failed:"
+                        f"{type(restart_error).__name__}"
+                    }
+                )
+                self.ops_safety.record_kill_switch_result(
+                    actor=actor,
+                    reason=reason,
+                    result=aggregate,
+                )
+                if operation_failed:
+                    logger.exception(
+                        "Order stream restart also failed after emergency flatten failure"
+                    )
+                else:
+                    raise
+
     def _reconcile_recoverable_orders_on_startup(self) -> dict | None:
         """Record startup order reconciliation for audited external orders."""
         if not self.execution_engine.audit_external_orders:
@@ -689,7 +912,7 @@ class StrategyEngine:
                         logger.exception(
                             "Failed to persist kill switch state; local halt remains active"
                         )
-                    self.ops_safety.kill_switch(
+                    self._run_ops_kill_switch(
                         actor=actor,
                         reason=reason,
                     )
