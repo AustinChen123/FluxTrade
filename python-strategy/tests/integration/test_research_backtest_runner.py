@@ -15,6 +15,7 @@ from sqlalchemy.ext.compiler import compiles
 from sqlalchemy.orm import sessionmaker
 
 from integration.conftest import PRODUCT_ID, TIMEFRAME, make_candle_series
+from src.core.analytics import calculate_metrics
 from src.core.backtest_runner import BacktestRunner
 from src.core.capital_allocator import CapitalAllocator
 from src.core.data_sources.memory import MemoryDataSource
@@ -85,7 +86,14 @@ def _sqlite_backtest_session_factory(tmp_path):
     return session_factory
 
 
-def _signal_factory(strategy_id: str, candles: list):
+def _signal_factory(
+    strategy_id: str,
+    candles: list,
+    *,
+    entry_type: SignalType = SignalType.LONG,
+    exit_type: SignalType = SignalType.EXIT_LONG,
+    quantity: Decimal = Decimal("0.01"),
+):
     def predict(candle):
         index = (candle.timestamp - candles[0].timestamp) // INTERVAL_MS
         if index % 80 == 10:
@@ -94,8 +102,8 @@ def _signal_factory(strategy_id: str, candles: list):
                 product_id=PRODUCT_ID,
                 timeframe=TIMEFRAME,
                 timestamp=candle.timestamp,
-                type=SignalType.LONG,
-                quantity=Decimal("0.01"),
+                type=entry_type,
+                quantity=quantity,
             )
         if index % 80 == 40:
             return Signal(
@@ -103,8 +111,8 @@ def _signal_factory(strategy_id: str, candles: list):
                 product_id=PRODUCT_ID,
                 timeframe=TIMEFRAME,
                 timestamp=candle.timestamp,
-                type=SignalType.EXIT_LONG,
-                quantity=Decimal("0.01"),
+                type=exit_type,
+                quantity=quantity,
             )
         return None
 
@@ -188,10 +196,38 @@ class CapitalGatedEntryStrategy(BaseStrategy):
 
 
 @pytest.mark.smoke
-def test_research_backtest_matches_full_runner_core_metrics(tmp_path):
+@pytest.mark.parametrize(
+    ("entry_type", "exit_type", "multiplier"),
+    [
+        (SignalType.LONG, SignalType.EXIT_LONG, None),
+        (SignalType.SHORT, SignalType.EXIT_SHORT, None),
+        (SignalType.LONG, SignalType.EXIT_LONG, Decimal("2")),
+        (SignalType.SHORT, SignalType.EXIT_SHORT, Decimal("2")),
+    ],
+    ids=["long-default", "short-default", "long-futures", "short-futures"],
+)
+def test_research_backtest_matches_full_runner_core_metrics(
+    tmp_path,
+    entry_type,
+    exit_type,
+    multiplier,
+):
     session_factory = _sqlite_backtest_session_factory(tmp_path)
     candles = make_candle_series(count=2_000)
     fee_config = {"maker": 0.0002, "taker": 0.0006}
+    quantity = Decimal("0.01")
+    instrument_spec = (
+        None
+        if multiplier is None
+        else InstrumentSpec(
+            product_id=PRODUCT_ID,
+            exchange="test",
+            symbol="MNQ",
+            base="MNQ",
+            quote="USD",
+            multiplier=multiplier,
+        )
+    )
 
     full_runner = BacktestRunner(
         start_time=candles[0].timestamp,
@@ -199,6 +235,7 @@ def test_research_backtest_matches_full_runner_core_metrics(tmp_path):
         product_id=PRODUCT_ID,
         timeframe=TIMEFRAME,
         initial_balance=10_000.0,
+        max_drawdown_limit=None,
         data_source=MemoryDataSource(candles),
         fee_config=fee_config,
         report_config={
@@ -208,11 +245,18 @@ def test_research_backtest_matches_full_runner_core_metrics(tmp_path):
             "journal_export": False,
         },
         db_session_factory=session_factory,
+        instrument_spec=instrument_spec,
     )
     full_runner.add_strategy(
         CallableStrategy(
             "research_parity",
-            _signal_factory("research_parity", candles),
+            _signal_factory(
+                "research_parity",
+                candles,
+                entry_type=entry_type,
+                exit_type=exit_type,
+                quantity=quantity,
+            ),
             PRODUCT_ID,
             TIMEFRAME,
         )
@@ -226,11 +270,19 @@ def test_research_backtest_matches_full_runner_core_metrics(tmp_path):
         initial_balance=10_000.0,
         data_source=MemoryDataSource(candles),
         fee_config=fee_config,
+        max_drawdown_limit=None,
+        instrument_spec=instrument_spec,
     )
     research_runner.add_strategy(
         CallableStrategy(
             "research_parity",
-            _signal_factory("research_parity", candles),
+            _signal_factory(
+                "research_parity",
+                candles,
+                entry_type=entry_type,
+                exit_type=exit_type,
+                quantity=quantity,
+            ),
             PRODUCT_ID,
             TIMEFRAME,
         )
@@ -241,8 +293,13 @@ def test_research_backtest_matches_full_runner_core_metrics(tmp_path):
 
     with session_factory() as session:
         summary = session.scalars(select(BacktestResultSummary)).one()
+        full_trades = session.scalars(select(BacktestTradeLog)).all()
 
     metrics = json.loads(summary.metrics_json)
+    full_closed_trades = calculate_metrics(
+        full_trades,
+        contract_multiplier=multiplier or Decimal("1"),
+    )["closed_trades"]
 
     assert research_result["candle_count"] == len(candles)
     assert research_result["raw_trade_count"] == 50
@@ -250,6 +307,7 @@ def test_research_backtest_matches_full_runner_core_metrics(tmp_path):
     assert research_result["total_trades"] == metrics["total_trades"]
     assert research_result["total_pnl"] == full_result["total_pnl"]
     assert research_result["profit_factor"] == full_result["profit_factor"]
+    assert research_result["closed_trades"] == full_closed_trades
 
 
 def test_research_backtest_syncs_capital_lifecycle_after_fills():

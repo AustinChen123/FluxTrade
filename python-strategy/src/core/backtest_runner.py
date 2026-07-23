@@ -159,7 +159,7 @@ class BacktestRunner:
         product_id: str,
         timeframe: str,
         initial_balance: float = 10000.0,
-        max_drawdown_limit: float = 0.20,
+        max_drawdown_limit: Optional[float] = 0.20,
         data_source: Optional[IDataSource] = None,
         fee_config: Optional[Dict[str, float]] = None,
         report_config: Optional[Dict] = None,
@@ -205,7 +205,7 @@ class BacktestRunner:
         self,
         candles: Iterable,
         mock_account: BacktestAccountService,
-        stop_drawdown_amount: Decimal,
+        stop_drawdown_amount: Decimal | None,
     ) -> int:
         count = 0
         peak_equity = Decimal(str(self.initial_balance))
@@ -222,7 +222,10 @@ class BacktestRunner:
             peak_equity = max(peak_equity, current_equity)
             max_drawdown = max(max_drawdown, peak_equity - current_equity)
             count += 1
-            if max_drawdown >= stop_drawdown_amount:
+            if (
+                stop_drawdown_amount is not None
+                and max_drawdown >= stop_drawdown_amount
+            ):
                 logger.warning(
                     "STOPPING BACKTEST: Max Drawdown Reached! Drawdown: %s >= %s",
                     max_drawdown,
@@ -367,7 +370,12 @@ class BacktestRunner:
 
         logger.info("Starting Backtest for %s [%s - %s]", self.product_id, self.start_time, self.end_time)
 
-        stop_drawdown_amount = Decimal(str(self.initial_balance)) * Decimal(str(self.max_drawdown_limit))
+        stop_drawdown_amount = (
+            None
+            if self.max_drawdown_limit is None
+            else Decimal(str(self.initial_balance))
+            * Decimal(str(self.max_drawdown_limit))
+        )
 
         if self.data_source:
             candle_context = nullcontext(self.data_source.get_candles(
