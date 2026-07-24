@@ -1,3 +1,4 @@
+pub mod aggregator;
 pub mod matcher;
 pub mod models;
 #[cfg(feature = "rithmic")]

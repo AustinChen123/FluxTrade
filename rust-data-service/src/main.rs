@@ -706,21 +706,43 @@ async fn run_event_loop(
             msg = candle_rx.recv(), if candle_open => {
                 match msg {
                     Some(candle) => {
-                        // Publish 1m candle
+                        // Publish the source candle unchanged.
                         if let Err(e) = pub_sender.publish_candle(&candle).await {
                             warn!("Failed to send candle to publisher: {}", e);
                         }
 
-                        // Aggregate to 5m and 15m
-                        if let Some(c5) = aggregator.add_candle(&candle, "5m") {
-                            if let Err(e) = pub_sender.publish_candle(&c5).await {
-                                warn!("Failed to send 5m candle to publisher: {}", e);
+                        for target_timeframe in ["5m", "15m"] {
+                            let can_derive = CandleAggregator::can_aggregate(
+                                &candle.timeframe,
+                                target_timeframe,
+                            );
+                            match can_derive {
+                                Ok(true) if candle.timeframe != target_timeframe => {}
+                                Ok(_) => continue,
+                                Err(e) => {
+                                    warn!(
+                                        "Invalid source/target timeframe pair {} -> {}: {}",
+                                        candle.timeframe, target_timeframe, e
+                                    );
+                                    continue;
+                                }
                             }
-                        }
-
-                        if let Some(c15) = aggregator.add_candle(&candle, "15m") {
-                            if let Err(e) = pub_sender.publish_candle(&c15).await {
-                                warn!("Failed to send 15m candle to publisher: {}", e);
+                            match aggregator.add_candle(&candle, target_timeframe) {
+                                Ok(Some(completed)) => {
+                                    if let Err(e) =
+                                        pub_sender.publish_candle(&completed).await
+                                    {
+                                        warn!(
+                                            "Failed to send {} candle to publisher: {}",
+                                            target_timeframe, e
+                                        );
+                                    }
+                                }
+                                Ok(None) => {}
+                                Err(e) => warn!(
+                                    "Failed to aggregate {} -> {} candle: {}",
+                                    candle.timeframe, target_timeframe, e
+                                ),
                             }
                         }
                     }
@@ -1044,6 +1066,90 @@ mod tests {
             Some(crate::publisher::PublishMessage::Candle(_))
         ));
         drop(candle_tx);
+        assert!(event_loop.await.unwrap().is_ok());
+    }
+
+    #[tokio::test]
+    async fn event_loop_accepts_closed_5m_source_candles() {
+        let (trade_tx, trade_rx) = mpsc::channel(1);
+        let (candle_tx, candle_rx) = mpsc::channel(4);
+        let (user_tx, user_rx) = mpsc::channel(1);
+        let (pub_sender, mut pub_rx) = create_publish_channel(8);
+        drop(trade_tx);
+        drop(user_tx);
+
+        let event_loop = tokio::spawn(run_event_loop(trade_rx, candle_rx, user_rx, pub_sender));
+        for index in 0..4 {
+            candle_tx
+                .send(model::Candlestick {
+                    product_id: "RITHMIC:NQ-202609".to_string(),
+                    timeframe: "5m".to_string(),
+                    timestamp: 1_800_000_000_000 + index * 5 * 60 * 1000,
+                    open: rust_decimal_macros::dec!(100),
+                    high: rust_decimal_macros::dec!(101),
+                    low: rust_decimal_macros::dec!(99),
+                    close: rust_decimal_macros::dec!(100),
+                    volume: rust_decimal_macros::dec!(1),
+                })
+                .await
+                .unwrap();
+        }
+        drop(candle_tx);
+
+        let mut published = Vec::new();
+        while let Some(message) = pub_rx.recv().await {
+            if let crate::publisher::PublishMessage::Candle(candle) = message {
+                published.push(candle);
+            }
+        }
+        assert!(event_loop.await.unwrap().is_ok());
+        assert_eq!(
+            published
+                .iter()
+                .filter(|candle| candle.timeframe == "5m")
+                .count(),
+            4
+        );
+        assert_eq!(
+            published
+                .iter()
+                .filter(|candle| candle.timeframe == "15m")
+                .count(),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn event_loop_preserves_shorter_source_that_cannot_form_5m_exactly() {
+        let (trade_tx, trade_rx) = mpsc::channel(1);
+        let (candle_tx, candle_rx) = mpsc::channel(1);
+        let (user_tx, user_rx) = mpsc::channel(1);
+        let (pub_sender, mut pub_rx) = create_publish_channel(1);
+        drop(trade_tx);
+        drop(user_tx);
+
+        let event_loop = tokio::spawn(run_event_loop(trade_rx, candle_rx, user_rx, pub_sender));
+        candle_tx
+            .send(model::Candlestick {
+                product_id: "RITHMIC:NQ-202609".to_string(),
+                timeframe: "2m".to_string(),
+                timestamp: 1_800_000_000_000,
+                open: rust_decimal_macros::dec!(100),
+                high: rust_decimal_macros::dec!(101),
+                low: rust_decimal_macros::dec!(99),
+                close: rust_decimal_macros::dec!(100),
+                volume: rust_decimal_macros::dec!(1),
+            })
+            .await
+            .unwrap();
+        drop(candle_tx);
+
+        let published = pub_rx.recv().await.expect("source candle should publish");
+        assert!(matches!(
+            published,
+            crate::publisher::PublishMessage::Candle(candle)
+                if candle.timeframe == "2m"
+        ));
         assert!(event_loop.await.unwrap().is_ok());
     }
 }

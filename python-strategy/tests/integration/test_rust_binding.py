@@ -10,7 +10,7 @@ from decimal import Decimal
 
 # Skip entire module if Rust .so is not available
 try:
-    from fluxtrade_core import PyMatchingEngine, Candlestick, Order
+    from fluxtrade_core import CandleAggregator, Candlestick, Order, PyMatchingEngine
     HAS_RUST = True
 except ImportError:
     HAS_RUST = False
@@ -71,6 +71,164 @@ def make_candle(
         close=close,
         volume="100",
     )
+
+
+def make_1m_candle(
+    ts: int,
+    *,
+    open: str,
+    high: str,
+    low: str,
+    close: str,
+    volume: str,
+):
+    return Candlestick(
+        product_id=PRODUCT,
+        timeframe="1m",
+        timestamp=ts,
+        open=open,
+        high=high,
+        low=low,
+        close=close,
+        volume=volume,
+    )
+
+
+# ===========================================================================
+# Candle aggregation
+# ===========================================================================
+class TestCandleAggregation:
+    @pytest.mark.parametrize(
+        ("source_timeframe", "target_timeframe", "expected"),
+        [
+            ("30s", "5m", True),
+            ("1m", "5m", True),
+            ("3m", "15m", True),
+            ("5m", "5m", True),
+            ("5m", "15m", True),
+            ("2m", "5m", False),
+            ("6m", "5m", False),
+            ("6m", "15m", False),
+        ],
+    )
+    def test_support_matrix(self, source_timeframe, target_timeframe, expected):
+        assert (
+            CandleAggregator.can_aggregate(source_timeframe, target_timeframe)
+            is expected
+        )
+
+    def test_aggregates_closed_5m_bucket_with_decimal_values(self):
+        aggregator = CandleAggregator()
+        base = 1_737_583_200_000
+        rows = [
+            ("100", "101", "99", "100.5", "10"),
+            ("100.5", "103", "100", "102", "20"),
+            ("102", "104", "98", "99", "30"),
+            ("99", "100", "97", "98", "40"),
+            ("98", "102", "96", "101", "50"),
+        ]
+        for minute, values in enumerate(rows):
+            assert (
+                aggregator.add_candle(
+                    make_1m_candle(
+                        base + minute * 60_000,
+                        open=values[0],
+                        high=values[1],
+                        low=values[2],
+                        close=values[3],
+                        volume=values[4],
+                    ),
+                    "5m",
+                )
+                is None
+            )
+
+        completed = aggregator.add_candle(
+            make_1m_candle(
+                base + 5 * 60_000,
+                open="101",
+                high="102",
+                low="100",
+                close="101.5",
+                volume="60",
+            ),
+            "5m",
+        )
+
+        assert completed.timestamp == base
+        assert completed.timeframe == "5m"
+        assert completed.open == "100"
+        assert completed.high == "104"
+        assert completed.low == "96"
+        assert completed.close == "101"
+        assert completed.volume == "150"
+
+    def test_aggregates_5m_source_into_closed_15m_bucket(self):
+        aggregator = CandleAggregator()
+        base = 1_737_583_200_000
+        rows = [
+            ("100", "101", "99", "100.5", "10"),
+            ("100.5", "103", "100", "102", "20"),
+            ("102", "104", "98", "99", "30"),
+        ]
+        for index, values in enumerate(rows):
+            candle = make_1m_candle(
+                base + index * 5 * 60_000,
+                open=values[0],
+                high=values[1],
+                low=values[2],
+                close=values[3],
+                volume=values[4],
+            )
+            candle.timeframe = "5m"
+            assert aggregator.add_candle(candle, "15m") is None
+
+        next_candle = make_1m_candle(
+            base + 15 * 60_000,
+            open="99",
+            high="100",
+            low="97",
+            close="98",
+            volume="40",
+        )
+        next_candle.timeframe = "5m"
+        completed = aggregator.add_candle(next_candle, "15m")
+
+        assert completed.timestamp == base
+        assert completed.timeframe == "15m"
+        assert completed.open == "100"
+        assert completed.high == "104"
+        assert completed.low == "98"
+        assert completed.close == "99"
+        assert completed.volume == "60"
+
+    @pytest.mark.parametrize(
+        ("source_timeframe", "target_timeframe"),
+        [
+            ("6m", "5m"),
+            ("1m", ""),
+            ("1m", "0m"),
+            ("1m", "5x"),
+            ("1m", "5分"),
+        ],
+    )
+    def test_rejects_ambiguous_aggregation_inputs(
+        self,
+        source_timeframe,
+        target_timeframe,
+    ):
+        candle = make_1m_candle(
+            1_737_583_200_000,
+            open="100",
+            high="101",
+            low="99",
+            close="100",
+            volume="10",
+        )
+        candle.timeframe = source_timeframe
+
+        with pytest.raises(ValueError):
+            CandleAggregator().add_candle(candle, target_timeframe)
 
 
 # ===========================================================================

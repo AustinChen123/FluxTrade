@@ -1,6 +1,8 @@
 use ::pyo3::prelude::*;
 
+mod aggregator;
 mod binding;
+mod model;
 #[cfg(feature = "rithmic")]
 mod rithmic_ledger;
 
@@ -14,6 +16,7 @@ fn fluxtrade_core(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<binding::models::FillEvent>()?;
     m.add_class::<binding::models::Position>()?;
     m.add_class::<binding::scaled::ScaledCandlestick>()?;
+    m.add_class::<binding::aggregator::PyCandleAggregator>()?;
 
     #[cfg(feature = "rithmic")]
     {
