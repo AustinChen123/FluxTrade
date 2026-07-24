@@ -363,10 +363,12 @@ class GeneRecord(Base):
     strategy_id = Column(String, ForeignKey('strategy.id'), nullable=False)
     role = Column(String(16), nullable=False)
     param_pack = Column(JSONB, nullable=False)
-    # Numeric (Decimal) — float forbidden per project rules.
     score_total = Column(Numeric(18, 8), nullable=False)
     score_breakdown = Column(JSONB, nullable=False)
-    max_drawdown = Column(Numeric(10, 8), nullable=False)
+    # Positive loss magnitude normalized at the parameter-search boundary.
+    max_drawdown = Column(Numeric(18, 8), nullable=False)
+    generation_index = Column(Integer, nullable=False)
+    candidate_id = Column(String(64), nullable=False)
     epoch_id = Column(
         String(64),
         ForeignKey('evolution_epochs.id'),
@@ -385,5 +387,11 @@ class GeneRecord(Base):
         CheckConstraint(
             "role IN ('challenger', 'champion', 'retired')",
             name='chk_gene_role',
+        ),
+        UniqueConstraint(
+            'epoch_id',
+            'generation_index',
+            'candidate_id',
+            name='uq_gene_epoch_generation_candidate',
         ),
     )

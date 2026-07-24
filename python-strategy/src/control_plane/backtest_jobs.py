@@ -99,7 +99,12 @@ class BacktestJobExecutor:
             with self._futures_lock:
                 self._futures.pop(job_id, None)
 
-    def run_backtest_request(self, request: BacktestJobRequest) -> dict[str, Any]:
+    def run_backtest_request(
+        self,
+        request: BacktestJobRequest,
+        *,
+        max_drawdown_limit: float | None = 0.20,
+    ) -> dict[str, Any]:
         data_source = CsvDataSource(
             file_path=request.candles_csv_path,
             product_id=request.product_id,
@@ -121,6 +126,7 @@ class BacktestJobExecutor:
             product_id=request.product_id,
             timeframe=request.timeframe,
             initial_balance=float(request.initial_balance),
+            max_drawdown_limit=max_drawdown_limit,
             data_source=data_source,
             fee_config={
                 "maker": float(request.maker_fee),

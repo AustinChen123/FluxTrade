@@ -66,7 +66,7 @@ def test_gene_record_score_total_is_numeric() -> None:
 def test_gene_record_max_drawdown_is_numeric() -> None:
     col = GeneRecord.__table__.columns["max_drawdown"]
     assert isinstance(col.type, Numeric)
-    assert col.type.precision == 10
+    assert col.type.precision == 18
     assert col.type.scale == 8
 
 
