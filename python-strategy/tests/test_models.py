@@ -246,6 +246,29 @@ class TestSignalModel:
         assert signal.stop_loss == Decimal("41000")
         assert signal.take_profit == Decimal("44000")
 
+    @pytest.mark.parametrize(
+        ("field", "value"),
+        [
+            (field, value)
+            for field in ("stop_loss", "take_profit", "trailing_distance")
+            for value in (
+                Decimal("0"),
+                Decimal("-1"),
+                Decimal("NaN"),
+                Decimal("Infinity"),
+            )
+        ],
+    )
+    def test_signal_rejects_invalid_protection_values(
+        self,
+        signal_factory,
+        field,
+        value,
+    ):
+        with pytest.raises(ValidationError) as exc_info:
+            signal_factory(**{field: value})
+        assert exc_info.value.errors()[0]["loc"] == (field,)
+
     def test_signal_with_metadata(self, signal_factory):
         """Signal should accept metadata dictionary."""
         metadata = {"reason": "golden_cross", "confidence": 0.85}
