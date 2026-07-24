@@ -19,6 +19,10 @@ from src.core.adapters.simulated import SimulatedAdapter
 from src.core.analytics import calculate_metrics
 from src.core.backtest.loader import get_candles_generator
 from src.core.clock import BacktestClock
+from src.core.conditional_order_intents import (
+    conditional_oco_pairs,
+    conditional_order_intents,
+)
 from src.core.db import SessionLocal
 from src.core.interfaces.data_source import IDataSource
 from src.core.models import Candlestick, OrderSide, Signal, SignalType
@@ -165,10 +169,21 @@ class ResearchBacktestRunner:
                         continue
                     if self._exit_without_position(signal, adapter):
                         continue
-                    order = self._order_from_signal(signal, candle, adapter)
-                    if order is not None:
-                        adapter.place_order(order)
-                        self._reserve_entry_capital(signal, order, candle)
+                    entry_order = self._order_from_signal(signal, candle, adapter)
+                    if entry_order is not None:
+                        orders = [
+                            entry_order,
+                            *self._conditional_orders_from_signal(
+                                signal,
+                                entry_order,
+                                candle,
+                            ),
+                        ]
+                        for order in orders:
+                            adapter.validate_order(order)
+                        for order in orders:
+                            adapter.place_order(order)
+                        self._reserve_entry_capital(signal, entry_order, candle)
 
             candle_count += 1
             if (
@@ -509,6 +524,48 @@ class ResearchBacktestRunner:
             if position is not None and position.quantity > 0:
                 return position.quantity
         return Decimal("0.01")
+
+    @staticmethod
+    def _conditional_orders_from_signal(
+        signal: Signal,
+        entry_order: Order,
+        candle: Candlestick,
+    ) -> list[Order]:
+        close_side = (
+            OrderSide.SELL
+            if entry_order.side.lower() == OrderSide.BUY.value
+            else OrderSide.BUY
+        )
+        orders = []
+        intents = conditional_order_intents(signal)
+        for intent in intents:
+            order_id = str(uuid.uuid4())
+            order = Order(
+                id=order_id,
+                exchange_order_id=f"sim_{order_id[:8]}",
+                strategy_id=signal.strategy_id,
+                product_id=signal.product_id,
+                exchange_id=signal.product_id.split(":")[0],
+                type=intent.order_type,
+                side=close_side,
+                price=None,
+                trigger_price=intent.trigger_price,
+                quantity=entry_order.quantity,
+                status="open",
+                timestamp=candle.timestamp,
+                filled_quantity=Decimal("0"),
+                filled_price=Decimal("0"),
+            )
+            if intent.trailing_distance is not None:
+                order._trailing_distance = intent.trailing_distance
+            orders.append(order)
+
+        for first_index, second_index in conditional_oco_pairs(intents):
+            first = orders[first_index]
+            second = orders[second_index]
+            first._linked_order_id = second.id
+            second._linked_order_id = first.id
+        return orders
 
     def _position_for_exit_signal(self, signal: Signal, adapter: SimulatedAdapter):
         position = adapter.get_position(

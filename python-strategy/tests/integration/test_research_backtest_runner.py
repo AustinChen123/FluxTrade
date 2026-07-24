@@ -14,7 +14,7 @@ from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.ext.compiler import compiles
 from sqlalchemy.orm import sessionmaker
 
-from integration.conftest import PRODUCT_ID, TIMEFRAME, make_candle_series
+from integration.conftest import PRODUCT_ID, TIMEFRAME, make_candle, make_candle_series
 from src.core.analytics import calculate_metrics
 from src.core.backtest_runner import BacktestRunner
 from src.core.capital_allocator import CapitalAllocator
@@ -115,6 +115,33 @@ def _signal_factory(
                 quantity=quantity,
             )
         return None
+
+    return predict
+
+
+def _conditional_signal_factory(
+    strategy_id: str,
+    first_timestamp: int,
+    *,
+    entry_type: SignalType,
+    stop_loss: Decimal | None,
+    take_profit: Decimal | None,
+    trailing_distance: Decimal | None,
+):
+    def predict(candle):
+        if candle.timestamp != first_timestamp:
+            return None
+        return Signal(
+            strategy_id=strategy_id,
+            product_id=PRODUCT_ID,
+            timeframe=TIMEFRAME,
+            timestamp=candle.timestamp,
+            type=entry_type,
+            quantity=Decimal("1"),
+            stop_loss=stop_loss,
+            take_profit=take_profit,
+            trailing_distance=trailing_distance,
+        )
 
     return predict
 
@@ -308,6 +335,349 @@ def test_research_backtest_matches_full_runner_core_metrics(
     assert research_result["total_pnl"] == full_result["total_pnl"]
     assert research_result["profit_factor"] == full_result["profit_factor"]
     assert research_result["closed_trades"] == full_closed_trades
+
+
+@pytest.mark.smoke
+@pytest.mark.parametrize(
+    (
+        "entry_type",
+        "stop_loss",
+        "take_profit",
+        "trailing_distance",
+        "gap_open",
+        "high",
+        "low",
+        "expected_exit",
+    ),
+    [
+        (
+            SignalType.LONG,
+            Decimal("90"),
+            None,
+            None,
+            None,
+            Decimal("105"),
+            Decimal("85"),
+            Decimal("90"),
+        ),
+        (
+            SignalType.LONG,
+            None,
+            Decimal("110"),
+            None,
+            None,
+            Decimal("115"),
+            Decimal("95"),
+            Decimal("110"),
+        ),
+        (
+            SignalType.LONG,
+            Decimal("90"),
+            Decimal("110"),
+            None,
+            None,
+            Decimal("115"),
+            Decimal("85"),
+            Decimal("90"),
+        ),
+        (
+            SignalType.LONG,
+            None,
+            None,
+            Decimal("10"),
+            None,
+            Decimal("115"),
+            Decimal("100"),
+            Decimal("105"),
+        ),
+        (
+            SignalType.SHORT,
+            Decimal("110"),
+            None,
+            None,
+            None,
+            Decimal("115"),
+            Decimal("95"),
+            Decimal("110"),
+        ),
+        (
+            SignalType.SHORT,
+            None,
+            Decimal("90"),
+            None,
+            None,
+            Decimal("105"),
+            Decimal("85"),
+            Decimal("90"),
+        ),
+        (
+            SignalType.SHORT,
+            Decimal("110"),
+            Decimal("90"),
+            None,
+            None,
+            Decimal("115"),
+            Decimal("85"),
+            Decimal("110"),
+        ),
+        (
+            SignalType.SHORT,
+            None,
+            None,
+            Decimal("10"),
+            None,
+            Decimal("100"),
+            Decimal("85"),
+            Decimal("95"),
+        ),
+        (
+            SignalType.LONG,
+            Decimal("90"),
+            None,
+            None,
+            Decimal("80"),
+            Decimal("100"),
+            Decimal("75"),
+            Decimal("80"),
+        ),
+        (
+            SignalType.SHORT,
+            Decimal("110"),
+            None,
+            None,
+            Decimal("120"),
+            Decimal("125"),
+            Decimal("100"),
+            Decimal("120"),
+        ),
+    ],
+    ids=[
+        "long-stop-loss",
+        "long-take-profit",
+        "long-both-worst-case",
+        "long-trailing",
+        "short-stop-loss",
+        "short-take-profit",
+        "short-both-worst-case",
+        "short-trailing",
+        "long-stop-loss-gap-through",
+        "short-stop-loss-gap-through",
+    ],
+)
+def test_research_backtest_matches_full_runner_conditional_orders(
+    tmp_path,
+    entry_type,
+    stop_loss,
+    take_profit,
+    trailing_distance,
+    gap_open,
+    high,
+    low,
+    expected_exit,
+):
+    start = 1_700_000_000_000
+    candles = [
+        make_candle(
+            start,
+            Decimal("100"),
+            Decimal("101"),
+            Decimal("99"),
+            Decimal("100"),
+        )
+    ]
+    if gap_open is not None:
+        candles.append(
+            make_candle(
+                start + INTERVAL_MS,
+                Decimal("100"),
+                Decimal("105"),
+                Decimal("95"),
+                Decimal("100"),
+            )
+        )
+    candles.append(
+        make_candle(
+            start + len(candles) * INTERVAL_MS,
+            gap_open or Decimal("100"),
+            high,
+            low,
+            Decimal("100"),
+        )
+    )
+    session_factory = _sqlite_backtest_session_factory(tmp_path)
+    fee_config = {
+        "maker": Decimal("0.0002"),
+        "taker": Decimal("0.0006"),
+    }
+    signal_factory = _conditional_signal_factory(
+        "conditional_parity",
+        candles[0].timestamp,
+        entry_type=entry_type,
+        stop_loss=stop_loss,
+        take_profit=take_profit,
+        trailing_distance=trailing_distance,
+    )
+
+    full_runner = BacktestRunner(
+        start_time=candles[0].timestamp,
+        end_time=candles[-1].timestamp,
+        product_id=PRODUCT_ID,
+        timeframe=TIMEFRAME,
+        initial_balance=10_000,
+        max_drawdown_limit=None,
+        data_source=MemoryDataSource(candles),
+        fee_config=fee_config,
+        report_config={
+            "csv_trades": False,
+            "markdown_report": False,
+            "equity_curve": False,
+            "journal_export": False,
+        },
+        db_session_factory=session_factory,
+    )
+    full_runner.add_strategy(
+        CallableStrategy(
+            "conditional_parity",
+            signal_factory,
+            PRODUCT_ID,
+            TIMEFRAME,
+        )
+    )
+    research_runner = ResearchBacktestRunner(
+        start_time=candles[0].timestamp,
+        end_time=candles[-1].timestamp,
+        product_id=PRODUCT_ID,
+        timeframe=TIMEFRAME,
+        initial_balance=10_000,
+        data_source=MemoryDataSource(candles),
+        fee_config=fee_config,
+    )
+    research_runner.add_strategy(
+        CallableStrategy(
+            "conditional_parity",
+            signal_factory,
+            PRODUCT_ID,
+            TIMEFRAME,
+        )
+    )
+
+    full_result = full_runner.run()
+    research_result = research_runner.run()
+
+    with session_factory() as session:
+        full_trades = session.scalars(select(BacktestTradeLog)).all()
+    full_closed_trades = calculate_metrics(full_trades)["closed_trades"]
+
+    assert full_result["candle_count"] == research_result["candle_count"] == len(candles)
+    assert full_result["total_trades"] == research_result["total_trades"] == 1
+    assert full_result["total_pnl"] == research_result["total_pnl"]
+    assert research_result["closed_trades"] == full_closed_trades
+    assert research_result["closed_trades"][0].exit_price == expected_exit
+
+
+@pytest.mark.smoke
+def test_conditional_orders_do_not_survive_explicit_exit_or_repeated_entry(
+    tmp_path,
+):
+    start = 1_700_000_000_000
+    candles = [
+        make_candle(
+            start + index * INTERVAL_MS,
+            Decimal("100"),
+            Decimal("115") if index == 4 else Decimal("101"),
+            Decimal("85") if index == 4 else Decimal("99"),
+            Decimal("100"),
+        )
+        for index in range(5)
+    ]
+
+    def predict(candle):
+        index = (candle.timestamp - start) // INTERVAL_MS
+        if index in {0, 3}:
+            return Signal(
+                strategy_id="conditional_cycles",
+                product_id=PRODUCT_ID,
+                timeframe=TIMEFRAME,
+                timestamp=candle.timestamp,
+                type=SignalType.LONG,
+                quantity=Decimal("1"),
+                stop_loss=Decimal("90"),
+                take_profit=Decimal("110"),
+            )
+        if index == 2:
+            return Signal(
+                strategy_id="conditional_cycles",
+                product_id=PRODUCT_ID,
+                timeframe=TIMEFRAME,
+                timestamp=candle.timestamp,
+                type=SignalType.EXIT_LONG,
+                quantity=Decimal("1"),
+            )
+        return None
+
+    session_factory = _sqlite_backtest_session_factory(tmp_path)
+    fee_config = {
+        "maker": Decimal("0.0002"),
+        "taker": Decimal("0.0006"),
+    }
+    full_runner = BacktestRunner(
+        start_time=candles[0].timestamp,
+        end_time=candles[-1].timestamp,
+        product_id=PRODUCT_ID,
+        timeframe=TIMEFRAME,
+        initial_balance=10_000,
+        max_drawdown_limit=None,
+        data_source=MemoryDataSource(candles),
+        fee_config=fee_config,
+        report_config={
+            "csv_trades": False,
+            "markdown_report": False,
+            "equity_curve": False,
+            "journal_export": False,
+        },
+        db_session_factory=session_factory,
+    )
+    full_runner.add_strategy(
+        CallableStrategy(
+            "conditional_cycles",
+            predict,
+            PRODUCT_ID,
+            TIMEFRAME,
+        )
+    )
+    research_runner = ResearchBacktestRunner(
+        start_time=candles[0].timestamp,
+        end_time=candles[-1].timestamp,
+        product_id=PRODUCT_ID,
+        timeframe=TIMEFRAME,
+        initial_balance=10_000,
+        data_source=MemoryDataSource(candles),
+        fee_config=fee_config,
+    )
+    research_runner.add_strategy(
+        CallableStrategy(
+            "conditional_cycles",
+            predict,
+            PRODUCT_ID,
+            TIMEFRAME,
+        )
+    )
+
+    full_result = full_runner.run()
+    research_result = research_runner.run()
+
+    with session_factory() as session:
+        full_trades = session.scalars(select(BacktestTradeLog)).all()
+    full_closed_trades = calculate_metrics(full_trades)["closed_trades"]
+
+    assert full_result["total_trades"] == research_result["total_trades"] == 2
+    assert research_result["raw_trade_count"] == 4
+    assert [trade.exit_price for trade in full_closed_trades] == [
+        Decimal("100"),
+        Decimal("90"),
+    ]
+    assert research_result["closed_trades"] == full_closed_trades
+    assert research_result["total_pnl"] == full_result["total_pnl"]
 
 
 def test_research_backtest_syncs_capital_lifecycle_after_fills():

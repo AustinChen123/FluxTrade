@@ -136,6 +136,13 @@ class Signal(BaseFluxModel):
     def validate_product_id(cls, v: str) -> str:
         return validate_product_id(v)
 
+    @field_validator("stop_loss", "take_profit", "trailing_distance")
+    @classmethod
+    def validate_protection_value(cls, value: Decimal | None) -> Decimal | None:
+        if value is not None and (not value.is_finite() or value <= 0):
+            raise ValueError("protection value must be finite and greater than zero")
+        return value
+
 class Position(BaseFluxModel):
     strategy_id: str
     product_id: str

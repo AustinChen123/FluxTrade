@@ -1,6 +1,6 @@
 use ::pyo3::prelude::*;
 use rust_decimal::Decimal;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::str::FromStr;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -23,6 +23,14 @@ impl FeeModel {
 
 use crate::binding::models::{Candlestick, FillEvent, Order, Position};
 use crate::binding::scaled::ScaledCandlestick;
+
+struct ExitCandidate {
+    order: Order,
+    fill_price: Decimal,
+    fee: Decimal,
+    position_key: String,
+    protected_side: String,
+}
 
 #[pyclass]
 pub struct PyMatchingEngine {
@@ -151,12 +159,10 @@ impl PyMatchingEngine {
         let mut fills: Vec<FillEvent> = Vec::new();
         let mut remaining_orders: Vec<Order> = Vec::new();
         // Collect IDs of orders cancelled by OCO during this candle
-        let mut cancelled_ids: std::collections::HashSet<String> = std::collections::HashSet::new();
+        let mut cancelled_ids: HashSet<String> = HashSet::new();
+        let mut closed_position_sides: HashMap<String, String> = HashMap::new();
 
-        // Update trailing stops before matching
-        self.update_trailing_stops(&candle);
-
-        // Partition orders by type for priority: Market > SL/TP/Trailing > Limit
+        // Entry/exit orders establish the position state that protections act on.
         let mut market_orders: Vec<Order> = Vec::new();
         let mut conditional_orders: Vec<Order> = Vec::new();
         let mut limit_orders: Vec<Order> = Vec::new();
@@ -169,6 +175,7 @@ impl PyMatchingEngine {
                 _ => remaining_orders.push(order),
             }
         }
+        conditional_orders.sort_by_key(Self::conditional_priority);
 
         // 1. Process Market Orders (taker fee, fill at open)
         for order in market_orders {
@@ -200,8 +207,38 @@ impl PyMatchingEngine {
             fills.push(fill);
         }
 
-        // 2. Process Conditional Orders (SL/TP/Trailing — taker fee)
-        for order in conditional_orders {
+        let (closing_limit_orders, opening_limit_orders): (Vec<_>, Vec<_>) = limit_orders
+            .into_iter()
+            .partition(|order| self.reduces_current_position(order));
+
+        // 2. Fill entries before evaluating their protection on the same candle.
+        for order in opening_limit_orders {
+            if cancelled_ids.contains(&order.id) {
+                continue;
+            }
+            if let Some(order) =
+                self.match_limit_order(order, &candle, &mut fills, &mut cancelled_ids)
+            {
+                remaining_orders.push(order);
+            }
+        }
+
+        let pending_entries: HashSet<(String, String, String)> = remaining_orders
+            .iter()
+            .filter(|order| matches!(order.order_type.as_str(), "MARKET" | "LIMIT"))
+            .map(|order| {
+                (
+                    order.strategy_id.clone(),
+                    order.product_id.clone(),
+                    order.side.clone(),
+                )
+            })
+            .collect();
+        let mut selected_exit_candidates: Vec<ExitCandidate> = Vec::new();
+        let mut selected_exit_indexes: HashMap<String, usize> = HashMap::new();
+
+        // 3. Evaluate conditional exits without mutating the position.
+        for mut order in conditional_orders {
             if cancelled_ids.contains(&order.id) {
                 continue;
             }
@@ -210,92 +247,237 @@ impl PyMatchingEngine {
                 continue;
             }
 
-            let trigger = match self.check_conditional_trigger(&order, &candle) {
+            let position_key = Self::position_key(&order.strategy_id, &order.product_id);
+            let Some(protected_side) = self
+                .positions
+                .get(&position_key)
+                .filter(|position| position.side == order.side && position.quantity > Decimal::ZERO)
+                .map(|position| position.side.clone())
+            else {
+                let protects_pending_entry = pending_entries.contains(&(
+                    order.strategy_id.clone(),
+                    order.product_id.clone(),
+                    order.side.clone(),
+                ));
+                if protects_pending_entry {
+                    remaining_orders.push(order);
+                }
+                continue;
+            };
+
+            let fill_price = match self.check_conditional_trigger(&mut order, &candle) {
                 Some(price) => price,
                 None => {
                     remaining_orders.push(order);
                     continue;
                 }
             };
-
-            let fee = self.calculate_fee(trigger, order.quantity, true);
-            let fill = FillEvent {
-                order_id: order.id.clone(),
-                product_id: order.product_id.clone(),
-                strategy_id: order.strategy_id.clone(),
-                price: trigger,
-                quantity: order.quantity,
-                fee,
-                timestamp: candle.timestamp,
-                fill_type: order.order_type.clone(),
-            };
-            self.update_position(&order, trigger);
-            let fee = std::cmp::min(fee, self.balance);
-            self.balance -= fee;
-            self.cancel_linked(&order, &mut cancelled_ids);
-            fills.push(fill);
+            let fee = self.calculate_fee(fill_price, order.quantity, true);
+            Self::consider_exit_candidate(
+                ExitCandidate {
+                    order,
+                    fill_price,
+                    fee,
+                    position_key,
+                    protected_side,
+                },
+                &mut selected_exit_candidates,
+                &mut selected_exit_indexes,
+                &mut remaining_orders,
+            );
         }
 
-        // 3. Process Limit Orders (maker fee)
-        for order in limit_orders {
+        // 4. Compare reachable explicit limit exits against protections.
+        for order in closing_limit_orders {
             if cancelled_ids.contains(&order.id) {
                 continue;
             }
-            if order.product_id != candle.product_id {
+            if order.product_id != candle.product_id || !Self::limit_order_matches(&order, &candle)
+            {
                 remaining_orders.push(order);
                 continue;
             }
-
-            let matched = if order.side == "LONG" {
-                candle.low <= order.price
-            } else {
-                candle.high >= order.price
-            };
-
-            if matched {
-                let fee = self.calculate_fee(order.price, order.quantity, false);
-                let fill = FillEvent {
-                    order_id: order.id.clone(),
-                    product_id: order.product_id.clone(),
-                    strategy_id: order.strategy_id.clone(),
-                    price: order.price,
-                    quantity: order.quantity,
-                    fee,
-                    timestamp: candle.timestamp,
-                    fill_type: "LIMIT".to_string(),
-                };
-                self.update_position(&order, order.price);
-                let fee = std::cmp::min(fee, self.balance);
-                self.balance -= fee;
-                self.cancel_linked(&order, &mut cancelled_ids);
-                fills.push(fill);
-            } else {
+            let position_key = Self::position_key(&order.strategy_id, &order.product_id);
+            let Some(protected_side) = self
+                .positions
+                .get(&position_key)
+                .filter(|position| position.quantity > Decimal::ZERO && position.side != order.side)
+                .map(|position| position.side.clone())
+            else {
                 remaining_orders.push(order);
-            }
+                continue;
+            };
+            let fill_price = order.price;
+            let fee = self.calculate_fee(fill_price, order.quantity, false);
+            Self::consider_exit_candidate(
+                ExitCandidate {
+                    order,
+                    fill_price,
+                    fee,
+                    position_key,
+                    protected_side,
+                },
+                &mut selected_exit_candidates,
+                &mut selected_exit_indexes,
+                &mut remaining_orders,
+            );
         }
 
-        // Filter out cancelled orders from remaining
-        remaining_orders.retain(|o| !cancelled_ids.contains(&o.id));
+        for candidate in selected_exit_candidates {
+            fills.push(FillEvent {
+                order_id: candidate.order.id.clone(),
+                product_id: candidate.order.product_id.clone(),
+                strategy_id: candidate.order.strategy_id.clone(),
+                price: candidate.fill_price,
+                quantity: candidate.order.quantity,
+                fee: candidate.fee,
+                timestamp: candle.timestamp,
+                fill_type: candidate.order.order_type.clone(),
+            });
+            self.update_position(&candidate.order, candidate.fill_price);
+            let still_protected_position =
+                self.positions
+                    .get(&candidate.position_key)
+                    .is_some_and(|position| {
+                        position.side == candidate.protected_side
+                            && position.quantity > Decimal::ZERO
+                    });
+            if !still_protected_position {
+                closed_position_sides.insert(candidate.position_key, candidate.protected_side);
+            }
+            let charged_fee = std::cmp::min(candidate.fee, self.balance);
+            self.balance -= charged_fee;
+            self.cancel_linked(&candidate.order, &mut cancelled_ids);
+        }
+
+        remaining_orders.retain(|order| {
+            if cancelled_ids.contains(&order.id) {
+                return false;
+            }
+            let position_key = Self::position_key(&order.strategy_id, &order.product_id);
+            if matches!(
+                order.order_type.as_str(),
+                "STOP_LOSS" | "TAKE_PROFIT" | "TRAILING_STOP"
+            ) {
+                let protects_current_position =
+                    self.positions.get(&position_key).is_some_and(|position| {
+                        position.side == order.side && position.quantity > Decimal::ZERO
+                    });
+                let protects_pending_entry = pending_entries.contains(&(
+                    order.strategy_id.clone(),
+                    order.product_id.clone(),
+                    order.side.clone(),
+                ));
+                return protects_current_position || protects_pending_entry;
+            }
+            match closed_position_sides.get(&position_key) {
+                Some(protected_side) if matches!(order.order_type.as_str(), "MARKET" | "LIMIT") => {
+                    order.side == *protected_side
+                }
+                _ => true,
+            }
+        });
         self.open_orders = remaining_orders;
         Ok(fills)
     }
 
-    /// Check if a conditional order triggers on this candle.
-    /// Returns the fill price if triggered, None otherwise.
-    fn check_conditional_trigger(&self, order: &Order, candle: &Candlestick) -> Option<Decimal> {
-        let trigger_price = order.trigger_price.unwrap_or(order.price);
+    fn consider_exit_candidate(
+        candidate: ExitCandidate,
+        selected: &mut Vec<ExitCandidate>,
+        indexes: &mut HashMap<String, usize>,
+        remaining_orders: &mut Vec<Order>,
+    ) {
+        let Some(index) = indexes.get(&candidate.position_key).copied() else {
+            indexes.insert(candidate.position_key.clone(), selected.len());
+            selected.push(candidate);
+            return;
+        };
+        if Self::candidate_is_worse(&candidate, &selected[index]) {
+            let previous = std::mem::replace(&mut selected[index], candidate);
+            remaining_orders.push(previous.order);
+        } else {
+            remaining_orders.push(candidate.order);
+        }
+    }
 
+    fn candidate_is_worse(candidate: &ExitCandidate, current: &ExitCandidate) -> bool {
+        let worse_price = if candidate.protected_side == "LONG" {
+            candidate.fill_price < current.fill_price
+        } else {
+            candidate.fill_price > current.fill_price
+        };
+        worse_price || (candidate.fill_price == current.fill_price && candidate.fee > current.fee)
+    }
+
+    fn reduces_current_position(&self, order: &Order) -> bool {
+        let position_key = Self::position_key(&order.strategy_id, &order.product_id);
+        self.positions.get(&position_key).is_some_and(|position| {
+            position.quantity > Decimal::ZERO && position.side != order.side
+        })
+    }
+
+    fn match_limit_order(
+        &mut self,
+        order: Order,
+        candle: &Candlestick,
+        fills: &mut Vec<FillEvent>,
+        cancelled_ids: &mut HashSet<String>,
+    ) -> Option<Order> {
+        if order.product_id != candle.product_id {
+            return Some(order);
+        }
+        if !Self::limit_order_matches(&order, candle) {
+            return Some(order);
+        }
+
+        let fee = self.calculate_fee(order.price, order.quantity, false);
+        fills.push(FillEvent {
+            order_id: order.id.clone(),
+            product_id: order.product_id.clone(),
+            strategy_id: order.strategy_id.clone(),
+            price: order.price,
+            quantity: order.quantity,
+            fee,
+            timestamp: candle.timestamp,
+            fill_type: "LIMIT".to_string(),
+        });
+        self.update_position(&order, order.price);
+        let charged_fee = std::cmp::min(fee, self.balance);
+        self.balance -= charged_fee;
+        self.cancel_linked(&order, cancelled_ids);
+        None
+    }
+
+    fn limit_order_matches(order: &Order, candle: &Candlestick) -> bool {
+        if order.side == "LONG" {
+            candle.low <= order.price
+        } else {
+            candle.high >= order.price
+        }
+    }
+
+    /// Lower values execute first when multiple conditional legs touch in one bar.
+    fn conditional_priority(order: &Order) -> u8 {
+        match order.order_type.as_str() {
+            "STOP_LOSS" => 0,
+            "TRAILING_STOP" => 1,
+            "TAKE_PROFIT" => 2,
+            _ => 3,
+        }
+    }
+
+    fn check_conditional_trigger(
+        &self,
+        order: &mut Order,
+        candle: &Candlestick,
+    ) -> Option<Decimal> {
         match order.order_type.as_str() {
             "STOP_LOSS" => {
-                if order.side == "LONG" {
-                    if candle.low <= trigger_price {
-                        return Some(trigger_price);
-                    }
-                } else if candle.high >= trigger_price {
-                    return Some(trigger_price);
-                }
+                let trigger_price = order.trigger_price.unwrap_or(order.price);
+                return Self::stop_trigger_fill(&order.side, trigger_price, candle);
             }
             "TAKE_PROFIT" => {
+                let trigger_price = order.trigger_price.unwrap_or(order.price);
                 if order.side == "LONG" {
                     if candle.high >= trigger_price {
                         return Some(trigger_price);
@@ -305,41 +487,78 @@ impl PyMatchingEngine {
                 }
             }
             "TRAILING_STOP" => {
-                if order.side == "LONG" {
-                    if candle.low <= trigger_price {
-                        return Some(trigger_price);
+                if let Some(trigger_price) = order.trigger_price {
+                    if let Some(fill_price) =
+                        Self::stop_trigger_fill(&order.side, trigger_price, candle)
+                    {
+                        return Some(fill_price);
                     }
-                } else if candle.high >= trigger_price {
-                    return Some(trigger_price);
                 }
+                Self::update_trailing_stop(order, candle);
+                let updated_trigger = order.trigger_price?;
+                return Self::intrabar_stop_trigger(&order.side, updated_trigger, candle);
             }
             _ => {}
         }
         None
     }
 
-    /// Update trailing stop trigger prices based on candle high/low.
-    fn update_trailing_stops(&mut self, candle: &Candlestick) {
-        for order in &mut self.open_orders {
-            if order.order_type != "TRAILING_STOP" || order.product_id != candle.product_id {
-                continue;
+    fn stop_trigger_fill(
+        side: &str,
+        trigger_price: Decimal,
+        candle: &Candlestick,
+    ) -> Option<Decimal> {
+        if side == "LONG" {
+            if candle.open <= trigger_price {
+                return Some(candle.open);
             }
-            let distance = match order.trailing_distance {
-                Some(d) => d,
-                None => continue,
-            };
-            let current_trigger = order.trigger_price.unwrap_or(order.price);
+            if candle.low <= trigger_price {
+                return Some(trigger_price);
+            }
+        } else {
+            if candle.open >= trigger_price {
+                return Some(candle.open);
+            }
+            if candle.high >= trigger_price {
+                return Some(trigger_price);
+            }
+        }
+        None
+    }
 
-            if order.side == "LONG" {
-                let new_trigger = candle.high - distance;
-                if new_trigger > current_trigger {
-                    order.trigger_price = Some(new_trigger);
-                }
-            } else {
-                let new_trigger = candle.low + distance;
-                if new_trigger < current_trigger {
-                    order.trigger_price = Some(new_trigger);
-                }
+    fn intrabar_stop_trigger(
+        side: &str,
+        trigger_price: Decimal,
+        candle: &Candlestick,
+    ) -> Option<Decimal> {
+        if (side == "LONG" && candle.low <= trigger_price)
+            || (side == "SHORT" && candle.high >= trigger_price)
+        {
+            return Some(trigger_price);
+        }
+        None
+    }
+
+    fn update_trailing_stop(order: &mut Order, candle: &Candlestick) {
+        let distance = match order.trailing_distance {
+            Some(d) => d,
+            None => return,
+        };
+        if order.side == "LONG" {
+            let new_trigger = candle.high - distance;
+            if order
+                .trigger_price
+                .is_none_or(|current_trigger| new_trigger > current_trigger)
+            {
+                order.trigger_price = Some(new_trigger);
+            }
+        } else {
+            let new_trigger = candle.low + distance;
+            if order
+                .trigger_price
+                .is_none_or(|current_trigger| new_trigger < current_trigger)
+            {
+                order.trigger_price = Some(new_trigger);
             }
         }
     }
@@ -754,6 +973,47 @@ mod tests {
         assert_eq!(fills[0].fee, expected_fee);
     }
 
+    #[test]
+    fn test_limit_entry_activates_protection_on_same_candle() {
+        let mut engine = make_engine(dec!(100000));
+        let entry = make_order("entry", "LONG", "LIMIT", dec!(100), dec!(1));
+        let mut stop = make_order("stop", "LONG", "STOP_LOSS", Decimal::ZERO, dec!(1));
+        stop.trigger_price = Some(dec!(90));
+        stop.linked_order_id = Some("take_profit".to_string());
+        let mut take_profit =
+            make_order("take_profit", "LONG", "TAKE_PROFIT", Decimal::ZERO, dec!(1));
+        take_profit.trigger_price = Some(dec!(110));
+        take_profit.linked_order_id = Some("stop".to_string());
+        engine.open_orders.extend([entry, stop, take_profit]);
+
+        let fills = engine
+            .process_candle_logic(make_candle(dec!(105), dec!(115), dec!(85), dec!(100)))
+            .unwrap();
+
+        assert_eq!(fills.len(), 2);
+        assert_eq!(fills[0].fill_type, "LIMIT");
+        assert_eq!(fills[1].fill_type, "STOP_LOSS");
+        assert!(engine.positions.is_empty());
+        assert!(engine.open_orders.is_empty());
+    }
+
+    #[test]
+    fn test_unfilled_limit_entry_keeps_protection_pending() {
+        let mut engine = make_engine(dec!(100000));
+        let entry = make_order("entry", "LONG", "LIMIT", dec!(90), dec!(1));
+        let mut take_profit =
+            make_order("take_profit", "LONG", "TAKE_PROFIT", Decimal::ZERO, dec!(1));
+        take_profit.trigger_price = Some(dec!(110));
+        engine.open_orders.extend([entry, take_profit]);
+
+        let fills = engine
+            .process_candle_logic(make_candle(dec!(100), dec!(115), dec!(95), dec!(105)))
+            .unwrap();
+
+        assert!(fills.is_empty());
+        assert_eq!(engine.open_orders.len(), 2);
+    }
+
     // ── Stop Loss ──
 
     #[test]
@@ -947,7 +1207,7 @@ mod tests {
 
         // high=49500 → new_trigger = 49500 - 1000 = 48500 < 49000 → should NOT move down
         let c = make_candle(dec!(49000), dec!(49500), dec!(48800), dec!(49200));
-        engine.update_trailing_stops(&c);
+        PyMatchingEngine::update_trailing_stop(&mut engine.open_orders[0], &c);
 
         assert_eq!(engine.open_orders[0].trigger_price.unwrap(), dec!(49000));
     }
@@ -1006,6 +1266,378 @@ mod tests {
         assert_eq!(fills.len(), 1);
         assert_eq!(fills[0].order_id, "tp_oco2");
         assert!(engine.open_orders.is_empty());
+    }
+
+    #[test]
+    fn test_oco_trigger_matrix_uses_worst_case_fill() {
+        let cases = [
+            ("LONG", dec!(50500), dec!(49500), None),
+            ("LONG", dec!(50500), dec!(48500), Some("STOP_LOSS")),
+            ("LONG", dec!(51500), dec!(49500), Some("TAKE_PROFIT")),
+            ("LONG", dec!(51500), dec!(48500), Some("STOP_LOSS")),
+            ("SHORT", dec!(50500), dec!(49500), None),
+            ("SHORT", dec!(51500), dec!(49500), Some("STOP_LOSS")),
+            ("SHORT", dec!(50500), dec!(48500), Some("TAKE_PROFIT")),
+            ("SHORT", dec!(51500), dec!(48500), Some("STOP_LOSS")),
+        ];
+
+        for (side, high, low, expected_fill_type) in cases {
+            for reverse_submission_order in [false, true] {
+                let mut engine = make_engine(dec!(100000));
+                engine.positions.insert(
+                    pos_key(STRATEGY, PRODUCT),
+                    make_position(PRODUCT, STRATEGY, side, dec!(1), dec!(50000)),
+                );
+
+                let (sl_trigger, tp_trigger) = if side == "LONG" {
+                    (dec!(49000), dec!(51000))
+                } else {
+                    (dec!(51000), dec!(49000))
+                };
+                let mut sl = make_order("matrix_sl", side, "STOP_LOSS", Decimal::ZERO, dec!(1));
+                sl.trigger_price = Some(sl_trigger);
+                sl.linked_order_id = Some("matrix_tp".to_string());
+                let mut tp = make_order("matrix_tp", side, "TAKE_PROFIT", Decimal::ZERO, dec!(1));
+                tp.trigger_price = Some(tp_trigger);
+                tp.linked_order_id = Some("matrix_sl".to_string());
+
+                if reverse_submission_order {
+                    engine.open_orders.extend([tp, sl]);
+                } else {
+                    engine.open_orders.extend([sl, tp]);
+                }
+
+                let candle = make_candle(dec!(50000), high, low, dec!(50000));
+                let fills = engine.process_candle_logic(candle).unwrap();
+
+                match expected_fill_type {
+                    Some(expected) => {
+                        assert_eq!(fills.len(), 1, "side={side} high={high} low={low}");
+                        assert_eq!(fills[0].fill_type, expected);
+                        assert!(engine.open_orders.is_empty());
+                    }
+                    None => {
+                        assert!(fills.is_empty(), "side={side} high={high} low={low}");
+                        assert_eq!(engine.open_orders.len(), 2);
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn test_stop_loss_gap_uses_worse_open_price() {
+        let cases = [
+            ("LONG", dec!(49000), dec!(48000), dec!(50000), dec!(47000)),
+            ("SHORT", dec!(51000), dec!(52000), dec!(53000), dec!(50000)),
+        ];
+
+        for (side, trigger, open, high, low) in cases {
+            let mut engine = make_engine(dec!(100000));
+            engine.positions.insert(
+                pos_key(STRATEGY, PRODUCT),
+                make_position(PRODUCT, STRATEGY, side, dec!(1), dec!(50000)),
+            );
+            let mut stop = make_order("gap_sl", side, "STOP_LOSS", Decimal::ZERO, dec!(1));
+            stop.trigger_price = Some(trigger);
+            engine.open_orders.push(stop);
+
+            let fills = engine
+                .process_candle_logic(make_candle(open, high, low, open))
+                .unwrap();
+
+            assert_eq!(fills.len(), 1);
+            assert_eq!(fills[0].price, open);
+        }
+    }
+
+    #[test]
+    fn test_market_exit_discards_protection_before_it_can_reopen_position() {
+        let mut engine = make_engine(dec!(100000));
+        engine.positions.insert(
+            pos_key(STRATEGY, PRODUCT),
+            make_position(PRODUCT, STRATEGY, "LONG", dec!(1), dec!(100)),
+        );
+        let exit = make_order("exit", "SHORT", "MARKET", Decimal::ZERO, dec!(1));
+        let mut stop = make_order("stop", "LONG", "STOP_LOSS", Decimal::ZERO, dec!(1));
+        stop.trigger_price = Some(dec!(90));
+        stop.linked_order_id = Some("take_profit".to_string());
+        let mut take_profit =
+            make_order("take_profit", "LONG", "TAKE_PROFIT", Decimal::ZERO, dec!(1));
+        take_profit.trigger_price = Some(dec!(110));
+        take_profit.linked_order_id = Some("stop".to_string());
+        engine.open_orders.extend([stop, take_profit, exit]);
+
+        let fills = engine
+            .process_candle_logic(make_candle(dec!(100), dec!(115), dec!(85), dec!(100)))
+            .unwrap();
+
+        assert_eq!(fills.len(), 1);
+        assert_eq!(fills[0].fill_type, "MARKET");
+        assert!(engine.positions.is_empty());
+        assert!(engine.open_orders.is_empty());
+    }
+
+    #[test]
+    fn test_worst_exit_candidate_matrix() {
+        let cases = [
+            (
+                "LONG",
+                "STOP_LOSS",
+                dec!(90),
+                dec!(105),
+                "STOP_LOSS",
+                dec!(90),
+            ),
+            (
+                "LONG",
+                "TAKE_PROFIT",
+                dec!(110),
+                dec!(105),
+                "LIMIT",
+                dec!(105),
+            ),
+            (
+                "LONG",
+                "TRAILING_STOP",
+                dec!(90),
+                dec!(105),
+                "TRAILING_STOP",
+                dec!(90),
+            ),
+            (
+                "LONG",
+                "TRAILING_STOP",
+                dec!(110),
+                dec!(95),
+                "LIMIT",
+                dec!(95),
+            ),
+            (
+                "SHORT",
+                "STOP_LOSS",
+                dec!(110),
+                dec!(95),
+                "STOP_LOSS",
+                dec!(110),
+            ),
+            (
+                "SHORT",
+                "TAKE_PROFIT",
+                dec!(90),
+                dec!(95),
+                "LIMIT",
+                dec!(95),
+            ),
+            (
+                "SHORT",
+                "TRAILING_STOP",
+                dec!(110),
+                dec!(95),
+                "TRAILING_STOP",
+                dec!(110),
+            ),
+            (
+                "SHORT",
+                "TRAILING_STOP",
+                dec!(90),
+                dec!(105),
+                "LIMIT",
+                dec!(105),
+            ),
+            (
+                "LONG",
+                "TAKE_PROFIT",
+                dec!(105),
+                dec!(105),
+                "TAKE_PROFIT",
+                dec!(105),
+            ),
+        ];
+
+        for (position_side, protection_type, trigger, limit_price, expected_type, expected_price) in
+            cases
+        {
+            let mut engine = make_engine(dec!(100000));
+            engine.positions.insert(
+                pos_key(STRATEGY, PRODUCT),
+                make_position(PRODUCT, STRATEGY, position_side, dec!(1), dec!(100)),
+            );
+            let exit_side = if position_side == "LONG" {
+                "SHORT"
+            } else {
+                "LONG"
+            };
+            let exit = make_order("exit", exit_side, "LIMIT", limit_price, dec!(1));
+            let mut protection = make_order(
+                "protection",
+                position_side,
+                protection_type,
+                Decimal::ZERO,
+                dec!(1),
+            );
+            protection.trigger_price = Some(trigger);
+            if protection_type == "TRAILING_STOP" {
+                protection.trailing_distance = Some(dec!(10));
+            }
+            engine.open_orders.extend([exit, protection]);
+
+            let fills = engine
+                .process_candle_logic(make_candle(dec!(100), dec!(115), dec!(85), dec!(100)))
+                .unwrap();
+
+            assert_eq!(
+                fills.len(),
+                1,
+                "side={position_side} type={protection_type}"
+            );
+            assert_eq!(fills[0].fill_type, expected_type);
+            assert_eq!(fills[0].price, expected_price);
+            assert!(engine.positions.is_empty());
+            assert!(engine.open_orders.is_empty());
+        }
+    }
+
+    #[test]
+    fn test_filled_limit_exit_discards_untouched_protection() {
+        let mut engine = make_engine(dec!(100000));
+        engine.positions.insert(
+            pos_key(STRATEGY, PRODUCT),
+            make_position(PRODUCT, STRATEGY, "LONG", dec!(1), dec!(100)),
+        );
+        let exit = make_order("exit", "SHORT", "LIMIT", dec!(110), dec!(1));
+        let mut stop = make_order("stop", "LONG", "STOP_LOSS", Decimal::ZERO, dec!(1));
+        stop.trigger_price = Some(dec!(90));
+        engine.open_orders.extend([exit, stop]);
+
+        let fills = engine
+            .process_candle_logic(make_candle(dec!(100), dec!(115), dec!(95), dec!(110)))
+            .unwrap();
+
+        assert_eq!(fills.len(), 1);
+        assert_eq!(fills[0].fill_type, "LIMIT");
+        assert!(engine.positions.is_empty());
+        assert!(engine.open_orders.is_empty());
+    }
+
+    #[test]
+    fn test_trailing_stop_prefers_existing_trigger_before_same_bar_update() {
+        let cases = [
+            (
+                "LONG",
+                dec!(49000),
+                dec!(1000),
+                make_candle(dec!(50000), dec!(52000), dec!(48000), dec!(50000)),
+            ),
+            (
+                "SHORT",
+                dec!(51000),
+                dec!(1000),
+                make_candle(dec!(50000), dec!(52000), dec!(48000), dec!(50000)),
+            ),
+        ];
+
+        for (side, trigger, distance, candle) in cases {
+            let mut engine = make_engine(dec!(100000));
+            engine.positions.insert(
+                pos_key(STRATEGY, PRODUCT),
+                make_position(PRODUCT, STRATEGY, side, dec!(1), dec!(50000)),
+            );
+            let mut trailing = make_order(
+                "trailing_old",
+                side,
+                "TRAILING_STOP",
+                Decimal::ZERO,
+                dec!(1),
+            );
+            trailing.trigger_price = Some(trigger);
+            trailing.trailing_distance = Some(distance);
+            engine.open_orders.push(trailing);
+
+            let fills = engine.process_candle_logic(candle).unwrap();
+
+            assert_eq!(fills.len(), 1);
+            assert_eq!(fills[0].price, trigger);
+        }
+    }
+
+    #[test]
+    fn test_trailing_stop_can_trigger_after_same_bar_favorable_move() {
+        let cases = [
+            (
+                "LONG",
+                dec!(49000),
+                dec!(51000),
+                make_candle(dec!(50000), dec!(52000), dec!(50000), dec!(50500)),
+            ),
+            (
+                "SHORT",
+                dec!(51000),
+                dec!(49000),
+                make_candle(dec!(50000), dec!(50000), dec!(48000), dec!(49500)),
+            ),
+        ];
+
+        for (side, old_trigger, expected_fill, candle) in cases {
+            let mut engine = make_engine(dec!(100000));
+            engine.positions.insert(
+                pos_key(STRATEGY, PRODUCT),
+                make_position(PRODUCT, STRATEGY, side, dec!(1), dec!(50000)),
+            );
+            let mut trailing = make_order(
+                "trailing_new",
+                side,
+                "TRAILING_STOP",
+                Decimal::ZERO,
+                dec!(1),
+            );
+            trailing.trigger_price = Some(old_trigger);
+            trailing.trailing_distance = Some(dec!(1000));
+            engine.open_orders.push(trailing);
+
+            let fills = engine.process_candle_logic(candle).unwrap();
+
+            assert_eq!(fills.len(), 1);
+            assert_eq!(fills[0].price, expected_fill);
+        }
+    }
+
+    #[test]
+    fn test_trailing_stop_without_initial_trigger_supports_both_sides() {
+        let cases = [
+            (
+                "LONG",
+                dec!(105),
+                make_candle(dec!(100), dec!(115), dec!(100), dec!(105)),
+            ),
+            (
+                "SHORT",
+                dec!(95),
+                make_candle(dec!(100), dec!(100), dec!(85), dec!(95)),
+            ),
+        ];
+
+        for (side, expected_fill, candle) in cases {
+            let mut engine = make_engine(dec!(100000));
+            engine.positions.insert(
+                pos_key(STRATEGY, PRODUCT),
+                make_position(PRODUCT, STRATEGY, side, dec!(1), dec!(100)),
+            );
+            let mut trailing = make_order(
+                "trailing_none",
+                side,
+                "TRAILING_STOP",
+                Decimal::ZERO,
+                dec!(1),
+            );
+            trailing.trailing_distance = Some(dec!(10));
+            engine.open_orders.push(trailing);
+
+            let fills = engine.process_candle_logic(candle).unwrap();
+
+            assert_eq!(fills.len(), 1);
+            assert_eq!(fills[0].price, expected_fill);
+        }
     }
 
     // ── Position Management ──
@@ -1150,7 +1782,7 @@ mod tests {
     }
 
     #[test]
-    fn test_close_position_on_flat_does_nothing() {
+    fn test_protection_on_flat_is_discarded_without_fill_or_fee() {
         let mut engine = make_engine(dec!(100000));
         let mut sl = make_order("flat_sl", "LONG", "STOP_LOSS", Decimal::ZERO, dec!(1));
         sl.trigger_price = Some(dec!(49000));
@@ -1159,9 +1791,9 @@ mod tests {
         let candle = make_candle(dec!(50000), dec!(50500), dec!(48000), dec!(49200));
         let fills = engine.process_candle_logic(candle).unwrap();
 
-        assert_eq!(fills.len(), 1);
-        let fee = fills[0].fee;
-        assert_eq!(engine.balance, dec!(100000) - fee);
+        assert!(fills.is_empty());
+        assert!(engine.open_orders.is_empty());
+        assert_eq!(engine.balance, dec!(100000));
     }
 
     #[test]
