@@ -26,6 +26,10 @@ from src.core.client_order_id import (
     linked_client_order_id,
     parse_client_order_id,
 )
+from src.core.conditional_order_intents import (
+    conditional_oco_pairs,
+    conditional_order_intents,
+)
 from src.core.fill_delta import (
     delta_price_from_cumulative_average,
     fill_delta_from_cumulative,
@@ -1505,66 +1509,32 @@ class ExecutionEngine:
         candle: Optional[Candlestick],
     ) -> list:
         """Create SL/TP/Trailing orders linked via OCO before external placement."""
-        # Closing side is opposite of entry
         close_side = OrderSide.SELL if entry_order.side.lower() == "buy" else OrderSide.BUY
-
-        sl_order = None
-        tp_order = None
         conditional_orders = []
+        intents = conditional_order_intents(signal)
 
-        # Create SL order
-        if signal.stop_loss:
-            sl_order = self.order_manager.create_order(
+        for intent in intents:
+            order = self.order_manager.create_order(
                 signal=signal,
                 side=close_side,
-                order_type="stop_loss",
+                order_type=intent.order_type,
                 quantity=qty,
-                trigger_price=signal.stop_loss,
+                trigger_price=intent.trigger_price,
                 client_order_id=self._conditional_client_order_id(
                     entry_order.client_order_id,
-                    "sl",
+                    intent.client_order_suffix,
                 ),
             )
-            self._attach_min_notional_reference_price(sl_order, candle)
-            conditional_orders.append(sl_order)
+            if intent.trailing_distance is not None:
+                order._trailing_distance = intent.trailing_distance
+            self._attach_min_notional_reference_price(order, candle)
+            conditional_orders.append(order)
 
-        # Create TP order
-        if signal.take_profit:
-            tp_order = self.order_manager.create_order(
-                signal=signal,
-                side=close_side,
-                order_type="take_profit",
-                quantity=qty,
-                trigger_price=signal.take_profit,
-                client_order_id=self._conditional_client_order_id(
-                    entry_order.client_order_id,
-                    "tp",
-                ),
-            )
-            self._attach_min_notional_reference_price(tp_order, candle)
-            conditional_orders.append(tp_order)
-
-        # Link OCO: SL and TP cancel each other
-        if sl_order and tp_order:
-            sl_order._linked_order_id = tp_order.id
-            tp_order._linked_order_id = sl_order.id
-
-        # Create Trailing Stop order
-        if signal.trailing_distance:
-            ts_order = self.order_manager.create_order(
-                signal=signal,
-                side=close_side,
-                order_type="trailing_stop",
-                quantity=qty,
-                trigger_price=signal.stop_loss,
-                client_order_id=self._conditional_client_order_id(
-                    entry_order.client_order_id,
-                    "tr",
-                ),
-            )
-            ts_order._trailing_distance = signal.trailing_distance
-            self._attach_min_notional_reference_price(ts_order, candle)
-            conditional_orders.append(ts_order)
+        for first_index, second_index in conditional_oco_pairs(intents):
+            first = conditional_orders[first_index]
+            second = conditional_orders[second_index]
+            first._linked_order_id = second.id
+            second._linked_order_id = first.id
 
         for conditional_order in conditional_orders:
             linked_order_id = getattr(conditional_order, "_linked_order_id", None)
