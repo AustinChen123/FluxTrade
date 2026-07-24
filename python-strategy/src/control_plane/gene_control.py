@@ -182,6 +182,8 @@ def _gene_payload(gene: GeneRecord) -> dict[str, Any]:
         "score_total": _decimal_str(gene.score_total),
         "score_breakdown": gene.score_breakdown,
         "max_drawdown": _decimal_str(gene.max_drawdown),
+        "generation_index": gene.generation_index,
+        "candidate_id": gene.candidate_id,
         "epoch_id": gene.epoch_id,
         "created_at": _iso_or_none(gene.created_at),
         "activated_at": _iso_or_none(gene.activated_at),

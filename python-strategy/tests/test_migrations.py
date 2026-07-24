@@ -430,9 +430,9 @@ def test_sample_data_insertion_after_upgrade(fresh_pg_db: str) -> None:
                     """
                     INSERT INTO gene_records
                     (strategy_id, role, param_pack, score_total, score_breakdown,
-                     max_drawdown, epoch_id)
+                     max_drawdown, generation_index, candidate_id, epoch_id)
                     VALUES ('strat-1', 'champion', '{}'::jsonb, 1.0, '{}'::jsonb,
-                            0.05, 'epoch-1')
+                            0.05, 0, 'champion', 'epoch-1')
                     """
                 )
             )
@@ -445,9 +445,10 @@ def test_sample_data_insertion_after_upgrade(fresh_pg_db: str) -> None:
                         """
                         INSERT INTO gene_records
                         (strategy_id, role, param_pack, score_total,
-                         score_breakdown, max_drawdown, epoch_id)
+                         score_breakdown, max_drawdown, generation_index,
+                         candidate_id, epoch_id)
                         VALUES ('strat-1', 'bogus', '{}'::jsonb, 0.0, '{}'::jsonb,
-                                0.0, 'epoch-1')
+                                0.0, 0, 'bogus', 'epoch-1')
                         """
                     )
                 )
@@ -460,9 +461,10 @@ def test_sample_data_insertion_after_upgrade(fresh_pg_db: str) -> None:
                         """
                         INSERT INTO gene_records
                         (strategy_id, role, param_pack, score_total,
-                         score_breakdown, max_drawdown, epoch_id)
+                         score_breakdown, max_drawdown, generation_index,
+                         candidate_id, epoch_id)
                         VALUES ('strat-1', 'champion', '{}'::jsonb, 2.0,
-                                '{}'::jsonb, 0.05, 'epoch-1')
+                                '{}'::jsonb, 0.05, 0, 'champion-2', 'epoch-1')
                         """
                     )
                 )
@@ -474,9 +476,9 @@ def test_sample_data_insertion_after_upgrade(fresh_pg_db: str) -> None:
                     """
                     INSERT INTO gene_records
                     (strategy_id, role, param_pack, score_total, score_breakdown,
-                     max_drawdown, epoch_id)
+                     max_drawdown, generation_index, candidate_id, epoch_id)
                     VALUES ('strat-1', 'challenger', '{}'::jsonb, 0.5, '{}'::jsonb,
-                            0.1, 'epoch-1')
+                            1250.125, 0, 'challenger', 'epoch-1')
                     """
                 )
             )

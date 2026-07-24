@@ -45,7 +45,7 @@ def generate_parameter_candidates(
 
     parameter_names = list(search_space.parameters)
     value_lists = [
-        _dimension_values(search_space.parameters[name])
+        parameter_dimension_values(search_space.parameters[name])
         for name in parameter_names
     ]
     total_combinations = prod(len(values) for values in value_lists)
@@ -75,7 +75,9 @@ def generate_parameter_candidates(
     ]
 
 
-def _dimension_values(dimension: ParameterSearchDimension) -> list[Any]:
+def parameter_dimension_values(dimension: ParameterSearchDimension) -> list[Any]:
+    """Expand one validated finite parameter dimension."""
+
     if dimension.type == "categorical":
         assert dimension.choices is not None
         return list(dimension.choices)

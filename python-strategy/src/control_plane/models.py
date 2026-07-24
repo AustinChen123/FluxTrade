@@ -167,7 +167,7 @@ class BacktestJobRequest(BaseModel):
 class ParameterCandidate(BaseModel):
     """Candidate parameter pack for a parameter-search job."""
 
-    candidate_id: str = Field(min_length=1)
+    candidate_id: str = Field(min_length=1, max_length=64)
     param_pack: dict[str, Any] = Field(default_factory=dict)
 
 
@@ -234,6 +234,41 @@ class ParameterSearchSpace(BaseModel):
             if not name.strip():
                 raise ValueError("parameter names cannot be blank")
         return value
+
+
+class EvolutionConfig(BaseModel):
+    """Deterministic generation-based parameter evolution settings."""
+
+    population_size: int = Field(ge=2, le=10_000)
+    max_generations: int = Field(ge=1, le=10_000)
+    tournament_size: int = Field(default=2, ge=2)
+    elite_count: int = Field(default=1, ge=1)
+    crossover_probability: Decimal = Decimal("0.9")
+    mutation_probability: Decimal = Decimal("0.1")
+    mutation_sigma_steps: Decimal = Decimal("1")
+    epoch_id: str | None = Field(default=None, min_length=1, max_length=64)
+
+    @field_validator("crossover_probability", "mutation_probability")
+    @classmethod
+    def validate_probability(cls, value: Decimal) -> Decimal:
+        if not value.is_finite() or value < 0 or value > 1:
+            raise ValueError("probability must be finite and between zero and one")
+        return value
+
+    @field_validator("mutation_sigma_steps")
+    @classmethod
+    def validate_mutation_sigma(cls, value: Decimal) -> Decimal:
+        if not value.is_finite() or value <= 0:
+            raise ValueError("mutation_sigma_steps must be finite and positive")
+        return value
+
+    @model_validator(mode="after")
+    def validate_population_settings(self) -> "EvolutionConfig":
+        if self.tournament_size > self.population_size:
+            raise ValueError("tournament_size cannot exceed population_size")
+        if self.elite_count >= self.population_size:
+            raise ValueError("elite_count must be smaller than population_size")
+        return self
 
 
 class CsvSignalBacktestEvaluationConfig(BaseModel):
@@ -405,6 +440,7 @@ class ParameterSearchJobRequest(BaseModel):
     candidates: list[ParameterCandidate] | None = Field(default=None, min_length=1)
     search_space: ParameterSearchSpace | None = None
     candidate_sample_count: int | None = Field(default=None, ge=1, le=10_000)
+    evolution: EvolutionConfig | None = None
 
     @field_validator("end_time")
     @classmethod
@@ -433,10 +469,28 @@ class ParameterSearchJobRequest(BaseModel):
         has_search_space = self.search_space is not None
         if has_candidates == has_search_space:
             raise ValueError("provide exactly one of candidates or search_space")
-        if has_candidates and self.candidate_sample_count is not None:
-            raise ValueError("candidate_sample_count requires search_space")
-        if has_search_space and self.candidate_sample_count is None:
-            raise ValueError("candidate_sample_count is required with search_space")
+        if self.evolution is not None:
+            if not has_search_space:
+                raise ValueError("evolution requires search_space")
+            if self.candidate_sample_count is not None:
+                raise ValueError("candidate_sample_count is not used by evolution")
+            assert self.search_space is not None
+            if any(
+                dimension.type == "categorical"
+                and any(
+                    isinstance(choice, Decimal)
+                    for choice in dimension.choices or []
+                )
+                for dimension in self.search_space.parameters.values()
+            ):
+                raise ValueError(
+                    "evolution categorical choices cannot contain Decimal values"
+                )
+        else:
+            if has_candidates and self.candidate_sample_count is not None:
+                raise ValueError("candidate_sample_count requires search_space")
+            if has_search_space and self.candidate_sample_count is None:
+                raise ValueError("candidate_sample_count is required with search_space")
         if self.evaluation_set is not None:
             warmup_dataset_ids = [
                 dataset.dataset_id

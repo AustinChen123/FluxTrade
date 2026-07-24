@@ -282,6 +282,7 @@ def test_backtest_executor_propagates_instrument_spec(monkeypatch, tmp_path):
     BacktestJobExecutor(run_inline=True).run_backtest_request(request)
 
     spec = captured["instrument_spec"]
+    assert captured["max_drawdown_limit"] == 0.20
     assert spec.multiplier == Decimal("2")
     assert spec.fee_model == FeeModel.PER_CONTRACT
     assert spec.quantity_step == Decimal("1")
@@ -873,6 +874,8 @@ def test_control_plane_promotes_gene_and_retires_previous_champion(tmp_path):
             score_total=Decimal("1.2"),
             score_breakdown={},
             max_drawdown=Decimal("0.1"),
+            generation_index=0,
+            candidate_id="champion",
             epoch_id="epoch-promote",
         )
         challenger = GeneRecord(
@@ -882,6 +885,8 @@ def test_control_plane_promotes_gene_and_retires_previous_champion(tmp_path):
             score_total=Decimal("2.5"),
             score_breakdown={},
             max_drawdown=Decimal("0.05"),
+            generation_index=0,
+            candidate_id="challenger",
             epoch_id="epoch-promote",
         )
         session.add(epoch)
@@ -945,6 +950,8 @@ def test_control_plane_lists_and_gets_genes(tmp_path):
             score_total=Decimal("2.5"),
             score_breakdown={"total_pnl": "2.5"},
             max_drawdown=Decimal("0.05"),
+            generation_index=0,
+            candidate_id="champion",
             epoch_id="epoch-query",
         )
         challenger = GeneRecord(
@@ -954,6 +961,8 @@ def test_control_plane_lists_and_gets_genes(tmp_path):
             score_total=Decimal("1.2"),
             score_breakdown={"total_pnl": "1.2"},
             max_drawdown=Decimal("0.10"),
+            generation_index=0,
+            candidate_id="challenger",
             epoch_id="epoch-query",
         )
         session.add(epoch)
