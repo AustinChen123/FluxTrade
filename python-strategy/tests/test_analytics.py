@@ -71,6 +71,12 @@ class TestEmptyAndEdge:
 # ── Basic metrics (backward compatibility) ───────────────────────
 
 class TestBasicMetrics:
+    def test_closed_trade_count_includes_breakeven_trade(self):
+        result = calculate_metrics(_round_trip(100.0, 100.0))
+
+        assert result["closed_trade_count"] == 1
+        assert result["total_trades"] == 0
+
     def test_single_winning_trade(self):
         trades = _round_trip(100.0, 110.0)
         result = calculate_metrics(trades)

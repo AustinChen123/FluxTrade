@@ -16,7 +16,11 @@ from sqlalchemy.ext.compiler import compiles
 from sqlalchemy.orm import sessionmaker
 
 from integration.conftest import PRODUCT_ID, TIMEFRAME, make_candle, make_candle_series
-from src.core.analytics import calculate_metrics
+from src.core.analytics import (
+    annualized_sharpe_from_moments,
+    calculate_metrics,
+    utc_daily_return_metrics,
+)
 from src.core.backtest_runner import BacktestRunner
 from src.core.capital_allocator import CapitalAllocator
 from src.core.data_sources.memory import MemoryDataSource
@@ -43,6 +47,49 @@ try:
     HAS_RUST = True
 except ImportError:
     HAS_RUST = False
+
+
+def test_utc_daily_sharpe_uses_close_to_close_equity_returns():
+    day_ms = 86_400_000
+    metrics = utc_daily_return_metrics(
+        [
+            (0, Decimal("100")),
+            (day_ms, Decimal("101")),
+            (2 * day_ms, Decimal("103.02")),
+        ],
+        initial_balance=Decimal("100"),
+        start_time=0,
+        end_time=2 * day_ms,
+    )
+    moments = {
+        name: metrics[name]
+        for name in ("count", "sum", "sum_squares", "sum_cubes", "sum_fourth")
+    }
+
+    assert moments == {
+        "count": 3,
+        "sum": Decimal("0.03"),
+        "sum_squares": Decimal("0.0005"),
+        "sum_cubes": Decimal("0.000009"),
+        "sum_fourth": Decimal("0.00000017"),
+    }
+    assert annualized_sharpe_from_moments(moments) == Decimal(365).sqrt()
+
+
+def test_utc_daily_sharpe_carries_leading_internal_and_trailing_days():
+    day_ms = 86_400_000
+    metrics = utc_daily_return_metrics(
+        [
+            (day_ms, Decimal("100")),
+            (3 * day_ms, Decimal("101")),
+        ],
+        initial_balance=Decimal("100"),
+        start_time=0,
+        end_time=4 * day_ms,
+    )
+
+    assert metrics["count"] == 5
+    assert metrics["sum"] == Decimal("0.01")
 
 pytestmark = [
     pytest.mark.rust,
@@ -1414,6 +1461,16 @@ def test_representative_strategy_matches_full_and_prepared_research_paths(tmp_pa
         research_result["mark_to_market_pnl"]
         == decimal_research_result["mark_to_market_pnl"]
         == full_result["mark_to_market_pnl"]
+    )
+    assert (
+        research_result["daily_return_moments"]
+        == decimal_research_result["daily_return_moments"]
+        == full_result["daily_return_moments"]
+    )
+    assert (
+        research_result["annualized_sharpe"]
+        == decimal_research_result["annualized_sharpe"]
+        == full_result["annualized_sharpe"]
     )
     assert (
         research_result["max_drawdown"]
