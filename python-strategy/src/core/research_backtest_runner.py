@@ -35,6 +35,7 @@ from src.core.product_registry import (
     resolve_contract_multiplier,
 )
 from src.core.strategy_context import RejectionSnapshot, StrategyContext
+from src.core.signal_processor import apply_strategy_position_state
 from src.strategies.base import BaseStrategy
 
 if TYPE_CHECKING:
@@ -138,6 +139,7 @@ class ResearchBacktestRunner:
         portfolio_peak_equity = initial_equity
         portfolio_max_drawdown = Decimal("0")
         equity_samples: list[tuple[int, Decimal]] = []
+        observed_position_sides: dict[tuple[str, str], str | None] = {}
 
         candle_count = 0
         for candle, prepared_candle in self._iter_replay_candles(adapter):
@@ -162,6 +164,22 @@ class ResearchBacktestRunner:
             )
             contexts: list[StrategyContext] = []
             for strategy in active_strategies:
+                position = adapter.get_position(
+                    strategy.product_id,
+                    strategy_id=strategy.strategy_id,
+                )
+                position_side = (
+                    None
+                    if position is None
+                    else str(getattr(position.side, "value", position.side)).upper()
+                )
+                position_key = (strategy.strategy_id, strategy.product_id)
+                if (
+                    position_key not in observed_position_sides
+                    or observed_position_sides[position_key] != position_side
+                ):
+                    apply_strategy_position_state(strategy, position_side)
+                    observed_position_sides[position_key] = position_side
                 context = self._strategy_context(
                     adapter=adapter,
                     strategy=strategy,
@@ -540,12 +558,17 @@ class ResearchBacktestRunner:
         )
 
     def _quantity_for_signal(self, signal: Signal, adapter: SimulatedAdapter) -> Decimal:
-        if signal.quantity and signal.quantity > 0:
-            return signal.quantity
         if signal.type in (SignalType.EXIT_LONG, SignalType.EXIT_SHORT):
             position = self._position_for_exit_signal(signal, adapter)
             if position is not None and position.quantity > 0:
-                return position.quantity
+                requested_quantity = (
+                    signal.quantity
+                    if signal.quantity is not None and signal.quantity > 0
+                    else position.quantity
+                )
+                return min(requested_quantity, position.quantity)
+        if signal.quantity and signal.quantity > 0:
+            return signal.quantity
         return Decimal("0.01")
 
     @staticmethod

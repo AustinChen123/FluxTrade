@@ -140,6 +140,14 @@ class TestSideDetermination:
 
     def test_exit_long_becomes_sell(self, execution_engine, signal_factory):
         """EXIT_LONG signal should produce a sell order."""
+        execution_engine.adapter.positions["BINANCE:BTCUSDT-PERP"] = Position(
+            strategy_id="test-strategy",
+            product_id="BINANCE:BTCUSDT-PERP",
+            side=PositionSide.LONG,
+            quantity=Decimal("0.1"),
+            entry_price=Decimal("42000"),
+            unrealized_pnl=Decimal("0"),
+        )
         signal = signal_factory(signal_type=SignalType.EXIT_LONG, price=Decimal("42000"))
         order_id = execution_engine.execute_signal(signal)
 
@@ -147,6 +155,14 @@ class TestSideDetermination:
 
     def test_exit_short_becomes_buy(self, execution_engine, signal_factory):
         """EXIT_SHORT signal should produce a buy order."""
+        execution_engine.adapter.positions["BINANCE:BTCUSDT-PERP"] = Position(
+            strategy_id="test-strategy",
+            product_id="BINANCE:BTCUSDT-PERP",
+            side=PositionSide.SHORT,
+            quantity=Decimal("0.1"),
+            entry_price=Decimal("42000"),
+            unrealized_pnl=Decimal("0"),
+        )
         signal = signal_factory(signal_type=SignalType.EXIT_SHORT, price=Decimal("42000"))
         order_id = execution_engine.execute_signal(signal)
 
@@ -238,6 +254,288 @@ class TestQuantityHandling:
         execution_engine.execute_signal(signal)
 
         assert mock_exchange_adapter.open_orders[0].quantity == Decimal("0.25")
+
+    def test_exit_quantity_is_capped_to_current_position(
+        self,
+        execution_engine,
+        signal_factory,
+        mock_exchange_adapter,
+    ):
+        product_id = "BINANCE:BTCUSDT-PERP"
+        mock_exchange_adapter.positions[product_id] = Position(
+            strategy_id="test-strategy",
+            product_id=product_id,
+            side=PositionSide.LONG,
+            quantity=Decimal("0.25"),
+            entry_price=Decimal("42000"),
+            unrealized_pnl=Decimal("0"),
+        )
+        signal = signal_factory(
+            signal_type=SignalType.EXIT_LONG,
+            product_id=product_id,
+            quantity=Decimal("1"),
+            price=Decimal("42000"),
+        )
+
+        execution_engine.execute_signal(signal)
+
+        order = mock_exchange_adapter.open_orders[0]
+        assert order.quantity == Decimal("0.25")
+        assert order.intent_payload == {
+            "reduce_only": True,
+            "source": "strategy_exit",
+        }
+
+    @pytest.mark.parametrize(
+        ("signal_type", "position_side", "expected_reason"),
+        [
+            (SignalType.EXIT_LONG, None, "already_flat"),
+            (SignalType.EXIT_LONG, PositionSide.SHORT, "position_side_mismatch"),
+            (SignalType.EXIT_SHORT, PositionSide.LONG, "position_side_mismatch"),
+        ],
+    )
+    def test_exit_does_not_submit_without_matching_position(
+        self,
+        execution_engine,
+        signal_factory,
+        mock_exchange_adapter,
+        caplog,
+        signal_type,
+        position_side,
+        expected_reason,
+    ):
+        product_id = "BINANCE:BTCUSDT-PERP"
+        if position_side is not None:
+            mock_exchange_adapter.positions[product_id] = Position(
+                strategy_id="test-strategy",
+                product_id=product_id,
+                side=position_side,
+                quantity=Decimal("0.25"),
+                entry_price=Decimal("42000"),
+                unrealized_pnl=Decimal("0"),
+            )
+        signal = signal_factory(
+            signal_type=signal_type,
+            product_id=product_id,
+            quantity=Decimal("1"),
+            price=Decimal("42000"),
+        )
+
+        assert execution_engine.execute_signal(signal) is None
+
+        assert mock_exchange_adapter.open_orders == []
+        assert expected_reason in caplog.text
+        assert execution_engine._reconcile_halt is (
+            expected_reason == "position_side_mismatch"
+        )
+
+    def test_unknown_exit_position_halts_submissions(
+        self,
+        execution_engine,
+        signal_factory,
+        mock_exchange_adapter,
+    ):
+        execution_engine._position_loader = lambda *_args: (_ for _ in ()).throw(
+            RuntimeError("ledger unavailable")
+        )
+        exit_signal = signal_factory(
+            signal_type=SignalType.EXIT_LONG,
+            quantity=Decimal("1"),
+            price=Decimal("42000"),
+        )
+
+        assert execution_engine.execute_signal(exit_signal) is None
+        assert execution_engine.execute_signal(signal_factory()) is None
+
+        assert mock_exchange_adapter.open_orders == []
+        assert execution_engine._reconcile_halt is True
+
+    def test_authoritative_exit_requires_full_matching_position(
+        self,
+        execution_engine,
+        signal_factory,
+        mock_exchange_adapter,
+    ):
+        product_id = "BINANCE:BTCUSDT-PERP"
+        mock_exchange_adapter.positions[product_id] = Position(
+            strategy_id="test-strategy",
+            product_id=product_id,
+            side=PositionSide.LONG,
+            quantity=Decimal("0.25"),
+            entry_price=Decimal("42000"),
+            unrealized_pnl=Decimal("0"),
+        )
+        executor = MagicMock(return_value={"status": "verified_flat"})
+
+        partial = signal_factory(
+            signal_type=SignalType.EXIT_LONG,
+            product_id=product_id,
+            quantity=Decimal("0.1"),
+        )
+        full = signal_factory(
+            signal_type=SignalType.EXIT_LONG,
+            product_id=product_id,
+            quantity=Decimal("0.25"),
+        )
+
+        assert (
+            execution_engine.execute_authoritative_exit_signal(
+                partial,
+                None,
+                executor,
+            )
+            is None
+        )
+        executor.assert_not_called()
+        assert execution_engine._reconcile_halt is True
+        execution_engine.resume_after_reconcile()
+
+        assert (
+            execution_engine.execute_authoritative_exit_signal(
+                full,
+                None,
+                executor,
+            )
+            is None
+        )
+        executor.assert_called_once()
+
+    def test_authoritative_exit_blocks_kill_switch_until_operation_finishes(
+        self,
+        execution_engine,
+        signal_factory,
+        mock_exchange_adapter,
+    ):
+        product_id = "BINANCE:BTCUSDT-PERP"
+        mock_exchange_adapter.positions[product_id] = Position(
+            strategy_id="test-strategy",
+            product_id=product_id,
+            side=PositionSide.LONG,
+            quantity=Decimal("0.25"),
+            entry_price=Decimal("42000"),
+            unrealized_pnl=Decimal("0"),
+        )
+        started = threading.Event()
+        release = threading.Event()
+
+        def executor(_signal, _decision):
+            started.set()
+            assert release.wait(timeout=1)
+            return {"status": "verified_flat"}
+
+        thread = threading.Thread(
+            target=execution_engine.execute_authoritative_exit_signal,
+            args=(
+                signal_factory(
+                    signal_type=SignalType.EXIT_LONG,
+                    product_id=product_id,
+                    quantity=Decimal("0.25"),
+                ),
+                None,
+                executor,
+            ),
+        )
+        thread.start()
+        assert started.wait(timeout=1)
+
+        assert execution_engine.halt_and_drain(timeout=0.01) is False
+        release.set()
+        thread.join(timeout=1)
+
+        assert not thread.is_alive()
+        assert execution_engine._submissions_halted is True
+        assert execution_engine._reconcile_halt is False
+
+    def test_authoritative_exit_does_not_clear_newer_reconcile_claim(
+        self,
+        execution_engine,
+        signal_factory,
+        mock_exchange_adapter,
+    ):
+        product_id = "BINANCE:BTCUSDT-PERP"
+        mock_exchange_adapter.positions[product_id] = Position(
+            strategy_id="test-strategy",
+            product_id=product_id,
+            side=PositionSide.LONG,
+            quantity=Decimal("0.25"),
+            entry_price=Decimal("42000"),
+            unrealized_pnl=Decimal("0"),
+        )
+        started = threading.Event()
+        release = threading.Event()
+
+        def executor(_signal, _decision):
+            started.set()
+            assert release.wait(timeout=1)
+            return {"status": "verified_flat"}
+
+        thread = threading.Thread(
+            target=execution_engine.execute_authoritative_exit_signal,
+            args=(
+                signal_factory(
+                    signal_type=SignalType.EXIT_LONG,
+                    product_id=product_id,
+                    quantity=Decimal("0.25"),
+                ),
+                None,
+                executor,
+            ),
+        )
+        thread.start()
+        assert started.wait(timeout=1)
+
+        assert execution_engine.halt_for_reconcile(timeout=0.01) is False
+        release.set()
+        thread.join(timeout=1)
+
+        assert not thread.is_alive()
+        assert execution_engine._reconcile_halt is True
+        execution_engine.resume_after_reconcile()
+        assert execution_engine._reconcile_halt is False
+
+    def test_authoritative_exit_outcome_audit_failure_keeps_gate_halted(
+        self,
+        mock_db_session,
+        mock_clock,
+        mock_exchange_adapter,
+        mock_order_repo,
+        signal_factory,
+    ):
+        product_id = "BINANCE:BTCUSDT-PERP"
+        mock_exchange_adapter.positions[product_id] = Position(
+            strategy_id="test-strategy",
+            product_id=product_id,
+            side=PositionSide.LONG,
+            quantity=Decimal("0.25"),
+            entry_price=Decimal("42000"),
+            unrealized_pnl=Decimal("0"),
+        )
+        engine = ExecutionEngine(
+            db_session=mock_db_session,
+            clock=mock_clock,
+            adapter=mock_exchange_adapter,
+            order_repository=mock_order_repo,
+            db_session_factory=lambda: nullcontext(mock_db_session),
+            audit_external_orders=True,
+        )
+        signal = signal_factory(
+            signal_type=SignalType.EXIT_LONG,
+            product_id=product_id,
+            quantity=Decimal("0.25"),
+        )
+
+        with patch(
+            "src.core.execution.write_signal_audit_outcome",
+            side_effect=RuntimeError("audit unavailable"),
+        ), pytest.raises(RuntimeError, match="audit unavailable"):
+            engine.execute_authoritative_exit_signal(
+                signal,
+                None,
+                MagicMock(return_value={"status": "verified_flat"}),
+            )
+
+        assert engine._reconcile_halt is True
+        assert engine._submissions_in_flight == 0
 
 
 class TestAdapterDelegation:

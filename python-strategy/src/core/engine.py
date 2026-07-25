@@ -239,6 +239,11 @@ class StrategyEngine:
             self.execution_engine,
             self._strategy_state_manager,
             lambda signal, candle: self.process_signal(signal, candle),
+            position_loader=getattr(
+                self.account_service,
+                "get_position_for_exit",
+                self.account_service.get_position,
+            ),
         )
         self.ops_safety = OpsSafetyService(
             self.execution_engine,

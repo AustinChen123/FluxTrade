@@ -13,6 +13,36 @@ from src.strategies.base import BaseStrategy
 logger = logging.getLogger(__name__)
 
 
+def apply_strategy_position_state(
+    strategy: BaseStrategy,
+    position_side: str | None,
+) -> bool:
+    """Align one strategy's internal trade state with authoritative position side."""
+    sync_hook = getattr(strategy, "sync_position_state", None)
+    if callable(sync_hook):
+        hook_result = sync_hook(position_side)
+        if hook_result is not None:
+            return bool(hook_result)
+
+    normalized_side = position_side.upper() if position_side else None
+    has_direction_attr = hasattr(strategy, "position")
+    if normalized_side is not None and not has_direction_attr:
+        return False
+    applied = False
+    if hasattr(strategy, "_in_position"):
+        setattr(strategy, "_in_position", normalized_side is not None)
+        applied = True
+    if has_direction_attr:
+        if normalized_side == "LONG":
+            setattr(strategy, "position", 1)
+        elif normalized_side == "SHORT":
+            setattr(strategy, "position", -1)
+        else:
+            setattr(strategy, "position", 0)
+        applied = True
+    return applied
+
+
 class SignalProcessor:
     """Dispatch market candles to registered strategies."""
 
@@ -22,11 +52,14 @@ class SignalProcessor:
         execution_engine: Any,
         state_manager: Any | None = None,
         signal_handler: Callable[[Signal, Optional[Candlestick]], None] | None = None,
+        position_loader: Callable[[str, str], Any | None] | None = None,
     ) -> None:
         self.registry = registry
         self.execution_engine = execution_engine
         self.state_manager = state_manager
         self.signal_handler = signal_handler
+        self.position_loader = position_loader
+        self._observed_position_sides: dict[tuple[str, str], str | None] = {}
 
     def on_candle(
         self,
@@ -57,6 +90,8 @@ class SignalProcessor:
                 continue
 
             try:
+                if not self._sync_position_if_changed(strategy):
+                    continue
                 signals = self._dispatch_to_strategy(strategy, candle)
                 if emit_signals:
                     self._process_signals(strategy.strategy_id, signals, candle)
@@ -85,30 +120,33 @@ class SignalProcessor:
         direction-aware ``position`` attribute; ``_in_position``-only
         strategies cannot represent direction and may only sync flat state.
         """
-        sync_hook = getattr(strategy, "sync_position_state", None)
-        if callable(sync_hook):
-            hook_result = sync_hook(position_side)
-            if hook_result is not None:
-                return bool(hook_result)
+        return apply_strategy_position_state(strategy, position_side)
 
-        normalized_side = position_side.upper() if position_side else None
-        has_direction_attr = hasattr(strategy, "position")
-        if normalized_side is not None and not has_direction_attr:
-            # _in_position alone cannot represent LONG vs SHORT safely.
-            return False
-        applied = False
-        if hasattr(strategy, "_in_position"):
-            setattr(strategy, "_in_position", normalized_side is not None)
-            applied = True
-        if has_direction_attr:
-            if normalized_side == "LONG":
-                setattr(strategy, "position", 1)
-            elif normalized_side == "SHORT":
-                setattr(strategy, "position", -1)
-            else:
-                setattr(strategy, "position", 0)
-            applied = True
-        return applied
+    def _sync_position_if_changed(self, strategy: BaseStrategy) -> bool:
+        if self.position_loader is None:
+            return True
+        key = (strategy.strategy_id, strategy.product_id)
+        position = self.position_loader(strategy.strategy_id, strategy.product_id)
+        position_side = (
+            None
+            if position is None
+            else str(getattr(position.side, "value", position.side)).upper()
+        )
+        if (
+            key in self._observed_position_sides
+            and self._observed_position_sides[key] == position_side
+        ):
+            return True
+        if not apply_strategy_position_state(strategy, position_side):
+            logger.debug(
+                "Strategy does not consume authoritative position sync: "
+                "strategy=%s product=%s side=%s",
+                strategy.strategy_id,
+                strategy.product_id,
+                position_side,
+            )
+        self._observed_position_sides[key] = position_side
+        return True
 
     @staticmethod
     def _snapshot_trade_state(strategy: BaseStrategy) -> dict[str, Any]:
