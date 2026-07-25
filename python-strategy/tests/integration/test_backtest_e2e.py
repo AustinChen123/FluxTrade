@@ -307,4 +307,51 @@ class TestBacktestE2E:
 
         assert result is not None
         assert result["candle_count"] == 3
+        assert result["max_drawdown"] == Decimal("40")
         assert result["journal_count"] >= 1
+
+    @patch("src.core.backtest_runner.SessionLocal")
+    def test_backtest_drawdown_aggregates_strategy_scoped_positions(
+        self,
+        mock_session_local,
+    ):
+        mock_session = MagicMock()
+        mock_session.query.return_value.filter_by.return_value.all.return_value = []
+        mock_session_local.return_value = mock_session
+
+        base_ts = 1_700_000_000_000
+        interval_ms = 15 * 60 * 1000
+        candles = [
+            make_candle(
+                base_ts + index * interval_ms,
+                price,
+                price,
+                price,
+                price,
+            )
+            for index, price in enumerate(
+                (Decimal("100"), Decimal("100"), Decimal("60"))
+            )
+        ]
+        runner = BacktestRunner(
+            start_time=candles[0].timestamp,
+            end_time=candles[-1].timestamp,
+            product_id=PRODUCT_ID,
+            timeframe=TIMEFRAME,
+            initial_balance=10000.0,
+            max_drawdown_limit=None,
+            data_source=MemoryDataSource(candles),
+            report_config={
+                "csv_trades": False,
+                "equity_curve": False,
+                "markdown_report": False,
+                "journal": False,
+            },
+        )
+        runner.add_strategy(OneShotLongStrategy("long-a"))
+        runner.add_strategy(OneShotLongStrategy("long-b"))
+
+        result = runner.run()
+
+        assert result is not None
+        assert result["max_drawdown"] == Decimal("80.00")

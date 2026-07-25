@@ -1,6 +1,6 @@
 from dataclasses import dataclass
 from decimal import Decimal
-from typing import List, Dict
+from typing import Dict, List, Sequence
 import pandas as pd
 import numpy as np
 from src.core.models import Trade, PositionSide
@@ -145,6 +145,7 @@ def calculate_metrics(
     risk_free_rate: float = 0.0,
     periods_per_year: int = 365,
     contract_multiplier: Decimal = Decimal("1"),
+    equity_samples: Sequence[tuple[int, Decimal]] | None = None,
 ) -> Dict:
     """Calculate performance metrics from a list of trades.
 
@@ -160,12 +161,21 @@ def calculate_metrics(
         max_consecutive_loss_amount, gross_profit, gross_loss
     """
     if not trade_history:
-        return {
+        result = {
             "total_pnl": Decimal("0.00"),
             "max_drawdown": Decimal("0.00"),
             "sharpe_ratio": 0.0,
             "win_rate": 0.0,
         }
+        if equity_samples is not None:
+            result.update(
+                _mark_to_market_drawdown_metrics(
+                    equity_samples,
+                    initial_balance=Decimal(str(initial_balance)),
+                    periods_per_year=periods_per_year,
+                )
+            )
+        return result
 
     closed_trades, trade_pnls, equity_curve, total_pnl = _build_closed_trades(
         trade_history,
@@ -307,10 +317,29 @@ def calculate_metrics(
                 cur_win_amt = Decimal("0")
                 cur_loss_amt = Decimal("0")
 
+    if equity_samples is not None:
+        mark_to_market_metrics = _mark_to_market_drawdown_metrics(
+            equity_samples,
+            initial_balance=Decimal(str(initial_balance)),
+            periods_per_year=periods_per_year,
+        )
+        max_drawdown = mark_to_market_metrics["max_drawdown"]
+        calmar_ratio = mark_to_market_metrics["calmar_ratio"]
+        max_drawdown_days = mark_to_market_metrics["max_drawdown_days"]
+        mark_to_market_pnl = mark_to_market_metrics["mark_to_market_pnl"]
+    else:
+        mark_to_market_pnl = total_pnl
+
+    reported_max_drawdown = (
+        max_drawdown
+        if equity_samples is not None
+        else Decimal(f"{max_drawdown:.2f}")
+    )
     return {
         # Basic (backward-compatible) - all numeric values as Decimal for precision
         "total_pnl": Decimal(f"{total_pnl:.2f}"),
-        "max_drawdown": Decimal(f"{max_drawdown:.2f}"),
+        "mark_to_market_pnl": mark_to_market_pnl,
+        "max_drawdown": reported_max_drawdown,
         "trade_sharpe": Decimal(f"{trade_sharpe:.2f}"),
         "win_rate": Decimal(f"{win_rate:.2f}"),
         "profit_factor": Decimal(f"{profit_factor:.2f}"),
@@ -330,4 +359,86 @@ def calculate_metrics(
         "gross_profit": Decimal(f"{gross_profit:.2f}"),
         "gross_loss": Decimal(f"{gross_loss:.2f}"),
         "closed_trades": closed_trades,
+    }
+
+
+def _mark_to_market_drawdown_metrics(
+    equity_samples: Sequence[tuple[int, Decimal]],
+    *,
+    initial_balance: Decimal,
+    periods_per_year: int,
+) -> dict[str, Decimal]:
+    if initial_balance <= 0:
+        raise ValueError("initial_balance must be positive")
+    if periods_per_year <= 0:
+        raise ValueError("periods_per_year must be positive")
+    if not equity_samples:
+        return {
+            "max_drawdown": Decimal("0.00"),
+            "calmar_ratio": Decimal("0.0000"),
+            "max_drawdown_days": Decimal("0.00"),
+            "mark_to_market_pnl": Decimal("0"),
+        }
+
+    previous_timestamp: int | None = None
+    peak_equity = initial_balance
+    peak_timestamp: int | None = None
+    max_drawdown = Decimal("0")
+    drawdown_started_at: int | None = None
+    longest_drawdown_ms = 0
+
+    for timestamp, equity in equity_samples:
+        if previous_timestamp is not None and timestamp <= previous_timestamp:
+            raise ValueError("equity sample timestamps must be strictly increasing")
+        previous_timestamp = timestamp
+        if not equity.is_finite():
+            raise ValueError("equity samples must be finite")
+
+        if equity >= peak_equity:
+            peak_equity = equity
+            if drawdown_started_at is not None:
+                longest_drawdown_ms = max(
+                    longest_drawdown_ms,
+                    timestamp - drawdown_started_at,
+                )
+                drawdown_started_at = None
+            peak_timestamp = timestamp
+            continue
+
+        max_drawdown = max(max_drawdown, peak_equity - equity)
+        if drawdown_started_at is None:
+            drawdown_started_at = (
+                peak_timestamp if peak_timestamp is not None else timestamp
+            )
+
+    first_timestamp = equity_samples[0][0]
+    last_timestamp = equity_samples[-1][0]
+    mark_to_market_pnl = equity_samples[-1][1] - initial_balance
+    if drawdown_started_at is not None:
+        longest_drawdown_ms = max(
+            longest_drawdown_ms,
+            last_timestamp - drawdown_started_at,
+        )
+
+    calmar_ratio = Decimal("0")
+    if max_drawdown > 0:
+        duration_days = max(
+            Decimal(last_timestamp - first_timestamp) / Decimal(86_400_000),
+            Decimal("1"),
+        )
+        annualized_return = (
+            mark_to_market_pnl
+            / initial_balance
+            * Decimal(periods_per_year)
+            / duration_days
+        )
+        calmar_ratio = annualized_return / (max_drawdown / initial_balance)
+
+    return {
+        "max_drawdown": max_drawdown,
+        "calmar_ratio": calmar_ratio.quantize(Decimal("0.0001")),
+        "max_drawdown_days": (
+            Decimal(longest_drawdown_ms) / Decimal(86_400_000)
+        ).quantize(Decimal("0.01")),
+        "mark_to_market_pnl": mark_to_market_pnl,
     }

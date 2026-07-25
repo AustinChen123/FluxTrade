@@ -283,7 +283,12 @@ class TestExportReports:
         metrics = {"total_pnl": 0, "closed_trades": []}
         journal = StrategyJournal("test")
 
-        result = runner._export_reports(metrics, journal, candle_count=0)
+        result = runner._export_reports(
+            metrics,
+            journal,
+            candle_count=0,
+            equity_samples=[],
+        )
         assert result is None
 
     @patch("src.core.backtest_runner.SessionLocal")
@@ -316,7 +321,15 @@ class TestExportReports:
         }
         journal = StrategyJournal("test")
 
-        result = runner._export_reports(metrics, journal, candle_count=100)
+        result = runner._export_reports(
+            metrics,
+            journal,
+            candle_count=100,
+            equity_samples=[
+                (1, Decimal("10000")),
+                (2, Decimal("9990")),
+            ],
+        )
 
         assert result is not None
         assert output_dir.exists()
