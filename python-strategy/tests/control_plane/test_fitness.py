@@ -3,9 +3,15 @@ from decimal import Decimal
 import pytest
 
 from src.control_plane.fitness import (
+    FITNESS_METRIC_DEFINITIONS,
+    REGISTERED_FITNESS_INPUTS,
+    FitnessMetricDefinition,
+    WalkForwardMetricData,
+    calculate_registered_fitness_inputs,
     deflated_sharpe_probability,
     evaluate_fitness_expression,
     expected_maximum_sharpe,
+    fitness_metric_contract,
     validate_fitness_expression,
 )
 from src.control_plane.parameter_search import _canonical_fitness_score
@@ -27,6 +33,109 @@ def test_fitness_expression_preserves_decimal_literal_text():
     )
 
     assert result == Decimal("0.10000000000000001")
+
+
+def test_metric_registry_owns_names_calculators_and_contract():
+    data = WalkForwardMetricData(
+        scores=(Decimal("10"), Decimal("20")),
+        returns=(Decimal("0.01"), Decimal("0.02")),
+        drawdown_percentages=(Decimal("0.03"), Decimal("0.04")),
+        daily_sharpes=(Decimal("1"), Decimal("2")),
+        annualized_sharpes=(Decimal("19"), Decimal("38")),
+        trade_counts=(2, 4),
+        pooled_daily_sharpe=Decimal("1.5"),
+        yearly_returns={"2025": Decimal("0.1")},
+        mean_r_values=(),
+    )
+
+    inputs = calculate_registered_fitness_inputs(data)
+    contract = fitness_metric_contract()
+
+    assert set(contract["metrics"]) == REGISTERED_FITNESS_INPUTS
+    assert set(inputs) == REGISTERED_FITNESS_INPUTS - {"worst_fold_mean_r"}
+    assert len(FITNESS_METRIC_DEFINITIONS) == len(REGISTERED_FITNESS_INPUTS)
+    sharpe_contract = contract["metrics"]["annualized_sharpe"]
+    assert sharpe_contract["sampling_interval"] == "utc_calendar_day"
+    assert sharpe_contract["periods_per_year"] == 365
+    assert sharpe_contract["risk_free_rate_annual"] == "0"
+    assert sharpe_contract["variance_ddof"] == 1
+    assert (
+        sharpe_contract["missing_day_policy"]
+        == "carry_prior_equity_zero_return"
+    )
+    assert (
+        contract["metrics"]["year_concentration"]["year_return_aggregation"]
+        == "compound_fold_returns_within_calendar_year"
+    )
+
+
+def test_custom_metric_definition_carries_calculation_and_contract_together():
+    definition = FitnessMetricDefinition(
+        name="custom_stability",
+        metric_id="custom_stability_v1",
+        calculator=lambda data: data.returns[0] * Decimal("2"),
+        source="fold_endpoint_returns",
+        aggregation="first_fold_times_two",
+    )
+    data = WalkForwardMetricData(
+        scores=(Decimal("1"),),
+        returns=(Decimal("0.25"),),
+        drawdown_percentages=(Decimal("0"),),
+        daily_sharpes=(Decimal("0"),),
+        annualized_sharpes=(Decimal("0"),),
+        trade_counts=(1,),
+        pooled_daily_sharpe=Decimal("0"),
+        yearly_returns={},
+        mean_r_values=(),
+    )
+
+    assert calculate_registered_fitness_inputs(
+        data,
+        definitions=(definition,),
+    ) == {"custom_stability": Decimal("0.50")}
+    assert fitness_metric_contract(definitions=(definition,))["metrics"] == {
+        "custom_stability": {
+            "metric_id": "custom_stability_v1",
+            "source": "fold_endpoint_returns",
+            "aggregation": "first_fold_times_two",
+        }
+    }
+
+
+def test_metric_registry_rejects_duplicate_names_and_nonfinite_outputs():
+    data = WalkForwardMetricData(
+        scores=(Decimal("1"),),
+        returns=(Decimal("0"),),
+        drawdown_percentages=(Decimal("0"),),
+        daily_sharpes=(Decimal("0"),),
+        annualized_sharpes=(Decimal("0"),),
+        trade_counts=(0,),
+        pooled_daily_sharpe=Decimal("0"),
+        yearly_returns={},
+        mean_r_values=(),
+    )
+    first = FitnessMetricDefinition(
+        "custom",
+        "custom_v1",
+        lambda _data: Decimal("0"),
+        "test",
+        "identity",
+    )
+    nonfinite = FitnessMetricDefinition(
+        "nonfinite",
+        "nonfinite_v1",
+        lambda _data: Decimal("NaN"),
+        "test",
+        "identity",
+    )
+
+    with pytest.raises(ValueError, match="names must be unique"):
+        fitness_metric_contract(definitions=(first, first))
+    with pytest.raises(ValueError, match="must be finite"):
+        calculate_registered_fitness_inputs(
+            data,
+            definitions=(nonfinite,),
+        )
 
 
 @pytest.mark.parametrize(

@@ -3,38 +3,17 @@
 from __future__ import annotations
 
 import ast
+from dataclasses import dataclass, field
 from decimal import Decimal
 import re
 from statistics import NormalDist
+from types import MappingProxyType
 from typing import Callable, Mapping, Sequence
 
 
 DEFAULT_WALK_FORWARD_FITNESS = (
     "deflated_sharpe + return_worst - drawdown_pct_worst "
     "- return_std - year_concentration"
-)
-
-REGISTERED_FITNESS_INPUTS = frozenset(
-    {
-        "deflated_sharpe",
-        "annualized_sharpe",
-        "annualized_sharpe_worst",
-        "daily_sharpe",
-        "daily_sharpe_worst",
-        "drawdown_pct_worst",
-        "fold_count",
-        "return_mean",
-        "return_std",
-        "return_worst",
-        "score_mean",
-        "score_sum",
-        "score_worst",
-        "trade_count_min",
-        "trade_count_mean",
-        "trade_count_total",
-        "worst_fold_mean_r",
-        "year_concentration",
-    }
 )
 
 _MAX_EXPRESSION_LENGTH = 512
@@ -145,6 +124,102 @@ def expected_maximum_sharpe(
 
 
 _EULER_NUMBER = Decimal("2.7182818284590452354")
+
+
+@dataclass(frozen=True, slots=True)
+class WalkForwardMetricData:
+    """Raw candidate aggregates exposed to registered metric calculators."""
+
+    scores: tuple[Decimal, ...]
+    returns: tuple[Decimal, ...]
+    drawdown_percentages: tuple[Decimal, ...]
+    daily_sharpes: tuple[Decimal, ...]
+    annualized_sharpes: tuple[Decimal, ...]
+    trade_counts: tuple[int, ...]
+    pooled_daily_sharpe: Decimal
+    yearly_returns: Mapping[str, Decimal]
+    mean_r_values: tuple[Decimal, ...]
+    deflated_sharpe: Decimal = Decimal("0")
+
+
+FitnessMetricCalculator = Callable[[WalkForwardMetricData], Decimal | None]
+
+
+@dataclass(frozen=True, slots=True)
+class FitnessMetricDefinition:
+    """One trusted metric calculator and its persisted semantic contract."""
+
+    name: str
+    metric_id: str
+    calculator: FitnessMetricCalculator
+    source: str
+    aggregation: str
+    metadata: Mapping[str, object] = field(default_factory=dict)
+
+    def __post_init__(self) -> None:
+        if not self.name.isidentifier():
+            raise ValueError("fitness metric name must be a valid identifier")
+        if not self.metric_id.strip():
+            raise ValueError("fitness metric_id cannot be blank")
+        if not self.source.strip() or not self.aggregation.strip():
+            raise ValueError("fitness metric source and aggregation cannot be blank")
+        object.__setattr__(
+            self,
+            "metadata",
+            MappingProxyType(dict(self.metadata)),
+        )
+
+    def contract(self) -> dict[str, object]:
+        return {
+            "metric_id": self.metric_id,
+            "source": self.source,
+            "aggregation": self.aggregation,
+            **self.metadata,
+        }
+
+
+def calculate_registered_fitness_inputs(
+    data: WalkForwardMetricData,
+    *,
+    definitions: Sequence[FitnessMetricDefinition] | None = None,
+) -> dict[str, Decimal]:
+    """Calculate inputs from the same registry used for validation and metadata."""
+    resolved = _resolve_metric_definitions(definitions)
+    inputs: dict[str, Decimal] = {}
+    for definition in resolved:
+        value = definition.calculator(data)
+        if value is not None:
+            inputs[definition.name] = _bounded_result(value)
+    return inputs
+
+
+def fitness_metric_contract(
+    *,
+    definitions: Sequence[FitnessMetricDefinition] | None = None,
+) -> dict[str, object]:
+    """Return the durable contract for the active trusted metric registry."""
+    resolved = _resolve_metric_definitions(definitions)
+    return {
+        "version": "walk_forward_fitness_v2",
+        "metrics": {
+            definition.name: definition.contract()
+            for definition in resolved
+        },
+    }
+
+
+def _resolve_metric_definitions(
+    definitions: Sequence[FitnessMetricDefinition] | None,
+) -> tuple[FitnessMetricDefinition, ...]:
+    resolved = (
+        FITNESS_METRIC_DEFINITIONS
+        if definitions is None
+        else tuple(definitions)
+    )
+    names = [definition.name for definition in resolved]
+    if len(names) != len(set(names)):
+        raise ValueError("fitness metric names must be unique")
+    return resolved
 
 
 def _parse_expression(expression: str) -> ast.Expression:
@@ -290,6 +365,200 @@ def _exponential(value: Decimal) -> Decimal:
     if abs(value) > Decimal("100"):
         raise ValueError("fitness exp input is too large")
     return value.exp()
+
+
+def _mean(values: Sequence[Decimal]) -> Decimal:
+    if not values:
+        return Decimal("0")
+    return sum(values, Decimal("0")) / Decimal(len(values))
+
+
+def _population_standard_deviation(values: Sequence[Decimal]) -> Decimal:
+    if len(values) < 2:
+        return Decimal("0")
+    mean = _mean(values)
+    variance = _mean([(value - mean) ** 2 for value in values])
+    return variance.sqrt()
+
+
+def _positive_year_concentration(
+    yearly_returns: Mapping[str, Decimal],
+) -> Decimal:
+    positive = [value for value in yearly_returns.values() if value > 0]
+    total = sum(positive, Decimal("0"))
+    if total <= 0:
+        return Decimal("1")
+    return max(positive) / total
+
+
+def _worst_fold_mean_r(data: WalkForwardMetricData) -> Decimal | None:
+    if len(data.mean_r_values) != len(data.scores):
+        return None
+    return min(data.mean_r_values)
+
+
+_DAILY_SHARPE_SOURCE = "utc_daily_mark_to_market_simple_returns_ddof_1_rf_0"
+_DAILY_SHARPE_METADATA = {
+    "sampling_interval": "utc_calendar_day",
+    "periods_per_year": 365,
+    "risk_free_rate_annual": "0",
+    "variance_estimator": "sample",
+    "variance_ddof": 1,
+    "missing_day_policy": "carry_prior_equity_zero_return",
+    "boundary_policy": "full_scoring_utc_date_range_leading_and_trailing_carry",
+    "zero_variance_policy": "zero",
+}
+FITNESS_METRIC_DEFINITIONS: tuple[FitnessMetricDefinition, ...] = (
+    FitnessMetricDefinition(
+        "deflated_sharpe",
+        "deflated_sharpe_probability_v1",
+        lambda data: data.deflated_sharpe,
+        _DAILY_SHARPE_SOURCE,
+        "all_evaluated_unique_genotypes",
+        {
+            **_DAILY_SHARPE_METADATA,
+            "observations": "pooled_utc_daily_returns",
+            "moments": "population_skewness_and_kurtosis_same_returns",
+            "benchmark": "all_evaluated_unique_genotypes",
+        },
+    ),
+    FitnessMetricDefinition(
+        "annualized_sharpe",
+        "annualized_sharpe_utc_daily_v1",
+        lambda data: data.pooled_daily_sharpe * Decimal(365).sqrt(),
+        _DAILY_SHARPE_SOURCE,
+        "pooled_raw_return_moments_sqrt_365",
+        _DAILY_SHARPE_METADATA,
+    ),
+    FitnessMetricDefinition(
+        "annualized_sharpe_worst",
+        "annualized_sharpe_worst_fold_v1",
+        lambda data: min(data.annualized_sharpes),
+        _DAILY_SHARPE_SOURCE,
+        "minimum_fold",
+        _DAILY_SHARPE_METADATA,
+    ),
+    FitnessMetricDefinition(
+        "daily_sharpe",
+        "daily_sharpe_utc_v1",
+        lambda data: data.pooled_daily_sharpe,
+        _DAILY_SHARPE_SOURCE,
+        "pooled_raw_return_moments",
+        _DAILY_SHARPE_METADATA,
+    ),
+    FitnessMetricDefinition(
+        "daily_sharpe_worst",
+        "daily_sharpe_worst_fold_v1",
+        lambda data: min(data.daily_sharpes),
+        _DAILY_SHARPE_SOURCE,
+        "minimum_fold",
+        _DAILY_SHARPE_METADATA,
+    ),
+    FitnessMetricDefinition(
+        "drawdown_pct_worst",
+        "drawdown_pct_worst_fold_v1",
+        lambda data: max(data.drawdown_percentages),
+        "fold_mark_to_market_max_drawdown_over_initial_balance",
+        "maximum_fold",
+    ),
+    FitnessMetricDefinition(
+        "fold_count",
+        "walk_forward_fold_count_v1",
+        lambda data: Decimal(len(data.scores)),
+        "resolved_scoring_folds",
+        "count",
+    ),
+    FitnessMetricDefinition(
+        "return_mean",
+        "fold_endpoint_return_mean_v1",
+        lambda data: _mean(data.returns),
+        "fold_endpoint_mark_to_market_pnl_over_initial_balance",
+        "arithmetic_mean",
+    ),
+    FitnessMetricDefinition(
+        "return_std",
+        "fold_endpoint_return_population_std_v1",
+        lambda data: _population_standard_deviation(data.returns),
+        "fold_endpoint_mark_to_market_pnl_over_initial_balance",
+        "population_std_ddof_0",
+    ),
+    FitnessMetricDefinition(
+        "return_worst",
+        "fold_endpoint_return_worst_v1",
+        lambda data: min(data.returns),
+        "fold_endpoint_mark_to_market_pnl_over_initial_balance",
+        "minimum_fold",
+    ),
+    FitnessMetricDefinition(
+        "score_mean",
+        "fold_score_mean_v1",
+        lambda data: _mean(data.scores),
+        "fold_endpoint_mark_to_market_pnl",
+        "arithmetic_mean",
+    ),
+    FitnessMetricDefinition(
+        "score_sum",
+        "fold_score_sum_v1",
+        lambda data: sum(data.scores, Decimal("0")),
+        "fold_endpoint_mark_to_market_pnl",
+        "sum",
+    ),
+    FitnessMetricDefinition(
+        "score_worst",
+        "fold_score_worst_v1",
+        lambda data: min(data.scores),
+        "fold_endpoint_mark_to_market_pnl",
+        "minimum_fold",
+    ),
+    FitnessMetricDefinition(
+        "trade_count_min",
+        "closed_trade_count_min_v1",
+        lambda data: Decimal(min(data.trade_counts)),
+        "closed_trade_count_including_breakeven",
+        "minimum_fold",
+    ),
+    FitnessMetricDefinition(
+        "trade_count_mean",
+        "closed_trade_count_mean_v1",
+        lambda data: _mean(
+            [Decimal(trade_count) for trade_count in data.trade_counts]
+        ),
+        "closed_trade_count_including_breakeven",
+        "arithmetic_mean",
+    ),
+    FitnessMetricDefinition(
+        "trade_count_total",
+        "closed_trade_count_total_v1",
+        lambda data: Decimal(sum(data.trade_counts)),
+        "closed_trade_count_including_breakeven",
+        "sum",
+    ),
+    FitnessMetricDefinition(
+        "worst_fold_mean_r",
+        "worst_fold_mean_r_v1",
+        _worst_fold_mean_r,
+        "fold_mean_r",
+        "minimum_fold_when_available_for_all_folds",
+    ),
+    FitnessMetricDefinition(
+        "year_concentration",
+        "positive_year_return_concentration_v1",
+        lambda data: _positive_year_concentration(data.yearly_returns),
+        "utc_daily_mark_to_market_returns",
+        "largest_positive_year_over_total_positive_years",
+        {
+            "year_return_aggregation": (
+                "compound_fold_returns_within_calendar_year"
+            ),
+            "formula": (
+                "largest_positive_year_return_over_all_positive_year_returns"
+            )
+        },
+    ),
+)
+REGISTERED_FITNESS_INPUTS = frozenset(
+    definition.name for definition in FITNESS_METRIC_DEFINITIONS
+)
 
 
 _FUNCTIONS: Mapping[str, Callable[..., Decimal]] = {
