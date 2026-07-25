@@ -564,10 +564,12 @@ def test_evolution_csv_evaluation_disables_early_stop_and_normalizes_drawdown(
     evaluator = CsvSignalBacktestParameterEvaluator()
     captured = {}
 
-    def run_backtest(backtest_request, *, max_drawdown_limit):
+    def run_backtest(backtest_request, *, max_drawdown_limit, data_source):
         captured["max_drawdown_limit"] = max_drawdown_limit
+        captured["data_source"] = data_source
         return {
             "total_pnl": "5",
+            "mark_to_market_pnl": "5",
             "max_drawdown": "-125.50",
         }
 

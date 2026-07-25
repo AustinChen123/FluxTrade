@@ -276,9 +276,9 @@ class EvolutionConfig(BaseModel):
 
 
 class CsvSignalBacktestEvaluationConfig(BaseModel):
-    """Backtest settings for CSV-signal parameter candidate evaluation."""
+    """Backtest accounting plus the default CSV candle-source reference."""
 
-    candles_csv_path: str = Field(min_length=1)
+    candles_csv_path: str | None = None
     initial_balance: Decimal = Decimal("10000")
     maker_fee: Decimal = Decimal("0")
     taker_fee: Decimal = Decimal("0")
@@ -287,7 +287,9 @@ class CsvSignalBacktestEvaluationConfig(BaseModel):
 
     @field_validator("candles_csv_path")
     @classmethod
-    def validate_path(cls, value: str) -> str:
+    def validate_path(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
         if not value.strip():
             raise ValueError("path cannot be blank")
         return str(Path(value))

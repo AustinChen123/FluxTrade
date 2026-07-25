@@ -5,27 +5,37 @@ from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from decimal import Decimal
-from pathlib import Path
 from threading import Lock
 from typing import Any, Callable, Iterable, Protocol, runtime_checkable
 from uuid import uuid4
 
 from sqlalchemy.orm import Session
 
-from src.control_plane.backtest_jobs import BacktestJobExecutor, SessionFactory, _json_safe
+from src.control_plane.backtest_jobs import (
+    BacktestJobExecutor,
+    BacktestRunSpec,
+    SessionFactory,
+    _json_safe,
+)
 from src.control_plane.evolution import (
     canonical_param_key,
     initial_population,
     next_population,
 )
+from src.control_plane.evaluation_data import (
+    CsvEvaluationDataSourceProvider,
+    EvaluationDataSourceProvider,
+)
 from src.control_plane.fitness import (
+    WalkForwardMetricData,
+    calculate_registered_fitness_inputs,
     deflated_sharpe_probability,
     evaluate_fitness_expression,
     expected_maximum_sharpe,
+    fitness_metric_contract,
 )
 from src.control_plane.jobs import InMemoryJobStore, JobStore
 from src.control_plane.models import (
-    BacktestJobRequest,
     CsvSignalBacktestEvaluationConfig,
     EvaluationDatasetConfig,
     JobRecord,
@@ -36,7 +46,6 @@ from src.control_plane.models import (
 )
 from src.control_plane.search_space import resolve_parameter_candidates
 from src.core.capital_allocator import CapitalAllocator
-from src.core.data_sources.csv_source import CsvDataSource
 from src.core.data_sources.memory import MemoryDataSource
 from src.core.golden_cross_fast_fitness import GoldenCrossFastFitnessEvaluator
 from src.core.models import GeneRole
@@ -50,45 +59,6 @@ from src.strategies.base import BaseStrategy
 from src.strategies.golden_cross import GoldenCrossStrategy
 
 
-_FITNESS_METRIC_CONTRACT = {
-    "version": "walk_forward_fitness_v2",
-    "sharpe": {
-        "metric_id": "annualized_sharpe_utc_daily_v1",
-        "return_source": "mark_to_market_equity_close_to_close_simple_return",
-        "sampling_interval": "utc_calendar_day",
-        "periods_per_year": 365,
-        "risk_free_rate_annual": "0",
-        "variance_estimator": "sample",
-        "variance_ddof": 1,
-        "annualization": "sqrt_periods_per_year",
-        "missing_day_policy": "carry_prior_equity_zero_return",
-        "boundary_policy": "full_scoring_utc_date_range_leading_and_trailing_carry",
-        "zero_variance_policy": "zero",
-        "fold_aggregation": "pooled_raw_return_moments",
-    },
-    "deflated_sharpe": {
-        "observed_metric": "unannualized_utc_daily_sharpe",
-        "observations": "pooled_utc_daily_returns",
-        "moments": "population_skewness_and_kurtosis_same_returns",
-        "benchmark": "all_evaluated_unique_genotypes",
-    },
-    "year_concentration": {
-        "source": "utc_daily_mark_to_market_returns",
-        "aggregation": "compound_fold_returns_within_calendar_year",
-        "formula": "largest_positive_year_return_over_all_positive_year_returns",
-    },
-    "trade_counts": {
-        "source": "closed_trade_count_including_breakeven",
-        "outputs": ["trade_count_min", "trade_count_mean", "trade_count_total"],
-    },
-    "trade_pnl_quality": {
-        "metric_id": "trade_pnl_quality_v1",
-        "source": "closed_trade_net_pnl",
-        "formula": "mean_over_population_std_ddof_0",
-        "annualized": False,
-        "comparison_scope": "same_strategy_sizing_and_execution_only",
-    },
-}
 _FITNESS_SCORE_QUANTUM = Decimal("0.00000001")
 _FITNESS_SCORE_MAX = Decimal("9999999999.99999999")
 
@@ -134,10 +104,20 @@ class CsvSignalBacktestParameterEvaluator:
     candle CSV and fees live in ``ParameterSearchJobRequest.backtest``.
     """
 
-    def __init__(self, db_session_factory: SessionFactory | None = None) -> None:
+    def __init__(
+        self,
+        db_session_factory: SessionFactory | None = None,
+        *,
+        data_source_provider: EvaluationDataSourceProvider | None = None,
+    ) -> None:
         self._backtest_executor = BacktestJobExecutor(
             db_session_factory=db_session_factory,
             run_inline=True,
+        )
+        self._data_source_provider = (
+            data_source_provider
+            if data_source_provider is not None
+            else CsvEvaluationDataSourceProvider()
         )
 
     def evaluate(
@@ -153,7 +133,7 @@ class CsvSignalBacktestParameterEvaluator:
         if not isinstance(signals_csv_path, str) or not signals_csv_path.strip():
             raise ValueError("candidate param_pack.signals_csv_path is required")
 
-        backtest_request = BacktestJobRequest(
+        backtest_request = BacktestRunSpec(
             strategy_id=f"{request.strategy_id}_{candidate.candidate_id}",
             product_id=request.product_id,
             timeframe=request.timeframe,
@@ -170,8 +150,9 @@ class CsvSignalBacktestParameterEvaluator:
         result = self._backtest_executor.run_backtest_request(
             backtest_request,
             max_drawdown_limit=None if request.evolution is not None else 0.20,
+            data_source=self._data_source_provider.create(request),
         )
-        score = _result_decimal(result, "total_pnl")
+        score = _result_decimal(result, "mark_to_market_pnl")
         max_drawdown = _result_decimal(result, "max_drawdown")
         return ParameterEvaluationResult(
             candidate_id=candidate.candidate_id,
@@ -193,10 +174,16 @@ class ResearchBacktestParameterEvaluator:
         *,
         preload_candles: bool = True,
         precision_codec: PrecisionCodec | None = None,
+        data_source_provider: EvaluationDataSourceProvider | None = None,
     ) -> None:
         self._strategy_factory = strategy_factory
         self._preload_candles = preload_candles
         self._precision_codec = precision_codec
+        self._data_source_provider = (
+            data_source_provider
+            if data_source_provider is not None
+            else CsvEvaluationDataSourceProvider()
+        )
         self._candle_cache: dict[tuple, list] = {}
         self._prepared_scaled_cache: dict[tuple, list] = {}
 
@@ -281,19 +268,15 @@ class ResearchBacktestParameterEvaluator:
             metrics=_normalize_metrics_drawdown(metrics),
         )
 
-    @staticmethod
     def _warm_up_strategy(
+        self,
         request: ParameterSearchJobRequest,
         strategy: BaseStrategy,
         *,
         warmup_start_time: int,
     ) -> None:
         assert request.backtest is not None
-        source = CsvDataSource(
-            file_path=request.backtest.candles_csv_path,
-            product_id=request.product_id,
-            timeframe=request.timeframe,
-        )
+        source = self._data_source_provider.create(request)
         candles = list(
             source.get_candles(
                 request.product_id,
@@ -316,19 +299,15 @@ class ResearchBacktestParameterEvaluator:
 
     def _replay_inputs_for(self, request: ParameterSearchJobRequest):
         assert request.backtest is not None
-        csv_source = CsvDataSource(
-            file_path=request.backtest.candles_csv_path,
-            product_id=request.product_id,
-            timeframe=request.timeframe,
-        )
+        data_source = self._data_source_provider.create(request)
         if not self._preload_candles:
-            return csv_source, None
+            return data_source, None
 
-        cache_key = _candle_cache_key(request)
+        cache_key = _candle_cache_key(request, self._data_source_provider)
         candles = self._candle_cache.get(cache_key)
         if candles is None:
             candles = list(
-                csv_source.get_candles(
+                data_source.get_candles(
                     request.product_id,
                     request.timeframe,
                     request.start_time,
@@ -352,17 +331,32 @@ class ResearchBacktestParameterEvaluator:
 class GoldenCrossResearchParameterEvaluator(ResearchBacktestParameterEvaluator):
     """Research evaluator for GoldenCrossStrategy parameter packs."""
 
-    def __init__(self, precision_codec: PrecisionCodec | None = None) -> None:
+    def __init__(
+        self,
+        precision_codec: PrecisionCodec | None = None,
+        *,
+        data_source_provider: EvaluationDataSourceProvider | None = None,
+    ) -> None:
         super().__init__(
             _golden_cross_strategy_factory,
             precision_codec=precision_codec,
+            data_source_provider=data_source_provider,
         )
 
 
 class GoldenCrossFastFitnessParameterEvaluator:
     """Evaluate GoldenCross candidates through the numeric fitness path."""
 
-    def __init__(self) -> None:
+    def __init__(
+        self,
+        *,
+        data_source_provider: EvaluationDataSourceProvider | None = None,
+    ) -> None:
+        self._data_source_provider = (
+            data_source_provider
+            if data_source_provider is not None
+            else CsvEvaluationDataSourceProvider()
+        )
         self._fitness_cache: dict[tuple, GoldenCrossFastFitnessEvaluator] = {}
 
     def evaluate(
@@ -403,14 +397,10 @@ class GoldenCrossFastFitnessParameterEvaluator:
         request: ParameterSearchJobRequest,
     ) -> GoldenCrossFastFitnessEvaluator:
         assert request.backtest is not None
-        cache_key = _fitness_cache_key(request)
+        cache_key = _fitness_cache_key(request, self._data_source_provider)
         evaluator = self._fitness_cache.get(cache_key)
         if evaluator is None:
-            data_source = CsvDataSource(
-                file_path=request.backtest.candles_csv_path,
-                product_id=request.product_id,
-                timeframe=request.timeframe,
-            )
+            data_source = self._data_source_provider.create(request)
             df = data_source.get_candles_df(
                 request.product_id,
                 request.timeframe,
@@ -453,14 +443,12 @@ def _golden_cross_strategy_factory(
     )
 
 
-def _candle_cache_key(request: ParameterSearchJobRequest) -> tuple:
-    assert request.backtest is not None
-    path = Path(request.backtest.candles_csv_path)
-    stat = path.stat()
+def _candle_cache_key(
+    request: ParameterSearchJobRequest,
+    data_source_provider: EvaluationDataSourceProvider,
+) -> tuple:
     return (
-        str(path.resolve()),
-        stat.st_mtime_ns,
-        stat.st_size,
+        data_source_provider.cache_key(request),
         request.product_id,
         request.timeframe,
         request.start_time,
@@ -468,11 +456,14 @@ def _candle_cache_key(request: ParameterSearchJobRequest) -> tuple:
     )
 
 
-def _fitness_cache_key(request: ParameterSearchJobRequest) -> tuple:
+def _fitness_cache_key(
+    request: ParameterSearchJobRequest,
+    data_source_provider: EvaluationDataSourceProvider,
+) -> tuple:
     assert request.backtest is not None
     instrument = request.backtest.instrument
     return (
-        _candle_cache_key(request),
+        _candle_cache_key(request, data_source_provider),
         request.backtest.initial_balance,
         request.backtest.taker_fee,
         instrument.multiplier if instrument is not None else None,
@@ -1014,7 +1005,7 @@ def _evolution_config_payload(
 ) -> dict[str, Any]:
     payload = request.model_dump(mode="json")
     if request.fitness is not None:
-        payload["fitness_metric_contract"] = _FITNESS_METRIC_CONTRACT
+        payload["fitness_metric_contract"] = fitness_metric_contract()
     return payload
 
 
@@ -1161,11 +1152,12 @@ def _apply_walk_forward_fitness(
         metrics = {
             **evaluation.metrics,
             "aggregation": "registered_walk_forward_fitness",
+            "fitness_inputs": inputs,
             "fitness": {
                 "expression": request.fitness.expression,
                 "independent_trials": independent_trials,
                 "benchmark_sharpe": benchmark_sharpe,
-                "metric_contract": _FITNESS_METRIC_CONTRACT,
+                "metric_contract": fitness_metric_contract(),
                 "inputs": inputs,
                 "score": score,
             },
@@ -1269,31 +1261,19 @@ def _walk_forward_inputs(
 
     pooled_statistics = _return_statistics(pooled_moments)
 
-    inputs = {
-        "annualized_sharpe": (
-            pooled_statistics["sharpe"] * Decimal(365).sqrt()
-        ),
-        "annualized_sharpe_worst": min(annualized_sharpes),
-        "daily_sharpe": pooled_statistics["sharpe"],
-        "daily_sharpe_worst": min(daily_sharpes),
-        "deflated_sharpe": Decimal("0"),
-        "drawdown_pct_worst": max(drawdown_percentages),
-        "fold_count": Decimal(len(scores)),
-        "return_mean": _mean(returns),
-        "return_std": _population_standard_deviation(returns),
-        "return_worst": min(returns),
-        "score_mean": _mean(scores),
-        "score_sum": sum(scores, Decimal("0")),
-        "score_worst": min(scores),
-        "trade_count_min": Decimal(min(trade_counts)),
-        "trade_count_mean": _mean(
-            [Decimal(trade_count) for trade_count in trade_counts]
-        ),
-        "trade_count_total": Decimal(sum(trade_counts)),
-        "year_concentration": _positive_year_concentration(yearly_returns),
-    }
-    if len(mean_r_values) == len(scores):
-        inputs["worst_fold_mean_r"] = min(mean_r_values)
+    inputs = calculate_registered_fitness_inputs(
+        WalkForwardMetricData(
+            scores=tuple(scores),
+            returns=tuple(returns),
+            drawdown_percentages=tuple(drawdown_percentages),
+            daily_sharpes=tuple(daily_sharpes),
+            annualized_sharpes=tuple(annualized_sharpes),
+            trade_counts=tuple(trade_counts),
+            pooled_daily_sharpe=pooled_statistics["sharpe"],
+            yearly_returns=yearly_returns,
+            mean_r_values=tuple(mean_r_values),
+        )
+    )
 
     statistics: dict[str, Decimal | int] = {
         "observations": pooled_moments["count"],
@@ -1383,28 +1363,6 @@ def _return_statistics(
         "skewness": third_moment / (second_moment.sqrt() ** 3),
         "kurtosis": fourth_moment / (second_moment**2),
     }
-
-
-def _mean(values: list[Decimal]) -> Decimal:
-    if not values:
-        return Decimal("0")
-    return sum(values, Decimal("0")) / Decimal(len(values))
-
-
-def _population_standard_deviation(values: list[Decimal]) -> Decimal:
-    if len(values) < 2:
-        return Decimal("0")
-    mean = _mean(values)
-    variance = _mean([(value - mean) ** 2 for value in values])
-    return variance.sqrt()
-
-
-def _positive_year_concentration(yearly_returns: dict[str, Decimal]) -> Decimal:
-    positive = [value for value in yearly_returns.values() if value > 0]
-    total = sum(positive, Decimal("0"))
-    if total <= 0:
-        return Decimal("1")
-    return max(positive) / total
 
 
 def _normalize_evaluation_result(

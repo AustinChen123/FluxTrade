@@ -2,6 +2,10 @@
 
 from src.control_plane.app import ControlPlaneApp, HttpResponse
 from src.control_plane.backtest_jobs import BacktestJobExecutor
+from src.control_plane.evaluation_data import (
+    CsvEvaluationDataSourceProvider,
+    EvaluationDataSourceProvider,
+)
 from src.control_plane.gene_control import GeneControlService
 from src.control_plane.jobs import InMemoryJobStore, JobStatus, JobStore, SqliteJobStore
 from src.control_plane.models import (
@@ -44,8 +48,10 @@ __all__ = [
     "ControlPlaneApp",
     "CsvSignalBacktestEvaluationConfig",
     "CsvSignalBacktestParameterEvaluator",
+    "CsvEvaluationDataSourceProvider",
     "DecimalSearchRange",
     "EvaluationDatasetConfig",
+    "EvaluationDataSourceProvider",
     "EvaluationSetConfig",
     "EvolutionConfig",
     "FitnessConfig",

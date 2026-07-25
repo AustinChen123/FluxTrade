@@ -521,7 +521,9 @@ def test_research_warmup_excludes_scoring_boundary_and_restores_trade_state(tmp_
     request = ParameterSearchJobRequest.model_validate(payload)
     strategy = _WarmupRecordingStrategy()
 
-    ResearchBacktestParameterEvaluator._warm_up_strategy(
+    ResearchBacktestParameterEvaluator(
+        lambda *_args: strategy,
+    )._warm_up_strategy(
         request,
         strategy,
         warmup_start_time=5_000,
@@ -549,7 +551,9 @@ def test_research_warmup_rejects_strategy_without_complete_state_contract(tmp_pa
         NotImplementedError,
         match="walk-forward trade-state isolation",
     ):
-        ResearchBacktestParameterEvaluator._warm_up_strategy(
+        ResearchBacktestParameterEvaluator(
+            lambda *_args: BaseStrategyWithoutWarmupContract(),
+        )._warm_up_strategy(
             request,
             BaseStrategyWithoutWarmupContract(),
             warmup_start_time=5_000,
@@ -734,6 +738,11 @@ def test_walk_forward_fitness_prefers_stable_candidate():
     }
     stable_fitness = evaluations["stable"]["metrics"]["fitness"]
     assert stable_fitness["expression"].startswith("deflated_sharpe")
+    assert (
+        evaluations["stable"]["metrics"]["fitness_inputs"]
+        == stable_fitness["inputs"]
+    )
+    assert stable_fitness["inputs"]["deflated_sharpe"] != "0"
     assert stable_fitness["inputs"]["return_worst"] == "0.004"
     assert stable_fitness["inputs"]["year_concentration"] == "0.5"
     assert stable_fitness["inputs"]["trade_count_min"] == "100"

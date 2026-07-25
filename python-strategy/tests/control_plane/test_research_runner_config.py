@@ -74,6 +74,19 @@ class _NoopEvaluator:
         )
 
 
+class _StaticDataSourceProvider:
+    def __init__(self, source):
+        self.source = source
+        self.requests = []
+
+    def create(self, request):
+        self.requests.append(request)
+        return self.source
+
+    def cache_key(self, request):
+        return "static", request.product_id, request.timeframe
+
+
 def _strategy_factory(strategy_id, product_id, timeframe, param_pack):
     return SimpleNamespace(
         strategy_id=strategy_id,
@@ -180,6 +193,28 @@ def test_research_parameter_search_propagates_instrument_spec(tmp_path, monkeypa
     assert spec.capital_per_contract == Decimal("2500")
 
 
+def test_research_evaluator_uses_injected_data_source_provider(
+    tmp_path,
+    monkeypatch,
+):
+    monkeypatch.setattr(parameter_search, "ResearchBacktestRunner", _RecordingRunner)
+    _RecordingRunner.instances = []
+    source = object()
+    provider = _StaticDataSourceProvider(source)
+    payload = _request_payload(tmp_path)
+    payload["backtest"].pop("candles_csv_path")
+    request = ParameterSearchJobRequest.model_validate(payload)
+
+    ResearchBacktestParameterEvaluator(
+        _strategy_factory,
+        preload_candles=False,
+        data_source_provider=provider,
+    ).evaluate(request, ParameterCandidate(candidate_id="a", param_pack={}))
+
+    assert _RecordingRunner.instances[0].kwargs["data_source"] is source
+    assert provider.requests == [request]
+
+
 def test_research_evaluator_scores_fold_endpoint_equity(tmp_path, monkeypatch):
     class _OpenPositionRunner(_RecordingRunner):
         def run(self):
@@ -204,6 +239,64 @@ def test_research_evaluator_scores_fold_endpoint_equity(tmp_path, monkeypatch):
     assert result.score_total == Decimal("-7")
     assert result.metrics["total_pnl"] == "1"
     assert result.metrics["mark_to_market_pnl"] == "-7"
+
+
+def test_csv_signal_evaluator_uses_injected_source_and_endpoint_equity(
+    tmp_path,
+    monkeypatch,
+):
+    payload = _request_payload(tmp_path)
+    payload.pop("research_runner")
+    payload["backtest"].pop("candles_csv_path")
+    request = ParameterSearchJobRequest.model_validate(payload)
+    source = object()
+    provider = _StaticDataSourceProvider(source)
+    evaluator = CsvSignalBacktestParameterEvaluator(
+        data_source_provider=provider,
+    )
+    captured = {}
+
+    def run_backtest_request(backtest_request, **kwargs):
+        captured["request"] = backtest_request
+        captured.update(kwargs)
+        return {
+            "total_pnl": "1",
+            "mark_to_market_pnl": "-7",
+            "max_drawdown": "2",
+        }
+
+    monkeypatch.setattr(
+        evaluator._backtest_executor,
+        "run_backtest_request",
+        run_backtest_request,
+    )
+
+    result = evaluator.evaluate(
+        request,
+        ParameterCandidate(
+            candidate_id="a",
+            param_pack={"signals_csv_path": str(tmp_path / "signals.csv")},
+        ),
+    )
+
+    assert result.score_total == Decimal("-7")
+    assert captured["data_source"] is source
+    assert provider.requests == [request]
+
+
+def test_default_csv_provider_rejects_missing_candle_path(tmp_path):
+    payload = _request_payload(tmp_path)
+    payload["backtest"].pop("candles_csv_path")
+    request = ParameterSearchJobRequest.model_validate(payload)
+
+    with pytest.raises(ValueError, match="CSV market data requires"):
+        ResearchBacktestParameterEvaluator(
+            _strategy_factory,
+            preload_candles=False,
+        ).evaluate(
+            request,
+            ParameterCandidate(candidate_id="a", param_pack={}),
+        )
 
 
 def test_research_parameter_search_isolates_capital_allocators_per_dataset(
