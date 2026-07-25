@@ -111,7 +111,12 @@ pub(crate) fn decode_last_trade(payload: &[u8]) -> Result<MarketDataEvent> {
     let quantity = trade.trade_size.context("missing Rithmic trade size")?;
     ensure!(quantity > 0, "invalid Rithmic trade size");
     let ssboe = trade.ssboe.context("missing Rithmic trade ssboe")?;
-    let usecs = trade.usecs.context("missing Rithmic trade usecs")?;
+    let is_snapshot = trade.is_snapshot.unwrap_or(false);
+    let usecs = match trade.usecs {
+        Some(usecs) => usecs,
+        None if is_snapshot => 0,
+        None => anyhow::bail!("missing Rithmic live trade usecs"),
+    };
     ensure!(ssboe >= 0, "invalid Rithmic trade ssboe");
     ensure!(
         (0..1_000_000).contains(&usecs),
@@ -134,7 +139,7 @@ pub(crate) fn decode_last_trade(payload: &[u8]) -> Result<MarketDataEvent> {
             Some(_) => anyhow::bail!("unknown Rithmic trade aggressor"),
         },
         timestamp: epoch_millis(ssboe, usecs),
-        is_snapshot: trade.is_snapshot.unwrap_or(false),
+        is_snapshot,
     }))
 }
 
@@ -301,14 +306,31 @@ mod tests {
     }
 
     #[test]
-    fn complete_trade_requires_usecs() {
-        let payload = codec::encode(&protocol::LastTrade {
+    fn missing_usecs_is_allowed_only_for_database_snapshots() {
+        let trade = protocol::LastTrade {
             usecs: None,
+            is_snapshot: Some(true),
             ..codec::decode::<protocol::LastTrade>(&last_trade_payload()).unwrap()
-        })
-        .unwrap();
+        };
+        let payload = codec::encode(&trade).unwrap();
 
-        assert!(decode_last_trade(&payload).is_err());
+        assert!(matches!(
+            decode_last_trade(&payload).unwrap(),
+            MarketDataEvent::LastTrade(LastTradeUpdate {
+                timestamp: 1_784_243_600_000,
+                is_snapshot: true,
+                ..
+            })
+        ));
+
+        for is_snapshot in [None, Some(false)] {
+            let payload = codec::encode(&protocol::LastTrade {
+                is_snapshot,
+                ..trade.clone()
+            })
+            .unwrap();
+            assert!(decode_last_trade(&payload).is_err());
+        }
     }
 
     #[test]
