@@ -13,6 +13,7 @@ from src.control_plane.models import (
     ParameterEvaluationResult,
     ParameterSearchJobRequest,
 )
+import src.control_plane.parameter_evaluation as parameter_evaluation
 from src.control_plane.parameter_search import (
     CsvSignalBacktestParameterEvaluator,
     GoldenCrossFastFitnessParameterEvaluator,
@@ -21,7 +22,6 @@ from src.control_plane.parameter_search import (
     ResearchBacktestParameterEvaluator,
 )
 from src.core.orm_models import EvolutionEpoch, GeneRecord, Strategy, SystemEvent
-import src.control_plane.parameter_search as parameter_search
 
 
 @compiles(JSONB, "sqlite")
@@ -142,7 +142,7 @@ def test_research_parameter_search_creates_isolated_capital_allocators(
     tmp_path,
     monkeypatch,
 ):
-    monkeypatch.setattr(parameter_search, "ResearchBacktestRunner", _RecordingRunner)
+    monkeypatch.setattr(parameter_evaluation, "ResearchBacktestRunner", _RecordingRunner)
     _RecordingRunner.instances = []
     evaluator = ResearchBacktestParameterEvaluator(
         _strategy_factory,
@@ -170,7 +170,7 @@ def test_research_parameter_search_creates_isolated_capital_allocators(
 
 
 def test_research_parameter_search_propagates_instrument_spec(tmp_path, monkeypatch):
-    monkeypatch.setattr(parameter_search, "ResearchBacktestRunner", _RecordingRunner)
+    monkeypatch.setattr(parameter_evaluation, "ResearchBacktestRunner", _RecordingRunner)
     _RecordingRunner.instances = []
     payload = _request_payload(tmp_path)
     payload["backtest"]["instrument"] = {
@@ -197,7 +197,7 @@ def test_research_evaluator_uses_injected_data_source_provider(
     tmp_path,
     monkeypatch,
 ):
-    monkeypatch.setattr(parameter_search, "ResearchBacktestRunner", _RecordingRunner)
+    monkeypatch.setattr(parameter_evaluation, "ResearchBacktestRunner", _RecordingRunner)
     _RecordingRunner.instances = []
     source = object()
     provider = _StaticDataSourceProvider(source)
@@ -224,7 +224,11 @@ def test_research_evaluator_scores_fold_endpoint_equity(tmp_path, monkeypatch):
                 "mark_to_market_pnl": Decimal("-7"),
             }
 
-    monkeypatch.setattr(parameter_search, "ResearchBacktestRunner", _OpenPositionRunner)
+    monkeypatch.setattr(
+        parameter_evaluation,
+        "ResearchBacktestRunner",
+        _OpenPositionRunner,
+    )
     evaluator = ResearchBacktestParameterEvaluator(
         _strategy_factory,
         preload_candles=False,
@@ -303,7 +307,7 @@ def test_research_parameter_search_isolates_capital_allocators_per_dataset(
     tmp_path,
     monkeypatch,
 ):
-    monkeypatch.setattr(parameter_search, "ResearchBacktestRunner", _RecordingRunner)
+    monkeypatch.setattr(parameter_evaluation, "ResearchBacktestRunner", _RecordingRunner)
     _RecordingRunner.instances = []
     evaluator = ResearchBacktestParameterEvaluator(
         _strategy_factory,
@@ -360,7 +364,7 @@ def test_research_evaluator_rejects_allocation_above_initial_balance(
     tmp_path,
     monkeypatch,
 ):
-    monkeypatch.setattr(parameter_search, "ResearchBacktestRunner", _RecordingRunner)
+    monkeypatch.setattr(parameter_evaluation, "ResearchBacktestRunner", _RecordingRunner)
     evaluator = ResearchBacktestParameterEvaluator(
         _strategy_factory,
         preload_candles=False,

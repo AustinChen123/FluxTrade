@@ -26,14 +26,14 @@ from src.control_plane.models import (
     ResearchRunnerEvaluationConfig,
     WalkForwardEvaluationConfig,
 )
-from src.control_plane.parameter_search import (
+from src.control_plane.parameter_evaluation import (
     CsvSignalBacktestParameterEvaluator,
     GoldenCrossFastFitnessParameterEvaluator,
     GoldenCrossResearchParameterEvaluator,
     ParameterSearchEvaluator,
-    ParameterSearchJobExecutor,
     ResearchBacktestParameterEvaluator,
 )
+from src.control_plane.parameter_search import ParameterSearchJobExecutor
 from src.control_plane.presets import (
     DecimalSearchRange,
     GoldenCrossParameterSearchPreset,
