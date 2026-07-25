@@ -14,7 +14,10 @@ from src.control_plane.fitness import (
     fitness_metric_contract,
     validate_fitness_expression,
 )
-from src.control_plane.parameter_search import _canonical_fitness_score
+from src.control_plane.parameter_fitness import _canonical_fitness_score
+from src.control_plane.parameter_search import (
+    _canonical_fitness_score as _legacy_canonical_fitness_score,
+)
 
 
 def test_registered_fitness_expression_uses_decimal_math():
@@ -241,6 +244,7 @@ def test_expected_maximum_sharpe_moves_with_sample_mean():
 
 
 def test_fitness_score_is_canonical_before_selection_and_persistence():
+    assert _legacy_canonical_fitness_score is _canonical_fitness_score
     assert _canonical_fitness_score(Decimal("1.000000004")) == Decimal(
         "1.00000000"
     )
