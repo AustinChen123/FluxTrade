@@ -12,11 +12,25 @@ from src.control_plane.models import (
     ParameterEvaluationResult,
     ParameterSearchJobRequest,
 )
-from src.control_plane.parameter_search import ParameterSearchJobExecutor
+from src.control_plane.parameter_search import (
+    ParameterSearchJobExecutor,
+    ResearchBacktestParameterEvaluator,
+)
 from src.core.orm_models import EvolutionEpoch, GeneRecord, Strategy, SystemEvent
+from src.strategies.base import BaseStrategy, StrategyRequirements
 
 
 PRODUCT_ID = "BINANCE:BTCUSDT-PERP"
+
+
+def _daily_return_moments(*values: Decimal) -> dict[str, Decimal | int]:
+    return {
+        "count": len(values),
+        "sum": sum(values, Decimal("0")),
+        "sum_squares": sum((value**2 for value in values), Decimal("0")),
+        "sum_cubes": sum((value**3 for value in values), Decimal("0")),
+        "sum_fourth": sum((value**4 for value in values), Decimal("0")),
+    }
 
 
 @compiles(JSONB, "sqlite")
@@ -62,6 +76,136 @@ class _DrawdownEvaluator:
             max_drawdown=drawdown,
             metrics={"max_drawdown": drawdown},
         )
+
+
+class _WarmupAwareEvaluator(_NoopEvaluator):
+    def __init__(self):
+        super().__init__()
+        self.warmups = []
+
+    def evaluate_with_warmup(
+        self,
+        request,
+        candidate,
+        *,
+        warmup_start_time,
+    ):
+        self.warmups.append(
+            (warmup_start_time, request.start_time, request.end_time)
+        )
+        return self.evaluate(request, candidate)
+
+
+class _WalkForwardFitnessEvaluator:
+    def evaluate(self, request, candidate):
+        fragile = candidate.candidate_id == "fragile"
+        first_fold = request.start_time == 10
+        if fragile:
+            score = Decimal("100") if first_fold else Decimal("-10")
+            sharpe = Decimal("2") if first_fold else Decimal("-1")
+            drawdown = Decimal("50") if first_fold else Decimal("100")
+        else:
+            score = Decimal("40")
+            sharpe = Decimal("1")
+            drawdown = Decimal("20")
+        year = "2020" if first_fold else "2021"
+        return ParameterEvaluationResult(
+            candidate_id=candidate.candidate_id,
+            score_total=score,
+            max_drawdown=drawdown,
+            metrics={
+                "daily_return_moments": _daily_return_moments(
+                    Decimal("0.01"),
+                    Decimal("0.02"),
+                ),
+                "closed_trade_count": 100,
+                "equity_sample_count": 2,
+                "max_drawdown": drawdown,
+                "monthly_returns": {f"{year}-01": score},
+                "total_trades": 100,
+                "trade_pnl_quality": sharpe,
+                "yearly_mark_to_market_returns": {
+                    year: score / Decimal("10000")
+                },
+            },
+        )
+
+
+class _BalanceScaledFitnessEvaluator:
+    def evaluate(self, request, candidate):
+        assert request.backtest is not None
+        score = request.backtest.initial_balance / Decimal("10")
+        year = "2020" if request.start_time == 10 else "2021"
+        return ParameterEvaluationResult(
+            candidate_id=candidate.candidate_id,
+            score_total=score,
+            max_drawdown=Decimal("0"),
+            metrics={
+                "daily_return_moments": _daily_return_moments(
+                    Decimal("0.01"),
+                    Decimal("0.02"),
+                ),
+                "closed_trade_count": 2,
+                "equity_sample_count": 2,
+                "monthly_returns": {f"{year}-01": score},
+                "total_trades": 2,
+                "yearly_mark_to_market_returns": {
+                    year: score / request.backtest.initial_balance
+                },
+            },
+        )
+
+
+class _EmptyScoringFitnessEvaluator:
+    def evaluate(self, request, candidate):
+        return ParameterEvaluationResult(
+            candidate_id=candidate.candidate_id,
+            score_total=Decimal("0"),
+            max_drawdown=Decimal("0"),
+            metrics={
+                "daily_return_moments": _daily_return_moments(),
+                "closed_trade_count": 0,
+                "equity_sample_count": 0,
+                "total_trades": 0,
+                "yearly_mark_to_market_returns": {},
+            },
+        )
+
+
+class _WarmupRecordingStrategy(BaseStrategy):
+    def __init__(self):
+        super().__init__("warmup", PRODUCT_ID)
+        self.timestamps = []
+        self._in_position = False
+        self.active_trade = None
+
+    @property
+    def requirements(self):
+        return StrategyRequirements(self.product_id, "5m", 2)
+
+    def on_candle(self, candle, context=None):
+        self.timestamps.append(candle.timestamp)
+        self._in_position = True
+        self.active_trade = {"entry": candle.close}
+        return None
+
+    def snapshot_walk_forward_trade_state(self):
+        return self._in_position, self.active_trade
+
+    def restore_walk_forward_trade_state(self, state):
+        self._in_position, self.active_trade = state
+
+
+class BaseStrategyWithoutWarmupContract(BaseStrategy):
+    def __init__(self):
+        super().__init__("no_contract", PRODUCT_ID)
+
+    @property
+    def requirements(self):
+        return StrategyRequirements(self.product_id, "5m", 2)
+
+    def on_candle(self, candle, context=None):
+        return None
 
 
 def _base_search_request() -> dict:
@@ -183,6 +327,73 @@ def test_evaluation_set_config_converts_to_core_model():
     assert dataset.metadata["regime"] == "trend"
 
 
+def test_evaluation_set_config_generates_walk_forward_folds():
+    config = EvaluationSetConfig.model_validate(
+        {
+            "walk_forward": {
+                "product_id": PRODUCT_ID,
+                "timeframe": "5m",
+                "start_time": 1_000,
+                "end_time": 3_499,
+                "fold_duration_ms": 1_000,
+                "warmup_duration_ms": 500,
+                "dataset_id_prefix": "fold",
+            }
+        }
+    )
+
+    assert [
+        (
+            dataset.dataset_id,
+            dataset.warmup_start_time,
+            dataset.start_time,
+            dataset.end_time,
+        )
+        for dataset in config.resolved_datasets
+    ] == [
+        ("fold_0000", 500, 1_000, 1_999),
+        ("fold_0001", 1_500, 2_000, 2_999),
+    ]
+    round_trip = EvaluationSetConfig.model_validate(config.model_dump(mode="json"))
+    assert round_trip.datasets == []
+    assert [
+        dataset.dataset_id for dataset in round_trip.resolved_datasets
+    ] == ["fold_0000", "fold_0001"]
+
+
+def test_evaluation_set_config_requires_one_dataset_source():
+    with pytest.raises(
+        ValidationError,
+        match="evaluation_set requires datasets or walk_forward",
+    ):
+        EvaluationSetConfig.model_validate({})
+
+    with pytest.raises(
+        ValidationError,
+        match="provide datasets or walk_forward, not both",
+    ):
+        EvaluationSetConfig.model_validate(
+            {
+                "datasets": [
+                    {
+                        "dataset_id": "manual",
+                        "product_id": PRODUCT_ID,
+                        "timeframe": "5m",
+                        "start_time": 1,
+                        "end_time": 2,
+                    }
+                ],
+                "walk_forward": {
+                    "product_id": PRODUCT_ID,
+                    "timeframe": "5m",
+                    "start_time": 1,
+                    "end_time": 10,
+                    "fold_duration_ms": 5,
+                },
+            }
+        )
+
+
 def test_evaluation_set_rejects_duplicate_dataset_ids():
     with pytest.raises(ValidationError, match="dataset_id values must be unique"):
         EvaluationSetConfig.model_validate(
@@ -225,8 +436,9 @@ def test_evaluation_dataset_rejects_invalid_warmup_range():
         )
 
 
-def test_parameter_search_rejects_warmup_datasets_before_job_creation():
+def test_parameter_search_accepts_warmup_datasets_for_capable_evaluators():
     payload = _base_search_request()
+    payload["backtest"] = {"candles_csv_path": "data/fold.csv"}
     payload["evaluation_set"] = {
         "datasets": [
             {
@@ -240,14 +452,367 @@ def test_parameter_search_rejects_warmup_datasets_before_job_creation():
         ],
     }
 
+    request = ParameterSearchJobRequest.model_validate(payload)
+
+    assert request.evaluation_set is not None
+    assert request.evaluation_set.datasets[0].warmup_start_time == 5
+
+
+def test_parameter_search_routes_warmup_only_to_capable_evaluator():
+    payload = _base_search_request()
+    payload["backtest"] = {"candles_csv_path": "data/fold.csv"}
+    payload["evaluation_set"] = {
+        "datasets": [
+            {
+                "dataset_id": "fold",
+                "product_id": PRODUCT_ID,
+                "timeframe": "5m",
+                "warmup_start_time": 5,
+                "start_time": 10,
+                "end_time": 20,
+            },
+        ],
+    }
+    evaluator = _WarmupAwareEvaluator()
+    executor = ParameterSearchJobExecutor(evaluator=evaluator, run_inline=True)
+
+    job = executor.submit_search(ParameterSearchJobRequest.model_validate(payload))
+
+    assert job.status.value == "SUCCEEDED"
+    assert evaluator.warmups == [(5, 10, 20)]
+
+
+def test_parameter_search_rejects_silently_ignored_warmup():
+    payload = _base_search_request()
+    payload["backtest"] = {"candles_csv_path": "data/fold.csv"}
+    payload["evaluation_set"] = {
+        "datasets": [
+            {
+                "dataset_id": "fold",
+                "product_id": PRODUCT_ID,
+                "timeframe": "5m",
+                "warmup_start_time": 5,
+                "start_time": 10,
+                "end_time": 20,
+            },
+        ],
+    }
+    executor = ParameterSearchJobExecutor(evaluator=_NoopEvaluator(), run_inline=True)
+
+    job = executor.submit_search(ParameterSearchJobRequest.model_validate(payload))
+
+    assert job.status.value == "FAILED"
+    assert job.error == "evaluator does not support walk-forward warmup: fold"
+
+
+def test_research_warmup_excludes_scoring_boundary_and_restores_trade_state(tmp_path):
+    csv_path = tmp_path / "warmup.csv"
+    csv_path.write_text(
+        "timestamp,open,high,low,close,volume\n"
+        "5,1,1,1,1,1\n"
+        "9,1,1,1,1,1\n"
+        "10,1,1,1,1,1\n"
+        "11,1,1,1,1,1\n"
+    )
+    payload = _base_search_request()
+    payload["start_time"] = 10_000
+    payload["end_time"] = 11_000
+    payload["backtest"] = {"candles_csv_path": str(csv_path)}
+    request = ParameterSearchJobRequest.model_validate(payload)
+    strategy = _WarmupRecordingStrategy()
+
+    ResearchBacktestParameterEvaluator._warm_up_strategy(
+        request,
+        strategy,
+        warmup_start_time=5_000,
+    )
+
+    assert strategy.timestamps == [5_000, 9_000]
+    assert strategy._in_position is False
+    assert strategy.active_trade is None
+
+
+def test_research_warmup_rejects_strategy_without_complete_state_contract(tmp_path):
+    csv_path = tmp_path / "warmup.csv"
+    csv_path.write_text(
+        "timestamp,open,high,low,close,volume\n"
+        "5,1,1,1,1,1\n"
+        "9,1,1,1,1,1\n"
+    )
+    payload = _base_search_request()
+    payload["start_time"] = 10_000
+    payload["end_time"] = 11_000
+    payload["backtest"] = {"candles_csv_path": str(csv_path)}
+    request = ParameterSearchJobRequest.model_validate(payload)
+
+    with pytest.raises(
+        NotImplementedError,
+        match="walk-forward trade-state isolation",
+    ):
+        ResearchBacktestParameterEvaluator._warm_up_strategy(
+            request,
+            BaseStrategyWithoutWarmupContract(),
+            warmup_start_time=5_000,
+        )
+
+
+def test_parameter_search_rejects_fitness_without_evaluation_set():
+    payload = _base_search_request()
+    payload["fitness"] = {"expression": "return_mean"}
+
+    with pytest.raises(ValidationError, match="fitness requires evaluation_set"):
+        ParameterSearchJobRequest.model_validate(payload)
+
+
+def test_parameter_search_rejects_fitness_with_non_score_objective():
+    payload = _base_search_request()
+    payload["objective"] = "minimize_drawdown"
+    payload["evaluation_set"] = {
+        "datasets": [
+            {
+                "dataset_id": "fold",
+                "product_id": PRODUCT_ID,
+                "timeframe": "5m",
+                "start_time": 10,
+                "end_time": 20,
+                "backtest": {"candles_csv_path": "data/fold.csv"},
+            },
+        ],
+    }
+    payload["fitness"] = {"expression": "return_mean"}
+
     with pytest.raises(
         ValidationError,
-        match=(
-            "parameter_search evaluation_set does not support "
-            "warmup_start_time yet: with_warmup"
-        ),
+        match="fitness requires objective=maximize_score",
     ):
         ParameterSearchJobRequest.model_validate(payload)
+
+
+def test_parameter_search_rejects_overlapping_fitness_scoring_folds():
+    payload = _base_search_request()
+    payload["evaluation_set"] = {
+        "datasets": [
+            {
+                "dataset_id": "first",
+                "product_id": PRODUCT_ID,
+                "timeframe": "5m",
+                "start_time": 10,
+                "end_time": 20,
+                "backtest": {"candles_csv_path": "data/first.csv"},
+            },
+            {
+                "dataset_id": "second",
+                "product_id": PRODUCT_ID,
+                "timeframe": "5m",
+                "start_time": 20,
+                "end_time": 30,
+                "warmup_start_time": 5,
+                "backtest": {"candles_csv_path": "data/second.csv"},
+            },
+        ],
+    }
+    payload["fitness"] = {"expression": "return_mean"}
+
+    with pytest.raises(ValidationError, match="fitness scoring folds overlap"):
+        ParameterSearchJobRequest.model_validate(payload)
+
+
+def test_parameter_search_allows_overlapping_warmup_only():
+    payload = _base_search_request()
+    payload["evaluation_set"] = {
+        "datasets": [
+            {
+                "dataset_id": "first",
+                "product_id": PRODUCT_ID,
+                "timeframe": "5m",
+                "start_time": 10,
+                "end_time": 20,
+                "backtest": {"candles_csv_path": "data/first.csv"},
+            },
+            {
+                "dataset_id": "second",
+                "product_id": PRODUCT_ID,
+                "timeframe": "5m",
+                "start_time": 21,
+                "end_time": 30,
+                "warmup_start_time": 5,
+                "backtest": {"candles_csv_path": "data/second.csv"},
+            },
+        ],
+    }
+    payload["fitness"] = {"expression": "return_mean"}
+
+    request = ParameterSearchJobRequest.model_validate(payload)
+
+    assert request.evaluation_set is not None
+
+
+def test_parameter_search_limits_independent_trials():
+    payload = _base_search_request()
+    payload["evaluation_set"] = {
+        "datasets": [
+            {
+                "dataset_id": "fold",
+                "product_id": PRODUCT_ID,
+                "timeframe": "5m",
+                "start_time": 10,
+                "end_time": 20,
+                "backtest": {"candles_csv_path": "data/fold.csv"},
+            },
+        ],
+    }
+    payload["fitness"] = {
+        "expression": "return_mean",
+        "independent_trials": 1_000_000_001,
+    }
+
+    with pytest.raises(ValidationError, match="less than or equal to 1000000000"):
+        ParameterSearchJobRequest.model_validate(payload)
+
+
+def test_parameter_search_rejects_unregistered_fitness_expression():
+    payload = _base_search_request()
+    payload["evaluation_set"] = {
+        "datasets": [
+            {
+                "dataset_id": "fold",
+                "product_id": PRODUCT_ID,
+                "timeframe": "5m",
+                "start_time": 10,
+                "end_time": 20,
+                "backtest": {"candles_csv_path": "data/fold.csv"},
+            },
+        ],
+    }
+    payload["fitness"] = {"expression": "__import__('os')"}
+
+    with pytest.raises(ValidationError, match="fitness function is not registered"):
+        ParameterSearchJobRequest.model_validate(payload)
+
+
+def test_walk_forward_fitness_prefers_stable_candidate():
+    payload = _base_search_request()
+    payload["backtest"] = {
+        "candles_csv_path": "data/folds.csv",
+        "initial_balance": "10000",
+    }
+    payload["candidates"] = [
+        {"candidate_id": "fragile", "param_pack": {}},
+        {"candidate_id": "stable", "param_pack": {}},
+    ]
+    payload["evaluation_set"] = {
+        "datasets": [
+            {
+                "dataset_id": "fold_2020",
+                "product_id": PRODUCT_ID,
+                "timeframe": "5m",
+                "start_time": 10,
+                "end_time": 20,
+            },
+            {
+                "dataset_id": "fold_2021",
+                "product_id": PRODUCT_ID,
+                "timeframe": "5m",
+                "start_time": 21,
+                "end_time": 30,
+            },
+        ],
+    }
+    payload["fitness"] = {}
+    executor = ParameterSearchJobExecutor(
+        evaluator=_WalkForwardFitnessEvaluator(),
+        run_inline=True,
+    )
+
+    job = executor.submit_search(ParameterSearchJobRequest.model_validate(payload))
+
+    assert job.status.value == "SUCCEEDED"
+    assert job.result is not None
+    assert job.result["best_candidate"]["candidate_id"] == "stable"
+    evaluations = {
+        item["candidate_id"]: item for item in job.result["evaluations"]
+    }
+    stable_fitness = evaluations["stable"]["metrics"]["fitness"]
+    assert stable_fitness["expression"].startswith("deflated_sharpe")
+    assert stable_fitness["inputs"]["return_worst"] == "0.004"
+    assert stable_fitness["inputs"]["year_concentration"] == "0.5"
+    assert stable_fitness["inputs"]["trade_count_min"] == "100"
+    assert stable_fitness["inputs"]["trade_count_mean"] == "100"
+    assert stable_fitness["inputs"]["trade_count_total"] == "200"
+    assert evaluations["fragile"]["metrics"]["dataset_scores"] == {
+        "fold_2020": "100",
+        "fold_2021": "-10",
+    }
+
+
+def test_year_concentration_uses_returns_across_different_fold_balances():
+    payload = _base_search_request()
+    payload["backtest"] = {
+        "candles_csv_path": "data/folds.csv",
+        "initial_balance": "10000",
+    }
+    payload["evaluation_set"] = {
+        "datasets": [
+            {
+                "dataset_id": "small",
+                "product_id": PRODUCT_ID,
+                "timeframe": "5m",
+                "start_time": 10,
+                "end_time": 20,
+                "backtest": {"initial_balance": "1000"},
+            },
+            {
+                "dataset_id": "large",
+                "product_id": PRODUCT_ID,
+                "timeframe": "5m",
+                "start_time": 21,
+                "end_time": 30,
+                "backtest": {"initial_balance": "10000"},
+            },
+        ],
+    }
+    payload["fitness"] = {}
+
+    job = ParameterSearchJobExecutor(
+        evaluator=_BalanceScaledFitnessEvaluator(),
+        run_inline=True,
+    ).submit_search(ParameterSearchJobRequest.model_validate(payload))
+
+    assert job.status.value == "SUCCEEDED"
+    assert (
+        job.result["evaluations"][0]["metrics"]["fitness"]["inputs"][
+            "year_concentration"
+        ]
+        == "0.5"
+    )
+
+
+def test_walk_forward_fitness_rejects_fold_without_scoring_candles():
+    payload = _base_search_request()
+    payload["backtest"] = {
+        "candles_csv_path": "data/folds.csv",
+        "initial_balance": "10000",
+    }
+    payload["evaluation_set"] = {
+        "datasets": [
+            {
+                "dataset_id": "empty",
+                "product_id": PRODUCT_ID,
+                "timeframe": "5m",
+                "start_time": 10,
+                "end_time": 20,
+            }
+        ],
+    }
+    payload["fitness"] = {}
+
+    job = ParameterSearchJobExecutor(
+        evaluator=_EmptyScoringFitnessEvaluator(),
+        run_inline=True,
+    ).submit_search(ParameterSearchJobRequest.model_validate(payload))
+
+    assert job.status.value == "FAILED"
+    assert job.error == "walk-forward dataset empty has no scoring candles"
 
 
 def test_parameter_search_accepts_shared_backtest_with_evaluation_set():

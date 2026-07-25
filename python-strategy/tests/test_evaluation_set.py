@@ -1,6 +1,10 @@
 import pytest
 
-from src.core.evaluation_set import EvaluationDataset, EvaluationSet
+from src.core.evaluation_set import (
+    MAX_WALK_FORWARD_FOLDS,
+    EvaluationDataset,
+    EvaluationSet,
+)
 
 
 PRODUCT_ID = "BINANCE:BTCUSDT-PERP"
@@ -73,6 +77,29 @@ def test_evaluation_set_rejects_duplicate_dataset_ids():
 def test_evaluation_set_rejects_empty_collections():
     with pytest.raises(ValueError, match="at least one dataset"):
         EvaluationSet(())
+
+
+def test_walk_forward_limits_fold_count_before_materializing():
+    with pytest.raises(ValueError, match="walk-forward fold count exceeds"):
+        EvaluationSet.walk_forward(
+            product_id=PRODUCT_ID,
+            timeframe="5m",
+            start_time=0,
+            end_time=2 * MAX_WALK_FORWARD_FOLDS + 1,
+            fold_duration_ms=2,
+        )
+
+
+def test_walk_forward_accepts_fold_count_limit():
+    evaluation_set = EvaluationSet.walk_forward(
+        product_id=PRODUCT_ID,
+        timeframe="5m",
+        start_time=0,
+        end_time=2 * MAX_WALK_FORWARD_FOLDS - 1,
+        fold_duration_ms=2,
+    )
+
+    assert len(evaluation_set) == MAX_WALK_FORWARD_FOLDS
 
 
 def test_evaluation_dataset_validates_time_range():
@@ -166,3 +193,56 @@ def test_evaluation_set_raises_key_error_for_unknown_dataset():
 
     with pytest.raises(KeyError):
         evaluation_set["missing"]
+
+
+def test_walk_forward_builds_non_overlapping_complete_folds():
+    evaluation_set = EvaluationSet.walk_forward(
+        product_id=PRODUCT_ID,
+        timeframe="5m",
+        start_time=1_000,
+        end_time=4_499,
+        fold_duration_ms=1_000,
+        warmup_duration_ms=500,
+        dataset_id_prefix="validation",
+    )
+
+    assert [
+        (
+            dataset.dataset_id,
+            dataset.warmup_start_time,
+            dataset.start_time,
+            dataset.end_time,
+        )
+        for dataset in evaluation_set
+    ] == [
+        ("validation_0000", 500, 1_000, 1_999),
+        ("validation_0001", 1_500, 2_000, 2_999),
+        ("validation_0002", 2_500, 3_000, 3_999),
+    ]
+    assert evaluation_set["validation_0001"].metadata["walk_forward_fold"] == 1
+
+
+@pytest.mark.parametrize(
+    ("updates", "message"),
+    [
+        ({"end_time": 999}, "end_time"),
+        ({"fold_duration_ms": 0}, "fold_duration_ms"),
+        ({"warmup_duration_ms": -1}, "warmup_duration_ms"),
+        ({"dataset_id_prefix": " "}, "dataset_id_prefix"),
+        ({"end_time": 1_499}, "complete fold"),
+    ],
+)
+def test_walk_forward_rejects_invalid_boundaries(updates, message):
+    arguments = {
+        "product_id": PRODUCT_ID,
+        "timeframe": "5m",
+        "start_time": 1_000,
+        "end_time": 2_999,
+        "fold_duration_ms": 1_000,
+        "warmup_duration_ms": 0,
+        "dataset_id_prefix": "wf",
+        **updates,
+    }
+
+    with pytest.raises(ValueError, match=message):
+        EvaluationSet.walk_forward(**arguments)

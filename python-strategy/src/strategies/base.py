@@ -49,6 +49,23 @@ class BaseStrategy(ABC):
         """
         return None
 
+    def snapshot_walk_forward_trade_state(self) -> object:
+        """Capture all state that a warm-up replay must not carry into scoring.
+
+        Walk-forward capable strategies must override this together with
+        ``restore_walk_forward_trade_state``. Indicator and feature state is
+        intentionally excluded so it remains warmed at the scoring boundary.
+        """
+        raise NotImplementedError(
+            "strategy does not define walk-forward trade-state isolation"
+        )
+
+    def restore_walk_forward_trade_state(self, state: object) -> None:
+        """Restore the complete trade-state snapshot captured before warm-up."""
+        raise NotImplementedError(
+            "strategy does not define walk-forward trade-state isolation"
+        )
+
     def run_vectorized(self, df: pd.DataFrame) -> pd.DataFrame:
         """
         Run strategy in vectorized mode using Pandas.

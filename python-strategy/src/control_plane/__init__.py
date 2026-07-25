@@ -10,6 +10,7 @@ from src.control_plane.models import (
     EvaluationDatasetConfig,
     EvaluationSetConfig,
     EvolutionConfig,
+    FitnessConfig,
     GenePromotionRequest,
     JobRecord,
     PartialCsvSignalBacktestEvaluationConfig,
@@ -19,6 +20,7 @@ from src.control_plane.models import (
     ParameterSearchDimension,
     ParameterSearchSpace,
     ResearchRunnerEvaluationConfig,
+    WalkForwardEvaluationConfig,
 )
 from src.control_plane.parameter_search import (
     CsvSignalBacktestParameterEvaluator,
@@ -46,6 +48,7 @@ __all__ = [
     "EvaluationDatasetConfig",
     "EvaluationSetConfig",
     "EvolutionConfig",
+    "FitnessConfig",
     "GeneControlService",
     "GoldenCrossFastFitnessParameterEvaluator",
     "GoldenCrossParameterSearchPreset",
@@ -70,4 +73,5 @@ __all__ = [
     "SqliteJobStore",
     "StrategyControlService",
     "StrategyStateQueryService",
+    "WalkForwardEvaluationConfig",
 ]

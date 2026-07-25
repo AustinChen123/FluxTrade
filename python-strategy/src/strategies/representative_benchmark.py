@@ -161,6 +161,18 @@ class RepresentativeBenchmarkStrategy(BaseStrategy):
         self._bars_held = 0
         return True
 
+    def snapshot_walk_forward_trade_state(self) -> object:
+        return self.position, self._bars_held
+
+    def restore_walk_forward_trade_state(self, state: object) -> None:
+        if (
+            not isinstance(state, tuple)
+            or len(state) != 2
+            or not all(isinstance(value, int) for value in state)
+        ):
+            raise TypeError("representative warm-up state must be two integers")
+        self.position, self._bars_held = state
+
     @property
     def last_confirmed_swing(self) -> tuple[str, int] | None:
         if self._last_swing_high_timestamp is None:

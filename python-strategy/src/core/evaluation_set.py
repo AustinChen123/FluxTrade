@@ -12,6 +12,9 @@ from types import MappingProxyType
 from typing import Iterable, Iterator, Mapping
 
 
+MAX_WALK_FORWARD_FOLDS = 1_000
+
+
 @dataclass(frozen=True, slots=True)
 class EvaluationDataset:
     """One replay dataset used by research or optimizer evaluation."""
@@ -77,6 +80,65 @@ class EvaluationSet:
     def single(cls, dataset: EvaluationDataset) -> "EvaluationSet":
         """Create an evaluation set from one dataset."""
         return cls((dataset,))
+
+    @classmethod
+    def walk_forward(
+        cls,
+        *,
+        product_id: str,
+        timeframe: str,
+        start_time: int,
+        end_time: int,
+        fold_duration_ms: int,
+        warmup_duration_ms: int = 0,
+        dataset_id_prefix: str = "wf",
+    ) -> "EvaluationSet":
+        """Build contiguous, non-overlapping scoring folds.
+
+        ``start_time`` and ``end_time`` are inclusive epoch-millisecond
+        boundaries. An incomplete trailing fold is excluded.
+        """
+        if end_time < start_time:
+            raise ValueError("end_time must be greater than or equal to start_time")
+        if fold_duration_ms <= 0:
+            raise ValueError("fold_duration_ms must be positive")
+        if warmup_duration_ms < 0:
+            raise ValueError("warmup_duration_ms cannot be negative")
+        prefix = dataset_id_prefix.strip()
+        if not prefix:
+            raise ValueError("dataset_id_prefix must be non-empty")
+        fold_count = (end_time - start_time + 1) // fold_duration_ms
+        if fold_count > MAX_WALK_FORWARD_FOLDS:
+            raise ValueError(
+                "walk-forward fold count exceeds "
+                f"{MAX_WALK_FORWARD_FOLDS}: {fold_count}"
+            )
+
+        datasets = []
+        fold_start = start_time
+        fold_index = 0
+        while fold_start + fold_duration_ms - 1 <= end_time:
+            fold_end = fold_start + fold_duration_ms - 1
+            datasets.append(
+                EvaluationDataset(
+                    dataset_id=f"{prefix}_{fold_index:04d}",
+                    product_id=product_id,
+                    timeframe=timeframe,
+                    start_time=fold_start,
+                    end_time=fold_end,
+                    warmup_start_time=(
+                        fold_start - warmup_duration_ms
+                        if warmup_duration_ms > 0
+                        else None
+                    ),
+                    metadata={"walk_forward_fold": fold_index},
+                )
+            )
+            fold_start = fold_end + 1
+            fold_index += 1
+        if not datasets:
+            raise ValueError("walk-forward range does not contain a complete fold")
+        return cls(datasets)
 
     def __iter__(self) -> Iterator[EvaluationDataset]:
         return iter(self.datasets)

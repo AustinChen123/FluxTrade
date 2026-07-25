@@ -98,9 +98,25 @@ class SignalProcessor:
             except Exception:
                 logger.exception("Error processing strategy %s", strategy.strategy_id)
 
-    def warm_up(self, strategy: BaseStrategy, candles: list[Candlestick]) -> None:
-        """Replay candles through one strategy without emitting orders."""
-        trade_state = self._snapshot_trade_state(strategy)
+    def warm_up(
+        self,
+        strategy: BaseStrategy,
+        candles: list[Candlestick],
+        *,
+        require_complete_trade_state: bool = False,
+    ) -> None:
+        """Replay candles through one strategy without emitting orders.
+
+        Startup restore retains the legacy generic position snapshot. Research
+        folds require the strategy's explicit complete trade-state contract so
+        warm-up signals cannot leak synthetic trades into scoring.
+        """
+        complete_trade_state = None
+        generic_trade_state = None
+        if require_complete_trade_state:
+            complete_trade_state = strategy.snapshot_walk_forward_trade_state()
+        else:
+            generic_trade_state = self._snapshot_trade_state(strategy)
         try:
             for candle in candles:
                 if strategy.product_id != candle.product_id:
@@ -109,7 +125,11 @@ class SignalProcessor:
                     continue
                 self._dispatch_to_strategy(strategy, candle)
         finally:
-            self._restore_trade_state(strategy, trade_state)
+            if require_complete_trade_state:
+                strategy.restore_walk_forward_trade_state(complete_trade_state)
+            else:
+                assert generic_trade_state is not None
+                self._restore_trade_state(strategy, generic_trade_state)
 
     def set_position_state(self, strategy: BaseStrategy, position_side: str | None) -> bool:
         """Align strategy trade-state with the actual account position.
