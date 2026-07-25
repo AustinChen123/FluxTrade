@@ -63,8 +63,14 @@ def engine_with_strategy():
         db = MagicMock()
         clock = MagicMock()
         clock.now.return_value = 1704067200.0
+        account_service = MagicMock()
+        account_service.get_position_for_exit.return_value = None
 
-        engine = StrategyEngine(db_session=db, clock=clock)
+        engine = StrategyEngine(
+            db_session=db,
+            clock=clock,
+            account_service=account_service,
+        )
 
         def _add(strategy_id, product_id, timeframe):
             strat = FakeStrategy(strategy_id, product_id, timeframe)
