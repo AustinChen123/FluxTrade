@@ -25,7 +25,7 @@ fn fluxtrade_core(m: &Bound<'_, PyModule>) -> PyResult<()> {
         m.add_class::<binding::rithmic_ledger::PyLedgerPosition>()?;
         m.add_class::<binding::rithmic_ledger::PyLedgerAccountSummary>()?;
         m.add_class::<binding::rithmic_ledger::PyLedgerSnapshot>()?;
-        m.add_class::<binding::rithmic_market::PyPriceSnapshot>()?;
+        m.add_class::<binding::rithmic_market::PyLastTradeSnapshot>()?;
         m.add_class::<binding::rithmic_order::PyOrderAck>()?;
         m.add_class::<binding::rithmic_order::PyOrderEvent>()?;
         m.add_class::<binding::rithmic_order::PyOrderClient>()?;
@@ -34,7 +34,7 @@ fn fluxtrade_core(m: &Bound<'_, PyModule>) -> PyResult<()> {
             m
         )?)?;
         m.add_function(wrap_pyfunction!(
-            binding::rithmic_market::rithmic_price_snapshot,
+            binding::rithmic_market::rithmic_offline_last_trade_snapshot,
             m
         )?)?;
     }
@@ -62,8 +62,8 @@ mod tests {
                 "RithmicLedgerAccountSummary",
                 "RithmicLedgerSnapshot",
                 "rithmic_ledger_snapshot",
-                "RithmicPriceSnapshot",
-                "rithmic_price_snapshot",
+                "RithmicLastTradeSnapshot",
+                "rithmic_offline_last_trade_snapshot",
                 "RithmicOrderAck",
                 "RithmicOrderEvent",
                 "RithmicOrderClient",

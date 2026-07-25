@@ -17,7 +17,7 @@ pub(crate) async fn run(
 ) -> Result<market::LastTradeUpdate> {
     ensure!(
         !wait.is_zero(),
-        "Rithmic price snapshot timeout must be positive"
+        "Rithmic LastTrade snapshot timeout must be positive"
     );
     let request = market::last_trade_request(exchange, symbol, SubscriptionAction::Subscribe)?;
     let runtime = config::load(profile, Plant::Ticker)?;
@@ -44,7 +44,7 @@ pub(crate) async fn run(
         }
     })
     .await
-    .context("Rithmic price snapshot timed out")?
+    .context("Rithmic LastTrade snapshot timed out")?
 }
 
 async fn wait_for_heartbeat(connection: &mut transport::RithmicConnection) -> Result<()> {
@@ -68,12 +68,12 @@ fn accept_event(
         MarketDataEvent::LastTrade(trade) => {
             ensure!(
                 trade.exchange == expected_exchange && trade.symbol == expected_symbol,
-                "Rithmic price snapshot instrument identity mismatch"
+                "Rithmic LastTrade snapshot instrument identity mismatch"
             );
             Ok(Some(trade))
         }
         MarketDataEvent::Rejected { response_codes, .. } => anyhow::bail!(
-            "Rithmic price snapshot subscription was rejected: {}",
+            "Rithmic LastTrade snapshot subscription was rejected: {}",
             response_codes.join(",")
         ),
     }

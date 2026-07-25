@@ -1,13 +1,14 @@
 use crate::rithmic_ledger::{
+    last_trade_snapshot,
     market::{Aggressor, LastTradeUpdate},
-    price_snapshot,
     profile_lock::ProfileLease,
 };
 use pyo3::{exceptions::PyRuntimeError, exceptions::PyValueError, prelude::*};
 use std::time::Duration;
 
-#[pyclass(frozen, name = "RithmicPriceSnapshot")]
-pub struct PyPriceSnapshot {
+/// One LastTrade received from an explicitly exclusive offline TICKER session.
+#[pyclass(frozen, name = "RithmicLastTradeSnapshot")]
+pub struct PyLastTradeSnapshot {
     #[pyo3(get)]
     pub exchange: String,
     #[pyo3(get)]
@@ -25,14 +26,20 @@ pub struct PyPriceSnapshot {
 }
 
 #[pyfunction]
-#[pyo3(signature = (profile, exchange, symbol, *, timeout_seconds=15))]
-pub fn rithmic_price_snapshot(
+#[pyo3(signature = (profile, exchange, symbol, *, exclusive_session, timeout_seconds=15))]
+pub fn rithmic_offline_last_trade_snapshot(
     py: Python<'_>,
     profile: &str,
     exchange: &str,
     symbol: &str,
+    exclusive_session: bool,
     timeout_seconds: u64,
-) -> PyResult<PyPriceSnapshot> {
+) -> PyResult<PyLastTradeSnapshot> {
+    if !exclusive_session {
+        return Err(PyValueError::new_err(
+            "exclusive_session=True is required after stopping all other Rithmic TICKER clients",
+        ));
+    }
     if !(1..=120).contains(&timeout_seconds) {
         return Err(PyValueError::new_err(
             "timeout_seconds must be between 1 and 120",
@@ -46,18 +53,18 @@ pub fn rithmic_price_snapshot(
             .build()
             .map_err(runtime_error)?;
         runtime
-            .block_on(price_snapshot::run(
+            .block_on(last_trade_snapshot::run(
                 profile,
                 exchange,
                 symbol,
                 Duration::from_secs(timeout_seconds),
             ))
-            .map(PyPriceSnapshot::from)
+            .map(PyLastTradeSnapshot::from)
             .map_err(runtime_error)
     })
 }
 
-impl From<LastTradeUpdate> for PyPriceSnapshot {
+impl From<LastTradeUpdate> for PyLastTradeSnapshot {
     fn from(trade: LastTradeUpdate) -> Self {
         Self {
             exchange: trade.exchange,
@@ -85,7 +92,7 @@ mod tests {
 
     #[test]
     fn python_snapshot_preserves_decimal_text_and_metadata() {
-        let snapshot = PyPriceSnapshot::from(LastTradeUpdate {
+        let snapshot = PyLastTradeSnapshot::from(LastTradeUpdate {
             exchange: "CME".to_string(),
             symbol: "NQU6".to_string(),
             price: dec!(29784.75),
@@ -100,5 +107,17 @@ mod tests {
         assert_eq!(snapshot.aggressor.as_deref(), Some("SELL"));
         assert_eq!(snapshot.timestamp_ms, 1_800_000_001_234);
         assert!(snapshot.is_snapshot);
+    }
+
+    #[test]
+    fn offline_snapshot_requires_explicit_exclusive_session_confirmation() {
+        Python::with_gil(|py| {
+            let error =
+                match rithmic_offline_last_trade_snapshot(py, "unused", "CME", "NQU6", false, 15) {
+                    Ok(_) => panic!("offline snapshot must require explicit confirmation"),
+                    Err(error) => error,
+                };
+            assert!(error.to_string().contains("exclusive_session=True"));
+        });
     }
 }
