@@ -8,6 +8,10 @@ from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
+from src.control_plane.fitness import (
+    DEFAULT_WALK_FORWARD_FITNESS,
+    validate_fitness_expression,
+)
 from src.core.evaluation_set import EvaluationDataset, EvaluationSet
 from src.core.product_registry import (
     CapitalModel,
@@ -272,9 +276,9 @@ class EvolutionConfig(BaseModel):
 
 
 class CsvSignalBacktestEvaluationConfig(BaseModel):
-    """Backtest settings for CSV-signal parameter candidate evaluation."""
+    """Backtest accounting plus the default CSV candle-source reference."""
 
-    candles_csv_path: str = Field(min_length=1)
+    candles_csv_path: str | None = None
     initial_balance: Decimal = Decimal("10000")
     maker_fee: Decimal = Decimal("0")
     taker_fee: Decimal = Decimal("0")
@@ -283,7 +287,9 @@ class CsvSignalBacktestEvaluationConfig(BaseModel):
 
     @field_validator("candles_csv_path")
     @classmethod
-    def validate_path(cls, value: str) -> str:
+    def validate_path(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
         if not value.strip():
             raise ValueError("path cannot be blank")
         return str(Path(value))
@@ -399,10 +405,42 @@ class EvaluationDatasetConfig(BaseModel):
         )
 
 
+class WalkForwardEvaluationConfig(BaseModel):
+    """Generate equal, non-overlapping scoring folds from one time range."""
+
+    product_id: str = Field(min_length=1)
+    timeframe: str = Field(min_length=1)
+    start_time: int
+    end_time: int
+    fold_duration_ms: int = Field(gt=0)
+    warmup_duration_ms: int = Field(default=0, ge=0)
+    dataset_id_prefix: str = Field(default="wf", min_length=1)
+
+    @field_validator("product_id", "timeframe", "dataset_id_prefix")
+    @classmethod
+    def strip_required_string(cls, value: str) -> str:
+        stripped = value.strip()
+        if not stripped:
+            raise ValueError("field cannot be blank")
+        return stripped
+
+    def to_core_evaluation_set(self) -> EvaluationSet:
+        return EvaluationSet.walk_forward(
+            product_id=self.product_id,
+            timeframe=self.timeframe,
+            start_time=self.start_time,
+            end_time=self.end_time,
+            fold_duration_ms=self.fold_duration_ms,
+            warmup_duration_ms=self.warmup_duration_ms,
+            dataset_id_prefix=self.dataset_id_prefix,
+        )
+
+
 class EvaluationSetConfig(BaseModel):
     """Control-plane payload for a group of evaluation datasets."""
 
-    datasets: list[EvaluationDatasetConfig] = Field(min_length=1)
+    datasets: list[EvaluationDatasetConfig] = Field(default_factory=list)
+    walk_forward: WalkForwardEvaluationConfig | None = None
 
     @field_validator("datasets")
     @classmethod
@@ -415,8 +453,51 @@ class EvaluationSetConfig(BaseModel):
             raise ValueError("dataset_id values must be unique")
         return value
 
+    @model_validator(mode="after")
+    def validate_dataset_source(self) -> "EvaluationSetConfig":
+        if self.datasets and self.walk_forward is not None:
+            raise ValueError("provide datasets or walk_forward, not both")
+        if not self.datasets and self.walk_forward is None:
+            raise ValueError("evaluation_set requires datasets or walk_forward")
+        return self
+
+    @property
+    def resolved_datasets(self) -> list[EvaluationDatasetConfig]:
+        if self.walk_forward is None:
+            return self.datasets
+        return [
+            EvaluationDatasetConfig(
+                dataset_id=dataset.dataset_id,
+                product_id=dataset.product_id,
+                timeframe=dataset.timeframe,
+                start_time=dataset.start_time,
+                end_time=dataset.end_time,
+                warmup_start_time=dataset.warmup_start_time,
+                metadata=dict(dataset.metadata),
+            )
+            for dataset in self.walk_forward.to_core_evaluation_set()
+        ]
+
     def to_core_evaluation_set(self) -> EvaluationSet:
-        return EvaluationSet(dataset.to_core_dataset() for dataset in self.datasets)
+        return EvaluationSet(
+            dataset.to_core_dataset() for dataset in self.resolved_datasets
+        )
+
+
+class FitnessConfig(BaseModel):
+    """Registered Decimal expression used to score walk-forward candidates."""
+
+    expression: str = DEFAULT_WALK_FORWARD_FITNESS
+    independent_trials: int | None = Field(
+        default=None,
+        ge=1,
+        le=1_000_000_000,
+    )
+
+    @field_validator("expression")
+    @classmethod
+    def validate_expression(cls, value: str) -> str:
+        return validate_fitness_expression(value)
 
 
 class ParameterSearchJobRequest(BaseModel):
@@ -437,6 +518,7 @@ class ParameterSearchJobRequest(BaseModel):
     backtest: CsvSignalBacktestEvaluationConfig | None = None
     research_runner: ResearchRunnerEvaluationConfig | None = None
     evaluation_set: EvaluationSetConfig | None = None
+    fitness: FitnessConfig | None = None
     candidates: list[ParameterCandidate] | None = Field(default=None, min_length=1)
     search_space: ParameterSearchSpace | None = None
     candidate_sample_count: int | None = Field(default=None, ge=1, le=10_000)
@@ -491,22 +573,19 @@ class ParameterSearchJobRequest(BaseModel):
                 raise ValueError("candidate_sample_count requires search_space")
             if has_search_space and self.candidate_sample_count is None:
                 raise ValueError("candidate_sample_count is required with search_space")
+        if self.fitness is not None:
+            if self.evaluation_set is None:
+                raise ValueError("fitness requires evaluation_set")
+            if self.objective != "maximize_score":
+                raise ValueError("fitness requires objective=maximize_score")
+            _require_non_overlapping_scoring_folds(
+                self.evaluation_set.resolved_datasets
+            )
         if self.evaluation_set is not None:
-            warmup_dataset_ids = [
-                dataset.dataset_id
-                for dataset in self.evaluation_set.datasets
-                if dataset.warmup_start_time is not None
-            ]
-            if warmup_dataset_ids:
-                datasets = ", ".join(warmup_dataset_ids)
-                raise ValueError(
-                    "parameter_search evaluation_set does not support "
-                    f"warmup_start_time yet: {datasets}"
-                )
             if self.backtest is None:
                 missing_backtest_dataset_ids = [
                     dataset.dataset_id
-                    for dataset in self.evaluation_set.datasets
+                    for dataset in self.evaluation_set.resolved_datasets
                     if dataset.backtest is None
                     or dataset.backtest.candles_csv_path is None
                 ]
@@ -516,7 +595,7 @@ class ParameterSearchJobRequest(BaseModel):
                         "evaluation_set datasets require candles_csv_path when "
                         f"shared backtest is not provided: {datasets}"
                     )
-            for dataset in self.evaluation_set.datasets:
+            for dataset in self.evaluation_set.resolved_datasets:
                 override = dataset.backtest.instrument if dataset.backtest else None
                 shared = self.backtest.instrument if self.backtest else None
                 _require_dated_future_rules(
@@ -542,6 +621,25 @@ class ParameterSearchJobRequest(BaseModel):
                 price_tick=instrument.price_tick if instrument else None,
             )
         return self
+
+
+def _require_non_overlapping_scoring_folds(
+    datasets: list[EvaluationDatasetConfig],
+) -> None:
+    grouped: dict[tuple[str, str], list[EvaluationDatasetConfig]] = {}
+    for dataset in datasets:
+        grouped.setdefault(
+            (dataset.product_id, dataset.timeframe),
+            [],
+        ).append(dataset)
+    for group in grouped.values():
+        ordered = sorted(group, key=lambda dataset: (dataset.start_time, dataset.end_time))
+        for previous, current in zip(ordered, ordered[1:]):
+            if current.start_time <= previous.end_time:
+                raise ValueError(
+                    "fitness scoring folds overlap: "
+                    f"{previous.dataset_id}, {current.dataset_id}"
+                )
 
 
 def _require_dated_future_rules(

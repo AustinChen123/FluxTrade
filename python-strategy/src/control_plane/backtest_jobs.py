@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from concurrent.futures import Future, ThreadPoolExecutor
 from contextlib import AbstractContextManager
+from dataclasses import dataclass
 from decimal import Decimal
 from threading import Lock
 from typing import Any, Callable
@@ -9,13 +10,37 @@ from typing import Any, Callable
 from sqlalchemy.orm import Session
 
 from src.control_plane.jobs import InMemoryJobStore, JobStore
-from src.control_plane.models import BacktestJobRequest, JobRecord, JobStatus
+from src.control_plane.models import (
+    BacktestInstrumentConfig,
+    BacktestJobRequest,
+    JobRecord,
+    JobStatus,
+)
 from src.core.backtest_runner import BacktestRunner
 from src.core.data_sources.csv_source import CsvDataSource
+from src.core.interfaces.data_source import IDataSource
 from src.strategies.csv_signal_strategy import CsvSignalStrategy
 
 
 SessionFactory = Callable[[], AbstractContextManager[Session]]
+
+
+@dataclass(frozen=True, slots=True)
+class BacktestRunSpec:
+    """Internal runner input; market data may be supplied by an injected provider."""
+
+    strategy_id: str
+    product_id: str
+    timeframe: str
+    signals_csv_path: str
+    start_time: int
+    end_time: int
+    initial_balance: Decimal
+    maker_fee: Decimal
+    taker_fee: Decimal
+    instrument: BacktestInstrumentConfig | None
+    write_reports: bool
+    candles_csv_path: str | None = None
 
 
 class BacktestJobExecutor:
@@ -101,15 +126,19 @@ class BacktestJobExecutor:
 
     def run_backtest_request(
         self,
-        request: BacktestJobRequest,
+        request: BacktestJobRequest | BacktestRunSpec,
         *,
         max_drawdown_limit: float | None = 0.20,
+        data_source: IDataSource | None = None,
     ) -> dict[str, Any]:
-        data_source = CsvDataSource(
-            file_path=request.candles_csv_path,
-            product_id=request.product_id,
-            timeframe=request.timeframe,
-        )
+        if data_source is None:
+            if request.candles_csv_path is None:
+                raise ValueError("CSV backtest requires candles_csv_path")
+            data_source = CsvDataSource(
+                file_path=request.candles_csv_path,
+                product_id=request.product_id,
+                timeframe=request.timeframe,
+            )
         strategy = CsvSignalStrategy(
             strategy_id=request.strategy_id,
             csv_path=request.signals_csv_path,

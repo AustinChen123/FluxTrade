@@ -16,6 +16,7 @@ from src.control_plane.models import (
 from src.control_plane.parameter_search import (
     CsvSignalBacktestParameterEvaluator,
     GoldenCrossFastFitnessParameterEvaluator,
+    GoldenCrossResearchParameterEvaluator,
     ParameterSearchJobExecutor,
     ResearchBacktestParameterEvaluator,
 )
@@ -42,11 +43,23 @@ class _RecordingRunner:
 
     def run(self):
         return {
+            "annualized_sharpe": Decimal("0"),
+            "daily_return_moments": {
+                "count": 0,
+                "sum": Decimal("0"),
+                "sum_squares": Decimal("0"),
+                "sum_cubes": Decimal("0"),
+                "sum_fourth": Decimal("0"),
+            },
+            "closed_trade_count": 0,
+            "equity_sample_count": 1,
             "total_pnl": Decimal("1"),
+            "mark_to_market_pnl": Decimal("1"),
             "max_drawdown": Decimal("0"),
             "raw_trades": [],
             "closed_trades": [],
             "raw_trade_count": 0,
+            "yearly_mark_to_market_returns": {},
             "candle_count": 0,
         }
 
@@ -59,6 +72,19 @@ class _NoopEvaluator:
             max_drawdown=Decimal("0"),
             metrics={},
         )
+
+
+class _StaticDataSourceProvider:
+    def __init__(self, source):
+        self.source = source
+        self.requests = []
+
+    def create(self, request):
+        self.requests.append(request)
+        return self.source
+
+    def cache_key(self, request):
+        return "static", request.product_id, request.timeframe
 
 
 def _strategy_factory(strategy_id, product_id, timeframe, param_pack):
@@ -165,6 +191,112 @@ def test_research_parameter_search_propagates_instrument_spec(tmp_path, monkeypa
     assert spec.fee_model.value == "per_contract"
     assert spec.capital_model.value == "per_contract"
     assert spec.capital_per_contract == Decimal("2500")
+
+
+def test_research_evaluator_uses_injected_data_source_provider(
+    tmp_path,
+    monkeypatch,
+):
+    monkeypatch.setattr(parameter_search, "ResearchBacktestRunner", _RecordingRunner)
+    _RecordingRunner.instances = []
+    source = object()
+    provider = _StaticDataSourceProvider(source)
+    payload = _request_payload(tmp_path)
+    payload["backtest"].pop("candles_csv_path")
+    request = ParameterSearchJobRequest.model_validate(payload)
+
+    ResearchBacktestParameterEvaluator(
+        _strategy_factory,
+        preload_candles=False,
+        data_source_provider=provider,
+    ).evaluate(request, ParameterCandidate(candidate_id="a", param_pack={}))
+
+    assert _RecordingRunner.instances[0].kwargs["data_source"] is source
+    assert provider.requests == [request]
+
+
+def test_research_evaluator_scores_fold_endpoint_equity(tmp_path, monkeypatch):
+    class _OpenPositionRunner(_RecordingRunner):
+        def run(self):
+            return {
+                **super().run(),
+                "total_pnl": Decimal("1"),
+                "mark_to_market_pnl": Decimal("-7"),
+            }
+
+    monkeypatch.setattr(parameter_search, "ResearchBacktestRunner", _OpenPositionRunner)
+    evaluator = ResearchBacktestParameterEvaluator(
+        _strategy_factory,
+        preload_candles=False,
+    )
+    request = ParameterSearchJobRequest.model_validate(_request_payload(tmp_path))
+
+    result = evaluator.evaluate(
+        request,
+        ParameterCandidate(candidate_id="a", param_pack={}),
+    )
+
+    assert result.score_total == Decimal("-7")
+    assert result.metrics["total_pnl"] == "1"
+    assert result.metrics["mark_to_market_pnl"] == "-7"
+
+
+def test_csv_signal_evaluator_uses_injected_source_and_endpoint_equity(
+    tmp_path,
+    monkeypatch,
+):
+    payload = _request_payload(tmp_path)
+    payload.pop("research_runner")
+    payload["backtest"].pop("candles_csv_path")
+    request = ParameterSearchJobRequest.model_validate(payload)
+    source = object()
+    provider = _StaticDataSourceProvider(source)
+    evaluator = CsvSignalBacktestParameterEvaluator(
+        data_source_provider=provider,
+    )
+    captured = {}
+
+    def run_backtest_request(backtest_request, **kwargs):
+        captured["request"] = backtest_request
+        captured.update(kwargs)
+        return {
+            "total_pnl": "1",
+            "mark_to_market_pnl": "-7",
+            "max_drawdown": "2",
+        }
+
+    monkeypatch.setattr(
+        evaluator._backtest_executor,
+        "run_backtest_request",
+        run_backtest_request,
+    )
+
+    result = evaluator.evaluate(
+        request,
+        ParameterCandidate(
+            candidate_id="a",
+            param_pack={"signals_csv_path": str(tmp_path / "signals.csv")},
+        ),
+    )
+
+    assert result.score_total == Decimal("-7")
+    assert captured["data_source"] is source
+    assert provider.requests == [request]
+
+
+def test_default_csv_provider_rejects_missing_candle_path(tmp_path):
+    payload = _request_payload(tmp_path)
+    payload["backtest"].pop("candles_csv_path")
+    request = ParameterSearchJobRequest.model_validate(payload)
+
+    with pytest.raises(ValueError, match="CSV market data requires"):
+        ResearchBacktestParameterEvaluator(
+            _strategy_factory,
+            preload_candles=False,
+        ).evaluate(
+            request,
+            ParameterCandidate(candidate_id="a", param_pack={}),
+        )
 
 
 def test_research_parameter_search_isolates_capital_allocators_per_dataset(
@@ -351,3 +483,71 @@ def test_fast_fitness_cache_separates_instrument_accounting(tmp_path):
     assert first is not second
     assert first.contract_multiplier == 1.0
     assert second.contract_multiplier == 2.0
+
+
+def test_generated_walk_forward_folds_run_through_research_evaluator(tmp_path):
+    candle_path = tmp_path / "walk_forward.csv"
+    start = 1_700_000_000_000
+    rows = ["timestamp,open,high,low,close,volume"]
+    for index in range(10):
+        timestamp = start + index * 300_000
+        price = 100 + (index % 4)
+        rows.append(f"{timestamp},{price},{price + 1},{price - 1},{price},10")
+    candle_path.write_text("\n".join(rows) + "\n")
+
+    scoring_start = start + 600_000
+    request = ParameterSearchJobRequest.model_validate(
+        {
+            "strategy_id": "golden_cross",
+            "product_id": "BINANCE:BTCUSDT-PERP",
+            "timeframe": "5m",
+            "start_time": scoring_start,
+            "end_time": scoring_start + 2_400_000 - 1,
+            "backtest": {
+                "candles_csv_path": str(candle_path),
+                "initial_balance": "1000",
+                "maker_fee": "0",
+                "taker_fee": "0",
+            },
+            "candidates": [
+                {
+                    "candidate_id": "baseline",
+                    "param_pack": {
+                        "short_window": 1,
+                        "long_window": 2,
+                        "quantity": "0.01",
+                    },
+                }
+            ],
+            "evaluation_set": {
+                "walk_forward": {
+                    "product_id": "BINANCE:BTCUSDT-PERP",
+                    "timeframe": "5m",
+                    "start_time": scoring_start,
+                    "end_time": scoring_start + 2_400_000 - 1,
+                    "fold_duration_ms": 1_200_000,
+                    "warmup_duration_ms": 600_000,
+                }
+            },
+            "fitness": {},
+        }
+    )
+    executor = ParameterSearchJobExecutor(
+        GoldenCrossResearchParameterEvaluator(),
+        run_inline=True,
+    )
+    restored_request = ParameterSearchJobRequest.model_validate(
+        request.model_dump(mode="json")
+    )
+
+    job = executor.submit_search(restored_request)
+
+    assert job.status.value == "SUCCEEDED"
+    assert job.result is not None
+    assert [
+        dataset["dataset_id"]
+        for dataset in job.result["evaluation_set"]["datasets"]
+    ] == ["wf_0000", "wf_0001"]
+    evaluation = job.result["evaluations"][0]
+    assert evaluation["metrics"]["aggregation"] == "registered_walk_forward_fitness"
+    assert evaluation["metrics"]["fitness"]["independent_trials"] == 1

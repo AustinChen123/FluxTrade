@@ -1,6 +1,7 @@
 from dataclasses import dataclass
+from datetime import UTC, date, datetime, timedelta
 from decimal import Decimal
-from typing import Dict, List, Sequence
+from typing import Dict, Iterable, List, Sequence
 import pandas as pd
 import numpy as np
 from src.core.models import Trade, PositionSide
@@ -18,6 +19,101 @@ class ClosedTrade:
     quantity: Decimal
     pnl: Decimal
     fee: Decimal = Decimal("0")
+
+
+def utc_daily_return_metrics(
+    equity_samples: Sequence[tuple[int, Decimal]],
+    *,
+    initial_balance: Decimal,
+    start_time: int,
+    end_time: int,
+) -> dict[str, object]:
+    """Summarize UTC calendar-day mark-to-market equity returns."""
+    if initial_balance <= 0:
+        raise ValueError("daily Sharpe initial balance must be positive")
+    if end_time < start_time:
+        raise ValueError("daily Sharpe end_time cannot precede start_time")
+    if not equity_samples:
+        return {
+            **raw_return_moments(()),
+            "equity_sample_count": 0,
+            "yearly_returns": {},
+        }
+
+    daily_closes: dict[date, Decimal] = {}
+    for timestamp, equity in equity_samples:
+        day = datetime.fromtimestamp(timestamp / 1000, tz=UTC).date()
+        daily_closes[day] = equity
+
+    first_day = datetime.fromtimestamp(start_time / 1000, tz=UTC).date()
+    last_day = datetime.fromtimestamp(end_time / 1000, tz=UTC).date()
+    previous_equity = initial_balance
+    returns: list[Decimal] = []
+    yearly_growth: dict[str, Decimal] = {}
+    day = first_day
+    while day <= last_day:
+        current_equity = daily_closes.get(day, previous_equity)
+        if previous_equity <= 0:
+            raise ValueError(
+                "daily Sharpe requires positive prior mark-to-market equity"
+            )
+        daily_return = current_equity / previous_equity - Decimal("1")
+        returns.append(daily_return)
+        year = str(day.year)
+        yearly_growth[year] = yearly_growth.get(year, Decimal("1")) * (
+            Decimal("1") + daily_return
+        )
+        previous_equity = current_equity
+        day += timedelta(days=1)
+    return {
+        **raw_return_moments(returns),
+        "equity_sample_count": len(equity_samples),
+        "yearly_returns": {
+            year: growth - Decimal("1")
+            for year, growth in yearly_growth.items()
+        },
+    }
+
+
+def raw_return_moments(
+    returns: Iterable[Decimal],
+) -> dict[str, Decimal | int]:
+    count = 0
+    sums = [Decimal("0")] * 4
+    for value in returns:
+        if not value.is_finite():
+            raise ValueError("daily returns must be finite")
+        count += 1
+        power = value
+        for index in range(4):
+            sums[index] += power
+            power *= value
+    return {
+        "count": count,
+        "sum": sums[0],
+        "sum_squares": sums[1],
+        "sum_cubes": sums[2],
+        "sum_fourth": sums[3],
+    }
+
+
+def annualized_sharpe_from_moments(
+    moments: dict[str, Decimal | int],
+    *,
+    periods_per_year: int = 365,
+) -> Decimal:
+    count = int(moments["count"])
+    if count < 2:
+        return Decimal("0")
+    total = Decimal(moments["sum"])
+    sum_squares = Decimal(moments["sum_squares"])
+    mean = total / Decimal(count)
+    sample_variance = (
+        sum_squares - total * total / Decimal(count)
+    ) / Decimal(count - 1)
+    if sample_variance <= 0:
+        return Decimal("0")
+    return mean / sample_variance.sqrt() * Decimal(periods_per_year).sqrt()
 
 
 def _build_closed_trades(
@@ -162,6 +258,7 @@ def calculate_metrics(
     """
     if not trade_history:
         result = {
+            "closed_trade_count": 0,
             "total_pnl": Decimal("0.00"),
             "max_drawdown": Decimal("0.00"),
             "sharpe_ratio": 0.0,
@@ -345,6 +442,7 @@ def calculate_metrics(
         "profit_factor": Decimal(f"{profit_factor:.2f}"),
         "avg_trade": Decimal(f"{avg_trade:.2f}"),
         "total_trades": total_trades,
+        "closed_trade_count": len(closed_trades),
         # Advanced
         "sortino_ratio": Decimal(f"{sortino_ratio:.4f}"),
         "calmar_ratio": Decimal(f"{calmar_ratio:.4f}"),

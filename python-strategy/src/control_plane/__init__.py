@@ -2,6 +2,10 @@
 
 from src.control_plane.app import ControlPlaneApp, HttpResponse
 from src.control_plane.backtest_jobs import BacktestJobExecutor
+from src.control_plane.evaluation_data import (
+    CsvEvaluationDataSourceProvider,
+    EvaluationDataSourceProvider,
+)
 from src.control_plane.gene_control import GeneControlService
 from src.control_plane.jobs import InMemoryJobStore, JobStatus, JobStore, SqliteJobStore
 from src.control_plane.models import (
@@ -10,6 +14,7 @@ from src.control_plane.models import (
     EvaluationDatasetConfig,
     EvaluationSetConfig,
     EvolutionConfig,
+    FitnessConfig,
     GenePromotionRequest,
     JobRecord,
     PartialCsvSignalBacktestEvaluationConfig,
@@ -19,6 +24,7 @@ from src.control_plane.models import (
     ParameterSearchDimension,
     ParameterSearchSpace,
     ResearchRunnerEvaluationConfig,
+    WalkForwardEvaluationConfig,
 )
 from src.control_plane.parameter_search import (
     CsvSignalBacktestParameterEvaluator,
@@ -42,10 +48,13 @@ __all__ = [
     "ControlPlaneApp",
     "CsvSignalBacktestEvaluationConfig",
     "CsvSignalBacktestParameterEvaluator",
+    "CsvEvaluationDataSourceProvider",
     "DecimalSearchRange",
     "EvaluationDatasetConfig",
+    "EvaluationDataSourceProvider",
     "EvaluationSetConfig",
     "EvolutionConfig",
+    "FitnessConfig",
     "GeneControlService",
     "GoldenCrossFastFitnessParameterEvaluator",
     "GoldenCrossParameterSearchPreset",
@@ -70,4 +79,5 @@ __all__ = [
     "SqliteJobStore",
     "StrategyControlService",
     "StrategyStateQueryService",
+    "WalkForwardEvaluationConfig",
 ]

@@ -3,7 +3,7 @@ import json
 import logging
 from contextlib import contextmanager, nullcontext
 from pathlib import Path
-from typing import Callable, ContextManager, Iterable, List, Optional, Dict
+from typing import Callable, ContextManager, Dict, Iterable, List, Optional, cast
 from decimal import Decimal
 from sqlalchemy.orm import Session
 from src.core.db import SessionLocal
@@ -14,7 +14,12 @@ from src.strategies.base import BaseStrategy
 from src.core.repositories import BacktestOrderRepository
 from src.core.backtest.loader import get_candles_generator
 from src.core.backtest.equity import portfolio_equity
-from src.core.analytics import calculate_metrics, ClosedTrade
+from src.core.analytics import (
+    ClosedTrade,
+    annualized_sharpe_from_moments,
+    calculate_metrics,
+    utc_daily_return_metrics,
+)
 from src.core.interfaces.data_source import IDataSource
 from src.core.adapters.simulated import SimulatedAdapter
 from src.core.mocks.account_service import BacktestAccountService
@@ -459,7 +464,9 @@ class BacktestRunner:
             "max_drawdown": metrics.get("max_drawdown", Decimal("0")),
             "win_rate": metrics.get("win_rate", Decimal("0")),
             "total_trades": int(metrics.get("total_trades", 0)),
+            "closed_trade_count": int(metrics.get("closed_trade_count", 0)),
             "trade_sharpe": metrics.get("trade_sharpe", Decimal("0")),
+            "trade_pnl_quality": metrics.get("trade_sharpe", Decimal("0")),
             "profit_factor": metrics.get("profit_factor", Decimal("0")),
             "sortino_ratio": metrics.get("sortino_ratio", Decimal("0")),
             "calmar_ratio": metrics.get("calmar_ratio", Decimal("0")),
@@ -467,12 +474,39 @@ class BacktestRunner:
             "avg_hold_time_hours": metrics.get("avg_hold_time_hours", Decimal("0")),
             "max_consecutive_wins": int(metrics.get("max_consecutive_wins", 0)),
             "max_consecutive_losses": int(metrics.get("max_consecutive_losses", 0)),
+            "monthly_returns": metrics.get("monthly_returns", {}),
             "journal": journal.to_dicts(),
             "journal_count": len(journal),
             "candle_count": count,
             "report_dir": report_dir,
             "per_strategy": per_strategy,
         }
+        daily_return_metrics = utc_daily_return_metrics(
+            equity_samples,
+            initial_balance=Decimal(str(self.initial_balance)),
+            start_time=self.start_time,
+            end_time=self.end_time,
+        )
+        daily_return_moments: dict[str, Decimal | int] = {
+            name: cast(Decimal | int, daily_return_metrics[name])
+            for name in (
+                "count",
+                "sum",
+                "sum_squares",
+                "sum_cubes",
+                "sum_fourth",
+            )
+        }
+        result["daily_return_moments"] = daily_return_moments
+        result["equity_sample_count"] = daily_return_metrics[
+            "equity_sample_count"
+        ]
+        result["yearly_mark_to_market_returns"] = daily_return_metrics[
+            "yearly_returns"
+        ]
+        result["annualized_sharpe"] = annualized_sharpe_from_moments(
+            daily_return_moments
+        )
 
         return result
 

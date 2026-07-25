@@ -11,6 +11,7 @@ from sqlalchemy.ext.compiler import compiles
 from sqlalchemy.orm import sessionmaker
 
 from src.control_plane.jobs import InMemoryJobStore, SqliteJobStore
+from src.control_plane.fitness import expected_maximum_sharpe
 from src.control_plane.evolution import (
     _value_index,
     canonical_param_key,
@@ -33,6 +34,16 @@ from src.core.orm_models import EvolutionEpoch, GeneRecord, Strategy
 
 
 PRODUCT_ID = "BINANCE:BTCUSDT-PERP"
+
+
+def _daily_return_moments(*values: Decimal) -> dict[str, Decimal | int]:
+    return {
+        "count": len(values),
+        "sum": sum(values, Decimal("0")),
+        "sum_squares": sum((value**2 for value in values), Decimal("0")),
+        "sum_cubes": sum((value**3 for value in values), Decimal("0")),
+        "sum_fourth": sum((value**4 for value in values), Decimal("0")),
+    }
 
 
 @compiles(JSONB, "sqlite")
@@ -72,6 +83,32 @@ class _BlockingKnownOptimumEvaluator(_KnownOptimumEvaluator):
         if not self.release.wait(timeout=5):
             raise RuntimeError("timed out waiting to release evaluator")
         return super().evaluate(request, candidate)
+
+
+class _WalkForwardKnownOptimumEvaluator(_KnownOptimumEvaluator):
+    def evaluate(self, request, candidate):
+        evaluation = super().evaluate(request, candidate)
+        year = "2020" if request.start_time % 120_000 == 0 else "2021"
+        return evaluation.model_copy(
+            update={
+                "metrics": {
+                    **evaluation.metrics,
+                    "daily_return_moments": _daily_return_moments(
+                        evaluation.score_total / Decimal("10000"),
+                        evaluation.score_total / Decimal("20000"),
+                    ),
+                    "closed_trade_count": 100,
+                    "equity_sample_count": 2,
+                    "monthly_returns": {
+                        f"{year}-01": evaluation.score_total,
+                    },
+                    "total_trades": 100,
+                    "yearly_mark_to_market_returns": {
+                        year: evaluation.score_total / Decimal("10000")
+                    },
+                }
+            }
+        )
 
 
 def _session_factory(tmp_path, name: str):
@@ -266,6 +303,95 @@ def test_evolution_resume_survives_durable_job_store_reopen(tmp_path):
     assert checkpointed_values.isdisjoint(resumed_evaluator.calls)
 
 
+def test_walk_forward_fitness_resume_survives_durable_store_reopen(tmp_path):
+    factory = _session_factory(tmp_path, "walk_forward_resume.db")
+    jobs_path = tmp_path / "walk_forward_jobs.db"
+    payload = _request(seed=41).model_dump(mode="json", exclude_none=True)
+    payload["backtest"] = {
+        "candles_csv_path": "data/folds.csv",
+        "initial_balance": "10000",
+    }
+    payload["evaluation_set"] = {
+        "walk_forward": {
+            "product_id": PRODUCT_ID,
+            "timeframe": "1m",
+            "start_time": 1_700_000_040_000,
+            "end_time": 1_700_000_159_999,
+            "fold_duration_ms": 60_000,
+        }
+    }
+    payload["fitness"] = {}
+    payload["evolution"].update(
+        {
+            "population_size": 4,
+            "max_generations": 2,
+            "tournament_size": 2,
+        }
+    )
+    request = ParameterSearchJobRequest.model_validate(payload)
+    evaluator = _WalkForwardKnownOptimumEvaluator(fail_after=0)
+    failed = ParameterSearchJobExecutor(
+        evaluator=evaluator,
+        store=SqliteJobStore(jobs_path),
+        run_inline=True,
+        db_session_factory=factory,
+    ).submit_search(request)
+
+    assert failed.status.value == "FAILED"
+
+    resumed = ParameterSearchJobExecutor(
+        evaluator=_WalkForwardKnownOptimumEvaluator(),
+        store=SqliteJobStore(jobs_path),
+        run_inline=True,
+        db_session_factory=factory,
+    ).retry_search(failed.id)
+
+    assert resumed.status.value == "SUCCEEDED"
+    with factory() as session:
+        records = (
+            session.query(GeneRecord)
+            .filter(GeneRecord.epoch_id == resumed.result["epoch_id"])
+            .all()
+        )
+    assert records
+    assert all(
+        record.score_breakdown["aggregation"]
+        == "registered_walk_forward_fitness"
+        for record in records
+    )
+    assert all(
+        record.score_breakdown["fitness"]["independent_trials"] == 8
+        for record in records
+    )
+    assert all(
+        record.score_breakdown["fitness"]["metric_contract"]["version"]
+        == "walk_forward_fitness_v2"
+        for record in records
+    )
+    with factory() as session:
+        epoch = session.get(EvolutionEpoch, resumed.result["epoch_id"])
+        assert (
+            epoch.config_json["fitness_metric_contract"]["version"]
+            == "walk_forward_fitness_v2"
+        )
+    unique_sharpes = {
+        canonical_param_key(record.param_pack): Decimal(
+            record.score_breakdown["fitness_inputs"]["daily_sharpe"]
+        )
+        for record in records
+    }
+    expected_benchmark = expected_maximum_sharpe(
+        list(unique_sharpes.values()),
+        independent_trials=8,
+    )
+    final_generation = max(record.generation_index for record in records)
+    assert {
+        Decimal(record.score_breakdown["fitness"]["benchmark_sharpe"])
+        for record in records
+        if record.generation_index == final_generation
+    } == {expected_benchmark}
+
+
 def test_duplicate_epoch_run_is_rejected_without_aborting_active_run(tmp_path):
     factory = _session_factory(tmp_path, "duplicate_epoch.db")
     evaluator = _BlockingKnownOptimumEvaluator()
@@ -360,8 +486,9 @@ def test_candidate_id_rejects_values_that_do_not_fit_gene_storage():
         ParameterCandidate(candidate_id="x" * 65, param_pack={})
 
 
-def test_evolution_request_keeps_shared_evaluation_set_validation():
+def test_evolution_request_accepts_walk_forward_warmup_boundary():
     payload = _request().model_dump(mode="json", exclude_none=True)
+    payload["backtest"] = {"candles_csv_path": "data/fold.csv"}
     payload["evaluation_set"] = {
         "datasets": [
             {
@@ -375,8 +502,12 @@ def test_evolution_request_keeps_shared_evaluation_set_validation():
         ]
     }
 
-    with pytest.raises(ValidationError, match="does not support warmup_start_time"):
-        ParameterSearchJobRequest.model_validate(payload)
+    request = ParameterSearchJobRequest.model_validate(payload)
+
+    assert request.evaluation_set is not None
+    assert request.evaluation_set.datasets[0].warmup_start_time == (
+        payload["start_time"] - 60_000
+    )
 
 
 def test_categorical_dimensions_reject_non_durable_decimal_values():
@@ -433,10 +564,12 @@ def test_evolution_csv_evaluation_disables_early_stop_and_normalizes_drawdown(
     evaluator = CsvSignalBacktestParameterEvaluator()
     captured = {}
 
-    def run_backtest(backtest_request, *, max_drawdown_limit):
+    def run_backtest(backtest_request, *, max_drawdown_limit, data_source):
         captured["max_drawdown_limit"] = max_drawdown_limit
+        captured["data_source"] = data_source
         return {
             "total_pnl": "5",
+            "mark_to_market_pnl": "5",
             "max_drawdown": "-125.50",
         }
 

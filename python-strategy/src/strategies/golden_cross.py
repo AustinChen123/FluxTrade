@@ -143,6 +143,14 @@ class GoldenCrossStrategy(BaseStrategy):
         self._in_position = position_side == "LONG"
         return True
 
+    def snapshot_walk_forward_trade_state(self) -> object:
+        return self._in_position
+
+    def restore_walk_forward_trade_state(self, state: object) -> None:
+        if not isinstance(state, bool):
+            raise TypeError("golden-cross warm-up state must be bool")
+        self._in_position = state
+
     def _signal(
         self,
         candle: Candlestick,

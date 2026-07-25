@@ -13,10 +13,14 @@ import uuid
 import inspect
 from dataclasses import dataclass, replace
 from decimal import Decimal
-from typing import TYPE_CHECKING, Any, Dict, Iterable, Optional, Sequence
+from typing import TYPE_CHECKING, Any, Dict, Iterable, Optional, Sequence, cast
 
 from src.core.adapters.simulated import SimulatedAdapter
-from src.core.analytics import calculate_metrics
+from src.core.analytics import (
+    annualized_sharpe_from_moments,
+    calculate_metrics,
+    utc_daily_return_metrics,
+)
 from src.core.backtest.equity import require_strategy_position_scope
 from src.core.backtest.loader import get_candles_generator
 from src.core.clock import BacktestClock
@@ -251,6 +255,22 @@ class ResearchBacktestRunner:
             contract_multiplier=self.contract_multiplier,
             equity_samples=equity_samples,
         )
+        daily_return_metrics = utc_daily_return_metrics(
+            equity_samples,
+            initial_balance=Decimal(str(self.initial_balance)),
+            start_time=self.start_time,
+            end_time=self.end_time,
+        )
+        daily_return_moments: dict[str, Decimal | int] = {
+            name: cast(Decimal | int, daily_return_metrics[name])
+            for name in (
+                "count",
+                "sum",
+                "sum_squares",
+                "sum_cubes",
+                "sum_fourth",
+            )
+        }
         return {
             "total_pnl": total_pnl,
             "mark_to_market_pnl": metrics.get(
@@ -260,6 +280,7 @@ class ResearchBacktestRunner:
             "max_drawdown": metrics.get("max_drawdown", Decimal("0")),
             "win_rate": metrics.get("win_rate", 0.0),
             "total_trades": int(metrics.get("total_trades", 0)),
+            "closed_trade_count": int(metrics.get("closed_trade_count", 0)),
             "trade_sharpe": metrics.get("trade_sharpe", Decimal("0")),
             "profit_factor": metrics.get("profit_factor", Decimal("0")),
             "sortino_ratio": metrics.get("sortino_ratio", Decimal("0")),
@@ -268,6 +289,16 @@ class ResearchBacktestRunner:
             "avg_hold_time_hours": metrics.get("avg_hold_time_hours", Decimal("0")),
             "max_consecutive_wins": int(metrics.get("max_consecutive_wins", 0)),
             "max_consecutive_losses": int(metrics.get("max_consecutive_losses", 0)),
+            "monthly_returns": metrics.get("monthly_returns", {}),
+            "daily_return_moments": daily_return_moments,
+            "equity_sample_count": daily_return_metrics["equity_sample_count"],
+            "yearly_mark_to_market_returns": daily_return_metrics[
+                "yearly_returns"
+            ],
+            "annualized_sharpe": annualized_sharpe_from_moments(
+                daily_return_moments
+            ),
+            "trade_pnl_quality": metrics.get("trade_sharpe", Decimal("0")),
             "closed_trades": metrics.get("closed_trades", []),
             "raw_trades": trades,
             "raw_trade_count": len(trades),

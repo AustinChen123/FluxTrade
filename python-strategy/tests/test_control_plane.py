@@ -22,7 +22,11 @@ from src.control_plane import (
     StrategyControlService,
     StrategyStateQueryService,
 )
-from src.control_plane.models import BacktestJobRequest, JobStatus
+from src.control_plane.models import (
+    BacktestJobRequest,
+    JobStatus,
+    ParameterSearchJobRequest,
+)
 from src.core.product_registry import FeeModel
 import src.control_plane.backtest_jobs as backtest_jobs
 from src.core.command_router import CommandResult
@@ -1307,6 +1311,68 @@ def test_control_plane_runs_parameter_search_with_csv_signal_backtests(tmp_path)
     assert job["status"] == JobStatus.SUCCEEDED.value
     assert job["result"]["best_candidate"]["candidate_id"] == "aggressive"
     assert Decimal(job["result"]["best_candidate"]["score_total"]) > Decimal("0")
+
+
+@pytest.mark.rust
+@pytest.mark.skipif(not HAS_RUST, reason="fluxtrade_core.so not compiled")
+def test_csv_signal_walk_forward_fitness_has_required_metrics(tmp_path):
+    session_factory = _sqlite_session_factory(tmp_path)
+    candle_rows = _write_candles(tmp_path / "fitness_candles.csv")
+    signals = tmp_path / "fitness_signals.csv"
+    _write_signals(signals, [row[0] for row in candle_rows])
+    request = ParameterSearchJobRequest.model_validate(
+        {
+            "strategy_id": "csv_fitness",
+            "product_id": PRODUCT_ID,
+            "timeframe": TIMEFRAME,
+            "start_time": candle_rows[0][0],
+            "end_time": candle_rows[-1][0],
+            "backtest": {
+                "candles_csv_path": str(tmp_path / "fitness_candles.csv"),
+                "initial_balance": "10000",
+            },
+            "candidates": [
+                {
+                    "candidate_id": "baseline",
+                    "param_pack": {"signals_csv_path": str(signals)},
+                }
+            ],
+            "evaluation_set": {
+                "datasets": [
+                    {
+                        "dataset_id": "first",
+                        "product_id": PRODUCT_ID,
+                        "timeframe": TIMEFRAME,
+                        "start_time": candle_rows[0][0],
+                        "end_time": candle_rows[1][0],
+                    },
+                    {
+                        "dataset_id": "second",
+                        "product_id": PRODUCT_ID,
+                        "timeframe": TIMEFRAME,
+                        "start_time": candle_rows[2][0],
+                        "end_time": candle_rows[3][0],
+                    },
+                ]
+            },
+            "fitness": {},
+        }
+    )
+
+    job = ParameterSearchJobExecutor(
+        CsvSignalBacktestParameterEvaluator(
+            db_session_factory=session_factory,
+        ),
+        run_inline=True,
+    ).submit_search(request)
+
+    assert job.status == JobStatus.SUCCEEDED
+    assert (
+        job.result["evaluations"][0]["metrics"]["fitness"]["metric_contract"][
+            "version"
+        ]
+        == "walk_forward_fitness_v2"
+    )
 
 
 @pytest.mark.rust
