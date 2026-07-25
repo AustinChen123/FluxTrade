@@ -16,7 +16,9 @@ from src.core.interfaces import IOrderRepository
 from src.core.journal import StrategyJournal
 from src.core.metrics import ORDERS_TOTAL, EXECUTION_LATENCY
 from src.core.audit_service import (
+    build_signal_audit,
     build_signal_intent_audit,
+    commit_signal_audit,
     write_signal_audit_intent,
     write_signal_audit_outcome,
     write_system_event,
@@ -49,6 +51,16 @@ class FlattenPending:
     reason: str
 
 
+@dataclass(frozen=True)
+class ExitDecision:
+    """Resolved position truth for one EXIT signal."""
+
+    allowed: bool
+    reason: str
+    quantity: Decimal | None = None
+    position_quantity: Decimal | None = None
+
+
 class ExecutionEngine:
     def __init__(
         self,
@@ -69,6 +81,15 @@ class ExecutionEngine:
         self._db_session_factory = db_session_factory
         self._db_session = db_session
         self.audit_external_orders = audit_external_orders
+        self._position_loader = (
+            getattr(
+                account_service,
+                "get_position_for_exit",
+                getattr(account_service, "get_position", None),
+            )
+            if account_service is not None
+            else None
+        )
         if order_repository:
             self.order_manager = OrderManager(
                 order_repository,
@@ -151,6 +172,8 @@ class ExecutionEngine:
         # reconcile resume can never clear an active kill-switch halt, and vice
         # versa. Submissions are rejected while either flag is set.
         self._reconcile_halt = False
+        self._reconcile_halt_generation = 0
+        self._reconcile_claim = threading.local()
         self._submissions_in_flight = 0
         self._drain_callbacks: list[Callable[[], None]] = []
 
@@ -177,6 +200,149 @@ class ExecutionEngine:
             account_id,
             snapshot_loader=snapshot_loader,
         )
+
+    def execute_authoritative_exit_signal(
+        self,
+        signal: Signal,
+        candle: Optional[Candlestick],
+        executor: Callable[[Signal, ExitDecision], dict[str, object]],
+    ) -> Optional[str]:
+        """Audit and execute one venue-native, full-position EXIT operation."""
+        reconcile_generation = self._begin_authoritative_exit(timeout=30.0)
+        if reconcile_generation is None:
+            self.logger.warning(
+                "Authoritative EXIT rejected by submission gate: strategy=%s "
+                "product=%s",
+                signal.strategy_id,
+                signal.product_id,
+            )
+            self._audit_non_submission(signal, candle, "submission_gate_halted")
+            return None
+
+        resume_after_exit = False
+        try:
+            decision = self._classify_exit_signal(signal)
+            if decision is None or not decision.allowed:
+                reason = "not_exit" if decision is None else decision.reason
+                self.logger.warning(
+                    "Authoritative EXIT not submitted: strategy=%s "
+                    "product=%s reason=%s",
+                    signal.strategy_id,
+                    signal.product_id,
+                    reason,
+                )
+                self._audit_non_submission(signal, candle, reason)
+                resume_after_exit = reason in {"not_exit", "already_flat"}
+                return None
+            if decision.quantity != decision.position_quantity:
+                self.logger.warning(
+                    "Authoritative partial EXIT is unsupported: strategy=%s "
+                    "product=%s requested=%s position=%s",
+                    signal.strategy_id,
+                    signal.product_id,
+                    decision.quantity,
+                    decision.position_quantity,
+                )
+                self._audit_non_submission(
+                    signal,
+                    candle,
+                    "authoritative_partial_exit_unsupported",
+                )
+                return None
+
+            client_order_id = self._client_order_id_for_signal(signal)
+            intent_payload = {
+                "signal": signal.model_dump(mode="json"),
+                "operation": {
+                    "type": "authoritative_position_exit",
+                    "quantity": decision.position_quantity,
+                    "client_order_id": client_order_id,
+                },
+            }
+            audit = None
+            if self.audit_external_orders:
+                if self._db_session_factory is None:
+                    raise RuntimeError(
+                        "audit_external_orders requires db_session_factory"
+                    )
+                audit = build_signal_intent_audit(
+                    clock=self.clock,
+                    signal=signal,
+                    client_order_id=client_order_id,
+                    intent_payload=intent_payload,
+                )
+                with self._db_session_factory() as db:
+                    write_signal_audit_intent(db, audit)
+
+            try:
+                outcome = executor(signal, decision)
+            except Exception as error:
+                if audit is not None:
+                    with self._db_session_factory() as db:
+                        write_signal_audit_outcome(
+                            db,
+                            audit,
+                            risk_message=str(error),
+                            outcome_payload={
+                                "status": "verification_blocked",
+                                "error_type": type(error).__name__,
+                            },
+                        )
+                raise
+
+            if audit is not None:
+                with self._db_session_factory() as db:
+                    write_signal_audit_outcome(
+                        db,
+                        audit,
+                        outcome_payload=outcome,
+                    )
+            resume_after_exit = True
+            return None
+        finally:
+            self._finish_authoritative_exit(
+                resume_after_reconcile=resume_after_exit,
+                reconcile_generation=reconcile_generation,
+            )
+
+    def _begin_authoritative_exit(self, *, timeout: float) -> int | None:
+        """Own the shared gate without counting this operation in its drain."""
+        with self._submission_gate:
+            if self._submissions_halted or self._reconcile_halt:
+                return None
+            reconcile_generation = self._claim_reconcile_halt_locked()
+            if not self._submission_gate.wait_for(
+                lambda: self._submissions_in_flight == 0,
+                timeout=timeout,
+            ):
+                return None
+            if self._submissions_halted:
+                return None
+            self._submissions_in_flight += 1
+            return reconcile_generation
+
+    def _finish_authoritative_exit(
+        self,
+        *,
+        resume_after_reconcile: bool,
+        reconcile_generation: int,
+    ) -> None:
+        callbacks: list[Callable[[], None]] = []
+        with self._submission_gate:
+            self._submissions_in_flight -= 1
+            if (
+                resume_after_reconcile
+                and self._reconcile_halt_generation == reconcile_generation
+            ):
+                self._reconcile_halt = False
+            if self._submissions_in_flight == 0:
+                callbacks, self._drain_callbacks = self._drain_callbacks, []
+            self._submission_gate.notify_all()
+        for callback in callbacks:
+            try:
+                callback()
+            except Exception:
+                self.logger.exception("Submission drain callback failed")
 
     def _fail_pending_conditional_orders_for_terminal_entry(self, entry_order) -> None:
         """Clear pending protection for an entry that terminated with zero fills.
@@ -762,17 +928,35 @@ class ExecutionEngine:
         were in flight within *timeout*.
         """
         with self._submission_gate:
-            self._reconcile_halt = True
+            generation = self._claim_reconcile_halt_locked()
+            self._reconcile_claim.generation = generation
             return self._submission_gate.wait_for(
                 lambda: self._submissions_in_flight == 0,
                 timeout=timeout,
             )
 
+    def _claim_reconcile_halt_locked(self) -> int:
+        """Raise the gate and return a generation identifying this claim."""
+        self._reconcile_halt_generation += 1
+        self._reconcile_halt = True
+        return self._reconcile_halt_generation
+
     def resume_after_reconcile(self) -> None:
         """Clear only the reconcile gate; leaves any kill-switch halt untouched."""
+        expected_generation = getattr(
+            self._reconcile_claim,
+            "generation",
+            None,
+        )
         with self._submission_gate:
-            self._reconcile_halt = False
+            if (
+                expected_generation is None
+                or self._reconcile_halt_generation == expected_generation
+            ):
+                self._reconcile_halt = False
             self._submission_gate.notify_all()
+        if expected_generation is not None:
+            del self._reconcile_claim.generation
 
     def modify_protection(
         self,
@@ -884,7 +1068,7 @@ class ExecutionEngine:
             }
         except NetworkError:
             with self._submission_gate:
-                self._reconcile_halt = True
+                self._claim_reconcile_halt_locked()
             raise
         finally:
             self._finish_submission()
@@ -919,20 +1103,48 @@ class ExecutionEngine:
                 return None
             self._submissions_in_flight += 1
         try:
+            exit_decision = self._classify_exit_signal(signal)
+            if exit_decision is not None and not exit_decision.allowed:
+                self.logger.warning(
+                    "EXIT signal not submitted: strategy=%s product=%s reason=%s",
+                    signal.strategy_id,
+                    signal.product_id,
+                    exit_decision.reason,
+                )
+                self._audit_non_submission(
+                    signal,
+                    candle,
+                    exit_decision.reason,
+                )
+                return None
             if self.audit_external_orders:
-                return self._execute_signal_with_audit(signal, candle)
-            return self._execute_signal_core(signal, candle)
+                return self._execute_signal_with_audit(
+                    signal,
+                    candle,
+                    exit_decision=exit_decision,
+                )
+            return self._execute_signal_core(
+                signal,
+                candle,
+                exit_decision=exit_decision,
+            )
         finally:
             self._finish_submission()
 
-    def _execute_signal_core(self, signal: Signal, candle: Optional[Candlestick] = None) -> Optional[str]:
+    def _execute_signal_core(
+        self,
+        signal: Signal,
+        candle: Optional[Candlestick] = None,
+        *,
+        exit_decision: ExitDecision | None = None,
+    ) -> Optional[str]:
         """Current non-audited signal execution path."""
         side = self._determine_side(signal.type)
         if not side:
             return None
 
         # Determine Quantity
-        qty = self._quantity_for_signal(signal)
+        qty = self._quantity_for_signal(signal, exit_decision=exit_decision)
 
         # Determine Order Type and Price
         if signal.price and signal.price > 0:
@@ -951,7 +1163,8 @@ class ExecutionEngine:
             side=side,
             order_type=order_type,
             quantity=qty,
-            price=limit_price
+            price=limit_price,
+            intent_payload=self._signal_order_intent(signal) or None,
         )
         self._attach_min_notional_reference_price(order, candle)
         conditional_orders = self._create_conditional_orders(signal, order, qty, candle)
@@ -1026,7 +1239,13 @@ class ExecutionEngine:
 
         return order.id
 
-    def _execute_signal_with_audit(self, signal: Signal, candle: Optional[Candlestick] = None) -> Optional[str]:
+    def _execute_signal_with_audit(
+        self,
+        signal: Signal,
+        candle: Optional[Candlestick] = None,
+        *,
+        exit_decision: ExitDecision | None = None,
+    ) -> Optional[str]:
         """Fail-stop external execution path with committed intent/outcome audits."""
         if self._db_session_factory is None:
             raise RuntimeError("audit_external_orders requires db_session_factory")
@@ -1035,7 +1254,7 @@ class ExecutionEngine:
         if not side:
             return None
 
-        qty = self._quantity_for_signal(signal)
+        qty = self._quantity_for_signal(signal, exit_decision=exit_decision)
         if signal.price and signal.price > 0:
             order_type = "limit"
             limit_price = signal.price
@@ -1061,7 +1280,9 @@ class ExecutionEngine:
                 "price": limit_price,
                 "min_notional_reference_price": candle.close if candle else None,
                 "client_order_id": client_order_id,
+                **self._signal_order_intent(signal),
             },
+            **self._signal_order_intent(signal),
         }
         order = self.order_manager.create_order(
             signal=signal,
@@ -1113,7 +1334,7 @@ class ExecutionEngine:
             self.logger.error("Execution Failed: %s", e)
             if atomic_group and isinstance(e, NetworkError):
                 with self._submission_gate:
-                    self._reconcile_halt = True
+                    self._claim_reconcile_halt_locked()
                 adoption = {
                     "action": "verification_blocked_native_bracket_submit",
                     "verification_blocked": True,
@@ -1474,32 +1695,100 @@ class ExecutionEngine:
             signal.type.value.lower(),
         )
 
-    def _quantity_for_signal(self, signal: Signal) -> Decimal:
+    def _quantity_for_signal(
+        self,
+        signal: Signal,
+        *,
+        exit_decision: ExitDecision | None = None,
+    ) -> Decimal:
+        if exit_decision is not None and exit_decision.quantity is not None:
+            return exit_decision.quantity
         if signal.quantity and signal.quantity > 0:
             return signal.quantity
-        if signal.type in (SignalType.EXIT_LONG, SignalType.EXIT_SHORT):
-            position = self._position_for_exit_signal(signal)
-            if position is not None and position.quantity > 0:
-                return position.quantity
         return self.default_quantity
 
-    def _position_for_exit_signal(self, signal: Signal):
+    def _classify_exit_signal(self, signal: Signal) -> ExitDecision | None:
+        if signal.type not in (SignalType.EXIT_LONG, SignalType.EXIT_SHORT):
+            return None
         try:
-            position = self.adapter.get_position(
+            position = self._load_strategy_position(signal)
+        except Exception as error:
+            with self._submission_gate:
+                self._claim_reconcile_halt_locked()
+            self.logger.error(
+                "EXIT position lookup failed; submissions halted: "
+                "strategy=%s product=%s error=%s",
+                signal.strategy_id,
+                signal.product_id,
+                error,
+            )
+            return ExitDecision(False, "position_unknown")
+        if position is None:
+            return ExitDecision(False, "already_flat")
+
+        position_side = getattr(position.side, "value", position.side)
+        expected_side = (
+            PositionSide.LONG.value
+            if signal.type == SignalType.EXIT_LONG
+            else PositionSide.SHORT.value
+        )
+        if position_side != expected_side:
+            with self._submission_gate:
+                self._claim_reconcile_halt_locked()
+            return ExitDecision(False, "position_side_mismatch")
+
+        position_quantity = Decimal(str(position.quantity))
+        if position_quantity <= 0:
+            return ExitDecision(False, "already_flat")
+        requested_quantity = (
+            signal.quantity
+            if signal.quantity is not None and signal.quantity > 0
+            else position_quantity
+        )
+        return ExitDecision(
+            True,
+            "position_matched",
+            min(requested_quantity, position_quantity),
+            position_quantity,
+        )
+
+    def _load_strategy_position(self, signal: Signal):
+        if self._position_loader is not None:
+            return self._position_loader(signal.strategy_id, signal.product_id)
+        try:
+            return self.adapter.get_position(
                 signal.product_id,
                 strategy_id=signal.strategy_id,
             )
         except TypeError:
-            position = self.adapter.get_position(signal.product_id)
-        if position is None:
-            return None
+            return self.adapter.get_position(signal.product_id)
 
-        position_side = getattr(position.side, "value", position.side)
-        if signal.type == SignalType.EXIT_LONG and position_side == PositionSide.LONG.value:
-            return position
-        if signal.type == SignalType.EXIT_SHORT and position_side == PositionSide.SHORT.value:
-            return position
-        return None
+    def _audit_non_submission(
+        self,
+        signal: Signal,
+        candle: Optional[Candlestick],
+        reason: str,
+    ) -> None:
+        if not self.audit_external_orders:
+            return
+        if self._db_session_factory is None:
+            raise RuntimeError("audit_external_orders requires db_session_factory")
+        audit = build_signal_audit(
+            clock=self.clock,
+            signal=signal,
+            candle=candle,
+            risk_passed=False,
+            risk_message=reason,
+            order_id=None,
+        )
+        with self._db_session_factory() as db:
+            commit_signal_audit(db, audit)
+
+    @staticmethod
+    def _signal_order_intent(signal: Signal) -> dict[str, object]:
+        if signal.type not in (SignalType.EXIT_LONG, SignalType.EXIT_SHORT):
+            return {}
+        return {"reduce_only": True, "source": "strategy_exit"}
 
     def _create_conditional_orders(
         self,

@@ -231,6 +231,36 @@ def test_set_position_state_prefers_explicit_strategy_hook() -> None:
     assert strategy.position == 99
 
 
+def test_on_candle_syncs_strategy_only_when_authoritative_side_changes() -> None:
+    class HookStrategy(DummyStrategy):
+        def __init__(self):
+            super().__init__("s1")
+            self.synced_sides: list[str | None] = []
+
+        def sync_position_state(self, position_side: str | None) -> bool:
+            self.synced_sides.append(position_side)
+            return True
+
+    strategy = HookStrategy()
+    registry = StrategyRegistry()
+    registry.register(strategy)
+    position = MagicMock(side="LONG")
+    current_position = [position]
+    processor = SignalProcessor(
+        registry,
+        MagicMock(),
+        position_loader=lambda _strategy_id, _product_id: current_position[0],
+    )
+
+    processor.on_candle(make_candle())
+    processor.on_candle(make_candle())
+    current_position[0] = None
+    processor.on_candle(make_candle())
+
+    assert strategy.synced_sides == ["LONG", None]
+    assert len(strategy.candles_received) == 3
+
+
 # ---------------------------------------------------------------------------
 # Parametrized decision-table for set_position_state
 # ---------------------------------------------------------------------------

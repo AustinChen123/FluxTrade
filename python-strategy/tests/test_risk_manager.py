@@ -984,6 +984,13 @@ class TestAccountService:
 
         assert service.get_position("strat", "BINANCE:BTCUSDT-PERP") is None
 
+    def test_exit_position_lookup_fails_when_redis_is_unavailable(self):
+        with patch("src.core.risk_manager.create_redis_client", side_effect=Exception("fail")):
+            service = AccountService()
+
+        with pytest.raises(RuntimeError, match="position_state_unavailable"):
+            service.get_position_for_exit("strat", "BINANCE:BTCUSDT-PERP")
+
     def test_get_all_positions_enumerates_redis_position_keys(self):
         """Should enumerate Redis position hashes and return non-flat positions."""
         mock_redis = MagicMock()

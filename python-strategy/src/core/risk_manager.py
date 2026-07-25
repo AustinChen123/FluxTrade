@@ -80,6 +80,18 @@ class AccountService:
             unrealized_pnl=unrealized_pnl
         )
 
+    def get_position_for_exit(
+        self,
+        strategy_id: str,
+        product_id: str,
+    ) -> Optional[Position]:
+        """Load position truth for an EXIT decision, distinguishing flat from unavailable."""
+        if type(self).get_position is not AccountService.get_position:
+            return self.get_position(strategy_id, product_id)
+        if not getattr(self, "redis", None):
+            raise RuntimeError("position_state_unavailable")
+        return self.get_position(strategy_id, product_id)
+
     def get_all_positions(self) -> list[Position]:
         if not getattr(self, "redis", None):
             return []

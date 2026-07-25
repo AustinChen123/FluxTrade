@@ -50,3 +50,10 @@ class BacktestAccountService(AccountService):
         if self.repo:
             return self.repo.get_position(strategy_id, product_id)
         return None
+
+    def get_position_for_exit(
+        self,
+        strategy_id: str,
+        product_id: str,
+    ) -> Optional[Position]:
+        return self.get_position(strategy_id, product_id)

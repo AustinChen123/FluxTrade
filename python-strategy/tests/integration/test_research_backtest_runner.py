@@ -711,6 +711,114 @@ def test_conditional_orders_do_not_survive_explicit_exit_or_repeated_entry(
     assert research_result["total_pnl"] == full_result["total_pnl"]
 
 
+@pytest.mark.smoke
+def test_protective_fill_then_same_bar_exit_does_not_reverse(tmp_path):
+    start = 1_700_000_000_000
+    candles = [
+        make_candle(start, Decimal("100"), Decimal("101"), Decimal("99"), Decimal("100")),
+        make_candle(
+            start + INTERVAL_MS,
+            Decimal("100"),
+            Decimal("101"),
+            Decimal("99"),
+            Decimal("100"),
+        ),
+        make_candle(
+            start + 2 * INTERVAL_MS,
+            Decimal("95"),
+            Decimal("96"),
+            Decimal("85"),
+            Decimal("88"),
+        ),
+        make_candle(
+            start + 3 * INTERVAL_MS,
+            Decimal("88"),
+            Decimal("89"),
+            Decimal("87"),
+            Decimal("88"),
+        ),
+    ]
+
+    def predict(candle):
+        index = (candle.timestamp - start) // INTERVAL_MS
+        if index == 0:
+            return Signal(
+                strategy_id="protective_exit_probe",
+                product_id=PRODUCT_ID,
+                timeframe=TIMEFRAME,
+                timestamp=candle.timestamp,
+                type=SignalType.LONG,
+                quantity=Decimal("1"),
+                stop_loss=Decimal("90"),
+            )
+        if index == 2:
+            return Signal(
+                strategy_id="protective_exit_probe",
+                product_id=PRODUCT_ID,
+                timeframe=TIMEFRAME,
+                timestamp=candle.timestamp,
+                type=SignalType.EXIT_LONG,
+                quantity=Decimal("1"),
+            )
+        return None
+
+    fee_config = {"maker": Decimal("0"), "taker": Decimal("0")}
+    full_runner = BacktestRunner(
+        start_time=candles[0].timestamp,
+        end_time=candles[-1].timestamp,
+        product_id=PRODUCT_ID,
+        timeframe=TIMEFRAME,
+        initial_balance=10_000,
+        max_drawdown_limit=None,
+        data_source=MemoryDataSource(candles),
+        fee_config=fee_config,
+        report_config={
+            "csv_trades": False,
+            "markdown_report": False,
+            "equity_curve": False,
+            "journal_export": False,
+        },
+        db_session_factory=_sqlite_backtest_session_factory(tmp_path),
+    )
+    full_runner.add_strategy(
+        CallableStrategy(
+            "protective_exit_probe",
+            predict,
+            PRODUCT_ID,
+            TIMEFRAME,
+        )
+    )
+    research_runner = ResearchBacktestRunner(
+        start_time=candles[0].timestamp,
+        end_time=candles[-1].timestamp,
+        product_id=PRODUCT_ID,
+        timeframe=TIMEFRAME,
+        initial_balance=10_000,
+        data_source=MemoryDataSource(candles),
+        fee_config=fee_config,
+    )
+    research_runner.add_strategy(
+        CallableStrategy(
+            "protective_exit_probe",
+            predict,
+            PRODUCT_ID,
+            TIMEFRAME,
+        )
+    )
+
+    full_result = full_runner.run()
+    research_result = research_runner.run()
+    full_position = full_runner.engine.execution_engine.adapter.get_position(
+        PRODUCT_ID,
+        strategy_id="protective_exit_probe",
+    )
+
+    assert full_position is None
+    assert full_result["total_trades"] == research_result["total_trades"] == 1
+    assert full_result["total_pnl"] == research_result["total_pnl"]
+    assert research_result["raw_trade_count"] == 2
+
+
 def test_research_backtest_syncs_capital_lifecycle_after_fills():
     candles = make_candle_series(count=4)
     strategy = CapitalLifecycleProbeStrategy()
@@ -847,6 +955,93 @@ def test_research_backtest_exit_without_quantity_closes_current_position():
     assert result["raw_trades"][0].quantity == Decimal("0.03")
     assert result["raw_trades"][1].quantity == Decimal("0.03")
     assert result["total_trades"] == 1
+
+
+def test_full_and_research_backtests_cap_exit_to_current_position(tmp_path):
+    candles = make_candle_series(count=4)
+
+    def predict(candle):
+        index = (candle.timestamp - candles[0].timestamp) // INTERVAL_MS
+        if index == 0:
+            return Signal(
+                strategy_id="research_exit_cap",
+                product_id=PRODUCT_ID,
+                timeframe=TIMEFRAME,
+                timestamp=candle.timestamp,
+                type=SignalType.LONG,
+                quantity=Decimal("0.03"),
+            )
+        if index == 2:
+            return Signal(
+                strategy_id="research_exit_cap",
+                product_id=PRODUCT_ID,
+                timeframe=TIMEFRAME,
+                timestamp=candle.timestamp,
+                type=SignalType.EXIT_LONG,
+                quantity=Decimal("1"),
+            )
+        return None
+
+    session_factory = _sqlite_backtest_session_factory(tmp_path)
+    full_runner = BacktestRunner(
+        start_time=candles[0].timestamp,
+        end_time=candles[-1].timestamp,
+        product_id=PRODUCT_ID,
+        timeframe=TIMEFRAME,
+        initial_balance=10_000.0,
+        data_source=MemoryDataSource(candles),
+        report_config={
+            "csv_trades": False,
+            "markdown_report": False,
+            "equity_curve": False,
+            "journal_export": False,
+        },
+        db_session_factory=session_factory,
+    )
+    full_runner.add_strategy(
+        CallableStrategy(
+            "research_exit_cap",
+            predict,
+            PRODUCT_ID,
+            TIMEFRAME,
+        )
+    )
+    research_runner = ResearchBacktestRunner(
+        start_time=candles[0].timestamp,
+        end_time=candles[-1].timestamp,
+        product_id=PRODUCT_ID,
+        timeframe=TIMEFRAME,
+        initial_balance=10_000.0,
+        data_source=MemoryDataSource(candles),
+    )
+    research_runner.add_strategy(
+        CallableStrategy(
+            "research_exit_cap",
+            predict,
+            PRODUCT_ID,
+            TIMEFRAME,
+        )
+    )
+
+    full_runner.run()
+    research_result = research_runner.run()
+    with session_factory() as session:
+        full_trades = session.scalars(select(BacktestTradeLog)).all()
+
+    assert research_result["raw_trade_count"] == 2
+    assert [trade.quantity for trade in research_result["raw_trades"]] == [
+        Decimal("0.03"),
+        Decimal("0.03"),
+    ]
+    assert [trade.quantity for trade in full_trades] == [
+        Decimal("0.03"),
+        Decimal("0.03"),
+    ]
+    assert (
+        _net_quantity(research_result["raw_trades"])
+        == _net_quantity(full_trades)
+        == Decimal("0")
+    )
 
 
 def test_research_backtest_rejects_entry_over_available_capital():
