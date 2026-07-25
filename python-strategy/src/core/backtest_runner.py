@@ -13,12 +13,12 @@ from src.core.clock import BacktestClock
 from src.strategies.base import BaseStrategy
 from src.core.repositories import BacktestOrderRepository
 from src.core.backtest.loader import get_candles_generator
+from src.core.backtest.equity import portfolio_equity
 from src.core.analytics import calculate_metrics, ClosedTrade
 from src.core.interfaces.data_source import IDataSource
 from src.core.adapters.simulated import SimulatedAdapter
 from src.core.mocks.account_service import BacktestAccountService
 from src.core.journal import StrategyJournal
-from src.core.models import PositionSide
 from src.core.product_registry import (
     FeeModel,
     InstrumentSpec,
@@ -206,10 +206,11 @@ class BacktestRunner:
         candles: Iterable,
         mock_account: BacktestAccountService,
         stop_drawdown_amount: Decimal | None,
-    ) -> int:
+    ) -> tuple[int, list[tuple[int, Decimal]]]:
         count = 0
         peak_equity = Decimal(str(self.initial_balance))
         max_drawdown = Decimal("0")
+        equity_samples: list[tuple[int, Decimal]] = []
         for candle in candles:
             # Update Clock
             self.clock.set_time(candle.timestamp / 1000)
@@ -218,7 +219,24 @@ class BacktestRunner:
             self.engine.on_market_data(candle)
 
             # Check Circuit Breaker
-            current_equity = self._account_equity(mock_account, candle)
+            if mock_account.adapter is None:
+                current_equity = mock_account.get_balance()
+            elif not isinstance(mock_account.adapter, SimulatedAdapter):
+                raise RuntimeError(
+                    "backtest portfolio equity requires SimulatedAdapter"
+                )
+            else:
+                current_equity = portfolio_equity(
+                    mock_account.adapter,
+                    strategy_ids=[
+                        strategy.strategy_id
+                        for strategy in self._strategies_buffer
+                    ],
+                    product_id=self.product_id,
+                    mark_price=candle.close,
+                    contract_multiplier=self.contract_multiplier,
+                )
+            equity_samples.append((candle.timestamp, current_equity))
             peak_equity = max(peak_equity, current_equity)
             max_drawdown = max(max_drawdown, peak_equity - current_equity)
             count += 1
@@ -240,30 +258,14 @@ class BacktestRunner:
                     candle.timestamp,
                     current_equity,
                 )
-        return count
-
-    def _account_equity(
-        self,
-        mock_account: BacktestAccountService,
-        candle,
-    ) -> Decimal:
-        cash = mock_account.get_balance()
-        if mock_account.adapter is None:
-            return cash
-        position = mock_account.adapter.get_position(self.product_id)
-        if position is None:
-            return cash
-        return cash + _unrealized_pnl_at_mark(
-            position,
-            candle.close,
-            self.contract_multiplier,
-        )
+        return count, equity_samples
 
     def _export_reports(
         self,
         metrics: Dict,
         journal: StrategyJournal,
         candle_count: int,
+        equity_samples: list[tuple[int, Decimal]] | None = None,
     ) -> Optional[str]:
         """Write report files to output_dir. Returns output directory path."""
         cfg = self.report_config
@@ -279,13 +281,12 @@ class BacktestRunner:
             _write_csv_trades(closed_trades, output_dir / "trades.csv")
 
         if cfg.get("equity_curve"):
-            # Rebuild equity curve from closed trades
-            running = Decimal("0")
-            equity = [running]
-            for ct in closed_trades:
-                running += ct.pnl
-                equity.append(running)
-            _write_equity_curve(equity, output_dir / "equity_curve.csv")
+            if equity_samples is None:
+                raise ValueError("equity_samples are required for equity curve export")
+            _write_equity_curve(
+                [equity for _, equity in equity_samples],
+                output_dir / "equity_curve.csv",
+            )
 
         if cfg.get("journal_export") and len(journal) > 0:
             _write_journal(journal, output_dir / "journal.jsonl")
@@ -398,7 +399,11 @@ class BacktestRunner:
                     self.start_time,
                     self.end_time,
                 )
-            count = self._process_candles(candle_gen, mock_account, stop_drawdown_amount)
+            count, equity_samples = self._process_candles(
+                candle_gen,
+                mock_account,
+                stop_drawdown_amount,
+            )
 
         # Calculate Final PnL
         final_balance = mock_account.get_balance()
@@ -412,6 +417,7 @@ class BacktestRunner:
                 trades,
                 initial_balance=self.initial_balance,
                 contract_multiplier=self.contract_multiplier,
+                equity_samples=equity_samples,
             )
 
             # Per-strategy metrics
@@ -432,7 +438,12 @@ class BacktestRunner:
             db_session.commit()
 
         # Export reports
-        report_dir = self._export_reports(metrics, journal, candle_count=count)
+        report_dir = self._export_reports(
+            metrics,
+            journal,
+            candle_count=count,
+            equity_samples=equity_samples,
+        )
 
         logger.info("Backtest Complete. Processed %d candles. Final PnL: %s", count, total_pnl)
         logger.info("Metrics: %s", metrics_for_json)
@@ -441,6 +452,10 @@ class BacktestRunner:
 
         result = {
             "total_pnl": total_pnl,
+            "mark_to_market_pnl": metrics.get(
+                "mark_to_market_pnl",
+                total_pnl,
+            ),
             "max_drawdown": metrics.get("max_drawdown", Decimal("0")),
             "win_rate": metrics.get("win_rate", Decimal("0")),
             "total_trades": int(metrics.get("total_trades", 0)),
@@ -448,6 +463,7 @@ class BacktestRunner:
             "profit_factor": metrics.get("profit_factor", Decimal("0")),
             "sortino_ratio": metrics.get("sortino_ratio", Decimal("0")),
             "calmar_ratio": metrics.get("calmar_ratio", Decimal("0")),
+            "max_drawdown_days": metrics.get("max_drawdown_days", Decimal("0")),
             "avg_hold_time_hours": metrics.get("avg_hold_time_hours", Decimal("0")),
             "max_consecutive_wins": int(metrics.get("max_consecutive_wins", 0)),
             "max_consecutive_losses": int(metrics.get("max_consecutive_losses", 0)),
@@ -480,29 +496,13 @@ class BacktestRunner:
         for sid in strategy_ids:
             strategy_trades = [t for t in trades if getattr(t, "strategy_id", None) == sid]
             if strategy_trades:
-                per_strategy[sid] = calculate_metrics(
+                strategy_metrics = calculate_metrics(
                     strategy_trades,
                     initial_balance=self.initial_balance,
                     contract_multiplier=self.contract_multiplier,
                 )
+                strategy_metrics["max_drawdown"] = abs(
+                    strategy_metrics.get("max_drawdown", Decimal("0"))
+                )
+                per_strategy[sid] = strategy_metrics
         return per_strategy
-
-
-def _unrealized_pnl_at_mark(
-    position,
-    mark_price: Decimal,
-    contract_multiplier: Decimal = Decimal("1"),
-) -> Decimal:
-    if position.side == PositionSide.LONG:
-        return (
-            (mark_price - position.entry_price)
-            * position.quantity
-            * contract_multiplier
-        )
-    if position.side == PositionSide.SHORT:
-        return (
-            (position.entry_price - mark_price)
-            * position.quantity
-            * contract_multiplier
-        )
-    return Decimal("0")

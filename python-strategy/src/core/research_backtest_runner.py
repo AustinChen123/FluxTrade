@@ -11,12 +11,13 @@ from __future__ import annotations
 import logging
 import uuid
 import inspect
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from decimal import Decimal
 from typing import TYPE_CHECKING, Any, Dict, Iterable, Optional, Sequence
 
 from src.core.adapters.simulated import SimulatedAdapter
 from src.core.analytics import calculate_metrics
+from src.core.backtest.equity import require_strategy_position_scope
 from src.core.backtest.loader import get_candles_generator
 from src.core.clock import BacktestClock
 from src.core.conditional_order_intents import (
@@ -134,6 +135,9 @@ class ResearchBacktestRunner:
             strategy.strategy_id: Decimal("0")
             for strategy in self._strategies
         }
+        portfolio_peak_equity = initial_equity
+        portfolio_max_drawdown = Decimal("0")
+        equity_samples: list[tuple[int, Decimal]] = []
 
         candle_count = 0
         for candle, prepared_candle in self._iter_replay_candles(adapter):
@@ -146,11 +150,18 @@ class ResearchBacktestRunner:
             trades.extend(self._fills_to_trades(fills, candle))
             self._sync_capital_usage(adapter, candle)
 
-            for strategy in self._strategies:
-                if strategy.product_id != candle.product_id:
-                    continue
-                if strategy.requirements.timeframe != candle.timeframe:
-                    continue
+            active_strategies = [
+                strategy
+                for strategy in self._strategies
+                if strategy.product_id == candle.product_id
+                and strategy.requirements.timeframe == candle.timeframe
+            ]
+            require_strategy_position_scope(
+                adapter,
+                [strategy.strategy_id for strategy in active_strategies],
+            )
+            contexts: list[StrategyContext] = []
+            for strategy in active_strategies:
                 context = self._strategy_context(
                     adapter=adapter,
                     strategy=strategy,
@@ -159,6 +170,7 @@ class ResearchBacktestRunner:
                     peak_equity_by_strategy=peak_equity_by_strategy,
                     max_drawdown_by_strategy=max_drawdown_by_strategy,
                 )
+                contexts.append(context)
                 decision_context = None
                 if context_support[strategy.strategy_id]:
                     decision_context = context
@@ -185,13 +197,30 @@ class ResearchBacktestRunner:
                             adapter.place_order(order)
                         self._reserve_entry_capital(signal, entry_order, candle)
 
+            portfolio_current_equity = (
+                contexts[0].available_cash
+                + sum(
+                    (context.unrealized_pnl for context in contexts),
+                    start=Decimal("0"),
+                )
+                if contexts
+                else adapter.get_balance()
+            )
+            equity_samples.append((candle.timestamp, portfolio_current_equity))
+            portfolio_peak_equity = max(
+                portfolio_peak_equity,
+                portfolio_current_equity,
+            )
+            portfolio_max_drawdown = max(
+                portfolio_max_drawdown,
+                portfolio_peak_equity - portfolio_current_equity,
+            )
             candle_count += 1
             if (
                 stop_drawdown_amount is not None
                 and self.balance_check_interval > 0
                 and candle_count % self.balance_check_interval == 0
-                and max(max_drawdown_by_strategy.values(), default=Decimal("0"))
-                >= stop_drawdown_amount
+                and portfolio_max_drawdown >= stop_drawdown_amount
             ):
                 logger.warning("Stopping research backtest at drawdown threshold")
                 break
@@ -202,20 +231,22 @@ class ResearchBacktestRunner:
             trades,
             initial_balance=self.initial_balance,
             contract_multiplier=self.contract_multiplier,
-        )
-        bar_max_drawdown = max(
-            max_drawdown_by_strategy.values(),
-            default=Decimal("0"),
+            equity_samples=equity_samples,
         )
         return {
             "total_pnl": total_pnl,
-            "max_drawdown": bar_max_drawdown,
+            "mark_to_market_pnl": metrics.get(
+                "mark_to_market_pnl",
+                total_pnl,
+            ),
+            "max_drawdown": metrics.get("max_drawdown", Decimal("0")),
             "win_rate": metrics.get("win_rate", 0.0),
             "total_trades": int(metrics.get("total_trades", 0)),
             "trade_sharpe": metrics.get("trade_sharpe", Decimal("0")),
             "profit_factor": metrics.get("profit_factor", Decimal("0")),
             "sortino_ratio": metrics.get("sortino_ratio", Decimal("0")),
             "calmar_ratio": metrics.get("calmar_ratio", Decimal("0")),
+            "max_drawdown_days": metrics.get("max_drawdown_days", Decimal("0")),
             "avg_hold_time_hours": metrics.get("avg_hold_time_hours", Decimal("0")),
             "max_consecutive_wins": int(metrics.get("max_consecutive_wins", 0)),
             "max_consecutive_losses": int(metrics.get("max_consecutive_losses", 0)),
@@ -323,23 +354,15 @@ class ResearchBacktestRunner:
         max_drawdown_by_strategy[strategy_id] = max_drawdown
 
         if (
-            peak_equity == context.total_equity
-            and context.current_drawdown == current_drawdown
+            context.current_drawdown == current_drawdown
             and context.max_drawdown == max_drawdown
         ):
             return context
 
-        return adapter.get_strategy_context(
-            strategy_id=strategy_id,
-            product_id=candle.product_id,
-            timestamp=candle.timestamp,
-            initial_balance=initial_balance,
-            mark_price=candle.close,
-            peak_equity=peak_equity,
+        return replace(
+            context,
+            current_drawdown=current_drawdown,
             max_drawdown=max_drawdown,
-            latest_fills=latest_fills,
-            latest_rejections=latest_rejections,
-            capital_allocator=self.capital_allocator,
         )
 
     def _sync_capital_usage(

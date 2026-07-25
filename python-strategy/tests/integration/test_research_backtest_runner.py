@@ -5,6 +5,7 @@ basic fill ordering and fee-aware PnL should stay aligned for simple signal
 strategies. These tests protect that contract without asserting speed.
 """
 
+import hashlib
 import json
 from decimal import Decimal
 
@@ -34,6 +35,7 @@ from src.core.research_backtest_runner import ResearchBacktestRunner
 from src.core.strategy_context import StrategyContext
 from src.strategies.base import BaseStrategy, StrategyRequirements
 from src.strategies.callable_strategy import CallableStrategy
+from src.strategies.representative_benchmark import RepresentativeBenchmarkStrategy
 
 try:
     import fluxtrade_core  # noqa: F401
@@ -117,6 +119,35 @@ def _signal_factory(
         return None
 
     return predict
+
+
+def _trade_digest(trades) -> str:
+    def decimal_text(value) -> str:
+        normalized = Decimal(value).normalize()
+        return "0" if normalized == 0 else format(normalized, "f")
+
+    rows = []
+    for trade in trades:
+        side = getattr(trade.side, "value", trade.side)
+        rows.append(
+            (
+                int(trade.timestamp),
+                str(side).lower(),
+                decimal_text(trade.price),
+                decimal_text(trade.quantity),
+                decimal_text(trade.fee),
+            )
+        )
+    rows.sort()
+    return hashlib.sha256(repr(rows).encode()).hexdigest()
+
+
+def _net_quantity(trades) -> Decimal:
+    quantity = Decimal("0")
+    for trade in trades:
+        side = getattr(trade.side, "value", trade.side)
+        quantity += trade.quantity if str(side).lower() == "buy" else -trade.quantity
+    return quantity
 
 
 def _conditional_signal_factory(
@@ -1033,3 +1064,184 @@ def test_research_backtest_rejects_out_of_order_prepared_scaled_candles():
 
     with pytest.raises(ValueError, match="prepared_scaled_candles timestamp"):
         runner.run()
+
+
+def test_representative_strategy_matches_full_and_prepared_research_paths(tmp_path):
+    start = 1_700_000_000_000
+    closes = [
+        Decimal(value)
+        for value in (
+            100,
+            101,
+            102,
+            103,
+            104,
+            105,
+            106,
+            105,
+            104,
+            103,
+            102,
+            101,
+            100,
+            99,
+            98,
+            97,
+            98,
+            99,
+            100,
+            101,
+            102,
+            103,
+            104,
+            103,
+            102,
+            101,
+            100,
+            99,
+            98,
+            97,
+        )
+    ]
+    candles = [
+        make_candle(
+            start + index * INTERVAL_MS,
+            close,
+            close + Decimal("0.5"),
+            close - Decimal("0.5"),
+            close,
+            volume=Decimal(100 + index % 4),
+        )
+        for index, close in enumerate(closes)
+    ]
+    session_factory = _sqlite_backtest_session_factory(tmp_path)
+    instrument = InstrumentSpec(
+        product_id=PRODUCT_ID,
+        exchange="binance",
+        symbol="BTC/USDT:USDT",
+        base="BTC",
+        quote="USDT",
+        multiplier=Decimal("1"),
+        quantity_step=Decimal("1"),
+        price_tick=Decimal("0.25"),
+        capital_model=CapitalModel.PER_CONTRACT,
+        capital_per_contract=Decimal("100"),
+    )
+    codec = PrecisionCodec(
+        PrecisionSpec(
+            price_tick=instrument.price_tick,
+            quantity_step=instrument.quantity_step,
+        )
+    )
+    prepared = ResearchBacktestRunner.prepare_scaled_candles(candles, codec)
+
+    def strategy() -> RepresentativeBenchmarkStrategy:
+        return RepresentativeBenchmarkStrategy(
+            "representative_parity",
+            PRODUCT_ID,
+            timeframe=TIMEFRAME,
+            trend_window=4,
+            breakout_window=3,
+            atr_window=3,
+            rsi_window=3,
+            volume_window=3,
+            swing_window=1,
+            entry_score=2,
+            hold_bars=3,
+            max_atr_expansion=Decimal("3"),
+            quantity=Decimal("1"),
+        )
+
+    full_runner = BacktestRunner(
+        start_time=candles[0].timestamp,
+        end_time=candles[-1].timestamp,
+        product_id=PRODUCT_ID,
+        timeframe=TIMEFRAME,
+        initial_balance=10_000,
+        max_drawdown_limit=None,
+        data_source=MemoryDataSource(candles),
+        fee_config={"maker": Decimal("0"), "taker": Decimal("0")},
+        report_config={
+            "csv_trades": False,
+            "markdown_report": False,
+            "equity_curve": False,
+            "journal_export": False,
+        },
+        db_session_factory=session_factory,
+        instrument_spec=instrument,
+    )
+    full_runner.add_strategy(strategy())
+    decimal_research_runner = ResearchBacktestRunner(
+        start_time=candles[0].timestamp,
+        end_time=candles[-1].timestamp,
+        product_id=PRODUCT_ID,
+        timeframe=TIMEFRAME,
+        initial_balance=10_000,
+        data_source=MemoryDataSource(candles),
+        fee_config={"maker": Decimal("0"), "taker": Decimal("0")},
+        instrument_spec=instrument,
+    )
+    decimal_research_runner.add_strategy(strategy())
+    research_runner = ResearchBacktestRunner(
+        start_time=candles[0].timestamp,
+        end_time=candles[-1].timestamp,
+        product_id=PRODUCT_ID,
+        timeframe=TIMEFRAME,
+        initial_balance=10_000,
+        data_source=MemoryDataSource(candles),
+        fee_config={"maker": Decimal("0"), "taker": Decimal("0")},
+        precision_codec=codec,
+        prepared_scaled_candles=prepared,
+        instrument_spec=instrument,
+    )
+    research_runner.add_strategy(strategy())
+
+    full_result = full_runner.run()
+    decimal_research_result = decimal_research_runner.run()
+    research_result = research_runner.run()
+
+    with session_factory() as session:
+        full_trades = session.scalars(select(BacktestTradeLog)).all()
+    full_closed_trades = calculate_metrics(full_trades)["closed_trades"]
+
+    assert research_result["total_trades"] > 0
+    assert (
+        research_result["closed_trades"]
+        == decimal_research_result["closed_trades"]
+        == full_closed_trades
+    )
+    assert (
+        research_result["total_pnl"]
+        == decimal_research_result["total_pnl"]
+        == full_result["total_pnl"]
+    )
+    assert (
+        research_result["mark_to_market_pnl"]
+        == decimal_research_result["mark_to_market_pnl"]
+        == full_result["mark_to_market_pnl"]
+    )
+    assert (
+        research_result["max_drawdown"]
+        == decimal_research_result["max_drawdown"]
+        == full_result["max_drawdown"]
+    )
+    assert (
+        research_result["calmar_ratio"]
+        == decimal_research_result["calmar_ratio"]
+        == full_result["calmar_ratio"]
+    )
+    assert (
+        research_result["max_drawdown_days"]
+        == decimal_research_result["max_drawdown_days"]
+        == full_result["max_drawdown_days"]
+    )
+    assert (
+        _trade_digest(research_result["raw_trades"])
+        == _trade_digest(decimal_research_result["raw_trades"])
+        == _trade_digest(full_trades)
+    )
+    assert (
+        _net_quantity(research_result["raw_trades"])
+        == _net_quantity(decimal_research_result["raw_trades"])
+        == _net_quantity(full_trades)
+    )

@@ -264,6 +264,73 @@ class TestMaxDrawdownDays:
         assert isinstance(result["max_drawdown_days"], Decimal)
         assert result["max_drawdown_days"] >= 0
 
+    def test_mark_to_market_samples_drive_all_drawdown_metrics(self):
+        day_ms = 86_400_000
+        trades = _round_trip(
+            100.0,
+            110.0,
+            qty=1.0,
+            entry_ts=0,
+            exit_ts=3 * day_ms,
+        )
+        result = calculate_metrics(
+            trades,
+            initial_balance=1000.0,
+            equity_samples=[
+                (0, Decimal("1000")),
+                (day_ms, Decimal("1100")),
+                (2 * day_ms, Decimal("900")),
+                (3 * day_ms, Decimal("1010")),
+            ],
+        )
+
+        assert result["max_drawdown"] == Decimal("200.00")
+        assert result["max_drawdown_days"] == Decimal("2.00")
+        assert result["calmar_ratio"] == Decimal("6.0833")
+        assert result["mark_to_market_pnl"] == Decimal("10")
+
+    def test_mark_to_market_open_drawdown_without_trades(self):
+        day_ms = 86_400_000
+        result = calculate_metrics(
+            [],
+            initial_balance=1000.0,
+            equity_samples=[
+                (0, Decimal("1000")),
+                (day_ms, Decimal("900")),
+                (2 * day_ms, Decimal("850")),
+            ],
+        )
+
+        assert result["max_drawdown"] == Decimal("150.00")
+        assert result["max_drawdown_days"] == Decimal("2.00")
+        assert result["calmar_ratio"] == Decimal("-182.5000")
+        assert result["mark_to_market_pnl"] == Decimal("-150")
+
+    def test_mark_to_market_samples_reject_non_increasing_timestamps(self):
+        with pytest.raises(
+            ValueError,
+            match="timestamps must be strictly increasing",
+        ):
+            calculate_metrics(
+                [],
+                equity_samples=[
+                    (1, Decimal("10000")),
+                    (1, Decimal("9990")),
+                ],
+            )
+
+    def test_mark_to_market_drawdown_preserves_sub_cent_precision(self):
+        result = calculate_metrics(
+            [],
+            initial_balance=100.0,
+            equity_samples=[
+                (1, Decimal("100")),
+                (2, Decimal("99.999")),
+            ],
+        )
+
+        assert result["max_drawdown"] == Decimal("0.001")
+
 
 class TestTradeFrequency:
     def test_frequency_calculation(self):

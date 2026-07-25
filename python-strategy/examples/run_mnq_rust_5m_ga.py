@@ -6,6 +6,7 @@ import sys
 import time
 from collections import defaultdict
 from datetime import UTC, datetime
+from decimal import Decimal
 from pathlib import Path
 from tempfile import TemporaryDirectory
 
@@ -23,8 +24,13 @@ from src.control_plane.models import ParameterSearchJobRequest  # noqa: E402
 from src.control_plane.parameter_search import (  # noqa: E402
     GoldenCrossResearchParameterEvaluator,
     ParameterSearchJobExecutor,
+    ResearchBacktestParameterEvaluator,
 )
 from src.core.orm_models import EvolutionEpoch, GeneRecord, Strategy  # noqa: E402
+from src.core.precision import PrecisionCodec, PrecisionSpec  # noqa: E402
+from src.strategies.representative_benchmark import (  # noqa: E402
+    representative_strategy_factory,
+)
 
 _FIVE_MINUTES_MS = 5 * 60 * 1000
 _PRODUCT_ID = "RITHMIC:MNQ_ROLL-PERP"
@@ -36,8 +42,8 @@ def _compile_jsonb_for_sqlite(type_, compiler, **kw):
 
 
 class _TimedEvaluator:
-    def __init__(self) -> None:
-        self.inner = GoldenCrossResearchParameterEvaluator()
+    def __init__(self, inner) -> None:
+        self.inner = inner
         self.durations: list[float] = []
 
     def evaluate(self, request, candidate):
@@ -51,7 +57,7 @@ def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description=(
             "Aggregate real MNQ 1m CSV data to closed 5m candles in Rust, "
-            "then run a resumable GoldenCross GA through ResearchBacktestRunner."
+            "then run a resumable GA through ResearchBacktestRunner."
         )
     )
     parser.add_argument("--csv", required=True)
@@ -64,6 +70,11 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--population", type=int, default=8)
     parser.add_argument("--generations", type=int, default=5)
     parser.add_argument("--seed", type=int, default=20260724)
+    parser.add_argument(
+        "--strategy",
+        choices=("golden-cross", "representative"),
+        default="representative",
+    )
     return parser
 
 
@@ -141,7 +152,7 @@ def _aggregate_5m(
     return source_count, output_count
 
 
-def _session_factory(path: Path):
+def _session_factory(path: Path, strategy_id: str, strategy_name: str):
     engine = create_engine(f"sqlite:///{path}")
     for table in [
         Strategy.__table__,
@@ -151,7 +162,7 @@ def _session_factory(path: Path):
         table.create(engine, checkfirst=True)
     factory = sessionmaker(bind=engine)
     with factory() as session:
-        session.add(Strategy(id="golden_cross_mnq_5m", name="Golden Cross MNQ 5m"))
+        session.add(Strategy(id=strategy_id, name=strategy_name))
         session.commit()
     return factory
 
@@ -174,10 +185,13 @@ def main() -> None:
             end_time=end_time,
         )
         aggregation_elapsed = time.perf_counter() - aggregation_started
+        strategy_id, strategy_name, search_space, evaluator = _strategy_config(
+            args.strategy
+        )
 
         request = ParameterSearchJobRequest.model_validate(
             {
-                "strategy_id": "golden_cross_mnq_5m",
+                "strategy_id": strategy_id,
                 "product_id": _PRODUCT_ID,
                 "timeframe": "5m",
                 "start_time": start_time,
@@ -199,28 +213,7 @@ def main() -> None:
                         "capital_per_contract": "1000",
                     },
                 },
-                "search_space": {
-                    "parameters": {
-                        "short_window": {
-                            "type": "integer",
-                            "min": 2,
-                            "max": 10,
-                            "step": 1,
-                        },
-                        "long_window": {
-                            "type": "integer",
-                            "min": 12,
-                            "max": 40,
-                            "step": 2,
-                        },
-                        "quantity": {
-                            "type": "decimal",
-                            "min": "1",
-                            "max": "1",
-                            "step": "1",
-                        },
-                    }
-                },
+                "search_space": {"parameters": search_space},
                 "evolution": {
                     "population_size": args.population,
                     "max_generations": args.generations,
@@ -229,18 +222,25 @@ def main() -> None:
                     "crossover_probability": "0.9",
                     "mutation_probability": "0.3",
                     "mutation_sigma_steps": "1.5",
-                    "epoch_id": "golden_cross_mnq_5m_demo",
+                    "epoch_id": f"{strategy_id}_demo",
                 },
             }
         )
-        evaluator = _TimedEvaluator()
+        timed_evaluator = _TimedEvaluator(evaluator)
         ga_started = time.perf_counter()
         job = ParameterSearchJobExecutor(
-            evaluator,
+            timed_evaluator,
             run_inline=True,
-            db_session_factory=_session_factory(temp / "checkpoint.db"),
+            db_session_factory=_session_factory(
+                temp / "checkpoint.db",
+                strategy_id,
+                strategy_name,
+            ),
         ).submit_search(request)
         ga_elapsed = time.perf_counter() - ga_started
+        if job.result is None:
+            raise RuntimeError("GA completed without a result")
+        job_result = job.result
 
         by_generation = defaultdict(list)
         with _session_factory_for_existing(temp / "checkpoint.db")() as session:
@@ -249,11 +249,13 @@ def main() -> None:
                 .order_by(GeneRecord.generation_index, GeneRecord.candidate_id)
                 .all()
             )
-            epoch = session.get(EvolutionEpoch, "golden_cross_mnq_5m_demo")
+            epoch = session.get(EvolutionEpoch, f"{strategy_id}_demo")
+            if epoch is None:
+                raise RuntimeError("GA checkpoint epoch was not persisted")
             for record in records:
                 by_generation[record.generation_index].append(record)
 
-        print("Rust 1m -> 5m + GoldenCross GA")
+        print(f"Rust 1m -> 5m + {strategy_name} GA")
         print(f"  source_csv={source_path}")
         print(f"  source_1m_candles={source_count}")
         print(f"  closed_5m_candles={candle_count}")
@@ -266,17 +268,122 @@ def main() -> None:
                 f"  generation={generation} score={best.score_total} "
                 f"drawdown={best.max_drawdown} params={best.param_pack}"
             )
-        durations = evaluator.durations
+        durations = timed_evaluator.durations
         print(f"  checkpoint={epoch.status} generations={epoch.generations_run}")
         print(f"  gene_records={len(records)} unique_evaluations={len(durations)}")
         print(f"  ga_seconds={ga_elapsed:.3f}")
         print(f"  seconds_per_unique_candidate={sum(durations) / len(durations):.3f}")
-        print(f"  best_params={job.result['best_candidate_param_pack']}")
-        print(f"  best_metrics={job.result['best_candidate']['metrics']}")
+        print(f"  best_params={job_result['best_candidate_param_pack']}")
+        print(f"  best_metrics={job_result['best_candidate']['metrics']}")
 
 
 def _session_factory_for_existing(path: Path):
     return sessionmaker(bind=create_engine(f"sqlite:///{path}"))
+
+
+def _strategy_config(strategy: str):
+    codec = PrecisionCodec(
+        PrecisionSpec(
+            price_tick=Decimal("0.25"),
+            quantity_step=Decimal("1"),
+        )
+    )
+    if strategy == "golden-cross":
+        return (
+            "golden_cross_mnq_5m",
+            "Golden Cross MNQ 5m",
+            {
+                "short_window": {
+                    "type": "integer",
+                    "min": 2,
+                    "max": 10,
+                    "step": 1,
+                },
+                "long_window": {
+                    "type": "integer",
+                    "min": 12,
+                    "max": 40,
+                    "step": 2,
+                },
+                "quantity": {
+                    "type": "decimal",
+                    "min": "1",
+                    "max": "1",
+                    "step": "1",
+                },
+            },
+            GoldenCrossResearchParameterEvaluator(precision_codec=codec),
+        )
+    return (
+        "representative_mnq_5m",
+        "Representative MNQ 5m",
+        {
+            "trend_window": {
+                "type": "integer",
+                "min": 8,
+                "max": 32,
+                "step": 4,
+            },
+            "breakout_window": {
+                "type": "integer",
+                "min": 5,
+                "max": 20,
+                "step": 5,
+            },
+            "atr_window": {
+                "type": "integer",
+                "min": 7,
+                "max": 21,
+                "step": 7,
+            },
+            "rsi_window": {
+                "type": "integer",
+                "min": 7,
+                "max": 21,
+                "step": 7,
+            },
+            "volume_window": {
+                "type": "integer",
+                "min": 5,
+                "max": 20,
+                "step": 5,
+            },
+            "swing_window": {
+                "type": "integer",
+                "min": 1,
+                "max": 4,
+                "step": 1,
+            },
+            "entry_score": {
+                "type": "integer",
+                "min": 2,
+                "max": 5,
+                "step": 1,
+            },
+            "hold_bars": {
+                "type": "integer",
+                "min": 3,
+                "max": 24,
+                "step": 3,
+            },
+            "max_atr_expansion": {
+                "type": "decimal",
+                "min": "1",
+                "max": "3",
+                "step": "0.5",
+            },
+            "quantity": {
+                "type": "decimal",
+                "min": "1",
+                "max": "1",
+                "step": "1",
+            },
+        },
+        ResearchBacktestParameterEvaluator(
+            representative_strategy_factory,
+            precision_codec=codec,
+        ),
+    )
 
 
 if __name__ == "__main__":
