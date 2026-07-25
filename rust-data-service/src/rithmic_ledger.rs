@@ -10,11 +10,18 @@ pub(crate) mod ledger;
 #[path = "connector/rithmic/ledger_runtime.rs"]
 pub(crate) mod ledger_runtime;
 
+#[path = "connector/rithmic/market.rs"]
+#[allow(dead_code)]
+pub(crate) mod market;
+
 #[path = "connector/rithmic/order.rs"]
 pub(crate) mod order;
 
 #[path = "connector/rithmic/order_runtime.rs"]
 pub(crate) mod order_runtime;
+
+#[path = "connector/rithmic/price_snapshot.rs"]
+pub(crate) mod price_snapshot;
 
 #[path = "connector/rithmic/profile_lock.rs"]
 pub(crate) mod profile_lock;
