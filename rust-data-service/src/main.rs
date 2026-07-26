@@ -20,19 +20,9 @@ use crate::publisher::{
 use anyhow::Context;
 use clap::{Parser, Subcommand};
 use dotenvy::dotenv;
-use std::time::Duration;
 use tokio::sync::mpsc;
 use tokio::task::JoinSet;
 use tracing::{error, info, warn, Level};
-
-/// Maximum consecutive failures before triggering graceful shutdown.
-const MAX_TASK_FAILURES: u32 = 3;
-
-/// Backoff base duration for task restarts.
-const RESTART_BACKOFF_BASE: Duration = Duration::from_secs(2);
-
-/// Maximum backoff duration for task restarts.
-const RESTART_BACKOFF_MAX: Duration = Duration::from_secs(30);
 
 #[derive(Parser)]
 #[command(author, version, about, long_about = None)]
@@ -268,17 +258,11 @@ impl std::fmt::Display for TaskId {
     }
 }
 
-fn task_exit_requires_shutdown(task_id: &TaskId) -> bool {
-    matches!(
-        task_id,
-        TaskId::Watchdog | TaskId::Publisher | TaskId::EventLoop
-    ) || matches!(task_id, TaskId::Connector(name) if name == "rithmic")
-}
-
-/// Track failure counts per task for restart decisions.
-struct TaskFailureTracker {
-    failures: std::collections::HashMap<String, u32>,
-    max_failures: u32,
+fn supervised_task_exit_error(task_id: &TaskId, task_result: anyhow::Result<()>) -> anyhow::Error {
+    match task_result {
+        Ok(()) => anyhow::anyhow!("Critical task '{}' exited unexpectedly", task_id),
+        Err(error) => anyhow::anyhow!("Critical task '{}' failed: {}", task_id, error),
+    }
 }
 
 #[cfg(feature = "rithmic")]
@@ -321,41 +305,6 @@ fn resolve_rithmic_live_args(
     }))
 }
 
-impl TaskFailureTracker {
-    fn new(max_failures: u32) -> Self {
-        Self {
-            failures: std::collections::HashMap::new(),
-            max_failures,
-        }
-    }
-
-    /// Record a failure. Returns true if the task should be restarted,
-    /// false if max failures exceeded.
-    fn record_failure(&mut self, task_id: &str) -> bool {
-        let count = self.failures.entry(task_id.to_string()).or_insert(0);
-        *count += 1;
-        *count <= self.max_failures
-    }
-
-    /// Reset failure count for a task (on successful restart).
-    #[allow(dead_code)]
-    fn reset(&mut self, task_id: &str) {
-        self.failures.remove(task_id);
-    }
-
-    /// Get current failure count for a task.
-    fn get_failures(&self, task_id: &str) -> u32 {
-        *self.failures.get(task_id).unwrap_or(&0)
-    }
-
-    /// Calculate backoff duration based on failure count.
-    fn backoff_duration(&self, task_id: &str) -> Duration {
-        let failures = self.get_failures(task_id);
-        let backoff = RESTART_BACKOFF_BASE * 2u32.saturating_pow(failures.saturating_sub(1));
-        std::cmp::min(backoff, RESTART_BACKOFF_MAX)
-    }
-}
-
 async fn run_live_mode(
     exchange_opt: Option<String>,
     symbol_opt: Option<String>,
@@ -394,7 +343,10 @@ async fn run_live_mode(
         .or_else(|| non_empty_env("EXCHANGE_ENABLED"))
         .unwrap_or_else(|| "binance,bybit,backpack".into());
     let enabled_exchanges = validate_enabled_exchanges(&enabled_exchanges_raw)?;
+    #[cfg(feature = "rithmic")]
     let enabled_exchanges_csv = enabled_exchanges.join(",");
+    let (binance_user_stream_enabled, backpack_user_stream_enabled) =
+        preflight_user_stream_credentials(&enabled_exchanges, |name| std::env::var(name).ok())?;
 
     #[cfg(feature = "rithmic")]
     let rithmic_args = resolve_rithmic_live_args(
@@ -423,11 +375,9 @@ async fn run_live_mode(
 
     // --- Supervised task set (Task 1: task supervision) ---
     let mut join_set: JoinSet<(TaskId, anyhow::Result<()>)> = JoinSet::new();
-    let mut tracker = TaskFailureTracker::new(MAX_TASK_FAILURES);
-
     // Spawn Watchdog task
     let watchdog_redis_url = redis_url.clone();
-    let watchdog_environment = runtime_environment.clone();
+    let watchdog_environment = runtime_environment;
     join_set.spawn(async move {
         let result = match crate::watchdog::Watchdog::new(&watchdog_redis_url, watchdog_environment)
         {
@@ -462,7 +412,14 @@ async fn run_live_mode(
         match exchange_name.as_str() {
             "binance" => {
                 join_set.spawn(async move {
-                    let result = run_binance_connector(symbols, trade_tx, candle_tx, user_tx).await;
+                    let result = run_binance_connector(
+                        symbols,
+                        trade_tx,
+                        candle_tx,
+                        user_tx,
+                        binance_user_stream_enabled,
+                    )
+                    .await;
                     (TaskId::Connector("binance".to_string()), result)
                 });
                 info!("Supervised task spawned: connector:binance");
@@ -476,8 +433,14 @@ async fn run_live_mode(
             }
             "backpack" => {
                 join_set.spawn(async move {
-                    let result =
-                        run_backpack_connector(symbols, trade_tx, candle_tx, user_tx).await;
+                    let result = run_backpack_connector(
+                        symbols,
+                        trade_tx,
+                        candle_tx,
+                        user_tx,
+                        backpack_user_stream_enabled,
+                    )
+                    .await;
                     (TaskId::Connector("backpack".to_string()), result)
                 });
                 info!("Supervised task spawned: connector:backpack");
@@ -514,99 +477,27 @@ async fn run_live_mode(
         join_set.len()
     );
 
-    // Store context needed for task restarts
-    let redis_url_for_restart = redis_url.clone();
-    let environment_for_restart = runtime_environment;
-    let symbols_for_restart = symbols;
-    let exchanges_for_restart = enabled_exchanges_csv;
+    tokio::select! {
+        _ = tokio::signal::ctrl_c() => {
+            info!("Received shutdown signal, stopping all tasks...");
+            join_set.shutdown().await;
+        }
 
-    loop {
-        tokio::select! {
-            _ = tokio::signal::ctrl_c() => {
-                info!("Received shutdown signal, stopping all tasks...");
-                join_set.shutdown().await;
-                break;
-            }
-
-            result = join_set.join_next() => {
-                match result {
-                    None => {
-                        // All tasks have exited
-                        info!("All supervised tasks have exited");
-                        break;
-                    }
-                    Some(Ok((task_id, task_result))) => {
-                        match task_result {
-                            Ok(()) => {
-                                if task_exit_requires_shutdown(&task_id) {
-                                    error!("Critical task '{}' exited unexpectedly", task_id);
-                                    join_set.shutdown().await;
-                                    return Err(anyhow::anyhow!(
-                                        "Critical task '{}' exited unexpectedly",
-                                        task_id
-                                    ));
-                                }
-                                info!("Task '{}' completed normally", task_id);
-                            }
-                            Err(ref e) => {
-                                error!("Task '{}' failed: {:#}", task_id, e);
-                                if task_exit_requires_shutdown(&task_id) {
-                                    join_set.shutdown().await;
-                                    return Err(anyhow::anyhow!(
-                                        "Critical task '{}' failed: {}",
-                                        task_id,
-                                        e
-                                    ));
-                                }
-                                let task_key = task_id.to_string();
-                                let should_restart = tracker.record_failure(&task_key);
-                                let failures = tracker.get_failures(&task_key);
-
-                                if should_restart {
-                                    let backoff = tracker.backoff_duration(&task_key);
-                                    warn!(
-                                        "Task '{}' will restart in {:?} (failure {}/{})",
-                                        task_id, backoff, failures, MAX_TASK_FAILURES
-                                    );
-                                    tokio::time::sleep(backoff).await;
-
-                                    // Restart the failed task
-                                    restart_task(
-                                        &task_id,
-                                        &mut join_set,
-                                        &redis_url_for_restart,
-                                        &environment_for_restart,
-                                        &pub_sender,
-                                        &symbols_for_restart,
-                                        &exchanges_for_restart,
-                                    );
-                                } else {
-                                    error!(
-                                        "Task '{}' exceeded max failures ({}). Initiating graceful shutdown.",
-                                        task_id, MAX_TASK_FAILURES
-                                    );
-                                    join_set.shutdown().await;
-                                    return Err(anyhow::anyhow!(
-                                        "Critical task '{}' failed {} times, shutting down",
-                                        task_id,
-                                        failures
-                                    ));
-                                }
-                            }
-                        }
-                    }
-                    Some(Err(join_err)) => {
-                        // Task panicked or was cancelled
-                        if join_err.is_panic() {
-                            error!("A supervised task panicked: {:?}", join_err);
-                            error!("Panic in supervised task is unrecoverable, shutting down");
-                            join_set.shutdown().await;
-                            return Err(anyhow::anyhow!("Task panic: {:?}", join_err));
-                        } else {
-                            // Task was cancelled (e.g. by shutdown)
-                            info!("A task was cancelled during shutdown");
-                        }
-                    }
+        result = join_set.join_next() => {
+            match result {
+                None => {
+                    info!("All supervised tasks have exited");
+                }
+                Some(Ok((task_id, task_result))) => {
+                    let error = supervised_task_exit_error(&task_id, task_result);
+                    error!("{:#}", error);
+                    join_set.shutdown().await;
+                    return Err(error);
+                }
+                Some(Err(join_err)) => {
+                    error!("Supervised task join failed: {:?}", join_err);
+                    join_set.shutdown().await;
+                    return Err(anyhow::anyhow!("Supervised task join failed: {:?}", join_err));
                 }
             }
         }
@@ -617,59 +508,6 @@ async fn run_live_mode(
     info!("FluxTrade Data Service stopped.");
 
     Ok(())
-}
-
-/// Restart a failed task by spawning a new instance into the JoinSet.
-/// Note: connector restarts create new mpsc senders but those feed into
-/// the existing event loop. The publisher and event-loop are not trivially
-/// restartable because their channel receivers are consumed, so they
-/// trigger a full shutdown instead.
-fn restart_task(
-    task_id: &TaskId,
-    join_set: &mut JoinSet<(TaskId, anyhow::Result<()>)>,
-    redis_url: &str,
-    environment: &crate::environment::RuntimeEnvironment,
-    _pub_sender: &PublishSender,
-    _symbols: &[String],
-    _exchanges: &str,
-) {
-    match task_id {
-        TaskId::Watchdog => {
-            let redis_url = redis_url.to_string();
-            let environment = environment.clone();
-            join_set.spawn(async move {
-                let result = match crate::watchdog::Watchdog::new(&redis_url, environment) {
-                    Ok(wd) => wd.run().await,
-                    Err(e) => Err(anyhow::anyhow!("Watchdog init failed: {}", e)),
-                };
-                (TaskId::Watchdog, result)
-            });
-            info!("Restarted task: watchdog");
-        }
-        TaskId::Publisher | TaskId::EventLoop => {
-            // Publisher and EventLoop hold consumed channel receivers.
-            // They cannot be trivially restarted without recreating the whole pipeline.
-            // We log this and let the supervisor trigger a full shutdown via the
-            // failure tracker exceeding max failures.
-            error!(
-                "Task '{}' cannot be restarted (channel receiver consumed). \
-                 This will count toward max failures and eventually trigger shutdown.",
-                task_id
-            );
-        }
-        TaskId::Connector(name) => {
-            // Connectors can't be restarted here because their mpsc Senders
-            // (trade_tx, candle_tx, user_tx) were moved into the original spawn.
-            // The WebSocketManager inside each connector already has its own
-            // retry/reconnect logic, so connector task exits are rare.
-            // We log and let the failure tracker decide.
-            warn!(
-                "Connector '{}' exited and cannot be trivially restarted from supervisor. \
-                 The connector's internal WebSocket retry logic should handle most reconnections.",
-                name
-            );
-        }
-    }
 }
 
 /// Run the main event loop: receives trades/candles/user events from connectors,
@@ -829,10 +667,21 @@ fn validate_enabled_exchanges(value: &str) -> anyhow::Result<Vec<String>> {
 }
 
 fn optional_credentials_present(credentials: &[(&str, Option<String>)]) -> anyhow::Result<bool> {
-    let present = credentials
-        .iter()
-        .filter(|(_, value)| value.is_some())
-        .count();
+    let mut present = 0;
+    for (name, value) in credentials {
+        let Some(value) = value else {
+            continue;
+        };
+        let trimmed = value.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        anyhow::ensure!(
+            trimmed == value,
+            "{name} must not contain surrounding whitespace"
+        );
+        present += 1;
+    }
     if present == 0 {
         return Ok(false);
     }
@@ -847,12 +696,29 @@ fn optional_credentials_present(credentials: &[(&str, Option<String>)]) -> anyho
     Ok(true)
 }
 
+fn preflight_user_stream_credentials(
+    enabled_exchanges: &[String],
+    lookup: impl Fn(&str) -> Option<String>,
+) -> anyhow::Result<(bool, bool)> {
+    let binance_enabled = enabled_exchanges.iter().any(|value| value == "binance");
+    let backpack_enabled = enabled_exchanges.iter().any(|value| value == "backpack");
+    let binance_user_stream = binance_enabled
+        && optional_credentials_present(&[("BINANCE_API_KEY", lookup("BINANCE_API_KEY"))])?;
+    let backpack_user_stream = backpack_enabled
+        && optional_credentials_present(&[
+            ("EXCHANGE_API_KEY", lookup("EXCHANGE_API_KEY")),
+            ("EXCHANGE_SECRET", lookup("EXCHANGE_SECRET")),
+        ])?;
+    Ok((binance_user_stream, backpack_user_stream))
+}
+
 /// Run the Binance connector: subscribes to trades, candles, and user stream.
 async fn run_binance_connector(
     symbols: Vec<String>,
     trade_tx: mpsc::Sender<model::Trade>,
     candle_tx: mpsc::Sender<model::Candlestick>,
     user_tx: mpsc::Sender<UserStreamEvent>,
+    user_stream_enabled: bool,
 ) -> anyhow::Result<()> {
     let mut conn = BinanceConnector::new();
     info!("Starting Binance Connector...");
@@ -867,8 +733,8 @@ async fn run_binance_connector(
         return Err(e);
     }
 
-    // Start User Stream if API Key is present
-    if optional_credentials_present(&[("BINANCE_API_KEY", non_empty_env("BINANCE_API_KEY"))])? {
+    // Credential completeness is validated before any connector task is spawned.
+    if user_stream_enabled {
         if let Err(e) = conn.subscribe_user_stream(user_tx).await {
             error!("Binance user stream error: {}", e);
             return Err(e);
@@ -912,6 +778,7 @@ async fn run_backpack_connector(
     trade_tx: mpsc::Sender<model::Trade>,
     candle_tx: mpsc::Sender<model::Candlestick>,
     user_tx: mpsc::Sender<UserStreamEvent>,
+    user_stream_enabled: bool,
 ) -> anyhow::Result<()> {
     let mut conn = BackpackConnector::new();
     info!("Starting Backpack Connector...");
@@ -932,11 +799,8 @@ async fn run_backpack_connector(
         return Err(e);
     }
 
-    // Start User Stream if API Key is present
-    if optional_credentials_present(&[
-        ("EXCHANGE_API_KEY", non_empty_env("EXCHANGE_API_KEY")),
-        ("EXCHANGE_SECRET", non_empty_env("EXCHANGE_SECRET")),
-    ])? {
+    // Credential completeness is validated before any connector task is spawned.
+    if user_stream_enabled {
         if let Err(e) = conn.subscribe_user_stream(user_tx).await {
             error!("Backpack user stream error: {}", e);
             return Err(e);
@@ -952,6 +816,7 @@ async fn run_backpack_connector(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::Duration;
 
     #[test]
     fn test_task_id_display() {
@@ -965,16 +830,25 @@ mod tests {
     }
 
     #[test]
-    fn rithmic_task_exit_policy_fails_closed() {
-        for task_id in [TaskId::Connector("binance".to_string())] {
-            assert!(!task_exit_requires_shutdown(&task_id));
+    fn every_supervised_task_exit_is_fatal() {
+        for task_id in [
+            TaskId::Watchdog,
+            TaskId::Publisher,
+            TaskId::EventLoop,
+            TaskId::Connector("binance".to_string()),
+            TaskId::Connector("bybit".to_string()),
+            TaskId::Connector("backpack".to_string()),
+            TaskId::Connector("rithmic".to_string()),
+        ] {
+            assert!(supervised_task_exit_error(&task_id, Ok(()))
+                .to_string()
+                .contains("exited unexpectedly"));
+            assert!(
+                supervised_task_exit_error(&task_id, Err(anyhow::anyhow!("test failure")))
+                    .to_string()
+                    .contains("test failure")
+            );
         }
-        for task_id in [TaskId::Watchdog, TaskId::Publisher, TaskId::EventLoop] {
-            assert!(task_exit_requires_shutdown(&task_id));
-        }
-        assert!(task_exit_requires_shutdown(&TaskId::Connector(
-            "rithmic".to_string()
-        )));
     }
 
     #[test]
@@ -995,7 +869,7 @@ mod tests {
     }
 
     #[test]
-    fn optional_credentials_require_all_non_empty_values() {
+    fn optional_credentials_require_all_clean_non_empty_values() {
         assert_eq!(normalized_optional_value(None), None);
         assert_eq!(normalized_optional_value(Some(String::new())), None);
         assert_eq!(normalized_optional_value(Some("  ".to_string())), None);
@@ -1014,6 +888,51 @@ mod tests {
             ("secret", None),
         ])
         .is_err());
+        assert!(optional_credentials_present(&[
+            ("key", Some(" key ".to_string())),
+            ("secret", Some("secret".to_string())),
+        ])
+        .is_err());
+        assert!(optional_credentials_present(&[
+            ("key", Some(" ".to_string())),
+            ("secret", Some("secret".to_string())),
+        ])
+        .is_err());
+    }
+
+    #[test]
+    fn user_stream_credentials_are_preflighted_for_enabled_exchanges() {
+        let enabled = vec!["binance".to_string(), "backpack".to_string()];
+        let complete = std::collections::HashMap::from([
+            ("BINANCE_API_KEY", "binance-key"),
+            ("EXCHANGE_API_KEY", "backpack-key"),
+            ("EXCHANGE_SECRET", "backpack-secret"),
+        ]);
+        assert_eq!(
+            preflight_user_stream_credentials(&enabled, |name| {
+                complete.get(name).map(|value| (*value).to_string())
+            })
+            .unwrap(),
+            (true, true)
+        );
+
+        let partial = std::collections::HashMap::from([("EXCHANGE_API_KEY", "backpack-key")]);
+        assert!(preflight_user_stream_credentials(&enabled, |name| {
+            partial.get(name).map(|value| (*value).to_string())
+        })
+        .is_err());
+
+        let public_only = preflight_user_stream_credentials(&enabled, |_| None).unwrap();
+        assert_eq!(public_only, (false, false));
+
+        let binance_only = vec!["binance".to_string()];
+        assert_eq!(
+            preflight_user_stream_credentials(&binance_only, |name| {
+                partial.get(name).map(|value| (*value).to_string())
+            })
+            .unwrap(),
+            (false, false)
+        );
     }
 
     #[cfg(not(feature = "rithmic"))]
@@ -1051,78 +970,6 @@ mod tests {
         ] {
             assert!(resolve_rithmic_live_args(args.0, args.1, args.2, args.3, args.4).is_err());
         }
-    }
-
-    #[test]
-    fn test_failure_tracker_basic() {
-        let mut tracker = TaskFailureTracker::new(3);
-
-        // First 3 failures should allow restart
-        assert!(tracker.record_failure("watchdog"));
-        assert!(tracker.record_failure("watchdog"));
-        assert!(tracker.record_failure("watchdog"));
-        // 4th failure exceeds max
-        assert!(!tracker.record_failure("watchdog"));
-    }
-
-    #[test]
-    fn test_failure_tracker_independent_tasks() {
-        let mut tracker = TaskFailureTracker::new(2);
-
-        assert!(tracker.record_failure("watchdog"));
-        assert!(tracker.record_failure("publisher"));
-        assert!(tracker.record_failure("watchdog"));
-        // watchdog at 2, publisher at 1
-        assert!(!tracker.record_failure("watchdog")); // 3rd > max(2)
-        assert!(tracker.record_failure("publisher")); // 2nd <= max(2)
-    }
-
-    #[test]
-    fn test_failure_tracker_backoff() {
-        let tracker = TaskFailureTracker::new(5);
-
-        // No failures yet: base duration
-        let d = tracker.backoff_duration("task");
-        assert_eq!(d, RESTART_BACKOFF_BASE);
-    }
-
-    #[test]
-    fn test_failure_tracker_backoff_exponential() {
-        let mut tracker = TaskFailureTracker::new(10);
-        tracker.record_failure("task"); // 1 failure
-        let d1 = tracker.backoff_duration("task");
-        assert_eq!(d1, RESTART_BACKOFF_BASE); // 2^0 * base
-
-        tracker.record_failure("task"); // 2 failures
-        let d2 = tracker.backoff_duration("task");
-        assert_eq!(d2, RESTART_BACKOFF_BASE * 2); // 2^1 * base
-
-        tracker.record_failure("task"); // 3 failures
-        let d3 = tracker.backoff_duration("task");
-        assert_eq!(d3, RESTART_BACKOFF_BASE * 4); // 2^2 * base
-    }
-
-    #[test]
-    fn test_failure_tracker_backoff_capped() {
-        let mut tracker = TaskFailureTracker::new(20);
-        for _ in 0..15 {
-            tracker.record_failure("task");
-        }
-        let d = tracker.backoff_duration("task");
-        assert!(d <= RESTART_BACKOFF_MAX);
-    }
-
-    #[test]
-    fn test_failure_tracker_reset() {
-        let mut tracker = TaskFailureTracker::new(3);
-        tracker.record_failure("watchdog");
-        tracker.record_failure("watchdog");
-        assert_eq!(tracker.get_failures("watchdog"), 2);
-
-        tracker.reset("watchdog");
-        assert_eq!(tracker.get_failures("watchdog"), 0);
-        // After reset, can fail again
-        assert!(tracker.record_failure("watchdog"));
     }
 
     #[tokio::test]
