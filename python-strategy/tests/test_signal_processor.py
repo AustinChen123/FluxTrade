@@ -492,7 +492,10 @@ def test_on_trade_routes_matching_strategy_without_timeframe_filter() -> None:
     ).on_trade(make_trade())
 
     assert strategy.trades_received == [make_trade()]
-    signal_handler.assert_called_once_with(signal, None)
+    emitted_signal = signal_handler.call_args.args[0]
+    assert emitted_signal.model_copy(update={"metadata": None}) == signal
+    assert emitted_signal.metadata["client_order_id"]
+    assert signal_handler.call_args.args[1] is None
     execution.execute_signal.assert_not_called()
 
 
@@ -523,6 +526,75 @@ def test_on_trade_skips_stopped_strategy() -> None:
 
     assert strategy.trades_received == []
     execution.execute_signal.assert_not_called()
+
+
+def test_trade_strategy_exception_blocks_all_signal_side_effects() -> None:
+    good = DummyStrategy("good", trade_result=make_signal("good"))
+    failing = DummyStrategy("bad", should_raise=True)
+    registry = StrategyRegistry()
+    registry.register(good)
+    registry.register(failing)
+    signal_handler = MagicMock()
+
+    with pytest.raises(RuntimeError, match="strategy failed"):
+        SignalProcessor(
+            registry,
+            MagicMock(),
+            signal_handler=signal_handler,
+        ).on_trade(make_trade())
+
+    assert good.trades_received == [make_trade()]
+    assert failing.trades_received == [make_trade()]
+    signal_handler.assert_not_called()
+
+
+def test_market_signal_id_is_stable_when_pending_trade_is_replayed() -> None:
+    strategy = DummyStrategy("s1", trade_result=make_signal("s1"))
+    registry = StrategyRegistry()
+    registry.register(strategy)
+    signal_handler = MagicMock()
+    processor = SignalProcessor(
+        registry,
+        MagicMock(),
+        signal_handler=signal_handler,
+    )
+    trade = make_trade()
+
+    processor.on_trade(trade)
+    processor.on_trade(trade)
+
+    first_signal = signal_handler.call_args_list[0].args[0]
+    second_signal = signal_handler.call_args_list[1].args[0]
+    assert first_signal.metadata["client_order_id"] == second_signal.metadata[
+        "client_order_id"
+    ]
+
+
+@pytest.mark.parametrize(
+    ("trade_id", "timestamp"),
+    [
+        ("", 1704067200000),
+        ("  ", 1704067200000),
+        ("unknown", 1704067200000),
+        ("UNKNOWN", 1704067200000),
+        ("t1", 0),
+    ],
+)
+def test_trade_without_stable_identity_fails_before_strategy_dispatch(
+    trade_id,
+    timestamp,
+) -> None:
+    strategy = DummyStrategy("s1", trade_result=make_signal("s1"))
+    registry = StrategyRegistry()
+    registry.register(strategy)
+    trade = make_trade().model_copy(
+        update={"id": trade_id, "timestamp": timestamp}
+    )
+
+    with pytest.raises(ValueError, match="stable id and positive timestamp"):
+        SignalProcessor(registry, MagicMock()).on_trade(trade)
+
+    assert strategy.trades_received == []
 
 
 def test_dispatch_normalizes_none_signal_and_list() -> None:
@@ -571,7 +643,7 @@ def test_process_signals_uses_signal_handler_when_provided() -> None:
     execution.execute_signal.assert_not_called()
 
 
-def test_strategy_exception_does_not_stop_other_strategies() -> None:
+def test_strategy_exception_blocks_all_signal_side_effects() -> None:
     good_signal = make_signal("good")
     failing = DummyStrategy("bad", should_raise=True)
     good = DummyStrategy("good", result=good_signal)
@@ -580,6 +652,31 @@ def test_strategy_exception_does_not_stop_other_strategies() -> None:
     registry.register(good)
     execution = MagicMock()
 
-    SignalProcessor(registry, execution).on_candle(make_candle())
+    with pytest.raises(RuntimeError, match="strategy failed"):
+        SignalProcessor(registry, execution).on_candle(make_candle())
 
-    execution.execute_signal.assert_called_once_with(good_signal, make_candle())
+    execution.execute_signal.assert_not_called()
+    assert good.candles_received == []
+
+
+def test_market_signal_id_is_stable_when_pending_candle_is_replayed() -> None:
+    signal = make_signal("s1")
+    strategy = DummyStrategy("s1", result=signal)
+    registry = StrategyRegistry()
+    registry.register(strategy)
+    signal_handler = MagicMock()
+    processor = SignalProcessor(
+        registry,
+        MagicMock(),
+        signal_handler=signal_handler,
+    )
+    candle = make_candle()
+
+    processor.on_candle(candle)
+    processor.on_candle(candle)
+
+    first_signal = signal_handler.call_args_list[0].args[0]
+    second_signal = signal_handler.call_args_list[1].args[0]
+    assert first_signal.metadata["client_order_id"] == second_signal.metadata[
+        "client_order_id"
+    ]

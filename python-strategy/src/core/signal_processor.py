@@ -6,6 +6,7 @@ import logging
 from collections.abc import Callable
 from typing import Any, Optional
 
+from src.core.client_order_id import market_signal_client_order_id
 from src.core.models import Candlestick, Signal, SignalType, Trade
 from src.core.strategy_registry import StrategyRegistry
 from src.strategies.base import BaseStrategy
@@ -73,6 +74,7 @@ class SignalProcessor:
         ``emit_signals=False`` is used for startup warm-up replay: strategy
         memory is rebuilt from candles, but any generated signals are ignored.
         """
+        decisions: list[tuple[str, list[Signal]]] = []
         for strategy in self.registry.list_active():
             if strategy.product_id != candle.product_id:
                 continue
@@ -89,14 +91,32 @@ class SignalProcessor:
                 )
                 continue
 
-            try:
-                if not self._sync_position_if_changed(strategy):
-                    continue
-                signals = self._dispatch_to_strategy(strategy, candle)
-                if emit_signals:
-                    self._process_signals(strategy.strategy_id, signals, candle)
-            except Exception:
-                logger.exception("Error processing strategy %s", strategy.strategy_id)
+            if not self._sync_position_if_changed(strategy):
+                continue
+            signals = self._dispatch_to_strategy(strategy, candle)
+            decisions.append((strategy.strategy_id, signals))
+
+        if emit_signals:
+            for strategy_id, signals in decisions:
+                replay_stable_signals = (
+                    [
+                        self._with_market_idempotency(
+                            signal,
+                            product_id=candle.product_id,
+                            event_scope=candle.timeframe,
+                            event_timestamp=candle.timestamp,
+                            ordinal=ordinal,
+                        )
+                        for ordinal, signal in enumerate(signals)
+                    ]
+                    if self.signal_handler is not None
+                    else signals
+                )
+                self._process_signals(
+                    strategy_id,
+                    replay_stable_signals,
+                    candle,
+                )
 
     def warm_up(
         self,
@@ -183,6 +203,15 @@ class SignalProcessor:
 
     def on_trade(self, trade: Trade) -> None:
         """Route a trade to matching, running strategies."""
+        if (
+            not trade.id.strip()
+            or trade.id.strip().lower() == "unknown"
+            or trade.timestamp <= 0
+        ):
+            raise ValueError(
+                "trade requires a stable id and positive timestamp for replay safety"
+            )
+        decisions: list[tuple[str, Signal]] = []
         for strategy in self.registry.list_active():
             if strategy.product_id != trade.product_id:
                 continue
@@ -195,12 +224,26 @@ class SignalProcessor:
                 )
                 continue
 
-            try:
-                signal = strategy.on_trade(trade)
-                if signal is not None:
-                    self._process_signals(strategy.strategy_id, [signal], None)
-            except Exception:
-                logger.exception("Error processing strategy %s", strategy.strategy_id)
+            signal = strategy.on_trade(trade)
+            if signal is not None:
+                decisions.append((strategy.strategy_id, signal))
+
+        for strategy_id, signal in decisions:
+            replay_stable_signal = (
+                self._with_market_idempotency(
+                    signal,
+                    product_id=trade.product_id,
+                    event_scope=f"trade:{trade.id}:{trade.side}",
+                    event_timestamp=trade.timestamp,
+                    # on_trade() has a singular Signal contract, so the
+                    # per-strategy ordinal is always zero and remains stable
+                    # if unrelated strategies are added or removed.
+                    ordinal=0,
+                )
+                if self.signal_handler is not None
+                else signal
+            )
+            self._process_signals(strategy_id, [replay_stable_signal], None)
 
     def _dispatch_to_strategy(
         self,
@@ -239,3 +282,25 @@ class SignalProcessor:
                 self.signal_handler(signal, candle)
             else:
                 self.execution_engine.execute_signal(signal, candle)
+
+    @staticmethod
+    def _with_market_idempotency(
+        signal: Signal,
+        *,
+        product_id: str,
+        event_scope: str,
+        event_timestamp: int,
+        ordinal: int,
+    ) -> Signal:
+        metadata = dict(signal.metadata or {})
+        if "client_order_id" in metadata:
+            return signal
+        metadata["client_order_id"] = market_signal_client_order_id(
+            signal.strategy_id,
+            product_id,
+            event_scope,
+            event_timestamp,
+            signal.type.value.lower(),
+            ordinal,
+        )
+        return signal.model_copy(update={"metadata": metadata})

@@ -1,4 +1,3 @@
-import copy
 import json
 import logging
 import os
@@ -14,6 +13,7 @@ from redis.exceptions import RedisError, ResponseError
 from src.core.models import Candlestick, Trade
 from src.core.redis_factory import create_redis_client
 from src.core.metrics import CONSUMER_LAG_MS
+from src.core.runtime_environment import RuntimeEnvironment
 
 # Load env
 load_dotenv(os.path.join(os.path.dirname(__file__), '../../../.env'))
@@ -25,12 +25,17 @@ MAX_BACKOFF = 300.0
 MAX_RETRIES = 10
 
 
+class MarketStreamPendingError(RuntimeError):
+    """A previous delivery has an ambiguous processing outcome."""
+
+
 class DataConsumer:
     def __init__(
         self,
         channels: List[str],
         on_message_callback: Callable[[Union[Candlestick, Trade]], None],
         channel_provider: Callable[[], List[str]] | None = None,
+        runtime_environment: RuntimeEnvironment | None = None,
     ):
         """
         :param channels: List of Redis Stream Keys to consume (e.g., ['stream:market:binance:btcusdt'])
@@ -39,10 +44,20 @@ class DataConsumer:
         self.redis_client = create_redis_client()
         self.channels = channels
         self.channel_provider = channel_provider
+        self.runtime_environment = runtime_environment or RuntimeEnvironment.from_env()
+        self.group_name = "strategy_group"
+        self._stream_registry_key = self.runtime_environment.key(
+            f"consumer:{self.group_name}:streams"
+        )
         self._initialized_channels: set[str] = set()
+        self._completed_pending: set[tuple[str, str]] = set()
+        self._blocked_streams: set[str] = set()
+        self._registered_streams: set[str] = set()
+        self._existing_group_streams_scanned = False
+        self._durable_registry_loaded = False
+        self._next_channel_index = 0
         self.callback = on_message_callback
         self.running = False
-        self.group_name = "strategy_group"
         self.consumer_name = f"consumer_{os.getpid()}"
 
     def start(self):
@@ -62,8 +77,21 @@ class DataConsumer:
             except KeyboardInterrupt:
                 self.stop()
                 break
+            except MarketStreamPendingError as e:
+                # Keep the process alive but stop reading newer entries. An
+                # operator/recovery workflow may resolve the pending delivery;
+                # the next loop rechecks the group before consumption resumes.
+                self._initialized_channels.clear()
+                logger.critical(
+                    "Market stream blocked by ambiguous delivery: %s",
+                    e,
+                )
+                time.sleep(INITIAL_BACKOFF)
             except RedisConnectionError as e:
                 self._initialized_channels.clear()
+                self._registered_streams.clear()
+                self._existing_group_streams_scanned = False
+                self._durable_registry_loaded = False
                 attempts += 1
                 if attempts > MAX_RETRIES:
                     logger.error("Max reconnection attempts (%d) exceeded. Giving up.", MAX_RETRIES)
@@ -74,6 +102,9 @@ class DataConsumer:
                 backoff = min(backoff * 2, MAX_BACKOFF)
             except (ConnectionError, OSError, RedisError) as e:
                 self._initialized_channels.clear()
+                self._registered_streams.clear()
+                self._existing_group_streams_scanned = False
+                self._durable_registry_loaded = False
                 attempts += 1
                 if attempts > MAX_RETRIES:
                     logger.error("Max reconnection attempts (%d) exceeded. Giving up.", MAX_RETRIES)
@@ -101,28 +132,129 @@ class DataConsumer:
                 if "BUSYGROUP" in str(e):
                     self._initialized_channels.add(stream_key)
                 else:
-                    logger.error("Error creating group for %s: %s", stream_key, e)
+                    raise
+            self._ensure_no_abandoned_pending([stream_key])
+
+    def _ensure_no_abandoned_pending(self, channels: list[str]) -> None:
+        """Fail closed rather than replay a candle with unknown order side effects."""
+        for stream_key in channels:
+            completed_ids = [
+                message_id
+                for completed_stream, message_id in self._completed_pending
+                if completed_stream == stream_key
+            ]
+            for message_id in completed_ids:
+                self.redis_client.xack(
+                    stream_key,
+                    self.group_name,
+                    message_id,
+                )
+                self._completed_pending.discard((stream_key, message_id))
+            summary = self.redis_client.xpending(stream_key, self.group_name)
+            if isinstance(summary, dict):
+                pending = int(summary.get("pending", 0))
+            elif isinstance(summary, (list, tuple)) and summary:
+                pending = int(summary[0])
+            else:
+                raise MarketStreamPendingError(
+                    f"invalid pending summary for {stream_key}"
+                )
+            if pending:
+                raise MarketStreamPendingError(
+                    f"market stream has {pending} unresolved deliveries: {stream_key}"
+                )
+            self._blocked_streams.discard(stream_key)
+
+    def _load_durable_stream_gate(self) -> None:
+        """Restore every stream this consumer group may have claimed."""
+        if self._durable_registry_loaded:
+            return
+        self._bootstrap_existing_group_streams()
+        registered = {
+            value.decode() if isinstance(value, bytes) else str(value)
+            for value in self.redis_client.smembers(self._stream_registry_key)
+        }
+        self._registered_streams = registered
+        if registered:
+            self._ensure_no_abandoned_pending(sorted(registered))
+        self._durable_registry_loaded = True
+
+    def _bootstrap_existing_group_streams(self) -> None:
+        """Discover streams claimed before the durable registry was introduced."""
+        if self._existing_group_streams_scanned:
+            return
+        existing_group_streams = []
+        for value in self.redis_client.scan_iter(
+            match="stream:market:*",
+            _type="stream",
+        ):
+            stream_key = value.decode() if isinstance(value, bytes) else str(value)
+            groups = self.redis_client.xinfo_groups(stream_key)
+            if any(
+                (
+                    group.get("name")
+                    if "name" in group
+                    else group.get(b"name")
+                )
+                in {self.group_name, self.group_name.encode()}
+                for group in groups
+            ):
+                existing_group_streams.append(stream_key)
+        if existing_group_streams:
+            self.redis_client.sadd(
+                self._stream_registry_key,
+                *existing_group_streams,
+            )
+        self._existing_group_streams_scanned = True
+
+    def _register_stream_before_read(self, stream_key: str) -> None:
+        """Durably record the stream before Redis can assign a delivery."""
+        if stream_key in self._registered_streams:
+            return
+        self.redis_client.sadd(self._stream_registry_key, stream_key)
+        self._registered_streams.add(stream_key)
 
     def _consume_loop(self):
         """Inner xreadgroup loop. Exits when self.running is False or on error."""
         while self.running:
+            self._load_durable_stream_gate()
+            # A stream remains a global submission gate even if the dynamic
+            # strategy set no longer subscribes to it. Resolve every delivery
+            # with an uncertain outcome before reading any newer market data.
+            if self._blocked_streams:
+                self._ensure_no_abandoned_pending(sorted(self._blocked_streams))
             channels = self._current_channels()
             if not channels:
                 time.sleep(0.1)
                 continue
             self._ensure_consumer_groups(channels)
-            # 1. Read from Streams
-            streams = {key: '>' for key in channels}
-            response = cast(
-                list[tuple[str, list[tuple[str, dict[str, str]]]]],
-                self.redis_client.xreadgroup(
-                    groupname=self.group_name,
-                    consumername=self.consumer_name,
-                    streams=cast(Any, streams),
-                    count=10,
-                    block=100,
-                ),
-            )
+            # Redis applies COUNT per stream. Poll exactly one stream so this
+            # process can never claim a second delivery before the first one
+            # reaches an ACK-safe outcome.
+            stream_key = channels[self._next_channel_index % len(channels)]
+            self._next_channel_index = (self._next_channel_index + 1) % len(channels)
+            self._register_stream_before_read(stream_key)
+            streams = {stream_key: '>'}
+            try:
+                response = cast(
+                    list[tuple[str, list[tuple[str, dict[str, str]]]]],
+                    self.redis_client.xreadgroup(
+                        groupname=self.group_name,
+                        consumername=self.consumer_name,
+                        streams=cast(Any, streams),
+                        # Without a durable per-message callback phase, claiming
+                        # more than one delivery can strand later, untouched
+                        # messages behind an ambiguous callback outcome.
+                        count=1,
+                        block=max(1, 100 // len(channels)),
+                    ),
+                )
+            except (ConnectionError, OSError, RedisError):
+                # The server may have claimed a delivery even if its response
+                # never reached this process. The next loop must inspect this
+                # stream's PEL before any other stream can advance.
+                self._blocked_streams.add(stream_key)
+                raise
 
             if not response:
                 continue
@@ -130,10 +262,9 @@ class DataConsumer:
             for stream_key, messages in response:
                 if not messages:
                     continue
+                self._blocked_streams.add(stream_key)
 
-                # 2. Conflation Logic
-                # Check the timestamp of the *latest* message in this batch
-                # Note: ID format is "timestamp-sequence"
+                # Record delivery lag without changing ordered delivery.
                 last_msg_id, _ = messages[-1]
                 last_msg_ts = int(last_msg_id.split('-')[0])
                 t = cast(tuple[int, int], self.redis_client.time())
@@ -141,70 +272,28 @@ class DataConsumer:
 
                 lag = server_time_ms - last_msg_ts
                 CONSUMER_LAG_MS.labels(stream_key=stream_key).set(lag)
-
-                if lag > 100:
-                    # Lag > 100ms: CONFLATE backlog
-                    logger.warning("LAG DETECTED (%dms > 100ms) on %s. Conflating %d msgs.",
-                                   lag, stream_key, len(messages))
-
-                    # 1. Ack all
-                    msg_ids = [mid for mid, _ in messages]
-                    self.redis_client.xack(stream_key, self.group_name, *msg_ids)
-
-                    # 2. Synthesize Batch
-                    synthesized_model = None
-                    total_qty = Decimal("0")
-                    max_price = Decimal("-Infinity")
-                    min_price = Decimal("Infinity")
-
-                    for _, m_data in messages:
-                        m_model = self._parse_message(stream_key, m_data)
-                        if not m_model:
-                            continue
-
-                        if isinstance(m_model, Trade):
-                            total_qty += m_model.quantity
-                            max_price = max(max_price, m_model.price)
-                            min_price = min(min_price, m_model.price)
-                        elif isinstance(m_model, Candlestick):
-                            total_qty += m_model.volume
-                            max_price = max(max_price, m_model.high)
-                            min_price = min(min_price, m_model.low)
-
-                        synthesized_model = m_model  # Keep latest as base
-
-                    if synthesized_model:
-                        # Copy to avoid mutating the original parsed object
-                        synthesized_model = copy.copy(synthesized_model)
-                        if isinstance(synthesized_model, Trade):
-                            synthesized_model.quantity = total_qty
-                        elif isinstance(synthesized_model, Candlestick):
-                            synthesized_model.volume = total_qty
-                            synthesized_model.high = max_price
-                            synthesized_model.low = min_price
-                            # OHLC invariant check
-                            if synthesized_model.high < max(synthesized_model.open, synthesized_model.close):
-                                logger.warning("OHLC invariant violated: high < max(open, close)")
-                                synthesized_model.high = max(synthesized_model.open, synthesized_model.close, synthesized_model.high)
-                            if synthesized_model.low > min(synthesized_model.open, synthesized_model.close):
-                                logger.warning("OHLC invariant violated: low > min(open, close)")
-                                synthesized_model.low = min(synthesized_model.open, synthesized_model.close, synthesized_model.low)
-
-                        self.callback(synthesized_model)
-
-                    # Jump to latest
-                    self.redis_client.xgroup_setid(stream_key, self.group_name, '$')
-                    continue
-
-                # 3. Process Messages Normally
                 for message_id, data in messages:
+                    model = self._parse_message(stream_key, data)
+                    if model is None:
+                        raise MarketStreamPendingError(
+                            f"unparseable market message {stream_key}:{message_id}"
+                        )
                     try:
-                        model = self._parse_message(stream_key, data)
-                        if model:
-                            self.callback(model)
-                            self.redis_client.xack(stream_key, self.group_name, message_id)
-                    except Exception as e:
-                        logger.error("Error processing %s: %s", message_id, e)
+                        self.callback(model)
+                    except Exception as exc:
+                        raise MarketStreamPendingError(
+                            f"market callback failed {stream_key}:{message_id}"
+                        ) from exc
+                    # Remember callback completion across a Redis reconnect.
+                    # This process may retry only the ACK, never the callback.
+                    self._completed_pending.add((stream_key, message_id))
+                    self.redis_client.xack(
+                        stream_key,
+                        self.group_name,
+                        message_id,
+                    )
+                    self._completed_pending.discard((stream_key, message_id))
+                    self._blocked_streams.discard(stream_key)
 
     def _parse_message(self, stream_key: str, data: dict) -> Union[Candlestick, Trade, None]:
         """Helper to parse raw stream data into models."""
