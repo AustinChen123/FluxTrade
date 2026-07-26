@@ -22,7 +22,6 @@ from sqlalchemy import create_engine, event, text
 from sqlalchemy.orm import sessionmaker
 
 from src.core.execution import ExecutionEngine, FlattenPending
-from src.core.engine import SYSTEM_STATE_KEY
 from src.core.interfaces.exchange import ExchangeError, NetworkError
 from src.core.models import Candlestick, OrderStatus, Position, PositionSide, Signal, SignalType
 from src.core.ops_safety import OpsSafetyService
@@ -1173,7 +1172,10 @@ class TestEngineKillSwitchCommand:
         )
 
         mock_ops_safety.kill_switch.assert_called_once_with(actor="ops", reason="drill")
-        engine.redis_client.set.assert_any_call(SYSTEM_STATE_KEY, "LOCKDOWN")
+        engine.redis_client.set.assert_any_call(
+            engine._system_state_key,
+            "LOCKDOWN",
+        )
 
     def test_kill_switch_default_actor_when_not_provided(self, engine_factory):
         """When actor absent, default to 'operator'."""
@@ -1219,7 +1221,7 @@ class TestEngineKillSwitchCommand:
             actor="operator",
             reason=None,
         )
-        engine.redis_client.set.assert_any_call(SYSTEM_STATE_KEY, "OK")
+        engine.redis_client.set.assert_any_call(engine._system_state_key, "OK")
         assert engine._kill_switch_halted is False
         assert engine.execution_engine._submissions_halted is False
 

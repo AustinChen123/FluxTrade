@@ -3,7 +3,6 @@ from __future__ import annotations
 from typing import Generator, Optional
 
 import pandas as pd
-from sqlalchemy import func
 from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import Session
 
@@ -11,6 +10,7 @@ from src.core.db import SessionLocal
 from src.core.interfaces.data_source import IDataSource
 from src.core.models import Candlestick
 from src.core.orm_models import ResearchCandlestick, ResearchDataset
+from src.core.research_datasets import persisted_research_dataset_is_valid
 
 
 def _empty_candle_frame() -> pd.DataFrame:
@@ -136,12 +136,7 @@ class ResearchDatabaseDataSource(IDataSource):
             dataset = session.get(ResearchDataset, self._dataset_id)
             if dataset is None or dataset.quality_status != "validated":
                 return False
-            actual_count = (
-                session.query(func.count(ResearchCandlestick.timestamp))
-                .filter(ResearchCandlestick.dataset_id == self._dataset_id)
-                .scalar()
-            )
-            return actual_count == dataset.row_count
+            return persisted_research_dataset_is_valid(session, dataset)
         except SQLAlchemyError:
             return False
         finally:

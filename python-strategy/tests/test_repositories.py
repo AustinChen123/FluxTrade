@@ -17,11 +17,10 @@ test_adapters_simulated.py for coverage of those behaviours.
 from contextlib import nullcontext
 from decimal import Decimal
 import inspect
-from unittest.mock import MagicMock
 
 from src.core.interfaces.repository import IOrderRepository
 from src.core.repositories import BacktestOrderRepository, LiveOrderRepository
-from src.core.orm_models import Order, Trade
+from src.core.orm_models import Order, Position, Trade
 
 
 class TestOrderRepositoryInterface:
@@ -199,91 +198,140 @@ class TestBacktestTradeLogging:
 
 class TestLiveOrderRepositoryBasics:
 
-    def test_accepts_session_factory(self, mock_db_session, order_factory):
+    def test_accepts_session_factory(
+        self,
+        sqlite_order_session_factory,
+        order_factory,
+    ):
         """Live repository should use an injected session factory."""
         repo = LiveOrderRepository(
-            db_session_factory=lambda: nullcontext(mock_db_session),
+            db_session_factory=sqlite_order_session_factory,
         )
         order = order_factory()
 
         repo.add_order(order)
 
         assert not hasattr(repo, "db")
-        mock_db_session.add.assert_called_with(order)
-        mock_db_session.commit.assert_called()
+        with sqlite_order_session_factory() as session:
+            assert session.get(Order, order.id) is not None
 
-    def test_add_order_commits(self, mock_db_session, order_factory):
+    def test_add_order_commits(self, sqlite_order_session_factory, order_factory):
         """add_order should add to session and commit."""
-        repo = LiveOrderRepository(mock_db_session)
+        repo = LiveOrderRepository(db_session_factory=sqlite_order_session_factory)
         order = order_factory()
 
         repo.add_order(order)
 
-        mock_db_session.add.assert_called_with(order)
-        mock_db_session.commit.assert_called()
-        mock_db_session.refresh.assert_called_with(order)
+        with sqlite_order_session_factory() as session:
+            persisted = session.get(Order, order.id)
+            assert persisted is not None
+            assert persisted.product_id == "BINANCE:BTCUSDT-PERP"
 
-    def test_update_order_commits(self, mock_db_session, order_factory):
+    def test_update_order_commits(
+        self,
+        sqlite_order_session_factory,
+        order_factory,
+    ):
         """update_order should add to session and commit."""
-        repo = LiveOrderRepository(mock_db_session)
+        repo = LiveOrderRepository(db_session_factory=sqlite_order_session_factory)
         order = order_factory()
+        repo.add_order(order)
+        order.status = "closed"
 
         repo.update_order(order)
 
-        mock_db_session.add.assert_called_with(order)
-        mock_db_session.commit.assert_called()
+        assert order.status == "closed"
+        with sqlite_order_session_factory() as session:
+            persisted = session.get(Order, order.id)
+            assert persisted is not None
+            assert persisted.status == "closed"
 
-    def test_get_order_queries_by_id(self, mock_db_session, order_factory):
-        """get_order should query by primary key string."""
-        repo = LiveOrderRepository(mock_db_session)
+    def test_get_order_by_id(
+        self,
+        sqlite_order_session_factory,
+        order_factory,
+    ):
+        """get_order should return the persisted order with the requested ID."""
+        repo = LiveOrderRepository(db_session_factory=sqlite_order_session_factory)
         order = order_factory(order_id="order-1")
-        mock_db_session.query.return_value.filter_by.return_value.first.return_value = order
+        repo.add_order(order)
 
         result = repo.get_order("order-1")
 
-        assert result is order
-        mock_db_session.query.assert_called_with(Order)
-        mock_db_session.query.return_value.filter_by.assert_called_with(id="order-1")
+        assert result is not None
+        assert result.id == "order-1"
 
-    def test_get_order_by_client_order_id_queries_by_id(self, mock_db_session, order_factory):
-        """get_order_by_client_order_id should query the idempotency key."""
-        repo = LiveOrderRepository(mock_db_session)
+    def test_get_order_by_client_order_id(
+        self,
+        sqlite_order_session_factory,
+        order_factory,
+    ):
+        """get_order_by_client_order_id should return the matching order."""
+        repo = LiveOrderRepository(db_session_factory=sqlite_order_session_factory)
         order = order_factory(order_id="order-1", client_order_id="client-1")
-        mock_db_session.query.return_value.filter_by.return_value.first.return_value = order
+        repo.add_order(order)
 
         result = repo.get_order_by_client_order_id("client-1")
 
-        assert result is order
-        mock_db_session.query.assert_called_with(Order)
-        mock_db_session.query.return_value.filter_by.assert_called_with(
-            client_order_id="client-1"
-        )
+        assert result is not None
+        assert result.id == "order-1"
 
     def test_list_client_orders_by_statuses_filters_status_and_client_id(
-        self, mock_db_session, order_factory
+        self,
+        sqlite_order_session_factory,
+        order_factory,
     ):
         """Recoverable order query should require target status and client ID."""
-        repo = LiveOrderRepository(mock_db_session)
-        order = order_factory(order_id="order-1", client_order_id="client-1")
-        mock_db_session.query.return_value.filter.return_value.all.return_value = [order]
+        repo = LiveOrderRepository(db_session_factory=sqlite_order_session_factory)
+        repo.add_order(
+            order_factory(
+                order_id="recoverable",
+                exchange_order_id=None,
+                client_order_id="client-1",
+                status="SUBMITTED",
+            )
+        )
+        repo.add_order(
+            order_factory(
+                order_id="missing-client-id",
+                exchange_order_id="EX-2",
+                client_order_id=None,
+                status="SUBMITTED",
+            )
+        )
+        repo.add_order(
+            order_factory(
+                order_id="terminal",
+                exchange_order_id=None,
+                client_order_id="client-2",
+                status="FILLED",
+            )
+        )
 
         result = repo.list_client_orders_by_statuses({"NEW", "SUBMITTED"})
 
-        assert result == [order]
-        mock_db_session.query.assert_called_with(Order)
-        mock_db_session.query.return_value.filter.assert_called_once()
+        assert [order.id for order in result] == ["recoverable"]
 
-    def test_list_client_orders_by_statuses_skips_empty_statuses(self, mock_db_session):
-        """Empty status sets should not query the DB."""
-        repo = LiveOrderRepository(mock_db_session)
+    def test_list_client_orders_by_statuses_skips_empty_statuses(
+        self,
+        sqlite_order_session_factory,
+    ):
+        """Empty status sets should return no orders."""
+        repo = LiveOrderRepository(db_session_factory=sqlite_order_session_factory)
 
         assert repo.list_client_orders_by_statuses(set()) == []
-        mock_db_session.query.assert_not_called()
 
-    def test_add_trade_commits(self, mock_db_session):
+    def test_add_trade_commits(
+        self,
+        sqlite_order_session_factory,
+        order_factory,
+    ):
         """add_trade should add to session and commit."""
-        repo = LiveOrderRepository(mock_db_session)
+        repo = LiveOrderRepository(db_session_factory=sqlite_order_session_factory)
+        order = order_factory(order_id="o1")
+        repo.add_order(order)
         trade = Trade(
+            id="t1",
             order_id="o1",
             exchange_trade_id="t1",
             product_id="BINANCE:BTCUSDT-PERP",
@@ -297,30 +345,36 @@ class TestLiveOrderRepositoryBasics:
 
         repo.add_trade(trade)
 
-        mock_db_session.add.assert_called_with(trade)
-        mock_db_session.commit.assert_called()
+        with sqlite_order_session_factory() as session:
+            assert session.get(Trade, "t1") is not None
 
-    def test_update_order_exchange_id_commits(self, mock_db_session, order_factory):
+    def test_update_order_exchange_id_commits(
+        self,
+        sqlite_order_session_factory,
+        order_factory,
+    ):
         """update_order_exchange_id should set ID and commit."""
-        repo = LiveOrderRepository(mock_db_session)
+        repo = LiveOrderRepository(db_session_factory=sqlite_order_session_factory)
         order = order_factory()
+        repo.add_order(order)
 
         repo.update_order_exchange_id(order, "EX-999")
 
         assert order.exchange_order_id == "EX-999"
-        mock_db_session.commit.assert_called()
+        with sqlite_order_session_factory() as session:
+            persisted = session.get(Order, order.id)
+            assert persisted is not None
+            assert persisted.exchange_order_id == "EX-999"
 
 
 class TestLiveOrderRepositoryPositionUpdate:
 
-    def test_buy_creates_new_position(self, mock_db_session):
+    def test_buy_creates_new_position(self, sqlite_order_session_factory):
         """Buying when no position exists should create a new position."""
-        repo = LiveOrderRepository(mock_db_session)
-        # No existing position
-        mock_db_session.query.return_value.with_for_update.return_value.filter_by.return_value.first.return_value = None
+        repo = LiveOrderRepository(db_session_factory=sqlite_order_session_factory)
 
         repo.update_position(
-            strategy_id="test",
+            strategy_id="test_strategy",
             product_id="BINANCE:BTCUSDT-PERP",
             side="buy",
             fill_quantity=Decimal("0.5"),
@@ -328,16 +382,21 @@ class TestLiveOrderRepositoryPositionUpdate:
             position_side="LONG",
         )
 
-        mock_db_session.add.assert_called()
-        mock_db_session.commit.assert_called()
+        with sqlite_order_session_factory() as session:
+            position = session.get(
+                Position,
+                ("test_strategy", "BINANCE:BTCUSDT-PERP", "LONG"),
+            )
+            assert position is not None
+            assert position.quantity == Decimal("0.5")
+            assert position.entry_price == Decimal("42000")
 
-    def test_sell_without_position_is_noop(self, mock_db_session):
+    def test_sell_without_position_is_noop(self, sqlite_order_session_factory):
         """Selling when no position exists should commit and return."""
-        repo = LiveOrderRepository(mock_db_session)
-        mock_db_session.query.return_value.with_for_update.return_value.filter_by.return_value.first.return_value = None
+        repo = LiveOrderRepository(db_session_factory=sqlite_order_session_factory)
 
         repo.update_position(
-            strategy_id="test",
+            strategy_id="test_strategy",
             product_id="BINANCE:BTCUSDT-PERP",
             side="sell",
             fill_quantity=Decimal("0.5"),
@@ -345,20 +404,29 @@ class TestLiveOrderRepositoryPositionUpdate:
             position_side="LONG",
         )
 
-        mock_db_session.add.assert_not_called()
-        mock_db_session.commit.assert_called()
+        with sqlite_order_session_factory() as session:
+            assert (
+                session.get(
+                    Position,
+                    ("test_strategy", "BINANCE:BTCUSDT-PERP", "LONG"),
+                )
+                is None
+            )
 
-    def test_buy_updates_existing_position(self, mock_db_session):
+    def test_buy_updates_existing_position(self, sqlite_order_session_factory):
         """Buying into existing position should average entry price."""
-        repo = LiveOrderRepository(mock_db_session)
-
-        existing_pos = MagicMock()
-        existing_pos.quantity = Decimal("0.5")
-        existing_pos.entry_price = Decimal("40000")
-        mock_db_session.query.return_value.with_for_update.return_value.filter_by.return_value.first.return_value = existing_pos
+        repo = LiveOrderRepository(db_session_factory=sqlite_order_session_factory)
+        repo.update_position(
+            strategy_id="test_strategy",
+            product_id="BINANCE:BTCUSDT-PERP",
+            side="buy",
+            fill_quantity=Decimal("0.5"),
+            fill_price=Decimal("40000"),
+            position_side="LONG",
+        )
 
         repo.update_position(
-            strategy_id="test",
+            strategy_id="test_strategy",
             product_id="BINANCE:BTCUSDT-PERP",
             side="buy",
             fill_quantity=Decimal("0.5"),
@@ -367,20 +435,29 @@ class TestLiveOrderRepositoryPositionUpdate:
         )
 
         # New avg entry: (0.5*40000 + 0.5*44000) / 1.0 = 42000
-        assert existing_pos.entry_price == Decimal("42000")
-        assert existing_pos.quantity == Decimal("1.0")
+        with sqlite_order_session_factory() as session:
+            position = session.get(
+                Position,
+                ("test_strategy", "BINANCE:BTCUSDT-PERP", "LONG"),
+            )
+            assert position is not None
+            assert position.entry_price == Decimal("42000")
+            assert position.quantity == Decimal("1.0")
 
-    def test_sell_reduces_position(self, mock_db_session):
+    def test_sell_reduces_position(self, sqlite_order_session_factory):
         """Selling should reduce position quantity."""
-        repo = LiveOrderRepository(mock_db_session)
-
-        existing_pos = MagicMock()
-        existing_pos.quantity = Decimal("1.0")
-        existing_pos.entry_price = Decimal("42000")
-        mock_db_session.query.return_value.with_for_update.return_value.filter_by.return_value.first.return_value = existing_pos
+        repo = LiveOrderRepository(db_session_factory=sqlite_order_session_factory)
+        repo.update_position(
+            strategy_id="test_strategy",
+            product_id="BINANCE:BTCUSDT-PERP",
+            side="buy",
+            fill_quantity=Decimal("1.0"),
+            fill_price=Decimal("42000"),
+            position_side="LONG",
+        )
 
         repo.update_position(
-            strategy_id="test",
+            strategy_id="test_strategy",
             product_id="BINANCE:BTCUSDT-PERP",
             side="sell",
             fill_quantity=Decimal("0.3"),
@@ -388,4 +465,10 @@ class TestLiveOrderRepositoryPositionUpdate:
             position_side="LONG",
         )
 
-        assert existing_pos.quantity == Decimal("0.7")
+        with sqlite_order_session_factory() as session:
+            position = session.get(
+                Position,
+                ("test_strategy", "BINANCE:BTCUSDT-PERP", "LONG"),
+            )
+            assert position is not None
+            assert position.quantity == Decimal("0.7")

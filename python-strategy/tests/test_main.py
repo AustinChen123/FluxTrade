@@ -8,6 +8,7 @@ from src import main as strategy_main
 
 def _set_live_ccxt_env(monkeypatch) -> None:
     values = {
+        "FLUXTRADE_ENVIRONMENT": "live",
         "ADAPTER_MODE": "live",
         "EXCHANGE_ID": "binance",
         "INSTRUMENT_PRODUCT_IDS": "BINANCE:BTCUSDT-PERP",
@@ -21,6 +22,7 @@ def _set_live_ccxt_env(monkeypatch) -> None:
 
 def _set_live_rithmic_env(monkeypatch) -> None:
     values = {
+        "FLUXTRADE_ENVIRONMENT": "live",
         "ADAPTER_MODE": "live",
         "EXCHANGE_ID": "rithmic",
         "INSTRUMENT_PRODUCT_IDS": "RITHMIC:NQ-202609",

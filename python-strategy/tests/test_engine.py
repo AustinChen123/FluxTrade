@@ -38,8 +38,6 @@ from src.core.adapters.rithmic_adapter import (
 from src.core.adapters.simulated import SimulatedAdapter
 from src.core.product_registry import InstrumentSpec
 from src.core.engine import (
-    SYSTEM_BOOT_STATE_KEY,
-    SYSTEM_STATE_KEY,
     StrategyEngine,
     _is_runtime_reconciliation_enabled,
     _kill_switch_result_is_complete,
@@ -507,6 +505,18 @@ class TestBuildStreamChannels:
 
         assert channels == sorted(channels)
 
+    def test_research_only_product_cannot_enter_live_stream_path(
+        self,
+        engine,
+        mock_strategy_class,
+    ):
+        engine.add_strategy(
+            mock_strategy_class("research", "RITHMIC:MNQ-CONTINUOUS")
+        )
+
+        with pytest.raises(ValueError, match="live stream mapping is unavailable"):
+            engine.build_stream_channels()
+
 
 # =============================================================================
 # on_market_data
@@ -920,7 +930,10 @@ class TestHandleCommand:
         redis_state = {}
 
         def redis_set(key, value, **kwargs):
-            if failed_path in {"redis", "both"} and key == SYSTEM_STATE_KEY:
+            if (
+                failed_path in {"redis", "both"}
+                and key == engine._system_state_key
+            ):
                 raise RuntimeError("redis unavailable")
             redis_state[key] = value
 
@@ -1858,7 +1871,9 @@ class TestPersistentKillSwitchState:
     def test_matching_db_and_redis_clear_state_resumes(self, engine):
         previous_boot = {"state": "CLEAN", "boot_id": "previous-boot"}
         engine.redis_client.get.side_effect = lambda key: (
-            "OK" if key == SYSTEM_STATE_KEY else json.dumps(previous_boot)
+            "OK"
+            if key == engine._system_state_key
+            else json.dumps(previous_boot)
         )
         engine.ops_safety.latest_kill_switch_state = MagicMock(return_value="OK")
         engine.ops_safety.latest_engine_boot_state = MagicMock(
@@ -1876,7 +1891,7 @@ class TestPersistentKillSwitchState:
             next(
                 call.args[1]
                 for call in engine.redis_client.set.call_args_list
-                if call.args[0] == SYSTEM_BOOT_STATE_KEY
+                if call.args[0] == engine._system_boot_state_key
             )
         )
         assert redis_boot == {"state": "UNCLEAN", "boot_id": engine._boot_id}
@@ -1901,7 +1916,7 @@ class TestPersistentKillSwitchState:
     ):
         engine.redis_client.get.side_effect = lambda key: (
             "OK"
-            if key == SYSTEM_STATE_KEY
+            if key == engine._system_state_key
             else json.dumps(redis_boot) if redis_boot is not None else None
         )
         engine.ops_safety.latest_kill_switch_state = MagicMock(return_value="OK")
@@ -1914,7 +1929,9 @@ class TestPersistentKillSwitchState:
     def test_unclean_boot_with_clear_kill_state_allows_automatic_recovery(self, engine):
         previous_boot = {"state": "UNCLEAN", "boot_id": "previous"}
         engine.redis_client.get.side_effect = lambda key: (
-            "OK" if key == SYSTEM_STATE_KEY else json.dumps(previous_boot)
+            "OK"
+            if key == engine._system_state_key
+            else json.dumps(previous_boot)
         )
         engine.ops_safety.latest_kill_switch_state = MagicMock(return_value="OK")
         engine.ops_safety.latest_engine_boot_state = MagicMock(
@@ -1996,7 +2013,9 @@ class TestPersistentKillSwitchState:
     def test_current_boot_marker_dual_write_failure_fails_closed(self, engine):
         previous_boot = {"state": "CLEAN", "boot_id": "previous"}
         engine.redis_client.get.side_effect = lambda key: (
-            "OK" if key == SYSTEM_STATE_KEY else json.dumps(previous_boot)
+            "OK"
+            if key == engine._system_state_key
+            else json.dumps(previous_boot)
         )
         engine.redis_client.set.side_effect = RuntimeError("redis unavailable")
         engine.ops_safety.latest_kill_switch_state = MagicMock(return_value="OK")
@@ -2498,7 +2517,10 @@ class TestExchangeOrderEventThread:
         assert engine._rithmic_external_order_drift_pending is True
         assert engine._kill_switch_halted is True
         engine.ops_safety.persist_kill_switch_state.assert_called_once()
-        engine.redis_client.set.assert_called_with(SYSTEM_STATE_KEY, "LOCKDOWN")
+        engine.redis_client.set.assert_called_with(
+            engine._system_state_key,
+            "LOCKDOWN",
+        )
         if poll_error is None:
             engine.execution_engine.process_exchange_order_event.assert_called_once_with(
                 external_event
@@ -2703,7 +2725,7 @@ class TestExchangeOrderEventThread:
         assert engine._rithmic_external_order_drift_pending is True
         assert engine._kill_switch_halted is True
         assert engine.redis_client.set.call_args_list[-1] == call(
-            SYSTEM_STATE_KEY,
+            engine._system_state_key,
             "LOCKDOWN",
         )
         assert engine.ops_safety.persist_kill_switch_state.call_args_list[-1] == call(
@@ -2784,7 +2806,7 @@ class TestExchangeOrderEventThread:
         assert engine._rithmic_external_order_drift_pending is True
         assert engine._kill_switch_halted is True
         assert engine.redis_client.set.call_args_list[-1] == call(
-            SYSTEM_STATE_KEY,
+            engine._system_state_key,
             "LOCKDOWN",
         )
         assert engine.ops_safety.persist_kill_switch_state.call_args_list[-1] == call(

@@ -22,7 +22,7 @@ from src.core.research_datasets import (
 )
 
 
-PRODUCT_ID = "RITHMIC:MNQ-202609"
+PRODUCT_ID = "RITHMIC:MNQ-CONTINUOUS"
 TIMEFRAME = "1m"
 
 
@@ -39,17 +39,6 @@ def session_factory():
         ],
     )
     factory = sessionmaker(bind=engine)
-    with factory() as session:
-        session.add(Exchange(id="RITHMIC", name="Rithmic"))
-        session.add(
-            Product(
-                id=PRODUCT_ID,
-                exchange_id="RITHMIC",
-                base_asset="MNQ",
-                quote_asset="USD",
-            )
-        )
-        session.commit()
     return factory
 
 
@@ -66,9 +55,18 @@ def dataset_spec() -> ResearchDatasetSpec:
     )
 
 
-def _write_csv(path, rows: list[str]) -> None:
+def _write_csv(
+    path,
+    rows: list[str],
+    *,
+    include_source_contract: bool = True,
+) -> None:
+    header = "timestamp,open,high,low,close,volume"
+    if include_source_contract:
+        header += ",source_contract"
+        rows = [f"{row},MNQH4" for row in rows]
     path.write_text(
-        "timestamp,open,high,low,close,volume\n" + "\n".join(rows),
+        header + "\n" + "\n".join(rows),
         encoding="utf-8",
     )
 
@@ -102,6 +100,14 @@ def test_import_is_transactional_and_readable(
         assert dataset.start_time == 1704067200000
         assert dataset.end_time == 1704067260000
         assert len(dataset.checksum_sha256) == 64
+        product = session.get(Product, PRODUCT_ID)
+        exchange = session.get(Exchange, "RITHMIC")
+        assert product is not None
+        assert product.exchange_id == "RITHMIC"
+        assert product.base_asset == "MNQ"
+        assert product.quote_asset == "USD"
+        assert exchange is not None
+        assert exchange.name == "Rithmic"
 
     source = ResearchDatabaseDataSource(
         dataset_spec.dataset_id,
@@ -270,6 +276,97 @@ def test_source_is_bound_to_dataset_product_and_timeframe(
     assert source.get_available_range("RITHMIC:NQ-202609", TIMEFRAME) is None
 
 
+def test_rolled_dataset_rejects_executable_contract_identity():
+    with pytest.raises(
+        ValueError,
+        match="rolled datasets require an EXCHANGE:ROOT-CONTINUOUS product_id",
+    ):
+        ResearchDatasetSpec(
+            dataset_id="misidentified-roll",
+            product_id="RITHMIC:MNQ-202609",
+            timeframe=TIMEFRAME,
+            source="rithmic-history",
+            revision="2026-07-25",
+            roll_policy="vendor-front-month",
+        )
+
+
+def test_continuous_dataset_requires_explicit_roll_policy():
+    with pytest.raises(
+        ValueError,
+        match="continuous datasets require an explicit roll_policy",
+    ):
+        ResearchDatasetSpec(
+            dataset_id="ambiguous-continuous",
+            product_id=PRODUCT_ID,
+            timeframe=TIMEFRAME,
+            source="rithmic-history",
+            revision="2026-07-25",
+        )
+
+
+@pytest.mark.parametrize(
+    ("rows", "message"),
+    [
+        (
+            ["1704067200000,100,101,99,100,12"],
+            "must include a source_contract column",
+        ),
+        (
+            ["1704067200000,100,101,99,100,12,"],
+            "source_contract is required",
+        ),
+    ],
+)
+def test_rolled_dataset_requires_source_contract_for_every_row(
+    tmp_path,
+    session_factory,
+    dataset_spec,
+    rows,
+    message,
+):
+    path = tmp_path / "candles.csv"
+    if rows[0].endswith(","):
+        path.write_text(
+            "timestamp,open,high,low,close,volume,source_contract\n"
+            + "\n".join(rows),
+            encoding="utf-8",
+        )
+    else:
+        _write_csv(path, rows, include_source_contract=False)
+
+    with pytest.raises(ResearchCsvValidationError, match=message):
+        ResearchDatasetImporter(session_factory=session_factory).import_csv(
+            path,
+            dataset_spec,
+        )
+
+
+def test_non_rolled_dataset_allows_missing_source_contract(
+    tmp_path,
+    session_factory,
+):
+    path = tmp_path / "candles.csv"
+    _write_csv(
+        path,
+        ["1704067200000,100,101,99,100,12"],
+        include_source_contract=False,
+    )
+    spec = ResearchDatasetSpec(
+        dataset_id="mnq-contract-202609",
+        product_id="RITHMIC:MNQ-202609",
+        timeframe=TIMEFRAME,
+        source="rithmic-history",
+        revision="2026-07-25",
+    )
+
+    result = ResearchDatasetImporter(
+        session_factory=session_factory
+    ).import_csv(path, spec)
+
+    assert result.row_count == 1
+
+
 def test_dataframe_preserves_decimal_values(
     tmp_path,
     session_factory,
@@ -319,6 +416,34 @@ def test_validate_detects_incomplete_dataset(
         )
 
 
+def test_validate_detects_changed_content_with_same_row_count(
+    tmp_path,
+    session_factory,
+    dataset_spec,
+):
+    path = tmp_path / "candles.csv"
+    _write_csv(path, ["1704067200000,100,101,99,100,12"])
+    importer = ResearchDatasetImporter(session_factory=session_factory)
+    importer.import_csv(path, dataset_spec)
+    with session_factory() as session:
+        candle = session.get(
+            ResearchCandlestick,
+            (dataset_spec.dataset_id, 1704067200000),
+        )
+        assert candle is not None
+        candle.close = Decimal("100.5")
+        session.commit()
+
+    source = ResearchDatabaseDataSource(
+        dataset_spec.dataset_id,
+        session_factory=session_factory,
+    )
+
+    assert source.validate() is False
+    with pytest.raises(ResearchDatasetConflictError):
+        importer.import_csv(path, dataset_spec)
+
+
 def test_file_change_between_validation_and_insert_rolls_back(
     tmp_path,
     session_factory,
@@ -328,7 +453,15 @@ def test_file_change_between_validation_and_insert_rolls_back(
     _write_csv(path, ["1704067200000,100,101,99,100,12"])
 
     class MutatingImporter(ResearchDatasetImporter):
-        def _insert_rows(self, session, path, dataset_id, timestamp_format):
+        def _insert_rows(
+            self,
+            session,
+            path,
+            dataset_id,
+            timestamp_format,
+            *,
+            require_source_contract,
+        ):
             _write_csv(
                 path,
                 ["1704067200000,100,102,99,101,12"],
@@ -338,6 +471,7 @@ def test_file_change_between_validation_and_insert_rolls_back(
                 path,
                 dataset_id,
                 timestamp_format,
+                require_source_contract=require_source_contract,
             )
 
     with pytest.raises(ResearchCsvValidationError, match="changed"):
@@ -374,6 +508,7 @@ def test_explicit_timestamp_format_normalizes_to_milliseconds(
         source=dataset_spec.source,
         revision=dataset_spec.revision,
         timestamp_format=timestamp_format,
+        roll_policy=dataset_spec.roll_policy,
     )
 
     ResearchDatasetImporter(session_factory=session_factory).import_csv(path, spec)
@@ -404,6 +539,7 @@ def test_iso_timestamp_without_offset_is_rejected(
         source=dataset_spec.source,
         revision=dataset_spec.revision,
         timestamp_format="iso8601",
+        roll_policy=dataset_spec.roll_policy,
     )
 
     with pytest.raises(
@@ -430,6 +566,7 @@ def test_iso_timestamp_with_non_utc_offset_is_normalized_to_utc(
         source=dataset_spec.source,
         revision=dataset_spec.revision,
         timestamp_format="iso8601",
+        roll_policy=dataset_spec.roll_policy,
     )
 
     ResearchDatasetImporter(session_factory=session_factory).import_csv(path, spec)

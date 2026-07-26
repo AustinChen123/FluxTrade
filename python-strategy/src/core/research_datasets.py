@@ -9,13 +9,17 @@ from decimal import Decimal, InvalidOperation
 from pathlib import Path
 from typing import Generator, Literal, Mapping, Protocol, Sequence, TypedDict
 
-from sqlalchemy import func, insert
+from sqlalchemy import insert
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from src.core.db import SessionLocal
 from src.core.orm_models import ResearchCandlestick, ResearchDataset
-from src.core.product_registry import validate_product_id
+from src.core.product_master import ensure_product_registered
+from src.core.product_registry import (
+    is_research_only_product_id,
+    validate_product_id,
+)
 
 
 _COLUMN_ALIASES = {
@@ -97,6 +101,14 @@ class ResearchDatasetSpec:
         ):
             raise ValueError("unsupported timestamp_format")
         validate_product_id(self.product_id)
+        if self.roll_policy is not None and not is_research_only_product_id(
+            self.product_id
+        ):
+            raise ValueError(
+                "rolled datasets require an EXCHANGE:ROOT-CONTINUOUS product_id"
+            )
+        if self.roll_policy is None and is_research_only_product_id(self.product_id):
+            raise ValueError("continuous datasets require an explicit roll_policy")
 
 
 @dataclass(frozen=True)
@@ -237,6 +249,8 @@ def _resolve_source_contract_column(
 def _iter_csv_rows(
     path: Path,
     timestamp_format: TimestampFormat,
+    *,
+    require_source_contract: bool = False,
 ) -> Generator[_ResearchCandleRow, None, None]:
     previous_timestamp: int | None = None
     with path.open("r", encoding="utf-8-sig", newline="") as handle:
@@ -244,6 +258,10 @@ def _iter_csv_rows(
         columns = _resolve_columns(reader.fieldnames)
         assert reader.fieldnames is not None
         source_contract_column = _resolve_source_contract_column(reader.fieldnames)
+        if require_source_contract and source_contract_column is None:
+            raise ResearchCsvValidationError(
+                "rolled dataset CSV must include a source_contract column"
+            )
         for line_number, row in enumerate(reader, start=2):
             timestamp = _parse_timestamp(
                 row[columns["timestamp"]],
@@ -264,6 +282,10 @@ def _iter_csv_rows(
             if len(source_contract) > 64:
                 raise ResearchCsvValidationError(
                     f"line {line_number}: source_contract must not exceed 64 characters"
+                )
+            if require_source_contract and not source_contract:
+                raise ResearchCsvValidationError(
+                    f"line {line_number}: source_contract is required for rolled datasets"
                 )
 
             if previous_timestamp is not None and timestamp <= previous_timestamp:
@@ -316,12 +338,21 @@ def _update_digest(
     )
 
 
-def _scan_csv(path: Path, timestamp_format: TimestampFormat) -> _CsvSummary:
+def _scan_csv(
+    path: Path,
+    timestamp_format: TimestampFormat,
+    *,
+    require_source_contract: bool = False,
+) -> _CsvSummary:
     digest = hashlib.sha256()
     row_count = 0
     start_time: int | None = None
     end_time: int | None = None
-    for row in _iter_csv_rows(path, timestamp_format):
+    for row in _iter_csv_rows(
+        path,
+        timestamp_format,
+        require_source_contract=require_source_contract,
+    ):
         timestamp = int(row["timestamp"])
         if start_time is None:
             start_time = timestamp
@@ -336,6 +367,73 @@ def _scan_csv(path: Path, timestamp_format: TimestampFormat) -> _CsvSummary:
         end_time=end_time,
         checksum_sha256=digest.hexdigest(),
     )
+
+
+def _summarize_persisted_rows(
+    session: Session,
+    dataset_id: str,
+) -> _CsvSummary | None:
+    digest = hashlib.sha256()
+    row_count = 0
+    start_time: int | None = None
+    end_time: int | None = None
+    rows = (
+        session.query(
+            ResearchCandlestick.timestamp,
+            ResearchCandlestick.open,
+            ResearchCandlestick.high,
+            ResearchCandlestick.low,
+            ResearchCandlestick.close,
+            ResearchCandlestick.volume,
+            ResearchCandlestick.source_contract,
+        )
+        .filter(ResearchCandlestick.dataset_id == dataset_id)
+        .order_by(ResearchCandlestick.timestamp.asc())
+        .yield_per(1_000)
+    )
+    for row in rows:
+        timestamp = int(row.timestamp)
+        if start_time is None:
+            start_time = timestamp
+        end_time = timestamp
+        row_count += 1
+        _update_digest(
+            digest,
+            {
+                "timestamp": timestamp,
+                "open": row.open,
+                "high": row.high,
+                "low": row.low,
+                "close": row.close,
+                "volume": row.volume,
+                "source_contract": row.source_contract,
+            },
+        )
+    if row_count == 0 or start_time is None or end_time is None:
+        return None
+    return _CsvSummary(
+        row_count=row_count,
+        start_time=start_time,
+        end_time=end_time,
+        checksum_sha256=digest.hexdigest(),
+    )
+
+
+def persisted_research_dataset_is_valid(
+    session: Session,
+    dataset: ResearchDataset,
+) -> bool:
+    """Verify immutable dataset metadata against its persisted candle content."""
+    actual = _summarize_persisted_rows(session, dataset.id)
+    if actual is None:
+        return False
+    expected = _CsvSummary(
+        row_count=dataset.row_count,
+        start_time=dataset.start_time,
+        end_time=dataset.end_time,
+        checksum_sha256=dataset.checksum_sha256,
+    )
+    return actual == expected
 
 
 class ResearchDatasetImporter:
@@ -361,9 +459,15 @@ class ResearchDatasetImporter:
             separators=(",", ":"),
             allow_nan=False,
         )
-        summary = _scan_csv(path, spec.timestamp_format)
+        require_source_contract = spec.roll_policy is not None
+        summary = _scan_csv(
+            path,
+            spec.timestamp_format,
+            require_source_contract=require_source_contract,
+        )
         session: Session = self._session_factory()
         try:
+            ensure_product_registered(session, spec.product_id)
             existing = session.get(ResearchDataset, spec.dataset_id)
             if existing is not None:
                 self._verify_existing(
@@ -403,6 +507,7 @@ class ResearchDatasetImporter:
                 path,
                 spec.dataset_id,
                 spec.timestamp_format,
+                require_source_contract=require_source_contract,
             )
             if second_summary != summary:
                 raise ResearchCsvValidationError(
@@ -446,13 +551,19 @@ class ResearchDatasetImporter:
         path: Path,
         dataset_id: str,
         timestamp_format: TimestampFormat,
+        *,
+        require_source_contract: bool,
     ) -> _CsvSummary:
         digest = hashlib.sha256()
         batch: list[dict[str, object]] = []
         row_count = 0
         start_time: int | None = None
         end_time: int | None = None
-        for row in _iter_csv_rows(path, timestamp_format):
+        for row in _iter_csv_rows(
+            path,
+            timestamp_format,
+            require_source_contract=require_source_contract,
+        ):
             timestamp = int(row["timestamp"])
             if start_time is None:
                 start_time = timestamp
@@ -510,12 +621,10 @@ class ResearchDatasetImporter:
             existing.quality_status,
         )
         expected = (*expected, "validated")
-        actual_count = (
-            session.query(func.count(ResearchCandlestick.timestamp))
-            .filter(ResearchCandlestick.dataset_id == spec.dataset_id)
-            .scalar()
-        )
-        if actual != expected or actual_count != summary.row_count:
+        if actual != expected or not persisted_research_dataset_is_valid(
+            session,
+            existing,
+        ):
             raise ResearchDatasetConflictError(
                 "dataset_id already exists with different content or provenance"
             )

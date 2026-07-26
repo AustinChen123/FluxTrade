@@ -57,6 +57,9 @@ _PERPETUAL_PRODUCT_ID_PATTERN = re.compile(r"^([A-Z0-9]+):([A-Z0-9_]+)-PERP$")
 _DATED_FUTURE_PRODUCT_ID_PATTERN = re.compile(
     r"^([A-Z0-9]+):([A-Z][A-Z0-9]*)-([0-9]{4})([0-9]{2})$"
 )
+_CONTINUOUS_FUTURE_PRODUCT_ID_PATTERN = re.compile(
+    r"^([A-Z0-9]+):([A-Z][A-Z0-9]*)-CONTINUOUS$"
+)
 
 
 @dataclass(frozen=True)
@@ -203,9 +206,21 @@ def _parse_product_id(product_id: str) -> dict:
                 "quote": "USD",
             }
 
+    continuous_future = _CONTINUOUS_FUTURE_PRODUCT_ID_PATTERN.fullmatch(product_id)
+    if continuous_future:
+        return {
+            "exchange": continuous_future.group(1).lower(),
+            "ccxt": None,
+            "symbol": None,
+            "base": continuous_future.group(2),
+            "quote": "USD",
+            "research_only": True,
+        }
+
     raise ValueError(
         f"Cannot parse product_id: {product_id}. Expected "
-        "EXCHANGE:BASEQUOTE-PERP or EXCHANGE:ROOT-YYYYMM"
+        "EXCHANGE:BASEQUOTE-PERP, EXCHANGE:ROOT-YYYYMM, or "
+        "EXCHANGE:ROOT-CONTINUOUS"
     )
 
 
@@ -219,6 +234,12 @@ def is_dated_future_product_id(product_id: str) -> bool:
     """Return whether a canonical product ID identifies an expiring contract."""
     validate_product_id(product_id)
     return _DATED_FUTURE_PRODUCT_ID_PATTERN.fullmatch(product_id) is not None
+
+
+def is_research_only_product_id(product_id: str) -> bool:
+    """Return whether a product identifies a non-executable research series."""
+    validate_product_id(product_id)
+    return _CONTINUOUS_FUTURE_PRODUCT_ID_PATTERN.fullmatch(product_id) is not None
 
 
 def to_ccxt_symbol(product_id: str) -> str:
@@ -275,6 +296,8 @@ def to_stream_key(product_id: str, timeframe: str) -> str:
         'stream:market:binance:btcusdt:15m'
     """
     info = _parse_product_id(product_id)
+    if info.get("research_only"):
+        raise ValueError(f"live stream mapping is unavailable for {product_id}")
     stream_symbol = info.get("stream_symbol") or f"{info['base']}{info['quote']}".lower()
     return f"stream:market:{info['exchange']}:{stream_symbol}:{timeframe}"
 
