@@ -504,6 +504,7 @@ class ParameterSearchJobRequest(BaseModel):
     """Request payload for evaluating strategy parameter candidates."""
 
     kind: Literal["parameter_search"] = "parameter_search"
+    strategy_type: str | None = Field(default=None, min_length=1)
     strategy_id: str = Field(min_length=1)
     product_id: str = Field(min_length=1)
     timeframe: str = Field(min_length=1)

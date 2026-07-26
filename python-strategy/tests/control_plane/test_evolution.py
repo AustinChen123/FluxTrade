@@ -262,6 +262,45 @@ def test_evolution_retry_resumes_without_reevaluating_checkpointed_genes(tmp_pat
         assert evaluator.calls[int(value)] == calls_before_resume[int(value)]
 
 
+def test_evolution_resume_accepts_checkpoint_without_optional_strategy_type(tmp_path):
+    factory = _session_factory(tmp_path, "pre_strategy_type_checkpoint.db")
+    request = _request().model_copy(
+        update={
+            "evolution": _request().evolution.model_copy(
+                update={"epoch_id": "epoch_pre_strategy_type"}
+            )
+        }
+    )
+    _ensure_evolution_epoch(factory, request)
+    with factory() as session:
+        epoch = session.get(EvolutionEpoch, "epoch_pre_strategy_type")
+        config = dict(epoch.config_json)
+        config.pop("strategy_type", None)
+        epoch.config_json = config
+        session.commit()
+
+    _ensure_evolution_epoch(factory, request)
+
+
+def test_evolution_resume_rejects_changed_strategy_type(tmp_path):
+    factory = _session_factory(tmp_path, "strategy_type_mismatch.db")
+    request = _request().model_copy(
+        update={
+            "strategy_type": "first",
+            "evolution": _request().evolution.model_copy(
+                update={"epoch_id": "epoch_strategy_type"}
+            ),
+        }
+    )
+    _ensure_evolution_epoch(factory, request)
+
+    with pytest.raises(ValueError, match="does not match request"):
+        _ensure_evolution_epoch(
+            factory,
+            request.model_copy(update={"strategy_type": "second"}),
+        )
+
+
 def test_evolution_resume_survives_durable_job_store_reopen(tmp_path):
     factory = _session_factory(tmp_path, "durable_resume.db")
     jobs_path = tmp_path / "control_plane_jobs.db"

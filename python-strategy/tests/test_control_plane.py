@@ -18,9 +18,12 @@ from src.control_plane import (
     InMemoryJobStore,
     ParameterEvaluationResult,
     ParameterSearchJobExecutor,
+    ParameterSearchEvaluatorRegistry,
+    RedisStrategyCommandRouter,
     SqliteJobStore,
     StrategyControlService,
     StrategyStateQueryService,
+    UnsupportedParameterSearchError,
 )
 from src.control_plane.models import (
     BacktestJobRequest,
@@ -134,6 +137,23 @@ def _sqlite_strategy_state_session_factory(tmp_path):
         )
         session.commit()
     return session_factory
+
+
+def _sqlite_control_plane_session_factory(tmp_path):
+    engine = create_engine(
+        f"sqlite:///{tmp_path / 'control_plane_production_wiring.db'}",
+        connect_args={"check_same_thread": False, "timeout": 30},
+    )
+    for table in [
+        Strategy.__table__,
+        SystemEvent.__table__,
+        StrategyState.__table__,
+        StrategyStateTransition.__table__,
+        EvolutionEpoch.__table__,
+        GeneRecord.__table__,
+    ]:
+        table.create(engine, checkfirst=True)
+    return sessionmaker(bind=engine)
 
 
 def _write_candles(path):
@@ -1676,6 +1696,84 @@ def test_control_plane_routes_strategy_status_and_commands():
     }
 
 
+def test_redis_strategy_router_queries_state_and_publishes_commands(tmp_path):
+    from unittest.mock import MagicMock
+
+    session_factory = _sqlite_strategy_state_session_factory(tmp_path)
+    with session_factory() as session:
+        session.add(
+            StrategyState(
+                strategy_id="s1",
+                status="ACTIVE",
+                config_json="{}",
+                performance_json="{}",
+                last_heartbeat=1,
+                uptime_start=1,
+                version=1,
+            )
+        )
+        session.commit()
+
+    redis = MagicMock()
+    redis.exists.return_value = 1
+    redis.publish.return_value = 1
+    router = RedisStrategyCommandRouter(
+        redis,
+        StrategyStateQueryService(session_factory),
+    )
+
+    listed = router.handle({"command": "LIST"})
+    health = router.handle({"command": "HEALTH_CHECK"})
+    submitted = router.handle(
+        {
+            "command": "STOP",
+            "strategy_id": "s1",
+            "params": {"strategy_id": "s1"},
+        }
+    )
+
+    assert listed.success is True
+    assert listed.data is not None
+    assert [row["strategy_id"] for row in listed.data["strategies"]] == ["s1"]
+    assert health.data == {"healthy": {"s1": True}}
+    assert submitted.success is True
+    assert submitted.accepted is True
+    redis.publish.assert_called_once_with(
+        "cmd:strategy:control",
+        '{"command":"STOP","strategy_id":"s1","params":{"strategy_id":"s1"}}',
+    )
+
+
+def test_strategy_command_returns_503_without_engine_listener(tmp_path):
+    from unittest.mock import MagicMock
+
+    redis = MagicMock()
+    redis.publish.return_value = 0
+    app = ControlPlaneApp(
+        BacktestJobExecutor(run_inline=True),
+        strategy_control=StrategyControlService(
+            RedisStrategyCommandRouter(
+                redis,
+                StrategyStateQueryService(
+                    _sqlite_strategy_state_session_factory(tmp_path)
+                ),
+            )
+        ),
+    )
+
+    response = app.handle(
+        "POST",
+        "/strategies/s1/commands",
+        json.dumps({"command": "STOP"}),
+    )
+
+    assert response.status_code == 503
+    assert response.body == {
+        "error": "strategy_control_unavailable",
+        "detail": "Strategy engine listener unavailable",
+    }
+
+
 def test_control_plane_reports_unavailable_strategy_control():
     app = ControlPlaneApp(BacktestJobExecutor(run_inline=True))
 
@@ -1905,30 +2003,373 @@ def test_kill_switch_publish_without_subscriber_returns_503():
     assert response.body == {"error": "kill_switch_no_listener"}
 
 
-def test_control_plane_main_wires_redis_client_for_kill_switch(monkeypatch):
+def test_production_control_plane_wiring_has_no_missing_dependency_503(tmp_path):
     from unittest.mock import MagicMock
 
     from src.control_plane import main as control_plane_main
 
     redis = MagicMock()
+    redis.exists.return_value = 1
+    redis.publish.return_value = 1
+
+    class AcceptingEvaluator:
+        def evaluate(self, request, candidate):
+            return ParameterEvaluationResult(
+                candidate_id=candidate.candidate_id,
+                score_total=Decimal("1"),
+            )
+
+    parameter_search_evaluator = ParameterSearchEvaluatorRegistry(
+        {
+            "test_strategy": AcceptingEvaluator(),
+            "golden_cross": AcceptingEvaluator(),
+        }
+    )
+    app = control_plane_main.build_control_plane_app(
+        redis_client=redis,
+        db_session_factory=_sqlite_control_plane_session_factory(tmp_path),
+        job_store=InMemoryJobStore(),
+        parameter_search_evaluator=parameter_search_evaluator,
+    )
+
+    generic_search_payload = json.dumps(
+        {
+            "strategy_type": "test_strategy",
+            "strategy_id": "test_search",
+            "product_id": PRODUCT_ID,
+            "timeframe": TIMEFRAME,
+            "start_time": 1,
+            "end_time": 2,
+            "candidates": [
+                {
+                    "candidate_id": "candidate",
+                    "param_pack": {"period": 10},
+                }
+            ],
+        }
+    )
+    golden_cross_preset_payload = json.dumps(
+        {
+            "product_id": PRODUCT_ID,
+            "timeframe": TIMEFRAME,
+            "start_time": 1,
+            "end_time": 2,
+            "short_window": {"min": 1, "max": 1},
+            "long_window": {"min": 2, "max": 2},
+            "candidate_sample_count": 1,
+        }
+    )
+    responses = {
+        "health": app.handle("GET", "/health"),
+        "submit_backtest": app.handle("POST", "/jobs/backtests", "{}"),
+        "submit_parameter_search": app.handle(
+            "POST", "/jobs/parameter-searches", generic_search_payload
+        ),
+        "submit_parameter_preset": app.handle(
+            "POST",
+            "/jobs/parameter-search-presets/golden-cross",
+            golden_cross_preset_payload,
+        ),
+        "list_jobs": app.handle("GET", "/jobs"),
+        "get_job": app.handle("GET", "/jobs/missing"),
+        "cancel_job": app.handle("POST", "/jobs/missing/cancel"),
+        "retry_job": app.handle("POST", "/jobs/missing/retry"),
+        "list_genes": app.handle("GET", "/genes"),
+        "get_gene": app.handle("GET", "/genes/999"),
+        "promote_gene": app.handle("POST", "/genes/999/promote"),
+        "list_epochs": app.handle("GET", "/evolution-epochs"),
+        "get_epoch": app.handle("GET", "/evolution-epochs/missing"),
+        "list_system_events": app.handle("GET", "/system-events"),
+        "get_system_event": app.handle("GET", "/system-events/999"),
+        "list_strategies": app.handle("GET", "/strategies"),
+        "strategy_health": app.handle("GET", "/strategies/health"),
+        "list_strategy_states": app.handle("GET", "/strategy-states"),
+        "strategy_state_summary": app.handle("GET", "/strategy-states/summary"),
+        "get_strategy_state": app.handle("GET", "/strategy-states/missing"),
+        "strategy_state_transitions": app.handle(
+            "GET", "/strategy-states/missing/transitions"
+        ),
+        "submit_strategy_command": app.handle(
+            "POST",
+            "/strategies/s1/commands",
+            json.dumps({"command": "STOP"}),
+        ),
+        "kill_switch": app.handle("POST", "/ops/kill-switch"),
+        "clear_kill_switch": app.handle("POST", "/ops/kill-switch/clear"),
+    }
+
+    unexpected_503s = {
+        name: response.body
+        for name, response in responses.items()
+        if response.status_code == 503
+    }
+    assert unexpected_503s == {}
+    assert responses["submit_parameter_search"].status_code == 202
+    assert responses["submit_parameter_preset"].status_code == 202
+    assert responses["submit_strategy_command"].status_code == 202
+    assert app.parameter_search_executor is not None
+    assert app.gene_control is not None
+    assert app.strategy_control is not None
+    assert app.strategy_state_query is not None
+    assert app.redis_client is redis
+    assert app.backtest_executor.store is app.parameter_search_executor.store
+
+
+def test_production_parameter_search_rejects_unregistered_strategy_before_job_creation(
+    tmp_path,
+):
+    from unittest.mock import MagicMock
+
+    from src.control_plane import main as control_plane_main
+
+    store = InMemoryJobStore()
+    app = control_plane_main.build_control_plane_app(
+        redis_client=MagicMock(),
+        db_session_factory=_sqlite_control_plane_session_factory(tmp_path),
+        job_store=store,
+        parameter_search_evaluator=ParameterSearchEvaluatorRegistry(
+            {"golden_cross": GoldenCrossResearchParameterEvaluator()}
+        ),
+    )
+
+    response = app.handle(
+        "POST",
+        "/jobs/parameter-searches",
+        json.dumps(
+            {
+                "strategy_type": "rsi",
+                "strategy_id": "rsi_search",
+                "product_id": PRODUCT_ID,
+                "timeframe": TIMEFRAME,
+                "start_time": 1,
+                "end_time": 2,
+                "candidates": [
+                    {
+                        "candidate_id": "candidate",
+                        "param_pack": {"rsi_period": 14},
+                    }
+                ],
+            }
+        ),
+    )
+
+    assert response.status_code == 422
+    assert response.body == {
+        "error": "parameter_search_rejected",
+        "detail": "unsupported strategy_type: rsi",
+    }
+    assert store.list() == []
+
+
+def test_production_control_plane_registers_default_parameter_evaluators(tmp_path):
+    from unittest.mock import MagicMock
+
+    from src.control_plane import main as control_plane_main
+
+    app = control_plane_main.build_control_plane_app(
+        redis_client=MagicMock(),
+        db_session_factory=_sqlite_control_plane_session_factory(tmp_path),
+        job_store=InMemoryJobStore(),
+    )
+    registry = app.parameter_search_executor.evaluator
+    assert isinstance(registry, ParameterSearchEvaluatorRegistry)
+    csv_request = ParameterSearchJobRequest.model_validate(
+        {
+            "strategy_type": "csv_signal",
+            "strategy_id": "csv_search",
+            "product_id": PRODUCT_ID,
+            "timeframe": TIMEFRAME,
+            "start_time": 1,
+            "end_time": 2,
+            "candidates": [
+                {
+                    "candidate_id": "candidate",
+                    "param_pack": {"signals_csv_path": "/unused.csv"},
+                }
+            ],
+        }
+    )
+    golden_cross_request = csv_request.model_copy(
+        update={
+            "strategy_type": "golden_cross",
+            "strategy_id": "golden_cross_search",
+        }
+    )
+
+    assert isinstance(
+        registry._resolve(csv_request),
+        CsvSignalBacktestParameterEvaluator,
+    )
+    assert isinstance(
+        registry._resolve(golden_cross_request),
+        GoldenCrossResearchParameterEvaluator,
+    )
+
+
+def test_production_parameter_search_rejects_unsupported_warmup_before_job_creation(
+    tmp_path,
+):
+    from unittest.mock import MagicMock
+
+    from src.control_plane import main as control_plane_main
+
+    class NoWarmupEvaluator:
+        def evaluate(self, request, candidate):
+            return ParameterEvaluationResult(
+                candidate_id=candidate.candidate_id,
+                score_total=Decimal("1"),
+            )
+
+    store = InMemoryJobStore()
+    app = control_plane_main.build_control_plane_app(
+        redis_client=MagicMock(),
+        db_session_factory=_sqlite_control_plane_session_factory(tmp_path),
+        job_store=store,
+        parameter_search_evaluator=ParameterSearchEvaluatorRegistry(
+            {"no_warmup": NoWarmupEvaluator()}
+        ),
+    )
+
+    response = app.handle(
+        "POST",
+        "/jobs/parameter-searches",
+        json.dumps(
+            {
+                "strategy_type": "no_warmup",
+                "strategy_id": "walk_forward_search",
+                "product_id": PRODUCT_ID,
+                "timeframe": TIMEFRAME,
+                "start_time": 1,
+                "end_time": 20,
+                "backtest": {"candles_csv_path": "/unused.csv"},
+                "candidates": [
+                    {
+                        "candidate_id": "candidate",
+                        "param_pack": {"period": 10},
+                    }
+                ],
+                "evaluation_set": {
+                    "datasets": [
+                        {
+                            "dataset_id": "fold",
+                            "product_id": PRODUCT_ID,
+                            "timeframe": TIMEFRAME,
+                            "warmup_start_time": 1,
+                            "start_time": 10,
+                            "end_time": 20,
+                        }
+                    ]
+                },
+            }
+        ),
+    )
+
+    assert response.status_code == 422
+    assert response.body == {
+        "error": "parameter_search_rejected",
+        "detail": (
+            "strategy_type does not support walk-forward warmup: no_warmup"
+        ),
+    }
+    assert store.list() == []
+
+
+def test_registry_delegates_request_validation_before_job_creation(tmp_path):
+    from unittest.mock import MagicMock
+
+    from src.control_plane import main as control_plane_main
+
+    class RejectingEvaluator:
+        def validate_request(self, request):
+            raise UnsupportedParameterSearchError("strategy parameters rejected")
+
+        def evaluate(self, request, candidate):
+            raise AssertionError("rejected request must not be evaluated")
+
+    store = InMemoryJobStore()
+    app = control_plane_main.build_control_plane_app(
+        redis_client=MagicMock(),
+        db_session_factory=_sqlite_control_plane_session_factory(tmp_path),
+        job_store=store,
+        parameter_search_evaluator=ParameterSearchEvaluatorRegistry(
+            {"rejecting": RejectingEvaluator()}
+        ),
+    )
+
+    response = app.handle(
+        "POST",
+        "/jobs/parameter-searches",
+        json.dumps(
+            {
+                "strategy_type": "rejecting",
+                "strategy_id": "rejected_search",
+                "product_id": PRODUCT_ID,
+                "timeframe": TIMEFRAME,
+                "start_time": 1,
+                "end_time": 2,
+                "candidates": [
+                    {
+                        "candidate_id": "candidate",
+                        "param_pack": {"period": 10},
+                    }
+                ],
+            }
+        ),
+    )
+
+    assert response.status_code == 422
+    assert response.body == {
+        "error": "parameter_search_rejected",
+        "detail": "strategy parameters rejected",
+    }
+    assert store.list() == []
+
+
+@pytest.mark.parametrize(
+    ("path", "body"),
+    [
+        ("/jobs/backtests", "[]"),
+        ("/jobs/parameter-searches", '"not-an-object"'),
+    ],
+)
+def test_control_plane_rejects_non_object_job_payloads(path, body):
+    app = ControlPlaneApp(
+        BacktestJobExecutor(run_inline=True),
+        parameter_search_executor=ParameterSearchJobExecutor(
+            ParameterSearchEvaluatorRegistry(
+                {"golden_cross": GoldenCrossResearchParameterEvaluator()}
+            ),
+            run_inline=True,
+        ),
+    )
+
+    response = app.handle("POST", path, body)
+
+    assert response.status_code == 400
+    assert response.body["error"] == "invalid_json"
+
+
+def test_control_plane_main_serves_production_app(monkeypatch):
+    from src.control_plane import main as control_plane_main
+
+    app = object()
     captured = {}
 
-    class CapturingControlPlaneApp:
-        def __init__(self, executor, *, api_key=None, redis_client=None):
-            captured["executor"] = executor
-            captured["api_key"] = api_key
-            captured["redis_client"] = redis_client
-
-    monkeypatch.setattr(control_plane_main, "ControlPlaneApp", CapturingControlPlaneApp)
-    monkeypatch.setattr(control_plane_main, "create_redis_client", lambda: redis)
+    monkeypatch.setattr(
+        control_plane_main,
+        "build_control_plane_app",
+        lambda *, api_key: captured.update({"api_key": api_key}) or app,
+    )
     monkeypatch.setattr(
         control_plane_main,
         "serve",
-        lambda app, *, host, port: captured.update(
-            {"served_app": app, "host": host, "port": port}
+        lambda served_app, *, host, port: captured.update(
+            {"served_app": served_app, "host": host, "port": port}
         ),
     )
 
     control_plane_main.main()
 
-    assert captured["redis_client"] is redis
+    assert captured["served_app"] is app
+    assert captured["host"] == "127.0.0.1"
+    assert captured["port"] == 8080

@@ -98,6 +98,7 @@ candidate to provide a `signals_csv_path`:
 curl -X POST http://127.0.0.1:8080/jobs/parameter-searches \
   -H 'Content-Type: application/json' \
   -d '{
+    "strategy_type": "csv_signal",
     "strategy_id": "rsi_scalper",
     "product_id": "BINANCE:BTCUSDT-PERP",
     "timeframe": "15m",
@@ -124,6 +125,11 @@ curl -X POST http://127.0.0.1:8080/jobs/parameter-searches \
     ]
   }'
 ```
+
+The standalone production composition registers `csv_signal` and
+`golden_cross` strategy types. Unsupported or missing `strategy_type` values
+are rejected before a job is created; the Golden Cross preset supplies its
+strategy type automatically.
 
 When the parameter-search executor is constructed with a database session
 factory, completed searches also persist `evolution_epochs` and challenger

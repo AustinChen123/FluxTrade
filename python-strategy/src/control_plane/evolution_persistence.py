@@ -234,6 +234,8 @@ def _evolution_config_payload(
     request: ParameterSearchJobRequest,
 ) -> dict[str, Any]:
     payload = request.model_dump(mode="json")
+    if payload.get("strategy_type") is None:
+        payload.pop("strategy_type", None)
     if request.fitness is not None:
         payload["fitness_metric_contract"] = fitness_metric_contract()
     return payload
