@@ -458,12 +458,17 @@ class TestOrderManagerEdgeCases:
 class TestOrderManagerLiveMode:
     """Tests for live mode (non-backtest) OrderManager."""
 
-    def test_lua_file_not_found_raises(self, mock_clock):
+    def test_lua_file_not_found_raises(
+        self,
+        mock_clock,
+        sqlite_order_session_factory,
+    ):
         """Missing Lua script should raise on init."""
         from src.core.repositories import LiveOrderRepository
 
-        mock_db = MagicMock()
-        repo = LiveOrderRepository(mock_db)
+        repo = LiveOrderRepository(
+            db_session_factory=sqlite_order_session_factory
+        )
 
         with patch("src.core.order_manager.create_redis_client") as mock_redis_cls, \
              patch("builtins.open", side_effect=FileNotFoundError("no lua")):
@@ -472,12 +477,18 @@ class TestOrderManagerLiveMode:
             with pytest.raises(FileNotFoundError):
                 OrderManager(repo, mock_clock, is_backtest=False)
 
-    def test_live_fill_calls_lua_script(self, mock_clock, signal_factory):
+    def test_live_fill_calls_lua_script(
+        self,
+        mock_clock,
+        signal_factory,
+        sqlite_order_session_factory,
+    ):
         """fill_order in live mode should call Redis Lua script."""
         from src.core.repositories import LiveOrderRepository
 
-        mock_db = MagicMock()
-        repo = LiveOrderRepository(mock_db)
+        repo = LiveOrderRepository(
+            db_session_factory=sqlite_order_session_factory
+        )
 
         mock_redis = MagicMock()
         mock_script = MagicMock()
@@ -494,13 +505,19 @@ class TestOrderManagerLiveMode:
         mock_script.assert_called_once()
         assert order.status == "closed"
 
-    def test_live_fill_lua_error_raises_runtime(self, mock_clock, signal_factory):
+    def test_live_fill_lua_error_raises_runtime(
+        self,
+        mock_clock,
+        signal_factory,
+        sqlite_order_session_factory,
+    ):
         """Lua script ResponseError should raise RuntimeError."""
         import redis as redis_lib
         from src.core.repositories import LiveOrderRepository
 
-        mock_db = MagicMock()
-        repo = LiveOrderRepository(mock_db)
+        repo = LiveOrderRepository(
+            db_session_factory=sqlite_order_session_factory
+        )
 
         mock_redis = MagicMock()
         mock_script = MagicMock()

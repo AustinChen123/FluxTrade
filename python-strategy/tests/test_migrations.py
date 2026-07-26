@@ -16,9 +16,10 @@ database:
    compare the resulting schema fingerprints to confirm idempotency.
 
 Each test runs against an isolated database created via ``CREATE DATABASE``
-on the project's PostgreSQL instance (Fixture Plan B). The database is
-dropped at fixture teardown. If PostgreSQL is unreachable the entire module
-is skipped, so this file is safe to keep in the default ``pytest`` run.
+on the explicitly selected PostgreSQL instance (Fixture Plan B). The database
+is dropped at fixture teardown. The module requires
+``FLUXTRADE_RUN_POSTGRES_MIGRATION_TESTS=1`` before checking connectivity, so a
+default ``pytest`` run cannot create or drop databases.
 
 Marked ``integration`` to keep it out of unit-only runs.
 """
@@ -29,11 +30,14 @@ import json
 import os
 import time
 from collections.abc import Iterator
+from concurrent.futures import ThreadPoolExecutor
+from threading import Barrier
 
 import pytest
 import sqlalchemy as sa
 from sqlalchemy import text
 from sqlalchemy.engine import Engine
+from sqlalchemy.exc import DBAPIError, IntegrityError
 
 # Alembic is imported lazily inside tests so that import-time failures do not
 # break collection on environments where alembic is missing.
@@ -42,6 +46,13 @@ ALEMBIC_INI = os.path.abspath(
 )
 
 pytestmark = pytest.mark.integration
+
+if os.getenv("FLUXTRADE_RUN_POSTGRES_MIGRATION_TESTS") != "1":
+    pytest.skip(
+        "set FLUXTRADE_RUN_POSTGRES_MIGRATION_TESTS=1 to run destructive "
+        "PostgreSQL migration tests",
+        allow_module_level=True,
+    )
 
 
 # --------------------------------------------------------------------------- #
@@ -355,7 +366,7 @@ def test_sample_data_insertion_after_upgrade(fresh_pg_db: str) -> None:
             )
 
         # Negative CHECK: invalid event_type must be rejected.
-        with pytest.raises(sa.exc.IntegrityError):
+        with pytest.raises(IntegrityError):
             with engine.begin() as conn:
                 conn.execute(
                     text(
@@ -372,7 +383,7 @@ def test_sample_data_insertion_after_upgrade(fresh_pg_db: str) -> None:
                 ("test", " "),
             )
         ):
-            with pytest.raises(sa.exc.IntegrityError):
+            with pytest.raises(IntegrityError):
                 with engine.begin() as conn:
                     conn.execute(
                         text(
@@ -391,7 +402,7 @@ def test_sample_data_insertion_after_upgrade(fresh_pg_db: str) -> None:
                     )
 
         # Negative CHECK: daily_nav_snapshots.source must be in whitelist.
-        with pytest.raises(sa.exc.IntegrityError):
+        with pytest.raises(IntegrityError):
             with engine.begin() as conn:
                 conn.execute(
                     text(
@@ -438,7 +449,7 @@ def test_sample_data_insertion_after_upgrade(fresh_pg_db: str) -> None:
             )
 
         # Negative CHECK: invalid gene role.
-        with pytest.raises(sa.exc.IntegrityError):
+        with pytest.raises(IntegrityError):
             with engine.begin() as conn:
                 conn.execute(
                     text(
@@ -454,7 +465,7 @@ def test_sample_data_insertion_after_upgrade(fresh_pg_db: str) -> None:
                 )
 
         # Partial unique: a second champion for the same strategy must fail.
-        with pytest.raises(sa.exc.IntegrityError):
+        with pytest.raises(IntegrityError):
             with engine.begin() as conn:
                 conn.execute(
                     text(
@@ -615,3 +626,287 @@ def test_round_trip_idempotent(fresh_pg_db: str) -> None:
         engine.dispose()
 
     assert fp_first == fp_second, "Schema fingerprint diverged across round-trip"
+
+
+def _insert_research_prerequisites(engine: Engine) -> None:
+    with engine.begin() as conn:
+        conn.execute(
+            text("INSERT INTO exchange (id, name) VALUES ('RITHMIC', 'Rithmic')")
+        )
+        conn.execute(
+            text(
+                "INSERT INTO product "
+                "(id, exchange_id, base_asset, quote_asset) "
+                "VALUES "
+                "('RITHMIC:MNQ-CONTINUOUS', 'RITHMIC', 'MNQ', 'USD')"
+            )
+        )
+
+
+def _insert_importing_research_dataset(conn, dataset_id: str) -> None:
+    conn.execute(
+        text(
+            """
+            INSERT INTO research_dataset (
+                id, product_id, timeframe, source, revision, timestamp_format,
+                checksum_sha256, roll_policy, start_time, end_time, row_count,
+                quality_status, lifecycle_state, sealed_at, metadata_json
+            )
+            VALUES (
+                :dataset_id, 'RITHMIC:MNQ-CONTINUOUS', '1m',
+                'rithmic-history', '2026-07-25', 'epoch_milliseconds',
+                :checksum, 'vendor-front-month', 1704067200000, 1704067200000,
+                1, 'validated', 'importing', NULL, '{}'
+            )
+            """
+        ),
+        {"dataset_id": dataset_id, "checksum": "0" * 64},
+    )
+
+
+def _insert_research_candle(conn, dataset_id: str, timestamp: int) -> None:
+    conn.execute(
+        text(
+            """
+            INSERT INTO research_candlestick (
+                dataset_id, timestamp, open, high, low, close, volume,
+                source_contract
+            )
+            VALUES (:dataset_id, :timestamp, 100, 101, 99, 100, 1, 'MNQH4')
+            """
+        ),
+        {"dataset_id": dataset_id, "timestamp": timestamp},
+    )
+
+
+def test_research_dataset_postgres_seal_guards(fresh_pg_db: str) -> None:
+    """Exercise the production PL/pgSQL immutability boundary."""
+    _upgrade(fresh_pg_db, "head")
+    engine = sa.create_engine(_target_url(fresh_pg_db))
+    dataset_id = "postgres-seal-guards"
+    try:
+        _insert_research_prerequisites(engine)
+        with engine.begin() as conn:
+            _insert_importing_research_dataset(conn, dataset_id)
+            _insert_research_candle(conn, dataset_id, 1704067200000)
+            conn.execute(
+                text(
+                    "UPDATE research_dataset "
+                    "SET lifecycle_state = 'sealed', sealed_at = NOW() "
+                    "WHERE id = :dataset_id"
+                ),
+                {"dataset_id": dataset_id},
+            )
+
+        mutations = (
+            (
+                "INSERT INTO research_candlestick "
+                "(dataset_id, timestamp, open, high, low, close, volume) "
+                "VALUES (:dataset_id, 1704067260000, 100, 101, 99, 100, 1)",
+                "sealed research dataset candles are immutable",
+            ),
+            (
+                "UPDATE research_candlestick SET close = 100.5 "
+                "WHERE dataset_id = :dataset_id",
+                "sealed research dataset candles are immutable",
+            ),
+            (
+                "DELETE FROM research_candlestick WHERE dataset_id = :dataset_id",
+                "sealed research dataset candles are immutable",
+            ),
+            (
+                "UPDATE research_dataset SET revision = 'mutated' "
+                "WHERE id = :dataset_id",
+                "sealed research dataset is immutable",
+            ),
+            (
+                "DELETE FROM research_dataset WHERE id = :dataset_id",
+                "sealed research dataset is immutable",
+            ),
+            (
+                "TRUNCATE research_candlestick",
+                "research dataset tables cannot be truncated",
+            ),
+        )
+        for statement, message in mutations:
+            with pytest.raises(DBAPIError, match=message):
+                with engine.begin() as conn:
+                    conn.execute(text(statement), {"dataset_id": dataset_id})
+
+        with pytest.raises(
+            DBAPIError,
+            match="must be created in importing state",
+        ):
+            with engine.begin() as conn:
+                conn.execute(
+                    text(
+                        """
+                        INSERT INTO research_dataset (
+                            id, product_id, timeframe, source, revision,
+                            timestamp_format, checksum_sha256, roll_policy,
+                            start_time, end_time, row_count, quality_status,
+                            lifecycle_state, sealed_at, metadata_json
+                        )
+                        VALUES (
+                            'direct-sealed', 'RITHMIC:MNQ-CONTINUOUS', '1m',
+                            'rithmic-history', '2026-07-25',
+                            'epoch_milliseconds', :checksum,
+                            'vendor-front-month', 1704067200000, 1704067200000,
+                            1, 'validated', 'sealed', NOW(), '{}'
+                        )
+                        """
+                    ),
+                    {"checksum": "0" * 64},
+                )
+
+        with engine.connect() as conn:
+            state = conn.execute(
+                text(
+                    "SELECT lifecycle_state, COUNT(c.timestamp) "
+                    "FROM research_dataset d "
+                    "JOIN research_candlestick c ON c.dataset_id = d.id "
+                    "WHERE d.id = :dataset_id "
+                    "GROUP BY lifecycle_state"
+                ),
+                {"dataset_id": dataset_id},
+            ).one()
+        assert state == ("sealed", 1)
+    finally:
+        engine.dispose()
+
+
+def test_research_dataset_postgres_rejects_invalid_seal_summary(
+    fresh_pg_db: str,
+) -> None:
+    _upgrade(fresh_pg_db, "head")
+    engine = sa.create_engine(_target_url(fresh_pg_db))
+    try:
+        _insert_research_prerequisites(engine)
+        with engine.begin() as conn:
+            _insert_importing_research_dataset(conn, "invalid-seal-summary")
+
+        with pytest.raises(
+            DBAPIError,
+            match="seal summary does not match candles",
+        ):
+            with engine.begin() as conn:
+                conn.execute(
+                    text(
+                        "UPDATE research_dataset "
+                        "SET lifecycle_state = 'sealed', sealed_at = NOW() "
+                        "WHERE id = 'invalid-seal-summary'"
+                    )
+                )
+    finally:
+        engine.dispose()
+
+
+def test_research_dataset_concurrent_import_has_one_winner(
+    fresh_pg_db: str,
+    tmp_path,
+) -> None:
+    """Two importers racing the same ID converge on one sealed dataset."""
+    from sqlalchemy.orm import Session, sessionmaker
+
+    from src.core.orm_models import ResearchDataset
+    from src.core.research_datasets import (
+        ResearchDatasetImporter,
+        ResearchDatasetSpec,
+    )
+
+    _upgrade(fresh_pg_db, "head")
+    engine = sa.create_engine(_target_url(fresh_pg_db))
+    _insert_research_prerequisites(engine)
+    dataset_id = "postgres-concurrent-import"
+    rendezvous = Barrier(2)
+
+    class ConcurrentImportSession(Session):
+        def get(self, entity, ident, **kwargs):
+            result = super().get(entity, ident, **kwargs)
+            if (
+                entity is ResearchDataset
+                and ident == dataset_id
+                and result is None
+            ):
+                rendezvous.wait(timeout=10)
+            return result
+
+    factory = sessionmaker(bind=engine, class_=ConcurrentImportSession)
+    csv_path = tmp_path / "concurrent.csv"
+    csv_path.write_text(
+        "timestamp,open,high,low,close,volume,source_contract\n"
+        "1704067200000,100,101,99,100,1,MNQH4\n",
+        encoding="utf-8",
+    )
+    spec = ResearchDatasetSpec(
+        dataset_id=dataset_id,
+        product_id="RITHMIC:MNQ-CONTINUOUS",
+        timeframe="1m",
+        source="rithmic-history",
+        revision="2026-07-25",
+        roll_policy="vendor-front-month",
+    )
+
+    def run_import():
+        return ResearchDatasetImporter(session_factory=factory).import_csv(
+            csv_path,
+            spec,
+        )
+
+    try:
+        with ThreadPoolExecutor(max_workers=2) as executor:
+            results = list(executor.map(lambda _index: run_import(), range(2)))
+
+        assert sorted(result.already_present for result in results) == [False, True]
+        with engine.connect() as conn:
+            assert conn.execute(
+                text(
+                    "SELECT lifecycle_state, row_count "
+                    "FROM research_dataset WHERE id = :dataset_id"
+                ),
+                {"dataset_id": dataset_id},
+            ).one() == ("sealed", 1)
+            assert conn.execute(
+                text(
+                    "SELECT COUNT(*) FROM research_candlestick "
+                    "WHERE dataset_id = :dataset_id"
+                ),
+                {"dataset_id": dataset_id},
+            ).scalar_one() == 1
+    finally:
+        engine.dispose()
+
+
+def test_research_dataset_downgrade_removes_guard_objects(
+    fresh_pg_db: str,
+) -> None:
+    _upgrade(fresh_pg_db, "head")
+    engine = sa.create_engine(_target_url(fresh_pg_db))
+    try:
+        with engine.connect() as conn:
+            assert conn.execute(
+                text(
+                    "SELECT COUNT(*) FROM pg_proc "
+                    "WHERE proname IN ("
+                    "'reject_sealed_research_dataset_mutation', "
+                    "'reject_sealed_research_candlestick_mutation', "
+                    "'reject_research_table_truncate')"
+                )
+            ).scalar_one() == 3
+
+        _downgrade(fresh_pg_db, "7a3c9e1b5d2f")
+
+        with engine.connect() as conn:
+            assert conn.execute(
+                text(
+                    "SELECT COUNT(*) FROM pg_proc "
+                    "WHERE proname IN ("
+                    "'reject_sealed_research_dataset_mutation', "
+                    "'reject_sealed_research_candlestick_mutation', "
+                    "'reject_research_table_truncate')"
+                )
+            ).scalar_one() == 0
+        assert "research_dataset" not in _table_names(engine)
+        assert "research_candlestick" not in _table_names(engine)
+    finally:
+        engine.dispose()

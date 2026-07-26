@@ -20,6 +20,7 @@ from src.core.product_registry import (
     calculate_required_capital,
     calculate_notional_exposure,
     instrument_spec_from_product,
+    is_research_only_product_id,
     validate_product_id,
     quantize_order_values,
 )
@@ -174,6 +175,7 @@ def test_rithmic_symbol_mapping_rejects_other_venues():
         "BINANCE:BTCUSDT-PERP",
         "BACKPACK:SOL_USDC-PERP",
         "RITHMIC:MNQ-202509",
+        "RITHMIC:MNQ-CONTINUOUS",
         "CME:ES-202512",
     ],
 )
@@ -206,6 +208,17 @@ def test_dated_future_registry_lookup_preserves_canonical_identity():
     assert spec.symbol == "MNQ-202509"
     assert spec.base == "MNQ"
     assert spec.quote == "USD"
+
+
+def test_continuous_future_is_research_only_and_not_executable():
+    product_id = "RITHMIC:MNQ-CONTINUOUS"
+
+    assert is_research_only_product_id(product_id) is True
+    assert to_base_quote(product_id) == ("MNQ", "USD")
+    with pytest.raises(ValueError, match="Instrument symbol mapping is unavailable"):
+        instrument_spec_from_product(product_id)
+    with pytest.raises(ValueError, match="Rithmic symbol mapping is unavailable"):
+        to_rithmic_symbol(product_id)
 
 
 @pytest.mark.parametrize(
@@ -435,6 +448,10 @@ class TestToStreamKey:
             to_stream_key("RITHMIC:MNQ-202509", "1m")
             == "stream:market:rithmic:mnq-202509:1m"
         )
+
+    def test_continuous_future_has_no_live_stream(self):
+        with pytest.raises(ValueError, match="live stream mapping is unavailable"):
+            to_stream_key("RITHMIC:MNQ-CONTINUOUS", "1m")
 
 
 class TestResolveExchange:

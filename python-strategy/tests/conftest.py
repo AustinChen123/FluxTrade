@@ -7,6 +7,9 @@ comprehensive testing without external dependencies (Redis, PostgreSQL, Exchange
 
 import os
 
+# Tests must never inherit a shell configured for the live namespace.
+os.environ["FLUXTRADE_ENVIRONMENT"] = "test"
+
 import pytest
 import uuid
 import time
@@ -15,11 +18,24 @@ from decimal import Decimal
 from typing import Optional, Dict, List
 from unittest.mock import MagicMock
 
+from sqlalchemy import create_engine, event
+from sqlalchemy.dialects.postgresql import JSONB
+from sqlalchemy.ext.compiler import compiles
+from sqlalchemy.orm import sessionmaker
+
 # Models
 from src.core.models import (
     Signal, SignalType, Candlestick, Position, PositionSide, Trade
 )
-from src.core.orm_models import Order, Trade as ORMTrade, Position as ORMPosition
+from src.core.orm_models import (
+    Base,
+    Exchange,
+    Order,
+    Position as ORMPosition,
+    Product,
+    Strategy,
+    Trade as ORMTrade,
+)
 
 # Interfaces
 from src.core.interfaces import IOrderRepository, IExchangeAdapter
@@ -30,7 +46,9 @@ from src.core.risk_manager import AccountService
 from src.core.clock import Clock
 
 
-os.environ.setdefault("FLUXTRADE_ENVIRONMENT", "live")
+@compiles(JSONB, "sqlite")
+def _compile_jsonb_as_json(_type, _compiler, **_kwargs):
+    return "JSON"
 
 
 # =============================================================================
@@ -41,6 +59,36 @@ DEFAULT_PRODUCT_ID = "BINANCE:BTCUSDT-PERP"
 DEFAULT_STRATEGY_ID = "test_strategy"
 DEFAULT_TIMEFRAME = "1m"
 DEFAULT_BALANCE = Decimal("100000")
+
+
+@pytest.fixture
+def sqlite_order_session_factory():
+    """Build a fresh relational order store without seeded product master data."""
+    engine = create_engine("sqlite://")
+
+    @event.listens_for(engine, "connect")
+    def _enable_foreign_keys(dbapi_connection, _connection_record):
+        cursor = dbapi_connection.cursor()
+        cursor.execute("PRAGMA foreign_keys=ON")
+        cursor.close()
+
+    Base.metadata.create_all(
+        engine,
+        tables=[
+            Exchange.__table__,
+            Product.__table__,
+            Strategy.__table__,
+            Order.__table__,
+            ORMTrade.__table__,
+            ORMPosition.__table__,
+        ],
+    )
+    factory = sessionmaker(bind=engine)
+    with factory() as session:
+        session.add(Strategy(id=DEFAULT_STRATEGY_ID, name="Test Strategy"))
+        session.commit()
+    yield factory
+    engine.dispose()
 
 
 # =============================================================================
@@ -654,7 +702,7 @@ def sample_order():
     """Provides a sample Order."""
     return Order(
         id=str(uuid.uuid4()),
-        exchange_order_id="",
+        exchange_order_id=None,
         strategy_id=DEFAULT_STRATEGY_ID,
         product_id=DEFAULT_PRODUCT_ID,
         exchange_id="BINANCE",
@@ -674,7 +722,7 @@ def order_factory():
     """Factory to create Orders with custom parameters."""
     def _create(
         order_id: str = None,
-        exchange_order_id: str = "",
+        exchange_order_id: Optional[str] = None,
         strategy_id: str = DEFAULT_STRATEGY_ID,
         product_id: str = DEFAULT_PRODUCT_ID,
         exchange_id: str = "BINANCE",

@@ -6,6 +6,7 @@ from sqlalchemy.orm import Session
 from src.core.interfaces import IOrderRepository
 from src.core.orm_models import Order, Trade, Position, BacktestTradeLog
 from src.core.models import OrderSide
+from src.core.product_master import ensure_product_registered
 
 class LiveOrderRepository(IOrderRepository):
     def __init__(
@@ -17,6 +18,7 @@ class LiveOrderRepository(IOrderRepository):
 
     def add_order(self, order: Order) -> None:
         with self._db_session_factory() as db:
+            ensure_product_registered(db, str(order.product_id))
             db.add(order)
             db.commit()
             db.refresh(order)
@@ -25,6 +27,7 @@ class LiveOrderRepository(IOrderRepository):
         with self._db_session_factory() as db:
             db.add(order)
             db.commit()
+            db.refresh(order)
 
     def get_order(self, order_id: str) -> Optional[Order]:
         with self._db_session_factory() as db:
@@ -69,6 +72,7 @@ class LiveOrderRepository(IOrderRepository):
 
     def add_trade(self, trade: Trade) -> None:
         with self._db_session_factory() as db:
+            ensure_product_registered(db, str(trade.product_id))
             db.add(trade)
             db.commit()
 
@@ -83,6 +87,7 @@ class LiveOrderRepository(IOrderRepository):
     def update_position(self, strategy_id: str, product_id: str, side: OrderSide, fill_quantity: Decimal, fill_price: Decimal, position_side: str) -> None:
         # Use with_for_update for locking
         with self._db_session_factory() as db:
+            ensure_product_registered(db, product_id)
             position = db.query(Position).with_for_update().filter_by(
                 strategy_id=strategy_id,
                 product_id=product_id,
@@ -124,6 +129,7 @@ class LiveOrderRepository(IOrderRepository):
         with self._db_session_factory() as db:
             db.add(order)
             db.commit()
+            db.refresh(order)
 
 
 class BacktestOrderRepository(IOrderRepository):

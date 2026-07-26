@@ -54,6 +54,7 @@ from src.core.strategy_registry import StrategyRegistry
 from src.core.strategy_state_manager import StrategyStateManager
 from src.core.audit_service import build_signal_audit, commit_signal_audit
 from src.core.runtime_environment import RuntimeEnvironment
+from src.core.product_registry import to_stream_key
 
 HOT_STRATEGIES_PATH = os.getenv('HOT_STRATEGIES_PATH', '/app/strategies_hot')
 _DEFAULT_RUNTIME_ENVIRONMENT = RuntimeEnvironment("live")
@@ -1684,12 +1685,12 @@ class StrategyEngine:
         """Derive Redis stream keys from registered strategy requirements."""
         channels = set()
         for strat in self._registry.list_active():
-            product_id = strat.product_id
-            parts = product_id.split(":")
-            exchange = parts[0].lower()
-            symbol = parts[1].replace("-PERP", "").lower()
-            tf = strat.requirements.timeframe
-            channels.add(f"stream:market:{exchange}:{symbol}:{tf}")
+            channels.add(
+                to_stream_key(
+                    strat.product_id,
+                    strat.requirements.timeframe,
+                )
+            )
         return sorted(channels)
 
     def on_market_data(self, data: Union[Candlestick, Trade]):
