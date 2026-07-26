@@ -13,6 +13,7 @@ MAX_CANONICAL_LENGTH = 128
 MAX_BINANCE_LENGTH = 36
 
 _COMPONENT_RE = re.compile(r"^[A-Za-z0-9_.:]+$")
+_STRATEGY_COMPONENT_RE = re.compile(r"^[A-Za-z0-9_.:-]+$")
 _EXCHANGE_CHARS_RE = re.compile(r"[^A-Za-z0-9_-]")
 _last_ts_ns = 0
 _lock = threading.Lock()
@@ -43,6 +44,32 @@ def generate_client_order_id(
     if len(coid) > MAX_CANONICAL_LENGTH:
         raise ValueError("client_order_id exceeds 128 characters")
     return coid
+
+
+def market_signal_client_order_id(
+    strategy_id: str,
+    product_id: str,
+    event_scope: str,
+    event_timestamp: int,
+    action: str,
+    ordinal: int,
+) -> str:
+    """Return a replay-stable ID for one signal emitted by a market event."""
+    _validate_component("strategy_id", strategy_id)
+    _validate_component("action", action)
+    if ordinal < 0:
+        raise ValueError("ordinal must be non-negative")
+    identity = (
+        f"{product_id}\0{event_scope}\0{event_timestamp}\0"
+        f"{strategy_id}\0{action}\0{ordinal}"
+    )
+    digest = hashlib.blake2b(identity.encode(), digest_size=8).digest()
+    stable_number = int.from_bytes(digest, "big")
+    client_order_id = (
+        f"{strategy_id}-market-{action}_{ordinal}-{stable_number}"
+    )
+    parse_client_order_id(client_order_id)
+    return client_order_id
 
 
 def parse_client_order_id(client_order_id: str) -> ClientOrderIdParts:
@@ -104,9 +131,10 @@ def to_exchange_format(client_order_id: str, exchange: str) -> str:
 def _validate_component(name: str, value: str) -> None:
     if not isinstance(value, str) or not value:
         raise ValueError(f"{name} must be a non-empty string")
-    if "-" in value:
+    if name != "strategy_id" and "-" in value:
         raise ValueError(f"{name} cannot contain '-'")
-    if not _COMPONENT_RE.match(value):
+    pattern = _STRATEGY_COMPONENT_RE if name == "strategy_id" else _COMPONENT_RE
+    if not pattern.match(value):
         raise ValueError(f"{name} contains unsupported characters")
 
 

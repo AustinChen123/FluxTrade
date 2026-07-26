@@ -262,6 +262,7 @@ def main():
         channels=channels,
         on_message_callback=engine.on_market_data,
         channel_provider=engine.build_stream_channels,
+        runtime_environment=engine.runtime_environment,
     )
 
     # 3. Signal handlers for graceful shutdown

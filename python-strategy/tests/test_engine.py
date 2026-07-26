@@ -14,6 +14,7 @@ Covers:
 from contextlib import nullcontext
 from decimal import Decimal
 import json
+import threading
 from types import SimpleNamespace
 from unittest.mock import MagicMock, call, patch
 
@@ -27,6 +28,7 @@ from src.core.models import (
     Signal,
     SignalType,
     StrategyStatus,
+    Trade,
 )
 from src.core.orm_models import Candlestick as ORMCandlestick, StrategyState
 from src.core.daily_nav_snapshot import DailyNavSnapshotService
@@ -84,6 +86,32 @@ def _make_candle(
         close=close,
         volume=Decimal("500"),
     )
+
+
+def _authoritative_rithmic_summary(
+    *,
+    account_id="ACCOUNT",
+    balance="50000.25",
+):
+    return {
+        "recoverable_count": 0,
+        "auto_resume_safe": True,
+        "ledger_verification": {
+            "account_id": account_id,
+            "account_currency": "USD",
+            "account_summary": {
+                "account_balance": balance,
+                "cash_on_hand": balance,
+                "available_buying_power": balance,
+                "day_pnl": "0",
+                "net_quantity": "0",
+                "timestamp_ms": 1704067200000,
+            },
+            "position_drifts": [],
+            "errors": [],
+            "verification_blocked": False,
+        },
+    }
 
 
 # =============================================================================
@@ -585,14 +613,37 @@ class TestOnMarketData:
 
         engine.process_signal.assert_not_called()
 
-    def test_strategy_exception_logged_not_raised(self, engine, strategy_instance):
-        """Exception in strategy.on_candle should be caught, not propagate."""
+    def test_strategy_exception_propagates_to_market_delivery_gate(
+        self,
+        engine,
+        strategy_instance,
+    ):
+        """A failed strategy must prevent the market delivery from being ACKed."""
         engine.add_strategy(strategy_instance)
         strategy_instance.on_candle = MagicMock(side_effect=RuntimeError("boom"))
 
         candle = _make_candle()
-        # Should not raise
-        engine.on_market_data(candle)
+        with pytest.raises(RuntimeError, match="boom"):
+            engine.on_market_data(candle)
+
+    def test_trade_strategy_exception_propagates_to_market_delivery_gate(
+        self,
+        engine,
+        strategy_instance,
+    ):
+        engine.add_strategy(strategy_instance)
+        strategy_instance.on_trade = MagicMock(side_effect=RuntimeError("boom"))
+        trade = Trade(
+            id="trade-1",
+            product_id="BINANCE:BTCUSDT-PERP",
+            price=Decimal("42000"),
+            quantity=Decimal("1"),
+            side="buy",
+            timestamp=1704067200000,
+        )
+
+        with pytest.raises(RuntimeError, match="boom"):
+            engine.on_market_data(trade)
 
     def test_no_strategies_for_product(self, engine):
         """Candle for unregistered product should not error."""
@@ -2201,9 +2252,215 @@ class TestRuntimeReconciliationThread:
         engine.runtime_reconciliation_job.run_once.assert_called_once()
         engine._runtime_reconcile_stop.wait.assert_called_once_with(3600.0)
 
+    def test_rithmic_runtime_reconciliation_waits_before_first_session_restart(
+        self,
+        engine,
+    ):
+        engine.execution_engine.adapter = _rithmic_adapter_for_reconnect_test()
+        engine._runtime_reconcile_interval = 300.0
+        engine._runtime_reconcile_stop = MagicMock()
+        engine._runtime_reconcile_stop.is_set.return_value = False
+        events = []
+        wait_count = 0
+
+        def wait_for_interval(interval):
+            nonlocal wait_count
+            wait_count += 1
+            events.append(("wait", interval))
+            return wait_count == 2
+
+        engine._runtime_reconcile_stop.wait.side_effect = wait_for_interval
+        engine._run_rithmic_runtime_reconciliation_once = MagicMock(
+            side_effect=lambda: events.append(("reconcile", None))
+        )
+
+        class ImmediateThread:
+            def __init__(self, *, target, daemon):
+                self.target = target
+                self.daemon = daemon
+
+            def start(self):
+                self.target()
+
+        with patch("src.core.engine.threading.Thread", ImmediateThread):
+            engine._start_runtime_reconciliation()
+
+        assert events == [
+            ("wait", 300.0),
+            ("reconcile", None),
+            ("wait", 300.0),
+        ]
+        engine._run_rithmic_runtime_reconciliation_once.assert_called_once_with()
+
+    def test_authoritative_rithmic_summary_publishes_exact_account_balance(
+        self,
+        engine,
+    ):
+        engine._rithmic_recovery_account_id = "ACCOUNT"
+        engine.account_service.replace_authoritative_balance = MagicMock()
+        engine.execution_engine.clock.now = MagicMock(return_value=1704067201)
+
+        engine._apply_rithmic_authoritative_account_summary(
+            _authoritative_rithmic_summary()
+        )
+
+        engine.account_service.replace_authoritative_balance.assert_called_once_with(
+            venue="rithmic",
+            account_id="ACCOUNT",
+            currency="USD",
+            balance=Decimal("50000.25"),
+            day_pnl=Decimal("0"),
+            observed_at_ms=1704067201000,
+            source_timestamp_ms=1704067200000,
+        )
+
+    def test_authoritative_rithmic_summary_rejects_wrong_account(self, engine):
+        engine._rithmic_recovery_account_id = "ACCOUNT"
+        engine.account_service.replace_authoritative_balance = MagicMock()
+
+        with pytest.raises(
+            RuntimeError,
+            match="rithmic_account_summary_identity_mismatch",
+        ):
+            engine._apply_rithmic_authoritative_account_summary(
+                _authoritative_rithmic_summary(account_id="OTHER")
+            )
+
+        engine.account_service.replace_authoritative_balance.assert_not_called()
+
+    def test_periodic_rithmic_reconciliation_refreshes_then_reopens_gate(
+        self,
+        engine,
+    ):
+        adapter = _rithmic_adapter_for_reconnect_test()
+        engine.execution_engine.adapter = adapter
+        engine._rithmic_recovery_profile = "test"
+        engine._rithmic_recovery_account_id = "ACCOUNT"
+        engine.execution_engine.halt_for_reconcile = MagicMock(return_value=True)
+        summary = _authoritative_rithmic_summary()
+        engine.execution_engine.reconcile_rithmic_owned_orders = MagicMock(
+            return_value=summary
+        )
+        engine._apply_rithmic_authoritative_account_summary = MagicMock()
+        engine._start_exchange_order_event_stream = MagicMock()
+        engine.execution_engine.resume_after_reconcile = MagicMock()
+        engine._lockdown_for_rithmic_order_drift = MagicMock()
+
+        assert engine._run_rithmic_runtime_reconciliation_once() is True
+
+        engine.execution_engine.halt_for_reconcile.assert_called_once_with(
+            timeout=30.0
+        )
+        engine.execution_engine.reconcile_rithmic_owned_orders.assert_called_once_with(
+            "test",
+            "ACCOUNT",
+        )
+        engine._apply_rithmic_authoritative_account_summary.assert_called_once_with(
+            summary
+        )
+        engine._start_exchange_order_event_stream.assert_called_once_with()
+        engine.execution_engine.resume_after_reconcile.assert_called_once_with()
+        engine._lockdown_for_rithmic_order_drift.assert_not_called()
+
+    def test_periodic_rithmic_reconciliation_holds_market_delivery_until_complete(
+        self,
+        engine,
+    ):
+        adapter = _rithmic_adapter_for_reconnect_test()
+        engine.execution_engine.adapter = adapter
+        engine._rithmic_recovery_profile = "test"
+        engine._rithmic_recovery_account_id = "ACCOUNT"
+        engine.execution_engine.halt_for_reconcile = MagicMock(return_value=True)
+        engine._apply_rithmic_authoritative_account_summary = MagicMock()
+        engine._start_exchange_order_event_stream = MagicMock()
+        engine.execution_engine.resume_after_reconcile = MagicMock()
+        engine.execution_engine.process_market_data = MagicMock()
+        engine._signal_processor.on_candle = MagicMock()
+        reconcile_started = threading.Event()
+        allow_reconcile = threading.Event()
+
+        def reconcile(*_args):
+            reconcile_started.set()
+            assert allow_reconcile.wait(timeout=5.0)
+            return _authoritative_rithmic_summary()
+
+        engine.execution_engine.reconcile_rithmic_owned_orders = reconcile
+        reconcile_thread = threading.Thread(
+            target=engine._run_rithmic_runtime_reconciliation_once
+        )
+        reconcile_thread.start()
+        assert reconcile_started.wait(timeout=5.0)
+
+        market_done = threading.Event()
+
+        def process_market_data():
+            engine.on_market_data(_make_candle())
+            market_done.set()
+
+        market_thread = threading.Thread(target=process_market_data)
+        market_thread.start()
+        assert not market_done.wait(timeout=0.05)
+        engine.execution_engine.process_market_data.assert_not_called()
+        engine._signal_processor.on_candle.assert_not_called()
+
+        allow_reconcile.set()
+        reconcile_thread.join(timeout=5.0)
+        market_thread.join(timeout=5.0)
+
+        assert not reconcile_thread.is_alive()
+        assert not market_thread.is_alive()
+        assert market_done.is_set()
+        engine.execution_engine.process_market_data.assert_called_once()
+        engine._signal_processor.on_candle.assert_called_once()
+
+    @pytest.mark.parametrize(
+        ("summary", "apply_error", "expected_reason"),
+        [
+            (
+                {"recoverable_count": 1, "auto_resume_safe": False},
+                None,
+                "rithmic_runtime_reconciliation_unresolved",
+            ),
+            (
+                _authoritative_rithmic_summary(),
+                RuntimeError("bad balance"),
+                "rithmic_runtime_reconciliation_failed",
+            ),
+        ],
+    )
+    def test_periodic_rithmic_reconciliation_failure_enters_lockdown(
+        self,
+        engine,
+        summary,
+        apply_error,
+        expected_reason,
+    ):
+        adapter = _rithmic_adapter_for_reconnect_test()
+        engine.execution_engine.adapter = adapter
+        engine._rithmic_recovery_profile = "test"
+        engine._rithmic_recovery_account_id = "ACCOUNT"
+        engine.execution_engine.halt_for_reconcile = MagicMock(return_value=True)
+        engine.execution_engine.reconcile_rithmic_owned_orders = MagicMock(
+            return_value=summary
+        )
+        engine._apply_rithmic_authoritative_account_summary = MagicMock(
+            side_effect=apply_error
+        )
+        engine._start_exchange_order_event_stream = MagicMock()
+        engine.execution_engine.resume_after_reconcile = MagicMock()
+        engine._lockdown_for_rithmic_order_drift = MagicMock()
+
+        assert engine._run_rithmic_runtime_reconciliation_once() is False
+
+        engine._start_exchange_order_event_stream.assert_called_once_with()
+        engine.execution_engine.resume_after_reconcile.assert_not_called()
+        engine._lockdown_for_rithmic_order_drift.assert_called_once_with(
+            expected_reason
+        )
+
 
 class TestExchangeOrderEventThread:
-    def test_rithmic_runtime_reconciliation_waits_for_pnl_support(self):
+    def test_rithmic_runtime_reconciliation_uses_authoritative_ledger(self):
         adapter = RithmicExchangeAdapter(
             profile="test",
             account_id="ACCOUNT",
@@ -2220,7 +2477,7 @@ class TestExchangeOrderEventThread:
         assert _is_runtime_reconciliation_enabled(
             adapter,
             {"mode": "live"},
-        ) is False
+        ) is True
 
     def test_rithmic_engine_requires_owned_order_audit(
         self,
@@ -2282,6 +2539,7 @@ class TestExchangeOrderEventThread:
             "_initialize_strategy_state_cache_on_startup",
             "_start_strategy_state_subscriber_on_startup",
             "_start_heartbeat",
+            "_start_runtime_reconciliation",
             "scan_strategies",
             "_restore_active_strategies_on_startup",
         ):
@@ -2563,6 +2821,7 @@ class TestExchangeOrderEventThread:
             )
         )
         engine._start_exchange_order_event_stream = MagicMock()
+        engine._apply_rithmic_authoritative_account_summary = MagicMock()
 
         assert engine._prepare_rithmic_kill_switch_clear() == expected
 
@@ -3016,6 +3275,7 @@ def test_rithmic_strategy_exit_uses_native_exit_and_verifies_flat(
     engine.execution_engine.reconcile_rithmic_owned_orders = MagicMock(
         return_value={"auto_resume_safe": True}
     )
+    engine._apply_rithmic_authoritative_account_summary = MagicMock()
     engine._start_exchange_order_event_stream = MagicMock()
     engine.account_service.replace_positions_for_products = MagicMock()
     signal = Signal(
@@ -3112,6 +3372,7 @@ def test_rithmic_strategy_exit_cancels_protection_before_native_exit(engine):
             or {"auto_resume_safe": True}
         )
     )
+    engine._apply_rithmic_authoritative_account_summary = MagicMock()
     engine._start_exchange_order_event_stream = MagicMock()
     engine.account_service.replace_positions_for_products = MagicMock(
         side_effect=lambda *_args, **_kwargs: operation_order.append("replace")
@@ -3667,6 +3928,7 @@ def test_reconnect_triggers_owned_order_reconcile_and_gates(engine):
             else pytest.fail("ledger recovery started before ORDER runtime closed")
         )
     )
+    engine._apply_rithmic_authoritative_account_summary = MagicMock()
     engine.execution_engine.halt_for_reconcile = MagicMock(return_value=True)
     engine.execution_engine.resume_after_reconcile = MagicMock()
 
@@ -3699,6 +3961,7 @@ def test_reconnect_reconcile_failure_keeps_gate_and_retries(engine):
     engine.execution_engine.reconcile_rithmic_owned_orders = MagicMock(
         side_effect=RuntimeError("boom")
     )
+    engine._apply_rithmic_authoritative_account_summary = MagicMock()
     engine.execution_engine.halt_for_reconcile = MagicMock(return_value=True)
     engine.execution_engine.resume_after_reconcile = MagicMock()
 
@@ -3752,6 +4015,7 @@ def test_generation_read_failure_reconciles_fail_closed(engine):
     engine.execution_engine.reconcile_rithmic_owned_orders = MagicMock(
         return_value={"recoverable_count": 0, "auto_resume_safe": True}
     )
+    engine._apply_rithmic_authoritative_account_summary = MagicMock()
     engine.execution_engine.resume_after_reconcile = MagicMock()
 
     assert engine._reconcile_owned_orders_on_reconnect() is True
@@ -3781,6 +4045,7 @@ def test_reconnect_unresolved_summary_stays_closed_and_gated(engine, summary):
     engine.execution_engine.reconcile_rithmic_owned_orders = MagicMock(
         return_value=summary
     )
+    engine._apply_rithmic_authoritative_account_summary = MagicMock()
     engine.execution_engine.resume_after_reconcile = MagicMock()
 
     assert engine._reconcile_owned_orders_on_reconnect() is False
@@ -3843,6 +4108,7 @@ def test_rithmic_event_loop_reconciles_and_restarts_before_polling(engine):
             else pytest.fail("ledger recovery started before ORDER runtime closed")
         )
     )
+    engine._apply_rithmic_authoritative_account_summary = MagicMock()
 
     class ImmediateThread:
         def __init__(self, *, target, name, daemon):
@@ -3892,6 +4158,7 @@ def test_reconnect_stream_restart_failure_stays_gated_then_retries(engine):
     engine.execution_engine.reconcile_rithmic_owned_orders = MagicMock(
         return_value={"recoverable_count": 0, "auto_resume_safe": True}
     )
+    engine._apply_rithmic_authoritative_account_summary = MagicMock()
     adapter.start_order_event_stream()
 
     assert engine._reconcile_owned_orders_on_reconnect() is False

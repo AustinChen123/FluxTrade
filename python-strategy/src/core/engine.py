@@ -130,13 +130,37 @@ def _is_runtime_reconciliation_enabled(
     if isinstance(adapter, CcxtExchangeAdapter):
         return True
     if isinstance(adapter, RithmicExchangeAdapter):
-        return False
+        return True
     return bool(adapter_config and adapter_config.get("mode") == "live")
 
 
 def _runtime_reconciliation_interval_from_env() -> float:
     name = "RUNTIME_RECONCILE_INTERVAL_SECONDS"
     raw_value = os.getenv(name, "3600")
+    try:
+        interval = float(raw_value)
+    except ValueError as exc:
+        raise ValueError(f"{name} must be a finite number greater than zero") from exc
+    if not math.isfinite(interval) or interval <= 0:
+        raise ValueError(f"{name} must be a finite number greater than zero")
+    return interval
+
+
+def _rithmic_account_snapshot_max_age_from_env() -> float:
+    name = "RITHMIC_ACCOUNT_SNAPSHOT_MAX_AGE_SECONDS"
+    raw_value = os.getenv(name, "600")
+    try:
+        max_age = float(raw_value)
+    except ValueError as exc:
+        raise ValueError(f"{name} must be a finite number greater than zero") from exc
+    if not math.isfinite(max_age) or max_age <= 0:
+        raise ValueError(f"{name} must be a finite number greater than zero")
+    return max_age
+
+
+def _rithmic_runtime_reconciliation_interval_from_env() -> float:
+    name = "RITHMIC_RUNTIME_RECONCILE_INTERVAL_SECONDS"
+    raw_value = os.getenv(name, "300")
     try:
         interval = float(raw_value)
     except ValueError as exc:
@@ -182,6 +206,7 @@ class StrategyEngine:
         self.loaded_classes: Dict[str, Type[BaseStrategy]] = {}
         self._strategy_lock = threading.Lock()
         self._ops_command_lock = threading.Lock()
+        self._market_processing_lock = threading.Lock()
         self._boot_id = uuid.uuid4().hex
         self._boot_started = False
         self.runtime_environment = RuntimeEnvironment.from_env()
@@ -243,6 +268,12 @@ class StrategyEngine:
             self._rithmic_recovery_account_id = (
                 self._rithmic_recovery_account_id or adapter.account_id
             )
+            self.account_service.configure_authoritative_balance(
+                venue="rithmic",
+                account_id=self._rithmic_recovery_account_id,
+                max_age_seconds=_rithmic_account_snapshot_max_age_from_env(),
+                runtime_environment=self.runtime_environment,
+            )
         self.risk_manager.instrument_spec_resolver = getattr(
             adapter,
             "get_instrument_spec",
@@ -253,7 +284,11 @@ class StrategyEngine:
             adapter_config,
         )
         self._runtime_reconcile_interval = (
-            _runtime_reconciliation_interval_from_env()
+            (
+                _rithmic_runtime_reconciliation_interval_from_env()
+                if isinstance(adapter, RithmicExchangeAdapter)
+                else _runtime_reconciliation_interval_from_env()
+            )
             if self._runtime_reconciliation_enabled
             else None
         )
@@ -580,6 +615,14 @@ class StrategyEngine:
                 "Rithmic clear reconciliation is unresolved; lockdown remains active"
             )
             return False, None
+        try:
+            self._apply_rithmic_authoritative_account_summary(summary)
+        except Exception:
+            logger.exception(
+                "Rithmic clear account reconciliation failed; lockdown remains active"
+            )
+            self.execution_engine.resume_after_reconcile()
+            return False, None
         return True, drift_generation
 
     def _run_ops_kill_switch(
@@ -820,11 +863,69 @@ class StrategyEngine:
                 "verification_blocked_count": 1,
                 "auto_resume_safe": False,
             }
+        if self._rithmic_recovery_profile:
+            try:
+                self._apply_rithmic_authoritative_account_summary(summary)
+            except Exception:
+                logger.exception(
+                    "Startup authoritative account reconciliation failed"
+                )
+                return {
+                    **summary,
+                    "auto_resume_safe": False,
+                    "account_context_error": True,
+                }
         logger.info(
             "Startup order reconciliation complete: %s recoverable orders",
             summary["recoverable_count"],
         )
         return summary
+
+    def _apply_rithmic_authoritative_account_summary(self, summary: dict) -> None:
+        """Publish an exact-account balance only after ledger verification passes."""
+        if summary.get("auto_resume_safe") is not True:
+            raise RuntimeError("rithmic_account_summary_not_authoritative")
+        ledger = summary.get("ledger_verification")
+        if not isinstance(ledger, dict) or ledger.get("verification_blocked"):
+            raise RuntimeError("rithmic_account_ledger_verification_blocked")
+        account_id = ledger.get("account_id")
+        if account_id != self._rithmic_recovery_account_id:
+            raise RuntimeError("rithmic_account_summary_identity_mismatch")
+        currency = ledger.get("account_currency")
+        account_summary = ledger.get("account_summary")
+        if not isinstance(account_summary, dict):
+            raise RuntimeError("rithmic_account_summary_missing")
+        raw_balance = account_summary.get("account_balance")
+        if raw_balance is None:
+            raise RuntimeError("rithmic_account_balance_missing")
+        raw_day_pnl = account_summary.get("day_pnl")
+        if raw_day_pnl is None:
+            raise RuntimeError("rithmic_account_day_pnl_missing")
+        try:
+            balance = Decimal(str(raw_balance))
+            day_pnl = Decimal(str(raw_day_pnl))
+        except ArithmeticError as exc:
+            raise RuntimeError("rithmic_account_balance_invalid") from exc
+        if not balance.is_finite() or not day_pnl.is_finite():
+            raise RuntimeError("rithmic_account_balance_invalid")
+        raw_source_timestamp = account_summary.get("timestamp_ms")
+        try:
+            source_timestamp_ms = (
+                int(raw_source_timestamp)
+                if raw_source_timestamp is not None
+                else None
+            )
+        except (TypeError, ValueError) as exc:
+            raise RuntimeError("rithmic_account_timestamp_invalid") from exc
+        self.account_service.replace_authoritative_balance(
+            venue="rithmic",
+            account_id=account_id,
+            currency=str(currency or ""),
+            balance=balance,
+            day_pnl=day_pnl,
+            observed_at_ms=int(self.execution_engine.clock.now() * 1000),
+            source_timestamp_ms=source_timestamp_ms,
+        )
 
     def _reconcile_owned_orders_on_reconnect(self) -> bool:
         """Reconcile owned orders whenever the order session reconnects.
@@ -895,6 +996,14 @@ class StrategyEngine:
         if summary.get("auto_resume_safe") is not True:
             logger.error(
                 "Reconnect order reconciliation is unresolved; submissions remain gated"
+            )
+            return False
+        try:
+            self._apply_rithmic_authoritative_account_summary(summary)
+        except Exception:
+            logger.exception(
+                "Reconnect authoritative account reconciliation failed; "
+                "submissions remain gated"
             )
             return False
         try:
@@ -1471,6 +1580,10 @@ class StrategyEngine:
         Startup Reconciliation
         Force overwrite Redis balance from actual Exchange API.
         """
+        if isinstance(self.execution_engine.adapter, RithmicExchangeAdapter):
+            # Rithmic balance is published only from the verified ledger
+            # reconciliation later in startup.
+            return
         logger.info("💰 Reconciling Balance...")
         try:
             balance = self.account_service.get_balance()
@@ -1637,9 +1750,21 @@ class StrategyEngine:
 
         def reconcile_loop():
             logger.info("Runtime reconciliation service started.")
+            is_rithmic = isinstance(
+                self.execution_engine.adapter,
+                RithmicExchangeAdapter,
+            )
+            # Rithmic startup already completed an authoritative ledger
+            # reconciliation. Avoid immediately tearing down and recreating
+            # the freshly started ORDER session.
+            if is_rithmic and self._runtime_reconcile_stop.wait(interval):
+                return
             while self.running and not self._runtime_reconcile_stop.is_set():
                 try:
-                    self.runtime_reconciliation_job.run_once()
+                    if is_rithmic:
+                        self._run_rithmic_runtime_reconciliation_once()
+                    else:
+                        self.runtime_reconciliation_job.run_once()
                 except Exception as e:
                     logger.error("Runtime reconciliation loop failed: %s", e)
                 if self._runtime_reconcile_stop.wait(interval):
@@ -1650,6 +1775,65 @@ class StrategyEngine:
             daemon=True,
         )
         self.runtime_reconcile_thread.start()
+
+    def _run_rithmic_runtime_reconciliation_once(self) -> bool:
+        """Refresh exact-account state while market processing and submissions wait."""
+        adapter = self.execution_engine.adapter
+        if not isinstance(adapter, RithmicExchangeAdapter):
+            raise RuntimeError("rithmic_runtime_reconciliation_adapter_mismatch")
+
+        with self._ops_command_lock, self._market_processing_lock:
+            if not self.execution_engine.halt_for_reconcile(timeout=30.0):
+                self._lockdown_for_rithmic_order_drift(
+                    "rithmic_runtime_reconciliation_drain_timeout"
+                )
+                return False
+
+            self._order_event_stop.set()
+            thread = self.order_event_thread
+            if thread is not None and thread.is_alive():
+                thread.join(timeout=30.0)
+                if thread.is_alive():
+                    self._lockdown_for_rithmic_order_drift(
+                        "rithmic_runtime_reconciliation_stream_stop_timeout"
+                    )
+                    return False
+
+            summary = None
+            failure_reason = None
+            adapter.close()
+            try:
+                summary = self.execution_engine.reconcile_rithmic_owned_orders(
+                    self._rithmic_recovery_profile,
+                    self._rithmic_recovery_account_id,
+                )
+                if summary.get("auto_resume_safe") is not True:
+                    failure_reason = "rithmic_runtime_reconciliation_unresolved"
+                else:
+                    self._apply_rithmic_authoritative_account_summary(summary)
+            except Exception:
+                logger.exception("Periodic Rithmic ledger reconciliation failed")
+                failure_reason = "rithmic_runtime_reconciliation_failed"
+
+            try:
+                self._start_exchange_order_event_stream()
+            except Exception:
+                logger.exception(
+                    "Order stream restart failed after periodic Rithmic reconciliation"
+                )
+                adapter.close()
+                failure_reason = "rithmic_runtime_reconciliation_stream_restart_failed"
+
+            if failure_reason is not None:
+                self._lockdown_for_rithmic_order_drift(failure_reason)
+                return False
+
+            self.execution_engine.resume_after_reconcile()
+            logger.info(
+                "Periodic Rithmic reconciliation complete: %s recoverable orders",
+                summary["recoverable_count"],
+            )
+            return True
 
     def _record_strategy_heartbeats(self, strategy_ids: list[str]) -> None:
         """Record strategy heartbeat state in HealthMonitor and DB."""
@@ -1697,13 +1881,14 @@ class StrategyEngine:
         """
         Callback triggered by DataConsumer when new market data arrives.
         """
-        if isinstance(data, Candlestick):
-            # Simulation/Backtest: check fills before strategy signals can create new orders.
-            self.execution_engine.process_market_data(data)
-            self._signal_processor.on_candle(data)
-            return
-        if isinstance(data, Trade):
-            self._signal_processor.on_trade(data)
+        with self._market_processing_lock:
+            if isinstance(data, Candlestick):
+                # Simulation/Backtest: check fills before strategy signals can create new orders.
+                self.execution_engine.process_market_data(data)
+                self._signal_processor.on_candle(data)
+                return
+            if isinstance(data, Trade):
+                self._signal_processor.on_trade(data)
 
     def process_signal(self, signal: Signal, candle: Optional[Candlestick]):
         """

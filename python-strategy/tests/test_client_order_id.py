@@ -4,6 +4,7 @@ from src.core.client_order_id import (
     MAX_BINANCE_LENGTH,
     generate_client_order_id,
     is_valid_client_order_id,
+    market_signal_client_order_id,
     parse_client_order_id,
     to_exchange_format,
 )
@@ -27,6 +28,17 @@ def test_generate_client_order_id_uses_canonical_format() -> None:
     assert parse_client_order_id(coid).ts_ns >= 1704067200000000000
 
 
+def test_strategy_id_may_contain_hyphens_without_ambiguous_parsing() -> None:
+    coid = generate_client_order_id(
+        "always-long",
+        "worker_a",
+        "entry",
+        clock_ns=lambda: 1704067200000000000,
+    )
+
+    assert parse_client_order_id(coid).strategy_id == "always-long"
+
+
 def test_generate_client_order_id_is_unique_for_repeated_clock_values() -> None:
     coids = {
         generate_client_order_id(
@@ -40,6 +52,24 @@ def test_generate_client_order_id_is_unique_for_repeated_clock_values() -> None:
 
     assert len(coids) == 100
     assert len({parse_client_order_id(coid).ts_ns for coid in coids}) == 100
+
+
+def test_market_signal_client_order_id_is_replay_stable_and_ordinal_scoped() -> None:
+    args = (
+        "strategy_1",
+        "RITHMIC:MNQ-202609",
+        "1m",
+        1704067200000,
+        "long",
+    )
+
+    first = market_signal_client_order_id(*args, 0)
+    replay = market_signal_client_order_id(*args, 0)
+    second_signal = market_signal_client_order_id(*args, 1)
+
+    assert first == replay
+    assert first != second_signal
+    assert is_valid_client_order_id(first)
 
 
 @pytest.mark.parametrize(

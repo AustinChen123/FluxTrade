@@ -5,7 +5,12 @@ from unittest.mock import MagicMock, patch
 import pytest
 import redis
 
-from src.core.consumer import DataConsumer, INITIAL_BACKOFF, MAX_BACKOFF
+from src.core.consumer import (
+    DataConsumer,
+    INITIAL_BACKOFF,
+    MAX_BACKOFF,
+    MarketStreamPendingError,
+)
 
 
 @pytest.fixture
@@ -184,3 +189,21 @@ class TestReconnectionBackoff:
 
         with pytest.raises(RuntimeError, match="unexpected"):
             consumer.start()
+
+    def test_ambiguous_delivery_backpressures_without_process_exit(self, consumer):
+        calls = 0
+
+        def block_then_stop():
+            nonlocal calls
+            calls += 1
+            if calls == 1:
+                raise MarketStreamPendingError("callback outcome unknown")
+            consumer.running = False
+
+        consumer._consume_loop = MagicMock(side_effect=block_then_stop)
+
+        with patch("src.core.consumer.time.sleep") as sleep:
+            consumer.start()
+
+        sleep.assert_called_once_with(INITIAL_BACKOFF)
+        assert consumer._consume_loop.call_count == 2

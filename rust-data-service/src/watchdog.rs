@@ -6,19 +6,56 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::time::sleep;
 use tracing::{error, info, warn};
 
+pub(crate) enum EmergencyMitigation {
+    LockdownOnly,
+    Backpack(BackpackConnector),
+    #[cfg(feature = "rithmic")]
+    Rithmic {
+        profile: String,
+        account_id: String,
+    },
+}
+
+impl EmergencyMitigation {
+    async fn run(&self) -> anyhow::Result<()> {
+        match self {
+            Self::LockdownOnly => Ok(()),
+            Self::Backpack(connector) => connector.cancel_all_orders().await,
+            #[cfg(feature = "rithmic")]
+            Self::Rithmic {
+                profile,
+                account_id,
+            } => {
+                let result =
+                    crate::connector::rithmic::emergency::mitigate(profile, account_id).await?;
+                info!(
+                    cancelled_orders = result.cancelled_orders,
+                    exited_positions = result.exited_positions,
+                    "Rithmic emergency mitigation verified flat"
+                );
+                Ok(())
+            }
+        }
+    }
+}
+
 pub struct Watchdog {
     redis_client: redis::Client,
-    backpack: BackpackConnector,
+    mitigation: EmergencyMitigation,
     missing_count: u32,
     environment: RuntimeEnvironment,
 }
 
 impl Watchdog {
-    pub fn new(redis_url: &str, environment: RuntimeEnvironment) -> anyhow::Result<Self> {
+    pub(crate) fn new(
+        redis_url: &str,
+        environment: RuntimeEnvironment,
+        mitigation: EmergencyMitigation,
+    ) -> anyhow::Result<Self> {
         let redis_client = redis::Client::open(redis_url)?;
         Ok(Self {
             redis_client,
-            backpack: BackpackConnector::new(),
+            mitigation,
             missing_count: 0,
             environment,
         })
@@ -96,8 +133,8 @@ impl Watchdog {
                 // This is the most critical part
                 let kill_result = if self.environment.allows_external_kill() {
                     let result = self
-                        .backpack
-                        .cancel_all_orders()
+                        .mitigation
+                        .run()
                         .await
                         .context("Watchdog failed to execute external kill switch");
                     if result.is_ok() {
@@ -157,7 +194,12 @@ mod tests {
             .await
             .unwrap();
 
-        let watchdog = Watchdog::new(&redis_url, test_environment).unwrap();
+        let watchdog = Watchdog::new(
+            &redis_url,
+            test_environment,
+            EmergencyMitigation::LockdownOnly,
+        )
+        .unwrap();
         let task = tokio::spawn(watchdog.run());
         timeout(Duration::from_secs(3), async {
             loop {
