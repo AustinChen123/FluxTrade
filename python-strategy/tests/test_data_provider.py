@@ -159,8 +159,8 @@ class TestBackfillCommand:
 
         assert "BTCUSDT" in cmd
 
-    def test_command_format_docker_exec(self):
-        """Backfill command should be a docker exec command."""
+    def test_command_targets_compose_service(self):
+        """Backfill command should target the stable Compose service."""
         mock_db = MagicMock()
         mock_db.execute.return_value.scalar.return_value = 0
 
@@ -168,7 +168,9 @@ class TestBackfillCommand:
             mock_db, "BINANCE:BTCUSDT-PERP", "1m", lookback=100
         )
 
-        assert cmd.startswith("docker exec fluxtrade-rust")
+        assert cmd.startswith(
+            "docker compose -f docker-compose.prod.yml exec rust-data"
+        )
         assert "backfill" in cmd
         assert "--exchange" in cmd
         assert "--symbol" in cmd

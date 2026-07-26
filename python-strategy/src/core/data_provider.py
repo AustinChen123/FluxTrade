@@ -61,7 +61,8 @@ def check_data_availability(db: Session, product: str, timeframe: str, lookback:
     end_dt = datetime.datetime.now()
     
     command = (
-        f"docker exec fluxtrade-rust rust-data-service backfill "
+        f"docker compose -f docker-compose.prod.yml exec rust-data "
+        f"rust-data-service backfill "
         f"--exchange {exchange.lower()} --symbol {symbol} "
         f"--start {start_dt.strftime('%Y-%m-%d')} --end {end_dt.strftime('%Y-%m-%d')}"
     )
