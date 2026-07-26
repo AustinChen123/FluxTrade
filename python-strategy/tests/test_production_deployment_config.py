@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import shutil
 import subprocess
 import tomllib
@@ -34,6 +35,7 @@ def _required_env() -> dict[str, str]:
         "CONTROL_PLANE_STEP_UP_CAPABILITY": "example.com/cap/fluxtrade-step-up",
         "GRAFANA_PASSWORD": "grafana-secret",
         "EXCHANGE_ENABLED": "binance",
+        "EXCHANGE_ID": "binance",
         "MARKET_DATA_SYMBOLS": "BTCUSDT",
         "FLUXTRADE_SECRETS_DIR": "/private/tmp/fluxtrade-test-secrets",
         "EXCHANGE_API_KEY": "exchange-key",
@@ -66,7 +68,10 @@ def _write_env_file(path: Path, values: dict[str, str]) -> None:
 
 def _compose_env() -> dict[str, str]:
     env = os.environ.copy()
-    for name in _required_env():
+    interpolated_names = set(
+        re.findall(r"\$\{([A-Z][A-Z0-9_]*)", PROD_COMPOSE.read_text())
+    )
+    for name in interpolated_names:
         env.pop(name, None)
     return env
 
@@ -131,6 +136,7 @@ def test_production_compose_requires_sensitive_env_vars():
     assert "${ADAPTER_MODE:?ADAPTER_MODE is required}" in text
     assert "${AUDIT_EXTERNAL_ORDERS:?AUDIT_EXTERNAL_ORDERS is required}" in text
     assert "${EXCHANGE_ENABLED:?EXCHANGE_ENABLED is required}" in text
+    assert "${EXCHANGE_ID:?EXCHANGE_ID is required}" in text
     assert "${MARKET_DATA_SYMBOLS:?MARKET_DATA_SYMBOLS is required}" in text
     assert "${FLUXTRADE_SECRETS_DIR:?FLUXTRADE_SECRETS_DIR is required}" in text
 
@@ -145,6 +151,7 @@ def test_production_compose_requires_sensitive_env_vars():
         "ADAPTER_MODE",
         "AUDIT_EXTERNAL_ORDERS",
         "EXCHANGE_ENABLED",
+        "EXCHANGE_ID",
         "MARKET_DATA_SYMBOLS",
         "FLUXTRADE_SECRETS_DIR",
     ],
@@ -229,12 +236,25 @@ def test_production_compose_wires_runtime_configuration_without_demo_overrides(
 
     assert rust_data["command"] == ["live"]
     assert rust_data["environment"]["EXCHANGE_ENABLED"] == "binance"
+    assert rust_data["environment"]["EXCHANGE_ID"] == "binance"
     assert rust_data["environment"]["MARKET_DATA_SYMBOLS"] == "BTCUSDT"
     assert strategy["environment"]["ADAPTER_MODE"] == "simulated"
     assert strategy["environment"]["AUDIT_EXTERNAL_ORDERS"] == "false"
     assert strategy["environment"]["EXCHANGE_API_KEY"] == "exchange-key"
     assert strategy["environment"]["EXCHANGE_SECRET"] == "exchange-secret"
     assert "BINANCE_SECRET" not in strategy["environment"]
+
+
+def test_compose_test_environment_excludes_all_interpolated_shell_values(
+    monkeypatch,
+):
+    interpolated_names = set(
+        re.findall(r"\$\{([A-Z][A-Z0-9_]*)", PROD_COMPOSE.read_text())
+    )
+    for name in interpolated_names:
+        monkeypatch.setenv(name, "inherited-value")
+
+    assert interpolated_names.isdisjoint(_compose_env())
 
 
 @pytest.mark.integration
