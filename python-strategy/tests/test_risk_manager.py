@@ -22,6 +22,7 @@ from src.core.risk_rules import RuleStatus
 from src.core.risk_rules.existing_position_entry import ExistingPositionEntryRule
 from src.core.risk_manager import RiskManager, AccountService
 from src.core.product_registry import InstrumentSpec
+from src.core.runtime_environment import RuntimeEnvironment
 
 
 class _FakeOrderRateLimitRule:
@@ -98,6 +99,29 @@ class TestRiskManagerBalanceChecks:
         is_allowed, reason = risk_manager.check_risk(signal)
 
         assert is_allowed is True
+
+    @pytest.mark.parametrize(
+        "signal_type",
+        [SignalType.EXIT_LONG, SignalType.EXIT_SHORT],
+    )
+    def test_exit_does_not_read_unavailable_balance(
+        self,
+        mock_account_service,
+        signal_factory,
+        signal_type,
+    ):
+        mock_account_service.get_balance = MagicMock(
+            side_effect=RuntimeError("authoritative_balance_snapshot_stale")
+        )
+        risk_manager = RiskManager(mock_account_service)
+
+        allowed, reason = risk_manager.check_risk(
+            signal_factory(signal_type=signal_type)
+        )
+
+        assert allowed is True
+        assert reason == "PASS"
+        mock_account_service.get_balance.assert_not_called()
 
     @pytest.mark.parametrize(
         "signal_type",
@@ -337,6 +361,27 @@ class TestRiskManagerExposureChecks:
 
         assert is_allowed is False
         assert reason == "REJECT: daily_loss_missing_start_nav_snapshot"
+
+    def test_authoritative_daily_nav_context_is_enforced_automatically(
+        self,
+        mock_account_service,
+        signal_factory,
+    ):
+        mock_account_service.get_daily_nav_context = MagicMock(
+            return_value=(Decimal("100000"), Decimal("94990"))
+        )
+        mock_account_service.get_balance = MagicMock(
+            side_effect=AssertionError("authoritative context already contains current NAV")
+        )
+        risk_manager = RiskManager(mock_account_service)
+
+        allowed, reason = risk_manager.check_risk(
+            signal_factory(signal_type=SignalType.LONG)
+        )
+
+        assert allowed is False
+        assert "daily_loss_circuit_breaker_triggered" in reason
+        mock_account_service.get_balance.assert_not_called()
 
     def test_order_rate_limit_rejects_after_prior_checks_pass(
         self, mock_account_service, signal_factory
@@ -916,6 +961,182 @@ class TestAccountService:
             service = AccountService()
 
         assert service.get_balance() == Decimal("0")
+
+    def test_authoritative_balance_uses_account_scoped_fresh_snapshot(self):
+        mock_redis = MagicMock()
+        mock_redis.ping.return_value = True
+        mock_redis.hgetall.return_value = {
+            "venue": "rithmic",
+            "account_id": "CC24212",
+            "currency": "USD",
+            "balance": "50123.45",
+            "day_pnl": "-100.55",
+            "day_start_nav": "50224.00",
+            "observed_at_ms": "1704067200000",
+            "source_timestamp_ms": "1704067199000",
+        }
+
+        with patch("src.core.risk_manager.create_redis_client", return_value=mock_redis):
+            service = AccountService()
+        service.configure_authoritative_balance(
+            venue="rithmic",
+            account_id="CC24212",
+            max_age_seconds=30,
+            runtime_environment=RuntimeEnvironment("live"),
+        )
+
+        with patch("src.core.risk_manager.time.time", return_value=1704067201):
+            assert service.get_balance() == Decimal("50123.45")
+        mock_redis.hgetall.assert_called_once_with(
+            "fluxtrade:live:account:rithmic:CC24212"
+        )
+
+    def test_authoritative_daily_nav_context_uses_same_snapshot(self):
+        mock_redis = MagicMock()
+        mock_redis.ping.return_value = True
+        mock_redis.hgetall.return_value = {
+            "venue": "rithmic",
+            "account_id": "CC24212",
+            "currency": "USD",
+            "balance": "49900",
+            "day_pnl": "-100",
+            "day_start_nav": "50000",
+            "observed_at_ms": "1704067200000",
+            "source_timestamp_ms": "1704067199000",
+        }
+        with patch("src.core.risk_manager.create_redis_client", return_value=mock_redis):
+            service = AccountService()
+        service.configure_authoritative_balance(
+            venue="rithmic",
+            account_id="CC24212",
+            max_age_seconds=30,
+            runtime_environment=RuntimeEnvironment("live"),
+        )
+
+        with patch("src.core.risk_manager.time.time", return_value=1704067201):
+            assert service.get_daily_nav_context() == (
+                Decimal("50000"),
+                Decimal("49900"),
+            )
+
+        mock_redis.hgetall.assert_called_once_with(
+            "fluxtrade:live:account:rithmic:CC24212"
+        )
+
+    @pytest.mark.parametrize(
+        ("snapshot", "error"),
+        [
+            ({}, "authoritative_balance_snapshot_missing"),
+            (
+                {
+                    "venue": "rithmic",
+                    "account_id": "OTHER",
+                    "currency": "USD",
+                    "balance": "50000",
+                    "day_pnl": "0",
+                    "day_start_nav": "50000",
+                    "observed_at_ms": "1704067200000",
+                },
+                "authoritative_balance_account_mismatch",
+            ),
+            (
+                {
+                    "venue": "rithmic",
+                    "account_id": "CC24212",
+                    "currency": "USD",
+                    "balance": "50000",
+                    "day_pnl": "0",
+                    "day_start_nav": "50000",
+                    "observed_at_ms": "1704067100000",
+                },
+                "authoritative_balance_snapshot_stale",
+            ),
+        ],
+    )
+    def test_authoritative_balance_fails_closed_for_untrusted_snapshot(
+        self,
+        snapshot,
+        error,
+    ):
+        mock_redis = MagicMock()
+        mock_redis.ping.return_value = True
+        mock_redis.hgetall.return_value = snapshot
+
+        with patch("src.core.risk_manager.create_redis_client", return_value=mock_redis):
+            service = AccountService()
+        service.configure_authoritative_balance(
+            venue="rithmic",
+            account_id="CC24212",
+            max_age_seconds=30,
+            runtime_environment=RuntimeEnvironment("live"),
+        )
+
+        with patch("src.core.risk_manager.time.time", return_value=1704067201):
+            with pytest.raises(RuntimeError, match=error):
+                service.get_balance()
+
+    def test_replace_authoritative_balance_rejects_wrong_account(self):
+        mock_redis = MagicMock()
+        mock_redis.ping.return_value = True
+        with patch("src.core.risk_manager.create_redis_client", return_value=mock_redis):
+            service = AccountService()
+        service.configure_authoritative_balance(
+            venue="rithmic",
+            account_id="CC24212",
+            max_age_seconds=30,
+            runtime_environment=RuntimeEnvironment("live"),
+        )
+
+        with pytest.raises(
+            ValueError,
+            match="authoritative_balance_account_mismatch",
+        ):
+            service.replace_authoritative_balance(
+                venue="rithmic",
+                account_id="OTHER",
+                currency="USD",
+                balance=Decimal("50000"),
+                day_pnl=Decimal("0"),
+                observed_at_ms=1704067200000,
+                source_timestamp_ms=None,
+            )
+        mock_redis.hset.assert_not_called()
+
+    def test_replace_authoritative_balance_persists_decimal_as_text(self):
+        mock_redis = MagicMock()
+        mock_redis.ping.return_value = True
+        with patch("src.core.risk_manager.create_redis_client", return_value=mock_redis):
+            service = AccountService()
+        service.configure_authoritative_balance(
+            venue="rithmic",
+            account_id="CC24212",
+            max_age_seconds=30,
+            runtime_environment=RuntimeEnvironment("live"),
+        )
+
+        service.replace_authoritative_balance(
+            venue="rithmic",
+            account_id="CC24212",
+            currency="USD",
+            balance=Decimal("50123.45"),
+            day_pnl=Decimal("-100.55"),
+            observed_at_ms=1704067200000,
+            source_timestamp_ms=1704067199000,
+        )
+
+        mock_redis.hset.assert_called_once_with(
+            "fluxtrade:live:account:rithmic:CC24212",
+            mapping={
+                "venue": "rithmic",
+                "account_id": "CC24212",
+                "currency": "USD",
+                "balance": "50123.45",
+                "day_pnl": "-100.55",
+                "day_start_nav": "50224.00",
+                "observed_at_ms": "1704067200000",
+                "source_timestamp_ms": "1704067199000",
+            },
+        )
 
     def test_get_position_returns_position(self):
         """Should return Position from Redis hash data."""

@@ -1,4 +1,5 @@
 import logging
+import time
 from datetime import date
 from decimal import Decimal
 from typing import TYPE_CHECKING, Optional, Any, Callable
@@ -13,6 +14,7 @@ from src.core.risk_rules.order_rate_limit import OrderRateLimitRule
 from src.core.risk_rules.price_sanity_check import PriceSanityCheckRule
 from src.core.risk_rules.single_order_notional import SingleOrderNotionalRule
 from src.core.product_registry import InstrumentSpec, calculate_notional_exposure
+from src.core.runtime_environment import RuntimeEnvironment
 
 if TYPE_CHECKING:
     from src.core.capital_allocator import CapitalAllocator
@@ -21,7 +23,12 @@ logger = logging.getLogger(__name__)
 
 class AccountService:
     """Interface for accessing account data via Redis."""
+
     def __init__(self):
+        self._authoritative_balance_key: str | None = None
+        self._authoritative_venue: str | None = None
+        self._authoritative_account_id: str | None = None
+        self._authoritative_balance_max_age_seconds: float | None = None
         try:
             self.redis = create_redis_client()
             self.redis.ping() # Check connection
@@ -33,13 +40,120 @@ class AccountService:
         if self.redis:
             self.redis.close()
 
+    def configure_authoritative_balance(
+        self,
+        *,
+        venue: str,
+        account_id: str,
+        max_age_seconds: float,
+        runtime_environment: RuntimeEnvironment,
+    ) -> None:
+        if not venue or not account_id:
+            raise ValueError("authoritative account identity is required")
+        if max_age_seconds <= 0:
+            raise ValueError("authoritative balance max age must be positive")
+        normalized_venue = venue.strip().lower()
+        self._authoritative_balance_key = runtime_environment.key(
+            f"account:{normalized_venue}:{account_id}"
+        )
+        self._authoritative_venue = normalized_venue
+        self._authoritative_account_id = account_id
+        self._authoritative_balance_max_age_seconds = max_age_seconds
+
+    def replace_authoritative_balance(
+        self,
+        *,
+        venue: str,
+        account_id: str,
+        currency: str,
+        balance: Decimal,
+        day_pnl: Decimal,
+        observed_at_ms: int,
+        source_timestamp_ms: int | None,
+    ) -> None:
+        if not self.redis or not self._authoritative_balance_key:
+            raise RuntimeError("authoritative_balance_cache_unavailable")
+        if venue.strip().lower() != self._authoritative_venue:
+            raise ValueError("authoritative_balance_venue_mismatch")
+        if account_id != self._authoritative_account_id:
+            raise ValueError("authoritative_balance_account_mismatch")
+        if not currency:
+            raise ValueError("authoritative_balance_currency_missing")
+        if not balance.is_finite() or not day_pnl.is_finite():
+            raise ValueError("authoritative_balance_not_finite")
+        if observed_at_ms <= 0:
+            raise ValueError("authoritative_balance_observation_time_invalid")
+
+        self.redis.hset(
+            self._authoritative_balance_key,
+            mapping={
+                "venue": self._authoritative_venue,
+                "account_id": account_id,
+                "currency": currency,
+                "balance": str(balance),
+                "day_pnl": str(day_pnl),
+                "day_start_nav": str(balance - day_pnl),
+                "observed_at_ms": str(observed_at_ms),
+                "source_timestamp_ms": (
+                    str(source_timestamp_ms)
+                    if source_timestamp_ms is not None
+                    else ""
+                ),
+            },
+        )
+
     def get_balance(self) -> Decimal:
+        if self._authoritative_balance_key is not None:
+            return self._get_authoritative_balance_snapshot()["balance"]
         if not self.redis:
             return Decimal("0")
         
         # Assuming single account 'main' for now as per Lua script usage
         balance = self.redis.hget("state:balance:main", "free")
         return Decimal(balance) if balance else Decimal("0")
+
+    def get_daily_nav_context(self) -> tuple[Decimal, Decimal] | None:
+        if getattr(self, "_authoritative_balance_key", None) is None:
+            return None
+        snapshot = self._get_authoritative_balance_snapshot()
+        return snapshot["day_start_nav"], snapshot["balance"]
+
+    def _get_authoritative_balance_snapshot(self) -> dict[str, Decimal]:
+        if not self.redis:
+            raise RuntimeError("authoritative_balance_cache_unavailable")
+        data = self.redis.hgetall(self._authoritative_balance_key)
+        if not data:
+            raise RuntimeError("authoritative_balance_snapshot_missing")
+        if data.get("venue") != self._authoritative_venue:
+            raise RuntimeError("authoritative_balance_venue_mismatch")
+        if data.get("account_id") != self._authoritative_account_id:
+            raise RuntimeError("authoritative_balance_account_mismatch")
+        if not data.get("currency"):
+            raise RuntimeError("authoritative_balance_currency_missing")
+        try:
+            observed_at_ms = int(data["observed_at_ms"])
+            balance = Decimal(data["balance"])
+            day_pnl = Decimal(data["day_pnl"])
+            day_start_nav = Decimal(data["day_start_nav"])
+        except (KeyError, ValueError, ArithmeticError) as exc:
+            raise RuntimeError("authoritative_balance_snapshot_invalid") from exc
+        max_age = self._authoritative_balance_max_age_seconds
+        if max_age is None:
+            raise RuntimeError("authoritative_balance_freshness_unconfigured")
+        age_ms = int(time.time() * 1000) - observed_at_ms
+        if age_ms < 0 or age_ms > int(max_age * 1000):
+            raise RuntimeError("authoritative_balance_snapshot_stale")
+        if not all(
+            value.is_finite() for value in (balance, day_pnl, day_start_nav)
+        ):
+            raise RuntimeError("authoritative_balance_snapshot_invalid")
+        if day_start_nav != balance - day_pnl:
+            raise RuntimeError("authoritative_balance_snapshot_inconsistent")
+        return {
+            "balance": balance,
+            "day_pnl": day_pnl,
+            "day_start_nav": day_start_nav,
+        }
 
     def get_position(self, strategy_id: str, product_id: str) -> Optional[Position]:
         if not self.redis:
@@ -235,7 +349,21 @@ class RiskManager:
         is_entry = signal.type in [SignalType.LONG, SignalType.SHORT]
         instrument_spec = self._instrument_spec(signal.product_id) if is_entry else None
 
-        # Rule 1: Balance / Capital check
+        balance: Decimal | None = None
+        if is_entry and daily_start_nav is None and current_nav is None:
+            context_loader = getattr(
+                self.account_service,
+                "get_daily_nav_context",
+                None,
+            )
+            if callable(context_loader):
+                nav_context = context_loader()
+                if nav_context is not None:
+                    daily_start_nav, current_nav = nav_context
+                    balance = current_nav
+
+        # Rule 1: Balance / Capital check. Risk-reducing signals must not depend
+        # on account-balance availability.
         if self.capital_allocator is not None:
             # Per-strategy capital check
             available = self.capital_allocator.get_available(signal.strategy_id)
@@ -245,15 +373,16 @@ class RiskManager:
                 return False, msg
         else:
             # Global balance check (backward-compatible)
-            balance = self.account_service.get_balance()
-            if is_entry and balance <= 0:
+            if is_entry and balance is None:
+                balance = self.account_service.get_balance()
+            if balance is not None and balance <= 0:
                 msg = f"REJECT: Account balance is {balance} (<= 0)"
                 logger.warning("RISK_REJECTED: %s signal_type=%s", msg, signal.type)
                 return False, msg
 
         # Rule 2: Single-order notional check.
         if is_entry:
-            nav = self.account_service.get_balance()
+            nav = balance if balance is not None else self.account_service.get_balance()
             rule_status, rule_reason = self.single_order_rule.evaluate(
                 signal,
                 nav,
