@@ -7,6 +7,8 @@ mod codec;
 #[allow(dead_code)]
 mod config;
 
+pub(crate) mod emergency;
+
 #[allow(dead_code)]
 mod front_month;
 
