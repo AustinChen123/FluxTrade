@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import json
 import time
-from typing import Any
+from typing import Any, cast
 
 from sqlalchemy import func, or_
 
@@ -20,20 +20,18 @@ class StrategyStateQueryService:
         self,
         *,
         status: str | None = None,
-        limit: int,
-        offset: int,
+        limit: int | None,
+        offset: int = 0,
     ) -> tuple[list[dict[str, Any]], int]:
         with self._db_session_factory() as session:
             query = session.query(StrategyState)
             if status is not None:
                 query = query.filter(StrategyState.status == status)
             total = query.count()
-            states = (
-                query.order_by(StrategyState.strategy_id)
-                .offset(offset)
-                .limit(limit)
-                .all()
-            )
+            query = query.order_by(StrategyState.strategy_id).offset(offset)
+            if limit is not None:
+                query = query.limit(limit)
+            states = query.all()
             return [_state_payload(state) for state in states], total
 
     def get_state(self, strategy_id: str) -> dict[str, Any]:
@@ -104,8 +102,8 @@ def _state_payload(state: StrategyState) -> dict[str, Any]:
     return {
         "strategy_id": state.strategy_id,
         "status": state.status,
-        "config": _loads_json_object(state.config_json),
-        "performance": _loads_json_object(state.performance_json),
+        "config": _loads_json_object(cast(str | None, state.config_json)),
+        "performance": _loads_json_object(cast(str | None, state.performance_json)),
         "last_heartbeat": state.last_heartbeat,
         "uptime_start": state.uptime_start,
         "last_error_message": state.last_error_message,

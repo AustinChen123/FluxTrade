@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from decimal import Decimal
 from typing import Any, Callable, Protocol, runtime_checkable
 
@@ -42,6 +43,17 @@ class ParameterSearchEvaluator(Protocol):
 
 
 @runtime_checkable
+class ParameterSearchRequestValidator(Protocol):
+    """Optional evaluator capability for rejecting unsupported jobs pre-submit."""
+
+    def validate_request(self, request: ParameterSearchJobRequest) -> None: ...
+
+
+class UnsupportedParameterSearchError(ValueError):
+    """Raised before job creation when no evaluator owns the strategy type."""
+
+
+@runtime_checkable
 class WalkForwardWarmupEvaluator(Protocol):
     """Optional evaluator capability for state-only pre-fold replay."""
 
@@ -52,6 +64,77 @@ class WalkForwardWarmupEvaluator(Protocol):
         *,
         warmup_start_time: int,
     ) -> ParameterEvaluationResult: ...
+
+
+class ParameterSearchEvaluatorRegistry:
+    """Dispatch parameter jobs to an explicitly registered strategy evaluator."""
+
+    def __init__(
+        self,
+        evaluators: Mapping[str, ParameterSearchEvaluator],
+    ) -> None:
+        if not evaluators:
+            raise ValueError("at least one parameter-search evaluator is required")
+        self._evaluators = dict(evaluators)
+
+    def validate_request(self, request: ParameterSearchJobRequest) -> None:
+        evaluator = self._resolve(request)
+        if request.evaluation_set is None:
+            return
+        requires_warmup = any(
+            dataset.warmup_start_time is not None
+            for dataset in request.evaluation_set.resolved_datasets
+        )
+        if requires_warmup and not isinstance(
+            evaluator,
+            WalkForwardWarmupEvaluator,
+        ):
+            raise UnsupportedParameterSearchError(
+                f"strategy_type does not support walk-forward warmup: "
+                f"{request.strategy_type}"
+            )
+
+    def evaluate(
+        self,
+        request: ParameterSearchJobRequest,
+        candidate: ParameterCandidate,
+    ) -> ParameterEvaluationResult:
+        return self._resolve(request).evaluate(request, candidate)
+
+    def evaluate_with_warmup(
+        self,
+        request: ParameterSearchJobRequest,
+        candidate: ParameterCandidate,
+        *,
+        warmup_start_time: int,
+    ) -> ParameterEvaluationResult:
+        evaluator = self._resolve(request)
+        if not isinstance(evaluator, WalkForwardWarmupEvaluator):
+            raise ValueError(
+                f"strategy_type does not support walk-forward warmup: "
+                f"{request.strategy_type}"
+            )
+        return evaluator.evaluate_with_warmup(
+            request,
+            candidate,
+            warmup_start_time=warmup_start_time,
+        )
+
+    def _resolve(
+        self,
+        request: ParameterSearchJobRequest,
+    ) -> ParameterSearchEvaluator:
+        strategy_type = request.strategy_type
+        if strategy_type is None:
+            raise UnsupportedParameterSearchError(
+                "strategy_type is required for parameter search"
+            )
+        evaluator = self._evaluators.get(strategy_type)
+        if evaluator is None:
+            raise UnsupportedParameterSearchError(
+                f"unsupported strategy_type: {strategy_type}"
+            )
+        return evaluator
 
 
 class CsvSignalBacktestParameterEvaluator:

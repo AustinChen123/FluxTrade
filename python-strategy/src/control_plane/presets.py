@@ -136,6 +136,7 @@ class GoldenCrossParameterSearchPreset(BaseModel):
 
     def to_parameter_search_request(self) -> ParameterSearchJobRequest:
         return ParameterSearchJobRequest(
+            strategy_type="golden_cross",
             strategy_id=self.strategy_id,
             product_id=self.product_id,
             timeframe=self.timeframe,

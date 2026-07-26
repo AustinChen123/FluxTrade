@@ -19,8 +19,12 @@ from src.control_plane.models import (
     StrategyCommandRequest,
 )
 from src.control_plane.parameter_search import ParameterSearchJobExecutor
+from src.control_plane.parameter_evaluation import UnsupportedParameterSearchError
 from src.control_plane.presets import GoldenCrossParameterSearchPreset
-from src.control_plane.strategy_control import StrategyControlService
+from src.control_plane.strategy_control import (
+    StrategyControlService,
+    StrategyControlUnavailable,
+)
 from src.control_plane.strategy_state_query import StrategyStateQueryService
 
 
@@ -126,13 +130,25 @@ class ControlPlaneApp:
         if method == "GET" and clean_path == "/strategies":
             if self.strategy_control is None:
                 return HttpResponse(503, {"error": "strategy_control_unavailable"})
-            result = self.strategy_control.list_strategies()
+            try:
+                result = self.strategy_control.list_strategies()
+            except StrategyControlUnavailable as exc:
+                return HttpResponse(
+                    503,
+                    {"error": "strategy_control_unavailable", "detail": str(exc)},
+                )
             return self._command_response(result)
 
         if method == "GET" and clean_path == "/strategies/health":
             if self.strategy_control is None:
                 return HttpResponse(503, {"error": "strategy_control_unavailable"})
-            result = self.strategy_control.health()
+            try:
+                result = self.strategy_control.health()
+            except StrategyControlUnavailable as exc:
+                return HttpResponse(
+                    503,
+                    {"error": "strategy_control_unavailable", "detail": str(exc)},
+                )
             return self._command_response(result)
 
         if method == "POST" and clean_path.startswith("/strategies/"):
@@ -197,7 +213,13 @@ class ControlPlaneApp:
         except ValueError as exc:
             return HttpResponse(400, {"error": "invalid_json", "detail": str(exc)})
 
-        job = self.parameter_search_executor.submit_search(request)
+        try:
+            job = self.parameter_search_executor.submit_search(request)
+        except UnsupportedParameterSearchError as exc:
+            return HttpResponse(
+                422,
+                {"error": "parameter_search_rejected", "detail": str(exc)},
+            )
         status_code = 200 if job.finished_at is not None else 202
         return HttpResponse(status_code, {"job": self._job_payload(job)})
 
@@ -224,7 +246,13 @@ class ControlPlaneApp:
         except ValueError as exc:
             return HttpResponse(400, {"error": "invalid_json", "detail": str(exc)})
 
-        job = self.parameter_search_executor.submit_search(request)
+        try:
+            job = self.parameter_search_executor.submit_search(request)
+        except UnsupportedParameterSearchError as exc:
+            return HttpResponse(
+                422,
+                {"error": "parameter_search_rejected", "detail": str(exc)},
+            )
         status_code = 200 if job.finished_at is not None else 202
         return HttpResponse(status_code, {"job": self._job_payload(job)})
 
@@ -315,7 +343,13 @@ class ControlPlaneApp:
         except ValueError as exc:
             return HttpResponse(400, {"error": "invalid_json", "detail": str(exc)})
 
-        result = self.strategy_control.submit_command(strategy_id, request)
+        try:
+            result = self.strategy_control.submit_command(strategy_id, request)
+        except StrategyControlUnavailable as exc:
+            return HttpResponse(
+                503,
+                {"error": "strategy_control_unavailable", "detail": str(exc)},
+            )
         return self._command_response(result)
 
     def _handle_kill_switch(self, body: str | bytes | None) -> HttpResponse:
@@ -582,6 +616,7 @@ class ControlPlaneApp:
         strategy_id: str,
         query: dict[str, list[str]],
     ) -> HttpResponse:
+        assert self.strategy_state_query is not None
         pagination = _parse_pagination(query)
         if isinstance(pagination, HttpResponse):
             return pagination
@@ -619,7 +654,9 @@ class ControlPlaneApp:
 
     @staticmethod
     def _command_response(result: dict[str, Any]) -> HttpResponse:
-        status_code = 200 if result["success"] else 400
+        status_code = 202 if result.get("accepted") else 200
+        if not result["success"]:
+            status_code = 400
         return HttpResponse(status_code, {"result": result})
 
     def _authorize(self, headers: Mapping[str, str] | None) -> HttpResponse | None:

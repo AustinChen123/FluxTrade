@@ -30,7 +30,9 @@ from src.control_plane.parameter_evaluation import (
     CsvSignalBacktestParameterEvaluator,
     GoldenCrossFastFitnessParameterEvaluator,
     GoldenCrossResearchParameterEvaluator,
+    ParameterSearchEvaluatorRegistry,
     ParameterSearchEvaluator,
+    UnsupportedParameterSearchError,
     ResearchBacktestParameterEvaluator,
 )
 from src.control_plane.parameter_search import ParameterSearchJobExecutor
@@ -39,7 +41,11 @@ from src.control_plane.presets import (
     GoldenCrossParameterSearchPreset,
     IntegerSearchRange,
 )
-from src.control_plane.strategy_control import StrategyControlService
+from src.control_plane.strategy_control import (
+    RedisStrategyCommandRouter,
+    StrategyControlService,
+    StrategyControlUnavailable,
+)
 from src.control_plane.strategy_state_query import StrategyStateQueryService
 
 __all__ = [
@@ -71,13 +77,17 @@ __all__ = [
     "ParameterSearchJobRequest",
     "ParameterSearchDimension",
     "ParameterSearchEvaluator",
+    "ParameterSearchEvaluatorRegistry",
+    "UnsupportedParameterSearchError",
     "ParameterSearchJobExecutor",
     "ParameterSearchSpace",
     "ResearchBacktestParameterEvaluator",
     "ResearchRunnerEvaluationConfig",
+    "RedisStrategyCommandRouter",
     "IntegerSearchRange",
     "SqliteJobStore",
     "StrategyControlService",
+    "StrategyControlUnavailable",
     "StrategyStateQueryService",
     "WalkForwardEvaluationConfig",
 ]

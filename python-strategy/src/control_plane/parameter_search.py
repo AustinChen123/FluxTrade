@@ -40,6 +40,7 @@ from src.control_plane.parameter_evaluation import (
     GoldenCrossFastFitnessParameterEvaluator as GoldenCrossFastFitnessParameterEvaluator,
     GoldenCrossResearchParameterEvaluator as GoldenCrossResearchParameterEvaluator,
     ParameterSearchEvaluator,
+    ParameterSearchRequestValidator,
     ResearchBacktestParameterEvaluator as ResearchBacktestParameterEvaluator,
     WalkForwardWarmupEvaluator,
     _normalize_evaluation_result,
@@ -92,6 +93,8 @@ class ParameterSearchJobExecutor:
         self._db_session_factory = db_session_factory
 
     def submit_search(self, request: ParameterSearchJobRequest) -> JobRecord:
+        if isinstance(self.evaluator, ParameterSearchRequestValidator):
+            self.evaluator.validate_request(request)
         if request.evolution is not None and request.evolution.epoch_id is None:
             request = request.model_copy(
                 update={
