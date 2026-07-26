@@ -6,6 +6,7 @@ import json
 import os
 import shutil
 import subprocess
+import tomllib
 from pathlib import Path
 
 import pytest
@@ -14,6 +15,7 @@ import pytest
 REPO_ROOT = Path(__file__).resolve().parents[2]
 PROD_COMPOSE = REPO_ROOT / "docker-compose.prod.yml"
 PYTHON_DOCKERFILE = REPO_ROOT / "python-strategy" / "Dockerfile"
+PYTHON_PYPROJECT = REPO_ROOT / "python-strategy" / "pyproject.toml"
 ROOT_DOCKERIGNORE = REPO_ROOT / ".dockerignore"
 
 
@@ -255,6 +257,32 @@ def test_production_compose_runs_persistent_control_plane(tmp_path: Path):
 
 
 @pytest.mark.integration
+def test_database_backed_services_wait_for_migrations(tmp_path: Path):
+    services = _compose_config(tmp_path)["services"]
+    migration = services["migrate"]
+
+    assert migration["command"] == [
+        "alembic",
+        "-c",
+        "/app/database/alembic.ini",
+        "upgrade",
+        "head",
+    ]
+    assert migration["restart"] == "no"
+    assert migration["depends_on"]["db"]["condition"] == "service_healthy"
+    for service_name in [
+        "rust-data",
+        "python-strategy",
+        "control-plane",
+        "dashboard",
+    ]:
+        assert (
+            services[service_name]["depends_on"]["migrate"]["condition"]
+            == "service_completed_successfully"
+        )
+
+
+@pytest.mark.integration
 def test_production_service_images_use_explicit_version_tags(tmp_path: Path):
     services = _compose_config(tmp_path)["services"]
 
@@ -268,21 +296,39 @@ def test_production_service_images_use_explicit_version_tags(tmp_path: Path):
 def test_python_services_use_clean_checkout_extension_image(tmp_path: Path):
     services = _compose_config(tmp_path)["services"]
 
-    for service_name in ["python-strategy", "control-plane"]:
+    for service_name in ["migrate", "python-strategy", "control-plane"]:
         service = services[service_name]
         assert service["image"] == "fluxtrade-python-strategy:local"
         assert service["build"]["context"] == str(REPO_ROOT)
         assert service["build"]["dockerfile"] == "python-strategy/Dockerfile"
 
+
+def test_python_production_image_contains_migration_runtime_contract():
     dockerfile = PYTHON_DOCKERFILE.read_text()
+    dockerignore_entries = set(ROOT_DOCKERIGNORE.read_text().splitlines())
+    pyproject = tomllib.loads(PYTHON_PYPROJECT.read_text())
+    runtime_dependencies = pyproject["project"]["dependencies"]
+    dev_dependencies = pyproject["dependency-groups"]["dev"]
+
     assert "FROM rust:1.82.0-bookworm AS extension-builder" in dockerfile
     assert "cargo build --lib --release" in dockerfile
+    assert "uv sync --frozen --no-dev" in dockerfile
     assert (
         "COPY --from=extension-builder "
         "/build/target/release/libfluxtrade_core.so "
         "./fluxtrade_core.so"
     ) in dockerfile
-    assert "python-strategy/src/fluxtrade_core.so" in ROOT_DOCKERIGNORE.read_text()
+    assert "COPY database/alembic.ini ./database/alembic.ini" in dockerfile
+    assert "COPY database/alembic/env.py ./database/alembic/env.py" in dockerfile
+    assert "COPY database/alembic/versions/ ./database/alembic/versions/" in dockerfile
+    assert any(dependency.startswith("alembic") for dependency in runtime_dependencies)
+    assert not any(dependency.startswith("alembic") for dependency in dev_dependencies)
+    assert {
+        "python-strategy/src/fluxtrade_core.so",
+        "!database/alembic.ini",
+        "!database/alembic/env.py",
+        "!database/alembic/versions/*.py",
+    } <= dockerignore_entries
 
 
 @pytest.mark.integration
@@ -297,5 +343,6 @@ def test_runtime_images_can_be_overridden_for_private_builds(tmp_path: Path):
     services = _compose_config(tmp_path, env)["services"]
 
     assert services["rust-data"]["image"] == env["RUST_DATA_IMAGE"]
+    assert services["migrate"]["image"] == env["PYTHON_STRATEGY_IMAGE"]
     assert services["python-strategy"]["image"] == env["PYTHON_STRATEGY_IMAGE"]
     assert services["control-plane"]["image"] == env["PYTHON_STRATEGY_IMAGE"]

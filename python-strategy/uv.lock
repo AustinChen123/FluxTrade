@@ -2457,6 +2457,7 @@ name = "python-strategy"
 version = "0.1.0"
 source = { virtual = "." }
 dependencies = [
+    { name = "alembic" },
     { name = "ccxt" },
     { name = "hiredis" },
     { name = "orjson" },
@@ -2481,7 +2482,6 @@ bench = [
     { name = "vectorbt", version = "0.28.4", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.14'" },
 ]
 dev = [
-    { name = "alembic" },
     { name = "maturin" },
     { name = "pyright" },
     { name = "pytest" },
@@ -2496,6 +2496,7 @@ docs = [
 
 [package.metadata]
 requires-dist = [
+    { name = "alembic", specifier = ">=1.18.4" },
     { name = "ccxt", specifier = ">=4.5.34" },
     { name = "hiredis", specifier = ">=3.3.0" },
     { name = "orjson", specifier = ">=3.11.5" },
@@ -2518,7 +2519,6 @@ bench = [
     { name = "vectorbt", specifier = ">=0.26.2" },
 ]
 dev = [
-    { name = "alembic", specifier = ">=1.18.4" },
     { name = "maturin", specifier = ">=1.11.5" },
     { name = "pyright", specifier = ">=1.1.408" },
     { name = "pytest", specifier = ">=9.0.2" },

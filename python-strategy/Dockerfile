@@ -23,10 +23,13 @@ ENV UV_SYSTEM_PYTHON=1
 COPY python-strategy/pyproject.toml python-strategy/uv.lock ./
 
 # Install dependencies
-RUN uv sync --frozen
+RUN uv sync --frozen --no-dev
 
 # Copy source code and the clean-checkout PyO3 build.
 COPY python-strategy/src/ ./src/
+COPY database/alembic.ini ./database/alembic.ini
+COPY database/alembic/env.py ./database/alembic/env.py
+COPY database/alembic/versions/ ./database/alembic/versions/
 COPY --from=extension-builder /build/target/release/libfluxtrade_core.so ./fluxtrade_core.so
 
 # Create non-root user and writable application data directory

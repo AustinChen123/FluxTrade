@@ -11,3 +11,9 @@
 !python-strategy/src/
 !python-strategy/src/**
 python-strategy/src/fluxtrade_core.so
+!database/
+!database/alembic.ini
+!database/alembic/
+!database/alembic/env.py
+!database/alembic/versions/
+!database/alembic/versions/*.py
