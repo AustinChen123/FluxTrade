@@ -1,3 +1,6 @@
+from datetime import datetime
+from decimal import Decimal
+
 from sqlalchemy import (
     BigInteger,
     CheckConstraint,
@@ -13,7 +16,7 @@ from sqlalchemy import (
     func,
 )
 from sqlalchemy.dialects.postgresql import JSONB
-from sqlalchemy.orm import declarative_base
+from sqlalchemy.orm import Mapped, declarative_base, mapped_column
 
 Base = declarative_base()
 
@@ -45,6 +48,63 @@ class Candlestick(Base):
     low = Column(Numeric, nullable=False)
     close = Column(Numeric, nullable=False)
     volume = Column(Numeric, nullable=False)
+
+
+class ResearchDataset(Base):
+    __tablename__ = 'research_dataset'
+
+    id: Mapped[str] = mapped_column(String(128), primary_key=True)
+    product_id: Mapped[str] = mapped_column(
+        String,
+        ForeignKey('product.id'),
+        nullable=False,
+    )
+    timeframe: Mapped[str] = mapped_column(String(32), nullable=False)
+    source: Mapped[str] = mapped_column(String(128), nullable=False)
+    revision: Mapped[str] = mapped_column(String(128), nullable=False)
+    timestamp_format: Mapped[str] = mapped_column(String(32), nullable=False)
+    checksum_sha256: Mapped[str] = mapped_column(String(64), nullable=False)
+    roll_policy: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    start_time: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    end_time: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    row_count: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    quality_status: Mapped[str] = mapped_column(String(32), nullable=False)
+    metadata_json: Mapped[str | None] = mapped_column(Text, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        nullable=False,
+        server_default=func.now(),
+    )
+
+    __table_args__ = (
+        CheckConstraint('row_count > 0', name='chk_research_dataset_nonempty'),
+        CheckConstraint(
+            'start_time <= end_time',
+            name='chk_research_dataset_time_range',
+        ),
+        CheckConstraint(
+            "quality_status IN ('validated')",
+            name='chk_research_dataset_quality_status',
+        ),
+    )
+
+
+class ResearchCandlestick(Base):
+    __tablename__ = 'research_candlestick'
+
+    dataset_id: Mapped[str] = mapped_column(
+        String(128),
+        ForeignKey('research_dataset.id', ondelete='CASCADE'),
+        primary_key=True,
+    )
+    timestamp: Mapped[int] = mapped_column(BigInteger, primary_key=True)
+    open: Mapped[Decimal] = mapped_column(Numeric, nullable=False)
+    high: Mapped[Decimal] = mapped_column(Numeric, nullable=False)
+    low: Mapped[Decimal] = mapped_column(Numeric, nullable=False)
+    close: Mapped[Decimal] = mapped_column(Numeric, nullable=False)
+    volume: Mapped[Decimal] = mapped_column(Numeric, nullable=False)
+    source_contract: Mapped[str | None] = mapped_column(String(64), nullable=True)
+
 
 class Strategy(Base):
     __tablename__ = 'strategy'
