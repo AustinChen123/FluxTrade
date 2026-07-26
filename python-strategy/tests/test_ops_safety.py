@@ -614,11 +614,16 @@ class TestKillSwitchAuditAlways:
         service = OpsSafetyService(fake_engine, fake_account, db_factory)
 
         with patch("src.core.ops_safety.write_system_event") as mock_write:
-            service.kill_switch(actor="compliance_team", reason="eod_drill")
+            service.kill_switch(
+                actor="compliance_team",
+                reason="eod_drill",
+                operation_id="mobile-lockdown-1",
+            )
             kwargs = mock_write.call_args.kwargs
             payload = kwargs["payload"]
             assert payload["actor"] == "compliance_team"
             assert payload["reason"] == "eod_drill"
+            assert payload["operation_id"] == "mobile-lockdown-1"
 
     def test_audit_payload_includes_full_result(self):
         db_factory = _make_null_db_session_factory()
@@ -716,9 +721,15 @@ class TestKillSwitchFlattenPositions:
             actor="ops",
             reason="drill",
             result={**result, "authoritative_flatten_verified": True},
+            operation_id="mobile-lockdown-1",
         )
 
-        service._write_event_best_effort.assert_called_once()
+        service._write_event_best_effort.assert_called_once_with(
+            actor="ops",
+            reason="drill",
+            result={**result, "authoritative_flatten_verified": True},
+            operation_id="mobile-lockdown-1",
+        )
 
 
 # =============================================================================

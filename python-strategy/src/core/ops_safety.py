@@ -59,11 +59,19 @@ class OpsSafetyService:
         self._recovery_result: dict | None = None
         self._recovery_actor = "system"
         self._recovery_reason: str | None = None
+        self._recovery_operation_id: str | None = None
 
-    def kill_switch(self, *, actor: str, reason: str | None = None) -> dict:
+    def kill_switch(
+        self,
+        *,
+        actor: str,
+        reason: str | None = None,
+        operation_id: str | None = None,
+    ) -> dict:
         return self._kill_switch(
             actor=actor,
             reason=reason,
+            operation_id=operation_id,
         )
 
     def kill_switch_with_authoritative_positions(
@@ -73,10 +81,12 @@ class OpsSafetyService:
         reason: str | None,
         position_loader: Callable[[], list[Any]],
         account_id: str,
+        operation_id: str | None = None,
     ) -> dict:
         return self._kill_switch(
             actor=actor,
             reason=reason,
+            operation_id=operation_id,
             position_loader=position_loader,
             authoritative_account_id=account_id,
             allow_async_recovery=False,
@@ -89,11 +99,13 @@ class OpsSafetyService:
         actor: str,
         reason: str | None,
         result: dict,
+        operation_id: str | None = None,
     ) -> None:
         self._write_event_best_effort(
             actor=actor,
             reason=reason,
             result=result,
+            operation_id=operation_id,
         )
 
     def _kill_switch(
@@ -101,6 +113,7 @@ class OpsSafetyService:
         *,
         actor: str,
         reason: str | None,
+        operation_id: str | None = None,
         position_loader: Callable[[], list[Any]] | None = None,
         authoritative_account_id: str | None = None,
         allow_async_recovery: bool = True,
@@ -108,10 +121,15 @@ class OpsSafetyService:
     ) -> dict:
         with self._kill_switch_lock:
             if self._recovery_pending:
+                if self._recovery_result is None:
+                    raise RuntimeError(
+                        "kill switch recovery state is inconsistent"
+                    )
                 return deepcopy(self._recovery_result)
             result, recovery_pending = self._run_kill_switch(
                 actor=actor,
                 reason=reason,
+                operation_id=operation_id,
                 position_loader=position_loader,
                 authoritative_account_id=authoritative_account_id,
                 write_audit=write_audit,
@@ -121,6 +139,7 @@ class OpsSafetyService:
                 self._recovery_result = deepcopy(result)
                 self._recovery_actor = actor
                 self._recovery_reason = reason
+                self._recovery_operation_id = operation_id
 
         if recovery_pending and allow_async_recovery:
             run_when_drained = getattr(
@@ -175,12 +194,14 @@ class OpsSafetyService:
         *,
         actor: str,
         reason: str | None,
+        operation_id: str | None = None,
     ) -> None:
         self._write_event(
             actor=actor,
             reason=reason,
             result={"state": state},
             event_subtype="kill_switch_state",
+            operation_id=operation_id,
         )
 
     def latest_kill_switch_state(self) -> str | None:
@@ -233,6 +254,7 @@ class OpsSafetyService:
         *,
         actor: str,
         reason: str | None = None,
+        operation_id: str | None = None,
         result: dict | None = None,
         position_loader: Callable[[], list[Any]] | None = None,
         authoritative_account_id: str | None = None,
@@ -289,6 +311,7 @@ class OpsSafetyService:
                     reason=reason,
                     result=result,
                     event_subtype="kill_switch_pending",
+                    operation_id=operation_id,
                 )
             self._log_drain_timeout()
             return result, True
@@ -308,7 +331,12 @@ class OpsSafetyService:
             and not result["recovery_failures"]
         )
         if drained and write_audit:
-            self._write_event_best_effort(actor=actor, reason=reason, result=result)
+            self._write_event_best_effort(
+                actor=actor,
+                reason=reason,
+                result=result,
+                operation_id=operation_id,
+            )
         return result, not drained
 
     def _recover_after_submission_drain(self) -> None:
@@ -318,10 +346,13 @@ class OpsSafetyService:
             result, recovery_pending = self._run_kill_switch(
                 actor=self._recovery_actor,
                 reason=self._recovery_reason,
+                operation_id=self._recovery_operation_id,
                 result=deepcopy(self._recovery_result),
             )
             self._recovery_pending = recovery_pending
             self._recovery_result = deepcopy(result) if recovery_pending else None
+            if not recovery_pending:
+                self._recovery_operation_id = None
 
     def _log_drain_timeout(self) -> None:
         in_flight = getattr(self._execution_engine, "_submissions_in_flight", None)
@@ -586,10 +617,13 @@ class OpsSafetyService:
         reason: str | None,
         result: dict,
         event_subtype: str = "kill_switch",
+        operation_id: str | None = None,
     ) -> None:
         payload = dict(result)
         payload["actor"] = actor
         payload["reason"] = reason
+        if operation_id is not None:
+            payload["operation_id"] = operation_id
         with self._db_session_factory() as session:
             write_system_event(
                 session,

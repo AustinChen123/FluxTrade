@@ -42,6 +42,7 @@ from src.core.engine import (
     SYSTEM_STATE_KEY,
     StrategyEngine,
     _is_runtime_reconciliation_enabled,
+    _kill_switch_result_is_complete,
 )
 from src.core.execution import ExitDecision
 from src.core.interfaces.exchange import (
@@ -822,9 +823,170 @@ class TestHandleCommand:
         """START command should activate the strategy through lifecycle orchestration."""
         engine.activate_strategy = MagicMock()
 
-        engine._handle_command({"command": "START", "params": {"id": "strat_1"}})
+        engine._handle_command(
+            {
+                "command": "START",
+                "params": {
+                    "id": "strat_1",
+                    "actor": "operator@example.com",
+                    "reason": "deployment",
+                },
+            }
+        )
 
-        engine.activate_strategy.assert_called_once_with("strat_1")
+        engine.activate_strategy.assert_called_once_with(
+            "strat_1",
+            actor="operator@example.com",
+            reason="deployment",
+        )
+
+    def test_kill_switch_replays_completed_idempotency_key_once(self, engine):
+        redis_state = {}
+        engine.redis_client.get.side_effect = redis_state.get
+        engine.redis_client.set.side_effect = (
+            lambda key, value, **kwargs: redis_state.__setitem__(key, value)
+        )
+        engine._halt_for_kill_switch = MagicMock()
+        engine.ops_safety.persist_kill_switch_state = MagicMock()
+        engine._run_ops_kill_switch = MagicMock(
+            return_value=_kill_switch_result()
+        )
+        command = {
+            "command": "KILL_SWITCH",
+            "params": {
+                "actor": "operator@example.com",
+                "idempotency_key": "mobile-lockdown-1",
+            },
+        }
+
+        engine._handle_command(command)
+        engine._handle_command(command)
+
+        engine._halt_for_kill_switch.assert_called_once_with()
+        engine._run_ops_kill_switch.assert_called_once_with(
+            actor="operator@example.com",
+            reason=None,
+            operation_id="mobile-lockdown-1",
+        )
+        engine.ops_safety.persist_kill_switch_state.assert_called_once_with(
+            "LOCKDOWN",
+            actor="operator@example.com",
+            reason=None,
+            operation_id="mobile-lockdown-1",
+        )
+
+    @pytest.mark.parametrize(
+        "first_result",
+        [
+            RuntimeError("exchange unavailable"),
+            {"flatten_failures": [{"reason": "exchange unavailable"}]},
+        ],
+    )
+    def test_kill_switch_failed_attempt_does_not_consume_idempotency_key(
+        self,
+        engine,
+        first_result,
+    ):
+        redis_state = {}
+        engine.redis_client.get.side_effect = redis_state.get
+        engine.redis_client.set.side_effect = (
+            lambda key, value, **kwargs: redis_state.__setitem__(key, value)
+        )
+        engine._halt_for_kill_switch = MagicMock()
+        engine.ops_safety.persist_kill_switch_state = MagicMock()
+        engine._run_ops_kill_switch = MagicMock(
+            side_effect=[first_result, _kill_switch_result()]
+        )
+        command = {
+            "command": "KILL_SWITCH",
+            "params": {
+                "actor": "operator@example.com",
+                "idempotency_key": "mobile-lockdown-retry",
+            },
+        }
+
+        engine._handle_command(command)
+        engine._handle_command(command)
+        engine._handle_command(command)
+
+        assert engine._run_ops_kill_switch.call_count == 2
+
+    @pytest.mark.parametrize("failed_path", ["database", "redis", "both"])
+    def test_kill_switch_persistence_failure_keeps_retry_available(
+        self,
+        engine,
+        failed_path,
+    ):
+        redis_state = {}
+
+        def redis_set(key, value, **kwargs):
+            if failed_path in {"redis", "both"} and key == SYSTEM_STATE_KEY:
+                raise RuntimeError("redis unavailable")
+            redis_state[key] = value
+
+        engine.redis_client.get.side_effect = redis_state.get
+        engine.redis_client.set.side_effect = redis_set
+        engine._halt_for_kill_switch = MagicMock()
+        engine.ops_safety.persist_kill_switch_state = MagicMock()
+        if failed_path in {"database", "both"}:
+            engine.ops_safety.persist_kill_switch_state.side_effect = [
+                RuntimeError("database unavailable"),
+                None,
+            ]
+        engine._run_ops_kill_switch = MagicMock(
+            return_value=_kill_switch_result()
+        )
+        command = {
+            "command": "KILL_SWITCH",
+            "params": {
+                "actor": "operator@example.com",
+                "idempotency_key": "mobile-lockdown-persistence-retry",
+            },
+        }
+
+        engine._handle_command(command)
+        if failed_path in {"redis", "both"}:
+            engine.redis_client.set.side_effect = (
+                lambda key, value, **kwargs: redis_state.__setitem__(key, value)
+            )
+        engine._handle_command(command)
+        engine._handle_command(command)
+
+        assert engine._run_ops_kill_switch.call_count == 2
+
+    @pytest.mark.parametrize(
+        ("marker", "expected_calls"),
+        [
+            ("completed", 0),
+            (b"completed", 0),
+            ("unexpected", 1),
+            (b"unexpected", 1),
+        ],
+    )
+    def test_kill_switch_only_accepts_exact_completed_marker(
+        self,
+        engine,
+        marker,
+        expected_calls,
+    ):
+        engine.redis_client.get.return_value = marker
+        engine._halt_for_kill_switch = MagicMock()
+        engine.ops_safety.persist_kill_switch_state = MagicMock()
+        engine._run_ops_kill_switch = MagicMock(
+            return_value=_kill_switch_result()
+        )
+
+        engine._handle_command(
+            {
+                "command": "KILL_SWITCH",
+                "params": {
+                    "actor": "operator@example.com",
+                    "idempotency_key": "mobile-lockdown-marker",
+                },
+            }
+        )
+
+        assert engine._run_ops_kill_switch.call_count == expected_calls
 
     def test_stop_command(self, engine):
         """STOP command should deactivate the strategy through lifecycle orchestration."""
@@ -2729,6 +2891,87 @@ def _kill_switch_result(**overrides):
     }
     result.update(overrides)
     return result
+
+
+@pytest.mark.parametrize(
+    "missing_key",
+    [
+        "cancelled_orders",
+        "cancel_failures",
+        "flattened_positions",
+        "flatten_pending",
+        "flatten_failures",
+        "recovery_failures",
+        "already_flat",
+        "drain_timeout",
+    ],
+)
+def test_kill_switch_completion_requires_full_schema(missing_key):
+    result = _kill_switch_result()
+    result.pop(missing_key)
+
+    assert (
+        _kill_switch_result_is_complete(
+            result,
+            authoritative_required=False,
+        )
+        is False
+    )
+
+
+@pytest.mark.parametrize(
+    "failure_key",
+    [
+        "cancel_failures",
+        "flatten_pending",
+        "flatten_failures",
+        "recovery_failures",
+    ],
+)
+def test_kill_switch_completion_rejects_each_failure_list(failure_key):
+    result = _kill_switch_result(
+        **{failure_key: [{"reason": "incomplete"}]}
+    )
+
+    assert (
+        _kill_switch_result_is_complete(
+            result,
+            authoritative_required=False,
+        )
+        is False
+    )
+
+
+@pytest.mark.parametrize(
+    ("result", "authoritative_required", "expected"),
+    [
+        (_kill_switch_result(), False, True),
+        (_kill_switch_result(drain_timeout=True), False, False),
+        (_kill_switch_result(), True, False),
+        (
+            _kill_switch_result(authoritative_flatten_verified=False),
+            True,
+            False,
+        ),
+        (
+            _kill_switch_result(authoritative_flatten_verified=True),
+            True,
+            True,
+        ),
+    ],
+)
+def test_kill_switch_completion_matrix(
+    result,
+    authoritative_required,
+    expected,
+):
+    assert (
+        _kill_switch_result_is_complete(
+            result,
+            authoritative_required=authoritative_required,
+        )
+        is expected
+    )
 
 
 @pytest.mark.parametrize("remote_quantity", ["1", "0.5"])
