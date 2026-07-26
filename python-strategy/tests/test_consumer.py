@@ -114,6 +114,68 @@ class TestEnsureConsumerGroups:
         assert mock_redis.xgroup_create.call_count == 2
 
 
+class TestDynamicChannels:
+
+    def test_refreshes_channels_from_provider(self, mock_redis):
+        provider = MagicMock(return_value=["stream:market:rithmic:nq-202609:1m"])
+        with patch("src.core.consumer.create_redis_client", return_value=mock_redis):
+            consumer = DataConsumer(
+                channels=[],
+                on_message_callback=MagicMock(),
+                channel_provider=provider,
+            )
+
+        assert consumer._current_channels() == [
+            "stream:market:rithmic:nq-202609:1m"
+        ]
+
+    def test_empty_channels_idle_until_strategy_becomes_active(self, mock_redis):
+        stream = "stream:market:rithmic:nq-202609:1m"
+        provider = MagicMock(side_effect=[[], [stream]])
+        with patch("src.core.consumer.create_redis_client", return_value=mock_redis):
+            consumer = DataConsumer(
+                channels=[],
+                on_message_callback=MagicMock(),
+                channel_provider=provider,
+            )
+
+        def stop_after_read(**kwargs):
+            consumer.running = False
+            return []
+
+        mock_redis.xreadgroup.side_effect = stop_after_read
+        consumer.running = True
+        with patch("src.core.consumer.time.sleep") as sleep:
+            consumer._consume_loop()
+
+        sleep.assert_called_once_with(0.1)
+        mock_redis.xreadgroup.assert_called_once()
+        assert mock_redis.xreadgroup.call_args.kwargs["streams"] == {stream: ">"}
+        mock_redis.xgroup_create.assert_called_once()
+
+    def test_redis_error_invalidates_consumer_group_cache(self, mock_redis):
+        with patch("src.core.consumer.create_redis_client", return_value=mock_redis):
+            consumer = DataConsumer(
+                channels=["stream:market:binance:btcusdt:1m"],
+                on_message_callback=MagicMock(),
+            )
+        consumer._initialized_channels.add(consumer.channels[0])
+        consumer._consume_loop = MagicMock(
+            side_effect=[
+                redis_lib.exceptions.RedisError(
+                    "NOGROUP No such key or consumer group"
+                ),
+                None,
+            ]
+        )
+
+        with patch("src.core.consumer.time.sleep"):
+            consumer.start()
+
+        assert consumer._initialized_channels == set()
+        assert consumer._consume_loop.call_count == 2
+
+
 # =============================================================================
 # Message parsing
 # =============================================================================

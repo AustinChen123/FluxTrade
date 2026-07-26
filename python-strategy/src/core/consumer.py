@@ -4,10 +4,13 @@ import logging
 import os
 import time
 
-import redis
 from decimal import Decimal
-from typing import Callable, List, Union
+from typing import Any, Callable, List, Union, cast
+
 from dotenv import load_dotenv
+from redis.exceptions import ConnectionError as RedisConnectionError
+from redis.exceptions import RedisError, ResponseError
+
 from src.core.models import Candlestick, Trade
 from src.core.redis_factory import create_redis_client
 from src.core.metrics import CONSUMER_LAG_MS
@@ -23,13 +26,20 @@ MAX_RETRIES = 10
 
 
 class DataConsumer:
-    def __init__(self, channels: List[str], on_message_callback: Callable[[Union[Candlestick, Trade]], None]):
+    def __init__(
+        self,
+        channels: List[str],
+        on_message_callback: Callable[[Union[Candlestick, Trade]], None],
+        channel_provider: Callable[[], List[str]] | None = None,
+    ):
         """
         :param channels: List of Redis Stream Keys to consume (e.g., ['stream:market:binance:btcusdt'])
         :param on_message_callback: Function to call when a valid data item is received
         """
         self.redis_client = create_redis_client()
         self.channels = channels
+        self.channel_provider = channel_provider
+        self._initialized_channels: set[str] = set()
         self.callback = on_message_callback
         self.running = False
         self.group_name = "strategy_group"
@@ -46,14 +56,14 @@ class DataConsumer:
 
         while self.running:
             try:
-                self._ensure_consumer_groups()
                 self._consume_loop()
                 # _consume_loop exits cleanly when self.running is False
                 break
             except KeyboardInterrupt:
                 self.stop()
                 break
-            except redis.exceptions.ConnectionError as e:
+            except RedisConnectionError as e:
+                self._initialized_channels.clear()
                 attempts += 1
                 if attempts > MAX_RETRIES:
                     logger.error("Max reconnection attempts (%d) exceeded. Giving up.", MAX_RETRIES)
@@ -62,7 +72,8 @@ class DataConsumer:
                                e, backoff, attempts, MAX_RETRIES)
                 time.sleep(backoff)
                 backoff = min(backoff * 2, MAX_BACKOFF)
-            except (ConnectionError, OSError, redis.exceptions.RedisError) as e:
+            except (ConnectionError, OSError, RedisError) as e:
+                self._initialized_channels.clear()
                 attempts += 1
                 if attempts > MAX_RETRIES:
                     logger.error("Max reconnection attempts (%d) exceeded. Giving up.", MAX_RETRIES)
@@ -72,26 +83,45 @@ class DataConsumer:
                 time.sleep(backoff)
                 backoff = min(backoff * 2, MAX_BACKOFF)
 
-    def _ensure_consumer_groups(self):
+    def _current_channels(self) -> list[str]:
+        if self.channel_provider is not None:
+            self.channels = sorted(set(self.channel_provider()))
+        return self.channels
+
+    def _ensure_consumer_groups(self, channels: list[str] | None = None):
         """Create consumer groups for all channels if they don't exist."""
-        for stream_key in self.channels:
+        channels = self.channels if channels is None else channels
+        for stream_key in channels:
+            if stream_key in self._initialized_channels:
+                continue
             try:
                 self.redis_client.xgroup_create(stream_key, self.group_name, id='$', mkstream=True)
-            except redis.exceptions.ResponseError as e:
-                if "BUSYGROUP" not in str(e):
+                self._initialized_channels.add(stream_key)
+            except ResponseError as e:
+                if "BUSYGROUP" in str(e):
+                    self._initialized_channels.add(stream_key)
+                else:
                     logger.error("Error creating group for %s: %s", stream_key, e)
 
     def _consume_loop(self):
         """Inner xreadgroup loop. Exits when self.running is False or on error."""
         while self.running:
+            channels = self._current_channels()
+            if not channels:
+                time.sleep(0.1)
+                continue
+            self._ensure_consumer_groups(channels)
             # 1. Read from Streams
-            streams = {key: '>' for key in self.channels}
-            response = self.redis_client.xreadgroup(
-                groupname=self.group_name,
-                consumername=self.consumer_name,
-                streams=streams,
-                count=10,
-                block=100
+            streams = {key: '>' for key in channels}
+            response = cast(
+                list[tuple[str, list[tuple[str, dict[str, str]]]]],
+                self.redis_client.xreadgroup(
+                    groupname=self.group_name,
+                    consumername=self.consumer_name,
+                    streams=cast(Any, streams),
+                    count=10,
+                    block=100,
+                ),
             )
 
             if not response:
@@ -106,7 +136,7 @@ class DataConsumer:
                 # Note: ID format is "timestamp-sequence"
                 last_msg_id, _ = messages[-1]
                 last_msg_ts = int(last_msg_id.split('-')[0])
-                t = self.redis_client.time()
+                t = cast(tuple[int, int], self.redis_client.time())
                 server_time_ms = int(t[0] * 1000) + int(t[1] / 1000)
 
                 lag = server_time_ms - last_msg_ts

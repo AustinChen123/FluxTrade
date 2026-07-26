@@ -1,8 +1,10 @@
 import logging
+import json
 import os
 import signal
 import sys
 from contextlib import contextmanager
+from pathlib import Path
 
 import structlog
 
@@ -11,10 +13,10 @@ sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from src.core.consumer import DataConsumer
 from src.core.engine import StrategyEngine
-from src.strategies.example import RandomStrategy
 from src.core.db import SessionLocal
 from src.core.clock import RealtimeClock
 from src.core.metrics import configure_metrics
+from src.core.product_registry import to_exchange_name
 
 
 def _setup_logging() -> None:
@@ -79,7 +81,12 @@ def _env_flag(name: str, default: bool = False) -> bool:
     value = os.getenv(name)
     if value is None:
         return default
-    return value.lower() in {"1", "true", "yes", "on"}
+    normalized = value.strip().lower()
+    if normalized in {"1", "true", "yes", "on"}:
+        return True
+    if normalized in {"0", "false", "no", "off"}:
+        return False
+    raise ValueError(f"{name} must be a boolean")
 
 
 def _env_csv(name: str, default: list[str] | None = None) -> list[str]:
@@ -89,15 +96,54 @@ def _env_csv(name: str, default: list[str] | None = None) -> list[str]:
     return [item.strip() for item in value.split(",") if item.strip()]
 
 
+def _required_env(name: str) -> str:
+    value = (os.getenv(name) or "").strip()
+    if not value:
+        raise ValueError(f"{name} must be set explicitly")
+    return value
+
+
+def _required_env_flag(name: str) -> bool:
+    _required_env(name)
+    return _env_flag(name)
+
+
+def _env_json_object(name: str) -> dict:
+    raw = _required_env(name)
+    try:
+        value = json.loads(raw)
+    except json.JSONDecodeError as exc:
+        raise ValueError(f"{name} must be valid JSON") from exc
+    if not isinstance(value, dict) or not value:
+        raise ValueError(f"{name} must be a non-empty JSON object")
+    return value
+
+
 def _adapter_config_from_env() -> dict:
-    mode = os.getenv("ADAPTER_MODE") or os.getenv("EXCHANGE_MODE") or "simulated"
-    mode = mode.lower()
+    if os.getenv("FLUXTRADE_ENVIRONMENT") == "live":
+        mode = _required_env("ADAPTER_MODE")
+    else:
+        mode = os.getenv("ADAPTER_MODE") or os.getenv("EXCHANGE_MODE") or "simulated"
+    mode = mode.strip().lower()
     if mode == "simulated":
         return {"mode": "simulated"}
     if mode != "live":
         raise ValueError(f"unsupported_adapter_mode: mode={mode}")
 
-    product_ids = _env_csv("INSTRUMENT_PRODUCT_IDS", ["BINANCE:BTCUSDT-PERP"])
+    exchange = _required_env("EXCHANGE_ID").lower()
+    product_ids = _env_csv("INSTRUMENT_PRODUCT_IDS")
+    if not product_ids:
+        raise ValueError("INSTRUMENT_PRODUCT_IDS must be set explicitly")
+    mismatched_products = [
+        product_id
+        for product_id in product_ids
+        if to_exchange_name(product_id) != exchange
+    ]
+    if mismatched_products:
+        raise ValueError(
+            f"INSTRUMENT_PRODUCT_IDS must use {exchange.upper()} venue: "
+            f"{', '.join(mismatched_products)}"
+        )
     account_initialization = {
         "product_ids": product_ids,
         "position_mode": os.getenv("ACCOUNT_POSITION_MODE", "one_way"),
@@ -111,20 +157,43 @@ def _adapter_config_from_env() -> dict:
 
     config = {
         "mode": "live",
-        "exchange": os.getenv("EXCHANGE_ID", "binance"),
-        "api_key": os.getenv("EXCHANGE_API_KEY"),
-        "secret": os.getenv("EXCHANGE_SECRET"),
-        "testnet": _env_flag("EXCHANGE_TESTNET", True),
+        "exchange": exchange,
         "enable_ws": _env_flag("EXCHANGE_ENABLE_WS", False),
         "instrument_product_ids": product_ids,
         "account_initialization": account_initialization,
     }
-    rithmic_profile = (os.getenv("RITHMIC_RECOVERY_PROFILE") or "").strip()
-    account_id = (os.getenv("RITHMIC_ACCOUNT_ID") or "").strip()
-    if rithmic_profile:
-        config["rithmic_recovery_profile"] = rithmic_profile
-    if account_id:
-        config["rithmic_recovery_account_id"] = account_id
+    if exchange != "rithmic":
+        config.update(
+            {
+                "api_key": _required_env("EXCHANGE_API_KEY"),
+                "secret": _required_env("EXCHANGE_SECRET"),
+                "testnet": _required_env_flag("EXCHANGE_TESTNET"),
+            }
+        )
+        return config
+
+    rithmic_profile = _required_env("RITHMIC_PROFILE")
+    account_id = _required_env("RITHMIC_ACCOUNT_ID")
+    instruments = _env_json_object("RITHMIC_INSTRUMENTS_JSON")
+    if set(instruments) != set(product_ids):
+        raise ValueError(
+            "RITHMIC_INSTRUMENTS_JSON keys must match INSTRUMENT_PRODUCT_IDS"
+        )
+    credentials_path = Path(_required_env("FLUXTRADE_CREDENTIALS_PATH"))
+    if not credentials_path.is_file():
+        raise ValueError("FLUXTRADE_CREDENTIALS_PATH must reference a file")
+    recovery_profile = (
+        os.getenv("RITHMIC_RECOVERY_PROFILE") or rithmic_profile
+    ).strip()
+    config.update(
+        {
+            "rithmic_profile": rithmic_profile,
+            "account_id": account_id,
+            "rithmic_instruments": instruments,
+            "rithmic_recovery_profile": recovery_profile,
+            "rithmic_recovery_account_id": account_id,
+        }
+    )
     return config
 
 
@@ -156,7 +225,11 @@ def _session_scope():
 def main():
     logger.info("Starting FluxTrade Strategy Service...")
     adapter_config = _adapter_config_from_env()
-    audit_external_orders = _env_flag("AUDIT_EXTERNAL_ORDERS")
+    audit_external_orders = (
+        _required_env_flag("AUDIT_EXTERNAL_ORDERS")
+        if os.getenv("FLUXTRADE_ENVIRONMENT") == "live"
+        else _env_flag("AUDIT_EXTERNAL_ORDERS")
+    )
     _validate_runtime_config(
         adapter_config,
         audit_external_orders=audit_external_orders,
@@ -183,16 +256,15 @@ def main():
     # Run Startup Checks (System State & Heartbeat)
     engine.startup()
 
-    # 2. Register Strategies
-    # Use 'strategy_1' which exists in seed data
-    strategy_1 = RandomStrategy(strategy_id="strategy_1", product_id="BINANCE:BTCUSDT-PERP")
-    engine.add_strategy(strategy_1)
-
-    # 3. Initialize Data Consumer (Redis Streams)
+    # 2. Initialize Data Consumer (Redis Streams)
     channels = engine.build_stream_channels()
-    consumer = DataConsumer(channels=channels, on_message_callback=engine.on_market_data)
+    consumer = DataConsumer(
+        channels=channels,
+        on_message_callback=engine.on_market_data,
+        channel_provider=engine.build_stream_channels,
+    )
 
-    # 4. Signal handlers for graceful shutdown
+    # 3. Signal handlers for graceful shutdown
     def handle_shutdown(signum, frame):
         sig_name = signal.Signals(signum).name
         logger.info("Received %s, initiating shutdown...", sig_name)
@@ -201,7 +273,7 @@ def main():
     signal.signal(signal.SIGTERM, handle_shutdown)
     signal.signal(signal.SIGINT, handle_shutdown)
 
-    # 5. Start
+    # 4. Start
     try:
         consumer.start()
     finally:

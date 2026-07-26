@@ -1,8 +1,8 @@
 # Stage 1: Chef (Cache dependencies)
-FROM rust:latest AS chef
+FROM rust:1.82.0-bookworm AS chef
 # Use sparse registry for faster updates
 ENV CARGO_REGISTRIES_CRATES_IO_PROTOCOL=sparse
-RUN cargo install cargo-chef
+RUN cargo install cargo-chef --version 0.1.71 --locked
 WORKDIR /app
 
 # Stage 2: Planner

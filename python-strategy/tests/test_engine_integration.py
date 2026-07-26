@@ -200,7 +200,7 @@ def test_commands_update_lifecycle_state_with_real_state_manager(
             StrategyState(
                 strategy_id="s1",
                 status=StrategyStatus.READY.value,
-                config_json="{}",
+                config_json='{"product_id":"BINANCE:BTCUSDT-PERP"}',
                 version=0,
             )
         )
@@ -270,7 +270,7 @@ def test_restart_restore_warms_and_blocks_duplicate_entry_with_real_session(
             StrategyState(
                 strategy_id="s1",
                 status=StrategyStatus.ACTIVE.value,
-                config_json="{}",
+                config_json='{"product_id":"BINANCE:BTCUSDT-PERP"}',
                 version=0,
             )
         )

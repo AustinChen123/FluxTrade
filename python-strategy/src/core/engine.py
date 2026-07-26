@@ -175,6 +175,13 @@ class StrategyEngine:
 
         # Use pre-created adapter or build from config
         effective_adapter_config = adapter_config or {"mode": "simulated"}
+        self._live_product_ids = (
+            frozenset(effective_adapter_config.get("instrument_product_ids") or [])
+            if effective_adapter_config.get("mode") == "live"
+            else None
+        )
+        if self._live_product_ids is not None and not self._live_product_ids:
+            raise ValueError("live adapter requires instrument_product_ids")
         self._rithmic_recovery_profile = effective_adapter_config.get(
             "rithmic_recovery_profile"
         ) or effective_adapter_config.get("rithmic_profile")
@@ -1080,7 +1087,7 @@ class StrategyEngine:
                 # Instantiate with dummy product to get requirements
                 strategy_cls = self.loaded_classes[strategy_id]
                 config = json.loads(state.config_json or "{}")
-                product_id = config.get("product_id", "BINANCE:BTCUSDT-PERP")
+                product_id = self._strategy_product_id(config)
                 
                 temp_instance = strategy_cls(strategy_id, product_id)
                 reqs = temp_instance.requirements
@@ -1135,7 +1142,7 @@ class StrategyEngine:
 
             try:
                 config = json.loads(state.config_json or "{}")
-                product_id = config.get("product_id", "BINANCE:BTCUSDT-PERP")
+                product_id = self._strategy_product_id(config)
                 
                 strategy_cls = self.loaded_classes[strategy_id]
                 instance = strategy_cls(strategy_id, product_id)
@@ -1170,6 +1177,18 @@ class StrategyEngine:
         except Exception as e:
             self._unregister_strategy_instance(strategy_id)
             logger.error("❌ Failed to transition %s to ACTIVE: %s", strategy_id, e)
+
+    def _strategy_product_id(self, config: dict) -> str:
+        product_id = str(config.get("product_id") or "").strip()
+        if self._live_product_ids is None:
+            return product_id or "BINANCE:BTCUSDT-PERP"
+        if not product_id:
+            raise ValueError("strategy product_id must be set explicitly in live")
+        if product_id not in self._live_product_ids:
+            raise ValueError(
+                f"strategy product_id is not enabled for live adapter: {product_id}"
+            )
+        return product_id
 
     def _warm_up_strategy_instance(self, db: Session, instance: BaseStrategy) -> int:
         """Replay recent candles into a strategy without emitting signals."""

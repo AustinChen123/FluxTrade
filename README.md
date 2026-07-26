@@ -109,12 +109,27 @@ FluxTrade does not include features that mature platforms provide: web UI for st
 
 ```bash
 cp .env.example .env
-# Edit .env with your database, Redis, and exchange credentials
+# Set FLUXTRADE_ENVIRONMENT=live and configure the required passwords,
+# API key, adapter, market-data venue, symbols, and risk settings.
+mkdir -p ./secrets
+chmod 700 ./secrets
+# Set FLUXTRADE_SECRETS_DIR to this directory's absolute path.
+# Non-Rithmic deployments may leave the directory empty.
 
-docker-compose -f docker-compose.prod.yml up -d
+docker compose -f docker-compose.prod.yml up -d
 
-# Dashboard at http://localhost:8501
+# Localhost-only endpoints:
+# dashboard http://127.0.0.1:8501
+# control plane http://127.0.0.1:8080
+# Grafana http://127.0.0.1:3000
 ```
+
+The Compose migration job upgrades PostgreSQL before database-backed services
+start. The default local images do not contain the licensed Rithmic protocol
+inputs, and setting Rithmic environment variables does not enable that feature.
+For Rithmic deployment, build approved private Rust and Python images with
+`RITHMIC_PROTO_DIR` pointing to the licensed proto directory outside the
+repository, then set `RUST_DATA_IMAGE` and `PYTHON_STRATEGY_IMAGE`.
 
 ### Manual Setup
 

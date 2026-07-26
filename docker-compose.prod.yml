@@ -1,7 +1,6 @@
 services:
   redis:
-    image: redis:alpine
-    container_name: fluxtrade-redis
+    image: redis:7.4.2-alpine
     restart: always
     command: >
       sh -c "redis-server --save 60 1 --loglevel warning --requirepass \"$$REDIS_PASSWORD\""
@@ -25,8 +24,7 @@ services:
         max-file: "3"
 
   db:
-    image: postgres:15-alpine
-    container_name: fluxtrade-db
+    image: postgres:15.10-alpine
     restart: always
     environment:
       POSTGRES_USER: ${POSTGRES_USER:-fluxtrade}
@@ -51,30 +49,60 @@ services:
         max-size: "10m"
         max-file: "3"
 
+  migrate:
+    image: ${PYTHON_STRATEGY_IMAGE:-fluxtrade-python-strategy:local}
+    build:
+      context: .
+      dockerfile: python-strategy/Dockerfile
+    restart: "no"
+    depends_on:
+      db:
+        condition: service_healthy
+    environment:
+      POSTGRES_HOST: db
+      POSTGRES_PORT: 5432
+      POSTGRES_USER: ${POSTGRES_USER:-fluxtrade}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?POSTGRES_PASSWORD is required}
+      POSTGRES_DB: ${POSTGRES_DB:-fluxtrade}
+    command: ["alembic", "-c", "/app/database/alembic.ini", "upgrade", "head"]
+
   rust-data:
+    image: ${RUST_DATA_IMAGE:-fluxtrade-rust-data:local}
     build:
       context: ./rust-data-service
       dockerfile: Dockerfile
-    container_name: fluxtrade-rust
     restart: unless-stopped
     depends_on:
       redis:
         condition: service_healthy
       db:
         condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
     environment:
       FLUXTRADE_ENVIRONMENT: ${FLUXTRADE_ENVIRONMENT:?FLUXTRADE_ENVIRONMENT is required}
       REDIS_HOST: redis
+      REDIS_PORT: 6379
       REDIS_PASSWORD: ${REDIS_PASSWORD:?REDIS_PASSWORD is required}
       POSTGRES_HOST: db
       POSTGRES_PORT: 5432
       POSTGRES_USER: ${POSTGRES_USER:-fluxtrade}
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?POSTGRES_PASSWORD is required}
       POSTGRES_DB: ${POSTGRES_DB:-fluxtrade}
-      EXCHANGE_ENABLED: "binance,backpack"
-      EXCHANGE_API_KEY: ${EXCHANGE_API_KEY}
-      EXCHANGE_SECRET: ${EXCHANGE_SECRET}
-    command: ["live", "--exchange", "binance", "--symbol", "BTCUSDT"]
+      EXCHANGE_ENABLED: ${EXCHANGE_ENABLED:?EXCHANGE_ENABLED is required}
+      MARKET_DATA_SYMBOLS: ${MARKET_DATA_SYMBOLS:?MARKET_DATA_SYMBOLS is required}
+      PUBLISHER_CHANNEL_CAPACITY: ${PUBLISHER_CHANNEL_CAPACITY:-10000}
+      BINANCE_API_KEY: ${BINANCE_API_KEY:-}
+      EXCHANGE_API_KEY: ${EXCHANGE_API_KEY:-}
+      EXCHANGE_SECRET: ${EXCHANGE_SECRET:-}
+      RITHMIC_PROFILE: ${RITHMIC_PROFILE:-}
+      RITHMIC_PRODUCT_ID: ${RITHMIC_PRODUCT_ID:-}
+      RITHMIC_EXCHANGE: ${RITHMIC_EXCHANGE:-}
+      RITHMIC_SYMBOL: ${RITHMIC_SYMBOL:-}
+      FLUXTRADE_CREDENTIALS_PATH: /run/secrets/fluxtrade/credentials.toml
+    command: ["live"]
+    volumes:
+      - ${FLUXTRADE_SECRETS_DIR:?FLUXTRADE_SECRETS_DIR is required}:/run/secrets/fluxtrade:ro
     deploy:
       resources:
         limits:
@@ -87,37 +115,62 @@ services:
         max-file: "5"
 
   python-strategy:
+    image: ${PYTHON_STRATEGY_IMAGE:-fluxtrade-python-strategy:local}
     build:
-      context: ./python-strategy
-      dockerfile: Dockerfile
-    container_name: fluxtrade-python
+      context: .
+      dockerfile: python-strategy/Dockerfile
     restart: unless-stopped
     depends_on:
       redis:
         condition: service_healthy
       db:
         condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
       rust-data:
         condition: service_started
     environment:
       FLUXTRADE_ENVIRONMENT: ${FLUXTRADE_ENVIRONMENT:?FLUXTRADE_ENVIRONMENT is required}
       REDIS_HOST: redis
+      REDIS_PORT: 6379
       REDIS_PASSWORD: ${REDIS_PASSWORD:?REDIS_PASSWORD is required}
-      CONTROL_PLANE_API_KEY: ${CONTROL_PLANE_API_KEY:?CONTROL_PLANE_API_KEY is required}
       POSTGRES_HOST: db
       POSTGRES_PORT: 5432
       POSTGRES_USER: ${POSTGRES_USER:-fluxtrade}
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?POSTGRES_PASSWORD is required}
       POSTGRES_DB: ${POSTGRES_DB:-fluxtrade}
-      BINANCE_API_KEY: ${BINANCE_API_KEY}
-      BINANCE_SECRET: ${BINANCE_SECRET}
-      METRICS_ENABLED: "true"
-      METRICS_PORT: "9090"
-      LOG_FORMAT: json
-    ports:
-      - "9090:9090"
+      ADAPTER_MODE: ${ADAPTER_MODE:?ADAPTER_MODE is required}
+      EXCHANGE_ID: ${EXCHANGE_ID:-}
+      EXCHANGE_API_KEY: ${EXCHANGE_API_KEY:-}
+      EXCHANGE_SECRET: ${EXCHANGE_SECRET:-}
+      EXCHANGE_TESTNET: ${EXCHANGE_TESTNET:-}
+      EXCHANGE_ENABLE_WS: ${EXCHANGE_ENABLE_WS:-false}
+      INSTRUMENT_PRODUCT_IDS: ${INSTRUMENT_PRODUCT_IDS:-}
+      ACCOUNT_POSITION_MODE: ${ACCOUNT_POSITION_MODE:-one_way}
+      ACCOUNT_LEVERAGE: ${ACCOUNT_LEVERAGE:-}
+      ACCOUNT_MARGIN_MODE: ${ACCOUNT_MARGIN_MODE:-}
+      AUDIT_EXTERNAL_ORDERS: ${AUDIT_EXTERNAL_ORDERS:?AUDIT_EXTERNAL_ORDERS is required}
+      RITHMIC_PROFILE: ${RITHMIC_PROFILE:-}
+      RITHMIC_RECOVERY_PROFILE: ${RITHMIC_RECOVERY_PROFILE:-}
+      RITHMIC_ACCOUNT_ID: ${RITHMIC_ACCOUNT_ID:-}
+      RITHMIC_INSTRUMENTS_JSON: ${RITHMIC_INSTRUMENTS_JSON:-}
+      FLUXTRADE_CREDENTIALS_PATH: /run/secrets/fluxtrade/credentials.toml
+      RISK_MAX_SINGLE_ORDER_NOTIONAL_PCT: ${RISK_MAX_SINGLE_ORDER_NOTIONAL_PCT:-0.05}
+      RISK_DAILY_LOSS_CIRCUIT_BREAKER_PCT: ${RISK_DAILY_LOSS_CIRCUIT_BREAKER_PCT:-0.05}
+      RISK_MAX_ORDERS_PER_MINUTE: ${RISK_MAX_ORDERS_PER_MINUTE:-10}
+      RISK_MAX_PRICE_DEVIATION_FROM_MID_PCT: ${RISK_MAX_PRICE_DEVIATION_FROM_MID_PCT:-0.03}
+      RISK_MAX_POSITION_NOTIONAL: ${RISK_MAX_POSITION_NOTIONAL:-100000}
+      RISK_ALLOW_SAME_SIDE_REENTRY: ${RISK_ALLOW_SAME_SIDE_REENTRY:-false}
+      RUNTIME_RECONCILE_INTERVAL_SECONDS: ${RUNTIME_RECONCILE_INTERVAL_SECONDS:-3600}
+      RECONCILE_QTY_DRIFT_THRESHOLD: ${RECONCILE_QTY_DRIFT_THRESHOLD:-0.00000001}
+      RECONCILE_BALANCE_DRIFT_THRESHOLD: ${RECONCILE_BALANCE_DRIFT_THRESHOLD:-0.01}
+      METRICS_ENABLED: ${METRICS_ENABLED:-true}
+      METRICS_PORT: 9090
+      LOG_FORMAT: ${LOG_FORMAT:-json}
+      HOT_STRATEGIES_PATH: /app/strategies_hot
     volumes:
       - ./python-strategy/strategies_hot:/app/strategies_hot
+      - ${FLUXTRADE_SECRETS_DIR:?FLUXTRADE_SECRETS_DIR is required}:/run/secrets/fluxtrade:ro
     deploy:
       resources:
         limits:
@@ -129,19 +182,76 @@ services:
         max-size: "10m"
         max-file: "5"
 
+  control-plane:
+    image: ${PYTHON_STRATEGY_IMAGE:-fluxtrade-python-strategy:local}
+    build:
+      context: .
+      dockerfile: python-strategy/Dockerfile
+    restart: unless-stopped
+    depends_on:
+      redis:
+        condition: service_healthy
+      db:
+        condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
+    environment:
+      FLUXTRADE_ENVIRONMENT: ${FLUXTRADE_ENVIRONMENT:?FLUXTRADE_ENVIRONMENT is required}
+      REDIS_HOST: redis
+      REDIS_PORT: 6379
+      REDIS_PASSWORD: ${REDIS_PASSWORD:?REDIS_PASSWORD is required}
+      POSTGRES_HOST: db
+      POSTGRES_PORT: 5432
+      POSTGRES_USER: ${POSTGRES_USER:-fluxtrade}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?POSTGRES_PASSWORD is required}
+      POSTGRES_DB: ${POSTGRES_DB:-fluxtrade}
+      CONTROL_PLANE_HOST: 0.0.0.0
+      CONTROL_PLANE_PORT: 8080
+      CONTROL_PLANE_API_KEY: ${CONTROL_PLANE_API_KEY:?CONTROL_PLANE_API_KEY is required}
+      CONTROL_PLANE_JOB_DB_PATH: /app/data/jobs.sqlite3
+      LOG_FORMAT: ${LOG_FORMAT:-json}
+    command: ["python", "-m", "src.control_plane.main"]
+    ports:
+      - "127.0.0.1:${CONTROL_PLANE_PORT:-8080}:8080"
+    volumes:
+      - control_plane_jobs:/app/data
+    healthcheck:
+      test:
+        [
+          "CMD",
+          "python",
+          "-c",
+          "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8080/health', timeout=2)",
+        ]
+      interval: 10s
+      timeout: 3s
+      retries: 3
+      start_period: 10s
+    deploy:
+      resources:
+        limits:
+          memory: ${CONTROL_PLANE_MEMORY_LIMIT:-512M}
+          cpus: ${CONTROL_PLANE_CPU_LIMIT:-0.5}
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
   dashboard:
     build:
       context: ./dashboard
       dockerfile: Dockerfile
-    container_name: fluxtrade-dashboard
     restart: always
     depends_on:
       redis:
         condition: service_healthy
       db:
         condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
     ports:
-      - "8501:8501"
+      - "127.0.0.1:${DASHBOARD_PORT:-8501}:8501"
     environment:
       REDIS_HOST: redis
       REDIS_PASSWORD: ${REDIS_PASSWORD:?REDIS_PASSWORD is required}
@@ -169,11 +279,8 @@ services:
         max-file: "3"
 
   prometheus:
-    image: prom/prometheus:latest
-    container_name: fluxtrade-prometheus
+    image: prom/prometheus:v3.1.0
     restart: always
-    ports:
-      - "9091:9090"
     volumes:
       - ./monitoring/prometheus.yml:/etc/prometheus/prometheus.yml:ro
       - prometheus_data:/prometheus
@@ -192,13 +299,12 @@ services:
         max-file: "3"
 
   grafana:
-    image: grafana/grafana:latest
-    container_name: fluxtrade-grafana
+    image: grafana/grafana:11.4.0
     restart: always
     depends_on:
       - prometheus
     ports:
-      - "3000:3000"
+      - "127.0.0.1:${GRAFANA_PORT:-3000}:3000"
     environment:
       GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_PASSWORD:?GRAFANA_PASSWORD is required}
     volumes:
@@ -217,5 +323,6 @@ services:
 
 volumes:
   postgres_data:
+  control_plane_jobs:
   prometheus_data:
   grafana_data:
