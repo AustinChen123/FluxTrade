@@ -11,6 +11,8 @@ Covers:
 from decimal import Decimal
 from unittest.mock import MagicMock, patch
 
+import pytest
+
 from src.core.backtest_runner import (
     _write_csv_trades,
     _write_equity_curve,
@@ -255,6 +257,23 @@ class TestBacktestRunnerInit:
         assert runner.report_config["csv_trades"] is False
         # Other defaults preserved
         assert runner.report_config["markdown_report"] is True
+
+    @patch("src.core.backtest_runner.SessionLocal")
+    def test_unknown_report_config_key_is_rejected(self, mock_session_local):
+        """A typo must not silently leave a default report export enabled."""
+        mock_session_local.return_value = MagicMock()
+
+        with pytest.raises(
+            ValueError,
+            match="unknown report_config keys: journal",
+        ):
+            BacktestRunner(
+                start_time=0,
+                end_time=0,
+                product_id="X:Y-PERP",
+                timeframe="1m",
+                report_config={"journal": False},
+            )
 
 
 # =============================================================================

@@ -179,6 +179,12 @@ class BacktestRunner:
         self.max_drawdown_limit = max_drawdown_limit
         self.data_source = data_source
         self.fee_config = fee_config or {}
+        unknown_report_keys = set(report_config or {}) - set(DEFAULT_REPORT_CONFIG)
+        if unknown_report_keys:
+            raise ValueError(
+                "unknown report_config keys: "
+                + ", ".join(sorted(str(key) for key in unknown_report_keys))
+            )
         self.report_config = {**DEFAULT_REPORT_CONFIG, **(report_config or {})}
         self._db_session_factory = db_session_factory or _sessionlocal_context
         self.instrument_spec = instrument_spec

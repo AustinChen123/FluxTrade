@@ -582,7 +582,7 @@ class TestBacktestMultiStrategy:
                 "csv_trades": False,
                 "equity_curve": False,
                 "markdown_report": False,
-                "journal": False,
+                "journal_export": False,
             },
         )
 
@@ -624,7 +624,7 @@ class TestBacktestMultiStrategy:
                 "csv_trades": False,
                 "equity_curve": False,
                 "markdown_report": False,
-                "journal": False,
+                "journal_export": False,
             },
         )
 

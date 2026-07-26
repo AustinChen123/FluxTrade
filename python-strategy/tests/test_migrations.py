@@ -16,9 +16,10 @@ database:
    compare the resulting schema fingerprints to confirm idempotency.
 
 Each test runs against an isolated database created via ``CREATE DATABASE``
-on the project's PostgreSQL instance (Fixture Plan B). The database is
-dropped at fixture teardown. If PostgreSQL is unreachable the entire module
-is skipped, so this file is safe to keep in the default ``pytest`` run.
+on the explicitly selected PostgreSQL instance (Fixture Plan B). The database
+is dropped at fixture teardown. The module requires
+``FLUXTRADE_RUN_POSTGRES_MIGRATION_TESTS=1`` before checking connectivity, so a
+default ``pytest`` run cannot create or drop databases.
 
 Marked ``integration`` to keep it out of unit-only runs.
 """
@@ -42,6 +43,13 @@ ALEMBIC_INI = os.path.abspath(
 )
 
 pytestmark = pytest.mark.integration
+
+if os.getenv("FLUXTRADE_RUN_POSTGRES_MIGRATION_TESTS") != "1":
+    pytest.skip(
+        "set FLUXTRADE_RUN_POSTGRES_MIGRATION_TESTS=1 to run destructive "
+        "PostgreSQL migration tests",
+        allow_module_level=True,
+    )
 
 
 # --------------------------------------------------------------------------- #

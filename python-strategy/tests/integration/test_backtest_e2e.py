@@ -154,7 +154,7 @@ class TestBacktestE2E:
             data_source=memory_source,
             fee_config={"maker": 0.0002, "taker": 0.0006},
             report_config={"csv_trades": False, "equity_curve": False,
-                           "markdown_report": False, "journal": False},
+                           "markdown_report": False, "journal_export": False},
         )
 
         strategy = AlwaysLongStrategy()
@@ -184,7 +184,7 @@ class TestBacktestE2E:
             data_source=memory_source,
             fee_config={"maker": 0.0002, "taker": 0.0006},
             report_config={"csv_trades": False, "equity_curve": False,
-                           "markdown_report": False, "journal": False},
+                           "markdown_report": False, "journal_export": False},
         )
 
         strategy = AlwaysLongStrategy()
@@ -211,7 +211,7 @@ class TestBacktestE2E:
                 data_source=memory_source,
                 fee_config=fee_config,
                 report_config={"csv_trades": False, "equity_curve": False,
-                               "markdown_report": False, "journal": False},
+                               "markdown_report": False, "journal_export": False},
             )
             runner.add_strategy(AlwaysLongStrategy())
             return runner.run()
@@ -239,7 +239,7 @@ class TestBacktestE2E:
             data_source=memory_source,
             fee_config={"maker": 0.0002, "taker": 0.0006},
             report_config={"csv_trades": False, "equity_curve": False,
-                           "markdown_report": False, "journal": False},
+                           "markdown_report": False, "journal_export": False},
         )
 
         runner.add_strategy(AlwaysLongStrategy())
@@ -265,7 +265,7 @@ class TestBacktestE2E:
             data_source=memory_source,
             fee_config={"maker": 0.001, "taker": 0.002},
             report_config={"csv_trades": False, "equity_curve": False,
-                           "markdown_report": False, "journal": False},
+                           "markdown_report": False, "journal_export": False},
         )
 
         runner.add_strategy(AlwaysLongStrategy())
@@ -299,7 +299,7 @@ class TestBacktestE2E:
             max_drawdown_limit=0.004,
             data_source=data_source,
             report_config={"csv_trades": False, "equity_curve": False,
-                           "markdown_report": False, "journal": False},
+                           "markdown_report": False, "journal_export": False},
         )
 
         runner.add_strategy(OneShotLongStrategy())
@@ -345,7 +345,7 @@ class TestBacktestE2E:
                 "csv_trades": False,
                 "equity_curve": False,
                 "markdown_report": False,
-                "journal": False,
+                "journal_export": False,
             },
         )
         runner.add_strategy(OneShotLongStrategy("long-a"))

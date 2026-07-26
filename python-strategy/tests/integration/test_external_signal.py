@@ -94,7 +94,7 @@ def _run_backtest(strategy, candle_data, mock_session_local, data_source=None):
         data_source=ds,
         fee_config={"maker": 0.0002, "taker": 0.0006},
         report_config={"csv_trades": False, "equity_curve": False,
-                       "markdown_report": False, "journal": False},
+                       "markdown_report": False, "journal_export": False},
     )
     runner.add_strategy(strategy)
     return runner.run()
