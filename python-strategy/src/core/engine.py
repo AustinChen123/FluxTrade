@@ -1,3 +1,4 @@
+import hashlib
 import json
 import math
 import os
@@ -61,8 +62,41 @@ SYSTEM_BOOT_STATE_KEY = _DEFAULT_RUNTIME_ENVIRONMENT.key("system:engine_boot_sta
 SYSTEM_STATE_LOCKDOWN = "LOCKDOWN"
 SYSTEM_STATE_OK = "OK"
 _RITHMIC_SAFE_ORDER_EVENT_ACTIONS = frozenset({"applied"})
+_KILL_SWITCH_IDEMPOTENCY_TTL_SECONDS = 86_400
 
 logger = logging.getLogger(__name__)
+
+
+def _kill_switch_result_is_complete(
+    result: dict,
+    *,
+    authoritative_required: bool,
+) -> bool:
+    count_keys = ("cancelled_orders", "flattened_positions")
+    list_keys = (
+        "cancel_failures",
+        "flatten_pending",
+        "flatten_failures",
+        "recovery_failures",
+    )
+    if any(
+        type(result.get(key)) is not int or result[key] < 0
+        for key in count_keys
+    ):
+        return False
+    if any(not isinstance(result.get(key), list) for key in list_keys):
+        return False
+    if type(result.get("already_flat")) is not bool:
+        return False
+    if result.get("drain_timeout") is not False:
+        return False
+    if any(result[key] for key in list_keys):
+        return False
+    if authoritative_required:
+        return result.get("authoritative_flatten_verified") is True
+    return "authoritative_flatten_verified" not in result or (
+        result["authoritative_flatten_verified"] is True
+    )
 
 
 def _merge_kill_switch_results(current: dict | None, update: dict) -> dict:
@@ -552,10 +586,20 @@ class StrategyEngine:
         *,
         actor: str,
         reason: str | None,
+        operation_id: str | None = None,
     ) -> dict:
         adapter = self.execution_engine.adapter
         if not isinstance(adapter, RithmicExchangeAdapter):
-            return self.ops_safety.kill_switch(actor=actor, reason=reason)
+            if operation_id is None:
+                return self.ops_safety.kill_switch(
+                    actor=actor,
+                    reason=reason,
+                )
+            return self.ops_safety.kill_switch(
+                actor=actor,
+                reason=reason,
+                operation_id=operation_id,
+            )
 
         aggregate = None
         operation_failed = False
@@ -584,11 +628,14 @@ class StrategyEngine:
                         "reason": failure_reason,
                     }
                 )
-            self.ops_safety.record_kill_switch_result(
-                actor=actor,
-                reason=reason,
-                result=aggregate,
-            )
+            audit_kwargs = {
+                "actor": actor,
+                "reason": reason,
+                "result": aggregate,
+            }
+            if operation_id is not None:
+                audit_kwargs["operation_id"] = operation_id
+            self.ops_safety.record_kill_switch_result(**audit_kwargs)
             return aggregate
 
         self._order_event_stop.set()
@@ -635,13 +682,16 @@ class StrategyEngine:
             submit_exit = True
             for _verification_attempt in range(6):
                 if submit_exit:
-                    result = (
-                        self.ops_safety.kill_switch_with_authoritative_positions(
-                            actor=actor,
-                            reason=reason,
-                            position_loader=load_positions,
-                            account_id=adapter.account_id,
-                        )
+                    authoritative_kwargs = {
+                        "actor": actor,
+                        "reason": reason,
+                        "position_loader": load_positions,
+                        "account_id": adapter.account_id,
+                    }
+                    if operation_id is not None:
+                        authoritative_kwargs["operation_id"] = operation_id
+                    result = self.ops_safety.kill_switch_with_authoritative_positions(
+                        **authoritative_kwargs
                     )
                     aggregate = _merge_kill_switch_results(aggregate, result)
                     exit_attempts += 1
@@ -733,11 +783,14 @@ class StrategyEngine:
                         f"{type(restart_error).__name__}"
                     }
                 )
-                self.ops_safety.record_kill_switch_result(
-                    actor=actor,
-                    reason=reason,
-                    result=aggregate,
-                )
+                audit_kwargs = {
+                    "actor": actor,
+                    "reason": reason,
+                    "result": aggregate,
+                }
+                if operation_id is not None:
+                    audit_kwargs["operation_id"] = operation_id
+                self.ops_safety.record_kill_switch_result(**audit_kwargs)
                 if operation_failed:
                     logger.exception(
                         "Order stream restart also failed after emergency flatten failure"
@@ -909,33 +962,76 @@ class StrategyEngine:
                 self.test_run_strategy(params.get("id"), params.get("days", 1))
             elif cmd == "KILL_SWITCH":
                 with self._ops_command_lock:
-                    self._halt_for_kill_switch()
                     actor = params.get("actor", "operator")
                     reason = params.get("reason")
+                    idempotency_key = params.get("idempotency_key")
+                    if (
+                        isinstance(idempotency_key, str)
+                        and self._kill_switch_operation_completed(
+                            actor=str(actor),
+                            idempotency_key=idempotency_key,
+                        )
+                    ):
+                        logger.info(
+                            "Skipping completed kill switch operation for actor %s",
+                            actor,
+                        )
+                        return
+                    self._halt_for_kill_switch()
+                    db_state_persisted = False
                     try:
+                        persist_kwargs = {
+                            "actor": actor,
+                            "reason": reason,
+                        }
+                        if isinstance(idempotency_key, str):
+                            persist_kwargs["operation_id"] = idempotency_key
                         self.ops_safety.persist_kill_switch_state(
                             SYSTEM_STATE_LOCKDOWN,
-                            actor=actor,
-                            reason=reason,
+                            **persist_kwargs,
                         )
+                        db_state_persisted = True
                     except Exception:
                         logger.exception(
                             "Failed to persist kill switch state to database"
                         )
+                    redis_state_persisted = False
                     try:
                         self.redis_client.set(
                             self._system_state_key,
                             SYSTEM_STATE_LOCKDOWN,
                         )
+                        redis_state_persisted = True
                     except Exception:
                         logger.exception(
                             "Failed to persist kill switch state; local halt remains active"
                         )
-                    self._run_ops_kill_switch(
-                        actor=actor,
-                        reason=reason,
+                    kill_switch_kwargs = {
+                        "actor": actor,
+                        "reason": reason,
+                    }
+                    if isinstance(idempotency_key, str):
+                        kill_switch_kwargs["operation_id"] = idempotency_key
+                    kill_switch_result = self._run_ops_kill_switch(
+                        **kill_switch_kwargs
                     )
                     self._kill_switch_halted = True
+                    if (
+                        isinstance(idempotency_key, str)
+                        and db_state_persisted
+                        and redis_state_persisted
+                        and _kill_switch_result_is_complete(
+                            kill_switch_result,
+                            authoritative_required=isinstance(
+                                self.execution_engine.adapter,
+                                RithmicExchangeAdapter,
+                            ),
+                        )
+                    ):
+                        self._mark_kill_switch_operation_completed(
+                            actor=str(actor),
+                            idempotency_key=idempotency_key,
+                        )
             elif cmd == "CLEAR_KILL_SWITCH":
                 with self._ops_command_lock:
                     actor = params.get("actor", "operator")
@@ -995,6 +1091,60 @@ class StrategyEngine:
                     logger.warning("Command %s failed: %s", cmd, result.message)
         except Exception as e:
             logger.error("Error executing command %s: %s\n%s", cmd, e, traceback.format_exc())
+
+    def _kill_switch_operation_redis_key(
+        self,
+        *,
+        actor: str,
+        idempotency_key: str,
+    ) -> str:
+        digest = hashlib.sha256(
+            f"{actor}\0{idempotency_key}".encode()
+        ).hexdigest()
+        return self.runtime_environment.key(
+            f"ops:kill-switch:idempotency:{digest}"
+        )
+
+    def _kill_switch_operation_completed(
+        self,
+        *,
+        actor: str,
+        idempotency_key: str,
+    ) -> bool:
+        key = self._kill_switch_operation_redis_key(
+            actor=actor,
+            idempotency_key=idempotency_key,
+        )
+        try:
+            marker = self.redis_client.get(key)
+            return marker in {"completed", b"completed"}
+        except Exception:
+            logger.exception(
+                "Unable to read kill switch idempotency marker; retrying safely"
+            )
+            return False
+
+    def _mark_kill_switch_operation_completed(
+        self,
+        *,
+        actor: str,
+        idempotency_key: str,
+    ) -> None:
+        key = self._kill_switch_operation_redis_key(
+            actor=actor,
+            idempotency_key=idempotency_key,
+        )
+        try:
+            self.redis_client.set(
+                key,
+                "completed",
+                ex=_KILL_SWITCH_IDEMPOTENCY_TTL_SECONDS,
+            )
+        except Exception:
+            logger.exception(
+                "Unable to persist kill switch idempotency marker; "
+                "future retries will execute safely"
+            )
 
     def scan_strategies(self):
         """

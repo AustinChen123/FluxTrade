@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 from collections.abc import Mapping
 from dataclasses import dataclass
+from datetime import UTC, datetime
 from hmac import compare_digest
 from urllib.parse import parse_qs, urlsplit
 from typing import Any
@@ -10,6 +11,11 @@ from typing import Any
 from pydantic import ValidationError
 
 from src.control_plane.backtest_jobs import BacktestJobExecutor
+from src.control_plane.browser_auth import (
+    BrowserAuthProvider,
+    BrowserAuthRejected,
+    BrowserPrincipal,
+)
 from src.control_plane.gene_control import GeneControlService
 from src.control_plane.models import (
     BacktestJobRequest,
@@ -32,9 +38,16 @@ from src.control_plane.strategy_state_query import StrategyStateQueryService
 class HttpResponse:
     status_code: int
     body: dict[str, Any]
+    headers: tuple[tuple[str, str], ...] = ()
 
     def json(self) -> str:
         return json.dumps(self.body, separators=(",", ":"), default=str)
+
+
+@dataclass(frozen=True, slots=True)
+class _RequestIdentity:
+    actor: str
+    browser_principal: BrowserPrincipal | None = None
 
 
 class ControlPlaneApp:
@@ -49,6 +62,7 @@ class ControlPlaneApp:
         strategy_state_query: StrategyStateQueryService | None = None,
         api_key: str | None = None,
         redis_client: Any | None = None,
+        browser_auth: BrowserAuthProvider | None = None,
     ) -> None:
         if api_key == "":
             raise ValueError("api_key must be non-empty when provided")
@@ -59,6 +73,7 @@ class ControlPlaneApp:
         self.strategy_state_query = strategy_state_query
         self.api_key = api_key
         self.redis_client = redis_client
+        self.browser_auth = browser_auth
 
     def handle(
         self,
@@ -75,9 +90,33 @@ class ControlPlaneApp:
         if method == "GET" and clean_path == "/health":
             return HttpResponse(200, {"status": "ok"})
 
-        auth_response = self._authorize(headers)
-        if auth_response is not None:
-            return auth_response
+        if method == "POST" and clean_path == "/api/v1/auth/session":
+            return self._create_browser_session(headers)
+
+        identity = self._authorize(headers)
+        if isinstance(identity, HttpResponse):
+            if clean_path == "/api/v1/auth/session":
+                return HttpResponse(
+                    identity.status_code,
+                    identity.body,
+                    headers=(("Cache-Control", "no-store"),),
+                )
+            return identity
+
+        browser_policy_response = self._authorize_browser_request(
+            method,
+            clean_path,
+            headers,
+            identity.browser_principal,
+        )
+        if browser_policy_response is not None:
+            return browser_policy_response
+
+        if method == "GET" and clean_path == "/api/v1/auth/session":
+            return self._get_browser_session(identity.browser_principal)
+
+        if method == "POST" and clean_path == "/api/v1/auth/logout":
+            return self._logout_browser_session(identity.browser_principal)
 
         if method == "POST" and clean_path == "/jobs/backtests":
             return self._submit_backtest(body)
@@ -95,7 +134,7 @@ class ControlPlaneApp:
             return self._handle_job_action(clean_path, body)
 
         if method == "POST" and clean_path.startswith("/genes/"):
-            return self._submit_gene_action(clean_path, body)
+            return self._submit_gene_action(clean_path, body, actor=identity.actor)
 
         if method == "GET" and clean_path == "/genes":
             return self._list_genes(query)
@@ -152,7 +191,12 @@ class ControlPlaneApp:
             return self._command_response(result)
 
         if method == "POST" and clean_path.startswith("/strategies/"):
-            return self._submit_strategy_command(clean_path, body)
+            return self._submit_strategy_command(
+                clean_path,
+                body,
+                actor=identity.actor,
+                browser_principal=identity.browser_principal,
+            )
 
         if method == "GET" and clean_path.startswith("/jobs/"):
             job_id = clean_path.removeprefix("/jobs/")
@@ -165,11 +209,19 @@ class ControlPlaneApp:
 
         if method == "POST" and clean_path == "/ops/kill-switch/clear":
             return self._publish_ops_command(
-                {"command": "CLEAR_KILL_SWITCH", "params": {"actor": "operator"}}
+                {
+                    "command": "CLEAR_KILL_SWITCH",
+                    "params": {"actor": identity.actor},
+                }
             )
 
         if method == "POST" and clean_path == "/ops/kill-switch":
-            return self._handle_kill_switch(body)
+            return self._handle_kill_switch(
+                body,
+                headers=headers,
+                actor=identity.actor,
+                require_confirmation=identity.browser_principal is not None,
+            )
 
         return HttpResponse(404, {"error": "not_found"})
 
@@ -314,6 +366,9 @@ class ControlPlaneApp:
         self,
         path: str,
         body: str | bytes | None,
+        *,
+        actor: str,
+        browser_principal: BrowserPrincipal | None,
     ) -> HttpResponse:
         if self.strategy_control is None:
             return HttpResponse(503, {"error": "strategy_control_unavailable"})
@@ -343,8 +398,20 @@ class ControlPlaneApp:
         except ValueError as exc:
             return HttpResponse(400, {"error": "invalid_json", "detail": str(exc)})
 
+        if (
+            browser_principal is not None
+            and request.command in {"START", "RESUME", "FORCE_RECOVER", "RELOAD"}
+        ):
+            assert self.browser_auth is not None
+            if not self.browser_auth.has_step_up(browser_principal):
+                return HttpResponse(403, {"error": "step_up_required"})
+
         try:
-            result = self.strategy_control.submit_command(strategy_id, request)
+            result = self.strategy_control.submit_command(
+                strategy_id,
+                request,
+                actor=actor,
+            )
         except StrategyControlUnavailable as exc:
             return HttpResponse(
                 503,
@@ -352,19 +419,15 @@ class ControlPlaneApp:
             )
         return self._command_response(result)
 
-    def _handle_kill_switch(self, body: str | bytes | None) -> HttpResponse:
-        """Publish a KILL_SWITCH command to the strategy engine via Redis.
-
-        Parses optional {"reason": str} from the request body, publishes
-        {"command": "KILL_SWITCH", "params": {"actor": "operator", "reason": ...}}
-        to the Redis channel ``cmd:strategy:control``, and returns 202.
-
-        Implementer must:
-        - Ensure self.redis_client is set (injected at construction time).
-        - Parse body JSON; "reason" key is optional.
-        - Publish JSON-encoded command to "cmd:strategy:control".
-        - Return HttpResponse(202, {"status": "accepted"}).
-        """
+    def _handle_kill_switch(
+        self,
+        body: str | bytes | None,
+        *,
+        headers: Mapping[str, str] | None,
+        actor: str,
+        require_confirmation: bool,
+    ) -> HttpResponse:
+        """Validate and publish an actor-attributed KILL_SWITCH command."""
         try:
             payload = self._parse_json_body(body)
         except json.JSONDecodeError as exc:
@@ -374,16 +437,35 @@ class ControlPlaneApp:
         reason = payload.get("reason")
         if reason is not None and not isinstance(reason, str):
             return HttpResponse(422, {"error": "validation_error"})
+        if require_confirmation and payload.get("confirm") is not True:
+            return HttpResponse(403, {"error": "confirmation_required"})
+        idempotency_key = None
+        if require_confirmation:
+            idempotency_key = _extract_idempotency_key(headers)
+            if idempotency_key is None:
+                return HttpResponse(400, {"error": "idempotency_key_required"})
+            if not _valid_idempotency_key(idempotency_key):
+                return HttpResponse(400, {"error": "idempotency_key_invalid"})
         command = {
             "command": "KILL_SWITCH",
             "params": {
-                "actor": "operator",
+                "actor": actor,
                 "reason": reason,
             },
         }
-        return self._publish_ops_command(command)
+        if idempotency_key is not None:
+            command["params"]["idempotency_key"] = idempotency_key
+        return self._publish_ops_command(
+            command,
+            operation_id=idempotency_key,
+        )
 
-    def _publish_ops_command(self, command: dict[str, Any]) -> HttpResponse:
+    def _publish_ops_command(
+        self,
+        command: dict[str, Any],
+        *,
+        operation_id: str | None = None,
+    ) -> HttpResponse:
         if self.redis_client is None:
             return HttpResponse(503, {"error": "redis_unavailable"})
         try:
@@ -398,12 +480,17 @@ class ControlPlaneApp:
             )
         if subscribers == 0:
             return HttpResponse(503, {"error": "kill_switch_no_listener"})
-        return HttpResponse(202, {"status": "accepted"})
+        body = {"status": "accepted"}
+        if operation_id is not None:
+            body["operation_id"] = operation_id
+        return HttpResponse(202, body)
 
     def _submit_gene_action(
         self,
         path: str,
         body: str | bytes | None,
+        *,
+        actor: str,
     ) -> HttpResponse:
         if self.gene_control is None:
             return HttpResponse(503, {"error": "gene_control_unavailable"})
@@ -425,7 +512,7 @@ class ControlPlaneApp:
             result = self.gene_control.promote_gene(
                 gene_id,
                 reason=request.reason,
-                actor=request.actor,
+                actor=actor,
             )
         except json.JSONDecodeError as exc:
             return HttpResponse(400, {"error": "invalid_json", "detail": str(exc)})
@@ -659,13 +746,115 @@ class ControlPlaneApp:
             status_code = 400
         return HttpResponse(status_code, {"result": result})
 
-    def _authorize(self, headers: Mapping[str, str] | None) -> HttpResponse | None:
-        if self.api_key is None:
-            return None
+    def _create_browser_session(
+        self,
+        headers: Mapping[str, str] | None,
+    ) -> HttpResponse:
+        if self.browser_auth is None:
+            return HttpResponse(404, {"error": "not_found"})
+        try:
+            principal = self.browser_auth.issue(headers)
+        except BrowserAuthRejected as exc:
+            status_code = 403 if exc.reason == "origin_rejected" else 401
+            return HttpResponse(
+                status_code,
+                {"error": exc.reason},
+                headers=(("Cache-Control", "no-store"),),
+            )
+        return HttpResponse(
+            201,
+            {
+                "actor": principal.actor,
+                "capabilities": sorted(principal.capabilities),
+                "csrf_token": principal.csrf_token,
+                "expires_at": _utc_iso(principal.expires_at),
+                "step_up_expires_at": _utc_iso(principal.step_up_expires_at),
+            },
+            headers=(
+                ("Cache-Control", "no-store"),
+                ("Set-Cookie", self.browser_auth.session_cookie(principal)),
+            ),
+        )
+
+    @staticmethod
+    def _get_browser_session(
+        principal: BrowserPrincipal | None,
+    ) -> HttpResponse:
+        if principal is None:
+            return HttpResponse(401, {"error": "browser_session_required"})
+        return HttpResponse(
+            200,
+            {
+                "actor": principal.actor,
+                "capabilities": sorted(principal.capabilities),
+                "csrf_token": principal.csrf_token,
+                "expires_at": _utc_iso(principal.expires_at),
+                "step_up_expires_at": _utc_iso(principal.step_up_expires_at),
+            },
+            headers=(("Cache-Control", "no-store"),),
+        )
+
+    def _logout_browser_session(
+        self,
+        principal: BrowserPrincipal | None,
+    ) -> HttpResponse:
+        if self.browser_auth is None or principal is None:
+            return HttpResponse(401, {"error": "browser_session_required"})
+        self.browser_auth.revoke(principal)
+        return HttpResponse(
+            200,
+            {"status": "logged_out"},
+            headers=(
+                ("Cache-Control", "no-store"),
+                ("Set-Cookie", self.browser_auth.expired_cookie()),
+            ),
+        )
+
+    def _authorize(
+        self,
+        headers: Mapping[str, str] | None,
+    ) -> _RequestIdentity | HttpResponse:
         supplied = _extract_api_key(headers)
-        if supplied is not None and compare_digest(supplied, self.api_key):
-            return None
+        if supplied is not None:
+            if self.api_key is not None and compare_digest(supplied, self.api_key):
+                return _RequestIdentity(actor="api_key")
+            return HttpResponse(401, {"error": "unauthorized"})
+        if self.browser_auth is not None:
+            try:
+                principal = self.browser_auth.authenticate(headers)
+            except BrowserAuthRejected as exc:
+                return HttpResponse(401, {"error": exc.reason})
+            if principal is not None:
+                return _RequestIdentity(
+                    actor=principal.actor,
+                    browser_principal=principal,
+                )
+        if self.api_key is None and self.browser_auth is None:
+            return _RequestIdentity(actor="operator")
         return HttpResponse(401, {"error": "unauthorized"})
+
+    def _authorize_browser_request(
+        self,
+        method: str,
+        path: str,
+        headers: Mapping[str, str] | None,
+        principal: BrowserPrincipal | None,
+    ) -> HttpResponse | None:
+        if principal is None or method == "GET":
+            return None
+        assert self.browser_auth is not None
+        try:
+            self.browser_auth.require_same_origin(headers)
+            self.browser_auth.require_csrf(principal, headers)
+        except BrowserAuthRejected as exc:
+            return HttpResponse(403, {"error": exc.reason})
+        if path == "/api/v1/auth/logout":
+            return None
+        if not principal.has_capability(self.browser_auth.operator_capability):
+            return HttpResponse(403, {"error": "operator_capability_required"})
+        if _requires_step_up(path) and not self.browser_auth.has_step_up(principal):
+            return HttpResponse(403, {"error": "step_up_required"})
+        return None
 
 
 def _single_query_value(query: dict[str, list[str]], key: str) -> str | None:
@@ -685,6 +874,36 @@ def _extract_api_key(headers: Mapping[str, str] | None) -> str | None:
         if scheme.lower() == "bearer" and token:
             return token
     return normalized.get("x-api-key")
+
+
+def _extract_idempotency_key(
+    headers: Mapping[str, str] | None,
+) -> str | None:
+    if headers is None:
+        return None
+    normalized = {key.lower(): value for key, value in headers.items()}
+    return normalized.get("idempotency-key")
+
+
+def _valid_idempotency_key(value: str) -> bool:
+    return (
+        bool(value)
+        and len(value) <= 128
+        and value.isascii()
+        and all(33 <= ord(character) <= 126 for character in value)
+    )
+
+
+def _requires_step_up(path: str) -> bool:
+    return path == "/ops/kill-switch/clear" or (
+        path.startswith("/genes/") and path.endswith("/promote")
+    )
+
+
+def _utc_iso(value: float | None) -> str | None:
+    if value is None:
+        return None
+    return datetime.fromtimestamp(value, tz=UTC).isoformat()
 
 
 def _parse_pagination(query: dict[str, list[str]]) -> tuple[int, int] | HttpResponse:

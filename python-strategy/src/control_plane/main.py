@@ -4,6 +4,8 @@ import os
 
 from src.control_plane import (
     BacktestJobExecutor,
+    BrowserAuthProvider,
+    BrowserSessionAuth,
     ControlPlaneApp,
     CsvSignalBacktestParameterEvaluator,
     GeneControlService,
@@ -30,6 +32,7 @@ def build_control_plane_app(
     job_store: JobStore | None = None,
     parameter_search_evaluator: ParameterSearchEvaluator | None = None,
     api_key: str | None = None,
+    browser_auth: BrowserAuthProvider | None = None,
 ) -> ControlPlaneApp:
     if redis_client is None:
         redis_client = create_redis_client()
@@ -68,13 +71,73 @@ def build_control_plane_app(
         strategy_state_query=state_query,
         api_key=api_key,
         redis_client=redis_client,
+        browser_auth=browser_auth,
     )
+
+
+def build_browser_session_auth_from_env() -> BrowserSessionAuth | None:
+    trusted_proxy_auth = os.getenv(
+        "CONTROL_PLANE_TRUSTED_PROXY_AUTH",
+        "false",
+    ).lower()
+    if trusted_proxy_auth not in {"true", "false"}:
+        raise ValueError("CONTROL_PLANE_TRUSTED_PROXY_AUTH must be true or false")
+    browser_values = {
+        "allowed_origin": os.getenv("CONTROL_PLANE_BROWSER_ORIGIN", ""),
+        "operator_capability": os.getenv(
+            "CONTROL_PLANE_OPERATOR_CAPABILITY",
+            "",
+        ),
+        "step_up_capability": os.getenv(
+            "CONTROL_PLANE_STEP_UP_CAPABILITY",
+            "",
+        ),
+    }
+    if trusted_proxy_auth == "false":
+        if any(browser_values.values()):
+            raise ValueError(
+                "browser auth settings require CONTROL_PLANE_TRUSTED_PROXY_AUTH=true"
+            )
+        return None
+    if not all(browser_values.values()):
+        raise ValueError(
+            "trusted proxy auth requires browser origin and capability names"
+        )
+    return BrowserSessionAuth(
+        allowed_origin=browser_values["allowed_origin"],
+        operator_capability=browser_values["operator_capability"],
+        step_up_capability=browser_values["step_up_capability"],
+        session_ttl_seconds=_positive_env_int(
+            "CONTROL_PLANE_SESSION_TTL_SECONDS",
+            28_800,
+        ),
+        step_up_ttl_seconds=_positive_env_int(
+            "CONTROL_PLANE_STEP_UP_TTL_SECONDS",
+            300,
+        ),
+    )
+
+
+def _positive_env_int(name: str, default: int) -> int:
+    raw_value = os.getenv(name)
+    if raw_value is None:
+        return default
+    try:
+        value = int(raw_value)
+    except ValueError:
+        raise ValueError(f"{name} must be a positive integer") from None
+    if value <= 0:
+        raise ValueError(f"{name} must be a positive integer")
+    return value
 
 
 def main() -> None:
     host = os.getenv("CONTROL_PLANE_HOST", "127.0.0.1")
     port = int(os.getenv("CONTROL_PLANE_PORT", "8080"))
-    app = build_control_plane_app(api_key=os.getenv("CONTROL_PLANE_API_KEY"))
+    app = build_control_plane_app(
+        api_key=os.getenv("CONTROL_PLANE_API_KEY"),
+        browser_auth=build_browser_session_auth_from_env(),
+    )
     serve(app, host=host, port=port)
 
 

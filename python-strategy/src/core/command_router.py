@@ -70,33 +70,42 @@ class CommandRouter:
         return handler()
 
     def _handle_start(self, strategy_id: str, params: dict, message: dict) -> CommandResult:
-        self.state_manager.transition_to_running(strategy_id)
+        actor = params.get("actor", "operator")
+        reason = params.get("reason") or message.get("reason")
+        self.state_manager.transition_to_running(
+            strategy_id,
+            actor=actor,
+            reason=reason,
+        )
         return CommandResult(True, f"Started strategy {strategy_id}")
 
     def _handle_stop(self, strategy_id: str, params: dict, message: dict) -> CommandResult:
+        actor = params.get("actor", "operator")
         reason = params.get("reason") or message.get("reason")
         self.state_manager.transition_to_stopped(
             strategy_id,
-            actor="operator",
+            actor=actor,
             reason=reason,
         )
         return CommandResult(True, f"Stopped strategy {strategy_id}")
 
     def _handle_resume(self, strategy_id: str, params: dict, message: dict) -> CommandResult:
+        actor = params.get("actor", "operator")
         reason = params.get("reason") or message.get("reason")
         self.state_manager.transition_to_running(
             strategy_id,
-            actor="operator",
+            actor=actor,
             force=True,
             reason=reason,
         )
         return CommandResult(True, f"Resumed strategy {strategy_id}")
 
     def _handle_force_recover(self, strategy_id: str, params: dict, message: dict) -> CommandResult:
+        actor = params.get("actor", "operator")
         reason = params.get("reason") or message.get("reason")
         self.state_manager.transition_to_running(
             strategy_id,
-            actor="operator",
+            actor=actor,
             force=True,
             reason=reason,
         )
