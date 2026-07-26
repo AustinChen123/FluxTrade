@@ -69,6 +69,11 @@ class ResearchDataset(Base):
     end_time: Mapped[int] = mapped_column(BigInteger, nullable=False)
     row_count: Mapped[int] = mapped_column(BigInteger, nullable=False)
     quality_status: Mapped[str] = mapped_column(String(32), nullable=False)
+    lifecycle_state: Mapped[str] = mapped_column(String(32), nullable=False)
+    sealed_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True),
+        nullable=True,
+    )
     metadata_json: Mapped[str | None] = mapped_column(Text, nullable=True)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True),
@@ -85,6 +90,15 @@ class ResearchDataset(Base):
         CheckConstraint(
             "quality_status IN ('validated')",
             name='chk_research_dataset_quality_status',
+        ),
+        CheckConstraint(
+            "lifecycle_state IN ('importing', 'sealed')",
+            name='chk_research_dataset_lifecycle_state',
+        ),
+        CheckConstraint(
+            "(lifecycle_state = 'importing' AND sealed_at IS NULL) OR "
+            "(lifecycle_state = 'sealed' AND sealed_at IS NOT NULL)",
+            name='chk_research_dataset_seal_consistency',
         ),
     )
 

@@ -10,7 +10,7 @@ from src.core.db import SessionLocal
 from src.core.interfaces.data_source import IDataSource
 from src.core.models import Candlestick
 from src.core.orm_models import ResearchCandlestick, ResearchDataset
-from src.core.research_datasets import persisted_research_dataset_is_valid
+from src.core.research_datasets import ResearchDatasetIntegrityError
 
 
 def _empty_candle_frame() -> pd.DataFrame:
@@ -29,15 +29,27 @@ class ResearchDatabaseDataSource(IDataSource):
         self._dataset_id = dataset_id
         self._session_factory = session_factory or SessionLocal
 
+    def _require_valid_dataset(self, session: Session) -> ResearchDataset:
+        dataset = session.get(ResearchDataset, self._dataset_id)
+        if (
+            dataset is None
+            or dataset.quality_status != "validated"
+            or dataset.lifecycle_state != "sealed"
+            or dataset.sealed_at is None
+        ):
+            raise ResearchDatasetIntegrityError(
+                f"research dataset failed integrity validation: {self._dataset_id}"
+            )
+        return dataset
+
     def get_candles(
         self, product_id: str, timeframe: str, start: int, end: int
     ) -> Generator[Candlestick, None, None]:
         session: Session = self._session_factory()
         try:
-            dataset = session.get(ResearchDataset, self._dataset_id)
+            dataset = self._require_valid_dataset(session)
             if (
-                dataset is None
-                or dataset.product_id != product_id
+                dataset.product_id != product_id
                 or dataset.timeframe != timeframe
             ):
                 return
@@ -69,10 +81,9 @@ class ResearchDatabaseDataSource(IDataSource):
     ) -> pd.DataFrame:
         session: Session = self._session_factory()
         try:
-            dataset = session.get(ResearchDataset, self._dataset_id)
+            dataset = self._require_valid_dataset(session)
             if (
-                dataset is None
-                or dataset.product_id != product_id
+                dataset.product_id != product_id
                 or dataset.timeframe != timeframe
             ):
                 return _empty_candle_frame()
@@ -118,10 +129,9 @@ class ResearchDatabaseDataSource(IDataSource):
     ) -> Optional[tuple[int, int]]:
         session: Session = self._session_factory()
         try:
-            dataset = session.get(ResearchDataset, self._dataset_id)
+            dataset = self._require_valid_dataset(session)
             if (
-                dataset is None
-                or dataset.product_id != product_id
+                dataset.product_id != product_id
                 or dataset.timeframe != timeframe
             ):
                 return None
@@ -133,11 +143,9 @@ class ResearchDatabaseDataSource(IDataSource):
         session: Session | None = None
         try:
             session = self._session_factory()
-            dataset = session.get(ResearchDataset, self._dataset_id)
-            if dataset is None or dataset.quality_status != "validated":
-                return False
-            return persisted_research_dataset_is_valid(session, dataset)
-        except SQLAlchemyError:
+            self._require_valid_dataset(session)
+            return True
+        except (ResearchDatasetIntegrityError, SQLAlchemyError):
             return False
         finally:
             if session is not None:

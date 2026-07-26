@@ -46,6 +46,10 @@ class ResearchDatasetConflictError(ValueError):
     """Raised when an existing immutable dataset ID has different content."""
 
 
+class ResearchDatasetIntegrityError(RuntimeError):
+    """Raised when a research dataset is not sealed for trusted reads."""
+
+
 class ResearchCsvValidationError(ValueError):
     """Raised when a research CSV cannot be imported without ambiguity."""
 
@@ -369,73 +373,6 @@ def _scan_csv(
     )
 
 
-def _summarize_persisted_rows(
-    session: Session,
-    dataset_id: str,
-) -> _CsvSummary | None:
-    digest = hashlib.sha256()
-    row_count = 0
-    start_time: int | None = None
-    end_time: int | None = None
-    rows = (
-        session.query(
-            ResearchCandlestick.timestamp,
-            ResearchCandlestick.open,
-            ResearchCandlestick.high,
-            ResearchCandlestick.low,
-            ResearchCandlestick.close,
-            ResearchCandlestick.volume,
-            ResearchCandlestick.source_contract,
-        )
-        .filter(ResearchCandlestick.dataset_id == dataset_id)
-        .order_by(ResearchCandlestick.timestamp.asc())
-        .yield_per(1_000)
-    )
-    for row in rows:
-        timestamp = int(row.timestamp)
-        if start_time is None:
-            start_time = timestamp
-        end_time = timestamp
-        row_count += 1
-        _update_digest(
-            digest,
-            {
-                "timestamp": timestamp,
-                "open": row.open,
-                "high": row.high,
-                "low": row.low,
-                "close": row.close,
-                "volume": row.volume,
-                "source_contract": row.source_contract,
-            },
-        )
-    if row_count == 0 or start_time is None or end_time is None:
-        return None
-    return _CsvSummary(
-        row_count=row_count,
-        start_time=start_time,
-        end_time=end_time,
-        checksum_sha256=digest.hexdigest(),
-    )
-
-
-def persisted_research_dataset_is_valid(
-    session: Session,
-    dataset: ResearchDataset,
-) -> bool:
-    """Verify immutable dataset metadata against its persisted candle content."""
-    actual = _summarize_persisted_rows(session, dataset.id)
-    if actual is None:
-        return False
-    expected = _CsvSummary(
-        row_count=dataset.row_count,
-        start_time=dataset.start_time,
-        end_time=dataset.end_time,
-        checksum_sha256=dataset.checksum_sha256,
-    )
-    return actual == expected
-
-
 class ResearchDatasetImporter:
     """Transactionally import immutable research candles from a CSV file."""
 
@@ -471,7 +408,6 @@ class ResearchDatasetImporter:
             existing = session.get(ResearchDataset, spec.dataset_id)
             if existing is not None:
                 self._verify_existing(
-                    session,
                     existing,
                     spec,
                     summary,
@@ -498,6 +434,8 @@ class ResearchDatasetImporter:
                     end_time=summary.end_time,
                     row_count=summary.row_count,
                     quality_status="validated",
+                    lifecycle_state="importing",
+                    sealed_at=None,
                     metadata_json=metadata_json,
                 )
             )
@@ -513,6 +451,13 @@ class ResearchDatasetImporter:
                 raise ResearchCsvValidationError(
                     "research CSV changed while it was being imported"
                 )
+            dataset = session.get(ResearchDataset, spec.dataset_id)
+            if dataset is None:
+                raise RuntimeError(
+                    f"research dataset disappeared during import: {spec.dataset_id}"
+                )
+            dataset.lifecycle_state = "sealed"
+            dataset.sealed_at = datetime.now(timezone.utc)
             session.commit()
         except IntegrityError:
             session.rollback()
@@ -520,7 +465,6 @@ class ResearchDatasetImporter:
             if existing is None:
                 raise
             self._verify_existing(
-                session,
                 existing,
                 spec,
                 summary,
@@ -587,7 +531,6 @@ class ResearchDatasetImporter:
 
     @staticmethod
     def _verify_existing(
-        session: Session,
         existing: ResearchDataset,
         spec: ResearchDatasetSpec,
         summary: _CsvSummary,
@@ -619,12 +562,11 @@ class ResearchDatasetImporter:
             existing.checksum_sha256,
             existing.metadata_json,
             existing.quality_status,
+            existing.lifecycle_state,
+            existing.sealed_at is not None,
         )
-        expected = (*expected, "validated")
-        if actual != expected or not persisted_research_dataset_is_valid(
-            session,
-            existing,
-        ):
+        expected = (*expected, "validated", "sealed", True)
+        if actual != expected:
             raise ResearchDatasetConflictError(
                 "dataset_id already exists with different content or provenance"
             )

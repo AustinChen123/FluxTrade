@@ -1,9 +1,11 @@
 from __future__ import annotations
 
+from datetime import datetime, timezone
 from decimal import Decimal
 
 import pytest
-from sqlalchemy import create_engine
+from sqlalchemy import create_engine, event, text
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import sessionmaker
 
 from src.core.data_sources.research_database import ResearchDatabaseDataSource
@@ -18,6 +20,7 @@ from src.core.research_datasets import (
     ResearchCsvValidationError,
     ResearchDatasetConflictError,
     ResearchDatasetImporter,
+    ResearchDatasetIntegrityError,
     ResearchDatasetSpec,
 )
 
@@ -29,6 +32,13 @@ TIMEFRAME = "1m"
 @pytest.fixture
 def session_factory():
     engine = create_engine("sqlite://")
+
+    @event.listens_for(engine, "connect")
+    def _enable_foreign_keys(dbapi_connection, _connection_record):
+        cursor = dbapi_connection.cursor()
+        cursor.execute("PRAGMA foreign_keys=ON")
+        cursor.close()
+
     Base.metadata.create_all(
         engine,
         tables=[
@@ -38,6 +48,90 @@ def session_factory():
             ResearchCandlestick.__table__,
         ],
     )
+    with engine.begin() as connection:
+        for statement in (
+            """
+            CREATE TRIGGER trg_test_research_dataset_insert_importing
+            BEFORE INSERT ON research_dataset
+            WHEN NEW.lifecycle_state <> 'importing' OR NEW.sealed_at IS NOT NULL
+            BEGIN
+                SELECT RAISE(
+                    ABORT,
+                    'research dataset must be created in importing state'
+                );
+            END
+            """,
+            """
+            CREATE TRIGGER trg_test_research_dataset_update_immutable
+            BEFORE UPDATE ON research_dataset
+            WHEN OLD.lifecycle_state = 'sealed'
+            BEGIN
+                SELECT RAISE(ABORT, 'sealed research dataset is immutable');
+            END
+            """,
+            """
+            CREATE TRIGGER trg_test_research_dataset_seal_summary
+            BEFORE UPDATE ON research_dataset
+            WHEN NEW.lifecycle_state = 'sealed'
+              AND (
+                  (SELECT COUNT(*) FROM research_candlestick
+                   WHERE dataset_id = NEW.id) <> NEW.row_count
+                  OR (SELECT MIN(timestamp) FROM research_candlestick
+                      WHERE dataset_id = NEW.id) IS NOT NEW.start_time
+                  OR (SELECT MAX(timestamp) FROM research_candlestick
+                      WHERE dataset_id = NEW.id) IS NOT NEW.end_time
+              )
+            BEGIN
+                SELECT RAISE(
+                    ABORT,
+                    'research dataset seal summary does not match candles'
+                );
+            END
+            """,
+            """
+            CREATE TRIGGER trg_test_research_dataset_delete_immutable
+            BEFORE DELETE ON research_dataset
+            WHEN OLD.lifecycle_state = 'sealed'
+            BEGIN
+                SELECT RAISE(ABORT, 'sealed research dataset is immutable');
+            END
+            """,
+            """
+            CREATE TRIGGER trg_test_research_candle_insert_immutable
+            BEFORE INSERT ON research_candlestick
+            WHEN EXISTS (
+                SELECT 1 FROM research_dataset
+                WHERE id = NEW.dataset_id AND lifecycle_state = 'sealed'
+            )
+            BEGIN
+                SELECT RAISE(ABORT, 'sealed research dataset candles are immutable');
+            END
+            """,
+            """
+            CREATE TRIGGER trg_test_research_candle_update_immutable
+            BEFORE UPDATE ON research_candlestick
+            WHEN EXISTS (
+                SELECT 1 FROM research_dataset
+                WHERE id IN (OLD.dataset_id, NEW.dataset_id)
+                  AND lifecycle_state = 'sealed'
+            )
+            BEGIN
+                SELECT RAISE(ABORT, 'sealed research dataset candles are immutable');
+            END
+            """,
+            """
+            CREATE TRIGGER trg_test_research_candle_delete_immutable
+            BEFORE DELETE ON research_candlestick
+            WHEN EXISTS (
+                SELECT 1 FROM research_dataset
+                WHERE id = OLD.dataset_id AND lifecycle_state = 'sealed'
+            )
+            BEGIN
+                SELECT RAISE(ABORT, 'sealed research dataset candles are immutable');
+            END
+            """,
+        ):
+            connection.execute(text(statement))
     factory = sessionmaker(bind=engine)
     return factory
 
@@ -100,6 +194,8 @@ def test_import_is_transactional_and_readable(
         assert dataset.start_time == 1704067200000
         assert dataset.end_time == 1704067260000
         assert len(dataset.checksum_sha256) == 64
+        assert dataset.lifecycle_state == "sealed"
+        assert dataset.sealed_at is not None
         product = session.get(Product, PRODUCT_ID)
         exchange = session.get(Exchange, "RITHMIC")
         assert product is not None
@@ -388,7 +484,231 @@ def test_dataframe_preserves_decimal_values(
     assert isinstance(frame.iloc[0]["open"], Decimal)
 
 
-def test_validate_detects_incomplete_dataset(
+@pytest.mark.parametrize(
+    "mutation",
+    (
+        "insert_candle",
+        "update_candle",
+        "delete_candle",
+        "update_dataset",
+        "delete_dataset",
+    ),
+)
+def test_sealed_dataset_rejects_all_content_and_metadata_mutations(
+    tmp_path,
+    session_factory,
+    dataset_spec,
+    mutation,
+):
+    path = tmp_path / "candles.csv"
+    _write_csv(path, ["1704067200000,100,101,99,100,12"])
+    ResearchDatasetImporter(session_factory=session_factory).import_csv(
+        path,
+        dataset_spec,
+    )
+    with session_factory() as session:
+        dataset = session.get(ResearchDataset, dataset_spec.dataset_id)
+        candle = session.get(
+            ResearchCandlestick,
+            (dataset_spec.dataset_id, 1704067200000),
+        )
+        assert dataset is not None
+        assert candle is not None
+        if mutation == "insert_candle":
+            session.add(
+                ResearchCandlestick(
+                    dataset_id=dataset_spec.dataset_id,
+                    timestamp=1704067260000,
+                    open=Decimal("100"),
+                    high=Decimal("101"),
+                    low=Decimal("99"),
+                    close=Decimal("100"),
+                    volume=Decimal("1"),
+                    source_contract="MNQH4",
+                )
+            )
+        elif mutation == "update_candle":
+            candle.close = Decimal("100.5")
+        elif mutation == "delete_candle":
+            session.delete(candle)
+        elif mutation == "update_dataset":
+            dataset.revision = "mutated"
+        else:
+            session.delete(dataset)
+        with pytest.raises(
+            IntegrityError,
+            match="sealed research dataset",
+        ):
+            session.commit()
+
+    source = ResearchDatabaseDataSource(
+        dataset_spec.dataset_id,
+        session_factory=session_factory,
+    )
+
+    assert source.validate() is True
+    assert len(
+        list(
+            source.get_candles(
+                PRODUCT_ID,
+                TIMEFRAME,
+                0,
+                9_999_999_999_999,
+            )
+        )
+    ) == 1
+
+
+def test_unsealed_dataset_is_not_readable(
+    session_factory,
+    dataset_spec,
+):
+    with session_factory() as session:
+        session.add(Exchange(id="RITHMIC", name="Rithmic"))
+        session.add(
+            Product(
+                id=PRODUCT_ID,
+                exchange_id="RITHMIC",
+                base_asset="MNQ",
+                quote_asset="USD",
+            )
+        )
+        session.add(
+            ResearchDataset(
+                id=dataset_spec.dataset_id,
+                product_id=PRODUCT_ID,
+                timeframe=TIMEFRAME,
+                source="rithmic-history",
+                revision="pending",
+                timestamp_format="epoch_milliseconds",
+                checksum_sha256="0" * 64,
+                roll_policy="vendor-front-month",
+                start_time=1704067200000,
+                end_time=1704067200000,
+                row_count=1,
+                quality_status="validated",
+                lifecycle_state="importing",
+                sealed_at=None,
+                metadata_json="{}",
+            )
+        )
+        session.commit()
+
+    source = ResearchDatabaseDataSource(
+        dataset_spec.dataset_id,
+        session_factory=session_factory,
+    )
+
+    assert source.validate() is False
+    with pytest.raises(ResearchDatasetIntegrityError):
+        list(
+            source.get_candles(
+                PRODUCT_ID,
+                TIMEFRAME,
+                0,
+                9_999_999_999_999,
+            )
+        )
+
+
+def test_dataset_cannot_be_created_as_sealed(
+    session_factory,
+    dataset_spec,
+):
+    with session_factory() as session:
+        session.add(Exchange(id="RITHMIC", name="Rithmic"))
+        session.add(
+            Product(
+                id=PRODUCT_ID,
+                exchange_id="RITHMIC",
+                base_asset="MNQ",
+                quote_asset="USD",
+            )
+        )
+        session.add(
+            ResearchDataset(
+                id=dataset_spec.dataset_id,
+                product_id=PRODUCT_ID,
+                timeframe=TIMEFRAME,
+                source="rithmic-history",
+                revision="invalid-direct-seal",
+                timestamp_format="epoch_milliseconds",
+                checksum_sha256="0" * 64,
+                roll_policy="vendor-front-month",
+                start_time=1704067200000,
+                end_time=1704067200000,
+                row_count=1,
+                quality_status="validated",
+                lifecycle_state="sealed",
+                sealed_at=datetime(2026, 7, 26, tzinfo=timezone.utc),
+                metadata_json="{}",
+            )
+        )
+
+        with pytest.raises(
+            IntegrityError,
+            match="must be created in importing state",
+        ):
+            session.commit()
+
+
+def test_dataset_cannot_be_sealed_with_mismatched_summary(
+    session_factory,
+    dataset_spec,
+):
+    with session_factory() as session:
+        session.add(Exchange(id="RITHMIC", name="Rithmic"))
+        session.add(
+            Product(
+                id=PRODUCT_ID,
+                exchange_id="RITHMIC",
+                base_asset="MNQ",
+                quote_asset="USD",
+            )
+        )
+        dataset = ResearchDataset(
+            id=dataset_spec.dataset_id,
+            product_id=PRODUCT_ID,
+            timeframe=TIMEFRAME,
+            source="rithmic-history",
+            revision="invalid-summary",
+            timestamp_format="epoch_milliseconds",
+            checksum_sha256="0" * 64,
+            roll_policy="vendor-front-month",
+            start_time=1704067200000,
+            end_time=1704067200000,
+            row_count=2,
+            quality_status="validated",
+            lifecycle_state="importing",
+            sealed_at=None,
+            metadata_json="{}",
+        )
+        session.add(dataset)
+        session.flush()
+        session.add(
+            ResearchCandlestick(
+                dataset_id=dataset_spec.dataset_id,
+                timestamp=1704067200000,
+                open=Decimal("100"),
+                high=Decimal("101"),
+                low=Decimal("99"),
+                close=Decimal("100"),
+                volume=Decimal("1"),
+                source_contract="MNQH4",
+            )
+        )
+        session.flush()
+        dataset.lifecycle_state = "sealed"
+        dataset.sealed_at = datetime(2026, 7, 26, tzinfo=timezone.utc)
+
+        with pytest.raises(
+            IntegrityError,
+            match="seal summary does not match candles",
+        ):
+            session.commit()
+
+
+def test_validate_checks_persistent_seal_without_scanning_candles(
     tmp_path,
     session_factory,
     dataset_spec,
@@ -400,48 +720,30 @@ def test_validate_detects_incomplete_dataset(
         dataset_spec,
     )
     with session_factory() as session:
-        session.query(ResearchCandlestick).delete()
-        session.commit()
+        engine = session.get_bind()
+    statements: list[str] = []
 
-    source = ResearchDatabaseDataSource(
-        dataset_spec.dataset_id,
-        session_factory=session_factory,
-    )
+    def capture_statement(
+        _connection,
+        _cursor,
+        statement,
+        _parameters,
+        _context,
+        _executemany,
+    ):
+        statements.append(statement)
 
-    assert source.validate() is False
-    with pytest.raises(ResearchDatasetConflictError):
-        ResearchDatasetImporter(session_factory=session_factory).import_csv(
-            path,
-            dataset_spec,
-        )
+    event.listen(engine, "before_cursor_execute", capture_statement)
+    try:
+        assert ResearchDatabaseDataSource(
+            dataset_spec.dataset_id,
+            session_factory=session_factory,
+        ).validate() is True
+    finally:
+        event.remove(engine, "before_cursor_execute", capture_statement)
 
-
-def test_validate_detects_changed_content_with_same_row_count(
-    tmp_path,
-    session_factory,
-    dataset_spec,
-):
-    path = tmp_path / "candles.csv"
-    _write_csv(path, ["1704067200000,100,101,99,100,12"])
-    importer = ResearchDatasetImporter(session_factory=session_factory)
-    importer.import_csv(path, dataset_spec)
-    with session_factory() as session:
-        candle = session.get(
-            ResearchCandlestick,
-            (dataset_spec.dataset_id, 1704067200000),
-        )
-        assert candle is not None
-        candle.close = Decimal("100.5")
-        session.commit()
-
-    source = ResearchDatabaseDataSource(
-        dataset_spec.dataset_id,
-        session_factory=session_factory,
-    )
-
-    assert source.validate() is False
-    with pytest.raises(ResearchDatasetConflictError):
-        importer.import_csv(path, dataset_spec)
+    assert any("research_dataset" in statement for statement in statements)
+    assert not any("research_candlestick" in statement for statement in statements)
 
 
 def test_file_change_between_validation_and_insert_rolls_back(
