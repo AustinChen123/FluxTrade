@@ -144,6 +144,39 @@ def test_reimport_same_normalized_content_is_idempotent(
         assert session.query(ResearchCandlestick).count() == 1
 
 
+def test_checksum_preserves_decimal_digits_beyond_context_precision(
+    tmp_path,
+    session_factory,
+    dataset_spec,
+):
+    path = tmp_path / "candles.csv"
+    _write_csv(
+        path,
+        [
+            "1704067200000,"
+            "12345678901234567890123456781,"
+            "12345678901234567890123456790,"
+            "12345678901234567890123456780,"
+            "12345678901234567890123456781,12"
+        ],
+    )
+    importer = ResearchDatasetImporter(session_factory=session_factory)
+    importer.import_csv(path, dataset_spec)
+    _write_csv(
+        path,
+        [
+            "1704067200000,"
+            "12345678901234567890123456782,"
+            "12345678901234567890123456790,"
+            "12345678901234567890123456780,"
+            "12345678901234567890123456782,12"
+        ],
+    )
+
+    with pytest.raises(ResearchDatasetConflictError):
+        importer.import_csv(path, dataset_spec)
+
+
 def test_existing_dataset_id_rejects_changed_content(
     tmp_path,
     session_factory,
@@ -349,6 +382,61 @@ def test_explicit_timestamp_format_normalizes_to_milliseconds(
         dataset = session.get(ResearchDataset, spec.dataset_id)
         assert dataset is not None
         assert dataset.timestamp_format == timestamp_format
+        assert dataset.start_time == 1704067200000
+
+
+@pytest.mark.parametrize(
+    "raw_timestamp",
+    ["2024-01-01T00:00:00", "2024-01-01"],
+)
+def test_iso_timestamp_without_offset_is_rejected(
+    tmp_path,
+    session_factory,
+    dataset_spec,
+    raw_timestamp,
+):
+    path = tmp_path / "candles.csv"
+    _write_csv(path, [f"{raw_timestamp},100,101,99,100,12"])
+    spec = ResearchDatasetSpec(
+        dataset_id=f"{dataset_spec.dataset_id}-naive",
+        product_id=dataset_spec.product_id,
+        timeframe=dataset_spec.timeframe,
+        source=dataset_spec.source,
+        revision=dataset_spec.revision,
+        timestamp_format="iso8601",
+    )
+
+    with pytest.raises(
+        ResearchCsvValidationError,
+        match="must include a UTC offset",
+    ):
+        ResearchDatasetImporter(session_factory=session_factory).import_csv(
+            path,
+            spec,
+        )
+
+
+def test_iso_timestamp_with_non_utc_offset_is_normalized_to_utc(
+    tmp_path,
+    session_factory,
+    dataset_spec,
+):
+    path = tmp_path / "candles.csv"
+    _write_csv(path, ["2024-01-01T08:00:00+08:00,100,101,99,100,12"])
+    spec = ResearchDatasetSpec(
+        dataset_id=f"{dataset_spec.dataset_id}-offset",
+        product_id=dataset_spec.product_id,
+        timeframe=dataset_spec.timeframe,
+        source=dataset_spec.source,
+        revision=dataset_spec.revision,
+        timestamp_format="iso8601",
+    )
+
+    ResearchDatasetImporter(session_factory=session_factory).import_csv(path, spec)
+
+    with session_factory() as session:
+        dataset = session.get(ResearchDataset, spec.dataset_id)
+        assert dataset is not None
         assert dataset.start_time == 1704067200000
 
 

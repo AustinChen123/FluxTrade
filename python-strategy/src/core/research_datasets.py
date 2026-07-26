@@ -160,8 +160,10 @@ def _parse_timestamp(
         raise ResearchCsvValidationError(
             f"line {line_number}: invalid timestamp"
         ) from exc
-    if parsed.tzinfo is None:
-        parsed = parsed.replace(tzinfo=timezone.utc)
+    if parsed.tzinfo is None or parsed.utcoffset() is None:
+        raise ResearchCsvValidationError(
+            f"line {line_number}: ISO timestamp must include a UTC offset"
+        )
     parsed = parsed.astimezone(timezone.utc)
     if parsed.microsecond % 1000:
         raise ResearchCsvValidationError(
@@ -197,7 +199,10 @@ def _parse_decimal(value: str, column: str, line_number: int) -> Decimal:
 def _canonical_decimal(value: Decimal) -> str:
     if value == 0:
         return "0"
-    return format(value.normalize(), "f")
+    canonical = format(value, "f")
+    if "." in canonical:
+        canonical = canonical.rstrip("0").rstrip(".")
+    return canonical
 
 
 def _resolve_columns(fieldnames: Sequence[str] | None) -> dict[str, str]:
