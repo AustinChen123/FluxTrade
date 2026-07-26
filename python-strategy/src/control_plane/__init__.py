@@ -2,6 +2,13 @@
 
 from src.control_plane.app import ControlPlaneApp, HttpResponse
 from src.control_plane.backtest_jobs import BacktestJobExecutor
+from src.control_plane.browser_auth import (
+    BrowserAuthProvider,
+    BrowserPrincipal,
+    BrowserSessionAuth,
+    BrowserSessionStore,
+    InMemoryBrowserSessionStore,
+)
 from src.control_plane.evaluation_data import (
     CsvEvaluationDataSourceProvider,
     EvaluationDataSourceProvider,
@@ -51,6 +58,10 @@ from src.control_plane.strategy_state_query import StrategyStateQueryService
 __all__ = [
     "BacktestJobExecutor",
     "BacktestJobRequest",
+    "BrowserAuthProvider",
+    "BrowserPrincipal",
+    "BrowserSessionAuth",
+    "BrowserSessionStore",
     "ControlPlaneApp",
     "CsvSignalBacktestEvaluationConfig",
     "CsvSignalBacktestParameterEvaluator",
@@ -68,6 +79,7 @@ __all__ = [
     "GenePromotionRequest",
     "HttpResponse",
     "InMemoryJobStore",
+    "InMemoryBrowserSessionStore",
     "JobRecord",
     "JobStatus",
     "JobStore",

@@ -46,23 +46,41 @@ def test_command_result_dataclass() -> None:
 def test_start_delegates_to_state_manager() -> None:
     router = CommandRouter(StrategyRegistry(), MagicMock())
 
-    result = router.handle({"command": "START", "params": {"id": "s1"}})
+    result = router.handle(
+        {
+            "command": "START",
+            "params": {
+                "id": "s1",
+                "actor": "operator@example.com",
+                "reason": "deployment",
+            },
+        }
+    )
 
     assert result.success is True
-    router.state_manager.transition_to_running.assert_called_once_with("s1")
+    router.state_manager.transition_to_running.assert_called_once_with(
+        "s1",
+        actor="operator@example.com",
+        reason="deployment",
+    )
 
 
 def test_stop_delegates_to_state_manager() -> None:
     router = CommandRouter(StrategyRegistry(), MagicMock())
 
     result = router.handle(
-        {"command": "STOP", "strategy_id": "s1", "reason": "maintenance"}
+        {
+            "command": "STOP",
+            "strategy_id": "s1",
+            "params": {"actor": "operator@example.com"},
+            "reason": "maintenance",
+        }
     )
 
     assert result.success is True
     router.state_manager.transition_to_stopped.assert_called_once_with(
         "s1",
-        actor="operator",
+        actor="operator@example.com",
         reason="maintenance",
     )
 
@@ -74,14 +92,17 @@ def test_resume_delegates_to_forced_running_transition() -> None:
         {
             "cmd": "resume",
             "strategy_id": "s1",
-            "reason": "operator confirmed",
+            "params": {
+                "actor": "operator@example.com",
+                "reason": "operator confirmed",
+            },
         }
     )
 
     assert result.success is True
     router.state_manager.transition_to_running.assert_called_once_with(
         "s1",
-        actor="operator",
+        actor="operator@example.com",
         force=True,
         reason="operator confirmed",
     )
@@ -95,6 +116,7 @@ def test_force_recover_delegates_to_forced_running_transition() -> None:
             "cmd": "force_recover",
             "params": {
                 "strategy_id": "s1",
+                "actor": "operator@example.com",
                 "reason": "manual reset",
             },
         }
@@ -103,7 +125,7 @@ def test_force_recover_delegates_to_forced_running_transition() -> None:
     assert result.success is True
     router.state_manager.transition_to_running.assert_called_once_with(
         "s1",
-        actor="operator",
+        actor="operator@example.com",
         force=True,
         reason="manual reset",
     )

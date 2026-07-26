@@ -1692,7 +1692,11 @@ def test_control_plane_routes_strategy_status_and_commands():
     assert router.messages[-1] == {
         "command": "STOP",
         "strategy_id": "s1",
-        "params": {"strategy_id": "s1", "reason": "operator pause"},
+        "params": {
+            "strategy_id": "s1",
+            "actor": "operator",
+            "reason": "operator pause",
+        },
     }
 
 
@@ -1926,7 +1930,7 @@ def test_clear_kill_switch_returns_202_and_publishes_manual_release():
     _, raw_payload = redis.publish.call_args.args
     assert json.loads(raw_payload) == {
         "command": "CLEAR_KILL_SWITCH",
-        "params": {"actor": "operator"},
+        "params": {"actor": "api_key"},
     }
 
 
@@ -2358,7 +2362,10 @@ def test_control_plane_main_serves_production_app(monkeypatch):
     monkeypatch.setattr(
         control_plane_main,
         "build_control_plane_app",
-        lambda *, api_key: captured.update({"api_key": api_key}) or app,
+        lambda *, api_key, browser_auth: captured.update(
+            {"api_key": api_key, "browser_auth": browser_auth}
+        )
+        or app,
     )
     monkeypatch.setattr(
         control_plane_main,
@@ -2371,5 +2378,6 @@ def test_control_plane_main_serves_production_app(monkeypatch):
     control_plane_main.main()
 
     assert captured["served_app"] is app
+    assert captured["browser_auth"] is None
     assert captured["host"] == "127.0.0.1"
     assert captured["port"] == 8080

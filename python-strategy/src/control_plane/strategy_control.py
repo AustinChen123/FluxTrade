@@ -106,8 +106,14 @@ class StrategyControlService:
         self,
         strategy_id: str,
         request: StrategyCommandRequest,
+        *,
+        actor: str,
     ) -> dict[str, Any]:
-        params = {**request.params, "strategy_id": strategy_id}
+        params = {
+            **request.params,
+            "strategy_id": strategy_id,
+            "actor": actor,
+        }
         if request.reason is not None:
             params["reason"] = request.reason
         message = {

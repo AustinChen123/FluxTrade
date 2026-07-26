@@ -28,6 +28,10 @@ def _required_env() -> dict[str, str]:
         "POSTGRES_PASSWORD": "postgres-secret",
         "DASHBOARD_PASSWORD": "dashboard-secret",
         "CONTROL_PLANE_API_KEY": "control-plane-secret",
+        "CONTROL_PLANE_TRUSTED_PROXY_AUTH": "true",
+        "CONTROL_PLANE_BROWSER_ORIGIN": "https://fluxtrade.example.ts.net",
+        "CONTROL_PLANE_OPERATOR_CAPABILITY": "example.com/cap/fluxtrade-operator",
+        "CONTROL_PLANE_STEP_UP_CAPABILITY": "example.com/cap/fluxtrade-step-up",
         "GRAFANA_PASSWORD": "grafana-secret",
         "EXCHANGE_ENABLED": "binance",
         "MARKET_DATA_SYMBOLS": "BTCUSDT",
@@ -189,6 +193,24 @@ def test_production_compose_passes_required_auth_to_services(tmp_path: Path):
     assert (
         services["control-plane"]["environment"]["CONTROL_PLANE_API_KEY"]
         == "control-plane-secret"
+    )
+    assert (
+        services["control-plane"]["environment"]["CONTROL_PLANE_TRUSTED_PROXY_AUTH"]
+        == "true"
+    )
+    assert (
+        services["control-plane"]["environment"]["CONTROL_PLANE_BROWSER_ORIGIN"]
+        == "https://fluxtrade.example.ts.net"
+    )
+    assert (
+        services["control-plane"]["environment"][
+            "CONTROL_PLANE_OPERATOR_CAPABILITY"
+        ]
+        == "example.com/cap/fluxtrade-operator"
+    )
+    assert (
+        services["control-plane"]["environment"]["CONTROL_PLANE_STEP_UP_CAPABILITY"]
+        == "example.com/cap/fluxtrade-step-up"
     )
     assert services["rust-data"]["environment"]["FLUXTRADE_ENVIRONMENT"] == "live"
     assert (

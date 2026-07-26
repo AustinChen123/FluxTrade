@@ -131,6 +131,15 @@ For Rithmic deployment, build approved private Rust and Python images with
 `RITHMIC_PROTO_DIR` pointing to the licensed proto directory outside the
 repository, then set `RUST_DATA_IMAGE` and `PYTHON_STRATEGY_IMAGE`.
 
+Browser sessions are optional and must only be enabled when the control plane
+is reached through a trusted Tailscale Serve proxy on the localhost-published
+port. Configure the browser origin and operator/step-up app capability names,
+which must be distinct, then set `CONTROL_PLANE_TRUSTED_PROXY_AUTH=true`.
+Trusted login identities are limited to 64 characters to match the audit
+schema. Browser kill-switch requests require a unique `Idempotency-Key` header
+in addition to confirmation. API-key authentication remains available for CLI
+and service clients; never place that key in browser code.
+
 ### Manual Setup
 
 Requires: Python 3.12+, Rust stable, PostgreSQL 15, Redis
