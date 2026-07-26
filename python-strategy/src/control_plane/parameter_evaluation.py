@@ -79,6 +79,8 @@ class ParameterSearchEvaluatorRegistry:
 
     def validate_request(self, request: ParameterSearchJobRequest) -> None:
         evaluator = self._resolve(request)
+        if isinstance(evaluator, ParameterSearchRequestValidator):
+            evaluator.validate_request(request)
         if request.evaluation_set is None:
             return
         requires_warmup = any(

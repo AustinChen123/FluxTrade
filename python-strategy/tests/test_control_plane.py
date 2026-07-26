@@ -23,6 +23,7 @@ from src.control_plane import (
     SqliteJobStore,
     StrategyControlService,
     StrategyStateQueryService,
+    UnsupportedParameterSearchError,
 )
 from src.control_plane.models import (
     BacktestJobRequest,
@@ -2269,6 +2270,57 @@ def test_production_parameter_search_rejects_unsupported_warmup_before_job_creat
         "detail": (
             "strategy_type does not support walk-forward warmup: no_warmup"
         ),
+    }
+    assert store.list() == []
+
+
+def test_registry_delegates_request_validation_before_job_creation(tmp_path):
+    from unittest.mock import MagicMock
+
+    from src.control_plane import main as control_plane_main
+
+    class RejectingEvaluator:
+        def validate_request(self, request):
+            raise UnsupportedParameterSearchError("strategy parameters rejected")
+
+        def evaluate(self, request, candidate):
+            raise AssertionError("rejected request must not be evaluated")
+
+    store = InMemoryJobStore()
+    app = control_plane_main.build_control_plane_app(
+        redis_client=MagicMock(),
+        db_session_factory=_sqlite_control_plane_session_factory(tmp_path),
+        job_store=store,
+        parameter_search_evaluator=ParameterSearchEvaluatorRegistry(
+            {"rejecting": RejectingEvaluator()}
+        ),
+    )
+
+    response = app.handle(
+        "POST",
+        "/jobs/parameter-searches",
+        json.dumps(
+            {
+                "strategy_type": "rejecting",
+                "strategy_id": "rejected_search",
+                "product_id": PRODUCT_ID,
+                "timeframe": TIMEFRAME,
+                "start_time": 1,
+                "end_time": 2,
+                "candidates": [
+                    {
+                        "candidate_id": "candidate",
+                        "param_pack": {"period": 10},
+                    }
+                ],
+            }
+        ),
+    )
+
+    assert response.status_code == 422
+    assert response.body == {
+        "error": "parameter_search_rejected",
+        "detail": "strategy parameters rejected",
     }
     assert store.list() == []
 
