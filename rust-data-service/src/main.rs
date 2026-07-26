@@ -390,17 +390,19 @@ async fn run_live_mode(
     let (candle_tx, candle_rx) = mpsc::channel(1000);
     let (user_tx, user_rx) = mpsc::channel(100);
 
-    let enabled_exchanges = exchange_opt.unwrap_or_else(|| {
-        std::env::var("EXCHANGE_ENABLED").unwrap_or_else(|_| "binance,bybit,backpack".into())
-    });
+    let enabled_exchanges_raw = exchange_opt
+        .or_else(|| non_empty_env("EXCHANGE_ENABLED"))
+        .unwrap_or_else(|| "binance,bybit,backpack".into());
+    let enabled_exchanges = validate_enabled_exchanges(&enabled_exchanges_raw)?;
+    let enabled_exchanges_csv = enabled_exchanges.join(",");
 
     #[cfg(feature = "rithmic")]
     let rithmic_args = resolve_rithmic_live_args(
-        &enabled_exchanges,
-        rithmic_profile,
-        rithmic_product_id,
-        rithmic_exchange,
-        rithmic_symbol,
+        &enabled_exchanges_csv,
+        rithmic_profile.or_else(|| non_empty_env("RITHMIC_PROFILE")),
+        rithmic_product_id.or_else(|| non_empty_env("RITHMIC_PRODUCT_ID")),
+        rithmic_exchange.or_else(|| non_empty_env("RITHMIC_EXCHANGE")),
+        rithmic_symbol.or_else(|| non_empty_env("RITHMIC_SYMBOL")),
     )?;
     #[cfg(feature = "rithmic")]
     let mut rithmic_config = rithmic_args
@@ -414,11 +416,10 @@ async fn run_live_mode(
         })
         .transpose()?;
 
-    let symbols_str = symbol_opt.unwrap_or_else(|| "BTCUSDT,SOLUSDC".into());
-    let symbols: Vec<String> = symbols_str
-        .split(',')
-        .map(|s| s.trim().to_uppercase())
-        .collect();
+    let symbols_str = symbol_opt
+        .or_else(|| non_empty_env("MARKET_DATA_SYMBOLS"))
+        .unwrap_or_else(|| "BTCUSDT,SOLUSDC".into());
+    let symbols = parse_unique_csv("MARKET_DATA_SYMBOLS", &symbols_str, str::to_uppercase)?;
 
     // --- Supervised task set (Task 1: task supervision) ---
     let mut join_set: JoinSet<(TaskId, anyhow::Result<()>)> = JoinSet::new();
@@ -452,12 +453,11 @@ async fn run_live_mode(
     );
 
     // Spawn Connector tasks
-    for ex in enabled_exchanges.split(',') {
+    for exchange_name in &enabled_exchanges {
         let trade_tx = trade_tx.clone();
         let candle_tx = candle_tx.clone();
         let user_tx = user_tx.clone();
         let symbols = symbols.clone();
-        let exchange_name = ex.trim().to_lowercase();
 
         match exchange_name.as_str() {
             "binance" => {
@@ -491,7 +491,7 @@ async fn run_live_mode(
                 });
                 info!("Supervised task spawned: connector:rithmic");
             }
-            _ => warn!("Unknown exchange in EXCHANGE_ENABLED: {}", ex),
+            _ => unreachable!("validated exchange: {exchange_name}"),
         }
     }
 
@@ -518,7 +518,7 @@ async fn run_live_mode(
     let redis_url_for_restart = redis_url.clone();
     let environment_for_restart = runtime_environment;
     let symbols_for_restart = symbols;
-    let exchanges_for_restart = enabled_exchanges;
+    let exchanges_for_restart = enabled_exchanges_csv;
 
     loop {
         tokio::select! {
@@ -784,6 +784,69 @@ async fn run_event_loop(
     }
 }
 
+fn non_empty_env(name: &str) -> Option<String> {
+    normalized_optional_value(std::env::var(name).ok())
+}
+
+fn normalized_optional_value(value: Option<String>) -> Option<String> {
+    value
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+}
+
+fn parse_unique_csv(
+    name: &str,
+    value: &str,
+    canonicalize: fn(&str) -> String,
+) -> anyhow::Result<Vec<String>> {
+    let values: Vec<String> = value
+        .split(',')
+        .map(str::trim)
+        .filter(|item| !item.is_empty())
+        .map(canonicalize)
+        .collect();
+    if values.is_empty() {
+        anyhow::bail!("{name} must contain at least one value");
+    }
+    let unique: std::collections::HashSet<&str> = values.iter().map(String::as_str).collect();
+    if unique.len() != values.len() {
+        anyhow::bail!("{name} must not contain duplicate values");
+    }
+    Ok(values)
+}
+
+fn validate_enabled_exchanges(value: &str) -> anyhow::Result<Vec<String>> {
+    let exchanges = parse_unique_csv("EXCHANGE_ENABLED", value, str::to_lowercase)?;
+    for exchange in &exchanges {
+        match exchange.as_str() {
+            "binance" | "bybit" | "backpack" => {}
+            #[cfg(feature = "rithmic")]
+            "rithmic" => {}
+            _ => anyhow::bail!("unsupported or unavailable exchange: {exchange}"),
+        }
+    }
+    Ok(exchanges)
+}
+
+fn optional_credentials_present(credentials: &[(&str, Option<String>)]) -> anyhow::Result<bool> {
+    let present = credentials
+        .iter()
+        .filter(|(_, value)| value.is_some())
+        .count();
+    if present == 0 {
+        return Ok(false);
+    }
+    if present != credentials.len() {
+        let names = credentials
+            .iter()
+            .map(|(name, _)| *name)
+            .collect::<Vec<_>>()
+            .join(", ");
+        anyhow::bail!("optional credentials must be provided together: {names}");
+    }
+    Ok(true)
+}
+
 /// Run the Binance connector: subscribes to trades, candles, and user stream.
 async fn run_binance_connector(
     symbols: Vec<String>,
@@ -805,7 +868,7 @@ async fn run_binance_connector(
     }
 
     // Start User Stream if API Key is present
-    if std::env::var("BINANCE_API_KEY").is_ok() {
+    if optional_credentials_present(&[("BINANCE_API_KEY", non_empty_env("BINANCE_API_KEY"))])? {
         if let Err(e) = conn.subscribe_user_stream(user_tx).await {
             error!("Binance user stream error: {}", e);
             return Err(e);
@@ -870,7 +933,10 @@ async fn run_backpack_connector(
     }
 
     // Start User Stream if API Key is present
-    if std::env::var("EXCHANGE_API_KEY").is_ok() && std::env::var("EXCHANGE_SECRET").is_ok() {
+    if optional_credentials_present(&[
+        ("EXCHANGE_API_KEY", non_empty_env("EXCHANGE_API_KEY")),
+        ("EXCHANGE_SECRET", non_empty_env("EXCHANGE_SECRET")),
+    ])? {
         if let Err(e) = conn.subscribe_user_stream(user_tx).await {
             error!("Backpack user stream error: {}", e);
             return Err(e);
@@ -909,6 +975,51 @@ mod tests {
         assert!(task_exit_requires_shutdown(&TaskId::Connector(
             "rithmic".to_string()
         )));
+    }
+
+    #[test]
+    fn production_runtime_csv_values_fail_closed() {
+        assert!(parse_unique_csv("MARKET_DATA_SYMBOLS", " , ", str::to_uppercase).is_err());
+        assert_eq!(
+            parse_unique_csv("MARKET_DATA_SYMBOLS", " btcusdt, mnqu6 ", str::to_uppercase,)
+                .unwrap(),
+            vec!["BTCUSDT", "MNQU6"]
+        );
+        assert!(parse_unique_csv("MARKET_DATA_SYMBOLS", "mnqu6,MNQU6", str::to_uppercase).is_err());
+        assert!(validate_enabled_exchanges("unknown").is_err());
+        assert_eq!(
+            validate_enabled_exchanges("BINANCE,bybit").unwrap(),
+            vec!["binance", "bybit"]
+        );
+        assert!(validate_enabled_exchanges("binance,BINANCE").is_err());
+    }
+
+    #[test]
+    fn optional_credentials_require_all_non_empty_values() {
+        assert_eq!(normalized_optional_value(None), None);
+        assert_eq!(normalized_optional_value(Some(String::new())), None);
+        assert_eq!(normalized_optional_value(Some("  ".to_string())), None);
+        assert_eq!(
+            normalized_optional_value(Some(" key ".to_string())),
+            Some("key".to_string())
+        );
+        assert!(!optional_credentials_present(&[("key", None), ("secret", None),]).unwrap());
+        assert!(optional_credentials_present(&[
+            ("key", Some("key".to_string())),
+            ("secret", Some("secret".to_string())),
+        ])
+        .unwrap());
+        assert!(optional_credentials_present(&[
+            ("key", Some("key".to_string())),
+            ("secret", None),
+        ])
+        .is_err());
+    }
+
+    #[cfg(not(feature = "rithmic"))]
+    #[test]
+    fn rithmic_requires_a_rithmic_enabled_build() {
+        assert!(validate_enabled_exchanges("rithmic").is_err());
     }
 
     #[cfg(feature = "rithmic")]

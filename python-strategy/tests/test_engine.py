@@ -146,7 +146,10 @@ class TestEngineInit:
                 StrategyEngine(
                     db_session=mock_db_session,
                     clock=mock_clock,
-                    adapter_config={"mode": "live"},
+                    adapter_config={
+                        "mode": "live",
+                        "instrument_product_ids": ["BINANCE:BTCUSDT-PERP"],
+                    },
                 )
 
     def test_default_adapter_simulated(self, mock_db_session, mock_clock):
@@ -171,7 +174,11 @@ class TestEngineInit:
             mock_factory.return_value = MagicMock()
             mock_create.return_value = MagicMock()
 
-            cfg = {"mode": "live", "exchange": "bybit"}
+            cfg = {
+                "mode": "live",
+                "exchange": "bybit",
+                "instrument_product_ids": ["BYBIT:BTCUSDT-PERP"],
+            }
             StrategyEngine(
                 db_session=mock_db_session,
                 clock=mock_clock,
@@ -214,7 +221,10 @@ class TestEngineInit:
                 StrategyEngine(
                     db_session=mock_db_session,
                     clock=mock_clock,
-                    adapter_config={"mode": "live"},
+                    adapter_config={
+                        "mode": "live",
+                        "instrument_product_ids": ["BINANCE:BTCUSDT-PERP"],
+                    },
                 )
 
     def test_provided_adapter_used_directly(self, mock_db_session, mock_clock):
@@ -330,6 +340,7 @@ class TestEngineInit:
             audit_external_orders=True,
             adapter_config={
                 "mode": "live",
+                "instrument_product_ids": ["RITHMIC:NQ-202609"],
                 "rithmic_recovery_profile": "test",
                 "rithmic_recovery_account_id": "ACCOUNT",
             },
@@ -995,6 +1006,34 @@ class TestScanStrategies:
 
 
 class TestStartStrategy:
+    @pytest.mark.parametrize(
+        ("product_id", "allowed"),
+        [
+            ("BINANCE:BTCUSDT-PERP", True),
+            ("BINANCE:ETHUSDT-PERP", False),
+            ("BYBIT:BTCUSDT-PERP", False),
+            ("", False),
+        ],
+    )
+    def test_live_strategy_product_must_match_adapter_allowlist(
+        self,
+        engine_factory,
+        product_id,
+        allowed,
+    ):
+        engine = engine_factory(
+            adapter_config={
+                "mode": "live",
+                "instrument_product_ids": ["BINANCE:BTCUSDT-PERP"],
+            }
+        )
+
+        if allowed:
+            assert engine._strategy_product_id({"product_id": product_id}) == product_id
+        else:
+            with pytest.raises(ValueError):
+                engine._strategy_product_id({"product_id": product_id})
+
 
     def test_start_unloaded_strategy_does_nothing(self, engine):
         """Starting an unloaded strategy should return early."""
@@ -1008,7 +1047,7 @@ class TestStartStrategy:
 
         mock_state = MagicMock()
         mock_state.status = "READY"
-        mock_state.config_json = "{}"
+        mock_state.config_json = '{"product_id":"BINANCE:BTCUSDT-PERP"}'
         mock_db = MagicMock()
         mock_db.query.return_value.filter.return_value.first.return_value = mock_state
         engine._db_session_factory = lambda: nullcontext(mock_db)
@@ -1079,7 +1118,7 @@ class TestTestRunStrategy:
         engine.loaded_classes["test.py::MyStrat"] = mock_strategy_class
 
         mock_state = MagicMock()
-        mock_state.config_json = "{}"
+        mock_state.config_json = '{"product_id":"BINANCE:BTCUSDT-PERP"}'
         mock_db = MagicMock()
         mock_db.query.return_value.filter.return_value.first.return_value = mock_state
         engine._db_session_factory = lambda: nullcontext(mock_db)
@@ -1094,7 +1133,7 @@ class TestTestRunStrategy:
         engine.loaded_classes["test.py::MyStrat"] = mock_strategy_class
 
         mock_state = MagicMock()
-        mock_state.config_json = "{}"
+        mock_state.config_json = '{"product_id":"BINANCE:BTCUSDT-PERP"}'
         mock_db = MagicMock()
         mock_db.query.return_value.filter.return_value.first.return_value = mock_state
         engine._db_session_factory = lambda: nullcontext(mock_db)
@@ -1113,7 +1152,7 @@ class TestTestRunStrategy:
         engine.loaded_classes["test.py::FailingStrat"] = FailingStrategy
 
         mock_state = MagicMock()
-        mock_state.config_json = "{}"
+        mock_state.config_json = '{"product_id":"BINANCE:BTCUSDT-PERP"}'
         mock_db = MagicMock()
         mock_db.query.return_value.filter.return_value.first.return_value = mock_state
         engine._db_session_factory = lambda: nullcontext(mock_db)
@@ -1180,7 +1219,7 @@ class TestStrategyWarmup:
 
         state = MagicMock()
         state.status = StrategyStatus.READY
-        state.config_json = "{}"
+        state.config_json = '{"product_id":"BINANCE:BTCUSDT-PERP"}'
         rows = [
             ORMCandlestick(
                 product_id="BINANCE:BTCUSDT-PERP",
@@ -1241,7 +1280,7 @@ class TestStrategyWarmup:
 
         state = MagicMock()
         state.status = StrategyStatus.READY
-        state.config_json = "{}"
+        state.config_json = '{"product_id":"BINANCE:BTCUSDT-PERP"}'
         rows = [
             ORMCandlestick(
                 product_id="BINANCE:BTCUSDT-PERP",
@@ -1293,7 +1332,7 @@ class TestStrategyWarmup:
 
         state = MagicMock()
         state.status = StrategyStatus.READY
-        state.config_json = "{}"
+        state.config_json = '{"product_id":"BINANCE:BTCUSDT-PERP"}'
         rows = [
             ORMCandlestick(
                 product_id="BINANCE:BTCUSDT-PERP",
@@ -1371,7 +1410,7 @@ class TestStrategyWarmup:
 
         state = MagicMock()
         state.status = StrategyStatus.READY
-        state.config_json = "{}"
+        state.config_json = '{"product_id":"BINANCE:BTCUSDT-PERP"}'
         rows = [
             ORMCandlestick(
                 product_id="BINANCE:BTCUSDT-PERP",
@@ -1418,7 +1457,7 @@ class TestStrategyWarmup:
 
         state = MagicMock()
         state.status = StrategyStatus.READY
-        state.config_json = "{}"
+        state.config_json = '{"product_id":"BINANCE:BTCUSDT-PERP"}'
         rows = [
             ORMCandlestick(
                 product_id="BINANCE:BTCUSDT-PERP",
@@ -1472,7 +1511,7 @@ class TestStrategyWarmup:
 
         state = MagicMock()
         state.status = StrategyStatus.READY
-        state.config_json = "{}"
+        state.config_json = '{"product_id":"BINANCE:BTCUSDT-PERP"}'
         engine._db_session_factory = self._make_warmup_db(state, [])
         engine.account_service.set_position(
             Position(
@@ -1527,7 +1566,7 @@ class TestStrategyWarmup:
 
         state = MagicMock()
         state.status = StrategyStatus.READY
-        state.config_json = "{}"
+        state.config_json = '{"product_id":"BINANCE:BTCUSDT-PERP"}'
         rows = [
             ORMCandlestick(
                 product_id="BINANCE:BTCUSDT-PERP",
@@ -1925,7 +1964,10 @@ class TestRuntimeReconciliationThread:
             engine = StrategyEngine(
                 db_session=mock_db_session,
                 clock=mock_clock,
-                adapter_config={"mode": "live"},
+                adapter_config={
+                    "mode": "live",
+                    "instrument_product_ids": ["BINANCE:BTCUSDT-PERP"],
+                },
             )
 
         startup_steps = [

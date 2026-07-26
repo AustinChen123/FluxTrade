@@ -1,0 +1,13 @@
+**
+!rust-data-service/
+!rust-data-service/Cargo.toml
+!rust-data-service/Cargo.lock
+!rust-data-service/build.rs
+!rust-data-service/src/
+!rust-data-service/src/**
+!python-strategy/
+!python-strategy/pyproject.toml
+!python-strategy/uv.lock
+!python-strategy/src/
+!python-strategy/src/**
+python-strategy/src/fluxtrade_core.so
