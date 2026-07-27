@@ -1782,7 +1782,7 @@ class StrategyEngine:
         if not isinstance(adapter, RithmicExchangeAdapter):
             raise RuntimeError("rithmic_runtime_reconciliation_adapter_mismatch")
 
-        with self._ops_command_lock, self._market_processing_lock:
+        with self._market_processing_lock, self._ops_command_lock:
             if not self.execution_engine.halt_for_reconcile(timeout=30.0):
                 self._lockdown_for_rithmic_order_drift(
                     "rithmic_runtime_reconciliation_drain_timeout"
