@@ -956,8 +956,8 @@ def test_control_plane_lists_and_gets_genes(tmp_path):
             strategy_id="searchable",
             started_at=datetime(2026, 5, 20, tzinfo=UTC),
             pop_size=2,
-            max_generations=1,
-            generations_run=1,
+            max_generations=2,
+            generations_run=2,
             best_score=Decimal("2.5"),
             seed=1,
             config_json={},
@@ -989,10 +989,22 @@ def test_control_plane_lists_and_gets_genes(tmp_path):
             candidate_id="challenger",
             epoch_id="epoch-query",
         )
+        next_generation = GeneRecord(
+            strategy_id="searchable",
+            role="challenger",
+            param_pack={"score": "3.1"},
+            score_total=Decimal("3.1"),
+            score_breakdown={"total_pnl": "3.1"},
+            max_drawdown=Decimal("0.04"),
+            generation_index=1,
+            candidate_id="next-generation",
+            epoch_id="epoch-query",
+        )
         session.add(epoch)
-        session.add_all([champion, challenger])
+        session.add_all([champion, challenger, next_generation])
         session.commit()
         champion_id = champion.id
+        next_generation_id = next_generation.id
 
     app = ControlPlaneApp(
         BacktestJobExecutor(run_inline=True),
@@ -1004,6 +1016,14 @@ def test_control_plane_lists_and_gets_genes(tmp_path):
         "/genes?strategy_id=searchable&role=champion&limit=1&offset=0",
     )
     get_response = app.handle("GET", f"/genes/{champion_id}")
+    generation_response = app.handle(
+        "GET",
+        "/genes?epoch_id=epoch-query&generation_index=1&limit=10000&offset=0",
+    )
+    summary_response = app.handle(
+        "GET",
+        "/evolution-epochs/epoch-query/generations",
+    )
 
     assert list_response.status_code == 200
     assert [gene["id"] for gene in list_response.body["genes"]] == [champion_id]
@@ -1014,6 +1034,56 @@ def test_control_plane_lists_and_gets_genes(tmp_path):
     assert get_response.body["gene"]["id"] == champion_id
     assert get_response.body["gene"]["score_total"] == "2.50000000"
     assert get_response.body["gene"]["param_pack"] == {"score": "2.5"}
+    assert [gene["id"] for gene in generation_response.body["genes"]] == [
+        next_generation_id
+    ]
+    assert generation_response.body["total"] == 1
+    assert generation_response.body["limit"] == 10_000
+    assert summary_response.status_code == 200
+    assert summary_response.body["generations"] == [
+        {
+            "generation_index": 0,
+            "candidate_count": 2,
+            "score_min": "1.20000000",
+            "score_max": "2.50000000",
+            "drawdown_min": "0.05000000",
+            "drawdown_max": "0.10000000",
+        },
+        {
+            "generation_index": 1,
+            "candidate_count": 1,
+            "score_min": "3.10000000",
+            "score_max": "3.10000000",
+            "drawdown_min": "0.04000000",
+            "drawdown_max": "0.04000000",
+        },
+    ]
+
+
+def test_control_plane_rejects_invalid_gene_generation_and_missing_epoch_summary(
+    tmp_path,
+):
+    app = ControlPlaneApp(
+        BacktestJobExecutor(run_inline=True),
+        gene_control=GeneControlService(
+            _sqlite_gene_registry_session_factory(tmp_path)
+        ),
+    )
+
+    invalid_generation = app.handle(
+        "GET",
+        "/genes?generation_index=-1",
+    )
+    missing_epoch = app.handle(
+        "GET",
+        "/evolution-epochs/missing/generations",
+    )
+    oversized_page = app.handle("GET", "/genes?limit=10001")
+
+    assert invalid_generation.status_code == 422
+    assert oversized_page.status_code == 422
+    assert missing_epoch.status_code == 404
+    assert missing_epoch.body == {"error": "epoch_not_found"}
 
 
 def test_control_plane_lists_and_gets_evolution_epochs(tmp_path):

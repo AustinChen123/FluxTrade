@@ -4,6 +4,8 @@ from datetime import UTC, datetime
 from decimal import Decimal
 from typing import Any
 
+from sqlalchemy import func
+
 from src.control_plane.backtest_jobs import SessionFactory
 from src.core.audit_service import write_system_event
 from src.core.models import GeneRole
@@ -84,6 +86,8 @@ class GeneControlService:
         *,
         strategy_id: str | None = None,
         role: str | None = None,
+        epoch_id: str | None = None,
+        generation_index: int | None = None,
         limit: int,
         offset: int,
     ) -> tuple[list[dict[str, Any]], int]:
@@ -93,6 +97,12 @@ class GeneControlService:
                 query = query.filter(GeneRecord.strategy_id == strategy_id)
             if role is not None:
                 query = query.filter(GeneRecord.role == role)
+            if epoch_id is not None:
+                query = query.filter(GeneRecord.epoch_id == epoch_id)
+            if generation_index is not None:
+                query = query.filter(
+                    GeneRecord.generation_index == generation_index
+                )
             total = query.count()
             genes = (
                 query.order_by(GeneRecord.created_at.desc(), GeneRecord.id.desc())
@@ -101,6 +111,43 @@ class GeneControlService:
                 .all()
             )
             return [_gene_payload(gene) for gene in genes], total
+
+    def list_generation_summaries(self, epoch_id: str) -> list[dict[str, Any]]:
+        with self._db_session_factory() as session:
+            if session.get(EvolutionEpoch, epoch_id) is None:
+                raise KeyError(epoch_id)
+            rows = (
+                session.query(
+                    GeneRecord.generation_index,
+                    func.count(GeneRecord.id),
+                    func.min(GeneRecord.score_total),
+                    func.max(GeneRecord.score_total),
+                    func.min(GeneRecord.max_drawdown),
+                    func.max(GeneRecord.max_drawdown),
+                )
+                .filter(GeneRecord.epoch_id == epoch_id)
+                .group_by(GeneRecord.generation_index)
+                .order_by(GeneRecord.generation_index)
+                .all()
+            )
+            return [
+                {
+                    "generation_index": generation_index,
+                    "candidate_count": candidate_count,
+                    "score_min": _decimal_str(score_min),
+                    "score_max": _decimal_str(score_max),
+                    "drawdown_min": _decimal_str(drawdown_min),
+                    "drawdown_max": _decimal_str(drawdown_max),
+                }
+                for (
+                    generation_index,
+                    candidate_count,
+                    score_min,
+                    score_max,
+                    drawdown_min,
+                    drawdown_max,
+                ) in rows
+            ]
 
     def get_gene(self, gene_id: int) -> dict[str, Any]:
         with self._db_session_factory() as session:
