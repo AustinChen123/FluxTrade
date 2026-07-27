@@ -2413,6 +2413,91 @@ class TestRuntimeReconciliationThread:
         engine.execution_engine.process_market_data.assert_called_once()
         engine._signal_processor.on_candle.assert_called_once()
 
+    def test_periodic_reconciliation_wait_does_not_block_kill_switch(
+        self,
+        engine,
+    ):
+        adapter = _rithmic_adapter_for_reconnect_test()
+        engine.execution_engine.adapter = adapter
+        engine._rithmic_recovery_profile = "test"
+        engine._rithmic_recovery_account_id = "ACCOUNT"
+        engine.execution_engine.halt_for_reconcile = MagicMock(return_value=True)
+        engine.execution_engine.reconcile_rithmic_owned_orders = MagicMock(
+            return_value=_authoritative_rithmic_summary()
+        )
+        engine._apply_rithmic_authoritative_account_summary = MagicMock()
+        engine._start_exchange_order_event_stream = MagicMock()
+        engine.execution_engine.resume_after_reconcile = MagicMock()
+        engine._run_ops_kill_switch = MagicMock(
+            return_value=_kill_switch_result()
+        )
+        engine.ops_safety.persist_kill_switch_state = MagicMock()
+
+        market_started = threading.Event()
+        release_market = threading.Event()
+        reconcile_waiting = threading.Event()
+        kill_halted = threading.Event()
+
+        class ObservableLock:
+            def __init__(self):
+                self._lock = threading.Lock()
+
+            def __enter__(self):
+                if threading.current_thread().name == "periodic-reconcile":
+                    reconcile_waiting.set()
+                self._lock.acquire()
+                return self
+
+            def __exit__(self, *_args):
+                self._lock.release()
+
+        engine._market_processing_lock = ObservableLock()
+
+        def hold_market_callback(_candle):
+            market_started.set()
+            assert release_market.wait(timeout=5.0)
+
+        engine.execution_engine.process_market_data = MagicMock(
+            side_effect=hold_market_callback
+        )
+        engine._signal_processor.on_candle = MagicMock()
+        engine._halt_for_kill_switch = MagicMock(
+            side_effect=lambda: kill_halted.set()
+        )
+
+        market_thread = threading.Thread(
+            name="market-callback",
+            target=lambda: engine.on_market_data(_make_candle()),
+        )
+        reconcile_thread = threading.Thread(
+            name="periodic-reconcile",
+            target=engine._run_rithmic_runtime_reconciliation_once,
+        )
+        kill_thread = threading.Thread(
+            name="kill-switch",
+            target=lambda: engine._handle_command(
+                {"command": "KILL_SWITCH", "params": {"actor": "operator"}}
+            ),
+        )
+
+        market_thread.start()
+        assert market_started.wait(timeout=5.0)
+        reconcile_thread.start()
+        assert reconcile_waiting.wait(timeout=5.0)
+        kill_thread.start()
+        try:
+            assert kill_halted.wait(timeout=1.0)
+        finally:
+            release_market.set()
+            market_thread.join(timeout=5.0)
+            kill_thread.join(timeout=5.0)
+            reconcile_thread.join(timeout=5.0)
+
+        assert not market_thread.is_alive()
+        assert not kill_thread.is_alive()
+        assert not reconcile_thread.is_alive()
+        engine._halt_for_kill_switch.assert_called_once_with()
+
     @pytest.mark.parametrize(
         ("summary", "apply_error", "expected_reason"),
         [
