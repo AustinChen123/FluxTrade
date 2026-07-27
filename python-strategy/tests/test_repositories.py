@@ -18,6 +18,8 @@ from contextlib import nullcontext
 from decimal import Decimal
 import inspect
 
+import pytest
+
 from src.core.interfaces.repository import IOrderRepository
 from src.core.repositories import BacktestOrderRepository, LiveOrderRepository
 from src.core.orm_models import Order, Position, Trade
@@ -181,6 +183,69 @@ class TestBacktestTradeLogging:
 
         assert mock_db_session.add.called
         assert mock_db_session.commit.called
+
+    def test_add_trade_assigns_monotonic_fill_sequence(
+        self,
+        mock_db_session,
+        order_factory,
+    ):
+        repo = BacktestOrderRepository(mock_db_session, session_id=42)
+        order_id = order_factory().id
+
+        for trade_id in ("trade-1", "trade-2"):
+            repo.add_trade(
+                Trade(
+                    id=trade_id,
+                    order_id=order_id,
+                    exchange_trade_id=f"sim-{trade_id}",
+                    product_id="BINANCE:BTCUSDT-PERP",
+                    side="buy",
+                    price=Decimal("42000"),
+                    quantity=Decimal("1"),
+                    fee=Decimal("0"),
+                    fee_asset="USDT",
+                    timestamp=1704067200000,
+                )
+            )
+
+        persisted = [
+            call.args[0]
+            for call in mock_db_session.add.call_args_list
+        ]
+        assert [trade.fill_sequence for trade in persisted] == [0, 1]
+
+    def test_failed_commit_does_not_consume_fill_sequence(
+        self,
+        mock_db_session,
+        order_factory,
+    ):
+        repo = BacktestOrderRepository(mock_db_session, session_id=42)
+        order_id = order_factory().id
+        mock_db_session.commit.side_effect = [RuntimeError("commit failed"), None]
+
+        def trade(trade_id):
+            return Trade(
+                id=trade_id,
+                order_id=order_id,
+                exchange_trade_id=f"sim-{trade_id}",
+                product_id="BINANCE:BTCUSDT-PERP",
+                side="buy",
+                price=Decimal("42000"),
+                quantity=Decimal("1"),
+                fee=Decimal("0"),
+                fee_asset="USDT",
+                timestamp=1704067200000,
+            )
+
+        with pytest.raises(RuntimeError, match="commit failed"):
+            repo.add_trade(trade("failed"))
+        repo.add_trade(trade("retry"))
+
+        persisted = [
+            call.args[0]
+            for call in mock_db_session.add.call_args_list
+        ]
+        assert [item.fill_sequence for item in persisted] == [0, 0]
 
     def test_update_order_exchange_id(self, mock_db_session, order_factory):
         """update_order_exchange_id should set exchange_order_id on order."""

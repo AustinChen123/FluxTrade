@@ -140,10 +140,18 @@ def test_current_backtest_replay_persists_trades_and_metrics(tmp_path):
         strategy_ids = set(
             session.scalars(select(BacktestTradeLog.strategy_id)).all()
         )
+        fill_sequences = list(
+            session.scalars(
+                select(BacktestTradeLog.fill_sequence).order_by(
+                    BacktestTradeLog.fill_sequence
+                )
+            ).all()
+        )
 
     metrics = json.loads(summary.metrics_json)
 
     assert trade_count == 50
+    assert fill_sequences == list(range(50))
     assert audit_count == 50
     assert strategy_ids == {"current_replay"}
     assert result["journal_count"] >= trade_count

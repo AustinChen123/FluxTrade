@@ -90,8 +90,16 @@ def test_concurrent_backtest_trade_logs_use_independent_sessions(tmp_path):
 
     with session_factory() as session:
         count = session.scalar(select(func.count()).select_from(BacktestTradeLog))
+        fill_sequences = list(
+            session.scalars(
+                select(BacktestTradeLog.fill_sequence).order_by(
+                    BacktestTradeLog.fill_sequence
+                )
+            )
+        )
 
     assert count == 200
+    assert fill_sequences == list(range(200))
 
 
 def test_concurrent_engine_heartbeat_updates_use_independent_sessions(tmp_path, engine_factory):

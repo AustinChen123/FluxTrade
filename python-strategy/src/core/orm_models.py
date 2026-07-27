@@ -284,6 +284,19 @@ class BacktestTradeLog(Base):
     fee = Column(Numeric, nullable=True)
     fee_asset = Column(String, nullable=True)
     timestamp = Column(BigInteger, nullable=False)
+    fill_sequence = Column(BigInteger, nullable=True)
+
+    __table_args__ = (
+        UniqueConstraint(
+            "session_id",
+            "fill_sequence",
+            name="uq_backtest_trade_log_session_fill_sequence",
+        ),
+        CheckConstraint(
+            "fill_sequence IS NULL OR fill_sequence >= 0",
+            name="chk_backtest_trade_log_fill_sequence_nonnegative",
+        ),
+    )
 
 class StrategyState(Base):
     __tablename__ = 'strategy_state'
