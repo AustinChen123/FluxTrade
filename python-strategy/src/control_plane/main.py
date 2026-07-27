@@ -134,11 +134,16 @@ def _positive_env_int(name: str, default: int) -> int:
 def main() -> None:
     host = os.getenv("CONTROL_PLANE_HOST", "127.0.0.1")
     port = int(os.getenv("CONTROL_PLANE_PORT", "8080"))
+    static_dir = os.getenv("CONTROL_PLANE_STATIC_DIR") or None
+    api_key = os.getenv("CONTROL_PLANE_API_KEY")
+    browser_auth = build_browser_session_auth_from_env()
+    if static_dir is not None and api_key and browser_auth is None:
+        static_dir = None
     app = build_control_plane_app(
-        api_key=os.getenv("CONTROL_PLANE_API_KEY"),
-        browser_auth=build_browser_session_auth_from_env(),
+        api_key=api_key,
+        browser_auth=browser_auth,
     )
-    serve(app, host=host, port=port)
+    serve(app, host=host, port=port, static_dir=static_dir)
 
 
 if __name__ == "__main__":

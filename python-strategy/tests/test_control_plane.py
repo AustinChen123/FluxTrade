@@ -384,6 +384,15 @@ def test_control_plane_api_key_auth_allows_health_without_credentials():
     assert response.body == {"status": "ok"}
 
 
+def test_control_plane_reports_browser_session_endpoint_unavailable():
+    app = ControlPlaneApp(BacktestJobExecutor(run_inline=True))
+
+    response = app.handle("GET", "/api/v1/auth/session")
+
+    assert response.status_code == 404
+    assert response.body == {"error": "not_found"}
+
+
 def test_control_plane_api_key_auth_rejects_missing_credentials():
     app = ControlPlaneApp(BacktestJobExecutor(run_inline=True), api_key="secret")
 
@@ -2427,7 +2436,15 @@ def test_control_plane_main_serves_production_app(monkeypatch):
     from src.control_plane import main as control_plane_main
 
     app = object()
+    browser_auth = object()
     captured = {}
+    monkeypatch.setenv("CONTROL_PLANE_STATIC_DIR", "/app/frontend")
+    monkeypatch.setenv("CONTROL_PLANE_API_KEY", "api-key")
+    monkeypatch.setattr(
+        control_plane_main,
+        "build_browser_session_auth_from_env",
+        lambda: browser_auth,
+    )
 
     monkeypatch.setattr(
         control_plane_main,
@@ -2440,14 +2457,59 @@ def test_control_plane_main_serves_production_app(monkeypatch):
     monkeypatch.setattr(
         control_plane_main,
         "serve",
-        lambda served_app, *, host, port: captured.update(
-            {"served_app": served_app, "host": host, "port": port}
+        lambda served_app, *, host, port, static_dir: captured.update(
+            {
+                "served_app": served_app,
+                "host": host,
+                "port": port,
+                "static_dir": static_dir,
+            }
         ),
     )
 
     control_plane_main.main()
 
     assert captured["served_app"] is app
-    assert captured["browser_auth"] is None
+    assert captured["api_key"] == "api-key"
+    assert captured["browser_auth"] is browser_auth
     assert captured["host"] == "127.0.0.1"
     assert captured["port"] == 8080
+    assert captured["static_dir"] == "/app/frontend"
+
+
+def test_control_plane_main_disables_static_frontend_with_api_key_only(
+    monkeypatch,
+):
+    from src.control_plane import main as control_plane_main
+
+    app = object()
+    captured = {}
+    monkeypatch.setenv("CONTROL_PLANE_STATIC_DIR", "/app/frontend")
+    monkeypatch.setenv("CONTROL_PLANE_API_KEY", "api-key")
+    monkeypatch.setattr(
+        control_plane_main,
+        "build_control_plane_app",
+        lambda *, api_key, browser_auth: captured.update(
+            {"api_key": api_key, "browser_auth": browser_auth}
+        )
+        or app,
+    )
+    monkeypatch.setattr(
+        control_plane_main,
+        "serve",
+        lambda served_app, *, host, port, static_dir: captured.update(
+            {
+                "served_app": served_app,
+                "host": host,
+                "port": port,
+                "static_dir": static_dir,
+            }
+        ),
+    )
+
+    control_plane_main.main()
+
+    assert captured["served_app"] is app
+    assert captured["api_key"] == "api-key"
+    assert captured["browser_auth"] is None
+    assert captured["static_dir"] is None

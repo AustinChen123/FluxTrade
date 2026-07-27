@@ -113,6 +113,8 @@ class ControlPlaneApp:
             return browser_policy_response
 
         if method == "GET" and clean_path == "/api/v1/auth/session":
+            if self.browser_auth is None:
+                return HttpResponse(404, {"error": "not_found"})
             return self._get_browser_session(identity.browser_principal)
 
         if method == "POST" and clean_path == "/api/v1/auth/logout":
