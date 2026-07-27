@@ -5,6 +5,14 @@ COPY rust-data-service/Cargo.toml rust-data-service/Cargo.lock rust-data-service
 COPY rust-data-service/src/ ./src/
 RUN cargo build --lib --release
 
+FROM node:24.15.0-alpine AS frontend-builder
+
+WORKDIR /build
+COPY frontend/package.json frontend/package-lock.json ./
+RUN npm ci
+COPY frontend/ ./
+RUN npm run build
+
 FROM python:3.12-slim-bookworm
 
 # Install system dependencies (for hiredis/psycopg2 compilation if needed)
@@ -31,6 +39,7 @@ COPY database/alembic.ini ./database/alembic.ini
 COPY database/alembic/env.py ./database/alembic/env.py
 COPY database/alembic/versions/ ./database/alembic/versions/
 COPY --from=extension-builder /build/target/release/libfluxtrade_core.so ./fluxtrade_core.so
+COPY --from=frontend-builder /build/dist/ ./frontend/
 
 # Create non-root user and writable application data directory
 RUN useradd -m -u 1000 -s /bin/bash trading \
@@ -41,5 +50,6 @@ USER trading
 # Set Python path and add venv to PATH
 ENV PYTHONPATH=/app
 ENV PATH="/app/.venv/bin:$PATH"
+ENV CONTROL_PLANE_STATIC_DIR=/app/frontend
 
 CMD ["python", "src/main.py"]

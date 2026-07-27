@@ -113,6 +113,8 @@ class ControlPlaneApp:
             return browser_policy_response
 
         if method == "GET" and clean_path == "/api/v1/auth/session":
+            if self.browser_auth is None:
+                return HttpResponse(404, {"error": "not_found"})
             return self._get_browser_session(identity.browser_principal)
 
         if method == "POST" and clean_path == "/api/v1/auth/logout":
@@ -144,6 +146,13 @@ class ControlPlaneApp:
 
         if method == "GET" and clean_path == "/evolution-epochs":
             return self._list_epochs(query)
+
+        if (
+            method == "GET"
+            and clean_path.startswith("/evolution-epochs/")
+            and clean_path.endswith("/generations")
+        ):
+            return self._list_epoch_generations(clean_path)
 
         if method == "GET" and clean_path.startswith("/evolution-epochs/"):
             return self._get_epoch(clean_path)
@@ -532,15 +541,23 @@ class ControlPlaneApp:
     def _list_genes(self, query: dict[str, list[str]]) -> HttpResponse:
         if self.gene_control is None:
             return HttpResponse(503, {"error": "gene_control_unavailable"})
-        pagination = _parse_pagination(query)
+        pagination = _parse_pagination(query, max_limit=10_000)
         if isinstance(pagination, HttpResponse):
             return pagination
         limit, offset = pagination
         strategy_id = _single_query_value(query, "strategy_id")
         role = _single_query_value(query, "role")
+        generation_index = _parse_optional_non_negative_int(
+            query,
+            "generation_index",
+        )
+        if isinstance(generation_index, HttpResponse):
+            return generation_index
         genes, total = self.gene_control.list_genes(
             strategy_id=strategy_id,
             role=role,
+            epoch_id=_single_query_value(query, "epoch_id"),
+            generation_index=generation_index,
             limit=limit,
             offset=offset,
         )
@@ -591,6 +608,20 @@ class ControlPlaneApp:
         except KeyError:
             return HttpResponse(404, {"error": "epoch_not_found"})
         return HttpResponse(200, {"epoch": epoch})
+
+    def _list_epoch_generations(self, path: str) -> HttpResponse:
+        if self.gene_control is None:
+            return HttpResponse(503, {"error": "gene_control_unavailable"})
+        epoch_id = path.removeprefix("/evolution-epochs/").removesuffix(
+            "/generations"
+        )
+        if not epoch_id or "/" in epoch_id:
+            return HttpResponse(404, {"error": "not_found"})
+        try:
+            generations = self.gene_control.list_generation_summaries(epoch_id)
+        except KeyError:
+            return HttpResponse(404, {"error": "epoch_not_found"})
+        return HttpResponse(200, {"generations": generations})
 
     def _list_system_events(self, query: dict[str, list[str]]) -> HttpResponse:
         if self.gene_control is None:
@@ -906,13 +937,17 @@ def _utc_iso(value: float | None) -> str | None:
     return datetime.fromtimestamp(value, tz=UTC).isoformat()
 
 
-def _parse_pagination(query: dict[str, list[str]]) -> tuple[int, int] | HttpResponse:
+def _parse_pagination(
+    query: dict[str, list[str]],
+    *,
+    max_limit: int = 500,
+) -> tuple[int, int] | HttpResponse:
     try:
         limit = int(_single_query_value(query, "limit") or "100")
         offset = int(_single_query_value(query, "offset") or "0")
     except ValueError:
         return HttpResponse(422, {"error": "validation_error"})
-    if limit < 1 or limit > 500 or offset < 0:
+    if limit < 1 or limit > max_limit or offset < 0:
         return HttpResponse(422, {"error": "validation_error"})
     return limit, offset
 

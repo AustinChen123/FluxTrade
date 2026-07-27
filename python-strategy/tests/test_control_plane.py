@@ -384,6 +384,15 @@ def test_control_plane_api_key_auth_allows_health_without_credentials():
     assert response.body == {"status": "ok"}
 
 
+def test_control_plane_reports_browser_session_endpoint_unavailable():
+    app = ControlPlaneApp(BacktestJobExecutor(run_inline=True))
+
+    response = app.handle("GET", "/api/v1/auth/session")
+
+    assert response.status_code == 404
+    assert response.body == {"error": "not_found"}
+
+
 def test_control_plane_api_key_auth_rejects_missing_credentials():
     app = ControlPlaneApp(BacktestJobExecutor(run_inline=True), api_key="secret")
 
@@ -956,8 +965,8 @@ def test_control_plane_lists_and_gets_genes(tmp_path):
             strategy_id="searchable",
             started_at=datetime(2026, 5, 20, tzinfo=UTC),
             pop_size=2,
-            max_generations=1,
-            generations_run=1,
+            max_generations=2,
+            generations_run=2,
             best_score=Decimal("2.5"),
             seed=1,
             config_json={},
@@ -989,10 +998,22 @@ def test_control_plane_lists_and_gets_genes(tmp_path):
             candidate_id="challenger",
             epoch_id="epoch-query",
         )
+        next_generation = GeneRecord(
+            strategy_id="searchable",
+            role="challenger",
+            param_pack={"score": "3.1"},
+            score_total=Decimal("3.1"),
+            score_breakdown={"total_pnl": "3.1"},
+            max_drawdown=Decimal("0.04"),
+            generation_index=1,
+            candidate_id="next-generation",
+            epoch_id="epoch-query",
+        )
         session.add(epoch)
-        session.add_all([champion, challenger])
+        session.add_all([champion, challenger, next_generation])
         session.commit()
         champion_id = champion.id
+        next_generation_id = next_generation.id
 
     app = ControlPlaneApp(
         BacktestJobExecutor(run_inline=True),
@@ -1004,6 +1025,14 @@ def test_control_plane_lists_and_gets_genes(tmp_path):
         "/genes?strategy_id=searchable&role=champion&limit=1&offset=0",
     )
     get_response = app.handle("GET", f"/genes/{champion_id}")
+    generation_response = app.handle(
+        "GET",
+        "/genes?epoch_id=epoch-query&generation_index=1&limit=10000&offset=0",
+    )
+    summary_response = app.handle(
+        "GET",
+        "/evolution-epochs/epoch-query/generations",
+    )
 
     assert list_response.status_code == 200
     assert [gene["id"] for gene in list_response.body["genes"]] == [champion_id]
@@ -1014,6 +1043,56 @@ def test_control_plane_lists_and_gets_genes(tmp_path):
     assert get_response.body["gene"]["id"] == champion_id
     assert get_response.body["gene"]["score_total"] == "2.50000000"
     assert get_response.body["gene"]["param_pack"] == {"score": "2.5"}
+    assert [gene["id"] for gene in generation_response.body["genes"]] == [
+        next_generation_id
+    ]
+    assert generation_response.body["total"] == 1
+    assert generation_response.body["limit"] == 10_000
+    assert summary_response.status_code == 200
+    assert summary_response.body["generations"] == [
+        {
+            "generation_index": 0,
+            "candidate_count": 2,
+            "score_min": "1.20000000",
+            "score_max": "2.50000000",
+            "drawdown_min": "0.05000000",
+            "drawdown_max": "0.10000000",
+        },
+        {
+            "generation_index": 1,
+            "candidate_count": 1,
+            "score_min": "3.10000000",
+            "score_max": "3.10000000",
+            "drawdown_min": "0.04000000",
+            "drawdown_max": "0.04000000",
+        },
+    ]
+
+
+def test_control_plane_rejects_invalid_gene_generation_and_missing_epoch_summary(
+    tmp_path,
+):
+    app = ControlPlaneApp(
+        BacktestJobExecutor(run_inline=True),
+        gene_control=GeneControlService(
+            _sqlite_gene_registry_session_factory(tmp_path)
+        ),
+    )
+
+    invalid_generation = app.handle(
+        "GET",
+        "/genes?generation_index=-1",
+    )
+    missing_epoch = app.handle(
+        "GET",
+        "/evolution-epochs/missing/generations",
+    )
+    oversized_page = app.handle("GET", "/genes?limit=10001")
+
+    assert invalid_generation.status_code == 422
+    assert oversized_page.status_code == 422
+    assert missing_epoch.status_code == 404
+    assert missing_epoch.body == {"error": "epoch_not_found"}
 
 
 def test_control_plane_lists_and_gets_evolution_epochs(tmp_path):
@@ -2357,7 +2436,15 @@ def test_control_plane_main_serves_production_app(monkeypatch):
     from src.control_plane import main as control_plane_main
 
     app = object()
+    browser_auth = object()
     captured = {}
+    monkeypatch.setenv("CONTROL_PLANE_STATIC_DIR", "/app/frontend")
+    monkeypatch.setenv("CONTROL_PLANE_API_KEY", "api-key")
+    monkeypatch.setattr(
+        control_plane_main,
+        "build_browser_session_auth_from_env",
+        lambda: browser_auth,
+    )
 
     monkeypatch.setattr(
         control_plane_main,
@@ -2370,14 +2457,59 @@ def test_control_plane_main_serves_production_app(monkeypatch):
     monkeypatch.setattr(
         control_plane_main,
         "serve",
-        lambda served_app, *, host, port: captured.update(
-            {"served_app": served_app, "host": host, "port": port}
+        lambda served_app, *, host, port, static_dir: captured.update(
+            {
+                "served_app": served_app,
+                "host": host,
+                "port": port,
+                "static_dir": static_dir,
+            }
         ),
     )
 
     control_plane_main.main()
 
     assert captured["served_app"] is app
-    assert captured["browser_auth"] is None
+    assert captured["api_key"] == "api-key"
+    assert captured["browser_auth"] is browser_auth
     assert captured["host"] == "127.0.0.1"
     assert captured["port"] == 8080
+    assert captured["static_dir"] == "/app/frontend"
+
+
+def test_control_plane_main_disables_static_frontend_with_api_key_only(
+    monkeypatch,
+):
+    from src.control_plane import main as control_plane_main
+
+    app = object()
+    captured = {}
+    monkeypatch.setenv("CONTROL_PLANE_STATIC_DIR", "/app/frontend")
+    monkeypatch.setenv("CONTROL_PLANE_API_KEY", "api-key")
+    monkeypatch.setattr(
+        control_plane_main,
+        "build_control_plane_app",
+        lambda *, api_key, browser_auth: captured.update(
+            {"api_key": api_key, "browser_auth": browser_auth}
+        )
+        or app,
+    )
+    monkeypatch.setattr(
+        control_plane_main,
+        "serve",
+        lambda served_app, *, host, port, static_dir: captured.update(
+            {
+                "served_app": served_app,
+                "host": host,
+                "port": port,
+                "static_dir": static_dir,
+            }
+        ),
+    )
+
+    control_plane_main.main()
+
+    assert captured["served_app"] is app
+    assert captured["api_key"] == "api-key"
+    assert captured["browser_auth"] is None
+    assert captured["static_dir"] is None
