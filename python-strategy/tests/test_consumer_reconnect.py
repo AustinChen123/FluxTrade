@@ -9,6 +9,7 @@ from src.core.consumer import (
     DataConsumer,
     INITIAL_BACKOFF,
     MAX_BACKOFF,
+    MarketStreamOwnershipError,
     MarketStreamPendingError,
 )
 
@@ -24,7 +25,11 @@ def consumer(mock_callback):
         mock_client = MagicMock()
         mock_factory.return_value = mock_client
         c = DataConsumer(channels=["stream:test"], on_message_callback=mock_callback)
+        mock_client.set.return_value = True
+        mock_client.get.side_effect = lambda _key: c._ownership_token
+        mock_client.eval.return_value = 1
         yield c
+        c.stop()
 
 
 class TestStopMethod:
@@ -149,7 +154,7 @@ class TestReconnectionBackoff:
         consumer.start()
 
         assert consumer.running is False
-        consumer.redis_client.close.assert_called_once()
+        consumer.redis_client.close.assert_not_called()
 
     def test_consume_loop_clean_exit(self, consumer):
         """When _consume_loop returns normally (running=False), start() should exit."""
@@ -162,6 +167,17 @@ class TestReconnectionBackoff:
         consumer.start()
         # Should exit without error
         assert consumer.running is False
+
+    def test_startup_shutdown_request_is_sticky(self, consumer):
+        consumer.acquire_service_ownership()
+        consumer.request_stop()
+        consumer._consume_loop = MagicMock()
+
+        consumer.start()
+
+        consumer._consume_loop.assert_not_called()
+        assert consumer.running is False
+        assert consumer._stop_requested.is_set()
 
     def test_os_error_also_retries(self, consumer):
         """OSError (network-level) should also trigger backoff retry."""
@@ -207,3 +223,16 @@ class TestReconnectionBackoff:
 
         sleep.assert_called_once_with(INITIAL_BACKOFF)
         assert consumer._consume_loop.call_count == 2
+
+    def test_ownership_loss_exits_for_fresh_service_restart(self, consumer):
+        consumer._consume_loop = MagicMock(
+            side_effect=MarketStreamOwnershipError("successor took ownership")
+        )
+
+        with pytest.raises(
+            MarketStreamOwnershipError,
+            match="successor took ownership",
+        ):
+            consumer.start()
+
+        assert consumer._ownership_active is True

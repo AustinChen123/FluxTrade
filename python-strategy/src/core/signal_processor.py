@@ -293,9 +293,7 @@ class SignalProcessor:
         ordinal: int,
     ) -> Signal:
         metadata = dict(signal.metadata or {})
-        if "client_order_id" in metadata:
-            return signal
-        metadata["client_order_id"] = market_signal_client_order_id(
+        derived_client_order_id = market_signal_client_order_id(
             signal.strategy_id,
             product_id,
             event_scope,
@@ -303,4 +301,13 @@ class SignalProcessor:
             signal.type.value.lower(),
             ordinal,
         )
+        requested_client_order_id = metadata.get("client_order_id")
+        if (
+            requested_client_order_id is not None
+            and requested_client_order_id != derived_client_order_id
+        ):
+            metadata["requested_client_order_id"] = str(
+                requested_client_order_id
+            )
+        metadata["client_order_id"] = derived_client_order_id
         return signal.model_copy(update={"metadata": metadata})

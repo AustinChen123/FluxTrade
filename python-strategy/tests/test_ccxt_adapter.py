@@ -1549,6 +1549,52 @@ class TestCreateAdapter:
         client.fetch_leverage.assert_called_once_with("BTC/USDT:USDT")
         client.fetch_margin_mode.assert_called_once_with("BTC/USDT:USDT")
 
+    def test_live_account_initialization_stops_after_leadership_loss(self):
+        class FakeCcxtError(Exception):
+            pass
+
+        owns_service = True
+
+        def assert_leadership():
+            if not owns_service:
+                raise RuntimeError("leadership lost")
+
+        def set_position_mode_then_lose_leadership(*_args):
+            nonlocal owns_service
+            owns_service = False
+
+        with patch("src.core.adapters.ccxt_adapter.ccxt") as mock_ccxt:
+            mock_ccxt.BaseError = FakeCcxtError
+            mock_cls = MagicMock()
+            client = MagicMock()
+            client.load_markets.return_value = {
+                "BTC/USDT:USDT": _linear_contract_market(),
+            }
+            client.set_position_mode.side_effect = set_position_mode_then_lose_leadership
+            mock_cls.return_value = client
+            mock_ccxt.binance = mock_cls
+            setattr(mock_ccxt, "binance", mock_cls)
+
+            with pytest.raises(RuntimeError, match="leadership lost"):
+                create_adapter(
+                    {
+                        "mode": "live",
+                        "exchange": "binance",
+                        "api_key": "k",
+                        "secret": "s",
+                        "instrument_product_ids": ["BINANCE:BTCUSDT-PERP"],
+                        "account_initialization": {
+                            "leverage": 2,
+                            "margin_mode": "cross",
+                        },
+                    },
+                    operation_guard=assert_leadership,
+                )
+
+        client.fetch_position_mode.assert_not_called()
+        client.set_margin_mode.assert_not_called()
+        client.set_leverage.assert_not_called()
+
     def test_bybit_account_initialization_allows_unsupported_position_mode_fetch(
         self,
     ):

@@ -75,12 +75,14 @@ class ExecutionEngine:
         account_service=None,
         rithmic_account_profile: str | None = None,
         rithmic_account_id: str | None = None,
+        operation_guard: Callable[[], None] | None = None,
     ):
         self.logger = logging.getLogger("ExecutionEngine")
         self.clock = clock
         self._db_session_factory = db_session_factory
         self._db_session = db_session
         self.audit_external_orders = audit_external_orders
+        self._operation_guard = operation_guard or (lambda: None)
         self._position_loader = (
             getattr(
                 account_service,
@@ -179,6 +181,12 @@ class ExecutionEngine:
 
         self.logger.info("ExecutionEngine initialized with adapter: %s", type(adapter).__name__)
 
+    def _assert_external_operation_allowed(self) -> None:
+        try:
+            self._operation_guard()
+        except Exception as error:
+            raise ExchangeError("external_operation_fenced") from error
+
     def list_recoverable_client_orders(self):
         return self._order_reconciler.list_recoverable_client_orders()
 
@@ -221,6 +229,7 @@ class ExecutionEngine:
 
         resume_after_exit = False
         try:
+            self._assert_external_operation_allowed()
             decision = self._classify_exit_signal(signal)
             if decision is None or not decision.allowed:
                 reason = "not_exit" if decision is None else decision.reason
@@ -682,6 +691,7 @@ class ExecutionEngine:
         if order.status == OrderStatus.CANCELLED.value:
             return True
 
+        self._assert_external_operation_allowed()
         client_order_id = getattr(order, "client_order_id", None)
         if client_order_id and self.adapter.cancel_order_by_client_id(
             client_order_id,
@@ -692,6 +702,7 @@ class ExecutionEngine:
             return True
 
         exchange_order_id = order.exchange_order_id or order.id
+        self._assert_external_operation_allowed()
         if not self.adapter.cancel_order(
             exchange_order_id,
             order.product_id,
@@ -791,6 +802,7 @@ class ExecutionEngine:
 
         submit_attempted = False
         try:
+            self._assert_external_operation_allowed()
             self.order_manager.mark_submitted_unconfirmed(order)
             submit_attempted = True
             exchange_id = self.adapter.place_order(order)
@@ -849,6 +861,7 @@ class ExecutionEngine:
         exit_position = getattr(self.adapter, "exit_position", None)
         if not callable(exit_position):
             raise ExchangeError("adapter_authoritative_position_exit_unavailable")
+        self._assert_external_operation_allowed()
         if not exit_position(product_id):
             raise ExchangeError("authoritative_position_exit_returned_false")
         return True
@@ -1013,6 +1026,7 @@ class ExecutionEngine:
                 order.intent_payload = payload
                 self.order_manager.repo.update_order(order)
                 try:
+                    self._assert_external_operation_allowed()
                     confirmed = self.adapter.modify_protection(
                         order,
                         trigger_price=price,
@@ -1103,6 +1117,7 @@ class ExecutionEngine:
                 return None
             self._submissions_in_flight += 1
         try:
+            self._assert_external_operation_allowed()
             exit_decision = self._classify_exit_signal(signal)
             if exit_decision is not None and not exit_decision.allowed:
                 self.logger.warning(
@@ -1643,12 +1658,14 @@ class ExecutionEngine:
         orders = [entry_order, *conditional_orders]
         atomic_group = self._supports_atomic_order_group(orders)
         if not atomic_group:
+            self._assert_external_operation_allowed()
             return self.adapter.place_order(entry_order), False
 
         with self._order_event_apply_lock:
             for order in orders:
                 if order.client_order_id:
                     self.order_manager.mark_submitted_unconfirmed(order)
+            self._assert_external_operation_allowed()
             exchange_id = self.adapter.place_order_group(orders)
             try:
                 self._record_order_ack(
@@ -2310,6 +2327,7 @@ class ExecutionEngine:
             try:
                 if order.client_order_id:
                     self.order_manager.mark_submitted_unconfirmed(order)
+                self._assert_external_operation_allowed()
                 submit_attempted = True
                 ex_id = self.adapter.place_order(order)
                 self._record_order_ack(order, ex_id, order_id=order_id)

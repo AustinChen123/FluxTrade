@@ -680,3 +680,39 @@ def test_market_signal_id_is_stable_when_pending_candle_is_replayed() -> None:
     assert first_signal.metadata["client_order_id"] == second_signal.metadata[
         "client_order_id"
     ]
+
+
+def test_pending_candle_replay_overrides_strategy_client_order_id() -> None:
+    first = make_signal("s1").model_copy(
+        update={"metadata": {"client_order_id": "strategy-attempt-1"}}
+    )
+    second = make_signal("s1").model_copy(
+        update={"metadata": {"client_order_id": "strategy-attempt-2"}}
+    )
+    candle = make_candle()
+
+    first_replay = SignalProcessor._with_market_idempotency(
+        first,
+        product_id=candle.product_id,
+        event_scope=candle.timeframe,
+        event_timestamp=candle.timestamp,
+        ordinal=0,
+    )
+    second_replay = SignalProcessor._with_market_idempotency(
+        second,
+        product_id=candle.product_id,
+        event_scope=candle.timeframe,
+        event_timestamp=candle.timestamp,
+        ordinal=0,
+    )
+
+    assert first_replay.metadata["client_order_id"] == second_replay.metadata[
+        "client_order_id"
+    ]
+    assert first_replay.metadata["client_order_id"] != "strategy-attempt-1"
+    assert first_replay.metadata["requested_client_order_id"] == (
+        "strategy-attempt-1"
+    )
+    assert second_replay.metadata["requested_client_order_id"] == (
+        "strategy-attempt-2"
+    )

@@ -566,6 +566,47 @@ class TestAdapterDelegation:
 
         assert len(mock_exchange_adapter.open_orders) == 3
 
+    def test_leadership_loss_immediately_before_placement_fences_adapter(
+        self,
+        mock_db_session,
+        mock_clock,
+        mock_exchange_adapter,
+        mock_order_repo,
+        signal_factory,
+    ):
+        owns_service = True
+
+        def assert_leadership():
+            if not owns_service:
+                raise RuntimeError("leadership lost")
+
+        engine = ExecutionEngine(
+            db_session=mock_db_session,
+            clock=mock_clock,
+            adapter=mock_exchange_adapter,
+            order_repository=mock_order_repo,
+            operation_guard=assert_leadership,
+        )
+        supports_atomic_group = engine._supports_atomic_order_group
+
+        def classify_then_lose_leadership(orders):
+            nonlocal owns_service
+            owns_service = False
+            return supports_atomic_group(orders)
+
+        engine._supports_atomic_order_group = classify_then_lose_leadership
+
+        result = engine.execute_signal(
+            signal_factory(price=Decimal("42000"))
+        )
+
+        assert result is None
+        assert not mock_exchange_adapter.open_orders
+        assert len(mock_order_repo.orders) == 1
+        order = next(iter(mock_order_repo.orders.values()))
+        assert order.status == "failed"
+        assert engine._submissions_in_flight == 0
+
 
 class TestExecutionTradingRules:
     """Regression coverage for exchange trading rules at execution entrypoints."""

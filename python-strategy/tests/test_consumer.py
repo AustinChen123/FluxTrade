@@ -11,12 +11,21 @@ Covers:
 
 import json
 from decimal import Decimal
-from unittest.mock import MagicMock, patch
+from unittest.mock import MagicMock, call, patch
 
 import pytest
 
 import redis as redis_lib
-from src.core.consumer import DataConsumer, MarketStreamPendingError
+from src.core.consumer import (
+    DataConsumer,
+    FENCED_XACK,
+    FENCED_XREADGROUP,
+    MarketStreamOwnershipError,
+    MarketStreamPendingError,
+    RELEASE_OWNERSHIP_LEASE,
+    RENEW_OWNERSHIP_LEASE,
+    XAUTOCLAIM_WITH_QUARANTINE,
+)
 from src.core.models import Candlestick, Trade
 
 
@@ -36,6 +45,39 @@ def mock_redis():
     client.smembers.return_value = set()
     client.sadd.return_value = 1
     client.time.return_value = (1704067200, 0)  # (seconds, microseconds)
+    client.xack.return_value = 1
+    def eval_script(script, *args):
+        if script in {RENEW_OWNERSHIP_LEASE, RELEASE_OWNERSHIP_LEASE}:
+            return 1
+        if script == FENCED_XACK:
+            return [1, client.xack(args[3], args[4], args[5])]
+        if script == FENCED_XREADGROUP:
+            response = client.xreadgroup(count=int(args[6]))
+            if not response:
+                return [1]
+            return [
+                1,
+                [
+                    [
+                        stream,
+                        [
+                            [
+                                message_id,
+                                [
+                                    item
+                                    for key, value in fields.items()
+                                    for item in (key, value)
+                                ],
+                            ]
+                            for message_id, fields in messages
+                        ],
+                    ]
+                    for stream, messages in response
+                ],
+            ]
+        raise AssertionError("unexpected Lua script")
+
+    client.eval.side_effect = eval_script
     return client
 
 
@@ -135,20 +177,8 @@ class TestEnsureConsumerGroups:
         consumer.running = True
         consumer._consume_loop()
 
-        assert [
-            call.kwargs["streams"] for call in mock_redis.xreadgroup.call_args_list
-        ] == [
-            {channels[0]: ">"},
-            {channels[1]: ">"},
-        ]
-        assert all(
-            call.kwargs["count"] == 1
-            for call in mock_redis.xreadgroup.call_args_list
-        )
-        assert all(
-            call.kwargs["block"] == 50
-            for call in mock_redis.xreadgroup.call_args_list
-        )
+        assert [call.args[3] for call in mock_redis.eval.call_args_list] == channels
+        assert all(call.args[-1] == 1 for call in mock_redis.eval.call_args_list)
 
 
 class TestDynamicChannels:
@@ -185,9 +215,9 @@ class TestDynamicChannels:
         with patch("src.core.consumer.time.sleep") as sleep:
             consumer._consume_loop()
 
-        sleep.assert_called_once_with(0.1)
+        assert sleep.call_args_list == [call(0.1), call(0.1)]
         mock_redis.xreadgroup.assert_called_once()
-        assert mock_redis.xreadgroup.call_args.kwargs["streams"] == {stream: ">"}
+        assert mock_redis.eval.call_args.args[3] == stream
         mock_redis.xgroup_create.assert_called_once()
 
 
@@ -209,6 +239,7 @@ class _BehaviorRedis:
         self.reads = 0
         self.requested_counts = []
         self.registered_streams = set()
+        self.quarantined_deliveries = set()
         self.existing_group_streams = set(existing_group_streams)
 
     def xgroup_create(self, *_args, **_kwargs):
@@ -227,10 +258,15 @@ class _BehaviorRedis:
             return [{"name": "strategy_group", "pending": self.pending}]
         return []
 
-    def smembers(self, _key):
+    def smembers(self, key):
+        if str(key).endswith(":quarantine"):
+            return set(self.quarantined_deliveries)
         return set(self.registered_streams)
 
-    def sadd(self, _key, *stream_keys):
+    def sadd(self, key, *stream_keys):
+        if str(key).endswith(":quarantine"):
+            self.quarantined_deliveries.update(stream_keys)
+            return len(stream_keys)
         self.registered_streams.update(stream_keys)
         return len(stream_keys)
 
@@ -247,6 +283,35 @@ class _BehaviorRedis:
             else []
         )
 
+    def eval(self, script, *args):
+        if script == FENCED_XACK:
+            return [1, self.xack(args[3], args[4], args[5])]
+        if script != FENCED_XREADGROUP:
+            raise AssertionError("unexpected Lua script")
+        response = self.xreadgroup(count=int(args[6]))
+        if not response:
+            return [1]
+        return [
+            1,
+            [
+                [
+                    stream,
+                    [
+                        [
+                            message_id,
+                            [
+                                item
+                                for key, value in fields.items()
+                                for item in (key, value)
+                            ],
+                        ]
+                        for message_id, fields in messages
+                    ],
+                ]
+                for stream, messages in response
+            ],
+        ]
+
     def time(self):
         return self.server_time
 
@@ -257,6 +322,149 @@ class _BehaviorRedis:
 
     def close(self):
         return None
+
+
+class _PendingRedis(_BehaviorRedis):
+    def __init__(
+        self,
+        stream: str,
+        pending_messages,
+        *,
+        claimable: bool = True,
+        deleted_ids=(),
+    ):
+        super().__init__([], pending=len(pending_messages))
+        self.stream = stream
+        self.pending_messages = list(pending_messages)
+        self.claimable = claimable
+        self.deleted_ids = list(deleted_ids)
+        self.claim_calls = []
+        self.registered_streams.add(stream)
+
+    def xautoclaim(
+        self,
+        stream,
+        group,
+        consumer,
+        min_idle_time,
+        start_id,
+        *,
+        count,
+    ):
+        self.claim_calls.append(
+            (stream, group, consumer, min_idle_time, start_id, count)
+        )
+        claimed = self.pending_messages if self.claimable else []
+        if self.deleted_ids:
+            self.pending = 0
+        return ("0-0", claimed, self.deleted_ids)
+
+    def eval(self, script, *args):
+        if script in {FENCED_XREADGROUP, FENCED_XACK}:
+            return super().eval(script, *args)
+        assert script == XAUTOCLAIM_WITH_QUARANTINE
+        (
+            _key_count,
+            stream,
+            quarantine_key,
+            _ownership_key,
+            _ownership_token,
+            group,
+            consumer,
+            min_idle_time,
+            start_id,
+            count,
+        ) = args
+        response = self.xautoclaim(
+            stream,
+            group,
+            consumer,
+            min_idle_time,
+            start_id,
+            count=count,
+        )
+        for message_id in response[2]:
+            assert str(quarantine_key).endswith(":quarantine")
+            self.quarantined_deliveries.add(
+                json.dumps(
+                    {
+                        "stream": stream,
+                        "message_id": message_id,
+                        "reason": "payload_deleted_while_pending",
+                    },
+                    sort_keys=True,
+                )
+            )
+        return [
+            1,
+            (
+                response[0],
+                [
+                    (
+                        message_id,
+                        [
+                            item
+                            for key, value in fields.items()
+                            for item in (key, value)
+                        ],
+                    )
+                    for message_id, fields in response[1]
+                ],
+                response[2],
+            ),
+        ]
+
+
+class _LeasePendingRedis(_PendingRedis):
+    def __init__(self, stream):
+        super().__init__(stream, [])
+        self.owner = None
+        self.expire_before_fenced_read = False
+        self.expire_before_fenced_ack = False
+
+    def set(self, _key, value, *, nx, px):
+        assert nx is True
+        assert px > 0
+        if self.owner is not None:
+            return False
+        self.owner = value
+        return True
+
+    def get(self, _key):
+        return self.owner
+
+    def eval(self, script, *args):
+        if script == FENCED_XACK:
+            token = args[2]
+            if self.expire_before_fenced_ack:
+                self.owner = "successor"
+                self.expire_before_fenced_ack = False
+            if self.owner != token:
+                return [0]
+            return _BehaviorRedis.eval(self, script, *args)
+        if script == FENCED_XREADGROUP:
+            token = args[3]
+            if self.expire_before_fenced_read:
+                self.owner = "successor"
+                self.expire_before_fenced_read = False
+            if self.owner != token:
+                return [0]
+            return _BehaviorRedis.eval(self, script, *args)
+        if script == XAUTOCLAIM_WITH_QUARANTINE:
+            token = args[4]
+            if self.owner != token:
+                return [0]
+            return super().eval(script, *args)
+        if script == RENEW_OWNERSHIP_LEASE:
+            token = args[2]
+            return 1 if self.owner == token else 0
+        if script == RELEASE_OWNERSHIP_LEASE:
+            token = args[2]
+            if self.owner == token:
+                self.owner = None
+                return 1
+            return 0
+        raise AssertionError("unexpected Lua script")
 
 
 def _candle_payload(timestamp: int, close: str) -> dict[str, str]:
@@ -277,6 +485,158 @@ def _candle_payload(timestamp: int, close: str) -> dict[str, str]:
 
 
 class TestDeliverySemantics:
+
+    def test_fenced_read_rejects_lease_expiry_before_claim(self):
+        stream = "stream:market:rithmic:mnq-202609:1m"
+        redis = _LeasePendingRedis(stream)
+        redis.messages = [
+            ("1704067200000-0", _candle_payload(1704067200000, "20000"))
+        ]
+        consumer = DataConsumer(
+            channels=[stream],
+            on_message_callback=MagicMock(),
+        )
+        consumer.redis_client = redis
+        consumer._acquire_ownership()
+        redis.expire_before_fenced_read = True
+        consumer.running = True
+
+        with pytest.raises(
+            MarketStreamOwnershipError,
+            match="ownership was lost before claim",
+        ):
+            consumer._consume_loop()
+
+        assert redis.reads == 0
+        assert len(redis.messages) == 1
+
+    def test_pending_replay_losing_ownership_does_not_ack(self):
+        stream = "stream:market:rithmic:mnq-202609:1m"
+        first = ("1704067200000-0", _candle_payload(1704067200000, "20000"))
+        redis = _LeasePendingRedis(stream)
+        redis.pending_messages = [first]
+        redis.pending = 1
+        consumer = DataConsumer(
+            channels=[stream],
+            on_message_callback=MagicMock(),
+            pending_replay_callback=lambda _model: setattr(
+                redis,
+                "owner",
+                "successor",
+            ),
+            pending_claim_idle_ms=0,
+        )
+        consumer.redis_client = redis
+        consumer._acquire_ownership()
+
+        with pytest.raises(
+            MarketStreamOwnershipError,
+            match="consumer ownership was lost",
+        ):
+            consumer._ensure_no_abandoned_pending([stream])
+
+        assert redis.acked == []
+        assert redis.pending == 1
+
+    def test_fenced_ack_rejects_takeover_before_pel_removal(self):
+        stream = "stream:market:rithmic:mnq-202609:1m"
+        redis = _LeasePendingRedis(stream)
+        redis.pending = 1
+        consumer = DataConsumer(
+            channels=[stream],
+            on_message_callback=MagicMock(),
+        )
+        consumer.redis_client = redis
+        consumer._acquire_ownership()
+        redis.expire_before_fenced_ack = True
+
+        with pytest.raises(
+            MarketStreamOwnershipError,
+            match="ownership was lost before ACK",
+        ):
+            consumer._ack_message(stream, "1704067200000-0")
+
+        assert redis.acked == []
+        assert redis.pending == 1
+
+    def test_pending_claim_is_atomically_rejected_after_ownership_loss(self):
+        stream = "stream:market:rithmic:mnq-202609:1m"
+        first = ("1704067200000-0", _candle_payload(1704067200000, "20000"))
+        redis = _LeasePendingRedis(stream)
+        redis.pending_messages = [first]
+        redis.pending = 1
+        consumer = DataConsumer(
+            channels=[stream],
+            on_message_callback=MagicMock(),
+            pending_replay_callback=MagicMock(),
+            pending_claim_idle_ms=0,
+        )
+        consumer.redis_client = redis
+        consumer._acquire_ownership()
+        redis.owner = "successor"
+
+        with pytest.raises(
+            MarketStreamOwnershipError,
+            match="ownership was lost before pending claim",
+        ):
+            consumer._ensure_no_abandoned_pending([stream])
+
+        assert redis.claim_calls == []
+        assert redis.pending == 1
+
+    def test_takeover_fences_old_consumer_before_next_delivery(self):
+        stream = "stream:market:rithmic:mnq-202609:1m"
+        first = ("1704067200000-0", _candle_payload(1704067200000, "20000"))
+        second = ("1704067260000-0", _candle_payload(1704067260000, "20001"))
+        redis = _LeasePendingRedis(stream)
+        redis.messages = [first, second]
+        old_callbacks = []
+        replayed = []
+        new_callbacks = []
+
+        old = DataConsumer(
+            channels=[stream],
+            on_message_callback=lambda model: old_callbacks.append(model.timestamp),
+            pending_claim_idle_ms=0,
+        )
+        new = DataConsumer(
+            channels=[stream],
+            on_message_callback=lambda model: (
+                new_callbacks.append(model.timestamp),
+                setattr(new, "running", False),
+            ),
+            pending_replay_callback=lambda model: replayed.append(model.timestamp),
+            pending_claim_idle_ms=0,
+        )
+        old.redis_client = redis
+        new.redis_client = redis
+        old._acquire_ownership()
+
+        def lose_ownership_after_callback(model):
+            old_callbacks.append(model.timestamp)
+            redis.pending_messages = [first]
+            redis.owner = None
+            new._acquire_ownership()
+
+        old.callback = lose_ownership_after_callback
+        old.running = True
+        with pytest.raises(
+            MarketStreamPendingError,
+            match="consumer ownership was lost",
+        ):
+            old._consume_loop()
+
+        assert old_callbacks == [1704067200000]
+        assert redis.acked == []
+        assert redis.reads == 1
+
+        new._ensure_no_abandoned_pending([stream])
+        new.running = True
+        new._consume_loop()
+
+        assert replayed == [1704067200000]
+        assert new_callbacks == [1704067260000]
+        assert redis.reads == 2
 
     def test_lagged_candles_are_processed_individually_in_order(self):
         stream = "stream:market:rithmic:mnq-202609:1m"
@@ -499,6 +859,8 @@ class TestDeliverySemantics:
         callback = MagicMock()
         with patch("src.core.consumer.create_redis_client", return_value=mock_redis):
             consumer = DataConsumer(channels=[stream], on_message_callback=callback)
+        mock_redis.set.return_value = True
+        mock_redis.get.side_effect = lambda _key: consumer._ownership_token
         message_id = "1704067200000-0"
         reads = iter(
             [[(stream, [(message_id, _candle_payload(1704067200000, "20000"))])]]
@@ -542,12 +904,203 @@ class TestDeliverySemantics:
 
         assert redis.reads == 0
 
+    def test_idle_pending_delivery_rebuilds_then_replays_and_acks(self):
+        stream = "stream:market:rithmic:mnq-202609:1m"
+        message_id = "1704067200000-0"
+        redis = _PendingRedis(
+            stream,
+            [(message_id, _candle_payload(1704067200000, "20000"))],
+        )
+        actions = []
+        normal_callback = MagicMock()
+        consumer = DataConsumer(
+            channels=[stream],
+            on_message_callback=normal_callback,
+            pending_replay_callback=lambda model: actions.append(
+                ("replay", model.timestamp)
+            ),
+            pending_claim_idle_ms=0,
+        )
+        consumer.redis_client = redis
+
+        consumer._ensure_no_abandoned_pending([stream])
+
+        assert actions == [("replay", 1704067200000)]
+        normal_callback.assert_not_called()
+        assert redis.acked == [(stream, consumer.group_name, message_id)]
+        assert redis.claim_calls[0][3] == 0
+
+    def test_non_idle_pending_delivery_remains_backpressured(self):
+        stream = "stream:market:rithmic:mnq-202609:1m"
+        redis = _PendingRedis(
+            stream,
+            [
+                (
+                    "1704067200000-0",
+                    _candle_payload(1704067200000, "20000"),
+                )
+            ],
+            claimable=False,
+        )
+        callback = MagicMock()
+        replay = MagicMock()
+        consumer = DataConsumer(
+            channels=[stream],
+            on_message_callback=callback,
+            pending_replay_callback=replay,
+        )
+        consumer.redis_client = redis
+
+        with pytest.raises(
+            MarketStreamPendingError,
+            match="not idle enough to reclaim",
+        ):
+            consumer._ensure_no_abandoned_pending([stream])
+
+        replay.assert_not_called()
+        callback.assert_not_called()
+        assert redis.acked == []
+
+    def test_deleted_pending_payload_fails_closed(self):
+        stream = "stream:market:rithmic:mnq-202609:1m"
+        redis = _PendingRedis(
+            stream,
+            [],
+            deleted_ids=["1704067200000-0"],
+        )
+        redis.pending = 1
+        consumer = DataConsumer(
+            channels=[stream],
+            on_message_callback=MagicMock(),
+            pending_replay_callback=MagicMock(),
+            pending_claim_idle_ms=0,
+        )
+        consumer.redis_client = redis
+
+        with pytest.raises(
+            MarketStreamPendingError,
+            match="pending market payload was deleted",
+        ):
+            consumer._ensure_no_abandoned_pending([stream])
+
+        assert redis.acked == []
+        assert redis.quarantined_deliveries
+        consumer.running = True
+
+        with pytest.raises(
+            MarketStreamPendingError,
+            match="quarantine requires operator recovery",
+        ):
+            consumer._consume_loop()
+        assert redis.reads == 0
+
+    def test_zero_ack_result_remains_ambiguous(self, consumer, mock_redis):
+        mock_redis.xack.return_value = 0
+
+        with pytest.raises(
+            MarketStreamPendingError,
+            match="ACK removed 0 deliveries",
+        ):
+            consumer._ack_message(
+                "stream:market:rithmic:mnq-202609:1m",
+                "1704067200000-0",
+            )
+
+    def test_completed_callback_accepts_ack_response_lost_when_pel_is_absent(
+        self,
+        consumer,
+        mock_redis,
+    ):
+        stream = "stream:market:rithmic:mnq-202609:1m"
+        message_id = "1704067200000-0"
+        consumer._completed_pending.add((stream, message_id))
+        mock_redis.xack.return_value = 0
+        mock_redis.xpending_range.return_value = []
+        mock_redis.xpending.return_value = {"pending": 0}
+
+        consumer._ensure_no_abandoned_pending([stream])
+
+        assert consumer._completed_pending == set()
+        mock_redis.xpending_range.assert_called_once_with(
+            stream,
+            consumer.group_name,
+            min=message_id,
+            max=message_id,
+            count=1,
+        )
+
+    def test_pending_replay_failure_keeps_delivery_unacked(self):
+        stream = "stream:market:rithmic:mnq-202609:1m"
+        redis = _PendingRedis(
+            stream,
+            [
+                (
+                    "1704067200000-0",
+                    _candle_payload(1704067200000, "20000"),
+                )
+            ],
+        )
+        callback = MagicMock()
+        consumer = DataConsumer(
+            channels=[stream],
+            on_message_callback=callback,
+            pending_replay_callback=MagicMock(
+                side_effect=RuntimeError("database unavailable")
+            ),
+            pending_claim_idle_ms=0,
+        )
+        consumer.redis_client = redis
+
+        with pytest.raises(
+            MarketStreamPendingError,
+            match="pending market callback failed",
+        ):
+            consumer._ensure_no_abandoned_pending([stream])
+
+        callback.assert_not_called()
+        assert redis.pending == 1
+        assert redis.acked == []
+
+    def test_pending_callback_failure_keeps_delivery_unacked(self):
+        stream = "stream:market:rithmic:mnq-202609:1m"
+        redis = _PendingRedis(
+            stream,
+            [
+                (
+                    "1704067200000-0",
+                    _candle_payload(1704067200000, "20000"),
+                )
+            ],
+        )
+        consumer = DataConsumer(
+            channels=[stream],
+            on_message_callback=MagicMock(
+                side_effect=RuntimeError("strategy failed")
+            ),
+            pending_replay_callback=MagicMock(
+                side_effect=RuntimeError("strategy failed")
+            ),
+            pending_claim_idle_ms=0,
+        )
+        consumer.redis_client = redis
+
+        with pytest.raises(
+            MarketStreamPendingError,
+            match="pending market callback failed",
+        ):
+            consumer._ensure_no_abandoned_pending([stream])
+
+        assert redis.pending == 1
+        assert redis.acked == []
+
     def test_redis_error_invalidates_consumer_group_cache(self, mock_redis):
         with patch("src.core.consumer.create_redis_client", return_value=mock_redis):
             consumer = DataConsumer(
                 channels=["stream:market:binance:btcusdt:1m"],
                 on_message_callback=MagicMock(),
             )
+        mock_redis.set.return_value = True
+        mock_redis.get.side_effect = lambda _key: consumer._ownership_token
         consumer._initialized_channels.add(consumer.channels[0])
         consumer._consume_loop = MagicMock(
             side_effect=[
@@ -680,6 +1233,22 @@ class TestParseMessage:
 
 
 class TestConsumerStop:
+
+    def test_service_ownership_guard_requires_active_lease(self, consumer):
+        with pytest.raises(
+            MarketStreamOwnershipError,
+            match="service ownership is not active",
+        ):
+            consumer.assert_service_ownership()
+
+    def test_service_ownership_guard_rejects_requested_stop(self, consumer):
+        consumer.request_stop()
+
+        with pytest.raises(
+            MarketStreamOwnershipError,
+            match="service stop was requested",
+        ):
+            consumer.assert_service_ownership()
 
     def test_stop_sets_running_false(self, consumer):
         """stop() should set running to False."""

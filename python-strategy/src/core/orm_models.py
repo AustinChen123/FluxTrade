@@ -50,6 +50,25 @@ class Candlestick(Base):
     volume = Column(Numeric, nullable=False)
 
 
+class MarketDataApplication(Base):
+    __tablename__ = "market_data_application"
+
+    environment = Column(String(64), primary_key=True)
+    product_id = Column(String, ForeignKey("product.id"), primary_key=True)
+    timeframe = Column(String, primary_key=True)
+    timestamp = Column(BigInteger, primary_key=True)
+    open = Column(Numeric, nullable=False)
+    high = Column(Numeric, nullable=False)
+    low = Column(Numeric, nullable=False)
+    close = Column(Numeric, nullable=False)
+    volume = Column(Numeric, nullable=False)
+    applied_at = Column(
+        DateTime(timezone=True),
+        nullable=False,
+        server_default=func.now(),
+    )
+
+
 class ResearchDataset(Base):
     __tablename__ = 'research_dataset'
 

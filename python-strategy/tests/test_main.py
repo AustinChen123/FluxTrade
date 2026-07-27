@@ -53,6 +53,51 @@ def test_env_flag_rejects_ambiguous_value(monkeypatch) -> None:
         strategy_main._env_flag("AUDIT_EXTERNAL_ORDERS")
 
 
+def test_env_nonnegative_int_uses_default_and_override(monkeypatch) -> None:
+    monkeypatch.delenv("MARKET_PENDING_CLAIM_IDLE_MS", raising=False)
+    assert strategy_main._env_nonnegative_int(
+        "MARKET_PENDING_CLAIM_IDLE_MS",
+        60_000,
+    ) == 60_000
+
+    monkeypatch.setenv("MARKET_PENDING_CLAIM_IDLE_MS", "2500")
+    assert strategy_main._env_nonnegative_int(
+        "MARKET_PENDING_CLAIM_IDLE_MS",
+        60_000,
+    ) == 2500
+
+
+def test_env_nonnegative_int_rejects_negative_value(monkeypatch) -> None:
+    monkeypatch.setenv("MARKET_PENDING_CLAIM_IDLE_MS", "-1")
+
+    with pytest.raises(
+        ValueError,
+        match="MARKET_PENDING_CLAIM_IDLE_MS must be non-negative",
+    ):
+        strategy_main._env_nonnegative_int(
+            "MARKET_PENDING_CLAIM_IDLE_MS",
+            60_000,
+        )
+
+
+def test_env_positive_int_uses_default_and_rejects_zero(monkeypatch) -> None:
+    monkeypatch.delenv("MARKET_CONSUMER_LEASE_MS", raising=False)
+    assert strategy_main._env_positive_int(
+        "MARKET_CONSUMER_LEASE_MS",
+        10_000,
+    ) == 10_000
+
+    monkeypatch.setenv("MARKET_CONSUMER_LEASE_MS", "0")
+    with pytest.raises(
+        ValueError,
+        match="MARKET_CONSUMER_LEASE_MS must be positive",
+    ):
+        strategy_main._env_positive_int(
+            "MARKET_CONSUMER_LEASE_MS",
+            10_000,
+        )
+
+
 def test_adapter_config_from_env_defaults_to_simulated(monkeypatch) -> None:
     monkeypatch.delenv("ADAPTER_MODE", raising=False)
     monkeypatch.delenv("EXCHANGE_MODE", raising=False)
@@ -325,11 +370,22 @@ def test_main_wires_session_factory_and_audit_flag(monkeypatch) -> None:
     db_session = MagicMock()
     engine = MagicMock()
     engine.build_stream_channels.return_value = []
-    consumer = MagicMock()
+    consumer = MagicMock(spec=strategy_main.DataConsumer)
+    events = []
+    consumer.acquire_service_ownership.side_effect = lambda: events.append(
+        "ownership"
+    )
+    engine.startup.side_effect = lambda **_kwargs: events.append("startup")
+    engine.shutdown.side_effect = lambda **_kwargs: events.append("engine_shutdown")
+    consumer.stop.side_effect = lambda: events.append("consumer_stop")
+
+    def build_engine(**_kwargs):
+        events.append("engine_construct")
+        return engine
 
     with patch("src.main.configure_metrics"), \
          patch("src.main.SessionLocal", return_value=db_session), \
-         patch("src.main.StrategyEngine", return_value=engine) as engine_cls, \
+         patch("src.main.StrategyEngine", side_effect=build_engine) as engine_cls, \
          patch("src.main.DataConsumer", return_value=consumer) as consumer_cls:
         strategy_main.main()
 
@@ -338,11 +394,81 @@ def test_main_wires_session_factory_and_audit_flag(monkeypatch) -> None:
     assert kwargs["adapter_config"] == {"mode": "simulated"}
     assert callable(kwargs["db_session_factory"])
     assert kwargs["audit_external_orders"] is True
-    engine.add_strategy.assert_not_called()
     assert (
-        consumer_cls.call_args.kwargs["channel_provider"]
+        kwargs["leadership_guard"]
+        is consumer.assert_service_ownership
+    )
+    engine.add_strategy.assert_not_called()
+    assert events == [
+        "ownership",
+        "engine_construct",
+        "startup",
+        "engine_shutdown",
+        "consumer_stop",
+    ]
+    consumer.acquire_service_ownership.assert_called_once()
+    engine.startup.assert_called_once_with()
+    assert (
+        consumer.configure_callbacks.call_args.kwargs["channel_provider"]
         is engine.build_stream_channels
     )
+    assert (
+        consumer.configure_callbacks.call_args.kwargs["pending_replay_callback"]
+        is engine.replay_pending_market_data
+    )
+    assert consumer_cls.call_args.kwargs["pending_claim_idle_ms"] == 60_000
+    assert consumer_cls.call_args.kwargs["ownership_lease_ms"] == 10_000
     consumer.start.assert_called_once()
-    engine.shutdown.assert_called_once()
+    consumer.stop.assert_called_once()
+    engine.shutdown.assert_called_once_with(clean_exit=True)
     db_session.close.assert_called_once()
+
+
+@pytest.mark.parametrize("failure_stage", ["startup", "consumer"])
+def test_main_never_marks_abnormal_service_exit_clean(
+    monkeypatch,
+    failure_stage,
+) -> None:
+    monkeypatch.setenv("AUDIT_EXTERNAL_ORDERS", "true")
+    monkeypatch.delenv("ADAPTER_MODE", raising=False)
+    monkeypatch.delenv("EXCHANGE_MODE", raising=False)
+    monkeypatch.delenv("FLUXTRADE_ENVIRONMENT", raising=False)
+    db_session = MagicMock()
+    engine = MagicMock()
+    consumer = MagicMock(spec=strategy_main.DataConsumer)
+    if failure_stage == "startup":
+        engine.startup.side_effect = RuntimeError("startup phase failed")
+    else:
+        consumer.start.side_effect = RuntimeError("ownership lost")
+
+    with patch("src.main.configure_metrics"), \
+         patch("src.main.SessionLocal", return_value=db_session), \
+         patch("src.main.StrategyEngine", return_value=engine), \
+         patch("src.main.DataConsumer", return_value=consumer):
+        with pytest.raises(RuntimeError):
+            strategy_main.main()
+
+    engine.shutdown.assert_called_once_with(clean_exit=False)
+    consumer.stop.assert_called_once()
+    db_session.close.assert_called_once()
+
+
+def test_main_releases_ownership_when_engine_shutdown_fails(monkeypatch) -> None:
+    monkeypatch.setenv("AUDIT_EXTERNAL_ORDERS", "true")
+    monkeypatch.delenv("ADAPTER_MODE", raising=False)
+    monkeypatch.delenv("EXCHANGE_MODE", raising=False)
+    monkeypatch.delenv("FLUXTRADE_ENVIRONMENT", raising=False)
+    db_session = MagicMock()
+    engine = MagicMock()
+    engine.shutdown.side_effect = RuntimeError("engine shutdown failed")
+    consumer = MagicMock(spec=strategy_main.DataConsumer)
+
+    with patch("src.main.configure_metrics"), \
+         patch("src.main.SessionLocal", return_value=db_session), \
+         patch("src.main.StrategyEngine", return_value=engine), \
+         patch("src.main.DataConsumer", return_value=consumer):
+        with pytest.raises(RuntimeError, match="engine shutdown failed"):
+            strategy_main.main()
+
+    db_session.close.assert_called_once()
+    consumer.stop.assert_called_once()
