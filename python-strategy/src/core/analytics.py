@@ -131,17 +131,37 @@ def _build_closed_trades(
     if contract_multiplier <= 0:
         raise ValueError("contract_multiplier must be positive")
     trades = []
+    has_fill_sequence = []
     for t in trade_history:
+        fill_sequence = getattr(t, "fill_sequence", None)
+        has_fill_sequence.append(fill_sequence is not None)
         trades.append({
             "timestamp": t.timestamp,
             "side": t.side,
             "price": t.price,
             "quantity": t.quantity,
             "fee": getattr(t, "fee", Decimal("0")) or Decimal("0"),
+            "fill_sequence": fill_sequence,
         })
 
-    df = pd.DataFrame(trades)
-    df.sort_values("timestamp", inplace=True)
+    if any(has_fill_sequence) and not all(has_fill_sequence):
+        raise ValueError("fill_sequence must be present for every trade or none")
+    if all(has_fill_sequence):
+        fill_sequences = [trade["fill_sequence"] for trade in trades]
+        if any(
+            isinstance(sequence, bool)
+            or not isinstance(sequence, int)
+            or sequence < 0
+            for sequence in fill_sequences
+        ):
+            raise ValueError("fill_sequence must be a non-negative integer")
+        if len(set(fill_sequences)) != len(fill_sequences):
+            raise ValueError("fill_sequence must be unique")
+        trades.sort(
+            key=lambda trade: (trade["timestamp"], trade["fill_sequence"])
+        )
+    else:
+        trades.sort(key=lambda trade: trade["timestamp"])
 
     _ZERO = Decimal("0")
     total_pnl = _ZERO
@@ -154,7 +174,7 @@ def _build_closed_trades(
     trade_pnls: list[float] = []
     closed_trades: list[ClosedTrade] = []
 
-    for _, row in df.iterrows():
+    for row in trades:
         qty: Decimal = row["quantity"]
         price: Decimal = row["price"]
         side = row["side"]

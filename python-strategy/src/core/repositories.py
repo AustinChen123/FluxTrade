@@ -1,6 +1,7 @@
 import time
 from contextlib import nullcontext
 from decimal import Decimal
+from threading import Lock
 from typing import Callable, ContextManager, Optional
 from sqlalchemy.orm import Session
 from src.core.interfaces import IOrderRepository
@@ -151,6 +152,8 @@ class BacktestOrderRepository(IOrderRepository):
         self.session_id = session_id
         self.balance = initial_balance  # kept for backward compatibility
         self._order_strategy_map: dict[str, str] = {}
+        self._next_fill_sequence = 0
+        self._trade_write_lock = Lock()
 
     def add_order(self, order: Order) -> None:
         # Track order → strategy_id for BacktestTradeLog
@@ -181,24 +184,27 @@ class BacktestOrderRepository(IOrderRepository):
         return []
 
     def add_trade(self, trade: Trade) -> None:
-        strategy_id = self._order_strategy_map.get(trade.order_id)
-        bt_log = BacktestTradeLog(
-            id=trade.id,
-            session_id=self.session_id,
-            strategy_id=strategy_id,
-            order_id=trade.order_id,
-            exchange_trade_id=trade.exchange_trade_id,
-            product_id=trade.product_id,
-            side=trade.side,
-            price=trade.price,
-            quantity=trade.quantity,
-            fee=trade.fee,
-            fee_asset=trade.fee_asset,
-            timestamp=trade.timestamp
-        )
-        with self._db_session_factory() as db:
-            db.add(bt_log)
-            db.commit()
+        with self._trade_write_lock:
+            strategy_id = self._order_strategy_map.get(trade.order_id)
+            bt_log = BacktestTradeLog(
+                id=trade.id,
+                session_id=self.session_id,
+                strategy_id=strategy_id,
+                order_id=trade.order_id,
+                exchange_trade_id=trade.exchange_trade_id,
+                product_id=trade.product_id,
+                side=trade.side,
+                price=trade.price,
+                quantity=trade.quantity,
+                fee=trade.fee,
+                fee_asset=trade.fee_asset,
+                timestamp=trade.timestamp,
+                fill_sequence=self._next_fill_sequence,
+            )
+            with self._db_session_factory() as db:
+                db.add(bt_log)
+                db.commit()
+            self._next_fill_sequence += 1
 
     def update_position(self, strategy_id: str, product_id: str, side: str, fill_quantity: Decimal, fill_price: Decimal, position_side: str) -> None:
         # No-op: position and balance are tracked by Rust PyMatchingEngine

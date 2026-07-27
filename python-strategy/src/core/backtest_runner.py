@@ -423,7 +423,16 @@ class BacktestRunner:
         with self._db_session_factory() as db_session:
             summary = db_session.query(BacktestResultSummary).filter_by(id=summary_id).first()
             # Metrics (with advanced calculations)
-            trades = db_session.query(BacktestTradeLog).filter_by(session_id=summary_id).all()
+            trades = (
+                db_session.query(BacktestTradeLog)
+                .filter_by(session_id=summary_id)
+                .order_by(
+                    BacktestTradeLog.timestamp,
+                    BacktestTradeLog.fill_sequence,
+                    BacktestTradeLog.id,
+                )
+                .all()
+            )
             metrics = calculate_metrics(
                 trades,
                 initial_balance=self.initial_balance,

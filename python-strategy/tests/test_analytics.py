@@ -4,7 +4,7 @@ import pytest
 from decimal import Decimal
 from types import SimpleNamespace
 from src.core.analytics import calculate_metrics, _build_closed_trades
-from src.core.models import Trade
+from src.core.models import PositionSide, Trade
 
 
 # ── Helpers ──────────────────────────────────────────────────────
@@ -199,6 +199,90 @@ class TestClosedTrades:
         )
         closed, _, _, _ = _build_closed_trades(trades)
         assert len(closed) == 2
+
+    def test_same_timestamp_trades_preserve_authoritative_input_order(self):
+        timestamp = 1_000_000
+        trades = [
+            _make_trade("sell", 100.0, 1.0, timestamp)
+            for _ in range(16)
+        ] + [
+            _make_trade("buy", 90.0, 1.0, timestamp)
+            for _ in range(16)
+        ]
+
+        closed, _, _, total_pnl = _build_closed_trades(trades)
+
+        assert len(closed) == 16
+        assert all(trade.side == PositionSide.SHORT for trade in closed)
+        assert all(trade.entry_price == Decimal("100.0") for trade in closed)
+        assert all(trade.exit_price == Decimal("90.0") for trade in closed)
+        assert total_pnl == Decimal("160.00")
+
+    def test_fill_sequence_orders_shuffled_persisted_trades(self):
+        timestamp = 1_000_000
+        entry = _make_fill("sell", "100", "2", "0", timestamp)
+        entry.fill_sequence = 0
+        partial_exit = _make_fill("buy", "90", "1", "0", timestamp)
+        partial_exit.fill_sequence = 1
+        reversal = _make_fill("buy", "80", "2", "0", timestamp)
+        reversal.fill_sequence = 2
+        long_exit = _make_fill("sell", "85", "1", "0", timestamp)
+        long_exit.fill_sequence = 3
+
+        closed, _, _, total_pnl = _build_closed_trades(
+            [long_exit, reversal, partial_exit, entry]
+        )
+
+        assert [trade.side for trade in closed] == [
+            PositionSide.SHORT,
+            PositionSide.SHORT,
+            PositionSide.LONG,
+        ]
+        assert [trade.quantity for trade in closed] == [
+            Decimal("1"),
+            Decimal("1"),
+            Decimal("1"),
+        ]
+        assert total_pnl == Decimal("35")
+
+    def test_mixed_fill_sequence_is_rejected(self):
+        trades = [
+            _make_fill("sell", "100", "1", "0", 1_000_000),
+            _make_fill("buy", "90", "1", "0", 1_000_000),
+        ]
+        trades[0].fill_sequence = 0
+
+        with pytest.raises(
+            ValueError,
+            match="fill_sequence must be present for every trade or none",
+        ):
+            _build_closed_trades(trades)
+
+    @pytest.mark.parametrize("invalid_sequence", [-1, True, "0"])
+    def test_invalid_fill_sequence_is_rejected(self, invalid_sequence):
+        trades = [
+            _make_fill("sell", "100", "1", "0", 1_000_000),
+            _make_fill("buy", "90", "1", "0", 1_000_000),
+        ]
+        trades[0].fill_sequence = invalid_sequence
+        trades[1].fill_sequence = 1
+
+        with pytest.raises(
+            ValueError,
+            match="fill_sequence must be a non-negative integer",
+        ):
+            _build_closed_trades(trades)
+
+    def test_duplicate_fill_sequence_is_rejected(self):
+        trades = [
+            _make_fill("sell", "100", "1", "0", 1_000_000),
+            _make_fill("buy", "90", "1", "0", 1_000_000),
+        ]
+        for trade in trades:
+            trade.fill_sequence = 0
+
+        with pytest.raises(ValueError, match="fill_sequence must be unique"):
+            _build_closed_trades(trades)
 
 
 # ── Advanced metrics ─────────────────────────────────────────────
