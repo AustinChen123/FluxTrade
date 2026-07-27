@@ -28,11 +28,22 @@ class CallableStrategy(BaseStrategy):
         product_id: str,
         timeframe: str = "1h",
         lookback_window: int = 1,
+        *,
+        replay_predict_factory: (
+            Callable[[], Callable[[Candlestick], Optional[Signal]]] | None
+        ) = None,
+        replay_config: object | None = None,
     ):
         super().__init__(strategy_id, product_id)
         self._predict_fn = predict_fn
         self._timeframe = timeframe
         self._lookback_window = lookback_window
+        self._replay_predict_factory = replay_predict_factory
+        self._replay_config = replay_config
+        if (replay_predict_factory is None) != (replay_config is None):
+            raise ValueError(
+                "replay_predict_factory and replay_config must be provided together"
+            )
 
     @property
     def requirements(self) -> StrategyRequirements:
@@ -40,6 +51,28 @@ class CallableStrategy(BaseStrategy):
             product_id=self.product_id,
             timeframe=self._timeframe,
             lookback_window=self._lookback_window,
+        )
+
+    def fresh_instance_for_replay(self) -> BaseStrategy:
+        if self._replay_predict_factory is None:
+            raise NotImplementedError(
+                "callable strategy requires an explicit replay_predict_factory"
+            )
+        return type(self)(
+            self.strategy_id,
+            self._replay_predict_factory(),
+            self.product_id,
+            self._timeframe,
+            self._lookback_window,
+            replay_predict_factory=self._replay_predict_factory,
+            replay_config=self._replay_config,
+        )
+
+    def replay_configuration(self) -> object:
+        return (
+            self._timeframe,
+            self._lookback_window,
+            self._replay_config,
         )
 
     def on_candle(self, candle: Candlestick) -> Signal:

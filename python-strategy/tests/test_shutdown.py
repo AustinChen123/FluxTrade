@@ -87,12 +87,23 @@ class TestEngineShutdown:
         engine.ops_safety._recovery_pending = False
         engine.ops_safety.persist_engine_boot_state = MagicMock()
 
-        engine.shutdown()
+        engine.shutdown(clean_exit=True)
 
         engine.ops_safety.persist_engine_boot_state.assert_called_once_with(
             "CLEAN",
             boot_id=engine._boot_id,
         )
+
+    def test_abnormal_started_boot_is_not_marked_clean(self):
+        engine = _make_engine()
+        engine._boot_started = True
+        engine._kill_switch_halted = False
+        engine.ops_safety._recovery_pending = False
+        engine.ops_safety.persist_engine_boot_state = MagicMock()
+
+        engine.shutdown(clean_exit=False)
+
+        engine.ops_safety.persist_engine_boot_state.assert_not_called()
 
     def test_halted_or_recovery_pending_boot_is_never_marked_clean(self):
         for halted, recovery_pending in ((True, False), (False, True)):

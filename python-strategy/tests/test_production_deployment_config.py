@@ -224,6 +224,14 @@ def test_production_compose_passes_required_auth_to_services(tmp_path: Path):
         services["python-strategy"]["environment"]["FLUXTRADE_ENVIRONMENT"]
         == "live"
     )
+    assert (
+        services["python-strategy"]["environment"]["MARKET_PENDING_CLAIM_IDLE_MS"]
+        == "60000"
+    )
+    assert (
+        services["python-strategy"]["environment"]["MARKET_CONSUMER_LEASE_MS"]
+        == "10000"
+    )
 
 
 @pytest.mark.integration

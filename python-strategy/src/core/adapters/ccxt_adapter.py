@@ -10,7 +10,7 @@ import os
 from dataclasses import dataclass
 from decimal import Decimal
 from enum import Enum
-from typing import Optional
+from typing import Callable, Optional
 
 import ccxt
 
@@ -311,46 +311,68 @@ class CcxtExchangeAdapter(IExchangeAdapter):
 
         return None
 
-    def warm_instrument_specs(self, product_ids: list[str]) -> None:
+    def warm_instrument_specs(
+        self,
+        product_ids: list[str],
+        *,
+        operation_guard: Callable[[], None] | None = None,
+    ) -> None:
         """Fetch and cache instrument specs for known live products."""
+        guard = operation_guard or (lambda: None)
         for product_id in product_ids:
+            guard()
             self.get_instrument_spec(product_id)
+            guard()
 
-    def initialize_account(self, config: AccountInitializationConfig) -> None:
+    def initialize_account(
+        self,
+        config: AccountInitializationConfig,
+        *,
+        operation_guard: Callable[[], None] | None = None,
+    ) -> None:
         """Apply fail-safe account settings before live trading starts.
 
         CCXT source defines set_position_mode(hedged=False) as one-way mode for
         Binance and Bybit; fetch_position_mode() returns ``hedged`` for
         verification on those venues.
         """
+        guard = operation_guard or (lambda: None)
+        guard()
         try:
             self.client.load_markets()
         except ccxt.BaseError as e:
             raise ExchangeError(
                 f"account_initialization_load_markets_failed: {e}"
             ) from e
+        guard()
 
         for product_id in config.product_ids:
             symbol = to_ccxt_symbol(product_id)
-            self._ensure_one_way_position_mode(symbol)
+            self._ensure_one_way_position_mode(symbol, guard)
             margin_mode_accepted = False
             if config.margin_mode is not None:
                 margin_mode_accepted = self._set_margin_mode(
                     config.margin_mode,
                     symbol,
                     config,
+                    guard,
                 )
             if config.leverage is not None:
-                self._set_leverage(config.leverage, symbol)
-                self._verify_leverage(config.leverage, symbol)
+                self._set_leverage(config.leverage, symbol, guard)
+                self._verify_leverage(config.leverage, symbol, guard)
             if config.margin_mode is not None:
                 self._verify_margin_mode(
                     config.margin_mode,
                     symbol,
                     allow_unsupported=margin_mode_accepted,
+                    operation_guard=guard,
                 )
 
-    def _ensure_one_way_position_mode(self, symbol: str) -> None:
+    def _ensure_one_way_position_mode(
+        self,
+        symbol: str,
+        operation_guard: Callable[[], None],
+    ) -> None:
         set_position_mode = getattr(self.client, "set_position_mode", None)
         if not callable(set_position_mode):
             raise ExchangeError(
@@ -358,6 +380,7 @@ class CcxtExchangeAdapter(IExchangeAdapter):
                 f"exchange={self.exchange_id}"
             )
         set_accepted = False
+        operation_guard()
         try:
             set_position_mode(False, symbol)
             set_accepted = True
@@ -367,6 +390,7 @@ class CcxtExchangeAdapter(IExchangeAdapter):
                     f"account_position_mode_set_failed: symbol={symbol} error={e}"
                 ) from e
             set_accepted = True
+        operation_guard()
 
         fetch_position_mode = getattr(self.client, "fetch_position_mode", None)
         if not callable(fetch_position_mode):
@@ -376,14 +400,17 @@ class CcxtExchangeAdapter(IExchangeAdapter):
                 "account_position_mode_verification_unsupported: "
                 f"exchange={self.exchange_id}"
             )
+        operation_guard()
         try:
             result = fetch_position_mode(symbol)
         except ccxt.BaseError as e:
             if set_accepted and self._is_position_mode_verification_unsupported(e):
+                operation_guard()
                 return
             raise ExchangeError(
                 f"account_position_mode_verify_failed: symbol={symbol} error={e}"
             ) from e
+        operation_guard()
 
         hedged = result.get("hedged") if isinstance(result, dict) else None
         if hedged is not False:
@@ -397,6 +424,7 @@ class CcxtExchangeAdapter(IExchangeAdapter):
         margin_mode: str,
         symbol: str,
         config: AccountInitializationConfig,
+        operation_guard: Callable[[], None],
     ) -> bool:
         set_margin_mode = getattr(self.client, "set_margin_mode", None)
         if not callable(set_margin_mode):
@@ -406,6 +434,7 @@ class CcxtExchangeAdapter(IExchangeAdapter):
         params = {}
         if config.leverage is not None:
             params["leverage"] = str(config.leverage)
+        operation_guard()
         try:
             set_margin_mode(margin_mode, symbol, params)
         except ccxt.BaseError as e:
@@ -413,14 +442,21 @@ class CcxtExchangeAdapter(IExchangeAdapter):
                 raise ExchangeError(
                     f"account_margin_mode_set_failed: symbol={symbol} error={e}"
                 ) from e
+        operation_guard()
         return True
 
-    def _set_leverage(self, leverage: int, symbol: str) -> None:
+    def _set_leverage(
+        self,
+        leverage: int,
+        symbol: str,
+        operation_guard: Callable[[], None],
+    ) -> None:
         set_leverage = getattr(self.client, "set_leverage", None)
         if not callable(set_leverage):
             raise ExchangeError(
                 f"account_leverage_unsupported: exchange={self.exchange_id}"
             )
+        operation_guard()
         try:
             set_leverage(leverage, symbol)
         except ccxt.BaseError as e:
@@ -428,9 +464,15 @@ class CcxtExchangeAdapter(IExchangeAdapter):
                 raise ExchangeError(
                     f"account_leverage_set_failed: symbol={symbol} error={e}"
                 ) from e
+        operation_guard()
 
-    def _verify_leverage(self, expected_leverage: int, symbol: str) -> None:
-        leverage = self._fetch_leverage_value(symbol)
+    def _verify_leverage(
+        self,
+        expected_leverage: int,
+        symbol: str,
+        operation_guard: Callable[[], None],
+    ) -> None:
+        leverage = self._fetch_leverage_value(symbol, operation_guard)
         if leverage != expected_leverage:
             raise ExchangeError(
                 "account_leverage_not_configured: "
@@ -443,9 +485,13 @@ class CcxtExchangeAdapter(IExchangeAdapter):
         symbol: str,
         *,
         allow_unsupported: bool,
+        operation_guard: Callable[[], None],
     ) -> None:
         try:
-            margin_mode = self._fetch_margin_mode_value(symbol)
+            margin_mode = self._fetch_margin_mode_value(
+                symbol,
+                operation_guard,
+            )
         except ExchangeError as e:
             if allow_unsupported and str(e).startswith(
                 "account_margin_mode_verification_unsupported"
@@ -463,26 +509,36 @@ class CcxtExchangeAdapter(IExchangeAdapter):
                 f"symbol={symbol} expected={expected_margin_mode} actual={margin_mode}"
             )
 
-    def _fetch_leverage_value(self, symbol: str) -> int | None:
+    def _fetch_leverage_value(
+        self,
+        symbol: str,
+        operation_guard: Callable[[], None],
+    ) -> int | None:
         fetch_leverage = getattr(self.client, "fetch_leverage", None)
         if callable(fetch_leverage):
+            operation_guard()
             try:
                 leverage = self._leverage_value_from_result(fetch_leverage(symbol))
                 if leverage is not None:
+                    operation_guard()
                     return leverage
             except ccxt.BaseError:
                 pass
+            operation_guard()
 
         fetch_leverages = getattr(self.client, "fetch_leverages", None)
         if callable(fetch_leverages):
+            operation_guard()
             try:
                 leverages = fetch_leverages([symbol])
                 result = leverages.get(symbol) if isinstance(leverages, dict) else None
                 leverage = self._leverage_value_from_result(result)
                 if leverage is not None:
+                    operation_guard()
                     return leverage
             except ccxt.BaseError:
                 pass
+            operation_guard()
 
         raise ExchangeError(
             "account_leverage_verification_unsupported: "
@@ -502,24 +558,34 @@ class CcxtExchangeAdapter(IExchangeAdapter):
         leverage = result.get("leverage")
         return int(leverage) if leverage is not None else None
 
-    def _fetch_margin_mode_value(self, symbol: str) -> str | None:
+    def _fetch_margin_mode_value(
+        self,
+        symbol: str,
+        operation_guard: Callable[[], None],
+    ) -> str | None:
         fetch_margin_mode = getattr(self.client, "fetch_margin_mode", None)
         if callable(fetch_margin_mode):
+            operation_guard()
             try:
                 margin_mode = self._margin_mode_from_result(fetch_margin_mode(symbol))
                 if margin_mode is not None:
+                    operation_guard()
                     return margin_mode
             except ccxt.BaseError:
                 pass
+            operation_guard()
 
         fetch_leverage = getattr(self.client, "fetch_leverage", None)
         if callable(fetch_leverage):
+            operation_guard()
             try:
                 margin_mode = self._margin_mode_from_result(fetch_leverage(symbol))
                 if margin_mode is not None:
+                    operation_guard()
                     return margin_mode
             except ccxt.BaseError:
                 pass
+            operation_guard()
 
         raise ExchangeError(
             "account_margin_mode_verification_unsupported: "

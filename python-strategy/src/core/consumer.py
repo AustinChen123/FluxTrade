@@ -1,10 +1,13 @@
 import json
 import logging
 import os
+import socket
+import threading
 import time
+import uuid
 
 from decimal import Decimal
-from typing import Any, Callable, List, Union, cast
+from typing import Any, Callable, Iterable, List, Union, cast
 
 from dotenv import load_dotenv
 from redis.exceptions import ConnectionError as RedisConnectionError
@@ -23,10 +26,86 @@ logger = logging.getLogger(__name__)
 INITIAL_BACKOFF = 1.0
 MAX_BACKOFF = 300.0
 MAX_RETRIES = 10
+DEFAULT_PENDING_CLAIM_IDLE_MS = 60_000
+DEFAULT_OWNERSHIP_LEASE_MS = 10_000
+XAUTOCLAIM_WITH_QUARANTINE = """
+if redis.call('GET', KEYS[3]) ~= ARGV[1] then
+    return {0}
+end
+local result = redis.call(
+    'XAUTOCLAIM',
+    KEYS[1],
+    ARGV[2],
+    ARGV[3],
+    ARGV[4],
+    ARGV[5],
+    'COUNT',
+    ARGV[6]
+)
+if result[3] then
+    for _, message_id in ipairs(result[3]) do
+        redis.call(
+            'SADD',
+            KEYS[2],
+            cjson.encode({
+                stream = KEYS[1],
+                message_id = message_id,
+                reason = 'payload_deleted_while_pending'
+            })
+        )
+    end
+end
+return {1, result}
+"""
+RENEW_OWNERSHIP_LEASE = """
+if redis.call('GET', KEYS[1]) == ARGV[1] then
+    return redis.call('PEXPIRE', KEYS[1], ARGV[2])
+end
+return 0
+"""
+RELEASE_OWNERSHIP_LEASE = """
+if redis.call('GET', KEYS[1]) == ARGV[1] then
+    return redis.call('DEL', KEYS[1])
+end
+return 0
+"""
+FENCED_XREADGROUP = """
+if redis.call('GET', KEYS[1]) ~= ARGV[1] then
+    return {0}
+end
+local response = redis.call(
+    'XREADGROUP',
+    'GROUP',
+    ARGV[2],
+    ARGV[3],
+    'COUNT',
+    ARGV[4],
+    'STREAMS',
+    KEYS[2],
+    '>'
+)
+if not response then
+    return {1}
+end
+return {1, response}
+"""
+FENCED_XACK = """
+if redis.call('GET', KEYS[1]) ~= ARGV[1] then
+    return {0}
+end
+return {
+    1,
+    redis.call('XACK', ARGV[2], ARGV[3], ARGV[4])
+}
+"""
 
 
 class MarketStreamPendingError(RuntimeError):
     """A previous delivery has an ambiguous processing outcome."""
+
+
+class MarketStreamOwnershipError(MarketStreamPendingError):
+    """Another process currently owns market stream consumption."""
 
 
 class DataConsumer:
@@ -36,6 +115,11 @@ class DataConsumer:
         on_message_callback: Callable[[Union[Candlestick, Trade]], None],
         channel_provider: Callable[[], List[str]] | None = None,
         runtime_environment: RuntimeEnvironment | None = None,
+        pending_replay_callback: (
+            Callable[[Union[Candlestick, Trade]], None] | None
+        ) = None,
+        pending_claim_idle_ms: int = DEFAULT_PENDING_CLAIM_IDLE_MS,
+        ownership_lease_ms: int = DEFAULT_OWNERSHIP_LEASE_MS,
     ):
         """
         :param channels: List of Redis Stream Keys to consume (e.g., ['stream:market:binance:btcusdt'])
@@ -49,6 +133,12 @@ class DataConsumer:
         self._stream_registry_key = self.runtime_environment.key(
             f"consumer:{self.group_name}:streams"
         )
+        self._quarantine_key = self.runtime_environment.key(
+            f"consumer:{self.group_name}:quarantine"
+        )
+        self._ownership_key = self.runtime_environment.key(
+            f"consumer:{self.group_name}:owner"
+        )
         self._initialized_channels: set[str] = set()
         self._completed_pending: set[tuple[str, str]] = set()
         self._blocked_streams: set[str] = set()
@@ -57,26 +147,165 @@ class DataConsumer:
         self._durable_registry_loaded = False
         self._next_channel_index = 0
         self.callback = on_message_callback
+        self.pending_replay_callback = pending_replay_callback
+        if pending_claim_idle_ms < 0:
+            raise ValueError("pending_claim_idle_ms must be non-negative")
+        if ownership_lease_ms <= 0:
+            raise ValueError("ownership_lease_ms must be positive")
+        self.pending_claim_idle_ms = pending_claim_idle_ms
+        self._ownership_lease_ms = ownership_lease_ms
+        self._ownership_token = uuid.uuid4().hex
+        self._ownership_lost = threading.Event()
+        self._ownership_heartbeat_stop = threading.Event()
+        self._ownership_heartbeat: threading.Thread | None = None
+        self._ownership_active = False
+        self._stop_requested = threading.Event()
         self.running = False
-        self.consumer_name = f"consumer_{os.getpid()}"
+        self.consumer_name = (
+            f"consumer_{socket.gethostname()}_{os.getpid()}_"
+            f"{self._ownership_token}"
+        )
+
+    def _acquire_ownership(self) -> None:
+        acquired = self.redis_client.set(
+            self._ownership_key,
+            self._ownership_token,
+            nx=True,
+            px=self._ownership_lease_ms,
+        )
+        if not acquired:
+            raise MarketStreamOwnershipError(
+                "market stream consumer ownership is held by another process"
+            )
+        self._ownership_lost.clear()
+        self._ownership_active = True
+
+    def _renew_ownership(self) -> None:
+        renewed = self.redis_client.eval(
+            RENEW_OWNERSHIP_LEASE,
+            1,
+            self._ownership_key,
+            self._ownership_token,
+            self._ownership_lease_ms,
+        )
+        if renewed != 1:
+            self._ownership_lost.set()
+
+    def _assert_ownership(self) -> None:
+        if not self._ownership_active:
+            return
+        owner = self.redis_client.get(self._ownership_key)
+        if isinstance(owner, bytes):
+            owner = owner.decode()
+        if self._ownership_lost.is_set() or owner != self._ownership_token:
+            self._ownership_lost.set()
+            raise MarketStreamOwnershipError(
+                "market stream consumer ownership was lost"
+            )
+
+    def _ownership_heartbeat_loop(self) -> None:
+        interval = max(self._ownership_lease_ms / 3 / 1000, 0.05)
+        while not self._ownership_heartbeat_stop.wait(interval):
+            try:
+                self._renew_ownership()
+            except (ConnectionError, OSError, RedisError):
+                self._ownership_lost.set()
+            if self._ownership_lost.is_set():
+                return
+
+    def _start_ownership_heartbeat(self) -> None:
+        self._ownership_heartbeat_stop.clear()
+        self._ownership_heartbeat = threading.Thread(
+            target=self._ownership_heartbeat_loop,
+            name="market-stream-ownership-heartbeat",
+            daemon=True,
+        )
+        self._ownership_heartbeat.start()
+
+    def _release_ownership(self) -> None:
+        if not self._ownership_active:
+            return
+        self._ownership_heartbeat_stop.set()
+        heartbeat = self._ownership_heartbeat
+        if heartbeat is not None and heartbeat is not threading.current_thread():
+            heartbeat.join(timeout=1)
+        try:
+            self.redis_client.eval(
+                RELEASE_OWNERSHIP_LEASE,
+                1,
+                self._ownership_key,
+                self._ownership_token,
+            )
+        except (ConnectionError, OSError, RedisError):
+            pass
+        self._ownership_active = False
+
+    def _establish_ownership(self) -> None:
+        while self.running and not self._stop_requested.is_set():
+            try:
+                self._acquire_ownership()
+            except MarketStreamOwnershipError:
+                time.sleep(INITIAL_BACKOFF)
+                continue
+            self._start_ownership_heartbeat()
+            return
+
+    def acquire_service_ownership(self) -> None:
+        """Become the sole live service before engine startup."""
+        self.running = True
+        self._establish_ownership()
+        if not self._ownership_active:
+            raise RuntimeError("market stream ownership acquisition cancelled")
+
+    def assert_service_ownership(self) -> None:
+        """Reject startup work after shutdown or leadership loss."""
+        if self._stop_requested.is_set():
+            raise MarketStreamOwnershipError(
+                "market stream service stop was requested"
+            )
+        if not self._ownership_active:
+            raise MarketStreamOwnershipError(
+                "market stream service ownership is not active"
+            )
+        self._assert_ownership()
+
+    def configure_callbacks(
+        self,
+        *,
+        on_message_callback: Callable[[Union[Candlestick, Trade]], None],
+        channel_provider: Callable[[], List[str]],
+        pending_replay_callback: Callable[[Union[Candlestick, Trade]], None],
+    ) -> None:
+        self.callback = on_message_callback
+        self.channel_provider = channel_provider
+        self.pending_replay_callback = pending_replay_callback
+        self.channels = channel_provider()
 
     def start(self):
         """Outer reconnection loop with exponential backoff."""
+        if self._stop_requested.is_set():
+            return
         self.running = True
+        if not self._ownership_active:
+            self._establish_ownership()
         logger.info("DataConsumer started. Stream Group: %s | Consumer: %s",
                      self.group_name, self.consumer_name)
 
         backoff = INITIAL_BACKOFF
         attempts = 0
 
-        while self.running:
+        while self.running and not self._stop_requested.is_set():
             try:
+                self._assert_ownership()
                 self._consume_loop()
                 # _consume_loop exits cleanly when self.running is False
                 break
             except KeyboardInterrupt:
-                self.stop()
+                self.request_stop()
                 break
+            except MarketStreamOwnershipError as e:
+                logger.critical("Market stream ownership lost: %s", e)
+                raise
             except MarketStreamPendingError as e:
                 # Keep the process alive but stop reading newer entries. An
                 # operator/recovery workflow may resolve the pending delivery;
@@ -135,8 +364,193 @@ class DataConsumer:
                     raise
             self._ensure_no_abandoned_pending([stream_key])
 
+    @staticmethod
+    def _pending_count(summary: object, stream_key: str) -> int:
+        if isinstance(summary, dict):
+            return int(summary.get("pending", 0))
+        if isinstance(summary, (list, tuple)) and summary:
+            return int(summary[0])
+        raise MarketStreamPendingError(
+            f"invalid pending summary for {stream_key}"
+        )
+
+    @staticmethod
+    def _stream_id_key(message_id: str) -> tuple[int, int]:
+        milliseconds, sequence = message_id.split("-", 1)
+        return int(milliseconds), int(sequence)
+
+    @staticmethod
+    def _decode_claimed_fields(raw_fields: object) -> dict:
+        if isinstance(raw_fields, dict):
+            return raw_fields
+        if isinstance(raw_fields, (list, tuple)) and len(raw_fields) % 2 == 0:
+            return dict(zip(raw_fields[::2], raw_fields[1::2]))
+        raise MarketStreamPendingError(
+            "invalid claimed market message fields"
+        )
+
+    def _claim_pending(
+        self,
+        stream_key: str,
+        pending: int,
+    ) -> list[tuple[str, dict]]:
+        cursor = "0-0"
+        claimed: list[tuple[str, dict]] = []
+        deleted_ids: list[str] = []
+        while True:
+            response = cast(
+                Any,
+                self.redis_client.eval(
+                    XAUTOCLAIM_WITH_QUARANTINE,
+                    3,
+                    stream_key,
+                    self._quarantine_key,
+                    self._ownership_key,
+                    self._ownership_token,
+                    self.group_name,
+                    self.consumer_name,
+                    self.pending_claim_idle_ms,
+                    cursor,
+                    1,
+                ),
+            )
+            if not isinstance(response, (list, tuple)) or not response:
+                raise MarketStreamPendingError(
+                    f"invalid XAUTOCLAIM response for {stream_key}"
+                )
+            if int(response[0]) != 1:
+                self._ownership_lost.set()
+                raise MarketStreamOwnershipError(
+                    "market stream consumer ownership was lost before pending claim"
+                )
+            response = response[1]
+            if not isinstance(response, (list, tuple)) or len(response) not in {2, 3}:
+                raise MarketStreamPendingError(
+                    f"invalid XAUTOCLAIM response for {stream_key}"
+                )
+            cursor = (
+                response[0].decode()
+                if isinstance(response[0], bytes)
+                else str(response[0])
+            )
+            claimed.extend(
+                (
+                    raw_message_id,
+                    self._decode_claimed_fields(raw_fields),
+                )
+                for raw_message_id, raw_fields in response[1]
+            )
+            if len(response) == 3:
+                deleted_ids.extend(
+                    value.decode() if isinstance(value, bytes) else str(value)
+                    for value in response[2]
+                )
+            if cursor == "0-0":
+                break
+
+        if deleted_ids:
+            raise MarketStreamPendingError(
+                f"pending market payload was deleted for {stream_key}: {deleted_ids}"
+            )
+        if len(claimed) != pending:
+            raise MarketStreamPendingError(
+                f"market stream has {pending - len(claimed)} pending deliveries "
+                f"that are not idle enough to reclaim: {stream_key}"
+            )
+        return claimed
+
+    def _ack_message(
+        self,
+        stream_key: str,
+        message_id: str,
+        *,
+        allow_already_absent: bool = False,
+    ) -> None:
+        response = self.redis_client.eval(
+            FENCED_XACK,
+            1,
+            self._ownership_key,
+            self._ownership_token,
+            stream_key,
+            self.group_name,
+            message_id,
+        )
+        if not isinstance(response, (list, tuple)) or not response:
+            raise MarketStreamPendingError(
+                f"invalid fenced ACK response for {stream_key}:{message_id}"
+            )
+        if int(response[0]) != 1:
+            self._ownership_lost.set()
+            raise MarketStreamOwnershipError(
+                "market stream consumer ownership was lost before ACK"
+            )
+        if len(response) != 2:
+            raise MarketStreamPendingError(
+                f"invalid fenced ACK response for {stream_key}:{message_id}"
+            )
+        acknowledged = int(response[1])
+        if acknowledged == 0 and allow_already_absent:
+            pending = self.redis_client.xpending_range(
+                stream_key,
+                self.group_name,
+                min=message_id,
+                max=message_id,
+                count=1,
+            )
+            if not pending:
+                return
+        if acknowledged != 1:
+            raise MarketStreamPendingError(
+                f"market message ACK removed {acknowledged} deliveries: "
+                f"{stream_key}:{message_id}"
+            )
+
+    def _recover_abandoned_pending(
+        self,
+        pending_by_stream: list[tuple[str, int]],
+    ) -> None:
+        if self.pending_replay_callback is None:
+            streams = ", ".join(stream for stream, _ in pending_by_stream)
+            raise MarketStreamPendingError(
+                "market stream has unresolved deliveries but pending replay "
+                f"callback is not configured: {streams}"
+            )
+
+        recovered: list[tuple[str, str, Union[Candlestick, Trade]]] = []
+        for stream_key, pending in pending_by_stream:
+            for raw_message_id, data in self._claim_pending(stream_key, pending):
+                message_id = (
+                    raw_message_id.decode()
+                    if isinstance(raw_message_id, bytes)
+                    else str(raw_message_id)
+                )
+                model = self._parse_message(stream_key, data)
+                if model is None:
+                    raise MarketStreamPendingError(
+                        f"unparseable pending market message "
+                        f"{stream_key}:{message_id}"
+                    )
+                recovered.append((stream_key, message_id, model))
+
+        recovered.sort(
+            key=lambda item: (*self._stream_id_key(item[1]), item[0])
+        )
+        for stream_key, message_id, model in recovered:
+            self._assert_ownership()
+            try:
+                self.pending_replay_callback(model)
+            except Exception as exc:
+                raise MarketStreamPendingError(
+                    f"pending market callback failed {stream_key}:{message_id}"
+                ) from exc
+            self._assert_ownership()
+            self._completed_pending.add((stream_key, message_id))
+            self._ack_message(stream_key, message_id)
+            self._completed_pending.discard((stream_key, message_id))
+            self._blocked_streams.discard(stream_key)
     def _ensure_no_abandoned_pending(self, channels: list[str]) -> None:
-        """Fail closed rather than replay a candle with unknown order side effects."""
+        """Recover idle deliveries before allowing any newer market data."""
+        pending_by_stream: list[tuple[str, int]] = []
         for stream_key in channels:
             completed_ids = [
                 message_id
@@ -144,35 +558,44 @@ class DataConsumer:
                 if completed_stream == stream_key
             ]
             for message_id in completed_ids:
-                self.redis_client.xack(
+                self._ack_message(
                     stream_key,
-                    self.group_name,
                     message_id,
+                    allow_already_absent=True,
                 )
                 self._completed_pending.discard((stream_key, message_id))
             summary = self.redis_client.xpending(stream_key, self.group_name)
-            if isinstance(summary, dict):
-                pending = int(summary.get("pending", 0))
-            elif isinstance(summary, (list, tuple)) and summary:
-                pending = int(summary[0])
-            else:
-                raise MarketStreamPendingError(
-                    f"invalid pending summary for {stream_key}"
-                )
+            pending = self._pending_count(summary, stream_key)
             if pending:
-                raise MarketStreamPendingError(
-                    f"market stream has {pending} unresolved deliveries: {stream_key}"
-                )
-            self._blocked_streams.discard(stream_key)
+                pending_by_stream.append((stream_key, pending))
+            else:
+                self._blocked_streams.discard(stream_key)
+        if pending_by_stream:
+            self._recover_abandoned_pending(pending_by_stream)
+
+    def _ensure_no_quarantined_delivery(self) -> None:
+        values = cast(
+            set[Any],
+            self.redis_client.smembers(self._quarantine_key),
+        )
+        if values:
+            raise MarketStreamPendingError(
+                "market stream quarantine requires operator recovery: "
+                + ", ".join(sorted(str(value) for value in values))
+            )
 
     def _load_durable_stream_gate(self) -> None:
         """Restore every stream this consumer group may have claimed."""
         if self._durable_registry_loaded:
             return
         self._bootstrap_existing_group_streams()
+        registered_values = cast(
+            set[Any],
+            self.redis_client.smembers(self._stream_registry_key),
+        )
         registered = {
             value.decode() if isinstance(value, bytes) else str(value)
-            for value in self.redis_client.smembers(self._stream_registry_key)
+            for value in registered_values
         }
         self._registered_streams = registered
         if registered:
@@ -184,12 +607,19 @@ class DataConsumer:
         if self._existing_group_streams_scanned:
             return
         existing_group_streams = []
-        for value in self.redis_client.scan_iter(
-            match="stream:market:*",
-            _type="stream",
-        ):
+        stream_values = cast(
+            Iterable[Any],
+            self.redis_client.scan_iter(
+                match="stream:market:*",
+                _type="stream",
+            ),
+        )
+        for value in stream_values:
             stream_key = value.decode() if isinstance(value, bytes) else str(value)
-            groups = self.redis_client.xinfo_groups(stream_key)
+            groups = cast(
+                Iterable[dict[Any, Any]],
+                self.redis_client.xinfo_groups(stream_key),
+            )
             if any(
                 (
                     group.get("name")
@@ -214,9 +644,58 @@ class DataConsumer:
         self.redis_client.sadd(self._stream_registry_key, stream_key)
         self._registered_streams.add(stream_key)
 
+    def _read_next_owned_message(
+        self,
+        stream_key: str,
+    ) -> list[tuple[str, list[tuple[str, dict]]]]:
+        raw = cast(
+            Any,
+            self.redis_client.eval(
+                FENCED_XREADGROUP,
+                2,
+                self._ownership_key,
+                stream_key,
+                self._ownership_token,
+                self.group_name,
+                self.consumer_name,
+                1,
+            ),
+        )
+        if not isinstance(raw, (list, tuple)) or not raw:
+            raise MarketStreamPendingError(
+                "invalid fenced XREADGROUP response"
+            )
+        if int(raw[0]) != 1:
+            self._ownership_lost.set()
+            raise MarketStreamOwnershipError(
+                "market stream consumer ownership was lost before claim"
+            )
+        if len(raw) == 1:
+            return []
+        streams = []
+        for raw_stream, raw_messages in raw[1]:
+            stream = (
+                raw_stream.decode()
+                if isinstance(raw_stream, bytes)
+                else str(raw_stream)
+            )
+            messages = [
+                (
+                    message_id.decode()
+                    if isinstance(message_id, bytes)
+                    else str(message_id),
+                    self._decode_claimed_fields(fields),
+                )
+                for message_id, fields in raw_messages
+            ]
+            streams.append((stream, messages))
+        return streams
+
     def _consume_loop(self):
         """Inner xreadgroup loop. Exits when self.running is False or on error."""
-        while self.running:
+        while self.running and not self._stop_requested.is_set():
+            self._assert_ownership()
+            self._ensure_no_quarantined_delivery()
             self._load_durable_stream_gate()
             # A stream remains a global submission gate even if the dynamic
             # strategy set no longer subscribes to it. Resolve every delivery
@@ -234,21 +713,8 @@ class DataConsumer:
             stream_key = channels[self._next_channel_index % len(channels)]
             self._next_channel_index = (self._next_channel_index + 1) % len(channels)
             self._register_stream_before_read(stream_key)
-            streams = {stream_key: '>'}
             try:
-                response = cast(
-                    list[tuple[str, list[tuple[str, dict[str, str]]]]],
-                    self.redis_client.xreadgroup(
-                        groupname=self.group_name,
-                        consumername=self.consumer_name,
-                        streams=cast(Any, streams),
-                        # Without a durable per-message callback phase, claiming
-                        # more than one delivery can strand later, untouched
-                        # messages behind an ambiguous callback outcome.
-                        count=1,
-                        block=max(1, 100 // len(channels)),
-                    ),
-                )
+                response = self._read_next_owned_message(stream_key)
             except (ConnectionError, OSError, RedisError):
                 # The server may have claimed a delivery even if its response
                 # never reached this process. The next loop must inspect this
@@ -257,6 +723,7 @@ class DataConsumer:
                 raise
 
             if not response:
+                time.sleep(max(0.001, 0.1 / len(channels)))
                 continue
 
             for stream_key, messages in response:
@@ -284,14 +751,11 @@ class DataConsumer:
                         raise MarketStreamPendingError(
                             f"market callback failed {stream_key}:{message_id}"
                         ) from exc
+                    self._assert_ownership()
                     # Remember callback completion across a Redis reconnect.
                     # This process may retry only the ACK, never the callback.
                     self._completed_pending.add((stream_key, message_id))
-                    self.redis_client.xack(
-                        stream_key,
-                        self.group_name,
-                        message_id,
-                    )
+                    self._ack_message(stream_key, message_id)
                     self._completed_pending.discard((stream_key, message_id))
                     self._blocked_streams.discard(stream_key)
 
@@ -320,8 +784,14 @@ class DataConsumer:
             logger.error("Parse error: %s", e)
             return None
 
-    def stop(self):
-        """Stop consuming and close Redis connection."""
+    def request_stop(self) -> None:
+        """Stop reading while retaining leadership during engine shutdown."""
+        self._stop_requested.set()
         self.running = False
+
+    def stop(self):
+        """Release leadership and close Redis after engine shutdown."""
+        self.request_stop()
+        self._release_ownership()
         self.redis_client.close()
         logger.info("DataConsumer stopped.")

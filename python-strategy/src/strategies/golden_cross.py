@@ -54,6 +54,24 @@ class GoldenCrossStrategy(BaseStrategy):
             lookback_window=self.long_window,
         )
 
+    def fresh_instance_for_replay(self) -> BaseStrategy:
+        return type(self)(
+            self.strategy_id,
+            self.product_id,
+            self.short_window,
+            self.long_window,
+            timeframe=self.timeframe,
+            quantity=self.quantity,
+        )
+
+    def replay_configuration(self) -> object:
+        return (
+            self.short_window,
+            self.long_window,
+            self.timeframe,
+            self.quantity,
+        )
+
     def run_vectorized(self, df: pd.DataFrame) -> pd.DataFrame:
         """
         Calculates SMA crossovers using Vectorized Pandas operations.

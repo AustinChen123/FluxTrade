@@ -6,6 +6,7 @@ Falls back to REST (parent class) when WS is unavailable.
 
 import logging
 import asyncio
+from collections.abc import Callable
 
 from src.core.adapters.ccxt_adapter import CcxtExchangeAdapter
 from src.core.client_order_id import to_exchange_format
@@ -22,6 +23,7 @@ class LiveBinanceAdapter(CcxtExchangeAdapter):
         secret: str | None = None,
         testnet: bool = True,
         enable_ws: bool = True,
+        operation_guard: Callable[[], None] | None = None,
     ):
         super().__init__(
             exchange_id="binance",
@@ -34,17 +36,35 @@ class LiveBinanceAdapter(CcxtExchangeAdapter):
         # Optional WebSocket fast path
         self.ws_connector: WebSocketOrderConnector | None = None
         if enable_ws:
+            guard = operation_guard or (lambda: None)
+            guard()
             try:
-                self.ws_connector = WebSocketOrderConnector(
+                connector = WebSocketOrderConnector(
                     self.client.apiKey or "",
                     self.client.secret or "",
                     "binance",
                     testnet,
                 )
-                self.ws_connector.start()
             except Exception as e:
                 self.logger.warning("WebSocket init failed, REST only: %s", e)
-                self.ws_connector = None
+            else:
+                guard()
+                try:
+                    connector.start()
+                except Exception as e:
+                    self.logger.warning("WebSocket init failed, REST only: %s", e)
+                else:
+                    self.ws_connector = connector
+            try:
+                guard()
+            except Exception:
+                if self.ws_connector is not None:
+                    self.ws_connector.running = False
+                raise
+
+    def close(self) -> None:
+        if self.ws_connector is not None:
+            self.ws_connector.running = False
 
     def place_order(self, order: Order) -> str:
         intent_payload = getattr(order, "intent_payload", None)

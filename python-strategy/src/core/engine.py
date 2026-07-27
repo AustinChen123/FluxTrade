@@ -7,11 +7,22 @@ import threading
 import logging
 import traceback
 import uuid
-from contextlib import nullcontext
+from contextlib import contextmanager, nullcontext
 from concurrent.futures import ThreadPoolExecutor
 from datetime import UTC, datetime
 from decimal import Decimal
-from typing import Callable, ContextManager, List, Union, Optional, Dict, Type
+from typing import (
+    Callable,
+    ContextManager,
+    Dict,
+    Iterator,
+    List,
+    Optional,
+    Sequence,
+    Type,
+    Union,
+)
+from sqlalchemy import func, text
 from sqlalchemy.orm import Session
 from src.core.models import (
     Candlestick,
@@ -22,7 +33,7 @@ from src.core.models import (
     StrategyStatus,
 )
 from src.core.orm_models import Candlestick as ORMCandlestick
-from src.core.orm_models import StrategyState
+from src.core.orm_models import MarketDataApplication, StrategyState
 from src.strategies.base import BaseStrategy
 from src.core.risk_manager import RiskManager, AccountService
 from src.core.execution import ExecutionEngine, ExitDecision
@@ -54,9 +65,11 @@ from src.core.strategy_registry import StrategyRegistry
 from src.core.strategy_state_manager import StrategyStateManager
 from src.core.audit_service import build_signal_audit, commit_signal_audit
 from src.core.runtime_environment import RuntimeEnvironment
+from src.core.product_master import ensure_product_registered
 from src.core.product_registry import to_stream_key
 
 HOT_STRATEGIES_PATH = os.getenv('HOT_STRATEGIES_PATH', '/app/strategies_hot')
+LIVE_CANDLE_FENCE_TIMEOUT_SECONDS = 5.0
 _DEFAULT_RUNTIME_ENVIRONMENT = RuntimeEnvironment("live")
 SYSTEM_STATE_KEY = _DEFAULT_RUNTIME_ENVIRONMENT.key("system:state")
 SYSTEM_BOOT_STATE_KEY = _DEFAULT_RUNTIME_ENVIRONMENT.key("system:engine_boot_state")
@@ -198,6 +211,7 @@ class StrategyEngine:
         journal: Optional[StrategyJournal] = None,
         db_session_factory: Optional[Callable[[], ContextManager[Session]]] = None,
         audit_external_orders: bool = False,
+        leadership_guard: Callable[[], None] | None = None,
     ):
         self._db_session_factory = db_session_factory or (lambda: nullcontext(db_session))
         self.clock = clock
@@ -209,6 +223,7 @@ class StrategyEngine:
         self._market_processing_lock = threading.Lock()
         self._boot_id = uuid.uuid4().hex
         self._boot_started = False
+        self._leadership_guard = leadership_guard or (lambda: None)
         self.runtime_environment = RuntimeEnvironment.from_env()
         self._system_state_key = self.runtime_environment.key("system:state")
         self._system_boot_state_key = self.runtime_environment.key(
@@ -252,7 +267,10 @@ class StrategyEngine:
         self._startup_lock_cause: str | None = None
         if adapter is None:
             try:
-                adapter = create_adapter(effective_adapter_config)
+                adapter = create_adapter(
+                    effective_adapter_config,
+                    operation_guard=self._leadership_guard,
+                )
                 logger.info("StrategyEngine: Using %s", type(adapter).__name__)
             except Exception as e:
                 logger.critical("Failed to init adapter: %s. NOT falling back silently.", e)
@@ -304,6 +322,7 @@ class StrategyEngine:
             account_service=self.account_service,
             rithmic_account_profile=self._rithmic_recovery_profile,
             rithmic_account_id=self._rithmic_recovery_account_id,
+            operation_guard=self._assert_runtime_leadership,
         )
         self._rithmic_recovery_profile = (
             self.execution_engine.order_manager.rithmic_account_profile
@@ -370,51 +389,102 @@ class StrategyEngine:
         self._order_event_stop = threading.Event()
         self.executor = ThreadPoolExecutor(max_workers=5)
 
-    def startup(self):
+    def startup(
+        self,
+        *,
+        leadership_guard: Callable[[], None] | None = None,
+    ):
         """
         Runs startup checks and starts background services.
         """
+        guard = leadership_guard or self._leadership_guard
+
+        def run_phase(phase):
+            try:
+                guard()
+            except Exception:
+                self._halt_for_kill_switch()
+                raise
+            try:
+                result = phase()
+            except Exception:
+                self._halt_for_kill_switch()
+                raise
+            try:
+                guard()
+            except Exception:
+                self._halt_for_kill_switch()
+                raise
+            return result
+
         # Start fail-closed so the command listener can accept a manual clear
         # while startup waits on a persisted LOCKDOWN state.
-        self._halt_for_kill_switch()
-        self._start_command_listener()
-        with self._ops_command_lock:
-            persisted_lockdown = self._check_system_state()
-        self._reconcile_balance()
-        self._initialize_strategy_state_cache_on_startup()
-        self._start_strategy_state_subscriber_on_startup()
-        reconciliation = self._reconcile_recoverable_orders_on_startup()
-        self._start_exchange_order_event_stream()
-        if isinstance(self.execution_engine.adapter, RithmicExchangeAdapter) and not (
-            reconciliation and reconciliation.get("auto_resume_safe") is True
-        ):
-            self._halt_for_kill_switch()
-            self._startup_lock_cause = "rithmic_reconciliation_blocked"
-            persisted_lockdown = True
-        if persisted_lockdown:
-            if self._can_auto_resume_after_startup_recovery(reconciliation):
-                self._resume_after_kill_switch()
-                persisted_lockdown = False
-                logger.info("Startup reconciliation passed; submissions resumed automatically")
-            elif self._startup_lock_cause == "explicit_lockdown":
-                with self._ops_command_lock:
-                    if self._kill_switch_halted:
-                        self._run_ops_kill_switch(
-                            actor="startup_recovery",
-                            reason="persisted_lockdown",
-                        )
-        self._start_heartbeat()
+        run_phase(self._halt_for_kill_switch)
+        run_phase(self._start_command_listener)
+
+        def check_system_state() -> bool:
+            with self._ops_command_lock:
+                return self._check_system_state()
+
+        persisted_lockdown = run_phase(check_system_state)
+        run_phase(self._reconcile_balance)
+        run_phase(self._initialize_strategy_state_cache_on_startup)
+        run_phase(self._start_strategy_state_subscriber_on_startup)
+        reconciliation = run_phase(self._reconcile_recoverable_orders_on_startup)
+        run_phase(self._start_exchange_order_event_stream)
+
+        def apply_reconciliation_result() -> bool:
+            lockdown = persisted_lockdown
+            if isinstance(
+                self.execution_engine.adapter,
+                RithmicExchangeAdapter,
+            ) and not (
+                reconciliation and reconciliation.get("auto_resume_safe") is True
+            ):
+                self._halt_for_kill_switch()
+                self._startup_lock_cause = "rithmic_reconciliation_blocked"
+                lockdown = True
+            if lockdown:
+                if self._can_auto_resume_after_startup_recovery(reconciliation):
+                    self._resume_after_kill_switch()
+                    lockdown = False
+                    logger.info(
+                        "Startup reconciliation passed; submissions resumed "
+                        "automatically"
+                    )
+                elif self._startup_lock_cause == "explicit_lockdown":
+                    with self._ops_command_lock:
+                        if self._kill_switch_halted:
+                            self._run_ops_kill_switch(
+                                actor="startup_recovery",
+                                reason="persisted_lockdown",
+                            )
+            return lockdown
+
+        run_phase(apply_reconciliation_result)
+        run_phase(self._start_heartbeat)
         if self._runtime_reconciliation_enabled:
-            self._start_runtime_reconciliation()
+            run_phase(self._start_runtime_reconciliation)
         
         # Initial scan to discover strategies
-        self.scan_strategies()
+        run_phase(self.scan_strategies)
         if not self._kill_switch_halted:
-            self._restore_active_strategies_on_startup()
+            run_phase(self._restore_active_strategies_on_startup)
 
     def _initialize_strategy_state_cache_on_startup(self) -> None:
         """Load strategy lifecycle state into the manager cache."""
         self._strategy_state_manager.initialize_cache_from_db()
+
+    def _assert_runtime_leadership(self) -> None:
+        """Fence every background side-effect path after lease handoff."""
+        try:
+            self._leadership_guard()
+        except Exception:
+            self._halt_for_kill_switch()
+            self.running = False
+            self._order_event_stop.set()
+            self._runtime_reconcile_stop.set()
+            raise
 
     def _start_strategy_state_subscriber_on_startup(self) -> None:
         """Listen for cross-process strategy state updates."""
@@ -443,6 +513,7 @@ class StrategyEngine:
         def order_event_loop() -> None:
             while self.running and not self._order_event_stop.is_set():
                 try:
+                    self._assert_runtime_leadership()
                     if isinstance(adapter, RithmicExchangeAdapter):
                         if not self._reconcile_owned_orders_on_reconnect():
                             self._order_event_stop.wait(1.0)
@@ -451,7 +522,9 @@ class StrategyEngine:
                     if event is None:
                         self._order_event_stop.wait(0.05)
                         continue
+                    self._assert_runtime_leadership()
                     result = self.execution_engine.process_exchange_order_event(event)
+                    self._assert_runtime_leadership()
                     if isinstance(adapter, RithmicExchangeAdapter):
                         action = str(result.get("action") or "")
                         if action == "unknown_order":
@@ -470,6 +543,10 @@ class StrategyEngine:
                                 event=event,
                             )
                 except RithmicUnmappedOrderEvent as error:
+                    try:
+                        self._assert_runtime_leadership()
+                    except Exception:
+                        return
                     self._lockdown_for_external_order(
                         account_id=error.account_id,
                         exchange=error.exchange,
@@ -567,6 +644,7 @@ class StrategyEngine:
         thread = self.order_event_thread
         if thread is not None and thread.is_alive():
             thread.join(timeout=30.0)
+            self._assert_runtime_leadership()
             if thread.is_alive():
                 logger.error(
                     "Rithmic clear reconciliation timed out stopping the order event stream"
@@ -578,6 +656,7 @@ class StrategyEngine:
             logger.error(
                 "Rithmic clear reconciliation timed out draining in-flight submissions"
             )
+            self._assert_runtime_leadership()
             try:
                 self._start_exchange_order_event_stream()
             except Exception:
@@ -585,6 +664,7 @@ class StrategyEngine:
                     "Order stream restart failed after reconciliation drain timeout"
                 )
                 return False, None
+            self._assert_runtime_leadership()
             self.execution_engine.resume_after_reconcile()
             return False, None
 
@@ -601,6 +681,7 @@ class StrategyEngine:
         with self._rithmic_external_order_drift_lock:
             drift_generation = self._rithmic_external_order_drift_generation
 
+        self._assert_runtime_leadership()
         try:
             self._start_exchange_order_event_stream()
         except Exception:
@@ -608,6 +689,7 @@ class StrategyEngine:
                 "Order stream restart failed after external-order reconciliation"
             )
             return False, None
+        self._assert_runtime_leadership()
 
         if not summary or summary.get("auto_resume_safe") is not True:
             self.execution_engine.resume_after_reconcile()
@@ -621,8 +703,10 @@ class StrategyEngine:
             logger.exception(
                 "Rithmic clear account reconciliation failed; lockdown remains active"
             )
+            self._assert_runtime_leadership()
             self.execution_engine.resume_after_reconcile()
             return False, None
+        self._assert_runtime_leadership()
         return True, drift_generation
 
     def _run_ops_kill_switch(
@@ -1007,6 +1091,13 @@ class StrategyEngine:
             )
             return False
         try:
+            self._assert_runtime_leadership()
+        except Exception:
+            # The authoritative snapshot belongs to the lease generation that
+            # requested it. A successor must perform its own reconciliation.
+            adapter.close()
+            raise
+        try:
             adapter.start_order_event_stream()
         except Exception:
             logger.exception(
@@ -1014,6 +1105,15 @@ class StrategyEngine:
             )
             adapter.close()
             return False
+
+        try:
+            self._assert_runtime_leadership()
+        except Exception:
+            # Do not publish completion for a runtime that lost its lease while
+            # restarting the stream. Keep the pending generation for retry by
+            # the new owner.
+            adapter.close()
+            raise
 
         # This is a new runtime, whose first successful connection is generation
         # 1. Any subsequent bump is another reconnect and will be observed here.
@@ -1046,6 +1146,10 @@ class StrategyEngine:
                     break
                 if message['type'] == 'message':
                     try:
+                        self._assert_runtime_leadership()
+                    except Exception:
+                        return
+                    try:
                         data = json.loads(message['data'])
                         self.executor.submit(self._handle_command, data)
                     except Exception as e:
@@ -1058,6 +1162,7 @@ class StrategyEngine:
         """
         Routes commands to specific handlers.
         """
+        self._assert_runtime_leadership()
         cmd = str(data.get("command") or data.get("cmd") or "").upper()
         params = data.get("params") or {}
         if not isinstance(params, dict):
@@ -1153,14 +1258,18 @@ class StrategyEngine:
                             "Kill switch clear rejected: rithmic_reconciliation_required"
                         )
                         return
+                    self._assert_runtime_leadership()
 
                     def persist_clear() -> None:
+                        self._assert_runtime_leadership()
                         self.ops_safety.persist_kill_switch_state(
                             SYSTEM_STATE_OK,
                             actor=actor,
                             reason=reason,
                         )
+                        self._assert_runtime_leadership()
                         self.redis_client.set(self._system_state_key, SYSTEM_STATE_OK)
+                        self._assert_runtime_leadership()
 
                     clear_succeeded = False
                     try:
@@ -1169,6 +1278,7 @@ class StrategyEngine:
                         )
                         clear_succeeded = bool(result["cleared"])
                         if drift_generation is None and clear_succeeded:
+                            self._assert_runtime_leadership()
                             self._kill_switch_halted = False
                         elif not clear_succeeded:
                             logger.warning(
@@ -1183,6 +1293,7 @@ class StrategyEngine:
                                     != drift_generation
                                 )
                                 if clear_succeeded and not drift_advanced:
+                                    self._assert_runtime_leadership()
                                     self._rithmic_external_order_drift_pending = False
                                     self._kill_switch_halted = False
                                 elif drift_advanced:
@@ -1192,6 +1303,7 @@ class StrategyEngine:
                                 self._persist_rithmic_external_order_lockdown(
                                     "rithmic_external_order_detected_during_clear"
                                 )
+                            self._assert_runtime_leadership()
                             self.execution_engine.resume_after_reconcile()
             else:
                 result = self._command_router.handle(data)
@@ -1407,6 +1519,8 @@ class StrategyEngine:
                 strategy_cls = self.loaded_classes[strategy_id]
                 instance = strategy_cls(strategy_id, product_id)
                 self._warm_up_strategy_instance(db, instance)
+                if self.runtime_environment.identity == "live":
+                    self._fresh_strategy_instance_for_replay(instance)
                 # Registration must follow warm-up — on restart-restore the lifecycle
                 # cache is already ACTIVE, so a registered instance is immediately
                 # live to on_market_data and could emit signals from partial state.
@@ -1450,7 +1564,13 @@ class StrategyEngine:
             )
         return product_id
 
-    def _warm_up_strategy_instance(self, db: Session, instance: BaseStrategy) -> int:
+    def _warm_up_strategy_instance(
+        self,
+        db: Session,
+        instance: BaseStrategy,
+        *,
+        before_timestamp: int | None = None,
+    ) -> int:
         """Replay recent candles into a strategy without emitting signals."""
         reqs = instance.requirements
         lookback = max(int(reqs.lookback_window), 0)
@@ -1460,13 +1580,14 @@ class StrategyEngine:
             self._sync_strategy_position_state(instance)
             return 0
 
+        query = db.query(ORMCandlestick).filter(
+            ORMCandlestick.product_id == reqs.product_id,
+            ORMCandlestick.timeframe == reqs.timeframe,
+        )
+        if before_timestamp is not None:
+            query = query.filter(ORMCandlestick.timestamp < before_timestamp)
         rows = (
-            db.query(ORMCandlestick)
-            .filter(
-                ORMCandlestick.product_id == reqs.product_id,
-                ORMCandlestick.timeframe == reqs.timeframe,
-            )
-            .order_by(ORMCandlestick.timestamp.desc())
+            query.order_by(ORMCandlestick.timestamp.desc())
             .limit(lookback)
             .all()
         )
@@ -1493,6 +1614,369 @@ class StrategyEngine:
         self._signal_processor.warm_up(instance, candles)
         self._sync_strategy_position_state(instance)
         return len(candles)
+
+    def _rewind_for_pending_market_replay(
+        self,
+        models: Sequence[Union[Candlestick, Trade]],
+    ) -> None:
+        """Rebuild affected strategies to immediately before pending candles."""
+        if not models:
+            return
+        if any(not isinstance(model, Candlestick) for model in models):
+            raise RuntimeError(
+                "pending trade replay has no durable strategy-state boundary"
+            )
+
+        replacements: list[BaseStrategy] = []
+        with self._db_session_factory() as db:
+            cutoffs: dict[tuple[str, str], int] = {}
+            for model in models:
+                assert isinstance(model, Candlestick)
+                if self._live_candle_was_applied(model, db=db):
+                    continue
+                self._assert_live_candle_is_newer(model, db=db)
+                key = (model.product_id, model.timeframe)
+                cutoffs[key] = min(
+                    cutoffs.get(key, model.timestamp),
+                    model.timestamp,
+                )
+            for current in self._registry.list_active():
+                cutoff = cutoffs.get(
+                    (
+                        current.product_id,
+                        current.requirements.timeframe,
+                    )
+                )
+                if cutoff is None:
+                    continue
+                replacement = self._fresh_strategy_instance_for_replay(current)
+                self._warm_up_strategy_instance(
+                    db,
+                    replacement,
+                    before_timestamp=cutoff,
+                )
+                replacements.append(replacement)
+        for replacement in replacements:
+            self._register_strategy_instance(replacement)
+
+    @staticmethod
+    def _fresh_strategy_instance_for_replay(
+        current: BaseStrategy,
+    ) -> BaseStrategy:
+        current_configuration = current.replay_configuration()
+        replacement = current.fresh_instance_for_replay()
+        if (
+            replacement is current
+            or type(replacement) is not type(current)
+            or replacement.strategy_id != current.strategy_id
+            or replacement.product_id != current.product_id
+            or replacement.requirements != current.requirements
+            or replacement.replay_configuration() != current_configuration
+        ):
+            raise RuntimeError(
+                "strategy recovery factory did not return a distinct "
+                "compatible instance: "
+                f"{current.strategy_id}"
+            )
+        return replacement
+
+    def _rebuild_strategies_through_applied_candle(
+        self,
+        candle: Candlestick,
+    ) -> None:
+        """Synchronize local strategy memory without repeating side effects."""
+        replacements: list[BaseStrategy] = []
+        with self._db_session_factory() as db:
+            if not self._live_candle_was_applied(candle, db=db):
+                raise RuntimeError(
+                    "cannot rebuild strategy through an unapplied candle"
+                )
+            for current in self._registry.list_active():
+                if (
+                    current.product_id != candle.product_id
+                    or current.requirements.timeframe != candle.timeframe
+                ):
+                    continue
+                replacement = self._fresh_strategy_instance_for_replay(current)
+                self._warm_up_strategy_instance(
+                    db,
+                    replacement,
+                    before_timestamp=candle.timestamp + 1,
+                )
+                replacements.append(replacement)
+        for replacement in replacements:
+            self._register_strategy_instance(replacement)
+
+    @staticmethod
+    def _candle_values(candle: Candlestick) -> tuple[Decimal, ...]:
+        return (
+            candle.open,
+            candle.high,
+            candle.low,
+            candle.close,
+            candle.volume,
+        )
+
+    @staticmethod
+    def _persisted_candle_values(candle: ORMCandlestick) -> tuple[Decimal, ...]:
+        return (
+            Decimal(str(candle.open)),
+            Decimal(str(candle.high)),
+            Decimal(str(candle.low)),
+            Decimal(str(candle.close)),
+            Decimal(str(candle.volume)),
+        )
+
+    @staticmethod
+    def _application_values(
+        application: MarketDataApplication,
+    ) -> tuple[Decimal, ...]:
+        return (
+            Decimal(str(application.open)),
+            Decimal(str(application.high)),
+            Decimal(str(application.low)),
+            Decimal(str(application.close)),
+            Decimal(str(application.volume)),
+        )
+
+    def _application_identity(self, candle: Candlestick) -> tuple[str, str, str, int]:
+        return (
+            self.runtime_environment.identity,
+            candle.product_id,
+            candle.timeframe,
+            candle.timestamp,
+        )
+
+    def _live_candle_was_applied(
+        self,
+        candle: Candlestick,
+        *,
+        db: Session | None = None,
+    ) -> bool:
+        if self.runtime_environment.identity != "live":
+            return False
+        if db is None:
+            with self._db_session_factory() as owned_db:
+                return self._live_candle_was_applied(candle, db=owned_db)
+
+        application = db.get(
+            MarketDataApplication,
+            self._application_identity(candle),
+        )
+        if application is None:
+            return False
+        if self._application_values(application) != self._candle_values(candle):
+            raise RuntimeError(
+                "live application receipt conflicts with market payload: "
+                f"{candle.product_id}:{candle.timeframe}:{candle.timestamp}"
+            )
+        persisted = db.get(
+            ORMCandlestick,
+            (
+                candle.product_id,
+                candle.timeframe,
+                candle.timestamp,
+            ),
+        )
+        if (
+            persisted is None
+            or self._persisted_candle_values(persisted)
+            != self._candle_values(candle)
+        ):
+            raise RuntimeError(
+                "live application receipt has no matching canonical candle: "
+                f"{candle.product_id}:{candle.timeframe}:{candle.timestamp}"
+            )
+        return True
+
+    def _assert_live_candle_is_newer(
+        self,
+        candle: Candlestick,
+        *,
+        db: Session | None = None,
+    ) -> None:
+        if self.runtime_environment.identity != "live":
+            return
+        if db is None:
+            with self._db_session_factory() as owned_db:
+                self._assert_live_candle_is_newer(candle, db=owned_db)
+            return
+        latest_timestamp = (
+            db.query(func.max(MarketDataApplication.timestamp))
+            .filter(
+                MarketDataApplication.environment
+                == self.runtime_environment.identity,
+                MarketDataApplication.product_id == candle.product_id,
+                MarketDataApplication.timeframe == candle.timeframe,
+            )
+            .scalar()
+        )
+        if latest_timestamp is not None and candle.timestamp <= int(latest_timestamp):
+            raise RuntimeError(
+                "live candle application is out of order: "
+                f"{candle.product_id}:{candle.timeframe}:"
+                f"latest={latest_timestamp}:received={candle.timestamp}"
+            )
+
+    def _persist_live_candle(self, candle: Candlestick) -> None:
+        if self.runtime_environment.identity != "live":
+            return
+        with self._db_session_factory() as db:
+            try:
+                ensure_product_registered(db, candle.product_id)
+                identity = (
+                    candle.product_id,
+                    candle.timeframe,
+                    candle.timestamp,
+                )
+                existing = db.get(ORMCandlestick, identity)
+                if existing is None:
+                    db.add(
+                        ORMCandlestick(
+                            product_id=candle.product_id,
+                            timeframe=candle.timeframe,
+                            timestamp=candle.timestamp,
+                            open=candle.open,
+                            high=candle.high,
+                            low=candle.low,
+                            close=candle.close,
+                            volume=candle.volume,
+                        )
+                    )
+                else:
+                    if self._persisted_candle_values(
+                        existing
+                    ) != self._candle_values(candle):
+                        raise RuntimeError(
+                            "live candle conflicts with canonical history: "
+                            f"{candle.product_id}:{candle.timeframe}:"
+                            f"{candle.timestamp}"
+                        )
+                application = db.get(
+                    MarketDataApplication,
+                    self._application_identity(candle),
+                )
+                if application is not None:
+                    raise RuntimeError(
+                        "live application receipt appeared concurrently: "
+                        f"{candle.product_id}:{candle.timeframe}:"
+                        f"{candle.timestamp}"
+                    )
+                db.add(
+                    MarketDataApplication(
+                        environment=self.runtime_environment.identity,
+                        product_id=candle.product_id,
+                        timeframe=candle.timeframe,
+                        timestamp=candle.timestamp,
+                        open=candle.open,
+                        high=candle.high,
+                        low=candle.low,
+                        close=candle.close,
+                        volume=candle.volume,
+                    )
+                )
+                db.commit()
+            except Exception:
+                db.rollback()
+                raise
+
+    def _assert_live_candle_compatible(self, candle: Candlestick) -> None:
+        if self.runtime_environment.identity != "live":
+            return
+        with self._db_session_factory() as db:
+            existing = db.get(
+                ORMCandlestick,
+                (
+                    candle.product_id,
+                    candle.timeframe,
+                    candle.timestamp,
+                ),
+            )
+            if existing is None:
+                return
+            if self._persisted_candle_values(existing) != self._candle_values(candle):
+                raise RuntimeError(
+                    "live candle conflicts with canonical history: "
+                    f"{candle.product_id}:{candle.timeframe}:"
+                    f"{candle.timestamp}"
+                )
+
+    @contextmanager
+    def _live_candle_application_fence(
+        self,
+        candle: Candlestick,
+    ) -> Iterator[None]:
+        if self.runtime_environment.identity != "live":
+            yield
+            return
+        lock_material = (
+            f"{self.runtime_environment.identity}\0{candle.product_id}\0"
+            f"{candle.timeframe}\0{candle.timestamp}"
+        ).encode()
+        lock_key = int.from_bytes(
+            hashlib.sha256(lock_material).digest()[:8],
+            byteorder="big",
+            signed=True,
+        )
+        with self._db_session_factory() as db:
+            dialect = db.get_bind().dialect.name
+            if dialect == "sqlite":
+                # SQLite is used only by process-local tests. Production
+                # deployment is PostgreSQL and uses the cross-process fence.
+                yield
+                return
+            if dialect != "postgresql":
+                raise RuntimeError(
+                    "live market recovery requires PostgreSQL advisory locks"
+                )
+            deadline = time.monotonic() + LIVE_CANDLE_FENCE_TIMEOUT_SECONDS
+            while not db.execute(
+                text("SELECT pg_try_advisory_lock(:lock_key)"),
+                {"lock_key": lock_key},
+            ).scalar():
+                if time.monotonic() >= deadline:
+                    raise RuntimeError(
+                        "timed out acquiring live candle application fence"
+                    )
+                time.sleep(0.05)
+            try:
+                yield
+            finally:
+                unlocked = db.execute(
+                    text("SELECT pg_advisory_unlock(:lock_key)"),
+                    {"lock_key": lock_key},
+                ).scalar()
+                if unlocked is not True:
+                    raise RuntimeError(
+                        "failed to release live candle application fence"
+                    )
+
+    def _apply_candle_at_fenced_boundary(self, candle: Candlestick) -> None:
+        if self._live_candle_was_applied(candle):
+            self._rebuild_strategies_through_applied_candle(candle)
+            return
+        self._assert_live_candle_is_newer(candle)
+        self._assert_live_candle_compatible(candle)
+        self.execution_engine.process_market_data(candle)
+        self._signal_processor.on_candle(candle)
+        self._persist_live_candle(candle)
+
+    def replay_pending_market_data(
+        self,
+        data: Union[Candlestick, Trade],
+    ) -> None:
+        """Recover one claimed candle under the durable application fence."""
+        if not isinstance(data, Candlestick):
+            raise RuntimeError(
+                "pending trade replay has no durable strategy-state boundary"
+            )
+        with self._market_processing_lock:
+            with self._live_candle_application_fence(data):
+                if self._live_candle_was_applied(data):
+                    self._rebuild_strategies_through_applied_candle(data)
+                    return
+                self._rewind_for_pending_market_replay([data])
+                self._apply_candle_at_fenced_boundary(data)
 
     def _sync_strategy_position_state(self, instance: BaseStrategy) -> None:
         """Align warmed strategy trade flags with the current account position."""
@@ -1716,6 +2200,10 @@ class StrategyEngine:
             logger.info("💓 Heartbeat Service Started.")
             while self.running:
                 try:
+                    self._assert_runtime_leadership()
+                except Exception:
+                    return
+                try:
                     self.redis_client.setex(
                         self._heartbeat_key,
                         3,
@@ -1761,12 +2249,20 @@ class StrategyEngine:
                 return
             while self.running and not self._runtime_reconcile_stop.is_set():
                 try:
+                    self._assert_runtime_leadership()
+                except Exception:
+                    return
+                try:
                     if is_rithmic:
                         self._run_rithmic_runtime_reconciliation_once()
                     else:
                         self.runtime_reconciliation_job.run_once()
                 except Exception as e:
                     logger.error("Runtime reconciliation loop failed: %s", e)
+                try:
+                    self._assert_runtime_leadership()
+                except Exception:
+                    return
                 if self._runtime_reconcile_stop.wait(interval):
                     break
 
@@ -1816,6 +2312,11 @@ class StrategyEngine:
                 failure_reason = "rithmic_runtime_reconciliation_failed"
 
             try:
+                self._assert_runtime_leadership()
+            except Exception:
+                adapter.close()
+                raise
+            try:
                 self._start_exchange_order_event_stream()
             except Exception:
                 logger.exception(
@@ -1824,10 +2325,20 @@ class StrategyEngine:
                 adapter.close()
                 failure_reason = "rithmic_runtime_reconciliation_stream_restart_failed"
 
+            try:
+                self._assert_runtime_leadership()
+            except Exception:
+                adapter.close()
+                raise
             if failure_reason is not None:
                 self._lockdown_for_rithmic_order_drift(failure_reason)
                 return False
 
+            try:
+                self._assert_runtime_leadership()
+            except Exception:
+                adapter.close()
+                raise
             self.execution_engine.resume_after_reconcile()
             logger.info(
                 "Periodic Rithmic reconciliation complete: %s recoverable orders",
@@ -1853,6 +2364,8 @@ class StrategyEngine:
         """
         Legacy support for static registration.
         """
+        if self.runtime_environment.identity == "live":
+            self._fresh_strategy_instance_for_replay(strategy)
         with self._strategy_lock:
             if strategy.product_id not in self.strategies:
                 self.strategies[strategy.product_id] = []
@@ -1883,9 +2396,8 @@ class StrategyEngine:
         """
         with self._market_processing_lock:
             if isinstance(data, Candlestick):
-                # Simulation/Backtest: check fills before strategy signals can create new orders.
-                self.execution_engine.process_market_data(data)
-                self._signal_processor.on_candle(data)
+                with self._live_candle_application_fence(data):
+                    self._apply_candle_at_fenced_boundary(data)
                 return
             if isinstance(data, Trade):
                 self._signal_processor.on_trade(data)
@@ -1988,8 +2500,10 @@ class StrategyEngine:
                 if order.strategy_id == signal.strategy_id
                 and order.product_id == signal.product_id
             ]
+            self._assert_runtime_leadership()
             adapter.start_order_event_stream()
             for order in active_orders:
+                self._assert_runtime_leadership()
                 if order.status == OrderStatus.NEW.value:
                     self.execution_engine.order_manager.fail_order(
                         order,
@@ -2014,6 +2528,7 @@ class StrategyEngine:
                     )
                 if remote.status in {"filled", "cancelled", "rejected"}:
                     continue
+                self._assert_runtime_leadership()
                 if not adapter.cancel_order(
                     remote.exchange_order_id,
                     order.product_id,
@@ -2052,6 +2567,7 @@ class StrategyEngine:
                 raise RuntimeError(
                     "rithmic_strategy_exit_preflight_reconciliation_blocked"
                 )
+            self._assert_runtime_leadership()
             self.account_service.replace_positions_for_products(
                 positions,
                 adapter.configured_product_ids,
@@ -2084,6 +2600,7 @@ class StrategyEngine:
                         f"expected_quantity={decision.position_quantity} "
                         f"remote_quantity={remote_position.quantity}"
                     )
+                self._assert_runtime_leadership()
                 adapter.start_order_event_stream()
                 self.execution_engine.exit_authoritative_position(
                     signal.product_id,
@@ -2091,6 +2608,7 @@ class StrategyEngine:
                 )
 
             for _attempt in range(6):
+                self._assert_runtime_leadership()
                 snapshot = load_snapshot()
                 remaining_positions = adapter.positions_from_ledger_snapshot(snapshot)
                 working_orders_remain = any(
@@ -2104,6 +2622,7 @@ class StrategyEngine:
                     self._rithmic_recovery_account_id,
                     snapshot_loader=lambda *_args, **_kwargs: snapshot,
                 )
+                self._assert_runtime_leadership()
                 self.account_service.replace_positions_for_products(
                     remaining_positions,
                     adapter.configured_product_ids,
@@ -2139,8 +2658,10 @@ class StrategyEngine:
             raise
         finally:
             try:
+                self._assert_runtime_leadership()
                 self._start_exchange_order_event_stream()
             except Exception:
+                adapter.close()
                 logger.exception(
                     "Rithmic strategy exit failed to restart order event stream"
                 )
@@ -2155,7 +2676,12 @@ class StrategyEngine:
             raise RuntimeError("rithmic_strategy_exit_outcome_missing")
         return outcome
 
-    def shutdown(self, timeout: float = 30.0):
+    def shutdown(
+        self,
+        timeout: float = 30.0,
+        *,
+        clean_exit: bool = False,
+    ):
         """Graceful shutdown: stop threads, drain executor, close Redis."""
         logger.info("StrategyEngine shutting down...")
         self.running = False
@@ -2180,6 +2706,8 @@ class StrategyEngine:
         self._strategy_state_manager.shutdown()
 
         if (
+            clean_exit
+            and
             self._boot_started
             and not self._kill_switch_halted
             and not self.ops_safety.recovery_pending

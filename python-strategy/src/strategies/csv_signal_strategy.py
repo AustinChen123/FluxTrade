@@ -1,6 +1,9 @@
 """Strategy that replays pre-computed signals from a CSV file."""
 import csv
+import hashlib
+import io
 from decimal import Decimal, InvalidOperation
+from pathlib import Path
 from typing import Dict, Optional
 from src.strategies.base import BaseStrategy, StrategyRequirements
 from src.core.models import Candlestick, Signal, SignalType
@@ -45,37 +48,42 @@ class CsvSignalStrategy(BaseStrategy):
         lookback_window: int = 1,
     ):
         super().__init__(strategy_id, product_id)
+        self._csv_path = csv_path
         self._timeframe = timeframe
         self._lookback_window = lookback_window
-        self._signals: Dict[int, Signal] = self._load_signals(csv_path)
+        source = Path(csv_path).read_bytes()
+        self._source_digest = hashlib.sha256(source).hexdigest()
+        self._signals: Dict[int, Signal] = self._load_signals(source, csv_path)
 
-    def _load_signals(self, path: str) -> Dict[int, Signal]:
+    def _load_signals(self, source: bytes, path: str) -> Dict[int, Signal]:
         signals: Dict[int, Signal] = {}
-        with open(path, newline="") as f:
-            reader = csv.DictReader(f)
-            for row in reader:
-                ts = int(row["timestamp"].strip())
-                type_str = row["type"].strip()
-                try:
-                    signal_type = SignalType(type_str)
-                except ValueError:
-                    raise ValueError(
-                        f"Invalid signal type '{type_str}' at timestamp {ts}. "
-                        f"Valid types: {[t.value for t in SignalType]}"
-                    )
-
-                signals[ts] = Signal(
-                    strategy_id=self.strategy_id,
-                    product_id=self.product_id,
-                    timeframe=self._timeframe,
-                    timestamp=ts,
-                    type=signal_type,
-                    price=_parse_decimal(row.get("price", ""), "price"),
-                    stop_loss=_parse_decimal(row.get("stop_loss", ""), "stop_loss"),
-                    take_profit=_parse_decimal(row.get("take_profit", ""), "take_profit"),
-                    trailing_distance=_parse_decimal(row.get("trailing_distance", ""), "trailing_distance"),
-                    quantity=_parse_decimal(row.get("quantity", ""), "quantity"),
+        reader = csv.DictReader(io.StringIO(source.decode("utf-8"), newline=""))
+        for row in reader:
+            ts = int(row["timestamp"].strip())
+            type_str = row["type"].strip()
+            try:
+                signal_type = SignalType(type_str)
+            except ValueError:
+                raise ValueError(
+                    f"Invalid signal type '{type_str}' at timestamp {ts}. "
+                    f"Valid types: {[t.value for t in SignalType]}"
                 )
+
+            signals[ts] = Signal(
+                strategy_id=self.strategy_id,
+                product_id=self.product_id,
+                timeframe=self._timeframe,
+                timestamp=ts,
+                type=signal_type,
+                price=_parse_decimal(row.get("price", ""), "price"),
+                stop_loss=_parse_decimal(row.get("stop_loss", ""), "stop_loss"),
+                take_profit=_parse_decimal(row.get("take_profit", ""), "take_profit"),
+                trailing_distance=_parse_decimal(
+                    row.get("trailing_distance", ""),
+                    "trailing_distance",
+                ),
+                quantity=_parse_decimal(row.get("quantity", ""), "quantity"),
+            )
 
         if not signals:
             raise ValueError(f"CSV '{path}' contains no signals (empty or header-only)")
@@ -87,6 +95,23 @@ class CsvSignalStrategy(BaseStrategy):
             product_id=self.product_id,
             timeframe=self._timeframe,
             lookback_window=self._lookback_window,
+        )
+
+    def fresh_instance_for_replay(self) -> BaseStrategy:
+        return type(self)(
+            self.strategy_id,
+            self._csv_path,
+            self.product_id,
+            self._timeframe,
+            self._lookback_window,
+        )
+
+    def replay_configuration(self) -> object:
+        return (
+            self._csv_path,
+            self._timeframe,
+            self._lookback_window,
+            self._source_digest,
         )
 
     def on_candle(self, candle: Candlestick) -> Signal:

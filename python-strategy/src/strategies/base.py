@@ -49,6 +49,18 @@ class BaseStrategy(ABC):
         """
         return None
 
+    def fresh_instance_for_replay(self) -> "BaseStrategy":
+        """Create an empty instance with the same runtime configuration."""
+        raise NotImplementedError(
+            "strategy does not define a pending-market replay factory"
+        )
+
+    def replay_configuration(self) -> object:
+        """Return a stable, equality-comparable recovery configuration."""
+        raise NotImplementedError(
+            "strategy does not define a pending-market replay configuration"
+        )
+
     def snapshot_walk_forward_trade_state(self) -> object:
         """Capture all state that a warm-up replay must not carry into scoring.
 

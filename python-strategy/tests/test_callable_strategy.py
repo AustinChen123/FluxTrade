@@ -96,3 +96,39 @@ class TestCallableStrategy:
         strat = CallableStrategy("crash", bad_predict, PRODUCT_ID, TIMEFRAME)
         with pytest.raises(RuntimeError, match="Model crashed"):
             strat.on_candle(_make_candle())
+
+    def test_replay_requires_explicit_predictor_factory(self):
+        strat = CallableStrategy(
+            "stateful",
+            lambda candle: None,
+            PRODUCT_ID,
+            TIMEFRAME,
+        )
+
+        with pytest.raises(
+            NotImplementedError,
+            match="explicit replay_predict_factory",
+        ):
+            strat.fresh_instance_for_replay()
+
+    def test_replay_factory_rebuilds_predictor_with_stable_config(self):
+        def build_predictor():
+            return lambda candle: None
+
+        strat = CallableStrategy(
+            "replayable",
+            build_predictor(),
+            PRODUCT_ID,
+            TIMEFRAME,
+            replay_predict_factory=build_predictor,
+            replay_config=("model", "v1"),
+        )
+
+        replacement = strat.fresh_instance_for_replay()
+
+        assert replacement is not strat
+        assert replacement.replay_configuration() == (
+            TIMEFRAME,
+            1,
+            ("model", "v1"),
+        )

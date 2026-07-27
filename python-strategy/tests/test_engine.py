@@ -40,6 +40,7 @@ from src.core.adapters.rithmic_adapter import (
 from src.core.adapters.simulated import SimulatedAdapter
 from src.core.product_registry import InstrumentSpec
 from src.core.engine import (
+    SYSTEM_STATE_OK,
     StrategyEngine,
     _is_runtime_reconciliation_enabled,
     _kill_switch_result_is_complete,
@@ -52,6 +53,7 @@ from src.core.interfaces.exchange import (
     NetworkError,
 )
 from src.core.strategy_state_manager import StrategyStateManager
+from src.core.runtime_environment import RuntimeEnvironment
 
 
 # =============================================================================
@@ -192,7 +194,8 @@ class TestEngineInit:
                 clock=mock_clock,
             )
 
-            mock_create.assert_called_once_with({"mode": "simulated"})
+            assert mock_create.call_args.args == ({"mode": "simulated"},)
+            assert callable(mock_create.call_args.kwargs["operation_guard"])
 
     def test_adapter_config_passed_through(self, mock_db_session, mock_clock):
         """Custom adapter_config should be forwarded to create_adapter."""
@@ -212,7 +215,8 @@ class TestEngineInit:
                 adapter_config=cfg,
             )
 
-            mock_create.assert_called_once_with(cfg)
+            assert mock_create.call_args.args == (cfg,)
+            assert callable(mock_create.call_args.kwargs["operation_guard"])
 
     def test_runtime_reconciliation_uses_configured_product_universe(
         self, mock_db_session, mock_clock
@@ -694,6 +698,41 @@ class TestProcessSignal:
 
         engine.execution_engine.execute_signal.assert_called_once()
 
+    def test_market_signal_is_fenced_after_leadership_loss(self, engine):
+        signal = Signal(
+            strategy_id="test",
+            product_id="BINANCE:BTCUSDT-PERP",
+            timeframe="1m",
+            timestamp=1704067200000,
+            type=SignalType.LONG,
+            value=Decimal("42000"),
+        )
+        owns_service = True
+
+        def check_risk_then_lose_leadership(*_args, **_kwargs):
+            nonlocal owns_service
+            owns_service = False
+            return True, "PASS"
+
+        def assert_leadership():
+            if not owns_service:
+                raise RuntimeError("leadership lost")
+
+        engine._leadership_guard = assert_leadership
+        engine.risk_manager.check_risk = MagicMock(
+            side_effect=check_risk_then_lose_leadership
+        )
+        engine.execution_engine.order_manager.create_order = MagicMock()
+        engine.execution_engine.adapter.place_order = MagicMock()
+
+        with pytest.raises(ExchangeError, match="external_operation_fenced"):
+            engine.process_signal(signal, _make_candle())
+
+        engine.execution_engine.order_manager.create_order.assert_not_called()
+        engine.execution_engine.adapter.place_order.assert_not_called()
+        assert engine.execution_engine._submissions_in_flight == 0
+        assert engine._kill_switch_halted is True
+
     def test_same_direction_entry_with_existing_position_still_uses_risk(self, engine):
         """Scale-ins are normal live signals and stay under risk-manager control."""
         signal = Signal(
@@ -871,6 +910,21 @@ class TestProcessSignal:
 
 
 class TestHandleCommand:
+
+    def test_queued_command_is_rejected_after_leadership_loss(self, engine):
+        engine._leadership_guard = MagicMock(
+            side_effect=RuntimeError("leadership lost")
+        )
+        engine.scan_strategies = MagicMock()
+
+        with pytest.raises(RuntimeError, match="leadership lost"):
+            engine._handle_command({"command": "SCAN"})
+
+        engine.scan_strategies.assert_not_called()
+        assert engine.running is False
+        assert engine._order_event_stop.is_set()
+        assert engine._runtime_reconcile_stop.is_set()
+        assert engine._kill_switch_halted is True
 
     def test_scan_command(self, engine):
         """SCAN command should call scan_strategies."""
@@ -1486,6 +1540,45 @@ class TestStrategyWarmup:
         assert instance._in_position is False
         engine.process_signal.assert_not_called()
         engine._strategy_state_manager.transition_to_running.assert_called_once()
+
+    def test_live_activation_rejects_strategy_without_replay_contract(
+        self,
+        engine,
+    ):
+        from src.strategies.base import BaseStrategy, StrategyRequirements
+
+        class UnrecoverableStrategy(BaseStrategy):
+            @property
+            def requirements(self):
+                return StrategyRequirements(self.product_id, "1m", 0)
+
+            def on_candle(self, candle, context=None):
+                return None
+
+        state = MagicMock()
+        state.status = StrategyStatus.READY
+        state.config_json = '{"product_id":"BINANCE:BTCUSDT-PERP"}'
+        mock_db = MagicMock()
+        mock_db.query.side_effect = lambda model: self._FakeQuery(
+            model,
+            state,
+            [],
+        )
+        engine._db_session_factory = lambda: nullcontext(mock_db)
+        engine.runtime_environment = RuntimeEnvironment("live")
+        engine.account_service.get_position = MagicMock(return_value=None)
+        engine.loaded_classes["test.py::UnrecoverableStrategy"] = (
+            UnrecoverableStrategy
+        )
+        engine._strategy_state_manager.transition_to_running = MagicMock()
+        engine._strategy_state_manager.transition_to_error = MagicMock()
+
+        engine.activate_strategy("test.py::UnrecoverableStrategy")
+
+        assert "test.py::UnrecoverableStrategy" not in engine.strategy_instances
+        engine._strategy_state_manager.transition_to_running.assert_not_called()
+        engine._strategy_state_manager.transition_to_error.assert_called_once()
+        assert "pending-market replay configuration" in state.performance_json
 
     def test_activate_strategy_fails_closed_when_warmup_replay_fails(self, engine):
         """Incomplete warm-up state must not transition a strategy to running."""
@@ -2157,6 +2250,91 @@ class TestPersistentKillSwitchState:
 
         engine.ops_safety.kill_switch.assert_not_called()
 
+    def test_startup_stops_after_leadership_loss_between_stateful_phases(
+        self,
+        engine,
+    ):
+        owns_service = True
+
+        def assert_leadership():
+            if not owns_service:
+                raise RuntimeError("leadership lost")
+
+        def reconcile_then_lose_leadership():
+            nonlocal owns_service
+            owns_service = False
+            return {
+                "recoverable_count": 0,
+                "unresolved_count": 0,
+                "verification_blocked_count": 0,
+                "auto_resume_safe": True,
+            }
+
+        engine._check_system_state = MagicMock(return_value=False)
+        engine._reconcile_recoverable_orders_on_startup = MagicMock(
+            side_effect=reconcile_then_lose_leadership
+        )
+        for name in (
+            "_start_command_listener",
+            "_reconcile_balance",
+            "_initialize_strategy_state_cache_on_startup",
+            "_start_strategy_state_subscriber_on_startup",
+            "_start_exchange_order_event_stream",
+            "_start_heartbeat",
+            "scan_strategies",
+            "_restore_active_strategies_on_startup",
+        ):
+            setattr(engine, name, MagicMock())
+
+        with pytest.raises(RuntimeError, match="leadership lost"):
+            engine.startup(leadership_guard=assert_leadership)
+
+        engine._start_exchange_order_event_stream.assert_not_called()
+        engine._start_heartbeat.assert_not_called()
+        engine.scan_strategies.assert_not_called()
+        assert engine._kill_switch_halted is True
+        assert engine.execution_engine._submissions_halted is True
+
+    def test_startup_phase_failure_halts_after_reconciliation_resume(
+        self,
+        engine,
+    ):
+        summary = {
+            "recoverable_count": 0,
+            "unresolved_count": 0,
+            "verification_blocked_count": 0,
+            "auto_resume_safe": True,
+        }
+        engine._check_system_state = MagicMock(return_value=True)
+        engine._can_auto_resume_after_startup_recovery = MagicMock(
+            return_value=True
+        )
+        engine._resume_after_kill_switch = MagicMock(
+            side_effect=lambda: setattr(engine, "_kill_switch_halted", False)
+        )
+        engine._reconcile_recoverable_orders_on_startup = MagicMock(
+            return_value=summary
+        )
+        for name in (
+            "_start_command_listener",
+            "_reconcile_balance",
+            "_initialize_strategy_state_cache_on_startup",
+            "_start_strategy_state_subscriber_on_startup",
+            "_start_exchange_order_event_stream",
+        ):
+            setattr(engine, name, MagicMock())
+        engine._start_heartbeat = MagicMock(
+            side_effect=RuntimeError("heartbeat startup failed")
+        )
+        engine.scan_strategies = MagicMock()
+
+        with pytest.raises(RuntimeError, match="heartbeat startup failed"):
+            engine.startup()
+
+        engine.scan_strategies.assert_not_called()
+        assert engine._kill_switch_halted is True
+        assert engine.execution_engine._submissions_halted is True
+
 
 class TestRuntimeReconciliationThread:
     def test_startup_skips_runtime_reconciliation_for_simulated_mode(self, engine):
@@ -2251,6 +2429,29 @@ class TestRuntimeReconciliationThread:
         assert created_threads[0].daemon is True
         engine.runtime_reconciliation_job.run_once.assert_called_once()
         engine._runtime_reconcile_stop.wait.assert_called_once_with(3600.0)
+
+    def test_runtime_reconciliation_stops_before_work_after_leadership_loss(
+        self,
+        engine,
+    ):
+        engine._leadership_guard = MagicMock(
+            side_effect=RuntimeError("leadership lost")
+        )
+        engine.runtime_reconciliation_job.run_once = MagicMock()
+
+        class ImmediateThread:
+            def __init__(self, *, target, daemon):
+                self.target = target
+
+            def start(self):
+                self.target()
+
+        with patch("src.core.engine.threading.Thread", ImmediateThread):
+            engine._start_runtime_reconciliation()
+
+        engine.runtime_reconciliation_job.run_once.assert_not_called()
+        assert engine.running is False
+        assert engine._kill_switch_halted is True
 
     def test_rithmic_runtime_reconciliation_waits_before_first_session_restart(
         self,
@@ -2361,6 +2562,43 @@ class TestRuntimeReconciliationThread:
         engine._start_exchange_order_event_stream.assert_called_once_with()
         engine.execution_engine.resume_after_reconcile.assert_called_once_with()
         engine._lockdown_for_rithmic_order_drift.assert_not_called()
+
+    def test_periodic_rithmic_reconciliation_does_not_restart_after_takeover(
+        self,
+        engine,
+    ):
+        adapter = _rithmic_adapter_for_reconnect_test()
+        adapter.close = MagicMock()
+        engine.execution_engine.adapter = adapter
+        engine._rithmic_recovery_profile = "test"
+        engine._rithmic_recovery_account_id = "ACCOUNT"
+        engine.execution_engine.halt_for_reconcile = MagicMock(return_value=True)
+        owns_service = True
+
+        def assert_leadership():
+            if not owns_service:
+                raise RuntimeError("leadership lost")
+
+        def reconcile_then_lose_leadership(*_args):
+            nonlocal owns_service
+            owns_service = False
+            return _authoritative_rithmic_summary()
+
+        engine._leadership_guard = assert_leadership
+        engine.execution_engine.reconcile_rithmic_owned_orders = MagicMock(
+            side_effect=reconcile_then_lose_leadership
+        )
+        engine._apply_rithmic_authoritative_account_summary = MagicMock()
+        engine._start_exchange_order_event_stream = MagicMock()
+        engine.execution_engine.resume_after_reconcile = MagicMock()
+
+        with pytest.raises(RuntimeError, match="leadership lost"):
+            engine._run_rithmic_runtime_reconciliation_once()
+
+        engine._start_exchange_order_event_stream.assert_not_called()
+        engine.execution_engine.resume_after_reconcile.assert_not_called()
+        assert adapter.close.call_count >= 2
+        assert engine._kill_switch_halted is True
 
     def test_periodic_rithmic_reconciliation_holds_market_delivery_until_complete(
         self,
@@ -2664,6 +2902,39 @@ class TestExchangeOrderEventThread:
         engine.execution_engine.process_exchange_order_event.assert_called_once_with(
             remote_event
         )
+
+    def test_queued_order_event_is_rejected_after_leadership_loss(self, engine):
+        adapter = MagicMock()
+        remote_event = MagicMock()
+        owns_service = True
+
+        def assert_leadership():
+            if not owns_service:
+                raise RuntimeError("leadership lost")
+
+        def poll_then_lose_leadership():
+            nonlocal owns_service
+            owns_service = False
+            return remote_event
+
+        engine._leadership_guard = assert_leadership
+        engine.execution_engine.adapter = adapter
+        engine.execution_engine.process_exchange_order_event = MagicMock()
+        adapter.poll_order_event.side_effect = poll_then_lose_leadership
+
+        class ImmediateThread:
+            def __init__(self, *, target, name, daemon):
+                self.target = target
+
+            def start(self):
+                self.target()
+
+        with patch("src.core.engine.threading.Thread", ImmediateThread):
+            engine._start_exchange_order_event_stream()
+
+        engine.execution_engine.process_exchange_order_event.assert_not_called()
+        assert engine.running is False
+        assert engine._kill_switch_halted is True
 
     def test_event_stream_start_failure_halts_before_propagating(self, engine):
         adapter = MagicMock()
@@ -3024,6 +3295,40 @@ class TestExchangeOrderEventThread:
             engine.ops_safety.clear_kill_switch.assert_not_called()
             engine.execution_engine.resume_after_reconcile.assert_not_called()
         assert engine._rithmic_external_order_drift_pending is expected_pending
+
+    def test_rithmic_clear_does_not_persist_or_resume_after_leadership_loss(
+        self,
+        engine,
+    ):
+        owns_service = True
+
+        def assert_leadership():
+            if not owns_service:
+                raise RuntimeError("leadership lost")
+
+        def reconcile_then_lose_leadership():
+            nonlocal owns_service
+            owns_service = False
+            return True, 0
+
+        engine._leadership_guard = assert_leadership
+        engine._kill_switch_halted = True
+        engine._prepare_rithmic_kill_switch_clear = MagicMock(
+            side_effect=reconcile_then_lose_leadership
+        )
+        engine.ops_safety.clear_kill_switch = MagicMock()
+        engine.ops_safety.persist_kill_switch_state = MagicMock()
+        engine.execution_engine.resume_after_reconcile = MagicMock()
+
+        engine._handle_command({"command": "CLEAR_KILL_SWITCH", "params": {}})
+
+        engine.ops_safety.clear_kill_switch.assert_not_called()
+        engine.ops_safety.persist_kill_switch_state.assert_not_called()
+        assert call(engine._system_state_key, SYSTEM_STATE_OK) not in (
+            engine.redis_client.set.call_args_list
+        )
+        engine.execution_engine.resume_after_reconcile.assert_not_called()
+        assert engine._kill_switch_halted is True
 
     def test_non_rithmic_clear_does_not_run_ledger_reconciliation(self, engine):
         engine._kill_switch_halted = True
@@ -4070,6 +4375,95 @@ def test_reconnect_reconcile_failure_keeps_gate_and_retries(engine):
     assert adapter._client is not None
     assert engine._pending_order_reconnect_generation is None
     engine.execution_engine.resume_after_reconcile.assert_called_once_with()
+
+
+def test_reconnect_lease_loss_after_reconcile_keeps_gate_and_generation(engine):
+    """A stale owner must not restart or publish completed reconciliation."""
+    adapter = _rithmic_adapter_for_reconnect_test()
+    adapter.connection_generation = MagicMock(return_value=2)
+    adapter.start_order_event_stream = MagicMock()
+    adapter.close = MagicMock(wraps=adapter.close)
+    engine.execution_engine.adapter = adapter
+    engine.execution_engine.audit_external_orders = True
+    engine._rithmic_recovery_profile = "test"
+    engine._rithmic_recovery_account_id = "ACCOUNT"
+    engine._last_order_generation = 1
+    leadership_lost = False
+
+    def reconcile(*_args):
+        nonlocal leadership_lost
+        leadership_lost = True
+        return {"recoverable_count": 0, "auto_resume_safe": True}
+
+    def assert_leadership():
+        if leadership_lost:
+            raise RuntimeError("market_consumer_ownership_lost")
+
+    engine._leadership_guard = assert_leadership
+    engine.execution_engine.reconcile_rithmic_owned_orders = MagicMock(
+        side_effect=reconcile
+    )
+    engine._apply_rithmic_authoritative_account_summary = MagicMock()
+    engine.execution_engine.halt_for_reconcile = MagicMock(
+        wraps=engine.execution_engine.halt_for_reconcile
+    )
+    engine.execution_engine.resume_after_reconcile = MagicMock()
+
+    with pytest.raises(RuntimeError, match="market_consumer_ownership_lost"):
+        engine._reconcile_owned_orders_on_reconnect()
+
+    adapter.start_order_event_stream.assert_not_called()
+    engine.execution_engine.resume_after_reconcile.assert_not_called()
+    assert engine._last_order_generation == 1
+    assert engine._pending_order_reconnect_generation == 2
+    assert engine.execution_engine._reconcile_halt is True
+    assert adapter.close.call_count == 2
+
+
+def test_reconnect_lease_loss_during_stream_restart_keeps_gate_and_generation(
+    engine,
+):
+    """A restarted stream cannot resume submissions after its lease expires."""
+    adapter = _rithmic_adapter_for_reconnect_test()
+    adapter.connection_generation = MagicMock(return_value=2)
+    adapter.close = MagicMock(wraps=adapter.close)
+    engine.execution_engine.adapter = adapter
+    engine.execution_engine.audit_external_orders = True
+    engine._rithmic_recovery_profile = "test"
+    engine._rithmic_recovery_account_id = "ACCOUNT"
+    engine._last_order_generation = 1
+    leadership_lost = False
+
+    def restart_then_lose_leadership():
+        nonlocal leadership_lost
+        leadership_lost = True
+
+    def assert_leadership():
+        if leadership_lost:
+            raise RuntimeError("market_consumer_ownership_lost")
+
+    adapter.start_order_event_stream = MagicMock(
+        side_effect=restart_then_lose_leadership
+    )
+    engine._leadership_guard = assert_leadership
+    engine.execution_engine.reconcile_rithmic_owned_orders = MagicMock(
+        return_value={"recoverable_count": 0, "auto_resume_safe": True}
+    )
+    engine._apply_rithmic_authoritative_account_summary = MagicMock()
+    engine.execution_engine.halt_for_reconcile = MagicMock(
+        wraps=engine.execution_engine.halt_for_reconcile
+    )
+    engine.execution_engine.resume_after_reconcile = MagicMock()
+
+    with pytest.raises(RuntimeError, match="market_consumer_ownership_lost"):
+        engine._reconcile_owned_orders_on_reconnect()
+
+    adapter.start_order_event_stream.assert_called_once_with()
+    engine.execution_engine.resume_after_reconcile.assert_not_called()
+    assert engine._last_order_generation == 1
+    assert engine._pending_order_reconnect_generation == 2
+    assert engine.execution_engine._reconcile_halt is True
+    assert adapter.close.call_count == 2
 
 
 def test_reconnect_waits_for_submission_drain_before_closing_runtime(engine):

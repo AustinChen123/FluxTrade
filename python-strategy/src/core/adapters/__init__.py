@@ -3,6 +3,8 @@
 Factory function ``create_adapter`` provides config-driven instantiation.
 """
 
+from collections.abc import Callable
+
 from src.core.adapters.ccxt_adapter import (
     AccountInitializationConfig,
     CcxtExchangeAdapter,
@@ -26,7 +28,11 @@ __all__ = [
 ]
 
 
-def create_adapter(config: dict) -> IExchangeAdapter:
+def create_adapter(
+    config: dict,
+    *,
+    operation_guard: Callable[[], None] | None = None,
+) -> IExchangeAdapter:
     """Create an exchange adapter from a configuration dict.
 
     Config keys:
@@ -55,8 +61,16 @@ def create_adapter(config: dict) -> IExchangeAdapter:
         )
 
     exchange_id = config.get("exchange", "binance")
+    guard = operation_guard or (lambda: None)
     if str(exchange_id).lower() == "rithmic":
-        return RithmicExchangeAdapter.from_config(config)
+        guard()
+        adapter = RithmicExchangeAdapter.from_config(config)
+        try:
+            guard()
+        except Exception:
+            adapter.close()
+            raise
+        return adapter
     api_key = config.get("api_key")
     secret = config.get("secret")
     testnet = config.get("testnet", True)
@@ -69,26 +83,38 @@ def create_adapter(config: dict) -> IExchangeAdapter:
     )
 
     # Use Binance-specific adapter if WS requested and exchange is binance
-    if exchange_id == "binance" and enable_ws:
-        adapter = LiveBinanceAdapter(
-            api_key=api_key,
-            secret=secret,
-            testnet=testnet,
-            enable_ws=True,
-        )
+    adapter = None
+    try:
+        guard()
+        if exchange_id == "binance" and enable_ws:
+            adapter = LiveBinanceAdapter(
+                api_key=api_key,
+                secret=secret,
+                testnet=testnet,
+                enable_ws=True,
+                operation_guard=guard,
+            )
+        else:
+            adapter = CcxtExchangeAdapter(
+                exchange_id=exchange_id,
+                api_key=api_key,
+                secret=secret,
+                testnet=testnet,
+                extra_config=extra_config,
+            )
+        guard()
         if account_initialization is not None:
-            adapter.initialize_account(account_initialization)
-        adapter.warm_instrument_specs(instrument_product_ids)
+            adapter.initialize_account(
+                account_initialization,
+                operation_guard=guard,
+            )
+        adapter.warm_instrument_specs(
+            instrument_product_ids,
+            operation_guard=guard,
+        )
         return adapter
-
-    adapter = CcxtExchangeAdapter(
-        exchange_id=exchange_id,
-        api_key=api_key,
-        secret=secret,
-        testnet=testnet,
-        extra_config=extra_config,
-    )
-    if account_initialization is not None:
-        adapter.initialize_account(account_initialization)
-    adapter.warm_instrument_specs(instrument_product_ids)
-    return adapter
+    except Exception:
+        close = getattr(adapter, "close", None)
+        if callable(close):
+            close()
+        raise

@@ -113,3 +113,12 @@ class TestCsvSignalStrategy:
         path.write_text("timestamp,type,price\n1700000000000,LONG,abc\n")
         with pytest.raises(ValueError, match="Invalid Decimal value"):
             CsvSignalStrategy("bad_dec", str(path), PRODUCT_ID, TIMEFRAME)
+
+    def test_replay_configuration_detects_changed_source(self, csv_file):
+        strat = CsvSignalStrategy("csv", csv_file, PRODUCT_ID, TIMEFRAME)
+
+        with open(csv_file, "a", encoding="utf-8") as source:
+            source.write("1700002700000,LONG,,,,,0.1\n")
+        replacement = strat.fresh_instance_for_replay()
+
+        assert replacement.replay_configuration() != strat.replay_configuration()

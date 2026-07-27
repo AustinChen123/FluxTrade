@@ -11,7 +11,11 @@ import structlog
 # Add project root to path
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from src.core.consumer import DataConsumer
+from src.core.consumer import (
+    DEFAULT_OWNERSHIP_LEASE_MS,
+    DEFAULT_PENDING_CLAIM_IDLE_MS,
+    DataConsumer,
+)
 from src.core.engine import StrategyEngine
 from src.core.db import SessionLocal
 from src.core.clock import RealtimeClock
@@ -87,6 +91,20 @@ def _env_flag(name: str, default: bool = False) -> bool:
     if normalized in {"0", "false", "no", "off"}:
         return False
     raise ValueError(f"{name} must be a boolean")
+
+
+def _env_nonnegative_int(name: str, default: int) -> int:
+    value = int(os.getenv(name, str(default)))
+    if value < 0:
+        raise ValueError(f"{name} must be non-negative")
+    return value
+
+
+def _env_positive_int(name: str, default: int) -> int:
+    value = int(os.getenv(name, str(default)))
+    if value <= 0:
+        raise ValueError(f"{name} must be positive")
+    return value
 
 
 def _env_csv(name: str, default: list[str] | None = None) -> list[str]:
@@ -235,52 +253,65 @@ def main():
         audit_external_orders=audit_external_orders,
     )
 
-    # 0. Metrics
-    metrics_enabled = os.getenv("METRICS_ENABLED", "true").lower() == "true"
-    metrics_port = int(os.getenv("METRICS_PORT", "9090"))
-    configure_metrics(enabled=metrics_enabled, port=metrics_port)
-
-    # 1. Init DB Session
-    db_session = SessionLocal()
-
-    # 2. Initialize Engine
-    clock = RealtimeClock()
-    engine = StrategyEngine(
-        db_session=db_session,
-        clock=clock,
-        adapter_config=adapter_config,
-        db_session_factory=_session_scope,
-        audit_external_orders=audit_external_orders,
-    )
-
-    # Run Startup Checks (System State & Heartbeat)
-    engine.startup()
-
-    # 2. Initialize Data Consumer (Redis Streams)
-    channels = engine.build_stream_channels()
     consumer = DataConsumer(
-        channels=channels,
-        on_message_callback=engine.on_market_data,
-        channel_provider=engine.build_stream_channels,
-        runtime_environment=engine.runtime_environment,
+        channels=[],
+        on_message_callback=lambda _data: None,
+        pending_claim_idle_ms=_env_nonnegative_int(
+            "MARKET_PENDING_CLAIM_IDLE_MS",
+            DEFAULT_PENDING_CLAIM_IDLE_MS,
+        ),
+        ownership_lease_ms=_env_positive_int(
+            "MARKET_CONSUMER_LEASE_MS",
+            DEFAULT_OWNERSHIP_LEASE_MS,
+        ),
     )
 
-    # 3. Signal handlers for graceful shutdown
     def handle_shutdown(signum, frame):
         sig_name = signal.Signals(signum).name
         logger.info("Received %s, initiating shutdown...", sig_name)
-        consumer.stop()
+        consumer.request_stop()
 
     signal.signal(signal.SIGTERM, handle_shutdown)
     signal.signal(signal.SIGINT, handle_shutdown)
 
-    # 4. Start
+    db_session = None
+    engine = None
+    clean_exit = False
     try:
+        consumer.acquire_service_ownership()
+        metrics_enabled = os.getenv("METRICS_ENABLED", "true").lower() == "true"
+        metrics_port = int(os.getenv("METRICS_PORT", "9090"))
+        configure_metrics(enabled=metrics_enabled, port=metrics_port)
+
+        db_session = SessionLocal()
+        clock = RealtimeClock()
+        engine = StrategyEngine(
+            db_session=db_session,
+            clock=clock,
+            adapter_config=adapter_config,
+            db_session_factory=_session_scope,
+            audit_external_orders=audit_external_orders,
+            leadership_guard=consumer.assert_service_ownership,
+        )
+        engine.startup()
+        consumer.configure_callbacks(
+            on_message_callback=engine.on_market_data,
+            channel_provider=engine.build_stream_channels,
+            pending_replay_callback=engine.replay_pending_market_data,
+        )
         consumer.start()
+        clean_exit = True
     finally:
-        engine.shutdown()
-        db_session.close()
-        logger.info("FluxTrade Strategy Service stopped.")
+        try:
+            if engine is not None:
+                engine.shutdown(clean_exit=clean_exit)
+        finally:
+            try:
+                if db_session is not None:
+                    db_session.close()
+            finally:
+                consumer.stop()
+                logger.info("FluxTrade Strategy Service stopped.")
 
 
 if __name__ == "__main__":

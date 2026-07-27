@@ -5,15 +5,34 @@ from __future__ import annotations
 from contextlib import nullcontext
 from datetime import UTC, datetime
 from decimal import Decimal
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
+import pytest
 from sqlalchemy import create_engine, select, text
 from sqlalchemy.orm import sessionmaker
 
-from src.core.models import Candlestick, Position, PositionSide, Signal, SignalType, StrategyStatus
+from src.core.models import (
+    Candlestick,
+    Position,
+    PositionSide,
+    Signal,
+    SignalType,
+    StrategyStatus,
+    Trade,
+)
 from src.core.orm_models import Candlestick as ORMCandlestick
-from src.core.orm_models import SignalAudit, Strategy, StrategyState, StrategyStateTransition
+from src.core.orm_models import (
+    Exchange,
+    MarketDataApplication,
+    Product,
+    SignalAudit,
+    Strategy,
+    StrategyState,
+    StrategyStateTransition,
+)
+from src.core.runtime_environment import RuntimeEnvironment
 from src.strategies.base import BaseStrategy, StrategyRequirements
+from src.strategies.golden_cross import GoldenCrossStrategy
 
 
 class EmittingStrategy(BaseStrategy):
@@ -28,6 +47,12 @@ class EmittingStrategy(BaseStrategy):
     def sync_position_state(self, position_side: str | None) -> bool:
         """Accept the position sync unconditionally — required for restart integration test."""
         return True
+
+    def fresh_instance_for_replay(self) -> BaseStrategy:
+        return type(self)(self.strategy_id, self.product_id)
+
+    def replay_configuration(self) -> object:
+        return ()
 
     def on_candle(self, candle: Candlestick) -> Signal:
         self.candles_received.append(candle)
@@ -136,6 +161,18 @@ def _sqlite_lifecycle_session_factory(tmp_path):
     return sessionmaker(bind=engine)
 
 
+def _sqlite_market_session_factory(tmp_path):
+    engine = create_engine(f"sqlite:///{tmp_path / 'market_recovery.db'}")
+    for table in [
+        Exchange.__table__,
+        Product.__table__,
+        ORMCandlestick.__table__,
+        MarketDataApplication.__table__,
+    ]:
+        table.create(engine, checkfirst=True)
+    return sessionmaker(bind=engine)
+
+
 def test_full_lifecycle_routes_signal_through_wired_components(engine_factory, mock_db_session):
     engine = engine_factory()
     strategy = EmittingStrategy("s1")
@@ -186,6 +223,522 @@ def test_health_monitoring_records_strategy_heartbeat(engine_factory):
     assert engine._health_monitor.is_healthy("s1") is True
     assert engine._health_monitor.get_uptime("s1") >= 0.0
     mock_db.commit.assert_called_once()
+
+
+def test_live_static_registration_rejects_missing_replay_contract(
+    engine_factory,
+):
+    class UnrecoverableStrategy(BaseStrategy):
+        @property
+        def requirements(self) -> StrategyRequirements:
+            return StrategyRequirements(self.product_id, "1m", 0)
+
+        def on_candle(self, candle, context=None):
+            return Signal(
+                strategy_id=self.strategy_id,
+                product_id=self.product_id,
+                timeframe=candle.timeframe,
+                timestamp=candle.timestamp,
+                type=SignalType.NO_SIGNAL,
+            )
+
+    engine = engine_factory()
+    engine.runtime_environment = RuntimeEnvironment("live")
+
+    with pytest.raises(
+        NotImplementedError,
+        match="pending-market replay configuration",
+    ):
+        engine.add_strategy(
+            UnrecoverableStrategy("unrecoverable", "BINANCE:BTCUSDT-PERP")
+        )
+
+    assert engine.strategy_instances == {}
+    assert engine.strategies == {}
+    assert engine._registry.list_active() == []
+
+
+def test_live_static_registration_rejects_replay_factory_returning_self(
+    engine_factory,
+):
+    class SelfReturningStrategy(EmittingStrategy):
+        def fresh_instance_for_replay(self) -> BaseStrategy:
+            return self
+
+    engine = engine_factory()
+    engine.runtime_environment = RuntimeEnvironment("live")
+
+    with pytest.raises(
+        RuntimeError,
+        match="did not return a distinct compatible instance",
+    ):
+        engine.add_strategy(
+            SelfReturningStrategy("same-instance", "BINANCE:BTCUSDT-PERP")
+        )
+
+    assert engine.strategy_instances == {}
+    assert engine.strategies == {}
+    assert engine._registry.list_active() == []
+
+
+def test_pending_replay_rebuilds_strategy_before_ambiguous_candle(
+    engine_factory,
+    tmp_path,
+):
+    session_factory = _sqlite_market_session_factory(tmp_path)
+    rows = make_orm_candles(11)
+    row_timestamps = [row.timestamp for row in rows]
+    pending = Candlestick(
+        product_id=rows[-1].product_id,
+        timeframe=rows[-1].timeframe,
+        timestamp=rows[-1].timestamp,
+        open=rows[-1].open,
+        high=rows[-1].high,
+        low=rows[-1].low,
+        close=rows[-1].close,
+        volume=rows[-1].volume,
+    )
+    with session_factory() as session:
+        session.add(Exchange(id="BINANCE", name="Binance"))
+        session.add(
+            Product(
+                id="BINANCE:BTCUSDT-PERP",
+                exchange_id="BINANCE",
+                base_asset="BTC",
+                quote_asset="USDT",
+            )
+        )
+        session.add_all(rows)
+        session.commit()
+
+    engine = engine_factory(db_session_factory=session_factory)
+    engine.runtime_environment = RuntimeEnvironment("live")
+    original = EmittingStrategy("s1")
+    engine.add_strategy(original)
+    engine.process_signal = MagicMock()
+
+    engine.replay_pending_market_data(pending)
+
+    replacement = engine.strategy_instances["s1"]
+    assert replacement is not original
+    assert [candle.timestamp for candle in replacement.candles_received] == [
+        *row_timestamps[:-1],
+        pending.timestamp,
+    ]
+
+
+def test_pending_trade_replay_fails_without_durable_state_boundary(engine_factory):
+    engine = engine_factory()
+    trade = Trade(
+        id="trade-1",
+        product_id="BINANCE:BTCUSDT-PERP",
+        price=Decimal("42000"),
+        quantity=Decimal("1"),
+        side="buy",
+        timestamp=1704067200000,
+    )
+
+    with pytest.raises(
+        RuntimeError,
+        match="pending trade replay has no durable strategy-state boundary",
+    ):
+        engine.replay_pending_market_data(trade)
+
+
+def test_pending_replay_uses_strategy_recovery_factory(
+    engine_factory,
+    tmp_path,
+):
+    class ConfiguredStrategy(EmittingStrategy):
+        def __init__(self, strategy_id: str, product_id: str, token: str):
+            super().__init__(strategy_id, product_id)
+            self.token = token
+
+        def fresh_instance_for_replay(self):
+            return type(self)(self.strategy_id, self.product_id, self.token)
+
+        def replay_configuration(self):
+            return (self.token,)
+
+    session_factory = _sqlite_market_session_factory(tmp_path)
+    rows = make_orm_candles(10)
+    pending = make_candle()
+    pending = pending.model_copy(
+        update={"timestamp": rows[-1].timestamp + 60_000}
+    )
+    with session_factory() as session:
+        session.add(Exchange(id="BINANCE", name="Binance"))
+        session.add(
+            Product(
+                id=pending.product_id,
+                exchange_id="BINANCE",
+                base_asset="BTC",
+                quote_asset="USDT",
+            )
+        )
+        session.add_all(rows)
+        session.commit()
+
+    engine = engine_factory(db_session_factory=session_factory)
+    engine.add_strategy(
+        ConfiguredStrategy("configured", pending.product_id, "registered-formula")
+    )
+    engine.process_signal = MagicMock()
+
+    engine.replay_pending_market_data(pending)
+
+    replacement = engine.strategy_instances["configured"]
+    assert replacement.token == "registered-formula"
+    assert len(replacement.candles_received) == 11
+
+
+def test_pending_replay_preserves_nondefault_golden_cross_configuration(
+    engine_factory,
+    tmp_path,
+):
+    session_factory = _sqlite_market_session_factory(tmp_path)
+    rows = make_orm_candles(4)
+    pending = Candlestick(
+        product_id=rows[-1].product_id,
+        timeframe=rows[-1].timeframe,
+        timestamp=rows[-1].timestamp,
+        open=rows[-1].open,
+        high=rows[-1].high,
+        low=rows[-1].low,
+        close=rows[-1].close,
+        volume=rows[-1].volume,
+    )
+    with session_factory() as session:
+        session.add(Exchange(id="BINANCE", name="Binance"))
+        session.add(
+            Product(
+                id=pending.product_id,
+                exchange_id="BINANCE",
+                base_asset="BTC",
+                quote_asset="USDT",
+            )
+        )
+        session.add_all(rows)
+        session.commit()
+
+    engine = engine_factory(db_session_factory=session_factory)
+    engine.runtime_environment = RuntimeEnvironment("live")
+    original = GoldenCrossStrategy(
+        "configured-golden-cross",
+        pending.product_id,
+        short_window=2,
+        long_window=3,
+        timeframe="1m",
+        quantity=Decimal("2"),
+    )
+    engine.add_strategy(original)
+    engine.process_signal = MagicMock()
+
+    engine.replay_pending_market_data(pending)
+
+    replacement = engine.strategy_instances["configured-golden-cross"]
+    assert replacement is not original
+    assert isinstance(replacement, GoldenCrossStrategy)
+    assert replacement.replay_configuration() == (
+        2,
+        3,
+        "1m",
+        Decimal("2"),
+    )
+
+
+def test_live_candle_fence_holds_postgres_advisory_lock_around_application(
+    engine_factory,
+):
+    engine = engine_factory()
+    engine.runtime_environment = RuntimeEnvironment("live")
+    db = MagicMock()
+    db.get_bind.return_value.dialect.name = "postgresql"
+    events: list[str] = []
+
+    def execute(statement, _parameters):
+        sql = str(statement)
+        if "pg_advisory_unlock" in sql:
+            events.append("unlock")
+            result = MagicMock()
+            result.scalar.return_value = True
+            return result
+        events.append("lock")
+        return MagicMock()
+
+    db.execute.side_effect = execute
+    engine._db_session_factory = lambda: nullcontext(db)
+
+    with engine._live_candle_application_fence(make_candle()):
+        events.append("application")
+
+    assert events == ["lock", "application", "unlock"]
+
+
+def test_live_candle_fence_rejects_non_postgres_production_database(
+    engine_factory,
+):
+    engine = engine_factory()
+    engine.runtime_environment = RuntimeEnvironment("live")
+    db = MagicMock()
+    db.get_bind.return_value.dialect.name = "mysql"
+    engine._db_session_factory = lambda: nullcontext(db)
+
+    with pytest.raises(
+        RuntimeError,
+        match="requires PostgreSQL advisory locks",
+    ):
+        with engine._live_candle_application_fence(make_candle()):
+            pytest.fail("application must remain fenced")
+
+
+def test_live_candle_fence_times_out_without_entering_application(
+    engine_factory,
+):
+    engine = engine_factory()
+    engine.runtime_environment = RuntimeEnvironment("live")
+    db = MagicMock()
+    db.get_bind.return_value.dialect.name = "postgresql"
+    result = MagicMock()
+    result.scalar.return_value = False
+    db.execute.return_value = result
+    engine._db_session_factory = lambda: nullcontext(db)
+
+    with patch(
+        "src.core.engine.LIVE_CANDLE_FENCE_TIMEOUT_SECONDS",
+        0,
+    ):
+        with pytest.raises(
+            RuntimeError,
+            match="timed out acquiring live candle application fence",
+        ):
+            with engine._live_candle_application_fence(make_candle()):
+                pytest.fail("application must not run without the fence")
+
+
+def test_live_candle_is_persisted_only_after_successful_application(
+    engine_factory,
+    tmp_path,
+):
+    session_factory = _sqlite_market_session_factory(tmp_path)
+    engine = engine_factory(db_session_factory=session_factory)
+    engine.runtime_environment = RuntimeEnvironment("live")
+    engine.execution_engine.process_market_data = MagicMock()
+    candle = make_candle()
+
+    engine.on_market_data(candle)
+
+    with session_factory() as session:
+        persisted = session.get(
+            ORMCandlestick,
+            (candle.product_id, candle.timeframe, candle.timestamp),
+        )
+        assert persisted is not None
+        assert Decimal(persisted.close) == candle.close
+        application = session.get(
+            MarketDataApplication,
+            (
+                "live",
+                candle.product_id,
+                candle.timeframe,
+                candle.timestamp,
+            ),
+        )
+        assert application is not None
+        assert Decimal(application.close) == candle.close
+
+    engine._signal_processor.on_candle = MagicMock(
+        side_effect=RuntimeError("strategy failed")
+    )
+    failed = candle.model_copy(update={"timestamp": candle.timestamp + 60_000})
+    with pytest.raises(RuntimeError, match="strategy failed"):
+        engine.on_market_data(failed)
+
+    with session_factory() as session:
+        assert session.get(
+            ORMCandlestick,
+            (failed.product_id, failed.timeframe, failed.timestamp),
+        ) is None
+        assert session.get(
+            MarketDataApplication,
+            (
+                "live",
+                failed.product_id,
+                failed.timeframe,
+                failed.timestamp,
+            ),
+        ) is None
+
+
+def test_durable_receipt_rebuilds_state_without_duplicate_side_effects(
+    engine_factory,
+    tmp_path,
+):
+    session_factory = _sqlite_market_session_factory(tmp_path)
+    rows = make_orm_candles(11)
+    pending = Candlestick(
+        product_id=rows[-1].product_id,
+        timeframe=rows[-1].timeframe,
+        timestamp=rows[-1].timestamp,
+        open=rows[-1].open,
+        high=rows[-1].high,
+        low=rows[-1].low,
+        close=rows[-1].close,
+        volume=rows[-1].volume,
+    )
+    with session_factory() as session:
+        session.add(Exchange(id="BINANCE", name="Binance"))
+        session.add(
+            Product(
+                id=pending.product_id,
+                exchange_id="BINANCE",
+                base_asset="BTC",
+                quote_asset="USDT",
+            )
+        )
+        session.add_all(rows)
+        session.add(
+            MarketDataApplication(
+                environment="live",
+                product_id=pending.product_id,
+                timeframe=pending.timeframe,
+                timestamp=pending.timestamp,
+                open=pending.open,
+                high=pending.high,
+                low=pending.low,
+                close=pending.close,
+                volume=pending.volume,
+            )
+        )
+        session.commit()
+
+    engine = engine_factory(db_session_factory=session_factory)
+    engine.runtime_environment = RuntimeEnvironment("live")
+    original = EmittingStrategy("s1")
+    engine.add_strategy(original)
+    engine.execution_engine.process_market_data = MagicMock()
+    engine._signal_processor.on_candle = MagicMock()
+
+    engine.replay_pending_market_data(pending)
+    engine.on_market_data(pending)
+
+    replacement = engine.strategy_instances["s1"]
+    assert replacement is not original
+    assert replacement.candles_received[-1] == pending
+    assert len(replacement.candles_received) == 10
+    engine.execution_engine.process_market_data.assert_not_called()
+    engine._signal_processor.on_candle.assert_not_called()
+
+
+def test_unreceipted_older_candle_fails_closed_before_replay_or_callback(
+    engine_factory,
+    tmp_path,
+):
+    session_factory = _sqlite_market_session_factory(tmp_path)
+    rows = make_orm_candles(11)
+    latest = Candlestick(
+        product_id=rows[-1].product_id,
+        timeframe=rows[-1].timeframe,
+        timestamp=rows[-1].timestamp,
+        open=rows[-1].open,
+        high=rows[-1].high,
+        low=rows[-1].low,
+        close=rows[-1].close,
+        volume=rows[-1].volume,
+    )
+    older = Candlestick(
+        product_id=rows[-2].product_id,
+        timeframe=rows[-2].timeframe,
+        timestamp=rows[-2].timestamp,
+        open=rows[-2].open,
+        high=rows[-2].high,
+        low=rows[-2].low,
+        close=rows[-2].close,
+        volume=rows[-2].volume,
+    )
+    with session_factory() as session:
+        session.add(Exchange(id="BINANCE", name="Binance"))
+        session.add(
+            Product(
+                id=latest.product_id,
+                exchange_id="BINANCE",
+                base_asset="BTC",
+                quote_asset="USDT",
+            )
+        )
+        session.add_all(rows)
+        session.add(
+            MarketDataApplication(
+                environment="live",
+                product_id=latest.product_id,
+                timeframe=latest.timeframe,
+                timestamp=latest.timestamp,
+                open=latest.open,
+                high=latest.high,
+                low=latest.low,
+                close=latest.close,
+                volume=latest.volume,
+            )
+        )
+        session.commit()
+
+    engine = engine_factory(db_session_factory=session_factory)
+    engine.runtime_environment = RuntimeEnvironment("live")
+    engine.execution_engine.process_market_data = MagicMock()
+    engine._signal_processor.on_candle = MagicMock()
+
+    with pytest.raises(RuntimeError, match="live candle application is out of order"):
+        engine.replay_pending_market_data(older)
+    with pytest.raises(RuntimeError, match="live candle application is out of order"):
+        engine.on_market_data(older)
+
+    engine.execution_engine.process_market_data.assert_not_called()
+    engine._signal_processor.on_candle.assert_not_called()
+
+
+def test_conflicting_history_blocks_live_callback_before_side_effect(
+    engine_factory,
+    tmp_path,
+):
+    session_factory = _sqlite_market_session_factory(tmp_path)
+    candle = make_candle()
+    with session_factory() as session:
+        session.add(Exchange(id="BINANCE", name="Binance"))
+        session.add(
+            Product(
+                id=candle.product_id,
+                exchange_id="BINANCE",
+                base_asset="BTC",
+                quote_asset="USDT",
+            )
+        )
+        session.add(
+            ORMCandlestick(
+                product_id=candle.product_id,
+                timeframe=candle.timeframe,
+                timestamp=candle.timestamp,
+                open=candle.open,
+                high=candle.high,
+                low=candle.low,
+                close=candle.close + Decimal("1"),
+                volume=candle.volume,
+            )
+        )
+        session.commit()
+
+    engine = engine_factory(db_session_factory=session_factory)
+    engine.runtime_environment = RuntimeEnvironment("live")
+    engine.execution_engine.process_market_data = MagicMock()
+    engine._signal_processor.on_candle = MagicMock()
+
+    with pytest.raises(
+        RuntimeError,
+        match="live candle conflicts with canonical history",
+    ):
+        engine.on_market_data(candle)
+
+    engine.execution_engine.process_market_data.assert_not_called()
+    engine._signal_processor.on_candle.assert_not_called()
 
 
 def test_commands_update_lifecycle_state_with_real_state_manager(
