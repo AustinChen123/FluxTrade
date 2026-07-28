@@ -1255,6 +1255,23 @@ class TestScanStrategies:
 
         assert "test.py::MyStrat" in engine.loaded_classes
 
+    def test_scan_removes_classes_missing_from_latest_artifact(
+        self,
+        engine,
+        mock_strategy_class,
+    ):
+        engine.loaded_classes["stale.py::OldStrat"] = mock_strategy_class
+        mock_db = MagicMock()
+        mock_db.query.return_value.filter.return_value.first.return_value = None
+        engine._db_session_factory = lambda: nullcontext(mock_db)
+
+        with patch("src.core.engine.StrategyLoader.scan_directory") as mock_scan:
+            mock_scan.return_value = {"new.py::NewStrat": mock_strategy_class}
+
+            engine.scan_strategies()
+
+        assert set(engine.loaded_classes) == {"new.py::NewStrat"}
+
     def test_scan_creates_db_state_for_new_strategy(self, engine, mock_strategy_class):
         """Newly discovered strategies should get a StrategyState record."""
         mock_db = MagicMock()
@@ -1343,6 +1360,65 @@ class TestStartStrategy:
             force=False,
             reason=None,
         )
+
+    @pytest.mark.parametrize(
+        ("readiness", "starts"),
+        [
+            ("RESEARCH_VALIDATED", False),
+            ("LIVE_APPROVED", True),
+        ],
+    )
+    def test_catalog_readiness_gates_live_activation(
+        self,
+        engine,
+        mock_strategy_class,
+        readiness,
+        starts,
+    ):
+        mock_strategy_class.__fluxtrade_readiness__ = readiness
+        engine.runtime_environment = RuntimeEnvironment("live")
+        engine.loaded_classes["stable_strategy_v1"] = mock_strategy_class
+        engine._strategy_state_manager.transition_to_running = MagicMock()
+        engine._strategy_state_manager.transition_to_error = MagicMock()
+        mock_state = MagicMock()
+        mock_state.status = "READY"
+        mock_state.config_json = '{"product_id":"BINANCE:BTCUSDT-PERP"}'
+        mock_db = MagicMock()
+        mock_db.query.return_value.filter.return_value.first.return_value = mock_state
+        engine._db_session_factory = lambda: nullcontext(mock_db)
+        engine._warm_up_strategy_instance = MagicMock(return_value=0)
+        engine._fresh_strategy_instance_for_replay = MagicMock()
+
+        engine.start_strategy("stable_strategy_v1")
+
+        assert ("stable_strategy_v1" in engine.strategy_instances) is starts
+        assert engine._warm_up_strategy_instance.called is starts
+
+    def test_start_uses_loaded_class_snapshot_during_rescan(
+        self,
+        engine,
+        mock_strategy_class,
+    ):
+        engine.loaded_classes["stable_strategy_v1"] = mock_strategy_class
+        mock_state = MagicMock()
+        mock_state.status = "READY"
+        mock_state.config_json = '{"product_id":"BINANCE:BTCUSDT-PERP"}'
+        mock_db = MagicMock()
+        mock_db.query.return_value.filter.return_value.first.return_value = mock_state
+        engine._db_session_factory = lambda: nullcontext(mock_db)
+        engine._warm_up_strategy_instance = MagicMock(return_value=0)
+        engine._strategy_state_manager.transition_to_running = MagicMock()
+
+        def snapshot_then_rescan(_strategy_id):
+            strategy_cls = engine.loaded_classes["stable_strategy_v1"]
+            engine.loaded_classes = {}
+            return strategy_cls
+
+        engine._get_loaded_strategy_class = snapshot_then_rescan
+
+        engine.start_strategy("stable_strategy_v1")
+
+        assert "stable_strategy_v1" in engine.strategy_instances
 
     def test_start_wrong_state_rejected(self, engine, mock_strategy_class):
         """Strategy in ERROR state should not be started."""
