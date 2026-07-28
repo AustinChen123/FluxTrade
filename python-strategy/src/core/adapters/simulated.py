@@ -336,8 +336,11 @@ class SimulatedAdapter(IExchangeAdapter):
         if fills:
             live_ids = {o.id for o in self._engine.open_orders}
             stale = [oid for oid in self._order_map if oid not in live_ids]
+            cancelled_orders = [self._order_map[oid] for oid in stale]
             for oid in stale:
                 del self._order_map[oid]
+            if cancelled_orders:
+                fills[-1]["cancelled_orders"] = cancelled_orders
 
         return fills
 
