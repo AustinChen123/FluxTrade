@@ -36,6 +36,8 @@ from src.strategies.golden_cross import GoldenCrossStrategy
 
 
 class EmittingStrategy(BaseStrategy):
+    __fluxtrade_readiness__ = "LIVE_APPROVED"
+
     def __init__(self, strategy_id: str, product_id: str = "BINANCE:BTCUSDT-PERP"):
         super().__init__(strategy_id, product_id)
         self.candles_received: list[Candlestick] = []
@@ -229,6 +231,8 @@ def test_live_static_registration_rejects_missing_replay_contract(
     engine_factory,
 ):
     class UnrecoverableStrategy(BaseStrategy):
+        __fluxtrade_readiness__ = "LIVE_APPROVED"
+
         @property
         def requirements(self) -> StrategyRequirements:
             return StrategyRequirements(self.product_id, "1m", 0)
@@ -395,6 +399,7 @@ def test_pending_replay_uses_strategy_recovery_factory(
 def test_pending_replay_preserves_nondefault_golden_cross_configuration(
     engine_factory,
     tmp_path,
+    monkeypatch,
 ):
     session_factory = _sqlite_market_session_factory(tmp_path)
     rows = make_orm_candles(4)
@@ -423,6 +428,12 @@ def test_pending_replay_preserves_nondefault_golden_cross_configuration(
 
     engine = engine_factory(db_session_factory=session_factory)
     engine.runtime_environment = RuntimeEnvironment("live")
+    monkeypatch.setattr(
+        GoldenCrossStrategy,
+        "__fluxtrade_readiness__",
+        "LIVE_APPROVED",
+        raising=False,
+    )
     original = GoldenCrossStrategy(
         "configured-golden-cross",
         pending.product_id,

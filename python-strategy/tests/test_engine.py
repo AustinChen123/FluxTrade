@@ -1364,7 +1364,9 @@ class TestStartStrategy:
     @pytest.mark.parametrize(
         ("readiness", "starts"),
         [
+            (None, False),
             ("RESEARCH_VALIDATED", False),
+            ("RESEARCH_FROZEN", False),
             ("LIVE_APPROVED", True),
         ],
     )
@@ -1624,6 +1626,8 @@ class TestStrategyWarmup:
         from src.strategies.base import BaseStrategy, StrategyRequirements
 
         class UnrecoverableStrategy(BaseStrategy):
+            __fluxtrade_readiness__ = "LIVE_APPROVED"
+
             @property
             def requirements(self):
                 return StrategyRequirements(self.product_id, "1m", 0)

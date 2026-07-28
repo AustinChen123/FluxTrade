@@ -23,7 +23,11 @@ logger = logging.getLogger(__name__)
 
 class StrategyLoader:
     CATALOG_NAME = "strategy_catalog.json"
-    READINESS_VALUES = {"RESEARCH_VALIDATED", "LIVE_APPROVED"}
+    READINESS_VALUES = {
+        "RESEARCH_VALIDATED",
+        "RESEARCH_FROZEN",
+        "LIVE_APPROVED",
+    }
     _SCAN_LOCK = threading.RLock()
     _catalog_snapshots: dict[str, tempfile.TemporaryDirectory[str]] = {}
 
@@ -48,9 +52,7 @@ class StrategyLoader:
         if catalog_path.exists():
             return StrategyLoader._scan_catalog(catalog_path)
 
-        nested_catalogs = sorted(
-            Path(path).glob(f"*/{StrategyLoader.CATALOG_NAME}")
-        )
+        nested_catalogs = sorted(Path(path).glob(f"*/{StrategyLoader.CATALOG_NAME}"))
         conflicting_modules = StrategyLoader._conflicting_catalog_modules(
             nested_catalogs
         )
@@ -68,8 +70,7 @@ class StrategyLoader:
             for strategy_id, result in nested.items():
                 if strategy_id in strategies:
                     strategies[strategy_id] = (
-                        "duplicate strategy id across strategy packs: "
-                        f"{strategy_id}"
+                        f"duplicate strategy id across strategy packs: {strategy_id}"
                     )
                 else:
                     strategies[strategy_id] = result
@@ -156,10 +157,8 @@ class StrategyLoader:
             logger.error("Failed to validate strategy catalog:\n%s", error_trace)
             return {f"{StrategyLoader.CATALOG_NAME}::LoadError": error_trace}
 
-        logger.info(
-            "Validated strategy catalog digest: %s",
-            hashlib.sha256(catalog_source).hexdigest(),
-        )
+        catalog_digest = hashlib.sha256(catalog_source).hexdigest()
+        logger.info("Validated strategy catalog digest: %s", catalog_digest)
         snapshot_root, package_name = StrategyLoader._snapshot_catalog_files(
             catalog_path.parent,
             files,
@@ -214,6 +213,11 @@ class StrategyLoader:
                     "__fluxtrade_readiness__",
                     entry["readiness"],
                 )
+                setattr(
+                    strategy_class,
+                    "__fluxtrade_catalog_sha256__",
+                    catalog_digest,
+                )
                 strategies[strategy_id] = strategy_class
                 logger.info("Loaded catalog strategy: %s", strategy_id)
             except Exception:
@@ -245,8 +249,7 @@ class StrategyLoader:
         pack_files = {
             path.relative_to(root).as_posix()
             for path in root.rglob("*")
-            if path.is_file()
-            and path.name != StrategyLoader.CATALOG_NAME
+            if path.is_file() and path.name != StrategyLoader.CATALOG_NAME
         }
         if declared_files != pack_files:
             missing = sorted(pack_files - declared_files)
@@ -284,10 +287,7 @@ class StrategyLoader:
                 "readiness",
             )
             values = {key: entry.get(key) for key in keys}
-            if not all(
-                isinstance(value, str) and value
-                for value in values.values()
-            ):
+            if not all(isinstance(value, str) and value for value in values.values()):
                 raise ValueError(
                     "strategy catalog entries require id, module, class, "
                     "display_name, artifact_version, readiness"
@@ -301,7 +301,9 @@ class StrategyLoader:
             if strategy_id in seen_ids:
                 raise ValueError(f"duplicate strategy id: {strategy_id}")
             if module_path not in files:
-                raise ValueError(f"strategy module is not integrity-pinned: {module_path}")
+                raise ValueError(
+                    f"strategy module is not integrity-pinned: {module_path}"
+                )
             if Path(module_path).suffix != ".py":
                 raise ValueError("strategy module must be a Python source file")
             if readiness not in StrategyLoader.READINESS_VALUES:
@@ -392,9 +394,7 @@ class StrategyLoader:
     ) -> None:
         if relative_parent == Path("."):
             return
-        importlib.import_module(
-            f"{package_name}.{'.'.join(relative_parent.parts)}"
-        )
+        importlib.import_module(f"{package_name}.{'.'.join(relative_parent.parts)}")
 
     @staticmethod
     def _declared_python_module_names(files: dict[str, bytes]) -> set[str]:
