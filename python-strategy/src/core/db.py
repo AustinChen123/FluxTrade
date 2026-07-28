@@ -1,25 +1,22 @@
 import os
 import threading
 from sqlalchemy import create_engine
+from sqlalchemy.engine import URL
 from sqlalchemy.orm import sessionmaker, Session
 from dotenv import load_dotenv
 
-_lock = threading.Lock()
+from src.core.database_url import build_postgres_url
+
+
+_lock = threading.RLock()
 _engine = None
 _session_factory = None
 
 
-def _build_database_url() -> str:
+def _build_database_url() -> URL:
     """Build the DATABASE_URL from environment variables."""
     load_dotenv(os.path.join(os.path.dirname(__file__), '../../../.env'))
-
-    postgres_user = os.getenv('POSTGRES_USER')
-    postgres_password = os.getenv('POSTGRES_PASSWORD')
-    postgres_host = os.getenv('POSTGRES_HOST')
-    postgres_port = os.getenv('POSTGRES_PORT')
-    postgres_db = os.getenv('POSTGRES_DB')
-
-    return f"postgresql://{postgres_user}:{postgres_password}@{postgres_host}:{postgres_port}/{postgres_db}"
+    return build_postgres_url(os.environ)
 
 
 def get_engine():
