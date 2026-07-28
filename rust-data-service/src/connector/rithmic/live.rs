@@ -5,7 +5,8 @@ use super::{
     session::Plant,
     transport::{self, ReconnectPolicy},
 };
-use crate::model::{validate_product_id, Candlestick};
+use crate::model::validate_product_id;
+use crate::AggregationSourceEvent;
 use anyhow::{ensure, Context, Result};
 use std::{
     sync::{Arc, Mutex},
@@ -49,11 +50,15 @@ pub(crate) fn configure(
     })
 }
 
-pub(crate) async fn run(config: LiveConfig, candle_tx: mpsc::Sender<Candlestick>) -> Result<()> {
+pub(crate) async fn run(
+    config: LiveConfig,
+    aggregation_source_tx: mpsc::Sender<AggregationSourceEvent>,
+) -> Result<()> {
     let (forward_tx, forward_rx) = mpsc::channel(FORWARD_QUEUE_CAPACITY);
+    let product_id = config.product_id.clone();
     let handler = Arc::new(Mutex::new(LivePayloadHandler {
         builder: MinuteBarBuilder::new(config.product_id, config.exchange, config.symbol)?,
-        candle_tx: forward_tx,
+        candle_tx: forward_tx.clone(),
         observed_last_trade: false,
     }));
     let reconnect_handler = Arc::clone(&handler);
@@ -70,6 +75,9 @@ pub(crate) async fn run(config: LiveConfig, candle_tx: mpsc::Sender<Candlestick>
                 .lock()
                 .map_err(|_| anyhow::anyhow!("Rithmic live handler lock poisoned"))?
                 .reset();
+            forward_tx
+                .try_send(AggregationSourceEvent::ResetProduct(product_id.clone()))
+                .context("Rithmic aggregation reset queue is unavailable")?;
             Ok(())
         },
         move |payload| {
@@ -82,13 +90,13 @@ pub(crate) async fn run(config: LiveConfig, candle_tx: mpsc::Sender<Candlestick>
 
     tokio::select! {
         result = transport => result,
-        result = forward_candles(forward_rx, candle_tx) => result,
+        result = forward_events(forward_rx, aggregation_source_tx) => result,
     }
 }
 
 struct LivePayloadHandler {
     builder: MinuteBarBuilder,
-    candle_tx: mpsc::Sender<Candlestick>,
+    candle_tx: mpsc::Sender<AggregationSourceEvent>,
     observed_last_trade: bool,
 }
 
@@ -114,7 +122,7 @@ impl LivePayloadHandler {
                         "Rithmic completed minute candle"
                     );
                     self.candle_tx
-                        .try_send(candle)
+                        .try_send(AggregationSourceEvent::Candle(candle))
                         .map_err(|error| match error {
                             mpsc::error::TrySendError::Full(_) => {
                                 anyhow::anyhow!("Rithmic candle forwarding queue exhausted")
@@ -141,15 +149,15 @@ impl LivePayloadHandler {
     }
 }
 
-async fn forward_candles(
-    mut source: mpsc::Receiver<Candlestick>,
-    destination: mpsc::Sender<Candlestick>,
+async fn forward_events(
+    mut source: mpsc::Receiver<AggregationSourceEvent>,
+    destination: mpsc::Sender<AggregationSourceEvent>,
 ) -> Result<()> {
-    while let Some(candle) = source.recv().await {
+    while let Some(event) = source.recv().await {
         destination
-            .send(candle)
+            .send(event)
             .await
-            .context("Rithmic candle destination is closed")?;
+            .context("Rithmic aggregation event destination is closed")?;
     }
     anyhow::bail!("Rithmic candle forwarding queue closed")
 }
@@ -177,6 +185,7 @@ mod tests {
     use crate::connector::rithmic::{
         codec, config::RuntimeConfig, protocol, session::LoginParameters,
     };
+    use crate::model::Candlestick;
     use futures_util::{SinkExt, StreamExt};
     use tokio::net::{TcpListener, TcpStream};
     use tokio::time::timeout;
@@ -203,7 +212,7 @@ mod tests {
         handler.handle(&last_trade(1_800_000_001)).unwrap();
         handler.handle(&last_trade(1_800_000_061)).unwrap();
 
-        let candle = candle_rx.try_recv().unwrap();
+        let candle = event_candle(candle_rx.try_recv().unwrap());
         assert_eq!(candle.product_id, "RITHMIC:NQ-202609");
         assert_eq!(candle.timestamp, 1_800_000_000_000);
         assert_eq!(candle.timeframe, "1m");
@@ -231,7 +240,10 @@ mod tests {
         assert!(candle_rx.try_recv().is_err());
 
         handler.handle(&last_trade(1_800_000_121)).unwrap();
-        assert_eq!(candle_rx.try_recv().unwrap().timestamp, 1_800_000_060_000);
+        assert_eq!(
+            event_candle(candle_rx.try_recv().unwrap()).timestamp,
+            1_800_000_060_000
+        );
     }
 
     #[tokio::test]
@@ -285,15 +297,27 @@ mod tests {
             exchange: "CME".to_string(),
             symbol: "NQU6".to_string(),
         };
-        let (candle_tx, mut candle_rx) = mpsc::channel(2);
-        let connector = tokio::spawn(run(config, candle_tx));
+        let (event_tx, mut event_rx) = mpsc::channel(4);
+        let connector = tokio::spawn(run(config, event_tx));
 
-        let candle = timeout(Duration::from_secs(2), candle_rx.recv())
+        let first = timeout(Duration::from_secs(2), event_rx.recv())
             .await
             .unwrap()
             .unwrap();
-        assert_eq!(candle.timestamp, 1_800_000_060_000);
-        assert!(candle_rx.try_recv().is_err());
+        let second = event_rx.recv().await.unwrap();
+        let third = event_rx.recv().await.unwrap();
+        assert!(matches!(
+            first,
+            AggregationSourceEvent::ResetProduct(ref product_id)
+                if product_id == "RITHMIC:NQ-202609"
+        ));
+        assert!(matches!(
+            second,
+            AggregationSourceEvent::ResetProduct(ref product_id)
+                if product_id == "RITHMIC:NQ-202609"
+        ));
+        assert_eq!(event_candle(third).timestamp, 1_800_000_060_000);
+        assert!(event_rx.try_recv().is_err());
 
         connector.abort();
         server.await.unwrap();
@@ -303,14 +327,26 @@ mod tests {
     async fn forwarder_waits_for_bounded_destination_capacity() {
         let (source_tx, source_rx) = mpsc::channel(1);
         let (destination_tx, mut destination_rx) = mpsc::channel(1);
-        destination_tx.send(candle(1)).await.unwrap();
-        source_tx.send(candle(2)).await.unwrap();
+        destination_tx
+            .send(AggregationSourceEvent::Candle(candle(1)))
+            .await
+            .unwrap();
+        source_tx
+            .send(AggregationSourceEvent::Candle(candle(2)))
+            .await
+            .unwrap();
 
-        let forwarder = tokio::spawn(forward_candles(source_rx, destination_tx));
+        let forwarder = tokio::spawn(forward_events(source_rx, destination_tx));
         tokio::task::yield_now().await;
         assert!(!forwarder.is_finished());
-        assert_eq!(destination_rx.recv().await.unwrap().timestamp, 1);
-        assert_eq!(destination_rx.recv().await.unwrap().timestamp, 2);
+        assert_eq!(
+            event_candle(destination_rx.recv().await.unwrap()).timestamp,
+            1
+        );
+        assert_eq!(
+            event_candle(destination_rx.recv().await.unwrap()).timestamp,
+            2
+        );
 
         drop(source_tx);
         assert!(forwarder.await.unwrap().is_err());
@@ -324,15 +360,20 @@ mod tests {
 
         let error = handler.handle(&last_trade(1_800_000_121)).unwrap_err();
         assert!(error.to_string().contains("queue exhausted"));
-        assert_eq!(candle_rx.try_recv().unwrap().timestamp, 1_800_000_000_000);
+        assert_eq!(
+            event_candle(candle_rx.try_recv().unwrap()).timestamp,
+            1_800_000_000_000
+        );
         assert!(candle_rx.try_recv().is_err());
     }
 
-    fn handler() -> (LivePayloadHandler, mpsc::Receiver<Candlestick>) {
+    fn handler() -> (LivePayloadHandler, mpsc::Receiver<AggregationSourceEvent>) {
         handler_with_capacity(FORWARD_QUEUE_CAPACITY)
     }
 
-    fn handler_with_capacity(capacity: usize) -> (LivePayloadHandler, mpsc::Receiver<Candlestick>) {
+    fn handler_with_capacity(
+        capacity: usize,
+    ) -> (LivePayloadHandler, mpsc::Receiver<AggregationSourceEvent>) {
         let (candle_tx, candle_rx) = mpsc::channel(capacity);
         (
             LivePayloadHandler {
@@ -347,6 +388,15 @@ mod tests {
             },
             candle_rx,
         )
+    }
+
+    fn event_candle(event: AggregationSourceEvent) -> Candlestick {
+        match event {
+            AggregationSourceEvent::Candle(candle) => candle,
+            AggregationSourceEvent::ResetProduct(product_id) => {
+                panic!("expected candle event, received reset for {product_id}")
+            }
+        }
     }
 
     fn candle(timestamp: i64) -> Candlestick {

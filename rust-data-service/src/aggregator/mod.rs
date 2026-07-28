@@ -8,6 +8,7 @@ const MAX_SOURCE_TIMEFRAME_MS: i64 = 5 * 60 * 1000;
 struct AggregationBuffer {
     candle: Candlestick,
     last_timestamp: i64,
+    eligible: bool,
 }
 
 pub struct CandleAggregator {
@@ -20,6 +21,11 @@ impl CandleAggregator {
         Self {
             buffers: HashMap::new(),
         }
+    }
+
+    pub fn reset_product(&mut self, product_id: &str) {
+        self.buffers
+            .retain(|(buffer_product_id, _, _), _| buffer_product_id != product_id);
     }
 
     /// Adds one source candle and returns a candle only when the target window is closed.
@@ -66,13 +72,13 @@ impl CandleAggregator {
                     AggregationBuffer {
                         candle: completed.clone(),
                         last_timestamp: candle.timestamp,
+                        eligible: true,
                     },
                 );
                 return Ok(Some(completed));
             }
             if bucket_start > buffer.candle.timestamp {
-                // Window closed, return buffer and start new one
-                let completed = buffer.candle;
+                let completed = buffer.eligible.then_some(buffer.candle);
 
                 // Initialize new buffer with current candle
                 let mut new_buffer = candle.clone();
@@ -83,10 +89,11 @@ impl CandleAggregator {
                     AggregationBuffer {
                         candle: new_buffer,
                         last_timestamp: candle.timestamp,
+                        eligible: buffer.eligible || candle.timestamp == bucket_start,
                     },
                 );
 
-                Ok(Some(completed))
+                Ok(completed)
             } else {
                 // Update current buffer
                 buffer.candle.high = buffer.candle.high.max(candle.high);
@@ -107,6 +114,7 @@ impl CandleAggregator {
                 AggregationBuffer {
                     candle: new_buffer,
                     last_timestamp: candle.timestamp,
+                    eligible: candle.timestamp == bucket_start,
                 },
             );
             if source_ms == target_ms {
@@ -175,6 +183,19 @@ mod tests {
             volume: dec!(10),
         };
 
+        let middle = (1..4)
+            .map(|minute| Candlestick {
+                product_id: product.clone(),
+                timeframe: "1m".to_string(),
+                timestamp: base_ts + minute * 60 * 1000,
+                open: dec!(105),
+                high: dec!(111),
+                low: dec!(95),
+                close: dec!(106),
+                volume: dec!(10),
+            })
+            .collect::<Vec<_>>();
+
         // 22:04 candle
         let c2 = Candlestick {
             product_id: product.clone(),
@@ -200,6 +221,9 @@ mod tests {
         };
 
         assert!(aggregator.add_candle(&c1, "5m").unwrap().is_none());
+        for candle in middle {
+            assert!(aggregator.add_candle(&candle, "5m").unwrap().is_none());
+        }
         assert!(aggregator.add_candle(&c2, "5m").unwrap().is_none());
 
         let completed = aggregator
@@ -212,8 +236,172 @@ mod tests {
         assert_eq!(completed.high, dec!(115));
         assert_eq!(completed.low, dec!(90));
         assert_eq!(completed.close, dec!(112));
-        assert_eq!(completed.volume, dec!(20));
+        assert_eq!(completed.volume, dec!(50));
         assert_eq!(completed.timeframe, "5m");
+    }
+
+    #[test]
+    fn aggregation_discards_partial_startup_bucket_then_recovers() {
+        let mut aggregator = CandleAggregator::new();
+        let base_ts = 1_800_000_000_000i64;
+        let candle = |minute: i64| Candlestick {
+            product_id: "RITHMIC:MNQ-202609".to_string(),
+            timeframe: "1m".to_string(),
+            timestamp: base_ts + minute * 60_000,
+            open: dec!(100),
+            high: dec!(101),
+            low: dec!(99),
+            close: dec!(100),
+            volume: dec!(1),
+        };
+
+        for minute in 2..5 {
+            assert!(aggregator
+                .add_candle(&candle(minute), "5m")
+                .unwrap()
+                .is_none());
+        }
+        assert!(aggregator.add_candle(&candle(5), "5m").unwrap().is_none());
+        for minute in 6..10 {
+            assert!(aggregator
+                .add_candle(&candle(minute), "5m")
+                .unwrap()
+                .is_none());
+        }
+
+        let completed = aggregator
+            .add_candle(&candle(10), "5m")
+            .unwrap()
+            .expect("the next complete bucket should be emitted");
+        assert_eq!(completed.timestamp, base_ts + 5 * 60_000);
+        assert_eq!(completed.volume, dec!(5));
+    }
+
+    #[test]
+    fn aggregation_does_not_promote_a_later_partial_bucket() {
+        let mut aggregator = CandleAggregator::new();
+        let base_ts = 1_800_000_000_000i64;
+        let candle = |minute: i64| Candlestick {
+            product_id: "RITHMIC:MNQ-202609".to_string(),
+            timeframe: "1m".to_string(),
+            timestamp: base_ts + minute * 60_000,
+            open: dec!(100),
+            high: dec!(101),
+            low: dec!(99),
+            close: dec!(100),
+            volume: dec!(1),
+        };
+
+        assert!(aggregator.add_candle(&candle(2), "5m").unwrap().is_none());
+        assert!(aggregator.add_candle(&candle(7), "5m").unwrap().is_none());
+        assert!(aggregator.add_candle(&candle(10), "5m").unwrap().is_none());
+
+        for minute in 11..15 {
+            assert!(aggregator
+                .add_candle(&candle(minute), "5m")
+                .unwrap()
+                .is_none());
+        }
+        let completed = aggregator
+            .add_candle(&candle(15), "5m")
+            .unwrap()
+            .expect("eligibility should recover only from an aligned bucket start");
+        assert_eq!(completed.timestamp, base_ts + 10 * 60_000);
+        assert_eq!(completed.volume, dec!(5));
+    }
+
+    #[test]
+    fn aggregation_reset_discards_pre_reconnect_partial_bucket() {
+        let mut aggregator = CandleAggregator::new();
+        let product_id = "RITHMIC:MNQ-202609";
+        let base_ts = 1_800_000_000_000i64;
+        let candle = |minute: i64| Candlestick {
+            product_id: product_id.to_string(),
+            timeframe: "1m".to_string(),
+            timestamp: base_ts + minute * 60_000,
+            open: dec!(100),
+            high: dec!(101),
+            low: dec!(99),
+            close: dec!(100),
+            volume: dec!(1),
+        };
+
+        for minute in 0..2 {
+            assert!(aggregator
+                .add_candle(&candle(minute), "5m")
+                .unwrap()
+                .is_none());
+        }
+        aggregator.reset_product(product_id);
+        for minute in 3..6 {
+            assert!(aggregator
+                .add_candle(&candle(minute), "5m")
+                .unwrap()
+                .is_none());
+        }
+    }
+
+    #[test]
+    fn aggregation_allows_minutes_without_trades_after_bucket_start() {
+        let mut aggregator = CandleAggregator::new();
+        let base_ts = 1_800_000_000_000i64;
+        let candle = |minute: i64| Candlestick {
+            product_id: "RITHMIC:MNQ-202609".to_string(),
+            timeframe: "1m".to_string(),
+            timestamp: base_ts + minute * 60_000,
+            open: dec!(100),
+            high: dec!(101),
+            low: dec!(99),
+            close: dec!(100),
+            volume: dec!(1),
+        };
+
+        for minute in [0, 1, 3, 4] {
+            assert!(aggregator
+                .add_candle(&candle(minute), "5m")
+                .unwrap()
+                .is_none());
+        }
+        let completed = aggregator
+            .add_candle(&candle(5), "5m")
+            .unwrap()
+            .expect("a no-trade minute does not make the observed OHLCV partial");
+        assert_eq!(completed.volume, dec!(4));
+    }
+
+    #[test]
+    fn aggregation_preserves_continuity_across_session_and_no_trade_gaps() {
+        let mut aggregator = CandleAggregator::new();
+        let base_ts = 1_800_000_000_000i64;
+        let candle = |minute: i64| Candlestick {
+            product_id: "RITHMIC:MNQ-202609".to_string(),
+            timeframe: "1m".to_string(),
+            timestamp: base_ts + minute * 60_000,
+            open: dec!(100),
+            high: dec!(101),
+            low: dec!(99),
+            close: dec!(100),
+            volume: dec!(1),
+        };
+
+        for minute in 0..5 {
+            assert!(aggregator
+                .add_candle(&candle(minute), "5m")
+                .unwrap()
+                .is_none());
+        }
+        let completed = aggregator
+            .add_candle(&candle(21), "5m")
+            .unwrap()
+            .expect("a later gap must not invalidate the already complete bucket");
+        assert_eq!(completed.timestamp, base_ts);
+        assert!(aggregator.add_candle(&candle(24), "5m").unwrap().is_none());
+        let sparse = aggregator
+            .add_candle(&candle(25), "5m")
+            .unwrap()
+            .expect("a no-trade bucket start must not suppress later observed trades");
+        assert_eq!(sparse.timestamp, base_ts + 20 * 60_000);
+        assert_eq!(sparse.volume, dec!(2));
     }
 
     #[test]

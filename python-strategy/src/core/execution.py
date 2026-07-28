@@ -64,7 +64,7 @@ class ExitDecision:
 class ExecutionEngine:
     def __init__(
         self,
-        db_session: Session,
+        db_session: Session | None,
         clock: Clock,
         adapter: IExchangeAdapter,
         order_repository: Optional[IOrderRepository] = None,
@@ -488,6 +488,17 @@ class ExecutionEngine:
                     fill_quantity=qty,
                     fee=fee,
                 )
+                if self.audit_external_orders and order.type in {"market", "limit"}:
+                    failures = self._place_pending_conditional_orders_for_entry(order)
+                    if failures:
+                        with self._submission_gate:
+                            self._claim_reconcile_halt_locked()
+                        raise ExchangeError(
+                            "conditional_order_placement_failed_after_simulated_fill: "
+                            f"{failures}"
+                        )
+                for cancelled_order in fill.get("cancelled_orders", []):
+                    self.order_manager.mark_cancelled(cancelled_order)
 
                 if self.journal is not None:
                     self._journal_fill(order, price, qty, fee, fill_type, candle)

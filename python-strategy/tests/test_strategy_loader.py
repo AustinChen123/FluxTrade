@@ -22,7 +22,7 @@ import pytest
 from src.core.strategy_loader import StrategyLoader
 from src.strategies.base import BaseStrategy
 
-STRATEGY_CODE = '''
+STRATEGY_CODE = """
 from src.strategies.base import BaseStrategy, StrategyRequirements
 from src.core.models import Signal, SignalType
 
@@ -38,7 +38,7 @@ class ManifestStrategy(BaseStrategy):
             timestamp=candle.timestamp,
             type=SignalType.NO_SIGNAL,
         )
-'''
+"""
 
 
 def _write_catalog(
@@ -71,7 +71,6 @@ def _write_catalog(
 
 
 class TestScanEmptyAndMissing:
-
     def test_scan_nonexistent_directory(self, tmp_path):
         """Should return empty dict for nonexistent path."""
         result = StrategyLoader.scan_directory(str(tmp_path / "nonexistent"))
@@ -90,10 +89,9 @@ class TestScanEmptyAndMissing:
 
 
 class TestFindStrategies:
-
     def test_finds_single_strategy(self, tmp_path):
         """Should discover a valid BaseStrategy subclass."""
-        code = '''
+        code = """
 from src.strategies.base import BaseStrategy, StrategyRequirements
 from src.core.models import Candlestick, Signal, SignalType
 
@@ -110,7 +108,7 @@ class MyStrategy(BaseStrategy):
             type=SignalType.NO_SIGNAL,
             value=candle.close,
         )
-'''
+"""
         (tmp_path / "my_strat.py").write_text(code)
         result = StrategyLoader.scan_directory(str(tmp_path))
 
@@ -119,7 +117,7 @@ class MyStrategy(BaseStrategy):
 
     def test_finds_multiple_strategies_in_one_file(self, tmp_path):
         """Should discover multiple subclasses in one file."""
-        code = '''
+        code = """
 from src.strategies.base import BaseStrategy, StrategyRequirements
 from src.core.models import Candlestick, Signal, SignalType
 
@@ -138,7 +136,7 @@ class StratB(BaseStrategy):
     def on_candle(self, candle):
         return Signal(strategy_id=self.strategy_id, product_id=self.product_id,
                       timeframe="5m", timestamp=0, type=SignalType.NO_SIGNAL, value=candle.close)
-'''
+"""
         (tmp_path / "multi.py").write_text(code)
         result = StrategyLoader.scan_directory(str(tmp_path))
 
@@ -147,7 +145,7 @@ class StratB(BaseStrategy):
 
     def test_finds_strategies_across_files(self, tmp_path):
         """Should discover strategies from multiple .py files."""
-        code_template = '''
+        code_template = """
 from src.strategies.base import BaseStrategy, StrategyRequirements
 from src.core.models import Candlestick, Signal, SignalType
 
@@ -158,7 +156,7 @@ class {name}(BaseStrategy):
     def on_candle(self, candle):
         return Signal(strategy_id=self.strategy_id, product_id=self.product_id,
                       timeframe="1m", timestamp=0, type=SignalType.NO_SIGNAL, value=candle.close)
-'''
+"""
         (tmp_path / "a.py").write_text(code_template.format(name="AlphaStrat"))
         (tmp_path / "b.py").write_text(code_template.format(name="BetaStrat"))
         result = StrategyLoader.scan_directory(str(tmp_path))
@@ -167,9 +165,9 @@ class {name}(BaseStrategy):
         assert "b.py::BetaStrat" in result
 
     def test_ignores_imported_strategy_classes(self, tmp_path):
-        code = '''
+        code = """
 from src.strategies.golden_cross import GoldenCrossStrategy
-'''
+"""
         (tmp_path / "imports.py").write_text(code)
 
         assert StrategyLoader.scan_directory(str(tmp_path)) == {}
@@ -188,7 +186,6 @@ from src.strategies.golden_cross import GoldenCrossStrategy
 
 
 class TestCatalogStrategies:
-
     def test_catalog_loads_only_declared_class_under_stable_id(self, tmp_path):
         _write_catalog(tmp_path)
 
@@ -333,25 +330,32 @@ class TestCatalogStrategies:
                 }
             ],
         }
-        (tmp_path / StrategyLoader.CATALOG_NAME).write_text(json.dumps(catalog))
+        catalog_path = tmp_path / StrategyLoader.CATALOG_NAME
+        catalog_path.write_text(json.dumps(catalog))
+        catalog_digest = hashlib.sha256(catalog_path.read_bytes()).hexdigest()
 
         result = StrategyLoader.scan_directory(str(tmp_path))
 
         assert result["stable_strategy_v1"].helper_value == 7
         assert (
-            result["stable_strategy_v1"].__fluxtrade_readiness__
-            == "RESEARCH_VALIDATED"
+            result["stable_strategy_v1"].__fluxtrade_readiness__ == "RESEARCH_VALIDATED"
+        )
+        assert (
+            result["stable_strategy_v1"].__fluxtrade_catalog_sha256__ == catalog_digest
         )
 
         helper.write_text("VALUE = 8\n")
-        catalog["files"]["helper.py"] = hashlib.sha256(
-            helper.read_bytes()
-        ).hexdigest()
-        (tmp_path / StrategyLoader.CATALOG_NAME).write_text(json.dumps(catalog))
+        catalog["files"]["helper.py"] = hashlib.sha256(helper.read_bytes()).hexdigest()
+        catalog_path.write_text(json.dumps(catalog))
+        rescanned_digest = hashlib.sha256(catalog_path.read_bytes()).hexdigest()
 
         rescanned = StrategyLoader.scan_directory(str(tmp_path))
 
         assert rescanned["stable_strategy_v1"].helper_value == 8
+        assert (
+            rescanned["stable_strategy_v1"].__fluxtrade_catalog_sha256__
+            == rescanned_digest
+        )
 
     def test_catalog_imports_the_verified_snapshot_when_source_changes(
         self,
@@ -437,21 +441,15 @@ class TestCatalogStrategies:
                     }
                 ],
             }
-            (tmp_path / StrategyLoader.CATALOG_NAME).write_text(
-                json.dumps(catalog)
-            )
+            (tmp_path / StrategyLoader.CATALOG_NAME).write_text(json.dumps(catalog))
 
         write_catalog(7)
-        first_class = StrategyLoader.scan_directory(str(tmp_path))[
-            "lazy_strategy_v1"
-        ]
+        first_class = StrategyLoader.scan_directory(str(tmp_path))["lazy_strategy_v1"]
         helper.write_text("VALUE = 99\n")
         assert first_class("first", "product").on_candle(None) == 7
 
         write_catalog(8)
-        second_class = StrategyLoader.scan_directory(str(tmp_path))[
-            "lazy_strategy_v1"
-        ]
+        second_class = StrategyLoader.scan_directory(str(tmp_path))["lazy_strategy_v1"]
 
         assert first_class("first", "product").on_candle(None) == 7
         assert second_class("second", "product").on_candle(None) == 8
@@ -601,9 +599,18 @@ class TestCatalogStrategies:
         error = result[f"{StrategyLoader.CATALOG_NAME}::LoadError"]
         assert "unknown strategy readiness" in error
 
+    def test_catalog_accepts_research_frozen_readiness(self, tmp_path):
+        _write_catalog(tmp_path, readiness="RESEARCH_FROZEN")
+
+        result = StrategyLoader.scan_directory(str(tmp_path))
+
+        assert (
+            result["stable_strategy_v1"].__fluxtrade_readiness__
+            == "RESEARCH_FROZEN"
+        )
+
 
 class TestIgnoreNonStrategies:
-
     def test_ignores_file_without_base_subclass(self, tmp_path):
         """Files without BaseStrategy subclass should be ignored."""
         (tmp_path / "util.py").write_text("def helper(): return 42\n")
@@ -621,7 +628,7 @@ class TestIgnoreNonStrategies:
 
     def test_ignores_base_strategy_itself(self, tmp_path):
         """BaseStrategy itself should not appear as a discovered strategy."""
-        code = '''
+        code = """
 from src.strategies.base import BaseStrategy, StrategyRequirements
 from src.core.models import Candlestick, Signal, SignalType
 
@@ -632,7 +639,7 @@ class ConcreteStrat(BaseStrategy):
     def on_candle(self, candle):
         return Signal(strategy_id=self.strategy_id, product_id=self.product_id,
                       timeframe="1m", timestamp=0, type=SignalType.NO_SIGNAL, value=candle.close)
-'''
+"""
         (tmp_path / "strat.py").write_text(code)
         result = StrategyLoader.scan_directory(str(tmp_path))
 
@@ -643,7 +650,6 @@ class ConcreteStrat(BaseStrategy):
 
 
 class TestErrorHandling:
-
     def test_syntax_error_captured_as_load_error(self, tmp_path):
         """Syntax errors should produce a LoadError entry."""
         (tmp_path / "bad_syntax.py").write_text("def foo(:\n  pass\n")
@@ -671,7 +677,7 @@ class TestErrorHandling:
 
     def test_mixed_good_and_bad_files(self, tmp_path):
         """Good files should load even when other files have errors."""
-        good_code = '''
+        good_code = """
 from src.strategies.base import BaseStrategy, StrategyRequirements
 from src.core.models import Candlestick, Signal, SignalType
 
@@ -682,7 +688,7 @@ class GoodStrat(BaseStrategy):
     def on_candle(self, candle):
         return Signal(strategy_id=self.strategy_id, product_id=self.product_id,
                       timeframe="1m", timestamp=0, type=SignalType.NO_SIGNAL, value=candle.close)
-'''
+"""
         (tmp_path / "good.py").write_text(good_code)
         (tmp_path / "bad.py").write_text("def broken(:\n  pass\n")
 

@@ -1586,7 +1586,7 @@ class StrategyEngine:
         if self.runtime_environment.identity != "live":
             return
         readiness = getattr(strategy_cls, "__fluxtrade_readiness__", None)
-        if readiness is not None and readiness != "LIVE_APPROVED":
+        if readiness != "LIVE_APPROVED":
             raise RuntimeError(
                 f"strategy_live_approval_required: readiness={readiness}"
             )
