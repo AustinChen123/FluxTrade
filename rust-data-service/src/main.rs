@@ -100,7 +100,7 @@ enum Commands {
     },
 
     #[cfg(feature = "rithmic")]
-    /// Downloads exact Rithmic 1m bars into the candle database.
+    /// Downloads closed exact Rithmic 1m bars into the candle database.
     RithmicHistory {
         #[arg(long)]
         profile: String,
@@ -116,6 +116,27 @@ enum Commands {
         /// Exclusive UTC epoch milliseconds, aligned to a minute boundary.
         #[arg(long)]
         end_ms: i64,
+    },
+
+    #[cfg(feature = "rithmic")]
+    /// Downloads closed exact Rithmic 1m bars into an atomic CSV file.
+    RithmicHistoryExport {
+        #[arg(long)]
+        profile: String,
+        #[arg(long)]
+        product_id: String,
+        #[arg(long)]
+        exchange: String,
+        #[arg(long)]
+        symbol: String,
+        /// Inclusive UTC epoch milliseconds, aligned to a minute boundary.
+        #[arg(long)]
+        start_ms: i64,
+        /// Exclusive UTC epoch milliseconds, aligned to a minute boundary.
+        #[arg(long)]
+        end_ms: i64,
+        #[arg(long)]
+        output: std::path::PathBuf,
     },
 
     #[cfg(feature = "rithmic")]
@@ -215,6 +236,33 @@ async fn main() -> anyhow::Result<()> {
             )
             .await?;
             info!(inserted, "Rithmic history backfill completed");
+        }
+
+        #[cfg(feature = "rithmic")]
+        Commands::RithmicHistoryExport {
+            profile,
+            product_id,
+            exchange,
+            symbol,
+            start_ms,
+            end_ms,
+            output,
+        } => {
+            let exported = crate::connector::rithmic::history_runtime::export_csv(
+                &profile,
+                &product_id,
+                &exchange,
+                &symbol,
+                start_ms,
+                end_ms,
+                &output,
+            )
+            .await?;
+            info!(
+                exported,
+                output = %output.display(),
+                "Rithmic history CSV export completed"
+            );
         }
 
         #[cfg(feature = "rithmic")]

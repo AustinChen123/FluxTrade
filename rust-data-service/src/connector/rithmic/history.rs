@@ -141,7 +141,12 @@ impl HistoryPageDecoder {
 
         let marker = response.marker.context("missing Rithmic history marker")?;
         ensure!(
-            marker >= 0 && marker <= self.finish_index,
+            marker >= 0
+                && (marker <= self.finish_index
+                    || self
+                        .finish_index
+                        .checked_add(60)
+                        .is_some_and(|boundary| marker == boundary)),
             "invalid Rithmic history marker"
         );
         ensure!(
@@ -294,6 +299,37 @@ mod tests {
                 .decode(&payload)
                 .is_err());
         }
+    }
+
+    #[test]
+    fn boundary_bar_beyond_requested_finish_completes_without_error() {
+        let mut decoder = HistoryPageDecoder::new("page", "CME", "NQU6", 120).unwrap();
+        let HistoryEvent::Bar(bar) = decoder
+            .decode(&response(vec![], vec!["0"], Some(180)))
+            .unwrap()
+        else {
+            panic!("expected boundary history bar");
+        };
+        assert_eq!(bar.end_timestamp, 180_000);
+        assert_eq!(
+            decoder.decode(&response(vec!["0"], vec![], None)).unwrap(),
+            HistoryEvent::PageEnded { next_start: None }
+        );
+    }
+
+    #[test]
+    fn non_boundary_markers_beyond_finish_are_rejected() {
+        for marker in [121, 179, 240] {
+            assert!(HistoryPageDecoder::new("page", "CME", "NQU6", 120)
+                .unwrap()
+                .decode(&response(vec![], vec!["0"], Some(marker)))
+                .is_err());
+        }
+
+        assert!(HistoryPageDecoder::new("page", "CME", "NQU6", i32::MAX)
+            .unwrap()
+            .decode(&response(vec![], vec!["0"], Some(i32::MAX)))
+            .is_ok());
     }
 
     #[test]
