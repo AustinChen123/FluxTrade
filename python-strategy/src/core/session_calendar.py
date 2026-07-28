@@ -88,6 +88,11 @@ class CmeEquityIndexCalendar:
             utc_date += timedelta(days=1)
         return False
 
+    def scheduled_close_ms(self, session_date: date) -> int | None:
+        """Return the packaged calendar close for one trading-date label."""
+
+        return _cme_scheduled_close_ms(session_date)
+
 
 def _has_unclosed_time(
     start_ms: int, end_ms: int, closures: tuple[SessionClosure, ...]
@@ -152,6 +157,25 @@ def _is_month_end_session(session_date: date) -> bool:
         start_date=session_date + timedelta(days=1),
         end_date=month_end,
     ).empty
+
+
+@lru_cache(maxsize=512)
+def _cme_scheduled_close_ms(session_date: date) -> int | None:
+    return _cme_scheduled_closes(session_date.year).get(session_date)
+
+
+@lru_cache(maxsize=32)
+def _cme_scheduled_closes(year: int) -> dict[date, int]:
+    schedule = _CME_EQUITY.schedule(
+        start_date=date(year, 1, 1),
+        end_date=date(year, 12, 31),
+    )
+    return {
+        cast(datetime, session_label).date(): _timestamp_ms(
+            cast(datetime, session["market_close"])
+        )
+        for session_label, session in schedule.iterrows()
+    }
 
 
 def _timestamp_ms(value: datetime) -> int:

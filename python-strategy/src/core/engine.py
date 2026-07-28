@@ -1377,7 +1377,8 @@ class StrategyEngine:
         
         # Update class registry
         new_classes = {k: v for k, v in found.items() if not isinstance(v, str)}
-        self.loaded_classes.update(new_classes)
+        with self._strategy_lock:
+            self.loaded_classes = new_classes
         
         # Sync with DB
         with self._db_session_factory() as db:
@@ -1445,7 +1446,8 @@ class StrategyEngine:
         Performs a test run/warm-up for a strategy.
         """
         logger.info("🧪 Test Run for %s (days=%s)", strategy_id, days)
-        if strategy_id not in self.loaded_classes:
+        strategy_cls = self._get_loaded_strategy_class(strategy_id)
+        if strategy_cls is None:
             logger.error("Strategy %s not loaded.", strategy_id)
             return
 
@@ -1457,7 +1459,6 @@ class StrategyEngine:
 
             try:
                 # Instantiate with dummy product to get requirements
-                strategy_cls = self.loaded_classes[strategy_id]
                 config = json.loads(state.config_json or "{}")
                 product_id = self._strategy_product_id(config)
                 
@@ -1500,7 +1501,8 @@ class StrategyEngine:
     ) -> None:
         """Instantiate/register a strategy and transition it to ACTIVE."""
         logger.info("🚀 Starting Strategy: %s", strategy_id)
-        if strategy_id not in self.loaded_classes:
+        strategy_cls = self._get_loaded_strategy_class(strategy_id)
+        if strategy_cls is None:
             logger.error("Strategy %s not loaded.", strategy_id)
             return
 
@@ -1516,7 +1518,7 @@ class StrategyEngine:
                 config = json.loads(state.config_json or "{}")
                 product_id = self._strategy_product_id(config)
                 
-                strategy_cls = self.loaded_classes[strategy_id]
+                self._assert_strategy_live_readiness(strategy_cls)
                 instance = strategy_cls(strategy_id, product_id)
                 self._warm_up_strategy_instance(db, instance)
                 if self.runtime_environment.identity == "live":
@@ -1563,6 +1565,25 @@ class StrategyEngine:
                 f"strategy product_id is not enabled for live adapter: {product_id}"
             )
         return product_id
+
+    def _get_loaded_strategy_class(
+        self,
+        strategy_id: str,
+    ) -> type[BaseStrategy] | None:
+        with self._strategy_lock:
+            return self.loaded_classes.get(strategy_id)
+
+    def _assert_strategy_live_readiness(
+        self,
+        strategy_cls: type[BaseStrategy],
+    ) -> None:
+        if self.runtime_environment.identity != "live":
+            return
+        readiness = getattr(strategy_cls, "__fluxtrade_readiness__", None)
+        if readiness is not None and readiness != "LIVE_APPROVED":
+            raise RuntimeError(
+                f"strategy_live_approval_required: readiness={readiness}"
+            )
 
     def _warm_up_strategy_instance(
         self,
@@ -2364,6 +2385,7 @@ class StrategyEngine:
         """
         Legacy support for static registration.
         """
+        self._assert_strategy_live_readiness(type(strategy))
         if self.runtime_environment.identity == "live":
             self._fresh_strategy_instance_for_replay(strategy)
         with self._strategy_lock:
