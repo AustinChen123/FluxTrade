@@ -147,6 +147,21 @@ enum Commands {
         #[arg(long)]
         account_id: Option<String>,
     },
+
+    #[cfg(feature = "rithmic")]
+    /// Resolves one root symbol to Rithmic's current front-month contract.
+    RithmicFrontMonth {
+        #[arg(long)]
+        profile: String,
+        #[arg(long)]
+        root_symbol: String,
+        #[arg(long)]
+        exchange: String,
+        #[arg(long)]
+        exclusive_session: bool,
+        #[arg(long, default_value_t = 15)]
+        timeout_seconds: u64,
+    },
 }
 
 #[tokio::main]
@@ -280,6 +295,29 @@ async fn main() -> anyhow::Result<()> {
                 has_account_summary = snapshot.account_summary.is_some(),
                 "Rithmic remote ledger snapshot completed"
             );
+        }
+
+        #[cfg(feature = "rithmic")]
+        Commands::RithmicFrontMonth {
+            profile,
+            root_symbol,
+            exchange,
+            exclusive_session,
+            timeout_seconds,
+        } => {
+            anyhow::ensure!(
+                (1..=120).contains(&timeout_seconds),
+                "--timeout-seconds must be between 1 and 120"
+            );
+            let trading_symbol = crate::connector::rithmic::front_month_runtime::run(
+                &profile,
+                &root_symbol,
+                &exchange,
+                exclusive_session,
+                std::time::Duration::from_secs(timeout_seconds),
+            )
+            .await?;
+            println!("{trading_symbol}");
         }
     }
 
