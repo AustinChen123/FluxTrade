@@ -70,6 +70,31 @@ def test_cme_labor_day_early_close_uses_market_calendar():
     assert calendar.is_open(_timestamp_ms("2026-09-07T22:00:00"))
 
 
+@pytest.mark.parametrize(
+    ("session_date", "expected_close"),
+    [
+        ("2026-01-05", "2026-01-05T22:00:00"),
+        ("2026-07-13", "2026-07-13T21:00:00"),
+        ("2026-09-07", "2026-09-07T17:00:00"),
+    ],
+)
+def test_cme_scheduled_close_tracks_dst_and_early_close(
+    session_date,
+    expected_close,
+):
+    calendar = CmeEquityIndexCalendar()
+
+    assert calendar.scheduled_close_ms(
+        datetime.fromisoformat(session_date).date()
+    ) == _timestamp_ms(expected_close)
+
+
+def test_cme_scheduled_close_is_none_for_non_trading_date():
+    calendar = CmeEquityIndexCalendar()
+
+    assert calendar.scheduled_close_ms(datetime(2026, 9, 6).date()) is None
+
+
 def test_explicit_closure_overrides_regular_session():
     closure = SessionClosure(
         _timestamp_ms("2026-07-03T17:00:00"),
