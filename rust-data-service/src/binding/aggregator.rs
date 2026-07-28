@@ -41,6 +41,10 @@ impl PyCandleAggregator {
             .map_err(|error| PyValueError::new_err(error.to_string()))
     }
 
+    fn reset_product(&mut self, product_id: &str) {
+        self.inner.reset_product(product_id);
+    }
+
     #[staticmethod]
     fn can_aggregate(source_timeframe: &str, target_timeframe: &str) -> PyResult<bool> {
         CandleAggregator::can_aggregate(source_timeframe, target_timeframe)

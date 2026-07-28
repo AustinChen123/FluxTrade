@@ -23,6 +23,12 @@ use tokio::sync::mpsc;
 use tokio::task::JoinSet;
 use tracing::{error, info, warn, Level};
 
+#[derive(Debug)]
+pub(crate) enum AggregationSourceEvent {
+    Candle(model::Candlestick),
+    ResetProduct(String),
+}
+
 #[derive(Parser)]
 #[command(author, version, about, long_about = None)]
 struct Cli {
@@ -448,6 +454,7 @@ async fn run_live_mode(
     let (trade_tx, trade_rx) = mpsc::channel(1000);
     let (candle_tx, candle_rx) = mpsc::channel(1000);
     let (user_tx, user_rx) = mpsc::channel(100);
+    let (aggregation_source_tx, aggregation_source_rx) = mpsc::channel(1000);
 
     let enabled_exchanges_raw = exchange_opt
         .or_else(|| non_empty_env("EXCHANGE_ENABLED"))
@@ -575,8 +582,10 @@ async fn run_live_mode(
             #[cfg(feature = "rithmic")]
             "rithmic" => {
                 let config = rithmic_config.take().expect("Rithmic configuration loaded");
+                let aggregation_source_tx = aggregation_source_tx.clone();
                 join_set.spawn(async move {
-                    let result = crate::connector::rithmic::live::run(config, candle_tx).await;
+                    let result =
+                        crate::connector::rithmic::live::run(config, aggregation_source_tx).await;
                     (TaskId::Connector("rithmic".to_string()), result)
                 });
                 info!("Supervised task spawned: connector:rithmic");
@@ -589,11 +598,19 @@ async fn run_live_mode(
     drop(trade_tx);
     drop(candle_tx);
     drop(user_tx);
+    drop(aggregation_source_tx);
 
     // Spawn the main event loop (aggregation + forwarding to publisher channel)
     let event_pub_sender = pub_sender.clone();
     join_set.spawn(async move {
-        let result = run_event_loop(trade_rx, candle_rx, user_rx, event_pub_sender).await;
+        let result = run_event_loop(
+            trade_rx,
+            candle_rx,
+            user_rx,
+            aggregation_source_rx,
+            event_pub_sender,
+        )
+        .await;
         (TaskId::EventLoop, result)
     });
     info!("Supervised task spawned: event-loop");
@@ -674,12 +691,14 @@ async fn run_event_loop(
     mut trade_rx: mpsc::Receiver<model::Trade>,
     mut candle_rx: mpsc::Receiver<model::Candlestick>,
     mut user_rx: mpsc::Receiver<UserStreamEvent>,
+    mut aggregation_source_rx: mpsc::Receiver<AggregationSourceEvent>,
     pub_sender: PublishSender,
 ) -> anyhow::Result<()> {
     let mut aggregator = CandleAggregator::new();
     let mut trade_open = true;
     let mut candle_open = true;
     let mut user_open = true;
+    let mut aggregation_source_open = true;
 
     info!("Event loop started");
 
@@ -702,45 +721,7 @@ async fn run_event_loop(
             msg = candle_rx.recv(), if candle_open => {
                 match msg {
                     Some(candle) => {
-                        // Publish the source candle unchanged.
-                        if let Err(e) = pub_sender.publish_candle(&candle).await {
-                            warn!("Failed to send candle to publisher: {}", e);
-                        }
-
-                        for target_timeframe in ["5m", "15m"] {
-                            let can_derive = CandleAggregator::can_aggregate(
-                                &candle.timeframe,
-                                target_timeframe,
-                            );
-                            match can_derive {
-                                Ok(true) if candle.timeframe != target_timeframe => {}
-                                Ok(_) => continue,
-                                Err(e) => {
-                                    warn!(
-                                        "Invalid source/target timeframe pair {} -> {}: {}",
-                                        candle.timeframe, target_timeframe, e
-                                    );
-                                    continue;
-                                }
-                            }
-                            match aggregator.add_candle(&candle, target_timeframe) {
-                                Ok(Some(completed)) => {
-                                    if let Err(e) =
-                                        pub_sender.publish_candle(&completed).await
-                                    {
-                                        warn!(
-                                            "Failed to send {} candle to publisher: {}",
-                                            target_timeframe, e
-                                        );
-                                    }
-                                }
-                                Ok(None) => {}
-                                Err(e) => warn!(
-                                    "Failed to aggregate {} -> {} candle: {}",
-                                    candle.timeframe, target_timeframe, e
-                                ),
-                            }
-                        }
+                        publish_and_aggregate_candle(&mut aggregator, &pub_sender, candle).await;
                     }
                     None => {
                         info!("Candle channel closed");
@@ -771,11 +752,66 @@ async fn run_event_loop(
                     }
                 }
             }
+
+            event = aggregation_source_rx.recv(), if aggregation_source_open => {
+                match event {
+                    Some(AggregationSourceEvent::Candle(candle)) => {
+                        publish_and_aggregate_candle(&mut aggregator, &pub_sender, candle).await;
+                    }
+                    Some(AggregationSourceEvent::ResetProduct(product_id)) => {
+                        aggregator.reset_product(&product_id);
+                        info!(product_id, "Aggregation state reset after source reconnect");
+                    }
+                    None => {
+                        aggregation_source_open = false;
+                    }
+                }
+            }
         }
 
-        if !trade_open && !candle_open && !user_open {
+        if !trade_open && !candle_open && !user_open && !aggregation_source_open {
             info!("All event channels closed, event loop exiting");
             return Ok(());
+        }
+    }
+}
+
+async fn publish_and_aggregate_candle(
+    aggregator: &mut CandleAggregator,
+    pub_sender: &PublishSender,
+    candle: model::Candlestick,
+) {
+    if let Err(e) = pub_sender.publish_candle(&candle).await {
+        warn!("Failed to send candle to publisher: {}", e);
+    }
+
+    for target_timeframe in ["5m", "15m"] {
+        let can_derive = CandleAggregator::can_aggregate(&candle.timeframe, target_timeframe);
+        match can_derive {
+            Ok(true) if candle.timeframe != target_timeframe => {}
+            Ok(_) => continue,
+            Err(e) => {
+                warn!(
+                    "Invalid source/target timeframe pair {} -> {}: {}",
+                    candle.timeframe, target_timeframe, e
+                );
+                continue;
+            }
+        }
+        match aggregator.add_candle(&candle, target_timeframe) {
+            Ok(Some(completed)) => {
+                if let Err(e) = pub_sender.publish_candle(&completed).await {
+                    warn!(
+                        "Failed to send {} candle to publisher: {}",
+                        target_timeframe, e
+                    );
+                }
+            }
+            Ok(None) => {}
+            Err(e) => warn!(
+                "Failed to aggregate {} -> {} candle: {}",
+                candle.timeframe, target_timeframe, e
+            ),
         }
     }
 }
@@ -1198,17 +1234,25 @@ mod tests {
         let (_trade_tx, trade_rx) = mpsc::channel(10);
         let (_candle_tx, candle_rx) = mpsc::channel(10);
         let (_user_tx, user_rx) = mpsc::channel(10);
+        let (aggregation_reset_tx, aggregation_reset_rx) = mpsc::channel(1);
         let (pub_sender, _pub_rx) = create_publish_channel(10);
 
         // Drop all senders to close the channels
         drop(_trade_tx);
         drop(_candle_tx);
         drop(_user_tx);
+        drop(aggregation_reset_tx);
 
         // Event loop should exit gracefully when all channels are closed
         let result = tokio::time::timeout(
             Duration::from_secs(2),
-            run_event_loop(trade_rx, candle_rx, user_rx, pub_sender),
+            run_event_loop(
+                trade_rx,
+                candle_rx,
+                user_rx,
+                aggregation_reset_rx,
+                pub_sender,
+            ),
         )
         .await;
 
@@ -1221,11 +1265,19 @@ mod tests {
         let (trade_tx, trade_rx) = mpsc::channel(1);
         let (candle_tx, candle_rx) = mpsc::channel(1);
         let (user_tx, user_rx) = mpsc::channel(1);
+        let (aggregation_reset_tx, aggregation_reset_rx) = mpsc::channel(1);
         let (pub_sender, mut pub_rx) = create_publish_channel(1);
         drop(trade_tx);
         drop(user_tx);
+        drop(aggregation_reset_tx);
 
-        let event_loop = tokio::spawn(run_event_loop(trade_rx, candle_rx, user_rx, pub_sender));
+        let event_loop = tokio::spawn(run_event_loop(
+            trade_rx,
+            candle_rx,
+            user_rx,
+            aggregation_reset_rx,
+            pub_sender,
+        ));
         candle_tx
             .send(model::Candlestick {
                 product_id: "RITHMIC:NQ-202609".to_string(),
@@ -1253,11 +1305,19 @@ mod tests {
         let (trade_tx, trade_rx) = mpsc::channel(1);
         let (candle_tx, candle_rx) = mpsc::channel(4);
         let (user_tx, user_rx) = mpsc::channel(1);
+        let (aggregation_reset_tx, aggregation_reset_rx) = mpsc::channel(1);
         let (pub_sender, mut pub_rx) = create_publish_channel(8);
         drop(trade_tx);
         drop(user_tx);
+        drop(aggregation_reset_tx);
 
-        let event_loop = tokio::spawn(run_event_loop(trade_rx, candle_rx, user_rx, pub_sender));
+        let event_loop = tokio::spawn(run_event_loop(
+            trade_rx,
+            candle_rx,
+            user_rx,
+            aggregation_reset_rx,
+            pub_sender,
+        ));
         for index in 0..4 {
             candle_tx
                 .send(model::Candlestick {
@@ -1299,15 +1359,85 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn event_loop_applies_rithmic_reset_before_post_reconnect_candles() {
+        let (trade_tx, trade_rx) = mpsc::channel(1);
+        let (candle_tx, candle_rx) = mpsc::channel(1);
+        let (user_tx, user_rx) = mpsc::channel(1);
+        let (aggregation_source_tx, aggregation_source_rx) = mpsc::channel(8);
+        let (pub_sender, mut pub_rx) = create_publish_channel(16);
+        drop(trade_tx);
+        drop(candle_tx);
+        drop(user_tx);
+
+        let event_loop = tokio::spawn(run_event_loop(
+            trade_rx,
+            candle_rx,
+            user_rx,
+            aggregation_source_rx,
+            pub_sender,
+        ));
+        let base_ts = 1_800_000_000_000;
+        let candle = |minute: i64| model::Candlestick {
+            product_id: "RITHMIC:NQ-202609".to_string(),
+            timeframe: "1m".to_string(),
+            timestamp: base_ts + minute * 60_000,
+            open: rust_decimal_macros::dec!(100),
+            high: rust_decimal_macros::dec!(101),
+            low: rust_decimal_macros::dec!(99),
+            close: rust_decimal_macros::dec!(100),
+            volume: rust_decimal_macros::dec!(1),
+        };
+        aggregation_source_tx
+            .send(AggregationSourceEvent::Candle(candle(2)))
+            .await
+            .unwrap();
+        aggregation_source_tx
+            .send(AggregationSourceEvent::ResetProduct(
+                "RITHMIC:NQ-202609".to_string(),
+            ))
+            .await
+            .unwrap();
+        for minute in 5..=10 {
+            aggregation_source_tx
+                .send(AggregationSourceEvent::Candle(candle(minute)))
+                .await
+                .unwrap();
+        }
+        drop(aggregation_source_tx);
+
+        let mut derived = Vec::new();
+        while let Some(message) = pub_rx.recv().await {
+            if let crate::publisher::PublishMessage::Candle(candle) = message {
+                if candle.timeframe != "1m" {
+                    derived.push(candle);
+                }
+            }
+        }
+        assert!(event_loop.await.unwrap().is_ok());
+        assert_eq!(derived.len(), 1);
+        assert_eq!(derived[0].timeframe, "5m");
+        assert_eq!(derived[0].timestamp, base_ts + 5 * 60_000);
+        assert_eq!(derived[0].volume, rust_decimal_macros::dec!(5));
+    }
+
+    #[tokio::test]
     async fn event_loop_preserves_shorter_source_that_cannot_form_5m_exactly() {
         let (trade_tx, trade_rx) = mpsc::channel(1);
         let (candle_tx, candle_rx) = mpsc::channel(1);
         let (user_tx, user_rx) = mpsc::channel(1);
+        let (aggregation_reset_tx, aggregation_reset_rx) = mpsc::channel(1);
         let (pub_sender, mut pub_rx) = create_publish_channel(1);
         drop(trade_tx);
         drop(user_tx);
+        drop(aggregation_reset_tx);
 
-        let event_loop = tokio::spawn(run_event_loop(trade_rx, candle_rx, user_rx, pub_sender));
+        let event_loop = tokio::spawn(run_event_loop(
+            trade_rx,
+            candle_rx,
+            user_rx,
+            aggregation_reset_rx,
+            pub_sender,
+        ));
         candle_tx
             .send(model::Candlestick {
                 product_id: "RITHMIC:NQ-202609".to_string(),
