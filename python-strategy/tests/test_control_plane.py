@@ -1,6 +1,11 @@
 import json
+import socketserver
+import threading
+import time
+from concurrent.futures import Future
 from datetime import UTC, date, datetime
 from decimal import Decimal
+from unittest.mock import MagicMock
 
 import pytest
 from sqlalchemy import create_engine, func, select
@@ -47,6 +52,7 @@ from src.core.orm_models import (
     StrategyStateTransition,
 )
 from src.core.precision import PrecisionCodec, PrecisionSpec
+from src.core.redis_factory import create_redis_client
 
 try:
     import fluxtrade_core  # noqa: F401
@@ -384,6 +390,154 @@ def test_control_plane_api_key_auth_allows_health_without_credentials():
     assert response.body == {"status": "ok"}
 
 
+def test_control_plane_readiness_requires_probe():
+    app = ControlPlaneApp(BacktestJobExecutor(run_inline=True))
+
+    response = app.handle("GET", "/ready")
+
+    assert response.status_code == 503
+    assert response.body == {"status": "not_ready"}
+
+
+def test_control_plane_readiness_reports_dependency_result():
+    calls = []
+    app = ControlPlaneApp(
+        BacktestJobExecutor(run_inline=True),
+        readiness_probe=lambda: calls.append("ready"),
+    )
+
+    response = app.handle("GET", "/ready")
+
+    assert response.status_code == 200
+    assert response.body == {"status": "ready"}
+    assert calls == ["ready"]
+
+
+def test_control_plane_readiness_hides_dependency_error_details():
+    def fail():
+        raise RuntimeError("postgresql://user:secret@db/fluxtrade")
+
+    app = ControlPlaneApp(
+        BacktestJobExecutor(run_inline=True),
+        readiness_probe=fail,
+    )
+
+    response = app.handle("GET", "/ready")
+
+    assert response.status_code == 503
+    assert response.body == {"status": "not_ready"}
+    assert "secret" not in response.json()
+
+
+def test_control_plane_readiness_returns_after_redis_socket_timeout():
+    release = threading.Event()
+
+    class BlackholeHandler(socketserver.BaseRequestHandler):
+        def handle(self):
+            release.wait(timeout=1.0)
+
+    class BlackholeServer(socketserver.ThreadingTCPServer):
+        allow_reuse_address = True
+        daemon_threads = True
+
+    with BlackholeServer(("127.0.0.1", 0), BlackholeHandler) as server:
+        server_thread = threading.Thread(target=server.serve_forever, daemon=True)
+        server_thread.start()
+        redis_client = create_redis_client(
+            host="127.0.0.1",
+            port=server.server_address[1],
+            socket_connect_timeout=0.05,
+            socket_timeout=0.05,
+        )
+
+        def readiness_probe() -> None:
+            redis_client.ping()
+
+        app = ControlPlaneApp(
+            BacktestJobExecutor(run_inline=True),
+            readiness_probe=readiness_probe,
+        )
+
+        started = time.monotonic()
+        response = app.handle("GET", "/ready")
+        elapsed = time.monotonic() - started
+
+        release.set()
+        server.shutdown()
+        redis_client.close()
+
+    assert response.status_code == 503
+    assert elapsed < 0.5
+
+
+def test_control_plane_shutdown_has_a_bounded_active_job_wait(monkeypatch):
+    started = threading.Event()
+    release = threading.Event()
+    executor = BacktestJobExecutor(run_inline=False, max_workers=1)
+    request = BacktestJobRequest(
+        strategy_id="blocking",
+        product_id=PRODUCT_ID,
+        timeframe=TIMEFRAME,
+        candles_csv_path="/tmp/candles.csv",
+        signals_csv_path="/tmp/signals.csv",
+        start_time=1,
+        end_time=2,
+    )
+
+    def block_job(_job_id, _request):
+        started.set()
+        release.wait(timeout=1.0)
+
+    monkeypatch.setattr(executor, "_run_job", block_job)
+    executor.submit_backtest(request)
+    assert started.wait(timeout=0.5)
+    app = ControlPlaneApp(executor)
+
+    began_shutdown = time.monotonic()
+    completed = app.shutdown(timeout=0.01)
+
+    assert completed is False
+    assert time.monotonic() - began_shutdown < 0.5
+    release.set()
+    assert executor.shutdown(wait=True, timeout=0.5) is True
+
+
+def test_runtime_readiness_probe_configures_postgres_deadlines(monkeypatch):
+    from src.control_plane import main as control_plane_main
+
+    captured = {}
+    runtime_engine = MagicMock()
+    connection = runtime_engine.connect.return_value.__enter__.return_value
+    base_engine = MagicMock()
+    base_engine.url = "postgresql://user:password@db/fluxtrade"
+    redis_client = MagicMock()
+    redis_client.ping.return_value = True
+    monkeypatch.setattr(control_plane_main, "get_engine", lambda: base_engine)
+    monkeypatch.setattr(
+        control_plane_main,
+        "create_engine",
+        lambda url, **kwargs: captured.update({"url": url, **kwargs})
+        or runtime_engine,
+    )
+
+    probe, close = control_plane_main._build_runtime_readiness_probe(
+        redis_client,
+        2,
+    )
+    probe()
+    close()
+
+    assert captured["url"] == base_engine.url
+    assert captured["connect_args"] == {
+        "connect_timeout": 2,
+        "options": "-c statement_timeout=2000",
+        "tcp_user_timeout": 2000,
+    }
+    redis_client.ping.assert_called_once_with()
+    connection.execute.assert_called_once()
+    runtime_engine.dispose.assert_called_once_with()
+
+
 def test_control_plane_reports_browser_session_endpoint_unavailable():
     app = ControlPlaneApp(BacktestJobExecutor(run_inline=True))
 
@@ -540,6 +694,54 @@ def test_control_plane_rejects_running_job_cancellation():
     assert store.get(job.id).status == JobStatus.RUNNING
 
 
+def test_backtest_cancel_keeps_a_started_future_visible_to_shutdown():
+    store = InMemoryJobStore()
+    executor = BacktestJobExecutor(store=store, run_inline=False)
+    request = BacktestJobRequest(
+        strategy_id="cancel-race",
+        product_id=PRODUCT_ID,
+        timeframe=TIMEFRAME,
+        candles_csv_path="/tmp/candles.csv",
+        signals_csv_path="/tmp/signals.csv",
+        start_time=1,
+        end_time=2,
+    )
+    job = store.create(kind=request.kind, request=request)
+    future = Future()
+    assert future.set_running_or_notify_cancel() is True
+    executor._futures[job.id] = future
+
+    with pytest.raises(ValueError, match="already started"):
+        executor.cancel_backtest(job.id)
+
+    assert executor._futures[job.id] is future
+    assert executor.shutdown(wait=True, timeout=0, cancel_futures=True) is False
+    future.set_result(job)
+    assert executor.shutdown(wait=True, timeout=0.5) is True
+
+
+def test_backtest_cancel_does_not_overwrite_a_completed_job():
+    store = InMemoryJobStore()
+    executor = BacktestJobExecutor(store=store, run_inline=False)
+    request = BacktestJobRequest(
+        strategy_id="completed",
+        product_id=PRODUCT_ID,
+        timeframe=TIMEFRAME,
+        candles_csv_path="/tmp/candles.csv",
+        signals_csv_path="/tmp/signals.csv",
+        start_time=1,
+        end_time=2,
+    )
+    job = store.create(kind=request.kind, request=request)
+    store.mark_succeeded(job.id, {"status": "complete"})
+
+    with pytest.raises(ValueError, match="succeeded jobs cannot be cancelled"):
+        executor.cancel_backtest(job.id)
+
+    assert store.get(job.id).status == JobStatus.SUCCEEDED
+    assert executor.shutdown(wait=True, timeout=0.5) is True
+
+
 def test_backtest_executor_retries_cancelled_jobs():
     store = InMemoryJobStore()
     executor = BacktestJobExecutor(store=store, run_inline=False)
@@ -591,6 +793,68 @@ class _WindowParameterEvaluator:
             score_total=score,
             metrics={"seed": request.seed, "score": str(score)},
         )
+
+
+def test_parameter_search_cancel_keeps_a_started_future_visible_to_shutdown():
+    store = InMemoryJobStore()
+    executor = ParameterSearchJobExecutor(
+        _FakeParameterEvaluator(),
+        store=store,
+        run_inline=False,
+    )
+    request = ParameterSearchJobRequest.model_validate(
+        {
+            "strategy_id": "cancel-race",
+            "product_id": PRODUCT_ID,
+            "timeframe": TIMEFRAME,
+            "start_time": 1,
+            "end_time": 2,
+            "candidates": [
+                {"candidate_id": "a", "param_pack": {"score": "1"}},
+            ],
+        }
+    )
+    job = store.create(kind=request.kind, request=request)
+    future = Future()
+    assert future.set_running_or_notify_cancel() is True
+    executor._futures[job.id] = future
+
+    with pytest.raises(ValueError, match="already started"):
+        executor.cancel_search(job.id)
+
+    assert executor._futures[job.id] is future
+    assert executor.shutdown(wait=True, timeout=0, cancel_futures=True) is False
+    future.set_result(job)
+    assert executor.shutdown(wait=True, timeout=0.5) is True
+
+
+def test_parameter_search_cancel_does_not_overwrite_a_completed_job():
+    store = InMemoryJobStore()
+    executor = ParameterSearchJobExecutor(
+        _FakeParameterEvaluator(),
+        store=store,
+        run_inline=False,
+    )
+    request = ParameterSearchJobRequest.model_validate(
+        {
+            "strategy_id": "completed",
+            "product_id": PRODUCT_ID,
+            "timeframe": TIMEFRAME,
+            "start_time": 1,
+            "end_time": 2,
+            "candidates": [
+                {"candidate_id": "a", "param_pack": {"score": "1"}},
+            ],
+        }
+    )
+    job = store.create(kind=request.kind, request=request)
+    store.mark_succeeded(job.id, {"status": "complete"})
+
+    with pytest.raises(ValueError, match="succeeded jobs cannot be cancelled"):
+        executor.cancel_search(job.id)
+
+    assert store.get(job.id).status == JobStatus.SUCCEEDED
+    assert executor.shutdown(wait=True, timeout=0.5) is True
 
 
 def test_control_plane_runs_parameter_search_job_with_injected_evaluator():
@@ -1799,6 +2063,7 @@ def test_redis_strategy_router_queries_state_and_publishes_commands(tmp_path):
 
     redis = MagicMock()
     redis.exists.return_value = 1
+    redis.ping.return_value = True
     redis.publish.return_value = 1
     router = RedisStrategyCommandRouter(
         redis,
@@ -2093,6 +2358,7 @@ def test_production_control_plane_wiring_has_no_missing_dependency_503(tmp_path)
 
     redis = MagicMock()
     redis.exists.return_value = 1
+    redis.ping.return_value = True
     redis.publish.return_value = 1
 
     class AcceptingEvaluator:
@@ -2114,6 +2380,8 @@ def test_production_control_plane_wiring_has_no_missing_dependency_503(tmp_path)
         job_store=InMemoryJobStore(),
         parameter_search_evaluator=parameter_search_evaluator,
     )
+    app.readiness_probe()
+    redis.ping.assert_called_once_with()
 
     generic_search_payload = json.dumps(
         {
@@ -2435,8 +2703,11 @@ def test_control_plane_rejects_non_object_job_payloads(path, body):
 def test_control_plane_main_serves_production_app(monkeypatch):
     from src.control_plane import main as control_plane_main
 
-    app = object()
+    app = MagicMock()
+    app.shutdown.return_value = True
     browser_auth = object()
+    redis_client = MagicMock()
+    close_readiness_probe = MagicMock()
     captured = {}
     monkeypatch.setenv("CONTROL_PLANE_STATIC_DIR", "/app/frontend")
     monkeypatch.setenv("CONTROL_PLANE_API_KEY", "api-key")
@@ -2449,20 +2720,45 @@ def test_control_plane_main_serves_production_app(monkeypatch):
     monkeypatch.setattr(
         control_plane_main,
         "build_control_plane_app",
-        lambda *, api_key, browser_auth: captured.update(
-            {"api_key": api_key, "browser_auth": browser_auth}
+        lambda *, redis_client, api_key, browser_auth, readiness_probe: captured.update(
+            {
+                "redis_client": redis_client,
+                "api_key": api_key,
+                "browser_auth": browser_auth,
+                "readiness_probe": readiness_probe,
+            }
         )
         or app,
     )
     monkeypatch.setattr(
         control_plane_main,
+        "create_redis_client",
+        lambda **kwargs: captured.update({"redis_kwargs": kwargs}) or redis_client,
+    )
+    monkeypatch.setattr(
+        control_plane_main,
+        "_build_runtime_readiness_probe",
+        lambda client, timeout: (
+            captured.update(
+                {
+                    "readiness_client": client,
+                    "readiness_timeout": timeout,
+                }
+            )
+            or (lambda: None),
+            close_readiness_probe,
+        ),
+    )
+    monkeypatch.setattr(
+        control_plane_main,
         "serve",
-        lambda served_app, *, host, port, static_dir: captured.update(
+        lambda served_app, *, host, port, static_dir, stop_event: captured.update(
             {
                 "served_app": served_app,
                 "host": host,
                 "port": port,
                 "static_dir": static_dir,
+                "stop_event": stop_event,
             }
         ),
     )
@@ -2475,6 +2771,16 @@ def test_control_plane_main_serves_production_app(monkeypatch):
     assert captured["host"] == "127.0.0.1"
     assert captured["port"] == 8080
     assert captured["static_dir"] == "/app/frontend"
+    assert not captured["stop_event"].is_set()
+    assert captured["redis_client"] is redis_client
+    assert captured["readiness_client"] is redis_client
+    assert captured["redis_kwargs"] == {
+        "socket_connect_timeout": 2,
+        "socket_timeout": 2,
+    }
+    app.shutdown.assert_called_once_with(timeout=20)
+    close_readiness_probe.assert_called_once_with()
+    redis_client.close.assert_called_once_with()
 
 
 def test_control_plane_main_disables_static_frontend_with_api_key_only(
@@ -2482,27 +2788,45 @@ def test_control_plane_main_disables_static_frontend_with_api_key_only(
 ):
     from src.control_plane import main as control_plane_main
 
-    app = object()
+    app = MagicMock()
+    app.shutdown.return_value = True
+    redis_client = MagicMock()
     captured = {}
     monkeypatch.setenv("CONTROL_PLANE_STATIC_DIR", "/app/frontend")
     monkeypatch.setenv("CONTROL_PLANE_API_KEY", "api-key")
     monkeypatch.setattr(
         control_plane_main,
         "build_control_plane_app",
-        lambda *, api_key, browser_auth: captured.update(
-            {"api_key": api_key, "browser_auth": browser_auth}
+        lambda *, redis_client, api_key, browser_auth, readiness_probe: captured.update(
+            {
+                "redis_client": redis_client,
+                "api_key": api_key,
+                "browser_auth": browser_auth,
+                "readiness_probe": readiness_probe,
+            }
         )
         or app,
     )
     monkeypatch.setattr(
         control_plane_main,
+        "create_redis_client",
+        lambda **_kwargs: redis_client,
+    )
+    monkeypatch.setattr(
+        control_plane_main,
+        "_build_runtime_readiness_probe",
+        lambda _client, _timeout: (lambda: None, lambda: None),
+    )
+    monkeypatch.setattr(
+        control_plane_main,
         "serve",
-        lambda served_app, *, host, port, static_dir: captured.update(
+        lambda served_app, *, host, port, static_dir, stop_event: captured.update(
             {
                 "served_app": served_app,
                 "host": host,
                 "port": port,
                 "static_dir": static_dir,
+                "stop_event": stop_event,
             }
         ),
     )
@@ -2513,3 +2837,47 @@ def test_control_plane_main_disables_static_frontend_with_api_key_only(
     assert captured["api_key"] == "api-key"
     assert captured["browser_auth"] is None
     assert captured["static_dir"] is None
+
+
+def test_control_plane_main_force_exits_after_job_shutdown_deadline(monkeypatch):
+    from src.control_plane import main as control_plane_main
+
+    app = MagicMock()
+    app.shutdown.return_value = False
+    redis_client = MagicMock()
+    close_readiness_probe = MagicMock()
+    monkeypatch.delenv("CONTROL_PLANE_STATIC_DIR", raising=False)
+    monkeypatch.delenv("CONTROL_PLANE_API_KEY", raising=False)
+    monkeypatch.setattr(
+        control_plane_main,
+        "build_browser_session_auth_from_env",
+        lambda: None,
+    )
+    monkeypatch.setattr(
+        control_plane_main,
+        "create_redis_client",
+        lambda **_kwargs: redis_client,
+    )
+    monkeypatch.setattr(
+        control_plane_main,
+        "_build_runtime_readiness_probe",
+        lambda _client, _timeout: (lambda: None, close_readiness_probe),
+    )
+    monkeypatch.setattr(
+        control_plane_main,
+        "build_control_plane_app",
+        lambda **_kwargs: app,
+    )
+    monkeypatch.setattr(control_plane_main, "serve", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(
+        control_plane_main.os,
+        "_exit",
+        lambda status: (_ for _ in ()).throw(SystemExit(status)),
+    )
+
+    with pytest.raises(SystemExit, match="1"):
+        control_plane_main.main()
+
+    app.shutdown.assert_called_once_with(timeout=20)
+    close_readiness_probe.assert_called_once_with()
+    redis_client.close.assert_called_once_with()

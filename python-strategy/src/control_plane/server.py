@@ -3,6 +3,7 @@ from __future__ import annotations
 import mimetypes
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
+from threading import Event
 from typing import Type
 from urllib.parse import unquote, urlsplit
 
@@ -100,9 +101,21 @@ def serve(
     port: int = 8080,
     *,
     static_dir: str | Path | None = None,
+    stop_event: Event | None = None,
 ) -> None:
     server = ThreadingHTTPServer(
         (host, port),
         make_handler(app, static_dir=static_dir),
     )
-    server.serve_forever()
+    try:
+        if stop_event is None:
+            server.serve_forever()
+        else:
+            server.timeout = 0.5
+            while not stop_event.is_set():
+                server.handle_request()
+    except KeyboardInterrupt:
+        if stop_event is not None:
+            stop_event.set()
+    finally:
+        server.server_close()

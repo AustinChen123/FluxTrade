@@ -1,12 +1,14 @@
 from __future__ import annotations
 
 import json
+import logging
+import time
 from collections.abc import Mapping
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from hmac import compare_digest
 from urllib.parse import parse_qs, urlsplit
-from typing import Any
+from typing import Any, Callable
 
 from pydantic import ValidationError
 
@@ -32,6 +34,9 @@ from src.control_plane.strategy_control import (
     StrategyControlUnavailable,
 )
 from src.control_plane.strategy_state_query import StrategyStateQueryService
+
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True)
@@ -63,6 +68,7 @@ class ControlPlaneApp:
         api_key: str | None = None,
         redis_client: Any | None = None,
         browser_auth: BrowserAuthProvider | None = None,
+        readiness_probe: Callable[[], None] | None = None,
     ) -> None:
         if api_key == "":
             raise ValueError("api_key must be non-empty when provided")
@@ -74,6 +80,24 @@ class ControlPlaneApp:
         self.api_key = api_key
         self.redis_client = redis_client
         self.browser_auth = browser_auth
+        self.readiness_probe = readiness_probe
+
+    def shutdown(self, timeout: float) -> bool:
+        """Stop accepting queued work and wait up to ``timeout`` for active jobs."""
+        deadline = time.monotonic() + max(timeout, 0.0)
+        backtests_stopped = self.backtest_executor.shutdown(
+            wait=True,
+            timeout=max(deadline - time.monotonic(), 0.0),
+            cancel_futures=True,
+        )
+        searches_stopped = True
+        if self.parameter_search_executor is not None:
+            searches_stopped = self.parameter_search_executor.shutdown(
+                wait=True,
+                timeout=max(deadline - time.monotonic(), 0.0),
+                cancel_futures=True,
+            )
+        return backtests_stopped and searches_stopped
 
     def handle(
         self,
@@ -89,6 +113,18 @@ class ControlPlaneApp:
 
         if method == "GET" and clean_path == "/health":
             return HttpResponse(200, {"status": "ok"})
+        if method == "GET" and clean_path == "/ready":
+            if self.readiness_probe is None:
+                return HttpResponse(503, {"status": "not_ready"})
+            try:
+                self.readiness_probe()
+            except Exception as exc:
+                logger.warning(
+                    "Control-plane readiness probe failed: %s",
+                    type(exc).__name__,
+                )
+                return HttpResponse(503, {"status": "not_ready"})
+            return HttpResponse(200, {"status": "ready"})
 
         if method == "POST" and clean_path == "/api/v1/auth/session":
             return self._create_browser_session(headers)

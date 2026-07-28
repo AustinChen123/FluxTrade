@@ -1,6 +1,7 @@
 """Tests for StrategyEngine.shutdown(): graceful teardown of threads, executor, and Redis."""
 
 import threading
+import time
 from concurrent.futures import ThreadPoolExecutor
 from unittest.mock import MagicMock, patch
 
@@ -64,6 +65,31 @@ class TestEngineShutdown:
         engine.command_thread = mock_thread
         engine.shutdown(timeout=5.0)
         mock_thread.join.assert_called_once_with(timeout=5.0)
+
+    def test_live_command_listener_exits_promptly_without_a_message(self):
+        engine = _make_engine()
+        subscribed = threading.Event()
+
+        class IdlePubSub:
+            def subscribe(self, _channel):
+                subscribed.set()
+
+            def get_message(self, timeout):
+                time.sleep(min(timeout, 0.01))
+                return None
+
+            def close(self):
+                return None
+
+        engine.redis_client.pubsub.return_value = IdlePubSub()
+        engine._start_command_listener()
+        assert subscribed.wait(timeout=1.0)
+
+        started = time.monotonic()
+        engine.shutdown(timeout=1.0)
+
+        assert time.monotonic() - started < 0.5
+        assert not engine.command_thread.is_alive()
 
     def test_shutdown_skips_dead_threads(self):
         engine = _make_engine()
