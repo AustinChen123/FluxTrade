@@ -197,6 +197,16 @@ class TestCatalogStrategies:
         assert list(result) == ["stable_strategy_v1"]
         assert issubclass(result["stable_strategy_v1"], BaseStrategy)
 
+    def test_catalog_rescan_reuses_unchanged_verified_generation(self, tmp_path):
+        _write_catalog(tmp_path)
+
+        first = StrategyLoader.scan_directory(str(tmp_path))["stable_strategy_v1"]
+        snapshot_count = len(StrategyLoader._catalog_snapshots)
+        second = StrategyLoader.scan_directory(str(tmp_path))["stable_strategy_v1"]
+
+        assert first.__module__ == second.__module__
+        assert len(StrategyLoader._catalog_snapshots) == snapshot_count
+
     def test_parent_directory_discovers_one_level_catalog_pack(self, tmp_path):
         pack = tmp_path / "stable_pack"
         pack.mkdir()
@@ -303,7 +313,7 @@ class TestCatalogStrategies:
         helper.write_text("VALUE = 7\n")
         module = tmp_path / "strategy.py"
         module.write_text(
-            f"from helper import VALUE\n{STRATEGY_CODE}"
+            f"from .helper import VALUE\n{STRATEGY_CODE}"
             "\nManifestStrategy.helper_value = VALUE\n"
         )
         catalog = {
@@ -352,7 +362,7 @@ class TestCatalogStrategies:
         helper.write_text("VALUE = 7\n")
         module = tmp_path / "strategy.py"
         module.write_text(
-            f"from helper import VALUE\n{STRATEGY_CODE}"
+            f"from .helper import VALUE\n{STRATEGY_CODE}"
             "\nManifestStrategy.helper_value = VALUE\n"
         )
         catalog = {
@@ -388,6 +398,118 @@ class TestCatalogStrategies:
         result = StrategyLoader.scan_directory(str(tmp_path))
 
         assert result["stable_strategy_v1"].helper_value == 7
+
+    def test_catalog_lazy_import_stays_bound_to_verified_generation(self, tmp_path):
+        private_lib_before = sys.modules.get("private_lib")
+        private_helper_before = sys.modules.get("private_lib.helper")
+        helper = tmp_path / "private_lib/helper.py"
+        helper.parent.mkdir()
+        module = tmp_path / "strategy.py"
+        module.write_text(
+            "from src.strategies.base import BaseStrategy, StrategyRequirements\n"
+            "class LazyStrategy(BaseStrategy):\n"
+            "    @property\n"
+            "    def requirements(self):\n"
+            '        return StrategyRequirements(self.product_id, "5m", 1)\n'
+            "    def on_candle(self, candle, context=None):\n"
+            "        from .private_lib.helper import VALUE\n"
+            "        return VALUE\n"
+        )
+
+        def write_catalog(value):
+            helper.write_text(f"VALUE = {value}\n")
+            catalog = {
+                "schema_version": 1,
+                "files": {
+                    path.relative_to(tmp_path).as_posix(): hashlib.sha256(
+                        path.read_bytes()
+                    ).hexdigest()
+                    for path in (helper, module)
+                },
+                "strategies": [
+                    {
+                        "id": "lazy_strategy_v1",
+                        "module": module.name,
+                        "class": "LazyStrategy",
+                        "display_name": "Lazy Strategy v1",
+                        "artifact_version": "1.0.0",
+                        "readiness": "RESEARCH_VALIDATED",
+                    }
+                ],
+            }
+            (tmp_path / StrategyLoader.CATALOG_NAME).write_text(
+                json.dumps(catalog)
+            )
+
+        write_catalog(7)
+        first_class = StrategyLoader.scan_directory(str(tmp_path))[
+            "lazy_strategy_v1"
+        ]
+        helper.write_text("VALUE = 99\n")
+        assert first_class("first", "product").on_candle(None) == 7
+
+        write_catalog(8)
+        second_class = StrategyLoader.scan_directory(str(tmp_path))[
+            "lazy_strategy_v1"
+        ]
+
+        assert first_class("first", "product").on_candle(None) == 7
+        assert second_class("second", "product").on_candle(None) == 8
+        assert sys.modules.get("private_lib") is private_lib_before
+        assert sys.modules.get("private_lib.helper") is private_helper_before
+
+    @pytest.mark.parametrize(
+        "import_statement",
+        [
+            "import private_lib.helper",
+            "from private_lib.helper import VALUE",
+        ],
+    )
+    def test_catalog_rejects_absolute_internal_imports_during_scan(
+        self,
+        tmp_path,
+        import_statement,
+    ):
+        helper = tmp_path / "private_lib/helper.py"
+        helper.parent.mkdir()
+        helper.write_text("VALUE = 7\n")
+        module = tmp_path / "strategy.py"
+        module.write_text(
+            "from src.strategies.base import BaseStrategy, StrategyRequirements\n"
+            "class InvalidStrategy(BaseStrategy):\n"
+            "    @property\n"
+            "    def requirements(self):\n"
+            '        return StrategyRequirements(self.product_id, "5m", 1)\n'
+            "    def on_candle(self, candle, context=None):\n"
+            f"        {import_statement}\n"
+            "        return None\n"
+        )
+        catalog = {
+            "schema_version": 1,
+            "files": {
+                path.relative_to(tmp_path).as_posix(): hashlib.sha256(
+                    path.read_bytes()
+                ).hexdigest()
+                for path in (helper, module)
+            },
+            "strategies": [
+                {
+                    "id": "invalid_strategy_v1",
+                    "module": module.name,
+                    "class": "InvalidStrategy",
+                    "display_name": "Invalid Strategy v1",
+                    "artifact_version": "1.0.0",
+                    "readiness": "LIVE_APPROVED",
+                }
+            ],
+        }
+        (tmp_path / StrategyLoader.CATALOG_NAME).write_text(json.dumps(catalog))
+
+        result = StrategyLoader.scan_directory(str(tmp_path))
+
+        error = result[f"{StrategyLoader.CATALOG_NAME}::LoadError"]
+        assert "internal imports must be relative" in error
+        assert "strategy.py:7" in error
 
     def test_concurrent_scans_are_serialized(self, monkeypatch):
         first_entered = threading.Event()

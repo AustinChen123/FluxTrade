@@ -1,6 +1,8 @@
+import ast
 import glob
 import hashlib
 import hmac
+import importlib
 import importlib.util
 import inspect
 import json
@@ -23,8 +25,7 @@ class StrategyLoader:
     CATALOG_NAME = "strategy_catalog.json"
     READINESS_VALUES = {"RESEARCH_VALIDATED", "LIVE_APPROVED"}
     _SCAN_LOCK = threading.RLock()
-    _catalog_module_names: dict[Path, set[str]] = {}
-    _catalog_snapshots: dict[Path, tempfile.TemporaryDirectory[str]] = {}
+    _catalog_snapshots: dict[str, tempfile.TemporaryDirectory[str]] = {}
 
     @staticmethod
     def scan_directory(path: str) -> Dict[str, Union[Type[BaseStrategy], str]]:
@@ -159,81 +160,70 @@ class StrategyLoader:
             "Validated strategy catalog digest: %s",
             hashlib.sha256(catalog_source).hexdigest(),
         )
-        snapshot_root = StrategyLoader._snapshot_catalog_files(
+        snapshot_root, package_name = StrategyLoader._snapshot_catalog_files(
             catalog_path.parent,
             files,
         )
         strategies: Dict[str, Union[Type[BaseStrategy], str]] = {}
-        shadowed_modules = StrategyLoader._remove_declared_pack_modules(files)
-        modules_before = set(sys.modules)
-        try:
-            for entry in entries:
-                strategy_id = entry["id"]
-                try:
-                    module_path = StrategyLoader._resolve_pack_file(
-                        snapshot_root,
-                        entry["module"],
-                    )
-                    module = StrategyLoader._load_module(
-                        module_path,
-                        StrategyLoader._catalog_module_name(
-                            catalog_path.parent,
-                            strategy_id,
-                        ),
-                        import_root=snapshot_root,
-                        evict_modules=False,
-                    )
-                    strategy_class = getattr(module, entry["class"])
-                    if (
-                        not inspect.isclass(strategy_class)
-                        or not issubclass(strategy_class, BaseStrategy)
-                        or strategy_class is BaseStrategy
-                        or strategy_class.__module__ != module.__name__
-                    ):
-                        raise TypeError(
-                            f"{entry['class']} is not a strategy defined by "
-                            f"{entry['module']}"
-                        )
-                    setattr(
-                        strategy_class,
-                        "__fluxtrade_artifact_version__",
-                        entry["artifact_version"],
-                    )
-                    setattr(
-                        strategy_class,
-                        "__fluxtrade_display_name__",
-                        entry["display_name"],
-                    )
-                    setattr(
-                        strategy_class,
-                        "__fluxtrade_readiness__",
-                        entry["readiness"],
-                    )
-                    strategies[strategy_id] = strategy_class
-                    logger.info("Loaded catalog strategy: %s", strategy_id)
-                except Exception:
-                    error_trace = traceback.format_exc()
-                    logger.error(
-                        "Failed to load catalog strategy %s:\n%s",
-                        strategy_id,
-                        error_trace,
-                    )
-                    strategies[strategy_id] = error_trace
-        finally:
-            loaded_pack_modules = {
-                name
-                for name in set(sys.modules) - modules_before
-                if StrategyLoader._module_is_from_root(
-                    sys.modules[name],
+        StrategyLoader._ensure_catalog_package(package_name, snapshot_root)
+        for entry in entries:
+            strategy_id = entry["id"]
+            try:
+                module_path = StrategyLoader._resolve_pack_file(
                     snapshot_root,
+                    entry["module"],
                 )
-            }
-            for name, previous_module in shadowed_modules.items():
-                sys.modules.pop(name, None)
-                sys.modules[name] = previous_module
-            StrategyLoader._catalog_module_names[
-                catalog_path.parent.resolve()
-            ] = loaded_pack_modules - set(shadowed_modules)
+                module_parent = Path(entry["module"]).parent
+                StrategyLoader._ensure_catalog_module_parent(
+                    package_name,
+                    module_parent,
+                )
+                module = StrategyLoader._load_module(
+                    module_path,
+                    StrategyLoader._catalog_module_name(
+                        package_name,
+                        module_parent,
+                        strategy_id,
+                    ),
+                    evict_modules=False,
+                    expose_import_root=False,
+                )
+                strategy_class = getattr(module, entry["class"])
+                if (
+                    not inspect.isclass(strategy_class)
+                    or not issubclass(strategy_class, BaseStrategy)
+                    or strategy_class is BaseStrategy
+                    or strategy_class.__module__ != module.__name__
+                ):
+                    raise TypeError(
+                        f"{entry['class']} is not a strategy defined by "
+                        f"{entry['module']}"
+                    )
+                setattr(
+                    strategy_class,
+                    "__fluxtrade_artifact_version__",
+                    entry["artifact_version"],
+                )
+                setattr(
+                    strategy_class,
+                    "__fluxtrade_display_name__",
+                    entry["display_name"],
+                )
+                setattr(
+                    strategy_class,
+                    "__fluxtrade_readiness__",
+                    entry["readiness"],
+                )
+                strategies[strategy_id] = strategy_class
+                logger.info("Loaded catalog strategy: %s", strategy_id)
+            except Exception:
+                error_trace = traceback.format_exc()
+                logger.error(
+                    "Failed to load catalog strategy %s:\n%s",
+                    strategy_id,
+                    error_trace,
+                )
+                strategies[strategy_id] = error_trace
         return strategies
 
     @staticmethod
@@ -278,6 +268,8 @@ class StrategyLoader:
                 raise ValueError(f"strategy pack digest mismatch: {relative_path}")
             verified_files[relative_path] = source
 
+        StrategyLoader._validate_pack_imports(verified_files)
+
         normalized: list[dict[str, str]] = []
         seen_ids: set[str] = set()
         for entry in entries:
@@ -310,6 +302,8 @@ class StrategyLoader:
                 raise ValueError(f"duplicate strategy id: {strategy_id}")
             if module_path not in files:
                 raise ValueError(f"strategy module is not integrity-pinned: {module_path}")
+            if Path(module_path).suffix != ".py":
+                raise ValueError("strategy module must be a Python source file")
             if readiness not in StrategyLoader.READINESS_VALUES:
                 raise ValueError(f"unknown strategy readiness: {readiness}")
             seen_ids.add(strategy_id)
@@ -317,15 +311,49 @@ class StrategyLoader:
         return normalized, verified_files
 
     @staticmethod
-    def _snapshot_catalog_files(root: Path, files: dict[str, bytes]) -> Path:
-        resolved_root = root.resolve()
-        StrategyLoader._evict_catalog_modules(resolved_root)
-        previous_snapshot = StrategyLoader._catalog_snapshots.pop(
-            resolved_root,
-            None,
-        )
-        if previous_snapshot is not None:
-            previous_snapshot.cleanup()
+    def _validate_pack_imports(files: dict[str, bytes]) -> None:
+        internal_modules = StrategyLoader._declared_python_module_names(files)
+        for relative_path, source in files.items():
+            if Path(relative_path).suffix != ".py":
+                continue
+            tree = ast.parse(source, filename=relative_path)
+            for node in ast.walk(tree):
+                if isinstance(node, ast.Import):
+                    imported_modules = tuple(alias.name for alias in node.names)
+                elif (
+                    isinstance(node, ast.ImportFrom)
+                    and node.level == 0
+                    and node.module is not None
+                ):
+                    imported_modules = (node.module,)
+                else:
+                    continue
+                for module_name in imported_modules:
+                    if any(
+                        module_name == internal
+                        or module_name.startswith(f"{internal}.")
+                        for internal in internal_modules
+                    ):
+                        raise ValueError(
+                            "strategy pack internal imports must be relative: "
+                            f"{relative_path}:{node.lineno} imports {module_name}"
+                        )
+
+    @staticmethod
+    def _snapshot_catalog_files(
+        root: Path,
+        files: dict[str, bytes],
+    ) -> tuple[Path, str]:
+        generation = hashlib.sha256(str(root.resolve()).encode())
+        for relative_path, source in sorted(files.items()):
+            path_bytes = relative_path.encode()
+            generation.update(len(path_bytes).to_bytes(8, "big"))
+            generation.update(path_bytes)
+            generation.update(hashlib.sha256(source).digest())
+        package_name = f"_fluxtrade_pack_{generation.hexdigest()}"
+        existing = StrategyLoader._catalog_snapshots.get(package_name)
+        if existing is not None:
+            return Path(existing.name), package_name
 
         snapshot = tempfile.TemporaryDirectory(prefix="fluxtrade-strategy-")
         snapshot_root = Path(snapshot.name)
@@ -337,24 +365,36 @@ class StrategyLoader:
         except Exception:
             snapshot.cleanup()
             raise
-        StrategyLoader._catalog_snapshots[resolved_root] = snapshot
-        return snapshot_root
+        # A running instance may still lazy-import from an older generation.
+        # Retain each small snapshot until process exit; add reference tracking
+        # only if hot-reload volume makes this measurable.
+        StrategyLoader._catalog_snapshots[package_name] = snapshot
+        return snapshot_root, package_name
 
     @staticmethod
-    def _evict_catalog_modules(root: Path) -> None:
-        for name in StrategyLoader._catalog_module_names.pop(root, set()):
-            sys.modules.pop(name, None)
+    def _ensure_catalog_package(package_name: str, snapshot_root: Path) -> None:
+        if package_name in sys.modules:
+            return
+        package = ModuleType(package_name)
+        package.__package__ = package_name
+        package.__path__ = [str(snapshot_root)]  # type: ignore[attr-defined]
+        package.__spec__ = importlib.util.spec_from_loader(
+            package_name,
+            loader=None,
+            is_package=True,
+        )
+        sys.modules[package_name] = package
 
     @staticmethod
-    def _remove_declared_pack_modules(
-        files: dict[str, bytes],
-    ) -> dict[str, ModuleType]:
-        shadowed: dict[str, ModuleType] = {}
-        for name in StrategyLoader._declared_python_module_names(files):
-            module = sys.modules.pop(name, None)
-            if module is not None:
-                shadowed[name] = module
-        return shadowed
+    def _ensure_catalog_module_parent(
+        package_name: str,
+        relative_parent: Path,
+    ) -> None:
+        if relative_parent == Path("."):
+            return
+        importlib.import_module(
+            f"{package_name}.{'.'.join(relative_parent.parts)}"
+        )
 
     @staticmethod
     def _declared_python_module_names(files: dict[str, bytes]) -> set[str]:
@@ -371,10 +411,15 @@ class StrategyLoader:
         return names
 
     @staticmethod
-    def _catalog_module_name(root: Path, strategy_id: str) -> str:
-        root_digest = hashlib.sha256(str(root.resolve()).encode()).hexdigest()
+    def _catalog_module_name(
+        package_name: str,
+        relative_parent: Path,
+        strategy_id: str,
+    ) -> str:
         strategy_digest = hashlib.sha256(strategy_id.encode()).hexdigest()
-        return f"_fluxtrade_strategy_{root_digest}_{strategy_digest}"
+        parent_name = ".".join(relative_parent.parts)
+        prefix = f"{package_name}.{parent_name}" if parent_name else package_name
+        return f"{prefix}._entry_{strategy_digest}"
 
     @staticmethod
     def _legacy_module_name(file_path: Path) -> str:
@@ -399,6 +444,7 @@ class StrategyLoader:
         *,
         import_root: Path | None = None,
         evict_modules: bool = True,
+        expose_import_root: bool = True,
     ):
         module_root = import_root or file_path.parent
         if evict_modules:
@@ -409,7 +455,8 @@ class StrategyLoader:
         module = importlib.util.module_from_spec(spec)
         sys.modules[module_name] = module
         import_path = str(module_root)
-        sys.path.insert(0, import_path)
+        if expose_import_root:
+            sys.path.insert(0, import_path)
         previous_dont_write_bytecode = sys.dont_write_bytecode
         sys.dont_write_bytecode = True
         importlib.invalidate_caches()
@@ -420,7 +467,8 @@ class StrategyLoader:
             raise
         finally:
             sys.dont_write_bytecode = previous_dont_write_bytecode
-            sys.path.remove(import_path)
+            if expose_import_root:
+                sys.path.remove(import_path)
         return module
 
     @staticmethod
