@@ -23,6 +23,7 @@ use tokio::sync::mpsc;
 use tokio::task::JoinSet;
 use tracing::{error, info, warn, Level};
 
+#[cfg_attr(not(feature = "rithmic"), allow(dead_code))]
 #[derive(Debug)]
 pub(crate) enum AggregationSourceEvent {
     Candle(model::Candlestick),
