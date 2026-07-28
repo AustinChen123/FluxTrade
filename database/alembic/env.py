@@ -1,11 +1,12 @@
 import os
 from logging.config import fileConfig
 
-from sqlalchemy import engine_from_config
-from sqlalchemy import pool
+from sqlalchemy import create_engine, make_url, pool
 
 from alembic import context
 from dotenv import load_dotenv
+
+from src.core.database_url import build_postgres_url
 
 # Load .env file
 load_dotenv(os.path.join(os.path.dirname(__file__), '../../.env'))
@@ -14,23 +15,21 @@ load_dotenv(os.path.join(os.path.dirname(__file__), '../../.env'))
 # access to the values within the .ini file in use.
 config = context.config
 
-# Set sqlalchemy.url from env vars
-db_user = os.getenv('POSTGRES_USER')
-db_password = os.getenv('POSTGRES_PASSWORD')
-db_host = os.getenv('POSTGRES_HOST')
-db_port = os.getenv('POSTGRES_PORT')
-db_name = os.getenv('POSTGRES_DB')
 configured_url = config.get_main_option('sqlalchemy.url')
-if (
-    db_user
-    and db_password
-    and db_host
-    and db_port
-    and db_name
-    and configured_url in (None, "", "driver://user:pass@localhost/dbname")
-):
-    db_url = f"postgresql://{db_user}:{db_password}@{db_host}:{db_port}/{db_name}"
-    config.set_main_option('sqlalchemy.url', db_url)
+postgres_settings_present = any(
+    os.getenv(name)
+    for name in (
+        "POSTGRES_USER",
+        "POSTGRES_PASSWORD",
+        "POSTGRES_HOST",
+        "POSTGRES_PORT",
+        "POSTGRES_DB",
+    )
+)
+if postgres_settings_present:
+    db_url = build_postgres_url(os.environ)
+else:
+    db_url = make_url(configured_url)
 
 # Interpret the config file for Python logging.
 # This line sets up loggers basically.
@@ -61,9 +60,8 @@ def run_migrations_offline() -> None:
     script output.
 
     """
-    url = config.get_main_option("sqlalchemy.url")
     context.configure(
-        url=url,
+        url=db_url,
         target_metadata=target_metadata,
         literal_binds=True,
         dialect_opts={"paramstyle": "named"},
@@ -80,11 +78,7 @@ def run_migrations_online() -> None:
     and associate a connection with the context.
 
     """
-    connectable = engine_from_config(
-        config.get_section(config.config_ini_section, {}),
-        prefix="sqlalchemy.",
-        poolclass=pool.NullPool,
-    )
+    connectable = create_engine(db_url, poolclass=pool.NullPool)
 
     with connectable.connect() as connection:
         context.configure(

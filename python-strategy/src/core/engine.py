@@ -1139,12 +1139,16 @@ class StrategyEngine:
         """
         def command_loop():
             pubsub = self.redis_client.pubsub()
-            pubsub.subscribe("cmd:strategy:control")
-            logger.info("📡 Command Listener Started. Subscribed to 'cmd:strategy:control'")
-            for message in pubsub.listen():
-                if not self.running:
-                    break
-                if message['type'] == 'message':
+            try:
+                pubsub.subscribe("cmd:strategy:control")
+                logger.info(
+                    "📡 Command Listener Started. "
+                    "Subscribed to 'cmd:strategy:control'"
+                )
+                while self.running:
+                    message = pubsub.get_message(timeout=1.0)
+                    if message is None or message['type'] != 'message':
+                        continue
                     try:
                         self._assert_runtime_leadership()
                     except Exception:
@@ -1154,6 +1158,8 @@ class StrategyEngine:
                         self.executor.submit(self._handle_command, data)
                     except Exception as e:
                         logger.error("Error parsing command: %s", e)
+            finally:
+                pubsub.close()
         
         self.command_thread = threading.Thread(target=command_loop, daemon=True)
         self.command_thread.start()

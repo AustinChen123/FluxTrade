@@ -9,8 +9,9 @@ mod config;
 
 pub(crate) mod emergency;
 
-#[allow(dead_code)]
 mod front_month;
+
+pub(crate) mod front_month_runtime;
 
 #[allow(dead_code)]
 mod history;

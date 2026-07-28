@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from concurrent.futures import Future, ThreadPoolExecutor
+from concurrent.futures import Future, ThreadPoolExecutor, wait as wait_futures
 from contextlib import AbstractContextManager
 from dataclasses import dataclass
 from decimal import Decimal
@@ -65,33 +65,43 @@ class BacktestJobExecutor:
         self._executor = None if run_inline else ThreadPoolExecutor(max_workers=max_workers)
         self._futures: dict[str, Future[JobRecord]] = {}
         self._futures_lock = Lock()
+        self._closed = False
 
     def submit_backtest(self, request: BacktestJobRequest) -> JobRecord:
-        job = self.store.create(kind=request.kind, request=request)
-        if self._run_inline:
-            return self._run_job(job.id, request)
-        assert self._executor is not None
-        future = self._executor.submit(self._run_job, job.id, request)
         with self._futures_lock:
-            self._futures[job.id] = future
-            if future.done():
-                self._futures.pop(job.id, None)
+            if self._closed:
+                raise RuntimeError("backtest executor is shut down")
+            job = self.store.create(kind=request.kind, request=request)
+            if self._run_inline:
+                future = None
+            else:
+                assert self._executor is not None
+                future = self._executor.submit(self._run_job, job.id, request)
+                self._futures[job.id] = future
+        if future is None:
+            return self._run_job(job.id, request)
         return job
 
     def cancel_backtest(self, job_id: str, reason: str | None = None) -> JobRecord:
-        job = self.store.get(job_id)
-        if job is None:
-            raise KeyError(job_id)
-        if job.status == JobStatus.RUNNING:
-            raise ValueError("running jobs cannot be cancelled")
-        if job.status != JobStatus.QUEUED:
-            raise ValueError(f"{job.status.value.lower()} jobs cannot be cancelled")
-
         with self._futures_lock:
-            future = self._futures.pop(job_id, None)
-        if future is not None and not future.cancel():
-            raise ValueError("job already started")
-        return self.store.mark_cancelled(job_id, reason or "cancelled by operator")
+            job = self.store.get(job_id)
+            if job is None:
+                raise KeyError(job_id)
+            if job.status == JobStatus.RUNNING:
+                raise ValueError("running jobs cannot be cancelled")
+            if job.status != JobStatus.QUEUED:
+                raise ValueError(
+                    f"{job.status.value.lower()} jobs cannot be cancelled"
+                )
+            future = self._futures.get(job_id)
+            if future is not None:
+                if not future.cancel():
+                    raise ValueError("job already started")
+                self._futures.pop(job_id, None)
+            return self.store.mark_cancelled(
+                job_id,
+                reason or "cancelled by operator",
+            )
 
     def retry_backtest(self, job_id: str) -> JobRecord:
         job = self.store.get(job_id)
@@ -105,9 +115,29 @@ class BacktestJobExecutor:
         request = BacktestJobRequest.model_validate(job.request)
         return self.submit_backtest(request)
 
-    def shutdown(self, wait: bool = True) -> None:
-        if self._executor is not None:
-            self._executor.shutdown(wait=wait, cancel_futures=False)
+    def shutdown(
+        self,
+        wait: bool = True,
+        *,
+        timeout: float | None = None,
+        cancel_futures: bool = False,
+    ) -> bool:
+        with self._futures_lock:
+            self._closed = True
+            if self._executor is None:
+                return True
+            futures = tuple(self._futures.values())
+            self._executor.shutdown(
+                wait=False,
+                cancel_futures=cancel_futures,
+            )
+        if not wait:
+            return all(future.done() for future in futures)
+        _, pending = wait_futures(futures, timeout=timeout)
+        if pending:
+            return False
+        self._executor.shutdown(wait=True)
+        return True
 
     def _run_job(self, job_id: str, request: BacktestJobRequest) -> JobRecord:
         try:

@@ -1,14 +1,16 @@
 import json
 from http.server import ThreadingHTTPServer
-from threading import Thread
+from threading import Event, Thread
 from urllib.error import HTTPError
 from urllib.request import urlopen
+from unittest.mock import MagicMock, patch
 
 import pytest
 
 from src.control_plane.app import ControlPlaneApp
 from src.control_plane.backtest_jobs import BacktestJobExecutor
 from src.control_plane.server import make_handler
+from src.control_plane.server import serve
 
 
 @pytest.fixture
@@ -72,3 +74,33 @@ def test_control_plane_static_files_reject_path_traversal(static_control_plane):
         )
 
     assert exc_info.value.code == 404
+
+
+def test_serve_closes_server_after_keyboard_interrupt():
+    app = ControlPlaneApp(BacktestJobExecutor(run_inline=True))
+    server = MagicMock()
+    server.serve_forever.side_effect = KeyboardInterrupt
+
+    with patch(
+        "src.control_plane.server.ThreadingHTTPServer",
+        return_value=server,
+    ):
+        serve(app)
+
+    server.server_close.assert_called_once_with()
+
+
+def test_serve_closes_server_when_stop_is_requested():
+    app = ControlPlaneApp(BacktestJobExecutor(run_inline=True))
+    server = MagicMock()
+    stop_event = Event()
+    stop_event.set()
+
+    with patch(
+        "src.control_plane.server.ThreadingHTTPServer",
+        return_value=server,
+    ):
+        serve(app, stop_event=stop_event)
+
+    server.handle_request.assert_not_called()
+    server.server_close.assert_called_once_with()

@@ -1,6 +1,13 @@
 from __future__ import annotations
 
+import logging
 import os
+import signal
+import threading
+from collections.abc import Callable
+
+from sqlalchemy import create_engine, text
+from sqlalchemy.pool import NullPool
 
 from src.control_plane import (
     BacktestJobExecutor,
@@ -21,8 +28,48 @@ from src.control_plane import (
 )
 from src.control_plane.jobs import JobStore
 from src.control_plane.server import serve
-from src.core.db import SessionLocal
+from src.core.db import SessionLocal, get_engine
 from src.core.redis_factory import create_redis_client
+
+
+logger = logging.getLogger(__name__)
+
+
+def _build_readiness_probe(redis_client, db_session_factory):
+    def probe() -> None:
+        if redis_client.ping() is not True:
+            raise RuntimeError("Redis readiness check failed")
+        session = db_session_factory()
+        try:
+            session.execute(text("SELECT 1"))
+        finally:
+            session.close()
+
+    return probe
+
+
+def _build_runtime_readiness_probe(
+    redis_client,
+    timeout_seconds: int,
+) -> tuple[Callable[[], None], Callable[[], None]]:
+    timeout_ms = timeout_seconds * 1_000
+    readiness_engine = create_engine(
+        get_engine().url,
+        poolclass=NullPool,
+        connect_args={
+            "connect_timeout": timeout_seconds,
+            "options": f"-c statement_timeout={timeout_ms}",
+            "tcp_user_timeout": timeout_ms,
+        },
+    )
+
+    def probe() -> None:
+        if redis_client.ping() is not True:
+            raise RuntimeError("Redis readiness check failed")
+        with readiness_engine.connect() as connection:
+            connection.execute(text("SELECT 1"))
+
+    return probe, readiness_engine.dispose
 
 
 def build_control_plane_app(
@@ -33,6 +80,7 @@ def build_control_plane_app(
     parameter_search_evaluator: ParameterSearchEvaluator | None = None,
     api_key: str | None = None,
     browser_auth: BrowserAuthProvider | None = None,
+    readiness_probe: Callable[[], None] | None = None,
 ) -> ControlPlaneApp:
     if redis_client is None:
         redis_client = create_redis_client()
@@ -72,6 +120,14 @@ def build_control_plane_app(
         api_key=api_key,
         redis_client=redis_client,
         browser_auth=browser_auth,
+        readiness_probe=(
+            readiness_probe
+            if readiness_probe is not None
+            else _build_readiness_probe(
+                redis_client,
+                db_session_factory,
+            )
+        ),
     )
 
 
@@ -139,11 +195,57 @@ def main() -> None:
     browser_auth = build_browser_session_auth_from_env()
     if static_dir is not None and api_key and browser_auth is None:
         static_dir = None
+    readiness_timeout = _positive_env_int(
+        "CONTROL_PLANE_READINESS_TIMEOUT_SECONDS",
+        2,
+    )
+    shutdown_timeout = _positive_env_int(
+        "CONTROL_PLANE_SHUTDOWN_TIMEOUT_SECONDS",
+        20,
+    )
+    redis_client = create_redis_client(
+        socket_connect_timeout=readiness_timeout,
+        socket_timeout=readiness_timeout,
+    )
+    readiness_probe, close_readiness_probe = _build_runtime_readiness_probe(
+        redis_client,
+        readiness_timeout,
+    )
     app = build_control_plane_app(
+        redis_client=redis_client,
         api_key=api_key,
         browser_auth=browser_auth,
+        readiness_probe=readiness_probe,
     )
-    serve(app, host=host, port=port, static_dir=static_dir)
+    stop_event = threading.Event()
+
+    def handle_shutdown(_signum, _frame) -> None:
+        stop_event.set()
+
+    previous_handlers = {
+        signum: signal.signal(signum, handle_shutdown)
+        for signum in (signal.SIGTERM, signal.SIGINT)
+    }
+    try:
+        serve(
+            app,
+            host=host,
+            port=port,
+            static_dir=static_dir,
+            stop_event=stop_event,
+        )
+    finally:
+        shutdown_completed = app.shutdown(timeout=shutdown_timeout)
+        close_readiness_probe()
+        redis_client.close()
+        for signum, handler in previous_handlers.items():
+            signal.signal(signum, handler)
+        if not shutdown_completed:
+            logger.error(
+                "Control-plane jobs exceeded the %ss shutdown deadline",
+                shutdown_timeout,
+            )
+            os._exit(1)
 
 
 if __name__ == "__main__":
