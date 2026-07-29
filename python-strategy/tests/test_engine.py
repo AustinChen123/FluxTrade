@@ -3169,6 +3169,33 @@ class TestExchangeOrderEventThread:
                     adapter=adapter,
                 )
 
+    def test_rithmic_engine_rejects_backtest_identity(
+        self,
+        engine_factory,
+    ):
+        adapter = RithmicExchangeAdapter(
+            profile="test",
+            account_id="ACCOUNT",
+            instruments={
+                "RITHMIC:NQ-202609": {
+                    "exchange": "CME",
+                    "quantity_step": "1",
+                    "price_tick": "0.25",
+                }
+            },
+            client_factory=MagicMock(),
+        )
+
+        with pytest.raises(
+            ValueError,
+            match="backtest mode requires SimulatedAdapter",
+        ):
+            engine_factory(
+                adapter=adapter,
+                audit_external_orders=True,
+                is_backtest=True,
+            )
+
     def test_rithmic_startup_stays_halted_when_recovery_is_not_safe(
         self,
         engine_factory,
