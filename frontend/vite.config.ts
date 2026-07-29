@@ -23,6 +23,8 @@ export default defineConfig({
       "/api": "http://127.0.0.1:8080",
       "/evolution-epochs": "http://127.0.0.1:8080",
       "/genes": "http://127.0.0.1:8080",
+      "/strategies": "http://127.0.0.1:8080",
+      "/strategy-states": "http://127.0.0.1:8080",
       "/health": "http://127.0.0.1:8080"
     }
   }

@@ -39,6 +39,39 @@ export type GenerationSummary = {
   drawdown_max: string;
 };
 
+export type BrowserSession = {
+  actor: string;
+  capabilities: string[];
+  csrf_token: string;
+  expires_at: string;
+  step_up_expires_at: string | null;
+};
+
+export type StrategyStatus =
+  | "DISCOVERED"
+  | "READY"
+  | "WARNING"
+  | "ACTIVE"
+  | "STOPPED"
+  | "ERROR";
+
+export type StrategyCommand = "START" | "STOP" | "RESUME" | "FORCE_RECOVER";
+
+export type StrategyState = {
+  strategy_id: string;
+  status: StrategyStatus;
+  config: Record<string, unknown> | null;
+  performance: Record<string, unknown> | null;
+  last_heartbeat: number | null;
+  uptime_start: number | null;
+  last_error_message: string | null;
+  entered_error_at: string | null;
+  recovered_at: string | null;
+  stopped_at: string | null;
+  version: number;
+  available_commands: StrategyCommand[];
+};
+
 type Page<TName extends string, T> = {
   total: number;
   limit: number;
@@ -46,6 +79,7 @@ type Page<TName extends string, T> = {
 } & Record<TName, T[]>;
 
 const PAGE_SIZE = 10_000;
+const STRATEGY_PAGE_SIZE = 500;
 
 export class ApiError extends Error {
   constructor(
@@ -76,18 +110,52 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
   return body as T;
 }
 
-export async function ensureBrowserSession(): Promise<void> {
+export async function ensureBrowserSession(): Promise<BrowserSession | null> {
   try {
-    await request("/api/v1/auth/session");
+    return await request<BrowserSession>("/api/v1/auth/session");
   } catch (error) {
     if (!(error instanceof ApiError) || error.status !== 401) {
       if (error instanceof ApiError && error.status === 404) {
-        return;
+        return null;
       }
       throw error;
     }
-    await request("/api/v1/auth/session", { method: "POST" });
+    return request<BrowserSession>("/api/v1/auth/session", { method: "POST" });
   }
+}
+
+export async function loadStrategyStates(): Promise<StrategyState[]> {
+  const query = (offset: number) =>
+    `/strategy-states?limit=${STRATEGY_PAGE_SIZE}&offset=${offset}`;
+  const first = await request<Page<"states", StrategyState>>(query(0));
+  const offsets = Array.from(
+    { length: Math.ceil(first.total / STRATEGY_PAGE_SIZE) - 1 },
+    (_, index) => (index + 1) * STRATEGY_PAGE_SIZE
+  );
+  const remaining = await Promise.all(
+    offsets.map((offset) =>
+      request<Page<"states", StrategyState>>(query(offset))
+    )
+  );
+  return [first, ...remaining].flatMap((page) => page.states);
+}
+
+export async function sendStrategyCommand(
+  strategyId: string,
+  command: StrategyCommand,
+  expectedVersion: number,
+  idempotencyKey: string,
+  csrfToken?: string
+): Promise<void> {
+  await request(`/strategies/${encodeURIComponent(strategyId)}/commands`, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      "Idempotency-Key": idempotencyKey,
+      ...(csrfToken ? { "X-CSRF-Token": csrfToken } : {})
+    },
+    body: JSON.stringify({ command, expected_version: expectedVersion })
+  });
 }
 
 export async function loadEpochs(): Promise<Epoch[]> {

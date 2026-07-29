@@ -43,6 +43,13 @@ const FitnessSurface3D = lazy(() =>
     default: module.FitnessSurface3D
   }))
 );
+const StrategyManager = lazy(() =>
+  import("./StrategyManager").then((module) => ({
+    default: module.StrategyManager
+  }))
+);
+
+type View = "research" | "strategies";
 
 function displayNumber(
   value: string | number | null,
@@ -100,6 +107,14 @@ export function App() {
   const demoMode =
     import.meta.env.DEV &&
     new URLSearchParams(window.location.search).get("demo") === "1";
+  const [view, setView] = useState<View>(() =>
+    new URLSearchParams(window.location.search).get("view") === "strategies"
+      ? "strategies"
+      : "research"
+  );
+  const [researchActivated, setResearchActivated] = useState(
+    view === "research"
+  );
   const [theme, setTheme] = useState<Theme>(initialTheme);
   const [epochs, setEpochs] = useState<Epoch[]>([]);
   const [epochId, setEpochId] = useState("");
@@ -112,6 +127,7 @@ export function App() {
   const [surfaceMode, setSurfaceMode] = useState<"2d" | "3d">("2d");
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<unknown | null>(null);
+  const [epochsLoaded, setEpochsLoaded] = useState(false);
   const [reloadToken, setReloadToken] = useState(0);
 
   const epoch = epochs.find((item) => item.id === epochId) ?? null;
@@ -121,6 +137,12 @@ export function App() {
   }, [theme]);
 
   useEffect(() => {
+    if (!researchActivated) {
+      return;
+    }
+    if (epochsLoaded) {
+      return;
+    }
     let active = true;
     setLoading(true);
     setError(null);
@@ -137,6 +159,7 @@ export function App() {
           return;
         }
         setEpochs(items);
+        setEpochsLoaded(true);
         setEpochId((current) =>
           items.some((item) => item.id === current) ? current : (items[0]?.id ?? "")
         );
@@ -146,7 +169,7 @@ export function App() {
     return () => {
       active = false;
     };
-  }, [demoMode, reloadToken]);
+  }, [demoMode, epochsLoaded, reloadToken, researchActivated]);
 
   useEffect(() => {
     if (!epoch) {
@@ -177,7 +200,7 @@ export function App() {
     return () => {
       active = false;
     };
-  }, [demoMode, epoch]);
+  }, [demoMode, epoch, reloadToken]);
 
   useEffect(() => {
     if (!epoch || generationIndex === null) {
@@ -331,6 +354,23 @@ export function App() {
     setSelectedGeneId(null);
     setEpochId(nextEpochId);
   };
+  const chooseView = (nextView: View) => {
+    if (nextView === "research") {
+      setResearchActivated(true);
+    }
+    const url = new URL(window.location.href);
+    if (nextView === "strategies") {
+      url.searchParams.set("view", "strategies");
+    } else {
+      url.searchParams.delete("view");
+    }
+    window.history.replaceState(
+      null,
+      "",
+      `${url.pathname}${url.search}${url.hash}`
+    );
+    setView(nextView);
+  };
   const dateFormatter = new Intl.DateTimeFormat(locale, {
     year: "numeric",
     month: "2-digit",
@@ -342,24 +382,27 @@ export function App() {
       <header className="topbar">
         <div>
           <p className="eyebrow">{t("app.eyebrow")}</p>
-          <h1>{t("app.title")}</h1>
+          <h1>{t(view === "research" ? "app.title" : "strategies.title")}</h1>
         </div>
         <div className="toolbar">
-          <div className="epoch-control">
-            <label htmlFor="epoch">{t("controls.epoch")}</label>
-            <select
-              id="epoch"
-              value={epochId}
-              onChange={(event) => chooseEpoch(event.target.value)}
-              disabled={!epochs.length}
-            >
-              {epochs.map((item) => (
-                <option key={item.id} value={item.id}>
-                  {item.strategy_id} · {dateFormatter.format(new Date(item.started_at))}
-                </option>
-              ))}
-            </select>
-          </div>
+          {view === "research" && (
+            <div className="epoch-control">
+              <label htmlFor="epoch">{t("controls.epoch")}</label>
+              <select
+                id="epoch"
+                value={epochId}
+                onChange={(event) => chooseEpoch(event.target.value)}
+                disabled={!epochs.length}
+              >
+                {epochs.map((item) => (
+                  <option key={item.id} value={item.id}>
+                    {item.strategy_id} ·{" "}
+                    {dateFormatter.format(new Date(item.started_at))}
+                  </option>
+                ))}
+              </select>
+            </div>
+          )}
           <label className="language-control" htmlFor="language">
             {t("controls.language")}
             <select
@@ -393,9 +436,41 @@ export function App() {
         </div>
       </header>
 
-      {demoMode && <p className="demo-notice">{t("demo")}</p>}
+      <nav className="console-nav" aria-label={t("navigation.aria")}>
+        <button
+          type="button"
+          aria-current={view === "research" ? "page" : undefined}
+          onClick={() => chooseView("research")}
+        >
+          {t("navigation.research")}
+        </button>
+        <button
+          type="button"
+          aria-current={view === "strategies" ? "page" : undefined}
+          onClick={() => chooseView("strategies")}
+        >
+          {t("navigation.strategies")}
+        </button>
+      </nav>
 
-      {error !== null && (
+      {view === "strategies" && (
+        <Suspense
+          fallback={
+            <div className="loading-indicator" aria-live="polite">
+              <span />
+              {t("strategies.loading")}
+            </div>
+          }
+        >
+          <StrategyManager />
+        </Suspense>
+      )}
+
+      {view === "research" && demoMode && (
+        <p className="demo-notice">{t("demo")}</p>
+      )}
+
+      {view === "research" && error !== null && (
         <section className="error-panel" role="alert">
           <div>
             <strong>{t("error.title")}</strong>
@@ -407,14 +482,14 @@ export function App() {
         </section>
       )}
 
-      {error === null && !loading && !epoch && (
+      {view === "research" && error === null && !loading && !epoch && (
         <section className="empty-panel">
           <strong>{t("empty.title")}</strong>
           <p>{t("empty.body")}</p>
         </section>
       )}
 
-      {epoch && (
+      {view === "research" && epoch && (
         <Suspense
           fallback={
             <div className="loading-indicator" aria-live="polite">
@@ -680,7 +755,7 @@ export function App() {
         </Suspense>
       )}
 
-      {loading && (
+      {view === "research" && loading && (
         <div className="loading-indicator" aria-live="polite">
           <span />
           {t("loading.snapshot")}
