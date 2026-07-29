@@ -220,9 +220,53 @@ def _portfolio_replay_signature(definition: PortfolioDefinition) -> tuple[object
 
 def portfolio_replay_configuration(
     definition: PortfolioDefinition,
-) -> tuple[object, ...]:
+) -> dict[str, object]:
     """Return the stable configuration used for portfolio evidence identity."""
-    return _portfolio_replay_signature(definition)
+    sleeves: list[dict[str, object]] = []
+    for sleeve in definition.sleeves:
+        requirements = sleeve.strategy.requirements
+        try:
+            replay_configuration = sleeve.strategy.replay_configuration()
+        except NotImplementedError as exc:
+            raise ValueError(
+                "portfolio sleeve is not replay-safe: "
+                f"{sleeve.strategy.strategy_id}"
+            ) from exc
+        sleeves.append(
+            {
+                "class_path": _portable_strategy_class_path(sleeve.strategy),
+                "strategy_id": sleeve.strategy.strategy_id,
+                "product_id": sleeve.strategy.product_id,
+                "requirements": {
+                    "product_id": requirements.product_id,
+                    "timeframe": requirements.timeframe,
+                    "lookback_window": requirements.lookback_window,
+                },
+                "replay_configuration": replay_configuration,
+                "activation_windows": [
+                    {
+                        "start_ms": window.start_ms,
+                        "end_ms": window.end_ms,
+                    }
+                    for window in sleeve.activation_windows
+                ],
+            }
+        )
+    return {
+        "portfolio_id": definition.portfolio_id,
+        "product_id": definition.product_id,
+        "max_gross_quantity": definition.max_gross_quantity,
+        "sleeves": sleeves,
+    }
+
+
+def _portable_strategy_class_path(strategy: BaseStrategy) -> str:
+    strategy_class = type(strategy)
+    module = strategy_class.__module__
+    package, separator, relative_module = module.partition(".")
+    if package.startswith("_fluxtrade_pack_") and separator:
+        module = relative_module
+    return f"{module}.{strategy_class.__qualname__}"
 
 
 class PortfolioCoordinator:
