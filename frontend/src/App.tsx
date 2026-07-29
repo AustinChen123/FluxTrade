@@ -48,8 +48,20 @@ const StrategyManager = lazy(() =>
     default: module.StrategyManager
   }))
 );
+const TradeChartView = lazy(() =>
+  import("./TradeChartView").then((module) => ({
+    default: module.TradeChartView
+  }))
+);
 
-type View = "research" | "strategies";
+type View = "research" | "strategies" | "trades";
+
+function initialView(): View {
+  const requested = new URLSearchParams(window.location.search).get("view");
+  return requested === "strategies" || requested === "trades"
+    ? requested
+    : "research";
+}
 
 function displayNumber(
   value: string | number | null,
@@ -107,11 +119,7 @@ export function App() {
   const demoMode =
     import.meta.env.DEV &&
     new URLSearchParams(window.location.search).get("demo") === "1";
-  const [view, setView] = useState<View>(() =>
-    new URLSearchParams(window.location.search).get("view") === "strategies"
-      ? "strategies"
-      : "research"
-  );
+  const [view, setView] = useState<View>(initialView);
   const [researchActivated, setResearchActivated] = useState(
     view === "research"
   );
@@ -359,10 +367,10 @@ export function App() {
       setResearchActivated(true);
     }
     const url = new URL(window.location.href);
-    if (nextView === "strategies") {
-      url.searchParams.set("view", "strategies");
-    } else {
+    if (nextView === "research") {
       url.searchParams.delete("view");
+    } else {
+      url.searchParams.set("view", nextView);
     }
     window.history.replaceState(
       null,
@@ -382,7 +390,15 @@ export function App() {
       <header className="topbar">
         <div>
           <p className="eyebrow">{t("app.eyebrow")}</p>
-          <h1>{t(view === "research" ? "app.title" : "strategies.title")}</h1>
+          <h1>
+            {t(
+              view === "research"
+                ? "app.title"
+                : view === "strategies"
+                  ? "strategies.title"
+                  : "trades.title"
+            )}
+          </h1>
         </div>
         <div className="toolbar">
           {view === "research" && (
@@ -451,6 +467,13 @@ export function App() {
         >
           {t("navigation.strategies")}
         </button>
+        <button
+          type="button"
+          aria-current={view === "trades" ? "page" : undefined}
+          onClick={() => chooseView("trades")}
+        >
+          {t("navigation.trades")}
+        </button>
       </nav>
 
       {view === "strategies" && (
@@ -466,8 +489,21 @@ export function App() {
         </Suspense>
       )}
 
-      {view === "research" && demoMode && (
+      {(view === "research" || view === "trades") && demoMode && (
         <p className="demo-notice">{t("demo")}</p>
+      )}
+
+      {view === "trades" && (
+        <Suspense
+          fallback={
+            <div className="loading-indicator" aria-live="polite">
+              <span />
+              {t("trades.loading")}
+            </div>
+          }
+        >
+          <TradeChartView demoMode={demoMode} theme={theme} />
+        </Suspense>
       )}
 
       {view === "research" && error !== null && (

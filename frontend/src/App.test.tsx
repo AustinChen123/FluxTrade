@@ -81,6 +81,12 @@ vi.mock("./StrategyManager", () => ({
   StrategyManager: () => <section data-testid="strategy-manager" />
 }));
 
+vi.mock("./TradeChartView", () => ({
+  TradeChartView: ({ demoMode }: { demoMode: boolean }) => (
+    <section data-demo={String(demoMode)} data-testid="trade-chart-view" />
+  )
+}));
+
 const epoch = (id: string): Epoch => ({
   id,
   strategy_id: `strategy-${id}`,
@@ -208,6 +214,21 @@ describe("GA visualization state", () => {
     ).toBeTruthy();
   });
 
+  it("opens trade inspection directly without loading GA data", async () => {
+    window.history.replaceState({}, "", "/?view=trades");
+
+    render(<App />);
+
+    expect(await screen.findByTestId("trade-chart-view")).toBeTruthy();
+    expect(api.ensureBrowserSession).not.toHaveBeenCalled();
+    expect(api.loadEpochs).not.toHaveBeenCalled();
+    expect(screen.queryByRole("combobox", { name: "演化批次" })).toBeNull();
+    expect(
+      screen.getByRole("button", { name: "進出場檢視", current: "page" })
+    ).toBeTruthy();
+    expect(new URL(window.location.href).searchParams.get("view")).toBe("trades");
+  });
+
   it("keeps the initial epoch request alive across console view switches", async () => {
     const epochs = deferred<Epoch[]>();
     api.loadEpochs.mockReturnValue(epochs.promise);
@@ -243,6 +264,22 @@ describe("GA visualization state", () => {
 
     fireEvent.click(screen.getByRole("button", { name: "參數研究" }));
     expect(new URL(window.location.href).searchParams.has("view")).toBe(false);
+  });
+
+  it("does not reload research data after visiting trade inspection", async () => {
+    api.loadGenerationSummaries.mockResolvedValue([summary]);
+    api.loadGenerationGenes.mockResolvedValue([gene("epoch-a")]);
+    render(<App />);
+    await screen.findAllByText("candidate-epoch-a");
+
+    fireEvent.click(screen.getByRole("button", { name: "進出場檢視" }));
+    expect(await screen.findByTestId("trade-chart-view")).toBeTruthy();
+    fireEvent.click(screen.getByRole("button", { name: "參數研究" }));
+    await screen.findAllByText("candidate-epoch-a");
+
+    expect(api.loadEpochs).toHaveBeenCalledTimes(1);
+    expect(api.loadGenerationSummaries).toHaveBeenCalledTimes(1);
+    expect(api.loadGenerationGenes).toHaveBeenCalledTimes(1);
   });
 
   it("does not reload research data when returning from strategy management", async () => {

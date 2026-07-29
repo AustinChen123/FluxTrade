@@ -22,7 +22,8 @@ const resources = {
       navigation: {
         aria: "控制台頁面",
         research: "參數研究",
-        strategies: "策略管理"
+        strategies: "策略管理",
+        trades: "進出場檢視"
       },
       strategies: {
         kicker: "運行控制",
@@ -65,6 +66,41 @@ const resources = {
           RESUME: "恢復",
           FORCE_RECOVER: "強制恢復"
         }
+      },
+      trades: {
+        kicker: "交易上下文",
+        title: "K 線與進出場",
+        body: "在同一段價格走勢中核對策略的實際進場、出場與交易結果。",
+        unavailableTitle: "尚未連接正式 K 線資料",
+        unavailableBody: "目前控制面尚未提供 browser-safe candles 與 trades contract。請使用開發展示模式驗證介面，正式模式不會顯示假資料。",
+        emptyTitle: "這段結果沒有可顯示的 K 線",
+        emptyBody: "確認結果綁定的資料集與時間範圍後再試一次。",
+        dataQuality: "已略過 {{candles}} 根無效 K 線與 {{markers}} 個無法精確對齊的交易標記。",
+        strategy: "策略",
+        instrument: "商品",
+        timeframe: "週期",
+        tradeCount: "交易數",
+        chartKicker: "價格路徑",
+        chartTitle: "進出場時間軸",
+        chartHint: "拖曳或滾輪縮放；點擊標記查看交易",
+        ledgerKicker: "交易清冊",
+        ledgerTitle: "已平倉交易",
+        noTrades: "這段 K 線沒有已平倉交易。",
+        selected: "已選交易",
+        selectPrompt: "點擊圖表標記或交易列以查看明細。",
+        side: "方向",
+        quantity: "數量",
+        entry: "進場",
+        exit: "出場",
+        fee: "費用",
+        pnl: "PnL",
+        price: "價格",
+        longEntry: "L 進",
+        longExit: "L 出",
+        shortEntry: "S 進",
+        shortExit: "S 出",
+        loading: "載入 K 線圖表",
+        ariaChart: "顯示策略進出場標記的互動式 K 線圖"
       },
       demo: "本機展示資料 · 正式建置不包含此模式",
       error: {
@@ -164,7 +200,8 @@ const resources = {
       navigation: {
         aria: "Console pages",
         research: "Parameter research",
-        strategies: "Strategy management"
+        strategies: "Strategy management",
+        trades: "Trade inspection"
       },
       strategies: {
         kicker: "Runtime control",
@@ -207,6 +244,41 @@ const resources = {
           RESUME: "Resume",
           FORCE_RECOVER: "Force recover"
         }
+      },
+      trades: {
+        kicker: "Trade context",
+        title: "Candles and executions",
+        body: "Inspect strategy entries, exits, and outcomes against the same price path.",
+        unavailableTitle: "Production candle data is not connected",
+        unavailableBody: "The control plane does not yet expose browser-safe candles and trades. Use development demo mode to verify the interface; production never displays fabricated data.",
+        emptyTitle: "No chartable candles in this result",
+        emptyBody: "Check the result's dataset and time range, then try again.",
+        dataQuality: "Skipped {{candles}} invalid candles and {{markers}} trade markers without an exact candle match.",
+        strategy: "Strategy",
+        instrument: "Instrument",
+        timeframe: "Timeframe",
+        tradeCount: "Trades",
+        chartKicker: "Price path",
+        chartTitle: "Execution timeline",
+        chartHint: "Drag or scroll to zoom; select a marker to inspect the trade",
+        ledgerKicker: "Trade ledger",
+        ledgerTitle: "Closed trades",
+        noTrades: "There are no closed trades in this candle range.",
+        selected: "Selected trade",
+        selectPrompt: "Select a chart marker or trade row to inspect its details.",
+        side: "Side",
+        quantity: "Quantity",
+        entry: "Entry",
+        exit: "Exit",
+        fee: "Fee",
+        pnl: "PnL",
+        price: "Price",
+        longEntry: "L entry",
+        longExit: "L exit",
+        shortEntry: "S entry",
+        shortExit: "S exit",
+        loading: "Loading candlestick chart",
+        ariaChart: "Interactive candlestick chart with strategy entry and exit markers"
       },
       demo: "Local demo data · unavailable in production builds",
       error: {
