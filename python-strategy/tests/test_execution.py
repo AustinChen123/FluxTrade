@@ -23,7 +23,7 @@ from prometheus_client import REGISTRY
 
 from src.core.adapters.ccxt_adapter import CcxtExchangeAdapter
 from src.core.adapters.rithmic_adapter import RithmicExchangeAdapter
-from src.core.execution import ExecutionEngine
+from src.core.execution import ExecutionEngine, ExitDecision
 from src.core.interfaces.exchange import ExchangeOrderSnapshot
 from src.core.interfaces.exchange import ExchangeOrderEvent
 from src.core.interfaces.exchange import ExchangeError
@@ -384,7 +384,7 @@ class TestQuantityHandling:
                 None,
                 executor,
             )
-            is None
+            is False
         )
         executor.assert_not_called()
         assert execution_engine._reconcile_halt is True
@@ -396,7 +396,7 @@ class TestQuantityHandling:
                 None,
                 executor,
             )
-            is None
+            is True
         )
         executor.assert_called_once()
 
@@ -536,6 +536,337 @@ class TestQuantityHandling:
 
         assert engine._reconcile_halt is True
         assert engine._submissions_in_flight == 0
+
+    def test_authoritative_exit_accepts_completed_verified_reduction_replay(
+        self,
+        execution_engine,
+        signal_factory,
+        mock_order_repo,
+        order_factory,
+    ):
+        client_order_id = generate_client_order_id(
+            "test_strategy",
+            "market",
+            "exit_long_0",
+            clock_ns=lambda: 1_704_067_200_000_000_000,
+        )
+        signal = signal_factory(
+            signal_type=SignalType.EXIT_LONG,
+            quantity=Decimal("0.25"),
+            metadata={"client_order_id": client_order_id},
+        )
+        order = order_factory(
+            order_id="completed-reduction",
+            strategy_id=signal.strategy_id,
+            product_id=signal.product_id,
+            order_type="market",
+            side="sell",
+            quantity=Decimal("0.25"),
+            status=OrderStatus.FILLED.value,
+            filled_quantity=Decimal("0.25"),
+            client_order_id=client_order_id,
+        )
+        order.intent_payload = {
+            "source": "authoritative_net_reduction",
+            "signal": {"type": SignalType.EXIT_LONG.value},
+        }
+        mock_order_repo.add_order(order)
+        execution_engine.record_verified_net_reduction(
+            signal,
+            str(order.id),
+            remaining_remote_quantity=Decimal("2"),
+        )
+        executor = MagicMock()
+
+        assert (
+            execution_engine.execute_authoritative_exit_signal(
+                signal,
+                None,
+                executor,
+            )
+            is True
+        )
+
+        executor.assert_not_called()
+        assert execution_engine._reconcile_halt is False
+
+    def test_authoritative_exit_halts_on_unverified_reduction_replay(
+        self,
+        execution_engine,
+        signal_factory,
+        mock_order_repo,
+        order_factory,
+    ):
+        client_order_id = generate_client_order_id(
+            "test_strategy",
+            "market",
+            "exit_long_0",
+            clock_ns=lambda: 1_704_067_200_000_000_000,
+        )
+        signal = signal_factory(
+            signal_type=SignalType.EXIT_LONG,
+            quantity=Decimal("0.25"),
+            metadata={"client_order_id": client_order_id},
+        )
+        order = order_factory(
+            strategy_id=signal.strategy_id,
+            product_id=signal.product_id,
+            order_type="market",
+            side="sell",
+            quantity=Decimal("0.25"),
+            status=OrderStatus.FILLED.value,
+            filled_quantity=Decimal("0.25"),
+            client_order_id=client_order_id,
+        )
+        order.intent_payload = {
+            "source": "authoritative_net_reduction",
+            "signal": {"type": SignalType.EXIT_LONG.value},
+        }
+        mock_order_repo.add_order(order)
+        executor = MagicMock()
+
+        with pytest.raises(
+            RuntimeError,
+            match="authoritative_exit_replay_verification_missing",
+        ):
+            execution_engine.execute_authoritative_exit_signal(
+                signal,
+                None,
+                executor,
+            )
+
+        executor.assert_not_called()
+        assert execution_engine._reconcile_halt is True
+
+    def test_authoritative_exit_still_rejects_fresh_already_flat(
+        self,
+        execution_engine,
+        signal_factory,
+    ):
+        executor = MagicMock()
+
+        assert (
+            execution_engine.execute_authoritative_exit_signal(
+                signal_factory(
+                    signal_type=SignalType.EXIT_LONG,
+                    quantity=Decimal("0.25"),
+                ),
+                None,
+                executor,
+            )
+            is False
+        )
+
+        executor.assert_not_called()
+        assert execution_engine._reconcile_halt is False
+
+
+def test_verified_net_reduction_requires_gate_and_omits_reduce_only(
+    mock_db_session,
+    mock_clock,
+    mock_exchange_adapter,
+    mock_order_repo,
+    signal_factory,
+):
+    engine = ExecutionEngine(
+        db_session=mock_db_session,
+        clock=mock_clock,
+        adapter=mock_exchange_adapter,
+        order_repository=mock_order_repo,
+        db_session_factory=lambda: nullcontext(mock_db_session),
+        audit_external_orders=True,
+    )
+    signal = signal_factory(
+        signal_type=SignalType.EXIT_LONG,
+        quantity=Decimal("1"),
+    )
+    decision = ExitDecision(
+        allowed=True,
+        reason="position_matched",
+        quantity=Decimal("1"),
+        position_quantity=Decimal("1"),
+    )
+
+    with pytest.raises(
+        RuntimeError,
+        match="requires_exclusive_exit_gate",
+    ):
+        engine.submit_verified_net_reduction(
+            signal,
+            decision,
+            candle=None,
+            preflight_remote_quantity=Decimal("3"),
+        )
+
+    generation = engine._begin_authoritative_exit(timeout=0.1)
+    assert generation is not None
+    try:
+        order_id = engine.submit_verified_net_reduction(
+            signal,
+            decision,
+            candle=None,
+            preflight_remote_quantity=Decimal("3"),
+        )
+    finally:
+        engine._finish_authoritative_exit(
+            resume_after_reconcile=True,
+            reconcile_generation=generation,
+        )
+
+    order = mock_order_repo.orders[order_id]
+    assert order.type == "market"
+    assert order.side == "sell"
+    assert order.quantity == Decimal("1")
+    assert order.intent_payload["source"] == "authoritative_net_reduction"
+    assert "reduce_only" not in order.intent_payload
+
+
+def test_verified_net_reduction_rejects_entry_signal_before_submission(
+    mock_db_session,
+    mock_clock,
+    mock_exchange_adapter,
+    mock_order_repo,
+    signal_factory,
+):
+    engine = ExecutionEngine(
+        db_session=mock_db_session,
+        clock=mock_clock,
+        adapter=mock_exchange_adapter,
+        order_repository=mock_order_repo,
+        db_session_factory=lambda: nullcontext(mock_db_session),
+        audit_external_orders=True,
+    )
+    signal = signal_factory(signal_type=SignalType.LONG, quantity=Decimal("1"))
+    decision = ExitDecision(
+        allowed=True,
+        reason="invalid_test_input",
+        quantity=Decimal("1"),
+        position_quantity=Decimal("1"),
+    )
+
+    with pytest.raises(ValueError, match="requires_exit_signal"):
+        engine.submit_verified_net_reduction(
+            signal,
+            decision,
+            candle=None,
+            preflight_remote_quantity=Decimal("1"),
+        )
+
+    assert mock_order_repo.orders == {}
+
+
+def test_portfolio_exposure_snapshot_is_fenced_with_fill_application(
+    mock_db_session,
+    mock_clock,
+    mock_exchange_adapter,
+    mock_order_repo,
+):
+    product_id = "BINANCE:BTCUSDT-PERP"
+    state = {"position": None}
+    working_order = SimpleNamespace(
+        id="entry",
+        strategy_id="sleeve",
+        product_id=product_id,
+        side="buy",
+        quantity=Decimal("1"),
+        filled_quantity=Decimal("0"),
+        intent_payload={},
+    )
+    mock_order_repo.list_orders_by_statuses = MagicMock(
+        return_value=[working_order]
+    )
+    engine = ExecutionEngine(
+        db_session=mock_db_session,
+        clock=mock_clock,
+        adapter=mock_exchange_adapter,
+        order_repository=mock_order_repo,
+        account_service=SimpleNamespace(
+            get_position_for_exit=lambda *_args: state["position"]
+        ),
+    )
+    result = {}
+
+    with engine._order_event_apply_lock:
+        thread = threading.Thread(
+            target=lambda: result.update(
+                engine.portfolio_exposure_snapshot(
+                    ("sleeve",),
+                    product_id,
+                    {},
+                ).quantities
+            )
+        )
+        thread.start()
+        state["position"] = Position(
+            strategy_id="sleeve",
+            product_id=product_id,
+            side=PositionSide.LONG,
+            quantity=Decimal("1"),
+            entry_price=Decimal("42000"),
+            unrealized_pnl=Decimal("0"),
+        )
+        working_order.filled_quantity = Decimal("1")
+
+    thread.join(timeout=1)
+
+    assert not thread.is_alive()
+    assert result == {"sleeve": Decimal("1")}
+
+
+def test_portfolio_exposure_snapshot_reports_persisted_replay_intent(
+    execution_engine,
+    mock_order_repo,
+):
+    client_order_id = "portfolio-intent"
+    mock_order_repo.get_order_by_client_order_id = MagicMock(
+        return_value=SimpleNamespace(
+            status=OrderStatus.FILLED.value,
+            strategy_id="sleeve",
+            product_id="BINANCE:BTCUSDT-PERP",
+        )
+    )
+    execution_engine._position_loader = lambda *_args: None
+
+    snapshot = execution_engine.portfolio_exposure_snapshot(
+        ("sleeve",),
+        "BINANCE:BTCUSDT-PERP",
+        {client_order_id: "sleeve"},
+    )
+
+    assert snapshot.existing_client_order_ids == frozenset({client_order_id})
+
+
+@pytest.mark.parametrize(
+    ("persisted_strategy_id", "persisted_product_id"),
+    [
+        ("other_sleeve", "BINANCE:BTCUSDT-PERP"),
+        ("sleeve", "BINANCE:ETHUSDT-PERP"),
+    ],
+)
+def test_portfolio_exposure_snapshot_rejects_replay_intent_identity_mismatch(
+    execution_engine,
+    mock_order_repo,
+    persisted_strategy_id,
+    persisted_product_id,
+):
+    client_order_id = "portfolio-intent"
+    mock_order_repo.get_order_by_client_order_id = MagicMock(
+        return_value=SimpleNamespace(
+            strategy_id=persisted_strategy_id,
+            product_id=persisted_product_id,
+        )
+    )
+    execution_engine._position_loader = lambda *_args: None
+
+    with pytest.raises(
+        RuntimeError,
+        match="portfolio_replay_intent_identity_mismatch",
+    ):
+        execution_engine.portfolio_exposure_snapshot(
+            ("sleeve", "other_sleeve"),
+            "BINANCE:BTCUSDT-PERP",
+            {client_order_id: "sleeve"},
+        )
 
 
 class TestAdapterDelegation:

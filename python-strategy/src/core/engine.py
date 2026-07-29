@@ -9,6 +9,7 @@ import traceback
 import uuid
 from contextlib import contextmanager, nullcontext
 from concurrent.futures import ThreadPoolExecutor
+from dataclasses import replace
 from datetime import UTC, datetime
 from decimal import Decimal
 from typing import (
@@ -41,6 +42,13 @@ from src.core.clock import Clock
 from src.core.interfaces import IExchangeAdapter, IOrderRepository
 from src.core.daily_nav_snapshot import DailyNavSnapshotService
 from src.core.strategy_loader import StrategyLoader
+from src.core.portfolio_runtime import (
+    PortfolioCoordinator,
+    PortfolioDefinition,
+    PortfolioFactory,
+    PortfolioSleeve,
+    build_portfolio_artifact,
+)
 from src.core.data_provider import check_data_availability
 from src.core.adapters import (
     CcxtExchangeAdapter,
@@ -52,6 +60,9 @@ from src.core.adapters import (
 from src.core.adapters.rithmic_recovery import (
     load_rithmic_recovery_snapshot,
     rithmic_order_may_be_working,
+)
+from src.core.adapters.rithmic_portfolio_exit import (
+    RithmicPortfolioExitService,
 )
 from src.core.journal import StrategyJournal
 from src.core.redis_factory import create_redis_client
@@ -217,8 +228,13 @@ class StrategyEngine:
         self.clock = clock
         self.strategies: Dict[str, List[BaseStrategy]] = {}
         self.strategy_instances: Dict[str, BaseStrategy] = {}
-        self.loaded_classes: Dict[str, Type[BaseStrategy]] = {}
+        self.portfolio_instances: Dict[str, PortfolioDefinition] = {}
+        self.loaded_classes: Dict[
+            str,
+            Type[BaseStrategy] | Type[PortfolioFactory],
+        ] = {}
         self._strategy_lock = threading.Lock()
+        self._runtime_registration_lock = threading.RLock()
         self._ops_command_lock = threading.Lock()
         self._market_processing_lock = threading.Lock()
         self._boot_id = uuid.uuid4().hex
@@ -231,6 +247,7 @@ class StrategyEngine:
         )
         self._heartbeat_key = self.runtime_environment.key("heartbeat:python")
         self._registry = StrategyRegistry()
+        self._portfolio_coordinator = PortfolioCoordinator()
         self.redis_client = create_redis_client()
         self._strategy_state_manager = StrategyStateManager(
             self._db_session_factory,
@@ -246,6 +263,9 @@ class StrategyEngine:
             self.account_service,
             state_manager=self._strategy_state_manager,
             daily_nav_service=self._daily_nav_snapshot_service,
+            lifecycle_id_resolver=(
+                self._portfolio_coordinator.lifecycle_id_for_strategy
+            ),
         )
 
         # Use pre-created adapter or build from config
@@ -347,6 +367,8 @@ class StrategyEngine:
                 "get_position_for_exit",
                 self.account_service.get_position,
             ),
+            exposure_loader=self.execution_engine.portfolio_exposure_snapshot,
+            portfolio_coordinator=self._portfolio_coordinator,
         )
         self.ops_safety = OpsSafetyService(
             self.execution_engine,
@@ -1452,8 +1474,8 @@ class StrategyEngine:
         Performs a test run/warm-up for a strategy.
         """
         logger.info("🧪 Test Run for %s (days=%s)", strategy_id, days)
-        strategy_cls = self._get_loaded_strategy_class(strategy_id)
-        if strategy_cls is None:
+        artifact_cls = self._get_loaded_strategy_class(strategy_id)
+        if artifact_cls is None:
             logger.error("Strategy %s not loaded.", strategy_id)
             return
 
@@ -1468,20 +1490,35 @@ class StrategyEngine:
                 config = json.loads(state.config_json or "{}")
                 product_id = self._strategy_product_id(config)
                 
-                temp_instance = strategy_cls(strategy_id, product_id)
-                reqs = temp_instance.requirements
-                
-                # Check data availability
-                is_available, backfill_cmd = check_data_availability(
-                    db, reqs.product_id, reqs.timeframe, reqs.lookback_window
+                instances = self._build_artifact_instances(
+                    artifact_cls,
+                    strategy_id=strategy_id,
+                    product_id=product_id,
+                    config=config,
                 )
-                
-                if not is_available:
-                    logger.warning("⚠️ Insufficient data for %s. Command: %s", strategy_id, backfill_cmd)
-                    state.status = StrategyStatus.WARNING
-                    state.performance_json = json.dumps({"backfill_command": backfill_cmd})
-                    db.commit()
-                    return
+                for temp_instance in instances:
+                    reqs = temp_instance.requirements
+
+                    # Check data availability
+                    is_available, backfill_cmd = check_data_availability(
+                        db,
+                        reqs.product_id,
+                        reqs.timeframe,
+                        reqs.lookback_window,
+                    )
+
+                    if not is_available:
+                        logger.warning(
+                            "⚠️ Insufficient data for %s. Command: %s",
+                            strategy_id,
+                            backfill_cmd,
+                        )
+                        state.status = StrategyStatus.WARNING
+                        state.performance_json = json.dumps(
+                            {"backfill_command": backfill_cmd}
+                        )
+                        db.commit()
+                        return
 
                 # If OK, update status to READY
                 state.status = StrategyStatus.READY
@@ -1507,8 +1544,8 @@ class StrategyEngine:
     ) -> None:
         """Instantiate/register a strategy and transition it to ACTIVE."""
         logger.info("🚀 Starting Strategy: %s", strategy_id)
-        strategy_cls = self._get_loaded_strategy_class(strategy_id)
-        if strategy_cls is None:
+        artifact_cls = self._get_loaded_strategy_class(strategy_id)
+        if artifact_cls is None:
             logger.error("Strategy %s not loaded.", strategy_id)
             return
 
@@ -1524,21 +1561,46 @@ class StrategyEngine:
                 config = json.loads(state.config_json or "{}")
                 product_id = self._strategy_product_id(config)
                 
-                self._assert_strategy_live_readiness(strategy_cls)
-                instance = strategy_cls(strategy_id, product_id)
-                self._warm_up_strategy_instance(db, instance)
-                if self.runtime_environment.identity == "live":
-                    self._fresh_strategy_instance_for_replay(instance)
-                # Registration must follow warm-up — on restart-restore the lifecycle
-                # cache is already ACTIVE, so a registered instance is immediately
-                # live to on_market_data and could emit signals from partial state.
-                self._register_strategy_instance(instance)
+                self._assert_strategy_live_readiness(artifact_cls)
+                if issubclass(artifact_cls, PortfolioFactory):
+                    definition = self._build_portfolio_definition(
+                        artifact_cls,
+                        portfolio_id=strategy_id,
+                        product_id=product_id,
+                        config=config,
+                    )
+                    warmed_sleeves: list[PortfolioSleeve] = []
+                    for sleeve in definition.sleeves:
+                        instance = sleeve.strategy
+                        self._warm_up_strategy_instance(db, instance)
+                        if self.runtime_environment.identity == "live":
+                            self._fresh_strategy_instance_for_replay(instance)
+                        warmed_sleeves.append(
+                            replace(sleeve, strategy=instance)
+                        )
+                    definition = replace(
+                        definition,
+                        sleeves=tuple(warmed_sleeves),
+                    )
+                    # Registration must follow complete portfolio warm-up. A
+                    # partially registered portfolio could execute only a
+                    # subset of one candle's decisions.
+                    self._register_portfolio_definition(definition)
+                else:
+                    instance = artifact_cls(strategy_id, product_id)
+                    self._warm_up_strategy_instance(db, instance)
+                    if self.runtime_environment.identity == "live":
+                        self._fresh_strategy_instance_for_replay(instance)
+                    # Registration must follow warm-up — on restart-restore the lifecycle
+                    # cache is already ACTIVE, so a registered instance is immediately
+                    # live to on_market_data and could emit signals from partial state.
+                    self._register_strategy_instance(instance)
                 state.uptime_start = int(time.time() * 1000)
                 db.commit()
                 logger.info("🔥 Strategy %s is now ACTIVE for %s", strategy_id, product_id)
 
             except Exception as e:
-                self._unregister_strategy_instance(strategy_id)
+                self._unregister_runtime_artifact(strategy_id)
                 state.performance_json = json.dumps({"error": str(e)})
                 db.commit()
                 self._strategy_state_manager.transition_to_error(
@@ -1557,7 +1619,7 @@ class StrategyEngine:
                 reason=reason,
             )
         except Exception as e:
-            self._unregister_strategy_instance(strategy_id)
+            self._unregister_runtime_artifact(strategy_id)
             logger.error("❌ Failed to transition %s to ACTIVE: %s", strategy_id, e)
 
     def _strategy_product_id(self, config: dict) -> str:
@@ -1575,13 +1637,13 @@ class StrategyEngine:
     def _get_loaded_strategy_class(
         self,
         strategy_id: str,
-    ) -> type[BaseStrategy] | None:
+    ) -> type[BaseStrategy] | type[PortfolioFactory] | None:
         with self._strategy_lock:
             return self.loaded_classes.get(strategy_id)
 
     def _assert_strategy_live_readiness(
         self,
-        strategy_cls: type[BaseStrategy],
+        strategy_cls: type[BaseStrategy] | type[PortfolioFactory],
     ) -> None:
         if self.runtime_environment.identity != "live":
             return
@@ -1590,6 +1652,42 @@ class StrategyEngine:
             raise RuntimeError(
                 f"strategy_live_approval_required: readiness={readiness}"
             )
+
+    @staticmethod
+    def _build_portfolio_definition(
+        factory_cls: type[PortfolioFactory],
+        *,
+        portfolio_id: str,
+        product_id: str,
+        config: dict,
+    ) -> PortfolioDefinition:
+        return build_portfolio_artifact(
+            factory_cls,
+            portfolio_id=portfolio_id,
+            product_id=product_id,
+            config=config,
+        )
+
+    @classmethod
+    def _build_artifact_instances(
+        cls,
+        artifact_cls: type[BaseStrategy] | type[PortfolioFactory],
+        *,
+        strategy_id: str,
+        product_id: str,
+        config: dict,
+    ) -> tuple[BaseStrategy, ...]:
+        if issubclass(artifact_cls, PortfolioFactory):
+            return tuple(
+                sleeve.strategy
+                for sleeve in cls._build_portfolio_definition(
+                    artifact_cls,
+                    portfolio_id=strategy_id,
+                    product_id=product_id,
+                    config=config,
+                ).sleeves
+            )
+        return (artifact_cls(strategy_id, product_id),)
 
     def _warm_up_strategy_instance(
         self,
@@ -2038,7 +2136,7 @@ class StrategyEngine:
     ) -> None:
         """Unregister a strategy and transition it to STOPPED."""
         logger.info("🛑 Stopping Strategy: %s", strategy_id)
-        if not self._unregister_strategy_instance(strategy_id):
+        if not self._unregister_runtime_artifact(strategy_id):
             logger.warning("Strategy %s is not active.", strategy_id)
             return
 
@@ -2056,35 +2154,117 @@ class StrategyEngine:
 
     def _register_strategy_instance(self, instance: BaseStrategy) -> None:
         """Register a live strategy instance in runtime-only structures."""
-        with self._strategy_lock:
-            old = self.strategy_instances.get(instance.strategy_id)
-            if old is not None and old.product_id in self.strategies:
-                self.strategies[old.product_id] = [
-                    s for s in self.strategies[old.product_id]
-                    if s.strategy_id != instance.strategy_id
-                ]
-            self.strategy_instances[instance.strategy_id] = instance
-            if instance.product_id not in self.strategies:
-                self.strategies[instance.product_id] = []
-            self.strategies[instance.product_id].append(instance)
-            self._registry.register(instance)
-            ACTIVE_STRATEGIES.set(len(self.strategy_instances))
+        with self._runtime_registration_lock:
+            updated_portfolio = (
+                self._portfolio_coordinator.replace_sleeve_strategy(instance)
+            )
+            with self._strategy_lock:
+                old = self.strategy_instances.get(instance.strategy_id)
+                if old is not None and old.product_id in self.strategies:
+                    self.strategies[old.product_id] = [
+                        s for s in self.strategies[old.product_id]
+                        if s.strategy_id != instance.strategy_id
+                    ]
+                self.strategy_instances[instance.strategy_id] = instance
+                if instance.product_id not in self.strategies:
+                    self.strategies[instance.product_id] = []
+                self.strategies[instance.product_id].append(instance)
+                self._registry.register(instance)
+                if (
+                    updated_portfolio is not None
+                    and updated_portfolio.portfolio_id in self.portfolio_instances
+                ):
+                    self.portfolio_instances[updated_portfolio.portfolio_id] = (
+                        updated_portfolio
+                    )
+                ACTIVE_STRATEGIES.set(len(self.strategy_instances))
+
+    def _register_portfolio_definition(
+        self,
+        definition: PortfolioDefinition,
+        *,
+        publish_active_state: bool = False,
+    ) -> None:
+        """Atomically expose a complete portfolio at the market event boundary."""
+        sleeve_ids = [
+            sleeve.strategy.strategy_id for sleeve in definition.sleeves
+        ]
+        new_ids = {definition.portfolio_id, *sleeve_ids}
+        with self._runtime_registration_lock, self._market_processing_lock:
+            with self._strategy_lock:
+                existing_ids = {
+                    *self.strategy_instances,
+                    *self.portfolio_instances,
+                }
+                collisions = sorted(new_ids & existing_ids)
+            if collisions:
+                raise ValueError(
+                    f"portfolio runtime IDs are already active: {collisions}"
+                )
+
+            registered: list[str] = []
+            self._portfolio_coordinator.register(definition)
+            try:
+                for sleeve in definition.sleeves:
+                    self._register_strategy_instance(sleeve.strategy)
+                    registered.append(sleeve.strategy.strategy_id)
+                with self._strategy_lock:
+                    self.portfolio_instances[definition.portfolio_id] = definition
+            except Exception:
+                for strategy_id in reversed(registered):
+                    self._unregister_strategy_instance(strategy_id)
+                self._portfolio_coordinator.unregister(definition.portfolio_id)
+                raise
+        if publish_active_state:
+            self._strategy_state_manager.on_state_change_message(
+                {
+                    "strategy_id": definition.portfolio_id,
+                    "status": StrategyStatus.ACTIVE.value,
+                }
+            )
+        logger.info(
+            "Registered portfolio %s with %s sleeve(s)",
+            definition.portfolio_id,
+            len(definition.sleeves),
+        )
+
+    def _unregister_runtime_artifact(self, runtime_id: str) -> bool:
+        """Remove a parent portfolio or one standalone strategy."""
+        with self._runtime_registration_lock, self._market_processing_lock:
+            definition = self._portfolio_coordinator.unregister(runtime_id)
+            if definition is not None:
+                for sleeve in definition.sleeves:
+                    self._unregister_strategy_instance(
+                        sleeve.strategy.strategy_id
+                    )
+                with self._strategy_lock:
+                    self.portfolio_instances.pop(runtime_id, None)
+                return True
+            if (
+                self._portfolio_coordinator.portfolio_id_for_sleeve(runtime_id)
+                is not None
+            ):
+                raise ValueError(
+                    "portfolio sleeves must be controlled through the portfolio ID"
+                )
+            return self._unregister_strategy_instance(runtime_id)
 
     def _unregister_strategy_instance(self, strategy_id: str) -> bool:
         """Remove a live strategy instance from runtime-only structures."""
-        with self._strategy_lock:
-            instance = self.strategy_instances.pop(strategy_id, None)
-            if instance is None:
-                return False
-            product_id = instance.product_id
-            if product_id in self.strategies:
-                self.strategies[product_id] = [
-                    s for s in self.strategies[product_id]
-                    if s.strategy_id != strategy_id
-                ]
-            self._registry.unregister(strategy_id)
-            ACTIVE_STRATEGIES.set(len(self.strategy_instances))
-            return True
+        with self._runtime_registration_lock:
+            with self._strategy_lock:
+                instance = self.strategy_instances.pop(strategy_id, None)
+                if instance is None:
+                    return False
+                product_id = instance.product_id
+                if product_id in self.strategies:
+                    self.strategies[product_id] = [
+                        s for s in self.strategies[product_id]
+                        if s.strategy_id != strategy_id
+                    ]
+                self._registry.unregister(strategy_id)
+                ACTIVE_STRATEGIES.set(len(self.strategy_instances))
+                return True
 
     def _reconcile_balance(self):
         """
@@ -2244,7 +2424,14 @@ class StrategyEngine:
                         pass
                     # Update DB heartbeats for active strategies (snapshot for thread safety)
                     with self._strategy_lock:
-                        active_sids = list(self.strategy_instances.keys())
+                        active_sids = sorted(
+                            {
+                                self._portfolio_coordinator.lifecycle_id_for_strategy(
+                                    strategy_id
+                                )
+                                for strategy_id in self.strategy_instances
+                            }
+                        )
                     self._record_strategy_heartbeats(active_sids)
                     time.sleep(1.0)
                 except Exception as e:
@@ -2394,17 +2581,43 @@ class StrategyEngine:
         self._assert_strategy_live_readiness(type(strategy))
         if self.runtime_environment.identity == "live":
             self._fresh_strategy_instance_for_replay(strategy)
-        with self._strategy_lock:
-            if strategy.product_id not in self.strategies:
-                self.strategies[strategy.product_id] = []
-            self.strategies[strategy.product_id].append(strategy)
-            self.strategy_instances[strategy.strategy_id] = strategy
-            self._registry.register(strategy)
+        with self._runtime_registration_lock:
+            with self._strategy_lock:
+                if (
+                    strategy.strategy_id in self.strategy_instances
+                    or strategy.strategy_id in self.portfolio_instances
+                    or self._portfolio_coordinator.portfolio_id_for_sleeve(
+                        strategy.strategy_id
+                    )
+                    is not None
+                ):
+                    raise ValueError(
+                        "strategy runtime ID is already active: "
+                        f"{strategy.strategy_id}"
+                    )
+            self._register_strategy_instance(strategy)
             self._strategy_state_manager.on_state_change_message(
                 {"strategy_id": strategy.strategy_id, "status": StrategyStatus.ACTIVE.value}
             )
-            ACTIVE_STRATEGIES.set(len(self.strategy_instances))
         logger.info("Registered strategy (legacy): %s for %s", strategy.strategy_id, strategy.product_id)
+
+    def add_portfolio(self, definition: PortfolioDefinition) -> None:
+        """Register one pre-built portfolio for backtest or static runtimes."""
+        if (
+            self.runtime_environment.identity == "live"
+            and definition.readiness != "LIVE_APPROVED"
+        ):
+            raise RuntimeError(
+                "portfolio_live_approval_required: "
+                f"readiness={definition.readiness}"
+            )
+        if self.runtime_environment.identity == "live":
+            for sleeve in definition.sleeves:
+                self._fresh_strategy_instance_for_replay(sleeve.strategy)
+        self._register_portfolio_definition(
+            definition,
+            publish_active_state=True,
+        )
 
     def build_stream_channels(self) -> list:
         """Derive Redis stream keys from registered strategy requirements."""
@@ -2430,19 +2643,42 @@ class StrategyEngine:
             if isinstance(data, Trade):
                 self._signal_processor.on_trade(data)
 
-    def process_signal(self, signal: Signal, candle: Optional[Candlestick]):
+    def on_backtest_market_data(
+        self,
+        execution_candle: Candlestick,
+        decision_candle: Candlestick | None = None,
+    ) -> None:
+        """Apply simulated fills before an optional completed decision candle.
+
+        Live venues drive fills from authoritative order events and expose only
+        completed Rust-aggregated decision candles to strategies. The split
+        candle path exists solely to reproduce those venue semantics in a
+        simulated backtest adapter.
         """
-        Handle the signal generated by a strategy.
+        if self.runtime_environment.identity == "live":
+            raise RuntimeError("split market routing is backtest-only")
+        with self._market_processing_lock:
+            self.execution_engine.process_market_data(execution_candle)
+            if decision_candle is not None:
+                self._signal_processor.on_candle(decision_candle)
+
+    def process_signal(
+        self,
+        signal: Signal,
+        candle: Optional[Candlestick],
+    ) -> bool:
+        """
+        Handle the signal generated by a strategy and report submission success.
         """
         if signal.type == SignalType.NO_SIGNAL:
-            return
+            return True
         if self._kill_switch_halted:
             logger.warning(
                 "Signal rejected because kill switch is active: strategy=%s type=%s",
                 signal.strategy_id,
                 signal.type,
             )
-            return
+            return False
 
         import structlog.contextvars
         structlog.contextvars.bind_contextvars(trace_id=uuid.uuid4().hex[:16])
@@ -2461,21 +2697,43 @@ class StrategyEngine:
         ).inc()
 
         order_id = None
+        execution_succeeded = False
         if is_passed:
             logger.info("✅ SIGNAL ACCEPTED: %s. Forwarding to Execution Engine...", signal.type)
             if (
                 isinstance(self.execution_engine.adapter, RithmicExchangeAdapter)
                 and signal.type in (SignalType.EXIT_LONG, SignalType.EXIT_SHORT)
             ):
-                order_id = self.execution_engine.execute_authoritative_exit_signal(
-                    signal,
-                    candle,
-                    self._run_rithmic_strategy_exit,
+                portfolio_id = (
+                    self._portfolio_coordinator.portfolio_id_for_sleeve(
+                        signal.strategy_id
+                    )
+                )
+                exit_executor = self._run_rithmic_strategy_exit
+                if portfolio_id is not None:
+                    def execute_portfolio_exit(
+                        portfolio_signal: Signal,
+                        decision: ExitDecision,
+                    ) -> dict[str, object]:
+                        return self._run_rithmic_portfolio_exit(
+                            portfolio_signal,
+                            decision,
+                            candle,
+                        )
+
+                    exit_executor = execute_portfolio_exit
+                execution_succeeded = (
+                    self.execution_engine.execute_authoritative_exit_signal(
+                        signal,
+                        candle,
+                        exit_executor,
+                    )
                 )
             else:
                 order_id = self.execution_engine.execute_signal(signal, candle)
+                execution_succeeded = order_id is not None
             if self.execution_engine.audit_external_orders:
-                return
+                return execution_succeeded
         
         audit = build_signal_audit(
             clock=self.clock,
@@ -2487,6 +2745,7 @@ class StrategyEngine:
         )
         with self._db_session_factory() as db:
             commit_signal_audit(db, audit)
+        return execution_succeeded
 
     def _run_rithmic_strategy_exit(
         self,
@@ -2514,6 +2773,8 @@ class StrategyEngine:
                         "rithmic_strategy_exit_event_stream_stop_timeout"
                     )
 
+            self._assert_runtime_leadership()
+            adapter.start_order_event_stream()
             active_statuses = {
                 OrderStatus.NEW.value,
                 OrderStatus.SUBMITTED_UNCONFIRMED.value,
@@ -2528,8 +2789,6 @@ class StrategyEngine:
                 if order.strategy_id == signal.strategy_id
                 and order.product_id == signal.product_id
             ]
-            self._assert_runtime_leadership()
-            adapter.start_order_event_stream()
             for order in active_orders:
                 self._assert_runtime_leadership()
                 if order.status == OrderStatus.NEW.value:
@@ -2703,6 +2962,51 @@ class StrategyEngine:
         if outcome is None:
             raise RuntimeError("rithmic_strategy_exit_outcome_missing")
         return outcome
+
+    def _run_rithmic_portfolio_exit(
+        self,
+        signal: Signal,
+        decision: ExitDecision,
+        candle: Optional[Candlestick],
+    ) -> dict[str, object]:
+        """Reduce one sleeve while preserving the verified product-net position."""
+        adapter = self.execution_engine.adapter
+        if not isinstance(adapter, RithmicExchangeAdapter):
+            raise RuntimeError("authoritative_portfolio_exit_requires_rithmic")
+        profile = self._rithmic_recovery_profile
+        account_id = self._rithmic_recovery_account_id
+        if not isinstance(profile, str) or not isinstance(account_id, str):
+            raise RuntimeError("rithmic_portfolio_exit_account_identity_missing")
+        return RithmicPortfolioExitService(
+            adapter=adapter,
+            execution_engine=self.execution_engine,
+            account_service=self.account_service,
+            profile=profile,
+            account_id=account_id,
+            order_event_stop=self._order_event_stop,
+            order_event_thread=self.order_event_thread,
+            assert_leadership=self._assert_runtime_leadership,
+            restart_order_stream=self._start_exchange_order_event_stream,
+            lockdown=self._lockdown_for_rithmic_order_drift,
+            schedule_emergency_flatten=(
+                self._schedule_rithmic_portfolio_exit_compensation
+            ),
+            portfolio_id_for_sleeve=(
+                self._portfolio_coordinator.portfolio_id_for_sleeve
+            ),
+        ).execute(signal, decision, candle)
+
+    def _schedule_rithmic_portfolio_exit_compensation(
+        self,
+        reason: str,
+    ) -> None:
+        """Flatten through the existing authoritative kill switch after drain."""
+        self.execution_engine.run_when_submissions_drained(
+            lambda: self._run_ops_kill_switch(
+                actor="engine",
+                reason=f"portfolio_exit_compensation:{reason}",
+            )
+        )
 
     def shutdown(
         self,

@@ -6,10 +6,16 @@ from pathlib import Path
 from typing import Callable, ContextManager, Dict, Iterable, List, Optional, cast
 from decimal import Decimal
 from sqlalchemy.orm import Session
+from fluxtrade_core import (
+    CandleAggregator,  # pyright: ignore[reportAttributeAccessIssue]
+    Candlestick as RustCandlestick,  # pyright: ignore[reportAttributeAccessIssue]
+)
 from src.core.db import SessionLocal
 from src.core.orm_models import Strategy as StrategyORM, BacktestResultSummary, BacktestTradeLog
 from src.core.engine import StrategyEngine
 from src.core.clock import BacktestClock
+from src.core.data_provider import timeframe_to_ms
+from src.core.models import Candlestick
 from src.strategies.base import BaseStrategy
 from src.core.repositories import BacktestOrderRepository
 from src.core.backtest.loader import get_candles_generator
@@ -21,6 +27,7 @@ from src.core.analytics import (
     utc_daily_return_metrics,
 )
 from src.core.interfaces.data_source import IDataSource
+from src.core.portfolio_runtime import PortfolioDefinition
 from src.core.adapters.simulated import SimulatedAdapter
 from src.core.mocks.account_service import BacktestAccountService
 from src.core.journal import StrategyJournal
@@ -170,11 +177,24 @@ class BacktestRunner:
         report_config: Optional[Dict] = None,
         db_session_factory: Optional[Callable[[], ContextManager[Session]]] = None,
         instrument_spec: InstrumentSpec | None = None,
+        execution_timeframe: str | None = None,
     ):
         self.start_time = start_time
         self.end_time = end_time
         self.product_id = product_id
         self.timeframe = timeframe
+        self.execution_timeframe = execution_timeframe
+        if execution_timeframe is not None:
+            execution_ms = timeframe_to_ms(execution_timeframe)
+            decision_ms = timeframe_to_ms(timeframe)
+            if (
+                execution_ms >= decision_ms
+                or decision_ms % execution_ms != 0
+            ):
+                raise ValueError(
+                    "execution_timeframe must evenly divide and be shorter "
+                    "than the strategy timeframe"
+                )
         self.initial_balance = initial_balance
         self.max_drawdown_limit = max_drawdown_limit
         self.data_source = data_source
@@ -193,20 +213,49 @@ class BacktestRunner:
 
         self.clock = BacktestClock(start_time=start_time / 1000)
         self._strategies_buffer: List[BaseStrategy] = []
+        self._portfolios_buffer: List[PortfolioDefinition] = []
+        self._primary_runtime_id: str | None = None
         self.engine = None
 
     def add_strategy(self, strategy: BaseStrategy):
+        if self._primary_runtime_id is None:
+            self._primary_runtime_id = strategy.strategy_id
         self._strategies_buffer.append(strategy)
+
+    def add_portfolio(self, definition: PortfolioDefinition) -> None:
+        """Add a portfolio while retaining strategy-scoped fills and metrics."""
+        decision_timeframe = (
+            definition.sleeves[0].strategy.requirements.timeframe
+        )
+        if (
+            definition.product_id != self.product_id
+            or decision_timeframe != self.timeframe
+        ):
+            raise ValueError(
+                "portfolio definition does not match backtest product/timeframe"
+            )
+        if self._primary_runtime_id is None:
+            self._primary_runtime_id = definition.portfolio_id
+        self._portfolios_buffer.append(definition)
+        self._strategies_buffer.extend(
+            sleeve.strategy for sleeve in definition.sleeves
+        )
 
     def _ensure_strategies_registered(self, db_session: Session):
         """Register all added strategies in the DB to avoid FK constraints"""
-        for strat in self._strategies_buffer:
-            exists = db_session.query(StrategyORM).filter_by(id=strat.strategy_id).first()
+        runtime_ids = [
+            strategy.strategy_id for strategy in self._strategies_buffer
+        ]
+        runtime_ids.extend(
+            portfolio.portfolio_id for portfolio in self._portfolios_buffer
+        )
+        for runtime_id in runtime_ids:
+            exists = db_session.query(StrategyORM).filter_by(id=runtime_id).first()
             if not exists:
-                logger.info("Registering missing strategy in DB: %s", strat.strategy_id)
+                logger.info("Registering missing strategy in DB: %s", runtime_id)
                 new_strat = StrategyORM(
-                    id=strat.strategy_id,
-                    name=f"Backtest: {strat.strategy_id}",
+                    id=runtime_id,
+                    name=f"Backtest: {runtime_id}",
                     configuration_json="{}"
                 )
                 db_session.add(new_strat)
@@ -222,12 +271,57 @@ class BacktestRunner:
         peak_equity = Decimal(str(self.initial_balance))
         max_drawdown = Decimal("0")
         equity_samples: list[tuple[int, Decimal]] = []
+        aggregator = (
+            CandleAggregator()
+            if self.execution_timeframe is not None
+            else None
+        )
         for candle in candles:
             # Update Clock
             self.clock.set_time(candle.timestamp / 1000)
 
-            # Process Candle
-            self.engine.on_market_data(candle)
+            # Fine-grained source candles drive matching first. Strategies only
+            # see completed derived candles, matching the live Rust pipeline.
+            if aggregator is None:
+                self.engine.on_market_data(candle)
+            else:
+                if candle.timeframe != self.execution_timeframe:
+                    raise ValueError(
+                        "backtest execution candle timeframe mismatch: "
+                        f"expected={self.execution_timeframe} "
+                        f"actual={candle.timeframe}"
+                    )
+                completed = aggregator.add_candle(
+                    RustCandlestick(
+                        product_id=candle.product_id,
+                        timeframe=candle.timeframe,
+                        timestamp=candle.timestamp,
+                        open=str(candle.open),
+                        high=str(candle.high),
+                        low=str(candle.low),
+                        close=str(candle.close),
+                        volume=str(candle.volume),
+                    ),
+                    self.timeframe,
+                )
+                decision_candle = (
+                    None
+                    if completed is None
+                    else Candlestick(
+                        product_id=completed.product_id,
+                        timeframe=completed.timeframe,
+                        timestamp=completed.timestamp,
+                        open=Decimal(str(completed.open)),
+                        high=Decimal(str(completed.high)),
+                        low=Decimal(str(completed.low)),
+                        close=Decimal(str(completed.close)),
+                        volume=Decimal(str(completed.volume)),
+                    )
+                )
+                self.engine.on_backtest_market_data(
+                    candle,
+                    decision_candle,
+                )
 
             # Check Circuit Breaker
             if mock_account.adapter is None:
@@ -328,7 +422,9 @@ class BacktestRunner:
             return
 
         # 1. Setup Backtest Session
-        primary_strategy_id = self._strategies_buffer[0].strategy_id
+        primary_strategy_id = (
+            self._primary_runtime_id or self._strategies_buffer[0].strategy_id
+        )
         summary = BacktestResultSummary(
             strategy_id=primary_strategy_id,
             start_time=self.start_time,
@@ -373,12 +469,20 @@ class BacktestRunner:
         )
 
         # Inject journal and account service into strategies
+        portfolio_sleeve_ids = {
+            sleeve.strategy.strategy_id
+            for portfolio in self._portfolios_buffer
+            for sleeve in portfolio.sleeves
+        }
         for strat in self._strategies_buffer:
             strat.journal = journal
             if hasattr(strat, 'risk_manager'):
                 strat.risk_manager.account_service = mock_account
                 strat.risk_manager.instrument_spec_resolver = self._resolve_instrument_spec
-            self.engine.add_strategy(strat)
+            if strat.strategy_id not in portfolio_sleeve_ids:
+                self.engine.add_strategy(strat)
+        for portfolio in self._portfolios_buffer:
+            self.engine.add_portfolio(portfolio)
 
         logger.info("Starting Backtest for %s [%s - %s]", self.product_id, self.start_time, self.end_time)
 
@@ -392,7 +496,7 @@ class BacktestRunner:
         if self.data_source:
             candle_context = nullcontext(self.data_source.get_candles(
                 self.product_id,
-                self.timeframe,
+                self.execution_timeframe or self.timeframe,
                 self.start_time,
                 self.end_time,
             ))
@@ -406,7 +510,7 @@ class BacktestRunner:
                 candle_gen = get_candles_generator(
                     candle_source,
                     self.product_id,
-                    self.timeframe,
+                    self.execution_timeframe or self.timeframe,
                     self.start_time,
                     self.end_time,
                 )
