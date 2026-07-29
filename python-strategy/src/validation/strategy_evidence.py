@@ -11,7 +11,7 @@ from dataclasses import asdict, dataclass
 from datetime import UTC, datetime
 from decimal import Decimal
 from pathlib import Path
-from typing import IO, Any, Callable, Iterable, Iterator
+from typing import IO, Any, Callable, Iterable, Iterator, Protocol
 
 from fluxtrade_core import (
     CandleAggregator,  # pyright: ignore[reportAttributeAccessIssue]
@@ -19,6 +19,14 @@ from fluxtrade_core import (
 )
 
 from src.core.models import Candlestick, Signal, SignalType
+from src.core.portfolio_runtime import (
+    PortfolioCoordinator,
+    PortfolioDefinition,
+    PortfolioExposureSnapshot,
+    PortfolioFactory,
+    build_portfolio_artifact,
+    portfolio_replay_configuration,
+)
 from src.core.strategy_loader import StrategyLoader
 from src.strategies.base import BaseStrategy
 
@@ -84,6 +92,71 @@ class ShadowRunReport:
         return asdict(self)
 
 
+class _DecisionEvidenceRuntime(Protocol):
+    identity: StrategyEvidenceIdentity
+
+    @property
+    def product_id(self) -> str: ...
+
+    @property
+    def timeframe(self) -> str: ...
+
+    def decide(self, candle: Candlestick) -> list[Signal]: ...
+
+
+@dataclass(slots=True)
+class _StrategyDecisionEvidenceRuntime:
+    strategy: BaseStrategy
+    identity: StrategyEvidenceIdentity
+
+    @property
+    def product_id(self) -> str:
+        return self.strategy.product_id
+
+    @property
+    def timeframe(self) -> str:
+        return self.strategy.requirements.timeframe
+
+    def decide(self, candle: Candlestick) -> list[Signal]:
+        return _signals(self.strategy, candle)
+
+
+@dataclass(slots=True)
+class _PortfolioDecisionEvidenceRuntime:
+    definition: PortfolioDefinition
+    identity: StrategyEvidenceIdentity
+    coordinator: PortfolioCoordinator
+
+    @property
+    def product_id(self) -> str:
+        return self.definition.product_id
+
+    @property
+    def timeframe(self) -> str:
+        return self.definition.sleeves[0].strategy.requirements.timeframe
+
+    def decide(self, candle: Candlestick) -> list[Signal]:
+        decisions = [
+            (sleeve.strategy.strategy_id, _signals(sleeve.strategy, candle))
+            for sleeve in self.definition.sleeves
+        ]
+        coordinated = self.coordinator.coordinate_candle_decisions(
+            candle,
+            decisions,
+            exposure_loader=lambda strategy_ids, _product_id, _intents: (
+                PortfolioExposureSnapshot(
+                    {strategy_id: Decimal("0") for strategy_id in strategy_ids}
+                )
+            ),
+            default_quantity=Decimal("1"),
+        )
+        return [
+            signal
+            for _strategy_id, signals in coordinated
+            for signal in signals
+        ]
+
+
 def load_strategy(
     strategy_directory: Path,
     strategy_id: str,
@@ -95,9 +168,36 @@ def load_strategy(
         raise ValueError(f"strategy not found: {strategy_id}")
     if isinstance(strategy_class, str):
         raise RuntimeError(strategy_class)
+    if not issubclass(strategy_class, BaseStrategy):
+        raise TypeError(f"artifact is not a strategy: {strategy_id}")
     strategy = strategy_class(strategy_id, product_id)
     require_verified_strategy_identity(strategy)
     return strategy
+
+
+def load_portfolio(
+    strategy_directory: Path,
+    portfolio_id: str,
+    product_id: str,
+    *,
+    config: dict[str, object],
+) -> PortfolioDefinition:
+    loaded = StrategyLoader.scan_directory(str(strategy_directory))
+    factory_class = loaded.get(portfolio_id)
+    if factory_class is None:
+        raise ValueError(f"portfolio not found: {portfolio_id}")
+    if isinstance(factory_class, str):
+        raise RuntimeError(factory_class)
+    if not issubclass(factory_class, PortfolioFactory):
+        raise TypeError(f"artifact is not a portfolio: {portfolio_id}")
+    definition = build_portfolio_artifact(
+        factory_class,
+        portfolio_id=portfolio_id,
+        product_id=product_id,
+        config=config,
+    )
+    require_verified_portfolio_identity(definition)
+    return definition
 
 
 def verify_historical_stream_parity(
@@ -112,12 +212,53 @@ def verify_historical_stream_parity(
     The reference may end before the source. Every reference row must match;
     source candles after its terminal timestamp are reported as extra coverage.
     """
+    return _verify_historical_stream_parity(
+        source_1m_path,
+        reference_5m_path,
+        product_id=product_id,
+        runtime_factory=lambda: _strategy_evidence_runtime(
+            strategy_factory()
+        ),
+    )
 
-    source_strategy = strategy_factory()
-    reference_strategy = strategy_factory()
-    strategy_identity = require_verified_strategy_identity(source_strategy)
-    if require_verified_strategy_identity(reference_strategy) != strategy_identity:
-        raise ValueError("historical parity strategy factory is not deterministic")
+
+def verify_portfolio_historical_stream_parity(
+    source_1m_path: Path,
+    reference_5m_path: Path,
+    *,
+    product_id: str,
+    portfolio_factory: Callable[[], PortfolioDefinition],
+) -> HistoricalParityReport:
+    """Verify aggregate and decision parity for one catalog portfolio."""
+    return _verify_historical_stream_parity(
+        source_1m_path,
+        reference_5m_path,
+        product_id=product_id,
+        runtime_factory=lambda: _portfolio_evidence_runtime(
+            portfolio_factory()
+        ),
+    )
+
+
+def _verify_historical_stream_parity(
+    source_1m_path: Path,
+    reference_5m_path: Path,
+    *,
+    product_id: str,
+    runtime_factory: Callable[[], _DecisionEvidenceRuntime],
+) -> HistoricalParityReport:
+    source_runtime = runtime_factory()
+    reference_runtime = runtime_factory()
+    strategy_identity = source_runtime.identity
+    if reference_runtime.identity != strategy_identity:
+        raise ValueError("historical parity runtime factory is not deterministic")
+    if (
+        source_runtime.product_id != product_id
+        or reference_runtime.product_id != product_id
+    ):
+        raise ValueError("historical parity runtime product mismatch")
+    if source_runtime.timeframe != "5m" or reference_runtime.timeframe != "5m":
+        raise ValueError("historical parity runtime timeframe must be 5m")
     source_digest = hashlib.sha256()
     reference_digest = hashlib.sha256()
     source_decision_count = 0
@@ -186,8 +327,8 @@ def verify_historical_stream_parity(
             )
             _assert_candle_equal(source_candle, reference_candle)
 
-            source_signals = _signals(source_strategy, source_candle)
-            reference_signals = _signals(reference_strategy, reference_candle)
+            source_signals = source_runtime.decide(source_candle)
+            reference_signals = reference_runtime.decide(reference_candle)
             _update_digest(source_digest, source_signals)
             _update_digest(reference_digest, reference_signals)
             source_decision_count += len(source_signals)
@@ -257,7 +398,53 @@ def run_shadow_evidence(
     monotonic: Callable[[], float] = time.monotonic,
 ) -> ShadowRunReport:
     """Record source candles and decisions from the official derived stream."""
+    return _run_shadow_evidence(
+        redis_client,
+        source_stream_key=source_stream_key,
+        decision_stream_key=decision_stream_key,
+        runtime=_strategy_evidence_runtime(strategy),
+        output=output,
+        duration_seconds=duration_seconds,
+        target_timeframe=target_timeframe,
+        monotonic=monotonic,
+    )
 
+
+def run_portfolio_shadow_evidence(
+    redis_client: Any,
+    *,
+    source_stream_key: str,
+    decision_stream_key: str,
+    portfolio: PortfolioDefinition,
+    output: IO[str],
+    duration_seconds: float,
+    target_timeframe: str = "5m",
+    monotonic: Callable[[], float] = time.monotonic,
+) -> ShadowRunReport:
+    """Record decision-only shadow evidence for one catalog portfolio."""
+    return _run_shadow_evidence(
+        redis_client,
+        source_stream_key=source_stream_key,
+        decision_stream_key=decision_stream_key,
+        runtime=_portfolio_evidence_runtime(portfolio),
+        output=output,
+        duration_seconds=duration_seconds,
+        target_timeframe=target_timeframe,
+        monotonic=monotonic,
+    )
+
+
+def _run_shadow_evidence(
+    redis_client: Any,
+    *,
+    source_stream_key: str,
+    decision_stream_key: str,
+    runtime: _DecisionEvidenceRuntime,
+    output: IO[str],
+    duration_seconds: float,
+    target_timeframe: str,
+    monotonic: Callable[[], float],
+) -> ShadowRunReport:
     if duration_seconds <= 0:
         raise ValueError("duration_seconds must be positive")
     if not source_stream_key or not decision_stream_key:
@@ -266,13 +453,13 @@ def run_shadow_evidence(
         raise ValueError("shadow source and decision streams must be different")
     if target_timeframe != "5m":
         raise ValueError("shadow evidence currently requires a 5m target")
-    if strategy.requirements.timeframe != target_timeframe:
+    if runtime.timeframe != target_timeframe:
         raise ValueError(
-            "strategy timeframe does not match shadow target: "
-            f"strategy={strategy.requirements.timeframe} target={target_timeframe}"
+            "runtime timeframe does not match shadow target: "
+            f"runtime={runtime.timeframe} target={target_timeframe}"
         )
 
-    identity = require_verified_strategy_identity(strategy)
+    identity = runtime.identity
     source_digest = hashlib.sha256()
     completed_digest = hashlib.sha256()
     decision_digest = hashlib.sha256()
@@ -317,7 +504,7 @@ def run_shadow_evidence(
                 return
             pending_decisions.pop(0)
             completed_count += 1
-            signals = _signals(strategy, candle)
+            signals = runtime.decide(candle)
             signal_payloads = [signal.model_dump(mode="json") for signal in signals]
             _update_payload_digest(completed_digest, candle_payload)
             _update_payload_digest(decision_digest, signal_payloads)
@@ -368,10 +555,10 @@ def run_shadow_evidence(
             for raw_id, raw_fields in messages:
                 last_ids[observed_stream] = _text(raw_id)
                 candle = _stream_candle(raw_fields)
-                if candle.product_id != strategy.product_id:
+                if candle.product_id != runtime.product_id:
                     raise ValueError(
                         "shadow product mismatch: "
-                        f"strategy={strategy.product_id} candle={candle.product_id}"
+                        f"runtime={runtime.product_id} candle={candle.product_id}"
                     )
                 candle_payload = candle.model_dump(mode="json")
                 if observed_stream == source_stream_key:
@@ -441,7 +628,7 @@ def run_shadow_evidence(
     report = ShadowRunReport(
         source_stream_key=source_stream_key,
         decision_stream_key=decision_stream_key,
-        product_id=strategy.product_id,
+        product_id=runtime.product_id,
         target_timeframe=target_timeframe,
         source_candles=source_count,
         completed_candles=completed_count,
@@ -471,7 +658,29 @@ def verify_shadow_evidence_bundle(
     strategy_factory: Callable[[], BaseStrategy],
 ) -> ShadowRunReport:
     """Replay one completed shadow bundle and verify every recorded decision."""
+    return _verify_shadow_evidence_bundle(
+        bundle,
+        runtime=_strategy_evidence_runtime(strategy_factory()),
+    )
 
+
+def verify_portfolio_shadow_evidence_bundle(
+    bundle: IO[str],
+    *,
+    portfolio_factory: Callable[[], PortfolioDefinition],
+) -> ShadowRunReport:
+    """Replay one portfolio shadow bundle and verify every recorded decision."""
+    return _verify_shadow_evidence_bundle(
+        bundle,
+        runtime=_portfolio_evidence_runtime(portfolio_factory()),
+    )
+
+
+def _verify_shadow_evidence_bundle(
+    bundle: IO[str],
+    *,
+    runtime: _DecisionEvidenceRuntime,
+) -> ShadowRunReport:
     records = [json.loads(line) for line in bundle if line.strip()]
     if len(records) < 2:
         raise ValueError("shadow evidence bundle is incomplete")
@@ -484,15 +693,14 @@ def verify_shadow_evidence_bundle(
     ):
         raise ValueError("shadow evidence bundle schema is unsupported")
 
-    strategy = strategy_factory()
-    identity = require_verified_strategy_identity(strategy)
+    identity = runtime.identity
     if session.get("strategy") != identity.to_dict():
-        raise AssertionError("shadow evidence strategy identity mismatch")
+        raise AssertionError("shadow evidence runtime identity mismatch")
     target_timeframe = session.get("target_timeframe")
     if not isinstance(target_timeframe, str):
         raise ValueError("shadow evidence target timeframe is missing")
-    if strategy.requirements.timeframe != target_timeframe:
-        raise ValueError("strategy timeframe does not match shadow evidence target")
+    if runtime.timeframe != target_timeframe:
+        raise ValueError("runtime timeframe does not match shadow evidence target")
     source_stream_key = session.get("source_stream_key")
     decision_stream_key = session.get("decision_stream_key")
     if not isinstance(source_stream_key, str) or not source_stream_key:
@@ -521,7 +729,7 @@ def verify_shadow_evidence_bundle(
             if not isinstance(candle_payload, dict):
                 raise ValueError("shadow source candle payload is invalid")
             candle = Candlestick.model_validate(candle_payload)
-            if candle.product_id != strategy.product_id:
+            if candle.product_id != runtime.product_id:
                 raise ValueError("shadow evidence product identity mismatch")
             if candle.timeframe != "1m":
                 raise ValueError("shadow evidence source timeframe must be 1m")
@@ -548,7 +756,7 @@ def verify_shadow_evidence_bundle(
         if not isinstance(candle_payload, dict):
             raise ValueError("shadow decision candle payload is invalid")
         candle = Candlestick.model_validate(candle_payload)
-        if candle.product_id != strategy.product_id:
+        if candle.product_id != runtime.product_id:
             raise ValueError("shadow evidence product identity mismatch")
         if candle.timeframe != target_timeframe:
             raise ValueError("shadow evidence decision timeframe mismatch")
@@ -579,7 +787,7 @@ def verify_shadow_evidence_bundle(
                 "shadow decision precedes its source watermark"
             )
         expected_signals = [
-            signal.model_dump(mode="json") for signal in _signals(strategy, candle)
+            signal.model_dump(mode="json") for signal in runtime.decide(candle)
         ]
         signal_payloads = record.get("signals")
         if signal_payloads != expected_signals:
@@ -600,7 +808,7 @@ def verify_shadow_evidence_bundle(
     observed = ShadowRunReport(
         source_stream_key=source_stream_key,
         decision_stream_key=decision_stream_key,
-        product_id=strategy.product_id,
+        product_id=runtime.product_id,
         target_timeframe=target_timeframe,
         source_candles=source_count,
         completed_candles=completed_count,
@@ -775,6 +983,64 @@ def require_verified_strategy_identity(
     strategy: BaseStrategy,
 ) -> StrategyEvidenceIdentity:
     identity = strategy_evidence_identity(strategy)
+    _require_complete_evidence_identity(identity)
+    return identity
+
+
+def portfolio_evidence_identity(
+    definition: PortfolioDefinition,
+) -> StrategyEvidenceIdentity:
+    replay_configuration = json.dumps(
+        portfolio_replay_configuration(definition),
+        default=str,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode()
+    return StrategyEvidenceIdentity(
+        strategy_id=definition.portfolio_id,
+        class_name=type(definition).__name__,
+        display_name=definition.display_name,
+        artifact_version=definition.artifact_version,
+        readiness=definition.readiness,
+        catalog_sha256=definition.catalog_sha256,
+        replay_configuration_sha256=hashlib.sha256(
+            replay_configuration
+        ).hexdigest(),
+    )
+
+
+def require_verified_portfolio_identity(
+    definition: PortfolioDefinition,
+) -> StrategyEvidenceIdentity:
+    identity = portfolio_evidence_identity(definition)
+    _require_complete_evidence_identity(identity)
+    return identity
+
+
+def _strategy_evidence_runtime(
+    strategy: BaseStrategy,
+) -> _StrategyDecisionEvidenceRuntime:
+    return _StrategyDecisionEvidenceRuntime(
+        strategy=strategy,
+        identity=require_verified_strategy_identity(strategy),
+    )
+
+
+def _portfolio_evidence_runtime(
+    definition: PortfolioDefinition,
+) -> _PortfolioDecisionEvidenceRuntime:
+    coordinator = PortfolioCoordinator()
+    coordinator.register(definition)
+    return _PortfolioDecisionEvidenceRuntime(
+        definition=definition,
+        identity=require_verified_portfolio_identity(definition),
+        coordinator=coordinator,
+    )
+
+
+def _require_complete_evidence_identity(
+    identity: StrategyEvidenceIdentity,
+) -> None:
     required = {
         "display_name": identity.display_name,
         "artifact_version": identity.artifact_version,
@@ -796,8 +1062,7 @@ def require_verified_strategy_identity(
     ):
         raise ValueError("strategy catalog SHA-256 provenance is invalid")
     if identity.readiness not in StrategyLoader.READINESS_VALUES:
-        raise ValueError("strategy readiness provenance is invalid")
-    return identity
+        raise ValueError("runtime readiness provenance is invalid")
 
 
 @contextmanager

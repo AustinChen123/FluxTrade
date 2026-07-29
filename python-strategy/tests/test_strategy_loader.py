@@ -182,6 +182,7 @@ class MyStrategy(BaseStrategy):
         )
         assert definition.readiness == "RESEARCH_FROZEN"
         assert definition.artifact_version == "1.0.0"
+        assert definition.display_name == "Portfolio v1"
         assert definition.catalog_sha256 is not None
 
     def test_finds_multiple_strategies_in_one_file(self, tmp_path):

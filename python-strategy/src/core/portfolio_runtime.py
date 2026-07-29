@@ -82,6 +82,7 @@ class PortfolioDefinition:
     sleeves: tuple[PortfolioSleeve, ...]
     max_gross_quantity: Decimal
     artifact_version: str | None = None
+    display_name: str | None = None
     readiness: str | None = None
     catalog_sha256: str | None = None
 
@@ -175,6 +176,11 @@ def build_portfolio_artifact(
             "__fluxtrade_artifact_version__",
             None,
         ),
+        display_name=getattr(
+            factory_cls,
+            "__fluxtrade_display_name__",
+            None,
+        ),
         readiness=getattr(factory_cls, "__fluxtrade_readiness__", None),
         catalog_sha256=getattr(
             factory_cls,
@@ -210,6 +216,13 @@ def _portfolio_replay_signature(definition: PortfolioDefinition) -> tuple[object
         definition.max_gross_quantity,
         tuple(sleeve_signatures),
     )
+
+
+def portfolio_replay_configuration(
+    definition: PortfolioDefinition,
+) -> tuple[object, ...]:
+    """Return the stable configuration used for portfolio evidence identity."""
+    return _portfolio_replay_signature(definition)
 
 
 class PortfolioCoordinator:
