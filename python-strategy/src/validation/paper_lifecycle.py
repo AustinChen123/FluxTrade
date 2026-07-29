@@ -60,7 +60,9 @@ class PaperScenarioReport:
     driver: str
     strategy: StrategyEvidenceIdentity | None
     restart_unresolved_count: int
+    restart_verification_blocked_count: int
     final_unresolved_count: int
+    final_verification_blocked_count: int
     final_position_count: int
     final_working_order_count: int
     order_statuses: tuple[tuple[str, str], ...]
@@ -95,6 +97,7 @@ class PaperInstrumentEvidence:
 @dataclass(frozen=True, slots=True)
 class PaperOrderEvidence:
     order_id: str
+    strategy_id: str
     client_order_id: str | None
     order_type: str
     side: str
@@ -110,6 +113,7 @@ class PaperOrderEvidence:
 @dataclass(frozen=True, slots=True)
 class PaperFillEvidence:
     order_id: str
+    strategy_id: str
     order_type: str
     side: str
     price: str
@@ -183,10 +187,10 @@ def _run_protection_scenario(
 
     restarted = _execution_engine(session_factory, adapter, clock)
     restart_reconcile = restarted.reconcile_recoverable_client_orders()
-    if restart_reconcile["unresolved_count"] != 0:
-        raise AssertionError(
-            f"{scenario} restart reconciliation was unresolved: {restart_reconcile}"
-        )
+    _assert_reconciliation_resolved(
+        restart_reconcile,
+        context=f"{scenario} restart reconciliation",
+    )
 
     trigger = (
         _candle(
@@ -217,6 +221,7 @@ def _run_protection_scenario(
         strategy_id,
         scenario,
         int(restart_reconcile["unresolved_count"]),
+        int(restart_reconcile["verification_blocked_count"]),
         driver="synthetic_protected_entry",
         strategy_identity=None,
     )
@@ -282,12 +287,17 @@ def _run_hard_flat_scenario(
         strategy_id,
         "hard_flat_1640_et",
         0,
+        0,
         driver="strategy",
         strategy_identity=strategy_identity,
     )
 
 
-def _session_factory(database_path: Path, product_id: str, strategy_id: str):
+def _session_factory(
+    database_path: Path,
+    product_id: str,
+    strategy_ids: str | tuple[str, ...],
+):
     if database_path.exists():
         raise FileExistsError(
             f"paper evidence database already exists: {database_path}"
@@ -317,7 +327,12 @@ def _session_factory(database_path: Path, product_id: str, strategy_id: str):
                 quote_asset="USD",
             )
         )
-        session.add(Strategy(id=strategy_id, name=strategy_id))
+        if isinstance(strategy_ids, str):
+            strategy_ids = (strategy_ids,)
+        session.add_all(
+            Strategy(id=strategy_id, name=strategy_id)
+            for strategy_id in strategy_ids
+        )
         session.commit()
     return factory
 
@@ -389,6 +404,7 @@ def _protected_entry(
     product_id: str,
     timestamp: int,
     *,
+    quantity: Decimal = Decimal("1"),
     stop_loss: Decimal = Decimal("19995"),
     take_profit: Decimal = Decimal("20005"),
 ) -> Signal:
@@ -398,7 +414,7 @@ def _protected_entry(
         timeframe="5m",
         timestamp=timestamp,
         type=SignalType.LONG,
-        quantity=Decimal("1"),
+        quantity=quantity,
         stop_loss=stop_loss,
         take_profit=take_profit,
         metadata={"evidence": "paper_lifecycle"},
@@ -436,12 +452,13 @@ def _assert_position(
     product_id: str,
     strategy_id: str,
     side: str,
+    quantity: Decimal = Decimal("1"),
 ) -> None:
     position = adapter.get_position(product_id, strategy_id=strategy_id)
     if (
         position is None
         or position.side.value != side
-        or position.quantity != Decimal("1")
+        or position.quantity != quantity
     ):
         raise AssertionError(f"unexpected paper position: {position}")
 
@@ -450,11 +467,16 @@ def _assert_working_protection(
     adapter: SimulatedAdapter,
     product_id: str,
     strategy_id: str,
+    quantity: Decimal = Decimal("1"),
 ) -> None:
     orders = adapter.get_open_orders(product_id, strategy_id)
     types = {order.type for order in orders}
-    if types != {"stop_loss", "take_profit"}:
-        raise AssertionError(f"paper protection is incomplete: {types}")
+    quantities = {Decimal(str(order.quantity)) for order in orders}
+    if types != {"stop_loss", "take_profit"} or quantities != {quantity}:
+        raise AssertionError(
+            "paper protection is incomplete: "
+            f"types={types} quantities={quantities}"
+        )
 
 
 def _finalize_report(
@@ -462,16 +484,30 @@ def _finalize_report(
     engine: ExecutionEngine,
     adapter: SimulatedAdapter,
     product_id: str,
-    strategy_id: str,
+    strategy_ids: str | tuple[str, ...],
     scenario: str,
     restart_unresolved_count: int,
+    restart_verification_blocked_count: int,
     *,
     driver: str,
     strategy_identity: StrategyEvidenceIdentity | None,
 ) -> PaperScenarioReport:
+    if isinstance(strategy_ids, str):
+        strategy_ids = (strategy_ids,)
     final_reconcile = engine.reconcile_recoverable_client_orders()
-    position = adapter.get_position(product_id, strategy_id=strategy_id)
-    working = adapter.get_open_orders(product_id, strategy_id)
+    _assert_reconciliation_resolved(
+        final_reconcile,
+        context=f"{scenario} final reconciliation",
+    )
+    positions = tuple(
+        adapter.get_position(product_id, strategy_id=strategy_id)
+        for strategy_id in strategy_ids
+    )
+    working = tuple(
+        order
+        for strategy_id in strategy_ids
+        for order in adapter.get_open_orders(product_id, strategy_id)
+    )
     with session_factory() as session:
         orders = list(
             session.scalars(select(Order).order_by(Order.timestamp, Order.id))
@@ -480,10 +516,14 @@ def _finalize_report(
             session.scalars(select(Trade).order_by(Trade.timestamp, Trade.id))
         )
     order_types = {str(order.id): str(order.type) for order in orders}
+    order_strategy_ids = {
+        str(order.id): str(order.strategy_id) for order in orders
+    }
     order_evidence = tuple(_order_evidence(order) for order in orders)
     fill_evidence = tuple(
         PaperFillEvidence(
             order_id=str(trade.order_id),
+            strategy_id=order_strategy_ids[str(trade.order_id)],
             order_type=order_types[str(trade.order_id)],
             side=str(trade.side),
             price=_required_decimal_text(trade.price),
@@ -498,16 +538,21 @@ def _finalize_report(
         driver=driver,
         strategy=strategy_identity,
         restart_unresolved_count=restart_unresolved_count,
+        restart_verification_blocked_count=restart_verification_blocked_count,
         final_unresolved_count=int(final_reconcile["unresolved_count"]),
-        final_position_count=0 if position is None else 1,
+        final_verification_blocked_count=int(
+            final_reconcile["verification_blocked_count"]
+        ),
+        final_position_count=sum(
+            position is not None for position in positions
+        ),
         final_working_order_count=len(working),
         order_statuses=tuple((order.type, order.status) for order in orders),
         orders=order_evidence,
         fills=fill_evidence,
     )
     if (
-        report.final_unresolved_count
-        or report.final_position_count
+        report.final_position_count
         or report.final_working_order_count
         or any(order.status in _RECOVERABLE_STATUSES for order in orders)
     ):
@@ -517,10 +562,23 @@ def _finalize_report(
     return report
 
 
+def _assert_reconciliation_resolved(
+    payload: dict,
+    *,
+    context: str,
+) -> None:
+    if (
+        int(payload["unresolved_count"]) != 0
+        or int(payload["verification_blocked_count"]) != 0
+    ):
+        raise AssertionError(f"{context} was not resolved and verified: {payload}")
+
+
 def _order_evidence(order: Order) -> PaperOrderEvidence:
     intent = order.intent_payload or {}
     return PaperOrderEvidence(
         order_id=str(order.id),
+        strategy_id=str(order.strategy_id),
         client_order_id=(
             None if order.client_order_id is None else str(order.client_order_id)
         ),

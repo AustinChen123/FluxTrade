@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import json
 import sys
+from decimal import Decimal
 from pathlib import Path
 
 from dotenv import load_dotenv
@@ -14,6 +15,9 @@ load_dotenv(ROOT.parent / ".env")
 from src.core.redis_factory import create_redis_client  # noqa: E402
 from src.core.product_registry import to_stream_key  # noqa: E402
 from src.validation.paper_lifecycle import run_paper_lifecycle  # noqa: E402
+from src.validation.portfolio_paper_lifecycle import (  # noqa: E402
+    run_portfolio_paper_lifecycle,
+)
 from src.validation.strategy_evidence import (  # noqa: E402
     load_portfolio,
     load_strategy,
@@ -65,6 +69,11 @@ def _parser() -> argparse.ArgumentParser:
     paper = subparsers.add_parser("paper-lifecycle")
     _add_strategy_arguments(paper)
     paper.add_argument("--workspace", type=Path, required=True)
+
+    portfolio_paper = subparsers.add_parser("portfolio-paper-lifecycle")
+    _add_portfolio_arguments(portfolio_paper)
+    portfolio_paper.add_argument("--workspace", type=Path, required=True)
+    portfolio_paper.add_argument("--scenario-quantities", type=Path)
     return parser
 
 
@@ -86,6 +95,18 @@ def _load_portfolio_config(path: Path) -> dict[str, object]:
     if not isinstance(parsed, dict):
         raise ValueError("portfolio config must be a JSON object")
     return parsed
+
+
+def _load_scenario_quantities(path: Path | None) -> dict[str, Decimal] | None:
+    if path is None:
+        return None
+    parsed = json.loads(path.read_text(encoding="utf-8"))
+    if not isinstance(parsed, dict):
+        raise ValueError("scenario quantities must be a JSON object")
+    return {
+        str(strategy_id): Decimal(str(quantity))
+        for strategy_id, quantity in parsed.items()
+    }
 
 
 def main() -> None:
@@ -175,7 +196,7 @@ def main() -> None:
                 bundle,
                 portfolio_factory=portfolio_factory,
             )
-    else:
+    elif args.command == "paper-lifecycle":
         factory = lambda: load_strategy(  # noqa: E731
             args.strategy_dir,
             args.strategy_id,
@@ -186,6 +207,20 @@ def main() -> None:
             product_id=args.product_id,
             strategy_id=args.strategy_id,
             hard_flat_strategy_factory=factory,
+        )
+    else:
+        portfolio_factory = lambda: load_portfolio(  # noqa: E731
+            args.strategy_dir,
+            args.portfolio_id,
+            args.product_id,
+            config=_load_portfolio_config(args.portfolio_config),
+        )
+        report = run_portfolio_paper_lifecycle(
+            args.workspace,
+            portfolio_factory=portfolio_factory,
+            scenario_quantities=_load_scenario_quantities(
+                args.scenario_quantities
+            ),
         )
     print(json.dumps(report.to_dict(), indent=2, sort_keys=True))
 

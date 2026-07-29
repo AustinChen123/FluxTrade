@@ -25,6 +25,9 @@ from src.validation.paper_lifecycle import (
     PaperScenarioReport,
     run_paper_lifecycle,
 )
+from src.validation.portfolio_paper_lifecycle import (
+    run_portfolio_paper_lifecycle,
+)
 
 __all__ = [
     "HistoricalParityReport",
@@ -41,6 +44,7 @@ __all__ = [
     "require_verified_portfolio_identity",
     "require_verified_strategy_identity",
     "run_paper_lifecycle",
+    "run_portfolio_paper_lifecycle",
     "run_portfolio_shadow_evidence",
     "run_shadow_evidence",
     "strategy_evidence_identity",
