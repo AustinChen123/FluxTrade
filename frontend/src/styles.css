@@ -603,6 +603,207 @@ dd {
   animation: pulse 0.9s ease-in-out infinite alternate;
 }
 
+.trade-console {
+  display: grid;
+  gap: 14px;
+}
+
+.trade-intro {
+  display: grid;
+  grid-template-columns: minmax(280px, 0.8fr) minmax(540px, 1.2fr);
+  align-items: end;
+  gap: 30px;
+  padding: 18px;
+  border: 1px solid var(--grid);
+  background: var(--panel);
+}
+
+.trade-intro p:last-child {
+  max-width: 660px;
+  margin: 8px 0 0;
+  color: var(--muted);
+}
+
+.trade-intro > dl {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  gap: 1px;
+  margin: 0;
+  background: var(--grid);
+}
+
+.trade-intro > dl div {
+  min-width: 0;
+  padding: 10px 12px;
+  background: var(--surface);
+}
+
+.trade-intro > dl dd {
+  overflow: hidden;
+  margin-top: 4px;
+  font-family: "SFMono-Regular", "Roboto Mono", monospace;
+  font-size: 0.72rem;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.trade-quality {
+  margin: 0;
+  padding: 10px 14px;
+  border-left: 3px solid var(--warning);
+  color: var(--warning);
+  background: color-mix(in srgb, var(--warning) 9%, transparent);
+}
+
+.trade-layout {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) minmax(290px, 340px);
+  gap: 14px;
+}
+
+.trade-chart-panel {
+  overflow: hidden;
+}
+
+.trade-chart {
+  height: 560px;
+}
+
+.trade-ledger {
+  display: flex;
+  height: calc(560px + 68px);
+  min-height: 0;
+  flex-direction: column;
+  overflow: hidden;
+}
+
+.trade-ledger > ol {
+  display: grid;
+  flex: 0 1 auto;
+  min-height: 0;
+  margin: 0;
+  overflow-y: auto;
+  padding: 0;
+  list-style: none;
+}
+
+.trade-ledger li button {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 10px;
+  width: 100%;
+  min-height: 64px;
+  padding: 9px 12px;
+  border: 0;
+  border-bottom: 1px solid var(--grid);
+  text-align: left;
+  cursor: pointer;
+}
+
+.trade-ledger li button:hover,
+.trade-ledger li button.is-selected {
+  background: var(--teal-soft);
+}
+
+.trade-ledger li button.is-selected {
+  box-shadow: inset 3px 0 var(--warning);
+}
+
+.trade-ledger li button > span:nth-child(2) {
+  display: grid;
+  gap: 3px;
+  min-width: 0;
+}
+
+.trade-ledger li strong,
+.trade-ledger li small {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.trade-ledger li strong {
+  font-family: "SFMono-Regular", "Roboto Mono", monospace;
+  font-size: 0.72rem;
+}
+
+.trade-ledger li small {
+  color: var(--muted);
+  font-size: 0.66rem;
+}
+
+.trade-ledger li b {
+  color: var(--teal);
+  font-family: "SFMono-Regular", "Roboto Mono", monospace;
+  font-size: 0.75rem;
+}
+
+.trade-ledger li b.is-loss {
+  color: var(--danger);
+}
+
+.trade-side {
+  min-width: 42px;
+  padding: 4px 5px;
+  color: #ffffff;
+  background: var(--teal);
+  font-family: "SFMono-Regular", "Roboto Mono", monospace;
+  font-size: 0.6rem;
+  font-weight: 700;
+  text-align: center;
+}
+
+.trade-side.side-short {
+  background: var(--coral);
+}
+
+.trade-detail {
+  margin-top: auto;
+  padding: 15px;
+  color: var(--selection-ink);
+  background: var(--selection-bg);
+}
+
+.trade-detail > div {
+  display: grid;
+  gap: 4px;
+  margin-bottom: 14px;
+}
+
+.trade-detail > div span,
+.trade-detail dt {
+  color: var(--selection-muted);
+}
+
+.trade-detail > div strong {
+  font-family: "SFMono-Regular", "Roboto Mono", monospace;
+  font-size: 0.8rem;
+}
+
+.trade-detail dl {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 11px 16px;
+  margin: 0;
+}
+
+.trade-detail dd {
+  margin-top: 3px;
+  color: var(--selection-ink);
+  font-family: "SFMono-Regular", "Roboto Mono", monospace;
+  font-size: 0.74rem;
+}
+
+.trade-prompt {
+  margin: auto 0 0;
+  padding: 18px;
+  border-top: 1px solid var(--grid);
+  color: var(--muted);
+  font-size: 0.76rem;
+  text-align: center;
+}
+
 .strategy-console {
   display: grid;
   gap: 14px;
@@ -798,6 +999,16 @@ dd {
   }
 }
 
+@media (max-width: 960px) {
+  .trade-intro {
+    grid-template-columns: 1fr;
+  }
+
+  .trade-layout {
+    grid-template-columns: 1fr;
+  }
+}
+
 @media (max-width: 760px) {
   .console-shell {
     padding: 20px 14px 44px;
@@ -805,6 +1016,7 @@ dd {
 
   .topbar,
   .run-strip,
+  .trade-intro,
   .strategy-intro {
     align-items: stretch;
     flex-direction: column;
@@ -836,6 +1048,24 @@ dd {
 
   .analysis-grid {
     grid-template-columns: 1fr;
+  }
+
+  .trade-intro > dl {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+
+  .trade-chart {
+    height: 420px;
+  }
+
+  .trade-ledger {
+    height: auto;
+    min-height: 0;
+    overflow: visible;
+  }
+
+  .trade-ledger > ol {
+    overflow-y: visible;
   }
 
   .topology-panel,
