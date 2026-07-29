@@ -39,6 +39,11 @@ from src.core.adapters.rithmic_adapter import (
 )
 from src.core.adapters.simulated import SimulatedAdapter
 from src.core.product_registry import InstrumentSpec
+from src.core.portfolio_runtime import (
+    PortfolioDefinition,
+    PortfolioFactory,
+    PortfolioSleeve,
+)
 from src.core.engine import (
     SYSTEM_STATE_OK,
     StrategyEngine,
@@ -476,6 +481,95 @@ class TestAddStrategy:
         assert "BINANCE:BTCUSDT-PERP" in engine.strategies
         assert "BINANCE:ETHUSDT-PERP" in engine.strategies
 
+    def test_portfolio_parent_cannot_reuse_standalone_strategy_id(
+        self,
+        engine,
+        mock_strategy_class,
+    ):
+        engine.add_strategy(
+            mock_strategy_class("portfolio_v1", "BINANCE:BTCUSDT-PERP")
+        )
+        definition = PortfolioDefinition(
+            portfolio_id="portfolio_v1",
+            product_id="BINANCE:BTCUSDT-PERP",
+            sleeves=(
+                PortfolioSleeve(
+                    mock_strategy_class(
+                        "portfolio_v1.sleeve",
+                        "BINANCE:BTCUSDT-PERP",
+                    )
+                ),
+            ),
+            max_gross_quantity=Decimal("1"),
+        )
+
+        with pytest.raises(ValueError, match="already active"):
+            engine.add_portfolio(definition)
+
+    def test_portfolio_sleeve_cannot_reuse_existing_parent_id(
+        self,
+        engine,
+        mock_strategy_class,
+    ):
+        first = PortfolioDefinition(
+            portfolio_id="first",
+            product_id="BINANCE:BTCUSDT-PERP",
+            sleeves=(
+                PortfolioSleeve(
+                    mock_strategy_class(
+                        "first.sleeve",
+                        "BINANCE:BTCUSDT-PERP",
+                    )
+                ),
+            ),
+            max_gross_quantity=Decimal("1"),
+        )
+        second = PortfolioDefinition(
+            portfolio_id="second",
+            product_id="BINANCE:BTCUSDT-PERP",
+            sleeves=(
+                PortfolioSleeve(
+                    mock_strategy_class(
+                        "first",
+                        "BINANCE:BTCUSDT-PERP",
+                    )
+                ),
+            ),
+            max_gross_quantity=Decimal("1"),
+        )
+        engine.add_portfolio(first)
+
+        with pytest.raises(ValueError, match="already active"):
+            engine.add_portfolio(second)
+
+    def test_standalone_strategy_cannot_reuse_portfolio_parent_id(
+        self,
+        engine,
+        mock_strategy_class,
+    ):
+        definition = PortfolioDefinition(
+            portfolio_id="portfolio_v1",
+            product_id="BINANCE:BTCUSDT-PERP",
+            sleeves=(
+                PortfolioSleeve(
+                    mock_strategy_class(
+                        "portfolio_v1.sleeve",
+                        "BINANCE:BTCUSDT-PERP",
+                    )
+                ),
+            ),
+            max_gross_quantity=Decimal("1"),
+        )
+        engine.add_portfolio(definition)
+
+        with pytest.raises(ValueError, match="already active"):
+            engine.add_strategy(
+                mock_strategy_class(
+                    "portfolio_v1",
+                    "BINANCE:BTCUSDT-PERP",
+                )
+            )
+
 
 # =============================================================================
 # build_stream_channels
@@ -657,6 +751,77 @@ class TestOnMarketData:
         # Should not raise
         engine.on_market_data(candle)
 
+    def test_split_backtest_routes_fill_before_completed_decision(self, engine):
+        engine.runtime_environment = RuntimeEnvironment("test")
+        execution_candle = _make_candle(timeframe="1m")
+        decision_candle = _make_candle(timeframe="5m")
+        calls = MagicMock()
+        engine.execution_engine.process_market_data = calls.process_market_data
+        engine._signal_processor.on_candle = calls.on_candle
+
+        engine.on_backtest_market_data(execution_candle, decision_candle)
+
+        assert calls.mock_calls == [
+            call.process_market_data(execution_candle),
+            call.on_candle(decision_candle),
+        ]
+
+    def test_split_backtest_route_is_rejected_in_live_runtime(self, engine):
+        engine.runtime_environment = RuntimeEnvironment("live")
+        execution_candle = _make_candle(timeframe="1m")
+        engine.execution_engine.process_market_data = MagicMock()
+
+        with pytest.raises(RuntimeError, match="backtest-only"):
+            engine.on_backtest_market_data(execution_candle)
+
+        engine.execution_engine.process_market_data.assert_not_called()
+
+    def test_portfolio_exposure_snapshot_excludes_protection_and_exits(
+        self,
+        engine,
+    ):
+        product_id = "RITHMIC:MNQ-202609"
+        orders = [
+            SimpleNamespace(
+                id="entry",
+                strategy_id="sleeve_a",
+                product_id=product_id,
+                side="buy",
+                quantity=Decimal("2"),
+                filled_quantity=Decimal("0.5"),
+                intent_payload={},
+            ),
+            SimpleNamespace(
+                id="protection",
+                strategy_id="sleeve_a",
+                product_id=product_id,
+                side="sell",
+                quantity=Decimal("1"),
+                filled_quantity=Decimal("0"),
+                intent_payload={"pending_entry_order_id": "entry"},
+            ),
+            SimpleNamespace(
+                id="exit",
+                strategy_id="sleeve_a",
+                product_id=product_id,
+                side="sell",
+                quantity=Decimal("1"),
+                filled_quantity=Decimal("0"),
+                intent_payload={"reduce_only": True},
+            ),
+        ]
+        repo = engine.execution_engine.order_manager.repo
+        repo.list_orders_by_statuses = MagicMock(return_value=orders)
+        engine.execution_engine._position_loader = lambda *_args: None
+
+        result = engine.execution_engine.portfolio_exposure_snapshot(
+            ("sleeve_a",),
+            product_id,
+            {},
+        )
+
+        assert result.quantities == {"sleeve_a": Decimal("1.5")}
+
 
 # =============================================================================
 # process_signal
@@ -694,7 +859,7 @@ class TestProcessSignal:
         engine.risk_manager.check_risk = MagicMock(return_value=(True, "PASS"))
         engine.execution_engine.execute_signal = MagicMock(return_value="order-123")
 
-        engine.process_signal(signal, _make_candle())
+        assert engine.process_signal(signal, _make_candle()) is True
 
         engine.execution_engine.execute_signal.assert_called_once()
 
@@ -789,6 +954,23 @@ class TestProcessSignal:
         engine.risk_manager.check_risk.assert_called_once()
         engine.execution_engine.execute_signal.assert_called_once()
 
+    def test_rithmic_authoritative_exit_rejection_reports_failure(self, engine):
+        signal = Signal(
+            strategy_id="test",
+            product_id="RITHMIC:MNQ-202609",
+            timeframe="1m",
+            timestamp=1704067200000,
+            type=SignalType.EXIT_LONG,
+            quantity=Decimal("1"),
+        )
+        engine.execution_engine.adapter = _rithmic_adapter_for_reconnect_test()
+        engine.risk_manager.check_risk = MagicMock(return_value=(True, "PASS"))
+        engine.execution_engine.execute_authoritative_exit_signal = MagicMock(
+            return_value=False
+        )
+
+        assert engine.process_signal(signal, None) is False
+
     def test_risk_reject_skips_execution(self, engine):
         """When risk check fails, signal should NOT be executed."""
         signal = Signal(
@@ -804,7 +986,7 @@ class TestProcessSignal:
         )
         engine.execution_engine.execute_signal = MagicMock()
 
-        engine.process_signal(signal, _make_candle())
+        assert engine.process_signal(signal, _make_candle()) is False
 
         engine.execution_engine.execute_signal.assert_not_called()
 
@@ -1358,6 +1540,82 @@ class TestStartStrategy:
             "test.py::MyStrat",
             actor="operator",
             force=False,
+            reason=None,
+        )
+
+    def test_start_portfolio_factory_registers_complete_parent_lifecycle(
+        self,
+        engine,
+        mock_strategy_class,
+    ):
+        class ReplaySafePortfolioSleeve(mock_strategy_class):
+            def replay_configuration(self):
+                return {
+                    "strategy_id": self.strategy_id,
+                    "product_id": self.product_id,
+                }
+
+        class TestPortfolioFactory(PortfolioFactory):
+            def build(self, *, portfolio_id, product_id, config):
+                return PortfolioDefinition(
+                    portfolio_id=portfolio_id,
+                    product_id=product_id,
+                    sleeves=tuple(
+                        PortfolioSleeve(
+                            ReplaySafePortfolioSleeve(
+                                f"{portfolio_id}.sleeve_{index}",
+                                product_id,
+                            )
+                        )
+                        for index in range(2)
+                    ),
+                    max_gross_quantity=Decimal(
+                        str(config["max_gross_quantity"])
+                    ),
+                )
+
+        engine.loaded_classes["portfolio_v1"] = TestPortfolioFactory
+        engine._strategy_state_manager.transition_to_running = MagicMock()
+        engine._strategy_state_manager.on_state_change_message = MagicMock()
+        mock_state = MagicMock()
+        mock_state.status = "READY"
+        mock_state.config_json = json.dumps(
+            {
+                "product_id": "BINANCE:BTCUSDT-PERP",
+                "max_gross_quantity": "2",
+            }
+        )
+        mock_db = MagicMock()
+        mock_db.query.return_value.filter.return_value.first.return_value = (
+            mock_state
+        )
+        engine._db_session_factory = lambda: nullcontext(mock_db)
+        engine._warm_up_strategy_instance = MagicMock(return_value=0)
+
+        engine.start_strategy("portfolio_v1")
+
+        assert set(engine.strategy_instances) == {
+            "portfolio_v1.sleeve_0",
+            "portfolio_v1.sleeve_1",
+        }
+        assert "portfolio_v1" in engine.portfolio_instances
+        assert engine._warm_up_strategy_instance.call_count == 2
+        engine._strategy_state_manager.on_state_change_message.assert_not_called()
+        engine._strategy_state_manager.transition_to_running.assert_called_once_with(
+            "portfolio_v1",
+            actor="operator",
+            force=False,
+            reason=None,
+        )
+
+        engine._strategy_state_manager.transition_to_stopped = MagicMock()
+        engine.stop_strategy("portfolio_v1")
+
+        assert engine.strategy_instances == {}
+        assert engine.portfolio_instances == {}
+        engine._strategy_state_manager.transition_to_stopped.assert_called_once_with(
+            "portfolio_v1",
+            actor="operator",
             reason=None,
         )
 
@@ -3887,6 +4145,410 @@ def test_rithmic_strategy_exit_cancels_protection_before_native_exit(engine):
         "reconcile",
         "replace",
     ]
+
+
+@pytest.mark.parametrize("record_failure", [False, True])
+def test_rithmic_portfolio_exit_reduces_only_owned_sleeve(
+    engine,
+    mock_strategy_class,
+    record_failure,
+):
+    adapter = _rithmic_adapter_for_reconnect_test()
+    engine.execution_engine.adapter = adapter
+    engine._rithmic_recovery_profile = "test"
+    engine._rithmic_recovery_account_id = "ACCOUNT"
+    engine.order_event_thread = None
+    engine.execution_engine.list_recoverable_client_orders = MagicMock(
+        return_value=[]
+    )
+    engine.execution_engine.order_manager.repo.list_orders_by_statuses = MagicMock(
+        return_value=[]
+    )
+    engine.execution_engine.reconcile_rithmic_owned_orders = MagicMock(
+        return_value={"auto_resume_safe": True}
+    )
+    engine.execution_engine.submit_verified_net_reduction = MagicMock(
+        return_value="exit-order"
+    )
+    engine.execution_engine.record_verified_net_reduction = MagicMock(
+        side_effect=(
+            RuntimeError("durable marker unavailable")
+            if record_failure
+            else None
+        )
+    )
+    engine._start_exchange_order_event_stream = MagicMock()
+    engine._lockdown_for_rithmic_order_drift = MagicMock()
+    engine._schedule_rithmic_portfolio_exit_compensation = MagicMock()
+    sleeve_position = Position(
+        strategy_id="portfolio_v1.sleeve_a",
+        product_id="RITHMIC:NQ-202609",
+        side=PositionSide.LONG,
+        quantity=Decimal("1"),
+        entry_price=Decimal("20000"),
+        unrealized_pnl=Decimal("0"),
+    )
+    engine.account_service.get_position_for_exit = MagicMock(
+        side_effect=[
+            sleeve_position,
+            sleeve_position,
+            None,
+        ]
+    )
+    engine.account_service.replace_positions_for_products = MagicMock()
+    definition = PortfolioDefinition(
+        portfolio_id="portfolio_v1",
+        product_id="RITHMIC:NQ-202609",
+        sleeves=(
+            PortfolioSleeve(
+                mock_strategy_class(
+                    "portfolio_v1.sleeve_a",
+                    "RITHMIC:NQ-202609",
+                )
+            ),
+            PortfolioSleeve(
+                mock_strategy_class(
+                    "portfolio_v1.sleeve_b",
+                    "RITHMIC:NQ-202609",
+                )
+            ),
+        ),
+        max_gross_quantity=Decimal("5"),
+    )
+    engine._portfolio_coordinator.register(definition)
+    signal = Signal(
+        strategy_id="portfolio_v1.sleeve_a",
+        product_id="RITHMIC:NQ-202609",
+        timeframe="1m",
+        timestamp=1_700_000_000_000,
+        type=SignalType.EXIT_LONG,
+        quantity=Decimal("1"),
+    )
+    decision = ExitDecision(
+        allowed=True,
+        reason="position_matched",
+        quantity=Decimal("1"),
+        position_quantity=Decimal("1"),
+    )
+    candle = _make_candle(
+        product_id="RITHMIC:NQ-202609",
+        close=Decimal("20000"),
+    )
+
+    snapshot_loader = patch(
+        "src.core.adapters.rithmic_portfolio_exit.load_rithmic_recovery_snapshot",
+        side_effect=[
+            _rithmic_emergency_snapshot(net_quantity="3"),
+            _rithmic_emergency_snapshot(net_quantity="3"),
+            _rithmic_emergency_snapshot(net_quantity="2"),
+        ],
+    )
+    if record_failure:
+        with snapshot_loader, pytest.raises(
+            RuntimeError,
+            match="durable marker unavailable",
+        ):
+            engine._run_rithmic_portfolio_exit(
+                signal,
+                decision,
+                candle,
+            )
+        engine._schedule_rithmic_portfolio_exit_compensation.assert_not_called()
+        engine._lockdown_for_rithmic_order_drift.assert_called_once()
+        return
+    with snapshot_loader:
+        result = engine._run_rithmic_portfolio_exit(signal, decision, candle)
+
+    assert result == {
+        "status": "verified_portfolio_reduction",
+        "portfolio_id": "portfolio_v1",
+        "strategy_id": "portfolio_v1.sleeve_a",
+        "product_id": "RITHMIC:NQ-202609",
+        "order_id": "exit-order",
+        "cancelled_orders": 0,
+        "preflight_remote_quantity": "3",
+        "remaining_remote_quantity": "2",
+    }
+    engine.execution_engine.submit_verified_net_reduction.assert_called_once_with(
+        signal,
+        decision,
+        candle=candle,
+        preflight_remote_quantity=Decimal("3"),
+    )
+    engine.execution_engine.record_verified_net_reduction.assert_called_once_with(
+        signal,
+        "exit-order",
+        remaining_remote_quantity=Decimal("2"),
+    )
+    engine.account_service.replace_positions_for_products.assert_not_called()
+    engine._schedule_rithmic_portfolio_exit_compensation.assert_not_called()
+    engine._lockdown_for_rithmic_order_drift.assert_not_called()
+
+
+def test_rithmic_portfolio_exit_does_not_reduce_another_sleeve_after_own_fill(
+    engine,
+    mock_strategy_class,
+):
+    adapter = _rithmic_adapter_for_reconnect_test()
+    engine.execution_engine.adapter = adapter
+    engine._rithmic_recovery_profile = "test"
+    engine._rithmic_recovery_account_id = "ACCOUNT"
+    engine.order_event_thread = None
+    engine.execution_engine.list_recoverable_client_orders = MagicMock(
+        return_value=[]
+    )
+    engine.execution_engine.order_manager.repo.list_orders_by_statuses = MagicMock(
+        return_value=[]
+    )
+    engine.execution_engine.reconcile_rithmic_owned_orders = MagicMock(
+        return_value={"auto_resume_safe": True}
+    )
+    engine.execution_engine.submit_verified_net_reduction = MagicMock()
+    engine.execution_engine.record_verified_net_reduction = MagicMock()
+    engine._start_exchange_order_event_stream = MagicMock()
+    engine._lockdown_for_rithmic_order_drift = MagicMock()
+    engine.account_service.get_position_for_exit = MagicMock(
+        side_effect=[
+            Position(
+                strategy_id="portfolio_v1.sleeve_a",
+                product_id="RITHMIC:NQ-202609",
+                side=PositionSide.LONG,
+                quantity=Decimal("1"),
+                entry_price=Decimal("20000"),
+                unrealized_pnl=Decimal("0"),
+            ),
+            None,
+        ]
+    )
+    definition = PortfolioDefinition(
+        portfolio_id="portfolio_v1",
+        product_id="RITHMIC:NQ-202609",
+        sleeves=(
+            PortfolioSleeve(
+                mock_strategy_class(
+                    "portfolio_v1.sleeve_a",
+                    "RITHMIC:NQ-202609",
+                )
+            ),
+            PortfolioSleeve(
+                mock_strategy_class(
+                    "portfolio_v1.sleeve_b",
+                    "RITHMIC:NQ-202609",
+                )
+            ),
+        ),
+        max_gross_quantity=Decimal("2"),
+    )
+    engine._portfolio_coordinator.register(definition)
+    signal = Signal(
+        strategy_id="portfolio_v1.sleeve_a",
+        product_id="RITHMIC:NQ-202609",
+        timeframe="1m",
+        timestamp=1_700_000_000_000,
+        type=SignalType.EXIT_LONG,
+        quantity=Decimal("1"),
+    )
+    decision = ExitDecision(
+        allowed=True,
+        reason="position_matched",
+        quantity=Decimal("1"),
+        position_quantity=Decimal("1"),
+    )
+
+    with patch(
+        "src.core.adapters.rithmic_portfolio_exit.load_rithmic_recovery_snapshot",
+        return_value=_rithmic_emergency_snapshot(net_quantity="1"),
+    ), pytest.raises(
+        RuntimeError,
+        match="rithmic_portfolio_exit_local_position_changed",
+    ):
+        engine._run_rithmic_portfolio_exit(
+            signal,
+            decision,
+            _make_candle(
+                product_id="RITHMIC:NQ-202609",
+                close=Decimal("20000"),
+            ),
+        )
+
+    engine.execution_engine.submit_verified_net_reduction.assert_not_called()
+    engine.execution_engine.record_verified_net_reduction.assert_not_called()
+    engine._lockdown_for_rithmic_order_drift.assert_called_once()
+
+
+def test_rithmic_portfolio_exit_does_not_cancel_before_safe_preflight(engine):
+    adapter = _rithmic_adapter_for_reconnect_test()
+    adapter.cancel_order = MagicMock(return_value=True)
+    engine.execution_engine.adapter = adapter
+    engine._rithmic_recovery_profile = "test"
+    engine._rithmic_recovery_account_id = "ACCOUNT"
+    engine.order_event_thread = None
+    engine.execution_engine.list_recoverable_client_orders = MagicMock(
+        return_value=[]
+    )
+    protection = SimpleNamespace(
+        id="stop-order",
+        strategy_id="portfolio_v1.sleeve_a",
+        product_id="RITHMIC:NQ-202609",
+        status=OrderStatus.SUBMITTED.value,
+        client_order_id="stop-client",
+        exchange_order_id="stop-basket",
+        type="stop_loss",
+    )
+    engine.execution_engine.order_manager.repo.list_orders_by_statuses = MagicMock(
+        return_value=[protection]
+    )
+    engine.execution_engine.reconcile_rithmic_owned_orders = MagicMock(
+        return_value={"auto_resume_safe": False}
+    )
+    engine.execution_engine.submit_verified_net_reduction = MagicMock()
+    engine._start_exchange_order_event_stream = MagicMock()
+    engine._lockdown_for_rithmic_order_drift = MagicMock()
+    engine._schedule_rithmic_portfolio_exit_compensation = MagicMock()
+    engine.account_service.get_position_for_exit = MagicMock()
+    signal = Signal(
+        strategy_id="portfolio_v1.sleeve_a",
+        product_id="RITHMIC:NQ-202609",
+        timeframe="1m",
+        timestamp=1_700_000_000_000,
+        type=SignalType.EXIT_LONG,
+        quantity=Decimal("1"),
+    )
+    decision = ExitDecision(
+        allowed=True,
+        reason="position_matched",
+        quantity=Decimal("1"),
+        position_quantity=Decimal("1"),
+    )
+
+    with patch(
+        "src.core.adapters.rithmic_portfolio_exit.load_rithmic_recovery_snapshot",
+        return_value=_rithmic_emergency_snapshot(net_quantity="1"),
+    ), pytest.raises(
+        RuntimeError,
+        match="rithmic_portfolio_exit_preflight_reconciliation_blocked",
+    ):
+        engine._run_rithmic_portfolio_exit(
+            signal,
+            decision,
+            _make_candle(
+                product_id="RITHMIC:NQ-202609",
+                close=Decimal("20000"),
+            ),
+        )
+
+    adapter.cancel_order.assert_not_called()
+    engine.execution_engine.submit_verified_net_reduction.assert_not_called()
+    engine.account_service.get_position_for_exit.assert_not_called()
+    engine._schedule_rithmic_portfolio_exit_compensation.assert_not_called()
+
+
+def test_rithmic_portfolio_exit_schedules_flatten_after_protection_mutation(
+    engine,
+):
+    adapter = _rithmic_adapter_for_reconnect_test()
+    adapter.get_order_by_client_id = MagicMock(
+        return_value=SimpleNamespace(
+            status="open",
+            exchange_order_id="stop-basket",
+        )
+    )
+    adapter.cancel_order = MagicMock(return_value=True)
+    engine.execution_engine.adapter = adapter
+    engine._rithmic_recovery_profile = "test"
+    engine._rithmic_recovery_account_id = "ACCOUNT"
+    engine.order_event_thread = None
+    engine.execution_engine.list_recoverable_client_orders = MagicMock(
+        return_value=[]
+    )
+    protection = SimpleNamespace(
+        id="stop-order",
+        strategy_id="portfolio_v1.sleeve_a",
+        product_id="RITHMIC:NQ-202609",
+        status=OrderStatus.SUBMITTED.value,
+        client_order_id="stop-client",
+        exchange_order_id="stop-basket",
+        type="stop_loss",
+    )
+    engine.execution_engine.order_manager.repo.list_orders_by_statuses = MagicMock(
+        return_value=[protection]
+    )
+    engine.execution_engine.reconcile_rithmic_owned_orders = MagicMock(
+        side_effect=[
+            {"auto_resume_safe": True},
+            *[{"auto_resume_safe": False} for _ in range(6)],
+        ]
+    )
+    engine.execution_engine.submit_verified_net_reduction = MagicMock()
+    engine._start_exchange_order_event_stream = MagicMock()
+    engine._lockdown_for_rithmic_order_drift = MagicMock()
+    engine._schedule_rithmic_portfolio_exit_compensation = MagicMock()
+    engine.account_service.get_position_for_exit = MagicMock(
+        return_value=Position(
+            strategy_id="portfolio_v1.sleeve_a",
+            product_id="RITHMIC:NQ-202609",
+            side=PositionSide.LONG,
+            quantity=Decimal("1"),
+            entry_price=Decimal("20000"),
+            unrealized_pnl=Decimal("0"),
+        )
+    )
+    signal = Signal(
+        strategy_id="portfolio_v1.sleeve_a",
+        product_id="RITHMIC:NQ-202609",
+        timeframe="1m",
+        timestamp=1_700_000_000_000,
+        type=SignalType.EXIT_LONG,
+        quantity=Decimal("1"),
+    )
+    decision = ExitDecision(
+        allowed=True,
+        reason="position_matched",
+        quantity=Decimal("1"),
+        position_quantity=Decimal("1"),
+    )
+
+    with patch(
+        "src.core.adapters.rithmic_portfolio_exit.load_rithmic_recovery_snapshot",
+        return_value=_rithmic_emergency_snapshot(net_quantity="1"),
+    ), pytest.raises(
+        RuntimeError,
+        match="rithmic_portfolio_exit_preflight_reconciliation_blocked",
+    ):
+        engine._run_rithmic_portfolio_exit(
+            signal,
+            decision,
+            _make_candle(
+                product_id="RITHMIC:NQ-202609",
+                close=Decimal("20000"),
+            ),
+        )
+
+    adapter.cancel_order.assert_called_once_with(
+        "stop-basket",
+        "RITHMIC:NQ-202609",
+        order_type="stop_loss",
+    )
+    engine.execution_engine.submit_verified_net_reduction.assert_not_called()
+    engine._schedule_rithmic_portfolio_exit_compensation.assert_called_once_with(
+        "rithmic_portfolio_exit_requires_reconciliation:RuntimeError"
+    )
+
+
+def test_rithmic_portfolio_exit_compensation_runs_after_submission_drain(engine):
+    engine.execution_engine.run_when_submissions_drained = MagicMock()
+    engine._run_ops_kill_switch = MagicMock()
+
+    engine._schedule_rithmic_portfolio_exit_compensation("verification_failed")
+
+    callback = (
+        engine.execution_engine.run_when_submissions_drained.call_args.args[0]
+    )
+    callback()
+    engine._run_ops_kill_switch.assert_called_once_with(
+        actor="engine",
+        reason="portfolio_exit_compensation:verification_failed",
+    )
 
 
 def test_rithmic_strategy_exit_blocks_when_remote_order_remains_working(engine):

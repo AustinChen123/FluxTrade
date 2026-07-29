@@ -21,8 +21,10 @@ from src.core.backtest_runner import (
     BacktestRunner,
 )
 from src.core.analytics import ClosedTrade
-from src.core.models import PositionSide
+from src.core.models import Candlestick, PositionSide
+from src.core.portfolio_runtime import PortfolioDefinition, PortfolioSleeve
 from src.core.journal import StrategyJournal
+from src.strategies.base import BaseStrategy, StrategyRequirements
 
 
 # =============================================================================
@@ -274,6 +276,137 @@ class TestBacktestRunnerInit:
                 timeframe="1m",
                 report_config={"journal": False},
             )
+
+    @patch("src.core.backtest_runner.SessionLocal")
+    def test_add_portfolio_uses_parent_as_result_identity(
+        self,
+        mock_session_local,
+    ):
+        mock_session_local.return_value = MagicMock()
+
+        class NoSignalStrategy(BaseStrategy):
+            @property
+            def requirements(self):
+                return StrategyRequirements(self.product_id, "5m", 1)
+
+            def on_candle(self, candle):
+                return None
+
+        definition = PortfolioDefinition(
+            portfolio_id="portfolio_v1",
+            product_id="RITHMIC:MNQ_ROLL-PERP",
+            sleeves=(
+                PortfolioSleeve(
+                    NoSignalStrategy(
+                        "portfolio_v1.sleeve_a",
+                        "RITHMIC:MNQ_ROLL-PERP",
+                    )
+                ),
+            ),
+            max_gross_quantity=Decimal("1"),
+        )
+        runner = BacktestRunner(
+            start_time=0,
+            end_time=0,
+            product_id="RITHMIC:MNQ_ROLL-PERP",
+            timeframe="5m",
+        )
+
+        runner.add_portfolio(definition)
+
+        assert runner._primary_runtime_id == "portfolio_v1"
+        assert runner._portfolios_buffer == [definition]
+        assert [
+            strategy.strategy_id for strategy in runner._strategies_buffer
+        ] == ["portfolio_v1.sleeve_a"]
+
+    @patch("src.core.backtest_runner.SessionLocal")
+    def test_execution_timeframe_requires_finer_even_divisor(
+        self,
+        mock_session_local,
+    ):
+        mock_session_local.return_value = MagicMock()
+
+        with pytest.raises(ValueError, match="evenly divide"):
+            BacktestRunner(
+                start_time=0,
+                end_time=0,
+                product_id="RITHMIC:MNQ_ROLL-PERP",
+                timeframe="5m",
+                execution_timeframe="3m",
+            )
+
+
+def test_split_backtest_routes_every_1m_fill_and_only_completed_5m_decisions():
+    runner = BacktestRunner(
+        start_time=1_700_000_000_000,
+        end_time=1_700_000_300_000,
+        product_id="RITHMIC:MNQ_ROLL-PERP",
+        timeframe="5m",
+        execution_timeframe="1m",
+    )
+    runner.engine = MagicMock()
+    account = MagicMock()
+    account.adapter = None
+    account.get_balance.return_value = Decimal("10000")
+    bucket_start = 1_704_067_200_000
+    candles = [
+        Candlestick(
+            product_id="RITHMIC:MNQ_ROLL-PERP",
+            timeframe="1m",
+            timestamp=bucket_start + minute * 60_000,
+            open=Decimal("20000"),
+            high=Decimal("20001"),
+            low=Decimal("19999"),
+            close=Decimal("20000"),
+            volume=Decimal("1"),
+        )
+        for minute in range(6)
+    ]
+
+    count, _equity = runner._process_candles(
+        candles,
+        account,
+        stop_drawdown_amount=None,
+    )
+
+    assert count == 6
+    assert runner.engine.on_backtest_market_data.call_count == 6
+    decision_candles = [
+        call.args[1]
+        for call in runner.engine.on_backtest_market_data.call_args_list
+        if call.args[1] is not None
+    ]
+    assert len(decision_candles) == 1
+    assert decision_candles[0].timeframe == "5m"
+    assert decision_candles[0].volume == Decimal("5")
+
+
+def test_add_portfolio_rejects_runner_identity_mismatch():
+    class OneMinuteStrategy(BaseStrategy):
+        @property
+        def requirements(self):
+            return StrategyRequirements(self.product_id, "1m", 1)
+
+        def on_candle(self, candle):
+            return None
+
+    strategy = OneMinuteStrategy("sleeve", "RITHMIC:MNQ_ROLL-PERP")
+    definition = PortfolioDefinition(
+        portfolio_id="portfolio_v1",
+        product_id="RITHMIC:MNQ_ROLL-PERP",
+        sleeves=(PortfolioSleeve(strategy),),
+        max_gross_quantity=Decimal("1"),
+    )
+    runner = BacktestRunner(
+        start_time=0,
+        end_time=0,
+        product_id="RITHMIC:MNQ_ROLL-PERP",
+        timeframe="5m",
+    )
+
+    with pytest.raises(ValueError, match="product/timeframe"):
+        runner.add_portfolio(definition)
 
 
 # =============================================================================

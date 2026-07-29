@@ -8,6 +8,13 @@ from unittest.mock import MagicMock, sentinel
 import pytest
 
 from src.core.models import Candlestick, Signal, SignalType, Trade
+from src.core.portfolio_runtime import (
+    PortfolioCoordinator,
+    PortfolioDecisionRejected,
+    PortfolioDefinition,
+    PortfolioExposureSnapshot,
+    PortfolioSleeve,
+)
 from src.core.signal_processor import SignalProcessor
 from src.core.strategy_registry import StrategyRegistry
 from src.strategies.base import BaseStrategy, StrategyRequirements
@@ -112,6 +119,238 @@ def test_on_candle_routes_matching_strategy() -> None:
 
     assert strategy.candles_received == [candle]
     execution.execute_signal.assert_called_once_with(signal, candle)
+
+
+def test_on_candle_coordinates_portfolio_before_emitting_any_signal() -> None:
+    strategy_a = DummyStrategy(
+        "sleeve_a",
+        result=make_signal("sleeve_a", SignalType.LONG),
+    )
+    strategy_b = DummyStrategy(
+        "sleeve_b",
+        result=make_signal("sleeve_b", SignalType.SHORT),
+    )
+    registry = StrategyRegistry()
+    registry.register(strategy_a)
+    registry.register(strategy_b)
+    coordinator = PortfolioCoordinator()
+    coordinator.register(
+        PortfolioDefinition(
+            portfolio_id="portfolio_v1",
+            product_id=strategy_a.product_id,
+            sleeves=(
+                PortfolioSleeve(strategy_a),
+                PortfolioSleeve(strategy_b),
+            ),
+            max_gross_quantity=Decimal("2"),
+        )
+    )
+    execution = MagicMock()
+    execution.default_quantity = Decimal("1")
+    handler = MagicMock()
+    processor = SignalProcessor(
+        registry,
+        execution,
+        signal_handler=handler,
+        position_loader=lambda *_args: None,
+        exposure_loader=lambda *_args: PortfolioExposureSnapshot({}),
+        portfolio_coordinator=coordinator,
+    )
+
+    with pytest.raises(PortfolioDecisionRejected, match="opposing_exposure"):
+        processor.on_candle(make_candle())
+
+    handler.assert_not_called()
+
+
+def test_portfolio_sleeves_share_parent_lifecycle_state() -> None:
+    strategy = DummyStrategy("sleeve_a", result=make_signal("sleeve_a"))
+    registry = StrategyRegistry()
+    registry.register(strategy)
+    coordinator = PortfolioCoordinator()
+    coordinator.register(
+        PortfolioDefinition(
+            portfolio_id="portfolio_v1",
+            product_id=strategy.product_id,
+            sleeves=(PortfolioSleeve(strategy),),
+            max_gross_quantity=Decimal("1"),
+        )
+    )
+    execution = MagicMock()
+    execution.default_quantity = Decimal("1")
+    state_manager = DummyStateManager({"portfolio_v1"})
+    handler = MagicMock()
+
+    SignalProcessor(
+        registry,
+        execution,
+        state_manager,
+        signal_handler=handler,
+        position_loader=lambda *_args: None,
+        exposure_loader=lambda *_args: PortfolioExposureSnapshot({}),
+        portfolio_coordinator=coordinator,
+    ).on_candle(make_candle())
+
+    handler.assert_called_once()
+
+
+def test_portfolio_submission_rejection_stops_remaining_sleeves() -> None:
+    strategy_a = DummyStrategy(
+        "sleeve_a",
+        result=make_signal("sleeve_a", SignalType.LONG),
+    )
+    strategy_b = DummyStrategy(
+        "sleeve_b",
+        result=make_signal("sleeve_b", SignalType.LONG),
+    )
+    registry = StrategyRegistry()
+    registry.register(strategy_a)
+    registry.register(strategy_b)
+    coordinator = PortfolioCoordinator()
+    coordinator.register(
+        PortfolioDefinition(
+            portfolio_id="portfolio_v1",
+            product_id=strategy_a.product_id,
+            sleeves=(
+                PortfolioSleeve(strategy_a),
+                PortfolioSleeve(strategy_b),
+            ),
+            max_gross_quantity=Decimal("2"),
+        )
+    )
+    execution = MagicMock(default_quantity=Decimal("1"))
+    handler = MagicMock(side_effect=[False, True])
+    processor = SignalProcessor(
+        registry,
+        execution,
+        signal_handler=handler,
+        position_loader=lambda *_args: None,
+        exposure_loader=lambda *_args: PortfolioExposureSnapshot({}),
+        portfolio_coordinator=coordinator,
+    )
+
+    with pytest.raises(
+        PortfolioDecisionRejected,
+        match="portfolio_submission_rejected:strategy_id=sleeve_a",
+    ):
+        processor.on_candle(make_candle())
+
+    handler.assert_called_once()
+
+
+def test_portfolio_crash_replay_does_not_double_count_persisted_intent() -> None:
+    strategy_a = DummyStrategy(
+        "sleeve_a",
+        result=make_signal("sleeve_a", SignalType.LONG),
+    )
+    strategy_b = DummyStrategy(
+        "sleeve_b",
+        result=make_signal("sleeve_b", SignalType.LONG),
+    )
+    registry = StrategyRegistry()
+    registry.register(strategy_a)
+    registry.register(strategy_b)
+    coordinator = PortfolioCoordinator()
+    coordinator.register(
+        PortfolioDefinition(
+            portfolio_id="portfolio_v1",
+            product_id=strategy_a.product_id,
+            sleeves=(
+                PortfolioSleeve(strategy_a),
+                PortfolioSleeve(strategy_b),
+            ),
+            max_gross_quantity=Decimal("2"),
+        )
+    )
+    execution = MagicMock(default_quantity=Decimal("1"))
+    handler = MagicMock(return_value=True)
+    observed_requested_intents = {}
+
+    def load_exposure(_strategy_ids, _product_id, requested_intents):
+        nonlocal observed_requested_intents
+        observed_requested_intents = requested_intents
+        client_order_ids = tuple(requested_intents)
+        return PortfolioExposureSnapshot(
+            quantities={"sleeve_a": Decimal("1")},
+            existing_client_order_ids=frozenset({client_order_ids[0]}),
+        )
+
+    SignalProcessor(
+        registry,
+        execution,
+        signal_handler=handler,
+        position_loader=lambda *_args: None,
+        exposure_loader=load_exposure,
+        portfolio_coordinator=coordinator,
+    ).on_candle(make_candle())
+
+    assert set(observed_requested_intents.values()) == {
+        "sleeve_a",
+        "sleeve_b",
+    }
+    assert handler.call_count == 2
+    assert {
+        call.args[0].metadata["client_order_id"]
+        for call in handler.call_args_list
+    } == set(observed_requested_intents)
+
+
+@pytest.mark.parametrize(
+    ("signal_types", "max_gross_quantity"),
+    [
+        ((SignalType.LONG, SignalType.SHORT), Decimal("2")),
+        ((SignalType.LONG, SignalType.LONG), Decimal("1")),
+    ],
+)
+def test_portfolio_trade_signals_fail_before_any_submission(
+    signal_types,
+    max_gross_quantity,
+) -> None:
+    strategies = tuple(
+        DummyStrategy(
+            f"sleeve_{index}",
+            trade_result=make_signal(
+                f"sleeve_{index}",
+                signal_type,
+            ),
+        )
+        for index, signal_type in enumerate(signal_types)
+    )
+    for strategy in strategies:
+        strategy.on_trade = MagicMock(return_value=strategy.trade_result)
+    registry = StrategyRegistry()
+    for strategy in strategies:
+        registry.register(strategy)
+    coordinator = PortfolioCoordinator()
+    coordinator.register(
+        PortfolioDefinition(
+            portfolio_id="portfolio_v1",
+            product_id=strategies[0].product_id,
+            sleeves=tuple(
+                PortfolioSleeve(strategy) for strategy in strategies
+            ),
+            max_gross_quantity=max_gross_quantity,
+        )
+    )
+    handler = MagicMock()
+    processor = SignalProcessor(
+        registry,
+        MagicMock(default_quantity=Decimal("1")),
+        signal_handler=handler,
+        position_loader=lambda *_args: None,
+        exposure_loader=lambda *_args: PortfolioExposureSnapshot({}),
+        portfolio_coordinator=coordinator,
+    )
+
+    with pytest.raises(
+        PortfolioDecisionRejected,
+        match="portfolio_trade_signals_unsupported",
+    ):
+        processor.on_trade(make_trade())
+
+    handler.assert_not_called()
+    for strategy in strategies:
+        strategy.on_trade.assert_not_called()
 
 
 def test_warm_up_routes_target_strategy_without_emitting_signals() -> None:

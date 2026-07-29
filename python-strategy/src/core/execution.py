@@ -1,6 +1,7 @@
 import logging
 import threading
 import time as _time
+from collections.abc import Mapping
 from dataclasses import dataclass
 from decimal import Decimal, InvalidOperation
 from typing import Callable, ContextManager, Optional
@@ -41,6 +42,7 @@ from src.core.order_event_sync import (
     exchange_snapshot_to_order_event,
 )
 from src.core.order_reconciliation import OrderReconciler
+from src.core.portfolio_runtime import PortfolioExposureSnapshot
 
 OPS_KILL_SWITCH_STRATEGY_ID = "__ops_kill_switch__"
 
@@ -209,12 +211,147 @@ class ExecutionEngine:
             snapshot_loader=snapshot_loader,
         )
 
+    def portfolio_exposure_snapshot(
+        self,
+        strategy_ids: tuple[str, ...],
+        product_id: str,
+        requested_intents: Mapping[str, str],
+    ) -> PortfolioExposureSnapshot:
+        """Read positions and working entries under the order-event fence."""
+        if self._position_loader is None:
+            raise RuntimeError("portfolio_position_loader_missing")
+
+        active_statuses = {
+            OrderStatus.NEW.value,
+            OrderStatus.SUBMITTED_UNCONFIRMED.value,
+            OrderStatus.SUBMITTED.value,
+            OrderStatus.PARTIALLY_FILLED.value,
+        }
+        owners = set(strategy_ids)
+        if len(owners) != len(strategy_ids):
+            raise ValueError("portfolio_exposure_strategy_ids_must_be_unique")
+        if set(requested_intents.values()) - owners:
+            raise ValueError("portfolio_exposure_intent_owner_unknown")
+
+        with self._order_event_apply_lock:
+            existing_client_order_ids: set[str] = set()
+            for client_order_id, expected_strategy_id in requested_intents.items():
+                existing_order = (
+                    self.order_manager.repo.get_order_by_client_order_id(
+                        client_order_id
+                    )
+                )
+                if existing_order is None:
+                    continue
+                if (
+                    str(existing_order.strategy_id) != expected_strategy_id
+                    or str(existing_order.product_id) != product_id
+                ):
+                    raise RuntimeError(
+                        "portfolio_replay_intent_identity_mismatch:"
+                        f"client_order_id={client_order_id}"
+                    )
+                existing_client_order_ids.add(client_order_id)
+            quantities: dict[str, Decimal] = {}
+            for strategy_id in strategy_ids:
+                position = self._position_loader(strategy_id, product_id)
+                if position is None:
+                    quantities[strategy_id] = Decimal("0")
+                    continue
+                quantity = Decimal(str(getattr(position, "quantity")))
+                side = str(
+                    getattr(
+                        getattr(position, "side"),
+                        "value",
+                        getattr(position, "side"),
+                    )
+                ).upper()
+                if not quantity.is_finite() or quantity <= 0:
+                    raise RuntimeError(
+                        f"portfolio_position_invalid:{strategy_id}"
+                    )
+                if side == PositionSide.LONG.value:
+                    quantities[strategy_id] = quantity
+                elif side == PositionSide.SHORT.value:
+                    quantities[strategy_id] = -quantity
+                else:
+                    raise RuntimeError(
+                        f"portfolio_position_side_invalid:{strategy_id}"
+                    )
+
+            for order in self.order_manager.repo.list_orders_by_statuses(
+                active_statuses
+            ):
+                strategy_id = str(order.strategy_id)
+                if (
+                    strategy_id not in owners
+                    or str(order.product_id) != product_id
+                ):
+                    continue
+                payload = (
+                    order.intent_payload
+                    if isinstance(order.intent_payload, dict)
+                    else {}
+                )
+                order_payload = payload.get("order")
+                if not isinstance(order_payload, dict):
+                    order_payload = {}
+                if (
+                    payload.get("pending_entry_order_id")
+                    or payload.get("reduce_only") is True
+                    or order_payload.get("reduce_only") is True
+                ):
+                    continue
+
+                quantity = Decimal(str(order.quantity))
+                filled_quantity = Decimal(
+                    str(order.filled_quantity or Decimal("0"))
+                )
+                remaining = quantity - filled_quantity
+                if (
+                    not quantity.is_finite()
+                    or quantity <= 0
+                    or not filled_quantity.is_finite()
+                    or filled_quantity < 0
+                    or remaining < 0
+                ):
+                    raise RuntimeError(
+                        "portfolio_pending_entry_quantity_invalid:"
+                        f"order_id={order.id}"
+                    )
+                if remaining == 0:
+                    continue
+                side = str(getattr(order.side, "value", order.side)).lower()
+                if side == OrderSide.BUY.value:
+                    signed = remaining
+                elif side == OrderSide.SELL.value:
+                    signed = -remaining
+                else:
+                    raise RuntimeError(
+                        "portfolio_pending_entry_side_invalid:"
+                        f"order_id={order.id}"
+                    )
+                current = quantities[strategy_id]
+                if current * signed < 0:
+                    raise RuntimeError(
+                        "portfolio_pending_entry_crosses_sleeve_position:"
+                        f"{strategy_id}"
+                    )
+                quantities[strategy_id] = current + signed
+
+            return PortfolioExposureSnapshot(
+                quantities=quantities,
+                existing_client_order_ids=frozenset(
+                    existing_client_order_ids
+                ),
+            )
+
     def execute_authoritative_exit_signal(
         self,
         signal: Signal,
         candle: Optional[Candlestick],
         executor: Callable[[Signal, ExitDecision], dict[str, object]],
-    ) -> Optional[str]:
+    ) -> bool:
         """Audit and execute one venue-native, full-position EXIT operation."""
         reconcile_generation = self._begin_authoritative_exit(timeout=30.0)
         if reconcile_generation is None:
@@ -225,7 +362,7 @@ class ExecutionEngine:
                 signal.product_id,
             )
             self._audit_non_submission(signal, candle, "submission_gate_halted")
-            return None
+            return False
 
         resume_after_exit = False
         try:
@@ -233,6 +370,18 @@ class ExecutionEngine:
             decision = self._classify_exit_signal(signal)
             if decision is None or not decision.allowed:
                 reason = "not_exit" if decision is None else decision.reason
+                if (
+                    reason == "already_flat"
+                    and self._completed_verified_net_reduction_replay(signal)
+                ):
+                    self.logger.info(
+                        "Authoritative EXIT replay already completed: "
+                        "strategy=%s product=%s",
+                        signal.strategy_id,
+                        signal.product_id,
+                    )
+                    resume_after_exit = True
+                    return True
                 self.logger.warning(
                     "Authoritative EXIT not submitted: strategy=%s "
                     "product=%s reason=%s",
@@ -242,7 +391,7 @@ class ExecutionEngine:
                 )
                 self._audit_non_submission(signal, candle, reason)
                 resume_after_exit = reason in {"not_exit", "already_flat"}
-                return None
+                return False
             if decision.quantity != decision.position_quantity:
                 self.logger.warning(
                     "Authoritative partial EXIT is unsupported: strategy=%s "
@@ -257,7 +406,7 @@ class ExecutionEngine:
                     candle,
                     "authoritative_partial_exit_unsupported",
                 )
-                return None
+                return False
 
             client_order_id = self._client_order_id_for_signal(signal)
             intent_payload = {
@@ -287,6 +436,7 @@ class ExecutionEngine:
                 outcome = executor(signal, decision)
             except Exception as error:
                 if audit is not None:
+                    assert self._db_session_factory is not None
                     with self._db_session_factory() as db:
                         write_signal_audit_outcome(
                             db,
@@ -300,6 +450,7 @@ class ExecutionEngine:
                 raise
 
             if audit is not None:
+                assert self._db_session_factory is not None
                 with self._db_session_factory() as db:
                     write_signal_audit_outcome(
                         db,
@@ -307,12 +458,201 @@ class ExecutionEngine:
                         outcome_payload=outcome,
                     )
             resume_after_exit = True
-            return None
+            return True
         finally:
             self._finish_authoritative_exit(
                 resume_after_reconcile=resume_after_exit,
                 reconcile_generation=reconcile_generation,
             )
+
+    def _completed_verified_net_reduction_replay(self, signal: Signal) -> bool:
+        client_order_id = self._client_order_id_for_signal(signal)
+        existing_order = self.order_manager.repo.get_order_by_client_order_id(
+            client_order_id
+        )
+        if existing_order is None:
+            return False
+
+        payload = self._verified_net_reduction_order_payload(
+            signal,
+            existing_order,
+        )
+        verification = payload.get("authoritative_verification")
+        if (
+            not isinstance(verification, dict)
+            or verification.get("status") != "verified_portfolio_reduction"
+            or verification.get("strategy_id") != signal.strategy_id
+            or verification.get("product_id") != signal.product_id
+        ):
+            raise RuntimeError(
+                "authoritative_exit_replay_verification_missing"
+            )
+        return True
+
+    def _verified_net_reduction_order_payload(
+        self,
+        signal: Signal,
+        order,
+    ) -> dict:
+        payload = (
+            order.intent_payload
+            if isinstance(order.intent_payload, dict)
+            else {}
+        )
+        signal_payload = payload.get("signal")
+        expected_side = self._determine_side(signal.type)
+        quantity = Decimal(str(order.quantity))
+        filled_quantity = Decimal(
+            str(order.filled_quantity or Decimal("0"))
+        )
+        if (
+            expected_side is None
+            or str(order.strategy_id) != signal.strategy_id
+            or str(order.product_id) != signal.product_id
+            or str(order.type) != "market"
+            or str(getattr(order.side, "value", order.side)).lower()
+            != expected_side.value
+            or payload.get("source") != "authoritative_net_reduction"
+            or not isinstance(signal_payload, dict)
+            or signal_payload.get("type") != signal.type.value
+            or str(order.status) != OrderStatus.FILLED.value
+            or not quantity.is_finite()
+            or quantity <= 0
+            or filled_quantity != quantity
+        ):
+            raise RuntimeError("authoritative_exit_replay_identity_mismatch")
+        return payload
+
+    def record_verified_net_reduction(
+        self,
+        signal: Signal,
+        order_id: str,
+        *,
+        remaining_remote_quantity: Decimal,
+    ) -> None:
+        if (
+            not remaining_remote_quantity.is_finite()
+            or remaining_remote_quantity < 0
+        ):
+            raise ValueError("verified_net_reduction_remaining_quantity_invalid")
+        order = self.order_manager.repo.get_order(order_id)
+        if order is None:
+            raise RuntimeError("verified_net_reduction_order_missing")
+        client_order_id = self._client_order_id_for_signal(signal)
+        if str(order.client_order_id) != client_order_id:
+            raise RuntimeError("verified_net_reduction_order_identity_mismatch")
+
+        payload = dict(
+            self._verified_net_reduction_order_payload(signal, order)
+        )
+        payload["authoritative_verification"] = {
+            "status": "verified_portfolio_reduction",
+            "strategy_id": signal.strategy_id,
+            "product_id": signal.product_id,
+            "remaining_remote_quantity": str(remaining_remote_quantity),
+        }
+        setattr(order, "intent_payload", payload)
+        self.order_manager.repo.update_order(order)
+
+    def submit_verified_net_reduction(
+        self,
+        signal: Signal,
+        decision: ExitDecision,
+        *,
+        candle: Optional[Candlestick],
+        preflight_remote_quantity: Decimal,
+    ) -> str:
+        """Submit one audited market reduction inside an authoritative exit gate.
+
+        This is intentionally not a reduce-only order. Venues without native
+        reduce-only semantics may use it only after the caller has fenced all
+        submissions and verified the exact remote net position.
+        """
+        if signal.type not in (SignalType.EXIT_LONG, SignalType.EXIT_SHORT):
+            raise ValueError("verified_net_reduction_requires_exit_signal")
+        if not self.audit_external_orders or self._db_session_factory is None:
+            raise RuntimeError(
+                "verified_net_reduction_requires_external_order_audit"
+            )
+        with self._submission_gate:
+            if not self._reconcile_halt or self._submissions_in_flight != 1:
+                raise RuntimeError(
+                    "verified_net_reduction_requires_exclusive_exit_gate"
+                )
+        if decision.quantity is None or decision.quantity <= 0:
+            raise ValueError("verified_net_reduction_quantity_invalid")
+        if (
+            decision.position_quantity is None
+            or decision.quantity > decision.position_quantity
+        ):
+            raise ValueError("verified_net_reduction_exceeds_strategy_position")
+        if preflight_remote_quantity < decision.quantity:
+            raise ValueError("verified_net_reduction_exceeds_remote_position")
+
+        side = self._determine_side(signal.type)
+        assert side is not None
+        client_order_id = self._client_order_id_for_signal(signal)
+        existing_order = self.order_manager.repo.get_order_by_client_order_id(
+            client_order_id
+        )
+        if existing_order is not None:
+            return str(existing_order.id)
+
+        intent_payload = {
+            "signal": signal.model_dump(mode="json"),
+            "order": {
+                "side": side.value,
+                "order_type": "market",
+                "quantity": decision.quantity,
+                "price": None,
+                "min_notional_reference_price": (
+                    candle.close if candle is not None else None
+                ),
+                "client_order_id": client_order_id,
+            },
+            "source": "authoritative_net_reduction",
+            "preflight_remote_quantity": str(preflight_remote_quantity),
+            "strategy_position_quantity": str(decision.position_quantity),
+        }
+        order = self.order_manager.create_order(
+            signal=signal,
+            side=side,
+            order_type="market",
+            quantity=decision.quantity,
+            client_order_id=client_order_id,
+            intent_payload=intent_payload,
+        )
+        self._attach_min_notional_reference_price(order, candle)
+        order_id = str(order.id)
+        submit_attempted = False
+        try:
+            self._validate_order_group([order])
+            self._assert_external_operation_allowed()
+            self.order_manager.mark_submitted_unconfirmed(order)
+            submit_attempted = True
+            exchange_id = self.adapter.place_order(order)
+            self._record_order_ack(order, exchange_id, order_id=order_id)
+            return order_id
+        except ExchangeError as error:
+            adoption = self._adopt_order_after_ambiguous_submit_error(
+                order,
+                error,
+                submit_attempted=submit_attempted,
+            )
+            if adoption["action"] == "adopted":
+                return order_id
+            if adoption.get("verification_blocked") or adoption.get("unresolved"):
+                with self._submission_gate:
+                    self._claim_reconcile_halt_locked()
+            elif not adoption.get("terminal"):
+                self.order_manager.fail_order(order, str(error))
+            self._record_order_rejection(
+                order=order,
+                order_type="market",
+                error=error,
+                phase="verified_net_reduction",
+            )
+            raise
 
     def _begin_authoritative_exit(self, *, timeout: float) -> int | None:
         """Own the shared gate without counting this operation in its drain."""
