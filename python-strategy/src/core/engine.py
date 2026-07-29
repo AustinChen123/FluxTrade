@@ -7,6 +7,7 @@ import threading
 import logging
 import traceback
 import uuid
+import weakref
 from contextlib import contextmanager, nullcontext
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import replace
@@ -73,7 +74,12 @@ from src.core.ops_safety import OpsSafetyService
 from src.core.runtime_reconcile import RuntimeReconciliationJob
 from src.core.signal_processor import SignalProcessor
 from src.core.strategy_registry import StrategyRegistry
-from src.core.strategy_state_manager import StrategyStateManager
+from src.core.strategy_state_manager import (
+    InvalidStrategyStateTransition,
+    StaleStrategyStateVersion,
+    StrategyStateManager,
+    available_strategy_commands,
+)
 from src.core.audit_service import build_signal_audit, commit_signal_audit
 from src.core.runtime_environment import RuntimeEnvironment
 from src.core.product_master import ensure_product_registered
@@ -88,6 +94,8 @@ SYSTEM_STATE_LOCKDOWN = "LOCKDOWN"
 SYSTEM_STATE_OK = "OK"
 _RITHMIC_SAFE_ORDER_EVENT_ACTIONS = frozenset({"applied"})
 _KILL_SWITCH_IDEMPOTENCY_TTL_SECONDS = 86_400
+_STRATEGY_COMMAND_CLAIM_TTL_SECONDS = 60
+_STRATEGY_COMMAND_IDEMPOTENCY_TTL_SECONDS = 86_400
 
 logger = logging.getLogger(__name__)
 
@@ -201,10 +209,12 @@ class _EngineLifecycleAdapter:
         self._engine = engine
 
     def transition_to_running(self, strategy_id: str, **kwargs) -> None:
-        self._engine.activate_strategy(strategy_id, **kwargs)
+        if self._engine.activate_strategy(strategy_id, **kwargs) is False:
+            raise RuntimeError(f"strategy activation rejected: {strategy_id}")
 
     def transition_to_stopped(self, strategy_id: str, **kwargs) -> None:
-        self._engine.deactivate_strategy(strategy_id, **kwargs)
+        if self._engine.deactivate_strategy(strategy_id, **kwargs) is False:
+            raise RuntimeError(f"strategy deactivation rejected: {strategy_id}")
 
     def is_running(self, strategy_id: str) -> bool:
         return strategy_id in self._engine.strategy_instances
@@ -243,6 +253,10 @@ class StrategyEngine:
         ] = {}
         self._strategy_lock = threading.Lock()
         self._runtime_registration_lock = threading.RLock()
+        self._strategy_lifecycle_locks: weakref.WeakValueDictionary[
+            str, threading.Lock
+        ] = weakref.WeakValueDictionary()
+        self._strategy_lifecycle_locks_lock = threading.Lock()
         self._ops_command_lock = threading.Lock()
         self._market_processing_lock = threading.Lock()
         self._boot_id = uuid.uuid4().hex
@@ -1345,7 +1359,57 @@ class StrategyEngine:
                             self._assert_runtime_leadership()
                             self.execution_engine.resume_after_reconcile()
             else:
+                expected_version = params.get("expected_version")
+                if (
+                    cmd in {"START", "STOP", "RESUME", "FORCE_RECOVER"}
+                    and (
+                        expected_version is None
+                        or (
+                            isinstance(expected_version, int)
+                            and not isinstance(expected_version, bool)
+                        )
+                    )
+                ):
+                    self._assert_strategy_command_allowed(
+                        strategy_id=str(
+                            params.get("id")
+                            or params.get("strategy_id")
+                            or data.get("id")
+                            or data.get("strategy_id")
+                            or ""
+                        ),
+                        command=cmd,
+                        expected_version=expected_version,
+                    )
+                if cmd in {
+                    "START",
+                    "STOP",
+                    "RESUME",
+                    "FORCE_RECOVER",
+                }:
+                    idempotency_key = params.get("idempotency_key")
+                    actor = str(params.get("actor", "operator"))
+                    if (
+                        isinstance(idempotency_key, str)
+                        and not self._claim_strategy_command_operation(
+                            actor=actor,
+                            idempotency_key=idempotency_key,
+                        )
+                    ):
+                        logger.info(
+                            "Skipping duplicate strategy command for actor %s",
+                            actor,
+                        )
+                        return
                 result = self._command_router.handle(data)
+                if (
+                    cmd in {"START", "STOP", "RESUME", "FORCE_RECOVER"}
+                    and isinstance(idempotency_key, str)
+                ):
+                    self._mark_strategy_command_operation_completed(
+                        actor=actor,
+                        idempotency_key=idempotency_key,
+                    )
                 if result.success:
                     logger.info("Command %s succeeded: %s", cmd, result.message)
                 else:
@@ -1365,6 +1429,58 @@ class StrategyEngine:
         return self.runtime_environment.key(
             f"ops:kill-switch:idempotency:{digest}"
         )
+
+    def _claim_strategy_command_operation(
+        self,
+        *,
+        actor: str,
+        idempotency_key: str,
+    ) -> bool:
+        digest = hashlib.sha256(
+            f"{actor}\0{idempotency_key}".encode()
+        ).hexdigest()
+        key = self.runtime_environment.key(
+            f"strategy-command:idempotency:{digest}"
+        )
+        try:
+            return bool(
+                self.redis_client.set(
+                    key,
+                    "claimed",
+                    nx=True,
+                    ex=_STRATEGY_COMMAND_CLAIM_TTL_SECONDS,
+                )
+            )
+        except Exception:
+            logger.exception(
+                "Unable to claim strategy command idempotency key; "
+                "command rejected"
+            )
+            return False
+
+    def _mark_strategy_command_operation_completed(
+        self,
+        *,
+        actor: str,
+        idempotency_key: str,
+    ) -> None:
+        digest = hashlib.sha256(
+            f"{actor}\0{idempotency_key}".encode()
+        ).hexdigest()
+        key = self.runtime_environment.key(
+            f"strategy-command:idempotency:{digest}"
+        )
+        try:
+            self.redis_client.set(
+                key,
+                "completed",
+                ex=_STRATEGY_COMMAND_IDEMPOTENCY_TTL_SECONDS,
+            )
+        except Exception:
+            logger.exception(
+                "Unable to persist completed strategy command marker; "
+                "expected_version remains the retry fence"
+            )
 
     def _kill_switch_operation_completed(
         self,
@@ -1423,20 +1539,35 @@ class StrategyEngine:
         with self._db_session_factory() as db:
             for strategy_id, result in found.items():
                 state = db.query(StrategyState).filter(StrategyState.strategy_id == strategy_id).first()
+                is_new = state is None
                 if not state:
                     state = StrategyState(
                         strategy_id=strategy_id,
-                        status=StrategyStatus.DISCOVERED,
-                        config_json="{}"
+                        status=(
+                            StrategyStatus.ERROR
+                            if isinstance(result, str)
+                            else StrategyStatus.DISCOVERED
+                        ),
+                        config_json="{}",
                     )
                     db.add(state)
 
                 if isinstance(result, str):
                     # It was a LoadError (traceback string)
-                    state.status = StrategyStatus.ERROR
-                    state.performance_json = json.dumps({"error": result})
-                    state.last_error_message = result
-                    state.entered_error_at = datetime.now(UTC)
+                    if is_new:
+                        state.performance_json = json.dumps({"error": result})
+                        state.last_error_message = result
+                        state.entered_error_at = datetime.now(UTC)
+                    else:
+                        expected_version = int(state.version or 0)
+                        db.commit()
+                        self._strategy_state_manager.transition_to_error(
+                            strategy_id,
+                            result,
+                            actor="system",
+                            expected_version=expected_version,
+                        )
+                        continue
                 
                 db.commit()
         logger.info("✅ Scan Complete. Total loaded: %s", len(self.loaded_classes))
@@ -1496,6 +1627,10 @@ class StrategyEngine:
                 logger.error("Strategy %s not in DB.", strategy_id)
                 return
 
+            expected_version = int(state.version or 0)
+            next_status = StrategyStatus.READY
+            transition_reason = "test_run_completed"
+            test_error: Exception | None = None
             try:
                 # Instantiate with dummy product to get requirements
                 config = json.loads(state.config_json or "{}")
@@ -1524,26 +1659,39 @@ class StrategyEngine:
                             strategy_id,
                             backfill_cmd,
                         )
-                        state.status = StrategyStatus.WARNING
                         state.performance_json = json.dumps(
                             {"backfill_command": backfill_cmd}
                         )
-                        db.commit()
-                        return
-
-                # If OK, update status to READY
-                state.status = StrategyStatus.READY
+                        next_status = StrategyStatus.WARNING
+                        transition_reason = "insufficient_data"
+                        break
                 db.commit()
-                logger.info("✅ Strategy %s is READY.", strategy_id)
-
             except Exception as e:
+                test_error = e
                 error_trace = traceback.format_exc()
-                state.status = StrategyStatus.ERROR
                 state.performance_json = json.dumps({"error": error_trace})
-                state.last_error_message = error_trace
-                state.entered_error_at = datetime.now(UTC)
                 db.commit()
-                logger.error("❌ Test Run failed for %s: %s", strategy_id, e)
+                next_status = StrategyStatus.ERROR
+                transition_reason = error_trace
+
+        if next_status == StrategyStatus.ERROR:
+            self._strategy_state_manager.transition_to_error(
+                strategy_id,
+                transition_reason,
+                actor="system",
+                expected_version=expected_version,
+            )
+            logger.error("❌ Test Run failed for %s: %s", strategy_id, test_error)
+            return
+        self._strategy_state_manager.transition_to_status(
+            strategy_id,
+            next_status,
+            actor="system",
+            reason=transition_reason,
+            expected_version=expected_version,
+        )
+        if next_status == StrategyStatus.READY:
+            logger.info("✅ Strategy %s is READY.", strategy_id)
 
     def activate_strategy(
         self,
@@ -1552,21 +1700,41 @@ class StrategyEngine:
         actor: str = "operator",
         reason: Optional[str] = None,
         force: bool = False,
-    ) -> None:
+        expected_version: int | None = None,
+    ) -> bool:
         """Instantiate/register a strategy and transition it to ACTIVE."""
+        with self._strategy_lifecycle_lock(strategy_id):
+            return self._activate_strategy_locked(
+                strategy_id,
+                actor=actor,
+                reason=reason,
+                force=force,
+                expected_version=expected_version,
+            )
+
+    def _activate_strategy_locked(
+        self,
+        strategy_id: str,
+        *,
+        actor: str,
+        reason: Optional[str],
+        force: bool,
+        expected_version: int | None,
+    ) -> bool:
         logger.info("🚀 Starting Strategy: %s", strategy_id)
         artifact_cls = self._get_loaded_strategy_class(strategy_id)
         if artifact_cls is None:
             logger.error("Strategy %s not loaded.", strategy_id)
-            return
+            return False
 
+        self._assert_expected_strategy_version(strategy_id, expected_version)
         with self._db_session_factory() as db:
             state = db.query(StrategyState).filter(StrategyState.strategy_id == strategy_id).first()
             # Allow READY or WARNING (with manual override implied by START command)
             startable = {StrategyStatus.READY, StrategyStatus.WARNING, StrategyStatus.STOPPED, StrategyStatus.DISCOVERED}
             if not state or (state.status not in startable and not force):
                  logger.error("Strategy %s is not in startable state (Current: %s)", strategy_id, state.status if state else 'None')
-                 return
+                 return False
 
             try:
                 config = json.loads(state.config_json or "{}")
@@ -1618,20 +1786,35 @@ class StrategyEngine:
                     strategy_id,
                     str(e),
                     actor="system",
+                    expected_version=expected_version,
                 )
                 logger.error("❌ Failed to start %s: %s", strategy_id, e)
-                return
+                return False
 
         try:
+            transition_kwargs = {
+                "actor": actor,
+                "force": force,
+                "reason": reason,
+            }
+            if expected_version is not None:
+                transition_kwargs["expected_version"] = expected_version
             self._strategy_state_manager.transition_to_running(
                 strategy_id,
-                actor=actor,
-                force=force,
-                reason=reason,
+                **transition_kwargs,
             )
         except Exception as e:
             self._unregister_runtime_artifact(strategy_id)
             logger.error("❌ Failed to transition %s to ACTIVE: %s", strategy_id, e)
+            return False
+        return True
+
+    def _strategy_lifecycle_lock(self, strategy_id: str) -> threading.Lock:
+        with self._strategy_lifecycle_locks_lock:
+            return self._strategy_lifecycle_locks.setdefault(
+                strategy_id,
+                threading.Lock(),
+            )
 
     def _strategy_product_id(self, config: dict) -> str:
         product_id = str(config.get("product_id") or "").strip()
@@ -1651,6 +1834,55 @@ class StrategyEngine:
     ) -> type[BaseStrategy] | type[PortfolioFactory] | None:
         with self._strategy_lock:
             return self.loaded_classes.get(strategy_id)
+
+    def _assert_expected_strategy_version(
+        self,
+        strategy_id: str,
+        expected_version: int | None,
+    ) -> None:
+        if expected_version is None:
+            return
+        with self._db_session_factory() as db:
+            state = (
+                db.query(StrategyState)
+                .filter(StrategyState.strategy_id == strategy_id)
+                .first()
+            )
+            if state is None:
+                raise KeyError(f"strategy state not found: {strategy_id}")
+            current_version = int(state.version or 0)
+        if current_version != expected_version:
+            raise StaleStrategyStateVersion(
+                f"{strategy_id} expected version {expected_version}, "
+                f"found {current_version}"
+            )
+
+    def _assert_strategy_command_allowed(
+        self,
+        *,
+        strategy_id: str,
+        command: str,
+        expected_version: int | None,
+    ) -> None:
+        with self._db_session_factory() as db:
+            state = (
+                db.query(StrategyState)
+                .filter(StrategyState.strategy_id == strategy_id)
+                .first()
+            )
+            if state is None:
+                raise KeyError(f"strategy state not found: {strategy_id}")
+            current_version = int(state.version or 0)
+            status = StrategyStatus(state.status)
+        if expected_version is not None and current_version != expected_version:
+            raise StaleStrategyStateVersion(
+                f"{strategy_id} expected version {expected_version}, "
+                f"found {current_version}"
+            )
+        if command not in available_strategy_commands(status):
+            raise InvalidStrategyStateTransition(
+                f"{command} is not allowed while {strategy_id} is {status.value}"
+            )
 
     def _assert_strategy_live_readiness(
         self,
@@ -2144,20 +2376,58 @@ class StrategyEngine:
         *,
         actor: str = "operator",
         reason: Optional[str] = None,
-    ) -> None:
+        expected_version: int | None = None,
+    ) -> bool:
         """Unregister a strategy and transition it to STOPPED."""
-        logger.info("🛑 Stopping Strategy: %s", strategy_id)
-        if not self._unregister_runtime_artifact(strategy_id):
-            logger.warning("Strategy %s is not active.", strategy_id)
-            return
+        with self._strategy_lifecycle_lock(strategy_id):
+            return self._deactivate_strategy_locked(
+                strategy_id,
+                actor=actor,
+                reason=reason,
+                expected_version=expected_version,
+            )
 
-        self._strategy_state_manager.transition_to_stopped(
-            strategy_id,
-            actor=actor,
-            reason=reason,
-        )
+    def _deactivate_strategy_locked(
+        self,
+        strategy_id: str,
+        *,
+        actor: str,
+        reason: Optional[str],
+        expected_version: int | None,
+    ) -> bool:
+        logger.info("🛑 Stopping Strategy: %s", strategy_id)
+        with self._runtime_registration_lock, self._market_processing_lock:
+            if (
+                self._portfolio_coordinator.portfolio_id_for_sleeve(strategy_id)
+                is not None
+            ):
+                raise ValueError(
+                    "portfolio sleeves must be controlled through the portfolio ID"
+                )
+            try:
+                transition_kwargs = {
+                    "actor": actor,
+                    "reason": reason,
+                }
+                if expected_version is not None:
+                    transition_kwargs["expected_version"] = expected_version
+                self._strategy_state_manager.transition_to_stopped(
+                    strategy_id,
+                    **transition_kwargs,
+                )
+            except (KeyError, InvalidStrategyStateTransition):
+                logger.warning("Strategy %s is not active.", strategy_id)
+                return False
+
+            if not self._unregister_runtime_artifact_locked(strategy_id):
+                logger.warning(
+                    "Strategy %s runtime was already absent; "
+                    "durable state reconciled.",
+                    strategy_id,
+                )
 
         logger.info("✅ Strategy %s stopped.", strategy_id)
+        return True
 
     def stop_strategy(self, strategy_id: str):
         """Backward-compatible wrapper for legacy callers."""
@@ -2242,23 +2512,26 @@ class StrategyEngine:
     def _unregister_runtime_artifact(self, runtime_id: str) -> bool:
         """Remove a parent portfolio or one standalone strategy."""
         with self._runtime_registration_lock, self._market_processing_lock:
-            definition = self._portfolio_coordinator.unregister(runtime_id)
-            if definition is not None:
-                for sleeve in definition.sleeves:
-                    self._unregister_strategy_instance(
-                        sleeve.strategy.strategy_id
-                    )
-                with self._strategy_lock:
-                    self.portfolio_instances.pop(runtime_id, None)
-                return True
-            if (
-                self._portfolio_coordinator.portfolio_id_for_sleeve(runtime_id)
-                is not None
-            ):
-                raise ValueError(
-                    "portfolio sleeves must be controlled through the portfolio ID"
+            return self._unregister_runtime_artifact_locked(runtime_id)
+
+    def _unregister_runtime_artifact_locked(self, runtime_id: str) -> bool:
+        definition = self._portfolio_coordinator.unregister(runtime_id)
+        if definition is not None:
+            for sleeve in definition.sleeves:
+                self._unregister_strategy_instance(
+                    sleeve.strategy.strategy_id
                 )
-            return self._unregister_strategy_instance(runtime_id)
+            with self._strategy_lock:
+                self.portfolio_instances.pop(runtime_id, None)
+            return True
+        if (
+            self._portfolio_coordinator.portfolio_id_for_sleeve(runtime_id)
+            is not None
+        ):
+            raise ValueError(
+                "portfolio sleeves must be controlled through the portfolio ID"
+            )
+        return self._unregister_strategy_instance(runtime_id)
 
     def _unregister_strategy_instance(self, strategy_id: str) -> bool:
         """Remove a live strategy instance from runtime-only structures."""
@@ -2608,7 +2881,10 @@ class StrategyEngine:
                     )
             self._register_strategy_instance(strategy)
             self._strategy_state_manager.on_state_change_message(
-                {"strategy_id": strategy.strategy_id, "status": StrategyStatus.ACTIVE.value}
+                {
+                    "strategy_id": strategy.strategy_id,
+                    "status": StrategyStatus.ACTIVE.value,
+                }
             )
         logger.info("Registered strategy (legacy): %s for %s", strategy.strategy_id, strategy.product_id)
 

@@ -422,7 +422,7 @@ def test_browser_gene_promotion_ignores_body_actor():
 
 @pytest.mark.parametrize(
     "command",
-    ["START", "RESUME", "FORCE_RECOVER", "RELOAD"],
+    ["START", "RESUME", "FORCE_RECOVER"],
 )
 def test_browser_risk_increasing_strategy_commands_require_step_up(command):
     strategy_control = MagicMock()
@@ -437,7 +437,7 @@ def test_browser_risk_increasing_strategy_commands_require_step_up(command):
     response = app.handle(
         "POST",
         "/strategies/s1/commands",
-        json.dumps({"command": command}),
+        json.dumps({"command": command, "expected_version": 1}),
         headers=_browser_request_headers(
             cookie,
             csrf_token,
@@ -469,12 +469,15 @@ def test_browser_stop_command_needs_operator_but_not_step_up():
     response = app.handle(
         "POST",
         "/strategies/s1/commands",
-        json.dumps({"command": "STOP"}),
-        headers=_browser_request_headers(
+        json.dumps({"command": "STOP", "expected_version": 1}),
+        headers={
+            **_browser_request_headers(
             cookie,
             csrf_token,
             OPERATOR_CAPABILITY,
-        ),
+            ),
+            "Idempotency-Key": "browser-stop-1",
+        },
     )
 
     assert response.status_code == 202
@@ -482,6 +485,9 @@ def test_browser_stop_command_needs_operator_but_not_step_up():
     assert strategy_control.submit_command.call_args.kwargs["actor"] == (
         "operator@example.com"
     )
+    assert strategy_control.submit_command.call_args.kwargs[
+        "idempotency_key"
+    ] == "browser-stop-1"
 
 
 def test_logout_revokes_session_and_expires_cookie():

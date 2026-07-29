@@ -57,7 +57,11 @@ from src.core.interfaces.exchange import (
     ExchangeOrderSnapshot,
     NetworkError,
 )
-from src.core.strategy_state_manager import StrategyStateManager
+from src.core.strategy_state_manager import (
+    InvalidStrategyStateTransition,
+    StaleStrategyStateVersion,
+    StrategyStateManager,
+)
 from src.core.runtime_environment import RuntimeEnvironment
 
 
@@ -1119,6 +1123,7 @@ class TestHandleCommand:
     def test_start_command(self, engine):
         """START command should activate the strategy through lifecycle orchestration."""
         engine.activate_strategy = MagicMock()
+        engine._assert_strategy_command_allowed = MagicMock()
 
         engine._handle_command(
             {
@@ -1136,6 +1141,185 @@ class TestHandleCommand:
             actor="operator@example.com",
             reason="deployment",
         )
+
+    def test_strategy_command_replay_uses_one_idempotent_versioned_transition(
+        self,
+        engine,
+    ):
+        claimed = set()
+
+        def claim_once(key, value, *, nx=False, **kwargs):
+            if nx and key in claimed:
+                return None
+            claimed.add(key)
+            return True
+
+        engine.redis_client.set.side_effect = claim_once
+        engine.activate_strategy = MagicMock()
+        mock_state = MagicMock(status="ERROR", version=3)
+        mock_db = MagicMock()
+        mock_db.query.return_value.filter.return_value.first.return_value = mock_state
+        engine._db_session_factory = lambda: nullcontext(mock_db)
+        command = {
+            "command": "FORCE_RECOVER",
+            "params": {
+                "strategy_id": "strat_1",
+                "actor": "operator@example.com",
+                "expected_version": 3,
+                "idempotency_key": "strategy-recover-1",
+            },
+        }
+
+        engine._handle_command(command)
+        engine._handle_command(command)
+
+        engine.activate_strategy.assert_called_once_with(
+            "strat_1",
+            actor="operator@example.com",
+            force=True,
+            reason=None,
+            expected_version=3,
+        )
+        first_set = engine.redis_client.set.call_args_list[0]
+        assert first_set.args[1] == "claimed"
+        assert first_set.kwargs == {"nx": True, "ex": 60}
+        completed_set = engine.redis_client.set.call_args_list[1]
+        assert completed_set.args[1] == "completed"
+        assert completed_set.kwargs == {"ex": 86_400}
+
+    def test_failed_strategy_command_leaves_only_a_short_claim_lease(
+        self,
+        engine,
+    ):
+        engine.activate_strategy = MagicMock(
+            side_effect=RuntimeError("activation failed")
+        )
+        mock_state = MagicMock(status="READY", version=3)
+        mock_db = MagicMock()
+        mock_db.query.return_value.filter.return_value.first.return_value = mock_state
+        engine._db_session_factory = lambda: nullcontext(mock_db)
+
+        engine._handle_command(
+            {
+                "command": "START",
+                "params": {
+                    "strategy_id": "strat_1",
+                    "expected_version": 3,
+                    "idempotency_key": "strategy-start-fails",
+                },
+            }
+        )
+
+        engine.redis_client.set.assert_called_once()
+        claim = engine.redis_client.set.call_args
+        assert claim.args[1] == "claimed"
+        assert claim.kwargs == {"nx": True, "ex": 60}
+
+    def test_strategy_command_rejects_when_idempotency_claim_fails(
+        self,
+        engine,
+    ):
+        engine.redis_client.set.side_effect = RuntimeError("redis unavailable")
+        engine.activate_strategy = MagicMock()
+        mock_state = MagicMock(status="READY", version=3)
+        mock_db = MagicMock()
+        mock_db.query.return_value.filter.return_value.first.return_value = mock_state
+        engine._db_session_factory = lambda: nullcontext(mock_db)
+
+        engine._handle_command(
+            {
+                "command": "START",
+                "params": {
+                    "strategy_id": "strat_1",
+                    "expected_version": 3,
+                    "idempotency_key": "strategy-start-1",
+                },
+            }
+        )
+
+        engine.activate_strategy.assert_not_called()
+
+    @pytest.mark.parametrize("status", list(StrategyStatus))
+    @pytest.mark.parametrize(
+        "command",
+        ["START", "STOP", "RESUME", "FORCE_RECOVER"],
+    )
+    def test_strategy_command_state_matrix_is_enforced_before_execution(
+        self,
+        engine,
+        status,
+        command,
+    ):
+        expected = {
+            StrategyStatus.DISCOVERED: {"START"},
+            StrategyStatus.READY: {"START"},
+            StrategyStatus.WARNING: {"START"},
+            StrategyStatus.ACTIVE: {"STOP"},
+            StrategyStatus.STOPPED: {"RESUME"},
+            StrategyStatus.ERROR: {"FORCE_RECOVER"},
+        }
+        mock_state = MagicMock(status=status.value, version=3)
+        mock_db = MagicMock()
+        mock_db.query.return_value.filter.return_value.first.return_value = mock_state
+        engine._db_session_factory = lambda: nullcontext(mock_db)
+
+        if command in expected[status]:
+            engine._assert_strategy_command_allowed(
+                strategy_id="strat_1",
+                command=command,
+                expected_version=3,
+            )
+        else:
+            with pytest.raises(InvalidStrategyStateTransition):
+                engine._assert_strategy_command_allowed(
+                    strategy_id="strat_1",
+                    command=command,
+                    expected_version=3,
+                )
+
+    @pytest.mark.parametrize("expected_version", [None, 3])
+    def test_invalid_strategy_command_is_rejected_before_idempotency_claim(
+        self,
+        engine,
+        expected_version,
+    ):
+        engine.activate_strategy = MagicMock()
+        mock_state = MagicMock(status="ACTIVE", version=3)
+        mock_db = MagicMock()
+        mock_db.query.return_value.filter.return_value.first.return_value = mock_state
+        engine._db_session_factory = lambda: nullcontext(mock_db)
+
+        engine._handle_command(
+            {
+                "command": "FORCE_RECOVER",
+                "params": {
+                    "strategy_id": "strat_1",
+                    "expected_version": expected_version,
+                    "idempotency_key": "strategy-recover-active",
+                },
+            }
+        )
+
+        engine.activate_strategy.assert_not_called()
+        engine.redis_client.set.assert_not_called()
+
+    def test_rejected_strategy_activation_is_not_logged_as_success(
+        self,
+        engine,
+        caplog,
+    ):
+        engine.activate_strategy = MagicMock(return_value=False)
+        engine._assert_strategy_command_allowed = MagicMock()
+
+        engine._handle_command(
+            {
+                "command": "START",
+                "params": {"strategy_id": "strat_1"},
+            }
+        )
+
+        assert "strategy activation rejected: strat_1" in caplog.text
+        assert "Command START succeeded" not in caplog.text
 
     def test_kill_switch_replays_completed_idempotency_key_once(self, engine):
         redis_state = {}
@@ -1291,6 +1475,7 @@ class TestHandleCommand:
     def test_stop_command(self, engine):
         """STOP command should deactivate the strategy through lifecycle orchestration."""
         engine.deactivate_strategy = MagicMock()
+        engine._assert_strategy_command_allowed = MagicMock()
 
         engine._handle_command({
             "command": "STOP",
@@ -1306,6 +1491,7 @@ class TestHandleCommand:
     def test_resume_command_forces_activation(self, engine):
         """RESUME command should pass force and reason to lifecycle orchestration."""
         engine.activate_strategy = MagicMock()
+        engine._assert_strategy_command_allowed = MagicMock()
 
         engine._handle_command({
             "cmd": "RESUME",
@@ -1323,6 +1509,7 @@ class TestHandleCommand:
     def test_force_recover_command_forces_activation(self, engine):
         """FORCE_RECOVER command should pass force and reason to lifecycle orchestration."""
         engine.activate_strategy = MagicMock()
+        engine._assert_strategy_command_allowed = MagicMock()
 
         engine._handle_command({
             "cmd": "FORCE_RECOVER",
@@ -1471,17 +1658,22 @@ class TestScanStrategies:
     def test_scan_marks_load_errors(self, engine):
         """Strategy with LoadError should get ERROR status in DB."""
         mock_state = MagicMock()
+        mock_state.version = 3
         mock_db = MagicMock()
         mock_db.query.return_value.filter.return_value.first.return_value = mock_state
         engine._db_session_factory = lambda: nullcontext(mock_db)
+        engine._strategy_state_manager.transition_to_error = MagicMock()
 
         with patch("src.core.engine.StrategyLoader.scan_directory") as mock_scan:
             mock_scan.return_value = {"bad.py::LoadError": "traceback string"}
             engine.scan_strategies()
 
-        assert mock_state.status == "ERROR"
-        assert "traceback string" in mock_state.last_error_message
-        assert mock_state.entered_error_at is not None
+        engine._strategy_state_manager.transition_to_error.assert_called_once_with(
+            "bad.py::LoadError",
+            "traceback string",
+            actor="system",
+            expected_version=3,
+        )
 
 
 class TestStartStrategy:
@@ -1513,6 +1705,109 @@ class TestStartStrategy:
             with pytest.raises(ValueError):
                 engine._strategy_product_id({"product_id": product_id})
 
+
+    def test_stale_expected_version_rejects_before_runtime_mutation(
+        self,
+        engine,
+        mock_strategy_class,
+    ):
+        engine.loaded_classes["test.py::MyStrat"] = mock_strategy_class
+        engine._warm_up_strategy_instance = MagicMock()
+        engine._register_strategy_instance = MagicMock()
+        engine._strategy_state_manager.transition_to_running = MagicMock()
+        mock_state = MagicMock()
+        mock_state.version = 4
+        mock_db = MagicMock()
+        mock_db.query.return_value.filter.return_value.first.return_value = (
+            mock_state
+        )
+        engine._db_session_factory = lambda: nullcontext(mock_db)
+
+        with pytest.raises(
+            StaleStrategyStateVersion,
+            match="expected version 3, found 4",
+        ):
+            engine.activate_strategy(
+                "test.py::MyStrat",
+                force=True,
+                expected_version=3,
+            )
+
+        engine._warm_up_strategy_instance.assert_not_called()
+        engine._register_strategy_instance.assert_not_called()
+        engine._strategy_state_manager.transition_to_running.assert_not_called()
+
+    def test_concurrent_start_with_same_version_keeps_winner_registered(
+        self,
+        engine,
+        mock_strategy_class,
+    ):
+        strategy_id = "test.py::MyStrat"
+        engine.loaded_classes[strategy_id] = mock_strategy_class
+        state = MagicMock(
+            status=StrategyStatus.READY,
+            version=3,
+            config_json='{"product_id":"BINANCE:BTCUSDT-PERP"}',
+        )
+        mock_db = MagicMock()
+        mock_db.query.return_value.filter.return_value.first.return_value = state
+        engine._db_session_factory = lambda: nullcontext(mock_db)
+
+        warmup_started = threading.Event()
+        second_warmup_started = threading.Event()
+        finish_warmup = threading.Event()
+        warmup_calls = 0
+
+        def warm_up(*_args):
+            nonlocal warmup_calls
+            warmup_calls += 1
+            if warmup_calls == 1:
+                warmup_started.set()
+            else:
+                second_warmup_started.set()
+            assert finish_warmup.wait(timeout=1)
+
+        def transition_to_running(*_args, **_kwargs):
+            state.status = StrategyStatus.ACTIVE
+            state.version = 4
+
+        engine._warm_up_strategy_instance = MagicMock(side_effect=warm_up)
+        engine._strategy_state_manager.transition_to_running = MagicMock(
+            side_effect=transition_to_running
+        )
+
+        results = []
+        errors = []
+
+        def activate():
+            try:
+                results.append(
+                    engine.activate_strategy(
+                        strategy_id,
+                        expected_version=3,
+                    )
+                )
+            except Exception as error:
+                errors.append(error)
+
+        first = threading.Thread(target=activate)
+        second = threading.Thread(target=activate)
+        first.start()
+        assert warmup_started.wait(timeout=1)
+        second.start()
+        assert second_warmup_started.wait(timeout=0.1) is False
+        assert engine._warm_up_strategy_instance.call_count == 1
+        finish_warmup.set()
+        first.join(timeout=1)
+        second.join(timeout=1)
+
+        assert not first.is_alive()
+        assert not second.is_alive()
+        assert results == [True]
+        assert len(errors) == 1
+        assert isinstance(errors[0], StaleStrategyStateVersion)
+        assert state.status == StrategyStatus.ACTIVE
+        assert strategy_id in engine.strategy_instances
 
     def test_start_unloaded_strategy_does_nothing(self, engine):
         """Starting an unloaded strategy should return early."""
@@ -1718,8 +2013,123 @@ class TestStopStrategy:
 
     def test_stop_inactive_strategy_warns(self, engine):
         """Stopping a non-active strategy should not crash."""
+        mock_db = MagicMock()
+        mock_db.query.return_value.filter.return_value.first.return_value = None
+        engine._db_session_factory = lambda: nullcontext(mock_db)
+
         engine.stop_strategy("nonexistent")
         # Should complete without error
+
+    def test_stop_reconciles_active_state_when_runtime_is_missing(self, engine):
+        state = MagicMock(status=StrategyStatus.ACTIVE, version=3)
+        mock_db = MagicMock()
+        mock_db.query.return_value.filter.return_value.first.return_value = state
+        engine._db_session_factory = lambda: nullcontext(mock_db)
+        engine._strategy_state_manager.transition_to_stopped = MagicMock()
+
+        stopped = engine.deactivate_strategy(
+            "missing-runtime",
+            expected_version=3,
+        )
+
+        assert stopped is True
+        engine._strategy_state_manager.transition_to_stopped.assert_called_once_with(
+            "missing-runtime",
+            actor="operator",
+            reason=None,
+            expected_version=3,
+        )
+
+    def test_stop_transition_failure_keeps_active_runtime_registered(
+        self,
+        engine,
+        strategy_instance,
+    ):
+        engine.add_strategy(strategy_instance)
+        state = MagicMock(status=StrategyStatus.ACTIVE, version=3)
+        mock_db = MagicMock()
+        mock_db.query.return_value.filter.return_value.first.return_value = state
+        engine._db_session_factory = lambda: nullcontext(mock_db)
+        engine._strategy_state_manager.transition_to_stopped = MagicMock(
+            side_effect=RuntimeError("database unavailable")
+        )
+
+        with pytest.raises(RuntimeError, match="database unavailable"):
+            engine.deactivate_strategy("test_strat", expected_version=3)
+
+        assert engine.strategy_instances["test_strat"] is strategy_instance
+
+    def test_stop_blocks_market_processing_until_runtime_is_removed(
+        self,
+        engine,
+        strategy_instance,
+    ):
+        engine.add_strategy(strategy_instance)
+        transition_started = threading.Event()
+        release_transition = threading.Event()
+        market_attempted = threading.Event()
+        market_finished = threading.Event()
+        active_at_decision = []
+
+        def transition_to_stopped(*_args, **_kwargs):
+            transition_started.set()
+            assert release_transition.wait(timeout=1)
+
+        def observe_active_strategies(_candle):
+            active_at_decision.extend(
+                strategy.strategy_id
+                for strategy in engine._registry.list_active()
+            )
+
+        engine._strategy_state_manager.transition_to_stopped = MagicMock(
+            side_effect=transition_to_stopped
+        )
+        engine._signal_processor.on_candle = MagicMock(
+            side_effect=observe_active_strategies
+        )
+
+        def process_market():
+            market_attempted.set()
+            engine.on_market_data(_make_candle())
+            market_finished.set()
+
+        stop_thread = threading.Thread(
+            target=engine.deactivate_strategy,
+            args=("test_strat",),
+        )
+        market_thread = threading.Thread(target=process_market)
+        stop_thread.start()
+        assert transition_started.wait(timeout=1)
+        market_thread.start()
+        assert market_attempted.wait(timeout=1)
+        assert market_finished.wait(timeout=0.05) is False
+        assert engine._signal_processor.on_candle.call_count == 0
+
+        release_transition.set()
+        stop_thread.join(timeout=1)
+        market_thread.join(timeout=1)
+
+        assert not stop_thread.is_alive()
+        assert not market_thread.is_alive()
+        assert market_finished.is_set()
+        assert active_at_decision == []
+
+    def test_stop_rejects_portfolio_sleeve_before_state_transition(
+        self,
+        engine,
+    ):
+        engine._portfolio_coordinator.portfolio_id_for_sleeve = MagicMock(
+            return_value="portfolio-1"
+        )
+        engine._strategy_state_manager.transition_to_stopped = MagicMock()
+
+        with pytest.raises(
+            ValueError,
+            match="portfolio sleeves must be controlled",
+        ):
+            engine.deactivate_strategy("portfolio-1.sleeve-1")
+
+        engine._strategy_state_manager.transition_to_stopped.assert_not_called()
 
 
 class TestTestRunStrategy:
@@ -1735,14 +2145,22 @@ class TestTestRunStrategy:
 
         mock_state = MagicMock()
         mock_state.config_json = '{"product_id":"BINANCE:BTCUSDT-PERP"}'
+        mock_state.version = 3
         mock_db = MagicMock()
         mock_db.query.return_value.filter.return_value.first.return_value = mock_state
         engine._db_session_factory = lambda: nullcontext(mock_db)
+        engine._strategy_state_manager.transition_to_status = MagicMock()
 
         with patch("src.core.engine.check_data_availability", return_value=(True, "")):
             engine.test_run_strategy("test.py::MyStrat", 1)
 
-        assert mock_state.status == "READY"
+        engine._strategy_state_manager.transition_to_status.assert_called_once_with(
+            "test.py::MyStrat",
+            StrategyStatus.READY,
+            actor="system",
+            reason="test_run_completed",
+            expected_version=3,
+        )
 
     def test_test_run_data_insufficient_sets_warning(self, engine, mock_strategy_class):
         """When data is insufficient, strategy should be set to WARNING."""
@@ -1750,14 +2168,22 @@ class TestTestRunStrategy:
 
         mock_state = MagicMock()
         mock_state.config_json = '{"product_id":"BINANCE:BTCUSDT-PERP"}'
+        mock_state.version = 3
         mock_db = MagicMock()
         mock_db.query.return_value.filter.return_value.first.return_value = mock_state
         engine._db_session_factory = lambda: nullcontext(mock_db)
+        engine._strategy_state_manager.transition_to_status = MagicMock()
 
         with patch("src.core.engine.check_data_availability", return_value=(False, "docker exec ...")):
             engine.test_run_strategy("test.py::MyStrat", 1)
 
-        assert mock_state.status == "WARNING"
+        engine._strategy_state_manager.transition_to_status.assert_called_once_with(
+            "test.py::MyStrat",
+            StrategyStatus.WARNING,
+            actor="system",
+            reason="insufficient_data",
+            expected_version=3,
+        )
 
     def test_test_run_exception_sets_error_metadata(self, engine):
         """Warm-up failures should satisfy ERROR state metadata constraints."""
@@ -1769,15 +2195,24 @@ class TestTestRunStrategy:
 
         mock_state = MagicMock()
         mock_state.config_json = '{"product_id":"BINANCE:BTCUSDT-PERP"}'
+        mock_state.version = 3
         mock_db = MagicMock()
         mock_db.query.return_value.filter.return_value.first.return_value = mock_state
         engine._db_session_factory = lambda: nullcontext(mock_db)
+        engine._strategy_state_manager.transition_to_error = MagicMock()
 
         engine.test_run_strategy("test.py::FailingStrat", 1)
 
-        assert mock_state.status == "ERROR"
-        assert "warm-up failed" in mock_state.last_error_message
-        assert mock_state.entered_error_at is not None
+        engine._strategy_state_manager.transition_to_error.assert_called_once()
+        args = engine._strategy_state_manager.transition_to_error.call_args.args
+        assert args[0] == "test.py::FailingStrat"
+        assert "warm-up failed" in args[1]
+        assert (
+            engine._strategy_state_manager.transition_to_error.call_args.kwargs[
+                "expected_version"
+            ]
+            == 3
+        )
 
 
 class TestStrategyWarmup:
@@ -1938,6 +2373,7 @@ class TestStrategyWarmup:
         state = MagicMock()
         state.status = StrategyStatus.READY
         state.config_json = '{"product_id":"BINANCE:BTCUSDT-PERP"}'
+        state.version = 3
         rows = [
             ORMCandlestick(
                 product_id="BINANCE:BTCUSDT-PERP",
@@ -1957,12 +2393,54 @@ class TestStrategyWarmup:
         engine._strategy_state_manager.transition_to_running = MagicMock()
         engine._strategy_state_manager.transition_to_error = MagicMock()
 
-        engine.activate_strategy("test.py::FailingWarmupStrategy")
+        engine.activate_strategy(
+            "test.py::FailingWarmupStrategy",
+            expected_version=3,
+        )
 
         assert "test.py::FailingWarmupStrategy" not in engine.strategy_instances
         engine._strategy_state_manager.transition_to_running.assert_not_called()
-        engine._strategy_state_manager.transition_to_error.assert_called_once()
+        engine._strategy_state_manager.transition_to_error.assert_called_once_with(
+            "test.py::FailingWarmupStrategy",
+            "warm-up replay failed",
+            actor="system",
+            expected_version=3,
+        )
         assert "warm-up replay failed" in state.performance_json
+
+    def test_activation_keeps_runtime_when_state_notification_fails(
+        self,
+        engine,
+        mock_strategy_class,
+    ):
+        state = MagicMock(
+            status=StrategyStatus.READY,
+            version=3,
+            config_json='{"product_id":"BINANCE:BTCUSDT-PERP"}',
+        )
+        query = MagicMock()
+        query.filter.return_value.first.return_value = state
+        query.filter_by.return_value.first.return_value = state
+        query.filter_by.return_value.filter.return_value.update.return_value = 1
+        mock_db = MagicMock()
+        mock_db.query.return_value = query
+        engine._db_session_factory = lambda: nullcontext(mock_db)
+        engine._strategy_state_manager = StrategyStateManager(
+            engine._db_session_factory,
+            engine.redis_client,
+        )
+        engine.redis_client.publish.side_effect = RuntimeError("redis unavailable")
+        engine.loaded_classes["test.py::MyStrat"] = mock_strategy_class
+        engine._warm_up_strategy_instance = MagicMock(return_value=0)
+
+        activated = engine.activate_strategy(
+            "test.py::MyStrat",
+            expected_version=3,
+        )
+
+        assert activated is True
+        assert "test.py::MyStrat" in engine.strategy_instances
+        assert engine._strategy_state_manager.is_running("test.py::MyStrat")
 
     def test_activate_strategy_fails_closed_when_warmup_data_is_insufficient(self, engine):
         """Warm-up must have the declared lookback before activation."""

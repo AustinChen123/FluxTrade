@@ -126,7 +126,27 @@ def test_transition_to_stopped_updates_db_cache_history_and_pubsub() -> None:
     assert transition.actor == "operator"
     channel, message = redis_client.publish.call_args.args
     assert channel == STATE_CHANGE_CHANNEL
-    assert json.loads(message)["status"] == StrategyStatus.STOPPED.value
+    payload = json.loads(message)
+    assert set(payload) == {"strategy_id", "status", "timestamp"}
+    assert payload["strategy_id"] == "s1"
+    assert payload["status"] == StrategyStatus.STOPPED.value
+    assert payload["timestamp"] == pytest.approx(time.time() * 1000, abs=1000)
+
+
+def test_publish_failure_does_not_undo_committed_transition() -> None:
+    redis_client = MagicMock()
+    redis_client.publish.side_effect = RuntimeError("redis unavailable")
+    db = _FakeSession([_state("s1", StrategyStatus.ACTIVE)])
+    manager = _manager(db, redis_client)
+    manager.initialize_cache_from_db()
+
+    manager.transition_to_stopped("s1", expected_version=0)
+
+    assert db.commit_count == 1
+    assert db.states["s1"].status == StrategyStatus.STOPPED.value
+    assert db.states["s1"].version == 1
+    assert manager.is_stopped("s1") is True
+    assert len(db.transitions) == 1
 
 
 def test_transition_to_error_records_error_metadata() -> None:
@@ -139,6 +159,28 @@ def test_transition_to_error_records_error_metadata() -> None:
     assert db.states["s1"].last_error_message == "daily loss exceeded"
     assert db.states["s1"].entered_error_at is not None
     assert manager.is_error("s1") is True
+
+
+def test_system_status_transition_increments_version() -> None:
+    db = _FakeSession([_state("s1", StrategyStatus.DISCOVERED)])
+    manager = _manager(db)
+
+    manager.transition_to_status(
+        "s1",
+        StrategyStatus.READY,
+        reason="test_run_completed",
+        expected_version=0,
+    )
+
+    assert db.states["s1"].status == StrategyStatus.READY.value
+    assert db.states["s1"].version == 1
+    assert db.transitions[0].actor == "system"
+    with pytest.raises(StaleStrategyStateVersion):
+        manager.transition_to_status(
+            "s1",
+            StrategyStatus.WARNING,
+            expected_version=0,
+        )
 
 
 def test_error_state_requires_force_to_resume() -> None:
@@ -181,6 +223,25 @@ def test_stale_version_rolls_back_and_raises() -> None:
     redis_client.publish.assert_not_called()
 
 
+def test_caller_expected_version_rejects_stale_transition() -> None:
+    redis_client = MagicMock()
+    db = _FakeSession([_state("s1", StrategyStatus.ERROR)])
+    db.states["s1"].version = 4
+    manager = _manager(db, redis_client)
+
+    with pytest.raises(StaleStrategyStateVersion, match="expected version 3, found 4"):
+        manager.transition_to_running(
+            "s1",
+            force=True,
+            expected_version=3,
+        )
+
+    assert db.commit_count == 0
+    assert db.states["s1"].status == StrategyStatus.ERROR.value
+    assert db.transitions == []
+    redis_client.publish.assert_not_called()
+
+
 def test_missing_strategy_raises_key_error() -> None:
     db = _FakeSession([])
     manager = _manager(db)
@@ -194,17 +255,61 @@ def test_on_state_change_message_updates_cache() -> None:
     manager = _manager(db)
 
     manager.on_state_change_message(
-        {"strategy_id": "s1", "status": StrategyStatus.STOPPED.value}
+        {
+            "strategy_id": "s1",
+            "status": StrategyStatus.STOPPED.value,
+        }
     )
 
     assert manager.is_stopped("s1") is True
 
 
-def test_on_state_change_message_ignores_malformed_message() -> None:
+def test_in_process_state_message_replaces_initialized_cache() -> None:
+    state = _state("s1", StrategyStatus.STOPPED)
+    state.version = 3
+    db = _FakeSession([state])
+    manager = _manager(db)
+    manager.initialize_cache_from_db()
+
+    manager.on_state_change_message(
+        {
+            "strategy_id": "s1",
+            "status": StrategyStatus.ACTIVE.value,
+        }
+    )
+
+    assert manager.is_running("s1") is True
+
+
+def test_local_cache_rejects_a_late_older_transition() -> None:
+    manager = _manager(_FakeSession([]))
+
+    manager._apply_cached_state("s1", StrategyStatus.ACTIVE, 5)
+    applied = manager._apply_cached_state("s1", StrategyStatus.STOPPED, 4)
+
+    assert applied is False
+    assert manager.is_running("s1") is True
+
+
+@pytest.mark.parametrize(
+    "message",
+    [
+        {"strategy_id": "s1"},
+        {
+            "strategy_id": "s1",
+            "status": [],
+        },
+        {
+            "strategy_id": "",
+            "status": StrategyStatus.ACTIVE.value,
+        },
+    ],
+)
+def test_on_state_change_message_ignores_malformed_message(message: dict) -> None:
     db = _FakeSession([])
     manager = _manager(db)
 
-    manager.on_state_change_message({"strategy_id": "s1"})
+    manager.on_state_change_message(message)
 
     assert manager.get_status("s1") is None
 
@@ -248,14 +353,17 @@ def test_start_subscriber_spawns_daemon_and_subscribes() -> None:
     assert pubsub.closed.wait(timeout=1)
 
 
-def test_subscriber_applies_json_state_change_message() -> None:
-    db = _FakeSession([])
+def test_subscriber_refreshes_authoritative_db_instead_of_stale_payload() -> None:
+    db = _FakeSession([_state("s1", StrategyStatus.ACTIVE)])
     pubsub = _FakePubSub(
         [
             {
                 "type": "message",
                 "data": json.dumps(
-                    {"strategy_id": "s1", "status": StrategyStatus.ACTIVE.value}
+                    {
+                        "strategy_id": "s1",
+                        "status": StrategyStatus.STOPPED.value,
+                    }
                 ),
             }
         ]
@@ -274,14 +382,17 @@ def test_subscriber_applies_json_state_change_message() -> None:
 
 
 def test_subscriber_ignores_malformed_json_and_continues() -> None:
-    db = _FakeSession([])
+    db = _FakeSession([_state("s1", StrategyStatus.STOPPED)])
     pubsub = _FakePubSub(
         [
             {"type": "message", "data": "not-json"},
             {
                 "type": "message",
                 "data": json.dumps(
-                    {"strategy_id": "s1", "status": StrategyStatus.STOPPED.value}
+                    {
+                        "strategy_id": "s1",
+                        "status": StrategyStatus.STOPPED.value,
+                    }
                 ),
             },
         ]

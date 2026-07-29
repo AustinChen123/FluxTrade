@@ -8,6 +8,7 @@ from sqlalchemy import func, or_
 
 from src.control_plane.backtest_jobs import SessionFactory
 from src.core.orm_models import StrategyState, StrategyStateTransition
+from src.core.strategy_state_manager import available_strategy_commands
 
 
 class StrategyStateQueryService:
@@ -111,6 +112,7 @@ def _state_payload(state: StrategyState) -> dict[str, Any]:
         "recovered_at": _iso_or_none(state.recovered_at),
         "stopped_at": _iso_or_none(state.stopped_at),
         "version": state.version,
+        "available_commands": list(available_strategy_commands(state.status)),
     }
 
 

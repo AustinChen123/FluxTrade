@@ -66,8 +66,24 @@ class CommandRouter:
         if command in {"START", "STOP", "RESUME", "FORCE_RECOVER", "RELOAD"}:
             if not strategy_id:
                 return CommandResult(False, f"{command} requires strategy_id")
+            expected_version = params.get("expected_version")
+            if expected_version is not None and (
+                isinstance(expected_version, bool)
+                or not isinstance(expected_version, int)
+                or expected_version < 0
+            ):
+                return CommandResult(False, "expected_version must be a non-negative integer")
             return handler(str(strategy_id), params, message)
         return handler()
+
+    @staticmethod
+    def _expected_version_kwargs(params: dict) -> dict:
+        expected_version = params.get("expected_version")
+        return (
+            {}
+            if expected_version is None
+            else {"expected_version": expected_version}
+        )
 
     def _handle_start(self, strategy_id: str, params: dict, message: dict) -> CommandResult:
         actor = params.get("actor", "operator")
@@ -76,6 +92,7 @@ class CommandRouter:
             strategy_id,
             actor=actor,
             reason=reason,
+            **self._expected_version_kwargs(params),
         )
         return CommandResult(True, f"Started strategy {strategy_id}")
 
@@ -86,6 +103,7 @@ class CommandRouter:
             strategy_id,
             actor=actor,
             reason=reason,
+            **self._expected_version_kwargs(params),
         )
         return CommandResult(True, f"Stopped strategy {strategy_id}")
 
@@ -97,6 +115,7 @@ class CommandRouter:
             actor=actor,
             force=True,
             reason=reason,
+            **self._expected_version_kwargs(params),
         )
         return CommandResult(True, f"Resumed strategy {strategy_id}")
 
@@ -108,14 +127,15 @@ class CommandRouter:
             actor=actor,
             force=True,
             reason=reason,
+            **self._expected_version_kwargs(params),
         )
         return CommandResult(True, f"Force recovered strategy {strategy_id}")
 
     def _handle_reload(self, strategy_id: str, params: dict, message: dict) -> CommandResult:
         logger.warning("Strategy reload is not implemented yet: %s", strategy_id)
         return CommandResult(
-            True,
-            f"Reload queued for later implementation: {strategy_id}",
+            False,
+            f"Strategy reload is not implemented: {strategy_id}",
         )
 
     def _handle_list(self) -> CommandResult:

@@ -17,6 +17,23 @@ from src.core.orm_models import StrategyState, StrategyStateTransition
 logger = logging.getLogger(__name__)
 
 STATE_CHANGE_CHANNEL = "strategy_state_changes"
+_COMMANDS_BY_STATUS = {
+    StrategyStatus.DISCOVERED: ("START",),
+    StrategyStatus.READY: ("START",),
+    StrategyStatus.WARNING: ("START",),
+    StrategyStatus.ACTIVE: ("STOP",),
+    StrategyStatus.STOPPED: ("RESUME",),
+    StrategyStatus.ERROR: ("FORCE_RECOVER",),
+}
+
+
+def available_strategy_commands(
+    status: StrategyStatus | str,
+) -> tuple[str, ...]:
+    try:
+        return _COMMANDS_BY_STATUS.get(StrategyStatus(status), ())
+    except ValueError:
+        return ()
 
 
 class InvalidStrategyStateTransition(RuntimeError):
@@ -38,6 +55,7 @@ class StrategyStateManager:
         self._db_session_factory = db_session_factory
         self._redis_client = redis_client
         self._cache: dict[str, StrategyStatus] = {}
+        self._cache_versions: dict[str, int] = {}
         self._lock = threading.Lock()
         self._subscriber_stop = threading.Event()
         self._subscriber_thread: threading.Thread | None = None
@@ -50,6 +68,10 @@ class StrategyStateManager:
         with self._lock:
             self._cache = {
                 state.strategy_id: StrategyStatus(state.status)
+                for state in states
+            }
+            self._cache_versions = {
+                state.strategy_id: int(state.version or 0)
                 for state in states
             }
 
@@ -73,6 +95,7 @@ class StrategyStateManager:
         actor: str = "operator",
         force: bool = False,
         reason: Optional[str] = None,
+        expected_version: int | None = None,
     ) -> None:
         self._transition(
             strategy_id,
@@ -80,6 +103,7 @@ class StrategyStateManager:
             actor=actor,
             force=force,
             reason=reason,
+            expected_version=expected_version,
         )
 
     def transition_to_stopped(
@@ -88,12 +112,14 @@ class StrategyStateManager:
         *,
         actor: str = "operator",
         reason: Optional[str] = None,
+        expected_version: int | None = None,
     ) -> None:
         self._transition(
             strategy_id,
             StrategyStatus.STOPPED,
             actor=actor,
             reason=reason,
+            expected_version=expected_version,
         )
 
     def transition_to_error(
@@ -102,24 +128,95 @@ class StrategyStateManager:
         reason: str,
         *,
         actor: str = "system",
+        expected_version: int | None = None,
     ) -> None:
         self._transition(
             strategy_id,
             StrategyStatus.ERROR,
             actor=actor,
             reason=reason,
+            expected_version=expected_version,
+        )
+
+    def transition_to_status(
+        self,
+        strategy_id: str,
+        status: StrategyStatus,
+        *,
+        actor: str = "system",
+        reason: Optional[str] = None,
+        expected_version: int | None = None,
+    ) -> None:
+        self._transition(
+            strategy_id,
+            status,
+            actor=actor,
+            reason=reason,
+            expected_version=expected_version,
         )
 
     def on_state_change_message(self, message: dict) -> None:
-        """Apply a pub/sub state-change message to the local cache."""
+        """Apply an in-process state change to the local cache."""
+        parsed = self._parse_state_change_message(message)
+        if parsed is not None:
+            self._set_unversioned_cached_state(*parsed)
+
+    @staticmethod
+    def _parse_state_change_message(
+        message: dict,
+    ) -> tuple[str, StrategyStatus] | None:
         strategy_id = message.get("strategy_id")
         status = message.get("status")
         if not strategy_id or not status:
             logger.warning("Ignoring malformed strategy state message: %s", message)
-            return
+            return None
+        try:
+            return str(strategy_id), StrategyStatus(status)
+        except (TypeError, ValueError):
+            logger.warning("Ignoring malformed strategy state message: %s", message)
+            return None
 
+    def _refresh_cached_state_from_db(self, strategy_id: str) -> None:
+        with self._db_session_factory() as db:
+            state = (
+                db.query(StrategyState)
+                .filter_by(strategy_id=strategy_id)
+                .first()
+            )
+        if state is None:
+            logger.warning(
+                "Ignoring strategy state message for unknown strategy: %s",
+                strategy_id,
+            )
+            return
+        self._apply_cached_state(
+            strategy_id,
+            StrategyStatus(state.status),
+            int(state.version or 0),
+        )
+
+    def _set_unversioned_cached_state(
+        self,
+        strategy_id: str,
+        status: StrategyStatus,
+    ) -> None:
         with self._lock:
-            self._cache[str(strategy_id)] = StrategyStatus(status)
+            self._cache[strategy_id] = status
+            self._cache_versions.pop(strategy_id, None)
+
+    def _apply_cached_state(
+        self,
+        strategy_id: str,
+        status: StrategyStatus,
+        version: int,
+    ) -> bool:
+        with self._lock:
+            current_version = self._cache_versions.get(strategy_id)
+            if current_version is not None and version < current_version:
+                return False
+            self._cache[strategy_id] = status
+            self._cache_versions[strategy_id] = version
+            return True
 
     def start_subscriber(self) -> None:
         """Start a daemon Redis subscriber for cross-process state changes."""
@@ -150,7 +247,9 @@ class StrategyStateManager:
                     if not message or message.get("type") != "message":
                         continue
                     payload = self._decode_state_change_message(message.get("data"))
-                    self.on_state_change_message(payload)
+                    parsed = self._parse_state_change_message(payload)
+                    if parsed is not None:
+                        self._refresh_cached_state_from_db(parsed[0])
                 except json.JSONDecodeError as e:
                     logger.warning("Ignoring malformed strategy state message: %s", e)
                 except Exception:
@@ -179,6 +278,7 @@ class StrategyStateManager:
         actor: str,
         reason: Optional[str],
         force: bool = False,
+        expected_version: int | None = None,
     ) -> None:
         now = datetime.now(UTC)
         with self._db_session_factory() as db:
@@ -192,10 +292,18 @@ class StrategyStateManager:
                     f"{strategy_id} is in ERROR and requires force=True to resume"
                 )
 
-            expected_version = int(state.version or 0)
+            current_version = int(state.version or 0)
+            if (
+                expected_version is not None
+                and current_version != expected_version
+            ):
+                raise StaleStrategyStateVersion(
+                    f"{strategy_id} expected version {expected_version}, "
+                    f"found {current_version}"
+                )
             update_values = {
                 "status": to_status.value,
-                "version": expected_version + 1,
+                "version": current_version + 1,
             }
             if to_status == StrategyStatus.ERROR:
                 update_values["last_error_message"] = reason
@@ -209,13 +317,13 @@ class StrategyStateManager:
             updated = (
                 db.query(StrategyState)
                 .filter_by(strategy_id=strategy_id)
-                .filter(StrategyState.version == expected_version)
+                .filter(StrategyState.version == current_version)
                 .update(update_values, synchronize_session=False)
             )
             if updated != 1:
                 db.rollback()
                 raise StaleStrategyStateVersion(
-                    f"{strategy_id} expected version {expected_version}"
+                    f"{strategy_id} expected version {current_version}"
                 )
 
             db.add(
@@ -230,9 +338,23 @@ class StrategyStateManager:
             )
             db.commit()
 
-        with self._lock:
-            self._cache[strategy_id] = to_status
-        self._publish_state_change(strategy_id, to_status, now)
+        self._apply_cached_state(
+            strategy_id,
+            to_status,
+            current_version + 1,
+        )
+        try:
+            self._publish_state_change(
+                strategy_id,
+                to_status,
+                now,
+            )
+        except Exception:
+            logger.exception(
+                "Failed to publish committed strategy state change: %s -> %s",
+                strategy_id,
+                to_status.value,
+            )
 
     def _publish_state_change(
         self,
