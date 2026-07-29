@@ -293,13 +293,35 @@ def test_portfolio_historical_stream_parity_enforces_batch_gross_limit(
         )
 
 
+class _FakePipeline:
+    def __init__(self, latest_ids):
+        self.latest_ids = latest_ids
+        self.stream_keys = []
+
+    def xrevrange(self, stream_key, *, count):
+        assert count == 1
+        self.stream_keys.append(stream_key)
+        return self
+
+    def execute(self):
+        return [
+            [(self.latest_ids[stream_key], {})] if stream_key in self.latest_ids else []
+            for stream_key in self.stream_keys
+        ]
+
+
 class _FakeRedis:
-    def __init__(self, events):
+    def __init__(self, events, *, latest_ids=None):
         self.events = list(events)
+        self.latest_ids = latest_ids or {}
         self.calls = []
 
+    def pipeline(self, *, transaction):
+        assert transaction is True
+        return _FakePipeline(self.latest_ids)
+
     def xread(self, streams, *, count, block):
-        self.calls.append((streams, count, block))
+        self.calls.append((streams.copy(), count, block))
         if not self.events:
             return []
         stream_key, entry = self.events.pop(0)
@@ -400,6 +422,72 @@ def test_shadow_records_replayable_source_candles_and_complete_decisions():
     assert replay == report
     assert all(call[0] for call in redis.calls)
     assert not hasattr(redis, "xreadgroup")
+
+
+@pytest.mark.parametrize(
+    ("latest_ids", "expected_cursors"),
+    [
+        ({}, {SOURCE_STREAM_KEY: "0-0", DECISION_STREAM_KEY: "0-0"}),
+        (
+            {SOURCE_STREAM_KEY: "1800000000000-0"},
+            {
+                SOURCE_STREAM_KEY: "1800000000000-0",
+                DECISION_STREAM_KEY: "0-0",
+            },
+        ),
+        (
+            {DECISION_STREAM_KEY: "1800000300000-0"},
+            {
+                SOURCE_STREAM_KEY: "0-0",
+                DECISION_STREAM_KEY: "1800000300000-0",
+            },
+        ),
+        (
+            {
+                SOURCE_STREAM_KEY: "1800000000000-0",
+                DECISION_STREAM_KEY: "1800000300000-0",
+            },
+            {
+                SOURCE_STREAM_KEY: "1800000000000-0",
+                DECISION_STREAM_KEY: "1800000300000-0",
+            },
+        ),
+    ],
+)
+def test_shadow_snapshots_initial_stream_cursors(latest_ids, expected_cursors):
+    redis = _FakeRedis(
+        _source_events(range(6))
+        + [(DECISION_STREAM_KEY, _decision_entry(0))],
+        latest_ids=latest_ids,
+    )
+
+    _run_shadow(
+        redis,
+        CloseSignalStrategy("strategy", PRODUCT_ID),
+        io.StringIO(),
+    )
+
+    assert redis.calls[0][0] == expected_cursors
+
+
+def test_shadow_fails_before_capture_when_cursor_snapshot_fails():
+    class _CursorFailureRedis(_FakeRedis):
+        def pipeline(self, *, transaction):
+            assert transaction is True
+            raise ConnectionError("redis unavailable")
+
+    redis = _CursorFailureRedis([])
+    output = io.StringIO()
+
+    with pytest.raises(ConnectionError, match="redis unavailable"):
+        _run_shadow(
+            redis,
+            CloseSignalStrategy("strategy", PRODUCT_ID),
+            output,
+        )
+
+    assert not redis.calls
+    assert output.getvalue() == ""
 
 
 def test_portfolio_shadow_records_and_replays_coordinated_decisions():
