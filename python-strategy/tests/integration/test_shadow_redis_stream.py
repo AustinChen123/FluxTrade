@@ -34,16 +34,41 @@ PRODUCT_ID = "RITHMIC:MNQ-202609"
 
 
 class _ObservedRedis:
-    def __init__(self, client: redis.Redis, reading: threading.Event) -> None:
+    def __init__(
+        self,
+        client: redis.Redis,
+        reading: threading.Event,
+        *,
+        source_stream_key: str | None = None,
+        source_returned: threading.Event | None = None,
+        source_release: threading.Event | None = None,
+    ) -> None:
         self._client = client
         self._reading = reading
+        self._source_stream_key = source_stream_key
+        self._source_returned = source_returned
+        self._source_release = source_release
+
+    def pipeline(self, *args, **kwargs):
+        return self._client.pipeline(*args, **kwargs)
 
     def xread(self, *args, **kwargs):
         self._reading.set()
-        return self._client.xread(*args, **kwargs)
+        response = self._client.xread(*args, **kwargs)
+        observed_streams = {stream for stream, _messages in response}
+        if (
+            self._source_returned is not None
+            and self._source_stream_key in observed_streams
+            and len(observed_streams) == 1
+        ):
+            self._source_returned.set()
+            if self._source_release is not None:
+                if not self._source_release.wait(timeout=1):
+                    raise TimeoutError("source response was not released")
+        return response
 
 
-def test_redis_stream_reaches_rust_aggregate_and_strategy(monkeypatch) -> None:
+def _mark_golden_cross_as_artifact(monkeypatch) -> None:
     monkeypatch.setattr(
         GoldenCrossStrategy,
         "__fluxtrade_display_name__",
@@ -68,6 +93,10 @@ def test_redis_stream_reaches_rust_aggregate_and_strategy(monkeypatch) -> None:
         "0" * 64,
         raising=False,
     )
+
+
+def test_redis_stream_reaches_rust_aggregate_and_strategy(monkeypatch) -> None:
+    _mark_golden_cross_as_artifact(monkeypatch)
     client = redis.Redis.from_url(str(REDIS_URL), decode_responses=True)
     client.ping()
     stream_suffix = uuid.uuid4().hex
@@ -154,6 +183,94 @@ def test_redis_stream_reaches_rust_aggregate_and_strategy(monkeypatch) -> None:
         assert client.xlen(source_stream_key) == 21
         assert client.xlen(decision_stream_key) == 4
     finally:
+        if consumer.is_alive():
+            consumer.join(timeout=3)
+        client.delete(source_stream_key, decision_stream_key)
+        client.close()
+
+
+def test_shadow_does_not_skip_decision_after_source_wakes_reader(
+    monkeypatch,
+) -> None:
+    _mark_golden_cross_as_artifact(monkeypatch)
+    client = redis.Redis.from_url(str(REDIS_URL), decode_responses=True)
+    client.ping()
+    stream_suffix = uuid.uuid4().hex
+    source_stream_key = f"test:shadow:{stream_suffix}:1m"
+    decision_stream_key = f"test:shadow:{stream_suffix}:5m"
+    reading = threading.Event()
+    source_returned = threading.Event()
+    source_release = threading.Event()
+    result: dict[str, object] = {}
+
+    def consume() -> None:
+        try:
+            result["report"] = run_shadow_evidence(
+                _ObservedRedis(
+                    client,
+                    reading,
+                    source_stream_key=source_stream_key,
+                    source_returned=source_returned,
+                    source_release=source_release,
+                ),
+                source_stream_key=source_stream_key,
+                decision_stream_key=decision_stream_key,
+                strategy=GoldenCrossStrategy(
+                    "golden-cross-shadow",
+                    PRODUCT_ID,
+                    short_window=2,
+                    long_window=3,
+                    timeframe="5m",
+                    quantity=Decimal("1"),
+                ),
+                output=io.StringIO(),
+                duration_seconds=2,
+            )
+        except Exception as exc:
+            result["error"] = exc
+
+    start_timestamp = 1_800_000_000_000
+
+    def candle(timeframe: str, minute: int) -> Candlestick:
+        return Candlestick(
+            product_id=PRODUCT_ID,
+            timeframe=timeframe,
+            timestamp=start_timestamp + minute * 60_000,
+            open=Decimal("100"),
+            high=Decimal("101"),
+            low=Decimal("99"),
+            close=Decimal("100"),
+            volume=Decimal("1"),
+        )
+
+    consumer = threading.Thread(target=consume)
+    try:
+        consumer.start()
+        assert reading.wait(timeout=1)
+        client.xadd(
+            source_stream_key,
+            {"json": candle("1m", 0).model_dump_json()},
+        )
+        assert source_returned.wait(timeout=1)
+        client.xadd(
+            decision_stream_key,
+            {"json": candle("5m", 0).model_dump_json()},
+        )
+        source_release.set()
+        for minute in range(1, 6):
+            client.xadd(
+                source_stream_key,
+                {"json": candle("1m", minute).model_dump_json()},
+            )
+
+        consumer.join(timeout=4)
+        assert not consumer.is_alive()
+        assert "error" not in result
+        report = cast(ShadowRunReport, result["report"])
+        assert report.source_candles == 6
+        assert report.completed_candles == 1
+    finally:
+        source_release.set()
         if consumer.is_alive():
             consumer.join(timeout=3)
         client.delete(source_stream_key, decision_stream_key)

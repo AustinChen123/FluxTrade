@@ -434,6 +434,22 @@ def run_portfolio_shadow_evidence(
     )
 
 
+def _initial_stream_cursors(
+    redis_client: Any,
+    stream_keys: tuple[str, ...],
+) -> dict[str, str]:
+    pipeline = redis_client.pipeline(transaction=True)
+    for stream_key in stream_keys:
+        pipeline.xrevrange(stream_key, count=1)
+    snapshots = pipeline.execute()
+    if len(snapshots) != len(stream_keys):
+        raise RuntimeError("shadow stream cursor snapshot was incomplete")
+    return {
+        stream_key: _text(entries[0][0]) if entries else "0-0"
+        for stream_key, entries in zip(stream_keys, snapshots, strict=True)
+    }
+
+
 def _run_shadow_evidence(
     redis_client: Any,
     *,
@@ -463,11 +479,9 @@ def _run_shadow_evidence(
     source_digest = hashlib.sha256()
     completed_digest = hashlib.sha256()
     decision_digest = hashlib.sha256()
+    stream_keys = (source_stream_key, decision_stream_key)
+    last_ids = _initial_stream_cursors(redis_client, stream_keys)
     deadline = monotonic() + duration_seconds
-    last_ids = {
-        source_stream_key: "$",
-        decision_stream_key: "$",
-    }
     source_count = 0
     completed_count = 0
     skipped_decision_prefix_count = 0
