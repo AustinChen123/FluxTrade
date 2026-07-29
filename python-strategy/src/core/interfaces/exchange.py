@@ -142,6 +142,10 @@ class IExchangeAdapter(ABC):
         """
         return self.cancel_order(client_order_id, product_id, order_type=order_type)
 
+    def cancel_terminal_state_delivered_by_order_events(self) -> bool:
+        """Whether a successful cancel still awaits an ordered terminal event."""
+        return False
+
     def get_order_by_client_id(
         self,
         client_order_id: str,

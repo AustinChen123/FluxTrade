@@ -108,6 +108,18 @@ class OrderEventApplier:
                 "status": event.status,
             }
 
+        terminal_failure_state = event_state in {
+            "cancelled",
+            "rejected",
+            "expired",
+            "failed",
+        }
+        if terminal_failure_state and fill_delta["quantity"] == 0:
+            # Keep the parent recoverable until zero-fill child cleanup is
+            # durable. If the process stops between these operations, startup
+            # reconciliation will still query the parent authoritatively.
+            self.fail_pending_conditionals_for_terminal_entry(order)
+
         if fill_delta["quantity"] > 0:
             terminal_status = self._status_for_exchange_event_fill(event_state)
             cumulative_quantity = event.cumulative_filled_quantity or (
@@ -134,8 +146,9 @@ class OrderEventApplier:
         else:
             self._apply_exchange_order_event_status(order, event_state, event)
 
-        if event_state in {"cancelled", "rejected", "expired", "failed"}:
-            self.fail_pending_conditionals_for_terminal_entry(order)
+        if terminal_failure_state:
+            if fill_delta["quantity"] > 0:
+                self.fail_pending_conditionals_for_terminal_entry(order)
             protective_failure = self.protective_terminal_without_fill_failure(order)
             if protective_failure is not None:
                 self.write_conditional_warning(

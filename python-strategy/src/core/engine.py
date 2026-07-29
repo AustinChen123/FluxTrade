@@ -213,7 +213,7 @@ class _EngineLifecycleAdapter:
 class StrategyEngine:
     def __init__(
         self,
-        db_session: Session,
+        db_session: Session | None,
         clock: Clock,
         order_repository: Optional[IOrderRepository] = None,
         account_service: Optional[AccountService] = None,
@@ -222,9 +222,17 @@ class StrategyEngine:
         journal: Optional[StrategyJournal] = None,
         db_session_factory: Optional[Callable[[], ContextManager[Session]]] = None,
         audit_external_orders: bool = False,
+        is_backtest: bool | None = None,
         leadership_guard: Callable[[], None] | None = None,
     ):
-        self._db_session_factory = db_session_factory or (lambda: nullcontext(db_session))
+        if db_session_factory is None:
+            if db_session is None:
+                raise ValueError(
+                    "StrategyEngine requires db_session or db_session_factory"
+                )
+            self._db_session_factory = lambda: nullcontext(db_session)
+        else:
+            self._db_session_factory = db_session_factory
         self.clock = clock
         self.strategies: Dict[str, List[BaseStrategy]] = {}
         self.strategy_instances: Dict[str, BaseStrategy] = {}
@@ -297,6 +305,8 @@ class StrategyEngine:
                 raise
         else:
             logger.info("StrategyEngine: Using provided adapter %s", type(adapter).__name__)
+        if is_backtest is True and not isinstance(adapter, SimulatedAdapter):
+            raise ValueError("backtest mode requires SimulatedAdapter")
         if isinstance(adapter, RithmicExchangeAdapter):
             if not audit_external_orders:
                 raise ValueError("Rithmic live trading requires audit_external_orders")
@@ -337,6 +347,7 @@ class StrategyEngine:
             adapter,
             order_repository,
             journal=journal,
+            is_backtest=is_backtest,
             db_session_factory=self._db_session_factory,
             audit_external_orders=audit_external_orders,
             account_service=self.account_service,
