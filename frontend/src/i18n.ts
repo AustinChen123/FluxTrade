@@ -19,6 +19,53 @@ const resources = {
         light: "切換至日間主題",
         dark: "切換至夜間主題"
       },
+      navigation: {
+        aria: "控制台頁面",
+        research: "參數研究",
+        strategies: "策略管理"
+      },
+      strategies: {
+        kicker: "運行控制",
+        title: "策略管理",
+        body: "查看權威運行狀態，並對單一策略送出受控生命週期命令。",
+        refresh: "重新整理狀態",
+        loading: "讀取策略狀態",
+        loadErrorTitle: "策略狀態未載入",
+        commandErrorTitle: "策略命令未送出",
+        refreshErrorTitle: "命令已接受，但狀態尚未更新",
+        unknownErrorTitle: "策略命令結果不明",
+        errorBody: "控制面目前無法完成要求。確認工作階段與服務狀態後再試一次。",
+        unknownErrorBody: "控制面可能已接受命令；在權威狀態更新前不會重新開放操作。",
+        unauthorized: "目前工作階段沒有管理策略的權限。請從受信任的 Tailscale 入口重新開啟。",
+        stepUpRequired: "這項命令需要短效升權。請取得 step-up 權限後重新建立工作階段。",
+        serviceError: "策略控制服務回覆 {{status}}。請確認引擎 listener 與控制面狀態。",
+        summary: "策略狀態摘要",
+        total: "策略總數",
+        list: "策略運行清冊",
+        heartbeat: "最近 heartbeat",
+        uptime: "啟動時間",
+        version: "狀態版本",
+        emptyTitle: "尚無策略狀態",
+        emptyBody: "策略引擎註冊第一個實例後，運行狀態會出現在這裡。",
+        pending: "送出中",
+        awaitingState: "等待狀態更新",
+        confirm: "確定要對 {{strategyId}} 執行「{{command}}」？",
+        accepted: "已接受 {{strategyId}} 的「{{command}}」命令。",
+        status: {
+          DISCOVERED: "已發現",
+          READY: "準備就緒",
+          WARNING: "警告",
+          ACTIVE: "運行中",
+          STOPPED: "已停止",
+          ERROR: "錯誤"
+        },
+        command: {
+          START: "啟動",
+          STOP: "停止",
+          RESUME: "恢復",
+          FORCE_RECOVER: "強制恢復"
+        }
+      },
       demo: "本機展示資料 · 正式建置不包含此模式",
       error: {
         title: "研究資料未載入",
@@ -113,6 +160,53 @@ const resources = {
         theme: "Theme",
         light: "Switch to light theme",
         dark: "Switch to dark theme"
+      },
+      navigation: {
+        aria: "Console pages",
+        research: "Parameter research",
+        strategies: "Strategy management"
+      },
+      strategies: {
+        kicker: "Runtime control",
+        title: "Strategy management",
+        body: "Inspect authoritative runtime state and send a controlled lifecycle command to one strategy.",
+        refresh: "Refresh state",
+        loading: "Loading strategy state",
+        loadErrorTitle: "Strategy state not loaded",
+        commandErrorTitle: "Strategy command not sent",
+        refreshErrorTitle: "Command accepted, but state not refreshed",
+        unknownErrorTitle: "Strategy command outcome unknown",
+        errorBody: "The control plane could not complete the request. Check the session and service state, then try again.",
+        unknownErrorBody: "The control plane may have accepted the command. Actions stay locked until authoritative state changes.",
+        unauthorized: "This session cannot manage strategies. Reopen the console through the trusted Tailscale entry point.",
+        stepUpRequired: "This command requires short-lived step-up access. Obtain step-up access and create a new session.",
+        serviceError: "Strategy control returned {{status}}. Check the engine listener and control-plane state.",
+        summary: "Strategy status summary",
+        total: "Total strategies",
+        list: "Strategy runtime roster",
+        heartbeat: "Last heartbeat",
+        uptime: "Started",
+        version: "State version",
+        emptyTitle: "No strategy state yet",
+        emptyBody: "Runtime state will appear after the strategy engine registers its first instance.",
+        pending: "Sending",
+        awaitingState: "Awaiting state update",
+        confirm: "Run “{{command}}” for {{strategyId}}?",
+        accepted: "Accepted “{{command}}” for {{strategyId}}.",
+        status: {
+          DISCOVERED: "Discovered",
+          READY: "Ready",
+          WARNING: "Warning",
+          ACTIVE: "Active",
+          STOPPED: "Stopped",
+          ERROR: "Error"
+        },
+        command: {
+          START: "Start",
+          STOP: "Stop",
+          RESUME: "Resume",
+          FORCE_RECOVER: "Force recover"
+        }
       },
       demo: "Local demo data · unavailable in production builds",
       error: {

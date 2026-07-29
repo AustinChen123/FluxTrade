@@ -720,7 +720,8 @@ class JobRecord(BaseModel):
 class StrategyCommandRequest(BaseModel):
     """Operator command for a strategy instance."""
 
-    command: Literal["START", "STOP", "RESUME", "FORCE_RECOVER", "RELOAD"]
+    command: Literal["START", "STOP", "RESUME", "FORCE_RECOVER"]
+    expected_version: int = Field(ge=0, strict=True)
     reason: str | None = None
     params: dict[str, Any] = Field(default_factory=dict)
 

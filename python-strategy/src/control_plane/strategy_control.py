@@ -22,6 +22,15 @@ class StrategyCommandResult:
 class StrategyControlUnavailable(RuntimeError):
     """Raised when the live strategy engine or its read model is unavailable."""
 
+    def __init__(
+        self,
+        message: str,
+        *,
+        code: str = "strategy_control_unavailable",
+    ) -> None:
+        super().__init__(message)
+        self.code = code
+
 
 class CommandRouterLike(Protocol):
     def handle(self, message: dict) -> Any:
@@ -80,7 +89,10 @@ class RedisStrategyCommandRouter:
                 "Strategy control backend unavailable"
             ) from exc
         if subscribers == 0:
-            raise StrategyControlUnavailable("Strategy engine listener unavailable")
+            raise StrategyControlUnavailable(
+                "Strategy engine listener unavailable",
+                code="strategy_engine_listener_unavailable",
+            )
         return StrategyCommandResult(
             True,
             f"{command} command accepted",
@@ -108,11 +120,14 @@ class StrategyControlService:
         request: StrategyCommandRequest,
         *,
         actor: str,
+        idempotency_key: str,
     ) -> dict[str, Any]:
         params = {
             **request.params,
             "strategy_id": strategy_id,
             "actor": actor,
+            "expected_version": request.expected_version,
+            "idempotency_key": idempotency_key,
         }
         if request.reason is not None:
             params["reason"] = request.reason

@@ -7,7 +7,7 @@ from collections.abc import Mapping
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from hmac import compare_digest
-from urllib.parse import parse_qs, urlsplit
+from urllib.parse import parse_qs, unquote, urlsplit
 from typing import Any, Callable
 
 from pydantic import ValidationError
@@ -219,7 +219,7 @@ class ControlPlaneApp:
             except StrategyControlUnavailable as exc:
                 return HttpResponse(
                     503,
-                    {"error": "strategy_control_unavailable", "detail": str(exc)},
+                    {"error": exc.code, "detail": str(exc)},
                 )
             return self._command_response(result)
 
@@ -231,7 +231,7 @@ class ControlPlaneApp:
             except StrategyControlUnavailable as exc:
                 return HttpResponse(
                     503,
-                    {"error": "strategy_control_unavailable", "detail": str(exc)},
+                    {"error": exc.code, "detail": str(exc)},
                 )
             return self._command_response(result)
 
@@ -239,6 +239,7 @@ class ControlPlaneApp:
             return self._submit_strategy_command(
                 clean_path,
                 body,
+                headers=headers,
                 actor=identity.actor,
                 browser_principal=identity.browser_principal,
             )
@@ -412,6 +413,7 @@ class ControlPlaneApp:
         path: str,
         body: str | bytes | None,
         *,
+        headers: Mapping[str, str] | None,
         actor: str,
         browser_principal: BrowserPrincipal | None,
     ) -> HttpResponse:
@@ -423,7 +425,7 @@ class ControlPlaneApp:
         if not path.endswith(suffix):
             return HttpResponse(404, {"error": "not_found"})
 
-        strategy_id = path.removeprefix(prefix)[: -len(suffix)]
+        strategy_id = unquote(path.removeprefix(prefix)[: -len(suffix)])
         if not strategy_id:
             return HttpResponse(404, {"error": "not_found"})
 
@@ -445,22 +447,29 @@ class ControlPlaneApp:
 
         if (
             browser_principal is not None
-            and request.command in {"START", "RESUME", "FORCE_RECOVER", "RELOAD"}
+            and request.command in {"START", "RESUME", "FORCE_RECOVER"}
         ):
             assert self.browser_auth is not None
             if not self.browser_auth.has_step_up(browser_principal):
                 return HttpResponse(403, {"error": "step_up_required"})
+
+        idempotency_key = _extract_idempotency_key(headers)
+        if idempotency_key is None:
+            return HttpResponse(400, {"error": "idempotency_key_required"})
+        if not _valid_idempotency_key(idempotency_key):
+            return HttpResponse(400, {"error": "idempotency_key_invalid"})
 
         try:
             result = self.strategy_control.submit_command(
                 strategy_id,
                 request,
                 actor=actor,
+                idempotency_key=idempotency_key,
             )
         except StrategyControlUnavailable as exc:
             return HttpResponse(
                 503,
-                {"error": "strategy_control_unavailable", "detail": str(exc)},
+                {"error": exc.code, "detail": str(exc)},
             )
         return self._command_response(result)
 
@@ -751,12 +760,14 @@ class ControlPlaneApp:
             return HttpResponse(503, {"error": "strategy_state_query_unavailable"})
         suffix = "/transitions"
         if path.endswith(suffix):
-            strategy_id = path.removeprefix("/strategy-states/")[: -len(suffix)]
+            strategy_id = unquote(
+                path.removeprefix("/strategy-states/")[: -len(suffix)]
+            )
             if not strategy_id:
                 return HttpResponse(404, {"error": "not_found"})
             return self._list_strategy_transitions(strategy_id, query)
 
-        strategy_id = path.removeprefix("/strategy-states/")
+        strategy_id = unquote(path.removeprefix("/strategy-states/"))
         if not strategy_id:
             return HttpResponse(404, {"error": "not_found"})
         try:

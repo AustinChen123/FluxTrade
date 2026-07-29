@@ -77,6 +77,10 @@ vi.mock("./FitnessSurface3D", async () => {
   };
 });
 
+vi.mock("./StrategyManager", () => ({
+  StrategyManager: () => <section data-testid="strategy-manager" />
+}));
+
 const epoch = (id: string): Epoch => ({
   id,
   strategy_id: `strategy-${id}`,
@@ -131,6 +135,7 @@ const storage = new Map<string, string>();
 describe("GA visualization state", () => {
   beforeEach(async () => {
     vi.clearAllMocks();
+    window.history.replaceState({}, "", "/");
     storage.clear();
     delete document.documentElement.dataset.theme;
     Object.defineProperty(window, "localStorage", {
@@ -187,6 +192,94 @@ describe("GA visualization state", () => {
     expect(resolveLocale(null, ["en-US", "zh-TW"])).toBe("en");
     expect(resolveLocale(null, ["de-DE"])).toBe("zh-TW");
     expect(resolveLocale("zh-TW", ["en-US"])).toBe("zh-TW");
+  });
+
+  it("opens strategy management directly without loading GA data", async () => {
+    window.history.replaceState({}, "", "/?view=strategies");
+
+    render(<App />);
+
+    expect(await screen.findByTestId("strategy-manager")).toBeTruthy();
+    expect(api.ensureBrowserSession).not.toHaveBeenCalled();
+    expect(api.loadEpochs).not.toHaveBeenCalled();
+    expect(screen.queryByRole("combobox", { name: "演化批次" })).toBeNull();
+    expect(
+      screen.getByRole("button", { name: "策略管理", current: "page" })
+    ).toBeTruthy();
+  });
+
+  it("keeps the initial epoch request alive across console view switches", async () => {
+    const epochs = deferred<Epoch[]>();
+    api.loadEpochs.mockReturnValue(epochs.promise);
+    api.loadGenerationSummaries.mockResolvedValue([summary]);
+    api.loadGenerationGenes.mockResolvedValue([gene("epoch-a")]);
+    render(<App />);
+    await waitFor(() => expect(api.loadEpochs).toHaveBeenCalledTimes(1));
+
+    fireEvent.click(screen.getByRole("button", { name: "策略管理" }));
+    expect(await screen.findByTestId("strategy-manager")).toBeTruthy();
+    fireEvent.click(screen.getByRole("button", { name: "參數研究" }));
+
+    expect(screen.getByText("讀取研究快照")).toBeTruthy();
+    expect(api.loadEpochs).toHaveBeenCalledTimes(1);
+
+    epochs.resolve([epoch("epoch-a"), epoch("epoch-b")]);
+    await screen.findAllByText("candidate-epoch-a");
+    expect(api.loadEpochs).toHaveBeenCalledTimes(1);
+  });
+
+  it("keeps the selected console page in the URL", async () => {
+    api.loadGenerationSummaries.mockResolvedValue([summary]);
+    api.loadGenerationGenes.mockResolvedValue([gene("epoch-a")]);
+    render(<App />);
+    await screen.findAllByText("candidate-epoch-a");
+
+    fireEvent.click(screen.getByRole("button", { name: "策略管理" }));
+
+    expect(await screen.findByTestId("strategy-manager")).toBeTruthy();
+    expect(new URL(window.location.href).searchParams.get("view")).toBe(
+      "strategies"
+    );
+
+    fireEvent.click(screen.getByRole("button", { name: "參數研究" }));
+    expect(new URL(window.location.href).searchParams.has("view")).toBe(false);
+  });
+
+  it("does not reload research data when returning from strategy management", async () => {
+    const genes = deferred<Gene[]>();
+    api.loadGenerationSummaries.mockResolvedValue([summary]);
+    api.loadGenerationGenes.mockReturnValue(genes.promise);
+    render(<App />);
+    await waitFor(() => expect(api.loadGenerationGenes).toHaveBeenCalledTimes(1));
+
+    fireEvent.click(screen.getByRole("button", { name: "策略管理" }));
+    expect(await screen.findByTestId("strategy-manager")).toBeTruthy();
+    fireEvent.click(screen.getByRole("button", { name: "參數研究" }));
+
+    expect(screen.getByText("讀取研究快照")).toBeTruthy();
+    expect(api.loadEpochs).toHaveBeenCalledTimes(1);
+    expect(api.loadGenerationSummaries).toHaveBeenCalledTimes(1);
+    expect(api.loadGenerationGenes).toHaveBeenCalledTimes(1);
+
+    genes.resolve([gene("epoch-a")]);
+    await screen.findAllByText("candidate-epoch-a");
+  });
+
+  it("still reloads research data after a downstream load failure", async () => {
+    api.loadGenerationSummaries
+      .mockRejectedValueOnce(new Error("summary unavailable"))
+      .mockResolvedValueOnce([summary]);
+    api.loadGenerationGenes.mockResolvedValue([gene("epoch-a")]);
+    render(<App />);
+
+    expect(await screen.findByText("研究資料未載入")).toBeTruthy();
+    fireEvent.click(screen.getByRole("button", { name: "重新讀取" }));
+
+    await waitFor(() => {
+      expect(api.loadEpochs).toHaveBeenCalledTimes(1);
+      expect(api.loadGenerationSummaries).toHaveBeenCalledTimes(2);
+      expect(api.loadGenerationGenes).toHaveBeenCalledTimes(1);
+    });
   });
 
   it("keeps the two surface axes distinct", async () => {

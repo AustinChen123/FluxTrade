@@ -1461,7 +1461,7 @@ def test_control_plane_lists_and_gets_strategy_states(tmp_path):
         session.add_all(
             [
                 StrategyState(
-                    strategy_id="s1",
+                    strategy_id="test.py::ActiveStrategy",
                     status="ACTIVE",
                     config_json='{"risk":"low"}',
                     performance_json='{"pnl":"12.3"}',
@@ -1487,16 +1487,72 @@ def test_control_plane_lists_and_gets_strategy_states(tmp_path):
     )
 
     list_response = app.handle("GET", "/strategy-states?status=ACTIVE&limit=5&offset=0")
-    get_response = app.handle("GET", "/strategy-states/s1")
+    get_response = app.handle(
+        "GET", "/strategy-states/test.py%3A%3AActiveStrategy"
+    )
 
     assert list_response.status_code == 200
     assert list_response.body["total"] == 1
-    assert [state["strategy_id"] for state in list_response.body["states"]] == ["s1"]
+    assert [state["strategy_id"] for state in list_response.body["states"]] == [
+        "test.py::ActiveStrategy"
+    ]
     assert get_response.status_code == 200
     assert get_response.body["state"]["status"] == "ACTIVE"
     assert get_response.body["state"]["config"] == {"risk": "low"}
     assert get_response.body["state"]["performance"] == {"pnl": "12.3"}
     assert get_response.body["state"]["version"] == 2
+    assert get_response.body["state"]["available_commands"] == ["STOP"]
+
+
+@pytest.mark.parametrize(
+    ("status", "available_commands"),
+    [
+        ("DISCOVERED", ["START"]),
+        ("READY", ["START"]),
+        ("WARNING", ["START"]),
+        ("ACTIVE", ["STOP"]),
+        ("STOPPED", ["RESUME"]),
+        ("ERROR", ["FORCE_RECOVER"]),
+    ],
+)
+def test_strategy_state_exposes_authoritative_commands(
+    tmp_path,
+    status,
+    available_commands,
+):
+    session_factory = _sqlite_strategy_state_session_factory(tmp_path)
+    state_kwargs = {}
+    if status == "STOPPED":
+        state_kwargs["stopped_at"] = datetime(2026, 5, 20, tzinfo=UTC)
+    elif status == "ERROR":
+        state_kwargs.update(
+            {
+                "last_error_message": "feed disconnected",
+                "entered_error_at": datetime(2026, 5, 20, tzinfo=UTC),
+            }
+        )
+    with session_factory() as session:
+        session.add(
+            StrategyState(
+                strategy_id="s1",
+                status=status,
+                config_json="{}",
+                performance_json="{}",
+                version=1,
+                **state_kwargs,
+            )
+        )
+        session.commit()
+
+    app = ControlPlaneApp(
+        BacktestJobExecutor(run_inline=True),
+        strategy_state_query=StrategyStateQueryService(session_factory),
+    )
+
+    response = app.handle("GET", "/strategy-states/s1")
+
+    assert response.status_code == 200
+    assert response.body["state"]["available_commands"] == available_commands
 
 
 def test_control_plane_summarizes_strategy_states(tmp_path):
@@ -1558,7 +1614,7 @@ def test_control_plane_lists_strategy_state_transitions(tmp_path):
     with session_factory() as session:
         session.add(
             StrategyState(
-                strategy_id="s1",
+                strategy_id="test.py::ActiveStrategy",
                 status="STOPPED",
                 config_json="{}",
                 performance_json="{}",
@@ -1569,7 +1625,7 @@ def test_control_plane_lists_strategy_state_transitions(tmp_path):
         session.add_all(
             [
                 StrategyStateTransition(
-                    strategy_id="s1",
+                    strategy_id="test.py::ActiveStrategy",
                     from_status="ACTIVE",
                     to_status="ERROR",
                     transitioned_at=datetime(2026, 5, 20, 1, tzinfo=UTC),
@@ -1577,7 +1633,7 @@ def test_control_plane_lists_strategy_state_transitions(tmp_path):
                     actor="system",
                 ),
                 StrategyStateTransition(
-                    strategy_id="s1",
+                    strategy_id="test.py::ActiveStrategy",
                     from_status="ERROR",
                     to_status="STOPPED",
                     transitioned_at=datetime(2026, 5, 20, 2, tzinfo=UTC),
@@ -1593,7 +1649,10 @@ def test_control_plane_lists_strategy_state_transitions(tmp_path):
         strategy_state_query=StrategyStateQueryService(session_factory),
     )
 
-    response = app.handle("GET", "/strategy-states/s1/transitions?limit=1&offset=0")
+    response = app.handle(
+        "GET",
+        "/strategy-states/test.py%3A%3AActiveStrategy/transitions?limit=1&offset=0",
+    )
 
     assert response.status_code == 200
     assert response.body["total"] == 2
@@ -2023,8 +2082,15 @@ def test_control_plane_routes_strategy_status_and_commands():
     health_response = app.handle("GET", "/strategies/health")
     command_response = app.handle(
         "POST",
-        "/strategies/s1/commands",
-        json.dumps({"command": "STOP", "reason": "operator pause"}),
+        "/strategies/test.py%3A%3AActiveStrategy/commands",
+        json.dumps(
+            {
+                "command": "STOP",
+                "expected_version": 7,
+                "reason": "operator pause",
+            }
+        ),
+        headers={"Idempotency-Key": "strategy-stop-1"},
     )
 
     assert list_response.status_code == 200
@@ -2034,13 +2100,61 @@ def test_control_plane_routes_strategy_status_and_commands():
     assert command_response.status_code == 200
     assert router.messages[-1] == {
         "command": "STOP",
-        "strategy_id": "s1",
+        "strategy_id": "test.py::ActiveStrategy",
         "params": {
-            "strategy_id": "s1",
+            "strategy_id": "test.py::ActiveStrategy",
             "actor": "operator",
+            "expected_version": 7,
+            "idempotency_key": "strategy-stop-1",
             "reason": "operator pause",
         },
     }
+
+
+@pytest.mark.parametrize(
+    ("body", "headers", "expected_error"),
+    [
+        (
+            {"command": "STOP", "expected_version": 1},
+            None,
+            "idempotency_key_required",
+        ),
+        (
+            {"command": "STOP", "expected_version": 1},
+            {"Idempotency-Key": "bad key"},
+            "idempotency_key_invalid",
+        ),
+        (
+            {"command": "STOP"},
+            {"Idempotency-Key": "strategy-stop-1"},
+            "validation_error",
+        ),
+        (
+            {"command": "RELOAD", "expected_version": 1},
+            {"Idempotency-Key": "strategy-reload-1"},
+            "validation_error",
+        ),
+    ],
+)
+def test_strategy_command_requires_versioned_idempotent_contract(
+    body,
+    headers,
+    expected_error,
+):
+    app = ControlPlaneApp(
+        BacktestJobExecutor(run_inline=True),
+        strategy_control=StrategyControlService(_FakeCommandRouter()),
+    )
+
+    response = app.handle(
+        "POST",
+        "/strategies/s1/commands",
+        json.dumps(body),
+        headers=headers,
+    )
+
+    assert response.status_code in {400, 422}
+    assert response.body["error"] == expected_error
 
 
 def test_redis_strategy_router_queries_state_and_publishes_commands(tmp_path):
@@ -2112,12 +2226,13 @@ def test_strategy_command_returns_503_without_engine_listener(tmp_path):
     response = app.handle(
         "POST",
         "/strategies/s1/commands",
-        json.dumps({"command": "STOP"}),
+        json.dumps({"command": "STOP", "expected_version": 1}),
+        headers={"Idempotency-Key": "strategy-stop-no-listener"},
     )
 
     assert response.status_code == 503
     assert response.body == {
-        "error": "strategy_control_unavailable",
+        "error": "strategy_engine_listener_unavailable",
         "detail": "Strategy engine listener unavailable",
     }
 
@@ -2443,7 +2558,8 @@ def test_production_control_plane_wiring_has_no_missing_dependency_503(tmp_path)
         "submit_strategy_command": app.handle(
             "POST",
             "/strategies/s1/commands",
-            json.dumps({"command": "STOP"}),
+            json.dumps({"command": "STOP", "expected_version": 1}),
+            headers={"Idempotency-Key": "strategy-stop-wiring"},
         ),
         "kill_switch": app.handle("POST", "/ops/kill-switch"),
         "clear_kill_switch": app.handle("POST", "/ops/kill-switch/clear"),

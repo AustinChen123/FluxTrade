@@ -131,14 +131,57 @@ def test_force_recover_delegates_to_forced_running_transition() -> None:
     )
 
 
-def test_reload_returns_placeholder_without_registry_reload() -> None:
+def test_force_recover_forwards_expected_version() -> None:
+    router = CommandRouter(StrategyRegistry(), MagicMock())
+
+    result = router.handle(
+        {
+            "command": "FORCE_RECOVER",
+            "params": {
+                "strategy_id": "s1",
+                "expected_version": 4,
+            },
+        }
+    )
+
+    assert result.success is True
+    router.state_manager.transition_to_running.assert_called_once_with(
+        "s1",
+        actor="operator",
+        force=True,
+        reason=None,
+        expected_version=4,
+    )
+
+
+def test_lifecycle_command_rejects_invalid_expected_version() -> None:
+    router = CommandRouter(StrategyRegistry(), MagicMock())
+
+    result = router.handle(
+        {
+            "command": "STOP",
+            "params": {
+                "strategy_id": "s1",
+                "expected_version": True,
+            },
+        }
+    )
+
+    assert result == CommandResult(
+        False,
+        "expected_version must be a non-negative integer",
+    )
+    router.state_manager.transition_to_stopped.assert_not_called()
+
+
+def test_reload_rejects_unimplemented_command() -> None:
     registry = StrategyRegistry()
     router = CommandRouter(registry, MagicMock())
 
     result = router.handle({"command": "RELOAD", "params": {"strategy_id": "s1"}})
 
-    assert result.success is True
-    assert "later implementation" in result.message
+    assert result.success is False
+    assert result.message == "Strategy reload is not implemented: s1"
 
 
 def test_list_returns_active_strategy_metadata() -> None:
