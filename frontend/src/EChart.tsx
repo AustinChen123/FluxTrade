@@ -1,34 +1,35 @@
 import { useEffect, useRef } from "react";
 import {
-  DataZoomComponent,
-  DatasetComponent,
   GridComponent,
   LegendComponent,
   ParallelComponent,
   TooltipComponent,
   VisualMapComponent
 } from "echarts/components";
-import { LineChart, ParallelChart, ScatterChart } from "echarts/charts";
+import {
+  CustomChart,
+  LineChart,
+  ParallelChart
+} from "echarts/charts";
 import { CanvasRenderer } from "echarts/renderers";
 import * as echarts from "echarts/core";
 import type { EChartsCoreOption } from "echarts/core";
 
 echarts.use([
   CanvasRenderer,
-  DataZoomComponent,
-  DatasetComponent,
   GridComponent,
   LegendComponent,
+  CustomChart,
   LineChart,
   ParallelChart,
   ParallelComponent,
-  ScatterChart,
   TooltipComponent,
   VisualMapComponent
 ]);
 
 type Props = {
   option: EChartsCoreOption;
+  updateOption?: EChartsCoreOption;
   className?: string;
   ariaLabel: string;
   onDataClick?: (data: unknown, dataIndex: number) => void;
@@ -36,6 +37,7 @@ type Props = {
 
 export function EChart({
   option,
+  updateOption,
   className,
   ariaLabel,
   onDataClick
@@ -70,6 +72,15 @@ export function EChart({
       : undefined;
     chart?.setOption(option, { notMerge: true, lazyUpdate: true });
   }, [option]);
+
+  useEffect(() => {
+    const chart = containerRef.current
+      ? echarts.getInstanceByDom(containerRef.current)
+      : undefined;
+    if (updateOption) {
+      chart?.setOption(updateOption, { lazyUpdate: true });
+    }
+  }, [option, updateOption]);
 
   return (
     <div

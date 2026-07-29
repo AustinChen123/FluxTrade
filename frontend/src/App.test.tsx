@@ -10,6 +10,7 @@ import {
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import { App } from "./App";
+import i18n, { resolveLocale } from "./i18n";
 import type { Epoch, Gene, GenerationSummary } from "./api";
 
 const api = vi.hoisted(() => ({
@@ -25,10 +26,56 @@ vi.mock("./api", async (importOriginal) => ({
 }));
 
 vi.mock("./EChart", () => ({
-  EChart: ({ ariaLabel }: { ariaLabel: string }) => (
-    <div aria-label={ariaLabel} />
+  EChart: ({
+    ariaLabel,
+    onDataClick
+  }: {
+    ariaLabel: string;
+    onDataClick?: (data: unknown, dataIndex: number) => void;
+  }) => (
+    <button
+      type="button"
+      aria-label={ariaLabel}
+      onClick={() =>
+        onDataClick?.([5, 20, 1, 2, "candidate-epoch-b"], 0)
+      }
+    />
   )
 }));
+
+vi.mock("./FitnessSurface3D", async () => {
+  const { useEffect, useRef } = await import("react");
+  return {
+    FitnessSurface3D: ({
+      ariaLabel,
+      observationLabel,
+      onDataClick,
+      theme
+    }: {
+      ariaLabel: string;
+      observationLabel: string;
+      onDataClick?: (data: unknown) => void;
+      theme: string;
+    }) => {
+      const ref = useRef<HTMLButtonElement>(null);
+      useEffect(() => {
+        ref.current?.setAttribute(
+          "data-drawn-theme",
+          document.documentElement.dataset.theme ?? ""
+        );
+      }, [theme]);
+      return (
+        <button
+          ref={ref}
+          type="button"
+          aria-label={ariaLabel}
+          data-observation-label={observationLabel}
+          onClick={() => onDataClick?.([5, 20, 1, 2, "candidate-epoch-b"])}
+        />
+      );
+    }
+  };
+});
 
 const epoch = (id: string): Epoch => ({
   id,
@@ -79,9 +126,23 @@ function deferred<T>() {
   return { promise, resolve };
 }
 
+const storage = new Map<string, string>();
+
 describe("GA visualization state", () => {
-  beforeEach(() => {
+  beforeEach(async () => {
     vi.clearAllMocks();
+    storage.clear();
+    delete document.documentElement.dataset.theme;
+    Object.defineProperty(window, "localStorage", {
+      configurable: true,
+      value: {
+        getItem: (key: string) => storage.get(key) ?? null,
+        setItem: (key: string, value: string) => storage.set(key, value),
+        removeItem: (key: string) => storage.delete(key),
+        clear: () => storage.clear()
+      }
+    });
+    await i18n.changeLanguage("zh-TW");
     api.ensureBrowserSession.mockResolvedValue(undefined);
     api.loadEpochs.mockResolvedValue([epoch("epoch-a"), epoch("epoch-b")]);
   });
@@ -104,9 +165,12 @@ describe("GA visualization state", () => {
     render(<App />);
     await screen.findAllByText("candidate-epoch-a");
 
-    fireEvent.change(screen.getByLabelText("演化批次"), {
-      target: { value: "epoch-b" }
-    });
+    fireEvent.change(
+      screen.getByRole("combobox", { name: "演化批次" }),
+      {
+        target: { value: "epoch-b" }
+      }
+    );
 
     expect(screen.queryByText("candidate-epoch-a")).toBeNull();
     await waitFor(() =>
@@ -115,5 +179,131 @@ describe("GA visualization state", () => {
 
     epochBSummaries.resolve([summary]);
     await screen.findAllByText("candidate-epoch-b");
+  });
+
+  it("uses browser language with a Traditional Chinese fallback", () => {
+    expect(resolveLocale(null, ["en-US"])).toBe("en");
+    expect(resolveLocale(null, ["zh-TW", "en-US"])).toBe("zh-TW");
+    expect(resolveLocale(null, ["en-US", "zh-TW"])).toBe("en");
+    expect(resolveLocale(null, ["de-DE"])).toBe("zh-TW");
+    expect(resolveLocale("zh-TW", ["en-US"])).toBe("zh-TW");
+  });
+
+  it("keeps the two surface axes distinct", async () => {
+    api.loadGenerationSummaries.mockResolvedValue([summary]);
+    api.loadGenerationGenes.mockResolvedValue([gene("epoch-a")]);
+
+    render(<App />);
+    await screen.findAllByText("candidate-epoch-a");
+
+    const xAxis = screen.getByLabelText("X") as HTMLSelectElement;
+    const yAxis = screen.getByLabelText("Y") as HTMLSelectElement;
+    await waitFor(() => {
+      expect(xAxis.value).toBe("fast");
+      expect(yAxis.value).toBe("slow");
+    });
+    expect(
+      Array.from(xAxis.options).find((option) => option.value === "slow")?.disabled
+    ).toBe(true);
+    expect(
+      Array.from(yAxis.options).find((option) => option.value === "fast")?.disabled
+    ).toBe(true);
+  });
+
+  it("switches the complete interface language and saves the choice", async () => {
+    api.loadGenerationSummaries.mockResolvedValue([summary]);
+    api.loadGenerationGenes.mockResolvedValue([gene("epoch-a")]);
+
+    render(<App />);
+    await screen.findAllByText("candidate-epoch-a");
+
+    fireEvent.change(screen.getByLabelText("語言"), {
+      target: { value: "en" }
+    });
+
+    await screen.findByRole("heading", { name: "Parameter terrain" });
+    expect(
+      (screen.getByLabelText("Language") as HTMLSelectElement).value
+    ).toBe("en");
+    expect(screen.getByText("Candidate comparison")).toBeTruthy();
+    expect(screen.getByText("1 candidate")).toBeTruthy();
+    expect(
+      screen.getByLabelText(
+        "Observed fitness surface for two strategy parameters"
+      )
+    ).toBeTruthy();
+    expect(screen.getAllByText("candidate-epoch-a").length).toBeGreaterThan(0);
+    expect(window.localStorage.getItem("fluxtrade.locale")).toBe("en");
+    expect(document.documentElement.lang).toBe("en");
+  });
+
+  it("switches between saved light and dark themes", async () => {
+    api.loadGenerationSummaries.mockResolvedValue([summary]);
+    api.loadGenerationGenes.mockResolvedValue([gene("epoch-a")]);
+
+    render(<App />);
+    await screen.findAllByText("candidate-epoch-a");
+
+    fireEvent.click(screen.getByRole("button", { name: "3D 地形" }));
+    const surface3d = await screen.findByRole("button", {
+      name: "兩個策略參數與候選適應度的互動式三維插值地形圖"
+    });
+    expect(surface3d.dataset.drawnTheme).toBe("light");
+    expect(window.localStorage.getItem("fluxtrade.theme")).toBeNull();
+    fireEvent.click(screen.getByRole("button", { name: "切換至夜間主題" }));
+
+    expect(document.documentElement.dataset.theme).toBe("dark");
+    expect(surface3d.dataset.drawnTheme).toBe("dark");
+    expect(window.localStorage.getItem("fluxtrade.theme")).toBe("dark");
+    expect(
+      screen.getByRole("button", { name: "切換至日間主題" })
+    ).toBeTruthy();
+  });
+
+  it("switches between 2D and 3D views and selects observed candidates", async () => {
+    api.loadGenerationSummaries.mockResolvedValue([summary]);
+    api.loadGenerationGenes.mockResolvedValue([
+      gene("epoch-a"),
+      gene("epoch-b")
+    ]);
+
+    render(<App />);
+    await screen.findAllByText("candidate-epoch-a");
+
+    fireEvent.click(screen.getByRole("button", { name: "3D 地形" }));
+    const surface3d = await screen.findByRole("button", {
+      name: "兩個策略參數與候選適應度的互動式三維插值地形圖"
+    });
+    expect(surface3d.dataset.observationLabel).toBe("觀測候選");
+    fireEvent.click(surface3d);
+
+    expect(screen.getAllByText("candidate-epoch-b")).toHaveLength(2);
+    fireEvent.click(screen.getByRole("button", { name: "2D 色階" }));
+    expect(
+      screen.getByRole("button", {
+        name: "兩個策略參數與候選適應度的觀測地形圖"
+      })
+    ).toBeTruthy();
+  });
+
+  it("fails closed when an epoch has an unsupported objective", async () => {
+    api.loadEpochs.mockResolvedValue([
+      {
+        ...epoch("epoch-a"),
+        config_json: { objective: "maximize_magic" }
+      }
+    ]);
+    api.loadGenerationSummaries.mockResolvedValue([summary]);
+    api.loadGenerationGenes.mockResolvedValue([gene("epoch-a")]);
+
+    render(<App />);
+
+    expect(
+      await screen.findByText("無法辨識這個批次的最佳化目標，已停止繪製候選地形。")
+    ).toBeTruthy();
+    expect(screen.getByText("不支援的最佳化目標")).toBeTruthy();
+    expect(
+      screen.queryByLabelText("兩個策略參數與候選適應度的觀測地形圖")
+    ).toBeNull();
   });
 });
