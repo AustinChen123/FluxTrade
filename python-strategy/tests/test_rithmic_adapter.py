@@ -137,6 +137,11 @@ def test_runtime_start_is_explicit_and_idempotent(client):
 
     factory.assert_called_once_with("test", "ACCOUNT")
 
+
+def test_cancel_terminal_state_is_delivered_by_order_events(adapter):
+    assert adapter.cancel_terminal_state_delivered_by_order_events() is True
+
+
 def test_exit_position_uses_native_instrument_identity(adapter, client):
     adapter.start_order_event_stream()
 

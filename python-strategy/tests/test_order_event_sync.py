@@ -111,6 +111,45 @@ def test_modify_rejection_preserves_existing_protection_state(
     assert order.trigger_price == Decimal("19998.25")
 
 
+def test_zero_fill_terminal_cleans_children_before_parent_becomes_terminal(
+    mock_clock,
+    mock_order_repo,
+    order_factory,
+):
+    order_manager = OrderManager(mock_order_repo, mock_clock, is_backtest=True)
+    cleanup = Mock(side_effect=RuntimeError("simulated crash"))
+    applier = OrderEventApplier(
+        order_manager=order_manager,
+        journal_fill=None,
+        fail_pending_conditionals_for_terminal_entry=cleanup,
+        protective_terminal_without_fill_failure=lambda _order: None,
+        write_conditional_warning=lambda **_kwargs: None,
+        place_pending_conditionals_for_entry=lambda _order: [],
+        protective_partial_fill_requires_resize=lambda _order, _state: None,
+        cancel_linked_conditional_for_protection_fill=lambda _order: None,
+    )
+    order = order_factory(
+        exchange_order_id="EX-CANCEL",
+        status=OrderStatus.SUBMITTED.value,
+        quantity=Decimal("2"),
+        filled_quantity=Decimal("0"),
+    )
+    mock_order_repo.add_order(order)
+
+    with pytest.raises(RuntimeError, match="simulated crash"):
+        applier.process_exchange_order_event(
+            ExchangeOrderEvent(
+                status="cancelled",
+                product_id=order.product_id,
+                exchange_order_id="EX-CANCEL",
+                cumulative_filled_quantity=Decimal("0"),
+            )
+        )
+
+    cleanup.assert_called_once_with(order)
+    assert order.status == OrderStatus.SUBMITTED.value
+
+
 def test_process_exchange_order_event_recomputes_catch_up_delta_price(
     mock_clock,
     mock_order_repo,

@@ -533,6 +533,9 @@ class RithmicExchangeAdapter(IExchangeAdapter):
             order_type=order_type,
         )
 
+    def cancel_terminal_state_delivered_by_order_events(self) -> bool:
+        return True
+
     def get_order_by_client_id(
         self,
         client_order_id: str,
