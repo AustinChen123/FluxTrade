@@ -20,6 +20,10 @@ from concurrent.futures import ThreadPoolExecutor
 import pytest
 
 from src.core.strategy_loader import StrategyLoader
+from src.core.portfolio_runtime import (
+    PortfolioFactory,
+    build_portfolio_artifact,
+)
 from src.strategies.base import BaseStrategy
 
 STRATEGY_CODE = """
@@ -37,6 +41,34 @@ class ManifestStrategy(BaseStrategy):
             timeframe="5m",
             timestamp=candle.timestamp,
             type=SignalType.NO_SIGNAL,
+        )
+"""
+
+PORTFOLIO_CODE = """
+from decimal import Decimal
+from src.core.portfolio_runtime import (
+    PortfolioDefinition,
+    PortfolioFactory,
+    PortfolioSleeve,
+)
+from src.strategies.base import BaseStrategy, StrategyRequirements
+
+class Sleeve(BaseStrategy):
+    @property
+    def requirements(self):
+        return StrategyRequirements(self.product_id, "5m", 10)
+    def on_candle(self, candle):
+        return None
+    def replay_configuration(self):
+        return {"strategy_id": self.strategy_id, "product_id": self.product_id}
+
+class ManifestPortfolioFactory(PortfolioFactory):
+    def build(self, *, portfolio_id, product_id, config):
+        return PortfolioDefinition(
+            portfolio_id=portfolio_id,
+            product_id=product_id,
+            sleeves=(PortfolioSleeve(Sleeve(f"{portfolio_id}.sleeve", product_id)),),
+            max_gross_quantity=Decimal(str(config["max_gross_quantity"])),
         )
 """
 
@@ -114,6 +146,43 @@ class MyStrategy(BaseStrategy):
 
         assert "my_strat.py::MyStrategy" in result
         assert issubclass(result["my_strat.py::MyStrategy"], BaseStrategy)
+
+    def test_finds_hash_pinned_portfolio_factory(self, tmp_path):
+        module = tmp_path / "portfolio.py"
+        module.write_text(PORTFOLIO_CODE)
+        catalog = {
+            "schema_version": 2,
+            "files": {
+                module.name: hashlib.sha256(module.read_bytes()).hexdigest(),
+            },
+            "strategies": [],
+            "portfolios": [
+                {
+                    "id": "portfolio_v1",
+                    "module": module.name,
+                    "class": "ManifestPortfolioFactory",
+                    "display_name": "Portfolio v1",
+                    "artifact_version": "1.0.0",
+                    "readiness": "RESEARCH_FROZEN",
+                }
+            ],
+        }
+        (tmp_path / StrategyLoader.CATALOG_NAME).write_text(json.dumps(catalog))
+
+        result = StrategyLoader.scan_directory(str(tmp_path))
+
+        factory = result["portfolio_v1"]
+        assert issubclass(factory, PortfolioFactory)
+        assert factory.__fluxtrade_readiness__ == "RESEARCH_FROZEN"
+        definition = build_portfolio_artifact(
+            factory,
+            portfolio_id="portfolio_v1",
+            product_id="RITHMIC:MNQ_ROLL-PERP",
+            config={"max_gross_quantity": "1"},
+        )
+        assert definition.readiness == "RESEARCH_FROZEN"
+        assert definition.artifact_version == "1.0.0"
+        assert definition.catalog_sha256 is not None
 
     def test_finds_multiple_strategies_in_one_file(self, tmp_path):
         """Should discover multiple subclasses in one file."""
@@ -541,7 +610,7 @@ class TestCatalogStrategies:
     @pytest.mark.parametrize(
         ("catalog_update", "expected_error"),
         [
-            ({"schema_version": 2}, "schema_version"),
+            ({"schema_version": 3}, "schema_version"),
             ({"files": {}}, "non-empty mapping"),
             ({"strategies": []}, "non-empty list"),
         ],

@@ -14,11 +14,15 @@ import threading
 import traceback
 from pathlib import Path
 from types import ModuleType
-from typing import Dict, Type, Union, cast
+from typing import Dict, Type, cast
 
+from src.core.portfolio_runtime import PortfolioFactory
 from src.strategies.base import BaseStrategy
 
 logger = logging.getLogger(__name__)
+
+LoadedArtifact = Type[BaseStrategy] | Type[PortfolioFactory]
+LoadResult = LoadedArtifact | str
 
 
 class StrategyLoader:
@@ -32,7 +36,7 @@ class StrategyLoader:
     _catalog_snapshots: dict[str, tempfile.TemporaryDirectory[str]] = {}
 
     @staticmethod
-    def scan_directory(path: str) -> Dict[str, Union[Type[BaseStrategy], str]]:
+    def scan_directory(path: str) -> Dict[str, LoadResult]:
         """
         Scans a directory for Python files and loads subclasses of BaseStrategy.
         Returns a dictionary mapping "FileName::ClassName" to the strategy class.
@@ -42,8 +46,8 @@ class StrategyLoader:
             return StrategyLoader._scan_directory(path)
 
     @staticmethod
-    def _scan_directory(path: str) -> Dict[str, Union[Type[BaseStrategy], str]]:
-        strategies: Dict[str, Union[Type[BaseStrategy], str]] = {}
+    def _scan_directory(path: str) -> Dict[str, LoadResult]:
+        strategies: Dict[str, LoadResult] = {}
         if not os.path.exists(path):
             logger.warning("Directory %s does not exist.", path)
             return strategies
@@ -104,8 +108,8 @@ class StrategyLoader:
         return conflicts
 
     @staticmethod
-    def _scan_legacy_directory(path: Path) -> Dict[str, Union[Type[BaseStrategy], str]]:
-        strategies: Dict[str, Union[Type[BaseStrategy], str]] = {}
+    def _scan_legacy_directory(path: Path) -> Dict[str, LoadResult]:
+        strategies: Dict[str, LoadResult] = {}
         search_path = os.path.join(path, "*.py")
         for file_path in glob.glob(search_path):
             file_name = os.path.basename(file_path)
@@ -144,7 +148,7 @@ class StrategyLoader:
     @staticmethod
     def _scan_catalog(
         catalog_path: Path,
-    ) -> Dict[str, Union[Type[BaseStrategy], str]]:
+    ) -> Dict[str, LoadResult]:
         try:
             catalog_source = catalog_path.read_bytes()
             catalog = json.loads(catalog_source)
@@ -163,7 +167,7 @@ class StrategyLoader:
             catalog_path.parent,
             files,
         )
-        strategies: Dict[str, Union[Type[BaseStrategy], str]] = {}
+        strategies: Dict[str, LoadResult] = {}
         StrategyLoader._ensure_catalog_package(package_name, snapshot_root)
         for entry in entries:
             strategy_id = entry["id"]
@@ -187,39 +191,48 @@ class StrategyLoader:
                     evict_modules=False,
                     expose_import_root=False,
                 )
-                strategy_class = getattr(module, entry["class"])
+                artifact_class = getattr(module, entry["class"])
+                expected_base = (
+                    PortfolioFactory
+                    if entry["kind"] == "portfolio"
+                    else BaseStrategy
+                )
                 if (
-                    not inspect.isclass(strategy_class)
-                    or not issubclass(strategy_class, BaseStrategy)
-                    or strategy_class is BaseStrategy
-                    or strategy_class.__module__ != module.__name__
+                    not inspect.isclass(artifact_class)
+                    or not issubclass(artifact_class, expected_base)
+                    or artifact_class is expected_base
+                    or artifact_class.__module__ != module.__name__
                 ):
                     raise TypeError(
-                        f"{entry['class']} is not a strategy defined by "
+                        f"{entry['class']} is not a {entry['kind']} defined by "
                         f"{entry['module']}"
                     )
                 setattr(
-                    strategy_class,
+                    artifact_class,
                     "__fluxtrade_artifact_version__",
                     entry["artifact_version"],
                 )
                 setattr(
-                    strategy_class,
+                    artifact_class,
                     "__fluxtrade_display_name__",
                     entry["display_name"],
                 )
                 setattr(
-                    strategy_class,
+                    artifact_class,
                     "__fluxtrade_readiness__",
                     entry["readiness"],
                 )
                 setattr(
-                    strategy_class,
+                    artifact_class,
                     "__fluxtrade_catalog_sha256__",
                     catalog_digest,
                 )
-                strategies[strategy_id] = strategy_class
-                logger.info("Loaded catalog strategy: %s", strategy_id)
+                strategies[strategy_id] = artifact_class
+                logger.info(
+                    "Loaded catalog %s: %s",
+                    entry["kind"],
+                    strategy_id,
+                )
             except Exception:
                 error_trace = traceback.format_exc()
                 logger.error(
@@ -235,15 +248,38 @@ class StrategyLoader:
         root: Path,
         catalog: object,
     ) -> tuple[list[dict[str, str]], dict[str, bytes]]:
-        if not isinstance(catalog, dict) or catalog.get("schema_version") != 1:
-            raise ValueError("strategy catalog schema_version must be 1")
+        if not isinstance(catalog, dict) or catalog.get("schema_version") not in {
+            1,
+            2,
+        }:
+            raise ValueError("strategy catalog schema_version must be 1 or 2")
 
         files = catalog.get("files")
-        entries = catalog.get("strategies")
+        schema_version = int(catalog["schema_version"])
+        strategy_entries = catalog.get("strategies")
+        portfolio_entries = catalog.get("portfolios", [])
         if not isinstance(files, dict) or not files:
             raise ValueError("strategy catalog files must be a non-empty mapping")
-        if not isinstance(entries, list) or not entries:
-            raise ValueError("strategy catalog strategies must be a non-empty list")
+        if not isinstance(strategy_entries, list) or not isinstance(
+            portfolio_entries, list
+        ):
+            raise ValueError(
+                "strategy catalog strategies and portfolios must be lists"
+            )
+        if schema_version == 1 and portfolio_entries:
+            raise ValueError("strategy catalog portfolios require schema_version 2")
+        if schema_version == 1 and not strategy_entries:
+            raise ValueError(
+                "strategy catalog strategies must be a non-empty list"
+            )
+        entries = [
+            *((entry, "strategy") for entry in strategy_entries),
+            *((entry, "portfolio") for entry in portfolio_entries),
+        ]
+        if not entries:
+            raise ValueError(
+                "strategy catalog must declare at least one strategy or portfolio"
+            )
 
         declared_files = set(files)
         pack_files = {
@@ -275,7 +311,7 @@ class StrategyLoader:
 
         normalized: list[dict[str, str]] = []
         seen_ids: set[str] = set()
-        for entry in entries:
+        for entry, kind in entries:
             if not isinstance(entry, dict):
                 raise ValueError("strategy catalog entries must be mappings")
             keys = (
@@ -309,7 +345,12 @@ class StrategyLoader:
             if readiness not in StrategyLoader.READINESS_VALUES:
                 raise ValueError(f"unknown strategy readiness: {readiness}")
             seen_ids.add(strategy_id)
-            normalized.append(cast(dict[str, str], values))
+            normalized.append(
+                {
+                    **cast(dict[str, str], values),
+                    "kind": kind,
+                }
+            )
         return normalized, verified_files
 
     @staticmethod

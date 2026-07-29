@@ -282,6 +282,32 @@ class TestRiskManagerExposureChecks:
             actor="system",
         )
 
+    def test_daily_loss_transitions_portfolio_parent_lifecycle(
+        self,
+        mock_account_service,
+        signal_factory,
+    ):
+        mock_account_service.set_balance(Decimal("100000"))
+        state_manager = MagicMock()
+        risk_manager = RiskManager(
+            mock_account_service,
+            state_manager=state_manager,
+            lifecycle_id_resolver=lambda _strategy_id: "portfolio_v1",
+        )
+
+        is_allowed, reason = risk_manager.check_risk(
+            signal_factory(signal_type=SignalType.LONG),
+            daily_start_nav=Decimal("100000"),
+            current_nav=Decimal("94990"),
+        )
+
+        assert is_allowed is False
+        state_manager.transition_to_error.assert_called_once_with(
+            "portfolio_v1",
+            reason.removeprefix("REJECT: "),
+            actor="system",
+        )
+
     def test_daily_loss_rejects_even_if_state_transition_fails(
         self, mock_account_service, signal_factory
     ):

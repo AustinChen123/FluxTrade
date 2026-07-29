@@ -4,10 +4,16 @@ from __future__ import annotations
 
 import logging
 from collections.abc import Callable
-from typing import Any, Optional
+from decimal import Decimal
+from typing import Any, Mapping, Optional
 
 from src.core.client_order_id import market_signal_client_order_id
 from src.core.models import Candlestick, Signal, SignalType, Trade
+from src.core.portfolio_runtime import (
+    PortfolioCoordinator,
+    PortfolioDecisionRejected,
+    PortfolioExposureSnapshot,
+)
 from src.core.strategy_registry import StrategyRegistry
 from src.strategies.base import BaseStrategy
 
@@ -52,14 +58,26 @@ class SignalProcessor:
         registry: StrategyRegistry,
         execution_engine: Any,
         state_manager: Any | None = None,
-        signal_handler: Callable[[Signal, Optional[Candlestick]], None] | None = None,
+        signal_handler: (
+            Callable[[Signal, Optional[Candlestick]], bool | None] | None
+        ) = None,
         position_loader: Callable[[str, str], Any | None] | None = None,
+        exposure_loader: (
+            Callable[
+                [tuple[str, ...], str, Mapping[str, str]],
+                PortfolioExposureSnapshot,
+            ]
+            | None
+        ) = None,
+        portfolio_coordinator: PortfolioCoordinator | None = None,
     ) -> None:
         self.registry = registry
         self.execution_engine = execution_engine
         self.state_manager = state_manager
         self.signal_handler = signal_handler
         self.position_loader = position_loader
+        self.exposure_loader = exposure_loader
+        self.portfolio_coordinator = portfolio_coordinator
         self._observed_position_sides: dict[tuple[str, str], str | None] = {}
 
     def on_candle(
@@ -83,7 +101,9 @@ class SignalProcessor:
             if (
                 respect_state
                 and self.state_manager is not None
-                and not self.state_manager.is_running(strategy.strategy_id)
+                and not self.state_manager.is_running(
+                    self._lifecycle_id(strategy.strategy_id)
+                )
             ):
                 logger.debug(
                     "Skipping strategy %s because it is not running",
@@ -97,24 +117,39 @@ class SignalProcessor:
             decisions.append((strategy.strategy_id, signals))
 
         if emit_signals:
-            for strategy_id, signals in decisions:
-                replay_stable_signals = (
-                    [
-                        self._with_market_idempotency(
-                            signal,
-                            product_id=candle.product_id,
-                            event_scope=candle.timeframe,
-                            event_timestamp=candle.timestamp,
-                            ordinal=ordinal,
-                        )
-                        for ordinal, signal in enumerate(signals)
-                    ]
-                    if self.signal_handler is not None
-                    else signals
+            if (
+                self.signal_handler is not None
+                or self.portfolio_coordinator is not None
+            ):
+                decisions = [
+                    (
+                        strategy_id,
+                        [
+                            self._with_market_idempotency(
+                                signal,
+                                product_id=candle.product_id,
+                                event_scope=candle.timeframe,
+                                event_timestamp=candle.timestamp,
+                                ordinal=ordinal,
+                            )
+                            for ordinal, signal in enumerate(signals)
+                        ],
+                    )
+                    for strategy_id, signals in decisions
+                ]
+            if self.portfolio_coordinator is not None:
+                decisions = self.portfolio_coordinator.coordinate_candle_decisions(
+                    candle,
+                    decisions,
+                    exposure_loader=self.exposure_loader,
+                    default_quantity=Decimal(
+                        str(self.execution_engine.default_quantity)
+                    ),
                 )
+            for strategy_id, signals in decisions:
                 self._process_signals(
                     strategy_id,
-                    replay_stable_signals,
+                    signals,
                     candle,
                 )
 
@@ -211,22 +246,60 @@ class SignalProcessor:
             raise ValueError(
                 "trade requires a stable id and positive timestamp for replay safety"
             )
-        decisions: list[tuple[str, Signal]] = []
+        eligible_strategies: list[BaseStrategy] = []
         for strategy in self.registry.list_active():
             if strategy.product_id != trade.product_id:
                 continue
             if self.state_manager is not None and not self.state_manager.is_running(
-                strategy.strategy_id
+                self._lifecycle_id(strategy.strategy_id)
             ):
                 logger.debug(
                     "Skipping strategy %s because it is not running",
                     strategy.strategy_id,
                 )
                 continue
+            eligible_strategies.append(strategy)
 
+        unsupported_portfolio_strategies = [
+            strategy.strategy_id
+            for strategy in eligible_strategies
+            if (
+                self.portfolio_coordinator is not None
+                and self.portfolio_coordinator.portfolio_id_for_sleeve(
+                    strategy.strategy_id
+                )
+                is not None
+                and type(strategy).on_trade is not BaseStrategy.on_trade
+            )
+        ]
+        if unsupported_portfolio_strategies:
+            raise PortfolioDecisionRejected(
+                "portfolio_trade_signals_unsupported:"
+                f"strategy_ids={','.join(unsupported_portfolio_strategies)}"
+            )
+
+        decisions: list[tuple[str, Signal]] = []
+        for strategy in eligible_strategies:
             signal = strategy.on_trade(trade)
             if signal is not None:
                 decisions.append((strategy.strategy_id, signal))
+
+        portfolio_signal_ids = [
+            strategy_id
+            for strategy_id, _signal in decisions
+            if (
+                self.portfolio_coordinator is not None
+                and self.portfolio_coordinator.portfolio_id_for_sleeve(
+                    strategy_id
+                )
+                is not None
+            )
+        ]
+        if portfolio_signal_ids:
+            raise PortfolioDecisionRejected(
+                "portfolio_trade_signals_unsupported:"
+                f"strategy_ids={','.join(portfolio_signal_ids)}"
+            )
 
         for strategy_id, signal in decisions:
             replay_stable_signal = (
@@ -244,6 +317,11 @@ class SignalProcessor:
                 else signal
             )
             self._process_signals(strategy_id, [replay_stable_signal], None)
+
+    def _lifecycle_id(self, strategy_id: str) -> str:
+        if self.portfolio_coordinator is None:
+            return strategy_id
+        return self.portfolio_coordinator.lifecycle_id_for_strategy(strategy_id)
 
     def _dispatch_to_strategy(
         self,
@@ -279,7 +357,19 @@ class SignalProcessor:
                     signal.strategy_id,
                 )
             if self.signal_handler is not None:
-                self.signal_handler(signal, candle)
+                submitted = self.signal_handler(signal, candle)
+                if (
+                    submitted is False
+                    and self.portfolio_coordinator is not None
+                    and self.portfolio_coordinator.portfolio_id_for_sleeve(
+                        strategy_id
+                    )
+                    is not None
+                ):
+                    raise PortfolioDecisionRejected(
+                        "portfolio_submission_rejected:"
+                        f"strategy_id={strategy_id}"
+                    )
             else:
                 self.execution_engine.execute_signal(signal, candle)
 

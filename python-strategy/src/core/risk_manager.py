@@ -298,6 +298,7 @@ class RiskManager:
         instrument_spec_resolver: Optional[
             Callable[[str], InstrumentSpec | None]
         ] = None,
+        lifecycle_id_resolver: Callable[[str], str] | None = None,
     ):
         self.account_service = account_service
         self.risk_config = risk_config or RiskConfig.from_env()
@@ -319,6 +320,7 @@ class RiskManager:
         self.state_manager = state_manager
         self.daily_nav_service = daily_nav_service
         self.instrument_spec_resolver = instrument_spec_resolver
+        self.lifecycle_id_resolver = lifecycle_id_resolver or (lambda value: value)
         self.max_exposure_per_strategy = (
             max_exposure_per_strategy or self.risk_config.max_position_notional
         )
@@ -512,7 +514,7 @@ class RiskManager:
             return
         try:
             self.state_manager.transition_to_error(
-                strategy_id,
+                self.lifecycle_id_resolver(strategy_id),
                 reason,
                 actor="system",
             )
