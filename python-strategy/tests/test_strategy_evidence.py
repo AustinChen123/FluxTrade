@@ -9,10 +9,14 @@ from pathlib import Path
 import pytest
 
 from src.core.models import Candlestick, Signal, SignalType
+from src.core.portfolio_runtime import PortfolioDefinition, PortfolioSleeve
 from src.core.strategy_context import StrategyContext
 from src.strategies.base import BaseStrategy, StrategyRequirements
 from src.validation.strategy_evidence import (
+    run_portfolio_shadow_evidence,
     run_shadow_evidence,
+    verify_portfolio_historical_stream_parity,
+    verify_portfolio_shadow_evidence_bundle,
     verify_shadow_evidence_bundle,
     verify_historical_stream_parity,
 )
@@ -53,6 +57,29 @@ setattr(CloseSignalStrategy, "__fluxtrade_display_name__", "Evidence Fixture")
 setattr(CloseSignalStrategy, "__fluxtrade_artifact_version__", "1.0.0")
 setattr(CloseSignalStrategy, "__fluxtrade_readiness__", "RESEARCH_VALIDATED")
 setattr(CloseSignalStrategy, "__fluxtrade_catalog_sha256__", "0" * 64)
+
+
+def _portfolio(
+    *,
+    max_gross_quantity: Decimal = Decimal("2"),
+) -> PortfolioDefinition:
+    return PortfolioDefinition(
+        portfolio_id="portfolio",
+        product_id=PRODUCT_ID,
+        sleeves=(
+            PortfolioSleeve(
+                CloseSignalStrategy("portfolio.sleeve_a", PRODUCT_ID)
+            ),
+            PortfolioSleeve(
+                CloseSignalStrategy("portfolio.sleeve_b", PRODUCT_ID)
+            ),
+        ),
+        max_gross_quantity=max_gross_quantity,
+        artifact_version="1.0.0",
+        display_name="Evidence Portfolio",
+        readiness="RESEARCH_FROZEN",
+        catalog_sha256="1" * 64,
+    )
 
 
 def _write_csv(path, rows):
@@ -187,6 +214,85 @@ def test_historical_stream_parity_reports_only_partial_reference_prefix(tmp_path
     assert report.source_actionable_signal_count == 1
 
 
+def test_portfolio_historical_stream_parity_uses_complete_sleeve_batch(
+    tmp_path,
+):
+    source = tmp_path / "source.csv"
+    reference = tmp_path / "reference.csv"
+    _write_csv(
+        source,
+        [
+            (
+                f"2026-07-27T12:{minute:02d}:00Z",
+                str(100 + minute),
+                str(101 + minute),
+                str(99 + minute),
+                str(100 + minute),
+                "1",
+            )
+            for minute in range(11)
+        ],
+    )
+    _write_csv(
+        reference,
+        [
+            ("1785153600000", "100", "105", "99", "104", "5"),
+            ("1785153900000", "105", "110", "104", "109", "5"),
+        ],
+    )
+
+    report = verify_portfolio_historical_stream_parity(
+        source,
+        reference,
+        product_id=PRODUCT_ID,
+        portfolio_factory=_portfolio,
+    )
+
+    assert report.source_decision_count == 4
+    assert report.source_actionable_signal_count == 4
+    assert report.source_signal_digest == report.reference_signal_digest
+    assert report.strategy.strategy_id == "portfolio"
+    assert report.strategy.display_name == "Evidence Portfolio"
+
+
+def test_portfolio_historical_stream_parity_enforces_batch_gross_limit(
+    tmp_path,
+):
+    source = tmp_path / "source.csv"
+    reference = tmp_path / "reference.csv"
+    _write_csv(
+        source,
+        [
+            (
+                f"2026-07-27T12:{minute:02d}:00Z",
+                "100",
+                "101",
+                "99",
+                "100",
+                "1",
+            )
+            for minute in range(6)
+        ],
+    )
+    _write_csv(
+        reference,
+        [("1785153600000", "100", "101", "99", "100", "5")],
+    )
+
+    with pytest.raises(
+        RuntimeError,
+        match="portfolio_gross_limit_exceeded",
+    ):
+        verify_portfolio_historical_stream_parity(
+            source,
+            reference,
+            product_id=PRODUCT_ID,
+            portfolio_factory=lambda: _portfolio(
+                max_gross_quantity=Decimal("1")
+            ),
+        )
+
+
 class _FakeRedis:
     def __init__(self, events):
         self.events = list(events)
@@ -294,6 +400,41 @@ def test_shadow_records_replayable_source_candles_and_complete_decisions():
     assert replay == report
     assert all(call[0] for call in redis.calls)
     assert not hasattr(redis, "xreadgroup")
+
+
+def test_portfolio_shadow_records_and_replays_coordinated_decisions():
+    redis = _FakeRedis(
+        _source_events(range(6))
+        + [(DECISION_STREAM_KEY, _decision_entry(0))]
+    )
+    output = io.StringIO()
+
+    report = run_portfolio_shadow_evidence(
+        redis,
+        source_stream_key=SOURCE_STREAM_KEY,
+        decision_stream_key=DECISION_STREAM_KEY,
+        portfolio=_portfolio(),
+        output=output,
+        duration_seconds=1,
+        monotonic=_Clock(),
+    )
+
+    assert report.actionable_signal_count == 2
+    assert report.strategy.strategy_id == "portfolio"
+    records = [json.loads(line) for line in output.getvalue().splitlines()]
+    decision = next(record for record in records if record["type"] == "decision")
+    assert [signal["strategy_id"] for signal in decision["signals"]] == [
+        "portfolio.sleeve_a",
+        "portfolio.sleeve_b",
+    ]
+    output.seek(0)
+    assert (
+        verify_portfolio_shadow_evidence_bundle(
+            output,
+            portfolio_factory=_portfolio,
+        )
+        == report
+    )
 
 
 def test_shadow_discards_partial_startup_bucket_then_recovers():

@@ -25,6 +25,7 @@ from src.core.portfolio_runtime import (
     build_portfolio_artifact,
 )
 from src.strategies.base import BaseStrategy
+from src.validation.strategy_evidence import portfolio_evidence_identity
 
 STRATEGY_CODE = """
 from src.strategies.base import BaseStrategy, StrategyRequirements
@@ -51,6 +52,23 @@ from src.core.portfolio_runtime import (
     PortfolioFactory,
     PortfolioSleeve,
 )
+from .sleeve_a import Sleeve as SleeveA
+from .sleeve_b import Sleeve as SleeveB
+
+class ManifestPortfolioFactory(PortfolioFactory):
+    def build(self, *, portfolio_id, product_id, config):
+        sleeve_class = SleeveB if config.get("sleeve") == "b" else SleeveA
+        return PortfolioDefinition(
+            portfolio_id=portfolio_id,
+            product_id=product_id,
+            sleeves=(
+                PortfolioSleeve(sleeve_class(f"{portfolio_id}.sleeve", product_id)),
+            ),
+            max_gross_quantity=Decimal(str(config["max_gross_quantity"])),
+        )
+"""
+
+PORTFOLIO_SLEEVE_A_CODE = """
 from src.strategies.base import BaseStrategy, StrategyRequirements
 
 class Sleeve(BaseStrategy):
@@ -61,15 +79,26 @@ class Sleeve(BaseStrategy):
         return None
     def replay_configuration(self):
         return {"strategy_id": self.strategy_id, "product_id": self.product_id}
+"""
 
-class ManifestPortfolioFactory(PortfolioFactory):
-    def build(self, *, portfolio_id, product_id, config):
-        return PortfolioDefinition(
-            portfolio_id=portfolio_id,
-            product_id=product_id,
-            sleeves=(PortfolioSleeve(Sleeve(f"{portfolio_id}.sleeve", product_id)),),
-            max_gross_quantity=Decimal(str(config["max_gross_quantity"])),
+PORTFOLIO_SLEEVE_B_CODE = """
+from src.core.models import Signal, SignalType
+from src.strategies.base import BaseStrategy, StrategyRequirements
+
+class Sleeve(BaseStrategy):
+    @property
+    def requirements(self):
+        return StrategyRequirements(self.product_id, "5m", 10)
+    def on_candle(self, candle):
+        return Signal(
+            strategy_id=self.strategy_id,
+            product_id=self.product_id,
+            timeframe="5m",
+            timestamp=candle.timestamp,
+            type=SignalType.NO_SIGNAL,
         )
+    def replay_configuration(self):
+        return {"strategy_id": self.strategy_id, "product_id": self.product_id}
 """
 
 
@@ -150,10 +179,16 @@ class MyStrategy(BaseStrategy):
     def test_finds_hash_pinned_portfolio_factory(self, tmp_path):
         module = tmp_path / "portfolio.py"
         module.write_text(PORTFOLIO_CODE)
+        sleeve_a = tmp_path / "sleeve_a.py"
+        sleeve_a.write_text(PORTFOLIO_SLEEVE_A_CODE)
+        sleeve_b = tmp_path / "sleeve_b.py"
+        sleeve_b.write_text(PORTFOLIO_SLEEVE_B_CODE)
         catalog = {
             "schema_version": 2,
             "files": {
                 module.name: hashlib.sha256(module.read_bytes()).hexdigest(),
+                sleeve_a.name: hashlib.sha256(sleeve_a.read_bytes()).hexdigest(),
+                sleeve_b.name: hashlib.sha256(sleeve_b.read_bytes()).hexdigest(),
             },
             "strategies": [],
             "portfolios": [
@@ -182,7 +217,56 @@ class MyStrategy(BaseStrategy):
         )
         assert definition.readiness == "RESEARCH_FROZEN"
         assert definition.artifact_version == "1.0.0"
+        assert definition.display_name == "Portfolio v1"
         assert definition.catalog_sha256 is not None
+
+        relocated = tmp_path / "relocated"
+        relocated.mkdir()
+        for source in (module, sleeve_a, sleeve_b):
+            (relocated / source.name).write_bytes(source.read_bytes())
+        (relocated / StrategyLoader.CATALOG_NAME).write_bytes(
+            (tmp_path / StrategyLoader.CATALOG_NAME).read_bytes()
+        )
+        relocated_factory = StrategyLoader.scan_directory(str(relocated))[
+            "portfolio_v1"
+        ]
+        assert not isinstance(relocated_factory, str)
+        relocated_definition = build_portfolio_artifact(
+            relocated_factory,
+            portfolio_id="portfolio_v1",
+            product_id="RITHMIC:MNQ_ROLL-PERP",
+            config={"max_gross_quantity": "1"},
+        )
+        assert (
+            portfolio_evidence_identity(definition).replay_configuration_sha256
+            == portfolio_evidence_identity(
+                relocated_definition
+            ).replay_configuration_sha256
+        )
+        changed_config_definition = build_portfolio_artifact(
+            relocated_factory,
+            portfolio_id="portfolio_v1",
+            product_id="RITHMIC:MNQ_ROLL-PERP",
+            config={"max_gross_quantity": "2"},
+        )
+        assert (
+            portfolio_evidence_identity(definition).replay_configuration_sha256
+            != portfolio_evidence_identity(
+                changed_config_definition
+            ).replay_configuration_sha256
+        )
+        changed_class_definition = build_portfolio_artifact(
+            relocated_factory,
+            portfolio_id="portfolio_v1",
+            product_id="RITHMIC:MNQ_ROLL-PERP",
+            config={"max_gross_quantity": "1", "sleeve": "b"},
+        )
+        assert (
+            portfolio_evidence_identity(definition).replay_configuration_sha256
+            != portfolio_evidence_identity(
+                changed_class_definition
+            ).replay_configuration_sha256
+        )
 
     def test_finds_multiple_strategies_in_one_file(self, tmp_path):
         """Should discover multiple subclasses in one file."""

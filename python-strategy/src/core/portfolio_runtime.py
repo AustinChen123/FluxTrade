@@ -82,6 +82,7 @@ class PortfolioDefinition:
     sleeves: tuple[PortfolioSleeve, ...]
     max_gross_quantity: Decimal
     artifact_version: str | None = None
+    display_name: str | None = None
     readiness: str | None = None
     catalog_sha256: str | None = None
 
@@ -175,6 +176,11 @@ def build_portfolio_artifact(
             "__fluxtrade_artifact_version__",
             None,
         ),
+        display_name=getattr(
+            factory_cls,
+            "__fluxtrade_display_name__",
+            None,
+        ),
         readiness=getattr(factory_cls, "__fluxtrade_readiness__", None),
         catalog_sha256=getattr(
             factory_cls,
@@ -210,6 +216,57 @@ def _portfolio_replay_signature(definition: PortfolioDefinition) -> tuple[object
         definition.max_gross_quantity,
         tuple(sleeve_signatures),
     )
+
+
+def portfolio_replay_configuration(
+    definition: PortfolioDefinition,
+) -> dict[str, object]:
+    """Return the stable configuration used for portfolio evidence identity."""
+    sleeves: list[dict[str, object]] = []
+    for sleeve in definition.sleeves:
+        requirements = sleeve.strategy.requirements
+        try:
+            replay_configuration = sleeve.strategy.replay_configuration()
+        except NotImplementedError as exc:
+            raise ValueError(
+                "portfolio sleeve is not replay-safe: "
+                f"{sleeve.strategy.strategy_id}"
+            ) from exc
+        sleeves.append(
+            {
+                "class_path": _portable_strategy_class_path(sleeve.strategy),
+                "strategy_id": sleeve.strategy.strategy_id,
+                "product_id": sleeve.strategy.product_id,
+                "requirements": {
+                    "product_id": requirements.product_id,
+                    "timeframe": requirements.timeframe,
+                    "lookback_window": requirements.lookback_window,
+                },
+                "replay_configuration": replay_configuration,
+                "activation_windows": [
+                    {
+                        "start_ms": window.start_ms,
+                        "end_ms": window.end_ms,
+                    }
+                    for window in sleeve.activation_windows
+                ],
+            }
+        )
+    return {
+        "portfolio_id": definition.portfolio_id,
+        "product_id": definition.product_id,
+        "max_gross_quantity": definition.max_gross_quantity,
+        "sleeves": sleeves,
+    }
+
+
+def _portable_strategy_class_path(strategy: BaseStrategy) -> str:
+    strategy_class = type(strategy)
+    module = strategy_class.__module__
+    package, separator, relative_module = module.partition(".")
+    if package.startswith("_fluxtrade_pack_") and separator:
+        module = relative_module
+    return f"{module}.{strategy_class.__qualname__}"
 
 
 class PortfolioCoordinator:
