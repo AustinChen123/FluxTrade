@@ -1,0 +1,12 @@
+title = "FluxTrade secret scanning"
+
+[extend]
+useDefault = true
+
+[[rules]]
+id = "rithmic-account-id"
+description = "Rithmic account identifiers must not be committed"
+regex = '''\b(CC[0-9]{5,})\b'''
+secretGroup = 1
+keywords = ["CC"]
+tags = ["rithmic", "account-id", "privacy"]
