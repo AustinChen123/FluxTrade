@@ -1,6 +1,8 @@
 import type { EChartsCoreOption } from "echarts/core";
 
+import { finiteDecimalNumber } from "./decimal";
 import type { Theme } from "./theme";
+import { parseUtcTimestamp } from "./utc";
 
 export type TradeSide = "LONG" | "SHORT";
 export type TradeEvent = "entry" | "exit";
@@ -60,40 +62,6 @@ export type TradeChartCopy = {
   shortExit: string;
 };
 
-function finiteNumber(value: string): number | null {
-  if (
-    !/^[+-]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][+-]?\d+)?$/.test(value.trim())
-  ) {
-    return null;
-  }
-  const parsed = Number(value);
-  return Number.isFinite(parsed) ? parsed : null;
-}
-
-export function parseUtcTimestamp(value: string): number | null {
-  const match =
-    /^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2}):(\d{2})(?:\.\d+)?(?:Z|\+00:00)$/.exec(
-      value
-    );
-  if (!match) {
-    return null;
-  }
-  const parsed = Date.parse(value);
-  if (!Number.isFinite(parsed)) {
-    return null;
-  }
-  const date = new Date(parsed);
-  const parts = match.slice(1, 7).map(Number);
-  return date.getUTCFullYear() === parts[0] &&
-    date.getUTCMonth() + 1 === parts[1] &&
-    date.getUTCDate() === parts[2] &&
-    date.getUTCHours() === parts[3] &&
-    date.getUTCMinutes() === parts[4] &&
-    date.getUTCSeconds() === parts[5]
-    ? parsed
-    : null;
-}
-
 export function buildTradeChartModel(
   snapshot: TradeChartSnapshot
 ): TradeChartModel {
@@ -104,11 +72,11 @@ export function buildTradeChartModel(
   let previousTimestamp = Number.NEGATIVE_INFINITY;
 
   for (const candle of snapshot.candles) {
-    const open = finiteNumber(candle.open);
-    const high = finiteNumber(candle.high);
-    const low = finiteNumber(candle.low);
-    const close = finiteNumber(candle.close);
-    const volume = finiteNumber(candle.volume);
+    const open = finiteDecimalNumber(candle.open);
+    const high = finiteDecimalNumber(candle.high);
+    const low = finiteDecimalNumber(candle.low);
+    const close = finiteDecimalNumber(candle.close);
+    const volume = finiteDecimalNumber(candle.volume);
     const timestamp = parseUtcTimestamp(candle.timestamp);
     const validTimestamp =
       timestamp !== null && timestamp > previousTimestamp;
@@ -139,7 +107,7 @@ export function buildTradeChartModel(
       ["exit", trade.exitTime, trade.exitPrice]
     ];
     for (const [event, timestamp, price] of events) {
-      const numericPrice = finiteNumber(price);
+      const numericPrice = finiteDecimalNumber(price);
       const instant = parseUtcTimestamp(timestamp);
       const candleTimestamp =
         instant === null ? undefined : timestampByInstant.get(instant);
@@ -205,11 +173,22 @@ export function tradeChartOption(
   const grid = dark ? "#3b4949" : "#cbd5d1";
   const up = dark ? "#49b2ae" : "#0e6b6f";
   const down = dark ? "#ef8a6b" : "#d46a4c";
-  const date = new Intl.DateTimeFormat(locale, {
+  const axisDate = new Intl.DateTimeFormat(locale, {
     month: "2-digit",
     day: "2-digit",
     hour: "2-digit",
-    minute: "2-digit"
+    minute: "2-digit",
+    hour12: false,
+    timeZone: "UTC"
+  });
+  const tooltipDate = new Intl.DateTimeFormat(locale, {
+    month: "2-digit",
+    day: "2-digit",
+    hour: "2-digit",
+    minute: "2-digit",
+    hour12: false,
+    timeZone: "UTC",
+    timeZoneName: "short"
   });
   const number = new Intl.NumberFormat(locale, {
     maximumFractionDigits: 8
@@ -257,7 +236,7 @@ export function tradeChartOption(
             return "";
           }
           return [
-            date.format(new Date(timestamp)),
+            tooltipDate.format(new Date(timestamp)),
             `O ${number.format(candle[0])}`,
             `H ${number.format(candle[3])}`,
             `L ${number.format(candle[2])}`,
@@ -273,7 +252,7 @@ export function tradeChartOption(
           `${marker.event === "entry" ? copy.entry : copy.exit} ${number.format(
             marker.value[1]
           )}`,
-          date.format(new Date(marker.value[0]))
+          tooltipDate.format(new Date(marker.value[0]))
         ].join("\n");
       }
     },
@@ -285,7 +264,7 @@ export function tradeChartOption(
       axisLabel: {
         color: muted,
         hideOverlap: true,
-        formatter: (value: string) => date.format(new Date(value))
+        formatter: (value: string) => axisDate.format(new Date(value))
       }
     },
     yAxis: {

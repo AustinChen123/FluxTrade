@@ -48,7 +48,14 @@ describe("TradeChartView", () => {
   });
 
   it("selects the same trade from chart markers and the accessible ledger", async () => {
-    render(<TradeChartView demoMode theme="light" />);
+    const onSelectTrade = vi.fn();
+    render(
+      <TradeChartView
+        demoMode
+        theme="light"
+        onSelectTrade={onSelectTrade}
+      />
+    );
 
     fireEvent.click(
       await screen.findByRole("button", {
@@ -61,10 +68,77 @@ describe("TradeChartView", () => {
         "aria-pressed"
       )
     ).toBe("true");
+    expect(onSelectTrade).toHaveBeenLastCalledWith("trade-000185");
 
     fireEvent.click(screen.getByRole("button", { name: /trade-000184/ }));
     expect(screen.getAllByText("trade-000184")).toHaveLength(2);
+    expect(onSelectTrade).toHaveBeenLastCalledWith("trade-000184");
   });
+
+  it("preselects a trade opened from the backtest result ledger", async () => {
+    render(
+      <TradeChartView
+        demoMode
+        theme="light"
+        initialTradeId="trade-000185"
+      />
+    );
+
+    const selectedTrade = await screen.findByRole("button", {
+      name: /trade-000185/
+    });
+    expect(selectedTrade.getAttribute("aria-pressed")).toBe("true");
+    expect(selectedTrade.textContent).toContain("16:20");
+    expect(selectedTrade.textContent).toContain("UTC");
+    expect(screen.getAllByText("trade-000185")).toHaveLength(2);
+  });
+
+  it("formats trade financial text without losing Decimal precision", () => {
+    render(
+      <TradeChartView
+        demoMode={false}
+        theme="light"
+        snapshot={{
+          ...demoTradeSnapshot,
+          trades: [
+            {
+              ...demoTradeSnapshot.trades[0],
+              pnl: "9007199254740993.00"
+            }
+          ]
+        }}
+      />
+    );
+
+    expect(
+      screen.getByRole("button", { name: /trade-000184/ }).textContent
+    ).toContain("9,007,199,254,740,993.00");
+  });
+
+  it.each(["0x10", "1e2", "", "Infinity"])(
+    "rejects non-decimal trade value %j",
+    (pnl) => {
+      render(
+        <TradeChartView
+          demoMode={false}
+          theme="light"
+          snapshot={{
+            ...demoTradeSnapshot,
+            trades: [
+              {
+                ...demoTradeSnapshot.trades[0],
+                pnl
+              }
+            ]
+          }}
+        />
+      );
+
+      expect(
+        screen.getByRole("button", { name: /trade-000184/ }).textContent
+      ).toContain("—");
+    }
+  );
 
   it("fails closed when production data is unavailable", () => {
     render(<TradeChartView demoMode={false} theme="dark" />);

@@ -2,9 +2,9 @@ import { lazy, Suspense, useMemo, useState } from "react";
 import { useTranslation } from "react-i18next";
 
 import { demoTradeSnapshot } from "./tradeDemo";
+import { finiteDecimalNumber, isDecimalString } from "./decimal";
 import {
   buildTradeChartModel,
-  parseUtcTimestamp,
   selectedTradeOption,
   tradeChartOption,
   tradeIdFromChartData,
@@ -13,6 +13,7 @@ import {
 } from "./tradeChart";
 import type { Locale } from "./i18n";
 import type { Theme } from "./theme";
+import { parseUtcTimestamp } from "./utc";
 
 const CandlestickChart = lazy(() =>
   import("./CandlestickChart").then((module) => ({
@@ -24,14 +25,19 @@ type Props = {
   demoMode: boolean;
   theme: Theme;
   snapshot?: TradeChartSnapshot | null;
+  initialTradeId?: string | null;
+  onSelectTrade?: (tradeId: string) => void;
 };
 
 function displayDecimal(
   value: string,
   formatter: Intl.NumberFormat
 ): string {
-  const parsed = Number(value);
-  return Number.isFinite(parsed) ? formatter.format(parsed) : "—";
+  if (!isDecimalString(value)) {
+    return "—";
+  }
+  // ECMA-402 preserves validated decimal strings; the ES2022 type only accepts numbers.
+  return formatter.format(value as unknown as number);
 }
 
 function displayTimestamp(
@@ -42,12 +48,20 @@ function displayTimestamp(
   return timestamp === null ? "—" : formatter.format(timestamp);
 }
 
-export function TradeChartView({ demoMode, theme, snapshot }: Props) {
+export function TradeChartView({
+  demoMode,
+  theme,
+  snapshot,
+  initialTradeId,
+  onSelectTrade
+}: Props) {
   const { t, i18n } = useTranslation();
   const locale: Locale = i18n.resolvedLanguage === "en" ? "en" : "zh-TW";
   const data =
     snapshot === undefined ? (demoMode ? demoTradeSnapshot : null) : snapshot;
-  const [selectedTradeId, setSelectedTradeId] = useState<string | null>(null);
+  const [selectedTradeId, setSelectedTradeId] = useState<string | null>(
+    initialTradeId ?? null
+  );
   const model = useMemo(
     () => (data ? buildTradeChartModel(data) : null),
     [data]
@@ -89,7 +103,10 @@ export function TradeChartView({ demoMode, theme, snapshot }: Props) {
         month: "2-digit",
         day: "2-digit",
         hour: "2-digit",
-        minute: "2-digit"
+        minute: "2-digit",
+        hour12: false,
+        timeZone: "UTC",
+        timeZoneName: "short"
       }),
     [locale]
   );
@@ -102,6 +119,10 @@ export function TradeChartView({ demoMode, theme, snapshot }: Props) {
         })}
       </p>
     ) : null;
+  const selectTrade = (tradeId: string) => {
+    setSelectedTradeId(tradeId);
+    onSelectTrade?.(tradeId);
+  };
 
   if (!data) {
     return (
@@ -187,7 +208,7 @@ export function TradeChartView({ demoMode, theme, snapshot }: Props) {
               onDataClick={(chartData) => {
                 const tradeId = tradeIdFromChartData(chartData);
                 if (tradeId !== null) {
-                  setSelectedTradeId(tradeId);
+                  selectTrade(tradeId);
                 }
               }}
             />
@@ -212,7 +233,7 @@ export function TradeChartView({ demoMode, theme, snapshot }: Props) {
                       trade.id === selectedTradeId ? "is-selected" : undefined
                     }
                     aria-pressed={trade.id === selectedTradeId}
-                    onClick={() => setSelectedTradeId(trade.id)}
+                    onClick={() => selectTrade(trade.id)}
                   >
                     <span className={`trade-side side-${trade.side.toLowerCase()}`}>
                       {trade.side}
@@ -221,7 +242,13 @@ export function TradeChartView({ demoMode, theme, snapshot }: Props) {
                       <strong>{trade.id}</strong>
                       <small>{displayTimestamp(trade.entryTime, date)}</small>
                     </span>
-                    <b className={Number(trade.pnl) < 0 ? "is-loss" : undefined}>
+                    <b
+                      className={
+                        (finiteDecimalNumber(trade.pnl) ?? 0) < 0
+                          ? "is-loss"
+                          : undefined
+                      }
+                    >
                       {displayDecimal(trade.pnl, number)}
                     </b>
                   </button>
