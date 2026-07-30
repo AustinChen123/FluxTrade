@@ -53,14 +53,39 @@ const TradeChartView = lazy(() =>
     default: module.TradeChartView
   }))
 );
+const BacktestResultsView = lazy(() =>
+  import("./BacktestResultsView").then((module) => ({
+    default: module.BacktestResultsView
+  }))
+);
 
-type View = "research" | "strategies" | "trades";
+type View = "research" | "results" | "strategies" | "trades";
+
+function validTradeId(value: string | null): value is string {
+  return (
+    value !== null &&
+    value.length > 0 &&
+    value.length <= 256 &&
+    !/[\u0000-\u001F\u007F]/.test(value)
+  );
+}
 
 function initialView(): View {
   const requested = new URLSearchParams(window.location.search).get("view");
-  return requested === "strategies" || requested === "trades"
+  return requested === "results" ||
+    requested === "strategies" ||
+    requested === "trades"
     ? requested
     : "research";
+}
+
+function initialInspectedTradeId(): string | null {
+  const parameters = new URLSearchParams(window.location.search);
+  const tradeId = parameters.get("trade");
+  return parameters.get("view") === "trades" &&
+    validTradeId(tradeId)
+    ? tradeId
+    : null;
 }
 
 function displayNumber(
@@ -133,6 +158,9 @@ export function App() {
   const [xParameter, setXParameter] = useState("");
   const [yParameter, setYParameter] = useState("");
   const [surfaceMode, setSurfaceMode] = useState<"2d" | "3d">("2d");
+  const [inspectedTradeId, setInspectedTradeId] = useState<string | null>(
+    initialInspectedTradeId
+  );
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<unknown | null>(null);
   const [epochsLoaded, setEpochsLoaded] = useState(false);
@@ -362,15 +390,26 @@ export function App() {
     setSelectedGeneId(null);
     setEpochId(nextEpochId);
   };
-  const chooseView = (nextView: View) => {
+  const chooseView = (nextView: View, requestedTradeId: string | null = null) => {
     if (nextView === "research") {
       setResearchActivated(true);
     }
+    const nextTradeId =
+      nextView === "trades" &&
+      validTradeId(requestedTradeId)
+        ? requestedTradeId
+        : null;
+    setInspectedTradeId(nextTradeId);
     const url = new URL(window.location.href);
     if (nextView === "research") {
       url.searchParams.delete("view");
     } else {
       url.searchParams.set("view", nextView);
+    }
+    if (nextTradeId === null) {
+      url.searchParams.delete("trade");
+    } else {
+      url.searchParams.set("trade", nextTradeId);
     }
     window.history.replaceState(
       null,
@@ -394,6 +433,8 @@ export function App() {
             {t(
               view === "research"
                 ? "app.title"
+                : view === "results"
+                  ? "results.title"
                 : view === "strategies"
                   ? "strategies.title"
                   : "trades.title"
@@ -462,6 +503,13 @@ export function App() {
         </button>
         <button
           type="button"
+          aria-current={view === "results" ? "page" : undefined}
+          onClick={() => chooseView("results")}
+        >
+          {t("navigation.results")}
+        </button>
+        <button
+          type="button"
           aria-current={view === "strategies" ? "page" : undefined}
           onClick={() => chooseView("strategies")}
         >
@@ -489,8 +537,28 @@ export function App() {
         </Suspense>
       )}
 
-      {(view === "research" || view === "trades") && demoMode && (
+      {(view === "research" || view === "results" || view === "trades") &&
+        demoMode && (
         <p className="demo-notice">{t("demo")}</p>
+      )}
+
+      {view === "results" && (
+        <Suspense
+          fallback={
+            <div className="loading-indicator" aria-live="polite">
+              <span />
+              {t("results.loading")}
+            </div>
+          }
+        >
+          <BacktestResultsView
+            demoMode={demoMode}
+            theme={theme}
+            onInspectTrade={(tradeId) => {
+              chooseView("trades", tradeId);
+            }}
+          />
+        </Suspense>
       )}
 
       {view === "trades" && (
@@ -502,7 +570,12 @@ export function App() {
             </div>
           }
         >
-          <TradeChartView demoMode={demoMode} theme={theme} />
+          <TradeChartView
+            demoMode={demoMode}
+            theme={theme}
+            initialTradeId={inspectedTradeId}
+            onSelectTrade={(tradeId) => chooseView("trades", tradeId)}
+          />
         </Suspense>
       )}
 

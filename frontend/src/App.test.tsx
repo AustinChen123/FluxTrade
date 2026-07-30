@@ -82,8 +82,46 @@ vi.mock("./StrategyManager", () => ({
 }));
 
 vi.mock("./TradeChartView", () => ({
-  TradeChartView: ({ demoMode }: { demoMode: boolean }) => (
-    <section data-demo={String(demoMode)} data-testid="trade-chart-view" />
+  TradeChartView: ({
+    demoMode,
+    initialTradeId,
+    onSelectTrade
+  }: {
+    demoMode: boolean;
+    initialTradeId?: string | null;
+    onSelectTrade?: (tradeId: string) => void;
+  }) => (
+    <section
+      data-demo={String(demoMode)}
+      data-selected-trade={initialTradeId ?? ""}
+      data-testid="trade-chart-view"
+    >
+      <button
+        type="button"
+        onClick={() => onSelectTrade?.("trade-000184")}
+      >
+        Select mock trade
+      </button>
+    </section>
+  )
+}));
+
+vi.mock("./BacktestResultsView", () => ({
+  BacktestResultsView: ({
+    demoMode,
+    onInspectTrade
+  }: {
+    demoMode: boolean;
+    onInspectTrade?: (tradeId: string) => void;
+  }) => (
+    <section data-demo={String(demoMode)} data-testid="backtest-results-view">
+      <button
+        type="button"
+        onClick={() => onInspectTrade?.("trade-000184")}
+      >
+        Inspect mock trade
+      </button>
+    </section>
   )
 }));
 
@@ -215,11 +253,16 @@ describe("GA visualization state", () => {
   });
 
   it("opens trade inspection directly without loading GA data", async () => {
-    window.history.replaceState({}, "", "/?view=trades");
+    window.history.replaceState(
+      {},
+      "",
+      "/?view=trades&trade=trade-000185&demo=1"
+    );
 
     render(<App />);
 
-    expect(await screen.findByTestId("trade-chart-view")).toBeTruthy();
+    const tradeView = await screen.findByTestId("trade-chart-view");
+    expect(tradeView.getAttribute("data-selected-trade")).toBe("trade-000185");
     expect(api.ensureBrowserSession).not.toHaveBeenCalled();
     expect(api.loadEpochs).not.toHaveBeenCalled();
     expect(screen.queryByRole("combobox", { name: "演化批次" })).toBeNull();
@@ -227,6 +270,84 @@ describe("GA visualization state", () => {
       screen.getByRole("button", { name: "進出場檢視", current: "page" })
     ).toBeTruthy();
     expect(new URL(window.location.href).searchParams.get("view")).toBe("trades");
+    expect(new URL(window.location.href).searchParams.get("trade")).toBe(
+      "trade-000185"
+    );
+  });
+
+  it("keeps an in-page trade selection in the URL across reload", async () => {
+    window.history.replaceState(
+      {},
+      "",
+      "/?view=trades&trade=trade-000185&demo=1"
+    );
+
+    const firstRender = render(<App />);
+    fireEvent.click(
+      await screen.findByRole("button", { name: "Select mock trade" })
+    );
+
+    expect(new URL(window.location.href).searchParams.get("trade")).toBe(
+      "trade-000184"
+    );
+    firstRender.unmount();
+
+    render(<App />);
+    expect(
+      (await screen.findByTestId("trade-chart-view")).getAttribute(
+        "data-selected-trade"
+      )
+    ).toBe("trade-000184");
+  });
+
+  it("opens backtest results directly without loading GA data", async () => {
+    window.history.replaceState({}, "", "/?view=results");
+
+    render(<App />);
+
+    expect(await screen.findByTestId("backtest-results-view")).toBeTruthy();
+    expect(api.ensureBrowserSession).not.toHaveBeenCalled();
+    expect(api.loadEpochs).not.toHaveBeenCalled();
+    expect(screen.queryByRole("combobox", { name: "演化批次" })).toBeNull();
+    expect(
+      screen.getByRole("button", { name: "回測績效", current: "page" })
+    ).toBeTruthy();
+    expect(new URL(window.location.href).searchParams.get("view")).toBe(
+      "results"
+    );
+  });
+
+  it("does not restore an invalid trade ID from the URL", async () => {
+    window.history.replaceState(
+      {},
+      "",
+      "/?view=trades&trade=%0Ainvalid&demo=1"
+    );
+
+    render(<App />);
+
+    const tradeView = await screen.findByTestId("trade-chart-view");
+    expect(tradeView.getAttribute("data-selected-trade")).toBe("");
+  });
+
+  it("opens the exact trade selected from backtest results", async () => {
+    window.history.replaceState({}, "", "/?view=results&demo=1");
+    render(<App />);
+
+    fireEvent.click(
+      await screen.findByRole("button", { name: "Inspect mock trade" })
+    );
+
+    const tradeView = await screen.findByTestId("trade-chart-view");
+    expect(tradeView.getAttribute("data-selected-trade")).toBe("trade-000184");
+    expect(new URL(window.location.href).searchParams.get("view")).toBe("trades");
+    expect(new URL(window.location.href).searchParams.get("trade")).toBe(
+      "trade-000184"
+    );
+
+    fireEvent.click(screen.getByRole("button", { name: "回測績效" }));
+    expect(await screen.findByTestId("backtest-results-view")).toBeTruthy();
+    expect(new URL(window.location.href).searchParams.has("trade")).toBe(false);
   });
 
   it("keeps the initial epoch request alive across console view switches", async () => {
