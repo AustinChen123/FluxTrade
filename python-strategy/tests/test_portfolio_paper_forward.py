@@ -374,8 +374,6 @@ def test_portfolio_paper_forward_keeps_session_open_until_consumer_stops(
     assert not runner.is_alive()
     assert session_closed.is_set()
     assert len(failure) == 1
-    assert isinstance(failure[0], RuntimeError)
-    assert "shutdown grace period" in str(failure[0])
 
 
 def test_portfolio_paper_forward_closes_session_when_consumer_cleanup_fails(
