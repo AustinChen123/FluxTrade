@@ -9,6 +9,7 @@ from src.core.adapters.rithmic_recovery import (
     build_rithmic_recovery_plan,
     compare_rithmic_positions,
     load_rithmic_recovery_snapshot,
+    rithmic_order_may_be_working,
 )
 from src.core.order_reconciliation import OrderReconciler
 
@@ -82,6 +83,57 @@ def snapshot(*, orders=(), order_history=(), fills=(), positions=(), account_sum
             SimpleNamespace(account_balance="100000") if account_summary else None
         ),
     )
+
+
+@pytest.mark.parametrize(
+    ("remote", "expected"),
+    [
+        (remote_order(), True),
+        (
+            remote_order(
+                status="complete",
+                notification_type="COMPLETE",
+                filled_quantity=None,
+                completion_reason="FA",
+            ),
+            False,
+        ),
+        (
+            remote_order(
+                status="complete",
+                notification_type="CANCEL",
+                filled_quantity="2",
+            ),
+            True,
+        ),
+        (
+            remote_order(
+                status="complete",
+                notification_type="REJECT",
+                filled_quantity="0",
+            ),
+            False,
+        ),
+        (
+            remote_order(
+                status="OPEN",
+                notification_type="FILL",
+                filled_quantity="2",
+            ),
+            False,
+        ),
+        (
+            remote_order(
+                status="OPEN",
+                notification_type="OPEN",
+                filled_quantity="2",
+            ),
+            True,
+        ),
+    ],
+)
+def test_rithmic_order_working_classifier_is_fail_closed(remote, expected):
+    assert rithmic_order_may_be_working(remote) is expected
 
 
 @pytest.mark.parametrize(
