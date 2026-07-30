@@ -13,6 +13,7 @@ import re
 from dataclasses import dataclass
 from decimal import Decimal, InvalidOperation, ROUND_DOWN, ROUND_UP
 from enum import Enum
+from functools import lru_cache
 from typing import Any
 
 logger = logging.getLogger(__name__)
@@ -155,6 +156,7 @@ class TriggerPricePolicy(str, Enum):
     ROUND_UP = "round_up"
 
 
+@lru_cache(maxsize=4096)
 def _parse_product_id(product_id: str) -> dict:
     """Parse product_id into components using generic rules.
 

@@ -1,7 +1,7 @@
 import inspect
 import uuid
 from decimal import Decimal
-from typing import TYPE_CHECKING, Optional, List, Dict
+from typing import TYPE_CHECKING, Optional, List, Dict, Sequence
 from src.core.interfaces.exchange import ExchangeError, ExchangeOrderSnapshot, IExchangeAdapter
 from src.core.orm_models import Order
 from src.core.models import OrderSide, Position, Candlestick, PositionSide
@@ -212,18 +212,36 @@ class SimulatedAdapter(IExchangeAdapter):
                         rust_pos = pos
                         break
 
-        if not rust_pos or rust_pos.side == "FLAT" or Decimal(rust_pos.quantity) <= 0:
-            return None
-
-        resolved_strategy_id = strategy_id or getattr(rust_pos, "strategy_id", "") or ""
-        return Position(
-            strategy_id=resolved_strategy_id,
+        return _position_from_rust(
+            rust_pos,
+            strategy_id=strategy_id,
             product_id=product_id,
-            side=PositionSide(rust_pos.side),
-            quantity=Decimal(rust_pos.quantity),
-            entry_price=Decimal(rust_pos.entry_price),
-            unrealized_pnl=Decimal(rust_pos.unrealized_pnl),
         )
+
+    def get_strategy_positions(
+        self,
+        product_id: str,
+        strategy_ids: Sequence[str],
+    ) -> tuple[Position, ...]:
+        """Return strategy-scoped positions from one matcher snapshot."""
+        if not self.supports_strategy_positions:
+            raise RuntimeError(
+                "strategy-scoped positions require a compatible Rust matcher"
+            )
+        rust_positions = self._engine.positions
+        positions = []
+        for strategy_id in dict.fromkeys(strategy_ids):
+            rust_pos = rust_positions.get(f"{strategy_id}:{product_id}")
+            if rust_pos is None:
+                rust_pos = rust_positions.get(product_id)
+            position = _position_from_rust(
+                rust_pos,
+                strategy_id=strategy_id,
+                product_id=product_id,
+            )
+            if position is not None:
+                positions.append(position)
+        return tuple(positions)
 
     def get_open_orders(
         self,
@@ -463,6 +481,33 @@ def _position_snapshot(
         mark_price=mark_price,
         notional=notional,
         unrealized_pnl=unrealized_pnl,
+    )
+
+
+def _position_from_rust(
+    rust_position,
+    *,
+    strategy_id: str | None,
+    product_id: str,
+) -> Position | None:
+    if (
+        rust_position is None
+        or rust_position.side == "FLAT"
+        or Decimal(rust_position.quantity) <= 0
+    ):
+        return None
+    resolved_strategy_id = (
+        strategy_id
+        or getattr(rust_position, "strategy_id", "")
+        or ""
+    )
+    return Position(
+        strategy_id=resolved_strategy_id,
+        product_id=product_id,
+        side=PositionSide(rust_position.side),
+        quantity=Decimal(rust_position.quantity),
+        entry_price=Decimal(rust_position.entry_price),
+        unrealized_pnl=Decimal(rust_position.unrealized_pnl),
     )
 
 

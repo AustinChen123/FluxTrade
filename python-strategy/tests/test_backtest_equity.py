@@ -2,7 +2,10 @@ from decimal import Decimal
 
 import pytest
 
-from src.core.backtest.equity import portfolio_equity
+from src.core.backtest.equity import (
+    PortfolioEquityCalculator,
+    portfolio_equity,
+)
 from src.core.models import Position, PositionSide
 
 
@@ -20,6 +23,21 @@ class _Adapter:
     def get_position(self, product_id, strategy_id=None):
         assert product_id == PRODUCT_ID
         return self.positions.get(strategy_id)
+
+
+class _BatchAdapter(_Adapter):
+    def __init__(self, positions):
+        super().__init__(positions)
+        self.requests = []
+
+    def get_strategy_positions(self, product_id, strategy_ids):
+        assert product_id == PRODUCT_ID
+        self.requests.append(tuple(strategy_ids))
+        return tuple(
+            self.positions[strategy_id]
+            for strategy_id in strategy_ids
+            if strategy_id in self.positions
+        )
 
 
 def _position(strategy_id: str, side: PositionSide, entry_price: str) -> Position:
@@ -108,3 +126,22 @@ def test_portfolio_equity_allows_one_unscoped_strategy():
         mark_price=Decimal("110"),
         contract_multiplier=Decimal("2"),
     ) == Decimal("1020")
+
+
+def test_portfolio_equity_calculator_reuses_deduplicated_batch_scope():
+    adapter = _BatchAdapter(
+        {
+            "a": _position("a", PositionSide.LONG, "100"),
+            "b": _position("b", PositionSide.SHORT, "120"),
+        }
+    )
+    calculator = PortfolioEquityCalculator(
+        adapter=adapter,
+        strategy_ids=["a", "a", "b"],
+        product_id=PRODUCT_ID,
+        contract_multiplier=Decimal("2"),
+    )
+
+    assert calculator.value(Decimal("110")) == Decimal("1040")
+    assert calculator.value(Decimal("115")) == Decimal("1040")
+    assert adapter.requests == [("a", "b"), ("a", "b")]
