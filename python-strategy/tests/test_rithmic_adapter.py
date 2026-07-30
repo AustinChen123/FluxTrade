@@ -187,9 +187,12 @@ def test_ledger_positions_are_authoritative_signed_positions(
     assert positions[0].quantity == expected_quantity
 
 
-def test_ledger_zero_position_is_omitted(adapter):
+@pytest.mark.parametrize("symbol", ["NQU6", "ESU6"])
+def test_ledger_zero_position_is_omitted_before_instrument_mapping(adapter, symbol):
     positions = adapter.positions_from_ledger_snapshot(
-        ledger_snapshot(positions=[ledger_position(net_quantity="0")])
+        ledger_snapshot(
+            positions=[ledger_position(symbol=symbol, net_quantity="0")]
+        )
     )
 
     assert positions == []

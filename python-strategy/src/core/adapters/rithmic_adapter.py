@@ -692,6 +692,20 @@ class RithmicExchangeAdapter(IExchangeAdapter):
 
         positions = []
         for remote in snapshot.positions:
+            try:
+                net_quantity = Decimal(str(remote.net_quantity))
+            except (InvalidOperation, TypeError, ValueError) as error:
+                raise ExchangeError(
+                    "rithmic_ledger_position_value_invalid: "
+                    f"exchange={remote.exchange} symbol={remote.symbol}"
+                ) from error
+            if not net_quantity.is_finite():
+                raise ExchangeError(
+                    "rithmic_ledger_position_value_invalid: "
+                    f"exchange={remote.exchange} symbol={remote.symbol}"
+                )
+            if net_quantity == 0:
+                continue
             identity = (
                 str(remote.exchange).strip().upper(),
                 str(remote.symbol).strip().upper(),
@@ -703,7 +717,6 @@ class RithmicExchangeAdapter(IExchangeAdapter):
                     f"exchange={identity[0]} symbol={identity[1]}"
                 )
             try:
-                net_quantity = Decimal(str(remote.net_quantity))
                 entry_price = Decimal(str(remote.average_open_fill_price or "0"))
                 unrealized_pnl = Decimal(str(remote.open_pnl or "0"))
             except (InvalidOperation, TypeError, ValueError) as error:
@@ -713,14 +726,12 @@ class RithmicExchangeAdapter(IExchangeAdapter):
                 ) from error
             if not all(
                 value.is_finite()
-                for value in (net_quantity, entry_price, unrealized_pnl)
+                for value in (entry_price, unrealized_pnl)
             ):
                 raise ExchangeError(
                     "rithmic_ledger_position_value_invalid: "
                     f"exchange={identity[0]} symbol={identity[1]}"
                 )
-            if net_quantity == 0:
-                continue
             positions.append(
                 Position(
                     strategy_id="LIVE",
