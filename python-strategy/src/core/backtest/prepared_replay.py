@@ -562,7 +562,9 @@ def _decision_candle(
     spec: PreparedReplaySpec,
     codec: PrecisionCodec,
 ) -> Candlestick:
-    return Candlestick(
+    # The artifact contract already validates product, timeframe, timestamps,
+    # precision, and OHLCV invariants before any event can be iterated.
+    return Candlestick.model_construct(
         product_id=spec.product_id,
         timeframe=spec.decision_timeframe,
         timestamp=int(row[_DECISION_TIMESTAMP]),
