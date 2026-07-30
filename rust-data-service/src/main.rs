@@ -1064,7 +1064,7 @@ mod tests {
         let mitigation = resolve_emergency_mitigation(
             &RuntimeEnvironment::new("live").unwrap(),
             Some("RITHMIC"),
-            Some(("profile-a", "CC24212")),
+            Some(("profile-a", "TEST_ACCOUNT_001")),
         )
         .unwrap();
 
@@ -1074,7 +1074,7 @@ mod tests {
                 account_id,
             } => {
                 assert_eq!(profile, "profile-a");
-                assert_eq!(account_id, "CC24212");
+                assert_eq!(account_id, "TEST_ACCOUNT_001");
             }
             _ => panic!("expected Rithmic emergency mitigation"),
         }

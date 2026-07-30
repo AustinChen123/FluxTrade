@@ -33,16 +33,16 @@ def test_sign_payload_binance_accepts_dict_payloads_in_insertion_order() -> None
         "recvWindow": "5000",
         "timestamp": "1499827319559",
     }
-    secret = "NhqPtmdSJYYUnHB3O3rQ5JYkqV8nG8fI"
+    secret = "test-secret"
 
     assert (
         _sign_payload_binance(payload, secret)
-        == "d9d6f1eae0e75783037ddf14087af6307f4f0da8a9dc6da99a4e7778eccd536a"
+        == "124db24caf194fd7731e272b8cd78354823df3f4cfc33f7430bf18c06eac17d6"
     )
 
 
 def test_sign_payload_binance_changes_when_payload_changes() -> None:
-    secret = "NhqPtmdSJYYUnHB3O3rQ5JYkqV8nG8fI"
+    secret = "test-secret"
 
     assert _sign_payload_binance("timestamp=1", secret) != _sign_payload_binance(
         "timestamp=2",
