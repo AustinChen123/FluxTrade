@@ -993,7 +993,7 @@ class TestAccountService:
         mock_redis.ping.return_value = True
         mock_redis.hgetall.return_value = {
             "venue": "rithmic",
-            "account_id": "CC24212",
+            "account_id": "TEST_ACCOUNT_001",
             "currency": "USD",
             "balance": "50123.45",
             "day_pnl": "-100.55",
@@ -1006,7 +1006,7 @@ class TestAccountService:
             service = AccountService()
         service.configure_authoritative_balance(
             venue="rithmic",
-            account_id="CC24212",
+            account_id="TEST_ACCOUNT_001",
             max_age_seconds=30,
             runtime_environment=RuntimeEnvironment("live"),
         )
@@ -1014,7 +1014,7 @@ class TestAccountService:
         with patch("src.core.risk_manager.time.time", return_value=1704067201):
             assert service.get_balance() == Decimal("50123.45")
         mock_redis.hgetall.assert_called_once_with(
-            "fluxtrade:live:account:rithmic:CC24212"
+            "fluxtrade:live:account:rithmic:TEST_ACCOUNT_001"
         )
 
     def test_authoritative_daily_nav_context_uses_same_snapshot(self):
@@ -1022,7 +1022,7 @@ class TestAccountService:
         mock_redis.ping.return_value = True
         mock_redis.hgetall.return_value = {
             "venue": "rithmic",
-            "account_id": "CC24212",
+            "account_id": "TEST_ACCOUNT_001",
             "currency": "USD",
             "balance": "49900",
             "day_pnl": "-100",
@@ -1034,7 +1034,7 @@ class TestAccountService:
             service = AccountService()
         service.configure_authoritative_balance(
             venue="rithmic",
-            account_id="CC24212",
+            account_id="TEST_ACCOUNT_001",
             max_age_seconds=30,
             runtime_environment=RuntimeEnvironment("live"),
         )
@@ -1046,7 +1046,7 @@ class TestAccountService:
             )
 
         mock_redis.hgetall.assert_called_once_with(
-            "fluxtrade:live:account:rithmic:CC24212"
+            "fluxtrade:live:account:rithmic:TEST_ACCOUNT_001"
         )
 
     @pytest.mark.parametrize(
@@ -1068,7 +1068,7 @@ class TestAccountService:
             (
                 {
                     "venue": "rithmic",
-                    "account_id": "CC24212",
+                    "account_id": "TEST_ACCOUNT_001",
                     "currency": "USD",
                     "balance": "50000",
                     "day_pnl": "0",
@@ -1092,7 +1092,7 @@ class TestAccountService:
             service = AccountService()
         service.configure_authoritative_balance(
             venue="rithmic",
-            account_id="CC24212",
+            account_id="TEST_ACCOUNT_001",
             max_age_seconds=30,
             runtime_environment=RuntimeEnvironment("live"),
         )
@@ -1108,7 +1108,7 @@ class TestAccountService:
             service = AccountService()
         service.configure_authoritative_balance(
             venue="rithmic",
-            account_id="CC24212",
+            account_id="TEST_ACCOUNT_001",
             max_age_seconds=30,
             runtime_environment=RuntimeEnvironment("live"),
         )
@@ -1135,14 +1135,14 @@ class TestAccountService:
             service = AccountService()
         service.configure_authoritative_balance(
             venue="rithmic",
-            account_id="CC24212",
+            account_id="TEST_ACCOUNT_001",
             max_age_seconds=30,
             runtime_environment=RuntimeEnvironment("live"),
         )
 
         service.replace_authoritative_balance(
             venue="rithmic",
-            account_id="CC24212",
+            account_id="TEST_ACCOUNT_001",
             currency="USD",
             balance=Decimal("50123.45"),
             day_pnl=Decimal("-100.55"),
@@ -1151,10 +1151,10 @@ class TestAccountService:
         )
 
         mock_redis.hset.assert_called_once_with(
-            "fluxtrade:live:account:rithmic:CC24212",
+            "fluxtrade:live:account:rithmic:TEST_ACCOUNT_001",
             mapping={
                 "venue": "rithmic",
-                "account_id": "CC24212",
+                "account_id": "TEST_ACCOUNT_001",
                 "currency": "USD",
                 "balance": "50123.45",
                 "day_pnl": "-100.55",
