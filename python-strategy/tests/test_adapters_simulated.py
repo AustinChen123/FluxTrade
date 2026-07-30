@@ -891,6 +891,36 @@ class TestPositionTracking:
 
         assert adapter.get_position(PRODUCT) is None
 
+    def test_strategy_positions_share_one_matcher_snapshot(self, order_factory):
+        adapter = SimulatedAdapter(Decimal("100000"))
+        for strategy_id, side in (("alpha", "buy"), ("beta", "sell")):
+            adapter.place_order(
+                order_factory(
+                    strategy_id=strategy_id,
+                    order_type="market",
+                    side=side,
+                    product_id=PRODUCT,
+                    quantity=Decimal("0.1"),
+                )
+            )
+        adapter.on_market_data(
+            _candle(200, 50000, 50500, 49500, 50200)
+        )
+
+        positions = adapter.get_strategy_positions(
+            PRODUCT,
+            ["alpha", "alpha", "missing", "beta"],
+        )
+
+        assert [position.strategy_id for position in positions] == [
+            "alpha",
+            "beta",
+        ]
+        assert [position.side for position in positions] == [
+            "LONG",
+            "SHORT",
+        ]
+
     def test_different_products_independent(self, order_factory):
         adapter = SimulatedAdapter(Decimal("100000"))
         btc = order_factory(order_type="market", side="buy",

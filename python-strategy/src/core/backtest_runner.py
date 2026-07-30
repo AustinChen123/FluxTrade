@@ -19,7 +19,7 @@ from src.core.models import Candlestick
 from src.strategies.base import BaseStrategy
 from src.core.repositories import BacktestOrderRepository
 from src.core.backtest.loader import get_candles_generator
-from src.core.backtest.equity import portfolio_equity
+from src.core.backtest.equity import PortfolioEquityCalculator
 from src.core.analytics import (
     ClosedTrade,
     annualized_sharpe_from_moments,
@@ -276,6 +276,19 @@ class BacktestRunner:
             if self.execution_timeframe is not None
             else None
         )
+        equity_calculator = (
+            PortfolioEquityCalculator(
+                adapter=mock_account.adapter,
+                strategy_ids=[
+                    strategy.strategy_id
+                    for strategy in self._strategies_buffer
+                ],
+                product_id=self.product_id,
+                contract_multiplier=self.contract_multiplier,
+            )
+            if isinstance(mock_account.adapter, SimulatedAdapter)
+            else None
+        )
         for candle in candles:
             # Update Clock
             self.clock.set_time(candle.timestamp / 1000)
@@ -331,16 +344,11 @@ class BacktestRunner:
                     "backtest portfolio equity requires SimulatedAdapter"
                 )
             else:
-                current_equity = portfolio_equity(
-                    mock_account.adapter,
-                    strategy_ids=[
-                        strategy.strategy_id
-                        for strategy in self._strategies_buffer
-                    ],
-                    product_id=self.product_id,
-                    mark_price=candle.close,
-                    contract_multiplier=self.contract_multiplier,
-                )
+                if equity_calculator is None:
+                    raise RuntimeError(
+                        "backtest portfolio equity calculator is unavailable"
+                    )
+                current_equity = equity_calculator.value(candle.close)
             equity_samples.append((candle.timestamp, current_equity))
             peak_equity = max(peak_equity, current_equity)
             max_drawdown = max(max_drawdown, peak_equity - current_equity)
