@@ -5,14 +5,16 @@ from sqlalchemy.orm import Session
 from sqlalchemy import text
 
 def timeframe_to_ms(timeframe: str) -> int:
-    """Converts timeframe string (e.g. '1m', '1h') to milliseconds."""
+    """Converts timeframe string (e.g. '30s', '1m', '1h') to milliseconds."""
     unit = timeframe[-1]
     try:
         value = int(timeframe[:-1])
     except ValueError:
         raise ValueError(f"Invalid timeframe format: {timeframe}")
 
-    if unit == 'm':
+    if unit == 's':
+        return value * 1000
+    elif unit == 'm':
         return value * 60 * 1000
     elif unit == 'h':
         return value * 60 * 60 * 1000
@@ -44,7 +46,7 @@ def check_data_availability(db: Session, product: str, timeframe: str, lookback:
     }).scalar()
     
     # 10% gap tolerance
-    if result >= lookback * 0.9:
+    if result is not None and result >= lookback * 0.9:
         return True, ""
     
     # Generate backfill command
