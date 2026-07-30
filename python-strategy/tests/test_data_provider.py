@@ -2,7 +2,7 @@
 Tests for src/core/data_provider.py
 
 Covers:
-- timeframe_to_ms unit conversions (minutes, hours, days)
+- timeframe_to_ms unit conversions (seconds, minutes, hours, days)
 - Invalid timeframe formats
 - check_data_availability with sufficient/insufficient data
 - Backfill command format generation
@@ -22,6 +22,9 @@ from src.core.data_provider import timeframe_to_ms, check_data_availability
 
 
 class TestTimeframeToMs:
+
+    def test_thirty_seconds(self):
+        assert timeframe_to_ms("30s") == 30_000
 
     def test_one_minute(self):
         assert timeframe_to_ms("1m") == 60_000
