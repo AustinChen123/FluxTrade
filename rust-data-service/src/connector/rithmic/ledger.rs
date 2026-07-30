@@ -115,6 +115,7 @@ pub(crate) struct OrderSnapshot {
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) enum OrderSnapshotEvent {
     Snapshot(Box<OrderSnapshot>),
+    InterleavedNotification,
     RequestCompleted,
 }
 
@@ -277,6 +278,20 @@ pub(crate) fn decode_order_snapshot_event(
             Ok(OrderSnapshotEvent::Snapshot(Box::new(
                 order_snapshot_from_notification(response, expected_account, true)?,
             )))
+        }
+        RITHMIC_ORDER_NOTIFICATION => {
+            let response: protocol::RithmicOrderNotification = codec::decode(payload)?;
+            if response.is_snapshot == Some(true) {
+                return Ok(OrderSnapshotEvent::Snapshot(Box::new(
+                    rithmic_order_snapshot(response, expected_account)?,
+                )));
+            }
+            let account = account_identity(response.fcm_id, response.ib_id, response.account_id)?;
+            ensure!(
+                account == *expected_account,
+                "Rithmic order notification account mismatch"
+            );
+            Ok(OrderSnapshotEvent::InterleavedNotification)
         }
         template_id => anyhow::bail!("unsupported Rithmic order snapshot template {template_id}"),
     }
@@ -1415,6 +1430,67 @@ mod tests {
         assert_eq!(snapshot.unfilled_quantity, Some(dec!(1)));
         assert_eq!(snapshot.average_fill_price, Some(dec!(21000.25)));
         assert_eq!(snapshot.timestamp_ms, Some(1_800_000_000_123));
+    }
+
+    #[test]
+    fn order_snapshot_distinguishes_snapshot_rows_from_live_notifications() {
+        let notification = |is_snapshot, account_id: &str| {
+            codec::encode(&protocol::RithmicOrderNotification {
+                template_id: RITHMIC_ORDER_NOTIFICATION,
+                notify_type: Some(
+                    protocol::rithmic_order_notification::NotifyType::Complete as i32,
+                ),
+                is_snapshot: Some(is_snapshot),
+                fcm_id: Some("FCM".to_string()),
+                ib_id: Some("IB".to_string()),
+                account_id: Some(account_id.to_string()),
+                basket_id: Some("basket-1".to_string()),
+                exchange: Some("CME".to_string()),
+                symbol: Some("MNQU6".to_string()),
+                status: Some("COMPLETE".to_string()),
+                completion_reason: Some("FA".to_string()),
+                transaction_type: Some(
+                    protocol::rithmic_order_notification::TransactionType::Sell as i32,
+                ),
+                quantity: Some(1),
+                ..Default::default()
+            })
+            .unwrap()
+        };
+
+        assert_eq!(
+            decode_order_snapshot_event(&notification(false, "ACCOUNT"), "orders", &account())
+                .unwrap(),
+            OrderSnapshotEvent::InterleavedNotification,
+        );
+        assert!(
+            decode_order_snapshot_event(&notification(false, "OTHER"), "orders", &account())
+                .is_err()
+        );
+
+        let OrderSnapshotEvent::Snapshot(snapshot) =
+            decode_order_snapshot_event(&notification(true, "ACCOUNT"), "orders", &account())
+                .unwrap()
+        else {
+            panic!("expected a Rithmic order snapshot row");
+        };
+        assert_eq!(snapshot.basket_id, "basket-1");
+        assert_eq!(snapshot.symbol, "MNQU6");
+        assert_eq!(snapshot.status, "COMPLETE");
+        assert_eq!(snapshot.completion_reason.as_deref(), Some("FA"));
+        assert_eq!(snapshot.notification_type.as_deref(), Some("COMPLETE"));
+
+        let sparse_snapshot = codec::encode(&protocol::RithmicOrderNotification {
+            template_id: RITHMIC_ORDER_NOTIFICATION,
+            notify_type: Some(protocol::rithmic_order_notification::NotifyType::Complete as i32),
+            is_snapshot: Some(true),
+            fcm_id: Some("FCM".to_string()),
+            ib_id: Some("IB".to_string()),
+            account_id: Some("ACCOUNT".to_string()),
+            ..Default::default()
+        })
+        .unwrap();
+        assert!(decode_order_snapshot_event(&sparse_snapshot, "orders", &account()).is_err());
     }
 
     #[test]

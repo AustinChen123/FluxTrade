@@ -10,6 +10,7 @@ use super::{
 };
 use anyhow::{ensure, Context, Result};
 use std::{collections::HashSet, time::Duration};
+use tracing::warn;
 
 const RESPONSE_TIMEOUT: Duration = Duration::from_secs(10);
 const SNAPSHOT_TIMEOUT: Duration = Duration::from_secs(30);
@@ -20,6 +21,7 @@ const ORDER_SNAPSHOT_KEY: &str = "fluxtrade-ledger-orders";
 const FILL_HISTORY_KEY: &str = "fluxtrade-ledger-fills";
 const PNL_SNAPSHOT_KEY: &str = "fluxtrade-ledger-pnl";
 const FILL_HISTORY_LIMIT: usize = 10_000;
+const ORDER_SNAPSHOT_MAX_ATTEMPTS: usize = 3;
 
 #[derive(Debug)]
 pub(crate) struct RecoveryQuery<'a> {
@@ -64,18 +66,7 @@ pub(crate) async fn run_with_recovery(
 
     let account = discover_order_account(&mut order_connection, account_id).await?;
 
-    order_connection
-        .send_payload(ledger::show_orders_request(
-            ORDER_SNAPSHOT_KEY,
-            &account.identity,
-        )?)
-        .await?;
-    let orders = tokio::time::timeout(
-        SNAPSHOT_TIMEOUT,
-        collect_orders(&mut order_connection, &account.identity),
-    )
-    .await
-    .context("Rithmic order snapshot timed out")??;
+    let orders = request_stable_order_snapshot(&mut order_connection, &account.identity).await?;
     let (order_history, fills) = if let Some(recovery) = recovery {
         let mut order_history = Vec::new();
         for (index, basket_id) in recovery.basket_ids.iter().enumerate() {
@@ -269,19 +260,55 @@ async fn collect_account(
 async fn collect_orders(
     connection: &mut RithmicConnection,
     account: &AccountIdentity,
-) -> Result<Vec<OrderSnapshot>> {
+    request_key: &str,
+) -> Result<(Vec<OrderSnapshot>, bool)> {
     let mut orders = Vec::new();
     let mut basket_ids = HashSet::new();
+    let mut interleaved_notification = false;
     loop {
         let payload = next_payload(connection).await?;
         if accept_order_event(
             &mut orders,
             &mut basket_ids,
-            ledger::decode_order_snapshot_event(&payload, ORDER_SNAPSHOT_KEY, account)?,
+            &mut interleaved_notification,
+            ledger::decode_order_snapshot_event(&payload, request_key, account)?,
         )? {
-            return Ok(orders);
+            return Ok((orders, interleaved_notification));
         }
     }
+}
+
+async fn request_stable_order_snapshot(
+    connection: &mut RithmicConnection,
+    account: &AccountIdentity,
+) -> Result<Vec<OrderSnapshot>> {
+    for attempt in 1..=ORDER_SNAPSHOT_MAX_ATTEMPTS {
+        let request_key = format!("{ORDER_SNAPSHOT_KEY}-{attempt}");
+        connection
+            .send_payload(ledger::show_orders_request(&request_key, account)?)
+            .await?;
+        let (mut orders, interleaved_notification) = tokio::time::timeout(
+            SNAPSHOT_TIMEOUT,
+            collect_orders(connection, account, &request_key),
+        )
+        .await
+        .context("Rithmic order snapshot timed out")??;
+        orders.sort_by(|left, right| left.basket_id.cmp(&right.basket_id));
+        if order_snapshot_attempt_is_authoritative(interleaved_notification) {
+            return Ok(orders);
+        }
+        warn!(
+            attempt,
+            "Rithmic order snapshot received a concurrent live notification; retrying"
+        );
+    }
+    anyhow::bail!(
+        "Rithmic order snapshot remained concurrent across {ORDER_SNAPSHOT_MAX_ATTEMPTS} attempts"
+    )
+}
+
+fn order_snapshot_attempt_is_authoritative(interleaved_notification: bool) -> bool {
+    !interleaved_notification
 }
 
 async fn collect_order_history(
@@ -421,6 +448,7 @@ fn accept_account_event(
 fn accept_order_event(
     orders: &mut Vec<OrderSnapshot>,
     basket_ids: &mut HashSet<String>,
+    interleaved_notification: &mut bool,
     event: OrderSnapshotEvent,
 ) -> Result<bool> {
     match event {
@@ -430,6 +458,10 @@ fn accept_order_event(
                 "duplicate Rithmic order snapshot basket ID"
             );
             orders.push(*order);
+            Ok(false)
+        }
+        OrderSnapshotEvent::InterleavedNotification => {
+            *interleaved_notification = true;
             Ok(false)
         }
         OrderSnapshotEvent::RequestCompleted => Ok(true),
@@ -652,24 +684,46 @@ mod tests {
     fn order_collection_requires_completion_and_rejects_duplicate_baskets() {
         let mut orders = Vec::new();
         let mut basket_ids = HashSet::new();
+        let mut interleaved_notification = false;
         assert!(!accept_order_event(
             &mut orders,
             &mut basket_ids,
+            &mut interleaved_notification,
             OrderSnapshotEvent::Snapshot(Box::new(order())),
         )
         .unwrap());
+        assert!(!accept_order_event(
+            &mut orders,
+            &mut basket_ids,
+            &mut interleaved_notification,
+            OrderSnapshotEvent::InterleavedNotification,
+        )
+        .unwrap());
+        assert!(interleaved_notification);
         assert!(accept_order_event(
             &mut orders,
             &mut basket_ids,
+            &mut interleaved_notification,
             OrderSnapshotEvent::RequestCompleted,
         )
         .unwrap());
         assert!(accept_order_event(
             &mut orders,
             &mut basket_ids,
+            &mut interleaved_notification,
             OrderSnapshotEvent::Snapshot(Box::new(order())),
         )
         .is_err());
+    }
+
+    #[test]
+    fn order_snapshot_authority_requires_a_quiet_collection_window() {
+        for (interleaved, expected) in [(false, true), (true, false)] {
+            assert_eq!(
+                order_snapshot_attempt_is_authoritative(interleaved),
+                expected,
+            );
+        }
     }
 
     #[test]

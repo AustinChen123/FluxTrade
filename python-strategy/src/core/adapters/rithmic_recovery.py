@@ -400,6 +400,8 @@ def rithmic_order_may_be_working(remote) -> bool:
     quantity = _decimal(getattr(remote, "quantity", None))
     filled = _decimal(getattr(remote, "filled_quantity", None))
     status = str(getattr(remote, "status", None) or "").strip().lower()
+    if notification == "COMPLETE" and status in {"complete", "completed"}:
+        return False
     if notification in {"CANCEL", "REJECT"} or status in {
         "cancel",
         "canceled",
