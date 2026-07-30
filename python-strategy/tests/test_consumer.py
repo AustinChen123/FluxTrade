@@ -16,10 +16,14 @@ from unittest.mock import MagicMock, call, patch
 import pytest
 
 import redis as redis_lib
+from redis.exceptions import ConnectionError as RedisConnectionError
+from redis.exceptions import RedisError
 from src.core.consumer import (
     DataConsumer,
+    FENCED_EPHEMERAL_GROUP_CLEANUP,
     FENCED_XACK,
     FENCED_XREADGROUP,
+    INITIAL_BACKOFF,
     MarketStreamOwnershipError,
     MarketStreamPendingError,
     RELEASE_OWNERSHIP_LEASE,
@@ -44,11 +48,37 @@ def mock_redis():
     client.xinfo_groups.return_value = []
     client.smembers.return_value = set()
     client.sadd.return_value = 1
+    client.xgroup_destroy.return_value = 1
     client.time.return_value = (1704067200, 0)  # (seconds, microseconds)
     client.xack.return_value = 1
     def eval_script(script, *args):
         if script in {RENEW_OWNERSHIP_LEASE, RELEASE_OWNERSHIP_LEASE}:
             return 1
+        if script == FENCED_EPHEMERAL_GROUP_CLEANUP:
+            stream_keys = args[4:-2]
+            pending = []
+            existing_streams = []
+            for index, stream_key in enumerate(stream_keys, start=4):
+                try:
+                    summary = client.xpending(stream_key, args[-1])
+                except redis_lib.exceptions.ResponseError as error:
+                    if "NOGROUP" in str(error):
+                        continue
+                    raise
+                pending.append((index, summary))
+                existing_streams.append(stream_key)
+            for index, summary in pending:
+                count = (
+                    int(summary.get("pending", 0))
+                    if isinstance(summary, dict)
+                    else int(summary[0])
+                )
+                if count:
+                    return [1, count, index]
+            for stream_key in existing_streams:
+                client.xgroup_destroy(stream_key, args[-1])
+            client.delete(args[2], args[3])
+            return [1, 0, len(existing_streams)]
         if script == FENCED_XACK:
             return [1, client.xack(args[3], args[4], args[5])]
         if script == FENCED_XREADGROUP:
@@ -91,6 +121,215 @@ def consumer(mock_redis):
         )
     c.redis_client = mock_redis
     return c
+
+
+def test_custom_group_name_isolated_from_strategy_group(mock_redis):
+    with patch("src.core.consumer.create_redis_client", return_value=mock_redis):
+        consumer = DataConsumer(
+            channels=[],
+            on_message_callback=MagicMock(),
+            group_name="paper_forward:run-1",
+        )
+
+    assert consumer.group_name == "paper_forward:run-1"
+    assert "paper_forward:run-1" in consumer._stream_registry_key
+    assert "paper_forward:run-1" in consumer._ownership_key
+
+
+@pytest.mark.parametrize("group_name", ["", "paper forward", " paper"])
+def test_invalid_group_name_rejected(group_name):
+    with pytest.raises(
+        ValueError,
+        match="group_name must be non-empty without whitespace",
+    ):
+        DataConsumer(
+            channels=[],
+            on_message_callback=MagicMock(),
+            group_name=group_name,
+        )
+
+
+def test_unresolved_delivery_assertion_reports_blocked_stream(consumer):
+    consumer._blocked_streams.add("stream:market:rithmic:mnq-202609:5m")
+
+    with pytest.raises(
+        MarketStreamPendingError,
+        match="unresolved local deliveries",
+    ):
+        consumer.assert_no_unresolved_deliveries()
+
+
+def test_cleanup_consumer_group_removes_only_registered_ephemeral_state(
+    mock_redis,
+):
+    stream = "stream:market:binance:btcusdt:1m"
+    with patch("src.core.consumer.create_redis_client", return_value=mock_redis):
+        consumer = DataConsumer(
+            channels=[stream],
+            on_message_callback=MagicMock(),
+            group_name="paper_forward:test",
+            ephemeral_group=True,
+        )
+    consumer._registered_streams.add(stream)
+    consumer._initialized_channels.add(stream)
+    consumer._ownership_active = True
+    mock_redis.get.return_value = consumer._ownership_token
+
+    consumer.cleanup_consumer_group()
+
+    mock_redis.xgroup_destroy.assert_called_once_with(
+        stream,
+        consumer.group_name,
+    )
+    mock_redis.delete.assert_called_once_with(
+        consumer._stream_registry_key,
+        consumer._quarantine_key,
+    )
+    assert consumer._registered_streams == set()
+    assert consumer._initialized_channels == set()
+
+
+def test_durable_consumer_rejects_group_cleanup(consumer):
+    with pytest.raises(
+        RuntimeError,
+        match="requires ephemeral_group=True",
+    ):
+        consumer.cleanup_consumer_group()
+
+
+def test_ephemeral_group_cleanup_is_retry_safe_after_partial_destroy(
+    mock_redis,
+):
+    streams = [
+        "stream:market:rithmic:mnq-202609:1m",
+        "stream:market:rithmic:mnq-202609:5m",
+    ]
+    with patch("src.core.consumer.create_redis_client", return_value=mock_redis):
+        consumer = DataConsumer(
+            channels=streams,
+            on_message_callback=MagicMock(),
+            group_name="paper_forward:retry",
+            ephemeral_group=True,
+        )
+    consumer._registered_streams.update(streams)
+    consumer._ownership_active = True
+    mock_redis.get.return_value = consumer._ownership_token
+    original_eval = mock_redis.eval.side_effect
+    cleanup_attempts = 0
+
+    def fail_once(script, *args):
+        nonlocal cleanup_attempts
+        if script == FENCED_EPHEMERAL_GROUP_CLEANUP:
+            cleanup_attempts += 1
+            if cleanup_attempts == 1:
+                raise redis_lib.exceptions.ConnectionError("lost during cleanup")
+        return original_eval(script, *args)
+
+    mock_redis.eval.side_effect = fail_once
+    with pytest.raises(redis_lib.exceptions.ConnectionError):
+        consumer.cleanup_consumer_group()
+    mock_redis.delete.assert_not_called()
+
+    def pending(stream_key, _group_name):
+        if stream_key == streams[0]:
+            raise redis_lib.exceptions.ResponseError("NOGROUP missing")
+        return {"pending": 0}
+
+    mock_redis.xpending.side_effect = pending
+    consumer.cleanup_consumer_group()
+
+    mock_redis.xgroup_destroy.assert_called_once_with(
+        streams[1],
+        consumer.group_name,
+    )
+    mock_redis.delete.assert_called_once_with(
+        consumer._stream_registry_key,
+        consumer._quarantine_key,
+    )
+    assert consumer._registered_streams == set()
+
+
+def test_ephemeral_cleanup_rejects_ownership_loss_before_destructive_work(
+    mock_redis,
+):
+    stream = "stream:market:rithmic:mnq-202609:5m"
+    with patch("src.core.consumer.create_redis_client", return_value=mock_redis):
+        consumer = DataConsumer(
+            channels=[stream],
+            on_message_callback=MagicMock(),
+            group_name="paper_forward:ownership-loss",
+            ephemeral_group=True,
+        )
+    consumer._registered_streams.add(stream)
+    consumer._ownership_active = True
+    mock_redis.get.return_value = consumer._ownership_token
+    original_eval = mock_redis.eval.side_effect
+
+    def lose_ownership_at_cleanup(script, *args):
+        if script == FENCED_EPHEMERAL_GROUP_CLEANUP:
+            return [0]
+        return original_eval(script, *args)
+
+    mock_redis.eval.side_effect = lose_ownership_at_cleanup
+
+    with pytest.raises(
+        MarketStreamOwnershipError,
+        match="ownership was lost before cleanup",
+    ):
+        consumer.cleanup_consumer_group()
+
+    mock_redis.xgroup_destroy.assert_not_called()
+    mock_redis.delete.assert_not_called()
+
+
+def test_ephemeral_cleanup_preserves_group_with_pending_deliveries(mock_redis):
+    stream = "stream:market:rithmic:mnq-202609:5m"
+    with patch("src.core.consumer.create_redis_client", return_value=mock_redis):
+        consumer = DataConsumer(
+            channels=[stream],
+            on_message_callback=MagicMock(),
+            group_name="paper_forward:pending",
+            ephemeral_group=True,
+        )
+    consumer._registered_streams.add(stream)
+    consumer._ownership_active = True
+    mock_redis.get.return_value = consumer._ownership_token
+    mock_redis.xpending.return_value = {"pending": 1}
+
+    with pytest.raises(
+        MarketStreamPendingError,
+        match="has 1 pending deliveries",
+    ):
+        consumer.cleanup_consumer_group()
+
+    mock_redis.xgroup_destroy.assert_not_called()
+    mock_redis.delete.assert_not_called()
+    assert consumer._registered_streams == {stream}
+
+
+def test_ephemeral_cleanup_includes_initialized_unregistered_streams(mock_redis):
+    registered = "stream:market:rithmic:mnq-202609:1m"
+    initialized = "stream:market:rithmic:mnq-202609:5m"
+    with patch("src.core.consumer.create_redis_client", return_value=mock_redis):
+        consumer = DataConsumer(
+            channels=[registered, initialized],
+            on_message_callback=MagicMock(),
+            group_name="paper_forward:multi-stream",
+            ephemeral_group=True,
+        )
+    consumer._registered_streams.add(registered)
+    consumer._initialized_channels.update({registered, initialized})
+    consumer._ownership_active = True
+    mock_redis.get.return_value = consumer._ownership_token
+
+    consumer.cleanup_consumer_group()
+
+    assert mock_redis.xgroup_destroy.call_args_list == [
+        call(registered, consumer.group_name),
+        call(initialized, consumer.group_name),
+    ]
+    assert consumer._registered_streams == set()
+    assert consumer._initialized_channels == set()
 
 
 # =============================================================================
@@ -884,7 +1123,11 @@ class TestDeliverySemantics:
             {"pending": 0},
         ]
 
-        with patch("src.core.consumer.time.sleep"):
+        with patch.object(
+            consumer._stop_requested,
+            "wait",
+            return_value=False,
+        ):
             consumer.start()
 
         callback.assert_called_once()
@@ -1111,7 +1354,11 @@ class TestDeliverySemantics:
             ]
         )
 
-        with patch("src.core.consumer.time.sleep"):
+        with patch.object(
+            consumer._stop_requested,
+            "wait",
+            return_value=False,
+        ):
             consumer.start()
 
         assert consumer._initialized_channels == set()
@@ -1119,6 +1366,33 @@ class TestDeliverySemantics:
         assert consumer._existing_group_streams_scanned is False
         assert consumer._durable_registry_loaded is False
         assert consumer._consume_loop.call_count == 2
+
+    @pytest.mark.parametrize(
+        "error",
+        [
+            MarketStreamPendingError("pending"),
+            RedisConnectionError("disconnected"),
+            RedisError("redis failed"),
+        ],
+    )
+    def test_request_stop_interrupts_retry_backoff(self, consumer, error):
+        consumer._ownership_active = True
+        consumer.redis_client.get.return_value = consumer._ownership_token
+        consumer._consume_loop = MagicMock(side_effect=error)
+
+        def request_stop(_delay):
+            consumer.request_stop()
+            return True
+
+        with patch.object(
+            consumer._stop_requested,
+            "wait",
+            side_effect=request_stop,
+        ) as wait:
+            consumer.start()
+
+        wait.assert_called_once_with(INITIAL_BACKOFF)
+        assert consumer._consume_loop.call_count == 1
 
 
 # =============================================================================

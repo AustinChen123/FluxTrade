@@ -81,7 +81,11 @@ class TestReconnectionBackoff:
         consumer._ensure_consumer_groups = MagicMock()
         consumer._consume_loop = MagicMock(side_effect=fail_then_stop)
 
-        with patch("src.core.consumer.time.sleep", side_effect=track_sleep):
+        with patch.object(
+            consumer._stop_requested,
+            "wait",
+            side_effect=track_sleep,
+        ):
             consumer.start()
 
         assert len(backoffs) == 3
@@ -101,7 +105,11 @@ class TestReconnectionBackoff:
             side_effect=redis.exceptions.ConnectionError("refused")
         )
 
-        with patch("src.core.consumer.time.sleep", side_effect=track_sleep):
+        with patch.object(
+            consumer._stop_requested,
+            "wait",
+            side_effect=track_sleep,
+        ):
             with pytest.raises(redis.exceptions.ConnectionError):
                 consumer.start()
 
@@ -116,7 +124,11 @@ class TestReconnectionBackoff:
             side_effect=redis.exceptions.ConnectionError("refused")
         )
 
-        with patch("src.core.consumer.time.sleep"):
+        with patch.object(
+            consumer._stop_requested,
+            "wait",
+            return_value=False,
+        ):
             with pytest.raises(redis.exceptions.ConnectionError):
                 consumer.start()
 
@@ -139,7 +151,11 @@ class TestReconnectionBackoff:
         consumer._ensure_consumer_groups = MagicMock()
         consumer._consume_loop = MagicMock(side_effect=fail_once_then_succeed)
 
-        with patch("src.core.consumer.time.sleep", side_effect=track_sleep):
+        with patch.object(
+            consumer._stop_requested,
+            "wait",
+            side_effect=track_sleep,
+        ):
             consumer.start()
 
         # Only one backoff sleep (from the first failure)
@@ -193,7 +209,11 @@ class TestReconnectionBackoff:
         consumer._ensure_consumer_groups = MagicMock()
         consumer._consume_loop = MagicMock(side_effect=fail_then_stop)
 
-        with patch("src.core.consumer.time.sleep"):
+        with patch.object(
+            consumer._stop_requested,
+            "wait",
+            return_value=False,
+        ):
             consumer.start()
 
         assert call_count == 2
@@ -218,10 +238,14 @@ class TestReconnectionBackoff:
 
         consumer._consume_loop = MagicMock(side_effect=block_then_stop)
 
-        with patch("src.core.consumer.time.sleep") as sleep:
+        with patch.object(
+            consumer._stop_requested,
+            "wait",
+            return_value=False,
+        ) as wait:
             consumer.start()
 
-        sleep.assert_called_once_with(INITIAL_BACKOFF)
+        wait.assert_called_once_with(INITIAL_BACKOFF)
         assert consumer._consume_loop.call_count == 2
 
     def test_ownership_loss_exits_for_fresh_service_restart(self, consumer):

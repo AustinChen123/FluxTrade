@@ -2949,6 +2949,13 @@ class StrategyEngine:
             if decision_candle is not None:
                 self._signal_processor.on_candle(decision_candle)
 
+    def on_backtest_decision_candle(self, decision_candle: Candlestick) -> None:
+        """Apply an asynchronously delivered completed decision candle."""
+        if self.runtime_environment.identity == "live":
+            raise RuntimeError("split market routing is backtest-only")
+        with self._market_processing_lock:
+            self._signal_processor.on_candle(decision_candle)
+
     def process_signal(
         self,
         signal: Signal,

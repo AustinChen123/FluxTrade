@@ -780,6 +780,30 @@ class TestOnMarketData:
 
         engine.execution_engine.process_market_data.assert_not_called()
 
+    def test_async_backtest_decision_does_not_reprocess_execution_candle(
+        self,
+        engine,
+    ):
+        engine.runtime_environment = RuntimeEnvironment("test")
+        decision_candle = _make_candle(timeframe="5m")
+        engine.execution_engine.process_market_data = MagicMock()
+        engine._signal_processor.on_candle = MagicMock()
+
+        engine.on_backtest_decision_candle(decision_candle)
+
+        engine.execution_engine.process_market_data.assert_not_called()
+        engine._signal_processor.on_candle.assert_called_once_with(decision_candle)
+
+    def test_async_backtest_decision_is_rejected_in_live_runtime(self, engine):
+        engine.runtime_environment = RuntimeEnvironment("live")
+        decision_candle = _make_candle(timeframe="5m")
+        engine._signal_processor.on_candle = MagicMock()
+
+        with pytest.raises(RuntimeError, match="backtest-only"):
+            engine.on_backtest_decision_candle(decision_candle)
+
+        engine._signal_processor.on_candle.assert_not_called()
+
     def test_portfolio_exposure_snapshot_excludes_protection_and_exits(
         self,
         engine,

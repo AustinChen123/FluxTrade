@@ -98,6 +98,39 @@ return {
     redis.call('XACK', ARGV[2], ARGV[3], ARGV[4])
 }
 """
+FENCED_EPHEMERAL_GROUP_CLEANUP = """
+if redis.call('GET', KEYS[1]) ~= ARGV[1] then
+    return {0}
+end
+local existing_groups = {}
+for index = 4, #KEYS do
+    local pending_result = redis.pcall('XPENDING', KEYS[index], ARGV[2])
+    if type(pending_result) == 'table' and pending_result.err then
+        if not string.find(pending_result.err, 'NOGROUP') then
+            return redis.error_reply(pending_result.err)
+        end
+        existing_groups[index] = false
+    else
+        existing_groups[index] = true
+        if tonumber(pending_result[1]) > 0 then
+            return {1, tonumber(pending_result[1]), index}
+        end
+    end
+end
+local destroyed = 0
+for index = 4, #KEYS do
+    if existing_groups[index] then
+        destroyed = destroyed + redis.call(
+            'XGROUP',
+            'DESTROY',
+            KEYS[index],
+            ARGV[2]
+        )
+    end
+end
+redis.call('DEL', KEYS[2], KEYS[3])
+return {1, 0, destroyed}
+"""
 
 
 class MarketStreamPendingError(RuntimeError):
@@ -120,6 +153,8 @@ class DataConsumer:
         ) = None,
         pending_claim_idle_ms: int = DEFAULT_PENDING_CLAIM_IDLE_MS,
         ownership_lease_ms: int = DEFAULT_OWNERSHIP_LEASE_MS,
+        group_name: str = "strategy_group",
+        ephemeral_group: bool = False,
     ):
         """
         :param channels: List of Redis Stream Keys to consume (e.g., ['stream:market:binance:btcusdt'])
@@ -129,7 +164,10 @@ class DataConsumer:
         self.channels = channels
         self.channel_provider = channel_provider
         self.runtime_environment = runtime_environment or RuntimeEnvironment.from_env()
-        self.group_name = "strategy_group"
+        if not group_name or any(char.isspace() for char in group_name):
+            raise ValueError("consumer group_name must be non-empty without whitespace")
+        self.group_name = group_name
+        self._ephemeral_group = ephemeral_group
         self._stream_registry_key = self.runtime_environment.key(
             f"consumer:{self.group_name}:streams"
         )
@@ -315,7 +353,8 @@ class DataConsumer:
                     "Market stream blocked by ambiguous delivery: %s",
                     e,
                 )
-                time.sleep(INITIAL_BACKOFF)
+                if self._stop_requested.wait(INITIAL_BACKOFF):
+                    break
             except RedisConnectionError as e:
                 self._initialized_channels.clear()
                 self._registered_streams.clear()
@@ -327,7 +366,8 @@ class DataConsumer:
                     raise
                 logger.warning("Redis connection lost: %s. Reconnecting in %.1fs (attempt %d/%d)",
                                e, backoff, attempts, MAX_RETRIES)
-                time.sleep(backoff)
+                if self._stop_requested.wait(backoff):
+                    break
                 backoff = min(backoff * 2, MAX_BACKOFF)
             except (ConnectionError, OSError, RedisError) as e:
                 self._initialized_channels.clear()
@@ -340,7 +380,8 @@ class DataConsumer:
                     raise
                 logger.error("Stream Consumer Error: %s. Reconnecting in %.1fs (attempt %d/%d)",
                              e, backoff, attempts, MAX_RETRIES)
-                time.sleep(backoff)
+                if self._stop_requested.wait(backoff):
+                    break
                 backoff = min(backoff * 2, MAX_BACKOFF)
 
     def _current_channels(self) -> list[str]:
@@ -788,6 +829,70 @@ class DataConsumer:
         """Stop reading while retaining leadership during engine shutdown."""
         self._stop_requested.set()
         self.running = False
+
+    def assert_no_unresolved_deliveries(self) -> None:
+        """Fail when this process stopped with callback or ACK state unresolved."""
+        self._assert_ownership()
+        unresolved = sorted(
+            {
+                *self._blocked_streams,
+                *(stream for stream, _message_id in self._completed_pending),
+            }
+        )
+        if unresolved:
+            raise MarketStreamPendingError(
+                "market stream has unresolved local deliveries: "
+                + ", ".join(unresolved)
+            )
+
+    def cleanup_consumer_group(self) -> None:
+        """Delete one clean, ephemeral consumer group's durable Redis state."""
+        if not self._ephemeral_group:
+            raise RuntimeError(
+                "consumer group cleanup requires ephemeral_group=True"
+            )
+        self.assert_no_unresolved_deliveries()
+        self._ensure_no_quarantined_delivery()
+        streams = sorted(self._registered_streams | self._initialized_channels)
+        result = cast(
+            Any,
+            self.redis_client.eval(
+                FENCED_EPHEMERAL_GROUP_CLEANUP,
+                3 + len(streams),
+                self._ownership_key,
+                self._stream_registry_key,
+                self._quarantine_key,
+                *streams,
+                self._ownership_token,
+                self.group_name,
+            ),
+        )
+        if not isinstance(result, (list, tuple)) or not result:
+            raise MarketStreamPendingError(
+                "invalid ephemeral consumer group cleanup response"
+            )
+        if int(result[0]) != 1:
+            self._ownership_lost.set()
+            raise MarketStreamOwnershipError(
+                "market stream consumer ownership was lost before cleanup"
+            )
+        if len(result) != 3:
+            raise MarketStreamPendingError(
+                "invalid ephemeral consumer group cleanup response"
+            )
+        pending = int(result[1])
+        if pending:
+            stream_index = int(result[2]) - 4
+            stream = (
+                streams[stream_index]
+                if 0 <= stream_index < len(streams)
+                else "unknown"
+            )
+            raise MarketStreamPendingError(
+                f"market stream has {pending} pending deliveries: {stream}"
+            )
+        self._registered_streams.difference_update(streams)
+        self._initialized_channels.difference_update(streams)
 
     def stop(self):
         """Release leadership and close Redis after engine shutdown."""

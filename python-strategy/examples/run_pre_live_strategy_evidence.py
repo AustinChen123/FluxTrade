@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import json
 import sys
+from collections import deque
 from decimal import Decimal
 from pathlib import Path
 
@@ -18,6 +19,11 @@ from src.validation.paper_lifecycle import run_paper_lifecycle  # noqa: E402
 from src.validation.portfolio_paper_lifecycle import (  # noqa: E402
     run_portfolio_paper_lifecycle,
 )
+from src.validation.portfolio_paper_forward import (  # noqa: E402
+    run_portfolio_paper_forward,
+    validate_portfolio_paper_forward_run,
+)
+from src.core.data_sources.csv_source import CsvDataSource  # noqa: E402
 from src.validation.strategy_evidence import (  # noqa: E402
     load_portfolio,
     load_strategy,
@@ -74,6 +80,14 @@ def _parser() -> argparse.ArgumentParser:
     _add_portfolio_arguments(portfolio_paper)
     portfolio_paper.add_argument("--workspace", type=Path, required=True)
     portfolio_paper.add_argument("--scenario-quantities", type=Path)
+
+    paper_forward = subparsers.add_parser("portfolio-paper-forward")
+    _add_portfolio_arguments(paper_forward)
+    paper_forward.add_argument("--workspace", type=Path, required=True)
+    paper_forward.add_argument("--warmup-5m", type=Path, required=True)
+    paper_forward.add_argument("--duration-seconds", type=float, required=True)
+    paper_forward.add_argument("--run-id", required=True)
+    paper_forward.add_argument("--output", type=Path, required=True)
     return parser
 
 
@@ -208,7 +222,7 @@ def main() -> None:
             strategy_id=args.strategy_id,
             hard_flat_strategy_factory=factory,
         )
-    else:
+    elif args.command == "portfolio-paper-lifecycle":
         portfolio_factory = lambda: load_portfolio(  # noqa: E731
             args.strategy_dir,
             args.portfolio_id,
@@ -222,6 +236,61 @@ def main() -> None:
                 args.scenario_quantities
             ),
         )
+    else:
+        portfolio_factory = lambda: load_portfolio(  # noqa: E731
+            args.strategy_dir,
+            args.portfolio_id,
+            args.product_id,
+            config=_load_portfolio_config(args.portfolio_config),
+        )
+        source = CsvDataSource(
+            str(args.warmup_5m),
+            product_id=args.product_id,
+            timeframe="5m",
+        )
+        available = source.get_available_range(args.product_id, "5m")
+        if available is None:
+            raise ValueError("paper-forward warmup source is empty")
+        baseline = portfolio_factory()
+        required = max(
+            int(sleeve.strategy.requirements.lookback_window)
+            for sleeve in baseline.sleeves
+        )
+        required = max(required, 1)
+        warmup = list(
+            deque(
+                source.get_candles(
+                    args.product_id,
+                    "5m",
+                    available[0],
+                    available[1],
+                ),
+                maxlen=required,
+            )
+        )
+        validate_portfolio_paper_forward_run(
+            args.workspace,
+            run_id=args.run_id,
+            definition=baseline,
+            warmup_candles=warmup,
+            duration_seconds=args.duration_seconds,
+        )
+        workspace_path = args.workspace.resolve()
+        output_path = args.output.resolve()
+        if output_path == workspace_path or workspace_path in output_path.parents:
+            raise ValueError(
+                "paper-forward output must be outside its managed workspace"
+            )
+        args.output.parent.mkdir(parents=True, exist_ok=True)
+        with args.output.open("x", encoding="utf-8") as output:
+            report = run_portfolio_paper_forward(
+                args.workspace,
+                run_id=args.run_id,
+                portfolio_factory=lambda: baseline,
+                warmup_candles=warmup,
+                output=output,
+                duration_seconds=args.duration_seconds,
+            )
     print(json.dumps(report.to_dict(), indent=2, sort_keys=True))
 
 
