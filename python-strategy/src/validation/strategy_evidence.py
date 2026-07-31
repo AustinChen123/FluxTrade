@@ -7,7 +7,7 @@ import json
 import tempfile
 import time
 from contextlib import contextmanager
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
 from datetime import UTC, datetime
 from decimal import Decimal
 from pathlib import Path
@@ -126,6 +126,7 @@ class _PortfolioDecisionEvidenceRuntime:
     definition: PortfolioDefinition
     identity: StrategyEvidenceIdentity
     coordinator: PortfolioCoordinator
+    quantities: dict[str, Decimal] = field(default_factory=dict)
 
     @property
     def product_id(self) -> str:
@@ -136,20 +137,44 @@ class _PortfolioDecisionEvidenceRuntime:
         return self.definition.sleeves[0].strategy.requirements.timeframe
 
     def decide(self, candle: Candlestick) -> list[Signal]:
-        decisions = [
-            (sleeve.strategy.strategy_id, _signals(sleeve.strategy, candle))
-            for sleeve in self.definition.sleeves
-        ]
-        coordinated = self.coordinator.coordinate_candle_decisions(
-            candle,
-            decisions,
-            exposure_loader=lambda strategy_ids, _product_id, _intents: (
-                PortfolioExposureSnapshot(
-                    {strategy_id: Decimal("0") for strategy_id in strategy_ids}
+        coordinated: list[tuple[str, list[Signal]]] = []
+        with self.coordinator.decision_state_transaction() as transaction:
+            decisions = []
+            for sleeve in self.definition.sleeves:
+                transaction.capture(sleeve.strategy)
+                decisions.append(
+                    (
+                        sleeve.strategy.strategy_id,
+                        _signals(sleeve.strategy, candle),
+                    )
                 )
-            ),
-            default_quantity=Decimal("1"),
-        )
+            coordinated = self.coordinator.coordinate_candle_decisions(
+                candle,
+                decisions,
+                exposure_loader=lambda strategy_ids, _product_id, _intents: (
+                    PortfolioExposureSnapshot(
+                        {
+                            strategy_id: (
+                                self.quantities.get(
+                                    strategy_id,
+                                    Decimal("0"),
+                                )
+                                if self.definition.exclusive_slots
+                                else Decimal("0")
+                            )
+                            for strategy_id in strategy_ids
+                        }
+                    )
+                ),
+                default_quantity=Decimal("1"),
+                decision_state_transaction=transaction,
+            )
+            if self.definition.exclusive_slots:
+                self.quantities = self.coordinator.project_coordinated_quantities(
+                    self.quantities,
+                    coordinated,
+                    default_quantity=Decimal("1"),
+                )
         return [
             signal
             for _strategy_id, signals in coordinated

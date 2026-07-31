@@ -9,10 +9,16 @@ from pathlib import Path
 import pytest
 
 from src.core.models import Candlestick, Signal, SignalType
-from src.core.portfolio_runtime import PortfolioDefinition, PortfolioSleeve
+from src.core.portfolio_runtime import (
+    PortfolioDefinition,
+    PortfolioExclusiveSlot,
+    PortfolioSleeve,
+)
 from src.core.strategy_context import StrategyContext
 from src.strategies.base import BaseStrategy, StrategyRequirements
 from src.validation.strategy_evidence import (
+    _portfolio_evidence_runtime,
+    portfolio_evidence_identity,
     run_portfolio_shadow_evidence,
     run_shadow_evidence,
     verify_portfolio_historical_stream_parity,
@@ -59,6 +65,48 @@ setattr(CloseSignalStrategy, "__fluxtrade_readiness__", "RESEARCH_VALIDATED")
 setattr(CloseSignalStrategy, "__fluxtrade_catalog_sha256__", "0" * 64)
 
 
+class StatefulEvidenceStrategy(CloseSignalStrategy):
+    def __init__(self, strategy_id: str, product_id: str) -> None:
+        super().__init__(strategy_id, product_id)
+        self._in_position = False
+        self._completed = False
+
+    def on_candle(
+        self,
+        candle: Candlestick,
+        context: StrategyContext | None = None,
+    ) -> Signal:
+        signal_type = SignalType.NO_SIGNAL
+        if self._in_position:
+            self._in_position = False
+            self._completed = True
+            signal_type = SignalType.EXIT_LONG
+        elif not self._completed:
+            self._in_position = True
+            signal_type = SignalType.LONG
+        return Signal(
+            strategy_id=self.strategy_id,
+            product_id=self.product_id,
+            timeframe="5m",
+            timestamp=candle.timestamp,
+            type=signal_type,
+            quantity=Decimal("1"),
+        )
+
+    def snapshot_walk_forward_trade_state(self) -> object:
+        return self._in_position, self._completed
+
+    def restore_walk_forward_trade_state(self, state: object) -> None:
+        assert isinstance(state, tuple)
+        self._in_position, self._completed = state
+
+
+setattr(StatefulEvidenceStrategy, "__fluxtrade_display_name__", "Stateful Evidence")
+setattr(StatefulEvidenceStrategy, "__fluxtrade_artifact_version__", "1.0.0")
+setattr(StatefulEvidenceStrategy, "__fluxtrade_readiness__", "RESEARCH_FROZEN")
+setattr(StatefulEvidenceStrategy, "__fluxtrade_catalog_sha256__", "2" * 64)
+
+
 def _portfolio(
     *,
     max_gross_quantity: Decimal = Decimal("2"),
@@ -87,6 +135,83 @@ def _write_csv(path, rows):
         writer = csv.writer(handle)
         writer.writerow(["timestamp", "open", "high", "low", "close", "volume"])
         writer.writerows(rows)
+
+
+def test_no_slot_portfolio_preserves_legacy_evidence_identity() -> None:
+    assert (
+        portfolio_evidence_identity(_portfolio()).replay_configuration_sha256
+        == "47fecef2d049e8a35820d8ef86985c3d656c7c1b0f863e992d6a579ea170b1ca"
+    )
+
+
+def test_exclusive_slot_evidence_restores_suppressed_sleeve_state() -> None:
+    strategy_b = StatefulEvidenceStrategy("portfolio.sleeve_b", PRODUCT_ID)
+    strategy_a = StatefulEvidenceStrategy("portfolio.sleeve_a", PRODUCT_ID)
+    definition = PortfolioDefinition(
+        portfolio_id="portfolio",
+        product_id=PRODUCT_ID,
+        sleeves=(
+            PortfolioSleeve(strategy_b),
+            PortfolioSleeve(strategy_a),
+        ),
+        max_gross_quantity=Decimal("1"),
+        artifact_version="1.0.0",
+        display_name="Stateful Evidence Portfolio",
+        readiness="RESEARCH_FROZEN",
+        catalog_sha256="3" * 64,
+        exclusive_slots=(
+            PortfolioExclusiveSlot(
+                slot_id="shared",
+                strategy_ids=(
+                    "portfolio.sleeve_a",
+                    "portfolio.sleeve_b",
+                ),
+            ),
+        ),
+    )
+    runtime = _portfolio_evidence_runtime(definition)
+
+    first = runtime.decide(
+        Candlestick(
+            product_id=PRODUCT_ID,
+            timeframe="5m",
+            timestamp=1_800_000_000_000,
+            open=Decimal("100"),
+            high=Decimal("101"),
+            low=Decimal("99"),
+            close=Decimal("100"),
+            volume=Decimal("1"),
+        )
+    )
+    second = runtime.decide(
+        Candlestick(
+            product_id=PRODUCT_ID,
+            timeframe="5m",
+            timestamp=1_800_000_300_000,
+            open=Decimal("100"),
+            high=Decimal("101"),
+            low=Decimal("99"),
+            close=Decimal("100"),
+            volume=Decimal("1"),
+        )
+    )
+    third = runtime.decide(
+        Candlestick(
+            product_id=PRODUCT_ID,
+            timeframe="5m",
+            timestamp=1_800_000_600_000,
+            open=Decimal("100"),
+            high=Decimal("101"),
+            low=Decimal("99"),
+            close=Decimal("100"),
+            volume=Decimal("1"),
+        )
+    )
+
+    assert [signal.strategy_id for signal in first] == ["portfolio.sleeve_a"]
+    assert [signal.strategy_id for signal in second] == ["portfolio.sleeve_a"]
+    assert second[0].type == SignalType.EXIT_LONG
+    assert [signal.strategy_id for signal in third] == ["portfolio.sleeve_b"]
 
 
 def test_historical_stream_parity_compares_closed_candles_and_signals(
