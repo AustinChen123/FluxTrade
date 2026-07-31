@@ -1687,6 +1687,8 @@ mod tests {
                 account_id: "ACCOUNT".to_string(),
             },
             client_order_id: Some("client-1".to_string()),
+            window_name: None,
+            originator_window_name: None,
             basket_id: basket_id.to_string(),
             original_basket_id: None,
             linked_basket_ids: None,
@@ -1784,6 +1786,7 @@ mod tests {
                 position: ExitPosition {
                     exchange: "CME".to_string(),
                     symbol: "NQU6".to_string(),
+                    window_name: Some("exit-window-1".to_string()),
                 },
                 deadline: Instant::now() + COMMAND_TIMEOUT,
                 reply: tx,

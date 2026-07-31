@@ -11,6 +11,20 @@ use pyo3::{exceptions::PyRuntimeError, exceptions::PyValueError, prelude::*};
 use rust_decimal::Decimal;
 use std::{str::FromStr, sync::Mutex};
 
+const RITHMIC_ORDER_CAPABILITIES: [&str; 3] = [
+    "exit_position.window_name",
+    "ledger_order.window_name",
+    "ledger_order.originator_window_name",
+];
+
+#[pyfunction]
+pub fn rithmic_order_capabilities() -> Vec<String> {
+    RITHMIC_ORDER_CAPABILITIES
+        .iter()
+        .map(|capability| (*capability).to_string())
+        .collect()
+}
+
 #[pyclass(frozen, name = "RithmicOrderAck")]
 pub struct PyOrderAck {
     #[pyo3(get)]
@@ -34,6 +48,10 @@ pub struct PyOrderEvent {
     pub account_id: String,
     #[pyo3(get)]
     pub client_order_id: Option<String>,
+    #[pyo3(get)]
+    pub window_name: Option<String>,
+    #[pyo3(get)]
+    pub originator_window_name: Option<String>,
     #[pyo3(get)]
     pub basket_id: String,
     #[pyo3(get)]
@@ -79,6 +97,8 @@ impl From<OrderEvent> for PyOrderEvent {
         Self {
             account_id: value.account.account_id,
             client_order_id: value.client_order_id,
+            window_name: value.window_name,
+            originator_window_name: value.originator_window_name,
             basket_id: value.basket_id,
             original_basket_id: value.original_basket_id,
             linked_basket_ids: value.linked_basket_ids,
@@ -263,8 +283,19 @@ impl PyOrderClient {
         .map_err(runtime_error)
     }
 
-    fn exit_position(&self, py: Python<'_>, exchange: String, symbol: String) -> PyResult<bool> {
-        let position = ExitPosition { exchange, symbol };
+    #[pyo3(signature = (exchange, symbol, window_name=None))]
+    fn exit_position(
+        &self,
+        py: Python<'_>,
+        exchange: String,
+        symbol: String,
+        window_name: Option<String>,
+    ) -> PyResult<bool> {
+        let position = ExitPosition {
+            exchange,
+            symbol,
+            window_name,
+        };
         let runtime = &self.runtime;
         py.allow_threads(|| {
             runtime
@@ -372,5 +403,39 @@ mod tests {
             "20000.25"
         );
         assert!(decimal("nan", "price").is_err());
+    }
+
+    #[test]
+    fn order_capabilities_describe_the_exit_identity_contract() {
+        assert_eq!(
+            rithmic_order_capabilities(),
+            [
+                "exit_position.window_name",
+                "ledger_order.window_name",
+                "ledger_order.originator_window_name",
+            ]
+        );
+    }
+
+    #[test]
+    fn exit_position_keeps_the_two_argument_python_call_compatible() {
+        Python::with_gil(|py| {
+            let module = PyModule::new(py, "fluxtrade_core").unwrap();
+            module.add_class::<PyOrderClient>().unwrap();
+            let method = module
+                .getattr("RithmicOrderClient")
+                .unwrap()
+                .getattr("exit_position")
+                .unwrap();
+            let signature = PyModule::import(py, "inspect")
+                .unwrap()
+                .call_method1("signature", (method,))
+                .unwrap();
+
+            assert_eq!(
+                signature.str().unwrap().to_str().unwrap(),
+                "(self, /, exchange, symbol, window_name=None)"
+            );
+        });
     }
 }

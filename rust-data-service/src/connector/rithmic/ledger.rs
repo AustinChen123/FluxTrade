@@ -90,6 +90,8 @@ pub(crate) enum TransactionType {
 pub(crate) struct OrderSnapshot {
     pub(crate) account: AccountIdentity,
     pub(crate) client_order_id: Option<String>,
+    pub(crate) window_name: Option<String>,
+    pub(crate) originator_window_name: Option<String>,
     pub(crate) basket_id: String,
     pub(crate) original_basket_id: Option<String>,
     pub(crate) linked_basket_ids: Option<String>,
@@ -320,6 +322,8 @@ fn order_snapshot_from_notification(
     Ok(OrderSnapshot {
         account,
         client_order_id: optional_text(response.user_tag),
+        window_name: optional_text(response.window_name),
+        originator_window_name: optional_text(response.originator_window_name),
         basket_id: required_text(response.basket_id, "basket_id")?,
         original_basket_id: optional_text(response.original_basket_id),
         linked_basket_ids: optional_text(response.linked_basket_ids),
@@ -508,6 +512,8 @@ fn rithmic_order_snapshot(
     Ok(OrderSnapshot {
         account,
         client_order_id: optional_text(response.user_tag),
+        window_name: optional_text(response.window_name),
+        originator_window_name: optional_text(response.originator_window_name),
         basket_id: required_text(response.basket_id, "basket_id")?,
         original_basket_id: optional_text(response.original_basket_id),
         linked_basket_ids: optional_text(response.linked_basket_ids),
@@ -1391,6 +1397,8 @@ mod tests {
             fcm_id: Some("FCM".to_string()),
             ib_id: Some("IB".to_string()),
             account_id: Some("ACCOUNT".to_string()),
+            window_name: Some("exit-window".to_string()),
+            originator_window_name: Some("origin-window".to_string()),
             basket_id: Some("basket-1".to_string()),
             exchange_order_id: Some("exchange-1".to_string()),
             exchange: Some("CME".to_string()),
@@ -1421,6 +1429,11 @@ mod tests {
             panic!("expected order snapshot");
         };
         assert_eq!(snapshot.client_order_id, None);
+        assert_eq!(snapshot.window_name.as_deref(), Some("exit-window"));
+        assert_eq!(
+            snapshot.originator_window_name.as_deref(),
+            Some("origin-window")
+        );
         assert_eq!(snapshot.quantity, dec!(2));
         assert_eq!(snapshot.price, Some(dec!(21001.25)));
         assert_eq!(snapshot.trigger_price, Some(dec!(20999.25)));
@@ -1444,6 +1457,8 @@ mod tests {
                 fcm_id: Some("FCM".to_string()),
                 ib_id: Some("IB".to_string()),
                 account_id: Some(account_id.to_string()),
+                window_name: Some("exit-window".to_string()),
+                originator_window_name: Some("origin-window".to_string()),
                 basket_id: Some("basket-1".to_string()),
                 exchange: Some("CME".to_string()),
                 symbol: Some("MNQU6".to_string()),
@@ -1475,6 +1490,11 @@ mod tests {
             panic!("expected a Rithmic order snapshot row");
         };
         assert_eq!(snapshot.basket_id, "basket-1");
+        assert_eq!(snapshot.window_name.as_deref(), Some("exit-window"));
+        assert_eq!(
+            snapshot.originator_window_name.as_deref(),
+            Some("origin-window")
+        );
         assert_eq!(snapshot.symbol, "MNQU6");
         assert_eq!(snapshot.status, "COMPLETE");
         assert_eq!(snapshot.completion_reason.as_deref(), Some("FA"));

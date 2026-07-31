@@ -14,6 +14,10 @@ pub struct PyLedgerOrder {
     #[pyo3(get)]
     pub client_order_id: Option<String>,
     #[pyo3(get)]
+    pub window_name: Option<String>,
+    #[pyo3(get)]
+    pub originator_window_name: Option<String>,
+    #[pyo3(get)]
     pub exchange_order_id: Option<String>,
     #[pyo3(get)]
     pub basket_id: String,
@@ -259,6 +263,8 @@ impl From<OrderSnapshot> for PyLedgerOrder {
     fn from(order: OrderSnapshot) -> Self {
         Self {
             client_order_id: order.client_order_id,
+            window_name: order.window_name,
+            originator_window_name: order.originator_window_name,
             exchange_order_id: order.exchange_order_id,
             basket_id: order.basket_id,
             original_basket_id: order.original_basket_id,
@@ -349,6 +355,8 @@ mod tests {
             orders: vec![OrderSnapshot {
                 account: account.clone(),
                 client_order_id: None,
+                window_name: Some("window".to_string()),
+                originator_window_name: Some("originator".to_string()),
                 basket_id: "BASKET".to_string(),
                 original_basket_id: None,
                 linked_basket_ids: None,
@@ -409,6 +417,11 @@ mod tests {
         assert_eq!(snapshot.account_id, "ACCOUNT");
         assert_eq!(snapshot.account_currency.as_deref(), Some("USD"));
         assert_eq!(snapshot.orders[0].client_order_id, None);
+        assert_eq!(snapshot.orders[0].window_name.as_deref(), Some("window"));
+        assert_eq!(
+            snapshot.orders[0].originator_window_name.as_deref(),
+            Some("originator")
+        );
         assert_eq!(snapshot.orders[0].basket_id, "BASKET");
         assert_eq!(
             snapshot.orders[0].notification_type.as_deref(),
