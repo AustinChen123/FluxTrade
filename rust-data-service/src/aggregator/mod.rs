@@ -31,7 +31,9 @@ impl CandleAggregator {
     /// Adds one source candle and returns a candle only when the target window is closed.
     ///
     /// The source duration must divide the target duration exactly. Equal source and target
-    /// durations are returned immediately because the input candle is already closed.
+    /// durations are returned immediately because the input candle is already closed. A
+    /// partial first bucket is never emitted: every returned target candle must start on its
+    /// target timeframe boundary.
     pub fn add_candle(
         &mut self,
         candle: &Candlestick,
@@ -67,6 +69,7 @@ impl CandleAggregator {
             if source_ms == target_ms {
                 let mut completed = candle.clone();
                 completed.timeframe = target_tf.to_string();
+                Self::validate_target_alignment(&completed, target_ms)?;
                 self.buffers.insert(
                     key,
                     AggregationBuffer {
@@ -78,7 +81,8 @@ impl CandleAggregator {
                 return Ok(Some(completed));
             }
             if bucket_start > buffer.candle.timestamp {
-                let completed = buffer.eligible.then_some(buffer.candle);
+                let previous_bucket_eligible = buffer.eligible;
+                let completed = Self::completed_buffer(buffer, target_ms)?;
 
                 // Initialize new buffer with current candle
                 let mut new_buffer = candle.clone();
@@ -89,7 +93,7 @@ impl CandleAggregator {
                     AggregationBuffer {
                         candle: new_buffer,
                         last_timestamp: candle.timestamp,
-                        eligible: buffer.eligible || candle.timestamp == bucket_start,
+                        eligible: previous_bucket_eligible || candle.timestamp == bucket_start,
                     },
                 );
 
@@ -109,6 +113,9 @@ impl CandleAggregator {
             new_buffer.timeframe = target_tf.to_string();
             new_buffer.timestamp = bucket_start;
             let completed = new_buffer.clone();
+            if source_ms == target_ms {
+                Self::validate_target_alignment(&completed, target_ms)?;
+            }
             self.buffers.insert(
                 key,
                 AggregationBuffer {
@@ -131,6 +138,21 @@ impl CandleAggregator {
         Ok(source_ms <= MAX_SOURCE_TIMEFRAME_MS
             && source_ms <= target_ms
             && target_ms % source_ms == 0)
+    }
+
+    fn completed_buffer(buffer: AggregationBuffer, target_ms: i64) -> Result<Option<Candlestick>> {
+        if !buffer.eligible {
+            return Ok(None);
+        }
+        Self::validate_target_alignment(&buffer.candle, target_ms)?;
+        Ok(Some(buffer.candle))
+    }
+
+    fn validate_target_alignment(candle: &Candlestick, target_ms: i64) -> Result<()> {
+        if candle.timestamp < 0 || candle.timestamp % target_ms != 0 {
+            bail!("aggregated candle timestamp must align to its target timeframe");
+        }
+        Ok(())
     }
 
     fn parse_timeframe_millis(tf: &str) -> Result<i64> {
@@ -238,6 +260,38 @@ mod tests {
         assert_eq!(completed.close, dec!(112));
         assert_eq!(completed.volume, dec!(50));
         assert_eq!(completed.timeframe, "5m");
+    }
+
+    #[test]
+    fn aggregation_emits_only_target_aligned_buckets() {
+        let mut aggregator = CandleAggregator::new();
+        let base_ts = 1_800_000_000_000i64;
+        let candle = |minute: i64| Candlestick {
+            product_id: "RITHMIC:MNQ-202609".to_string(),
+            timeframe: "1m".to_string(),
+            timestamp: base_ts + minute * 60_000,
+            open: dec!(100),
+            high: dec!(101),
+            low: dec!(99),
+            close: dec!(100),
+            volume: dec!(1),
+        };
+
+        // Start mid-window to prove that a partial 00:00 bucket is never promoted.
+        let emitted = (2..=15)
+            .filter_map(|minute| aggregator.add_candle(&candle(minute), "5m").unwrap())
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            emitted
+                .iter()
+                .map(|candle| candle.timestamp)
+                .collect::<Vec<_>>(),
+            vec![base_ts + 5 * 60_000, base_ts + 10 * 60_000]
+        );
+        assert!(emitted
+            .iter()
+            .all(|candle| candle.timestamp % (5 * 60 * 1000) == 0));
     }
 
     #[test]
