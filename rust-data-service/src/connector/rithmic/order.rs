@@ -88,6 +88,7 @@ pub(crate) struct ProtectionModification {
 pub(crate) struct ExitPosition {
     pub(crate) exchange: String,
     pub(crate) symbol: String,
+    pub(crate) window_name: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -106,6 +107,8 @@ pub(crate) struct MutationResponse {
 pub(crate) struct OrderEvent {
     pub(crate) account: AccountIdentity,
     pub(crate) client_order_id: Option<String>,
+    pub(crate) window_name: Option<String>,
+    pub(crate) originator_window_name: Option<String>,
     pub(crate) basket_id: String,
     pub(crate) original_basket_id: Option<String>,
     pub(crate) linked_basket_ids: Option<String>,
@@ -448,9 +451,15 @@ pub(crate) fn exit_position_request(
     validate_account(account)?;
     let exchange = required_text(Some(position.exchange.clone()), "exchange")?;
     let symbol = required_text(Some(position.symbol.clone()), "symbol")?;
+    let window_name = position
+        .window_name
+        .clone()
+        .map(|value| required_text(Some(value), "window_name"))
+        .transpose()?;
     codec::encode(&protocol::RequestExitPosition {
         template_id: EXIT_POSITION_REQUEST,
         user_msg: vec![request_key.to_string()],
+        window_name,
         fcm_id: Some(account.fcm_id.clone()),
         ib_id: Some(account.ib_id.clone()),
         account_id: Some(account.account_id.clone()),
@@ -538,6 +547,8 @@ pub(crate) fn decode_order_event(
     Ok(OrderEvent {
         account,
         client_order_id: optional_text(response.user_tag),
+        window_name: optional_text(response.window_name),
+        originator_window_name: optional_text(response.originator_window_name),
         basket_id: required_text(response.basket_id, "basket ID")?,
         original_basket_id: optional_text(response.original_basket_id),
         linked_basket_ids: optional_text(response.linked_basket_ids),
@@ -1147,6 +1158,7 @@ mod tests {
         let position = ExitPosition {
             exchange: "CME".to_string(),
             symbol: "NQU6".to_string(),
+            window_name: Some("exit-window-1".to_string()),
         };
         let payload = exit_position_request("exit-1", &account(), &position).unwrap();
         let request: protocol::RequestExitPosition = codec::decode(&payload).unwrap();
@@ -1155,10 +1167,26 @@ mod tests {
         assert_eq!(request.account_id.as_deref(), Some("ACCOUNT"));
         assert_eq!(request.exchange.as_deref(), Some("CME"));
         assert_eq!(request.symbol.as_deref(), Some("NQU6"));
+        assert_eq!(request.window_name.as_deref(), Some("exit-window-1"));
         assert_eq!(
             request.manual_or_auto,
             Some(protocol::request_exit_position::OrderPlacement::Auto as i32)
         );
+        let uncorrelated = ExitPosition {
+            window_name: None,
+            ..position.clone()
+        };
+        let payload = exit_position_request("exit-2", &account(), &uncorrelated).unwrap();
+        let request: protocol::RequestExitPosition = codec::decode(&payload).unwrap();
+        assert_eq!(request.window_name, None);
+
+        for invalid in ["", " "] {
+            let candidate = ExitPosition {
+                window_name: Some(invalid.to_string()),
+                ..position.clone()
+            };
+            assert!(exit_position_request("exit", &account(), &candidate).is_err());
+        }
 
         let response = |exchange: &str, symbol: &str, code: &str| {
             codec::encode(&protocol::ResponseExitPosition {
@@ -1225,6 +1253,7 @@ mod tests {
                     &ExitPosition {
                         exchange: exchange.to_string(),
                         symbol: symbol.to_string(),
+                        window_name: None,
                     },
                 )
                 .is_ok(),
@@ -1628,6 +1657,8 @@ mod tests {
             fcm_id: Some("FCM".to_string()),
             ib_id: Some("IB".to_string()),
             account_id: Some("ACCOUNT".to_string()),
+            window_name: Some("exit-window".to_string()),
+            originator_window_name: Some("origin-window".to_string()),
             basket_id: Some("child-1".to_string()),
             original_basket_id: Some("parent-1".to_string()),
             linked_basket_ids: Some("child-2".to_string()),
@@ -1651,6 +1682,11 @@ mod tests {
         .unwrap();
 
         let event = decode_order_event(&payload, &account()).unwrap();
+        assert_eq!(event.window_name.as_deref(), Some("exit-window"));
+        assert_eq!(
+            event.originator_window_name.as_deref(),
+            Some("origin-window")
+        );
         assert_eq!(event.original_basket_id.as_deref(), Some("parent-1"));
         assert_eq!(event.linked_basket_ids.as_deref(), Some("child-2"));
         assert_eq!(event.price, Some(dec!(20002.25)));

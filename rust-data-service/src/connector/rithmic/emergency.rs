@@ -214,6 +214,7 @@ fn apply_actions(
         match runtime.exit_position(ExitPosition {
             exchange: instrument.0.clone(),
             symbol: instrument.1.clone(),
+            window_name: None,
         }) {
             Ok(()) => {
                 exited_instruments.insert(instrument);
@@ -279,6 +280,8 @@ mod tests {
         OrderSnapshot {
             account: account_identity(),
             client_order_id: Some("client".to_string()),
+            window_name: None,
+            originator_window_name: None,
             basket_id: "basket".to_string(),
             original_basket_id: None,
             linked_basket_ids: None,

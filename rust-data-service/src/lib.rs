@@ -30,6 +30,10 @@ fn fluxtrade_core(m: &Bound<'_, PyModule>) -> PyResult<()> {
         m.add_class::<binding::rithmic_order::PyOrderEvent>()?;
         m.add_class::<binding::rithmic_order::PyOrderClient>()?;
         m.add_function(wrap_pyfunction!(
+            binding::rithmic_order::rithmic_order_capabilities,
+            m
+        )?)?;
+        m.add_function(wrap_pyfunction!(
             binding::rithmic_ledger::rithmic_ledger_snapshot,
             m
         )?)?;
@@ -67,6 +71,7 @@ mod tests {
                 "RithmicOrderAck",
                 "RithmicOrderEvent",
                 "RithmicOrderClient",
+                "rithmic_order_capabilities",
             ] {
                 assert!(
                     module.hasattr(name).unwrap(),

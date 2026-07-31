@@ -536,6 +536,8 @@ mod tests {
         OrderSnapshot {
             account: identity("FCM", "IB"),
             client_order_id: None,
+            window_name: None,
+            originator_window_name: None,
             basket_id: "BASKET".to_string(),
             original_basket_id: None,
             linked_basket_ids: None,
