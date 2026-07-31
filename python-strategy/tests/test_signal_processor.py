@@ -12,6 +12,7 @@ from src.core.portfolio_runtime import (
     PortfolioCoordinator,
     PortfolioDecisionRejected,
     PortfolioDefinition,
+    PortfolioExclusiveSlot,
     PortfolioExposureSnapshot,
     PortfolioSleeve,
 )
@@ -53,6 +54,48 @@ class DummyStrategy(BaseStrategy):
         if self.should_raise:
             raise RuntimeError("strategy failed")
         return self.trade_result
+
+    def snapshot_walk_forward_trade_state(self) -> object:
+        return None
+
+    def restore_walk_forward_trade_state(self, state: object) -> None:
+        assert state is None
+
+
+class StatefulEntryStrategy(DummyStrategy):
+    def __init__(self, strategy_id: str):
+        super().__init__(strategy_id)
+        self._in_position = False
+        self.restore_calls = 0
+
+    def on_candle(self, candle: Candlestick):
+        self.candles_received.append(candle)
+        signal_type = SignalType.NO_SIGNAL
+        if not self._in_position:
+            self._in_position = True
+            signal_type = SignalType.LONG
+        return Signal(
+            strategy_id=self.strategy_id,
+            product_id=self.product_id,
+            timeframe=self.requirements.timeframe,
+            timestamp=candle.timestamp,
+            type=signal_type,
+            quantity=Decimal("1"),
+        )
+
+    def snapshot_walk_forward_trade_state(self) -> object:
+        return self._in_position
+
+    def restore_walk_forward_trade_state(self, state: object) -> None:
+        assert isinstance(state, bool)
+        self.restore_calls += 1
+        self._in_position = state
+
+
+class RestoreFailingEntryStrategy(StatefulEntryStrategy):
+    def restore_walk_forward_trade_state(self, state: object) -> None:
+        self.restore_calls += 1
+        raise RuntimeError("restore failed")
 
 
 class DummyStateManager:
@@ -161,6 +204,199 @@ def test_on_candle_coordinates_portfolio_before_emitting_any_signal() -> None:
         processor.on_candle(make_candle())
 
     handler.assert_not_called()
+
+
+def test_on_candle_emits_only_selected_exclusive_slot_owner() -> None:
+    strategy_b = DummyStrategy(
+        "sleeve_b",
+        result=make_signal("sleeve_b", SignalType.SHORT),
+    )
+    strategy_a = DummyStrategy(
+        "sleeve_a",
+        result=make_signal("sleeve_a", SignalType.LONG),
+    )
+    registry = StrategyRegistry()
+    registry.register(strategy_b)
+    registry.register(strategy_a)
+    coordinator = PortfolioCoordinator()
+    coordinator.register(
+        PortfolioDefinition(
+            portfolio_id="portfolio_v1",
+            product_id=strategy_a.product_id,
+            sleeves=(
+                PortfolioSleeve(strategy_b),
+                PortfolioSleeve(strategy_a),
+            ),
+            max_gross_quantity=Decimal("1"),
+            exclusive_slots=(
+                PortfolioExclusiveSlot(
+                    slot_id="shared",
+                    strategy_ids=("sleeve_a", "sleeve_b"),
+                ),
+            ),
+        )
+    )
+    execution = MagicMock()
+    execution.default_quantity = Decimal("1")
+    handler = MagicMock(return_value=True)
+
+    SignalProcessor(
+        registry,
+        execution,
+        signal_handler=handler,
+        position_loader=lambda *_args: None,
+        exposure_loader=lambda *_args: PortfolioExposureSnapshot({}),
+        portfolio_coordinator=coordinator,
+    ).on_candle(make_candle())
+
+    handler.assert_called_once()
+    emitted_signal, emitted_candle = handler.call_args.args
+    assert emitted_signal.strategy_id == "sleeve_a"
+    assert emitted_signal.type == SignalType.LONG
+    assert emitted_candle == make_candle()
+
+
+def test_exclusive_slot_restores_suppressed_stateful_sleeve() -> None:
+    strategy_b = StatefulEntryStrategy("sleeve_b")
+    strategy_a = StatefulEntryStrategy("sleeve_a")
+    registry = StrategyRegistry()
+    registry.register(strategy_b)
+    registry.register(strategy_a)
+    coordinator = PortfolioCoordinator()
+    coordinator.register(
+        PortfolioDefinition(
+            portfolio_id="portfolio_v1",
+            product_id=strategy_a.product_id,
+            sleeves=(
+                PortfolioSleeve(strategy_b),
+                PortfolioSleeve(strategy_a),
+            ),
+            max_gross_quantity=Decimal("1"),
+            exclusive_slots=(
+                PortfolioExclusiveSlot(
+                    slot_id="shared",
+                    strategy_ids=("sleeve_a", "sleeve_b"),
+                ),
+            ),
+        )
+    )
+    execution = MagicMock()
+    execution.default_quantity = Decimal("1")
+    handler = MagicMock(return_value=True)
+    processor = SignalProcessor(
+        registry,
+        execution,
+        signal_handler=handler,
+        exposure_loader=lambda *_args: PortfolioExposureSnapshot({}),
+        portfolio_coordinator=coordinator,
+    )
+
+    processor.on_candle(make_candle())
+
+    assert strategy_a._in_position is True
+    assert strategy_b._in_position is False
+    strategy_a._in_position = True
+    second_candle = make_candle().model_copy(
+        update={"timestamp": make_candle().timestamp + 60_000}
+    )
+    processor.on_candle(second_candle)
+
+    assert strategy_b._in_position is True
+    assert [call.args[0].strategy_id for call in handler.call_args_list] == [
+        "sleeve_a",
+        "sleeve_b",
+    ]
+
+
+def test_exclusive_slot_restores_state_when_coordination_rejects() -> None:
+    strategy_a = StatefulEntryStrategy("sleeve_a")
+    strategy_b = StatefulEntryStrategy("sleeve_b")
+    registry = StrategyRegistry()
+    registry.register(strategy_a)
+    registry.register(strategy_b)
+    coordinator = PortfolioCoordinator()
+    coordinator.register(
+        PortfolioDefinition(
+            portfolio_id="portfolio_v1",
+            product_id=strategy_a.product_id,
+            sleeves=(
+                PortfolioSleeve(strategy_a),
+                PortfolioSleeve(strategy_b),
+            ),
+            max_gross_quantity=Decimal("0.5"),
+            exclusive_slots=(
+                PortfolioExclusiveSlot(
+                    slot_id="shared",
+                    strategy_ids=("sleeve_a", "sleeve_b"),
+                ),
+            ),
+        )
+    )
+    execution = MagicMock()
+    execution.default_quantity = Decimal("1")
+    processor = SignalProcessor(
+        registry,
+        execution,
+        signal_handler=MagicMock(return_value=True),
+        exposure_loader=lambda *_args: PortfolioExposureSnapshot({}),
+        portfolio_coordinator=coordinator,
+    )
+
+    with pytest.raises(
+        PortfolioDecisionRejected,
+        match="portfolio_gross_limit_exceeded",
+    ):
+        processor.on_candle(make_candle())
+
+    assert strategy_a._in_position is False
+    assert strategy_b._in_position is False
+
+
+def test_exclusive_slot_restore_failure_prevents_signal_emission() -> None:
+    strategy_a = StatefulEntryStrategy("sleeve_a")
+    strategy_b = RestoreFailingEntryStrategy("sleeve_b")
+    registry = StrategyRegistry()
+    registry.register(strategy_a)
+    registry.register(strategy_b)
+    coordinator = PortfolioCoordinator()
+    coordinator.register(
+        PortfolioDefinition(
+            portfolio_id="portfolio_v1",
+            product_id=strategy_a.product_id,
+            sleeves=(
+                PortfolioSleeve(strategy_a),
+                PortfolioSleeve(strategy_b),
+            ),
+            max_gross_quantity=Decimal("1"),
+            exclusive_slots=(
+                PortfolioExclusiveSlot(
+                    slot_id="shared",
+                    strategy_ids=("sleeve_a", "sleeve_b"),
+                ),
+            ),
+        )
+    )
+    execution = MagicMock()
+    execution.default_quantity = Decimal("1")
+    handler = MagicMock(return_value=True)
+    processor = SignalProcessor(
+        registry,
+        execution,
+        signal_handler=handler,
+        exposure_loader=lambda *_args: PortfolioExposureSnapshot({}),
+        portfolio_coordinator=coordinator,
+    )
+
+    with pytest.raises(
+        PortfolioDecisionRejected,
+        match="portfolio_decision_trade_state_restore_failed",
+    ):
+        processor.on_candle(make_candle())
+
+    handler.assert_not_called()
+    assert strategy_a.restore_calls == 1
+    assert strategy_a._in_position is False
+    assert strategy_b.restore_calls >= 1
 
 
 def test_portfolio_sleeves_share_parent_lifecycle_state() -> None:

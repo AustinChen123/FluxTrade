@@ -12,10 +12,12 @@ from src.core.portfolio_runtime import (
     PortfolioCoordinator,
     PortfolioDecisionRejected,
     PortfolioDefinition,
+    PortfolioExclusiveSlot,
     PortfolioExposureSnapshot,
     PortfolioFactory,
     PortfolioSleeve,
     build_portfolio_artifact,
+    portfolio_replay_configuration,
 )
 from src.strategies.base import BaseStrategy, StrategyRequirements
 
@@ -37,6 +39,12 @@ class SleeveStrategy(BaseStrategy):
             "strategy_id": self.strategy_id,
             "product_id": self.product_id,
         }
+
+    def snapshot_walk_forward_trade_state(self) -> object:
+        return None
+
+    def restore_walk_forward_trade_state(self, state: object) -> None:
+        assert state is None
 
 
 def _candle(timestamp: int = TIMESTAMP) -> Candlestick:
@@ -73,6 +81,7 @@ def _definition(
     *strategy_ids: str,
     max_gross_quantity: Decimal | None = None,
     windows: dict[str, tuple[ActivationWindow, ...]] | None = None,
+    exclusive_slots: tuple[PortfolioExclusiveSlot, ...] = (),
 ) -> PortfolioDefinition:
     return PortfolioDefinition(
         portfolio_id="portfolio_v1",
@@ -85,6 +94,7 @@ def _definition(
             for strategy_id in strategy_ids
         ),
         max_gross_quantity=max_gross_quantity or Decimal(len(strategy_ids)),
+        exclusive_slots=exclusive_slots,
     )
 
 
@@ -119,14 +129,18 @@ def _coordinate(
             else -position.quantity
         )
         exposure[strategy_id] = exposure.get(strategy_id, Decimal("0")) + signed
-    return coordinator.coordinate_candle_decisions(
-        _candle(),
-        decisions,
-        exposure_loader=lambda _strategy_ids, _product_id, _client_order_ids: (
-            PortfolioExposureSnapshot(exposure)
-        ),
-        default_quantity=Decimal("1"),
-    )
+    with coordinator.decision_state_transaction() as transaction:
+        for sleeve in definition.sleeves:
+            transaction.capture(sleeve.strategy)
+        return coordinator.coordinate_candle_decisions(
+            _candle(),
+            decisions,
+            exposure_loader=lambda _strategy_ids, _product_id, _client_order_ids: (
+                PortfolioExposureSnapshot(exposure)
+            ),
+            default_quantity=Decimal("1"),
+            decision_state_transaction=transaction,
+        )
 
 
 def test_same_direction_sleeves_are_kept_in_definition_order() -> None:
@@ -143,6 +157,223 @@ def test_same_direction_sleeves_are_kept_in_definition_order() -> None:
     assert [strategy_id for strategy_id, _ in result] == [
         "sleeve_a",
         "sleeve_b",
+    ]
+
+
+def _exclusive_definition(
+    *,
+    max_gross_quantity: Decimal = Decimal("3"),
+    windows: dict[str, tuple[ActivationWindow, ...]] | None = None,
+) -> PortfolioDefinition:
+    return _definition(
+        "sleeve_b",
+        "sleeve_a",
+        "sleeve_c",
+        max_gross_quantity=max_gross_quantity,
+        windows=windows,
+        exclusive_slots=(
+            PortfolioExclusiveSlot(
+                slot_id="shared",
+                strategy_ids=("sleeve_a", "sleeve_b"),
+            ),
+        ),
+    )
+
+
+def test_exclusive_slot_uses_declared_priority_not_sleeve_order() -> None:
+    definition = _exclusive_definition()
+
+    result = _coordinate(
+        definition,
+        [
+            ("sleeve_b", [_signal("sleeve_b", SignalType.LONG)]),
+            ("sleeve_a", [_signal("sleeve_a", SignalType.LONG)]),
+            ("sleeve_c", []),
+        ],
+    )
+
+    assert result == [
+        ("sleeve_b", []),
+        ("sleeve_a", [_signal("sleeve_a", SignalType.LONG)]),
+        ("sleeve_c", []),
+    ]
+
+
+def test_exclusive_slot_priority_resolves_opposing_entries() -> None:
+    definition = _exclusive_definition()
+
+    result = _coordinate(
+        definition,
+        [
+            ("sleeve_b", [_signal("sleeve_b", SignalType.SHORT)]),
+            ("sleeve_a", [_signal("sleeve_a", SignalType.LONG)]),
+            ("sleeve_c", []),
+        ],
+    )
+
+    assert result == [
+        ("sleeve_b", []),
+        ("sleeve_a", [_signal("sleeve_a", SignalType.LONG)]),
+        ("sleeve_c", []),
+    ]
+
+
+def test_exclusive_slot_accepts_lower_priority_when_it_is_only_entry() -> None:
+    definition = _exclusive_definition()
+
+    result = _coordinate(
+        definition,
+        [
+            ("sleeve_b", [_signal("sleeve_b", SignalType.LONG)]),
+            ("sleeve_a", []),
+            ("sleeve_c", []),
+        ],
+    )
+
+    assert result[0] == (
+        "sleeve_b",
+        [_signal("sleeve_b", SignalType.LONG)],
+    )
+
+
+def test_exclusive_slot_ignores_inactive_higher_priority_entry() -> None:
+    definition = _exclusive_definition(
+        windows={
+            "sleeve_a": (
+                ActivationWindow(
+                    start_ms=TIMESTAMP + 1,
+                    end_ms=TIMESTAMP + 100,
+                ),
+            ),
+        },
+    )
+
+    result = _coordinate(
+        definition,
+        [
+            ("sleeve_b", [_signal("sleeve_b", SignalType.LONG)]),
+            ("sleeve_a", [_signal("sleeve_a", SignalType.LONG)]),
+            ("sleeve_c", []),
+        ],
+    )
+
+    assert result[0] == (
+        "sleeve_b",
+        [_signal("sleeve_b", SignalType.LONG)],
+    )
+    assert result[1] == ("sleeve_a", [])
+
+
+@pytest.mark.parametrize("existing_kind", ["position", "working_entry"])
+def test_exclusive_slot_existing_owner_suppresses_other_entry(
+    existing_kind,
+) -> None:
+    definition = _exclusive_definition()
+    positions = (
+        {"sleeve_a": _position("sleeve_a", PositionSide.LONG)}
+        if existing_kind == "position"
+        else None
+    )
+    pending_entries = (
+        {"sleeve_a": Decimal("1")}
+        if existing_kind == "working_entry"
+        else None
+    )
+
+    result = _coordinate(
+        definition,
+        [
+            ("sleeve_b", [_signal("sleeve_b", SignalType.LONG)]),
+            ("sleeve_a", []),
+            ("sleeve_c", []),
+        ],
+        positions=positions,
+        pending_entries=pending_entries,
+    )
+
+    assert result[0] == ("sleeve_b", [])
+
+
+def test_exclusive_slot_does_not_handoff_on_owner_exit_candle() -> None:
+    definition = _exclusive_definition()
+
+    result = _coordinate(
+        definition,
+        [
+            ("sleeve_b", [_signal("sleeve_b", SignalType.LONG)]),
+            ("sleeve_a", [_signal("sleeve_a", SignalType.EXIT_LONG)]),
+            ("sleeve_c", []),
+        ],
+        positions={
+            "sleeve_a": _position("sleeve_a", PositionSide.LONG),
+        },
+    )
+
+    assert result[0] == ("sleeve_b", [])
+    assert result[1] == (
+        "sleeve_a",
+        [_signal("sleeve_a", SignalType.EXIT_LONG)],
+    )
+
+
+def test_exclusive_slot_rejects_multiple_existing_owners() -> None:
+    definition = _exclusive_definition()
+
+    with pytest.raises(
+        PortfolioDecisionRejected,
+        match="portfolio_existing_exclusive_slot_conflict",
+    ):
+        _coordinate(
+            definition,
+            [
+                ("sleeve_b", []),
+                ("sleeve_a", []),
+                ("sleeve_c", []),
+            ],
+            positions={
+                "sleeve_a": _position("sleeve_a", PositionSide.LONG),
+                "sleeve_b": _position("sleeve_b", PositionSide.LONG),
+            },
+        )
+
+
+def test_exclusive_slot_requires_decision_state_transaction() -> None:
+    definition = _exclusive_definition()
+    coordinator = PortfolioCoordinator()
+    coordinator.register(definition)
+
+    with pytest.raises(
+        PortfolioDecisionRejected,
+        match="portfolio_decision_trade_state_missing",
+    ):
+        coordinator.coordinate_candle_decisions(
+            _candle(),
+            [
+                ("sleeve_b", [_signal("sleeve_b", SignalType.LONG)]),
+                ("sleeve_a", [_signal("sleeve_a", SignalType.LONG)]),
+                ("sleeve_c", []),
+            ],
+            exposure_loader=lambda *_args: PortfolioExposureSnapshot({}),
+            default_quantity=Decimal("1"),
+        )
+
+
+def test_exclusive_slot_does_not_suppress_independent_sleeve() -> None:
+    definition = _exclusive_definition()
+
+    result = _coordinate(
+        definition,
+        [
+            ("sleeve_b", [_signal("sleeve_b", SignalType.LONG)]),
+            ("sleeve_a", [_signal("sleeve_a", SignalType.LONG)]),
+            ("sleeve_c", [_signal("sleeve_c", SignalType.LONG)]),
+        ],
+    )
+
+    assert result == [
+        ("sleeve_b", []),
+        ("sleeve_a", [_signal("sleeve_a", SignalType.LONG)]),
+        ("sleeve_c", [_signal("sleeve_c", SignalType.LONG)]),
     ]
 
 
@@ -336,6 +567,191 @@ def test_definition_rejects_duplicate_sleeve_ids_and_mixed_timeframes() -> None:
             product_id=PRODUCT,
             sleeves=(PortfolioSleeve(duplicate), PortfolioSleeve(duplicate)),
             max_gross_quantity=Decimal("2"),
+        )
+
+
+def test_definition_validates_exclusive_slot_membership() -> None:
+    with pytest.raises(ValueError, match="unknown sleeves"):
+        _definition(
+            "sleeve_a",
+            "sleeve_b",
+            exclusive_slots=(
+                PortfolioExclusiveSlot(
+                    slot_id="shared",
+                    strategy_ids=("sleeve_a", "unknown"),
+                ),
+            ),
+        )
+
+    with pytest.raises(ValueError, match="multiple exclusive slots"):
+        _definition(
+            "sleeve_a",
+            "sleeve_b",
+            "sleeve_c",
+            exclusive_slots=(
+                PortfolioExclusiveSlot(
+                    slot_id="first",
+                    strategy_ids=("sleeve_a", "sleeve_b"),
+                ),
+                PortfolioExclusiveSlot(
+                    slot_id="second",
+                    strategy_ids=("sleeve_a", "sleeve_c"),
+                ),
+            ),
+        )
+
+
+def test_definition_requires_exclusive_slot_trade_state_rollback() -> None:
+    class NoRollbackStrategy(BaseStrategy):
+        @property
+        def requirements(self) -> StrategyRequirements:
+            return StrategyRequirements(self.product_id, "5m", 2)
+
+        def on_candle(self, candle: Candlestick):
+            return None
+
+    with pytest.raises(ValueError, match="trade-state rollback"):
+        PortfolioDefinition(
+            portfolio_id="portfolio_v1",
+            product_id=PRODUCT,
+            sleeves=(
+                PortfolioSleeve(NoRollbackStrategy("sleeve_a", PRODUCT)),
+                PortfolioSleeve(SleeveStrategy("sleeve_b", PRODUCT)),
+            ),
+            max_gross_quantity=Decimal("1"),
+            exclusive_slots=(
+                PortfolioExclusiveSlot(
+                    slot_id="shared",
+                    strategy_ids=("sleeve_a", "sleeve_b"),
+                ),
+            ),
+        )
+
+
+@pytest.mark.parametrize(
+    ("slot_id", "strategy_ids", "error"),
+    [
+        ("", ("sleeve_a", "sleeve_b"), "ID must be non-empty"),
+        ("shared", ("sleeve_a",), "at least two"),
+        ("shared", ("sleeve_a", ""), "strategy IDs must be non-empty"),
+        ("shared", ("sleeve_a", "sleeve_a"), "must be unique"),
+    ],
+)
+def test_exclusive_slot_validates_identity_and_members(
+    slot_id: str,
+    strategy_ids: tuple[str, ...],
+    error: str,
+) -> None:
+    with pytest.raises(ValueError, match=error):
+        PortfolioExclusiveSlot(
+            slot_id=slot_id,
+            strategy_ids=strategy_ids,
+        )
+
+
+def test_definition_rejects_duplicate_exclusive_slot_ids() -> None:
+    with pytest.raises(ValueError, match="slot IDs must be unique"):
+        _definition(
+            "sleeve_a",
+            "sleeve_b",
+            "sleeve_c",
+            "sleeve_d",
+            exclusive_slots=(
+                PortfolioExclusiveSlot(
+                    slot_id="shared",
+                    strategy_ids=("sleeve_a", "sleeve_b"),
+                ),
+                PortfolioExclusiveSlot(
+                    slot_id="shared",
+                    strategy_ids=("sleeve_c", "sleeve_d"),
+                ),
+            ),
+        )
+
+
+def test_exclusive_slots_are_part_of_replay_configuration() -> None:
+    definition = _exclusive_definition()
+
+    assert portfolio_replay_configuration(definition)["exclusive_slots"] == [
+        {
+            "slot_id": "shared",
+            "strategy_ids": ["sleeve_a", "sleeve_b"],
+        }
+    ]
+
+
+def test_no_slot_replay_configuration_preserves_legacy_shape() -> None:
+    assert "exclusive_slots" not in portfolio_replay_configuration(
+        _definition("sleeve_a", "sleeve_b")
+    )
+
+
+def test_no_slot_preserves_rejection_precedence() -> None:
+    definition = _definition(
+        "sleeve_a",
+        "sleeve_b",
+        max_gross_quantity=Decimal("1"),
+    )
+    invalid_later_signal = _signal(
+        "sleeve_b",
+        SignalType.LONG,
+    ).model_copy(update={"strategy_id": "wrong"})
+
+    with pytest.raises(
+        PortfolioDecisionRejected,
+        match="portfolio_gross_limit_exceeded",
+    ):
+        _coordinate(
+            definition,
+            [
+                (
+                    "sleeve_a",
+                    [
+                        _signal(
+                            "sleeve_a",
+                            SignalType.LONG,
+                            quantity=Decimal("2"),
+                        )
+                    ],
+                ),
+                ("sleeve_b", [invalid_later_signal]),
+            ],
+        )
+
+
+def test_artifact_factory_rejects_exclusive_slot_priority_drift() -> None:
+    class SlotDriftingFactory(PortfolioFactory):
+        build_count = 0
+
+        def build(self, *, portfolio_id, product_id, config):
+            type(self).build_count += 1
+            strategy_ids = (
+                ("sleeve_a", "sleeve_b")
+                if type(self).build_count == 1
+                else ("sleeve_b", "sleeve_a")
+            )
+            return PortfolioDefinition(
+                portfolio_id=portfolio_id,
+                product_id=product_id,
+                sleeves=tuple(
+                    PortfolioSleeve(SleeveStrategy(strategy_id, product_id))
+                    for strategy_id in ("sleeve_a", "sleeve_b")
+                ),
+                max_gross_quantity=Decimal("1"),
+                exclusive_slots=(
+                    PortfolioExclusiveSlot(
+                        slot_id="shared",
+                        strategy_ids=strategy_ids,
+                    ),
+                ),
+            )
+
+    with pytest.raises(ValueError, match="not deterministic"):
+        build_portfolio_artifact(
+            SlotDriftingFactory,
+            portfolio_id="portfolio_v1",
+            product_id=PRODUCT,
+            config={},
         )
 
 

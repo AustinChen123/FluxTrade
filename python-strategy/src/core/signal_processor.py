@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+from contextlib import nullcontext
 from collections.abc import Callable
 from decimal import Decimal
 from typing import Any, Mapping, Optional
@@ -93,59 +94,77 @@ class SignalProcessor:
         memory is rebuilt from candles, but any generated signals are ignored.
         """
         decisions: list[tuple[str, list[Signal]]] = []
-        for strategy in self.registry.list_active():
-            if strategy.product_id != candle.product_id:
-                continue
-            if strategy.requirements.timeframe != candle.timeframe:
-                continue
-            if (
-                respect_state
-                and self.state_manager is not None
-                and not self.state_manager.is_running(
-                    self._lifecycle_id(strategy.strategy_id)
-                )
-            ):
-                logger.debug(
-                    "Skipping strategy %s because it is not running",
-                    strategy.strategy_id,
-                )
-                continue
+        transaction_context = (
+            self.portfolio_coordinator.decision_state_transaction()
+            if emit_signals and self.portfolio_coordinator is not None
+            else nullcontext()
+        )
+        with transaction_context as decision_state_transaction:
+            for strategy in self.registry.list_active():
+                if strategy.product_id != candle.product_id:
+                    continue
+                if strategy.requirements.timeframe != candle.timeframe:
+                    continue
+                if (
+                    respect_state
+                    and self.state_manager is not None
+                    and not self.state_manager.is_running(
+                        self._lifecycle_id(strategy.strategy_id)
+                    )
+                ):
+                    logger.debug(
+                        "Skipping strategy %s because it is not running",
+                        strategy.strategy_id,
+                    )
+                    continue
 
-            if not self._sync_position_if_changed(strategy):
-                continue
-            signals = self._dispatch_to_strategy(strategy, candle)
-            decisions.append((strategy.strategy_id, signals))
+                if not self._sync_position_if_changed(strategy):
+                    continue
+                if (
+                    decision_state_transaction is not None
+                    and self.portfolio_coordinator is not None
+                ):
+                    decision_state_transaction.capture(strategy)
+                signals = self._dispatch_to_strategy(strategy, candle)
+                decisions.append((strategy.strategy_id, signals))
+
+            if emit_signals:
+                if (
+                    self.signal_handler is not None
+                    or self.portfolio_coordinator is not None
+                ):
+                    decisions = [
+                        (
+                            strategy_id,
+                            [
+                                self._with_market_idempotency(
+                                    signal,
+                                    product_id=candle.product_id,
+                                    event_scope=candle.timeframe,
+                                    event_timestamp=candle.timestamp,
+                                    ordinal=ordinal,
+                                )
+                                for ordinal, signal in enumerate(signals)
+                            ],
+                        )
+                        for strategy_id, signals in decisions
+                    ]
+                if self.portfolio_coordinator is not None:
+                    decisions = (
+                        self.portfolio_coordinator.coordinate_candle_decisions(
+                            candle,
+                            decisions,
+                            exposure_loader=self.exposure_loader,
+                            default_quantity=Decimal(
+                                    str(self.execution_engine.default_quantity)
+                                ),
+                            decision_state_transaction=(
+                                decision_state_transaction
+                            ),
+                        )
+                    )
 
         if emit_signals:
-            if (
-                self.signal_handler is not None
-                or self.portfolio_coordinator is not None
-            ):
-                decisions = [
-                    (
-                        strategy_id,
-                        [
-                            self._with_market_idempotency(
-                                signal,
-                                product_id=candle.product_id,
-                                event_scope=candle.timeframe,
-                                event_timestamp=candle.timestamp,
-                                ordinal=ordinal,
-                            )
-                            for ordinal, signal in enumerate(signals)
-                        ],
-                    )
-                    for strategy_id, signals in decisions
-                ]
-            if self.portfolio_coordinator is not None:
-                decisions = self.portfolio_coordinator.coordinate_candle_decisions(
-                    candle,
-                    decisions,
-                    exposure_loader=self.exposure_loader,
-                    default_quantity=Decimal(
-                        str(self.execution_engine.default_quantity)
-                    ),
-                )
             for strategy_id, signals in decisions:
                 self._process_signals(
                     strategy_id,
