@@ -13,7 +13,7 @@ from src.core.fast_bar import (
     _resolve_fast_bar_order_intent,
     prepare_fast_strategy,
 )
-from src.core.models import OrderSide, SignalType
+from src.core.models import OrderSide, PositionSide, SignalType
 from src.core.product_registry import InstrumentSpec
 from src.core.research_backtest_runner import ResearchBacktestRunner
 from src.strategies.callable_strategy import CallableStrategy
@@ -312,6 +312,103 @@ def test_fast_bar_invalid_intent_aborts_without_metrics():
 
 @pytest.mark.rust
 @pytest.mark.skipif(not HAS_RUST, reason="fluxtrade_core.so not compiled")
+def test_fast_bar_empty_endpoint_state_has_no_final_observation():
+    runner = FastBarReplayRunner(
+        tape=MarketTape.empty(product_id=PRODUCT_ID, timeframe=TIMEFRAME),
+        strategy=_ScriptedFastStrategy([]),
+    )
+
+    result = runner.run()
+
+    endpoint = result["endpoint_state"]
+    assert endpoint.positions == ()
+    assert endpoint.working_orders == ()
+    assert endpoint.protection_orders == ()
+    assert endpoint.final_mark is None
+    assert endpoint.end_timestamp is None
+    assert endpoint.halted_early is False
+
+
+@pytest.mark.rust
+@pytest.mark.skipif(not HAS_RUST, reason="fluxtrade_core.so not compiled")
+def test_fast_bar_final_bar_entry_is_visible_as_working_order():
+    runner = _fast_runner(
+        SignalIntent(SignalType.LONG, quantity=Decimal("1")),
+    )
+
+    result = runner.run()
+
+    endpoint = result["endpoint_state"]
+    assert endpoint.positions == ()
+    assert len(endpoint.working_orders) == 1
+    assert endpoint.working_orders[0].side == OrderSide.BUY
+    assert endpoint.working_orders[0].order_type == "MARKET"
+    assert endpoint.working_orders[0].price is None
+    assert endpoint.protection_orders == ()
+    assert endpoint.final_mark == Decimal(str(runner.tape.close[0]))
+    assert endpoint.end_timestamp == int(runner.tape.timestamps[0])
+    assert endpoint.halted_early is False
+
+
+@pytest.mark.rust
+@pytest.mark.skipif(not HAS_RUST, reason="fluxtrade_core.so not compiled")
+@pytest.mark.parametrize(
+    ("entry_type", "expected_side"),
+    [
+        (SignalType.LONG, PositionSide.LONG),
+        (SignalType.SHORT, PositionSide.SHORT),
+    ],
+)
+def test_fast_bar_open_position_is_visible_at_endpoint(
+    entry_type,
+    expected_side,
+):
+    runner = _fast_runner(
+        SignalIntent(entry_type, quantity=Decimal("1")),
+        None,
+    )
+
+    endpoint = runner.run()["endpoint_state"]
+
+    assert len(endpoint.positions) == 1
+    assert endpoint.positions[0].side == expected_side
+    assert endpoint.positions[0].quantity == Decimal("1")
+    assert endpoint.working_orders == ()
+    assert endpoint.halted_early is False
+
+
+@pytest.mark.rust
+@pytest.mark.skipif(not HAS_RUST, reason="fluxtrade_core.so not compiled")
+def test_fast_bar_pending_exit_preserves_position_and_working_order():
+    endpoint = _fast_runner(
+        SignalIntent(SignalType.LONG, quantity=Decimal("1")),
+        SignalIntent(SignalType.EXIT_LONG),
+    ).run()["endpoint_state"]
+
+    assert len(endpoint.positions) == 1
+    assert endpoint.positions[0].side == PositionSide.LONG
+    assert len(endpoint.working_orders) == 1
+    assert endpoint.working_orders[0].side == OrderSide.SELL
+    assert endpoint.protection_orders == ()
+
+
+@pytest.mark.rust
+@pytest.mark.skipif(not HAS_RUST, reason="fluxtrade_core.so not compiled")
+def test_fast_bar_completed_exit_is_flat_at_endpoint():
+    endpoint = _fast_runner(
+        SignalIntent(SignalType.LONG, quantity=Decimal("1")),
+        SignalIntent(SignalType.EXIT_LONG),
+        None,
+    ).run()["endpoint_state"]
+
+    assert endpoint.positions == ()
+    assert endpoint.working_orders == ()
+    assert endpoint.protection_orders == ()
+    assert endpoint.halted_early is False
+
+
+@pytest.mark.rust
+@pytest.mark.skipif(not HAS_RUST, reason="fluxtrade_core.so not compiled")
 def test_fast_bar_invalid_intent_after_fill_aborts_without_metrics():
     runner = _fast_runner(
         SignalIntent(SignalType.LONG, quantity=Decimal("1")),
@@ -454,6 +551,7 @@ def test_fast_bar_golden_cross_matches_research_runner_core_metrics():
     assert fast_result["total_trades"] == research_result["total_trades"]
     assert fast_result["total_pnl"] == research_result["total_pnl"]
     assert fast_result["max_drawdown"] == research_result["max_drawdown"]
+    assert fast_result["endpoint_state"] == research_result["endpoint_state"]
 
 
 @pytest.mark.skipif(not HAS_RUST, reason="fluxtrade_core.so not compiled")

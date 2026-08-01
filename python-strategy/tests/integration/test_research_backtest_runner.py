@@ -24,7 +24,14 @@ from src.core.analytics import (
 from src.core.backtest_runner import BacktestRunner
 from src.core.capital_allocator import CapitalAllocator
 from src.core.data_sources.memory import MemoryDataSource
-from src.core.models import Candlestick, Signal, SignalType
+from src.core.fast_bar import FastBarReplayRunner, MarketTape, SignalIntent
+from src.core.models import (
+    Candlestick,
+    OrderSide,
+    PositionSide,
+    Signal,
+    SignalType,
+)
 from src.core.orm_models import (
     BacktestResultSummary,
     BacktestTradeLog,
@@ -471,6 +478,326 @@ def test_research_backtest_matches_full_runner_core_metrics(
     assert research_result["total_pnl"] == full_result["total_pnl"]
     assert research_result["profit_factor"] == full_result["profit_factor"]
     assert research_result["closed_trades"] == full_closed_trades
+
+
+@pytest.mark.parametrize(
+    (
+        "scenario",
+        "entry_type",
+        "candle_count",
+        "expected_position_side",
+        "expected_working_orders",
+        "expected_protection_orders",
+    ),
+    [
+        ("empty", None, 0, None, 0, 0),
+        ("zero-mark", None, 1, None, 0, 0),
+        ("negative-mark", None, 1, None, 0, 0),
+        ("pending-protected-entry", SignalType.LONG, 1, None, 3, 2),
+        ("open-long", SignalType.LONG, 2, PositionSide.LONG, 0, 0),
+        ("open-long-trailing", SignalType.LONG, 3, PositionSide.LONG, 1, 1),
+        ("open-short", SignalType.SHORT, 2, PositionSide.SHORT, 0, 0),
+        ("flat", SignalType.LONG, 3, None, 0, 0),
+    ],
+)
+def test_full_and_research_runners_share_canonical_endpoint_state(
+    tmp_path,
+    scenario,
+    entry_type,
+    candle_count,
+    expected_position_side,
+    expected_working_orders,
+    expected_protection_orders,
+):
+    start = 1_700_000_000_000
+    endpoint_price = {
+        "zero-mark": Decimal("0"),
+        "negative-mark": Decimal("-1"),
+    }.get(scenario, Decimal("100"))
+    candles = []
+    for index in range(candle_count):
+        if scenario == "open-long-trailing" and index == 2:
+            open_price = Decimal("107")
+            high_price = Decimal("110")
+            low_price = Decimal("106")
+            close_price = Decimal("108")
+        else:
+            open_price = endpoint_price
+            high_price = endpoint_price + Decimal("1")
+            low_price = endpoint_price - Decimal("1")
+            close_price = endpoint_price
+        candles.append(
+            make_candle(
+                start + index * INTERVAL_MS,
+                open_price,
+                high_price,
+                low_price,
+                close_price,
+            )
+        )
+
+    def predict(candle):
+        index = (candle.timestamp - start) // INTERVAL_MS
+        if index == 0 and entry_type is not None:
+            return Signal(
+                strategy_id="endpoint_parity",
+                product_id=PRODUCT_ID,
+                timeframe=TIMEFRAME,
+                timestamp=candle.timestamp,
+                type=entry_type,
+                quantity=Decimal("1"),
+                stop_loss=(
+                    Decimal("90")
+                    if scenario == "pending-protected-entry"
+                    else None
+                ),
+                take_profit=(
+                    Decimal("110")
+                    if scenario == "pending-protected-entry"
+                    else None
+                ),
+                trailing_distance=(
+                    Decimal("5")
+                    if scenario == "open-long-trailing"
+                    else None
+                ),
+            )
+        if index == 1 and scenario == "flat":
+            return Signal(
+                strategy_id="endpoint_parity",
+                product_id=PRODUCT_ID,
+                timeframe=TIMEFRAME,
+                timestamp=candle.timestamp,
+                type=SignalType.EXIT_LONG,
+                quantity=Decimal("1"),
+            )
+        return None
+
+    end = candles[-1].timestamp if candles else start
+    common = {
+        "start_time": start,
+        "end_time": end,
+        "product_id": PRODUCT_ID,
+        "timeframe": TIMEFRAME,
+        "initial_balance": 10_000,
+        "max_drawdown_limit": None,
+        "data_source": MemoryDataSource(candles),
+    }
+    full_runner = BacktestRunner(
+        **common,
+        report_config={
+            "csv_trades": False,
+            "markdown_report": False,
+            "equity_curve": False,
+            "journal_export": False,
+        },
+        db_session_factory=_sqlite_backtest_session_factory(tmp_path),
+    )
+    full_runner.add_strategy(
+        CallableStrategy(
+            "endpoint_parity",
+            predict,
+            PRODUCT_ID,
+            TIMEFRAME,
+        )
+    )
+    research_runner = ResearchBacktestRunner(**common)
+    research_runner.add_strategy(
+        CallableStrategy(
+            "endpoint_parity",
+            predict,
+            PRODUCT_ID,
+            TIMEFRAME,
+        )
+    )
+
+    full_endpoint = full_runner.run()["endpoint_state"]
+    research_endpoint = research_runner.run()["endpoint_state"]
+
+    assert full_endpoint.model_dump() == research_endpoint.model_dump()
+    assert full_endpoint.halted_early is False
+    assert len(full_endpoint.positions) == (expected_position_side is not None)
+    assert len(full_endpoint.working_orders) == expected_working_orders
+    assert len(full_endpoint.protection_orders) == expected_protection_orders
+    if candles:
+        assert full_endpoint.final_mark == candles[-1].close
+        assert full_endpoint.end_timestamp == candles[-1].timestamp
+    else:
+        assert full_endpoint.final_mark is None
+        assert full_endpoint.end_timestamp is None
+    if expected_position_side is not None:
+        position = full_endpoint.positions[0]
+        assert position.strategy_id == "endpoint_parity"
+        assert position.product_id == PRODUCT_ID
+        assert position.side == expected_position_side
+        assert position.quantity == Decimal("1")
+        assert position.average_entry_price == Decimal("100")
+    if scenario == "pending-protected-entry":
+        assert {order.order_type for order in full_endpoint.working_orders} == {
+            "MARKET",
+            "STOP_LOSS",
+            "TAKE_PROFIT",
+        }
+        assert {
+            order.side for order in full_endpoint.protection_orders
+        } == {OrderSide.SELL}
+    if scenario == "open-long-trailing":
+        trailing = full_endpoint.protection_orders[0]
+        assert trailing.order_type == "TRAILING_STOP"
+        assert trailing.trigger_price == Decimal("105")
+        assert trailing.trailing_distance == Decimal("5")
+
+
+@pytest.mark.parametrize(
+    ("entry_type", "expected_side", "expected_unrealized"),
+    [
+        (SignalType.LONG, PositionSide.LONG, Decimal("2")),
+        (SignalType.SHORT, PositionSide.SHORT, Decimal("-2")),
+    ],
+)
+def test_three_runners_share_open_endpoint_and_mark_to_market(
+    tmp_path,
+    entry_type,
+    expected_side,
+    expected_unrealized,
+):
+    start = 1_700_000_000_000
+    candles = [
+        make_candle(
+            start,
+            Decimal("100"),
+            Decimal("101"),
+            Decimal("99"),
+            Decimal("100"),
+        ),
+        make_candle(
+            start + INTERVAL_MS,
+            Decimal("99"),
+            Decimal("100"),
+            Decimal("98"),
+            Decimal("99"),
+        ),
+        make_candle(
+            start + 2 * INTERVAL_MS,
+            Decimal("101"),
+            Decimal("102"),
+            Decimal("100"),
+            Decimal("101"),
+        ),
+        make_candle(
+            start + 3 * INTERVAL_MS,
+            Decimal("102"),
+            Decimal("104"),
+            Decimal("101"),
+            Decimal("103"),
+        ),
+    ]
+    instrument = InstrumentSpec(
+        product_id=PRODUCT_ID,
+        exchange="test",
+        symbol="MNQ",
+        base="MNQ",
+        quote="USD",
+        multiplier=Decimal("2"),
+    )
+    taker_fee = Decimal("0.001")
+
+    def predict(candle):
+        if candle.timestamp != candles[2].timestamp:
+            return None
+        return Signal(
+            strategy_id="three_runner_endpoint",
+            product_id=PRODUCT_ID,
+            timeframe=TIMEFRAME,
+            timestamp=candle.timestamp,
+            type=entry_type,
+            quantity=Decimal("1"),
+        )
+
+    class PreparedStrategy:
+        strategy_id = "three_runner_endpoint"
+
+        def on_bar(self, bar):
+            if bar.timestamp != candles[2].timestamp:
+                return None
+            return SignalIntent(entry_type, quantity=Decimal("1"))
+
+    full_runner = BacktestRunner(
+        start_time=candles[0].timestamp,
+        end_time=candles[-1].timestamp,
+        product_id=PRODUCT_ID,
+        timeframe=TIMEFRAME,
+        initial_balance=10_000,
+        max_drawdown_limit=None,
+        data_source=MemoryDataSource(candles),
+        fee_config={"maker": Decimal("0"), "taker": taker_fee},
+        report_config={
+            "csv_trades": False,
+            "markdown_report": False,
+            "equity_curve": False,
+            "journal_export": False,
+        },
+        db_session_factory=_sqlite_backtest_session_factory(tmp_path),
+        instrument_spec=instrument,
+    )
+    full_runner.add_strategy(
+        CallableStrategy(
+            "three_runner_endpoint",
+            predict,
+            PRODUCT_ID,
+            TIMEFRAME,
+        )
+    )
+    research_runner = ResearchBacktestRunner(
+        start_time=candles[0].timestamp,
+        end_time=candles[-1].timestamp,
+        product_id=PRODUCT_ID,
+        timeframe=TIMEFRAME,
+        initial_balance=10_000,
+        data_source=MemoryDataSource(candles),
+        fee_config={"maker": Decimal("0"), "taker": taker_fee},
+        max_drawdown_limit=None,
+        instrument_spec=instrument,
+    )
+    research_runner.add_strategy(
+        CallableStrategy(
+            "three_runner_endpoint",
+            predict,
+            PRODUCT_ID,
+            TIMEFRAME,
+        )
+    )
+    fast_runner = FastBarReplayRunner(
+        tape=MarketTape.from_candles(
+            candles,
+            product_id=PRODUCT_ID,
+            timeframe=TIMEFRAME,
+        ),
+        strategy=PreparedStrategy(),
+        initial_balance=Decimal("10000"),
+        taker_fee=taker_fee,
+        instrument_spec=instrument,
+    )
+
+    full_result = full_runner.run()
+    research_result = research_runner.run()
+    fast_result = fast_runner.run()
+    endpoints = [
+        result["endpoint_state"].model_dump(mode="json")
+        for result in (full_result, research_result, fast_result)
+    ]
+
+    assert endpoints[0] == endpoints[1] == endpoints[2]
+    assert len(full_result["endpoint_state"].positions) == 1
+    assert full_result["endpoint_state"].positions[0].side == expected_side
+    assert full_result["endpoint_state"].working_orders == ()
+    expected_entry_fee = candles[3].open * Decimal("2") * taker_fee
+    assert (
+        full_result["mark_to_market_pnl"]
+        == research_result["mark_to_market_pnl"]
+        == fast_result["mark_to_market_pnl"]
+        == expected_unrealized - expected_entry_fee
+    )
 
 
 @pytest.mark.parametrize("invalid_field", [None, "price", "value"])

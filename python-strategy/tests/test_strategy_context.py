@@ -598,15 +598,27 @@ def test_research_runner_reports_bar_level_drawdown_for_open_positions():
 
 @pytest.mark.rust
 @pytest.mark.skipif(not HAS_RUST, reason="fluxtrade_core.so not compiled")
-def test_research_runner_stops_on_bar_level_open_position_drawdown():
+@pytest.mark.parametrize("include_unprocessed_candle", [False, True])
+def test_research_runner_reports_triggered_drawdown_halt_policy(
+    include_unprocessed_candle,
+):
     base_ts = 1_700_000_000_000
     interval_ms = 15 * 60 * 1000
     candles = [
         make_candle(base_ts, Decimal("100"), Decimal("100"), Decimal("100"), Decimal("100")),
         make_candle(base_ts + interval_ms, Decimal("100"), Decimal("100"), Decimal("100"), Decimal("100")),
         make_candle(base_ts + 2 * interval_ms, Decimal("60"), Decimal("60"), Decimal("60"), Decimal("60")),
-        make_candle(base_ts + 3 * interval_ms, Decimal("105"), Decimal("105"), Decimal("105"), Decimal("105")),
     ]
+    if include_unprocessed_candle:
+        candles.append(
+            make_candle(
+                base_ts + 3 * interval_ms,
+                Decimal("105"),
+                Decimal("105"),
+                Decimal("105"),
+                Decimal("105"),
+            )
+        )
     strategy = SingleEntryStrategy(quantity=Decimal("1"))
     runner = ResearchBacktestRunner(
         start_time=candles[0].timestamp,
@@ -627,6 +639,17 @@ def test_research_runner_stops_on_bar_level_open_position_drawdown():
     assert result["max_drawdown"] == Decimal("40")
     assert len(strategy.contexts) == 3
     assert strategy.contexts[-1].current_drawdown == Decimal("40")
+    endpoint_state = result["endpoint_state"]
+    assert endpoint_state.halted_early is True
+    assert endpoint_state.final_mark == candles[2].close
+    assert endpoint_state.end_timestamp == candles[2].timestamp
+    assert len(endpoint_state.positions) == 1
+    endpoint_position = endpoint_state.positions[0]
+    assert endpoint_position.strategy_id == strategy.strategy_id
+    assert endpoint_position.product_id == PRODUCT_ID
+    assert endpoint_position.side == PositionSide.LONG
+    assert endpoint_position.quantity == Decimal("1")
+    assert endpoint_position.average_entry_price == Decimal("100")
 
 
 @pytest.mark.rust

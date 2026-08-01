@@ -17,6 +17,7 @@ from decimal import Decimal
 import pytest
 
 from src.core.adapters.simulated import SimulatedAdapter
+from src.core.backtest.endpoint_state import build_replay_endpoint_state
 from src.core.models import Candlestick
 from src.core.precision import PrecisionCodec, PrecisionSpec
 from src.core.interfaces.exchange import ExchangeError
@@ -693,6 +694,43 @@ class TestTrailingStop:
         assert _approx(fills[0]["price"], 51500)
         assert adapter.get_position(PRODUCT) is None
 
+    def test_endpoint_snapshot_uses_matcher_updated_trailing_trigger(
+        self,
+        order_factory,
+    ):
+        adapter = SimulatedAdapter(Decimal("10000"))
+        entry = order_factory(
+            order_type="market",
+            side="buy",
+            product_id=PRODUCT,
+            quantity=Decimal("0.1"),
+        )
+        adapter.place_order(entry)
+        adapter.on_market_data(_candle(200, 50000, 50200, 49900, 50100))
+        trailing = order_factory(
+            order_type="trailing_stop",
+            side="sell",
+            product_id=PRODUCT,
+            quantity=Decimal("0.1"),
+            trigger_price=Decimal("49500"),
+        )
+        trailing._trailing_distance = Decimal("500")
+        adapter.place_order(trailing)
+
+        fills = adapter.on_market_data(
+            _candle(400, 50500, 52000, 51600, 51900)
+        )
+        endpoint = build_replay_endpoint_state(
+            positions=adapter.get_all_positions(),
+            working_orders=adapter.get_matching_open_orders(),
+            final_mark=Decimal("51900"),
+            end_timestamp=400,
+        )
+
+        assert fills == []
+        assert endpoint.protection_orders[0].trigger_price == Decimal("51500")
+        assert endpoint.protection_orders[0].trailing_distance == Decimal("500")
+
     def test_trailing_for_short(self, order_factory):
         adapter = SimulatedAdapter(Decimal("10000"))
         entry = order_factory(order_type="market", side="sell",
@@ -920,6 +958,36 @@ class TestPositionTracking:
             "LONG",
             "SHORT",
         ]
+
+    def test_all_positions_preserve_ownership_and_are_deterministic(
+        self,
+        order_factory,
+    ):
+        adapter = SimulatedAdapter(Decimal("100000"))
+        for strategy_id, side in (("beta", "sell"), ("alpha", "buy")):
+            adapter.place_order(
+                order_factory(
+                    strategy_id=strategy_id,
+                    order_type="market",
+                    side=side,
+                    product_id=PRODUCT,
+                    quantity=Decimal("0.1"),
+                )
+            )
+        adapter.on_market_data(
+            _candle(200, 50000, 50500, 49500, 50200)
+        )
+
+        positions = adapter.get_all_positions()
+
+        assert [
+            (position.strategy_id, position.product_id, position.side)
+            for position in positions
+        ] == [
+            ("alpha", PRODUCT, "LONG"),
+            ("beta", PRODUCT, "SHORT"),
+        ]
+        assert adapter.get_all_positions() == positions
 
     def test_different_products_independent(self, order_factory):
         adapter = SimulatedAdapter(Decimal("100000"))

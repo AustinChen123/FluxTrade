@@ -309,6 +309,10 @@ class TestBacktestE2E:
         assert result["candle_count"] == 3
         assert result["max_drawdown"] == Decimal("40")
         assert result["journal_count"] >= 1
+        endpoint_state = result["endpoint_state"]
+        assert endpoint_state.halted_early is True
+        assert endpoint_state.final_mark == candles[2].close
+        assert endpoint_state.end_timestamp == candles[2].timestamp
 
     @patch("src.core.backtest_runner.SessionLocal")
     def test_backtest_drawdown_aggregates_strategy_scoped_positions(

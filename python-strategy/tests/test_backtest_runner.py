@@ -364,13 +364,16 @@ def test_split_backtest_routes_every_1m_fill_and_only_completed_5m_decisions():
         for minute in range(6)
     ]
 
-    count, _equity = runner._process_candles(
+    progress = runner._process_candles(
         candles,
         account,
         stop_drawdown_amount=None,
     )
 
-    assert count == 6
+    assert progress.candle_count == 6
+    assert progress.final_mark == Decimal("20000")
+    assert progress.end_timestamp == candles[-1].timestamp
+    assert progress.halted_early is False
     assert runner.engine.on_backtest_market_data.call_count == 6
     decision_candles = [
         call.args[1]

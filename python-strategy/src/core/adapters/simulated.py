@@ -243,6 +243,28 @@ class SimulatedAdapter(IExchangeAdapter):
                 positions.append(position)
         return tuple(positions)
 
+    def get_all_positions(self) -> tuple[Position, ...]:
+        """Return all non-flat matcher positions in deterministic order."""
+        positions = []
+        for rust_position in self._engine.positions.values():
+            position = _position_from_rust(
+                rust_position,
+                strategy_id=getattr(rust_position, "strategy_id", None),
+                product_id=rust_position.product_id,
+            )
+            if position is not None:
+                positions.append(position)
+        return tuple(
+            sorted(
+                positions,
+                key=lambda position: (
+                    position.strategy_id,
+                    position.product_id,
+                    position.side.value,
+                ),
+            )
+        )
+
     def get_open_orders(
         self,
         product_id: Optional[str] = None,
@@ -255,6 +277,10 @@ class SimulatedAdapter(IExchangeAdapter):
         if strategy_id is not None:
             orders = [order for order in orders if order.strategy_id == strategy_id]
         return orders
+
+    def get_matching_open_orders(self) -> tuple[RustOrder, ...]:
+        """Return the matcher-authoritative working-order snapshot."""
+        return tuple(self._engine.open_orders)
 
     def get_strategy_context(
         self,
