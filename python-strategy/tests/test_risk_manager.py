@@ -64,7 +64,7 @@ class TestRiskManagerBalanceChecks:
         mock_account_service.set_balance(Decimal("0"))
         risk_manager = RiskManager(mock_account_service)
 
-        signal = signal_factory(signal_type=SignalType.LONG)
+        signal = signal_factory(signal_type=SignalType.LONG, value=None)
         is_allowed, reason = risk_manager.check_risk(signal)
 
         assert is_allowed is False
@@ -165,7 +165,7 @@ class TestRiskManagerBalanceChecks:
         mock_account_service.set_balance(Decimal("10000"))
         risk_manager = RiskManager(mock_account_service)
 
-        signal = signal_factory(signal_type=SignalType.LONG)
+        signal = signal_factory(signal_type=SignalType.LONG, value=None)
         is_allowed, reason = risk_manager.check_risk(signal)
 
         assert is_allowed is True
@@ -246,7 +246,7 @@ class TestRiskManagerExposureChecks:
         """Daily-loss circuit breaker should reject entries when NAV loss breaches threshold."""
         mock_account_service.set_balance(Decimal("100000"))
         risk_manager = RiskManager(mock_account_service)
-        signal = signal_factory(signal_type=SignalType.LONG)
+        signal = signal_factory(signal_type=SignalType.LONG, value=None)
 
         is_allowed, reason = risk_manager.check_risk(
             signal,
@@ -267,7 +267,7 @@ class TestRiskManagerExposureChecks:
             mock_account_service,
             state_manager=state_manager,
         )
-        signal = signal_factory(signal_type=SignalType.LONG)
+        signal = signal_factory(signal_type=SignalType.LONG, value=None)
 
         is_allowed, reason = risk_manager.check_risk(
             signal,
@@ -296,7 +296,7 @@ class TestRiskManagerExposureChecks:
         )
 
         is_allowed, reason = risk_manager.check_risk(
-            signal_factory(signal_type=SignalType.LONG),
+            signal_factory(signal_type=SignalType.LONG, value=None),
             daily_start_nav=Decimal("100000"),
             current_nav=Decimal("94990"),
         )
@@ -319,7 +319,7 @@ class TestRiskManagerExposureChecks:
             mock_account_service,
             state_manager=state_manager,
         )
-        signal = signal_factory(signal_type=SignalType.LONG)
+        signal = signal_factory(signal_type=SignalType.LONG, value=None)
 
         is_allowed, reason = risk_manager.check_risk(
             signal,
@@ -336,7 +336,7 @@ class TestRiskManagerExposureChecks:
         """Partial NAV context should fail closed instead of silently skipping."""
         mock_account_service.set_balance(Decimal("100000"))
         risk_manager = RiskManager(mock_account_service)
-        signal = signal_factory(signal_type=SignalType.LONG)
+        signal = signal_factory(signal_type=SignalType.LONG, value=None)
 
         is_allowed, reason = risk_manager.check_risk(
             signal,
@@ -356,7 +356,7 @@ class TestRiskManagerExposureChecks:
             mock_account_service,
             daily_nav_service=daily_nav_service,
         )
-        signal = signal_factory(signal_type=SignalType.LONG)
+        signal = signal_factory(signal_type=SignalType.LONG, value=None)
 
         is_allowed, reason = risk_manager.check_risk(
             signal,
@@ -377,7 +377,7 @@ class TestRiskManagerExposureChecks:
             mock_account_service,
             daily_nav_service=_FakeDailyNavService(None),
         )
-        signal = signal_factory(signal_type=SignalType.LONG)
+        signal = signal_factory(signal_type=SignalType.LONG, value=None)
 
         is_allowed, reason = risk_manager.check_risk(
             signal,
@@ -402,7 +402,7 @@ class TestRiskManagerExposureChecks:
         risk_manager = RiskManager(mock_account_service)
 
         allowed, reason = risk_manager.check_risk(
-            signal_factory(signal_type=SignalType.LONG)
+            signal_factory(signal_type=SignalType.LONG, value=None)
         )
 
         assert allowed is False
@@ -422,7 +422,7 @@ class TestRiskManagerExposureChecks:
             mock_account_service,
             order_rate_limit_rule=rate_limit,
         )
-        signal = signal_factory(signal_type=SignalType.LONG)
+        signal = signal_factory(signal_type=SignalType.LONG, value=None)
 
         is_allowed, reason = risk_manager.check_risk(signal)
 
@@ -469,7 +469,7 @@ class TestRiskManagerExposureChecks:
             mock_account_service,
             existing_position_entry_rule=_PassExistingPositionEntryRule(),
         )
-        signal = signal_factory(signal_type=SignalType.LONG)
+        signal = signal_factory(signal_type=SignalType.LONG, value=None)
 
         # current_price=40000 -> 3 * 40000 = 120000 > default 100000
         is_allowed, reason = risk_manager.check_risk(signal, current_price=Decimal("40000"))
@@ -596,7 +596,7 @@ class TestRiskManagerExposureChecks:
             mock_account_service,
             existing_position_entry_rule=_PassExistingPositionEntryRule(),
         )
-        signal = signal_factory(signal_type=SignalType.LONG)
+        signal = signal_factory(signal_type=SignalType.LONG, value=None)
 
         # current 90 -> exposure 90000 < 100000: allowed
         is_allowed, reason = risk_manager.check_risk(signal, current_price=Decimal("90"))
@@ -624,7 +624,7 @@ class TestRiskManagerExposureChecks:
             mock_account_service,
             existing_position_entry_rule=_PassExistingPositionEntryRule(),
         )
-        signal = signal_factory(signal_type=SignalType.LONG)
+        signal = signal_factory(signal_type=SignalType.LONG, value=None)
 
         is_allowed, reason = risk_manager.check_risk(signal)
 
@@ -834,7 +834,7 @@ class TestRiskManagerEdgeCases:
         mock_account_service.set_balance(Decimal("0.01"))
         risk_manager = RiskManager(mock_account_service)
 
-        signal = signal_factory(signal_type=SignalType.LONG)
+        signal = signal_factory(signal_type=SignalType.LONG, value=None)
         is_allowed, reason = risk_manager.check_risk(signal)
 
         # Should be allowed (balance > 0)
@@ -845,7 +845,7 @@ class TestRiskManagerEdgeCases:
         mock_account_service.set_balance(Decimal("1000000000"))  # 1 billion
         risk_manager = RiskManager(mock_account_service)
 
-        signal = signal_factory(signal_type=SignalType.LONG)
+        signal = signal_factory(signal_type=SignalType.LONG, value=None)
         is_allowed, reason = risk_manager.check_risk(signal)
 
         assert is_allowed is True
@@ -856,7 +856,7 @@ class TestRiskManagerEdgeCases:
         # No position set
         risk_manager = RiskManager(mock_account_service)
 
-        signal = signal_factory(signal_type=SignalType.LONG)
+        signal = signal_factory(signal_type=SignalType.LONG, value=None)
         is_allowed, reason = risk_manager.check_risk(signal)
 
         assert is_allowed is True
@@ -878,7 +878,7 @@ class TestRiskManagerEdgeCases:
             mock_account_service,
             existing_position_entry_rule=_PassExistingPositionEntryRule(),
         )
-        signal = signal_factory(signal_type=SignalType.LONG)
+        signal = signal_factory(signal_type=SignalType.LONG, value=None)
 
         is_allowed, reason = risk_manager.check_risk(signal, current_price=Decimal("40000"))
 
@@ -1399,7 +1399,7 @@ class TestRiskManagerWithCapitalAllocator:
         allocator.allocate("test_strategy", Decimal("50000"))
         risk_manager = RiskManager(mock_account_service, capital_allocator=allocator)
 
-        signal = signal_factory(signal_type=SignalType.LONG)
+        signal = signal_factory(signal_type=SignalType.LONG, value=None)
         is_allowed, reason = risk_manager.check_risk(signal)
 
         assert is_allowed is True
@@ -1459,7 +1459,7 @@ class TestRiskManagerWithCapitalAllocator:
             existing_position_entry_rule=_PassExistingPositionEntryRule(),
         )
 
-        signal = signal_factory(signal_type=SignalType.LONG)
+        signal = signal_factory(signal_type=SignalType.LONG, value=None)
         is_allowed, reason = risk_manager.check_risk(signal, current_price=Decimal("45000"))
 
         assert is_allowed is False
@@ -1472,7 +1472,7 @@ class TestRiskManagerWithCapitalAllocator:
         mock_account_service.set_balance(Decimal("10000"))
         risk_manager = RiskManager(mock_account_service)
 
-        signal = signal_factory(signal_type=SignalType.LONG)
+        signal = signal_factory(signal_type=SignalType.LONG, value=None)
         is_allowed, reason = risk_manager.check_risk(signal)
 
         assert is_allowed is True
@@ -1504,7 +1504,7 @@ class TestRiskManagerWithCapitalAllocator:
         )
 
         allowed, reason = risk_manager.check_risk(
-            signal_factory(signal_type=SignalType.LONG),
+            signal_factory(signal_type=SignalType.LONG, value=None),
             current_price=Decimal("40000"),
         )
 

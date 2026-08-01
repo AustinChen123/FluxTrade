@@ -73,6 +73,11 @@ from src.core.health_monitor import HealthMonitor
 from src.core.ops_safety import OpsSafetyService
 from src.core.runtime_reconcile import RuntimeReconciliationJob
 from src.core.signal_processor import SignalProcessor
+from src.core.signal_order_intent import (
+    InvalidSignalOrderIntent,
+    normalize_signal_quantity,
+    resolve_signal_order_intent,
+)
 from src.core.strategy_registry import StrategyRegistry
 from src.core.strategy_state_manager import (
     InvalidStrategyStateTransition,
@@ -2978,10 +2983,21 @@ class StrategyEngine:
         structlog.contextvars.bind_contextvars(trace_id=uuid.uuid4().hex[:16])
 
         current_price = candle.close if candle else None
-        is_passed, risk_msg = self.risk_manager.check_risk(
-            signal,
-            current_price=current_price,
-        )
+        try:
+            signal = normalize_signal_quantity(
+                signal,
+                default_entry_quantity=self.execution_engine.default_quantity,
+            )
+            resolve_signal_order_intent(signal)
+        except InvalidSignalOrderIntent as exc:
+            is_passed = False
+            risk_msg = f"REJECT: {exc}"
+            logger.warning("RISK_REJECTED: %s", risk_msg)
+        else:
+            is_passed, risk_msg = self.risk_manager.check_risk(
+                signal,
+                current_price=current_price,
+            )
 
         risk_status = "PASS" if is_passed else "REJECT"
         SIGNALS_TOTAL.labels(

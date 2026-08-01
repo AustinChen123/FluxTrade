@@ -891,6 +891,93 @@ class TestProcessSignal:
 
         engine.execution_engine.execute_signal.assert_called_once()
 
+    @pytest.mark.parametrize(
+        ("signal_type", "quantity", "expected_quantity"),
+        [
+            (SignalType.LONG, None, Decimal("0.25")),
+            (SignalType.LONG, Decimal("0"), Decimal("0.25")),
+            (SignalType.LONG, Decimal("-1"), Decimal("0.25")),
+            (SignalType.SHORT, None, Decimal("0.25")),
+            (SignalType.SHORT, Decimal("0"), Decimal("0.25")),
+            (SignalType.SHORT, Decimal("-1"), Decimal("0.25")),
+            (SignalType.LONG, Decimal("0.5"), Decimal("0.5")),
+            (SignalType.SHORT, Decimal("0.5"), Decimal("0.5")),
+            (SignalType.EXIT_LONG, None, None),
+            (SignalType.EXIT_SHORT, None, None),
+        ],
+    )
+    def test_effective_quantity_is_shared_by_risk_and_execution(
+        self,
+        engine,
+        signal_type,
+        quantity,
+        expected_quantity,
+    ):
+        """Only entries receive defaults, and every consumer sees the same quantity."""
+        signal = Signal(
+            strategy_id="test",
+            product_id="BINANCE:BTCUSDT-PERP",
+            timeframe="1m",
+            timestamp=1704067200000,
+            type=signal_type,
+            value=Decimal("42000"),
+            quantity=quantity,
+        )
+        engine.execution_engine.default_quantity = Decimal("0.25")
+        engine.risk_manager.check_risk = MagicMock(return_value=(True, "PASS"))
+        engine.execution_engine.execute_signal = MagicMock(return_value="order-123")
+
+        assert engine.process_signal(signal, _make_candle()) is True
+
+        risk_signal = engine.risk_manager.check_risk.call_args.args[0]
+        execution_signal = engine.execution_engine.execute_signal.call_args.args[0]
+        assert risk_signal.quantity == expected_quantity
+        assert execution_signal.quantity == expected_quantity
+
+    @pytest.mark.parametrize(
+        ("signal_type", "quantity", "default_quantity", "expected_field"),
+        [
+            (SignalType.LONG, Decimal("NaN"), Decimal("0.25"), "signal.quantity"),
+            (SignalType.LONG, Decimal("Infinity"), Decimal("0.25"), "signal.quantity"),
+            (SignalType.LONG, Decimal("-Infinity"), Decimal("0.25"), "signal.quantity"),
+            (SignalType.SHORT, Decimal("NaN"), Decimal("0.25"), "signal.quantity"),
+            (SignalType.SHORT, Decimal("Infinity"), Decimal("0.25"), "signal.quantity"),
+            (SignalType.SHORT, Decimal("-Infinity"), Decimal("0.25"), "signal.quantity"),
+            (SignalType.LONG, None, Decimal("0"), "default_entry_quantity"),
+            (SignalType.SHORT, None, Decimal("-1"), "default_entry_quantity"),
+            (SignalType.LONG, None, Decimal("NaN"), "default_entry_quantity"),
+            (SignalType.SHORT, None, Decimal("Infinity"), "default_entry_quantity"),
+        ],
+    )
+    def test_invalid_effective_entry_quantity_is_audited_and_not_executed(
+        self,
+        engine,
+        mock_db_session,
+        signal_type,
+        quantity,
+        default_quantity,
+        expected_field,
+    ):
+        signal = Signal(
+            strategy_id="test",
+            product_id="BINANCE:BTCUSDT-PERP",
+            timeframe="1m",
+            timestamp=1704067200000,
+            type=signal_type,
+            value=Decimal("42000"),
+        ).model_copy(update={"quantity": quantity})
+        engine.execution_engine.default_quantity = default_quantity
+        engine.risk_manager.check_risk = MagicMock(return_value=(True, "PASS"))
+        engine.execution_engine.execute_signal = MagicMock(return_value="order-123")
+
+        assert engine.process_signal(signal, _make_candle()) is False
+
+        engine.risk_manager.check_risk.assert_not_called()
+        engine.execution_engine.execute_signal.assert_not_called()
+        audit = mock_db_session.add.call_args.args[0]
+        assert audit.risk_status == "REJECT"
+        assert expected_field in audit.risk_message
+
     def test_market_signal_is_fenced_after_leadership_loss(self, engine):
         signal = Signal(
             strategy_id="test",

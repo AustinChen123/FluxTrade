@@ -300,6 +300,64 @@ class CapitalGatedEntryStrategy(BaseStrategy):
         )
 
 
+class OrderIntentParityProbeStrategy(BaseStrategy):
+    def __init__(
+        self,
+        invalid_field: str | None,
+        strategy_id: str = "order_intent_parity",
+    ) -> None:
+        super().__init__(strategy_id, PRODUCT_ID)
+        self.invalid_field = invalid_field
+        self.contexts: list[StrategyContext] = []
+        self.first_timestamp: int | None = None
+
+    @property
+    def requirements(self) -> StrategyRequirements:
+        return StrategyRequirements(PRODUCT_ID, TIMEFRAME, 1)
+
+    def on_candle(
+        self,
+        candle: Candlestick,
+        context: StrategyContext | None = None,
+    ) -> Signal | None:
+        if context is not None:
+            self.contexts.append(context)
+        if self.first_timestamp is None:
+            self.first_timestamp = candle.timestamp
+        index = (candle.timestamp - self.first_timestamp) // INTERVAL_MS
+
+        if self.invalid_field is not None and index == 0:
+            signal = self._entry_signal(candle)
+            return signal.model_copy(
+                update={self.invalid_field: Decimal("0")}
+            )
+
+        entry_index = 1 if self.invalid_field is not None else 0
+        if index == entry_index:
+            return self._entry_signal(candle)
+        if index == entry_index + 2:
+            return Signal(
+                strategy_id=self.strategy_id,
+                product_id=PRODUCT_ID,
+                timeframe=TIMEFRAME,
+                timestamp=candle.timestamp,
+                type=SignalType.EXIT_LONG,
+                quantity=Decimal("0.01"),
+            )
+        return None
+
+    def _entry_signal(self, candle: Candlestick) -> Signal:
+        return Signal(
+            strategy_id=self.strategy_id,
+            product_id=PRODUCT_ID,
+            timeframe=TIMEFRAME,
+            timestamp=candle.timestamp,
+            type=SignalType.LONG,
+            value=Decimal("99"),
+            quantity=Decimal("0.01"),
+        )
+
+
 @pytest.mark.smoke
 @pytest.mark.parametrize(
     ("entry_type", "exit_type", "multiplier"),
@@ -413,6 +471,139 @@ def test_research_backtest_matches_full_runner_core_metrics(
     assert research_result["total_pnl"] == full_result["total_pnl"]
     assert research_result["profit_factor"] == full_result["profit_factor"]
     assert research_result["closed_trades"] == full_closed_trades
+
+
+@pytest.mark.parametrize("invalid_field", [None, "price", "value"])
+def test_full_and_research_runners_share_order_intent_outcomes(
+    tmp_path,
+    invalid_field,
+):
+    start = 1_700_000_000_000
+    candles = [
+        make_candle(
+            start + index * INTERVAL_MS,
+            Decimal("100"),
+            Decimal("101"),
+            Decimal("98"),
+            Decimal("100"),
+        )
+        for index in range(5)
+    ]
+    session_factory = _sqlite_backtest_session_factory(tmp_path)
+    report_config = {
+        "csv_trades": False,
+        "markdown_report": False,
+        "equity_curve": False,
+        "journal_export": False,
+    }
+    full_strategy = OrderIntentParityProbeStrategy(invalid_field)
+    research_strategy = OrderIntentParityProbeStrategy(invalid_field)
+
+    full_runner = BacktestRunner(
+        start_time=candles[0].timestamp,
+        end_time=candles[-1].timestamp,
+        product_id=PRODUCT_ID,
+        timeframe=TIMEFRAME,
+        initial_balance=10_000,
+        max_drawdown_limit=None,
+        data_source=MemoryDataSource(candles),
+        report_config=report_config,
+        db_session_factory=session_factory,
+    )
+    full_runner.add_strategy(full_strategy)
+    research_runner = ResearchBacktestRunner(
+        start_time=candles[0].timestamp,
+        end_time=candles[-1].timestamp,
+        product_id=PRODUCT_ID,
+        timeframe=TIMEFRAME,
+        initial_balance=10_000,
+        max_drawdown_limit=None,
+        data_source=MemoryDataSource(candles),
+    )
+    research_runner.add_strategy(research_strategy)
+
+    full_result = full_runner.run()
+    research_result = research_runner.run()
+
+    assert full_result["closed_trade_count"] == 1
+    assert research_result["closed_trade_count"] == 1
+    assert full_result["total_trades"] == research_result["total_trades"] == 1
+    assert full_result["total_pnl"] == research_result["total_pnl"]
+    assert research_result["raw_trade_count"] == 2
+    expected_rejections = 0 if invalid_field is None else 1
+    assert research_result["invalid_order_intent_count"] == expected_rejections
+    assert (
+        len(research_result["invalid_order_intent_rejections"])
+        == expected_rejections
+    )
+
+    with session_factory() as session:
+        full_trades = list(
+            session.scalars(
+                select(BacktestTradeLog).order_by(
+                    BacktestTradeLog.timestamp,
+                    BacktestTradeLog.fill_sequence,
+                    BacktestTradeLog.id,
+                )
+            )
+        )
+        full_rejections = list(
+            session.scalars(
+                select(SignalAudit).where(SignalAudit.risk_status == "REJECT")
+            )
+        )
+    assert full_trades[0].price == Decimal("99")
+    assert research_result["raw_trades"][0].price == Decimal("99")
+    assert len(full_rejections) == expected_rejections
+    if invalid_field is not None:
+        expected_reason = f"signal.{invalid_field}"
+        assert expected_reason in full_rejections[0].risk_message
+        assert expected_reason in (
+            research_result["invalid_order_intent_rejections"][0].reason
+        )
+        assert any(
+            expected_reason in rejection.reason
+            for context in research_strategy.contexts
+            for rejection in context.latest_rejections
+        )
+
+
+def test_invalid_order_intent_results_preserve_multistrategy_ownership():
+    candles = make_candle_series(count=3)
+    runner = ResearchBacktestRunner(
+        start_time=candles[0].timestamp,
+        end_time=candles[-1].timestamp,
+        product_id=PRODUCT_ID,
+        timeframe=TIMEFRAME,
+        data_source=MemoryDataSource(candles),
+    )
+    strategy_a = OrderIntentParityProbeStrategy("price", "strategy-a")
+    strategy_b = OrderIntentParityProbeStrategy("value", "strategy-b")
+    runner.add_strategy(strategy_a)
+    runner.add_strategy(strategy_b)
+
+    result = runner.run()
+
+    assert result["invalid_order_intent_count"] == 2
+    rejections_by_strategy = {
+        rejection.strategy_id: rejection
+        for rejection in result["invalid_order_intent_rejections"]
+    }
+    assert set(rejections_by_strategy) == {"strategy-a", "strategy-b"}
+    assert rejections_by_strategy["strategy-a"].product_id == PRODUCT_ID
+    assert "signal.price" in rejections_by_strategy["strategy-a"].reason
+    assert rejections_by_strategy["strategy-b"].product_id == PRODUCT_ID
+    assert "signal.value" in rejections_by_strategy["strategy-b"].reason
+
+    assert strategy_a.contexts[0].latest_rejections == ()
+    assert len(strategy_a.contexts[1].latest_rejections) == 1
+    assert "signal.price" in strategy_a.contexts[1].latest_rejections[0].reason
+    assert strategy_a.contexts[2].latest_rejections == ()
+
+    assert strategy_b.contexts[0].latest_rejections == ()
+    assert len(strategy_b.contexts[1].latest_rejections) == 1
+    assert "signal.value" in strategy_b.contexts[1].latest_rejections[0].reason
+    assert strategy_b.contexts[2].latest_rejections == ()
 
 
 @pytest.mark.smoke

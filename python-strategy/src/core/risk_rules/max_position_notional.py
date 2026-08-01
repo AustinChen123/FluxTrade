@@ -12,6 +12,10 @@ from src.core.product_registry import (
 )
 from src.core.risk_config import RiskConfig
 from src.core.risk_rules import RuleStatus
+from src.core.signal_order_intent import (
+    InvalidSignalOrderIntent,
+    resolve_signal_order_intent,
+)
 
 
 class MaxPositionNotionalRule:
@@ -34,7 +38,11 @@ class MaxPositionNotionalRule:
         if mid_price <= 0:
             return RuleStatus.REJECT, f"max_position_notional_invalid_mid_price: {mid_price}"
 
-        order_price = signal.price if signal.price is not None else mid_price
+        try:
+            resolved_intent = resolve_signal_order_intent(signal)
+        except InvalidSignalOrderIntent as exc:
+            return RuleStatus.REJECT, str(exc)
+        order_price = resolved_intent.limit_price or mid_price
         current_notional = _signed_position_notional(
             current_position,
             mid_price,

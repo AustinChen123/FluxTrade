@@ -205,7 +205,7 @@ class TestRiskManagerIntegration:
 
     def test_risk_check_passes_for_entry(self, risk_manager):
         """New entry signal should pass risk check with sufficient balance."""
-        signal = _make_signal(SignalType.LONG, quantity=Decimal("0.1"))
+        signal = _make_signal(SignalType.LONG, quantity=Decimal("0.005"))
         current_price = Decimal("50000")
         passed, msg = risk_manager.check_risk(signal, current_price)
         assert passed is True

@@ -70,7 +70,7 @@ def test_risk_manager_circuit_breaker_updates_state_from_snapshot(
         order_rate_limit_rule=rate_limit,
         state_manager=state_manager,
     )
-    signal = signal_factory(signal_type=SignalType.LONG)
+    signal = signal_factory(signal_type=SignalType.LONG, value=None)
 
     allowed, reason = risk_manager.check_risk(
         signal,
@@ -103,6 +103,7 @@ def test_risk_manager_market_order_passes_and_records_rate_limit(
     signal = signal_factory(
         signal_type=SignalType.LONG,
         price=None,
+        value=None,
         quantity=Decimal("0.1"),
     )
 

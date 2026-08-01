@@ -55,7 +55,7 @@ class AlwaysLongStrategy(BaseStrategy):
                 timestamp=candle.timestamp,
                 type=SignalType.LONG,
                 value=candle.close,
-                quantity=Decimal("0.01"),
+                quantity=Decimal("0.005"),
             )
         elif self._count % 20 == 0:
             return Signal(
@@ -65,7 +65,7 @@ class AlwaysLongStrategy(BaseStrategy):
                 timestamp=candle.timestamp,
                 type=SignalType.EXIT_LONG,
                 value=candle.close,
-                quantity=Decimal("0.01"),
+                quantity=Decimal("0.005"),
             )
         return Signal(
             strategy_id=self.strategy_id,
