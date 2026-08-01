@@ -7,6 +7,7 @@ GoldenCrossStrategy market LONG/EXIT_LONG behavior.
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass
 from decimal import Decimal
 
@@ -89,6 +90,20 @@ class GoldenCrossFastFitnessEvaluator:
             raise ValueError("SMA windows must be positive")
         if short_window >= long_window:
             raise ValueError("short_window must be smaller than long_window")
+        if (
+            not isinstance(quantity, Decimal)
+            or not quantity.is_finite()
+            or quantity <= 0
+        ):
+            raise ValueError("quantity must be a finite Decimal greater than zero")
+        try:
+            qty = float(quantity)
+        except (OverflowError, ValueError) as exc:
+            raise ValueError(
+                "quantity must fit the finite numeric fitness range"
+            ) from exc
+        if not math.isfinite(qty) or qty <= 0.0:
+            raise ValueError("quantity must fit the finite numeric fitness range")
 
         n = len(self.closes)
         if n <= long_window:
@@ -106,7 +121,6 @@ class GoldenCrossFastFitnessEvaluator:
         exits = ~bullish & previous_bullish & valid_signal_index
         signal_indices = np.flatnonzero(entries | exits)
 
-        qty = float(quantity)
         net_qty = 0.0
         entry_price = 0.0
         total_pnl = 0.0
@@ -123,11 +137,13 @@ class GoldenCrossFastFitnessEvaluator:
             is_exit = bool(exits[signal_index])
             fill_price = float(self.opens[fill_index])
             fee = self._fee(fill_price, qty)
+            _require_finite_fitness_values(fee)
 
             if is_entry and net_qty == 0.0:
                 net_qty = qty
                 entry_price = fill_price
                 total_pnl -= fee
+                _require_finite_fitness_values(total_pnl)
                 equity_curve.append(total_pnl)
                 raw_trade_count += 1
             elif is_exit and net_qty > 0.0:
@@ -139,6 +155,12 @@ class GoldenCrossFastFitnessEvaluator:
                 )
                 trade_pnl = gross_pnl - entry_fee - fee
                 total_pnl += gross_pnl - fee
+                _require_finite_fitness_values(
+                    entry_fee,
+                    gross_pnl,
+                    trade_pnl,
+                    total_pnl,
+                )
                 trade_pnls.append(trade_pnl)
                 equity_curve.append(total_pnl)
                 raw_trade_count += 1
@@ -182,6 +204,7 @@ def _result_from_pnls(
     trade_pnls: list[float],
     raw_trade_count: int,
 ) -> GoldenCrossFastFitnessResult:
+    _require_finite_fitness_values(total_pnl, *equity_curve, *trade_pnls)
     wins = sum(1 for pnl in trade_pnls if pnl > 0)
     losses = sum(1 for pnl in trade_pnls if pnl < 0)
     total_trades = wins + losses
@@ -196,6 +219,13 @@ def _result_from_pnls(
     equity = np.array(equity_curve, dtype=np.float64)
     drawdown = equity - np.maximum.accumulate(equity)
     max_drawdown = float(drawdown.min()) if len(drawdown) > 0 else 0.0
+    _require_finite_fitness_values(
+        win_rate,
+        gross_profit,
+        gross_loss,
+        profit_factor,
+        max_drawdown,
+    )
 
     return GoldenCrossFastFitnessResult(
         total_pnl=Decimal(f"{total_pnl:.8f}"),
@@ -207,3 +237,8 @@ def _result_from_pnls(
         gross_profit=Decimal(f"{gross_profit:.2f}"),
         gross_loss=Decimal(f"{gross_loss:.2f}"),
     )
+
+
+def _require_finite_fitness_values(*values: float) -> None:
+    if not all(math.isfinite(value) for value in values):
+        raise ValueError("numeric fitness calculation produced a non-finite value")

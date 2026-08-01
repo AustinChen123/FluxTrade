@@ -475,6 +475,64 @@ def test_fast_fitness_evaluator_rejects_research_runner_config(tmp_path):
         )
 
 
+def test_fast_fitness_candidate_invalid_quantity_produces_no_metrics(tmp_path):
+    payload = _request_payload(tmp_path)
+    payload.pop("research_runner")
+    candle_path = tmp_path / "candles.csv"
+    candle_path.write_text(
+        "timestamp,open,high,low,close,volume\n"
+        "1700000000000,100,101,99,100,10\n"
+        "1700000060000,101,102,100,101,10\n"
+    )
+    request = ParameterSearchJobRequest.model_validate(payload)
+    evaluator = GoldenCrossFastFitnessParameterEvaluator()
+
+    with pytest.raises(ValueError, match="quantity must"):
+        evaluator.evaluate(
+            request,
+            ParameterCandidate(
+                candidate_id="invalid-quantity",
+                param_pack={
+                    "short_window": 1,
+                    "long_window": 2,
+                    "quantity": "0",
+                },
+            ),
+        )
+
+
+def test_fast_fitness_candidate_overflow_produces_no_metrics(tmp_path):
+    payload = _request_payload(tmp_path)
+    payload.pop("research_runner")
+    payload["end_time"] = 1_700_001_500_000
+    payload["backtest"]["taker_fee"] = "0.01"
+    candle_path = tmp_path / "candles.csv"
+    candle_path.write_text(
+        "timestamp,open,high,low,close,volume\n"
+        "1700000000000,100,101,99,100,10\n"
+        "1700000300000,100,102,99,101,10\n"
+        "1700000600000,100,101,98,99,10\n"
+        "1700000900000,100,102,99,101,10\n"
+        "1700001200000,100,101,98,99,10\n"
+        "1700001500000,100,102,99,101,10\n"
+    )
+    request = ParameterSearchJobRequest.model_validate(payload)
+    evaluator = GoldenCrossFastFitnessParameterEvaluator()
+
+    with pytest.raises(ValueError, match="non-finite"):
+        evaluator.evaluate(
+            request,
+            ParameterCandidate(
+                candidate_id="overflow-quantity",
+                param_pack={
+                    "short_window": 1,
+                    "long_window": 2,
+                    "quantity": "1e308",
+                },
+            ),
+        )
+
+
 def test_fast_fitness_propagates_instrument_spec(tmp_path):
     payload = _request_payload(tmp_path)
     payload.pop("research_runner")

@@ -4,9 +4,18 @@ import pytest
 
 from integration.conftest import PRODUCT_ID, TIMEFRAME, make_candle_series
 from src.core.data_sources.memory import MemoryDataSource
-from src.core.fast_bar import FastBarReplayRunner, MarketTape, RollingMean, prepare_fast_strategy
-from src.core.research_backtest_runner import ResearchBacktestRunner
+from src.core.fast_bar import (
+    FastBarReplayRunner,
+    InvalidFastBarIntent,
+    MarketTape,
+    RollingMean,
+    SignalIntent,
+    _resolve_fast_bar_order_intent,
+    prepare_fast_strategy,
+)
+from src.core.models import OrderSide, SignalType
 from src.core.product_registry import InstrumentSpec
+from src.core.research_backtest_runner import ResearchBacktestRunner
 from src.strategies.callable_strategy import CallableStrategy
 from src.strategies.golden_cross import GoldenCrossStrategy
 
@@ -16,6 +25,37 @@ try:
     HAS_RUST = True
 except ImportError:
     HAS_RUST = False
+
+
+class _ScriptedFastStrategy:
+    strategy_id = "scripted_fast"
+
+    def __init__(self, intents: list[SignalIntent | None]) -> None:
+        self._intents = iter(intents)
+
+    def on_bar(self, bar):
+        del bar
+        return next(self._intents, None)
+
+
+def _fast_runner(*intents: SignalIntent | None) -> FastBarReplayRunner:
+    candles = make_candle_series(count=max(1, len(intents)))
+    return FastBarReplayRunner(
+        tape=MarketTape.from_candles(
+            candles,
+            product_id=PRODUCT_ID,
+            timeframe=TIMEFRAME,
+        ),
+        strategy=_ScriptedFastStrategy(list(intents)),
+    )
+
+
+def _owned_position_for(signal_type: SignalType):
+    if signal_type == SignalType.EXIT_LONG:
+        return "LONG", Decimal("2")
+    if signal_type == SignalType.EXIT_SHORT:
+        return "SHORT", Decimal("2")
+    return None
 
 
 def test_market_tape_builds_from_memory_data_source():
@@ -87,6 +127,272 @@ def test_prepare_fast_strategy_reports_unsupported_strategy():
         prepare_fast_strategy(strategy)
 
 
+@pytest.mark.parametrize(
+    ("signal_type", "quantity", "owned_position", "expected"),
+    [
+        (SignalType.LONG, None, None, ("LONG", OrderSide.BUY, Decimal("0.01"))),
+        (SignalType.SHORT, None, None, ("SHORT", OrderSide.SELL, Decimal("0.01"))),
+        (
+            SignalType.LONG,
+            Decimal("2"),
+            ("SHORT", Decimal("3")),
+            ("LONG", OrderSide.BUY, Decimal("2")),
+        ),
+        (
+            SignalType.EXIT_LONG,
+            Decimal("2"),
+            ("LONG", Decimal("2")),
+            ("SHORT", OrderSide.SELL, Decimal("2")),
+        ),
+        (
+            SignalType.EXIT_LONG,
+            Decimal("1"),
+            ("LONG", Decimal("2")),
+            ("SHORT", OrderSide.SELL, Decimal("1")),
+        ),
+        (
+            SignalType.EXIT_SHORT,
+            None,
+            ("SHORT", Decimal("2")),
+            ("LONG", OrderSide.BUY, Decimal("2")),
+        ),
+        (
+            SignalType.EXIT_SHORT,
+            Decimal("1"),
+            ("SHORT", Decimal("2")),
+            ("LONG", OrderSide.BUY, Decimal("1")),
+        ),
+    ],
+)
+def test_fast_bar_order_intent_supported_state_matrix(
+    signal_type,
+    quantity,
+    owned_position,
+    expected,
+):
+    intent = SignalIntent(signal_type, quantity=quantity)
+
+    resolved = _resolve_fast_bar_order_intent(
+        intent,
+        owned_position=owned_position,
+    )
+
+    assert resolved == expected
+
+
+@pytest.mark.parametrize(
+    "signal_type",
+    [SignalType.LONG, SignalType.SHORT, SignalType.EXIT_LONG, SignalType.EXIT_SHORT],
+)
+@pytest.mark.parametrize("price", [Decimal("0"), Decimal("100")])
+def test_fast_bar_rejects_price_for_every_actionable_signal(signal_type, price):
+    intent = SignalIntent(signal_type, price=price)
+
+    with pytest.raises(InvalidFastBarIntent, match="price is unsupported"):
+        _resolve_fast_bar_order_intent(
+            intent,
+            owned_position=_owned_position_for(signal_type),
+        )
+
+
+@pytest.mark.parametrize(
+    "signal_type",
+    [SignalType.LONG, SignalType.SHORT, SignalType.EXIT_LONG, SignalType.EXIT_SHORT],
+)
+@pytest.mark.parametrize(
+    "quantity",
+    [
+        Decimal("0"),
+        Decimal("-1"),
+        Decimal("NaN"),
+        Decimal("Infinity"),
+        Decimal("-Infinity"),
+    ],
+)
+def test_fast_bar_rejects_invalid_quantity_for_every_actionable_signal(
+    signal_type,
+    quantity,
+):
+    intent = SignalIntent(signal_type, quantity=quantity)
+
+    with pytest.raises(InvalidFastBarIntent, match="quantity must"):
+        _resolve_fast_bar_order_intent(
+            intent,
+            owned_position=_owned_position_for(signal_type),
+        )
+
+
+def test_fast_bar_rejects_non_decimal_quantity():
+    intent = SignalIntent(SignalType.LONG, quantity=1)  # type: ignore[arg-type]
+
+    with pytest.raises(InvalidFastBarIntent, match="quantity must"):
+        _resolve_fast_bar_order_intent(intent, owned_position=None)
+
+
+def test_fast_bar_rejects_unsupported_signal_type():
+    intent = SignalIntent("unsupported")  # type: ignore[arg-type]
+
+    with pytest.raises(InvalidFastBarIntent, match="unsupported signal type"):
+        _resolve_fast_bar_order_intent(intent, owned_position=None)
+
+
+@pytest.mark.parametrize(
+    ("signal_type", "owned_position", "quantity", "reason"),
+    [
+        (SignalType.EXIT_LONG, None, None, "requires an owned position"),
+        (SignalType.EXIT_SHORT, None, None, "requires an owned position"),
+        (
+            SignalType.EXIT_LONG,
+            ("SHORT", Decimal("1")),
+            None,
+            "side mismatch",
+        ),
+        (
+            SignalType.EXIT_SHORT,
+            ("LONG", Decimal("1")),
+            None,
+            "side mismatch",
+        ),
+        (
+            SignalType.EXIT_LONG,
+            ("LONG", Decimal("1")),
+            Decimal("2"),
+            "exceeds owned position",
+        ),
+        (
+            SignalType.EXIT_SHORT,
+            ("SHORT", Decimal("1")),
+            Decimal("2"),
+            "exceeds owned position",
+        ),
+    ],
+)
+def test_fast_bar_exit_rejection_state_matrix(
+    signal_type,
+    owned_position,
+    quantity,
+    reason,
+):
+    intent = SignalIntent(signal_type, quantity=quantity)
+
+    with pytest.raises(InvalidFastBarIntent, match=reason):
+        _resolve_fast_bar_order_intent(intent, owned_position=owned_position)
+
+
+@pytest.mark.parametrize(
+    "position_quantity",
+    [
+        Decimal("0"),
+        Decimal("-1"),
+        Decimal("NaN"),
+        Decimal("Infinity"),
+        1,
+    ],
+)
+def test_fast_bar_rejects_invalid_owned_position_quantity(position_quantity):
+    intent = SignalIntent(SignalType.EXIT_LONG)
+
+    with pytest.raises(InvalidFastBarIntent, match="owned position quantity"):
+        _resolve_fast_bar_order_intent(
+            intent,
+            owned_position=("LONG", position_quantity),  # type: ignore[arg-type]
+        )
+
+
+@pytest.mark.rust
+@pytest.mark.skipif(not HAS_RUST, reason="fluxtrade_core.so not compiled")
+def test_fast_bar_invalid_intent_aborts_without_metrics():
+    runner = _fast_runner(
+        SignalIntent(SignalType.LONG, price=Decimal("100")),
+    )
+
+    with pytest.raises(InvalidFastBarIntent, match="price is unsupported"):
+        runner.run()
+
+
+@pytest.mark.rust
+@pytest.mark.skipif(not HAS_RUST, reason="fluxtrade_core.so not compiled")
+def test_fast_bar_invalid_intent_after_fill_aborts_without_metrics():
+    runner = _fast_runner(
+        SignalIntent(SignalType.LONG, quantity=Decimal("1")),
+        SignalIntent(SignalType.EXIT_LONG, price=Decimal("100")),
+    )
+
+    with pytest.raises(InvalidFastBarIntent, match="price is unsupported"):
+        runner.run()
+
+
+@pytest.mark.rust
+@pytest.mark.skipif(not HAS_RUST, reason="fluxtrade_core.so not compiled")
+@pytest.mark.parametrize("signal_type", [SignalType.EXIT_LONG, SignalType.EXIT_SHORT])
+def test_fast_bar_flat_exit_aborts_without_metrics(signal_type):
+    runner = _fast_runner(SignalIntent(signal_type))
+
+    with pytest.raises(InvalidFastBarIntent, match="requires an owned position"):
+        runner.run()
+
+
+@pytest.mark.rust
+@pytest.mark.skipif(not HAS_RUST, reason="fluxtrade_core.so not compiled")
+@pytest.mark.parametrize("quantity", [Decimal("1e10000"), Decimal("1e-10000")])
+def test_fast_bar_rejects_quantity_outside_matcher_decimal_range(quantity):
+    runner = _fast_runner(SignalIntent(SignalType.LONG, quantity=quantity))
+
+    with pytest.raises(InvalidFastBarIntent, match="matcher Decimal range"):
+        runner.run()
+
+
+@pytest.mark.rust
+@pytest.mark.skipif(not HAS_RUST, reason="fluxtrade_core.so not compiled")
+@pytest.mark.parametrize(
+    ("entry_type", "exit_type", "exit_quantity", "expected_exit_quantity"),
+    [
+        (SignalType.LONG, SignalType.EXIT_LONG, None, Decimal("2")),
+        (SignalType.LONG, SignalType.EXIT_LONG, Decimal("1"), Decimal("1")),
+        (SignalType.SHORT, SignalType.EXIT_SHORT, None, Decimal("2")),
+        (SignalType.SHORT, SignalType.EXIT_SHORT, Decimal("1"), Decimal("1")),
+    ],
+)
+def test_fast_bar_exit_uses_owned_position_quantity(
+    entry_type,
+    exit_type,
+    exit_quantity,
+    expected_exit_quantity,
+):
+    result = _fast_runner(
+        SignalIntent(entry_type, quantity=Decimal("2")),
+        SignalIntent(exit_type, quantity=exit_quantity),
+        None,
+    ).run()
+
+    assert [trade.quantity for trade in result["raw_trades"]] == [
+        Decimal("2"),
+        expected_exit_quantity,
+    ]
+
+
+@pytest.mark.rust
+@pytest.mark.skipif(not HAS_RUST, reason="fluxtrade_core.so not compiled")
+@pytest.mark.parametrize(
+    ("exit_intent", "reason"),
+    [
+        (SignalIntent(SignalType.EXIT_SHORT, quantity=Decimal("1")), "side mismatch"),
+        (
+            SignalIntent(SignalType.EXIT_LONG, quantity=Decimal("2")),
+            "exceeds owned position",
+        ),
+    ],
+)
+def test_fast_bar_exit_rejects_mismatch_or_oversize(exit_intent, reason):
+    runner = _fast_runner(
+        SignalIntent(SignalType.LONG, quantity=Decimal("1")),
+        exit_intent,
+    )
+
+    with pytest.raises(InvalidFastBarIntent, match=reason):
+        runner.run()
+
+
 @pytest.mark.rust
 @pytest.mark.skipif(not HAS_RUST, reason="fluxtrade_core.so not compiled")
 def test_fast_bar_golden_cross_matches_research_runner_core_metrics():
@@ -136,7 +442,14 @@ def test_fast_bar_golden_cross_matches_research_runner_core_metrics():
     research_result = research_runner.run()
     fast_result = fast_runner.run()
 
+    def fill_digest(result):
+        return [
+            (trade.timestamp, trade.side, trade.price, trade.quantity, trade.fee)
+            for trade in result["raw_trades"]
+        ]
+
     assert fast_result["candle_count"] == research_result["candle_count"]
+    assert fill_digest(fast_result) == fill_digest(research_result)
     assert fast_result["raw_trade_count"] == research_result["raw_trade_count"]
     assert fast_result["total_trades"] == research_result["total_trades"]
     assert fast_result["total_pnl"] == research_result["total_pnl"]

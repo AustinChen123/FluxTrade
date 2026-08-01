@@ -6,9 +6,8 @@ import pytest
 from integration.conftest import PRODUCT_ID, TIMEFRAME, make_candle_series
 from src.core.data_sources.memory import MemoryDataSource
 from src.core.golden_cross_fast_fitness import GoldenCrossFastFitnessEvaluator
+from src.core.product_registry import FeeModel, InstrumentSpec
 from src.core.research_backtest_runner import ResearchBacktestRunner
-from src.core.product_registry import InstrumentSpec
-from src.core.product_registry import FeeModel
 from src.strategies.golden_cross import GoldenCrossStrategy
 
 try:
@@ -41,6 +40,61 @@ def test_golden_cross_fast_fitness_validates_windows():
 
     with pytest.raises(ValueError, match="short_window must be smaller"):
         evaluator.evaluate(short_window=5, long_window=5)
+
+
+@pytest.mark.parametrize(
+    "quantity",
+    [
+        Decimal("0"),
+        Decimal("-1"),
+        Decimal("NaN"),
+        Decimal("Infinity"),
+        Decimal("-Infinity"),
+        Decimal("1e10000"),
+        Decimal("1e-10000"),
+        1,
+    ],
+)
+def test_golden_cross_fast_fitness_rejects_invalid_quantity_before_empty_result(
+    quantity,
+):
+    candles = make_candle_series(count=2)
+    evaluator = GoldenCrossFastFitnessEvaluator.from_dataframe(_candles_df(candles))
+
+    with pytest.raises(ValueError, match="quantity must"):
+        evaluator.evaluate(
+            short_window=1,
+            long_window=5,
+            quantity=quantity,  # type: ignore[arg-type]
+        )
+
+
+def test_golden_cross_fast_fitness_rejects_non_finite_calculation():
+    df = pd.DataFrame(
+        {
+            "timestamp": [
+                1_700_000_000_000,
+                1_700_000_300_000,
+                1_700_000_600_000,
+                1_700_000_900_000,
+                1_700_001_200_000,
+                1_700_001_500_000,
+            ],
+            "open": [100, 100, 100, 100, 100, 100],
+            "close": [100, 101, 99, 101, 99, 101],
+        }
+    )
+    evaluator = GoldenCrossFastFitnessEvaluator.from_dataframe(
+        df,
+        taker_fee=Decimal("0.01"),
+    )
+
+    with pytest.raises(ValueError, match="non-finite"):
+        evaluator.evaluate(
+            short_window=1,
+            long_window=2,
+            quantity=Decimal("1e308"),
+        )
 
 
 @pytest.mark.rust
