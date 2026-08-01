@@ -296,10 +296,21 @@ class ResearchBacktestParameterEvaluator:
         runner.add_strategy(strategy)
 
         result = runner.run()
+        invalid_intent_count = int(result.get("invalid_order_intent_count", 0))
+        if invalid_intent_count:
+            raise ValueError(
+                "research_backtest_invalid_order_intent: "
+                f"count={invalid_intent_count}"
+            )
         metrics = {
             key: value
             for key, value in result.items()
-            if key not in {"closed_trades", "raw_trades"}
+            if key
+            not in {
+                "closed_trades",
+                "raw_trades",
+                "invalid_order_intent_rejections",
+            }
         }
         return ParameterEvaluationResult(
             candidate_id=candidate.candidate_id,

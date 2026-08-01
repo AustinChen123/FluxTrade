@@ -38,6 +38,11 @@ from src.core.product_registry import (
     calculate_required_capital,
     resolve_contract_multiplier,
 )
+from src.core.signal_order_intent import (
+    InvalidSignalOrderIntent,
+    normalize_signal_quantity,
+    resolve_signal_order_intent,
+)
 from src.core.strategy_context import RejectionSnapshot, StrategyContext
 from src.core.signal_processor import apply_strategy_position_state
 from src.strategies.base import BaseStrategy
@@ -46,6 +51,7 @@ if TYPE_CHECKING:
     from src.core.capital_allocator import CapitalAllocator
 
 logger = logging.getLogger(__name__)
+_DEFAULT_ENTRY_QUANTITY = Decimal("0.01")
 
 
 @dataclass(slots=True)
@@ -61,6 +67,16 @@ class ResearchTrade:
     fee: Decimal
     timestamp: int
     strategy_id: Optional[str] = None
+
+
+@dataclass(frozen=True, slots=True)
+class InvalidOrderIntentRejection:
+    """Durable invalid-intent diagnostic with strategy ownership."""
+
+    strategy_id: str
+    product_id: str
+    reason: str
+    timestamp: int
 
 
 class ResearchBacktestRunner:
@@ -104,6 +120,7 @@ class ResearchBacktestRunner:
         self.contract_multiplier = resolve_contract_multiplier(instrument_spec)
         self._reserved_entry_capital: dict[str, tuple[str, Decimal]] = {}
         self._latest_rejections: dict[str, tuple[RejectionSnapshot, ...]] = {}
+        self._invalid_order_intent_rejections: list[InvalidOrderIntentRejection] = []
         self.clock = BacktestClock(start_time=start_time / 1000)
         self._strategies: list[BaseStrategy] = []
 
@@ -117,6 +134,7 @@ class ResearchBacktestRunner:
 
         self._reserved_entry_capital = {}
         self._latest_rejections = {}
+        self._invalid_order_intent_rejections = []
         adapter = SimulatedAdapter(
             initial_balance=Decimal(str(self.initial_balance)),
             maker_fee=Decimal(str(self.fee_config.get("maker", 0))),
@@ -198,6 +216,17 @@ class ResearchBacktestRunner:
                     decision_context = context
                 signals = self._signals_from_strategy(strategy, candle, decision_context)
                 for signal in signals:
+                    if signal.type == SignalType.NO_SIGNAL:
+                        continue
+                    try:
+                        signal = normalize_signal_quantity(
+                            signal,
+                            default_entry_quantity=_DEFAULT_ENTRY_QUANTITY,
+                        )
+                        resolve_signal_order_intent(signal)
+                    except InvalidSignalOrderIntent as exc:
+                        self._record_invalid_order_intent(signal, candle, str(exc))
+                        continue
                     if self._capital_rejects_entry(signal, candle):
                         self._record_capital_rejection(signal, candle)
                         continue
@@ -303,6 +332,12 @@ class ResearchBacktestRunner:
             "raw_trades": trades,
             "raw_trade_count": len(trades),
             "candle_count": candle_count,
+            "invalid_order_intent_count": len(
+                self._invalid_order_intent_rejections
+            ),
+            "invalid_order_intent_rejections": tuple(
+                self._invalid_order_intent_rejections
+            ),
             "report_dir": None,
         }
 
@@ -505,15 +540,46 @@ class ResearchBacktestRunner:
             return
         required = self._entry_required_capital(signal, candle)
         available = self.capital_allocator.get_available(signal.strategy_id)
-        rejection = RejectionSnapshot(
-            reason=(
+        self._record_rejection(
+            signal,
+            candle,
+            (
                 "capital_allocation_rejected: "
                 f"required={required} available={available} strategy_id={signal.strategy_id}"
             ),
-            timestamp=candle.timestamp,
         )
+
+    def _record_rejection(
+        self,
+        signal: Signal,
+        candle: Candlestick,
+        reason: str,
+    ) -> None:
+        rejection = RejectionSnapshot(reason=reason, timestamp=candle.timestamp)
         existing = self._latest_rejections.get(signal.strategy_id, ())
         self._latest_rejections[signal.strategy_id] = existing + (rejection,)
+
+    def _record_invalid_order_intent(
+        self,
+        signal: Signal,
+        candle: Candlestick,
+        reason: str,
+    ) -> None:
+        logger.warning(
+            "Research signal order intent rejected: strategy=%s product=%s reason=%s",
+            signal.strategy_id,
+            signal.product_id,
+            reason,
+        )
+        self._record_rejection(signal, candle, reason)
+        self._invalid_order_intent_rejections.append(
+            InvalidOrderIntentRejection(
+                strategy_id=signal.strategy_id,
+                product_id=signal.product_id,
+                reason=reason,
+                timestamp=candle.timestamp,
+            )
+        )
 
     @staticmethod
     def _exit_without_position(signal: Signal, adapter: SimulatedAdapter) -> bool:
@@ -560,15 +626,7 @@ class ResearchBacktestRunner:
             return None
 
         quantity = self._quantity_for_signal(signal, adapter)
-        if signal.price and signal.price > 0:
-            order_type = "limit"
-            limit_price = signal.price
-        elif signal.value:
-            order_type = "limit"
-            limit_price = signal.value
-        else:
-            order_type = "market"
-            limit_price = None
+        resolved_intent = resolve_signal_order_intent(signal)
 
         order_id = str(uuid.uuid4())
         return Order(
@@ -577,9 +635,9 @@ class ResearchBacktestRunner:
             strategy_id=signal.strategy_id,
             product_id=signal.product_id,
             exchange_id=signal.product_id.split(":")[0],
-            type=order_type,
+            type=resolved_intent.order_type,
             side=side,
-            price=limit_price,
+            price=resolved_intent.limit_price,
             trigger_price=None,
             quantity=quantity,
             status="open",
@@ -600,7 +658,7 @@ class ResearchBacktestRunner:
                 return min(requested_quantity, position.quantity)
         if signal.quantity and signal.quantity > 0:
             return signal.quantity
-        return Decimal("0.01")
+        return _DEFAULT_ENTRY_QUANTITY
 
     @staticmethod
     def _conditional_orders_from_signal(
@@ -659,16 +717,19 @@ class ResearchBacktestRunner:
         return None
 
     def _entry_required_capital(self, signal: Signal, candle: Candlestick) -> Decimal:
-        quantity = signal.quantity if signal.quantity and signal.quantity > 0 else Decimal("0.01")
+        quantity = (
+            signal.quantity
+            if signal.quantity is not None and signal.quantity > 0
+            else _DEFAULT_ENTRY_QUANTITY
+        )
         price = self._signal_execution_price(signal, candle)
         return calculate_required_capital(quantity, price, self.instrument_spec)
 
     @staticmethod
     def _signal_execution_price(signal: Signal, candle: Candlestick) -> Decimal:
-        if signal.price and signal.price > 0:
-            return signal.price
-        if signal.value and signal.value > 0:
-            return signal.value
+        resolved_intent = resolve_signal_order_intent(signal)
+        if resolved_intent.limit_price is not None:
+            return resolved_intent.limit_price
         return candle.close
 
     def _fills_to_trades(self, fills: list[dict], candle: Candlestick) -> list[ResearchTrade]:

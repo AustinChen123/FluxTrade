@@ -245,6 +245,39 @@ def test_research_evaluator_scores_fold_endpoint_equity(tmp_path, monkeypatch):
     assert result.metrics["mark_to_market_pnl"] == "-7"
 
 
+def test_research_evaluator_rejects_invalid_order_intent_result(
+    tmp_path,
+    monkeypatch,
+):
+    class _InvalidIntentRunner(_RecordingRunner):
+        def run(self):
+            return {
+                **super().run(),
+                "invalid_order_intent_count": 1,
+                "invalid_order_intent_rejections": ("signal.price",),
+            }
+
+    monkeypatch.setattr(
+        parameter_evaluation,
+        "ResearchBacktestRunner",
+        _InvalidIntentRunner,
+    )
+    evaluator = ResearchBacktestParameterEvaluator(
+        _strategy_factory,
+        preload_candles=False,
+    )
+    request = ParameterSearchJobRequest.model_validate(_request_payload(tmp_path))
+
+    with pytest.raises(
+        ValueError,
+        match=r"research_backtest_invalid_order_intent: count=1",
+    ):
+        evaluator.evaluate(
+            request,
+            ParameterCandidate(candidate_id="a", param_pack={}),
+        )
+
+
 def test_csv_signal_evaluator_uses_injected_source_and_endpoint_equity(
     tmp_path,
     monkeypatch,
