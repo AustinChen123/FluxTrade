@@ -194,6 +194,9 @@ class TestOrderTypeDetection:
 
         assert len(mock_exchange_adapter.open_orders) == 1
         assert mock_exchange_adapter.open_orders[0].type == "limit"
+        assert mock_exchange_adapter.open_orders[0].intent_payload == {
+            "legacy_price_source": "signal.value"
+        }
 
     def test_signal_without_price_creates_market(self, execution_engine, signal_factory, mock_exchange_adapter):
         """Signal without price should create market order."""
@@ -202,6 +205,36 @@ class TestOrderTypeDetection:
 
         assert len(mock_exchange_adapter.open_orders) == 1
         assert mock_exchange_adapter.open_orders[0].type == "market"
+
+    @pytest.mark.parametrize("price", [Decimal("0"), Decimal("-1"), Decimal("NaN")])
+    def test_explicit_invalid_price_is_not_downgraded_to_market_or_value(
+        self,
+        execution_engine,
+        signal_factory,
+        mock_exchange_adapter,
+        price,
+    ):
+        signal = signal_factory(price=None, value=None).model_copy(
+            update={"price": price, "value": Decimal("42000")}
+        )
+
+        assert execution_engine.execute_signal(signal) is None
+        assert mock_exchange_adapter.open_orders == []
+
+    @pytest.mark.parametrize("value", [Decimal("0"), Decimal("-1"), Decimal("NaN")])
+    def test_explicit_invalid_legacy_value_is_rejected(
+        self,
+        execution_engine,
+        signal_factory,
+        mock_exchange_adapter,
+        value,
+    ):
+        signal = signal_factory(price=None, value=None).model_copy(
+            update={"value": value}
+        )
+
+        assert execution_engine.execute_signal(signal) is None
+        assert mock_exchange_adapter.open_orders == []
 
 
 class TestQuantityHandling:
@@ -227,6 +260,50 @@ class TestQuantityHandling:
         execution_engine.execute_signal(signal)
 
         assert mock_exchange_adapter.open_orders[0].quantity == Decimal("0.01")
+
+    @pytest.mark.parametrize(
+        "quantity",
+        [Decimal("NaN"), Decimal("Infinity"), Decimal("-Infinity")],
+    )
+    @pytest.mark.parametrize(
+        "signal_type",
+        [SignalType.LONG, SignalType.EXIT_LONG],
+    )
+    def test_nonfinite_quantity_is_rejected_before_order_creation(
+        self,
+        execution_engine,
+        signal_factory,
+        mock_exchange_adapter,
+        quantity,
+        signal_type,
+    ):
+        signal = signal_factory(
+            signal_type=signal_type,
+            price=Decimal("42000"),
+        ).model_copy(
+            update={"quantity": quantity}
+        )
+
+        assert execution_engine.execute_signal(signal) is None
+        assert mock_exchange_adapter.open_orders == []
+
+    @pytest.mark.parametrize(
+        "default_quantity",
+        [Decimal("0"), Decimal("-1"), Decimal("NaN"), Decimal("Infinity")],
+    )
+    def test_invalid_default_quantity_is_rejected_before_order_creation(
+        self,
+        execution_engine,
+        signal_factory,
+        mock_exchange_adapter,
+        default_quantity,
+    ):
+        execution_engine.default_quantity = default_quantity
+
+        assert execution_engine.execute_signal(
+            signal_factory(quantity=None, price=Decimal("42000"))
+        ) is None
+        assert mock_exchange_adapter.open_orders == []
 
     def test_exit_without_quantity_closes_current_position(
         self,
@@ -2979,6 +3056,40 @@ class TestAuditedExecution:
         assert audit.order_id == order.id
         assert audit_session.flush.call_count == 1
         assert audit_session.commit.call_count == 2
+
+    def test_invalid_explicit_price_writes_non_submission_audit(
+        self,
+        mock_db_session,
+        mock_clock,
+        mock_exchange_adapter,
+        mock_order_repo,
+        signal_factory,
+    ):
+        audit_session = mock_db_session
+        engine = ExecutionEngine(
+            db_session=mock_db_session,
+            clock=mock_clock,
+            adapter=mock_exchange_adapter,
+            order_repository=mock_order_repo,
+            db_session_factory=lambda: nullcontext(audit_session),
+            audit_external_orders=True,
+        )
+        signal = signal_factory(price=None, value=None).model_copy(
+            update={"price": Decimal("0"), "value": Decimal("42000")}
+        )
+
+        assert engine.execute_signal(signal) is None
+
+        assert mock_order_repo.orders == {}
+        assert mock_exchange_adapter.open_orders == []
+        audit = audit_session.add.call_args_list[0].args[0]
+        assert audit.risk_status == "REJECT"
+        assert audit.risk_message == (
+            "invalid_signal_order_intent: signal.price must be finite "
+            "and greater than zero"
+        )
+        assert audit.order_id is None
+        assert audit_session.commit.call_count == 1
 
     def test_exchange_failure_writes_outcome_then_raises(
         self, mock_db_session, mock_clock, mock_exchange_adapter, mock_order_repo, signal_factory

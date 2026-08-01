@@ -54,6 +54,36 @@ def test_price_sanity_rejects_above_threshold(signal_factory) -> None:
     assert reason == "price_sanity_check_failed: deviation=0.0301% > 0.03%"
 
 
+def test_price_sanity_applies_to_legacy_value_limit(signal_factory) -> None:
+    signal = signal_factory(price=None, value=Decimal("103.01"))
+
+    status, reason = _rule().evaluate(
+        signal,
+        best_bid=Decimal("99"),
+        best_ask=Decimal("101"),
+    )
+
+    assert status == RuleStatus.REJECT
+    assert reason == "price_sanity_check_failed: deviation=0.0301% > 0.03%"
+
+
+def test_price_sanity_rejects_invalid_legacy_value(signal_factory) -> None:
+    signal = signal_factory(price=None).model_copy(
+        update={"value": Decimal("NaN")}
+    )
+
+    status, reason = _rule().evaluate(
+        signal,
+        best_bid=Decimal("99"),
+        best_ask=Decimal("101"),
+    )
+
+    assert status == RuleStatus.REJECT
+    assert reason == (
+        "invalid_signal_order_intent: signal.value must be finite and greater than zero"
+    )
+
+
 def test_price_sanity_rejects_below_threshold(signal_factory) -> None:
     signal = signal_factory(price=Decimal("96.99"))
 
@@ -68,7 +98,7 @@ def test_price_sanity_rejects_below_threshold(signal_factory) -> None:
 
 
 def test_price_sanity_passes_market_order(signal_factory) -> None:
-    signal = signal_factory(price=None)
+    signal = signal_factory(price=None, value=None)
 
     status, reason = _rule().evaluate(
         signal,

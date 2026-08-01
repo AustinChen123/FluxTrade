@@ -41,6 +41,35 @@ def test_max_position_notional_rejects_without_position_over_limit(signal_factor
     assert reason == "max_position_notional_exceeded: 100000.02 > 100000"
 
 
+def test_max_position_notional_applies_to_legacy_value_limit(signal_factory) -> None:
+    signal = signal_factory(
+        signal_type=SignalType.LONG,
+        price=None,
+        value=Decimal("50000.01"),
+        quantity=Decimal("2"),
+    )
+
+    status, reason = _rule().evaluate(signal, None, mid_price=Decimal("50000"))
+
+    assert status == RuleStatus.REJECT
+    assert reason == "max_position_notional_exceeded: 100000.02 > 100000"
+
+
+def test_max_position_notional_rejects_invalid_legacy_value(signal_factory) -> None:
+    signal = signal_factory(
+        signal_type=SignalType.LONG,
+        price=None,
+        quantity=Decimal("1"),
+    ).model_copy(update={"value": Decimal("NaN")})
+
+    status, reason = _rule().evaluate(signal, None, mid_price=Decimal("50000"))
+
+    assert status == RuleStatus.REJECT
+    assert reason == (
+        "invalid_signal_order_intent: signal.value must be finite and greater than zero"
+    )
+
+
 def test_max_position_notional_rejects_same_side_add_over_limit(
     signal_factory,
     position_factory,
@@ -120,6 +149,7 @@ def test_max_position_notional_uses_mid_price_for_market_order(signal_factory) -
     signal = signal_factory(
         signal_type=SignalType.SHORT,
         price=None,
+        value=None,
         quantity=Decimal("1.5"),
     )
 

@@ -43,8 +43,34 @@ def test_single_order_notional_rejects_above_limit(signal_factory) -> None:
     assert reason == "single_order_notional_exceeded: 5000.010 > 5000.00"
 
 
+def test_single_order_notional_applies_to_legacy_value_limit(signal_factory) -> None:
+    signal = signal_factory(
+        price=None,
+        value=Decimal("50000.10"),
+        quantity=Decimal("0.1"),
+    )
+
+    status, reason = _rule().evaluate(signal, nav=Decimal("100000"))
+
+    assert status == RuleStatus.REJECT
+    assert reason == "single_order_notional_exceeded: 5000.010 > 5000.00"
+
+
+def test_single_order_notional_rejects_invalid_legacy_value(signal_factory) -> None:
+    signal = signal_factory(price=None, quantity=Decimal("0.1")).model_copy(
+        update={"value": Decimal("NaN")}
+    )
+
+    status, reason = _rule().evaluate(signal, nav=Decimal("100000"))
+
+    assert status == RuleStatus.REJECT
+    assert reason == (
+        "invalid_signal_order_intent: signal.value must be finite and greater than zero"
+    )
+
+
 def test_single_order_notional_passes_market_order(signal_factory) -> None:
-    signal = signal_factory(price=None, quantity=Decimal("100"))
+    signal = signal_factory(price=None, value=None, quantity=Decimal("100"))
 
     status, reason = _rule().evaluate(signal, nav=Decimal("100000"))
 

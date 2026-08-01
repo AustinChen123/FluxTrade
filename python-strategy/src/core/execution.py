@@ -43,6 +43,12 @@ from src.core.order_event_sync import (
 )
 from src.core.order_reconciliation import OrderReconciler
 from src.core.portfolio_runtime import PortfolioExposureSnapshot
+from src.core.signal_order_intent import (
+    InvalidSignalOrderIntent,
+    ResolvedOrderIntent,
+    normalize_signal_quantity,
+    resolve_signal_order_intent,
+)
 
 OPS_KILL_SWITCH_STRATEGY_ID = "__ops_kill_switch__"
 
@@ -1483,6 +1489,9 @@ class ExecutionEngine:
             self._submissions_in_flight += 1
         try:
             self._assert_external_operation_allowed()
+            signal = self._normalize_signal_quantity_or_reject(signal, candle)
+            if signal is None:
+                return None
             exit_decision = self._classify_exit_signal(signal)
             if exit_decision is not None and not exit_decision.allowed:
                 self.logger.warning(
@@ -1526,16 +1535,11 @@ class ExecutionEngine:
         # Determine Quantity
         qty = self._quantity_for_signal(signal, exit_decision=exit_decision)
 
-        # Determine Order Type and Price
-        if signal.price and signal.price > 0:
-            order_type = "limit"
-            limit_price = signal.price
-        elif signal.value:
-            order_type = "limit"
-            limit_price = signal.value
-        else:
-            order_type = "market"
-            limit_price = None
+        resolved_intent = self._resolve_order_intent_or_reject(signal, candle)
+        if resolved_intent is None:
+            return None
+        order_type = resolved_intent.order_type
+        limit_price = resolved_intent.limit_price
 
         # 1. Create Entry Order in DB
         order = self.order_manager.create_order(
@@ -1544,7 +1548,7 @@ class ExecutionEngine:
             order_type=order_type,
             quantity=qty,
             price=limit_price,
-            intent_payload=self._signal_order_intent(signal) or None,
+            intent_payload=self._signal_order_intent(signal, resolved_intent) or None,
         )
         self._attach_min_notional_reference_price(order, candle)
         conditional_orders = self._create_conditional_orders(signal, order, qty, candle)
@@ -1635,15 +1639,11 @@ class ExecutionEngine:
             return None
 
         qty = self._quantity_for_signal(signal, exit_decision=exit_decision)
-        if signal.price and signal.price > 0:
-            order_type = "limit"
-            limit_price = signal.price
-        elif signal.value:
-            order_type = "limit"
-            limit_price = signal.value
-        else:
-            order_type = "market"
-            limit_price = None
+        resolved_intent = self._resolve_order_intent_or_reject(signal, candle)
+        if resolved_intent is None:
+            return None
+        order_type = resolved_intent.order_type
+        limit_price = resolved_intent.limit_price
 
         client_order_id = self._client_order_id_for_signal(signal)
         existing_order = self.order_manager.repo.get_order_by_client_order_id(client_order_id)
@@ -1660,9 +1660,9 @@ class ExecutionEngine:
                 "price": limit_price,
                 "min_notional_reference_price": candle.close if candle else None,
                 "client_order_id": client_order_id,
-                **self._signal_order_intent(signal),
+                **self._signal_order_intent(signal, resolved_intent),
             },
-            **self._signal_order_intent(signal),
+            **self._signal_order_intent(signal, resolved_intent),
         }
         order = self.order_manager.create_order(
             signal=signal,
@@ -2167,10 +2167,55 @@ class ExecutionEngine:
             commit_signal_audit(db, audit)
 
     @staticmethod
-    def _signal_order_intent(signal: Signal) -> dict[str, object]:
-        if signal.type not in (SignalType.EXIT_LONG, SignalType.EXIT_SHORT):
-            return {}
-        return {"reduce_only": True, "source": "strategy_exit"}
+    def _signal_order_intent(
+        signal: Signal,
+        resolved_intent: ResolvedOrderIntent,
+    ) -> dict[str, object]:
+        payload: dict[str, object] = {}
+        if signal.type in (SignalType.EXIT_LONG, SignalType.EXIT_SHORT):
+            payload.update({"reduce_only": True, "source": "strategy_exit"})
+        if resolved_intent.uses_legacy_value_fallback:
+            payload["legacy_price_source"] = "signal.value"
+        return payload
+
+    def _resolve_order_intent_or_reject(
+        self,
+        signal: Signal,
+        candle: Optional[Candlestick],
+    ) -> ResolvedOrderIntent | None:
+        try:
+            return resolve_signal_order_intent(signal)
+        except InvalidSignalOrderIntent as exc:
+            reason = str(exc)
+            self.logger.warning(
+                "Signal order intent rejected: strategy=%s product=%s reason=%s",
+                signal.strategy_id,
+                signal.product_id,
+                reason,
+            )
+            self._audit_non_submission(signal, candle, reason)
+            return None
+
+    def _normalize_signal_quantity_or_reject(
+        self,
+        signal: Signal,
+        candle: Optional[Candlestick],
+    ) -> Signal | None:
+        try:
+            return normalize_signal_quantity(
+                signal,
+                default_entry_quantity=self.default_quantity,
+            )
+        except InvalidSignalOrderIntent as exc:
+            reason = str(exc)
+            self.logger.warning(
+                "Signal quantity rejected: strategy=%s product=%s reason=%s",
+                signal.strategy_id,
+                signal.product_id,
+                reason,
+            )
+            self._audit_non_submission(signal, candle, reason)
+            return None
 
     def _create_conditional_orders(
         self,

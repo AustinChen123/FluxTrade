@@ -9,6 +9,10 @@ from src.core.models import Signal
 from src.core.product_registry import InstrumentSpec, calculate_notional_exposure
 from src.core.risk_config import RiskConfig
 from src.core.risk_rules import RuleStatus
+from src.core.signal_order_intent import (
+    InvalidSignalOrderIntent,
+    resolve_signal_order_intent,
+)
 
 
 class SingleOrderNotionalRule:
@@ -23,7 +27,11 @@ class SingleOrderNotionalRule:
         nav: Decimal,
         instrument_spec: InstrumentSpec | None = None,
     ) -> tuple[RuleStatus, Optional[str]]:
-        if signal.price is None:
+        try:
+            resolved_intent = resolve_signal_order_intent(signal)
+        except InvalidSignalOrderIntent as exc:
+            return RuleStatus.REJECT, str(exc)
+        if resolved_intent.limit_price is None:
             return RuleStatus.PASS, None
         if signal.quantity is None:
             return RuleStatus.REJECT, "single_order_notional_missing_quantity"
@@ -32,7 +40,7 @@ class SingleOrderNotionalRule:
 
         notional = calculate_notional_exposure(
             signal.quantity,
-            signal.price,
+            resolved_intent.limit_price,
             instrument_spec,
         )
         limit_notional = nav * self.config.max_single_order_notional_pct
