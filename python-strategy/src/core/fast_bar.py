@@ -26,6 +26,13 @@ from src.core.research_backtest_runner import ResearchTrade
 from src.strategies.base import BaseStrategy
 
 
+_DEFAULT_ENTRY_QUANTITY = Decimal("0.01")
+
+
+class InvalidFastBarIntent(ValueError):
+    """Raised when an intent exceeds the FastBar market-order contract."""
+
+
 class PreparedStrategy(Protocol):
     """Fast strategy runtime prepared once for a specific replay/live context."""
 
@@ -382,29 +389,36 @@ class FastBarReplayRunner:
             intent = self.strategy.on_bar(bar)
             if intent is None or intent.type == SignalType.NO_SIGNAL:
                 continue
-            side = _rust_side(intent.type)
-            if side is None:
-                continue
-            trade_side = _trade_side(intent.type)
-            if trade_side is None:
-                continue
-            quantity = intent.quantity if intent.quantity and intent.quantity > 0 else Decimal("0.01")
-            order_counter += 1
-            order_id = f"fast_{order_counter}"
-            order_strategy[order_id] = strategy_id
-            order_side[order_id] = trade_side
-            engine.submit_order(
-                RustOrder(
+            owned_position = None
+            if intent.type in (SignalType.EXIT_LONG, SignalType.EXIT_SHORT):
+                position = engine.get_position(strategy_id, product_id)
+                if position is not None:
+                    owned_position = (position.side, Decimal(position.quantity))
+            side, trade_side, quantity = _resolve_fast_bar_order_intent(
+                intent,
+                owned_position=owned_position,
+            )
+            order_id = f"fast_{order_counter + 1}"
+            try:
+                rust_order = RustOrder(
                     id=order_id,
                     product_id=product_id,
                     side=side,
                     order_type="MARKET",
-                    price=str(intent.price) if intent.price else "0",
+                    price="0",
                     quantity=str(quantity),
                     timestamp=bar.timestamp,
                     strategy_id=strategy_id,
                 )
-            )
+            except ValueError as exc:
+                raise InvalidFastBarIntent(
+                    "invalid_fast_bar_intent: quantity is outside the matcher "
+                    "Decimal range"
+                ) from exc
+            order_counter += 1
+            order_strategy[order_id] = strategy_id
+            order_side[order_id] = trade_side
+            engine.submit_order(rust_order)
 
         final_balance = Decimal(engine.balance)
         metrics = calculate_metrics(
@@ -430,25 +444,68 @@ def _resize_array(array: np.ndarray, capacity: int, dtype: np.dtype) -> np.ndarr
     return resized
 
 
-def _rust_side(signal_type: SignalType) -> str | None:
-    if signal_type == SignalType.LONG:
-        return "LONG"
-    if signal_type == SignalType.SHORT:
-        return "SHORT"
-    if signal_type == SignalType.EXIT_LONG:
-        return "SHORT"
-    if signal_type == SignalType.EXIT_SHORT:
-        return "LONG"
-    return None
+def _resolve_fast_bar_order_intent(
+    intent: SignalIntent,
+    *,
+    owned_position: tuple[str, Decimal] | None,
+) -> tuple[str, OrderSide, Decimal]:
+    """Resolve the supported market subset or reject the entire replay."""
+    if intent.price is not None:
+        raise InvalidFastBarIntent(
+            "invalid_fast_bar_intent: price is unsupported; "
+            "FastBar only supports market orders"
+        )
 
+    quantity = intent.quantity
+    if quantity is not None and (
+        not isinstance(quantity, Decimal)
+        or not quantity.is_finite()
+        or quantity <= 0
+    ):
+        raise InvalidFastBarIntent(
+            "invalid_fast_bar_intent: quantity must be a finite Decimal "
+            "greater than zero"
+        )
 
-def _trade_side(signal_type: SignalType) -> OrderSide | None:
-    if signal_type == SignalType.LONG:
-        return OrderSide.BUY
-    if signal_type == SignalType.SHORT:
-        return OrderSide.SELL
-    if signal_type == SignalType.EXIT_LONG:
-        return OrderSide.SELL
-    if signal_type == SignalType.EXIT_SHORT:
-        return OrderSide.BUY
-    return None
+    if intent.type == SignalType.LONG:
+        return "LONG", OrderSide.BUY, quantity or _DEFAULT_ENTRY_QUANTITY
+    if intent.type == SignalType.SHORT:
+        return "SHORT", OrderSide.SELL, quantity or _DEFAULT_ENTRY_QUANTITY
+
+    if intent.type == SignalType.EXIT_LONG:
+        expected_side = "LONG"
+        order_side = "SHORT"
+        trade_side = OrderSide.SELL
+    elif intent.type == SignalType.EXIT_SHORT:
+        expected_side = "SHORT"
+        order_side = "LONG"
+        trade_side = OrderSide.BUY
+    else:
+        raise InvalidFastBarIntent(
+            f"invalid_fast_bar_intent: unsupported signal type {intent.type!r}"
+        )
+
+    if owned_position is None:
+        raise InvalidFastBarIntent(
+            "invalid_fast_bar_intent: exit requires an owned position"
+        )
+    position_side, position_quantity = owned_position
+    if position_side != expected_side:
+        raise InvalidFastBarIntent(
+            "invalid_fast_bar_intent: exit position side mismatch"
+        )
+    if (
+        not isinstance(position_quantity, Decimal)
+        or not position_quantity.is_finite()
+        or position_quantity <= 0
+    ):
+        raise InvalidFastBarIntent(
+            "invalid_fast_bar_intent: owned position quantity must be positive"
+        )
+
+    exit_quantity = position_quantity if quantity is None else quantity
+    if exit_quantity > position_quantity:
+        raise InvalidFastBarIntent(
+            "invalid_fast_bar_intent: exit quantity exceeds owned position"
+        )
+    return order_side, trade_side, exit_quantity
