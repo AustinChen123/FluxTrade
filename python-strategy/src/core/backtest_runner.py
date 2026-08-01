@@ -2,6 +2,7 @@ import csv
 import json
 import logging
 from contextlib import contextmanager, nullcontext
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable, ContextManager, Dict, Iterable, List, Optional, cast
 from decimal import Decimal
@@ -19,6 +20,7 @@ from src.core.models import Candlestick
 from src.strategies.base import BaseStrategy
 from src.core.repositories import BacktestOrderRepository
 from src.core.backtest.loader import get_candles_generator
+from src.core.backtest.endpoint_state import build_replay_endpoint_state
 from src.core.backtest.equity import PortfolioEquityCalculator
 from src.core.analytics import (
     ClosedTrade,
@@ -47,6 +49,15 @@ DEFAULT_REPORT_CONFIG: Dict = {
     "journal_export": True,
     "output_dir": "backtest_output/",
 }
+
+
+@dataclass(frozen=True, slots=True)
+class _ReplayProgress:
+    candle_count: int
+    equity_samples: list[tuple[int, Decimal]]
+    final_mark: Decimal | None
+    end_timestamp: int | None
+    halted_early: bool
 
 
 @contextmanager
@@ -266,11 +277,14 @@ class BacktestRunner:
         candles: Iterable,
         mock_account: BacktestAccountService,
         stop_drawdown_amount: Decimal | None,
-    ) -> tuple[int, list[tuple[int, Decimal]]]:
+    ) -> _ReplayProgress:
         count = 0
         peak_equity = Decimal(str(self.initial_balance))
         max_drawdown = Decimal("0")
         equity_samples: list[tuple[int, Decimal]] = []
+        final_mark: Decimal | None = None
+        end_timestamp: int | None = None
+        halted_early = False
         aggregator = (
             CandleAggregator()
             if self.execution_timeframe is not None
@@ -350,6 +364,8 @@ class BacktestRunner:
                     )
                 current_equity = equity_calculator.value(candle.close)
             equity_samples.append((candle.timestamp, current_equity))
+            final_mark = candle.close
+            end_timestamp = candle.timestamp
             peak_equity = max(peak_equity, current_equity)
             max_drawdown = max(max_drawdown, peak_equity - current_equity)
             count += 1
@@ -362,6 +378,7 @@ class BacktestRunner:
                     max_drawdown,
                     stop_drawdown_amount,
                 )
+                halted_early = True
                 break
 
             if count % 1000 == 0:
@@ -371,7 +388,13 @@ class BacktestRunner:
                     candle.timestamp,
                     current_equity,
                 )
-        return count, equity_samples
+        return _ReplayProgress(
+            candle_count=count,
+            equity_samples=equity_samples,
+            final_mark=final_mark,
+            end_timestamp=end_timestamp,
+            halted_early=halted_early,
+        )
 
     def _export_reports(
         self,
@@ -522,11 +545,19 @@ class BacktestRunner:
                     self.start_time,
                     self.end_time,
                 )
-            count, equity_samples = self._process_candles(
+            progress = self._process_candles(
                 candle_gen,
                 mock_account,
                 stop_drawdown_amount,
             )
+
+        endpoint_state = build_replay_endpoint_state(
+            positions=adapter.get_all_positions(),
+            working_orders=adapter.get_matching_open_orders(),
+            final_mark=progress.final_mark,
+            end_timestamp=progress.end_timestamp,
+            halted_early=progress.halted_early,
+        )
 
         # Calculate Final PnL
         final_balance = mock_account.get_balance()
@@ -549,7 +580,7 @@ class BacktestRunner:
                 trades,
                 initial_balance=self.initial_balance,
                 contract_multiplier=self.contract_multiplier,
-                equity_samples=equity_samples,
+                equity_samples=progress.equity_samples,
             )
 
             # Per-strategy metrics
@@ -573,11 +604,15 @@ class BacktestRunner:
         report_dir = self._export_reports(
             metrics,
             journal,
-            candle_count=count,
-            equity_samples=equity_samples,
+            candle_count=progress.candle_count,
+            equity_samples=progress.equity_samples,
         )
 
-        logger.info("Backtest Complete. Processed %d candles. Final PnL: %s", count, total_pnl)
+        logger.info(
+            "Backtest Complete. Processed %d candles. Final PnL: %s",
+            progress.candle_count,
+            total_pnl,
+        )
         logger.info("Metrics: %s", metrics_for_json)
         if report_dir:
             logger.info("Reports written to: %s", report_dir)
@@ -604,12 +639,13 @@ class BacktestRunner:
             "monthly_returns": metrics.get("monthly_returns", {}),
             "journal": journal.to_dicts(),
             "journal_count": len(journal),
-            "candle_count": count,
+            "candle_count": progress.candle_count,
             "report_dir": report_dir,
             "per_strategy": per_strategy,
+            "endpoint_state": endpoint_state,
         }
         daily_return_metrics = utc_daily_return_metrics(
-            equity_samples,
+            progress.equity_samples,
             initial_balance=Decimal(str(self.initial_balance)),
             start_time=self.start_time,
             end_time=self.end_time,

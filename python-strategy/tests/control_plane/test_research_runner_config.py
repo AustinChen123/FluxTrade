@@ -21,6 +21,7 @@ from src.control_plane.parameter_search import (
     ParameterSearchJobExecutor,
     ResearchBacktestParameterEvaluator,
 )
+from src.core.backtest.endpoint_state import ReplayEndpointState
 from src.core.orm_models import EvolutionEpoch, GeneRecord, Strategy, SystemEvent
 
 
@@ -61,6 +62,7 @@ class _RecordingRunner:
             "raw_trade_count": 0,
             "yearly_mark_to_market_returns": {},
             "candle_count": 0,
+            "endpoint_state": ReplayEndpointState(),
         }
 
 
@@ -243,6 +245,14 @@ def test_research_evaluator_scores_fold_endpoint_equity(tmp_path, monkeypatch):
     assert result.score_total == Decimal("-7")
     assert result.metrics["total_pnl"] == "1"
     assert result.metrics["mark_to_market_pnl"] == "-7"
+    assert result.metrics["endpoint_state"] == {
+        "positions": [],
+        "working_orders": [],
+        "final_mark": None,
+        "end_timestamp": None,
+        "halted_early": False,
+        "protection_orders": [],
+    }
 
 
 def test_research_evaluator_rejects_invalid_order_intent_result(

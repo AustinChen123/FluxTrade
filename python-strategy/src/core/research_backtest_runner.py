@@ -21,6 +21,7 @@ from src.core.analytics import (
     calculate_metrics,
     utc_daily_return_metrics,
 )
+from src.core.backtest.endpoint_state import build_replay_endpoint_state
 from src.core.backtest.equity import require_strategy_position_scope
 from src.core.backtest.loader import get_candles_generator
 from src.core.clock import BacktestClock
@@ -162,6 +163,9 @@ class ResearchBacktestRunner:
         portfolio_max_drawdown = Decimal("0")
         equity_samples: list[tuple[int, Decimal]] = []
         observed_position_sides: dict[tuple[str, str], str | None] = {}
+        final_mark: Decimal | None = None
+        end_timestamp: int | None = None
+        halted_early = False
 
         candle_count = 0
         for candle, prepared_candle in self._iter_replay_candles(adapter):
@@ -258,6 +262,8 @@ class ResearchBacktestRunner:
                 else adapter.get_balance()
             )
             equity_samples.append((candle.timestamp, portfolio_current_equity))
+            final_mark = candle.close
+            end_timestamp = candle.timestamp
             portfolio_peak_equity = max(
                 portfolio_peak_equity,
                 portfolio_current_equity,
@@ -274,8 +280,16 @@ class ResearchBacktestRunner:
                 and portfolio_max_drawdown >= stop_drawdown_amount
             ):
                 logger.warning("Stopping research backtest at drawdown threshold")
+                halted_early = True
                 break
 
+        endpoint_state = build_replay_endpoint_state(
+            positions=adapter.get_all_positions(),
+            working_orders=adapter.get_matching_open_orders(),
+            final_mark=final_mark,
+            end_timestamp=end_timestamp,
+            halted_early=halted_early,
+        )
         final_balance = adapter.get_balance()
         total_pnl = final_balance - Decimal(str(self.initial_balance))
         metrics = calculate_metrics(
@@ -339,6 +353,7 @@ class ResearchBacktestRunner:
                 self._invalid_order_intent_rejections
             ),
             "report_dir": None,
+            "endpoint_state": endpoint_state,
         }
 
     def _iter_candles(self) -> Iterable[Candlestick]:
