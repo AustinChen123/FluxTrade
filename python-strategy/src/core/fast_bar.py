@@ -15,8 +15,9 @@ from typing import Deque, Iterable, Protocol
 import numpy as np
 
 from src.core.analytics import calculate_metrics
+from src.core.backtest.endpoint_state import build_replay_endpoint_state
 from src.core.interfaces.data_source import IDataSource
-from src.core.models import Candlestick, OrderSide, SignalType
+from src.core.models import Candlestick, OrderSide, PositionSide, SignalType
 from src.core.product_registry import (
     InstrumentSpec,
     resolve_contract_multiplier,
@@ -426,8 +427,43 @@ class FastBarReplayRunner:
             initial_balance=float(self.initial_balance),
             contract_multiplier=self.contract_multiplier,
         )
+        last_index = len(self.tape) - 1
+        final_mark = (
+            None
+            if last_index < 0
+            else Decimal(str(closes[last_index]))
+        )
+        end_timestamp = (
+            None
+            if last_index < 0
+            else int(timestamps[last_index])
+        )
+        endpoint_state = build_replay_endpoint_state(
+            positions=engine.positions.values(),
+            working_orders=engine.open_orders,
+            final_mark=final_mark,
+            end_timestamp=end_timestamp,
+            halted_early=False,
+        )
+        unrealized_pnl = Decimal("0")
+        if endpoint_state.final_mark is not None:
+            for position in endpoint_state.positions:
+                direction = (
+                    Decimal("1")
+                    if position.side == PositionSide.LONG
+                    else Decimal("-1")
+                )
+                unrealized_pnl += (
+                    (endpoint_state.final_mark - position.average_entry_price)
+                    * position.quantity
+                    * self.contract_multiplier
+                    * direction
+                )
         return {
             "total_pnl": final_balance - self.initial_balance,
+            "mark_to_market_pnl": (
+                final_balance - self.initial_balance + unrealized_pnl
+            ),
             "max_drawdown": metrics.get("max_drawdown", Decimal("0")),
             "win_rate": metrics.get("win_rate", Decimal("0")),
             "profit_factor": metrics.get("profit_factor", Decimal("0")),
@@ -436,6 +472,7 @@ class FastBarReplayRunner:
             "raw_trades": trades,
             "closed_trades": metrics.get("closed_trades", []),
             "candle_count": len(self.tape),
+            "endpoint_state": endpoint_state,
         }
 
 def _resize_array(array: np.ndarray, capacity: int, dtype: np.dtype) -> np.ndarray:
