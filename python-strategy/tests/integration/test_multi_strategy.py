@@ -145,7 +145,7 @@ class StrategyA(BaseStrategy):
                 timestamp=candle.timestamp,
                 type=SignalType.LONG,
                 value=candle.close,
-                quantity=Decimal("0.01"),
+                quantity=Decimal("0.005"),
             )
         elif self._count == 10:
             return Signal(
@@ -155,7 +155,7 @@ class StrategyA(BaseStrategy):
                 timestamp=candle.timestamp,
                 type=SignalType.EXIT_LONG,
                 value=candle.close,
-                quantity=Decimal("0.01"),
+                quantity=Decimal("0.005"),
             )
         return Signal(
             strategy_id=self.strategy_id,
@@ -192,7 +192,7 @@ class StrategyB(BaseStrategy):
                 timestamp=candle.timestamp,
                 type=SignalType.SHORT,
                 value=candle.close,
-                quantity=Decimal("0.01"),
+                quantity=Decimal("0.005"),
             )
         elif self._count == 14:
             return Signal(
@@ -202,7 +202,7 @@ class StrategyB(BaseStrategy):
                 timestamp=candle.timestamp,
                 type=SignalType.EXIT_SHORT,
                 value=candle.close,
-                quantity=Decimal("0.01"),
+                quantity=Decimal("0.005"),
             )
         return Signal(
             strategy_id=self.strategy_id,
