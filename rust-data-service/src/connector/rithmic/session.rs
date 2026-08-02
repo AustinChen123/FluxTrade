@@ -137,7 +137,7 @@ impl RithmicSession {
         let result = (|| {
             expect_template(frame, SYSTEM_INFO_RESPONSE)?;
             let response: protocol::ResponseRithmicSystemInfo = codec::decode(frame)?;
-            ensure_handshake_success(&response.rp_code)?;
+            ensure_handshake_success(&response.rp_code, "system-info")?;
             if !response.system_name.contains(&self.login.system_name) {
                 return Err(FatalSessionError(
                     "configured Rithmic system is unavailable".to_string(),
@@ -181,7 +181,7 @@ impl RithmicSession {
         let result = (|| {
             expect_template(frame, LOGIN_RESPONSE)?;
             let response: protocol::ResponseLogin = codec::decode(frame)?;
-            ensure_handshake_success(&response.rp_code)?;
+            ensure_handshake_success(&response.rp_code, "login")?;
             let seconds = response.heartbeat_interval.ok_or_else(|| {
                 FatalSessionError("Rithmic login response omitted heartbeat_interval".to_string())
             })?;
@@ -375,12 +375,19 @@ pub(super) fn classify_response_codes(
     anyhow::bail!("Rithmic response omitted status codes")
 }
 
-fn ensure_handshake_success(rp_codes: &[String]) -> Result<()> {
+fn ensure_handshake_success(rp_codes: &[String], phase: &str) -> Result<()> {
     let code = rp_codes.first().ok_or_else(|| {
-        FatalSessionError("Rithmic handshake response omitted rp_code".to_string())
+        FatalSessionError(format!(
+            "Rithmic {phase} handshake response omitted rp_code"
+        ))
     })?;
     if code != "0" {
-        return Err(FatalSessionError(format!("Rithmic handshake response code {code}")).into());
+        let safe_code = code
+            .parse::<u32>()
+            .map(|value| value.to_string())
+            .unwrap_or_else(|_| "unrecognized".to_string());
+        let message = format!("Rithmic {phase} handshake response code {safe_code}");
+        return Err(FatalSessionError(message).into());
     }
     Ok(())
 }
@@ -544,6 +551,34 @@ mod tests {
             .accept_system_info(&system_info(&["test-system"], "9"))
             .unwrap_err();
         assert!(is_fatal_session_error(&error));
+        assert!(error.to_string().contains("system-info"));
+        assert_eq!(session.state(), SessionState::Failed);
+    }
+
+    #[test]
+    fn login_error_preserves_phase_without_untrusted_server_detail() {
+        let mut session = RithmicSession::new(login(Plant::Ticker));
+        session.begin_system_info().unwrap();
+        session
+            .accept_system_info(&system_info(&["test-system"], "0"))
+            .unwrap();
+        session.mark_reconnected().unwrap();
+        session.begin_login().unwrap();
+        let response = codec::encode(&protocol::ResponseLogin {
+            template_id: LOGIN_RESPONSE,
+            rp_code: vec!["13".to_string(), "session unavailable".to_string()],
+            ..Default::default()
+        })
+        .unwrap();
+
+        let error = session.accept_login(&response).unwrap_err();
+
+        assert!(is_fatal_session_error(&error));
+        assert_eq!(
+            error.to_string(),
+            "Rithmic login handshake response code 13"
+        );
+        assert!(!error.to_string().contains("session unavailable"));
         assert_eq!(session.state(), SessionState::Failed);
     }
 
