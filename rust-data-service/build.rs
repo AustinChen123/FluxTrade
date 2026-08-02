@@ -15,6 +15,7 @@ const RITHMIC_PROTOS: &[&str] = &[
     "response_market_data_update.proto",
     "request_front_month_contract.proto",
     "response_front_month_contract.proto",
+    "front_month_contract_update.proto",
     "last_trade.proto",
     "best_bid_offer.proto",
     "request_time_bar_replay.proto",

@@ -1,18 +1,23 @@
 use super::{
     bar::MinuteBarBuilder,
     config,
+    front_month::{self, FrontMonthEvent},
     market::{self, MarketDataEvent, SubscriptionAction},
     session::Plant,
-    transport::{self, ReconnectPolicy},
+    transport::{self, ConnectionPreparation, ReconnectPolicy},
 };
 use crate::model::validate_product_id;
 use crate::AggregationSourceEvent;
 use anyhow::{ensure, Context, Result};
+use chrono::{Datelike, Utc};
 use std::{
     sync::{Arc, Mutex},
     time::Duration,
 };
-use tokio::sync::mpsc;
+use tokio::{
+    sync::{mpsc, watch},
+    time::Instant,
+};
 use tracing::info;
 
 const RESPONSE_TIMEOUT: Duration = Duration::from_secs(10);
@@ -22,9 +27,10 @@ const FORWARD_QUEUE_CAPACITY: usize = 60;
 
 pub(crate) struct LiveConfig {
     runtime: config::RuntimeConfig,
-    startup: Vec<u8>,
+    startup: Vec<Vec<u8>>,
     policy: ReconnectPolicy,
     product_id: String,
+    root_symbol: String,
     exchange: String,
     symbol: String,
 }
@@ -36,8 +42,12 @@ pub(crate) fn configure(
     symbol: String,
 ) -> Result<LiveConfig> {
     validate_instrument(&product_id, &exchange, &symbol)?;
+    let root_symbol = dated_product_root(&product_id)?;
     let runtime = config::load(profile, Plant::Ticker)?;
-    let startup = market::last_trade_request(&exchange, &symbol, SubscriptionAction::Subscribe)?;
+    let startup = vec![
+        front_month::request_with_updates("live-front-month", &root_symbol, &exchange, true)?,
+        market::last_trade_request(&exchange, &symbol, SubscriptionAction::Subscribe)?,
+    ];
     let policy = ReconnectPolicy::new(INITIAL_BACKOFF, MAX_BACKOFF)?;
 
     Ok(LiveConfig {
@@ -45,6 +55,7 @@ pub(crate) fn configure(
         startup,
         policy,
         product_id,
+        root_symbol,
         exchange,
         symbol,
     })
@@ -55,13 +66,22 @@ pub(crate) async fn run(
     aggregation_source_tx: mpsc::Sender<AggregationSourceEvent>,
 ) -> Result<()> {
     let (forward_tx, forward_rx) = mpsc::channel(FORWARD_QUEUE_CAPACITY);
+    let (front_month_gate_tx, front_month_gate_rx) = watch::channel(FrontMonthGateState::Idle);
     let product_id = config.product_id.clone();
     let handler = Arc::new(Mutex::new(LivePayloadHandler {
-        builder: MinuteBarBuilder::new(config.product_id, config.exchange, config.symbol)?,
+        builder: MinuteBarBuilder::new(
+            config.product_id,
+            config.exchange.clone(),
+            config.symbol.clone(),
+        )?,
         candle_tx: forward_tx.clone(),
         observed_last_trade: false,
+        root_symbol: config.root_symbol,
+        exchange: config.exchange,
+        symbol: config.symbol,
+        front_month_gate: front_month_gate_tx,
     }));
-    let reconnect_handler = Arc::clone(&handler);
+    let lifecycle_handler = Arc::clone(&handler);
     let payload_handler = Arc::clone(&handler);
 
     let transport = transport::run_with_reconnect(
@@ -69,16 +89,9 @@ pub(crate) async fn run(
         config.runtime.login,
         RESPONSE_TIMEOUT,
         config.policy,
-        vec![config.startup],
-        move || {
-            reconnect_handler
-                .lock()
-                .map_err(|_| anyhow::anyhow!("Rithmic live handler lock poisoned"))?
-                .reset();
-            forward_tx
-                .try_send(AggregationSourceEvent::ResetProduct(product_id.clone()))
-                .context("Rithmic aggregation reset queue is unavailable")?;
-            Ok(())
+        config.startup,
+        move |preparation| {
+            prepare_live_connection(&lifecycle_handler, &forward_tx, &product_id, preparation)
         },
         move |payload| {
             payload_handler
@@ -91,6 +104,64 @@ pub(crate) async fn run(
     tokio::select! {
         result = transport => result,
         result = forward_events(forward_rx, aggregation_source_tx) => result,
+        result = enforce_front_month_deadline(front_month_gate_rx) => result,
+    }
+}
+
+fn prepare_live_connection(
+    handler: &Arc<Mutex<LivePayloadHandler>>,
+    forward_tx: &mpsc::Sender<AggregationSourceEvent>,
+    product_id: &str,
+    preparation: ConnectionPreparation,
+) -> Result<()> {
+    let mut handler = handler
+        .lock()
+        .map_err(|_| anyhow::anyhow!("Rithmic live handler lock poisoned"))?;
+    match preparation {
+        ConnectionPreparation::Startup => {
+            handler.reset();
+            forward_tx
+                .try_send(AggregationSourceEvent::ResetProduct(product_id.to_string()))
+                .context("Rithmic aggregation reset queue is unavailable")?;
+        }
+        ConnectionPreparation::Retry => handler.suspend(),
+    }
+    Ok(())
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum FrontMonthGateState {
+    Idle,
+    Awaiting { deadline: Instant },
+    Verified,
+}
+
+async fn enforce_front_month_deadline(
+    mut state_rx: watch::Receiver<FrontMonthGateState>,
+) -> Result<()> {
+    loop {
+        let observed = *state_rx.borrow_and_update();
+        match observed {
+            FrontMonthGateState::Idle | FrontMonthGateState::Verified => {
+                state_rx
+                    .changed()
+                    .await
+                    .context("Rithmic front-month gate closed")?
+            }
+            FrontMonthGateState::Awaiting { deadline } => {
+                tokio::select! {
+                    _ = tokio::time::sleep_until(deadline) => {
+                        ensure!(
+                            *state_rx.borrow() != observed,
+                            "Rithmic front-month verification timed out"
+                        );
+                    }
+                    changed = state_rx.changed() => {
+                        changed.context("Rithmic front-month gate closed")?;
+                    }
+                }
+            }
+        }
     }
 }
 
@@ -98,17 +169,57 @@ struct LivePayloadHandler {
     builder: MinuteBarBuilder,
     candle_tx: mpsc::Sender<AggregationSourceEvent>,
     observed_last_trade: bool,
+    root_symbol: String,
+    exchange: String,
+    symbol: String,
+    front_month_gate: watch::Sender<FrontMonthGateState>,
 }
 
 impl LivePayloadHandler {
+    fn suspend(&mut self) {
+        self.front_month_gate
+            .send_replace(FrontMonthGateState::Idle);
+    }
+
     fn reset(&mut self) {
         self.builder.reset();
         self.observed_last_trade = false;
+        self.front_month_gate
+            .send_replace(FrontMonthGateState::Awaiting {
+                deadline: Instant::now() + RESPONSE_TIMEOUT,
+            });
     }
 
     fn handle(&mut self, payload: &[u8]) -> Result<()> {
+        if let Some(event) = front_month::decode_live_event(
+            payload,
+            "live-front-month",
+            &self.root_symbol,
+            &self.exchange,
+            &self.symbol,
+        )? {
+            return match event {
+                FrontMonthEvent::CurrentVerified => {
+                    self.front_month_gate
+                        .send_replace(FrontMonthGateState::Verified);
+                    info!(
+                        symbol = self.symbol,
+                        "Rithmic configured contract is current front month"
+                    );
+                    Ok(())
+                }
+                FrontMonthEvent::RolloverRequired(next_symbol) => anyhow::bail!(
+                    "rithmic_rollover_required: configured_symbol={} next_symbol={next_symbol}",
+                    self.symbol
+                ),
+            };
+        }
         match market::decode_market_data_event(payload)? {
             MarketDataEvent::LastTrade(trade) => {
+                let completed = self.builder.push(&trade)?;
+                if *self.front_month_gate.borrow() != FrontMonthGateState::Verified {
+                    return Ok(());
+                }
                 if !self.observed_last_trade {
                     info!(
                         is_snapshot = trade.is_snapshot,
@@ -116,7 +227,7 @@ impl LivePayloadHandler {
                     );
                     self.observed_last_trade = true;
                 }
-                if let Some(candle) = self.builder.push(&trade)? {
+                if let Some(candle) = completed {
                     info!(
                         timestamp = candle.timestamp,
                         "Rithmic completed minute candle"
@@ -163,20 +274,92 @@ async fn forward_events(
 }
 
 fn validate_instrument(product_id: &str, exchange: &str, symbol: &str) -> Result<()> {
+    validate_instrument_for_year(product_id, exchange, symbol, Utc::now().year())
+}
+
+fn validate_instrument_for_year(
+    product_id: &str,
+    exchange: &str,
+    symbol: &str,
+    current_year: i32,
+) -> Result<()> {
     validate_product_id(product_id)?;
     ensure!(
         product_id.starts_with("RITHMIC:"),
         "Rithmic live product ID must use RITHMIC venue"
     );
     ensure!(
-        !exchange.trim().is_empty(),
-        "Rithmic exchange must not be empty"
+        exchange.eq_ignore_ascii_case("CME"),
+        "Rithmic live market-data validation currently supports CME only"
     );
     ensure!(
         !symbol.trim().is_empty(),
         "Rithmic symbol must not be empty"
     );
+    let expiry_year = product_id
+        .rsplit_once('-')
+        .and_then(|(_, expiry)| expiry.get(..4))
+        .and_then(|year| year.parse::<i32>().ok())
+        .context("Rithmic product ID has an invalid expiry year")?;
+    ensure!(
+        (current_year - 1..=current_year + 1).contains(&expiry_year),
+        "Rithmic product ID expiry year is outside the live validation window"
+    );
+    ensure!(
+        dated_product_root(product_id)?.eq_ignore_ascii_case("MNQ"),
+        "Rithmic live market-data validation currently supports MNQ only"
+    );
+    ensure!(
+        expected_native_symbol(product_id)?.eq_ignore_ascii_case(symbol),
+        "Rithmic product ID and native symbol identify different contracts"
+    );
     Ok(())
+}
+
+fn expected_native_symbol(product_id: &str) -> Result<String> {
+    let instrument = product_id
+        .strip_prefix("RITHMIC:")
+        .context("Rithmic live product ID must use RITHMIC venue")?;
+    let (root, expiry) = instrument
+        .rsplit_once('-')
+        .context("Rithmic live product ID must identify a dated future")?;
+    let month_code = match expiry
+        .get(4..)
+        .context("Rithmic product ID has an invalid expiry month")?
+    {
+        "01" => 'F',
+        "02" => 'G',
+        "03" => 'H',
+        "04" => 'J',
+        "05" => 'K',
+        "06" => 'M',
+        "07" => 'N',
+        "08" => 'Q',
+        "09" => 'U',
+        "10" => 'V',
+        "11" => 'X',
+        "12" => 'Z',
+        _ => anyhow::bail!("Rithmic product ID has an invalid expiry month"),
+    };
+    let year_code = expiry
+        .chars()
+        .nth(3)
+        .context("Rithmic product ID has an invalid expiry year")?;
+    Ok(format!("{root}{month_code}{year_code}"))
+}
+
+fn dated_product_root(product_id: &str) -> Result<String> {
+    let instrument = product_id
+        .strip_prefix("RITHMIC:")
+        .context("Rithmic live product ID must use RITHMIC venue")?;
+    let (root, _) = instrument
+        .rsplit_once('-')
+        .context("Rithmic live product ID must identify a dated future")?;
+    ensure!(
+        !root.is_empty(),
+        "Rithmic dated product root must not be empty"
+    );
+    Ok(root.to_string())
 }
 
 #[cfg(test)]
@@ -193,15 +376,20 @@ mod tests {
 
     #[test]
     fn explicit_instrument_identity_validation_matrix() {
-        assert!(validate_instrument("RITHMIC:NQ-202609", "CME", "NQU6").is_ok());
+        assert!(validate_instrument_for_year("RITHMIC:MNQ-202609", "CME", "MNQU6", 2026).is_ok());
 
         for (product_id, exchange, symbol) in [
-            ("CME:NQ-202609", "CME", "NQU6"),
-            ("RITHMIC:NQ", "CME", "NQU6"),
-            ("RITHMIC:NQ-202609", "", "NQU6"),
-            ("RITHMIC:NQ-202609", "CME", ""),
+            ("CME:MNQ-202609", "CME", "MNQU6"),
+            ("RITHMIC:MNQ", "CME", "MNQU6"),
+            ("RITHMIC:MNQ-202609", "", "MNQU6"),
+            ("RITHMIC:MNQ-202609", "NYMEX", "MNQU6"),
+            ("RITHMIC:NQ-202609", "CME", "NQU6"),
+            ("RITHMIC:MNQ-202609", "CME", ""),
+            ("RITHMIC:MNQ-202612", "CME", "MNQU6"),
+            ("RITHMIC:MNQ-202609", "CME", "MNQZ6"),
+            ("RITHMIC:MNQ-203609", "CME", "MNQU9"),
         ] {
-            assert!(validate_instrument(product_id, exchange, symbol).is_err());
+            assert!(validate_instrument_for_year(product_id, exchange, symbol, 2026).is_err());
         }
     }
 
@@ -209,13 +397,138 @@ mod tests {
     fn live_payload_handler_emits_completed_canonical_minute() {
         let (mut handler, mut candle_rx) = handler();
 
+        handler.handle(&front_month_response("MNQU6")).unwrap();
         handler.handle(&last_trade(1_800_000_001)).unwrap();
         handler.handle(&last_trade(1_800_000_061)).unwrap();
 
         let candle = event_candle(candle_rx.try_recv().unwrap());
-        assert_eq!(candle.product_id, "RITHMIC:NQ-202609");
+        assert_eq!(candle.product_id, "RITHMIC:MNQ-202609");
         assert_eq!(candle.timestamp, 1_800_000_000_000);
         assert_eq!(candle.timeframe, "1m");
+    }
+
+    #[test]
+    fn live_payload_handler_front_month_state_matrix_fails_closed() {
+        let (mut unverified, mut unverified_rx) = handler();
+        unverified.handle(&last_trade(1_800_000_001)).unwrap();
+        assert!(unverified_rx.try_recv().is_err());
+
+        let (mut current, _) = handler();
+        current.handle(&front_month_response("MNQU6")).unwrap();
+        assert_eq!(
+            *current.front_month_gate.borrow(),
+            FrontMonthGateState::Verified
+        );
+
+        let (mut changed, _) = handler();
+        let error = changed.handle(&front_month_update("MNQZ6")).unwrap_err();
+        assert!(error.to_string().contains("rithmic_rollover_required"));
+        assert_ne!(
+            *changed.front_month_gate.borrow(),
+            FrontMonthGateState::Verified
+        );
+    }
+
+    #[test]
+    fn preverification_trades_are_retained_but_not_published() {
+        let (mut handler, mut candle_rx) = handler();
+
+        handler.handle(&last_trade(1_800_000_001)).unwrap();
+        assert!(candle_rx.try_recv().is_err());
+
+        handler.handle(&front_month_response("MNQU6")).unwrap();
+        handler.handle(&last_trade(1_800_000_061)).unwrap();
+
+        assert_eq!(
+            event_candle(candle_rx.try_recv().unwrap()).timestamp,
+            1_800_000_000_000
+        );
+    }
+
+    #[tokio::test]
+    async fn front_month_deadline_expires_without_market_payload() {
+        let (_state_tx, state_rx) = watch::channel(FrontMonthGateState::Awaiting {
+            deadline: Instant::now() + Duration::from_millis(10),
+        });
+
+        let error = timeout(
+            Duration::from_secs(1),
+            enforce_front_month_deadline(state_rx),
+        )
+        .await
+        .unwrap()
+        .unwrap_err();
+
+        assert!(error
+            .to_string()
+            .contains("front-month verification timed out"));
+    }
+
+    #[tokio::test]
+    async fn front_month_deadline_starts_only_when_startup_is_prepared() {
+        let (state_tx, state_rx) = watch::channel(FrontMonthGateState::Idle);
+        let watchdog = tokio::spawn(enforce_front_month_deadline(state_rx));
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        assert!(!watchdog.is_finished());
+
+        state_tx.send_replace(FrontMonthGateState::Awaiting {
+            deadline: Instant::now() + Duration::from_millis(10),
+        });
+        let error = timeout(Duration::from_secs(1), watchdog)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("front-month verification timed out"));
+    }
+
+    #[tokio::test]
+    async fn reconnect_wait_can_outlive_previous_front_month_deadline() {
+        let (handler, _) = handler();
+        let state_rx = handler.front_month_gate.subscribe();
+        handler
+            .front_month_gate
+            .send_replace(FrontMonthGateState::Awaiting {
+                deadline: Instant::now() + Duration::from_millis(10),
+            });
+        let handler = Arc::new(Mutex::new(handler));
+        let (forward_tx, mut forward_rx) = mpsc::channel(1);
+        let watchdog = tokio::spawn(enforce_front_month_deadline(state_rx));
+        tokio::task::yield_now().await;
+
+        prepare_live_connection(
+            &handler,
+            &forward_tx,
+            "RITHMIC:MNQ-202609",
+            ConnectionPreparation::Retry,
+        )
+        .unwrap();
+        assert!(forward_rx.try_recv().is_err());
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        assert!(!watchdog.is_finished());
+
+        prepare_live_connection(
+            &handler,
+            &forward_tx,
+            "RITHMIC:MNQ-202609",
+            ConnectionPreparation::Startup,
+        )
+        .unwrap();
+        assert!(matches!(
+            forward_rx.try_recv().unwrap(),
+            AggregationSourceEvent::ResetProduct(ref product_id)
+                if product_id == "RITHMIC:MNQ-202609"
+        ));
+        handler
+            .lock()
+            .unwrap()
+            .handle(&front_month_response("MNQU6"))
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        assert!(!watchdog.is_finished());
+        watchdog.abort();
     }
 
     #[test]
@@ -234,8 +547,14 @@ mod tests {
     #[test]
     fn reconnect_reset_discards_partial_minute() {
         let (mut handler, mut candle_rx) = handler();
+        handler.handle(&front_month_response("MNQU6")).unwrap();
         handler.handle(&last_trade(1_800_000_001)).unwrap();
         handler.reset();
+        assert_ne!(
+            *handler.front_month_gate.borrow(),
+            FrontMonthGateState::Verified
+        );
+        handler.handle(&front_month_response("MNQU6")).unwrap();
         handler.handle(&last_trade(1_800_000_061)).unwrap();
         assert!(candle_rx.try_recv().is_err());
 
@@ -254,6 +573,8 @@ mod tests {
             for attempt in 0..2 {
                 let mut socket = serve_handshake(&listener).await;
                 send(&mut socket, heartbeat_response()).await;
+                assert_template(socket.next().await.unwrap().unwrap(), 113);
+                send(&mut socket, front_month_response("MNQU6")).await;
                 assert_template(socket.next().await.unwrap().unwrap(), 100);
                 send(
                     &mut socket,
@@ -275,8 +596,10 @@ mod tests {
                 }
             }
         });
-        let startup =
-            market::last_trade_request("CME", "NQU6", SubscriptionAction::Subscribe).unwrap();
+        let startup = vec![
+            front_month::request_with_updates("live-front-month", "MNQ", "CME", true).unwrap(),
+            market::last_trade_request("CME", "MNQU6", SubscriptionAction::Subscribe).unwrap(),
+        ];
         let config = LiveConfig {
             runtime: RuntimeConfig {
                 url,
@@ -293,9 +616,10 @@ mod tests {
             startup,
             policy: ReconnectPolicy::new(Duration::from_millis(1), Duration::from_millis(10))
                 .unwrap(),
-            product_id: "RITHMIC:NQ-202609".to_string(),
+            product_id: "RITHMIC:MNQ-202609".to_string(),
+            root_symbol: "MNQ".to_string(),
             exchange: "CME".to_string(),
-            symbol: "NQU6".to_string(),
+            symbol: "MNQU6".to_string(),
         };
         let (event_tx, mut event_rx) = mpsc::channel(4);
         let connector = tokio::spawn(run(config, event_tx));
@@ -309,12 +633,12 @@ mod tests {
         assert!(matches!(
             first,
             AggregationSourceEvent::ResetProduct(ref product_id)
-                if product_id == "RITHMIC:NQ-202609"
+                if product_id == "RITHMIC:MNQ-202609"
         ));
         assert!(matches!(
             second,
             AggregationSourceEvent::ResetProduct(ref product_id)
-                if product_id == "RITHMIC:NQ-202609"
+                if product_id == "RITHMIC:MNQ-202609"
         ));
         assert_eq!(event_candle(third).timestamp, 1_800_000_060_000);
         assert!(event_rx.try_recv().is_err());
@@ -355,6 +679,7 @@ mod tests {
     #[test]
     fn full_forwarding_queue_fails_closed_without_dropping_buffered_candle() {
         let (mut handler, mut candle_rx) = handler_with_capacity(1);
+        handler.handle(&front_month_response("MNQU6")).unwrap();
         handler.handle(&last_trade(1_800_000_001)).unwrap();
         handler.handle(&last_trade(1_800_000_061)).unwrap();
 
@@ -375,16 +700,23 @@ mod tests {
         capacity: usize,
     ) -> (LivePayloadHandler, mpsc::Receiver<AggregationSourceEvent>) {
         let (candle_tx, candle_rx) = mpsc::channel(capacity);
+        let (front_month_gate, _) = watch::channel(FrontMonthGateState::Awaiting {
+            deadline: Instant::now() + RESPONSE_TIMEOUT,
+        });
         (
             LivePayloadHandler {
                 builder: MinuteBarBuilder::new(
-                    "RITHMIC:NQ-202609".to_string(),
+                    "RITHMIC:MNQ-202609".to_string(),
                     "CME".to_string(),
-                    "NQU6".to_string(),
+                    "MNQU6".to_string(),
                 )
                 .unwrap(),
                 candle_tx,
                 observed_last_trade: false,
+                root_symbol: "MNQ".to_string(),
+                exchange: "CME".to_string(),
+                symbol: "MNQU6".to_string(),
+                front_month_gate,
             },
             candle_rx,
         )
@@ -401,7 +733,7 @@ mod tests {
 
     fn candle(timestamp: i64) -> Candlestick {
         Candlestick {
-            product_id: "RITHMIC:NQ-202609".to_string(),
+            product_id: "RITHMIC:MNQ-202609".to_string(),
             timeframe: "1m".to_string(),
             timestamp,
             open: rust_decimal_macros::dec!(1),
@@ -417,11 +749,39 @@ mod tests {
             template_id: 150,
             presence_bits: Some(1),
             exchange: Some("CME".to_string()),
-            symbol: Some("NQU6".to_string()),
+            symbol: Some("MNQU6".to_string()),
             trade_price: Some(29_784.75),
             trade_size: Some(1),
             ssboe: Some(ssboe),
             usecs: Some(0),
+            ..Default::default()
+        })
+        .unwrap()
+    }
+
+    fn front_month_response(symbol: &str) -> Vec<u8> {
+        codec::encode(&protocol::ResponseFrontMonthContract {
+            template_id: 114,
+            user_msg: vec!["live-front-month".to_string()],
+            rp_code: vec!["0".to_string()],
+            symbol: Some("MNQ".to_string()),
+            exchange: Some("CME".to_string()),
+            trading_symbol: Some(symbol.to_string()),
+            trading_exchange: Some("CME".to_string()),
+            is_front_month_symbol: Some(true),
+            ..Default::default()
+        })
+        .unwrap()
+    }
+
+    fn front_month_update(symbol: &str) -> Vec<u8> {
+        codec::encode(&protocol::FrontMonthContractUpdate {
+            template_id: 159,
+            symbol: Some("MNQ".to_string()),
+            exchange: Some("CME".to_string()),
+            trading_symbol: Some(symbol.to_string()),
+            trading_exchange: Some("CME".to_string()),
+            is_front_month_symbol: Some(true),
             ..Default::default()
         })
         .unwrap()

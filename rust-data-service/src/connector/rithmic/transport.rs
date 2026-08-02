@@ -61,18 +61,24 @@ impl ReconnectPolicy {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ConnectionPreparation {
+    Startup,
+    Retry,
+}
+
 pub(crate) async fn run_with_reconnect<F, P>(
     url: &str,
     login: LoginParameters,
     response_timeout: Duration,
     policy: ReconnectPolicy,
     startup_payloads: Vec<Vec<u8>>,
-    mut prepare_startup: P,
+    mut prepare_connection: P,
     mut handle_payload: F,
 ) -> Result<()>
 where
     F: FnMut(Vec<u8>) -> Result<()>,
-    P: FnMut() -> Result<()>,
+    P: FnMut(ConnectionPreparation) -> Result<()>,
 {
     let mut backoffs = ReconnectBackoffs::new(policy);
 
@@ -86,7 +92,8 @@ where
                         Ok(ConnectionEvent::HeartbeatConfirmed) => {
                             heartbeat_confirmations = heartbeat_confirmations.saturating_add(1);
                             if startup_pending {
-                                prepare_startup().context("Rithmic startup preparation failed")?;
+                                prepare_connection(ConnectionPreparation::Startup)
+                                    .context("Rithmic startup preparation failed")?;
                                 for payload in &startup_payloads {
                                     let template_id = codec::template_id(payload)
                                         .context("invalid Rithmic startup payload")?;
@@ -129,6 +136,8 @@ where
         };
 
         let delay = backoffs.next_delay(retry_cause);
+        prepare_connection(ConnectionPreparation::Retry)
+            .context("Rithmic retry preparation failed")?;
         tokio::time::sleep(delay).await;
     }
 }
@@ -562,6 +571,8 @@ mod tests {
         let handler_payloads = Arc::clone(&payloads);
         let preparations = Arc::new(Mutex::new(0_u32));
         let startup_preparations = Arc::clone(&preparations);
+        let retries = Arc::new(Mutex::new(0_u32));
+        let retry_preparations = Arc::clone(&retries);
         let startup_payload = codec::encode(&protocol::RequestMarketDataUpdate {
             template_id: 100,
             ..Default::default()
@@ -574,8 +585,13 @@ mod tests {
                 Duration::from_secs(1),
                 policy,
                 vec![startup_payload],
-                move || {
-                    *startup_preparations.lock().unwrap() += 1;
+                move |preparation| {
+                    match preparation {
+                        ConnectionPreparation::Startup => {
+                            *startup_preparations.lock().unwrap() += 1
+                        }
+                        ConnectionPreparation::Retry => *retry_preparations.lock().unwrap() += 1,
+                    }
                     Ok(())
                 },
                 move |payload| {
@@ -601,6 +617,7 @@ mod tests {
             .collect();
         assert_eq!(templates, [12, 13]);
         assert_eq!(*preparations.lock().unwrap(), 2);
+        assert!(*retries.lock().unwrap() >= 1);
 
         supervisor.abort();
         server.await.unwrap();
@@ -635,7 +652,7 @@ mod tests {
                 Duration::from_secs(1),
                 policy,
                 vec![startup_payload],
-                || Ok(()),
+                |_| Ok(()),
                 move |payload| {
                     handler_payloads.lock().unwrap().push(payload);
                     Ok(())
@@ -696,7 +713,7 @@ mod tests {
                 Duration::from_secs(1),
                 policy,
                 vec![],
-                || Ok(()),
+                |_| Ok(()),
                 move |payload| {
                     handler_templates
                         .lock()
