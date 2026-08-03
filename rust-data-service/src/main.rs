@@ -369,7 +369,7 @@ impl std::fmt::Display for TaskId {
 fn supervised_task_exit_error(task_id: &TaskId, task_result: anyhow::Result<()>) -> anyhow::Error {
     match task_result {
         Ok(()) => anyhow::anyhow!("Critical task '{}' exited unexpectedly", task_id),
-        Err(error) => anyhow::anyhow!("Critical task '{}' failed: {}", task_id, error),
+        Err(error) => error.context(format!("Critical task '{}' failed", task_id)),
     }
 }
 
@@ -1094,12 +1094,33 @@ mod tests {
             assert!(supervised_task_exit_error(&task_id, Ok(()))
                 .to_string()
                 .contains("exited unexpectedly"));
-            assert!(
+            assert!(format!(
+                "{:#}",
                 supervised_task_exit_error(&task_id, Err(anyhow::anyhow!("test failure")))
-                    .to_string()
-                    .contains("test failure")
-            );
+            )
+            .contains("test failure"));
         }
+    }
+
+    #[test]
+    fn supervised_task_failure_preserves_the_complete_error_chain() {
+        let source = anyhow::anyhow!("unsupported Rithmic market-data template 151")
+            .context("Rithmic payload handler failed");
+        let error =
+            supervised_task_exit_error(&TaskId::Connector("rithmic".to_string()), Err(source));
+
+        assert_eq!(
+            error.chain().map(ToString::to_string).collect::<Vec<_>>(),
+            [
+                "Critical task 'connector:rithmic' failed",
+                "Rithmic payload handler failed",
+                "unsupported Rithmic market-data template 151",
+            ]
+        );
+        assert_eq!(
+            format!("{error:#}"),
+            "Critical task 'connector:rithmic' failed: Rithmic payload handler failed: unsupported Rithmic market-data template 151"
+        );
     }
 
     #[test]

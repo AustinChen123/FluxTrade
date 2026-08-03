@@ -116,7 +116,7 @@ where
                             }
                         }
                         Ok(ConnectionEvent::Payload(payload)) => {
-                            handle_payload(payload).context("Rithmic payload handler failed")?;
+                            handle_payload_with_diagnostics(payload, &mut handle_payload)?;
                         }
                         Err(error) => {
                             break 'connected classify_connection_error(
@@ -140,6 +140,22 @@ where
             .context("Rithmic retry preparation failed")?;
         tokio::time::sleep(delay).await;
     }
+}
+
+fn handle_payload_with_diagnostics<F>(payload: Vec<u8>, handle_payload: &mut F) -> Result<()>
+where
+    F: FnMut(Vec<u8>) -> Result<()>,
+{
+    let payload_len = payload.len();
+    let template_id = codec::template_id(&payload).ok();
+    handle_payload(payload).with_context(|| match template_id {
+        Some(template_id) => format!(
+            "Rithmic payload handler failed: template_id={template_id} payload_len={payload_len}"
+        ),
+        None => {
+            format!("Rithmic payload handler failed: template_id=unknown payload_len={payload_len}")
+        }
+    })
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -736,6 +752,30 @@ mod tests {
 
         supervisor.abort();
         server.await.unwrap();
+    }
+
+    #[test]
+    fn payload_handler_failure_reports_safe_identity_and_preserves_source_chain() {
+        let payload = codec::encode(&protocol::Reject {
+            template_id: 75,
+            user_msg: vec!["do-not-log-this".to_string()],
+            rp_code: vec!["also-sensitive".to_string()],
+        })
+        .unwrap();
+        let mut handler = |_| {
+            Err(anyhow::anyhow!("missing Rithmic trade usecs")
+                .context("failed to decode LastTrade"))
+        };
+
+        let error = handle_payload_with_diagnostics(payload, &mut handler).unwrap_err();
+        let formatted = format!("{error:#}");
+
+        assert!(formatted.contains("template_id=75"));
+        assert!(formatted.contains("payload_len="));
+        assert!(formatted.contains("failed to decode LastTrade"));
+        assert!(formatted.contains("missing Rithmic trade usecs"));
+        assert!(!formatted.contains("do-not-log-this"));
+        assert!(!formatted.contains("also-sensitive"));
     }
 
     fn login() -> LoginParameters {
