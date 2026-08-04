@@ -207,14 +207,15 @@ class TestBacktestE2E:
                 end_time=candle_data[-1].timestamp,
                 product_id=PRODUCT_ID,
                 timeframe=TIMEFRAME,
-                initial_balance=Decimal("10000"),
                 data_source=memory_source,
                 fee_config=fee_config,
                 report_config={"csv_trades": False, "equity_curve": False,
                                "markdown_report": False, "journal_export": False},
             )
             runner.add_strategy(AlwaysLongStrategy())
-            return runner.run()
+            result = runner.run()
+            assert result is not None
+            return result
 
         maker_fee_rate = Decimal("0.001")
         result_no_fee = run_backtest({"maker": Decimal("0"), "taker": Decimal("0")})
