@@ -196,7 +196,7 @@ class TestBacktestE2E:
 
     @patch("src.core.backtest_runner.SessionLocal")
     def test_backtest_fees_reflected(self, mock_session_local, memory_source, candle_data):
-        """PnL should differ between zero-fee and with-fee runs."""
+        """Fees should exactly reduce PnL for identical LIMIT fill economics."""
         mock_session = MagicMock()
         mock_session.query.return_value.filter_by.return_value.all.return_value = []
         mock_session_local.return_value = mock_session
@@ -207,7 +207,7 @@ class TestBacktestE2E:
                 end_time=candle_data[-1].timestamp,
                 product_id=PRODUCT_ID,
                 timeframe=TIMEFRAME,
-                initial_balance=10000.0,
+                initial_balance=Decimal("10000"),
                 data_source=memory_source,
                 fee_config=fee_config,
                 report_config={"csv_trades": False, "equity_curve": False,
@@ -216,12 +216,52 @@ class TestBacktestE2E:
             runner.add_strategy(AlwaysLongStrategy())
             return runner.run()
 
-        result_no_fee = run_backtest({"maker": 0, "taker": 0})
-        result_with_fee = run_backtest({"maker": 0.001, "taker": 0.002})
+        maker_fee_rate = Decimal("0.001")
+        result_no_fee = run_backtest({"maker": Decimal("0"), "taker": Decimal("0")})
+        result_with_fee = run_backtest(
+            {"maker": maker_fee_rate, "taker": Decimal("0.002")}
+        )
 
-        # If trades were generated, fee should cause PnL difference
-        if result_no_fee["total_trades"] > 0:
-            assert result_no_fee["total_pnl"] != result_with_fee["total_pnl"]
+        no_fee_fills = [
+            entry["data"] for entry in result_no_fee["journal"]
+            if "fill_type" in entry["data"]
+        ]
+        with_fee_fills = [
+            entry["data"] for entry in result_with_fee["journal"]
+            if "fill_type" in entry["data"]
+        ]
+        assert no_fee_fills
+
+        def normalize(fills):
+            return [
+                (
+                    fill["side"].value,
+                    Decimal(fill["price"]),
+                    Decimal(fill["quantity"]),
+                    fill["fill_type"],
+                )
+                for fill in fills
+            ]
+
+        no_fee_economics = normalize(no_fee_fills)
+        with_fee_economics = normalize(with_fee_fills)
+        assert {side for side, _, _, _ in no_fee_economics} == {"buy", "sell"}
+        assert all(fill_type == "LIMIT" for _, _, _, fill_type in no_fee_economics)
+        assert no_fee_economics == with_fee_economics
+
+        expected_fees = sum(
+            (price * quantity * maker_fee_rate for _, price, quantity, _ in no_fee_economics),
+            Decimal("0"),
+        )
+        reported_fees = sum(
+            (Decimal(fill["fee"]) for fill in with_fee_fills), Decimal("0")
+        )
+        assert reported_fees == expected_fees
+        assert (
+            Decimal(result_no_fee["total_pnl"])
+            - Decimal(result_with_fee["total_pnl"])
+            == expected_fees
+        )
 
     @patch("src.core.backtest_runner.SessionLocal")
     def test_backtest_journal_populated(self, mock_session_local, memory_source, candle_data):
