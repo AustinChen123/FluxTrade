@@ -1,7 +1,7 @@
 {
   "schema": "fluxtrade_refactor_expected_jobs_v1",
   "workflow_path": ".github/workflows/ci.yml",
-  "workflow_sha256": "c86e097ecc58fad15a90f539e9bd3c96d0f8983b4e8d950958365dd8e8601e26",
+  "workflow_sha256": "5750ed87b2dddfc918f26011ad5bbeb9b5ad7a269d897c7b3cf82fbeb292922f",
   "aggregate_job_id": "refactor-gate",
   "required_job_ids": [
     "integration-check",
