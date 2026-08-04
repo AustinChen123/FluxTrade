@@ -5,7 +5,12 @@ from typing import cast
 import pytest
 from pydantic import ValidationError
 
-from src.core.backtest.endpoint_state import ReplayEndpointState
+from src.core.backtest.endpoint_state import (
+    EndpointOrder,
+    EndpointPosition,
+    ReplayEndpointState,
+)
+from src.core.models import OrderSide, PositionSide
 from src.validation.trading_outcome import TradingOutcome
 
 
@@ -122,6 +127,79 @@ def test_dynamic_int_and_decimal_are_collision_free() -> None:
     _items(decimal, "journal")[0]["data_json"] = Decimal("1")
     assert _outcome(integer).sha256() != _outcome(decimal).sha256()
     assert _outcome(integer).first_difference(_outcome(decimal)) is not None
+
+
+def test_non_empty_endpoint_semantics_change_digest() -> None:
+    position = EndpointPosition(
+        strategy_id="s",
+        product_id="MNQ",
+        side=PositionSide.LONG,
+        quantity=Decimal("1"),
+        average_entry_price=Decimal("100"),
+    )
+    order = EndpointOrder(
+        strategy_id="s",
+        product_id="MNQ",
+        side=OrderSide.SELL,
+        order_type="LIMIT",
+        quantity=Decimal("1"),
+        timestamp=3,
+        price=Decimal("101"),
+    )
+    payload = _payload()
+    payload["endpoint_state"] = ReplayEndpointState(
+        positions=(position,),
+        working_orders=(order,),
+        final_mark=Decimal("100"),
+        end_timestamp=3,
+    )
+    expected = _outcome(payload)
+
+    for field, changed, path in (
+        (
+            "positions",
+            position.model_copy(update={"quantity": Decimal("2")}),
+            "$.endpoint_state.positions[0].quantity",
+        ),
+        (
+            "working_orders",
+            order.model_copy(update={"price": Decimal("102")}),
+            "$.endpoint_state.working_orders[0].price",
+        ),
+    ):
+        changed_payload = deepcopy(payload)
+        endpoint_state = changed_payload["endpoint_state"]
+        assert isinstance(endpoint_state, ReplayEndpointState)
+        changed_payload["endpoint_state"] = endpoint_state.model_copy(
+            update={field: (changed,)}
+        )
+        actual = _outcome(changed_payload)
+        difference = expected.first_difference(actual)
+        assert expected.sha256() != actual.sha256()
+        assert difference is not None and difference.path == path
+
+
+@pytest.mark.parametrize("method", ["model_copy", "model_construct"])
+def test_trading_outcome_revalidates_endpoint_instance_content(method: str) -> None:
+    valid = ReplayEndpointState(
+        final_mark=Decimal("100"), end_timestamp=3, halted_early=False
+    )
+    if method == "model_copy":
+        corrupted = valid.model_copy(update={"final_mark": 100.0})
+    else:
+        corrupted = ReplayEndpointState.model_construct(
+            positions=(),
+            working_orders=(),
+            final_mark=100.0,
+            end_timestamp=3,
+            halted_early=False,
+        )
+    assert isinstance(corrupted.final_mark, float)
+    payload = _payload()
+    payload["endpoint_state"] = corrupted
+
+    with pytest.raises(ValidationError):
+        _outcome(payload)
 
 
 @pytest.mark.parametrize(
