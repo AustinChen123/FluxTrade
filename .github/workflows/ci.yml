@@ -44,11 +44,14 @@ jobs:
 
       - name: Scan committed changes for secrets
         env:
+          EVENT_NAME: ${{ github.event_name }}
+          EVENT_CREATED: ${{ github.event.created }}
+          EVENT_REF: ${{ github.ref }}
           BASE_SHA: ${{ github.event.pull_request.base.sha || github.event.before }}
           HEAD_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
         run: |
           scan_range=$(bash .github/scripts/resolve-secret-scan-range.sh \
-            "${BASE_SHA}" "${HEAD_SHA}" refs/remotes/origin/develop)
+            "${EVENT_NAME}" "${EVENT_CREATED}" "${EVENT_REF}" "${BASE_SHA}" "${HEAD_SHA}" refs/remotes/origin/develop)
           "${RUNNER_TEMP}/gitleaks/gitleaks" git \
             --config .gitleaks.toml \
             --log-opts="--diff-merges=first-parent ${scan_range}" \
