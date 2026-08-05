@@ -63,6 +63,11 @@ class AdversarialTuple(tuple[object, ...]):
         return iter((self.exposed,))
 
 
+class _FalseyModelExtra(dict[str, object]):
+    def __bool__(self) -> bool:
+        return False
+
+
 def _position_values() -> dict[str, object]:
     return {
         "strategy_id": "alpha",
@@ -99,6 +104,39 @@ def _corrupt_order(method: str) -> EndpointOrder:
     if method == "model_copy":
         return order.model_copy(update={"price": 21000.0})
     return EndpointOrder.model_construct(**{**_order_values(), "price": 21000.0})
+
+
+@pytest.mark.parametrize(
+    ("model", "values", "field"),
+    [
+        (EndpointPosition, _position_values, "positions"),
+        (EndpointOrder, _order_values, "working_orders"),
+    ],
+)
+@pytest.mark.parametrize(
+    "extra",
+    [
+        pytest.param(None, id="none"),
+        pytest.param({}, id="empty"),
+        pytest.param(_FalseyModelExtra(unexpected="accepted"), id="falsey_nonempty"),
+        pytest.param({"unexpected": "accepted"}, id="truthy_nonempty"),
+    ],
+)
+def test_endpoint_child_model_extra_matrix_at_state_construction(
+    model: type[EndpointPosition] | type[EndpointOrder],
+    values: Callable[[], dict[str, object]],
+    field: str,
+    extra: dict[str, object] | None,
+) -> None:
+    child = model.model_validate(values())
+    object.__setattr__(child, "__pydantic_extra__", extra)
+    assert child.model_extra == extra
+    if extra is None:
+        state = ReplayEndpointState.model_validate({field: (child,)})
+        assert getattr(state, field)[0].model_extra is None
+    else:
+        with pytest.raises(ValidationError):
+            ReplayEndpointState.model_validate({field: (child,)})
 
 
 def _rust_position() -> SimpleNamespace:
@@ -708,11 +746,15 @@ def test_replay_state_rejects_container_mapping_and_scalar_coercion(
     [
         (EndpointPosition, {**_position_values(), "side": "LONG"}),
         (EndpointPosition, {**_position_values(), "unexpected": "value"}),
+        (EndpointPosition, {**_position_values(), "strategy_id": "\ud800"}),
+        (EndpointPosition, {**_position_values(), "product_id": "\ud800"}),
         (EndpointOrder, {**_order_values(), "side": "buy"}),
         (EndpointOrder, {**_order_values(), "order_type": "limit"}),
         (EndpointOrder, {**_order_values(), "timestamp": "100"}),
         (EndpointOrder, {**_order_values(), "timestamp": True}),
         (EndpointOrder, {**_order_values(), "unexpected": "value"}),
+        (EndpointOrder, {**_order_values(), "strategy_id": "\ud800"}),
+        (EndpointOrder, {**_order_values(), "product_id": "\ud800"}),
     ],
 )
 def test_nested_models_reject_noncanonical_direct_values(
@@ -721,6 +763,48 @@ def test_nested_models_reject_noncanonical_direct_values(
 ) -> None:
     with pytest.raises(ValidationError):
         model.model_validate(values)
+
+
+@pytest.mark.parametrize("model", [EndpointPosition, EndpointOrder])
+@pytest.mark.parametrize("method", ["model_copy", "model_construct"])
+def test_parent_rejects_non_utf8_nested_identity(
+    model: type[EndpointPosition] | type[EndpointOrder], method: str
+) -> None:
+    values = _position_values() if model is EndpointPosition else _order_values()
+    field = "positions" if model is EndpointPosition else "working_orders"
+    corrupted = (
+        model.model_validate(values).model_copy(update={"strategy_id": "\ud800"})
+        if method == "model_copy"
+        else model.model_construct(**{**values, "strategy_id": "\ud800"})
+    )
+    with pytest.raises(ValidationError):
+        ReplayEndpointState.model_validate({field: (corrupted,)})
+
+
+@pytest.mark.parametrize("model", [EndpointPosition, EndpointOrder])
+@pytest.mark.parametrize("identity", ["strategy_id", "product_id"])
+@pytest.mark.parametrize(
+    "projection", ["direct", "exact", "model_copy", "model_construct"]
+)
+def test_endpoint_identity_preserves_valid_multibyte_utf8(
+    model: type[EndpointPosition] | type[EndpointOrder],
+    identity: str,
+    projection: str,
+) -> None:
+    tagged = "strategy-策略-交易-ß-🙂"
+    values = _position_values() if model is EndpointPosition else _order_values()
+    values[identity] = tagged
+    child = model.model_validate(values)
+    if projection != "direct":
+        if projection != "exact":
+            child = (
+                child.model_copy(update={identity: tagged})
+                if projection == "model_copy"
+                else model.model_construct(**{**values, identity: tagged})
+            )
+        field = "positions" if model is EndpointPosition else "working_orders"
+        child = getattr(ReplayEndpointState.model_validate({field: (child,)}), field)[0]
+    assert getattr(child, identity) == tagged
 
 
 STRICT_FALSE_CASES: list[tuple[EndpointModel, dict[str, object], tuple[str, ...]]] = [

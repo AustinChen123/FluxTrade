@@ -4,11 +4,21 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 from collections.abc import Mapping
 from decimal import Decimal
-from typing import Annotated, ClassVar
+from typing import Annotated, ClassVar, Self
 
-from pydantic import AfterValidator, BaseModel, BeforeValidator, ConfigDict
+from pydantic import (
+    AfterValidator,
+    BaseModel,
+    BeforeValidator,
+    ConfigDict,
+    ModelWrapValidatorHandler,
+    field_validator,
+    model_validator,
+)
+from pydantic_core import PydanticCustomError
 
 from src.core.backtest.endpoint_state import ReplayEndpointState
 
@@ -35,15 +45,23 @@ def _decimal(value: object) -> Decimal:
 def _identity(value: str) -> str:
     if not value.strip():
         raise ValueError("logical identities must be non-empty")
+    value.encode("utf-8")
     return value
 
 
 def _json(value: object) -> str:
+    try:
+        return _json_value(value)
+    except (RecursionError, UnicodeEncodeError) as error:
+        raise ValueError("canonical value is not representable") from error
+
+
+def _json_value(value: object) -> str:
     if value is None:
         return '["null"]'
     if isinstance(value, bool):
         return f'["bool",{str(value).lower()}]'
-    if isinstance(value, int):
+    if type(value) is int:
         return f'["int","{value}"]'
     if isinstance(value, Decimal):
         sign, digits, exponent = _decimal(value).as_tuple()
@@ -51,17 +69,21 @@ def _json(value: object) -> str:
         coefficient = "".join(str(digit) for digit in digits)
         return f'["decimal",{sign},"{coefficient}",{exponent}]'
     if isinstance(value, str):
+        str.encode(value, "utf-8")
         return f'["string",{json.dumps(value, ensure_ascii=False)}]'
-    if isinstance(value, (list, tuple)):
-        tag = "list" if isinstance(value, list) else "tuple"
-        return f'["{tag}",[' + ",".join(_json(item) for item in value) + "]]"
-    if isinstance(value, Mapping):
-        if not all(isinstance(key, str) for key in value):
+    if type(value) is list:
+        return '["list",[' + ",".join(_json_value(item) for item in value) + "]]"
+    if type(value) is tuple:
+        return '["tuple",[' + ",".join(_json_value(item) for item in value) + "]]"
+    if type(value) is dict:
+        if not all(type(key) is str for key in value):
             raise ValueError("canonical mappings require string keys")
+        for key in value:
+            str.encode(key, "utf-8")
         return (
             '["map",['
             + ",".join(
-                f"[{json.dumps(key, ensure_ascii=False)},{_json(value[key])}]"
+                f"[{json.dumps(key, ensure_ascii=False)},{_json_value(value[key])}]"
                 for key in sorted(value)
             )
             + "]]"
@@ -74,11 +96,147 @@ Identity = Annotated[str, AfterValidator(_identity)]
 CanonicalJson = Annotated[str, BeforeValidator(_json)]
 
 
+def _reject_json_number(_: str) -> object:
+    raise ValueError("canonical tagged JSON cannot contain raw numbers")
+
+
+def _decode_canonical_json(value: object) -> object:
+    if type(value) is not str:
+        raise ValueError("stored canonical JSON must be a string")
+    try:
+        encoded = json.loads(
+            value,
+            parse_float=_reject_json_number,
+            parse_constant=_reject_json_number,
+        )
+    except (ArithmeticError, RecursionError) as error:
+        raise ValueError("unrepresentable stored canonical JSON") from error
+    except (json.JSONDecodeError, ValueError) as error:
+        raise ValueError("invalid stored canonical JSON") from error
+
+    def decode(node: object) -> object:
+        if type(node) is not list or not node or type(node[0]) is not str:
+            raise ValueError("invalid canonical tag shape")
+        tag = node[0]
+        if tag == "null" and len(node) == 1:
+            return None
+        if tag == "bool" and len(node) == 2 and type(node[1]) is bool:
+            return node[1]
+        if (
+            tag == "int"
+            and len(node) == 2
+            and type(node[1]) is str
+            and re.fullmatch(r"-?(?:0|[1-9][0-9]*)", node[1])
+        ):
+            return int(node[1])
+        if (
+            tag == "decimal"
+            and len(node) == 4
+            and type(node[1]) is int
+            and node[1] in (0, 1)
+            and type(node[2]) is str
+            and re.fullmatch(r"[0-9]+", node[2])
+            and type(node[3]) is int
+        ):
+            return Decimal((node[1], tuple(map(int, node[2])), node[3]))
+        if tag == "string" and len(node) == 2 and type(node[1]) is str:
+            return node[1]
+        if tag in ("list", "tuple") and len(node) == 2 and type(node[1]) is list:
+            items = [decode(item) for item in node[1]]
+            return items if tag == "list" else tuple(items)
+        if tag == "map" and len(node) == 2 and type(node[1]) is list:
+            result: dict[str, object] = {}
+            for pair in node[1]:
+                if (
+                    type(pair) is not list
+                    or len(pair) != 2
+                    or type(pair[0]) is not str
+                    or pair[0] in result
+                ):
+                    raise ValueError("invalid canonical map entry")
+                result[pair[0]] = decode(pair[1])
+            return result
+        raise ValueError("invalid canonical tag")
+
+    try:
+        decoded = decode(encoded)
+        if _json(decoded) != value:
+            raise ValueError("stored canonical JSON is not byte-identical")
+    except (ArithmeticError, RecursionError) as error:
+        raise ValueError("unrepresentable stored canonical JSON") from error
+    return decoded
+
+
+def _project_observation(value: object, expected: type[BaseModel]) -> object:
+    if type(value) is not expected:
+        if isinstance(value, expected):
+            raise ValueError(f"{expected.__name__} subclasses are unsupported")
+        return value
+    if isinstance(value, BaseModel) and value.model_extra is not None:
+        raise ValueError(f"{expected.__name__} contains unexpected fields")
+    projected = dict(value.__dict__)
+    for field in ("metadata_json", "data_json"):
+        if field in projected:
+            projected[field] = _decode_canonical_json(projected[field])
+    return projected
+
+
+def _project_sequence(value: object, expected: type[BaseModel]) -> object:
+    if type(value) is not tuple:
+        raise PydanticCustomError("tuple_type", "Input should be a valid tuple")
+    return tuple(_project_observation(item, expected) for item in value)
+
+
 class _Observation(BaseModel):
-    model_config = ConfigDict(frozen=True, strict=True, extra="forbid")
+    model_config = ConfigDict(
+        frozen=True, strict=True, extra="forbid", revalidate_instances="always"
+    )
+    _strings: ClassVar[frozenset[str]] = frozenset()
+    _identities: ClassVar[frozenset[str]] = frozenset()
+    _timestamps: ClassVar[frozenset[str]] = frozenset()
+    _canonical_json: ClassVar[frozenset[str]] = frozenset()
+
+    @model_validator(mode="wrap")
+    @classmethod
+    def project_exact_instance(
+        cls, value: object, handler: ModelWrapValidatorHandler[Self]
+    ) -> Self:
+        if not isinstance(value, _Observation):
+            return handler(value)
+        if type(value) is not cls:
+            raise ValueError(f"{cls.__name__} subclasses are unsupported")
+        if value.model_extra is not None:
+            raise ValueError(f"{cls.__name__} contains unexpected fields")
+        values = dict(value.__dict__)
+        for field in cls._canonical_json & values.keys():
+            values[field] = _decode_canonical_json(values[field])
+        return handler(values)
+
+    @model_validator(mode="before")
+    @classmethod
+    def validate_raw_mapping(cls, value: object) -> object:
+        if not isinstance(value, Mapping):
+            raise ValueError("canonical models require mapping input")
+        values = dict(value)
+        if set(values) - set(cls.model_fields):
+            raise ValueError("canonical models forbid unexpected fields")
+        for field in cls._strings & values.keys():
+            if type(values[field]) is not str:
+                raise ValueError(f"{field} must be a string")
+            values[field].encode("utf-8")
+        for field in cls._identities & values.keys():
+            if values[field] is not None and type(values[field]) is not str:
+                raise ValueError(f"{field} must be a string or null")
+        for field in cls._timestamps & values.keys():
+            if type(values[field]) is not int:
+                raise ValueError(f"{field} must be an integer")
+        return values
 
 
 class SignalObservation(_Observation):
+    _strings = frozenset({"strategy_id", "product_id", "timeframe", "signal_type"})
+    _timestamps = frozenset({"timestamp_ms"})
+    _canonical_json = frozenset({"metadata_json"})
     strategy_id: str
     product_id: str
     timeframe: str
@@ -94,6 +252,19 @@ class SignalObservation(_Observation):
 
 
 class OrderObservation(_Observation):
+    _strings = frozenset(
+        {
+            "logical_order_id",
+            "strategy_id",
+            "product_id",
+            "phase",
+            "status",
+            "order_type",
+            "side",
+        }
+    )
+    _identities = frozenset({"parent_logical_order_id", "linked_logical_order_id"})
+    _timestamps = frozenset({"timestamp_ms"})
     logical_order_id: Identity
     parent_logical_order_id: Identity | None
     linked_logical_order_id: Identity | None
@@ -112,6 +283,10 @@ class OrderObservation(_Observation):
 
 
 class FillObservation(_Observation):
+    _strings = frozenset(
+        {"logical_order_id", "strategy_id", "product_id", "fill_type", "side"}
+    )
+    _timestamps = frozenset({"timestamp_ms"})
     logical_order_id: Identity
     strategy_id: str
     product_id: str
@@ -131,6 +306,10 @@ class FinancialOutcome(_Observation):
 
 
 class JournalObservation(_Observation):
+    _strings = frozenset({"strategy_id", "tag"})
+    _identities = frozenset({"logical_trade_id"})
+    _timestamps = frozenset({"timestamp_ms"})
+    _canonical_json = frozenset({"data_json"})
     strategy_id: str
     timestamp_ms: int
     tag: str
@@ -187,6 +366,36 @@ class TradingOutcome(_Observation):
     endpoint_state: ReplayEndpointState
     financial: FinancialOutcome
     journal: tuple[JournalObservation, ...]
+
+    @field_validator("signals", mode="before")
+    @classmethod
+    def reproject_signals(cls, value: object) -> object:
+        return _project_sequence(value, SignalObservation)
+
+    @field_validator("order_observations", mode="before")
+    @classmethod
+    def reproject_orders(cls, value: object) -> object:
+        return _project_sequence(value, OrderObservation)
+
+    @field_validator("fills", mode="before")
+    @classmethod
+    def reproject_fills(cls, value: object) -> object:
+        return _project_sequence(value, FillObservation)
+
+    @field_validator("endpoint_state", mode="before")
+    @classmethod
+    def reproject_endpoint_state(cls, value: object) -> object:
+        return _project_observation(value, ReplayEndpointState)
+
+    @field_validator("financial", mode="before")
+    @classmethod
+    def reproject_financial(cls, value: object) -> object:
+        return _project_observation(value, FinancialOutcome)
+
+    @field_validator("journal", mode="before")
+    @classmethod
+    def reproject_journal(cls, value: object) -> object:
+        return _project_sequence(value, JournalObservation)
 
     def _projection(self) -> dict[str, object]:
         return {

@@ -156,6 +156,7 @@ class EndpointPosition(BaseFluxModel):
     def validate_identity(cls, value: object) -> str:
         if not isinstance(value, str) or not value.strip():
             raise ValueError("endpoint identity must be a non-empty string")
+        value.encode("utf-8")
         return value
 
     @field_validator("side", mode="before")
@@ -209,6 +210,7 @@ class EndpointOrder(BaseFluxModel):
     def validate_identity(cls, value: object) -> str:
         if not isinstance(value, str) or not value.strip():
             raise ValueError("endpoint identity must be a non-empty string")
+        value.encode("utf-8")
         return value
 
     @field_validator("side", mode="before")
@@ -295,7 +297,8 @@ class ReplayEndpointState(BaseFluxModel):
     @classmethod
     def validate_positions_container(cls, value: object) -> object:
         if type(value) is not tuple or not all(
-            type(item) is EndpointPosition for item in value
+            type(item) is EndpointPosition and item.model_extra is None
+            for item in value
         ):
             raise ValueError("positions must contain exact EndpointPosition values")
         return value
@@ -304,7 +307,7 @@ class ReplayEndpointState(BaseFluxModel):
     @classmethod
     def validate_working_orders_container(cls, value: object) -> object:
         if type(value) is not tuple or not all(
-            type(item) is EndpointOrder for item in value
+            type(item) is EndpointOrder and item.model_extra is None for item in value
         ):
             raise ValueError("working_orders must contain exact EndpointOrder values")
         return value

@@ -7,9 +7,23 @@ import json
 from collections.abc import Mapping
 from typing import Annotated, ClassVar, Literal, Self
 
-from pydantic import BaseModel, ConfigDict, StringConstraints, model_validator
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    ModelWrapValidatorHandler,
+    StringConstraints,
+    model_validator,
+)
 
-from src.validation.trading_outcome import TradingOutcome
+from src.core.backtest.endpoint_state import ReplayEndpointState
+from src.validation.trading_outcome import (
+    FillObservation,
+    FinancialOutcome,
+    JournalObservation,
+    OrderObservation,
+    SignalObservation,
+    TradingOutcome,
+)
 
 __all__ = ["TradingParityRun"]
 
@@ -30,7 +44,9 @@ _Sha256Identity = Annotated[
 class TradingParityRun(BaseModel):
     """Strict provenance and outcome identity for one parity matrix cell."""
 
-    model_config = ConfigDict(frozen=True, strict=True, extra="forbid")
+    model_config = ConfigDict(
+        frozen=True, strict=True, extra="forbid", revalidate_instances="always"
+    )
     schema_version: ClassVar[str] = "fluxtrade.trading_parity_run.v2"
 
     role: Literal["BL", "BB", "CL", "CB"]
@@ -45,17 +61,72 @@ class TradingParityRun(BaseModel):
     loaded_artifact_sha256: _Sha256Identity
     native_matcher_sha256: _Sha256Identity
     outcome: TradingOutcome
+    _string_fields: ClassVar[frozenset[str]] = frozenset(
+        {
+            "role",
+            "source_version",
+            "mode",
+            "revision_sha",
+            "tree_oid",
+            "runtime_source_sha256",
+            "input_sha256",
+            "configuration_sha256",
+            "runner_sha256",
+            "loaded_artifact_sha256",
+            "native_matcher_sha256",
+        }
+    )
+
+    @model_validator(mode="wrap")
+    @classmethod
+    def reject_direct_model_extra(
+        cls, value: object, handler: ModelWrapValidatorHandler[Self]
+    ) -> Self:
+        if (
+            cls is TradingParityRun
+            and type(value) is cls
+            and value.model_extra is not None
+        ):
+            raise ValueError("parity run contains unexpected fields")
+        return handler(value)
 
     @model_validator(mode="before")
     @classmethod
     def require_outcome_instance(cls, data: object) -> object:
-        if (
-            isinstance(data, Mapping)
-            and "outcome" in data
-            and not isinstance(data["outcome"], TradingOutcome)
-        ):
-            raise ValueError("outcome must be an instantiated TradingOutcome")
-        return data
+        if not isinstance(data, Mapping):
+            raise ValueError("parity runs require mapping input")
+        projected = dict(data)
+        if set(projected) - set(cls.model_fields):
+            raise ValueError("parity runs forbid unexpected fields")
+        for field in cls._string_fields & projected.keys():
+            if type(projected[field]) is not str:
+                raise ValueError(f"{field} must be a string")
+        if "outcome" in projected:
+            outcome = projected["outcome"]
+            if type(outcome) is not TradingOutcome:
+                raise ValueError("outcome must be an exact TradingOutcome")
+            if outcome.model_extra is not None:
+                raise ValueError("outcome contains unexpected fields")
+            values = outcome.__dict__
+            sequences = (
+                (values.get("signals"), SignalObservation),
+                (values.get("order_observations"), OrderObservation),
+                (values.get("fills"), FillObservation),
+                (values.get("journal"), JournalObservation),
+            )
+            if any(
+                type(items) is not tuple
+                or any(type(item) is not expected for item in items)
+                for items, expected in sequences
+            ):
+                raise ValueError("outcome observations must have exact canonical types")
+            if (
+                type(values.get("endpoint_state")) is not ReplayEndpointState
+                or type(values.get("financial")) is not FinancialOutcome
+            ):
+                raise ValueError("outcome summaries must have exact canonical types")
+            projected["outcome"] = TradingOutcome.model_validate(dict(values))
+        return projected
 
     @model_validator(mode="after")
     def validate_matrix_cell(self) -> Self:
