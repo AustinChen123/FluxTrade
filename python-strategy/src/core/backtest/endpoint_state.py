@@ -33,7 +33,7 @@ def _reject_extra_fields(value: object, *, allowed: frozenset[str]) -> object:
 def _raw_decimal(value: object, *, field_name: str) -> Decimal:
     if not isinstance(value, Decimal):
         raise ValueError(f"{field_name} must be a Decimal")
-    return value
+    return Decimal(value)
 
 
 def _raw_optional_decimal(value: object, *, field_name: str) -> Decimal | None:
@@ -65,7 +65,7 @@ def _decimal(value: object, *, field_name: str) -> Decimal:
     if not isinstance(value, (Decimal, str)):
         raise ValueError(f"{field_name} must be a decimal value")
     try:
-        result = value if isinstance(value, Decimal) else Decimal(value)
+        result = Decimal(value)
     except (ArithmeticError, TypeError, ValueError) as exc:
         raise ValueError(f"{field_name} must be a decimal value") from exc
     if not result.is_finite():

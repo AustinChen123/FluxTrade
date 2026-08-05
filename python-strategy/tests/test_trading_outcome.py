@@ -1,5 +1,5 @@
 from copy import deepcopy
-from decimal import Decimal
+from decimal import Decimal, DecimalTuple, getcontext, localcontext
 from typing import cast
 
 import pytest
@@ -126,7 +126,7 @@ def test_canonical_decimal_mapping_and_first_difference() -> None:
     assert expected.sha256() == actual.sha256()
     assert expected.first_difference(actual) is None
     changed = deepcopy(_payload())
-    _items(changed, "fills")[0]["fee"] = Decimal("2")
+    _items(changed, "fills")[0]["fee"] = Decimal("-2")
     actual = _outcome(changed)
     difference = expected.first_difference(actual)
     assert expected.sha256() != actual.sha256() and difference is not None
@@ -135,7 +135,83 @@ def test_canonical_decimal_mapping_and_first_difference() -> None:
         difference.kind,
         difference.expected_json,
         difference.actual_json,
-    ) == ("$.fills[0].fee", "value", '["decimal","1"]', '["decimal","2"]')
+    ) == (
+        "$.fills[0].fee",
+        "value",
+        '["decimal",0,"1",0]',
+        '["decimal",1,"2",0]',
+    )
+
+
+class _ForgedTupleDecimal(Decimal):
+    def as_tuple(self) -> DecimalTuple:
+        return Decimal("999.00").as_tuple()
+
+    def is_finite(self) -> bool:
+        return False
+
+    def is_zero(self) -> bool:
+        return True
+
+
+def test_outcome_projects_decimal_subclass_to_base_value() -> None:
+    payload = _payload()
+    cast(dict[str, object], payload["financial"])["equity"] = _ForgedTupleDecimal(
+        "1.25"
+    )
+    outcome = _outcome(payload)
+
+    assert outcome.financial.equity == Decimal("1.25")
+    assert outcome.financial.equity != Decimal("999.00")
+    assert type(outcome.financial.equity) is Decimal
+
+
+def test_extreme_exponents_are_exact_compact_and_digest_distinct() -> None:
+    outcomes = []
+    for value in (Decimal("1E+1000000"), Decimal("1E-1000000")):
+        payload = _payload()
+        cast(dict[str, object], payload["financial"])["equity"] = value
+        outcomes.append(_outcome(payload))
+
+    assert tuple(outcome.financial.equity.as_tuple() for outcome in outcomes) == (
+        Decimal("1E+1000000").as_tuple(),
+        Decimal("1E-1000000").as_tuple(),
+    )
+    assert all(len(outcome.canonical_bytes()) < 2048 for outcome in outcomes)
+    assert outcomes[0].sha256() != outcomes[1].sha256()
+    assert TradingOutcome.schema_version == "fluxtrade.trading_outcome.v2"
+
+
+def test_long_decimal_identity_is_context_independent_and_collision_free() -> None:
+    exact = Decimal(
+        "123456789012345678901234567890123456789012345678901234567890.123456789"
+    )
+    adjacent = Decimal(
+        "123456789012345678901234567890123456789012345678901234567890.123456788"
+    )
+    global_context = str(getcontext())
+    identities: list[tuple[bytes, str]] = []
+
+    for precision in (6, 28, 50):
+        with localcontext() as context:
+            context.prec = precision
+            exact_payload = _payload()
+            cast(dict[str, object], exact_payload["financial"])["equity"] = exact
+            adjacent_payload = _payload()
+            cast(dict[str, object], adjacent_payload["financial"])["equity"] = adjacent
+            outcome = _outcome(exact_payload)
+            changed = _outcome(adjacent_payload)
+
+            assert outcome.financial.equity == exact
+            assert changed.financial.equity == adjacent
+            assert outcome.financial.equity != changed.financial.equity
+            assert outcome.sha256() != changed.sha256()
+            difference = outcome.first_difference(changed)
+            assert difference is not None and difference.path == "$.financial.equity"
+            identities.append((outcome.canonical_bytes(), outcome.sha256()))
+
+    assert len(set(identities)) == 1
+    assert str(getcontext()) == global_context
 
 
 def test_dynamic_int_and_decimal_are_collision_free() -> None:

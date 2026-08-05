@@ -16,11 +16,20 @@ __all__ = ["OutcomeDifference", "TradingOutcome"]
 
 
 def _decimal(value: object) -> Decimal:
-    if not isinstance(value, Decimal) or not value.is_finite():
+    if not isinstance(value, Decimal):
+        raise ValueError("financial values must be finite Decimal instances")
+    value = Decimal(value)
+    if not value.is_finite():
         raise ValueError("financial values must be finite Decimal instances")
     if value.is_zero():
         return Decimal(0)
-    return value.normalize()
+    sign, digits, exponent = value.as_tuple()
+    assert isinstance(exponent, int)
+    trailing_zeros = next(
+        index for index, digit in enumerate(reversed(digits)) if digit
+    )
+    coefficient = digits[:-trailing_zeros] if trailing_zeros else digits
+    return Decimal((sign, coefficient, exponent + trailing_zeros))
 
 
 def _identity(value: str) -> str:
@@ -37,7 +46,10 @@ def _json(value: object) -> str:
     if isinstance(value, int):
         return f'["int","{value}"]'
     if isinstance(value, Decimal):
-        return f'["decimal","{format(_decimal(value), "f")}"]'
+        sign, digits, exponent = _decimal(value).as_tuple()
+        assert isinstance(exponent, int)
+        coefficient = "".join(str(digit) for digit in digits)
+        return f'["decimal",{sign},"{coefficient}",{exponent}]'
     if isinstance(value, str):
         return f'["string",{json.dumps(value, ensure_ascii=False)}]'
     if isinstance(value, (list, tuple)):
@@ -167,7 +179,7 @@ def _difference(
 
 
 class TradingOutcome(_Observation):
-    schema_version: ClassVar[str] = "fluxtrade.trading_outcome.v1"
+    schema_version: ClassVar[str] = "fluxtrade.trading_outcome.v2"
 
     signals: tuple[SignalObservation, ...]
     order_observations: tuple[OrderObservation, ...]

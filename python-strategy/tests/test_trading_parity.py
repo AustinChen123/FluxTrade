@@ -1,5 +1,5 @@
 from copy import deepcopy
-from decimal import Decimal
+from decimal import Decimal, getcontext, localcontext
 
 import pytest
 from pydantic import ValidationError
@@ -160,6 +160,49 @@ def test_decimal_equivalent_outcomes_keep_envelope_identity() -> None:
     right = _run(payload)
     assert left.canonical_bytes() == right.canonical_bytes()
     assert left.sha256() == right.sha256()
+
+
+def test_extreme_decimal_parity_envelope_is_compact_and_digest_sensitive() -> None:
+    runs = []
+    for value in (Decimal("1E+1000000"), Decimal("1E-1000000")):
+        payload = _payload()
+        payload["outcome"] = _outcome(value)
+        runs.append(_run(payload))
+
+    assert tuple(run.outcome.financial.equity.as_tuple() for run in runs) == (
+        Decimal("1E+1000000").as_tuple(),
+        Decimal("1E-1000000").as_tuple(),
+    )
+    assert all(len(run.canonical_bytes()) < 2048 for run in runs)
+    assert runs[0].sha256() != runs[1].sha256()
+    assert TradingParityRun.schema_version == "fluxtrade.trading_parity_run.v2"
+
+
+def test_long_decimal_parity_identity_is_context_independent() -> None:
+    exact = Decimal(
+        "123456789012345678901234567890123456789012345678901234567890.123456789"
+    )
+    adjacent = Decimal(
+        "123456789012345678901234567890123456789012345678901234567890.123456788"
+    )
+    global_context = str(getcontext())
+    identities: list[tuple[bytes, str]] = []
+
+    for precision in (6, 28, 50):
+        with localcontext() as context:
+            context.prec = precision
+            exact_payload = _payload()
+            exact_payload["outcome"] = _outcome(exact)
+            adjacent_payload = _payload()
+            adjacent_payload["outcome"] = _outcome(adjacent)
+            run = _run(exact_payload)
+            changed = _run(adjacent_payload)
+
+            assert run.sha256() != changed.sha256()
+            identities.append((run.canonical_bytes(), run.sha256()))
+
+    assert len(set(identities)) == 1
+    assert str(getcontext()) == global_context
 
 
 @pytest.mark.parametrize(

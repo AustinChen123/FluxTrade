@@ -31,7 +31,7 @@ class TradingParityRun(BaseModel):
     """Strict provenance and outcome identity for one parity matrix cell."""
 
     model_config = ConfigDict(frozen=True, strict=True, extra="forbid")
-    schema_version: ClassVar[str] = "fluxtrade.trading_parity_run.v1"
+    schema_version: ClassVar[str] = "fluxtrade.trading_parity_run.v2"
 
     role: Literal["BL", "BB", "CL", "CB"]
     source_version: Literal["baseline", "candidate"]
