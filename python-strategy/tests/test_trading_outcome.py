@@ -984,33 +984,29 @@ def test_every_top_level_section_is_required(section: str) -> None:
 @pytest.mark.parametrize(
     "section,field",
     [
-        ("signals", field)
-        for field in (
-            "value",
-            "quantity",
-            "price",
-            "stop_loss",
-            "take_profit",
-            "trailing_distance",
-        )
-    ]
-    + [
-        ("order_observations", field)
-        for field in (
-            "parent_logical_order_id",
-            "linked_logical_order_id",
-            "price",
-            "trigger_price",
-            "trailing_distance",
-        )
-    ]
-    + [("journal", "logical_trade_id")],
+        (section, field)
+        for section, (_, fields) in _OBSERVATION_FIELDS.items()
+        for field in fields
+    ],
 )
-def test_every_nullable_observation_field_is_required(section: str, field: str) -> None:
+def test_every_raw_observation_field_is_required_at_exact_path(
+    section: str, field: str
+) -> None:
     missing = _payload()
-    del _items(missing, section)[0][field]
-    with pytest.raises(ValidationError):
+    target = (
+        cast(dict[str, object], missing[section])
+        if section == "financial"
+        else _items(missing, section)[0]
+    )
+    del target[field]
+    expected_location = (
+        (section, field) if section == "financial" else (section, 0, field)
+    )
+    with pytest.raises(ValidationError) as exc_info:
         _outcome(missing)
+    assert [(error["type"], error["loc"]) for error in exc_info.value.errors()] == [
+        ("missing", expected_location)
+    ]
 
 
 def test_empty_and_null_dynamic_values_and_empty_sequence_are_distinct() -> None:
