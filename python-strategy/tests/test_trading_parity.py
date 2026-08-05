@@ -51,7 +51,30 @@ def _payload() -> dict[str, object]:
 
 
 def _run(payload: dict[str, object] | None = None) -> TradingParityRun:
-    return TradingParityRun.model_validate(payload or _payload())
+    return TradingParityRun.model_validate(_payload() if payload is None else payload)
+
+
+def test_run_preserves_explicit_empty_mapping() -> None:
+    with pytest.raises(ValidationError) as exc_info:
+        _run({})
+
+    errors = exc_info.value.errors()
+    assert len(errors) == 12
+    assert {error["loc"] for error in errors} == {
+        ("role",),
+        ("source_version",),
+        ("mode",),
+        ("revision_sha",),
+        ("tree_oid",),
+        ("runtime_source_sha256",),
+        ("input_sha256",),
+        ("configuration_sha256",),
+        ("runner_sha256",),
+        ("loaded_artifact_sha256",),
+        ("native_matcher_sha256",),
+        ("outcome",),
+    }
+    assert all(error["type"] == "missing" for error in errors)
 
 
 @pytest.mark.parametrize(

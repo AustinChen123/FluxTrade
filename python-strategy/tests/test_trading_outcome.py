@@ -94,7 +94,24 @@ def _items(payload: dict[str, object], section: str) -> tuple[dict[str, object],
 
 
 def _outcome(payload: dict[str, object] | None = None) -> TradingOutcome:
-    return TradingOutcome.model_validate(payload or _payload())
+    return TradingOutcome.model_validate(_payload() if payload is None else payload)
+
+
+def test_outcome_preserves_explicit_empty_mapping() -> None:
+    with pytest.raises(ValidationError) as exc_info:
+        _outcome({})
+
+    errors = exc_info.value.errors()
+    assert len(errors) == 6
+    assert {error["loc"] for error in errors} == {
+        ("signals",),
+        ("order_observations",),
+        ("fills",),
+        ("endpoint_state",),
+        ("financial",),
+        ("journal",),
+    }
+    assert all(error["type"] == "missing" for error in errors)
 
 
 def test_canonical_decimal_mapping_and_first_difference() -> None:
