@@ -21,6 +21,7 @@ from pydantic import (
 from pydantic_core import PydanticCustomError
 
 from src.core.backtest.endpoint_state import ReplayEndpointState
+from src.core.canonical_mapping import snapshot_mapping
 
 __all__ = ["OutcomeDifference", "TradingOutcome"]
 
@@ -217,7 +218,10 @@ class _Observation(BaseModel):
     def validate_raw_mapping(cls, value: object) -> object:
         if not isinstance(value, Mapping):
             raise ValueError("canonical models require mapping input")
-        values = dict(value)
+        values = snapshot_mapping(
+            value,
+            invalid_key_error="canonical model field names must be exact strings",
+        )
         if set(values) - set(cls.model_fields):
             raise ValueError("canonical models forbid unexpected fields")
         for field in cls._strings & values.keys():

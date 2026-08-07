@@ -16,6 +16,7 @@ from pydantic import (
 )
 
 from src.core.backtest.endpoint_state import ReplayEndpointState
+from src.core.canonical_mapping import snapshot_mapping
 from src.validation.trading_outcome import (
     FillObservation,
     FinancialOutcome,
@@ -95,7 +96,10 @@ class TradingParityRun(BaseModel):
     def require_outcome_instance(cls, data: object) -> object:
         if not isinstance(data, Mapping):
             raise ValueError("parity runs require mapping input")
-        projected = dict(data)
+        projected = snapshot_mapping(
+            data,
+            invalid_key_error="parity run field names must be exact strings",
+        )
         if set(projected) - set(cls.model_fields):
             raise ValueError("parity runs forbid unexpected fields")
         for field in cls._string_fields & projected.keys():
