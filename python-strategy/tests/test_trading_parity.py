@@ -22,6 +22,14 @@ class _FalseyModelExtra(dict[str, object]):
         return False
 
 
+class _CleanTradingParityRun(TradingParityRun):
+    pass
+
+
+class _SemanticTradingParityRun(TradingParityRun):
+    semantic_field: str
+
+
 def _outcome(equity: Decimal = Decimal("1002")) -> TradingOutcome:
     return TradingOutcome.model_validate(
         {
@@ -558,37 +566,119 @@ def test_direct_parity_run_rejects_model_extra(hidden: dict[str, object]) -> Non
         TradingParityRun.model_validate(exact)
 
 
-@pytest.mark.parametrize("hidden", [None, {}], ids=["none", "empty_dict"])
-def test_parity_subclass_self_validation_preserves_clean_identity(
-    hidden: dict[str, object] | None,
+SUBCLASS_ERROR = "TradingParityRun subclasses are unsupported"
+SUBCLASS_CASES = [
+    pytest.param(_CleanTradingParityRun, {}, id="clean"),
+    pytest.param(
+        _SemanticTradingParityRun,
+        {"semantic_field": "semantic-one"},
+        id="semantic",
+    ),
+]
+
+
+def _assert_subclass_validation_error(
+    exc_info: pytest.ExceptionInfo[ValidationError],
 ) -> None:
-    expected = _run()
-    subclass = type("FreshTradingParityRun", (TradingParityRun,), {})
-    exact = subclass.model_construct(**expected.__dict__)
-    object.__setattr__(exact, "__pydantic_extra__", hidden)
-    actual = subclass.model_validate(exact)
-    assert type(actual) is subclass
-    assert actual.model_extra is None
-    assert actual.canonical_bytes() == expected.canonical_bytes()
-    assert actual.sha256() == expected.sha256()
+    errors = exc_info.value.errors(include_url=False)
+    assert len(errors) == 1
+    error = errors[0]
+    context = error.get("ctx")
+    assert error["loc"] == () and context is not None
+    cause = context["error"]
+    assert (type(cause), str(cause)) == (ValueError, SUBCLASS_ERROR)
+
+
+def _construct_subclass(
+    subclass: type[TradingParityRun], extra: dict[str, object]
+) -> TradingParityRun:
+    if subclass is _SemanticTradingParityRun:
+        semantic = extra["semantic_field"]
+        assert type(semantic) is str
+        return subclass.model_construct(**_run().__dict__, semantic_field=semantic)
+    return subclass.model_construct(**_run().__dict__)
+
+
+@pytest.mark.parametrize("subclass,extra", SUBCLASS_CASES)
+@pytest.mark.parametrize("entrypoint", ["constructor", "model_validate"])
+def test_parity_subclasses_reject_normal_validation(
+    subclass: type[TradingParityRun],
+    extra: dict[str, object],
+    entrypoint: Literal["constructor", "model_validate"],
+) -> None:
+    payload = {**_payload(), **extra}
+    with pytest.raises(ValidationError) as exc_info:
+        if entrypoint == "constructor":
+            if subclass is _SemanticTradingParityRun:
+                semantic = extra["semantic_field"]
+                assert type(semantic) is str
+                subclass(**_run().__dict__, semantic_field=semantic)
+            else:
+                subclass(**_run().__dict__)
+        else:
+            subclass.model_validate(payload)
+    _assert_subclass_validation_error(exc_info)
 
 
 @pytest.mark.parametrize(
-    "hidden",
+    "subclass", [_CleanTradingParityRun, _SemanticTradingParityRun]
+)
+@pytest.mark.parametrize("entrypoint", ["constructor", "model_validate"])
+def test_subclass_gate_precedes_empty_payload_validation(
+    subclass: type[TradingParityRun],
+    entrypoint: Literal["constructor", "model_validate"],
+) -> None:
+    empty_payload = _run().__dict__.copy()
+    empty_payload.clear()
+    assert empty_payload == {}
+    with pytest.raises(ValidationError) as exc_info:
+        if entrypoint == "constructor":
+            subclass(**empty_payload)
+        else:
+            subclass.model_validate(empty_payload)
+    _assert_subclass_validation_error(exc_info)
+
+
+@pytest.mark.parametrize("subclass,extra", SUBCLASS_CASES)
+def test_base_owner_rejects_parity_subclass_instance(
+    subclass: type[TradingParityRun], extra: dict[str, object]
+) -> None:
+    instance = _construct_subclass(subclass, extra)
+    with pytest.raises(ValidationError) as exc_info:
+        TradingParityRun.model_validate(instance)
+    _assert_subclass_validation_error(exc_info)
+
+
+@pytest.mark.parametrize(
+    "subclass,extra",
     [
-        pytest.param(_FalseyModelExtra(unexpected="accepted"), id="falsey_nonempty"),
-        pytest.param({"unexpected": "accepted"}, id="truthy_nonempty"),
+        pytest.param(_CleanTradingParityRun, {}, id="clean"),
+        pytest.param(
+            _SemanticTradingParityRun,
+            {"semantic_field": "semantic-one"},
+            id="semantic_one",
+        ),
+        pytest.param(
+            _SemanticTradingParityRun,
+            {"semantic_field": "semantic-two"},
+            id="semantic_two",
+        ),
     ],
 )
-def test_parity_subclass_self_validation_rejects_nonempty_extra(
-    hidden: dict[str, object],
+@pytest.mark.parametrize("copied", [False, True], ids=["construct", "copy"])
+@pytest.mark.parametrize("method", ["canonical_bytes", "sha256"])
+def test_direct_parity_subclasses_cannot_emit_identity(
+    subclass: type[TradingParityRun],
+    extra: dict[str, object],
+    copied: bool,
+    method: Literal["canonical_bytes", "sha256"],
 ) -> None:
-    expected = _run()
-    subclass = type("FreshTradingParityRun", (TradingParityRun,), {})
-    exact = subclass.model_construct(**expected.__dict__)
-    object.__setattr__(exact, "__pydantic_extra__", hidden)
-    with pytest.raises(ValidationError):
-        subclass.model_validate(exact)
+    instance = _construct_subclass(subclass, extra)
+    if copied:
+        instance = instance.model_copy()
+    with pytest.raises(ValueError) as exc_info:
+        getattr(instance, method)()
+    assert (type(exc_info.value), str(exc_info.value)) == (ValueError, SUBCLASS_ERROR)
 
 
 def test_fixed_multibyte_v2_outcome_and_parity_identity() -> None:

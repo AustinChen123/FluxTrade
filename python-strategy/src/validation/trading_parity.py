@@ -40,6 +40,7 @@ _Sha256Identity = Annotated[
     str,
     StringConstraints(strict=True, pattern=r"^[0-9a-f]{64}$"),
 ]
+_SUBCLASS_ERROR = "TradingParityRun subclasses are unsupported"
 
 
 class TradingParityRun(BaseModel):
@@ -83,6 +84,10 @@ class TradingParityRun(BaseModel):
     def reject_direct_model_extra(
         cls, value: object, handler: ModelWrapValidatorHandler[Self]
     ) -> Self:
+        if cls is not TradingParityRun or (
+            type(value) is not TradingParityRun and isinstance(value, TradingParityRun)
+        ):
+            raise ValueError(_SUBCLASS_ERROR)
         if (
             cls is TradingParityRun
             and type(value) is cls
@@ -147,6 +152,8 @@ class TradingParityRun(BaseModel):
         return self
 
     def canonical_bytes(self) -> bytes:
+        if type(self) is not TradingParityRun:
+            raise ValueError(_SUBCLASS_ERROR)
         values = [
             self.schema_version,
             self.role,
