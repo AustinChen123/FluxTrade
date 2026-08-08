@@ -7,7 +7,6 @@ used by replay runners; source-specific identifiers are intentionally omitted.
 
 from collections.abc import Iterable, Mapping
 from decimal import Decimal
-from enum import Enum
 from types import MappingProxyType
 
 from pydantic import ConfigDict, Field, computed_field, field_validator, model_validator
@@ -98,28 +97,38 @@ def _optional_decimal(value: object | None, *, field_name: str) -> Decimal | Non
 
 
 def _position_side(value: object) -> PositionSide:
-    if isinstance(value, PositionSide):
+    if type(value) is PositionSide:
         return value
-    raw = value.value if isinstance(value, Enum) else value
+    if type(value) is not str:
+        raise ValueError("position side must be a PositionSide or string")
     try:
-        return PositionSide(str(raw).strip().upper())
+        return PositionSide(str.upper(str.strip(value)))
     except ValueError as exc:
-        raise ValueError(f"unsupported position side: {value!r}") from exc
+        raise ValueError(f"unsupported position side: {str.__repr__(value)}") from exc
 
 
 def _order_type(value: object) -> str:
-    raw = value.value if isinstance(value, Enum) else value
-    normalized = str(raw).strip().upper().replace(" ", "_")
+    if type(value) is not str:
+        raise ValueError("order type must be a string")
+    normalized = str.replace(str.upper(str.strip(value)), " ", "_")
     if normalized not in _ORDER_TYPES:
-        raise ValueError(f"unsupported order type: {value!r}")
+        raise ValueError(f"unsupported order type: {str.__repr__(value)}")
     return normalized
 
 
 def _order_side(value: object, *, order_type: str) -> OrderSide:
-    if isinstance(value, OrderSide):
+    if type(value) is OrderSide:
         return value
-    raw = value.value if isinstance(value, Enum) else value
-    normalized = str(raw).strip().upper()
+    if type(value) is PositionSide:
+        position_side = value
+        return (
+            OrderSide.closing_side(position_side)
+            if order_type in _PROTECTION_ORDER_TYPES
+            else OrderSide.from_position_side(position_side)
+        )
+    if type(value) is not str:
+        raise ValueError("order side must be an OrderSide, PositionSide, or string")
+    normalized = str.upper(str.strip(value))
     if normalized == "BUY":
         return OrderSide.BUY
     if normalized == "SELL":
@@ -129,7 +138,7 @@ def _order_side(value: object, *, order_type: str) -> OrderSide:
         if order_type in _PROTECTION_ORDER_TYPES:
             return OrderSide.closing_side(position_side)
         return OrderSide.from_position_side(position_side)
-    raise ValueError(f"unsupported order side: {value!r}")
+    raise ValueError(f"unsupported order side: {str.__repr__(value)}")
 
 
 def _timestamp(value: object, *, field_name: str) -> int:
