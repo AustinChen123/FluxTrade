@@ -154,6 +154,10 @@ class TradingParityRun(BaseModel):
     def canonical_bytes(self) -> bytes:
         if type(self) is not TradingParityRun:
             raise ValueError(_SUBCLASS_ERROR)
+        if self.model_extra is not None:
+            raise ValueError("parity run contains unexpected fields")
+        validated = TradingParityRun.model_validate(dict(self.__dict__))
+        self = validated
         values = [
             self.schema_version,
             self.role,

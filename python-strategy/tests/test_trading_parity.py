@@ -30,6 +30,58 @@ class _SemanticTradingParityRun(TradingParityRun):
     semantic_field: str
 
 
+class _CleanTradingOutcome(TradingOutcome):
+    pass
+
+
+class _HostileIdentity(str):
+    calls: list[str]
+
+    def __new__(cls, value: str) -> "_HostileIdentity":
+        instance = super().__new__(cls, value)
+        instance.calls = []
+        return instance
+
+    def strip(self, chars: str | None = None) -> str:
+        self.calls.append("strip")
+        return str.strip(self, chars)
+
+    def encode(self, encoding: str = "utf-8", errors: str = "strict") -> bytes:
+        self.calls.append("encode")
+        return str.encode(self, encoding, errors)
+
+    def __hash__(self) -> int:
+        self.calls.append("hash")
+        return str.__hash__(self)
+
+    def __eq__(self, other: object) -> bool:
+        self.calls.append("eq")
+        return str.__eq__(self, other)
+
+    def __repr__(self) -> str:
+        self.calls.append("repr")
+        return str.__repr__(self)
+
+    def __format__(self, format_spec: str) -> str:
+        self.calls.append("format")
+        return str.__format__(self, format_spec)
+
+
+PARITY_STRING_FIELDS = (
+    "role",
+    "source_version",
+    "mode",
+    "revision_sha",
+    "tree_oid",
+    "runtime_source_sha256",
+    "input_sha256",
+    "configuration_sha256",
+    "runner_sha256",
+    "loaded_artifact_sha256",
+    "native_matcher_sha256",
+)
+
+
 def _outcome(equity: Decimal = Decimal("1002")) -> TradingOutcome:
     return TradingOutcome.model_validate(
         {
@@ -143,6 +195,38 @@ def _outcome_construct(
         del values[omit]
     values.update({} if changes is None else changes)
     return TradingOutcome.model_construct(**values)
+
+
+def _direct_run(
+    method: Literal["model_copy", "model_construct"],
+    *,
+    changes: dict[str, object] | None = None,
+) -> TradingParityRun:
+    valid = _run()
+    if method == "model_copy":
+        return valid.model_copy(update={} if changes is None else changes)
+    values = dict(valid.__dict__)
+    values.update({} if changes is None else changes)
+    return TradingParityRun.model_construct(**values)
+
+
+def _assert_root_cause(
+    exc_info: pytest.ExceptionInfo[ValueError | ValidationError],
+    message: str,
+    loc: tuple[str, ...] = (),
+) -> None:
+    assert isinstance(exc_info.value, ValidationError)
+    assert exc_info.value.title == "TradingParityRun"
+    errors = exc_info.value.errors(include_input=False, include_url=False)
+    assert len(errors) == 1
+    error = errors[0]
+    context = error.get("ctx")
+    assert error["loc"] == loc
+    assert error["type"] == "value_error"
+    assert error["msg"] == f"Value error, {message}"
+    assert context is not None
+    cause = context["error"]
+    assert (type(cause), str(cause)) == (ValueError, message)
 
 
 def test_all_legal_parity_cells_have_unique_canonical_identity() -> None:
@@ -564,6 +648,246 @@ def test_direct_parity_run_rejects_model_extra(hidden: dict[str, object]) -> Non
     assert exact.model_extra is hidden
     with pytest.raises(ValidationError):
         TradingParityRun.model_validate(exact)
+
+
+@pytest.mark.parametrize("field", list(TradingParityRun.model_fields))
+@pytest.mark.parametrize("identity_method", ["canonical_bytes", "sha256"])
+def test_direct_missing_parity_field_has_structured_validation_error(
+    field: str, identity_method: Literal["canonical_bytes", "sha256"]
+) -> None:
+    values = dict(_run().__dict__)
+    del values[field]
+    corrupt = TradingParityRun.model_construct(**values)
+
+    with pytest.raises(ValidationError) as exc_info:
+        getattr(corrupt, identity_method)()
+
+    assert exc_info.value.errors(include_input=False, include_url=False) == [
+        {"type": "missing", "loc": (field,), "msg": "Field required"}
+    ]
+
+
+@pytest.mark.parametrize("method", ["model_copy", "model_construct"])
+@pytest.mark.parametrize("identity_method", ["canonical_bytes", "sha256"])
+@pytest.mark.parametrize(
+    "field,value,error_type,message,context",
+    [
+        pytest.param(
+            "role",
+            "XX",
+            "literal_error",
+            "Input should be 'BL', 'BB', 'CL' or 'CB'",
+            {"expected": "'BL', 'BB', 'CL' or 'CB'"},
+            id="role_literal",
+        ),
+        pytest.param(
+            "source_version",
+            "other",
+            "literal_error",
+            "Input should be 'baseline' or 'candidate'",
+            {"expected": "'baseline' or 'candidate'"},
+            id="source_literal",
+        ),
+        pytest.param(
+            "mode",
+            "other",
+            "literal_error",
+            "Input should be 'live_like' or 'backtest'",
+            {"expected": "'live_like' or 'backtest'"},
+            id="mode_literal",
+        ),
+        pytest.param(
+            "revision_sha",
+            "NOT-A-SHA",
+            "string_pattern_mismatch",
+            "String should match pattern '^(?:[0-9a-f]{40}|[0-9a-f]{64})$'",
+            {"pattern": "^(?:[0-9a-f]{40}|[0-9a-f]{64})$"},
+            id="git_sha_pattern",
+        ),
+        pytest.param(
+            "input_sha256",
+            "NOT-A-SHA",
+            "string_pattern_mismatch",
+            "String should match pattern '^[0-9a-f]{64}$'",
+            {"pattern": "^[0-9a-f]{64}$"},
+            id="sha256_pattern",
+        ),
+    ],
+)
+def test_direct_invalid_parity_field_has_structured_validation_error(
+    method: Literal["model_copy", "model_construct"],
+    identity_method: Literal["canonical_bytes", "sha256"],
+    field: str,
+    value: str,
+    error_type: str,
+    message: str,
+    context: dict[str, str],
+) -> None:
+    corrupt = _direct_run(method, changes={field: value})
+
+    with pytest.raises(ValidationError) as exc_info:
+        getattr(corrupt, identity_method)()
+
+    assert exc_info.value.errors(include_input=False, include_url=False) == [
+        {"type": error_type, "loc": (field,), "msg": message, "ctx": context}
+    ]
+
+
+@pytest.mark.parametrize("method", ["model_copy", "model_construct"])
+@pytest.mark.parametrize("identity_method", ["canonical_bytes", "sha256"])
+def test_direct_parity_matrix_mismatch_has_structured_validation_error(
+    method: Literal["model_copy", "model_construct"],
+    identity_method: Literal["canonical_bytes", "sha256"],
+) -> None:
+    corrupt = _direct_run(method, changes={"mode": "backtest"})
+
+    with pytest.raises(ValidationError) as exc_info:
+        getattr(corrupt, identity_method)()
+
+    _assert_root_cause(
+        exc_info,
+        "role, source_version, and mode must identify one exact parity cell",
+    )
+
+
+@pytest.mark.parametrize("method", ["model_copy", "model_construct"])
+@pytest.mark.parametrize("identity_method", ["canonical_bytes", "sha256"])
+@pytest.mark.parametrize("field", PARITY_STRING_FIELDS)
+def test_direct_parity_rejects_hostile_string_subclass_before_operations(
+    method: Literal["model_copy", "model_construct"],
+    identity_method: Literal["canonical_bytes", "sha256"],
+    field: str,
+) -> None:
+    hostile = _HostileIdentity(str(getattr(_run(), field)))
+    corrupt = _direct_run(method, changes={field: hostile})
+    assert hostile.calls == []
+
+    with pytest.raises(ValidationError) as exc_info:
+        getattr(corrupt, identity_method)()
+
+    _assert_root_cause(exc_info, f"{field} must be a string")
+    assert hostile.calls == []
+
+
+def test_parity_string_field_ledger_matches_owner() -> None:
+    assert set(PARITY_STRING_FIELDS) == TradingParityRun._string_fields
+
+
+@pytest.mark.parametrize(
+    "hidden",
+    [
+        pytest.param(_FalseyModelExtra(unexpected="accepted"), id="falsey"),
+        pytest.param({"unexpected": "accepted"}, id="truthy"),
+    ],
+)
+@pytest.mark.parametrize("identity_method", ["canonical_bytes", "sha256"])
+def test_direct_parity_identity_rejects_model_extra(
+    hidden: dict[str, object],
+    identity_method: Literal["canonical_bytes", "sha256"],
+) -> None:
+    corrupt = _run().model_copy()
+    object.__setattr__(corrupt, "__pydantic_extra__", hidden)
+    assert corrupt.model_extra is hidden
+
+    with pytest.raises(ValueError) as exc_info:
+        getattr(corrupt, identity_method)()
+
+    assert (type(exc_info.value), str(exc_info.value)) == (
+        ValueError,
+        "parity run contains unexpected fields",
+    )
+
+
+@pytest.mark.parametrize("method", ["model_copy", "model_construct"])
+@pytest.mark.parametrize("identity_method", ["canonical_bytes", "sha256"])
+@pytest.mark.parametrize("case", ["raw_mapping", "subclass"])
+def test_direct_parity_rejects_nonexact_outcome_with_structured_error(
+    method: Literal["model_copy", "model_construct"],
+    identity_method: Literal["canonical_bytes", "sha256"],
+    case: Literal["raw_mapping", "subclass"],
+) -> None:
+    valid = _outcome()
+    outcome: object = (
+        valid.model_dump()
+        if case == "raw_mapping"
+        else _CleanTradingOutcome.model_construct(**valid.__dict__)
+    )
+    corrupt = _direct_run(method, changes={"outcome": outcome})
+
+    with pytest.raises(ValidationError) as exc_info:
+        getattr(corrupt, identity_method)()
+
+    _assert_root_cause(exc_info, "outcome must be an exact TradingOutcome")
+
+
+@pytest.mark.parametrize("method", ["model_copy", "model_construct"])
+@pytest.mark.parametrize("identity_method", ["canonical_bytes", "sha256"])
+@pytest.mark.parametrize(
+    "case,expected_loc,expected_message",
+    [
+        pytest.param(
+            "raw_financial",
+            (),
+            "outcome summaries must have exact canonical types",
+            id="raw_financial",
+        ),
+        pytest.param(
+            "missing_financial",
+            (),
+            "outcome summaries must have exact canonical types",
+            id="missing_financial",
+        ),
+        pytest.param(
+            "float_equity",
+            ("financial", "equity"),
+            "financial values must be finite Decimal instances",
+            id="float_equity",
+        ),
+        pytest.param(
+            "falsey_extra",
+            (),
+            "outcome contains unexpected fields",
+            id="falsey_extra",
+        ),
+        pytest.param(
+            "truthy_extra",
+            (),
+            "outcome contains unexpected fields",
+            id="truthy_extra",
+        ),
+    ],
+)
+def test_direct_parity_keeps_corrupt_exact_outcome_fail_closed(
+    method: Literal["model_copy", "model_construct"],
+    identity_method: Literal["canonical_bytes", "sha256"],
+    case: str,
+    expected_loc: tuple[str, ...],
+    expected_message: str,
+) -> None:
+    valid = _outcome()
+    if case == "raw_financial":
+        outcome = _outcome_construct(
+            valid, changes={"financial": dict(valid.financial.__dict__)}
+        )
+    elif case == "missing_financial":
+        outcome = _outcome_construct(valid, omit="financial")
+    elif case == "float_equity":
+        financial = valid.financial.model_copy(update={"equity": 1002.0})
+        outcome = _outcome_construct(valid, changes={"financial": financial})
+    else:
+        outcome = _outcome_construct(valid)
+        hidden: dict[str, object] = (
+            _FalseyModelExtra(unexpected="accepted")
+            if case == "falsey_extra"
+            else {"unexpected": "accepted"}
+        )
+        object.__setattr__(outcome, "__pydantic_extra__", hidden)
+    corrupt = _direct_run(method, changes={"outcome": outcome})
+
+    with pytest.raises(ValidationError) as exc_info:
+        getattr(corrupt, identity_method)()
+
+    _assert_root_cause(exc_info, expected_message, expected_loc)
 
 
 SUBCLASS_ERROR = "TradingParityRun subclasses are unsupported"
