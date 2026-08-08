@@ -86,7 +86,7 @@ def _decimal(value: object, *, field_name: str) -> Decimal:
 
 
 def _identity(value: object, *, field_name: str) -> str:
-    if not isinstance(value, str) or not value.strip():
+    if type(value) is not str or not str.strip(value):
         raise ValueError(f"{field_name} must be a non-empty string")
     return value
 
@@ -161,9 +161,9 @@ class EndpointPosition(BaseFluxModel):
     @field_validator("strategy_id", "product_id", mode="before")
     @classmethod
     def validate_identity(cls, value: object) -> str:
-        if not isinstance(value, str) or not value.strip():
+        if type(value) is not str or not str.strip(value):
             raise ValueError("endpoint identity must be a non-empty string")
-        value.encode("utf-8")
+        str.encode(value, "utf-8")
         return value
 
     @field_validator("side", mode="before")
@@ -215,9 +215,9 @@ class EndpointOrder(BaseFluxModel):
     @field_validator("strategy_id", "product_id", mode="before")
     @classmethod
     def validate_identity(cls, value: object) -> str:
-        if not isinstance(value, str) or not value.strip():
+        if type(value) is not str or not str.strip(value):
             raise ValueError("endpoint identity must be a non-empty string")
-        value.encode("utf-8")
+        str.encode(value, "utf-8")
         return value
 
     @field_validator("side", mode="before")
@@ -230,7 +230,7 @@ class EndpointOrder(BaseFluxModel):
     @field_validator("order_type", mode="before")
     @classmethod
     def validate_order_type(cls, value: object) -> str:
-        if not isinstance(value, str):
+        if type(value) is not str:
             raise ValueError("endpoint order type must be a string")
         if value not in _ORDER_TYPES:
             raise ValueError(f"unsupported order type: {value!r}")
