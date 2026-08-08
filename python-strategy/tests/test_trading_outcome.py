@@ -1258,3 +1258,315 @@ def test_dynamic_json_preserves_valid_multibyte_utf8_bytes(
     outcome = _outcome(payload)
     assert getattr(_observation(outcome, section), field).encode() == expected.encode()
     assert _MULTIBYTE.encode() in outcome.canonical_bytes()
+
+
+class _SemanticTradingOutcome(TradingOutcome):
+    semantic_field: str
+
+
+_SUBCLASS_ERROR = "TradingOutcome subclasses are unsupported"
+_EXTRA_ERROR = "TradingOutcome contains unexpected fields"
+_OBSERVATION_ERROR = "TradingOutcome observations must have exact canonical types"
+_SUMMARY_ERROR = "TradingOutcome summaries must have exact canonical types"
+_MONEY_ERROR = "financial values must be finite Decimal instances"
+_GOLDEN_SHA256 = "05faee5ac0518a1f060775e78993d701b272487391753bbb2c5f4ff95d311a09"
+_GOLDEN_BYTES = b'["map",[["endpoint_state",["map",[["end_timestamp",["int","3"]],["final_mark",["decimal",0,"1",2]],["halted_early",["bool",false]],["positions",["tuple",[]]],["working_orders",["tuple",[]]]]]],["fills",["tuple",[["map",[["fee",["decimal",0,"1",0]],["fill_type",["string","entry"]],["logical_order_id",["string","order-1"]],["price",["decimal",0,"1",2]],["product_id",["string","MNQ"]],["quantity",["decimal",0,"2",0]],["side",["string","buy"]],["strategy_id",["string","s"]],["timestamp_ms",["int","3"]]]]]]],["financial",["map",[["equity",["decimal",0,"1002",0]],["fees",["decimal",0,"1",0]],["realized_pnl",["decimal",0,"0",0]],["unrealized_pnl",["decimal",0,"2",0]]]]],["journal",["tuple",[["map",[["data_json",["string","[\\"map\\",[[\\"price\\",[\\"decimal\\",0,\\"1\\",2]]]]"]],["logical_trade_id",["string","trade-1"]],["strategy_id",["string","s"]],["tag",["string","fill"]],["timestamp_ms",["int","4"]]]]]]],["order_observations",["tuple",[["map",[["filled_quantity",["decimal",0,"0",0]],["linked_logical_order_id",["null"]],["logical_order_id",["string","order-1"]],["order_type",["string","LIMIT"]],["parent_logical_order_id",["null"]],["phase",["string","submitted"]],["price",["decimal",0,"1",2]],["product_id",["string","MNQ"]],["quantity",["decimal",0,"2",0]],["side",["string","buy"]],["status",["string","NEW"]],["strategy_id",["string","s"]],["timestamp_ms",["int","2"]],["trailing_distance",["null"]],["trigger_price",["null"]]]]]]],["schema_version",["string","fluxtrade.trading_outcome.v2"]],["signals",["tuple",[["map",[["metadata_json",["string","[\\"map\\",[[\\"a\\",[\\"list\\",[[\\"bool\\",true],[\\"null\\"]]]],[\\"z\\",[\\"decimal\\",0,\\"0\\",0]]]]"]],["price",["null"]],["product_id",["string","MNQ"]],["quantity",["decimal",0,"2",0]],["signal_type",["string","LONG"]],["stop_loss",["null"]],["strategy_id",["string","s"]],["take_profit",["null"]],["timeframe",["string","5m"]],["timestamp_ms",["int","1"]],["trailing_distance",["null"]],["value",["decimal",0,"1",0]]]]]]]]]'
+_SHAPE_CASES = [
+    pytest.param("signals", "list", _OBSERVATION_ERROR, id="signals_list"),
+    pytest.param("signals", "raw", _OBSERVATION_ERROR, id="signals_raw_child"),
+    pytest.param("order_observations", "list", _OBSERVATION_ERROR, id="orders_list"),
+    pytest.param("order_observations", "raw", _OBSERVATION_ERROR, id="orders_raw"),
+    pytest.param("fills", "list", _OBSERVATION_ERROR, id="fills_list"),
+    pytest.param("fills", "raw", _OBSERVATION_ERROR, id="fills_raw_child"),
+    pytest.param("journal", "list", _OBSERVATION_ERROR, id="journal_list"),
+    pytest.param("journal", "raw", _OBSERVATION_ERROR, id="journal_raw_child"),
+    pytest.param("endpoint_state", "raw", _SUMMARY_ERROR, id="endpoint_raw_dict"),
+    pytest.param("financial", "raw", _SUMMARY_ERROR, id="financial_raw_dict"),
+]
+
+
+def test_valid_fixture_matches_literal_canonical_identity() -> None:
+    valid = _outcome()
+    assert valid.canonical_bytes() == _GOLDEN_BYTES
+    assert valid.sha256() == _GOLDEN_SHA256
+
+
+def _direct_shape_corruption(field: str, variant: str) -> TradingOutcome:
+    valid = _outcome()
+    if variant == "list":
+        changed = list(getattr(valid, field))
+    elif field in {"endpoint_state", "financial"}:
+        changed = getattr(valid, field).model_dump()
+    else:
+        changed = (_items(_payload(), field)[0],)
+    return valid.model_copy(update={field: changed})
+
+
+def _assert_direct_identity_error(
+    outcome: TradingOutcome,
+    method: Literal["canonical_bytes", "sha256"],
+    message: str,
+) -> None:
+    with pytest.raises(ValueError) as exc_info:
+        getattr(outcome, method)()
+    assert (type(exc_info.value), str(exc_info.value)) == (ValueError, message)
+
+
+@pytest.mark.parametrize("field,variant,message", _SHAPE_CASES)
+@pytest.mark.parametrize("method", ["canonical_bytes", "sha256"])
+def test_direct_identity_rejects_invalid_graph_shape(
+    field: str,
+    variant: str,
+    message: str,
+    method: Literal["canonical_bytes", "sha256"],
+) -> None:
+    _assert_direct_identity_error(
+        _direct_shape_corruption(field, variant), method, message
+    )
+
+
+@pytest.mark.parametrize(
+    "field", list(TradingOutcome.model_fields), ids=list(TradingOutcome.model_fields)
+)
+@pytest.mark.parametrize("method", ["canonical_bytes", "sha256"])
+def test_direct_identity_rejects_missing_top_level_field(
+    field: str, method: Literal["canonical_bytes", "sha256"]
+) -> None:
+    values = dict(_outcome().__dict__)
+    del values[field]
+    corrupt = TradingOutcome.model_construct(**values)
+    message = (
+        _SUMMARY_ERROR
+        if field in {"endpoint_state", "financial"}
+        else _OBSERVATION_ERROR
+    )
+    _assert_direct_identity_error(corrupt, method, message)
+
+
+@pytest.mark.parametrize(
+    "extra",
+    [
+        pytest.param(_FalseyModelExtra(unexpected="accepted"), id="falsey"),
+        pytest.param({"unexpected": "accepted"}, id="truthy"),
+    ],
+)
+@pytest.mark.parametrize("method", ["canonical_bytes", "sha256"])
+def test_direct_identity_rejects_model_extra(
+    extra: dict[str, object], method: Literal["canonical_bytes", "sha256"]
+) -> None:
+    corrupt = _outcome()
+    object.__setattr__(corrupt, "__pydantic_extra__", extra)
+    assert corrupt.model_extra is extra
+    _assert_direct_identity_error(corrupt, method, _EXTRA_ERROR)
+
+
+_CONTENT_CASES = [
+    pytest.param(
+        "signals", "value", 1.0, ("signals", 0, "value"), _MONEY_ERROR, id="signals"
+    ),
+    pytest.param(
+        "order_observations",
+        "quantity",
+        1.0,
+        ("order_observations", 0, "quantity"),
+        _MONEY_ERROR,
+        id="orders",
+    ),
+    pytest.param(
+        "fills", "price", 1.0, ("fills", 0, "price"), _MONEY_ERROR, id="fills"
+    ),
+    pytest.param(
+        "journal",
+        "strategy_id",
+        None,
+        ("journal", 0, "strategy_id"),
+        None,
+        id="journal_missing",
+    ),
+    pytest.param(
+        "endpoint_state",
+        "quantity",
+        1.0,
+        ("endpoint_state", "positions", 0, "quantity"),
+        "endpoint position quantity must be a Decimal",
+        id="endpoint",
+    ),
+    pytest.param(
+        "financial",
+        "equity",
+        1002.0,
+        ("financial", "equity"),
+        _MONEY_ERROR,
+        id="financial",
+    ),
+]
+
+
+def _direct_content_corruption(
+    owner: str, child_field: str, invalid: object, method: str
+) -> TradingOutcome:
+    valid = _endpoint_outcome() if owner == "endpoint_state" else _outcome()
+    if owner == "journal":
+        journal = valid.journal[0]
+        values = {
+            field: value
+            for field, value in journal.__dict__.items()
+            if field != child_field
+        }
+        if method == "model_copy":
+            changed = journal.model_copy()
+            object.__setattr__(changed, "__dict__", values)
+        else:
+            changed = JournalObservation.model_construct(**values)
+        return valid.model_copy(update={"journal": (changed,)})
+    if owner == "endpoint_state":
+        position = valid.endpoint_state.positions[0]
+        changed = _corrupt(position, method, child_field, invalid)
+        endpoint = valid.endpoint_state.model_copy(update={"positions": (changed,)})
+        return valid.model_copy(update={"endpoint_state": endpoint})
+    child = getattr(valid, owner)
+    if owner != "financial":
+        child = child[0]
+    changed = _corrupt(child, method, child_field, invalid)
+    return valid.model_copy(
+        update={owner: changed if owner == "financial" else (changed,)}
+    )
+
+
+@pytest.mark.parametrize(
+    "owner,child_field,invalid,expected_loc,cause_message", _CONTENT_CASES
+)
+@pytest.mark.parametrize("child_method", ["model_copy", "model_construct"])
+@pytest.mark.parametrize("identity_method", ["canonical_bytes", "sha256"])
+def test_direct_identity_revalidates_exact_child_content(
+    owner: str,
+    child_field: str,
+    invalid: object,
+    expected_loc: tuple[str | int, ...],
+    cause_message: str | None,
+    child_method: str,
+    identity_method: Literal["canonical_bytes", "sha256"],
+) -> None:
+    corrupt = _direct_content_corruption(owner, child_field, invalid, child_method)
+    with pytest.raises(ValidationError) as exc_info:
+        getattr(corrupt, identity_method)()
+    errors = exc_info.value.errors(include_url=False)
+    assert len(errors) == 1
+    error = errors[0]
+    assert error["loc"] == expected_loc
+    if cause_message is None:
+        assert (error["type"], error["msg"], error.get("ctx")) == (
+            "missing",
+            "Field required",
+            None,
+        )
+    else:
+        context = error.get("ctx")
+        assert context is not None
+        cause = context["error"]
+        assert (error["type"], error["msg"]) == (
+            "value_error",
+            f"Value error, {cause_message}",
+        )
+        assert (type(cause), str(cause)) == (ValueError, cause_message)
+
+
+class _HostileIdentity(str):
+    calls: list[str]
+
+    def __new__(cls, value: str) -> "_HostileIdentity":
+        instance = super().__new__(cls, value)
+        instance.calls = []
+        return instance
+
+    def strip(self, chars: str | None = None) -> str:
+        self.calls.append("strip")
+        return str.strip(self, chars)
+
+    def encode(self, encoding: str = "utf-8", errors: str = "strict") -> bytes:
+        self.calls.append("encode")
+        return str.encode(self, encoding, errors)
+
+    def __hash__(self) -> int:
+        self.calls.append("hash")
+        return str.__hash__(self)
+
+    def __eq__(self, other: object) -> bool:
+        self.calls.append("eq")
+        return str.__eq__(self, other)
+
+    def __repr__(self) -> str:
+        self.calls.append("repr")
+        return str.__repr__(self)
+
+    def __format__(self, format_spec: str) -> str:
+        self.calls.append("format")
+        return str.__format__(self, format_spec)
+
+
+@pytest.mark.parametrize("owner", ["signals", "order_observations", "fills", "journal"])
+@pytest.mark.parametrize("child_method", ["model_copy", "model_construct"])
+@pytest.mark.parametrize("identity_method", ["canonical_bytes", "sha256"])
+def test_direct_revalidation_rejects_string_subclass_before_hostile_operations(
+    owner: str,
+    child_method: str,
+    identity_method: Literal["canonical_bytes", "sha256"],
+) -> None:
+    valid = _outcome()
+    hostile = _HostileIdentity("valid-looking")
+    child = getattr(valid, owner)[0]
+    changed = _corrupt(child, child_method, "strategy_id", hostile)
+    corrupt = valid.model_copy(update={owner: (changed,)})
+    with pytest.raises(ValidationError) as exc_info:
+        getattr(corrupt, identity_method)()
+    assert hostile.calls == []
+    errors = exc_info.value.errors(include_input=False, include_url=False)
+    assert hostile.calls == [] and len(errors) == 1
+    error = errors[0]
+    context = error.get("ctx")
+    assert error["loc"] == (owner, 0) and context is not None
+    cause = context["error"]
+    assert (error["type"], error["msg"]) == (
+        "value_error",
+        "Value error, strategy_id must be a string",
+    )
+    assert (type(cause), str(cause)) == (
+        ValueError,
+        "strategy_id must be a string",
+    )
+    assert hostile.calls == []
+
+
+@pytest.mark.parametrize("method", ["canonical_bytes", "sha256"])
+def test_semantic_subclass_cannot_emit_identity(
+    method: Literal["canonical_bytes", "sha256"],
+) -> None:
+    valid = _outcome()
+    subclass = _SemanticTradingOutcome.model_construct(
+        **valid.__dict__, semantic_field="semantic"
+    )
+    _assert_direct_identity_error(subclass, method, _SUBCLASS_ERROR)
+
+
+@pytest.mark.parametrize("side", ["self", "actual"])
+def test_semantic_subclass_cannot_compare_identity(side: str) -> None:
+    valid = _outcome()
+    subclass = _SemanticTradingOutcome.model_construct(
+        **valid.__dict__, semantic_field="semantic"
+    )
+    with pytest.raises(ValueError) as exc_info:
+        subclass.first_difference(valid) if side == "self" else valid.first_difference(
+            subclass
+        )
+    assert (type(exc_info.value), str(exc_info.value)) == (ValueError, _SUBCLASS_ERROR)
+
+
+@pytest.mark.parametrize("side", ["self", "actual"])
+def test_first_difference_rejects_corrupt_summary(side: str) -> None:
+    valid = _outcome()
+    corrupt = valid.model_copy(update={"financial": valid.financial.model_dump()})
+    with pytest.raises(ValueError) as exc_info:
+        corrupt.first_difference(valid) if side == "self" else valid.first_difference(
+            corrupt
+        )
+    assert (type(exc_info.value), str(exc_info.value)) == (ValueError, _SUMMARY_ERROR)

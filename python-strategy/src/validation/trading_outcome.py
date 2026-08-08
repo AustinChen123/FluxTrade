@@ -402,9 +402,34 @@ class TradingOutcome(_Observation):
         return _project_sequence(value, JournalObservation)
 
     def _projection(self) -> dict[str, object]:
+        if type(self) is not TradingOutcome:
+            raise ValueError("TradingOutcome subclasses are unsupported")
+        if self.model_extra is not None:
+            raise ValueError("TradingOutcome contains unexpected fields")
+        values = self.__dict__
+        sequences = (
+            (values.get("signals"), SignalObservation),
+            (values.get("order_observations"), OrderObservation),
+            (values.get("fills"), FillObservation),
+            (values.get("journal"), JournalObservation),
+        )
+        if any(
+            type(items) is not tuple
+            or any(type(item) is not expected for item in items)
+            for items, expected in sequences
+        ):
+            raise ValueError(
+                "TradingOutcome observations must have exact canonical types"
+            )
+        if (
+            type(values.get("endpoint_state")) is not ReplayEndpointState
+            or type(values.get("financial")) is not FinancialOutcome
+        ):
+            raise ValueError("TradingOutcome summaries must have exact canonical types")
+        validated = TradingOutcome.model_validate(dict(values))
         return {
             "schema_version": self.schema_version,
-            **self.model_dump(exclude_computed_fields=True),
+            **validated.model_dump(exclude_computed_fields=True),
         }
 
     def canonical_bytes(self) -> bytes:
