@@ -433,10 +433,12 @@ class TradingOutcome(_Observation):
         }
 
     def canonical_bytes(self) -> bytes:
-        return _json(self._projection()).encode()
+        return _json(TradingOutcome._projection(self)).encode()
 
     def sha256(self) -> str:
-        return hashlib.sha256(self.canonical_bytes()).hexdigest()
+        return hashlib.sha256(TradingOutcome.canonical_bytes(self)).hexdigest()
 
     def first_difference(self, actual: TradingOutcome) -> OutcomeDifference | None:
-        return _difference(self._projection(), actual._projection())
+        return _difference(
+            TradingOutcome._projection(self), TradingOutcome._projection(actual)
+        )

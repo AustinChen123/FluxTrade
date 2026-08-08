@@ -1264,6 +1264,26 @@ class _SemanticTradingOutcome(TradingOutcome):
     semantic_field: str
 
 
+class _PassiveTradingOutcome(TradingOutcome):
+    pass
+
+
+class _HostileTradingOutcome(TradingOutcome):
+    calls: list[str] = []
+
+    def _projection(self) -> dict[str, object]:
+        self.calls.append("projection")
+        return _outcome()._projection()
+
+
+class _HostileCanonicalBytesTradingOutcome(TradingOutcome):
+    calls: list[str] = []
+
+    def canonical_bytes(self) -> bytes:
+        self.calls.append("canonical_bytes")
+        return b"hostile"
+
+
 _SUBCLASS_ERROR = "TradingOutcome subclasses are unsupported"
 _EXTRA_ERROR = "TradingOutcome contains unexpected fields"
 _OBSERVATION_ERROR = "TradingOutcome observations must have exact canonical types"
@@ -1559,6 +1579,156 @@ def test_semantic_subclass_cannot_compare_identity(side: str) -> None:
             subclass
         )
     assert (type(exc_info.value), str(exc_info.value)) == (ValueError, _SUBCLASS_ERROR)
+
+
+@pytest.mark.parametrize("method", ["canonical_bytes", "sha256"])
+def test_passive_subclass_cannot_emit_identity(
+    method: Literal["canonical_bytes", "sha256"],
+) -> None:
+    valid = _outcome()
+    passive = _PassiveTradingOutcome.model_construct(**valid.__dict__)
+    _assert_direct_identity_error(passive, method, _SUBCLASS_ERROR)
+
+
+@pytest.mark.parametrize("side", ["self", "actual"])
+def test_passive_subclass_cannot_compare_identity(side: str) -> None:
+    valid = _outcome()
+    passive = _PassiveTradingOutcome.model_construct(**valid.__dict__)
+    with pytest.raises(ValueError, match=f"^{_SUBCLASS_ERROR}$"):
+        passive.first_difference(valid) if side == "self" else valid.first_difference(
+            passive
+        )
+
+
+def test_sha256_cannot_dispatch_hostile_canonical_bytes_override() -> None:
+    valid = _outcome()
+    hostile = _HostileCanonicalBytesTradingOutcome.model_construct(
+        **valid.__dict__, calls=[]
+    )
+    with pytest.raises(ValueError, match=f"^{_SUBCLASS_ERROR}$"):
+        hostile.sha256()
+    assert hostile.calls == []
+
+
+@pytest.mark.parametrize("method", ["canonical_bytes", "sha256"])
+def test_hostile_subclass_cannot_dispatch_identity_projection(method: str) -> None:
+    valid = _outcome()
+    hostile = _HostileTradingOutcome.model_construct(**valid.__dict__, calls=[])
+    with pytest.raises(ValueError, match=f"^{_SUBCLASS_ERROR}$"):
+        getattr(hostile, method)()
+    assert hostile.calls == []
+
+
+@pytest.mark.parametrize("side", ["self", "actual"])
+def test_hostile_subclass_cannot_dispatch_comparison_projection(side: str) -> None:
+    valid = _outcome()
+    hostile = _HostileTradingOutcome.model_construct(**valid.__dict__, calls=[])
+    with pytest.raises(ValueError, match=f"^{_SUBCLASS_ERROR}$"):
+        hostile.first_difference(valid) if side == "self" else valid.first_difference(
+            hostile
+        )
+    assert hostile.calls == []
+
+
+def _shadow_projection(outcome: TradingOutcome, calls: list[str]) -> None:
+    def hostile() -> dict[str, object]:
+        calls.append("projection")
+        return {}
+
+    object.__setattr__(outcome, "_projection", hostile)
+
+
+def _shadow_canonical_bytes(outcome: TradingOutcome, calls: list[str]) -> None:
+    def hostile() -> bytes:
+        calls.append("canonical_bytes")
+        return b"hostile"
+
+    object.__setattr__(outcome, "canonical_bytes", hostile)
+
+
+def _assert_shadow_rejection(exc_info: pytest.ExceptionInfo[ValidationError]) -> None:
+    errors = exc_info.value.errors(include_url=False)
+    assert len(errors) == 1
+    error = errors[0]
+    assert (error["type"], error["loc"], error["msg"]) == (
+        "value_error",
+        (),
+        "Value error, canonical models forbid unexpected fields",
+    )
+    context = error.get("ctx")
+    assert context is not None
+    cause = context["error"]
+    assert (type(cause), str(cause)) == (
+        ValueError,
+        "canonical models forbid unexpected fields",
+    )
+
+
+@pytest.mark.parametrize("method", ["canonical_bytes", "sha256"])
+def test_exact_instance_shadow_cannot_dispatch_identity_projection(method: str) -> None:
+    hostile = _outcome()
+    calls: list[str] = []
+    _shadow_projection(hostile, calls)
+    with pytest.raises(ValidationError) as exc_info:
+        getattr(hostile, method)()
+    assert calls == []
+    _assert_shadow_rejection(exc_info)
+    assert calls == []
+
+
+@pytest.mark.parametrize("side", ["self", "actual"])
+def test_exact_instance_shadow_cannot_dispatch_comparison_projection(side: str) -> None:
+    valid, hostile = _outcome(), _outcome()
+    calls: list[str] = []
+    _shadow_projection(hostile, calls)
+    with pytest.raises(ValidationError) as exc_info:
+        hostile.first_difference(valid) if side == "self" else valid.first_difference(
+            hostile
+        )
+    assert calls == []
+    _assert_shadow_rejection(exc_info)
+    assert calls == []
+
+
+def test_sha256_rejects_exact_instance_canonical_bytes_shadow_without_dispatch() -> (
+    None
+):
+    hostile = _outcome()
+    calls: list[str] = []
+    _shadow_canonical_bytes(hostile, calls)
+    with pytest.raises(ValidationError) as exc_info:
+        hostile.sha256()
+    assert calls == []
+    _assert_shadow_rejection(exc_info)
+    assert calls == []
+
+
+@pytest.mark.parametrize("side", ["self", "actual"])
+def test_first_difference_rejects_canonical_bytes_shadow_without_dispatch(
+    side: str,
+) -> None:
+    valid, hostile = _outcome(), _outcome()
+    calls: list[str] = []
+    _shadow_canonical_bytes(hostile, calls)
+    with pytest.raises(ValidationError) as exc_info:
+        hostile.first_difference(valid) if side == "self" else valid.first_difference(
+            hostile
+        )
+    assert calls == []
+    _assert_shadow_rejection(exc_info)
+    assert calls == []
+
+
+@pytest.mark.parametrize("side", ["self", "actual"])
+def test_first_difference_rejects_falsey_model_extra(side: str) -> None:
+    valid, corrupt = _outcome(), _outcome()
+    extra = _FalseyModelExtra(unexpected="accepted")
+    object.__setattr__(corrupt, "__pydantic_extra__", extra)
+    with pytest.raises(ValueError) as exc_info:
+        corrupt.first_difference(valid) if side == "self" else valid.first_difference(
+            corrupt
+        )
+    assert (type(exc_info.value), str(exc_info.value)) == (ValueError, _EXTRA_ERROR)
 
 
 @pytest.mark.parametrize("side", ["self", "actual"])
