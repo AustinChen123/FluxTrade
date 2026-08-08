@@ -1,7 +1,7 @@
 from copy import deepcopy
 from decimal import Decimal, getcontext, localcontext
 from types import SimpleNamespace
-from typing import Literal
+from typing import ClassVar, Literal
 
 import pytest
 from pydantic import ValidationError
@@ -28,6 +28,14 @@ class _CleanTradingParityRun(TradingParityRun):
 
 class _SemanticTradingParityRun(TradingParityRun):
     semantic_field: str
+
+
+class _HostileCanonicalBytesTradingParityRun(TradingParityRun):
+    calls: ClassVar[int] = 0
+
+    def canonical_bytes(self) -> bytes:
+        type(self).calls += 1
+        raise AssertionError("hostile canonical_bytes dispatch")
 
 
 class _CleanTradingOutcome(TradingOutcome):
@@ -1003,6 +1011,60 @@ def test_direct_parity_subclasses_cannot_emit_identity(
     with pytest.raises(ValueError) as exc_info:
         getattr(instance, method)()
     assert (type(exc_info.value), str(exc_info.value)) == (ValueError, SUBCLASS_ERROR)
+
+
+def test_sha256_rejects_hostile_subclass_before_canonical_bytes_dispatch() -> None:
+    instance = _HostileCanonicalBytesTradingParityRun.model_construct(**_run().__dict__)
+    _HostileCanonicalBytesTradingParityRun.calls = 0
+
+    with pytest.raises(ValueError, match=f"^{SUBCLASS_ERROR}$"):
+        instance.sha256()
+
+    assert _HostileCanonicalBytesTradingParityRun.calls == 0
+
+
+@pytest.mark.parametrize(
+    "hidden,expected_exception,expected_message",
+    [
+        pytest.param(
+            None,
+            ValidationError,
+            "parity runs forbid unexpected fields",
+            id="clean_envelope",
+        ),
+        pytest.param(
+            _FalseyModelExtra(unexpected="accepted"),
+            ValueError,
+            "parity run contains unexpected fields",
+            id="falsey_model_extra",
+        ),
+    ],
+)
+def test_sha256_rejects_exact_instance_shadow_without_dispatch(
+    hidden: dict[str, object] | None,
+    expected_exception: type[ValueError],
+    expected_message: str,
+) -> None:
+    instance = _run()
+    calls = 0
+
+    def hostile_canonical_bytes() -> bytes:
+        nonlocal calls
+        calls += 1
+        raise AssertionError("hostile canonical_bytes dispatch")
+
+    object.__setattr__(instance, "canonical_bytes", hostile_canonical_bytes)
+    if hidden is not None:
+        object.__setattr__(instance, "__pydantic_extra__", hidden)
+
+    with pytest.raises(expected_exception) as exc_info:
+        instance.sha256()
+
+    if expected_exception is ValidationError:
+        _assert_root_cause(exc_info, expected_message)
+    else:
+        assert str(exc_info.value) == expected_message
+    assert calls == 0
 
 
 def test_fixed_multibyte_v2_outcome_and_parity_identity() -> None:

@@ -176,4 +176,4 @@ class TradingParityRun(BaseModel):
         return json.dumps(values, ensure_ascii=False, separators=(",", ":")).encode()
 
     def sha256(self) -> str:
-        return hashlib.sha256(self.canonical_bytes()).hexdigest()
+        return hashlib.sha256(TradingParityRun.canonical_bytes(self)).hexdigest()
