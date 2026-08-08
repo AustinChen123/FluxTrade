@@ -8,9 +8,11 @@ used by replay runners; source-specific identifiers are intentionally omitted.
 from collections.abc import Iterable, Mapping
 from decimal import Decimal
 from enum import Enum
+from types import MappingProxyType
 
 from pydantic import ConfigDict, Field, computed_field, field_validator, model_validator
 
+from src.core.canonical_mapping import snapshot_mapping
 from src.core.models import BaseFluxModel, OrderSide, PositionSide
 
 
@@ -24,10 +26,15 @@ _MISSING = object()
 def _reject_extra_fields(value: object, *, allowed: frozenset[str]) -> object:
     if not isinstance(value, Mapping):
         raise ValueError("endpoint model input must be a mapping")
-    extras = tuple(key for key in value if key not in allowed)
+    snapshot = snapshot_mapping(
+        value, invalid_key_error="endpoint field names must be exact strings"
+    )
+    extras = tuple(key for key in snapshot if key not in allowed)
     if extras:
         raise ValueError(f"unexpected endpoint fields: {extras!r}")
-    return value
+    if isinstance(value, dict):
+        return snapshot
+    return MappingProxyType(snapshot)
 
 
 def _raw_decimal(value: object, *, field_name: str) -> Decimal:
