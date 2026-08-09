@@ -239,6 +239,7 @@ class StrategyEngine:
         audit_external_orders: bool = False,
         is_backtest: bool | None = None,
         leadership_guard: Callable[[], None] | None = None,
+        signal_batch_observer: Callable[[tuple[Signal, ...]], None] | None = None,
     ):
         if db_session_factory is None:
             if db_session is None:
@@ -399,6 +400,7 @@ class StrategyEngine:
             ),
             exposure_loader=self.execution_engine.portfolio_exposure_snapshot,
             portfolio_coordinator=self._portfolio_coordinator,
+            signal_batch_observer=signal_batch_observer,
         )
         self.ops_safety = OpsSafetyService(
             self.execution_engine,

@@ -16,7 +16,7 @@ from src.core.orm_models import Strategy as StrategyORM, BacktestResultSummary, 
 from src.core.engine import StrategyEngine
 from src.core.clock import BacktestClock
 from src.core.data_provider import timeframe_to_ms
-from src.core.models import Candlestick
+from src.core.models import Candlestick, Signal
 from src.strategies.base import BaseStrategy
 from src.core.repositories import BacktestOrderRepository
 from src.core.backtest.loader import get_candles_generator
@@ -189,6 +189,7 @@ class BacktestRunner:
         db_session_factory: Optional[Callable[[], ContextManager[Session]]] = None,
         instrument_spec: InstrumentSpec | None = None,
         execution_timeframe: str | None = None,
+        signal_batch_observer: Callable[[tuple[Signal, ...]], None] | None = None,
     ):
         self.start_time = start_time
         self.end_time = end_time
@@ -221,6 +222,7 @@ class BacktestRunner:
         self.instrument_spec = instrument_spec
         self.contract_multiplier = resolve_contract_multiplier(instrument_spec)
         self.fee_model = resolve_fee_model(instrument_spec)
+        self.signal_batch_observer = signal_batch_observer
 
         self.clock = BacktestClock(start_time=start_time / 1000)
         self._strategies_buffer: List[BaseStrategy] = []
@@ -497,6 +499,7 @@ class BacktestRunner:
             adapter=adapter,
             journal=journal,
             db_session_factory=self._db_session_factory,
+            signal_batch_observer=self.signal_batch_observer,
         )
 
         # Inject journal and account service into strategies

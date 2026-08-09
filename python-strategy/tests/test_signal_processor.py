@@ -16,7 +16,7 @@ from src.core.portfolio_runtime import (
     PortfolioExposureSnapshot,
     PortfolioSleeve,
 )
-from src.core.signal_processor import SignalProcessor
+from src.core.signal_processor import SignalObserverError, SignalProcessor
 from src.core.strategy_registry import StrategyRegistry
 from src.strategies.base import BaseStrategy, StrategyRequirements
 
@@ -239,6 +239,7 @@ def test_on_candle_emits_only_selected_exclusive_slot_owner() -> None:
     execution = MagicMock()
     execution.default_quantity = Decimal("1")
     handler = MagicMock(return_value=True)
+    observed: list[tuple[Signal, ...]] = []
 
     SignalProcessor(
         registry,
@@ -247,6 +248,7 @@ def test_on_candle_emits_only_selected_exclusive_slot_owner() -> None:
         position_loader=lambda *_args: None,
         exposure_loader=lambda *_args: PortfolioExposureSnapshot({}),
         portfolio_coordinator=coordinator,
+        signal_batch_observer=observed.append,
     ).on_candle(make_candle())
 
     handler.assert_called_once()
@@ -254,6 +256,9 @@ def test_on_candle_emits_only_selected_exclusive_slot_owner() -> None:
     assert emitted_signal.strategy_id == "sleeve_a"
     assert emitted_signal.type == SignalType.LONG
     assert emitted_candle == make_candle()
+    assert len(observed) == 1
+    assert observed[0] == (emitted_signal,)
+    assert observed[0][0] is emitted_signal
 
 
 def test_exclusive_slot_restores_suppressed_stateful_sleeve() -> None:
@@ -1116,6 +1121,226 @@ def test_process_signals_uses_signal_handler_when_provided() -> None:
 
     signal_handler.assert_called_once_with(signal, candle)
     execution.execute_signal.assert_not_called()
+
+
+def test_finalized_signal_observer_preserves_batch_order_identity_and_timing() -> None:
+    class RecordingProcessor(SignalProcessor):
+        processed: list[list[Signal]] = []
+
+        def _process_signals(self, strategy_id, signals, candle=None) -> None:
+            self.processed.append(signals)
+            super()._process_signals(strategy_id, signals, candle)
+
+    first_signals = [
+        make_signal("s1", SignalType.LONG),
+        make_signal("s1", SignalType.NO_SIGNAL),
+    ]
+    second_signals = [
+        make_signal("s2", SignalType.SHORT),
+        make_signal("s2", SignalType.EXIT_SHORT),
+    ]
+    registry = StrategyRegistry()
+    registry.register(DummyStrategy("s1", result=first_signals))
+    registry.register(DummyStrategy("s2", result=second_signals))
+    events: list[tuple[str, object]] = []
+    observed: list[tuple[Signal, ...]] = []
+
+    def observer(batch: tuple[Signal, ...]) -> None:
+        observed.append(batch)
+        events.append(("observer", batch))
+
+    def handler(signal: Signal, _candle: Candlestick | None) -> bool:
+        events.append(("handler", signal))
+        return True
+
+    processor = RecordingProcessor(
+        registry,
+        MagicMock(),
+        signal_handler=handler,
+        signal_batch_observer=observer,
+    )
+    processor.on_candle(make_candle())
+
+    assert len(observed) == 1
+    assert [signal.type for signal in observed[0]] == [
+        SignalType.LONG,
+        SignalType.NO_SIGNAL,
+        SignalType.SHORT,
+        SignalType.EXIT_SHORT,
+    ]
+    assert events[0][0] == "observer"
+    assert events[1][1] is observed[0][0]
+    assert events[2][1] is observed[0][2]
+    assert events[3][1] is observed[0][3]
+    processed = tuple(signal for signals in processor.processed for signal in signals)
+    assert all(
+        observed_signal is processed_signal
+        for observed_signal, processed_signal in zip(
+            observed[0], processed, strict=True
+        )
+    )
+    assert observed[0][0].metadata is not None
+    assert observed[0][0].metadata["client_order_id"]
+
+
+@pytest.mark.parametrize("explicit_none", [False, True])
+def test_finalized_signal_observer_default_none_is_equivalent(
+    explicit_none: bool,
+) -> None:
+    class ExactSignals(list[Signal]):
+        iterations = 0
+
+        def __iter__(self):
+            self.iterations += 1
+            return super().__iter__()
+
+    signal = make_signal()
+    signals = ExactSignals([signal])
+    strategy = DummyStrategy("s1", result=signals)
+    registry = StrategyRegistry()
+    registry.register(strategy)
+    execution = MagicMock()
+    kwargs = {"signal_batch_observer": None} if explicit_none else {}
+
+    SignalProcessor(registry, execution, **kwargs).on_candle(make_candle())
+
+    execution.execute_signal.assert_called_once_with(signal, make_candle())
+    assert signals.iterations == 1
+    assert execution.execute_signal.call_args.args[0] is signal
+    assert signal.metadata is None
+
+
+def test_finalized_signal_observer_does_not_call_for_pure_empty_batch() -> None:
+    registry = StrategyRegistry()
+    registry.register(DummyStrategy("empty", result=[]))
+    observer = MagicMock()
+
+    SignalProcessor(
+        registry,
+        MagicMock(),
+        signal_batch_observer=observer,
+    ).on_candle(make_candle())
+
+    observer.assert_not_called()
+
+
+def test_finalized_signal_observer_skips_empty_but_observes_no_signal() -> None:
+    strategies = [
+        DummyStrategy("empty", result=[]),
+        DummyStrategy("none", result=None),
+        DummyStrategy(
+            "no_signal", result=make_signal("no_signal", SignalType.NO_SIGNAL)
+        ),
+    ]
+    registry = StrategyRegistry()
+    for strategy in strategies:
+        registry.register(strategy)
+    observed: list[tuple[Signal, ...]] = []
+    execution = MagicMock()
+
+    SignalProcessor(
+        registry,
+        execution,
+        signal_batch_observer=observed.append,
+    ).on_candle(make_candle())
+
+    assert len(observed) == 1
+    assert observed[0][0].type == SignalType.NO_SIGNAL
+    execution.execute_signal.assert_not_called()
+
+
+def test_finalized_signal_observer_ignores_false_return_value() -> None:
+    signal = make_signal()
+    registry = StrategyRegistry()
+    registry.register(DummyStrategy("s1", result=signal))
+    observer = MagicMock(return_value=False)
+    handler = MagicMock(return_value=True)
+
+    SignalProcessor(
+        registry,
+        MagicMock(),
+        signal_handler=handler,
+        signal_batch_observer=observer,
+    ).on_candle(make_candle())
+
+    observer.assert_called_once()
+    handler.assert_called_once()
+    assert handler.call_args.args[0] is observer.call_args.args[0][0]
+
+
+def test_finalized_signal_observer_failure_has_stage_cause_and_no_effects() -> None:
+    class HostileObserverFailure(Exception):
+        def __str__(self) -> str:
+            raise AssertionError("must not render observer failure")
+
+        def __repr__(self) -> str:
+            raise AssertionError("must not render observer failure")
+
+    cause = HostileObserverFailure()
+    strategy = DummyStrategy("s1", result=make_signal())
+    registry = StrategyRegistry()
+    registry.register(strategy)
+    execution = MagicMock()
+    handler = MagicMock()
+
+    def observer(_batch: tuple[Signal, ...]) -> None:
+        raise cause
+
+    with pytest.raises(SignalObserverError) as caught:
+        SignalProcessor(
+            registry,
+            execution,
+            signal_handler=handler,
+            signal_batch_observer=observer,
+        ).on_candle(make_candle())
+
+    assert caught.value.stage == "post_coordination_pre_execution"
+    assert caught.value.args == ("signal observer failed",)
+    assert caught.value.__cause__ is cause
+    handler.assert_not_called()
+    execution.execute_signal.assert_not_called()
+
+
+def test_finalized_signal_observer_failure_rolls_back_exclusive_slot_state() -> None:
+    strategy_a = StatefulEntryStrategy("sleeve_a")
+    strategy_b = StatefulEntryStrategy("sleeve_b")
+    registry = StrategyRegistry()
+    registry.register(strategy_a)
+    registry.register(strategy_b)
+    coordinator = PortfolioCoordinator()
+    coordinator.register(
+        PortfolioDefinition(
+            portfolio_id="portfolio_v1",
+            product_id=strategy_a.product_id,
+            sleeves=(PortfolioSleeve(strategy_a), PortfolioSleeve(strategy_b)),
+            max_gross_quantity=Decimal("1"),
+            exclusive_slots=(
+                PortfolioExclusiveSlot(
+                    slot_id="shared",
+                    strategy_ids=("sleeve_a", "sleeve_b"),
+                ),
+            ),
+        )
+    )
+    execution = MagicMock(default_quantity=Decimal("1"))
+    handler = MagicMock()
+
+    def observer(_batch: tuple[Signal, ...]) -> None:
+        raise RuntimeError("observer failed")
+
+    with pytest.raises(Exception, match="signal observer failed"):
+        SignalProcessor(
+            registry,
+            execution,
+            signal_handler=handler,
+            exposure_loader=lambda *_args: PortfolioExposureSnapshot({}),
+            portfolio_coordinator=coordinator,
+            signal_batch_observer=observer,
+        ).on_candle(make_candle())
+
+    assert strategy_a._in_position is False
+    assert strategy_b._in_position is False
+    handler.assert_not_called()
 
 
 def test_strategy_exception_blocks_all_signal_side_effects() -> None:

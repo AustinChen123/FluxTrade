@@ -21,6 +21,12 @@ from src.strategies.base import BaseStrategy
 logger = logging.getLogger(__name__)
 
 
+class SignalObserverError(RuntimeError):
+    """Report a finalized signal observer failure before execution."""
+
+    stage = "post_coordination_pre_execution"
+
+
 def apply_strategy_position_state(
     strategy: BaseStrategy,
     position_side: str | None,
@@ -71,6 +77,7 @@ class SignalProcessor:
             | None
         ) = None,
         portfolio_coordinator: PortfolioCoordinator | None = None,
+        signal_batch_observer: Callable[[tuple[Signal, ...]], None] | None = None,
     ) -> None:
         self.registry = registry
         self.execution_engine = execution_engine
@@ -79,6 +86,7 @@ class SignalProcessor:
         self.position_loader = position_loader
         self.exposure_loader = exposure_loader
         self.portfolio_coordinator = portfolio_coordinator
+        self.signal_batch_observer = signal_batch_observer
         self._observed_position_sides: dict[tuple[str, str], str | None] = {}
 
     def on_candle(
@@ -163,6 +171,17 @@ class SignalProcessor:
                             ),
                         )
                     )
+                if self.signal_batch_observer is not None:
+                    finalized_batch = tuple(
+                        signal
+                        for _strategy_id, signals in decisions
+                        for signal in signals
+                    )
+                    if finalized_batch:
+                        try:
+                            self.signal_batch_observer(finalized_batch)
+                        except Exception as exc:
+                            raise SignalObserverError("signal observer failed") from exc
 
         if emit_signals:
             for strategy_id, signals in decisions:

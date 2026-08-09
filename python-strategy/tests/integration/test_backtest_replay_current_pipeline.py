@@ -86,6 +86,7 @@ def _sqlite_backtest_session_factory(tmp_path):
 def test_current_backtest_replay_persists_trades_and_metrics(tmp_path):
     session_factory = _sqlite_backtest_session_factory(tmp_path)
     candles = make_candle_series(count=2_000)
+    observed_batches: list[tuple[Signal, ...]] = []
 
     def predict(candle):
         index = (candle.timestamp - candles[0].timestamp) // INTERVAL_MS
@@ -124,6 +125,7 @@ def test_current_backtest_replay_persists_trades_and_metrics(tmp_path):
             "journal_export": False,
         },
         db_session_factory=session_factory,
+        signal_batch_observer=observed_batches.append,
     )
     runner.add_strategy(
         CallableStrategy("current_replay", predict, PRODUCT_ID, TIMEFRAME)
@@ -148,12 +150,25 @@ def test_current_backtest_replay_persists_trades_and_metrics(tmp_path):
             ).all()
         )
 
+    assert result is not None
+    assert isinstance(summary.metrics_json, str)
+    assert isinstance(summary.total_pnl, Decimal)
+    assert trade_count is not None
     metrics = json.loads(summary.metrics_json)
 
     assert trade_count == 50
     assert fill_sequences == list(range(50))
     assert audit_count == 50
     assert strategy_ids == {"current_replay"}
+    observed_signals = tuple(signal for batch in observed_batches for signal in batch)
+    assert len(observed_batches) == len(candles)
+    assert len(observed_signals) == len(candles)
+    assert sum(signal.type != SignalType.NO_SIGNAL for signal in observed_signals) == 50
+    client_order_ids: set[str] = set()
+    for signal in observed_signals:
+        assert signal.metadata is not None
+        client_order_ids.add(signal.metadata["client_order_id"])
+    assert len(client_order_ids) == len(candles)
     assert result["journal_count"] >= trade_count
     assert result["total_trades"] == 25
     assert metrics["total_trades"] == 25
