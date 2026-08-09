@@ -1,9 +1,12 @@
 import json
 import logging
 import threading
+import time
 from unittest.mock import MagicMock, patch
 
 import pytest
+from redis import Redis
+from redis.exceptions import ConnectionError as RedisConnectionError
 
 from src.core.rithmic_publisher_liveness_gate import (
     RithmicPublisherLivenessGate,
@@ -79,14 +82,44 @@ def test_factory_owns_environment_key_and_bounded_redis_client() -> None:
             logger=logging.getLogger("test.publisher_liveness"),
         )
 
-    redis_factory.assert_called_once_with(
-        socket_connect_timeout=0.25,
-        socket_timeout=0.25,
-    )
+    redis_factory.assert_called_once()
+    factory_kwargs = redis_factory.call_args.kwargs
+    assert factory_kwargs["socket_connect_timeout"] == 0.25
+    assert factory_kwargs["socket_timeout"] == 0.25
+    retry = factory_kwargs["retry"]
+    assert retry.get_retries() == 0
     gate.arm()
     gate.observe()
     assert reader.get_calls == 1
     assert reader.keys == ["fluxtrade:live:heartbeat:data-publisher"]
+
+
+def test_factory_installs_non_retrying_policy_on_actual_redis_client(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("REDIS_HOST", "127.0.0.1")
+    monkeypatch.setenv("REDIS_PORT", "1")
+    gate = RithmicPublisherLivenessGate.for_environment(
+        RuntimeEnvironment("live"),
+        logger=logging.getLogger("test.publisher_liveness"),
+    )
+    client = gate._redis_client
+    assert isinstance(client, Redis)
+    retry = client.connection_pool.connection_kwargs["retry"]
+    attempts = 0
+
+    def fail() -> None:
+        nonlocal attempts
+        attempts += 1
+        raise RedisConnectionError("expected")
+
+    started = time.monotonic()
+    with pytest.raises(RedisConnectionError, match="expected"):
+        retry.call_with_retry(fail, lambda _error: None)
+
+    assert attempts == 1
+    assert time.monotonic() - started < 0.5
+    gate.close()
 
 
 @pytest.mark.parametrize("unhealthy_value", [None, "stale", b"stale"])

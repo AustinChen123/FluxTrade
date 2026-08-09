@@ -3,6 +3,9 @@ import threading
 from enum import Enum
 from typing import Protocol
 
+from redis.backoff import NoBackoff
+from redis.retry import Retry
+
 from src.core.redis_factory import create_redis_client
 from src.core.runtime_environment import RuntimeEnvironment
 
@@ -50,6 +53,7 @@ class RithmicPublisherLivenessGate:
         redis_client = create_redis_client(
             socket_connect_timeout=_REDIS_OPERATION_TIMEOUT_SECONDS,
             socket_timeout=_REDIS_OPERATION_TIMEOUT_SECONDS,
+            retry=Retry(NoBackoff(), 0),
         )
         return cls(
             redis_client=redis_client,
