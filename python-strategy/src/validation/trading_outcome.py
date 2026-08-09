@@ -22,6 +22,7 @@ from pydantic_core import PydanticCustomError
 
 from src.core.backtest.endpoint_state import ReplayEndpointState
 from src.core.canonical_mapping import snapshot_mapping
+from src.core.models import OrderSide, PositionSide
 
 __all__ = ["OutcomeDifference", "TradingOutcome"]
 
@@ -69,7 +70,9 @@ def _json_value(value: object) -> str:
         assert isinstance(exponent, int)
         coefficient = "".join(str(digit) for digit in digits)
         return f'["decimal",{sign},"{coefficient}",{exponent}]'
-    if isinstance(value, str):
+    if type(value) is OrderSide or type(value) is PositionSide:
+        value = value.value
+    if type(value) is str:
         str.encode(value, "utf-8")
         return f'["string",{json.dumps(value, ensure_ascii=False)}]'
     if type(value) is list:
@@ -89,7 +92,8 @@ def _json_value(value: object) -> str:
             )
             + "]]"
         )
-    raise ValueError(f"unsupported canonical value: {type(value).__name__}")
+    type_name = type.__dict__["__name__"].__get__(type(value))
+    raise ValueError(f"unsupported canonical value: {type_name}")
 
 
 Money = Annotated[Decimal, BeforeValidator(_decimal)]

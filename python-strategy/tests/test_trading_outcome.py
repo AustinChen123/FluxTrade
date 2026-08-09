@@ -1,6 +1,7 @@
 from copy import deepcopy
 from collections.abc import Callable, Iterator
 from decimal import Decimal, DecimalTuple, getcontext, localcontext
+from enum import Enum, StrEnum
 from types import SimpleNamespace
 from typing import Literal, cast
 
@@ -12,7 +13,7 @@ from src.core.backtest.endpoint_state import (
     EndpointPosition,
     ReplayEndpointState,
 )
-from src.core.models import OrderSide, PositionSide
+from src.core.models import OrderSide, PositionSide, SignalType
 from src.validation.trading_outcome import (
     FillObservation,
     FinancialOutcome,
@@ -21,6 +22,50 @@ from src.validation.trading_outcome import (
     SignalObservation,
     TradingOutcome,
 )
+
+
+class _CustomStringEnum(str, Enum):
+    VALUE = "custom-enum"
+
+
+class _CustomStrEnum(StrEnum):
+    VALUE = "custom-str-enum"
+
+
+_HOSTILE_STRING_CALLS: list[str] = []
+
+
+class _HostileStringMetaBase(type):
+    def __eq__(cls, other: object) -> bool:
+        _HOSTILE_STRING_CALLS.append("metaclass_eq")
+        return type.__eq__(cls, other)
+
+    def __hash__(cls) -> int:
+        _HOSTILE_STRING_CALLS.append("metaclass_hash")
+        return type.__hash__(cls)
+
+    def __getattribute__(cls, name: str) -> object:
+        _HOSTILE_STRING_CALLS.append("metaclass_getattribute")
+        return type.__getattribute__(cls, name)
+
+
+def _hostile_type_name(cls: type) -> str:
+    _HOSTILE_STRING_CALLS.append("metaclass_name")
+    return "hostile-name"
+
+
+_HostileStringMeta = type(
+    "_HostileStringMeta",
+    (_HostileStringMetaBase,),
+    {"__name__": property(_hostile_type_name)},
+)
+
+
+class _HostileMetaclassString(str, metaclass=_HostileStringMeta):
+    @property
+    def value(self) -> str:
+        _HOSTILE_STRING_CALLS.append("instance_value")
+        return str(self)
 
 
 _OBSERVATION_FIELDS = {
@@ -961,6 +1006,110 @@ def test_dynamic_values_fail_closed(invalid: object, section: str, field: str) -
     _items(payload, section)[0][field] = invalid
     with pytest.raises(ValidationError):
         _outcome(payload)
+
+
+@pytest.mark.parametrize(
+    "section,field",
+    [
+        pytest.param("signals", "metadata_json", id="SignalObservation"),
+        pytest.param("journal", "data_json", id="JournalObservation"),
+    ],
+)
+@pytest.mark.parametrize(
+    "position",
+    ["root", "list_item", "tuple_item", "nested_mapping_value"],
+)
+def test_dynamic_string_subclass_fails_before_hostile_operations(
+    section: str, field: str, position: str
+) -> None:
+    hostile = _HostileIdentity("valid-looking")
+    values = {
+        "root": hostile,
+        "list_item": [hostile],
+        "tuple_item": (hostile,),
+        "nested_mapping_value": {"nested": hostile},
+    }
+    payload = _payload()
+    _items(payload, section)[0][field] = values[position]
+
+    with pytest.raises(ValidationError):
+        _outcome(payload)
+    assert hostile.calls == []
+
+
+@pytest.mark.parametrize(
+    "value,expected",
+    [
+        ("", b'["string",""]'),
+        (" padded ASCII ", b'["string"," padded ASCII "]'),
+        (" 兩端留白 ", '["string"," 兩端留白 "]'.encode()),
+        ("Grüße世界", '["string","Grüße世界"]'.encode()),
+    ],
+)
+@pytest.mark.parametrize(
+    "section,field",
+    [
+        pytest.param("signals", "metadata_json", id="SignalObservation"),
+        pytest.param("journal", "data_json", id="JournalObservation"),
+    ],
+)
+def test_dynamic_exact_base_strings_preserve_canonical_bytes(
+    section: str, field: str, value: str, expected: bytes
+) -> None:
+    payload = _payload()
+    _items(payload, section)[0][field] = value
+    observation = _observation(_outcome(payload), section)
+    assert getattr(observation, field).encode() == expected
+
+
+@pytest.mark.parametrize(
+    "value,expected",
+    [
+        (PositionSide.LONG, b'["string","LONG"]'),
+        (PositionSide.SHORT, b'["string","SHORT"]'),
+        (OrderSide.BUY, b'["string","buy"]'),
+        (OrderSide.SELL, b'["string","sell"]'),
+    ],
+)
+def test_declared_side_enums_preserve_exact_base_string_bytes(
+    value: PositionSide | OrderSide, expected: bytes
+) -> None:
+    payload = _payload()
+    _items(payload, "journal")[0]["data_json"] = value
+    assert _outcome(payload).journal[0].data_json.encode() == expected
+
+
+@pytest.mark.parametrize(
+    "value", [_CustomStringEnum.VALUE, _CustomStrEnum.VALUE, SignalType.LONG]
+)
+@pytest.mark.parametrize(
+    "section,field",
+    [("signals", "metadata_json"), ("journal", "data_json")],
+)
+def test_undeclared_string_enums_fail_closed(
+    section: str, field: str, value: str
+) -> None:
+    payload = _payload()
+    _items(payload, section)[0][field] = value
+    with pytest.raises(ValidationError):
+        _outcome(payload)
+
+
+@pytest.mark.parametrize(
+    "section,field",
+    [("signals", "metadata_json"), ("journal", "data_json")],
+)
+def test_hostile_metaclass_string_rejects_without_dispatch(
+    section: str, field: str
+) -> None:
+    hostile = _HostileMetaclassString("valid-looking")
+    payload = _payload()
+    _items(payload, section)[0][field] = hostile
+    _HOSTILE_STRING_CALLS.clear()
+
+    with pytest.raises(ValidationError):
+        _outcome(payload)
+    assert _HOSTILE_STRING_CALLS == []
 
 
 @pytest.mark.parametrize(
