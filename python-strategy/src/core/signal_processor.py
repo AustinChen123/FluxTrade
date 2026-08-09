@@ -402,14 +402,15 @@ class SignalProcessor:
         decisions: list[tuple[str, Signal]] = []
         admission_states: dict[str, tuple[BaseStrategy, bool, object]] = {}
         for strategy in eligible_strategies:
-            if type(strategy).on_trade is BaseStrategy.on_trade:
+            on_trade = strategy.on_trade
+            if getattr(on_trade, "__func__", None) is BaseStrategy.on_trade:
                 continue
             if self.entry_admission_handler is not None:
                 admission_states[strategy.strategy_id] = (
                     strategy,
                     *self._snapshot_entry_admission_state(strategy),
                 )
-            signal = strategy.on_trade(trade)
+            signal = on_trade(trade)
             if signal is not None:
                 decisions.append((strategy.strategy_id, signal))
 
