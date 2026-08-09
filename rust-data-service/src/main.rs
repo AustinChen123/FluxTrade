@@ -182,6 +182,7 @@ async fn main() -> ExitCode {
         .expect("Failed to install crypto provider");
 
     tracing_subscriber::fmt()
+        .with_ansi(false)
         .with_max_level(Level::DEBUG)
         .init();
 
