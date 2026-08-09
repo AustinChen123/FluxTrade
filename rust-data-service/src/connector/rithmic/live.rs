@@ -709,6 +709,120 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn whole_second_trade_survives_full_live_path_before_later_fatal_payload() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("ws://{}", listener.local_addr().unwrap());
+        let (fatal_tx, fatal_rx) = tokio::sync::oneshot::channel();
+        let (payloads_sent_tx, payloads_sent_rx) = tokio::sync::oneshot::channel();
+        let server = tokio::spawn(async move {
+            let mut socket = serve_handshake(&listener).await;
+            send(&mut socket, heartbeat_response()).await;
+            assert_template(socket.next().await.unwrap().unwrap(), 113);
+            send(&mut socket, front_month_response("MNQU6")).await;
+            assert_template(socket.next().await.unwrap().unwrap(), 100);
+            send(
+                &mut socket,
+                codec::encode(&protocol::ResponseMarketDataUpdate {
+                    template_id: 101,
+                    rp_code: vec!["0".to_string()],
+                    ..Default::default()
+                })
+                .unwrap(),
+            )
+            .await;
+            send(&mut socket, last_trade_without_usecs(1_800_000_001)).await;
+            send(&mut socket, last_trade(1_800_000_061)).await;
+
+            fatal_rx.await.unwrap();
+            let mut invalid: protocol::LastTrade =
+                codec::decode(&last_trade(1_800_000_062)).unwrap();
+            invalid.trade_price = Some(0.0);
+            socket
+                .feed(Message::Binary(codec::encode(&invalid).unwrap().into()))
+                .await
+                .unwrap();
+            socket
+                .feed(Message::Binary(last_trade(1_800_000_121).into()))
+                .await
+                .unwrap();
+            socket.flush().await.unwrap();
+            payloads_sent_tx.send(()).unwrap();
+        });
+        let config = LiveConfig {
+            runtime: RuntimeConfig {
+                url,
+                login: LoginParameters::new(
+                    "test-user".to_string(),
+                    "test-password".to_string(),
+                    "test-system".to_string(),
+                    "FluxTrade".to_string(),
+                    "0.1.0".to_string(),
+                    Plant::Ticker,
+                )
+                .unwrap(),
+            },
+            startup: vec![
+                front_month::request_with_updates("live-front-month", "MNQ", "CME", true).unwrap(),
+                market::last_trade_request("CME", "MNQU6", SubscriptionAction::Subscribe).unwrap(),
+            ],
+            policy: ReconnectPolicy::new(Duration::from_millis(1), Duration::from_millis(10))
+                .unwrap(),
+            product_id: "RITHMIC:MNQ-202609".to_string(),
+            root_symbol: "MNQ".to_string(),
+            exchange: "CME".to_string(),
+            symbol: "MNQU6".to_string(),
+        };
+        let (event_tx, mut event_rx) = mpsc::channel(4);
+        let connector = tokio::spawn(run(config, event_tx));
+
+        let reset = timeout(Duration::from_secs(2), event_rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(matches!(
+            reset,
+            AggregationSourceEvent::ResetProduct(ref product_id)
+                if product_id == "RITHMIC:MNQ-202609"
+        ));
+        let candle = event_candle(
+            timeout(Duration::from_secs(2), event_rx.recv())
+                .await
+                .unwrap()
+                .unwrap(),
+        );
+        assert_eq!(candle.timestamp, 1_800_000_000_000);
+        assert_eq!(candle.open, rust_decimal_macros::dec!(29784.75));
+        assert_eq!(candle.high, rust_decimal_macros::dec!(29784.75));
+        assert_eq!(candle.low, rust_decimal_macros::dec!(29784.75));
+        assert_eq!(candle.close, rust_decimal_macros::dec!(29784.75));
+        assert_eq!(candle.volume, rust_decimal_macros::dec!(1));
+        assert!(event_rx.try_recv().is_err());
+        assert!(!connector.is_finished());
+
+        fatal_tx.send(()).unwrap();
+        timeout(Duration::from_secs(2), payloads_sent_rx)
+            .await
+            .unwrap()
+            .unwrap();
+        let error = timeout(Duration::from_secs(2), connector)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap_err();
+        let failure = error.downcast_ref::<PayloadFailure>().unwrap();
+        assert_eq!(failure.stage(), "market_decode");
+        assert_eq!(failure.stable_error_code(), "malformed_market_payload");
+        assert_eq!(failure.disposition(), "fatal_service_exit");
+        assert_eq!(failure.template_id(), Some(150));
+        assert!(failure.payload_len().is_some());
+        assert!(event_rx.try_recv().is_err());
+        timeout(Duration::from_secs(2), server)
+            .await
+            .unwrap()
+            .unwrap();
+    }
+
+    #[tokio::test]
     async fn forwarder_waits_for_bounded_destination_capacity() {
         let (source_tx, source_rx) = mpsc::channel(1);
         let (destination_tx, mut destination_rx) = mpsc::channel(1);
@@ -910,6 +1024,12 @@ mod tests {
             ..Default::default()
         })
         .unwrap()
+    }
+
+    fn last_trade_without_usecs(ssboe: i32) -> Vec<u8> {
+        let mut trade: protocol::LastTrade = codec::decode(&last_trade(ssboe)).unwrap();
+        trade.usecs = None;
+        codec::encode(&trade).unwrap()
     }
 
     fn front_month_response(symbol: &str) -> Vec<u8> {
