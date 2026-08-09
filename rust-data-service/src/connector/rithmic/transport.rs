@@ -46,7 +46,7 @@ impl PayloadFailure {
         }
     }
 
-    fn attach_transport(&mut self, template_id: Option<i32>, payload_len: usize) {
+    pub(crate) fn attach_transport(&mut self, template_id: Option<i32>, payload_len: usize) {
         self.template_id = template_id;
         self.payload_len = Some(payload_len);
     }

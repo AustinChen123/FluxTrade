@@ -19,6 +19,7 @@ use crate::publisher::{
 use anyhow::Context;
 use clap::{Parser, Subcommand};
 use dotenvy::dotenv;
+use std::process::ExitCode;
 use tokio::sync::mpsc;
 use tokio::task::JoinSet;
 use tracing::{error, info, warn, Level};
@@ -172,7 +173,7 @@ enum Commands {
 }
 
 #[tokio::main]
-async fn main() -> anyhow::Result<()> {
+async fn main() -> ExitCode {
     dotenv().ok();
 
     // Explicitly install CryptoProvider for rustls 0.23+
@@ -184,6 +185,16 @@ async fn main() -> anyhow::Result<()> {
         .with_max_level(Level::DEBUG)
         .init();
 
+    match run_application().await {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(error) => {
+            report_terminal_failure(&error);
+            ExitCode::FAILURE
+        }
+    }
+}
+
+async fn run_application() -> anyhow::Result<()> {
     let cli = Cli::parse();
 
     match cli.command.unwrap_or(Commands::Live {
@@ -368,9 +379,257 @@ impl std::fmt::Display for TaskId {
 
 fn supervised_task_exit_error(task_id: &TaskId, task_result: anyhow::Result<()>) -> anyhow::Error {
     match task_result {
-        Ok(()) => anyhow::anyhow!("Critical task '{}' exited unexpectedly", task_id),
-        Err(error) => error.context(format!("Critical task '{}' failed", task_id)),
+        Ok(()) => {
+            SupervisedFailure::new(task_id, SupervisedFailureKind::UnexpectedExit, None).into()
+        }
+        Err(error) => {
+            SupervisedFailure::new(task_id, SupervisedFailureKind::TaskError, Some(error)).into()
+        }
     }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SupervisedFailureKind {
+    TaskError,
+    UnexpectedExit,
+    CancelledJoin,
+    PanickedJoin,
+    OtherJoin,
+}
+
+impl SupervisedFailureKind {
+    fn diagnostic(self) -> (&'static str, &'static str, &'static str) {
+        match self {
+            Self::TaskError => (
+                "task_exit",
+                "supervised_task_failed",
+                "supervised task failed",
+            ),
+            Self::UnexpectedExit => (
+                "task_exit",
+                "supervised_task_exited",
+                "supervised task exited unexpectedly",
+            ),
+            Self::CancelledJoin => (
+                "task_join",
+                "supervised_task_cancelled",
+                "supervised task was cancelled",
+            ),
+            Self::PanickedJoin => (
+                "task_join",
+                "supervised_task_panicked",
+                "supervised task panicked",
+            ),
+            Self::OtherJoin => (
+                "task_join",
+                "supervised_task_join_failed",
+                "supervised task join failed",
+            ),
+        }
+    }
+}
+
+#[derive(Debug)]
+struct SupervisedFailure {
+    task: String,
+    kind: SupervisedFailureKind,
+    source: Option<anyhow::Error>,
+}
+
+impl SupervisedFailure {
+    fn new(task: &TaskId, kind: SupervisedFailureKind, source: Option<anyhow::Error>) -> Self {
+        Self {
+            task: task.to_string(),
+            kind,
+            source,
+        }
+    }
+}
+
+impl std::fmt::Display for SupervisedFailure {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(self.kind.diagnostic().2)
+    }
+}
+
+impl std::error::Error for SupervisedFailure {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        self.source.as_ref().map(|error| error.as_ref())
+    }
+}
+
+fn supervised_join_error(error: tokio::task::JoinError) -> anyhow::Error {
+    let kind = classify_join_failure(error.is_cancelled(), error.is_panic());
+    SupervisedFailure {
+        task: "unknown".to_string(),
+        kind,
+        source: None,
+    }
+    .into()
+}
+
+fn classify_join_failure(cancelled: bool, panicked: bool) -> SupervisedFailureKind {
+    if cancelled {
+        SupervisedFailureKind::CancelledJoin
+    } else if panicked {
+        SupervisedFailureKind::PanickedJoin
+    } else {
+        SupervisedFailureKind::OtherJoin
+    }
+}
+
+struct TerminalDiagnostic {
+    component: &'static str,
+    task: String,
+    operation: &'static str,
+    stage: &'static str,
+    template_id: String,
+    payload_len: String,
+    stable_error_code: &'static str,
+    disposition: &'static str,
+    state_effect: &'static str,
+    safe_cause: &'static str,
+}
+
+fn terminal_diagnostic(error: &anyhow::Error) -> TerminalDiagnostic {
+    let supervisor = error
+        .chain()
+        .find_map(|cause| cause.downcast_ref::<SupervisedFailure>());
+    let task = supervisor.map_or_else(|| "unknown".to_string(), |failure| failure.task.clone());
+    #[cfg(feature = "rithmic")]
+    if let Some(failure) = error
+        .chain()
+        .find_map(|cause| cause.downcast_ref::<crate::connector::rithmic::PayloadFailure>())
+    {
+        return TerminalDiagnostic {
+            component: "rithmic",
+            task,
+            operation: failure.operation(),
+            stage: failure.stage(),
+            template_id: failure
+                .template_id()
+                .map_or_else(|| "unknown".to_string(), |value| value.to_string()),
+            payload_len: failure
+                .payload_len()
+                .map_or_else(|| "unknown".to_string(), |value| value.to_string()),
+            stable_error_code: failure.stable_error_code(),
+            disposition: failure.disposition(),
+            state_effect: failure.state_effect(),
+            safe_cause: failure.safe_cause(),
+        };
+    }
+    #[cfg(feature = "rithmic")]
+    if error
+        .chain()
+        .any(crate::connector::rithmic::is_handshake_rejection)
+    {
+        return TerminalDiagnostic {
+            component: "rithmic",
+            task,
+            operation: "handshake",
+            stage: "handshake",
+            template_id: "unknown".to_string(),
+            payload_len: "unknown".to_string(),
+            stable_error_code: "rithmic_handshake_rejected",
+            disposition: "fatal_service_exit",
+            state_effect: "session_failed",
+            safe_cause: "Rithmic handshake rejected",
+        };
+    }
+    let (stage, stable_error_code, safe_cause) = supervisor
+        .map(|failure| failure.kind.diagnostic())
+        .unwrap_or((
+            "unknown",
+            "terminal_failure",
+            "terminal failure details unavailable",
+        ));
+    TerminalDiagnostic {
+        component: "unknown",
+        task,
+        operation: "unknown",
+        stage,
+        template_id: "unknown".to_string(),
+        payload_len: "unknown".to_string(),
+        stable_error_code,
+        disposition: "fatal_service_exit",
+        state_effect: "process_exit",
+        safe_cause,
+    }
+}
+
+fn report_terminal_failure(error: &anyhow::Error) {
+    let diagnostic = terminal_diagnostic(error);
+    error!(
+        component = %diagnostic.component, task = %diagnostic.task,
+        operation = %diagnostic.operation, stage = %diagnostic.stage,
+        template_id = %diagnostic.template_id, payload_len = %diagnostic.payload_len,
+        stable_error_code = %diagnostic.stable_error_code, disposition = %diagnostic.disposition,
+        state_effect = %diagnostic.state_effect, safe_cause = %diagnostic.safe_cause,
+        "FluxTrade terminal failure"
+    );
+}
+
+#[cfg(test)]
+#[derive(Clone)]
+struct CaptureLayer {
+    events: std::sync::Arc<std::sync::Mutex<Vec<std::collections::BTreeMap<String, String>>>>,
+}
+
+#[cfg(test)]
+impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for CaptureLayer {
+    fn on_event(
+        &self,
+        event: &tracing::Event<'_>,
+        _context: tracing_subscriber::layer::Context<'_, S>,
+    ) {
+        if *event.metadata().level() != Level::ERROR {
+            return;
+        }
+        let mut fields = std::collections::BTreeMap::new();
+        event.record(&mut FieldVisitor(&mut fields));
+        self.events.lock().unwrap().push(fields);
+    }
+}
+
+#[cfg(test)]
+struct FieldVisitor<'a>(&'a mut std::collections::BTreeMap<String, String>);
+
+#[cfg(test)]
+impl tracing::field::Visit for FieldVisitor<'_> {
+    fn record_str(&mut self, field: &tracing::field::Field, value: &str) {
+        self.0.insert(field.name().to_string(), value.to_string());
+    }
+
+    fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+        self.0.insert(
+            field.name().to_string(),
+            format!("{value:?}").trim_matches('"').to_string(),
+        );
+    }
+}
+
+#[cfg(test)]
+fn capture_error_events(
+    operation: impl FnOnce(),
+) -> Vec<std::collections::BTreeMap<String, String>> {
+    use tracing_subscriber::prelude::*;
+
+    let events = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let subscriber = tracing_subscriber::registry().with(CaptureLayer {
+        events: std::sync::Arc::clone(&events),
+    });
+    tracing::subscriber::with_default(subscriber, operation);
+    std::sync::Arc::try_unwrap(events)
+        .unwrap()
+        .into_inner()
+        .unwrap()
+}
+
+#[cfg(test)]
+fn capture_terminal_event(error: &anyhow::Error) -> std::collections::BTreeMap<String, String> {
+    let mut captured = capture_error_events(|| report_terminal_failure(error));
+    assert_eq!(captured.len(), 1);
+    captured.pop().unwrap()
 }
 
 #[cfg(feature = "rithmic")]
@@ -635,14 +894,12 @@ async fn run_live_mode(
                 }
                 Some(Ok((task_id, task_result))) => {
                     let error = supervised_task_exit_error(&task_id, task_result);
-                    error!("{:#}", error);
                     join_set.shutdown().await;
                     return Err(error);
                 }
                 Some(Err(join_err)) => {
-                    error!("Supervised task join failed: {:?}", join_err);
                     join_set.shutdown().await;
-                    return Err(anyhow::anyhow!("Supervised task join failed: {:?}", join_err));
+                    return Err(supervised_join_error(join_err));
                 }
             }
         }
@@ -918,22 +1175,13 @@ async fn run_binance_connector(
     let mut conn = BinanceConnector::new();
     info!("Starting Binance Connector...");
 
-    if let Err(e) = conn.subscribe_trades(&symbols, trade_tx).await {
-        error!("Binance trades error: {}", e);
-        return Err(e);
-    }
+    conn.subscribe_trades(&symbols, trade_tx).await?;
 
-    if let Err(e) = conn.subscribe_candles(&symbols, "1m", candle_tx).await {
-        error!("Binance candles error: {}", e);
-        return Err(e);
-    }
+    conn.subscribe_candles(&symbols, "1m", candle_tx).await?;
 
     // Credential completeness is validated before any connector task is spawned.
     if user_stream_enabled {
-        if let Err(e) = conn.subscribe_user_stream(user_tx).await {
-            error!("Binance user stream error: {}", e);
-            return Err(e);
-        }
+        conn.subscribe_user_stream(user_tx).await?;
     } else {
         info!("BINANCE_API_KEY not found, skipping User Data Stream");
     }
@@ -953,15 +1201,9 @@ async fn run_bybit_connector(
     let mut conn = BybitConnector::new();
     info!("Starting Bybit Connector...");
 
-    if let Err(e) = conn.subscribe_trades(&symbols, trade_tx).await {
-        error!("Bybit trades error: {}", e);
-        return Err(e);
-    }
+    conn.subscribe_trades(&symbols, trade_tx).await?;
 
-    if let Err(e) = conn.subscribe_candles(&symbols, "1m", candle_tx).await {
-        error!("Bybit candles error: {}", e);
-        return Err(e);
-    }
+    conn.subscribe_candles(&symbols, "1m", candle_tx).await?;
 
     std::future::pending::<()>().await;
     Ok(())
@@ -981,25 +1223,14 @@ async fn run_backpack_connector(
     // Backpack symbols often use underscore
     let backpack_symbols = vec!["BTC_USDC".to_string(), "SOL_USDC".to_string()];
 
-    if let Err(e) = conn.subscribe_trades(&backpack_symbols, trade_tx).await {
-        error!("Backpack trades error: {}", e);
-        return Err(e);
-    }
+    conn.subscribe_trades(&backpack_symbols, trade_tx).await?;
 
-    if let Err(e) = conn
-        .subscribe_candles(&backpack_symbols, "1m", candle_tx)
-        .await
-    {
-        error!("Backpack candles error: {}", e);
-        return Err(e);
-    }
+    conn.subscribe_candles(&backpack_symbols, "1m", candle_tx)
+        .await?;
 
     // Credential completeness is validated before any connector task is spawned.
     if user_stream_enabled {
-        if let Err(e) = conn.subscribe_user_stream(user_tx).await {
-            error!("Backpack user stream error: {}", e);
-            return Err(e);
-        }
+        conn.subscribe_user_stream(user_tx).await?;
     } else {
         info!("Backpack API Key/Secret not found, skipping User Data Stream");
     }
@@ -1012,7 +1243,135 @@ async fn run_backpack_connector(
 mod tests {
     use super::*;
     use crate::environment::RuntimeEnvironment;
+    use futures_util::FutureExt;
+    use std::sync::Mutex;
     use std::time::Duration;
+
+    static ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    struct EnvVarGuard {
+        name: &'static str,
+        prior: Option<std::ffi::OsString>,
+    }
+
+    impl EnvVarGuard {
+        fn remove(name: &'static str) -> Self {
+            let prior = std::env::var_os(name);
+            std::env::remove_var(name);
+            Self { name, prior }
+        }
+    }
+
+    impl Drop for EnvVarGuard {
+        fn drop(&mut self) {
+            match self.prior.take() {
+                Some(value) => std::env::set_var(self.name, value),
+                None => std::env::remove_var(self.name),
+            }
+        }
+    }
+
+    fn assert_generic_terminal_fields(fields: &std::collections::BTreeMap<String, String>) {
+        assert_eq!(fields.len(), 11);
+        assert_eq!(fields["message"], "FluxTrade terminal failure");
+        assert_eq!(fields["component"], "unknown");
+        assert_eq!(fields["task"], "unknown");
+        assert_eq!(fields["operation"], "unknown");
+        assert_eq!(fields["stage"], "unknown");
+        assert_eq!(fields["template_id"], "unknown");
+        assert_eq!(fields["payload_len"], "unknown");
+        assert_eq!(fields["stable_error_code"], "terminal_failure");
+        assert_eq!(fields["disposition"], "fatal_service_exit");
+        assert_eq!(fields["state_effect"], "process_exit");
+        assert_eq!(fields["safe_cause"], "terminal failure details unavailable");
+    }
+
+    #[test]
+    fn terminal_reporter_emits_ten_independent_fields_and_fixed_message() {
+        assert_generic_terminal_fields(&capture_terminal_event(&anyhow::anyhow!("secret")));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn binance_wrapper_propagates_then_reports_exactly_one_error_without_network_poll() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let _key = EnvVarGuard::remove("BINANCE_API_KEY");
+        let (trade_tx, _) = mpsc::channel(1);
+        let (candle_tx, _) = mpsc::channel(1);
+        let (user_tx, _) = mpsc::channel(1);
+        let mut events = capture_error_events(|| {
+            let future = run_binance_connector(Vec::new(), trade_tx, candle_tx, user_tx, true);
+            let source = future.now_or_never().unwrap().unwrap_err();
+            let error =
+                supervised_task_exit_error(&TaskId::Connector("binance".to_string()), Err(source));
+            report_terminal_failure(&error);
+        });
+
+        assert_eq!(events.len(), 1);
+        let fields = events.pop().unwrap();
+        assert_eq!(fields.len(), 11);
+        assert_eq!(fields["message"], "FluxTrade terminal failure");
+        assert_eq!(fields["component"], "unknown");
+        assert_eq!(fields["task"], "connector:binance");
+        assert_eq!(fields["operation"], "unknown");
+        assert_eq!(fields["stage"], "task_exit");
+        assert_eq!(fields["template_id"], "unknown");
+        assert_eq!(fields["payload_len"], "unknown");
+        assert_eq!(fields["stable_error_code"], "supervised_task_failed");
+        assert_eq!(fields["disposition"], "fatal_service_exit");
+        assert_eq!(fields["state_effect"], "process_exit");
+        assert_eq!(fields["safe_cause"], "supervised task failed");
+    }
+
+    #[tokio::test]
+    async fn actual_join_errors_select_safe_terminal_classifications() {
+        let cancelled = tokio::spawn(std::future::pending::<()>());
+        cancelled.abort();
+        let cancelled = supervised_join_error(cancelled.await.unwrap_err());
+        let cancelled_fields = capture_terminal_event(&cancelled);
+        assert_eq!(
+            cancelled_fields["stable_error_code"],
+            "supervised_task_cancelled"
+        );
+
+        let panicked = tokio::spawn(async { panic!("panic-payload-sentinel") });
+        let panicked = supervised_join_error(panicked.await.unwrap_err());
+        let panicked_fields = capture_terminal_event(&panicked);
+        assert_eq!(
+            panicked_fields["stable_error_code"],
+            "supervised_task_panicked"
+        );
+        assert!(panicked_fields
+            .values()
+            .all(|value| !value.contains("panic-payload-sentinel")));
+    }
+
+    #[cfg(feature = "rithmic")]
+    #[test]
+    fn typed_payload_metadata_reaches_supervised_terminal_event_through_contexts() {
+        let mut failure = crate::connector::rithmic::PayloadFailure::new(
+            crate::connector::rithmic::PayloadFailureKind::MarketDecode,
+        );
+        failure.attach_transport(Some(151), 777);
+        let source = anyhow::Error::new(failure)
+            .context("payload boundary")
+            .context("connector boundary");
+        let error =
+            supervised_task_exit_error(&TaskId::Connector("rithmic".to_string()), Err(source));
+        let fields = capture_terminal_event(&error);
+
+        assert_eq!(fields.len(), 11);
+        assert_eq!(fields["message"], "FluxTrade terminal failure");
+        assert_eq!(fields["component"], "rithmic");
+        assert_eq!(fields["task"], "connector:rithmic");
+        assert_eq!(fields["operation"], "handle_payload");
+        assert_eq!(fields["stage"], "market_decode");
+        assert_eq!(fields["template_id"], "151");
+        assert_eq!(fields["payload_len"], "777");
+        assert_eq!(fields["stable_error_code"], "malformed_market_payload");
+        assert_eq!(fields["disposition"], "fatal_service_exit");
+        assert_eq!(fields["state_effect"], "none");
+        assert_eq!(fields["safe_cause"], "market payload validation failed");
+    }
 
     #[test]
     fn test_task_id_display() {
@@ -1091,14 +1450,26 @@ mod tests {
             TaskId::Connector("backpack".to_string()),
             TaskId::Connector("rithmic".to_string()),
         ] {
-            assert!(supervised_task_exit_error(&task_id, Ok(()))
-                .to_string()
-                .contains("exited unexpectedly"));
-            assert!(format!(
-                "{:#}",
-                supervised_task_exit_error(&task_id, Err(anyhow::anyhow!("test failure")))
-            )
-            .contains("test failure"));
+            let clean = supervised_task_exit_error(&task_id, Ok(()));
+            assert_eq!(
+                terminal_diagnostic(&clean).stable_error_code,
+                "supervised_task_exited"
+            );
+            let failed = supervised_task_exit_error(&task_id, Err(anyhow::anyhow!("secret")));
+            assert_eq!(
+                terminal_diagnostic(&failed).stable_error_code,
+                "supervised_task_failed"
+            );
+        }
+        for (cancelled, panicked, expected) in [
+            (true, false, "supervised_task_cancelled"),
+            (false, true, "supervised_task_panicked"),
+            (false, false, "supervised_task_join_failed"),
+        ] {
+            assert_eq!(
+                classify_join_failure(cancelled, panicked).diagnostic().1,
+                expected
+            );
         }
     }
 
@@ -1112,15 +1483,12 @@ mod tests {
         assert_eq!(
             error.chain().map(ToString::to_string).collect::<Vec<_>>(),
             [
-                "Critical task 'connector:rithmic' failed",
+                "supervised task failed",
                 "Rithmic payload handler failed",
                 "unsupported Rithmic market-data template 151",
             ]
         );
-        assert_eq!(
-            format!("{error:#}"),
-            "Critical task 'connector:rithmic' failed: Rithmic payload handler failed: unsupported Rithmic market-data template 151"
-        );
+        assert_eq!(terminal_diagnostic(&error).task, "connector:rithmic");
     }
 
     #[test]

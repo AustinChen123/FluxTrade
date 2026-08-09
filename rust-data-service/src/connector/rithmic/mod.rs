@@ -43,9 +43,13 @@ pub(crate) mod protocol {
 
 #[allow(dead_code)]
 mod session;
+pub(crate) use session::is_handshake_rejection;
 
 #[allow(dead_code)]
 mod transport;
+pub(crate) use transport::PayloadFailure;
+#[cfg(test)]
+pub(crate) use transport::PayloadFailureKind;
 
 #[cfg(test)]
 mod tests {

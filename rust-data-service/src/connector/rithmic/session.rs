@@ -12,6 +12,11 @@ pub(crate) fn is_fatal_session_error(error: &anyhow::Error) -> bool {
     error.downcast_ref::<FatalSessionError>().is_some()
 }
 
+pub(crate) fn is_handshake_rejection(error: &(dyn std::error::Error + 'static)) -> bool {
+    matches!(error.downcast_ref::<FatalSessionError>(), Some(error)
+        if error.0 == "stable_error_code=rithmic_handshake_rejected")
+}
+
 const SYSTEM_INFO_REQUEST: i32 = 16;
 const SYSTEM_INFO_RESPONSE: i32 = 17;
 const LOGIN_REQUEST: i32 = 10;
@@ -562,6 +567,7 @@ mod tests {
             .accept_system_info(&system_info(&["test-system"], "9"))
             .unwrap_err();
         assert!(is_fatal_session_error(&error));
+        assert!(!error.chain().any(is_handshake_rejection));
         assert!(error.to_string().contains("system-info"));
         assert_eq!(session.state(), SessionState::Failed);
     }
@@ -585,6 +591,7 @@ mod tests {
         let error = session.accept_login(&response).unwrap_err();
 
         assert!(is_fatal_session_error(&error));
+        assert!(!error.chain().any(is_handshake_rejection));
         assert_eq!(
             error.to_string(),
             "Rithmic login handshake response code 13"
@@ -718,6 +725,7 @@ mod tests {
         let mut terminated = activate(Plant::Ticker);
         let error = terminated.accept_control(&forced_logout).unwrap_err();
         assert!(is_fatal_session_error(&error));
+        assert!(!error.chain().any(is_handshake_rejection));
         assert_eq!(terminated.state(), SessionState::Failed);
     }
 
@@ -782,14 +790,24 @@ mod tests {
 
             for mut session in handshake_sessions() {
                 let error = session.reject_terminal(&reject).unwrap_err();
+                let error = error
+                    .context("outer handshake context")
+                    .context("terminal owner");
                 let chain = error.chain().map(ToString::to_string).collect::<Vec<_>>();
                 let alternate = format!("{error:#}");
 
                 assert!(is_fatal_session_error(&error));
+                assert!(error.chain().any(is_handshake_rejection));
                 assert_eq!(session.state(), SessionState::Failed);
-                assert_eq!(error.to_string(), SAFE_MESSAGE);
-                assert_eq!(chain, [SAFE_MESSAGE]);
-                assert_eq!(alternate, SAFE_MESSAGE);
+                assert_eq!(error.root_cause().to_string(), SAFE_MESSAGE);
+                assert_eq!(
+                    chain,
+                    ["terminal owner", "outer handshake context", SAFE_MESSAGE]
+                );
+                assert_eq!(
+                    alternate,
+                    format!("terminal owner: outer handshake context: {SAFE_MESSAGE}")
+                );
                 for sentinel in SENTINELS {
                     assert!(!alternate.contains(sentinel));
                     assert!(chain.iter().all(|layer| !layer.contains(sentinel)));
