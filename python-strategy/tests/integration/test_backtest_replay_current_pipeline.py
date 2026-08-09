@@ -30,6 +30,8 @@ from src.core.orm_models import (
     Strategy,
 )
 from src.strategies.callable_strategy import CallableStrategy
+from src.validation.backtest_capture import capture_signal_batch
+from src.validation.trading_outcome import SignalObservation
 
 try:
     import fluxtrade_core  # noqa: F401
@@ -51,7 +53,7 @@ def _compile_jsonb_for_sqlite(type_, compiler, **kw):
     return "JSON"
 
 
-def _sqlite_backtest_session_factory(tmp_path):
+def _sqlite_backtest_session_factory(tmp_path, request: pytest.FixtureRequest):
     engine = create_engine(
         f"sqlite:///{tmp_path / 'current_backtest_replay.db'}",
         connect_args={"check_same_thread": False, "timeout": 30},
@@ -67,6 +69,7 @@ def _sqlite_backtest_session_factory(tmp_path):
         table.create(engine, checkfirst=True)
 
     session_factory = sessionmaker(bind=engine)
+    request.addfinalizer(engine.dispose)
     with session_factory() as session:
         session.add(Exchange(id="BINANCE", name="Binance"))
         session.add(
@@ -83,10 +86,15 @@ def _sqlite_backtest_session_factory(tmp_path):
 
 
 @pytest.mark.smoke
-def test_current_backtest_replay_persists_trades_and_metrics(tmp_path):
-    session_factory = _sqlite_backtest_session_factory(tmp_path)
+def test_current_backtest_replay_persists_trades_and_metrics(
+    tmp_path, request: pytest.FixtureRequest
+):
+    session_factory = _sqlite_backtest_session_factory(tmp_path, request)
     candles = make_candle_series(count=2_000)
-    observed_batches: list[tuple[Signal, ...]] = []
+    observed_batches: list[tuple[SignalObservation, ...]] = []
+
+    def capture_batch(batch: tuple[Signal, ...]) -> None:
+        observed_batches.append(capture_signal_batch(batch))
 
     def predict(candle):
         index = (candle.timestamp - candles[0].timestamp) // INTERVAL_MS
@@ -125,7 +133,7 @@ def test_current_backtest_replay_persists_trades_and_metrics(tmp_path):
             "journal_export": False,
         },
         db_session_factory=session_factory,
-        signal_batch_observer=observed_batches.append,
+        signal_batch_observer=capture_batch,
     )
     runner.add_strategy(
         CallableStrategy("current_replay", predict, PRODUCT_ID, TIMEFRAME)
@@ -135,13 +143,9 @@ def test_current_backtest_replay_persists_trades_and_metrics(tmp_path):
 
     with session_factory() as session:
         summary = session.scalars(select(BacktestResultSummary)).one()
-        trade_count = session.scalar(
-            select(func.count()).select_from(BacktestTradeLog)
-        )
+        trade_count = session.scalar(select(func.count()).select_from(BacktestTradeLog))
         audit_count = session.scalar(select(func.count()).select_from(SignalAudit))
-        strategy_ids = set(
-            session.scalars(select(BacktestTradeLog.strategy_id)).all()
-        )
+        strategy_ids = set(session.scalars(select(BacktestTradeLog.strategy_id)).all())
         fill_sequences = list(
             session.scalars(
                 select(BacktestTradeLog.fill_sequence).order_by(
@@ -163,12 +167,13 @@ def test_current_backtest_replay_persists_trades_and_metrics(tmp_path):
     observed_signals = tuple(signal for batch in observed_batches for signal in batch)
     assert len(observed_batches) == len(candles)
     assert len(observed_signals) == len(candles)
-    assert sum(signal.type != SignalType.NO_SIGNAL for signal in observed_signals) == 50
-    client_order_ids: set[str] = set()
+    assert all(type(signal) is SignalObservation for signal in observed_signals)
+    assert sum(signal.signal_type != "NO_SIGNAL" for signal in observed_signals) == 50
+    metadata_values: set[str] = set()
     for signal in observed_signals:
-        assert signal.metadata is not None
-        client_order_ids.add(signal.metadata["client_order_id"])
-    assert len(client_order_ids) == len(candles)
+        assert "client_order_id" in signal.metadata_json
+        metadata_values.add(signal.metadata_json)
+    assert len(metadata_values) == len(candles)
     assert result["journal_count"] >= trade_count
     assert result["total_trades"] == 25
     assert metrics["total_trades"] == 25
