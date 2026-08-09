@@ -176,15 +176,12 @@ enum Commands {
 async fn main() -> ExitCode {
     dotenv().ok();
 
+    initialize_process_diagnostics();
+
     // Explicitly install CryptoProvider for rustls 0.23+
     rustls::crypto::ring::default_provider()
         .install_default()
         .expect("Failed to install crypto provider");
-
-    tracing_subscriber::fmt()
-        .with_ansi(false)
-        .with_max_level(Level::DEBUG)
-        .init();
 
     match run_application().await {
         Ok(()) => ExitCode::SUCCESS,
@@ -193,6 +190,38 @@ async fn main() -> ExitCode {
             ExitCode::FAILURE
         }
     }
+}
+
+fn initialize_process_diagnostics() {
+    tracing_subscriber::fmt()
+        .with_ansi(false)
+        .with_max_level(Level::DEBUG)
+        .init();
+    install_sanitized_panic_hook();
+}
+
+fn install_sanitized_panic_hook() {
+    std::panic::set_hook(Box::new(|info| {
+        let (source_file, source_line, source_column) =
+            info.location().map_or(("unknown", 0, 0), |location| {
+                (
+                    std::path::Path::new(location.file())
+                        .file_name()
+                        .and_then(std::ffi::OsStr::to_str)
+                        .unwrap_or("unknown"),
+                    location.line(),
+                    location.column(),
+                )
+            });
+        warn!(
+            component = %"runtime", task = %"unknown", operation = %"panic",
+            stage = %"panic_hook", template_id = %"unknown", payload_len = %"unknown",
+            stable_error_code = %"panic_observed", disposition = %"continue_unwind",
+            state_effect = %"unwinding", safe_cause = %"panic payload suppressed",
+            source_file = %source_file, source_line, source_column,
+            "FluxTrade panic observed"
+        );
+    }));
 }
 
 async fn run_application() -> anyhow::Result<()> {
@@ -479,6 +508,7 @@ fn classify_join_failure(cancelled: bool, panicked: bool) -> SupervisedFailureKi
     }
 }
 
+#[derive(Debug, PartialEq, Eq)]
 struct TerminalDiagnostic {
     component: &'static str,
     task: String,
@@ -620,10 +650,8 @@ fn capture_error_events(
         events: std::sync::Arc::clone(&events),
     });
     tracing::subscriber::with_default(subscriber, operation);
-    std::sync::Arc::try_unwrap(events)
-        .unwrap()
-        .into_inner()
-        .unwrap()
+    let captured = events.lock().unwrap().clone();
+    captured
 }
 
 #[cfg(test)]
@@ -1245,10 +1273,14 @@ mod tests {
     use super::*;
     use crate::environment::RuntimeEnvironment;
     use futures_util::FutureExt;
+    use std::process::Command;
     use std::sync::Mutex;
     use std::time::Duration;
 
     static ENV_LOCK: Mutex<()> = Mutex::new(());
+    const PANIC_CHILD_ENV: &str = "FLUXTRADE_PANIC_HOOK_SUBPROCESS";
+    const PANIC_CHILD_VALUE: &str = "fluxtrade-panic-hook-child-v1";
+    const PANIC_SENTINEL: &str = "panic-provider-payload-sentinel";
 
     struct EnvVarGuard {
         name: &'static str,
@@ -1290,6 +1322,222 @@ mod tests {
     #[test]
     fn terminal_reporter_emits_ten_independent_fields_and_fixed_message() {
         assert_generic_terminal_fields(&capture_terminal_event(&anyhow::anyhow!("secret")));
+    }
+
+    #[test]
+    fn panic_hook_subprocess_child() {
+        if std::env::var(PANIC_CHILD_ENV).as_deref() != Ok(PANIC_CHILD_VALUE) {
+            return;
+        }
+
+        initialize_process_diagnostics();
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("child runtime should build")
+            .block_on(async {
+                let panicked = tokio::spawn(async { panic!("{PANIC_SENTINEL}") });
+                let error = supervised_join_error(panicked.await.unwrap_err());
+                report_terminal_failure(&error);
+            });
+    }
+
+    #[test]
+    fn panic_hook_subprocess_suppresses_payload_and_reports_once() {
+        let output = Command::new(std::env::current_exe().expect("test executable should exist"))
+            .args([
+                "tests::panic_hook_subprocess_child",
+                "--exact",
+                "--nocapture",
+            ])
+            .env(PANIC_CHILD_ENV, PANIC_CHILD_VALUE)
+            .output()
+            .expect("panic-hook child should run");
+
+        for stream in [&output.stdout, &output.stderr] {
+            assert!(
+                !stream
+                    .windows(PANIC_SENTINEL.len())
+                    .any(|bytes| bytes == PANIC_SENTINEL.as_bytes()),
+                "panic payload leaked in raw subprocess output"
+            );
+        }
+        assert!(output.status.success(), "child failed: {output:?}");
+        let stdout = String::from_utf8(output.stdout).expect("stdout should be UTF-8");
+        let stderr = String::from_utf8(output.stderr).expect("stderr should be UTF-8");
+        let combined = format!("{stdout}\n{stderr}");
+        assert_eq!(combined.matches("FluxTrade panic observed").count(), 1);
+        assert_eq!(combined.matches(" WARN ").count(), 1);
+        assert_eq!(combined.matches("FluxTrade terminal failure").count(), 1);
+        assert!(!combined.contains("Error:"), "Result termination leaked");
+
+        let warning = combined
+            .lines()
+            .find(|line| line.contains("FluxTrade panic observed"))
+            .expect("panic warning should be present");
+        assert!(warning.contains(" WARN "), "wrong severity: {warning}");
+        for field in [
+            "component=runtime",
+            "task=unknown",
+            "operation=panic",
+            "stage=panic_hook",
+            "template_id=unknown",
+            "payload_len=unknown",
+            "stable_error_code=panic_observed",
+            "disposition=continue_unwind",
+            "state_effect=unwinding",
+            "safe_cause=panic payload suppressed",
+            "source_file=main.rs",
+        ] {
+            assert!(warning.contains(field), "missing {field}: {warning}");
+        }
+        let numeric_field = |name: &str| {
+            warning
+                .split_whitespace()
+                .find_map(|field| field.strip_prefix(name))
+                .unwrap_or_else(|| panic!("missing {name}: {warning}"))
+                .parse::<u32>()
+                .unwrap_or_else(|_| panic!("non-numeric {name}: {warning}"))
+        };
+        assert!(numeric_field("source_line=") > 0);
+        assert!(numeric_field("source_column=") > 0);
+
+        let terminal = combined
+            .lines()
+            .find(|line| line.contains("FluxTrade terminal failure"))
+            .expect("terminal event should be present");
+        assert!(terminal.contains(" ERROR "), "wrong severity: {terminal}");
+    }
+
+    #[test]
+    fn terminal_diagnostic_classification_matrix_has_exact_structs() {
+        let generic = |task: &str, stage, stable_error_code, safe_cause| TerminalDiagnostic {
+            component: "unknown",
+            task: task.to_string(),
+            operation: "unknown",
+            stage,
+            template_id: "unknown".to_string(),
+            payload_len: "unknown".to_string(),
+            stable_error_code,
+            disposition: "fatal_service_exit",
+            state_effect: "process_exit",
+            safe_cause,
+        };
+        let direct_supervisor = |kind| {
+            anyhow::Error::new(SupervisedFailure {
+                task: "unknown".to_string(),
+                kind,
+                source: None,
+            })
+        };
+        let mut cases = vec![
+            (
+                "generic",
+                anyhow::anyhow!("generic-secret"),
+                generic(
+                    "unknown",
+                    "unknown",
+                    "terminal_failure",
+                    "terminal failure details unavailable",
+                ),
+            ),
+            (
+                "TaskError",
+                supervised_task_exit_error(
+                    &TaskId::Connector("binance".to_string()),
+                    Err(anyhow::anyhow!("task-secret")),
+                ),
+                generic(
+                    "connector:binance",
+                    "task_exit",
+                    "supervised_task_failed",
+                    "supervised task failed",
+                ),
+            ),
+            (
+                "UnexpectedExit",
+                supervised_task_exit_error(&TaskId::EventLoop, Ok(())),
+                generic(
+                    "event-loop",
+                    "task_exit",
+                    "supervised_task_exited",
+                    "supervised task exited unexpectedly",
+                ),
+            ),
+        ];
+        for (name, kind, code, cause) in [
+            (
+                "CancelledJoin",
+                SupervisedFailureKind::CancelledJoin,
+                "supervised_task_cancelled",
+                "supervised task was cancelled",
+            ),
+            (
+                "PanickedJoin",
+                SupervisedFailureKind::PanickedJoin,
+                "supervised_task_panicked",
+                "supervised task panicked",
+            ),
+            (
+                "OtherJoin",
+                SupervisedFailureKind::OtherJoin,
+                "supervised_task_join_failed",
+                "supervised task join failed",
+            ),
+        ] {
+            cases.push((
+                name,
+                direct_supervisor(kind),
+                generic("unknown", "task_join", code, cause),
+            ));
+        }
+
+        #[cfg(feature = "rithmic")]
+        {
+            let mut failure = crate::connector::rithmic::PayloadFailure::new(
+                crate::connector::rithmic::PayloadFailureKind::MarketDecode,
+            );
+            failure.attach_transport(Some(151), 777);
+            let source = anyhow::Error::new(failure)
+                .context("payload boundary")
+                .context("connector boundary");
+            cases.push((
+                "RithmicPayload",
+                supervised_task_exit_error(&TaskId::Connector("rithmic".to_string()), Err(source)),
+                TerminalDiagnostic {
+                    component: "rithmic",
+                    task: "connector:rithmic".to_string(),
+                    operation: "handle_payload",
+                    stage: "market_decode",
+                    template_id: "151".to_string(),
+                    payload_len: "777".to_string(),
+                    stable_error_code: "malformed_market_payload",
+                    disposition: "fatal_service_exit",
+                    state_effect: "none",
+                    safe_cause: "market payload validation failed",
+                },
+            ));
+            cases.push((
+                "HandshakeReject",
+                crate::connector::rithmic::handshake_rejection_with_contexts(),
+                TerminalDiagnostic {
+                    component: "rithmic",
+                    task: "unknown".to_string(),
+                    operation: "handshake",
+                    stage: "handshake",
+                    template_id: "unknown".to_string(),
+                    payload_len: "unknown".to_string(),
+                    stable_error_code: "rithmic_handshake_rejected",
+                    disposition: "fatal_service_exit",
+                    state_effect: "session_failed",
+                    safe_cause: "Rithmic handshake rejected",
+                },
+            ));
+        }
+
+        for (name, error, expected) in cases {
+            assert_eq!(terminal_diagnostic(&error), expected, "{name}");
+        }
     }
 
     #[tokio::test(flavor = "current_thread")]

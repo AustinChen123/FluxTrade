@@ -394,6 +394,38 @@ fn ensure_handshake_success(rp_codes: &[String], phase: &str) -> Result<()> {
 }
 
 #[cfg(test)]
+pub(crate) fn handshake_rejection_with_contexts() -> anyhow::Error {
+    let login = LoginParameters::new(
+        "test-user".to_string(),
+        "test-password".to_string(),
+        "test-system".to_string(),
+        "FluxTrade".to_string(),
+        "0.1.0".to_string(),
+        Plant::Ticker,
+    )
+    .expect("test login parameters should be valid");
+    let mut session = RithmicSession::new(login);
+    session
+        .begin_system_info()
+        .expect("test session should enter the system-info handshake");
+    let reject = codec::encode(&protocol::Reject {
+        template_id: REJECT,
+        user_msg: vec!["provider-user-sentinel".to_string()],
+        rp_code: vec![
+            "provider-code-sentinel".to_string(),
+            "provider-detail-sentinel".to_string(),
+        ],
+    })
+    .expect("test reject should encode");
+
+    session
+        .reject_terminal(&reject)
+        .expect_err("handshake reject should fail the session")
+        .context("outer handshake context")
+        .context("terminal owner context")
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
 

@@ -43,6 +43,8 @@ pub(crate) mod protocol {
 
 #[allow(dead_code)]
 mod session;
+#[cfg(test)]
+pub(crate) use session::handshake_rejection_with_contexts;
 pub(crate) use session::is_handshake_rejection;
 
 #[allow(dead_code)]
