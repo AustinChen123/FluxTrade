@@ -264,13 +264,9 @@ impl RithmicSession {
 
     fn accept_handshake_reject(&mut self, frame: &[u8]) -> Result<()> {
         expect_template(frame, REJECT)?;
-        let response: protocol::Reject = codec::decode(frame)?;
+        let _: protocol::Reject = codec::decode(frame)?;
         self.state = SessionState::Failed;
-        Err(FatalSessionError(format!(
-            "Rithmic rejected the session: {}",
-            response.rp_code.join(",")
-        ))
-        .into())
+        Err(FatalSessionError("stable_error_code=rithmic_handshake_rejected".to_string()).into())
     }
 
     fn accept_forced_logout(&mut self, frame: &[u8]) -> Result<()> {
@@ -450,6 +446,21 @@ mod tests {
             .accept_login(&login_response(Some(30.0), "0"))
             .unwrap();
         session
+    }
+
+    fn handshake_sessions() -> [RithmicSession; 2] {
+        let mut discovery = RithmicSession::new(login(Plant::Ticker));
+        discovery.begin_system_info().unwrap();
+
+        let mut login_session = RithmicSession::new(login(Plant::Ticker));
+        login_session.begin_system_info().unwrap();
+        login_session
+            .accept_system_info(&system_info(&["test-system"], "0"))
+            .unwrap();
+        login_session.mark_reconnected().unwrap();
+        login_session.begin_login().unwrap();
+
+        [discovery, login_session]
     }
 
     #[test]
@@ -742,6 +753,48 @@ mod tests {
             let error = login_session.reject_terminal(&frame).unwrap_err();
             assert!(is_fatal_session_error(&error));
             assert_eq!(login_session.state(), SessionState::Failed);
+        }
+    }
+
+    #[test]
+    fn handshake_reject_error_chain_excludes_provider_controlled_values() {
+        const SAFE_MESSAGE: &str = "stable_error_code=rithmic_handshake_rejected";
+        const SENTINELS: [&str; 3] = [
+            "provider-user-sentinel",
+            "provider-code-sentinel",
+            "provider-detail-sentinel",
+        ];
+
+        for (user_msg, rp_code) in [
+            (
+                vec![SENTINELS[0].to_string()],
+                vec![SENTINELS[1].to_string(), SENTINELS[2].to_string()],
+            ),
+            (vec![String::new()], vec![String::new()]),
+            (vec![], vec![]),
+        ] {
+            let reject = codec::encode(&protocol::Reject {
+                template_id: REJECT,
+                user_msg,
+                rp_code,
+            })
+            .unwrap();
+
+            for mut session in handshake_sessions() {
+                let error = session.reject_terminal(&reject).unwrap_err();
+                let chain = error.chain().map(ToString::to_string).collect::<Vec<_>>();
+                let alternate = format!("{error:#}");
+
+                assert!(is_fatal_session_error(&error));
+                assert_eq!(session.state(), SessionState::Failed);
+                assert_eq!(error.to_string(), SAFE_MESSAGE);
+                assert_eq!(chain, [SAFE_MESSAGE]);
+                assert_eq!(alternate, SAFE_MESSAGE);
+                for sentinel in SENTINELS {
+                    assert!(!alternate.contains(sentinel));
+                    assert!(chain.iter().all(|layer| !layer.contains(sentinel)));
+                }
+            }
         }
     }
 
