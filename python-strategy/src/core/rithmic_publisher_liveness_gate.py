@@ -3,9 +3,15 @@ import threading
 from enum import Enum
 from typing import Protocol
 
+from src.core.redis_factory import create_redis_client
+from src.core.runtime_environment import RuntimeEnvironment
+
+
+_REDIS_OPERATION_TIMEOUT_SECONDS = 0.25
+
 
 class _RedisLivenessClient(Protocol):
-    def get(self, key: str) -> object: ...
+    def get(self, key: str, /) -> object: ...
 
     def close(self) -> None: ...
 
@@ -33,6 +39,23 @@ class RithmicPublisherLivenessGate:
         self._state = RithmicPublisherLivenessState.UNARMED
         self._unconfirmed_logged = False
         self._lock = threading.Lock()
+
+    @classmethod
+    def for_environment(
+        cls,
+        environment: RuntimeEnvironment,
+        *,
+        logger: logging.Logger,
+    ) -> "RithmicPublisherLivenessGate":
+        redis_client = create_redis_client(
+            socket_connect_timeout=_REDIS_OPERATION_TIMEOUT_SECONDS,
+            socket_timeout=_REDIS_OPERATION_TIMEOUT_SECONDS,
+        )
+        return cls(
+            redis_client=redis_client,
+            key=environment.key("heartbeat:data-publisher"),
+            logger=logger,
+        )
 
     @property
     def state(self) -> RithmicPublisherLivenessState:

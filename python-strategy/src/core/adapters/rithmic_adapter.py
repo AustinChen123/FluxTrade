@@ -5,6 +5,7 @@ from typing import Callable
 
 from src.core.client_order_id import linked_client_order_id
 from src.core.interfaces.exchange import (
+    EntryAdmissionGate,
     ExchangeError,
     ExchangeOrderEvent,
     ExchangeOrderSnapshot,
@@ -13,6 +14,8 @@ from src.core.interfaces.exchange import (
 )
 from src.core.models import Position, PositionSide
 from src.core.orm_models import Order
+from src.core.rithmic_publisher_liveness_gate import RithmicPublisherLivenessGate
+from src.core.runtime_environment import RuntimeEnvironment
 from src.core.product_registry import (
     InstrumentSpec,
     instrument_spec_from_product,
@@ -102,6 +105,17 @@ class RithmicExchangeAdapter(IExchangeAdapter):
             profile=str(config.get("rithmic_profile") or ""),
             account_id=config.get("account_id"),
             instruments=config.get("rithmic_instruments") or {},
+        )
+
+    def create_entry_admission_gate(
+        self,
+        environment: RuntimeEnvironment,
+        *,
+        logger: logging.Logger,
+    ) -> EntryAdmissionGate:
+        return RithmicPublisherLivenessGate.for_environment(
+            environment,
+            logger=logger,
         )
 
     def start_order_event_stream(self) -> None:

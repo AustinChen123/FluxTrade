@@ -1,9 +1,24 @@
+import logging
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from decimal import Decimal
-from typing import Any, Dict, List, Optional
+from typing import TYPE_CHECKING, Any, Dict, List, Optional, Protocol
 from src.core.orm_models import Order
 from src.core.models import Candlestick, Position
+
+if TYPE_CHECKING:
+    from src.core.runtime_environment import RuntimeEnvironment
+
+
+class EntryAdmissionGate(Protocol):
+    """Venue-neutral control for admitting new positions."""
+
+    def arm(self) -> None: ...
+
+    def observe(self) -> bool: ...
+
+    def close(self) -> None: ...
+
 
 class ExchangeError(Exception):
     """Base exception for all exchange related errors."""
@@ -62,6 +77,15 @@ class IExchangeAdapter(ABC):
     Interface for exchange adapters (Real and Simulated).
     Decouples execution logic from specific exchange implementations.
     """
+
+    def create_entry_admission_gate(
+        self,
+        environment: "RuntimeEnvironment",
+        *,
+        logger: logging.Logger,
+    ) -> EntryAdmissionGate | None:
+        """Build a venue-owned runtime gate when this adapter requires one."""
+        return None
 
     @abstractmethod
     def place_order(self, order: Order) -> str:

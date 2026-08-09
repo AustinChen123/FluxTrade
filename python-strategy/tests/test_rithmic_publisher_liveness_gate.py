@@ -1,7 +1,7 @@
 import json
 import logging
 import threading
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
 import pytest
 
@@ -9,6 +9,7 @@ from src.core.rithmic_publisher_liveness_gate import (
     RithmicPublisherLivenessGate,
     RithmicPublisherLivenessState,
 )
+from src.core.runtime_environment import RuntimeEnvironment
 
 
 class _RedisReader:
@@ -16,10 +17,12 @@ class _RedisReader:
         self.value = value
         self.error: Exception | None = None
         self.get_calls = 0
+        self.keys: list[str] = []
         self.close_calls = 0
 
     def get(self, key: str) -> object:
         self.get_calls += 1
+        self.keys.append(key)
         if self.error is not None:
             raise self.error
         return self.value
@@ -62,6 +65,28 @@ def test_unarmed_gate_is_closed_without_redis_io() -> None:
     assert gate.state is RithmicPublisherLivenessState.UNARMED
     assert gate.observe() is False
     assert reader.get_calls == 0
+
+
+def test_factory_owns_environment_key_and_bounded_redis_client() -> None:
+    reader = _RedisReader()
+
+    with patch(
+        "src.core.rithmic_publisher_liveness_gate.create_redis_client",
+        return_value=reader,
+    ) as redis_factory:
+        gate = RithmicPublisherLivenessGate.for_environment(
+            RuntimeEnvironment("live"),
+            logger=logging.getLogger("test.publisher_liveness"),
+        )
+
+    redis_factory.assert_called_once_with(
+        socket_connect_timeout=0.25,
+        socket_timeout=0.25,
+    )
+    gate.arm()
+    gate.observe()
+    assert reader.get_calls == 1
+    assert reader.keys == ["fluxtrade:live:heartbeat:data-publisher"]
 
 
 @pytest.mark.parametrize("unhealthy_value", [None, "stale", b"stale"])

@@ -14,6 +14,7 @@ Covers:
 from contextlib import nullcontext
 from decimal import Decimal
 import json
+import logging
 import threading
 from types import SimpleNamespace
 from unittest.mock import MagicMock, call, patch
@@ -63,6 +64,9 @@ from src.core.strategy_state_manager import (
     StrategyStateManager,
 )
 from src.core.runtime_environment import RuntimeEnvironment
+from src.core.rithmic_publisher_liveness_gate import (
+    RithmicPublisherLivenessGate,
+)
 
 
 # =============================================================================
@@ -1686,6 +1690,278 @@ class TestHandleCommand:
 
 
 class TestHeartbeatRecording:
+    def test_live_rithmic_engine_builds_venue_owned_liveness_gate(
+        self,
+        mock_db_session,
+        mock_clock,
+        mock_account_service,
+        mock_order_repo,
+    ):
+        shared_redis = MagicMock()
+        liveness_gate = MagicMock(spec=RithmicPublisherLivenessGate)
+        adapter = _rithmic_adapter_for_reconnect_test()
+
+        with (
+            patch(
+                "src.core.engine.RuntimeEnvironment.from_env",
+                return_value=RuntimeEnvironment("live"),
+            ),
+            patch(
+                "src.core.engine.create_redis_client",
+                return_value=shared_redis,
+            ) as redis_factory,
+            patch.object(
+                RithmicPublisherLivenessGate,
+                "for_environment",
+                return_value=liveness_gate,
+            ) as liveness_factory,
+        ):
+            engine = StrategyEngine(
+                db_session=mock_db_session,
+                clock=mock_clock,
+                order_repository=mock_order_repo,
+                account_service=mock_account_service,
+                adapter=adapter,
+                audit_external_orders=True,
+            )
+
+        redis_factory.assert_called_once_with()
+        assert engine._entry_admission_gate is liveness_gate
+        liveness_factory.assert_called_once()
+        assert liveness_factory.call_args.args == (engine.runtime_environment,)
+        assert liveness_factory.call_args.kwargs["logger"].name == "src.core.engine"
+
+    @pytest.mark.parametrize("environment", ["test", "backtest"])
+    def test_non_live_rithmic_engine_does_not_build_liveness_gate(
+        self,
+        engine_factory,
+        environment,
+    ):
+        with patch(
+            "src.core.engine.RuntimeEnvironment.from_env",
+            return_value=RuntimeEnvironment(environment),
+        ):
+            engine = engine_factory(
+                adapter=_rithmic_adapter_for_reconnect_test(),
+                audit_external_orders=True,
+            )
+
+        assert engine._entry_admission_gate is None
+
+    def test_live_non_rithmic_engine_has_no_gate_or_extra_redis_read(
+        self,
+        engine_factory,
+    ):
+        with patch(
+            "src.core.engine.RuntimeEnvironment.from_env",
+            return_value=RuntimeEnvironment("live"),
+        ):
+            engine = engine_factory()
+
+        assert engine._entry_admission_gate is None
+
+        engine.process_signal(
+            Signal(
+                strategy_id="test",
+                product_id="BINANCE:BTCUSDT-PERP",
+                timeframe="1m",
+                timestamp=1704067200000,
+                type=SignalType.NO_SIGNAL,
+                value=Decimal("42000"),
+            ),
+            None,
+        )
+
+        engine.redis_client.get.assert_not_called()
+
+    def test_safe_startup_arms_liveness_before_resume_and_heartbeat(
+        self,
+        engine,
+    ):
+        events: list[str] = []
+        gate = MagicMock(spec=RithmicPublisherLivenessGate)
+        gate.arm.side_effect = lambda: events.append("arm")
+        engine._entry_admission_gate = gate
+        engine.execution_engine.adapter = _rithmic_adapter_for_reconnect_test()
+        engine._check_system_state = MagicMock(return_value=True)
+        engine._reconcile_recoverable_orders_on_startup = MagicMock(
+            side_effect=lambda: (
+                events.append("reconcile") or {"auto_resume_safe": True}
+            )
+        )
+        engine._can_auto_resume_after_startup_recovery = MagicMock(return_value=True)
+        engine._resume_after_kill_switch = MagicMock(
+            side_effect=lambda: events.append("resume")
+        )
+        engine._start_heartbeat = MagicMock(
+            side_effect=lambda: events.append("heartbeat")
+        )
+        for name in (
+            "_halt_for_kill_switch",
+            "_start_command_listener",
+            "_reconcile_balance",
+            "_initialize_strategy_state_cache_on_startup",
+            "_start_strategy_state_subscriber_on_startup",
+            "_start_exchange_order_event_stream",
+            "_start_runtime_reconciliation",
+            "scan_strategies",
+            "_restore_active_strategies_on_startup",
+        ):
+            setattr(engine, name, MagicMock())
+
+        engine.startup()
+
+        assert events == ["reconcile", "arm", "resume", "heartbeat"]
+
+    def test_unsafe_startup_never_arms_liveness(self, engine):
+        gate = MagicMock(spec=RithmicPublisherLivenessGate)
+        engine._entry_admission_gate = gate
+        engine.execution_engine.adapter = _rithmic_adapter_for_reconnect_test()
+        engine._check_system_state = MagicMock(return_value=False)
+        engine._reconcile_recoverable_orders_on_startup = MagicMock(
+            return_value={"auto_resume_safe": False}
+        )
+        for name in (
+            "_halt_for_kill_switch",
+            "_start_command_listener",
+            "_reconcile_balance",
+            "_initialize_strategy_state_cache_on_startup",
+            "_start_strategy_state_subscriber_on_startup",
+            "_start_exchange_order_event_stream",
+            "_start_heartbeat",
+            "_start_runtime_reconciliation",
+            "scan_strategies",
+            "_restore_active_strategies_on_startup",
+        ):
+            setattr(engine, name, MagicMock())
+
+        engine.startup()
+
+        gate.arm.assert_not_called()
+
+    @pytest.mark.parametrize("liveness_allows_heartbeat", [False, True])
+    def test_process_heartbeat_continues_while_strategy_heartbeat_is_gated(
+        self,
+        engine,
+        liveness_allows_heartbeat,
+    ):
+        gate = MagicMock(spec=RithmicPublisherLivenessGate)
+        gate.observe.side_effect = lambda: (
+            setattr(engine, "running", False) or liveness_allows_heartbeat
+        )
+        engine._entry_admission_gate = gate
+        engine._record_strategy_heartbeats = MagicMock()
+        engine.strategy_instances = {}
+        engine.running = True
+
+        class ImmediateThread:
+            def __init__(self, *, target, daemon):
+                self._target = target
+
+            def start(self):
+                self._target()
+
+        with (
+            patch("src.core.engine.threading.Thread", ImmediateThread),
+            patch(
+                "src.core.engine.time.sleep",
+                side_effect=lambda _seconds: setattr(engine, "running", False),
+            ),
+        ):
+            engine._start_heartbeat()
+
+        engine.redis_client.setex.assert_called_once()
+        if liveness_allows_heartbeat:
+            engine._record_strategy_heartbeats.assert_called_once_with([])
+        else:
+            engine._record_strategy_heartbeats.assert_not_called()
+
+    @pytest.mark.parametrize("signal_type", [SignalType.LONG, SignalType.SHORT])
+    def test_closed_liveness_gate_rejects_entry_before_risk(
+        self,
+        engine,
+        signal_type,
+        caplog,
+    ):
+        gate = MagicMock(spec=RithmicPublisherLivenessGate)
+        gate.observe.return_value = False
+        engine._entry_admission_gate = gate
+        engine.risk_manager.check_risk = MagicMock()
+        engine.execution_engine.execute_signal = MagicMock()
+        signal = Signal(
+            strategy_id="test",
+            product_id="RITHMIC:NQ-202609",
+            timeframe="1m",
+            timestamp=1704067200000,
+            type=signal_type,
+            value=Decimal("20000"),
+        )
+
+        with (
+            caplog.at_level(logging.WARNING, logger="src.core.engine"),
+            patch("src.core.engine.normalize_signal_quantity") as normalize,
+        ):
+            assert engine.process_signal(signal, _make_candle()) is False
+
+        normalize.assert_not_called()
+        engine.risk_manager.check_risk.assert_not_called()
+        engine.execution_engine.execute_signal.assert_not_called()
+        rejection = next(
+            record
+            for record in caplog.records
+            if getattr(record, "event_code", None) == "entry_admission_rejected"
+        )
+        assert {
+            "level": rejection.levelname,
+            "message": rejection.getMessage(),
+            "component": vars(rejection)["component"],
+            "event_code": vars(rejection)["event_code"],
+            "strategy_id": vars(rejection)["strategy_id"],
+            "product_id": vars(rejection)["product_id"],
+            "signal_type": vars(rejection)["signal_type"],
+        } == {
+            "level": "WARNING",
+            "message": "Entry signal rejected by venue admission gate",
+            "component": "strategy_engine",
+            "event_code": "entry_admission_rejected",
+            "strategy_id": "test",
+            "product_id": "RITHMIC:NQ-202609",
+            "signal_type": signal_type.value,
+        }
+
+    @pytest.mark.parametrize(
+        "signal_type",
+        [SignalType.NO_SIGNAL, SignalType.EXIT_LONG, SignalType.EXIT_SHORT],
+    )
+    def test_non_entry_signal_bypasses_liveness_gate(
+        self,
+        engine,
+        signal_type,
+    ):
+        gate = MagicMock(spec=RithmicPublisherLivenessGate)
+        engine._entry_admission_gate = gate
+        engine.risk_manager.check_risk = MagicMock(return_value=(True, "PASS"))
+        engine.execution_engine.execute_signal = MagicMock(return_value="order-1")
+        signal = Signal(
+            strategy_id="test",
+            product_id="RITHMIC:NQ-202609",
+            timeframe="1m",
+            timestamp=1704067200000,
+            type=signal_type,
+            value=Decimal("20000"),
+        )
+
+        assert engine.process_signal(signal, _make_candle()) is True
+
+        gate.observe.assert_not_called()
+
+    def test_shutdown_closes_liveness_gate(self, engine):
+        gate = MagicMock(spec=RithmicPublisherLivenessGate)
+        engine._entry_admission_gate = gate
+
+        engine.shutdown(timeout=0.1)
+
+        gate.close.assert_called_once_with()
 
     def test_record_strategy_heartbeats_updates_health_monitor_and_db(self, engine):
         """Strategy heartbeat recording should update HealthMonitor and DB state."""

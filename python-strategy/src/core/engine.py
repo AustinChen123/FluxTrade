@@ -41,6 +41,7 @@ from src.core.risk_manager import RiskManager, AccountService
 from src.core.execution import ExecutionEngine, ExitDecision
 from src.core.clock import Clock
 from src.core.interfaces import IExchangeAdapter, IOrderRepository
+from src.core.interfaces.exchange import EntryAdmissionGate
 from src.core.daily_nav_snapshot import DailyNavSnapshotService
 from src.core.strategy_loader import StrategyLoader
 from src.core.portfolio_runtime import (
@@ -442,6 +443,12 @@ class StrategyEngine:
         self.order_event_thread = None
         self._order_event_stop = threading.Event()
         self.executor = ThreadPoolExecutor(max_workers=5)
+        self._entry_admission_gate: EntryAdmissionGate | None = None
+        if self.runtime_environment.identity == "live":
+            self._entry_admission_gate = adapter.create_entry_admission_gate(
+                self.runtime_environment,
+                logger=logger,
+            )
 
     def startup(
         self,
@@ -489,11 +496,20 @@ class StrategyEngine:
 
         def apply_reconciliation_result() -> bool:
             lockdown = persisted_lockdown
-            if isinstance(
+            rithmic_reconciliation_safe = isinstance(
                 self.execution_engine.adapter,
                 RithmicExchangeAdapter,
-            ) and not (
+            ) and bool(
                 reconciliation and reconciliation.get("auto_resume_safe") is True
+            )
+            if rithmic_reconciliation_safe and self._entry_admission_gate is not None:
+                self._entry_admission_gate.arm()
+            if (
+                isinstance(
+                    self.execution_engine.adapter,
+                    RithmicExchangeAdapter,
+                )
+                and not rithmic_reconciliation_safe
             ):
                 self._halt_for_kill_switch()
                 self._startup_lock_cause = "rithmic_reconciliation_blocked"
@@ -2707,6 +2723,10 @@ class StrategyEngine:
                         3,
                         str(int(time.time() * 1000)),
                     )
+                    strategy_heartbeat_allowed = (
+                        self._entry_admission_gate is None
+                        or self._entry_admission_gate.observe()
+                    )
                     # Expose balance to Prometheus
                     try:
                         balance = self.account_service.get_balance()
@@ -2723,7 +2743,8 @@ class StrategyEngine:
                                 for strategy_id in self.strategy_instances
                             }
                         )
-                    self._record_strategy_heartbeats(active_sids)
+                    if strategy_heartbeat_allowed:
+                        self._record_strategy_heartbeats(active_sids)
                     time.sleep(1.0)
                 except Exception as e:
                     logger.error("💓 Heartbeat Failed: %s", e)
@@ -2978,6 +2999,22 @@ class StrategyEngine:
                 "Signal rejected because kill switch is active: strategy=%s type=%s",
                 signal.strategy_id,
                 signal.type,
+            )
+            return False
+        if (
+            signal.type in (SignalType.LONG, SignalType.SHORT)
+            and self._entry_admission_gate is not None
+            and not self._entry_admission_gate.observe()
+        ):
+            logger.warning(
+                "Entry signal rejected by venue admission gate",
+                extra={
+                    "component": "strategy_engine",
+                    "event_code": "entry_admission_rejected",
+                    "strategy_id": signal.strategy_id,
+                    "product_id": signal.product_id,
+                    "signal_type": signal.type.value,
+                },
             )
             return False
 
@@ -3362,5 +3399,8 @@ class StrategyEngine:
             self.redis_client.close()
         except Exception as e:
             logger.warning("Error closing Redis: %s", e)
+
+        if self._entry_admission_gate is not None:
+            self._entry_admission_gate.close()
 
         logger.info("StrategyEngine shutdown complete.")
