@@ -381,8 +381,8 @@ mod tests {
 
     #[test]
     fn runtime_error_projects_only_the_independent_safe_ledger() {
-        const SENTINELS: [&str; 8] = [
-            "PROVIDER", "RP", "ACCOUNT", "BASKET", "STATUS", "PROFILE", "URL", "USER",
+        const SENTINELS: [&str; 10] = [
+            "PROVIDER", "RP", "ACCOUNT", "BASKET", "STATUS", "PROFILE", "URL", "USER", "FCM", "IB",
         ];
         const EXPECTED: &str = "profile_lease|profile_lease_failed|profile lease failed
 runtime_initialization|runtime_initialization_failed|runtime initialization failed
@@ -425,7 +425,7 @@ unclassified_internal|unclassified_ledger_snapshot_failure|ledger snapshot faile
         Python::with_gil(|py| {
             for (index, (stage, expected)) in stages.into_iter().zip(EXPECTED.lines()).enumerate() {
                 let source = anyhow::Error::new(std::io::Error::other(
-                    "provider=PROVIDER rp_code=RP account=ACCOUNT basket=BASKET status=STATUS profile=PROFILE URL=URL user=USER",
+                    "provider=PROVIDER rp_code=RP account=ACCOUNT basket=BASKET status=STATUS profile=PROFILE URL=URL user=USER fcm=FCM ib=IB",
                 ));
                 let source = if index == 16 {
                     source
