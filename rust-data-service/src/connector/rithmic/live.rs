@@ -1,10 +1,10 @@
 use super::{
     bar::MinuteBarBuilder,
-    config,
+    codec, config,
     front_month::{self, FrontMonthEvent},
     market::{self, MarketDataEvent, SubscriptionAction},
     session::Plant,
-    transport::{self, ConnectionPreparation, ReconnectPolicy},
+    transport::{self, ConnectionPreparation, PayloadFailure, PayloadFailureKind, ReconnectPolicy},
 };
 use crate::model::validate_product_id;
 use crate::AggregationSourceEvent;
@@ -24,6 +24,10 @@ const RESPONSE_TIMEOUT: Duration = Duration::from_secs(10);
 const INITIAL_BACKOFF: Duration = Duration::from_secs(1);
 const MAX_BACKOFF: Duration = Duration::from_secs(30);
 const FORWARD_QUEUE_CAPACITY: usize = 60;
+
+fn payload_failure(kind: PayloadFailureKind) -> anyhow::Error {
+    PayloadFailure::new(kind).into()
+}
 
 pub(crate) struct LiveConfig {
     runtime: config::RuntimeConfig,
@@ -93,12 +97,7 @@ pub(crate) async fn run(
         move |preparation| {
             prepare_live_connection(&lifecycle_handler, &forward_tx, &product_id, preparation)
         },
-        move |payload| {
-            payload_handler
-                .lock()
-                .map_err(|_| anyhow::anyhow!("Rithmic live handler lock poisoned"))?
-                .handle(&payload)
-        },
+        move |payload| handle_live_payload(&payload_handler, &payload),
     );
 
     tokio::select! {
@@ -106,6 +105,13 @@ pub(crate) async fn run(
         result = forward_events(forward_rx, aggregation_source_tx) => result,
         result = enforce_front_month_deadline(front_month_gate_rx) => result,
     }
+}
+
+fn handle_live_payload(handler: &Arc<Mutex<LivePayloadHandler>>, payload: &[u8]) -> Result<()> {
+    handler
+        .lock()
+        .map_err(|_| payload_failure(PayloadFailureKind::HandlerLockPayload))?
+        .handle(payload)
 }
 
 fn prepare_live_connection(
@@ -116,13 +122,13 @@ fn prepare_live_connection(
 ) -> Result<()> {
     let mut handler = handler
         .lock()
-        .map_err(|_| anyhow::anyhow!("Rithmic live handler lock poisoned"))?;
+        .map_err(|_| payload_failure(PayloadFailureKind::HandlerLockPreparation))?;
     match preparation {
         ConnectionPreparation::Startup => {
             handler.reset();
             forward_tx
                 .try_send(AggregationSourceEvent::ResetProduct(product_id.to_string()))
-                .context("Rithmic aggregation reset queue is unavailable")?;
+                .map_err(|_| payload_failure(PayloadFailureKind::ResetQueue))?;
         }
         ConnectionPreparation::Retry => handler.suspend(),
     }
@@ -191,13 +197,20 @@ impl LivePayloadHandler {
     }
 
     fn handle(&mut self, payload: &[u8]) -> Result<()> {
-        if let Some(event) = front_month::decode_live_event(
-            payload,
-            "live-front-month",
-            &self.root_symbol,
-            &self.exchange,
-            &self.symbol,
-        )? {
+        let template_id = codec::template_id(payload)
+            .map_err(|_| payload_failure(PayloadFailureKind::MarketDecode))?;
+        let front_month_event = match template_id {
+            114 | 159 => front_month::decode_live_event(
+                payload,
+                "live-front-month",
+                &self.root_symbol,
+                &self.exchange,
+                &self.symbol,
+            )
+            .map_err(|_| payload_failure(PayloadFailureKind::FrontMonthValidation))?,
+            _ => None,
+        };
+        if let Some(event) = front_month_event {
             return match event {
                 FrontMonthEvent::CurrentVerified => {
                     self.front_month_gate
@@ -208,15 +221,19 @@ impl LivePayloadHandler {
                     );
                     Ok(())
                 }
-                FrontMonthEvent::RolloverRequired(next_symbol) => anyhow::bail!(
-                    "rithmic_rollover_required: configured_symbol={} next_symbol={next_symbol}",
-                    self.symbol
-                ),
+                FrontMonthEvent::RolloverRequired(_) => {
+                    Err(payload_failure(PayloadFailureKind::RolloverRequired))
+                }
             };
         }
-        match market::decode_market_data_event(payload)? {
+        match market::decode_market_data_event(payload)
+            .map_err(|_| payload_failure(PayloadFailureKind::MarketDecode))?
+        {
             MarketDataEvent::LastTrade(trade) => {
-                let completed = self.builder.push(&trade)?;
+                let completed = self
+                    .builder
+                    .push(&trade)
+                    .map_err(|_| payload_failure(PayloadFailureKind::MinuteBarInvariant))?;
                 if *self.front_month_gate.borrow() != FrontMonthGateState::Verified {
                     return Ok(());
                 }
@@ -236,10 +253,10 @@ impl LivePayloadHandler {
                         .try_send(AggregationSourceEvent::Candle(candle))
                         .map_err(|error| match error {
                             mpsc::error::TrySendError::Full(_) => {
-                                anyhow::anyhow!("Rithmic candle forwarding queue exhausted")
+                                payload_failure(PayloadFailureKind::CandleQueueFull)
                             }
                             mpsc::error::TrySendError::Closed(_) => {
-                                anyhow::anyhow!("Rithmic candle forwarding queue closed")
+                                payload_failure(PayloadFailureKind::CandleQueueClosed)
                             }
                         })?;
                 }
@@ -250,11 +267,8 @@ impl LivePayloadHandler {
                 Ok(())
             }
             MarketDataEvent::LastTradeCleared | MarketDataEvent::LastTradeUnchanged => Ok(()),
-            MarketDataEvent::Rejected { response_codes, .. } => {
-                anyhow::bail!(
-                    "Rithmic market-data subscription was rejected: {}",
-                    response_codes.join(",")
-                )
+            MarketDataEvent::Rejected { .. } => {
+                Err(payload_failure(PayloadFailureKind::SubscriptionRejected))
             }
         }
     }
@@ -422,11 +436,30 @@ mod tests {
 
         let (mut changed, _) = handler();
         let error = changed.handle(&front_month_update("MNQZ6")).unwrap_err();
-        assert!(error.to_string().contains("rithmic_rollover_required"));
+        assert_failure(&error, "handle_payload", "rollover_required", "none");
         assert_ne!(
             *changed.front_month_gate.borrow(),
             FrontMonthGateState::Verified
         );
+
+        let mut mismatch: protocol::ResponseFrontMonthContract =
+            codec::decode(&front_month_response("MNQU6")).unwrap();
+        mismatch.symbol = Some("SENTINEL_ROOT".to_string());
+        let error = changed
+            .handle(&codec::encode(&mismatch).unwrap())
+            .unwrap_err();
+        assert_failure(
+            &error,
+            "handle_payload",
+            "front_month_validation_failed",
+            "none",
+        );
+        assert!(!error.to_string().contains("SENTINEL_ROOT"));
+
+        for invalid in [vec![], vec![0x80]] {
+            let error = changed.handle(&invalid).unwrap_err();
+            assert_failure(&error, "handle_payload", "malformed_market_payload", "none");
+        }
     }
 
     #[test]
@@ -536,12 +569,40 @@ mod tests {
         let (mut handler, _) = handler();
         let rejected = codec::encode(&protocol::Reject {
             template_id: 75,
-            rp_code: vec!["permission-denied".to_string()],
-            ..Default::default()
+            user_msg: vec!["SENTINEL_USER_MSG".to_string()],
+            rp_code: vec!["SENTINEL_RP_CODE".to_string()],
         })
         .unwrap();
 
-        assert!(handler.handle(&rejected).is_err());
+        let error = handler.handle(&rejected).unwrap_err();
+        assert_failure(&error, "handle_payload", "subscription_rejected", "none");
+        assert!(!error.to_string().contains("SENTINEL"));
+
+        let malformed = codec::encode(&protocol::LastTrade {
+            template_id: 150,
+            presence_bits: Some(1),
+            symbol: Some("SENTINEL_SYMBOL".to_string()),
+            ..Default::default()
+        })
+        .unwrap();
+        let error = handler.handle(&malformed).unwrap_err();
+        assert_failure(&error, "handle_payload", "malformed_market_payload", "none");
+        assert!(!error.to_string().contains("SENTINEL_SYMBOL"));
+    }
+
+    #[test]
+    fn minute_bar_invariant_failures_remain_fatal() {
+        let (mut late_handler, _) = handler();
+        late_handler.handle(&last_trade(1_800_000_061)).unwrap();
+        let late = late_handler.handle(&last_trade(1_800_000_001)).unwrap_err();
+        assert_failure(&late, "handle_payload", "minute_bar_invariant", "none");
+
+        let (mut handler, _) = handler();
+        let mut wrong: protocol::LastTrade = codec::decode(&last_trade(1_800_000_001)).unwrap();
+        wrong.symbol = Some("NQU6".to_string());
+        let wrong = handler.handle(&codec::encode(&wrong).unwrap()).unwrap_err();
+        assert_failure(&wrong, "handle_payload", "minute_bar_invariant", "none");
+        assert!(!wrong.to_string().contains("NQU6"));
     }
 
     #[test]
@@ -684,12 +745,104 @@ mod tests {
         handler.handle(&last_trade(1_800_000_061)).unwrap();
 
         let error = handler.handle(&last_trade(1_800_000_121)).unwrap_err();
-        assert!(error.to_string().contains("queue exhausted"));
+        assert_failure(
+            &error,
+            "handle_payload",
+            "candle_queue_full",
+            "builder_advanced_candle_not_handed_off",
+        );
         assert_eq!(
             event_candle(candle_rx.try_recv().unwrap()).timestamp,
             1_800_000_000_000
         );
         assert!(candle_rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn structural_failures_report_causal_operation_and_state_effect() {
+        let (live_handler, _) = handler();
+        let poisoned = Arc::new(Mutex::new(live_handler));
+        let poisoner = Arc::clone(&poisoned);
+        let _ = std::thread::spawn(move || {
+            let _guard = poisoner.lock().unwrap();
+            panic!("poison live handler");
+        })
+        .join();
+        let payload_lock = handle_live_payload(&poisoned, &last_trade(1_800_000_001)).unwrap_err();
+
+        let (forward_tx, forward_rx) = mpsc::channel(1);
+        let preparation_lock = prepare_live_connection(
+            &poisoned,
+            &forward_tx,
+            "RITHMIC:MNQ-202609",
+            ConnectionPreparation::Retry,
+        )
+        .unwrap_err();
+
+        let (handler, _) = handler();
+        let handler = Arc::new(Mutex::new(handler));
+        drop(forward_rx);
+        let reset = prepare_live_connection(
+            &handler,
+            &forward_tx,
+            "RITHMIC:MNQ-202609",
+            ConnectionPreparation::Startup,
+        )
+        .unwrap_err();
+
+        let (mut handler, candle_rx) = handler_with_capacity(1);
+        drop(candle_rx);
+        handler.handle(&front_month_response("MNQU6")).unwrap();
+        handler.handle(&last_trade(1_800_000_001)).unwrap();
+        let queue_closed = handler.handle(&last_trade(1_800_000_061)).unwrap_err();
+
+        assert_identity(
+            &payload_lock,
+            (
+                "handle_payload",
+                "handler_lock_poisoned",
+                "mutation_unknown",
+            ),
+        );
+        assert_identity(
+            &preparation_lock,
+            (
+                "prepare_connection",
+                "handler_lock_poisoned",
+                "preparation_state_unknown",
+            ),
+        );
+        assert_identity(
+            &reset,
+            (
+                "prepare_connection",
+                "reset_queue_unavailable",
+                "builder_reset_downstream_not_notified",
+            ),
+        );
+        assert_identity(
+            &queue_closed,
+            (
+                "handle_payload",
+                "candle_queue_closed",
+                "builder_advanced_candle_not_handed_off",
+            ),
+        );
+    }
+
+    fn assert_failure(error: &anyhow::Error, operation: &str, code: &str, state_effect: &str) {
+        let failure = error.downcast_ref::<PayloadFailure>().unwrap();
+        assert_eq!(failure.operation(), operation);
+        assert_eq!(failure.stable_error_code(), code);
+        assert_eq!(failure.state_effect(), state_effect);
+        assert!(matches!(
+            failure.disposition(),
+            "fatal_service_exit" | "controlled_halt"
+        ));
+    }
+
+    fn assert_identity(error: &anyhow::Error, expected: (&str, &str, &str)) {
+        assert_failure(error, expected.0, expected.1, expected.2);
     }
 
     fn handler() -> (LivePayloadHandler, mpsc::Receiver<AggregationSourceEvent>) {
