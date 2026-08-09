@@ -461,6 +461,7 @@ def test_portfolio_submission_rejection_stops_remaining_sleeves() -> None:
     )
     execution = MagicMock(default_quantity=Decimal("1"))
     handler = MagicMock(side_effect=[False, True])
+    admission = MagicMock(return_value=True)
     processor = SignalProcessor(
         registry,
         execution,
@@ -468,6 +469,7 @@ def test_portfolio_submission_rejection_stops_remaining_sleeves() -> None:
         position_loader=lambda *_args: None,
         exposure_loader=lambda *_args: PortfolioExposureSnapshot({}),
         portfolio_coordinator=coordinator,
+        entry_admission_handler=admission,
     )
 
     with pytest.raises(
@@ -476,7 +478,194 @@ def test_portfolio_submission_rejection_stops_remaining_sleeves() -> None:
     ):
         processor.on_candle(make_candle())
 
+    assert admission.call_count == 2
     handler.assert_called_once()
+
+
+def test_portfolio_admission_checks_complete_batch_before_submission() -> None:
+    strategies = tuple(
+        DummyStrategy(
+            f"sleeve_{index}",
+            result=make_signal(f"sleeve_{index}", SignalType.LONG),
+        )
+        for index in range(2)
+    )
+    registry = StrategyRegistry()
+    for strategy in strategies:
+        registry.register(strategy)
+    coordinator = PortfolioCoordinator()
+    coordinator.register(
+        PortfolioDefinition(
+            portfolio_id="portfolio_v1",
+            product_id=strategies[0].product_id,
+            sleeves=tuple(PortfolioSleeve(strategy) for strategy in strategies),
+            max_gross_quantity=Decimal("2"),
+        )
+    )
+    handler = MagicMock(return_value=True)
+    admission = MagicMock(side_effect=[True, False])
+
+    SignalProcessor(
+        registry,
+        MagicMock(default_quantity=Decimal("1")),
+        signal_handler=handler,
+        exposure_loader=lambda *_args: PortfolioExposureSnapshot({}),
+        portfolio_coordinator=coordinator,
+        entry_admission_handler=admission,
+    ).on_candle(make_candle())
+
+    assert [call.args[0].strategy_id for call in admission.call_args_list] == [
+        "sleeve_0",
+        "sleeve_1",
+    ]
+    handler.assert_not_called()
+
+
+def test_entry_admission_suppression_preserves_exit_and_observer_batch() -> None:
+    entry = DummyStrategy(
+        "entry",
+        result=make_signal("entry", SignalType.LONG),
+    )
+    exiting = DummyStrategy(
+        "exit",
+        result=make_signal("exit", SignalType.EXIT_LONG),
+    )
+    idle = DummyStrategy(
+        "idle",
+        result=make_signal("idle", SignalType.NO_SIGNAL),
+    )
+    registry = StrategyRegistry()
+    registry.register(entry)
+    registry.register(idle)
+    registry.register(exiting)
+    coordinator = PortfolioCoordinator()
+    coordinator.register(
+        PortfolioDefinition(
+            portfolio_id="portfolio_v1",
+            product_id=entry.product_id,
+            sleeves=(
+                PortfolioSleeve(entry),
+                PortfolioSleeve(exiting),
+            ),
+            max_gross_quantity=Decimal("1"),
+        )
+    )
+    handler = MagicMock(return_value=True)
+    observer = MagicMock()
+
+    SignalProcessor(
+        registry,
+        MagicMock(default_quantity=Decimal("1")),
+        signal_handler=handler,
+        exposure_loader=lambda *_args: PortfolioExposureSnapshot({}),
+        portfolio_coordinator=coordinator,
+        signal_batch_observer=observer,
+        entry_admission_handler=MagicMock(return_value=False),
+    ).on_candle(make_candle())
+
+    handler.assert_called_once()
+    processed = handler.call_args.args[0]
+    assert processed.type == SignalType.EXIT_LONG
+    observer.assert_called_once()
+    observed = observer.call_args.args[0]
+    assert tuple(signal.type for signal in observed) == (
+        SignalType.EXIT_LONG,
+        SignalType.NO_SIGNAL,
+    )
+    assert observed[0] is processed
+
+
+@pytest.mark.parametrize("portfolio_owned", [False, True])
+def test_entry_admission_suppression_restores_nonexclusive_trade_state(
+    portfolio_owned: bool,
+) -> None:
+    strategy = StatefulEntryStrategy("sleeve")
+    registry = StrategyRegistry()
+    registry.register(strategy)
+    coordinator = None
+    exposure_loader = None
+    if portfolio_owned:
+
+        def load_exposure(*_args: object) -> PortfolioExposureSnapshot:
+            return PortfolioExposureSnapshot({})
+
+        coordinator = PortfolioCoordinator()
+        coordinator.register(
+            PortfolioDefinition(
+                portfolio_id="portfolio_v1",
+                product_id=strategy.product_id,
+                sleeves=(PortfolioSleeve(strategy),),
+                max_gross_quantity=Decimal("1"),
+            )
+        )
+        exposure_loader = load_exposure
+    handler = MagicMock(return_value=True)
+    admission = MagicMock(side_effect=[False, True])
+    processor = SignalProcessor(
+        registry,
+        MagicMock(default_quantity=Decimal("1")),
+        signal_handler=handler,
+        exposure_loader=exposure_loader,
+        portfolio_coordinator=coordinator,
+        entry_admission_handler=admission,
+    )
+
+    processor.on_candle(make_candle())
+
+    assert strategy._in_position is False
+    assert strategy.restore_calls == 1
+    handler.assert_not_called()
+
+    processor.on_candle(
+        make_candle().model_copy(update={"timestamp": make_candle().timestamp + 60_000})
+    )
+
+    handler.assert_called_once()
+    assert handler.call_args.args[0].type == SignalType.LONG
+    assert admission.call_count == 2
+
+
+def test_admission_error_propagates_and_rolls_back_exclusive_slot_state() -> None:
+    strategy_a = StatefulEntryStrategy("sleeve_a")
+    strategy_b = StatefulEntryStrategy("sleeve_b")
+    registry = StrategyRegistry()
+    registry.register(strategy_a)
+    registry.register(strategy_b)
+    coordinator = PortfolioCoordinator()
+    coordinator.register(
+        PortfolioDefinition(
+            portfolio_id="portfolio_v1",
+            product_id=strategy_a.product_id,
+            sleeves=(PortfolioSleeve(strategy_a), PortfolioSleeve(strategy_b)),
+            max_gross_quantity=Decimal("1"),
+            exclusive_slots=(
+                PortfolioExclusiveSlot(
+                    slot_id="shared",
+                    strategy_ids=("sleeve_a", "sleeve_b"),
+                ),
+            ),
+        )
+    )
+    cause = RuntimeError("admission unavailable")
+    handler = MagicMock()
+
+    def fail_admission(_signal: Signal) -> bool:
+        raise cause
+
+    with pytest.raises(RuntimeError, match="admission unavailable") as caught:
+        SignalProcessor(
+            registry,
+            MagicMock(default_quantity=Decimal("1")),
+            signal_handler=handler,
+            exposure_loader=lambda *_args: PortfolioExposureSnapshot({}),
+            portfolio_coordinator=coordinator,
+            entry_admission_handler=fail_admission,
+        ).on_candle(make_candle())
+
+    assert caught.value is cause
+    assert strategy_a._in_position is False
+    assert strategy_b._in_position is False
+    handler.assert_not_called()
 
 
 def test_portfolio_crash_replay_does_not_double_count_persisted_intent() -> None:
@@ -977,6 +1166,122 @@ def test_on_trade_routes_matching_strategy_without_timeframe_filter() -> None:
     assert emitted_signal.metadata["client_order_id"]
     assert signal_handler.call_args.args[1] is None
     execution.execute_signal.assert_not_called()
+
+
+def test_on_trade_admission_rejection_skips_submission() -> None:
+    class StatefulTradeStrategy(DummyStrategy):
+        def __init__(self):
+            super().__init__("s1")
+            self._in_position = False
+            self.restore_calls = 0
+
+        def on_trade(self, trade):
+            self._in_position = True
+            return make_signal()
+
+        def snapshot_walk_forward_trade_state(self):
+            return self._in_position
+
+        def restore_walk_forward_trade_state(self, state):
+            self.restore_calls += 1
+            self._in_position = state
+
+    strategy = StatefulTradeStrategy()
+    registry = StrategyRegistry()
+    registry.register(strategy)
+    signal_handler = MagicMock()
+    admission = MagicMock(side_effect=[False, True])
+    processor = SignalProcessor(
+        registry,
+        MagicMock(),
+        signal_handler=signal_handler,
+        entry_admission_handler=admission,
+    )
+
+    processor.on_trade(make_trade())
+
+    assert strategy._in_position is False
+    assert strategy.restore_calls == 1
+    signal_handler.assert_not_called()
+
+    processor.on_trade(make_trade())
+
+    assert admission.call_count == 2
+    assert admission.call_args.args[0].metadata["client_order_id"]
+    signal_handler.assert_called_once()
+
+
+def test_on_trade_admission_error_propagates_and_restores_state() -> None:
+    class StatefulTradeStrategy(DummyStrategy):
+        def __init__(self):
+            super().__init__("s1")
+            self._in_position = False
+            self.restore_calls = 0
+
+        def on_trade(self, trade):
+            self._in_position = True
+            return make_signal()
+
+        def snapshot_walk_forward_trade_state(self):
+            return self._in_position
+
+        def restore_walk_forward_trade_state(self, state):
+            self.restore_calls += 1
+            self._in_position = state
+
+    strategy = StatefulTradeStrategy()
+    registry = StrategyRegistry()
+    registry.register(strategy)
+    signal_handler = MagicMock()
+    cause = RuntimeError("admission unavailable")
+
+    def fail_admission(_signal: Signal) -> bool:
+        raise cause
+
+    processor = SignalProcessor(
+        registry,
+        MagicMock(),
+        signal_handler=signal_handler,
+        entry_admission_handler=fail_admission,
+    )
+
+    with pytest.raises(RuntimeError, match="admission unavailable") as caught:
+        processor.on_trade(make_trade())
+
+    assert caught.value is cause
+    assert strategy._in_position is False
+    assert strategy.restore_calls == 1
+    signal_handler.assert_not_called()
+
+
+def test_on_trade_admission_checks_all_entries_before_preserving_exit() -> None:
+    strategies = (
+        DummyStrategy("entry_0", trade_result=make_signal("entry_0")),
+        DummyStrategy("entry_1", trade_result=make_signal("entry_1")),
+        DummyStrategy(
+            "exit",
+            trade_result=make_signal("exit", SignalType.EXIT_LONG),
+        ),
+    )
+    registry = StrategyRegistry()
+    for strategy in strategies:
+        registry.register(strategy)
+    handler = MagicMock(return_value=True)
+    admission = MagicMock(side_effect=[True, False])
+
+    SignalProcessor(
+        registry,
+        MagicMock(),
+        signal_handler=handler,
+        entry_admission_handler=admission,
+    ).on_trade(make_trade())
+
+    assert [call.args[0].strategy_id for call in admission.call_args_list] == [
+        "entry_0",
+        "entry_1",
+    ]
+    handler.assert_called_once()
+    assert handler.call_args.args[0].type == SignalType.EXIT_LONG
 
 
 def test_on_trade_skips_product_mismatch() -> None:

@@ -78,6 +78,7 @@ class SignalProcessor:
         ) = None,
         portfolio_coordinator: PortfolioCoordinator | None = None,
         signal_batch_observer: Callable[[tuple[Signal, ...]], None] | None = None,
+        entry_admission_handler: Callable[[Signal], bool] | None = None,
     ) -> None:
         self.registry = registry
         self.execution_engine = execution_engine
@@ -87,6 +88,7 @@ class SignalProcessor:
         self.exposure_loader = exposure_loader
         self.portfolio_coordinator = portfolio_coordinator
         self.signal_batch_observer = signal_batch_observer
+        self.entry_admission_handler = entry_admission_handler
         self._observed_position_sides: dict[tuple[str, str], str | None] = {}
 
     def on_candle(
@@ -102,6 +104,7 @@ class SignalProcessor:
         memory is rebuilt from candles, but any generated signals are ignored.
         """
         decisions: list[tuple[str, list[Signal]]] = []
+        admission_states: dict[str, tuple[BaseStrategy, bool, object]] = {}
         transaction_context = (
             self.portfolio_coordinator.decision_state_transaction()
             if emit_signals and self.portfolio_coordinator is not None
@@ -128,6 +131,11 @@ class SignalProcessor:
 
                 if not self._sync_position_if_changed(strategy):
                     continue
+                if self.entry_admission_handler is not None:
+                    admission_states[strategy.strategy_id] = (
+                        strategy,
+                        *self._snapshot_entry_admission_state(strategy),
+                    )
                 if (
                     decision_state_transaction is not None
                     and self.portfolio_coordinator is not None
@@ -158,19 +166,67 @@ class SignalProcessor:
                         for strategy_id, signals in decisions
                     ]
                 if self.portfolio_coordinator is not None:
-                    decisions = (
-                        self.portfolio_coordinator.coordinate_candle_decisions(
-                            candle,
-                            decisions,
-                            exposure_loader=self.exposure_loader,
-                            default_quantity=Decimal(
-                                    str(self.execution_engine.default_quantity)
-                                ),
-                            decision_state_transaction=(
-                                decision_state_transaction
-                            ),
-                        )
+                    decisions = self.portfolio_coordinator.coordinate_candle_decisions(
+                        candle,
+                        decisions,
+                        exposure_loader=self.exposure_loader,
+                        default_quantity=Decimal(
+                            str(self.execution_engine.default_quantity)
+                        ),
+                        decision_state_transaction=(decision_state_transaction),
                     )
+                if self.entry_admission_handler is not None:
+                    entry_strategy_ids = {
+                        strategy_id
+                        for strategy_id, signals in decisions
+                        if any(
+                            signal.type in (SignalType.LONG, SignalType.SHORT)
+                            for signal in signals
+                        )
+                    }
+                    locally_restored_ids = self._locally_restored_entry_ids(
+                        entry_strategy_ids
+                    )
+                    try:
+                        entry_admissions = [
+                            self._entry_is_admitted(signal)
+                            for _strategy_id, signals in decisions
+                            for signal in signals
+                            if signal.type in (SignalType.LONG, SignalType.SHORT)
+                        ]
+                    except Exception:
+                        self._restore_entry_admission_states(
+                            locally_restored_ids,
+                            admission_states,
+                        )
+                        raise
+                    admitted_decisions = (
+                        decisions
+                        if all(entry_admissions)
+                        else [
+                            (
+                                strategy_id,
+                                [
+                                    signal
+                                    for signal in signals
+                                    if signal.type
+                                    not in (SignalType.LONG, SignalType.SHORT)
+                                ],
+                            )
+                            for strategy_id, signals in decisions
+                        ]
+                    )
+                    if not all(entry_admissions):
+                        self._restore_entry_admission_states(
+                            locally_restored_ids,
+                            admission_states,
+                        )
+                    if decision_state_transaction is not None:
+                        decision_state_transaction.restore_suppressed(
+                            decisions,
+                            admitted_decisions,
+                        )
+                    decisions = admitted_decisions
                 if self.signal_batch_observer is not None:
                     finalized_batch = tuple(
                         signal
@@ -270,6 +326,33 @@ class SignalProcessor:
         }
 
     @staticmethod
+    def _snapshot_entry_admission_state(
+        strategy: BaseStrategy,
+    ) -> tuple[bool, object]:
+        uses_explicit_contract = (
+            type(strategy).snapshot_walk_forward_trade_state
+            is not BaseStrategy.snapshot_walk_forward_trade_state
+            and type(strategy).restore_walk_forward_trade_state
+            is not BaseStrategy.restore_walk_forward_trade_state
+        )
+        if uses_explicit_contract:
+            return True, strategy.snapshot_walk_forward_trade_state()
+        return False, SignalProcessor._snapshot_trade_state(strategy)
+
+    @staticmethod
+    def _restore_entry_admission_states(
+        strategy_ids: set[str],
+        states: Mapping[str, tuple[BaseStrategy, bool, object]],
+    ) -> None:
+        for strategy_id in sorted(strategy_ids):
+            strategy, uses_explicit_contract, state = states[strategy_id]
+            if uses_explicit_contract:
+                strategy.restore_walk_forward_trade_state(state)
+            else:
+                assert isinstance(state, dict)
+                SignalProcessor._restore_trade_state(strategy, state)
+
+    @staticmethod
     def _restore_trade_state(strategy: BaseStrategy, state: dict[str, Any]) -> None:
         for attr, value in state.items():
             setattr(strategy, attr, value)
@@ -317,7 +400,15 @@ class SignalProcessor:
             )
 
         decisions: list[tuple[str, Signal]] = []
+        admission_states: dict[str, tuple[BaseStrategy, bool, object]] = {}
         for strategy in eligible_strategies:
+            if type(strategy).on_trade is BaseStrategy.on_trade:
+                continue
+            if self.entry_admission_handler is not None:
+                admission_states[strategy.strategy_id] = (
+                    strategy,
+                    *self._snapshot_entry_admission_state(strategy),
+                )
             signal = strategy.on_trade(trade)
             if signal is not None:
                 decisions.append((strategy.strategy_id, signal))
@@ -339,8 +430,9 @@ class SignalProcessor:
                 f"strategy_ids={','.join(portfolio_signal_ids)}"
             )
 
-        for strategy_id, signal in decisions:
-            replay_stable_signal = (
+        replay_decisions = [
+            (
+                strategy_id,
                 self._with_market_idempotency(
                     signal,
                     product_id=trade.product_id,
@@ -352,9 +444,61 @@ class SignalProcessor:
                     ordinal=0,
                 )
                 if self.signal_handler is not None
-                else signal
+                else signal,
             )
+            for strategy_id, signal in decisions
+        ]
+        if self.entry_admission_handler is not None:
+            entry_strategy_ids = {
+                strategy_id
+                for strategy_id, signal in replay_decisions
+                if signal.type in (SignalType.LONG, SignalType.SHORT)
+            }
+            try:
+                entry_admissions = [
+                    self._entry_is_admitted(signal)
+                    for _strategy_id, signal in replay_decisions
+                    if signal.type in (SignalType.LONG, SignalType.SHORT)
+                ]
+            except Exception:
+                self._restore_entry_admission_states(
+                    entry_strategy_ids,
+                    admission_states,
+                )
+                raise
+            if not all(entry_admissions):
+                self._restore_entry_admission_states(
+                    entry_strategy_ids,
+                    admission_states,
+                )
+                replay_decisions = [
+                    (strategy_id, signal)
+                    for strategy_id, signal in replay_decisions
+                    if signal.type not in (SignalType.LONG, SignalType.SHORT)
+                ]
+
+        for strategy_id, replay_stable_signal in replay_decisions:
             self._process_signals(strategy_id, [replay_stable_signal], None)
+
+    def _entry_is_admitted(self, signal: Signal) -> bool:
+        return (
+            signal.type not in (SignalType.LONG, SignalType.SHORT)
+            or self.entry_admission_handler is None
+            or self.entry_admission_handler(signal)
+        )
+
+    def _locally_restored_entry_ids(
+        self,
+        strategy_ids: set[str],
+    ) -> set[str]:
+        return {
+            strategy_id
+            for strategy_id in strategy_ids
+            if self.portfolio_coordinator is None
+            or not self.portfolio_coordinator.requires_decision_state_rollback(
+                strategy_id
+            )
+        }
 
     def _lifecycle_id(self, strategy_id: str) -> str:
         if self.portfolio_coordinator is None:

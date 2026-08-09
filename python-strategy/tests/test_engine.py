@@ -23,6 +23,7 @@ import pytest
 
 from src.core.models import (
     Candlestick,
+    OrderSide,
     OrderStatus,
     Position,
     PositionSide,
@@ -41,7 +42,10 @@ from src.core.adapters.rithmic_adapter import (
 from src.core.adapters.simulated import SimulatedAdapter
 from src.core.product_registry import InstrumentSpec
 from src.core.portfolio_runtime import (
+    PortfolioDecisionRejected,
     PortfolioDefinition,
+    PortfolioExclusiveSlot,
+    PortfolioExposureSnapshot,
     PortfolioFactory,
     PortfolioSleeve,
 )
@@ -1727,6 +1731,10 @@ class TestHeartbeatRecording:
 
         redis_factory.assert_called_once_with()
         assert engine._entry_admission_gate is liveness_gate
+        assert (
+            engine._signal_processor.entry_admission_handler
+            == engine._entry_signal_allowed_for_processor
+        )
         liveness_factory.assert_called_once()
         assert liveness_factory.call_args.args == (engine.runtime_environment,)
         assert liveness_factory.call_args.kwargs["logger"].name == "src.core.engine"
@@ -1747,6 +1755,7 @@ class TestHeartbeatRecording:
             )
 
         assert engine._entry_admission_gate is None
+        assert engine._signal_processor.entry_admission_handler is None
 
     def test_live_non_rithmic_engine_has_no_gate_or_extra_redis_read(
         self,
@@ -1759,6 +1768,7 @@ class TestHeartbeatRecording:
             engine = engine_factory()
 
         assert engine._entry_admission_gate is None
+        assert engine._signal_processor.entry_admission_handler is None
 
         engine.process_signal(
             Signal(
@@ -1886,6 +1896,9 @@ class TestHeartbeatRecording:
         gate = MagicMock(spec=RithmicPublisherLivenessGate)
         gate.observe.return_value = False
         engine._entry_admission_gate = gate
+        engine._signal_processor.entry_admission_handler = (
+            engine._entry_signal_allowed_for_processor
+        )
         engine.risk_manager.check_risk = MagicMock()
         engine.execution_engine.execute_signal = MagicMock()
         signal = Signal(
@@ -1928,6 +1941,164 @@ class TestHeartbeatRecording:
             "product_id": "RITHMIC:NQ-202609",
             "signal_type": signal_type.value,
         }
+
+    @pytest.mark.parametrize("kill_switch_active", [False, True])
+    def test_portfolio_entry_admission_preserves_runtime_dispositions_and_exits(
+        self,
+        engine,
+        mock_strategy_class,
+        kill_switch_active,
+    ):
+        class StatefulSleeve(mock_strategy_class):
+            def __init__(self, strategy_id: str):
+                super().__init__(strategy_id, "RITHMIC:NQ-202609")
+                self._in_position = False
+                self.restore_calls = 0
+
+            def on_candle(self, candle):
+                signal_type = (
+                    SignalType.LONG
+                    if candle.timestamp == 1_704_067_200_000
+                    else SignalType.EXIT_LONG
+                )
+                if signal_type == SignalType.LONG:
+                    self._in_position = True
+                return Signal(
+                    strategy_id=self.strategy_id,
+                    product_id=self.product_id,
+                    timeframe=candle.timeframe,
+                    timestamp=candle.timestamp,
+                    type=signal_type,
+                    quantity=Decimal("1"),
+                    value=candle.close,
+                )
+
+            def snapshot_walk_forward_trade_state(self):
+                return self._in_position
+
+            def restore_walk_forward_trade_state(self, state):
+                self.restore_calls += 1
+                self._in_position = state
+
+        class PassiveSleeve(StatefulSleeve):
+            def on_candle(self, candle):
+                return Signal(
+                    strategy_id=self.strategy_id,
+                    product_id=self.product_id,
+                    timeframe=candle.timeframe,
+                    timestamp=candle.timestamp,
+                    type=SignalType.EXIT_LONG,
+                    quantity=Decimal("1"),
+                    value=candle.close,
+                )
+
+        active = StatefulSleeve("portfolio_v1.active")
+        passive = PassiveSleeve("portfolio_v1.passive")
+        engine.add_portfolio(
+            PortfolioDefinition(
+                portfolio_id="portfolio_v1",
+                product_id=active.product_id,
+                sleeves=(PortfolioSleeve(active), PortfolioSleeve(passive)),
+                max_gross_quantity=Decimal("1"),
+                exclusive_slots=(
+                    PortfolioExclusiveSlot(
+                        slot_id="shared",
+                        strategy_ids=(active.strategy_id, passive.strategy_id),
+                    ),
+                ),
+            )
+        )
+        engine._signal_processor.exposure_loader = (
+            lambda *_args: PortfolioExposureSnapshot({})
+        )
+        gate = MagicMock(spec=RithmicPublisherLivenessGate)
+        gate.observe.return_value = False
+        engine._entry_admission_gate = gate
+        engine._signal_processor.entry_admission_handler = (
+            engine._entry_signal_allowed_for_processor
+        )
+        engine._kill_switch_halted = kill_switch_active
+        engine._persist_live_candle = MagicMock()
+        engine.risk_manager.check_risk = MagicMock(return_value=(True, "PASS"))
+        engine.execution_engine.execute_signal = MagicMock(return_value="exit-order")
+        entry_candle = _make_candle(
+            product_id=active.product_id,
+            ts=1_704_067_200_000,
+        )
+        if kill_switch_active:
+            with pytest.raises(
+                PortfolioDecisionRejected,
+                match="portfolio_submission_rejected",
+            ):
+                engine.on_market_data(entry_candle)
+            gate.observe.assert_not_called()
+            engine.execution_engine.execute_signal.assert_not_called()
+            engine._persist_live_candle.assert_not_called()
+            return
+
+        engine.on_market_data(entry_candle)
+
+        assert active._in_position is False
+        assert active.restore_calls == 1
+        engine._persist_live_candle.assert_called_once_with(entry_candle)
+        engine.risk_manager.check_risk.assert_called_once()
+        engine.execution_engine.execute_signal.assert_called_once()
+        assert (
+            engine.execution_engine.execute_signal.call_args.args[0].type
+            == SignalType.EXIT_LONG
+        )
+        gate.observe.assert_called_once_with()
+
+    def test_trade_entry_kill_switch_rejection_does_not_read_liveness_gate(
+        self,
+        engine,
+        mock_strategy_class,
+    ):
+        class TradeEntryStrategy(mock_strategy_class):
+            def __init__(self):
+                super().__init__("trade_entry", "BINANCE:BTCUSDT-PERP")
+                self.trade_calls = 0
+
+            def on_trade(self, _trade):
+                self.trade_calls += 1
+                return signal
+
+        signal = Signal(
+            strategy_id="trade_entry",
+            product_id="BINANCE:BTCUSDT-PERP",
+            timeframe="1m",
+            timestamp=1_704_067_200_000,
+            type=SignalType.LONG,
+            quantity=Decimal("1"),
+            value=Decimal("42000"),
+        )
+        strategy = TradeEntryStrategy()
+        engine.add_strategy(strategy)
+        gate = MagicMock(spec=RithmicPublisherLivenessGate)
+        gate.observe.return_value = False
+        engine._entry_admission_gate = gate
+        engine._signal_processor.entry_admission_handler = (
+            engine._entry_signal_allowed_for_processor
+        )
+        engine._kill_switch_halted = True
+        engine.risk_manager.check_risk = MagicMock()
+        engine.execution_engine.execute_signal = MagicMock()
+
+        engine.on_market_data(
+            Trade(
+                id="trade-1",
+                product_id=strategy.product_id,
+                price=Decimal("42000"),
+                quantity=Decimal("1"),
+                side=OrderSide.BUY,
+                timestamp=1_704_067_200_000,
+            )
+        )
+
+        assert strategy.trade_calls == 1
+        gate.observe.assert_not_called()
+        engine.risk_manager.check_risk.assert_not_called()
+        engine.execution_engine.execute_signal.assert_not_called()
 
     @pytest.mark.parametrize(
         "signal_type",
