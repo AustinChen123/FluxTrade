@@ -24,6 +24,8 @@ from src.core.backtest.endpoint_state import build_replay_endpoint_state
 from src.core.backtest.equity import PortfolioEquityCalculator
 from src.core.analytics import (
     ClosedTrade,
+    InitialBalanceInput,
+    _normalize_initial_balance,
     annualized_sharpe_from_moments,
     calculate_metrics,
     utc_daily_return_metrics,
@@ -106,7 +108,7 @@ def _write_markdown_report(
     *,
     product_id: str,
     timeframe: str,
-    initial_balance: float,
+    initial_balance: InitialBalanceInput,
     start_time: int,
     end_time: int,
     fee_config: Dict,
@@ -181,7 +183,7 @@ class BacktestRunner:
         end_time: int,
         product_id: str,
         timeframe: str,
-        initial_balance: float = 10000.0,
+        initial_balance: InitialBalanceInput = Decimal("10000"),
         max_drawdown_limit: Optional[float] = 0.20,
         data_source: Optional[IDataSource] = None,
         fee_config: Optional[Dict[str, float]] = None,
@@ -207,7 +209,7 @@ class BacktestRunner:
                     "execution_timeframe must evenly divide and be shorter "
                     "than the strategy timeframe"
                 )
-        self.initial_balance = initial_balance
+        self.initial_balance = _normalize_initial_balance(initial_balance)
         self.max_drawdown_limit = max_drawdown_limit
         self.data_source = data_source
         self.fee_config = fee_config or {}
@@ -281,7 +283,7 @@ class BacktestRunner:
         stop_drawdown_amount: Decimal | None,
     ) -> _ReplayProgress:
         count = 0
-        peak_equity = Decimal(str(self.initial_balance))
+        peak_equity = self.initial_balance
         max_drawdown = Decimal("0")
         equity_samples: list[tuple[int, Decimal]] = []
         final_mark: Decimal | None = None
@@ -476,7 +478,7 @@ class BacktestRunner:
 
         # 3. Create Rust-backed adapter with fee config
         adapter = SimulatedAdapter(
-            initial_balance=Decimal(str(self.initial_balance)),
+            initial_balance=self.initial_balance,
             maker_fee=Decimal(str(self.fee_config.get("maker", 0))),
             taker_fee=Decimal(str(self.fee_config.get("taker", 0))),
             instrument_spec=self.instrument_spec,
@@ -523,8 +525,7 @@ class BacktestRunner:
         stop_drawdown_amount = (
             None
             if self.max_drawdown_limit is None
-            else Decimal(str(self.initial_balance))
-            * Decimal(str(self.max_drawdown_limit))
+            else self.initial_balance * Decimal(str(self.max_drawdown_limit))
         )
 
         if self.data_source:
@@ -564,7 +565,7 @@ class BacktestRunner:
 
         # Calculate Final PnL
         final_balance = mock_account.get_balance()
-        total_pnl = final_balance - Decimal(str(self.initial_balance))
+        total_pnl = final_balance - self.initial_balance
 
         with self._db_session_factory() as db_session:
             summary = db_session.query(BacktestResultSummary).filter_by(id=summary_id).first()
@@ -649,7 +650,7 @@ class BacktestRunner:
         }
         daily_return_metrics = utc_daily_return_metrics(
             progress.equity_samples,
-            initial_balance=Decimal(str(self.initial_balance)),
+            initial_balance=self.initial_balance,
             start_time=self.start_time,
             end_time=self.end_time,
         )

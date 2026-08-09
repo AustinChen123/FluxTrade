@@ -1,10 +1,29 @@
 from dataclasses import dataclass
 from datetime import UTC, date, datetime, timedelta
-from decimal import Decimal
+from decimal import Decimal, InvalidOperation
 from typing import Dict, Iterable, List, Sequence
 import pandas as pd
 import numpy as np
 from src.core.models import Trade, PositionSide
+
+
+InitialBalanceInput = Decimal | int | float | str
+_INVALID_INITIAL_BALANCE = "initial_balance must be a positive finite decimal value"
+
+
+def _normalize_initial_balance(value: object) -> Decimal:
+    if type(value) is Decimal:
+        balance = value
+    elif type(value) in (int, float, str):
+        try:
+            balance = Decimal(str(value))
+        except (InvalidOperation, ValueError):
+            raise ValueError(_INVALID_INITIAL_BALANCE) from None
+    else:
+        raise ValueError(_INVALID_INITIAL_BALANCE)
+    if not balance.is_finite() or balance <= 0:
+        raise ValueError(_INVALID_INITIAL_BALANCE)
+    return balance
 
 
 @dataclass(slots=True)
@@ -257,7 +276,7 @@ def _build_closed_trades(
 def calculate_metrics(
     trade_history: List[Trade],
     *,
-    initial_balance: float = 10000.0,
+    initial_balance: InitialBalanceInput = Decimal("10000"),
     risk_free_rate: float = 0.0,
     periods_per_year: int = 365,
     contract_multiplier: Decimal = Decimal("1"),
@@ -276,6 +295,7 @@ def calculate_metrics(
         max_consecutive_losses, max_consecutive_win_amount,
         max_consecutive_loss_amount, gross_profit, gross_loss
     """
+    initial_balance_decimal = _normalize_initial_balance(initial_balance)
     if not trade_history:
         result = {
             "closed_trade_count": 0,
@@ -288,7 +308,7 @@ def calculate_metrics(
             result.update(
                 _mark_to_market_drawdown_metrics(
                     equity_samples,
-                    initial_balance=Decimal(str(initial_balance)),
+                    initial_balance=initial_balance_decimal,
                     periods_per_year=periods_per_year,
                 )
             )
@@ -344,11 +364,18 @@ def calculate_metrics(
     if closed_trades and max_drawdown < 0:
         first_ts = closed_trades[0].entry_time
         last_ts = closed_trades[-1].exit_time
-        duration_days = max((last_ts - first_ts) / (1000 * 86400), 1.0)
-        annualized_return = (float(total_pnl) / initial_balance) * (
-            periods_per_year / duration_days
+        duration_days = max(
+            Decimal(last_ts - first_ts) / Decimal(86_400_000),
+            Decimal("1"),
         )
-        calmar_ratio = float(annualized_return / abs(float(max_drawdown) / initial_balance))
+        annualized_return = (
+            total_pnl
+            / initial_balance_decimal
+            * (Decimal(periods_per_year) / duration_days)
+        )
+        calmar_ratio = annualized_return / (
+            abs(Decimal(str(max_drawdown))) / initial_balance_decimal
+        )
 
     # Monthly returns
     monthly_returns: Dict[str, Decimal] = {}
@@ -437,7 +464,7 @@ def calculate_metrics(
     if equity_samples is not None:
         mark_to_market_metrics = _mark_to_market_drawdown_metrics(
             equity_samples,
-            initial_balance=Decimal(str(initial_balance)),
+            initial_balance=initial_balance_decimal,
             periods_per_year=periods_per_year,
         )
         max_drawdown = mark_to_market_metrics["max_drawdown"]
