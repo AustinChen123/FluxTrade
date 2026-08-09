@@ -785,7 +785,7 @@ async fn run_live_mode(
     let mut join_set: JoinSet<(TaskId, anyhow::Result<()>)> = JoinSet::new();
     // Spawn Watchdog task
     let watchdog_redis_url = redis_url.clone();
-    let watchdog_environment = runtime_environment;
+    let watchdog_environment = runtime_environment.clone();
     let execution_venue = non_empty_env("EXCHANGE_ID");
     #[cfg(feature = "rithmic")]
     let rithmic_watchdog_identity = rithmic_args
@@ -813,8 +813,9 @@ async fn run_live_mode(
 
     // Spawn Publisher task (Task 2: dedicated publisher with channel)
     let publisher_redis_url = redis_url.clone();
+    let publisher_environment = runtime_environment;
     join_set.spawn(async move {
-        let result = match RedisPublisher::new(&publisher_redis_url) {
+        let result = match RedisPublisher::new(&publisher_redis_url, publisher_environment) {
             Ok(mut publisher) => publisher.run(pub_rx).await,
             Err(e) => Err(e),
         };

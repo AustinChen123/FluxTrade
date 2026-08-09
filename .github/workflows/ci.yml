@@ -110,6 +110,14 @@ jobs:
           watchdog::tests::test_timeout_locks_only_test_environment
           -- --ignored --exact
 
+      - name: Run Redis publisher liveness isolation smoke
+        env:
+          DATA_PUBLISHER_TEST_REDIS_URL: redis://127.0.0.1:6379
+        run: >-
+          cargo test --no-default-features
+          publisher::tests::publisher_liveness_renews_recovers_fails_at_threshold_and_expires
+          -- --ignored --exact
+
       # TODO: Add Rust coverage with cargo-llvm-cov
       # Steps needed:
       #   1. Install cargo-llvm-cov: cargo install cargo-llvm-cov
