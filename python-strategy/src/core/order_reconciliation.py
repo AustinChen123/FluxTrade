@@ -1,7 +1,7 @@
 import logging
 from datetime import datetime, timezone
 from decimal import Decimal
-from typing import Callable, ContextManager, Optional
+from typing import Callable, ContextManager, Optional, Protocol, TypedDict, cast
 
 from sqlalchemy.orm import Session
 
@@ -9,6 +9,7 @@ from src.core.audit_service import write_system_event
 from src.core.fill_delta import FillDeltaState, classify_fill_delta, snapshot_fill_delta
 from src.core.interfaces.exchange import (
     ExchangeError,
+    ExchangeOrderEvent,
     ExchangeOrderLookupUnsupported,
 )
 from src.core.models import OrderStatus
@@ -65,6 +66,30 @@ _LEDGER_SNAPSHOT_FAILURE_FALLBACK = (
 )
 
 
+class _ExchangeOrderEventProcessor(Protocol):
+    def __call__(
+        self,
+        event: ExchangeOrderEvent,
+        *,
+        allow_remote_side_effects: bool = True,
+    ) -> dict[str, object]: ...
+
+
+class _ProtectionRecovery(TypedDict):
+    failures: list[dict[str, object]]
+
+
+class _RecoveryOrderIdentity(Protocol):
+    id: object
+    client_order_id: object
+
+
+class _PricedFill(TypedDict):
+    price: Decimal
+    quantity: Decimal
+    fee: Decimal | None
+
+
 def _classify_ledger_snapshot_failure(exc: Exception) -> tuple[str, str, str, str]:
     error_type = "RuntimeError" if type(exc) is RuntimeError else "Exception"
     if type(exc) is RuntimeError:
@@ -89,7 +114,7 @@ class OrderReconciler:
         order_manager,
         clock,
         db_session_factory: Optional[Callable[[], ContextManager[Session]]],
-        process_exchange_order_event: Callable[[object], dict[str, object]],
+        process_exchange_order_event: _ExchangeOrderEventProcessor,
         place_pending_protection_for_filled_entries: Callable[[], dict[str, object]],
         fail_pending_conditionals_for_terminal_entry: Callable[[object], None],
         protective_terminal_without_fill_failure: Callable[[object], dict | None],
@@ -134,7 +159,9 @@ class OrderReconciler:
     def record_recoverable_order_scan(self) -> dict:
         """Record a startup scan of client orders that still need reconciliation."""
         if self._db_session_factory is None:
-            raise RuntimeError("record_recoverable_order_scan requires db_session_factory")
+            raise RuntimeError(
+                "record_recoverable_order_scan requires db_session_factory"
+            )
 
         orders = self.list_recoverable_client_orders()
         status_counts: dict[str, int] = {}
@@ -182,7 +209,9 @@ class OrderReconciler:
         them unplaced keeps a live position naked across restarts.
         """
         if self._db_session_factory is None:
-            raise RuntimeError("reconcile_recoverable_client_orders requires db_session_factory")
+            raise RuntimeError(
+                "reconcile_recoverable_client_orders requires db_session_factory"
+            )
 
         orders = self.list_recoverable_client_orders()
         results = []
@@ -210,7 +239,9 @@ class OrderReconciler:
                 snapshot = None
                 result = "exchange_lookup_unsupported"
             else:
-                result = "exchange_found" if snapshot is not None else "exchange_not_found"
+                result = (
+                    "exchange_found" if snapshot is not None else "exchange_not_found"
+                )
             result_counts[result] = result_counts.get(result, 0) + 1
             if result == "exchange_lookup_unsupported":
                 decision = "exchange_unknown"
@@ -220,7 +251,9 @@ class OrderReconciler:
                     verification_blocked=True,
                 )
             else:
-                decision = self._reconcile_decision(order.status, snapshot.status if snapshot else None)
+                decision = self._reconcile_decision(
+                    order.status, snapshot.status if snapshot else None
+                )
                 repair = self._repair_reconciled_order(order, decision, snapshot)
             decision_counts[decision] = decision_counts.get(decision, 0) + 1
             unresolved = bool(repair["unresolved"])
@@ -235,7 +268,9 @@ class OrderReconciler:
                     "local_exchange_order_id": local_exchange_order_id,
                     "result": result,
                     "decision": decision,
-                    "exchange_order_id": snapshot.exchange_order_id if snapshot else None,
+                    "exchange_order_id": snapshot.exchange_order_id
+                    if snapshot
+                    else None,
                     "exchange_status": snapshot.status if snapshot else None,
                     "repair_action": repair["action"],
                     "repair_reason": repair.get("reason"),
@@ -245,10 +280,14 @@ class OrderReconciler:
             )
 
         protection_recovery = self.place_pending_protection_for_filled_entries()
+        protection_failures = cast(
+            _ProtectionRecovery,
+            protection_recovery,
+        )["failures"]
         reconciliation_unresolved_count = sum(
             1 for result in results if result["unresolved"]
         )
-        protection_unresolved_count = len(protection_recovery["failures"])
+        protection_unresolved_count = len(protection_failures)
 
         payload = {
             "recoverable_count": len(orders),
@@ -301,7 +340,9 @@ class OrderReconciler:
     ) -> dict[str, object]:
         """Repair recent FluxTrade-owned Rithmic orders from one remote snapshot."""
         if self._db_session_factory is None:
-            raise RuntimeError("reconcile_rithmic_owned_orders requires db_session_factory")
+            raise RuntimeError(
+                "reconcile_rithmic_owned_orders requires db_session_factory"
+            )
 
         orders = [
             order
@@ -405,19 +446,25 @@ class OrderReconciler:
             ]
             external_orders = []
         else:
-            recovery_plan, external_orders = build_rithmic_recovery_plan(orders, snapshot)
-            plan = [
-                {
-                    "order_id": str(item.order.id),
-                    "client_order_id": item.order.client_order_id,
-                    "classification": item.classification,
-                    "reason": item.reason,
-                    "repair_action": "pending" if item.event is not None else "none",
-                    "verification_blocked": item.verification_blocked,
-                    "unresolved": item.unresolved,
-                }
-                for item in recovery_plan
-            ]
+            recovery_plan, external_orders = build_rithmic_recovery_plan(
+                orders, snapshot
+            )
+            plan = []
+            for item in recovery_plan:
+                order = cast(_RecoveryOrderIdentity, item.order)
+                plan.append(
+                    {
+                        "order_id": str(order.id),
+                        "client_order_id": order.client_order_id,
+                        "classification": item.classification,
+                        "reason": item.reason,
+                        "repair_action": "pending"
+                        if item.event is not None
+                        else "none",
+                        "verification_blocked": item.verification_blocked,
+                        "unresolved": item.unresolved,
+                    }
+                )
 
         planned_payload = self._rithmic_recovery_payload(orders, plan, external_orders)
         if any(item.event is not None for item in recovery_plan):
@@ -578,7 +625,10 @@ class OrderReconciler:
         }
         if not snapshot.account_currency:
             result["errors"].append("remote_account_currency_missing")
-        if expected_account_id is not None and snapshot.account_id != expected_account_id:
+        if (
+            expected_account_id is not None
+            and snapshot.account_id != expected_account_id
+        ):
             result["errors"].append("remote_account_id_mismatch")
         if account_state is None:
             result["errors"].append("remote_account_summary_missing")
@@ -607,7 +657,10 @@ class OrderReconciler:
         *,
         phase: str = "completed",
     ) -> dict[str, object]:
-        with self._db_session_factory() as db:
+        db_session_factory = self._db_session_factory
+        if db_session_factory is None:
+            raise RuntimeError("Rithmic recovery audit requires db_session_factory")
+        with db_session_factory() as db:
             try:
                 write_system_event(
                     db,
@@ -689,7 +742,9 @@ class OrderReconciler:
 
         return {
             "recoverable_count": len(orders),
-            "applied_count": sum(1 for result in results if result["action"] == "applied"),
+            "applied_count": sum(
+                1 for result in results if result["action"] == "applied"
+            ),
             "unresolved_count": sum(1 for result in results if result["unresolved"]),
             "verification_blocked_count": sum(
                 1 for result in results if result["verification_blocked"]
@@ -706,9 +761,13 @@ class OrderReconciler:
     def _resync_action_verification_blocked(action: str) -> bool:
         return action in {"unknown_order", "unknown_status"}
 
-    def _repair_reconciled_order(self, order, decision: str, snapshot) -> dict[str, object]:
+    def _repair_reconciled_order(
+        self, order, decision: str, snapshot
+    ) -> dict[str, object]:
         if decision == "local_only":
-            self.order_manager.fail_order(order, "startup reconciliation: local order not found on exchange")
+            self.order_manager.fail_order(
+                order, "startup reconciliation: local order not found on exchange"
+            )
             self.fail_pending_conditionals_for_terminal_entry(order)
             self._mark_reconciled(order)
             return self._repair_result("marked_failed")
@@ -770,16 +829,19 @@ class OrderReconciler:
                 )
 
             if fill_state == FillDeltaState.DELTA_PRICED:
+                priced_fill = cast(_PricedFill, terminal_fill)
                 self.order_manager.record_fill_delta(
                     order,
-                    terminal_fill["price"],
-                    terminal_fill["quantity"],
+                    priced_fill["price"],
+                    priced_fill["quantity"],
                     snapshot.filled_quantity,
                     snapshot.average_price,
                     terminal_status=terminal_status,
-                    fee=terminal_fill["fee"],
+                    fee=priced_fill["fee"],
                 )
-                cancel_failure = self.cancel_linked_conditional_for_protection_fill(order)
+                cancel_failure = self.cancel_linked_conditional_for_protection_fill(
+                    order
+                )
                 if cancel_failure is not None:
                     return self._repair_result(
                         "unresolved_linked_conditional_cancel_failed",
@@ -795,7 +857,9 @@ class OrderReconciler:
             self.order_manager.repo.update_order(order)
             if terminal_status in {OrderStatus.CANCELLED, OrderStatus.FAILED}:
                 self.fail_pending_conditionals_for_terminal_entry(order)
-                protective_failure = self.protective_terminal_without_fill_failure(order)
+                protective_failure = self.protective_terminal_without_fill_failure(
+                    order
+                )
                 if protective_failure is not None:
                     self._mark_reconciled(order)
                     return self._repair_result(
@@ -837,7 +901,9 @@ class OrderReconciler:
         }
 
     @staticmethod
-    def _terminal_order_status(normalized_exchange_status: str) -> Optional[OrderStatus]:
+    def _terminal_order_status(
+        normalized_exchange_status: str,
+    ) -> Optional[OrderStatus]:
         if normalized_exchange_status in {"closed", "filled"}:
             return OrderStatus.FILLED
         if normalized_exchange_status in {"canceled", "cancelled"}:
@@ -920,18 +986,21 @@ class OrderReconciler:
                 unresolved=True,
             )
 
+        priced_fill = cast(_PricedFill, fill_delta)
         self.order_manager.record_partial_fill(
             order,
-            fill_delta["price"],
-            fill_delta["quantity"],
+            priced_fill["price"],
+            priced_fill["quantity"],
             snapshot.filled_quantity,
             snapshot.average_price,
-            fee=fill_delta["fee"],
+            fee=priced_fill["fee"],
         )
         return self._repair_result("recorded_partial_fill_and_restored_tracking")
 
     def _mark_reconciled(self, order) -> None:
-        order.last_reconciled_at = datetime.fromtimestamp(self.clock.now(), timezone.utc)
+        order.last_reconciled_at = datetime.fromtimestamp(
+            self.clock.now(), timezone.utc
+        )
         self.order_manager.repo.update_order(order)
 
     @staticmethod
