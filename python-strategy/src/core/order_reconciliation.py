@@ -20,6 +20,67 @@ from src.core.adapters.rithmic_recovery import (
 )
 
 
+_SAFE_LEDGER_SNAPSHOT_FAILURES = frozenset(
+    {
+        ("profile_lease", "profile_lease_failed", "profile lease failed"),
+        (
+            "runtime_initialization",
+            "runtime_initialization_failed",
+            "runtime initialization failed",
+        ),
+        (
+            "request_validation",
+            "invalid_ledger_snapshot_request",
+            "ledger snapshot request validation failed",
+        ),
+        ("order_config", "order_config_failed", "ORDER config failed"),
+        ("order_connect", "order_connect_failed", "ORDER connect failed"),
+        ("order_heartbeat", "order_heartbeat_failed", "ORDER heartbeat failed"),
+        ("order_login_info", "order_login_info_failed", "ORDER login info failed"),
+        (
+            "order_account_list",
+            "order_account_list_failed",
+            "ORDER account list failed",
+        ),
+        ("order_snapshot", "order_snapshot_failed", "ORDER snapshot failed"),
+        ("order_history", "order_history_failed", "ORDER history failed"),
+        ("fill_history", "fill_history_failed", "fill history failed"),
+        ("pnl_config", "pnl_config_failed", "PNL config failed"),
+        ("pnl_connect", "pnl_connect_failed", "PNL connect failed"),
+        ("pnl_heartbeat", "pnl_heartbeat_failed", "PNL heartbeat failed"),
+        ("pnl_request", "pnl_request_failed", "PNL request failed"),
+        ("pnl_snapshot", "pnl_snapshot_failed", "PNL snapshot failed"),
+        (
+            "unclassified_internal",
+            "unclassified_ledger_snapshot_failure",
+            "ledger snapshot failed before safe classification",
+        ),
+    }
+)
+_LEDGER_SNAPSHOT_FAILURE_FALLBACK = (
+    "Exception",
+    "unclassified_internal",
+    "unclassified_ledger_snapshot_failure",
+    "ledger snapshot failed before safe classification",
+)
+
+
+def _classify_ledger_snapshot_failure(exc: Exception) -> tuple[str, str, str, str]:
+    error_type = "RuntimeError" if type(exc) is RuntimeError else "Exception"
+    if type(exc) is RuntimeError:
+        stage = getattr(exc, "stage", None)
+        code = getattr(exc, "stable_error_code", None)
+        cause = getattr(exc, "safe_cause", None)
+        if (
+            type(stage) is str
+            and type(code) is str
+            and type(cause) is str
+            and (stage, code, cause) in _SAFE_LEDGER_SNAPSHOT_FAILURES
+        ):
+            return ("RuntimeError", stage, code, cause)
+    return (error_type, *_LEDGER_SNAPSHOT_FAILURE_FALLBACK[1:])
+
+
 class OrderReconciler:
     def __init__(
         self,
@@ -293,6 +354,19 @@ class OrderReconciler:
                 snapshot_loader,
             )
         except Exception as exc:
+            error_type, error_stage, error_code, error_cause = (
+                _classify_ledger_snapshot_failure(exc)
+            )
+            snapshot_diagnostics = {
+                "snapshot_error_type": error_type,
+                "snapshot_error_stage": error_stage,
+                "snapshot_error_code": error_code,
+                "snapshot_error_cause": error_cause,
+            }
+            self.logger.error(
+                "Rithmic ledger snapshot acquisition failed",
+                extra=snapshot_diagnostics,
+            )
             return self._write_rithmic_recovery_audit(
                 {
                     "recoverable_count": len(orders),
@@ -313,7 +387,7 @@ class OrderReconciler:
                         for order in orders
                     ],
                     "external_orders": [],
-                    "snapshot_error_type": type(exc).__name__,
+                    **snapshot_diagnostics,
                 }
             )
 

@@ -14,6 +14,92 @@ from src.core.adapters.rithmic_recovery import (
 from src.core.order_reconciliation import OrderReconciler
 
 
+SAFE_SNAPSHOT_FAILURES = [
+    ("profile_lease", "profile_lease_failed", "profile lease failed"),
+    (
+        "runtime_initialization",
+        "runtime_initialization_failed",
+        "runtime initialization failed",
+    ),
+    (
+        "request_validation",
+        "invalid_ledger_snapshot_request",
+        "ledger snapshot request validation failed",
+    ),
+    ("order_config", "order_config_failed", "ORDER config failed"),
+    ("order_connect", "order_connect_failed", "ORDER connect failed"),
+    ("order_heartbeat", "order_heartbeat_failed", "ORDER heartbeat failed"),
+    ("order_login_info", "order_login_info_failed", "ORDER login info failed"),
+    ("order_account_list", "order_account_list_failed", "ORDER account list failed"),
+    ("order_snapshot", "order_snapshot_failed", "ORDER snapshot failed"),
+    ("order_history", "order_history_failed", "ORDER history failed"),
+    ("fill_history", "fill_history_failed", "fill history failed"),
+    ("pnl_config", "pnl_config_failed", "PNL config failed"),
+    ("pnl_connect", "pnl_connect_failed", "PNL connect failed"),
+    ("pnl_heartbeat", "pnl_heartbeat_failed", "PNL heartbeat failed"),
+    ("pnl_request", "pnl_request_failed", "PNL request failed"),
+    ("pnl_snapshot", "pnl_snapshot_failed", "PNL snapshot failed"),
+    (
+        "unclassified_internal",
+        "unclassified_ledger_snapshot_failure",
+        "ledger snapshot failed before safe classification",
+    ),
+]
+SNAPSHOT_DIAGNOSTIC_KEYS = (
+    "snapshot_error_type",
+    "snapshot_error_stage",
+    "snapshot_error_code",
+    "snapshot_error_cause",
+)
+RAW_SENTINELS = (
+    "PROVIDER_SECRET_123 ACCOUNT_ID_SECRET_123 BASKET_ID_SECRET_123 "
+    "STATUS_SECRET_123 FCM_ID_SECRET_123 IB_ID_SECRET_123 PROFILE_SECRET_123 "
+    "URL_SECRET_123 USER_SECRET_123"
+).split()
+
+
+def snapshot_failure(exception_type=RuntimeError, **attributes):
+    raw = " ".join(RAW_SENTINELS)
+    error = exception_type(raw)
+    for name, value in attributes.items():
+        setattr(error, name, value)
+    try:
+        raise ValueError(raw)
+    except ValueError as source:
+        try:
+            raise error from source
+        except Exception as chained:
+            return chained
+
+
+def assert_no_raw_sentinels(value):
+    pending = [value]
+    while pending:
+        item = pending.pop()
+        if type(item) is str:
+            assert all(sentinel not in item for sentinel in RAW_SENTINELS)
+        elif type(item) is dict:
+            pending.extend((*item.keys(), *item.values()))
+        elif type(item) in (list, tuple, set, frozenset):
+            pending.extend(item)
+
+
+def assert_snapshot_diagnostics(result, event_payload, records, expected):
+    diagnostics = [
+        record
+        for record in records
+        if record.getMessage() == "Rithmic ledger snapshot acquisition failed"
+    ]
+    assert len(diagnostics) == 1
+    surfaces = (
+        tuple(result[key] for key in SNAPSHOT_DIAGNOSTIC_KEYS),
+        tuple(event_payload[key] for key in SNAPSHOT_DIAGNOSTIC_KEYS),
+        tuple(getattr(diagnostics[0], key) for key in SNAPSHOT_DIAGNOSTIC_KEYS),
+    )
+    assert surfaces == (expected, expected, expected)
+    assert_no_raw_sentinels((result, event_payload, vars(diagnostics[0])))
+
+
 def local_order(**overrides):
     values = {
         "id": "local-1",
@@ -917,7 +1003,13 @@ def test_reconciler_leaves_planned_audit_when_completion_audit_fails():
     db.rollback.assert_called_once()
 
 
-def test_reconciler_snapshot_failure_blocks_every_owned_order_without_mutation():
+@pytest.mark.parametrize(("stage", "code", "cause"), SAFE_SNAPSHOT_FAILURES)
+def test_reconciler_snapshot_failure_blocks_every_owned_order_without_mutation(
+    caplog,
+    stage,
+    code,
+    cause,
+):
     order = local_order(status="SUBMITTED")
     repo = MagicMock()
     repo.list_client_orders_by_statuses.return_value = [order]
@@ -937,27 +1029,50 @@ def test_reconciler_snapshot_failure_blocks_every_owned_order_without_mutation()
         local_positions_loader=lambda: [],
     )
 
-    result = reconciler.reconcile_rithmic_owned_orders(
-        "test",
-        "ACCOUNT",
-        snapshot_loader=Mock(side_effect=RuntimeError("unavailable")),
-    )
+    error = snapshot_failure(stage=stage, stable_error_code=code, safe_cause=cause)
+    with caplog.at_level("ERROR", logger="OrderReconciler"):
+        result = reconciler.reconcile_rithmic_owned_orders(
+            "test",
+            "ACCOUNT",
+            snapshot_loader=Mock(side_effect=error),
+        )
 
+    assert result["recoverable_count"] == 1
+    assert result["matched_count"] == 0
+    assert result["repaired_count"] == 0
+    assert result["external_count"] == 0
     assert result["verification_blocked_count"] == 1
     assert result["unresolved_count"] == 1
-    assert result["results"][0]["reason"] == "remote_snapshot_failed"
+    assert result["results"] == [
+        {
+            "order_id": "local-1",
+            "classification": "unresolved",
+            "reason": "remote_snapshot_failed",
+            "verification_blocked": True,
+            "unresolved": True,
+        }
+    ]
+    assert result["external_orders"] == []
     assert result["auto_resume_safe"] is False
+    assert_snapshot_diagnostics(
+        result,
+        db.add.call_args.args[0].payload,
+        caplog.records,
+        ("RuntimeError", stage, code, cause),
+    )
     processor.assert_not_called()
 
 
-def test_reconciler_snapshot_failure_blocks_without_recoverable_orders():
+def test_reconciler_snapshot_failure_logs_once_when_audit_commit_fails(caplog):
     repo = MagicMock()
     repo.list_client_orders_by_statuses.return_value = []
+    db = MagicMock()
+    db.commit.side_effect = RuntimeError("audit unavailable")
     reconciler = OrderReconciler(
         adapter=MagicMock(),
         order_manager=SimpleNamespace(repo=repo),
         clock=SimpleNamespace(now=lambda: 1_700_000_200),
-        db_session_factory=lambda: nullcontext(MagicMock()),
+        db_session_factory=lambda: nullcontext(db),
         process_exchange_order_event=Mock(),
         place_pending_protection_for_filled_entries=Mock(),
         fail_pending_conditionals_for_terminal_entry=Mock(),
@@ -967,16 +1082,103 @@ def test_reconciler_snapshot_failure_blocks_without_recoverable_orders():
         local_positions_loader=lambda: [],
     )
 
-    result = reconciler.reconcile_rithmic_owned_orders(
-        "test",
-        "ACCOUNT",
-        snapshot_loader=Mock(side_effect=RuntimeError("unavailable")),
+    error = snapshot_failure(
+        stage="order_snapshot",
+        stable_error_code="order_snapshot_failed",
+        safe_cause="ORDER snapshot failed",
     )
+    with caplog.at_level("ERROR", logger="OrderReconciler"):
+        with pytest.raises(RuntimeError, match="audit unavailable"):
+            reconciler.reconcile_rithmic_owned_orders(
+                "test", "ACCOUNT", snapshot_loader=Mock(side_effect=error)
+            )
 
+    assert (
+        sum(
+            record.getMessage() == "Rithmic ledger snapshot acquisition failed"
+            for record in caplog.records
+        )
+        == 1
+    )
+    db.rollback.assert_called_once()
+
+
+@pytest.mark.parametrize(
+    ("exception_type", "mutation", "field", "value"),
+    [
+        (RuntimeError, "missing", "stage", None),
+        (RuntimeError, "missing", "stable_error_code", None),
+        (RuntimeError, "missing", "safe_cause", None),
+        (RuntimeError, "replace", "stage", 7),
+        (RuntimeError, "replace", "stable_error_code", 7),
+        (RuntimeError, "replace", "safe_cause", 7),
+        (RuntimeError, "replace", "stage", "x" * 1000),
+        (RuntimeError, "replace", "stable_error_code", "x" * 1000),
+        (RuntimeError, "replace", "safe_cause", "x" * 1000),
+        (RuntimeError, "replace", "stable_error_code", "pnl_snapshot_failed"),
+        (ValueError, "unchanged", "stage", None),
+    ],
+)
+def test_reconciler_snapshot_failure_falls_back_atomically(
+    caplog,
+    exception_type,
+    mutation,
+    field,
+    value,
+):
+    repo = MagicMock()
+    repo.list_client_orders_by_statuses.return_value = []
+    db = MagicMock()
+    reconciler = OrderReconciler(
+        adapter=MagicMock(),
+        order_manager=SimpleNamespace(repo=repo),
+        clock=SimpleNamespace(now=lambda: 1_700_000_200),
+        db_session_factory=lambda: nullcontext(db),
+        process_exchange_order_event=Mock(),
+        place_pending_protection_for_filled_entries=Mock(),
+        fail_pending_conditionals_for_terminal_entry=Mock(),
+        protective_terminal_without_fill_failure=Mock(),
+        cancel_protective_order_when_sibling_closed=Mock(),
+        cancel_linked_conditional_for_protection_fill=Mock(),
+        local_positions_loader=lambda: [],
+    )
+    attributes: dict[str, object] = {
+        "stage": "order_snapshot",
+        "stable_error_code": "order_snapshot_failed",
+        "safe_cause": "ORDER snapshot failed",
+    }
+    if mutation == "missing":
+        attributes.pop(field)
+    elif mutation == "replace":
+        attributes[field] = value
+    error = snapshot_failure(exception_type, **attributes)
+
+    with caplog.at_level("ERROR", logger="OrderReconciler"):
+        result = reconciler.reconcile_rithmic_owned_orders(
+            "test", "ACCOUNT", snapshot_loader=Mock(side_effect=error)
+        )
+
+    expected = (
+        "RuntimeError" if exception_type is RuntimeError else "Exception",
+        "unclassified_internal",
+        "unclassified_ledger_snapshot_failure",
+        "ledger snapshot failed before safe classification",
+    )
+    assert_snapshot_diagnostics(
+        result,
+        db.add.call_args.args[0].payload,
+        caplog.records,
+        expected,
+    )
     assert result["recoverable_count"] == 0
+    assert result["matched_count"] == 0
+    assert result["repaired_count"] == 0
+    assert result["external_count"] == 0
     assert result["unresolved_count"] == 1
     assert result["verification_blocked_count"] == 1
     assert result["auto_resume_safe"] is False
+    assert result["results"] == []
+    assert result["external_orders"] == []
 
 
 @pytest.mark.parametrize(
@@ -1198,14 +1400,15 @@ def test_reconciler_blocks_unowned_working_order_without_adopting_it():
     assert result["verification_blocked_count"] == 1
 
 
-def test_reconciler_clean_snapshot_explicitly_allows_auto_resume():
+def test_reconciler_clean_snapshot_explicitly_allows_auto_resume(caplog):
     repo = MagicMock()
     repo.list_client_orders_by_statuses.return_value = []
+    db = MagicMock()
     reconciler = OrderReconciler(
         adapter=MagicMock(),
         order_manager=SimpleNamespace(repo=repo),
         clock=SimpleNamespace(now=lambda: 1_700_000_200),
-        db_session_factory=lambda: nullcontext(MagicMock()),
+        db_session_factory=lambda: nullcontext(db),
         process_exchange_order_event=Mock(),
         place_pending_protection_for_filled_entries=Mock(),
         fail_pending_conditionals_for_terminal_entry=Mock(),
@@ -1215,13 +1418,22 @@ def test_reconciler_clean_snapshot_explicitly_allows_auto_resume():
         local_positions_loader=lambda: [],
     )
 
-    result = reconciler.reconcile_rithmic_owned_orders(
-        "test",
-        "ACCOUNT",
-        snapshot_loader=Mock(return_value=snapshot()),
-    )
+    with caplog.at_level("ERROR", logger="OrderReconciler"):
+        result = reconciler.reconcile_rithmic_owned_orders(
+            "test",
+            "ACCOUNT",
+            snapshot_loader=Mock(return_value=snapshot()),
+        )
 
     assert result["auto_resume_safe"] is True
+    assert not any(key.startswith("snapshot_error_") for key in result)
+    assert not any(
+        key.startswith("snapshot_error_") for key in db.add.call_args.args[0].payload
+    )
+    assert not any(
+        record.getMessage() == "Rithmic ledger snapshot acquisition failed"
+        for record in caplog.records
+    )
 
 
 @pytest.mark.parametrize(
