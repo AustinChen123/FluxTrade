@@ -3,10 +3,27 @@ use crate::rithmic_ledger::{
         AccountSummarySnapshot, FillSnapshot, InstrumentPositionSnapshot, OrderSnapshot,
         TransactionType,
     },
-    ledger_runtime::{RecoveryQuery, RemoteLedgerSnapshot},
+    ledger_runtime::{LedgerSnapshotFailure, RecoveryQuery, RemoteLedgerSnapshot},
     profile_lock::ProfileLease,
 };
+use anyhow::Context;
 use pyo3::{exceptions::PyRuntimeError, exceptions::PyValueError, prelude::*};
+
+const PROFILE_LEASE_FAILURE: LedgerSnapshotFailure = LedgerSnapshotFailure::new(
+    "profile_lease",
+    "profile_lease_failed",
+    "profile lease failed",
+);
+const RUNTIME_INITIALIZATION_FAILURE: LedgerSnapshotFailure = LedgerSnapshotFailure::new(
+    "runtime_initialization",
+    "runtime_initialization_failed",
+    "runtime initialization failed",
+);
+const UNCLASSIFIED_FAILURE: LedgerSnapshotFailure = LedgerSnapshotFailure::new(
+    "unclassified_internal",
+    "unclassified_ledger_snapshot_failure",
+    "ledger snapshot failed before safe classification",
+);
 
 #[pyclass(frozen, name = "RithmicLedgerOrder")]
 #[derive(Clone)]
@@ -191,13 +208,13 @@ pub fn rithmic_ledger_snapshot(
         }
     };
     let _ = rustls::crypto::ring::default_provider().install_default();
-    py.allow_threads(|| {
-        let _lease = ProfileLease::acquire(profile).map_err(runtime_error)?;
+    let result = py.allow_threads(|| -> anyhow::Result<PyLedgerSnapshot> {
+        let _lease = ProfileLease::acquire(profile).context(PROFILE_LEASE_FAILURE)?;
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
-            .map_err(runtime_error)?;
-        let snapshot = match recovery {
+            .context(RUNTIME_INITIALIZATION_FAILURE)?;
+        match recovery {
             Some(recovery) => {
                 runtime.block_on(crate::rithmic_ledger::ledger_runtime::run_with_recovery(
                     profile,
@@ -208,9 +225,10 @@ pub fn rithmic_ledger_snapshot(
             None => runtime.block_on(crate::rithmic_ledger::ledger_runtime::run(
                 profile, account_id,
             )),
-        };
-        snapshot.map(PyLedgerSnapshot::from).map_err(runtime_error)
-    })
+        }
+        .map(PyLedgerSnapshot::from)
+    });
+    result.map_err(|error| runtime_error(py, error))
 }
 
 impl From<RemoteLedgerSnapshot> for PyLedgerSnapshot {
@@ -325,8 +343,34 @@ impl From<AccountSummarySnapshot> for PyLedgerAccountSummary {
     }
 }
 
-fn runtime_error(error: impl std::fmt::Display) -> PyErr {
-    PyRuntimeError::new_err(error.to_string())
+fn runtime_error(py: Python<'_>, error: anyhow::Error) -> PyErr {
+    let failure = error
+        .downcast_ref::<LedgerSnapshotFailure>()
+        .copied()
+        .unwrap_or(UNCLASSIFIED_FAILURE);
+    let target = PyRuntimeError::new_err("Rithmic ledger snapshot failed")
+        .into_value(py)
+        .into_bound(py)
+        .into_any();
+    project_runtime_error_target(failure, target)
+}
+
+fn project_runtime_error_target(failure: LedgerSnapshotFailure, target: Bound<'_, PyAny>) -> PyErr {
+    if set_diagnostic_attributes(&target, failure).is_err() {
+        return PyRuntimeError::new_err("Rithmic ledger snapshot failed");
+    }
+    PyErr::from_value(target)
+}
+
+fn set_diagnostic_attributes(
+    target: &Bound<'_, PyAny>,
+    failure: LedgerSnapshotFailure,
+) -> PyResult<()> {
+    let [stage, stable_error_code, safe_cause] = failure.safe_fields();
+    target
+        .setattr("stage", stage)
+        .and_then(|_| target.setattr("stable_error_code", stable_error_code))
+        .and_then(|_| target.setattr("safe_cause", safe_cause))
 }
 
 #[cfg(test)]
@@ -334,6 +378,169 @@ mod tests {
     use super::*;
     use crate::rithmic_ledger::ledger::{Account, AccountIdentity};
     use rust_decimal_macros::dec;
+
+    #[test]
+    fn runtime_error_projects_only_the_independent_safe_ledger() {
+        const SENTINELS: [&str; 8] = [
+            "PROVIDER", "RP", "ACCOUNT", "BASKET", "STATUS", "PROFILE", "URL", "USER",
+        ];
+        const EXPECTED: &str = "profile_lease|profile_lease_failed|profile lease failed
+runtime_initialization|runtime_initialization_failed|runtime initialization failed
+request_validation|invalid_ledger_snapshot_request|ledger snapshot request validation failed
+order_config|order_config_failed|ORDER config failed
+order_connect|order_connect_failed|ORDER connect failed
+order_heartbeat|order_heartbeat_failed|ORDER heartbeat failed
+order_login_info|order_login_info_failed|ORDER login info failed
+order_account_list|order_account_list_failed|ORDER account list failed
+order_snapshot|order_snapshot_failed|ORDER snapshot failed
+order_history|order_history_failed|ORDER history failed
+fill_history|fill_history_failed|fill history failed
+pnl_config|pnl_config_failed|PNL config failed
+pnl_connect|pnl_connect_failed|PNL connect failed
+pnl_heartbeat|pnl_heartbeat_failed|PNL heartbeat failed
+pnl_request|pnl_request_failed|PNL request failed
+pnl_snapshot|pnl_snapshot_failed|PNL snapshot failed
+unclassified_internal|unclassified_ledger_snapshot_failure|ledger snapshot failed before safe classification";
+        let stages = [
+            PROFILE_LEASE_FAILURE,
+            RUNTIME_INITIALIZATION_FAILURE,
+            LedgerSnapshotFailure::REQUEST_VALIDATION,
+            LedgerSnapshotFailure::ORDER_CONFIG,
+            LedgerSnapshotFailure::ORDER_CONNECT,
+            LedgerSnapshotFailure::ORDER_HEARTBEAT,
+            LedgerSnapshotFailure::ORDER_LOGIN_INFO,
+            LedgerSnapshotFailure::ORDER_ACCOUNT_LIST,
+            LedgerSnapshotFailure::ORDER_SNAPSHOT,
+            LedgerSnapshotFailure::ORDER_HISTORY,
+            LedgerSnapshotFailure::FILL_HISTORY,
+            LedgerSnapshotFailure::PNL_CONFIG,
+            LedgerSnapshotFailure::PNL_CONNECT,
+            LedgerSnapshotFailure::PNL_HEARTBEAT,
+            LedgerSnapshotFailure::PNL_REQUEST,
+            LedgerSnapshotFailure::PNL_SNAPSHOT,
+            UNCLASSIFIED_FAILURE,
+        ];
+        assert_eq!(stages.len(), 17);
+        assert_eq!(EXPECTED.lines().count(), 17);
+        Python::with_gil(|py| {
+            for (index, (stage, expected)) in stages.into_iter().zip(EXPECTED.lines()).enumerate() {
+                let source = anyhow::Error::new(std::io::Error::other(
+                    "provider=PROVIDER rp_code=RP account=ACCOUNT basket=BASKET status=STATUS profile=PROFILE URL=URL user=USER",
+                ));
+                let source = if index == 16 {
+                    source
+                } else {
+                    source.context(stage)
+                };
+                assert!(source.downcast_ref::<std::io::Error>().is_some());
+                assert_eq!(source.chain().count(), if index == 16 { 1 } else { 2 });
+                let error = runtime_error(py, source);
+                let value = error.value(py);
+                assert!(value.is_instance_of::<PyRuntimeError>());
+                assert_eq!(value.get_type().name().unwrap(), "RuntimeError");
+                let message = value.to_string();
+                let args = value
+                    .getattr("args")
+                    .unwrap()
+                    .extract::<(String,)>()
+                    .unwrap();
+                assert_eq!(message, "Rithmic ledger snapshot failed");
+                assert_eq!(args, ("Rithmic ledger snapshot failed".to_string(),));
+                for sentinel in SENTINELS {
+                    assert!(!message.contains(sentinel));
+                    assert!(!args.0.contains(sentinel));
+                }
+                let expected: Vec<_> = expected.split('|').collect();
+                for (attribute, expected) in ["stage", "stable_error_code", "safe_cause"]
+                    .into_iter()
+                    .zip(expected)
+                {
+                    let actual = value
+                        .getattr(attribute)
+                        .unwrap()
+                        .extract::<String>()
+                        .unwrap();
+                    assert_eq!(actual, expected);
+                    for sentinel in SENTINELS {
+                        assert!(!actual.contains(sentinel));
+                    }
+                }
+            }
+        });
+    }
+
+    #[test]
+    fn rejected_diagnostic_target_returns_fixed_runtime_error() {
+        Python::with_gil(|py| {
+            let error =
+                project_runtime_error_target(PROFILE_LEASE_FAILURE, py.None().into_bound(py));
+            let value = error.value(py);
+            assert!(value.is_instance_of::<PyRuntimeError>());
+            assert_eq!(value.to_string(), "Rithmic ledger snapshot failed");
+            assert_eq!(
+                value
+                    .getattr("args")
+                    .unwrap()
+                    .extract::<(String,)>()
+                    .unwrap(),
+                ("Rithmic ledger snapshot failed".to_string(),)
+            );
+        });
+    }
+
+    #[test]
+    fn profile_lease_failure_uses_public_safe_boundary() {
+        let profile = "snapshot-diagnostic-profile-sentinel";
+        let lease = ProfileLease::acquire(profile).unwrap();
+        Python::with_gil(|py| {
+            let error = rithmic_ledger_snapshot(py, profile, None, None, None, None)
+                .err()
+                .expect("held profile lease must reject the snapshot");
+            let value = error.value(py);
+            assert_eq!(value.to_string(), "Rithmic ledger snapshot failed");
+            assert_eq!(
+                value
+                    .getattr("args")
+                    .unwrap()
+                    .extract::<(String,)>()
+                    .unwrap(),
+                ("Rithmic ledger snapshot failed".to_string(),)
+            );
+            assert!(!value.to_string().contains(profile));
+            assert!(!value.getattr("args").unwrap().to_string().contains(profile));
+            for (attribute, expected) in [
+                ("stage", "profile_lease"),
+                ("stable_error_code", "profile_lease_failed"),
+                ("safe_cause", "profile lease failed"),
+            ] {
+                let actual = value
+                    .getattr(attribute)
+                    .unwrap()
+                    .extract::<String>()
+                    .unwrap();
+                assert_eq!(actual, expected);
+                assert!(!actual.contains(profile));
+            }
+        });
+        drop(lease);
+    }
+
+    #[test]
+    fn production_seams_keep_gil_release_runtime_context_and_fallback() {
+        let source = include_str!("rithmic_ledger.rs");
+        let allow_threads = source
+            .split_once("let result = py.allow_threads")
+            .unwrap()
+            .1
+            .split_once("\n    });\n")
+            .unwrap()
+            .0;
+        assert!(allow_threads.contains(".map(PyLedgerSnapshot::from)"));
+        assert!(allow_threads
+            .contains(".build()\n            .context(RUNTIME_INITIALIZATION_FAILURE)?"));
+        let runtime_error = source.split_once("fn runtime_error").unwrap().1;
+        assert!(runtime_error.contains("project_runtime_error_target(failure, target)"));
+    }
 
     fn account() -> AccountIdentity {
         AccountIdentity {
