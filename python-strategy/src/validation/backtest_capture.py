@@ -3,7 +3,11 @@
 from decimal import Decimal, InvalidOperation
 
 from src.core.backtest.endpoint_state import ReplayEndpointState
-from src.core.decimal_math import exact_decimal_add, exact_decimal_subtract
+from src.core.decimal_math import (
+    canonical_decimal_text,
+    exact_decimal_add,
+    exact_decimal_subtract,
+)
 from src.core.models import OrderSide, Signal, SignalType
 from src.validation.trading_outcome import (
     FillObservation,
@@ -373,6 +377,12 @@ def _build_normal_backtest_trading_outcome(
         ):
             projected_data = dict(data)
             projected_data["order_id"] = logical_id
+            if tag == "entry":
+                projected_data["quantity"] = canonical_decimal_text(fill_quantity)
+            else:
+                projected_data["price"] = canonical_decimal_text(fill_price)
+                projected_data["quantity"] = canonical_decimal_text(fill_quantity)
+                projected_data["fee"] = canonical_decimal_text(fill_fee)
             projected_side = projected_data["side"]
             assert type(projected_side) is OrderSide
             projected_data["side"] = projected_side.value

@@ -1,4 +1,4 @@
-from decimal import Decimal, localcontext
+from decimal import Decimal, ROUND_DOWN, ROUND_HALF_UP, localcontext
 
 import pytest
 from pydantic import ValidationError
@@ -10,6 +10,7 @@ from src.core.backtest.endpoint_state import (
     build_replay_endpoint_state,
 )
 from src.core.models import OrderSide, PositionSide, Signal, SignalType
+from src.core.decimal_math import canonical_decimal_text
 from src.validation.backtest_capture import (
     BacktestOutcomeCaptureError,
     build_normal_backtest_trading_outcome,
@@ -321,6 +322,96 @@ def test_build_normal_backtest_outcome_is_independent_of_raw_ids_and_sources() -
     assert b"other-order" not in before
     assert b"raw-fill-a" not in before
     assert b"other-fill" not in before
+
+
+@pytest.mark.parametrize("precision", [6, 60])
+@pytest.mark.parametrize("rounding", [ROUND_DOWN, ROUND_HALF_UP])
+@pytest.mark.parametrize(
+    ("value", "expected"),
+    [
+        (Decimal("1E-8"), "0.00000001"),
+        (Decimal("-1E-8"), "-0.00000001"),
+        (Decimal("1E+3"), "1000"),
+        (Decimal("0E-13"), "0"),
+        (Decimal("-0"), "0"),
+        (Decimal("1.230000"), "1.23"),
+        (Decimal("1.234567890123"), "1.234567890123"),
+    ],
+)
+def test_canonical_decimal_text_is_fixed_and_context_independent(
+    precision: int,
+    rounding: str,
+    value: Decimal,
+    expected: str,
+) -> None:
+    with localcontext() as context:
+        context.prec = precision
+        context.rounding = rounding
+        actual = canonical_decimal_text(value)
+
+    assert actual == expected
+
+
+@pytest.mark.parametrize("precision", [6, 60])
+@pytest.mark.parametrize("rounding", [ROUND_DOWN, ROUND_HALF_UP])
+def test_build_normal_backtest_outcome_canonicalizes_journal_money_text(
+    precision: int,
+    rounding: str,
+) -> None:
+    minimal = _outcome_sources()
+    exponent = _outcome_sources()
+    exponent_fills = exponent["fills"]
+    exponent_journal = exponent["journal"]
+    assert type(exponent_fills) is tuple and type(exponent_journal) is tuple
+    fill = dict(exponent_fills[0])
+    fill.update(
+        price=Decimal("1.015E+2"),
+        quantity=Decimal("5E-1"),
+        fee=Decimal("2.5E-1"),
+    )
+    exponent["fills"] = (fill,)
+    rows = [dict(row) for row in exponent_journal]
+    entry_data = dict(rows[0]["data"])
+    entry_data["quantity"] = "5E-1"
+    rows[0]["data"] = entry_data
+    fill_data = dict(rows[1]["data"])
+    fill_data.update(price="1.015E+2", quantity="5E-1", fee="2.5E-1")
+    rows[1]["data"] = fill_data
+    exponent["journal"] = tuple(rows)
+
+    with localcontext() as context:
+        context.prec = precision
+        context.rounding = rounding
+        minimal_outcome = build_normal_backtest_trading_outcome(**minimal)
+        exponent_outcome = build_normal_backtest_trading_outcome(**exponent)
+
+    assert exponent_outcome.canonical_bytes() == minimal_outcome.canonical_bytes()
+    assert exponent_outcome.sha256() == minimal_outcome.sha256()
+    assert exponent_outcome.first_difference(minimal_outcome) is None
+    assert '"quantity",["string","0.5"]' in exponent_outcome.journal[0].data_json
+    fill_json = exponent_outcome.journal[1].data_json
+    assert '"price",["string","101.5"]' in fill_json
+    assert '"quantity",["string","0.5"]' in fill_json
+    assert '"fee",["string","0.25"]' in fill_json
+
+
+def test_journal_money_mismatch_fails_before_canonical_projection() -> None:
+    sources = _outcome_sources()
+    journal = sources["journal"]
+    assert type(journal) is tuple
+    rows = [dict(row) for row in journal]
+    entry_data = dict(rows[0]["data"])
+    entry_data["quantity"] = "5.1E-1"
+    rows[0]["data"] = entry_data
+    sources["journal"] = tuple(rows)
+
+    with pytest.raises(BacktestOutcomeCaptureError) as caught:
+        build_normal_backtest_trading_outcome(**sources)
+
+    assert type(caught.value.__cause__) is ValueError
+    assert str(caught.value.__cause__) == (
+        "signal, entry and fill quantity do not match"
+    )
 
 
 def test_build_normal_backtest_outcome_accepts_negative_total_pnl() -> None:

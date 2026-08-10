@@ -4,6 +4,18 @@ from decimal import Decimal
 from fractions import Fraction
 
 
+def canonical_decimal_text(value: Decimal) -> str:
+    """Render one finite exact Decimal as context-independent fixed-point text."""
+    if type(value) is not Decimal or not value.is_finite():
+        raise ValueError("value must be a finite exact Decimal")
+    if value.is_zero():
+        return "0"
+    rendered = format(value, "f")
+    if "." in rendered:
+        rendered = rendered.rstrip("0").rstrip(".")
+    return rendered
+
+
 def exact_decimal_add(left: Decimal, right: Decimal) -> Decimal:
     """Add finite Decimals without consulting the ambient context."""
     left_sign, left_digits, left_exponent = left.as_tuple()

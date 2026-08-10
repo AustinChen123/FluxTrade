@@ -566,7 +566,7 @@ def test_actual_consumer_matcher_sqlite_path_builds_exact_outcome(
     )
     for index, expected_fee in zip(
         (1, 3),
-        ("0.1010000000000", "0.1030000000000"),
+        ("0.101", "0.103"),
         strict=True,
     ):
         data = outcome.journal[index].data_json
