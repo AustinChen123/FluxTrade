@@ -48,6 +48,9 @@ from src.core.adapters.rithmic_order_reconnect import (
 from src.core.adapters.rithmic_runtime_recovery import (
     RithmicRuntimeRecoveryService,
 )
+from src.core.adapters.rithmic_emergency_flatten import (
+    RithmicEmergencyFlattenService,
+)
 from src.core.adapters.rithmic_strategy_exit import RithmicStrategyExitService
 from src.core.adapters.simulated import SimulatedAdapter
 from src.core.product_registry import InstrumentSpec
@@ -196,6 +199,16 @@ class TestEngineInit:
         assert isinstance(
             engine._rithmic_strategy_exit,
             RithmicStrategyExitService,
+        )
+
+    def test_rithmic_engine_constructs_emergency_flatten_owner(self, engine_factory):
+        adapter = _rithmic_adapter_for_reconnect_test()
+
+        engine = engine_factory(adapter=adapter, audit_external_orders=True)
+
+        assert isinstance(
+            engine._rithmic_emergency_flatten,
+            RithmicEmergencyFlattenService,
         )
 
     def test_risk_manager_uses_adapter_instrument_specs(self, engine_factory):
@@ -5247,6 +5260,29 @@ def _install_rithmic_strategy_exit_service(
     return service
 
 
+def _install_rithmic_emergency_flatten_service(
+    engine: StrategyEngine,
+    adapter: RithmicExchangeAdapter,
+) -> RithmicEmergencyFlattenService:
+    service = RithmicEmergencyFlattenService(
+        adapter=adapter,
+        execution_engine=engine.execution_engine,
+        account_service=engine.account_service,
+        ops_safety=engine.ops_safety,
+        profile=engine._rithmic_recovery_profile or "test",
+        account_id=engine._rithmic_recovery_account_id or "ACCOUNT",
+        stop_current_worker=engine._stop_exchange_order_event_stream,
+        clear_polling_stop=engine._order_event_stop.clear,
+        restart_generic_worker=engine._start_exchange_order_event_stream,
+        run_when_submissions_drained=(
+            engine.execution_engine.run_when_submissions_drained
+        ),
+        logger=logging.getLogger("test.rithmic_emergency_flatten"),
+    )
+    engine._rithmic_emergency_flatten = service
+    return service
+
+
 def _rithmic_emergency_snapshot(*, net_quantity=None, orders=None):
     positions = []
     if net_quantity is not None:
@@ -5622,7 +5658,7 @@ def test_rithmic_portfolio_exit_reduces_only_owned_sleeve(
     )
     engine._start_exchange_order_event_stream = MagicMock()
     engine._lockdown_for_rithmic_order_drift = MagicMock()
-    engine._schedule_rithmic_portfolio_exit_compensation = MagicMock()
+    engine._rithmic_emergency_flatten = MagicMock()
     sleeve_position = Position(
         strategy_id="portfolio_v1.sleeve_a",
         product_id="RITHMIC:NQ-202609",
@@ -5699,7 +5735,7 @@ def test_rithmic_portfolio_exit_reduces_only_owned_sleeve(
                 decision,
                 candle,
             )
-        engine._schedule_rithmic_portfolio_exit_compensation.assert_not_called()
+        engine._rithmic_emergency_flatten.schedule_portfolio_exit_compensation.assert_not_called()
         engine._lockdown_for_rithmic_order_drift.assert_called_once()
         return
     with snapshot_loader:
@@ -5727,7 +5763,7 @@ def test_rithmic_portfolio_exit_reduces_only_owned_sleeve(
         remaining_remote_quantity=Decimal("2"),
     )
     engine.account_service.replace_positions_for_products.assert_not_called()
-    engine._schedule_rithmic_portfolio_exit_compensation.assert_not_called()
+    engine._rithmic_emergency_flatten.schedule_portfolio_exit_compensation.assert_not_called()
     engine._lockdown_for_rithmic_order_drift.assert_not_called()
 
 
@@ -5751,6 +5787,7 @@ def test_rithmic_portfolio_exit_does_not_reduce_another_sleeve_after_own_fill(
     engine.execution_engine.record_verified_net_reduction = MagicMock()
     engine._start_exchange_order_event_stream = MagicMock()
     engine._lockdown_for_rithmic_order_drift = MagicMock()
+    engine._rithmic_emergency_flatten = MagicMock()
     engine.account_service.get_position_for_exit = MagicMock(
         side_effect=[
             Position(
@@ -5849,7 +5886,7 @@ def test_rithmic_portfolio_exit_does_not_cancel_before_safe_preflight(engine):
     engine.execution_engine.submit_verified_net_reduction = MagicMock()
     engine._start_exchange_order_event_stream = MagicMock()
     engine._lockdown_for_rithmic_order_drift = MagicMock()
-    engine._schedule_rithmic_portfolio_exit_compensation = MagicMock()
+    engine._rithmic_emergency_flatten = MagicMock()
     engine.account_service.get_position_for_exit = MagicMock()
     signal = Signal(
         strategy_id="portfolio_v1.sleeve_a",
@@ -5888,11 +5925,13 @@ def test_rithmic_portfolio_exit_does_not_cancel_before_safe_preflight(engine):
     adapter.cancel_order.assert_not_called()
     engine.execution_engine.submit_verified_net_reduction.assert_not_called()
     engine.account_service.get_position_for_exit.assert_not_called()
-    engine._schedule_rithmic_portfolio_exit_compensation.assert_not_called()
+    engine._rithmic_emergency_flatten.schedule_portfolio_exit_compensation.assert_not_called()
 
 
+@pytest.mark.parametrize("schedule_fails", [False, True])
 def test_rithmic_portfolio_exit_schedules_flatten_after_protection_mutation(
     engine,
+    schedule_fails,
 ):
     adapter = _rithmic_adapter_for_reconnect_test()
     adapter.get_order_by_client_id = MagicMock(
@@ -5928,7 +5967,11 @@ def test_rithmic_portfolio_exit_schedules_flatten_after_protection_mutation(
     engine.execution_engine.submit_verified_net_reduction = MagicMock()
     engine._start_exchange_order_event_stream = MagicMock()
     engine._lockdown_for_rithmic_order_drift = MagicMock()
-    engine._schedule_rithmic_portfolio_exit_compensation = MagicMock()
+    engine._rithmic_emergency_flatten = MagicMock()
+    if schedule_fails:
+        engine._rithmic_emergency_flatten.schedule_portfolio_exit_compensation.side_effect = RuntimeError(
+            "callback registration failed"
+        )
     engine.account_service.get_position_for_exit = MagicMock(
         return_value=Position(
             strategy_id="portfolio_v1.sleeve_a",
@@ -5961,7 +6004,11 @@ def test_rithmic_portfolio_exit_schedules_flatten_after_protection_mutation(
         ),
         pytest.raises(
             RuntimeError,
-            match="rithmic_portfolio_exit_preflight_reconciliation_blocked",
+            match=(
+                "rithmic_portfolio_exit_compensation_schedule_failed"
+                if schedule_fails
+                else "rithmic_portfolio_exit_preflight_reconciliation_blocked"
+            ),
         ),
     ):
         engine._run_rithmic_portfolio_exit(
@@ -5979,23 +6026,17 @@ def test_rithmic_portfolio_exit_schedules_flatten_after_protection_mutation(
         order_type="stop_loss",
     )
     engine.execution_engine.submit_verified_net_reduction.assert_not_called()
-    engine._schedule_rithmic_portfolio_exit_compensation.assert_called_once_with(
+    engine._rithmic_emergency_flatten.schedule_portfolio_exit_compensation.assert_called_once_with(
         "rithmic_portfolio_exit_requires_reconciliation:RuntimeError"
     )
-
-
-def test_rithmic_portfolio_exit_compensation_runs_after_submission_drain(engine):
-    engine.execution_engine.run_when_submissions_drained = MagicMock()
-    engine._run_ops_kill_switch = MagicMock()
-
-    engine._schedule_rithmic_portfolio_exit_compensation("verification_failed")
-
-    callback = engine.execution_engine.run_when_submissions_drained.call_args.args[0]
-    callback()
-    engine._run_ops_kill_switch.assert_called_once_with(
-        actor="engine",
-        reason="portfolio_exit_compensation:verification_failed",
-    )
+    expected_lockdowns = [
+        call("rithmic_portfolio_exit_requires_reconciliation:RuntimeError")
+    ]
+    if schedule_fails:
+        expected_lockdowns.append(
+            call("rithmic_portfolio_exit_compensation_schedule_failed:RuntimeError")
+        )
+    assert engine._lockdown_for_rithmic_order_drift.call_args_list == expected_lockdowns
 
 
 def test_rithmic_strategy_exit_blocks_when_remote_order_remains_working(engine):
@@ -6047,6 +6088,46 @@ def test_rithmic_strategy_exit_blocks_when_remote_order_remains_working(engine):
     engine._start_exchange_order_event_stream.assert_called_once_with()
 
 
+@pytest.mark.parametrize("operation_id", [None, "operation-1"])
+def test_non_rithmic_kill_switch_keeps_generic_ops_dispatch(engine, operation_id):
+    engine.ops_safety.kill_switch = MagicMock(return_value=_kill_switch_result())
+
+    result = engine._run_ops_kill_switch(
+        actor="ops",
+        reason="drill",
+        operation_id=operation_id,
+    )
+
+    expected = {"actor": "ops", "reason": "drill"}
+    if operation_id is not None:
+        expected["operation_id"] = operation_id
+    engine.ops_safety.kill_switch.assert_called_once_with(**expected)
+    assert result == _kill_switch_result()
+
+
+def test_rithmic_kill_switch_delegates_exactly_once_to_venue_owner(engine):
+    adapter = _rithmic_adapter_for_reconnect_test()
+    engine.execution_engine.adapter = adapter
+    expected = _kill_switch_result(authoritative_flatten_verified=True)
+    engine._rithmic_emergency_flatten = MagicMock()
+    engine._rithmic_emergency_flatten.execute.return_value = expected
+    engine.ops_safety.kill_switch = MagicMock()
+
+    result = engine._run_ops_kill_switch(
+        actor="ops",
+        reason="drill",
+        operation_id="operation-1",
+    )
+
+    assert result is expected
+    engine._rithmic_emergency_flatten.execute.assert_called_once_with(
+        actor="ops",
+        reason="drill",
+        operation_id="operation-1",
+    )
+    engine.ops_safety.kill_switch.assert_not_called()
+
+
 def test_rithmic_kill_switch_uses_and_verifies_authoritative_positions(engine):
     adapter = _rithmic_adapter_for_reconnect_test()
     adapter.start_order_event_stream()
@@ -6078,9 +6159,10 @@ def test_rithmic_kill_switch_uses_and_verifies_authoritative_positions(engine):
         _rithmic_emergency_snapshot(net_quantity="1"),
         _rithmic_emergency_snapshot(),
     ]
+    _install_rithmic_emergency_flatten_service(engine, adapter)
 
     with patch(
-        "src.core.engine.load_rithmic_recovery_snapshot",
+        "src.core.adapters.rithmic_emergency_flatten.load_rithmic_recovery_snapshot",
         side_effect=snapshots,
     ) as snapshot_loader:
         result = engine._run_ops_kill_switch(actor="ops", reason="drill")
@@ -6111,9 +6193,10 @@ def test_rithmic_kill_switch_real_path_uses_native_exit_not_market_submit(engine
         return_value={"auto_resume_safe": True}
     )
     engine.account_service.replace_positions_for_products = MagicMock()
+    _install_rithmic_emergency_flatten_service(engine, adapter)
 
     with patch(
-        "src.core.engine.load_rithmic_recovery_snapshot",
+        "src.core.adapters.rithmic_emergency_flatten.load_rithmic_recovery_snapshot",
         side_effect=[
             _rithmic_emergency_snapshot(net_quantity="1"),
             _rithmic_emergency_snapshot(),
@@ -6149,9 +6232,10 @@ def test_rithmic_kill_switch_ambiguous_native_exit_never_resubmits(
         return_value={"auto_resume_safe": True}
     )
     engine.account_service.replace_positions_for_products = MagicMock()
+    _install_rithmic_emergency_flatten_service(engine, adapter)
 
     with patch(
-        "src.core.engine.load_rithmic_recovery_snapshot",
+        "src.core.adapters.rithmic_emergency_flatten.load_rithmic_recovery_snapshot",
         side_effect=[
             _rithmic_emergency_snapshot(net_quantity="1"),
             _rithmic_emergency_snapshot(net_quantity=post_quantity),
@@ -6178,8 +6262,11 @@ def test_rithmic_kill_switch_does_not_snapshot_after_drain_timeout(engine):
             drain_timeout=True,
         )
     )
+    _install_rithmic_emergency_flatten_service(engine, adapter)
 
-    with patch("src.core.engine.load_rithmic_recovery_snapshot") as snapshot_loader:
+    with patch(
+        "src.core.adapters.rithmic_emergency_flatten.load_rithmic_recovery_snapshot"
+    ) as snapshot_loader:
         result = engine._run_ops_kill_switch(actor="ops", reason="drill")
 
     assert result["authoritative_flatten_verified"] is False
@@ -6200,10 +6287,11 @@ def test_rithmic_kill_switch_audits_verification_failure_before_raising(engine):
     engine.ops_safety.kill_switch_with_authoritative_positions = MagicMock(
         side_effect=lambda **kwargs: kwargs["position_loader"]()
     )
+    _install_rithmic_emergency_flatten_service(engine, adapter)
 
     with (
         patch(
-            "src.core.engine.load_rithmic_recovery_snapshot",
+            "src.core.adapters.rithmic_emergency_flatten.load_rithmic_recovery_snapshot",
             side_effect=RuntimeError("ledger unavailable"),
         ),
         pytest.raises(RuntimeError, match="ledger unavailable"),
@@ -6217,11 +6305,13 @@ def test_rithmic_kill_switch_audits_verification_failure_before_raising(engine):
 
 
 def test_rithmic_kill_switch_audits_event_stream_stop_timeout(engine):
-    engine.execution_engine.adapter = _rithmic_adapter_for_reconnect_test()
+    adapter = _rithmic_adapter_for_reconnect_test()
+    engine.execution_engine.adapter = adapter
     engine.order_event_thread = MagicMock()
     engine.order_event_thread.is_alive.return_value = True
     engine.ops_safety.record_kill_switch_result = MagicMock()
     engine.ops_safety.kill_switch_with_authoritative_positions = MagicMock()
+    _install_rithmic_emergency_flatten_service(engine, adapter)
 
     with pytest.raises(
         RuntimeError,
@@ -6233,6 +6323,30 @@ def test_rithmic_kill_switch_audits_event_stream_stop_timeout(engine):
     assert recorded["authoritative_flatten_verified"] is False
     assert engine._order_event_stop.is_set() is False
     engine.ops_safety.kill_switch_with_authoritative_positions.assert_not_called()
+
+
+def test_rithmic_emergency_flatten_stops_current_replacement_thread(engine):
+    adapter = _rithmic_adapter_for_reconnect_test()
+    engine.execution_engine.adapter = adapter
+    stale_thread = MagicMock()
+    stale_thread.is_alive.return_value = True
+    engine.order_event_thread = stale_thread
+    engine.ops_safety.record_kill_switch_result = MagicMock()
+    _install_rithmic_emergency_flatten_service(engine, adapter)
+    current_thread = MagicMock()
+    current_thread.is_alive.side_effect = [True, True]
+    engine.order_event_thread = current_thread
+
+    with pytest.raises(
+        RuntimeError,
+        match="rithmic_emergency_flatten_event_stream_stop_timeout",
+    ):
+        engine._run_ops_kill_switch(actor="ops", reason="drill")
+
+    stale_thread.is_alive.assert_not_called()
+    stale_thread.join.assert_not_called()
+    current_thread.join.assert_called_once_with(timeout=30.0)
+    assert engine._order_event_stop.is_set() is False
 
 
 def test_rithmic_kill_switch_retries_only_from_fresh_residual_position(engine):
@@ -6274,9 +6388,10 @@ def test_rithmic_kill_switch_retries_only_from_fresh_residual_position(engine):
         _rithmic_emergency_snapshot(net_quantity="1"),
         _rithmic_emergency_snapshot(),
     ]
+    _install_rithmic_emergency_flatten_service(engine, adapter)
 
     with patch(
-        "src.core.engine.load_rithmic_recovery_snapshot",
+        "src.core.adapters.rithmic_emergency_flatten.load_rithmic_recovery_snapshot",
         side_effect=snapshots,
     ):
         result = engine._run_ops_kill_switch(actor="ops", reason="drill")
@@ -6307,9 +6422,10 @@ def test_rithmic_kill_switch_waits_for_accepted_exit_working_order(engine):
         side_effect=exit_position
     )
     working = SimpleNamespace(basket_id="native-exit-1")
+    _install_rithmic_emergency_flatten_service(engine, adapter)
 
     with patch(
-        "src.core.engine.load_rithmic_recovery_snapshot",
+        "src.core.adapters.rithmic_emergency_flatten.load_rithmic_recovery_snapshot",
         side_effect=[
             _rithmic_emergency_snapshot(net_quantity="1"),
             _rithmic_emergency_snapshot(net_quantity="1", orders=[working]),
@@ -6352,9 +6468,10 @@ def test_rithmic_kill_switch_ignores_terminal_remote_order_rows(engine):
     engine.ops_safety.kill_switch_with_authoritative_positions = MagicMock(
         side_effect=exit_position
     )
+    _install_rithmic_emergency_flatten_service(engine, adapter)
 
     with patch(
-        "src.core.engine.load_rithmic_recovery_snapshot",
+        "src.core.adapters.rithmic_emergency_flatten.load_rithmic_recovery_snapshot",
         side_effect=[
             _rithmic_emergency_snapshot(
                 net_quantity="1",
@@ -6387,9 +6504,10 @@ def test_rithmic_kill_switch_does_not_retry_unreconciled_residual(engine):
     engine.ops_safety.kill_switch_with_authoritative_positions = MagicMock(
         side_effect=flatten
     )
+    _install_rithmic_emergency_flatten_service(engine, adapter)
 
     with patch(
-        "src.core.engine.load_rithmic_recovery_snapshot",
+        "src.core.adapters.rithmic_emergency_flatten.load_rithmic_recovery_snapshot",
         side_effect=[
             _rithmic_emergency_snapshot(net_quantity="1"),
             _rithmic_emergency_snapshot(net_quantity="1"),
@@ -6414,9 +6532,10 @@ def test_rithmic_kill_switch_blocks_when_remote_working_order_remains(engine):
     )
     engine.ops_safety._write_event_best_effort = MagicMock()
     working = SimpleNamespace(basket_id="external-1")
+    _install_rithmic_emergency_flatten_service(engine, adapter)
 
     with patch(
-        "src.core.engine.load_rithmic_recovery_snapshot",
+        "src.core.adapters.rithmic_emergency_flatten.load_rithmic_recovery_snapshot",
         side_effect=[
             _rithmic_emergency_snapshot(
                 net_quantity="1",
@@ -6454,10 +6573,11 @@ def test_rithmic_kill_switch_preserves_primary_error_when_restart_also_fails(
     engine.ops_safety.kill_switch_with_authoritative_positions = MagicMock(
         side_effect=lambda **kwargs: kwargs["position_loader"]()
     )
+    _install_rithmic_emergency_flatten_service(engine, adapter)
 
     with (
         patch(
-            "src.core.engine.load_rithmic_recovery_snapshot",
+            "src.core.adapters.rithmic_emergency_flatten.load_rithmic_recovery_snapshot",
             side_effect=RuntimeError("ledger unavailable"),
         ),
         pytest.raises(RuntimeError, match="ledger unavailable"),

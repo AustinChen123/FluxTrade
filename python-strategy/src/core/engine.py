@@ -58,9 +58,8 @@ from src.core.adapters import (
     SimulatedAdapter,
     create_adapter,
 )
-from src.core.adapters.rithmic_recovery import (
-    load_rithmic_recovery_snapshot,
-    rithmic_order_may_be_working,
+from src.core.adapters.rithmic_emergency_flatten import (
+    RithmicEmergencyFlattenService,
 )
 from src.core.adapters.rithmic_portfolio_exit import (
     RithmicPortfolioExitService,
@@ -142,27 +141,6 @@ def _kill_switch_result_is_complete(
     return "authoritative_flatten_verified" not in result or (
         result["authoritative_flatten_verified"] is True
     )
-
-
-def _merge_kill_switch_results(current: dict | None, update: dict) -> dict:
-    if current is None:
-        return dict(update)
-    for key in ("cancelled_orders", "flattened_positions"):
-        current[key] = int(current.get(key, 0)) + int(update.get(key, 0))
-    for key in (
-        "cancel_failures",
-        "flatten_pending",
-        "flatten_failures",
-        "recovery_failures",
-    ):
-        current.setdefault(key, []).extend(update.get(key, []))
-    current["drain_timeout"] = bool(
-        current.get("drain_timeout") or update.get("drain_timeout")
-    )
-    current["already_flat"] = bool(
-        current.get("already_flat") and update.get("already_flat")
-    )
-    return current
 
 
 def _is_runtime_reconciliation_enabled(
@@ -519,6 +497,27 @@ class StrategyEngine:
             self.account_service,
             self._db_session_factory,
         )
+        self.order_event_thread = None
+        self._order_event_stop = threading.Event()
+        self._rithmic_emergency_flatten = (
+            RithmicEmergencyFlattenService(
+                adapter=adapter,
+                execution_engine=self.execution_engine,
+                account_service=self.account_service,
+                ops_safety=self.ops_safety,
+                profile=self._rithmic_recovery_profile or "",
+                account_id=self._rithmic_recovery_account_id,
+                stop_current_worker=self._stop_exchange_order_event_stream,
+                clear_polling_stop=self._order_event_stop.clear,
+                restart_generic_worker=self._start_exchange_order_event_stream,
+                run_when_submissions_drained=(
+                    self.execution_engine.run_when_submissions_drained
+                ),
+                logger=logger,
+            )
+            if isinstance(adapter, RithmicExchangeAdapter)
+            else None
+        )
         self.runtime_reconciliation_job = RuntimeReconciliationJob(
             account_service=self.account_service,
             adapter=adapter,
@@ -547,8 +546,6 @@ class StrategyEngine:
         self._rithmic_external_order_drift_pending = False
         self._rithmic_external_order_drift_generation = 0
         self._rithmic_external_order_drift_lock = threading.Lock()
-        self.order_event_thread = None
-        self._order_event_stop = threading.Event()
         self.executor = ThreadPoolExecutor(max_workers=5)
         self._entry_admission_gate: EntryAdmissionGate | None = None
         if self.runtime_environment.identity == "live":
@@ -921,196 +918,13 @@ class StrategyEngine:
                 operation_id=operation_id,
             )
 
-        aggregate = None
-        operation_failed = False
-
-        def finalize(
-            verified: bool,
-            failure_reason: str | None = None,
-        ) -> dict:
-            nonlocal aggregate
-            aggregate = aggregate or {
-                "cancelled_orders": 0,
-                "cancel_failures": [],
-                "flattened_positions": 0,
-                "flatten_pending": [],
-                "flatten_failures": [],
-                "recovery_failures": [],
-                "already_flat": False,
-                "drain_timeout": False,
-            }
-            aggregate["authoritative_flatten_verified"] = verified
-            if failure_reason is not None:
-                aggregate["flatten_failures"].append(
-                    {
-                        "strategy_id": "LIVE",
-                        "product_id": "unknown",
-                        "reason": failure_reason,
-                    }
-                )
-            audit_kwargs = {
-                "actor": actor,
-                "reason": reason,
-                "result": aggregate,
-            }
-            if operation_id is not None:
-                audit_kwargs["operation_id"] = operation_id
-            self.ops_safety.record_kill_switch_result(**audit_kwargs)
-            return aggregate
-
-        self._order_event_stop.set()
-        thread = self.order_event_thread
-        if thread is not None and thread.is_alive():
-            thread.join(timeout=30.0)
-            if thread.is_alive():
-                self._order_event_stop.clear()
-                finalize(
-                    False,
-                    "rithmic_emergency_flatten_event_stream_stop_timeout",
-                )
-                raise RuntimeError(
-                    "rithmic_emergency_flatten_event_stream_stop_timeout"
-                )
-
-        def load_snapshot():
-            adapter.close()
-            recoverable_orders = [
-                order
-                for order in self.execution_engine.list_recoverable_client_orders()
-                if str(order.exchange_id).lower() == "rithmic"
-            ]
-            return load_rithmic_recovery_snapshot(
-                self._rithmic_recovery_profile,
-                self._rithmic_recovery_account_id,
-                recoverable_orders,
-                int(self.execution_engine.clock.now()),
-            )
-
-        def load_positions() -> list:
-            snapshot = load_snapshot()
-            if any(rithmic_order_may_be_working(order) for order in snapshot.orders):
-                raise RuntimeError("rithmic_emergency_flatten_working_orders_remain")
-            positions = adapter.positions_from_ledger_snapshot(snapshot)
-            adapter.start_order_event_stream()
-            return positions
-
-        try:
-            exit_attempts = 0
-            exit_failed = False
-            submit_exit = True
-            for _verification_attempt in range(6):
-                if submit_exit:
-                    authoritative_kwargs = {
-                        "actor": actor,
-                        "reason": reason,
-                        "position_loader": load_positions,
-                        "account_id": adapter.account_id,
-                    }
-                    if operation_id is not None:
-                        authoritative_kwargs["operation_id"] = operation_id
-                    result = self.ops_safety.kill_switch_with_authoritative_positions(
-                        **authoritative_kwargs
-                    )
-                    aggregate = _merge_kill_switch_results(aggregate, result)
-                    exit_attempts += 1
-                    exit_failed = bool(
-                        result.get("drain_timeout")
-                        or result.get("flatten_pending")
-                        or result.get("flatten_failures")
-                    )
-                    if result.get("drain_timeout"):
-                        break
-
-                snapshot = load_snapshot()
-                reconciliation = self.execution_engine.reconcile_rithmic_owned_orders(
-                    self._rithmic_recovery_profile,
-                    self._rithmic_recovery_account_id,
-                    snapshot_loader=lambda *_args, **_kwargs: snapshot,
-                )
-                remaining_positions = adapter.positions_from_ledger_snapshot(snapshot)
-                working_orders_remain = any(
-                    rithmic_order_may_be_working(order) for order in snapshot.orders
-                )
-                if not working_orders_remain:
-                    self.account_service.replace_positions_for_products(
-                        remaining_positions,
-                        adapter.configured_product_ids,
-                        timestamp_ms=int(self.execution_engine.clock.now() * 1000),
-                    )
-                    reconciliation = (
-                        self.execution_engine.reconcile_rithmic_owned_orders(
-                            self._rithmic_recovery_profile,
-                            self._rithmic_recovery_account_id,
-                            snapshot_loader=lambda *_args, **_kwargs: snapshot,
-                        )
-                    )
-                    if (
-                        not remaining_positions
-                        and reconciliation.get("auto_resume_safe") is True
-                    ):
-                        return finalize(True)
-
-                if working_orders_remain:
-                    if exit_failed:
-                        break
-                    submit_exit = False
-                    continue
-                if (
-                    exit_failed
-                    or exit_attempts >= 3
-                    or reconciliation.get("auto_resume_safe") is not True
-                ):
-                    break
-
-                adapter.start_order_event_stream()
-                submit_exit = True
-
-            return finalize(
-                False,
-                "rithmic_authoritative_flatten_not_verified",
-            )
-        except Exception as exc:
-            operation_failed = True
-            finalize(
-                False,
-                f"rithmic_authoritative_flatten_failed:{type(exc).__name__}",
-            )
-            raise
-        finally:
-            try:
-                self._start_exchange_order_event_stream()
-            except Exception as restart_error:
-                aggregate = aggregate or {
-                    "cancelled_orders": 0,
-                    "cancel_failures": [],
-                    "flattened_positions": 0,
-                    "flatten_pending": [],
-                    "flatten_failures": [],
-                    "recovery_failures": [],
-                    "already_flat": False,
-                    "drain_timeout": False,
-                    "authoritative_flatten_verified": False,
-                }
-                aggregate["recovery_failures"].append(
-                    {
-                        "reason": "rithmic_order_stream_restart_failed:"
-                        f"{type(restart_error).__name__}"
-                    }
-                )
-                audit_kwargs = {
-                    "actor": actor,
-                    "reason": reason,
-                    "result": aggregate,
-                }
-                if operation_id is not None:
-                    audit_kwargs["operation_id"] = operation_id
-                self.ops_safety.record_kill_switch_result(**audit_kwargs)
-                if operation_failed:
-                    logger.exception(
-                        "Order stream restart also failed after emergency flatten failure"
-                    )
-                else:
-                    raise
+        if self._rithmic_emergency_flatten is None:
+            raise RuntimeError("rithmic_emergency_flatten_unavailable")
+        return self._rithmic_emergency_flatten.execute(
+            actor=actor,
+            reason=reason,
+            operation_id=operation_id,
+        )
 
     def _reconcile_recoverable_orders_on_startup(self) -> dict | None:
         """Record startup order reconciliation for audited external orders."""
@@ -3047,6 +2861,8 @@ class StrategyEngine:
         account_id = self._rithmic_recovery_account_id
         if not isinstance(profile, str) or not isinstance(account_id, str):
             raise RuntimeError("rithmic_portfolio_exit_account_identity_missing")
+        if self._rithmic_emergency_flatten is None:
+            raise RuntimeError("rithmic_emergency_flatten_unavailable")
         return RithmicPortfolioExitService(
             adapter=adapter,
             execution_engine=self.execution_engine,
@@ -3059,24 +2875,12 @@ class StrategyEngine:
             restart_order_stream=self._start_exchange_order_event_stream,
             lockdown=self._lockdown_for_rithmic_order_drift,
             schedule_emergency_flatten=(
-                self._schedule_rithmic_portfolio_exit_compensation
+                self._rithmic_emergency_flatten.schedule_portfolio_exit_compensation
             ),
             portfolio_id_for_sleeve=(
                 self._portfolio_coordinator.portfolio_id_for_sleeve
             ),
         ).execute(signal, decision, candle)
-
-    def _schedule_rithmic_portfolio_exit_compensation(
-        self,
-        reason: str,
-    ) -> None:
-        """Flatten through the existing authoritative kill switch after drain."""
-        self.execution_engine.run_when_submissions_drained(
-            lambda: self._run_ops_kill_switch(
-                actor="engine",
-                reason=f"portfolio_exit_compensation:{reason}",
-            )
-        )
 
     def shutdown(
         self,
