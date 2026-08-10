@@ -69,6 +69,9 @@ from src.core.adapters.rithmic_portfolio_exit import (
 from src.core.adapters.rithmic_ledger_recovery import (
     RithmicLedgerRecoveryService,
 )
+from src.core.adapters.rithmic_order_reconnect import (
+    RithmicOrderReconnectService,
+)
 from src.core.journal import StrategyJournal
 from src.core.redis_factory import create_redis_client
 from src.core.metrics import SIGNALS_TOTAL, ACTIVE_STRATEGIES, BALANCE_USDT
@@ -94,7 +97,7 @@ from src.core.runtime_environment import RuntimeEnvironment
 from src.core.product_master import ensure_product_registered
 from src.core.product_registry import to_stream_key
 
-HOT_STRATEGIES_PATH = os.getenv('HOT_STRATEGIES_PATH', '/app/strategies_hot')
+HOT_STRATEGIES_PATH = os.getenv("HOT_STRATEGIES_PATH", "/app/strategies_hot")
 LIVE_CANDLE_FENCE_TIMEOUT_SECONDS = 5.0
 _DEFAULT_RUNTIME_ENVIRONMENT = RuntimeEnvironment("live")
 SYSTEM_STATE_KEY = _DEFAULT_RUNTIME_ENVIRONMENT.key("system:state")
@@ -121,10 +124,7 @@ def _kill_switch_result_is_complete(
         "flatten_failures",
         "recovery_failures",
     )
-    if any(
-        type(result.get(key)) is not int or result[key] < 0
-        for key in count_keys
-    ):
+    if any(type(result.get(key)) is not int or result[key] < 0 for key in count_keys):
         return False
     if any(not isinstance(result.get(key), list) for key in list_keys):
         return False
@@ -325,10 +325,14 @@ class StrategyEngine:
                 )
                 logger.info("StrategyEngine: Using %s", type(adapter).__name__)
             except Exception as e:
-                logger.critical("Failed to init adapter: %s. NOT falling back silently.", e)
+                logger.critical(
+                    "Failed to init adapter: %s. NOT falling back silently.", e
+                )
                 raise
         else:
-            logger.info("StrategyEngine: Using provided adapter %s", type(adapter).__name__)
+            logger.info(
+                "StrategyEngine: Using provided adapter %s", type(adapter).__name__
+            )
         if is_backtest is True and not isinstance(adapter, SimulatedAdapter):
             raise ValueError("backtest mode requires SimulatedAdapter")
         if isinstance(adapter, RithmicExchangeAdapter):
@@ -387,7 +391,7 @@ class StrategyEngine:
         )
         self._rithmic_ledger_recovery = (
             RithmicLedgerRecoveryService(
-                profile=self._rithmic_recovery_profile,
+                profile=self._rithmic_recovery_profile or "",
                 account_id=self._rithmic_recovery_account_id,
                 reconcile_owned_orders=lambda profile, account_id: (
                     self.execution_engine.reconcile_rithmic_owned_orders(
@@ -402,6 +406,36 @@ class StrategyEngine:
                 logger=logger,
             )
             if self._rithmic_recovery_profile
+            else None
+        )
+        self._rithmic_order_reconnect = (
+            RithmicOrderReconnectService(
+                adapter=adapter,
+                profile=self._rithmic_recovery_profile or "",
+                account_id=self._rithmic_recovery_account_id,
+                audit_external_orders=lambda: (
+                    self.execution_engine.audit_external_orders
+                ),
+                reconcile_owned_orders=lambda profile, account_id: (
+                    self.execution_engine.reconcile_rithmic_owned_orders(
+                        profile,
+                        account_id,
+                    )
+                ),
+                publish_authoritative_summary=(
+                    self._rithmic_ledger_recovery.publish_authoritative_summary
+                ),
+                halt_for_reconcile=lambda **values: (
+                    self.execution_engine.halt_for_reconcile(**values)
+                ),
+                resume_after_reconcile=lambda: (
+                    self.execution_engine.resume_after_reconcile()
+                ),
+                assert_runtime_leadership=self._assert_runtime_leadership,
+                logger=logger,
+            )
+            if isinstance(adapter, RithmicExchangeAdapter)
+            and self._rithmic_ledger_recovery is not None
             else None
         )
         self._lifecycle_adapter = _EngineLifecycleAdapter(self)
@@ -450,7 +484,7 @@ class StrategyEngine:
                 or []
             ),
         )
-        
+
         # System State & Heartbeat
         self._health_monitor.redis_client = self.redis_client
         self.running = True
@@ -459,10 +493,6 @@ class StrategyEngine:
         self.command_thread = None
         self.runtime_reconcile_thread = None
         self._runtime_reconcile_stop = threading.Event()
-        # Last observed order-session connection generation; a bump means the
-        # order session reconnected and owned orders must be reconciled.
-        self._last_order_generation: int | None = None
-        self._pending_order_reconnect_generation: int | None = None
         self._rithmic_external_order_drift_pending = False
         self._rithmic_external_order_drift_generation = 0
         self._rithmic_external_order_drift_lock = threading.Lock()
@@ -565,7 +595,7 @@ class StrategyEngine:
         run_phase(self._start_heartbeat)
         if self._runtime_reconciliation_enabled:
             run_phase(self._start_runtime_reconciliation)
-        
+
         # Initial scan to discover strategies
         run_phase(self.scan_strategies)
         if not self._kill_switch_halted:
@@ -603,11 +633,8 @@ class StrategyEngine:
             self._halt_for_kill_switch()
             raise
         if isinstance(adapter, RithmicExchangeAdapter):
-            # A newly created runtime always publishes generation 1 before its
-            # constructor returns. Starting from that known value means a fast
-            # reconnect cannot disappear into a delayed first observation.
-            self._last_order_generation = 1
-            self._pending_order_reconnect_generation = None
+            if self._rithmic_order_reconnect is not None:
+                self._rithmic_order_reconnect.on_runtime_started()
         self._order_event_stop.clear()
 
         def order_event_loop() -> None:
@@ -629,7 +656,9 @@ class StrategyEngine:
                         action = str(result.get("action") or "")
                         if action == "unknown_order":
                             self._lockdown_for_external_order(
-                                account_id=str((event.raw or {}).get("account_id") or ""),
+                                account_id=str(
+                                    (event.raw or {}).get("account_id") or ""
+                                ),
                                 exchange=str((event.raw or {}).get("exchange") or ""),
                                 symbol=str(
                                     (event.raw or {}).get("symbol") or event.product_id
@@ -714,7 +743,9 @@ class StrategyEngine:
             # Publish the generation and raise the submission gate atomically
             # with respect to a concurrent clear decision.
             self._halt_for_kill_switch()
-        logger.error("%s; submissions locked pending authoritative reconciliation", reason)
+        logger.error(
+            "%s; submissions locked pending authoritative reconciliation", reason
+        )
         if not first_detection:
             return
         self._persist_rithmic_external_order_lockdown(reason)
@@ -897,9 +928,7 @@ class StrategyEngine:
         def load_positions() -> list:
             snapshot = load_snapshot()
             if any(rithmic_order_may_be_working(order) for order in snapshot.orders):
-                raise RuntimeError(
-                    "rithmic_emergency_flatten_working_orders_remain"
-                )
+                raise RuntimeError("rithmic_emergency_flatten_working_orders_remain")
             positions = adapter.positions_from_ledger_snapshot(snapshot)
             adapter.start_order_event_stream()
             return positions
@@ -937,12 +966,9 @@ class StrategyEngine:
                     self._rithmic_recovery_account_id,
                     snapshot_loader=lambda *_args, **_kwargs: snapshot,
                 )
-                remaining_positions = adapter.positions_from_ledger_snapshot(
-                    snapshot
-                )
+                remaining_positions = adapter.positions_from_ledger_snapshot(snapshot)
                 working_orders_remain = any(
-                    rithmic_order_may_be_working(order)
-                    for order in snapshot.orders
+                    rithmic_order_may_be_working(order) for order in snapshot.orders
                 )
                 if not working_orders_remain:
                     self.account_service.replace_positions_for_products(
@@ -986,8 +1012,7 @@ class StrategyEngine:
             operation_failed = True
             finalize(
                 False,
-                "rithmic_authoritative_flatten_failed:"
-                f"{type(exc).__name__}",
+                f"rithmic_authoritative_flatten_failed:{type(exc).__name__}",
             )
             raise
         finally:
@@ -1057,119 +1082,17 @@ class StrategyEngine:
         self._rithmic_ledger_recovery.publish_authoritative_summary(summary)
 
     def _reconcile_owned_orders_on_reconnect(self) -> bool:
-        """Reconcile owned orders whenever the order session reconnects.
-
-        The order runtime exposes a monotonic connection generation; a bump
-        since the last observation means a mid-session reconnect happened, so a
-        fresh authoritative snapshot (orders + history + fills) is reconciled —
-        the same path as startup — to catch fills/cancels that occurred while
-        disconnected. Submissions are gated for the duration via the independent
-        reconcile gate (never touching a kill-switch halt). Fail-safe: if the
-        reconcile fails, submissions stay gated and the generation is not
-        advanced, so it retries on the next tick rather than trading against an
-        unreconciled book.
-        """
+        """Delegate Rithmic ORDER reconnect recovery to its venue owner."""
         adapter = self.execution_engine.adapter
         if not isinstance(adapter, RithmicExchangeAdapter):
             return True
-        if self._pending_order_reconnect_generation is None:
-            if self._last_order_generation is None:
-                self._last_order_generation = 1
-            try:
-                generation = adapter.connection_generation()
-            except Exception:
-                logger.exception(
-                    "Order connection generation unavailable; reconciling fail closed"
-                )
-                generation = self._last_order_generation + 1
-            if generation <= self._last_order_generation:
-                return True
-            self._pending_order_reconnect_generation = generation
-
-        generation = self._pending_order_reconnect_generation
-
-        logger.info(
-            "Order session reconnected (generation %s -> %s); reconciling owned orders",
-            self._last_order_generation,
-            generation,
-        )
-        if not self.execution_engine.halt_for_reconcile(timeout=30.0):
+        if self._rithmic_order_reconnect is None:
             logger.error(
-                "Reconnect order reconciliation waiting for in-flight submissions"
-            )
-            return False
-
-        # The ORDER runtime owns the profile lease for its whole lifetime.
-        # Closing it before the ledger snapshot is therefore part of the
-        # reconciliation boundary, not optional cleanup.
-        adapter.close()
-        if (
-            not self.execution_engine.audit_external_orders
-            or not self._rithmic_recovery_profile
-        ):
-            logger.error(
-                "Reconnect order reconciliation is unavailable; submissions remain gated"
-            )
-            return False
-        try:
-            summary = self.execution_engine.reconcile_rithmic_owned_orders(
-                self._rithmic_recovery_profile,
-                self._rithmic_recovery_account_id,
-            )
-        except Exception:
-            logger.exception(
-                "Reconnect order reconciliation failed; submissions remain gated"
-            )
-            # Stay gated and do not advance the generation: retry next tick.
-            return False
-        if summary.get("auto_resume_safe") is not True:
-            logger.error(
-                "Reconnect order reconciliation is unresolved; submissions remain gated"
-            )
-            return False
-        try:
-            self._apply_rithmic_authoritative_account_summary(summary)
-        except Exception:
-            logger.exception(
-                "Reconnect authoritative account reconciliation failed; "
+                "Reconnect order reconciliation is unavailable; "
                 "submissions remain gated"
             )
             return False
-        try:
-            self._assert_runtime_leadership()
-        except Exception:
-            # The authoritative snapshot belongs to the lease generation that
-            # requested it. A successor must perform its own reconciliation.
-            adapter.close()
-            raise
-        try:
-            adapter.start_order_event_stream()
-        except Exception:
-            logger.exception(
-                "Reconnect order stream restart failed; submissions remain gated"
-            )
-            adapter.close()
-            return False
-
-        try:
-            self._assert_runtime_leadership()
-        except Exception:
-            # Do not publish completion for a runtime that lost its lease while
-            # restarting the stream. Keep the pending generation for retry by
-            # the new owner.
-            adapter.close()
-            raise
-
-        # This is a new runtime, whose first successful connection is generation
-        # 1. Any subsequent bump is another reconnect and will be observed here.
-        self._last_order_generation = 1
-        self._pending_order_reconnect_generation = None
-        self.execution_engine.resume_after_reconcile()
-        logger.info(
-            "Reconnect order reconciliation complete: %s recoverable orders",
-            summary["recoverable_count"],
-        )
-        return True
+        return self._rithmic_order_reconnect.reconcile_if_needed()
 
     def _can_auto_resume_after_startup_recovery(self, summary: dict | None) -> bool:
         return bool(
@@ -1182,30 +1105,30 @@ class StrategyEngine:
         """
         Starts the Redis command listener in a background thread.
         """
+
         def command_loop():
             pubsub = self.redis_client.pubsub()
             try:
                 pubsub.subscribe("cmd:strategy:control")
                 logger.info(
-                    "📡 Command Listener Started. "
-                    "Subscribed to 'cmd:strategy:control'"
+                    "📡 Command Listener Started. Subscribed to 'cmd:strategy:control'"
                 )
                 while self.running:
                     message = pubsub.get_message(timeout=1.0)
-                    if message is None or message['type'] != 'message':
+                    if message is None or message["type"] != "message":
                         continue
                     try:
                         self._assert_runtime_leadership()
                     except Exception:
                         return
                     try:
-                        data = json.loads(message['data'])
+                        data = json.loads(message["data"])
                         self.executor.submit(self._handle_command, data)
                     except Exception as e:
                         logger.error("Error parsing command: %s", e)
             finally:
                 pubsub.close()
-        
+
         self.command_thread = threading.Thread(target=command_loop, daemon=True)
         self.command_thread.start()
 
@@ -1218,9 +1141,9 @@ class StrategyEngine:
         params = data.get("params") or {}
         if not isinstance(params, dict):
             params = {}
-        
+
         logger.info("Received Command: %s with params %s", cmd, params)
-        
+
         try:
             if cmd == "SCAN":
                 self.scan_strategies()
@@ -1231,12 +1154,11 @@ class StrategyEngine:
                     actor = params.get("actor", "operator")
                     reason = params.get("reason")
                     idempotency_key = params.get("idempotency_key")
-                    if (
-                        isinstance(idempotency_key, str)
-                        and self._kill_switch_operation_completed(
-                            actor=str(actor),
-                            idempotency_key=idempotency_key,
-                        )
+                    if isinstance(
+                        idempotency_key, str
+                    ) and self._kill_switch_operation_completed(
+                        actor=str(actor),
+                        idempotency_key=idempotency_key,
                     ):
                         logger.info(
                             "Skipping completed kill switch operation for actor %s",
@@ -1278,9 +1200,7 @@ class StrategyEngine:
                     }
                     if isinstance(idempotency_key, str):
                         kill_switch_kwargs["operation_id"] = idempotency_key
-                    kill_switch_result = self._run_ops_kill_switch(
-                        **kill_switch_kwargs
-                    )
+                    kill_switch_result = self._run_ops_kill_switch(**kill_switch_kwargs)
                     self._kill_switch_halted = True
                     if (
                         isinstance(idempotency_key, str)
@@ -1303,7 +1223,9 @@ class StrategyEngine:
                     actor = params.get("actor", "operator")
                     reason = params.get("reason")
 
-                    verified, drift_generation = self._prepare_rithmic_kill_switch_clear()
+                    verified, drift_generation = (
+                        self._prepare_rithmic_kill_switch_clear()
+                    )
                     if not verified:
                         logger.warning(
                             "Kill switch clear rejected: rithmic_reconciliation_required"
@@ -1358,14 +1280,11 @@ class StrategyEngine:
                             self.execution_engine.resume_after_reconcile()
             else:
                 expected_version = params.get("expected_version")
-                if (
-                    cmd in {"START", "STOP", "RESUME", "FORCE_RECOVER"}
-                    and (
-                        expected_version is None
-                        or (
-                            isinstance(expected_version, int)
-                            and not isinstance(expected_version, bool)
-                        )
+                if cmd in {"START", "STOP", "RESUME", "FORCE_RECOVER"} and (
+                    expected_version is None
+                    or (
+                        isinstance(expected_version, int)
+                        and not isinstance(expected_version, bool)
                     )
                 ):
                     self._assert_strategy_command_allowed(
@@ -1387,12 +1306,11 @@ class StrategyEngine:
                 }:
                     idempotency_key = params.get("idempotency_key")
                     actor = str(params.get("actor", "operator"))
-                    if (
-                        isinstance(idempotency_key, str)
-                        and not self._claim_strategy_command_operation(
-                            actor=actor,
-                            idempotency_key=idempotency_key,
-                        )
+                    if isinstance(
+                        idempotency_key, str
+                    ) and not self._claim_strategy_command_operation(
+                        actor=actor,
+                        idempotency_key=idempotency_key,
                     ):
                         logger.info(
                             "Skipping duplicate strategy command for actor %s",
@@ -1400,9 +1318,8 @@ class StrategyEngine:
                         )
                         return
                 result = self._command_router.handle(data)
-                if (
-                    cmd in {"START", "STOP", "RESUME", "FORCE_RECOVER"}
-                    and isinstance(idempotency_key, str)
+                if cmd in {"START", "STOP", "RESUME", "FORCE_RECOVER"} and isinstance(
+                    idempotency_key, str
                 ):
                     self._mark_strategy_command_operation_completed(
                         actor=actor,
@@ -1413,7 +1330,9 @@ class StrategyEngine:
                 else:
                     logger.warning("Command %s failed: %s", cmd, result.message)
         except Exception as e:
-            logger.error("Error executing command %s: %s\n%s", cmd, e, traceback.format_exc())
+            logger.error(
+                "Error executing command %s: %s\n%s", cmd, e, traceback.format_exc()
+            )
 
     def _kill_switch_operation_redis_key(
         self,
@@ -1421,12 +1340,8 @@ class StrategyEngine:
         actor: str,
         idempotency_key: str,
     ) -> str:
-        digest = hashlib.sha256(
-            f"{actor}\0{idempotency_key}".encode()
-        ).hexdigest()
-        return self.runtime_environment.key(
-            f"ops:kill-switch:idempotency:{digest}"
-        )
+        digest = hashlib.sha256(f"{actor}\0{idempotency_key}".encode()).hexdigest()
+        return self.runtime_environment.key(f"ops:kill-switch:idempotency:{digest}")
 
     def _claim_strategy_command_operation(
         self,
@@ -1434,12 +1349,8 @@ class StrategyEngine:
         actor: str,
         idempotency_key: str,
     ) -> bool:
-        digest = hashlib.sha256(
-            f"{actor}\0{idempotency_key}".encode()
-        ).hexdigest()
-        key = self.runtime_environment.key(
-            f"strategy-command:idempotency:{digest}"
-        )
+        digest = hashlib.sha256(f"{actor}\0{idempotency_key}".encode()).hexdigest()
+        key = self.runtime_environment.key(f"strategy-command:idempotency:{digest}")
         try:
             return bool(
                 self.redis_client.set(
@@ -1451,8 +1362,7 @@ class StrategyEngine:
             )
         except Exception:
             logger.exception(
-                "Unable to claim strategy command idempotency key; "
-                "command rejected"
+                "Unable to claim strategy command idempotency key; command rejected"
             )
             return False
 
@@ -1462,12 +1372,8 @@ class StrategyEngine:
         actor: str,
         idempotency_key: str,
     ) -> None:
-        digest = hashlib.sha256(
-            f"{actor}\0{idempotency_key}".encode()
-        ).hexdigest()
-        key = self.runtime_environment.key(
-            f"strategy-command:idempotency:{digest}"
-        )
+        digest = hashlib.sha256(f"{actor}\0{idempotency_key}".encode()).hexdigest()
+        key = self.runtime_environment.key(f"strategy-command:idempotency:{digest}")
         try:
             self.redis_client.set(
                 key,
@@ -1527,16 +1433,20 @@ class StrategyEngine:
         """
         logger.info("🔍 Scanning for strategies in %s...", HOT_STRATEGIES_PATH)
         found = StrategyLoader.scan_directory(HOT_STRATEGIES_PATH)
-        
+
         # Update class registry
         new_classes = {k: v for k, v in found.items() if not isinstance(v, str)}
         with self._strategy_lock:
             self.loaded_classes = new_classes
-        
+
         # Sync with DB
         with self._db_session_factory() as db:
             for strategy_id, result in found.items():
-                state = db.query(StrategyState).filter(StrategyState.strategy_id == strategy_id).first()
+                state = (
+                    db.query(StrategyState)
+                    .filter(StrategyState.strategy_id == strategy_id)
+                    .first()
+                )
                 is_new = state is None
                 if not state:
                     state = StrategyState(
@@ -1566,7 +1476,7 @@ class StrategyEngine:
                             expected_version=expected_version,
                         )
                         continue
-                
+
                 db.commit()
         logger.info("✅ Scan Complete. Total loaded: %s", len(self.loaded_classes))
 
@@ -1620,7 +1530,11 @@ class StrategyEngine:
             return
 
         with self._db_session_factory() as db:
-            state = db.query(StrategyState).filter(StrategyState.strategy_id == strategy_id).first()
+            state = (
+                db.query(StrategyState)
+                .filter(StrategyState.strategy_id == strategy_id)
+                .first()
+            )
             if not state:
                 logger.error("Strategy %s not in DB.", strategy_id)
                 return
@@ -1633,7 +1547,7 @@ class StrategyEngine:
                 # Instantiate with dummy product to get requirements
                 config = json.loads(state.config_json or "{}")
                 product_id = self._strategy_product_id(config)
-                
+
                 instances = self._build_artifact_instances(
                     artifact_cls,
                     strategy_id=strategy_id,
@@ -1727,17 +1641,30 @@ class StrategyEngine:
 
         self._assert_expected_strategy_version(strategy_id, expected_version)
         with self._db_session_factory() as db:
-            state = db.query(StrategyState).filter(StrategyState.strategy_id == strategy_id).first()
+            state = (
+                db.query(StrategyState)
+                .filter(StrategyState.strategy_id == strategy_id)
+                .first()
+            )
             # Allow READY or WARNING (with manual override implied by START command)
-            startable = {StrategyStatus.READY, StrategyStatus.WARNING, StrategyStatus.STOPPED, StrategyStatus.DISCOVERED}
+            startable = {
+                StrategyStatus.READY,
+                StrategyStatus.WARNING,
+                StrategyStatus.STOPPED,
+                StrategyStatus.DISCOVERED,
+            }
             if not state or (state.status not in startable and not force):
-                 logger.error("Strategy %s is not in startable state (Current: %s)", strategy_id, state.status if state else 'None')
-                 return False
+                logger.error(
+                    "Strategy %s is not in startable state (Current: %s)",
+                    strategy_id,
+                    state.status if state else "None",
+                )
+                return False
 
             try:
                 config = json.loads(state.config_json or "{}")
                 product_id = self._strategy_product_id(config)
-                
+
                 self._assert_strategy_live_readiness(artifact_cls)
                 if issubclass(artifact_cls, PortfolioFactory):
                     definition = self._build_portfolio_definition(
@@ -1752,9 +1679,7 @@ class StrategyEngine:
                         self._warm_up_strategy_instance(db, instance)
                         if self.runtime_environment.identity == "live":
                             self._fresh_strategy_instance_for_replay(instance)
-                        warmed_sleeves.append(
-                            replace(sleeve, strategy=instance)
-                        )
+                        warmed_sleeves.append(replace(sleeve, strategy=instance))
                     definition = replace(
                         definition,
                         sleeves=tuple(warmed_sleeves),
@@ -1774,7 +1699,9 @@ class StrategyEngine:
                     self._register_strategy_instance(instance)
                 state.uptime_start = int(time.time() * 1000)
                 db.commit()
-                logger.info("🔥 Strategy %s is now ACTIVE for %s", strategy_id, product_id)
+                logger.info(
+                    "🔥 Strategy %s is now ACTIVE for %s", strategy_id, product_id
+                )
 
             except Exception as e:
                 self._unregister_runtime_artifact(strategy_id)
@@ -1952,11 +1879,7 @@ class StrategyEngine:
         )
         if before_timestamp is not None:
             query = query.filter(ORMCandlestick.timestamp < before_timestamp)
-        rows = (
-            query.order_by(ORMCandlestick.timestamp.desc())
-            .limit(lookback)
-            .all()
-        )
+        rows = query.order_by(ORMCandlestick.timestamp.desc()).limit(lookback).all()
         rows = sorted(rows, key=lambda row: row.timestamp)
         if len(rows) < lookback:
             raise RuntimeError(
@@ -2144,11 +2067,9 @@ class StrategyEngine:
                 candle.timestamp,
             ),
         )
-        if (
-            persisted is None
-            or self._persisted_candle_values(persisted)
-            != self._candle_values(candle)
-        ):
+        if persisted is None or self._persisted_candle_values(
+            persisted
+        ) != self._candle_values(candle):
             raise RuntimeError(
                 "live application receipt has no matching canonical candle: "
                 f"{candle.product_id}:{candle.timeframe}:{candle.timestamp}"
@@ -2170,8 +2091,7 @@ class StrategyEngine:
         latest_timestamp = (
             db.query(func.max(MarketDataApplication.timestamp))
             .filter(
-                MarketDataApplication.environment
-                == self.runtime_environment.identity,
+                MarketDataApplication.environment == self.runtime_environment.identity,
                 MarketDataApplication.product_id == candle.product_id,
                 MarketDataApplication.timeframe == candle.timeframe,
             )
@@ -2210,9 +2130,9 @@ class StrategyEngine:
                         )
                     )
                 else:
-                    if self._persisted_candle_values(
-                        existing
-                    ) != self._candle_values(candle):
+                    if self._persisted_candle_values(existing) != self._candle_values(
+                        candle
+                    ):
                         raise RuntimeError(
                             "live candle conflicts with canonical history: "
                             f"{candle.product_id}:{candle.timeframe}:"
@@ -2356,7 +2276,9 @@ class StrategyEngine:
                 "position_state_sync_failed: "
                 f"strategy_id={instance.strategy_id} error={e}"
             ) from e
-        position_side = None if position is None else getattr(position.side, "value", position.side)
+        position_side = (
+            None if position is None else getattr(position.side, "value", position.side)
+        )
         applied = self._signal_processor.set_position_state(instance, position_side)
         if position_side is not None and not applied:
             raise RuntimeError(
@@ -2419,8 +2341,7 @@ class StrategyEngine:
 
             if not self._unregister_runtime_artifact_locked(strategy_id):
                 logger.warning(
-                    "Strategy %s runtime was already absent; "
-                    "durable state reconciled.",
+                    "Strategy %s runtime was already absent; durable state reconciled.",
                     strategy_id,
                 )
 
@@ -2434,14 +2355,15 @@ class StrategyEngine:
     def _register_strategy_instance(self, instance: BaseStrategy) -> None:
         """Register a live strategy instance in runtime-only structures."""
         with self._runtime_registration_lock:
-            updated_portfolio = (
-                self._portfolio_coordinator.replace_sleeve_strategy(instance)
+            updated_portfolio = self._portfolio_coordinator.replace_sleeve_strategy(
+                instance
             )
             with self._strategy_lock:
                 old = self.strategy_instances.get(instance.strategy_id)
                 if old is not None and old.product_id in self.strategies:
                     self.strategies[old.product_id] = [
-                        s for s in self.strategies[old.product_id]
+                        s
+                        for s in self.strategies[old.product_id]
                         if s.strategy_id != instance.strategy_id
                     ]
                 self.strategy_instances[instance.strategy_id] = instance
@@ -2465,9 +2387,7 @@ class StrategyEngine:
         publish_active_state: bool = False,
     ) -> None:
         """Atomically expose a complete portfolio at the market event boundary."""
-        sleeve_ids = [
-            sleeve.strategy.strategy_id for sleeve in definition.sleeves
-        ]
+        sleeve_ids = [sleeve.strategy.strategy_id for sleeve in definition.sleeves]
         new_ids = {definition.portfolio_id, *sleeve_ids}
         with self._runtime_registration_lock, self._market_processing_lock:
             with self._strategy_lock:
@@ -2516,16 +2436,11 @@ class StrategyEngine:
         definition = self._portfolio_coordinator.unregister(runtime_id)
         if definition is not None:
             for sleeve in definition.sleeves:
-                self._unregister_strategy_instance(
-                    sleeve.strategy.strategy_id
-                )
+                self._unregister_strategy_instance(sleeve.strategy.strategy_id)
             with self._strategy_lock:
                 self.portfolio_instances.pop(runtime_id, None)
             return True
-        if (
-            self._portfolio_coordinator.portfolio_id_for_sleeve(runtime_id)
-            is not None
-        ):
+        if self._portfolio_coordinator.portfolio_id_for_sleeve(runtime_id) is not None:
             raise ValueError(
                 "portfolio sleeves must be controlled through the portfolio ID"
             )
@@ -2541,7 +2456,8 @@ class StrategyEngine:
                 product_id = instance.product_id
                 if product_id in self.strategies:
                     self.strategies[product_id] = [
-                        s for s in self.strategies[product_id]
+                        s
+                        for s in self.strategies[product_id]
                         if s.strategy_id != strategy_id
                     ]
                 self._registry.unregister(strategy_id)
@@ -2563,7 +2479,9 @@ class StrategyEngine:
             self.redis_client.set("state:balance:USDT", str(balance))
             logger.info("✅ Balance Reconciled: %s USDT", balance)
         except Exception as e:
-            logger.warning("⚠️ Balance Reconciliation Failed: %s. Using DB/Redis state.", e)
+            logger.warning(
+                "⚠️ Balance Reconciliation Failed: %s. Using DB/Redis state.", e
+            )
 
     def _check_system_state(self) -> bool:
         """
@@ -2685,6 +2603,7 @@ class StrategyEngine:
         """
         Starts the heartbeat background thread.
         """
+
         def heartbeat_loop():
             logger.info("💓 Heartbeat Service Started.")
             while self.running:
@@ -2724,7 +2643,7 @@ class StrategyEngine:
                 except Exception as e:
                     logger.error("💓 Heartbeat Failed: %s", e)
                     time.sleep(1.0)
-        
+
         self.heartbeat_thread = threading.Thread(target=heartbeat_loop, daemon=True)
         self.heartbeat_thread.start()
 
@@ -2856,9 +2775,9 @@ class StrategyEngine:
                     self._health_monitor.update_heartbeat(sid)
                 except Exception as e:
                     logger.warning("Failed to update health monitor for %s: %s", sid, e)
-                db.query(StrategyState).filter(StrategyState.strategy_id == sid).update({
-                    "last_heartbeat": now_ms
-                })
+                db.query(StrategyState).filter(StrategyState.strategy_id == sid).update(
+                    {"last_heartbeat": now_ms}
+                )
             db.commit()
 
     def add_strategy(self, strategy: BaseStrategy):
@@ -2879,8 +2798,7 @@ class StrategyEngine:
                     is not None
                 ):
                     raise ValueError(
-                        "strategy runtime ID is already active: "
-                        f"{strategy.strategy_id}"
+                        f"strategy runtime ID is already active: {strategy.strategy_id}"
                     )
             self._register_strategy_instance(strategy)
             self._strategy_state_manager.on_state_change_message(
@@ -2889,7 +2807,11 @@ class StrategyEngine:
                     "status": StrategyStatus.ACTIVE.value,
                 }
             )
-        logger.info("Registered strategy (legacy): %s for %s", strategy.strategy_id, strategy.product_id)
+        logger.info(
+            "Registered strategy (legacy): %s for %s",
+            strategy.strategy_id,
+            strategy.product_id,
+        )
 
     def add_portfolio(self, definition: PortfolioDefinition) -> None:
         """Register one pre-built portfolio for backtest or static runtimes."""
@@ -2898,8 +2820,7 @@ class StrategyEngine:
             and definition.readiness != "LIVE_APPROVED"
         ):
             raise RuntimeError(
-                "portfolio_live_approval_required: "
-                f"readiness={definition.readiness}"
+                f"portfolio_live_approval_required: readiness={definition.readiness}"
             )
         if self.runtime_environment.identity == "live":
             for sleeve in definition.sleeves:
@@ -3053,18 +2974,18 @@ class StrategyEngine:
         order_id = None
         execution_succeeded = False
         if is_passed:
-            logger.info("✅ SIGNAL ACCEPTED: %s. Forwarding to Execution Engine...", signal.type)
-            if (
-                isinstance(self.execution_engine.adapter, RithmicExchangeAdapter)
-                and signal.type in (SignalType.EXIT_LONG, SignalType.EXIT_SHORT)
-            ):
-                portfolio_id = (
-                    self._portfolio_coordinator.portfolio_id_for_sleeve(
-                        signal.strategy_id
-                    )
+            logger.info(
+                "✅ SIGNAL ACCEPTED: %s. Forwarding to Execution Engine...", signal.type
+            )
+            if isinstance(
+                self.execution_engine.adapter, RithmicExchangeAdapter
+            ) and signal.type in (SignalType.EXIT_LONG, SignalType.EXIT_SHORT):
+                portfolio_id = self._portfolio_coordinator.portfolio_id_for_sleeve(
+                    signal.strategy_id
                 )
                 exit_executor = self._run_rithmic_strategy_exit
                 if portfolio_id is not None:
+
                     def execute_portfolio_exit(
                         portfolio_signal: Signal,
                         decision: ExitDecision,
@@ -3088,7 +3009,7 @@ class StrategyEngine:
                 execution_succeeded = order_id is not None
             if self.execution_engine.audit_external_orders:
                 return execution_succeeded
-        
+
         audit = build_signal_audit(
             clock=self.clock,
             signal=signal,
@@ -3110,7 +3031,10 @@ class StrategyEngine:
         adapter = self.execution_engine.adapter
         if not isinstance(adapter, RithmicExchangeAdapter):
             raise RuntimeError("authoritative_strategy_exit_requires_rithmic")
-        if decision.position_quantity is None or decision.quantity != decision.position_quantity:
+        if (
+            decision.position_quantity is None
+            or decision.quantity != decision.position_quantity
+        ):
             raise RuntimeError("rithmic_partial_strategy_exit_unsupported")
 
         verified = False
@@ -3176,8 +3100,7 @@ class StrategyEngine:
                     order_type=order.type,
                 ):
                     raise RuntimeError(
-                        "rithmic_strategy_exit_cancel_failed:"
-                        f"order_id={order.id}"
+                        f"rithmic_strategy_exit_cancel_failed:order_id={order.id}"
                     )
                 cancelled_orders += 1
 
@@ -3227,9 +3150,7 @@ class StrategyEngine:
                     getattr(remote_position.side, "value", remote_position.side)
                 ).upper()
                 expected_side = (
-                    "LONG"
-                    if signal.type == SignalType.EXIT_LONG
-                    else "SHORT"
+                    "LONG" if signal.type == SignalType.EXIT_LONG else "SHORT"
                 )
                 if (
                     remote_side != expected_side
@@ -3253,8 +3174,7 @@ class StrategyEngine:
                 snapshot = load_snapshot()
                 remaining_positions = adapter.positions_from_ledger_snapshot(snapshot)
                 working_orders_remain = any(
-                    rithmic_order_may_be_working(order)
-                    for order in snapshot.orders
+                    rithmic_order_may_be_working(order) for order in snapshot.orders
                 )
                 if working_orders_remain:
                     continue
@@ -3293,8 +3213,7 @@ class StrategyEngine:
         except Exception as error:
             operation_failed = True
             self._lockdown_for_rithmic_order_drift(
-                "rithmic_strategy_exit_requires_reconciliation:"
-                f"{type(error).__name__}"
+                f"rithmic_strategy_exit_requires_reconciliation:{type(error).__name__}"
             )
             raise
         finally:
@@ -3393,8 +3312,7 @@ class StrategyEngine:
 
         if (
             clean_exit
-            and
-            self._boot_started
+            and self._boot_started
             and not self._kill_switch_halted
             and not self.ops_safety.recovery_pending
         ):
