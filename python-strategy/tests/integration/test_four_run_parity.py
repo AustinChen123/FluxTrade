@@ -454,7 +454,9 @@ def test_real_collectors_produce_the_same_exact_outcome(
 
 
 def test_product_manifest_rejects_path_or_blob_drift() -> None:
-    manifest = fixture_module._manifest_bytes(fixture_module.NATIVE_ARTIFACT_FIX_SHA)
+    manifest = (
+        Path(__file__).with_name("fixtures") / "d0b4b_product_manifest.txt"
+    ).read_bytes()
     assert validate_frozen_product_manifest(manifest) == PARENT_MANIFEST_SHA256
     lines = manifest.splitlines(keepends=True)
     with pytest.raises(ValueError, match="differs from reviewed parent"):
