@@ -45,6 +45,9 @@ from src.core.adapters.rithmic_ledger_recovery import (
 from src.core.adapters.rithmic_order_reconnect import (
     RithmicOrderReconnectService,
 )
+from src.core.adapters.rithmic_order_event_lifecycle import (
+    RithmicOrderEventLifecycleGate,
+)
 from src.core.adapters.rithmic_runtime_recovery import (
     RithmicRuntimeRecoveryService,
 )
@@ -4835,6 +4838,26 @@ class TestExchangeOrderEventThread:
             engine.execution_engine.resume_after_reconcile.assert_called_once_with()
         assert engine._rithmic_external_order_drift_pending is drift_pending
 
+    def test_rithmic_clear_enters_shared_order_event_lifecycle_gate(self, engine):
+        adapter = _rithmic_adapter_for_reconnect_test()
+        engine.execution_engine.adapter = adapter
+        sentinel = (False, 17)
+        engine._rithmic_order_event_lifecycle.run = MagicMock(return_value=sentinel)
+
+        assert engine._prepare_rithmic_kill_switch_clear() is sentinel
+
+        engine._rithmic_order_event_lifecycle.run.assert_called_once_with(
+            engine._prepare_rithmic_kill_switch_clear_serialized,
+            adapter,
+        )
+
+    def test_non_rithmic_clear_does_not_enter_rithmic_lifecycle_gate(self, engine):
+        engine._rithmic_order_event_lifecycle.run = MagicMock()
+
+        assert engine._prepare_rithmic_kill_switch_clear() == (True, None)
+
+        engine._rithmic_order_event_lifecycle.run.assert_not_called()
+
     def test_external_order_clear_reconcile_failure_restarts_stream_and_stays_locked(
         self,
         engine,
@@ -5250,6 +5273,7 @@ def _install_rithmic_strategy_exit_service(
         account_service=engine.account_service,
         profile=engine._rithmic_recovery_profile or "",
         account_id=engine._rithmic_recovery_account_id,
+        operation_gate=engine._rithmic_order_event_lifecycle,
         stop_order_event_stream=engine._stop_exchange_order_event_stream,
         assert_leadership=engine._assert_runtime_leadership,
         restart_order_stream=engine._start_exchange_order_event_stream,
@@ -5271,6 +5295,7 @@ def _install_rithmic_emergency_flatten_service(
         ops_safety=engine.ops_safety,
         profile=engine._rithmic_recovery_profile or "test",
         account_id=engine._rithmic_recovery_account_id or "ACCOUNT",
+        operation_gate=engine._rithmic_order_event_lifecycle,
         stop_current_worker=engine._stop_exchange_order_event_stream,
         clear_polling_stop=engine._order_event_stop.clear,
         restart_generic_worker=engine._start_exchange_order_event_stream,
@@ -5540,10 +5565,165 @@ def test_strategy_exit_owner_stops_current_replacement_thread(engine):
     stale_thread.is_alive.assert_not_called()
     stale_thread.join.assert_not_called()
     current_thread.join.assert_called_once_with(timeout=30.0)
-    engine._start_exchange_order_event_stream.assert_called_once_with()
+    engine._start_exchange_order_event_stream.assert_not_called()
     engine._lockdown_for_rithmic_order_drift.assert_called_once_with(
         "rithmic_strategy_exit_requires_reconciliation:RuntimeError"
     )
+
+
+def test_rithmic_exit_owners_share_one_order_event_lifecycle_gate(engine):
+    adapter = _rithmic_adapter_for_reconnect_test()
+    engine.execution_engine.adapter = adapter
+    engine._rithmic_recovery_profile = "test"
+    engine._rithmic_recovery_account_id = "ACCOUNT"
+    strategy_owner = _install_rithmic_strategy_exit_service(engine, adapter)
+    flatten_owner = _install_rithmic_emergency_flatten_service(engine, adapter)
+
+    assert isinstance(
+        engine._rithmic_order_event_lifecycle,
+        RithmicOrderEventLifecycleGate,
+    )
+    assert strategy_owner.operation_gate is engine._rithmic_order_event_lifecycle
+    assert flatten_owner.operation_gate is engine._rithmic_order_event_lifecycle
+
+    sentinel = {"status": "serialized_portfolio_exit"}
+    engine._rithmic_order_event_lifecycle.run = MagicMock(return_value=sentinel)
+    signal = Signal(
+        strategy_id="portfolio_v1.sleeve_a",
+        product_id="RITHMIC:NQ-202609",
+        timeframe="1m",
+        timestamp=1_700_000_000_000,
+        type=SignalType.EXIT_LONG,
+        quantity=Decimal("1"),
+    )
+    decision = ExitDecision(
+        allowed=True,
+        reason="position_matched",
+        quantity=Decimal("1"),
+        position_quantity=Decimal("1"),
+    )
+
+    assert engine._run_rithmic_portfolio_exit(signal, decision, None) is sentinel
+    engine._rithmic_order_event_lifecycle.run.assert_called_once()
+
+
+def test_invalid_portfolio_exit_fails_before_lifecycle_gate(engine):
+    adapter = _rithmic_adapter_for_reconnect_test()
+    engine.execution_engine.adapter = adapter
+    engine._rithmic_recovery_profile = "test"
+    engine._rithmic_recovery_account_id = "ACCOUNT"
+    engine._rithmic_emergency_flatten = MagicMock()
+    engine._rithmic_order_event_lifecycle.run = MagicMock()
+    signal = Signal(
+        strategy_id="portfolio_v1.sleeve_a",
+        product_id="RITHMIC:NQ-202609",
+        timeframe="1m",
+        timestamp=1_700_000_000_000,
+        type=SignalType.LONG,
+        quantity=Decimal("1"),
+    )
+    decision = ExitDecision(
+        allowed=True,
+        reason="position_matched",
+        quantity=Decimal("1"),
+        position_quantity=Decimal("1"),
+    )
+
+    with pytest.raises(
+        ValueError,
+        match="rithmic_portfolio_exit_requires_exit_signal",
+    ):
+        engine._run_rithmic_portfolio_exit(signal, decision, None)
+
+    engine._rithmic_order_event_lifecycle.run.assert_not_called()
+
+
+def test_portfolio_exit_stop_timeout_does_not_start_replacement_worker(engine):
+    adapter = _rithmic_adapter_for_reconnect_test()
+    engine.execution_engine.adapter = adapter
+    engine._rithmic_recovery_profile = "test"
+    engine._rithmic_recovery_account_id = "ACCOUNT"
+    engine._rithmic_emergency_flatten = MagicMock()
+    engine._start_exchange_order_event_stream = MagicMock()
+    engine._lockdown_for_rithmic_order_drift = MagicMock()
+    current_thread = MagicMock()
+    current_thread.is_alive.side_effect = [True, True]
+    engine.order_event_thread = current_thread
+    signal = Signal(
+        strategy_id="portfolio_v1.sleeve_a",
+        product_id="RITHMIC:NQ-202609",
+        timeframe="1m",
+        timestamp=1_700_000_000_000,
+        type=SignalType.EXIT_LONG,
+        quantity=Decimal("1"),
+    )
+    decision = ExitDecision(
+        allowed=True,
+        reason="position_matched",
+        quantity=Decimal("1"),
+        position_quantity=Decimal("1"),
+    )
+
+    with pytest.raises(
+        RuntimeError,
+        match="rithmic_portfolio_exit_event_stream_stop_timeout",
+    ):
+        engine._run_rithmic_portfolio_exit(signal, decision, None)
+
+    current_thread.join.assert_called_once_with(timeout=30.0)
+    assert engine._order_event_stop.is_set()
+    engine._start_exchange_order_event_stream.assert_not_called()
+    engine._rithmic_emergency_flatten.schedule_portfolio_exit_compensation.assert_not_called()
+    engine._lockdown_for_rithmic_order_drift.assert_called_once_with(
+        "rithmic_portfolio_exit_requires_reconciliation:RuntimeError"
+    )
+
+
+def test_portfolio_exit_resolves_current_worker_after_acquiring_gate(engine):
+    adapter = _rithmic_adapter_for_reconnect_test()
+    engine.execution_engine.adapter = adapter
+    engine._rithmic_recovery_profile = "test"
+    engine._rithmic_recovery_account_id = "ACCOUNT"
+    engine._rithmic_emergency_flatten = MagicMock()
+    engine._start_exchange_order_event_stream = MagicMock()
+    stale_thread = MagicMock()
+    stale_thread.is_alive.return_value = True
+    current_thread = MagicMock()
+    current_thread.is_alive.side_effect = [True, True]
+    engine.order_event_thread = stale_thread
+
+    def replace_worker_then_enter(operation, *args):
+        engine.order_event_thread = current_thread
+        return operation(*args)
+
+    engine._rithmic_order_event_lifecycle.run = MagicMock(
+        side_effect=replace_worker_then_enter
+    )
+    signal = Signal(
+        strategy_id="portfolio_v1.sleeve_a",
+        product_id="RITHMIC:NQ-202609",
+        timeframe="1m",
+        timestamp=1_700_000_000_000,
+        type=SignalType.EXIT_LONG,
+        quantity=Decimal("1"),
+    )
+    decision = ExitDecision(
+        allowed=True,
+        reason="position_matched",
+        quantity=Decimal("1"),
+        position_quantity=Decimal("1"),
+    )
+
+    with pytest.raises(
+        RuntimeError,
+        match="rithmic_portfolio_exit_event_stream_stop_timeout",
+    ):
+        engine._run_rithmic_portfolio_exit(signal, decision, None)
+
+    stale_thread.is_alive.assert_not_called()
+    stale_thread.join.assert_not_called()
+    current_thread.join.assert_called_once_with(timeout=30.0)
+    engine._start_exchange_order_event_stream.assert_not_called()
 
 
 def test_rithmic_strategy_exit_cancels_protection_before_native_exit(engine):

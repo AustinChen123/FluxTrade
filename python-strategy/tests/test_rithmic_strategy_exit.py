@@ -7,6 +7,9 @@ from unittest.mock import MagicMock, call, patch
 
 import pytest
 
+from src.core.adapters.rithmic_order_event_lifecycle import (
+    RithmicOrderEventLifecycleGate,
+)
 from src.core.adapters.rithmic_strategy_exit import RithmicStrategyExitService
 from src.core.execution import ExitDecision
 from src.core.models import OrderStatus, Position, PositionSide, Signal, SignalType
@@ -92,6 +95,7 @@ def _service() -> tuple[RithmicStrategyExitService, SimpleNamespace]:
         adapter=adapter,
         execution_engine=execution_engine,
         account_service=account_service,
+        operation_gate=RithmicOrderEventLifecycleGate(),
         stop_order_event_stream=MagicMock(return_value=True),
         assert_leadership=MagicMock(),
         restart_order_stream=MagicMock(),
@@ -101,6 +105,7 @@ def _service() -> tuple[RithmicStrategyExitService, SimpleNamespace]:
         adapter=adapter,
         execution_engine=execution_engine,
         account_service=account_service,
+        operation_gate=dependencies.operation_gate,
         profile="test",
         account_id="ACCOUNT",
         stop_order_event_stream=dependencies.stop_order_event_stream,
@@ -110,6 +115,23 @@ def _service() -> tuple[RithmicStrategyExitService, SimpleNamespace]:
         logger=logging.getLogger("test.rithmic_strategy_exit"),
     )
     return service, dependencies
+
+
+def test_valid_request_enters_operation_gate_before_money_path() -> None:
+    service, dependencies = _service()
+    sentinel = {"status": "serialized"}
+    dependencies.operation_gate.run = MagicMock(return_value=sentinel)
+
+    assert service.execute(_signal(), _decision()) is sentinel
+
+    dependencies.operation_gate.run.assert_called_once()
+    operation, signal, position_quantity = (
+        dependencies.operation_gate.run.call_args.args
+    )
+    assert operation == service._execute_validated
+    assert signal == _signal()
+    assert position_quantity == Decimal("1")
+    dependencies.stop_order_event_stream.assert_not_called()
 
 
 @pytest.mark.parametrize(
@@ -134,10 +156,12 @@ def test_invalid_request_fails_before_runtime_or_money_mutation(
     expected: str,
 ) -> None:
     service, dependencies = _service()
+    dependencies.operation_gate.run = MagicMock()
 
     with pytest.raises((ValueError, RuntimeError), match=expected):
         service.execute(signal, decision)
 
+    dependencies.operation_gate.run.assert_not_called()
     dependencies.stop_order_event_stream.assert_not_called()
     dependencies.adapter.start_order_event_stream.assert_not_called()
     dependencies.execution_engine.exit_authoritative_position.assert_not_called()
@@ -145,7 +169,7 @@ def test_invalid_request_fails_before_runtime_or_money_mutation(
     dependencies.lockdown.assert_not_called()
 
 
-def test_stop_timeout_prohibits_money_path_but_runs_finalizer() -> None:
+def test_stop_timeout_prohibits_money_path_and_replacement_worker() -> None:
     service, dependencies = _service()
     dependencies.stop_order_event_stream.return_value = False
 
@@ -159,8 +183,8 @@ def test_stop_timeout_prohibits_money_path_but_runs_finalizer() -> None:
     dependencies.execution_engine.reconcile_rithmic_owned_orders.assert_not_called()
     dependencies.execution_engine.exit_authoritative_position.assert_not_called()
     dependencies.account_service.replace_positions_for_products.assert_not_called()
-    dependencies.assert_leadership.assert_called_once_with()
-    dependencies.restart_order_stream.assert_called_once_with()
+    dependencies.assert_leadership.assert_not_called()
+    dependencies.restart_order_stream.assert_not_called()
     dependencies.lockdown.assert_called_once_with(
         "rithmic_strategy_exit_requires_reconciliation:RuntimeError"
     )

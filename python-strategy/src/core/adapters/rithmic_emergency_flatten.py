@@ -11,6 +11,9 @@ from src.core.adapters.rithmic_recovery import (
     load_rithmic_recovery_snapshot,
     rithmic_order_may_be_working,
 )
+from src.core.adapters.rithmic_order_event_lifecycle import (
+    RithmicOrderEventLifecycleGate,
+)
 from src.core.execution import ExecutionEngine
 from src.core.ops_safety import OpsSafetyService
 
@@ -64,6 +67,7 @@ class RithmicEmergencyFlattenService:
         ops_safety: OpsSafetyService,
         profile: str,
         account_id: str | None,
+        operation_gate: RithmicOrderEventLifecycleGate,
         stop_current_worker: Callable[..., bool],
         clear_polling_stop: Callable[[], None],
         restart_generic_worker: Callable[[], None],
@@ -78,6 +82,7 @@ class RithmicEmergencyFlattenService:
         self.ops_safety = ops_safety
         self.profile = profile
         self.account_id = account_id
+        self.operation_gate = operation_gate
         self.stop_current_worker = stop_current_worker
         self.clear_polling_stop = clear_polling_stop
         self.restart_generic_worker = restart_generic_worker
@@ -85,6 +90,20 @@ class RithmicEmergencyFlattenService:
         self.logger = logger
 
     def execute(
+        self,
+        *,
+        actor: str,
+        reason: str | None,
+        operation_id: str | None = None,
+    ) -> dict[str, Any]:
+        return self.operation_gate.run(
+            self._execute_serialized,
+            actor=actor,
+            reason=reason,
+            operation_id=operation_id,
+        )
+
+    def _execute_serialized(
         self,
         *,
         actor: str,

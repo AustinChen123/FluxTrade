@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Callable
+from decimal import Decimal
 from logging import Logger
 from typing import Any, cast
 
@@ -10,6 +11,9 @@ from src.core.adapters.rithmic_adapter import RithmicExchangeAdapter
 from src.core.adapters.rithmic_recovery import (
     load_rithmic_recovery_snapshot,
     rithmic_order_may_be_working,
+)
+from src.core.adapters.rithmic_order_event_lifecycle import (
+    RithmicOrderEventLifecycleGate,
 )
 from src.core.execution import ExecutionEngine, ExitDecision
 from src.core.models import OrderStatus, Position, Signal, SignalType
@@ -26,6 +30,7 @@ class RithmicStrategyExitService:
         account_service: Any,
         profile: str,
         account_id: str | None,
+        operation_gate: RithmicOrderEventLifecycleGate,
         stop_order_event_stream: Callable[..., bool],
         assert_leadership: Callable[[], None],
         restart_order_stream: Callable[[], None],
@@ -39,6 +44,7 @@ class RithmicStrategyExitService:
         self.account_service = account_service
         self.profile = profile
         self.account_id = account_id
+        self.operation_gate = operation_gate
         self.stop_order_event_stream = stop_order_event_stream
         self.assert_leadership = assert_leadership
         self.restart_order_stream = restart_order_stream
@@ -58,13 +64,26 @@ class RithmicStrategyExitService:
         ):
             raise RuntimeError("rithmic_partial_strategy_exit_unsupported")
 
+        return self.operation_gate.run(
+            self._execute_validated,
+            signal,
+            decision.position_quantity,
+        )
+
+    def _execute_validated(
+        self,
+        signal: Signal,
+        position_quantity: Decimal,
+    ) -> dict[str, object]:
         verified = False
+        order_event_stopped = False
         operation_failed = False
         outcome: dict[str, object] | None = None
         cancelled_orders = 0
         try:
             if not self.stop_order_event_stream(timeout=30.0):
                 raise RuntimeError("rithmic_strategy_exit_event_stream_stop_timeout")
+            order_event_stopped = True
 
             self.assert_leadership()
             self.adapter.start_order_event_stream()
@@ -98,12 +117,12 @@ class RithmicStrategyExitService:
                 )
                 if (
                     remote_side != expected_side
-                    or remote_position.quantity > decision.position_quantity
+                    or remote_position.quantity > position_quantity
                 ):
                     raise RuntimeError(
                         "rithmic_strategy_exit_position_drift:"
                         f"expected_side={expected_side} remote_side={remote_side} "
-                        f"expected_quantity={decision.position_quantity} "
+                        f"expected_quantity={position_quantity} "
                         f"remote_quantity={remote_position.quantity}"
                     )
                 self.assert_leadership()
@@ -154,19 +173,20 @@ class RithmicStrategyExitService:
             )
             raise
         finally:
-            try:
-                self.assert_leadership()
-                self.restart_order_stream()
-            except Exception:
-                self.adapter.close()
-                self.logger.exception(
-                    "Rithmic strategy exit failed to restart order event stream"
-                )
-                self.lockdown("rithmic_strategy_exit_order_stream_restart_failed")
-                if not operation_failed:
-                    raise RuntimeError(
-                        "rithmic_strategy_exit_order_stream_restart_failed"
+            if order_event_stopped:
+                try:
+                    self.assert_leadership()
+                    self.restart_order_stream()
+                except Exception:
+                    self.adapter.close()
+                    self.logger.exception(
+                        "Rithmic strategy exit failed to restart order event stream"
                     )
+                    self.lockdown("rithmic_strategy_exit_order_stream_restart_failed")
+                    if not operation_failed:
+                        raise RuntimeError(
+                            "rithmic_strategy_exit_order_stream_restart_failed"
+                        )
         if outcome is None:
             raise RuntimeError("rithmic_strategy_exit_outcome_missing")
         return outcome

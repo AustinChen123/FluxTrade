@@ -4,13 +4,15 @@ from __future__ import annotations
 
 from collections.abc import Callable
 from decimal import Decimal
-from threading import Event, Thread
 from typing import Any
 
 from src.core.adapters.rithmic_adapter import RithmicExchangeAdapter
 from src.core.adapters.rithmic_recovery import (
     load_rithmic_recovery_snapshot,
     rithmic_order_may_be_working,
+)
+from src.core.adapters.rithmic_order_event_lifecycle import (
+    RithmicOrderEventLifecycleGate,
 )
 from src.core.execution import ExecutionEngine, ExitDecision
 from src.core.models import Candlestick, OrderStatus, Signal, SignalType
@@ -27,8 +29,8 @@ class RithmicPortfolioExitService:
         account_service: Any,
         profile: str,
         account_id: str,
-        order_event_stop: Event,
-        order_event_thread: Thread | None,
+        operation_gate: RithmicOrderEventLifecycleGate,
+        stop_order_event_stream: Callable[..., bool],
         assert_leadership: Callable[[], None],
         restart_order_stream: Callable[[], None],
         lockdown: Callable[[str], None],
@@ -42,8 +44,8 @@ class RithmicPortfolioExitService:
         self.account_service = account_service
         self.profile = profile
         self.account_id = account_id
-        self.order_event_stop = order_event_stop
-        self.order_event_thread = order_event_thread
+        self.operation_gate = operation_gate
+        self.stop_order_event_stream = stop_order_event_stream
         self.assert_leadership = assert_leadership
         self.restart_order_stream = restart_order_stream
         self.lockdown = lockdown
@@ -68,11 +70,28 @@ class RithmicPortfolioExitService:
         if exit_quantity is None:
             raise RuntimeError("rithmic_portfolio_exit_quantity_missing")
 
+        return self.operation_gate.run(
+            self._execute_validated,
+            signal,
+            decision,
+            candle,
+            exit_quantity,
+        )
+
+    def _execute_validated(
+        self,
+        signal: Signal,
+        decision: ExitDecision,
+        candle: Candlestick | None,
+        exit_quantity: Decimal,
+    ) -> dict[str, object]:
         operation_failed = False
+        order_event_stopped = False
         outcome: dict[str, object] | None = None
-        self.order_event_stop.set()
         try:
-            self._join_order_event_thread()
+            if not self.stop_order_event_stream(timeout=30.0):
+                raise RuntimeError("rithmic_portfolio_exit_event_stream_stop_timeout")
+            order_event_stopped = True
             expected_side = (
                 "LONG"
                 if signal.type == SignalType.EXIT_LONG
@@ -188,18 +207,17 @@ class RithmicPortfolioExitService:
                     ) from compensation_error
             raise
         finally:
-            try:
-                self.assert_leadership()
-                self.restart_order_stream()
-            except Exception:
-                self.adapter.close()
-                self.lockdown(
-                    "rithmic_portfolio_exit_order_stream_restart_failed"
-                )
-                if not operation_failed:
-                    raise RuntimeError(
-                        "rithmic_portfolio_exit_order_stream_restart_failed"
-                    )
+            if order_event_stopped:
+                try:
+                    self.assert_leadership()
+                    self.restart_order_stream()
+                except Exception:
+                    self.adapter.close()
+                    self.lockdown("rithmic_portfolio_exit_order_stream_restart_failed")
+                    if not operation_failed:
+                        raise RuntimeError(
+                            "rithmic_portfolio_exit_order_stream_restart_failed"
+                        )
         return outcome
 
     def _verified_preflight_position(
@@ -277,16 +295,6 @@ class RithmicPortfolioExitService:
             or quantity != exit_quantity
         ):
             raise RuntimeError("rithmic_portfolio_exit_local_position_changed")
-
-    def _join_order_event_thread(self) -> None:
-        thread = self.order_event_thread
-        if thread is None or not thread.is_alive():
-            return
-        thread.join(timeout=30.0)
-        if thread.is_alive():
-            raise RuntimeError(
-                "rithmic_portfolio_exit_event_stream_stop_timeout"
-            )
 
     def _load_snapshot(self):
         self.adapter.close()

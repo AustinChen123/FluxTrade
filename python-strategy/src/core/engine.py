@@ -70,6 +70,9 @@ from src.core.adapters.rithmic_ledger_recovery import (
 from src.core.adapters.rithmic_order_reconnect import (
     RithmicOrderReconnectService,
 )
+from src.core.adapters.rithmic_order_event_lifecycle import (
+    RithmicOrderEventLifecycleGate,
+)
 from src.core.adapters.rithmic_runtime_recovery import (
     RithmicRuntimeRecoveryService,
 )
@@ -451,6 +454,7 @@ class StrategyEngine:
             and self._rithmic_ledger_recovery is not None
             else None
         )
+        self._rithmic_order_event_lifecycle = RithmicOrderEventLifecycleGate()
         self._rithmic_strategy_exit = (
             RithmicStrategyExitService(
                 adapter=adapter,
@@ -458,6 +462,7 @@ class StrategyEngine:
                 account_service=self.account_service,
                 profile=self._rithmic_recovery_profile or "",
                 account_id=self._rithmic_recovery_account_id,
+                operation_gate=self._rithmic_order_event_lifecycle,
                 stop_order_event_stream=self._stop_exchange_order_event_stream,
                 assert_leadership=self._assert_runtime_leadership,
                 restart_order_stream=self._start_exchange_order_event_stream,
@@ -507,6 +512,7 @@ class StrategyEngine:
                 ops_safety=self.ops_safety,
                 profile=self._rithmic_recovery_profile or "",
                 account_id=self._rithmic_recovery_account_id,
+                operation_gate=self._rithmic_order_event_lifecycle,
                 stop_current_worker=self._stop_exchange_order_event_stream,
                 clear_polling_stop=self._order_event_stop.clear,
                 restart_generic_worker=self._start_exchange_order_event_stream,
@@ -828,7 +834,15 @@ class StrategyEngine:
         adapter = self.execution_engine.adapter
         if not isinstance(adapter, RithmicExchangeAdapter):
             return True, None
+        return self._rithmic_order_event_lifecycle.run(
+            self._prepare_rithmic_kill_switch_clear_serialized,
+            adapter,
+        )
 
+    def _prepare_rithmic_kill_switch_clear_serialized(
+        self,
+        adapter: RithmicExchangeAdapter,
+    ) -> tuple[bool, int | None]:
         self._order_event_stop.set()
         thread = self.order_event_thread
         if thread is not None and thread.is_alive():
@@ -2869,8 +2883,8 @@ class StrategyEngine:
             account_service=self.account_service,
             profile=profile,
             account_id=account_id,
-            order_event_stop=self._order_event_stop,
-            order_event_thread=self.order_event_thread,
+            operation_gate=self._rithmic_order_event_lifecycle,
+            stop_order_event_stream=self._stop_exchange_order_event_stream,
             assert_leadership=self._assert_runtime_leadership,
             restart_order_stream=self._start_exchange_order_event_stream,
             lockdown=self._lockdown_for_rithmic_order_drift,

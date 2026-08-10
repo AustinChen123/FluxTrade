@@ -1,4 +1,5 @@
 from copy import deepcopy
+from threading import Event, Lock, Thread
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
@@ -6,6 +7,9 @@ import pytest
 
 from src.core.adapters.rithmic_emergency_flatten import (
     RithmicEmergencyFlattenService,
+)
+from src.core.adapters.rithmic_order_event_lifecycle import (
+    RithmicOrderEventLifecycleGate,
 )
 
 
@@ -65,6 +69,7 @@ def _owner(*, stop=True, restart_error=None, run_when=None):
         execution_engine=execution_engine,
         account_service=account_service,
         ops_safety=ops_safety,
+        operation_gate=RithmicOrderEventLifecycleGate(),
         profile="test",
         account_id="ACCOUNT",
         stop_current_worker=stop_current_worker,
@@ -484,6 +489,84 @@ def test_operator_and_queued_compensation_keep_aggregate_identity_local() -> Non
             "reason": "rithmic_authoritative_flatten_not_verified",
         }
     ]
+
+
+def test_operator_and_compensation_cannot_overlap_owner_lifecycle() -> None:
+    owner = _owner()
+    second_gate_attempted = Event()
+
+    class ObservableLock:
+        def __init__(self) -> None:
+            self._lock = Lock()
+            self._attempt_lock = Lock()
+            self._attempts = 0
+
+        def __enter__(self) -> "ObservableLock":
+            with self._attempt_lock:
+                self._attempts += 1
+                if self._attempts == 2:
+                    second_gate_attempted.set()
+            self._lock.acquire()
+            return self
+
+        def __exit__(self, *_args: object) -> None:
+            self._lock.release()
+
+    setattr(owner.service.operation_gate, "_lock", ObservableLock())
+    first_stop_entered = Event()
+    release_first_stop = Event()
+    second_stop_entered = Event()
+    second_started = Event()
+    call_lock = Lock()
+    stop_calls = 0
+
+    def stop_current_worker(**_kwargs) -> bool:
+        nonlocal stop_calls
+        with call_lock:
+            stop_calls += 1
+            call_number = stop_calls
+        if call_number == 1:
+            first_stop_entered.set()
+            assert release_first_stop.wait(timeout=2.0)
+        else:
+            second_stop_entered.set()
+        return False
+
+    owner.stop.side_effect = stop_current_worker
+    errors = []
+
+    def execute(*, actor: str, reason: str) -> None:
+        try:
+            owner.service.execute(actor=actor, reason=reason)
+        except RuntimeError as error:
+            errors.append(error)
+
+    first = Thread(target=execute, kwargs={"actor": "ops", "reason": "operator"})
+
+    def execute_compensation() -> None:
+        second_started.set()
+        execute(actor="engine", reason="portfolio_exit_compensation:failed")
+
+    second = Thread(target=execute_compensation)
+    first.start()
+    assert first_stop_entered.wait(timeout=2.0)
+    second.start()
+    assert second_started.wait(timeout=2.0)
+
+    second_attempted = second_gate_attempted.wait(timeout=2.0)
+    overlapped = second_stop_entered.is_set()
+    calls_before_release = stop_calls
+    release_first_stop.set()
+    first.join(timeout=2.0)
+    second.join(timeout=2.0)
+    assert not first.is_alive()
+    assert not second.is_alive()
+    assert second_attempted
+    assert overlapped is False
+    assert calls_before_release == 1
+    assert second_stop_entered.is_set()
+    assert stop_calls == 2
+    assert len(errors) == 2
 
 
 def test_queued_compensation_failure_is_owned_by_submission_completion(
