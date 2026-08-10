@@ -170,6 +170,21 @@ class RithmicRuntimeOwners:
 
         return True, run_current_owner
 
+    def run_startup_balance_reconciliation(
+        self,
+        fallback: Callable[[], object],
+    ) -> object | None:
+        """Run generic balance startup unless the venue ledger owns it."""
+        if self.is_rithmic_runtime:
+            return None
+        return fallback()
+
+    def classify_startup_reconciliation(self, summary: Any) -> tuple[bool, bool]:
+        """Classify startup recovery without moving generic resume policy."""
+        if not self.is_rithmic_runtime:
+            return False, False
+        return True, bool(summary and summary.get("auto_resume_safe") is True)
+
     def execute_strategy_exit(
         self,
         signal: Signal,

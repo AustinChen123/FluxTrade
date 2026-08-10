@@ -519,7 +519,7 @@ class StrategyEngine:
                 return self._check_system_state()
 
         persisted_lockdown = run_phase(check_system_state)
-        run_phase(self._reconcile_balance)
+        run_phase(self._reconcile_startup_balance)
         run_phase(self._initialize_strategy_state_cache_on_startup)
         run_phase(self._start_strategy_state_subscriber_on_startup)
         reconciliation = run_phase(self._reconcile_recoverable_orders_on_startup)
@@ -527,21 +527,13 @@ class StrategyEngine:
 
         def apply_reconciliation_result() -> bool:
             lockdown = persisted_lockdown
-            rithmic_reconciliation_safe = isinstance(
-                self.execution_engine.adapter,
-                RithmicExchangeAdapter,
-            ) and bool(
-                reconciliation and reconciliation.get("auto_resume_safe") is True
-            )
+            (
+                rithmic_reconciliation_owned,
+                rithmic_reconciliation_safe,
+            ) = self._rithmic_runtime.classify_startup_reconciliation(reconciliation)
             if rithmic_reconciliation_safe and self._entry_admission_gate is not None:
                 self._entry_admission_gate.arm()
-            if (
-                isinstance(
-                    self.execution_engine.adapter,
-                    RithmicExchangeAdapter,
-                )
-                and not rithmic_reconciliation_safe
-            ):
+            if rithmic_reconciliation_owned and not rithmic_reconciliation_safe:
                 self._halt_for_kill_switch()
                 self._startup_lock_cause = "rithmic_reconciliation_blocked"
                 lockdown = True
@@ -2080,15 +2072,17 @@ class StrategyEngine:
                 ACTIVE_STRATEGIES.set(len(self.strategy_instances))
                 return True
 
-    def _reconcile_balance(self):
+    def _reconcile_startup_balance(self) -> object | None:
+        """Dispatch startup balance policy through the venue composition."""
+        return self._rithmic_runtime.run_startup_balance_reconciliation(
+            self._reconcile_balance
+        )
+
+    def _reconcile_balance(self) -> None:
         """
         Startup Reconciliation
         Force overwrite Redis balance from actual Exchange API.
         """
-        if isinstance(self.execution_engine.adapter, RithmicExchangeAdapter):
-            # Rithmic balance is published only from the verified ledger
-            # reconciliation later in startup.
-            return
         logger.info("💰 Reconciling Balance...")
         try:
             balance = self.account_service.get_balance()

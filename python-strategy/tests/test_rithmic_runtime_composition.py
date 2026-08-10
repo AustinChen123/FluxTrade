@@ -358,6 +358,68 @@ def test_runtime_reconciliation_selector_preserves_operation_exception() -> None
     generic_operation.assert_not_called()
 
 
+def test_startup_balance_dispatch_preserves_generic_result_and_call_count() -> None:
+    owners = RithmicRuntimeOwners(order_event_lifecycle=MagicMock())
+    result = object()
+    generic_reconciliation = MagicMock(return_value=result)
+
+    assert owners.run_startup_balance_reconciliation(generic_reconciliation) is result
+    generic_reconciliation.assert_called_once_with()
+
+
+def test_startup_balance_dispatch_defers_to_rithmic_ledger_owner() -> None:
+    owners = RithmicRuntimeOwners(
+        order_event_lifecycle=MagicMock(),
+        is_rithmic_runtime=True,
+    )
+    generic_reconciliation = MagicMock()
+
+    assert owners.run_startup_balance_reconciliation(generic_reconciliation) is None
+    generic_reconciliation.assert_not_called()
+
+
+@pytest.mark.parametrize(
+    ("is_rithmic_runtime", "summary", "expected"),
+    [
+        (False, {"auto_resume_safe": True}, (False, False)),
+        (True, None, (True, False)),
+        (True, {}, (True, False)),
+        (True, 0, (True, False)),
+        (True, "", (True, False)),
+        (True, [], (True, False)),
+        (True, {"other": True}, (True, False)),
+        (True, {"auto_resume_safe": False}, (True, False)),
+        (True, {"auto_resume_safe": 1}, (True, False)),
+        (True, {"auto_resume_safe": True}, (True, True)),
+    ],
+)
+def test_startup_reconciliation_classifier_preserves_owner_and_exact_safety(
+    is_rithmic_runtime: bool,
+    summary: object,
+    expected: tuple[bool, bool],
+) -> None:
+    owners = RithmicRuntimeOwners(
+        order_event_lifecycle=MagicMock(),
+        is_rithmic_runtime=is_rithmic_runtime,
+    )
+
+    assert owners.classify_startup_reconciliation(summary) == expected
+
+
+@pytest.mark.parametrize("summary", [1, "unsafe", ["unsafe"]])
+def test_startup_reconciliation_classifier_preserves_truthy_malformed_failure(
+    summary: object,
+) -> None:
+    owners = RithmicRuntimeOwners(
+        order_event_lifecycle=MagicMock(),
+        is_rithmic_runtime=True,
+    )
+    classify = owners.classify_startup_reconciliation
+
+    with pytest.raises(AttributeError):
+        classify(summary)
+
+
 @pytest.mark.parametrize(
     ("facade_method", "owner_method"),
     [
