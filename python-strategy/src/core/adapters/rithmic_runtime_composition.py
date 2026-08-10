@@ -155,6 +155,21 @@ class RithmicRuntimeOwners:
             raise RuntimeError("rithmic_runtime_reconciliation_unavailable")
         return self.runtime_recovery.run_once
 
+    def select_runtime_reconciliation(
+        self,
+        fallback: Callable[[], object],
+        run_exclusive: Callable[[Callable[[], object]], object],
+    ) -> tuple[bool, Callable[[], object]]:
+        """Select generic reconciliation or a dynamically resolved venue owner."""
+        if not self.is_rithmic_runtime:
+            return False, fallback
+
+        def run_current_owner() -> object:
+            operation = self.runtime_recovery_operation()
+            return run_exclusive(operation)
+
+        return True, run_current_owner
+
     def execute_strategy_exit(
         self,
         signal: Signal,

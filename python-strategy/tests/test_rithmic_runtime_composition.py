@@ -252,6 +252,112 @@ def test_runtime_handle_preserves_runtime_recovery_exception_identity() -> None:
     assert caught.value is error
 
 
+def test_runtime_reconciliation_selector_preserves_generic_operation_identity() -> None:
+    owners = RithmicRuntimeOwners(order_event_lifecycle=MagicMock())
+    generic_operation = MagicMock(return_value=True)
+    run_exclusive = MagicMock()
+
+    venue_owned, selected_operation = owners.select_runtime_reconciliation(
+        generic_operation,
+        run_exclusive,
+    )
+
+    assert venue_owned is False
+    assert selected_operation is generic_operation
+    run_exclusive.assert_not_called()
+
+
+def test_runtime_reconciliation_selector_resolves_current_owner_each_time() -> None:
+    owners = RithmicRuntimeOwners(
+        order_event_lifecycle=MagicMock(),
+        is_rithmic_runtime=True,
+    )
+    generic_operation = MagicMock(return_value=False)
+    events: list[str] = []
+
+    def run_exclusive(operation):
+        events.append("exclusive")
+        return operation()
+
+    venue_owned, selected_operation = owners.select_runtime_reconciliation(
+        generic_operation,
+        run_exclusive,
+    )
+
+    first_owner = MagicMock()
+    first_owner.run_once.side_effect = lambda: events.append("first") or True
+    owners.runtime_recovery = first_owner
+    assert selected_operation() is True
+
+    second_owner = MagicMock()
+    second_owner.run_once.side_effect = lambda: events.append("second") or False
+    owners.runtime_recovery = second_owner
+    assert selected_operation() is False
+
+    assert venue_owned is True
+    assert events == ["exclusive", "first", "exclusive", "second"]
+    generic_operation.assert_not_called()
+    first_owner.run_once.assert_called_once_with()
+    second_owner.run_once.assert_called_once_with()
+
+
+def test_runtime_reconciliation_selector_fails_closed_before_exclusion() -> None:
+    owners = RithmicRuntimeOwners(
+        order_event_lifecycle=MagicMock(),
+        is_rithmic_runtime=True,
+    )
+    generic_operation = MagicMock(return_value=True)
+    run_exclusive = MagicMock()
+
+    venue_owned, selected_operation = owners.select_runtime_reconciliation(
+        generic_operation,
+        run_exclusive,
+    )
+
+    assert venue_owned is True
+    with pytest.raises(
+        RuntimeError,
+        match="^rithmic_runtime_reconciliation_unavailable$",
+    ):
+        selected_operation()
+    generic_operation.assert_not_called()
+    run_exclusive.assert_not_called()
+
+
+def test_runtime_reconciliation_selector_preserves_operation_exception() -> None:
+    owners = RithmicRuntimeOwners(
+        order_event_lifecycle=MagicMock(),
+        is_rithmic_runtime=True,
+    )
+    generic_operation = MagicMock(return_value=True)
+    error = RuntimeError("recovery sentinel")
+    owner = MagicMock()
+    owner.run_once.side_effect = error
+    owners.runtime_recovery = owner
+    events: list[str] = []
+
+    def run_exclusive(operation):
+        events.extend(("enter:market", "enter:ops"))
+        try:
+            return operation()
+        finally:
+            events.extend(("exit:ops", "exit:market"))
+
+    venue_owned, selected_operation = owners.select_runtime_reconciliation(
+        generic_operation,
+        run_exclusive,
+    )
+
+    assert venue_owned is True
+    with pytest.raises(RuntimeError) as caught:
+        selected_operation()
+
+    assert caught.value is error
+    assert events == ["enter:market", "enter:ops", "exit:ops", "exit:market"]
+    owner.run_once.assert_called_once_with()
+    generic_operation.assert_not_called()
+
+
 @pytest.mark.parametrize(
     ("facade_method", "owner_method"),
     [

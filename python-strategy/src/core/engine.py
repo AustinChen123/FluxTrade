@@ -2277,14 +2277,16 @@ class StrategyEngine:
 
         def reconcile_loop():
             logger.info("Runtime reconciliation service started.")
-            is_rithmic = isinstance(
-                self.execution_engine.adapter,
-                RithmicExchangeAdapter,
+            venue_owned, run_reconciliation = (
+                self._rithmic_runtime.select_runtime_reconciliation(
+                    self.runtime_reconciliation_job.run_once,
+                    self._run_runtime_recovery_exclusive,
+                )
             )
             # Rithmic startup already completed an authoritative ledger
             # reconciliation. Avoid immediately tearing down and recreating
             # the freshly started ORDER session.
-            if is_rithmic and self._runtime_reconcile_stop.wait(interval):
+            if venue_owned and self._runtime_reconcile_stop.wait(interval):
                 return
             while self.running and not self._runtime_reconcile_stop.is_set():
                 try:
@@ -2292,10 +2294,7 @@ class StrategyEngine:
                 except Exception:
                     return
                 try:
-                    if is_rithmic:
-                        self._run_rithmic_runtime_reconciliation_once()
-                    else:
-                        self.runtime_reconciliation_job.run_once()
+                    run_reconciliation()
                 except Exception as e:
                     logger.error("Runtime reconciliation loop failed: %s", e)
                 try:
@@ -2311,14 +2310,13 @@ class StrategyEngine:
         )
         self.runtime_reconcile_thread.start()
 
-    def _run_rithmic_runtime_reconciliation_once(self) -> bool:
-        """Run the venue recovery owner under generic Engine exclusion locks."""
-        adapter = self.execution_engine.adapter
-        if not isinstance(adapter, RithmicExchangeAdapter):
-            raise RuntimeError("rithmic_runtime_reconciliation_adapter_mismatch")
-        run_runtime_recovery = self._rithmic_runtime.runtime_recovery_operation()
+    def _run_runtime_recovery_exclusive(
+        self,
+        operation: Callable[[], object],
+    ) -> object:
+        """Run one selected recovery operation under generic exclusion locks."""
         with self._market_processing_lock, self._ops_command_lock:
-            return run_runtime_recovery()
+            return operation()
 
     def _record_strategy_heartbeats(self, strategy_ids: list[str]) -> None:
         """Record strategy heartbeat state in HealthMonitor and DB."""

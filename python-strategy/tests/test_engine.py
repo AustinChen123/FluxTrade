@@ -4197,7 +4197,7 @@ class TestRuntimeReconciliationThread:
         self,
         engine,
     ):
-        engine.execution_engine.adapter = _rithmic_adapter_for_reconnect_test()
+        engine._rithmic_runtime.is_rithmic_runtime = True
         engine._runtime_reconcile_interval = 300.0
         engine._runtime_reconcile_stop = MagicMock()
         engine._runtime_reconcile_stop.is_set.return_value = False
@@ -4211,7 +4211,8 @@ class TestRuntimeReconciliationThread:
             return wait_count == 2
 
         engine._runtime_reconcile_stop.wait.side_effect = wait_for_interval
-        engine._run_rithmic_runtime_reconciliation_once = MagicMock(
+        engine._rithmic_runtime.runtime_recovery = MagicMock()
+        engine._rithmic_runtime.runtime_recovery.run_once = MagicMock(
             side_effect=lambda: events.append(("reconcile", None))
         )
 
@@ -4231,7 +4232,105 @@ class TestRuntimeReconciliationThread:
             ("reconcile", None),
             ("wait", 300.0),
         ]
-        engine._run_rithmic_runtime_reconciliation_once.assert_called_once_with()
+        engine._rithmic_runtime.runtime_recovery.run_once.assert_called_once_with()
+
+    def test_rithmic_runtime_reconciliation_stops_during_initial_defer(
+        self,
+        engine,
+    ):
+        engine._rithmic_runtime.is_rithmic_runtime = True
+        engine._runtime_reconcile_interval = 300.0
+        engine._runtime_reconcile_stop = MagicMock()
+        engine._runtime_reconcile_stop.wait.return_value = True
+        engine._assert_runtime_leadership = MagicMock()
+        engine.runtime_reconciliation_job.run_once = MagicMock()
+        engine._rithmic_runtime.runtime_recovery = MagicMock()
+
+        class ImmediateThread:
+            def __init__(self, *, target, daemon):
+                self.target = target
+
+            def start(self):
+                self.target()
+
+        with patch("src.core.engine.threading.Thread", ImmediateThread):
+            engine._start_runtime_reconciliation()
+
+        engine._runtime_reconcile_stop.wait.assert_called_once_with(300.0)
+        engine._assert_runtime_leadership.assert_not_called()
+        engine._rithmic_runtime.runtime_recovery.run_once.assert_not_called()
+        engine.runtime_reconciliation_job.run_once.assert_not_called()
+
+    def test_rithmic_runtime_reconciliation_retries_after_operation_failure(
+        self,
+        engine,
+    ):
+        engine._runtime_reconcile_interval = 300.0
+        engine._runtime_reconcile_stop = MagicMock()
+        engine._runtime_reconcile_stop.is_set.return_value = False
+        generic_operation = MagicMock(return_value=True)
+        engine.runtime_reconciliation_job.run_once = generic_operation
+        error = RuntimeError("recovery sentinel")
+        events: list[object] = []
+        operation_calls = 0
+        wait_calls = 0
+
+        def selected_operation():
+            nonlocal operation_calls
+            operation_calls += 1
+            events.append(("operation", operation_calls))
+            if operation_calls == 1:
+                raise error
+            return True
+
+        def wait_for_interval(interval):
+            nonlocal wait_calls
+            wait_calls += 1
+            events.append(("wait", interval))
+            return wait_calls == 3
+
+        engine._runtime_reconcile_stop.wait.side_effect = wait_for_interval
+        engine._assert_runtime_leadership = MagicMock(
+            side_effect=lambda: events.append("leadership")
+        )
+        engine._rithmic_runtime.select_runtime_reconciliation = MagicMock(
+            return_value=(True, selected_operation)
+        )
+
+        class ImmediateThread:
+            def __init__(self, *, target, daemon):
+                self.target = target
+
+            def start(self):
+                self.target()
+
+        with (
+            patch("src.core.engine.threading.Thread", ImmediateThread),
+            patch("src.core.engine.logger.error") as log_error,
+        ):
+            log_error.side_effect = lambda *args: events.append(("error", args))
+            engine._start_runtime_reconciliation()
+
+        assert events == [
+            ("wait", 300.0),
+            "leadership",
+            ("operation", 1),
+            (
+                "error",
+                ("Runtime reconciliation loop failed: %s", error),
+            ),
+            "leadership",
+            ("wait", 300.0),
+            "leadership",
+            ("operation", 2),
+            "leadership",
+            ("wait", 300.0),
+        ]
+        engine._rithmic_runtime.select_runtime_reconciliation.assert_called_once_with(
+            generic_operation,
+            engine._run_runtime_recovery_exclusive,
+        )
+        generic_operation.assert_not_called()
 
     def test_runtime_recovery_owner_runs_once_inside_market_then_ops_locks(
         self,
@@ -4250,16 +4349,21 @@ class TestRuntimeReconciliationThread:
             def __exit__(self, *_args):
                 events.append(f"exit:{self.name}")
 
-        adapter = _rithmic_adapter_for_reconnect_test()
         owner = MagicMock()
         owner.run_once.side_effect = lambda: events.append("owner") or True
-        engine.execution_engine.adapter = adapter
+        engine._rithmic_runtime.is_rithmic_runtime = True
         engine._rithmic_runtime.runtime_recovery = owner
         engine._market_processing_lock = ObservableLock("market")
         engine._ops_command_lock = ObservableLock("ops")
         engine.execution_engine.reconcile_rithmic_owned_orders = MagicMock()
 
-        assert engine._run_rithmic_runtime_reconciliation_once() is True
+        venue_owned, operation = engine._rithmic_runtime.select_runtime_reconciliation(
+            engine.runtime_reconciliation_job.run_once,
+            engine._run_runtime_recovery_exclusive,
+        )
+
+        assert venue_owned is True
+        assert operation() is True
 
         assert events == [
             "enter:market",
@@ -4271,34 +4375,33 @@ class TestRuntimeReconciliationThread:
         owner.run_once.assert_called_once_with()
         engine.execution_engine.reconcile_rithmic_owned_orders.assert_not_called()
 
-    def test_runtime_recovery_delegate_rejects_non_rithmic_adapter(self, engine):
-        owner = MagicMock()
-        engine._rithmic_runtime.runtime_recovery = owner
-
-        with pytest.raises(
-            RuntimeError,
-            match="rithmic_runtime_reconciliation_adapter_mismatch",
-        ):
-            engine._run_rithmic_runtime_reconciliation_once()
-
-        owner.run_once.assert_not_called()
-
     def test_runtime_recovery_delegate_fails_closed_without_owner(self, engine):
-        engine.execution_engine.adapter = _rithmic_adapter_for_reconnect_test()
+        engine._rithmic_runtime.is_rithmic_runtime = True
         engine._rithmic_runtime.runtime_recovery = None
         engine.execution_engine.reconcile_rithmic_owned_orders = MagicMock()
         engine._market_processing_lock = MagicMock()
         engine._ops_command_lock = MagicMock()
 
+        venue_owned, operation = engine._rithmic_runtime.select_runtime_reconciliation(
+            engine.runtime_reconciliation_job.run_once,
+            engine._run_runtime_recovery_exclusive,
+        )
+
+        assert venue_owned is True
         with pytest.raises(
             RuntimeError,
             match="rithmic_runtime_reconciliation_unavailable",
         ):
-            engine._run_rithmic_runtime_reconciliation_once()
+            operation()
 
         engine.execution_engine.reconcile_rithmic_owned_orders.assert_not_called()
         engine._market_processing_lock.__enter__.assert_not_called()
         engine._ops_command_lock.__enter__.assert_not_called()
+
+    def test_legacy_rithmic_runtime_reconciliation_seam_is_absent(self):
+        legacy_name = "_run_rithmic_runtime_" + "reconciliation_once"
+
+        assert not hasattr(StrategyEngine, legacy_name)
 
     @pytest.mark.parametrize("still_alive", (False, True))
     def test_stop_order_event_stream_is_bounded_and_reports_completion(
@@ -4399,7 +4502,7 @@ class TestRuntimeReconciliationThread:
         engine._lockdown_for_rithmic_order_drift = MagicMock()
         _install_rithmic_runtime_recovery_service(engine, adapter)
 
-        assert engine._run_rithmic_runtime_reconciliation_once() is True
+        assert _run_selected_rithmic_runtime_recovery(engine) is True
 
         engine.execution_engine.halt_for_reconcile.assert_called_once_with(timeout=30.0)
         engine.execution_engine.reconcile_rithmic_owned_orders.assert_called_once_with(
@@ -4444,7 +4547,7 @@ class TestRuntimeReconciliationThread:
         _install_rithmic_runtime_recovery_service(engine, adapter)
 
         with pytest.raises(RuntimeError, match="leadership lost"):
-            engine._run_rithmic_runtime_reconciliation_once()
+            _run_selected_rithmic_runtime_recovery(engine)
 
         engine._start_exchange_order_event_stream.assert_not_called()
         engine.execution_engine.resume_after_reconcile.assert_not_called()
@@ -4476,7 +4579,8 @@ class TestRuntimeReconciliationThread:
 
         engine.execution_engine.reconcile_rithmic_owned_orders = reconcile
         reconcile_thread = threading.Thread(
-            target=engine._run_rithmic_runtime_reconciliation_once
+            target=_run_selected_rithmic_runtime_recovery,
+            args=(engine,),
         )
         reconcile_thread.start()
         assert reconcile_started.wait(timeout=5.0)
@@ -4558,7 +4662,8 @@ class TestRuntimeReconciliationThread:
         )
         reconcile_thread = threading.Thread(
             name="periodic-reconcile",
-            target=engine._run_rithmic_runtime_reconciliation_once,
+            target=_run_selected_rithmic_runtime_recovery,
+            args=(engine,),
         )
         kill_thread = threading.Thread(
             name="kill-switch",
@@ -4623,7 +4728,7 @@ class TestRuntimeReconciliationThread:
         engine._lockdown_for_rithmic_order_drift = MagicMock()
         _install_rithmic_runtime_recovery_service(engine, adapter)
 
-        assert engine._run_rithmic_runtime_reconciliation_once() is False
+        assert _run_selected_rithmic_runtime_recovery(engine) is False
 
         engine._start_exchange_order_event_stream.assert_called_once_with()
         engine.execution_engine.resume_after_reconcile.assert_not_called()
@@ -5411,8 +5516,20 @@ def _install_rithmic_runtime_recovery_service(
         lockdown=lambda reason: engine._lockdown_for_rithmic_order_drift(reason),
         logger=logging.getLogger("test.rithmic_runtime_recovery"),
     )
+    engine._rithmic_runtime.is_rithmic_runtime = True
     engine._rithmic_runtime.runtime_recovery = service
     return service
+
+
+def _run_selected_rithmic_runtime_recovery(engine: StrategyEngine) -> bool:
+    venue_owned, operation = engine._rithmic_runtime.select_runtime_reconciliation(
+        engine.runtime_reconciliation_job.run_once,
+        engine._run_runtime_recovery_exclusive,
+    )
+    assert venue_owned is True
+    result = operation()
+    assert isinstance(result, bool)
+    return result
 
 
 def _install_rithmic_strategy_exit_service(
