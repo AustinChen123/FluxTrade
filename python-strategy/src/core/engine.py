@@ -58,34 +58,11 @@ from src.core.adapters import (
     SimulatedAdapter,
     create_adapter,
 )
-from src.core.adapters.rithmic_emergency_flatten import (
-    RithmicEmergencyFlattenService,
+from src.core.adapters.rithmic_runtime_composition import (
+    RithmicRuntimeCallbacks,
+    build_rithmic_portfolio_exit_owner,
+    build_rithmic_runtime_owners,
 )
-from src.core.adapters.rithmic_external_order_drift import (
-    RithmicExternalOrderDriftService,
-)
-from src.core.adapters.rithmic_portfolio_exit import (
-    RithmicPortfolioExitService,
-)
-from src.core.adapters.rithmic_ledger_recovery import (
-    RithmicLedgerRecoveryService,
-)
-from src.core.adapters.rithmic_kill_switch_clear import (
-    RithmicKillSwitchClearPreparationService,
-)
-from src.core.adapters.rithmic_order_reconnect import (
-    RithmicOrderReconnectService,
-)
-from src.core.adapters.rithmic_order_event_lifecycle import (
-    RithmicOrderEventLifecycleGate,
-)
-from src.core.adapters.rithmic_order_event_stream import (
-    RithmicOrderEventStreamService,
-)
-from src.core.adapters.rithmic_runtime_recovery import (
-    RithmicRuntimeRecoveryService,
-)
-from src.core.adapters.rithmic_strategy_exit import RithmicStrategyExitService
 from src.core.journal import StrategyJournal
 from src.core.redis_factory import create_redis_client
 from src.core.metrics import SIGNALS_TOTAL, ACTIVE_STRATEGIES, BALANCE_USDT
@@ -381,129 +358,6 @@ class StrategyEngine:
         self._rithmic_recovery_account_id = (
             self.execution_engine.order_manager.rithmic_account_id
         )
-        self._rithmic_ledger_recovery = (
-            RithmicLedgerRecoveryService(
-                profile=self._rithmic_recovery_profile or "",
-                account_id=self._rithmic_recovery_account_id,
-                reconcile_owned_orders=lambda profile, account_id: (
-                    self.execution_engine.reconcile_rithmic_owned_orders(
-                        profile,
-                        account_id,
-                    )
-                ),
-                now_seconds=lambda: self.execution_engine.clock.now(),
-                publish_authoritative_balance=lambda **values: (
-                    self.account_service.replace_authoritative_balance(**values)
-                ),
-                logger=logger,
-            )
-            if self._rithmic_recovery_profile
-            else None
-        )
-        self._rithmic_order_reconnect = (
-            RithmicOrderReconnectService(
-                adapter=adapter,
-                profile=self._rithmic_recovery_profile or "",
-                account_id=self._rithmic_recovery_account_id,
-                audit_external_orders=lambda: (
-                    self.execution_engine.audit_external_orders
-                ),
-                reconcile_owned_orders=lambda profile, account_id: (
-                    self.execution_engine.reconcile_rithmic_owned_orders(
-                        profile,
-                        account_id,
-                    )
-                ),
-                publish_authoritative_summary=(
-                    self._rithmic_ledger_recovery.publish_authoritative_summary
-                ),
-                halt_for_reconcile=lambda **values: (
-                    self.execution_engine.halt_for_reconcile(**values)
-                ),
-                resume_after_reconcile=lambda: (
-                    self.execution_engine.resume_after_reconcile()
-                ),
-                assert_runtime_leadership=self._assert_runtime_leadership,
-                logger=logger,
-            )
-            if isinstance(adapter, RithmicExchangeAdapter)
-            and self._rithmic_ledger_recovery is not None
-            else None
-        )
-        self._rithmic_runtime_recovery = (
-            RithmicRuntimeRecoveryService(
-                adapter=adapter,
-                profile=self._rithmic_recovery_profile or "",
-                account_id=self._rithmic_recovery_account_id,
-                halt_for_reconcile=lambda **values: (
-                    self.execution_engine.halt_for_reconcile(**values)
-                ),
-                stop_order_event_stream=lambda **values: (
-                    self._stop_exchange_order_event_stream(**values)
-                ),
-                reconcile_owned_orders=lambda profile, account_id: (
-                    self.execution_engine.reconcile_rithmic_owned_orders(
-                        profile,
-                        account_id,
-                    )
-                ),
-                publish_authoritative_summary=(
-                    self._rithmic_ledger_recovery.publish_authoritative_summary
-                ),
-                assert_runtime_leadership=self._assert_runtime_leadership,
-                start_order_event_stream=self._start_exchange_order_event_stream,
-                resume_after_reconcile=lambda: (
-                    self.execution_engine.resume_after_reconcile()
-                ),
-                lockdown=self._lockdown_for_rithmic_order_drift,
-                logger=logger,
-            )
-            if isinstance(adapter, RithmicExchangeAdapter)
-            and self._rithmic_ledger_recovery is not None
-            else None
-        )
-        self._rithmic_order_event_lifecycle = RithmicOrderEventLifecycleGate()
-        self._rithmic_external_order_drift = (
-            RithmicExternalOrderDriftService(
-                halt_submissions=self._halt_for_kill_switch,
-                clear_local_halt=self._clear_local_kill_switch_halt,
-                persist_lockdown_state=lambda reason: (
-                    self.ops_safety.persist_kill_switch_state(
-                        SYSTEM_STATE_LOCKDOWN,
-                        actor="rithmic_order_stream",
-                        reason=reason,
-                    )
-                ),
-                persist_redis_lockdown=lambda: self.redis_client.set(
-                    self._system_state_key,
-                    SYSTEM_STATE_LOCKDOWN,
-                ),
-                assert_runtime_leadership=self._assert_runtime_leadership,
-                resume_after_reconcile=lambda: (
-                    self.execution_engine.resume_after_reconcile()
-                ),
-                logger=logger,
-            )
-            if isinstance(adapter, RithmicExchangeAdapter)
-            else None
-        )
-        self._rithmic_strategy_exit = (
-            RithmicStrategyExitService(
-                adapter=adapter,
-                execution_engine=self.execution_engine,
-                account_service=self.account_service,
-                profile=self._rithmic_recovery_profile or "",
-                account_id=self._rithmic_recovery_account_id,
-                operation_gate=self._rithmic_order_event_lifecycle,
-                stop_order_event_stream=self._stop_exchange_order_event_stream,
-                assert_leadership=self._assert_runtime_leadership,
-                restart_order_stream=self._start_exchange_order_event_stream,
-                lockdown=self._lockdown_for_rithmic_order_drift,
-                logger=logger,
-            )
-            if isinstance(adapter, RithmicExchangeAdapter)
-            else None
-        )
         self._lifecycle_adapter = _EngineLifecycleAdapter(self)
         self._health_monitor = HealthMonitor(self._registry)
         self._command_router = CommandRouter(
@@ -536,15 +390,25 @@ class StrategyEngine:
         )
         self.order_event_thread = None
         self._order_event_stop = threading.Event()
-        self._rithmic_order_event_stream = (
-            RithmicOrderEventStreamService(
-                adapter=adapter,
-                stop_event=self._order_event_stop,
+        rithmic_runtime = build_rithmic_runtime_owners(
+            adapter=adapter,
+            profile=self._rithmic_recovery_profile,
+            account_id=self._rithmic_recovery_account_id,
+            execution_engine=self.execution_engine,
+            account_service=self.account_service,
+            ops_safety=self.ops_safety,
+            stop_event=self._order_event_stop,
+            callbacks=RithmicRuntimeCallbacks(
                 is_running=lambda: self.running,
                 publish_worker=lambda worker: setattr(
                     self,
                     "order_event_thread",
                     worker,
+                ),
+                on_runtime_started=lambda: (
+                    self._rithmic_order_reconnect.on_runtime_started()
+                    if self._rithmic_order_reconnect is not None
+                    else None
                 ),
                 reconcile_if_needed=lambda: (
                     self._reconcile_owned_orders_on_reconnect()
@@ -552,73 +416,48 @@ class StrategyEngine:
                 process_event=lambda event: (
                     self.execution_engine.process_exchange_order_event(event)
                 ),
-                lockdown=lambda reason: self._lockdown_for_rithmic_order_drift(reason),
-                assert_runtime_leadership=lambda: self._assert_runtime_leadership(),
+                lockdown=lambda reason: (
+                    self._lockdown_for_rithmic_order_drift(reason)
+                ),
+                assert_runtime_leadership=lambda: (self._assert_runtime_leadership()),
                 halt_submissions=lambda: self._halt_for_kill_switch(),
-                on_runtime_started=lambda: (
-                    self._rithmic_order_reconnect.on_runtime_started()
-                    if self._rithmic_order_reconnect is not None
-                    else None
-                ),
-                logger=logger,
-            )
-            if isinstance(adapter, RithmicExchangeAdapter)
-            else None
-        )
-        self._rithmic_kill_switch_clear_preparation = (
-            RithmicKillSwitchClearPreparationService(
-                adapter=adapter,
-                profile=self._rithmic_recovery_profile or "",
-                account_id=self._rithmic_recovery_account_id,
-                operation_gate=self._rithmic_order_event_lifecycle,
-                set_order_event_stop=self._order_event_stop.set,
-                clear_order_event_stop=self._order_event_stop.clear,
-                current_order_event_thread=lambda: self.order_event_thread,
-                halt_for_reconcile=lambda **values: (
-                    self.execution_engine.halt_for_reconcile(**values)
-                ),
-                reconcile_owned_orders=lambda profile, account_id: (
-                    self.execution_engine.reconcile_rithmic_owned_orders(
-                        profile,
-                        account_id,
+                clear_local_halt=lambda: self._clear_local_kill_switch_halt(),
+                persist_lockdown_state=lambda reason: (
+                    self.ops_safety.persist_kill_switch_state(
+                        SYSTEM_STATE_LOCKDOWN,
+                        actor="rithmic_order_stream",
+                        reason=reason,
                     )
                 ),
-                publish_authoritative_summary=(
-                    self._apply_rithmic_authoritative_account_summary
+                persist_redis_lockdown=lambda: self.redis_client.set(
+                    self._system_state_key,
+                    SYSTEM_STATE_LOCKDOWN,
                 ),
-                current_drift_generation=(
-                    self._current_rithmic_external_order_drift_generation
+                stop_order_event_stream=lambda **values: (
+                    self._stop_exchange_order_event_stream(**values)
                 ),
-                assert_runtime_leadership=self._assert_runtime_leadership,
-                start_order_event_stream=self._start_exchange_order_event_stream,
-                resume_after_reconcile=lambda: (
-                    self.execution_engine.resume_after_reconcile()
+                start_order_event_stream=lambda: (
+                    self._start_exchange_order_event_stream()
                 ),
-                logger=logger,
-            )
-            if isinstance(adapter, RithmicExchangeAdapter)
-            else None
+                current_order_event_thread=lambda: self.order_event_thread,
+                publish_authoritative_summary=lambda summary: (
+                    self._apply_rithmic_authoritative_account_summary(summary)
+                ),
+            ),
+            logger=logger,
         )
-        self._rithmic_emergency_flatten = (
-            RithmicEmergencyFlattenService(
-                adapter=adapter,
-                execution_engine=self.execution_engine,
-                account_service=self.account_service,
-                ops_safety=self.ops_safety,
-                profile=self._rithmic_recovery_profile or "",
-                account_id=self._rithmic_recovery_account_id,
-                operation_gate=self._rithmic_order_event_lifecycle,
-                stop_current_worker=self._stop_exchange_order_event_stream,
-                clear_polling_stop=self._order_event_stop.clear,
-                restart_generic_worker=self._start_exchange_order_event_stream,
-                run_when_submissions_drained=(
-                    self.execution_engine.run_when_submissions_drained
-                ),
-                logger=logger,
-            )
-            if isinstance(adapter, RithmicExchangeAdapter)
-            else None
+        self._rithmic_ledger_recovery = rithmic_runtime.ledger_recovery
+        self._rithmic_order_reconnect = rithmic_runtime.order_reconnect
+        self._rithmic_runtime_recovery = rithmic_runtime.runtime_recovery
+        self._rithmic_order_event_lifecycle = rithmic_runtime.order_event_lifecycle
+        self._rithmic_external_order_drift = rithmic_runtime.external_order_drift
+        self._rithmic_strategy_exit = rithmic_runtime.strategy_exit
+        self._rithmic_order_event_stream = rithmic_runtime.order_event_stream
+        self._rithmic_kill_switch_clear_preparation = (
+            rithmic_runtime.kill_switch_clear_preparation
         )
+        self._rithmic_emergency_flatten = rithmic_runtime.emergency_flatten
+        self._rithmic_portfolio_exit_factory = rithmic_runtime.portfolio_exit_factory
         self.runtime_reconciliation_job = RuntimeReconciliationJob(
             account_service=self.account_service,
             adapter=adapter,
@@ -2793,24 +2632,27 @@ class StrategyEngine:
             raise RuntimeError("rithmic_portfolio_exit_account_identity_missing")
         if self._rithmic_emergency_flatten is None:
             raise RuntimeError("rithmic_emergency_flatten_unavailable")
-        return RithmicPortfolioExitService(
-            adapter=adapter,
-            execution_engine=self.execution_engine,
-            account_service=self.account_service,
-            profile=profile,
-            account_id=account_id,
-            operation_gate=self._rithmic_order_event_lifecycle,
-            stop_order_event_stream=self._stop_exchange_order_event_stream,
-            assert_leadership=self._assert_runtime_leadership,
-            restart_order_stream=self._start_exchange_order_event_stream,
-            lockdown=self._lockdown_for_rithmic_order_drift,
-            schedule_emergency_flatten=(
-                self._rithmic_emergency_flatten.schedule_portfolio_exit_compensation
-            ),
-            portfolio_id_for_sleeve=(
-                self._portfolio_coordinator.portfolio_id_for_sleeve
-            ),
-        ).execute(signal, decision, candle)
+        portfolio_id_for_sleeve = self._portfolio_coordinator.portfolio_id_for_sleeve
+        if self._rithmic_portfolio_exit_factory is None:
+            owner = build_rithmic_portfolio_exit_owner(
+                adapter=adapter,
+                execution_engine=self.execution_engine,
+                account_service=self.account_service,
+                profile=profile,
+                account_id=account_id,
+                operation_gate=self._rithmic_order_event_lifecycle,
+                stop_order_event_stream=self._stop_exchange_order_event_stream,
+                assert_leadership=self._assert_runtime_leadership,
+                restart_order_stream=self._start_exchange_order_event_stream,
+                lockdown=self._lockdown_for_rithmic_order_drift,
+                schedule_emergency_flatten=(
+                    self._rithmic_emergency_flatten.schedule_portfolio_exit_compensation
+                ),
+                portfolio_id_for_sleeve=portfolio_id_for_sleeve,
+            )
+        else:
+            owner = self._rithmic_portfolio_exit_factory(portfolio_id_for_sleeve)
+        return owner.execute(signal, decision, candle)
 
     def shutdown(
         self,

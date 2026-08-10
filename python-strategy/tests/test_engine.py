@@ -54,6 +54,7 @@ from src.core.adapters.rithmic_order_event_lifecycle import (
 from src.core.adapters.rithmic_order_event_stream import (
     RithmicOrderEventStreamService,
 )
+from src.core.adapters.rithmic_runtime_composition import RithmicRuntimeOwners
 from src.core.adapters.rithmic_runtime_recovery import (
     RithmicRuntimeRecoveryService,
 )
@@ -183,6 +184,46 @@ def _attach_rithmic_ledger_recovery(engine) -> None:
 
 
 class TestEngineInit:
+    def test_engine_delegates_rithmic_owner_graph_construction_once(
+        self,
+        engine_factory,
+    ):
+        lifecycle = RithmicOrderEventLifecycleGate()
+        owners = RithmicRuntimeOwners(order_event_lifecycle=lifecycle)
+
+        with patch(
+            "src.core.engine.build_rithmic_runtime_owners",
+            return_value=owners,
+        ) as build:
+            engine = engine_factory()
+
+        build.assert_called_once()
+        build_kwargs = build.call_args.kwargs
+        assert build_kwargs["adapter"] is engine.execution_engine.adapter
+        assert build_kwargs["execution_engine"] is engine.execution_engine
+        assert build_kwargs["account_service"] is engine.account_service
+        assert build_kwargs["ops_safety"] is engine.ops_safety
+        assert build_kwargs["stop_event"] is engine._order_event_stop
+        callbacks = build_kwargs["callbacks"]
+        replacement_stop = MagicMock(return_value=True)
+        replacement_start = MagicMock()
+        engine._stop_exchange_order_event_stream = replacement_stop
+        engine._start_exchange_order_event_stream = replacement_start
+        assert callbacks.stop_order_event_stream(timeout=30.0)
+        callbacks.start_order_event_stream()
+        replacement_stop.assert_called_once_with(timeout=30.0)
+        replacement_start.assert_called_once_with()
+        assert engine._rithmic_order_event_lifecycle is lifecycle
+        assert engine._rithmic_ledger_recovery is None
+        assert engine._rithmic_order_reconnect is None
+        assert engine._rithmic_runtime_recovery is None
+        assert engine._rithmic_external_order_drift is None
+        assert engine._rithmic_strategy_exit is None
+        assert engine._rithmic_order_event_stream is None
+        assert engine._rithmic_kill_switch_clear_preparation is None
+        assert engine._rithmic_emergency_flatten is None
+        assert engine._rithmic_portfolio_exit_factory is None
+
     def test_rithmic_engine_constructs_order_reconnect_owner(self, engine_factory):
         adapter = _rithmic_adapter_for_reconnect_test()
 
