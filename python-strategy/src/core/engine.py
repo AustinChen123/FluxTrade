@@ -674,9 +674,7 @@ class StrategyEngine:
                 operation_id=operation_id,
             )
 
-        if self._rithmic_runtime.emergency_flatten is None:
-            raise RuntimeError("rithmic_emergency_flatten_unavailable")
-        return self._rithmic_runtime.emergency_flatten.execute(
+        return self._rithmic_runtime.execute_emergency_flatten(
             actor=actor,
             reason=reason,
             operation_id=operation_id,
@@ -2588,9 +2586,7 @@ class StrategyEngine:
         adapter = self.execution_engine.adapter
         if not isinstance(adapter, RithmicExchangeAdapter):
             raise RuntimeError("authoritative_strategy_exit_requires_rithmic")
-        if self._rithmic_runtime.strategy_exit is None:
-            raise RuntimeError("rithmic_strategy_exit_unavailable")
-        return self._rithmic_runtime.strategy_exit.execute(signal, decision)
+        return self._rithmic_runtime.execute_strategy_exit(signal, decision)
 
     def _run_rithmic_portfolio_exit(
         self,

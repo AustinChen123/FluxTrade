@@ -273,6 +273,126 @@ def test_runtime_handle_preserves_reconnect_exception_identity(
     assert caught.value is error
 
 
+def test_runtime_handle_routes_execution_dispatch_to_current_owners() -> None:
+    owners = RithmicRuntimeOwners(order_event_lifecycle=MagicMock())
+    signal = MagicMock()
+    decision = MagicMock()
+    first_exit = MagicMock()
+    first_exit_result = {"status": "first"}
+    first_exit.execute.return_value = first_exit_result
+    first_flatten = MagicMock()
+    first_flatten_result = {"status": "flattened"}
+    first_flatten.execute.return_value = first_flatten_result
+    owners.strategy_exit = first_exit
+    owners.emergency_flatten = first_flatten
+
+    assert owners.execute_strategy_exit(signal, decision) is first_exit_result
+    assert (
+        owners.execute_emergency_flatten(
+            actor="ops",
+            reason="drill",
+            operation_id="operation-1",
+        )
+        is first_flatten_result
+    )
+    first_exit.execute.assert_called_once_with(signal, decision)
+    first_flatten.execute.assert_called_once_with(
+        actor="ops",
+        reason="drill",
+        operation_id="operation-1",
+    )
+
+    second_exit = MagicMock()
+    second_exit_result = {"status": "second"}
+    second_exit.execute.return_value = second_exit_result
+    second_flatten = MagicMock()
+    second_flatten_result = {"status": "flat-again"}
+    second_flatten.execute.return_value = second_flatten_result
+    owners.strategy_exit = second_exit
+    owners.emergency_flatten = second_flatten
+
+    assert owners.execute_strategy_exit(signal, decision) is second_exit_result
+    assert (
+        owners.execute_emergency_flatten(actor="ops", reason=None)
+        is second_flatten_result
+    )
+    first_exit.execute.assert_called_once_with(signal, decision)
+    first_flatten.execute.assert_called_once()
+    second_exit.execute.assert_called_once_with(signal, decision)
+    second_flatten.execute.assert_called_once_with(
+        actor="ops",
+        reason=None,
+        operation_id=None,
+    )
+
+
+@pytest.mark.parametrize(
+    ("facade_method", "args", "kwargs", "message"),
+    [
+        (
+            "execute_strategy_exit",
+            (MagicMock(), MagicMock()),
+            {},
+            "rithmic_strategy_exit_unavailable",
+        ),
+        (
+            "execute_emergency_flatten",
+            (),
+            {"actor": "ops", "reason": None},
+            "rithmic_emergency_flatten_unavailable",
+        ),
+    ],
+)
+def test_runtime_handle_rejects_missing_execution_dispatch_owner(
+    facade_method: str,
+    args: tuple[object, ...],
+    kwargs: dict[str, object],
+    message: str,
+) -> None:
+    owners = RithmicRuntimeOwners(order_event_lifecycle=MagicMock())
+
+    with pytest.raises(RuntimeError, match=f"^{message}$"):
+        getattr(owners, facade_method)(*args, **kwargs)
+
+
+@pytest.mark.parametrize(
+    ("owner_attr", "owner_method", "facade_method", "args", "kwargs"),
+    [
+        (
+            "strategy_exit",
+            "execute",
+            "execute_strategy_exit",
+            (MagicMock(), MagicMock()),
+            {},
+        ),
+        (
+            "emergency_flatten",
+            "execute",
+            "execute_emergency_flatten",
+            (),
+            {"actor": "ops", "reason": "drill"},
+        ),
+    ],
+)
+def test_runtime_handle_preserves_execution_dispatch_exception_identity(
+    owner_attr: str,
+    owner_method: str,
+    facade_method: str,
+    args: tuple[object, ...],
+    kwargs: dict[str, object],
+) -> None:
+    owners = RithmicRuntimeOwners(order_event_lifecycle=MagicMock())
+    owner = MagicMock()
+    error = RuntimeError(owner_method)
+    getattr(owner, owner_method).side_effect = error
+    setattr(owners, owner_attr, owner)
+
+    with pytest.raises(RuntimeError) as caught:
+        getattr(owners, facade_method)(*args, **kwargs)
+
+    assert caught.value is error
+
+
 def test_rithmic_composition_builds_the_complete_shared_owner_graph() -> None:
     adapter = RithmicExchangeAdapter(
         profile="test",

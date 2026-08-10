@@ -5571,6 +5571,47 @@ def test_rithmic_strategy_exit_engine_seam_delegates_exactly_once(engine):
     )
 
 
+def test_rithmic_strategy_exit_engine_seam_uses_runtime_facade(engine):
+    adapter = _rithmic_adapter_for_reconnect_test()
+    engine.execution_engine.adapter = adapter
+    result = {"status": "verified_flat"}
+    engine._rithmic_runtime.execute_strategy_exit = MagicMock(return_value=result)
+    engine._rithmic_runtime.strategy_exit = MagicMock()
+    signal = Signal(
+        strategy_id="strategy",
+        product_id="RITHMIC:NQ-202609",
+        timeframe="1m",
+        timestamp=1_700_000_000_000,
+        type=SignalType.EXIT_LONG,
+        quantity=Decimal("1"),
+    )
+    decision = ExitDecision(
+        allowed=True,
+        reason="position_matched",
+        quantity=Decimal("1"),
+        position_quantity=Decimal("1"),
+    )
+
+    assert engine._run_rithmic_strategy_exit(signal, decision) is result
+
+    engine._rithmic_runtime.execute_strategy_exit.assert_called_once_with(
+        signal, decision
+    )
+    engine._rithmic_runtime.strategy_exit.execute.assert_not_called()
+
+
+def test_non_rithmic_strategy_exit_rejects_before_runtime_facade(engine):
+    engine._rithmic_runtime.execute_strategy_exit = MagicMock()
+
+    with pytest.raises(
+        RuntimeError,
+        match="^authoritative_strategy_exit_requires_rithmic$",
+    ):
+        engine._run_rithmic_strategy_exit(MagicMock(), MagicMock())
+
+    engine._rithmic_runtime.execute_strategy_exit.assert_not_called()
+
+
 def test_strategy_exit_owner_stops_current_replacement_thread(engine):
     adapter = _rithmic_adapter_for_reconnect_test()
     engine.execution_engine.adapter = adapter
@@ -6363,6 +6404,7 @@ def test_rithmic_strategy_exit_blocks_when_remote_order_remains_working(engine):
 @pytest.mark.parametrize("operation_id", [None, "operation-1"])
 def test_non_rithmic_kill_switch_keeps_generic_ops_dispatch(engine, operation_id):
     engine.ops_safety.kill_switch = MagicMock(return_value=_kill_switch_result())
+    engine._rithmic_runtime.execute_emergency_flatten = MagicMock()
 
     result = engine._run_ops_kill_switch(
         actor="ops",
@@ -6374,6 +6416,7 @@ def test_non_rithmic_kill_switch_keeps_generic_ops_dispatch(engine, operation_id
     if operation_id is not None:
         expected["operation_id"] = operation_id
     engine.ops_safety.kill_switch.assert_called_once_with(**expected)
+    engine._rithmic_runtime.execute_emergency_flatten.assert_not_called()
     assert result == _kill_switch_result()
 
 
@@ -6397,6 +6440,30 @@ def test_rithmic_kill_switch_delegates_exactly_once_to_venue_owner(engine):
         reason="drill",
         operation_id="operation-1",
     )
+    engine.ops_safety.kill_switch.assert_not_called()
+
+
+def test_rithmic_kill_switch_uses_runtime_execution_facade(engine):
+    adapter = _rithmic_adapter_for_reconnect_test()
+    engine.execution_engine.adapter = adapter
+    expected = _kill_switch_result(authoritative_flatten_verified=True)
+    engine._rithmic_runtime.execute_emergency_flatten = MagicMock(return_value=expected)
+    engine._rithmic_runtime.emergency_flatten = MagicMock()
+    engine.ops_safety.kill_switch = MagicMock()
+
+    result = engine._run_ops_kill_switch(
+        actor="ops",
+        reason="drill",
+        operation_id="operation-1",
+    )
+
+    assert result is expected
+    engine._rithmic_runtime.execute_emergency_flatten.assert_called_once_with(
+        actor="ops",
+        reason="drill",
+        operation_id="operation-1",
+    )
+    engine._rithmic_runtime.emergency_flatten.execute.assert_not_called()
     engine.ops_safety.kill_switch.assert_not_called()
 
 

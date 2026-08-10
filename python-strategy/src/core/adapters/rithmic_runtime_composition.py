@@ -35,9 +35,10 @@ from src.core.adapters.rithmic_runtime_recovery import (
     RithmicRuntimeRecoveryService,
 )
 from src.core.adapters.rithmic_strategy_exit import RithmicStrategyExitService
-from src.core.execution import ExecutionEngine
+from src.core.execution import ExecutionEngine, ExitDecision
 from src.core.interfaces import IExchangeAdapter
 from src.core.interfaces.exchange import ExchangeOrderEvent
+from src.core.models import Signal
 from src.core.ops_safety import OpsSafetyService
 from src.core.risk_manager import AccountService
 
@@ -150,6 +151,32 @@ class RithmicRuntimeOwners:
         if self.runtime_recovery is None:
             raise RuntimeError("rithmic_runtime_reconciliation_unavailable")
         return self.runtime_recovery.run_once
+
+    def execute_strategy_exit(
+        self,
+        signal: Signal,
+        decision: ExitDecision,
+    ) -> dict[str, object]:
+        """Dispatch one authoritative strategy exit to the current owner."""
+        if self.strategy_exit is None:
+            raise RuntimeError("rithmic_strategy_exit_unavailable")
+        return self.strategy_exit.execute(signal, decision)
+
+    def execute_emergency_flatten(
+        self,
+        *,
+        actor: str,
+        reason: str | None,
+        operation_id: str | None = None,
+    ) -> dict[str, Any]:
+        """Dispatch emergency flatten to the current venue owner."""
+        if self.emergency_flatten is None:
+            raise RuntimeError("rithmic_emergency_flatten_unavailable")
+        return self.emergency_flatten.execute(
+            actor=actor,
+            reason=reason,
+            operation_id=operation_id,
+        )
 
 
 def build_rithmic_portfolio_exit_owner(
