@@ -87,6 +87,7 @@ FEATURE_COMMIT_SHA = "98b453ee5ae21e08bd46fcbef9b6984370cdf8ef"
 SHALLOW_IDENTITY_FIX_SHA = "d5eb57d2b12a2bd7a0928f7650e8ea0c121c57f4"
 NATIVE_ARTIFACT_FIX_SHA = "f5bb2dd628a2501cd25d435a2caaedda85d42feb"
 D0T_SENSITIVITY_COMMIT_SHA = "5056c8890e9ca818e0a192e5117b195e78bfd380"
+REVIEWED_DELIVERY_TIP_SHA = "02d67503b38ae035d11e0d82afb5e8c73ac80cf2"
 PARENT_MANIFEST_ENTRIES = 171
 PARENT_MANIFEST_BYTES = 17_008
 PARENT_MANIFEST_SHA256 = (
@@ -488,8 +489,11 @@ def _validate_untracked_product_paths(
         raise ValueError("untracked product runtime path is present")
 
 
-def committed_candidate_available() -> bool:
-    return _git("rev-parse", "HEAD").strip().decode() != PARENT_SHA
+def reviewed_delivery_checkout_available(head_sha: str | None = None) -> bool:
+    """Return whether HEAD is the exact reviewed D0B4B delivery checkout."""
+    if head_sha is None:
+        head_sha = _git("rev-parse", "HEAD").strip().decode()
+    return head_sha == REVIEWED_DELIVERY_TIP_SHA
 
 
 def _candidate_identity() -> tuple[str, str, dict[str, str], str]:

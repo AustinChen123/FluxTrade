@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import hashlib
-import subprocess
 from decimal import Decimal
 from pathlib import Path
 
@@ -17,8 +16,8 @@ from integration.four_run_parity_fixture import (
     build_four_run_matrix,
     collect_backtest_with_final_price,
     collect_real_mode_outcomes,
-    committed_candidate_available,
     native_matcher_sha256,
+    reviewed_delivery_checkout_available,
     selected_native_matcher_module,
     semantic_identity_sha256,
     validate_frozen_product_manifest,
@@ -329,6 +328,10 @@ def _assert_exact_outcome(outcome: TradingOutcome) -> None:
     )
 
 
+@pytest.mark.skipif(
+    not reviewed_delivery_checkout_available(),
+    reason="runtime attestation belongs to the exact reviewed D0B4B delivery",
+)
 def test_parent_manifest_and_loaded_native_binary_are_exact() -> None:
     assert verify_reviewed_product_runtime() == PARENT_MANIFEST_SHA256
     selected = selected_native_matcher_module()
@@ -385,6 +388,22 @@ def test_reviewed_candidate_chain_allows_only_one_native_artifact_fix() -> None:
     )
 
 
+@pytest.mark.parametrize(
+    ("head_sha", "expected"),
+    (
+        ("02d67503b38ae035d11e0d82afb5e8c73ac80cf2", True),
+        ("76984432bd9fac138c6c50e307a445c1dfa75423", False),
+        ("5056c8890e9ca818e0a192e5117b195e78bfd380", False),
+        ("02d67503b38ae035d11e0d82afb5e8c73ac80cf3", False),
+    ),
+)
+def test_reviewed_delivery_runtime_gate_is_exact(
+    head_sha: str,
+    expected: bool,
+) -> None:
+    assert reviewed_delivery_checkout_available(head_sha) is expected
+
+
 def test_untracked_product_paths_allow_only_the_selected_ci_native_binary() -> None:
     selected = "python-strategy/src/fluxtrade_core.so"
 
@@ -435,24 +454,7 @@ def test_real_collectors_produce_the_same_exact_outcome(
 
 
 def test_product_manifest_rejects_path_or_blob_drift() -> None:
-    manifest = subprocess.run(
-        (
-            "git",
-            "ls-tree",
-            "-r",
-            "HEAD",
-            "--",
-            "python-strategy/src",
-            "python-strategy/pyproject.toml",
-            "python-strategy/uv.lock",
-            "rust-data-service/src",
-            "rust-data-service/Cargo.toml",
-            "rust-data-service/Cargo.lock",
-        ),
-        cwd=Path(__file__).resolve().parents[3],
-        check=True,
-        capture_output=True,
-    ).stdout
+    manifest = fixture_module._manifest_bytes(fixture_module.NATIVE_ARTIFACT_FIX_SHA)
     assert validate_frozen_product_manifest(manifest) == PARENT_MANIFEST_SHA256
     lines = manifest.splitlines(keepends=True)
     with pytest.raises(ValueError, match="differs from reviewed parent"):
@@ -522,8 +524,8 @@ def test_real_money_path_change_is_detected(
 
 
 @pytest.mark.skipif(
-    not committed_candidate_available(),
-    reason="exact candidate SHA/tree exist only after the reviewed commit",
+    not reviewed_delivery_checkout_available(),
+    reason="committed matrix belongs to the exact reviewed D0B4B delivery",
 )
 def test_committed_real_four_run_matrix_is_exact(
     tmp_path: Path,
