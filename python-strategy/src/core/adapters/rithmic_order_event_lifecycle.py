@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Callable
-from threading import Lock
+from threading import RLock
 from typing import ParamSpec, TypeVar
 
 _P = ParamSpec("_P")
@@ -14,7 +14,7 @@ class RithmicOrderEventLifecycleGate:
     """Own mutual exclusion across complete venue worker lifecycles."""
 
     def __init__(self) -> None:
-        self._lock = Lock()
+        self._lock = RLock()
 
     def run(
         self, operation: Callable[_P, _R], *args: _P.args, **kwargs: _P.kwargs

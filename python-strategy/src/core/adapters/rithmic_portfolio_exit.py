@@ -18,6 +18,22 @@ from src.core.execution import ExecutionEngine, ExitDecision
 from src.core.models import Candlestick, OrderStatus, Signal, SignalType
 
 
+class _PortfolioExitOperationFailure(Exception):
+    """Carry a failed gated operation to post-gate compensation scheduling."""
+
+    def __init__(
+        self,
+        error: Exception,
+        reason: str,
+        *,
+        compensation_required: bool,
+    ) -> None:
+        super().__init__(reason)
+        self.error = error
+        self.reason = reason
+        self.compensation_required = compensation_required
+
+
 class RithmicPortfolioExitService:
     """Safely reduce one sleeve against a venue-level product net position."""
 
@@ -51,7 +67,6 @@ class RithmicPortfolioExitService:
         self.lockdown = lockdown
         self.schedule_emergency_flatten = schedule_emergency_flatten
         self.portfolio_id_for_sleeve = portfolio_id_for_sleeve
-        self._compensation_required = False
 
     def execute(
         self,
@@ -70,13 +85,29 @@ class RithmicPortfolioExitService:
         if exit_quantity is None:
             raise RuntimeError("rithmic_portfolio_exit_quantity_missing")
 
-        return self.operation_gate.run(
-            self._execute_validated,
-            signal,
-            decision,
-            candle,
-            exit_quantity,
-        )
+        def execute_validated() -> dict[str, object]:
+            try:
+                return self._execute_validated(
+                    signal,
+                    decision,
+                    candle,
+                    exit_quantity,
+                )
+            except _PortfolioExitOperationFailure as failure:
+                if failure.compensation_required:
+                    try:
+                        self.schedule_emergency_flatten(failure.reason)
+                    except Exception as compensation_error:
+                        self.lockdown(
+                            "rithmic_portfolio_exit_compensation_schedule_failed:"
+                            f"{type(compensation_error).__name__}"
+                        )
+                        raise RuntimeError(
+                            "rithmic_portfolio_exit_compensation_schedule_failed"
+                        ) from compensation_error
+                raise failure.error
+
+        return self.operation_gate.run(execute_validated)
 
     def _execute_validated(
         self,
@@ -87,7 +118,13 @@ class RithmicPortfolioExitService:
     ) -> dict[str, object]:
         operation_failed = False
         order_event_stopped = False
+        compensation_required = False
         outcome: dict[str, object] | None = None
+
+        def mark_compensation_required() -> None:
+            nonlocal compensation_required
+            compensation_required = True
+
         try:
             if not self.stop_order_event_stream(timeout=30.0):
                 raise RuntimeError("rithmic_portfolio_exit_event_stream_stop_timeout")
@@ -107,6 +144,7 @@ class RithmicPortfolioExitService:
             cancelled_orders, cancelled_identities = self._cancel_strategy_orders(
                 signal.strategy_id,
                 signal.product_id,
+                mark_compensation_required=mark_compensation_required,
             )
             _, remote_quantity = self._verified_preflight_position(
                 signal,
@@ -117,7 +155,7 @@ class RithmicPortfolioExitService:
             expected_remaining_quantity = remote_quantity - exit_quantity
             self.assert_leadership()
             self.adapter.start_order_event_stream()
-            self._compensation_required = True
+            compensation_required = True
             order_id = self.execution_engine.submit_verified_net_reduction(
                 signal,
                 decision,
@@ -164,7 +202,7 @@ class RithmicPortfolioExitService:
                     )
                     and local_sleeve_position is None
                 ):
-                    self._compensation_required = False
+                    compensation_required = False
                     self.execution_engine.record_verified_net_reduction(
                         signal,
                         order_id,
@@ -190,22 +228,14 @@ class RithmicPortfolioExitService:
         except Exception as error:
             operation_failed = True
             reason = (
-                "rithmic_portfolio_exit_requires_reconciliation:"
-                f"{type(error).__name__}"
+                f"rithmic_portfolio_exit_requires_reconciliation:{type(error).__name__}"
             )
             self.lockdown(reason)
-            if self._compensation_required:
-                try:
-                    self.schedule_emergency_flatten(reason)
-                except Exception as compensation_error:
-                    self.lockdown(
-                        "rithmic_portfolio_exit_compensation_schedule_failed:"
-                        f"{type(compensation_error).__name__}"
-                    )
-                    raise RuntimeError(
-                        "rithmic_portfolio_exit_compensation_schedule_failed"
-                    ) from compensation_error
-            raise
+            raise _PortfolioExitOperationFailure(
+                error,
+                reason,
+                compensation_required=compensation_required,
+            ) from error
         finally:
             if order_event_stopped:
                 try:
@@ -333,6 +363,8 @@ class RithmicPortfolioExitService:
         self,
         strategy_id: str,
         product_id: str,
+        *,
+        mark_compensation_required: Callable[[], None],
     ) -> tuple[int, set[tuple[str | None, str | None]]]:
         active_statuses = {
             OrderStatus.NEW.value,
@@ -396,7 +428,7 @@ class RithmicPortfolioExitService:
                     f"order_id={order.id}"
                 )
             self.assert_leadership()
-            self._compensation_required = True
+            mark_compensation_required()
             if not self.adapter.cancel_order(
                 remote.exchange_order_id,
                 order.product_id,

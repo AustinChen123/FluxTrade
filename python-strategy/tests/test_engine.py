@@ -6107,19 +6107,30 @@ def test_rithmic_portfolio_exit_schedules_flatten_after_protection_mutation(
     engine.execution_engine.order_manager.repo.list_orders_by_statuses = MagicMock(
         return_value=[protection]
     )
+    primary = RuntimeError("verification failed after protection mutation")
     engine.execution_engine.reconcile_rithmic_owned_orders = MagicMock(
-        side_effect=[
-            {"auto_resume_safe": True},
-            *[{"auto_resume_safe": False} for _ in range(6)],
-        ]
+        side_effect=[{"auto_resume_safe": True}, primary]
     )
     engine.execution_engine.submit_verified_net_reduction = MagicMock()
-    engine._start_exchange_order_event_stream = MagicMock()
+    lifecycle_calls: list[str] = []
+    engine._start_exchange_order_event_stream = MagicMock(
+        side_effect=lambda: lifecycle_calls.append("restart")
+    )
     engine._lockdown_for_rithmic_order_drift = MagicMock()
     engine._rithmic_emergency_flatten = MagicMock()
+    compensation_calls: list[str] = []
     if schedule_fails:
         engine._rithmic_emergency_flatten.schedule_portfolio_exit_compensation.side_effect = RuntimeError(
             "callback registration failed"
+        )
+    else:
+        engine._rithmic_emergency_flatten.schedule_portfolio_exit_compensation.side_effect = (
+            lambda reason: engine._rithmic_order_event_lifecycle.run(
+                lambda: (
+                    lifecycle_calls.append("compensation"),
+                    compensation_calls.append(reason),
+                )
+            )
         )
     engine.account_service.get_position_for_exit = MagicMock(
         return_value=Position(
@@ -6146,28 +6157,35 @@ def test_rithmic_portfolio_exit_schedules_flatten_after_protection_mutation(
         position_quantity=Decimal("1"),
     )
 
-    with (
-        patch(
-            "src.core.adapters.rithmic_portfolio_exit.load_rithmic_recovery_snapshot",
-            return_value=_rithmic_emergency_snapshot(net_quantity="1"),
-        ),
-        pytest.raises(
-            RuntimeError,
-            match=(
-                "rithmic_portfolio_exit_compensation_schedule_failed"
-                if schedule_fails
-                else "rithmic_portfolio_exit_preflight_reconciliation_blocked"
-            ),
-        ),
+    errors: list[Exception] = []
+
+    def run_exit() -> None:
+        try:
+            engine._run_rithmic_portfolio_exit(
+                signal,
+                decision,
+                _make_candle(
+                    product_id="RITHMIC:NQ-202609",
+                    close=Decimal("20000"),
+                ),
+            )
+        except Exception as error:
+            errors.append(error)
+
+    with patch(
+        "src.core.adapters.rithmic_portfolio_exit.load_rithmic_recovery_snapshot",
+        return_value=_rithmic_emergency_snapshot(net_quantity="1"),
     ):
-        engine._run_rithmic_portfolio_exit(
-            signal,
-            decision,
-            _make_candle(
-                product_id="RITHMIC:NQ-202609",
-                close=Decimal("20000"),
-            ),
-        )
+        worker = threading.Thread(target=run_exit, daemon=True)
+        worker.start()
+        worker.join(timeout=1.0)
+
+    assert not worker.is_alive(), "portfolio-exit compensation deadlocked"
+    assert len(errors) == 1
+    if schedule_fails:
+        assert str(errors[0]) == ("rithmic_portfolio_exit_compensation_schedule_failed")
+    else:
+        assert errors[0] is primary
 
     adapter.cancel_order.assert_called_once_with(
         "stop-basket",
@@ -6178,6 +6196,12 @@ def test_rithmic_portfolio_exit_schedules_flatten_after_protection_mutation(
     engine._rithmic_emergency_flatten.schedule_portfolio_exit_compensation.assert_called_once_with(
         "rithmic_portfolio_exit_requires_reconciliation:RuntimeError"
     )
+    assert compensation_calls == (
+        []
+        if schedule_fails
+        else ["rithmic_portfolio_exit_requires_reconciliation:RuntimeError"]
+    )
+    assert lifecycle_calls == ["restart"] + ([] if schedule_fails else ["compensation"])
     expected_lockdowns = [
         call("rithmic_portfolio_exit_requires_reconciliation:RuntimeError")
     ]
@@ -6186,6 +6210,29 @@ def test_rithmic_portfolio_exit_schedules_flatten_after_protection_mutation(
             call("rithmic_portfolio_exit_compensation_schedule_failed:RuntimeError")
         )
     assert engine._lockdown_for_rithmic_order_drift.call_args_list == expected_lockdowns
+
+    if not schedule_fails:
+        compensation_calls.clear()
+        errors.clear()
+        engine._rithmic_emergency_flatten.schedule_portfolio_exit_compensation.reset_mock()
+        engine.execution_engine.reconcile_rithmic_owned_orders.side_effect = [
+            {"auto_resume_safe": False} for _ in range(6)
+        ]
+        with patch(
+            "src.core.adapters.rithmic_portfolio_exit.load_rithmic_recovery_snapshot",
+            return_value=_rithmic_emergency_snapshot(net_quantity="1"),
+        ):
+            worker = threading.Thread(target=run_exit, daemon=True)
+            worker.start()
+            worker.join(timeout=1.0)
+
+        assert not worker.is_alive()
+        assert len(errors) == 1
+        assert str(errors[0]) == (
+            "rithmic_portfolio_exit_preflight_reconciliation_blocked"
+        )
+        engine._rithmic_emergency_flatten.schedule_portfolio_exit_compensation.assert_not_called()
+        assert compensation_calls == []
 
 
 def test_rithmic_strategy_exit_blocks_when_remote_order_remains_working(engine):
