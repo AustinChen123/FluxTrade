@@ -393,6 +393,71 @@ def test_runtime_handle_preserves_execution_dispatch_exception_identity(
     assert caught.value is error
 
 
+def test_runtime_handle_routes_portfolio_exit_to_current_factory() -> None:
+    owners = RithmicRuntimeOwners(order_event_lifecycle=MagicMock())
+    signal = MagicMock()
+    decision = MagicMock()
+    candle = MagicMock()
+    portfolio_id_for_sleeve = MagicMock(return_value="portfolio")
+    owner = MagicMock()
+    result = {"status": "verified_reduced"}
+    owner.execute.return_value = result
+    factory = MagicMock(return_value=owner)
+    owners.portfolio_exit_factory = factory
+
+    assert (
+        owners.execute_portfolio_exit(
+            signal,
+            decision,
+            candle,
+            portfolio_id_for_sleeve,
+        )
+        is result
+    )
+    factory.assert_called_once_with(portfolio_id_for_sleeve)
+    owner.execute.assert_called_once_with(signal, decision, candle)
+
+
+def test_runtime_handle_rejects_missing_portfolio_exit_factory() -> None:
+    owners = RithmicRuntimeOwners(order_event_lifecycle=MagicMock())
+
+    with pytest.raises(
+        RuntimeError,
+        match="^rithmic_portfolio_exit_unavailable$",
+    ):
+        owners.execute_portfolio_exit(
+            MagicMock(),
+            MagicMock(),
+            None,
+            MagicMock(),
+        )
+
+
+@pytest.mark.parametrize("failure_owner", ["factory", "execute"])
+def test_runtime_handle_preserves_portfolio_exit_exception_identity(
+    failure_owner: str,
+) -> None:
+    owners = RithmicRuntimeOwners(order_event_lifecycle=MagicMock())
+    error = RuntimeError(failure_owner)
+    owner = MagicMock()
+    factory = MagicMock(return_value=owner)
+    owners.portfolio_exit_factory = factory
+    if failure_owner == "factory":
+        factory.side_effect = error
+    else:
+        owner.execute.side_effect = error
+
+    with pytest.raises(RuntimeError) as caught:
+        owners.execute_portfolio_exit(
+            MagicMock(),
+            MagicMock(),
+            None,
+            MagicMock(),
+        )
+
+    assert caught.value is error
+
+
 def test_rithmic_composition_builds_the_complete_shared_owner_graph() -> None:
     adapter = RithmicExchangeAdapter(
         profile="test",

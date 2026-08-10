@@ -54,7 +54,10 @@ from src.core.adapters.rithmic_order_event_lifecycle import (
 from src.core.adapters.rithmic_order_event_stream import (
     RithmicOrderEventStreamService,
 )
-from src.core.adapters.rithmic_runtime_composition import RithmicRuntimeOwners
+from src.core.adapters.rithmic_runtime_composition import (
+    RithmicRuntimeOwners,
+    build_rithmic_portfolio_exit_owner,
+)
 from src.core.adapters.rithmic_runtime_recovery import (
     RithmicRuntimeRecoveryService,
 )
@@ -5347,8 +5350,39 @@ def _install_rithmic_emergency_flatten_service(
         ),
         logger=logging.getLogger("test.rithmic_emergency_flatten"),
     )
-    engine._rithmic_runtime.emergency_flatten = service
+    _install_rithmic_portfolio_exit_factory(engine, adapter, service)
     return service
+
+
+def _install_rithmic_portfolio_exit_factory(
+    engine: StrategyEngine,
+    adapter: RithmicExchangeAdapter,
+    emergency_flatten: RithmicEmergencyFlattenService | MagicMock | None = None,
+) -> RithmicEmergencyFlattenService | MagicMock:
+    if emergency_flatten is None:
+        emergency_flatten = MagicMock()
+    engine._rithmic_runtime.emergency_flatten = emergency_flatten
+
+    def build(portfolio_id_for_sleeve):
+        return build_rithmic_portfolio_exit_owner(
+            adapter=adapter,
+            execution_engine=engine.execution_engine,
+            account_service=engine.account_service,
+            profile=engine._rithmic_recovery_profile or "test",
+            account_id=engine._rithmic_recovery_account_id or "ACCOUNT",
+            operation_gate=engine._rithmic_runtime.order_event_lifecycle,
+            stop_order_event_stream=engine._stop_exchange_order_event_stream,
+            assert_leadership=engine._assert_runtime_leadership,
+            restart_order_stream=engine._start_exchange_order_event_stream,
+            lockdown=engine._lockdown_for_rithmic_order_drift,
+            schedule_emergency_flatten=(
+                emergency_flatten.schedule_portfolio_exit_compensation
+            ),
+            portfolio_id_for_sleeve=portfolio_id_for_sleeve,
+        )
+
+    engine._rithmic_runtime.portfolio_exit_factory = build
+    return emergency_flatten
 
 
 def _rithmic_emergency_snapshot(*, net_quantity=None, orders=None):
@@ -5695,12 +5729,73 @@ def test_rithmic_exit_owners_share_one_order_event_lifecycle_gate(engine):
     engine._rithmic_runtime.order_event_lifecycle.run.assert_called_once()
 
 
+def test_rithmic_portfolio_exit_engine_seam_uses_runtime_facade(engine):
+    adapter = _rithmic_adapter_for_reconnect_test()
+    engine.execution_engine.adapter = adapter
+    engine._rithmic_recovery_profile = "test"
+    engine._rithmic_recovery_account_id = "ACCOUNT"
+    result = {"status": "verified_reduced"}
+    engine._rithmic_runtime.execute_portfolio_exit = MagicMock(return_value=result)
+    engine._rithmic_runtime.emergency_flatten = MagicMock()
+    engine._rithmic_runtime.portfolio_exit_factory = MagicMock()
+    portfolio_id_for_sleeve = MagicMock(return_value="portfolio")
+    engine._portfolio_coordinator.portfolio_id_for_sleeve = portfolio_id_for_sleeve
+    signal = MagicMock()
+    decision = MagicMock()
+    candle = MagicMock()
+
+    assert engine._run_rithmic_portfolio_exit(signal, decision, candle) is result
+
+    engine._rithmic_runtime.execute_portfolio_exit.assert_called_once_with(
+        signal,
+        decision,
+        candle,
+        portfolio_id_for_sleeve,
+    )
+    engine._rithmic_runtime.portfolio_exit_factory.assert_not_called()
+
+
+def test_non_rithmic_portfolio_exit_rejects_before_runtime_facade(engine):
+    engine._rithmic_runtime.execute_portfolio_exit = MagicMock()
+
+    with pytest.raises(
+        RuntimeError,
+        match="^authoritative_portfolio_exit_requires_rithmic$",
+    ):
+        engine._run_rithmic_portfolio_exit(MagicMock(), MagicMock(), None)
+
+    engine._rithmic_runtime.execute_portfolio_exit.assert_not_called()
+
+
+@pytest.mark.parametrize(
+    ("profile", "account_id"),
+    [(None, "ACCOUNT"), ("test", None)],
+)
+def test_portfolio_exit_rejects_missing_identity_before_runtime_facade(
+    engine,
+    profile,
+    account_id,
+):
+    engine.execution_engine.adapter = _rithmic_adapter_for_reconnect_test()
+    engine._rithmic_recovery_profile = profile
+    engine._rithmic_recovery_account_id = account_id
+    engine._rithmic_runtime.execute_portfolio_exit = MagicMock()
+
+    with pytest.raises(
+        RuntimeError,
+        match="^rithmic_portfolio_exit_account_identity_missing$",
+    ):
+        engine._run_rithmic_portfolio_exit(MagicMock(), MagicMock(), None)
+
+    engine._rithmic_runtime.execute_portfolio_exit.assert_not_called()
+
+
 def test_invalid_portfolio_exit_fails_before_lifecycle_gate(engine):
     adapter = _rithmic_adapter_for_reconnect_test()
     engine.execution_engine.adapter = adapter
     engine._rithmic_recovery_profile = "test"
     engine._rithmic_recovery_account_id = "ACCOUNT"
-    engine._rithmic_runtime.emergency_flatten = MagicMock()
+    _install_rithmic_portfolio_exit_factory(engine, adapter)
     engine._rithmic_runtime.order_event_lifecycle.run = MagicMock()
     signal = Signal(
         strategy_id="portfolio_v1.sleeve_a",
@@ -5731,7 +5826,7 @@ def test_portfolio_exit_stop_timeout_does_not_start_replacement_worker(engine):
     engine.execution_engine.adapter = adapter
     engine._rithmic_recovery_profile = "test"
     engine._rithmic_recovery_account_id = "ACCOUNT"
-    engine._rithmic_runtime.emergency_flatten = MagicMock()
+    _install_rithmic_portfolio_exit_factory(engine, adapter)
     engine._start_exchange_order_event_stream = MagicMock()
     engine._lockdown_for_rithmic_order_drift = MagicMock()
     current_thread = MagicMock()
@@ -5770,7 +5865,7 @@ def test_portfolio_exit_stop_timeout_does_not_start_replacement_worker(engine):
 def test_portfolio_exit_resolves_current_worker_after_acquiring_gate(engine_factory):
     adapter = _rithmic_adapter_for_reconnect_test()
     engine = engine_factory(adapter=adapter, audit_external_orders=True)
-    engine._rithmic_runtime.emergency_flatten = MagicMock()
+    _install_rithmic_portfolio_exit_factory(engine, adapter)
     engine._start_exchange_order_event_stream = MagicMock()
     stale_thread = MagicMock()
     stale_thread.is_alive.return_value = True
@@ -5924,7 +6019,7 @@ def test_rithmic_portfolio_exit_reduces_only_owned_sleeve(
     )
     engine._start_exchange_order_event_stream = MagicMock()
     engine._lockdown_for_rithmic_order_drift = MagicMock()
-    engine._rithmic_runtime.emergency_flatten = MagicMock()
+    _install_rithmic_portfolio_exit_factory(engine, adapter)
     sleeve_position = Position(
         strategy_id="portfolio_v1.sleeve_a",
         product_id="RITHMIC:NQ-202609",
@@ -6053,7 +6148,7 @@ def test_rithmic_portfolio_exit_does_not_reduce_another_sleeve_after_own_fill(
     engine.execution_engine.record_verified_net_reduction = MagicMock()
     engine._start_exchange_order_event_stream = MagicMock()
     engine._lockdown_for_rithmic_order_drift = MagicMock()
-    engine._rithmic_runtime.emergency_flatten = MagicMock()
+    _install_rithmic_portfolio_exit_factory(engine, adapter)
     engine.account_service.get_position_for_exit = MagicMock(
         side_effect=[
             Position(
@@ -6152,7 +6247,7 @@ def test_rithmic_portfolio_exit_does_not_cancel_before_safe_preflight(engine):
     engine.execution_engine.submit_verified_net_reduction = MagicMock()
     engine._start_exchange_order_event_stream = MagicMock()
     engine._lockdown_for_rithmic_order_drift = MagicMock()
-    engine._rithmic_runtime.emergency_flatten = MagicMock()
+    _install_rithmic_portfolio_exit_factory(engine, adapter)
     engine.account_service.get_position_for_exit = MagicMock()
     signal = Signal(
         strategy_id="portfolio_v1.sleeve_a",
@@ -6234,7 +6329,7 @@ def test_rithmic_portfolio_exit_schedules_flatten_after_protection_mutation(
         side_effect=lambda: lifecycle_calls.append("restart")
     )
     engine._lockdown_for_rithmic_order_drift = MagicMock()
-    engine._rithmic_runtime.emergency_flatten = MagicMock()
+    _install_rithmic_portfolio_exit_factory(engine, adapter)
     compensation_calls: list[str] = []
     if schedule_fails:
         engine._rithmic_runtime.emergency_flatten.schedule_portfolio_exit_compensation.side_effect = RuntimeError(

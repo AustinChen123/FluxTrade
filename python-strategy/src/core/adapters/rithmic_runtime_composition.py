@@ -38,7 +38,7 @@ from src.core.adapters.rithmic_strategy_exit import RithmicStrategyExitService
 from src.core.execution import ExecutionEngine, ExitDecision
 from src.core.interfaces import IExchangeAdapter
 from src.core.interfaces.exchange import ExchangeOrderEvent
-from src.core.models import Signal
+from src.core.models import Candlestick, Signal
 from src.core.ops_safety import OpsSafetyService
 from src.core.risk_manager import AccountService
 
@@ -177,6 +177,19 @@ class RithmicRuntimeOwners:
             reason=reason,
             operation_id=operation_id,
         )
+
+    def execute_portfolio_exit(
+        self,
+        signal: Signal,
+        decision: ExitDecision,
+        candle: Candlestick | None,
+        portfolio_id_for_sleeve: Callable[[str], str | None],
+    ) -> dict[str, object]:
+        """Build and execute one portfolio exit through the venue facade."""
+        if self.portfolio_exit_factory is None:
+            raise RuntimeError("rithmic_portfolio_exit_unavailable")
+        owner = self.portfolio_exit_factory(portfolio_id_for_sleeve)
+        return owner.execute(signal, decision, candle)
 
 
 def build_rithmic_portfolio_exit_owner(

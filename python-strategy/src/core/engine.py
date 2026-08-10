@@ -60,7 +60,6 @@ from src.core.adapters import (
 )
 from src.core.adapters.rithmic_runtime_composition import (
     RithmicRuntimeCallbacks,
-    build_rithmic_portfolio_exit_owner,
     build_rithmic_runtime_owners,
 )
 from src.core.journal import StrategyJournal
@@ -2602,31 +2601,13 @@ class StrategyEngine:
         account_id = self._rithmic_recovery_account_id
         if not isinstance(profile, str) or not isinstance(account_id, str):
             raise RuntimeError("rithmic_portfolio_exit_account_identity_missing")
-        if self._rithmic_runtime.emergency_flatten is None:
-            raise RuntimeError("rithmic_emergency_flatten_unavailable")
         portfolio_id_for_sleeve = self._portfolio_coordinator.portfolio_id_for_sleeve
-        if self._rithmic_runtime.portfolio_exit_factory is None:
-            owner = build_rithmic_portfolio_exit_owner(
-                adapter=adapter,
-                execution_engine=self.execution_engine,
-                account_service=self.account_service,
-                profile=profile,
-                account_id=account_id,
-                operation_gate=self._rithmic_runtime.order_event_lifecycle,
-                stop_order_event_stream=self._stop_exchange_order_event_stream,
-                assert_leadership=self._assert_runtime_leadership,
-                restart_order_stream=self._start_exchange_order_event_stream,
-                lockdown=self._lockdown_for_rithmic_order_drift,
-                schedule_emergency_flatten=(
-                    self._rithmic_runtime.emergency_flatten.schedule_portfolio_exit_compensation
-                ),
-                portfolio_id_for_sleeve=portfolio_id_for_sleeve,
-            )
-        else:
-            owner = self._rithmic_runtime.portfolio_exit_factory(
-                portfolio_id_for_sleeve
-            )
-        return owner.execute(signal, decision, candle)
+        return self._rithmic_runtime.execute_portfolio_exit(
+            signal,
+            decision,
+            candle,
+            portfolio_id_for_sleeve,
+        )
 
     def shutdown(
         self,
