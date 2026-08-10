@@ -41,31 +41,292 @@ pytestmark = [
 ]
 
 
+_SIGNAL_FIELDS = (
+    "strategy_id",
+    "product_id",
+    "timeframe",
+    "timestamp_ms",
+    "signal_type",
+    "value",
+    "quantity",
+    "price",
+    "stop_loss",
+    "take_profit",
+    "trailing_distance",
+    "metadata_json",
+)
+_EXPECTED_SIGNALS = (
+    (
+        "d0b4_four_run",
+        "BINANCE:BTCUSDT-PERP",
+        "1m",
+        1_800_000_000_000,
+        "LONG",
+        None,
+        Decimal("1"),
+        None,
+        None,
+        None,
+        None,
+        '["map",[["client_order_id",["string","d0b4_four_run-market-long_0-6359818500763019921"]]]]',
+    ),
+    (
+        "d0b4_four_run",
+        "BINANCE:BTCUSDT-PERP",
+        "1m",
+        1_800_000_060_000,
+        "NO_SIGNAL",
+        Decimal("101"),
+        None,
+        None,
+        None,
+        None,
+        None,
+        '["map",[["client_order_id",["string","d0b4_four_run-market-no_signal_0-14594312868061664539"]]]]',
+    ),
+    (
+        "d0b4_four_run",
+        "BINANCE:BTCUSDT-PERP",
+        "1m",
+        1_800_000_120_000,
+        "EXIT_LONG",
+        None,
+        Decimal("1"),
+        None,
+        None,
+        None,
+        None,
+        '["map",[["client_order_id",["string","d0b4_four_run-market-exit_long_0-4588675349013221256"]]]]',
+    ),
+    (
+        "d0b4_four_run",
+        "BINANCE:BTCUSDT-PERP",
+        "1m",
+        1_800_000_180_000,
+        "NO_SIGNAL",
+        Decimal("103"),
+        None,
+        None,
+        None,
+        None,
+        None,
+        '["map",[["client_order_id",["string","d0b4_four_run-market-no_signal_0-9612643641772838732"]]]]',
+    ),
+)
+
+_ORDER_FIELDS = (
+    "logical_order_id",
+    "parent_logical_order_id",
+    "linked_logical_order_id",
+    "strategy_id",
+    "product_id",
+    "timestamp_ms",
+    "phase",
+    "status",
+    "order_type",
+    "side",
+    "quantity",
+    "filled_quantity",
+    "price",
+    "trigger_price",
+    "trailing_distance",
+)
+_EXPECTED_ORDERS = (
+    (
+        "order-000000",
+        None,
+        None,
+        "d0b4_four_run",
+        "BINANCE:BTCUSDT-PERP",
+        1_800_000_000_000,
+        "submitted",
+        "PLACED",
+        "market",
+        "buy",
+        Decimal("1"),
+        Decimal("0"),
+        None,
+        None,
+        None,
+    ),
+    (
+        "order-000000",
+        None,
+        None,
+        "d0b4_four_run",
+        "BINANCE:BTCUSDT-PERP",
+        1_800_000_060_000,
+        "filled",
+        "FILLED",
+        "market",
+        "buy",
+        Decimal("1"),
+        Decimal("1"),
+        Decimal("101"),
+        None,
+        None,
+    ),
+    (
+        "order-000001",
+        None,
+        None,
+        "d0b4_four_run",
+        "BINANCE:BTCUSDT-PERP",
+        1_800_000_120_000,
+        "submitted",
+        "PLACED",
+        "market",
+        "sell",
+        Decimal("1"),
+        Decimal("0"),
+        None,
+        None,
+        None,
+    ),
+    (
+        "order-000001",
+        None,
+        None,
+        "d0b4_four_run",
+        "BINANCE:BTCUSDT-PERP",
+        1_800_000_180_000,
+        "filled",
+        "FILLED",
+        "market",
+        "sell",
+        Decimal("1"),
+        Decimal("1"),
+        Decimal("103"),
+        None,
+        None,
+    ),
+)
+
+_FILL_FIELDS = (
+    "logical_order_id",
+    "strategy_id",
+    "product_id",
+    "timestamp_ms",
+    "fill_type",
+    "side",
+    "price",
+    "quantity",
+    "fee",
+)
+_EXPECTED_FILLS = (
+    (
+        "order-000000",
+        "d0b4_four_run",
+        "BINANCE:BTCUSDT-PERP",
+        1_800_000_060_000,
+        "MARKET",
+        "buy",
+        Decimal("101"),
+        Decimal("1"),
+        Decimal("0.101"),
+    ),
+    (
+        "order-000001",
+        "d0b4_four_run",
+        "BINANCE:BTCUSDT-PERP",
+        1_800_000_180_000,
+        "MARKET",
+        "sell",
+        Decimal("103"),
+        Decimal("1"),
+        Decimal("0.103"),
+    ),
+)
+
+_JOURNAL_FIELDS = (
+    "strategy_id",
+    "timestamp_ms",
+    "tag",
+    "logical_trade_id",
+    "data_json",
+)
+_EXPECTED_JOURNAL = (
+    (
+        "d0b4_four_run",
+        1_800_000_000_000,
+        "entry",
+        "order-000000",
+        '["map",[["order_id",["string","order-000000"]],["order_type",["string","market"]],["price",["string","market"]],["quantity",["string","1"]],["side",["string","buy"]],["stop_loss",["null"]],["take_profit",["null"]],["trailing_distance",["null"]]]]',
+    ),
+    (
+        "d0b4_four_run",
+        1_800_000_060_000,
+        "fill",
+        "order-000000",
+        '["map",[["fee",["string","0.101"]],["fill_type",["string","MARKET"]],["order_id",["string","order-000000"]],["price",["string","101"]],["quantity",["string","1"]],["side",["string","buy"]]]]',
+    ),
+    (
+        "d0b4_four_run",
+        1_800_000_120_000,
+        "entry",
+        "order-000001",
+        '["map",[["order_id",["string","order-000001"]],["order_type",["string","market"]],["price",["string","market"]],["quantity",["string","1"]],["side",["string","sell"]],["stop_loss",["null"]],["take_profit",["null"]],["trailing_distance",["null"]]]]',
+    ),
+    (
+        "d0b4_four_run",
+        1_800_000_180_000,
+        "fill",
+        "order-000001",
+        '["map",[["fee",["string","0.103"]],["fill_type",["string","MARKET"]],["order_id",["string","order-000001"]],["price",["string","103"]],["quantity",["string","1"]],["side",["string","sell"]]]]',
+    ),
+)
+
+
 def _assert_exact_outcome(outcome: TradingOutcome) -> None:
     assert type(outcome) is TradingOutcome
-    assert tuple(signal.signal_type for signal in outcome.signals) == (
-        "LONG",
-        "NO_SIGNAL",
-        "EXIT_LONG",
-        "NO_SIGNAL",
+    assert (
+        tuple(
+            tuple(getattr(signal, field) for field in _SIGNAL_FIELDS)
+            for signal in outcome.signals
+        )
+        == _EXPECTED_SIGNALS
     )
-    assert tuple(
-        (fill.side, fill.price, fill.quantity, fill.fee) for fill in outcome.fills
+    assert (
+        tuple(
+            tuple(getattr(order, field) for field in _ORDER_FIELDS)
+            for order in outcome.order_observations
+        )
+        == _EXPECTED_ORDERS
+    )
+    assert (
+        tuple(
+            tuple(getattr(fill, field) for field in _FILL_FIELDS)
+            for fill in outcome.fills
+        )
+        == _EXPECTED_FILLS
+    )
+    assert (
+        tuple(
+            tuple(getattr(row, field) for field in _JOURNAL_FIELDS)
+            for row in outcome.journal
+        )
+        == _EXPECTED_JOURNAL
+    )
+    assert (
+        outcome.financial.fees,
+        outcome.financial.realized_pnl,
+        outcome.financial.unrealized_pnl,
+        outcome.financial.equity,
     ) == (
-        ("buy", Decimal("101"), Decimal("1"), Decimal("0.101")),
-        ("sell", Decimal("103"), Decimal("1"), Decimal("0.103")),
+        Decimal("0.204"),
+        Decimal("1.796"),
+        Decimal("0"),
+        Decimal("10001.796"),
     )
-    assert len(outcome.order_observations) == 4
-    assert len(outcome.journal) == 4
-    assert outcome.financial.fees == Decimal("0.204")
-    assert outcome.financial.realized_pnl == Decimal("1.796")
-    assert outcome.financial.unrealized_pnl == Decimal("0")
-    assert outcome.financial.equity == Decimal("10001.796")
     assert not outcome.endpoint_state.positions
     assert not outcome.endpoint_state.working_orders
     assert outcome.endpoint_state.final_mark == Decimal("103")
     assert outcome.endpoint_state.end_timestamp == TIMESTAMPS[-1]
     assert outcome.endpoint_state.halted_early is False
+    assert (
+        outcome.sha256()
+        == "43ea059c075a8986bada3ac884a470ab26b90ee23c90634a8f4cd1419ebbca6a"
+    )
 
 
 def test_parent_manifest_and_loaded_native_binary_are_exact() -> None:
