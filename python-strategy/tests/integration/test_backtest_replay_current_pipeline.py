@@ -10,6 +10,7 @@ MemoryDataSource -> BacktestRunner -> StrategyEngine -> SignalProcessor
 
 import json
 from decimal import Decimal
+from uuid import uuid4
 
 import pytest
 from sqlalchemy import create_engine, func, select
@@ -30,8 +31,11 @@ from src.core.orm_models import (
     Strategy,
 )
 from src.strategies.callable_strategy import CallableStrategy
-from src.validation.backtest_capture import capture_signal_batch
-from src.validation.trading_outcome import SignalObservation
+from src.validation.backtest_capture import (
+    build_normal_backtest_trading_outcome,
+    capture_signal_batch,
+)
+from src.validation.trading_outcome import SignalObservation, TradingOutcome
 
 try:
     import fluxtrade_core  # noqa: F401
@@ -153,6 +157,29 @@ def test_current_backtest_replay_persists_trades_and_metrics(
                 )
             ).all()
         )
+        persisted_fills = tuple(
+            {
+                "id": trade.id,
+                "strategy_id": trade.strategy_id,
+                "order_id": trade.order_id,
+                "exchange_trade_id": trade.exchange_trade_id,
+                "product_id": trade.product_id,
+                "side": trade.side,
+                "price": trade.price,
+                "quantity": trade.quantity,
+                "fee": trade.fee,
+                "fee_asset": trade.fee_asset,
+                "timestamp": trade.timestamp,
+                "fill_sequence": trade.fill_sequence,
+            }
+            for trade in session.scalars(
+                select(BacktestTradeLog).order_by(
+                    BacktestTradeLog.timestamp,
+                    BacktestTradeLog.fill_sequence,
+                    BacktestTradeLog.id,
+                )
+            ).all()
+        )
 
     assert result is not None
     assert isinstance(summary.metrics_json, str)
@@ -174,6 +201,71 @@ def test_current_backtest_replay_persists_trades_and_metrics(
         assert "client_order_id" in signal.metadata_json
         metadata_values.add(signal.metadata_json)
     assert len(metadata_values) == len(candles)
+    journal = result["journal"]
+    assert type(journal) is list
+    outcome = build_normal_backtest_trading_outcome(
+        signals=observed_signals,
+        fills=persisted_fills,
+        journal=tuple(journal),
+        endpoint_state=result["endpoint_state"],
+        initial_balance=runner.initial_balance,
+        total_pnl=result["total_pnl"],
+    )
+    assert type(outcome) is TradingOutcome
+    assert len(outcome.signals) == len(candles)
+    assert len(outcome.order_observations) == trade_count * 2
+    assert len(outcome.fills) == trade_count
+    assert len(outcome.journal) == trade_count * 2
+    assert not outcome.endpoint_state.positions
+    assert not outcome.endpoint_state.working_orders
+    assert outcome.financial.fees == sum(
+        (fill.fee for fill in outcome.fills),
+        start=Decimal("0"),
+    )
+    assert outcome.financial.realized_pnl == result["total_pnl"]
+    assert outcome.financial.equity == runner.initial_balance + result["total_pnl"]
+    for index, fill in enumerate(outcome.fills):
+        logical_id = f"order-{index:06d}"
+        submitted, filled = outcome.order_observations[index * 2 : index * 2 + 2]
+        entry_journal, fill_journal = outcome.journal[index * 2 : index * 2 + 2]
+        assert submitted.logical_order_id == logical_id
+        assert filled.logical_order_id == logical_id
+        assert fill.logical_order_id == logical_id
+        assert entry_journal.logical_trade_id == logical_id
+        assert fill_journal.logical_trade_id == logical_id
+        assert (submitted.phase, filled.phase) == ("submitted", "filled")
+        assert (submitted.status, filled.status) == ("PLACED", "FILLED")
+        assert submitted.side == filled.side == fill.side
+    canonical = outcome.canonical_bytes()
+    assert outcome.sha256()
+    for persisted_fill in persisted_fills:
+        assert str(persisted_fill["id"]).encode() not in canonical
+        assert str(persisted_fill["order_id"]).encode() not in canonical
+    replacement_ids = {str(fill["order_id"]): uuid4().hex for fill in persisted_fills}
+    alternate_fills = tuple(
+        {
+            **fill,
+            "id": uuid4().hex,
+            "order_id": replacement_ids[str(fill["order_id"])],
+        }
+        for fill in persisted_fills
+    )
+    alternate_journal = []
+    for row in journal:
+        replacement = replacement_ids[str(row["trade_id"])]
+        data = {**row["data"], "order_id": replacement}
+        alternate_journal.append({**row, "trade_id": replacement, "data": data})
+    alternate = build_normal_backtest_trading_outcome(
+        signals=observed_signals,
+        fills=alternate_fills,
+        journal=tuple(alternate_journal),
+        endpoint_state=result["endpoint_state"],
+        initial_balance=runner.initial_balance,
+        total_pnl=result["total_pnl"],
+    )
+    assert alternate.canonical_bytes() == canonical
+    assert alternate.sha256() == outcome.sha256()
+    assert alternate.first_difference(outcome) is None
     assert result["journal_count"] >= trade_count
     assert result["total_trades"] == 25
     assert metrics["total_trades"] == 25

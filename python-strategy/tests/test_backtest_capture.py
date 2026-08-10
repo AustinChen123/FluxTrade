@@ -1,11 +1,21 @@
-from decimal import Decimal
+from decimal import Decimal, localcontext
 
 import pytest
 from pydantic import ValidationError
 
-from src.core.models import Signal, SignalType
-from src.validation.backtest_capture import capture_signal_batch
-from src.validation.trading_outcome import SignalObservation
+from src.core.backtest.endpoint_state import (
+    EndpointOrder,
+    EndpointPosition,
+    ReplayEndpointState,
+    build_replay_endpoint_state,
+)
+from src.core.models import OrderSide, PositionSide, Signal, SignalType
+from src.validation.backtest_capture import (
+    BacktestOutcomeCaptureError,
+    build_normal_backtest_trading_outcome,
+    capture_signal_batch,
+)
+from src.validation.trading_outcome import SignalObservation, TradingOutcome
 
 
 def _signal(
@@ -178,3 +188,413 @@ def test_capture_signal_batch_requires_exact_tuple_and_signal() -> None:
 
 def test_capture_signal_batch_preserves_empty_batch() -> None:
     assert capture_signal_batch(()) == ()
+
+
+def _outcome_sources(
+    *,
+    raw_order_id: str = "raw-order-a",
+    raw_fill_id: str = "raw-fill-a",
+) -> dict[str, object]:
+    signals = capture_signal_batch(
+        (_signal(signal_type=SignalType.LONG, timestamp=100),)
+    )
+    fills = (
+        {
+            "id": raw_fill_id,
+            "strategy_id": "strategy-a",
+            "order_id": raw_order_id,
+            "exchange_trade_id": None,
+            "product_id": "BINANCE:BTCUSDT-PERP",
+            "side": "buy",
+            "price": Decimal("101.50"),
+            "quantity": Decimal("0.5"),
+            "fee": Decimal("0.25"),
+            "fee_asset": "USDT",
+            "timestamp": 101,
+            "fill_sequence": 0,
+        },
+    )
+    journal = (
+        {
+            "strategy_id": "strategy-a",
+            "timestamp": 100,
+            "tag": "entry",
+            "data": {
+                "order_id": raw_order_id,
+                "side": OrderSide.BUY,
+                "order_type": "market",
+                "quantity": "0.5",
+                "price": "market",
+                "stop_loss": None,
+                "take_profit": None,
+                "trailing_distance": None,
+            },
+            "trade_id": raw_order_id,
+        },
+        {
+            "strategy_id": "strategy-a",
+            "timestamp": 101,
+            "tag": "fill",
+            "data": {
+                "order_id": raw_order_id,
+                "side": OrderSide.BUY,
+                "price": "101.50",
+                "quantity": "0.5",
+                "fee": "0.25",
+                "fill_type": "MARKET",
+            },
+            "trade_id": raw_order_id,
+        },
+    )
+    endpoint_state = build_replay_endpoint_state(
+        positions=(),
+        working_orders=(),
+        final_mark=Decimal("101.50"),
+        end_timestamp=200,
+        halted_early=False,
+    )
+    return {
+        "signals": signals,
+        "fills": fills,
+        "journal": journal,
+        "endpoint_state": endpoint_state,
+        "initial_balance": Decimal("10000"),
+        "total_pnl": Decimal("5"),
+    }
+
+
+def test_build_normal_backtest_outcome_links_all_canonical_sections() -> None:
+    sources = _outcome_sources()
+
+    outcome = build_normal_backtest_trading_outcome(**sources)
+
+    assert type(outcome) is TradingOutcome
+    assert outcome.signals is not sources["signals"]
+    assert tuple(order.phase for order in outcome.order_observations) == (
+        "submitted",
+        "filled",
+    )
+    assert tuple(order.status for order in outcome.order_observations) == (
+        "PLACED",
+        "FILLED",
+    )
+    assert {order.logical_order_id for order in outcome.order_observations} == {
+        "order-000000"
+    }
+    assert outcome.fills[0].logical_order_id == "order-000000"
+    assert tuple(item.logical_trade_id for item in outcome.journal) == (
+        "order-000000",
+        "order-000000",
+    )
+    assert outcome.financial.fees == Decimal("0.25")
+    assert outcome.financial.realized_pnl == Decimal("5")
+    assert outcome.financial.unrealized_pnl == Decimal("0")
+    assert outcome.financial.equity == Decimal("10005")
+    canonical = outcome.canonical_bytes()
+    assert outcome.sha256()
+    assert b"raw-order-a" not in canonical
+    assert b"raw-fill-a" not in canonical
+
+
+def test_build_normal_backtest_outcome_is_independent_of_raw_ids_and_sources() -> None:
+    first_sources = _outcome_sources()
+    second_sources = _outcome_sources(
+        raw_order_id="other-order",
+        raw_fill_id="other-fill",
+    )
+
+    first = build_normal_backtest_trading_outcome(**first_sources)
+    second = build_normal_backtest_trading_outcome(**second_sources)
+    before = first.canonical_bytes()
+
+    fills = first_sources["fills"]
+    journal = first_sources["journal"]
+    assert type(fills) is tuple and type(journal) is tuple
+    fills[0]["price"] = Decimal("999")
+    journal[0]["data"]["quantity"] = "999"
+
+    assert first.canonical_bytes() == before
+    assert second.canonical_bytes() == before
+    assert first.sha256() == second.sha256()
+    assert first.first_difference(second) is None
+    assert b"raw-order-a" not in before
+    assert b"other-order" not in before
+    assert b"raw-fill-a" not in before
+    assert b"other-fill" not in before
+
+
+def test_build_normal_backtest_outcome_accepts_negative_total_pnl() -> None:
+    sources = _outcome_sources()
+    sources["total_pnl"] = Decimal("-5.25")
+
+    outcome = build_normal_backtest_trading_outcome(**sources)
+
+    assert outcome.financial.realized_pnl == Decimal("-5.25")
+    assert outcome.financial.equity == Decimal("9994.75")
+
+
+@pytest.mark.parametrize("precision", [6, 28, 50])
+def test_build_normal_backtest_outcome_financial_equation_is_context_independent(
+    precision: int,
+) -> None:
+    sources = _outcome_sources()
+    fills = sources["fills"]
+    journal = sources["journal"]
+    assert type(fills) is tuple and type(journal) is tuple
+    fee = Decimal("0.1234567890123456789012345678")
+    fill = dict(fills[0])
+    fill["fee"] = fee
+    sources["fills"] = (fill,)
+    rows = [dict(row) for row in journal]
+    fill_data = dict(rows[1]["data"])
+    fill_data["fee"] = str(fee)
+    rows[1]["data"] = fill_data
+    sources["journal"] = tuple(rows)
+    initial = Decimal("1234567890123456789012345678")
+    pnl = Decimal("0.1")
+    sources["initial_balance"] = initial
+    sources["total_pnl"] = pnl
+
+    with localcontext() as context:
+        context.prec = precision
+        outcome = build_normal_backtest_trading_outcome(**sources)
+
+    assert outcome.financial.fees == fee
+    assert outcome.financial.realized_pnl == pnl
+    assert outcome.financial.equity == Decimal("1234567890123456789012345678.1")
+
+
+@pytest.mark.parametrize("invalid_input", ["no_actionable_signal", "endpoint_dict"])
+def test_build_normal_backtest_outcome_requires_supported_normal_path(
+    invalid_input: str,
+) -> None:
+    sources = _outcome_sources()
+    if invalid_input == "no_actionable_signal":
+        sources["signals"] = capture_signal_batch((_signal(timestamp=100),))
+        sources["fills"] = ()
+        sources["journal"] = ()
+    else:
+        endpoint_state = sources["endpoint_state"]
+        assert type(endpoint_state) is ReplayEndpointState
+        sources["endpoint_state"] = endpoint_state.model_dump()
+
+    with pytest.raises(BacktestOutcomeCaptureError) as caught:
+        build_normal_backtest_trading_outcome(**sources)
+
+    assert caught.value.args == ("normal backtest outcome capture failed",)
+    assert type(caught.value.__cause__) is ValueError
+
+
+@pytest.mark.parametrize(
+    ("mutation", "expected_cause"),
+    [
+        ("fill_price", "price"),
+        ("fill_sequence", "fill_sequence"),
+        ("strategy", "strategy"),
+        ("working_order", "working_orders"),
+        ("position", "positions"),
+    ],
+)
+def test_build_normal_backtest_outcome_rejects_inconsistent_sources(
+    mutation: str, expected_cause: str
+) -> None:
+    sources = _outcome_sources()
+    fills = sources["fills"]
+    journal = sources["journal"]
+    assert type(fills) is tuple and type(journal) is tuple
+    if mutation == "fill_price":
+        changed = dict(fills[0])
+        changed["price"] = Decimal("102")
+        sources["fills"] = (changed,)
+    elif mutation == "fill_sequence":
+        changed = dict(fills[0])
+        changed["fill_sequence"] = 1
+        sources["fills"] = (changed,)
+    elif mutation == "strategy":
+        changed = dict(fills[0])
+        changed["strategy_id"] = "other"
+        sources["fills"] = (changed,)
+    elif mutation == "working_order":
+        sources["endpoint_state"] = build_replay_endpoint_state(
+            positions=(),
+            working_orders=(
+                EndpointOrder(
+                    strategy_id="strategy-a",
+                    product_id="BINANCE:BTCUSDT-PERP",
+                    side=OrderSide.BUY,
+                    order_type="LIMIT",
+                    quantity=Decimal("0.5"),
+                    timestamp=199,
+                    price=Decimal("100"),
+                ),
+            ),
+            final_mark=Decimal("101.50"),
+            end_timestamp=200,
+            halted_early=False,
+        )
+    else:
+        sources["endpoint_state"] = build_replay_endpoint_state(
+            positions=(
+                EndpointPosition(
+                    strategy_id="strategy-a",
+                    product_id="BINANCE:BTCUSDT-PERP",
+                    side=PositionSide.LONG,
+                    quantity=Decimal("0.5"),
+                    average_entry_price=Decimal("101.50"),
+                ),
+            ),
+            working_orders=(),
+            final_mark=Decimal("101.50"),
+            end_timestamp=200,
+            halted_early=False,
+        )
+
+    with pytest.raises(BacktestOutcomeCaptureError) as caught:
+        build_normal_backtest_trading_outcome(**sources)
+
+    assert caught.value.stage == "normal_backtest_outcome_capture"
+    assert caught.value.__cause__ is not None
+    assert expected_cause in str(caught.value.__cause__)
+
+
+@pytest.mark.parametrize(
+    ("signal_type", "side"),
+    [
+        (SignalType.LONG, OrderSide.BUY),
+        (SignalType.SHORT, OrderSide.SELL),
+        (SignalType.EXIT_LONG, OrderSide.SELL),
+        (SignalType.EXIT_SHORT, OrderSide.BUY),
+    ],
+)
+def test_build_normal_backtest_outcome_maps_all_signal_sides(
+    signal_type: SignalType, side: OrderSide
+) -> None:
+    sources = _outcome_sources()
+    sources["signals"] = capture_signal_batch(
+        (_signal(signal_type=signal_type, timestamp=100),)
+    )
+    fills = sources["fills"]
+    journal = sources["journal"]
+    assert type(fills) is tuple and type(journal) is tuple
+    fill = dict(fills[0])
+    fill["side"] = side.value
+    sources["fills"] = (fill,)
+    changed_journal = []
+    for row in journal:
+        changed = dict(row)
+        data = dict(changed["data"])
+        data["side"] = side
+        changed["data"] = data
+        changed_journal.append(changed)
+    sources["journal"] = tuple(changed_journal)
+
+    outcome = build_normal_backtest_trading_outcome(**sources)
+
+    assert outcome.order_observations[0].side == side.value
+    assert outcome.fills[0].side == side.value
+
+
+@pytest.mark.parametrize(
+    ("target", "replacement"),
+    [
+        ("fill_price", 101.5),
+        ("fill_quantity", "0.5"),
+        ("fill_fee", 0),
+        ("initial_balance", 10_000),
+        ("total_pnl", "5"),
+    ],
+)
+def test_build_normal_backtest_outcome_rejects_non_decimal_money(
+    target: str, replacement: object
+) -> None:
+    sources = _outcome_sources()
+    if target.startswith("fill_"):
+        fills = sources["fills"]
+        assert type(fills) is tuple
+        fill = dict(fills[0])
+        fill[target.removeprefix("fill_")] = replacement
+        sources["fills"] = (fill,)
+    else:
+        sources[target] = replacement
+
+    with pytest.raises(BacktestOutcomeCaptureError) as caught:
+        build_normal_backtest_trading_outcome(**sources)
+
+    assert caught.value.args == ("normal backtest outcome capture failed",)
+    assert type(caught.value.__cause__) is ValueError
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    [
+        "missing_fill_key",
+        "extra_fill_key",
+        "unknown_order_id",
+        "reordered_journal",
+        "journal_fee",
+        "product",
+        "duplicate_order_id",
+        "missing_fill",
+    ],
+)
+def test_build_normal_backtest_outcome_rejects_invalid_evidence_shape(
+    mutation: str,
+) -> None:
+    sources = _outcome_sources()
+    fills = sources["fills"]
+    journal = sources["journal"]
+    assert type(fills) is tuple and type(journal) is tuple
+    fill = dict(fills[0])
+    rows = [dict(row) for row in journal]
+    if mutation == "missing_fill_key":
+        del fill["fee_asset"]
+        sources["fills"] = (fill,)
+    elif mutation == "extra_fill_key":
+        fill["unexpected"] = None
+        sources["fills"] = (fill,)
+    elif mutation == "unknown_order_id":
+        fill["order_id"] = "unknown"
+        sources["fills"] = (fill,)
+    elif mutation == "reordered_journal":
+        sources["journal"] = tuple(reversed(rows))
+    elif mutation == "journal_fee":
+        data = dict(rows[1]["data"])
+        data["fee"] = "0.26"
+        rows[1]["data"] = data
+        sources["journal"] = tuple(rows)
+    elif mutation == "product":
+        fill["product_id"] = "BINANCE:ETHUSDT-PERP"
+        sources["fills"] = (fill,)
+    elif mutation == "duplicate_order_id":
+        second = dict(fill)
+        second["id"] = "raw-fill-b"
+        second["side"] = "sell"
+        second["timestamp"] = 201
+        second["fill_sequence"] = 1
+        sources["fills"] = (fill, second)
+        sources["signals"] = capture_signal_batch(
+            (
+                _signal(signal_type=SignalType.LONG, timestamp=100),
+                _signal(signal_type=SignalType.EXIT_LONG, timestamp=200),
+            )
+        )
+        second_entry = dict(rows[0])
+        second_entry["timestamp"] = 200
+        second_entry_data = dict(second_entry["data"])
+        second_entry_data["side"] = OrderSide.SELL
+        second_entry["data"] = second_entry_data
+        second_fill = dict(rows[1])
+        second_fill["timestamp"] = 201
+        second_fill_data = dict(second_fill["data"])
+        second_fill_data["side"] = OrderSide.SELL
+        second_fill["data"] = second_fill_data
+        sources["journal"] = (*rows, second_entry, second_fill)
+    else:
+        sources["fills"] = ()
+
+    with pytest.raises(BacktestOutcomeCaptureError) as caught:
+        build_normal_backtest_trading_outcome(**sources)
+
+    assert caught.value.args == ("normal backtest outcome capture failed",)
+    assert type(caught.value.__cause__) is ValueError
+    assert "raw-order-a" not in str(caught.value)
