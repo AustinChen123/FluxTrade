@@ -1903,6 +1903,148 @@ class TestHandleCommand:
             operation_id="mobile-lockdown-1",
         )
 
+    def test_kill_switch_success_preserves_exact_phase_order(self, engine):
+        trace = []
+        result = _kill_switch_result()
+        engine._kill_switch_operation_completed = MagicMock(
+            side_effect=lambda **_: trace.append("completed-read") or False
+        )
+        engine._halt_for_kill_switch = MagicMock(
+            side_effect=lambda: trace.append("local-halt")
+        )
+        engine.ops_safety.persist_kill_switch_state = MagicMock(
+            side_effect=lambda *_args, **_kwargs: trace.append("db-lockdown")
+        )
+        engine.redis_client.set = MagicMock(
+            side_effect=lambda *_args, **_kwargs: trace.append("redis-lockdown")
+        )
+        engine._run_ops_kill_switch = MagicMock(
+            side_effect=lambda **_: trace.append("facade-dispatch") or result
+        )
+        engine._rithmic_runtime.requires_authoritative_flatten_verification = MagicMock(
+            side_effect=lambda: trace.append("authoritative") or False
+        )
+        engine._mark_kill_switch_operation_completed = MagicMock(
+            side_effect=lambda **_: trace.append("completed-write")
+        )
+
+        def classify(actual, *, authoritative_required):
+            trace.append("completion-classifier")
+            assert actual is result
+            assert authoritative_required is False
+            return True
+
+        with patch(
+            "src.core.engine._kill_switch_result_is_complete",
+            side_effect=classify,
+        ):
+            engine._handle_command(
+                {
+                    "command": "KILL_SWITCH",
+                    "params": {
+                        "actor": "operator@example.com",
+                        "idempotency_key": "ordered-lockdown",
+                    },
+                }
+            )
+
+        assert trace == [
+            "completed-read",
+            "local-halt",
+            "db-lockdown",
+            "redis-lockdown",
+            "facade-dispatch",
+            "authoritative",
+            "completion-classifier",
+            "completed-write",
+        ]
+
+    @pytest.mark.parametrize("failed_path", ["database", "redis"])
+    def test_kill_switch_persistence_failure_skips_completion_policy(
+        self,
+        engine,
+        failed_path,
+    ):
+        engine._kill_switch_operation_completed = MagicMock(return_value=False)
+        engine._halt_for_kill_switch = MagicMock()
+        engine.ops_safety.persist_kill_switch_state = MagicMock()
+        if failed_path == "database":
+            engine.ops_safety.persist_kill_switch_state.side_effect = RuntimeError(
+                "database unavailable"
+            )
+        engine.redis_client.set = MagicMock()
+        if failed_path == "redis":
+            engine.redis_client.set.side_effect = RuntimeError("redis unavailable")
+        engine._run_ops_kill_switch = MagicMock(return_value=_kill_switch_result())
+        engine._rithmic_runtime.requires_authoritative_flatten_verification = (
+            MagicMock()
+        )
+        engine._mark_kill_switch_operation_completed = MagicMock()
+
+        engine._handle_command(
+            {
+                "command": "KILL_SWITCH",
+                "params": {
+                    "actor": "operator@example.com",
+                    "idempotency_key": "persistence-failed",
+                },
+            }
+        )
+
+        engine._run_ops_kill_switch.assert_called_once_with(
+            actor="operator@example.com",
+            reason=None,
+            operation_id="persistence-failed",
+        )
+        engine._rithmic_runtime.requires_authoritative_flatten_verification.assert_not_called()
+        engine._mark_kill_switch_operation_completed.assert_not_called()
+
+    @pytest.mark.parametrize(
+        (
+            "facade_is_rithmic",
+            "adapter_is_rithmic",
+            "authoritative_verified",
+            "expected_completed",
+        ),
+        [
+            (False, True, None, True),
+            (True, False, None, False),
+            (True, False, True, True),
+        ],
+    )
+    def test_kill_switch_completion_requirement_uses_facade_authority(
+        self,
+        engine,
+        facade_is_rithmic,
+        adapter_is_rithmic,
+        authoritative_verified,
+        expected_completed,
+    ):
+        if adapter_is_rithmic:
+            engine.execution_engine.adapter = _rithmic_adapter_for_reconnect_test()
+        engine._rithmic_runtime.is_rithmic_runtime = facade_is_rithmic
+        engine._kill_switch_operation_completed = MagicMock(return_value=False)
+        engine._halt_for_kill_switch = MagicMock()
+        engine.ops_safety.persist_kill_switch_state = MagicMock()
+        engine.redis_client.set = MagicMock()
+        result = _kill_switch_result()
+        if authoritative_verified is not None:
+            result["authoritative_flatten_verified"] = authoritative_verified
+        engine._run_ops_kill_switch = MagicMock(return_value=result)
+        engine._mark_kill_switch_operation_completed = MagicMock()
+
+        engine._handle_command(
+            {
+                "command": "KILL_SWITCH",
+                "params": {
+                    "actor": "operator@example.com",
+                    "idempotency_key": "facade-authority",
+                },
+            }
+        )
+
+        assert engine._mark_kill_switch_operation_completed.called is expected_completed
+
     @pytest.mark.parametrize(
         "first_result",
         [
@@ -5868,6 +6010,16 @@ def test_kill_switch_completion_rejects_each_failure_list(failure_key):
             False,
         ),
         (
+            _kill_switch_result(authoritative_flatten_verified="true"),
+            True,
+            False,
+        ),
+        (
+            _kill_switch_result(authoritative_flatten_verified=1),
+            True,
+            False,
+        ),
+        (
             _kill_switch_result(authoritative_flatten_verified=True),
             True,
             True,
@@ -6818,9 +6970,50 @@ def test_non_rithmic_kill_switch_keeps_generic_ops_dispatch(engine, operation_id
     assert result == _kill_switch_result()
 
 
+@pytest.mark.parametrize(
+    ("facade_is_rithmic", "adapter_is_rithmic", "expected_source"),
+    [
+        (False, True, "generic"),
+        (True, False, "rithmic"),
+    ],
+)
+def test_kill_switch_dispatch_uses_facade_not_concrete_adapter(
+    engine,
+    facade_is_rithmic,
+    adapter_is_rithmic,
+    expected_source,
+):
+    if adapter_is_rithmic:
+        engine.execution_engine.adapter = _rithmic_adapter_for_reconnect_test()
+    engine._rithmic_runtime.is_rithmic_runtime = facade_is_rithmic
+    generic_result = {"source": "generic"}
+    venue_result = {"source": "rithmic"}
+    engine.ops_safety.kill_switch = MagicMock(return_value=generic_result)
+    engine._rithmic_runtime.emergency_flatten = MagicMock()
+    engine._rithmic_runtime.emergency_flatten.execute.return_value = venue_result
+
+    result = engine._run_ops_kill_switch(actor="ops", reason="drill")
+
+    assert result["source"] == expected_source
+    if facade_is_rithmic:
+        engine.ops_safety.kill_switch.assert_not_called()
+        engine._rithmic_runtime.emergency_flatten.execute.assert_called_once_with(
+            actor="ops",
+            reason="drill",
+            operation_id=None,
+        )
+    else:
+        engine.ops_safety.kill_switch.assert_called_once_with(
+            actor="ops",
+            reason="drill",
+        )
+        engine._rithmic_runtime.emergency_flatten.execute.assert_not_called()
+
+
 def test_rithmic_kill_switch_delegates_exactly_once_to_venue_owner(engine):
     adapter = _rithmic_adapter_for_reconnect_test()
     engine.execution_engine.adapter = adapter
+    engine._rithmic_runtime.is_rithmic_runtime = True
     expected = _kill_switch_result(authoritative_flatten_verified=True)
     engine._rithmic_runtime.emergency_flatten = MagicMock()
     engine._rithmic_runtime.emergency_flatten.execute.return_value = expected
@@ -6844,6 +7037,7 @@ def test_rithmic_kill_switch_delegates_exactly_once_to_venue_owner(engine):
 def test_rithmic_kill_switch_uses_runtime_execution_facade(engine):
     adapter = _rithmic_adapter_for_reconnect_test()
     engine.execution_engine.adapter = adapter
+    engine._rithmic_runtime.is_rithmic_runtime = True
     expected = _kill_switch_result(authoritative_flatten_verified=True)
     engine._rithmic_runtime.execute_emergency_flatten = MagicMock(return_value=expected)
     engine._rithmic_runtime.emergency_flatten = MagicMock()

@@ -211,6 +211,27 @@ class RithmicRuntimeOwners:
             operation_id=operation_id,
         )
 
+    def run_emergency_flatten(
+        self,
+        fallback: Callable[[], dict[str, Any]],
+        *,
+        actor: str,
+        reason: str | None,
+        operation_id: str | None = None,
+    ) -> dict[str, Any]:
+        """Select generic flatten or the current venue owner."""
+        if not self.is_rithmic_runtime:
+            return fallback()
+        return self.execute_emergency_flatten(
+            actor=actor,
+            reason=reason,
+            operation_id=operation_id,
+        )
+
+    def requires_authoritative_flatten_verification(self) -> bool:
+        """Declare whether completion requires venue-authoritative proof."""
+        return self.is_rithmic_runtime is True
+
     def execute_portfolio_exit(
         self,
         signal: Signal,

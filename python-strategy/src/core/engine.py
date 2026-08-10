@@ -652,8 +652,7 @@ class StrategyEngine:
         reason: str | None,
         operation_id: str | None = None,
     ) -> dict:
-        adapter = self.execution_engine.adapter
-        if not isinstance(adapter, RithmicExchangeAdapter):
+        def run_generic_kill_switch() -> dict:
             if operation_id is None:
                 return self.ops_safety.kill_switch(
                     actor=actor,
@@ -665,7 +664,8 @@ class StrategyEngine:
                 operation_id=operation_id,
             )
 
-        return self._rithmic_runtime.execute_emergency_flatten(
+        return self._rithmic_runtime.run_emergency_flatten(
+            run_generic_kill_switch,
             actor=actor,
             reason=reason,
             operation_id=operation_id,
@@ -830,10 +830,7 @@ class StrategyEngine:
                         and redis_state_persisted
                         and _kill_switch_result_is_complete(
                             kill_switch_result,
-                            authoritative_required=isinstance(
-                                self.execution_engine.adapter,
-                                RithmicExchangeAdapter,
-                            ),
+                            authoritative_required=self._rithmic_runtime.requires_authoritative_flatten_verification(),
                         )
                     ):
                         self._mark_kill_switch_operation_completed(

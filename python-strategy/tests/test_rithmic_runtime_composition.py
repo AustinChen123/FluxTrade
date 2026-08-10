@@ -496,6 +496,128 @@ def test_runtime_handle_routes_execution_dispatch_to_current_owners() -> None:
     )
 
 
+@pytest.mark.parametrize("operation_id", [None, "operation-1"])
+def test_emergency_flatten_dispatcher_uses_generic_fallback_exactly_once(
+    operation_id: str | None,
+) -> None:
+    owners = RithmicRuntimeOwners(
+        order_event_lifecycle=MagicMock(),
+        is_rithmic_runtime=False,
+    )
+    result = {"source": "generic", "operation_id": operation_id}
+    fallback = MagicMock(return_value=result)
+    owners.emergency_flatten = MagicMock()
+
+    actual = owners.run_emergency_flatten(
+        fallback,
+        actor="ops",
+        reason="drill",
+        operation_id=operation_id,
+    )
+
+    assert actual is result
+    fallback.assert_called_once_with()
+    owners.emergency_flatten.execute.assert_not_called()
+    assert owners.requires_authoritative_flatten_verification() is False
+
+
+def test_emergency_flatten_dispatcher_uses_current_rithmic_owner() -> None:
+    owners = RithmicRuntimeOwners(
+        order_event_lifecycle=MagicMock(),
+        is_rithmic_runtime=True,
+    )
+    fallback = MagicMock()
+    first = MagicMock()
+    first_result = {"source": "first"}
+    first.execute.return_value = first_result
+    owners.emergency_flatten = first
+
+    assert (
+        owners.run_emergency_flatten(
+            fallback,
+            actor="ops",
+            reason="drill",
+            operation_id="operation-1",
+        )
+        is first_result
+    )
+
+    second = MagicMock()
+    second_result = {"source": "second"}
+    second.execute.return_value = second_result
+    owners.emergency_flatten = second
+    assert (
+        owners.run_emergency_flatten(
+            fallback,
+            actor="operator",
+            reason=None,
+        )
+        is second_result
+    )
+    fallback.assert_not_called()
+    first.execute.assert_called_once_with(
+        actor="ops",
+        reason="drill",
+        operation_id="operation-1",
+    )
+    second.execute.assert_called_once_with(
+        actor="operator",
+        reason=None,
+        operation_id=None,
+    )
+    assert owners.requires_authoritative_flatten_verification() is True
+
+
+def test_emergency_flatten_dispatcher_rejects_missing_rithmic_owner() -> None:
+    owners = RithmicRuntimeOwners(
+        order_event_lifecycle=MagicMock(),
+        is_rithmic_runtime=True,
+    )
+    fallback = MagicMock()
+
+    with pytest.raises(
+        RuntimeError,
+        match="^rithmic_emergency_flatten_unavailable$",
+    ):
+        owners.run_emergency_flatten(
+            fallback,
+            actor="ops",
+            reason="drill",
+        )
+
+    fallback.assert_not_called()
+
+
+@pytest.mark.parametrize("owner_configured", [False, True])
+def test_emergency_flatten_dispatcher_preserves_selected_exception_identity(
+    owner_configured: bool,
+) -> None:
+    owners = RithmicRuntimeOwners(
+        order_event_lifecycle=MagicMock(),
+        is_rithmic_runtime=owner_configured,
+    )
+    fallback = MagicMock()
+    error = RuntimeError("selected owner failed")
+    if owner_configured:
+        owners.emergency_flatten = MagicMock()
+        owners.emergency_flatten.execute.side_effect = error
+    else:
+        fallback.side_effect = error
+
+    with pytest.raises(RuntimeError) as caught:
+        owners.run_emergency_flatten(
+            fallback,
+            actor="ops",
+            reason=None,
+        )
+
+    assert caught.value is error
+    if owner_configured:
+        fallback.assert_not_called()
+    else:
+        assert owners.emergency_flatten is None
+
+
 @pytest.mark.parametrize(
     ("facade_method", "args", "kwargs", "message"),
     [
