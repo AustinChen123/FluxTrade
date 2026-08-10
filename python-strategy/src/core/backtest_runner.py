@@ -4,7 +4,7 @@ import logging
 from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Callable, ContextManager, Dict, Iterable, List, Optional, cast
+from typing import Callable, ContextManager, Dict, Iterable, List, Mapping, Optional, cast
 from decimal import Decimal
 from sqlalchemy.orm import Session
 from fluxtrade_core import (
@@ -111,7 +111,7 @@ def _write_markdown_report(
     initial_balance: InitialBalanceInput,
     start_time: int,
     end_time: int,
-    fee_config: Dict,
+    fee_config: Mapping[str, Decimal | float],
     fee_model: FeeModel = FeeModel.PERCENTAGE_NOTIONAL,
     candle_count: int,
     path: Path,
@@ -186,7 +186,7 @@ class BacktestRunner:
         initial_balance: InitialBalanceInput = Decimal("10000"),
         max_drawdown_limit: Optional[float] = 0.20,
         data_source: Optional[IDataSource] = None,
-        fee_config: Optional[Dict[str, float]] = None,
+        fee_config: Mapping[str, Decimal | float] | None = None,
         report_config: Optional[Dict] = None,
         db_session_factory: Optional[Callable[[], ContextManager[Session]]] = None,
         instrument_spec: InstrumentSpec | None = None,
