@@ -29,6 +29,7 @@ from src.core.adapters.rithmic_runtime_composition import (
     RithmicRuntimeCallbacks,
     RithmicRuntimeOwners,
     build_rithmic_runtime_owners,
+    prepare_rithmic_runtime_bootstrap,
 )
 from src.core.adapters.rithmic_runtime_recovery import (
     RithmicRuntimeRecoveryService,
@@ -39,6 +40,168 @@ from src.core.interfaces import IExchangeAdapter
 from src.core.models import Signal, SignalType
 from src.core.ops_safety import OpsSafetyService
 from src.core.risk_manager import AccountService
+from src.core.runtime_environment import RuntimeEnvironment
+
+
+def _rithmic_adapter(*, profile: str = "orders", account_id: str = "ACCOUNT"):
+    return RithmicExchangeAdapter(
+        profile=profile,
+        account_id=account_id,
+        instruments={
+            "RITHMIC:NQ-202609": {
+                "exchange": "CME",
+                "quantity_step": "1",
+                "price_tick": "0.25",
+            }
+        },
+        client_factory=MagicMock(),
+    )
+
+
+@pytest.mark.parametrize(
+    ("config", "expected_profile"),
+    [
+        (
+            {
+                "rithmic_recovery_profile": "recovery",
+                "rithmic_profile": "configured",
+            },
+            "recovery",
+        ),
+        (
+            {"rithmic_recovery_profile": "", "rithmic_profile": "configured"},
+            "configured",
+        ),
+        ({"rithmic_recovery_profile": "", "rithmic_profile": ""}, "orders"),
+    ],
+)
+def test_bootstrap_preserves_profile_precedence(
+    config: dict[str, str],
+    expected_profile: str,
+) -> None:
+    account_service = MagicMock(spec=AccountService)
+    bootstrap = prepare_rithmic_runtime_bootstrap(
+        adapter=_rithmic_adapter(),
+        adapter_config={**config, "rithmic_recovery_account_id": "ACCOUNT"},
+        audit_external_orders=True,
+        account_service=account_service,
+        runtime_environment=RuntimeEnvironment("test"),
+    )
+
+    assert bootstrap.profile == expected_profile
+    assert bootstrap.account_id == "ACCOUNT"
+
+
+@pytest.mark.parametrize(
+    "config",
+    [
+        {"rithmic_recovery_account_id": "ACCOUNT", "account_id": "OTHER"},
+        {"rithmic_recovery_account_id": "", "account_id": "ACCOUNT"},
+        {"rithmic_recovery_account_id": "", "account_id": ""},
+    ],
+)
+def test_bootstrap_preserves_account_precedence_and_canonicalizes_once(
+    config: dict[str, str],
+) -> None:
+    account_service = MagicMock(spec=AccountService)
+    environment = RuntimeEnvironment("test")
+    bootstrap = prepare_rithmic_runtime_bootstrap(
+        adapter=_rithmic_adapter(),
+        adapter_config=config,
+        audit_external_orders=True,
+        account_service=account_service,
+        runtime_environment=environment,
+    )
+
+    assert bootstrap.account_id == "ACCOUNT"
+    account_service.configure_authoritative_balance.assert_called_once_with(
+        venue="rithmic",
+        account_id="ACCOUNT",
+        max_age_seconds=600.0,
+        runtime_environment=environment,
+    )
+
+
+def test_same_profile_can_bootstrap_two_explicit_accounts_without_selection() -> None:
+    accounts = []
+    for account_id in ("ACCOUNT-A", "ACCOUNT-B"):
+        bootstrap = prepare_rithmic_runtime_bootstrap(
+            adapter=_rithmic_adapter(account_id=account_id),
+            adapter_config={"rithmic_recovery_account_id": account_id},
+            audit_external_orders=True,
+            account_service=MagicMock(spec=AccountService),
+            runtime_environment=RuntimeEnvironment("test"),
+        )
+        accounts.append((bootstrap.profile, bootstrap.account_id))
+
+    assert accounts == [("orders", "ACCOUNT-A"), ("orders", "ACCOUNT-B")]
+
+
+def test_bootstrap_defers_rithmic_interval_until_after_engine_risk_setup(
+    monkeypatch,
+) -> None:
+    monkeypatch.setenv("RITHMIC_RUNTIME_RECONCILE_INTERVAL_SECONDS", "invalid")
+    bootstrap = prepare_rithmic_runtime_bootstrap(
+        adapter=_rithmic_adapter(),
+        adapter_config={},
+        audit_external_orders=True,
+        account_service=MagicMock(spec=AccountService),
+        runtime_environment=RuntimeEnvironment("test"),
+    )
+
+    with pytest.raises(
+        ValueError,
+        match="^RITHMIC_RUNTIME_RECONCILE_INTERVAL_SECONDS must be a finite number greater than zero$",
+    ):
+        bootstrap.resolve_reconciliation_schedule(
+            generic_enabled=False,
+            generic_interval_resolver=MagicMock(),
+        )
+
+
+def test_bootstrap_rejects_missing_audit_before_account_setup() -> None:
+    account_service = MagicMock(spec=AccountService)
+
+    with pytest.raises(
+        ValueError,
+        match="^Rithmic live trading requires audit_external_orders$",
+    ):
+        prepare_rithmic_runtime_bootstrap(
+            adapter=_rithmic_adapter(),
+            adapter_config={},
+            audit_external_orders=False,
+            account_service=account_service,
+            runtime_environment=RuntimeEnvironment("test"),
+        )
+
+    account_service.configure_authoritative_balance.assert_not_called()
+
+
+def test_non_rithmic_bootstrap_does_not_parse_or_configure_rithmic_policy(
+    monkeypatch,
+) -> None:
+    monkeypatch.setenv("RITHMIC_ACCOUNT_SNAPSHOT_MAX_AGE_SECONDS", "invalid")
+    monkeypatch.setenv("RITHMIC_RUNTIME_RECONCILE_INTERVAL_SECONDS", "invalid")
+    account_service = MagicMock(spec=AccountService)
+    generic_interval = MagicMock(return_value=42.0)
+
+    bootstrap = prepare_rithmic_runtime_bootstrap(
+        adapter=cast(IExchangeAdapter, MagicMock()),
+        adapter_config={
+            "rithmic_recovery_profile": "configured",
+            "rithmic_recovery_account_id": "ACCOUNT",
+        },
+        audit_external_orders=True,
+        account_service=account_service,
+        runtime_environment=RuntimeEnvironment("test"),
+    )
+
+    assert bootstrap.resolve_reconciliation_schedule(
+        generic_enabled=True,
+        generic_interval_resolver=generic_interval,
+    ) == (True, 42.0)
+    account_service.configure_authoritative_balance.assert_not_called()
+    generic_interval.assert_called_once_with()
 
 
 def _callbacks() -> RithmicRuntimeCallbacks:

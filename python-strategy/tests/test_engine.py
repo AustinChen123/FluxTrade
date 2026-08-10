@@ -15,6 +15,7 @@ from contextlib import nullcontext
 from decimal import Decimal
 import json
 import logging
+from pathlib import Path
 import threading
 from types import SimpleNamespace
 from unittest.mock import MagicMock, call, patch
@@ -83,8 +84,9 @@ from src.core.engine import (
     StrategyEngine,
     _is_runtime_reconciliation_enabled,
     _kill_switch_result_is_complete,
+    _runtime_reconciliation_interval_from_env,
 )
-from src.core.execution import ExitDecision
+from src.core.execution import ExecutionEngine, ExitDecision
 from src.core.interfaces.exchange import (
     ExchangeError,
     ExchangeOrderEvent,
@@ -181,12 +183,37 @@ def _attach_rithmic_ledger_recovery(engine) -> None:
     )
 
 
+class _RecordingRiskManager:
+    def __init__(self, events: list[str]):
+        self._events = events
+
+    @property
+    def instrument_spec_resolver(self):
+        return None
+
+    @instrument_spec_resolver.setter
+    def instrument_spec_resolver(self, value):
+        self._events.append("risk_resolver")
+
+
 # =============================================================================
 # Initialization
 # =============================================================================
 
 
 class TestEngineInit:
+    def test_engine_has_no_concrete_rithmic_bootstrap_policy(self):
+        source = (Path(__file__).parents[1] / "src" / "core" / "engine.py").read_text()
+
+        for venue_detail in (
+            "RithmicExchangeAdapter",
+            "RITHMIC_ACCOUNT_SNAPSHOT_MAX_AGE_SECONDS",
+            "RITHMIC_RUNTIME_RECONCILE_INTERVAL_SECONDS",
+            "_rithmic_account_snapshot_max_age_from_env",
+            "_rithmic_runtime_reconciliation_interval_from_env",
+        ):
+            assert venue_detail not in source
+
     def test_engine_delegates_rithmic_owner_graph_construction_once(
         self,
         engine_factory,
@@ -367,10 +394,33 @@ class TestEngineInit:
     def test_live_engine_rejects_invalid_runtime_reconciliation_interval(
         self, mock_db_session, mock_clock, monkeypatch, interval
     ):
+        events: list[str] = []
+        account_service = MagicMock()
+
+        def parse_generic_interval():
+            events.append("generic_interval")
+            return _runtime_reconciliation_interval_from_env()
+
         monkeypatch.setenv("RUNTIME_RECONCILE_INTERVAL_SECONDS", interval)
         with (
             patch("src.core.engine.create_redis_client") as redis_factory,
             patch("src.core.engine.create_adapter") as create_adapter,
+            patch(
+                "src.core.engine.RiskManager",
+                return_value=_RecordingRiskManager(events),
+            ),
+            patch(
+                "src.core.engine._runtime_reconciliation_interval_from_env",
+                side_effect=parse_generic_interval,
+            ),
+            patch(
+                "src.core.adapters.rithmic_runtime_composition._rithmic_account_snapshot_max_age_from_env"
+            ) as rithmic_max_age,
+            patch(
+                "src.core.adapters.rithmic_runtime_composition._rithmic_runtime_reconciliation_interval_from_env"
+            ) as rithmic_interval,
+            patch("src.core.engine.ExecutionEngine") as execution_engine,
+            patch("src.core.engine.build_rithmic_runtime_owners") as build_owners,
         ):
             redis_factory.return_value = MagicMock()
             create_adapter.return_value = MagicMock()
@@ -386,7 +436,332 @@ class TestEngineInit:
                         "mode": "live",
                         "instrument_product_ids": ["BINANCE:BTCUSDT-PERP"],
                     },
+                    account_service=account_service,
                 )
+
+        assert events == ["risk_resolver", "generic_interval"]
+        account_service.configure_authoritative_balance.assert_not_called()
+        rithmic_max_age.assert_not_called()
+        rithmic_interval.assert_not_called()
+        execution_engine.assert_not_called()
+        build_owners.assert_not_called()
+
+    def test_rithmic_engine_rejects_recovery_account_mismatch_before_bootstrap(
+        self,
+        mock_db_session,
+        mock_clock,
+    ):
+        adapter = _rithmic_adapter_for_reconnect_test()
+        account_service = MagicMock()
+        redis_client = MagicMock()
+        events: list[str] = []
+        risk_manager = _RecordingRiskManager(events)
+
+        with (
+            patch("src.core.engine.create_redis_client", return_value=redis_client),
+            patch("src.core.engine.RiskManager", return_value=risk_manager),
+            patch(
+                "src.core.adapters.rithmic_runtime_composition._rithmic_account_snapshot_max_age_from_env"
+            ) as max_age,
+            patch("src.core.engine.ExecutionEngine") as execution_engine,
+            patch("src.core.engine.build_rithmic_runtime_owners") as build_owners,
+            patch("src.core.engine.OpsSafetyService") as ops_safety,
+            pytest.raises(
+                ValueError,
+                match="^Rithmic recovery account must match order adapter account$",
+            ),
+        ):
+            StrategyEngine(
+                db_session=mock_db_session,
+                clock=mock_clock,
+                adapter=adapter,
+                adapter_config={
+                    "mode": "live",
+                    "instrument_product_ids": ["RITHMIC:NQ-202609"],
+                    "rithmic_recovery_profile": "recovery",
+                    "rithmic_recovery_account_id": "OTHER",
+                },
+                account_service=account_service,
+                audit_external_orders=True,
+            )
+
+        account_service.configure_authoritative_balance.assert_not_called()
+        max_age.assert_not_called()
+        assert events == []
+        execution_engine.assert_not_called()
+        ops_safety.assert_not_called()
+        build_owners.assert_not_called()
+        redis_client.set.assert_not_called()
+
+    def test_rithmic_engine_invalid_max_age_stops_before_later_bootstrap(
+        self,
+        engine_factory,
+        monkeypatch,
+    ):
+        account_service = MagicMock()
+        events: list[str] = []
+        monkeypatch.setenv("RITHMIC_ACCOUNT_SNAPSHOT_MAX_AGE_SECONDS", "invalid")
+
+        with (
+            patch(
+                "src.core.engine.RiskManager",
+                return_value=_RecordingRiskManager(events),
+            ),
+            patch(
+                "src.core.adapters.rithmic_runtime_composition._rithmic_runtime_reconciliation_interval_from_env"
+            ) as interval,
+            patch("src.core.engine.ExecutionEngine") as execution_engine,
+            pytest.raises(
+                ValueError,
+                match="^RITHMIC_ACCOUNT_SNAPSHOT_MAX_AGE_SECONDS must be a finite number greater than zero$",
+            ),
+        ):
+            engine_factory(
+                adapter=_rithmic_adapter_for_reconnect_test(),
+                account_service=account_service,
+                audit_external_orders=True,
+            )
+
+        account_service.configure_authoritative_balance.assert_not_called()
+        assert events == []
+        interval.assert_not_called()
+        execution_engine.assert_not_called()
+
+    def test_rithmic_engine_preserves_account_setup_exception_order_and_identity(
+        self,
+        engine_factory,
+    ):
+        error = RuntimeError("account setup")
+        events: list[str] = []
+        account_service = MagicMock()
+
+        def fail_account_setup(**kwargs):
+            events.append("account_setup")
+            raise error
+
+        account_service.configure_authoritative_balance.side_effect = fail_account_setup
+        with (
+            patch(
+                "src.core.engine.RiskManager",
+                return_value=_RecordingRiskManager(events),
+            ),
+            patch(
+                "src.core.adapters.rithmic_runtime_composition._rithmic_account_snapshot_max_age_from_env",
+                side_effect=lambda: events.append("max_age") or 600.0,
+            ),
+            patch(
+                "src.core.adapters.rithmic_runtime_composition._rithmic_runtime_reconciliation_interval_from_env"
+            ) as interval,
+            patch("src.core.engine.ExecutionEngine") as execution_engine,
+            pytest.raises(RuntimeError) as caught,
+        ):
+            engine_factory(
+                adapter=_rithmic_adapter_for_reconnect_test(),
+                account_service=account_service,
+                audit_external_orders=True,
+            )
+
+        assert caught.value is error
+        assert events == ["max_age", "account_setup"]
+        interval.assert_not_called()
+        execution_engine.assert_not_called()
+
+    def test_rithmic_engine_invalid_interval_follows_account_and_risk_setup(
+        self,
+        engine_factory,
+    ):
+        events: list[str] = []
+        account_service = MagicMock()
+        account_service.configure_authoritative_balance.side_effect = (
+            lambda **kwargs: events.append("account_setup")
+        )
+
+        def invalid_interval():
+            events.append("interval")
+            raise ValueError(
+                "RITHMIC_RUNTIME_RECONCILE_INTERVAL_SECONDS must be a finite number greater than zero"
+            )
+
+        with (
+            patch(
+                "src.core.engine.RiskManager",
+                return_value=_RecordingRiskManager(events),
+            ),
+            patch(
+                "src.core.adapters.rithmic_runtime_composition._rithmic_account_snapshot_max_age_from_env",
+                side_effect=lambda: events.append("max_age") or 600.0,
+            ),
+            patch(
+                "src.core.adapters.rithmic_runtime_composition._rithmic_runtime_reconciliation_interval_from_env",
+                side_effect=invalid_interval,
+            ),
+            patch("src.core.engine.ExecutionEngine") as execution_engine,
+            pytest.raises(
+                ValueError,
+                match="^RITHMIC_RUNTIME_RECONCILE_INTERVAL_SECONDS must be a finite number greater than zero$",
+            ),
+        ):
+            engine_factory(
+                adapter=_rithmic_adapter_for_reconnect_test(),
+                account_service=account_service,
+                audit_external_orders=True,
+            )
+
+        assert events == ["max_age", "account_setup", "risk_resolver", "interval"]
+        execution_engine.assert_not_called()
+
+    def test_rithmic_engine_blank_profile_fails_in_order_manager_after_setup(
+        self,
+        engine_factory,
+    ):
+        events: list[str] = []
+        account_service = MagicMock()
+        account_service.configure_authoritative_balance.side_effect = (
+            lambda **kwargs: events.append("account_setup")
+        )
+
+        def construct_execution_engine(*args, **kwargs):
+            events.append("execution_engine")
+            return ExecutionEngine(*args, **kwargs)
+
+        with (
+            patch(
+                "src.core.engine.RiskManager",
+                return_value=_RecordingRiskManager(events),
+            ),
+            patch(
+                "src.core.adapters.rithmic_runtime_composition._rithmic_account_snapshot_max_age_from_env",
+                side_effect=lambda: events.append("max_age") or 600.0,
+            ),
+            patch(
+                "src.core.adapters.rithmic_runtime_composition._rithmic_runtime_reconciliation_interval_from_env",
+                side_effect=lambda: events.append("interval") or 300.0,
+            ),
+            patch(
+                "src.core.engine.ExecutionEngine",
+                side_effect=construct_execution_engine,
+            ),
+            patch(
+                "src.core.order_manager.create_redis_client", return_value=MagicMock()
+            ),
+            patch("src.core.engine.build_rithmic_runtime_owners") as build_owners,
+            pytest.raises(
+                ValueError,
+                match="^account identity must not be blank$",
+            ),
+        ):
+            engine_factory(
+                adapter=_rithmic_adapter_for_reconnect_test(),
+                adapter_config={
+                    "mode": "live",
+                    "instrument_product_ids": ["RITHMIC:NQ-202609"],
+                    "rithmic_recovery_profile": "   ",
+                    "rithmic_recovery_account_id": "ACCOUNT",
+                },
+                account_service=account_service,
+                audit_external_orders=True,
+            )
+
+        assert events == [
+            "max_age",
+            "account_setup",
+            "risk_resolver",
+            "interval",
+            "execution_engine",
+        ]
+        build_owners.assert_not_called()
+
+    def test_backtest_identity_precedes_rithmic_audit_and_bootstrap(
+        self,
+        engine_factory,
+    ):
+        account_service = MagicMock()
+        with (
+            patch("src.core.engine.prepare_rithmic_runtime_bootstrap") as bootstrap,
+            pytest.raises(
+                ValueError,
+                match="^backtest mode requires SimulatedAdapter$",
+            ),
+        ):
+            engine_factory(
+                adapter=_rithmic_adapter_for_reconnect_test(),
+                account_service=account_service,
+                audit_external_orders=False,
+                is_backtest=True,
+            )
+
+        bootstrap.assert_not_called()
+        account_service.configure_authoritative_balance.assert_not_called()
+
+    def test_rithmic_audit_failure_precedes_account_bootstrap(self, engine_factory):
+        account_service = MagicMock()
+        events: list[str] = []
+        with (
+            patch(
+                "src.core.engine.RiskManager",
+                return_value=_RecordingRiskManager(events),
+            ),
+            patch(
+                "src.core.adapters.rithmic_runtime_composition._rithmic_account_snapshot_max_age_from_env"
+            ) as max_age,
+            patch("src.core.engine.ExecutionEngine") as execution_engine,
+            pytest.raises(
+                ValueError,
+                match="^Rithmic live trading requires audit_external_orders$",
+            ),
+        ):
+            engine_factory(
+                adapter=_rithmic_adapter_for_reconnect_test(),
+                account_service=account_service,
+                audit_external_orders=False,
+            )
+
+        account_service.configure_authoritative_balance.assert_not_called()
+        max_age.assert_not_called()
+        assert events == []
+        execution_engine.assert_not_called()
+
+    def test_rithmic_engine_uses_one_canonical_account_for_every_owner(
+        self,
+        engine_factory,
+    ):
+        adapter = _rithmic_adapter_for_reconnect_test()
+        account_service = MagicMock()
+
+        with patch(
+            "src.core.engine.ExecutionEngine",
+            wraps=ExecutionEngine,
+        ) as execution_engine:
+            engine = engine_factory(
+                adapter=adapter,
+                adapter_config={
+                    "mode": "live",
+                    "instrument_product_ids": ["RITHMIC:NQ-202609"],
+                    "rithmic_recovery_profile": " recovery ",
+                    "rithmic_recovery_account_id": " ACCOUNT ",
+                },
+                account_service=account_service,
+                audit_external_orders=True,
+            )
+
+        account_service.configure_authoritative_balance.assert_called_once_with(
+            venue="rithmic",
+            account_id="ACCOUNT",
+            max_age_seconds=600.0,
+            runtime_environment=engine.runtime_environment,
+        )
+        assert execution_engine.call_args.kwargs["rithmic_account_profile"] == (
+            " recovery "
+        )
+        assert execution_engine.call_args.kwargs["rithmic_account_id"] == "ACCOUNT"
+        assert engine.execution_engine.order_manager.rithmic_account_profile == (
+            "recovery"
+        )
+        assert engine.execution_engine.order_manager.rithmic_account_id == "ACCOUNT"
+        assert engine._rithmic_recovery_profile == "recovery"
+        assert engine._rithmic_recovery_account_id == "ACCOUNT"
+        assert engine._rithmic_runtime.profile == "recovery"
+        assert engine._rithmic_runtime.account_id == "ACCOUNT"
 
     def test_default_adapter_simulated(self, mock_db_session, mock_clock):
         """When no adapter_config, should default to simulated mode."""
@@ -5082,7 +5457,10 @@ class TestRuntimeReconciliationThread:
 
 
 class TestExchangeOrderEventThread:
-    def test_rithmic_runtime_reconciliation_uses_authoritative_ledger(self):
+    def test_rithmic_runtime_reconciliation_uses_authoritative_ledger(
+        self,
+        engine_factory,
+    ):
         adapter = RithmicExchangeAdapter(
             profile="test",
             account_id="ACCOUNT",
@@ -5096,13 +5474,10 @@ class TestExchangeOrderEventThread:
             client_factory=MagicMock(),
         )
 
-        assert (
-            _is_runtime_reconciliation_enabled(
-                adapter,
-                {"mode": "live"},
-            )
-            is True
-        )
+        engine = engine_factory(adapter=adapter, audit_external_orders=True)
+
+        assert engine._runtime_reconciliation_enabled is True
+        assert engine._runtime_reconcile_interval == 300.0
 
     def test_rithmic_engine_requires_owned_order_audit(
         self,

@@ -5,6 +5,8 @@ from __future__ import annotations
 from collections.abc import Callable
 from dataclasses import dataclass
 import logging
+import math
+import os
 import threading
 from typing import Any
 
@@ -41,6 +43,97 @@ from src.core.interfaces.exchange import ExchangeOrderEvent
 from src.core.models import Candlestick, Signal, SignalType
 from src.core.ops_safety import OpsSafetyService
 from src.core.risk_manager import AccountService
+from src.core.runtime_environment import RuntimeEnvironment
+
+
+def _positive_env_float(name: str, default: str) -> float:
+    raw_value = os.getenv(name, default)
+    try:
+        value = float(raw_value)
+    except ValueError as exc:
+        raise ValueError(f"{name} must be a finite number greater than zero") from exc
+    if not math.isfinite(value) or value <= 0:
+        raise ValueError(f"{name} must be a finite number greater than zero")
+    return value
+
+
+def _rithmic_account_snapshot_max_age_from_env() -> float:
+    return _positive_env_float("RITHMIC_ACCOUNT_SNAPSHOT_MAX_AGE_SECONDS", "600")
+
+
+def _rithmic_runtime_reconciliation_interval_from_env() -> float:
+    return _positive_env_float("RITHMIC_RUNTIME_RECONCILE_INTERVAL_SECONDS", "300")
+
+
+@dataclass(frozen=True)
+class RithmicRuntimeBootstrap:
+    """Venue-owned identity and deferred schedule selected during startup."""
+
+    profile: str | None
+    account_id: str | None
+    is_rithmic_runtime: bool
+    _interval_resolver: Callable[[], float] | None = None
+
+    def resolve_reconciliation_schedule(
+        self,
+        *,
+        generic_enabled: bool,
+        generic_interval_resolver: Callable[[], float],
+    ) -> tuple[bool, float | None]:
+        """Apply a Rithmic schedule override without owning generic policy."""
+        if self.is_rithmic_runtime:
+            if self._interval_resolver is None:
+                raise RuntimeError("Rithmic reconciliation schedule is unavailable")
+            return True, self._interval_resolver()
+        if not generic_enabled:
+            return False, None
+        return True, generic_interval_resolver()
+
+
+def prepare_rithmic_runtime_bootstrap(
+    *,
+    adapter: IExchangeAdapter,
+    adapter_config: dict[str, Any],
+    audit_external_orders: bool,
+    account_service: AccountService,
+    runtime_environment: RuntimeEnvironment,
+) -> RithmicRuntimeBootstrap:
+    """Prepare venue identity and account authority without external I/O."""
+    profile = adapter_config.get("rithmic_recovery_profile") or adapter_config.get(
+        "rithmic_profile"
+    )
+    account_id = adapter_config.get(
+        "rithmic_recovery_account_id"
+    ) or adapter_config.get("account_id")
+    if not isinstance(adapter, RithmicExchangeAdapter):
+        return RithmicRuntimeBootstrap(
+            profile=profile,
+            account_id=account_id,
+            is_rithmic_runtime=False,
+        )
+    if not audit_external_orders:
+        raise ValueError("Rithmic live trading requires audit_external_orders")
+
+    profile = profile or adapter.profile
+    raw_account_id = account_id or adapter.account_id
+    if not isinstance(raw_account_id, str):
+        raise ValueError("Rithmic recovery account must match order adapter account")
+    account_id = raw_account_id.strip()
+    if not account_id or account_id != adapter.account_id:
+        raise ValueError("Rithmic recovery account must match order adapter account")
+
+    account_service.configure_authoritative_balance(
+        venue="rithmic",
+        account_id=account_id,
+        max_age_seconds=_rithmic_account_snapshot_max_age_from_env(),
+        runtime_environment=runtime_environment,
+    )
+    return RithmicRuntimeBootstrap(
+        profile=profile,
+        account_id=account_id,
+        is_rithmic_runtime=True,
+        _interval_resolver=_rithmic_runtime_reconciliation_interval_from_env,
+    )
 
 
 @dataclass(frozen=True)

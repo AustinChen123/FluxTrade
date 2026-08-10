@@ -54,13 +54,13 @@ from src.core.portfolio_runtime import (
 from src.core.data_provider import check_data_availability
 from src.core.adapters import (
     CcxtExchangeAdapter,
-    RithmicExchangeAdapter,
     SimulatedAdapter,
     create_adapter,
 )
 from src.core.adapters.rithmic_runtime_composition import (
     RithmicRuntimeCallbacks,
     build_rithmic_runtime_owners,
+    prepare_rithmic_runtime_bootstrap,
 )
 from src.core.journal import StrategyJournal
 from src.core.redis_factory import create_redis_client
@@ -138,38 +138,12 @@ def _is_runtime_reconciliation_enabled(
         return False
     if isinstance(adapter, CcxtExchangeAdapter):
         return True
-    if isinstance(adapter, RithmicExchangeAdapter):
-        return True
     return bool(adapter_config and adapter_config.get("mode") == "live")
 
 
 def _runtime_reconciliation_interval_from_env() -> float:
     name = "RUNTIME_RECONCILE_INTERVAL_SECONDS"
     raw_value = os.getenv(name, "3600")
-    try:
-        interval = float(raw_value)
-    except ValueError as exc:
-        raise ValueError(f"{name} must be a finite number greater than zero") from exc
-    if not math.isfinite(interval) or interval <= 0:
-        raise ValueError(f"{name} must be a finite number greater than zero")
-    return interval
-
-
-def _rithmic_account_snapshot_max_age_from_env() -> float:
-    name = "RITHMIC_ACCOUNT_SNAPSHOT_MAX_AGE_SECONDS"
-    raw_value = os.getenv(name, "600")
-    try:
-        max_age = float(raw_value)
-    except ValueError as exc:
-        raise ValueError(f"{name} must be a finite number greater than zero") from exc
-    if not math.isfinite(max_age) or max_age <= 0:
-        raise ValueError(f"{name} must be a finite number greater than zero")
-    return max_age
-
-
-def _rithmic_runtime_reconciliation_interval_from_env() -> float:
-    name = "RITHMIC_RUNTIME_RECONCILE_INTERVAL_SECONDS"
-    raw_value = os.getenv(name, "300")
     try:
         interval = float(raw_value)
     except ValueError as exc:
@@ -277,12 +251,6 @@ class StrategyEngine:
         )
         if self._live_product_ids is not None and not self._live_product_ids:
             raise ValueError("live adapter requires instrument_product_ids")
-        self._rithmic_recovery_profile = effective_adapter_config.get(
-            "rithmic_recovery_profile"
-        ) or effective_adapter_config.get("rithmic_profile")
-        self._rithmic_recovery_account_id = effective_adapter_config.get(
-            "rithmic_recovery_account_id"
-        ) or effective_adapter_config.get("account_id")
         self._startup_auto_recovery_allowed = False
         self._startup_lock_cause: str | None = None
         if adapter is None:
@@ -303,38 +271,29 @@ class StrategyEngine:
             )
         if is_backtest is True and not isinstance(adapter, SimulatedAdapter):
             raise ValueError("backtest mode requires SimulatedAdapter")
-        if isinstance(adapter, RithmicExchangeAdapter):
-            if not audit_external_orders:
-                raise ValueError("Rithmic live trading requires audit_external_orders")
-            self._rithmic_recovery_profile = (
-                self._rithmic_recovery_profile or adapter.profile
-            )
-            self._rithmic_recovery_account_id = (
-                self._rithmic_recovery_account_id or adapter.account_id
-            )
-            self.account_service.configure_authoritative_balance(
-                venue="rithmic",
-                account_id=self._rithmic_recovery_account_id,
-                max_age_seconds=_rithmic_account_snapshot_max_age_from_env(),
-                runtime_environment=self.runtime_environment,
-            )
+        rithmic_bootstrap = prepare_rithmic_runtime_bootstrap(
+            adapter=adapter,
+            adapter_config=effective_adapter_config,
+            audit_external_orders=audit_external_orders,
+            account_service=self.account_service,
+            runtime_environment=self.runtime_environment,
+        )
+        self._rithmic_recovery_profile = rithmic_bootstrap.profile
+        self._rithmic_recovery_account_id = rithmic_bootstrap.account_id
         self.risk_manager.instrument_spec_resolver = getattr(
             adapter,
             "get_instrument_spec",
             None,
         )
-        self._runtime_reconciliation_enabled = _is_runtime_reconciliation_enabled(
-            adapter,
-            adapter_config,
-        )
-        self._runtime_reconcile_interval = (
-            (
-                _rithmic_runtime_reconciliation_interval_from_env()
-                if isinstance(adapter, RithmicExchangeAdapter)
-                else _runtime_reconciliation_interval_from_env()
-            )
-            if self._runtime_reconciliation_enabled
-            else None
+        (
+            self._runtime_reconciliation_enabled,
+            self._runtime_reconcile_interval,
+        ) = rithmic_bootstrap.resolve_reconciliation_schedule(
+            generic_enabled=_is_runtime_reconciliation_enabled(
+                adapter,
+                adapter_config,
+            ),
+            generic_interval_resolver=_runtime_reconciliation_interval_from_env,
         )
 
         self.execution_engine = ExecutionEngine(
