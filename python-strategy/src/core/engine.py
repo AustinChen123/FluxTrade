@@ -719,7 +719,7 @@ class StrategyEngine:
     def _can_auto_resume_after_startup_recovery(self, summary: dict | None) -> bool:
         return bool(
             self._startup_auto_recovery_allowed
-            and summary is not None
+            and summary
             and summary.get("auto_resume_safe") is True
         )
 

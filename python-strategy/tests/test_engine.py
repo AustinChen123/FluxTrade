@@ -2402,7 +2402,7 @@ class TestHeartbeatRecording:
             return_value={"auto_resume_safe": True}
         )
         engine._resume_after_kill_switch = MagicMock()
-        engine.ops_safety.kill_switch = MagicMock()
+        engine._run_ops_kill_switch = MagicMock(return_value=_kill_switch_result())
         for name in (
             "_halt_for_kill_switch",
             "_start_command_listener",
@@ -2421,7 +2421,7 @@ class TestHeartbeatRecording:
 
         gate.arm.assert_called_once_with()
         engine._resume_after_kill_switch.assert_not_called()
-        engine.ops_safety.kill_switch.assert_called_once_with(
+        engine._run_ops_kill_switch.assert_called_once_with(
             actor="startup_recovery",
             reason="persisted_lockdown",
         )
@@ -2456,6 +2456,46 @@ class TestHeartbeatRecording:
         gate.arm.assert_not_called()
         engine._resume_after_kill_switch.assert_not_called()
         assert engine._startup_lock_cause == "rithmic_reconciliation_blocked"
+
+    @pytest.mark.parametrize("summary", [0, "", []])
+    def test_falsey_malformed_rithmic_startup_remains_locked_and_continues(
+        self,
+        engine,
+        summary,
+    ):
+        gate = MagicMock(spec=RithmicPublisherLivenessGate)
+        engine._entry_admission_gate = gate
+        engine._rithmic_runtime.is_rithmic_runtime = True
+        engine._startup_auto_recovery_allowed = True
+        engine._startup_lock_cause = "unclean_boot"
+        engine._runtime_reconciliation_enabled = True
+        engine._check_system_state = MagicMock(return_value=True)
+        engine._reconcile_recoverable_orders_on_startup = MagicMock(
+            return_value=summary
+        )
+        engine._resume_after_kill_switch = MagicMock()
+        for name in (
+            "_halt_for_kill_switch",
+            "_start_command_listener",
+            "_reconcile_balance",
+            "_initialize_strategy_state_cache_on_startup",
+            "_start_strategy_state_subscriber_on_startup",
+            "_start_exchange_order_event_stream",
+            "_start_heartbeat",
+            "_start_runtime_reconciliation",
+            "scan_strategies",
+            "_restore_active_strategies_on_startup",
+        ):
+            setattr(engine, name, MagicMock())
+
+        engine.startup()
+
+        gate.arm.assert_not_called()
+        engine._resume_after_kill_switch.assert_not_called()
+        assert engine._startup_lock_cause == "rithmic_reconciliation_blocked"
+        engine._start_heartbeat.assert_called_once_with()
+        engine._start_runtime_reconciliation.assert_called_once_with()
+        engine.scan_strategies.assert_called_once_with()
 
     def test_truthy_malformed_rithmic_summary_aborts_remaining_startup(self, engine):
         engine._rithmic_runtime.is_rithmic_runtime = True
