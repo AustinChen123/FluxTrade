@@ -89,6 +89,18 @@ class RithmicRuntimeOwners:
         self.order_event_stream.start()
         return True
 
+    def on_order_runtime_started(self) -> None:
+        """Baseline the current reconnect owner after a successful start."""
+        if self.order_reconnect is None:
+            return
+        self.order_reconnect.on_runtime_started()
+
+    def reconcile_order_reconnect(self) -> tuple[bool, bool]:
+        """Run reconnect recovery and report whether a venue owner handled it."""
+        if self.order_reconnect is None:
+            return False, False
+        return True, self.order_reconnect.reconcile_if_needed()
+
     def detect_external_order_drift(self, reason: str) -> None:
         """Route an external-order finding to the current drift owner."""
         if self.external_order_drift is None:

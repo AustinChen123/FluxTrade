@@ -6911,6 +6911,22 @@ def test_engine_reconnect_seam_delegates_only_to_venue_owner(engine):
     engine.execution_engine.reconcile_rithmic_owned_orders.assert_not_called()
 
 
+def test_engine_reconnect_seams_route_through_runtime_facade(engine_factory):
+    adapter = _rithmic_adapter_for_reconnect_test()
+    engine = engine_factory(adapter=adapter, audit_external_orders=True)
+    engine._rithmic_runtime.order_reconnect = None
+    engine._rithmic_runtime.reconcile_order_reconnect = MagicMock(
+        return_value=(True, True)
+    )
+    engine._rithmic_runtime.on_order_runtime_started = MagicMock()
+
+    assert engine._reconcile_owned_orders_on_reconnect() is True
+    engine._rithmic_runtime.reconcile_order_reconnect.assert_called_once_with()
+
+    engine._rithmic_runtime.order_event_stream._on_runtime_started()
+    engine._rithmic_runtime.on_order_runtime_started.assert_called_once_with()
+
+
 def test_rithmic_stream_start_clears_pending_generation_after_success(
     engine_factory,
 ):

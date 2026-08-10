@@ -406,9 +406,7 @@ class StrategyEngine:
                     worker,
                 ),
                 on_runtime_started=lambda: (
-                    self._rithmic_runtime.order_reconnect.on_runtime_started()
-                    if self._rithmic_runtime.order_reconnect is not None
-                    else None
+                    self._rithmic_runtime.on_order_runtime_started()
                 ),
                 reconcile_if_needed=lambda: (
                     self._reconcile_owned_orders_on_reconnect()
@@ -718,13 +716,16 @@ class StrategyEngine:
         adapter = self.execution_engine.adapter
         if not isinstance(adapter, RithmicExchangeAdapter):
             return True
-        if self._rithmic_runtime.order_reconnect is None:
+        handled_by_rithmic, reconciled = (
+            self._rithmic_runtime.reconcile_order_reconnect()
+        )
+        if not handled_by_rithmic:
             logger.error(
                 "Reconnect order reconciliation is unavailable; "
                 "submissions remain gated"
             )
             return False
-        return self._rithmic_runtime.order_reconnect.reconcile_if_needed()
+        return reconciled
 
     def _can_auto_resume_after_startup_recovery(self, summary: dict | None) -> bool:
         return bool(

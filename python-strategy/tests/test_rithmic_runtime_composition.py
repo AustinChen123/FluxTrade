@@ -148,6 +148,33 @@ def test_runtime_handle_does_not_fall_through_when_ledger_owner_returns_none() -
     assert owners.reconcile_startup() == (True, None)
 
 
+def test_runtime_handle_routes_reconnect_lifecycle_to_current_owner() -> None:
+    owners = RithmicRuntimeOwners(order_event_lifecycle=MagicMock())
+
+    assert owners.on_order_runtime_started() is None
+    assert owners.reconcile_order_reconnect() == (False, False)
+
+    first_owner = MagicMock()
+    first_owner.reconcile_if_needed.return_value = False
+    owners.order_reconnect = first_owner
+
+    assert owners.on_order_runtime_started() is None
+    assert owners.reconcile_order_reconnect() == (True, False)
+    first_owner.on_runtime_started.assert_called_once_with()
+    first_owner.reconcile_if_needed.assert_called_once_with()
+
+    second_owner = MagicMock()
+    second_owner.reconcile_if_needed.return_value = True
+    owners.order_reconnect = second_owner
+
+    assert owners.on_order_runtime_started() is None
+    assert owners.reconcile_order_reconnect() == (True, True)
+    first_owner.on_runtime_started.assert_called_once_with()
+    first_owner.reconcile_if_needed.assert_called_once_with()
+    second_owner.on_runtime_started.assert_called_once_with()
+    second_owner.reconcile_if_needed.assert_called_once_with()
+
+
 @pytest.mark.parametrize(
     ("owner_attr", "owner_method", "facade_method", "args", "kwargs"),
     [
@@ -219,6 +246,29 @@ def test_runtime_handle_preserves_runtime_recovery_exception_identity() -> None:
     operation = owners.runtime_recovery_operation()
     with pytest.raises(RuntimeError) as caught:
         operation()
+
+    assert caught.value is error
+
+
+@pytest.mark.parametrize(
+    ("facade_method", "owner_method"),
+    [
+        ("on_order_runtime_started", "on_runtime_started"),
+        ("reconcile_order_reconnect", "reconcile_if_needed"),
+    ],
+)
+def test_runtime_handle_preserves_reconnect_exception_identity(
+    facade_method: str,
+    owner_method: str,
+) -> None:
+    owners = RithmicRuntimeOwners(order_event_lifecycle=MagicMock())
+    owner = MagicMock()
+    error = RuntimeError(owner_method)
+    getattr(owner, owner_method).side_effect = error
+    owners.order_reconnect = owner
+
+    with pytest.raises(RuntimeError) as caught:
+        getattr(owners, facade_method)()
 
     assert caught.value is error
 
