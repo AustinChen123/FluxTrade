@@ -76,6 +76,21 @@ def test_parent_manifest_and_loaded_native_binary_are_exact() -> None:
     assert native_matcher_sha256() == expected
 
 
+def test_candidate_parent_is_read_from_the_raw_commit_object(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    raw_commit = (
+        b"tree cfae260b0a67de1ef7c0f11cb98c664cab9bf3e4\n"
+        b"parent 6494c2aa3d436f57c4c5466320d5e7a25c4b8a0a\n"
+        b"author Test <test@example.com> 0 +0000\n\nsubject\n"
+    )
+    monkeypatch.setattr(fixture_module, "_git", lambda *_args: raw_commit)
+    assert fixture_module._commit_tree_and_parents("HEAD") == (
+        "cfae260b0a67de1ef7c0f11cb98c664cab9bf3e4",
+        ["6494c2aa3d436f57c4c5466320d5e7a25c4b8a0a"],
+    )
+
+
 def test_real_collectors_produce_the_same_exact_outcome(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

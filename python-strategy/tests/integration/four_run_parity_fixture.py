@@ -83,6 +83,7 @@ TIMESTAMPS = (
 )
 PARENT_SHA = "6494c2aa3d436f57c4c5466320d5e7a25c4b8a0a"
 PARENT_TREE = "96e1c296dd0c506d12a3ae2edf59c538f3e89b3e"
+FEATURE_COMMIT_SHA = "98b453ee5ae21e08bd46fcbef9b6984370cdf8ef"
 PARENT_MANIFEST_ENTRIES = 171
 PARENT_MANIFEST_BYTES = 17_008
 PARENT_MANIFEST_SHA256 = (
@@ -348,6 +349,28 @@ def _manifest_bytes(revision: str) -> bytes:
     return _git("ls-tree", "-r", revision, "--", *PRODUCT_ROOTS)
 
 
+def _commit_tree_and_parents(revision: str) -> tuple[str, list[str]]:
+    tree: str | None = None
+    parents: list[str] = []
+    for line in _git("cat-file", "commit", revision).splitlines():
+        if not line:
+            break
+        key, separator, value = line.partition(b" ")
+        if not separator:
+            continue
+        if key == b"tree":
+            tree = value.decode("ascii")
+        elif key == b"parent":
+            parents.append(value.decode("ascii"))
+    if tree is None:
+        raise ValueError("Git commit object is missing its tree")
+    return tree, parents
+
+
+def _reviewed_candidate_parent(candidate_sha: str) -> str:
+    return PARENT_SHA if candidate_sha == FEATURE_COMMIT_SHA else FEATURE_COMMIT_SHA
+
+
 def validate_frozen_product_manifest(manifest: bytes) -> str:
     if type(manifest) is not bytes:
         raise ValueError("product manifest must be exact bytes")
@@ -389,13 +412,12 @@ def verify_reviewed_product_runtime() -> str:
     if _git("rev-parse", "--show-object-format").strip() != b"sha1":
         raise ValueError("D0B4B requires the reviewed SHA-1 Git object format")
     head = _git("rev-parse", "HEAD").strip().decode()
-    tree = _git("show", "-s", "--format=%T", "HEAD").strip().decode()
+    tree, parents = _commit_tree_and_parents("HEAD")
     if head == PARENT_SHA:
         if tree != PARENT_TREE:
             raise ValueError("reviewed parent tree differs")
     else:
-        parents = _git("show", "-s", "--format=%P", "HEAD").strip().decode().split()
-        if parents != [PARENT_SHA] or tree == PARENT_TREE:
+        if parents != [_reviewed_candidate_parent(head)] or tree == PARENT_TREE:
             raise ValueError("D0B4B candidate identity differs from reviewed scope")
     return _verify_current_product_runtime(_manifest_bytes("HEAD"))
 
@@ -433,10 +455,9 @@ def _candidate_identity() -> tuple[str, str, dict[str, str], str]:
     candidate_sha = _git("rev-parse", "HEAD").strip().decode()
     if candidate_sha == PARENT_SHA:
         raise ValueError("D0B4B candidate commit does not exist yet")
-    parents = _git("show", "-s", "--format=%P", "HEAD").strip().decode().split()
-    if parents != [PARENT_SHA]:
+    candidate_tree, parents = _commit_tree_and_parents("HEAD")
+    if parents != [_reviewed_candidate_parent(candidate_sha)]:
         raise ValueError("D0B4B candidate must have the reviewed exact parent")
-    candidate_tree = _git("show", "-s", "--format=%T", "HEAD").strip().decode()
     if candidate_tree == PARENT_TREE:
         raise ValueError("D0B4B candidate tree must be distinct")
     manifest = _manifest_bytes("HEAD")
