@@ -23,6 +23,7 @@ from typing import (
     Sequence,
     Type,
     Union,
+    cast,
 )
 from sqlalchemy import func, text
 from sqlalchemy.orm import Session
@@ -40,7 +41,7 @@ from src.core.risk_manager import RiskManager, AccountService
 from src.core.execution import ExecutionEngine, ExitDecision
 from src.core.clock import Clock
 from src.core.interfaces import IExchangeAdapter, IOrderRepository
-from src.core.interfaces.exchange import EntryAdmissionGate
+from src.core.interfaces.exchange import EntryAdmissionGate, ExchangeOrderEvent
 from src.core.daily_nav_snapshot import DailyNavSnapshotService
 from src.core.strategy_loader import StrategyLoader
 from src.core.portfolio_runtime import (
@@ -54,7 +55,6 @@ from src.core.data_provider import check_data_availability
 from src.core.adapters import (
     CcxtExchangeAdapter,
     RithmicExchangeAdapter,
-    RithmicUnmappedOrderEvent,
     SimulatedAdapter,
     create_adapter,
 )
@@ -78,6 +78,9 @@ from src.core.adapters.rithmic_order_reconnect import (
 )
 from src.core.adapters.rithmic_order_event_lifecycle import (
     RithmicOrderEventLifecycleGate,
+)
+from src.core.adapters.rithmic_order_event_stream import (
+    RithmicOrderEventStreamService,
 )
 from src.core.adapters.rithmic_runtime_recovery import (
     RithmicRuntimeRecoveryService,
@@ -115,7 +118,6 @@ SYSTEM_STATE_KEY = _DEFAULT_RUNTIME_ENVIRONMENT.key("system:state")
 SYSTEM_BOOT_STATE_KEY = _DEFAULT_RUNTIME_ENVIRONMENT.key("system:engine_boot_state")
 SYSTEM_STATE_LOCKDOWN = "LOCKDOWN"
 SYSTEM_STATE_OK = "OK"
-_RITHMIC_SAFE_ORDER_EVENT_ACTIONS = frozenset({"applied"})
 _KILL_SWITCH_IDEMPOTENCY_TTL_SECONDS = 86_400
 _STRATEGY_COMMAND_CLAIM_TTL_SECONDS = 60
 _STRATEGY_COMMAND_IDEMPOTENCY_TTL_SECONDS = 86_400
@@ -534,6 +536,35 @@ class StrategyEngine:
         )
         self.order_event_thread = None
         self._order_event_stop = threading.Event()
+        self._rithmic_order_event_stream = (
+            RithmicOrderEventStreamService(
+                adapter=adapter,
+                stop_event=self._order_event_stop,
+                is_running=lambda: self.running,
+                publish_worker=lambda worker: setattr(
+                    self,
+                    "order_event_thread",
+                    worker,
+                ),
+                reconcile_if_needed=lambda: (
+                    self._reconcile_owned_orders_on_reconnect()
+                ),
+                process_event=lambda event: (
+                    self.execution_engine.process_exchange_order_event(event)
+                ),
+                lockdown=lambda reason: self._lockdown_for_rithmic_order_drift(reason),
+                assert_runtime_leadership=lambda: self._assert_runtime_leadership(),
+                halt_submissions=lambda: self._halt_for_kill_switch(),
+                on_runtime_started=lambda: (
+                    self._rithmic_order_reconnect.on_runtime_started()
+                    if self._rithmic_order_reconnect is not None
+                    else None
+                ),
+                logger=logger,
+            )
+            if isinstance(adapter, RithmicExchangeAdapter)
+            else None
+        )
         self._rithmic_kill_switch_clear_preparation = (
             RithmicKillSwitchClearPreparationService(
                 adapter=adapter,
@@ -736,6 +767,9 @@ class StrategyEngine:
         self._strategy_state_manager.start_subscriber()
 
     def _start_exchange_order_event_stream(self) -> None:
+        if self._rithmic_order_event_stream is not None:
+            self._rithmic_order_event_stream.start()
+            return
         adapter = self.execution_engine.adapter
         start = getattr(adapter, "start_order_event_stream", None)
         poll = getattr(adapter, "poll_order_event", None)
@@ -747,56 +781,21 @@ class StrategyEngine:
         except Exception:
             self._halt_for_kill_switch()
             raise
-        if isinstance(adapter, RithmicExchangeAdapter):
-            if self._rithmic_order_reconnect is not None:
-                self._rithmic_order_reconnect.on_runtime_started()
         self._order_event_stop.clear()
 
         def order_event_loop() -> None:
             while self.running and not self._order_event_stop.is_set():
                 try:
                     self._assert_runtime_leadership()
-                    if isinstance(adapter, RithmicExchangeAdapter):
-                        if not self._reconcile_owned_orders_on_reconnect():
-                            self._order_event_stop.wait(1.0)
-                            continue
                     event = poll()
                     if event is None:
                         self._order_event_stop.wait(0.05)
                         continue
                     self._assert_runtime_leadership()
-                    result = self.execution_engine.process_exchange_order_event(event)
-                    self._assert_runtime_leadership()
-                    if isinstance(adapter, RithmicExchangeAdapter):
-                        action = str(result.get("action") or "")
-                        if action == "unknown_order":
-                            self._lockdown_for_external_order(
-                                account_id=str(
-                                    (event.raw or {}).get("account_id") or ""
-                                ),
-                                exchange=str((event.raw or {}).get("exchange") or ""),
-                                symbol=str(
-                                    (event.raw or {}).get("symbol") or event.product_id
-                                ),
-                                client_order_id=event.client_order_id,
-                                exchange_order_id=event.exchange_order_id,
-                            )
-                        elif self._rithmic_order_event_requires_reconciliation(result):
-                            self._lockdown_for_rithmic_order_event(
-                                action=action or "missing_action",
-                                event=event,
-                            )
-                except RithmicUnmappedOrderEvent as error:
-                    try:
-                        self._assert_runtime_leadership()
-                    except Exception:
-                        return
-                    self._lockdown_for_external_order(
-                        account_id=error.account_id,
-                        exchange=error.exchange,
-                        symbol=error.symbol,
+                    self.execution_engine.process_exchange_order_event(
+                        cast(ExchangeOrderEvent, event)
                     )
-                    continue
+                    self._assert_runtime_leadership()
                 except Exception:
                     logger.exception(
                         "Exchange order event stream failed; submissions remain halted"
@@ -820,45 +819,6 @@ class StrategyEngine:
             if thread.is_alive():
                 return False
         return True
-
-    def _lockdown_for_external_order(
-        self,
-        *,
-        account_id: str,
-        exchange: str,
-        symbol: str,
-        client_order_id: str | None = None,
-        exchange_order_id: str | None = None,
-    ) -> None:
-        reason = (
-            "rithmic_external_order_detected: "
-            f"account_id={account_id or 'unknown'} "
-            f"exchange={exchange or 'unknown'} symbol={symbol or 'unknown'} "
-            f"client_order_id={client_order_id or 'unknown'} "
-            f"exchange_order_id={exchange_order_id or 'unknown'}"
-        )
-        self._lockdown_for_rithmic_order_drift(reason)
-
-    @staticmethod
-    def _rithmic_order_event_requires_reconciliation(result: dict) -> bool:
-        return (
-            result.get("action") not in _RITHMIC_SAFE_ORDER_EVENT_ACTIONS
-            or bool(result.get("verification_blocked"))
-            or bool(result.get("unresolved"))
-        )
-
-    def _lockdown_for_rithmic_order_event(
-        self,
-        *,
-        action: str,
-        event,
-    ) -> None:
-        self._lockdown_for_rithmic_order_drift(
-            "rithmic_order_event_requires_reconciliation: "
-            f"action={action} product_id={event.product_id} "
-            f"client_order_id={event.client_order_id or 'unknown'} "
-            f"exchange_order_id={event.exchange_order_id or 'unknown'}"
-        )
 
     def _lockdown_for_rithmic_order_drift(self, reason: str) -> None:
         if self._rithmic_external_order_drift is None:

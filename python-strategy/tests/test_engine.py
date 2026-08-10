@@ -51,6 +51,9 @@ from src.core.adapters.rithmic_order_reconnect import (
 from src.core.adapters.rithmic_order_event_lifecycle import (
     RithmicOrderEventLifecycleGate,
 )
+from src.core.adapters.rithmic_order_event_stream import (
+    RithmicOrderEventStreamService,
+)
 from src.core.adapters.rithmic_runtime_recovery import (
     RithmicRuntimeRecoveryService,
 )
@@ -4643,6 +4646,16 @@ class TestExchangeOrderEventThread:
 
         engine._halt_for_kill_switch.assert_called_once_with()
 
+    def test_rithmic_event_stream_start_delegates_only_to_venue_owner(self, engine):
+        owner = MagicMock()
+        engine._rithmic_order_event_stream = owner
+        engine.execution_engine.adapter.start_order_event_stream = MagicMock()
+
+        engine._start_exchange_order_event_stream()
+
+        owner.start.assert_called_once_with()
+        engine.execution_engine.adapter.start_order_event_stream.assert_not_called()
+
     def test_event_stream_failure_halts_local_submissions(self, engine):
         adapter = MagicMock()
         adapter.poll_order_event.side_effect = ExchangeError("invalid event")
@@ -4690,18 +4703,19 @@ class TestExchangeOrderEventThread:
         result = {} if action is None else {"action": action}
 
         assert (
-            StrategyEngine._rithmic_order_event_requires_reconciliation(result)
+            RithmicOrderEventStreamService.requires_reconciliation(result)
             is requires_reconciliation
         )
 
     @pytest.mark.parametrize("flag", ["verification_blocked", "unresolved"])
     def test_rithmic_applied_event_with_unsafe_flag_fails_closed(self, flag):
-        assert StrategyEngine._rithmic_order_event_requires_reconciliation(
+        assert RithmicOrderEventStreamService.requires_reconciliation(
             {"action": "applied", flag: True}
         )
 
     def test_rithmic_unresolved_order_event_locks_down_and_keeps_streaming(
-        self, engine
+        self,
+        engine_factory,
     ):
         adapter = RithmicExchangeAdapter(
             profile="test",
@@ -4715,6 +4729,7 @@ class TestExchangeOrderEventThread:
             },
             client_factory=MagicMock(return_value=MagicMock()),
         )
+        engine = engine_factory(adapter=adapter, audit_external_orders=True)
         remote_event = ExchangeOrderEvent(
             status="partially_filled",
             product_id="RITHMIC:NQ-202609",
@@ -4732,12 +4747,11 @@ class TestExchangeOrderEventThread:
             return None
 
         adapter.poll_order_event = MagicMock(side_effect=poll_event)
-        engine.execution_engine.adapter = adapter
         engine.execution_engine.process_exchange_order_event = MagicMock(
             return_value={"action": "unresolved_missing_fill_price"}
         )
         engine._reconcile_owned_orders_on_reconnect = MagicMock(return_value=True)
-        engine._lockdown_for_rithmic_order_event = MagicMock()
+        engine._rithmic_external_order_drift = MagicMock()
 
         class ImmediateThread:
             def __init__(self, *, target, name, daemon):
@@ -4746,13 +4760,18 @@ class TestExchangeOrderEventThread:
             def start(self):
                 self.target()
 
-        with patch("src.core.engine.threading.Thread", ImmediateThread):
+        with patch(
+            "src.core.adapters.rithmic_order_event_stream.threading.Thread",
+            ImmediateThread,
+        ):
             engine._start_exchange_order_event_stream()
 
         assert adapter.poll_order_event.call_count == 2
-        engine._lockdown_for_rithmic_order_event.assert_called_once_with(
-            action="unresolved_missing_fill_price",
-            event=remote_event,
+        engine._rithmic_external_order_drift.detect.assert_called_once_with(
+            "rithmic_order_event_requires_reconciliation: "
+            "action=unresolved_missing_fill_price "
+            "product_id=RITHMIC:NQ-202609 client_order_id=owned-order "
+            "exchange_order_id=basket-1"
         )
 
     @pytest.mark.parametrize(
@@ -4819,7 +4838,10 @@ class TestExchangeOrderEventThread:
             def start(self):
                 self.target()
 
-        with patch("src.core.engine.threading.Thread", ImmediateThread):
+        with patch(
+            "src.core.adapters.rithmic_order_event_stream.threading.Thread",
+            ImmediateThread,
+        ):
             engine._start_exchange_order_event_stream()
 
         assert adapter.poll_order_event.call_count == 2
@@ -4957,11 +4979,11 @@ class TestExchangeOrderEventThread:
 
         def clear_kill_switch(*, persist_clear):
             persist_clear()
-            engine._lockdown_for_external_order(
-                account_id="ACCOUNT",
-                exchange="CME",
-                symbol="NQU6",
-                exchange_order_id="manual-order",
+            assert engine._rithmic_order_event_stream is not None
+            engine._rithmic_order_event_stream._lockdown(
+                "rithmic_external_order_detected: account_id=ACCOUNT "
+                "exchange=CME symbol=NQU6 client_order_id=unknown "
+                "exchange_order_id=manual-order"
             )
             return {"cleared": True, "reason": "cleared"}
 
@@ -4985,11 +5007,15 @@ class TestExchangeOrderEventThread:
 
     def test_external_order_detection_delegates_to_rithmic_owner(self, engine):
         engine._rithmic_external_order_drift = MagicMock()
+        engine._rithmic_order_event_stream = MagicMock()
+        engine._rithmic_order_event_stream._lockdown = (
+            engine._lockdown_for_rithmic_order_drift
+        )
 
-        engine._lockdown_for_external_order(
-            account_id="ACCOUNT",
-            exchange="CME",
-            symbol="NQU6",
+        engine._rithmic_order_event_stream._lockdown(
+            "rithmic_external_order_detected: "
+            "account_id=ACCOUNT exchange=CME symbol=NQU6 "
+            "client_order_id=unknown exchange_order_id=unknown"
         )
 
         engine._rithmic_external_order_drift.detect.assert_called_once_with(
@@ -5049,10 +5075,11 @@ class TestExchangeOrderEventThread:
 
         def fail_after_partial_clear(*, persist_clear):
             persist_clear()
-            engine._lockdown_for_external_order(
-                account_id="ACCOUNT",
-                exchange="CME",
-                symbol="NQU6",
+            assert engine._rithmic_order_event_stream is not None
+            engine._rithmic_order_event_stream._lockdown(
+                "rithmic_external_order_detected: account_id=ACCOUNT "
+                "exchange=CME symbol=NQU6 client_order_id=unknown "
+                "exchange_order_id=unknown"
             )
             raise RuntimeError("database unavailable")
 
@@ -6761,16 +6788,20 @@ def test_engine_reconnect_seam_delegates_only_to_venue_owner(engine):
     engine.execution_engine.reconcile_rithmic_owned_orders.assert_not_called()
 
 
-def test_generic_stream_start_clears_pending_generation_after_success(engine):
+def test_rithmic_stream_start_clears_pending_generation_after_success(
+    engine_factory,
+):
     adapter = _rithmic_adapter_for_reconnect_test()
     adapter.connection_generation = MagicMock(return_value=2)
-    engine.execution_engine.adapter = adapter
+    engine = engine_factory(adapter=adapter, audit_external_orders=True)
     engine.execution_engine.halt_for_reconcile = MagicMock(return_value=False)
     reconnect = _install_rithmic_order_reconnect_service(engine, adapter)
     assert reconnect.reconcile_if_needed() is False
     assert reconnect.pending_generation == 2
 
-    with patch("src.core.engine.threading.Thread") as thread_type:
+    with patch(
+        "src.core.adapters.rithmic_order_event_stream.threading.Thread"
+    ) as thread_type:
         engine._start_exchange_order_event_stream()
 
     thread_type.return_value.start.assert_called_once_with()
@@ -6778,10 +6809,10 @@ def test_generic_stream_start_clears_pending_generation_after_success(engine):
     assert reconnect.pending_generation is None
 
 
-def test_generic_stream_start_failure_preserves_pending_generation(engine):
+def test_rithmic_stream_start_failure_preserves_pending_generation(engine_factory):
     adapter = _rithmic_adapter_for_reconnect_test()
     adapter.connection_generation = MagicMock(return_value=2)
-    engine.execution_engine.adapter = adapter
+    engine = engine_factory(adapter=adapter, audit_external_orders=True)
     engine.execution_engine.halt_for_reconcile = MagicMock(return_value=False)
     engine._halt_for_kill_switch = MagicMock()
     reconnect = _install_rithmic_order_reconnect_service(engine, adapter)
@@ -7014,11 +7045,13 @@ def test_reconnect_unresolved_summary_stays_closed_and_gated(engine, summary):
     engine.execution_engine.resume_after_reconcile.assert_not_called()
 
 
-def test_rithmic_event_loop_checks_reconnect_without_runtime_reconcile_service(engine):
+def test_rithmic_event_loop_checks_reconnect_without_runtime_reconcile_service(
+    engine_factory,
+):
     client = MagicMock()
-    client.poll_event.side_effect = lambda: engine._order_event_stop.set()
     adapter = _rithmic_adapter_for_reconnect_test(client=client)
-    engine.execution_engine.adapter = adapter
+    engine = engine_factory(adapter=adapter, audit_external_orders=True)
+    client.poll_event.side_effect = lambda: engine._order_event_stop.set()
     engine._reconcile_owned_orders_on_reconnect = MagicMock(return_value=True)
     reconnect = _install_rithmic_order_reconnect_service(engine, adapter)
 
@@ -7029,14 +7062,17 @@ def test_rithmic_event_loop_checks_reconnect_without_runtime_reconcile_service(e
         def start(self):
             self.target()
 
-    with patch("src.core.engine.threading.Thread", ImmediateThread):
+    with patch(
+        "src.core.adapters.rithmic_order_event_stream.threading.Thread",
+        ImmediateThread,
+    ):
         engine._start_exchange_order_event_stream()
 
     engine._reconcile_owned_orders_on_reconnect.assert_called_once_with()
     assert reconnect.last_generation == 1
 
 
-def test_rithmic_event_loop_reconciles_and_restarts_before_polling(engine):
+def test_rithmic_event_loop_reconciles_and_restarts_before_polling(engine_factory):
     """The real event loop closes, reconciles, restarts, then resumes polling."""
     first_client = MagicMock()
     first_client.connection_generation.return_value = 2
@@ -7056,7 +7092,7 @@ def test_rithmic_event_loop_reconciles_and_restarts_before_polling(engine):
         },
         client_factory=factory,
     )
-    engine.execution_engine.adapter = adapter
+    engine = engine_factory(adapter=adapter, audit_external_orders=True)
     engine.execution_engine.audit_external_orders = True
     engine._rithmic_recovery_profile = "test"
     engine._rithmic_recovery_account_id = "ACCOUNT"
@@ -7077,7 +7113,10 @@ def test_rithmic_event_loop_reconciles_and_restarts_before_polling(engine):
         def start(self):
             self.target()
 
-    with patch("src.core.engine.threading.Thread", ImmediateThread):
+    with patch(
+        "src.core.adapters.rithmic_order_event_stream.threading.Thread",
+        ImmediateThread,
+    ):
         engine._start_exchange_order_event_stream()
 
     assert factory.call_count == 2
