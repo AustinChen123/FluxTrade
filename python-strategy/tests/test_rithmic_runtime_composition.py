@@ -1,4 +1,5 @@
 from dataclasses import replace
+from decimal import Decimal
 from typing import cast
 from unittest.mock import MagicMock
 
@@ -33,8 +34,9 @@ from src.core.adapters.rithmic_runtime_recovery import (
     RithmicRuntimeRecoveryService,
 )
 from src.core.adapters.rithmic_strategy_exit import RithmicStrategyExitService
-from src.core.execution import ExecutionEngine
+from src.core.execution import ExecutionEngine, ExitDecision
 from src.core.interfaces import IExchangeAdapter
+from src.core.models import Signal, SignalType
 from src.core.ops_safety import OpsSafetyService
 from src.core.risk_manager import AccountService
 
@@ -394,7 +396,11 @@ def test_runtime_handle_preserves_execution_dispatch_exception_identity(
 
 
 def test_runtime_handle_routes_portfolio_exit_to_current_factory() -> None:
-    owners = RithmicRuntimeOwners(order_event_lifecycle=MagicMock())
+    owners = RithmicRuntimeOwners(
+        order_event_lifecycle=MagicMock(),
+        profile="test",
+        account_id="ACCOUNT",
+    )
     signal = MagicMock()
     decision = MagicMock()
     candle = MagicMock()
@@ -419,7 +425,11 @@ def test_runtime_handle_routes_portfolio_exit_to_current_factory() -> None:
 
 
 def test_runtime_handle_rejects_missing_portfolio_exit_factory() -> None:
-    owners = RithmicRuntimeOwners(order_event_lifecycle=MagicMock())
+    owners = RithmicRuntimeOwners(
+        order_event_lifecycle=MagicMock(),
+        profile="test",
+        account_id="ACCOUNT",
+    )
 
     with pytest.raises(
         RuntimeError,
@@ -437,7 +447,11 @@ def test_runtime_handle_rejects_missing_portfolio_exit_factory() -> None:
 def test_runtime_handle_preserves_portfolio_exit_exception_identity(
     failure_owner: str,
 ) -> None:
-    owners = RithmicRuntimeOwners(order_event_lifecycle=MagicMock())
+    owners = RithmicRuntimeOwners(
+        order_event_lifecycle=MagicMock(),
+        profile="test",
+        account_id="ACCOUNT",
+    )
     error = RuntimeError(failure_owner)
     owner = MagicMock()
     factory = MagicMock(return_value=owner)
@@ -453,6 +467,176 @@ def test_runtime_handle_preserves_portfolio_exit_exception_identity(
             MagicMock(),
             None,
             MagicMock(),
+        )
+
+    assert caught.value is error
+
+
+def _exit_signal() -> Signal:
+    return Signal(
+        strategy_id="portfolio.sleeve",
+        product_id="RITHMIC:NQ-202609",
+        timeframe="1m",
+        timestamp=1_700_000_000_000,
+        type=SignalType.EXIT_LONG,
+        quantity=Decimal("1"),
+    )
+
+
+def test_runtime_handle_routes_current_strategy_exit_without_identity_guard() -> None:
+    owners = RithmicRuntimeOwners(
+        order_event_lifecycle=MagicMock(),
+        is_rithmic_runtime=True,
+    )
+    signal = _exit_signal()
+    decision = ExitDecision(
+        allowed=True,
+        reason="position_matched",
+        quantity=signal.quantity,
+        position_quantity=signal.quantity,
+    )
+    strategy_exit = MagicMock()
+    result = {"status": "verified_flat"}
+    strategy_exit.execute.return_value = result
+    owners.strategy_exit = strategy_exit
+    resolver = MagicMock(return_value=None)
+    authoritative = MagicMock(
+        side_effect=lambda routed_signal, candle, execute: (
+            execute(routed_signal, decision) is result
+        )
+    )
+
+    assert owners.route_authoritative_exit(
+        signal,
+        None,
+        resolver,
+        authoritative,
+    ) == (True, True)
+
+    resolver.assert_called_once_with(signal.strategy_id)
+    authoritative.assert_called_once()
+    strategy_exit.execute.assert_called_once_with(signal, decision)
+
+
+def test_runtime_handle_routes_portfolio_with_original_resolver_identity() -> None:
+    owners = RithmicRuntimeOwners(
+        order_event_lifecycle=MagicMock(),
+        is_rithmic_runtime=True,
+        profile="test",
+        account_id="ACCOUNT",
+    )
+    signal = _exit_signal()
+    candle = MagicMock()
+    decision = MagicMock()
+    resolver = MagicMock(return_value="portfolio")
+    owner = MagicMock()
+    result = {"status": "verified_reduced"}
+    owner.execute.return_value = result
+    factory = MagicMock(return_value=owner)
+    owners.portfolio_exit_factory = factory
+    authoritative = MagicMock(
+        side_effect=lambda routed_signal, routed_candle, execute: (
+            execute(routed_signal, decision) is result
+        )
+    )
+
+    assert owners.route_authoritative_exit(
+        signal,
+        candle,
+        resolver,
+        authoritative,
+    ) == (True, True)
+
+    resolver.assert_called_once_with(signal.strategy_id)
+    factory.assert_called_once_with(resolver)
+    owner.execute.assert_called_once_with(signal, decision, candle)
+
+
+@pytest.mark.parametrize("configured", [False, True])
+def test_runtime_handle_leaves_unowned_signals_unhandled(configured: bool) -> None:
+    owners = RithmicRuntimeOwners(
+        order_event_lifecycle=MagicMock(),
+        is_rithmic_runtime=configured,
+    )
+    signal = _exit_signal()
+    if configured:
+        signal = signal.model_copy(update={"type": SignalType.LONG})
+    resolver = MagicMock()
+    authoritative = MagicMock()
+
+    assert owners.route_authoritative_exit(
+        signal,
+        None,
+        resolver,
+        authoritative,
+    ) == (False, False)
+
+    resolver.assert_not_called()
+    authoritative.assert_not_called()
+
+
+def test_runtime_handle_rejects_missing_portfolio_identity_before_factory() -> None:
+    owners = RithmicRuntimeOwners(
+        order_event_lifecycle=MagicMock(),
+        is_rithmic_runtime=True,
+    )
+    owners.portfolio_exit_factory = MagicMock()
+    resolver = MagicMock(return_value="portfolio")
+    authoritative = MagicMock(
+        side_effect=lambda signal, candle, execute: execute(signal, MagicMock())
+    )
+
+    with pytest.raises(
+        RuntimeError,
+        match="^rithmic_portfolio_exit_account_identity_missing$",
+    ):
+        owners.route_authoritative_exit(
+            _exit_signal(),
+            None,
+            resolver,
+            authoritative,
+        )
+
+    owners.portfolio_exit_factory.assert_not_called()
+
+
+@pytest.mark.parametrize(
+    "failure_owner",
+    ["resolver", "factory", "owner", "authoritative"],
+)
+def test_runtime_handle_preserves_routed_exit_exception_identity(
+    failure_owner: str,
+) -> None:
+    owners = RithmicRuntimeOwners(
+        order_event_lifecycle=MagicMock(),
+        is_rithmic_runtime=True,
+        profile="test",
+        account_id="ACCOUNT",
+    )
+    error = RuntimeError(failure_owner)
+    resolver = MagicMock(return_value="portfolio")
+    factory = MagicMock()
+    owner = MagicMock()
+    factory.return_value = owner
+    owners.portfolio_exit_factory = factory
+    authoritative = MagicMock(
+        side_effect=lambda signal, candle, execute: execute(signal, MagicMock())
+    )
+    if failure_owner == "resolver":
+        resolver.side_effect = error
+    elif failure_owner == "factory":
+        factory.side_effect = error
+    elif failure_owner == "owner":
+        owner.execute.side_effect = error
+    else:
+        authoritative.side_effect = error
+
+    with pytest.raises(RuntimeError) as caught:
+        owners.route_authoritative_exit(
+            _exit_signal(),
+            None,
+            resolver,
+            authoritative,
         )
 
     assert caught.value is error
@@ -504,6 +688,9 @@ def test_rithmic_composition_builds_the_complete_shared_owner_graph() -> None:
     )
     assert isinstance(owners.emergency_flatten, RithmicEmergencyFlattenService)
     assert owners.portfolio_exit_factory is not None
+    assert owners.is_rithmic_runtime is True
+    assert owners.profile == "test"
+    assert owners.account_id == "ACCOUNT"
     portfolio_id_for_sleeve = MagicMock(return_value="portfolio")
     portfolio_exit = owners.portfolio_exit_factory(portfolio_id_for_sleeve)
     assert isinstance(portfolio_exit, RithmicPortfolioExitService)
@@ -565,6 +752,9 @@ def test_non_rithmic_composition_creates_no_venue_runtime_owner() -> None:
     assert owners.kill_switch_clear_preparation is None
     assert owners.emergency_flatten is None
     assert owners.portfolio_exit_factory is None
+    assert owners.is_rithmic_runtime is False
+    assert owners.profile is None
+    assert owners.account_id is None
     for callback in callbacks.__dict__.values():
         callback.assert_not_called()
 

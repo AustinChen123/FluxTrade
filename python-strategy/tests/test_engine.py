@@ -1348,8 +1348,114 @@ class TestProcessSignal:
         engine.execution_engine.execute_authoritative_exit_signal = MagicMock(
             return_value=False
         )
+        engine._rithmic_runtime.route_authoritative_exit = MagicMock(
+            return_value=(True, False)
+        )
+        engine.execution_engine.execute_signal = MagicMock()
 
         assert engine.process_signal(signal, None) is False
+
+        engine._rithmic_runtime.route_authoritative_exit.assert_called_once_with(
+            signal,
+            None,
+            engine._portfolio_coordinator.portfolio_id_for_sleeve,
+            engine.execution_engine.execute_authoritative_exit_signal,
+        )
+        engine.execution_engine.execute_signal.assert_not_called()
+
+    def test_unhandled_signal_uses_generic_execution_exactly_once(
+        self,
+        engine,
+        mock_db_session,
+    ):
+        candle = _make_candle()
+        signal = Signal(
+            strategy_id="test",
+            product_id="BINANCE:BTCUSDT-PERP",
+            timeframe="1m",
+            timestamp=1704067200000,
+            type=SignalType.LONG,
+            quantity=Decimal("1"),
+            value=Decimal("42000"),
+        )
+        engine.risk_manager.check_risk = MagicMock(return_value=(True, "PASS"))
+        engine._rithmic_runtime.route_authoritative_exit = MagicMock(
+            return_value=(False, False)
+        )
+        engine.execution_engine.execute_signal = MagicMock(return_value="order-123")
+
+        assert engine.process_signal(signal, candle) is True
+
+        engine._rithmic_runtime.route_authoritative_exit.assert_called_once_with(
+            signal,
+            candle,
+            engine._portfolio_coordinator.portfolio_id_for_sleeve,
+            engine.execution_engine.execute_authoritative_exit_signal,
+        )
+        engine.execution_engine.execute_signal.assert_called_once_with(
+            signal,
+            candle,
+        )
+        audit = mock_db_session.add.call_args.args[0]
+        assert audit.order_id == "order-123"
+        mock_db_session.commit.assert_called_once_with()
+
+    def test_handled_success_keeps_audited_early_return(
+        self,
+        engine,
+        mock_db_session,
+    ):
+        signal = Signal(
+            strategy_id="test",
+            product_id="RITHMIC:MNQ-202609",
+            timeframe="1m",
+            timestamp=1704067200000,
+            type=SignalType.EXIT_LONG,
+            quantity=Decimal("1"),
+        )
+        engine.risk_manager.check_risk = MagicMock(return_value=(True, "PASS"))
+        engine.execution_engine.audit_external_orders = True
+        engine._rithmic_runtime.route_authoritative_exit = MagicMock(
+            return_value=(True, True)
+        )
+        engine.execution_engine.execute_signal = MagicMock()
+
+        assert engine.process_signal(signal, None) is True
+
+        engine._rithmic_runtime.route_authoritative_exit.assert_called_once_with(
+            signal,
+            None,
+            engine._portfolio_coordinator.portfolio_id_for_sleeve,
+            engine.execution_engine.execute_authoritative_exit_signal,
+        )
+        engine.execution_engine.execute_signal.assert_not_called()
+        mock_db_session.add.assert_not_called()
+        mock_db_session.commit.assert_not_called()
+
+    @pytest.mark.parametrize("rejection", ["risk", "intent"])
+    def test_rejection_stops_before_exit_facade_and_generic_execution(
+        self,
+        engine,
+        rejection,
+    ):
+        signal = Signal(
+            strategy_id="test",
+            product_id="RITHMIC:MNQ-202609",
+            timeframe="1m",
+            timestamp=1704067200000,
+            type=SignalType.EXIT_LONG,
+            quantity=Decimal("1"),
+            price=Decimal("0") if rejection == "intent" else None,
+        )
+        if rejection == "risk":
+            engine.risk_manager.check_risk = MagicMock(return_value=(False, "REJECT"))
+        engine._rithmic_runtime.route_authoritative_exit = MagicMock()
+        engine.execution_engine.execute_signal = MagicMock()
+
+        assert engine.process_signal(signal, None) is False
+
+        engine._rithmic_runtime.route_authoritative_exit.assert_not_called()
+        engine.execution_engine.execute_signal.assert_not_called()
 
     def test_risk_reject_skips_execution(self, engine):
         """When risk check fails, signal should NOT be executed."""
@@ -5362,6 +5468,11 @@ def _install_rithmic_portfolio_exit_factory(
     if emergency_flatten is None:
         emergency_flatten = MagicMock()
     engine._rithmic_runtime.emergency_flatten = emergency_flatten
+    engine._rithmic_runtime.is_rithmic_runtime = True
+    engine._rithmic_runtime.profile = engine._rithmic_recovery_profile or "test"
+    engine._rithmic_runtime.account_id = (
+        engine._rithmic_recovery_account_id or "ACCOUNT"
+    )
 
     def build(portfolio_id_for_sleeve):
         return build_rithmic_portfolio_exit_owner(
@@ -5771,7 +5882,7 @@ def test_non_rithmic_portfolio_exit_rejects_before_runtime_facade(engine):
     ("profile", "account_id"),
     [(None, "ACCOUNT"), ("test", None)],
 )
-def test_portfolio_exit_rejects_missing_identity_before_runtime_facade(
+def test_portfolio_exit_delegates_missing_identity_error_from_runtime_facade(
     engine,
     profile,
     account_id,
@@ -5779,15 +5890,14 @@ def test_portfolio_exit_rejects_missing_identity_before_runtime_facade(
     engine.execution_engine.adapter = _rithmic_adapter_for_reconnect_test()
     engine._rithmic_recovery_profile = profile
     engine._rithmic_recovery_account_id = account_id
-    engine._rithmic_runtime.execute_portfolio_exit = MagicMock()
+    error = RuntimeError("rithmic_portfolio_exit_account_identity_missing")
+    engine._rithmic_runtime.execute_portfolio_exit = MagicMock(side_effect=error)
 
-    with pytest.raises(
-        RuntimeError,
-        match="^rithmic_portfolio_exit_account_identity_missing$",
-    ):
+    with pytest.raises(RuntimeError) as caught:
         engine._run_rithmic_portfolio_exit(MagicMock(), MagicMock(), None)
 
-    engine._rithmic_runtime.execute_portfolio_exit.assert_not_called()
+    assert caught.value is error
+    engine._rithmic_runtime.execute_portfolio_exit.assert_called_once()
 
 
 def test_invalid_portfolio_exit_fails_before_lifecycle_gate(engine):

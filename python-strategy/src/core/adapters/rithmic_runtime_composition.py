@@ -38,7 +38,7 @@ from src.core.adapters.rithmic_strategy_exit import RithmicStrategyExitService
 from src.core.execution import ExecutionEngine, ExitDecision
 from src.core.interfaces import IExchangeAdapter
 from src.core.interfaces.exchange import ExchangeOrderEvent
-from src.core.models import Candlestick, Signal
+from src.core.models import Candlestick, Signal, SignalType
 from src.core.ops_safety import OpsSafetyService
 from src.core.risk_manager import AccountService
 
@@ -82,6 +82,9 @@ class RithmicRuntimeOwners:
     portfolio_exit_factory: (
         Callable[[Callable[[str], str | None]], RithmicPortfolioExitService] | None
     ) = None
+    is_rithmic_runtime: bool = False
+    profile: str | None = None
+    account_id: str | None = None
 
     def start_order_event_stream(self) -> bool:
         """Start the current venue stream owner, if configured."""
@@ -186,10 +189,51 @@ class RithmicRuntimeOwners:
         portfolio_id_for_sleeve: Callable[[str], str | None],
     ) -> dict[str, object]:
         """Build and execute one portfolio exit through the venue facade."""
+        if not isinstance(self.profile, str) or not isinstance(self.account_id, str):
+            raise RuntimeError("rithmic_portfolio_exit_account_identity_missing")
         if self.portfolio_exit_factory is None:
             raise RuntimeError("rithmic_portfolio_exit_unavailable")
         owner = self.portfolio_exit_factory(portfolio_id_for_sleeve)
         return owner.execute(signal, decision, candle)
+
+    def route_authoritative_exit(
+        self,
+        signal: Signal,
+        candle: Candlestick | None,
+        portfolio_id_for_sleeve: Callable[[str], str | None],
+        execute_authoritative_exit_signal: Callable[
+            [
+                Signal,
+                Candlestick | None,
+                Callable[[Signal, ExitDecision], dict[str, object]],
+            ],
+            bool,
+        ],
+    ) -> tuple[bool, bool]:
+        """Route one configured venue exit and report whether it was handled."""
+        if not self.is_rithmic_runtime or signal.type not in (
+            SignalType.EXIT_LONG,
+            SignalType.EXIT_SHORT,
+        ):
+            return False, False
+
+        portfolio_id = portfolio_id_for_sleeve(signal.strategy_id)
+        exit_executor = self.execute_strategy_exit
+        if portfolio_id is not None:
+
+            def execute_portfolio_exit(
+                routed_signal: Signal,
+                decision: ExitDecision,
+            ) -> dict[str, object]:
+                return self.execute_portfolio_exit(
+                    routed_signal,
+                    decision,
+                    candle,
+                    portfolio_id_for_sleeve,
+                )
+
+            exit_executor = execute_portfolio_exit
+        return True, execute_authoritative_exit_signal(signal, candle, exit_executor)
 
 
 def build_rithmic_portfolio_exit_owner(
@@ -422,4 +466,7 @@ def build_rithmic_runtime_owners(
         kill_switch_clear_preparation=kill_switch_clear_preparation,
         emergency_flatten=emergency_flatten,
         portfolio_exit_factory=build_portfolio_exit,
+        is_rithmic_runtime=True,
+        profile=profile,
+        account_id=account_id,
     )

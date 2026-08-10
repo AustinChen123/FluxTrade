@@ -2531,34 +2531,15 @@ class StrategyEngine:
             logger.info(
                 "✅ SIGNAL ACCEPTED: %s. Forwarding to Execution Engine...", signal.type
             )
-            if isinstance(
-                self.execution_engine.adapter, RithmicExchangeAdapter
-            ) and signal.type in (SignalType.EXIT_LONG, SignalType.EXIT_SHORT):
-                portfolio_id = self._portfolio_coordinator.portfolio_id_for_sleeve(
-                    signal.strategy_id
+            handled, execution_succeeded = (
+                self._rithmic_runtime.route_authoritative_exit(
+                    signal,
+                    candle,
+                    self._portfolio_coordinator.portfolio_id_for_sleeve,
+                    self.execution_engine.execute_authoritative_exit_signal,
                 )
-                exit_executor = self._run_rithmic_strategy_exit
-                if portfolio_id is not None:
-
-                    def execute_portfolio_exit(
-                        portfolio_signal: Signal,
-                        decision: ExitDecision,
-                    ) -> dict[str, object]:
-                        return self._run_rithmic_portfolio_exit(
-                            portfolio_signal,
-                            decision,
-                            candle,
-                        )
-
-                    exit_executor = execute_portfolio_exit
-                execution_succeeded = (
-                    self.execution_engine.execute_authoritative_exit_signal(
-                        signal,
-                        candle,
-                        exit_executor,
-                    )
-                )
-            else:
+            )
+            if not handled:
                 order_id = self.execution_engine.execute_signal(signal, candle)
                 execution_succeeded = order_id is not None
             if self.execution_engine.audit_external_orders:
@@ -2597,10 +2578,6 @@ class StrategyEngine:
         adapter = self.execution_engine.adapter
         if not isinstance(adapter, RithmicExchangeAdapter):
             raise RuntimeError("authoritative_portfolio_exit_requires_rithmic")
-        profile = self._rithmic_recovery_profile
-        account_id = self._rithmic_recovery_account_id
-        if not isinstance(profile, str) or not isinstance(account_id, str):
-            raise RuntimeError("rithmic_portfolio_exit_account_identity_missing")
         portfolio_id_for_sleeve = self._portfolio_coordinator.portfolio_id_for_sleeve
         return self._rithmic_runtime.execute_portfolio_exit(
             signal,
