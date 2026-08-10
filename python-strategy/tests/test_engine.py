@@ -5653,7 +5653,7 @@ def test_rithmic_strategy_exit_uses_native_exit_and_verifies_flat(
             _rithmic_emergency_snapshot(),
         ],
     ):
-        result = engine._run_rithmic_strategy_exit(signal, decision)
+        result = engine._rithmic_runtime.execute_strategy_exit(signal, decision)
 
     assert result == {
         "status": "verified_flat",
@@ -5688,73 +5688,15 @@ def test_rithmic_strategy_exit_uses_native_exit_and_verifies_flat(
     engine._start_exchange_order_event_stream.assert_called_once_with()
 
 
-def test_rithmic_strategy_exit_engine_seam_delegates_exactly_once(engine):
-    adapter = _rithmic_adapter_for_reconnect_test()
-    engine.execution_engine.adapter = adapter
-    result = {"status": "verified_flat"}
-    engine._rithmic_runtime.strategy_exit = MagicMock()
-    engine._rithmic_runtime.strategy_exit.execute.return_value = result
-    signal = Signal(
-        strategy_id="strategy",
-        product_id="RITHMIC:NQ-202609",
-        timeframe="1m",
-        timestamp=1_700_000_000_000,
-        type=SignalType.EXIT_LONG,
-        quantity=Decimal("1"),
-    )
-    decision = ExitDecision(
-        allowed=True,
-        reason="position_matched",
-        quantity=Decimal("1"),
-        position_quantity=Decimal("1"),
-    )
-
-    assert engine._run_rithmic_strategy_exit(signal, decision) is result
-
-    engine._rithmic_runtime.strategy_exit.execute.assert_called_once_with(
-        signal, decision
-    )
-
-
-def test_rithmic_strategy_exit_engine_seam_uses_runtime_facade(engine):
-    adapter = _rithmic_adapter_for_reconnect_test()
-    engine.execution_engine.adapter = adapter
-    result = {"status": "verified_flat"}
-    engine._rithmic_runtime.execute_strategy_exit = MagicMock(return_value=result)
-    engine._rithmic_runtime.strategy_exit = MagicMock()
-    signal = Signal(
-        strategy_id="strategy",
-        product_id="RITHMIC:NQ-202609",
-        timeframe="1m",
-        timestamp=1_700_000_000_000,
-        type=SignalType.EXIT_LONG,
-        quantity=Decimal("1"),
-    )
-    decision = ExitDecision(
-        allowed=True,
-        reason="position_matched",
-        quantity=Decimal("1"),
-        position_quantity=Decimal("1"),
-    )
-
-    assert engine._run_rithmic_strategy_exit(signal, decision) is result
-
-    engine._rithmic_runtime.execute_strategy_exit.assert_called_once_with(
-        signal, decision
-    )
-    engine._rithmic_runtime.strategy_exit.execute.assert_not_called()
-
-
-def test_non_rithmic_strategy_exit_rejects_before_runtime_facade(engine):
-    engine._rithmic_runtime.execute_strategy_exit = MagicMock()
-
-    with pytest.raises(
-        RuntimeError,
-        match="^authoritative_strategy_exit_requires_rithmic$",
-    ):
-        engine._run_rithmic_strategy_exit(MagicMock(), MagicMock())
-
-    engine._rithmic_runtime.execute_strategy_exit.assert_not_called()
+@pytest.mark.parametrize(
+    "method_name",
+    [
+        "_run_rithmic_" + "strategy_exit",
+        "_run_rithmic_" + "portfolio_exit",
+    ],
+)
+def test_engine_exposes_no_legacy_rithmic_exit_seam(method_name):
+    assert not hasattr(StrategyEngine, method_name)
 
 
 def test_strategy_exit_owner_stops_current_replacement_thread(engine):
@@ -5791,7 +5733,7 @@ def test_strategy_exit_owner_stops_current_replacement_thread(engine):
         RuntimeError,
         match="rithmic_strategy_exit_event_stream_stop_timeout",
     ):
-        engine._run_rithmic_strategy_exit(signal, decision)
+        engine._rithmic_runtime.execute_strategy_exit(signal, decision)
 
     stale_thread.is_alive.assert_not_called()
     stale_thread.join.assert_not_called()
@@ -5836,68 +5778,16 @@ def test_rithmic_exit_owners_share_one_order_event_lifecycle_gate(engine):
         position_quantity=Decimal("1"),
     )
 
-    assert engine._run_rithmic_portfolio_exit(signal, decision, None) is sentinel
-    engine._rithmic_runtime.order_event_lifecycle.run.assert_called_once()
-
-
-def test_rithmic_portfolio_exit_engine_seam_uses_runtime_facade(engine):
-    adapter = _rithmic_adapter_for_reconnect_test()
-    engine.execution_engine.adapter = adapter
-    engine._rithmic_recovery_profile = "test"
-    engine._rithmic_recovery_account_id = "ACCOUNT"
-    result = {"status": "verified_reduced"}
-    engine._rithmic_runtime.execute_portfolio_exit = MagicMock(return_value=result)
-    engine._rithmic_runtime.emergency_flatten = MagicMock()
-    engine._rithmic_runtime.portfolio_exit_factory = MagicMock()
-    portfolio_id_for_sleeve = MagicMock(return_value="portfolio")
-    engine._portfolio_coordinator.portfolio_id_for_sleeve = portfolio_id_for_sleeve
-    signal = MagicMock()
-    decision = MagicMock()
-    candle = MagicMock()
-
-    assert engine._run_rithmic_portfolio_exit(signal, decision, candle) is result
-
-    engine._rithmic_runtime.execute_portfolio_exit.assert_called_once_with(
-        signal,
-        decision,
-        candle,
-        portfolio_id_for_sleeve,
+    assert (
+        engine._rithmic_runtime.execute_portfolio_exit(
+            signal,
+            decision,
+            None,
+            engine._portfolio_coordinator.portfolio_id_for_sleeve,
+        )
+        is sentinel
     )
-    engine._rithmic_runtime.portfolio_exit_factory.assert_not_called()
-
-
-def test_non_rithmic_portfolio_exit_rejects_before_runtime_facade(engine):
-    engine._rithmic_runtime.execute_portfolio_exit = MagicMock()
-
-    with pytest.raises(
-        RuntimeError,
-        match="^authoritative_portfolio_exit_requires_rithmic$",
-    ):
-        engine._run_rithmic_portfolio_exit(MagicMock(), MagicMock(), None)
-
-    engine._rithmic_runtime.execute_portfolio_exit.assert_not_called()
-
-
-@pytest.mark.parametrize(
-    ("profile", "account_id"),
-    [(None, "ACCOUNT"), ("test", None)],
-)
-def test_portfolio_exit_delegates_missing_identity_error_from_runtime_facade(
-    engine,
-    profile,
-    account_id,
-):
-    engine.execution_engine.adapter = _rithmic_adapter_for_reconnect_test()
-    engine._rithmic_recovery_profile = profile
-    engine._rithmic_recovery_account_id = account_id
-    error = RuntimeError("rithmic_portfolio_exit_account_identity_missing")
-    engine._rithmic_runtime.execute_portfolio_exit = MagicMock(side_effect=error)
-
-    with pytest.raises(RuntimeError) as caught:
-        engine._run_rithmic_portfolio_exit(MagicMock(), MagicMock(), None)
-
-    assert caught.value is error
-    engine._rithmic_runtime.execute_portfolio_exit.assert_called_once()
+    engine._rithmic_runtime.order_event_lifecycle.run.assert_called_once()
 
 
 def test_invalid_portfolio_exit_fails_before_lifecycle_gate(engine):
@@ -5926,7 +5816,12 @@ def test_invalid_portfolio_exit_fails_before_lifecycle_gate(engine):
         ValueError,
         match="rithmic_portfolio_exit_requires_exit_signal",
     ):
-        engine._run_rithmic_portfolio_exit(signal, decision, None)
+        engine._rithmic_runtime.execute_portfolio_exit(
+            signal,
+            decision,
+            None,
+            engine._portfolio_coordinator.portfolio_id_for_sleeve,
+        )
 
     engine._rithmic_runtime.order_event_lifecycle.run.assert_not_called()
 
@@ -5961,7 +5856,12 @@ def test_portfolio_exit_stop_timeout_does_not_start_replacement_worker(engine):
         RuntimeError,
         match="rithmic_portfolio_exit_event_stream_stop_timeout",
     ):
-        engine._run_rithmic_portfolio_exit(signal, decision, None)
+        engine._rithmic_runtime.execute_portfolio_exit(
+            signal,
+            decision,
+            None,
+            engine._portfolio_coordinator.portfolio_id_for_sleeve,
+        )
 
     current_thread.join.assert_called_once_with(timeout=30.0)
     assert engine._order_event_stop.is_set()
@@ -6009,7 +5909,12 @@ def test_portfolio_exit_resolves_current_worker_after_acquiring_gate(engine_fact
         RuntimeError,
         match="rithmic_portfolio_exit_event_stream_stop_timeout",
     ):
-        engine._run_rithmic_portfolio_exit(signal, decision, None)
+        engine._rithmic_runtime.execute_portfolio_exit(
+            signal,
+            decision,
+            None,
+            engine._portfolio_coordinator.portfolio_id_for_sleeve,
+        )
 
     stale_thread.is_alive.assert_not_called()
     stale_thread.join.assert_not_called()
@@ -6081,7 +5986,7 @@ def test_rithmic_strategy_exit_cancels_protection_before_native_exit(engine):
             _rithmic_emergency_snapshot(),
         ],
     ):
-        result = engine._run_rithmic_strategy_exit(signal, decision)
+        result = engine._rithmic_runtime.execute_strategy_exit(signal, decision)
 
     assert result["cancelled_orders"] == 1
     adapter.cancel_order.assert_called_once_with(
@@ -6201,16 +6106,22 @@ def test_rithmic_portfolio_exit_reduces_only_owned_sleeve(
                 match="durable marker unavailable",
             ),
         ):
-            engine._run_rithmic_portfolio_exit(
+            engine._rithmic_runtime.execute_portfolio_exit(
                 signal,
                 decision,
                 candle,
+                engine._portfolio_coordinator.portfolio_id_for_sleeve,
             )
         engine._rithmic_runtime.emergency_flatten.schedule_portfolio_exit_compensation.assert_not_called()
         engine._lockdown_for_rithmic_order_drift.assert_called_once()
         return
     with snapshot_loader:
-        result = engine._run_rithmic_portfolio_exit(signal, decision, candle)
+        result = engine._rithmic_runtime.execute_portfolio_exit(
+            signal,
+            decision,
+            candle,
+            engine._portfolio_coordinator.portfolio_id_for_sleeve,
+        )
 
     assert result == {
         "status": "verified_portfolio_reduction",
@@ -6317,13 +6228,14 @@ def test_rithmic_portfolio_exit_does_not_reduce_another_sleeve_after_own_fill(
             match="rithmic_portfolio_exit_local_position_changed",
         ),
     ):
-        engine._run_rithmic_portfolio_exit(
+        engine._rithmic_runtime.execute_portfolio_exit(
             signal,
             decision,
             _make_candle(
                 product_id="RITHMIC:NQ-202609",
                 close=Decimal("20000"),
             ),
+            engine._portfolio_coordinator.portfolio_id_for_sleeve,
         )
 
     engine.execution_engine.submit_verified_net_reduction.assert_not_called()
@@ -6384,13 +6296,14 @@ def test_rithmic_portfolio_exit_does_not_cancel_before_safe_preflight(engine):
             match="rithmic_portfolio_exit_preflight_reconciliation_blocked",
         ),
     ):
-        engine._run_rithmic_portfolio_exit(
+        engine._rithmic_runtime.execute_portfolio_exit(
             signal,
             decision,
             _make_candle(
                 product_id="RITHMIC:NQ-202609",
                 close=Decimal("20000"),
             ),
+            engine._portfolio_coordinator.portfolio_id_for_sleeve,
         )
 
     adapter.cancel_order.assert_not_called()
@@ -6483,13 +6396,14 @@ def test_rithmic_portfolio_exit_schedules_flatten_after_protection_mutation(
 
     def run_exit() -> None:
         try:
-            engine._run_rithmic_portfolio_exit(
+            engine._rithmic_runtime.execute_portfolio_exit(
                 signal,
                 decision,
                 _make_candle(
                     product_id="RITHMIC:NQ-202609",
                     close=Decimal("20000"),
                 ),
+                engine._portfolio_coordinator.portfolio_id_for_sleeve,
             )
         except Exception as error:
             errors.append(error)
@@ -6599,7 +6513,7 @@ def test_rithmic_strategy_exit_blocks_when_remote_order_remains_working(engine):
             match="rithmic_strategy_exit_working_orders_remain",
         ),
     ):
-        engine._run_rithmic_strategy_exit(signal, decision)
+        engine._rithmic_runtime.execute_strategy_exit(signal, decision)
 
     engine.execution_engine.exit_authoritative_position.assert_not_called()
     engine._lockdown_for_rithmic_order_drift.assert_called_once()

@@ -38,7 +38,7 @@ from src.core.orm_models import Candlestick as ORMCandlestick
 from src.core.orm_models import MarketDataApplication, StrategyState
 from src.strategies.base import BaseStrategy
 from src.core.risk_manager import RiskManager, AccountService
-from src.core.execution import ExecutionEngine, ExitDecision
+from src.core.execution import ExecutionEngine
 from src.core.clock import Clock
 from src.core.interfaces import IExchangeAdapter, IOrderRepository
 from src.core.interfaces.exchange import EntryAdmissionGate, ExchangeOrderEvent
@@ -2556,35 +2556,6 @@ class StrategyEngine:
         with self._db_session_factory() as db:
             commit_signal_audit(db, audit)
         return execution_succeeded
-
-    def _run_rithmic_strategy_exit(
-        self,
-        signal: Signal,
-        decision: ExitDecision,
-    ) -> dict[str, object]:
-        """Delegate a full single-strategy exit to the Rithmic venue owner."""
-        adapter = self.execution_engine.adapter
-        if not isinstance(adapter, RithmicExchangeAdapter):
-            raise RuntimeError("authoritative_strategy_exit_requires_rithmic")
-        return self._rithmic_runtime.execute_strategy_exit(signal, decision)
-
-    def _run_rithmic_portfolio_exit(
-        self,
-        signal: Signal,
-        decision: ExitDecision,
-        candle: Optional[Candlestick],
-    ) -> dict[str, object]:
-        """Reduce one sleeve while preserving the verified product-net position."""
-        adapter = self.execution_engine.adapter
-        if not isinstance(adapter, RithmicExchangeAdapter):
-            raise RuntimeError("authoritative_portfolio_exit_requires_rithmic")
-        portfolio_id_for_sleeve = self._portfolio_coordinator.portfolio_id_for_sleeve
-        return self._rithmic_runtime.execute_portfolio_exit(
-            signal,
-            decision,
-            candle,
-            portfolio_id_for_sleeve,
-        )
 
     def shutdown(
         self,
