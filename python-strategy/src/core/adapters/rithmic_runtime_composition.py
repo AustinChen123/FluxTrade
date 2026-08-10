@@ -82,6 +82,63 @@ class RithmicRuntimeOwners:
         Callable[[Callable[[str], str | None]], RithmicPortfolioExitService] | None
     ) = None
 
+    def start_order_event_stream(self) -> bool:
+        """Start the current venue stream owner, if configured."""
+        if self.order_event_stream is None:
+            return False
+        self.order_event_stream.start()
+        return True
+
+    def detect_external_order_drift(self, reason: str) -> None:
+        """Route an external-order finding to the current drift owner."""
+        if self.external_order_drift is None:
+            raise RuntimeError("Rithmic external-order drift owner is unavailable")
+        self.external_order_drift.detect(reason)
+
+    def prepare_kill_switch_clear(self) -> tuple[bool, int | None]:
+        """Prepare a clear or preserve the non-Rithmic compatibility default."""
+        if self.kill_switch_clear_preparation is None:
+            return True, None
+        return self.kill_switch_clear_preparation.prepare()
+
+    def current_external_order_drift_generation(self) -> int:
+        """Return the current drift generation or its compatibility default."""
+        if self.external_order_drift is None:
+            return 0
+        return self.external_order_drift.current_generation()
+
+    def finalize_external_order_drift_clear(
+        self,
+        *,
+        prepared_generation: int,
+        clear_succeeded: bool,
+    ) -> None:
+        """Finalize a prepared clear through the current drift owner."""
+        if self.external_order_drift is None:
+            raise RuntimeError("Rithmic external-order drift owner is unavailable")
+        self.external_order_drift.finalize_clear(
+            prepared_generation=prepared_generation,
+            clear_succeeded=clear_succeeded,
+        )
+
+    def reconcile_startup(self) -> tuple[bool, dict[str, Any] | None]:
+        """Run configured venue ledger recovery and report ownership."""
+        if self.ledger_recovery is None:
+            return False, None
+        return True, self.ledger_recovery.reconcile_startup()
+
+    def publish_authoritative_summary(self, summary: dict[str, Any]) -> None:
+        """Publish through the current venue ledger owner."""
+        if self.ledger_recovery is None:
+            raise RuntimeError("rithmic_ledger_recovery_unavailable")
+        self.ledger_recovery.publish_authoritative_summary(summary)
+
+    def runtime_recovery_operation(self) -> Callable[[], bool]:
+        """Resolve the current periodic venue recovery operation."""
+        if self.runtime_recovery is None:
+            raise RuntimeError("rithmic_runtime_reconciliation_unavailable")
+        return self.runtime_recovery.run_once
+
 
 def build_rithmic_portfolio_exit_owner(
     *,

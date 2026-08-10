@@ -595,8 +595,7 @@ class StrategyEngine:
         self._strategy_state_manager.start_subscriber()
 
     def _start_exchange_order_event_stream(self) -> None:
-        if self._rithmic_runtime.order_event_stream is not None:
-            self._rithmic_runtime.order_event_stream.start()
+        if self._rithmic_runtime.start_order_event_stream():
             return
         adapter = self.execution_engine.adapter
         start = getattr(adapter, "start_order_event_stream", None)
@@ -649,19 +648,13 @@ class StrategyEngine:
         return True
 
     def _lockdown_for_rithmic_order_drift(self, reason: str) -> None:
-        if self._rithmic_runtime.external_order_drift is None:
-            raise RuntimeError("Rithmic external-order drift owner is unavailable")
-        self._rithmic_runtime.external_order_drift.detect(reason)
+        self._rithmic_runtime.detect_external_order_drift(reason)
 
     def _prepare_rithmic_kill_switch_clear(self) -> tuple[bool, int | None]:
-        if self._rithmic_runtime.kill_switch_clear_preparation is None:
-            return True, None
-        return self._rithmic_runtime.kill_switch_clear_preparation.prepare()
+        return self._rithmic_runtime.prepare_kill_switch_clear()
 
     def _current_rithmic_external_order_drift_generation(self) -> int:
-        if self._rithmic_runtime.external_order_drift is None:
-            return 0
-        return self._rithmic_runtime.external_order_drift.current_generation()
+        return self._rithmic_runtime.current_external_order_drift_generation()
 
     def _run_ops_kill_switch(
         self,
@@ -696,8 +689,9 @@ class StrategyEngine:
         if not self.execution_engine.audit_external_orders:
             return None
 
-        if self._rithmic_runtime.ledger_recovery is not None:
-            return self._rithmic_runtime.ledger_recovery.reconcile_startup()
+        handled_by_rithmic, rithmic_summary = self._rithmic_runtime.reconcile_startup()
+        if handled_by_rithmic:
+            return rithmic_summary
 
         try:
             summary = self.execution_engine.reconcile_recoverable_client_orders()
@@ -717,9 +711,7 @@ class StrategyEngine:
 
     def _apply_rithmic_authoritative_account_summary(self, summary: dict) -> None:
         """Delegate authoritative Rithmic account publication to its owner."""
-        if self._rithmic_runtime.ledger_recovery is None:
-            raise RuntimeError("rithmic_ledger_recovery_unavailable")
-        self._rithmic_runtime.ledger_recovery.publish_authoritative_summary(summary)
+        self._rithmic_runtime.publish_authoritative_summary(summary)
 
     def _reconcile_owned_orders_on_reconnect(self) -> bool:
         """Delegate Rithmic ORDER reconnect recovery to its venue owner."""
@@ -900,11 +892,7 @@ class StrategyEngine:
                             )
                     finally:
                         if drift_generation is not None:
-                            if self._rithmic_runtime.external_order_drift is None:
-                                raise RuntimeError(
-                                    "Rithmic external-order drift owner is unavailable"
-                                )
-                            self._rithmic_runtime.external_order_drift.finalize_clear(
+                            self._rithmic_runtime.finalize_external_order_drift_clear(
                                 prepared_generation=drift_generation,
                                 clear_succeeded=clear_succeeded,
                             )
@@ -2330,11 +2318,9 @@ class StrategyEngine:
         adapter = self.execution_engine.adapter
         if not isinstance(adapter, RithmicExchangeAdapter):
             raise RuntimeError("rithmic_runtime_reconciliation_adapter_mismatch")
-        if self._rithmic_runtime.runtime_recovery is None:
-            raise RuntimeError("rithmic_runtime_reconciliation_unavailable")
-
+        run_runtime_recovery = self._rithmic_runtime.runtime_recovery_operation()
         with self._market_processing_lock, self._ops_command_lock:
-            return self._rithmic_runtime.runtime_recovery.run_once()
+            return run_runtime_recovery()
 
     def _record_strategy_heartbeats(self, strategy_ids: list[str]) -> None:
         """Record strategy heartbeat state in HealthMonitor and DB."""

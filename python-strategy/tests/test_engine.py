@@ -651,6 +651,18 @@ class TestEngineInit:
         engine.execution_engine.reconcile_rithmic_owned_orders.assert_not_called()
         engine.execution_engine.reconcile_recoverable_client_orders.assert_not_called()
 
+    def test_startup_rithmic_owner_none_result_never_falls_through(self, engine):
+        service = MagicMock()
+        service.reconcile_startup.return_value = None
+        engine.execution_engine.audit_external_orders = True
+        engine._rithmic_runtime.ledger_recovery = service
+        engine.execution_engine.reconcile_recoverable_client_orders = MagicMock()
+
+        assert engine._reconcile_recoverable_orders_on_startup() is None
+
+        service.reconcile_startup.assert_called_once_with()
+        engine.execution_engine.reconcile_recoverable_client_orders.assert_not_called()
+
     def test_startup_restores_loaded_active_strategies(self, engine):
         """Restart should re-instantiate previously ACTIVE strategies."""
         active_state = MagicMock()
@@ -4166,6 +4178,8 @@ class TestRuntimeReconciliationThread:
         engine.execution_engine.adapter = _rithmic_adapter_for_reconnect_test()
         engine._rithmic_runtime.runtime_recovery = None
         engine.execution_engine.reconcile_rithmic_owned_orders = MagicMock()
+        engine._market_processing_lock = MagicMock()
+        engine._ops_command_lock = MagicMock()
 
         with pytest.raises(
             RuntimeError,
@@ -4174,6 +4188,8 @@ class TestRuntimeReconciliationThread:
             engine._run_rithmic_runtime_reconciliation_once()
 
         engine.execution_engine.reconcile_rithmic_owned_orders.assert_not_called()
+        engine._market_processing_lock.__enter__.assert_not_called()
+        engine._ops_command_lock.__enter__.assert_not_called()
 
     @pytest.mark.parametrize("still_alive", (False, True))
     def test_stop_order_event_stream_is_bounded_and_reports_completion(

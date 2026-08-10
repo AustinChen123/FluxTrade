@@ -2,6 +2,8 @@ from dataclasses import replace
 from typing import cast
 from unittest.mock import MagicMock
 
+import pytest
+
 from src.core.adapters.rithmic_adapter import RithmicExchangeAdapter
 from src.core.adapters.rithmic_emergency_flatten import (
     RithmicEmergencyFlattenService,
@@ -24,6 +26,7 @@ from src.core.adapters.rithmic_order_reconnect import (
 from src.core.adapters.rithmic_portfolio_exit import RithmicPortfolioExitService
 from src.core.adapters.rithmic_runtime_composition import (
     RithmicRuntimeCallbacks,
+    RithmicRuntimeOwners,
     build_rithmic_runtime_owners,
 )
 from src.core.adapters.rithmic_runtime_recovery import (
@@ -62,6 +65,162 @@ def _execution_engine() -> MagicMock:
     execution_engine.clock.now.return_value = 1_700_000_000.0
     execution_engine.audit_external_orders = True
     return execution_engine
+
+
+def test_runtime_handle_routes_control_calls_to_current_owners() -> None:
+    owners = RithmicRuntimeOwners(order_event_lifecycle=MagicMock())
+    stream = MagicMock()
+    drift = MagicMock()
+    drift.current_generation.return_value = 7
+    clear_preparation = MagicMock()
+    clear_preparation.prepare.return_value = (True, 7)
+    ledger = MagicMock()
+    summary = {"auto_resume_safe": True}
+    ledger.reconcile_startup.return_value = summary
+    runtime_recovery = MagicMock()
+    runtime_recovery.run_once.return_value = True
+    owners.order_event_stream = stream
+    owners.external_order_drift = drift
+    owners.kill_switch_clear_preparation = clear_preparation
+    owners.ledger_recovery = ledger
+    owners.runtime_recovery = runtime_recovery
+
+    assert owners.start_order_event_stream() is True
+    owners.detect_external_order_drift("external order")
+    assert owners.prepare_kill_switch_clear() == (True, 7)
+    assert owners.current_external_order_drift_generation() == 7
+    owners.finalize_external_order_drift_clear(
+        prepared_generation=7,
+        clear_succeeded=True,
+    )
+    assert owners.reconcile_startup() == (True, summary)
+    owners.publish_authoritative_summary(summary)
+    assert owners.runtime_recovery_operation()() is True
+
+    stream.start.assert_called_once_with()
+    drift.detect.assert_called_once_with("external order")
+    drift.current_generation.assert_called_once_with()
+    drift.finalize_clear.assert_called_once_with(
+        prepared_generation=7,
+        clear_succeeded=True,
+    )
+    clear_preparation.prepare.assert_called_once_with()
+    ledger.reconcile_startup.assert_called_once_with()
+    ledger.publish_authoritative_summary.assert_called_once_with(summary)
+    runtime_recovery.run_once.assert_called_once_with()
+
+
+def test_runtime_handle_preserves_absent_owner_defaults_and_errors() -> None:
+    owners = RithmicRuntimeOwners(order_event_lifecycle=MagicMock())
+
+    assert owners.start_order_event_stream() is False
+    assert owners.prepare_kill_switch_clear() == (True, None)
+    assert owners.current_external_order_drift_generation() == 0
+    assert owners.reconcile_startup() == (False, None)
+
+    with pytest.raises(
+        RuntimeError,
+        match="Rithmic external-order drift owner is unavailable",
+    ):
+        owners.detect_external_order_drift("external order")
+    with pytest.raises(
+        RuntimeError,
+        match="Rithmic external-order drift owner is unavailable",
+    ):
+        owners.finalize_external_order_drift_clear(
+            prepared_generation=1,
+            clear_succeeded=False,
+        )
+    with pytest.raises(RuntimeError, match="rithmic_ledger_recovery_unavailable"):
+        owners.publish_authoritative_summary({})
+    with pytest.raises(
+        RuntimeError,
+        match="rithmic_runtime_reconciliation_unavailable",
+    ):
+        owners.runtime_recovery_operation()
+
+
+def test_runtime_handle_does_not_fall_through_when_ledger_owner_returns_none() -> None:
+    owners = RithmicRuntimeOwners(order_event_lifecycle=MagicMock())
+    owners.ledger_recovery = MagicMock()
+    owners.ledger_recovery.reconcile_startup.return_value = None
+
+    assert owners.reconcile_startup() == (True, None)
+
+
+@pytest.mark.parametrize(
+    ("owner_attr", "owner_method", "facade_method", "args", "kwargs"),
+    [
+        ("order_event_stream", "start", "start_order_event_stream", (), {}),
+        (
+            "external_order_drift",
+            "detect",
+            "detect_external_order_drift",
+            ("external order",),
+            {},
+        ),
+        (
+            "kill_switch_clear_preparation",
+            "prepare",
+            "prepare_kill_switch_clear",
+            (),
+            {},
+        ),
+        (
+            "external_order_drift",
+            "current_generation",
+            "current_external_order_drift_generation",
+            (),
+            {},
+        ),
+        (
+            "external_order_drift",
+            "finalize_clear",
+            "finalize_external_order_drift_clear",
+            (),
+            {"prepared_generation": 1, "clear_succeeded": False},
+        ),
+        ("ledger_recovery", "reconcile_startup", "reconcile_startup", (), {}),
+        (
+            "ledger_recovery",
+            "publish_authoritative_summary",
+            "publish_authoritative_summary",
+            ({},),
+            {},
+        ),
+    ],
+)
+def test_runtime_handle_preserves_owner_exception_identity(
+    owner_attr: str,
+    owner_method: str,
+    facade_method: str,
+    args: tuple[object, ...],
+    kwargs: dict[str, object],
+) -> None:
+    owners = RithmicRuntimeOwners(order_event_lifecycle=MagicMock())
+    owner = MagicMock()
+    error = RuntimeError(owner_method)
+    getattr(owner, owner_method).side_effect = error
+    setattr(owners, owner_attr, owner)
+
+    with pytest.raises(RuntimeError) as caught:
+        getattr(owners, facade_method)(*args, **kwargs)
+
+    assert caught.value is error
+
+
+def test_runtime_handle_preserves_runtime_recovery_exception_identity() -> None:
+    owners = RithmicRuntimeOwners(order_event_lifecycle=MagicMock())
+    error = RuntimeError("runtime recovery")
+    runtime_recovery = MagicMock()
+    runtime_recovery.run_once.side_effect = error
+    owners.runtime_recovery = runtime_recovery
+
+    operation = owners.runtime_recovery_operation()
+    with pytest.raises(RuntimeError) as caught:
+        operation()
+
+    assert caught.value is error
 
 
 def test_rithmic_composition_builds_the_complete_shared_owner_graph() -> None:
