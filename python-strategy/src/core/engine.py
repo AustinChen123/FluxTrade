@@ -702,13 +702,8 @@ class StrategyEngine:
 
     def _reconcile_owned_orders_on_reconnect(self) -> bool:
         """Delegate Rithmic ORDER reconnect recovery to its venue owner."""
-        adapter = self.execution_engine.adapter
-        if not isinstance(adapter, RithmicExchangeAdapter):
-            return True
-        handled_by_rithmic, reconciled = (
-            self._rithmic_runtime.reconcile_order_reconnect()
-        )
-        if not handled_by_rithmic:
+        reconciled = self._rithmic_runtime.reconcile_order_reconnect()
+        if reconciled is None:
             logger.error(
                 "Reconnect order reconciliation is unavailable; "
                 "submissions remain gated"

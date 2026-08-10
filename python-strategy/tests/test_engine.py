@@ -5825,6 +5825,7 @@ def _install_rithmic_order_reconnect_service(
         logger=logging.getLogger("test.rithmic_order_reconnect"),
     )
     service.on_runtime_started()
+    engine._rithmic_runtime.is_rithmic_runtime = True
     engine._rithmic_runtime.order_reconnect = service
     return service
 
@@ -7597,10 +7598,10 @@ def test_reconnect_triggers_owned_order_reconcile_and_gates(engine):
 
 
 def test_engine_reconnect_seam_delegates_only_to_venue_owner(engine):
-    adapter = _rithmic_adapter_for_reconnect_test()
     service = MagicMock()
     service.reconcile_if_needed.return_value = True
-    engine.execution_engine.adapter = adapter
+    assert not isinstance(engine.execution_engine.adapter, RithmicExchangeAdapter)
+    engine._rithmic_runtime.is_rithmic_runtime = True
     engine._rithmic_runtime.order_reconnect = service
     engine.execution_engine.reconcile_rithmic_owned_orders = MagicMock()
 
@@ -7610,13 +7611,98 @@ def test_engine_reconnect_seam_delegates_only_to_venue_owner(engine):
     engine.execution_engine.reconcile_rithmic_owned_orders.assert_not_called()
 
 
+def test_engine_reconnect_policy_ignores_concrete_adapter_without_facade_authority(
+    engine,
+):
+    engine.execution_engine.adapter = _rithmic_adapter_for_reconnect_test()
+    engine._rithmic_runtime.is_rithmic_runtime = False
+    owner = MagicMock()
+    engine._rithmic_runtime.order_reconnect = owner
+
+    assert engine._reconcile_owned_orders_on_reconnect() is True
+
+    owner.reconcile_if_needed.assert_not_called()
+
+
+@pytest.mark.parametrize(
+    "case",
+    ["generic", "missing", "owner_false", "owner_true", "owner_exception"],
+)
+def test_engine_reconnect_dispatch_has_no_generic_safety_side_effects(
+    engine,
+    caplog,
+    case,
+):
+    engine._rithmic_runtime.is_rithmic_runtime = case != "generic"
+    owner = None if case == "missing" else MagicMock()
+    error = RuntimeError("reconnect-owner-sentinel")
+    if owner is not None:
+        if case == "owner_exception":
+            owner.reconcile_if_needed.side_effect = error
+        else:
+            owner.reconcile_if_needed.return_value = case != "owner_false"
+    engine._rithmic_runtime.order_reconnect = owner
+    engine._market_processing_lock = MagicMock()
+    engine._ops_command_lock = MagicMock()
+    engine._halt_for_kill_switch = MagicMock()
+    engine._clear_local_kill_switch_halt = MagicMock()
+    engine.ops_safety.persist_kill_switch_state = MagicMock()
+    engine.execution_engine.resume_after_reconcile = MagicMock()
+    engine._apply_rithmic_authoritative_account_summary = MagicMock()
+    engine.redis_client.set = MagicMock()
+
+    caplog.clear()
+    with caplog.at_level(logging.ERROR, logger="src.core.engine"):
+        if case == "owner_exception":
+            with pytest.raises(RuntimeError) as raised:
+                engine._reconcile_owned_orders_on_reconnect()
+            assert raised.value is error
+        else:
+            expected = case not in {"missing", "owner_false"}
+            assert engine._reconcile_owned_orders_on_reconnect() is expected
+
+    expected_messages = (
+        ["Reconnect order reconciliation is unavailable; submissions remain gated"]
+        if case == "missing"
+        else []
+    )
+    assert caplog.messages == expected_messages
+    if owner is not None:
+        if case == "generic":
+            owner.reconcile_if_needed.assert_not_called()
+        else:
+            owner.reconcile_if_needed.assert_called_once_with()
+    engine._market_processing_lock.__enter__.assert_not_called()
+    engine._ops_command_lock.__enter__.assert_not_called()
+    engine._halt_for_kill_switch.assert_not_called()
+    engine._clear_local_kill_switch_halt.assert_not_called()
+    engine.ops_safety.persist_kill_switch_state.assert_not_called()
+    engine.execution_engine.resume_after_reconcile.assert_not_called()
+    engine._apply_rithmic_authoritative_account_summary.assert_not_called()
+    engine.redis_client.set.assert_not_called()
+
+
+def test_engine_reconnect_dispatch_resolves_replacement_owner_at_call_time(engine):
+    engine._rithmic_runtime.is_rithmic_runtime = True
+    first_owner = MagicMock()
+    first_owner.reconcile_if_needed.return_value = True
+    replacement_owner = MagicMock()
+    replacement_owner.reconcile_if_needed.return_value = False
+    engine._rithmic_runtime.order_reconnect = first_owner
+
+    assert engine._reconcile_owned_orders_on_reconnect() is True
+    engine._rithmic_runtime.order_reconnect = replacement_owner
+    assert engine._reconcile_owned_orders_on_reconnect() is False
+
+    first_owner.reconcile_if_needed.assert_called_once_with()
+    replacement_owner.reconcile_if_needed.assert_called_once_with()
+
+
 def test_engine_reconnect_seams_route_through_runtime_facade(engine_factory):
     adapter = _rithmic_adapter_for_reconnect_test()
     engine = engine_factory(adapter=adapter, audit_external_orders=True)
     engine._rithmic_runtime.order_reconnect = None
-    engine._rithmic_runtime.reconcile_order_reconnect = MagicMock(
-        return_value=(True, True)
-    )
+    engine._rithmic_runtime.reconcile_order_reconnect = MagicMock(return_value=True)
     engine._rithmic_runtime.on_order_runtime_started = MagicMock()
 
     assert engine._reconcile_owned_orders_on_reconnect() is True

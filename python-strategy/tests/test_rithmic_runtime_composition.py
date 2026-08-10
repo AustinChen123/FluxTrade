@@ -151,17 +151,20 @@ def test_runtime_handle_does_not_fall_through_when_ledger_owner_returns_none() -
 
 
 def test_runtime_handle_routes_reconnect_lifecycle_to_current_owner() -> None:
-    owners = RithmicRuntimeOwners(order_event_lifecycle=MagicMock())
+    owners = RithmicRuntimeOwners(
+        order_event_lifecycle=MagicMock(),
+        is_rithmic_runtime=True,
+    )
 
     assert owners.on_order_runtime_started() is None
-    assert owners.reconcile_order_reconnect() == (False, False)
+    assert owners.reconcile_order_reconnect() is None
 
     first_owner = MagicMock()
     first_owner.reconcile_if_needed.return_value = False
     owners.order_reconnect = first_owner
 
     assert owners.on_order_runtime_started() is None
-    assert owners.reconcile_order_reconnect() == (True, False)
+    assert owners.reconcile_order_reconnect() is False
     first_owner.on_runtime_started.assert_called_once_with()
     first_owner.reconcile_if_needed.assert_called_once_with()
 
@@ -170,11 +173,28 @@ def test_runtime_handle_routes_reconnect_lifecycle_to_current_owner() -> None:
     owners.order_reconnect = second_owner
 
     assert owners.on_order_runtime_started() is None
-    assert owners.reconcile_order_reconnect() == (True, True)
+    assert owners.reconcile_order_reconnect() is True
     first_owner.on_runtime_started.assert_called_once_with()
     first_owner.reconcile_if_needed.assert_called_once_with()
     second_owner.on_runtime_started.assert_called_once_with()
     second_owner.reconcile_if_needed.assert_called_once_with()
+
+
+def test_reconnect_policy_uses_facade_authority_before_current_owner() -> None:
+    owner = MagicMock()
+    owner.reconcile_if_needed.return_value = False
+    owners = RithmicRuntimeOwners(
+        order_event_lifecycle=MagicMock(),
+        order_reconnect=owner,
+        is_rithmic_runtime=False,
+    )
+
+    assert owners.reconcile_order_reconnect() is True
+    owner.reconcile_if_needed.assert_not_called()
+
+    owners.is_rithmic_runtime = True
+    assert owners.reconcile_order_reconnect() is False
+    owner.reconcile_if_needed.assert_called_once_with()
 
 
 @pytest.mark.parametrize(
@@ -431,7 +451,10 @@ def test_runtime_handle_preserves_reconnect_exception_identity(
     facade_method: str,
     owner_method: str,
 ) -> None:
-    owners = RithmicRuntimeOwners(order_event_lifecycle=MagicMock())
+    owners = RithmicRuntimeOwners(
+        order_event_lifecycle=MagicMock(),
+        is_rithmic_runtime=True,
+    )
     owner = MagicMock()
     error = RuntimeError(owner_method)
     getattr(owner, owner_method).side_effect = error
