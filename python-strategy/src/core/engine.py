@@ -72,6 +72,9 @@ from src.core.adapters.rithmic_ledger_recovery import (
 from src.core.adapters.rithmic_order_reconnect import (
     RithmicOrderReconnectService,
 )
+from src.core.adapters.rithmic_runtime_recovery import (
+    RithmicRuntimeRecoveryService,
+)
 from src.core.journal import StrategyJournal
 from src.core.redis_factory import create_redis_client
 from src.core.metrics import SIGNALS_TOTAL, ACTIVE_STRATEGIES, BALANCE_USDT
@@ -438,6 +441,38 @@ class StrategyEngine:
             and self._rithmic_ledger_recovery is not None
             else None
         )
+        self._rithmic_runtime_recovery = (
+            RithmicRuntimeRecoveryService(
+                adapter=adapter,
+                profile=self._rithmic_recovery_profile or "",
+                account_id=self._rithmic_recovery_account_id,
+                halt_for_reconcile=lambda **values: (
+                    self.execution_engine.halt_for_reconcile(**values)
+                ),
+                stop_order_event_stream=lambda **values: (
+                    self._stop_exchange_order_event_stream(**values)
+                ),
+                reconcile_owned_orders=lambda profile, account_id: (
+                    self.execution_engine.reconcile_rithmic_owned_orders(
+                        profile,
+                        account_id,
+                    )
+                ),
+                publish_authoritative_summary=(
+                    self._rithmic_ledger_recovery.publish_authoritative_summary
+                ),
+                assert_runtime_leadership=self._assert_runtime_leadership,
+                start_order_event_stream=self._start_exchange_order_event_stream,
+                resume_after_reconcile=lambda: (
+                    self.execution_engine.resume_after_reconcile()
+                ),
+                lockdown=self._lockdown_for_rithmic_order_drift,
+                logger=logger,
+            )
+            if isinstance(adapter, RithmicExchangeAdapter)
+            and self._rithmic_ledger_recovery is not None
+            else None
+        )
         self._lifecycle_adapter = _EngineLifecycleAdapter(self)
         self._health_monitor = HealthMonitor(self._registry)
         self._command_router = CommandRouter(
@@ -695,6 +730,16 @@ class StrategyEngine:
             daemon=True,
         )
         self.order_event_thread.start()
+
+    def _stop_exchange_order_event_stream(self, *, timeout: float) -> bool:
+        """Stop the generic order-event worker within a bounded timeout."""
+        self._order_event_stop.set()
+        thread = self.order_event_thread
+        if thread is not None and thread.is_alive():
+            thread.join(timeout=timeout)
+            if thread.is_alive():
+                return False
+        return True
 
     def _lockdown_for_external_order(
         self,
@@ -2693,78 +2738,15 @@ class StrategyEngine:
         self.runtime_reconcile_thread.start()
 
     def _run_rithmic_runtime_reconciliation_once(self) -> bool:
-        """Refresh exact-account state while market processing and submissions wait."""
+        """Run the venue recovery owner under generic Engine exclusion locks."""
         adapter = self.execution_engine.adapter
         if not isinstance(adapter, RithmicExchangeAdapter):
             raise RuntimeError("rithmic_runtime_reconciliation_adapter_mismatch")
+        if self._rithmic_runtime_recovery is None:
+            raise RuntimeError("rithmic_runtime_reconciliation_unavailable")
 
         with self._market_processing_lock, self._ops_command_lock:
-            if not self.execution_engine.halt_for_reconcile(timeout=30.0):
-                self._lockdown_for_rithmic_order_drift(
-                    "rithmic_runtime_reconciliation_drain_timeout"
-                )
-                return False
-
-            self._order_event_stop.set()
-            thread = self.order_event_thread
-            if thread is not None and thread.is_alive():
-                thread.join(timeout=30.0)
-                if thread.is_alive():
-                    self._lockdown_for_rithmic_order_drift(
-                        "rithmic_runtime_reconciliation_stream_stop_timeout"
-                    )
-                    return False
-
-            summary = None
-            failure_reason = None
-            adapter.close()
-            try:
-                summary = self.execution_engine.reconcile_rithmic_owned_orders(
-                    self._rithmic_recovery_profile,
-                    self._rithmic_recovery_account_id,
-                )
-                if summary.get("auto_resume_safe") is not True:
-                    failure_reason = "rithmic_runtime_reconciliation_unresolved"
-                else:
-                    self._apply_rithmic_authoritative_account_summary(summary)
-            except Exception:
-                logger.exception("Periodic Rithmic ledger reconciliation failed")
-                failure_reason = "rithmic_runtime_reconciliation_failed"
-
-            try:
-                self._assert_runtime_leadership()
-            except Exception:
-                adapter.close()
-                raise
-            try:
-                self._start_exchange_order_event_stream()
-            except Exception:
-                logger.exception(
-                    "Order stream restart failed after periodic Rithmic reconciliation"
-                )
-                adapter.close()
-                failure_reason = "rithmic_runtime_reconciliation_stream_restart_failed"
-
-            try:
-                self._assert_runtime_leadership()
-            except Exception:
-                adapter.close()
-                raise
-            if failure_reason is not None:
-                self._lockdown_for_rithmic_order_drift(failure_reason)
-                return False
-
-            try:
-                self._assert_runtime_leadership()
-            except Exception:
-                adapter.close()
-                raise
-            self.execution_engine.resume_after_reconcile()
-            logger.info(
-                "Periodic Rithmic reconciliation complete: %s recoverable orders",
-                summary["recoverable_count"],
-            )
-            return True
+            return self._rithmic_runtime_recovery.run_once()
 
     def _record_strategy_heartbeats(self, strategy_ids: list[str]) -> None:
         """Record strategy heartbeat state in HealthMonitor and DB."""
