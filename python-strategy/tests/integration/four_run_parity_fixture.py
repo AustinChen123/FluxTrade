@@ -85,6 +85,8 @@ PARENT_SHA = "6494c2aa3d436f57c4c5466320d5e7a25c4b8a0a"
 PARENT_TREE = "96e1c296dd0c506d12a3ae2edf59c538f3e89b3e"
 FEATURE_COMMIT_SHA = "98b453ee5ae21e08bd46fcbef9b6984370cdf8ef"
 SHALLOW_IDENTITY_FIX_SHA = "d5eb57d2b12a2bd7a0928f7650e8ea0c121c57f4"
+NATIVE_ARTIFACT_FIX_SHA = "f5bb2dd628a2501cd25d435a2caaedda85d42feb"
+D0T_SENSITIVITY_COMMIT_SHA = "5056c8890e9ca818e0a192e5117b195e78bfd380"
 PARENT_MANIFEST_ENTRIES = 171
 PARENT_MANIFEST_BYTES = 17_008
 PARENT_MANIFEST_SHA256 = (
@@ -373,7 +375,11 @@ def _reviewed_candidate_parent(candidate_sha: str) -> str:
         return PARENT_SHA
     if candidate_sha == SHALLOW_IDENTITY_FIX_SHA:
         return FEATURE_COMMIT_SHA
-    return SHALLOW_IDENTITY_FIX_SHA
+    if candidate_sha == NATIVE_ARTIFACT_FIX_SHA:
+        return SHALLOW_IDENTITY_FIX_SHA
+    if candidate_sha == D0T_SENSITIVITY_COMMIT_SHA:
+        return NATIVE_ARTIFACT_FIX_SHA
+    return D0T_SENSITIVITY_COMMIT_SHA
 
 
 def validate_frozen_product_manifest(manifest: bytes) -> str:

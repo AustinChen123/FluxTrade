@@ -367,9 +367,21 @@ def test_reviewed_candidate_chain_allows_only_one_native_artifact_fix() -> None:
     )
     assert (
         fixture_module._reviewed_candidate_parent(
-            "1111111111111111111111111111111111111111"
+            "f5bb2dd628a2501cd25d435a2caaedda85d42feb"
         )
         == "d5eb57d2b12a2bd7a0928f7650e8ea0c121c57f4"
+    )
+    assert (
+        fixture_module._reviewed_candidate_parent(
+            "5056c8890e9ca818e0a192e5117b195e78bfd380"
+        )
+        == "f5bb2dd628a2501cd25d435a2caaedda85d42feb"
+    )
+    assert (
+        fixture_module._reviewed_candidate_parent(
+            "1111111111111111111111111111111111111111"
+        )
+        == "5056c8890e9ca818e0a192e5117b195e78bfd380"
     )
 
 
