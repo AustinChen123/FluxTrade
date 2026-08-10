@@ -91,6 +91,41 @@ def test_candidate_parent_is_read_from_the_raw_commit_object(
     )
 
 
+def test_reviewed_candidate_chain_allows_only_one_native_artifact_fix() -> None:
+    assert (
+        fixture_module._reviewed_candidate_parent(
+            "98b453ee5ae21e08bd46fcbef9b6984370cdf8ef"
+        )
+        == "6494c2aa3d436f57c4c5466320d5e7a25c4b8a0a"
+    )
+    assert (
+        fixture_module._reviewed_candidate_parent(
+            "d5eb57d2b12a2bd7a0928f7650e8ea0c121c57f4"
+        )
+        == "98b453ee5ae21e08bd46fcbef9b6984370cdf8ef"
+    )
+    assert (
+        fixture_module._reviewed_candidate_parent(
+            "1111111111111111111111111111111111111111"
+        )
+        == "d5eb57d2b12a2bd7a0928f7650e8ea0c121c57f4"
+    )
+
+
+def test_untracked_product_paths_allow_only_the_selected_ci_native_binary() -> None:
+    selected = "python-strategy/src/fluxtrade_core.so"
+
+    fixture_module._validate_untracked_product_paths((selected,), selected)
+
+    for untracked, allowed in (
+        (("python-strategy/src/unrelated.py",), selected),
+        ((selected, "python-strategy/src/unrelated.py"), selected),
+        ((selected,), None),
+    ):
+        with pytest.raises(ValueError, match="untracked product runtime path"):
+            fixture_module._validate_untracked_product_paths(untracked, allowed)
+
+
 def test_real_collectors_produce_the_same_exact_outcome(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

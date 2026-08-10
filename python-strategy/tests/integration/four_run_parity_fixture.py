@@ -84,6 +84,7 @@ TIMESTAMPS = (
 PARENT_SHA = "6494c2aa3d436f57c4c5466320d5e7a25c4b8a0a"
 PARENT_TREE = "96e1c296dd0c506d12a3ae2edf59c538f3e89b3e"
 FEATURE_COMMIT_SHA = "98b453ee5ae21e08bd46fcbef9b6984370cdf8ef"
+SHALLOW_IDENTITY_FIX_SHA = "d5eb57d2b12a2bd7a0928f7650e8ea0c121c57f4"
 PARENT_MANIFEST_ENTRIES = 171
 PARENT_MANIFEST_BYTES = 17_008
 PARENT_MANIFEST_SHA256 = (
@@ -368,7 +369,11 @@ def _commit_tree_and_parents(revision: str) -> tuple[str, list[str]]:
 
 
 def _reviewed_candidate_parent(candidate_sha: str) -> str:
-    return PARENT_SHA if candidate_sha == FEATURE_COMMIT_SHA else FEATURE_COMMIT_SHA
+    if candidate_sha == FEATURE_COMMIT_SHA:
+        return PARENT_SHA
+    if candidate_sha == SHALLOW_IDENTITY_FIX_SHA:
+        return FEATURE_COMMIT_SHA
+    return SHALLOW_IDENTITY_FIX_SHA
 
 
 def validate_frozen_product_manifest(manifest: bytes) -> str:
@@ -436,8 +441,17 @@ def _verify_current_product_runtime(manifest: bytes) -> str:
         check=False,
     ).returncode:
         raise ValueError("product index differs from candidate HEAD")
-    if _git("ls-files", "--others", "--exclude-standard", "--", *PRODUCT_ROOTS):
-        raise ValueError("untracked product runtime path is present")
+    untracked = tuple(
+        path.decode("utf-8")
+        for path in _git(
+            "ls-files",
+            "--others",
+            "--exclude-standard",
+            "--",
+            *PRODUCT_ROOTS,
+        ).splitlines()
+    )
+    _validate_untracked_product_paths(untracked, _selected_repo_native_path())
     for raw_line in manifest.splitlines():
         header, raw_path = raw_line.split(b"\t", 1)
         mode, _kind, raw_oid = header.split(b" ", 2)
@@ -445,6 +459,27 @@ def _verify_current_product_runtime(manifest: bytes) -> str:
         if _git_blob_oid(_ROOT / path, mode.decode("ascii")) != raw_oid.decode("ascii"):
             raise ValueError("loaded product filesystem differs from candidate blob")
     return digest
+
+
+def _selected_repo_native_path() -> str | None:
+    module = selected_native_matcher_module()
+    assert type(module.__file__) is str
+    try:
+        relative = Path(module.__file__).resolve().relative_to(_ROOT.resolve())
+    except ValueError:
+        return None
+    if relative.parent != Path("python-strategy/src"):
+        return None
+    return relative.as_posix()
+
+
+def _validate_untracked_product_paths(
+    untracked: tuple[str, ...],
+    selected_native_path: str | None,
+) -> None:
+    allowed = () if selected_native_path is None else (selected_native_path,)
+    if untracked not in ((), allowed):
+        raise ValueError("untracked product runtime path is present")
 
 
 def committed_candidate_available() -> bool:
