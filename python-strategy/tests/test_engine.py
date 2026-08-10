@@ -39,6 +39,9 @@ from src.core.adapters.rithmic_adapter import (
     RithmicExchangeAdapter,
     RithmicUnmappedOrderEvent,
 )
+from src.core.adapters.rithmic_ledger_recovery import (
+    RithmicLedgerRecoveryService,
+)
 from src.core.adapters.simulated import SimulatedAdapter
 from src.core.product_registry import InstrumentSpec
 from src.core.portfolio_runtime import (
@@ -131,6 +134,24 @@ def _authoritative_rithmic_summary(
             "verification_blocked": False,
         },
     }
+
+
+def _attach_rithmic_ledger_recovery(engine) -> None:
+    engine._rithmic_ledger_recovery = RithmicLedgerRecoveryService(
+        profile=engine._rithmic_recovery_profile or "test",
+        account_id=engine._rithmic_recovery_account_id,
+        reconcile_owned_orders=lambda profile, account_id: (
+            engine.execution_engine.reconcile_rithmic_owned_orders(
+                profile,
+                account_id,
+            )
+        ),
+        now_seconds=lambda: engine.execution_engine.clock.now(),
+        publish_authoritative_balance=lambda **values: (
+            engine.account_service.replace_authoritative_balance(**values)
+        ),
+        logger=logging.getLogger("src.core.engine"),
+    )
 
 
 # =============================================================================
@@ -371,6 +392,7 @@ class TestEngineInit:
                 clock=mock_clock,
                 adapter=MagicMock(),
                 audit_external_orders=True,
+                account_service=MagicMock(),
             )
         engine.execution_engine.reconcile_recoverable_client_orders = MagicMock(
             return_value={"recoverable_count": 2}
@@ -379,6 +401,7 @@ class TestEngineInit:
         engine._reconcile_recoverable_orders_on_startup()
 
         engine.execution_engine.reconcile_recoverable_client_orders.assert_called_once_with()
+        assert engine._rithmic_ledger_recovery is None
 
     def test_startup_reconcile_uses_rithmic_owned_recovery_when_configured(
         self,
@@ -393,20 +416,54 @@ class TestEngineInit:
                 "rithmic_recovery_account_id": "ACCOUNT",
             },
         )
+        summary = _authoritative_rithmic_summary()
         engine.execution_engine.reconcile_rithmic_owned_orders = MagicMock(
-            return_value={
-                "recoverable_count": 1,
-                "unresolved_count": 0,
-                "verification_blocked_count": 0,
-            }
+            return_value=summary
         )
+        engine.execution_engine.reconcile_recoverable_client_orders = MagicMock()
+        engine.execution_engine.clock.now = MagicMock(return_value=1704067201)
+        engine.account_service.replace_authoritative_balance = MagicMock()
 
-        engine._reconcile_recoverable_orders_on_startup()
+        result = engine._reconcile_recoverable_orders_on_startup()
 
+        assert isinstance(
+            engine._rithmic_ledger_recovery,
+            RithmicLedgerRecoveryService,
+        )
+        assert result is summary
         engine.execution_engine.reconcile_rithmic_owned_orders.assert_called_once_with(
             "test",
             "ACCOUNT",
         )
+        engine.execution_engine.reconcile_recoverable_client_orders.assert_not_called()
+        engine.account_service.replace_authoritative_balance.assert_called_once_with(
+            venue="rithmic",
+            account_id="ACCOUNT",
+            currency="USD",
+            balance=Decimal("50000.25"),
+            day_pnl=Decimal("0"),
+            observed_at_ms=1704067201000,
+            source_timestamp_ms=1704067200000,
+        )
+
+    def test_startup_rithmic_reconciliation_delegates_only_to_venue_owner(
+        self,
+        engine,
+    ):
+        result = object()
+        service = MagicMock()
+        service.reconcile_startup.return_value = result
+        engine.execution_engine.audit_external_orders = True
+        engine._rithmic_ledger_recovery = service
+        engine.execution_engine.reconcile_rithmic_owned_orders = MagicMock()
+        engine.execution_engine.reconcile_recoverable_client_orders = MagicMock()
+
+        actual = engine._reconcile_recoverable_orders_on_startup()
+
+        assert actual is result
+        service.reconcile_startup.assert_called_once_with()
+        engine.execution_engine.reconcile_rithmic_owned_orders.assert_not_called()
+        engine.execution_engine.reconcile_recoverable_client_orders.assert_not_called()
 
     def test_startup_restores_loaded_active_strategies(self, engine):
         """Restart should re-instantiate previously ACTIVE strategies."""
@@ -3874,6 +3931,7 @@ class TestRuntimeReconciliationThread:
         engine._rithmic_recovery_account_id = "ACCOUNT"
         engine.account_service.replace_authoritative_balance = MagicMock()
         engine.execution_engine.clock.now = MagicMock(return_value=1704067201)
+        _attach_rithmic_ledger_recovery(engine)
 
         engine._apply_rithmic_authoritative_account_summary(
             _authoritative_rithmic_summary()
@@ -3889,9 +3947,36 @@ class TestRuntimeReconciliationThread:
             source_timestamp_ms=1704067200000,
         )
 
+    def test_authoritative_rithmic_summary_delegates_to_venue_owner(
+        self,
+        engine,
+    ):
+        summary = object()
+        service = MagicMock()
+        engine._rithmic_ledger_recovery = service
+
+        engine._apply_rithmic_authoritative_account_summary(summary)
+
+        service.publish_authoritative_summary.assert_called_once_with(summary)
+
+    def test_authoritative_rithmic_summary_preserves_service_exception_identity(
+        self,
+        engine,
+    ):
+        error = RuntimeError("projection failed")
+        service = MagicMock()
+        service.publish_authoritative_summary.side_effect = error
+        engine._rithmic_ledger_recovery = service
+
+        with pytest.raises(RuntimeError) as caught:
+            engine._apply_rithmic_authoritative_account_summary({})
+
+        assert caught.value is error
+
     def test_authoritative_rithmic_summary_rejects_wrong_account(self, engine):
         engine._rithmic_recovery_account_id = "ACCOUNT"
         engine.account_service.replace_authoritative_balance = MagicMock()
+        _attach_rithmic_ledger_recovery(engine)
 
         with pytest.raises(
             RuntimeError,
