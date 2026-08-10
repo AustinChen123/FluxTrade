@@ -57,6 +57,9 @@ from src.core.adapters.rithmic_runtime_recovery import (
 from src.core.adapters.rithmic_emergency_flatten import (
     RithmicEmergencyFlattenService,
 )
+from src.core.adapters.rithmic_external_order_drift import (
+    RithmicExternalOrderDriftService,
+)
 from src.core.adapters.rithmic_strategy_exit import RithmicStrategyExitService
 from src.core.adapters.simulated import SimulatedAdapter
 from src.core.product_registry import InstrumentSpec
@@ -237,7 +240,10 @@ class TestEngineInit:
         assert owner._halt_for_reconcile(timeout=30.0) is True
         engine.execution_engine.halt_for_reconcile.assert_called_once_with(timeout=30.0)
 
-        engine._rithmic_external_order_drift_generation = 11
+        assert engine._rithmic_external_order_drift is not None
+        engine._rithmic_external_order_drift.current_generation = MagicMock(
+            return_value=11
+        )
         assert owner._current_drift_generation() == 11
 
         summary = {"auto_resume_safe": True}
@@ -246,6 +252,19 @@ class TestEngineInit:
         owner._publish_authoritative_summary(summary)
         engine._rithmic_ledger_recovery.publish_authoritative_summary.assert_called_once_with(
             summary
+        )
+
+    def test_rithmic_engine_constructs_external_order_drift_owner(
+        self,
+        engine_factory,
+    ):
+        adapter = _rithmic_adapter_for_reconnect_test()
+
+        engine = engine_factory(adapter=adapter, audit_external_orders=True)
+
+        assert isinstance(
+            engine._rithmic_external_order_drift,
+            RithmicExternalOrderDriftService,
         )
 
     def test_risk_manager_uses_adapter_instrument_specs(self, engine_factory):
@@ -4750,7 +4769,7 @@ class TestExchangeOrderEventThread:
     )
     def test_rithmic_external_order_locks_down_without_stopping_stream(
         self,
-        engine,
+        engine_factory,
         poll_error,
     ):
         adapter = RithmicExchangeAdapter(
@@ -4765,6 +4784,7 @@ class TestExchangeOrderEventThread:
             },
             client_factory=MagicMock(return_value=MagicMock()),
         )
+        engine = engine_factory(adapter=adapter, audit_external_orders=True)
         external_event = ExchangeOrderEvent(
             status="open",
             product_id="RITHMIC:NQ-202609",
@@ -4786,14 +4806,10 @@ class TestExchangeOrderEventThread:
             return None
 
         adapter.poll_order_event = MagicMock(side_effect=poll_event)
-        engine.execution_engine.adapter = adapter
         engine.execution_engine.process_exchange_order_event = MagicMock(
             return_value={"action": "unknown_order"}
         )
         engine._reconcile_owned_orders_on_reconnect = MagicMock(return_value=True)
-        engine._halt_for_kill_switch = MagicMock(
-            side_effect=lambda: setattr(engine, "_kill_switch_halted", True)
-        )
         engine.ops_safety.persist_kill_switch_state = MagicMock()
 
         class ImmediateThread:
@@ -4807,7 +4823,8 @@ class TestExchangeOrderEventThread:
             engine._start_exchange_order_event_stream()
 
         assert adapter.poll_order_event.call_count == 2
-        assert engine._rithmic_external_order_drift_pending is True
+        assert engine._rithmic_external_order_drift is not None
+        assert engine._rithmic_external_order_drift.pending is True
         assert engine._kill_switch_halted is True
         engine.ops_safety.persist_kill_switch_state.assert_called_once()
         engine.redis_client.set.assert_called_with(
@@ -4837,11 +4854,11 @@ class TestExchangeOrderEventThread:
         assert engine._prepare_rithmic_kill_switch_clear() == (True, None)
 
     @pytest.mark.parametrize(
-        ("prepared", "cleared", "expected_pending"),
+        ("prepared", "cleared"),
         [
-            ((False, None), None, True),
-            ((True, 0), False, True),
-            ((True, 0), True, False),
+            ((False, None), None),
+            ((True, 0), False),
+            ((True, 0), True),
         ],
     )
     def test_external_order_drift_blocks_clear_until_both_checks_pass(
@@ -4849,12 +4866,10 @@ class TestExchangeOrderEventThread:
         engine,
         prepared,
         cleared,
-        expected_pending,
     ):
-        engine._rithmic_external_order_drift_pending = True
         engine._kill_switch_halted = True
         engine._prepare_rithmic_kill_switch_clear = MagicMock(return_value=prepared)
-        engine.execution_engine.resume_after_reconcile = MagicMock()
+        engine._rithmic_external_order_drift = MagicMock()
         engine.ops_safety.clear_kill_switch = MagicMock(
             return_value={"cleared": cleared, "reason": "still_open"}
         )
@@ -4863,11 +4878,13 @@ class TestExchangeOrderEventThread:
 
         if prepared[0]:
             engine.ops_safety.clear_kill_switch.assert_called_once()
-            engine.execution_engine.resume_after_reconcile.assert_called_once_with()
+            engine._rithmic_external_order_drift.finalize_clear.assert_called_once_with(
+                prepared_generation=0,
+                clear_succeeded=bool(cleared),
+            )
         else:
             engine.ops_safety.clear_kill_switch.assert_not_called()
-            engine.execution_engine.resume_after_reconcile.assert_not_called()
-        assert engine._rithmic_external_order_drift_pending is expected_pending
+            engine._rithmic_external_order_drift.finalize_clear.assert_not_called()
 
     def test_rithmic_clear_does_not_persist_or_resume_after_leadership_loss(
         self,
@@ -4919,15 +4936,24 @@ class TestExchangeOrderEventThread:
         engine.execution_engine.halt_for_reconcile.assert_not_called()
         engine.execution_engine.resume_after_reconcile.assert_not_called()
 
-    def test_rithmic_clear_reasserts_lockdown_when_new_drift_is_detected(self, engine):
-        engine._rithmic_external_order_drift_pending = True
-        engine._kill_switch_halted = True
-        engine._prepare_rithmic_kill_switch_clear = MagicMock(return_value=(True, 0))
-        engine.execution_engine.resume_after_reconcile = MagicMock()
-        engine._halt_for_kill_switch = MagicMock(
-            side_effect=lambda: setattr(engine, "_kill_switch_halted", True)
+    def test_rithmic_clear_reasserts_lockdown_when_new_drift_is_detected(
+        self,
+        engine_factory,
+    ):
+        engine = engine_factory(
+            adapter=_rithmic_adapter_for_reconnect_test(),
+            audit_external_orders=True,
         )
+        owner = engine._rithmic_external_order_drift
+        assert owner is not None
+        owner.detect("before clear")
+        prepared_generation = owner.current_generation()
+        engine._prepare_rithmic_kill_switch_clear = MagicMock(
+            return_value=(True, prepared_generation)
+        )
+        engine.execution_engine.resume_after_reconcile = MagicMock()
         engine.ops_safety.persist_kill_switch_state = MagicMock()
+        engine.redis_client.set.reset_mock()
 
         def clear_kill_switch(*, persist_clear):
             persist_clear()
@@ -4943,8 +4969,8 @@ class TestExchangeOrderEventThread:
 
         engine._handle_command({"command": "CLEAR_KILL_SWITCH", "params": {}})
 
-        assert engine._rithmic_external_order_drift_generation == 1
-        assert engine._rithmic_external_order_drift_pending is True
+        assert owner.current_generation() == prepared_generation + 1
+        assert owner.pending is True
         assert engine._kill_switch_halted is True
         assert engine.redis_client.set.call_args_list[-1] == call(
             engine._system_state_key,
@@ -4957,20 +4983,8 @@ class TestExchangeOrderEventThread:
         )
         engine.execution_engine.resume_after_reconcile.assert_called_once_with()
 
-    def test_external_order_generation_and_submission_halt_are_atomic(self, engine):
-        def halt_while_generation_lock_is_held():
-            acquired = engine._rithmic_external_order_drift_lock.acquire(blocking=False)
-            if acquired:
-                engine._rithmic_external_order_drift_lock.release()
-                pytest.fail(
-                    "external-order generation published before submission halt"
-                )
-            engine._kill_switch_halted = True
-
-        engine._halt_for_kill_switch = MagicMock(
-            side_effect=halt_while_generation_lock_is_held
-        )
-        engine.ops_safety.persist_kill_switch_state = MagicMock()
+    def test_external_order_detection_delegates_to_rithmic_owner(self, engine):
+        engine._rithmic_external_order_drift = MagicMock()
 
         engine._lockdown_for_external_order(
             account_id="ACCOUNT",
@@ -4978,16 +4992,27 @@ class TestExchangeOrderEventThread:
             symbol="NQU6",
         )
 
-        assert engine._rithmic_external_order_drift_generation == 1
-        assert engine._rithmic_external_order_drift_pending is True
-        assert engine._kill_switch_halted is True
+        engine._rithmic_external_order_drift.detect.assert_called_once_with(
+            "rithmic_external_order_detected: "
+            "account_id=ACCOUNT exchange=CME symbol=NQU6 "
+            "client_order_id=unknown exchange_order_id=unknown"
+        )
 
     def test_rithmic_clear_releases_reconcile_gate_after_final_clean_decision(
-        self, engine
+        self,
+        engine_factory,
     ):
-        engine._rithmic_external_order_drift_pending = True
-        engine._kill_switch_halted = True
-        engine._prepare_rithmic_kill_switch_clear = MagicMock(return_value=(True, 0))
+        engine = engine_factory(
+            adapter=_rithmic_adapter_for_reconnect_test(),
+            audit_external_orders=True,
+        )
+        owner = engine._rithmic_external_order_drift
+        assert owner is not None
+        owner.detect("before clear")
+        prepared_generation = owner.current_generation()
+        engine._prepare_rithmic_kill_switch_clear = MagicMock(
+            return_value=(True, prepared_generation)
+        )
         engine.ops_safety.clear_kill_switch = MagicMock(
             return_value={"cleared": True, "reason": "cleared"}
         )
@@ -5000,18 +5025,27 @@ class TestExchangeOrderEventThread:
 
         engine._handle_command({"command": "CLEAR_KILL_SWITCH", "params": {}})
 
-        assert engine._rithmic_external_order_drift_pending is False
+        assert owner.pending is False
         assert engine._kill_switch_halted is False
         engine.execution_engine.resume_after_reconcile.assert_called_once_with()
 
-    def test_rithmic_clear_exception_releases_only_reconcile_gate(self, engine):
-        engine._rithmic_external_order_drift_pending = True
-        engine._kill_switch_halted = True
-        engine._prepare_rithmic_kill_switch_clear = MagicMock(return_value=(True, 0))
-        engine._halt_for_kill_switch = MagicMock(
-            side_effect=lambda: setattr(engine, "_kill_switch_halted", True)
+    def test_rithmic_clear_exception_releases_only_reconcile_gate(
+        self,
+        engine_factory,
+    ):
+        engine = engine_factory(
+            adapter=_rithmic_adapter_for_reconnect_test(),
+            audit_external_orders=True,
+        )
+        owner = engine._rithmic_external_order_drift
+        assert owner is not None
+        owner.detect("before clear")
+        prepared_generation = owner.current_generation()
+        engine._prepare_rithmic_kill_switch_clear = MagicMock(
+            return_value=(True, prepared_generation)
         )
         engine.ops_safety.persist_kill_switch_state = MagicMock()
+        engine.redis_client.set.reset_mock()
 
         def fail_after_partial_clear(*, persist_clear):
             persist_clear()
@@ -5029,7 +5063,7 @@ class TestExchangeOrderEventThread:
 
         engine._handle_command({"command": "CLEAR_KILL_SWITCH", "params": {}})
 
-        assert engine._rithmic_external_order_drift_pending is True
+        assert owner.pending is True
         assert engine._kill_switch_halted is True
         assert engine.redis_client.set.call_args_list[-1] == call(
             engine._system_state_key,
@@ -5589,11 +5623,9 @@ def test_portfolio_exit_stop_timeout_does_not_start_replacement_worker(engine):
     )
 
 
-def test_portfolio_exit_resolves_current_worker_after_acquiring_gate(engine):
+def test_portfolio_exit_resolves_current_worker_after_acquiring_gate(engine_factory):
     adapter = _rithmic_adapter_for_reconnect_test()
-    engine.execution_engine.adapter = adapter
-    engine._rithmic_recovery_profile = "test"
-    engine._rithmic_recovery_account_id = "ACCOUNT"
+    engine = engine_factory(adapter=adapter, audit_external_orders=True)
     engine._rithmic_emergency_flatten = MagicMock()
     engine._start_exchange_order_event_stream = MagicMock()
     stale_thread = MagicMock()

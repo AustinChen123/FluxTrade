@@ -61,6 +61,9 @@ from src.core.adapters import (
 from src.core.adapters.rithmic_emergency_flatten import (
     RithmicEmergencyFlattenService,
 )
+from src.core.adapters.rithmic_external_order_drift import (
+    RithmicExternalOrderDriftService,
+)
 from src.core.adapters.rithmic_portfolio_exit import (
     RithmicPortfolioExitService,
 )
@@ -458,6 +461,30 @@ class StrategyEngine:
             else None
         )
         self._rithmic_order_event_lifecycle = RithmicOrderEventLifecycleGate()
+        self._rithmic_external_order_drift = (
+            RithmicExternalOrderDriftService(
+                halt_submissions=self._halt_for_kill_switch,
+                clear_local_halt=self._clear_local_kill_switch_halt,
+                persist_lockdown_state=lambda reason: (
+                    self.ops_safety.persist_kill_switch_state(
+                        SYSTEM_STATE_LOCKDOWN,
+                        actor="rithmic_order_stream",
+                        reason=reason,
+                    )
+                ),
+                persist_redis_lockdown=lambda: self.redis_client.set(
+                    self._system_state_key,
+                    SYSTEM_STATE_LOCKDOWN,
+                ),
+                assert_runtime_leadership=self._assert_runtime_leadership,
+                resume_after_reconcile=lambda: (
+                    self.execution_engine.resume_after_reconcile()
+                ),
+                logger=logger,
+            )
+            if isinstance(adapter, RithmicExchangeAdapter)
+            else None
+        )
         self._rithmic_strategy_exit = (
             RithmicStrategyExitService(
                 adapter=adapter,
@@ -586,9 +613,6 @@ class StrategyEngine:
         self.command_thread = None
         self.runtime_reconcile_thread = None
         self._runtime_reconcile_stop = threading.Event()
-        self._rithmic_external_order_drift_pending = False
-        self._rithmic_external_order_drift_generation = 0
-        self._rithmic_external_order_drift_lock = threading.Lock()
         self.executor = ThreadPoolExecutor(max_workers=5)
         self._entry_admission_gate: EntryAdmissionGate | None = None
         if self.runtime_environment.identity == "live":
@@ -837,35 +861,9 @@ class StrategyEngine:
         )
 
     def _lockdown_for_rithmic_order_drift(self, reason: str) -> None:
-        with self._rithmic_external_order_drift_lock:
-            first_detection = not self._rithmic_external_order_drift_pending
-            self._rithmic_external_order_drift_pending = True
-            self._rithmic_external_order_drift_generation += 1
-            # Publish the generation and raise the submission gate atomically
-            # with respect to a concurrent clear decision.
-            self._halt_for_kill_switch()
-        logger.error(
-            "%s; submissions locked pending authoritative reconciliation", reason
-        )
-        if not first_detection:
-            return
-        self._persist_rithmic_external_order_lockdown(reason)
-
-    def _persist_rithmic_external_order_lockdown(self, reason: str) -> None:
-        try:
-            self.ops_safety.persist_kill_switch_state(
-                SYSTEM_STATE_LOCKDOWN,
-                actor="rithmic_order_stream",
-                reason=reason,
-            )
-        except Exception:
-            logger.exception("Failed to persist external-order lockdown to database")
-        try:
-            self.redis_client.set(self._system_state_key, SYSTEM_STATE_LOCKDOWN)
-        except Exception:
-            logger.exception(
-                "Failed to persist external-order lockdown to Redis; local halt remains active"
-            )
+        if self._rithmic_external_order_drift is None:
+            raise RuntimeError("Rithmic external-order drift owner is unavailable")
+        self._rithmic_external_order_drift.detect(reason)
 
     def _prepare_rithmic_kill_switch_clear(self) -> tuple[bool, int | None]:
         if self._rithmic_kill_switch_clear_preparation is None:
@@ -873,8 +871,9 @@ class StrategyEngine:
         return self._rithmic_kill_switch_clear_preparation.prepare()
 
     def _current_rithmic_external_order_drift_generation(self) -> int:
-        with self._rithmic_external_order_drift_lock:
-            return self._rithmic_external_order_drift_generation
+        if self._rithmic_external_order_drift is None:
+            return 0
+        return self._rithmic_external_order_drift.current_generation()
 
     def _run_ops_kill_switch(
         self,
@@ -1113,24 +1112,14 @@ class StrategyEngine:
                             )
                     finally:
                         if drift_generation is not None:
-                            with self._rithmic_external_order_drift_lock:
-                                drift_advanced = (
-                                    self._rithmic_external_order_drift_generation
-                                    != drift_generation
+                            if self._rithmic_external_order_drift is None:
+                                raise RuntimeError(
+                                    "Rithmic external-order drift owner is unavailable"
                                 )
-                                if clear_succeeded and not drift_advanced:
-                                    self._assert_runtime_leadership()
-                                    self._rithmic_external_order_drift_pending = False
-                                    self._kill_switch_halted = False
-                                elif drift_advanced:
-                                    self._rithmic_external_order_drift_pending = True
-                                    self._halt_for_kill_switch()
-                            if drift_advanced:
-                                self._persist_rithmic_external_order_lockdown(
-                                    "rithmic_external_order_detected_during_clear"
-                                )
-                            self._assert_runtime_leadership()
-                            self.execution_engine.resume_after_reconcile()
+                            self._rithmic_external_order_drift.finalize_clear(
+                                prepared_generation=drift_generation,
+                                clear_succeeded=clear_succeeded,
+                            )
             else:
                 expected_version = params.get("expected_version")
                 if cmd in {"START", "STOP", "RESUME", "FORCE_RECOVER"} and (
@@ -2447,6 +2436,9 @@ class StrategyEngine:
     def _halt_for_kill_switch(self) -> None:
         self._kill_switch_halted = True
         self.execution_engine.halt_and_drain(timeout=0)
+
+    def _clear_local_kill_switch_halt(self) -> None:
+        self._kill_switch_halted = False
 
     def _resume_after_kill_switch(self) -> None:
         self.execution_engine.resume_submissions()
