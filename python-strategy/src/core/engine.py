@@ -406,8 +406,8 @@ class StrategyEngine:
                     worker,
                 ),
                 on_runtime_started=lambda: (
-                    self._rithmic_order_reconnect.on_runtime_started()
-                    if self._rithmic_order_reconnect is not None
+                    self._rithmic_runtime.order_reconnect.on_runtime_started()
+                    if self._rithmic_runtime.order_reconnect is not None
                     else None
                 ),
                 reconcile_if_needed=lambda: (
@@ -446,18 +446,7 @@ class StrategyEngine:
             ),
             logger=logger,
         )
-        self._rithmic_ledger_recovery = rithmic_runtime.ledger_recovery
-        self._rithmic_order_reconnect = rithmic_runtime.order_reconnect
-        self._rithmic_runtime_recovery = rithmic_runtime.runtime_recovery
-        self._rithmic_order_event_lifecycle = rithmic_runtime.order_event_lifecycle
-        self._rithmic_external_order_drift = rithmic_runtime.external_order_drift
-        self._rithmic_strategy_exit = rithmic_runtime.strategy_exit
-        self._rithmic_order_event_stream = rithmic_runtime.order_event_stream
-        self._rithmic_kill_switch_clear_preparation = (
-            rithmic_runtime.kill_switch_clear_preparation
-        )
-        self._rithmic_emergency_flatten = rithmic_runtime.emergency_flatten
-        self._rithmic_portfolio_exit_factory = rithmic_runtime.portfolio_exit_factory
+        self._rithmic_runtime = rithmic_runtime
         self.runtime_reconciliation_job = RuntimeReconciliationJob(
             account_service=self.account_service,
             adapter=adapter,
@@ -606,8 +595,8 @@ class StrategyEngine:
         self._strategy_state_manager.start_subscriber()
 
     def _start_exchange_order_event_stream(self) -> None:
-        if self._rithmic_order_event_stream is not None:
-            self._rithmic_order_event_stream.start()
+        if self._rithmic_runtime.order_event_stream is not None:
+            self._rithmic_runtime.order_event_stream.start()
             return
         adapter = self.execution_engine.adapter
         start = getattr(adapter, "start_order_event_stream", None)
@@ -660,19 +649,19 @@ class StrategyEngine:
         return True
 
     def _lockdown_for_rithmic_order_drift(self, reason: str) -> None:
-        if self._rithmic_external_order_drift is None:
+        if self._rithmic_runtime.external_order_drift is None:
             raise RuntimeError("Rithmic external-order drift owner is unavailable")
-        self._rithmic_external_order_drift.detect(reason)
+        self._rithmic_runtime.external_order_drift.detect(reason)
 
     def _prepare_rithmic_kill_switch_clear(self) -> tuple[bool, int | None]:
-        if self._rithmic_kill_switch_clear_preparation is None:
+        if self._rithmic_runtime.kill_switch_clear_preparation is None:
             return True, None
-        return self._rithmic_kill_switch_clear_preparation.prepare()
+        return self._rithmic_runtime.kill_switch_clear_preparation.prepare()
 
     def _current_rithmic_external_order_drift_generation(self) -> int:
-        if self._rithmic_external_order_drift is None:
+        if self._rithmic_runtime.external_order_drift is None:
             return 0
-        return self._rithmic_external_order_drift.current_generation()
+        return self._rithmic_runtime.external_order_drift.current_generation()
 
     def _run_ops_kill_switch(
         self,
@@ -694,9 +683,9 @@ class StrategyEngine:
                 operation_id=operation_id,
             )
 
-        if self._rithmic_emergency_flatten is None:
+        if self._rithmic_runtime.emergency_flatten is None:
             raise RuntimeError("rithmic_emergency_flatten_unavailable")
-        return self._rithmic_emergency_flatten.execute(
+        return self._rithmic_runtime.emergency_flatten.execute(
             actor=actor,
             reason=reason,
             operation_id=operation_id,
@@ -707,8 +696,8 @@ class StrategyEngine:
         if not self.execution_engine.audit_external_orders:
             return None
 
-        if self._rithmic_ledger_recovery is not None:
-            return self._rithmic_ledger_recovery.reconcile_startup()
+        if self._rithmic_runtime.ledger_recovery is not None:
+            return self._rithmic_runtime.ledger_recovery.reconcile_startup()
 
         try:
             summary = self.execution_engine.reconcile_recoverable_client_orders()
@@ -728,22 +717,22 @@ class StrategyEngine:
 
     def _apply_rithmic_authoritative_account_summary(self, summary: dict) -> None:
         """Delegate authoritative Rithmic account publication to its owner."""
-        if self._rithmic_ledger_recovery is None:
+        if self._rithmic_runtime.ledger_recovery is None:
             raise RuntimeError("rithmic_ledger_recovery_unavailable")
-        self._rithmic_ledger_recovery.publish_authoritative_summary(summary)
+        self._rithmic_runtime.ledger_recovery.publish_authoritative_summary(summary)
 
     def _reconcile_owned_orders_on_reconnect(self) -> bool:
         """Delegate Rithmic ORDER reconnect recovery to its venue owner."""
         adapter = self.execution_engine.adapter
         if not isinstance(adapter, RithmicExchangeAdapter):
             return True
-        if self._rithmic_order_reconnect is None:
+        if self._rithmic_runtime.order_reconnect is None:
             logger.error(
                 "Reconnect order reconciliation is unavailable; "
                 "submissions remain gated"
             )
             return False
-        return self._rithmic_order_reconnect.reconcile_if_needed()
+        return self._rithmic_runtime.order_reconnect.reconcile_if_needed()
 
     def _can_auto_resume_after_startup_recovery(self, summary: dict | None) -> bool:
         return bool(
@@ -911,11 +900,11 @@ class StrategyEngine:
                             )
                     finally:
                         if drift_generation is not None:
-                            if self._rithmic_external_order_drift is None:
+                            if self._rithmic_runtime.external_order_drift is None:
                                 raise RuntimeError(
                                     "Rithmic external-order drift owner is unavailable"
                                 )
-                            self._rithmic_external_order_drift.finalize_clear(
+                            self._rithmic_runtime.external_order_drift.finalize_clear(
                                 prepared_generation=drift_generation,
                                 clear_succeeded=clear_succeeded,
                             )
@@ -2341,11 +2330,11 @@ class StrategyEngine:
         adapter = self.execution_engine.adapter
         if not isinstance(adapter, RithmicExchangeAdapter):
             raise RuntimeError("rithmic_runtime_reconciliation_adapter_mismatch")
-        if self._rithmic_runtime_recovery is None:
+        if self._rithmic_runtime.runtime_recovery is None:
             raise RuntimeError("rithmic_runtime_reconciliation_unavailable")
 
         with self._market_processing_lock, self._ops_command_lock:
-            return self._rithmic_runtime_recovery.run_once()
+            return self._rithmic_runtime.runtime_recovery.run_once()
 
     def _record_strategy_heartbeats(self, strategy_ids: list[str]) -> None:
         """Record strategy heartbeat state in HealthMonitor and DB."""
@@ -2612,9 +2601,9 @@ class StrategyEngine:
         adapter = self.execution_engine.adapter
         if not isinstance(adapter, RithmicExchangeAdapter):
             raise RuntimeError("authoritative_strategy_exit_requires_rithmic")
-        if self._rithmic_strategy_exit is None:
+        if self._rithmic_runtime.strategy_exit is None:
             raise RuntimeError("rithmic_strategy_exit_unavailable")
-        return self._rithmic_strategy_exit.execute(signal, decision)
+        return self._rithmic_runtime.strategy_exit.execute(signal, decision)
 
     def _run_rithmic_portfolio_exit(
         self,
@@ -2630,28 +2619,30 @@ class StrategyEngine:
         account_id = self._rithmic_recovery_account_id
         if not isinstance(profile, str) or not isinstance(account_id, str):
             raise RuntimeError("rithmic_portfolio_exit_account_identity_missing")
-        if self._rithmic_emergency_flatten is None:
+        if self._rithmic_runtime.emergency_flatten is None:
             raise RuntimeError("rithmic_emergency_flatten_unavailable")
         portfolio_id_for_sleeve = self._portfolio_coordinator.portfolio_id_for_sleeve
-        if self._rithmic_portfolio_exit_factory is None:
+        if self._rithmic_runtime.portfolio_exit_factory is None:
             owner = build_rithmic_portfolio_exit_owner(
                 adapter=adapter,
                 execution_engine=self.execution_engine,
                 account_service=self.account_service,
                 profile=profile,
                 account_id=account_id,
-                operation_gate=self._rithmic_order_event_lifecycle,
+                operation_gate=self._rithmic_runtime.order_event_lifecycle,
                 stop_order_event_stream=self._stop_exchange_order_event_stream,
                 assert_leadership=self._assert_runtime_leadership,
                 restart_order_stream=self._start_exchange_order_event_stream,
                 lockdown=self._lockdown_for_rithmic_order_drift,
                 schedule_emergency_flatten=(
-                    self._rithmic_emergency_flatten.schedule_portfolio_exit_compensation
+                    self._rithmic_runtime.emergency_flatten.schedule_portfolio_exit_compensation
                 ),
                 portfolio_id_for_sleeve=portfolio_id_for_sleeve,
             )
         else:
-            owner = self._rithmic_portfolio_exit_factory(portfolio_id_for_sleeve)
+            owner = self._rithmic_runtime.portfolio_exit_factory(
+                portfolio_id_for_sleeve
+            )
         return owner.execute(signal, decision, candle)
 
     def shutdown(

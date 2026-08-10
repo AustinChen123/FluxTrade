@@ -63,9 +63,9 @@ class RithmicRuntimeCallbacks:
     publish_authoritative_summary: Callable[[dict[str, Any]], None]
 
 
-@dataclass(frozen=True)
+@dataclass
 class RithmicRuntimeOwners:
-    """Concrete services owned by one Rithmic runtime composition."""
+    """Current concrete services owned by one Rithmic runtime composition."""
 
     order_event_lifecycle: RithmicOrderEventLifecycleGate
     ledger_recovery: RithmicLedgerRecoveryService | None = None

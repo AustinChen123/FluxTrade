@@ -161,7 +161,7 @@ def _authoritative_rithmic_summary(
 
 
 def _attach_rithmic_ledger_recovery(engine) -> None:
-    engine._rithmic_ledger_recovery = RithmicLedgerRecoveryService(
+    engine._rithmic_runtime.ledger_recovery = RithmicLedgerRecoveryService(
         profile=engine._rithmic_recovery_profile or "test",
         account_id=engine._rithmic_recovery_account_id,
         reconcile_owned_orders=lambda profile, account_id: (
@@ -213,16 +213,29 @@ class TestEngineInit:
         callbacks.start_order_event_stream()
         replacement_stop.assert_called_once_with(timeout=30.0)
         replacement_start.assert_called_once_with()
-        assert engine._rithmic_order_event_lifecycle is lifecycle
-        assert engine._rithmic_ledger_recovery is None
-        assert engine._rithmic_order_reconnect is None
-        assert engine._rithmic_runtime_recovery is None
-        assert engine._rithmic_external_order_drift is None
-        assert engine._rithmic_strategy_exit is None
-        assert engine._rithmic_order_event_stream is None
-        assert engine._rithmic_kill_switch_clear_preparation is None
-        assert engine._rithmic_emergency_flatten is None
-        assert engine._rithmic_portfolio_exit_factory is None
+        assert engine._rithmic_runtime is owners
+        assert not {
+            "_rithmic_ledger_recovery",
+            "_rithmic_order_reconnect",
+            "_rithmic_runtime_recovery",
+            "_rithmic_order_event_lifecycle",
+            "_rithmic_external_order_drift",
+            "_rithmic_strategy_exit",
+            "_rithmic_order_event_stream",
+            "_rithmic_kill_switch_clear_preparation",
+            "_rithmic_emergency_flatten",
+            "_rithmic_portfolio_exit_factory",
+        }.intersection(vars(engine))
+        assert engine._rithmic_runtime.order_event_lifecycle is lifecycle
+        assert engine._rithmic_runtime.ledger_recovery is None
+        assert engine._rithmic_runtime.order_reconnect is None
+        assert engine._rithmic_runtime.runtime_recovery is None
+        assert engine._rithmic_runtime.external_order_drift is None
+        assert engine._rithmic_runtime.strategy_exit is None
+        assert engine._rithmic_runtime.order_event_stream is None
+        assert engine._rithmic_runtime.kill_switch_clear_preparation is None
+        assert engine._rithmic_runtime.emergency_flatten is None
+        assert engine._rithmic_runtime.portfolio_exit_factory is None
 
     def test_rithmic_engine_constructs_order_reconnect_owner(self, engine_factory):
         adapter = _rithmic_adapter_for_reconnect_test()
@@ -230,7 +243,7 @@ class TestEngineInit:
         engine = engine_factory(adapter=adapter, audit_external_orders=True)
 
         assert isinstance(
-            engine._rithmic_order_reconnect,
+            engine._rithmic_runtime.order_reconnect,
             RithmicOrderReconnectService,
         )
 
@@ -240,7 +253,7 @@ class TestEngineInit:
         engine = engine_factory(adapter=adapter, audit_external_orders=True)
 
         assert isinstance(
-            engine._rithmic_runtime_recovery,
+            engine._rithmic_runtime.runtime_recovery,
             RithmicRuntimeRecoveryService,
         )
 
@@ -250,7 +263,7 @@ class TestEngineInit:
         engine = engine_factory(adapter=adapter, audit_external_orders=True)
 
         assert isinstance(
-            engine._rithmic_strategy_exit,
+            engine._rithmic_runtime.strategy_exit,
             RithmicStrategyExitService,
         )
 
@@ -260,7 +273,7 @@ class TestEngineInit:
         engine = engine_factory(adapter=adapter, audit_external_orders=True)
 
         assert isinstance(
-            engine._rithmic_emergency_flatten,
+            engine._rithmic_runtime.emergency_flatten,
             RithmicEmergencyFlattenService,
         )
 
@@ -272,9 +285,9 @@ class TestEngineInit:
 
         engine = engine_factory(adapter=adapter, audit_external_orders=True)
 
-        owner = engine._rithmic_kill_switch_clear_preparation
+        owner = engine._rithmic_runtime.kill_switch_clear_preparation
         assert isinstance(owner, RithmicKillSwitchClearPreparationService)
-        assert owner._operation_gate is engine._rithmic_order_event_lifecycle
+        assert owner._operation_gate is engine._rithmic_runtime.order_event_lifecycle
 
         replacement_worker = MagicMock()
         engine.order_event_thread = replacement_worker
@@ -284,17 +297,19 @@ class TestEngineInit:
         assert owner._halt_for_reconcile(timeout=30.0) is True
         engine.execution_engine.halt_for_reconcile.assert_called_once_with(timeout=30.0)
 
-        assert engine._rithmic_external_order_drift is not None
-        engine._rithmic_external_order_drift.current_generation = MagicMock(
+        assert engine._rithmic_runtime.external_order_drift is not None
+        engine._rithmic_runtime.external_order_drift.current_generation = MagicMock(
             return_value=11
         )
         assert owner._current_drift_generation() == 11
 
         summary = {"auto_resume_safe": True}
-        assert engine._rithmic_ledger_recovery is not None
-        engine._rithmic_ledger_recovery.publish_authoritative_summary = MagicMock()
+        assert engine._rithmic_runtime.ledger_recovery is not None
+        engine._rithmic_runtime.ledger_recovery.publish_authoritative_summary = (
+            MagicMock()
+        )
         owner._publish_authoritative_summary(summary)
-        engine._rithmic_ledger_recovery.publish_authoritative_summary.assert_called_once_with(
+        engine._rithmic_runtime.ledger_recovery.publish_authoritative_summary.assert_called_once_with(
             summary
         )
 
@@ -307,7 +322,7 @@ class TestEngineInit:
         engine = engine_factory(adapter=adapter, audit_external_orders=True)
 
         assert isinstance(
-            engine._rithmic_external_order_drift,
+            engine._rithmic_runtime.external_order_drift,
             RithmicExternalOrderDriftService,
         )
 
@@ -572,7 +587,7 @@ class TestEngineInit:
         engine._reconcile_recoverable_orders_on_startup()
 
         engine.execution_engine.reconcile_recoverable_client_orders.assert_called_once_with()
-        assert engine._rithmic_ledger_recovery is None
+        assert engine._rithmic_runtime.ledger_recovery is None
 
     def test_startup_reconcile_uses_rithmic_owned_recovery_when_configured(
         self,
@@ -598,7 +613,7 @@ class TestEngineInit:
         result = engine._reconcile_recoverable_orders_on_startup()
 
         assert isinstance(
-            engine._rithmic_ledger_recovery,
+            engine._rithmic_runtime.ledger_recovery,
             RithmicLedgerRecoveryService,
         )
         assert result is summary
@@ -625,7 +640,7 @@ class TestEngineInit:
         service = MagicMock()
         service.reconcile_startup.return_value = result
         engine.execution_engine.audit_external_orders = True
-        engine._rithmic_ledger_recovery = service
+        engine._rithmic_runtime.ledger_recovery = service
         engine.execution_engine.reconcile_rithmic_owned_orders = MagicMock()
         engine.execution_engine.reconcile_recoverable_client_orders = MagicMock()
 
@@ -4118,7 +4133,7 @@ class TestRuntimeReconciliationThread:
         owner = MagicMock()
         owner.run_once.side_effect = lambda: events.append("owner") or True
         engine.execution_engine.adapter = adapter
-        engine._rithmic_runtime_recovery = owner
+        engine._rithmic_runtime.runtime_recovery = owner
         engine._market_processing_lock = ObservableLock("market")
         engine._ops_command_lock = ObservableLock("ops")
         engine.execution_engine.reconcile_rithmic_owned_orders = MagicMock()
@@ -4137,7 +4152,7 @@ class TestRuntimeReconciliationThread:
 
     def test_runtime_recovery_delegate_rejects_non_rithmic_adapter(self, engine):
         owner = MagicMock()
-        engine._rithmic_runtime_recovery = owner
+        engine._rithmic_runtime.runtime_recovery = owner
 
         with pytest.raises(
             RuntimeError,
@@ -4149,7 +4164,7 @@ class TestRuntimeReconciliationThread:
 
     def test_runtime_recovery_delegate_fails_closed_without_owner(self, engine):
         engine.execution_engine.adapter = _rithmic_adapter_for_reconnect_test()
-        engine._rithmic_runtime_recovery = None
+        engine._rithmic_runtime.runtime_recovery = None
         engine.execution_engine.reconcile_rithmic_owned_orders = MagicMock()
 
         with pytest.raises(
@@ -4205,7 +4220,7 @@ class TestRuntimeReconciliationThread:
     ):
         summary = object()
         service = MagicMock()
-        engine._rithmic_ledger_recovery = service
+        engine._rithmic_runtime.ledger_recovery = service
 
         engine._apply_rithmic_authoritative_account_summary(summary)
 
@@ -4218,7 +4233,7 @@ class TestRuntimeReconciliationThread:
         error = RuntimeError("projection failed")
         service = MagicMock()
         service.publish_authoritative_summary.side_effect = error
-        engine._rithmic_ledger_recovery = service
+        engine._rithmic_runtime.ledger_recovery = service
 
         with pytest.raises(RuntimeError) as caught:
             engine._apply_rithmic_authoritative_account_summary({})
@@ -4689,7 +4704,7 @@ class TestExchangeOrderEventThread:
 
     def test_rithmic_event_stream_start_delegates_only_to_venue_owner(self, engine):
         owner = MagicMock()
-        engine._rithmic_order_event_stream = owner
+        engine._rithmic_runtime.order_event_stream = owner
         engine.execution_engine.adapter.start_order_event_stream = MagicMock()
 
         engine._start_exchange_order_event_stream()
@@ -4792,7 +4807,7 @@ class TestExchangeOrderEventThread:
             return_value={"action": "unresolved_missing_fill_price"}
         )
         engine._reconcile_owned_orders_on_reconnect = MagicMock(return_value=True)
-        engine._rithmic_external_order_drift = MagicMock()
+        engine._rithmic_runtime.external_order_drift = MagicMock()
 
         class ImmediateThread:
             def __init__(self, *, target, name, daemon):
@@ -4808,7 +4823,7 @@ class TestExchangeOrderEventThread:
             engine._start_exchange_order_event_stream()
 
         assert adapter.poll_order_event.call_count == 2
-        engine._rithmic_external_order_drift.detect.assert_called_once_with(
+        engine._rithmic_runtime.external_order_drift.detect.assert_called_once_with(
             "rithmic_order_event_requires_reconciliation: "
             "action=unresolved_missing_fill_price "
             "product_id=RITHMIC:NQ-202609 client_order_id=owned-order "
@@ -4886,8 +4901,8 @@ class TestExchangeOrderEventThread:
             engine._start_exchange_order_event_stream()
 
         assert adapter.poll_order_event.call_count == 2
-        assert engine._rithmic_external_order_drift is not None
-        assert engine._rithmic_external_order_drift.pending is True
+        assert engine._rithmic_runtime.external_order_drift is not None
+        assert engine._rithmic_runtime.external_order_drift.pending is True
         assert engine._kill_switch_halted is True
         engine.ops_safety.persist_kill_switch_state.assert_called_once()
         engine.redis_client.set.assert_called_with(
@@ -4905,14 +4920,14 @@ class TestExchangeOrderEventThread:
         sentinel = (False, 17)
         owner = MagicMock()
         owner.prepare.return_value = sentinel
-        engine._rithmic_kill_switch_clear_preparation = owner
+        engine._rithmic_runtime.kill_switch_clear_preparation = owner
 
         assert engine._prepare_rithmic_kill_switch_clear() is sentinel
 
         owner.prepare.assert_called_once_with()
 
     def test_non_rithmic_clear_does_not_construct_or_call_rithmic_owner(self, engine):
-        assert engine._rithmic_kill_switch_clear_preparation is None
+        assert engine._rithmic_runtime.kill_switch_clear_preparation is None
 
         assert engine._prepare_rithmic_kill_switch_clear() == (True, None)
 
@@ -4932,7 +4947,7 @@ class TestExchangeOrderEventThread:
     ):
         engine._kill_switch_halted = True
         engine._prepare_rithmic_kill_switch_clear = MagicMock(return_value=prepared)
-        engine._rithmic_external_order_drift = MagicMock()
+        engine._rithmic_runtime.external_order_drift = MagicMock()
         engine.ops_safety.clear_kill_switch = MagicMock(
             return_value={"cleared": cleared, "reason": "still_open"}
         )
@@ -4941,13 +4956,13 @@ class TestExchangeOrderEventThread:
 
         if prepared[0]:
             engine.ops_safety.clear_kill_switch.assert_called_once()
-            engine._rithmic_external_order_drift.finalize_clear.assert_called_once_with(
+            engine._rithmic_runtime.external_order_drift.finalize_clear.assert_called_once_with(
                 prepared_generation=0,
                 clear_succeeded=bool(cleared),
             )
         else:
             engine.ops_safety.clear_kill_switch.assert_not_called()
-            engine._rithmic_external_order_drift.finalize_clear.assert_not_called()
+            engine._rithmic_runtime.external_order_drift.finalize_clear.assert_not_called()
 
     def test_rithmic_clear_does_not_persist_or_resume_after_leadership_loss(
         self,
@@ -5007,7 +5022,7 @@ class TestExchangeOrderEventThread:
             adapter=_rithmic_adapter_for_reconnect_test(),
             audit_external_orders=True,
         )
-        owner = engine._rithmic_external_order_drift
+        owner = engine._rithmic_runtime.external_order_drift
         assert owner is not None
         owner.detect("before clear")
         prepared_generation = owner.current_generation()
@@ -5020,8 +5035,8 @@ class TestExchangeOrderEventThread:
 
         def clear_kill_switch(*, persist_clear):
             persist_clear()
-            assert engine._rithmic_order_event_stream is not None
-            engine._rithmic_order_event_stream._lockdown(
+            assert engine._rithmic_runtime.order_event_stream is not None
+            engine._rithmic_runtime.order_event_stream._lockdown(
                 "rithmic_external_order_detected: account_id=ACCOUNT "
                 "exchange=CME symbol=NQU6 client_order_id=unknown "
                 "exchange_order_id=manual-order"
@@ -5047,19 +5062,19 @@ class TestExchangeOrderEventThread:
         engine.execution_engine.resume_after_reconcile.assert_called_once_with()
 
     def test_external_order_detection_delegates_to_rithmic_owner(self, engine):
-        engine._rithmic_external_order_drift = MagicMock()
-        engine._rithmic_order_event_stream = MagicMock()
-        engine._rithmic_order_event_stream._lockdown = (
+        engine._rithmic_runtime.external_order_drift = MagicMock()
+        engine._rithmic_runtime.order_event_stream = MagicMock()
+        engine._rithmic_runtime.order_event_stream._lockdown = (
             engine._lockdown_for_rithmic_order_drift
         )
 
-        engine._rithmic_order_event_stream._lockdown(
+        engine._rithmic_runtime.order_event_stream._lockdown(
             "rithmic_external_order_detected: "
             "account_id=ACCOUNT exchange=CME symbol=NQU6 "
             "client_order_id=unknown exchange_order_id=unknown"
         )
 
-        engine._rithmic_external_order_drift.detect.assert_called_once_with(
+        engine._rithmic_runtime.external_order_drift.detect.assert_called_once_with(
             "rithmic_external_order_detected: "
             "account_id=ACCOUNT exchange=CME symbol=NQU6 "
             "client_order_id=unknown exchange_order_id=unknown"
@@ -5073,7 +5088,7 @@ class TestExchangeOrderEventThread:
             adapter=_rithmic_adapter_for_reconnect_test(),
             audit_external_orders=True,
         )
-        owner = engine._rithmic_external_order_drift
+        owner = engine._rithmic_runtime.external_order_drift
         assert owner is not None
         owner.detect("before clear")
         prepared_generation = owner.current_generation()
@@ -5104,7 +5119,7 @@ class TestExchangeOrderEventThread:
             adapter=_rithmic_adapter_for_reconnect_test(),
             audit_external_orders=True,
         )
-        owner = engine._rithmic_external_order_drift
+        owner = engine._rithmic_runtime.external_order_drift
         assert owner is not None
         owner.detect("before clear")
         prepared_generation = owner.current_generation()
@@ -5116,8 +5131,8 @@ class TestExchangeOrderEventThread:
 
         def fail_after_partial_clear(*, persist_clear):
             persist_clear()
-            assert engine._rithmic_order_event_stream is not None
-            engine._rithmic_order_event_stream._lockdown(
+            assert engine._rithmic_runtime.order_event_stream is not None
+            engine._rithmic_runtime.order_event_stream._lockdown(
                 "rithmic_external_order_detected: account_id=ACCOUNT "
                 "exchange=CME symbol=NQU6 client_order_id=unknown "
                 "exchange_order_id=unknown"
@@ -5236,7 +5251,7 @@ def _install_rithmic_order_reconnect_service(
         logger=logging.getLogger("test.rithmic_order_reconnect"),
     )
     service.on_runtime_started()
-    engine._rithmic_order_reconnect = service
+    engine._rithmic_runtime.order_reconnect = service
     return service
 
 
@@ -5271,7 +5286,7 @@ def _install_rithmic_runtime_recovery_service(
         lockdown=lambda reason: engine._lockdown_for_rithmic_order_drift(reason),
         logger=logging.getLogger("test.rithmic_runtime_recovery"),
     )
-    engine._rithmic_runtime_recovery = service
+    engine._rithmic_runtime.runtime_recovery = service
     return service
 
 
@@ -5285,14 +5300,14 @@ def _install_rithmic_strategy_exit_service(
         account_service=engine.account_service,
         profile=engine._rithmic_recovery_profile or "",
         account_id=engine._rithmic_recovery_account_id,
-        operation_gate=engine._rithmic_order_event_lifecycle,
+        operation_gate=engine._rithmic_runtime.order_event_lifecycle,
         stop_order_event_stream=engine._stop_exchange_order_event_stream,
         assert_leadership=engine._assert_runtime_leadership,
         restart_order_stream=engine._start_exchange_order_event_stream,
         lockdown=engine._lockdown_for_rithmic_order_drift,
         logger=logging.getLogger("test.rithmic_strategy_exit"),
     )
-    engine._rithmic_strategy_exit = service
+    engine._rithmic_runtime.strategy_exit = service
     return service
 
 
@@ -5307,7 +5322,7 @@ def _install_rithmic_emergency_flatten_service(
         ops_safety=engine.ops_safety,
         profile=engine._rithmic_recovery_profile or "test",
         account_id=engine._rithmic_recovery_account_id or "ACCOUNT",
-        operation_gate=engine._rithmic_order_event_lifecycle,
+        operation_gate=engine._rithmic_runtime.order_event_lifecycle,
         stop_current_worker=engine._stop_exchange_order_event_stream,
         clear_polling_stop=engine._order_event_stop.clear,
         restart_generic_worker=engine._start_exchange_order_event_stream,
@@ -5316,7 +5331,7 @@ def _install_rithmic_emergency_flatten_service(
         ),
         logger=logging.getLogger("test.rithmic_emergency_flatten"),
     )
-    engine._rithmic_emergency_flatten = service
+    engine._rithmic_runtime.emergency_flatten = service
     return service
 
 
@@ -5516,8 +5531,8 @@ def test_rithmic_strategy_exit_engine_seam_delegates_exactly_once(engine):
     adapter = _rithmic_adapter_for_reconnect_test()
     engine.execution_engine.adapter = adapter
     result = {"status": "verified_flat"}
-    engine._rithmic_strategy_exit = MagicMock()
-    engine._rithmic_strategy_exit.execute.return_value = result
+    engine._rithmic_runtime.strategy_exit = MagicMock()
+    engine._rithmic_runtime.strategy_exit.execute.return_value = result
     signal = Signal(
         strategy_id="strategy",
         product_id="RITHMIC:NQ-202609",
@@ -5535,7 +5550,9 @@ def test_rithmic_strategy_exit_engine_seam_delegates_exactly_once(engine):
 
     assert engine._run_rithmic_strategy_exit(signal, decision) is result
 
-    engine._rithmic_strategy_exit.execute.assert_called_once_with(signal, decision)
+    engine._rithmic_runtime.strategy_exit.execute.assert_called_once_with(
+        signal, decision
+    )
 
 
 def test_strategy_exit_owner_stops_current_replacement_thread(engine):
@@ -5592,14 +5609,16 @@ def test_rithmic_exit_owners_share_one_order_event_lifecycle_gate(engine):
     flatten_owner = _install_rithmic_emergency_flatten_service(engine, adapter)
 
     assert isinstance(
-        engine._rithmic_order_event_lifecycle,
+        engine._rithmic_runtime.order_event_lifecycle,
         RithmicOrderEventLifecycleGate,
     )
-    assert strategy_owner.operation_gate is engine._rithmic_order_event_lifecycle
-    assert flatten_owner.operation_gate is engine._rithmic_order_event_lifecycle
+    assert (
+        strategy_owner.operation_gate is engine._rithmic_runtime.order_event_lifecycle
+    )
+    assert flatten_owner.operation_gate is engine._rithmic_runtime.order_event_lifecycle
 
     sentinel = {"status": "serialized_portfolio_exit"}
-    engine._rithmic_order_event_lifecycle.run = MagicMock(return_value=sentinel)
+    engine._rithmic_runtime.order_event_lifecycle.run = MagicMock(return_value=sentinel)
     signal = Signal(
         strategy_id="portfolio_v1.sleeve_a",
         product_id="RITHMIC:NQ-202609",
@@ -5616,7 +5635,7 @@ def test_rithmic_exit_owners_share_one_order_event_lifecycle_gate(engine):
     )
 
     assert engine._run_rithmic_portfolio_exit(signal, decision, None) is sentinel
-    engine._rithmic_order_event_lifecycle.run.assert_called_once()
+    engine._rithmic_runtime.order_event_lifecycle.run.assert_called_once()
 
 
 def test_invalid_portfolio_exit_fails_before_lifecycle_gate(engine):
@@ -5624,8 +5643,8 @@ def test_invalid_portfolio_exit_fails_before_lifecycle_gate(engine):
     engine.execution_engine.adapter = adapter
     engine._rithmic_recovery_profile = "test"
     engine._rithmic_recovery_account_id = "ACCOUNT"
-    engine._rithmic_emergency_flatten = MagicMock()
-    engine._rithmic_order_event_lifecycle.run = MagicMock()
+    engine._rithmic_runtime.emergency_flatten = MagicMock()
+    engine._rithmic_runtime.order_event_lifecycle.run = MagicMock()
     signal = Signal(
         strategy_id="portfolio_v1.sleeve_a",
         product_id="RITHMIC:NQ-202609",
@@ -5647,7 +5666,7 @@ def test_invalid_portfolio_exit_fails_before_lifecycle_gate(engine):
     ):
         engine._run_rithmic_portfolio_exit(signal, decision, None)
 
-    engine._rithmic_order_event_lifecycle.run.assert_not_called()
+    engine._rithmic_runtime.order_event_lifecycle.run.assert_not_called()
 
 
 def test_portfolio_exit_stop_timeout_does_not_start_replacement_worker(engine):
@@ -5655,7 +5674,7 @@ def test_portfolio_exit_stop_timeout_does_not_start_replacement_worker(engine):
     engine.execution_engine.adapter = adapter
     engine._rithmic_recovery_profile = "test"
     engine._rithmic_recovery_account_id = "ACCOUNT"
-    engine._rithmic_emergency_flatten = MagicMock()
+    engine._rithmic_runtime.emergency_flatten = MagicMock()
     engine._start_exchange_order_event_stream = MagicMock()
     engine._lockdown_for_rithmic_order_drift = MagicMock()
     current_thread = MagicMock()
@@ -5685,7 +5704,7 @@ def test_portfolio_exit_stop_timeout_does_not_start_replacement_worker(engine):
     current_thread.join.assert_called_once_with(timeout=30.0)
     assert engine._order_event_stop.is_set()
     engine._start_exchange_order_event_stream.assert_not_called()
-    engine._rithmic_emergency_flatten.schedule_portfolio_exit_compensation.assert_not_called()
+    engine._rithmic_runtime.emergency_flatten.schedule_portfolio_exit_compensation.assert_not_called()
     engine._lockdown_for_rithmic_order_drift.assert_called_once_with(
         "rithmic_portfolio_exit_requires_reconciliation:RuntimeError"
     )
@@ -5694,7 +5713,7 @@ def test_portfolio_exit_stop_timeout_does_not_start_replacement_worker(engine):
 def test_portfolio_exit_resolves_current_worker_after_acquiring_gate(engine_factory):
     adapter = _rithmic_adapter_for_reconnect_test()
     engine = engine_factory(adapter=adapter, audit_external_orders=True)
-    engine._rithmic_emergency_flatten = MagicMock()
+    engine._rithmic_runtime.emergency_flatten = MagicMock()
     engine._start_exchange_order_event_stream = MagicMock()
     stale_thread = MagicMock()
     stale_thread.is_alive.return_value = True
@@ -5706,7 +5725,7 @@ def test_portfolio_exit_resolves_current_worker_after_acquiring_gate(engine_fact
         engine.order_event_thread = current_thread
         return operation(*args)
 
-    engine._rithmic_order_event_lifecycle.run = MagicMock(
+    engine._rithmic_runtime.order_event_lifecycle.run = MagicMock(
         side_effect=replace_worker_then_enter
     )
     signal = Signal(
@@ -5848,7 +5867,7 @@ def test_rithmic_portfolio_exit_reduces_only_owned_sleeve(
     )
     engine._start_exchange_order_event_stream = MagicMock()
     engine._lockdown_for_rithmic_order_drift = MagicMock()
-    engine._rithmic_emergency_flatten = MagicMock()
+    engine._rithmic_runtime.emergency_flatten = MagicMock()
     sleeve_position = Position(
         strategy_id="portfolio_v1.sleeve_a",
         product_id="RITHMIC:NQ-202609",
@@ -5925,7 +5944,7 @@ def test_rithmic_portfolio_exit_reduces_only_owned_sleeve(
                 decision,
                 candle,
             )
-        engine._rithmic_emergency_flatten.schedule_portfolio_exit_compensation.assert_not_called()
+        engine._rithmic_runtime.emergency_flatten.schedule_portfolio_exit_compensation.assert_not_called()
         engine._lockdown_for_rithmic_order_drift.assert_called_once()
         return
     with snapshot_loader:
@@ -5953,7 +5972,7 @@ def test_rithmic_portfolio_exit_reduces_only_owned_sleeve(
         remaining_remote_quantity=Decimal("2"),
     )
     engine.account_service.replace_positions_for_products.assert_not_called()
-    engine._rithmic_emergency_flatten.schedule_portfolio_exit_compensation.assert_not_called()
+    engine._rithmic_runtime.emergency_flatten.schedule_portfolio_exit_compensation.assert_not_called()
     engine._lockdown_for_rithmic_order_drift.assert_not_called()
 
 
@@ -5977,7 +5996,7 @@ def test_rithmic_portfolio_exit_does_not_reduce_another_sleeve_after_own_fill(
     engine.execution_engine.record_verified_net_reduction = MagicMock()
     engine._start_exchange_order_event_stream = MagicMock()
     engine._lockdown_for_rithmic_order_drift = MagicMock()
-    engine._rithmic_emergency_flatten = MagicMock()
+    engine._rithmic_runtime.emergency_flatten = MagicMock()
     engine.account_service.get_position_for_exit = MagicMock(
         side_effect=[
             Position(
@@ -6076,7 +6095,7 @@ def test_rithmic_portfolio_exit_does_not_cancel_before_safe_preflight(engine):
     engine.execution_engine.submit_verified_net_reduction = MagicMock()
     engine._start_exchange_order_event_stream = MagicMock()
     engine._lockdown_for_rithmic_order_drift = MagicMock()
-    engine._rithmic_emergency_flatten = MagicMock()
+    engine._rithmic_runtime.emergency_flatten = MagicMock()
     engine.account_service.get_position_for_exit = MagicMock()
     signal = Signal(
         strategy_id="portfolio_v1.sleeve_a",
@@ -6115,7 +6134,7 @@ def test_rithmic_portfolio_exit_does_not_cancel_before_safe_preflight(engine):
     adapter.cancel_order.assert_not_called()
     engine.execution_engine.submit_verified_net_reduction.assert_not_called()
     engine.account_service.get_position_for_exit.assert_not_called()
-    engine._rithmic_emergency_flatten.schedule_portfolio_exit_compensation.assert_not_called()
+    engine._rithmic_runtime.emergency_flatten.schedule_portfolio_exit_compensation.assert_not_called()
 
 
 @pytest.mark.parametrize("schedule_fails", [False, True])
@@ -6158,15 +6177,15 @@ def test_rithmic_portfolio_exit_schedules_flatten_after_protection_mutation(
         side_effect=lambda: lifecycle_calls.append("restart")
     )
     engine._lockdown_for_rithmic_order_drift = MagicMock()
-    engine._rithmic_emergency_flatten = MagicMock()
+    engine._rithmic_runtime.emergency_flatten = MagicMock()
     compensation_calls: list[str] = []
     if schedule_fails:
-        engine._rithmic_emergency_flatten.schedule_portfolio_exit_compensation.side_effect = RuntimeError(
+        engine._rithmic_runtime.emergency_flatten.schedule_portfolio_exit_compensation.side_effect = RuntimeError(
             "callback registration failed"
         )
     else:
-        engine._rithmic_emergency_flatten.schedule_portfolio_exit_compensation.side_effect = (
-            lambda reason: engine._rithmic_order_event_lifecycle.run(
+        engine._rithmic_runtime.emergency_flatten.schedule_portfolio_exit_compensation.side_effect = (
+            lambda reason: engine._rithmic_runtime.order_event_lifecycle.run(
                 lambda: (
                     lifecycle_calls.append("compensation"),
                     compensation_calls.append(reason),
@@ -6234,7 +6253,7 @@ def test_rithmic_portfolio_exit_schedules_flatten_after_protection_mutation(
         order_type="stop_loss",
     )
     engine.execution_engine.submit_verified_net_reduction.assert_not_called()
-    engine._rithmic_emergency_flatten.schedule_portfolio_exit_compensation.assert_called_once_with(
+    engine._rithmic_runtime.emergency_flatten.schedule_portfolio_exit_compensation.assert_called_once_with(
         "rithmic_portfolio_exit_requires_reconciliation:RuntimeError"
     )
     assert compensation_calls == (
@@ -6255,7 +6274,7 @@ def test_rithmic_portfolio_exit_schedules_flatten_after_protection_mutation(
     if not schedule_fails:
         compensation_calls.clear()
         errors.clear()
-        engine._rithmic_emergency_flatten.schedule_portfolio_exit_compensation.reset_mock()
+        engine._rithmic_runtime.emergency_flatten.schedule_portfolio_exit_compensation.reset_mock()
         engine.execution_engine.reconcile_rithmic_owned_orders.side_effect = [
             {"auto_resume_safe": False} for _ in range(6)
         ]
@@ -6272,7 +6291,7 @@ def test_rithmic_portfolio_exit_schedules_flatten_after_protection_mutation(
         assert str(errors[0]) == (
             "rithmic_portfolio_exit_preflight_reconciliation_blocked"
         )
-        engine._rithmic_emergency_flatten.schedule_portfolio_exit_compensation.assert_not_called()
+        engine._rithmic_runtime.emergency_flatten.schedule_portfolio_exit_compensation.assert_not_called()
         assert compensation_calls == []
 
 
@@ -6346,8 +6365,8 @@ def test_rithmic_kill_switch_delegates_exactly_once_to_venue_owner(engine):
     adapter = _rithmic_adapter_for_reconnect_test()
     engine.execution_engine.adapter = adapter
     expected = _kill_switch_result(authoritative_flatten_verified=True)
-    engine._rithmic_emergency_flatten = MagicMock()
-    engine._rithmic_emergency_flatten.execute.return_value = expected
+    engine._rithmic_runtime.emergency_flatten = MagicMock()
+    engine._rithmic_runtime.emergency_flatten.execute.return_value = expected
     engine.ops_safety.kill_switch = MagicMock()
 
     result = engine._run_ops_kill_switch(
@@ -6357,7 +6376,7 @@ def test_rithmic_kill_switch_delegates_exactly_once_to_venue_owner(engine):
     )
 
     assert result is expected
-    engine._rithmic_emergency_flatten.execute.assert_called_once_with(
+    engine._rithmic_runtime.emergency_flatten.execute.assert_called_once_with(
         actor="ops",
         reason="drill",
         operation_id="operation-1",
@@ -6867,7 +6886,7 @@ def test_engine_reconnect_seam_delegates_only_to_venue_owner(engine):
     service = MagicMock()
     service.reconcile_if_needed.return_value = True
     engine.execution_engine.adapter = adapter
-    engine._rithmic_order_reconnect = service
+    engine._rithmic_runtime.order_reconnect = service
     engine.execution_engine.reconcile_rithmic_owned_orders = MagicMock()
 
     assert engine._reconcile_owned_orders_on_reconnect() is True
@@ -6920,7 +6939,7 @@ def test_rithmic_stream_start_failure_preserves_pending_generation(engine_factor
 def test_generic_stream_start_without_rithmic_owner_remains_compatible(engine):
     adapter = _rithmic_adapter_for_reconnect_test()
     engine.execution_engine.adapter = adapter
-    engine._rithmic_order_reconnect = None
+    engine._rithmic_runtime.order_reconnect = None
 
     with patch("src.core.engine.threading.Thread") as thread_type:
         engine._start_exchange_order_event_stream()
@@ -6931,7 +6950,7 @@ def test_generic_stream_start_without_rithmic_owner_remains_compatible(engine):
 
 def test_non_rithmic_stream_helper_does_not_notify_rithmic_owner(engine):
     service = MagicMock()
-    engine._rithmic_order_reconnect = service
+    engine._rithmic_runtime.order_reconnect = service
 
     engine._start_exchange_order_event_stream()
 
