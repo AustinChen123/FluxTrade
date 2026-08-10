@@ -17,6 +17,8 @@ __all__ = [
     "BacktestOutcomeCaptureError",
     "build_normal_backtest_trading_outcome",
     "capture_signal_batch",
+    "exact_decimal_add",
+    "exact_decimal_subtract",
 ]
 
 _FIELD_NAMES = frozenset(Signal.model_fields)
@@ -152,7 +154,7 @@ def _journal_money(value: object, field: str, *, allow_zero: bool) -> Decimal:
     return parsed
 
 
-def _exact_add(left: Decimal, right: Decimal) -> Decimal:
+def exact_decimal_add(left: Decimal, right: Decimal) -> Decimal:
     left_sign, left_digits, left_exponent = left.as_tuple()
     right_sign, right_digits, right_exponent = right.as_tuple()
     assert isinstance(left_exponent, int) and isinstance(right_exponent, int)
@@ -175,6 +177,11 @@ def _exact_add(left: Decimal, right: Decimal) -> Decimal:
             exponent,
         )
     )
+
+
+def exact_decimal_subtract(left: Decimal, right: Decimal) -> Decimal:
+    """Subtract finite Decimals without consulting the ambient context."""
+    return exact_decimal_add(left, right.copy_negate())
 
 
 def _build_normal_backtest_trading_outcome(
@@ -409,7 +416,7 @@ def _build_normal_backtest_trading_outcome(
                     }
                 )
             )
-        fees = _exact_add(fees, fill_fee)
+        fees = exact_decimal_add(fees, fill_fee)
 
     return TradingOutcome(
         signals=captured_signals,
@@ -420,7 +427,7 @@ def _build_normal_backtest_trading_outcome(
             fees=fees,
             realized_pnl=pnl,
             unrealized_pnl=Decimal("0"),
-            equity=_exact_add(initial, pnl),
+            equity=exact_decimal_add(initial, pnl),
         ),
         journal=tuple(journal_observations),
     )
