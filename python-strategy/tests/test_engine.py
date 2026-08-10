@@ -42,6 +42,9 @@ from src.core.adapters.rithmic_adapter import (
 from src.core.adapters.rithmic_ledger_recovery import (
     RithmicLedgerRecoveryService,
 )
+from src.core.adapters.rithmic_kill_switch_clear import (
+    RithmicKillSwitchClearPreparationService,
+)
 from src.core.adapters.rithmic_order_reconnect import (
     RithmicOrderReconnectService,
 )
@@ -212,6 +215,37 @@ class TestEngineInit:
         assert isinstance(
             engine._rithmic_emergency_flatten,
             RithmicEmergencyFlattenService,
+        )
+
+    def test_rithmic_engine_constructs_kill_switch_clear_preparation_owner(
+        self,
+        engine_factory,
+    ):
+        adapter = _rithmic_adapter_for_reconnect_test()
+
+        engine = engine_factory(adapter=adapter, audit_external_orders=True)
+
+        owner = engine._rithmic_kill_switch_clear_preparation
+        assert isinstance(owner, RithmicKillSwitchClearPreparationService)
+        assert owner._operation_gate is engine._rithmic_order_event_lifecycle
+
+        replacement_worker = MagicMock()
+        engine.order_event_thread = replacement_worker
+        assert owner._current_order_event_thread() is replacement_worker
+
+        engine.execution_engine.halt_for_reconcile = MagicMock(return_value=True)
+        assert owner._halt_for_reconcile(timeout=30.0) is True
+        engine.execution_engine.halt_for_reconcile.assert_called_once_with(timeout=30.0)
+
+        engine._rithmic_external_order_drift_generation = 11
+        assert owner._current_drift_generation() == 11
+
+        summary = {"auto_resume_safe": True}
+        assert engine._rithmic_ledger_recovery is not None
+        engine._rithmic_ledger_recovery.publish_authoritative_summary = MagicMock()
+        owner._publish_authoritative_summary(summary)
+        engine._rithmic_ledger_recovery.publish_authoritative_summary.assert_called_once_with(
+            summary
         )
 
     def test_risk_manager_uses_adapter_instrument_specs(self, engine_factory):
@@ -4787,144 +4821,20 @@ class TestExchangeOrderEventThread:
         else:
             engine.execution_engine.process_exchange_order_event.assert_not_called()
 
-    @pytest.mark.parametrize(
-        ("summary", "expected"),
-        [
-            ({"recoverable_count": 0, "auto_resume_safe": True}, (True, 0)),
-            ({"recoverable_count": 1, "auto_resume_safe": False}, (False, None)),
-            ({"recoverable_count": 1}, (False, None)),
-        ],
-    )
-    @pytest.mark.parametrize("drift_pending", [False, True])
-    def test_rithmic_clear_uses_fresh_ledger_snapshot_and_restarts_stream(
-        self,
-        engine,
-        summary,
-        expected,
-        drift_pending,
-    ):
-        adapter = _rithmic_adapter_for_reconnect_test()
-        adapter.start_order_event_stream()
-        adapter.close = MagicMock(wraps=adapter.close)
-        engine.execution_engine.adapter = adapter
-        engine._rithmic_recovery_profile = "test"
-        engine._rithmic_recovery_account_id = "ACCOUNT"
-        engine._rithmic_external_order_drift_pending = drift_pending
-        engine.order_event_thread = MagicMock()
-        engine.order_event_thread.is_alive.side_effect = [True, False]
-        engine.execution_engine.halt_for_reconcile = MagicMock(return_value=True)
-        engine.execution_engine.resume_after_reconcile = MagicMock()
-        engine.execution_engine.reconcile_rithmic_owned_orders = MagicMock(
-            side_effect=lambda *_: (
-                summary
-                if adapter._client is None
-                else pytest.fail("ledger recovery started before ORDER runtime closed")
-            )
-        )
-        engine._start_exchange_order_event_stream = MagicMock()
-        engine._apply_rithmic_authoritative_account_summary = MagicMock()
-
-        assert engine._prepare_rithmic_kill_switch_clear() == expected
-
-        engine.order_event_thread.join.assert_called_once_with(timeout=30.0)
-        engine.execution_engine.halt_for_reconcile.assert_called_once_with(timeout=30.0)
-        engine.execution_engine.reconcile_rithmic_owned_orders.assert_called_once_with(
-            "test", "ACCOUNT"
-        )
-        engine._start_exchange_order_event_stream.assert_called_once_with()
-        if expected[0]:
-            engine.execution_engine.resume_after_reconcile.assert_not_called()
-        else:
-            engine.execution_engine.resume_after_reconcile.assert_called_once_with()
-        assert engine._rithmic_external_order_drift_pending is drift_pending
-
-    def test_rithmic_clear_enters_shared_order_event_lifecycle_gate(self, engine):
-        adapter = _rithmic_adapter_for_reconnect_test()
-        engine.execution_engine.adapter = adapter
+    def test_rithmic_clear_delegates_to_venue_owner(self, engine):
         sentinel = (False, 17)
-        engine._rithmic_order_event_lifecycle.run = MagicMock(return_value=sentinel)
+        owner = MagicMock()
+        owner.prepare.return_value = sentinel
+        engine._rithmic_kill_switch_clear_preparation = owner
 
         assert engine._prepare_rithmic_kill_switch_clear() is sentinel
 
-        engine._rithmic_order_event_lifecycle.run.assert_called_once_with(
-            engine._prepare_rithmic_kill_switch_clear_serialized,
-            adapter,
-        )
+        owner.prepare.assert_called_once_with()
 
-    def test_non_rithmic_clear_does_not_enter_rithmic_lifecycle_gate(self, engine):
-        engine._rithmic_order_event_lifecycle.run = MagicMock()
+    def test_non_rithmic_clear_does_not_construct_or_call_rithmic_owner(self, engine):
+        assert engine._rithmic_kill_switch_clear_preparation is None
 
         assert engine._prepare_rithmic_kill_switch_clear() == (True, None)
-
-        engine._rithmic_order_event_lifecycle.run.assert_not_called()
-
-    def test_external_order_clear_reconcile_failure_restarts_stream_and_stays_locked(
-        self,
-        engine,
-    ):
-        adapter = _rithmic_adapter_for_reconnect_test()
-        engine.execution_engine.adapter = adapter
-        engine._rithmic_external_order_drift_pending = True
-        engine.execution_engine.halt_for_reconcile = MagicMock(return_value=True)
-        engine.execution_engine.reconcile_rithmic_owned_orders = MagicMock(
-            side_effect=RuntimeError("ledger offline")
-        )
-        engine.execution_engine.resume_after_reconcile = MagicMock()
-        engine._start_exchange_order_event_stream = MagicMock()
-
-        assert engine._prepare_rithmic_kill_switch_clear() == (False, None)
-
-        engine._start_exchange_order_event_stream.assert_called_once_with()
-        engine.execution_engine.resume_after_reconcile.assert_called_once_with()
-        assert engine._rithmic_external_order_drift_pending is True
-
-    def test_external_order_clear_restart_failure_keeps_reconcile_gate(self, engine):
-        adapter = _rithmic_adapter_for_reconnect_test()
-        engine.execution_engine.adapter = adapter
-        engine._rithmic_external_order_drift_pending = True
-        engine.execution_engine.halt_for_reconcile = MagicMock(return_value=True)
-        engine.execution_engine.reconcile_rithmic_owned_orders = MagicMock(
-            return_value={"recoverable_count": 0, "auto_resume_safe": True}
-        )
-        engine.execution_engine.resume_after_reconcile = MagicMock()
-        engine._start_exchange_order_event_stream = MagicMock(
-            side_effect=NetworkError("offline")
-        )
-
-        assert engine._prepare_rithmic_kill_switch_clear() == (False, None)
-
-        engine.execution_engine.resume_after_reconcile.assert_not_called()
-        assert engine._rithmic_external_order_drift_pending is True
-
-    def test_external_order_clear_stop_timeout_keeps_event_stream_running(self, engine):
-        adapter = _rithmic_adapter_for_reconnect_test()
-        engine.execution_engine.adapter = adapter
-        engine._rithmic_external_order_drift_pending = True
-        engine.order_event_thread = MagicMock()
-        engine.order_event_thread.is_alive.return_value = True
-        engine.execution_engine.halt_for_reconcile = MagicMock()
-
-        assert engine._prepare_rithmic_kill_switch_clear() == (False, None)
-
-        assert engine._order_event_stop.is_set() is False
-        engine.execution_engine.halt_for_reconcile.assert_not_called()
-
-    def test_external_order_clear_drain_timeout_restarts_stream_but_stays_locked(
-        self,
-        engine,
-    ):
-        adapter = _rithmic_adapter_for_reconnect_test()
-        engine.execution_engine.adapter = adapter
-        engine._rithmic_external_order_drift_pending = True
-        engine.execution_engine.halt_for_reconcile = MagicMock(return_value=False)
-        engine.execution_engine.resume_after_reconcile = MagicMock()
-        engine._start_exchange_order_event_stream = MagicMock()
-
-        assert engine._prepare_rithmic_kill_switch_clear() == (False, None)
-
-        engine._start_exchange_order_event_stream.assert_called_once_with()
-        engine.execution_engine.resume_after_reconcile.assert_called_once_with()
-        assert engine._rithmic_external_order_drift_pending is True
 
     @pytest.mark.parametrize(
         ("prepared", "cleared", "expected_pending"),

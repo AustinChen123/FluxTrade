@@ -67,6 +67,9 @@ from src.core.adapters.rithmic_portfolio_exit import (
 from src.core.adapters.rithmic_ledger_recovery import (
     RithmicLedgerRecoveryService,
 )
+from src.core.adapters.rithmic_kill_switch_clear import (
+    RithmicKillSwitchClearPreparationService,
+)
 from src.core.adapters.rithmic_order_reconnect import (
     RithmicOrderReconnectService,
 )
@@ -504,6 +507,40 @@ class StrategyEngine:
         )
         self.order_event_thread = None
         self._order_event_stop = threading.Event()
+        self._rithmic_kill_switch_clear_preparation = (
+            RithmicKillSwitchClearPreparationService(
+                adapter=adapter,
+                profile=self._rithmic_recovery_profile or "",
+                account_id=self._rithmic_recovery_account_id,
+                operation_gate=self._rithmic_order_event_lifecycle,
+                set_order_event_stop=self._order_event_stop.set,
+                clear_order_event_stop=self._order_event_stop.clear,
+                current_order_event_thread=lambda: self.order_event_thread,
+                halt_for_reconcile=lambda **values: (
+                    self.execution_engine.halt_for_reconcile(**values)
+                ),
+                reconcile_owned_orders=lambda profile, account_id: (
+                    self.execution_engine.reconcile_rithmic_owned_orders(
+                        profile,
+                        account_id,
+                    )
+                ),
+                publish_authoritative_summary=(
+                    self._apply_rithmic_authoritative_account_summary
+                ),
+                current_drift_generation=(
+                    self._current_rithmic_external_order_drift_generation
+                ),
+                assert_runtime_leadership=self._assert_runtime_leadership,
+                start_order_event_stream=self._start_exchange_order_event_stream,
+                resume_after_reconcile=lambda: (
+                    self.execution_engine.resume_after_reconcile()
+                ),
+                logger=logger,
+            )
+            if isinstance(adapter, RithmicExchangeAdapter)
+            else None
+        )
         self._rithmic_emergency_flatten = (
             RithmicEmergencyFlattenService(
                 adapter=adapter,
@@ -831,86 +868,13 @@ class StrategyEngine:
             )
 
     def _prepare_rithmic_kill_switch_clear(self) -> tuple[bool, int | None]:
-        adapter = self.execution_engine.adapter
-        if not isinstance(adapter, RithmicExchangeAdapter):
+        if self._rithmic_kill_switch_clear_preparation is None:
             return True, None
-        return self._rithmic_order_event_lifecycle.run(
-            self._prepare_rithmic_kill_switch_clear_serialized,
-            adapter,
-        )
+        return self._rithmic_kill_switch_clear_preparation.prepare()
 
-    def _prepare_rithmic_kill_switch_clear_serialized(
-        self,
-        adapter: RithmicExchangeAdapter,
-    ) -> tuple[bool, int | None]:
-        self._order_event_stop.set()
-        thread = self.order_event_thread
-        if thread is not None and thread.is_alive():
-            thread.join(timeout=30.0)
-            self._assert_runtime_leadership()
-            if thread.is_alive():
-                logger.error(
-                    "Rithmic clear reconciliation timed out stopping the order event stream"
-                )
-                self._order_event_stop.clear()
-                return False, None
-
-        if not self.execution_engine.halt_for_reconcile(timeout=30.0):
-            logger.error(
-                "Rithmic clear reconciliation timed out draining in-flight submissions"
-            )
-            self._assert_runtime_leadership()
-            try:
-                self._start_exchange_order_event_stream()
-            except Exception:
-                logger.exception(
-                    "Order stream restart failed after reconciliation drain timeout"
-                )
-                return False, None
-            self._assert_runtime_leadership()
-            self.execution_engine.resume_after_reconcile()
-            return False, None
-
-        adapter.close()
-        summary = None
-        try:
-            summary = self.execution_engine.reconcile_rithmic_owned_orders(
-                self._rithmic_recovery_profile,
-                self._rithmic_recovery_account_id,
-            )
-        except Exception:
-            logger.exception("Rithmic clear reconciliation failed")
-
+    def _current_rithmic_external_order_drift_generation(self) -> int:
         with self._rithmic_external_order_drift_lock:
-            drift_generation = self._rithmic_external_order_drift_generation
-
-        self._assert_runtime_leadership()
-        try:
-            self._start_exchange_order_event_stream()
-        except Exception:
-            logger.exception(
-                "Order stream restart failed after external-order reconciliation"
-            )
-            return False, None
-        self._assert_runtime_leadership()
-
-        if not summary or summary.get("auto_resume_safe") is not True:
-            self.execution_engine.resume_after_reconcile()
-            logger.error(
-                "Rithmic clear reconciliation is unresolved; lockdown remains active"
-            )
-            return False, None
-        try:
-            self._apply_rithmic_authoritative_account_summary(summary)
-        except Exception:
-            logger.exception(
-                "Rithmic clear account reconciliation failed; lockdown remains active"
-            )
-            self._assert_runtime_leadership()
-            self.execution_engine.resume_after_reconcile()
-            return False, None
-        self._assert_runtime_leadership()
-        return True, drift_generation
+            return self._rithmic_external_order_drift_generation
 
     def _run_ops_kill_switch(
         self,
