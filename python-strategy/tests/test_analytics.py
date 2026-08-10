@@ -1,13 +1,23 @@
 """Tests for analytics.py — basic and advanced metrics."""
 
-import pytest
-from decimal import Decimal
+import json
+from decimal import Decimal, ROUND_DOWN, ROUND_HALF_UP, localcontext
+from fractions import Fraction
 from types import SimpleNamespace
+
+import pytest
+
 from src.core.analytics import calculate_metrics, _build_closed_trades
+from src.core.decimal_math import (
+    decimal_from_fraction,
+    exact_decimal_add,
+    exact_decimal_subtract,
+)
 from src.core.models import PositionSide, Trade
 
 
 # ── Helpers ──────────────────────────────────────────────────────
+
 
 def _make_trade(side: str, price: float, qty: float, ts: int) -> Trade:
     return Trade(
@@ -55,6 +65,7 @@ def _round_trip(
 
 # ── Empty / edge cases ──────────────────────────────────────────
 
+
 class TestEmptyAndEdge:
     def test_empty_trades(self):
         result = calculate_metrics([])
@@ -69,6 +80,7 @@ class TestEmptyAndEdge:
 
 
 # ── Basic metrics (backward compatibility) ───────────────────────
+
 
 class TestBasicMetrics:
     def test_closed_trade_count_includes_breakeven_trade(self):
@@ -118,9 +130,8 @@ class TestBasicMetrics:
             )
 
     def test_mixed_trades(self):
-        trades = (
-            _round_trip(100.0, 120.0, entry_ts=1000, exit_ts=2000)
-            + _round_trip(100.0, 95.0, entry_ts=3000, exit_ts=4000)
+        trades = _round_trip(100.0, 120.0, entry_ts=1000, exit_ts=2000) + _round_trip(
+            100.0, 95.0, entry_ts=3000, exit_ts=4000
         )
         result = calculate_metrics(trades)
         assert result["total_trades"] == 2
@@ -128,9 +139,8 @@ class TestBasicMetrics:
         assert float(result["total_pnl"]) == pytest.approx(1.5, abs=0.01)
 
     def test_profit_factor(self):
-        trades = (
-            _round_trip(100.0, 120.0, entry_ts=1000, exit_ts=2000)
-            + _round_trip(100.0, 95.0, entry_ts=3000, exit_ts=4000)
+        trades = _round_trip(100.0, 120.0, entry_ts=1000, exit_ts=2000) + _round_trip(
+            100.0, 95.0, entry_ts=3000, exit_ts=4000
         )
         result = calculate_metrics(trades)
         # gross_profit=2.0, gross_loss=0.5
@@ -138,9 +148,8 @@ class TestBasicMetrics:
 
     def test_max_drawdown(self):
         # Win then lose: equity goes 0 → +2 → +1.5
-        trades = (
-            _round_trip(100.0, 120.0, entry_ts=1000, exit_ts=2000)
-            + _round_trip(100.0, 95.0, entry_ts=3000, exit_ts=4000)
+        trades = _round_trip(100.0, 120.0, entry_ts=1000, exit_ts=2000) + _round_trip(
+            100.0, 95.0, entry_ts=3000, exit_ts=4000
         )
         result = calculate_metrics(trades)
         assert float(result["max_drawdown"]) == pytest.approx(-0.5, abs=0.01)
@@ -160,9 +169,8 @@ class TestBasicMetrics:
         assert closed[0].fee == Decimal("0.03")
 
     def test_trade_sharpe(self):
-        trades = (
-            _round_trip(100.0, 110.0, entry_ts=1000, exit_ts=2000)
-            + _round_trip(100.0, 110.0, entry_ts=3000, exit_ts=4000)
+        trades = _round_trip(100.0, 110.0, entry_ts=1000, exit_ts=2000) + _round_trip(
+            100.0, 110.0, entry_ts=3000, exit_ts=4000
         )
         result = calculate_metrics(trades)
         # All wins → sharpe is mean/std, but std=0 for identical PnLs
@@ -171,6 +179,7 @@ class TestBasicMetrics:
 
 
 # ── ClosedTrade pairing ─────────────────────────────────────────
+
 
 class TestClosedTrades:
     def test_long_round_trip(self):
@@ -186,28 +195,25 @@ class TestClosedTrades:
         assert ct.pnl == Decimal("1.00")
 
     def test_short_round_trip(self):
-        trades = _round_trip(100.0, 90.0, side="short", entry_ts=1_000_000, exit_ts=2_000_000)
+        trades = _round_trip(
+            100.0, 90.0, side="short", entry_ts=1_000_000, exit_ts=2_000_000
+        )
         closed, _, _, _ = _build_closed_trades(trades)
         assert len(closed) == 1
         assert closed[0].side == "SHORT"
         assert closed[0].pnl == Decimal("1.00")
 
     def test_multiple_round_trips(self):
-        trades = (
-            _round_trip(100.0, 110.0, entry_ts=1000, exit_ts=2000)
-            + _round_trip(200.0, 190.0, entry_ts=3000, exit_ts=4000)
+        trades = _round_trip(100.0, 110.0, entry_ts=1000, exit_ts=2000) + _round_trip(
+            200.0, 190.0, entry_ts=3000, exit_ts=4000
         )
         closed, _, _, _ = _build_closed_trades(trades)
         assert len(closed) == 2
 
     def test_same_timestamp_trades_preserve_authoritative_input_order(self):
         timestamp = 1_000_000
-        trades = [
-            _make_trade("sell", 100.0, 1.0, timestamp)
-            for _ in range(16)
-        ] + [
-            _make_trade("buy", 90.0, 1.0, timestamp)
-            for _ in range(16)
+        trades = [_make_trade("sell", 100.0, 1.0, timestamp) for _ in range(16)] + [
+            _make_trade("buy", 90.0, 1.0, timestamp) for _ in range(16)
         ]
 
         closed, _, _, total_pnl = _build_closed_trades(trades)
@@ -287,20 +293,19 @@ class TestClosedTrades:
 
 # ── Advanced metrics ─────────────────────────────────────────────
 
+
 class TestSortinoRatio:
     def test_all_positive_returns(self):
-        trades = (
-            _round_trip(100.0, 110.0, entry_ts=1000, exit_ts=2000)
-            + _round_trip(100.0, 120.0, entry_ts=3000, exit_ts=4000)
+        trades = _round_trip(100.0, 110.0, entry_ts=1000, exit_ts=2000) + _round_trip(
+            100.0, 120.0, entry_ts=3000, exit_ts=4000
         )
         result = calculate_metrics(trades)
         # No downside → downside_std=0 → sortino=0
         assert result["sortino_ratio"] == 0.0
 
     def test_mixed_returns(self):
-        trades = (
-            _round_trip(100.0, 120.0, entry_ts=1000, exit_ts=2000)
-            + _round_trip(100.0, 80.0, entry_ts=3000, exit_ts=4000)
+        trades = _round_trip(100.0, 120.0, entry_ts=1000, exit_ts=2000) + _round_trip(
+            100.0, 80.0, entry_ts=3000, exit_ts=4000
         )
         result = calculate_metrics(trades)
         # Has both positive and negative → sortino should be nonzero
@@ -310,10 +315,9 @@ class TestSortinoRatio:
 class TestCalmarRatio:
     def test_calmar_with_drawdown(self):
         # Create trades with drawdown
-        trades = (
-            _round_trip(100.0, 120.0, entry_ts=86_400_000, exit_ts=86_400_000 * 2)
-            + _round_trip(100.0, 80.0, entry_ts=86_400_000 * 3, exit_ts=86_400_000 * 4)
-        )
+        trades = _round_trip(
+            100.0, 120.0, entry_ts=86_400_000, exit_ts=86_400_000 * 2
+        ) + _round_trip(100.0, 80.0, entry_ts=86_400_000 * 3, exit_ts=86_400_000 * 4)
         result = calculate_metrics(trades, initial_balance=10000.0)
         assert isinstance(result["calmar_ratio"], Decimal)
 
@@ -328,10 +332,9 @@ class TestMonthlyReturns:
         # Jan trade + Feb trade
         jan_ts = 1704067200000  # 2024-01-01
         feb_ts = 1706745600000  # 2024-02-01
-        trades = (
-            _round_trip(100.0, 110.0, entry_ts=jan_ts, exit_ts=jan_ts + 60000)
-            + _round_trip(100.0, 90.0, entry_ts=feb_ts, exit_ts=feb_ts + 60000)
-        )
+        trades = _round_trip(
+            100.0, 110.0, entry_ts=jan_ts, exit_ts=jan_ts + 60000
+        ) + _round_trip(100.0, 90.0, entry_ts=feb_ts, exit_ts=feb_ts + 60000)
         result = calculate_metrics(trades)
         monthly = result["monthly_returns"]
         assert "2024-01" in monthly
@@ -345,10 +348,155 @@ class TestMonthlyReturns:
 
 
 class TestMaxDrawdownDays:
+    @pytest.mark.parametrize("precision", [6, 60])
+    @pytest.mark.parametrize("rounding", [ROUND_DOWN, ROUND_HALF_UP])
+    def test_mark_to_market_is_ambient_decimal_context_independent(
+        self,
+        precision: int,
+        rounding: str,
+    ):
+        with localcontext() as context:
+            context.prec = precision
+            context.rounding = rounding
+            result = calculate_metrics(
+                [],
+                initial_balance=Decimal("10000"),
+                equity_samples=[
+                    (1_800_000_000_000, Decimal("10000")),
+                    (1_800_000_060_000, Decimal("9999.90")),
+                    (1_800_000_120_000, Decimal("10000.9")),
+                    (1_800_000_180_000, Decimal("10001.8")),
+                ],
+            )
+
+        assert result["max_drawdown"] == Decimal("0.10")
+        assert result["calmar_ratio"] == Decimal("6570.0000")
+        assert result["max_drawdown_days"] == Decimal("0.00")
+        assert result["mark_to_market_pnl"] == Decimal("1.8")
+
+    @pytest.mark.parametrize("precision", [6, 60])
+    @pytest.mark.parametrize("rounding", [ROUND_DOWN, ROUND_HALF_UP])
+    def test_exact_decimal_math_ignores_ambient_context(
+        self,
+        precision: int,
+        rounding: str,
+    ):
+        left = Decimal("1234567890123456789012345678")
+        right = Decimal("0.0000000000000000000000000001")
+
+        with localcontext() as context:
+            context.prec = precision
+            context.rounding = rounding
+            total = exact_decimal_add(left, right)
+            difference = exact_decimal_subtract(total, left)
+
+        assert total == Decimal(
+            "1234567890123456789012345678.0000000000000000000000000001"
+        )
+        assert difference == right
+
+    def test_mark_to_market_large_values_use_exact_subtraction(self):
+        initial = Decimal("1234567890123456789012345678")
+        samples = [
+            (1_800_000_000_000, initial),
+            (
+                1_800_000_060_000,
+                Decimal("1234567890123456789012345677.876543211"),
+            ),
+            (
+                1_800_000_120_000,
+                Decimal("1234567890123456789012345678.987654321"),
+            ),
+        ]
+        results: list[dict[str, object]] = []
+
+        for precision in (6, 60):
+            for rounding in (ROUND_DOWN, ROUND_HALF_UP):
+                with localcontext() as context:
+                    context.prec = precision
+                    context.rounding = rounding
+                    results.append(
+                        calculate_metrics(
+                            [],
+                            initial_balance=initial,
+                            equity_samples=samples,
+                        )
+                    )
+
+        assert all(result == results[0] for result in results[1:])
+        for result in results:
+            drawdown = result["max_drawdown"]
+            pnl = result["mark_to_market_pnl"]
+            assert isinstance(drawdown, Decimal)
+            assert isinstance(pnl, Decimal)
+            assert drawdown.as_tuple() == Decimal("0.123456789").as_tuple()
+            assert pnl.as_tuple() == Decimal("0.987654321").as_tuple()
+
+    @pytest.mark.parametrize("precision", [6, 60])
+    @pytest.mark.parametrize("rounding", [ROUND_DOWN, ROUND_HALF_UP])
+    def test_zero_mark_to_market_pnl_preserves_existing_scale_and_json(
+        self,
+        precision: int,
+        rounding: str,
+    ):
+        with localcontext() as context:
+            context.prec = precision
+            context.rounding = rounding
+            result = calculate_metrics(
+                [],
+                initial_balance=Decimal("100.00"),
+                equity_samples=[
+                    (1_800_000_000_000, Decimal("100.00")),
+                    (1_800_000_060_000, Decimal("100.00")),
+                ],
+            )
+
+        pnl = result["mark_to_market_pnl"]
+        drawdown = result["max_drawdown"]
+        assert isinstance(pnl, Decimal)
+        assert isinstance(drawdown, Decimal)
+        assert pnl.as_tuple() == Decimal("0.00").as_tuple()
+        assert drawdown.as_tuple() == Decimal("0").as_tuple()
+        assert (
+            json.dumps(
+                {"mark_to_market_pnl": pnl},
+                default=str,
+                separators=(",", ":"),
+            )
+            == '{"mark_to_market_pnl":"0.00"}'
+        )
+
+    @pytest.mark.parametrize("precision", [6, 60])
+    @pytest.mark.parametrize("rounding", [ROUND_DOWN, ROUND_HALF_UP])
+    @pytest.mark.parametrize(
+        ("value", "places", "expected"),
+        [
+            (Fraction(24689, 20000), 4, Decimal("1.2344")),
+            (Fraction(24691, 20000), 4, Decimal("1.2346")),
+            (Fraction(-24689, 20000), 4, Decimal("-1.2344")),
+            (Fraction(-24691, 20000), 4, Decimal("-1.2346")),
+            (Fraction(249, 200), 2, Decimal("1.24")),
+            (Fraction(251, 200), 2, Decimal("1.26")),
+        ],
+    )
+    def test_fraction_quantization_is_signed_half_even(
+        self,
+        precision: int,
+        rounding: str,
+        value: Fraction,
+        places: int,
+        expected: Decimal,
+    ):
+        with localcontext() as context:
+            context.prec = precision
+            context.rounding = rounding
+            actual = decimal_from_fraction(value, places=places)
+
+        assert actual.as_tuple() == expected.as_tuple()
+
     def test_has_drawdown_days(self):
-        trades = (
-            _round_trip(100.0, 120.0, entry_ts=1000, exit_ts=2000)
-            + _round_trip(100.0, 80.0, entry_ts=3000, exit_ts=4000)
+        trades = _round_trip(100.0, 120.0, entry_ts=1000, exit_ts=2000) + _round_trip(
+            100.0, 80.0, entry_ts=3000, exit_ts=4000
         )
         result = calculate_metrics(trades)
         assert isinstance(result["max_drawdown_days"], Decimal)
@@ -472,9 +620,8 @@ class TestConsecutiveStreaks:
 
 class TestGrossProfitLoss:
     def test_gross_values(self):
-        trades = (
-            _round_trip(100.0, 120.0, entry_ts=1000, exit_ts=2000)
-            + _round_trip(100.0, 95.0, entry_ts=3000, exit_ts=4000)
+        trades = _round_trip(100.0, 120.0, entry_ts=1000, exit_ts=2000) + _round_trip(
+            100.0, 95.0, entry_ts=3000, exit_ts=4000
         )
         result = calculate_metrics(trades)
         assert result["gross_profit"] == pytest.approx(2.0, abs=0.01)

@@ -3,6 +3,7 @@
 from decimal import Decimal, InvalidOperation
 
 from src.core.backtest.endpoint_state import ReplayEndpointState
+from src.core.decimal_math import exact_decimal_add, exact_decimal_subtract
 from src.core.models import OrderSide, Signal, SignalType
 from src.validation.trading_outcome import (
     FillObservation,
@@ -152,36 +153,6 @@ def _journal_money(value: object, field: str, *, allow_zero: bool) -> Decimal:
         qualifier = "nonnegative" if allow_zero else "positive"
         raise ValueError(f"{field} must contain a {qualifier} finite Decimal")
     return parsed
-
-
-def exact_decimal_add(left: Decimal, right: Decimal) -> Decimal:
-    left_sign, left_digits, left_exponent = left.as_tuple()
-    right_sign, right_digits, right_exponent = right.as_tuple()
-    assert isinstance(left_exponent, int) and isinstance(right_exponent, int)
-    exponent = min(left_exponent, right_exponent)
-    left_coefficient = int("".join(map(str, left_digits))) * 10 ** (
-        left_exponent - exponent
-    )
-    right_coefficient = int("".join(map(str, right_digits))) * 10 ** (
-        right_exponent - exponent
-    )
-    total = (-left_coefficient if left_sign else left_coefficient) + (
-        -right_coefficient if right_sign else right_coefficient
-    )
-    if total == 0:
-        return Decimal(0)
-    return Decimal(
-        (
-            int(total < 0),
-            tuple(map(int, str(abs(total)))),
-            exponent,
-        )
-    )
-
-
-def exact_decimal_subtract(left: Decimal, right: Decimal) -> Decimal:
-    """Subtract finite Decimals without consulting the ambient context."""
-    return exact_decimal_add(left, right.copy_negate())
 
 
 def _build_normal_backtest_trading_outcome(
