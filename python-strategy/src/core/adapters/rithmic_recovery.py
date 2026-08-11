@@ -2,6 +2,7 @@ from dataclasses import dataclass
 from decimal import Decimal
 from typing import Callable, Iterable
 
+from src.core.adapters.rithmic_native_bracket import native_bracket_leg_type
 from src.core.interfaces.exchange import ExchangeOrderEvent
 from src.core.product_registry import to_rithmic_symbol
 
@@ -62,8 +63,7 @@ def build_rithmic_recovery_plan(
         (
             order
             for order in snapshot.orders
-            if order.client_order_id
-            and not getattr(order, "original_basket_id", None)
+            if order.client_order_id and not getattr(order, "original_basket_id", None)
         ),
         "client_order_id",
     )
@@ -77,8 +77,12 @@ def build_rithmic_recovery_plan(
     )
     history_by_basket = _group(snapshot.order_history, "basket_id")
     fills_by_basket = _group(snapshot.fills, "basket_id")
-    local_baskets = {str(order.exchange_order_id) for order in orders if order.exchange_order_id}
-    local_clients = {str(order.client_order_id) for order in orders if order.client_order_id}
+    local_baskets = {
+        str(order.exchange_order_id) for order in orders if order.exchange_order_id
+    }
+    local_clients = {
+        str(order.client_order_id) for order in orders if order.client_order_id
+    }
     expected_native_children = _expected_native_children(orders, local_by_id)
     native_local_counts: dict[tuple[str, str], int] = {}
     for order in orders:
@@ -124,7 +128,10 @@ def build_rithmic_recovery_plan(
         ):
             results.append(_blocked(order, "duplicate_local_native_bracket_leg"))
             continue
-        if basket_id in duplicate_local_baskets or client_order_id in duplicate_local_clients:
+        if (
+            basket_id in duplicate_local_baskets
+            or client_order_id in duplicate_local_clients
+        ):
             results.append(_blocked(order, "duplicate_local_identity"))
             continue
         if basket_id in duplicate_working or client_order_id in duplicate_clients:
@@ -142,7 +149,8 @@ def build_rithmic_recovery_plan(
                 remote
                 for remote in snapshot.orders
                 if getattr(remote, "original_basket_id", None) == native_parent
-                and _remote_leg_type(remote) == str(order.type)
+                and native_bracket_leg_type(getattr(remote, "price_type", None))
+                == str(order.type)
             ]
             if len(candidates) > 1:
                 results.append(_blocked(order, "duplicate_remote_native_bracket_leg"))
@@ -169,7 +177,9 @@ def build_rithmic_recovery_plan(
             if str(getattr(remote, "original_basket_id", None) or "") != native_parent:
                 results.append(_blocked(order, "native_parent_basket_id_mismatch"))
                 continue
-            if _remote_leg_type(remote) != str(order.type):
+            if native_bracket_leg_type(getattr(remote, "price_type", None)) != str(
+                order.type
+            ):
                 results.append(_blocked(order, "native_bracket_leg_mismatch"))
                 continue
 
@@ -211,9 +221,9 @@ def compare_rithmic_positions(
     remote_by_symbol: dict[str, Decimal] = {}
     for position in remote_positions:
         symbol = str(position.symbol).upper()
-        remote_by_symbol[symbol] = remote_by_symbol.get(symbol, Decimal("0")) + _decimal(
-            position.net_quantity
-        )
+        remote_by_symbol[symbol] = remote_by_symbol.get(
+            symbol, Decimal("0")
+        ) + _decimal(position.net_quantity)
 
     drifts = [
         {
@@ -245,7 +255,10 @@ def _classify_order(order, remote, fills: list[object]) -> RithmicRecoveryItem:
             parent_client_id = intent_payload.get("native_parent_client_order_id")
             if parent_client_id:
                 allowed_client_ids.add(str(parent_client_id))
-        if remote.client_order_id and str(remote.client_order_id) not in allowed_client_ids:
+        if (
+            remote.client_order_id
+            and str(remote.client_order_id) not in allowed_client_ids
+        ):
             return _blocked(order, "client_order_id_mismatch")
         if not _symbol_matches_product(order.product_id, remote.symbol):
             return _blocked(order, "product_symbol_mismatch")
@@ -277,10 +290,16 @@ def _classify_order(order, remote, fills: list[object]) -> RithmicRecoveryItem:
     remote_quantity = _decimal(remote.filled_quantity) if remote is not None else None
     remote_average = _decimal(remote.average_fill_price) if remote is not None else None
     if remote_quantity is not None and fills and remote_quantity != fill_quantity:
-        return _blocked(order, "order_and_fill_history_quantity_mismatch", unresolved=True)
+        return _blocked(
+            order, "order_and_fill_history_quantity_mismatch", unresolved=True
+        )
     if remote_average is not None and fills and remote_average != fill_average:
-        return _blocked(order, "order_and_fill_history_average_mismatch", unresolved=True)
-    cumulative_quantity = remote_quantity if remote_quantity is not None else fill_quantity
+        return _blocked(
+            order, "order_and_fill_history_average_mismatch", unresolved=True
+        )
+    cumulative_quantity = (
+        remote_quantity if remote_quantity is not None else fill_quantity
+    )
     cumulative_average = remote_average if remote_average is not None else fill_average
     order_quantity = Decimal(str(order.quantity))
     local_filled = _decimal(getattr(order, "filled_quantity", None))
@@ -339,7 +358,9 @@ def _classify_order(order, remote, fills: list[object]) -> RithmicRecoveryItem:
         ),
     )
     if unresolved:
-        classification = "matched" if _event_matches_local(order, event) else "repaired_partial"
+        classification = (
+            "matched" if _event_matches_local(order, event) else "repaired_partial"
+        )
     else:
         classification = "matched" if _event_matches_local(order, event) else "repaired"
 
@@ -487,7 +508,9 @@ def _aggregate_fills(fills: list[object]) -> tuple[Decimal, Decimal | None]:
     return quantity, notional / quantity
 
 
-def _unique_index(items: Iterable[object], field: str) -> tuple[dict[str, object], set[str]]:
+def _unique_index(
+    items: Iterable[object], field: str
+) -> tuple[dict[str, object], set[str]]:
     index = {}
     duplicates = set()
     for item in items:
@@ -525,14 +548,19 @@ def _native_protection(order) -> dict | None:
 
 def _native_parent_basket(order, local_by_id: dict[str, object]) -> str | None:
     payload = getattr(order, "intent_payload", None)
-    if not isinstance(payload, dict) or payload.get("placement_mode") != "attach-at-entry":
+    if (
+        not isinstance(payload, dict)
+        or payload.get("placement_mode") != "attach-at-entry"
+    ):
         return None
     persisted_basket_id = payload.get("native_parent_basket_id")
     if persisted_basket_id:
         return str(persisted_basket_id)
     parent_id = payload.get("pending_entry_order_id")
     parent = local_by_id.get(str(parent_id)) if parent_id is not None else None
-    basket_id = getattr(parent, "exchange_order_id", None) if parent is not None else None
+    basket_id = (
+        getattr(parent, "exchange_order_id", None) if parent is not None else None
+    )
     return str(basket_id) if basket_id else None
 
 
@@ -556,7 +584,7 @@ def _expected_native_children(
         native = _native_protection(order)
         if native is None or not order.exchange_order_id:
             continue
-        for leg_type in (native.get("legs") or {}):
+        for leg_type in native.get("legs") or {}:
             if leg_type in {"stop_loss", "take_profit"}:
                 expected[(str(order.exchange_order_id), leg_type)] = {
                     str(order.client_order_id)
@@ -566,7 +594,7 @@ def _expected_native_children(
 
 def _remote_native_key(remote) -> tuple[str, str] | None:
     parent = getattr(remote, "original_basket_id", None)
-    leg_type = _remote_leg_type(remote)
+    leg_type = native_bracket_leg_type(getattr(remote, "price_type", None))
     return (str(parent), leg_type) if parent and leg_type else None
 
 
@@ -580,15 +608,6 @@ def _is_expected_native_child(
         return False
     client_order_id = getattr(remote, "client_order_id", None)
     return not client_order_id or str(client_order_id) in expected[key]
-
-
-def _remote_leg_type(remote) -> str | None:
-    price_type = str(getattr(remote, "price_type", "") or "").lower()
-    if price_type in {"stop_market", "stop_limit"}:
-        return "stop_loss"
-    if price_type in {"limit", "market_if_touched", "limit_if_touched"}:
-        return "take_profit"
-    return None
 
 
 def _decimal(value) -> Decimal:

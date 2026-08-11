@@ -6,6 +6,7 @@ from unittest.mock import Mock
 
 import pytest
 
+import src.core.adapters.rithmic_adapter as rithmic_adapter_module
 from src.core.adapters import create_adapter
 from src.core.adapters.rithmic_adapter import (
     RithmicExchangeAdapter,
@@ -175,9 +176,7 @@ def test_ledger_positions_are_authoritative_signed_positions(
     expected_quantity,
 ):
     positions = adapter.positions_from_ledger_snapshot(
-        ledger_snapshot(
-            positions=[ledger_position(net_quantity=net_quantity)]
-        )
+        ledger_snapshot(positions=[ledger_position(net_quantity=net_quantity)])
     )
 
     assert len(positions) == 1
@@ -190,9 +189,7 @@ def test_ledger_positions_are_authoritative_signed_positions(
 @pytest.mark.parametrize("symbol", ["NQU6", "ESU6"])
 def test_ledger_zero_position_is_omitted_before_instrument_mapping(adapter, symbol):
     positions = adapter.positions_from_ledger_snapshot(
-        ledger_snapshot(
-            positions=[ledger_position(symbol=symbol, net_quantity="0")]
-        )
+        ledger_snapshot(positions=[ledger_position(symbol=symbol, net_quantity="0")])
     )
 
     assert positions == []
@@ -210,9 +207,7 @@ def test_ledger_zero_position_is_omitted_before_instrument_mapping(adapter, symb
             "rithmic_ledger_position_instrument_unmapped",
         ),
         (
-            ledger_snapshot(
-                positions=[ledger_position(net_quantity="not-a-number")]
-            ),
+            ledger_snapshot(positions=[ledger_position(net_quantity="not-a-number")]),
             "rithmic_ledger_position_value_invalid",
         ),
     ],
@@ -354,20 +349,114 @@ def test_native_bracket_submits_one_atomic_single_contract_request(
     for leg_type in leg_types:
         leg = legs[leg_type]
         assert leg.intent_payload["placement_mode"] == "attach-at-entry"
-        assert leg.intent_payload["native_parent_client_order_id"] == entry.client_order_id
+        assert (
+            leg.intent_payload["native_parent_client_order_id"] == entry.client_order_id
+        )
+    assert adapter._submitted_client_order_ids == {entry.client_order_id}
+    assert adapter._native_bracket_parent_client_order_ids == {entry.client_order_id}
+    assert adapter._native_brackets_by_parent == {
+        "parent-1": {
+            "entry": entry.client_order_id,
+            **{leg_type: legs[leg_type].client_order_id for leg_type in leg_types},
+        }
+    }
+
+
+def test_atomic_group_eligibility_delegates_to_native_bracket_owner(
+    adapter,
+    monkeypatch,
+):
+    entry, stop, target = bracket_orders()
+    orders = [entry, stop, target]
+    calls = []
+
+    def reject(candidate_orders):
+        calls.append(candidate_orders)
+        return False
+
+    monkeypatch.setattr(
+        rithmic_adapter_module,
+        "supports_native_bracket_group",
+        reject,
+        raising=False,
+    )
+
+    assert adapter.supports_atomic_order_group(orders) is False
+    assert calls == [orders]
+
+
+def test_group_validation_delegates_to_native_bracket_owner(
+    adapter,
+    monkeypatch,
+):
+    class Delegated(Exception):
+        pass
+
+    entry, stop, target = bracket_orders()
+    orders = [entry, stop, target]
+
+    def delegated(*args, **kwargs):
+        assert args == (orders,)
+        assert kwargs["persist"] is True
+        assert kwargs["validate_order"].__self__ is adapter
+        assert kwargs["get_instrument_spec"].__self__ is adapter
+        assert adapter._client_lock.locked() is False
+        raise Delegated
+
+    monkeypatch.setattr(
+        rithmic_adapter_module,
+        "build_native_bracket_plan",
+        delegated,
+        raising=False,
+    )
+
+    with pytest.raises(Delegated):
+        adapter.validate_order_group(orders)
 
 
 @pytest.mark.parametrize(
     ("mutate", "message"),
     [
-        (lambda entry, stop, target: setattr(entry, "quantity", Decimal("2")), "single_contract"),
-        (lambda entry, stop, target: setattr(stop, "quantity", Decimal("2")), "single_contract"),
-        (lambda entry, stop, target: setattr(stop, "trigger_price", Decimal("19998.30")), "distance_off_tick"),
-        (lambda entry, stop, target: setattr(stop, "trigger_price", Decimal("20001")), "wrong_side"),
-        (lambda entry, stop, target: setattr(target, "side", "buy"), "close_side_mismatch"),
-        (lambda entry, stop, target: setattr(target, "product_id", "RITHMIC:ES-202609"), "product_mismatch"),
-        (lambda entry, stop, target: setattr(stop, "client_order_id", "strategy-execution-wrong-123"), "client_order_id_mismatch"),
-        (lambda entry, stop, target: setattr(stop, "type", "trailing_stop"), "leg_unsupported"),
+        (
+            lambda entry, stop, target: setattr(entry, "quantity", Decimal("2")),
+            "single_contract",
+        ),
+        (
+            lambda entry, stop, target: setattr(stop, "quantity", Decimal("2")),
+            "single_contract",
+        ),
+        (
+            lambda entry, stop, target: setattr(
+                stop, "trigger_price", Decimal("19998.30")
+            ),
+            "distance_off_tick",
+        ),
+        (
+            lambda entry, stop, target: setattr(
+                stop, "trigger_price", Decimal("20001")
+            ),
+            "wrong_side",
+        ),
+        (
+            lambda entry, stop, target: setattr(target, "side", "buy"),
+            "close_side_mismatch",
+        ),
+        (
+            lambda entry, stop, target: setattr(
+                target, "product_id", "RITHMIC:ES-202609"
+            ),
+            "product_mismatch",
+        ),
+        (
+            lambda entry, stop, target: setattr(
+                stop, "client_order_id", "strategy-execution-wrong-123"
+            ),
+            "client_order_id_mismatch",
+        ),
+        (
+            lambda entry, stop, target: setattr(stop, "type", "trailing_stop"),
+            "leg_unsupported",
+        ),
     ],
 )
 def test_native_bracket_validation_fails_before_remote_submission(
@@ -383,6 +472,8 @@ def test_native_bracket_validation_fails_before_remote_submission(
     client.submit.assert_not_called()
     client.submit_bracket.assert_not_called()
     assert adapter._submitted_client_order_ids == set()
+    assert adapter._native_bracket_parent_client_order_ids == set()
+    assert adapter._native_brackets_by_parent == {}
 
 
 def test_native_market_bracket_requires_a_reference_price(adapter, client):
@@ -411,6 +502,74 @@ def test_native_bracket_child_event_maps_to_local_leg_identity(adapter, client):
 
     assert mapped.client_order_id == stop.client_order_id
     assert mapped.raw["native_parent_client_order_id"] == entry.client_order_id
+
+
+def test_event_resolution_and_restore_merge_share_the_existing_client_lock(
+    adapter,
+    client,
+    monkeypatch,
+):
+    adapter.start_order_event_stream()
+    entry, stop, target = bracket_orders()
+    adapter.place_order_group([entry, stop, target])
+    client.poll_event.return_value = event(
+        client_order_id=entry.client_order_id,
+        basket_id="child-stop-1",
+        original_basket_id="parent-1",
+        price_type="stop_market",
+    )
+    resolver_entered = threading.Event()
+    release_resolver = threading.Event()
+    restore_built = threading.Event()
+    merge_started = threading.Event()
+    original_resolve = (
+        rithmic_adapter_module.resolve_native_bracket_event_client_order_id
+    )
+    original_build = rithmic_adapter_module.build_restored_native_bracket_groups
+    original_merge = rithmic_adapter_module.merge_native_bracket_groups
+
+    def resolve(**kwargs):
+        assert adapter._client_lock.locked() is True
+        resolver_entered.set()
+        assert release_resolver.wait(timeout=1)
+        return original_resolve(**kwargs)
+
+    def build_restored(orders):
+        restored = original_build(orders)
+        restore_built.set()
+        return restored
+
+    def merge_restored(*args):
+        assert adapter._client_lock.locked() is True
+        merge_started.set()
+        return original_merge(*args)
+
+    monkeypatch.setattr(
+        rithmic_adapter_module,
+        "resolve_native_bracket_event_client_order_id",
+        resolve,
+    )
+    monkeypatch.setattr(
+        rithmic_adapter_module,
+        "build_restored_native_bracket_groups",
+        build_restored,
+    )
+    monkeypatch.setattr(
+        rithmic_adapter_module,
+        "merge_native_bracket_groups",
+        merge_restored,
+    )
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        event_future = executor.submit(adapter.poll_order_event)
+        assert resolver_entered.wait(timeout=1)
+        stop.intent_payload["native_parent_basket_id"] = "parent-1"
+        restore_future = executor.submit(adapter.restore_order_groups, [stop])
+        assert restore_built.wait(timeout=1)
+        assert merge_started.is_set() is False
+        release_resolver.set()
+        assert event_future.result(timeout=1).client_order_id == stop.client_order_id
+        restore_future.result(timeout=1)
 
 
 @pytest.mark.parametrize(
@@ -465,11 +624,16 @@ def test_ambiguous_bracket_submit_keeps_parent_tag_from_claiming_child(
 ):
     adapter.start_order_event_stream()
     entry, stop, target = bracket_orders()
-    client.submit_bracket.side_effect = RuntimeError("order result is ambiguous")
+    failure = RuntimeError("order result is ambiguous")
+    client.submit_bracket.side_effect = failure
 
-    with pytest.raises(NetworkError, match="ambiguous"):
+    with pytest.raises(NetworkError, match="ambiguous") as captured:
         adapter.place_order_group([entry, stop, target])
 
+    assert captured.value.__cause__ is failure
+    assert adapter._submitted_client_order_ids == {entry.client_order_id}
+    assert adapter._native_bracket_parent_client_order_ids == {entry.client_order_id}
+    assert adapter._native_brackets_by_parent == {}
     client.submit_bracket.side_effect = None
     client.poll_event.return_value = event(
         client_order_id=entry.client_order_id,
@@ -484,15 +648,101 @@ def test_ambiguous_bracket_submit_keeps_parent_tag_from_claiming_child(
 def test_explicit_bracket_rejection_allows_safe_same_id_retry(adapter, client):
     adapter.start_order_event_stream()
     entry, stop, target = bracket_orders()
+    failure = RuntimeError("request rejected")
     client.submit_bracket.side_effect = [
-        RuntimeError("request rejected"),
+        failure,
         SimpleNamespace(basket_id="parent-1"),
     ]
 
-    with pytest.raises(ExchangeError, match="request rejected"):
+    with pytest.raises(ExchangeError, match="request rejected") as captured:
         adapter.place_order_group([entry, stop, target])
 
+    assert captured.value.__cause__ is failure
+    assert adapter._submitted_client_order_ids == set()
+    assert adapter._native_bracket_parent_client_order_ids == set()
+    assert adapter._native_brackets_by_parent == {}
     assert adapter.place_order_group([entry, stop, target]) == "parent-1"
+
+
+def test_duplicate_bracket_parent_fails_before_transport_without_state_drift(
+    adapter,
+    client,
+):
+    adapter.start_order_event_stream()
+    entry, stop, target = bracket_orders()
+    adapter._submitted_client_order_ids.add(entry.client_order_id)
+
+    with pytest.raises(ExchangeError, match="duplicate_rithmic_client_order_id"):
+        adapter.place_order_group([entry, stop, target])
+
+    client.submit_bracket.assert_not_called()
+    assert adapter._submitted_client_order_ids == {entry.client_order_id}
+    assert adapter._native_bracket_parent_client_order_ids == set()
+    assert adapter._native_brackets_by_parent == {}
+
+
+def test_submit_ack_and_restore_merge_share_client_lock_without_lost_update(
+    adapter,
+    client,
+    monkeypatch,
+):
+    adapter.start_order_event_stream()
+    entry, stop, target = bracket_orders()
+    submit_entered = threading.Event()
+    release_submit = threading.Event()
+    restore_built = threading.Event()
+    merge_started = threading.Event()
+    original_build = rithmic_adapter_module.build_restored_native_bracket_groups
+    original_merge = rithmic_adapter_module.merge_native_bracket_groups
+
+    def submit_bracket(*args):
+        assert adapter._client_lock.locked() is True
+        submit_entered.set()
+        assert release_submit.wait(timeout=1)
+        return SimpleNamespace(basket_id="parent-1")
+
+    def build_restored(orders):
+        restored = original_build(orders)
+        restore_built.set()
+        return restored
+
+    def merge_restored(*args):
+        assert adapter._client_lock.locked() is True
+        merge_started.set()
+        return original_merge(*args)
+
+    client.submit_bracket.side_effect = submit_bracket
+    monkeypatch.setattr(
+        rithmic_adapter_module,
+        "build_restored_native_bracket_groups",
+        build_restored,
+    )
+    monkeypatch.setattr(
+        rithmic_adapter_module,
+        "merge_native_bracket_groups",
+        merge_restored,
+    )
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        submit_future = executor.submit(
+            adapter.place_order_group, [entry, stop, target]
+        )
+        assert submit_entered.wait(timeout=1)
+        stop.intent_payload["native_parent_basket_id"] = "parent-1"
+        restore_future = executor.submit(adapter.restore_order_groups, [stop])
+        assert restore_built.wait(timeout=1)
+        assert merge_started.is_set() is False
+        release_submit.set()
+        assert submit_future.result(timeout=1) == "parent-1"
+        restore_future.result(timeout=1)
+
+    assert adapter._native_brackets_by_parent == {
+        "parent-1": {
+            "entry": entry.client_order_id,
+            "stop_loss": stop.client_order_id,
+            "take_profit": target.client_order_id,
+        }
+    }
 
 
 def test_unknown_bracket_parent_cannot_claim_local_child_identity(adapter, client):
@@ -674,6 +924,36 @@ def test_modify_native_protection_uses_known_child_basket(adapter, client):
     )
 
 
+def test_modify_projection_precedes_the_existing_transport_lock(
+    adapter,
+    client,
+    monkeypatch,
+):
+    adapter.start_order_event_stream()
+    entry, stop, target = bracket_orders()
+    adapter.validate_order_group([entry, stop, target])
+    stop.exchange_order_id = "child-stop-1"
+    stop.intent_payload["actual_entry_fill_price"] = "20000.75"
+    original_build = rithmic_adapter_module.build_native_protection_request
+
+    def build_request(*args, **kwargs):
+        assert adapter._client_lock.locked() is False
+        return original_build(*args, **kwargs)
+
+    def modify_protection(*args):
+        assert adapter._client_lock.locked() is True
+        return True
+
+    monkeypatch.setattr(
+        rithmic_adapter_module,
+        "build_native_protection_request",
+        build_request,
+    )
+    client.modify_protection.side_effect = modify_protection
+
+    assert adapter.modify_protection(stop, trigger_price=Decimal("19999.00"))
+
+
 @pytest.mark.parametrize(
     ("mutate", "message"),
     [
@@ -738,7 +1018,9 @@ def test_reduce_only_order_fails_before_submit(adapter, client):
         (order(client_order_id=None), "rithmic_client_order_id_required"),
     ],
 )
-def test_order_validation_matrix_fails_before_submit(adapter, client, candidate, message):
+def test_order_validation_matrix_fails_before_submit(
+    adapter, client, candidate, message
+):
     adapter.start_order_event_stream()
 
     with pytest.raises(ExchangeError, match=message):
@@ -761,7 +1043,10 @@ def test_ambiguous_runtime_failure_maps_to_network_error(adapter, client):
 
 def test_explicit_submit_rejection_allows_safe_same_id_retry(adapter, client):
     adapter.start_order_event_stream()
-    client.submit.side_effect = [RuntimeError("request rejected"), SimpleNamespace(basket_id="basket-1")]
+    client.submit.side_effect = [
+        RuntimeError("request rejected"),
+        SimpleNamespace(basket_id="basket-1"),
+    ]
 
     with pytest.raises(ExchangeError, match="request rejected"):
         adapter.place_order(order())
@@ -830,7 +1115,9 @@ def test_lookup_rejects_inconsistent_terminal_snapshot(adapter, client):
     adapter.start_order_event_stream()
     client.lookup.return_value = snapshot(status="COMPLETE", filled_quantity="1")
 
-    with pytest.raises(ExchangeError, match="unsupported_rithmic_order_snapshot_status"):
+    with pytest.raises(
+        ExchangeError, match="unsupported_rithmic_order_snapshot_status"
+    ):
         adapter.get_order_by_client_id("client-1", PRODUCT_ID)
 
 
@@ -858,7 +1145,9 @@ def test_lookup_rejects_cancel_notification_after_a_full_fill(adapter, client):
         filled_quantity="2",
     )
 
-    with pytest.raises(ExchangeError, match="invalid_rithmic_cancel_snapshot_quantities"):
+    with pytest.raises(
+        ExchangeError, match="invalid_rithmic_cancel_snapshot_quantities"
+    ):
         adapter.get_order_by_client_id("client-1", PRODUCT_ID)
 
 
@@ -886,7 +1175,9 @@ def test_lookup_rejects_reject_notification_after_a_full_fill(adapter, client):
         filled_quantity="2",
     )
 
-    with pytest.raises(ExchangeError, match="invalid_rithmic_reject_snapshot_quantities"):
+    with pytest.raises(
+        ExchangeError, match="invalid_rithmic_reject_snapshot_quantities"
+    ):
         adapter.get_order_by_client_id("client-1", PRODUCT_ID)
 
 
