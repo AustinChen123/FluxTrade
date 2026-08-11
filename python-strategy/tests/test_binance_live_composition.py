@@ -150,9 +150,9 @@ def test_binance_owner_keeps_existing_module_dependency_boundary():
         (
             {
                 "mode": "live",
-                "exchange": "bybit",
-                "api_key": "bybit-key",
-                "secret": "bybit-secret",
+                "exchange": "okx",
+                "api_key": "okx-key",
+                "secret": "okx-secret",
                 "testnet": False,
                 "extra_config": {"recvWindow": 5_000},
             },
@@ -217,9 +217,9 @@ def test_generic_factory_routes_to_exact_venue_owner(config, expected):
         rithmic_cls.from_config.assert_called_once_with(config)
     if expected == "generic":
         generic_cls.assert_called_once_with(
-            exchange_id="bybit",
-            api_key="bybit-key",
-            secret="bybit-secret",
+            exchange_id="okx",
+            api_key="okx-key",
+            secret="okx-secret",
             testnet=False,
             extra_config=config["extra_config"],
         )

@@ -1,4 +1,4 @@
-"""Composition boundary tests for Backpack live adapters."""
+"""Composition boundary tests for Bybit live adapters."""
 
 import ast
 import importlib
@@ -11,10 +11,10 @@ import src.core.adapters as adapters
 
 
 def _owner():
-    return importlib.import_module("src.core.adapters.live_backpack")
+    return importlib.import_module("src.core.adapters.live_bybit")
 
 
-def test_backpack_owner_constructs_exact_generic_adapter() -> None:
+def test_bybit_owner_constructs_exact_generic_adapter() -> None:
     owner = _owner()
     result = object()
     api_key = object()
@@ -23,7 +23,7 @@ def test_backpack_owner_constructs_exact_generic_adapter() -> None:
     extra_config = object()
 
     with patch.object(owner, "CcxtExchangeAdapter", return_value=result) as constructor:
-        actual = owner.create_backpack_live_adapter(
+        actual = owner.create_bybit_live_adapter(
             api_key=api_key,
             secret=secret,
             testnet=testnet,
@@ -32,7 +32,7 @@ def test_backpack_owner_constructs_exact_generic_adapter() -> None:
 
     assert actual is result
     constructor.assert_called_once_with(
-        exchange_id="backpack",
+        exchange_id="bybit",
         api_key=api_key,
         secret=secret,
         testnet=testnet,
@@ -40,15 +40,15 @@ def test_backpack_owner_constructs_exact_generic_adapter() -> None:
     )
 
 
-def test_backpack_owner_preserves_constructor_exception_identity() -> None:
+def test_bybit_owner_preserves_constructor_exception_identity() -> None:
     owner = _owner()
-    failure = RuntimeError("backpack-constructor-sentinel")
+    failure = RuntimeError("bybit-constructor-sentinel")
 
     with (
         patch.object(owner, "CcxtExchangeAdapter", side_effect=failure),
         pytest.raises(RuntimeError) as raised,
     ):
-        owner.create_backpack_live_adapter(
+        owner.create_bybit_live_adapter(
             api_key=None,
             secret=None,
             testnet=False,
@@ -58,7 +58,7 @@ def test_backpack_owner_preserves_constructor_exception_identity() -> None:
     assert raised.value is failure
 
 
-def test_backpack_owner_has_only_shared_ccxt_dependency() -> None:
+def test_bybit_owner_has_only_shared_ccxt_dependency() -> None:
     owner = _owner()
     tree = ast.parse(inspect.getsource(owner))
     imports = [
@@ -74,7 +74,7 @@ def test_backpack_owner_has_only_shared_ccxt_dependency() -> None:
         node
         for node in tree.body
         if isinstance(node, ast.FunctionDef)
-        and node.name == "create_backpack_live_adapter"
+        and node.name == "create_bybit_live_adapter"
     )
     assert not any(
         isinstance(node, ast.Import | ast.ImportFrom) for node in ast.walk(function)
@@ -115,9 +115,19 @@ def test_backpack_owner_has_only_shared_ccxt_dependency() -> None:
                 "api_key": "backpack-key",
                 "secret": "backpack-secret",
                 "testnet": False,
-                "extra_config": {"options": {"defaultType": "swap"}},
             },
             "backpack",
+        ),
+        (
+            {
+                "mode": "live",
+                "exchange": "bybit",
+                "api_key": "bybit-key",
+                "secret": "bybit-secret",
+                "testnet": False,
+                "extra_config": {"options": {"defaultType": "swap"}},
+            },
+            "bybit",
         ),
     ],
 )
@@ -127,6 +137,7 @@ def test_generic_factory_routes_to_exact_construction_owner(config, expected) ->
     generic = MagicMock()
     binance = MagicMock()
     backpack = MagicMock()
+    bybit = MagicMock()
 
     with (
         patch.object(
@@ -145,8 +156,13 @@ def test_generic_factory_routes_to_exact_construction_owner(config, expected) ->
             adapters,
             "create_backpack_live_adapter",
             return_value=backpack,
-            create=True,
         ) as backpack_owner,
+        patch.object(
+            adapters,
+            "create_bybit_live_adapter",
+            return_value=bybit,
+            create=True,
+        ) as bybit_owner,
         patch.object(
             adapters.AccountInitializationConfig, "from_config", return_value=None
         ),
@@ -160,6 +176,7 @@ def test_generic_factory_routes_to_exact_construction_owner(config, expected) ->
         "generic": generic,
         "binance": binance,
         "backpack": backpack,
+        "bybit": bybit,
     }[expected]
     assert actual is expected_result
     assert simulated_cls.call_count == (expected == "simulated")
@@ -167,19 +184,20 @@ def test_generic_factory_routes_to_exact_construction_owner(config, expected) ->
     assert generic_cls.call_count == (expected == "generic")
     assert binance_owner.call_count == (expected == "binance")
     assert backpack_owner.call_count == (expected == "backpack")
-    if expected == "backpack":
-        backpack_owner.assert_called_once_with(
-            api_key="backpack-key",
-            secret="backpack-secret",
+    assert bybit_owner.call_count == (expected == "bybit")
+    if expected == "bybit":
+        bybit_owner.assert_called_once_with(
+            api_key="bybit-key",
+            secret="bybit-secret",
             testnet=False,
             extra_config=config["extra_config"],
         )
 
 
-def test_generic_factory_preserves_backpack_lifecycle_order() -> None:
+def test_generic_factory_preserves_bybit_lifecycle_order() -> None:
     trace: list[str] = []
     account_config = object()
-    product_ids = ["BACKPACK:BTC_USDC-PERP"]
+    product_ids = ["BYBIT:BTCUSDT-PERP"]
     extra_config = {"options": {"defaultType": "swap"}}
     adapter = MagicMock()
 
@@ -205,7 +223,7 @@ def test_generic_factory_preserves_backpack_lifecycle_order() -> None:
         ) as parser,
         patch.object(
             adapters,
-            "create_backpack_live_adapter",
+            "create_bybit_live_adapter",
             side_effect=construct,
             create=True,
         ) as owner,
@@ -218,7 +236,7 @@ def test_generic_factory_preserves_backpack_lifecycle_order() -> None:
         actual = adapters.create_adapter(
             {
                 "mode": "live",
-                "exchange": "backpack",
+                "exchange": "bybit",
                 "api_key": "key",
                 "secret": "secret",
                 "testnet": False,
@@ -252,7 +270,7 @@ def test_generic_factory_preserves_backpack_lifecycle_order() -> None:
 
 
 @pytest.mark.parametrize("failure_stage", ["parse", "pre_guard", "construct"])
-def test_backpack_early_failure_preserves_identity_and_stops(failure_stage) -> None:
+def test_bybit_early_failure_preserves_identity_and_stops(failure_stage) -> None:
     failure = RuntimeError(failure_stage)
     trace: list[str] = []
     adapter = MagicMock()
@@ -280,7 +298,7 @@ def test_backpack_early_failure_preserves_identity_and_stops(failure_stage) -> N
         ),
         patch.object(
             adapters,
-            "create_backpack_live_adapter",
+            "create_bybit_live_adapter",
             side_effect=construct,
             create=True,
         ),
@@ -292,7 +310,7 @@ def test_backpack_early_failure_preserves_identity_and_stops(failure_stage) -> N
         pytest.raises(RuntimeError) as raised,
     ):
         adapters.create_adapter(
-            {"mode": "live", "exchange": "backpack"},
+            {"mode": "live", "exchange": "bybit"},
             operation_guard=guard,
         )
 
@@ -312,7 +330,7 @@ def test_backpack_early_failure_preserves_identity_and_stops(failure_stage) -> N
 
 @pytest.mark.parametrize("failure_stage", ["post_guard", "initialize", "warm"])
 @pytest.mark.parametrize("close_mode", ["absent", "success", "failure"])
-def test_backpack_downstream_failure_preserves_close_precedence(
+def test_bybit_downstream_failure_preserves_close_precedence(
     failure_stage, close_mode
 ) -> None:
     primary = RuntimeError(failure_stage)
@@ -364,7 +382,7 @@ def test_backpack_downstream_failure_preserves_close_precedence(
         ),
         patch.object(
             adapters,
-            "create_backpack_live_adapter",
+            "create_bybit_live_adapter",
             side_effect=construct,
             create=True,
         ),
@@ -376,7 +394,7 @@ def test_backpack_downstream_failure_preserves_close_precedence(
         pytest.raises(RuntimeError) as raised,
     ):
         adapters.create_adapter(
-            {"mode": "live", "exchange": "backpack"},
+            {"mode": "live", "exchange": "bybit"},
             operation_guard=guard,
         )
 
@@ -404,7 +422,7 @@ def test_backpack_downstream_failure_preserves_close_precedence(
     assert trace == expected
 
 
-def test_generic_factory_source_has_one_backpack_owner_entrypoint() -> None:
+def test_generic_factory_source_has_one_bybit_owner_entrypoint() -> None:
     tree = ast.parse(inspect.getsource(adapters.create_adapter))
     calls = [
         node.func.id
@@ -412,4 +430,4 @@ def test_generic_factory_source_has_one_backpack_owner_entrypoint() -> None:
         if isinstance(node, ast.Call) and isinstance(node.func, ast.Name)
     ]
 
-    assert calls.count("create_backpack_live_adapter") == 1
+    assert calls.count("create_bybit_live_adapter") == 1

@@ -14,6 +14,7 @@ from src.core.adapters.live_binance import (
     create_binance_live_adapter,
 )
 from src.core.adapters.live_backpack import create_backpack_live_adapter
+from src.core.adapters.live_bybit import create_bybit_live_adapter
 from src.core.adapters.rithmic_adapter import (
     RithmicExchangeAdapter,
     RithmicUnmappedOrderEvent,
@@ -101,6 +102,13 @@ def create_adapter(
             )
         elif exchange_id == "backpack":
             adapter = create_backpack_live_adapter(
+                api_key=api_key,
+                secret=secret,
+                testnet=testnet,
+                extra_config=extra_config,
+            )
+        elif exchange_id == "bybit":
+            adapter = create_bybit_live_adapter(
                 api_key=api_key,
                 secret=secret,
                 testnet=testnet,
