@@ -9,7 +9,10 @@ from src.core.adapters.ccxt_adapter import (
     AccountInitializationConfig,
     CcxtExchangeAdapter,
 )
-from src.core.adapters.live_binance import LiveBinanceAdapter
+from src.core.adapters.live_binance import (
+    LiveBinanceAdapter,
+    create_binance_live_adapter,
+)
 from src.core.adapters.rithmic_adapter import (
     RithmicExchangeAdapter,
     RithmicUnmappedOrderEvent,
@@ -86,12 +89,13 @@ def create_adapter(
     adapter = None
     try:
         guard()
-        if exchange_id == "binance" and enable_ws:
-            adapter = LiveBinanceAdapter(
+        if exchange_id == "binance":
+            adapter = create_binance_live_adapter(
                 api_key=api_key,
                 secret=secret,
                 testnet=testnet,
-                enable_ws=True,
+                enable_ws=enable_ws,
+                extra_config=extra_config,
                 operation_guard=guard,
             )
         else:

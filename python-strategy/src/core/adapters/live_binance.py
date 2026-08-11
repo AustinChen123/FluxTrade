@@ -75,8 +75,7 @@ class LiveBinanceAdapter(CcxtExchangeAdapter):
         # Try WS fast path for market orders
         if (
             not reduce_only
-            and
-            self.ws_connector
+            and self.ws_connector
             and self.ws_connector.is_connected("binance")
             and order.type
             and order.type.lower() == "market"
@@ -109,3 +108,30 @@ class LiveBinanceAdapter(CcxtExchangeAdapter):
 
         # REST fallback (parent class)
         return super().place_order(order)
+
+
+def create_binance_live_adapter(
+    *,
+    api_key: str | None = None,
+    secret: str | None = None,
+    testnet: bool = True,
+    enable_ws: object = False,
+    extra_config: dict | None = None,
+    operation_guard: Callable[[], None] | None = None,
+) -> CcxtExchangeAdapter:
+    """Construct the configured Binance adapter without owning its lifecycle."""
+    if enable_ws:
+        return LiveBinanceAdapter(
+            api_key=api_key,
+            secret=secret,
+            testnet=testnet,
+            enable_ws=True,
+            operation_guard=operation_guard,
+        )
+    return CcxtExchangeAdapter(
+        exchange_id="binance",
+        api_key=api_key,
+        secret=secret,
+        testnet=testnet,
+        extra_config=extra_config,
+    )
