@@ -406,8 +406,8 @@ def test_rithmic_config_never_calls_ccxt_credential_owner(
 @pytest.mark.parametrize(
     ("exchange", "product_id"),
     [
-        ("binance", "BINANCE:BTCUSDT-PERP"),
         ("bybit", "BYBIT:BTCUSDT-PERP"),
+        ("okx", "OKX:BTCUSDT-PERP"),
     ],
 )
 def test_non_rithmic_live_config_delegates_to_ccxt_owner_once(
@@ -449,6 +449,8 @@ def test_ccxt_credential_owner_failure_precedes_audit_and_initialization(
     monkeypatch,
 ) -> None:
     _set_live_ccxt_env(monkeypatch)
+    monkeypatch.setenv("EXCHANGE_ID", "bybit")
+    monkeypatch.setenv("INSTRUMENT_PRODUCT_IDS", "BYBIT:BTCUSDT-PERP")
     sentinel = RuntimeError("ccxt-credential-owner-sentinel")
     owner = MagicMock(side_effect=sentinel)
     audit_reader = MagicMock(side_effect=AssertionError("audit read"))
