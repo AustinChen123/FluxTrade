@@ -1493,8 +1493,14 @@ class TestCreateAdapter:
         client.load_markets.assert_called_once()
 
     def test_live_adapter_initializes_account_before_warming_specs(self):
-        with patch("src.core.adapters.ccxt_adapter.ccxt") as mock_ccxt:
+        with (
+            patch("src.core.adapters.ccxt_adapter.ccxt") as mock_ccxt,
+            patch(
+                "src.core.adapters.ccxt_account_initialization.ccxt"
+            ) as mock_account_ccxt,
+        ):
             mock_ccxt.BaseError = Exception
+            mock_account_ccxt.BaseError = Exception
             mock_cls = MagicMock()
             client = MagicMock()
             client.fetch_position_mode.side_effect = Exception(
@@ -1598,8 +1604,14 @@ class TestCreateAdapter:
     def test_bybit_account_initialization_allows_unsupported_position_mode_fetch(
         self,
     ):
-        with patch("src.core.adapters.ccxt_adapter.ccxt") as mock_ccxt:
+        with (
+            patch("src.core.adapters.ccxt_adapter.ccxt") as mock_ccxt,
+            patch(
+                "src.core.adapters.ccxt_account_initialization.ccxt"
+            ) as mock_account_ccxt,
+        ):
             mock_ccxt.BaseError = Exception
+            mock_account_ccxt.BaseError = Exception
             mock_cls = MagicMock()
             client = MagicMock()
             client.fetch_position_mode.side_effect = Exception(
@@ -1651,8 +1663,14 @@ class TestCreateAdapter:
     def test_bybit_account_initialization_allows_unsupported_margin_mode_verification(
         self,
     ):
-        with patch("src.core.adapters.ccxt_adapter.ccxt") as mock_ccxt:
+        with (
+            patch("src.core.adapters.ccxt_adapter.ccxt") as mock_ccxt,
+            patch(
+                "src.core.adapters.ccxt_account_initialization.ccxt"
+            ) as mock_account_ccxt,
+        ):
             mock_ccxt.BaseError = Exception
+            mock_account_ccxt.BaseError = Exception
             mock_cls = MagicMock()
             client = MagicMock()
             client.fetch_position_mode.side_effect = Exception(

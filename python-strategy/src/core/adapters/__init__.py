@@ -5,10 +5,8 @@ Factory function ``create_adapter`` provides config-driven instantiation.
 
 from collections.abc import Callable
 
-from src.core.adapters.ccxt_adapter import (
-    AccountInitializationConfig,
-    CcxtExchangeAdapter,
-)
+from src.core.adapters.ccxt_account_initialization import AccountInitializationConfig
+from src.core.adapters.ccxt_adapter import CcxtExchangeAdapter
 from src.core.adapters.live_binance import (
     LiveBinanceAdapter,
     create_binance_live_adapter,
