@@ -42,6 +42,7 @@ from src.core.ops_safety import OpsSafetyService
 from src.core.risk_manager import AccountService
 from src.core.runtime_capabilities import (
     KillSwitchClearPreparation,
+    OrderAccountIdentity,
     StartupReconciliationState,
 )
 from src.core.runtime_environment import RuntimeEnvironment
@@ -164,6 +165,40 @@ def test_same_profile_can_bootstrap_two_explicit_accounts_without_selection() ->
         accounts.append((bootstrap.profile, bootstrap.account_id))
 
     assert accounts == [("orders", "ACCOUNT-A"), ("orders", "ACCOUNT-B")]
+
+
+@pytest.mark.parametrize(
+    ("product_id", "is_backtest", "expected"),
+    [
+        (
+            "RITHMIC:NQ-202609",
+            False,
+            OrderAccountIdentity(account_profile="orders", account_id="ACCOUNT"),
+        ),
+        ("BINANCE:BTCUSDT-PERP", False, None),
+        ("RITHMIC:NQ-202609", True, None),
+    ],
+)
+def test_rithmic_bootstrap_owns_order_account_identity_resolution(
+    product_id: str,
+    is_backtest: bool,
+    expected: OrderAccountIdentity | None,
+) -> None:
+    bootstrap = prepare_rithmic_runtime_bootstrap(
+        adapter=_rithmic_adapter(),
+        adapter_config={"rithmic_recovery_account_id": "ACCOUNT"},
+        audit_external_orders=True,
+        account_service=MagicMock(spec=AccountService),
+        runtime_environment=RuntimeEnvironment("test"),
+    )
+
+    assert (
+        bootstrap.resolve_order_account_identity(
+            product_id,
+            is_backtest=is_backtest,
+        )
+        == expected
+    )
 
 
 def test_bootstrap_defers_rithmic_interval_until_after_engine_risk_setup(

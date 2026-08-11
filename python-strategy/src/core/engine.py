@@ -295,8 +295,8 @@ class StrategyEngine:
             if runtime_bootstrap_factory is not None
             else DefaultRuntimeBootstrap()
         )
-        self._rithmic_recovery_profile = runtime_bootstrap.profile
-        self._rithmic_recovery_account_id = runtime_bootstrap.account_id
+        self._runtime_profile = runtime_bootstrap.profile
+        self._runtime_account_id = runtime_bootstrap.account_id
         self.risk_manager.instrument_spec_resolver = getattr(
             adapter,
             "get_instrument_spec",
@@ -323,15 +323,10 @@ class StrategyEngine:
             db_session_factory=self._db_session_factory,
             audit_external_orders=audit_external_orders,
             account_service=self.account_service,
-            rithmic_account_profile=self._rithmic_recovery_profile,
-            rithmic_account_id=self._rithmic_recovery_account_id,
+            order_account_identity_resolver=(
+                runtime_bootstrap.resolve_order_account_identity
+            ),
             operation_guard=self._assert_runtime_leadership,
-        )
-        self._rithmic_recovery_profile = (
-            self.execution_engine.order_manager.rithmic_account_profile
-        )
-        self._rithmic_recovery_account_id = (
-            self.execution_engine.order_manager.rithmic_account_id
         )
         self._lifecycle_adapter = _EngineLifecycleAdapter(self)
         self._health_monitor = HealthMonitor(self._registry)
@@ -406,8 +401,8 @@ class StrategyEngine:
         self._venue_runtime = (
             runtime_capabilities_factory(
                 adapter=adapter,
-                profile=self._rithmic_recovery_profile,
-                account_id=self._rithmic_recovery_account_id,
+                profile=self._runtime_profile,
+                account_id=self._runtime_account_id,
                 execution_engine=self.execution_engine,
                 account_service=self.account_service,
                 ops_safety=self.ops_safety,

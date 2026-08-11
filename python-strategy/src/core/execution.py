@@ -9,6 +9,7 @@ from sqlalchemy.orm import Session
 from src.core.models import Signal, SignalType, Candlestick, OrderSide, OrderStatus, PositionSide
 from src.core.orm_models import Strategy
 from src.core.order_manager import OrderManager
+from src.core.runtime_capabilities import OrderAccountIdentityResolver
 from src.core.interfaces.exchange import IExchangeAdapter, ExchangeError, NetworkError
 from src.core.interfaces.exchange import ExchangeOrderEvent
 from src.core.interfaces.exchange import ExchangeOrderLookupUnsupported
@@ -81,8 +82,7 @@ class ExecutionEngine:
         db_session_factory: Optional[Callable[[], ContextManager[Session]]] = None,
         audit_external_orders: bool = False,
         account_service=None,
-        rithmic_account_profile: str | None = None,
-        rithmic_account_id: str | None = None,
+        order_account_identity_resolver: OrderAccountIdentityResolver | None = None,
         operation_guard: Callable[[], None] | None = None,
     ):
         self.logger = logging.getLogger("ExecutionEngine")
@@ -105,8 +105,7 @@ class ExecutionEngine:
                 order_repository,
                 clock,
                 is_backtest=is_backtest,
-                rithmic_account_profile=rithmic_account_profile,
-                rithmic_account_id=rithmic_account_id,
+                order_account_identity_resolver=order_account_identity_resolver,
             )
         else:
             from src.core.repositories import LiveOrderRepository
@@ -114,8 +113,7 @@ class ExecutionEngine:
                 LiveOrderRepository(db_session, db_session_factory=db_session_factory),
                 clock,
                 is_backtest=is_backtest,
-                rithmic_account_profile=rithmic_account_profile,
-                rithmic_account_id=rithmic_account_id,
+                order_account_identity_resolver=order_account_identity_resolver,
             )
 
         self.default_quantity = Decimal("0.01")

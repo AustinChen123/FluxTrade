@@ -1217,8 +1217,6 @@ class TestExecutionTradingRules:
             db_session_factory=lambda: nullcontext(mock_db_session),
             audit_external_orders=True,
             is_backtest=True,
-            rithmic_account_profile="test",
-            rithmic_account_id="ACCOUNT",
         )
 
         order_id = engine.execute_signal(
@@ -1350,8 +1348,6 @@ class TestExecutionTradingRules:
             db_session_factory=lambda: nullcontext(mock_db_session),
             audit_external_orders=True,
             is_backtest=True,
-            rithmic_account_profile="test",
-            rithmic_account_id="ACCOUNT",
         )
         order_id = engine.execute_signal(
             signal_factory(
@@ -1437,8 +1433,6 @@ class TestExecutionTradingRules:
             db_session_factory=lambda: nullcontext(mock_db_session),
             audit_external_orders=True,
             is_backtest=True,
-            rithmic_account_profile="test",
-            rithmic_account_id="ACCOUNT",
         )
         entry_id = engine.execute_signal(
             signal_factory(
@@ -1531,8 +1525,6 @@ class TestExecutionTradingRules:
             db_session_factory=lambda: nullcontext(mock_db_session),
             audit_external_orders=True,
             is_backtest=True,
-            rithmic_account_profile="test",
-            rithmic_account_id="ACCOUNT",
         )
         entry_id = engine.execute_signal(
             signal_factory(
@@ -1601,8 +1593,6 @@ class TestExecutionTradingRules:
             db_session_factory=lambda: nullcontext(mock_db_session),
             audit_external_orders=True,
             is_backtest=True,
-            rithmic_account_profile="test",
-            rithmic_account_id="ACCOUNT",
         )
 
         with pytest.raises(NetworkError, match="ambiguous"):
@@ -1650,8 +1640,6 @@ class TestExecutionTradingRules:
             db_session_factory=lambda: nullcontext(mock_db_session),
             audit_external_orders=True,
             is_backtest=True,
-            rithmic_account_profile="test",
-            rithmic_account_id="ACCOUNT",
         )
         update_order = mock_order_repo.update_order
 
@@ -1706,8 +1694,6 @@ class TestExecutionTradingRules:
             db_session_factory=lambda: nullcontext(mock_db_session),
             audit_external_orders=True,
             is_backtest=True,
-            rithmic_account_profile="test",
-            rithmic_account_id="ACCOUNT",
         )
         entry_id = engine.execute_signal(
             signal_factory(

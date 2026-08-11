@@ -10,20 +10,12 @@ from src.core.clock import Clock
 from src.core.interfaces import IOrderRepository
 from src.core.jsonb_helpers import serialize_payload_with_decimals
 from src.core.redis_factory import create_redis_client
+from src.core.runtime_capabilities import OrderAccountIdentityResolver
 
 logger = logging.getLogger(__name__)
 
 _VALID_SIDES = {OrderSide.BUY, OrderSide.SELL, "buy", "sell"}
 _VALID_ORDER_TYPES = {"market", "limit", "stop_loss", "take_profit", "trailing_stop"}
-
-
-def _optional_identity(value: str | None) -> str | None:
-    if value is None:
-        return None
-    value = value.strip()
-    if not value:
-        raise ValueError("account identity must not be blank")
-    return value
 
 
 class OrderManager:
@@ -33,8 +25,7 @@ class OrderManager:
         clock: Clock,
         is_backtest: Optional[bool] = None,
         *,
-        rithmic_account_profile: str | None = None,
-        rithmic_account_id: str | None = None,
+        order_account_identity_resolver: OrderAccountIdentityResolver | None = None,
     ):
         self.repo = repo
         self.clock = clock
@@ -59,8 +50,7 @@ class OrderManager:
                 raise e
         else:
              logger.info("OrderManager: Initialized in Backtest Mode (Redis Disabled).")
-        self.rithmic_account_profile = _optional_identity(rithmic_account_profile)
-        self.rithmic_account_id = _optional_identity(rithmic_account_id)
+        self._order_account_identity_resolver = order_account_identity_resolver
 
     def create_order(
         self,
@@ -79,11 +69,14 @@ class OrderManager:
             raise ValueError(f"Invalid order type: {order_type!r}. Must be one of {_VALID_ORDER_TYPES}")
         exchange_id = signal.product_id.split(':')[0]
         account_profile = account_id = None
-        if exchange_id.upper() == "RITHMIC" and not self.is_backtest:
-            if self.rithmic_account_profile is None or self.rithmic_account_id is None:
-                raise RuntimeError("Rithmic live orders require account profile and account ID")
-            account_profile = self.rithmic_account_profile
-            account_id = self.rithmic_account_id
+        if self._order_account_identity_resolver is not None:
+            account_identity = self._order_account_identity_resolver(
+                signal.product_id,
+                is_backtest=self.is_backtest,
+            )
+            if account_identity is not None:
+                account_profile = account_identity.account_profile
+                account_id = account_identity.account_id
         order_id = str(uuid.uuid4())
         is_idempotent_order = client_order_id is not None
 

@@ -44,6 +44,7 @@ from src.core.ops_safety import OpsSafetyService
 from src.core.risk_manager import AccountService
 from src.core.runtime_capabilities import (
     KillSwitchClearPreparation,
+    OrderAccountIdentity,
     RuntimeCallbacks as RithmicRuntimeCallbacks,
     StartupReconciliationState,
 )
@@ -73,10 +74,21 @@ def _rithmic_runtime_reconciliation_interval_from_env() -> float:
 class RithmicRuntimeBootstrap:
     """Venue-owned identity and deferred schedule selected during startup."""
 
-    profile: str | None
-    account_id: str | None
+    order_account_identity: OrderAccountIdentity | None
     is_rithmic_runtime: bool
     _interval_resolver: Callable[[], float] | None = None
+
+    @property
+    def profile(self) -> str | None:
+        if self.order_account_identity is None:
+            return None
+        return self.order_account_identity.account_profile
+
+    @property
+    def account_id(self) -> str | None:
+        if self.order_account_identity is None:
+            return None
+        return self.order_account_identity.account_id
 
     def resolve_reconciliation_schedule(
         self,
@@ -93,6 +105,23 @@ class RithmicRuntimeBootstrap:
             return False, None
         return True, generic_interval_resolver()
 
+    def resolve_order_account_identity(
+        self,
+        product_id: str,
+        *,
+        is_backtest: bool,
+    ) -> OrderAccountIdentity | None:
+        """Resolve Rithmic order identity without leaking venue policy."""
+        if not self.is_rithmic_runtime or is_backtest:
+            return None
+        if product_id.partition(":")[0].upper() != "RITHMIC":
+            return None
+        if self.order_account_identity is None:
+            raise RuntimeError(
+                "Rithmic live orders require account profile and account ID"
+            )
+        return self.order_account_identity
+
 
 def prepare_rithmic_runtime_bootstrap(
     *,
@@ -105,8 +134,7 @@ def prepare_rithmic_runtime_bootstrap(
     """Prepare venue identity and account authority without external I/O."""
     if not isinstance(adapter, RithmicExchangeAdapter):
         return RithmicRuntimeBootstrap(
-            profile=None,
-            account_id=None,
+            order_account_identity=None,
             is_rithmic_runtime=False,
         )
     profile = adapter_config.get("rithmic_recovery_profile") or adapter_config.get(
@@ -126,15 +154,18 @@ def prepare_rithmic_runtime_bootstrap(
     if not account_id or account_id != adapter.account_id:
         raise ValueError("Rithmic recovery account must match order adapter account")
 
+    order_account_identity = OrderAccountIdentity(
+        account_profile=profile,
+        account_id=account_id,
+    )
     account_service.configure_authoritative_balance(
         venue="rithmic",
-        account_id=account_id,
+        account_id=order_account_identity.account_id,
         max_age_seconds=_rithmic_account_snapshot_max_age_from_env(),
         runtime_environment=runtime_environment,
     )
     return RithmicRuntimeBootstrap(
-        profile=profile,
-        account_id=account_id,
+        order_account_identity=order_account_identity,
         is_rithmic_runtime=True,
         _interval_resolver=_rithmic_runtime_reconciliation_interval_from_env,
     )

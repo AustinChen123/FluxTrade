@@ -11,8 +11,10 @@ Covers:
 
 import pytest
 from decimal import Decimal
+from pathlib import Path
 from unittest.mock import patch, MagicMock
 
+from src.core.runtime_capabilities import OrderAccountIdentity
 from src.core.order_manager import OrderManager
 from src.core.models import OrderSide, OrderStatus, SignalType
 
@@ -135,22 +137,61 @@ class TestOrderCreation:
             "limits": ["42000.5"],
         }
 
-    def test_rithmic_live_order_persists_account_identity_before_submission(
+    def test_neutral_resolver_is_the_only_order_account_identity_source(
         self,
         mock_order_repo,
         mock_clock,
         signal_factory,
     ):
+        calls: list[tuple[str, bool]] = []
+
+        def resolve_identity(
+            product_id: str,
+            *,
+            is_backtest: bool,
+        ) -> OrderAccountIdentity | None:
+            calls.append((product_id, is_backtest))
+            return OrderAccountIdentity(
+                account_profile="orders",
+                account_id="ACCOUNT",
+            )
+
         order_manager = OrderManager(
             mock_order_repo,
             mock_clock,
             is_backtest=False,
-            rithmic_account_profile=" test ",
-            rithmic_account_id=" ACCOUNT ",
+            order_account_identity_resolver=resolve_identity,
+        )
+        order = order_manager.create_order(
+            signal_factory(product_id="RITHMIC:NQ-202609"),
+            OrderSide.BUY,
+            "market",
+            Decimal("1"),
+        )
+
+        assert calls == [("RITHMIC:NQ-202609", False)]
+        assert order.account_profile == "orders"
+        assert order.account_id == "ACCOUNT"
+
+    def test_live_order_persists_resolved_account_identity_before_submission(
+        self,
+        mock_order_repo,
+        mock_clock,
+        signal_factory,
+    ):
+        identity = OrderAccountIdentity(
+            account_profile=" test ",
+            account_id=" ACCOUNT ",
+        )
+        order_manager = OrderManager(
+            mock_order_repo,
+            mock_clock,
+            is_backtest=False,
+            order_account_identity_resolver=lambda *_args, **_kwargs: identity,
         )
 
         order = order_manager.create_order(
-            signal_factory(product_id="RITHMIC:NQ-202609"),
+            signal_factory(product_id="VENUE:ABC-202609"),
             OrderSide.BUY,
             "limit",
             Decimal("1"),
@@ -162,17 +203,25 @@ class TestOrderCreation:
         assert order.account_id == "ACCOUNT"
         assert mock_order_repo.orders[order.id].account_id == "ACCOUNT"
 
-    def test_rithmic_live_order_rejects_missing_account_identity(
+    def test_order_identity_resolver_failure_precedes_persistence(
         self,
         mock_order_repo,
         mock_clock,
         signal_factory,
     ):
-        order_manager = OrderManager(mock_order_repo, mock_clock, is_backtest=False)
+        def reject_identity(*_args, **_kwargs):
+            raise RuntimeError("order account identity unavailable")
 
-        with pytest.raises(RuntimeError, match="require account profile and account ID"):
+        order_manager = OrderManager(
+            mock_order_repo,
+            mock_clock,
+            is_backtest=False,
+            order_account_identity_resolver=reject_identity,
+        )
+
+        with pytest.raises(RuntimeError, match="order account identity unavailable"):
             order_manager.create_order(
-                signal_factory(product_id="RITHMIC:NQ-202609"),
+                signal_factory(product_id="VENUE:ABC-202609"),
                 OrderSide.BUY,
                 "market",
                 Decimal("1"),
@@ -186,12 +235,21 @@ class TestOrderCreation:
         mock_clock,
         signal_factory,
     ):
+        identity = OrderAccountIdentity(
+            account_profile="test",
+            account_id="ACCOUNT",
+        )
+
+        def resolve_identity(product_id: str, *, is_backtest: bool):
+            if is_backtest or product_id != "VENUE:ABC-202609":
+                return None
+            return identity
+
         live_manager = OrderManager(
             mock_order_repo,
             mock_clock,
             is_backtest=False,
-            rithmic_account_profile="test",
-            rithmic_account_id="ACCOUNT",
+            order_account_identity_resolver=resolve_identity,
         )
         binance_order = live_manager.create_order(
             signal_factory(product_id="BINANCE:BTCUSDT-PERP"),
@@ -203,11 +261,10 @@ class TestOrderCreation:
             mock_order_repo,
             mock_clock,
             is_backtest=True,
-            rithmic_account_profile="test",
-            rithmic_account_id="ACCOUNT",
+            order_account_identity_resolver=resolve_identity,
         )
         rithmic_backtest_order = backtest_manager.create_order(
-            signal_factory(product_id="RITHMIC:NQ-202609"),
+            signal_factory(product_id="VENUE:ABC-202609"),
             OrderSide.BUY,
             "market",
             Decimal("1"),
@@ -217,6 +274,18 @@ class TestOrderCreation:
         assert binance_order.account_id is None
         assert rithmic_backtest_order.account_profile is None
         assert rithmic_backtest_order.account_id is None
+
+
+def test_generic_order_chain_has_no_rithmic_account_policy() -> None:
+    root = Path(__file__).parents[1] / "src" / "core"
+    for path in (root / "engine.py", root / "execution.py", root / "order_manager.py"):
+        source = path.read_text()
+        assert "rithmic_account_profile" not in source
+        assert "rithmic_account_id" not in source
+    assert (
+        'exchange_id.upper() == "RITHMIC"'
+        not in (root / "order_manager.py").read_text()
+    )
 
 
 class TestOrderStatusUpdates:

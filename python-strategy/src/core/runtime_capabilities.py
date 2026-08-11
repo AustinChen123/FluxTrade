@@ -30,6 +30,36 @@ class RuntimeBootstrap(Protocol):
         generic_interval_resolver: Callable[[], float],
     ) -> tuple[bool, float | None]: ...
 
+    def resolve_order_account_identity(
+        self,
+        product_id: str,
+        *,
+        is_backtest: bool,
+    ) -> OrderAccountIdentity | None: ...
+
+
+@dataclass(frozen=True)
+class OrderAccountIdentity:
+    account_profile: str
+    account_id: str
+
+    def __post_init__(self) -> None:
+        profile = self.account_profile.strip()
+        account_id = self.account_id.strip()
+        if not profile or not account_id:
+            raise ValueError("account identity must not be blank")
+        object.__setattr__(self, "account_profile", profile)
+        object.__setattr__(self, "account_id", account_id)
+
+
+class OrderAccountIdentityResolver(Protocol):
+    def __call__(
+        self,
+        product_id: str,
+        *,
+        is_backtest: bool,
+    ) -> OrderAccountIdentity | None: ...
+
 
 @dataclass(frozen=True)
 class DefaultRuntimeBootstrap:
@@ -45,6 +75,14 @@ class DefaultRuntimeBootstrap:
         if not generic_enabled:
             return False, None
         return True, generic_interval_resolver()
+
+    def resolve_order_account_identity(
+        self,
+        product_id: str,
+        *,
+        is_backtest: bool,
+    ) -> OrderAccountIdentity | None:
+        return None
 
 
 class RuntimeBootstrapFactory(Protocol):

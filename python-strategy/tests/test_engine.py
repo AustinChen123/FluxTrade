@@ -107,6 +107,7 @@ from src.core.runtime_environment import RuntimeEnvironment
 from src.core.runtime_capabilities import (
     KillSwitchClearPreparation,
     NoopRuntimeCapabilities,
+    OrderAccountIdentity,
     StartupReconciliationState,
 )
 from src.core.rithmic_publisher_liveness_gate import (
@@ -197,8 +198,8 @@ def _authoritative_rithmic_summary(
 
 def _attach_rithmic_ledger_recovery(engine) -> None:
     engine._venue_runtime.ledger_recovery = RithmicLedgerRecoveryService(
-        profile=engine._rithmic_recovery_profile or "test",
-        account_id=engine._rithmic_recovery_account_id,
+        profile=engine._runtime_profile or "test",
+        account_id=engine._runtime_account_id,
         reconcile_owned_orders=lambda profile, account_id: (
             engine.execution_engine.reconcile_rithmic_owned_orders(
                 profile,
@@ -688,7 +689,7 @@ class TestEngineInit:
         assert events == ["max_age", "account_setup", "risk_resolver", "interval"]
         execution_engine.assert_not_called()
 
-    def test_rithmic_engine_blank_profile_fails_in_order_manager_after_setup(
+    def test_rithmic_engine_blank_profile_fails_in_bootstrap_before_side_effects(
         self,
         engine_factory,
     ):
@@ -742,13 +743,7 @@ class TestEngineInit:
                 audit_external_orders=True,
             )
 
-        assert events == [
-            "max_age",
-            "account_setup",
-            "risk_resolver",
-            "interval",
-            "execution_engine",
-        ]
+        assert events == []
         build_owners.assert_not_called()
 
     def test_backtest_identity_precedes_rithmic_audit_and_bootstrap(
@@ -832,16 +827,20 @@ class TestEngineInit:
             max_age_seconds=600.0,
             runtime_environment=engine.runtime_environment,
         )
-        assert execution_engine.call_args.kwargs["rithmic_account_profile"] == (
-            " recovery "
+        resolve_identity = execution_engine.call_args.kwargs[
+            "order_account_identity_resolver"
+        ]
+        assert resolve_identity(
+            "RITHMIC:NQ-202609",
+            is_backtest=False,
+        ) == OrderAccountIdentity(
+            account_profile="recovery",
+            account_id="ACCOUNT",
         )
-        assert execution_engine.call_args.kwargs["rithmic_account_id"] == "ACCOUNT"
-        assert engine.execution_engine.order_manager.rithmic_account_profile == (
-            "recovery"
-        )
-        assert engine.execution_engine.order_manager.rithmic_account_id == "ACCOUNT"
-        assert engine._rithmic_recovery_profile == "recovery"
-        assert engine._rithmic_recovery_account_id == "ACCOUNT"
+        assert "rithmic_account_profile" not in execution_engine.call_args.kwargs
+        assert "rithmic_account_id" not in execution_engine.call_args.kwargs
+        assert engine._runtime_profile == "recovery"
+        assert engine._runtime_account_id == "ACCOUNT"
         assert engine._venue_runtime.profile == "recovery"
         assert engine._venue_runtime.account_id == "ACCOUNT"
 
@@ -1130,8 +1129,8 @@ class TestEngineInit:
             result = engine._reconcile_recoverable_orders_on_startup()
 
         assert engine._venue_runtime.is_rithmic_runtime is False
-        assert engine._rithmic_recovery_profile is None
-        assert engine._rithmic_recovery_account_id is None
+        assert engine._runtime_profile is None
+        assert engine._runtime_account_id is None
         assert result == {
             "recoverable_count": 0,
             "unresolved_count": 1,
@@ -5403,7 +5402,7 @@ class TestRuntimeReconciliationThread:
         self,
         engine,
     ):
-        engine._rithmic_recovery_account_id = "ACCOUNT"
+        engine._runtime_account_id = "ACCOUNT"
         engine.account_service.replace_authoritative_balance = MagicMock()
         engine.execution_engine.clock.now = MagicMock(return_value=1704067201)
         _attach_rithmic_ledger_recovery(engine)
@@ -5449,7 +5448,7 @@ class TestRuntimeReconciliationThread:
         assert caught.value is error
 
     def test_authoritative_rithmic_summary_rejects_wrong_account(self, engine):
-        engine._rithmic_recovery_account_id = "ACCOUNT"
+        engine._runtime_account_id = "ACCOUNT"
         engine.account_service.replace_authoritative_balance = MagicMock()
         _attach_rithmic_ledger_recovery(engine)
 
@@ -5469,8 +5468,8 @@ class TestRuntimeReconciliationThread:
     ):
         adapter = _rithmic_adapter_for_reconnect_test()
         engine.execution_engine.adapter = adapter
-        engine._rithmic_recovery_profile = "test"
-        engine._rithmic_recovery_account_id = "ACCOUNT"
+        engine._runtime_profile = "test"
+        engine._runtime_account_id = "ACCOUNT"
         engine.execution_engine.halt_for_reconcile = MagicMock(return_value=True)
         summary = _authoritative_rithmic_summary()
         engine.execution_engine.reconcile_rithmic_owned_orders = MagicMock(
@@ -5503,8 +5502,8 @@ class TestRuntimeReconciliationThread:
         adapter = _rithmic_adapter_for_reconnect_test()
         adapter.close = MagicMock()
         engine.execution_engine.adapter = adapter
-        engine._rithmic_recovery_profile = "test"
-        engine._rithmic_recovery_account_id = "ACCOUNT"
+        engine._runtime_profile = "test"
+        engine._runtime_account_id = "ACCOUNT"
         engine.execution_engine.halt_for_reconcile = MagicMock(return_value=True)
         owns_service = True
 
@@ -5540,8 +5539,8 @@ class TestRuntimeReconciliationThread:
     ):
         adapter = _rithmic_adapter_for_reconnect_test()
         engine.execution_engine.adapter = adapter
-        engine._rithmic_recovery_profile = "test"
-        engine._rithmic_recovery_account_id = "ACCOUNT"
+        engine._runtime_profile = "test"
+        engine._runtime_account_id = "ACCOUNT"
         engine.execution_engine.halt_for_reconcile = MagicMock(return_value=True)
         engine._apply_rithmic_authoritative_account_summary = MagicMock()
         engine._start_exchange_order_event_stream = MagicMock()
@@ -5593,8 +5592,8 @@ class TestRuntimeReconciliationThread:
     ):
         adapter = _rithmic_adapter_for_reconnect_test()
         engine.execution_engine.adapter = adapter
-        engine._rithmic_recovery_profile = "test"
-        engine._rithmic_recovery_account_id = "ACCOUNT"
+        engine._runtime_profile = "test"
+        engine._runtime_account_id = "ACCOUNT"
         engine.execution_engine.halt_for_reconcile = MagicMock(return_value=True)
         engine.execution_engine.reconcile_rithmic_owned_orders = MagicMock(
             return_value=_authoritative_rithmic_summary()
@@ -5694,8 +5693,8 @@ class TestRuntimeReconciliationThread:
     ):
         adapter = _rithmic_adapter_for_reconnect_test()
         engine.execution_engine.adapter = adapter
-        engine._rithmic_recovery_profile = "test"
-        engine._rithmic_recovery_account_id = "ACCOUNT"
+        engine._runtime_profile = "test"
+        engine._runtime_account_id = "ACCOUNT"
         engine.execution_engine.halt_for_reconcile = MagicMock(return_value=True)
         engine.execution_engine.reconcile_rithmic_owned_orders = MagicMock(
             return_value=summary
@@ -6489,8 +6488,8 @@ def _install_rithmic_order_reconnect_service(
     runtime = _rithmic_runtime_owners(engine)
     service = RithmicOrderReconnectService(
         adapter=adapter,
-        profile=engine._rithmic_recovery_profile or "",
-        account_id=engine._rithmic_recovery_account_id,
+        profile=engine._runtime_profile or "",
+        account_id=engine._runtime_account_id,
         audit_external_orders=lambda: engine.execution_engine.audit_external_orders,
         reconcile_owned_orders=lambda profile, account_id: (
             engine.execution_engine.reconcile_rithmic_owned_orders(
@@ -6523,8 +6522,8 @@ def _install_venue_runtime_recovery_service(
     runtime = _rithmic_runtime_owners(engine)
     service = RithmicRuntimeRecoveryService(
         adapter=adapter,
-        profile=engine._rithmic_recovery_profile or "",
-        account_id=engine._rithmic_recovery_account_id,
+        profile=engine._runtime_profile or "",
+        account_id=engine._runtime_account_id,
         halt_for_reconcile=lambda **values: (
             engine.execution_engine.halt_for_reconcile(**values)
         ),
@@ -6573,8 +6572,8 @@ def _install_rithmic_strategy_exit_service(
         adapter=adapter,
         execution_engine=engine.execution_engine,
         account_service=engine.account_service,
-        profile=engine._rithmic_recovery_profile or "",
-        account_id=engine._rithmic_recovery_account_id,
+        profile=engine._runtime_profile or "",
+        account_id=engine._runtime_account_id,
         operation_gate=runtime.order_event_lifecycle,
         stop_order_event_stream=engine._stop_exchange_order_event_stream,
         assert_leadership=engine._assert_runtime_leadership,
@@ -6596,8 +6595,8 @@ def _install_rithmic_emergency_flatten_service(
         execution_engine=engine.execution_engine,
         account_service=engine.account_service,
         ops_safety=engine.ops_safety,
-        profile=engine._rithmic_recovery_profile or "test",
-        account_id=engine._rithmic_recovery_account_id or "ACCOUNT",
+        profile=engine._runtime_profile or "test",
+        account_id=engine._runtime_account_id or "ACCOUNT",
         operation_gate=runtime.order_event_lifecycle,
         stop_current_worker=engine._stop_exchange_order_event_stream,
         clear_polling_stop=engine._order_event_stop.clear,
@@ -6621,16 +6620,16 @@ def _install_rithmic_portfolio_exit_factory(
         emergency_flatten = MagicMock()
     runtime.emergency_flatten = emergency_flatten
     runtime.is_rithmic_runtime = True
-    runtime.profile = engine._rithmic_recovery_profile or "test"
-    runtime.account_id = engine._rithmic_recovery_account_id or "ACCOUNT"
+    runtime.profile = engine._runtime_profile or "test"
+    runtime.account_id = engine._runtime_account_id or "ACCOUNT"
 
     def build(portfolio_id_for_sleeve):
         return build_rithmic_portfolio_exit_owner(
             adapter=adapter,
             execution_engine=engine.execution_engine,
             account_service=engine.account_service,
-            profile=engine._rithmic_recovery_profile or "test",
-            account_id=engine._rithmic_recovery_account_id or "ACCOUNT",
+            profile=engine._runtime_profile or "test",
+            account_id=engine._runtime_account_id or "ACCOUNT",
             operation_gate=runtime.order_event_lifecycle,
             stop_order_event_stream=engine._stop_exchange_order_event_stream,
             assert_leadership=engine._assert_runtime_leadership,
@@ -6776,8 +6775,8 @@ def test_rithmic_strategy_exit_uses_native_exit_and_verifies_flat(
 ):
     adapter = _rithmic_adapter_for_reconnect_test()
     engine.execution_engine.adapter = adapter
-    engine._rithmic_recovery_profile = "test"
-    engine._rithmic_recovery_account_id = "ACCOUNT"
+    engine._runtime_profile = "test"
+    engine._runtime_account_id = "ACCOUNT"
     engine.order_event_thread = None
     engine.execution_engine.list_recoverable_client_orders = MagicMock(return_value=[])
     engine.execution_engine.order_manager.repo.list_orders_by_statuses = MagicMock(
@@ -6862,8 +6861,8 @@ def test_engine_exposes_no_legacy_rithmic_exit_seam(method_name):
 def test_strategy_exit_owner_stops_current_replacement_thread(engine):
     adapter = _rithmic_adapter_for_reconnect_test()
     engine.execution_engine.adapter = adapter
-    engine._rithmic_recovery_profile = "test"
-    engine._rithmic_recovery_account_id = "ACCOUNT"
+    engine._runtime_profile = "test"
+    engine._runtime_account_id = "ACCOUNT"
     engine._assert_runtime_leadership = MagicMock()
     engine._start_exchange_order_event_stream = MagicMock()
     engine._lockdown_for_rithmic_order_drift = MagicMock()
@@ -6907,8 +6906,8 @@ def test_strategy_exit_owner_stops_current_replacement_thread(engine):
 def test_rithmic_exit_owners_share_one_order_event_lifecycle_gate(engine):
     adapter = _rithmic_adapter_for_reconnect_test()
     engine.execution_engine.adapter = adapter
-    engine._rithmic_recovery_profile = "test"
-    engine._rithmic_recovery_account_id = "ACCOUNT"
+    engine._runtime_profile = "test"
+    engine._runtime_account_id = "ACCOUNT"
     strategy_owner = _install_rithmic_strategy_exit_service(engine, adapter)
     flatten_owner = _install_rithmic_emergency_flatten_service(engine, adapter)
 
@@ -6951,8 +6950,8 @@ def test_rithmic_exit_owners_share_one_order_event_lifecycle_gate(engine):
 def test_invalid_portfolio_exit_fails_before_lifecycle_gate(engine):
     adapter = _rithmic_adapter_for_reconnect_test()
     engine.execution_engine.adapter = adapter
-    engine._rithmic_recovery_profile = "test"
-    engine._rithmic_recovery_account_id = "ACCOUNT"
+    engine._runtime_profile = "test"
+    engine._runtime_account_id = "ACCOUNT"
     _install_rithmic_portfolio_exit_factory(engine, adapter)
     engine._venue_runtime.order_event_lifecycle.run = MagicMock()
     signal = Signal(
@@ -6987,8 +6986,8 @@ def test_invalid_portfolio_exit_fails_before_lifecycle_gate(engine):
 def test_portfolio_exit_stop_timeout_does_not_start_replacement_worker(engine):
     adapter = _rithmic_adapter_for_reconnect_test()
     engine.execution_engine.adapter = adapter
-    engine._rithmic_recovery_profile = "test"
-    engine._rithmic_recovery_account_id = "ACCOUNT"
+    engine._runtime_profile = "test"
+    engine._runtime_account_id = "ACCOUNT"
     _install_rithmic_portfolio_exit_factory(engine, adapter)
     engine._start_exchange_order_event_stream = MagicMock()
     engine._lockdown_for_rithmic_order_drift = MagicMock()
@@ -7083,8 +7082,8 @@ def test_portfolio_exit_resolves_current_worker_after_acquiring_gate(engine_fact
 def test_rithmic_strategy_exit_cancels_protection_before_native_exit(engine):
     adapter = _rithmic_adapter_for_reconnect_test()
     engine.execution_engine.adapter = adapter
-    engine._rithmic_recovery_profile = "test"
-    engine._rithmic_recovery_account_id = "ACCOUNT"
+    engine._runtime_profile = "test"
+    engine._runtime_account_id = "ACCOUNT"
     engine.order_event_thread = None
     protection = SimpleNamespace(
         id="protection-1",
@@ -7172,8 +7171,8 @@ def test_rithmic_portfolio_exit_reduces_only_owned_sleeve(
 ):
     adapter = _rithmic_adapter_for_reconnect_test()
     engine.execution_engine.adapter = adapter
-    engine._rithmic_recovery_profile = "test"
-    engine._rithmic_recovery_account_id = "ACCOUNT"
+    engine._runtime_profile = "test"
+    engine._runtime_account_id = "ACCOUNT"
     engine.order_event_thread = None
     engine.execution_engine.list_recoverable_client_orders = MagicMock(return_value=[])
     engine.execution_engine.order_manager.repo.list_orders_by_statuses = MagicMock(
@@ -7313,8 +7312,8 @@ def test_rithmic_portfolio_exit_does_not_reduce_another_sleeve_after_own_fill(
 ):
     adapter = _rithmic_adapter_for_reconnect_test()
     engine.execution_engine.adapter = adapter
-    engine._rithmic_recovery_profile = "test"
-    engine._rithmic_recovery_account_id = "ACCOUNT"
+    engine._runtime_profile = "test"
+    engine._runtime_account_id = "ACCOUNT"
     engine.order_event_thread = None
     engine.execution_engine.list_recoverable_client_orders = MagicMock(return_value=[])
     engine.execution_engine.order_manager.repo.list_orders_by_statuses = MagicMock(
@@ -7405,8 +7404,8 @@ def test_rithmic_portfolio_exit_does_not_cancel_before_safe_preflight(engine):
     adapter = _rithmic_adapter_for_reconnect_test()
     adapter.cancel_order = MagicMock(return_value=True)
     engine.execution_engine.adapter = adapter
-    engine._rithmic_recovery_profile = "test"
-    engine._rithmic_recovery_account_id = "ACCOUNT"
+    engine._runtime_profile = "test"
+    engine._runtime_account_id = "ACCOUNT"
     engine.order_event_thread = None
     engine.execution_engine.list_recoverable_client_orders = MagicMock(return_value=[])
     protection = SimpleNamespace(
@@ -7484,8 +7483,8 @@ def test_rithmic_portfolio_exit_schedules_flatten_after_protection_mutation(
     )
     adapter.cancel_order = MagicMock(return_value=True)
     engine.execution_engine.adapter = adapter
-    engine._rithmic_recovery_profile = "test"
-    engine._rithmic_recovery_account_id = "ACCOUNT"
+    engine._runtime_profile = "test"
+    engine._runtime_account_id = "ACCOUNT"
     engine.order_event_thread = None
     engine.execution_engine.list_recoverable_client_orders = MagicMock(return_value=[])
     protection = SimpleNamespace(
@@ -7632,8 +7631,8 @@ def test_rithmic_portfolio_exit_schedules_flatten_after_protection_mutation(
 def test_rithmic_strategy_exit_blocks_when_remote_order_remains_working(engine):
     adapter = _rithmic_adapter_for_reconnect_test()
     engine.execution_engine.adapter = adapter
-    engine._rithmic_recovery_profile = "test"
-    engine._rithmic_recovery_account_id = "ACCOUNT"
+    engine._runtime_profile = "test"
+    engine._runtime_account_id = "ACCOUNT"
     engine.order_event_thread = None
     engine.execution_engine.list_recoverable_client_orders = MagicMock(return_value=[])
     engine.execution_engine.order_manager.repo.list_orders_by_statuses = MagicMock(
@@ -7790,8 +7789,8 @@ def test_rithmic_kill_switch_uses_and_verifies_authoritative_positions(engine):
     adapter = _rithmic_adapter_for_reconnect_test()
     adapter.start_order_event_stream()
     engine.execution_engine.adapter = adapter
-    engine._rithmic_recovery_profile = "test"
-    engine._rithmic_recovery_account_id = "ACCOUNT"
+    engine._runtime_profile = "test"
+    engine._runtime_account_id = "ACCOUNT"
     engine._start_exchange_order_event_stream = MagicMock()
     engine.execution_engine.reconcile_rithmic_owned_orders = MagicMock(
         return_value={"auto_resume_safe": True}
@@ -7844,8 +7843,8 @@ def test_rithmic_kill_switch_real_path_uses_native_exit_not_market_submit(engine
     adapter = _rithmic_adapter_for_reconnect_test(order_client)
     adapter.start_order_event_stream()
     engine.execution_engine.adapter = adapter
-    engine._rithmic_recovery_profile = "test"
-    engine._rithmic_recovery_account_id = "ACCOUNT"
+    engine._runtime_profile = "test"
+    engine._runtime_account_id = "ACCOUNT"
     engine._start_exchange_order_event_stream = MagicMock()
     engine.execution_engine.reconcile_rithmic_owned_orders = MagicMock(
         return_value={"auto_resume_safe": True}
@@ -7883,8 +7882,8 @@ def test_rithmic_kill_switch_ambiguous_native_exit_never_resubmits(
     adapter = _rithmic_adapter_for_reconnect_test(order_client)
     adapter.start_order_event_stream()
     engine.execution_engine.adapter = adapter
-    engine._rithmic_recovery_profile = "test"
-    engine._rithmic_recovery_account_id = "ACCOUNT"
+    engine._runtime_profile = "test"
+    engine._runtime_account_id = "ACCOUNT"
     engine._start_exchange_order_event_stream = MagicMock()
     engine.execution_engine.reconcile_rithmic_owned_orders = MagicMock(
         return_value={"auto_resume_safe": True}
@@ -7909,8 +7908,8 @@ def test_rithmic_kill_switch_ambiguous_native_exit_never_resubmits(
 def test_rithmic_kill_switch_does_not_snapshot_after_drain_timeout(engine):
     adapter = _rithmic_adapter_for_reconnect_test()
     engine.execution_engine.adapter = adapter
-    engine._rithmic_recovery_profile = "test"
-    engine._rithmic_recovery_account_id = "ACCOUNT"
+    engine._runtime_profile = "test"
+    engine._runtime_account_id = "ACCOUNT"
     engine._start_exchange_order_event_stream = MagicMock()
     engine.ops_safety.record_kill_switch_result = MagicMock()
     engine.execution_engine.reconcile_rithmic_owned_orders = MagicMock()
@@ -7938,8 +7937,8 @@ def test_rithmic_kill_switch_audits_verification_failure_before_raising(engine):
     adapter = _rithmic_adapter_for_reconnect_test()
     adapter.start_order_event_stream()
     engine.execution_engine.adapter = adapter
-    engine._rithmic_recovery_profile = "test"
-    engine._rithmic_recovery_account_id = "ACCOUNT"
+    engine._runtime_profile = "test"
+    engine._runtime_account_id = "ACCOUNT"
     engine._start_exchange_order_event_stream = MagicMock()
     engine.ops_safety.record_kill_switch_result = MagicMock()
     engine.ops_safety.kill_switch_with_authoritative_positions = MagicMock(
@@ -8011,8 +8010,8 @@ def test_rithmic_kill_switch_retries_only_from_fresh_residual_position(engine):
     adapter = _rithmic_adapter_for_reconnect_test()
     adapter.start_order_event_stream()
     engine.execution_engine.adapter = adapter
-    engine._rithmic_recovery_profile = "test"
-    engine._rithmic_recovery_account_id = "ACCOUNT"
+    engine._runtime_profile = "test"
+    engine._runtime_account_id = "ACCOUNT"
     engine._start_exchange_order_event_stream = MagicMock()
     engine.execution_engine.reconcile_rithmic_owned_orders = MagicMock(
         side_effect=[
@@ -8064,8 +8063,8 @@ def test_rithmic_kill_switch_waits_for_accepted_exit_working_order(engine):
     adapter = _rithmic_adapter_for_reconnect_test()
     adapter.start_order_event_stream()
     engine.execution_engine.adapter = adapter
-    engine._rithmic_recovery_profile = "test"
-    engine._rithmic_recovery_account_id = "ACCOUNT"
+    engine._runtime_profile = "test"
+    engine._runtime_account_id = "ACCOUNT"
     engine._start_exchange_order_event_stream = MagicMock()
     engine.execution_engine.reconcile_rithmic_owned_orders = MagicMock(
         return_value={"auto_resume_safe": True}
@@ -8106,8 +8105,8 @@ def test_rithmic_kill_switch_ignores_terminal_remote_order_rows(engine):
     adapter = _rithmic_adapter_for_reconnect_test()
     adapter.start_order_event_stream()
     engine.execution_engine.adapter = adapter
-    engine._rithmic_recovery_profile = "test"
-    engine._rithmic_recovery_account_id = "ACCOUNT"
+    engine._runtime_profile = "test"
+    engine._runtime_account_id = "ACCOUNT"
     engine._start_exchange_order_event_stream = MagicMock()
     engine.execution_engine.reconcile_rithmic_owned_orders = MagicMock(
         return_value={"auto_resume_safe": True}
@@ -8148,8 +8147,8 @@ def test_rithmic_kill_switch_does_not_retry_unreconciled_residual(engine):
     adapter = _rithmic_adapter_for_reconnect_test()
     adapter.start_order_event_stream()
     engine.execution_engine.adapter = adapter
-    engine._rithmic_recovery_profile = "test"
-    engine._rithmic_recovery_account_id = "ACCOUNT"
+    engine._runtime_profile = "test"
+    engine._runtime_account_id = "ACCOUNT"
     engine._start_exchange_order_event_stream = MagicMock()
     engine.execution_engine.reconcile_rithmic_owned_orders = MagicMock(
         return_value={"auto_resume_safe": False}
@@ -8182,8 +8181,8 @@ def test_rithmic_kill_switch_blocks_when_remote_working_order_remains(engine):
     adapter.start_order_event_stream()
     order_client = adapter._client
     engine.execution_engine.adapter = adapter
-    engine._rithmic_recovery_profile = "test"
-    engine._rithmic_recovery_account_id = "ACCOUNT"
+    engine._runtime_profile = "test"
+    engine._runtime_account_id = "ACCOUNT"
     engine._start_exchange_order_event_stream = MagicMock()
     engine.execution_engine.reconcile_rithmic_owned_orders = MagicMock(
         return_value={"auto_resume_safe": False}
@@ -8222,8 +8221,8 @@ def test_rithmic_kill_switch_preserves_primary_error_when_restart_also_fails(
     adapter = _rithmic_adapter_for_reconnect_test()
     adapter.start_order_event_stream()
     engine.execution_engine.adapter = adapter
-    engine._rithmic_recovery_profile = "test"
-    engine._rithmic_recovery_account_id = "ACCOUNT"
+    engine._runtime_profile = "test"
+    engine._runtime_account_id = "ACCOUNT"
     engine._start_exchange_order_event_stream = MagicMock(
         side_effect=RuntimeError("restart failed")
     )
@@ -8253,8 +8252,8 @@ def test_reconnect_triggers_owned_order_reconcile_and_gates(engine):
     adapter.connection_generation = MagicMock(return_value=1)
     engine.execution_engine.adapter = adapter
     engine.execution_engine.audit_external_orders = True
-    engine._rithmic_recovery_profile = "test"
-    engine._rithmic_recovery_account_id = "ACCOUNT"
+    engine._runtime_profile = "test"
+    engine._runtime_account_id = "ACCOUNT"
     engine.execution_engine.reconcile_rithmic_owned_orders = MagicMock(
         side_effect=lambda *_: (
             {"recoverable_count": 0, "auto_resume_safe": True}
@@ -8466,8 +8465,8 @@ def test_reconnect_reconcile_failure_keeps_gate_and_retries(engine):
     adapter.connection_generation = MagicMock(return_value=2)
     engine.execution_engine.adapter = adapter
     engine.execution_engine.audit_external_orders = True
-    engine._rithmic_recovery_profile = "test"
-    engine._rithmic_recovery_account_id = "ACCOUNT"
+    engine._runtime_profile = "test"
+    engine._runtime_account_id = "ACCOUNT"
     engine.execution_engine.reconcile_rithmic_owned_orders = MagicMock(
         side_effect=RuntimeError("boom")
     )
@@ -8506,8 +8505,8 @@ def test_reconnect_lease_loss_after_reconcile_keeps_gate_and_generation(engine):
     adapter.close = MagicMock(wraps=adapter.close)
     engine.execution_engine.adapter = adapter
     engine.execution_engine.audit_external_orders = True
-    engine._rithmic_recovery_profile = "test"
-    engine._rithmic_recovery_account_id = "ACCOUNT"
+    engine._runtime_profile = "test"
+    engine._runtime_account_id = "ACCOUNT"
     leadership_lost = False
 
     def reconcile(*_args):
@@ -8550,8 +8549,8 @@ def test_reconnect_lease_loss_during_stream_restart_keeps_gate_and_generation(
     adapter.close = MagicMock(wraps=adapter.close)
     engine.execution_engine.adapter = adapter
     engine.execution_engine.audit_external_orders = True
-    engine._rithmic_recovery_profile = "test"
-    engine._rithmic_recovery_account_id = "ACCOUNT"
+    engine._runtime_profile = "test"
+    engine._runtime_account_id = "ACCOUNT"
     leadership_lost = False
 
     def restart_then_lose_leadership():
@@ -8608,8 +8607,8 @@ def test_generation_read_failure_reconciles_fail_closed(engine):
     adapter.connection_generation = MagicMock(side_effect=RuntimeError("old binding"))
     engine.execution_engine.adapter = adapter
     engine.execution_engine.audit_external_orders = True
-    engine._rithmic_recovery_profile = "test"
-    engine._rithmic_recovery_account_id = "ACCOUNT"
+    engine._runtime_profile = "test"
+    engine._runtime_account_id = "ACCOUNT"
     engine.execution_engine.halt_for_reconcile = MagicMock(return_value=True)
     engine.execution_engine.reconcile_rithmic_owned_orders = MagicMock(
         return_value={"recoverable_count": 0, "auto_resume_safe": True}
@@ -8638,8 +8637,8 @@ def test_reconnect_unresolved_summary_stays_closed_and_gated(engine, summary):
     adapter.connection_generation = MagicMock(return_value=2)
     engine.execution_engine.adapter = adapter
     engine.execution_engine.audit_external_orders = True
-    engine._rithmic_recovery_profile = "test"
-    engine._rithmic_recovery_account_id = "ACCOUNT"
+    engine._runtime_profile = "test"
+    engine._runtime_account_id = "ACCOUNT"
     engine.execution_engine.halt_for_reconcile = MagicMock(return_value=True)
     engine.execution_engine.reconcile_rithmic_owned_orders = MagicMock(
         return_value=summary
@@ -8704,8 +8703,8 @@ def test_rithmic_event_loop_reconciles_and_restarts_before_polling(engine_factor
     )
     engine = engine_factory(adapter=adapter, audit_external_orders=True)
     engine.execution_engine.audit_external_orders = True
-    engine._rithmic_recovery_profile = "test"
-    engine._rithmic_recovery_account_id = "ACCOUNT"
+    engine._runtime_profile = "test"
+    engine._runtime_account_id = "ACCOUNT"
     engine.execution_engine.reconcile_rithmic_owned_orders = MagicMock(
         side_effect=lambda *_: (
             {"recoverable_count": 0, "auto_resume_safe": True}
@@ -8761,8 +8760,8 @@ def test_reconnect_stream_restart_failure_stays_gated_then_retries(engine):
     )
     engine.execution_engine.adapter = adapter
     engine.execution_engine.audit_external_orders = True
-    engine._rithmic_recovery_profile = "test"
-    engine._rithmic_recovery_account_id = "ACCOUNT"
+    engine._runtime_profile = "test"
+    engine._runtime_account_id = "ACCOUNT"
     engine.execution_engine.reconcile_rithmic_owned_orders = MagicMock(
         return_value={"recoverable_count": 0, "auto_resume_safe": True}
     )
