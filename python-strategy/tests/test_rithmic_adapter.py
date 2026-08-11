@@ -217,6 +217,27 @@ def test_ledger_position_conversion_fails_closed(adapter, snapshot_value, error)
         adapter.positions_from_ledger_snapshot(snapshot_value)
 
 
+def test_ledger_position_projection_delegates_once_with_owned_identity(
+    adapter,
+    monkeypatch,
+):
+    snapshot_value = ledger_snapshot(positions=[ledger_position()])
+    expected = [object()]
+    projection = Mock(return_value=expected)
+    monkeypatch.setattr(
+        rithmic_adapter_module,
+        "project_rithmic_ledger_positions",
+        projection,
+    )
+
+    assert adapter.positions_from_ledger_snapshot(snapshot_value) is expected
+    projection.assert_called_once_with(
+        snapshot_value,
+        account_id="ACCOUNT",
+        products_by_native_identity=adapter._products_by_native_identity,
+    )
+
+
 def test_close_waits_for_active_order_client_call(adapter, client):
     call_started = threading.Event()
     release_call = threading.Event()

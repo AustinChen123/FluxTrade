@@ -3,6 +3,9 @@ import threading
 from decimal import Decimal, InvalidOperation
 from typing import Callable
 
+from src.core.adapters.rithmic_ledger_position import (
+    project_rithmic_ledger_positions,
+)
 from src.core.adapters.rithmic_native_bracket import (
     NativeBracketPlan,
     build_native_bracket_plan,
@@ -20,7 +23,7 @@ from src.core.interfaces.exchange import (
     IExchangeAdapter,
     NetworkError,
 )
-from src.core.models import Position, PositionSide
+from src.core.models import Position
 from src.core.orm_models import Order
 from src.core.rithmic_publisher_liveness_gate import RithmicPublisherLivenessGate
 from src.core.runtime_environment import RuntimeEnvironment
@@ -473,61 +476,11 @@ class RithmicExchangeAdapter(IExchangeAdapter):
 
     def positions_from_ledger_snapshot(self, snapshot) -> list[Position]:
         """Convert one authoritative account snapshot into configured positions."""
-        if str(getattr(snapshot, "account_id", "")).strip() != self.account_id:
-            raise ExchangeError("rithmic_ledger_account_id_mismatch")
-
-        positions = []
-        for remote in snapshot.positions:
-            try:
-                net_quantity = Decimal(str(remote.net_quantity))
-            except (InvalidOperation, TypeError, ValueError) as error:
-                raise ExchangeError(
-                    "rithmic_ledger_position_value_invalid: "
-                    f"exchange={remote.exchange} symbol={remote.symbol}"
-                ) from error
-            if not net_quantity.is_finite():
-                raise ExchangeError(
-                    "rithmic_ledger_position_value_invalid: "
-                    f"exchange={remote.exchange} symbol={remote.symbol}"
-                )
-            if net_quantity == 0:
-                continue
-            identity = (
-                str(remote.exchange).strip().upper(),
-                str(remote.symbol).strip().upper(),
-            )
-            product_id = self._products_by_native_identity.get(identity)
-            if product_id is None:
-                raise ExchangeError(
-                    "rithmic_ledger_position_instrument_unmapped: "
-                    f"exchange={identity[0]} symbol={identity[1]}"
-                )
-            try:
-                entry_price = Decimal(str(remote.average_open_fill_price or "0"))
-                unrealized_pnl = Decimal(str(remote.open_pnl or "0"))
-            except (InvalidOperation, TypeError, ValueError) as error:
-                raise ExchangeError(
-                    "rithmic_ledger_position_value_invalid: "
-                    f"exchange={identity[0]} symbol={identity[1]}"
-                ) from error
-            if not all(value.is_finite() for value in (entry_price, unrealized_pnl)):
-                raise ExchangeError(
-                    "rithmic_ledger_position_value_invalid: "
-                    f"exchange={identity[0]} symbol={identity[1]}"
-                )
-            positions.append(
-                Position(
-                    strategy_id="LIVE",
-                    product_id=product_id,
-                    side=(
-                        PositionSide.LONG if net_quantity > 0 else PositionSide.SHORT
-                    ),
-                    quantity=abs(net_quantity),
-                    entry_price=entry_price,
-                    unrealized_pnl=unrealized_pnl,
-                )
-            )
-        return positions
+        return project_rithmic_ledger_positions(
+            snapshot,
+            account_id=self.account_id,
+            products_by_native_identity=self._products_by_native_identity,
+        )
 
     def connection_generation(self) -> int:
         """Successful (re)connect count of the order session.
