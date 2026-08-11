@@ -9,7 +9,9 @@ from unittest.mock import MagicMock
 import pytest
 
 import src.core.adapters.ccxt_adapter as ccxt_adapter_module
+import src.core.adapters.live_binance as live_binance_module
 from src.core.adapters.ccxt_adapter import CcxtExchangeAdapter
+from src.core.adapters.live_binance import LiveBinanceAdapter
 from src.core.client_order_id import to_exchange_format
 from src.core.interfaces.exchange import ExchangeError
 from src.core.orm_models import Order
@@ -31,17 +33,25 @@ def _owner_functions():
     )
 
 
-def _adapter(exchange_id: str = "binance") -> CcxtExchangeAdapter:
+def _adapter() -> LiveBinanceAdapter:
+    adapter = object.__new__(LiveBinanceAdapter)
+    adapter.exchange_id = "binance"
+    adapter.logger = MagicMock()
+    adapter.ws_connector = None
+    return adapter
+
+
+def _generic_adapter(exchange_id: str) -> CcxtExchangeAdapter:
     adapter = object.__new__(CcxtExchangeAdapter)
     adapter.exchange_id = exchange_id
     adapter.logger = MagicMock()
     return adapter
 
 
-def test_shared_conditional_mapping_delegates_once(monkeypatch) -> None:
+def test_live_binance_conditional_mapping_delegates_once(monkeypatch) -> None:
     owner = MagicMock(return_value=("OWNER", {"owner": True}))
     monkeypatch.setattr(
-        ccxt_adapter_module,
+        live_binance_module,
         "binance_conditional_order_mapping",
         owner,
         raising=False,
@@ -57,10 +67,10 @@ def test_shared_conditional_mapping_delegates_once(monkeypatch) -> None:
     owner.assert_called_once_with("binance", "stop_loss", Decimal("41000"))
 
 
-def test_shared_client_id_params_delegate_once(monkeypatch) -> None:
+def test_live_binance_client_id_params_delegate_once(monkeypatch) -> None:
     owner = MagicMock(return_value={"owner": True})
     monkeypatch.setattr(
-        ccxt_adapter_module,
+        live_binance_module,
         "binance_lookup_client_order_id_params",
         owner,
         raising=False,
@@ -85,7 +95,7 @@ def test_place_order_delegates_submission_client_id_policy(monkeypatch) -> None:
     )
     policy = MagicMock(return_value={"ownerKey": "owner-value"})
     monkeypatch.setattr(
-        ccxt_adapter_module,
+        live_binance_module,
         "binance_submission_client_order_id_params",
         policy,
     )
@@ -122,7 +132,7 @@ def test_cancel_order_delegates_algo_namespace_policy(
     vars(adapter)["client"] = client
     policy = MagicMock(return_value=uses_algo)
     monkeypatch.setattr(
-        ccxt_adapter_module,
+        live_binance_module,
         "uses_binance_algo_order_endpoints",
         policy,
     )
@@ -153,18 +163,14 @@ def test_quantization_failure_precedes_policy(
     monkeypatch,
     public_method: str,
 ) -> None:
-    adapter = _adapter("bybit")
+    adapter = _generic_adapter("bybit")
     client = MagicMock()
     vars(adapter)["client"] = client
     sentinel = RuntimeError("quantization sentinel")
     quantize = MagicMock(side_effect=sentinel)
     policy = MagicMock()
     monkeypatch.setattr(adapter, "_quantize_order", quantize)
-    monkeypatch.setattr(
-        ccxt_adapter_module,
-        "binance_conditional_order_mapping",
-        policy,
-    )
+    monkeypatch.setattr(adapter, "_ccxt_order_type_and_params", policy)
     order = SimpleNamespace(
         product_id="BYBIT:BTCUSDT-PERP",
         type="stop_loss",
@@ -185,18 +191,14 @@ def test_policy_rejection_follows_successful_quantization(
     monkeypatch,
     public_method: str,
 ) -> None:
-    adapter = _adapter("bybit")
+    adapter = _generic_adapter("bybit")
     client = MagicMock()
     vars(adapter)["client"] = client
     quantize = MagicMock()
     rejection = ExchangeError("conditional rejection")
     policy = MagicMock(side_effect=rejection)
     monkeypatch.setattr(adapter, "_quantize_order", quantize)
-    monkeypatch.setattr(
-        ccxt_adapter_module,
-        "binance_conditional_order_mapping",
-        policy,
-    )
+    monkeypatch.setattr(adapter, "_ccxt_order_type_and_params", policy)
     order = SimpleNamespace(
         product_id="BYBIT:BTCUSDT-PERP",
         type="stop_loss",
@@ -208,7 +210,7 @@ def test_policy_rejection_follows_successful_quantization(
 
     assert exc_info.value is rejection
     quantize.assert_called_once_with(order)
-    policy.assert_called_once_with("bybit", "stop_loss", None)
+    policy.assert_called_once_with(order)
     client.create_order.assert_not_called()
 
 
@@ -311,6 +313,9 @@ def test_owner_is_a_pure_policy_module() -> None:
 
 def test_shared_adapter_contains_no_binance_order_routing_literals() -> None:
     source = inspect.getsource(ccxt_adapter_module)
+
+    assert "binance_order_routing" not in source
+    assert "binance_user_stream" not in source
 
     for literal in (
         "clientAlgoId",

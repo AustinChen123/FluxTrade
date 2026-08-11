@@ -8,8 +8,9 @@ from unittest.mock import MagicMock
 import ccxt
 import pytest
 
-import src.core.adapters.ccxt_adapter as ccxt_adapter_module
+import src.core.adapters.live_binance as live_binance_module
 from src.core.adapters.ccxt_adapter import CcxtExchangeAdapter
+from src.core.adapters.live_binance import LiveBinanceAdapter
 from src.core.interfaces.exchange import (
     ExchangeError,
     ExchangeUserStreamUnsupported,
@@ -25,18 +26,18 @@ def _owner_functions():
     return create_binance_user_stream_listen_key, keepalive_binance_user_stream
 
 
-def _adapter(client: object) -> CcxtExchangeAdapter:
-    adapter = object.__new__(CcxtExchangeAdapter)
+def _adapter(client: object) -> LiveBinanceAdapter:
+    adapter = object.__new__(LiveBinanceAdapter)
     adapter.exchange_id = "binance"
     vars(adapter)["client"] = client
     return adapter
 
 
-def test_shared_adapter_delegates_create_with_exact_identities(monkeypatch) -> None:
+def test_live_adapter_delegates_create_with_exact_identities(monkeypatch) -> None:
     client = object()
     owner = MagicMock(return_value="listen-key")
     monkeypatch.setattr(
-        ccxt_adapter_module,
+        live_binance_module,
         "create_binance_user_stream_listen_key",
         owner,
         raising=False,
@@ -46,12 +47,12 @@ def test_shared_adapter_delegates_create_with_exact_identities(monkeypatch) -> N
     owner.assert_called_once_with("binance", client)
 
 
-def test_shared_adapter_delegates_keepalive_with_exact_identities(monkeypatch) -> None:
+def test_live_adapter_delegates_keepalive_with_exact_identities(monkeypatch) -> None:
     client = object()
     listen_key = "listen-key"
     owner = MagicMock()
     monkeypatch.setattr(
-        ccxt_adapter_module,
+        live_binance_module,
         "keepalive_binance_user_stream",
         owner,
         raising=False,
@@ -78,7 +79,7 @@ def test_shared_adapter_delegates_keepalive_with_exact_identities(monkeypatch) -
         ),
     ],
 )
-def test_shared_adapter_preserves_owner_exception_identity(
+def test_live_adapter_preserves_owner_exception_identity(
     monkeypatch,
     owner_name: str,
     adapter_method: str,
@@ -88,7 +89,7 @@ def test_shared_adapter_preserves_owner_exception_identity(
     client = object()
     sentinel = RuntimeError("owner sentinel")
     owner = MagicMock(side_effect=sentinel)
-    monkeypatch.setattr(ccxt_adapter_module, owner_name, owner)
+    monkeypatch.setattr(live_binance_module, owner_name, owner)
 
     with pytest.raises(RuntimeError) as exc_info:
         getattr(_adapter(client), adapter_method)(*adapter_args)
@@ -242,7 +243,7 @@ def test_keepalive_preserves_provider_error_contract(
     provider.assert_called_once_with({"listenKey": "listen-key"})
 
 
-def test_owner_and_shared_adapter_keep_the_dependency_boundary() -> None:
+def test_owner_and_live_adapter_keep_the_dependency_boundary() -> None:
     from src.core.adapters import binance_user_stream
 
     owner_source = inspect.getsource(binance_user_stream)

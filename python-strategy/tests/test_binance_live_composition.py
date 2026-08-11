@@ -34,13 +34,14 @@ def test_binance_owner_routes_truthy_ws_to_live_adapter(enable_ws):
         secret="secret",
         testnet=False,
         enable_ws=True,
+        extra_config={"options": {"defaultType": "future"}},
         operation_guard=guard,
     )
     generic.assert_not_called()
 
 
 @pytest.mark.parametrize("enable_ws", [None, False, 0, ""])
-def test_binance_owner_routes_falsey_ws_to_generic_adapter(enable_ws):
+def test_binance_owner_routes_falsey_ws_to_live_adapter(enable_ws):
     result = object()
     extra_config = {"recvWindow": 5_000}
     guard = MagicMock()
@@ -60,24 +61,23 @@ def test_binance_owner_routes_falsey_ws_to_generic_adapter(enable_ws):
             operation_guard=guard,
         )
 
-    assert actual is result
-    generic.assert_called_once_with(
-        exchange_id="binance",
+    assert actual is live.return_value
+    live.assert_called_once_with(
         api_key="key",
         secret="secret",
         testnet=False,
+        enable_ws=False,
         extra_config=extra_config,
+        operation_guard=guard,
     )
-    live.assert_not_called()
+    generic.assert_not_called()
 
 
 @pytest.mark.parametrize("enable_ws", [False, True])
 def test_binance_owner_preserves_selected_constructor_exception(enable_ws):
     failure = RuntimeError("constructor failed")
-    live = MagicMock()
+    live = MagicMock(side_effect=failure)
     generic = MagicMock()
-    selected = live if enable_ws else generic
-    selected.side_effect = failure
 
     with (
         patch.object(live_binance, "LiveBinanceAdapter", live),
@@ -94,24 +94,15 @@ def test_binance_owner_preserves_selected_constructor_exception(enable_ws):
         )
 
     assert raised.value is failure
-    if enable_ws:
-        live.assert_called_once_with(
-            api_key=None,
-            secret=None,
-            testnet=True,
-            enable_ws=True,
-            operation_guard=None,
-        )
-        generic.assert_not_called()
-    else:
-        generic.assert_called_once_with(
-            exchange_id="binance",
-            api_key=None,
-            secret=None,
-            testnet=True,
-            extra_config=None,
-        )
-        live.assert_not_called()
+    live.assert_called_once_with(
+        api_key=None,
+        secret=None,
+        testnet=True,
+        enable_ws=enable_ws,
+        extra_config=None,
+        operation_guard=None,
+    )
+    generic.assert_not_called()
 
 
 def test_binance_owner_keeps_existing_module_dependency_boundary():
@@ -126,6 +117,18 @@ def test_binance_owner_keeps_existing_module_dependency_boundary():
         "import logging",
         "import asyncio",
         "from collections.abc import Callable",
+        (
+            "from src.core.adapters.binance_order_routing import "
+            "binance_conditional_order_mapping, "
+            "binance_lookup_client_order_id_params, "
+            "binance_submission_client_order_id_params, "
+            "uses_binance_algo_order_endpoints"
+        ),
+        (
+            "from src.core.adapters.binance_user_stream import "
+            "create_binance_user_stream_listen_key, "
+            "keepalive_binance_user_stream"
+        ),
         "from src.core.adapters.ccxt_adapter import CcxtExchangeAdapter",
         "from src.core.client_order_id import to_exchange_format",
         "from src.core.orm_models import Order",

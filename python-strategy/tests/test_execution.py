@@ -22,6 +22,7 @@ from unittest.mock import MagicMock, patch
 from prometheus_client import REGISTRY
 
 from src.core.adapters.ccxt_adapter import CcxtExchangeAdapter
+from src.core.adapters.live_binance import LiveBinanceAdapter
 from src.core.adapters.rithmic_adapter import RithmicExchangeAdapter
 from src.core.execution import ExecutionEngine, ExitDecision
 from src.core.interfaces.exchange import ExchangeOrderSnapshot
@@ -78,11 +79,11 @@ def _ccxt_adapter_with_market_rules(markets: dict) -> tuple[CcxtExchangeAdapter,
         exchange_cls = MagicMock(return_value=client)
         mock_ccxt.binance = exchange_cls
         setattr(mock_ccxt, "binance", exchange_cls)
-        adapter = CcxtExchangeAdapter(
-            exchange_id="binance",
+        adapter = LiveBinanceAdapter(
             api_key="test-key",
             secret="test-secret",
             testnet=False,
+            enable_ws=False,
         )
     adapter.client = client
     return adapter, client

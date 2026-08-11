@@ -8,6 +8,16 @@ import logging
 import asyncio
 from collections.abc import Callable
 
+from src.core.adapters.binance_order_routing import (
+    binance_conditional_order_mapping,
+    binance_lookup_client_order_id_params,
+    binance_submission_client_order_id_params,
+    uses_binance_algo_order_endpoints,
+)
+from src.core.adapters.binance_user_stream import (
+    create_binance_user_stream_listen_key,
+    keepalive_binance_user_stream,
+)
 from src.core.adapters.ccxt_adapter import CcxtExchangeAdapter
 from src.core.client_order_id import to_exchange_format
 from src.core.orm_models import Order
@@ -23,6 +33,7 @@ class LiveBinanceAdapter(CcxtExchangeAdapter):
         secret: str | None = None,
         testnet: bool = True,
         enable_ws: bool = True,
+        extra_config: dict | None = None,
         operation_guard: Callable[[], None] | None = None,
     ):
         super().__init__(
@@ -30,6 +41,7 @@ class LiveBinanceAdapter(CcxtExchangeAdapter):
             api_key=api_key,
             secret=secret,
             testnet=testnet,
+            extra_config=extra_config,
         )
         self.logger = logging.getLogger("LiveBinanceAdapter")
 
@@ -65,6 +77,52 @@ class LiveBinanceAdapter(CcxtExchangeAdapter):
     def close(self) -> None:
         if self.ws_connector is not None:
             self.ws_connector.running = False
+
+    def _submission_client_order_id_params(
+        self,
+        exchange_client_order_id: str,
+        order_type: str | None,
+    ) -> dict:
+        return binance_submission_client_order_id_params(
+            "binance",
+            order_type,
+            exchange_client_order_id,
+        ) or super()._submission_client_order_id_params(
+            exchange_client_order_id,
+            order_type,
+        )
+
+    def _ccxt_order_type_and_params(self, order: Order) -> tuple[str, dict]:
+        conditional = binance_conditional_order_mapping(
+            "binance",
+            (getattr(order, "type", None) or "").lower(),
+            getattr(order, "trigger_price", None),
+        )
+        if conditional is not None:
+            return conditional
+        return super()._ccxt_order_type_and_params(order)
+
+    def _cancel_order_params(self, order_type: str | None) -> dict | None:
+        if uses_binance_algo_order_endpoints("binance", order_type):
+            return {"trigger": True}
+        return super()._cancel_order_params(order_type)
+
+    def _client_order_id_params(
+        self,
+        exchange_client_order_id: str,
+        order_type: str | None,
+    ) -> dict:
+        return binance_lookup_client_order_id_params(
+            "binance",
+            order_type,
+            exchange_client_order_id,
+        ) or super()._client_order_id_params(exchange_client_order_id, order_type)
+
+    def create_user_stream_listen_key(self) -> str:
+        return create_binance_user_stream_listen_key("binance", self.client)
+
+    def keepalive_user_stream(self, listen_key: str) -> None:
+        keepalive_binance_user_stream("binance", self.client, listen_key)
 
     def place_order(self, order: Order) -> str:
         intent_payload = getattr(order, "intent_payload", None)
@@ -118,20 +176,13 @@ def create_binance_live_adapter(
     enable_ws: object = False,
     extra_config: dict | None = None,
     operation_guard: Callable[[], None] | None = None,
-) -> CcxtExchangeAdapter:
+) -> LiveBinanceAdapter:
     """Construct the configured Binance adapter without owning its lifecycle."""
-    if enable_ws:
-        return LiveBinanceAdapter(
-            api_key=api_key,
-            secret=secret,
-            testnet=testnet,
-            enable_ws=True,
-            operation_guard=operation_guard,
-        )
-    return CcxtExchangeAdapter(
-        exchange_id="binance",
+    return LiveBinanceAdapter(
         api_key=api_key,
         secret=secret,
         testnet=testnet,
+        enable_ws=bool(enable_ws),
         extra_config=extra_config,
+        operation_guard=operation_guard,
     )

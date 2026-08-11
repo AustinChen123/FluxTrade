@@ -12,16 +12,6 @@ from typing import Callable, Optional
 
 import ccxt
 
-from src.core.adapters.binance_user_stream import (
-    create_binance_user_stream_listen_key,
-    keepalive_binance_user_stream,
-)
-from src.core.adapters.binance_order_routing import (
-    binance_conditional_order_mapping,
-    binance_lookup_client_order_id_params,
-    binance_submission_client_order_id_params,
-    uses_binance_algo_order_endpoints,
-)
 from src.core.adapters.ccxt_account_initialization import (
     AccountInitializationConfig,
     AccountPositionMode as AccountPositionMode,
@@ -30,6 +20,7 @@ from src.core.adapters.ccxt_account_initialization import (
 from src.core.interfaces.exchange import (
     ExchangeOrderSnapshot,
     ExchangeError,
+    ExchangeUserStreamUnsupported,
     IExchangeAdapter,
     InsufficientFundsError,
     NetworkError,
@@ -52,8 +43,8 @@ logger = logging.getLogger(__name__)
 class CcxtExchangeAdapter(IExchangeAdapter):
     """Universal exchange adapter via CCXT.
 
-    Supports any CCXT-compatible exchange (Binance, Bybit, Backpack, etc.)
-    through a single implementation.
+    Supports provider-neutral CCXT transport and account operations. Concrete
+    venue policy belongs to venue-owned subclasses or composition owners.
     """
 
     def __init__(
@@ -103,18 +94,21 @@ class CcxtExchangeAdapter(IExchangeAdapter):
         if order_type == "limit":
             params["timeInForce"] = "GTC"
         intent_payload = getattr(order, "intent_payload", None)
-        if isinstance(intent_payload, dict) and intent_payload.get("reduce_only") is True:
+        if (
+            isinstance(intent_payload, dict)
+            and intent_payload.get("reduce_only") is True
+        ):
             params["reduceOnly"] = True
         client_order_id = getattr(order, "client_order_id", None)
         if client_order_id:
-            exchange_client_order_id = to_exchange_format(client_order_id, self.exchange_id)
+            exchange_client_order_id = to_exchange_format(
+                client_order_id, self.exchange_id
+            )
             params.update(
-                binance_submission_client_order_id_params(
-                    self.exchange_id,
-                    order.type,
+                self._submission_client_order_id_params(
                     exchange_client_order_id,
+                    getattr(order, "type", None),
                 )
-                or {"clientOrderId": exchange_client_order_id}
             )
 
         try:
@@ -145,15 +139,19 @@ class CcxtExchangeAdapter(IExchangeAdapter):
 
     _SUPPORTED_PLAIN_ORDER_TYPES = frozenset({"market", "limit"})
 
+    def _submission_client_order_id_params(
+        self,
+        exchange_client_order_id: str,
+        order_type: Optional[str],
+    ) -> dict:
+        return {"clientOrderId": exchange_client_order_id}
+
     def _ccxt_order_type_and_params(self, order: Order) -> tuple[str, dict]:
-        order_type = (order.type or "").lower()
-        conditional = binance_conditional_order_mapping(
-            self.exchange_id,
-            order_type,
-            order.trigger_price,
-        )
-        if conditional is not None:
-            return conditional
+        order_type = (getattr(order, "type", None) or "").lower()
+        if order_type in {"stop_loss", "take_profit"}:
+            raise ExchangeError(
+                f"conditional_order_mapping_unsupported: exchange={self.exchange_id}"
+            )
         if order_type == "trailing_stop":
             raise ExchangeError(
                 f"trailing_stop_mapping_unsupported: exchange={self.exchange_id}"
@@ -176,7 +174,9 @@ class CcxtExchangeAdapter(IExchangeAdapter):
         try:
             markets = self.client.load_markets()
         except ccxt.BaseError as e:
-            raise ExchangeError(f"Failed to load market rules for {product_id}: {e}") from e
+            raise ExchangeError(
+                f"Failed to load market rules for {product_id}: {e}"
+            ) from e
         market = markets.get(ccxt_symbol) if isinstance(markets, dict) else None
         if market is None:
             raise ExchangeError(
@@ -307,9 +307,7 @@ class CcxtExchangeAdapter(IExchangeAdapter):
         try:
             ticker = self.client.fetch_ticker(ccxt_symbol)
         except ccxt.BaseError as exc:
-            raise ExchangeError(
-                f"market_reference_price_unavailable: {exc}"
-            ) from exc
+            raise ExchangeError(f"market_reference_price_unavailable: {exc}") from exc
 
         side = order.side.lower()
         if side not in {"buy", "sell"}:
@@ -330,8 +328,9 @@ class CcxtExchangeAdapter(IExchangeAdapter):
     ) -> bool:
         ccxt_symbol = to_ccxt_symbol(product_id)
         try:
-            if uses_binance_algo_order_endpoints(self.exchange_id, order_type):
-                self.client.cancel_order(order_id, ccxt_symbol, params={"trigger": True})
+            params = self._cancel_order_params(order_type)
+            if params is not None:
+                self.client.cancel_order(order_id, ccxt_symbol, params=params)
             else:
                 self.client.cancel_order(order_id, ccxt_symbol)
             return True
@@ -341,6 +340,9 @@ class CcxtExchangeAdapter(IExchangeAdapter):
         except ccxt.BaseError as e:
             self.logger.error("Failed to cancel order %s: %s", order_id, e)
             return False
+
+    def _cancel_order_params(self, order_type: Optional[str]) -> dict | None:
+        return None
 
     def cancel_order_by_client_id(
         self,
@@ -353,7 +355,9 @@ class CcxtExchangeAdapter(IExchangeAdapter):
         exchange_client_order_id = to_exchange_format(client_order_id, self.exchange_id)
         params = self._client_order_id_params(exchange_client_order_id, order_type)
         try:
-            self.client.cancel_order(exchange_client_order_id, ccxt_symbol, params=params)
+            self.client.cancel_order(
+                exchange_client_order_id, ccxt_symbol, params=params
+            )
             return True
         except ccxt.OrderNotFound:
             self.logger.warning(
@@ -374,11 +378,7 @@ class CcxtExchangeAdapter(IExchangeAdapter):
         exchange_client_order_id: str,
         order_type: Optional[str],
     ) -> dict:
-        return binance_lookup_client_order_id_params(
-            self.exchange_id,
-            order_type,
-            exchange_client_order_id,
-        ) or {"clientOrderId": exchange_client_order_id}
+        return {"clientOrderId": exchange_client_order_id}
 
     def get_order_by_client_id(
         self,
@@ -420,7 +420,9 @@ class CcxtExchangeAdapter(IExchangeAdapter):
                 average_price = Decimal(str(cost)) / filled_decimal
         return ExchangeOrderSnapshot(
             client_order_id=client_order_id,
-            exchange_order_id=str(exchange_order_id) if exchange_order_id is not None else None,
+            exchange_order_id=str(exchange_order_id)
+            if exchange_order_id is not None
+            else None,
             status=str(status),
             filled_quantity=(
                 Decimal(str(filled_quantity)) if filled_quantity is not None else None
@@ -428,19 +430,23 @@ class CcxtExchangeAdapter(IExchangeAdapter):
             average_price=(
                 average_price
                 if isinstance(average_price, Decimal)
-                else Decimal(str(average_price)) if average_price is not None else None
+                else Decimal(str(average_price))
+                if average_price is not None
+                else None
             ),
             fee=Decimal(str(fee_cost)) if fee_cost is not None else None,
             raw=response,
         )
 
     def create_user_stream_listen_key(self) -> str:
-        """Create a user-data stream listen key when supported."""
-        return create_binance_user_stream_listen_key(self.exchange_id, self.client)
+        raise ExchangeUserStreamUnsupported(
+            f"user_stream_listen_key_unsupported: exchange={self.exchange_id}"
+        )
 
     def keepalive_user_stream(self, listen_key: str) -> None:
-        """Refresh an existing user-data stream listen key when supported."""
-        keepalive_binance_user_stream(self.exchange_id, self.client, listen_key)
+        raise ExchangeUserStreamUnsupported(
+            f"user_stream_keepalive_unsupported: exchange={self.exchange_id}"
+        )
 
     def get_balance(self, asset: str) -> Decimal:
         try:

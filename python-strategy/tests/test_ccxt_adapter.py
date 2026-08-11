@@ -97,20 +97,36 @@ def mock_ccxt_client():
 
 @pytest.fixture
 def adapter(mock_ccxt_client):
-    """CcxtExchangeAdapter with a mocked CCXT client injected."""
+    """LiveBinanceAdapter with a mocked CCXT client injected."""
     with patch("src.core.adapters.ccxt_adapter.ccxt") as mock_ccxt:
         mock_exchange_cls = MagicMock(return_value=mock_ccxt_client)
         mock_ccxt.binance = mock_exchange_cls
         setattr(mock_ccxt, "binance", mock_exchange_cls)
-        a = CcxtExchangeAdapter(
-            exchange_id="binance",
+        a = LiveBinanceAdapter(
             api_key="test-key",
             secret="test-secret",
             testnet=True,
+            enable_ws=False,
         )
     # Ensure client is our mock
     a.client = mock_ccxt_client
     return a
+
+
+@pytest.fixture
+def generic_adapter(mock_ccxt_client):
+    """Non-Binance CCXT adapter with the same mocked transport."""
+    with patch("src.core.adapters.ccxt_adapter.ccxt") as mock_ccxt:
+        mock_exchange_cls = MagicMock(return_value=mock_ccxt_client)
+        setattr(mock_ccxt, "bybit", mock_exchange_cls)
+        adapter = CcxtExchangeAdapter(
+            exchange_id="bybit",
+            api_key="test-key",
+            secret="test-secret",
+            testnet=True,
+        )
+    adapter.client = mock_ccxt_client
+    return adapter
 
 
 # ---------------------------------------------------------------------------
@@ -203,9 +219,8 @@ class TestPlaceOrder:
         )
 
     def test_non_binance_protective_order_mapping_fails_closed(
-        self, adapter, mock_ccxt_client
+        self, generic_adapter, mock_ccxt_client
     ):
-        adapter.exchange_id = "bybit"
         order = _make_order(
             product_id="BYBIT:BTCUSDT-PERP",
             side="sell",
@@ -214,15 +229,16 @@ class TestPlaceOrder:
             trigger_price=Decimal("41000"),
         )
 
-        with pytest.raises(ExchangeError, match="conditional_order_mapping_unsupported"):
-            adapter.place_order(order)
+        with pytest.raises(
+            ExchangeError, match="conditional_order_mapping_unsupported"
+        ):
+            generic_adapter.place_order(order)
 
         mock_ccxt_client.create_order.assert_not_called()
 
     def test_validate_order_rejects_unsupported_protective_mapping_before_submit(
-        self, adapter, mock_ccxt_client
+        self, generic_adapter, mock_ccxt_client
     ):
-        adapter.exchange_id = "bybit"
         order = _make_order(
             product_id="BYBIT:BTCUSDT-PERP",
             side="sell",
@@ -231,8 +247,10 @@ class TestPlaceOrder:
             trigger_price=Decimal("43000"),
         )
 
-        with pytest.raises(ExchangeError, match="conditional_order_mapping_unsupported"):
-            adapter.validate_order(order)
+        with pytest.raises(
+            ExchangeError, match="conditional_order_mapping_unsupported"
+        ):
+            generic_adapter.validate_order(order)
 
         mock_ccxt_client.create_order.assert_not_called()
 
