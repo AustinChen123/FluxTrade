@@ -301,12 +301,248 @@ def test_non_rithmic_config_never_calls_rithmic_owner(monkeypatch, mode) -> None
     owner.assert_not_called()
 
 
+def test_simulated_config_never_calls_ccxt_credential_owner(monkeypatch) -> None:
+    owner = MagicMock(side_effect=AssertionError("CCXT credential owner called"))
+    rithmic_owner = MagicMock(side_effect=AssertionError("Rithmic owner called"))
+    monkeypatch.setattr(
+        strategy_main,
+        "build_ccxt_live_credentials",
+        owner,
+        raising=False,
+    )
+    monkeypatch.setattr(
+        strategy_main,
+        "build_rithmic_live_adapter_config",
+        rithmic_owner,
+        raising=False,
+    )
+    monkeypatch.delenv("FLUXTRADE_ENVIRONMENT", raising=False)
+    monkeypatch.setenv("ADAPTER_MODE", "simulated")
+
+    assert strategy_main._adapter_config_from_env() == {"mode": "simulated"}
+    owner.assert_not_called()
+    rithmic_owner.assert_not_called()
+
+
+@pytest.mark.parametrize("enable_ws", ["true", "enabled"])
+def test_rithmic_config_never_calls_ccxt_credential_owner(
+    monkeypatch,
+    enable_ws,
+) -> None:
+    _set_live_rithmic_env(monkeypatch)
+    monkeypatch.setenv("EXCHANGE_ENABLE_WS", enable_ws)
+    owner = MagicMock(side_effect=AssertionError("CCXT credential owner called"))
+    rithmic_result = {
+        "rithmic_profile": "orders",
+        "account_id": "ACCOUNT",
+        "rithmic_instruments": {
+            "RITHMIC:NQ-202609": {
+                "exchange": "CME",
+                "quantity_step": "1",
+                "price_tick": "0.25",
+            }
+        },
+        "rithmic_recovery_profile": "orders",
+        "rithmic_recovery_account_id": "ACCOUNT",
+    }
+    rithmic_owner = MagicMock(return_value=rithmic_result)
+    monkeypatch.setattr(
+        strategy_main,
+        "build_ccxt_live_credentials",
+        owner,
+        raising=False,
+    )
+    monkeypatch.setattr(
+        strategy_main,
+        "build_rithmic_live_adapter_config",
+        rithmic_owner,
+        raising=False,
+    )
+
+    if enable_ws == "enabled":
+        with pytest.raises(
+            ValueError,
+            match="EXCHANGE_ENABLE_WS must be a boolean",
+        ):
+            strategy_main._adapter_config_from_env()
+    else:
+        config = strategy_main._adapter_config_from_env()
+        assert config == {
+            "mode": "live",
+            "exchange": "rithmic",
+            "enable_ws": True,
+            "instrument_product_ids": ["RITHMIC:NQ-202609"],
+            "account_initialization": {
+                "product_ids": ["RITHMIC:NQ-202609"],
+                "position_mode": "one_way",
+            },
+            "rithmic_profile": "orders",
+            "account_id": "ACCOUNT",
+            "rithmic_instruments": {
+                "RITHMIC:NQ-202609": {
+                    "exchange": "CME",
+                    "quantity_step": "1",
+                    "price_tick": "0.25",
+                }
+            },
+            "rithmic_recovery_profile": "orders",
+            "rithmic_recovery_account_id": "ACCOUNT",
+        }
+        rithmic_owner.assert_called_once()
+        assert (
+            rithmic_owner.call_args.kwargs["product_ids"]
+            is config["instrument_product_ids"]
+        )
+        assert (
+            config["instrument_product_ids"]
+            is config["account_initialization"]["product_ids"]
+        )
+
+    owner.assert_not_called()
+    if enable_ws == "enabled":
+        rithmic_owner.assert_not_called()
+
+
+@pytest.mark.parametrize(
+    ("exchange", "product_id"),
+    [
+        ("binance", "BINANCE:BTCUSDT-PERP"),
+        ("bybit", "BYBIT:BTCUSDT-PERP"),
+    ],
+)
+def test_non_rithmic_live_config_delegates_to_ccxt_owner_once(
+    monkeypatch,
+    exchange,
+    product_id,
+) -> None:
+    _set_live_ccxt_env(monkeypatch)
+    monkeypatch.setenv("EXCHANGE_ID", exchange)
+    monkeypatch.setenv("INSTRUMENT_PRODUCT_IDS", product_id)
+    products = [product_id]
+    monkeypatch.setattr(strategy_main, "_env_csv", lambda _name: products)
+    owner_result = {"api_key": object(), "secret": object(), "testnet": object()}
+    owner = MagicMock(return_value=owner_result)
+    rithmic_owner = MagicMock(side_effect=AssertionError("Rithmic owner called"))
+    monkeypatch.setattr(
+        strategy_main,
+        "build_ccxt_live_credentials",
+        owner,
+        raising=False,
+    )
+    monkeypatch.setattr(
+        strategy_main,
+        "build_rithmic_live_adapter_config",
+        rithmic_owner,
+        raising=False,
+    )
+
+    config = strategy_main._adapter_config_from_env()
+
+    owner.assert_called_once_with(strategy_main.os.environ)
+    assert {name: config[name] for name in owner_result} == owner_result
+    assert config["instrument_product_ids"] is products
+    assert config["account_initialization"]["product_ids"] is products
+    rithmic_owner.assert_not_called()
+
+
+def test_ccxt_credential_owner_failure_precedes_audit_and_initialization(
+    monkeypatch,
+) -> None:
+    _set_live_ccxt_env(monkeypatch)
+    sentinel = RuntimeError("ccxt-credential-owner-sentinel")
+    owner = MagicMock(side_effect=sentinel)
+    audit_reader = MagicMock(side_effect=AssertionError("audit read"))
+    initialization = _forbid_runtime_initialization(monkeypatch)
+    monkeypatch.setattr(
+        strategy_main,
+        "build_ccxt_live_credentials",
+        owner,
+        raising=False,
+    )
+    monkeypatch.setattr(strategy_main, "_required_env_flag", audit_reader)
+
+    with pytest.raises(RuntimeError) as raised:
+        strategy_main.main()
+
+    assert raised.value is sentinel
+    owner.assert_called_once_with(strategy_main.os.environ)
+    audit_reader.assert_not_called()
+    _assert_initialization_not_called(initialization)
+
+
+def test_ambiguous_websocket_precedes_ccxt_credential_owner(monkeypatch) -> None:
+    _set_live_ccxt_env(monkeypatch)
+    monkeypatch.setenv("EXCHANGE_ENABLE_WS", "enabled")
+    owner = MagicMock(side_effect=AssertionError("CCXT credential owner called"))
+    monkeypatch.setattr(
+        strategy_main,
+        "build_ccxt_live_credentials",
+        owner,
+        raising=False,
+    )
+
+    with pytest.raises(ValueError) as raised:
+        strategy_main._adapter_config_from_env()
+
+    assert raised.value.args == ("EXCHANGE_ENABLE_WS must be a boolean",)
+    owner.assert_not_called()
+
+
+@pytest.mark.parametrize("raw", [None, "", "   ", "hedge"])
+def test_account_position_mode_preserves_existing_truthiness(
+    monkeypatch,
+    raw,
+) -> None:
+    _set_live_ccxt_env(monkeypatch)
+    if raw is None:
+        monkeypatch.delenv("ACCOUNT_POSITION_MODE", raising=False)
+        expected = "one_way"
+    else:
+        monkeypatch.setenv("ACCOUNT_POSITION_MODE", raw)
+        expected = raw
+
+    config = strategy_main._adapter_config_from_env()
+
+    assert config["account_initialization"]["position_mode"] == expected
+
+
+@pytest.mark.parametrize("name", ["ACCOUNT_LEVERAGE", "ACCOUNT_MARGIN_MODE"])
+@pytest.mark.parametrize("raw", [None, "", "   ", "normal"])
+def test_optional_account_fields_preserve_raw_truthiness(
+    monkeypatch,
+    name,
+    raw,
+) -> None:
+    _set_live_ccxt_env(monkeypatch)
+    if raw is None:
+        monkeypatch.delenv(name, raising=False)
+    else:
+        monkeypatch.setenv(name, raw)
+
+    account = strategy_main._adapter_config_from_env()["account_initialization"]
+    field = "leverage" if name == "ACCOUNT_LEVERAGE" else "margin_mode"
+    if raw in {None, ""}:
+        assert field not in account
+    else:
+        assert account[field] == raw
+
+
+def test_generic_main_has_one_ccxt_credential_policy_entrypoint() -> None:
+    source = inspect.getsource(strategy_main._adapter_config_from_env)
+
+    assert source.count("build_ccxt_live_credentials(") == 1
+    assert "EXCHANGE_API_KEY" not in source
+    assert "EXCHANGE_SECRET" not in source
+    assert "EXCHANGE_TESTNET" not in source
+
+
 def test_common_product_failure_precedes_rithmic_owner_and_audit_reader(
     monkeypatch,
 ) -> None:
     _set_live_rithmic_env(monkeypatch)
     monkeypatch.setenv("INSTRUMENT_PRODUCT_IDS", "BINANCE:BTCUSDT-PERP")
     owner = MagicMock(side_effect=AssertionError("Rithmic owner called"))
+    ccxt_owner = MagicMock(side_effect=AssertionError("CCXT owner called"))
     audit_reader = MagicMock(side_effect=AssertionError("audit read"))
     initialization = _forbid_runtime_initialization(monkeypatch)
     monkeypatch.setattr(
@@ -315,12 +551,19 @@ def test_common_product_failure_precedes_rithmic_owner_and_audit_reader(
         owner,
         raising=False,
     )
+    monkeypatch.setattr(
+        strategy_main,
+        "build_ccxt_live_credentials",
+        ccxt_owner,
+        raising=False,
+    )
     monkeypatch.setattr(strategy_main, "_required_env_flag", audit_reader)
 
     with pytest.raises(ValueError, match="must use RITHMIC venue"):
         strategy_main.main()
 
     owner.assert_not_called()
+    ccxt_owner.assert_not_called()
     audit_reader.assert_not_called()
     _assert_initialization_not_called(initialization)
 

@@ -19,6 +19,7 @@ from src.core.db import SessionLocal
 from src.core.clock import RealtimeClock
 from src.core.metrics import configure_metrics
 from src.core.product_registry import to_exchange_name
+from src.core.adapters.ccxt_live_credentials import build_ccxt_live_credentials
 from src.core.adapters.rithmic_live_config import (
     build_rithmic_live_adapter_config,
     validate_rithmic_recovery_identity,
@@ -172,13 +173,7 @@ def _adapter_config_from_env() -> dict:
         "account_initialization": account_initialization,
     }
     if exchange != "rithmic":
-        config.update(
-            {
-                "api_key": _required_env("EXCHANGE_API_KEY"),
-                "secret": _required_env("EXCHANGE_SECRET"),
-                "testnet": _required_env_flag("EXCHANGE_TESTNET"),
-            }
-        )
+        config.update(build_ccxt_live_credentials(os.environ))
         return config
 
     config.update(
