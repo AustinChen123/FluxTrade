@@ -89,9 +89,9 @@ def test_bybit_owner_has_only_shared_ccxt_dependency() -> None:
         (
             {
                 "mode": "live",
-                "exchange": "okx",
-                "api_key": "okx-key",
-                "secret": "okx-secret",
+                "exchange": "kraken",
+                "api_key": "kraken-key",
+                "secret": "kraken-secret",
                 "testnet": False,
                 "extra_config": {"recvWindow": 5_000},
             },
