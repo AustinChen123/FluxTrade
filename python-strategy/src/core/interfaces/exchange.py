@@ -87,6 +87,15 @@ class IExchangeAdapter(ABC):
         """Build a venue-owned runtime gate when this adapter requires one."""
         return None
 
+    def exit_authoritative_position(
+        self,
+        product_id: str,
+        *,
+        account_id: str,
+    ) -> bool:
+        """Exit a provider-authoritative position when the adapter supports it."""
+        raise ExchangeError("adapter_authoritative_position_exit_unsupported")
+
     @abstractmethod
     def place_order(self, order: Order) -> str:
         """

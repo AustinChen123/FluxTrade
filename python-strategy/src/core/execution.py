@@ -1219,21 +1219,11 @@ class ExecutionEngine:
         account_id: str,
     ) -> bool:
         """Exit one server-side position without deriving side or quantity locally."""
-        if (
-            getattr(self.adapter, "authoritative_position_exit_authority", None)
-            != "rithmic_exit_position"
-        ):
-            raise ExchangeError("adapter_authoritative_position_exit_unsupported")
-        adapter_account_id = str(getattr(self.adapter, "account_id", "")).strip()
-        if adapter_account_id != account_id.strip():
-            raise ExchangeError("authoritative_position_exit_account_mismatch")
-        exit_position = getattr(self.adapter, "exit_position", None)
-        if not callable(exit_position):
-            raise ExchangeError("adapter_authoritative_position_exit_unavailable")
         self._assert_external_operation_allowed()
-        if not exit_position(product_id):
-            raise ExchangeError("authoritative_position_exit_returned_false")
-        return True
+        return self.adapter.exit_authoritative_position(
+            product_id,
+            account_id=account_id,
+        )
 
     def _active_flatten_order(self, product_id: str):
         active_statuses = {

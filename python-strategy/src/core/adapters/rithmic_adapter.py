@@ -44,7 +44,6 @@ from src.core.product_registry import (
 class RithmicExchangeAdapter(IExchangeAdapter):
     """Rithmic ORDER adapter with explicit startup after ledger recovery."""
 
-    authoritative_position_exit_authority = "rithmic_exit_position"
     requires_runtime_capabilities = True
 
     def __init__(
@@ -424,6 +423,19 @@ class RithmicExchangeAdapter(IExchangeAdapter):
                 "rithmic_exit_position_failed",
                 error,
             ) from error
+
+    def exit_authoritative_position(
+        self,
+        product_id: str,
+        *,
+        account_id: str,
+    ) -> bool:
+        """Exit this adapter account's server-side position."""
+        if self.account_id.strip() != account_id.strip():
+            raise ExchangeError("authoritative_position_exit_account_mismatch")
+        if not self.exit_position(product_id):
+            raise ExchangeError("authoritative_position_exit_returned_false")
+        return True
 
     def positions_from_ledger_snapshot(self, snapshot) -> list[Position]:
         """Convert one authoritative account snapshot into configured positions."""

@@ -153,6 +153,43 @@ def test_exit_position_uses_native_instrument_identity(adapter, client):
     assert adapter.configured_product_ids == (PRODUCT_ID,)
 
 
+def test_authoritative_position_exit_owns_account_identity_and_native_result(
+    adapter,
+    client,
+):
+    adapter.start_order_event_stream()
+
+    assert (
+        adapter.exit_authoritative_position(
+            PRODUCT_ID,
+            account_id=" ACCOUNT ",
+        )
+        is True
+    )
+
+    client.exit_position.assert_called_once_with("CME", "NQU6")
+
+
+def test_authoritative_position_exit_rejects_account_mismatch_before_native_io(
+    adapter,
+    client,
+):
+    adapter.start_order_event_stream()
+
+    with pytest.raises(ExchangeError, match="account_mismatch"):
+        adapter.exit_authoritative_position(PRODUCT_ID, account_id="OTHER")
+
+    client.exit_position.assert_not_called()
+
+
+def test_authoritative_position_exit_rejects_false_native_result(adapter, client):
+    adapter.start_order_event_stream()
+    client.exit_position.return_value = False
+
+    with pytest.raises(ExchangeError, match="returned_false"):
+        adapter.exit_authoritative_position(PRODUCT_ID, account_id="ACCOUNT")
+
+
 def test_exit_position_maps_ambiguous_runtime_failure(adapter, client):
     adapter.start_order_event_stream()
     client.exit_position.side_effect = RuntimeError(
@@ -161,6 +198,17 @@ def test_exit_position_maps_ambiguous_runtime_failure(adapter, client):
 
     with pytest.raises(NetworkError, match="rithmic_exit_position_failed"):
         adapter.exit_position(PRODUCT_ID)
+
+
+def test_authoritative_position_exit_preserves_native_failure(adapter, client):
+    adapter.start_order_event_stream()
+    failure = NetworkError("native_exit_failed")
+    adapter.exit_position = Mock(side_effect=failure)
+
+    with pytest.raises(NetworkError) as raised:
+        adapter.exit_authoritative_position(PRODUCT_ID, account_id="ACCOUNT")
+
+    assert raised.value is failure
 
 
 @pytest.mark.parametrize(

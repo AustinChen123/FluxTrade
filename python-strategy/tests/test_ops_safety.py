@@ -13,6 +13,7 @@ from __future__ import annotations
 
 from contextlib import contextmanager
 from decimal import Decimal
+import inspect
 import threading
 import time
 from unittest.mock import MagicMock, patch
@@ -815,37 +816,41 @@ class TestFlattenPosition:
         mock_exchange_adapter,
         mock_order_repo,
     ):
-        mock_exchange_adapter.account_id = "ACCOUNT"
-        mock_exchange_adapter.authoritative_position_exit_authority = (
-            "rithmic_exit_position"
+        calls = []
+        eng._operation_guard = MagicMock(side_effect=lambda: calls.append("guard"))
+        mock_exchange_adapter.exit_authoritative_position = MagicMock(
+            side_effect=lambda *_args, **_kwargs: calls.append("adapter") or True
         )
-        mock_exchange_adapter.exit_position = MagicMock(return_value=True)
 
-        assert eng.exit_authoritative_position(
+        assert (
+            eng.exit_authoritative_position(
+                PRODUCT_ID,
+                account_id="ACCOUNT",
+            )
+            is True
+        )
+
+        mock_exchange_adapter.exit_authoritative_position.assert_called_once_with(
             PRODUCT_ID,
             account_id="ACCOUNT",
-        ) is True
-
-        mock_exchange_adapter.exit_position.assert_called_once_with(PRODUCT_ID)
+        )
+        assert calls == ["guard", "adapter"]
         assert mock_order_repo.orders == {}
 
-    def test_authoritative_exit_rejects_account_mismatch(
+    def test_authoritative_exit_checks_operation_fence_before_adapter(
         self,
         eng,
         mock_exchange_adapter,
         mock_order_repo,
     ):
-        mock_exchange_adapter.account_id = "OTHER"
-        mock_exchange_adapter.authoritative_position_exit_authority = (
-            "rithmic_exit_position"
-        )
-        mock_exchange_adapter.exit_position = MagicMock()
+        eng._operation_guard = MagicMock(side_effect=RuntimeError("lease_lost"))
+        mock_exchange_adapter.exit_authoritative_position = MagicMock()
 
-        with pytest.raises(ExchangeError, match="account_mismatch"):
+        with pytest.raises(ExchangeError, match="external_operation_fenced"):
             eng.exit_authoritative_position(PRODUCT_ID, account_id="ACCOUNT")
 
         assert mock_order_repo.orders == {}
-        mock_exchange_adapter.exit_position.assert_not_called()
+        mock_exchange_adapter.exit_authoritative_position.assert_not_called()
 
     def test_authoritative_exit_requires_explicit_adapter_capability(
         self,
@@ -860,19 +865,11 @@ class TestFlattenPosition:
 
         assert mock_order_repo.orders == {}
 
-    def test_authoritative_exit_rejects_false_adapter_result(
-        self,
-        eng,
-        mock_exchange_adapter,
-    ):
-        mock_exchange_adapter.account_id = "ACCOUNT"
-        mock_exchange_adapter.authoritative_position_exit_authority = (
-            "rithmic_exit_position"
-        )
-        mock_exchange_adapter.exit_position = MagicMock(return_value=False)
+    def test_authoritative_exit_facade_contains_no_provider_authority_marker(self):
+        source = inspect.getsource(ExecutionEngine.exit_authoritative_position)
 
-        with pytest.raises(ExchangeError, match="returned_false"):
-            eng.exit_authoritative_position(PRODUCT_ID, account_id="ACCOUNT")
+        assert "authoritative_position_exit_authority" not in source
+        assert "rithmic_exit_position" not in source
 
     def test_flatten_persists_and_submits_validated_quantity(
         self, eng, mock_order_repo
