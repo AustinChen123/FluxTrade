@@ -28,6 +28,8 @@ from src.core.interfaces.exchange import (
     ExchangeOrderSnapshot,
     IExchangeAdapter,
     NetworkError,
+    OwnedOrderReconciliationContext,
+    OwnedOrderReconciler,
 )
 from src.core.models import Position
 from src.core.orm_models import Order
@@ -120,6 +122,21 @@ class RithmicExchangeAdapter(IExchangeAdapter):
         return RithmicPublisherLivenessGate.for_environment(
             environment,
             logger=logger,
+        )
+
+    def create_owned_order_reconciler(
+        self,
+        context: OwnedOrderReconciliationContext,
+    ) -> OwnedOrderReconciler:
+        from src.core.adapters.rithmic_owned_order_reconciliation import (
+            RithmicOwnedOrderReconciler,
+        )
+
+        return RithmicOwnedOrderReconciler(
+            adapter=self,
+            profile=self.profile,
+            account_id=self.account_id,
+            context=context,
         )
 
     def start_order_event_stream(self) -> None:

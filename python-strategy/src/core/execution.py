@@ -202,17 +202,9 @@ class ExecutionEngine:
     def reconcile_recoverable_client_orders(self) -> dict:
         return self._order_reconciler.reconcile_recoverable_client_orders()
 
-    def reconcile_rithmic_owned_orders(
-        self,
-        profile: str,
-        account_id: str | None = None,
-        *,
-        snapshot_loader=None,
-    ) -> dict[str, object]:
-        return self._order_reconciler.reconcile_rithmic_owned_orders(
-            profile,
-            account_id,
-            snapshot_loader=snapshot_loader,
+    def reconcile_owned_orders(self, *, snapshot_loader=None) -> dict[str, object]:
+        return self._order_reconciler.reconcile_owned_orders(
+            snapshot_loader=snapshot_loader
         )
 
     def portfolio_exposure_snapshot(

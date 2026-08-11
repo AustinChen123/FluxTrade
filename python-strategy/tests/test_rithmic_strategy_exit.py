@@ -87,9 +87,7 @@ def _service() -> tuple[RithmicStrategyExitService, SimpleNamespace]:
     execution_engine.clock.now.return_value = 1_704_067_200
     execution_engine.list_recoverable_client_orders.return_value = []
     execution_engine.order_manager.repo.list_orders_by_statuses.return_value = []
-    execution_engine.reconcile_rithmic_owned_orders.return_value = {
-        "auto_resume_safe": True
-    }
+    execution_engine.reconcile_owned_orders.return_value = {"auto_resume_safe": True}
     account_service = MagicMock()
     dependencies = SimpleNamespace(
         adapter=adapter,
@@ -180,7 +178,7 @@ def test_stop_timeout_prohibits_money_path_and_replacement_worker() -> None:
         service.execute(_signal(), _decision())
 
     dependencies.execution_engine.order_manager.repo.list_orders_by_statuses.assert_not_called()
-    dependencies.execution_engine.reconcile_rithmic_owned_orders.assert_not_called()
+    dependencies.execution_engine.reconcile_owned_orders.assert_not_called()
     dependencies.execution_engine.exit_authoritative_position.assert_not_called()
     dependencies.account_service.replace_positions_for_products.assert_not_called()
     dependencies.assert_leadership.assert_not_called()
@@ -260,7 +258,7 @@ def test_success_preserves_exact_money_path_order(
         lambda *_args, **_kwargs: trace.append("cancel") or True
     )
     dependencies.adapter.close.side_effect = lambda: trace.append("close")
-    dependencies.execution_engine.reconcile_rithmic_owned_orders.side_effect = (
+    dependencies.execution_engine.reconcile_owned_orders.side_effect = (
         lambda *_args, **_kwargs: trace.append("reconcile")
         or {"auto_resume_safe": True}
     )
@@ -473,7 +471,7 @@ def test_preflight_failures_prevent_native_exit(failure: str) -> None:
         orders=[_working_order()] if failure == "working_order" else [],
     )
     if failure == "unsafe_reconciliation":
-        dependencies.execution_engine.reconcile_rithmic_owned_orders.return_value = {
+        dependencies.execution_engine.reconcile_owned_orders.return_value = {
             "auto_resume_safe": False
         }
 
@@ -532,13 +530,11 @@ def test_verification_runs_all_six_attempts_before_failing(remaining: str) -> No
 
     assert loader.call_count == 7
     if remaining == "working_order":
-        dependencies.execution_engine.reconcile_rithmic_owned_orders.assert_called_once()
+        dependencies.execution_engine.reconcile_owned_orders.assert_called_once()
         dependencies.account_service.replace_positions_for_products.assert_called_once()
         dependencies.execution_engine.exit_authoritative_position.assert_not_called()
     else:
-        assert (
-            dependencies.execution_engine.reconcile_rithmic_owned_orders.call_count == 7
-        )
+        assert dependencies.execution_engine.reconcile_owned_orders.call_count == 7
         assert (
             dependencies.account_service.replace_positions_for_products.call_count == 7
         )
@@ -579,9 +575,7 @@ def test_body_primary_and_finalizer_failure_precedence(
     primary = RuntimeError("body-primary")
     finalizer = RuntimeError("finalizer-failure")
     if body_primary:
-        dependencies.execution_engine.reconcile_rithmic_owned_orders.side_effect = (
-            primary
-        )
+        dependencies.execution_engine.reconcile_owned_orders.side_effect = primary
         leadership_calls_before_finalizer = 1
     else:
         leadership_calls_before_finalizer = 4

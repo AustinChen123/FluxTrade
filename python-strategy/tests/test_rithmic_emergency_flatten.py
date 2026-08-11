@@ -52,9 +52,7 @@ def _owner(*, stop=True, restart_error=None, run_when=None):
     execution_engine = MagicMock()
     execution_engine.clock.now.return_value = 1_700_000_000.0
     execution_engine.list_recoverable_client_orders.return_value = []
-    execution_engine.reconcile_rithmic_owned_orders.return_value = {
-        "auto_resume_safe": True
-    }
+    execution_engine.reconcile_owned_orders.return_value = {"auto_resume_safe": True}
     account_service = MagicMock()
     ops_safety = MagicMock()
     stop_current_worker = MagicMock(return_value=stop)
@@ -108,7 +106,7 @@ def test_stop_timeout_audits_without_entering_money_path() -> None:
     owner.stop.assert_called_once_with(timeout=30.0)
     owner.clear.assert_called_once_with()
     owner.ops_safety.kill_switch_with_authoritative_positions.assert_not_called()
-    owner.execution_engine.reconcile_rithmic_owned_orders.assert_not_called()
+    owner.execution_engine.reconcile_owned_orders.assert_not_called()
     owner.adapter.close.assert_not_called()
     owner.adapter.start_order_event_stream.assert_not_called()
     owner.restart.assert_not_called()
@@ -140,7 +138,7 @@ def test_verified_flatten_preserves_full_lifecycle_order() -> None:
     owner.account_service.replace_positions_for_products.side_effect = (
         lambda *_args, **_kwargs: trace.append("publish")
     )
-    owner.execution_engine.reconcile_rithmic_owned_orders.side_effect = (
+    owner.execution_engine.reconcile_owned_orders.side_effect = (
         lambda *_args, **_kwargs: trace.append("reconcile")
         or {"auto_resume_safe": True}
     )
@@ -241,7 +239,7 @@ def test_working_order_verification_uses_all_six_snapshots_without_resubmit() ->
     assert result["authoritative_flatten_verified"] is False
     assert snapshot_loader.call_count == 7
     assert owner.ops_safety.kill_switch_with_authoritative_positions.call_count == 1
-    assert owner.execution_engine.reconcile_rithmic_owned_orders.call_count == 6
+    assert owner.execution_engine.reconcile_owned_orders.call_count == 6
     owner.account_service.replace_positions_for_products.assert_not_called()
 
 
@@ -263,7 +261,7 @@ def test_fresh_residual_positions_allow_at_most_three_submissions() -> None:
     assert result["authoritative_flatten_verified"] is False
     assert snapshot_loader.call_count == 6
     assert owner.ops_safety.kill_switch_with_authoritative_positions.call_count == 3
-    assert owner.execution_engine.reconcile_rithmic_owned_orders.call_count == 6
+    assert owner.execution_engine.reconcile_owned_orders.call_count == 6
 
 
 @pytest.mark.parametrize(

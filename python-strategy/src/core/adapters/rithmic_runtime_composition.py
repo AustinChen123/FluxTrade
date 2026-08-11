@@ -470,10 +470,7 @@ def build_rithmic_runtime_owners(
             profile=profile or "",
             account_id=account_id,
             reconcile_owned_orders=lambda owner_profile, owner_account_id: (
-                execution_engine.reconcile_rithmic_owned_orders(
-                    owner_profile,
-                    owner_account_id,
-                )
+                execution_engine.reconcile_owned_orders()
             ),
             now_seconds=lambda: execution_engine.clock.now(),
             publish_authoritative_balance=lambda **values: (
@@ -491,10 +488,7 @@ def build_rithmic_runtime_owners(
             account_id=account_id,
             audit_external_orders=lambda: execution_engine.audit_external_orders,
             reconcile_owned_orders=lambda owner_profile, owner_account_id: (
-                execution_engine.reconcile_rithmic_owned_orders(
-                    owner_profile,
-                    owner_account_id,
-                )
+                execution_engine.reconcile_owned_orders()
             ),
             publish_authoritative_summary=(
                 ledger_recovery.publish_authoritative_summary
@@ -519,10 +513,7 @@ def build_rithmic_runtime_owners(
             ),
             stop_order_event_stream=callbacks.stop_order_event_stream,
             reconcile_owned_orders=lambda owner_profile, owner_account_id: (
-                execution_engine.reconcile_rithmic_owned_orders(
-                    owner_profile,
-                    owner_account_id,
-                )
+                execution_engine.reconcile_owned_orders()
             ),
             publish_authoritative_summary=(
                 ledger_recovery.publish_authoritative_summary
@@ -586,10 +577,7 @@ def build_rithmic_runtime_owners(
             execution_engine.halt_for_reconcile(**values)
         ),
         reconcile_owned_orders=lambda owner_profile, owner_account_id: (
-            execution_engine.reconcile_rithmic_owned_orders(
-                owner_profile,
-                owner_account_id,
-            )
+            execution_engine.reconcile_owned_orders()
         ),
         publish_authoritative_summary=callbacks.publish_authoritative_summary,
         current_drift_generation=lambda: external_order_drift.current_generation(),

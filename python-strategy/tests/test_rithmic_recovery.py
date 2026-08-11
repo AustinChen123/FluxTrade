@@ -1,3 +1,4 @@
+import logging
 from contextlib import nullcontext
 from decimal import Decimal
 from types import SimpleNamespace
@@ -11,7 +12,10 @@ from src.core.adapters.rithmic_recovery import (
     load_rithmic_recovery_snapshot,
     rithmic_order_may_be_working,
 )
-from src.core.order_reconciliation import OrderReconciler
+from src.core.adapters.rithmic_owned_order_reconciliation import (
+    RithmicOwnedOrderReconciler,
+)
+from src.core.interfaces.exchange import OwnedOrderReconciliationContext
 
 
 SAFE_SNAPSHOT_FAILURES = [
@@ -56,6 +60,38 @@ RAW_SENTINELS = (
     "STATUS_SECRET_123 FCM_ID_SECRET_123 IB_ID_SECRET_123 PROFILE_SECRET_123 "
     "URL_SECRET_123 USER_SECRET_123"
 ).split()
+
+
+def owned_reconciler(
+    *,
+    adapter,
+    order_manager,
+    clock,
+    db_session_factory,
+    process_exchange_order_event,
+    local_positions_loader=None,
+    logger=None,
+    profile="test",
+    account_id="ACCOUNT",
+    **_unused,
+):
+    return RithmicOwnedOrderReconciler(
+        adapter=adapter,
+        profile=profile,
+        account_id=account_id,
+        context=OwnedOrderReconciliationContext(
+            list_recoverable_client_orders=lambda: (
+                order_manager.repo.list_client_orders_by_statuses(
+                    {"NEW", "SUBMITTED_UNCONFIRMED", "SUBMITTED", "PARTIALLY_FILLED"}
+                )
+            ),
+            process_exchange_order_event=process_exchange_order_event,
+            now_seconds=lambda: float(clock.now()),
+            db_session_factory=db_session_factory,
+            local_positions_loader=local_positions_loader,
+            logger=logger or logging.getLogger("OrderReconciler"),
+        ),
+    )
 
 
 def snapshot_failure(exception_type=RuntimeError, **attributes):
@@ -903,7 +939,7 @@ def test_reconciler_applies_owned_event_without_remote_side_effects_and_audits()
     order_manager = SimpleNamespace(repo=repo)
     processor = Mock(return_value={"action": "applied"})
     db = MagicMock()
-    reconciler = OrderReconciler(
+    reconciler = owned_reconciler(
         adapter=MagicMock(),
         order_manager=order_manager,
         clock=SimpleNamespace(now=lambda: 1_700_000_200),
@@ -918,9 +954,7 @@ def test_reconciler_applies_owned_event_without_remote_side_effects_and_audits()
     )
     loader = Mock(return_value=snapshot(orders=[remote_order()]))
 
-    result = reconciler.reconcile_rithmic_owned_orders(
-        "test",
-        "ACCOUNT",
+    result = reconciler.reconcile(
         snapshot_loader=loader,
     )
 
@@ -944,7 +978,7 @@ def test_reconciler_does_not_mutate_when_planned_audit_fails():
     processor = Mock(return_value={"action": "applied"})
     db = MagicMock()
     db.commit.side_effect = RuntimeError("audit unavailable")
-    reconciler = OrderReconciler(
+    reconciler = owned_reconciler(
         adapter=MagicMock(),
         order_manager=SimpleNamespace(repo=repo),
         clock=SimpleNamespace(now=lambda: 1_700_000_200),
@@ -959,9 +993,7 @@ def test_reconciler_does_not_mutate_when_planned_audit_fails():
     )
 
     with pytest.raises(RuntimeError, match="audit unavailable"):
-        reconciler.reconcile_rithmic_owned_orders(
-            "test",
-            "ACCOUNT",
+        reconciler.reconcile(
             snapshot_loader=Mock(return_value=snapshot(orders=[remote_order()])),
         )
 
@@ -976,7 +1008,7 @@ def test_reconciler_leaves_planned_audit_when_completion_audit_fails():
     processor = Mock(return_value={"action": "applied"})
     db = MagicMock()
     db.commit.side_effect = [None, RuntimeError("audit unavailable")]
-    reconciler = OrderReconciler(
+    reconciler = owned_reconciler(
         adapter=MagicMock(),
         order_manager=SimpleNamespace(repo=repo),
         clock=SimpleNamespace(now=lambda: 1_700_000_200),
@@ -991,9 +1023,7 @@ def test_reconciler_leaves_planned_audit_when_completion_audit_fails():
     )
 
     with pytest.raises(RuntimeError, match="audit unavailable"):
-        reconciler.reconcile_rithmic_owned_orders(
-            "test",
-            "ACCOUNT",
+        reconciler.reconcile(
             snapshot_loader=Mock(return_value=snapshot(orders=[remote_order()])),
         )
 
@@ -1015,7 +1045,7 @@ def test_reconciler_snapshot_failure_blocks_every_owned_order_without_mutation(
     repo.list_client_orders_by_statuses.return_value = [order]
     processor = Mock()
     db = MagicMock()
-    reconciler = OrderReconciler(
+    reconciler = owned_reconciler(
         adapter=MagicMock(),
         order_manager=SimpleNamespace(repo=repo),
         clock=SimpleNamespace(now=lambda: 1_700_000_200),
@@ -1031,9 +1061,7 @@ def test_reconciler_snapshot_failure_blocks_every_owned_order_without_mutation(
 
     error = snapshot_failure(stage=stage, stable_error_code=code, safe_cause=cause)
     with caplog.at_level("ERROR", logger="OrderReconciler"):
-        result = reconciler.reconcile_rithmic_owned_orders(
-            "test",
-            "ACCOUNT",
+        result = reconciler.reconcile(
             snapshot_loader=Mock(side_effect=error),
         )
 
@@ -1068,7 +1096,7 @@ def test_reconciler_snapshot_failure_logs_once_when_audit_commit_fails(caplog):
     repo.list_client_orders_by_statuses.return_value = []
     db = MagicMock()
     db.commit.side_effect = RuntimeError("audit unavailable")
-    reconciler = OrderReconciler(
+    reconciler = owned_reconciler(
         adapter=MagicMock(),
         order_manager=SimpleNamespace(repo=repo),
         clock=SimpleNamespace(now=lambda: 1_700_000_200),
@@ -1089,9 +1117,7 @@ def test_reconciler_snapshot_failure_logs_once_when_audit_commit_fails(caplog):
     )
     with caplog.at_level("ERROR", logger="OrderReconciler"):
         with pytest.raises(RuntimeError, match="audit unavailable"):
-            reconciler.reconcile_rithmic_owned_orders(
-                "test", "ACCOUNT", snapshot_loader=Mock(side_effect=error)
-            )
+            reconciler.reconcile(snapshot_loader=Mock(side_effect=error))
 
     assert (
         sum(
@@ -1129,7 +1155,7 @@ def test_reconciler_snapshot_failure_falls_back_atomically(
     repo = MagicMock()
     repo.list_client_orders_by_statuses.return_value = []
     db = MagicMock()
-    reconciler = OrderReconciler(
+    reconciler = owned_reconciler(
         adapter=MagicMock(),
         order_manager=SimpleNamespace(repo=repo),
         clock=SimpleNamespace(now=lambda: 1_700_000_200),
@@ -1154,9 +1180,7 @@ def test_reconciler_snapshot_failure_falls_back_atomically(
     error = snapshot_failure(exception_type, **attributes)
 
     with caplog.at_level("ERROR", logger="OrderReconciler"):
-        result = reconciler.reconcile_rithmic_owned_orders(
-            "test", "ACCOUNT", snapshot_loader=Mock(side_effect=error)
-        )
+        result = reconciler.reconcile(snapshot_loader=Mock(side_effect=error))
 
     expected = (
         "RuntimeError" if exception_type is RuntimeError else "Exception",
@@ -1197,7 +1221,7 @@ def test_reconciler_blocks_untrusted_local_account_identity(
     repo = MagicMock()
     repo.list_client_orders_by_statuses.return_value = [local_order(**order_overrides)]
     loader = Mock(return_value=snapshot())
-    reconciler = OrderReconciler(
+    reconciler = owned_reconciler(
         adapter=MagicMock(),
         order_manager=SimpleNamespace(repo=repo),
         clock=SimpleNamespace(now=lambda: 1_700_000_200),
@@ -1211,9 +1235,7 @@ def test_reconciler_blocks_untrusted_local_account_identity(
         local_positions_loader=lambda: [],
     )
 
-    result = reconciler.reconcile_rithmic_owned_orders(
-        "test",
-        "ACCOUNT",
+    result = reconciler.reconcile(
         snapshot_loader=loader,
     )
 
@@ -1237,7 +1259,7 @@ def test_reconciler_blocks_missing_configured_account_identity(
     repo = MagicMock()
     repo.list_client_orders_by_statuses.return_value = orders
     loader = Mock(return_value=snapshot())
-    reconciler = OrderReconciler(
+    reconciler = owned_reconciler(
         adapter=MagicMock(),
         order_manager=SimpleNamespace(repo=repo),
         clock=SimpleNamespace(now=lambda: 1_700_000_200),
@@ -1249,11 +1271,11 @@ def test_reconciler_blocks_missing_configured_account_identity(
         cancel_protective_order_when_sibling_closed=Mock(),
         cancel_linked_conditional_for_protection_fill=Mock(),
         local_positions_loader=lambda: [],
+        profile=profile,
+        account_id=account_id,
     )
 
-    result = reconciler.reconcile_rithmic_owned_orders(
-        profile,
-        account_id,
+    result = reconciler.reconcile(
         snapshot_loader=loader,
     )
 
@@ -1269,7 +1291,7 @@ def test_reconciler_blocks_entire_mixed_account_identity_batch():
     repo = MagicMock()
     repo.list_client_orders_by_statuses.return_value = [matching, mismatched]
     loader = Mock(return_value=snapshot())
-    reconciler = OrderReconciler(
+    reconciler = owned_reconciler(
         adapter=MagicMock(),
         order_manager=SimpleNamespace(repo=repo),
         clock=SimpleNamespace(now=lambda: 1_700_000_200),
@@ -1283,9 +1305,7 @@ def test_reconciler_blocks_entire_mixed_account_identity_batch():
         local_positions_loader=lambda: [],
     )
 
-    result = reconciler.reconcile_rithmic_owned_orders(
-        "test",
-        "ACCOUNT",
+    result = reconciler.reconcile(
         snapshot_loader=loader,
     )
 
@@ -1303,7 +1323,7 @@ def test_reconciler_checks_remote_exposure_even_without_recoverable_orders():
     repo = MagicMock()
     repo.list_client_orders_by_statuses.return_value = []
     processor = Mock()
-    reconciler = OrderReconciler(
+    reconciler = owned_reconciler(
         adapter=MagicMock(),
         order_manager=SimpleNamespace(repo=repo),
         clock=SimpleNamespace(now=lambda: 1_700_000_200),
@@ -1322,9 +1342,7 @@ def test_reconciler_checks_remote_exposure_even_without_recoverable_orders():
         )
     )
 
-    result = reconciler.reconcile_rithmic_owned_orders(
-        "test",
-        "ACCOUNT",
+    result = reconciler.reconcile(
         snapshot_loader=loader,
     )
 
@@ -1344,7 +1362,7 @@ def test_reconciler_checks_remote_exposure_even_without_recoverable_orders():
 def test_reconciler_blocks_account_mismatch_even_without_recoverable_orders():
     repo = MagicMock()
     repo.list_client_orders_by_statuses.return_value = []
-    reconciler = OrderReconciler(
+    reconciler = owned_reconciler(
         adapter=MagicMock(),
         order_manager=SimpleNamespace(repo=repo),
         clock=SimpleNamespace(now=lambda: 1_700_000_200),
@@ -1360,9 +1378,7 @@ def test_reconciler_blocks_account_mismatch_even_without_recoverable_orders():
     remote_snapshot = snapshot()
     remote_snapshot.account_id = "OTHER"
 
-    result = reconciler.reconcile_rithmic_owned_orders(
-        "test",
-        "ACCOUNT",
+    result = reconciler.reconcile(
         snapshot_loader=Mock(return_value=remote_snapshot),
     )
 
@@ -1374,7 +1390,7 @@ def test_reconciler_blocks_unowned_working_order_without_adopting_it():
     repo = MagicMock()
     repo.list_client_orders_by_statuses.return_value = []
     processor = Mock()
-    reconciler = OrderReconciler(
+    reconciler = owned_reconciler(
         adapter=MagicMock(),
         order_manager=SimpleNamespace(repo=repo),
         clock=SimpleNamespace(now=lambda: 1_700_000_200),
@@ -1388,9 +1404,7 @@ def test_reconciler_blocks_unowned_working_order_without_adopting_it():
         local_positions_loader=lambda: [],
     )
 
-    result = reconciler.reconcile_rithmic_owned_orders(
-        "test",
-        "ACCOUNT",
+    result = reconciler.reconcile(
         snapshot_loader=Mock(return_value=snapshot(orders=[remote_order()])),
     )
 
@@ -1404,7 +1418,7 @@ def test_reconciler_clean_snapshot_explicitly_allows_auto_resume(caplog):
     repo = MagicMock()
     repo.list_client_orders_by_statuses.return_value = []
     db = MagicMock()
-    reconciler = OrderReconciler(
+    reconciler = owned_reconciler(
         adapter=MagicMock(),
         order_manager=SimpleNamespace(repo=repo),
         clock=SimpleNamespace(now=lambda: 1_700_000_200),
@@ -1419,9 +1433,7 @@ def test_reconciler_clean_snapshot_explicitly_allows_auto_resume(caplog):
     )
 
     with caplog.at_level("ERROR", logger="OrderReconciler"):
-        result = reconciler.reconcile_rithmic_owned_orders(
-            "test",
-            "ACCOUNT",
+        result = reconciler.reconcile(
             snapshot_loader=Mock(return_value=snapshot()),
         )
 
@@ -1456,7 +1468,7 @@ def test_reconciler_keeps_startup_blocked_on_ledger_verification_failure(
     order = local_order(status="SUBMITTED")
     repo = MagicMock()
     repo.list_client_orders_by_statuses.return_value = [order]
-    reconciler = OrderReconciler(
+    reconciler = owned_reconciler(
         adapter=MagicMock(),
         order_manager=SimpleNamespace(repo=repo),
         clock=SimpleNamespace(now=lambda: 1_700_000_200),
@@ -1470,9 +1482,7 @@ def test_reconciler_keeps_startup_blocked_on_ledger_verification_failure(
         local_positions_loader=lambda: [],
     )
 
-    result = reconciler.reconcile_rithmic_owned_orders(
-        "test",
-        "ACCOUNT",
+    result = reconciler.reconcile(
         snapshot_loader=Mock(return_value=remote_snapshot),
     )
 

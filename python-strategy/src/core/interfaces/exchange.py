@@ -2,7 +2,16 @@ import logging
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from decimal import Decimal
-from typing import TYPE_CHECKING, Any, Dict, List, Optional, Protocol
+from typing import (
+    TYPE_CHECKING,
+    Any,
+    Callable,
+    ContextManager,
+    Dict,
+    List,
+    Optional,
+    Protocol,
+)
 from src.core.orm_models import Order
 from src.core.models import Candlestick, Position
 
@@ -18,6 +27,28 @@ class EntryAdmissionGate(Protocol):
     def observe(self) -> bool: ...
 
     def close(self) -> None: ...
+
+
+@dataclass(frozen=True)
+class OwnedOrderReconciliationContext:
+    """Venue-neutral callbacks required by an owned-order reconciler."""
+
+    list_recoverable_client_orders: Callable[[], list[Any]]
+    process_exchange_order_event: Callable[..., dict[str, object]]
+    now_seconds: Callable[[], float]
+    db_session_factory: Callable[[], ContextManager[Any]] | None
+    local_positions_loader: Callable[[], list[object]] | None
+    logger: logging.Logger
+
+
+class OwnedOrderReconciler(Protocol):
+    """Optional adapter-owned reconciliation capability."""
+
+    def reconcile(
+        self,
+        *,
+        snapshot_loader: Callable[..., Any] | None = None,
+    ) -> dict[str, object]: ...
 
 
 class ExchangeError(Exception):
@@ -85,6 +116,13 @@ class IExchangeAdapter(ABC):
         logger: logging.Logger,
     ) -> EntryAdmissionGate | None:
         """Build a venue-owned runtime gate when this adapter requires one."""
+        return None
+
+    def create_owned_order_reconciler(
+        self,
+        context: OwnedOrderReconciliationContext,
+    ) -> OwnedOrderReconciler | None:
+        """Build a venue-owned order reconciler when supported."""
         return None
 
     def exit_authoritative_position(

@@ -341,9 +341,7 @@ class RithmicPortfolioExitService:
         )
 
     def _reconcile(self, snapshot) -> dict[str, object]:
-        return self.execution_engine.reconcile_rithmic_owned_orders(
-            self.profile,
-            self.account_id,
+        return self.execution_engine.reconcile_owned_orders(
             snapshot_loader=lambda *_args, **_kwargs: snapshot,
         )
 

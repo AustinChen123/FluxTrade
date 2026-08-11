@@ -1350,7 +1350,7 @@ def test_rithmic_composition_builds_the_complete_shared_owner_graph() -> None:
     assert owners.emergency_flatten.operation_gate is owners.order_event_lifecycle
     for callback in callbacks.__dict__.values():
         callback.assert_not_called()
-    execution_engine.reconcile_rithmic_owned_orders.assert_not_called()
+    execution_engine.reconcile_owned_orders.assert_not_called()
     execution_engine.halt_for_reconcile.assert_not_called()
     execution_engine.resume_after_reconcile.assert_not_called()
     account_service.replace_authoritative_balance.assert_not_called()
