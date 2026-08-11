@@ -355,6 +355,12 @@ def test_other_live_venues_never_call_binance_owner(
             MagicMock(return_value=result),
         )
     else:
+        for name, value in {
+            "EXCHANGE_API_KEY": "key",
+            "EXCHANGE_SECRET": "secret",
+            "EXCHANGE_TESTNET": "false",
+        }.items():
+            monkeypatch.setenv(name, value)
         monkeypatch.setattr(
             strategy_main,
             "build_ccxt_live_credentials",

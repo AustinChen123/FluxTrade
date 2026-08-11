@@ -23,6 +23,7 @@ from src.core.adapters.backpack_live_config import (
     build_backpack_live_adapter_config,
 )
 from src.core.adapters.binance_live_config import build_binance_live_adapter_config
+from src.core.adapters.bybit_live_config import build_bybit_live_adapter_config
 from src.core.adapters.ccxt_live_credentials import build_ccxt_live_credentials
 from src.core.adapters.rithmic_live_config import (
     build_rithmic_live_adapter_config,
@@ -165,6 +166,11 @@ def _adapter_config_from_env() -> dict:
         )
     if exchange == "binance":
         return build_binance_live_adapter_config(
+            product_ids=product_ids,
+            environ=os.environ,
+        )
+    if exchange == "bybit":
+        return build_bybit_live_adapter_config(
             product_ids=product_ids,
             environ=os.environ,
         )
