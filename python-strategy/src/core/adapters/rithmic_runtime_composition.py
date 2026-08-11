@@ -39,10 +39,10 @@ from src.core.adapters.rithmic_runtime_recovery import (
 from src.core.adapters.rithmic_strategy_exit import RithmicStrategyExitService
 from src.core.execution import ExecutionEngine, ExitDecision
 from src.core.interfaces import IExchangeAdapter
-from src.core.interfaces.exchange import ExchangeOrderEvent
 from src.core.models import Candlestick, Signal, SignalType
 from src.core.ops_safety import OpsSafetyService
 from src.core.risk_manager import AccountService
+from src.core.runtime_capabilities import RuntimeCallbacks as RithmicRuntimeCallbacks
 from src.core.runtime_environment import RuntimeEnvironment
 
 
@@ -134,27 +134,6 @@ def prepare_rithmic_runtime_bootstrap(
         is_rithmic_runtime=True,
         _interval_resolver=_rithmic_runtime_reconciliation_interval_from_env,
     )
-
-
-@dataclass(frozen=True)
-class RithmicRuntimeCallbacks:
-    """Dynamic Engine seams consumed by the venue composition."""
-
-    is_running: Callable[[], bool]
-    publish_worker: Callable[[threading.Thread], None]
-    on_runtime_started: Callable[[], None]
-    reconcile_if_needed: Callable[[], bool]
-    process_event: Callable[[ExchangeOrderEvent], dict[str, Any]]
-    lockdown: Callable[[str], None]
-    assert_runtime_leadership: Callable[[], None]
-    halt_submissions: Callable[[], None]
-    clear_local_halt: Callable[[], None]
-    persist_lockdown_state: Callable[[str], None]
-    persist_redis_lockdown: Callable[[], object]
-    stop_order_event_stream: Callable[..., bool]
-    start_order_event_stream: Callable[[], None]
-    current_order_event_thread: Callable[[], threading.Thread | None]
-    publish_authoritative_summary: Callable[[dict[str, Any]], None]
 
 
 @dataclass

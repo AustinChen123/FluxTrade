@@ -839,6 +839,8 @@ def test_main_wires_session_factory_and_audit_flag(monkeypatch) -> None:
     assert callable(kwargs["db_session_factory"])
     assert kwargs["audit_external_orders"] is True
     assert kwargs["leadership_guard"] is consumer.assert_service_ownership
+    assert kwargs["runtime_bootstrap_factory"] is None
+    assert kwargs["runtime_capabilities_factory"] is None
     engine.add_strategy.assert_not_called()
     assert events == [
         "ownership",
@@ -863,6 +865,93 @@ def test_main_wires_session_factory_and_audit_flag(monkeypatch) -> None:
     consumer.stop.assert_called_once()
     engine.shutdown.assert_called_once_with(clean_exit=True)
     db_session.close.assert_called_once()
+
+
+def test_main_injects_rithmic_runtime_composition_factories(monkeypatch) -> None:
+    adapter_config = {
+        "mode": "live",
+        "exchange": "rithmic",
+        "instrument_product_ids": ["RITHMIC:NQ-202609"],
+        "rithmic_recovery_profile": "orders",
+        "rithmic_recovery_account_id": "ACCOUNT",
+    }
+    bootstrap_factory = MagicMock()
+    capabilities_factory = MagicMock()
+    db_session = MagicMock()
+    engine = MagicMock()
+    engine.build_stream_channels.return_value = []
+    consumer = MagicMock(spec=strategy_main.DataConsumer)
+    monkeypatch.setattr(
+        strategy_main, "_adapter_config_from_env", lambda: adapter_config
+    )
+    monkeypatch.setattr(strategy_main, "_validate_runtime_config", MagicMock())
+    monkeypatch.setattr(strategy_main, "_required_env_flag", lambda _name: True)
+    monkeypatch.setattr(
+        strategy_main,
+        "prepare_rithmic_runtime_bootstrap",
+        bootstrap_factory,
+        raising=False,
+    )
+    monkeypatch.setattr(
+        strategy_main,
+        "build_rithmic_runtime_owners",
+        capabilities_factory,
+        raising=False,
+    )
+
+    with (
+        patch("src.main.configure_metrics"),
+        patch("src.main.SessionLocal", return_value=db_session),
+        patch("src.main.StrategyEngine", return_value=engine) as engine_cls,
+        patch("src.main.DataConsumer", return_value=consumer),
+    ):
+        strategy_main.main()
+
+    kwargs = engine_cls.call_args.kwargs
+    assert kwargs["runtime_bootstrap_factory"] is bootstrap_factory
+    assert kwargs["runtime_capabilities_factory"] is capabilities_factory
+
+
+@pytest.mark.parametrize(
+    ("exchange", "product_id"),
+    [
+        ("binance", "BINANCE:BTCUSDT-PERP"),
+        ("backpack", "BACKPACK:BTC_USDC-PERP"),
+        ("bybit", "BYBIT:BTCUSDT-PERP"),
+        ("okx", "OKX:BTC-USDT-SWAP"),
+    ],
+)
+def test_main_does_not_inject_rithmic_factories_for_ccxt_live(
+    monkeypatch,
+    exchange,
+    product_id,
+) -> None:
+    adapter_config = {
+        "mode": "live",
+        "exchange": exchange,
+        "instrument_product_ids": [product_id],
+    }
+    db_session = MagicMock()
+    engine = MagicMock()
+    engine.build_stream_channels.return_value = []
+    consumer = MagicMock(spec=strategy_main.DataConsumer)
+    monkeypatch.setattr(
+        strategy_main, "_adapter_config_from_env", lambda: adapter_config
+    )
+    monkeypatch.setattr(strategy_main, "_validate_runtime_config", MagicMock())
+    monkeypatch.setattr(strategy_main, "_required_env_flag", lambda _name: True)
+
+    with (
+        patch("src.main.configure_metrics"),
+        patch("src.main.SessionLocal", return_value=db_session),
+        patch("src.main.StrategyEngine", return_value=engine) as engine_cls,
+        patch("src.main.DataConsumer", return_value=consumer),
+    ):
+        strategy_main.main()
+
+    kwargs = engine_cls.call_args.kwargs
+    assert kwargs["runtime_bootstrap_factory"] is None
+    assert kwargs["runtime_capabilities_factory"] is None
 
 
 @pytest.mark.parametrize("failure_stage", ["startup", "consumer"])

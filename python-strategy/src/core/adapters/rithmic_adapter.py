@@ -45,6 +45,7 @@ class RithmicExchangeAdapter(IExchangeAdapter):
     """Rithmic ORDER adapter with explicit startup after ledger recovery."""
 
     authoritative_position_exit_authority = "rithmic_exit_position"
+    requires_runtime_capabilities = True
 
     def __init__(
         self,

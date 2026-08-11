@@ -30,6 +30,10 @@ from src.core.adapters.rithmic_live_config import (
     build_rithmic_live_adapter_config,
     validate_rithmic_recovery_identity,
 )
+from src.core.adapters.rithmic_runtime_composition import (
+    build_rithmic_runtime_owners,
+    prepare_rithmic_runtime_bootstrap,
+)
 
 
 def _setup_logging() -> None:
@@ -243,6 +247,11 @@ def main():
         adapter_config,
         audit_external_orders=audit_external_orders,
     )
+    runtime_bootstrap_factory = None
+    runtime_capabilities_factory = None
+    if adapter_config.get("exchange") == "rithmic":
+        runtime_bootstrap_factory = prepare_rithmic_runtime_bootstrap
+        runtime_capabilities_factory = build_rithmic_runtime_owners
 
     consumer = DataConsumer(
         channels=[],
@@ -283,6 +292,8 @@ def main():
             db_session_factory=_session_scope,
             audit_external_orders=audit_external_orders,
             leadership_guard=consumer.assert_service_ownership,
+            runtime_bootstrap_factory=runtime_bootstrap_factory,
+            runtime_capabilities_factory=runtime_capabilities_factory,
         )
         engine.startup()
         consumer.configure_callbacks(

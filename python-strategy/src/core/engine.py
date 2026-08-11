@@ -57,11 +57,6 @@ from src.core.adapters import (
     SimulatedAdapter,
     create_adapter,
 )
-from src.core.adapters.rithmic_runtime_composition import (
-    RithmicRuntimeCallbacks,
-    build_rithmic_runtime_owners,
-    prepare_rithmic_runtime_bootstrap,
-)
 from src.core.journal import StrategyJournal
 from src.core.redis_factory import create_redis_client
 from src.core.metrics import SIGNALS_TOTAL, ACTIVE_STRATEGIES, BALANCE_USDT
@@ -84,6 +79,13 @@ from src.core.strategy_state_manager import (
 )
 from src.core.audit_service import build_signal_audit, commit_signal_audit
 from src.core.runtime_environment import RuntimeEnvironment
+from src.core.runtime_capabilities import (
+    DefaultRuntimeBootstrap,
+    NoopRuntimeCapabilities,
+    RuntimeBootstrapFactory,
+    RuntimeCallbacks,
+    RuntimeCapabilitiesFactory,
+)
 from src.core.product_master import ensure_product_registered
 from src.core.product_registry import to_stream_key
 
@@ -186,6 +188,8 @@ class StrategyEngine:
         is_backtest: bool | None = None,
         leadership_guard: Callable[[], None] | None = None,
         signal_batch_observer: Callable[[tuple[Signal, ...]], None] | None = None,
+        runtime_bootstrap_factory: RuntimeBootstrapFactory | None = None,
+        runtime_capabilities_factory: RuntimeCapabilitiesFactory | None = None,
     ):
         if db_session_factory is None:
             if db_session is None:
@@ -271,15 +275,28 @@ class StrategyEngine:
             )
         if is_backtest is True and not isinstance(adapter, SimulatedAdapter):
             raise ValueError("backtest mode requires SimulatedAdapter")
-        rithmic_bootstrap = prepare_rithmic_runtime_bootstrap(
-            adapter=adapter,
-            adapter_config=effective_adapter_config,
-            audit_external_orders=audit_external_orders,
-            account_service=self.account_service,
-            runtime_environment=self.runtime_environment,
+        if (runtime_bootstrap_factory is None) != (
+            runtime_capabilities_factory is None
+        ):
+            raise ValueError("runtime capability factories must be provided together")
+        if (
+            getattr(adapter, "requires_runtime_capabilities", False) is True
+            and runtime_bootstrap_factory is None
+        ):
+            raise ValueError("adapter requires runtime capability composition")
+        runtime_bootstrap = (
+            runtime_bootstrap_factory(
+                adapter=adapter,
+                adapter_config=effective_adapter_config,
+                audit_external_orders=audit_external_orders,
+                account_service=self.account_service,
+                runtime_environment=self.runtime_environment,
+            )
+            if runtime_bootstrap_factory is not None
+            else DefaultRuntimeBootstrap()
         )
-        self._rithmic_recovery_profile = rithmic_bootstrap.profile
-        self._rithmic_recovery_account_id = rithmic_bootstrap.account_id
+        self._rithmic_recovery_profile = runtime_bootstrap.profile
+        self._rithmic_recovery_account_id = runtime_bootstrap.account_id
         self.risk_manager.instrument_spec_resolver = getattr(
             adapter,
             "get_instrument_spec",
@@ -288,7 +305,7 @@ class StrategyEngine:
         (
             self._runtime_reconciliation_enabled,
             self._runtime_reconcile_interval,
-        ) = rithmic_bootstrap.resolve_reconciliation_schedule(
+        ) = runtime_bootstrap.resolve_reconciliation_schedule(
             generic_enabled=_is_runtime_reconciliation_enabled(
                 adapter,
                 adapter_config,
@@ -348,61 +365,59 @@ class StrategyEngine:
         )
         self.order_event_thread = None
         self._order_event_stop = threading.Event()
-        rithmic_runtime = build_rithmic_runtime_owners(
-            adapter=adapter,
-            profile=self._rithmic_recovery_profile,
-            account_id=self._rithmic_recovery_account_id,
-            execution_engine=self.execution_engine,
-            account_service=self.account_service,
-            ops_safety=self.ops_safety,
-            stop_event=self._order_event_stop,
-            callbacks=RithmicRuntimeCallbacks(
-                is_running=lambda: self.running,
-                publish_worker=lambda worker: setattr(
-                    self,
-                    "order_event_thread",
-                    worker,
-                ),
-                on_runtime_started=lambda: (
-                    self._rithmic_runtime.on_order_runtime_started()
-                ),
-                reconcile_if_needed=lambda: (
-                    self._reconcile_owned_orders_on_reconnect()
-                ),
-                process_event=lambda event: (
-                    self.execution_engine.process_exchange_order_event(event)
-                ),
-                lockdown=lambda reason: (
-                    self._lockdown_for_rithmic_order_drift(reason)
-                ),
-                assert_runtime_leadership=lambda: (self._assert_runtime_leadership()),
-                halt_submissions=lambda: self._halt_for_kill_switch(),
-                clear_local_halt=lambda: self._clear_local_kill_switch_halt(),
-                persist_lockdown_state=lambda reason: (
-                    self.ops_safety.persist_kill_switch_state(
-                        SYSTEM_STATE_LOCKDOWN,
-                        actor="rithmic_order_stream",
-                        reason=reason,
-                    )
-                ),
-                persist_redis_lockdown=lambda: self.redis_client.set(
-                    self._system_state_key,
-                    SYSTEM_STATE_LOCKDOWN,
-                ),
-                stop_order_event_stream=lambda **values: (
-                    self._stop_exchange_order_event_stream(**values)
-                ),
-                start_order_event_stream=lambda: (
-                    self._start_exchange_order_event_stream()
-                ),
-                current_order_event_thread=lambda: self.order_event_thread,
-                publish_authoritative_summary=lambda summary: (
-                    self._apply_rithmic_authoritative_account_summary(summary)
-                ),
+        runtime_callbacks = RuntimeCallbacks(
+            is_running=lambda: self.running,
+            publish_worker=lambda worker: setattr(
+                self,
+                "order_event_thread",
+                worker,
             ),
-            logger=logger,
+            on_runtime_started=lambda: (self._venue_runtime.on_order_runtime_started()),
+            reconcile_if_needed=lambda: (self._reconcile_owned_orders_on_reconnect()),
+            process_event=lambda event: (
+                self.execution_engine.process_exchange_order_event(event)
+            ),
+            lockdown=lambda reason: (self._lockdown_for_rithmic_order_drift(reason)),
+            assert_runtime_leadership=lambda: (self._assert_runtime_leadership()),
+            halt_submissions=lambda: self._halt_for_kill_switch(),
+            clear_local_halt=lambda: self._clear_local_kill_switch_halt(),
+            persist_lockdown_state=lambda reason: (
+                self.ops_safety.persist_kill_switch_state(
+                    SYSTEM_STATE_LOCKDOWN,
+                    actor="rithmic_order_stream",
+                    reason=reason,
+                )
+            ),
+            persist_redis_lockdown=lambda: self.redis_client.set(
+                self._system_state_key,
+                SYSTEM_STATE_LOCKDOWN,
+            ),
+            stop_order_event_stream=lambda **values: (
+                self._stop_exchange_order_event_stream(**values)
+            ),
+            start_order_event_stream=lambda: (
+                self._start_exchange_order_event_stream()
+            ),
+            current_order_event_thread=lambda: self.order_event_thread,
+            publish_authoritative_summary=lambda summary: (
+                self._apply_rithmic_authoritative_account_summary(summary)
+            ),
         )
-        self._rithmic_runtime = rithmic_runtime
+        self._venue_runtime = (
+            runtime_capabilities_factory(
+                adapter=adapter,
+                profile=self._rithmic_recovery_profile,
+                account_id=self._rithmic_recovery_account_id,
+                execution_engine=self.execution_engine,
+                account_service=self.account_service,
+                ops_safety=self.ops_safety,
+                stop_event=self._order_event_stop,
+                callbacks=runtime_callbacks,
+                logger=logger,
+            )
+            if runtime_capabilities_factory is not None
+            else NoopRuntimeCapabilities()
+        )
         self.runtime_reconciliation_job = RuntimeReconciliationJob(
             account_service=self.account_service,
             adapter=adapter,
@@ -489,7 +504,7 @@ class StrategyEngine:
             (
                 rithmic_reconciliation_owned,
                 rithmic_reconciliation_safe,
-            ) = self._rithmic_runtime.classify_startup_reconciliation(reconciliation)
+            ) = self._venue_runtime.classify_startup_reconciliation(reconciliation)
             if rithmic_reconciliation_safe and self._entry_admission_gate is not None:
                 self._entry_admission_gate.arm()
             if rithmic_reconciliation_owned and not rithmic_reconciliation_safe:
@@ -543,7 +558,7 @@ class StrategyEngine:
         self._strategy_state_manager.start_subscriber()
 
     def _start_exchange_order_event_stream(self) -> None:
-        if self._rithmic_runtime.start_order_event_stream():
+        if self._venue_runtime.start_order_event_stream():
             return
         adapter = self.execution_engine.adapter
         start = getattr(adapter, "start_order_event_stream", None)
@@ -596,13 +611,13 @@ class StrategyEngine:
         return True
 
     def _lockdown_for_rithmic_order_drift(self, reason: str) -> None:
-        self._rithmic_runtime.detect_external_order_drift(reason)
+        self._venue_runtime.detect_external_order_drift(reason)
 
     def _prepare_rithmic_kill_switch_clear(self) -> tuple[bool, int | None]:
-        return self._rithmic_runtime.prepare_kill_switch_clear()
+        return self._venue_runtime.prepare_kill_switch_clear()
 
     def _current_rithmic_external_order_drift_generation(self) -> int:
-        return self._rithmic_runtime.current_external_order_drift_generation()
+        return self._venue_runtime.current_external_order_drift_generation()
 
     def _run_ops_kill_switch(
         self,
@@ -623,7 +638,7 @@ class StrategyEngine:
                 operation_id=operation_id,
             )
 
-        return self._rithmic_runtime.run_emergency_flatten(
+        return self._venue_runtime.run_emergency_flatten(
             run_generic_kill_switch,
             actor=actor,
             reason=reason,
@@ -652,15 +667,15 @@ class StrategyEngine:
             )
             return summary
 
-        return self._rithmic_runtime.reconcile_startup(reconcile_generic)
+        return self._venue_runtime.reconcile_startup(reconcile_generic)
 
     def _apply_rithmic_authoritative_account_summary(self, summary: dict) -> None:
         """Delegate authoritative Rithmic account publication to its owner."""
-        self._rithmic_runtime.publish_authoritative_summary(summary)
+        self._venue_runtime.publish_authoritative_summary(summary)
 
     def _reconcile_owned_orders_on_reconnect(self) -> bool:
         """Delegate Rithmic ORDER reconnect recovery to its venue owner."""
-        reconciled = self._rithmic_runtime.reconcile_order_reconnect()
+        reconciled = self._venue_runtime.reconcile_order_reconnect()
         if reconciled is None:
             logger.error(
                 "Reconnect order reconciliation is unavailable; "
@@ -783,7 +798,7 @@ class StrategyEngine:
                         and redis_state_persisted
                         and _kill_switch_result_is_complete(
                             kill_switch_result,
-                            authoritative_required=self._rithmic_runtime.requires_authoritative_flatten_verification(),
+                            authoritative_required=self._venue_runtime.requires_authoritative_flatten_verification(),
                         )
                     ):
                         self._mark_kill_switch_operation_completed(
@@ -832,7 +847,7 @@ class StrategyEngine:
                             )
                     finally:
                         if drift_generation is not None:
-                            self._rithmic_runtime.finalize_external_order_drift_clear(
+                            self._venue_runtime.finalize_external_order_drift_clear(
                                 prepared_generation=drift_generation,
                                 clear_succeeded=clear_succeeded,
                             )
@@ -2024,7 +2039,7 @@ class StrategyEngine:
 
     def _reconcile_startup_balance(self) -> object | None:
         """Dispatch startup balance policy through the venue composition."""
-        return self._rithmic_runtime.run_startup_balance_reconciliation(
+        return self._venue_runtime.run_startup_balance_reconciliation(
             self._reconcile_balance
         )
 
@@ -2222,7 +2237,7 @@ class StrategyEngine:
         def reconcile_loop():
             logger.info("Runtime reconciliation service started.")
             venue_owned, run_reconciliation = (
-                self._rithmic_runtime.select_runtime_reconciliation(
+                self._venue_runtime.select_runtime_reconciliation(
                     self.runtime_reconciliation_job.run_once,
                     self._run_runtime_recovery_exclusive,
                 )
@@ -2473,13 +2488,11 @@ class StrategyEngine:
             logger.info(
                 "✅ SIGNAL ACCEPTED: %s. Forwarding to Execution Engine...", signal.type
             )
-            handled, execution_succeeded = (
-                self._rithmic_runtime.route_authoritative_exit(
-                    signal,
-                    candle,
-                    self._portfolio_coordinator.portfolio_id_for_sleeve,
-                    self.execution_engine.execute_authoritative_exit_signal,
-                )
+            handled, execution_succeeded = self._venue_runtime.route_authoritative_exit(
+                signal,
+                candle,
+                self._portfolio_coordinator.portfolio_id_for_sleeve,
+                self.execution_engine.execute_authoritative_exit_signal,
             )
             if not handled:
                 order_id = self.execution_engine.execute_signal(signal, candle)

@@ -15,7 +15,7 @@ import uuid
 import time
 import random
 from decimal import Decimal
-from typing import Optional, Dict, List
+from typing import Any, Optional, Dict, List
 from unittest.mock import MagicMock
 
 from sqlalchemy import create_engine, event
@@ -25,7 +25,12 @@ from sqlalchemy.orm import sessionmaker
 
 # Models
 from src.core.models import (
-    Signal, SignalType, Candlestick, Position, PositionSide, Trade
+    Signal,
+    SignalType,
+    Candlestick,
+    Position,
+    PositionSide,
+    Trade,
 )
 from src.core.orm_models import (
     Base,
@@ -94,6 +99,7 @@ def sqlite_order_session_factory():
 # =============================================================================
 # Mock Services
 # =============================================================================
+
 
 class MockAccountService(AccountService):
     """Mock AccountService that doesn't require Redis."""
@@ -212,24 +218,29 @@ class MockOrderRepository(IOrderRepository):
         ]
 
     def list_orders_by_statuses(self, statuses: set[str]) -> list[Order]:
-        return [
-            order
-            for order in self.orders.values()
-            if order.status in statuses
-        ]
+        return [order for order in self.orders.values() if order.status in statuses]
 
     def add_trade(self, trade: ORMTrade) -> None:
         self.trades.append(trade)
 
-    def get_position(self, strategy_id: str, product_id: str, side: str = None) -> Optional[ORMPosition]:
+    def get_position(
+        self, strategy_id: str, product_id: str, side: str = None
+    ) -> Optional[ORMPosition]:
         key = f"{strategy_id}:{product_id}"
         pos = self.positions.get(key)
         if pos and side and pos.side != side:
             return None
         return pos
 
-    def update_position(self, strategy_id: str, product_id: str, side: str,
-                       fill_quantity: Decimal, fill_price: Decimal, position_side: str) -> None:
+    def update_position(
+        self,
+        strategy_id: str,
+        product_id: str,
+        side: str,
+        fill_quantity: Decimal,
+        fill_price: Decimal,
+        position_side: str,
+    ) -> None:
         key = f"{strategy_id}:{product_id}"
         pos = self.positions.get(key)
         current_time = int(time.time() * 1000)
@@ -242,13 +253,15 @@ class MockOrderRepository(IOrderRepository):
                 quantity=fill_quantity,
                 entry_price=fill_price,
                 unrealized_pnl=Decimal("0"),
-                last_update_timestamp=current_time
+                last_update_timestamp=current_time,
             )
             self.positions[key] = pos
         else:
             # Simple update logic
-            if side.lower() == 'buy':
-                total_cost = (pos.quantity * pos.entry_price) + (fill_quantity * fill_price)
+            if side.lower() == "buy":
+                total_cost = (pos.quantity * pos.entry_price) + (
+                    fill_quantity * fill_price
+                )
                 total_qty = pos.quantity + fill_quantity
                 if total_qty > 0:
                     pos.entry_price = total_cost / total_qty
@@ -283,11 +296,13 @@ class MockExchangeAdapter(IExchangeAdapter):
     def place_order(self, order: Order) -> str:
         if self._should_fail:
             from src.core.interfaces import ExchangeError
+
             raise ExchangeError(self._fail_reason)
 
         # Fail on specific order types (for testing SL/TP/Trailing error paths)
         if order.type in self._fail_on_order_types:
             from src.core.interfaces import ExchangeError
+
             raise ExchangeError(f"Mock failure for order type: {order.type}")
 
         exchange_id = f"MOCK-{uuid.uuid4().hex[:8]}"
@@ -303,7 +318,9 @@ class MockExchangeAdapter(IExchangeAdapter):
         order_type: str | None = None,
     ) -> bool:
         initial_len = len(self.open_orders)
-        self.open_orders = [o for o in self.open_orders if o.exchange_order_id != order_id]
+        self.open_orders = [
+            o for o in self.open_orders if o.exchange_order_id != order_id
+        ]
         return len(self.open_orders) < initial_len
 
     def cancel_order_by_client_id(
@@ -327,7 +344,10 @@ class MockExchangeAdapter(IExchangeAdapter):
         order_type: str | None = None,
     ) -> Optional[ExchangeOrderSnapshot]:
         for order in self.open_orders:
-            if order.client_order_id == client_order_id and order.product_id == product_id:
+            if (
+                order.client_order_id == client_order_id
+                and order.product_id == product_id
+            ):
                 return ExchangeOrderSnapshot(
                     client_order_id=client_order_id,
                     exchange_order_id=order.exchange_order_id,
@@ -352,11 +372,9 @@ class MockExchangeAdapter(IExchangeAdapter):
                 continue
 
             fill_price = self._next_fill_price or candle.close
-            fills.append({
-                "order": order,
-                "price": fill_price,
-                "quantity": order.quantity
-            })
+            fills.append(
+                {"order": order, "price": fill_price, "quantity": order.quantity}
+            )
 
         self.open_orders = remaining
         self.filled_orders.extend(fills)
@@ -408,6 +426,7 @@ class RealisticMockAdapter(MockExchangeAdapter):
     def place_order(self, order: Order) -> str:
         if self._rng.random() < self.reject_probability:
             from src.core.interfaces import ExchangeError
+
             raise ExchangeError("Order rejected (simulated)")
         return super().place_order(order)
 
@@ -433,11 +452,13 @@ class RealisticMockAdapter(MockExchangeAdapter):
                 remaining.append(order)
                 continue
 
-            fills.append({
-                "order": order,
-                "price": fill_price,
-                "quantity": fill_qty,
-            })
+            fills.append(
+                {
+                    "order": order,
+                    "price": fill_price,
+                    "quantity": fill_qty,
+                }
+            )
 
             # Partial fill: keep remainder as open order
             unfilled = order.quantity - fill_qty
@@ -454,6 +475,7 @@ class RealisticMockAdapter(MockExchangeAdapter):
 # Fixture Factories
 # =============================================================================
 
+
 @pytest.fixture
 def mock_account_service():
     """Provides a MockAccountService with default balance."""
@@ -463,8 +485,10 @@ def mock_account_service():
 @pytest.fixture
 def mock_account_service_factory():
     """Factory to create MockAccountService with custom balance."""
+
     def _create(balance: Decimal = DEFAULT_BALANCE) -> MockAccountService:
         return MockAccountService(balance=balance)
+
     return _create
 
 
@@ -520,6 +544,7 @@ def mock_db_session():
 # Data Fixtures - Candlesticks
 # =============================================================================
 
+
 @pytest.fixture
 def sample_candlestick():
     """Provides a sample Candlestick."""
@@ -531,13 +556,14 @@ def sample_candlestick():
         high=Decimal("42500.00"),
         low=Decimal("41500.00"),
         close=Decimal("42200.00"),
-        volume=Decimal("1000.50")
+        volume=Decimal("1000.50"),
     )
 
 
 @pytest.fixture
 def candlestick_factory():
     """Factory to create Candlesticks with custom parameters."""
+
     def _create(
         product_id: str = DEFAULT_PRODUCT_ID,
         timeframe: str = DEFAULT_TIMEFRAME,
@@ -546,7 +572,7 @@ def candlestick_factory():
         high: Decimal = Decimal("42500.00"),
         low: Decimal = Decimal("41500.00"),
         close: Decimal = Decimal("42200.00"),
-        volume: Decimal = Decimal("1000.50")
+        volume: Decimal = Decimal("1000.50"),
     ) -> Candlestick:
         return Candlestick(
             product_id=product_id,
@@ -556,23 +582,26 @@ def candlestick_factory():
             high=high,
             low=low,
             close=close,
-            volume=volume
+            volume=volume,
         )
+
     return _create
 
 
 @pytest.fixture
 def candlestick_series_factory():
     """Factory to create a series of Candlesticks for backtesting."""
+
     def _create(
         count: int = 100,
         product_id: str = DEFAULT_PRODUCT_ID,
         timeframe: str = DEFAULT_TIMEFRAME,
         start_timestamp: int = 1704067200000,
         start_price: Decimal = Decimal("42000.00"),
-        volatility: Decimal = Decimal("100.00")
+        volatility: Decimal = Decimal("100.00"),
     ) -> List[Candlestick]:
         import random
+
         candles = []
         price = float(start_price)
 
@@ -580,28 +609,36 @@ def candlestick_series_factory():
             change = random.gauss(0, float(volatility))
             open_price = Decimal(str(round(price, 2)))
             close_price = Decimal(str(round(price + change, 2)))
-            high = max(open_price, close_price) + Decimal(str(abs(random.gauss(0, float(volatility) / 2))))
-            low = min(open_price, close_price) - Decimal(str(abs(random.gauss(0, float(volatility) / 2))))
+            high = max(open_price, close_price) + Decimal(
+                str(abs(random.gauss(0, float(volatility) / 2)))
+            )
+            low = min(open_price, close_price) - Decimal(
+                str(abs(random.gauss(0, float(volatility) / 2)))
+            )
 
-            candles.append(Candlestick(
-                product_id=product_id,
-                timeframe=timeframe,
-                timestamp=start_timestamp + i * 60000,
-                open=open_price,
-                high=high.quantize(Decimal("0.01")),
-                low=low.quantize(Decimal("0.01")),
-                close=close_price,
-                volume=Decimal(str(round(random.uniform(100, 1000), 2)))
-            ))
+            candles.append(
+                Candlestick(
+                    product_id=product_id,
+                    timeframe=timeframe,
+                    timestamp=start_timestamp + i * 60000,
+                    open=open_price,
+                    high=high.quantize(Decimal("0.01")),
+                    low=low.quantize(Decimal("0.01")),
+                    close=close_price,
+                    volume=Decimal(str(round(random.uniform(100, 1000), 2))),
+                )
+            )
             price = float(close_price)
 
         return candles
+
     return _create
 
 
 # =============================================================================
 # Data Fixtures - Signals
 # =============================================================================
+
 
 @pytest.fixture
 def sample_long_signal():
@@ -614,7 +651,7 @@ def sample_long_signal():
         type=SignalType.LONG,
         value=Decimal("42000.00"),
         quantity=Decimal("0.1"),
-        price=Decimal("42000.00")
+        price=Decimal("42000.00"),
     )
 
 
@@ -629,7 +666,7 @@ def sample_short_signal():
         type=SignalType.SHORT,
         value=Decimal("42000.00"),
         quantity=Decimal("0.1"),
-        price=Decimal("42000.00")
+        price=Decimal("42000.00"),
     )
 
 
@@ -642,7 +679,7 @@ def sample_exit_long_signal():
         timeframe=DEFAULT_TIMEFRAME,
         timestamp=1704067200000,
         type=SignalType.EXIT_LONG,
-        value=Decimal("42500.00")
+        value=Decimal("42500.00"),
     )
 
 
@@ -655,13 +692,14 @@ def sample_exit_short_signal():
         timeframe=DEFAULT_TIMEFRAME,
         timestamp=1704067200000,
         type=SignalType.EXIT_SHORT,
-        value=Decimal("41500.00")
+        value=Decimal("41500.00"),
     )
 
 
 @pytest.fixture
 def signal_factory():
     """Factory to create Signals with custom parameters."""
+
     def _create(
         strategy_id: str = DEFAULT_STRATEGY_ID,
         product_id: str = DEFAULT_PRODUCT_ID,
@@ -674,7 +712,7 @@ def signal_factory():
         stop_loss: Optional[Decimal] = None,
         take_profit: Optional[Decimal] = None,
         trailing_distance: Optional[Decimal] = None,
-        metadata: Optional[dict] = None
+        metadata: Optional[dict] = None,
     ) -> Signal:
         return Signal(
             strategy_id=strategy_id,
@@ -688,14 +726,16 @@ def signal_factory():
             stop_loss=stop_loss,
             take_profit=take_profit,
             trailing_distance=trailing_distance,
-            metadata=metadata
+            metadata=metadata,
         )
+
     return _create
 
 
 # =============================================================================
 # Data Fixtures - Orders
 # =============================================================================
+
 
 @pytest.fixture
 def sample_order():
@@ -713,13 +753,14 @@ def sample_order():
         status="open",
         timestamp=1704067200000,
         filled_quantity=Decimal("0"),
-        filled_price=Decimal("0")
+        filled_price=Decimal("0"),
     )
 
 
 @pytest.fixture
 def order_factory():
     """Factory to create Orders with custom parameters."""
+
     def _create(
         order_id: str = None,
         exchange_order_id: Optional[str] = None,
@@ -754,12 +795,14 @@ def order_factory():
             filled_price=filled_price,
             client_order_id=client_order_id,
         )
+
     return _create
 
 
 # =============================================================================
 # Data Fixtures - Positions
 # =============================================================================
+
 
 @pytest.fixture
 def sample_long_position():
@@ -770,7 +813,7 @@ def sample_long_position():
         side=PositionSide.LONG,
         quantity=Decimal("0.5"),
         entry_price=Decimal("42000.00"),
-        unrealized_pnl=Decimal("0")
+        unrealized_pnl=Decimal("0"),
     )
 
 
@@ -783,20 +826,21 @@ def sample_short_position():
         side=PositionSide.SHORT,
         quantity=Decimal("0.5"),
         entry_price=Decimal("42000.00"),
-        unrealized_pnl=Decimal("0")
+        unrealized_pnl=Decimal("0"),
     )
 
 
 @pytest.fixture
 def position_factory():
     """Factory to create Positions with custom parameters."""
+
     def _create(
         strategy_id: str = DEFAULT_STRATEGY_ID,
         product_id: str = DEFAULT_PRODUCT_ID,
         side: PositionSide = PositionSide.LONG,
         quantity: Decimal = Decimal("0.5"),
         entry_price: Decimal = Decimal("42000.00"),
-        unrealized_pnl: Decimal = Decimal("0")
+        unrealized_pnl: Decimal = Decimal("0"),
     ) -> Position:
         return Position(
             strategy_id=strategy_id,
@@ -804,14 +848,16 @@ def position_factory():
             side=side,
             quantity=quantity,
             entry_price=entry_price,
-            unrealized_pnl=unrealized_pnl
+            unrealized_pnl=unrealized_pnl,
         )
+
     return _create
 
 
 # =============================================================================
 # Data Fixtures - Trades
 # =============================================================================
+
 
 @pytest.fixture
 def sample_trade():
@@ -822,20 +868,21 @@ def sample_trade():
         price=Decimal("42000.00"),
         quantity=Decimal("0.1"),
         side="buy",
-        timestamp=1704067200000
+        timestamp=1704067200000,
     )
 
 
 @pytest.fixture
 def trade_factory():
     """Factory to create Trades with custom parameters."""
+
     def _create(
         trade_id: str = None,
         product_id: str = DEFAULT_PRODUCT_ID,
         price: Decimal = Decimal("42000.00"),
         quantity: Decimal = Decimal("0.1"),
         side: str = "buy",
-        timestamp: int = 1704067200000
+        timestamp: int = 1704067200000,
     ) -> Trade:
         return Trade(
             id=trade_id or str(uuid.uuid4()),
@@ -843,8 +890,9 @@ def trade_factory():
             price=price,
             quantity=quantity,
             side=side,
-            timestamp=timestamp
+            timestamp=timestamp,
         )
+
     return _create
 
 
@@ -852,10 +900,12 @@ def trade_factory():
 # Integration Fixtures
 # =============================================================================
 
+
 @pytest.fixture
 def risk_manager(mock_account_service):
     """Provides a RiskManager with mock account service."""
     from src.core.risk_manager import RiskManager
+
     return RiskManager(mock_account_service)
 
 
@@ -863,6 +913,7 @@ def risk_manager(mock_account_service):
 def order_manager(mock_order_repo, mock_clock):
     """Provides an OrderManager with mock repo and clock."""
     from src.core.order_manager import OrderManager
+
     return OrderManager(mock_order_repo, mock_clock)
 
 
@@ -871,6 +922,7 @@ def simulated_adapter():
     """Provides a SimulatedAdapter backed by Rust PyMatchingEngine."""
     from decimal import Decimal
     from src.core.adapters.simulated import SimulatedAdapter
+
     return SimulatedAdapter(
         initial_balance=DEFAULT_BALANCE,
         maker_fee=Decimal("0.0002"),
@@ -882,10 +934,9 @@ def simulated_adapter():
 def backtest_order_repo(mock_db_session):
     """Provides a BacktestOrderRepository."""
     from src.core.repositories import BacktestOrderRepository
+
     return BacktestOrderRepository(
-        db_session=mock_db_session,
-        session_id=1,
-        initial_balance=DEFAULT_BALANCE
+        db_session=mock_db_session, session_id=1, initial_balance=DEFAULT_BALANCE
     )
 
 
@@ -896,7 +947,9 @@ def mock_strategy_class():
     from src.core.models import Candlestick, Signal, SignalType
 
     class StubStrategy(BaseStrategy):
-        def __init__(self, strategy_id: str = "stub", product_id: str = DEFAULT_PRODUCT_ID):
+        def __init__(
+            self, strategy_id: str = "stub", product_id: str = DEFAULT_PRODUCT_ID
+        ):
             super().__init__(strategy_id, product_id)
             self._signal: Signal | None = None
 
@@ -930,7 +983,7 @@ def engine_factory(mock_db_session, mock_clock, mock_exchange_adapter):
     def _create(**overrides):
         from src.core.engine import StrategyEngine
 
-        defaults = dict(
+        defaults: dict[str, Any] = dict(
             db_session=mock_db_session,
             clock=mock_clock,
             order_repository=MockOrderRepository(),
@@ -938,6 +991,19 @@ def engine_factory(mock_db_session, mock_clock, mock_exchange_adapter):
             adapter=mock_exchange_adapter,
         )
         defaults.update(overrides)
+        from src.core.adapters.rithmic_runtime_composition import (
+            build_rithmic_runtime_owners,
+            prepare_rithmic_runtime_bootstrap,
+        )
+
+        defaults.setdefault(
+            "runtime_bootstrap_factory",
+            prepare_rithmic_runtime_bootstrap,
+        )
+        defaults.setdefault(
+            "runtime_capabilities_factory",
+            build_rithmic_runtime_owners,
+        )
 
         with patch("src.core.engine.create_redis_client") as mock_factory:
             mock_redis_inst = MagicMock()
@@ -949,4 +1015,5 @@ def engine_factory(mock_db_session, mock_clock, mock_exchange_adapter):
         return engine
 
     from unittest.mock import patch
+
     return _create
