@@ -940,10 +940,12 @@ class TestEngineInit:
     ):
         """Startup order reconciliation should only run for audited external orders."""
         engine.execution_engine.reconcile_recoverable_client_orders = MagicMock()
+        engine._rithmic_runtime.reconcile_startup = MagicMock()
 
         engine._reconcile_recoverable_orders_on_startup()
 
         engine.execution_engine.reconcile_recoverable_client_orders.assert_not_called()
+        engine._rithmic_runtime.reconcile_startup.assert_not_called()
 
     def test_startup_reconcile_runs_when_audit_external_orders_enabled(
         self, mock_db_session, mock_clock
@@ -972,6 +974,7 @@ class TestEngineInit:
         engine_factory,
     ):
         engine = engine_factory(
+            adapter=_rithmic_adapter_for_reconnect_test(),
             audit_external_orders=True,
             adapter_config={
                 "mode": "live",
@@ -1010,6 +1013,137 @@ class TestEngineInit:
             source_timestamp_ms=1704067200000,
         )
 
+    def test_generic_startup_failure_keeps_fixed_envelope_and_no_lockdown(
+        self,
+        engine_factory,
+        simulated_adapter,
+        caplog,
+    ):
+        sentinel = RuntimeError("generic reconciliation sentinel")
+        engine = engine_factory(
+            adapter=simulated_adapter,
+            audit_external_orders=True,
+            adapter_config={
+                "rithmic_recovery_profile": "misleading-profile",
+                "rithmic_recovery_account_id": "MISLEADING-ACCOUNT",
+            },
+        )
+        engine.execution_engine.audit_external_orders = True
+        engine.execution_engine.reconcile_recoverable_client_orders = MagicMock(
+            side_effect=sentinel
+        )
+        engine.execution_engine.reconcile_rithmic_owned_orders = MagicMock()
+        engine.ops_safety.persist_kill_switch_state = MagicMock()
+        engine._run_ops_kill_switch = MagicMock()
+        engine.redis_client.set = MagicMock()
+
+        with caplog.at_level(logging.ERROR, logger="src.core.engine"):
+            result = engine._reconcile_recoverable_orders_on_startup()
+
+        assert engine._rithmic_runtime.is_rithmic_runtime is False
+        assert engine._rithmic_runtime.ledger_recovery is None
+        assert engine._rithmic_recovery_profile is None
+        assert engine._rithmic_recovery_account_id is None
+        assert result == {
+            "recoverable_count": 0,
+            "unresolved_count": 1,
+            "verification_blocked_count": 1,
+            "auto_resume_safe": False,
+        }
+        engine.execution_engine.reconcile_recoverable_client_orders.assert_called_once_with()
+        engine.execution_engine.reconcile_rithmic_owned_orders.assert_not_called()
+        failure_records = [
+            record
+            for record in caplog.records
+            if record.getMessage() == "Startup order reconciliation failed"
+        ]
+        assert len(failure_records) == 1
+        assert failure_records[0].exc_info is not None
+        assert failure_records[0].exc_info[1] is sentinel
+        engine._run_ops_kill_switch.assert_not_called()
+        engine.ops_safety.persist_kill_switch_state.assert_not_called()
+        engine.redis_client.set.assert_not_called()
+
+    def test_rithmic_missing_startup_owner_aborts_before_later_phases(
+        self,
+        engine,
+    ):
+        engine.execution_engine.audit_external_orders = True
+        engine._rithmic_runtime.is_rithmic_runtime = True
+        engine._rithmic_runtime.ledger_recovery = None
+        actual_dispatch = engine._rithmic_runtime.reconcile_startup
+        captured_error: list[RuntimeError] = []
+
+        def capture_dispatch(fallback):
+            try:
+                return actual_dispatch(fallback)
+            except RuntimeError as exc:
+                captured_error.append(exc)
+                raise
+
+        engine._rithmic_runtime.reconcile_startup = MagicMock(
+            side_effect=capture_dispatch
+        )
+        engine.execution_engine.reconcile_recoverable_client_orders = MagicMock()
+        engine.execution_engine.halt_and_drain = MagicMock()
+        engine._check_system_state = MagicMock(return_value=False)
+        engine.ops_safety.persist_kill_switch_state = MagicMock()
+        engine.redis_client.set = MagicMock()
+        for name in (
+            "_start_command_listener",
+            "_reconcile_startup_balance",
+            "_initialize_strategy_state_cache_on_startup",
+            "_start_strategy_state_subscriber_on_startup",
+            "_start_exchange_order_event_stream",
+            "_start_heartbeat",
+            "_start_runtime_reconciliation",
+            "scan_strategies",
+            "_restore_active_strategies_on_startup",
+        ):
+            setattr(engine, name, MagicMock())
+
+        with (
+            patch("src.core.engine.logger") as owner_logger,
+            pytest.raises(RuntimeError) as raised,
+        ):
+            engine.startup()
+
+        assert type(raised.value) is RuntimeError
+        assert raised.value.args == ("rithmic_ledger_recovery_unavailable",)
+        assert captured_error == [raised.value]
+        assert engine._kill_switch_halted is True
+        assert engine.execution_engine.halt_and_drain.call_count == 2
+        engine.execution_engine.reconcile_recoverable_client_orders.assert_not_called()
+        owner_logger.exception.assert_not_called()
+        engine.ops_safety.persist_kill_switch_state.assert_not_called()
+        engine.redis_client.set.assert_not_called()
+        engine._start_exchange_order_event_stream.assert_not_called()
+        engine._start_heartbeat.assert_not_called()
+        engine._start_runtime_reconciliation.assert_not_called()
+        engine.scan_strategies.assert_not_called()
+        engine._restore_active_strategies_on_startup.assert_not_called()
+
+    def test_rithmic_missing_startup_owner_dispatch_never_takes_engine_locks(
+        self,
+        engine,
+    ):
+        engine.execution_engine.audit_external_orders = True
+        engine._rithmic_runtime.is_rithmic_runtime = True
+        engine._rithmic_runtime.ledger_recovery = None
+        engine.execution_engine.reconcile_recoverable_client_orders = MagicMock()
+        engine._market_processing_lock = MagicMock()
+        engine._ops_command_lock = MagicMock()
+
+        with pytest.raises(
+            RuntimeError,
+            match="^rithmic_ledger_recovery_unavailable$",
+        ):
+            engine._reconcile_recoverable_orders_on_startup()
+
+        engine._market_processing_lock.__enter__.assert_not_called()
+        engine._ops_command_lock.__enter__.assert_not_called()
+        engine.execution_engine.reconcile_recoverable_client_orders.assert_not_called()
+
     def test_startup_rithmic_reconciliation_delegates_only_to_venue_owner(
         self,
         engine,
@@ -1018,6 +1152,7 @@ class TestEngineInit:
         service = MagicMock()
         service.reconcile_startup.return_value = result
         engine.execution_engine.audit_external_orders = True
+        engine._rithmic_runtime.is_rithmic_runtime = True
         engine._rithmic_runtime.ledger_recovery = service
         engine.execution_engine.reconcile_rithmic_owned_orders = MagicMock()
         engine.execution_engine.reconcile_recoverable_client_orders = MagicMock()
@@ -1033,6 +1168,7 @@ class TestEngineInit:
         service = MagicMock()
         service.reconcile_startup.return_value = None
         engine.execution_engine.audit_external_orders = True
+        engine._rithmic_runtime.is_rithmic_runtime = True
         engine._rithmic_runtime.ledger_recovery = service
         engine.execution_engine.reconcile_recoverable_client_orders = MagicMock()
 

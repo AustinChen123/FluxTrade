@@ -635,25 +635,24 @@ class StrategyEngine:
         if not self.execution_engine.audit_external_orders:
             return None
 
-        handled_by_rithmic, rithmic_summary = self._rithmic_runtime.reconcile_startup()
-        if handled_by_rithmic:
-            return rithmic_summary
+        def reconcile_generic() -> dict:
+            try:
+                summary = self.execution_engine.reconcile_recoverable_client_orders()
+            except Exception:
+                logger.exception("Startup order reconciliation failed")
+                return {
+                    "recoverable_count": 0,
+                    "unresolved_count": 1,
+                    "verification_blocked_count": 1,
+                    "auto_resume_safe": False,
+                }
+            logger.info(
+                "Startup order reconciliation complete: %s recoverable orders",
+                summary["recoverable_count"],
+            )
+            return summary
 
-        try:
-            summary = self.execution_engine.reconcile_recoverable_client_orders()
-        except Exception:
-            logger.exception("Startup order reconciliation failed")
-            return {
-                "recoverable_count": 0,
-                "unresolved_count": 1,
-                "verification_blocked_count": 1,
-                "auto_resume_safe": False,
-            }
-        logger.info(
-            "Startup order reconciliation complete: %s recoverable orders",
-            summary["recoverable_count"],
-        )
-        return summary
+        return self._rithmic_runtime.reconcile_startup(reconcile_generic)
 
     def _apply_rithmic_authoritative_account_summary(self, summary: dict) -> None:
         """Delegate authoritative Rithmic account publication to its owner."""

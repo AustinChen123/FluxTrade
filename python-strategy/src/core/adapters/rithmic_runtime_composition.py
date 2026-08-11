@@ -99,18 +99,18 @@ def prepare_rithmic_runtime_bootstrap(
     runtime_environment: RuntimeEnvironment,
 ) -> RithmicRuntimeBootstrap:
     """Prepare venue identity and account authority without external I/O."""
+    if not isinstance(adapter, RithmicExchangeAdapter):
+        return RithmicRuntimeBootstrap(
+            profile=None,
+            account_id=None,
+            is_rithmic_runtime=False,
+        )
     profile = adapter_config.get("rithmic_recovery_profile") or adapter_config.get(
         "rithmic_profile"
     )
     account_id = adapter_config.get(
         "rithmic_recovery_account_id"
     ) or adapter_config.get("account_id")
-    if not isinstance(adapter, RithmicExchangeAdapter):
-        return RithmicRuntimeBootstrap(
-            profile=profile,
-            account_id=account_id,
-            is_rithmic_runtime=False,
-        )
     if not audit_external_orders:
         raise ValueError("Rithmic live trading requires audit_external_orders")
 
@@ -232,11 +232,16 @@ class RithmicRuntimeOwners:
             clear_succeeded=clear_succeeded,
         )
 
-    def reconcile_startup(self) -> tuple[bool, dict[str, Any] | None]:
-        """Run configured venue ledger recovery and report ownership."""
+    def reconcile_startup(
+        self,
+        fallback: Callable[[], dict[str, Any] | None],
+    ) -> dict[str, Any] | None:
+        """Dispatch startup recovery through the current venue owner."""
+        if not self.is_rithmic_runtime:
+            return fallback()
         if self.ledger_recovery is None:
-            return False, None
-        return True, self.ledger_recovery.reconcile_startup()
+            raise RuntimeError("rithmic_ledger_recovery_unavailable")
+        return self.ledger_recovery.reconcile_startup()
 
     def publish_authoritative_summary(self, summary: dict[str, Any]) -> None:
         """Publish through the current venue ledger owner."""
@@ -429,6 +434,8 @@ def build_rithmic_runtime_owners(
     """Build Rithmic owners without performing external I/O."""
 
     operation_gate = RithmicOrderEventLifecycleGate()
+    if not isinstance(adapter, RithmicExchangeAdapter):
+        return RithmicRuntimeOwners(order_event_lifecycle=operation_gate)
     ledger_recovery = (
         RithmicLedgerRecoveryService(
             profile=profile or "",
@@ -448,11 +455,6 @@ def build_rithmic_runtime_owners(
         if profile
         else None
     )
-    if not isinstance(adapter, RithmicExchangeAdapter):
-        return RithmicRuntimeOwners(
-            order_event_lifecycle=operation_gate,
-            ledger_recovery=ledger_recovery,
-        )
     order_reconnect = (
         RithmicOrderReconnectService(
             adapter=adapter,

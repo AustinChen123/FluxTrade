@@ -200,6 +200,9 @@ def test_non_rithmic_bootstrap_does_not_parse_or_configure_rithmic_policy(
         generic_enabled=True,
         generic_interval_resolver=generic_interval,
     ) == (True, 42.0)
+    assert bootstrap.profile is None
+    assert bootstrap.account_id is None
+    assert bootstrap.is_rithmic_runtime is False
     account_service.configure_authoritative_balance.assert_not_called()
     generic_interval.assert_called_once_with()
 
@@ -233,7 +236,10 @@ def _execution_engine() -> MagicMock:
 
 
 def test_runtime_handle_routes_control_calls_to_current_owners() -> None:
-    owners = RithmicRuntimeOwners(order_event_lifecycle=MagicMock())
+    owners = RithmicRuntimeOwners(
+        order_event_lifecycle=MagicMock(),
+        is_rithmic_runtime=True,
+    )
     stream = MagicMock()
     drift = MagicMock()
     drift.current_generation.return_value = 7
@@ -258,7 +264,8 @@ def test_runtime_handle_routes_control_calls_to_current_owners() -> None:
         prepared_generation=7,
         clear_succeeded=True,
     )
-    assert owners.reconcile_startup() == (True, summary)
+    fallback = MagicMock()
+    assert owners.reconcile_startup(fallback) is summary
     owners.publish_authoritative_summary(summary)
     assert owners.runtime_recovery_operation()() is True
 
@@ -271,17 +278,21 @@ def test_runtime_handle_routes_control_calls_to_current_owners() -> None:
     )
     clear_preparation.prepare.assert_called_once_with()
     ledger.reconcile_startup.assert_called_once_with()
+    fallback.assert_not_called()
     ledger.publish_authoritative_summary.assert_called_once_with(summary)
     runtime_recovery.run_once.assert_called_once_with()
 
 
 def test_runtime_handle_preserves_absent_owner_defaults_and_errors() -> None:
     owners = RithmicRuntimeOwners(order_event_lifecycle=MagicMock())
+    generic_summary = {"recoverable_count": 2}
+    fallback = MagicMock(return_value=generic_summary)
 
     assert owners.start_order_event_stream() is False
     assert owners.prepare_kill_switch_clear() == (True, None)
     assert owners.current_external_order_drift_generation() == 0
-    assert owners.reconcile_startup() == (False, None)
+    assert owners.reconcile_startup(fallback) is generic_summary
+    fallback.assert_called_once_with()
 
     with pytest.raises(
         RuntimeError,
@@ -304,13 +315,83 @@ def test_runtime_handle_preserves_absent_owner_defaults_and_errors() -> None:
     ):
         owners.runtime_recovery_operation()
 
+    rithmic = RithmicRuntimeOwners(
+        order_event_lifecycle=MagicMock(),
+        is_rithmic_runtime=True,
+    )
+    generic = MagicMock()
+    with pytest.raises(
+        RuntimeError,
+        match="^rithmic_ledger_recovery_unavailable$",
+    ):
+        rithmic.reconcile_startup(generic)
+    generic.assert_not_called()
+
 
 def test_runtime_handle_does_not_fall_through_when_ledger_owner_returns_none() -> None:
-    owners = RithmicRuntimeOwners(order_event_lifecycle=MagicMock())
+    owners = RithmicRuntimeOwners(
+        order_event_lifecycle=MagicMock(),
+        is_rithmic_runtime=True,
+    )
     owners.ledger_recovery = MagicMock()
     owners.ledger_recovery.reconcile_startup.return_value = None
+    fallback = MagicMock()
 
-    assert owners.reconcile_startup() == (True, None)
+    assert owners.reconcile_startup(fallback) is None
+    fallback.assert_not_called()
+
+
+@pytest.mark.parametrize(
+    "summary",
+    [
+        {"auto_resume_safe": True},
+        {"auto_resume_safe": False},
+    ],
+)
+def test_runtime_handle_preserves_rithmic_startup_result_without_fallback(
+    summary: dict[str, bool],
+) -> None:
+    ledger = MagicMock()
+    ledger.reconcile_startup.return_value = summary
+    owners = RithmicRuntimeOwners(
+        order_event_lifecycle=MagicMock(),
+        ledger_recovery=ledger,
+        is_rithmic_runtime=True,
+    )
+    fallback = MagicMock()
+
+    assert owners.reconcile_startup(fallback) is summary
+    ledger.reconcile_startup.assert_called_once_with()
+    fallback.assert_not_called()
+
+
+def test_runtime_handle_preserves_startup_exception_identity_without_fallback() -> None:
+    sentinel = RuntimeError("ledger sentinel")
+    ledger = MagicMock()
+    ledger.reconcile_startup.side_effect = sentinel
+    owners = RithmicRuntimeOwners(
+        order_event_lifecycle=MagicMock(),
+        ledger_recovery=ledger,
+        is_rithmic_runtime=True,
+    )
+    fallback = MagicMock()
+
+    with pytest.raises(RuntimeError) as raised:
+        owners.reconcile_startup(fallback)
+
+    assert raised.value is sentinel
+    fallback.assert_not_called()
+
+
+def test_runtime_handle_preserves_generic_fallback_exception_identity() -> None:
+    sentinel = RuntimeError("generic sentinel")
+    fallback = MagicMock(side_effect=sentinel)
+    owners = RithmicRuntimeOwners(order_event_lifecycle=MagicMock())
+
+    with pytest.raises(RuntimeError) as raised:
+        owners.reconcile_startup(fallback)
+
+    assert raised.value is sentinel
 
 
 def test_runtime_handle_routes_reconnect_lifecycle_to_current_owner() -> None:
@@ -392,7 +473,13 @@ def test_reconnect_policy_uses_facade_authority_before_current_owner() -> None:
             (),
             {"prepared_generation": 1, "clear_succeeded": False},
         ),
-        ("ledger_recovery", "reconcile_startup", "reconcile_startup", (), {}),
+        (
+            "ledger_recovery",
+            "reconcile_startup",
+            "reconcile_startup",
+            (MagicMock(),),
+            {},
+        ),
         (
             "ledger_recovery",
             "publish_authoritative_summary",
@@ -410,6 +497,8 @@ def test_runtime_handle_preserves_owner_exception_identity(
     kwargs: dict[str, object],
 ) -> None:
     owners = RithmicRuntimeOwners(order_event_lifecycle=MagicMock())
+    if facade_method == "reconcile_startup":
+        owners.is_rithmic_runtime = True
     owner = MagicMock()
     error = RuntimeError(owner_method)
     getattr(owner, owner_method).side_effect = error
@@ -1235,7 +1324,7 @@ def test_non_rithmic_composition_creates_no_venue_runtime_owner() -> None:
         callback.assert_not_called()
 
 
-def test_configured_ledger_recovery_remains_available_without_rithmic_adapter() -> None:
+def test_non_rithmic_composition_ignores_misleading_rithmic_configuration() -> None:
     callbacks = _callbacks()
 
     owners = build_rithmic_runtime_owners(
@@ -1250,7 +1339,7 @@ def test_configured_ledger_recovery_remains_available_without_rithmic_adapter() 
         logger=MagicMock(),
     )
 
-    assert isinstance(owners.ledger_recovery, RithmicLedgerRecoveryService)
+    assert owners.ledger_recovery is None
     assert owners.order_reconnect is None
     assert owners.runtime_recovery is None
     assert owners.external_order_drift is None
@@ -1261,3 +1350,30 @@ def test_configured_ledger_recovery_remains_available_without_rithmic_adapter() 
     assert owners.portfolio_exit_factory is None
     for callback in callbacks.__dict__.values():
         callback.assert_not_called()
+
+
+def test_same_profile_builds_distinct_explicit_account_owners() -> None:
+    owners = []
+    for account_id in ("ACCOUNT-A", "ACCOUNT-B"):
+        owners.append(
+            build_rithmic_runtime_owners(
+                adapter=_rithmic_adapter(account_id=account_id),
+                profile="orders",
+                account_id=account_id,
+                execution_engine=_execution_engine(),
+                account_service=MagicMock(spec=AccountService),
+                ops_safety=MagicMock(spec=OpsSafetyService),
+                stop_event=MagicMock(),
+                callbacks=_callbacks(),
+                logger=MagicMock(),
+            )
+        )
+
+    assert [(owner.profile, owner.account_id) for owner in owners] == [
+        ("orders", "ACCOUNT-A"),
+        ("orders", "ACCOUNT-B"),
+    ]
+    assert [owner.ledger_recovery._account_id for owner in owners] == [
+        "ACCOUNT-A",
+        "ACCOUNT-B",
+    ]
