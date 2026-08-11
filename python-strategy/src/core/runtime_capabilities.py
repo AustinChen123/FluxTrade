@@ -78,6 +78,13 @@ class RuntimeCallbacks:
     publish_authoritative_summary: Callable[[dict[str, Any]], None]
 
 
+@dataclass(frozen=True)
+class StartupReconciliationState:
+    owner_handled: bool
+    entry_admission_safe: bool
+    blocking_reason: str | None
+
+
 class RuntimeCapabilities(Protocol):
     def start_order_event_stream(self) -> bool: ...
 
@@ -116,7 +123,10 @@ class RuntimeCapabilities(Protocol):
         fallback: Callable[[], object],
     ) -> object | None: ...
 
-    def classify_startup_reconciliation(self, summary: Any) -> tuple[bool, bool]: ...
+    def classify_startup_reconciliation(
+        self,
+        summary: Any,
+    ) -> StartupReconciliationState: ...
 
     def run_emergency_flatten(
         self,
@@ -210,8 +220,11 @@ class NoopRuntimeCapabilities:
     ) -> object | None:
         return fallback()
 
-    def classify_startup_reconciliation(self, summary: Any) -> tuple[bool, bool]:
-        return False, False
+    def classify_startup_reconciliation(
+        self,
+        summary: Any,
+    ) -> StartupReconciliationState:
+        return StartupReconciliationState(False, False, None)
 
     def run_emergency_flatten(
         self,

@@ -104,7 +104,10 @@ from src.core.strategy_state_manager import (
     StrategyStateManager,
 )
 from src.core.runtime_environment import RuntimeEnvironment
-from src.core.runtime_capabilities import NoopRuntimeCapabilities
+from src.core.runtime_capabilities import (
+    NoopRuntimeCapabilities,
+    StartupReconciliationState,
+)
 from src.core.rithmic_publisher_liveness_gate import (
     RithmicPublisherLivenessGate,
 )
@@ -123,6 +126,9 @@ def test_engine_has_no_concrete_rithmic_runtime_composition_dependency() -> None
     assert "build_rithmic_runtime_owners" not in source
     assert "prepare_rithmic_runtime_bootstrap" not in source
     assert "_rithmic_runtime" not in source
+    assert "rithmic_reconciliation_owned" not in source
+    assert "rithmic_reconciliation_safe" not in source
+    assert '"rithmic_reconciliation_blocked"' not in source
 
 
 @pytest.fixture
@@ -3047,6 +3053,43 @@ class TestHeartbeatRecording:
         gate.arm.assert_not_called()
         engine._resume_after_kill_switch.assert_not_called()
         assert engine._startup_lock_cause == "rithmic_reconciliation_blocked"
+
+    def test_startup_uses_venue_owner_blocking_reason_without_provider_inference(
+        self,
+        engine,
+    ):
+        gate = MagicMock(spec=RithmicPublisherLivenessGate)
+        engine._entry_admission_gate = gate
+        engine._venue_runtime.classify_startup_reconciliation = MagicMock(
+            return_value=StartupReconciliationState(
+                owner_handled=True,
+                entry_admission_safe=False,
+                blocking_reason="synthetic_venue_reconciliation_blocked",
+            )
+        )
+        engine._check_system_state = MagicMock(return_value=False)
+        engine._reconcile_recoverable_orders_on_startup = MagicMock(return_value={})
+        engine._kill_switch_halted = True
+        for name in (
+            "_halt_for_kill_switch",
+            "_start_command_listener",
+            "_reconcile_balance",
+            "_initialize_strategy_state_cache_on_startup",
+            "_start_strategy_state_subscriber_on_startup",
+            "_start_exchange_order_event_stream",
+            "_start_heartbeat",
+            "_start_runtime_reconciliation",
+            "scan_strategies",
+            "_restore_active_strategies_on_startup",
+        ):
+            setattr(engine, name, MagicMock())
+
+        engine.startup()
+
+        gate.arm.assert_not_called()
+        assert engine._halt_for_kill_switch.call_count == 2
+        assert engine._startup_lock_cause == "synthetic_venue_reconciliation_blocked"
+        engine._restore_active_strategies_on_startup.assert_not_called()
 
     @pytest.mark.parametrize("summary", [0, "", []])
     def test_falsey_malformed_rithmic_startup_remains_locked_and_continues(

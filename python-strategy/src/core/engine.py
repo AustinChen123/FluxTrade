@@ -501,15 +501,20 @@ class StrategyEngine:
 
         def apply_reconciliation_result() -> bool:
             lockdown = persisted_lockdown
-            (
-                rithmic_reconciliation_owned,
-                rithmic_reconciliation_safe,
-            ) = self._venue_runtime.classify_startup_reconciliation(reconciliation)
-            if rithmic_reconciliation_safe and self._entry_admission_gate is not None:
+            reconciliation_state = (
+                self._venue_runtime.classify_startup_reconciliation(reconciliation)
+            )
+            if (
+                reconciliation_state.entry_admission_safe
+                and self._entry_admission_gate is not None
+            ):
                 self._entry_admission_gate.arm()
-            if rithmic_reconciliation_owned and not rithmic_reconciliation_safe:
+            if (
+                reconciliation_state.owner_handled
+                and not reconciliation_state.entry_admission_safe
+            ):
                 self._halt_for_kill_switch()
-                self._startup_lock_cause = "rithmic_reconciliation_blocked"
+                self._startup_lock_cause = reconciliation_state.blocking_reason
                 lockdown = True
             if lockdown:
                 if self._can_auto_resume_after_startup_recovery(reconciliation):

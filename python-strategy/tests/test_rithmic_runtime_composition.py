@@ -1,4 +1,4 @@
-from dataclasses import replace
+from dataclasses import FrozenInstanceError, replace
 from decimal import Decimal
 from typing import cast
 from unittest.mock import MagicMock
@@ -40,7 +40,21 @@ from src.core.interfaces import IExchangeAdapter
 from src.core.models import Signal, SignalType
 from src.core.ops_safety import OpsSafetyService
 from src.core.risk_manager import AccountService
+from src.core.runtime_capabilities import StartupReconciliationState
 from src.core.runtime_environment import RuntimeEnvironment
+
+_UNHANDLED_RECONCILIATION = StartupReconciliationState(False, False, None)
+_BLOCKED_RECONCILIATION = StartupReconciliationState(
+    True,
+    False,
+    "rithmic_reconciliation_blocked",
+)
+_SAFE_RECONCILIATION = StartupReconciliationState(True, True, None)
+
+
+def test_startup_reconciliation_state_is_immutable() -> None:
+    with pytest.raises(FrozenInstanceError):
+        setattr(_BLOCKED_RECONCILIATION, "blocking_reason", "changed")
 
 
 def _rithmic_adapter(*, profile: str = "orders", account_id: str = "ACCOUNT"):
@@ -653,22 +667,22 @@ def test_startup_balance_dispatch_defers_to_rithmic_ledger_owner() -> None:
 @pytest.mark.parametrize(
     ("is_rithmic_runtime", "summary", "expected"),
     [
-        (False, {"auto_resume_safe": True}, (False, False)),
-        (True, None, (True, False)),
-        (True, {}, (True, False)),
-        (True, 0, (True, False)),
-        (True, "", (True, False)),
-        (True, [], (True, False)),
-        (True, {"other": True}, (True, False)),
-        (True, {"auto_resume_safe": False}, (True, False)),
-        (True, {"auto_resume_safe": 1}, (True, False)),
-        (True, {"auto_resume_safe": True}, (True, True)),
+        (False, {"auto_resume_safe": True}, _UNHANDLED_RECONCILIATION),
+        (True, None, _BLOCKED_RECONCILIATION),
+        (True, {}, _BLOCKED_RECONCILIATION),
+        (True, 0, _BLOCKED_RECONCILIATION),
+        (True, "", _BLOCKED_RECONCILIATION),
+        (True, [], _BLOCKED_RECONCILIATION),
+        (True, {"other": True}, _BLOCKED_RECONCILIATION),
+        (True, {"auto_resume_safe": False}, _BLOCKED_RECONCILIATION),
+        (True, {"auto_resume_safe": 1}, _BLOCKED_RECONCILIATION),
+        (True, {"auto_resume_safe": True}, _SAFE_RECONCILIATION),
     ],
 )
 def test_startup_reconciliation_classifier_preserves_owner_and_exact_safety(
     is_rithmic_runtime: bool,
     summary: object,
-    expected: tuple[bool, bool],
+    expected: StartupReconciliationState,
 ) -> None:
     owners = RithmicRuntimeOwners(
         order_event_lifecycle=MagicMock(),

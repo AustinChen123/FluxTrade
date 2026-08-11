@@ -42,7 +42,10 @@ from src.core.interfaces import IExchangeAdapter
 from src.core.models import Candlestick, Signal, SignalType
 from src.core.ops_safety import OpsSafetyService
 from src.core.risk_manager import AccountService
-from src.core.runtime_capabilities import RuntimeCallbacks as RithmicRuntimeCallbacks
+from src.core.runtime_capabilities import (
+    RuntimeCallbacks as RithmicRuntimeCallbacks,
+    StartupReconciliationState,
+)
 from src.core.runtime_environment import RuntimeEnvironment
 
 
@@ -258,11 +261,21 @@ class RithmicRuntimeOwners:
             return None
         return fallback()
 
-    def classify_startup_reconciliation(self, summary: Any) -> tuple[bool, bool]:
+    def classify_startup_reconciliation(
+        self,
+        summary: Any,
+    ) -> StartupReconciliationState:
         """Classify startup recovery without moving generic resume policy."""
         if not self.is_rithmic_runtime:
-            return False, False
-        return True, bool(summary and summary.get("auto_resume_safe") is True)
+            return StartupReconciliationState(False, False, None)
+        entry_admission_safe = bool(summary and summary.get("auto_resume_safe") is True)
+        return StartupReconciliationState(
+            owner_handled=True,
+            entry_admission_safe=entry_admission_safe,
+            blocking_reason=(
+                None if entry_admission_safe else "rithmic_reconciliation_blocked"
+            ),
+        )
 
     def execute_strategy_exit(
         self,
