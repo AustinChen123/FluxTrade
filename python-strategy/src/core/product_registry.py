@@ -46,13 +46,23 @@ _KNOWN_PRODUCTS: dict[str, dict] = {
         "base": "ETH",
         "quote": "USDT",
     },
-    "BACKPACK:BTCUSDT-PERP": {
+    "BACKPACK:BTC_USDC-PERP": {
         "exchange": "backpack",
-        "ccxt": "BTC/USDT:USDT",
+        "ccxt": "BTC/USDC:USDC",
+        "stream_symbol": "btc_usdc",
         "base": "BTC",
-        "quote": "USDT",
+        "quote": "USDC",
+    },
+    "BACKPACK:SOL_USDC-PERP": {
+        "exchange": "backpack",
+        "ccxt": "SOL/USDC:USDC",
+        "stream_symbol": "sol_usdc",
+        "base": "SOL",
+        "quote": "USDC",
     },
 }
+
+_REJECTED_PRODUCT_IDS = frozenset({"BACKPACK:BTCUSDT-PERP"})
 
 _PERPETUAL_PRODUCT_ID_PATTERN = re.compile(r"^([A-Z0-9]+):([A-Z0-9_]+)-PERP$")
 _DATED_FUTURE_PRODUCT_ID_PATTERN = re.compile(
@@ -132,11 +142,17 @@ def calculate_required_capital(
     spec: InstrumentSpec | None,
 ) -> Decimal:
     """Calculate non-negative capital usage from one explicit instrument model."""
-    model = CapitalModel(spec.capital_model) if spec and spec.capital_model else CapitalModel.NOTIONAL
+    model = (
+        CapitalModel(spec.capital_model)
+        if spec and spec.capital_model
+        else CapitalModel.NOTIONAL
+    )
     if model == CapitalModel.PER_CONTRACT:
         capital_per_contract = spec.capital_per_contract if spec else None
         if capital_per_contract is None or capital_per_contract <= 0:
-            raise ValueError("capital_per_contract must be positive for per_contract capital")
+            raise ValueError(
+                "capital_per_contract must be positive for per_contract capital"
+            )
         return abs(quantity) * capital_per_contract
     return abs(quantity * price * resolve_contract_multiplier(spec))
 
@@ -165,6 +181,8 @@ def _parse_product_id(product_id: str) -> dict:
     Raises:
         ValueError: If product_id format is unrecognizable.
     """
+    if product_id in _REJECTED_PRODUCT_IDS:
+        raise ValueError(f"unsupported Backpack product_id: {product_id}")
     if product_id in _KNOWN_PRODUCTS:
         return _KNOWN_PRODUCTS[product_id]
 
@@ -300,7 +318,9 @@ def to_stream_key(product_id: str, timeframe: str) -> str:
     info = _parse_product_id(product_id)
     if info.get("research_only"):
         raise ValueError(f"live stream mapping is unavailable for {product_id}")
-    stream_symbol = info.get("stream_symbol") or f"{info['base']}{info['quote']}".lower()
+    stream_symbol = (
+        info.get("stream_symbol") or f"{info['base']}{info['quote']}".lower()
+    )
     return f"stream:market:{info['exchange']}:{stream_symbol}:{timeframe}"
 
 
@@ -333,7 +353,7 @@ def instrument_spec_from_product(
     min_quantity: Decimal | None = None,
     multiplier: Decimal | None = None,
     tick_value: Decimal | None = None,
-    fee_model: str | None = None,
+    fee_model: FeeModel | None = None,
     session_calendar_id: str | None = None,
 ) -> InstrumentSpec:
     info = _parse_product_id(product_id)
@@ -525,15 +545,11 @@ def _validate_dated_future_order_values(
         or spec.quantity_step <= 0
     ):
         raise ValueError("futures_quantity_step_must_be_positive")
-    if (
-        not quantity.is_finite()
-        or quantity <= 0
-    ):
+    if not quantity.is_finite() or quantity <= 0:
         raise ValueError(f"futures_quantity_must_be_positive: quantity={quantity}")
     if _floor_to_step(quantity, spec.quantity_step) != quantity:
         raise ValueError(
-            "futures_quantity_off_step: "
-            f"quantity={quantity} step={spec.quantity_step}"
+            f"futures_quantity_off_step: quantity={quantity} step={spec.quantity_step}"
         )
 
     has_price = any(
@@ -639,7 +655,11 @@ def _quantize_trigger_price(
     side: str | None,
     order_type: str | None,
 ) -> Decimal:
-    if tick is None or tick <= 0 or _floor_to_step(trigger_price, tick) == trigger_price:
+    if (
+        tick is None
+        or tick <= 0
+        or _floor_to_step(trigger_price, tick) == trigger_price
+    ):
         return trigger_price
 
     policy = _trigger_price_policy(order_type=order_type, side=side)
@@ -663,8 +683,7 @@ def _trigger_price_policy(
         if normalized_side == "sell":
             return TriggerPricePolicy.ROUND_UP
         raise ValueError(
-            "trigger_price_off_tick_without_side: "
-            f"order_type={order_type}"
+            f"trigger_price_off_tick_without_side: order_type={order_type}"
         )
     return TriggerPricePolicy.REQUIRE_ON_TICK
 
