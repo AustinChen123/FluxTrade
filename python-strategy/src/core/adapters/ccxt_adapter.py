@@ -18,6 +18,12 @@ from src.core.adapters.binance_user_stream import (
     create_binance_user_stream_listen_key,
     keepalive_binance_user_stream,
 )
+from src.core.adapters.binance_order_routing import (
+    binance_conditional_order_mapping,
+    binance_lookup_client_order_id_params,
+    binance_submission_client_order_id_params,
+    uses_binance_algo_order_endpoints,
+)
 from src.core.interfaces.exchange import (
     ExchangeOrderSnapshot,
     ExchangeError,
@@ -169,12 +175,14 @@ class CcxtExchangeAdapter(IExchangeAdapter):
         client_order_id = getattr(order, "client_order_id", None)
         if client_order_id:
             exchange_client_order_id = to_exchange_format(client_order_id, self.exchange_id)
-            if self._uses_algo_order_endpoints(order.type):
-                params["clientAlgoId"] = exchange_client_order_id
-            elif self.exchange_id == "binance":
-                params["newClientOrderId"] = exchange_client_order_id
-            else:
-                params["clientOrderId"] = exchange_client_order_id
+            params.update(
+                binance_submission_client_order_id_params(
+                    self.exchange_id,
+                    order.type,
+                    exchange_client_order_id,
+                )
+                or {"clientOrderId": exchange_client_order_id}
+            )
 
         try:
             self.logger.info(
@@ -202,47 +210,21 @@ class CcxtExchangeAdapter(IExchangeAdapter):
         except ccxt.BaseError as e:
             raise ExchangeError(f"Order placement failed: {e}") from e
 
-    _BINANCE_ALGO_ORDER_TYPES = frozenset({"stop_loss", "take_profit"})
     _SUPPORTED_PLAIN_ORDER_TYPES = frozenset({"market", "limit"})
-
-    def _uses_algo_order_endpoints(self, order_type: Optional[str]) -> bool:
-        """Binance USDT-M conditional orders live in the algo order id namespace.
-
-        ccxt only routes create/fetch/cancel to the futures algo endpoints when
-        the conditional flag is present (ccxt 4.5 binance.py cancel_order /
-        fetch_order: ``isConditional = safe_bool_n(['stop','trigger','conditional'])``).
-        Without it the algoId/clientAlgoId is sent to the regular order endpoint
-        and the order is reported as not found.
-        """
-        return (
-            self.exchange_id == "binance"
-            and (order_type or "").lower() in self._BINANCE_ALGO_ORDER_TYPES
-        )
 
     def _ccxt_order_type_and_params(self, order: Order) -> tuple[str, dict]:
         order_type = (order.type or "").lower()
-        if order_type in {"stop_loss", "take_profit"} and self.exchange_id != "binance":
-            raise ExchangeError(
-                f"conditional_order_mapping_unsupported: exchange={self.exchange_id}"
-            )
+        conditional = binance_conditional_order_mapping(
+            self.exchange_id,
+            order_type,
+            order.trigger_price,
+        )
+        if conditional is not None:
+            return conditional
         if order_type == "trailing_stop":
             raise ExchangeError(
                 f"trailing_stop_mapping_unsupported: exchange={self.exchange_id}"
             )
-        if order_type == "stop_loss":
-            if order.trigger_price is None:
-                raise ExchangeError("stop_loss_requires_trigger_price")
-            return "STOP_MARKET", {
-                "stopLossPrice": str(order.trigger_price),
-                "reduceOnly": True,
-            }
-        if order_type == "take_profit":
-            if order.trigger_price is None:
-                raise ExchangeError("take_profit_requires_trigger_price")
-            return "TAKE_PROFIT_MARKET", {
-                "takeProfitPrice": str(order.trigger_price),
-                "reduceOnly": True,
-            }
         if order_type in self._SUPPORTED_PLAIN_ORDER_TYPES:
             return order_type, {}
         raise ExchangeError(f"order_type_mapping_unsupported: order_type={order_type}")
@@ -700,7 +682,7 @@ class CcxtExchangeAdapter(IExchangeAdapter):
     ) -> bool:
         ccxt_symbol = to_ccxt_symbol(product_id)
         try:
-            if self._uses_algo_order_endpoints(order_type):
+            if uses_binance_algo_order_endpoints(self.exchange_id, order_type):
                 self.client.cancel_order(order_id, ccxt_symbol, params={"trigger": True})
             else:
                 self.client.cancel_order(order_id, ccxt_symbol)
@@ -744,11 +726,11 @@ class CcxtExchangeAdapter(IExchangeAdapter):
         exchange_client_order_id: str,
         order_type: Optional[str],
     ) -> dict:
-        if self._uses_algo_order_endpoints(order_type):
-            return {"clientAlgoId": exchange_client_order_id, "trigger": True}
-        if self.exchange_id == "binance":
-            return {"origClientOrderId": exchange_client_order_id}
-        return {"clientOrderId": exchange_client_order_id}
+        return binance_lookup_client_order_id_params(
+            self.exchange_id,
+            order_type,
+            exchange_client_order_id,
+        ) or {"clientOrderId": exchange_client_order_id}
 
     def get_order_by_client_id(
         self,
