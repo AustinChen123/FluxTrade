@@ -1,6 +1,6 @@
 import threading
 from concurrent.futures import ThreadPoolExecutor
-from decimal import Decimal
+from decimal import Decimal, InvalidOperation
 from types import SimpleNamespace
 from unittest.mock import Mock
 
@@ -14,6 +14,7 @@ from src.core.adapters.rithmic_adapter import (
 )
 from src.core.interfaces.exchange import ExchangeError, NetworkError
 from src.core.models import PositionSide
+from src.core.order_reconciliation import OrderReconciler
 
 
 PRODUCT_ID = "RITHMIC:NQ-202609"
@@ -1114,6 +1115,36 @@ def test_lookup_normalizes_remote_state_matrix(
     client.lookup.assert_called_once_with("client-1", "CME", "NQU6")
 
 
+def test_lookup_delegates_remote_snapshot_projection_once(adapter, client, monkeypatch):
+    adapter.start_order_event_stream()
+    remote = snapshot()
+    trace = []
+
+    def lookup(*_args):
+        assert adapter._client_lock.locked() is True
+        trace.append("lookup")
+        return remote
+
+    client.lookup.side_effect = lookup
+    expected = object()
+
+    def project(*args, **kwargs):
+        assert adapter._client_lock.locked() is False
+        trace.append("project")
+        assert args == (remote,)
+        assert kwargs == {"account_id": "ACCOUNT"}
+        return expected
+
+    monkeypatch.setattr(
+        rithmic_adapter_module,
+        "project_rithmic_order_snapshot",
+        project,
+    )
+
+    assert adapter.get_order_by_client_id("client-1", PRODUCT_ID) is expected
+    assert trace == ["lookup", "project"]
+
+
 def test_cancel_by_client_id_uses_lookup_basket_identity(adapter, client):
     adapter.start_order_event_stream()
     client.lookup.return_value = snapshot()
@@ -1223,6 +1254,206 @@ def test_order_event_maps_native_identity_and_decimal_fields(adapter, client):
     assert mapped.raw["trigger_price"] == "19998.25"
     assert mapped.raw["price_type"] == "stop_market"
     assert mapped.raw["bracket_type"] == "target_and_stop_static"
+
+
+def test_poll_delegates_resolved_order_event_projection_once(
+    adapter,
+    client,
+    monkeypatch,
+):
+    adapter.start_order_event_stream()
+    remote = event()
+    client.poll_event.return_value = remote
+    expected = object()
+    projection = Mock(return_value=expected)
+    monkeypatch.setattr(
+        rithmic_adapter_module,
+        "project_rithmic_order_event",
+        projection,
+    )
+
+    assert adapter.poll_order_event() is expected
+    projection.assert_called_once_with(
+        remote,
+        product_id=PRODUCT_ID,
+        client_order_id="client-1",
+        native_identity=("CME", "NQU6"),
+    )
+
+
+def test_event_identity_and_bracket_resolution_precede_unlocked_projection(
+    adapter,
+    client,
+    monkeypatch,
+):
+    adapter.start_order_event_stream()
+    remote = event()
+    trace = []
+
+    def poll_event():
+        assert adapter._client_lock.locked() is True
+        trace.append("poll")
+        return remote
+
+    client.poll_event.side_effect = poll_event
+    mapping_before = dict(adapter._products_by_native_identity)
+    original_identity_resolver = (
+        rithmic_adapter_module.resolve_rithmic_order_event_identity
+    )
+
+    def identify(*args, **kwargs):
+        assert adapter._client_lock.locked() is False
+        trace.append("identity")
+        return original_identity_resolver(*args, **kwargs)
+
+    def resolve(**_kwargs):
+        assert adapter._client_lock.locked() is True
+        trace.append("resolve")
+        return "resolved-child-client-1"
+
+    expected = object()
+
+    def project(*args, **kwargs):
+        assert adapter._client_lock.locked() is False
+        trace.append("project")
+        assert args == (remote,)
+        assert kwargs == {
+            "product_id": PRODUCT_ID,
+            "client_order_id": "resolved-child-client-1",
+            "native_identity": ("CME", "NQU6"),
+        }
+        return expected
+
+    monkeypatch.setattr(
+        rithmic_adapter_module,
+        "resolve_rithmic_order_event_identity",
+        identify,
+    )
+    monkeypatch.setattr(
+        rithmic_adapter_module,
+        "resolve_native_bracket_event_client_order_id",
+        resolve,
+    )
+    monkeypatch.setattr(
+        rithmic_adapter_module,
+        "project_rithmic_order_event",
+        project,
+    )
+
+    assert adapter.poll_order_event() is expected
+    assert trace == ["poll", "identity", "resolve", "project"]
+    assert adapter._products_by_native_identity == mapping_before
+
+
+def test_unmapped_event_stops_before_bracket_resolution_or_projection(
+    adapter,
+    client,
+    monkeypatch,
+):
+    adapter.start_order_event_stream()
+    client.poll_event.return_value = event(account_id="ACCOUNT-B", symbol="ESU6")
+    mapping_before = dict(adapter._products_by_native_identity)
+    resolver = Mock()
+    projection = Mock()
+    monkeypatch.setattr(
+        rithmic_adapter_module,
+        "resolve_native_bracket_event_client_order_id",
+        resolver,
+    )
+    monkeypatch.setattr(
+        rithmic_adapter_module,
+        "project_rithmic_order_event",
+        projection,
+    )
+
+    with pytest.raises(RithmicUnmappedOrderEvent) as caught:
+        adapter.poll_order_event()
+
+    assert caught.value.account_id == "ACCOUNT"
+    resolver.assert_not_called()
+    projection.assert_not_called()
+    assert adapter._products_by_native_identity == mapping_before
+
+
+def test_bracket_identity_conflict_stops_before_decimal_projection(
+    adapter,
+    client,
+    monkeypatch,
+):
+    adapter.start_order_event_stream()
+    client.poll_event.return_value = event(cumulative_filled_quantity="not-decimal")
+    mapping_before = dict(adapter._products_by_native_identity)
+    projection = Mock()
+
+    def conflict(**_kwargs):
+        assert adapter._client_lock.locked() is True
+        raise ExchangeError("native_bracket_event_identity_conflict")
+
+    monkeypatch.setattr(
+        rithmic_adapter_module,
+        "resolve_native_bracket_event_client_order_id",
+        conflict,
+    )
+    monkeypatch.setattr(
+        rithmic_adapter_module,
+        "project_rithmic_order_event",
+        projection,
+    )
+
+    with pytest.raises(ExchangeError, match="native_bracket_event_identity_conflict"):
+        adapter.poll_order_event()
+
+    projection.assert_not_called()
+    assert adapter._client_lock.locked() is False
+    assert adapter._products_by_native_identity == mapping_before
+
+
+def test_event_decimal_failure_occurs_after_lock_release_without_mapping_mutation(
+    adapter,
+    client,
+):
+    adapter.start_order_event_stream()
+    client.poll_event.return_value = event(cumulative_filled_quantity="not-decimal")
+    mapping_before = dict(adapter._products_by_native_identity)
+
+    with pytest.raises(InvalidOperation):
+        adapter.poll_order_event()
+
+    assert adapter._client_lock.locked() is False
+    assert adapter._products_by_native_identity == mapping_before
+
+
+def test_reconciliation_does_not_reclassify_malformed_snapshot_decimal(
+    adapter,
+    client,
+):
+    adapter.start_order_event_stream()
+    client.lookup.return_value = snapshot(quantity="not-decimal")
+    recoverable_order = SimpleNamespace(
+        id="order-1",
+        client_order_id="client-1",
+        product_id=PRODUCT_ID,
+        type="limit",
+        status="submitted",
+        intent_payload={},
+    )
+    repo = Mock()
+    repo.list_client_orders_by_statuses.return_value = [recoverable_order]
+    reconciler = OrderReconciler(
+        adapter=adapter,
+        order_manager=SimpleNamespace(repo=repo),
+        clock=Mock(),
+        db_session_factory=None,
+        process_exchange_order_event=Mock(),
+        place_pending_protection_for_filled_entries=Mock(),
+        fail_pending_conditionals_for_terminal_entry=Mock(),
+        protective_terminal_without_fill_failure=Mock(),
+        cancel_protective_order_when_sibling_closed=Mock(),
+        cancel_linked_conditional_for_protection_fill=Mock(),
+    )
+
+    with pytest.raises(InvalidOperation):
+        reconciler.resync_recoverable_order_events()
 
 
 def test_unknown_order_event_instrument_fails_closed(adapter, client):

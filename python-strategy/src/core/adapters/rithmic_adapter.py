@@ -15,6 +15,12 @@ from src.core.adapters.rithmic_native_bracket import (
     resolve_native_bracket_event_client_order_id,
     supports_native_bracket_group,
 )
+from src.core.adapters.rithmic_order_observation import (
+    RithmicUnmappedOrderEvent as RithmicUnmappedOrderEvent,
+    project_rithmic_order_event,
+    project_rithmic_order_snapshot,
+    resolve_rithmic_order_event_identity,
+)
 from src.core.interfaces.exchange import (
     EntryAdmissionGate,
     ExchangeError,
@@ -33,19 +39,6 @@ from src.core.product_registry import (
     quantize_order_values,
     to_rithmic_symbol,
 )
-
-
-class RithmicUnmappedOrderEvent(ExchangeError):
-    """Account-level order event whose instrument is not locally configured."""
-
-    def __init__(self, *, account_id: str, exchange: str, symbol: str):
-        self.account_id = account_id
-        self.exchange = exchange
-        self.symbol = symbol
-        super().__init__(
-            "unknown_rithmic_order_event_instrument: "
-            f"account_id={account_id} exchange={exchange} symbol={symbol}"
-        )
 
 
 class RithmicExchangeAdapter(IExchangeAdapter):
@@ -361,27 +354,7 @@ class RithmicExchangeAdapter(IExchangeAdapter):
             raise _map_runtime_error("rithmic_order_lookup_failed", error) from error
         if remote is None:
             return None
-        quantity = Decimal(str(remote.quantity))
-        filled_quantity = _event_decimal(remote.filled_quantity) or Decimal("0")
-        status = _normalize_snapshot_status(
-            str(remote.status),
-            filled_quantity,
-            quantity,
-            notification_type=getattr(remote, "notification_type", None),
-        )
-        return ExchangeOrderSnapshot(
-            client_order_id=str(remote.client_order_id),
-            exchange_order_id=str(remote.basket_id),
-            status=status,
-            filled_quantity=filled_quantity,
-            average_price=_event_decimal(remote.average_fill_price),
-            raw={
-                "basket_id": str(remote.basket_id),
-                "exchange_order_id": remote.exchange_order_id,
-                "quantity": str(remote.quantity),
-                "account_id": self.account_id,
-            },
-        )
+        return project_rithmic_order_snapshot(remote, account_id=self.account_id)
 
     def poll_order_event(self) -> ExchangeOrderEvent | None:
         try:
@@ -391,14 +364,11 @@ class RithmicExchangeAdapter(IExchangeAdapter):
             raise _map_runtime_error("rithmic_order_event_failed", error) from error
         if event is None:
             return None
-        identity = (str(event.exchange).upper(), str(event.symbol).upper())
-        product_id = self._products_by_native_identity.get(identity)
-        if product_id is None:
-            raise RithmicUnmappedOrderEvent(
-                account_id=self.account_id,
-                exchange=identity[0],
-                symbol=identity[1],
-            )
+        product_id, native_identity = resolve_rithmic_order_event_identity(
+            event,
+            account_id=self.account_id,
+            products_by_native_identity=self._products_by_native_identity,
+        )
         client_order_id = event.client_order_id
         original_basket_id = event.original_basket_id
         basket_id = str(event.basket_id)
@@ -411,31 +381,11 @@ class RithmicExchangeAdapter(IExchangeAdapter):
                 groups=self._native_brackets_by_parent,
                 parent_ids=self._native_bracket_parent_client_order_ids,
             )
-        return ExchangeOrderEvent(
-            status=str(event.status),
+        return project_rithmic_order_event(
+            event,
             product_id=product_id,
             client_order_id=client_order_id,
-            exchange_order_id=basket_id,
-            cumulative_filled_quantity=_event_decimal(event.cumulative_filled_quantity),
-            cumulative_average_price=_event_decimal(event.cumulative_average_price),
-            last_fill_quantity=_event_decimal(event.last_fill_quantity),
-            last_fill_price=_event_decimal(event.last_fill_price),
-            event_timestamp=event.timestamp_ms,
-            raw={
-                "basket_id": str(event.basket_id),
-                "native_parent_client_order_id": event.client_order_id,
-                "original_basket_id": event.original_basket_id,
-                "linked_basket_ids": event.linked_basket_ids,
-                "exchange_order_id": event.exchange_order_id,
-                "account_id": event.account_id,
-                "exchange": identity[0],
-                "symbol": identity[1],
-                "price": event.price,
-                "trigger_price": event.trigger_price,
-                "price_type": event.price_type,
-                "bracket_type": event.bracket_type,
-                "notification_type": getattr(event, "notification_type", None),
-            },
+            native_identity=native_identity,
         )
 
     def get_instrument_spec(self, product_id: str) -> InstrumentSpec:
@@ -524,46 +474,6 @@ def _order_side(order: Order) -> str:
     if normalized not in {"buy", "sell"}:
         raise ExchangeError(f"rithmic_order_side_unsupported: side={normalized}")
     return normalized
-
-
-def _event_decimal(value) -> Decimal | None:
-    return Decimal(str(value)) if value is not None else None
-
-
-def _normalize_snapshot_status(
-    status: str,
-    filled_quantity: Decimal,
-    quantity: Decimal,
-    *,
-    notification_type: str | None = None,
-) -> str:
-    normalized = status.strip().lower().replace("-", "_").replace(" ", "_")
-    notification = str(notification_type or "").strip().upper()
-    if quantity <= 0 or filled_quantity < 0 or filled_quantity > quantity:
-        raise ExchangeError("invalid_rithmic_order_snapshot_quantities")
-    if notification == "CANCEL":
-        if filled_quantity == quantity:
-            raise ExchangeError("invalid_rithmic_cancel_snapshot_quantities")
-        return "cancelled"
-    if notification == "REJECT":
-        if filled_quantity == quantity:
-            raise ExchangeError("invalid_rithmic_reject_snapshot_quantities")
-        return "rejected"
-    if normalized in {"open", "open_pending", "new", "submitted", "accepted"}:
-        return "partially_filled" if filled_quantity > 0 else "open"
-    if normalized in {"partial", "partially_filled", "partiallyfilled"}:
-        if Decimal("0") < filled_quantity < quantity:
-            return "partially_filled"
-    elif normalized in {"complete", "completed", "filled"}:
-        if filled_quantity == quantity:
-            return "filled"
-    elif normalized in {"cancel", "canceled", "cancelled"}:
-        return "cancelled"
-    elif normalized in {"reject", "rejected", "failed", "expired"}:
-        return "rejected"
-    raise ExchangeError(
-        f"unsupported_rithmic_order_snapshot_status: status={normalized}"
-    )
 
 
 def _map_runtime_error(prefix: str, error: RuntimeError) -> ExchangeError:
