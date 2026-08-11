@@ -19,6 +19,9 @@ from src.core.db import SessionLocal
 from src.core.clock import RealtimeClock
 from src.core.metrics import configure_metrics
 from src.core.product_registry import to_exchange_name
+from src.core.adapters.backpack_live_config import (
+    build_backpack_live_adapter_config,
+)
 from src.core.adapters.ccxt_live_credentials import build_ccxt_live_credentials
 from src.core.adapters.rithmic_live_config import (
     build_rithmic_live_adapter_config,
@@ -153,6 +156,11 @@ def _adapter_config_from_env() -> dict:
         raise ValueError(
             f"INSTRUMENT_PRODUCT_IDS must use {exchange.upper()} venue: "
             f"{', '.join(mismatched_products)}"
+        )
+    if exchange == "backpack":
+        return build_backpack_live_adapter_config(
+            product_ids=product_ids,
+            environ=os.environ,
         )
     account_initialization = {
         "product_ids": product_ids,
