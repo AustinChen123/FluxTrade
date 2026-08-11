@@ -13,6 +13,7 @@ from src.core.adapters.live_binance import (
     LiveBinanceAdapter,
     create_binance_live_adapter,
 )
+from src.core.adapters.live_backpack import create_backpack_live_adapter
 from src.core.adapters.rithmic_adapter import (
     RithmicExchangeAdapter,
     RithmicUnmappedOrderEvent,
@@ -97,6 +98,13 @@ def create_adapter(
                 enable_ws=enable_ws,
                 extra_config=extra_config,
                 operation_guard=guard,
+            )
+        elif exchange_id == "backpack":
+            adapter = create_backpack_live_adapter(
+                api_key=api_key,
+                secret=secret,
+                testnet=testnet,
+                extra_config=extra_config,
             )
         else:
             adapter = CcxtExchangeAdapter(
