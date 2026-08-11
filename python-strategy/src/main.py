@@ -1,10 +1,8 @@
 import logging
-import json
 import os
 import signal
 import sys
 from contextlib import contextmanager
-from pathlib import Path
 
 import structlog
 
@@ -21,6 +19,10 @@ from src.core.db import SessionLocal
 from src.core.clock import RealtimeClock
 from src.core.metrics import configure_metrics
 from src.core.product_registry import to_exchange_name
+from src.core.adapters.rithmic_live_config import (
+    build_rithmic_live_adapter_config,
+    validate_rithmic_recovery_identity,
+)
 
 
 def _setup_logging() -> None:
@@ -126,17 +128,6 @@ def _required_env_flag(name: str) -> bool:
     return _env_flag(name)
 
 
-def _env_json_object(name: str) -> dict:
-    raw = _required_env(name)
-    try:
-        value = json.loads(raw)
-    except json.JSONDecodeError as exc:
-        raise ValueError(f"{name} must be valid JSON") from exc
-    if not isinstance(value, dict) or not value:
-        raise ValueError(f"{name} must be a non-empty JSON object")
-    return value
-
-
 def _adapter_config_from_env() -> dict:
     if os.getenv("FLUXTRADE_ENVIRONMENT") == "live":
         mode = _required_env("ADAPTER_MODE")
@@ -190,45 +181,24 @@ def _adapter_config_from_env() -> dict:
         )
         return config
 
-    rithmic_profile = _required_env("RITHMIC_PROFILE")
-    account_id = _required_env("RITHMIC_ACCOUNT_ID")
-    instruments = _env_json_object("RITHMIC_INSTRUMENTS_JSON")
-    if set(instruments) != set(product_ids):
-        raise ValueError(
-            "RITHMIC_INSTRUMENTS_JSON keys must match INSTRUMENT_PRODUCT_IDS"
-        )
-    credentials_path = Path(_required_env("FLUXTRADE_CREDENTIALS_PATH"))
-    if not credentials_path.is_file():
-        raise ValueError("FLUXTRADE_CREDENTIALS_PATH must reference a file")
-    recovery_profile = (
-        os.getenv("RITHMIC_RECOVERY_PROFILE") or rithmic_profile
-    ).strip()
     config.update(
-        {
-            "rithmic_profile": rithmic_profile,
-            "account_id": account_id,
-            "rithmic_instruments": instruments,
-            "rithmic_recovery_profile": recovery_profile,
-            "rithmic_recovery_account_id": account_id,
-        }
+        build_rithmic_live_adapter_config(
+            product_ids=product_ids,
+            environ=os.environ,
+        )
     )
     return config
 
 
-def _validate_runtime_config(adapter_config: dict, *, audit_external_orders: bool) -> None:
+def _validate_runtime_config(
+    adapter_config: dict, *, audit_external_orders: bool
+) -> None:
     if adapter_config.get("mode") == "live" and not audit_external_orders:
         raise ValueError(
             "live_adapter_requires_audit_external_orders: "
             "set AUDIT_EXTERNAL_ORDERS=true for live trading"
         )
-    if adapter_config.get("rithmic_recovery_profile") and not adapter_config.get(
-        "rithmic_recovery_account_id"
-    ):
-        raise ValueError("rithmic_recovery_requires_account_id")
-    if adapter_config.get("rithmic_recovery_account_id") and not adapter_config.get(
-        "rithmic_recovery_profile"
-    ):
-        raise ValueError("rithmic_account_id_requires_recovery_profile")
+    validate_rithmic_recovery_identity(adapter_config)
 
 
 @contextmanager

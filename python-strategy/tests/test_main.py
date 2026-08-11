@@ -1,9 +1,30 @@
+import inspect
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 import pytest
 
 from src import main as strategy_main
+
+
+def _forbid_runtime_initialization(monkeypatch) -> dict[str, MagicMock]:
+    owners = {
+        name: MagicMock(side_effect=AssertionError(f"{name} initialized"))
+        for name in (
+            "DataConsumer",
+            "SessionLocal",
+            "StrategyEngine",
+            "configure_metrics",
+        )
+    }
+    for name, owner in owners.items():
+        monkeypatch.setattr(strategy_main, name, owner)
+    return owners
+
+
+def _assert_initialization_not_called(owners: dict[str, MagicMock]) -> None:
+    for owner in owners.values():
+        owner.assert_not_called()
 
 
 def _set_live_ccxt_env(monkeypatch) -> None:
@@ -55,16 +76,22 @@ def test_env_flag_rejects_ambiguous_value(monkeypatch) -> None:
 
 def test_env_nonnegative_int_uses_default_and_override(monkeypatch) -> None:
     monkeypatch.delenv("MARKET_PENDING_CLAIM_IDLE_MS", raising=False)
-    assert strategy_main._env_nonnegative_int(
-        "MARKET_PENDING_CLAIM_IDLE_MS",
-        60_000,
-    ) == 60_000
+    assert (
+        strategy_main._env_nonnegative_int(
+            "MARKET_PENDING_CLAIM_IDLE_MS",
+            60_000,
+        )
+        == 60_000
+    )
 
     monkeypatch.setenv("MARKET_PENDING_CLAIM_IDLE_MS", "2500")
-    assert strategy_main._env_nonnegative_int(
-        "MARKET_PENDING_CLAIM_IDLE_MS",
-        60_000,
-    ) == 2500
+    assert (
+        strategy_main._env_nonnegative_int(
+            "MARKET_PENDING_CLAIM_IDLE_MS",
+            60_000,
+        )
+        == 2500
+    )
 
 
 def test_env_nonnegative_int_rejects_negative_value(monkeypatch) -> None:
@@ -82,10 +109,13 @@ def test_env_nonnegative_int_rejects_negative_value(monkeypatch) -> None:
 
 def test_env_positive_int_uses_default_and_rejects_zero(monkeypatch) -> None:
     monkeypatch.delenv("MARKET_CONSUMER_LEASE_MS", raising=False)
-    assert strategy_main._env_positive_int(
-        "MARKET_CONSUMER_LEASE_MS",
-        10_000,
-    ) == 10_000
+    assert (
+        strategy_main._env_positive_int(
+            "MARKET_CONSUMER_LEASE_MS",
+            10_000,
+        )
+        == 10_000
+    )
 
     monkeypatch.setenv("MARKET_CONSUMER_LEASE_MS", "0")
     with pytest.raises(
@@ -213,6 +243,166 @@ def test_adapter_config_from_env_wires_rithmic_live_identity(monkeypatch) -> Non
     assert config["rithmic_recovery_account_id"] == "ACCOUNT"
 
 
+def test_rithmic_live_config_delegates_to_venue_owner_exactly_once(
+    monkeypatch,
+) -> None:
+    _set_live_rithmic_env(monkeypatch)
+    owner_result = {
+        "rithmic_profile": "OWNER-PROFILE",
+        "account_id": "OWNER-ACCOUNT",
+        "rithmic_instruments": {"owner": "result"},
+        "rithmic_recovery_profile": "OWNER-RECOVERY",
+        "rithmic_recovery_account_id": "OWNER-ACCOUNT",
+    }
+    owner = MagicMock(return_value=owner_result)
+    monkeypatch.setattr(
+        strategy_main,
+        "build_rithmic_live_adapter_config",
+        owner,
+        raising=False,
+    )
+
+    config = strategy_main._adapter_config_from_env()
+
+    owner.assert_called_once()
+    assert owner.call_args.kwargs["product_ids"] == ["RITHMIC:NQ-202609"]
+    assert owner.call_args.kwargs["environ"] is strategy_main.os.environ
+    assert {key: config[key] for key in owner_result} == owner_result
+
+
+def test_generic_main_has_one_rithmic_policy_entrypoint() -> None:
+    source = inspect.getsource(strategy_main._adapter_config_from_env)
+
+    assert source.count("build_rithmic_live_adapter_config(") == 1
+    assert "RITHMIC_" not in source
+    assert "json." not in source
+    assert "Path(" not in source
+    assert ".is_file(" not in source
+
+
+@pytest.mark.parametrize("mode", ["simulated", "binance"])
+def test_non_rithmic_config_never_calls_rithmic_owner(monkeypatch, mode) -> None:
+    owner = MagicMock(side_effect=AssertionError("Rithmic owner called"))
+    monkeypatch.setattr(
+        strategy_main,
+        "build_rithmic_live_adapter_config",
+        owner,
+        raising=False,
+    )
+    monkeypatch.setenv("RITHMIC_ACCOUNT_ID", "MISLEADING")
+    if mode == "simulated":
+        monkeypatch.delenv("FLUXTRADE_ENVIRONMENT", raising=False)
+        monkeypatch.setenv("ADAPTER_MODE", "simulated")
+    else:
+        _set_live_ccxt_env(monkeypatch)
+
+    strategy_main._adapter_config_from_env()
+
+    owner.assert_not_called()
+
+
+def test_common_product_failure_precedes_rithmic_owner_and_audit_reader(
+    monkeypatch,
+) -> None:
+    _set_live_rithmic_env(monkeypatch)
+    monkeypatch.setenv("INSTRUMENT_PRODUCT_IDS", "BINANCE:BTCUSDT-PERP")
+    owner = MagicMock(side_effect=AssertionError("Rithmic owner called"))
+    audit_reader = MagicMock(side_effect=AssertionError("audit read"))
+    initialization = _forbid_runtime_initialization(monkeypatch)
+    monkeypatch.setattr(
+        strategy_main,
+        "build_rithmic_live_adapter_config",
+        owner,
+        raising=False,
+    )
+    monkeypatch.setattr(strategy_main, "_required_env_flag", audit_reader)
+
+    with pytest.raises(ValueError, match="must use RITHMIC venue"):
+        strategy_main.main()
+
+    owner.assert_not_called()
+    audit_reader.assert_not_called()
+    _assert_initialization_not_called(initialization)
+
+
+def test_rithmic_owner_failure_precedes_audit_and_initialization(monkeypatch) -> None:
+    _set_live_rithmic_env(monkeypatch)
+    sentinel = RuntimeError("rithmic-config-owner-sentinel")
+    owner = MagicMock(side_effect=sentinel)
+    audit_reader = MagicMock(side_effect=AssertionError("audit read"))
+    initialization = _forbid_runtime_initialization(monkeypatch)
+    monkeypatch.setattr(
+        strategy_main,
+        "build_rithmic_live_adapter_config",
+        owner,
+        raising=False,
+    )
+    monkeypatch.setattr(strategy_main, "_required_env_flag", audit_reader)
+
+    with pytest.raises(RuntimeError) as raised:
+        strategy_main.main()
+
+    assert raised.value is sentinel
+    owner.assert_called_once()
+    audit_reader.assert_not_called()
+    _assert_initialization_not_called(initialization)
+
+
+def test_live_audit_failure_precedes_recovery_identity_validation(
+    monkeypatch,
+) -> None:
+    adapter_config = {
+        "mode": "live",
+        "exchange": "rithmic",
+        "rithmic_recovery_profile": "orders",
+    }
+    validator = MagicMock(side_effect=AssertionError("identity validation reached"))
+    initialization = _forbid_runtime_initialization(monkeypatch)
+    monkeypatch.setattr(
+        strategy_main, "_adapter_config_from_env", lambda: adapter_config
+    )
+    monkeypatch.setattr(strategy_main, "_required_env_flag", lambda _name: False)
+    monkeypatch.setattr(
+        strategy_main,
+        "validate_rithmic_recovery_identity",
+        validator,
+        raising=False,
+    )
+
+    with pytest.raises(ValueError, match="live_adapter_requires_audit_external_orders"):
+        strategy_main.main()
+
+    validator.assert_not_called()
+    _assert_initialization_not_called(initialization)
+
+
+def test_runtime_validation_delegates_recovery_identity_after_audit(
+    monkeypatch,
+) -> None:
+    adapter_config = {
+        "mode": "live",
+        "exchange": "rithmic",
+        "rithmic_recovery_profile": "orders",
+        "rithmic_recovery_account_id": "ACCOUNT",
+    }
+    sentinel = RuntimeError("rithmic-identity-validator-sentinel")
+    validator = MagicMock(side_effect=sentinel)
+    monkeypatch.setattr(
+        strategy_main,
+        "validate_rithmic_recovery_identity",
+        validator,
+    )
+
+    with pytest.raises(RuntimeError) as raised:
+        strategy_main._validate_runtime_config(
+            adapter_config,
+            audit_external_orders=True,
+        )
+
+    assert raised.value is sentinel
+    validator.assert_called_once_with(adapter_config)
+
+
 def test_rithmic_recovery_profile_defaults_to_order_profile(monkeypatch) -> None:
     _set_live_rithmic_env(monkeypatch)
     monkeypatch.delenv("RITHMIC_RECOVERY_PROFILE", raising=False)
@@ -320,8 +510,12 @@ def test_validate_runtime_config_requires_rithmic_account_id() -> None:
         )
 
 
-def test_adapter_config_preserves_incomplete_identity_for_validation(monkeypatch) -> None:
-    with pytest.raises(ValueError, match="rithmic_account_id_requires_recovery_profile"):
+def test_adapter_config_preserves_incomplete_identity_for_validation(
+    monkeypatch,
+) -> None:
+    with pytest.raises(
+        ValueError, match="rithmic_account_id_requires_recovery_profile"
+    ):
         strategy_main._validate_runtime_config(
             {
                 "mode": "live",
@@ -335,10 +529,14 @@ def test_main_rejects_live_without_audit_before_initialization(monkeypatch) -> N
     _set_live_ccxt_env(monkeypatch)
     monkeypatch.setenv("AUDIT_EXTERNAL_ORDERS", "false")
 
-    with patch("src.main.configure_metrics") as configure_metrics, \
-         patch("src.main.SessionLocal") as session_local, \
-         patch("src.main.StrategyEngine") as engine_cls:
-        with pytest.raises(ValueError, match="live_adapter_requires_audit_external_orders"):
+    with (
+        patch("src.main.configure_metrics") as configure_metrics,
+        patch("src.main.SessionLocal") as session_local,
+        patch("src.main.StrategyEngine") as engine_cls,
+    ):
+        with pytest.raises(
+            ValueError, match="live_adapter_requires_audit_external_orders"
+        ):
             strategy_main.main()
 
     configure_metrics.assert_not_called()
@@ -350,8 +548,10 @@ def test_main_requires_explicit_live_audit_flag(monkeypatch) -> None:
     _set_live_ccxt_env(monkeypatch)
     monkeypatch.delenv("AUDIT_EXTERNAL_ORDERS", raising=False)
 
-    with patch("src.main.configure_metrics") as configure_metrics, \
-         patch("src.main.SessionLocal") as session_local:
+    with (
+        patch("src.main.configure_metrics") as configure_metrics,
+        patch("src.main.SessionLocal") as session_local,
+    ):
         with pytest.raises(
             ValueError,
             match="AUDIT_EXTERNAL_ORDERS must be set explicitly",
@@ -372,9 +572,7 @@ def test_main_wires_session_factory_and_audit_flag(monkeypatch) -> None:
     engine.build_stream_channels.return_value = []
     consumer = MagicMock(spec=strategy_main.DataConsumer)
     events = []
-    consumer.acquire_service_ownership.side_effect = lambda: events.append(
-        "ownership"
-    )
+    consumer.acquire_service_ownership.side_effect = lambda: events.append("ownership")
     engine.startup.side_effect = lambda **_kwargs: events.append("startup")
     engine.shutdown.side_effect = lambda **_kwargs: events.append("engine_shutdown")
     consumer.stop.side_effect = lambda: events.append("consumer_stop")
@@ -383,10 +581,12 @@ def test_main_wires_session_factory_and_audit_flag(monkeypatch) -> None:
         events.append("engine_construct")
         return engine
 
-    with patch("src.main.configure_metrics"), \
-         patch("src.main.SessionLocal", return_value=db_session), \
-         patch("src.main.StrategyEngine", side_effect=build_engine) as engine_cls, \
-         patch("src.main.DataConsumer", return_value=consumer) as consumer_cls:
+    with (
+        patch("src.main.configure_metrics"),
+        patch("src.main.SessionLocal", return_value=db_session),
+        patch("src.main.StrategyEngine", side_effect=build_engine) as engine_cls,
+        patch("src.main.DataConsumer", return_value=consumer) as consumer_cls,
+    ):
         strategy_main.main()
 
     kwargs = engine_cls.call_args.kwargs
@@ -394,10 +594,7 @@ def test_main_wires_session_factory_and_audit_flag(monkeypatch) -> None:
     assert kwargs["adapter_config"] == {"mode": "simulated"}
     assert callable(kwargs["db_session_factory"])
     assert kwargs["audit_external_orders"] is True
-    assert (
-        kwargs["leadership_guard"]
-        is consumer.assert_service_ownership
-    )
+    assert kwargs["leadership_guard"] is consumer.assert_service_ownership
     engine.add_strategy.assert_not_called()
     assert events == [
         "ownership",
@@ -441,10 +638,12 @@ def test_main_never_marks_abnormal_service_exit_clean(
     else:
         consumer.start.side_effect = RuntimeError("ownership lost")
 
-    with patch("src.main.configure_metrics"), \
-         patch("src.main.SessionLocal", return_value=db_session), \
-         patch("src.main.StrategyEngine", return_value=engine), \
-         patch("src.main.DataConsumer", return_value=consumer):
+    with (
+        patch("src.main.configure_metrics"),
+        patch("src.main.SessionLocal", return_value=db_session),
+        patch("src.main.StrategyEngine", return_value=engine),
+        patch("src.main.DataConsumer", return_value=consumer),
+    ):
         with pytest.raises(RuntimeError):
             strategy_main.main()
 
@@ -463,10 +662,12 @@ def test_main_releases_ownership_when_engine_shutdown_fails(monkeypatch) -> None
     engine.shutdown.side_effect = RuntimeError("engine shutdown failed")
     consumer = MagicMock(spec=strategy_main.DataConsumer)
 
-    with patch("src.main.configure_metrics"), \
-         patch("src.main.SessionLocal", return_value=db_session), \
-         patch("src.main.StrategyEngine", return_value=engine), \
-         patch("src.main.DataConsumer", return_value=consumer):
+    with (
+        patch("src.main.configure_metrics"),
+        patch("src.main.SessionLocal", return_value=db_session),
+        patch("src.main.StrategyEngine", return_value=engine),
+        patch("src.main.DataConsumer", return_value=consumer),
+    ):
         with pytest.raises(RuntimeError, match="engine shutdown failed"):
             strategy_main.main()
 
