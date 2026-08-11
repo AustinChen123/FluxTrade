@@ -40,7 +40,10 @@ from src.core.interfaces import IExchangeAdapter
 from src.core.models import Signal, SignalType
 from src.core.ops_safety import OpsSafetyService
 from src.core.risk_manager import AccountService
-from src.core.runtime_capabilities import StartupReconciliationState
+from src.core.runtime_capabilities import (
+    KillSwitchClearPreparation,
+    StartupReconciliationState,
+)
 from src.core.runtime_environment import RuntimeEnvironment
 
 _UNHANDLED_RECONCILIATION = StartupReconciliationState(False, False, None)
@@ -50,11 +53,23 @@ _BLOCKED_RECONCILIATION = StartupReconciliationState(
     "rithmic_reconciliation_blocked",
 )
 _SAFE_RECONCILIATION = StartupReconciliationState(True, True, None)
+_GENERIC_CLEAR = KillSwitchClearPreparation(True, None, None)
+_RITHMIC_CLEAR_ALLOWED = KillSwitchClearPreparation(True, 7, None)
+_RITHMIC_CLEAR_BLOCKED = KillSwitchClearPreparation(
+    False,
+    None,
+    "rithmic_reconciliation_required",
+)
 
 
 def test_startup_reconciliation_state_is_immutable() -> None:
     with pytest.raises(FrozenInstanceError):
         setattr(_BLOCKED_RECONCILIATION, "blocking_reason", "changed")
+
+
+def test_kill_switch_clear_preparation_is_immutable() -> None:
+    with pytest.raises(FrozenInstanceError):
+        setattr(_RITHMIC_CLEAR_BLOCKED, "blocking_reason", "changed")
 
 
 def _rithmic_adapter(*, profile: str = "orders", account_id: str = "ACCOUNT"):
@@ -272,7 +287,7 @@ def test_runtime_handle_routes_control_calls_to_current_owners() -> None:
 
     assert owners.start_order_event_stream() is True
     owners.detect_external_order_drift("external order")
-    assert owners.prepare_kill_switch_clear() == (True, 7)
+    assert owners.prepare_kill_switch_clear() == _RITHMIC_CLEAR_ALLOWED
     assert owners.current_external_order_drift_generation() == 7
     owners.finalize_external_order_drift_clear(
         prepared_generation=7,
@@ -297,13 +312,26 @@ def test_runtime_handle_routes_control_calls_to_current_owners() -> None:
     runtime_recovery.run_once.assert_called_once_with()
 
 
+def test_runtime_handle_owns_denied_clear_reason() -> None:
+    preparation = MagicMock()
+    preparation.prepare.return_value = (False, 99)
+    owners = RithmicRuntimeOwners(
+        order_event_lifecycle=MagicMock(),
+        kill_switch_clear_preparation=preparation,
+        is_rithmic_runtime=True,
+    )
+
+    assert owners.prepare_kill_switch_clear() == _RITHMIC_CLEAR_BLOCKED
+    preparation.prepare.assert_called_once_with()
+
+
 def test_runtime_handle_preserves_absent_owner_defaults_and_errors() -> None:
     owners = RithmicRuntimeOwners(order_event_lifecycle=MagicMock())
     generic_summary = {"recoverable_count": 2}
     fallback = MagicMock(return_value=generic_summary)
 
     assert owners.start_order_event_stream() is False
-    assert owners.prepare_kill_switch_clear() == (True, None)
+    assert owners.prepare_kill_switch_clear() == _GENERIC_CLEAR
     assert owners.current_external_order_drift_generation() == 0
     assert owners.reconcile_startup(fallback) is generic_summary
     fallback.assert_called_once_with()

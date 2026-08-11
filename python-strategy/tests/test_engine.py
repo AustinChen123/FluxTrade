@@ -105,6 +105,7 @@ from src.core.strategy_state_manager import (
 )
 from src.core.runtime_environment import RuntimeEnvironment
 from src.core.runtime_capabilities import (
+    KillSwitchClearPreparation,
     NoopRuntimeCapabilities,
     StartupReconciliationState,
 )
@@ -6128,26 +6129,48 @@ class TestExchangeOrderEventThread:
             engine.execution_engine.process_exchange_order_event.assert_not_called()
 
     def test_rithmic_clear_delegates_to_venue_owner(self, engine):
-        sentinel = (False, 17)
         owner = MagicMock()
-        owner.prepare.return_value = sentinel
+        owner.prepare.return_value = (False, 17)
         engine._venue_runtime.kill_switch_clear_preparation = owner
 
-        assert engine._prepare_rithmic_kill_switch_clear() is sentinel
+        assert engine._venue_runtime.prepare_kill_switch_clear() == (
+            KillSwitchClearPreparation(
+                False,
+                None,
+                "rithmic_reconciliation_required",
+            )
+        )
 
         owner.prepare.assert_called_once_with()
 
     def test_non_rithmic_clear_does_not_construct_or_call_rithmic_owner(self, engine):
         assert engine._venue_runtime.kill_switch_clear_preparation is None
 
-        assert engine._prepare_rithmic_kill_switch_clear() == (True, None)
+        assert engine._venue_runtime.prepare_kill_switch_clear() == (
+            KillSwitchClearPreparation(True, None, None)
+        )
+
+    def test_clear_command_consumes_venue_neutral_preparation(self) -> None:
+        source = inspect.getsource(StrategyEngine._handle_command)
+
+        assert "rithmic_reconciliation_required" not in source
+        assert "preparation.allowed" in source
+        assert "preparation.blocking_reason" in source
+        assert "preparation.drift_generation" in source
 
     @pytest.mark.parametrize(
         ("prepared", "cleared"),
         [
-            ((False, None), None),
-            ((True, 0), False),
-            ((True, 0), True),
+            (
+                KillSwitchClearPreparation(
+                    False,
+                    None,
+                    "synthetic_clear_blocked",
+                ),
+                None,
+            ),
+            (KillSwitchClearPreparation(True, 0, None), False),
+            (KillSwitchClearPreparation(True, 0, None), True),
         ],
     )
     def test_external_order_drift_blocks_clear_until_both_checks_pass(
@@ -6155,17 +6178,21 @@ class TestExchangeOrderEventThread:
         engine,
         prepared,
         cleared,
+        caplog,
     ):
         engine._kill_switch_halted = True
-        engine._prepare_rithmic_kill_switch_clear = MagicMock(return_value=prepared)
+        engine._venue_runtime.prepare_kill_switch_clear = MagicMock(
+            return_value=prepared
+        )
         engine._venue_runtime.external_order_drift = MagicMock()
         engine.ops_safety.clear_kill_switch = MagicMock(
             return_value={"cleared": cleared, "reason": "still_open"}
         )
 
-        engine._handle_command({"command": "CLEAR_KILL_SWITCH", "params": {}})
+        with caplog.at_level(logging.WARNING, logger="src.core.engine"):
+            engine._handle_command({"command": "CLEAR_KILL_SWITCH", "params": {}})
 
-        if prepared[0]:
+        if prepared.allowed:
             engine.ops_safety.clear_kill_switch.assert_called_once()
             engine._venue_runtime.external_order_drift.finalize_clear.assert_called_once_with(
                 prepared_generation=0,
@@ -6174,6 +6201,9 @@ class TestExchangeOrderEventThread:
         else:
             engine.ops_safety.clear_kill_switch.assert_not_called()
             engine._venue_runtime.external_order_drift.finalize_clear.assert_not_called()
+            assert "Kill switch clear rejected: synthetic_clear_blocked" in (
+                record.getMessage() for record in caplog.records
+            )
 
     def test_rithmic_clear_does_not_persist_or_resume_after_leadership_loss(
         self,
@@ -6188,11 +6218,11 @@ class TestExchangeOrderEventThread:
         def reconcile_then_lose_leadership():
             nonlocal owns_service
             owns_service = False
-            return True, 0
+            return KillSwitchClearPreparation(True, 0, None)
 
         engine._leadership_guard = assert_leadership
         engine._kill_switch_halted = True
-        engine._prepare_rithmic_kill_switch_clear = MagicMock(
+        engine._venue_runtime.prepare_kill_switch_clear = MagicMock(
             side_effect=reconcile_then_lose_leadership
         )
         engine.ops_safety.clear_kill_switch = MagicMock()
@@ -6237,8 +6267,12 @@ class TestExchangeOrderEventThread:
         assert owner is not None
         owner.detect("before clear")
         prepared_generation = owner.current_generation()
-        engine._prepare_rithmic_kill_switch_clear = MagicMock(
-            return_value=(True, prepared_generation)
+        engine._venue_runtime.prepare_kill_switch_clear = MagicMock(
+            return_value=KillSwitchClearPreparation(
+                True,
+                prepared_generation,
+                None,
+            )
         )
         engine.execution_engine.resume_after_reconcile = MagicMock()
         engine.ops_safety.persist_kill_switch_state = MagicMock()
@@ -6303,8 +6337,12 @@ class TestExchangeOrderEventThread:
         assert owner is not None
         owner.detect("before clear")
         prepared_generation = owner.current_generation()
-        engine._prepare_rithmic_kill_switch_clear = MagicMock(
-            return_value=(True, prepared_generation)
+        engine._venue_runtime.prepare_kill_switch_clear = MagicMock(
+            return_value=KillSwitchClearPreparation(
+                True,
+                prepared_generation,
+                None,
+            )
         )
         engine.ops_safety.clear_kill_switch = MagicMock(
             return_value={"cleared": True, "reason": "cleared"}
@@ -6334,8 +6372,12 @@ class TestExchangeOrderEventThread:
         assert owner is not None
         owner.detect("before clear")
         prepared_generation = owner.current_generation()
-        engine._prepare_rithmic_kill_switch_clear = MagicMock(
-            return_value=(True, prepared_generation)
+        engine._venue_runtime.prepare_kill_switch_clear = MagicMock(
+            return_value=KillSwitchClearPreparation(
+                True,
+                prepared_generation,
+                None,
+            )
         )
         engine.ops_safety.persist_kill_switch_state = MagicMock()
         engine.redis_client.set.reset_mock()

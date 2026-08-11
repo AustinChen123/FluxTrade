@@ -43,6 +43,7 @@ from src.core.models import Candlestick, Signal, SignalType
 from src.core.ops_safety import OpsSafetyService
 from src.core.risk_manager import AccountService
 from src.core.runtime_capabilities import (
+    KillSwitchClearPreparation,
     RuntimeCallbacks as RithmicRuntimeCallbacks,
     StartupReconciliationState,
 )
@@ -188,11 +189,16 @@ class RithmicRuntimeOwners:
             raise RuntimeError("Rithmic external-order drift owner is unavailable")
         self.external_order_drift.detect(reason)
 
-    def prepare_kill_switch_clear(self) -> tuple[bool, int | None]:
+    def prepare_kill_switch_clear(self) -> KillSwitchClearPreparation:
         """Prepare a clear or preserve the non-Rithmic compatibility default."""
         if self.kill_switch_clear_preparation is None:
-            return True, None
-        return self.kill_switch_clear_preparation.prepare()
+            return KillSwitchClearPreparation(True, None, None)
+        allowed, drift_generation = self.kill_switch_clear_preparation.prepare()
+        return KillSwitchClearPreparation(
+            allowed=allowed,
+            drift_generation=drift_generation if allowed else None,
+            blocking_reason=(None if allowed else "rithmic_reconciliation_required"),
+        )
 
     def current_external_order_drift_generation(self) -> int:
         """Return the current drift generation or its compatibility default."""

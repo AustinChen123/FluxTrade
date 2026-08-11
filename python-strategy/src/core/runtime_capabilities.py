@@ -85,6 +85,13 @@ class StartupReconciliationState:
     blocking_reason: str | None
 
 
+@dataclass(frozen=True)
+class KillSwitchClearPreparation:
+    allowed: bool
+    drift_generation: int | None
+    blocking_reason: str | None
+
+
 class RuntimeCapabilities(Protocol):
     def start_order_event_stream(self) -> bool: ...
 
@@ -94,7 +101,7 @@ class RuntimeCapabilities(Protocol):
 
     def detect_external_order_drift(self, reason: str) -> None: ...
 
-    def prepare_kill_switch_clear(self) -> tuple[bool, int | None]: ...
+    def prepare_kill_switch_clear(self) -> KillSwitchClearPreparation: ...
 
     def current_external_order_drift_generation(self) -> int: ...
 
@@ -184,8 +191,8 @@ class NoopRuntimeCapabilities:
     def detect_external_order_drift(self, reason: str) -> None:
         raise RuntimeError("venue external-order drift owner is unavailable")
 
-    def prepare_kill_switch_clear(self) -> tuple[bool, int | None]:
-        return True, None
+    def prepare_kill_switch_clear(self) -> KillSwitchClearPreparation:
+        return KillSwitchClearPreparation(True, None, None)
 
     def current_external_order_drift_generation(self) -> int:
         return 0

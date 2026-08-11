@@ -501,8 +501,8 @@ class StrategyEngine:
 
         def apply_reconciliation_result() -> bool:
             lockdown = persisted_lockdown
-            reconciliation_state = (
-                self._venue_runtime.classify_startup_reconciliation(reconciliation)
+            reconciliation_state = self._venue_runtime.classify_startup_reconciliation(
+                reconciliation
             )
             if (
                 reconciliation_state.entry_admission_safe
@@ -617,9 +617,6 @@ class StrategyEngine:
 
     def _lockdown_for_rithmic_order_drift(self, reason: str) -> None:
         self._venue_runtime.detect_external_order_drift(reason)
-
-    def _prepare_rithmic_kill_switch_clear(self) -> tuple[bool, int | None]:
-        return self._venue_runtime.prepare_kill_switch_clear()
 
     def _current_rithmic_external_order_drift_generation(self) -> int:
         return self._venue_runtime.current_external_order_drift_generation()
@@ -815,14 +812,14 @@ class StrategyEngine:
                     actor = params.get("actor", "operator")
                     reason = params.get("reason")
 
-                    verified, drift_generation = (
-                        self._prepare_rithmic_kill_switch_clear()
-                    )
-                    if not verified:
+                    preparation = self._venue_runtime.prepare_kill_switch_clear()
+                    if not preparation.allowed:
                         logger.warning(
-                            "Kill switch clear rejected: rithmic_reconciliation_required"
+                            "Kill switch clear rejected: %s",
+                            preparation.blocking_reason,
                         )
                         return
+                    drift_generation = preparation.drift_generation
                     self._assert_runtime_leadership()
 
                     def persist_clear() -> None:
