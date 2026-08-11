@@ -245,6 +245,8 @@ def test_other_live_venues_never_call_backpack_owner(monkeypatch, exchange) -> N
         )
     else:
         product_id = f"{exchange.upper()}:BTCUSDT-PERP"
+        for name, value in _valid_environ().items():
+            monkeypatch.setenv(name, value)
         monkeypatch.setattr(
             strategy_main,
             "build_ccxt_live_credentials",
