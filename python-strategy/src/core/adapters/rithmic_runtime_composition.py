@@ -539,7 +539,10 @@ def build_rithmic_runtime_owners(
     external_order_drift = RithmicExternalOrderDriftService(
         halt_submissions=callbacks.halt_submissions,
         clear_local_halt=callbacks.clear_local_halt,
-        persist_lockdown_state=callbacks.persist_lockdown_state,
+        persist_lockdown_state=lambda reason: callbacks.persist_lockdown_state(
+            "rithmic_order_stream",
+            reason,
+        ),
         persist_redis_lockdown=callbacks.persist_redis_lockdown,
         assert_runtime_leadership=callbacks.assert_runtime_leadership,
         resume_after_reconcile=lambda: execution_engine.resume_after_reconcile(),

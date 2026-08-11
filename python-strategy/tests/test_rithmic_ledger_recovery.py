@@ -271,7 +271,7 @@ def test_publisher_exception_propagates_without_translation():
 
 def test_engine_compatibility_method_contains_only_one_owner_delegation():
     source = inspect.getsource(
-        StrategyEngine._apply_rithmic_authoritative_account_summary
+        StrategyEngine._publish_authoritative_account_summary
     )
 
     assert source.count("publish_authoritative_summary") == 1

@@ -372,14 +372,14 @@ class StrategyEngine:
             process_event=lambda event: (
                 self.execution_engine.process_exchange_order_event(event)
             ),
-            lockdown=lambda reason: (self._lockdown_for_rithmic_order_drift(reason)),
+            lockdown=lambda reason: (self._detect_external_order_drift(reason)),
             assert_runtime_leadership=lambda: (self._assert_runtime_leadership()),
             halt_submissions=lambda: self._halt_for_kill_switch(),
             clear_local_halt=lambda: self._clear_local_kill_switch_halt(),
-            persist_lockdown_state=lambda reason: (
+            persist_lockdown_state=lambda actor, reason: (
                 self.ops_safety.persist_kill_switch_state(
                     SYSTEM_STATE_LOCKDOWN,
-                    actor="rithmic_order_stream",
+                    actor=actor,
                     reason=reason,
                 )
             ),
@@ -395,7 +395,7 @@ class StrategyEngine:
             ),
             current_order_event_thread=lambda: self.order_event_thread,
             publish_authoritative_summary=lambda summary: (
-                self._apply_rithmic_authoritative_account_summary(summary)
+                self._publish_authoritative_account_summary(summary)
             ),
         )
         self._venue_runtime = (
@@ -610,11 +610,8 @@ class StrategyEngine:
                 return False
         return True
 
-    def _lockdown_for_rithmic_order_drift(self, reason: str) -> None:
+    def _detect_external_order_drift(self, reason: str) -> None:
         self._venue_runtime.detect_external_order_drift(reason)
-
-    def _current_rithmic_external_order_drift_generation(self) -> int:
-        return self._venue_runtime.current_external_order_drift_generation()
 
     def _run_ops_kill_switch(
         self,
@@ -666,12 +663,12 @@ class StrategyEngine:
 
         return self._venue_runtime.reconcile_startup(reconcile_generic)
 
-    def _apply_rithmic_authoritative_account_summary(self, summary: dict) -> None:
-        """Delegate authoritative Rithmic account publication to its owner."""
+    def _publish_authoritative_account_summary(self, summary: dict) -> None:
+        """Delegate authoritative account publication to its runtime owner."""
         self._venue_runtime.publish_authoritative_summary(summary)
 
     def _reconcile_owned_orders_on_reconnect(self) -> bool:
-        """Delegate Rithmic ORDER reconnect recovery to its venue owner."""
+        """Delegate ORDER reconnect recovery to its venue owner."""
         reconciled = self._venue_runtime.reconcile_order_reconnect()
         if reconciled is None:
             logger.error(
@@ -2239,7 +2236,7 @@ class StrategyEngine:
                     self._run_runtime_recovery_exclusive,
                 )
             )
-            # Rithmic startup already completed an authoritative ledger
+            # Venue startup already completed an authoritative ledger
             # reconciliation. Avoid immediately tearing down and recreating
             # the freshly started ORDER session.
             if venue_owned and self._runtime_reconcile_stop.wait(interval):

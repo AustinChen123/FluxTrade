@@ -1370,6 +1370,29 @@ def test_rithmic_composition_builds_the_complete_shared_owner_graph() -> None:
     runtime_started.assert_called_once_with()
 
 
+def test_rithmic_composition_owns_external_drift_persistence_actor() -> None:
+    callbacks = _callbacks()
+    owners = build_rithmic_runtime_owners(
+        adapter=_rithmic_adapter(),
+        profile="orders",
+        account_id="ACCOUNT",
+        execution_engine=_execution_engine(),
+        account_service=MagicMock(spec=AccountService),
+        ops_safety=MagicMock(spec=OpsSafetyService),
+        stop_event=MagicMock(),
+        callbacks=callbacks,
+        logger=MagicMock(),
+    )
+
+    assert owners.external_order_drift is not None
+    owners.external_order_drift.detect("external order sentinel")
+
+    callbacks.persist_lockdown_state.assert_called_once_with(
+        "rithmic_order_stream",
+        "external order sentinel",
+    )
+
+
 def test_non_rithmic_composition_creates_no_venue_runtime_owner() -> None:
     callbacks = _callbacks()
 

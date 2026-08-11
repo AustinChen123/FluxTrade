@@ -108,7 +108,7 @@ class RuntimeCallbacks:
     assert_runtime_leadership: Callable[[], None]
     halt_submissions: Callable[[], None]
     clear_local_halt: Callable[[], None]
-    persist_lockdown_state: Callable[[str], None]
+    persist_lockdown_state: Callable[[str, str], None]
     persist_redis_lockdown: Callable[[], object]
     stop_order_event_stream: Callable[..., bool]
     start_order_event_stream: Callable[[], None]

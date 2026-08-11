@@ -123,6 +123,7 @@ from src.core.rithmic_publisher_liveness_gate import (
 def test_engine_has_no_concrete_rithmic_runtime_composition_dependency() -> None:
     source = inspect.getsource(engine_module)
 
+    assert "rithmic" not in source.lower()
     assert "rithmic_runtime_composition" not in source
     assert "RithmicRuntimeCallbacks" not in source
     assert "build_rithmic_runtime_owners" not in source
@@ -5407,7 +5408,7 @@ class TestRuntimeReconciliationThread:
         engine.execution_engine.clock.now = MagicMock(return_value=1704067201)
         _attach_rithmic_ledger_recovery(engine)
 
-        engine._apply_rithmic_authoritative_account_summary(
+        engine._publish_authoritative_account_summary(
             _authoritative_rithmic_summary()
         )
 
@@ -5429,7 +5430,7 @@ class TestRuntimeReconciliationThread:
         service = MagicMock()
         engine._venue_runtime.ledger_recovery = service
 
-        engine._apply_rithmic_authoritative_account_summary(summary)
+        engine._publish_authoritative_account_summary(summary)
 
         service.publish_authoritative_summary.assert_called_once_with(summary)
 
@@ -5443,7 +5444,7 @@ class TestRuntimeReconciliationThread:
         engine._venue_runtime.ledger_recovery = service
 
         with pytest.raises(RuntimeError) as caught:
-            engine._apply_rithmic_authoritative_account_summary({})
+            engine._publish_authoritative_account_summary({})
 
         assert caught.value is error
 
@@ -5456,7 +5457,7 @@ class TestRuntimeReconciliationThread:
             RuntimeError,
             match="rithmic_account_summary_identity_mismatch",
         ):
-            engine._apply_rithmic_authoritative_account_summary(
+            engine._publish_authoritative_account_summary(
                 _authoritative_rithmic_summary(account_id="OTHER")
             )
 
@@ -5475,10 +5476,10 @@ class TestRuntimeReconciliationThread:
         engine.execution_engine.reconcile_rithmic_owned_orders = MagicMock(
             return_value=summary
         )
-        engine._apply_rithmic_authoritative_account_summary = MagicMock()
+        engine._publish_authoritative_account_summary = MagicMock()
         engine._start_exchange_order_event_stream = MagicMock()
         engine.execution_engine.resume_after_reconcile = MagicMock()
-        engine._lockdown_for_rithmic_order_drift = MagicMock()
+        engine._detect_external_order_drift = MagicMock()
         _install_venue_runtime_recovery_service(engine, adapter)
 
         assert _run_selected_venue_runtime_recovery(engine) is True
@@ -5488,12 +5489,12 @@ class TestRuntimeReconciliationThread:
             "test",
             "ACCOUNT",
         )
-        engine._apply_rithmic_authoritative_account_summary.assert_called_once_with(
+        engine._publish_authoritative_account_summary.assert_called_once_with(
             summary
         )
         engine._start_exchange_order_event_stream.assert_called_once_with()
         engine.execution_engine.resume_after_reconcile.assert_called_once_with()
-        engine._lockdown_for_rithmic_order_drift.assert_not_called()
+        engine._detect_external_order_drift.assert_not_called()
 
     def test_periodic_rithmic_reconciliation_does_not_restart_after_takeover(
         self,
@@ -5520,7 +5521,7 @@ class TestRuntimeReconciliationThread:
         engine.execution_engine.reconcile_rithmic_owned_orders = MagicMock(
             side_effect=reconcile_then_lose_leadership
         )
-        engine._apply_rithmic_authoritative_account_summary = MagicMock()
+        engine._publish_authoritative_account_summary = MagicMock()
         engine._start_exchange_order_event_stream = MagicMock()
         engine.execution_engine.resume_after_reconcile = MagicMock()
         _install_venue_runtime_recovery_service(engine, adapter)
@@ -5542,7 +5543,7 @@ class TestRuntimeReconciliationThread:
         engine._runtime_profile = "test"
         engine._runtime_account_id = "ACCOUNT"
         engine.execution_engine.halt_for_reconcile = MagicMock(return_value=True)
-        engine._apply_rithmic_authoritative_account_summary = MagicMock()
+        engine._publish_authoritative_account_summary = MagicMock()
         engine._start_exchange_order_event_stream = MagicMock()
         engine.execution_engine.resume_after_reconcile = MagicMock()
         engine.execution_engine.process_market_data = MagicMock()
@@ -5598,7 +5599,7 @@ class TestRuntimeReconciliationThread:
         engine.execution_engine.reconcile_rithmic_owned_orders = MagicMock(
             return_value=_authoritative_rithmic_summary()
         )
-        engine._apply_rithmic_authoritative_account_summary = MagicMock()
+        engine._publish_authoritative_account_summary = MagicMock()
         engine._start_exchange_order_event_stream = MagicMock()
         engine.execution_engine.resume_after_reconcile = MagicMock()
         engine._run_ops_kill_switch = MagicMock(return_value=_kill_switch_result())
@@ -5699,19 +5700,19 @@ class TestRuntimeReconciliationThread:
         engine.execution_engine.reconcile_rithmic_owned_orders = MagicMock(
             return_value=summary
         )
-        engine._apply_rithmic_authoritative_account_summary = MagicMock(
+        engine._publish_authoritative_account_summary = MagicMock(
             side_effect=apply_error
         )
         engine._start_exchange_order_event_stream = MagicMock()
         engine.execution_engine.resume_after_reconcile = MagicMock()
-        engine._lockdown_for_rithmic_order_drift = MagicMock()
+        engine._detect_external_order_drift = MagicMock()
         _install_venue_runtime_recovery_service(engine, adapter)
 
         assert _run_selected_venue_runtime_recovery(engine) is False
 
         engine._start_exchange_order_event_stream.assert_called_once_with()
         engine.execution_engine.resume_after_reconcile.assert_not_called()
-        engine._lockdown_for_rithmic_order_drift.assert_called_once_with(
+        engine._detect_external_order_drift.assert_called_once_with(
             expected_reason
         )
 
@@ -6309,7 +6310,7 @@ class TestExchangeOrderEventThread:
         engine._venue_runtime.external_order_drift = MagicMock()
         engine._venue_runtime.order_event_stream = MagicMock()
         engine._venue_runtime.order_event_stream._lockdown = (
-            engine._lockdown_for_rithmic_order_drift
+            engine._detect_external_order_drift
         )
 
         engine._venue_runtime.order_event_stream._lockdown(
@@ -6498,7 +6499,7 @@ def _install_rithmic_order_reconnect_service(
             )
         ),
         publish_authoritative_summary=lambda summary: (
-            engine._apply_rithmic_authoritative_account_summary(summary)
+            engine._publish_authoritative_account_summary(summary)
         ),
         halt_for_reconcile=lambda **values: (
             engine.execution_engine.halt_for_reconcile(**values)
@@ -6537,14 +6538,14 @@ def _install_venue_runtime_recovery_service(
             )
         ),
         publish_authoritative_summary=lambda summary: (
-            engine._apply_rithmic_authoritative_account_summary(summary)
+            engine._publish_authoritative_account_summary(summary)
         ),
         assert_runtime_leadership=engine._assert_runtime_leadership,
         start_order_event_stream=lambda: engine._start_exchange_order_event_stream(),
         resume_after_reconcile=lambda: (
             engine.execution_engine.resume_after_reconcile()
         ),
-        lockdown=lambda reason: engine._lockdown_for_rithmic_order_drift(reason),
+        lockdown=lambda reason: engine._detect_external_order_drift(reason),
         logger=logging.getLogger("test.rithmic_runtime_recovery"),
     )
     runtime.is_rithmic_runtime = True
@@ -6578,7 +6579,7 @@ def _install_rithmic_strategy_exit_service(
         stop_order_event_stream=engine._stop_exchange_order_event_stream,
         assert_leadership=engine._assert_runtime_leadership,
         restart_order_stream=engine._start_exchange_order_event_stream,
-        lockdown=engine._lockdown_for_rithmic_order_drift,
+        lockdown=engine._detect_external_order_drift,
         logger=logging.getLogger("test.rithmic_strategy_exit"),
     )
     runtime.strategy_exit = service
@@ -6634,7 +6635,7 @@ def _install_rithmic_portfolio_exit_factory(
             stop_order_event_stream=engine._stop_exchange_order_event_stream,
             assert_leadership=engine._assert_runtime_leadership,
             restart_order_stream=engine._start_exchange_order_event_stream,
-            lockdown=engine._lockdown_for_rithmic_order_drift,
+            lockdown=engine._detect_external_order_drift,
             schedule_emergency_flatten=(
                 emergency_flatten.schedule_portfolio_exit_compensation
             ),
@@ -6786,7 +6787,7 @@ def test_rithmic_strategy_exit_uses_native_exit_and_verifies_flat(
     engine.execution_engine.reconcile_rithmic_owned_orders = MagicMock(
         return_value={"auto_resume_safe": True}
     )
-    engine._apply_rithmic_authoritative_account_summary = MagicMock()
+    engine._publish_authoritative_account_summary = MagicMock()
     engine._start_exchange_order_event_stream = MagicMock()
     engine.account_service.replace_positions_for_products = MagicMock()
     _install_rithmic_strategy_exit_service(engine, adapter)
@@ -6865,7 +6866,7 @@ def test_strategy_exit_owner_stops_current_replacement_thread(engine):
     engine._runtime_account_id = "ACCOUNT"
     engine._assert_runtime_leadership = MagicMock()
     engine._start_exchange_order_event_stream = MagicMock()
-    engine._lockdown_for_rithmic_order_drift = MagicMock()
+    engine._detect_external_order_drift = MagicMock()
     stale_thread = MagicMock()
     stale_thread.is_alive.return_value = True
     engine.order_event_thread = stale_thread
@@ -6898,7 +6899,7 @@ def test_strategy_exit_owner_stops_current_replacement_thread(engine):
     stale_thread.join.assert_not_called()
     current_thread.join.assert_called_once_with(timeout=30.0)
     engine._start_exchange_order_event_stream.assert_not_called()
-    engine._lockdown_for_rithmic_order_drift.assert_called_once_with(
+    engine._detect_external_order_drift.assert_called_once_with(
         "rithmic_strategy_exit_requires_reconciliation:RuntimeError"
     )
 
@@ -6990,7 +6991,7 @@ def test_portfolio_exit_stop_timeout_does_not_start_replacement_worker(engine):
     engine._runtime_account_id = "ACCOUNT"
     _install_rithmic_portfolio_exit_factory(engine, adapter)
     engine._start_exchange_order_event_stream = MagicMock()
-    engine._lockdown_for_rithmic_order_drift = MagicMock()
+    engine._detect_external_order_drift = MagicMock()
     current_thread = MagicMock()
     current_thread.is_alive.side_effect = [True, True]
     engine.order_event_thread = current_thread
@@ -7024,7 +7025,7 @@ def test_portfolio_exit_stop_timeout_does_not_start_replacement_worker(engine):
     assert engine._order_event_stop.is_set()
     engine._start_exchange_order_event_stream.assert_not_called()
     engine._venue_runtime.emergency_flatten.schedule_portfolio_exit_compensation.assert_not_called()
-    engine._lockdown_for_rithmic_order_drift.assert_called_once_with(
+    engine._detect_external_order_drift.assert_called_once_with(
         "rithmic_portfolio_exit_requires_reconciliation:RuntimeError"
     )
 
@@ -7115,7 +7116,7 @@ def test_rithmic_strategy_exit_cancels_protection_before_native_exit(engine):
             operation_order.append("reconcile") or {"auto_resume_safe": True}
         )
     )
-    engine._apply_rithmic_authoritative_account_summary = MagicMock()
+    engine._publish_authoritative_account_summary = MagicMock()
     engine._start_exchange_order_event_stream = MagicMock()
     engine.account_service.replace_positions_for_products = MagicMock(
         side_effect=lambda *_args, **_kwargs: operation_order.append("replace")
@@ -7190,7 +7191,7 @@ def test_rithmic_portfolio_exit_reduces_only_owned_sleeve(
         )
     )
     engine._start_exchange_order_event_stream = MagicMock()
-    engine._lockdown_for_rithmic_order_drift = MagicMock()
+    engine._detect_external_order_drift = MagicMock()
     _install_rithmic_portfolio_exit_factory(engine, adapter)
     sleeve_position = Position(
         strategy_id="portfolio_v1.sleeve_a",
@@ -7270,7 +7271,7 @@ def test_rithmic_portfolio_exit_reduces_only_owned_sleeve(
                 engine._portfolio_coordinator.portfolio_id_for_sleeve,
             )
         engine._venue_runtime.emergency_flatten.schedule_portfolio_exit_compensation.assert_not_called()
-        engine._lockdown_for_rithmic_order_drift.assert_called_once()
+        engine._detect_external_order_drift.assert_called_once()
         return
     with snapshot_loader:
         result = engine._venue_runtime.execute_portfolio_exit(
@@ -7303,7 +7304,7 @@ def test_rithmic_portfolio_exit_reduces_only_owned_sleeve(
     )
     engine.account_service.replace_positions_for_products.assert_not_called()
     engine._venue_runtime.emergency_flatten.schedule_portfolio_exit_compensation.assert_not_called()
-    engine._lockdown_for_rithmic_order_drift.assert_not_called()
+    engine._detect_external_order_drift.assert_not_called()
 
 
 def test_rithmic_portfolio_exit_does_not_reduce_another_sleeve_after_own_fill(
@@ -7325,7 +7326,7 @@ def test_rithmic_portfolio_exit_does_not_reduce_another_sleeve_after_own_fill(
     engine.execution_engine.submit_verified_net_reduction = MagicMock()
     engine.execution_engine.record_verified_net_reduction = MagicMock()
     engine._start_exchange_order_event_stream = MagicMock()
-    engine._lockdown_for_rithmic_order_drift = MagicMock()
+    engine._detect_external_order_drift = MagicMock()
     _install_rithmic_portfolio_exit_factory(engine, adapter)
     engine.account_service.get_position_for_exit = MagicMock(
         side_effect=[
@@ -7397,7 +7398,7 @@ def test_rithmic_portfolio_exit_does_not_reduce_another_sleeve_after_own_fill(
 
     engine.execution_engine.submit_verified_net_reduction.assert_not_called()
     engine.execution_engine.record_verified_net_reduction.assert_not_called()
-    engine._lockdown_for_rithmic_order_drift.assert_called_once()
+    engine._detect_external_order_drift.assert_called_once()
 
 
 def test_rithmic_portfolio_exit_does_not_cancel_before_safe_preflight(engine):
@@ -7425,7 +7426,7 @@ def test_rithmic_portfolio_exit_does_not_cancel_before_safe_preflight(engine):
     )
     engine.execution_engine.submit_verified_net_reduction = MagicMock()
     engine._start_exchange_order_event_stream = MagicMock()
-    engine._lockdown_for_rithmic_order_drift = MagicMock()
+    engine._detect_external_order_drift = MagicMock()
     _install_rithmic_portfolio_exit_factory(engine, adapter)
     engine.account_service.get_position_for_exit = MagicMock()
     signal = Signal(
@@ -7508,7 +7509,7 @@ def test_rithmic_portfolio_exit_schedules_flatten_after_protection_mutation(
     engine._start_exchange_order_event_stream = MagicMock(
         side_effect=lambda: lifecycle_calls.append("restart")
     )
-    engine._lockdown_for_rithmic_order_drift = MagicMock()
+    engine._detect_external_order_drift = MagicMock()
     _install_rithmic_portfolio_exit_factory(engine, adapter)
     compensation_calls: list[str] = []
     if schedule_fails:
@@ -7602,7 +7603,7 @@ def test_rithmic_portfolio_exit_schedules_flatten_after_protection_mutation(
         expected_lockdowns.append(
             call("rithmic_portfolio_exit_compensation_schedule_failed:RuntimeError")
         )
-    assert engine._lockdown_for_rithmic_order_drift.call_args_list == expected_lockdowns
+    assert engine._detect_external_order_drift.call_args_list == expected_lockdowns
 
     if not schedule_fails:
         compensation_calls.clear()
@@ -7640,7 +7641,7 @@ def test_rithmic_strategy_exit_blocks_when_remote_order_remains_working(engine):
     )
     engine.execution_engine.exit_authoritative_position = MagicMock()
     engine._start_exchange_order_event_stream = MagicMock()
-    engine._lockdown_for_rithmic_order_drift = MagicMock()
+    engine._detect_external_order_drift = MagicMock()
     _install_rithmic_strategy_exit_service(engine, adapter)
     signal = Signal(
         strategy_id="strategy",
@@ -7673,7 +7674,7 @@ def test_rithmic_strategy_exit_blocks_when_remote_order_remains_working(engine):
         engine._venue_runtime.execute_strategy_exit(signal, decision)
 
     engine.execution_engine.exit_authoritative_position.assert_not_called()
-    engine._lockdown_for_rithmic_order_drift.assert_called_once()
+    engine._detect_external_order_drift.assert_called_once()
     engine._start_exchange_order_event_stream.assert_called_once_with()
 
 
@@ -8261,7 +8262,7 @@ def test_reconnect_triggers_owned_order_reconcile_and_gates(engine):
             else pytest.fail("ledger recovery started before ORDER runtime closed")
         )
     )
-    engine._apply_rithmic_authoritative_account_summary = MagicMock()
+    engine._publish_authoritative_account_summary = MagicMock()
     engine.execution_engine.halt_for_reconcile = MagicMock(return_value=True)
     engine.execution_engine.resume_after_reconcile = MagicMock()
     reconnect = _install_rithmic_order_reconnect_service(engine, adapter)
@@ -8333,7 +8334,7 @@ def test_engine_reconnect_dispatch_has_no_generic_safety_side_effects(
     engine._clear_local_kill_switch_halt = MagicMock()
     engine.ops_safety.persist_kill_switch_state = MagicMock()
     engine.execution_engine.resume_after_reconcile = MagicMock()
-    engine._apply_rithmic_authoritative_account_summary = MagicMock()
+    engine._publish_authoritative_account_summary = MagicMock()
     engine.redis_client.set = MagicMock()
 
     caplog.clear()
@@ -8363,7 +8364,7 @@ def test_engine_reconnect_dispatch_has_no_generic_safety_side_effects(
     engine._clear_local_kill_switch_halt.assert_not_called()
     engine.ops_safety.persist_kill_switch_state.assert_not_called()
     engine.execution_engine.resume_after_reconcile.assert_not_called()
-    engine._apply_rithmic_authoritative_account_summary.assert_not_called()
+    engine._publish_authoritative_account_summary.assert_not_called()
     engine.redis_client.set.assert_not_called()
 
 
@@ -8470,7 +8471,7 @@ def test_reconnect_reconcile_failure_keeps_gate_and_retries(engine):
     engine.execution_engine.reconcile_rithmic_owned_orders = MagicMock(
         side_effect=RuntimeError("boom")
     )
-    engine._apply_rithmic_authoritative_account_summary = MagicMock()
+    engine._publish_authoritative_account_summary = MagicMock()
     engine.execution_engine.halt_for_reconcile = MagicMock(return_value=True)
     engine.execution_engine.resume_after_reconcile = MagicMock()
     reconnect = _install_rithmic_order_reconnect_service(engine, adapter)
@@ -8522,7 +8523,7 @@ def test_reconnect_lease_loss_after_reconcile_keeps_gate_and_generation(engine):
     engine.execution_engine.reconcile_rithmic_owned_orders = MagicMock(
         side_effect=reconcile
     )
-    engine._apply_rithmic_authoritative_account_summary = MagicMock()
+    engine._publish_authoritative_account_summary = MagicMock()
     engine.execution_engine.halt_for_reconcile = MagicMock(
         wraps=engine.execution_engine.halt_for_reconcile
     )
@@ -8568,7 +8569,7 @@ def test_reconnect_lease_loss_during_stream_restart_keeps_gate_and_generation(
     engine.execution_engine.reconcile_rithmic_owned_orders = MagicMock(
         return_value={"recoverable_count": 0, "auto_resume_safe": True}
     )
-    engine._apply_rithmic_authoritative_account_summary = MagicMock()
+    engine._publish_authoritative_account_summary = MagicMock()
     engine.execution_engine.halt_for_reconcile = MagicMock(
         wraps=engine.execution_engine.halt_for_reconcile
     )
@@ -8613,7 +8614,7 @@ def test_generation_read_failure_reconciles_fail_closed(engine):
     engine.execution_engine.reconcile_rithmic_owned_orders = MagicMock(
         return_value={"recoverable_count": 0, "auto_resume_safe": True}
     )
-    engine._apply_rithmic_authoritative_account_summary = MagicMock()
+    engine._publish_authoritative_account_summary = MagicMock()
     engine.execution_engine.resume_after_reconcile = MagicMock()
     _install_rithmic_order_reconnect_service(engine, adapter)
 
@@ -8643,7 +8644,7 @@ def test_reconnect_unresolved_summary_stays_closed_and_gated(engine, summary):
     engine.execution_engine.reconcile_rithmic_owned_orders = MagicMock(
         return_value=summary
     )
-    engine._apply_rithmic_authoritative_account_summary = MagicMock()
+    engine._publish_authoritative_account_summary = MagicMock()
     engine.execution_engine.resume_after_reconcile = MagicMock()
     reconnect = _install_rithmic_order_reconnect_service(engine, adapter)
 
@@ -8712,7 +8713,7 @@ def test_rithmic_event_loop_reconciles_and_restarts_before_polling(engine_factor
             else pytest.fail("ledger recovery started before ORDER runtime closed")
         )
     )
-    engine._apply_rithmic_authoritative_account_summary = MagicMock()
+    engine._publish_authoritative_account_summary = MagicMock()
     reconnect = _install_rithmic_order_reconnect_service(engine, adapter)
 
     class ImmediateThread:
@@ -8765,7 +8766,7 @@ def test_reconnect_stream_restart_failure_stays_gated_then_retries(engine):
     engine.execution_engine.reconcile_rithmic_owned_orders = MagicMock(
         return_value={"recoverable_count": 0, "auto_resume_safe": True}
     )
-    engine._apply_rithmic_authoritative_account_summary = MagicMock()
+    engine._publish_authoritative_account_summary = MagicMock()
     reconnect = _install_rithmic_order_reconnect_service(engine, adapter)
     adapter.start_order_event_stream()
 
