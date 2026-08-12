@@ -9,12 +9,102 @@ use futures_util::SinkExt;
 use ring::signature::Ed25519KeyPair;
 use rust_decimal::Decimal;
 use serde_json::{json, Value};
+use std::future::Future;
 use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::sync::mpsc;
+use tokio::task::AbortHandle;
 use tokio_tungstenite::tungstenite::protocol::Message;
 use tracing::{error, info, warn};
 
 const DEFAULT_MARKET_DATA_SYMBOLS: &str = "BTC_USDC_PERP,SOL_USDC_PERP";
+
+#[derive(Debug)]
+pub(crate) struct BackpackTaskFailure {
+    task: &'static str,
+    stable_error_code: &'static str,
+    safe_cause: &'static str,
+    source: Option<anyhow::Error>,
+}
+
+impl BackpackTaskFailure {
+    pub(crate) fn task_error(task: &'static str, source: anyhow::Error) -> Self {
+        Self {
+            task,
+            stable_error_code: "backpack_stream_task_failed",
+            safe_cause: "Backpack stream task failed",
+            source: Some(source),
+        }
+    }
+
+    pub(crate) fn unexpected_exit(task: &'static str) -> Self {
+        Self {
+            task,
+            stable_error_code: "backpack_stream_task_exited",
+            safe_cause: "Backpack stream task exited unexpectedly",
+            source: None,
+        }
+    }
+
+    pub(crate) fn panicked(task: &'static str) -> Self {
+        Self {
+            task,
+            stable_error_code: "backpack_stream_task_panicked",
+            safe_cause: "Backpack stream task panicked",
+            source: None,
+        }
+    }
+
+    pub(crate) fn cancelled(task: &'static str) -> Self {
+        Self {
+            task,
+            stable_error_code: "backpack_stream_task_cancelled",
+            safe_cause: "Backpack stream task was cancelled",
+            source: None,
+        }
+    }
+
+    fn join_failed(task: &'static str) -> Self {
+        Self {
+            task,
+            stable_error_code: "backpack_stream_task_join_failed",
+            safe_cause: "Backpack stream task join failed",
+            source: None,
+        }
+    }
+
+    fn monitor_closed() -> Self {
+        Self {
+            task: "task_monitor",
+            stable_error_code: "backpack_task_monitor_closed",
+            safe_cause: "Backpack task monitor closed unexpectedly",
+            source: None,
+        }
+    }
+
+    pub(crate) fn task(&self) -> &'static str {
+        self.task
+    }
+
+    pub(crate) fn stable_error_code(&self) -> &'static str {
+        self.stable_error_code
+    }
+
+    pub(crate) fn safe_cause(&self) -> &'static str {
+        self.safe_cause
+    }
+}
+
+impl std::fmt::Display for BackpackTaskFailure {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(self.safe_cause)
+    }
+}
+
+impl std::error::Error for BackpackTaskFailure {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        self.source.as_ref().map(|error| error.as_ref())
+    }
+}
 
 fn product_id_from_market_symbol(symbol: &str) -> Result<String> {
     let contract = symbol
@@ -74,7 +164,8 @@ pub(crate) async fn run(
     user_tx: mpsc::Sender<UserStreamEvent>,
     user_stream_enabled: bool,
 ) -> Result<()> {
-    let mut connector = BackpackConnector::new();
+    let (task_exit_tx, mut task_exit_rx) = mpsc::unbounded_channel();
+    let mut connector = BackpackConnector::with_task_exit_tx(task_exit_tx);
     info!(symbols = ?symbols, "Starting Backpack Connector");
     subscribe_market_data(&mut connector, &symbols, trade_tx, candle_tx).await?;
 
@@ -84,12 +175,21 @@ pub(crate) async fn run(
         info!("Backpack API Key/Secret not found, skipping User Data Stream");
     }
 
-    std::future::pending::<()>().await;
-    Ok(())
+    await_task_exit(&mut task_exit_rx).await
+}
+
+async fn await_task_exit(
+    task_exit_rx: &mut mpsc::UnboundedReceiver<BackpackTaskFailure>,
+) -> Result<()> {
+    match task_exit_rx.recv().await {
+        Some(failure) => Err(failure.into()),
+        None => Err(BackpackTaskFailure::monitor_closed().into()),
+    }
 }
 
 pub struct BackpackConnector {
     exchange_id: String,
+    task_exit_tx: Option<mpsc::UnboundedSender<BackpackTaskFailure>>,
 }
 
 impl BackpackConnector {
@@ -97,7 +197,44 @@ impl BackpackConnector {
     pub fn new() -> Self {
         Self {
             exchange_id: "BACKPACK".to_string(),
+            task_exit_tx: None,
         }
+    }
+
+    fn with_task_exit_tx(task_exit_tx: mpsc::UnboundedSender<BackpackTaskFailure>) -> Self {
+        Self {
+            task_exit_tx: Some(task_exit_tx),
+            ..Self::new()
+        }
+    }
+
+    fn spawn_task<F>(&self, task_name: &'static str, future: F) -> AbortHandle
+    where
+        F: Future<Output = Result<()>> + Send + 'static,
+    {
+        let task = tokio::spawn(future);
+        let abort_handle = task.abort_handle();
+        let task_exit_tx = self.task_exit_tx.clone();
+        tokio::spawn(async move {
+            let failure = match task.await {
+                Ok(Ok(())) => BackpackTaskFailure::unexpected_exit(task_name),
+                Ok(Err(error)) => BackpackTaskFailure::task_error(task_name, error),
+                Err(error) if error.is_panic() => BackpackTaskFailure::panicked(task_name),
+                Err(error) if error.is_cancelled() => BackpackTaskFailure::cancelled(task_name),
+                Err(_) => BackpackTaskFailure::join_failed(task_name),
+            };
+            if let Some(task_exit_tx) = task_exit_tx {
+                let _ = task_exit_tx.send(failure);
+            } else {
+                error!(
+                    task = failure.task(),
+                    stable_error_code = failure.stable_error_code(),
+                    safe_cause = failure.safe_cause(),
+                    "Backpack connector task failed"
+                );
+            }
+        });
+        abort_handle
     }
 
     fn sign(instruction: &str, timestamp: &str, window: &str, secret: &str) -> Result<String> {
@@ -170,8 +307,8 @@ impl BackpackConnector {
 
         info!("Subscribing to Backpack User Stream");
 
-        tokio::spawn(async move {
-            let res = ws_manager
+        let _user_stream = self.spawn_task("user_stream", async move {
+            ws_manager
                 .connect_with_retry(
                     |mut ws| {
                         let api_key = api_key.clone();
@@ -293,11 +430,7 @@ impl BackpackConnector {
                         }
                     },
                 )
-                .await;
-
-            if let Err(e) = res {
-                error!("Backpack User Stream failed: {}", e);
-            }
+                .await
         });
 
         Ok(())
@@ -340,8 +473,8 @@ impl ExchangeConnector for BackpackConnector {
 
         info!("Subscribing to Backpack trades: {:?}", args);
 
-        tokio::spawn(async move {
-            let res = ws_manager
+        let _trades = self.spawn_task("trades", async move {
+            ws_manager
                 .connect_with_retry(
                     |mut ws| {
                         let args = args.clone();
@@ -417,11 +550,7 @@ impl ExchangeConnector for BackpackConnector {
                         }
                     },
                 )
-                .await;
-
-            if let Err(e) = res {
-                error!("Backpack trades subscription failed: {}", e);
-            }
+                .await
         });
 
         Ok(())
@@ -453,8 +582,8 @@ impl ExchangeConnector for BackpackConnector {
 
         info!("Subscribing to Backpack candles: {:?}", args);
 
-        tokio::spawn(async move {
-            let res = ws_manager
+        let _candles = self.spawn_task("candles", async move {
+            ws_manager
                 .connect_with_retry(
                     |mut ws| {
                         let args = args.clone();
@@ -537,11 +666,7 @@ impl ExchangeConnector for BackpackConnector {
                         }
                     },
                 )
-                .await;
-
-            if let Err(e) = res {
-                error!("Backpack candles subscription failed: {}", e);
-            }
+                .await
         });
 
         Ok(())
@@ -595,6 +720,7 @@ mod tests {
     use super::*;
     use async_trait::async_trait;
     use serde_json::json;
+    use std::time::Duration;
 
     #[test]
     fn backpack_market_data_symbols_are_provider_owned_and_fail_closed() {
@@ -697,6 +823,138 @@ mod tests {
         assert_eq!(connector.trade_symbols, symbols);
         assert_eq!(connector.candle_symbols, symbols);
         assert_eq!(connector.candle_timeframe, "1m");
+    }
+
+    #[tokio::test]
+    async fn internal_task_error_reaches_the_backpack_runtime_owner() {
+        let (task_exit_tx, mut task_exit_rx) = mpsc::unbounded_channel();
+        let connector = BackpackConnector::with_task_exit_tx(task_exit_tx);
+        let _task = connector.spawn_task("trades", async {
+            Err(anyhow::anyhow!("provider failure sentinel"))
+        });
+
+        let error =
+            tokio::time::timeout(Duration::from_secs(1), await_task_exit(&mut task_exit_rx))
+                .await
+                .unwrap()
+                .unwrap_err();
+
+        let failure = error.downcast_ref::<BackpackTaskFailure>().unwrap();
+        assert_eq!(failure.task(), "trades");
+        assert_eq!(failure.stable_error_code(), "backpack_stream_task_failed");
+        assert_eq!(failure.safe_cause(), "Backpack stream task failed");
+        assert_eq!(
+            error.chain().map(ToString::to_string).collect::<Vec<_>>(),
+            ["Backpack stream task failed", "provider failure sentinel"]
+        );
+    }
+
+    #[tokio::test]
+    async fn clean_internal_task_exit_is_not_treated_as_healthy() {
+        let (task_exit_tx, mut task_exit_rx) = mpsc::unbounded_channel();
+        let connector = BackpackConnector::with_task_exit_tx(task_exit_tx);
+        let _task = connector.spawn_task("candles", async { Ok(()) });
+
+        let error =
+            tokio::time::timeout(Duration::from_secs(1), await_task_exit(&mut task_exit_rx))
+                .await
+                .unwrap()
+                .unwrap_err();
+
+        let failure = error.downcast_ref::<BackpackTaskFailure>().unwrap();
+        assert_eq!(failure.task(), "candles");
+        assert_eq!(failure.stable_error_code(), "backpack_stream_task_exited");
+        assert_eq!(
+            failure.safe_cause(),
+            "Backpack stream task exited unexpectedly"
+        );
+    }
+
+    #[tokio::test]
+    async fn panicked_internal_task_has_a_fixed_safe_error() {
+        let (task_exit_tx, mut task_exit_rx) = mpsc::unbounded_channel();
+        let connector = BackpackConnector::with_task_exit_tx(task_exit_tx);
+        let _task = connector.spawn_task("user_stream", async {
+            panic!("provider panic payload sentinel")
+        });
+
+        let error =
+            tokio::time::timeout(Duration::from_secs(1), await_task_exit(&mut task_exit_rx))
+                .await
+                .unwrap()
+                .unwrap_err();
+        let failure = error.downcast_ref::<BackpackTaskFailure>().unwrap();
+        assert_eq!(failure.task(), "user_stream");
+        assert_eq!(failure.stable_error_code(), "backpack_stream_task_panicked");
+        let rendered = error.to_string();
+        assert_eq!(rendered, "Backpack stream task panicked");
+        assert!(!rendered.contains("provider panic payload sentinel"));
+    }
+
+    #[tokio::test]
+    async fn cancelled_internal_task_has_a_fixed_safe_error() {
+        let (task_exit_tx, mut task_exit_rx) = mpsc::unbounded_channel();
+        let connector = BackpackConnector::with_task_exit_tx(task_exit_tx);
+        let task = connector.spawn_task("trades", async {
+            std::future::pending::<Result<()>>().await
+        });
+        task.abort();
+
+        let error =
+            tokio::time::timeout(Duration::from_secs(1), await_task_exit(&mut task_exit_rx))
+                .await
+                .unwrap()
+                .unwrap_err();
+
+        let failure = error.downcast_ref::<BackpackTaskFailure>().unwrap();
+        assert_eq!(failure.task(), "trades");
+        assert_eq!(
+            failure.stable_error_code(),
+            "backpack_stream_task_cancelled"
+        );
+        assert_eq!(failure.safe_cause(), "Backpack stream task was cancelled");
+    }
+
+    #[tokio::test]
+    async fn closed_task_monitor_is_not_treated_as_healthy() {
+        let (task_exit_tx, mut task_exit_rx) = mpsc::unbounded_channel();
+        drop(task_exit_tx);
+
+        let error =
+            tokio::time::timeout(Duration::from_secs(1), await_task_exit(&mut task_exit_rx))
+                .await
+                .unwrap()
+                .unwrap_err();
+        let failure = error.downcast_ref::<BackpackTaskFailure>().unwrap();
+        assert_eq!(failure.task(), "task_monitor");
+        assert_eq!(failure.stable_error_code(), "backpack_task_monitor_closed");
+        assert_eq!(
+            failure.safe_cause(),
+            "Backpack task monitor closed unexpectedly"
+        );
+    }
+
+    #[test]
+    fn production_owner_does_not_hide_or_double_log_final_task_failures() {
+        let source = include_str!("backpack.rs");
+        let production = source.split_once("#[cfg(test)]").unwrap().0;
+        assert!(!production.contains("std::future::pending::<()>().await;"));
+        assert_eq!(production.matches("tokio::spawn").count(), 2);
+        assert_eq!(production.matches("self.spawn_task(").count(), 3);
+        for monitored in [
+            "self.spawn_task(\"user_stream\"",
+            "self.spawn_task(\"trades\"",
+            "self.spawn_task(\"candles\"",
+        ] {
+            assert!(production.contains(monitored), "{monitored}");
+        }
+        for legacy in [
+            "Backpack User Stream failed:",
+            "Backpack trades subscription failed:",
+            "Backpack candles subscription failed:",
+        ] {
+            assert!(!production.contains(legacy), "{legacy}");
+        }
     }
 
     #[test]

@@ -543,6 +543,23 @@ fn terminal_diagnostic(error: &anyhow::Error) -> TerminalDiagnostic {
             safe_cause: failure.safe_cause(),
         };
     }
+    if let Some(failure) = error
+        .chain()
+        .find_map(|cause| cause.downcast_ref::<crate::connector::backpack::BackpackTaskFailure>())
+    {
+        return TerminalDiagnostic {
+            component: "backpack",
+            task,
+            operation: "stream_task",
+            stage: failure.task(),
+            template_id: "unknown".to_string(),
+            payload_len: "unknown".to_string(),
+            stable_error_code: failure.stable_error_code(),
+            disposition: "fatal_service_exit",
+            state_effect: "process_exit",
+            safe_cause: failure.safe_cause(),
+        };
+    }
     #[cfg(feature = "rithmic")]
     if let Some(failure) = error
         .chain()
@@ -1481,6 +1498,55 @@ mod tests {
                 },
             ));
         }
+        for (name, failure, code, cause) in [
+            (
+                "BackpackTaskError",
+                crate::connector::backpack::BackpackTaskFailure::task_error(
+                    "trades",
+                    anyhow::anyhow!("provider-secret"),
+                ),
+                "backpack_stream_task_failed",
+                "Backpack stream task failed",
+            ),
+            (
+                "BackpackUnexpectedExit",
+                crate::connector::backpack::BackpackTaskFailure::unexpected_exit("trades"),
+                "backpack_stream_task_exited",
+                "Backpack stream task exited unexpectedly",
+            ),
+            (
+                "BackpackPanicked",
+                crate::connector::backpack::BackpackTaskFailure::panicked("trades"),
+                "backpack_stream_task_panicked",
+                "Backpack stream task panicked",
+            ),
+            (
+                "BackpackCancelled",
+                crate::connector::backpack::BackpackTaskFailure::cancelled("trades"),
+                "backpack_stream_task_cancelled",
+                "Backpack stream task was cancelled",
+            ),
+        ] {
+            cases.push((
+                name,
+                supervised_task_exit_error(
+                    &TaskId::Connector("backpack".to_string()),
+                    Err(failure.into()),
+                ),
+                TerminalDiagnostic {
+                    component: "backpack",
+                    task: "connector:backpack".to_string(),
+                    operation: "stream_task",
+                    stage: "trades",
+                    template_id: "unknown".to_string(),
+                    payload_len: "unknown".to_string(),
+                    stable_error_code: code,
+                    disposition: "fatal_service_exit",
+                    state_effect: "process_exit",
+                    safe_cause: cause,
+                },
+            ));
+        }
         for (name, kind, code, cause) in [
             (
                 "CancelledJoin",
@@ -1610,6 +1676,34 @@ mod tests {
         assert_eq!(fields["disposition"], "fatal_service_exit");
         assert_eq!(fields["state_effect"], "process_exit");
         assert_eq!(fields["safe_cause"], "Binance stream task failed");
+        assert!(fields
+            .values()
+            .all(|value| !value.contains("provider failure sentinel")));
+    }
+
+    #[test]
+    fn backpack_internal_task_failure_reports_exact_safe_terminal_fields() {
+        let source = anyhow::anyhow!("provider failure sentinel");
+        let failure =
+            crate::connector::backpack::BackpackTaskFailure::task_error("candles", source);
+        let error = supervised_task_exit_error(
+            &TaskId::Connector("backpack".to_string()),
+            Err(failure.into()),
+        );
+        let fields = capture_terminal_event(&error);
+
+        assert_eq!(fields.len(), 11);
+        assert_eq!(fields["message"], "FluxTrade terminal failure");
+        assert_eq!(fields["component"], "backpack");
+        assert_eq!(fields["task"], "connector:backpack");
+        assert_eq!(fields["operation"], "stream_task");
+        assert_eq!(fields["stage"], "candles");
+        assert_eq!(fields["template_id"], "unknown");
+        assert_eq!(fields["payload_len"], "unknown");
+        assert_eq!(fields["stable_error_code"], "backpack_stream_task_failed");
+        assert_eq!(fields["disposition"], "fatal_service_exit");
+        assert_eq!(fields["state_effect"], "process_exit");
+        assert_eq!(fields["safe_cause"], "Backpack stream task failed");
         assert!(fields
             .values()
             .all(|value| !value.contains("provider failure sentinel")));
