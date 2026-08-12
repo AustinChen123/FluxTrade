@@ -47,6 +47,9 @@ class CcxtExchangeAdapter(IExchangeAdapter):
     venue policy belongs to venue-owned subclasses or composition owners.
     """
 
+    def supports_runtime_reconciliation(self) -> bool:
+        return True
+
     def __init__(
         self,
         exchange_id: str,

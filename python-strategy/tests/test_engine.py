@@ -492,20 +492,35 @@ class TestEngineInit:
         assert engine.risk_manager.instrument_spec_resolver(spec.product_id) is spec
 
     @pytest.mark.parametrize(
-        ("adapter", "adapter_config", "expected"),
+        ("adapter", "declared", "expected"),
         [
-            (object.__new__(SimulatedAdapter), None, False),
-            (object.__new__(CcxtExchangeAdapter), None, True),
-            (object.__new__(SimulatedAdapter), {"mode": "live"}, False),
-            (object.__new__(CcxtExchangeAdapter), {"mode": "simulated"}, True),
-            (MagicMock(), {"mode": "live"}, True),
-            (MagicMock(), None, False),
+            (object.__new__(SimulatedAdapter), True, True),
+            (object.__new__(CcxtExchangeAdapter), False, False),
+            (object.__new__(CcxtExchangeAdapter), "yes", False),
         ],
     )
-    def test_runtime_reconciliation_mode_uses_actual_adapter(
-        self, adapter, adapter_config, expected
+    def test_runtime_reconciliation_mode_uses_adapter_capability(
+        self, adapter, declared, expected
     ):
-        assert _is_runtime_reconciliation_enabled(adapter, adapter_config) is expected
+        adapter.supports_runtime_reconciliation = MagicMock(return_value=declared)
+
+        assert _is_runtime_reconciliation_enabled(adapter) is expected
+        adapter.supports_runtime_reconciliation.assert_called_once_with()
+
+    def test_runtime_reconciliation_capability_defaults_are_adapter_owned(self):
+        assert (
+            object.__new__(SimulatedAdapter).supports_runtime_reconciliation() is False
+        )
+        assert (
+            object.__new__(CcxtExchangeAdapter).supports_runtime_reconciliation()
+            is True
+        )
+
+    def test_engine_runtime_reconciliation_has_no_concrete_ccxt_dependency(self):
+        source = inspect.getsource(_is_runtime_reconciliation_enabled)
+
+        assert "CcxtExchangeAdapter" not in source
+        assert "adapter_config" not in source
 
     @pytest.mark.parametrize(
         "interval",
@@ -543,6 +558,9 @@ class TestEngineInit:
         ):
             redis_factory.return_value = MagicMock()
             create_adapter.return_value = MagicMock()
+            create_adapter.return_value.supports_runtime_reconciliation.return_value = (
+                True
+            )
 
             with pytest.raises(
                 ValueError,
@@ -559,6 +577,7 @@ class TestEngineInit:
                 )
 
         assert events == ["risk_resolver", "generic_interval"]
+        create_adapter.return_value.supports_runtime_reconciliation.assert_called_once_with()
         account_service.configure_authoritative_balance.assert_not_called()
         rithmic_max_age.assert_not_called()
         rithmic_interval.assert_not_called()
@@ -5660,6 +5679,9 @@ class TestRuntimeReconciliationThread:
         ):
             mock_factory.return_value = MagicMock()
             mock_create.return_value = MagicMock()
+            mock_create.return_value.supports_runtime_reconciliation.return_value = (
+                True
+            )
             engine = StrategyEngine(
                 db_session=mock_db_session,
                 clock=mock_clock,

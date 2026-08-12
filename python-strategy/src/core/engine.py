@@ -50,7 +50,6 @@ from src.core.portfolio_runtime import (
 )
 from src.core.data_provider import check_data_availability
 from src.core.adapters import (
-    CcxtExchangeAdapter,
     SimulatedAdapter,
     create_adapter,
 )
@@ -136,13 +135,8 @@ def _kill_switch_result_is_complete(
 
 def _is_runtime_reconciliation_enabled(
     adapter: IExchangeAdapter,
-    adapter_config: Optional[Dict],
 ) -> bool:
-    if isinstance(adapter, SimulatedAdapter):
-        return False
-    if isinstance(adapter, CcxtExchangeAdapter):
-        return True
-    return bool(adapter_config and adapter_config.get("mode") == "live")
+    return adapter.supports_runtime_reconciliation() is True
 
 
 def _runtime_reconciliation_interval_from_env() -> float:
@@ -325,7 +319,6 @@ class StrategyEngine:
         ) = runtime_bootstrap.resolve_reconciliation_schedule(
             generic_enabled=_is_runtime_reconciliation_enabled(
                 adapter,
-                adapter_config,
             ),
             generic_interval_resolver=_runtime_reconciliation_interval_from_env,
         )

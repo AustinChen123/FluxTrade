@@ -109,6 +109,10 @@ class IExchangeAdapter(ABC):
     Decouples execution logic from specific exchange implementations.
     """
 
+    def supports_runtime_reconciliation(self) -> bool:
+        """Whether the adapter supports generic periodic reconciliation."""
+        return False
+
     def create_entry_admission_gate(
         self,
         environment: "RuntimeEnvironment",
