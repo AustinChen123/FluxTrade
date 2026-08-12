@@ -55,7 +55,7 @@ class FakeStrategy(BaseStrategy):
 def engine_with_strategy():
     """Create a StrategyEngine with a FakeStrategy, mocking heavy deps."""
     with patch("src.core.engine.create_redis_client"), \
-         patch("src.core.engine.create_adapter") as mock_create:
+         patch("src.core.engine.create_simulated_adapter") as mock_create:
         mock_create.return_value = MagicMock()
 
         from src.core.engine import StrategyEngine

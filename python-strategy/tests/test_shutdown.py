@@ -16,7 +16,7 @@ class _MockClock(Clock):
 def _make_engine():
     """Create a StrategyEngine with mocked dependencies (no real Redis/DB)."""
     with patch("src.core.engine.create_redis_client") as mock_factory, \
-         patch("src.core.engine.create_adapter") as mock_create_adapter:
+         patch("src.core.engine.create_simulated_adapter") as mock_create_adapter:
         mock_factory.return_value = MagicMock()
         mock_create_adapter.return_value = MagicMock()
 
@@ -26,6 +26,7 @@ def _make_engine():
             db_session=MagicMock(),
             clock=_MockClock(),
             adapter_config={"mode": "simulated"},
+            account_service=MagicMock(),
         )
     return engine
 
