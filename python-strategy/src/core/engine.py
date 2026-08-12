@@ -59,6 +59,9 @@ from src.core.metrics import SIGNALS_TOTAL, ACTIVE_STRATEGIES, BALANCE_USDT
 from src.core.command_router import CommandRouter
 from src.core.health_monitor import HealthMonitor
 from src.core.engine_heartbeat_service import EngineHeartbeatService
+from src.core.engine_runtime_reconciliation_service import (
+    EngineRuntimeReconciliationService,
+)
 from src.core.ops_safety import OpsSafetyService
 from src.core.runtime_reconcile import RuntimeReconciliationJob
 from src.core.runtime_artifact_registry import RuntimeArtifactRegistry
@@ -477,6 +480,17 @@ class StrategyEngine:
             record_strategy_heartbeats=lambda strategy_ids: (
                 self._record_strategy_heartbeats(strategy_ids)
             ),
+            event_logger=logger,
+        )
+        self._runtime_reconciliation_service = EngineRuntimeReconciliationService(
+            is_running=lambda: self.running,
+            select_reconciliation=lambda: (
+                self._venue_runtime.select_runtime_reconciliation(
+                    self.runtime_reconciliation_job.run_once,
+                    self._run_runtime_recovery_exclusive,
+                )
+            ),
+            assert_leadership=lambda: self._assert_runtime_leadership(),
             event_logger=logger,
         )
 
@@ -2023,42 +2037,10 @@ class StrategyEngine:
             if self._runtime_reconcile_interval is not None
             else _runtime_reconciliation_interval_from_env()
         )
-        self._runtime_reconcile_stop.clear()
-
-        def reconcile_loop():
-            logger.info("Runtime reconciliation service started.")
-            venue_owned, run_reconciliation = (
-                self._venue_runtime.select_runtime_reconciliation(
-                    self.runtime_reconciliation_job.run_once,
-                    self._run_runtime_recovery_exclusive,
-                )
-            )
-            # Venue startup already completed an authoritative ledger
-            # reconciliation. Avoid immediately tearing down and recreating
-            # the freshly started ORDER session.
-            if venue_owned and self._runtime_reconcile_stop.wait(interval):
-                return
-            while self.running and not self._runtime_reconcile_stop.is_set():
-                try:
-                    self._assert_runtime_leadership()
-                except Exception:
-                    return
-                try:
-                    run_reconciliation()
-                except Exception as e:
-                    logger.error("Runtime reconciliation loop failed: %s", e)
-                try:
-                    self._assert_runtime_leadership()
-                except Exception:
-                    return
-                if self._runtime_reconcile_stop.wait(interval):
-                    break
-
-        self.runtime_reconcile_thread = threading.Thread(
-            target=reconcile_loop,
-            daemon=True,
+        self.runtime_reconcile_thread = self._runtime_reconciliation_service.start(
+            interval=interval,
+            stop_event=self._runtime_reconcile_stop,
         )
-        self.runtime_reconcile_thread.start()
 
     def _run_runtime_recovery_exclusive(
         self,

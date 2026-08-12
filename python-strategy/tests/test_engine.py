@@ -5778,16 +5778,20 @@ class TestRuntimeReconciliationThread:
         created_threads = []
 
         class ImmediateThread:
-            def __init__(self, *, target, daemon):
+            def __init__(self, *, target, args, daemon):
                 self.target = target
+                self.args = args
                 self.daemon = daemon
                 created_threads.append(self)
 
             def start(self):
-                self.target()
+                self.target(*self.args)
 
         with (
-            patch("src.core.engine.threading.Thread", ImmediateThread),
+            patch(
+                "src.core.engine_runtime_reconciliation_service.threading.Thread",
+                ImmediateThread,
+            ),
             patch(
                 "src.core.engine.time.sleep",
                 side_effect=AssertionError(
@@ -5801,6 +5805,20 @@ class TestRuntimeReconciliationThread:
         engine.runtime_reconciliation_job.run_once.assert_called_once()
         engine._runtime_reconcile_stop.wait.assert_called_once_with(3600.0)
 
+    def test_start_runtime_reconciliation_delegates_to_current_service(self, engine):
+        engine._runtime_reconcile_interval = 17.0
+        engine._runtime_reconciliation_service = MagicMock()
+        thread = MagicMock()
+        engine._runtime_reconciliation_service.start.return_value = thread
+
+        engine._start_runtime_reconciliation()
+
+        engine._runtime_reconciliation_service.start.assert_called_once_with(
+            interval=17.0,
+            stop_event=engine._runtime_reconcile_stop,
+        )
+        assert engine.runtime_reconcile_thread is thread
+
     def test_runtime_reconciliation_stops_before_work_after_leadership_loss(
         self,
         engine,
@@ -5811,13 +5829,17 @@ class TestRuntimeReconciliationThread:
         engine.runtime_reconciliation_job.run_once = MagicMock()
 
         class ImmediateThread:
-            def __init__(self, *, target, daemon):
+            def __init__(self, *, target, args, daemon):
                 self.target = target
+                self.args = args
 
             def start(self):
-                self.target()
+                self.target(*self.args)
 
-        with patch("src.core.engine.threading.Thread", ImmediateThread):
+        with patch(
+            "src.core.engine_runtime_reconciliation_service.threading.Thread",
+            ImmediateThread,
+        ):
             engine._start_runtime_reconciliation()
 
         engine.runtime_reconciliation_job.run_once.assert_not_called()
@@ -5848,14 +5870,18 @@ class TestRuntimeReconciliationThread:
         )
 
         class ImmediateThread:
-            def __init__(self, *, target, daemon):
+            def __init__(self, *, target, args, daemon):
                 self.target = target
+                self.args = args
                 self.daemon = daemon
 
             def start(self):
-                self.target()
+                self.target(*self.args)
 
-        with patch("src.core.engine.threading.Thread", ImmediateThread):
+        with patch(
+            "src.core.engine_runtime_reconciliation_service.threading.Thread",
+            ImmediateThread,
+        ):
             engine._start_runtime_reconciliation()
 
         assert events == [
@@ -5878,13 +5904,17 @@ class TestRuntimeReconciliationThread:
         engine._venue_runtime.runtime_recovery = MagicMock()
 
         class ImmediateThread:
-            def __init__(self, *, target, daemon):
+            def __init__(self, *, target, args, daemon):
                 self.target = target
+                self.args = args
 
             def start(self):
-                self.target()
+                self.target(*self.args)
 
-        with patch("src.core.engine.threading.Thread", ImmediateThread):
+        with patch(
+            "src.core.engine_runtime_reconciliation_service.threading.Thread",
+            ImmediateThread,
+        ):
             engine._start_runtime_reconciliation()
 
         engine._runtime_reconcile_stop.wait.assert_called_once_with(300.0)
@@ -5929,14 +5959,18 @@ class TestRuntimeReconciliationThread:
         )
 
         class ImmediateThread:
-            def __init__(self, *, target, daemon):
+            def __init__(self, *, target, args, daemon):
                 self.target = target
+                self.args = args
 
             def start(self):
-                self.target()
+                self.target(*self.args)
 
         with (
-            patch("src.core.engine.threading.Thread", ImmediateThread),
+            patch(
+                "src.core.engine_runtime_reconciliation_service.threading.Thread",
+                ImmediateThread,
+            ),
             patch("src.core.engine.logger.error") as log_error,
         ):
             log_error.side_effect = lambda *args: events.append(("error", args))
