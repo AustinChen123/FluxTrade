@@ -3474,7 +3474,9 @@ class TestHeartbeatRecording:
 
         with (
             caplog.at_level(logging.WARNING, logger="src.core.engine"),
-            patch("src.core.engine.normalize_signal_quantity") as normalize,
+            patch(
+                "src.core.signal_execution_service.normalize_signal_quantity"
+            ) as normalize,
         ):
             assert engine.process_signal(signal, _make_candle()) is False
 

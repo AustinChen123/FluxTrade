@@ -47,7 +47,7 @@ from src.core.adapters.simulated import (
 )
 from src.core.journal import StrategyJournal
 from src.core.redis_factory import create_redis_client
-from src.core.metrics import SIGNALS_TOTAL, ACTIVE_STRATEGIES, BALANCE_USDT
+from src.core.metrics import ACTIVE_STRATEGIES, BALANCE_USDT
 from src.core.command_router import CommandRouter
 from src.core.health_monitor import HealthMonitor
 from src.core.engine_heartbeat_service import EngineHeartbeatService
@@ -61,11 +61,7 @@ from src.core.ops_safety import OpsSafetyService
 from src.core.runtime_reconcile import RuntimeReconciliationJob
 from src.core.runtime_artifact_registry import RuntimeArtifactRegistry
 from src.core.signal_processor import SignalProcessor
-from src.core.signal_order_intent import (
-    InvalidSignalOrderIntent,
-    normalize_signal_quantity,
-    resolve_signal_order_intent,
-)
+from src.core.signal_execution_service import SignalExecutionService
 from src.core.strategy_registry import StrategyRegistry
 from src.core.strategy_artifact_discovery import synchronize_strategy_artifacts
 from src.core.strategy_command_listener import build_strategy_command_listener
@@ -86,7 +82,6 @@ from src.core.strategy_hydration_service import StrategyHydrationService
 from src.core.strategy_activation_service import StrategyActivationService
 from src.core.strategy_deactivation_service import StrategyDeactivationService
 from src.core.strategy_test_run_service import StrategyTestRunService
-from src.core.audit_service import build_signal_audit, commit_signal_audit
 from src.core.runtime_environment import RuntimeEnvironment
 from src.core.runtime_capabilities import (
     DefaultRuntimeBootstrap,
@@ -478,6 +473,34 @@ class StrategyEngine:
             )
             if runtime_capabilities_factory is not None
             else NoopRuntimeCapabilities()
+        )
+        self._signal_execution = SignalExecutionService(
+            clock=self.clock,
+            default_entry_quantity=lambda: self.execution_engine.default_quantity,
+            check_risk=lambda signal, *, current_price: self.risk_manager.check_risk(
+                signal,
+                current_price=current_price,
+            ),
+            route_authoritative_exit=lambda signal, candle, portfolio_id, execute: (
+                self._venue_runtime.route_authoritative_exit(
+                    signal,
+                    candle,
+                    portfolio_id,
+                    execute,
+                )
+            ),
+            execute_signal=lambda signal, candle: (
+                self.execution_engine.execute_signal(signal, candle)
+            ),
+            execute_authoritative_exit_signal=(
+                lambda: self.execution_engine.execute_authoritative_exit_signal
+            ),
+            portfolio_id_for_sleeve=(
+                lambda: self._portfolio_coordinator.portfolio_id_for_sleeve
+            ),
+            audit_external_orders=lambda: self.execution_engine.audit_external_orders,
+            db_session_factory=lambda: self._db_session_factory(),
+            event_logger=logger,
         )
         self.runtime_reconciliation_job = RuntimeReconciliationJob(
             account_service=self.account_service,
@@ -1513,7 +1536,7 @@ class StrategyEngine:
             return False
         if not _entry_admitted and not self._entry_signal_allowed(signal):
             return False
-        return self._process_admitted_signal(signal, candle)
+        return self._signal_execution.process(signal, candle)
 
     def _runtime_signal_allowed(self, signal: Signal) -> bool:
         """Apply runtime-wide submission gates before risk or execution."""
@@ -1553,72 +1576,6 @@ class StrategyEngine:
         if self._kill_switch_halted:
             return True
         return self._entry_signal_allowed(signal)
-
-    def _process_admitted_signal(
-        self,
-        signal: Signal,
-        candle: Optional[Candlestick],
-    ) -> bool:
-        """Process a signal after admission was decided at the owning boundary."""
-        if signal.type == SignalType.NO_SIGNAL:
-            return True
-        import structlog.contextvars
-
-        structlog.contextvars.bind_contextvars(trace_id=uuid.uuid4().hex[:16])
-
-        current_price = candle.close if candle else None
-        try:
-            signal = normalize_signal_quantity(
-                signal,
-                default_entry_quantity=self.execution_engine.default_quantity,
-            )
-            resolve_signal_order_intent(signal)
-        except InvalidSignalOrderIntent as exc:
-            is_passed = False
-            risk_msg = f"REJECT: {exc}"
-            logger.warning("RISK_REJECTED: %s", risk_msg)
-        else:
-            is_passed, risk_msg = self.risk_manager.check_risk(
-                signal,
-                current_price=current_price,
-            )
-
-        risk_status = "PASS" if is_passed else "REJECT"
-        SIGNALS_TOTAL.labels(
-            strategy_id=signal.strategy_id,
-            signal_type=signal.type.value,
-            risk_status=risk_status,
-        ).inc()
-
-        order_id = None
-        execution_succeeded = False
-        if is_passed:
-            logger.info(
-                "✅ SIGNAL ACCEPTED: %s. Forwarding to Execution Engine...", signal.type
-            )
-            handled, execution_succeeded = self._venue_runtime.route_authoritative_exit(
-                signal,
-                candle,
-                self._portfolio_coordinator.portfolio_id_for_sleeve,
-                self.execution_engine.execute_authoritative_exit_signal,
-            )
-            if not handled:
-                order_id = self.execution_engine.execute_signal(signal, candle)
-                execution_succeeded = order_id is not None
-            if self.execution_engine.audit_external_orders:
-                return execution_succeeded
-
-        audit = build_signal_audit(
-            clock=self.clock,
-            signal=signal,
-            candle=candle,
-            risk_passed=is_passed,
-            risk_message=risk_msg,
-            order_id=order_id,
-        )
-        with self._db_session_factory() as db:
-            commit_signal_audit(db, audit)
-        return execution_succeeded
 
     def shutdown(
         self,
