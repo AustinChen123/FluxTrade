@@ -86,6 +86,7 @@ from src.core.strategy_state_manager import (
     available_strategy_commands,
 )
 from src.core.strategy_hydration_service import StrategyHydrationService
+from src.core.strategy_deactivation_service import StrategyDeactivationService
 from src.core.strategy_test_run_service import StrategyTestRunService
 from src.core.audit_service import build_signal_audit, commit_signal_audit
 from src.core.runtime_environment import RuntimeEnvironment
@@ -253,6 +254,14 @@ class StrategyEngine:
         self.strategy_instances = self._runtime_artifacts.strategy_instances
         self.portfolio_instances = self._runtime_artifacts.portfolio_instances
         self._runtime_registration_lock = self._runtime_artifacts.registration_lock
+        self._strategy_deactivation = StrategyDeactivationService(
+            state_manager=self._strategy_state_manager,
+            portfolio_coordinator=self._portfolio_coordinator,
+            runtime_artifacts=self._runtime_artifacts,
+            registration_lock=self._runtime_registration_lock,
+            market_processing_lock=self._market_processing_lock,
+            event_logger=logger,
+        )
         self._daily_nav_snapshot_service = DailyNavSnapshotService(
             self._db_session_factory,
         )
@@ -1352,53 +1361,12 @@ class StrategyEngine:
     ) -> bool:
         """Unregister a strategy and transition it to STOPPED."""
         with self._strategy_lifecycle_lock(strategy_id):
-            return self._deactivate_strategy_locked(
+            return self._strategy_deactivation.deactivate_locked(
                 strategy_id,
                 actor=actor,
                 reason=reason,
                 expected_version=expected_version,
             )
-
-    def _deactivate_strategy_locked(
-        self,
-        strategy_id: str,
-        *,
-        actor: str,
-        reason: Optional[str],
-        expected_version: int | None,
-    ) -> bool:
-        logger.info("🛑 Stopping Strategy: %s", strategy_id)
-        with self._runtime_registration_lock, self._market_processing_lock:
-            if (
-                self._portfolio_coordinator.portfolio_id_for_sleeve(strategy_id)
-                is not None
-            ):
-                raise ValueError(
-                    "portfolio sleeves must be controlled through the portfolio ID"
-                )
-            try:
-                transition_kwargs = {
-                    "actor": actor,
-                    "reason": reason,
-                }
-                if expected_version is not None:
-                    transition_kwargs["expected_version"] = expected_version
-                self._strategy_state_manager.transition_to_stopped(
-                    strategy_id,
-                    **transition_kwargs,
-                )
-            except (KeyError, InvalidStrategyStateTransition):
-                logger.warning("Strategy %s is not active.", strategy_id)
-                return False
-
-            if not self._unregister_runtime_artifact_locked(strategy_id):
-                logger.warning(
-                    "Strategy %s runtime was already absent; durable state reconciled.",
-                    strategy_id,
-                )
-
-        logger.info("✅ Strategy %s stopped.", strategy_id)
-        return True
 
     def stop_strategy(self, strategy_id: str):
         """Backward-compatible wrapper for legacy callers."""
@@ -1423,9 +1391,6 @@ class StrategyEngine:
     def _unregister_runtime_artifact(self, runtime_id: str) -> bool:
         """Remove a parent portfolio or one standalone strategy."""
         return self._runtime_artifacts.unregister(runtime_id)
-
-    def _unregister_runtime_artifact_locked(self, runtime_id: str) -> bool:
-        return self._runtime_artifacts.unregister_locked(runtime_id)
 
     def _unregister_strategy_instance(self, strategy_id: str) -> bool:
         """Remove a live strategy instance from runtime-only structures."""
