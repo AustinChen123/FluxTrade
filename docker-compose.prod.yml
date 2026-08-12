@@ -173,9 +173,8 @@ services:
       METRICS_ENABLED: ${METRICS_ENABLED:-true}
       METRICS_PORT: 9090
       LOG_FORMAT: ${LOG_FORMAT:-json}
-      HOT_STRATEGIES_PATH: /app/strategies_hot
+      STRATEGY_ARTIFACTS_PATH: /app/strategy_artifacts
     volumes:
-      - ./python-strategy/strategies_hot:/app/strategies_hot
       - ${FLUXTRADE_SECRETS_DIR:?FLUXTRADE_SECRETS_DIR is required}:/run/secrets/fluxtrade:ro
     deploy:
       resources:

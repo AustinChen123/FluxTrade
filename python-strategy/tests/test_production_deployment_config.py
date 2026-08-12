@@ -381,6 +381,35 @@ def test_python_production_image_contains_migration_runtime_contract():
     } <= dockerignore_entries
 
 
+def test_python_production_image_owns_immutable_strategy_artifact_root():
+    dockerfile = PYTHON_DOCKERFILE.read_text()
+
+    create_root = "mkdir -p /app/data /app/strategy_artifacts"
+    switch_user = "USER trading"
+    assert create_root in dockerfile
+    assert dockerfile.index(create_root) < dockerfile.index(switch_user)
+    assert "chown -R trading:trading /app/strategy_artifacts" not in dockerfile
+    assert (
+        re.search(r"chown\s+-R\s+trading:trading\s+/app(?:\s|\\|$)", dockerfile) is None
+    )
+
+
+@pytest.mark.integration
+def test_production_strategy_source_is_image_owned_not_writable_mount(
+    tmp_path: Path,
+):
+    strategy = _compose_config(tmp_path)["services"]["python-strategy"]
+
+    assert strategy["environment"]["STRATEGY_ARTIFACTS_PATH"] == (
+        "/app/strategy_artifacts"
+    )
+    assert "STRATEGY_BREAK_GLASS_ENABLED" not in strategy["environment"]
+    assert all(
+        volume["target"] not in {"/app/strategies_hot", "/app/strategy_artifacts"}
+        for volume in strategy["volumes"]
+    )
+
+
 @pytest.mark.integration
 def test_runtime_images_can_be_overridden_for_private_builds(tmp_path: Path):
     env = _required_env()
