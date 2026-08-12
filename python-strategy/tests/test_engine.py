@@ -536,10 +536,11 @@ class TestEngineInit:
             events.append("generic_interval")
             return _runtime_reconciliation_interval_from_env()
 
+        adapter = MagicMock()
+        adapter.supports_runtime_reconciliation.return_value = True
         monkeypatch.setenv("RUNTIME_RECONCILE_INTERVAL_SECONDS", interval)
         with (
             patch("src.core.engine.create_redis_client") as redis_factory,
-            patch("src.core.engine.create_adapter") as create_adapter,
             patch(
                 "src.core.engine.RiskManager",
                 return_value=_RecordingRiskManager(events),
@@ -557,10 +558,6 @@ class TestEngineInit:
             patch("src.core.engine.ExecutionEngine") as execution_engine,
         ):
             redis_factory.return_value = MagicMock()
-            create_adapter.return_value = MagicMock()
-            create_adapter.return_value.supports_runtime_reconciliation.return_value = (
-                True
-            )
 
             with pytest.raises(
                 ValueError,
@@ -573,11 +570,12 @@ class TestEngineInit:
                         "mode": "live",
                         "instrument_product_ids": ["BINANCE:BTCUSDT-PERP"],
                     },
+                    adapter=adapter,
                     account_service=account_service,
                 )
 
         assert events == ["risk_resolver", "generic_interval"]
-        create_adapter.return_value.supports_runtime_reconciliation.assert_called_once_with()
+        adapter.supports_runtime_reconciliation.assert_called_once_with()
         account_service.configure_authoritative_balance.assert_not_called()
         rithmic_max_age.assert_not_called()
         rithmic_interval.assert_not_called()
@@ -909,7 +907,7 @@ class TestEngineInit:
         """When no adapter_config, should default to simulated mode."""
         with (
             patch("src.core.engine.create_redis_client") as mock_factory,
-            patch("src.core.engine.create_adapter") as mock_create,
+            patch("src.core.engine.create_simulated_adapter") as mock_create,
         ):
             mock_factory.return_value = MagicMock()
             mock_adapter = MagicMock()
@@ -922,44 +920,24 @@ class TestEngineInit:
             )
 
             assert mock_create.call_args.args == ({"mode": "simulated"},)
-            assert callable(mock_create.call_args.kwargs["operation_guard"])
+            assert mock_create.call_args.kwargs == {}
 
-    def test_adapter_config_passed_through(self, mock_db_session, mock_clock):
-        """Custom adapter_config should be forwarded to create_adapter."""
-        with (
-            patch("src.core.engine.create_redis_client") as mock_factory,
-            patch("src.core.engine.create_adapter") as mock_create,
-        ):
-            mock_factory.return_value = MagicMock()
-            mock_create.return_value = MagicMock()
-
-            cfg = {
-                "mode": "live",
-                "exchange": "bybit",
-                "instrument_product_ids": ["BYBIT:BTCUSDT-PERP"],
-            }
-            StrategyEngine(
-                db_session=mock_db_session,
-                clock=mock_clock,
-                adapter_config=cfg,
-                account_service=MagicMock(),
-            )
-
-            assert mock_create.call_args.args == (cfg,)
-            assert callable(mock_create.call_args.kwargs["operation_guard"])
-
-    def test_runtime_reconciliation_uses_configured_product_universe(
-        self, mock_db_session, mock_clock
+    def test_live_adapter_must_be_composed_before_engine(
+        self,
+        mock_db_session,
+        mock_clock,
     ):
-        """Runtime reconciliation must scan configured products even when local is flat."""
         with (
-            patch("src.core.engine.create_redis_client") as mock_factory,
-            patch("src.core.engine.create_adapter") as mock_create,
+            patch("src.core.engine.create_redis_client") as redis_factory,
+            patch("src.core.engine.create_simulated_adapter") as adapter_factory,
+            patch("src.core.engine.ExecutionEngine") as execution_engine,
+            pytest.raises(
+                ValueError,
+                match="^live adapter must be composed by the service entrypoint$",
+            ),
         ):
-            mock_factory.return_value = MagicMock()
-            mock_create.return_value = MagicMock()
-
-            engine = StrategyEngine(
+            redis_factory.return_value = MagicMock()
+            StrategyEngine(
                 db_session=mock_db_session,
                 clock=mock_clock,
                 adapter_config={
@@ -970,35 +948,69 @@ class TestEngineInit:
                 account_service=MagicMock(),
             )
 
+        adapter_factory.assert_not_called()
+        execution_engine.assert_not_called()
+
+    def test_live_config_uses_injected_adapter(self, mock_db_session, mock_clock):
+        with (
+            patch("src.core.engine.create_redis_client") as mock_factory,
+            patch("src.core.engine.create_simulated_adapter") as mock_create,
+        ):
+            mock_factory.return_value = MagicMock()
+            adapter = MagicMock()
+
+            cfg = {
+                "mode": "live",
+                "exchange": "bybit",
+                "instrument_product_ids": ["BYBIT:BTCUSDT-PERP"],
+            }
+            StrategyEngine(
+                db_session=mock_db_session,
+                clock=mock_clock,
+                adapter_config=cfg,
+                adapter=adapter,
+                account_service=MagicMock(),
+            )
+
+            mock_create.assert_not_called()
+
+    def test_runtime_reconciliation_uses_configured_product_universe(
+        self, mock_db_session, mock_clock
+    ):
+        """Runtime reconciliation must scan configured products even when local is flat."""
+        with patch("src.core.engine.create_redis_client") as mock_factory:
+            mock_factory.return_value = MagicMock()
+            adapter = MagicMock()
+
+            engine = StrategyEngine(
+                db_session=mock_db_session,
+                clock=mock_clock,
+                adapter_config={
+                    "mode": "live",
+                    "exchange": "binance",
+                    "instrument_product_ids": ["BINANCE:BTCUSDT-PERP"],
+                },
+                adapter=adapter,
+                account_service=MagicMock(),
+            )
+
         assert engine.runtime_reconciliation_job._product_ids == (
             "BINANCE:BTCUSDT-PERP",
         )
 
-    def test_adapter_create_failure_raises(self, mock_db_session, mock_clock):
-        """If create_adapter fails, should log critical and re-raise."""
-        with (
-            patch("src.core.engine.create_redis_client") as mock_factory,
-            patch("src.core.engine.create_adapter") as mock_create,
-        ):
-            mock_factory.return_value = MagicMock()
-            mock_create.side_effect = RuntimeError("boom")
+    def test_engine_constructor_has_no_provider_factory_dependency(self):
+        source = inspect.getsource(StrategyEngine.__init__)
 
-            with pytest.raises(RuntimeError, match="boom"):
-                StrategyEngine(
-                    db_session=mock_db_session,
-                    clock=mock_clock,
-                    adapter_config={
-                        "mode": "live",
-                        "instrument_product_ids": ["BINANCE:BTCUSDT-PERP"],
-                    },
-                    account_service=MagicMock(),
-                )
+        assert "create_adapter" not in source
+        assert "src.core.adapters import" not in inspect.getsource(
+            __import__("src.core.engine", fromlist=["StrategyEngine"])
+        )
 
     def test_provided_adapter_used_directly(self, mock_db_session, mock_clock):
-        """Pre-created adapter should be used without calling create_adapter."""
+        """Pre-created adapter should bypass simulated construction."""
         with (
             patch("src.core.engine.create_redis_client") as mock_factory,
-            patch("src.core.engine.create_adapter") as mock_create,
+            patch("src.core.engine.create_simulated_adapter") as mock_create,
         ):
             mock_factory.return_value = MagicMock()
             mock_adapter = MagicMock()
@@ -5675,13 +5687,10 @@ class TestRuntimeReconciliationThread:
         """Live runs should start periodic runtime reconciliation."""
         with (
             patch("src.core.engine.create_redis_client") as mock_factory,
-            patch("src.core.engine.create_adapter") as mock_create,
         ):
             mock_factory.return_value = MagicMock()
-            mock_create.return_value = MagicMock()
-            mock_create.return_value.supports_runtime_reconciliation.return_value = (
-                True
-            )
+            adapter = MagicMock()
+            adapter.supports_runtime_reconciliation.return_value = True
             engine = StrategyEngine(
                 db_session=mock_db_session,
                 clock=mock_clock,
@@ -5689,6 +5698,7 @@ class TestRuntimeReconciliationThread:
                     "mode": "live",
                     "instrument_product_ids": ["BINANCE:BTCUSDT-PERP"],
                 },
+                adapter=adapter,
                 account_service=MagicMock(),
             )
 

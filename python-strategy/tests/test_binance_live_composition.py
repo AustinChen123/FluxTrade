@@ -2,12 +2,37 @@
 
 import ast
 import inspect
+from decimal import Decimal
 from unittest.mock import ANY, MagicMock, patch
 
 import pytest
 
 import src.core.adapters as adapters
 from src.core.adapters import live_binance
+from src.core.adapters import simulated as simulated_owner
+
+
+def test_simulated_owner_preserves_decimal_configuration() -> None:
+    result = object()
+    with patch.object(
+        simulated_owner,
+        "SimulatedAdapter",
+        return_value=result,
+    ) as adapter_cls:
+        actual = simulated_owner.create_simulated_adapter(
+            {
+                "balance": "1234567890.123456789",
+                "maker_fee": "0.000123456789",
+                "taker_fee": Decimal("0.000987654321"),
+            }
+        )
+
+    assert actual is result
+    adapter_cls.assert_called_once_with(
+        initial_balance=Decimal("1234567890.123456789"),
+        maker_fee=Decimal("0.000123456789"),
+        taker_fee=Decimal("0.000987654321"),
+    )
 
 
 @pytest.mark.parametrize("enable_ws", [True, "enabled"])
@@ -183,7 +208,7 @@ def test_generic_factory_routes_to_exact_venue_owner(config, expected):
 
     with (
         patch.object(
-            adapters, "SimulatedAdapter", return_value=simulated
+            adapters, "create_simulated_adapter", return_value=simulated
         ) as simulated_cls,
         patch.object(adapters, "RithmicExchangeAdapter") as rithmic_cls,
         patch.object(

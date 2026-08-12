@@ -18,7 +18,7 @@ from src.core.adapters.rithmic_adapter import (
     RithmicExchangeAdapter,
     RithmicUnmappedOrderEvent,
 )
-from src.core.adapters.simulated import SimulatedAdapter
+from src.core.adapters.simulated import SimulatedAdapter, create_simulated_adapter
 from src.core.interfaces.exchange import IExchangeAdapter
 
 __all__ = [
@@ -50,19 +50,10 @@ def create_adapter(
         extra_config: dict          (extra CCXT config, optional)
         account_initialization: dict (live account settings, optional)
     """
-    from decimal import Decimal
-
     mode = config.get("mode", "simulated")
 
     if mode == "simulated":
-        balance = Decimal(str(config.get("balance", 100000)))
-        maker_fee = Decimal(str(config.get("maker_fee", 0)))
-        taker_fee = Decimal(str(config.get("taker_fee", 0)))
-        return SimulatedAdapter(
-            initial_balance=balance,
-            maker_fee=maker_fee,
-            taker_fee=taker_fee,
-        )
+        return create_simulated_adapter(config)
 
     exchange_id = config.get("exchange", "binance")
     guard = operation_guard or (lambda: None)

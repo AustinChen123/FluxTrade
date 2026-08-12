@@ -42,6 +42,15 @@ if TYPE_CHECKING:
 _RUST_HAS_STRATEGY_ID = "strategy_id" in str(inspect.signature(RustOrder))
 
 
+def create_simulated_adapter(config: dict) -> "SimulatedAdapter":
+    """Build the local matching adapter without importing live providers."""
+    return SimulatedAdapter(
+        initial_balance=Decimal(str(config.get("balance", 100000))),
+        maker_fee=Decimal(str(config.get("maker_fee", 0))),
+        taker_fee=Decimal(str(config.get("taker_fee", 0))),
+    )
+
+
 class SimulatedAdapter(IExchangeAdapter):
     """Exchange adapter backed by Rust PyMatchingEngine for backtest.
 

@@ -1009,6 +1009,17 @@ def test_main_wires_session_factory_and_audit_flag(monkeypatch) -> None:
     engine.shutdown.side_effect = lambda **_kwargs: events.append("engine_shutdown")
     consumer.stop.side_effect = lambda: events.append("consumer_stop")
     artifact_loader = MagicMock(return_value={})
+    adapter = MagicMock()
+    adapter_factory = MagicMock(
+        side_effect=lambda *_args, **_kwargs: events.append("adapter_construct")
+        or adapter
+    )
+    monkeypatch.setattr(
+        strategy_main,
+        "create_adapter",
+        adapter_factory,
+        raising=False,
+    )
 
     def build_engine(**_kwargs):
         events.append("engine_construct")
@@ -1029,6 +1040,7 @@ def test_main_wires_session_factory_and_audit_flag(monkeypatch) -> None:
     kwargs = engine_cls.call_args.kwargs
     assert kwargs["db_session"] is db_session
     assert kwargs["adapter_config"] == {"mode": "simulated"}
+    assert kwargs["adapter"] is adapter
     assert callable(kwargs["db_session_factory"])
     assert kwargs["audit_external_orders"] is True
     assert kwargs["leadership_guard"] is consumer.assert_service_ownership
@@ -1039,12 +1051,17 @@ def test_main_wires_session_factory_and_audit_flag(monkeypatch) -> None:
     engine.add_strategy.assert_not_called()
     assert events == [
         "ownership",
+        "adapter_construct",
         "engine_construct",
         "startup",
         "engine_shutdown",
         "consumer_stop",
     ]
     consumer.acquire_service_ownership.assert_called_once()
+    assert adapter_factory.call_args.args == ({"mode": "simulated"},)
+    assert adapter_factory.call_args.kwargs == {
+        "operation_guard": consumer.assert_service_ownership
+    }
     engine.startup.assert_called_once_with()
     assert (
         consumer.configure_callbacks.call_args.kwargs["channel_provider"]
@@ -1062,6 +1079,79 @@ def test_main_wires_session_factory_and_audit_flag(monkeypatch) -> None:
     db_session.close.assert_called_once()
 
 
+def test_main_closes_unowned_adapter_when_engine_construction_fails(
+    monkeypatch,
+    caplog,
+) -> None:
+    error = RuntimeError("engine construction failed")
+    adapter = MagicMock()
+    adapter.close.side_effect = OSError("cleanup details")
+    adapter_factory = MagicMock(return_value=adapter)
+    consumer = MagicMock(spec=strategy_main.DataConsumer)
+    db_session = MagicMock()
+    monkeypatch.setenv("AUDIT_EXTERNAL_ORDERS", "true")
+    monkeypatch.delenv("ADAPTER_MODE", raising=False)
+    monkeypatch.delenv("EXCHANGE_MODE", raising=False)
+    monkeypatch.delenv("FLUXTRADE_ENVIRONMENT", raising=False)
+    monkeypatch.setattr(
+        strategy_main,
+        "create_adapter",
+        adapter_factory,
+        raising=False,
+    )
+
+    with (
+        patch("src.main.configure_metrics"),
+        patch("src.main.SessionLocal", return_value=db_session),
+        patch("src.main.StrategyEngine", side_effect=error),
+        patch("src.main.DataConsumer", return_value=consumer),
+        pytest.raises(RuntimeError) as caught,
+    ):
+        strategy_main.main()
+
+    assert caught.value is error
+    adapter_factory.assert_called_once_with(
+        {"mode": "simulated"},
+        operation_guard=consumer.assert_service_ownership,
+    )
+    adapter.close.assert_called_once_with()
+    assert "Failed to close unowned adapter" in caplog.text
+    assert "OSError" in caplog.text
+    assert "cleanup details" not in caplog.text
+    consumer.stop.assert_called_once_with()
+    db_session.close.assert_called_once_with()
+
+
+def test_main_preserves_adapter_construction_failure(monkeypatch) -> None:
+    error = RuntimeError("adapter construction failed")
+    adapter_factory = MagicMock(side_effect=error)
+    consumer = MagicMock(spec=strategy_main.DataConsumer)
+    db_session = MagicMock()
+    monkeypatch.setenv("AUDIT_EXTERNAL_ORDERS", "true")
+    monkeypatch.delenv("ADAPTER_MODE", raising=False)
+    monkeypatch.delenv("EXCHANGE_MODE", raising=False)
+    monkeypatch.delenv("FLUXTRADE_ENVIRONMENT", raising=False)
+    monkeypatch.setattr(strategy_main, "create_adapter", adapter_factory)
+
+    with (
+        patch("src.main.configure_metrics"),
+        patch("src.main.SessionLocal", return_value=db_session),
+        patch("src.main.StrategyEngine") as engine_cls,
+        patch("src.main.DataConsumer", return_value=consumer),
+        pytest.raises(RuntimeError) as caught,
+    ):
+        strategy_main.main()
+
+    assert caught.value is error
+    adapter_factory.assert_called_once_with(
+        {"mode": "simulated"},
+        operation_guard=consumer.assert_service_ownership,
+    )
+    engine_cls.assert_not_called()
+    consumer.stop.assert_called_once_with()
+    db_session.close.assert_called_once_with()
+
+
 def test_main_injects_rithmic_runtime_composition_factories(monkeypatch) -> None:
     adapter_config = {
         "mode": "live",
@@ -1076,6 +1166,7 @@ def test_main_injects_rithmic_runtime_composition_factories(monkeypatch) -> None
     engine = MagicMock()
     engine.build_stream_channels.return_value = []
     consumer = MagicMock(spec=strategy_main.DataConsumer)
+    adapter = MagicMock()
     monkeypatch.setattr(
         strategy_main, "_adapter_config_from_env", lambda: adapter_config
     )
@@ -1093,6 +1184,11 @@ def test_main_injects_rithmic_runtime_composition_factories(monkeypatch) -> None
         capabilities_factory,
         raising=False,
     )
+    monkeypatch.setattr(
+        strategy_main,
+        "create_adapter",
+        MagicMock(return_value=adapter),
+    )
 
     with (
         patch("src.main.configure_metrics"),
@@ -1103,6 +1199,7 @@ def test_main_injects_rithmic_runtime_composition_factories(monkeypatch) -> None
         strategy_main.main()
 
     kwargs = engine_cls.call_args.kwargs
+    assert kwargs["adapter"] is adapter
     assert kwargs["runtime_bootstrap_factory"] is bootstrap_factory
     assert kwargs["runtime_capabilities_factory"] is capabilities_factory
 
@@ -1130,11 +1227,17 @@ def test_main_does_not_inject_rithmic_factories_for_ccxt_live(
     engine = MagicMock()
     engine.build_stream_channels.return_value = []
     consumer = MagicMock(spec=strategy_main.DataConsumer)
+    adapter = MagicMock()
     monkeypatch.setattr(
         strategy_main, "_adapter_config_from_env", lambda: adapter_config
     )
     monkeypatch.setattr(strategy_main, "_validate_runtime_config", MagicMock())
     monkeypatch.setattr(strategy_main, "_required_env_flag", lambda _name: True)
+    monkeypatch.setattr(
+        strategy_main,
+        "create_adapter",
+        MagicMock(return_value=adapter),
+    )
 
     with (
         patch("src.main.configure_metrics"),
@@ -1145,6 +1248,7 @@ def test_main_does_not_inject_rithmic_factories_for_ccxt_live(
         strategy_main.main()
 
     kwargs = engine_cls.call_args.kwargs
+    assert kwargs["adapter"] is adapter
     assert kwargs["runtime_bootstrap_factory"] is None
     assert kwargs["runtime_capabilities_factory"] is None
 

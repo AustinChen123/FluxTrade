@@ -131,7 +131,7 @@ def test_generic_factory_routes_to_exact_construction_owner(config, expected) ->
     with (
         patch.object(
             adapters,
-            "SimulatedAdapter",
+            "create_simulated_adapter",
             return_value=results["simulated"],
         ) as simulated_cls,
         patch.object(adapters, "RithmicExchangeAdapter") as rithmic_cls,

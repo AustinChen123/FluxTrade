@@ -27,6 +27,7 @@ from src.core.adapters.binance_live_config import build_binance_live_adapter_con
 from src.core.adapters.bybit_live_config import build_bybit_live_adapter_config
 from src.core.adapters.ccxt_live_credentials import build_ccxt_live_credentials
 from src.core.adapters.okx_live_config import build_okx_live_adapter_config
+from src.core.adapters import create_adapter
 from src.core.adapters.rithmic_live_config import (
     build_rithmic_live_adapter_config,
     validate_rithmic_recovery_identity,
@@ -305,6 +306,7 @@ def main():
 
     db_session = None
     engine = None
+    adapter = None
     clean_exit = False
     try:
         consumer.acquire_service_ownership()
@@ -314,17 +316,42 @@ def main():
 
         db_session = SessionLocal()
         clock = RealtimeClock()
-        engine = StrategyEngine(
-            db_session=db_session,
-            clock=clock,
-            adapter_config=adapter_config,
-            db_session_factory=_session_scope,
-            audit_external_orders=audit_external_orders,
-            leadership_guard=consumer.assert_service_ownership,
-            runtime_bootstrap_factory=runtime_bootstrap_factory,
-            runtime_capabilities_factory=runtime_capabilities_factory,
-            strategy_artifact_loader=strategy_artifact_loader,
-        )
+        try:
+            adapter = create_adapter(
+                adapter_config,
+                operation_guard=consumer.assert_service_ownership,
+            )
+        except Exception as exc:
+            logger.critical(
+                "Failed to init adapter: %s. NOT falling back silently.",
+                exc,
+            )
+            raise
+        try:
+            engine = StrategyEngine(
+                db_session=db_session,
+                clock=clock,
+                adapter_config=adapter_config,
+                adapter=adapter,
+                db_session_factory=_session_scope,
+                audit_external_orders=audit_external_orders,
+                leadership_guard=consumer.assert_service_ownership,
+                runtime_bootstrap_factory=runtime_bootstrap_factory,
+                runtime_capabilities_factory=runtime_capabilities_factory,
+                strategy_artifact_loader=strategy_artifact_loader,
+            )
+        except Exception:
+            close_adapter = getattr(adapter, "close", None)
+            if callable(close_adapter):
+                try:
+                    close_adapter()
+                except Exception as close_error:
+                    logger.warning(
+                        "Failed to close unowned adapter after Engine construction failure: %s",
+                        type(close_error).__name__,
+                    )
+            adapter = None
+            raise
         engine.startup()
         consumer.configure_callbacks(
             on_message_callback=engine.on_market_data,
@@ -337,6 +364,10 @@ def main():
         try:
             if engine is not None:
                 engine.shutdown(clean_exit=clean_exit)
+            elif adapter is not None:
+                close_adapter = getattr(adapter, "close", None)
+                if callable(close_adapter):
+                    close_adapter()
         finally:
             try:
                 if db_session is not None:

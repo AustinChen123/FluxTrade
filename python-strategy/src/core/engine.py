@@ -49,9 +49,9 @@ from src.core.portfolio_runtime import (
     build_portfolio_artifact,
 )
 from src.core.data_provider import check_data_availability
-from src.core.adapters import (
+from src.core.adapters.simulated import (
     SimulatedAdapter,
-    create_adapter,
+    create_simulated_adapter,
 )
 from src.core.journal import StrategyJournal
 from src.core.redis_factory import create_redis_client
@@ -257,7 +257,8 @@ class StrategyEngine:
             ),
         )
 
-        # Use pre-created adapter or build from config
+        # Live adapters are composed by the service entrypoint. Keep the local
+        # simulated default for library and backtest callers.
         effective_adapter_config = adapter_config or {"mode": "simulated"}
         self._live_product_ids = (
             frozenset(effective_adapter_config.get("instrument_product_ids") or [])
@@ -269,17 +270,12 @@ class StrategyEngine:
         self._startup_auto_recovery_allowed = False
         self._startup_lock_cause: str | None = None
         if adapter is None:
-            try:
-                adapter = create_adapter(
-                    effective_adapter_config,
-                    operation_guard=self._leadership_guard,
+            if effective_adapter_config.get("mode", "simulated") != "simulated":
+                raise ValueError(
+                    "live adapter must be composed by the service entrypoint"
                 )
-                logger.info("StrategyEngine: Using %s", type(adapter).__name__)
-            except Exception as e:
-                logger.critical(
-                    "Failed to init adapter: %s. NOT falling back silently.", e
-                )
-                raise
+            adapter = create_simulated_adapter(effective_adapter_config)
+            logger.info("StrategyEngine: Using %s", type(adapter).__name__)
         else:
             logger.info(
                 "StrategyEngine: Using provided adapter %s", type(adapter).__name__
