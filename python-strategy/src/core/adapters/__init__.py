@@ -4,22 +4,21 @@ Factory function ``create_adapter`` provides config-driven instantiation.
 """
 
 from collections.abc import Callable
+from typing import TYPE_CHECKING, Any
 
-from src.core.adapters.ccxt_account_initialization import AccountInitializationConfig
-from src.core.adapters.ccxt_adapter import CcxtExchangeAdapter
-from src.core.adapters.live_binance import (
-    LiveBinanceAdapter,
-    create_binance_live_adapter,
-)
-from src.core.adapters.live_backpack import create_backpack_live_adapter
-from src.core.adapters.live_bybit import create_bybit_live_adapter
-from src.core.adapters.live_okx import create_okx_live_adapter
-from src.core.adapters.rithmic_adapter import (
-    RithmicExchangeAdapter,
-    RithmicUnmappedOrderEvent,
-)
-from src.core.adapters.simulated import SimulatedAdapter, create_simulated_adapter
 from src.core.interfaces.exchange import IExchangeAdapter
+
+if TYPE_CHECKING:
+    from src.core.adapters.ccxt_account_initialization import (
+        AccountInitializationConfig,
+    )
+    from src.core.adapters.ccxt_adapter import CcxtExchangeAdapter
+    from src.core.adapters.live_binance import LiveBinanceAdapter
+    from src.core.adapters.rithmic_adapter import (
+        RithmicExchangeAdapter,
+        RithmicUnmappedOrderEvent,
+    )
+    from src.core.adapters.simulated import SimulatedAdapter
 
 __all__ = [
     "AccountInitializationConfig",
@@ -30,6 +29,68 @@ __all__ = [
     "SimulatedAdapter",
     "create_adapter",
 ]
+
+
+def __getattr__(name: str) -> Any:
+    """Resolve compatibility exports without loading every venue provider."""
+    if name == "AccountInitializationConfig":
+        from src.core.adapters.ccxt_account_initialization import (
+            AccountInitializationConfig as value,
+        )
+    elif name == "CcxtExchangeAdapter":
+        from src.core.adapters.ccxt_adapter import CcxtExchangeAdapter as value
+    elif name == "LiveBinanceAdapter":
+        from src.core.adapters import live_binance
+
+        value = getattr(live_binance, name)
+    elif name in {"RithmicExchangeAdapter", "RithmicUnmappedOrderEvent"}:
+        from src.core.adapters import rithmic_adapter
+
+        value = getattr(rithmic_adapter, name)
+    elif name == "SimulatedAdapter":
+        from src.core.adapters import simulated
+
+        value = getattr(simulated, name)
+    else:
+        raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+    globals()[name] = value
+    return value
+
+
+def _adapter_dependency(name: str) -> Any:
+    if name in globals():
+        return globals()[name]
+    return __getattr__(name)
+
+
+def create_simulated_adapter(config: dict):
+    from src.core.adapters.simulated import create_simulated_adapter as owner
+
+    return owner(config)
+
+
+def create_binance_live_adapter(**kwargs):
+    from src.core.adapters.live_binance import create_binance_live_adapter as owner
+
+    return owner(**kwargs)
+
+
+def create_backpack_live_adapter(**kwargs):
+    from src.core.adapters.live_backpack import create_backpack_live_adapter as owner
+
+    return owner(**kwargs)
+
+
+def create_bybit_live_adapter(**kwargs):
+    from src.core.adapters.live_bybit import create_bybit_live_adapter as owner
+
+    return owner(**kwargs)
+
+
+def create_okx_live_adapter(**kwargs):
+    from src.core.adapters.live_okx import create_okx_live_adapter as owner
+
+    return owner(**kwargs)
 
 
 def create_adapter(
@@ -59,7 +120,7 @@ def create_adapter(
     guard = operation_guard or (lambda: None)
     if str(exchange_id).lower() == "rithmic":
         guard()
-        adapter = RithmicExchangeAdapter.from_config(config)
+        adapter = _adapter_dependency("RithmicExchangeAdapter").from_config(config)
         try:
             guard()
         except Exception:
@@ -72,7 +133,9 @@ def create_adapter(
     enable_ws = config.get("enable_ws", False)
     extra_config = config.get("extra_config")
     instrument_product_ids = config.get("instrument_product_ids") or []
-    account_initialization = AccountInitializationConfig.from_config(
+    account_initialization = _adapter_dependency(
+        "AccountInitializationConfig"
+    ).from_config(
         config.get("account_initialization"),
         default_product_ids=instrument_product_ids,
     )
@@ -112,7 +175,7 @@ def create_adapter(
                 extra_config=extra_config,
             )
         else:
-            adapter = CcxtExchangeAdapter(
+            adapter = _adapter_dependency("CcxtExchangeAdapter")(
                 exchange_id=exchange_id,
                 api_key=api_key,
                 secret=secret,

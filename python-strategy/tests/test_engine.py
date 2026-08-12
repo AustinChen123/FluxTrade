@@ -17,6 +17,8 @@ import inspect
 import json
 import logging
 from pathlib import Path
+import subprocess
+import sys
 import threading
 from types import SimpleNamespace
 from typing import Any
@@ -132,6 +134,33 @@ def test_engine_has_no_concrete_rithmic_runtime_composition_dependency() -> None
     assert "rithmic_reconciliation_owned" not in source
     assert "rithmic_reconciliation_safe" not in source
     assert '"rithmic_reconciliation_blocked"' not in source
+
+
+def test_fresh_engine_import_does_not_load_live_adapter_modules() -> None:
+    script = """
+import json
+import sys
+import src.core.engine
+
+live_modules = sorted(
+    name
+    for name in sys.modules
+    if name == "ccxt"
+    or name.startswith("src.core.adapters.ccxt_")
+    or name.startswith("src.core.adapters.live_")
+    or name.startswith("src.core.adapters.rithmic_")
+)
+print(json.dumps(live_modules))
+"""
+    result = subprocess.run(
+        [sys.executable, "-c", script],
+        cwd=Path(__file__).parents[1],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+
+    assert json.loads(result.stdout) == []
 
 
 def test_engine_runtime_artifact_maps_are_owned_by_one_registry(engine) -> None:
