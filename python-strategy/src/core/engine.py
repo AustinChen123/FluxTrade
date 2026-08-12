@@ -53,6 +53,7 @@ from src.core.health_monitor import HealthMonitor
 from src.core.engine_heartbeat_service import EngineHeartbeatService
 from src.core.engine_boot_state_service import EngineBootStateService
 from src.core.engine_shutdown import EngineShutdownService
+from src.core.generic_order_event_stream import GenericOrderEventStream
 from src.core.engine_runtime_reconciliation_service import (
     EngineRuntimeReconciliationService,
 )
@@ -423,6 +424,26 @@ class StrategyEngine:
         )
         self.order_event_thread = None
         self._order_event_stop = threading.Event()
+        self._generic_order_event_stream = GenericOrderEventStream(
+            adapter_loader=lambda: self.execution_engine.adapter,
+            is_running=lambda: self.running,
+            stop_event=lambda: self._order_event_stop,
+            assert_leadership=lambda: self._assert_runtime_leadership(),
+            process_event=lambda event: (
+                self.execution_engine.process_exchange_order_event(
+                    cast(ExchangeOrderEvent, event)
+                )
+            ),
+            halt_submissions=lambda: self._halt_for_kill_switch(),
+            publish_worker=lambda worker: setattr(
+                self,
+                "order_event_thread",
+                worker,
+            ),
+            current_worker=lambda: self.order_event_thread,
+            event_logger=logger,
+            thread_factory=lambda **values: threading.Thread(**values),
+        )
         runtime_callbacks = RuntimeCallbacks(
             is_running=lambda: self.running,
             publish_worker=lambda worker: setattr(
@@ -772,55 +793,11 @@ class StrategyEngine:
     def _start_exchange_order_event_stream(self) -> None:
         if self._venue_runtime.start_order_event_stream():
             return
-        adapter = self.execution_engine.adapter
-        start = getattr(adapter, "start_order_event_stream", None)
-        poll = getattr(adapter, "poll_order_event", None)
-        if not callable(start) or not callable(poll):
-            return
-
-        try:
-            start()
-        except Exception:
-            self._halt_for_kill_switch()
-            raise
-        self._order_event_stop.clear()
-
-        def order_event_loop() -> None:
-            while self.running and not self._order_event_stop.is_set():
-                try:
-                    self._assert_runtime_leadership()
-                    event = poll()
-                    if event is None:
-                        self._order_event_stop.wait(0.05)
-                        continue
-                    self._assert_runtime_leadership()
-                    self.execution_engine.process_exchange_order_event(
-                        cast(ExchangeOrderEvent, event)
-                    )
-                    self._assert_runtime_leadership()
-                except Exception:
-                    logger.exception(
-                        "Exchange order event stream failed; submissions remain halted"
-                    )
-                    self._halt_for_kill_switch()
-                    return
-
-        self.order_event_thread = threading.Thread(
-            target=order_event_loop,
-            name="exchange-order-events",
-            daemon=True,
-        )
-        self.order_event_thread.start()
+        self._generic_order_event_stream.start()
 
     def _stop_exchange_order_event_stream(self, *, timeout: float) -> bool:
         """Stop the generic order-event worker within a bounded timeout."""
-        self._order_event_stop.set()
-        thread = self.order_event_thread
-        if thread is not None and thread.is_alive():
-            thread.join(timeout=timeout)
-            if thread.is_alive():
-                return False
-        return True
+        return self._generic_order_event_stream.stop(timeout=timeout)
 
     def _detect_external_order_drift(self, reason: str) -> None:
         self._venue_runtime.detect_external_order_drift(reason)

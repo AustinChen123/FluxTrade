@@ -6688,12 +6688,31 @@ class TestExchangeOrderEventThread:
     def test_rithmic_event_stream_start_delegates_only_to_venue_owner(self, engine):
         owner = MagicMock()
         engine._venue_runtime.order_event_stream = owner
+        engine._generic_order_event_stream = MagicMock()
         engine.execution_engine.adapter.start_order_event_stream = MagicMock()
 
         engine._start_exchange_order_event_stream()
 
         owner.start.assert_called_once_with()
+        engine._generic_order_event_stream.start.assert_not_called()
         engine.execution_engine.adapter.start_order_event_stream.assert_not_called()
+
+    def test_generic_event_stream_start_delegates_after_venue_declines(self, engine):
+        engine._venue_runtime.start_order_event_stream = MagicMock(return_value=False)
+        engine._generic_order_event_stream = MagicMock()
+
+        engine._start_exchange_order_event_stream()
+
+        engine._venue_runtime.start_order_event_stream.assert_called_once_with()
+        engine._generic_order_event_stream.start.assert_called_once_with()
+
+    def test_generic_event_stream_stop_delegates_with_timeout(self, engine):
+        engine._generic_order_event_stream = MagicMock()
+        engine._generic_order_event_stream.stop.return_value = False
+
+        assert engine._stop_exchange_order_event_stream(timeout=3.5) is False
+
+        engine._generic_order_event_stream.stop.assert_called_once_with(timeout=3.5)
 
     def test_event_stream_failure_halts_local_submissions(self, engine):
         adapter = MagicMock()
