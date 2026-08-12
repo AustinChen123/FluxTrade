@@ -1360,6 +1360,24 @@ class TestEngineInit:
             actor="system",
         )
 
+    def test_startup_restore_delegates_with_current_engine_dependencies(self, engine):
+        engine.activate_strategy = MagicMock()
+        engine._strategy_state_manager.transition_to_error = MagicMock()
+
+        with patch("src.core.engine.restore_active_strategies") as restore:
+            engine._restore_active_strategies_on_startup()
+
+        kwargs = restore.call_args.kwargs
+        assert kwargs["db_session_factory"] is engine._db_session_factory
+        assert kwargs["activate_strategy"] is engine.activate_strategy
+        assert (
+            kwargs["transition_to_error"]
+            is engine._strategy_state_manager.transition_to_error
+        )
+        assert kwargs["is_strategy_loaded"]("dynamic") is False
+        engine.loaded_classes["dynamic"] = MagicMock()
+        assert kwargs["is_strategy_loaded"]("dynamic") is True
+
 
 # =============================================================================
 # add_strategy (legacy)

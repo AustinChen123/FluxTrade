@@ -70,6 +70,7 @@ from src.core.signal_order_intent import (
 )
 from src.core.strategy_registry import StrategyRegistry
 from src.core.strategy_artifact_discovery import synchronize_strategy_artifacts
+from src.core.strategy_startup_restore import restore_active_strategies
 from src.core.strategy_state_manager import (
     InvalidStrategyStateTransition,
     StaleStrategyStateVersion,
@@ -1026,42 +1027,13 @@ class StrategyEngine:
 
     def _restore_active_strategies_on_startup(self) -> None:
         """Re-instantiate strategies that were ACTIVE before process restart."""
-        with self._db_session_factory() as db:
-            active_states = (
-                db.query(StrategyState)
-                .filter(StrategyState.status == StrategyStatus.ACTIVE.value)
-                .all()
-            )
-
-        for state in active_states:
-            if state.strategy_id not in self.loaded_classes:
-                logger.error(
-                    "Startup restore: strategy class not loaded for %s — marking ERROR",
-                    state.strategy_id,
-                )
-                self._strategy_state_manager.transition_to_error(
-                    state.strategy_id,
-                    "startup_restore_class_missing",
-                    actor="system",
-                )
-                continue
-            try:
-                self.activate_strategy(
-                    state.strategy_id,
-                    actor="system",
-                    reason="startup_restore",
-                    force=True,
-                )
-            except Exception as e:
-                logger.exception(
-                    "Startup restore: failed to activate %s — marking ERROR",
-                    state.strategy_id,
-                )
-                self._strategy_state_manager.transition_to_error(
-                    state.strategy_id,
-                    f"startup_restore_failed: {e}",
-                    actor="system",
-                )
+        restore_active_strategies(
+            db_session_factory=self._db_session_factory,
+            is_strategy_loaded=lambda strategy_id: strategy_id in self.loaded_classes,
+            activate_strategy=self.activate_strategy,
+            transition_to_error=self._strategy_state_manager.transition_to_error,
+            event_logger=logger,
+        )
 
     def test_run_strategy(self, strategy_id: str, days: int):
         """
