@@ -86,6 +86,7 @@ from src.core.strategy_state_manager import (
     available_strategy_commands,
 )
 from src.core.strategy_hydration_service import StrategyHydrationService
+from src.core.strategy_test_run_service import StrategyTestRunService
 from src.core.audit_service import build_signal_audit, commit_signal_audit
 from src.core.runtime_environment import RuntimeEnvironment
 from src.core.runtime_capabilities import (
@@ -233,6 +234,11 @@ class StrategyEngine:
         self._strategy_state_manager = StrategyStateManager(
             self._db_session_factory,
             self.redis_client,
+        )
+        self._strategy_test_run = StrategyTestRunService(
+            db_session_factory=lambda: self._db_session_factory(),
+            state_manager=self._strategy_state_manager,
+            event_logger=logger,
         )
         self._runtime_artifacts = RuntimeArtifactRegistry(
             strategy_registry=self._registry,
@@ -1046,90 +1052,15 @@ class StrategyEngine:
         )
 
     def test_run_strategy(self, strategy_id: str, days: int):
-        """
-        Performs a test run/warm-up for a strategy.
-        """
-        logger.info("🧪 Test Run for %s (days=%s)", strategy_id, days)
-        artifact_cls = self._get_loaded_strategy_class(strategy_id)
-        if artifact_cls is None:
-            logger.error("Strategy %s not loaded.", strategy_id)
-            return
-
-        with self._db_session_factory() as db:
-            state = (
-                db.query(StrategyState)
-                .filter(StrategyState.strategy_id == strategy_id)
-                .first()
-            )
-            if not state:
-                logger.error("Strategy %s not in DB.", strategy_id)
-                return
-
-            expected_version = int(state.version or 0)
-            next_status = StrategyStatus.READY
-            transition_reason = "test_run_completed"
-            test_error: Exception | None = None
-            try:
-                # Instantiate with dummy product to get requirements
-                config = json.loads(state.config_json or "{}")
-                product_id = self._strategy_product_id(config)
-
-                instances = self._build_artifact_instances(
-                    artifact_cls,
-                    strategy_id=strategy_id,
-                    product_id=product_id,
-                    config=config,
-                )
-                for temp_instance in instances:
-                    reqs = temp_instance.requirements
-
-                    # Check data availability
-                    is_available, backfill_cmd = check_data_availability(
-                        db,
-                        reqs.product_id,
-                        reqs.timeframe,
-                        reqs.lookback_window,
-                    )
-
-                    if not is_available:
-                        logger.warning(
-                            "⚠️ Insufficient data for %s. Command: %s",
-                            strategy_id,
-                            backfill_cmd,
-                        )
-                        state.performance_json = json.dumps(
-                            {"backfill_command": backfill_cmd}
-                        )
-                        next_status = StrategyStatus.WARNING
-                        transition_reason = "insufficient_data"
-                        break
-                db.commit()
-            except Exception as e:
-                test_error = e
-                error_trace = traceback.format_exc()
-                state.performance_json = json.dumps({"error": error_trace})
-                db.commit()
-                next_status = StrategyStatus.ERROR
-                transition_reason = error_trace
-
-        if next_status == StrategyStatus.ERROR:
-            self._strategy_state_manager.transition_to_error(
-                strategy_id,
-                transition_reason,
-                actor="system",
-                expected_version=expected_version,
-            )
-            logger.error("❌ Test Run failed for %s: %s", strategy_id, test_error)
-            return
-        self._strategy_state_manager.transition_to_status(
+        """Evaluate historical data readiness without registering runtime state."""
+        self._strategy_test_run.run(
             strategy_id,
-            next_status,
-            actor="system",
-            reason=transition_reason,
-            expected_version=expected_version,
+            days=days,
+            artifact_cls=self._get_loaded_strategy_class(strategy_id),
+            resolve_product_id=self._strategy_product_id,
+            build_artifact_instances=self._build_artifact_instances,
+            check_data_availability=check_data_availability,
         )
-        if next_status == StrategyStatus.READY:
-            logger.info("✅ Strategy %s is READY.", strategy_id)
 
     def activate_strategy(
         self,

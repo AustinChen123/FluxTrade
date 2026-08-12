@@ -4622,6 +4622,26 @@ class TestStopStrategy:
 
 
 class TestTestRunStrategy:
+    def test_test_run_delegates_current_engine_policy_seams(
+        self,
+        engine,
+        mock_strategy_class,
+    ):
+        strategy_id = "test.py::Delegated"
+        artifact_cls = mock_strategy_class
+        engine.loaded_classes[strategy_id] = artifact_cls
+        engine._strategy_test_run.run = MagicMock()
+
+        with patch("src.core.engine.check_data_availability") as availability:
+            engine.test_run_strategy(strategy_id, 5)
+
+        call_kwargs = engine._strategy_test_run.run.call_args.kwargs
+        assert call_kwargs["days"] == 5
+        assert call_kwargs["artifact_cls"] is artifact_cls
+        assert call_kwargs["resolve_product_id"].__self__ is engine
+        assert call_kwargs["build_artifact_instances"].__self__ is StrategyEngine
+        assert call_kwargs["check_data_availability"] is availability
+
     def test_test_run_unloaded_returns_early(self, engine):
         """test_run on unloaded strategy should return."""
         engine.test_run_strategy("nonexistent", 1)
