@@ -1,6 +1,8 @@
 import threading
 from unittest.mock import MagicMock, call
 
+import pytest
+
 from src.core.strategy_command_listener import build_strategy_command_listener
 
 
@@ -114,6 +116,21 @@ def test_parse_failure_logs_existing_envelope_and_continues() -> None:
     assert leadership.call_count == 2
     submit.assert_called_once_with({"command": "SCAN"})
     assert event_logger.error.call_count == 1
+    assert event_logger.error.call_args.args[0] == "Error parsing command: %s"
+
+
+@pytest.mark.parametrize("payload", ["[]", "null", '"SCAN"', "1"])
+def test_non_mapping_json_is_rejected_before_submission(payload: str) -> None:
+    event_logger = MagicMock()
+
+    _pubsub, leadership, submit, _logger, _thread = _start_with_messages(
+        [{"type": "message", "data": payload}],
+        event_logger=event_logger,
+    )
+
+    leadership.assert_called_once_with()
+    submit.assert_not_called()
+    event_logger.error.assert_called_once()
     assert event_logger.error.call_args.args[0] == "Error parsing command: %s"
 
 

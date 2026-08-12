@@ -317,31 +317,38 @@ class BacktestTradeLog(Base):
         ),
     )
 
+
 class StrategyState(Base):
-    __tablename__ = 'strategy_state'
-    strategy_id = Column(String, primary_key=True)
-    status = Column(String, nullable=False)
-    config_json = Column(Text, nullable=True)
-    performance_json = Column(Text, nullable=True)
-    last_heartbeat = Column(BigInteger, nullable=True)
-    uptime_start = Column(BigInteger, nullable=True)
+    __tablename__ = "strategy_state"
+    strategy_id: Mapped[str] = mapped_column(String, primary_key=True)
+    status: Mapped[str] = mapped_column(String, nullable=False)
+    config_json: Mapped[str | None] = mapped_column(Text, nullable=True)
+    performance_json: Mapped[str | None] = mapped_column(Text, nullable=True)
+    last_heartbeat: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
+    uptime_start: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
 
     # Migration 6 — audit / lifecycle metadata + optimistic-lock version.
-    last_error_message = Column(Text, nullable=True)
-    entered_error_at = Column(DateTime(timezone=True), nullable=True)
-    recovered_at = Column(DateTime(timezone=True), nullable=True)
-    stopped_at = Column(DateTime(timezone=True), nullable=True)
-    version = Column(Integer, nullable=False, server_default='0')
+    last_error_message: Mapped[str | None] = mapped_column(Text, nullable=True)
+    entered_error_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    recovered_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    stopped_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    version: Mapped[int] = mapped_column(Integer, nullable=False, server_default="0")
 
     __table_args__ = (
         CheckConstraint(
             "status <> 'ERROR' OR "
             "(entered_error_at IS NOT NULL AND last_error_message IS NOT NULL)",
-            name='chk_error_state',
+            name="chk_error_state",
         ),
         CheckConstraint(
             "status <> 'STOPPED' OR stopped_at IS NOT NULL",
-            name='chk_stopped_state',
+            name="chk_stopped_state",
         ),
     )
 

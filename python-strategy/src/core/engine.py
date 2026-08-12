@@ -754,11 +754,14 @@ class StrategyEngine:
         )
         self.command_thread.start()
 
-    def _handle_command(self, data: dict):
+    def _handle_command(self, data: object):
         """
         Routes commands to specific handlers.
         """
         self._assert_runtime_leadership()
+        if not isinstance(data, dict):
+            logger.error("Malformed command payload")
+            return
         cmd = str(data.get("command") or data.get("cmd") or "").upper()
         params = data.get("params") or {}
         if not isinstance(params, dict):
@@ -770,7 +773,16 @@ class StrategyEngine:
             if cmd == "SCAN":
                 self.scan_strategies()
             elif cmd == "TEST_RUN":
-                self.test_run_strategy(params.get("id"), params.get("days", 1))
+                strategy_id = params.get("id")
+                days = params.get("days", 1)
+                if (
+                    not isinstance(strategy_id, str)
+                    or not strategy_id.strip()
+                    or type(days) is not int
+                ):
+                    logger.error("Malformed TEST_RUN command")
+                    return
+                self.test_run_strategy(strategy_id, days)
             elif cmd == "KILL_SWITCH":
                 with self._ops_command_lock:
                     actor = params.get("actor", "operator")
@@ -884,6 +896,8 @@ class StrategyEngine:
                                 clear_succeeded=clear_succeeded,
                             )
             else:
+                idempotency_key: object = None
+                actor = "operator"
                 expected_version = params.get("expected_version")
                 if cmd in {"START", "STOP", "RESUME", "FORCE_RECOVER"} and (
                     expected_version is None

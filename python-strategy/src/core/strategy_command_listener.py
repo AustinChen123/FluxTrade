@@ -14,7 +14,7 @@ def build_strategy_command_listener(
     pubsub_factory: Callable[[], Any],
     is_running: Callable[[], bool],
     assert_leadership: Callable[[], None],
-    submit_command: Callable[[object], object],
+    submit_command: Callable[[dict[str, object]], object],
     event_logger: logging.Logger = logger,
 ) -> threading.Thread:
     """Build the strategy-control subscriber daemon thread."""
@@ -36,6 +36,8 @@ def build_strategy_command_listener(
                     return
                 try:
                     data = json.loads(message["data"])
+                    if not isinstance(data, dict):
+                        raise ValueError("command payload must be a JSON object")
                     submit_command(data)
                 except Exception as error:
                     event_logger.error("Error parsing command: %s", error)

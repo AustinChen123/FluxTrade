@@ -2421,6 +2421,20 @@ def test_command_idempotency_facades_resolve_current_engine_dependencies(engine)
 
 
 class TestHandleCommand:
+    @pytest.mark.parametrize("payload", [None, [], "SCAN", 1])
+    def test_non_mapping_command_is_rejected_before_field_access(
+        self,
+        engine,
+        payload,
+        caplog,
+    ):
+        engine.scan_strategies = MagicMock()
+
+        engine._handle_command(payload)
+
+        engine.scan_strategies.assert_not_called()
+        assert "Malformed command payload" in caplog.text
+
     def test_queued_command_is_rejected_after_leadership_loss(self, engine):
         engine._leadership_guard = MagicMock(
             side_effect=RuntimeError("leadership lost")
@@ -3013,6 +3027,25 @@ class TestHandleCommand:
         engine._handle_command({"command": "TEST_RUN", "params": {"id": "strat_1"}})
 
         engine.test_run_strategy.assert_called_once_with("strat_1", 1)
+
+    @pytest.mark.parametrize(
+        "params",
+        [
+            {},
+            {"id": None},
+            {"id": ""},
+            {"id": "   "},
+            {"id": 1},
+            {"id": "strat_1", "days": True},
+            {"id": "strat_1", "days": "3"},
+        ],
+    )
+    def test_test_run_rejects_malformed_identity_or_days(self, engine, params):
+        engine.test_run_strategy = MagicMock()
+
+        engine._handle_command({"command": "TEST_RUN", "params": params})
+
+        engine.test_run_strategy.assert_not_called()
 
     def test_unknown_command_does_not_raise(self, engine):
         """Unknown commands should be logged but not raise."""
