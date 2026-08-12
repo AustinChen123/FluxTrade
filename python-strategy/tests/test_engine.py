@@ -3032,6 +3032,16 @@ class TestHandleCommand:
 
 
 class TestHeartbeatRecording:
+    def test_start_heartbeat_delegates_to_current_service(self, engine):
+        heartbeat_thread = MagicMock()
+        engine._heartbeat_service = MagicMock()
+        engine._heartbeat_service.start.return_value = heartbeat_thread
+
+        engine._start_heartbeat()
+
+        engine._heartbeat_service.start.assert_called_once_with()
+        assert engine.heartbeat_thread is heartbeat_thread
+
     def test_live_rithmic_engine_builds_venue_owned_liveness_gate(
         self,
         mock_db_session,
@@ -3377,6 +3387,7 @@ class TestHeartbeatRecording:
         engine._record_strategy_heartbeats = MagicMock()
         engine.strategy_instances = {}
         engine.running = True
+        engine._heartbeat_service._sleep = lambda _seconds: None
 
         class ImmediateThread:
             def __init__(self, *, target, daemon):
@@ -3386,15 +3397,19 @@ class TestHeartbeatRecording:
                 self._target()
 
         with (
-            patch("src.core.engine.threading.Thread", ImmediateThread),
             patch(
-                "src.core.engine.time.sleep",
-                side_effect=lambda _seconds: setattr(engine, "running", False),
+                "src.core.engine_heartbeat_service.threading.Thread",
+                ImmediateThread,
             ),
+            patch("src.core.engine.time.time", return_value=1700.0),
         ):
             engine._start_heartbeat()
 
-        engine.redis_client.setex.assert_called_once()
+        engine.redis_client.setex.assert_called_once_with(
+            engine._heartbeat_key,
+            3,
+            "1700000",
+        )
         if liveness_allows_heartbeat:
             engine._record_strategy_heartbeats.assert_called_once_with([])
         else:

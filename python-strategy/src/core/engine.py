@@ -58,6 +58,7 @@ from src.core.redis_factory import create_redis_client
 from src.core.metrics import SIGNALS_TOTAL, ACTIVE_STRATEGIES, BALANCE_USDT
 from src.core.command_router import CommandRouter
 from src.core.health_monitor import HealthMonitor
+from src.core.engine_heartbeat_service import EngineHeartbeatService
 from src.core.ops_safety import OpsSafetyService
 from src.core.runtime_reconcile import RuntimeReconciliationJob
 from src.core.runtime_artifact_registry import RuntimeArtifactRegistry
@@ -455,6 +456,29 @@ class StrategyEngine:
             self._signal_processor.entry_admission_handler = (
                 self._entry_signal_allowed_for_processor
             )
+        self._heartbeat_service = EngineHeartbeatService(
+            is_running=lambda: self.running,
+            assert_leadership=lambda: self._assert_runtime_leadership(),
+            write_process_heartbeat=lambda: self.redis_client.setex(
+                self._heartbeat_key,
+                3,
+                str(int(time.time() * 1000)),
+            ),
+            observe_entry_admission=lambda: (
+                self._entry_admission_gate is None
+                or self._entry_admission_gate.observe()
+            ),
+            record_balance_metric=lambda: BALANCE_USDT.set(
+                float(self.account_service.get_balance())
+            ),
+            load_active_strategy_ids=lambda: (
+                self._active_heartbeat_lifecycle_ids()
+            ),
+            record_strategy_heartbeats=lambda strategy_ids: (
+                self._record_strategy_heartbeats(strategy_ids)
+            ),
+            event_logger=logger,
+        )
 
     def startup(
         self,
@@ -1979,52 +2003,18 @@ class StrategyEngine:
         self._kill_switch_halted = False
 
     def _start_heartbeat(self):
-        """
-        Starts the heartbeat background thread.
-        """
+        """Start the provider-neutral heartbeat worker."""
+        self.heartbeat_thread = self._heartbeat_service.start()
 
-        def heartbeat_loop():
-            logger.info("💓 Heartbeat Service Started.")
-            while self.running:
-                try:
-                    self._assert_runtime_leadership()
-                except Exception:
-                    return
-                try:
-                    self.redis_client.setex(
-                        self._heartbeat_key,
-                        3,
-                        str(int(time.time() * 1000)),
-                    )
-                    strategy_heartbeat_allowed = (
-                        self._entry_admission_gate is None
-                        or self._entry_admission_gate.observe()
-                    )
-                    # Expose balance to Prometheus
-                    try:
-                        balance = self.account_service.get_balance()
-                        BALANCE_USDT.set(float(balance))
-                    except Exception:
-                        pass
-                    # Update DB heartbeats for active strategies (snapshot for thread safety)
-                    with self._strategy_lock:
-                        active_sids = sorted(
-                            {
-                                self._portfolio_coordinator.lifecycle_id_for_strategy(
-                                    strategy_id
-                                )
-                                for strategy_id in self.strategy_instances
-                            }
-                        )
-                    if strategy_heartbeat_allowed:
-                        self._record_strategy_heartbeats(active_sids)
-                    time.sleep(1.0)
-                except Exception as e:
-                    logger.error("💓 Heartbeat Failed: %s", e)
-                    time.sleep(1.0)
-
-        self.heartbeat_thread = threading.Thread(target=heartbeat_loop, daemon=True)
-        self.heartbeat_thread.start()
+    def _active_heartbeat_lifecycle_ids(self) -> list[str]:
+        """Return a stable lifecycle-ID snapshot for strategy heartbeats."""
+        with self._strategy_lock:
+            return sorted(
+                {
+                    self._portfolio_coordinator.lifecycle_id_for_strategy(strategy_id)
+                    for strategy_id in self.strategy_instances
+                }
+            )
 
     def _start_runtime_reconciliation(self):
         """Start periodic runtime reconciliation in a daemon thread."""
