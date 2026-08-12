@@ -3565,7 +3565,335 @@ class TestScanStrategies:
         )
 
 
+class _RecordingStrategyState:
+    def __init__(
+        self,
+        events: list[tuple[str, str | None]],
+        *,
+        config_json: str,
+        status: str = "READY",
+    ) -> None:
+        self.strategy_id = "test.py::ProductIdentity"
+        self.status = status
+        self.version = 3
+        self.config_json = config_json
+        self.uptime_start = "unchanged"
+        self._performance_json = None
+        self._events = events
+
+    @property
+    def performance_json(self) -> str | None:
+        return self._performance_json
+
+    @performance_json.setter
+    def performance_json(self, value: str) -> None:
+        self._performance_json = value
+        self._events.append(("persist_error", json.loads(value)["error"]))
+
+
 class TestStartStrategy:
+    @pytest.mark.parametrize(
+        ("config", "error_type", "message"),
+        [
+            ({}, ValueError, "strategy product_id must be set explicitly"),
+            (
+                {"product_id": None},
+                ValueError,
+                "strategy product_id must be set explicitly",
+            ),
+            (
+                {"product_id": ""},
+                ValueError,
+                "strategy product_id must be set explicitly",
+            ),
+            (
+                {"product_id": "   "},
+                ValueError,
+                "strategy product_id must be set explicitly",
+            ),
+            ({"product_id": False}, TypeError, "strategy product_id must be a string"),
+            ({"product_id": True}, TypeError, "strategy product_id must be a string"),
+            ({"product_id": 0}, TypeError, "strategy product_id must be a string"),
+            ({"product_id": 7}, TypeError, "strategy product_id must be a string"),
+            ({"product_id": 1.5}, TypeError, "strategy product_id must be a string"),
+            ({"product_id": []}, TypeError, "strategy product_id must be a string"),
+            ({"product_id": {}}, TypeError, "strategy product_id must be a string"),
+        ],
+    )
+    def test_strategy_product_id_rejects_missing_blank_and_wrong_json_types(
+        self,
+        engine,
+        config,
+        error_type,
+        message,
+    ):
+        with pytest.raises(error_type) as exc_info:
+            engine._strategy_product_id(config)
+
+        assert str(exc_info.value) == message
+
+    @pytest.mark.parametrize(
+        ("configured", "expected"),
+        [
+            ("  BINANCE:BTCUSDT-PERP  ", "BINANCE:BTCUSDT-PERP"),
+            ("  RITHMIC:MNQ-202509  ", "RITHMIC:MNQ-202509"),
+        ],
+    )
+    def test_non_live_strategy_product_id_is_explicit_and_venue_neutral(
+        self,
+        engine,
+        configured,
+        expected,
+    ):
+        assert engine._strategy_product_id({"product_id": configured}) == expected
+
+    @pytest.mark.parametrize(
+        ("config", "expected", "error_type", "message"),
+        [
+            (
+                {},
+                None,
+                ValueError,
+                "strategy product_id must be set explicitly",
+            ),
+            (
+                {"product_id": None},
+                None,
+                ValueError,
+                "strategy product_id must be set explicitly",
+            ),
+            (
+                {"product_id": ""},
+                None,
+                ValueError,
+                "strategy product_id must be set explicitly",
+            ),
+            (
+                {"product_id": "   "},
+                None,
+                ValueError,
+                "strategy product_id must be set explicitly",
+            ),
+            (
+                {"product_id": False},
+                None,
+                TypeError,
+                "strategy product_id must be a string",
+            ),
+            (
+                {"product_id": True},
+                None,
+                TypeError,
+                "strategy product_id must be a string",
+            ),
+            (
+                {"product_id": 0},
+                None,
+                TypeError,
+                "strategy product_id must be a string",
+            ),
+            (
+                {"product_id": 7},
+                None,
+                TypeError,
+                "strategy product_id must be a string",
+            ),
+            (
+                {"product_id": 1.5},
+                None,
+                TypeError,
+                "strategy product_id must be a string",
+            ),
+            (
+                {"product_id": []},
+                None,
+                TypeError,
+                "strategy product_id must be a string",
+            ),
+            (
+                {"product_id": {}},
+                None,
+                TypeError,
+                "strategy product_id must be a string",
+            ),
+            (
+                {"product_id": "  BINANCE:BTCUSDT-PERP  "},
+                "BINANCE:BTCUSDT-PERP",
+                None,
+                None,
+            ),
+            (
+                {"product_id": "RITHMIC:MNQ-202509"},
+                None,
+                ValueError,
+                "strategy product_id is not enabled for live adapter: "
+                "RITHMIC:MNQ-202509",
+            ),
+            (
+                {"product_id": "binance:BTCUSDT-PERP"},
+                None,
+                ValueError,
+                "strategy product_id is not enabled for live adapter: "
+                "binance:BTCUSDT-PERP",
+            ),
+        ],
+    )
+    def test_live_strategy_product_validation_precedes_exact_allowlist(
+        self,
+        engine_factory,
+        config,
+        expected,
+        error_type,
+        message,
+    ):
+        engine = engine_factory(
+            adapter_config={
+                "mode": "live",
+                "instrument_product_ids": ["BINANCE:BTCUSDT-PERP"],
+            }
+        )
+
+        if error_type is None:
+            assert engine._strategy_product_id(config) == expected
+            return
+
+        with pytest.raises(error_type) as exc_info:
+            engine._strategy_product_id(config)
+
+        assert str(exc_info.value) == message
+
+    @pytest.mark.parametrize(
+        "config",
+        [
+            {},
+            {"product_id": True},
+        ],
+    )
+    def test_activation_product_resolution_failure_keeps_existing_error_envelope(
+        self,
+        engine,
+        config,
+    ):
+        events = []
+
+        class ConstructionProbe:
+            def __init__(self, *_args):
+                events.append(("construct", None))
+
+        state = _RecordingStrategyState(events, config_json=json.dumps(config))
+        mock_db = MagicMock()
+        mock_db.query.return_value.filter.return_value.first.return_value = state
+        mock_db.commit.side_effect = lambda: events.append(("commit", None))
+        engine._db_session_factory = lambda: nullcontext(mock_db)
+        engine.loaded_classes[state.strategy_id] = ConstructionProbe
+        original_resolver = engine._strategy_product_id
+
+        def resolve(config):
+            events.append(("resolve", None))
+            return original_resolver(config)
+
+        engine._strategy_product_id = MagicMock(side_effect=resolve)
+        engine._unregister_runtime_artifact = MagicMock(
+            side_effect=lambda _strategy_id: events.append(("unregister", None))
+        )
+        engine._warm_up_strategy_instance = MagicMock()
+        engine._register_strategy_instance = MagicMock()
+        engine._strategy_state_manager.transition_to_running = MagicMock()
+        engine._strategy_state_manager.transition_to_error = MagicMock(
+            side_effect=lambda *_args, **_kwargs: events.append(
+                ("transition_error", None)
+            )
+        )
+
+        message = (
+            "strategy product_id must be set explicitly"
+            if not config
+            else "strategy product_id must be a string"
+        )
+
+        activated = engine.activate_strategy(state.strategy_id)
+
+        assert activated is False
+        assert events == [
+            ("resolve", None),
+            ("unregister", None),
+            ("persist_error", message),
+            ("commit", None),
+            ("transition_error", None),
+        ]
+        assert state.uptime_start == "unchanged"
+        engine._unregister_runtime_artifact.assert_called_once_with(state.strategy_id)
+        engine._warm_up_strategy_instance.assert_not_called()
+        engine._register_strategy_instance.assert_not_called()
+        engine._strategy_state_manager.transition_to_running.assert_not_called()
+        engine._strategy_state_manager.transition_to_error.assert_called_once_with(
+            state.strategy_id,
+            message,
+            actor="system",
+            expected_version=None,
+        )
+
+    def test_startup_restore_missing_product_transitions_error_once(self, engine):
+        events = []
+
+        class ConstructionProbe:
+            def __init__(self, *_args):
+                events.append(("construct", None))
+
+        state = _RecordingStrategyState(
+            events,
+            config_json="{}",
+            status=StrategyStatus.ACTIVE.value,
+        )
+        mock_query = MagicMock()
+        mock_query.filter.return_value = mock_query
+        mock_query.all.return_value = [state]
+        mock_query.first.return_value = state
+        mock_db = MagicMock()
+        mock_db.query.return_value = mock_query
+        mock_db.commit.side_effect = lambda: events.append(("commit", None))
+        engine._db_session_factory = lambda: nullcontext(mock_db)
+        engine.loaded_classes[state.strategy_id] = ConstructionProbe
+        original_resolver = engine._strategy_product_id
+
+        def resolve(config):
+            events.append(("resolve", None))
+            return original_resolver(config)
+
+        engine._strategy_product_id = MagicMock(side_effect=resolve)
+        engine._unregister_runtime_artifact = MagicMock(
+            side_effect=lambda _strategy_id: events.append(("unregister", None))
+        )
+        engine._warm_up_strategy_instance = MagicMock()
+        engine._register_strategy_instance = MagicMock()
+        engine._strategy_state_manager.transition_to_running = MagicMock()
+        engine._strategy_state_manager.transition_to_error = MagicMock(
+            side_effect=lambda *_args, **_kwargs: events.append(
+                ("transition_error", None)
+            )
+        )
+
+        engine._restore_active_strategies_on_startup()
+
+        assert events == [
+            ("resolve", None),
+            ("unregister", None),
+            ("persist_error", "strategy product_id must be set explicitly"),
+            ("commit", None),
+            ("transition_error", None),
+        ]
+        assert state.uptime_start == "unchanged"
+        engine._unregister_runtime_artifact.assert_called_once_with(state.strategy_id)
+        engine._warm_up_strategy_instance.assert_not_called()
+        engine._register_strategy_instance.assert_not_called()
+        engine._strategy_state_manager.transition_to_running.assert_not_called()
+        engine._strategy_state_manager.transition_to_error.assert_called_once_with(
+            state.strategy_id,
+            "strategy product_id must be set explicitly",
+            actor="system",
+            expected_version=None,
+        )
+
     @pytest.mark.parametrize(
         ("product_id", "allowed"),
         [
@@ -4017,6 +4345,88 @@ class TestTestRunStrategy:
         """test_run on unloaded strategy should return."""
         engine.test_run_strategy("nonexistent", 1)
         # No crash
+
+    @pytest.mark.parametrize(
+        ("config", "error_type", "message"),
+        [
+            ({}, ValueError, "strategy product_id must be set explicitly"),
+            (
+                {"product_id": True},
+                TypeError,
+                "strategy product_id must be a string",
+            ),
+        ],
+    )
+    def test_test_run_invalid_product_uses_existing_error_disposition(
+        self,
+        engine,
+        config,
+        error_type,
+        message,
+    ):
+        strategy_id = "test.py::ProductIdentity"
+        engine.loaded_classes[strategy_id] = MagicMock()
+        state = MagicMock()
+        state.config_json = json.dumps(config)
+        state.version = 3
+        mock_db = MagicMock()
+        mock_db.query.return_value.filter.return_value.first.return_value = state
+        engine._db_session_factory = lambda: nullcontext(mock_db)
+        engine._build_artifact_instances = MagicMock(return_value=())
+        engine._strategy_state_manager.transition_to_error = MagicMock()
+        engine._strategy_state_manager.transition_to_status = MagicMock()
+
+        with patch("src.core.engine.check_data_availability") as availability:
+            engine.test_run_strategy(strategy_id, 1)
+
+        engine._build_artifact_instances.assert_not_called()
+        availability.assert_not_called()
+        mock_db.commit.assert_called_once_with()
+        engine._strategy_state_manager.transition_to_status.assert_not_called()
+        engine._strategy_state_manager.transition_to_error.assert_called_once()
+        error_call = engine._strategy_state_manager.transition_to_error.call_args
+        assert error_call.args[0] == strategy_id
+        assert message in error_call.args[1]
+        assert error_call.kwargs == {
+            "actor": "system",
+            "expected_version": 3,
+        }
+        persisted_trace = json.loads(state.performance_json)["error"]
+        assert persisted_trace.splitlines()[-1] == f"{error_type.__name__}: {message}"
+
+    def test_test_run_builds_with_trimmed_explicit_product_identity(self, engine):
+        strategy_id = "test.py::ProductIdentity"
+        artifact_cls = MagicMock()
+        engine.loaded_classes[strategy_id] = artifact_cls
+        state = MagicMock()
+        state.config_json = json.dumps({"product_id": "  RITHMIC:MNQ-202509  "})
+        state.version = 3
+        mock_db = MagicMock()
+        mock_db.query.return_value.filter.return_value.first.return_value = state
+        engine._db_session_factory = lambda: nullcontext(mock_db)
+        engine._build_artifact_instances = MagicMock(return_value=())
+        engine._strategy_state_manager.transition_to_error = MagicMock()
+        engine._strategy_state_manager.transition_to_status = MagicMock()
+
+        with patch("src.core.engine.check_data_availability") as availability:
+            engine.test_run_strategy(strategy_id, 1)
+
+        engine._build_artifact_instances.assert_called_once_with(
+            artifact_cls,
+            strategy_id=strategy_id,
+            product_id="RITHMIC:MNQ-202509",
+            config={"product_id": "  RITHMIC:MNQ-202509  "},
+        )
+        availability.assert_not_called()
+        mock_db.commit.assert_called_once_with()
+        engine._strategy_state_manager.transition_to_error.assert_not_called()
+        engine._strategy_state_manager.transition_to_status.assert_called_once_with(
+            strategy_id,
+            StrategyStatus.READY,
+            actor="system",
+            reason="test_run_completed",
+            expected_version=3,
+        )
 
     def test_test_run_data_available_sets_ready(self, engine, mock_strategy_class):
         """When data is available, strategy should be set to READY."""

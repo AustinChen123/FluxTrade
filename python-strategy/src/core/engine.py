@@ -1309,11 +1309,16 @@ class StrategyEngine:
             )
 
     def _strategy_product_id(self, config: dict) -> str:
-        product_id = str(config.get("product_id") or "").strip()
-        if self._live_product_ids is None:
-            return product_id or "BINANCE:BTCUSDT-PERP"
+        raw_product_id = config.get("product_id")
+        if raw_product_id is None:
+            raise ValueError("strategy product_id must be set explicitly")
+        if not isinstance(raw_product_id, str):
+            raise TypeError("strategy product_id must be a string")
+        product_id = raw_product_id.strip()
         if not product_id:
-            raise ValueError("strategy product_id must be set explicitly in live")
+            raise ValueError("strategy product_id must be set explicitly")
+        if self._live_product_ids is None:
+            return product_id
         if product_id not in self._live_product_ids:
             raise ValueError(
                 f"strategy product_id is not enabled for live adapter: {product_id}"
