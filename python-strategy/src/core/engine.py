@@ -1,4 +1,3 @@
-import hashlib
 import json
 import math
 import os
@@ -8,7 +7,7 @@ import logging
 import traceback
 import uuid
 import weakref
-from contextlib import contextmanager, nullcontext
+from contextlib import nullcontext
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import replace
 from decimal import Decimal
@@ -16,14 +15,12 @@ from typing import (
     Callable,
     ContextManager,
     Dict,
-    Iterator,
     Optional,
     Sequence,
     Type,
     Union,
     cast,
 )
-from sqlalchemy import func, text
 from sqlalchemy.orm import Session
 from src.core.models import (
     Candlestick,
@@ -33,7 +30,7 @@ from src.core.models import (
     StrategyStatus,
 )
 from src.core.orm_models import Candlestick as ORMCandlestick
-from src.core.orm_models import MarketDataApplication, StrategyState
+from src.core.orm_models import StrategyState
 from src.strategies.base import BaseStrategy
 from src.core.risk_manager import RiskManager, AccountService
 from src.core.execution import ExecutionEngine
@@ -62,6 +59,7 @@ from src.core.engine_heartbeat_service import EngineHeartbeatService
 from src.core.engine_runtime_reconciliation_service import (
     EngineRuntimeReconciliationService,
 )
+from src.core.live_candle_application import LiveCandleApplicationService
 from src.core.ops_safety import OpsSafetyService
 from src.core.runtime_reconcile import RuntimeReconciliationJob
 from src.core.runtime_artifact_registry import RuntimeArtifactRegistry
@@ -96,10 +94,8 @@ from src.core.runtime_capabilities import (
     RuntimeCallbacks,
     RuntimeCapabilitiesFactory,
 )
-from src.core.product_master import ensure_product_registered
 from src.core.product_registry import to_stream_key
 
-LIVE_CANDLE_FENCE_TIMEOUT_SECONDS = 5.0
 _DEFAULT_RUNTIME_ENVIRONMENT = RuntimeEnvironment("live")
 SYSTEM_STATE_KEY = _DEFAULT_RUNTIME_ENVIRONMENT.key("system:state")
 SYSTEM_BOOT_STATE_KEY = _DEFAULT_RUNTIME_ENVIRONMENT.key("system:engine_boot_state")
@@ -221,6 +217,10 @@ class StrategyEngine:
         self._boot_started = False
         self._leadership_guard = leadership_guard or (lambda: None)
         self.runtime_environment = RuntimeEnvironment.from_env()
+        self._live_candle_application = LiveCandleApplicationService(
+            environment_identity=lambda: self.runtime_environment.identity,
+            db_session_factory=lambda: self._db_session_factory(),
+        )
         self._system_state_key = self.runtime_environment.key("system:state")
         self._system_boot_state_key = self.runtime_environment.key(
             "system:engine_boot_state"
@@ -1418,9 +1418,9 @@ class StrategyEngine:
             cutoffs: dict[tuple[str, str], int] = {}
             for model in models:
                 assert isinstance(model, Candlestick)
-                if self._live_candle_was_applied(model, db=db):
+                if self._live_candle_application.was_applied(model, db=db):
                     continue
-                self._assert_live_candle_is_newer(model, db=db)
+                self._live_candle_application.assert_newer(model, db=db)
                 key = (model.product_id, model.timeframe)
                 cutoffs[key] = min(
                     cutoffs.get(key, model.timestamp),
@@ -1473,7 +1473,7 @@ class StrategyEngine:
         """Synchronize local strategy memory without repeating side effects."""
         replacements: list[BaseStrategy] = []
         with self._db_session_factory() as db:
-            if not self._live_candle_was_applied(candle, db=db):
+            if not self._live_candle_application.was_applied(candle, db=db):
                 raise RuntimeError(
                     "cannot rebuild strategy through an unapplied candle"
                 )
@@ -1493,256 +1493,9 @@ class StrategyEngine:
         for replacement in replacements:
             self._register_strategy_instance(replacement)
 
-    @staticmethod
-    def _candle_values(candle: Candlestick) -> tuple[Decimal, ...]:
-        return (
-            candle.open,
-            candle.high,
-            candle.low,
-            candle.close,
-            candle.volume,
-        )
-
-    @staticmethod
-    def _persisted_candle_values(candle: ORMCandlestick) -> tuple[Decimal, ...]:
-        return (
-            Decimal(str(candle.open)),
-            Decimal(str(candle.high)),
-            Decimal(str(candle.low)),
-            Decimal(str(candle.close)),
-            Decimal(str(candle.volume)),
-        )
-
-    @staticmethod
-    def _application_values(
-        application: MarketDataApplication,
-    ) -> tuple[Decimal, ...]:
-        return (
-            Decimal(str(application.open)),
-            Decimal(str(application.high)),
-            Decimal(str(application.low)),
-            Decimal(str(application.close)),
-            Decimal(str(application.volume)),
-        )
-
-    def _application_identity(self, candle: Candlestick) -> tuple[str, str, str, int]:
-        return (
-            self.runtime_environment.identity,
-            candle.product_id,
-            candle.timeframe,
-            candle.timestamp,
-        )
-
-    def _live_candle_was_applied(
-        self,
-        candle: Candlestick,
-        *,
-        db: Session | None = None,
-    ) -> bool:
-        if self.runtime_environment.identity != "live":
-            return False
-        if db is None:
-            with self._db_session_factory() as owned_db:
-                return self._live_candle_was_applied(candle, db=owned_db)
-
-        application = db.get(
-            MarketDataApplication,
-            self._application_identity(candle),
-        )
-        if application is None:
-            return False
-        if self._application_values(application) != self._candle_values(candle):
-            raise RuntimeError(
-                "live application receipt conflicts with market payload: "
-                f"{candle.product_id}:{candle.timeframe}:{candle.timestamp}"
-            )
-        persisted = db.get(
-            ORMCandlestick,
-            (
-                candle.product_id,
-                candle.timeframe,
-                candle.timestamp,
-            ),
-        )
-        if persisted is None or self._persisted_candle_values(
-            persisted
-        ) != self._candle_values(candle):
-            raise RuntimeError(
-                "live application receipt has no matching canonical candle: "
-                f"{candle.product_id}:{candle.timeframe}:{candle.timestamp}"
-            )
-        return True
-
-    def _assert_live_candle_is_newer(
-        self,
-        candle: Candlestick,
-        *,
-        db: Session | None = None,
-    ) -> None:
-        if self.runtime_environment.identity != "live":
-            return
-        if db is None:
-            with self._db_session_factory() as owned_db:
-                self._assert_live_candle_is_newer(candle, db=owned_db)
-            return
-        latest_timestamp = (
-            db.query(func.max(MarketDataApplication.timestamp))
-            .filter(
-                MarketDataApplication.environment == self.runtime_environment.identity,
-                MarketDataApplication.product_id == candle.product_id,
-                MarketDataApplication.timeframe == candle.timeframe,
-            )
-            .scalar()
-        )
-        if latest_timestamp is not None and candle.timestamp <= int(latest_timestamp):
-            raise RuntimeError(
-                "live candle application is out of order: "
-                f"{candle.product_id}:{candle.timeframe}:"
-                f"latest={latest_timestamp}:received={candle.timestamp}"
-            )
-
-    def _persist_live_candle(self, candle: Candlestick) -> None:
-        if self.runtime_environment.identity != "live":
-            return
-        with self._db_session_factory() as db:
-            try:
-                ensure_product_registered(db, candle.product_id)
-                identity = (
-                    candle.product_id,
-                    candle.timeframe,
-                    candle.timestamp,
-                )
-                existing = db.get(ORMCandlestick, identity)
-                if existing is None:
-                    db.add(
-                        ORMCandlestick(
-                            product_id=candle.product_id,
-                            timeframe=candle.timeframe,
-                            timestamp=candle.timestamp,
-                            open=candle.open,
-                            high=candle.high,
-                            low=candle.low,
-                            close=candle.close,
-                            volume=candle.volume,
-                        )
-                    )
-                else:
-                    if self._persisted_candle_values(existing) != self._candle_values(
-                        candle
-                    ):
-                        raise RuntimeError(
-                            "live candle conflicts with canonical history: "
-                            f"{candle.product_id}:{candle.timeframe}:"
-                            f"{candle.timestamp}"
-                        )
-                application = db.get(
-                    MarketDataApplication,
-                    self._application_identity(candle),
-                )
-                if application is not None:
-                    raise RuntimeError(
-                        "live application receipt appeared concurrently: "
-                        f"{candle.product_id}:{candle.timeframe}:"
-                        f"{candle.timestamp}"
-                    )
-                db.add(
-                    MarketDataApplication(
-                        environment=self.runtime_environment.identity,
-                        product_id=candle.product_id,
-                        timeframe=candle.timeframe,
-                        timestamp=candle.timestamp,
-                        open=candle.open,
-                        high=candle.high,
-                        low=candle.low,
-                        close=candle.close,
-                        volume=candle.volume,
-                    )
-                )
-                db.commit()
-            except Exception:
-                db.rollback()
-                raise
-
-    def _assert_live_candle_compatible(self, candle: Candlestick) -> None:
-        if self.runtime_environment.identity != "live":
-            return
-        with self._db_session_factory() as db:
-            existing = db.get(
-                ORMCandlestick,
-                (
-                    candle.product_id,
-                    candle.timeframe,
-                    candle.timestamp,
-                ),
-            )
-            if existing is None:
-                return
-            if self._persisted_candle_values(existing) != self._candle_values(candle):
-                raise RuntimeError(
-                    "live candle conflicts with canonical history: "
-                    f"{candle.product_id}:{candle.timeframe}:"
-                    f"{candle.timestamp}"
-                )
-
-    @contextmanager
-    def _live_candle_application_fence(
-        self,
-        candle: Candlestick,
-    ) -> Iterator[None]:
-        if self.runtime_environment.identity != "live":
-            yield
-            return
-        lock_material = (
-            f"{self.runtime_environment.identity}\0{candle.product_id}\0"
-            f"{candle.timeframe}\0{candle.timestamp}"
-        ).encode()
-        lock_key = int.from_bytes(
-            hashlib.sha256(lock_material).digest()[:8],
-            byteorder="big",
-            signed=True,
-        )
-        with self._db_session_factory() as db:
-            dialect = db.get_bind().dialect.name
-            if dialect == "sqlite":
-                # SQLite is used only by process-local tests. Production
-                # deployment is PostgreSQL and uses the cross-process fence.
-                yield
-                return
-            if dialect != "postgresql":
-                raise RuntimeError(
-                    "live market recovery requires PostgreSQL advisory locks"
-                )
-            deadline = time.monotonic() + LIVE_CANDLE_FENCE_TIMEOUT_SECONDS
-            while not db.execute(
-                text("SELECT pg_try_advisory_lock(:lock_key)"),
-                {"lock_key": lock_key},
-            ).scalar():
-                if time.monotonic() >= deadline:
-                    raise RuntimeError(
-                        "timed out acquiring live candle application fence"
-                    )
-                time.sleep(0.05)
-            try:
-                yield
-            finally:
-                unlocked = db.execute(
-                    text("SELECT pg_advisory_unlock(:lock_key)"),
-                    {"lock_key": lock_key},
-                ).scalar()
-                if unlocked is not True:
-                    raise RuntimeError(
-                        "failed to release live candle application fence"
-                    )
-
-    def _apply_candle_at_fenced_boundary(self, candle: Candlestick) -> None:
-        if self._live_candle_was_applied(candle):
-            self._rebuild_strategies_through_applied_candle(candle)
-            return
-        self._assert_live_candle_is_newer(candle)
-        self._assert_live_candle_compatible(candle)
+    def _apply_unpersisted_candle(self, candle: Candlestick) -> None:
         self.execution_engine.process_market_data(candle)
         self._signal_processor.on_candle(candle)
-        self._persist_live_candle(candle)
 
     def replay_pending_market_data(
         self,
@@ -1754,12 +1507,14 @@ class StrategyEngine:
                 "pending trade replay has no durable strategy-state boundary"
             )
         with self._market_processing_lock:
-            with self._live_candle_application_fence(data):
-                if self._live_candle_was_applied(data):
-                    self._rebuild_strategies_through_applied_candle(data)
-                    return
-                self._rewind_for_pending_market_replay([data])
-                self._apply_candle_at_fenced_boundary(data)
+            self._live_candle_application.replay(
+                data,
+                rewind_pending=lambda candle: (
+                    self._rewind_for_pending_market_replay([candle])
+                ),
+                apply_new=self._apply_unpersisted_candle,
+                rebuild_applied=self._rebuild_strategies_through_applied_candle,
+            )
 
     def _sync_strategy_position_state(self, instance: BaseStrategy) -> None:
         """Align warmed strategy trade flags with the current account position."""
@@ -2132,8 +1887,14 @@ class StrategyEngine:
         """
         with self._market_processing_lock:
             if isinstance(data, Candlestick):
-                with self._live_candle_application_fence(data):
-                    self._apply_candle_at_fenced_boundary(data)
+                with self._live_candle_application.application_fence(data):
+                    self._live_candle_application.apply(
+                        data,
+                        apply_new=self._apply_unpersisted_candle,
+                        rebuild_applied=(
+                            self._rebuild_strategies_through_applied_candle
+                        ),
+                    )
                 return
             if isinstance(data, Trade):
                 self._signal_processor.on_trade(data)

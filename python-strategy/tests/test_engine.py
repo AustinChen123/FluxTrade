@@ -3547,7 +3547,7 @@ class TestHeartbeatRecording:
             engine._entry_signal_allowed_for_processor
         )
         engine._kill_switch_halted = kill_switch_active
-        engine._persist_live_candle = MagicMock()
+        engine._live_candle_application._persist = MagicMock()
         engine.risk_manager.check_risk = MagicMock(return_value=(True, "PASS"))
         engine.execution_engine.execute_signal = MagicMock(return_value="exit-order")
         entry_candle = _make_candle(
@@ -3562,14 +3562,14 @@ class TestHeartbeatRecording:
                 engine.on_market_data(entry_candle)
             gate.observe.assert_not_called()
             engine.execution_engine.execute_signal.assert_not_called()
-            engine._persist_live_candle.assert_not_called()
+            engine._live_candle_application._persist.assert_not_called()
             return
 
         engine.on_market_data(entry_candle)
 
         assert active._in_position is False
         assert active.restore_calls == 1
-        engine._persist_live_candle.assert_called_once_with(entry_candle)
+        engine._live_candle_application._persist.assert_called_once_with(entry_candle)
         engine.risk_manager.check_risk.assert_called_once()
         engine.execution_engine.execute_signal.assert_called_once()
         assert (

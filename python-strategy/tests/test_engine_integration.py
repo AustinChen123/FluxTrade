@@ -480,7 +480,7 @@ def test_live_candle_fence_holds_postgres_advisory_lock_around_application(
     db.execute.side_effect = execute
     engine._db_session_factory = lambda: nullcontext(db)
 
-    with engine._live_candle_application_fence(make_candle()):
+    with engine._live_candle_application.application_fence(make_candle()):
         events.append("application")
 
     assert events == ["lock", "application", "unlock"]
@@ -499,7 +499,7 @@ def test_live_candle_fence_rejects_non_postgres_production_database(
         RuntimeError,
         match="requires PostgreSQL advisory locks",
     ):
-        with engine._live_candle_application_fence(make_candle()):
+        with engine._live_candle_application.application_fence(make_candle()):
             pytest.fail("application must remain fenced")
 
 
@@ -516,14 +516,14 @@ def test_live_candle_fence_times_out_without_entering_application(
     engine._db_session_factory = lambda: nullcontext(db)
 
     with patch(
-        "src.core.engine.LIVE_CANDLE_FENCE_TIMEOUT_SECONDS",
+        "src.core.live_candle_application.LIVE_CANDLE_FENCE_TIMEOUT_SECONDS",
         0,
     ):
         with pytest.raises(
             RuntimeError,
             match="timed out acquiring live candle application fence",
         ):
-            with engine._live_candle_application_fence(make_candle()):
+            with engine._live_candle_application.application_fence(make_candle()):
                 pytest.fail("application must not run without the fence")
 
 
