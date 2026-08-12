@@ -71,6 +71,12 @@ from src.core.signal_order_intent import (
 from src.core.strategy_registry import StrategyRegistry
 from src.core.strategy_artifact_discovery import synchronize_strategy_artifacts
 from src.core.strategy_command_listener import build_strategy_command_listener
+from src.core.strategy_command_idempotency import (
+    claim_strategy_command_operation,
+    kill_switch_operation_completed,
+    mark_kill_switch_operation_completed,
+    mark_strategy_command_operation_completed,
+)
 from src.core.strategy_startup_restore import restore_active_strategies
 from src.core.strategy_state_manager import (
     InvalidStrategyStateTransition,
@@ -96,10 +102,6 @@ SYSTEM_STATE_KEY = _DEFAULT_RUNTIME_ENVIRONMENT.key("system:state")
 SYSTEM_BOOT_STATE_KEY = _DEFAULT_RUNTIME_ENVIRONMENT.key("system:engine_boot_state")
 SYSTEM_STATE_LOCKDOWN = "LOCKDOWN"
 SYSTEM_STATE_OK = "OK"
-_KILL_SWITCH_IDEMPOTENCY_TTL_SECONDS = 86_400
-_STRATEGY_COMMAND_CLAIM_TTL_SECONDS = 60
-_STRATEGY_COMMAND_IDEMPOTENCY_TTL_SECONDS = 86_400
-
 logger = logging.getLogger(__name__)
 
 
@@ -899,37 +901,19 @@ class StrategyEngine:
                 "Error executing command %s: %s\n%s", cmd, e, traceback.format_exc()
             )
 
-    def _kill_switch_operation_redis_key(
-        self,
-        *,
-        actor: str,
-        idempotency_key: str,
-    ) -> str:
-        digest = hashlib.sha256(f"{actor}\0{idempotency_key}".encode()).hexdigest()
-        return self.runtime_environment.key(f"ops:kill-switch:idempotency:{digest}")
-
     def _claim_strategy_command_operation(
         self,
         *,
         actor: str,
         idempotency_key: str,
     ) -> bool:
-        digest = hashlib.sha256(f"{actor}\0{idempotency_key}".encode()).hexdigest()
-        key = self.runtime_environment.key(f"strategy-command:idempotency:{digest}")
-        try:
-            return bool(
-                self.redis_client.set(
-                    key,
-                    "claimed",
-                    nx=True,
-                    ex=_STRATEGY_COMMAND_CLAIM_TTL_SECONDS,
-                )
-            )
-        except Exception:
-            logger.exception(
-                "Unable to claim strategy command idempotency key; command rejected"
-            )
-            return False
+        return claim_strategy_command_operation(
+            redis_client=self.redis_client,
+            key_builder=self.runtime_environment.key,
+            actor=actor,
+            idempotency_key=idempotency_key,
+            event_logger=logger,
+        )
 
     def _mark_strategy_command_operation_completed(
         self,
@@ -937,19 +921,13 @@ class StrategyEngine:
         actor: str,
         idempotency_key: str,
     ) -> None:
-        digest = hashlib.sha256(f"{actor}\0{idempotency_key}".encode()).hexdigest()
-        key = self.runtime_environment.key(f"strategy-command:idempotency:{digest}")
-        try:
-            self.redis_client.set(
-                key,
-                "completed",
-                ex=_STRATEGY_COMMAND_IDEMPOTENCY_TTL_SECONDS,
-            )
-        except Exception:
-            logger.exception(
-                "Unable to persist completed strategy command marker; "
-                "expected_version remains the retry fence"
-            )
+        mark_strategy_command_operation_completed(
+            redis_client=self.redis_client,
+            key_builder=self.runtime_environment.key,
+            actor=actor,
+            idempotency_key=idempotency_key,
+            event_logger=logger,
+        )
 
     def _kill_switch_operation_completed(
         self,
@@ -957,18 +935,13 @@ class StrategyEngine:
         actor: str,
         idempotency_key: str,
     ) -> bool:
-        key = self._kill_switch_operation_redis_key(
+        return kill_switch_operation_completed(
+            redis_client=self.redis_client,
+            key_builder=self.runtime_environment.key,
             actor=actor,
             idempotency_key=idempotency_key,
+            event_logger=logger,
         )
-        try:
-            marker = self.redis_client.get(key)
-            return marker in {"completed", b"completed"}
-        except Exception:
-            logger.exception(
-                "Unable to read kill switch idempotency marker; retrying safely"
-            )
-            return False
 
     def _mark_kill_switch_operation_completed(
         self,
@@ -976,21 +949,13 @@ class StrategyEngine:
         actor: str,
         idempotency_key: str,
     ) -> None:
-        key = self._kill_switch_operation_redis_key(
+        mark_kill_switch_operation_completed(
+            redis_client=self.redis_client,
+            key_builder=self.runtime_environment.key,
             actor=actor,
             idempotency_key=idempotency_key,
+            event_logger=logger,
         )
-        try:
-            self.redis_client.set(
-                key,
-                "completed",
-                ex=_KILL_SWITCH_IDEMPOTENCY_TTL_SECONDS,
-            )
-        except Exception:
-            logger.exception(
-                "Unable to persist kill switch idempotency marker; "
-                "future retries will execute safely"
-            )
 
     def scan_strategies(self):
         """Scan configured artifacts and synchronize their durable state."""

@@ -2298,6 +2298,68 @@ class TestProcessSignal:
 # =============================================================================
 
 
+def test_command_idempotency_facades_resolve_current_engine_dependencies(engine):
+    redis_client = MagicMock(name="current_redis_client")
+    key_builder = MagicMock(name="current_key_builder")
+    runtime_environment = MagicMock(name="current_runtime_environment")
+    runtime_environment.key = key_builder
+    event_logger = MagicMock(name="current_event_logger")
+    engine.redis_client = redis_client
+    engine.runtime_environment = runtime_environment
+
+    with (
+        patch(
+            "src.core.engine.claim_strategy_command_operation",
+            return_value=True,
+        ) as claim,
+        patch(
+            "src.core.engine.mark_strategy_command_operation_completed"
+        ) as mark_strategy,
+        patch(
+            "src.core.engine.kill_switch_operation_completed",
+            return_value=True,
+        ) as kill_switch_completed,
+        patch(
+            "src.core.engine.mark_kill_switch_operation_completed"
+        ) as mark_kill_switch,
+        patch("src.core.engine.logger", event_logger),
+    ):
+        assert (
+            engine._claim_strategy_command_operation(
+                actor="operator",
+                idempotency_key="request-1",
+            )
+            is True
+        )
+        engine._mark_strategy_command_operation_completed(
+            actor="operator",
+            idempotency_key="request-1",
+        )
+        assert (
+            engine._kill_switch_operation_completed(
+                actor="operator",
+                idempotency_key="request-1",
+            )
+            is True
+        )
+        engine._mark_kill_switch_operation_completed(
+            actor="operator",
+            idempotency_key="request-1",
+        )
+
+    expected = {
+        "redis_client": redis_client,
+        "key_builder": key_builder,
+        "actor": "operator",
+        "idempotency_key": "request-1",
+        "event_logger": event_logger,
+    }
+    claim.assert_called_once_with(**expected)
+    mark_strategy.assert_called_once_with(**expected)
+    kill_switch_completed.assert_called_once_with(**expected)
+    mark_kill_switch.assert_called_once_with(**expected)
+
+
 class TestHandleCommand:
     def test_queued_command_is_rejected_after_leadership_loss(self, engine):
         engine._leadership_guard = MagicMock(
