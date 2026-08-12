@@ -70,6 +70,7 @@ from src.core.signal_order_intent import (
 )
 from src.core.strategy_registry import StrategyRegistry
 from src.core.strategy_artifact_discovery import synchronize_strategy_artifacts
+from src.core.strategy_command_listener import build_strategy_command_listener
 from src.core.strategy_startup_restore import restore_active_strategies
 from src.core.strategy_state_manager import (
     InvalidStrategyStateTransition,
@@ -700,34 +701,17 @@ class StrategyEngine:
         )
 
     def _start_command_listener(self):
-        """
-        Starts the Redis command listener in a background thread.
-        """
-
-        def command_loop():
-            pubsub = self.redis_client.pubsub()
-            try:
-                pubsub.subscribe("cmd:strategy:control")
-                logger.info(
-                    "📡 Command Listener Started. Subscribed to 'cmd:strategy:control'"
-                )
-                while self.running:
-                    message = pubsub.get_message(timeout=1.0)
-                    if message is None or message["type"] != "message":
-                        continue
-                    try:
-                        self._assert_runtime_leadership()
-                    except Exception:
-                        return
-                    try:
-                        data = json.loads(message["data"])
-                        self.executor.submit(self._handle_command, data)
-                    except Exception as e:
-                        logger.error("Error parsing command: %s", e)
-            finally:
-                pubsub.close()
-
-        self.command_thread = threading.Thread(target=command_loop, daemon=True)
+        """Start the Redis strategy-control listener."""
+        self.command_thread = build_strategy_command_listener(
+            pubsub_factory=lambda: self.redis_client.pubsub(),
+            is_running=lambda: self.running,
+            assert_leadership=lambda: self._assert_runtime_leadership(),
+            submit_command=lambda data: self.executor.submit(
+                self._handle_command,
+                data,
+            ),
+            event_logger=logger,
+        )
         self.command_thread.start()
 
     def _handle_command(self, data: dict):

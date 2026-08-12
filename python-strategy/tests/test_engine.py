@@ -140,6 +140,42 @@ def test_engine_runtime_artifact_maps_are_owned_by_one_registry(engine) -> None:
     assert engine.portfolio_instances is engine._runtime_artifacts.portfolio_instances
 
 
+def test_engine_command_listener_delegates_current_runtime_seams(engine) -> None:
+    returned_thread = MagicMock()
+
+    def assert_published_before_start() -> None:
+        assert engine.command_thread is returned_thread
+
+    returned_thread.start.side_effect = assert_published_before_start
+    engine.running = True
+    engine.executor.submit = MagicMock()
+    engine._handle_command = MagicMock()
+
+    with patch(
+        "src.core.engine.build_strategy_command_listener",
+        return_value=returned_thread,
+    ) as build_listener:
+        engine._start_command_listener()
+
+    kwargs = build_listener.call_args.kwargs
+    assert engine.command_thread is returned_thread
+    returned_thread.start.assert_called_once_with()
+    replacement_redis = MagicMock()
+    engine.redis_client = replacement_redis
+    assert kwargs["pubsub_factory"]() is replacement_redis.pubsub.return_value
+    assert kwargs["is_running"]() is True
+    engine.running = False
+    assert kwargs["is_running"]() is False
+    replacement_leadership = MagicMock()
+    engine._assert_runtime_leadership = replacement_leadership
+    kwargs["assert_leadership"]()
+    replacement_leadership.assert_called_once_with()
+
+    command = {"command": "SCAN"}
+    kwargs["submit_command"](command)
+    engine.executor.submit.assert_called_once_with(engine._handle_command, command)
+
+
 @pytest.fixture
 def engine(engine_factory):
     """Default engine with all mocks."""
