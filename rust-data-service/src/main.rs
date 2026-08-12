@@ -8,7 +8,6 @@ mod watchdog;
 
 use crate::aggregator::CandleAggregator;
 use crate::connector::backpack::BackpackConnector;
-use crate::connector::binance::BinanceConnector;
 use crate::connector::bybit::BybitConnector;
 use crate::connector::ExchangeConnector;
 use crate::model::UserStreamEvent;
@@ -844,7 +843,7 @@ async fn run_live_mode(
         match exchange_name.as_str() {
             "binance" => {
                 join_set.spawn(async move {
-                    let result = run_binance_connector(
+                    let result = crate::connector::binance::run(
                         symbols,
                         trade_tx,
                         candle_tx,
@@ -1202,34 +1201,6 @@ fn preflight_user_stream_credentials(
     Ok((binance_user_stream, backpack_user_stream))
 }
 
-/// Run the Binance connector: subscribes to trades, candles, and user stream.
-async fn run_binance_connector(
-    symbols: Vec<String>,
-    trade_tx: mpsc::Sender<model::Trade>,
-    candle_tx: mpsc::Sender<model::Candlestick>,
-    user_tx: mpsc::Sender<UserStreamEvent>,
-    user_stream_enabled: bool,
-) -> anyhow::Result<()> {
-    let mut conn = BinanceConnector::new();
-    info!("Starting Binance Connector...");
-
-    conn.subscribe_trades(&symbols, trade_tx).await?;
-
-    conn.subscribe_candles(&symbols, "1m", candle_tx).await?;
-
-    // Credential completeness is validated before any connector task is spawned.
-    if user_stream_enabled {
-        conn.subscribe_user_stream(user_tx).await?;
-    } else {
-        info!("BINANCE_API_KEY not found, skipping User Data Stream");
-    }
-
-    // Keep the task alive — connector internal tasks handle the WebSocket loops.
-    // We use a pending future that will only resolve if cancelled.
-    std::future::pending::<()>().await;
-    Ok(())
-}
-
 /// Run the Bybit connector: subscribes to trades and candles.
 async fn run_bybit_connector(
     symbols: Vec<String>,
@@ -1527,7 +1498,8 @@ mod tests {
         let (candle_tx, _) = mpsc::channel(1);
         let (user_tx, _) = mpsc::channel(1);
         let mut events = capture_error_events(|| {
-            let future = run_binance_connector(Vec::new(), trade_tx, candle_tx, user_tx, true);
+            let future =
+                crate::connector::binance::run(Vec::new(), trade_tx, candle_tx, user_tx, true);
             let source = future.now_or_never().unwrap().unwrap_err();
             let error =
                 supervised_task_exit_error(&TaskId::Connector("binance".to_string()), Err(source));

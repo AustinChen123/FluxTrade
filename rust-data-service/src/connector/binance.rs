@@ -11,6 +11,39 @@ use tokio::sync::mpsc;
 use tokio_tungstenite::tungstenite::protocol::Message;
 use tracing::{error, info, warn};
 
+const LISTEN_KEY_ACQUIRED_MESSAGE: &str = "Obtained Binance listen key";
+
+async fn subscribe_market_data(
+    connector: &mut impl ExchangeConnector,
+    symbols: &[String],
+    trade_tx: mpsc::Sender<Trade>,
+    candle_tx: mpsc::Sender<Candlestick>,
+) -> Result<()> {
+    connector.subscribe_trades(symbols, trade_tx).await?;
+    connector.subscribe_candles(symbols, "1m", candle_tx).await
+}
+
+pub(crate) async fn run(
+    symbols: Vec<String>,
+    trade_tx: mpsc::Sender<Trade>,
+    candle_tx: mpsc::Sender<Candlestick>,
+    user_tx: mpsc::Sender<UserStreamEvent>,
+    user_stream_enabled: bool,
+) -> Result<()> {
+    let mut connector = BinanceConnector::new();
+    info!(symbols = ?symbols, "Starting Binance Connector");
+    subscribe_market_data(&mut connector, &symbols, trade_tx, candle_tx).await?;
+
+    if user_stream_enabled {
+        connector.subscribe_user_stream(user_tx).await?;
+    } else {
+        info!("BINANCE_API_KEY not found, skipping User Data Stream");
+    }
+
+    std::future::pending::<()>().await;
+    Ok(())
+}
+
 #[allow(dead_code)]
 pub struct BinanceConnector {
     ws_manager: WebSocketManager,
@@ -96,7 +129,7 @@ impl BinanceConnector {
     pub async fn subscribe_user_stream(&self, tx: mpsc::Sender<UserStreamEvent>) -> Result<()> {
         let api_key = env::var("BINANCE_API_KEY").context("BINANCE_API_KEY not set")?;
         let listen_key = self.get_listen_key(&api_key).await?;
-        info!("Obtained Binance ListenKey: {}", listen_key);
+        info!("{LISTEN_KEY_ACQUIRED_MESSAGE}");
 
         // Spawn Keep-Alive Task
         let http_client = self.http_client.clone();
@@ -503,6 +536,93 @@ impl ExchangeConnector for BinanceConnector {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[derive(Default)]
+    struct RecordingConnector {
+        calls: Vec<(&'static str, Vec<String>, String)>,
+    }
+
+    #[async_trait]
+    impl ExchangeConnector for RecordingConnector {
+        async fn connect(&mut self) -> Result<()> {
+            Ok(())
+        }
+
+        async fn subscribe_trades(
+            &mut self,
+            symbols: &[String],
+            _tx: mpsc::Sender<Trade>,
+        ) -> Result<()> {
+            self.calls.push(("trades", symbols.to_vec(), String::new()));
+            Ok(())
+        }
+
+        async fn subscribe_orderbook(
+            &mut self,
+            _symbols: &[String],
+            _tx: mpsc::Sender<OrderBook>,
+        ) -> Result<()> {
+            Ok(())
+        }
+
+        async fn subscribe_candles(
+            &mut self,
+            symbols: &[String],
+            timeframe: &str,
+            _tx: mpsc::Sender<Candlestick>,
+        ) -> Result<()> {
+            self.calls
+                .push(("candles", symbols.to_vec(), timeframe.to_string()));
+            Ok(())
+        }
+
+        async fn fetch_recent_candles(
+            &self,
+            _symbol: &str,
+            _timeframe: &str,
+            _limit: u32,
+        ) -> Result<Vec<Candlestick>> {
+            Ok(Vec::new())
+        }
+    }
+
+    #[tokio::test]
+    async fn binance_owner_subscribes_exact_symbols_in_runtime_order() {
+        let symbols = vec!["BTCUSDT".to_string(), "SOLUSDC".to_string()];
+        let (trade_tx, _) = mpsc::channel(1);
+        let (candle_tx, _) = mpsc::channel(1);
+        let mut connector = RecordingConnector::default();
+
+        subscribe_market_data(&mut connector, &symbols, trade_tx, candle_tx)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            connector.calls,
+            vec![
+                ("trades", symbols.clone(), String::new()),
+                ("candles", symbols, "1m".to_string()),
+            ]
+        );
+    }
+
+    #[test]
+    fn binance_listen_key_log_is_fixed_and_cannot_render_the_key() {
+        assert_eq!(LISTEN_KEY_ACQUIRED_MESSAGE, "Obtained Binance listen key");
+        assert!(!LISTEN_KEY_ACQUIRED_MESSAGE.contains("{}"));
+        let source = include_str!("binance.rs");
+        assert!(source.contains("info!(\"{LISTEN_KEY_ACQUIRED_MESSAGE}\")"));
+        let forbidden = ["Obtained Binance ", "ListenKey", ":"].concat();
+        assert!(!source.contains(&forbidden));
+    }
+
+    #[test]
+    fn generic_main_delegates_binance_runtime_without_constructing_the_provider() {
+        let main_source = include_str!("../main.rs");
+        assert!(main_source.contains("crate::connector::binance::run("));
+        assert!(!main_source.contains("BinanceConnector::new"));
+        assert!(!main_source.contains("run_binance_connector"));
+    }
 
     #[test]
     fn test_binance_parse_kline() {
