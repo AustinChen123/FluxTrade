@@ -11,7 +11,6 @@ import weakref
 from contextlib import contextmanager, nullcontext
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import replace
-from datetime import UTC, datetime
 from decimal import Decimal
 from typing import (
     Callable,
@@ -70,6 +69,7 @@ from src.core.signal_order_intent import (
     resolve_signal_order_intent,
 )
 from src.core.strategy_registry import StrategyRegistry
+from src.core.strategy_artifact_discovery import synchronize_strategy_artifacts
 from src.core.strategy_state_manager import (
     InvalidStrategyStateTransition,
     StaleStrategyStateVersion,
@@ -1008,57 +1008,21 @@ class StrategyEngine:
             )
 
     def scan_strategies(self):
-        """
-        Scans for strategy files and syncs with DB.
-        """
-        logger.info("🔍 Scanning configured strategy artifacts...")
-        found = self._strategy_artifact_loader()
+        """Scan configured artifacts and synchronize their durable state."""
+        synchronize_strategy_artifacts(
+            artifact_loader=self._strategy_artifact_loader,
+            publish_loaded_classes=self._replace_loaded_strategy_classes,
+            db_session_factory=self._db_session_factory,
+            transition_to_error=self._strategy_state_manager.transition_to_error,
+            event_logger=logger,
+        )
 
-        # Update class registry
-        new_classes = {k: v for k, v in found.items() if not isinstance(v, str)}
+    def _replace_loaded_strategy_classes(
+        self,
+        new_classes: dict[str, type[BaseStrategy] | type[PortfolioFactory]],
+    ) -> None:
         with self._strategy_lock:
             self.loaded_classes = new_classes
-
-        # Sync with DB
-        with self._db_session_factory() as db:
-            for strategy_id, result in found.items():
-                state = (
-                    db.query(StrategyState)
-                    .filter(StrategyState.strategy_id == strategy_id)
-                    .first()
-                )
-                is_new = state is None
-                if not state:
-                    state = StrategyState(
-                        strategy_id=strategy_id,
-                        status=(
-                            StrategyStatus.ERROR
-                            if isinstance(result, str)
-                            else StrategyStatus.DISCOVERED
-                        ),
-                        config_json="{}",
-                    )
-                    db.add(state)
-
-                if isinstance(result, str):
-                    # It was a LoadError (traceback string)
-                    if is_new:
-                        state.performance_json = json.dumps({"error": result})
-                        state.last_error_message = result
-                        state.entered_error_at = datetime.now(UTC)
-                    else:
-                        expected_version = int(state.version or 0)
-                        db.commit()
-                        self._strategy_state_manager.transition_to_error(
-                            strategy_id,
-                            result,
-                            actor="system",
-                            expected_version=expected_version,
-                        )
-                        continue
-
-                db.commit()
-        logger.info("✅ Scan Complete. Total loaded: %s", len(self.loaded_classes))
 
     def _restore_active_strategies_on_startup(self) -> None:
         """Re-instantiate strategies that were ACTIVE before process restart."""
