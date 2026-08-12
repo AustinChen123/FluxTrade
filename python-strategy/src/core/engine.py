@@ -59,6 +59,7 @@ from src.core.engine_runtime_reconciliation_service import (
 from src.core.live_candle_application import LiveCandleApplicationService
 from src.core.pending_market_replay import PendingMarketReplayService
 from src.core.ops_safety import OpsSafetyService
+from src.core.ops_command_service import OpsCommandService
 from src.core.runtime_reconcile import RuntimeReconciliationJob
 from src.core.runtime_artifact_registry import RuntimeArtifactRegistry
 from src.core.signal_processor import SignalProcessor
@@ -599,6 +600,67 @@ class StrategyEngine:
             ),
             event_logger=logger,
         )
+        self._ops_command_service = OpsCommandService(
+            operation_lock=lambda: self._ops_command_lock,
+            kill_switch_operation_completed=lambda **kwargs: (
+                self._kill_switch_operation_completed(**kwargs)
+            ),
+            halt_for_kill_switch=lambda: self._halt_for_kill_switch(),
+            persist_lockdown_database=lambda **kwargs: (
+                self.ops_safety.persist_kill_switch_state(
+                    SYSTEM_STATE_LOCKDOWN,
+                    **kwargs,
+                )
+            ),
+            persist_lockdown_redis=lambda: self.redis_client.set(
+                self._system_state_key,
+                SYSTEM_STATE_LOCKDOWN,
+            ),
+            run_kill_switch=lambda **kwargs: self._run_ops_kill_switch(**kwargs),
+            mark_kill_switch_halted=lambda: setattr(
+                self,
+                "_kill_switch_halted",
+                True,
+            ),
+            requires_authoritative_verification=(
+                lambda: self._venue_runtime.requires_authoritative_flatten_verification()
+            ),
+            kill_switch_result_is_complete=(
+                lambda *args, **kwargs: _kill_switch_result_is_complete(
+                    *args,
+                    **kwargs,
+                )
+            ),
+            mark_kill_switch_operation_completed=lambda **kwargs: (
+                self._mark_kill_switch_operation_completed(**kwargs)
+            ),
+            prepare_kill_switch_clear=(
+                lambda: self._venue_runtime.prepare_kill_switch_clear()
+            ),
+            assert_leadership=lambda: self._assert_runtime_leadership(),
+            clear_kill_switch=lambda **kwargs: self.ops_safety.clear_kill_switch(
+                **kwargs
+            ),
+            persist_clear_database=lambda **kwargs: (
+                self.ops_safety.persist_kill_switch_state(
+                    SYSTEM_STATE_OK,
+                    **kwargs,
+                )
+            ),
+            persist_clear_redis=lambda: self.redis_client.set(
+                self._system_state_key,
+                SYSTEM_STATE_OK,
+            ),
+            clear_local_halt=lambda: setattr(
+                self,
+                "_kill_switch_halted",
+                False,
+            ),
+            finalize_external_drift_clear=lambda **kwargs: (
+                self._venue_runtime.finalize_external_order_drift_clear(**kwargs)
+            ),
+            event_logger=lambda: logger,
+        )
 
     def startup(
         self,
@@ -879,117 +941,9 @@ class StrategyEngine:
                     return
                 self.test_run_strategy(strategy_id, days)
             elif cmd == "KILL_SWITCH":
-                with self._ops_command_lock:
-                    actor = params.get("actor", "operator")
-                    reason = params.get("reason")
-                    idempotency_key = params.get("idempotency_key")
-                    if isinstance(
-                        idempotency_key, str
-                    ) and self._kill_switch_operation_completed(
-                        actor=str(actor),
-                        idempotency_key=idempotency_key,
-                    ):
-                        logger.info(
-                            "Skipping completed kill switch operation for actor %s",
-                            actor,
-                        )
-                        return
-                    self._halt_for_kill_switch()
-                    db_state_persisted = False
-                    try:
-                        persist_kwargs = {
-                            "actor": actor,
-                            "reason": reason,
-                        }
-                        if isinstance(idempotency_key, str):
-                            persist_kwargs["operation_id"] = idempotency_key
-                        self.ops_safety.persist_kill_switch_state(
-                            SYSTEM_STATE_LOCKDOWN,
-                            **persist_kwargs,
-                        )
-                        db_state_persisted = True
-                    except Exception:
-                        logger.exception(
-                            "Failed to persist kill switch state to database"
-                        )
-                    redis_state_persisted = False
-                    try:
-                        self.redis_client.set(
-                            self._system_state_key,
-                            SYSTEM_STATE_LOCKDOWN,
-                        )
-                        redis_state_persisted = True
-                    except Exception:
-                        logger.exception(
-                            "Failed to persist kill switch state; local halt remains active"
-                        )
-                    kill_switch_kwargs = {
-                        "actor": actor,
-                        "reason": reason,
-                    }
-                    if isinstance(idempotency_key, str):
-                        kill_switch_kwargs["operation_id"] = idempotency_key
-                    kill_switch_result = self._run_ops_kill_switch(**kill_switch_kwargs)
-                    self._kill_switch_halted = True
-                    if (
-                        isinstance(idempotency_key, str)
-                        and db_state_persisted
-                        and redis_state_persisted
-                        and _kill_switch_result_is_complete(
-                            kill_switch_result,
-                            authoritative_required=self._venue_runtime.requires_authoritative_flatten_verification(),
-                        )
-                    ):
-                        self._mark_kill_switch_operation_completed(
-                            actor=str(actor),
-                            idempotency_key=idempotency_key,
-                        )
+                self._ops_command_service.handle_kill_switch(params)
             elif cmd == "CLEAR_KILL_SWITCH":
-                with self._ops_command_lock:
-                    actor = params.get("actor", "operator")
-                    reason = params.get("reason")
-
-                    preparation = self._venue_runtime.prepare_kill_switch_clear()
-                    if not preparation.allowed:
-                        logger.warning(
-                            "Kill switch clear rejected: %s",
-                            preparation.blocking_reason,
-                        )
-                        return
-                    drift_generation = preparation.drift_generation
-                    self._assert_runtime_leadership()
-
-                    def persist_clear() -> None:
-                        self._assert_runtime_leadership()
-                        self.ops_safety.persist_kill_switch_state(
-                            SYSTEM_STATE_OK,
-                            actor=actor,
-                            reason=reason,
-                        )
-                        self._assert_runtime_leadership()
-                        self.redis_client.set(self._system_state_key, SYSTEM_STATE_OK)
-                        self._assert_runtime_leadership()
-
-                    clear_succeeded = False
-                    try:
-                        result = self.ops_safety.clear_kill_switch(
-                            persist_clear=persist_clear,
-                        )
-                        clear_succeeded = bool(result["cleared"])
-                        if drift_generation is None and clear_succeeded:
-                            self._assert_runtime_leadership()
-                            self._kill_switch_halted = False
-                        elif not clear_succeeded:
-                            logger.warning(
-                                "Kill switch clear rejected: %s",
-                                result["reason"],
-                            )
-                    finally:
-                        if drift_generation is not None:
-                            self._venue_runtime.finalize_external_order_drift_clear(
-                                prepared_generation=drift_generation,
-                                clear_succeeded=clear_succeeded,
-                            )
+                self._ops_command_service.handle_clear_kill_switch(params)
             else:
                 idempotency_key: object = None
                 actor = "operator"

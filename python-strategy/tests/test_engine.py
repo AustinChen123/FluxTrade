@@ -38,6 +38,7 @@ from src.core.models import (
     Trade,
 )
 from src.core.orm_models import Candlestick as ORMCandlestick, StrategyState
+from src.core.ops_command_service import OpsCommandService
 from src.core.daily_nav_snapshot import DailyNavSnapshotService
 from src.core.adapters.ccxt_adapter import CcxtExchangeAdapter
 from src.core.adapters.rithmic_adapter import (
@@ -2453,10 +2454,34 @@ class TestHandleCommand:
     def test_scan_command(self, engine):
         """SCAN command should call scan_strategies."""
         engine.scan_strategies = MagicMock()
+        engine._ops_command_service = MagicMock()
 
         engine._handle_command({"command": "SCAN"})
 
         engine.scan_strategies.assert_called_once()
+        engine._ops_command_service.handle_kill_switch.assert_not_called()
+        engine._ops_command_service.handle_clear_kill_switch.assert_not_called()
+
+    @pytest.mark.parametrize(
+        ("command", "handler"),
+        [
+            ("KILL_SWITCH", "handle_kill_switch"),
+            ("CLEAR_KILL_SWITCH", "handle_clear_kill_switch"),
+        ],
+    )
+    def test_ops_command_delegates_exactly_once(self, engine, command, handler):
+        params = {"actor": "operator", "reason": "test"}
+        engine._ops_command_service = MagicMock()
+
+        engine._handle_command({"command": command, "params": params})
+
+        getattr(engine._ops_command_service, handler).assert_called_once_with(params)
+        other = (
+            "handle_clear_kill_switch"
+            if handler == "handle_kill_switch"
+            else "handle_kill_switch"
+        )
+        getattr(engine._ops_command_service, other).assert_not_called()
 
     def test_start_command(self, engine):
         """START command should activate the strategy through lifecycle orchestration."""
@@ -6897,12 +6922,14 @@ class TestExchangeOrderEventThread:
         )
 
     def test_clear_command_consumes_venue_neutral_preparation(self) -> None:
-        source = inspect.getsource(StrategyEngine._handle_command)
+        engine_source = inspect.getsource(StrategyEngine._handle_command)
+        owner_source = inspect.getsource(OpsCommandService.handle_clear_kill_switch)
 
-        assert "rithmic_reconciliation_required" not in source
-        assert "preparation.allowed" in source
-        assert "preparation.blocking_reason" in source
-        assert "preparation.drift_generation" in source
+        assert "rithmic_reconciliation_required" not in engine_source + owner_source
+        assert "handle_clear_kill_switch" in engine_source
+        assert "preparation.allowed" in owner_source
+        assert "preparation.blocking_reason" in owner_source
+        assert "preparation.drift_generation" in owner_source
 
     @pytest.mark.parametrize(
         ("prepared", "cleared"),
