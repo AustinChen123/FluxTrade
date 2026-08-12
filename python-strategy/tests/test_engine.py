@@ -39,6 +39,9 @@ from src.core.models import (
 )
 from src.core.orm_models import Candlestick as ORMCandlestick, StrategyState
 from src.core.ops_command_service import OpsCommandService
+from src.core.strategy_command_dispatch_service import (
+    StrategyCommandDispatchService,
+)
 from src.core.daily_nav_snapshot import DailyNavSnapshotService
 from src.core.adapters.ccxt_adapter import CcxtExchangeAdapter
 from src.core.adapters.rithmic_adapter import (
@@ -6942,10 +6945,13 @@ class TestExchangeOrderEventThread:
 
     def test_clear_command_consumes_venue_neutral_preparation(self) -> None:
         engine_source = inspect.getsource(StrategyEngine._handle_command)
+        dispatch_source = inspect.getsource(StrategyCommandDispatchService.dispatch)
         owner_source = inspect.getsource(OpsCommandService.handle_clear_kill_switch)
 
-        assert "rithmic_reconciliation_required" not in engine_source + owner_source
-        assert "handle_clear_kill_switch" in engine_source
+        assert "rithmic_reconciliation_required" not in (
+            engine_source + dispatch_source + owner_source
+        )
+        assert "handle_clear_kill_switch" in dispatch_source
         assert "preparation.allowed" in owner_source
         assert "preparation.blocking_reason" in owner_source
         assert "preparation.drift_generation" in owner_source

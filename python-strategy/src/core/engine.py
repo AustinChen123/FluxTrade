@@ -3,7 +3,6 @@ import os
 import time
 import threading
 import logging
-import traceback
 import uuid
 import weakref
 from contextlib import nullcontext
@@ -73,6 +72,9 @@ from src.core.strategy_command_idempotency import (
     kill_switch_operation_completed,
     mark_kill_switch_operation_completed,
     mark_strategy_command_operation_completed,
+)
+from src.core.strategy_command_dispatch_service import (
+    StrategyCommandDispatchService,
 )
 from src.core.strategy_startup_restore import restore_active_strategies
 from src.core.strategy_state_manager import (
@@ -682,6 +684,26 @@ class StrategyEngine:
             ),
             event_logger=lambda: logger,
         )
+        self._strategy_command_dispatch = StrategyCommandDispatchService(
+            assert_leadership=lambda: self._assert_runtime_leadership(),
+            scan_strategies=lambda: self.scan_strategies(),
+            test_run_strategy=lambda strategy_id, days: self.test_run_strategy(
+                strategy_id,
+                days,
+            ),
+            ops_command_service=lambda: self._ops_command_service,
+            assert_strategy_command_allowed=lambda **kwargs: (
+                self._assert_strategy_command_allowed(**kwargs)
+            ),
+            claim_strategy_command_operation=lambda **kwargs: (
+                self._claim_strategy_command_operation(**kwargs)
+            ),
+            mark_strategy_command_operation_completed=lambda **kwargs: (
+                self._mark_strategy_command_operation_completed(**kwargs)
+            ),
+            command_router=lambda: self._command_router,
+            event_logger=lambda: logger,
+        )
 
     def startup(
         self,
@@ -889,95 +911,8 @@ class StrategyEngine:
         self.command_thread.start()
 
     def _handle_command(self, data: object):
-        """
-        Routes commands to specific handlers.
-        """
-        self._assert_runtime_leadership()
-        if not isinstance(data, dict):
-            logger.error("Malformed command payload")
-            return
-        cmd = str(data.get("command") or data.get("cmd") or "").upper()
-        params = data.get("params") or {}
-        if not isinstance(params, dict):
-            params = {}
-
-        logger.info("Received Command: %s with params %s", cmd, params)
-
-        try:
-            if cmd == "SCAN":
-                self.scan_strategies()
-            elif cmd == "TEST_RUN":
-                strategy_id = params.get("id")
-                days = params.get("days", 1)
-                if (
-                    not isinstance(strategy_id, str)
-                    or not strategy_id.strip()
-                    or type(days) is not int
-                ):
-                    logger.error("Malformed TEST_RUN command")
-                    return
-                self.test_run_strategy(strategy_id, days)
-            elif cmd == "KILL_SWITCH":
-                self._ops_command_service.handle_kill_switch(params)
-            elif cmd == "CLEAR_KILL_SWITCH":
-                self._ops_command_service.handle_clear_kill_switch(params)
-            else:
-                idempotency_key: object = None
-                actor = "operator"
-                expected_version = params.get("expected_version")
-                if cmd in {"START", "STOP", "RESUME", "FORCE_RECOVER"} and (
-                    expected_version is None
-                    or (
-                        isinstance(expected_version, int)
-                        and not isinstance(expected_version, bool)
-                    )
-                ):
-                    self._assert_strategy_command_allowed(
-                        strategy_id=str(
-                            params.get("id")
-                            or params.get("strategy_id")
-                            or data.get("id")
-                            or data.get("strategy_id")
-                            or ""
-                        ),
-                        command=cmd,
-                        expected_version=expected_version,
-                    )
-                if cmd in {
-                    "START",
-                    "STOP",
-                    "RESUME",
-                    "FORCE_RECOVER",
-                }:
-                    idempotency_key = params.get("idempotency_key")
-                    actor = str(params.get("actor", "operator"))
-                    if isinstance(
-                        idempotency_key, str
-                    ) and not self._claim_strategy_command_operation(
-                        actor=actor,
-                        idempotency_key=idempotency_key,
-                    ):
-                        logger.info(
-                            "Skipping duplicate strategy command for actor %s",
-                            actor,
-                        )
-                        return
-                result = self._command_router.handle(data)
-                if cmd in {"START", "STOP", "RESUME", "FORCE_RECOVER"} and isinstance(
-                    idempotency_key, str
-                ):
-                    self._mark_strategy_command_operation_completed(
-                        actor=actor,
-                        idempotency_key=idempotency_key,
-                    )
-                if result.success:
-                    logger.info("Command %s succeeded: %s", cmd, result.message)
-                else:
-                    logger.warning("Command %s failed: %s", cmd, result.message)
-        except Exception as e:
-            logger.error(
-                "Error executing command %s: %s\n%s", cmd, e, traceback.format_exc()
-            )
+        """Route one command through the venue-neutral dispatch owner."""
+        self._strategy_command_dispatch.dispatch(data)
 
     def _claim_strategy_command_operation(
         self,
