@@ -43,7 +43,6 @@ from src.core.clock import Clock
 from src.core.interfaces import IExchangeAdapter, IOrderRepository
 from src.core.interfaces.exchange import EntryAdmissionGate, ExchangeOrderEvent
 from src.core.daily_nav_snapshot import DailyNavSnapshotService
-from src.core.strategy_loader import StrategyLoader
 from src.core.portfolio_runtime import (
     PortfolioCoordinator,
     PortfolioDefinition,
@@ -89,7 +88,6 @@ from src.core.runtime_capabilities import (
 from src.core.product_master import ensure_product_registered
 from src.core.product_registry import to_stream_key
 
-HOT_STRATEGIES_PATH = os.getenv("HOT_STRATEGIES_PATH", "/app/strategies_hot")
 LIVE_CANDLE_FENCE_TIMEOUT_SECONDS = 5.0
 _DEFAULT_RUNTIME_ENVIRONMENT = RuntimeEnvironment("live")
 SYSTEM_STATE_KEY = _DEFAULT_RUNTIME_ENVIRONMENT.key("system:state")
@@ -190,6 +188,11 @@ class StrategyEngine:
         signal_batch_observer: Callable[[tuple[Signal, ...]], None] | None = None,
         runtime_bootstrap_factory: RuntimeBootstrapFactory | None = None,
         runtime_capabilities_factory: RuntimeCapabilitiesFactory | None = None,
+        strategy_artifact_loader: Callable[
+            [],
+            dict[str, Type[BaseStrategy] | Type[PortfolioFactory] | str],
+        ]
+        | None = None,
     ):
         if db_session_factory is None:
             if db_session is None:
@@ -207,6 +210,7 @@ class StrategyEngine:
             str,
             Type[BaseStrategy] | Type[PortfolioFactory],
         ] = {}
+        self._strategy_artifact_loader = strategy_artifact_loader or (lambda: {})
         self._strategy_lock = threading.Lock()
         self._runtime_registration_lock = threading.RLock()
         self._strategy_lifecycle_locks: weakref.WeakValueDictionary[
@@ -998,8 +1002,8 @@ class StrategyEngine:
         """
         Scans for strategy files and syncs with DB.
         """
-        logger.info("🔍 Scanning for strategies in %s...", HOT_STRATEGIES_PATH)
-        found = StrategyLoader.scan_directory(HOT_STRATEGIES_PATH)
+        logger.info("🔍 Scanning configured strategy artifacts...")
+        found = self._strategy_artifact_loader()
 
         # Update class registry
         new_classes = {k: v for k, v in found.items() if not isinstance(v, str)}

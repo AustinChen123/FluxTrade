@@ -3500,17 +3500,59 @@ class TestHeartbeatRecording:
 
 
 class TestScanStrategies:
+    def test_engine_source_does_not_own_strategy_artifact_policy(self):
+        source = (
+            Path(__file__).parents[1] / "src" / "core" / "engine.py"
+        ).read_text()
+
+        assert "HOT_STRATEGIES_PATH" not in source
+        assert "StrategyLoader" not in source
+
+    def test_scan_uses_injected_artifact_loader_exactly_once(
+        self,
+        engine_factory,
+        mock_strategy_class,
+    ):
+        artifact_loader = MagicMock(
+            return_value={"catalog_strategy_v1": mock_strategy_class}
+        )
+        engine = engine_factory(strategy_artifact_loader=artifact_loader)
+        mock_db = MagicMock()
+        mock_db.query.return_value.filter.return_value.first.return_value = None
+        engine._db_session_factory = lambda: nullcontext(mock_db)
+
+        engine.scan_strategies()
+
+        artifact_loader.assert_called_once_with()
+        assert engine.loaded_classes == {"catalog_strategy_v1": mock_strategy_class}
+
+    def test_default_engine_loader_has_no_filesystem_side_effect(self, engine):
+        mock_db = MagicMock()
+        engine._db_session_factory = lambda: nullcontext(mock_db)
+
+        with patch(
+            "src.core.strategy_loader.StrategyLoader.scan_directory",
+            side_effect=AssertionError("filesystem strategy scan"),
+        ) as scan_directory:
+            engine.scan_strategies()
+
+        scan_directory.assert_not_called()
+        assert engine.loaded_classes == {}
+
     def test_scan_updates_loaded_classes(self, engine, mock_strategy_class):
         """scan_strategies should update loaded_classes from StrategyLoader results."""
         mock_db = MagicMock()
         mock_db.query.return_value.filter.return_value.first.return_value = None
         engine._db_session_factory = lambda: nullcontext(mock_db)
 
-        with patch("src.core.engine.StrategyLoader.scan_directory") as mock_scan:
-            mock_scan.return_value = {"test.py::MyStrat": mock_strategy_class}
+        artifact_loader = MagicMock(
+            return_value={"test.py::MyStrat": mock_strategy_class}
+        )
+        engine._strategy_artifact_loader = artifact_loader
 
-            engine.scan_strategies()
+        engine.scan_strategies()
 
+        artifact_loader.assert_called_once_with()
         assert "test.py::MyStrat" in engine.loaded_classes
 
     def test_scan_removes_classes_missing_from_latest_artifact(
@@ -3523,11 +3565,14 @@ class TestScanStrategies:
         mock_db.query.return_value.filter.return_value.first.return_value = None
         engine._db_session_factory = lambda: nullcontext(mock_db)
 
-        with patch("src.core.engine.StrategyLoader.scan_directory") as mock_scan:
-            mock_scan.return_value = {"new.py::NewStrat": mock_strategy_class}
+        artifact_loader = MagicMock(
+            return_value={"new.py::NewStrat": mock_strategy_class}
+        )
+        engine._strategy_artifact_loader = artifact_loader
 
-            engine.scan_strategies()
+        engine.scan_strategies()
 
+        artifact_loader.assert_called_once_with()
         assert set(engine.loaded_classes) == {"new.py::NewStrat"}
 
     def test_scan_creates_db_state_for_new_strategy(self, engine, mock_strategy_class):
@@ -3536,11 +3581,14 @@ class TestScanStrategies:
         mock_db.query.return_value.filter.return_value.first.return_value = None
         engine._db_session_factory = lambda: nullcontext(mock_db)
 
-        with patch("src.core.engine.StrategyLoader.scan_directory") as mock_scan:
-            mock_scan.return_value = {"new.py::NewStrat": mock_strategy_class}
+        artifact_loader = MagicMock(
+            return_value={"new.py::NewStrat": mock_strategy_class}
+        )
+        engine._strategy_artifact_loader = artifact_loader
 
-            engine.scan_strategies()
+        engine.scan_strategies()
 
+        artifact_loader.assert_called_once_with()
         mock_db.add.assert_called()
         mock_db.commit.assert_called()
 
@@ -3553,10 +3601,13 @@ class TestScanStrategies:
         engine._db_session_factory = lambda: nullcontext(mock_db)
         engine._strategy_state_manager.transition_to_error = MagicMock()
 
-        with patch("src.core.engine.StrategyLoader.scan_directory") as mock_scan:
-            mock_scan.return_value = {"bad.py::LoadError": "traceback string"}
-            engine.scan_strategies()
+        artifact_loader = MagicMock(
+            return_value={"bad.py::LoadError": "traceback string"}
+        )
+        engine._strategy_artifact_loader = artifact_loader
+        engine.scan_strategies()
 
+        artifact_loader.assert_called_once_with()
         engine._strategy_state_manager.transition_to_error.assert_called_once_with(
             "bad.py::LoadError",
             "traceback string",

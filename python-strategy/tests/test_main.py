@@ -59,6 +59,194 @@ def _set_live_rithmic_env(monkeypatch) -> None:
         monkeypatch.setenv(name, value)
 
 
+@pytest.mark.parametrize(
+    ("environment", "adapter_mode", "production_policy"),
+    [
+        ("live", "live", True),
+        ("live", "simulated", True),
+        ("test", "live", False),
+        ("test", "simulated", False),
+    ],
+)
+def test_strategy_artifact_policy_is_selected_only_by_environment(
+    monkeypatch,
+    environment,
+    adapter_mode,
+    production_policy,
+) -> None:
+    monkeypatch.setenv("FLUXTRADE_ENVIRONMENT", environment)
+    monkeypatch.setenv("ADAPTER_MODE", adapter_mode)
+    production_scan = MagicMock(return_value={})
+    local_scan = MagicMock(return_value={})
+    monkeypatch.setattr(
+        strategy_main.StrategyLoader,
+        "scan_production_sources",
+        production_scan,
+        raising=False,
+    )
+    monkeypatch.setattr(strategy_main.StrategyLoader, "scan_directory", local_scan)
+
+    loader = strategy_main._strategy_artifact_loader_from_env()
+    assert loader() == {}
+
+    if production_policy:
+        production_scan.assert_called_once_with(
+            "/app/strategy_artifacts",
+            break_glass_path=None,
+        )
+        local_scan.assert_not_called()
+    else:
+        local_scan.assert_called_once_with("/app/strategies_hot")
+        production_scan.assert_not_called()
+
+
+def test_live_strategy_artifact_primary_path_cannot_bypass_break_glass(
+    monkeypatch,
+) -> None:
+    monkeypatch.setenv("FLUXTRADE_ENVIRONMENT", "live")
+    monkeypatch.setenv("STRATEGY_ARTIFACTS_PATH", "/private/tmp/operator-source")
+
+    with pytest.raises(
+        ValueError,
+        match="STRATEGY_ARTIFACTS_PATH must be /app/strategy_artifacts in live",
+    ):
+        strategy_main._strategy_artifact_loader_from_env()
+
+
+@pytest.mark.parametrize("raw_flag", ["enabled", "sometimes"])
+def test_invalid_break_glass_flag_preserves_env_flag_error(
+    monkeypatch,
+    raw_flag,
+) -> None:
+    monkeypatch.setenv("FLUXTRADE_ENVIRONMENT", "live")
+    monkeypatch.setenv("STRATEGY_BREAK_GLASS_ENABLED", raw_flag)
+
+    with pytest.raises(
+        ValueError,
+        match="STRATEGY_BREAK_GLASS_ENABLED must be a boolean",
+    ):
+        strategy_main._strategy_artifact_loader_from_env()
+
+
+@pytest.mark.parametrize("raw_path", [None, "", "   "])
+def test_enabled_break_glass_requires_nonblank_path(monkeypatch, raw_path) -> None:
+    monkeypatch.setenv("FLUXTRADE_ENVIRONMENT", "live")
+    monkeypatch.setenv("STRATEGY_BREAK_GLASS_ENABLED", "true")
+    if raw_path is None:
+        monkeypatch.delenv("STRATEGY_BREAK_GLASS_PATH", raising=False)
+    else:
+        monkeypatch.setenv("STRATEGY_BREAK_GLASS_PATH", raw_path)
+
+    with pytest.raises(
+        ValueError,
+        match=("STRATEGY_BREAK_GLASS_PATH must be set when break-glass is enabled"),
+    ):
+        strategy_main._strategy_artifact_loader_from_env()
+
+
+def test_disabled_break_glass_does_not_read_path_or_warn(monkeypatch) -> None:
+    monkeypatch.setenv("FLUXTRADE_ENVIRONMENT", "live")
+    monkeypatch.setenv("STRATEGY_BREAK_GLASS_ENABLED", "false")
+    monkeypatch.setenv("STRATEGY_BREAK_GLASS_PATH", "/must-not-be-read")
+    real_getenv = strategy_main.os.getenv
+    reads: list[str] = []
+
+    def recording_getenv(name, default=None):
+        reads.append(name)
+        return real_getenv(name, default)
+
+    production_scan = MagicMock(return_value={})
+    monkeypatch.setattr(strategy_main.os, "getenv", recording_getenv)
+    monkeypatch.setattr(
+        strategy_main.StrategyLoader,
+        "scan_production_sources",
+        production_scan,
+        raising=False,
+    )
+    warning = MagicMock()
+    monkeypatch.setattr(strategy_main.logger, "warning", warning)
+
+    loader = strategy_main._strategy_artifact_loader_from_env()
+    loader()
+
+    assert "STRATEGY_BREAK_GLASS_PATH" not in reads
+    warning.assert_not_called()
+    production_scan.assert_called_once_with(
+        "/app/strategy_artifacts",
+        break_glass_path=None,
+    )
+
+
+def test_enabled_break_glass_warns_before_source_validation(monkeypatch) -> None:
+    monkeypatch.setenv("FLUXTRADE_ENVIRONMENT", "live")
+    monkeypatch.setenv("STRATEGY_BREAK_GLASS_ENABLED", "true")
+    monkeypatch.setenv("STRATEGY_BREAK_GLASS_PATH", "/read-only/operator-pack")
+    events: list[str] = []
+    warning = MagicMock(side_effect=lambda *_args: events.append("warning"))
+    production_scan = MagicMock(
+        side_effect=lambda *_args, **_kwargs: events.append("scan") or {}
+    )
+    monkeypatch.setattr(strategy_main.logger, "warning", warning)
+    monkeypatch.setattr(
+        strategy_main.StrategyLoader,
+        "scan_production_sources",
+        production_scan,
+        raising=False,
+    )
+
+    loader = strategy_main._strategy_artifact_loader_from_env()
+    loader()
+
+    assert events == ["warning", "scan"]
+    warning.assert_called_once_with("Strategy break-glass artifact source enabled")
+    production_scan.assert_called_once_with(
+        "/app/strategy_artifacts",
+        break_glass_path="/read-only/operator-pack",
+    )
+
+
+@pytest.mark.parametrize(
+    ("environment_update", "expected_message"),
+    [
+        (
+            {"STRATEGY_ARTIFACTS_PATH": "/alternate"},
+            "STRATEGY_ARTIFACTS_PATH must be /app/strategy_artifacts in live",
+        ),
+        (
+            {"STRATEGY_BREAK_GLASS_ENABLED": "ambiguous"},
+            "STRATEGY_BREAK_GLASS_ENABLED must be a boolean",
+        ),
+        (
+            {"STRATEGY_BREAK_GLASS_ENABLED": "true"},
+            "STRATEGY_BREAK_GLASS_PATH must be set when break-glass is enabled",
+        ),
+    ],
+)
+def test_main_strategy_source_config_failure_precedes_runtime_initialization(
+    monkeypatch,
+    environment_update,
+    expected_message,
+) -> None:
+    monkeypatch.setenv("FLUXTRADE_ENVIRONMENT", "live")
+    monkeypatch.delenv("STRATEGY_ARTIFACTS_PATH", raising=False)
+    monkeypatch.delenv("STRATEGY_BREAK_GLASS_ENABLED", raising=False)
+    monkeypatch.delenv("STRATEGY_BREAK_GLASS_PATH", raising=False)
+    for name, value in environment_update.items():
+        monkeypatch.setenv(name, value)
+    monkeypatch.setattr(
+        strategy_main,
+        "_adapter_config_from_env",
+        lambda: {"mode": "simulated"},
+    )
+    monkeypatch.setattr(strategy_main, "_required_env_flag", lambda _name: True)
+    initialization = _forbid_runtime_initialization(monkeypatch)
+
+    with pytest.raises(ValueError, match=expected_message):
+        strategy_main.main()
+
+    _assert_initialization_not_called(initialization)
+
+
 def test_env_flag_parses_truthy_values(monkeypatch) -> None:
     monkeypatch.setenv("AUDIT_EXTERNAL_ORDERS", "true")
     assert strategy_main._env_flag("AUDIT_EXTERNAL_ORDERS") is True
@@ -820,6 +1008,7 @@ def test_main_wires_session_factory_and_audit_flag(monkeypatch) -> None:
     engine.startup.side_effect = lambda **_kwargs: events.append("startup")
     engine.shutdown.side_effect = lambda **_kwargs: events.append("engine_shutdown")
     consumer.stop.side_effect = lambda: events.append("consumer_stop")
+    artifact_loader = MagicMock(return_value={})
 
     def build_engine(**_kwargs):
         events.append("engine_construct")
@@ -830,6 +1019,10 @@ def test_main_wires_session_factory_and_audit_flag(monkeypatch) -> None:
         patch("src.main.SessionLocal", return_value=db_session),
         patch("src.main.StrategyEngine", side_effect=build_engine) as engine_cls,
         patch("src.main.DataConsumer", return_value=consumer) as consumer_cls,
+        patch(
+            "src.main._strategy_artifact_loader_from_env",
+            return_value=artifact_loader,
+        ) as artifact_loader_builder,
     ):
         strategy_main.main()
 
@@ -841,6 +1034,8 @@ def test_main_wires_session_factory_and_audit_flag(monkeypatch) -> None:
     assert kwargs["leadership_guard"] is consumer.assert_service_ownership
     assert kwargs["runtime_bootstrap_factory"] is None
     assert kwargs["runtime_capabilities_factory"] is None
+    assert kwargs["strategy_artifact_loader"] is artifact_loader
+    artifact_loader_builder.assert_called_once_with()
     engine.add_strategy.assert_not_called()
     assert events == [
         "ownership",

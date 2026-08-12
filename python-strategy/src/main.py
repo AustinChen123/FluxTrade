@@ -15,6 +15,7 @@ from src.core.consumer import (
     DataConsumer,
 )
 from src.core.engine import StrategyEngine
+from src.core.strategy_loader import StrategyLoader
 from src.core.db import SessionLocal
 from src.core.clock import RealtimeClock
 from src.core.metrics import configure_metrics
@@ -93,6 +94,9 @@ def _setup_logging() -> None:
 _setup_logging()
 logger = logging.getLogger(__name__)
 
+_PRODUCTION_STRATEGY_ARTIFACTS_PATH = "/app/strategy_artifacts"
+_LOCAL_STRATEGIES_PATH = "/app/strategies_hot"
+
 
 def _env_flag(name: str, default: bool = False) -> bool:
     value = os.getenv(name)
@@ -137,6 +141,30 @@ def _required_env(name: str) -> str:
 def _required_env_flag(name: str) -> bool:
     _required_env(name)
     return _env_flag(name)
+
+
+def _strategy_artifact_loader_from_env():
+    if os.getenv("FLUXTRADE_ENVIRONMENT") != "live":
+        path = os.getenv("HOT_STRATEGIES_PATH", _LOCAL_STRATEGIES_PATH)
+        return lambda: StrategyLoader.scan_directory(path)
+
+    configured_path = os.getenv("STRATEGY_ARTIFACTS_PATH")
+    if configured_path not in {None, _PRODUCTION_STRATEGY_ARTIFACTS_PATH}:
+        raise ValueError(
+            "STRATEGY_ARTIFACTS_PATH must be /app/strategy_artifacts in live"
+        )
+    break_glass_path = None
+    if _env_flag("STRATEGY_BREAK_GLASS_ENABLED", False):
+        break_glass_path = (os.getenv("STRATEGY_BREAK_GLASS_PATH") or "").strip()
+        if not break_glass_path:
+            raise ValueError(
+                "STRATEGY_BREAK_GLASS_PATH must be set when break-glass is enabled"
+            )
+        logger.warning("Strategy break-glass artifact source enabled")
+    return lambda: StrategyLoader.scan_production_sources(
+        _PRODUCTION_STRATEGY_ARTIFACTS_PATH,
+        break_glass_path=break_glass_path,
+    )
 
 
 def _adapter_config_from_env() -> dict:
@@ -247,6 +275,7 @@ def main():
         adapter_config,
         audit_external_orders=audit_external_orders,
     )
+    strategy_artifact_loader = _strategy_artifact_loader_from_env()
     runtime_bootstrap_factory = None
     runtime_capabilities_factory = None
     if adapter_config.get("exchange") == "rithmic":
@@ -294,6 +323,7 @@ def main():
             leadership_guard=consumer.assert_service_ownership,
             runtime_bootstrap_factory=runtime_bootstrap_factory,
             runtime_capabilities_factory=runtime_capabilities_factory,
+            strategy_artifact_loader=strategy_artifact_loader,
         )
         engine.startup()
         consumer.configure_callbacks(

@@ -16,6 +16,9 @@ import sys
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import contextmanager
+from pathlib import Path
+from unittest.mock import patch
 
 import pytest
 
@@ -129,6 +132,178 @@ def _write_catalog(
     }
     (tmp_path / StrategyLoader.CATALOG_NAME).write_text(json.dumps(catalog))
     return catalog
+
+
+@contextmanager
+def _read_only_tree(root: Path):
+    paths = [root, *root.rglob("*")]
+    for path in reversed(paths):
+        if not path.is_symlink():
+            path.chmod(0o555 if path.is_dir() else 0o444)
+    try:
+        yield
+    finally:
+        for path in paths:
+            if path.exists() and not path.is_symlink():
+                path.chmod(0o755 if path.is_dir() else 0o644)
+
+
+def _load_error(result: dict) -> str:
+    assert set(result) == {f"{StrategyLoader.CATALOG_NAME}::LoadError"}
+    error = result[f"{StrategyLoader.CATALOG_NAME}::LoadError"]
+    assert isinstance(error, str)
+    return error
+
+
+class TestProductionSources:
+    def test_empty_read_only_primary_has_no_legacy_fallback(self, tmp_path):
+        with _read_only_tree(tmp_path):
+            assert StrategyLoader.scan_production_sources(str(tmp_path)) == {}
+
+    def test_missing_primary_fails_closed(self, tmp_path):
+        result = StrategyLoader.scan_production_sources(str(tmp_path / "missing"))
+
+        assert "does not exist" in _load_error(result)
+
+    def test_valid_catalog_loads_after_complete_preflight(self, tmp_path):
+        _write_catalog(tmp_path)
+
+        with _read_only_tree(tmp_path):
+            result = StrategyLoader.scan_production_sources(str(tmp_path))
+
+        assert set(result) == {"stable_strategy_v1"}
+        strategy = result["stable_strategy_v1"]
+        assert isinstance(strategy, type)
+        assert issubclass(strategy, BaseStrategy)
+
+    def test_loose_python_is_rejected_before_import(self, tmp_path):
+        (tmp_path / "strategy.py").write_text(STRATEGY_CODE)
+
+        with (
+            _read_only_tree(tmp_path),
+            patch.object(StrategyLoader, "_load_module") as load_module,
+        ):
+            result = StrategyLoader.scan_production_sources(str(tmp_path))
+
+        assert "catalog-only" in _load_error(result)
+        load_module.assert_not_called()
+
+    @pytest.mark.parametrize("writable_part", ["root", "catalog", "module"])
+    def test_writable_consumed_tree_is_rejected_before_import(
+        self,
+        tmp_path,
+        writable_part,
+    ):
+        _write_catalog(tmp_path)
+        targets = {
+            "root": tmp_path,
+            "catalog": tmp_path / StrategyLoader.CATALOG_NAME,
+            "module": tmp_path / "strategy.py",
+        }
+
+        with _read_only_tree(tmp_path):
+            target = targets[writable_part]
+            target.chmod(0o755 if target.is_dir() else 0o644)
+            with patch.object(StrategyLoader, "_load_module") as load_module:
+                result = StrategyLoader.scan_production_sources(str(tmp_path))
+
+        assert "writable" in _load_error(result)
+        load_module.assert_not_called()
+
+    def test_writable_nested_parent_is_rejected_before_import(self, tmp_path):
+        pack = tmp_path / "pack"
+        pack.mkdir()
+        _write_catalog(pack)
+
+        with _read_only_tree(tmp_path):
+            pack.chmod(0o755)
+            with patch.object(StrategyLoader, "_load_module") as load_module:
+                result = StrategyLoader.scan_production_sources(str(tmp_path))
+
+        assert "writable" in _load_error(result)
+        load_module.assert_not_called()
+
+    @pytest.mark.parametrize("link_name", ["strategy.py", "strategy_catalog.json"])
+    def test_symlink_is_rejected_before_import(self, tmp_path, link_name):
+        source = tmp_path.parent / f"outside-{link_name}"
+        if link_name == "strategy.py":
+            source.write_text(STRATEGY_CODE)
+            module = tmp_path / link_name
+            module.symlink_to(source)
+            catalog = {
+                "schema_version": 1,
+                "files": {link_name: hashlib.sha256(source.read_bytes()).hexdigest()},
+                "strategies": [
+                    {
+                        "id": "stable_strategy_v1",
+                        "module": link_name,
+                        "class": "ManifestStrategy",
+                        "display_name": "Stable Strategy v1",
+                        "artifact_version": "1.0.0",
+                        "readiness": "RESEARCH_VALIDATED",
+                    }
+                ],
+            }
+            (tmp_path / StrategyLoader.CATALOG_NAME).write_text(json.dumps(catalog))
+        else:
+            (tmp_path / "strategy.py").write_text(STRATEGY_CODE)
+            catalog_root = tmp_path.parent / "outside-catalog-root"
+            catalog_root.mkdir()
+            _write_catalog(catalog_root)
+            (tmp_path / link_name).symlink_to(
+                catalog_root / StrategyLoader.CATALOG_NAME
+            )
+
+        with (
+            _read_only_tree(tmp_path),
+            patch.object(StrategyLoader, "_load_module") as load_module,
+        ):
+            result = StrategyLoader.scan_production_sources(str(tmp_path))
+
+        assert "symlink" in _load_error(result)
+        load_module.assert_not_called()
+
+    def test_duplicate_break_glass_id_rejects_complete_combined_result(
+        self,
+        tmp_path,
+    ):
+        primary = tmp_path / "primary"
+        break_glass = tmp_path / "break-glass"
+        primary.mkdir()
+        break_glass.mkdir()
+        _write_catalog(primary)
+        _write_catalog(break_glass)
+
+        with _read_only_tree(tmp_path):
+            result = StrategyLoader.scan_production_sources(
+                str(primary),
+                break_glass_path=str(break_glass),
+            )
+
+        assert "duplicate strategy id" in _load_error(result)
+
+    def test_invalid_break_glass_does_not_publish_primary_partial_result(
+        self,
+        tmp_path,
+    ):
+        primary = tmp_path / "primary"
+        break_glass = tmp_path / "break-glass"
+        primary.mkdir()
+        break_glass.mkdir()
+        _write_catalog(primary)
+        (break_glass / "loose.py").write_text(STRATEGY_CODE)
+
+        with (
+            _read_only_tree(tmp_path),
+            patch.object(StrategyLoader, "_load_module") as load_module,
+        ):
+            result = StrategyLoader.scan_production_sources(
+                str(primary),
+                break_glass_path=str(break_glass),
+            )
+
+        assert "catalog-only" in _load_error(result)
+        load_module.assert_not_called()
 
 
 class TestScanEmptyAndMissing:
