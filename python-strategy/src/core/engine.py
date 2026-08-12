@@ -1,4 +1,3 @@
-import json
 import math
 import os
 import time
@@ -9,7 +8,6 @@ import uuid
 import weakref
 from contextlib import nullcontext
 from concurrent.futures import ThreadPoolExecutor
-from dataclasses import replace
 from decimal import Decimal
 from typing import (
     Callable,
@@ -40,7 +38,6 @@ from src.core.portfolio_runtime import (
     PortfolioCoordinator,
     PortfolioDefinition,
     PortfolioFactory,
-    PortfolioSleeve,
     build_portfolio_artifact,
 )
 from src.core.data_provider import check_data_availability
@@ -86,6 +83,7 @@ from src.core.strategy_state_manager import (
     available_strategy_commands,
 )
 from src.core.strategy_hydration_service import StrategyHydrationService
+from src.core.strategy_activation_service import StrategyActivationService
 from src.core.strategy_deactivation_service import StrategyDeactivationService
 from src.core.strategy_test_run_service import StrategyTestRunService
 from src.core.audit_service import build_signal_audit, commit_signal_audit
@@ -382,6 +380,27 @@ class StrategyEngine:
         self._strategy_hydration = StrategyHydrationService(
             signal_processor=self._signal_processor,
             account_service=self.account_service,
+        )
+        self._strategy_activation = StrategyActivationService(
+            db_session_factory=lambda: self._db_session_factory(),
+            transition_to_running=lambda *args, **kwargs: (
+                self._strategy_state_manager.transition_to_running(*args, **kwargs)
+            ),
+            transition_to_error=lambda *args, **kwargs: (
+                self._strategy_state_manager.transition_to_error(*args, **kwargs)
+            ),
+            hydration=self._strategy_hydration,
+            register_strategy=lambda instance: self._register_strategy_instance(
+                instance
+            ),
+            register_portfolio=lambda definition: (
+                self._register_portfolio_definition(definition)
+            ),
+            unregister_runtime_artifact=lambda strategy_id: (
+                self._unregister_runtime_artifact(strategy_id)
+            ),
+            environment_identity=lambda: self.runtime_environment.identity,
+            event_logger=logger,
         )
         self._pending_market_replay = PendingMarketReplayService(
             db_session_factory=lambda: self._db_session_factory(),
@@ -1082,123 +1101,17 @@ class StrategyEngine:
     ) -> bool:
         """Instantiate/register a strategy and transition it to ACTIVE."""
         with self._strategy_lifecycle_lock(strategy_id):
-            return self._activate_strategy_locked(
+            return self._strategy_activation.activate_locked(
                 strategy_id,
+                artifact_cls=self._get_loaded_strategy_class(strategy_id),
                 actor=actor,
                 reason=reason,
                 force=force,
                 expected_version=expected_version,
+                resolve_product_id=self._strategy_product_id,
+                assert_live_readiness=self._assert_strategy_live_readiness,
+                build_portfolio_definition=self._build_portfolio_definition,
             )
-
-    def _activate_strategy_locked(
-        self,
-        strategy_id: str,
-        *,
-        actor: str,
-        reason: Optional[str],
-        force: bool,
-        expected_version: int | None,
-    ) -> bool:
-        logger.info("🚀 Starting Strategy: %s", strategy_id)
-        artifact_cls = self._get_loaded_strategy_class(strategy_id)
-        if artifact_cls is None:
-            logger.error("Strategy %s not loaded.", strategy_id)
-            return False
-
-        self._assert_expected_strategy_version(strategy_id, expected_version)
-        with self._db_session_factory() as db:
-            state = (
-                db.query(StrategyState)
-                .filter(StrategyState.strategy_id == strategy_id)
-                .first()
-            )
-            # Allow READY or WARNING (with manual override implied by START command)
-            startable = {
-                StrategyStatus.READY,
-                StrategyStatus.WARNING,
-                StrategyStatus.STOPPED,
-                StrategyStatus.DISCOVERED,
-            }
-            if not state or (state.status not in startable and not force):
-                logger.error(
-                    "Strategy %s is not in startable state (Current: %s)",
-                    strategy_id,
-                    state.status if state else "None",
-                )
-                return False
-
-            try:
-                config = json.loads(state.config_json or "{}")
-                product_id = self._strategy_product_id(config)
-
-                self._assert_strategy_live_readiness(artifact_cls)
-                if issubclass(artifact_cls, PortfolioFactory):
-                    definition = self._build_portfolio_definition(
-                        artifact_cls,
-                        portfolio_id=strategy_id,
-                        product_id=product_id,
-                        config=config,
-                    )
-                    warmed_sleeves: list[PortfolioSleeve] = []
-                    for sleeve in definition.sleeves:
-                        instance = sleeve.strategy
-                        self._strategy_hydration.warm_up(db, instance)
-                        if self.runtime_environment.identity == "live":
-                            self._strategy_hydration.fresh_instance_for_replay(instance)
-                        warmed_sleeves.append(replace(sleeve, strategy=instance))
-                    definition = replace(
-                        definition,
-                        sleeves=tuple(warmed_sleeves),
-                    )
-                    # Registration must follow complete portfolio warm-up. A
-                    # partially registered portfolio could execute only a
-                    # subset of one candle's decisions.
-                    self._register_portfolio_definition(definition)
-                else:
-                    instance = artifact_cls(strategy_id, product_id)
-                    self._strategy_hydration.warm_up(db, instance)
-                    if self.runtime_environment.identity == "live":
-                        self._strategy_hydration.fresh_instance_for_replay(instance)
-                    # Registration must follow warm-up — on restart-restore the lifecycle
-                    # cache is already ACTIVE, so a registered instance is immediately
-                    # live to on_market_data and could emit signals from partial state.
-                    self._register_strategy_instance(instance)
-                state.uptime_start = int(time.time() * 1000)
-                db.commit()
-                logger.info(
-                    "🔥 Strategy %s is now ACTIVE for %s", strategy_id, product_id
-                )
-
-            except Exception as e:
-                self._unregister_runtime_artifact(strategy_id)
-                state.performance_json = json.dumps({"error": str(e)})
-                db.commit()
-                self._strategy_state_manager.transition_to_error(
-                    strategy_id,
-                    str(e),
-                    actor="system",
-                    expected_version=expected_version,
-                )
-                logger.error("❌ Failed to start %s: %s", strategy_id, e)
-                return False
-
-        try:
-            transition_kwargs = {
-                "actor": actor,
-                "force": force,
-                "reason": reason,
-            }
-            if expected_version is not None:
-                transition_kwargs["expected_version"] = expected_version
-            self._strategy_state_manager.transition_to_running(
-                strategy_id,
-                **transition_kwargs,
-            )
-        except Exception as e:
-            self._unregister_runtime_artifact(strategy_id)
-            logger.error("❌ Failed to transition %s to ACTIVE: %s", strategy_id, e)
-            return False
-        return True
 
     def _strategy_lifecycle_lock(self, strategy_id: str) -> threading.Lock:
         with self._strategy_lifecycle_locks_lock:
@@ -1230,28 +1143,6 @@ class StrategyEngine:
     ) -> type[BaseStrategy] | type[PortfolioFactory] | None:
         with self._strategy_lock:
             return self.loaded_classes.get(strategy_id)
-
-    def _assert_expected_strategy_version(
-        self,
-        strategy_id: str,
-        expected_version: int | None,
-    ) -> None:
-        if expected_version is None:
-            return
-        with self._db_session_factory() as db:
-            state = (
-                db.query(StrategyState)
-                .filter(StrategyState.strategy_id == strategy_id)
-                .first()
-            )
-            if state is None:
-                raise KeyError(f"strategy state not found: {strategy_id}")
-            current_version = int(state.version or 0)
-        if current_version != expected_version:
-            raise StaleStrategyStateVersion(
-                f"{strategy_id} expected version {expected_version}, "
-                f"found {current_version}"
-            )
 
     def _assert_strategy_command_allowed(
         self,
