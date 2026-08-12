@@ -349,6 +349,26 @@ def test_pending_trade_replay_fails_without_durable_state_boundary(engine_factor
         engine.replay_pending_market_data(trade)
 
 
+def test_pending_candle_replay_holds_engine_market_lock(engine_factory):
+    engine = engine_factory()
+    candle = make_candle()
+    market_lock = MagicMock()
+    engine._market_processing_lock = market_lock
+    engine._pending_market_replay = MagicMock()
+
+    def replay(data, *, apply_new):
+        assert market_lock.__enter__.call_count == 1
+        assert data is candle
+        assert apply_new == engine._apply_unpersisted_candle
+
+    engine._pending_market_replay.replay.side_effect = replay
+
+    engine.replay_pending_market_data(candle)
+
+    market_lock.__exit__.assert_called_once_with(None, None, None)
+    engine._pending_market_replay.replay.assert_called_once()
+
+
 def test_pending_replay_uses_strategy_recovery_factory(
     engine_factory,
     tmp_path,

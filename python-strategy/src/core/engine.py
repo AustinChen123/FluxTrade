@@ -16,7 +16,6 @@ from typing import (
     ContextManager,
     Dict,
     Optional,
-    Sequence,
     Type,
     Union,
     cast,
@@ -60,6 +59,7 @@ from src.core.engine_runtime_reconciliation_service import (
     EngineRuntimeReconciliationService,
 )
 from src.core.live_candle_application import LiveCandleApplicationService
+from src.core.pending_market_replay import PendingMarketReplayService
 from src.core.ops_safety import OpsSafetyService
 from src.core.runtime_reconcile import RuntimeReconciliationJob
 from src.core.runtime_artifact_registry import RuntimeArtifactRegistry
@@ -367,6 +367,15 @@ class StrategyEngine:
         self._strategy_hydration = StrategyHydrationService(
             signal_processor=self._signal_processor,
             account_service=self.account_service,
+        )
+        self._pending_market_replay = PendingMarketReplayService(
+            db_session_factory=lambda: self._db_session_factory(),
+            live_candle_application=self._live_candle_application,
+            strategy_hydration=self._strategy_hydration,
+            list_active_strategies=self._registry.list_active,
+            publish_replacement=lambda replacement: self._register_strategy_instance(
+                replacement
+            ),
         )
         self.ops_safety = OpsSafetyService(
             self.execution_engine,
@@ -1379,81 +1388,6 @@ class StrategyEngine:
             )
         return (artifact_cls(strategy_id, product_id),)
 
-    def _rewind_for_pending_market_replay(
-        self,
-        models: Sequence[Union[Candlestick, Trade]],
-    ) -> None:
-        """Rebuild affected strategies to immediately before pending candles."""
-        if not models:
-            return
-        if any(not isinstance(model, Candlestick) for model in models):
-            raise RuntimeError(
-                "pending trade replay has no durable strategy-state boundary"
-            )
-
-        replacements: list[BaseStrategy] = []
-        with self._db_session_factory() as db:
-            cutoffs: dict[tuple[str, str], int] = {}
-            for model in models:
-                assert isinstance(model, Candlestick)
-                if self._live_candle_application.was_applied(model, db=db):
-                    continue
-                self._live_candle_application.assert_newer(model, db=db)
-                key = (model.product_id, model.timeframe)
-                cutoffs[key] = min(
-                    cutoffs.get(key, model.timestamp),
-                    model.timestamp,
-                )
-            for current in self._registry.list_active():
-                cutoff = cutoffs.get(
-                    (
-                        current.product_id,
-                        current.requirements.timeframe,
-                    )
-                )
-                if cutoff is None:
-                    continue
-                replacement = self._strategy_hydration.fresh_instance_for_replay(
-                    current
-                )
-                self._strategy_hydration.warm_up(
-                    db,
-                    replacement,
-                    before_timestamp=cutoff,
-                )
-                replacements.append(replacement)
-        for replacement in replacements:
-            self._register_strategy_instance(replacement)
-
-    def _rebuild_strategies_through_applied_candle(
-        self,
-        candle: Candlestick,
-    ) -> None:
-        """Synchronize local strategy memory without repeating side effects."""
-        replacements: list[BaseStrategy] = []
-        with self._db_session_factory() as db:
-            if not self._live_candle_application.was_applied(candle, db=db):
-                raise RuntimeError(
-                    "cannot rebuild strategy through an unapplied candle"
-                )
-            for current in self._registry.list_active():
-                if (
-                    current.product_id != candle.product_id
-                    or current.requirements.timeframe != candle.timeframe
-                ):
-                    continue
-                replacement = self._strategy_hydration.fresh_instance_for_replay(
-                    current
-                )
-                self._strategy_hydration.warm_up(
-                    db,
-                    replacement,
-                    before_timestamp=candle.timestamp + 1,
-                )
-                replacements.append(replacement)
-        for replacement in replacements:
-            self._register_strategy_instance(replacement)
-
     def _apply_unpersisted_candle(self, candle: Candlestick) -> None:
         self.execution_engine.process_market_data(candle)
         self._signal_processor.on_candle(candle)
@@ -1468,13 +1402,9 @@ class StrategyEngine:
                 "pending trade replay has no durable strategy-state boundary"
             )
         with self._market_processing_lock:
-            self._live_candle_application.replay(
+            self._pending_market_replay.replay(
                 data,
-                rewind_pending=lambda candle: (
-                    self._rewind_for_pending_market_replay([candle])
-                ),
                 apply_new=self._apply_unpersisted_candle,
-                rebuild_applied=self._rebuild_strategies_through_applied_candle,
             )
 
     def start_strategy(self, strategy_id: str):
@@ -1750,9 +1680,7 @@ class StrategyEngine:
                     self._live_candle_application.apply(
                         data,
                         apply_new=self._apply_unpersisted_candle,
-                        rebuild_applied=(
-                            self._rebuild_strategies_through_applied_candle
-                        ),
+                        rebuild_applied=self._pending_market_replay.rebuild_applied,
                     )
                 return
             if isinstance(data, Trade):
