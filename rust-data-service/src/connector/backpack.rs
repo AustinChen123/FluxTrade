@@ -14,6 +14,80 @@ use tokio::sync::mpsc;
 use tokio_tungstenite::tungstenite::protocol::Message;
 use tracing::{error, info, warn};
 
+const DEFAULT_MARKET_DATA_SYMBOLS: &str = "BTC_USDC_PERP,SOL_USDC_PERP";
+
+fn product_id_from_market_symbol(symbol: &str) -> Result<String> {
+    let contract = symbol
+        .strip_suffix("_PERP")
+        .context("unsupported Backpack market type")?;
+    let parts = contract.split('_').collect::<Vec<_>>();
+    anyhow::ensure!(
+        parts.len() == 2
+            && parts
+                .iter()
+                .all(|part| !part.is_empty() && part.chars().all(|ch| ch.is_ascii_alphanumeric())),
+        "invalid Backpack perpetual market symbol: {symbol}"
+    );
+    Ok(format!("BACKPACK:{contract}-PERP"))
+}
+
+pub(crate) fn resolve_market_data_symbols(configured: Option<&str>) -> Result<Vec<String>> {
+    let raw = configured.unwrap_or(DEFAULT_MARKET_DATA_SYMBOLS);
+    let symbols = raw
+        .split(',')
+        .map(str::trim)
+        .filter(|symbol| !symbol.is_empty())
+        .map(str::to_uppercase)
+        .collect::<Vec<_>>();
+    anyhow::ensure!(
+        !symbols.is_empty(),
+        "BACKPACK_MARKET_DATA_SYMBOLS must contain at least one symbol"
+    );
+    anyhow::ensure!(
+        symbols.len()
+            == symbols
+                .iter()
+                .collect::<std::collections::HashSet<_>>()
+                .len(),
+        "BACKPACK_MARKET_DATA_SYMBOLS must not contain duplicates"
+    );
+    for symbol in &symbols {
+        product_id_from_market_symbol(symbol)?;
+    }
+    Ok(symbols)
+}
+
+async fn subscribe_market_data(
+    connector: &mut impl ExchangeConnector,
+    symbols: &[String],
+    trade_tx: mpsc::Sender<Trade>,
+    candle_tx: mpsc::Sender<Candlestick>,
+) -> Result<()> {
+    connector.subscribe_trades(symbols, trade_tx).await?;
+    connector.subscribe_candles(symbols, "1m", candle_tx).await
+}
+
+pub(crate) async fn run(
+    symbols: Vec<String>,
+    trade_tx: mpsc::Sender<Trade>,
+    candle_tx: mpsc::Sender<Candlestick>,
+    user_tx: mpsc::Sender<UserStreamEvent>,
+    user_stream_enabled: bool,
+) -> Result<()> {
+    let mut connector = BackpackConnector::new();
+    info!(symbols = ?symbols, "Starting Backpack Connector");
+    subscribe_market_data(&mut connector, &symbols, trade_tx, candle_tx).await?;
+
+    if user_stream_enabled {
+        connector.subscribe_user_stream(user_tx).await?;
+    } else {
+        info!("Backpack API Key/Secret not found, skipping User Data Stream");
+    }
+
+    std::future::pending::<()>().await;
+    Ok(())
+}
+
 pub struct BackpackConnector {
     exchange_id: String,
 }
@@ -261,7 +335,6 @@ impl ExchangeConnector for BackpackConnector {
     ) -> Result<()> {
         let url = "wss://ws.backpack.exchange/";
         let ws_manager = WebSocketManager::new(url);
-        let connector_id = self.exchange_id.clone();
 
         let args: Vec<String> = symbols.iter().map(|s| format!("trade.{}", s)).collect();
 
@@ -285,7 +358,6 @@ impl ExchangeConnector for BackpackConnector {
                     },
                     |msg| {
                         let tx = tx.clone();
-                        let connector_id = connector_id.clone();
                         async move {
                             if let Message::Text(text) = msg {
                                 let v: Value = serde_json::from_str(&text)?;
@@ -298,14 +370,12 @@ impl ExchangeConnector for BackpackConnector {
                                                 .as_i64()
                                                 .context("t")?
                                                 .to_string(),
-                                            product_id: format!(
-                                                "{}:{}-PERP",
-                                                connector_id,
+                                            product_id: product_id_from_market_symbol(
                                                 data.get("s")
                                                     .context("s")?
                                                     .as_str()
-                                                    .context("s")?
-                                            ),
+                                                    .context("s")?,
+                                            )?,
                                             price: data
                                                 .get("p")
                                                 .context("p")?
@@ -373,7 +443,6 @@ impl ExchangeConnector for BackpackConnector {
     ) -> Result<()> {
         let url = "wss://ws.backpack.exchange/";
         let ws_manager = WebSocketManager::new(url);
-        let connector_id = self.exchange_id.clone();
 
         let args: Vec<String> = symbols
             .iter()
@@ -402,7 +471,6 @@ impl ExchangeConnector for BackpackConnector {
                     },
                     |msg| {
                         let tx = tx.clone();
-                        let connector_id = connector_id.clone();
                         let timeframe_str = timeframe_str.clone();
                         async move {
                             if let Message::Text(text) = msg {
@@ -418,14 +486,12 @@ impl ExchangeConnector for BackpackConnector {
                                             BackpackConnector::parse_iso8601_to_ms(ts_str)?;
 
                                         let candle = Candlestick {
-                                            product_id: format!(
-                                                "{}:{}-PERP",
-                                                connector_id,
+                                            product_id: product_id_from_market_symbol(
                                                 data.get("s")
                                                     .context("s")?
                                                     .as_str()
-                                                    .context("s")?
-                                            ),
+                                                    .context("s")?,
+                                            )?,
                                             timeframe: timeframe_str, // Use the cloned String
                                             timestamp,
                                             open: data
@@ -527,7 +593,111 @@ impl ExchangeConnector for BackpackConnector {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use async_trait::async_trait;
     use serde_json::json;
+
+    #[test]
+    fn backpack_market_data_symbols_are_provider_owned_and_fail_closed() {
+        assert_eq!(
+            resolve_market_data_symbols(None).unwrap(),
+            ["BTC_USDC_PERP", "SOL_USDC_PERP"]
+        );
+        assert_eq!(
+            resolve_market_data_symbols(Some(" sui_usdc_perp,eth_usdc_perp ")).unwrap(),
+            ["SUI_USDC_PERP", "ETH_USDC_PERP"]
+        );
+
+        for raw in [
+            "",
+            "   ",
+            "BTCUSDT",
+            "BTC_USDC",
+            "BTC_USDC_RFQ",
+            "BTC_USDC_IPERP",
+            "BTC_USDC_PERP,BTC_USDC_PERP",
+            "BTC-_USDC_PERP",
+        ] {
+            assert!(resolve_market_data_symbols(Some(raw)).is_err(), "{raw}");
+        }
+    }
+
+    #[test]
+    fn backpack_perpetual_market_symbol_projects_to_canonical_product_identity() {
+        assert_eq!(
+            product_id_from_market_symbol("SOL_USDC_PERP").unwrap(),
+            "BACKPACK:SOL_USDC-PERP"
+        );
+        for unsupported in ["SOL_USDC", "SOL_USDC_RFQ", "SOL_USDC_IPERP"] {
+            assert!(product_id_from_market_symbol(unsupported).is_err());
+        }
+    }
+
+    #[derive(Default)]
+    struct RecordingConnector {
+        trade_symbols: Vec<String>,
+        candle_symbols: Vec<String>,
+        candle_timeframe: String,
+    }
+
+    #[async_trait]
+    impl ExchangeConnector for RecordingConnector {
+        async fn connect(&mut self) -> Result<()> {
+            Ok(())
+        }
+
+        async fn subscribe_trades(
+            &mut self,
+            symbols: &[String],
+            _tx: mpsc::Sender<Trade>,
+        ) -> Result<()> {
+            self.trade_symbols = symbols.to_vec();
+            Ok(())
+        }
+
+        async fn subscribe_orderbook(
+            &mut self,
+            _symbols: &[String],
+            _tx: mpsc::Sender<OrderBook>,
+        ) -> Result<()> {
+            Ok(())
+        }
+
+        async fn subscribe_candles(
+            &mut self,
+            symbols: &[String],
+            timeframe: &str,
+            _tx: mpsc::Sender<Candlestick>,
+        ) -> Result<()> {
+            self.candle_symbols = symbols.to_vec();
+            self.candle_timeframe = timeframe.to_string();
+            Ok(())
+        }
+
+        async fn fetch_recent_candles(
+            &self,
+            _symbol: &str,
+            _timeframe: &str,
+            _limit: u32,
+        ) -> Result<Vec<Candlestick>> {
+            Ok(Vec::new())
+        }
+    }
+
+    #[tokio::test]
+    async fn backpack_market_data_subscriptions_receive_the_exact_configured_symbols() {
+        let symbols = vec!["SUI_USDC_PERP".to_string(), "ETH_USDC_PERP".to_string()];
+        let (trade_tx, _) = mpsc::channel(1);
+        let (candle_tx, _) = mpsc::channel(1);
+        let mut connector = RecordingConnector::default();
+
+        subscribe_market_data(&mut connector, &symbols, trade_tx, candle_tx)
+            .await
+            .unwrap();
+
+        assert_eq!(connector.trade_symbols, symbols);
+        assert_eq!(connector.candle_symbols, symbols);
+        assert_eq!(connector.candle_timeframe, "1m");
+    }
 
     #[test]
     fn test_backpack_parse_iso8601() {
@@ -548,14 +718,15 @@ mod tests {
             "m": false,
             "p": "128.57",
             "q": "0.72",
-            "s": "SOL_USDC",
+            "s": "SOL_USDC_PERP",
             "t": 379172947i64
         });
 
         // Mocking the behavior inside subscribe_trades closure
         let trade = Trade {
             id: data.get("t").unwrap().as_i64().unwrap().to_string(),
-            product_id: format!("BACKPACK:{}-PERP", data.get("s").unwrap().as_str().unwrap()),
+            product_id: product_id_from_market_symbol(data.get("s").unwrap().as_str().unwrap())
+                .unwrap(),
             price: data
                 .get("p")
                 .unwrap()

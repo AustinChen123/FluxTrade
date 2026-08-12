@@ -780,6 +780,13 @@ async fn run_live_mode(
         .or_else(|| non_empty_env("MARKET_DATA_SYMBOLS"))
         .unwrap_or_else(|| "BTCUSDT,SOLUSDC".into());
     let symbols = parse_unique_csv("MARKET_DATA_SYMBOLS", &symbols_str, str::to_uppercase)?;
+    let backpack_symbols = if enabled_exchanges.iter().any(|value| value == "backpack") {
+        crate::connector::backpack::resolve_market_data_symbols(
+            non_empty_env("BACKPACK_MARKET_DATA_SYMBOLS").as_deref(),
+        )?
+    } else {
+        Vec::new()
+    };
 
     // --- Supervised task set (Task 1: task supervision) ---
     let mut join_set: JoinSet<(TaskId, anyhow::Result<()>)> = JoinSet::new();
@@ -832,6 +839,7 @@ async fn run_live_mode(
         let candle_tx = candle_tx.clone();
         let user_tx = user_tx.clone();
         let symbols = symbols.clone();
+        let backpack_symbols = backpack_symbols.clone();
 
         match exchange_name.as_str() {
             "binance" => {
@@ -857,8 +865,8 @@ async fn run_live_mode(
             }
             "backpack" => {
                 join_set.spawn(async move {
-                    let result = run_backpack_connector(
-                        symbols,
+                    let result = crate::connector::backpack::run(
+                        backpack_symbols,
                         trade_tx,
                         candle_tx,
                         user_tx,
@@ -1234,36 +1242,6 @@ async fn run_bybit_connector(
     conn.subscribe_trades(&symbols, trade_tx).await?;
 
     conn.subscribe_candles(&symbols, "1m", candle_tx).await?;
-
-    std::future::pending::<()>().await;
-    Ok(())
-}
-
-/// Run the Backpack connector: subscribes to trades, candles, and user stream.
-async fn run_backpack_connector(
-    _symbols: Vec<String>,
-    trade_tx: mpsc::Sender<model::Trade>,
-    candle_tx: mpsc::Sender<model::Candlestick>,
-    user_tx: mpsc::Sender<UserStreamEvent>,
-    user_stream_enabled: bool,
-) -> anyhow::Result<()> {
-    let mut conn = BackpackConnector::new();
-    info!("Starting Backpack Connector...");
-
-    // Backpack symbols often use underscore
-    let backpack_symbols = vec!["BTC_USDC".to_string(), "SOL_USDC".to_string()];
-
-    conn.subscribe_trades(&backpack_symbols, trade_tx).await?;
-
-    conn.subscribe_candles(&backpack_symbols, "1m", candle_tx)
-        .await?;
-
-    // Credential completeness is validated before any connector task is spawned.
-    if user_stream_enabled {
-        conn.subscribe_user_stream(user_tx).await?;
-    } else {
-        info!("Backpack API Key/Secret not found, skipping User Data Stream");
-    }
 
     std::future::pending::<()>().await;
     Ok(())
