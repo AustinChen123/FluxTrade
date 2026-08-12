@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 import subprocess
 import sys
 from unittest.mock import MagicMock
@@ -32,6 +33,7 @@ def test_main_import_does_not_eager_load_provider_owners() -> None:
         [sys.executable, "-B", "-c", script],
         check=True,
         capture_output=True,
+        env={**os.environ, "PYTHONPATH": os.pathsep.join(sys.path)},
         text=True,
     )
 
