@@ -55,6 +55,7 @@ from src.core.metrics import SIGNALS_TOTAL, ACTIVE_STRATEGIES, BALANCE_USDT
 from src.core.command_router import CommandRouter
 from src.core.health_monitor import HealthMonitor
 from src.core.engine_heartbeat_service import EngineHeartbeatService
+from src.core.engine_boot_state_service import EngineBootStateService
 from src.core.engine_runtime_reconciliation_service import (
     EngineRuntimeReconciliationService,
 )
@@ -372,6 +373,14 @@ class StrategyEngine:
             self.account_service,
             self._db_session_factory,
         )
+        self._boot_state_service = EngineBootStateService(
+            ops_safety=self.ops_safety,
+            redis_client=self.redis_client,
+            system_state_key=self._system_state_key,
+            system_boot_state_key=self._system_boot_state_key,
+            boot_id=self._boot_id,
+            logger=logger,
+        )
         self.order_event_thread = None
         self._order_event_stop = threading.Event()
         runtime_callbacks = RuntimeCallbacks(
@@ -478,9 +487,7 @@ class StrategyEngine:
             record_balance_metric=lambda: BALANCE_USDT.set(
                 float(self.account_service.get_balance())
             ),
-            load_active_strategy_ids=lambda: (
-                self._active_heartbeat_lifecycle_ids()
-            ),
+            load_active_strategy_ids=lambda: (self._active_heartbeat_lifecycle_ids()),
             record_strategy_heartbeats=lambda strategy_ids: (
                 self._record_strategy_heartbeats(strategy_ids)
             ),
@@ -1576,107 +1583,27 @@ class StrategyEngine:
         """
         logger.info("🔍 Checking System State...")
         self._boot_started = True
-        read_failed = False
-        try:
-            db_state = self.ops_safety.latest_kill_switch_state()
-            redis_state = self.redis_client.get(self._system_state_key)
-            if isinstance(redis_state, bytes):
-                redis_state = redis_state.decode("utf-8")
-            db_boot = self.ops_safety.latest_engine_boot_state()
-            redis_boot = self._decode_boot_state(
-                self.redis_client.get(self._system_boot_state_key)
-            )
-        except Exception as exc:
-            logger.error("System state unavailable; starting in LOCKDOWN: %s", exc)
-            read_failed = True
-            db_state = redis_state = None
-            db_boot = redis_boot = None
-
-        boot_marker_persisted = self._persist_engine_boot_state("UNCLEAN")
-
-        states_disagree = db_state != redis_state
-        state = db_state if db_state is not None else redis_state
-        kill_state_clear = (
-            db_state == SYSTEM_STATE_OK and redis_state == SYSTEM_STATE_OK
-        )
-        previous_boot_clean = (
-            db_boot is not None
-            and db_boot == redis_boot
-            and db_boot.get("state") == "CLEAN"
-        )
-        self._startup_auto_recovery_allowed = bool(
-            not read_failed
-            and boot_marker_persisted
-            and not states_disagree
-            and kill_state_clear
-            and not previous_boot_clean
-        )
-        if SYSTEM_STATE_LOCKDOWN in {db_state, redis_state}:
-            self._startup_lock_cause = "explicit_lockdown"
-        elif self._startup_auto_recovery_allowed:
-            self._startup_lock_cause = "unclean_boot"
-        else:
-            self._startup_lock_cause = "state_verification_failed"
-        if (
-            read_failed
-            or not boot_marker_persisted
-            or states_disagree
-            or not kill_state_clear
-            or not previous_boot_clean
-        ):
+        assessment = self._boot_state_service.assess_startup()
+        self._startup_auto_recovery_allowed = assessment.auto_recovery_allowed
+        self._startup_lock_cause = assessment.lock_cause
+        if assessment.locked:
             self._halt_for_kill_switch()
             logger.warning(
                 "SYSTEM LOCKED (db=%s redis=%s db_boot=%s redis_boot=%s); "
                 "startup recovery required",
-                db_state,
-                redis_state,
-                db_boot,
-                redis_boot,
+                assessment.db_state,
+                assessment.redis_state,
+                assessment.db_boot,
+                assessment.redis_boot,
             )
             return True
 
         self._resume_after_kill_switch()
-        self._startup_lock_cause = None
-        logger.info("System State: %s. Proceeding.", state or SYSTEM_STATE_OK)
+        logger.info(
+            "System State: %s. Proceeding.",
+            assessment.db_state or assessment.redis_state or SYSTEM_STATE_OK,
+        )
         return False
-
-    @staticmethod
-    def _decode_boot_state(value: object) -> dict[str, str] | None:
-        if isinstance(value, bytes):
-            value = value.decode("utf-8")
-        if not isinstance(value, str):
-            return None
-        try:
-            payload = json.loads(value)
-        except (TypeError, ValueError):
-            return None
-        if not isinstance(payload, dict):
-            return None
-        state = payload.get("state")
-        boot_id = payload.get("boot_id")
-        if state not in {"CLEAN", "UNCLEAN"} or not isinstance(boot_id, str):
-            return None
-        return {"state": state, "boot_id": boot_id}
-
-    def _persist_engine_boot_state(self, state: str) -> bool:
-        db_persisted = redis_persisted = False
-        try:
-            self.ops_safety.persist_engine_boot_state(state, boot_id=self._boot_id)
-            db_persisted = True
-        except Exception:
-            logger.exception("Failed to persist engine boot state to database")
-        try:
-            self.redis_client.set(
-                self._system_boot_state_key,
-                json.dumps(
-                    {"state": state, "boot_id": self._boot_id},
-                    separators=(",", ":"),
-                ),
-            )
-            redis_persisted = True
-        except Exception:
-            logger.exception("Failed to persist engine boot state to Redis")
-        return db_persisted or redis_persisted
 
     def _halt_for_kill_switch(self) -> None:
         self._kill_switch_halted = True
@@ -1999,7 +1926,7 @@ class StrategyEngine:
             and not self._kill_switch_halted
             and not self.ops_safety.recovery_pending
         ):
-            self._persist_engine_boot_state("CLEAN")
+            self._boot_state_service.persist("CLEAN")
 
         try:
             self.redis_client.close()

@@ -5407,21 +5407,32 @@ class TestPersistentKillSwitchState:
         assert redis_boot == {"state": "UNCLEAN", "boot_id": engine._boot_id}
 
     @pytest.mark.parametrize(
-        "db_boot, redis_boot",
+        "db_boot, redis_boot, auto_recovery_allowed, lock_cause",
         [
-            (None, None),
+            (None, None, False, "state_verification_failed"),
             (
                 {"state": "UNCLEAN", "boot_id": "previous"},
                 {"state": "UNCLEAN", "boot_id": "previous"},
+                True,
+                "unclean_boot",
             ),
             (
                 {"state": "CLEAN", "boot_id": "db-boot"},
                 {"state": "CLEAN", "boot_id": "redis-boot"},
+                False,
+                "state_verification_failed",
             ),
         ],
         ids=["missing", "unclean", "disagree"],
     )
-    def test_untrusted_previous_boot_fails_closed(self, engine, db_boot, redis_boot):
+    def test_untrusted_previous_boot_fails_closed(
+        self,
+        engine,
+        db_boot,
+        redis_boot,
+        auto_recovery_allowed,
+        lock_cause,
+    ):
         engine.redis_client.get.side_effect = lambda key: (
             "OK"
             if key == engine._system_state_key
@@ -5435,6 +5446,8 @@ class TestPersistentKillSwitchState:
 
         assert engine._check_system_state() is True
         assert engine._kill_switch_halted is True
+        assert engine._startup_auto_recovery_allowed is auto_recovery_allowed
+        assert engine._startup_lock_cause == lock_cause
 
     def test_unclean_boot_with_clear_kill_state_allows_automatic_recovery(self, engine):
         previous_boot = {"state": "UNCLEAN", "boot_id": "previous"}
