@@ -18,7 +18,6 @@ from typing import (
     ContextManager,
     Dict,
     Iterator,
-    List,
     Optional,
     Sequence,
     Type,
@@ -63,6 +62,7 @@ from src.core.command_router import CommandRouter
 from src.core.health_monitor import HealthMonitor
 from src.core.ops_safety import OpsSafetyService
 from src.core.runtime_reconcile import RuntimeReconciliationJob
+from src.core.runtime_artifact_registry import RuntimeArtifactRegistry
 from src.core.signal_processor import SignalProcessor
 from src.core.signal_order_intent import (
     InvalidSignalOrderIntent,
@@ -203,16 +203,12 @@ class StrategyEngine:
         else:
             self._db_session_factory = db_session_factory
         self.clock = clock
-        self.strategies: Dict[str, List[BaseStrategy]] = {}
-        self.strategy_instances: Dict[str, BaseStrategy] = {}
-        self.portfolio_instances: Dict[str, PortfolioDefinition] = {}
         self.loaded_classes: Dict[
             str,
             Type[BaseStrategy] | Type[PortfolioFactory],
         ] = {}
         self._strategy_artifact_loader = strategy_artifact_loader or (lambda: {})
         self._strategy_lock = threading.Lock()
-        self._runtime_registration_lock = threading.RLock()
         self._strategy_lifecycle_locks: weakref.WeakValueDictionary[
             str, threading.Lock
         ] = weakref.WeakValueDictionary()
@@ -235,6 +231,19 @@ class StrategyEngine:
             self._db_session_factory,
             self.redis_client,
         )
+        self._runtime_artifacts = RuntimeArtifactRegistry(
+            strategy_registry=self._registry,
+            portfolio_coordinator=self._portfolio_coordinator,
+            state_lock=self._strategy_lock,
+            market_processing_lock=self._market_processing_lock,
+            publish_active_state=self._strategy_state_manager.on_state_change_message,
+            record_active_count=ACTIVE_STRATEGIES.set,
+            event_logger=logger,
+        )
+        self.strategies = self._runtime_artifacts.strategies
+        self.strategy_instances = self._runtime_artifacts.strategy_instances
+        self.portfolio_instances = self._runtime_artifacts.portfolio_instances
+        self._runtime_registration_lock = self._runtime_artifacts.registration_lock
         self._daily_nav_snapshot_service = DailyNavSnapshotService(
             self._db_session_factory,
         )
@@ -1930,31 +1939,7 @@ class StrategyEngine:
 
     def _register_strategy_instance(self, instance: BaseStrategy) -> None:
         """Register a live strategy instance in runtime-only structures."""
-        with self._runtime_registration_lock:
-            updated_portfolio = self._portfolio_coordinator.replace_sleeve_strategy(
-                instance
-            )
-            with self._strategy_lock:
-                old = self.strategy_instances.get(instance.strategy_id)
-                if old is not None and old.product_id in self.strategies:
-                    self.strategies[old.product_id] = [
-                        s
-                        for s in self.strategies[old.product_id]
-                        if s.strategy_id != instance.strategy_id
-                    ]
-                self.strategy_instances[instance.strategy_id] = instance
-                if instance.product_id not in self.strategies:
-                    self.strategies[instance.product_id] = []
-                self.strategies[instance.product_id].append(instance)
-                self._registry.register(instance)
-                if (
-                    updated_portfolio is not None
-                    and updated_portfolio.portfolio_id in self.portfolio_instances
-                ):
-                    self.portfolio_instances[updated_portfolio.portfolio_id] = (
-                        updated_portfolio
-                    )
-                ACTIVE_STRATEGIES.set(len(self.strategy_instances))
+        self._runtime_artifacts.register_strategy(instance)
 
     def _register_portfolio_definition(
         self,
@@ -1963,82 +1948,21 @@ class StrategyEngine:
         publish_active_state: bool = False,
     ) -> None:
         """Atomically expose a complete portfolio at the market event boundary."""
-        sleeve_ids = [sleeve.strategy.strategy_id for sleeve in definition.sleeves]
-        new_ids = {definition.portfolio_id, *sleeve_ids}
-        with self._runtime_registration_lock, self._market_processing_lock:
-            with self._strategy_lock:
-                existing_ids = {
-                    *self.strategy_instances,
-                    *self.portfolio_instances,
-                }
-                collisions = sorted(new_ids & existing_ids)
-            if collisions:
-                raise ValueError(
-                    f"portfolio runtime IDs are already active: {collisions}"
-                )
-
-            registered: list[str] = []
-            self._portfolio_coordinator.register(definition)
-            try:
-                for sleeve in definition.sleeves:
-                    self._register_strategy_instance(sleeve.strategy)
-                    registered.append(sleeve.strategy.strategy_id)
-                with self._strategy_lock:
-                    self.portfolio_instances[definition.portfolio_id] = definition
-            except Exception:
-                for strategy_id in reversed(registered):
-                    self._unregister_strategy_instance(strategy_id)
-                self._portfolio_coordinator.unregister(definition.portfolio_id)
-                raise
-        if publish_active_state:
-            self._strategy_state_manager.on_state_change_message(
-                {
-                    "strategy_id": definition.portfolio_id,
-                    "status": StrategyStatus.ACTIVE.value,
-                }
-            )
-        logger.info(
-            "Registered portfolio %s with %s sleeve(s)",
-            definition.portfolio_id,
-            len(definition.sleeves),
+        self._runtime_artifacts.register_portfolio(
+            definition,
+            publish_active_state=publish_active_state,
         )
 
     def _unregister_runtime_artifact(self, runtime_id: str) -> bool:
         """Remove a parent portfolio or one standalone strategy."""
-        with self._runtime_registration_lock, self._market_processing_lock:
-            return self._unregister_runtime_artifact_locked(runtime_id)
+        return self._runtime_artifacts.unregister(runtime_id)
 
     def _unregister_runtime_artifact_locked(self, runtime_id: str) -> bool:
-        definition = self._portfolio_coordinator.unregister(runtime_id)
-        if definition is not None:
-            for sleeve in definition.sleeves:
-                self._unregister_strategy_instance(sleeve.strategy.strategy_id)
-            with self._strategy_lock:
-                self.portfolio_instances.pop(runtime_id, None)
-            return True
-        if self._portfolio_coordinator.portfolio_id_for_sleeve(runtime_id) is not None:
-            raise ValueError(
-                "portfolio sleeves must be controlled through the portfolio ID"
-            )
-        return self._unregister_strategy_instance(runtime_id)
+        return self._runtime_artifacts.unregister_locked(runtime_id)
 
     def _unregister_strategy_instance(self, strategy_id: str) -> bool:
         """Remove a live strategy instance from runtime-only structures."""
-        with self._runtime_registration_lock:
-            with self._strategy_lock:
-                instance = self.strategy_instances.pop(strategy_id, None)
-                if instance is None:
-                    return False
-                product_id = instance.product_id
-                if product_id in self.strategies:
-                    self.strategies[product_id] = [
-                        s
-                        for s in self.strategies[product_id]
-                        if s.strategy_id != strategy_id
-                    ]
-                self._registry.unregister(strategy_id)
-                ACTIVE_STRATEGIES.set(len(self.strategy_instances))
-                return True
+        return self._runtime_artifacts.unregister_strategy(strategy_id)
 
     def _reconcile_startup_balance(self) -> object | None:
         """Dispatch startup balance policy through the venue composition."""

@@ -134,6 +134,12 @@ def test_engine_has_no_concrete_rithmic_runtime_composition_dependency() -> None
     assert '"rithmic_reconciliation_blocked"' not in source
 
 
+def test_engine_runtime_artifact_maps_are_owned_by_one_registry(engine) -> None:
+    assert engine.strategies is engine._runtime_artifacts.strategies
+    assert engine.strategy_instances is engine._runtime_artifacts.strategy_instances
+    assert engine.portfolio_instances is engine._runtime_artifacts.portfolio_instances
+
+
 @pytest.fixture
 def engine(engine_factory):
     """Default engine with all mocks."""
@@ -232,7 +238,9 @@ class _RecordingRiskManager:
 
 class TestEngineInit:
     def test_engine_has_no_concrete_rithmic_bootstrap_policy(self):
-        source = (Path(__file__).parents[1] / "src" / "core" / "engine.py").read_text()
+        source = (
+            Path(__file__).parents[1] / "src" / "core" / "engine.py"
+        ).read_text()
 
         for venue_detail in (
             "RithmicExchangeAdapter",
@@ -3501,9 +3509,7 @@ class TestHeartbeatRecording:
 
 class TestScanStrategies:
     def test_engine_source_does_not_own_strategy_artifact_policy(self):
-        source = (
-            Path(__file__).parents[1] / "src" / "core" / "engine.py"
-        ).read_text()
+        source = (Path(__file__).parents[1] / "src" / "core" / "engine.py").read_text()
 
         assert "HOT_STRATEGIES_PATH" not in source
         assert "StrategyLoader" not in source
