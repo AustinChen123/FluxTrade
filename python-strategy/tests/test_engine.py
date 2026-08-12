@@ -4044,7 +4044,7 @@ class TestStartStrategy:
         engine._unregister_runtime_artifact = MagicMock(
             side_effect=lambda _strategy_id: events.append(("unregister", None))
         )
-        engine._warm_up_strategy_instance = MagicMock()
+        engine._strategy_hydration.warm_up = MagicMock()
         engine._register_strategy_instance = MagicMock()
         engine._strategy_state_manager.transition_to_running = MagicMock()
         engine._strategy_state_manager.transition_to_error = MagicMock(
@@ -4071,7 +4071,7 @@ class TestStartStrategy:
         ]
         assert state.uptime_start == "unchanged"
         engine._unregister_runtime_artifact.assert_called_once_with(state.strategy_id)
-        engine._warm_up_strategy_instance.assert_not_called()
+        engine._strategy_hydration.warm_up.assert_not_called()
         engine._register_strategy_instance.assert_not_called()
         engine._strategy_state_manager.transition_to_running.assert_not_called()
         engine._strategy_state_manager.transition_to_error.assert_called_once_with(
@@ -4112,7 +4112,7 @@ class TestStartStrategy:
         engine._unregister_runtime_artifact = MagicMock(
             side_effect=lambda _strategy_id: events.append(("unregister", None))
         )
-        engine._warm_up_strategy_instance = MagicMock()
+        engine._strategy_hydration.warm_up = MagicMock()
         engine._register_strategy_instance = MagicMock()
         engine._strategy_state_manager.transition_to_running = MagicMock()
         engine._strategy_state_manager.transition_to_error = MagicMock(
@@ -4132,7 +4132,7 @@ class TestStartStrategy:
         ]
         assert state.uptime_start == "unchanged"
         engine._unregister_runtime_artifact.assert_called_once_with(state.strategy_id)
-        engine._warm_up_strategy_instance.assert_not_called()
+        engine._strategy_hydration.warm_up.assert_not_called()
         engine._register_strategy_instance.assert_not_called()
         engine._strategy_state_manager.transition_to_running.assert_not_called()
         engine._strategy_state_manager.transition_to_error.assert_called_once_with(
@@ -4176,7 +4176,7 @@ class TestStartStrategy:
         mock_strategy_class,
     ):
         engine.loaded_classes["test.py::MyStrat"] = mock_strategy_class
-        engine._warm_up_strategy_instance = MagicMock()
+        engine._strategy_hydration.warm_up = MagicMock()
         engine._register_strategy_instance = MagicMock()
         engine._strategy_state_manager.transition_to_running = MagicMock()
         mock_state = MagicMock()
@@ -4195,7 +4195,7 @@ class TestStartStrategy:
                 expected_version=3,
             )
 
-        engine._warm_up_strategy_instance.assert_not_called()
+        engine._strategy_hydration.warm_up.assert_not_called()
         engine._register_strategy_instance.assert_not_called()
         engine._strategy_state_manager.transition_to_running.assert_not_called()
 
@@ -4233,7 +4233,7 @@ class TestStartStrategy:
             state.status = StrategyStatus.ACTIVE
             state.version = 4
 
-        engine._warm_up_strategy_instance = MagicMock(side_effect=warm_up)
+        engine._strategy_hydration.warm_up = MagicMock(side_effect=warm_up)
         engine._strategy_state_manager.transition_to_running = MagicMock(
             side_effect=transition_to_running
         )
@@ -4258,7 +4258,7 @@ class TestStartStrategy:
         assert warmup_started.wait(timeout=1)
         second.start()
         assert second_warmup_started.wait(timeout=0.1) is False
-        assert engine._warm_up_strategy_instance.call_count == 1
+        assert engine._strategy_hydration.warm_up.call_count == 1
         finish_warmup.set()
         first.join(timeout=1)
         second.join(timeout=1)
@@ -4287,12 +4287,12 @@ class TestStartStrategy:
         mock_db = MagicMock()
         mock_db.query.return_value.filter.return_value.first.return_value = mock_state
         engine._db_session_factory = lambda: nullcontext(mock_db)
-        engine._warm_up_strategy_instance = MagicMock(return_value=0)
+        engine._strategy_hydration.warm_up = MagicMock(return_value=0)
 
         engine.start_strategy("test.py::MyStrat")
 
         assert "test.py::MyStrat" in engine.strategy_instances
-        engine._warm_up_strategy_instance.assert_called_once()
+        engine._strategy_hydration.warm_up.assert_called_once()
         engine._strategy_state_manager.transition_to_running.assert_called_once_with(
             "test.py::MyStrat",
             actor="operator",
@@ -4343,7 +4343,7 @@ class TestStartStrategy:
         mock_db = MagicMock()
         mock_db.query.return_value.filter.return_value.first.return_value = mock_state
         engine._db_session_factory = lambda: nullcontext(mock_db)
-        engine._warm_up_strategy_instance = MagicMock(return_value=0)
+        engine._strategy_hydration.warm_up = MagicMock(return_value=0)
 
         engine.start_strategy("portfolio_v1")
 
@@ -4352,7 +4352,7 @@ class TestStartStrategy:
             "portfolio_v1.sleeve_1",
         }
         assert "portfolio_v1" in engine.portfolio_instances
-        assert engine._warm_up_strategy_instance.call_count == 2
+        assert engine._strategy_hydration.warm_up.call_count == 2
         engine._strategy_state_manager.on_state_change_message.assert_not_called()
         engine._strategy_state_manager.transition_to_running.assert_called_once_with(
             "portfolio_v1",
@@ -4399,13 +4399,13 @@ class TestStartStrategy:
         mock_db = MagicMock()
         mock_db.query.return_value.filter.return_value.first.return_value = mock_state
         engine._db_session_factory = lambda: nullcontext(mock_db)
-        engine._warm_up_strategy_instance = MagicMock(return_value=0)
-        engine._fresh_strategy_instance_for_replay = MagicMock()
+        engine._strategy_hydration.warm_up = MagicMock(return_value=0)
+        engine._strategy_hydration.fresh_instance_for_replay = MagicMock()
 
         engine.start_strategy("stable_strategy_v1")
 
         assert ("stable_strategy_v1" in engine.strategy_instances) is starts
-        assert engine._warm_up_strategy_instance.called is starts
+        assert engine._strategy_hydration.warm_up.called is starts
 
     def test_start_uses_loaded_class_snapshot_during_rescan(
         self,
@@ -4419,7 +4419,7 @@ class TestStartStrategy:
         mock_db = MagicMock()
         mock_db.query.return_value.filter.return_value.first.return_value = mock_state
         engine._db_session_factory = lambda: nullcontext(mock_db)
-        engine._warm_up_strategy_instance = MagicMock(return_value=0)
+        engine._strategy_hydration.warm_up = MagicMock(return_value=0)
         engine._strategy_state_manager.transition_to_running = MagicMock()
 
         def snapshot_then_rescan(_strategy_id):
@@ -4971,7 +4971,7 @@ class TestStrategyWarmup:
         )
         engine.redis_client.publish.side_effect = RuntimeError("redis unavailable")
         engine.loaded_classes["test.py::MyStrat"] = mock_strategy_class
-        engine._warm_up_strategy_instance = MagicMock(return_value=0)
+        engine._strategy_hydration.warm_up = MagicMock(return_value=0)
 
         activated = engine.activate_strategy(
             "test.py::MyStrat",
@@ -5058,7 +5058,7 @@ class TestStrategyWarmup:
             )
         )
 
-        engine._sync_strategy_position_state(strategy)
+        engine._strategy_hydration.sync_position_state(strategy)
 
         assert strategy.position == 1
         assert strategy._in_position is True
@@ -5274,7 +5274,7 @@ class TestStrategyWarmup:
         engine.loaded_classes["test.py::OrderTrackingStrategy"] = OrderTrackingStrategy
         engine._strategy_state_manager.transition_to_running = MagicMock()
 
-        original_warmup = engine._warm_up_strategy_instance
+        original_warmup = engine._strategy_hydration.warm_up
         original_register = engine._register_strategy_instance
 
         def tracking_warmup(db, instance):
@@ -5285,7 +5285,7 @@ class TestStrategyWarmup:
             call_order.append("register")
             return original_register(instance)
 
-        engine._warm_up_strategy_instance = tracking_warmup
+        engine._strategy_hydration.warm_up = tracking_warmup
         engine._register_strategy_instance = tracking_register
 
         engine.activate_strategy("test.py::OrderTrackingStrategy")

@@ -29,7 +29,6 @@ from src.core.models import (
     SignalType,
     StrategyStatus,
 )
-from src.core.orm_models import Candlestick as ORMCandlestick
 from src.core.orm_models import StrategyState
 from src.strategies.base import BaseStrategy
 from src.core.risk_manager import RiskManager, AccountService
@@ -85,6 +84,7 @@ from src.core.strategy_state_manager import (
     StrategyStateManager,
     available_strategy_commands,
 )
+from src.core.strategy_hydration_service import StrategyHydrationService
 from src.core.audit_service import build_signal_audit, commit_signal_audit
 from src.core.runtime_environment import RuntimeEnvironment
 from src.core.runtime_capabilities import (
@@ -362,6 +362,10 @@ class StrategyEngine:
             exposure_loader=self.execution_engine.portfolio_exposure_snapshot,
             portfolio_coordinator=self._portfolio_coordinator,
             signal_batch_observer=signal_batch_observer,
+        )
+        self._strategy_hydration = StrategyHydrationService(
+            signal_processor=self._signal_processor,
+            account_service=self.account_service,
         )
         self.ops_safety = OpsSafetyService(
             self.execution_engine,
@@ -1168,9 +1172,9 @@ class StrategyEngine:
                     warmed_sleeves: list[PortfolioSleeve] = []
                     for sleeve in definition.sleeves:
                         instance = sleeve.strategy
-                        self._warm_up_strategy_instance(db, instance)
+                        self._strategy_hydration.warm_up(db, instance)
                         if self.runtime_environment.identity == "live":
-                            self._fresh_strategy_instance_for_replay(instance)
+                            self._strategy_hydration.fresh_instance_for_replay(instance)
                         warmed_sleeves.append(replace(sleeve, strategy=instance))
                     definition = replace(
                         definition,
@@ -1182,9 +1186,9 @@ class StrategyEngine:
                     self._register_portfolio_definition(definition)
                 else:
                     instance = artifact_cls(strategy_id, product_id)
-                    self._warm_up_strategy_instance(db, instance)
+                    self._strategy_hydration.warm_up(db, instance)
                     if self.runtime_environment.identity == "live":
-                        self._fresh_strategy_instance_for_replay(instance)
+                        self._strategy_hydration.fresh_instance_for_replay(instance)
                     # Registration must follow warm-up — on restart-restore the lifecycle
                     # cache is already ACTIVE, so a registered instance is immediately
                     # live to on_market_data and could emit signals from partial state.
@@ -1354,53 +1358,6 @@ class StrategyEngine:
             )
         return (artifact_cls(strategy_id, product_id),)
 
-    def _warm_up_strategy_instance(
-        self,
-        db: Session,
-        instance: BaseStrategy,
-        *,
-        before_timestamp: int | None = None,
-    ) -> int:
-        """Replay recent candles into a strategy without emitting signals."""
-        reqs = instance.requirements
-        lookback = max(int(reqs.lookback_window), 0)
-        if lookback == 0:
-            # No candle warm-up needed, but restored live positions must still
-            # be synced or the strategy activates with flat internal state.
-            self._sync_strategy_position_state(instance)
-            return 0
-
-        query = db.query(ORMCandlestick).filter(
-            ORMCandlestick.product_id == reqs.product_id,
-            ORMCandlestick.timeframe == reqs.timeframe,
-        )
-        if before_timestamp is not None:
-            query = query.filter(ORMCandlestick.timestamp < before_timestamp)
-        rows = query.order_by(ORMCandlestick.timestamp.desc()).limit(lookback).all()
-        rows = sorted(rows, key=lambda row: row.timestamp)
-        if len(rows) < lookback:
-            raise RuntimeError(
-                "warmup_insufficient_candles: "
-                f"strategy_id={instance.strategy_id} "
-                f"available={len(rows)} required={lookback}"
-            )
-        candles = [
-            Candlestick(
-                product_id=row.product_id,
-                timeframe=row.timeframe,
-                timestamp=row.timestamp,
-                open=row.open,
-                high=row.high,
-                low=row.low,
-                close=row.close,
-                volume=row.volume,
-            )
-            for row in rows
-        ]
-        self._signal_processor.warm_up(instance, candles)
-        self._sync_strategy_position_state(instance)
-        return len(candles)
-
     def _rewind_for_pending_market_replay(
         self,
         models: Sequence[Union[Candlestick, Trade]],
@@ -1435,8 +1392,10 @@ class StrategyEngine:
                 )
                 if cutoff is None:
                     continue
-                replacement = self._fresh_strategy_instance_for_replay(current)
-                self._warm_up_strategy_instance(
+                replacement = self._strategy_hydration.fresh_instance_for_replay(
+                    current
+                )
+                self._strategy_hydration.warm_up(
                     db,
                     replacement,
                     before_timestamp=cutoff,
@@ -1444,27 +1403,6 @@ class StrategyEngine:
                 replacements.append(replacement)
         for replacement in replacements:
             self._register_strategy_instance(replacement)
-
-    @staticmethod
-    def _fresh_strategy_instance_for_replay(
-        current: BaseStrategy,
-    ) -> BaseStrategy:
-        current_configuration = current.replay_configuration()
-        replacement = current.fresh_instance_for_replay()
-        if (
-            replacement is current
-            or type(replacement) is not type(current)
-            or replacement.strategy_id != current.strategy_id
-            or replacement.product_id != current.product_id
-            or replacement.requirements != current.requirements
-            or replacement.replay_configuration() != current_configuration
-        ):
-            raise RuntimeError(
-                "strategy recovery factory did not return a distinct "
-                "compatible instance: "
-                f"{current.strategy_id}"
-            )
-        return replacement
 
     def _rebuild_strategies_through_applied_candle(
         self,
@@ -1483,8 +1421,10 @@ class StrategyEngine:
                     or current.requirements.timeframe != candle.timeframe
                 ):
                     continue
-                replacement = self._fresh_strategy_instance_for_replay(current)
-                self._warm_up_strategy_instance(
+                replacement = self._strategy_hydration.fresh_instance_for_replay(
+                    current
+                )
+                self._strategy_hydration.warm_up(
                     db,
                     replacement,
                     before_timestamp=candle.timestamp + 1,
@@ -1514,28 +1454,6 @@ class StrategyEngine:
                 ),
                 apply_new=self._apply_unpersisted_candle,
                 rebuild_applied=self._rebuild_strategies_through_applied_candle,
-            )
-
-    def _sync_strategy_position_state(self, instance: BaseStrategy) -> None:
-        """Align warmed strategy trade flags with the current account position."""
-        try:
-            position = self.account_service.get_position(
-                instance.strategy_id,
-                instance.product_id,
-            )
-        except Exception as e:
-            raise RuntimeError(
-                "position_state_sync_failed: "
-                f"strategy_id={instance.strategy_id} error={e}"
-            ) from e
-        position_side = (
-            None if position is None else getattr(position.side, "value", position.side)
-        )
-        applied = self._signal_processor.set_position_state(instance, position_side)
-        if position_side is not None and not applied:
-            raise RuntimeError(
-                "position_state_sync_unsupported: "
-                f"strategy_id={instance.strategy_id} side={position_side}"
             )
 
     def start_strategy(self, strategy_id: str):
@@ -1825,7 +1743,7 @@ class StrategyEngine:
         """
         self._assert_strategy_live_readiness(type(strategy))
         if self.runtime_environment.identity == "live":
-            self._fresh_strategy_instance_for_replay(strategy)
+            self._strategy_hydration.fresh_instance_for_replay(strategy)
         with self._runtime_registration_lock:
             with self._strategy_lock:
                 if (
@@ -1863,7 +1781,7 @@ class StrategyEngine:
             )
         if self.runtime_environment.identity == "live":
             for sleeve in definition.sleeves:
-                self._fresh_strategy_instance_for_replay(sleeve.strategy)
+                self._strategy_hydration.fresh_instance_for_replay(sleeve.strategy)
         self._register_portfolio_definition(
             definition,
             publish_active_state=True,
