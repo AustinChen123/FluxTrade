@@ -136,11 +136,11 @@ def test_engine_has_no_concrete_rithmic_runtime_composition_dependency() -> None
     assert '"rithmic_reconciliation_blocked"' not in source
 
 
-def test_fresh_engine_import_does_not_load_live_adapter_modules() -> None:
+def test_fresh_adapter_package_import_does_not_load_live_modules() -> None:
     script = """
 import json
 import sys
-import src.core.engine
+import src.core.adapters
 
 live_modules = sorted(
     name
