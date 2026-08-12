@@ -6,12 +6,102 @@ use async_trait::async_trait;
 use rust_decimal::Decimal;
 use serde_json::Value;
 use std::env;
+use std::future::Future;
 use std::time::Duration;
 use tokio::sync::mpsc;
+use tokio::task::AbortHandle;
 use tokio_tungstenite::tungstenite::protocol::Message;
 use tracing::{error, info, warn};
 
 const LISTEN_KEY_ACQUIRED_MESSAGE: &str = "Obtained Binance listen key";
+
+#[derive(Debug)]
+pub(crate) struct BinanceTaskFailure {
+    task: &'static str,
+    stable_error_code: &'static str,
+    safe_cause: &'static str,
+    source: Option<anyhow::Error>,
+}
+
+impl BinanceTaskFailure {
+    pub(crate) fn task_error(task: &'static str, source: anyhow::Error) -> Self {
+        Self {
+            task,
+            stable_error_code: "binance_stream_task_failed",
+            safe_cause: "Binance stream task failed",
+            source: Some(source),
+        }
+    }
+
+    pub(crate) fn unexpected_exit(task: &'static str) -> Self {
+        Self {
+            task,
+            stable_error_code: "binance_stream_task_exited",
+            safe_cause: "Binance stream task exited unexpectedly",
+            source: None,
+        }
+    }
+
+    pub(crate) fn panicked(task: &'static str) -> Self {
+        Self {
+            task,
+            stable_error_code: "binance_stream_task_panicked",
+            safe_cause: "Binance stream task panicked",
+            source: None,
+        }
+    }
+
+    pub(crate) fn cancelled(task: &'static str) -> Self {
+        Self {
+            task,
+            stable_error_code: "binance_stream_task_cancelled",
+            safe_cause: "Binance stream task was cancelled",
+            source: None,
+        }
+    }
+
+    fn join_failed(task: &'static str) -> Self {
+        Self {
+            task,
+            stable_error_code: "binance_stream_task_join_failed",
+            safe_cause: "Binance stream task join failed",
+            source: None,
+        }
+    }
+
+    fn monitor_closed() -> Self {
+        Self {
+            task: "task_monitor",
+            stable_error_code: "binance_task_monitor_closed",
+            safe_cause: "Binance task monitor closed unexpectedly",
+            source: None,
+        }
+    }
+
+    pub(crate) fn task(&self) -> &'static str {
+        self.task
+    }
+
+    pub(crate) fn stable_error_code(&self) -> &'static str {
+        self.stable_error_code
+    }
+
+    pub(crate) fn safe_cause(&self) -> &'static str {
+        self.safe_cause
+    }
+}
+
+impl std::fmt::Display for BinanceTaskFailure {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(self.safe_cause)
+    }
+}
+
+impl std::error::Error for BinanceTaskFailure {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        self.source.as_ref().map(|error| error.as_ref())
+    }
+}
 
 async fn subscribe_market_data(
     connector: &mut impl ExchangeConnector,
@@ -30,7 +120,8 @@ pub(crate) async fn run(
     user_tx: mpsc::Sender<UserStreamEvent>,
     user_stream_enabled: bool,
 ) -> Result<()> {
-    let mut connector = BinanceConnector::new();
+    let (task_exit_tx, mut task_exit_rx) = mpsc::unbounded_channel();
+    let mut connector = BinanceConnector::with_task_exit_tx(task_exit_tx);
     info!(symbols = ?symbols, "Starting Binance Connector");
     subscribe_market_data(&mut connector, &symbols, trade_tx, candle_tx).await?;
 
@@ -40,8 +131,16 @@ pub(crate) async fn run(
         info!("BINANCE_API_KEY not found, skipping User Data Stream");
     }
 
-    std::future::pending::<()>().await;
-    Ok(())
+    await_task_exit(&mut task_exit_rx).await
+}
+
+async fn await_task_exit(
+    task_exit_rx: &mut mpsc::UnboundedReceiver<BinanceTaskFailure>,
+) -> Result<()> {
+    match task_exit_rx.recv().await {
+        Some(failure) => Err(failure.into()),
+        None => Err(BinanceTaskFailure::monitor_closed().into()),
+    }
 }
 
 #[allow(dead_code)]
@@ -50,6 +149,7 @@ pub struct BinanceConnector {
     exchange_id: String,
     http_client: reqwest::Client,
     base_url: String,
+    task_exit_tx: Option<mpsc::UnboundedSender<BinanceTaskFailure>>,
 }
 
 fn parse_trade_from_json(v: &Value, exchange_id: &str) -> Result<Trade> {
@@ -105,6 +205,64 @@ impl BinanceConnector {
             exchange_id: "BINANCE".to_string(),
             http_client: reqwest::Client::new(),
             base_url: "https://fapi.binance.com".to_string(),
+            task_exit_tx: None,
+        }
+    }
+
+    fn with_task_exit_tx(task_exit_tx: mpsc::UnboundedSender<BinanceTaskFailure>) -> Self {
+        Self {
+            task_exit_tx: Some(task_exit_tx),
+            ..Self::new()
+        }
+    }
+
+    fn spawn_task<F>(&self, task_name: &'static str, future: F) -> AbortHandle
+    where
+        F: Future<Output = Result<()>> + Send + 'static,
+    {
+        let task = tokio::spawn(future);
+        let abort_handle = task.abort_handle();
+        let task_exit_tx = self.task_exit_tx.clone();
+        tokio::spawn(async move {
+            let failure = match task.await {
+                Ok(Ok(())) => BinanceTaskFailure::unexpected_exit(task_name),
+                Ok(Err(error)) => BinanceTaskFailure::task_error(task_name, error),
+                Err(error) if error.is_panic() => BinanceTaskFailure::panicked(task_name),
+                Err(error) if error.is_cancelled() => BinanceTaskFailure::cancelled(task_name),
+                Err(_) => BinanceTaskFailure::join_failed(task_name),
+            };
+            if let Some(task_exit_tx) = task_exit_tx {
+                let _ = task_exit_tx.send(failure);
+            } else {
+                error!(
+                    task = failure.task(),
+                    stable_error_code = failure.stable_error_code(),
+                    safe_cause = failure.safe_cause(),
+                    "Binance connector task failed"
+                );
+            }
+        });
+        abort_handle
+    }
+
+    async fn keep_listen_key_alive(
+        http_client: reqwest::Client,
+        base_url: String,
+        api_key: String,
+    ) -> Result<()> {
+        let mut interval = tokio::time::interval(Duration::from_secs(1800));
+        loop {
+            interval.tick().await;
+            let url = format!("{base_url}/fapi/v1/listenKey");
+            match http_client
+                .put(&url)
+                .header("X-MBX-APIKEY", &api_key)
+                .send()
+                .await
+            {
+                Ok(_) => info!("Refreshed Binance ListenKey"),
+                Err(error) => error!("Failed to refresh ListenKey: {error}"),
+            }
         }
     }
 
@@ -131,26 +289,13 @@ impl BinanceConnector {
         let listen_key = self.get_listen_key(&api_key).await?;
         info!("{LISTEN_KEY_ACQUIRED_MESSAGE}");
 
-        // Spawn Keep-Alive Task
         let http_client = self.http_client.clone();
         let base_url = self.base_url.clone();
         let api_key_keep = api_key.clone();
-        tokio::spawn(async move {
-            let mut interval = tokio::time::interval(Duration::from_secs(1800)); // 30 mins
-            loop {
-                interval.tick().await;
-                let url = format!("{}/fapi/v1/listenKey", base_url);
-                match http_client
-                    .put(&url)
-                    .header("X-MBX-APIKEY", &api_key_keep)
-                    .send()
-                    .await
-                {
-                    Ok(_) => info!("Refreshed Binance ListenKey"),
-                    Err(e) => error!("Failed to refresh ListenKey: {}", e),
-                }
-            }
-        });
+        let _keepalive = self.spawn_task(
+            "listen_key_keepalive",
+            Self::keep_listen_key_alive(http_client, base_url, api_key_keep),
+        );
 
         // Connect to WS
         let url = format!("wss://fstream.binance.com/ws/{}", listen_key);
@@ -159,8 +304,8 @@ impl BinanceConnector {
 
         info!("Subscribing to Binance User Stream");
 
-        tokio::spawn(async move {
-            let res = ws_manager
+        let _user_stream = self.spawn_task("user_stream", async move {
+            ws_manager
                 .connect_with_retry(
                     |ws| async { Ok((ws, Ok(()))) },
                     |msg| {
@@ -253,11 +398,7 @@ impl BinanceConnector {
                         }
                     },
                 )
-                .await;
-
-            if let Err(e) = res {
-                error!("Binance User Stream failed: {}", e);
-            }
+                .await
         });
 
         Ok(())
@@ -352,8 +493,8 @@ impl ExchangeConnector for BinanceConnector {
 
         info!("Subscribing to Binance trades: {}", streams);
 
-        tokio::spawn(async move {
-            let res = ws_manager
+        let _trades = self.spawn_task("trades", async move {
+            ws_manager
                 .connect_with_retry(
                     |ws| async { Ok((ws, Ok(()))) },
                     |msg| {
@@ -379,11 +520,7 @@ impl ExchangeConnector for BinanceConnector {
                         }
                     },
                 )
-                .await;
-
-            if let Err(e) = res {
-                error!("Binance trades subscription failed: {}", e);
-            }
+                .await
         });
 
         Ok(())
@@ -417,8 +554,8 @@ impl ExchangeConnector for BinanceConnector {
 
         info!("Subscribing to Binance candles: {}", streams);
 
-        tokio::spawn(async move {
-            let res = ws_manager
+        let _candles = self.spawn_task("candles", async move {
+            ws_manager
                 .connect_with_retry(
                     |ws| async { Ok((ws, Ok(()))) },
                     |msg| {
@@ -489,11 +626,7 @@ impl ExchangeConnector for BinanceConnector {
                         }
                     },
                 )
-                .await;
-
-            if let Err(e) = res {
-                error!("Binance candles subscription failed: {}", e);
-            }
+                .await
         });
 
         Ok(())
@@ -622,6 +755,100 @@ mod tests {
         assert!(main_source.contains("crate::connector::binance::run("));
         assert!(!main_source.contains("BinanceConnector::new"));
         assert!(!main_source.contains("run_binance_connector"));
+    }
+
+    #[tokio::test]
+    async fn internal_task_error_reaches_the_binance_runtime_owner() {
+        let (task_exit_tx, mut task_exit_rx) = mpsc::unbounded_channel();
+        let connector = BinanceConnector::with_task_exit_tx(task_exit_tx);
+        let _task = connector.spawn_task("trades", async {
+            Err(anyhow::anyhow!("provider failure sentinel"))
+        });
+
+        let error =
+            tokio::time::timeout(Duration::from_secs(1), await_task_exit(&mut task_exit_rx))
+                .await
+                .unwrap()
+                .unwrap_err();
+
+        let failure = error.downcast_ref::<BinanceTaskFailure>().unwrap();
+        assert_eq!(failure.task(), "trades");
+        assert_eq!(failure.stable_error_code(), "binance_stream_task_failed");
+        assert_eq!(failure.safe_cause(), "Binance stream task failed");
+        assert_eq!(
+            error.chain().map(ToString::to_string).collect::<Vec<_>>(),
+            ["Binance stream task failed", "provider failure sentinel"]
+        );
+    }
+
+    #[tokio::test]
+    async fn clean_internal_task_exit_is_not_treated_as_healthy() {
+        let (task_exit_tx, mut task_exit_rx) = mpsc::unbounded_channel();
+        let connector = BinanceConnector::with_task_exit_tx(task_exit_tx);
+        let _task = connector.spawn_task("candles", async { Ok(()) });
+
+        let error =
+            tokio::time::timeout(Duration::from_secs(1), await_task_exit(&mut task_exit_rx))
+                .await
+                .unwrap()
+                .unwrap_err();
+
+        let failure = error.downcast_ref::<BinanceTaskFailure>().unwrap();
+        assert_eq!(failure.task(), "candles");
+        assert_eq!(failure.stable_error_code(), "binance_stream_task_exited");
+        assert_eq!(
+            failure.safe_cause(),
+            "Binance stream task exited unexpectedly"
+        );
+    }
+
+    #[tokio::test]
+    async fn panicked_internal_task_has_a_fixed_safe_error() {
+        let (task_exit_tx, mut task_exit_rx) = mpsc::unbounded_channel();
+        let connector = BinanceConnector::with_task_exit_tx(task_exit_tx);
+        let _task = connector.spawn_task("user_stream", async {
+            panic!("provider panic payload sentinel")
+        });
+
+        let error =
+            tokio::time::timeout(Duration::from_secs(1), await_task_exit(&mut task_exit_rx))
+                .await
+                .unwrap()
+                .unwrap_err();
+        let failure = error.downcast_ref::<BinanceTaskFailure>().unwrap();
+        assert_eq!(failure.task(), "user_stream");
+        assert_eq!(failure.stable_error_code(), "binance_stream_task_panicked");
+        let rendered = error.to_string();
+        assert_eq!(rendered, "Binance stream task panicked");
+        assert!(!rendered.contains("provider panic payload sentinel"));
+    }
+
+    #[tokio::test]
+    async fn cancelled_internal_task_has_a_fixed_safe_error() {
+        let (task_exit_tx, mut task_exit_rx) = mpsc::unbounded_channel();
+        let connector = BinanceConnector::with_task_exit_tx(task_exit_tx);
+        let task = connector.spawn_task("listen_key_keepalive", async {
+            std::future::pending::<Result<()>>().await
+        });
+        task.abort();
+
+        let error =
+            tokio::time::timeout(Duration::from_secs(1), await_task_exit(&mut task_exit_rx))
+                .await
+                .unwrap()
+                .unwrap_err();
+
+        let failure = error.downcast_ref::<BinanceTaskFailure>().unwrap();
+        assert_eq!(failure.task(), "listen_key_keepalive");
+        assert_eq!(failure.stable_error_code(), "binance_stream_task_cancelled");
+        assert_eq!(failure.safe_cause(), "Binance stream task was cancelled");
+    }
+
+    #[test]
+    fn production_owner_does_not_hide_behind_an_unconditional_pending_future() {
+        let source = include_str!("binance.rs");
+        let production = source.split_once("#[cfg(test)]").unwrap().0;
+        assert!(!production.contains("std::future::pending::<()>().await;"));
     }
 
     #[test]

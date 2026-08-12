@@ -526,6 +526,23 @@ fn terminal_diagnostic(error: &anyhow::Error) -> TerminalDiagnostic {
         .chain()
         .find_map(|cause| cause.downcast_ref::<SupervisedFailure>());
     let task = supervisor.map_or_else(|| "unknown".to_string(), |failure| failure.task.clone());
+    if let Some(failure) = error
+        .chain()
+        .find_map(|cause| cause.downcast_ref::<crate::connector::binance::BinanceTaskFailure>())
+    {
+        return TerminalDiagnostic {
+            component: "binance",
+            task,
+            operation: "stream_task",
+            stage: failure.task(),
+            template_id: "unknown".to_string(),
+            payload_len: "unknown".to_string(),
+            stable_error_code: failure.stable_error_code(),
+            disposition: "fatal_service_exit",
+            state_effect: "process_exit",
+            safe_cause: failure.safe_cause(),
+        };
+    }
     #[cfg(feature = "rithmic")]
     if let Some(failure) = error
         .chain()
@@ -1415,6 +1432,55 @@ mod tests {
                 ),
             ),
         ];
+        for (name, failure, code, cause) in [
+            (
+                "BinanceTaskError",
+                crate::connector::binance::BinanceTaskFailure::task_error(
+                    "trades",
+                    anyhow::anyhow!("provider-secret"),
+                ),
+                "binance_stream_task_failed",
+                "Binance stream task failed",
+            ),
+            (
+                "BinanceUnexpectedExit",
+                crate::connector::binance::BinanceTaskFailure::unexpected_exit("trades"),
+                "binance_stream_task_exited",
+                "Binance stream task exited unexpectedly",
+            ),
+            (
+                "BinancePanicked",
+                crate::connector::binance::BinanceTaskFailure::panicked("trades"),
+                "binance_stream_task_panicked",
+                "Binance stream task panicked",
+            ),
+            (
+                "BinanceCancelled",
+                crate::connector::binance::BinanceTaskFailure::cancelled("trades"),
+                "binance_stream_task_cancelled",
+                "Binance stream task was cancelled",
+            ),
+        ] {
+            cases.push((
+                name,
+                supervised_task_exit_error(
+                    &TaskId::Connector("binance".to_string()),
+                    Err(failure.into()),
+                ),
+                TerminalDiagnostic {
+                    component: "binance",
+                    task: "connector:binance".to_string(),
+                    operation: "stream_task",
+                    stage: "trades",
+                    template_id: "unknown".to_string(),
+                    payload_len: "unknown".to_string(),
+                    stable_error_code: code,
+                    disposition: "fatal_service_exit",
+                    state_effect: "process_exit",
+                    safe_cause: cause,
+                },
+            ));
+        }
         for (name, kind, code, cause) in [
             (
                 "CancelledJoin",
@@ -1520,6 +1586,33 @@ mod tests {
         assert_eq!(fields["disposition"], "fatal_service_exit");
         assert_eq!(fields["state_effect"], "process_exit");
         assert_eq!(fields["safe_cause"], "supervised task failed");
+    }
+
+    #[test]
+    fn binance_internal_task_failure_reports_exact_safe_terminal_fields() {
+        let source = anyhow::anyhow!("provider failure sentinel");
+        let failure = crate::connector::binance::BinanceTaskFailure::task_error("trades", source);
+        let error = supervised_task_exit_error(
+            &TaskId::Connector("binance".to_string()),
+            Err(failure.into()),
+        );
+        let fields = capture_terminal_event(&error);
+
+        assert_eq!(fields.len(), 11);
+        assert_eq!(fields["message"], "FluxTrade terminal failure");
+        assert_eq!(fields["component"], "binance");
+        assert_eq!(fields["task"], "connector:binance");
+        assert_eq!(fields["operation"], "stream_task");
+        assert_eq!(fields["stage"], "trades");
+        assert_eq!(fields["template_id"], "unknown");
+        assert_eq!(fields["payload_len"], "unknown");
+        assert_eq!(fields["stable_error_code"], "binance_stream_task_failed");
+        assert_eq!(fields["disposition"], "fatal_service_exit");
+        assert_eq!(fields["state_effect"], "process_exit");
+        assert_eq!(fields["safe_cause"], "Binance stream task failed");
+        assert!(fields
+            .values()
+            .all(|value| !value.contains("provider failure sentinel")));
     }
 
     #[tokio::test]
