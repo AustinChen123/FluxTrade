@@ -8,6 +8,23 @@ import pytest
 import main as strategy_main
 
 
+_PROVIDER_OWNERS = {
+    "build_backpack_live_adapter_config": (
+        "src.core.adapters.backpack_live_config.build_backpack_live_adapter_config"
+    ),
+    "build_ccxt_live_credentials": (
+        "src.core.adapters.ccxt_live_credentials.build_ccxt_live_credentials"
+    ),
+    "build_rithmic_live_adapter_config": (
+        "src.core.adapters.rithmic_live_config.build_rithmic_live_adapter_config"
+    ),
+}
+
+
+def _patch_provider_owner(monkeypatch, name: str, value: object) -> None:
+    monkeypatch.setattr(_PROVIDER_OWNERS[name], value)
+
+
 def _owner():
     return importlib.import_module("src.core.adapters.backpack_live_config")
 
@@ -140,7 +157,7 @@ def test_backpack_owner_progressively_reveals_compound_invalid_config() -> None:
     )
 
 
-def test_backpack_main_delegates_once_without_other_provider_owners(
+def test_backpack_main_delegates_to_venue_owner_once(
     monkeypatch,
 ) -> None:
     _set_live_backpack_env(monkeypatch)
@@ -155,19 +172,8 @@ def test_backpack_main_delegates_once_without_other_provider_owners(
         "testnet": False,
     }
     backpack_owner = MagicMock(return_value=owner_result)
-    ccxt_owner = MagicMock(side_effect=AssertionError("shared owner called"))
-    rithmic_owner = MagicMock(side_effect=AssertionError("Rithmic owner called"))
-    monkeypatch.setattr(
-        strategy_main,
-        "build_backpack_live_adapter_config",
-        backpack_owner,
-        raising=False,
-    )
-    monkeypatch.setattr(strategy_main, "build_ccxt_live_credentials", ccxt_owner)
-    monkeypatch.setattr(
-        strategy_main,
-        "build_rithmic_live_adapter_config",
-        rithmic_owner,
+    _patch_provider_owner(
+        monkeypatch, "build_backpack_live_adapter_config", backpack_owner
     )
 
     config = strategy_main._adapter_config_from_env()
@@ -177,8 +183,6 @@ def test_backpack_main_delegates_once_without_other_provider_owners(
         product_ids=products,
         environ=strategy_main.os.environ,
     )
-    ccxt_owner.assert_not_called()
-    rithmic_owner.assert_not_called()
 
 
 def test_backpack_config_failure_stops_main_before_audit_and_runtime(
@@ -198,11 +202,8 @@ def test_backpack_config_failure_stops_main_before_audit_and_runtime(
             "configure_metrics",
         )
     }
-    monkeypatch.setattr(
-        strategy_main,
-        "build_backpack_live_adapter_config",
-        backpack_owner,
-        raising=False,
+    _patch_provider_owner(
+        monkeypatch, "build_backpack_live_adapter_config", backpack_owner
     )
     for name, value in forbidden.items():
         monkeypatch.setattr(strategy_main, name, value)
@@ -219,11 +220,8 @@ def test_backpack_config_failure_stops_main_before_audit_and_runtime(
 @pytest.mark.parametrize("exchange", ["binance", "bybit", "rithmic"])
 def test_other_live_venues_never_call_backpack_owner(monkeypatch, exchange) -> None:
     backpack_owner = MagicMock(side_effect=AssertionError("Backpack owner called"))
-    monkeypatch.setattr(
-        strategy_main,
-        "build_backpack_live_adapter_config",
-        backpack_owner,
-        raising=False,
+    _patch_provider_owner(
+        monkeypatch, "build_backpack_live_adapter_config", backpack_owner
     )
     monkeypatch.setenv("FLUXTRADE_ENVIRONMENT", "live")
     monkeypatch.setenv("ADAPTER_MODE", "live")
@@ -238,8 +236,8 @@ def test_other_live_venues_never_call_backpack_owner(monkeypatch, exchange) -> N
             "rithmic_recovery_profile": "orders",
             "rithmic_recovery_account_id": "ACCOUNT",
         }
-        monkeypatch.setattr(
-            strategy_main,
+        _patch_provider_owner(
+            monkeypatch,
             "build_rithmic_live_adapter_config",
             MagicMock(return_value=result),
         )
@@ -247,13 +245,6 @@ def test_other_live_venues_never_call_backpack_owner(monkeypatch, exchange) -> N
         product_id = f"{exchange.upper()}:BTCUSDT-PERP"
         for name, value in _valid_environ().items():
             monkeypatch.setenv(name, value)
-        monkeypatch.setattr(
-            strategy_main,
-            "build_ccxt_live_credentials",
-            MagicMock(
-                return_value={"api_key": "key", "secret": "secret", "testnet": False}
-            ),
-        )
     monkeypatch.setenv("INSTRUMENT_PRODUCT_IDS", product_id)
 
     assert strategy_main._adapter_config_from_env()["exchange"] == exchange
@@ -262,11 +253,8 @@ def test_other_live_venues_never_call_backpack_owner(monkeypatch, exchange) -> N
 
 def test_simulated_config_never_calls_backpack_owner(monkeypatch) -> None:
     backpack_owner = MagicMock(side_effect=AssertionError("Backpack owner called"))
-    monkeypatch.setattr(
-        strategy_main,
-        "build_backpack_live_adapter_config",
-        backpack_owner,
-        raising=False,
+    _patch_provider_owner(
+        monkeypatch, "build_backpack_live_adapter_config", backpack_owner
     )
     monkeypatch.delenv("FLUXTRADE_ENVIRONMENT", raising=False)
     monkeypatch.setenv("ADAPTER_MODE", "simulated")

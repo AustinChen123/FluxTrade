@@ -5,6 +5,7 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 from src import main as strategy_main
+from src.core import adapter_runtime_composition
 
 
 def _forbid_runtime_initialization(monkeypatch) -> dict[str, MagicMock]:
@@ -444,10 +445,8 @@ def test_rithmic_live_config_delegates_to_venue_owner_exactly_once(
     }
     owner = MagicMock(return_value=owner_result)
     monkeypatch.setattr(
-        strategy_main,
-        "build_rithmic_live_adapter_config",
+        "src.core.adapters.rithmic_live_config.build_rithmic_live_adapter_config",
         owner,
-        raising=False,
     )
 
     config = strategy_main._adapter_config_from_env()
@@ -459,7 +458,7 @@ def test_rithmic_live_config_delegates_to_venue_owner_exactly_once(
 
 
 def test_generic_main_has_one_rithmic_policy_entrypoint() -> None:
-    source = inspect.getsource(strategy_main._adapter_config_from_env)
+    source = inspect.getsource(adapter_runtime_composition.build_live_adapter_config)
 
     assert source.count("build_rithmic_live_adapter_config(") == 1
     assert "RITHMIC_" not in source
@@ -472,10 +471,8 @@ def test_generic_main_has_one_rithmic_policy_entrypoint() -> None:
 def test_non_rithmic_config_never_calls_rithmic_owner(monkeypatch, mode) -> None:
     owner = MagicMock(side_effect=AssertionError("Rithmic owner called"))
     monkeypatch.setattr(
-        strategy_main,
-        "build_rithmic_live_adapter_config",
+        "src.core.adapters.rithmic_live_config.build_rithmic_live_adapter_config",
         owner,
-        raising=False,
     )
     monkeypatch.setenv("RITHMIC_ACCOUNT_ID", "MISLEADING")
     if mode == "simulated":
@@ -493,16 +490,12 @@ def test_simulated_config_never_calls_ccxt_credential_owner(monkeypatch) -> None
     owner = MagicMock(side_effect=AssertionError("CCXT credential owner called"))
     rithmic_owner = MagicMock(side_effect=AssertionError("Rithmic owner called"))
     monkeypatch.setattr(
-        strategy_main,
-        "build_ccxt_live_credentials",
+        "src.core.adapters.ccxt_live_credentials.build_ccxt_live_credentials",
         owner,
-        raising=False,
     )
     monkeypatch.setattr(
-        strategy_main,
-        "build_rithmic_live_adapter_config",
+        "src.core.adapters.rithmic_live_config.build_rithmic_live_adapter_config",
         rithmic_owner,
-        raising=False,
     )
     monkeypatch.delenv("FLUXTRADE_ENVIRONMENT", raising=False)
     monkeypatch.setenv("ADAPTER_MODE", "simulated")
@@ -535,16 +528,12 @@ def test_rithmic_config_never_calls_ccxt_credential_owner(
     }
     rithmic_owner = MagicMock(return_value=rithmic_result)
     monkeypatch.setattr(
-        strategy_main,
-        "build_ccxt_live_credentials",
+        "src.core.adapters.ccxt_live_credentials.build_ccxt_live_credentials",
         owner,
-        raising=False,
     )
     monkeypatch.setattr(
-        strategy_main,
-        "build_rithmic_live_adapter_config",
+        "src.core.adapters.rithmic_live_config.build_rithmic_live_adapter_config",
         rithmic_owner,
-        raising=False,
     )
 
     if enable_ws == "enabled":
@@ -611,16 +600,12 @@ def test_non_rithmic_live_config_delegates_to_ccxt_owner_once(
     owner = MagicMock(return_value=owner_result)
     rithmic_owner = MagicMock(side_effect=AssertionError("Rithmic owner called"))
     monkeypatch.setattr(
-        strategy_main,
-        "build_ccxt_live_credentials",
+        "src.core.adapters.ccxt_live_credentials.build_ccxt_live_credentials",
         owner,
-        raising=False,
     )
     monkeypatch.setattr(
-        strategy_main,
-        "build_rithmic_live_adapter_config",
+        "src.core.adapters.rithmic_live_config.build_rithmic_live_adapter_config",
         rithmic_owner,
-        raising=False,
     )
 
     config = strategy_main._adapter_config_from_env()
@@ -643,10 +628,8 @@ def test_ccxt_credential_owner_failure_precedes_audit_and_initialization(
     audit_reader = MagicMock(side_effect=AssertionError("audit read"))
     initialization = _forbid_runtime_initialization(monkeypatch)
     monkeypatch.setattr(
-        strategy_main,
-        "build_ccxt_live_credentials",
+        "src.core.adapters.ccxt_live_credentials.build_ccxt_live_credentials",
         owner,
-        raising=False,
     )
     monkeypatch.setattr(strategy_main, "_required_env_flag", audit_reader)
 
@@ -664,10 +647,8 @@ def test_ambiguous_websocket_precedes_ccxt_credential_owner(monkeypatch) -> None
     monkeypatch.setenv("EXCHANGE_ENABLE_WS", "enabled")
     owner = MagicMock(side_effect=AssertionError("CCXT credential owner called"))
     monkeypatch.setattr(
-        strategy_main,
-        "build_ccxt_live_credentials",
+        "src.core.adapters.ccxt_live_credentials.build_ccxt_live_credentials",
         owner,
-        raising=False,
     )
 
     with pytest.raises(ValueError) as raised:
@@ -717,7 +698,7 @@ def test_optional_account_fields_preserve_raw_truthiness(
 
 
 def test_generic_main_has_one_ccxt_credential_policy_entrypoint() -> None:
-    source = inspect.getsource(strategy_main._adapter_config_from_env)
+    source = inspect.getsource(adapter_runtime_composition.build_live_adapter_config)
 
     assert source.count("build_ccxt_live_credentials(") == 1
     assert "EXCHANGE_API_KEY" not in source
@@ -731,20 +712,12 @@ def test_common_product_failure_precedes_rithmic_owner_and_audit_reader(
     _set_live_rithmic_env(monkeypatch)
     monkeypatch.setenv("INSTRUMENT_PRODUCT_IDS", "BINANCE:BTCUSDT-PERP")
     owner = MagicMock(side_effect=AssertionError("Rithmic owner called"))
-    ccxt_owner = MagicMock(side_effect=AssertionError("CCXT owner called"))
     audit_reader = MagicMock(side_effect=AssertionError("audit read"))
     initialization = _forbid_runtime_initialization(monkeypatch)
     monkeypatch.setattr(
         strategy_main,
-        "build_rithmic_live_adapter_config",
+        "build_live_adapter_config",
         owner,
-        raising=False,
-    )
-    monkeypatch.setattr(
-        strategy_main,
-        "build_ccxt_live_credentials",
-        ccxt_owner,
-        raising=False,
     )
     monkeypatch.setattr(strategy_main, "_required_env_flag", audit_reader)
 
@@ -752,7 +725,6 @@ def test_common_product_failure_precedes_rithmic_owner_and_audit_reader(
         strategy_main.main()
 
     owner.assert_not_called()
-    ccxt_owner.assert_not_called()
     audit_reader.assert_not_called()
     _assert_initialization_not_called(initialization)
 
@@ -764,10 +736,8 @@ def test_rithmic_owner_failure_precedes_audit_and_initialization(monkeypatch) ->
     audit_reader = MagicMock(side_effect=AssertionError("audit read"))
     initialization = _forbid_runtime_initialization(monkeypatch)
     monkeypatch.setattr(
-        strategy_main,
-        "build_rithmic_live_adapter_config",
+        "src.core.adapters.rithmic_live_config.build_rithmic_live_adapter_config",
         owner,
-        raising=False,
     )
     monkeypatch.setattr(strategy_main, "_required_env_flag", audit_reader)
 
@@ -795,10 +765,8 @@ def test_live_audit_failure_precedes_recovery_identity_validation(
     )
     monkeypatch.setattr(strategy_main, "_required_env_flag", lambda _name: False)
     monkeypatch.setattr(
-        strategy_main,
-        "validate_rithmic_recovery_identity",
+        "src.core.adapters.rithmic_live_config.validate_rithmic_recovery_identity",
         validator,
-        raising=False,
     )
 
     with pytest.raises(ValueError, match="live_adapter_requires_audit_external_orders"):
@@ -820,8 +788,7 @@ def test_runtime_validation_delegates_recovery_identity_after_audit(
     sentinel = RuntimeError("rithmic-identity-validator-sentinel")
     validator = MagicMock(side_effect=sentinel)
     monkeypatch.setattr(
-        strategy_main,
-        "validate_rithmic_recovery_identity",
+        "src.core.adapters.rithmic_live_config.validate_rithmic_recovery_identity",
         validator,
     )
 
@@ -1162,6 +1129,7 @@ def test_main_injects_rithmic_runtime_composition_factories(monkeypatch) -> None
     }
     bootstrap_factory = MagicMock()
     capabilities_factory = MagicMock()
+    factory_selector = MagicMock(return_value=(bootstrap_factory, capabilities_factory))
     db_session = MagicMock()
     engine = MagicMock()
     engine.build_stream_channels.return_value = []
@@ -1174,15 +1142,8 @@ def test_main_injects_rithmic_runtime_composition_factories(monkeypatch) -> None
     monkeypatch.setattr(strategy_main, "_required_env_flag", lambda _name: True)
     monkeypatch.setattr(
         strategy_main,
-        "prepare_rithmic_runtime_bootstrap",
-        bootstrap_factory,
-        raising=False,
-    )
-    monkeypatch.setattr(
-        strategy_main,
-        "build_rithmic_runtime_owners",
-        capabilities_factory,
-        raising=False,
+        "runtime_factories_for_config",
+        factory_selector,
     )
     monkeypatch.setattr(
         strategy_main,
@@ -1199,6 +1160,7 @@ def test_main_injects_rithmic_runtime_composition_factories(monkeypatch) -> None
         strategy_main.main()
 
     kwargs = engine_cls.call_args.kwargs
+    factory_selector.assert_called_once_with(adapter_config)
     assert kwargs["adapter"] is adapter
     assert kwargs["runtime_bootstrap_factory"] is bootstrap_factory
     assert kwargs["runtime_capabilities_factory"] is capabilities_factory

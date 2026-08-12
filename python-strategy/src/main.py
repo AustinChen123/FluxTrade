@@ -20,21 +20,11 @@ from src.core.db import SessionLocal
 from src.core.clock import RealtimeClock
 from src.core.metrics import configure_metrics
 from src.core.product_registry import to_exchange_name
-from src.core.adapters.backpack_live_config import (
-    build_backpack_live_adapter_config,
-)
-from src.core.adapters.binance_live_config import build_binance_live_adapter_config
-from src.core.adapters.bybit_live_config import build_bybit_live_adapter_config
-from src.core.adapters.ccxt_live_credentials import build_ccxt_live_credentials
-from src.core.adapters.okx_live_config import build_okx_live_adapter_config
 from src.core.adapters import create_adapter
-from src.core.adapters.rithmic_live_config import (
-    build_rithmic_live_adapter_config,
-    validate_rithmic_recovery_identity,
-)
-from src.core.adapters.rithmic_runtime_composition import (
-    build_rithmic_runtime_owners,
-    prepare_rithmic_runtime_bootstrap,
+from src.core.adapter_runtime_composition import (
+    build_live_adapter_config,
+    runtime_factories_for_config,
+    validate_runtime_config as _validate_runtime_config,
 )
 
 
@@ -193,66 +183,12 @@ def _adapter_config_from_env() -> dict:
             f"INSTRUMENT_PRODUCT_IDS must use {exchange.upper()} venue: "
             f"{', '.join(mismatched_products)}"
         )
-    if exchange == "backpack":
-        return build_backpack_live_adapter_config(
-            product_ids=product_ids,
-            environ=os.environ,
-        )
-    if exchange == "binance":
-        return build_binance_live_adapter_config(
-            product_ids=product_ids,
-            environ=os.environ,
-        )
-    if exchange == "bybit":
-        return build_bybit_live_adapter_config(
-            product_ids=product_ids,
-            environ=os.environ,
-        )
-    if exchange == "okx":
-        return build_okx_live_adapter_config(
-            product_ids=product_ids,
-            environ=os.environ,
-        )
-    account_initialization = {
-        "product_ids": product_ids,
-        "position_mode": os.getenv("ACCOUNT_POSITION_MODE", "one_way"),
-    }
-    leverage = os.getenv("ACCOUNT_LEVERAGE")
-    if leverage:
-        account_initialization["leverage"] = leverage
-    margin_mode = os.getenv("ACCOUNT_MARGIN_MODE")
-    if margin_mode:
-        account_initialization["margin_mode"] = margin_mode
-
-    config = {
-        "mode": "live",
-        "exchange": exchange,
-        "enable_ws": _env_flag("EXCHANGE_ENABLE_WS", False),
-        "instrument_product_ids": product_ids,
-        "account_initialization": account_initialization,
-    }
-    if exchange != "rithmic":
-        config.update(build_ccxt_live_credentials(os.environ))
-        return config
-
-    config.update(
-        build_rithmic_live_adapter_config(
-            product_ids=product_ids,
-            environ=os.environ,
-        )
+    return build_live_adapter_config(
+        exchange=exchange,
+        product_ids=product_ids,
+        environ=os.environ,
+        read_enable_ws=lambda: _env_flag("EXCHANGE_ENABLE_WS", False),
     )
-    return config
-
-
-def _validate_runtime_config(
-    adapter_config: dict, *, audit_external_orders: bool
-) -> None:
-    if adapter_config.get("mode") == "live" and not audit_external_orders:
-        raise ValueError(
-            "live_adapter_requires_audit_external_orders: "
-            "set AUDIT_EXTERNAL_ORDERS=true for live trading"
-        )
-    validate_rithmic_recovery_identity(adapter_config)
 
 
 @contextmanager
@@ -277,11 +213,9 @@ def main():
         audit_external_orders=audit_external_orders,
     )
     strategy_artifact_loader = _strategy_artifact_loader_from_env()
-    runtime_bootstrap_factory = None
-    runtime_capabilities_factory = None
-    if adapter_config.get("exchange") == "rithmic":
-        runtime_bootstrap_factory = prepare_rithmic_runtime_bootstrap
-        runtime_capabilities_factory = build_rithmic_runtime_owners
+    runtime_bootstrap_factory, runtime_capabilities_factory = (
+        runtime_factories_for_config(adapter_config)
+    )
 
     consumer = DataConsumer(
         channels=[],

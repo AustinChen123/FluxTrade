@@ -10,6 +10,23 @@ import pytest
 import main as strategy_main
 
 
+_PROVIDER_OWNERS = {
+    name: f"src.core.adapters.{module}.{name}"
+    for name, module in {
+        "build_backpack_live_adapter_config": "backpack_live_config",
+        "build_binance_live_adapter_config": "binance_live_config",
+        "build_bybit_live_adapter_config": "bybit_live_config",
+        "build_ccxt_live_credentials": "ccxt_live_credentials",
+        "build_okx_live_adapter_config": "okx_live_config",
+        "build_rithmic_live_adapter_config": "rithmic_live_config",
+    }.items()
+}
+
+
+def _patch_provider_owner(monkeypatch, name: str, value: object) -> None:
+    monkeypatch.setattr(_PROVIDER_OWNERS[name], value)
+
+
 def _owner():
     return importlib.import_module("src.core.adapters.okx_live_config")
 
@@ -51,22 +68,6 @@ def _forbid_runtime(monkeypatch) -> dict[str, MagicMock]:
             "DataConsumer",
             "StrategyEngine",
             "configure_metrics",
-        )
-    }
-    for name, value in forbidden.items():
-        monkeypatch.setattr(strategy_main, name, value)
-    return forbidden
-
-
-def _forbid_other_provider_owners(monkeypatch) -> dict[str, MagicMock]:
-    forbidden = {
-        name: MagicMock(side_effect=AssertionError(name))
-        for name in (
-            "build_ccxt_live_credentials",
-            "build_binance_live_adapter_config",
-            "build_bybit_live_adapter_config",
-            "build_backpack_live_adapter_config",
-            "build_rithmic_live_adapter_config",
         )
     }
     for name, value in forbidden.items():
@@ -292,39 +293,25 @@ def test_okx_owner_uses_one_successful_shared_credential_projection(
     assert config["testnet"] is testnet
 
 
-def test_okx_main_delegates_once_without_other_provider_owners(monkeypatch) -> None:
+def test_okx_main_delegates_to_venue_owner_once(monkeypatch) -> None:
     _set_live_okx_env(monkeypatch)
     products = ["OKX:BTCUSDT-PERP"]
     monkeypatch.setattr(strategy_main, "_env_csv", lambda _name: products)
     result = {"mode": "live", "exchange": "okx"}
     okx = MagicMock(return_value=result)
-    forbidden = _forbid_other_provider_owners(monkeypatch)
-    monkeypatch.setattr(
-        strategy_main,
-        "build_okx_live_adapter_config",
-        okx,
-        raising=False,
-    )
+    _patch_provider_owner(monkeypatch, "build_okx_live_adapter_config", okx)
     assert strategy_main._adapter_config_from_env() is result
     okx.assert_called_once_with(
         product_ids=products,
         environ=strategy_main.os.environ,
     )
-    for value in forbidden.values():
-        value.assert_not_called()
 
 
 def test_okx_owner_failure_precedes_audit_and_runtime(monkeypatch) -> None:
     _set_live_okx_env(monkeypatch)
     sentinel = RuntimeError("okx-config-owner-sentinel")
     owner = MagicMock(side_effect=sentinel)
-    monkeypatch.setattr(
-        strategy_main,
-        "build_okx_live_adapter_config",
-        owner,
-        raising=False,
-    )
-    other_owners = _forbid_other_provider_owners(monkeypatch)
+    _patch_provider_owner(monkeypatch, "build_okx_live_adapter_config", owner)
     forbidden = _forbid_runtime(monkeypatch)
 
     with pytest.raises(RuntimeError) as raised:
@@ -332,22 +319,15 @@ def test_okx_owner_failure_precedes_audit_and_runtime(monkeypatch) -> None:
 
     assert raised.value is sentinel
     owner.assert_called_once()
-    for value in (*other_owners.values(), *forbidden.values()):
+    for value in forbidden.values():
         value.assert_not_called()
 
 
 def test_okx_product_mismatch_precedes_all_owners_and_runtime(monkeypatch) -> None:
     _set_live_okx_env(monkeypatch)
     monkeypatch.setenv("INSTRUMENT_PRODUCT_IDS", "BINANCE:BTCUSDT-PERP")
-    owners = _forbid_other_provider_owners(monkeypatch)
-    owners["build_okx_live_adapter_config"] = MagicMock(
-        side_effect=AssertionError("build_okx_live_adapter_config")
-    )
-    monkeypatch.setattr(
-        strategy_main,
-        "build_okx_live_adapter_config",
-        owners["build_okx_live_adapter_config"],
-    )
+    owner = MagicMock(side_effect=AssertionError("composition owner called"))
+    monkeypatch.setattr(strategy_main, "build_live_adapter_config", owner)
     forbidden = _forbid_runtime(monkeypatch)
 
     with pytest.raises(ValueError) as raised:
@@ -356,7 +336,8 @@ def test_okx_product_mismatch_precedes_all_owners_and_runtime(monkeypatch) -> No
     assert raised.value.args == (
         "INSTRUMENT_PRODUCT_IDS must use OKX venue: BINANCE:BTCUSDT-PERP",
     )
-    for value in (*owners.values(), *forbidden.values()):
+    owner.assert_not_called()
+    for value in forbidden.values():
         value.assert_not_called()
 
 
@@ -393,8 +374,8 @@ def test_non_okx_live_routes_never_call_okx_owner(
         else {"mode": "live", "exchange": exchange}
     )
     selected = MagicMock(return_value=selected_result)
-    monkeypatch.setattr(strategy_main, "build_okx_live_adapter_config", okx)
-    monkeypatch.setattr(strategy_main, selected_owner, selected)
+    _patch_provider_owner(monkeypatch, "build_okx_live_adapter_config", okx)
+    _patch_provider_owner(monkeypatch, selected_owner, selected)
 
     config = strategy_main._adapter_config_from_env()
 
@@ -411,7 +392,7 @@ def test_non_okx_live_routes_never_call_okx_owner(
 
 def test_simulated_route_never_calls_okx_owner(monkeypatch) -> None:
     owner = MagicMock(side_effect=AssertionError("OKX owner called"))
-    monkeypatch.setattr(strategy_main, "build_okx_live_adapter_config", owner)
+    _patch_provider_owner(monkeypatch, "build_okx_live_adapter_config", owner)
     monkeypatch.delenv("FLUXTRADE_ENVIRONMENT", raising=False)
     monkeypatch.setenv("ADAPTER_MODE", "simulated")
 

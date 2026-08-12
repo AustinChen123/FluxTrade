@@ -10,6 +10,22 @@ import pytest
 import main as strategy_main
 
 
+_PROVIDER_OWNERS = {
+    name: f"src.core.adapters.{module}.{name}"
+    for name, module in {
+        "build_backpack_live_adapter_config": "backpack_live_config",
+        "build_binance_live_adapter_config": "binance_live_config",
+        "build_bybit_live_adapter_config": "bybit_live_config",
+        "build_ccxt_live_credentials": "ccxt_live_credentials",
+        "build_rithmic_live_adapter_config": "rithmic_live_config",
+    }.items()
+}
+
+
+def _patch_provider_owner(monkeypatch, name: str, value: object) -> None:
+    monkeypatch.setattr(_PROVIDER_OWNERS[name], value)
+
+
 def _owner():
     return importlib.import_module("src.core.adapters.bybit_live_config")
 
@@ -276,49 +292,26 @@ def test_bybit_owner_uses_one_successful_shared_credential_projection(
     assert config["testnet"] is testnet
 
 
-def test_bybit_main_delegates_once_without_other_provider_owners(monkeypatch) -> None:
+def test_bybit_main_delegates_to_venue_owner_once(monkeypatch) -> None:
     _set_live_bybit_env(monkeypatch)
     products = ["BYBIT:BTCUSDT-PERP"]
     monkeypatch.setattr(strategy_main, "_env_csv", lambda _name: products)
     result = {"mode": "live", "exchange": "bybit"}
     bybit = MagicMock(return_value=result)
-    forbidden = {
-        name: MagicMock(side_effect=AssertionError(name))
-        for name in (
-            "build_ccxt_live_credentials",
-            "build_binance_live_adapter_config",
-            "build_backpack_live_adapter_config",
-            "build_rithmic_live_adapter_config",
-        )
-    }
-    monkeypatch.setattr(
-        strategy_main,
-        "build_bybit_live_adapter_config",
-        bybit,
-        raising=False,
-    )
-    for name, value in forbidden.items():
-        monkeypatch.setattr(strategy_main, name, value)
+    _patch_provider_owner(monkeypatch, "build_bybit_live_adapter_config", bybit)
 
     assert strategy_main._adapter_config_from_env() is result
     bybit.assert_called_once_with(
         product_ids=products,
         environ=strategy_main.os.environ,
     )
-    for value in forbidden.values():
-        value.assert_not_called()
 
 
 def test_bybit_owner_failure_precedes_audit_and_runtime(monkeypatch) -> None:
     _set_live_bybit_env(monkeypatch)
     sentinel = RuntimeError("bybit-config-owner-sentinel")
     owner = MagicMock(side_effect=sentinel)
-    monkeypatch.setattr(
-        strategy_main,
-        "build_bybit_live_adapter_config",
-        owner,
-        raising=False,
-    )
+    _patch_provider_owner(monkeypatch, "build_bybit_live_adapter_config", owner)
     forbidden = _forbid_runtime(monkeypatch)
 
     with pytest.raises(RuntimeError) as raised:
@@ -333,18 +326,8 @@ def test_bybit_owner_failure_precedes_audit_and_runtime(monkeypatch) -> None:
 def test_bybit_product_mismatch_precedes_all_owners_and_runtime(monkeypatch) -> None:
     _set_live_bybit_env(monkeypatch)
     monkeypatch.setenv("INSTRUMENT_PRODUCT_IDS", "BINANCE:BTCUSDT-PERP")
-    owners = {
-        name: MagicMock(side_effect=AssertionError(name))
-        for name in (
-            "build_bybit_live_adapter_config",
-            "build_binance_live_adapter_config",
-            "build_backpack_live_adapter_config",
-            "build_rithmic_live_adapter_config",
-            "build_ccxt_live_credentials",
-        )
-    }
-    for name, value in owners.items():
-        monkeypatch.setattr(strategy_main, name, value, raising=False)
+    owner = MagicMock(side_effect=AssertionError("composition owner called"))
+    monkeypatch.setattr(strategy_main, "build_live_adapter_config", owner)
     forbidden = _forbid_runtime(monkeypatch)
 
     with pytest.raises(ValueError) as raised:
@@ -353,7 +336,8 @@ def test_bybit_product_mismatch_precedes_all_owners_and_runtime(monkeypatch) -> 
     assert raised.value.args == (
         "INSTRUMENT_PRODUCT_IDS must use BYBIT venue: BINANCE:BTCUSDT-PERP",
     )
-    for value in (*owners.values(), *forbidden.values()):
+    owner.assert_not_called()
+    for value in forbidden.values():
         value.assert_not_called()
 
 

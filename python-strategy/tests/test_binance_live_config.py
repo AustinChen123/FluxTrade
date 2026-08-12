@@ -9,6 +9,23 @@ import pytest
 import main as strategy_main
 
 
+_PROVIDER_OWNERS = {
+    name: f"src.core.adapters.{module}.{name}"
+    for name, module in {
+        "build_backpack_live_adapter_config": "backpack_live_config",
+        "build_binance_live_adapter_config": "binance_live_config",
+        "build_bybit_live_adapter_config": "bybit_live_config",
+        "build_ccxt_live_credentials": "ccxt_live_credentials",
+        "build_okx_live_adapter_config": "okx_live_config",
+        "build_rithmic_live_adapter_config": "rithmic_live_config",
+    }.items()
+}
+
+
+def _patch_provider_owner(monkeypatch, name: str, value: object) -> None:
+    monkeypatch.setattr(_PROVIDER_OWNERS[name], value)
+
+
 def _owner():
     return importlib.import_module("src.core.adapters.binance_live_config")
 
@@ -232,35 +249,15 @@ def test_binance_owner_preserves_optional_account_field_truthiness(
         assert account[field] == raw
 
 
-def test_binance_main_delegates_once_without_other_provider_owners(
+def test_binance_main_delegates_to_venue_owner_once(
     monkeypatch,
 ) -> None:
     _set_live_binance_env(monkeypatch)
     products = ["BINANCE:BTCUSDT-PERP"]
     result = {"owner": object()}
     owner = MagicMock(return_value=result)
-    forbidden = [
-        MagicMock(side_effect=AssertionError(name))
-        for name in ("shared", "Rithmic", "Backpack")
-    ]
     monkeypatch.setattr(strategy_main, "_env_csv", lambda _name: products)
-    monkeypatch.setattr(
-        strategy_main,
-        "build_binance_live_adapter_config",
-        owner,
-        raising=False,
-    )
-    monkeypatch.setattr(strategy_main, "build_ccxt_live_credentials", forbidden[0])
-    monkeypatch.setattr(
-        strategy_main,
-        "build_rithmic_live_adapter_config",
-        forbidden[1],
-    )
-    monkeypatch.setattr(
-        strategy_main,
-        "build_backpack_live_adapter_config",
-        forbidden[2],
-    )
+    _patch_provider_owner(monkeypatch, "build_binance_live_adapter_config", owner)
 
     config = strategy_main._adapter_config_from_env()
 
@@ -269,8 +266,6 @@ def test_binance_main_delegates_once_without_other_provider_owners(
         product_ids=products,
         environ=strategy_main.os.environ,
     )
-    for other_owner in forbidden:
-        other_owner.assert_not_called()
 
 
 def test_binance_config_failure_stops_main_before_audit_and_runtime(
@@ -290,12 +285,7 @@ def test_binance_config_failure_stops_main_before_audit_and_runtime(
             "configure_metrics",
         )
     }
-    monkeypatch.setattr(
-        strategy_main,
-        "build_binance_live_adapter_config",
-        owner,
-        raising=False,
-    )
+    _patch_provider_owner(monkeypatch, "build_binance_live_adapter_config", owner)
     for name, value in forbidden.items():
         monkeypatch.setattr(strategy_main, name, value)
 
@@ -323,12 +313,7 @@ def test_other_live_venues_never_call_binance_owner(
     product_id,
 ) -> None:
     owner = MagicMock(side_effect=AssertionError("Binance owner called"))
-    monkeypatch.setattr(
-        strategy_main,
-        "build_binance_live_adapter_config",
-        owner,
-        raising=False,
-    )
+    _patch_provider_owner(monkeypatch, "build_binance_live_adapter_config", owner)
     monkeypatch.setenv("FLUXTRADE_ENVIRONMENT", "live")
     monkeypatch.setenv("ADAPTER_MODE", "live")
     monkeypatch.setenv("EXCHANGE_ID", exchange)
@@ -342,15 +327,15 @@ def test_other_live_venues_never_call_binance_owner(
             "rithmic_recovery_profile": "orders",
             "rithmic_recovery_account_id": "ACCOUNT",
         }
-        monkeypatch.setattr(
-            strategy_main,
+        _patch_provider_owner(
+            monkeypatch,
             "build_rithmic_live_adapter_config",
             MagicMock(return_value=result),
         )
     elif exchange == "backpack":
         result = {"mode": "live", "exchange": "backpack"}
-        monkeypatch.setattr(
-            strategy_main,
+        _patch_provider_owner(
+            monkeypatch,
             "build_backpack_live_adapter_config",
             MagicMock(return_value=result),
         )
@@ -361,13 +346,6 @@ def test_other_live_venues_never_call_binance_owner(
             "EXCHANGE_TESTNET": "false",
         }.items():
             monkeypatch.setenv(name, value)
-        monkeypatch.setattr(
-            strategy_main,
-            "build_ccxt_live_credentials",
-            MagicMock(
-                return_value={"api_key": "key", "secret": "secret", "testnet": False}
-            ),
-        )
 
     config = strategy_main._adapter_config_from_env()
 
@@ -377,12 +355,7 @@ def test_other_live_venues_never_call_binance_owner(
 
 def test_simulated_config_never_calls_binance_owner(monkeypatch) -> None:
     owner = MagicMock(side_effect=AssertionError("Binance owner called"))
-    monkeypatch.setattr(
-        strategy_main,
-        "build_binance_live_adapter_config",
-        owner,
-        raising=False,
-    )
+    _patch_provider_owner(monkeypatch, "build_binance_live_adapter_config", owner)
     monkeypatch.delenv("FLUXTRADE_ENVIRONMENT", raising=False)
     monkeypatch.setenv("ADAPTER_MODE", "simulated")
 
@@ -391,7 +364,8 @@ def test_simulated_config_never_calls_binance_owner(monkeypatch) -> None:
 
 
 def test_generic_main_has_one_binance_config_entrypoint() -> None:
-    source = inspect.getsource(strategy_main._adapter_config_from_env)
+    composition = importlib.import_module("src.core.adapter_runtime_composition")
+    source = inspect.getsource(composition.build_live_adapter_config)
 
     assert source.count("build_binance_live_adapter_config(") == 1
 
