@@ -15,8 +15,10 @@ class _MockClock(Clock):
 
 def _make_engine():
     """Create a StrategyEngine with mocked dependencies (no real Redis/DB)."""
-    with patch("src.core.engine.create_redis_client") as mock_factory, \
-         patch("src.core.engine.create_simulated_adapter") as mock_create_adapter:
+    with (
+        patch("src.core.engine.create_redis_client") as mock_factory,
+        patch("src.core.engine.create_simulated_adapter") as mock_create_adapter,
+    ):
         mock_factory.return_value = MagicMock()
         mock_create_adapter.return_value = MagicMock()
 
@@ -49,7 +51,9 @@ class TestEngineShutdown:
         engine = _make_engine()
         engine.executor = MagicMock(spec=ThreadPoolExecutor)
         engine.shutdown()
-        engine.executor.shutdown.assert_called_once_with(wait=True, cancel_futures=False)
+        engine.executor.shutdown.assert_called_once_with(
+            wait=True, cancel_futures=False
+        )
 
     def test_shutdown_joins_heartbeat_thread(self):
         engine = _make_engine()
@@ -132,14 +136,18 @@ class TestEngineShutdown:
 
         engine.ops_safety.persist_engine_boot_state.assert_not_called()
 
-    def test_halted_or_recovery_pending_boot_is_never_marked_clean(self):
-        for halted, recovery_pending in ((True, False), (False, True)):
+    def test_unsafe_boot_is_never_marked_clean(self):
+        for boot_started, halted, recovery_pending in (
+            (False, False, False),
+            (True, True, False),
+            (True, False, True),
+        ):
             engine = _make_engine()
-            engine._boot_started = True
+            engine._boot_started = boot_started
             engine._kill_switch_halted = halted
             engine.ops_safety._recovery_pending = recovery_pending
             engine.ops_safety.persist_engine_boot_state = MagicMock()
 
-            engine.shutdown()
+            engine.shutdown(clean_exit=True)
 
             engine.ops_safety.persist_engine_boot_state.assert_not_called()

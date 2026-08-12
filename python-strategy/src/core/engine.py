@@ -52,6 +52,7 @@ from src.core.command_router import CommandRouter
 from src.core.health_monitor import HealthMonitor
 from src.core.engine_heartbeat_service import EngineHeartbeatService
 from src.core.engine_boot_state_service import EngineBootStateService
+from src.core.engine_shutdown import EngineShutdownService
 from src.core.engine_runtime_reconciliation_service import (
     EngineRuntimeReconciliationService,
 )
@@ -568,6 +569,34 @@ class StrategyEngine:
                 )
             ),
             assert_leadership=lambda: self._assert_runtime_leadership(),
+            event_logger=logger,
+        )
+        self._shutdown_service = EngineShutdownService(
+            mark_stopping=self._mark_stopping_for_shutdown,
+            shutdown_executor=lambda: self.executor.shutdown(
+                wait=True,
+                cancel_futures=False,
+            ),
+            thread_loaders=(
+                lambda: self.heartbeat_thread,
+                lambda: self.command_thread,
+                lambda: self.runtime_reconcile_thread,
+                lambda: self.order_event_thread,
+            ),
+            adapter_loader=lambda: self.execution_engine.adapter,
+            shutdown_strategy_state=lambda: self._strategy_state_manager.shutdown(),
+            clean_persistence_allowed=lambda: (
+                self._boot_started
+                and not self._kill_switch_halted
+                and not self.ops_safety.recovery_pending
+            ),
+            persist_clean=lambda: self._boot_state_service.persist("CLEAN"),
+            close_redis=lambda: self.redis_client.close(),
+            close_entry_gate=lambda: (
+                self._entry_admission_gate.close()
+                if self._entry_admission_gate is not None
+                else None
+            ),
             event_logger=logger,
         )
 
@@ -1584,42 +1613,9 @@ class StrategyEngine:
         clean_exit: bool = False,
     ):
         """Graceful shutdown: stop threads, drain executor, close Redis."""
-        logger.info("StrategyEngine shutting down...")
+        self._shutdown_service.shutdown(timeout=timeout, clean_exit=clean_exit)
+
+    def _mark_stopping_for_shutdown(self) -> None:
         self.running = False
         self._runtime_reconcile_stop.set()
         self._order_event_stop.set()
-
-        self.executor.shutdown(wait=True, cancel_futures=False)
-
-        if self.heartbeat_thread and self.heartbeat_thread.is_alive():
-            self.heartbeat_thread.join(timeout=timeout)
-        if self.command_thread and self.command_thread.is_alive():
-            self.command_thread.join(timeout=timeout)
-        if self.runtime_reconcile_thread and self.runtime_reconcile_thread.is_alive():
-            self.runtime_reconcile_thread.join(timeout=timeout)
-        if self.order_event_thread and self.order_event_thread.is_alive():
-            self.order_event_thread.join(timeout=timeout)
-
-        close_adapter = getattr(self.execution_engine.adapter, "close", None)
-        if callable(close_adapter):
-            close_adapter()
-
-        self._strategy_state_manager.shutdown()
-
-        if (
-            clean_exit
-            and self._boot_started
-            and not self._kill_switch_halted
-            and not self.ops_safety.recovery_pending
-        ):
-            self._boot_state_service.persist("CLEAN")
-
-        try:
-            self.redis_client.close()
-        except Exception as e:
-            logger.warning("Error closing Redis: %s", e)
-
-        if self._entry_admission_gate is not None:
-            self._entry_admission_gate.close()
-
-        logger.info("StrategyEngine shutdown complete.")
