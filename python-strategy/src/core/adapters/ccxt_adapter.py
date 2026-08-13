@@ -461,7 +461,11 @@ class CcxtExchangeAdapter(IExchangeAdapter):
         except ccxt.BaseError as e:
             raise ExchangeError(f"Failed to fetch balance: {e}") from e
 
-    def get_position(self, product_id: str) -> Optional[Position]:
+    def get_position(
+        self,
+        product_id: str,
+        strategy_id: str | None = None,
+    ) -> Optional[Position]:
         ccxt_symbol = to_ccxt_symbol(product_id)
         try:
             positions = self.client.fetch_positions([ccxt_symbol])

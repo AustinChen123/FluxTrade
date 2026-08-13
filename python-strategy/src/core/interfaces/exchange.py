@@ -259,12 +259,18 @@ class IExchangeAdapter(ABC):
         pass
 
     @abstractmethod
-    def get_position(self, product_id: str) -> Optional[Position]:
+    def get_position(
+        self,
+        product_id: str,
+        strategy_id: str | None = None,
+    ) -> Optional[Position]:
         """
         Retrieves the current open position for a product.
 
         Args:
             product_id: The product/symbol identifier.
+            strategy_id: Optional strategy identity for adapters that maintain
+                strategy-scoped positions. Account-net live adapters ignore it.
 
         Returns:
             Optional[Position]: The position details (Pydantic model) or None if no position.

@@ -339,6 +339,31 @@ class TestQuantityHandling:
 
         assert mock_exchange_adapter.open_orders[0].quantity == Decimal("0.25")
 
+    def test_position_lookup_passes_strategy_hint_to_capable_adapter(
+        self,
+        execution_engine,
+        signal_factory,
+    ):
+        position = Position(
+            strategy_id="test-strategy",
+            product_id="BINANCE:BTCUSDT-PERP",
+            side=PositionSide.LONG,
+            quantity=Decimal("0.25"),
+            entry_price=Decimal("42000"),
+            unrealized_pnl=Decimal("0"),
+        )
+        execution_engine.adapter.get_position = MagicMock(return_value=position)
+        signal = signal_factory(
+            signal_type=SignalType.EXIT_LONG,
+            product_id="BINANCE:BTCUSDT-PERP",
+        )
+
+        assert execution_engine._load_strategy_position(signal) is position
+        execution_engine.adapter.get_position.assert_called_once_with(
+            "BINANCE:BTCUSDT-PERP",
+            strategy_id=signal.strategy_id,
+        )
+
     def test_exit_quantity_is_capped_to_current_position(
         self,
         execution_engine,
@@ -1093,6 +1118,25 @@ def test_portfolio_exposure_snapshot_rejects_replay_intent_identity_mismatch(
 
 class TestAdapterDelegation:
     """Tests for adapter order placement."""
+
+    def test_ops_strategy_requires_database_session(
+        self,
+        mock_clock,
+        mock_exchange_adapter,
+        mock_order_repo,
+    ):
+        engine = ExecutionEngine(
+            db_session=None,
+            clock=mock_clock,
+            adapter=mock_exchange_adapter,
+            order_repository=mock_order_repo,
+        )
+
+        with pytest.raises(
+            RuntimeError,
+            match="ExecutionEngine requires a database session",
+        ):
+            engine._ensure_ops_strategy()
 
     def test_order_sent_to_adapter(self, execution_engine, signal_factory, mock_exchange_adapter):
         """Order should be sent to adapter for execution."""

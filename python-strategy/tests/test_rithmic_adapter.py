@@ -1523,7 +1523,7 @@ def test_account_queries_remain_explicitly_unavailable(adapter):
     with pytest.raises(ExchangeError, match="balance_unavailable"):
         adapter.get_balance("USD")
     with pytest.raises(ExchangeError, match="position_unavailable"):
-        adapter.get_position(PRODUCT_ID)
+        adapter.get_position(PRODUCT_ID, strategy_id="ignored-by-account-net-adapter")
 
 
 def test_factory_selects_rithmic_without_starting_network_runtime():

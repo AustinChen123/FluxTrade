@@ -146,38 +146,68 @@ class Strategy(Base):
     configuration_json = Column(Text, nullable=True)
 
 class Order(Base):
-    __tablename__ = 'order'
-    id = Column(String, primary_key=True)
-    exchange_order_id = Column(String, nullable=True)
-    strategy_id = Column(String, ForeignKey('strategy.id'), nullable=False)
-    product_id = Column(String, ForeignKey('product.id'), nullable=False)
-    exchange_id = Column(String, ForeignKey('exchange.id'), nullable=False)
-    account_profile = Column(String(128), nullable=True)
-    account_id = Column(String(128), nullable=True)
-    type = Column(String, nullable=False)
-    side = Column(String, nullable=False)
-    price = Column(Numeric, nullable=True)
-    trigger_price = Column(Numeric, nullable=True)
-    quantity = Column(Numeric, nullable=False)
-    status = Column(String, nullable=False)
-    timestamp = Column(BigInteger, nullable=False)
-    filled_quantity = Column(Numeric, nullable=True, default=0)
-    filled_price = Column(Numeric, nullable=True)
+    __tablename__ = "order"
+    id: Mapped[str] = mapped_column(String, primary_key=True)
+    exchange_order_id: Mapped[str | None] = mapped_column(String, nullable=True)
+    strategy_id: Mapped[str] = mapped_column(
+        String,
+        ForeignKey("strategy.id"),
+        nullable=False,
+    )
+    product_id: Mapped[str] = mapped_column(
+        String,
+        ForeignKey("product.id"),
+        nullable=False,
+    )
+    exchange_id: Mapped[str] = mapped_column(
+        String,
+        ForeignKey("exchange.id"),
+        nullable=False,
+    )
+    account_profile: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    account_id: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    type: Mapped[str] = mapped_column(String, nullable=False)
+    side: Mapped[str] = mapped_column(String, nullable=False)
+    price: Mapped[Decimal | None] = mapped_column(Numeric, nullable=True)
+    trigger_price: Mapped[Decimal | None] = mapped_column(Numeric, nullable=True)
+    quantity: Mapped[Decimal] = mapped_column(Numeric, nullable=False)
+    status: Mapped[str] = mapped_column(String, nullable=False)
+    timestamp: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    filled_quantity: Mapped[Decimal | None] = mapped_column(
+        Numeric,
+        nullable=True,
+        default=0,
+    )
+    filled_price: Mapped[Decimal | None] = mapped_column(Numeric, nullable=True)
 
     # Migration 5 — idempotency / lifecycle columns.
-    client_order_id = Column(String(128), nullable=True)
-    intent_payload = Column(JSONB, nullable=True)
-    submitted_at = Column(DateTime(timezone=True), nullable=True)
-    acked_at = Column(DateTime(timezone=True), nullable=True)
-    last_reconciled_at = Column(DateTime(timezone=True), nullable=True)
+    client_order_id: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    intent_payload: Mapped[dict[str, object] | None] = mapped_column(
+        JSONB,
+        nullable=True,
+    )
+    submitted_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True),
+        nullable=True,
+    )
+    acked_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True),
+        nullable=True,
+    )
+    last_reconciled_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True),
+        nullable=True,
+    )
 
     __table_args__ = (
-        UniqueConstraint('exchange_order_id', 'exchange_id', name='uq_order_exchange_id'),
+        UniqueConstraint(
+            "exchange_order_id", "exchange_id", name="uq_order_exchange_id"
+        ),
         CheckConstraint(
             "(account_profile IS NULL AND account_id IS NULL) OR "
             "(account_profile IS NOT NULL AND account_id IS NOT NULL AND "
             "TRIM(account_profile) <> '' AND TRIM(account_id) <> '')",
-            name='chk_order_account_identity_complete',
+            name="chk_order_account_identity_complete",
         ),
     )
 

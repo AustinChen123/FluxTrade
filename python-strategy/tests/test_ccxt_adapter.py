@@ -1371,7 +1371,10 @@ class TestGetPosition:
                 "unrealizedPnl": 100,
             }
         ]
-        pos = adapter.get_position("BINANCE:BTCUSDT-PERP")
+        pos = adapter.get_position(
+            "BINANCE:BTCUSDT-PERP",
+            strategy_id="ignored-by-account-net-adapter",
+        )
         assert pos is not None
         assert pos.side == "LONG"
         assert pos.quantity == Decimal("0.5")

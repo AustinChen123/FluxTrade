@@ -416,7 +416,11 @@ class RithmicExchangeAdapter(IExchangeAdapter):
     def get_balance(self, asset: str) -> Decimal:
         raise ExchangeError("rithmic_live_balance_unavailable")
 
-    def get_position(self, product_id: str) -> Position | None:
+    def get_position(
+        self,
+        product_id: str,
+        strategy_id: str | None = None,
+    ) -> Position | None:
         self.get_instrument_spec(product_id)
         raise ExchangeError("rithmic_live_position_unavailable")
 

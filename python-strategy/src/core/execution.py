@@ -949,6 +949,8 @@ class ExecutionEngine:
             with self._db_session_factory() as session:
                 ensure(session)
             return
+        if self._db_session is None:
+            raise RuntimeError("ExecutionEngine requires a database session")
         ensure(self._db_session)
 
     def halt_and_drain(self, timeout: float = 30.0) -> bool:
@@ -1048,9 +1050,13 @@ class ExecutionEngine:
             return None
         try:
             self._assert_external_operation_allowed()
-            signal = self._normalize_signal_quantity_or_reject(signal, candle)
-            if signal is None:
+            normalized_signal = self._normalize_signal_quantity_or_reject(
+                signal,
+                candle,
+            )
+            if normalized_signal is None:
                 return None
+            signal = normalized_signal
             exit_decision = self._classify_exit_signal(signal)
             if exit_decision is not None and not exit_decision.allowed:
                 self.logger.warning(
