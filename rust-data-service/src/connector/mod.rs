@@ -3,6 +3,7 @@ use anyhow::Result;
 pub mod backpack;
 pub mod binance;
 pub mod bybit;
+pub(crate) mod emergency;
 #[cfg(feature = "rithmic")]
 pub mod rithmic;
 pub mod ws;

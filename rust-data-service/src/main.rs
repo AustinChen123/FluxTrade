@@ -7,13 +7,11 @@ mod publisher;
 mod watchdog;
 
 use crate::aggregator::CandleAggregator;
-use crate::connector::backpack::BackpackConnector;
 use crate::model::UserStreamEvent;
 use crate::publisher::{
     create_publish_channel, PublishSender, RedisPublisher, DEFAULT_CHANNEL_CAPACITY,
 };
 
-use anyhow::Context;
 use clap::{Parser, Subcommand};
 use dotenvy::dotenv;
 use std::process::ExitCode;
@@ -794,7 +792,7 @@ async fn run_live_mode(
         .map(crate::connector::rithmic::live::ResolvedLiveOptions::watchdog_identity);
     #[cfg(not(feature = "rithmic"))]
     let rithmic_watchdog_identity = None;
-    let watchdog_mitigation = resolve_emergency_mitigation(
+    let watchdog_mitigation = crate::connector::emergency::resolve(
         &watchdog_environment,
         execution_venue.as_deref(),
         rithmic_watchdog_identity,
@@ -942,37 +940,6 @@ async fn run_live_mode(
     info!("FluxTrade Data Service stopped.");
 
     Ok(())
-}
-
-fn resolve_emergency_mitigation(
-    environment: &crate::environment::RuntimeEnvironment,
-    execution_venue: Option<&str>,
-    rithmic_identity: Option<(&str, &str)>,
-) -> anyhow::Result<crate::watchdog::EmergencyMitigation> {
-    #[cfg(not(feature = "rithmic"))]
-    let _ = rithmic_identity;
-    if !environment.allows_external_kill() {
-        return Ok(crate::watchdog::EmergencyMitigation::LockdownOnly);
-    }
-    let venue = execution_venue
-        .context("EXCHANGE_ID must be set explicitly in live")?
-        .trim()
-        .to_ascii_lowercase();
-    match venue.as_str() {
-        "backpack" => Ok(crate::watchdog::EmergencyMitigation::Backpack(
-            BackpackConnector::new(),
-        )),
-        #[cfg(feature = "rithmic")]
-        "rithmic" => {
-            let (profile, account_id) =
-                rithmic_identity.context("Rithmic watchdog requires live Rithmic configuration")?;
-            Ok(crate::watchdog::EmergencyMitigation::Rithmic {
-                profile: profile.to_string(),
-                account_id: account_id.to_string(),
-            })
-        }
-        _ => anyhow::bail!("unsupported emergency execution venue: {venue}"),
-    }
 }
 
 /// Run the main event loop: receives trades/candles/user events from connectors,
@@ -1172,7 +1139,6 @@ fn preflight_user_stream_credentials(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::environment::RuntimeEnvironment;
     use futures_util::FutureExt;
     use std::process::Command;
     use std::sync::Mutex;
@@ -1765,58 +1731,25 @@ mod tests {
     }
 
     #[test]
-    fn non_live_watchdog_never_builds_external_mitigation() {
-        let mitigation = resolve_emergency_mitigation(
-            &RuntimeEnvironment::new("test").unwrap(),
-            Some("backpack"),
-            None,
-        )
-        .unwrap();
-
-        assert!(matches!(
-            mitigation,
-            crate::watchdog::EmergencyMitigation::LockdownOnly
-        ));
-    }
-
-    #[test]
-    fn live_watchdog_requires_supported_explicit_execution_venue() {
-        let environment = RuntimeEnvironment::new("live").unwrap();
-
-        assert!(resolve_emergency_mitigation(&environment, None, None)
-            .err()
+    fn emergency_mitigation_is_connector_owned() {
+        let main_source = include_str!("main.rs");
+        let watchdog_source = include_str!("watchdog.rs");
+        let owner_source = include_str!("connector/emergency.rs");
+        let main_product = main_source
+            .rsplit_once("\n#[cfg(test)]\nmod tests {")
             .unwrap()
-            .to_string()
-            .contains("EXCHANGE_ID"));
-        assert!(
-            resolve_emergency_mitigation(&environment, Some("binance"), None)
-                .err()
-                .unwrap()
-                .to_string()
-                .contains("unsupported emergency execution venue")
-        );
-    }
+            .0;
+        let watchdog_product = watchdog_source
+            .rsplit_once("\n#[cfg(test)]\nmod tests {")
+            .unwrap()
+            .0;
 
-    #[cfg(feature = "rithmic")]
-    #[test]
-    fn live_rithmic_watchdog_preserves_exact_profile_and_account() {
-        let mitigation = resolve_emergency_mitigation(
-            &RuntimeEnvironment::new("live").unwrap(),
-            Some("RITHMIC"),
-            Some(("profile-a", "TEST_ACCOUNT_001")),
-        )
-        .unwrap();
-
-        match mitigation {
-            crate::watchdog::EmergencyMitigation::Rithmic {
-                profile,
-                account_id,
-            } => {
-                assert_eq!(profile, "profile-a");
-                assert_eq!(account_id, "TEST_ACCOUNT_001");
-            }
-            _ => panic!("expected Rithmic emergency mitigation"),
-        }
+        assert!(!main_product.contains("BackpackConnector"));
+        assert!(!main_product.contains("fn resolve_emergency_mitigation"));
+        assert!(!watchdog_product.contains("crate::connector::backpack"));
+        assert!(!watchdog_product.contains("crate::connector::rithmic"));
+        assert!(owner_source.contains("pub(crate) fn resolve"));
+        assert!(owner_source.contains("pub(crate) async fn run"));
     }
 
     #[test]
