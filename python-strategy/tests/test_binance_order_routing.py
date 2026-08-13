@@ -10,9 +10,9 @@ import pytest
 
 import src.core.adapters.ccxt_adapter as ccxt_adapter_module
 import src.core.adapters.live_binance as live_binance_module
+from src.core.adapters.binance_client_order_id import to_binance_client_order_id
 from src.core.adapters.ccxt_adapter import CcxtExchangeAdapter
 from src.core.adapters.live_binance import LiveBinanceAdapter
-from src.core.client_order_id import to_exchange_format
 from src.core.interfaces.exchange import ExchangeError
 from src.core.orm_models import Order
 
@@ -110,7 +110,7 @@ def test_place_order_delegates_submission_client_id_policy(monkeypatch) -> None:
 
     assert adapter.place_order(order) == "exchange-order"
 
-    exchange_id = to_exchange_format(order.client_order_id, "binance")
+    exchange_id = to_binance_client_order_id(order.client_order_id)
     policy.assert_called_once_with("binance", "market", exchange_id)
     client.create_order.assert_called_once_with(
         symbol="BTC/USDT:USDT",

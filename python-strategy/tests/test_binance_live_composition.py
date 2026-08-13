@@ -150,6 +150,10 @@ def test_binance_owner_keeps_existing_module_dependency_boundary():
             "uses_binance_algo_order_endpoints"
         ),
         (
+            "from src.core.adapters.binance_client_order_id import "
+            "to_binance_client_order_id"
+        ),
+        (
             "from src.core.adapters.binance_user_stream import "
             "create_binance_user_stream_listen_key, "
             "keepalive_binance_user_stream"
@@ -159,7 +163,6 @@ def test_binance_owner_keeps_existing_module_dependency_boundary():
             "BinanceWebSocketOrderConnector"
         ),
         "from src.core.adapters.ccxt_adapter import CcxtExchangeAdapter",
-        "from src.core.client_order_id import to_exchange_format",
         "from src.core.orm_models import Order",
     ]
     owner = next(

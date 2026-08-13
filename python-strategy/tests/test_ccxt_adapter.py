@@ -6,6 +6,7 @@ from unittest.mock import MagicMock, call, patch
 import pytest
 
 from src.core.adapters import create_adapter
+from src.core.adapters.binance_client_order_id import to_binance_client_order_id
 from src.core.adapters.ccxt_adapter import (
     AccountInitializationConfig,
     AccountPositionMode,
@@ -13,7 +14,6 @@ from src.core.adapters.ccxt_adapter import (
 )
 from src.core.adapters.live_binance import LiveBinanceAdapter
 from src.core.adapters.simulated import SimulatedAdapter
-from src.core.client_order_id import to_exchange_format
 from src.core.interfaces.exchange import (
     ExchangeError,
     ExchangeUserStreamUnsupported,
@@ -213,10 +213,9 @@ class TestPlaceOrder:
         assert call_kwargs.kwargs["price"] is None
         assert call_kwargs.kwargs["params"][trigger_param] == "41000"
         assert call_kwargs.kwargs["params"]["reduceOnly"] is True
-        assert call_kwargs.kwargs["params"]["clientAlgoId"] == to_exchange_format(
-            CANONICAL_CLIENT_ORDER_ID,
-            "binance",
-        )
+        assert call_kwargs.kwargs["params"][
+            "clientAlgoId"
+        ] == to_binance_client_order_id(CANONICAL_CLIENT_ORDER_ID)
 
     def test_non_binance_protective_order_mapping_fails_closed(
         self, generic_adapter, mock_ccxt_client
@@ -940,9 +939,10 @@ class TestPlaceOrder:
         adapter.place_order(order)
 
         call_kwargs = mock_ccxt_client.create_order.call_args
-        assert call_kwargs.kwargs["params"]["newClientOrderId"] == to_exchange_format(
-            CANONICAL_CLIENT_ORDER_ID,
-            "binance",
+        assert call_kwargs.kwargs[
+            "params"
+        ]["newClientOrderId"] == to_binance_client_order_id(
+            CANONICAL_CLIENT_ORDER_ID
         )
 
     def test_non_binance_order_passes_client_order_id(self, mock_ccxt_client):
@@ -1004,9 +1004,8 @@ class TestCancelOrder:
             "BINANCE:BTCUSDT-PERP",
         )
 
-        exchange_client_order_id = to_exchange_format(
-            CANONICAL_CLIENT_ORDER_ID,
-            "binance",
+        exchange_client_order_id = to_binance_client_order_id(
+            CANONICAL_CLIENT_ORDER_ID
         )
         assert result is True
         mock_ccxt_client.cancel_order.assert_called_once_with(
@@ -1091,9 +1090,8 @@ class TestConditionalOrderIdRouting:
     def test_cancel_conditional_by_client_id_uses_client_algo_id(
         self, adapter, mock_ccxt_client
     ):
-        exchange_client_order_id = to_exchange_format(
-            CANONICAL_CLIENT_ORDER_ID,
-            "binance",
+        exchange_client_order_id = to_binance_client_order_id(
+            CANONICAL_CLIENT_ORDER_ID
         )
 
         result = adapter.cancel_order_by_client_id(
@@ -1112,9 +1110,8 @@ class TestConditionalOrderIdRouting:
     def test_fetch_conditional_by_client_id_uses_client_algo_id(
         self, adapter, mock_ccxt_client
     ):
-        exchange_client_order_id = to_exchange_format(
-            CANONICAL_CLIENT_ORDER_ID,
-            "binance",
+        exchange_client_order_id = to_binance_client_order_id(
+            CANONICAL_CLIENT_ORDER_ID
         )
         mock_ccxt_client.fetch_order.return_value = {
             "id": "ALGO-123",
@@ -1164,9 +1161,8 @@ class TestConditionalOrderIdRouting:
 
 class TestGetOrderByClientId:
     def test_binance_fetches_order_with_exchange_safe_client_id(self, adapter, mock_ccxt_client):
-        exchange_client_order_id = to_exchange_format(
-            CANONICAL_CLIENT_ORDER_ID,
-            "binance",
+        exchange_client_order_id = to_binance_client_order_id(
+            CANONICAL_CLIENT_ORDER_ID
         )
         mock_ccxt_client.fetch_order.return_value = {
             "id": "EX-123",
@@ -1228,9 +1224,8 @@ class TestGetOrderByClientId:
         )
 
     def test_fetch_order_does_not_use_limit_price_as_average(self, adapter, mock_ccxt_client):
-        exchange_client_order_id = to_exchange_format(
-            CANONICAL_CLIENT_ORDER_ID,
-            "binance",
+        exchange_client_order_id = to_binance_client_order_id(
+            CANONICAL_CLIENT_ORDER_ID
         )
         mock_ccxt_client.fetch_order.return_value = {
             "id": "EX-123",
@@ -1251,9 +1246,8 @@ class TestGetOrderByClientId:
         assert snapshot.average_price is None
 
     def test_fetch_order_derives_average_from_cost_when_available(self, adapter, mock_ccxt_client):
-        exchange_client_order_id = to_exchange_format(
-            CANONICAL_CLIENT_ORDER_ID,
-            "binance",
+        exchange_client_order_id = to_binance_client_order_id(
+            CANONICAL_CLIENT_ORDER_ID
         )
         mock_ccxt_client.fetch_order.return_value = {
             "id": "EX-123",
@@ -1935,6 +1929,8 @@ class TestLiveBinanceWsOrderPath:
             MockWS.return_value = mock_ws_inst
 
             adapter = LiveBinanceAdapter(api_key="k", secret="s", enable_ws=True)
+            formatter = MagicMock(return_value="binance-client-order-id")
+            adapter._exchange_client_order_id = formatter
             order = _make_order(
                 type="market",
                 quantity=Decimal("0.0109"),
@@ -1942,11 +1938,9 @@ class TestLiveBinanceWsOrderPath:
             )
             result = adapter.place_order(order)
 
-            exchange_client_order_id = to_exchange_format(
-                CANONICAL_CLIENT_ORDER_ID,
-                "binance",
-            )
+            exchange_client_order_id = "binance-client-order-id"
             assert result == "WS-123"
+            formatter.assert_called_once_with(CANONICAL_CLIENT_ORDER_ID)
             mock_ws_inst.place_order.assert_called_once()
             assert (
                 mock_ws_inst.place_order.call_args.kwargs["client_order_id"]

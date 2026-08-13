@@ -14,13 +14,13 @@ from src.core.adapters.binance_order_routing import (
     binance_submission_client_order_id_params,
     uses_binance_algo_order_endpoints,
 )
+from src.core.adapters.binance_client_order_id import to_binance_client_order_id
 from src.core.adapters.binance_user_stream import (
     create_binance_user_stream_listen_key,
     keepalive_binance_user_stream,
 )
 from src.core.adapters.binance_ws_order import BinanceWebSocketOrderConnector
 from src.core.adapters.ccxt_adapter import CcxtExchangeAdapter
-from src.core.client_order_id import to_exchange_format
 from src.core.orm_models import Order
 
 
@@ -91,6 +91,9 @@ class LiveBinanceAdapter(CcxtExchangeAdapter):
             order_type,
         )
 
+    def _exchange_client_order_id(self, client_order_id: str) -> str:
+        return to_binance_client_order_id(client_order_id)
+
     def _ccxt_order_type_and_params(self, order: Order) -> tuple[str, dict]:
         conditional = binance_conditional_order_mapping(
             "binance",
@@ -141,7 +144,7 @@ class LiveBinanceAdapter(CcxtExchangeAdapter):
                 self._quantize_order(order)
                 client_order_id = getattr(order, "client_order_id", None)
                 exchange_client_order_id = (
-                    to_exchange_format(client_order_id, "binance")
+                    self._exchange_client_order_id(client_order_id)
                     if client_order_id
                     else None
                 )

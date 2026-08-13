@@ -25,7 +25,7 @@ from src.core.interfaces.exchange import (
     InsufficientFundsError,
     NetworkError,
 )
-from src.core.client_order_id import to_exchange_format
+from src.core.client_order_id import parse_client_order_id
 from src.core.models import Position
 from src.core.orm_models import Order
 from src.core.product_registry import (
@@ -90,6 +90,10 @@ class CcxtExchangeAdapter(IExchangeAdapter):
 
     # -- IExchangeAdapter ------------------------------------------------
 
+    def _exchange_client_order_id(self, client_order_id: str) -> str:
+        parse_client_order_id(client_order_id)
+        return client_order_id
+
     def place_order(self, order: Order) -> str:
         ccxt_symbol = to_ccxt_symbol(order.product_id)
         self._quantize_order(order)
@@ -104,9 +108,7 @@ class CcxtExchangeAdapter(IExchangeAdapter):
             params["reduceOnly"] = True
         client_order_id = getattr(order, "client_order_id", None)
         if client_order_id:
-            exchange_client_order_id = to_exchange_format(
-                client_order_id, self.exchange_id
-            )
+            exchange_client_order_id = self._exchange_client_order_id(client_order_id)
             params.update(
                 self._submission_client_order_id_params(
                     exchange_client_order_id,
@@ -355,7 +357,7 @@ class CcxtExchangeAdapter(IExchangeAdapter):
         order_type: Optional[str] = None,
     ) -> bool:
         ccxt_symbol = to_ccxt_symbol(product_id)
-        exchange_client_order_id = to_exchange_format(client_order_id, self.exchange_id)
+        exchange_client_order_id = self._exchange_client_order_id(client_order_id)
         params = self._client_order_id_params(exchange_client_order_id, order_type)
         try:
             self.client.cancel_order(
@@ -391,7 +393,7 @@ class CcxtExchangeAdapter(IExchangeAdapter):
         order_type: Optional[str] = None,
     ) -> Optional[ExchangeOrderSnapshot]:
         ccxt_symbol = to_ccxt_symbol(product_id)
-        exchange_client_order_id = to_exchange_format(client_order_id, self.exchange_id)
+        exchange_client_order_id = self._exchange_client_order_id(client_order_id)
         params = self._client_order_id_params(exchange_client_order_id, order_type)
         try:
             response = self.client.fetch_order(
