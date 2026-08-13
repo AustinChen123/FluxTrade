@@ -154,10 +154,13 @@ def test_binance_owner_keeps_existing_module_dependency_boundary():
             "create_binance_user_stream_listen_key, "
             "keepalive_binance_user_stream"
         ),
+        (
+            "from src.core.adapters.binance_ws_order import "
+            "BinanceWebSocketOrderConnector"
+        ),
         "from src.core.adapters.ccxt_adapter import CcxtExchangeAdapter",
         "from src.core.client_order_id import to_exchange_format",
         "from src.core.orm_models import Order",
-        "from src.core.ws_connector import WebSocketOrderConnector",
     ]
     owner = next(
         node

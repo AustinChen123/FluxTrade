@@ -18,10 +18,10 @@ from src.core.adapters.binance_user_stream import (
     create_binance_user_stream_listen_key,
     keepalive_binance_user_stream,
 )
+from src.core.adapters.binance_ws_order import BinanceWebSocketOrderConnector
 from src.core.adapters.ccxt_adapter import CcxtExchangeAdapter
 from src.core.client_order_id import to_exchange_format
 from src.core.orm_models import Order
-from src.core.ws_connector import WebSocketOrderConnector
 
 
 class LiveBinanceAdapter(CcxtExchangeAdapter):
@@ -46,15 +46,14 @@ class LiveBinanceAdapter(CcxtExchangeAdapter):
         self.logger = logging.getLogger("LiveBinanceAdapter")
 
         # Optional WebSocket fast path
-        self.ws_connector: WebSocketOrderConnector | None = None
+        self.ws_connector: BinanceWebSocketOrderConnector | None = None
         if enable_ws:
             guard = operation_guard or (lambda: None)
             guard()
             try:
-                connector = WebSocketOrderConnector(
+                connector = BinanceWebSocketOrderConnector(
                     self.client.apiKey or "",
                     self.client.secret or "",
-                    "binance",
                     testnet,
                 )
             except Exception as e:
@@ -134,7 +133,7 @@ class LiveBinanceAdapter(CcxtExchangeAdapter):
         if (
             not reduce_only
             and self.ws_connector
-            and self.ws_connector.is_connected("binance")
+            and self.ws_connector.is_connected()
             and order.type
             and order.type.lower() == "market"
         ):

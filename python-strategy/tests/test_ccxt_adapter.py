@@ -1826,7 +1826,7 @@ class TestCreateAdapter:
 
     def test_live_binance_with_ws(self):
         with patch("src.core.adapters.ccxt_adapter.ccxt") as mock_ccxt, \
-             patch("src.core.adapters.live_binance.WebSocketOrderConnector"):
+             patch("src.core.adapters.live_binance.BinanceWebSocketOrderConnector"):
             mock_cls = MagicMock()
             client = MagicMock()
             client.apiKey = "k"
@@ -1864,7 +1864,7 @@ class TestLiveBinanceWsInit:
     def test_ws_init_failure_falls_back_to_rest(self):
         """WS init failure should set ws_connector to None (REST fallback)."""
         with patch("src.core.adapters.ccxt_adapter.ccxt") as mock_ccxt, \
-             patch("src.core.adapters.live_binance.WebSocketOrderConnector", side_effect=RuntimeError("ws fail")):
+             patch("src.core.adapters.live_binance.BinanceWebSocketOrderConnector", side_effect=RuntimeError("ws fail")):
             mock_cls = MagicMock()
             client = MagicMock()
             client.apiKey = "k"
@@ -1905,7 +1905,7 @@ class TestLiveBinanceWsOrderPath:
     def test_market_order_via_ws(self):
         """Market order should use WS fast path when connected."""
         with patch("src.core.adapters.ccxt_adapter.ccxt") as mock_ccxt, \
-             patch("src.core.adapters.live_binance.WebSocketOrderConnector") as MockWS:
+             patch("src.core.adapters.live_binance.BinanceWebSocketOrderConnector") as MockWS:
             mock_cls = MagicMock()
             client = MagicMock()
             client.apiKey = "k"
@@ -1958,7 +1958,7 @@ class TestLiveBinanceWsOrderPath:
     def test_reduce_only_market_order_uses_rest_not_ws(self):
         """Reduce-only flatten orders must use the REST path that sends reduceOnly."""
         with patch("src.core.adapters.ccxt_adapter.ccxt") as mock_ccxt, \
-             patch("src.core.adapters.live_binance.WebSocketOrderConnector") as MockWS:
+             patch("src.core.adapters.live_binance.BinanceWebSocketOrderConnector") as MockWS:
             mock_cls = MagicMock()
             client = MagicMock()
             client.apiKey = "k"
@@ -1989,7 +1989,7 @@ class TestLiveBinanceWsOrderPath:
     def test_ws_ack_timeout_falls_back_to_rest(self):
         """WS ACK timeout should fall back to REST."""
         with patch("src.core.adapters.ccxt_adapter.ccxt") as mock_ccxt, \
-             patch("src.core.adapters.live_binance.WebSocketOrderConnector") as MockWS:
+             patch("src.core.adapters.live_binance.BinanceWebSocketOrderConnector") as MockWS:
             mock_cls = MagicMock()
             client = MagicMock()
             client.apiKey = "k"
@@ -2016,7 +2016,7 @@ class TestLiveBinanceWsOrderPath:
     def test_ws_failure_falls_back_to_rest(self):
         """WS order failure should fall back to REST."""
         with patch("src.core.adapters.ccxt_adapter.ccxt") as mock_ccxt, \
-             patch("src.core.adapters.live_binance.WebSocketOrderConnector") as MockWS:
+             patch("src.core.adapters.live_binance.BinanceWebSocketOrderConnector") as MockWS:
             mock_cls = MagicMock()
             client = MagicMock()
             client.apiKey = "k"
@@ -2042,7 +2042,7 @@ class TestLiveBinanceWsOrderPath:
     def test_limit_order_uses_rest(self):
         """Limit orders should always use REST path (not WS)."""
         with patch("src.core.adapters.ccxt_adapter.ccxt") as mock_ccxt, \
-             patch("src.core.adapters.live_binance.WebSocketOrderConnector") as MockWS:
+             patch("src.core.adapters.live_binance.BinanceWebSocketOrderConnector") as MockWS:
             mock_cls = MagicMock()
             client = MagicMock()
             client.apiKey = "k"
@@ -2068,7 +2068,7 @@ class TestLiveBinanceWsOrderPath:
     def test_ws_disconnected_uses_rest(self):
         """When WS is not connected, should fall back to REST."""
         with patch("src.core.adapters.ccxt_adapter.ccxt") as mock_ccxt, \
-             patch("src.core.adapters.live_binance.WebSocketOrderConnector") as MockWS:
+             patch("src.core.adapters.live_binance.BinanceWebSocketOrderConnector") as MockWS:
             mock_cls = MagicMock()
             client = MagicMock()
             client.apiKey = "k"
