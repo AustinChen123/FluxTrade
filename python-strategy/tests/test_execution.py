@@ -25,6 +25,7 @@ from src.core.adapters.ccxt_adapter import CcxtExchangeAdapter
 from src.core.adapters.live_binance import LiveBinanceAdapter
 from src.core.adapters.rithmic_adapter import RithmicExchangeAdapter
 from src.core.execution import ExecutionEngine, ExitDecision
+from src.core import execution_fill_journal
 from src.core.interfaces.exchange import ExchangeOrderSnapshot
 from src.core.interfaces.exchange import ExchangeOrderEvent
 from src.core.interfaces.exchange import ExchangeError
@@ -2209,6 +2210,138 @@ class TestLiveOrderEventSync:
             journal=journal,
             is_backtest=True,
         )
+
+    @pytest.mark.parametrize("initial_journal_present", [False, True])
+    @pytest.mark.parametrize("current_journal_present", [False, True])
+    def test_constructor_journal_callback_preserves_registration_and_dynamic_dependencies(
+        self,
+        monkeypatch,
+        mock_db_session,
+        mock_clock,
+        mock_exchange_adapter,
+        mock_order_repo,
+        initial_journal_present,
+        current_journal_present,
+    ):
+        initial_journal = MagicMock() if initial_journal_present else None
+        engine = self._engine(
+            mock_db_session,
+            mock_clock,
+            mock_exchange_adapter,
+            mock_order_repo,
+            journal=initial_journal,
+        )
+        callback = engine._order_event_applier.journal_fill
+        current_journal = MagicMock() if current_journal_present else None
+        current_clock = MagicMock()
+        engine.journal = current_journal
+        engine.clock = current_clock
+        projection = MagicMock()
+        monkeypatch.setattr(
+            execution_fill_journal,
+            "journal_exchange_order_event_fill",
+            projection,
+        )
+
+        if initial_journal is None:
+            assert callback is None
+            projection.assert_not_called()
+            return
+
+        assert callback is not None
+        assert callback.__self__ is engine
+        order = SimpleNamespace(id="order-1")
+        event = ExchangeOrderEvent(status="filled", product_id="TEST:PRODUCT")
+        callback(order, event, Decimal("10"), Decimal("2"))
+        projection.assert_called_once_with(
+            current_journal,
+            current_clock,
+            order,
+            event,
+            Decimal("10"),
+            Decimal("2"),
+        )
+
+    def test_exchange_event_journal_failure_preserves_fill_and_releases_lock(
+        self,
+        monkeypatch,
+        mock_db_session,
+        mock_clock,
+        mock_exchange_adapter,
+        mock_order_repo,
+        order_factory,
+    ):
+        engine = self._engine(
+            mock_db_session,
+            mock_clock,
+            mock_exchange_adapter,
+            mock_order_repo,
+            journal=MagicMock(),
+        )
+        order = order_factory(
+            client_order_id="strategy-entry-1",
+            exchange_order_id=None,
+            status=OrderStatus.SUBMITTED.value,
+            price=Decimal("100"),
+            quantity=Decimal("0.10"),
+        )
+        mock_order_repo.add_order(order)
+        for callback_name in (
+            "place_pending_conditionals_for_entry",
+            "protective_partial_fill_requires_resize",
+            "cancel_linked_conditional_for_protection_fill",
+            "write_conditional_warning",
+        ):
+            setattr(engine._order_event_applier, callback_name, MagicMock())
+        error = RuntimeError("exchange journal sentinel")
+        projection = MagicMock(side_effect=error)
+        monkeypatch.setattr(
+            execution_fill_journal,
+            "journal_exchange_order_event_fill",
+            projection,
+        )
+
+        with pytest.raises(RuntimeError) as raised:
+            engine.process_exchange_order_event(
+                ExchangeOrderEvent(
+                    status="filled",
+                    product_id=order.product_id,
+                    client_order_id=order.client_order_id,
+                    exchange_order_id="EX-1",
+                    cumulative_filled_quantity=Decimal("0.10"),
+                    cumulative_average_price=Decimal("101"),
+                    fee=Decimal("0.001"),
+                    fee_asset="USDT",
+                )
+            )
+
+        assert raised.value is error
+        assert order.exchange_order_id == "EX-1"
+        assert order.status == OrderStatus.FILLED.value
+        assert order.filled_quantity == Decimal("0.10")
+        assert len(mock_order_repo.trades) == 1
+        projection.assert_called_once()
+        for callback_name in (
+            "place_pending_conditionals_for_entry",
+            "protective_partial_fill_requires_resize",
+            "cancel_linked_conditional_for_protection_fill",
+            "write_conditional_warning",
+        ):
+            getattr(engine._order_event_applier, callback_name).assert_not_called()
+
+        acquired = []
+
+        def acquire_from_another_thread():
+            locked = engine._order_event_apply_lock.acquire(timeout=0.5)
+            acquired.append(locked)
+            if locked:
+                engine._order_event_apply_lock.release()
+
+        worker = threading.Thread(target=acquire_from_another_thread)
+        worker.start()
+        worker.join(timeout=1.0)
+        assert not worker.is_alive()
+        assert acquired == [True]
 
     def test_live_order_event_records_partial_then_final_fill_delta(
         self,
@@ -6873,6 +7006,63 @@ class TestMarketDataProcessing:
         candle = candlestick_factory()
         # Should not raise
         execution_engine.process_market_data(candle)
+
+    def test_journal_failure_preserves_prior_fill_and_cancel_then_stops_batch(
+        self,
+        monkeypatch,
+        mock_db_session,
+        mock_clock,
+        mock_exchange_adapter,
+        mock_order_repo,
+        order_factory,
+        candlestick_factory,
+    ):
+        engine = ExecutionEngine(
+            db_session=mock_db_session,
+            clock=mock_clock,
+            adapter=mock_exchange_adapter,
+            order_repository=mock_order_repo,
+            journal=MagicMock(),
+            is_backtest=True,
+        )
+        first = order_factory(order_id="first", status=OrderStatus.SUBMITTED.value)
+        second = order_factory(order_id="second", status=OrderStatus.SUBMITTED.value)
+        cancelled = order_factory(
+            order_id="cancelled", status=OrderStatus.SUBMITTED.value
+        )
+        for order in (first, second, cancelled):
+            mock_order_repo.add_order(order)
+        mock_exchange_adapter.on_market_data = MagicMock(
+            return_value=[
+                {
+                    "order": first,
+                    "price": Decimal("101"),
+                    "quantity": Decimal("0.1"),
+                    "fee": Decimal("0.001"),
+                    "fill_type": "LIMIT",
+                    "cancelled_orders": [cancelled],
+                },
+                {
+                    "order": second,
+                    "price": Decimal("102"),
+                    "quantity": Decimal("0.1"),
+                },
+            ]
+        )
+        error = RuntimeError("simulated journal sentinel")
+        projection = MagicMock(side_effect=error)
+        monkeypatch.setattr(execution_fill_journal, "journal_fill", projection)
+
+        with pytest.raises(RuntimeError) as raised:
+            engine.process_market_data(candlestick_factory(close=Decimal("101")))
+
+        assert raised.value is error
+        assert first.status == "closed"
+        assert cancelled.status == OrderStatus.CANCELLED.value
+        assert second.status == OrderStatus.SUBMITTED.value
+        assert len(mock_order_repo.trades) == 1
+        assert mock_order_repo.trades[0].order_id == "first"
+        projection.assert_called_once()
 
 
 class TestConditionalOrderErrorHandling:

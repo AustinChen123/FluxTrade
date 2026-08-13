@@ -47,6 +47,7 @@ from src.core.fill_delta import (
 )
 from src.core.execution_submission_gate import ExecutionSubmissionGate
 from src.core import execution_failure_diagnostics
+from src.core import execution_fill_journal
 from src.core.order_event_sync import (
     OrderEventApplier,
     exchange_snapshot_to_order_event,
@@ -2736,28 +2737,14 @@ class ExecutionEngine:
         fill_type: str,
         candle: Optional[Candlestick] = None,
     ) -> None:
-        """Record a fill event to the journal."""
-        tag_map = {
-            "STOP_LOSS": "sl_hit",
-            "TAKE_PROFIT": "tp_hit",
-            "TRAILING_STOP": "trailing_hit",
-            "MARKET": "fill",
-            "LIMIT": "fill",
-        }
-        tag = tag_map.get(fill_type, "fill")
-        ts = candle.timestamp if candle else 0
-        self.journal.log(
-            tag,
-            {
-                "order_id": str(order.id),
-                "side": order.side,
-                "price": str(price),
-                "quantity": str(qty),
-                "fee": str(fee) if fee else "0",
-                "fill_type": fill_type,
-            },
-            timestamp=ts,
-            trade_id=str(order.id),
+        execution_fill_journal.journal_fill(
+            self.journal,
+            order,
+            price,
+            qty,
+            fee,
+            fill_type,
+            candle,
         )
 
     def _journal_exchange_order_event_fill(
@@ -2767,35 +2754,14 @@ class ExecutionEngine:
         fill_price: Decimal,
         fill_quantity: Decimal,
     ) -> None:
-        self.journal.log(
-            "fill",
-            {
-                "order_id": str(order.id),
-                "side": order.side,
-                "signal_price": self._intent_signal_price(order),
-                "submitted_price": str(order.price) if order.price else "market",
-                "fill_price": str(fill_price),
-                "quantity": str(fill_quantity),
-                "fee": str(event.fee) if event.fee is not None else "0",
-                "fee_asset": event.fee_asset,
-                "exchange_order_id": event.exchange_order_id,
-                "client_order_id": event.client_order_id,
-                "exchange_status": event.status,
-            },
-            timestamp=event.event_timestamp or int(self.clock.now() * 1000),
-            trade_id=str(order.id),
+        execution_fill_journal.journal_exchange_order_event_fill(
+            self.journal,
+            self.clock,
+            order,
+            event,
+            fill_price,
+            fill_quantity,
         )
-
-    @staticmethod
-    def _intent_signal_price(order) -> str | None:
-        intent_payload = getattr(order, "intent_payload", None)
-        if not isinstance(intent_payload, dict):
-            return None
-        order_payload = intent_payload.get("order")
-        if not isinstance(order_payload, dict):
-            return None
-        price = order_payload.get("price")
-        return str(price) if price is not None else None
 
     def _determine_side(self, signal_type: SignalType) -> Optional[OrderSide]:
         if signal_type == SignalType.LONG:
