@@ -1,9 +1,19 @@
 from decimal import Decimal
-from typing import Optional
+from typing import Optional, Protocol
 from src.core.risk_manager import AccountService
 from src.core.models import Position
-from src.core.interfaces import IOrderRepository
 from src.core.interfaces.exchange import IExchangeAdapter
+
+
+class _BacktestAccountRepository(Protocol):
+    balance: Decimal
+
+    def get_position(
+        self,
+        strategy_id: str,
+        product_id: str,
+        side: str | None = None,
+    ) -> Position | None: ...
 
 
 class BacktestAccountService(AccountService):
@@ -17,7 +27,7 @@ class BacktestAccountService(AccountService):
     def __init__(
         self,
         adapter: Optional[IExchangeAdapter] = None,
-        repo: Optional[IOrderRepository] = None,
+        repo: Optional[_BacktestAccountRepository] = None,
         initial_balance: Decimal = Decimal("10000"),
     ):
         self.adapter = adapter

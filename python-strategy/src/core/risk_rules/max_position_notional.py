@@ -33,7 +33,8 @@ class MaxPositionNotionalRule:
     ) -> tuple[RuleStatus, Optional[str]]:
         if signal.type in {SignalType.NO_SIGNAL, SignalType.EXIT_LONG, SignalType.EXIT_SHORT}:
             return RuleStatus.PASS, None
-        if signal.quantity is None:
+        quantity = signal.quantity
+        if quantity is None:
             return RuleStatus.REJECT, "max_position_notional_missing_quantity"
         if mid_price <= 0:
             return RuleStatus.REJECT, f"max_position_notional_invalid_mid_price: {mid_price}"
@@ -48,7 +49,12 @@ class MaxPositionNotionalRule:
             mid_price,
             instrument_spec,
         )
-        order_notional = _signed_order_notional(signal, order_price, instrument_spec)
+        order_notional = _signed_order_notional(
+            signal,
+            quantity,
+            order_price,
+            instrument_spec,
+        )
         total_notional = abs(current_notional + order_notional)
 
         if total_notional > self.config.max_position_notional:
@@ -80,12 +86,13 @@ def _signed_position_notional(
 
 def _signed_order_notional(
     signal: Signal,
+    quantity: Decimal,
     order_price: Decimal,
     instrument_spec: InstrumentSpec | None = None,
 ) -> Decimal:
     sign = Decimal("1") if signal.type == SignalType.LONG else Decimal("-1")
     return sign * calculate_notional_exposure(
-        signal.quantity,
+        quantity,
         order_price,
         instrument_spec,
     )
