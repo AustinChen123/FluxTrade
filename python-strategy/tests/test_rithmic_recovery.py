@@ -339,6 +339,24 @@ def test_owned_order_recovery_state_matrix(
     assert plan[0].unresolved is unresolved
 
 
+def test_recovery_uses_latest_available_fill_timestamp_when_one_is_missing():
+    plan, external = build_rithmic_recovery_plan(
+        [local_order()],
+        snapshot(
+            fills=[
+                remote_fill(timestamp_ms=None),
+                remote_fill(fill_id="fill-2", timestamp_ms=1_700_000_125_000),
+            ]
+        ),
+    )
+
+    assert external == []
+    assert plan[0].classification == "repaired"
+    assert plan[0].event is not None
+    assert plan[0].event.status == "filled"
+    assert plan[0].event.event_timestamp == 1_700_000_125_000
+
+
 def test_recovery_matches_cloned_python_snapshot_rows_by_stable_identity():
     class CloningSnapshot:
         account_id = "ACCOUNT"
@@ -676,6 +694,30 @@ def test_snapshot_loader_is_called_once_with_bounded_owned_window():
         fill_start_index=1_700_000_122,
         fill_finish_index=1_700_000_201,
     )
+
+
+def test_default_snapshot_loader_resolves_the_native_extension_export(monkeypatch):
+    loader = Mock(return_value=snapshot())
+    module_loader = Mock(
+        return_value=SimpleNamespace(
+            rithmic_ledger_snapshot=loader,
+        )
+    )
+    monkeypatch.setattr(
+        "src.core.adapters.rithmic_recovery.import_module",
+        module_loader,
+    )
+
+    result = load_rithmic_recovery_snapshot(
+        "test",
+        "ACCOUNT",
+        [],
+        1_700_000_200,
+    )
+
+    assert result.account_id == "ACCOUNT"
+    module_loader.assert_called_once_with("fluxtrade_core")
+    loader.assert_called_once_with("test", "ACCOUNT")
 
 
 def test_snapshot_loader_includes_persisted_native_parent_basket():

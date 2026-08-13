@@ -1,10 +1,95 @@
 from dataclasses import dataclass
 from decimal import Decimal
-from typing import Callable, Iterable
+from importlib import import_module
+from typing import Iterable, Protocol, TypeVar, cast
 
 from src.core.adapters.rithmic_native_bracket import native_bracket_leg_type
 from src.core.interfaces.exchange import ExchangeOrderEvent
 from src.core.product_registry import to_rithmic_symbol
+
+
+class _RecoveryOrder(Protocol):
+    @property
+    def id(self) -> str: ...
+
+    @property
+    def exchange_order_id(self) -> str | None: ...
+
+    @property
+    def client_order_id(self) -> str | None: ...
+
+    @property
+    def timestamp(self) -> int: ...
+
+    @property
+    def type(self) -> str: ...
+
+    @property
+    def product_id(self) -> str: ...
+
+    @property
+    def quantity(self) -> Decimal: ...
+
+    @property
+    def side(self) -> str: ...
+
+
+class _LedgerOrder(Protocol):
+    client_order_id: str | None
+    exchange_order_id: str | None
+    basket_id: str
+    original_basket_id: str | None
+    symbol: str
+    status: str
+    notification_type: str | None
+    transaction_type: str
+    quantity: str
+    price: str | None
+    trigger_price: str | None
+    price_type: str | None
+    bracket_type: str | None
+    filled_quantity: str | None
+    average_fill_price: str | None
+    timestamp_ms: int | None
+
+
+class _LedgerFill(Protocol):
+    basket_id: str
+    exchange_order_id: str | None
+    fill_id: str
+    symbol: str
+    transaction_type: str
+    fill_quantity: str
+    fill_price: str
+    timestamp_ms: int | None
+
+
+class _LedgerPosition(Protocol):
+    symbol: str
+    net_quantity: str
+
+
+class _LedgerSnapshot(Protocol):
+    account_id: str
+    orders: list[_LedgerOrder]
+    order_history: list[_LedgerOrder]
+    fills: list[_LedgerFill]
+    positions: list[_LedgerPosition]
+
+
+class _SnapshotLoader(Protocol):
+    def __call__(
+        self,
+        profile: str,
+        account_id: str | None,
+        *,
+        recovery_basket_ids: list[str] | None = None,
+        fill_start_index: int | None = None,
+        fill_finish_index: int | None = None,
+    ) -> _LedgerSnapshot: ...
+
+
+_T = TypeVar("_T")
 
 
 @dataclass(frozen=True)
@@ -20,25 +105,26 @@ class RithmicRecoveryItem:
 def load_rithmic_recovery_snapshot(
     profile: str,
     account_id: str | None,
-    orders: Iterable[object],
+    orders: Iterable[_RecoveryOrder],
     now_seconds: int,
-    loader: Callable | None = None,
-):
+    loader: _SnapshotLoader | None = None,
+) -> _LedgerSnapshot:
     if loader is None:
-        from fluxtrade_core import rithmic_ledger_snapshot
-
-        loader = rithmic_ledger_snapshot
+        loader = cast(
+            _SnapshotLoader,
+            getattr(import_module("fluxtrade_core"), "rithmic_ledger_snapshot"),
+        )
 
     orders = list(orders)
     basket_ids = {
         str(order.exchange_order_id) for order in orders if order.exchange_order_id
     }
-    basket_ids.update(
-        str(parent_basket_id)
-        for order in orders
-        if isinstance(getattr(order, "intent_payload", None), dict)
-        and (parent_basket_id := order.intent_payload.get("native_parent_basket_id"))
-    )
+    for order in orders:
+        intent_payload = getattr(order, "intent_payload", None)
+        if isinstance(intent_payload, dict) and (
+            parent_basket_id := intent_payload.get("native_parent_basket_id")
+        ):
+            basket_ids.add(str(parent_basket_id))
     basket_ids = sorted(basket_ids)
     if not basket_ids:
         return loader(profile, account_id)
@@ -53,8 +139,8 @@ def load_rithmic_recovery_snapshot(
 
 
 def build_rithmic_recovery_plan(
-    orders: Iterable[object],
-    snapshot,
+    orders: Iterable[_RecoveryOrder],
+    snapshot: _LedgerSnapshot,
 ) -> tuple[list[RithmicRecoveryItem], list[dict[str, str | None]]]:
     orders = list(orders)
     local_by_id = {str(order.id): order for order in orders}
@@ -184,7 +270,11 @@ def build_rithmic_recovery_plan(
                 continue
 
         remote_basket_id = remote.basket_id if remote is not None else basket_id
-        fills, reason = _deduplicate_fills(fills_by_basket.get(remote_basket_id, []))
+        fills, reason = _deduplicate_fills(
+            fills_by_basket.get(remote_basket_id, [])
+            if remote_basket_id is not None
+            else []
+        )
         if reason is not None:
             results.append(_blocked(order, reason))
             continue
@@ -193,9 +283,9 @@ def build_rithmic_recovery_plan(
 
 
 def compare_rithmic_positions(
-    orders: Iterable[object],
+    orders: Iterable[_RecoveryOrder],
     local_positions: Iterable[object],
-    remote_positions: Iterable[object],
+    remote_positions: Iterable[_LedgerPosition],
 ) -> list[dict[str, str]]:
     local_positions = list(local_positions)
     remote_positions = list(remote_positions)
@@ -204,16 +294,17 @@ def compare_rithmic_positions(
         for order in orders
     }
     for position in local_positions:
-        product_id = str(position.product_id)
+        product_id = str(getattr(position, "product_id"))
         if product_id.upper().startswith("RITHMIC:"):
             products[product_id] = _product_symbol(product_id)
     local_by_product = {product_id: Decimal("0") for product_id in products}
     for position in local_positions:
-        product_id = str(position.product_id)
+        product_id = str(getattr(position, "product_id"))
         if product_id not in local_by_product:
             continue
-        quantity = _decimal(position.quantity)
-        side = getattr(position.side, "value", position.side)
+        quantity = _decimal(getattr(position, "quantity"))
+        raw_side = getattr(position, "side")
+        side = getattr(raw_side, "value", raw_side)
         local_by_product[product_id] += (
             -quantity if str(side).upper() == "SHORT" else quantity
         )
@@ -247,7 +338,11 @@ def compare_rithmic_positions(
     return drifts
 
 
-def _classify_order(order, remote, fills: list[object]) -> RithmicRecoveryItem:
+def _classify_order(
+    order: _RecoveryOrder,
+    remote: _LedgerOrder | None,
+    fills: list[_LedgerFill],
+) -> RithmicRecoveryItem:
     if remote is not None:
         allowed_client_ids = {str(order.client_order_id)}
         intent_payload = getattr(order, "intent_payload", None)
@@ -342,7 +437,14 @@ def _classify_order(order, remote, fills: list[object]) -> RithmicRecoveryItem:
         event_timestamp=(
             remote.timestamp_ms
             if remote is not None
-            else max((fill.timestamp_ms for fill in fills), default=None)
+            else max(
+                (
+                    timestamp
+                    for fill in fills
+                    if (timestamp := fill.timestamp_ms) is not None
+                ),
+                default=None,
+            )
         ),
         raw=(
             {
@@ -416,7 +518,7 @@ def _normalize_transaction_type(value: str) -> str | None:
     return None
 
 
-def rithmic_order_may_be_working(remote) -> bool:
+def rithmic_order_may_be_working(remote: _LedgerOrder) -> bool:
     notification = str(getattr(remote, "notification_type", None) or "").strip().upper()
     quantity = _decimal(getattr(remote, "quantity", None))
     filled = _decimal(getattr(remote, "filled_quantity", None))
@@ -441,7 +543,7 @@ def rithmic_order_may_be_working(remote) -> bool:
     return True
 
 
-def _event_matches_local(order, event: ExchangeOrderEvent) -> bool:
+def _event_matches_local(order: _RecoveryOrder, event: ExchangeOrderEvent) -> bool:
     expected_status = {
         "open": "SUBMITTED",
         "partially_filled": "PARTIALLY_FILLED",
@@ -464,21 +566,28 @@ def _event_matches_local(order, event: ExchangeOrderEvent) -> bool:
     )
 
 
-def _latest_history(history: list[object]) -> tuple[object | None, str | None]:
+def _latest_history(
+    history: list[_LedgerOrder],
+) -> tuple[_LedgerOrder | None, str | None]:
     if not history:
         return None, None
     if len(history) == 1:
         return history[0], None
-    if any(item.timestamp_ms is None for item in history):
+    timestamps = [item.timestamp_ms for item in history]
+    if any(timestamp is None for timestamp in timestamps):
         return None, "ambiguous_order_history_ordering"
-    latest_timestamp = max(item.timestamp_ms for item in history)
+    latest_timestamp = max(
+        timestamp for timestamp in timestamps if timestamp is not None
+    )
     latest = [item for item in history if item.timestamp_ms == latest_timestamp]
     if len(latest) != 1:
         return None, "ambiguous_order_history_ordering"
     return latest[0], None
 
 
-def _deduplicate_fills(fills: list[object]) -> tuple[list[object], str | None]:
+def _deduplicate_fills(
+    fills: list[_LedgerFill],
+) -> tuple[list[_LedgerFill], str | None]:
     unique = {}
     for fill in fills:
         previous = unique.get(fill.fill_id)
@@ -497,7 +606,7 @@ def _deduplicate_fills(fills: list[object]) -> tuple[list[object], str | None]:
     return [fill for fill in fills if unique.pop(fill.fill_id, None) is not None], None
 
 
-def _aggregate_fills(fills: list[object]) -> tuple[Decimal, Decimal | None]:
+def _aggregate_fills(fills: list[_LedgerFill]) -> tuple[Decimal, Decimal | None]:
     quantity = sum((_decimal(fill.fill_quantity) for fill in fills), Decimal("0"))
     if quantity == 0:
         return quantity, None
@@ -508,9 +617,7 @@ def _aggregate_fills(fills: list[object]) -> tuple[Decimal, Decimal | None]:
     return quantity, notional / quantity
 
 
-def _unique_index(
-    items: Iterable[object], field: str
-) -> tuple[dict[str, object], set[str]]:
+def _unique_index(items: Iterable[_T], field: str) -> tuple[dict[str, _T], set[str]]:
     index = {}
     duplicates = set()
     for item in items:
@@ -522,7 +629,7 @@ def _unique_index(
     return index, duplicates
 
 
-def _group(items: Iterable[object], field: str) -> dict[str, list[object]]:
+def _group(items: Iterable[_T], field: str) -> dict[str, list[_T]]:
     grouped = {}
     for item in items:
         grouped.setdefault(str(getattr(item, field)), []).append(item)
@@ -540,13 +647,16 @@ def _product_symbol(product_id: str) -> str:
     return to_rithmic_symbol(product_id)
 
 
-def _native_protection(order) -> dict | None:
+def _native_protection(order: _RecoveryOrder) -> dict | None:
     payload = getattr(order, "intent_payload", None)
     native = payload.get("native_protection") if isinstance(payload, dict) else None
     return native if isinstance(native, dict) else None
 
 
-def _native_parent_basket(order, local_by_id: dict[str, object]) -> str | None:
+def _native_parent_basket(
+    order: _RecoveryOrder,
+    local_by_id: dict[str, _RecoveryOrder],
+) -> str | None:
     payload = getattr(order, "intent_payload", None)
     if (
         not isinstance(payload, dict)
@@ -565,8 +675,8 @@ def _native_parent_basket(order, local_by_id: dict[str, object]) -> str | None:
 
 
 def _expected_native_children(
-    orders: Iterable[object],
-    local_by_id: dict[str, object],
+    orders: Iterable[_RecoveryOrder],
+    local_by_id: dict[str, _RecoveryOrder],
 ) -> dict[tuple[str, str], set[str]]:
     expected: dict[tuple[str, str], set[str]] = {}
     for order in orders:
@@ -592,14 +702,14 @@ def _expected_native_children(
     return expected
 
 
-def _remote_native_key(remote) -> tuple[str, str] | None:
+def _remote_native_key(remote: _LedgerOrder) -> tuple[str, str] | None:
     parent = getattr(remote, "original_basket_id", None)
     leg_type = native_bracket_leg_type(getattr(remote, "price_type", None))
     return (str(parent), leg_type) if parent and leg_type else None
 
 
 def _is_expected_native_child(
-    remote,
+    remote: _LedgerOrder,
     expected: dict[tuple[str, str], set[str]],
     remote_counts: dict[tuple[str, str], int],
 ) -> bool:
@@ -614,7 +724,12 @@ def _decimal(value) -> Decimal:
     return Decimal(str(value or "0"))
 
 
-def _blocked(order, reason: str, *, unresolved: bool = True) -> RithmicRecoveryItem:
+def _blocked(
+    order: _RecoveryOrder,
+    reason: str,
+    *,
+    unresolved: bool = True,
+) -> RithmicRecoveryItem:
     return RithmicRecoveryItem(
         order=order,
         classification="unresolved",
