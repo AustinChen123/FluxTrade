@@ -666,42 +666,22 @@ async fn run_live_mode(
     let (user_tx, user_rx) = mpsc::channel(100);
     let (aggregation_source_tx, aggregation_source_rx) = mpsc::channel(1000);
 
-    let enabled_exchanges_raw = exchange_opt
-        .or_else(|| non_empty_env("EXCHANGE_ENABLED"))
-        .unwrap_or_else(|| "binance,bybit,backpack".into());
-    let enabled_exchanges = validate_enabled_exchanges(&enabled_exchanges_raw)?;
-    let (binance_user_stream_enabled, backpack_user_stream_enabled) =
-        preflight_user_stream_credentials(&enabled_exchanges, |name| std::env::var(name).ok())?;
-
-    #[cfg(feature = "rithmic")]
-    let rithmic_args = crate::connector::rithmic::live::resolve_live_options(
-        &enabled_exchanges,
-        crate::connector::rithmic::live::LiveOptions::new(
+    let live_runtime = crate::connector::live_runtime::LiveRuntime::prepare(
+        crate::connector::live_runtime::LiveRuntimeOptions::new(
+            exchange_opt,
+            symbol_opt,
+            #[cfg(feature = "rithmic")]
             rithmic_profile,
+            #[cfg(feature = "rithmic")]
             rithmic_account_id,
+            #[cfg(feature = "rithmic")]
             rithmic_product_id,
+            #[cfg(feature = "rithmic")]
             rithmic_exchange,
+            #[cfg(feature = "rithmic")]
             rithmic_symbol,
         ),
-        |name| std::env::var(name).ok(),
     )?;
-    #[cfg(feature = "rithmic")]
-    let mut rithmic_config = rithmic_args
-        .as_ref()
-        .map(crate::connector::rithmic::live::ResolvedLiveOptions::configure)
-        .transpose()?;
-
-    let symbols_str = symbol_opt
-        .or_else(|| non_empty_env("MARKET_DATA_SYMBOLS"))
-        .unwrap_or_else(|| "BTCUSDT,SOLUSDC".into());
-    let symbols = parse_unique_csv("MARKET_DATA_SYMBOLS", &symbols_str, str::to_uppercase)?;
-    let backpack_symbols = if enabled_exchanges.iter().any(|value| value == "backpack") {
-        crate::connector::backpack::resolve_market_data_symbols(
-            non_empty_env("BACKPACK_MARKET_DATA_SYMBOLS").as_deref(),
-        )?
-    } else {
-        Vec::new()
-    };
 
     // --- Supervised task set (Task 1: task supervision) ---
     let mut join_set: JoinSet<(TaskId, anyhow::Result<()>)> = JoinSet::new();
@@ -709,16 +689,10 @@ async fn run_live_mode(
     let watchdog_redis_url = redis_url.clone();
     let watchdog_environment = runtime_environment.clone();
     let execution_venue = non_empty_env("EXCHANGE_ID");
-    #[cfg(feature = "rithmic")]
-    let rithmic_watchdog_identity = rithmic_args
-        .as_ref()
-        .map(crate::connector::rithmic::live::ResolvedLiveOptions::watchdog_identity);
-    #[cfg(not(feature = "rithmic"))]
-    let rithmic_watchdog_identity = None;
     let watchdog_mitigation = crate::connector::emergency::resolve(
         &watchdog_environment,
         execution_venue.as_deref(),
-        rithmic_watchdog_identity,
+        live_runtime.watchdog_identity(),
     )?;
     join_set.spawn(async move {
         let result = match crate::watchdog::Watchdog::new(
@@ -748,64 +722,13 @@ async fn run_live_mode(
         channel_capacity
     );
 
-    // Spawn Connector tasks
-    for exchange_name in &enabled_exchanges {
-        let trade_tx = trade_tx.clone();
-        let candle_tx = candle_tx.clone();
-        let user_tx = user_tx.clone();
-        let symbols = symbols.clone();
-        let backpack_symbols = backpack_symbols.clone();
-
-        match exchange_name.as_str() {
-            "binance" => {
-                join_set.spawn(async move {
-                    let result = crate::connector::binance::run(
-                        symbols,
-                        trade_tx,
-                        candle_tx,
-                        user_tx,
-                        binance_user_stream_enabled,
-                    )
-                    .await;
-                    (TaskId::Connector("binance".to_string()), result)
-                });
-                info!("Supervised task spawned: connector:binance");
-            }
-            "bybit" => {
-                join_set.spawn(async move {
-                    let result = crate::connector::bybit::run(symbols, trade_tx, candle_tx).await;
-                    (TaskId::Connector("bybit".to_string()), result)
-                });
-                info!("Supervised task spawned: connector:bybit");
-            }
-            "backpack" => {
-                join_set.spawn(async move {
-                    let result = crate::connector::backpack::run(
-                        backpack_symbols,
-                        trade_tx,
-                        candle_tx,
-                        user_tx,
-                        backpack_user_stream_enabled,
-                    )
-                    .await;
-                    (TaskId::Connector("backpack".to_string()), result)
-                });
-                info!("Supervised task spawned: connector:backpack");
-            }
-            #[cfg(feature = "rithmic")]
-            "rithmic" => {
-                let config = rithmic_config.take().expect("Rithmic configuration loaded");
-                let aggregation_source_tx = aggregation_source_tx.clone();
-                join_set.spawn(async move {
-                    let result =
-                        crate::connector::rithmic::live::run(config, aggregation_source_tx).await;
-                    (TaskId::Connector("rithmic".to_string()), result)
-                });
-                info!("Supervised task spawned: connector:rithmic");
-            }
-            _ => unreachable!("validated exchange: {exchange_name}"),
-        }
-    }
+    live_runtime.spawn(
+        &mut join_set,
+        trade_tx.clone(),
+        candle_tx.clone(),
+        user_tx.clone(),
+        aggregation_source_tx.clone(),
+    );
 
     // Drop the extra sender clones so channels close properly when connectors exit
     drop(trade_tx);
@@ -1004,59 +927,6 @@ fn normalized_optional_value(value: Option<String>) -> Option<String> {
     value
         .map(|value| value.trim().to_string())
         .filter(|value| !value.is_empty())
-}
-
-fn parse_unique_csv(
-    name: &str,
-    value: &str,
-    canonicalize: fn(&str) -> String,
-) -> anyhow::Result<Vec<String>> {
-    let values: Vec<String> = value
-        .split(',')
-        .map(str::trim)
-        .filter(|item| !item.is_empty())
-        .map(canonicalize)
-        .collect();
-    if values.is_empty() {
-        anyhow::bail!("{name} must contain at least one value");
-    }
-    let unique: std::collections::HashSet<&str> = values.iter().map(String::as_str).collect();
-    if unique.len() != values.len() {
-        anyhow::bail!("{name} must not contain duplicate values");
-    }
-    Ok(values)
-}
-
-fn validate_enabled_exchanges(value: &str) -> anyhow::Result<Vec<String>> {
-    let exchanges = parse_unique_csv("EXCHANGE_ENABLED", value, str::to_lowercase)?;
-    for exchange in &exchanges {
-        match exchange.as_str() {
-            "binance" | "bybit" | "backpack" => {}
-            #[cfg(feature = "rithmic")]
-            "rithmic" => {}
-            _ => anyhow::bail!("unsupported or unavailable exchange: {exchange}"),
-        }
-    }
-    Ok(exchanges)
-}
-
-fn preflight_user_stream_credentials(
-    enabled_exchanges: &[String],
-    lookup: impl Fn(&str) -> Option<String>,
-) -> anyhow::Result<(bool, bool)> {
-    let binance_enabled = enabled_exchanges.iter().any(|value| value == "binance");
-    let backpack_enabled = enabled_exchanges.iter().any(|value| value == "backpack");
-    let binance_user_stream = if binance_enabled {
-        crate::connector::binance::preflight_user_stream_credentials(&lookup)?
-    } else {
-        false
-    };
-    let backpack_user_stream = if backpack_enabled {
-        crate::connector::backpack::preflight_user_stream_credentials(&lookup)?
-    } else {
-        false
-    };
-    Ok((binance_user_stream, backpack_user_stream))
 }
 
 #[cfg(test)]
@@ -1698,6 +1568,34 @@ mod tests {
     }
 
     #[test]
+    fn connector_live_runtime_composition_is_connector_owned() {
+        let main_source = include_str!("main.rs");
+        let owner_source = include_str!("connector/live_runtime.rs");
+        let main_product = main_source
+            .rsplit_once("\n#[cfg(test)]\nmod tests {")
+            .unwrap()
+            .0;
+
+        for (main_detail, owner_detail) in [
+            ("connector::binance::run", "super::binance::run"),
+            ("connector::bybit::run", "super::bybit::run"),
+            ("connector::backpack::run", "super::backpack::run"),
+            (
+                "preflight_user_stream_credentials",
+                "preflight_user_stream_credentials",
+            ),
+            ("resolve_market_data_symbols", "resolve_market_data_symbols"),
+            ("resolve_live_options", "resolve_live_options"),
+        ] {
+            assert!(!main_product.contains(main_detail));
+            assert!(owner_source.contains(owner_detail));
+        }
+        assert!(owner_source.contains("pub(crate) struct LiveRuntime"));
+        assert!(owner_source.contains("pub(crate) fn prepare"));
+        assert!(owner_source.contains("pub(crate) fn spawn"));
+    }
+
+    #[test]
     fn every_supervised_task_exit_is_fatal() {
         for task_id in [
             TaskId::Watchdog,
@@ -1750,23 +1648,6 @@ mod tests {
     }
 
     #[test]
-    fn production_runtime_csv_values_fail_closed() {
-        assert!(parse_unique_csv("MARKET_DATA_SYMBOLS", " , ", str::to_uppercase).is_err());
-        assert_eq!(
-            parse_unique_csv("MARKET_DATA_SYMBOLS", " btcusdt, mnqu6 ", str::to_uppercase,)
-                .unwrap(),
-            vec!["BTCUSDT", "MNQU6"]
-        );
-        assert!(parse_unique_csv("MARKET_DATA_SYMBOLS", "mnqu6,MNQU6", str::to_uppercase).is_err());
-        assert!(validate_enabled_exchanges("unknown").is_err());
-        assert_eq!(
-            validate_enabled_exchanges("BINANCE,bybit").unwrap(),
-            vec!["binance", "bybit"]
-        );
-        assert!(validate_enabled_exchanges("binance,BINANCE").is_err());
-    }
-
-    #[test]
     fn optional_environment_values_are_trimmed() {
         assert_eq!(normalized_optional_value(None), None);
         assert_eq!(normalized_optional_value(Some(String::new())), None);
@@ -1774,70 +1655,6 @@ mod tests {
         assert_eq!(
             normalized_optional_value(Some(" key ".to_string())),
             Some("key".to_string())
-        );
-    }
-
-    #[test]
-    fn user_stream_credentials_are_preflighted_for_enabled_exchanges() {
-        let enabled = vec!["binance".to_string(), "backpack".to_string()];
-        let complete = std::collections::HashMap::from([
-            ("BINANCE_API_KEY", "binance-key"),
-            ("EXCHANGE_API_KEY", "backpack-key"),
-            ("EXCHANGE_SECRET", "backpack-secret"),
-        ]);
-        assert_eq!(
-            preflight_user_stream_credentials(&enabled, |name| {
-                complete.get(name).map(|value| (*value).to_string())
-            })
-            .unwrap(),
-            (true, true)
-        );
-
-        let partial = std::collections::HashMap::from([("EXCHANGE_API_KEY", "backpack-key")]);
-        assert!(preflight_user_stream_credentials(&enabled, |name| {
-            partial.get(name).map(|value| (*value).to_string())
-        })
-        .is_err());
-
-        let public_only = preflight_user_stream_credentials(&enabled, |_| None).unwrap();
-        assert_eq!(public_only, (false, false));
-
-        let binance_only = vec!["binance".to_string()];
-        assert_eq!(
-            preflight_user_stream_credentials(&binance_only, |name| {
-                partial.get(name).map(|value| (*value).to_string())
-            })
-            .unwrap(),
-            (false, false)
-        );
-
-        let backpack_only = vec!["backpack".to_string()];
-        let backpack_complete_with_invalid_binance = std::collections::HashMap::from([
-            ("BINANCE_API_KEY", " binance-key "),
-            ("EXCHANGE_API_KEY", "backpack-key"),
-            ("EXCHANGE_SECRET", "backpack-secret"),
-        ]);
-        assert_eq!(
-            preflight_user_stream_credentials(&backpack_only, |name| {
-                backpack_complete_with_invalid_binance
-                    .get(name)
-                    .map(|value| (*value).to_string())
-            })
-            .unwrap(),
-            (false, true)
-        );
-
-        let both_invalid = std::collections::HashMap::from([
-            ("BINANCE_API_KEY", " binance-key "),
-            ("EXCHANGE_API_KEY", "backpack-key"),
-        ]);
-        assert_eq!(
-            preflight_user_stream_credentials(&enabled, |name| {
-                both_invalid.get(name).map(|value| (*value).to_string())
-            })
-            .unwrap_err()
-            .to_string(),
-            "BINANCE_API_KEY must not contain surrounding whitespace"
         );
     }
 
@@ -1855,34 +1672,6 @@ mod tests {
         ] {
             assert!(!production.contains(forbidden), "{forbidden}");
         }
-    }
-
-    #[cfg(not(feature = "rithmic"))]
-    #[test]
-    fn rithmic_requires_a_rithmic_enabled_build() {
-        assert!(validate_enabled_exchanges("rithmic").is_err());
-    }
-
-    #[cfg(feature = "rithmic")]
-    #[test]
-    fn rithmic_live_option_policy_is_provider_owned() {
-        let production = include_str!("main.rs")
-            .split_once("#[cfg(test)]\nmod tests")
-            .unwrap()
-            .0;
-        for forbidden in [
-            "RITHMIC_PROFILE",
-            "RITHMIC_ACCOUNT_ID",
-            "RITHMIC_PRODUCT_ID",
-            "RITHMIC_EXCHANGE",
-            "RITHMIC_SYMBOL",
-            "resolve_rithmic_live_args",
-        ] {
-            assert!(!production.contains(forbidden), "{forbidden}");
-        }
-        assert!(production.contains("rithmic::live::resolve_live_options("));
-        assert!(production.contains("ResolvedLiveOptions::configure"));
-        assert!(production.contains("ResolvedLiveOptions::watchdog_identity"));
     }
 
     #[tokio::test]

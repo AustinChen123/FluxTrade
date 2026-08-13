@@ -781,11 +781,20 @@ mod tests {
     }
 
     #[test]
-    fn generic_main_delegates_binance_runtime_without_constructing_the_provider() {
-        let main_source = include_str!("../main.rs");
-        assert!(main_source.contains("crate::connector::binance::run("));
-        assert!(!main_source.contains("BinanceConnector::new"));
-        assert!(!main_source.contains("run_binance_connector"));
+    fn generic_main_delegates_binance_runtime_to_the_connector_composition_owner() {
+        let main_product = include_str!("../main.rs")
+            .rsplit_once("\n#[cfg(test)]\nmod tests {")
+            .unwrap()
+            .0;
+        let runtime_product = include_str!("live_runtime.rs")
+            .rsplit_once("\n#[cfg(test)]\nmod tests {")
+            .unwrap()
+            .0;
+
+        assert!(main_product.contains("connector::live_runtime::LiveRuntime"));
+        assert!(!main_product.contains("connector::binance::run("));
+        assert!(!main_product.contains("BinanceConnector::new"));
+        assert_eq!(runtime_product.matches("super::binance::run(").count(), 1);
     }
 
     #[tokio::test]

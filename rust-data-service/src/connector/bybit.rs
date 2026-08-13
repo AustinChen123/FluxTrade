@@ -673,7 +673,14 @@ mod tests {
     fn production_owner_does_not_hide_or_double_log_final_task_failures() {
         let source = include_str!("bybit.rs");
         let production = source.split_once("#[cfg(test)]").unwrap().0;
-        let main = include_str!("../main.rs");
+        let main = include_str!("../main.rs")
+            .rsplit_once("\n#[cfg(test)]\nmod tests {")
+            .unwrap()
+            .0;
+        let runtime = include_str!("live_runtime.rs")
+            .rsplit_once("\n#[cfg(test)]\nmod tests {")
+            .unwrap()
+            .0;
         assert_eq!(production.matches("tokio::spawn").count(), 2);
         assert_eq!(production.matches("self.spawn_task(").count(), 2);
         for monitored in ["self.spawn_task(\"trades\"", "self.spawn_task(\"candles\""] {
@@ -685,9 +692,10 @@ mod tests {
         ] {
             assert!(!production.contains(legacy), "{legacy}");
         }
-        assert!(main.contains("crate::connector::bybit::run("));
+        assert!(!main.contains("crate::connector::bybit::run("));
         assert!(!main.contains("run_bybit_connector"));
         assert!(!main.contains("BybitConnector::new"));
+        assert_eq!(runtime.matches("super::bybit::run(").count(), 1);
     }
 
     #[test]
