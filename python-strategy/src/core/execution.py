@@ -49,6 +49,7 @@ from src.core.execution_submission_gate import ExecutionSubmissionGate
 from src.core import execution_failure_diagnostics
 from src.core import execution_journal
 from src.core import execution_portfolio_exposure
+from src.core import execution_verified_net_reduction
 from src.core.order_event_sync import (
     OrderEventApplier,
     exchange_snapshot_to_order_event,
@@ -369,48 +370,11 @@ class ExecutionEngine:
         )
         if existing_order is None:
             return False
-
-        payload = self._verified_net_reduction_order_payload(
+        return execution_verified_net_reduction.completed_replay(
             signal,
             existing_order,
+            expected_side=self._determine_side(signal.type),
         )
-        verification = payload.get("authoritative_verification")
-        if (
-            not isinstance(verification, dict)
-            or verification.get("status") != "verified_portfolio_reduction"
-            or verification.get("strategy_id") != signal.strategy_id
-            or verification.get("product_id") != signal.product_id
-        ):
-            raise RuntimeError("authoritative_exit_replay_verification_missing")
-        return True
-
-    def _verified_net_reduction_order_payload(
-        self,
-        signal: Signal,
-        order,
-    ) -> dict:
-        payload = order.intent_payload if isinstance(order.intent_payload, dict) else {}
-        signal_payload = payload.get("signal")
-        expected_side = self._determine_side(signal.type)
-        quantity = Decimal(str(order.quantity))
-        filled_quantity = Decimal(str(order.filled_quantity or Decimal("0")))
-        if (
-            expected_side is None
-            or str(order.strategy_id) != signal.strategy_id
-            or str(order.product_id) != signal.product_id
-            or str(order.type) != "market"
-            or str(getattr(order.side, "value", order.side)).lower()
-            != expected_side.value
-            or payload.get("source") != "authoritative_net_reduction"
-            or not isinstance(signal_payload, dict)
-            or signal_payload.get("type") != signal.type.value
-            or str(order.status) != OrderStatus.FILLED.value
-            or not quantity.is_finite()
-            or quantity <= 0
-            or filled_quantity != quantity
-        ):
-            raise RuntimeError("authoritative_exit_replay_identity_mismatch")
-        return payload
 
     def record_verified_net_reduction(
         self,
@@ -419,24 +383,21 @@ class ExecutionEngine:
         *,
         remaining_remote_quantity: Decimal,
     ) -> None:
-        if not remaining_remote_quantity.is_finite() or remaining_remote_quantity < 0:
-            raise ValueError("verified_net_reduction_remaining_quantity_invalid")
+        execution_verified_net_reduction.validate_remaining_remote_quantity(
+            remaining_remote_quantity
+        )
         order = self.order_manager.repo.get_order(order_id)
         if order is None:
             raise RuntimeError("verified_net_reduction_order_missing")
         client_order_id = self._client_order_id_for_signal(signal)
-        if str(order.client_order_id) != client_order_id:
-            raise RuntimeError("verified_net_reduction_order_identity_mismatch")
-
-        payload = dict(self._verified_net_reduction_order_payload(signal, order))
-        payload["authoritative_verification"] = {
-            "status": "verified_portfolio_reduction",
-            "strategy_id": signal.strategy_id,
-            "product_id": signal.product_id,
-            "remaining_remote_quantity": str(remaining_remote_quantity),
-        }
-        setattr(order, "intent_payload", payload)
-        self.order_manager.repo.update_order(order)
+        execution_verified_net_reduction.record_verification(
+            self.order_manager.repo,
+            signal,
+            order,
+            client_order_id=client_order_id,
+            expected_side=self._determine_side(signal.type),
+            remaining_remote_quantity=remaining_remote_quantity,
+        )
 
     def submit_verified_net_reduction(
         self,
