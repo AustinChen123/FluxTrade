@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 import logging
 import math
@@ -26,6 +26,7 @@ from src.core.adapters.rithmic_ledger_recovery import (
 from src.core.adapters.rithmic_native_protection_event import (
     process_native_protection_event,
 )
+from src.core.adapters.rithmic_native_bracket import audit_native_bracket_fill
 from src.core.adapters.rithmic_order_event_lifecycle import (
     RithmicOrderEventLifecycleGate,
 )
@@ -137,6 +138,17 @@ class RithmicRuntimeBootstrap:
         if not self.is_rithmic_runtime:
             return apply_event()
         return process_native_protection_event(repository, event, apply_event)
+
+    def audit_pending_protection_fill(
+        self,
+        repository: IOrderRepository,
+        entry_order: object,
+        related_orders: Sequence[object],
+    ) -> list[dict[str, object]] | None:
+        """Delegate attach-at-entry fill audit to the Rithmic owner."""
+        if not self.is_rithmic_runtime:
+            return None
+        return audit_native_bracket_fill(repository, entry_order, related_orders)
 
 
 def prepare_rithmic_runtime_bootstrap(

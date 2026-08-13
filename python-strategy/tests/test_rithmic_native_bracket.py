@@ -1,11 +1,14 @@
 from decimal import Decimal
+from pathlib import Path
 from types import SimpleNamespace
+from unittest.mock import MagicMock
 
 import pytest
 
 import src.core.adapters.rithmic_recovery as rithmic_recovery_module
 from src.core.client_order_id import linked_client_order_id
 from src.core.adapters.rithmic_native_bracket import (
+    audit_native_bracket_fill,
     build_native_bracket_plan,
     build_native_protection_request,
     build_restored_native_bracket_groups,
@@ -72,6 +75,208 @@ def _bracket_orders():
 
 def _side(order) -> str:
     return str(order.side).lower()
+
+
+def _filled_entry(**overrides):
+    values = {
+        "id": "entry-1",
+        "type": "market",
+        "side": "buy",
+        "filled_price": Decimal("20000.75"),
+    }
+    values.update(overrides)
+    return SimpleNamespace(**values)
+
+
+def _native_leg(**overrides):
+    values = {
+        "id": "stop-1",
+        "type": "stop_loss",
+        "trigger_price": Decimal("19998.25"),
+        "intent_payload": {
+            "placement_mode": "attach-at-entry",
+            "price_tick": "0.25",
+            "ticks": "8",
+            "requested_price": "19998.25",
+        },
+    }
+    values.update(overrides)
+    return SimpleNamespace(**values)
+
+
+def test_fill_audit_returns_unhandled_for_deferred_protection():
+    repository = MagicMock()
+    deferred = _native_leg(intent_payload={"placement_mode": "place-after-fill"})
+
+    assert audit_native_bracket_fill(repository, _filled_entry(), [deferred]) is None
+    repository.update_order.assert_not_called()
+
+
+def test_fill_audit_rejects_mixed_native_and_deferred_group_before_mutation():
+    repository = MagicMock()
+    native = _native_leg()
+    deferred = _native_leg(
+        id="target-1",
+        type="take_profit",
+        intent_payload={"placement_mode": "place-after-fill"},
+    )
+
+    assert audit_native_bracket_fill(
+        repository,
+        _filled_entry(),
+        [native, deferred],
+    ) == [
+        {
+            "order_id": "entry-1",
+            "order_type": "market",
+            "reason": "mixed_native_and_deferred_protection",
+        }
+    ]
+    assert native.intent_payload == {
+        "placement_mode": "attach-at-entry",
+        "price_tick": "0.25",
+        "ticks": "8",
+        "requested_price": "19998.25",
+    }
+    repository.update_order.assert_not_called()
+
+
+def test_fill_audit_rejects_missing_entry_fill_before_leg_mutation():
+    repository = MagicMock()
+    leg = _native_leg()
+
+    assert audit_native_bracket_fill(
+        repository,
+        _filled_entry(filled_price=None),
+        [leg],
+    ) == [
+        {
+            "order_id": "entry-1",
+            "order_type": "market",
+            "reason": "native_bracket_entry_fill_price_missing",
+        }
+    ]
+    repository.update_order.assert_not_called()
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("price_tick", None),
+        ("price_tick", "0"),
+        ("ticks", "NaN"),
+        ("requested_price", "-1"),
+    ],
+)
+def test_fill_audit_rejects_invalid_metadata_without_persistence(field, value):
+    repository = MagicMock()
+    leg = _native_leg()
+    leg.intent_payload[field] = value
+
+    assert audit_native_bracket_fill(
+        repository,
+        _filled_entry(),
+        [leg],
+    ) == [
+        {
+            "order_id": "stop-1",
+            "order_type": "stop_loss",
+            "reason": "native_bracket_audit_metadata_invalid",
+        }
+    ]
+    repository.update_order.assert_not_called()
+
+
+@pytest.mark.parametrize(
+    ("remote_price", "expected_confirmation", "expected_failures"),
+    [
+        (None, "pending_remote_event", []),
+        ("19998.75", "confirmed", []),
+        (
+            "19998.50",
+            "conflict",
+            [
+                {
+                    "order_id": "stop-1",
+                    "order_type": "stop_loss",
+                    "reason": "native_bracket_remote_price_mismatch",
+                }
+            ],
+        ),
+    ],
+)
+def test_fill_audit_projects_exact_remote_confirmation(
+    remote_price,
+    expected_confirmation,
+    expected_failures,
+):
+    repository = MagicMock()
+    leg = _native_leg()
+    original_payload = leg.intent_payload
+    if remote_price is not None:
+        leg.intent_payload["remote_effective_price"] = remote_price
+
+    assert (
+        audit_native_bracket_fill(
+            repository,
+            _filled_entry(),
+            [leg],
+        )
+        == expected_failures
+    )
+
+    assert leg.intent_payload["actual_entry_fill_price"] == "20000.75"
+    assert leg.intent_payload["expected_effective_price"] == "19998.75"
+    assert leg.intent_payload["price_drift"] == "0.50"
+    assert leg.intent_payload["protection_confirmation"] == expected_confirmation
+    if expected_confirmation == "confirmed":
+        assert leg.trigger_price == Decimal("19998.75")
+        assert leg.intent_payload["effective_price"] == "19998.75"
+    else:
+        assert leg.trigger_price == Decimal("19998.25")
+        assert "effective_price" not in leg.intent_payload
+    repository.update_order.assert_called_once_with(leg)
+    assert leg.intent_payload is not original_payload
+    assert "actual_entry_fill_price" not in original_payload
+
+
+def test_fill_audit_preserves_sell_stop_price_direction():
+    repository = MagicMock()
+    leg = _native_leg(
+        trigger_price=Decimal("20002.25"),
+        intent_payload={
+            "placement_mode": "attach-at-entry",
+            "price_tick": "0.25",
+            "ticks": "8",
+            "requested_price": "20002.25",
+            "remote_effective_price": "20002.75",
+        },
+    )
+
+    assert (
+        audit_native_bracket_fill(
+            repository,
+            _filled_entry(side="sell"),
+            [leg],
+        )
+        == []
+    )
+    assert leg.trigger_price == Decimal("20002.75")
+    assert leg.intent_payload["expected_effective_price"] == "20002.75"
+    assert leg.intent_payload["price_drift"] == "0.50"
+
+
+def test_generic_execution_has_no_rithmic_native_fill_audit_policy():
+    source = (Path(__file__).parents[1] / "src" / "core" / "execution.py").read_text()
+
+    for provider_detail in (
+        "_audit_native_bracket_fill",
+        "native_bracket_entry_fill_price_missing",
+        "native_bracket_audit_metadata_invalid",
+        "native_bracket_remote_price_mismatch",
+        "remote_effective_price",
+    ):
+        assert provider_detail not in source
 
 
 @pytest.mark.parametrize(

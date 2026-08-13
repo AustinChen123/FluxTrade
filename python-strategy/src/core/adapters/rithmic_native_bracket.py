@@ -5,11 +5,15 @@ from __future__ import annotations
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from decimal import Decimal, InvalidOperation
-from typing import Generic, TypeVar, TypedDict
+from typing import TYPE_CHECKING, Generic, TypeVar, TypedDict, cast
 
 from src.core.client_order_id import linked_client_order_id
+from src.core.interfaces import IOrderRepository
 from src.core.interfaces.exchange import ExchangeError
 from src.core.product_registry import InstrumentSpec
+
+if TYPE_CHECKING:
+    from src.core.orm_models import Order
 
 
 NativeBracketGroups = dict[str, dict[str, str]]
@@ -30,6 +34,118 @@ class NativeProtectionRequest:
     quantity: str
     leg_type: str
     price: str
+
+
+def audit_native_bracket_fill(
+    repository: IOrderRepository,
+    entry_order: object,
+    related_orders: Sequence[object],
+) -> list[dict[str, object]] | None:
+    """Audit attach-at-entry protection after its parent entry fills."""
+    native_orders = [
+        order
+        for order in related_orders
+        if (getattr(order, "intent_payload", None) or {}).get("placement_mode")
+        == "attach-at-entry"
+    ]
+    if not native_orders:
+        return None
+    if len(native_orders) != len(related_orders):
+        return [
+            {
+                "order_id": str(getattr(entry_order, "id", "?")),
+                "order_type": getattr(entry_order, "type", "?"),
+                "reason": "mixed_native_and_deferred_protection",
+            }
+        ]
+
+    fill_price = getattr(entry_order, "filled_price", None)
+    if fill_price is None or fill_price <= 0:
+        return [
+            {
+                "order_id": str(getattr(entry_order, "id", "?")),
+                "order_type": getattr(entry_order, "type", "?"),
+                "reason": "native_bracket_entry_fill_price_missing",
+            }
+        ]
+
+    failures: list[dict[str, object]] = []
+    for order in native_orders:
+        payload = dict(getattr(order, "intent_payload", None) or {})
+        try:
+            tick = Decimal(str(payload["price_tick"]))
+            distance_ticks = Decimal(str(payload["ticks"]))
+            requested_price = Decimal(str(payload["requested_price"]))
+        except (KeyError, InvalidOperation, TypeError, ValueError):
+            failures.append(
+                _fill_audit_failure(order, "native_bracket_audit_metadata_invalid")
+            )
+            continue
+        if (
+            not all(
+                value.is_finite() for value in (tick, distance_ticks, requested_price)
+            )
+            or tick <= 0
+            or distance_ticks <= 0
+            or requested_price <= 0
+        ):
+            failures.append(
+                _fill_audit_failure(order, "native_bracket_audit_metadata_invalid")
+            )
+            continue
+
+        entry_side = getattr(entry_order, "side", None)
+        away_from_entry = (
+            getattr(entry_side, "value", entry_side) == "buy"
+            and getattr(order, "type", None) == "take_profit"
+        ) or (
+            getattr(entry_side, "value", entry_side) == "sell"
+            and getattr(order, "type", None) == "stop_loss"
+        )
+        expected_price = (
+            fill_price + distance_ticks * tick
+            if away_from_entry
+            else fill_price - distance_ticks * tick
+        )
+        drift = (expected_price - requested_price).copy_abs()
+        payload.update(
+            {
+                "actual_entry_fill_price": str(fill_price),
+                "expected_effective_price": str(expected_price),
+                "price_drift": str(drift),
+            }
+        )
+        remote_raw = payload.get("remote_effective_price")
+        try:
+            remote_price = Decimal(str(remote_raw))
+        except (InvalidOperation, TypeError, ValueError):
+            remote_price = None
+        if remote_price is None:
+            payload["protection_confirmation"] = "pending_remote_event"
+        elif not remote_price.is_finite() or remote_price != expected_price:
+            payload["protection_confirmation"] = "conflict"
+            failures.append(
+                _fill_audit_failure(order, "native_bracket_remote_price_mismatch")
+            )
+        else:
+            payload.update(
+                {
+                    "effective_price": str(remote_price),
+                    "protection_confirmation": "confirmed",
+                }
+            )
+            setattr(order, "trigger_price", remote_price)
+        setattr(order, "intent_payload", payload)
+        repository.update_order(cast("Order", order))
+    return failures
+
+
+def _fill_audit_failure(order: object, reason: str) -> dict[str, object]:
+    return {
+        "order_id": str(getattr(order, "id", "?")),
+        "order_type": getattr(order, "type", "?"),
+        "reason": reason,
+    }
 
 
 def supports_native_bracket_group(orders: Sequence[object]) -> bool:

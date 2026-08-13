@@ -24,6 +24,7 @@ from prometheus_client import REGISTRY
 from src.core.adapters.ccxt_adapter import CcxtExchangeAdapter
 from src.core.adapters.live_binance import LiveBinanceAdapter
 from src.core.adapters.rithmic_adapter import RithmicExchangeAdapter
+from src.core.adapters.rithmic_native_bracket import audit_native_bracket_fill
 from src.core.adapters.rithmic_native_protection_event import (
     process_native_protection_event,
 )
@@ -1447,6 +1448,7 @@ class TestExecutionTradingRules:
             audit_external_orders=True,
             is_backtest=True,
             order_event_processor=process_native_protection_event,
+            pending_protection_fill_processor=audit_native_bracket_fill,
         )
         signal = signal_factory(
             product_id="RITHMIC:NQ-202609",
@@ -1496,6 +1498,7 @@ class TestExecutionTradingRules:
             audit_external_orders=True,
             is_backtest=True,
             order_event_processor=process_native_protection_event,
+            pending_protection_fill_processor=audit_native_bracket_fill,
         )
 
         order_id = engine.execute_signal(
@@ -1628,6 +1631,7 @@ class TestExecutionTradingRules:
             audit_external_orders=True,
             is_backtest=True,
             order_event_processor=process_native_protection_event,
+            pending_protection_fill_processor=audit_native_bracket_fill,
         )
         order_id = engine.execute_signal(
             signal_factory(
@@ -1714,6 +1718,7 @@ class TestExecutionTradingRules:
             audit_external_orders=True,
             is_backtest=True,
             order_event_processor=process_native_protection_event,
+            pending_protection_fill_processor=audit_native_bracket_fill,
         )
         entry_id = engine.execute_signal(
             signal_factory(
@@ -1807,6 +1812,7 @@ class TestExecutionTradingRules:
             audit_external_orders=True,
             is_backtest=True,
             order_event_processor=process_native_protection_event,
+            pending_protection_fill_processor=audit_native_bracket_fill,
         )
         entry_id = engine.execute_signal(
             signal_factory(

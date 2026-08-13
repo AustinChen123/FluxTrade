@@ -42,6 +42,7 @@ from src.core.models import Signal, SignalType
 from src.core.ops_safety import OpsSafetyService
 from src.core.risk_manager import AccountService
 from src.core.runtime_capabilities import (
+    DefaultRuntimeBootstrap,
     KillSwitchClearPreparation,
     OrderAccountIdentity,
     StartupReconciliationState,
@@ -289,6 +290,29 @@ def test_non_rithmic_bootstrap_applies_generic_order_event_once() -> None:
     }
     apply_event.assert_called_once_with()
 
+    assert (
+        bootstrap.audit_pending_protection_fill(
+            repository,
+            object(),
+            [object()],
+        )
+        is None
+    )
+
+
+def test_default_bootstrap_leaves_pending_protection_unhandled() -> None:
+    repository = MagicMock()
+
+    assert (
+        DefaultRuntimeBootstrap().audit_pending_protection_fill(
+            repository,
+            object(),
+            [object()],
+        )
+        is None
+    )
+    assert repository.mock_calls == []
+
 
 def test_rithmic_bootstrap_delegates_order_event_to_provider_owner(monkeypatch) -> None:
     process_event = MagicMock(return_value={"action": "provider"})
@@ -311,6 +335,31 @@ def test_rithmic_bootstrap_delegates_order_event_to_provider_owner(monkeypatch) 
         "action": "provider"
     }
     process_event.assert_called_once_with(repository, event, apply_event)
+
+
+def test_rithmic_bootstrap_delegates_fill_audit_to_provider_owner(monkeypatch) -> None:
+    audit_fill = MagicMock(return_value=[{"reason": "provider"}])
+    monkeypatch.setattr(
+        "src.core.adapters.rithmic_runtime_composition.audit_native_bracket_fill",
+        audit_fill,
+    )
+    bootstrap = prepare_rithmic_runtime_bootstrap(
+        adapter=_rithmic_adapter(),
+        adapter_config={"rithmic_recovery_account_id": "ACCOUNT"},
+        audit_external_orders=True,
+        account_service=MagicMock(spec=AccountService),
+        runtime_environment=RuntimeEnvironment("test"),
+    )
+    repository = MagicMock()
+    entry = object()
+    related = [object()]
+
+    assert bootstrap.audit_pending_protection_fill(
+        repository,
+        entry,
+        related,
+    ) == [{"reason": "provider"}]
+    audit_fill.assert_called_once_with(repository, entry, related)
 
 
 def _callbacks() -> RithmicRuntimeCallbacks:

@@ -3,7 +3,7 @@ from __future__ import annotations
 import logging
 import threading
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any, Callable, Protocol
+from typing import TYPE_CHECKING, Any, Callable, Protocol, Sequence
 
 from src.core.interfaces import IExchangeAdapter, IOrderRepository
 from src.core.interfaces.exchange import ExchangeOrderEvent
@@ -17,6 +17,7 @@ if TYPE_CHECKING:
 
 
 OrderEventApply = Callable[[], dict[str, object]]
+PendingProtectionFillResult = list[dict[str, object]] | None
 
 
 class OrderEventProcessor(Protocol):
@@ -28,6 +29,15 @@ class OrderEventProcessor(Protocol):
     ) -> dict[str, object]: ...
 
 
+class PendingProtectionFillProcessor(Protocol):
+    def __call__(
+        self,
+        repository: IOrderRepository,
+        entry_order: object,
+        related_orders: Sequence[object],
+    ) -> PendingProtectionFillResult: ...
+
+
 def process_order_event_without_venue_policy(
     repository: IOrderRepository,
     event: ExchangeOrderEvent,
@@ -35,6 +45,15 @@ def process_order_event_without_venue_policy(
 ) -> dict[str, object]:
     """Apply an order event when no venue-specific projection is selected."""
     return apply_event()
+
+
+def audit_pending_protection_without_venue_policy(
+    repository: IOrderRepository,
+    entry_order: object,
+    related_orders: Sequence[object],
+) -> PendingProtectionFillResult:
+    """Leave pending protection to generic placement policy."""
+    return None
 
 
 class RuntimeBootstrap(Protocol):
@@ -64,6 +83,13 @@ class RuntimeBootstrap(Protocol):
         event: ExchangeOrderEvent,
         apply_event: OrderEventApply,
     ) -> dict[str, object]: ...
+
+    def audit_pending_protection_fill(
+        self,
+        repository: IOrderRepository,
+        entry_order: object,
+        related_orders: Sequence[object],
+    ) -> PendingProtectionFillResult: ...
 
 
 @dataclass(frozen=True)
@@ -122,6 +148,18 @@ class DefaultRuntimeBootstrap:
             repository,
             event,
             apply_event,
+        )
+
+    def audit_pending_protection_fill(
+        self,
+        repository: IOrderRepository,
+        entry_order: object,
+        related_orders: Sequence[object],
+    ) -> PendingProtectionFillResult:
+        return audit_pending_protection_without_venue_policy(
+            repository,
+            entry_order,
+            related_orders,
         )
 
 

@@ -3,7 +3,7 @@ import threading
 import time as _time
 from collections.abc import Mapping
 from dataclasses import dataclass
-from decimal import Decimal, InvalidOperation
+from decimal import Decimal
 from typing import Callable, ContextManager, Optional
 from sqlalchemy.orm import Session
 from src.core.models import (
@@ -19,6 +19,8 @@ from src.core.order_manager import OrderManager
 from src.core.runtime_capabilities import (
     OrderAccountIdentityResolver,
     OrderEventProcessor,
+    PendingProtectionFillProcessor,
+    audit_pending_protection_without_venue_policy,
     process_order_event_without_venue_policy,
 )
 from src.core.interfaces.exchange import IExchangeAdapter, ExchangeError, NetworkError
@@ -101,6 +103,7 @@ class ExecutionEngine:
         order_account_identity_resolver: OrderAccountIdentityResolver | None = None,
         operation_guard: Callable[[], None] | None = None,
         order_event_processor: OrderEventProcessor | None = None,
+        pending_protection_fill_processor: PendingProtectionFillProcessor | None = None,
     ):
         self.logger = logging.getLogger("ExecutionEngine")
         self.clock = clock
@@ -110,6 +113,10 @@ class ExecutionEngine:
         self._operation_guard = operation_guard or (lambda: None)
         self._order_event_processor = (
             order_event_processor or process_order_event_without_venue_policy
+        )
+        self._pending_protection_fill_processor = (
+            pending_protection_fill_processor
+            or audit_pending_protection_without_venue_policy
         )
         self._position_loader = (
             getattr(
@@ -1952,21 +1959,13 @@ class ExecutionEngine:
             and order.intent_payload.get("pending_entry_order_id")
             == str(entry_order.id)
         ]
-        native_orders = [
-            order
-            for order in related_orders
-            if order.intent_payload.get("placement_mode") == "attach-at-entry"
-        ]
-        if native_orders:
-            if len(native_orders) != len(related_orders):
-                return [
-                    {
-                        "order_id": str(entry_order.id),
-                        "order_type": entry_order.type,
-                        "reason": "mixed_native_and_deferred_protection",
-                    }
-                ]
-            return self._audit_native_bracket_fill(entry_order, native_orders)
+        provider_result = self._pending_protection_fill_processor(
+            self.order_manager.repo,
+            entry_order,
+            related_orders,
+        )
+        if provider_result is not None:
+            return provider_result
         pending = [
             order for order in related_orders if order.status == OrderStatus.NEW.value
         ]
@@ -1992,99 +1991,6 @@ class ExecutionEngine:
             failures.append(lookup_failure)
         if placement_candidates:
             failures.extend(self._place_conditional_orders(placement_candidates))
-        return failures
-
-    def _audit_native_bracket_fill(
-        self, entry_order, native_orders: list
-    ) -> list[dict]:
-        fill_price = entry_order.filled_price
-        if fill_price is None or fill_price <= 0:
-            return [
-                {
-                    "order_id": str(entry_order.id),
-                    "order_type": entry_order.type,
-                    "reason": "native_bracket_entry_fill_price_missing",
-                }
-            ]
-        failures = []
-        for order in native_orders:
-            payload = dict(order.intent_payload or {})
-            try:
-                tick = Decimal(str(payload["price_tick"]))
-                distance_ticks = Decimal(str(payload["ticks"]))
-                requested_price = Decimal(str(payload["requested_price"]))
-            except (KeyError, InvalidOperation, TypeError, ValueError):
-                failures.append(
-                    {
-                        "order_id": str(order.id),
-                        "order_type": order.type,
-                        "reason": "native_bracket_audit_metadata_invalid",
-                    }
-                )
-                continue
-            if (
-                not all(
-                    value.is_finite()
-                    for value in (tick, distance_ticks, requested_price)
-                )
-                or tick <= 0
-                or distance_ticks <= 0
-                or requested_price <= 0
-            ):
-                failures.append(
-                    {
-                        "order_id": str(order.id),
-                        "order_type": order.type,
-                        "reason": "native_bracket_audit_metadata_invalid",
-                    }
-                )
-                continue
-            away_from_entry = (
-                getattr(entry_order.side, "value", entry_order.side) == "buy"
-                and order.type == "take_profit"
-            ) or (
-                getattr(entry_order.side, "value", entry_order.side) == "sell"
-                and order.type == "stop_loss"
-            )
-            expected_price = (
-                fill_price + distance_ticks * tick
-                if away_from_entry
-                else fill_price - distance_ticks * tick
-            )
-            drift = (expected_price - requested_price).copy_abs()
-            payload.update(
-                {
-                    "actual_entry_fill_price": str(fill_price),
-                    "expected_effective_price": str(expected_price),
-                    "price_drift": str(drift),
-                }
-            )
-            remote_raw = payload.get("remote_effective_price")
-            try:
-                remote_price = Decimal(str(remote_raw))
-            except (InvalidOperation, TypeError, ValueError):
-                remote_price = None
-            if remote_price is None:
-                payload["protection_confirmation"] = "pending_remote_event"
-            elif not remote_price.is_finite() or remote_price != expected_price:
-                payload["protection_confirmation"] = "conflict"
-                failures.append(
-                    {
-                        "order_id": str(order.id),
-                        "order_type": order.type,
-                        "reason": "native_bracket_remote_price_mismatch",
-                    }
-                )
-            else:
-                payload.update(
-                    {
-                        "effective_price": str(remote_price),
-                        "protection_confirmation": "confirmed",
-                    }
-                )
-                order.trigger_price = remote_price
-            order.intent_payload = payload
-            self.order_manager.repo.update_order(order)
         return failures
 
     @staticmethod
