@@ -31,6 +31,9 @@ mod order_pending;
 #[path = "connector/rithmic/order_runtime.rs"]
 pub(crate) mod order_runtime;
 
+#[path = "connector/rithmic/order_session.rs"]
+mod order_session;
+
 #[path = "connector/rithmic/market.rs"]
 #[allow(dead_code)]
 pub(crate) mod market;

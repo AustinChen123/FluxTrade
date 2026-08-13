@@ -1,15 +1,13 @@
 use super::{
-    config,
     ledger::{AccountIdentity, OrderSnapshot, UserType},
-    ledger_runtime::{discover_order_account_with_login, next_payload, wait_for_heartbeat},
-    order::{self, TradeRoute, TradeRouteEvent},
+    order::{self, TradeRoute},
     order_command::{BracketOrder, ExitPosition, NewOrder, OrderAck, ProtectionModification},
     order_dispatch::{begin_command, reject_command, Command, Reply},
     order_event::{self, OrderEvent},
     order_pending::{self, fail_pending, pending_expired, Pending},
+    order_session::connect_and_prepare,
     profile_lock::ProfileLease,
-    session::Plant,
-    transport::{self, ConnectionEvent, RithmicConnection},
+    transport::{ConnectionEvent, RithmicConnection},
 };
 use anyhow::{bail, ensure, Context, Result};
 use std::{
@@ -33,14 +31,13 @@ use super::order_pending::{
     complete_lookup, complete_or_restore_cancel, update_pending_from_event,
     update_pending_from_snapshot, SubmitKind,
 };
+#[cfg(test)]
+use super::order_session::{connect_and_prepare_runtime, SUBSCRIBE_KEY, TRADE_ROUTES_KEY};
 
-const RESPONSE_TIMEOUT: Duration = Duration::from_secs(10);
 const STARTUP_TIMEOUT: Duration = Duration::from_secs(45);
 const COMMAND_TIMEOUT: Duration = Duration::from_secs(30);
 const RECONNECT_INITIAL: Duration = Duration::from_secs(1);
 const RECONNECT_MAX: Duration = Duration::from_secs(30);
-const TRADE_ROUTES_KEY: &str = "fluxtrade-order-routes";
-const SUBSCRIBE_KEY: &str = "fluxtrade-order-subscribe";
 
 pub(crate) struct OrderRuntimeHandle {
     commands: mpsc::Sender<Command>,
@@ -302,66 +299,6 @@ async fn run_with_connector<C, F>(
     }
 }
 
-async fn connect_and_prepare(
-    profile: &str,
-    account_id: Option<&str>,
-) -> Result<(
-    RithmicConnection,
-    AccountIdentity,
-    UserType,
-    Vec<TradeRoute>,
-)> {
-    let runtime = config::load(profile, Plant::Order)?;
-    connect_and_prepare_runtime(runtime, account_id).await
-}
-
-async fn connect_and_prepare_runtime(
-    runtime: config::RuntimeConfig,
-    account_id: Option<&str>,
-) -> Result<(
-    RithmicConnection,
-    AccountIdentity,
-    UserType,
-    Vec<TradeRoute>,
-)> {
-    let mut connection = transport::connect(&runtime.url, runtime.login, RESPONSE_TIMEOUT).await?;
-    wait_for_heartbeat(&mut connection, "ORDER").await?;
-    let (account, login_info) =
-        discover_order_account_with_login(&mut connection, account_id).await?;
-    let account = account.identity;
-
-    connection
-        .send_payload(order::trade_routes_request(TRADE_ROUTES_KEY)?)
-        .await?;
-    let routes = collect_trade_routes(&mut connection).await?;
-    ensure!(!routes.is_empty(), "Rithmic returned no open trade routes");
-
-    connection
-        .send_payload(order::subscribe_order_updates_request(
-            SUBSCRIBE_KEY,
-            &account,
-        )?)
-        .await?;
-    let payload = tokio::time::timeout(RESPONSE_TIMEOUT, next_payload(&mut connection))
-        .await
-        .context("Rithmic order-update subscription timed out")??;
-    order::decode_subscribe_order_updates_response(&payload, SUBSCRIBE_KEY)?;
-    Ok((connection, account, login_info.user_type, routes))
-}
-
-async fn collect_trade_routes(connection: &mut RithmicConnection) -> Result<Vec<TradeRoute>> {
-    let mut routes = Vec::new();
-    loop {
-        let payload = tokio::time::timeout(RESPONSE_TIMEOUT, next_payload(connection))
-            .await
-            .context("Rithmic trade-route request timed out")??;
-        match order::decode_trade_route_event(&payload, TRADE_ROUTES_KEY)? {
-            TradeRouteEvent::Route(route) => routes.push(route),
-            TradeRouteEvent::Completed => return Ok(routes),
-        }
-    }
-}
-
 async fn run_connected(
     connection: &mut RithmicConnection,
     account: &AccountIdentity,
@@ -462,7 +399,12 @@ fn handle_payload(
 #[cfg(test)]
 mod tests {
     use super::super::ledger::TransactionType;
-    use super::super::{codec, config::RuntimeConfig, protocol, session::LoginParameters};
+    use super::super::{
+        codec,
+        config::RuntimeConfig,
+        protocol,
+        session::{LoginParameters, Plant},
+    };
     use super::*;
     use futures_util::{SinkExt, StreamExt};
     use rust_decimal_macros::dec;
@@ -766,6 +708,35 @@ mod tests {
                     "missing dispatch ledger: {expected}"
                 );
             }
+        }
+    }
+
+    #[test]
+    fn session_preparation_implementation_has_one_module_owner() {
+        let actor = include_str!("order_runtime.rs")
+            .split_once("#[cfg(test)]\nmod tests {")
+            .unwrap()
+            .0;
+        let owner = include_str!("order_session.rs");
+        for expected in [
+            "async fn connect_and_prepare(",
+            "async fn connect_and_prepare_runtime(",
+            "async fn collect_trade_routes(",
+            "fluxtrade-order-routes",
+            "fluxtrade-order-subscribe",
+            "wait_for_heartbeat(&mut connection, \"ORDER\")",
+            "discover_order_account_with_login",
+            "Rithmic returned no open trade routes",
+            "decode_subscribe_order_updates_response",
+        ] {
+            assert!(
+                owner.contains(expected),
+                "missing session owner for {expected}"
+            );
+            assert!(
+                !actor.contains(expected),
+                "duplicate runtime session owner for {expected}"
+            );
         }
     }
 

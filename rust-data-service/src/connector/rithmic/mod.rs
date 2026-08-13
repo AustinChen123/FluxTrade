@@ -35,6 +35,8 @@ mod order_event;
 
 mod order_pending;
 
+mod order_session;
+
 #[allow(dead_code)]
 pub(crate) mod order_runtime;
 
