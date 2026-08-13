@@ -46,6 +46,7 @@ from src.core.fill_delta import (
     fill_delta_from_cumulative,
 )
 from src.core.execution_submission_gate import ExecutionSubmissionGate
+from src.core import execution_failure_diagnostics
 from src.core.order_event_sync import (
     OrderEventApplier,
     exchange_snapshot_to_order_event,
@@ -1691,7 +1692,7 @@ class ExecutionEngine:
                     write_event=False,
                 )
                 with self._db_session_factory() as db:
-                    self._write_order_rejection_event(
+                    execution_failure_diagnostics.write_order_rejection_event(
                         db,
                         order=order,
                         order_type=order_type,
@@ -1734,7 +1735,7 @@ class ExecutionEngine:
                     write_event=False,
                 )
                 with self._db_session_factory() as db:
-                    self._write_order_rejection_event(
+                    execution_failure_diagnostics.write_order_rejection_event(
                         db,
                         order=order,
                         order_type=order_type,
@@ -2587,80 +2588,14 @@ class ExecutionEngine:
         phase: str,
         write_event: bool = True,
     ) -> str:
-        reason = self._order_rejection_reason(error)
-        ORDERS_TOTAL.labels(
+        return execution_failure_diagnostics.record_order_rejection(
+            db_session_factory=self._db_session_factory,
+            logger=self.logger,
+            order=order,
             order_type=order_type,
-            status="failed",
-            reason=reason,
-        ).inc()
-        if write_event:
-            self._try_write_order_rejection_event(
-                order=order,
-                order_type=order_type,
-                reason=reason,
-                error=error,
-                phase=phase,
-            )
-        return reason
-
-    @staticmethod
-    def _order_rejection_reason(error: ExchangeError) -> str:
-        message = str(error)
-        token = message.split(":", 1)[0].strip()
-        normalized = "".join(
-            char if char.isalnum() else "_" for char in token.lower()
-        ).strip("_")
-        return normalized or "exchange_error"
-
-    def _try_write_order_rejection_event(
-        self,
-        *,
-        order,
-        order_type: str,
-        reason: str,
-        error: ExchangeError,
-        phase: str,
-    ) -> None:
-        if self._db_session_factory is None:
-            return
-        try:
-            with self._db_session_factory() as db:
-                self._write_order_rejection_event(
-                    db,
-                    order=order,
-                    order_type=order_type,
-                    reason=reason,
-                    error=error,
-                    phase=phase,
-                )
-                db.commit()
-        except Exception:
-            self.logger.exception("Failed to write order rejection system event")
-
-    def _write_order_rejection_event(
-        self,
-        db: Session,
-        *,
-        order,
-        order_type: str,
-        reason: str,
-        error: ExchangeError,
-        phase: str,
-    ) -> None:
-        write_system_event(
-            db,
-            event_type="system_error",
-            event_subtype="order_rejected",
-            related_strategy_id=order.strategy_id,
-            related_order_id=str(order.id),
-            payload={
-                "order_id": str(order.id),
-                "product_id": order.product_id,
-                "order_type": order_type,
-                "phase": phase,
-                "reason": reason,
-                "error": str(error),
-            },
+            error=error,
+            phase=phase,
+            write_event=write_event,
         )
 
     def _place_conditional_orders(self, conditional_orders: list) -> list[dict]:
@@ -2766,7 +2701,7 @@ class ExecutionEngine:
         ORDERS_TOTAL.labels(
             order_type=order.type,
             status="failed",
-            reason=self._order_rejection_reason(error),
+            reason=execution_failure_diagnostics.order_rejection_reason(error),
         ).inc()
         return [
             {
@@ -2784,25 +2719,13 @@ class ExecutionEngine:
         order,
         failures: list[dict],
     ) -> None:
-        if self._db_session_factory is None:
-            return
-        try:
-            with self._db_session_factory() as db:
-                write_system_event(
-                    db,
-                    event_type="system_error",
-                    event_subtype=event_subtype,
-                    related_strategy_id=order.strategy_id,
-                    related_order_id=str(order.id),
-                    payload={
-                        "order_id": str(order.id),
-                        "product_id": order.product_id,
-                        "failures": failures,
-                    },
-                )
-                db.commit()
-        except Exception:
-            self.logger.exception("Failed to write conditional order warning event")
+        execution_failure_diagnostics.try_write_conditional_order_event_warning(
+            db_session_factory=self._db_session_factory,
+            logger=self.logger,
+            event_subtype=event_subtype,
+            order=order,
+            failures=failures,
+        )
 
     def _journal_fill(
         self,

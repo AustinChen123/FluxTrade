@@ -31,7 +31,7 @@ from src.core.interfaces.exchange import ExchangeError
 from src.core.interfaces.exchange import NetworkError
 from src.core.interfaces.exchange import ExchangeOrderLookupUnsupported
 from src.core.models import OrderStatus, Position, PositionSide, SignalType
-from src.core.orm_models import SystemEvent
+from src.core.orm_models import SignalAudit, SystemEvent
 from src.core.client_order_id import generate_client_order_id, parse_client_order_id
 
 
@@ -2016,6 +2016,13 @@ class TestExecutionTradingRules:
         assert events[0].related_order_id == failed_orders[0].id
         assert events[0].payload["reason"] == "min_notional_not_met"
         assert events[0].payload["phase"] == "audited_execution"
+        persisted = [call.args[0] for call in mock_db_session.add.call_args_list]
+        assert [type(value) for value in persisted] == [
+            SignalAudit,
+            SystemEvent,
+            SignalAudit,
+        ]
+        assert mock_db_session.commit.call_count == 2
 
     def test_market_min_notional_without_reference_price_fails_local_order_and_audit(
         self, mock_db_session, mock_clock, mock_order_repo, signal_factory
@@ -3429,6 +3436,38 @@ class TestAuditedExecution:
             "error": "Unknown symbol",
         }
 
+    def test_rejection_projection_failure_preserves_primary_identity_and_no_early_commit(
+        self,
+        mock_db_session,
+        mock_clock,
+        mock_exchange_adapter,
+        mock_order_repo,
+        signal_factory,
+    ):
+        mock_exchange_adapter.set_should_fail(True, "Order rejected")
+        engine = ExecutionEngine(
+            db_session=mock_db_session,
+            clock=mock_clock,
+            adapter=mock_exchange_adapter,
+            order_repository=mock_order_repo,
+            db_session_factory=lambda: nullcontext(mock_db_session),
+            audit_external_orders=True,
+        )
+        error = RuntimeError("rejection projection sentinel")
+
+        with patch(
+            "src.core.execution_failure_diagnostics.write_order_rejection_event",
+            side_effect=error,
+        ), pytest.raises(RuntimeError) as raised:
+            engine.execute_signal(signal_factory(price=Decimal("42000")))
+
+        assert raised.value is error
+        assert mock_db_session.commit.call_count == 1
+        mock_db_session.rollback.assert_not_called()
+        audit = mock_db_session.add.call_args_list[0].args[0]
+        assert isinstance(audit, SignalAudit)
+        assert audit.outcome_payload is None
+
     @pytest.mark.parametrize(
         ("lookup_result", "expected_action"),
         [
@@ -3612,6 +3651,59 @@ class TestAuditedExecution:
         assert set(event.payload["conditional_order_ids"]) == {
             order.id for order in conditional_orders
         }
+        events = [
+            call.args[0]
+            for call in audit_session.add.call_args_list
+            if isinstance(call.args[0], SystemEvent)
+        ]
+        assert [event.event_subtype for event in events] == [
+            "order_rejected",
+            "protective_orders_pending_after_submit_uncertainty",
+        ]
+        persisted = [call.args[0] for call in audit_session.add.call_args_list]
+        assert isinstance(persisted[0], SignalAudit)
+        assert persisted[1:3] == events
+        assert persisted[3] is persisted[0]
+        assert audit_session.commit.call_count == 2
+
+    def test_pending_warning_failure_preserves_identity_and_prevents_audit_commit(
+        self,
+        mock_db_session,
+        mock_clock,
+        mock_exchange_adapter,
+        mock_order_repo,
+        signal_factory,
+    ):
+        mock_exchange_adapter.place_order = MagicMock(
+            side_effect=NetworkError("Connection timeout")
+        )
+        mock_exchange_adapter.get_order_by_client_id = MagicMock(return_value=None)
+        engine = ExecutionEngine(
+            db_session=mock_db_session,
+            clock=mock_clock,
+            adapter=mock_exchange_adapter,
+            order_repository=mock_order_repo,
+            db_session_factory=lambda: nullcontext(mock_db_session),
+            audit_external_orders=True,
+        )
+        error = RuntimeError("pending warning sentinel")
+        engine._write_pending_protection_warning = MagicMock(side_effect=error)
+
+        with pytest.raises(RuntimeError) as raised:
+            engine.execute_signal(
+                signal_factory(
+                    price=Decimal("42000"),
+                    stop_loss=Decimal("41000"),
+                )
+            )
+
+        assert raised.value is error
+        assert mock_db_session.commit.call_count == 1
+        mock_db_session.rollback.assert_not_called()
+        persisted = [call.args[0] for call in mock_db_session.add.call_args_list]
+        assert [type(value) for value in persisted] == [SignalAudit, SystemEvent]
+        assert persisted[1].event_subtype == "order_rejected"
+        assert persisted[0].outcome_payload is None
 
     def test_ambiguous_submit_error_with_terminal_snapshot_does_not_place_protection(
         self, mock_db_session, mock_clock, mock_exchange_adapter, mock_order_repo, signal_factory
