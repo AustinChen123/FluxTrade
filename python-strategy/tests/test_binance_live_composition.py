@@ -139,9 +139,10 @@ def test_binance_owner_keeps_existing_module_dependency_boundary():
     ]
 
     assert imports == [
-        "import logging",
         "import asyncio",
+        "import logging",
         "from collections.abc import Callable",
+        "from typing import cast",
         (
             "from src.core.adapters.binance_order_routing import "
             "binance_conditional_order_mapping, "
@@ -160,10 +161,12 @@ def test_binance_owner_keeps_existing_module_dependency_boundary():
         ),
         (
             "from src.core.adapters.binance_ws_order import "
-            "BinanceWebSocketOrderConnector"
+            "BinanceWebSocketOrderConnector, OrderRejected"
         ),
         "from src.core.adapters.ccxt_adapter import CcxtExchangeAdapter",
+        "from src.core.interfaces.exchange import NetworkError",
         "from src.core.orm_models import Order",
+        "from src.core.product_registry import to_base_quote",
     ]
     owner = next(
         node

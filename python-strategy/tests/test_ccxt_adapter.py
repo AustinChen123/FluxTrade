@@ -7,6 +7,7 @@ import pytest
 
 from src.core.adapters import create_adapter
 from src.core.adapters.binance_client_order_id import to_binance_client_order_id
+from src.core.adapters.binance_ws_order import OrderAckTimeout
 from src.core.adapters.ccxt_adapter import (
     AccountInitializationConfig,
     AccountPositionMode,
@@ -1980,8 +1981,8 @@ class TestLiveBinanceWsOrderPath:
             mock_ws_inst.place_order.assert_not_called()
             assert client.create_order.call_args.kwargs["params"]["reduceOnly"] is True
 
-    def test_ws_ack_timeout_falls_back_to_rest(self):
-        """WS ACK timeout should fall back to REST."""
+    def test_ws_ack_timeout_is_ambiguous_and_never_rests(self):
+        """WS ACK timeout must enter generic ambiguous-submit recovery."""
         with patch("src.core.adapters.ccxt_adapter.ccxt") as mock_ccxt, \
              patch("src.core.adapters.live_binance.BinanceWebSocketOrderConnector") as MockWS:
             mock_cls = MagicMock()
@@ -1997,15 +1998,18 @@ class TestLiveBinanceWsOrderPath:
             mock_ws_inst = MagicMock()
             mock_ws_inst.is_connected.return_value = True
             mock_ws_inst.place_order.return_value = True
-            mock_ws_inst._wait_for_ack.side_effect = TimeoutError("ack timeout")
+            timeout = OrderAckTimeout("ack timeout")
+            mock_ws_inst._wait_for_ack.side_effect = timeout
             MockWS.return_value = mock_ws_inst
 
             adapter = LiveBinanceAdapter(api_key="k", secret="s", enable_ws=True)
             adapter.client = client
             order = _make_order(type="market", client_order_id=CANONICAL_CLIENT_ORDER_ID)
-            result = adapter.place_order(order)
+            with pytest.raises(NetworkError) as exc_info:
+                adapter.place_order(order)
 
-            assert result == "REST-ACK-TIMEOUT"
+            assert exc_info.value is timeout
+            client.create_order.assert_not_called()
 
     def test_ws_failure_falls_back_to_rest(self):
         """WS order failure should fall back to REST."""

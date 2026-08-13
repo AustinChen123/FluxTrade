@@ -4,9 +4,10 @@ Extends CcxtExchangeAdapter with WS market-order fast path.
 Falls back to REST (parent class) when WS is unavailable.
 """
 
-import logging
 import asyncio
+import logging
 from collections.abc import Callable
+from typing import cast
 
 from src.core.adapters.binance_order_routing import (
     binance_conditional_order_mapping,
@@ -19,9 +20,14 @@ from src.core.adapters.binance_user_stream import (
     create_binance_user_stream_listen_key,
     keepalive_binance_user_stream,
 )
-from src.core.adapters.binance_ws_order import BinanceWebSocketOrderConnector
+from src.core.adapters.binance_ws_order import (
+    BinanceWebSocketOrderConnector,
+    OrderRejected,
+)
 from src.core.adapters.ccxt_adapter import CcxtExchangeAdapter
+from src.core.interfaces.exchange import NetworkError
 from src.core.orm_models import Order
+from src.core.product_registry import to_base_quote
 
 
 class LiveBinanceAdapter(CcxtExchangeAdapter):
@@ -128,6 +134,7 @@ class LiveBinanceAdapter(CcxtExchangeAdapter):
 
     def place_order(self, order: Order) -> str:
         intent_payload = getattr(order, "intent_payload", None)
+        order_type = cast(str | None, order.type)
         reduce_only = (
             isinstance(intent_payload, dict)
             and intent_payload.get("reduce_only") is True
@@ -137,34 +144,54 @@ class LiveBinanceAdapter(CcxtExchangeAdapter):
             not reduce_only
             and self.ws_connector
             and self.ws_connector.is_connected()
-            and order.type
-            and order.type.lower() == "market"
+            and order_type
+            and order_type.lower() == "market"
         ):
-            try:
+            client_order_id = cast(
+                str | None,
+                getattr(order, "client_order_id", None),
+            )
+            if client_order_id:
                 self._quantize_order(order)
-                client_order_id = getattr(order, "client_order_id", None)
-                exchange_client_order_id = (
-                    self._exchange_client_order_id(client_order_id)
-                    if client_order_id
-                    else None
+                exchange_client_order_id = self._exchange_client_order_id(
+                    client_order_id
                 )
-                success = self.ws_connector.place_order(
-                    symbol=order.product_id,
-                    side=order.side,
-                    quantity=str(order.quantity),
-                    price=str(order.price) if order.price else None,
-                    order_type=order.type,
-                    client_order_id=exchange_client_order_id,
-                )
-                if success:
-                    if exchange_client_order_id:
-                        ack = asyncio.run(
-                            self.ws_connector._wait_for_ack(exchange_client_order_id)
-                        )
-                        return ack.exchange_order_id
-                    return f"WS-{order.id}"
-            except Exception as e:
-                self.logger.warning("WS order failed, falling back to REST: %s", e)
+                base, quote = to_base_quote(cast(str, order.product_id))
+                try:
+                    success = self.ws_connector.place_order(
+                        symbol=f"{base}{quote}",
+                        side=cast(str, order.side),
+                        quantity=str(order.quantity),
+                        price=str(order.price) if order.price is not None else None,
+                        order_type=order_type,
+                        client_order_id=exchange_client_order_id,
+                    )
+                except NetworkError:
+                    raise
+                except Exception:
+                    self.logger.warning(
+                        "Binance WebSocket order failed before scheduling; using REST"
+                    )
+                else:
+                    if success:
+                        try:
+                            ack = asyncio.run(
+                                self.ws_connector._wait_for_ack(
+                                    exchange_client_order_id
+                                )
+                            )
+                        except OrderRejected:
+                            self.logger.warning(
+                                "Binance WebSocket order was rejected; using REST"
+                            )
+                        except NetworkError:
+                            raise
+                        except Exception as error:
+                            raise NetworkError(
+                                "Binance WebSocket order acknowledgement is ambiguous"
+                            ) from error
+                        else:
+                            return ack.exchange_order_id
 
         # REST fallback (parent class)
         return super().place_order(order)

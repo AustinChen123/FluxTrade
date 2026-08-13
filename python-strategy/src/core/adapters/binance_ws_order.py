@@ -9,7 +9,8 @@ import logging
 import threading
 import time
 from typing import Any, cast
-from urllib.parse import urlencode
+
+from src.core.interfaces.exchange import ExchangeError, NetworkError
 
 websockets: Any = None
 try:
@@ -25,8 +26,20 @@ MAX_BACKOFF = 300.0
 MAX_RETRIES = 10
 
 
-class OrderAckTimeout(TimeoutError):
+class OrderAckTimeout(NetworkError):
     """Raised when a Binance order ACK does not arrive before timeout."""
+
+
+class OrderRejected(ExchangeError):
+    """Sanitized deterministic rejection from Binance WebSocket order entry."""
+
+    def __init__(self, *, status: int, code: int | None) -> None:
+        self.status = status
+        self.code = code
+        super().__init__(
+            "Binance WebSocket order rejected: "
+            f"status={status} code={code if code is not None else 'unknown'}"
+        )
 
 
 @dataclass(frozen=True)
@@ -38,7 +51,7 @@ class ExchangeAck:
 def _sign_payload_binance(payload: str | dict[str, Any], secret: str) -> str:
     """Return Binance-compatible HMAC-SHA256 signature for a payload."""
     if isinstance(payload, dict):
-        payload = urlencode(payload, doseq=True)
+        payload = "&".join(f"{key}={payload[key]}" for key in sorted(payload))
     return hmac.new(
         secret.encode("utf-8"),
         payload.encode("utf-8"),
@@ -64,13 +77,13 @@ class BinanceWebSocketOrderConnector:
         self.running = False
         self.thread = None
         self.logger = logging.getLogger("WS_Connector")
-        self._ack_registry: dict[str, ExchangeAck] = {}
+        self._ack_registry: dict[str, ExchangeAck | ExchangeError] = {}
         self._ack_lock = threading.Lock()
 
     def _get_ws_url(self) -> str:
         if self.testnet:
             return "wss://testnet.binancefuture.com/ws-fapi/v1"
-        return "wss://fstream.binance.com/ws-fapi/v1"
+        return "wss://ws-fapi.binance.com/ws-fapi/v1"
 
     def start(self) -> None:
         if not HAS_WEBSOCKETS:
@@ -137,36 +150,56 @@ class BinanceWebSocketOrderConnector:
     def _handle_message(self, msg: str | bytes) -> None:
         try:
             data = json.loads(msg)
-        except json.JSONDecodeError:
-            self.logger.warning("Ignoring non-JSON WS message: %s", msg)
+        except (json.JSONDecodeError, UnicodeDecodeError):
+            self.logger.warning("Ignoring non-JSON Binance WS order response")
             return
 
-        coid = (
-            data.get("clientOrderId")
-            or data.get("client_order_id")
-            or data.get("c")
-            or data.get("params", {}).get("clientOrderId")
-        )
-        exchange_order_id = (
-            data.get("orderId")
-            or data.get("exchange_order_id")
-            or data.get("i")
-            or data.get("params", {}).get("orderId")
-        )
-        ack_type = (
-            data.get("ack_type")
-            or data.get("status")
-            or data.get("X")
-            or data.get("params", {}).get("status")
-            or "ACK"
-        )
-        if coid and exchange_order_id:
+        if not isinstance(data, dict):
+            return
+        request_id = data.get("id")
+        status = data.get("status")
+        if not isinstance(request_id, str) or type(status) is not int:
+            return
+        if status != 200:
+            error = data.get("error")
+            code = error.get("code") if isinstance(error, dict) else None
+            safe_code = code if type(code) is int else None
+            failure: ExchangeError
+            if status == 408 or status >= 500 or safe_code in {-1006, -1007}:
+                failure = NetworkError(
+                    "Binance WebSocket order response is ambiguous: "
+                    f"status={status} "
+                    f"code={safe_code if safe_code is not None else 'unknown'}"
+                )
+            else:
+                failure = OrderRejected(status=status, code=safe_code)
             self._record_ack(
-                str(coid),
-                ExchangeAck(str(exchange_order_id), str(ack_type)),
+                request_id,
+                failure,
             )
+            return
 
-    def _record_ack(self, client_order_id: str, ack: ExchangeAck) -> None:
+        result = data.get("result")
+        if not isinstance(result, dict):
+            return
+        client_order_id = result.get("clientOrderId")
+        exchange_order_id = result.get("orderId")
+        if client_order_id != request_id or type(exchange_order_id) not in (int, str):
+            return
+        ack_type = result.get("status")
+        self._record_ack(
+            request_id,
+            ExchangeAck(
+                str(exchange_order_id),
+                ack_type if isinstance(ack_type, str) else "ACK",
+            ),
+        )
+
+    def _record_ack(
+        self,
+        client_order_id: str,
+        ack: ExchangeAck | ExchangeError,
+    ) -> None:
         with self._ack_lock:
             self._ack_registry[client_order_id] = ack
 
@@ -182,6 +215,8 @@ class BinanceWebSocketOrderConnector:
             with self._ack_lock:
                 ack = self._ack_registry.pop(client_order_id, None)
             if ack is not None:
+                if isinstance(ack, ExchangeError):
+                    raise ack
                 return ack
             remaining = deadline - loop.time()
             if remaining <= 0:
@@ -201,38 +236,52 @@ class BinanceWebSocketOrderConnector:
         client_order_id: str | None = None,
     ) -> bool:
         """Send an order asynchronously, returning False for REST fallback."""
-        if not self.running or not self.ws:
+        if not self.running or not self.ws or not client_order_id:
             return False
 
-        payload = {
-            "method": "order.place",
-            "params": {
-                "symbol": symbol,
-                "side": side.upper(),
-                "quantity": str(quantity),
-                "price": str(price) if price else "0",
-                "type": order_type.upper(),
-            },
-            "id": int(time.time() * 1000),
+        params: dict[str, Any] = {
+            "apiKey": self.api_key,
+            "newClientOrderId": client_order_id,
+            "quantity": str(quantity),
+            "recvWindow": 5000,
+            "side": side.upper(),
+            "symbol": symbol,
+            "timestamp": int(time.time() * 1000),
+            "type": order_type.upper(),
         }
-        if client_order_id:
-            payload["params"]["newClientOrderId"] = client_order_id
+        if price is not None:
+            params["price"] = str(price)
+        if order_type.upper() == "LIMIT":
+            params["timeInForce"] = "GTC"
+        self._sign_payload(params)
+        payload: dict[str, Any] = {
+            "id": client_order_id,
+            "method": "order.place",
+            "params": params,
+        }
 
-        self._sign_payload(payload)
-
+        send_coro = None
         try:
-            asyncio.run_coroutine_threadsafe(
-                self.ws.send(json.dumps(payload)),
+            send_coro = self.ws.send(json.dumps(payload))
+            future = asyncio.run_coroutine_threadsafe(
+                send_coro,
                 cast(asyncio.AbstractEventLoop, self.loop),
             )
-            return True
-        except Exception as error:
-            self.logger.warning("Failed to send WS order: %s", error)
+        except Exception:
+            if send_coro is not None:
+                send_coro.close()
+            self.logger.warning("Binance WebSocket order was not scheduled")
             return False
+        try:
+            future.result(timeout=3.0)
+        except Exception as error:
+            raise NetworkError(
+                "Binance WebSocket order submission result is ambiguous"
+            ) from error
+        return True
 
     def _sign_payload(self, payload: dict[str, Any]) -> None:
-        # Preserved behavior: protocol signing is a separate correctness slice.
-        return None
+        payload["signature"] = _sign_payload_binance(payload, self.secret)
 
     def is_connected(self) -> bool:
         """Return whether the Binance WebSocket order connection is active."""

@@ -11,9 +11,14 @@ import pytest
 import src.core.adapters.ccxt_adapter as ccxt_adapter_module
 import src.core.adapters.live_binance as live_binance_module
 from src.core.adapters.binance_client_order_id import to_binance_client_order_id
+from src.core.adapters.binance_ws_order import (
+    ExchangeAck,
+    OrderAckTimeout,
+    OrderRejected,
+)
 from src.core.adapters.ccxt_adapter import CcxtExchangeAdapter
 from src.core.adapters.live_binance import LiveBinanceAdapter
-from src.core.interfaces.exchange import ExchangeError
+from src.core.interfaces.exchange import ExchangeError, NetworkError
 from src.core.orm_models import Order
 
 
@@ -46,6 +51,139 @@ def _generic_adapter(exchange_id: str) -> CcxtExchangeAdapter:
     adapter.exchange_id = exchange_id
     adapter.logger = MagicMock()
     return adapter
+
+
+def _market_order(
+    *,
+    product_id: str = "BINANCE:BTCUSDT-PERP",
+    client_order_id: str | None = "strategy-worker-entry-1700000000000000000",
+) -> MagicMock:
+    order = MagicMock(spec=Order)
+    order.product_id = product_id
+    order.type = "market"
+    order.side = "buy"
+    order.quantity = Decimal("0.1")
+    order.price = None
+    order.client_order_id = client_order_id
+    order.intent_payload = None
+    return order
+
+
+def _ws_adapter(monkeypatch) -> tuple[LiveBinanceAdapter, MagicMock, MagicMock]:
+    adapter = _adapter()
+    client = MagicMock()
+    client.create_order.return_value = {"id": "rest-order"}
+    vars(adapter)["client"] = client
+    monkeypatch.setattr(adapter, "_quantize_order", MagicMock())
+    monkeypatch.setattr(
+        adapter,
+        "_ccxt_order_type_and_params",
+        MagicMock(return_value=("market", {})),
+    )
+    connector = MagicMock()
+    connector.is_connected.return_value = True
+    adapter.ws_connector = connector
+    return adapter, connector, client
+
+
+@pytest.mark.parametrize(
+    ("product_id", "native_symbol"),
+    [
+        ("BINANCE:BTCUSDT-PERP", "BTCUSDT"),
+        ("BINANCE:BTCUSDC-PERP", "BTCUSDC"),
+    ],
+)
+def test_websocket_market_order_uses_native_symbol_and_ack(
+    monkeypatch,
+    product_id: str,
+    native_symbol: str,
+) -> None:
+    adapter, connector, client = _ws_adapter(monkeypatch)
+    connector.place_order.return_value = True
+
+    async def wait_for_ack(_client_order_id: str) -> ExchangeAck:
+        return ExchangeAck("exchange-order", "NEW")
+
+    connector._wait_for_ack.side_effect = wait_for_ack
+    order = _market_order(product_id=product_id)
+
+    assert adapter.place_order(order) == "exchange-order"
+
+    connector.place_order.assert_called_once()
+    assert connector.place_order.call_args.kwargs["symbol"] == native_symbol
+    client.create_order.assert_not_called()
+
+
+@pytest.mark.parametrize(
+    "failure",
+    [
+        NetworkError("Binance WebSocket order submission result is ambiguous"),
+        OrderAckTimeout("Binance WebSocket order acknowledgement is ambiguous"),
+    ],
+)
+def test_ambiguous_websocket_failure_never_rests(
+    monkeypatch,
+    failure: NetworkError,
+) -> None:
+    adapter, connector, client = _ws_adapter(monkeypatch)
+    if isinstance(failure, OrderAckTimeout):
+        connector.place_order.return_value = True
+
+        async def wait_for_ack(_client_order_id: str) -> ExchangeAck:
+            raise failure
+
+        connector._wait_for_ack.side_effect = wait_for_ack
+    else:
+        connector.place_order.side_effect = failure
+
+    with pytest.raises(NetworkError) as exc_info:
+        adapter.place_order(_market_order())
+
+    assert exc_info.value is failure
+    client.create_order.assert_not_called()
+
+
+def test_explicit_websocket_rejection_falls_back_once(monkeypatch) -> None:
+    adapter, connector, client = _ws_adapter(monkeypatch)
+    connector.place_order.return_value = True
+    rejection = OrderRejected(status=400, code=-1102)
+
+    async def wait_for_ack(_client_order_id: str) -> ExchangeAck:
+        raise rejection
+
+    connector._wait_for_ack.side_effect = wait_for_ack
+
+    assert adapter.place_order(_market_order()) == "rest-order"
+
+    client.create_order.assert_called_once()
+    assert "PROVIDER_SECRET" not in str(rejection)
+
+
+def test_missing_client_order_id_falls_back_without_websocket_send(monkeypatch) -> None:
+    adapter, connector, client = _ws_adapter(monkeypatch)
+
+    assert adapter.place_order(_market_order(client_order_id=None)) == "rest-order"
+
+    connector.place_order.assert_not_called()
+    client.create_order.assert_called_once()
+
+
+@pytest.mark.parametrize("connected", [False, True])
+def test_websocket_presend_unavailable_falls_back_once(
+    monkeypatch,
+    connected: bool,
+) -> None:
+    adapter, connector, client = _ws_adapter(monkeypatch)
+    connector.is_connected.return_value = connected
+    connector.place_order.return_value = False
+
+    assert adapter.place_order(_market_order()) == "rest-order"
+
+    if connected:
+        connector.place_order.assert_called_once()
+    else:
+        connector.place_order.assert_not_called()
+    client.create_order.assert_called_once()
 
 
 def test_live_binance_conditional_mapping_delegates_once(monkeypatch) -> None:
