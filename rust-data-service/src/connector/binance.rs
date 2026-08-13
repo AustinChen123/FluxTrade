@@ -113,6 +113,23 @@ async fn subscribe_market_data(
     connector.subscribe_candles(symbols, "1m", candle_tx).await
 }
 
+pub(crate) fn preflight_user_stream_credentials(
+    lookup: impl Fn(&str) -> Option<String>,
+) -> Result<bool> {
+    let Some(value) = lookup("BINANCE_API_KEY") else {
+        return Ok(false);
+    };
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        return Ok(false);
+    }
+    anyhow::ensure!(
+        trimmed == value,
+        "BINANCE_API_KEY must not contain surrounding whitespace"
+    );
+    Ok(true)
+}
+
 pub(crate) async fn run(
     symbols: Vec<String>,
     trade_tx: mpsc::Sender<Trade>,
@@ -669,6 +686,20 @@ impl ExchangeConnector for BinanceConnector {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn binance_owner_preflights_its_optional_user_stream_key() {
+        for value in [None, Some(""), Some("   ")] {
+            assert!(!preflight_user_stream_credentials(|_| value.map(str::to_string)).unwrap());
+        }
+        assert!(preflight_user_stream_credentials(|_| Some("binance-key".to_string())).unwrap());
+        assert_eq!(
+            preflight_user_stream_credentials(|_| Some(" binance-key ".to_string()))
+                .unwrap_err()
+                .to_string(),
+            "BINANCE_API_KEY must not contain surrounding whitespace"
+        );
+    }
 
     #[derive(Default)]
     struct RecordingConnector {

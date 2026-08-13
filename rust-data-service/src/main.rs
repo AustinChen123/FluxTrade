@@ -1204,49 +1204,22 @@ fn validate_enabled_exchanges(value: &str) -> anyhow::Result<Vec<String>> {
     Ok(exchanges)
 }
 
-fn optional_credentials_present(credentials: &[(&str, Option<String>)]) -> anyhow::Result<bool> {
-    let mut present = 0;
-    for (name, value) in credentials {
-        let Some(value) = value else {
-            continue;
-        };
-        let trimmed = value.trim();
-        if trimmed.is_empty() {
-            continue;
-        }
-        anyhow::ensure!(
-            trimmed == value,
-            "{name} must not contain surrounding whitespace"
-        );
-        present += 1;
-    }
-    if present == 0 {
-        return Ok(false);
-    }
-    if present != credentials.len() {
-        let names = credentials
-            .iter()
-            .map(|(name, _)| *name)
-            .collect::<Vec<_>>()
-            .join(", ");
-        anyhow::bail!("optional credentials must be provided together: {names}");
-    }
-    Ok(true)
-}
-
 fn preflight_user_stream_credentials(
     enabled_exchanges: &[String],
     lookup: impl Fn(&str) -> Option<String>,
 ) -> anyhow::Result<(bool, bool)> {
     let binance_enabled = enabled_exchanges.iter().any(|value| value == "binance");
     let backpack_enabled = enabled_exchanges.iter().any(|value| value == "backpack");
-    let binance_user_stream = binance_enabled
-        && optional_credentials_present(&[("BINANCE_API_KEY", lookup("BINANCE_API_KEY"))])?;
-    let backpack_user_stream = backpack_enabled
-        && optional_credentials_present(&[
-            ("EXCHANGE_API_KEY", lookup("EXCHANGE_API_KEY")),
-            ("EXCHANGE_SECRET", lookup("EXCHANGE_SECRET")),
-        ])?;
+    let binance_user_stream = if binance_enabled {
+        crate::connector::binance::preflight_user_stream_credentials(&lookup)?
+    } else {
+        false
+    };
+    let backpack_user_stream = if backpack_enabled {
+        crate::connector::backpack::preflight_user_stream_credentials(&lookup)?
+    } else {
+        false
+    };
     Ok((binance_user_stream, backpack_user_stream))
 }
 
@@ -1970,7 +1943,7 @@ mod tests {
     }
 
     #[test]
-    fn optional_credentials_require_all_clean_non_empty_values() {
+    fn optional_environment_values_are_trimmed() {
         assert_eq!(normalized_optional_value(None), None);
         assert_eq!(normalized_optional_value(Some(String::new())), None);
         assert_eq!(normalized_optional_value(Some("  ".to_string())), None);
@@ -1978,27 +1951,6 @@ mod tests {
             normalized_optional_value(Some(" key ".to_string())),
             Some("key".to_string())
         );
-        assert!(!optional_credentials_present(&[("key", None), ("secret", None),]).unwrap());
-        assert!(optional_credentials_present(&[
-            ("key", Some("key".to_string())),
-            ("secret", Some("secret".to_string())),
-        ])
-        .unwrap());
-        assert!(optional_credentials_present(&[
-            ("key", Some("key".to_string())),
-            ("secret", None),
-        ])
-        .is_err());
-        assert!(optional_credentials_present(&[
-            ("key", Some(" key ".to_string())),
-            ("secret", Some("secret".to_string())),
-        ])
-        .is_err());
-        assert!(optional_credentials_present(&[
-            ("key", Some(" ".to_string())),
-            ("secret", Some("secret".to_string())),
-        ])
-        .is_err());
     }
 
     #[test]
@@ -2034,6 +1986,51 @@ mod tests {
             .unwrap(),
             (false, false)
         );
+
+        let backpack_only = vec!["backpack".to_string()];
+        let backpack_complete_with_invalid_binance = std::collections::HashMap::from([
+            ("BINANCE_API_KEY", " binance-key "),
+            ("EXCHANGE_API_KEY", "backpack-key"),
+            ("EXCHANGE_SECRET", "backpack-secret"),
+        ]);
+        assert_eq!(
+            preflight_user_stream_credentials(&backpack_only, |name| {
+                backpack_complete_with_invalid_binance
+                    .get(name)
+                    .map(|value| (*value).to_string())
+            })
+            .unwrap(),
+            (false, true)
+        );
+
+        let both_invalid = std::collections::HashMap::from([
+            ("BINANCE_API_KEY", " binance-key "),
+            ("EXCHANGE_API_KEY", "backpack-key"),
+        ]);
+        assert_eq!(
+            preflight_user_stream_credentials(&enabled, |name| {
+                both_invalid.get(name).map(|value| (*value).to_string())
+            })
+            .unwrap_err()
+            .to_string(),
+            "BINANCE_API_KEY must not contain surrounding whitespace"
+        );
+    }
+
+    #[test]
+    fn generic_main_contains_no_venue_credential_schema_or_pair_validator() {
+        let production = include_str!("main.rs")
+            .split_once("#[cfg(test)]")
+            .unwrap()
+            .0;
+        for forbidden in [
+            "BINANCE_API_KEY",
+            "EXCHANGE_API_KEY",
+            "EXCHANGE_SECRET",
+            "optional_credentials_present",
+        ] {
+            assert!(!production.contains(forbidden), "{forbidden}");
+        }
     }
 
     #[cfg(not(feature = "rithmic"))]

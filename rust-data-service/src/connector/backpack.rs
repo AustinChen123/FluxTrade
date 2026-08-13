@@ -157,6 +157,37 @@ async fn subscribe_market_data(
     connector.subscribe_candles(symbols, "1m", candle_tx).await
 }
 
+pub(crate) fn preflight_user_stream_credentials(
+    lookup: impl Fn(&str) -> Option<String>,
+) -> Result<bool> {
+    const NAMES: [&str; 2] = ["EXCHANGE_API_KEY", "EXCHANGE_SECRET"];
+    let values = NAMES.map(lookup);
+    let mut present = 0;
+    for (name, value) in NAMES.into_iter().zip(&values) {
+        let Some(value) = value else {
+            continue;
+        };
+        let trimmed = value.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        anyhow::ensure!(
+            trimmed == value,
+            "{name} must not contain surrounding whitespace"
+        );
+        present += 1;
+    }
+    if present == 0 {
+        return Ok(false);
+    }
+    anyhow::ensure!(
+        present == NAMES.len(),
+        "optional credentials must be provided together: {}",
+        NAMES.join(", ")
+    );
+    Ok(true)
+}
+
 pub(crate) async fn run(
     symbols: Vec<String>,
     trade_tx: mpsc::Sender<Trade>,
@@ -721,6 +752,43 @@ mod tests {
     use async_trait::async_trait;
     use serde_json::json;
     use std::time::Duration;
+
+    #[test]
+    fn backpack_owner_preflights_its_optional_user_stream_key_pair() {
+        let lookup = |key: Option<&str>, secret: Option<&str>| {
+            preflight_user_stream_credentials(|name| match name {
+                "EXCHANGE_API_KEY" => key.map(str::to_string),
+                "EXCHANGE_SECRET" => secret.map(str::to_string),
+                _ => unreachable!(),
+            })
+        };
+
+        assert!(!lookup(None, None).unwrap());
+        assert!(!lookup(Some(""), Some("   ")).unwrap());
+        assert!(lookup(Some("backpack-key"), Some("backpack-secret")).unwrap());
+        for (key, secret) in [
+            (Some("backpack-key"), None),
+            (None, Some("backpack-secret")),
+            (Some("   "), Some("backpack-secret")),
+        ] {
+            assert_eq!(
+                lookup(key, secret).unwrap_err().to_string(),
+                "optional credentials must be provided together: EXCHANGE_API_KEY, EXCHANGE_SECRET"
+            );
+        }
+        assert_eq!(
+            lookup(Some(" backpack-key "), Some("backpack-secret"))
+                .unwrap_err()
+                .to_string(),
+            "EXCHANGE_API_KEY must not contain surrounding whitespace"
+        );
+        assert_eq!(
+            lookup(Some("backpack-key"), Some(" backpack-secret "))
+                .unwrap_err()
+                .to_string(),
+            "EXCHANGE_SECRET must not contain surrounding whitespace"
+        );
+    }
 
     #[test]
     fn backpack_market_data_symbols_are_provider_owned_and_fail_closed() {
