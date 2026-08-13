@@ -47,6 +47,7 @@ from src.core.execution_conditional_order_creation import (
     EntryOrder,
     create_conditional_orders,
 )
+from src.core.execution_order_cancellation import cancel_known_order
 from src.core.fill_delta import (
     delta_price_from_cumulative_average,
     fill_delta_from_cumulative,
@@ -764,41 +765,16 @@ class ExecutionEngine:
         acknowledge the request here. Other adapters complete the local
         terminal transition synchronously.
         """
-        order = self.order_manager.repo.get_order(order_id)
-        if order is None:
-            return False
-        if order.status == OrderStatus.CANCELLED.value:
-            self._fail_pending_conditional_orders_for_terminal_entry(order)
-            return True
-
-        terminal_event_pending = (
-            self.adapter.cancel_terminal_state_delivered_by_order_events() is True
+        return cancel_known_order(
+            repository=self.order_manager.repo,
+            adapter=self.adapter,
+            order_id=order_id,
+            assert_external_operation_allowed=self._assert_external_operation_allowed,
+            mark_cancelled=self.order_manager.mark_cancelled,
+            fail_pending_conditional_orders_for_terminal_entry=(
+                self._fail_pending_conditional_orders_for_terminal_entry
+            ),
         )
-        self._assert_external_operation_allowed()
-        client_order_id = getattr(order, "client_order_id", None)
-        if client_order_id and self.adapter.cancel_order_by_client_id(
-            client_order_id,
-            order.product_id,
-            order_type=order.type,
-        ):
-            if not terminal_event_pending:
-                self.order_manager.mark_cancelled(order)
-                self._fail_pending_conditional_orders_for_terminal_entry(order)
-            return True
-
-        exchange_order_id = order.exchange_order_id or order.id
-        self._assert_external_operation_allowed()
-        if not self.adapter.cancel_order(
-            exchange_order_id,
-            order.product_id,
-            order_type=order.type,
-        ):
-            return False
-
-        if not terminal_event_pending:
-            self.order_manager.mark_cancelled(order)
-            self._fail_pending_conditional_orders_for_terminal_entry(order)
-        return True
 
     def flatten_position(
         self,

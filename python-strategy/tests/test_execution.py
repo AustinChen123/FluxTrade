@@ -7027,6 +7027,31 @@ class TestAuditedExecution:
 class TestCancelOrder:
     """Tests for execution-level cancellation."""
 
+    def test_cancel_order_delegates_exact_generic_owner_dependencies(
+        self,
+        execution_engine,
+    ):
+        with patch.object(
+            execution_module,
+            "cancel_known_order",
+            return_value=True,
+        ) as owner:
+            result = execution_engine.cancel_order("order-1")
+
+        assert result is True
+        owner.assert_called_once_with(
+            repository=execution_engine.order_manager.repo,
+            adapter=execution_engine.adapter,
+            order_id="order-1",
+            assert_external_operation_allowed=(
+                execution_engine._assert_external_operation_allowed
+            ),
+            mark_cancelled=execution_engine.order_manager.mark_cancelled,
+            fail_pending_conditional_orders_for_terminal_entry=(
+                execution_engine._fail_pending_conditional_orders_for_terminal_entry
+            ),
+        )
+
     def test_cancel_order_returns_false_when_order_missing(
         self, execution_engine, mock_exchange_adapter
     ):
