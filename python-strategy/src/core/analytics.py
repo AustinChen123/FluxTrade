@@ -2,7 +2,7 @@ from dataclasses import dataclass
 from datetime import UTC, date, datetime, timedelta
 from decimal import Decimal, InvalidOperation
 from fractions import Fraction
-from typing import Dict, Iterable, List, Sequence
+from typing import Dict, Iterable, Protocol, Sequence
 import pandas as pd
 import numpy as np
 from src.core.decimal_math import (
@@ -10,7 +10,7 @@ from src.core.decimal_math import (
     exact_decimal_subtract,
     exact_decimal_subtract_preserving_zero_scale,
 )
-from src.core.models import Trade, PositionSide
+from src.core.models import PositionSide
 
 
 InitialBalanceInput = Decimal | int | float | str
@@ -44,6 +44,20 @@ class ClosedTrade:
     quantity: Decimal
     pnl: Decimal
     fee: Decimal = Decimal("0")
+
+
+class _MetricsTrade(Protocol):
+    @property
+    def timestamp(self) -> int: ...
+
+    @property
+    def side(self) -> str: ...
+
+    @property
+    def price(self) -> Decimal: ...
+
+    @property
+    def quantity(self) -> Decimal: ...
 
 
 def utc_daily_return_metrics(
@@ -141,7 +155,7 @@ def annualized_sharpe_from_moments(
 
 
 def _build_closed_trades(
-    trade_history: List[Trade],
+    trade_history: Sequence[_MetricsTrade],
     *,
     contract_multiplier: Decimal = Decimal("1"),
 ) -> tuple[list[ClosedTrade], list[float], list[float], Decimal]:
@@ -279,7 +293,7 @@ def _build_closed_trades(
 
 
 def calculate_metrics(
-    trade_history: List[Trade],
+    trade_history: Sequence[_MetricsTrade],
     *,
     initial_balance: InitialBalanceInput = Decimal("10000"),
     risk_free_rate: float = 0.0,

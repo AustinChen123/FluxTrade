@@ -39,15 +39,19 @@ class Product(Base):
     quote_asset = Column(String, nullable=False)
 
 class Candlestick(Base):
-    __tablename__ = 'candlestick'
-    product_id = Column(String, ForeignKey('product.id'), primary_key=True)
-    timeframe = Column(String, primary_key=True)
-    timestamp = Column(BigInteger, primary_key=True)
-    open = Column(Numeric, nullable=False)
-    high = Column(Numeric, nullable=False)
-    low = Column(Numeric, nullable=False)
-    close = Column(Numeric, nullable=False)
-    volume = Column(Numeric, nullable=False)
+    __tablename__ = "candlestick"
+    product_id: Mapped[str] = mapped_column(
+        String,
+        ForeignKey("product.id"),
+        primary_key=True,
+    )
+    timeframe: Mapped[str] = mapped_column(String, primary_key=True)
+    timestamp: Mapped[int] = mapped_column(BigInteger, primary_key=True)
+    open: Mapped[Decimal] = mapped_column(Numeric, nullable=False)
+    high: Mapped[Decimal] = mapped_column(Numeric, nullable=False)
+    low: Mapped[Decimal] = mapped_column(Numeric, nullable=False)
+    close: Mapped[Decimal] = mapped_column(Numeric, nullable=False)
+    volume: Mapped[Decimal] = mapped_column(Numeric, nullable=False)
 
 
 class MarketDataApplication(Base):
@@ -321,29 +325,47 @@ class SystemEvent(Base):
 
 
 class BacktestResultSummary(Base):
-    __tablename__ = 'backtest_result_summary'
-    id = Column(_autoincrement_bigint(), primary_key=True, autoincrement=True)
-    strategy_id = Column(String, ForeignKey('strategy.id'), nullable=False)
-    start_time = Column(BigInteger, nullable=False)
-    end_time = Column(BigInteger, nullable=False)
-    total_pnl = Column(Numeric, nullable=False)
-    metrics_json = Column(Text, nullable=True) # Using Text for JSONB compatibility in generic ORM
+    __tablename__ = "backtest_result_summary"
+    id: Mapped[int] = mapped_column(
+        _autoincrement_bigint(),
+        primary_key=True,
+        autoincrement=True,
+    )
+    strategy_id: Mapped[str] = mapped_column(
+        String,
+        ForeignKey("strategy.id"),
+        nullable=False,
+    )
+    start_time: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    end_time: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    total_pnl: Mapped[Decimal] = mapped_column(Numeric, nullable=False)
+    # Text is used for JSONB compatibility in the generic ORM.
+    metrics_json: Mapped[str | None] = mapped_column(Text, nullable=True)
+
 
 class BacktestTradeLog(Base):
-    __tablename__ = 'backtest_trade_log'
-    id = Column(String, primary_key=True)
-    session_id = Column(BigInteger, ForeignKey('backtest_result_summary.id'), nullable=False)
-    strategy_id = Column(String, nullable=True)
-    order_id = Column(String, nullable=False)
-    exchange_trade_id = Column(String, nullable=True)
-    product_id = Column(String, ForeignKey('product.id'), nullable=False)
-    side = Column(String, nullable=False)
-    price = Column(Numeric, nullable=False)
-    quantity = Column(Numeric, nullable=False)
-    fee = Column(Numeric, nullable=True)
-    fee_asset = Column(String, nullable=True)
-    timestamp = Column(BigInteger, nullable=False)
-    fill_sequence = Column(BigInteger, nullable=True)
+    __tablename__ = "backtest_trade_log"
+    id: Mapped[str] = mapped_column(String, primary_key=True)
+    session_id: Mapped[int] = mapped_column(
+        BigInteger,
+        ForeignKey("backtest_result_summary.id"),
+        nullable=False,
+    )
+    strategy_id: Mapped[str | None] = mapped_column(String, nullable=True)
+    order_id: Mapped[str] = mapped_column(String, nullable=False)
+    exchange_trade_id: Mapped[str | None] = mapped_column(String, nullable=True)
+    product_id: Mapped[str] = mapped_column(
+        String,
+        ForeignKey("product.id"),
+        nullable=False,
+    )
+    side: Mapped[str] = mapped_column(String, nullable=False)
+    price: Mapped[Decimal] = mapped_column(Numeric, nullable=False)
+    quantity: Mapped[Decimal] = mapped_column(Numeric, nullable=False)
+    fee: Mapped[Decimal | None] = mapped_column(Numeric, nullable=True)
+    fee_asset: Mapped[str | None] = mapped_column(String, nullable=True)
+    timestamp: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    fill_sequence: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
 
     __table_args__ = (
         UniqueConstraint(
