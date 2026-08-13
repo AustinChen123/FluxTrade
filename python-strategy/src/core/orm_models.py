@@ -211,37 +211,47 @@ class Order(Base):
         ),
     )
 
+
 class Trade(Base):
-    __tablename__ = 'trade'
-    id = Column(String, primary_key=True)
-    order_id = Column(String, ForeignKey('order.id'), nullable=False)
-    exchange_trade_id = Column(String, nullable=True)
-    product_id = Column(String, ForeignKey('product.id'), nullable=False)
-    side = Column(String, nullable=False)
-    price = Column(Numeric, nullable=False)
-    quantity = Column(Numeric, nullable=False)
-    fee = Column(Numeric, nullable=True)
-    fee_asset = Column(String, nullable=True)
-    timestamp = Column(BigInteger, nullable=False)
+    __tablename__ = "trade"
+    id: Mapped[str] = mapped_column(String, primary_key=True)
+    order_id: Mapped[str] = mapped_column(
+        String,
+        ForeignKey("order.id"),
+        nullable=False,
+    )
+    exchange_trade_id: Mapped[str | None] = mapped_column(String, nullable=True)
+    product_id: Mapped[str] = mapped_column(
+        String,
+        ForeignKey("product.id"),
+        nullable=False,
+    )
+    side: Mapped[str] = mapped_column(String, nullable=False)
+    price: Mapped[Decimal] = mapped_column(Numeric, nullable=False)
+    quantity: Mapped[Decimal] = mapped_column(Numeric, nullable=False)
+    fee: Mapped[Decimal | None] = mapped_column(Numeric, nullable=True)
+    fee_asset: Mapped[str | None] = mapped_column(String, nullable=True)
+    timestamp: Mapped[int] = mapped_column(BigInteger, nullable=False)
+
 
 class Position(Base):
+    __tablename__ = "position"
 
-    __tablename__ = 'position'
-
-    strategy_id = Column(String, ForeignKey('strategy.id'), primary_key=True)
-
-    product_id = Column(String, ForeignKey('product.id'), primary_key=True)
-
-    side = Column(String, primary_key=True)
-
-    quantity = Column(Numeric, nullable=False)
-
-    entry_price = Column(Numeric, nullable=False)
-
-    unrealized_pnl = Column(Numeric, nullable=False)
-
-    last_update_timestamp = Column(BigInteger, nullable=False)
-
+    strategy_id: Mapped[str] = mapped_column(
+        String,
+        ForeignKey("strategy.id"),
+        primary_key=True,
+    )
+    product_id: Mapped[str] = mapped_column(
+        String,
+        ForeignKey("product.id"),
+        primary_key=True,
+    )
+    side: Mapped[str] = mapped_column(String, primary_key=True)
+    quantity: Mapped[Decimal] = mapped_column(Numeric, nullable=False)
+    entry_price: Mapped[Decimal] = mapped_column(Numeric, nullable=False)
+    unrealized_pnl: Mapped[Decimal] = mapped_column(Numeric, nullable=False)
+    last_update_timestamp: Mapped[int] = mapped_column(BigInteger, nullable=False)
 
 
 class SignalAudit(Base):

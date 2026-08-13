@@ -261,7 +261,13 @@ class TestBacktestTradeLogging:
 # LiveOrderRepository
 # =============================================================================
 
+
 class TestLiveOrderRepositoryBasics:
+    def test_missing_session_fails_only_when_database_work_begins(self):
+        repo = LiveOrderRepository()
+
+        with pytest.raises(RuntimeError, match="^database session is required$"):
+            repo.get_order("order-1")
 
     def test_accepts_session_factory(
         self,

@@ -1,13 +1,23 @@
 import time
-from contextlib import nullcontext
+from contextlib import contextmanager
 from decimal import Decimal
 from threading import Lock
-from typing import Callable, ContextManager, Optional
+from typing import Callable, ContextManager, Iterator, Optional
+
 from sqlalchemy.orm import Session
+
 from src.core.interfaces import IOrderRepository
-from src.core.orm_models import Order, Trade, Position, BacktestTradeLog
 from src.core.models import OrderSide
+from src.core.orm_models import BacktestTradeLog, Order, Position, Trade
 from src.core.product_master import ensure_product_registered
+
+
+@contextmanager
+def _provided_session(session: Session | None) -> Iterator[Session]:
+    if session is None:
+        raise RuntimeError("database session is required")
+    yield session
+
 
 class LiveOrderRepository(IOrderRepository):
     def __init__(
@@ -15,7 +25,9 @@ class LiveOrderRepository(IOrderRepository):
         db_session: Session | None = None,
         db_session_factory: Optional[Callable[[], ContextManager[Session]]] = None,
     ):
-        self._db_session_factory = db_session_factory or (lambda: nullcontext(db_session))
+        self._db_session_factory = db_session_factory or (
+            lambda: _provided_session(db_session)
+        )
 
     def add_order(self, order: Order) -> None:
         with self._db_session_factory() as db:
@@ -85,7 +97,15 @@ class LiveOrderRepository(IOrderRepository):
                 side=side
             ).first()
 
-    def update_position(self, strategy_id: str, product_id: str, side: OrderSide, fill_quantity: Decimal, fill_price: Decimal, position_side: str) -> None:
+    def update_position(
+        self,
+        strategy_id: str,
+        product_id: str,
+        side: str,
+        fill_quantity: Decimal,
+        fill_price: Decimal,
+        position_side: str,
+    ) -> None:
         # Use with_for_update for locking
         with self._db_session_factory() as db:
             ensure_product_registered(db, product_id)
@@ -148,7 +168,9 @@ class BacktestOrderRepository(IOrderRepository):
         initial_balance: Decimal = Decimal("10000"),
         db_session_factory: Optional[Callable[[], ContextManager[Session]]] = None,
     ):
-        self._db_session_factory = db_session_factory or (lambda: nullcontext(db_session))
+        self._db_session_factory = db_session_factory or (
+            lambda: _provided_session(db_session)
+        )
         self.session_id = session_id
         self.balance = initial_balance  # kept for backward compatibility
         self._order_strategy_map: dict[str, str] = {}
@@ -210,7 +232,12 @@ class BacktestOrderRepository(IOrderRepository):
         # No-op: position and balance are tracked by Rust PyMatchingEngine
         pass
 
-    def get_position(self, strategy_id: str, product_id: str, side: str = None) -> Optional[Position]:
+    def get_position(
+        self,
+        strategy_id: str,
+        product_id: str,
+        side: str | None = None,
+    ) -> Optional[Position]:
         # Position state lives in Rust engine; accessed via BacktestAccountService
         return None
 
