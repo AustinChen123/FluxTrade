@@ -709,54 +709,6 @@ fn capture_terminal_event(error: &anyhow::Error) -> std::collections::BTreeMap<S
     captured.pop().unwrap()
 }
 
-#[cfg(feature = "rithmic")]
-#[derive(Clone)]
-struct RithmicLiveArgs {
-    profile: String,
-    account_id: String,
-    product_id: String,
-    exchange: String,
-    symbol: String,
-}
-
-#[cfg(feature = "rithmic")]
-fn resolve_rithmic_live_args(
-    enabled_exchanges: &str,
-    profile: Option<String>,
-    account_id: Option<String>,
-    product_id: Option<String>,
-    exchange: Option<String>,
-    symbol: Option<String>,
-) -> anyhow::Result<Option<RithmicLiveArgs>> {
-    let enabled_count = enabled_exchanges
-        .split(',')
-        .filter(|value| value.trim().eq_ignore_ascii_case("rithmic"))
-        .count();
-    anyhow::ensure!(
-        enabled_count <= 1,
-        "Rithmic exchange must not be enabled more than once"
-    );
-    if enabled_count == 0 {
-        anyhow::ensure!(
-            profile.is_none()
-                && account_id.is_none()
-                && product_id.is_none()
-                && exchange.is_none()
-                && symbol.is_none(),
-            "Rithmic options require --exchange rithmic"
-        );
-        return Ok(None);
-    }
-
-    Ok(Some(RithmicLiveArgs {
-        profile: profile.context("--rithmic-profile is required")?,
-        account_id: account_id.context("--rithmic-account-id is required")?,
-        product_id: product_id.context("--rithmic-product-id is required")?,
-        exchange: exchange.context("--rithmic-exchange is required")?,
-        symbol: symbol.context("--rithmic-symbol is required")?,
-    }))
-}
-
 async fn run_live_mode(
     exchange_opt: Option<String>,
     symbol_opt: Option<String>,
@@ -797,31 +749,25 @@ async fn run_live_mode(
         .or_else(|| non_empty_env("EXCHANGE_ENABLED"))
         .unwrap_or_else(|| "binance,bybit,backpack".into());
     let enabled_exchanges = validate_enabled_exchanges(&enabled_exchanges_raw)?;
-    #[cfg(feature = "rithmic")]
-    let enabled_exchanges_csv = enabled_exchanges.join(",");
     let (binance_user_stream_enabled, backpack_user_stream_enabled) =
         preflight_user_stream_credentials(&enabled_exchanges, |name| std::env::var(name).ok())?;
 
     #[cfg(feature = "rithmic")]
-    let rithmic_args = resolve_rithmic_live_args(
-        &enabled_exchanges_csv,
-        rithmic_profile.or_else(|| non_empty_env("RITHMIC_PROFILE")),
-        rithmic_account_id.or_else(|| non_empty_env("RITHMIC_ACCOUNT_ID")),
-        rithmic_product_id.or_else(|| non_empty_env("RITHMIC_PRODUCT_ID")),
-        rithmic_exchange.or_else(|| non_empty_env("RITHMIC_EXCHANGE")),
-        rithmic_symbol.or_else(|| non_empty_env("RITHMIC_SYMBOL")),
+    let rithmic_args = crate::connector::rithmic::live::resolve_live_options(
+        &enabled_exchanges,
+        crate::connector::rithmic::live::LiveOptions::new(
+            rithmic_profile,
+            rithmic_account_id,
+            rithmic_product_id,
+            rithmic_exchange,
+            rithmic_symbol,
+        ),
+        |name| std::env::var(name).ok(),
     )?;
     #[cfg(feature = "rithmic")]
     let mut rithmic_config = rithmic_args
         .as_ref()
-        .map(|args| {
-            crate::connector::rithmic::live::configure(
-                &args.profile,
-                args.product_id.clone(),
-                args.exchange.clone(),
-                args.symbol.clone(),
-            )
-        })
+        .map(crate::connector::rithmic::live::ResolvedLiveOptions::configure)
         .transpose()?;
 
     let symbols_str = symbol_opt
@@ -845,7 +791,7 @@ async fn run_live_mode(
     #[cfg(feature = "rithmic")]
     let rithmic_watchdog_identity = rithmic_args
         .as_ref()
-        .map(|args| (args.profile.as_str(), args.account_id.as_str()));
+        .map(crate::connector::rithmic::live::ResolvedLiveOptions::watchdog_identity);
     #[cfg(not(feature = "rithmic"))]
     let rithmic_watchdog_identity = None;
     let watchdog_mitigation = resolve_emergency_mitigation(
@@ -2020,7 +1966,7 @@ mod tests {
     #[test]
     fn generic_main_contains_no_venue_credential_schema_or_pair_validator() {
         let production = include_str!("main.rs")
-            .split_once("#[cfg(test)]")
+            .split_once("#[cfg(test)]\nmod tests")
             .unwrap()
             .0;
         for forbidden in [
@@ -2041,40 +1987,24 @@ mod tests {
 
     #[cfg(feature = "rithmic")]
     #[test]
-    fn rithmic_live_arguments_fail_closed_before_startup() {
-        assert!(
-            resolve_rithmic_live_args("binance", None, None, None, None, None)
-                .unwrap()
-                .is_none()
-        );
-        let args = resolve_rithmic_live_args(
-            "rithmic",
-            Some("lucid".to_string()),
-            Some("ACCOUNT".to_string()),
-            Some("RITHMIC:NQ-202609".to_string()),
-            Some("CME".to_string()),
-            Some("NQU6".to_string()),
-        )
-        .unwrap()
-        .unwrap();
-        assert_eq!(args.account_id, "ACCOUNT");
-
-        for args in [
-            ("rithmic", None, None, None, None, None),
-            ("rithmic,rithmic", None, None, None, None, None),
-            (
-                "binance",
-                Some("lucid".to_string()),
-                Some("ACCOUNT".to_string()),
-                Some("RITHMIC:NQ-202609".to_string()),
-                Some("CME".to_string()),
-                Some("NQU6".to_string()),
-            ),
+    fn rithmic_live_option_policy_is_provider_owned() {
+        let production = include_str!("main.rs")
+            .split_once("#[cfg(test)]\nmod tests")
+            .unwrap()
+            .0;
+        for forbidden in [
+            "RITHMIC_PROFILE",
+            "RITHMIC_ACCOUNT_ID",
+            "RITHMIC_PRODUCT_ID",
+            "RITHMIC_EXCHANGE",
+            "RITHMIC_SYMBOL",
+            "resolve_rithmic_live_args",
         ] {
-            assert!(
-                resolve_rithmic_live_args(args.0, args.1, args.2, args.3, args.4, args.5).is_err()
-            );
+            assert!(!production.contains(forbidden), "{forbidden}");
         }
+        assert!(production.contains("rithmic::live::resolve_live_options("));
+        assert!(production.contains("ResolvedLiveOptions::configure"));
+        assert!(production.contains("ResolvedLiveOptions::watchdog_identity"));
     }
 
     #[tokio::test]

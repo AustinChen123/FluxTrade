@@ -25,6 +25,108 @@ const INITIAL_BACKOFF: Duration = Duration::from_secs(1);
 const MAX_BACKOFF: Duration = Duration::from_secs(30);
 const FORWARD_QUEUE_CAPACITY: usize = 60;
 
+pub(crate) struct LiveOptions {
+    profile: Option<String>,
+    account_id: Option<String>,
+    product_id: Option<String>,
+    exchange: Option<String>,
+    symbol: Option<String>,
+}
+
+impl LiveOptions {
+    pub(crate) fn new(
+        profile: Option<String>,
+        account_id: Option<String>,
+        product_id: Option<String>,
+        exchange: Option<String>,
+        symbol: Option<String>,
+    ) -> Self {
+        Self {
+            profile,
+            account_id,
+            product_id,
+            exchange,
+            symbol,
+        }
+    }
+}
+
+pub(crate) struct ResolvedLiveOptions {
+    profile: String,
+    account_id: String,
+    product_id: String,
+    exchange: String,
+    symbol: String,
+}
+
+impl ResolvedLiveOptions {
+    pub(crate) fn watchdog_identity(&self) -> (&str, &str) {
+        (&self.profile, &self.account_id)
+    }
+
+    pub(crate) fn configure(&self) -> Result<LiveConfig> {
+        configure(
+            &self.profile,
+            self.product_id.clone(),
+            self.exchange.clone(),
+            self.symbol.clone(),
+        )
+    }
+}
+
+pub(crate) fn resolve_live_options(
+    enabled_exchanges: &[String],
+    options: LiveOptions,
+    lookup: impl Fn(&str) -> Option<String>,
+) -> Result<Option<ResolvedLiveOptions>> {
+    let normalized_env = |name| {
+        lookup(name)
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty())
+    };
+    let profile = options
+        .profile
+        .or_else(|| normalized_env("RITHMIC_PROFILE"));
+    let account_id = options
+        .account_id
+        .or_else(|| normalized_env("RITHMIC_ACCOUNT_ID"));
+    let product_id = options
+        .product_id
+        .or_else(|| normalized_env("RITHMIC_PRODUCT_ID"));
+    let exchange = options
+        .exchange
+        .or_else(|| normalized_env("RITHMIC_EXCHANGE"));
+    let symbol = options.symbol.or_else(|| normalized_env("RITHMIC_SYMBOL"));
+
+    let enabled_count = enabled_exchanges
+        .iter()
+        .filter(|value| value.eq_ignore_ascii_case("rithmic"))
+        .count();
+    ensure!(
+        enabled_count <= 1,
+        "Rithmic exchange must not be enabled more than once"
+    );
+    if enabled_count == 0 {
+        ensure!(
+            profile.is_none()
+                && account_id.is_none()
+                && product_id.is_none()
+                && exchange.is_none()
+                && symbol.is_none(),
+            "Rithmic options require --exchange rithmic"
+        );
+        return Ok(None);
+    }
+
+    Ok(Some(ResolvedLiveOptions {
+        profile: profile.context("--rithmic-profile is required")?,
+        account_id: account_id.context("--rithmic-account-id is required")?,
+        product_id: product_id.context("--rithmic-product-id is required")?,
+        exchange: exchange.context("--rithmic-exchange is required")?,
+        symbol: symbol.context("--rithmic-symbol is required")?,
+    }))
+}
+
 fn payload_failure(kind: PayloadFailureKind) -> anyhow::Error {
     PayloadFailure::new(kind).into()
 }
@@ -387,6 +489,110 @@ mod tests {
     use tokio::net::{TcpListener, TcpStream};
     use tokio::time::timeout;
     use tokio_tungstenite::{accept_async, tungstenite::protocol::Message, WebSocketStream};
+
+    fn live_options(values: [Option<&str>; 5]) -> LiveOptions {
+        LiveOptions::new(
+            values[0].map(str::to_string),
+            values[1].map(str::to_string),
+            values[2].map(str::to_string),
+            values[3].map(str::to_string),
+            values[4].map(str::to_string),
+        )
+    }
+
+    fn live_options_error(result: Result<Option<ResolvedLiveOptions>>) -> String {
+        match result {
+            Ok(_) => panic!("live options must fail"),
+            Err(error) => error.to_string(),
+        }
+    }
+
+    #[test]
+    fn rithmic_owner_resolves_live_options_with_exact_precedence() {
+        let disabled = vec!["binance".to_string()];
+        assert!(
+            resolve_live_options(&disabled, live_options([None; 5]), |_| None)
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(
+            live_options_error(resolve_live_options(
+                &disabled,
+                live_options([Some("lucid"), None, None, None, None]),
+                |_| None
+            )),
+            "Rithmic options require --exchange rithmic"
+        );
+        assert_eq!(
+            live_options_error(resolve_live_options(
+                &disabled,
+                live_options([None; 5]),
+                |name| (name == "RITHMIC_ACCOUNT_ID").then(|| "ENV-ACCOUNT".to_string())
+            )),
+            "Rithmic options require --exchange rithmic"
+        );
+
+        let enabled = vec!["rithmic".to_string()];
+        let complete = [
+            Some("cli-profile"),
+            Some("CLI-ACCOUNT"),
+            Some("RITHMIC:MNQ-202609"),
+            Some("CME"),
+            Some("MNQU6"),
+        ];
+        let resolved = resolve_live_options(&enabled, live_options(complete), |_| {
+            Some("ignored-env".to_string())
+        })
+        .unwrap()
+        .unwrap();
+        assert_eq!(resolved.watchdog_identity(), ("cli-profile", "CLI-ACCOUNT"));
+        assert_eq!(resolved.product_id, "RITHMIC:MNQ-202609");
+        assert_eq!(resolved.exchange, "CME");
+        assert_eq!(resolved.symbol, "MNQU6");
+
+        let env = std::collections::HashMap::from([
+            ("RITHMIC_PROFILE", " env-profile "),
+            ("RITHMIC_ACCOUNT_ID", " ENV-ACCOUNT "),
+            ("RITHMIC_PRODUCT_ID", " RITHMIC:MNQ-202609 "),
+            ("RITHMIC_EXCHANGE", " CME "),
+            ("RITHMIC_SYMBOL", " MNQU6 "),
+        ]);
+        let resolved = resolve_live_options(&enabled, live_options([None; 5]), |name| {
+            env.get(name).map(|value| (*value).to_string())
+        })
+        .unwrap()
+        .unwrap();
+        assert_eq!(resolved.watchdog_identity(), ("env-profile", "ENV-ACCOUNT"));
+        assert_eq!(resolved.product_id, "RITHMIC:MNQ-202609");
+
+        let duplicate = vec!["rithmic".to_string(), "RITHMIC".to_string()];
+        assert_eq!(
+            live_options_error(resolve_live_options(
+                &duplicate,
+                live_options([None; 5]),
+                |_| None
+            )),
+            "Rithmic exchange must not be enabled more than once"
+        );
+
+        let required = [
+            "--rithmic-profile is required",
+            "--rithmic-account-id is required",
+            "--rithmic-product-id is required",
+            "--rithmic-exchange is required",
+            "--rithmic-symbol is required",
+        ];
+        for missing in 0..required.len() {
+            let mut values = complete;
+            values[missing] = None;
+            assert_eq!(
+                live_options_error(resolve_live_options(&enabled, live_options(values), |_| {
+                    None
+                })),
+                required[missing]
+            );
+        }
+    }
 
     #[test]
     fn explicit_instrument_identity_validation_matrix() {
