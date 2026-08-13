@@ -3474,6 +3474,38 @@ class TestLiveOrderEventSync:
 class TestExecutionErrorHandling:
     """Tests for error handling during execution."""
 
+    def test_ambiguous_submit_adoption_delegates_exact_owner_dependencies(
+        self,
+        execution_engine,
+    ):
+        order = SimpleNamespace(
+            client_order_id="client-1",
+            product_id="TEST:PRODUCT",
+            type="limit",
+        )
+        error = NetworkError("timeout")
+        expected = {"action": "adopted"}
+
+        with patch.object(
+            execution_module,
+            "adopt_order_after_ambiguous_submit_error",
+            return_value=expected,
+        ) as owner:
+            result = execution_engine._adopt_order_after_ambiguous_submit_error(
+                order,
+                error,
+                submit_attempted=True,
+            )
+
+        assert result is expected
+        owner.assert_called_once_with(
+            adapter=execution_engine.adapter,
+            process_exchange_order_event=execution_engine.process_exchange_order_event,
+            order=order,
+            error=error,
+            submit_attempted=True,
+        )
+
     def test_adapter_failure_marks_order_failed(
         self, execution_engine, signal_factory, mock_exchange_adapter, mock_order_repo
     ):

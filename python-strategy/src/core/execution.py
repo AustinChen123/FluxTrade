@@ -47,6 +47,9 @@ from src.core.execution_conditional_order_creation import (
     EntryOrder,
     create_conditional_orders,
 )
+from src.core.execution_ambiguous_submit_adoption import (
+    adopt_order_after_ambiguous_submit_error,
+)
 from src.core.execution_order_cancellation import cancel_known_order
 from src.core.fill_delta import (
     delta_price_from_cumulative_average,
@@ -642,10 +645,6 @@ class ExecutionEngine:
         snapshot,
     ) -> ExchangeOrderEvent:
         return exchange_snapshot_to_order_event(product_id, snapshot)
-
-    @staticmethod
-    def _resync_action_verification_blocked(action: str) -> bool:
-        return OrderReconciler._resync_action_verification_blocked(action)
 
     @staticmethod
     def _reconcile_decision(local_status: str, exchange_status: Optional[str]) -> str:
@@ -1409,91 +1408,13 @@ class ExecutionEngine:
         *,
         submit_attempted: bool,
     ) -> dict[str, object]:
-        if not submit_attempted:
-            return {
-                "action": "submit_not_attempted",
-                "verification_blocked": False,
-            }
-        if not self._is_ambiguous_submit_error(error):
-            return {
-                "action": "not_ambiguous",
-                "verification_blocked": False,
-            }
-        if not order.client_order_id:
-            return {
-                "action": "verification_blocked_missing_client_order_id",
-                "verification_blocked": True,
-            }
-        try:
-            snapshot = self.adapter.get_order_by_client_id(
-                order.client_order_id,
-                order.product_id,
-                order_type=order.type,
-            )
-        except ExchangeOrderLookupUnsupported:
-            return {
-                "action": "verification_blocked_order_lookup_unsupported",
-                "verification_blocked": True,
-            }
-        except ExchangeError as lookup_error:
-            return {
-                "action": "verification_blocked_order_lookup_failed",
-                "reason": str(lookup_error),
-                "verification_blocked": True,
-            }
-
-        if snapshot is None:
-            return {
-                "action": "verification_blocked_order_snapshot_missing",
-                "verification_blocked": True,
-            }
-
-        event_result = self.process_exchange_order_event(
-            self._exchange_snapshot_to_order_event(order.product_id, snapshot)
+        return adopt_order_after_ambiguous_submit_error(
+            adapter=self.adapter,
+            process_exchange_order_event=self.process_exchange_order_event,
+            order=order,
+            error=error,
+            submit_attempted=submit_attempted,
         )
-        if event_result["action"] != "applied":
-            return {
-                "action": event_result["action"],
-                "event_result": event_result,
-                "verification_blocked": self._resync_action_verification_blocked(
-                    str(event_result["action"])
-                ),
-                "unresolved": str(event_result["action"]).startswith("unresolved_"),
-            }
-        if event_result.get("state") in {
-            "cancelled",
-            "rejected",
-            "expired",
-            "failed",
-            "liquidated",
-        }:
-            return {
-                "action": "terminal_after_submit_error",
-                "event_result": event_result,
-                "exchange_order_id": event_result.get("exchange_order_id")
-                or snapshot.exchange_order_id,
-                "verification_blocked": False,
-                "terminal": True,
-            }
-        exchange_order_id = (
-            event_result.get("exchange_order_id") or snapshot.exchange_order_id
-        )
-        if exchange_order_id is None:
-            return {
-                "action": "verification_blocked_order_snapshot_missing_exchange_order_id",
-                "event_result": event_result,
-                "verification_blocked": True,
-            }
-        return {
-            "action": "adopted",
-            "event_result": event_result,
-            "exchange_order_id": exchange_order_id,
-            "verification_blocked": False,
-        }
-
-    @staticmethod
-    def _is_ambiguous_submit_error(error: ExchangeError) -> bool:
-        return isinstance(error, NetworkError)
 
     def _write_pending_protection_warning(
         self,
