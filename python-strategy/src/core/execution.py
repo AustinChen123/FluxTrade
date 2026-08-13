@@ -40,12 +40,12 @@ from src.core.audit_service import (
 )
 from src.core.client_order_id import (
     generate_client_order_id,
-    linked_client_order_id,
     parse_client_order_id,
 )
-from src.core.conditional_order_intents import (
-    conditional_oco_pairs,
-    conditional_order_intents,
+from src.core.execution_conditional_order_creation import (
+    ConditionalOrderManager,
+    EntryOrder,
+    create_conditional_orders,
 )
 from src.core.fill_delta import (
     delta_price_from_cumulative_average,
@@ -1793,57 +1793,16 @@ class ExecutionEngine:
         qty: Decimal,
         candle: Optional[Candlestick],
     ) -> list:
-        """Create SL/TP/Trailing orders linked via OCO before external placement."""
-        close_side = (
-            OrderSide.SELL if entry_order.side.lower() == "buy" else OrderSide.BUY
+        return create_conditional_orders(
+            order_manager=cast(ConditionalOrderManager, self.order_manager),
+            signal=signal,
+            entry_order=cast(EntryOrder, entry_order),
+            quantity=qty,
+            candle=candle,
+            attach_min_notional_reference_price=(
+                self._attach_min_notional_reference_price
+            ),
         )
-        conditional_orders = []
-        intents = conditional_order_intents(signal)
-
-        for intent in intents:
-            order = self.order_manager.create_order(
-                signal=signal,
-                side=close_side,
-                order_type=intent.order_type,
-                quantity=qty,
-                trigger_price=intent.trigger_price,
-                client_order_id=self._conditional_client_order_id(
-                    entry_order.client_order_id,
-                    intent.client_order_suffix,
-                ),
-            )
-            if intent.trailing_distance is not None:
-                order._trailing_distance = intent.trailing_distance
-            self._attach_min_notional_reference_price(order, candle)
-            conditional_orders.append(order)
-
-        for first_index, second_index in conditional_oco_pairs(intents):
-            first = conditional_orders[first_index]
-            second = conditional_orders[second_index]
-            first._linked_order_id = second.id
-            second._linked_order_id = first.id
-
-        for conditional_order in conditional_orders:
-            linked_order_id = getattr(conditional_order, "_linked_order_id", None)
-            conditional_order.status = OrderStatus.NEW.value
-            conditional_order.exchange_order_id = None
-            conditional_order.intent_payload = {
-                "pending_entry_order_id": str(entry_order.id),
-                "linked_order_id": str(linked_order_id) if linked_order_id else None,
-                "placement_mode": "place-after-fill",
-            }
-            self.order_manager.repo.update_order(conditional_order)
-
-        return conditional_orders
-
-    @staticmethod
-    def _conditional_client_order_id(
-        entry_client_order_id: str | None,
-        suffix: str,
-    ) -> str | None:
-        if not entry_client_order_id:
-            return None
-        return linked_client_order_id(entry_client_order_id, suffix)
 
     def _place_pending_conditional_orders_for_entry(self, entry_order) -> list[dict]:
         # Gate: reject conditional placement if the submission gate is halted by

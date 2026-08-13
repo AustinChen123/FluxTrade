@@ -4148,6 +4148,41 @@ class TestAuditedExecution:
         assert audit.outcome_payload["status"] == "terminal_after_submit_error"
         assert audit.outcome_payload["adoption"]["action"] == "terminal_after_submit_error"
 
+    def test_conditional_order_creation_delegates_exact_dependencies(
+        self,
+        execution_engine,
+        signal_factory,
+    ):
+        signal = signal_factory(
+            stop_loss=Decimal("41000"),
+            take_profit=Decimal("43000"),
+        )
+        entry = SimpleNamespace(id="entry-1", side="buy", client_order_id="client-1")
+        expected = [SimpleNamespace(id="conditional-1")]
+
+        with patch(
+            "src.core.execution.create_conditional_orders",
+            return_value=expected,
+        ) as create:
+            result = execution_engine._create_conditional_orders(
+                signal,
+                entry,
+                Decimal("2.00"),
+                None,
+            )
+
+        assert result is expected
+        create.assert_called_once_with(
+            order_manager=execution_engine.order_manager,
+            signal=signal,
+            entry_order=entry,
+            quantity=Decimal("2.00"),
+            candle=None,
+            attach_min_notional_reference_price=(
+                execution_engine._attach_min_notional_reference_price
+            ),
+        )
+
     def test_audited_conditional_orders_place_after_entry_fill(
         self, mock_db_session, mock_clock, mock_exchange_adapter, mock_order_repo, signal_factory
     ):
