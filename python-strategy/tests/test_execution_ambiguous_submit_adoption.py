@@ -1,5 +1,5 @@
 from types import SimpleNamespace
-from unittest.mock import MagicMock, patch
+from unittest.mock import MagicMock
 
 import pytest
 
@@ -7,7 +7,6 @@ from src.core.execution_ambiguous_submit_adoption import (
     adopt_pending_conditional_order_before_submit,
     adopt_order_after_ambiguous_submit_error,
 )
-from src.core.execution import ExecutionEngine
 from src.core.interfaces.exchange import (
     ExchangeError,
     ExchangeOrderLookupUnsupported,
@@ -127,26 +126,6 @@ def test_pending_conditional_snapshot_is_converted_and_processed_once(action):
     assert event.exchange_order_id == "exchange-1"
     assert event.status == "open"
     subject.process_order_event.assert_called_once()
-
-
-def test_engine_pending_conditional_adoption_facade_delegates_exact_dependencies():
-    engine = ExecutionEngine.__new__(ExecutionEngine)
-    engine.adapter = MagicMock()
-    engine.process_exchange_order_event = MagicMock()
-    order = SimpleNamespace(id="order-1")
-    result = {"marker": object()}
-
-    with patch(
-        "src.core.execution.adopt_pending_conditional_order_before_submit",
-        return_value=result,
-    ) as owner:
-        assert engine._adopt_pending_conditional_order_before_submit(order) is result
-
-    owner.assert_called_once_with(
-        adapter=engine.adapter,
-        process_exchange_order_event=engine.process_exchange_order_event,
-        order=order,
-    )
 
 
 @pytest.mark.parametrize(

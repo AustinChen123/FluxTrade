@@ -4,7 +4,7 @@ from unittest.mock import MagicMock, call
 
 import pytest
 
-from src.core.execution_conditional_order_creation import create_conditional_orders
+from src.core.execution_conditional_orders import create_conditional_orders
 from src.core.models import OrderSide, OrderStatus, SignalType
 
 

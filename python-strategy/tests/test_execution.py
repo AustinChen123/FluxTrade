@@ -4192,20 +4192,18 @@ class TestAuditedExecution:
         entry = SimpleNamespace(id="entry-1", side="buy", client_order_id="client-1")
         expected = [SimpleNamespace(id="conditional-1")]
 
-        with patch(
-            "src.core.execution.create_conditional_orders",
-            return_value=expected,
-        ) as create:
-            result = execution_engine._create_conditional_orders(
-                signal,
-                entry,
-                Decimal("2.00"),
-                None,
-            )
+        create = MagicMock(return_value=expected)
+        execution_engine._conditional_order_lifecycle.create_orders = create
+
+        result = execution_engine._create_conditional_orders(
+            signal,
+            entry,
+            Decimal("2.00"),
+            None,
+        )
 
         assert result is expected
         create.assert_called_once_with(
-            order_manager=execution_engine.order_manager,
             signal=signal,
             entry_order=entry,
             quantity=Decimal("2.00"),

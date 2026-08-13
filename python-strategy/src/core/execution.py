@@ -41,13 +41,8 @@ from src.core.client_order_id import (
     generate_client_order_id,
     parse_client_order_id,
 )
-from src.core.execution_conditional_order_creation import (
-    ConditionalOrderManager,
-    EntryOrder,
-    create_conditional_orders,
-)
+from src.core.execution_conditional_orders import ConditionalOrderLifecycleOwner
 from src.core.execution_ambiguous_submit_adoption import (
-    adopt_pending_conditional_order_before_submit,
     adopt_order_after_ambiguous_submit_error,
 )
 from src.core.execution_order_cancellation import cancel_known_order
@@ -154,6 +149,20 @@ class ExecutionEngine:
         self.adapter = adapter
         self.journal = journal
         self._order_event_apply_lock = threading.RLock()
+        self._submission_gate_owner = ExecutionSubmissionGate(
+            self._log_submission_drain_callback_failure
+        )
+        self._conditional_order_lifecycle = ConditionalOrderLifecycleOwner(
+            order_manager=self.order_manager,
+            adapter=self.adapter,
+            submission_gate=self._submission_gate_owner,
+            pending_protection_fill_processor=(self._pending_protection_fill_processor),
+            process_exchange_order_event=self.process_exchange_order_event,
+            assert_external_operation_allowed=(self._assert_external_operation_allowed),
+            record_order_ack=self._record_order_ack,
+            write_warning=self._try_write_conditional_order_event_warning,
+            logger=self.logger,
+        )
         self._order_event_applier = OrderEventApplier(
             order_manager=self.order_manager,
             journal_fill=(
@@ -167,9 +176,9 @@ class ExecutionEngine:
             protective_terminal_without_fill_failure=(
                 self._protective_terminal_without_fill_failure
             ),
-            write_conditional_warning=self._try_write_conditional_order_event_warning,
+            write_conditional_warning=self._conditional_order_lifecycle.write_warning,
             place_pending_conditionals_for_entry=(
-                self._place_pending_conditional_orders_for_entry
+                self._conditional_order_lifecycle.place_pending_for_entry
             ),
             protective_partial_fill_requires_resize=(
                 self._protective_partial_fill_requires_resize
@@ -186,7 +195,7 @@ class ExecutionEngine:
             db_session_factory=self._db_session_factory,
             process_exchange_order_event=self.process_exchange_order_event,
             place_pending_protection_for_filled_entries=(
-                self.place_pending_protection_for_filled_entries
+                self._conditional_order_lifecycle.recover_pending_protection
             ),
             fail_pending_conditionals_for_terminal_entry=(
                 self._fail_pending_conditional_orders_for_terminal_entry
@@ -207,10 +216,6 @@ class ExecutionEngine:
             ),
             logger=self.logger,
         )
-        self._submission_gate_owner = ExecutionSubmissionGate(
-            self._log_submission_drain_callback_failure
-        )
-
         self.logger.info(
             "ExecutionEngine initialized with adapter: %s", type(adapter).__name__
         )
@@ -1680,10 +1685,9 @@ class ExecutionEngine:
         qty: Decimal,
         candle: Optional[Candlestick],
     ) -> list:
-        return create_conditional_orders(
-            order_manager=cast(ConditionalOrderManager, self.order_manager),
+        return self._conditional_order_lifecycle.create_orders(
             signal=signal,
-            entry_order=cast(EntryOrder, entry_order),
+            entry_order=entry_order,
             quantity=qty,
             candle=candle,
             attach_min_notional_reference_price=(
@@ -1692,155 +1696,10 @@ class ExecutionEngine:
         )
 
     def _place_pending_conditional_orders_for_entry(self, entry_order) -> list[dict]:
-        # Gate: reject conditional placement if the submission gate is halted by
-        # a kill switch or while reconnect owned-order reconciliation runs.
-        admission_rejection = self._submission_gate_owner.try_begin_submission()
-        if admission_rejection is not None:
-            self.logger.warning(
-                "Conditional order placement rejected for entry %s: submission gate halted (%s)",
-                getattr(entry_order, "id", "?"),
-                admission_rejection,
-            )
-            return [
-                {
-                    "order_id": str(getattr(entry_order, "id", "?")),
-                    "order_type": getattr(entry_order, "type", "?"),
-                    "reason": admission_rejection,
-                }
-            ]
-        try:
-            return self._place_pending_conditional_orders_for_entry_impl(entry_order)
-        finally:
-            self._finish_submission()
-
-    def _place_pending_conditional_orders_for_entry_impl(
-        self, entry_order
-    ) -> list[dict]:
-        if entry_order.type not in {"market", "limit"}:
-            return []
-        protected_quantity = entry_order.filled_quantity or Decimal("0")
-        if protected_quantity <= 0:
-            return []
-        related_orders = [
-            order
-            for order in self.order_manager.repo.list_orders_by_statuses(
-                {
-                    OrderStatus.NEW.value,
-                    OrderStatus.SUBMITTED_UNCONFIRMED.value,
-                    OrderStatus.SUBMITTED.value,
-                    OrderStatus.PARTIALLY_FILLED.value,
-                }
-            )
-            if isinstance(order.intent_payload, dict)
-            and order.intent_payload.get("pending_entry_order_id")
-            == str(entry_order.id)
-        ]
-        provider_result = self._pending_protection_fill_processor(
-            self.order_manager.repo,
-            entry_order,
-            related_orders,
-        )
-        if provider_result is not None:
-            return provider_result
-        pending = [
-            order for order in related_orders if order.status == OrderStatus.NEW.value
-        ]
-        failures = self._underprotected_conditional_order_failures(
-            related_orders,
-            protected_quantity,
-            pending_statuses={OrderStatus.NEW.value},
-        )
-        if not pending:
-            if failures:
-                return failures
-            return []
-        for order in pending:
-            order.quantity = protected_quantity
-            self.order_manager.repo.update_order(order)
-        placement_candidates = []
-        for order in pending:
-            lookup_failure = self._adopt_pending_conditional_order_before_submit(order)
-            if lookup_failure is None:
-                if order.status == OrderStatus.NEW.value:
-                    placement_candidates.append(order)
-                continue
-            failures.append(lookup_failure)
-        if placement_candidates:
-            failures.extend(self._place_conditional_orders(placement_candidates))
-        return failures
-
-    @staticmethod
-    def _underprotected_conditional_order_failures(
-        related_orders: list,
-        protected_quantity: Decimal,
-        *,
-        pending_statuses: set[str],
-    ) -> list[dict]:
-        return [
-            {
-                "order_id": str(order.id),
-                "order_type": order.type,
-                "reason": "conditional_order_resize_required_after_entry_fill",
-                "current_quantity": str(order.quantity),
-                "required_quantity": str(protected_quantity),
-            }
-            for order in related_orders
-            if order.status not in pending_statuses
-            and (order.quantity or Decimal("0")) < protected_quantity
-        ]
-
-    def _adopt_pending_conditional_order_before_submit(self, order) -> dict | None:
-        return adopt_pending_conditional_order_before_submit(
-            adapter=self.adapter,
-            process_exchange_order_event=self.process_exchange_order_event,
-            order=order,
-        )
+        return self._conditional_order_lifecycle.place_pending_for_entry(entry_order)
 
     def place_pending_protection_for_filled_entries(self) -> dict[str, object]:
-        """Retry NEW pending protective orders whose entry already has fills.
-
-        Crash/replay safety net: entry fills are persisted before protective
-        placement, so a crash between the two steps leaves NEW conditional
-        orders behind while no further fill delta will ever re-trigger
-        placement (a fully filled entry drops out of the recoverable scan).
-        Placing protection is the fail-safe direction for a naked position.
-        """
-        pending = [
-            order
-            for order in self.order_manager.repo.list_orders_by_statuses(
-                {OrderStatus.NEW.value}
-            )
-            if isinstance(order.intent_payload, dict)
-            and order.intent_payload.get("pending_entry_order_id")
-        ]
-        entry_ids = {
-            str(order.intent_payload["pending_entry_order_id"]) for order in pending
-        }
-        attempted = 0
-        failures: list[dict] = []
-        for entry_id in sorted(entry_ids):
-            entry = self.order_manager.repo.get_order(entry_id)
-            if entry is None or (entry.filled_quantity or Decimal("0")) <= 0:
-                continue
-            attempted += 1
-            entry_failures = self._place_pending_conditional_orders_for_entry(entry)
-            if entry_failures:
-                failures.extend(entry_failures)
-                self._try_write_conditional_order_event_warning(
-                    event_subtype="conditional_order_placement_failed_after_entry_fill",
-                    order=entry,
-                    failures=entry_failures,
-                )
-        if failures:
-            self.logger.error(
-                "Pending protection recovery has %s placement failure(s)",
-                len(failures),
-            )
-        return {
-            "pending_count": len(pending),
-            "entries_attempted": attempted,
-            "failures": failures,
-        }
+        return self._conditional_order_lifecycle.recover_pending_protection()
 
     @staticmethod
     def _protective_partial_fill_requires_resize(
@@ -1954,118 +1813,7 @@ class ExecutionEngine:
         )
 
     def _place_conditional_orders(self, conditional_orders: list) -> list[dict]:
-        """Submit prevalidated SL/TP/Trailing orders linked via OCO to each other."""
-        failures = []
-        for order in conditional_orders:
-            order_id = str(order.id)
-            submit_attempted = False
-            try:
-                if order.client_order_id:
-                    self.order_manager.mark_submitted_unconfirmed(order)
-                self._assert_external_operation_allowed()
-                submit_attempted = True
-                ex_id = self.adapter.place_order(order)
-                self._record_order_ack(order, ex_id, order_id=order_id)
-                ORDERS_TOTAL.labels(
-                    order_type=order.type, status="placed", reason="none"
-                ).inc()
-            except ExchangeError as e:
-                label = {
-                    "stop_loss": "SL",
-                    "take_profit": "TP",
-                    "trailing_stop": "trailing stop",
-                }.get(order.type, order.type)
-                self.logger.error("Failed to place %s order: %s", label, e)
-                failures.extend(
-                    self._handle_conditional_order_placement_error(
-                        order,
-                        e,
-                        submit_attempted=submit_attempted,
-                    )
-                )
-        return failures
-
-    def _handle_conditional_order_placement_error(
-        self,
-        order,
-        error: ExchangeError,
-        *,
-        submit_attempted: bool,
-    ) -> list[dict]:
-        adoption = self._adopt_order_after_ambiguous_submit_error(
-            order,
-            error,
-            submit_attempted=submit_attempted,
-        )
-        if (
-            submit_attempted
-            and adoption["action"] == "verification_blocked_missing_client_order_id"
-        ):
-            self.order_manager.mark_submitted_unconfirmed(order)
-            ORDERS_TOTAL.labels(
-                order_type=order.type,
-                status="failed",
-                reason="verification_blocked_missing_client_order_id",
-            ).inc()
-            return [
-                {
-                    "order_id": str(order.id),
-                    "order_type": order.type,
-                    "reason": "verification_blocked_missing_client_order_id",
-                    "adoption": adoption,
-                    "operator_action": (
-                        "conditional_submit_outcome_uncertain_without_client_id; "
-                        "verify exchange manually"
-                    ),
-                }
-            ]
-        if adoption["action"] == "adopted":
-            ORDERS_TOTAL.labels(
-                order_type=order.type,
-                status="placed",
-                reason="adopted_after_submit_error",
-            ).inc()
-            return []
-        if adoption.get("terminal"):
-            ORDERS_TOTAL.labels(
-                order_type=order.type,
-                status="failed",
-                reason="terminal_after_submit_error",
-            ).inc()
-            return [
-                {
-                    "order_id": str(order.id),
-                    "order_type": order.type,
-                    "reason": "terminal_after_submit_error",
-                    "adoption": adoption,
-                }
-            ]
-        if adoption.get("verification_blocked") or adoption.get("unresolved"):
-            ORDERS_TOTAL.labels(
-                order_type=order.type, status="failed", reason=str(adoption["action"])
-            ).inc()
-            return [
-                {
-                    "order_id": str(order.id),
-                    "order_type": order.type,
-                    "reason": str(adoption["action"]),
-                    "adoption": adoption,
-                }
-            ]
-        self.order_manager.fail_order(order, str(error))
-        ORDERS_TOTAL.labels(
-            order_type=order.type,
-            status="failed",
-            reason=execution_failure_diagnostics.order_rejection_reason(error),
-        ).inc()
-        return [
-            {
-                "order_id": str(order.id),
-                "order_type": order.type,
-                "reason": str(error),
-                "adoption": adoption,
-            }
-        ]
+        return self._conditional_order_lifecycle.place_orders(conditional_orders)
 
     def _try_write_conditional_order_event_warning(
         self,
