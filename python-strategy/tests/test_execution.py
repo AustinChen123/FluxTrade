@@ -738,6 +738,144 @@ class TestQuantityHandling:
         executor.assert_not_called()
         assert execution_engine._reconcile_halt is False
 
+    def test_authoritative_non_exit_clears_matching_gate(
+        self,
+        execution_engine,
+        signal_factory,
+    ):
+        executor = MagicMock()
+
+        assert (
+            execution_engine.execute_authoritative_exit_signal(
+                signal_factory(signal_type=SignalType.LONG),
+                None,
+                executor,
+            )
+            is False
+        )
+
+        executor.assert_not_called()
+        assert execution_engine._reconcile_halt is False
+
+    @pytest.mark.parametrize(
+        "failure",
+        ["position_unknown", "position_side_mismatch"],
+    )
+    def test_authoritative_position_failure_preserves_reconcile_gate(
+        self,
+        execution_engine,
+        signal_factory,
+        mock_exchange_adapter,
+        failure,
+    ):
+        product_id = "BINANCE:BTCUSDT-PERP"
+        if failure == "position_unknown":
+            execution_engine._position_loader = lambda *_args: (
+                _ for _ in ()
+            ).throw(RuntimeError("ledger unavailable"))
+        else:
+            mock_exchange_adapter.positions[product_id] = Position(
+                strategy_id="test-strategy",
+                product_id=product_id,
+                side=PositionSide.SHORT,
+                quantity=Decimal("0.25"),
+                entry_price=Decimal("42000"),
+                unrealized_pnl=Decimal("0"),
+            )
+        executor = MagicMock()
+
+        assert (
+            execution_engine.execute_authoritative_exit_signal(
+                signal_factory(
+                    signal_type=SignalType.EXIT_LONG,
+                    product_id=product_id,
+                    quantity=Decimal("0.25"),
+                ),
+                None,
+                executor,
+            )
+            is False
+        )
+
+        executor.assert_not_called()
+        assert execution_engine._reconcile_halt is True
+
+    def test_authoritative_executor_failure_preserves_reconcile_gate(
+        self,
+        execution_engine,
+        signal_factory,
+        mock_exchange_adapter,
+    ):
+        product_id = "BINANCE:BTCUSDT-PERP"
+        mock_exchange_adapter.positions[product_id] = Position(
+            strategy_id="test-strategy",
+            product_id=product_id,
+            side=PositionSide.LONG,
+            quantity=Decimal("0.25"),
+            entry_price=Decimal("42000"),
+            unrealized_pnl=Decimal("0"),
+        )
+        sentinel = RuntimeError("executor unavailable")
+
+        with pytest.raises(RuntimeError) as raised:
+            execution_engine.execute_authoritative_exit_signal(
+                signal_factory(
+                    signal_type=SignalType.EXIT_LONG,
+                    product_id=product_id,
+                    quantity=Decimal("0.25"),
+                ),
+                None,
+                MagicMock(side_effect=sentinel),
+            )
+
+        assert raised.value is sentinel
+        assert execution_engine._reconcile_halt is True
+
+    def test_authoritative_intent_audit_failure_preserves_reconcile_gate(
+        self,
+        mock_db_session,
+        mock_clock,
+        mock_exchange_adapter,
+        mock_order_repo,
+        signal_factory,
+    ):
+        product_id = "BINANCE:BTCUSDT-PERP"
+        mock_exchange_adapter.positions[product_id] = Position(
+            strategy_id="test-strategy",
+            product_id=product_id,
+            side=PositionSide.LONG,
+            quantity=Decimal("0.25"),
+            entry_price=Decimal("42000"),
+            unrealized_pnl=Decimal("0"),
+        )
+        engine = ExecutionEngine(
+            db_session=mock_db_session,
+            clock=mock_clock,
+            adapter=mock_exchange_adapter,
+            order_repository=mock_order_repo,
+            db_session_factory=lambda: nullcontext(mock_db_session),
+            audit_external_orders=True,
+        )
+        sentinel = RuntimeError("intent audit unavailable")
+
+        with patch(
+            "src.core.execution.write_signal_audit_intent",
+            side_effect=sentinel,
+        ), pytest.raises(RuntimeError) as raised:
+            engine.execute_authoritative_exit_signal(
+                signal_factory(
+                    signal_type=SignalType.EXIT_LONG,
+                    product_id=product_id,
+                    quantity=Decimal("0.25"),
+                ),
+                None,
+                MagicMock(),
+            )
+
+        assert raised.value is sentinel
+        assert engine._reconcile_halt is True
+        assert engine._submissions_in_flight == 0
+
 
 def test_verified_net_reduction_requires_gate_and_omits_reduce_only(
     mock_db_session,
@@ -1549,6 +1687,7 @@ class TestExecutionTradingRules:
                 update_order(order)
 
             mock_order_repo.update_order = fail_ambiguous_attempt
+        initial_generation = engine._submission_gate_owner.generation
 
         with pytest.raises(error):
             engine.modify_protection(entry_id, stop_loss=Decimal("19999.00"))
@@ -1560,6 +1699,47 @@ class TestExecutionTradingRules:
             == expected_status
         )
         assert engine._reconcile_halt is reconcile_halted
+        if error is NetworkError:
+            assert engine._submission_gate_owner.generation == initial_generation + 2
+            engine.resume_after_reconcile()
+            assert engine._reconcile_halt is True
+            engine.resume_after_reconcile()
+            assert engine._reconcile_halt is False
+
+    @pytest.mark.parametrize(
+        ("kill_halted", "reconcile_halted"),
+        [(True, False), (False, True), (True, True)],
+    )
+    def test_modify_protection_rejects_every_submission_halt_before_mutation(
+        self,
+        execution_engine,
+        mock_exchange_adapter,
+        mock_order_repo,
+        caplog,
+        kill_halted,
+        reconcile_halted,
+    ):
+        if reconcile_halted:
+            execution_engine._submission_gate_owner.claim_reconcile_halt()
+        if kill_halted:
+            assert execution_engine.halt_and_drain(timeout=0) is True
+        caplog.clear()
+
+        with pytest.raises(
+            ExchangeError,
+            match="^modify_protection_submission_gate_halted$",
+        ):
+            execution_engine.modify_protection(
+                "not-loaded-entry",
+                stop_loss=Decimal("19999.00"),
+            )
+
+        assert execution_engine._submissions_halted is kill_halted
+        assert execution_engine._reconcile_halt is reconcile_halted
+        assert execution_engine._submissions_in_flight == 0
+        assert mock_order_repo.orders == {}
+        assert mock_exchange_adapter.open_orders == []
+        assert caplog.records == []
 
     def test_ambiguous_native_bracket_submit_requires_authoritative_reconciliation(
         self,
@@ -6708,3 +6888,46 @@ def test_reconcile_gate_is_independent_of_kill_switch(execution_engine):
     execution_engine.resume_submissions()
     assert execution_engine._submissions_halted is False
     assert execution_engine._reconcile_halt is True
+
+
+def test_execution_engine_submission_gate_facade_delegates_to_single_owner(
+    mock_db_session,
+    mock_clock,
+    mock_exchange_adapter,
+    mock_order_repo,
+    signal_factory,
+):
+    gate = MagicMock()
+    gate.try_begin_submission.return_value = "kill_switch_halted"
+    gate.halt_and_drain.return_value = True
+    gate.halt_for_reconcile.return_value = False
+    gate.submissions_halted = True
+    gate.reconcile_halted = False
+    gate.in_flight = 0
+    callback = MagicMock()
+
+    with patch("src.core.execution.ExecutionSubmissionGate", return_value=gate):
+        engine = ExecutionEngine(
+            db_session=mock_db_session,
+            clock=mock_clock,
+            adapter=mock_exchange_adapter,
+            order_repository=mock_order_repo,
+        )
+
+    assert engine.execute_signal(signal_factory()) is None
+    assert engine.halt_and_drain(timeout=7) is True
+    engine.run_when_submissions_drained(callback)
+    engine.resume_submissions()
+    assert engine.halt_for_reconcile(timeout=3) is False
+    engine.resume_after_reconcile()
+
+    gate.try_begin_submission.assert_called_once_with()
+    gate.halt_and_drain.assert_called_once_with(timeout=7)
+    gate.run_when_submissions_drained.assert_called_once_with(callback)
+    gate.resume_submissions.assert_called_once_with()
+    gate.halt_for_reconcile.assert_called_once_with(timeout=3)
+    gate.resume_after_reconcile.assert_called_once_with()
+    assert engine._submissions_halted is True
+    assert engine._reconcile_halt is False
+    assert engine._submissions_in_flight == 0
+    assert mock_exchange_adapter.open_orders == []

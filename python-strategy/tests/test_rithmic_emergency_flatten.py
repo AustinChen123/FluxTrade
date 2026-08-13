@@ -578,8 +578,7 @@ def test_queued_compensation_failure_is_owned_by_submission_completion(
         side_effect=RuntimeError("queued compensation failed")
     )
     engine.execution_engine.logger = MagicMock()
-    with engine.execution_engine._submission_gate:
-        engine.execution_engine._submissions_in_flight = 1
+    assert engine.execution_engine._submission_gate_owner.try_begin_submission() is None
 
     owner.service.schedule_portfolio_exit_compensation("verification_failed")
     owner.service.execute.assert_not_called()

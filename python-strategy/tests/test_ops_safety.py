@@ -1208,7 +1208,7 @@ class TestEngineKillSwitchCommand:
     def test_clear_kill_switch_persists_before_resuming(self, engine_factory):
         engine = engine_factory()
         engine._kill_switch_halted = True
-        engine.execution_engine._submissions_halted = True
+        assert engine.execution_engine.halt_and_drain(timeout=0) is True
         engine.ops_safety.persist_kill_switch_state = MagicMock()
 
         engine._handle_command({"command": "CLEAR_KILL_SWITCH", "params": {}})
@@ -1227,7 +1227,7 @@ class TestEngineKillSwitchCommand:
     ):
         engine = engine_factory()
         engine._kill_switch_halted = True
-        engine.execution_engine._submissions_halted = True
+        assert engine.execution_engine.halt_and_drain(timeout=0) is True
         engine.redis_client.set.side_effect = RuntimeError("redis unavailable")
 
         engine._handle_command({"command": "CLEAR_KILL_SWITCH", "params": {}})

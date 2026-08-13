@@ -6,7 +6,14 @@ from dataclasses import dataclass
 from decimal import Decimal, InvalidOperation
 from typing import Callable, ContextManager, Optional
 from sqlalchemy.orm import Session
-from src.core.models import Signal, SignalType, Candlestick, OrderSide, OrderStatus, PositionSide
+from src.core.models import (
+    Signal,
+    SignalType,
+    Candlestick,
+    OrderSide,
+    OrderStatus,
+    PositionSide,
+)
 from src.core.orm_models import Strategy
 from src.core.order_manager import OrderManager
 from src.core.runtime_capabilities import OrderAccountIdentityResolver
@@ -38,6 +45,7 @@ from src.core.fill_delta import (
     delta_price_from_cumulative_average,
     fill_delta_from_cumulative,
 )
+from src.core.execution_submission_gate import ExecutionSubmissionGate
 from src.core.order_event_sync import (
     OrderEventApplier,
     exchange_snapshot_to_order_event,
@@ -109,6 +117,7 @@ class ExecutionEngine:
             )
         else:
             from src.core.repositories import LiveOrderRepository
+
             self.order_manager = OrderManager(
                 LiveOrderRepository(db_session, db_session_factory=db_session_factory),
                 clock,
@@ -123,7 +132,9 @@ class ExecutionEngine:
         self._order_event_applier = OrderEventApplier(
             order_manager=self.order_manager,
             journal_fill=(
-                self._journal_exchange_order_event_fill if self.journal is not None else None
+                self._journal_exchange_order_event_fill
+                if self.journal is not None
+                else None
             ),
             fail_pending_conditionals_for_terminal_entry=(
                 self._fail_pending_conditional_orders_for_terminal_entry
@@ -171,21 +182,28 @@ class ExecutionEngine:
             ),
             logger=self.logger,
         )
-        # Submission drain gate: halts new order submissions and waits for
-        # in-flight ones to finish before a kill switch snapshot.
-        self._submission_gate = threading.Condition()
-        self._submissions_halted = False
-        # Independent gate raised while owned-order reconciliation runs after an
-        # order-session reconnect. Kept separate from the kill-switch halt so a
-        # reconcile resume can never clear an active kill-switch halt, and vice
-        # versa. Submissions are rejected while either flag is set.
-        self._reconcile_halt = False
-        self._reconcile_halt_generation = 0
-        self._reconcile_claim = threading.local()
-        self._submissions_in_flight = 0
-        self._drain_callbacks: list[Callable[[], None]] = []
+        self._submission_gate_owner = ExecutionSubmissionGate(
+            self._log_submission_drain_callback_failure
+        )
 
-        self.logger.info("ExecutionEngine initialized with adapter: %s", type(adapter).__name__)
+        self.logger.info(
+            "ExecutionEngine initialized with adapter: %s", type(adapter).__name__
+        )
+
+    @property
+    def _submissions_halted(self) -> bool:
+        return self._submission_gate_owner.submissions_halted
+
+    @property
+    def _reconcile_halt(self) -> bool:
+        return self._submission_gate_owner.reconcile_halted
+
+    @property
+    def _submissions_in_flight(self) -> int:
+        return self._submission_gate_owner.in_flight
+
+    def _log_submission_drain_callback_failure(self) -> None:
+        self.logger.exception("Submission drain callback failed")
 
     def _assert_external_operation_allowed(self) -> None:
         try:
@@ -232,10 +250,8 @@ class ExecutionEngine:
         with self._order_event_apply_lock:
             existing_client_order_ids: set[str] = set()
             for client_order_id, expected_strategy_id in requested_intents.items():
-                existing_order = (
-                    self.order_manager.repo.get_order_by_client_order_id(
-                        client_order_id
-                    )
+                existing_order = self.order_manager.repo.get_order_by_client_order_id(
+                    client_order_id
                 )
                 if existing_order is None:
                     continue
@@ -263,26 +279,19 @@ class ExecutionEngine:
                     )
                 ).upper()
                 if not quantity.is_finite() or quantity <= 0:
-                    raise RuntimeError(
-                        f"portfolio_position_invalid:{strategy_id}"
-                    )
+                    raise RuntimeError(f"portfolio_position_invalid:{strategy_id}")
                 if side == PositionSide.LONG.value:
                     quantities[strategy_id] = quantity
                 elif side == PositionSide.SHORT.value:
                     quantities[strategy_id] = -quantity
                 else:
-                    raise RuntimeError(
-                        f"portfolio_position_side_invalid:{strategy_id}"
-                    )
+                    raise RuntimeError(f"portfolio_position_side_invalid:{strategy_id}")
 
             for order in self.order_manager.repo.list_orders_by_statuses(
                 active_statuses
             ):
                 strategy_id = str(order.strategy_id)
-                if (
-                    strategy_id not in owners
-                    or str(order.product_id) != product_id
-                ):
+                if strategy_id not in owners or str(order.product_id) != product_id:
                     continue
                 payload = (
                     order.intent_payload
@@ -300,9 +309,7 @@ class ExecutionEngine:
                     continue
 
                 quantity = Decimal(str(order.quantity))
-                filled_quantity = Decimal(
-                    str(order.filled_quantity or Decimal("0"))
-                )
+                filled_quantity = Decimal(str(order.filled_quantity or Decimal("0")))
                 remaining = quantity - filled_quantity
                 if (
                     not quantity.is_finite()
@@ -312,8 +319,7 @@ class ExecutionEngine:
                     or remaining < 0
                 ):
                     raise RuntimeError(
-                        "portfolio_pending_entry_quantity_invalid:"
-                        f"order_id={order.id}"
+                        f"portfolio_pending_entry_quantity_invalid:order_id={order.id}"
                     )
                 if remaining == 0:
                     continue
@@ -324,22 +330,18 @@ class ExecutionEngine:
                     signed = -remaining
                 else:
                     raise RuntimeError(
-                        "portfolio_pending_entry_side_invalid:"
-                        f"order_id={order.id}"
+                        f"portfolio_pending_entry_side_invalid:order_id={order.id}"
                     )
                 current = quantities[strategy_id]
                 if current * signed < 0:
                     raise RuntimeError(
-                        "portfolio_pending_entry_crosses_sleeve_position:"
-                        f"{strategy_id}"
+                        f"portfolio_pending_entry_crosses_sleeve_position:{strategy_id}"
                     )
                 quantities[strategy_id] = current + signed
 
             return PortfolioExposureSnapshot(
                 quantities=quantities,
-                existing_client_order_ids=frozenset(
-                    existing_client_order_ids
-                ),
+                existing_client_order_ids=frozenset(existing_client_order_ids),
             )
 
     def execute_authoritative_exit_signal(
@@ -480,9 +482,7 @@ class ExecutionEngine:
             or verification.get("strategy_id") != signal.strategy_id
             or verification.get("product_id") != signal.product_id
         ):
-            raise RuntimeError(
-                "authoritative_exit_replay_verification_missing"
-            )
+            raise RuntimeError("authoritative_exit_replay_verification_missing")
         return True
 
     def _verified_net_reduction_order_payload(
@@ -490,17 +490,11 @@ class ExecutionEngine:
         signal: Signal,
         order,
     ) -> dict:
-        payload = (
-            order.intent_payload
-            if isinstance(order.intent_payload, dict)
-            else {}
-        )
+        payload = order.intent_payload if isinstance(order.intent_payload, dict) else {}
         signal_payload = payload.get("signal")
         expected_side = self._determine_side(signal.type)
         quantity = Decimal(str(order.quantity))
-        filled_quantity = Decimal(
-            str(order.filled_quantity or Decimal("0"))
-        )
+        filled_quantity = Decimal(str(order.filled_quantity or Decimal("0")))
         if (
             expected_side is None
             or str(order.strategy_id) != signal.strategy_id
@@ -526,10 +520,7 @@ class ExecutionEngine:
         *,
         remaining_remote_quantity: Decimal,
     ) -> None:
-        if (
-            not remaining_remote_quantity.is_finite()
-            or remaining_remote_quantity < 0
-        ):
+        if not remaining_remote_quantity.is_finite() or remaining_remote_quantity < 0:
             raise ValueError("verified_net_reduction_remaining_quantity_invalid")
         order = self.order_manager.repo.get_order(order_id)
         if order is None:
@@ -538,9 +529,7 @@ class ExecutionEngine:
         if str(order.client_order_id) != client_order_id:
             raise RuntimeError("verified_net_reduction_order_identity_mismatch")
 
-        payload = dict(
-            self._verified_net_reduction_order_payload(signal, order)
-        )
+        payload = dict(self._verified_net_reduction_order_payload(signal, order))
         payload["authoritative_verification"] = {
             "status": "verified_portfolio_reduction",
             "strategy_id": signal.strategy_id,
@@ -567,14 +556,9 @@ class ExecutionEngine:
         if signal.type not in (SignalType.EXIT_LONG, SignalType.EXIT_SHORT):
             raise ValueError("verified_net_reduction_requires_exit_signal")
         if not self.audit_external_orders or self._db_session_factory is None:
-            raise RuntimeError(
-                "verified_net_reduction_requires_external_order_audit"
-            )
-        with self._submission_gate:
-            if not self._reconcile_halt or self._submissions_in_flight != 1:
-                raise RuntimeError(
-                    "verified_net_reduction_requires_exclusive_exit_gate"
-                )
+            raise RuntimeError("verified_net_reduction_requires_external_order_audit")
+        if not self._submission_gate_owner.authoritative_exit_active:
+            raise RuntimeError("verified_net_reduction_requires_exclusive_exit_gate")
         if decision.quantity is None or decision.quantity <= 0:
             raise ValueError("verified_net_reduction_quantity_invalid")
         if (
@@ -638,8 +622,7 @@ class ExecutionEngine:
             if adoption["action"] == "adopted":
                 return order_id
             if adoption.get("verification_blocked") or adoption.get("unresolved"):
-                with self._submission_gate:
-                    self._claim_reconcile_halt_locked()
+                self._submission_gate_owner.claim_reconcile_halt()
             elif not adoption.get("terminal"):
                 self.order_manager.fail_order(order, str(error))
             self._record_order_rejection(
@@ -652,19 +635,7 @@ class ExecutionEngine:
 
     def _begin_authoritative_exit(self, *, timeout: float) -> int | None:
         """Own the shared gate without counting this operation in its drain."""
-        with self._submission_gate:
-            if self._submissions_halted or self._reconcile_halt:
-                return None
-            reconcile_generation = self._claim_reconcile_halt_locked()
-            if not self._submission_gate.wait_for(
-                lambda: self._submissions_in_flight == 0,
-                timeout=timeout,
-            ):
-                return None
-            if self._submissions_halted:
-                return None
-            self._submissions_in_flight += 1
-            return reconcile_generation
+        return self._submission_gate_owner.begin_authoritative_exit(timeout=timeout)
 
     def _finish_authoritative_exit(
         self,
@@ -672,22 +643,10 @@ class ExecutionEngine:
         resume_after_reconcile: bool,
         reconcile_generation: int,
     ) -> None:
-        callbacks: list[Callable[[], None]] = []
-        with self._submission_gate:
-            self._submissions_in_flight -= 1
-            if (
-                resume_after_reconcile
-                and self._reconcile_halt_generation == reconcile_generation
-            ):
-                self._reconcile_halt = False
-            if self._submissions_in_flight == 0:
-                callbacks, self._drain_callbacks = self._drain_callbacks, []
-            self._submission_gate.notify_all()
-        for callback in callbacks:
-            try:
-                callback()
-            except Exception:
-                self.logger.exception("Submission drain callback failed")
+        self._submission_gate_owner.finish_authoritative_exit(
+            resume_after_reconcile=resume_after_reconcile,
+            reconcile_generation=reconcile_generation,
+        )
 
     def _fail_pending_conditional_orders_for_terminal_entry(self, entry_order) -> None:
         """Clear pending protection for an entry that terminated with zero fills.
@@ -703,7 +662,11 @@ class ExecutionEngine:
         if (entry_order.filled_quantity or Decimal("0")) > 0:
             return
         for order in self.order_manager.repo.list_orders_by_statuses(
-            {OrderStatus.NEW.value, OrderStatus.SUBMITTED_UNCONFIRMED.value, OrderStatus.SUBMITTED.value}
+            {
+                OrderStatus.NEW.value,
+                OrderStatus.SUBMITTED_UNCONFIRMED.value,
+                OrderStatus.SUBMITTED.value,
+            }
         ):
             if (
                 isinstance(order.intent_payload, dict)
@@ -761,14 +724,18 @@ class ExecutionEngine:
                     }
                 )
                 if isinstance(candidate.intent_payload, dict)
-                and candidate.intent_payload.get("pending_entry_order_id") == str(order.id)
+                and candidate.intent_payload.get("pending_entry_order_id")
+                == str(order.id)
             ]
             return any(
                 candidate.status == OrderStatus.NEW.value
                 or (candidate.quantity or Decimal("0")) < protected_quantity
                 for candidate in related
             )
-        if self._protective_partial_fill_requires_resize(order, event_state) is not None:
+        if (
+            self._protective_partial_fill_requires_resize(order, event_state)
+            is not None
+        ):
             return True
         if event_state not in {"filled", "liquidated"}:
             return False
@@ -811,13 +778,18 @@ class ExecutionEngine:
 
         if fills:
             for fill in fills:
-                order = fill['order']
-                price = fill['price']
-                qty = fill['quantity']
-                fee = fill.get('fee')
-                fill_type = fill.get('fill_type', 'MARKET')
+                order = fill["order"]
+                price = fill["price"]
+                qty = fill["quantity"]
+                fee = fill.get("fee")
+                fill_type = fill.get("fill_type", "MARKET")
 
-                self.logger.info("Execution: Adapter fill for %s at %s (fee=%s)", order.id, price, fee)
+                self.logger.info(
+                    "Execution: Adapter fill for %s at %s (fee=%s)",
+                    order.id,
+                    price,
+                    fee,
+                )
                 self.order_manager.fill_order(
                     order=order,
                     fill_price=price,
@@ -827,8 +799,7 @@ class ExecutionEngine:
                 if self.audit_external_orders and order.type in {"market", "limit"}:
                     failures = self._place_pending_conditional_orders_for_entry(order)
                     if failures:
-                        with self._submission_gate:
-                            self._claim_reconcile_halt_locked()
+                        self._submission_gate_owner.claim_reconcile_halt()
                         raise ExchangeError(
                             "conditional_order_placement_failed_after_simulated_fill: "
                             f"{failures}"
@@ -929,9 +900,7 @@ class ExecutionEngine:
                 "action": "unresolved_native_protection_bracket_type_mismatch",
             }
         raw_price = (
-            raw.get("trigger_price")
-            if order.type == "stop_loss"
-            else raw.get("price")
+            raw.get("trigger_price") if order.type == "stop_loss" else raw.get("price")
         )
         try:
             remote_price = Decimal(str(raw_price))
@@ -987,9 +956,9 @@ class ExecutionEngine:
         order_id: str | None = None,
     ) -> None:
         with self._order_event_apply_lock:
-            current = self.order_manager.repo.get_order(
-                order_id or str(order.id)
-            ) or order
+            current = (
+                self.order_manager.repo.get_order(order_id or str(order.id)) or order
+            )
             if (
                 current.status == OrderStatus.SUBMITTED_UNCONFIRMED.value
                 or not current.client_order_id
@@ -1045,8 +1014,7 @@ class ExecutionEngine:
             return True
 
         terminal_event_pending = (
-            self.adapter.cancel_terminal_state_delivered_by_order_events()
-            is True
+            self.adapter.cancel_terminal_state_delivered_by_order_events() is True
         )
         self._assert_external_operation_allowed()
         client_order_id = getattr(order, "client_order_id", None)
@@ -1265,24 +1233,13 @@ class ExecutionEngine:
         Returns True if all in-flight submissions completed within the timeout,
         False if the timeout was reached with work still in flight.
         """
-        with self._submission_gate:
-            self._submissions_halted = True
-            return self._submission_gate.wait_for(
-                lambda: self._submissions_in_flight == 0,
-                timeout=timeout,
-            )
+        return self._submission_gate_owner.halt_and_drain(timeout=timeout)
 
     def run_when_submissions_drained(self, callback: Callable[[], None]) -> None:
-        with self._submission_gate:
-            if self._submissions_in_flight > 0:
-                self._drain_callbacks.append(callback)
-                return
-        callback()
+        self._submission_gate_owner.run_when_submissions_drained(callback)
 
     def resume_submissions(self) -> None:
-        with self._submission_gate:
-            self._submissions_halted = False
-            self._submission_gate.notify_all()
+        self._submission_gate_owner.resume_submissions()
 
     def halt_for_reconcile(self, timeout: float = 0.0) -> bool:
         """Raise the independent reconcile gate and drain in-flight submissions.
@@ -1291,36 +1248,11 @@ class ExecutionEngine:
         never clear an active kill-switch halt. Returns True if no submissions
         were in flight within *timeout*.
         """
-        with self._submission_gate:
-            generation = self._claim_reconcile_halt_locked()
-            self._reconcile_claim.generation = generation
-            return self._submission_gate.wait_for(
-                lambda: self._submissions_in_flight == 0,
-                timeout=timeout,
-            )
-
-    def _claim_reconcile_halt_locked(self) -> int:
-        """Raise the gate and return a generation identifying this claim."""
-        self._reconcile_halt_generation += 1
-        self._reconcile_halt = True
-        return self._reconcile_halt_generation
+        return self._submission_gate_owner.halt_for_reconcile(timeout=timeout)
 
     def resume_after_reconcile(self) -> None:
         """Clear only the reconcile gate; leaves any kill-switch halt untouched."""
-        expected_generation = getattr(
-            self._reconcile_claim,
-            "generation",
-            None,
-        )
-        with self._submission_gate:
-            if (
-                expected_generation is None
-                or self._reconcile_halt_generation == expected_generation
-            ):
-                self._reconcile_halt = False
-            self._submission_gate.notify_all()
-        if expected_generation is not None:
-            del self._reconcile_claim.generation
+        self._submission_gate_owner.resume_after_reconcile()
 
     def modify_protection(
         self,
@@ -1333,13 +1265,13 @@ class ExecutionEngine:
             ("stop_loss", stop_loss),
             ("take_profit", take_profit),
         ]
-        requested = [(leg_type, price) for leg_type, price in requested if price is not None]
+        requested = [
+            (leg_type, price) for leg_type, price in requested if price is not None
+        ]
         if len(requested) != 1:
             raise ExchangeError("modify_protection_requires_exactly_one_leg")
-        with self._submission_gate:
-            if self._submissions_halted or self._reconcile_halt:
-                raise ExchangeError("modify_protection_submission_gate_halted")
-            self._submissions_in_flight += 1
+        if self._submission_gate_owner.try_begin_submission() is not None:
+            raise ExchangeError("modify_protection_submission_gate_halted")
         try:
             leg_type, price = requested[0]
             entry = self.order_manager.repo.get_order(str(entry_order_id))
@@ -1432,26 +1364,17 @@ class ExecutionEngine:
                 "effective_price": str(price),
             }
         except NetworkError:
-            with self._submission_gate:
-                self._claim_reconcile_halt_locked()
+            self._submission_gate_owner.claim_reconcile_halt()
             raise
         finally:
             self._finish_submission()
 
     def _finish_submission(self) -> None:
-        callbacks: list[Callable[[], None]] = []
-        with self._submission_gate:
-            self._submissions_in_flight -= 1
-            if self._submissions_in_flight == 0:
-                callbacks, self._drain_callbacks = self._drain_callbacks, []
-            self._submission_gate.notify_all()
-        for callback in callbacks:
-            try:
-                callback()
-            except Exception:
-                self.logger.exception("Submission drain callback failed")
+        self._submission_gate_owner.finish_submission()
 
-    def execute_signal(self, signal: Signal, candle: Optional[Candlestick] = None) -> Optional[str]:
+    def execute_signal(
+        self, signal: Signal, candle: Optional[Candlestick] = None
+    ) -> Optional[str]:
         """
         Converts Signal to Order and delegates execution to the Adapter.
         Also places SL/TP/Trailing orders when specified in the signal.
@@ -1459,14 +1382,17 @@ class ExecutionEngine:
         """
         # Gate: reject if the submission gate has been halted by a kill switch
         # or while owned-order reconciliation runs after a reconnect.
-        with self._submission_gate:
-            if self._submissions_halted or self._reconcile_halt:
-                cause = "kill switch active" if self._submissions_halted else "reconnect reconcile"
-                self.logger.warning(
-                    "execute_signal rejected: submission gate is halted (%s)", cause
-                )
-                return None
-            self._submissions_in_flight += 1
+        admission_rejection = self._submission_gate_owner.try_begin_submission()
+        if admission_rejection is not None:
+            cause = (
+                "kill switch active"
+                if admission_rejection == "kill_switch_halted"
+                else "reconnect reconcile"
+            )
+            self.logger.warning(
+                "execute_signal rejected: submission gate is halted (%s)", cause
+            )
+            return None
         try:
             self._assert_external_operation_allowed()
             signal = self._normalize_signal_quantity_or_reject(signal, candle)
@@ -1558,7 +1484,9 @@ class ExecutionEngine:
             EXECUTION_LATENCY.observe(_time.monotonic() - t0)
             if not atomic_group:
                 self.order_manager.update_exchange_order_id(order, exchange_id)
-            self.logger.info("Order Placed. Internal: %s, Exchange: %s", order.id, exchange_id)
+            self.logger.info(
+                "Order Placed. Internal: %s, Exchange: %s", order.id, exchange_id
+            )
             ORDERS_TOTAL.labels(
                 order_type=order_type,
                 status="placed",
@@ -1568,7 +1496,9 @@ class ExecutionEngine:
             self.logger.error("Execution Failed: %s", e)
             self.order_manager.fail_order(order, str(e))
             for conditional_order in conditional_orders:
-                self.order_manager.fail_order(conditional_order, "entry_placement_failed")
+                self.order_manager.fail_order(
+                    conditional_order, "entry_placement_failed"
+                )
             self._record_order_rejection(
                 order=order,
                 order_type=order_type,
@@ -1590,8 +1520,12 @@ class ExecutionEngine:
                     "quantity": str(order.quantity),
                     "price": str(order.price) if order.price else "market",
                     "stop_loss": str(signal.stop_loss) if signal.stop_loss else None,
-                    "take_profit": str(signal.take_profit) if signal.take_profit else None,
-                    "trailing_distance": str(signal.trailing_distance) if signal.trailing_distance else None,
+                    "take_profit": str(signal.take_profit)
+                    if signal.take_profit
+                    else None,
+                    "trailing_distance": str(signal.trailing_distance)
+                    if signal.trailing_distance
+                    else None,
                 },
                 timestamp=signal.timestamp,
                 trade_id=str(order.id),
@@ -1626,9 +1560,13 @@ class ExecutionEngine:
         limit_price = resolved_intent.limit_price
 
         client_order_id = self._client_order_id_for_signal(signal)
-        existing_order = self.order_manager.repo.get_order_by_client_order_id(client_order_id)
+        existing_order = self.order_manager.repo.get_order_by_client_order_id(
+            client_order_id
+        )
         if existing_order is not None:
-            self.logger.info("Order already exists for client_order_id=%s", client_order_id)
+            self.logger.info(
+                "Order already exists for client_order_id=%s", client_order_id
+            )
             return existing_order.id
 
         intent_payload = {
@@ -1684,7 +1622,9 @@ class ExecutionEngine:
             EXECUTION_LATENCY.observe(_time.monotonic() - t0)
             if not atomic_group:
                 self._record_order_ack(order, exchange_id, order_id=order_id)
-            self.logger.info("Order Placed. Internal: %s, Exchange: %s", order.id, exchange_id)
+            self.logger.info(
+                "Order Placed. Internal: %s, Exchange: %s", order.id, exchange_id
+            )
             ORDERS_TOTAL.labels(
                 order_type=order_type,
                 status="placed",
@@ -1693,8 +1633,7 @@ class ExecutionEngine:
         except ExchangeError as e:
             self.logger.error("Execution Failed: %s", e)
             if atomic_group and isinstance(e, NetworkError):
-                with self._submission_gate:
-                    self._claim_reconcile_halt_locked()
+                self._submission_gate_owner.claim_reconcile_halt()
                 adoption = {
                     "action": "verification_blocked_native_bracket_submit",
                     "verification_blocked": True,
@@ -1833,8 +1772,12 @@ class ExecutionEngine:
                     "quantity": str(order.quantity),
                     "price": str(order.price) if order.price else "market",
                     "stop_loss": str(signal.stop_loss) if signal.stop_loss else None,
-                    "take_profit": str(signal.take_profit) if signal.take_profit else None,
-                    "trailing_distance": str(signal.trailing_distance) if signal.trailing_distance else None,
+                    "take_profit": str(signal.take_profit)
+                    if signal.take_profit
+                    else None,
+                    "trailing_distance": str(signal.trailing_distance)
+                    if signal.trailing_distance
+                    else None,
                 },
                 timestamp=signal.timestamp,
                 trade_id=str(order.id),
@@ -1915,7 +1858,9 @@ class ExecutionEngine:
                 "verification_blocked": False,
                 "terminal": True,
             }
-        exchange_order_id = event_result.get("exchange_order_id") or snapshot.exchange_order_id
+        exchange_order_id = (
+            event_result.get("exchange_order_id") or snapshot.exchange_order_id
+        )
         if exchange_order_id is None:
             return {
                 "action": "verification_blocked_order_snapshot_missing_exchange_order_id",
@@ -1999,7 +1944,9 @@ class ExecutionEngine:
             conditional_order.intent_payload = payload
             self.order_manager.repo.update_order(conditional_order)
 
-    def _place_entry_order(self, entry_order, conditional_orders: list) -> tuple[str, bool]:
+    def _place_entry_order(
+        self, entry_order, conditional_orders: list
+    ) -> tuple[str, bool]:
         orders = [entry_order, *conditional_orders]
         atomic_group = self._supports_atomic_order_group(orders)
         if not atomic_group:
@@ -2019,14 +1966,17 @@ class ExecutionEngine:
                     order_id=str(entry_order.id),
                 )
                 for conditional_order in conditional_orders:
-                    current = self.order_manager.repo.get_order(
-                        str(conditional_order.id)
-                    ) or conditional_order
+                    current = (
+                        self.order_manager.repo.get_order(str(conditional_order.id))
+                        or conditional_order
+                    )
                     payload = dict(current.intent_payload or {})
                     payload.update(
                         {
                             "native_parent_basket_id": str(exchange_id),
-                            "native_parent_client_order_id": str(entry_order.client_order_id),
+                            "native_parent_client_order_id": str(
+                                entry_order.client_order_id
+                            ),
                         }
                     )
                     current.intent_payload = payload
@@ -2075,8 +2025,7 @@ class ExecutionEngine:
         try:
             position = self._load_strategy_position(signal)
         except Exception as error:
-            with self._submission_gate:
-                self._claim_reconcile_halt_locked()
+            self._submission_gate_owner.claim_reconcile_halt()
             self.logger.error(
                 "EXIT position lookup failed; submissions halted: "
                 "strategy=%s product=%s error=%s",
@@ -2095,8 +2044,7 @@ class ExecutionEngine:
             else PositionSide.SHORT.value
         )
         if position_side != expected_side:
-            with self._submission_gate:
-                self._claim_reconcile_halt_locked()
+            self._submission_gate_owner.claim_reconcile_halt()
             return ExitDecision(False, "position_side_mismatch")
 
         position_quantity = Decimal(str(position.quantity))
@@ -2205,7 +2153,9 @@ class ExecutionEngine:
         candle: Optional[Candlestick],
     ) -> list:
         """Create SL/TP/Trailing orders linked via OCO before external placement."""
-        close_side = OrderSide.SELL if entry_order.side.lower() == "buy" else OrderSide.BUY
+        close_side = (
+            OrderSide.SELL if entry_order.side.lower() == "buy" else OrderSide.BUY
+        )
         conditional_orders = []
         intents = conditional_order_intents(signal)
 
@@ -2257,28 +2207,28 @@ class ExecutionEngine:
     def _place_pending_conditional_orders_for_entry(self, entry_order) -> list[dict]:
         # Gate: reject conditional placement if the submission gate is halted by
         # a kill switch or while reconnect owned-order reconciliation runs.
-        with self._submission_gate:
-            if self._submissions_halted or self._reconcile_halt:
-                reason = "kill_switch_halted" if self._submissions_halted else "reconcile_halted"
-                self.logger.warning(
-                    "Conditional order placement rejected for entry %s: submission gate halted (%s)",
-                    getattr(entry_order, "id", "?"),
-                    reason,
-                )
-                return [
-                    {
-                        "order_id": str(getattr(entry_order, "id", "?")),
-                        "order_type": getattr(entry_order, "type", "?"),
-                        "reason": reason,
-                    }
-                ]
-            self._submissions_in_flight += 1
+        admission_rejection = self._submission_gate_owner.try_begin_submission()
+        if admission_rejection is not None:
+            self.logger.warning(
+                "Conditional order placement rejected for entry %s: submission gate halted (%s)",
+                getattr(entry_order, "id", "?"),
+                admission_rejection,
+            )
+            return [
+                {
+                    "order_id": str(getattr(entry_order, "id", "?")),
+                    "order_type": getattr(entry_order, "type", "?"),
+                    "reason": admission_rejection,
+                }
+            ]
         try:
             return self._place_pending_conditional_orders_for_entry_impl(entry_order)
         finally:
             self._finish_submission()
 
-    def _place_pending_conditional_orders_for_entry_impl(self, entry_order) -> list[dict]:
+    def _place_pending_conditional_orders_for_entry_impl(
+        self, entry_order
+    ) -> list[dict]:
         if entry_order.type not in {"market", "limit"}:
             return []
         protected_quantity = entry_order.filled_quantity or Decimal("0")
@@ -2295,7 +2245,8 @@ class ExecutionEngine:
                 }
             )
             if isinstance(order.intent_payload, dict)
-            and order.intent_payload.get("pending_entry_order_id") == str(entry_order.id)
+            and order.intent_payload.get("pending_entry_order_id")
+            == str(entry_order.id)
         ]
         native_orders = [
             order
@@ -2339,7 +2290,9 @@ class ExecutionEngine:
             failures.extend(self._place_conditional_orders(placement_candidates))
         return failures
 
-    def _audit_native_bracket_fill(self, entry_order, native_orders: list) -> list[dict]:
+    def _audit_native_bracket_fill(
+        self, entry_order, native_orders: list
+    ) -> list[dict]:
         fill_price = entry_order.filled_price
         if fill_price is None or fill_price <= 0:
             return [
@@ -2383,14 +2336,11 @@ class ExecutionEngine:
                 )
                 continue
             away_from_entry = (
-                (
-                    getattr(entry_order.side, "value", entry_order.side) == "buy"
-                    and order.type == "take_profit"
-                )
-                or (
-                    getattr(entry_order.side, "value", entry_order.side) == "sell"
-                    and order.type == "stop_loss"
-                )
+                getattr(entry_order.side, "value", entry_order.side) == "buy"
+                and order.type == "take_profit"
+            ) or (
+                getattr(entry_order.side, "value", entry_order.side) == "sell"
+                and order.type == "stop_loss"
             )
             expected_price = (
                 fill_price + distance_ticks * tick
@@ -2537,7 +2487,9 @@ class ExecutionEngine:
         }
 
     @staticmethod
-    def _protective_partial_fill_requires_resize(order, event_state: str) -> dict | None:
+    def _protective_partial_fill_requires_resize(
+        order, event_state: str
+    ) -> dict | None:
         if order.type not in {"stop_loss", "take_profit", "trailing_stop"}:
             return None
         if event_state in {"filled", "liquidated"}:
@@ -2554,7 +2506,9 @@ class ExecutionEngine:
             "reason": "protective_partial_fill_requires_resize",
         }
 
-    def _cancel_linked_conditional_order_for_protection_fill(self, order) -> dict | None:
+    def _cancel_linked_conditional_order_for_protection_fill(
+        self, order
+    ) -> dict | None:
         if order.type not in {"stop_loss", "take_profit", "trailing_stop"}:
             return None
         if not isinstance(order.intent_payload, dict):
@@ -2619,7 +2573,9 @@ class ExecutionEngine:
             self.order_manager.repo.update_order(order)
 
     def _supports_atomic_order_group(self, orders: list) -> bool:
-        supports_group = getattr(type(self.adapter), "supports_atomic_order_group", None)
+        supports_group = getattr(
+            type(self.adapter), "supports_atomic_order_group", None
+        )
         return bool(supports_group and supports_group(self.adapter, orders))
 
     def _record_order_rejection(
@@ -2652,8 +2608,7 @@ class ExecutionEngine:
         message = str(error)
         token = message.split(":", 1)[0].strip()
         normalized = "".join(
-            char if char.isalnum() else "_"
-            for char in token.lower()
+            char if char.isalnum() else "_" for char in token.lower()
         ).strip("_")
         return normalized or "exchange_error"
 
@@ -2721,7 +2676,9 @@ class ExecutionEngine:
                 submit_attempted = True
                 ex_id = self.adapter.place_order(order)
                 self._record_order_ack(order, ex_id, order_id=order_id)
-                ORDERS_TOTAL.labels(order_type=order.type, status="placed", reason="none").inc()
+                ORDERS_TOTAL.labels(
+                    order_type=order.type, status="placed", reason="none"
+                ).inc()
             except ExchangeError as e:
                 label = {
                     "stop_loss": "SL",
@@ -2755,7 +2712,11 @@ class ExecutionEngine:
             and adoption["action"] == "verification_blocked_missing_client_order_id"
         ):
             self.order_manager.mark_submitted_unconfirmed(order)
-            ORDERS_TOTAL.labels(order_type=order.type, status="failed", reason="verification_blocked_missing_client_order_id").inc()
+            ORDERS_TOTAL.labels(
+                order_type=order.type,
+                status="failed",
+                reason="verification_blocked_missing_client_order_id",
+            ).inc()
             return [
                 {
                     "order_id": str(order.id),
@@ -2769,10 +2730,18 @@ class ExecutionEngine:
                 }
             ]
         if adoption["action"] == "adopted":
-            ORDERS_TOTAL.labels(order_type=order.type, status="placed", reason="adopted_after_submit_error").inc()
+            ORDERS_TOTAL.labels(
+                order_type=order.type,
+                status="placed",
+                reason="adopted_after_submit_error",
+            ).inc()
             return []
         if adoption.get("terminal"):
-            ORDERS_TOTAL.labels(order_type=order.type, status="failed", reason="terminal_after_submit_error").inc()
+            ORDERS_TOTAL.labels(
+                order_type=order.type,
+                status="failed",
+                reason="terminal_after_submit_error",
+            ).inc()
             return [
                 {
                     "order_id": str(order.id),
@@ -2782,7 +2751,9 @@ class ExecutionEngine:
                 }
             ]
         if adoption.get("verification_blocked") or adoption.get("unresolved"):
-            ORDERS_TOTAL.labels(order_type=order.type, status="failed", reason=str(adoption["action"])).inc()
+            ORDERS_TOTAL.labels(
+                order_type=order.type, status="failed", reason=str(adoption["action"])
+            ).inc()
             return [
                 {
                     "order_id": str(order.id),
@@ -2792,7 +2763,11 @@ class ExecutionEngine:
                 }
             ]
         self.order_manager.fail_order(order, str(error))
-        ORDERS_TOTAL.labels(order_type=order.type, status="failed", reason=self._order_rejection_reason(error)).inc()
+        ORDERS_TOTAL.labels(
+            order_type=order.type,
+            status="failed",
+            reason=self._order_rejection_reason(error),
+        ).inc()
         return [
             {
                 "order_id": str(order.id),
@@ -2829,7 +2804,15 @@ class ExecutionEngine:
         except Exception:
             self.logger.exception("Failed to write conditional order warning event")
 
-    def _journal_fill(self, order, price, qty, fee, fill_type: str, candle: Optional[Candlestick] = None) -> None:
+    def _journal_fill(
+        self,
+        order,
+        price,
+        qty,
+        fee,
+        fill_type: str,
+        candle: Optional[Candlestick] = None,
+    ) -> None:
         """Record a fill event to the journal."""
         tag_map = {
             "STOP_LOSS": "sl_hit",
