@@ -1,4 +1,4 @@
-from datetime import datetime
+from datetime import date, datetime
 from decimal import Decimal
 
 from sqlalchemy import (
@@ -488,38 +488,51 @@ class EvolutionEpoch(Base):
     its evaluation context (pair / window / timeframe).
     """
 
-    __tablename__ = 'evolution_epochs'
+    __tablename__ = "evolution_epochs"
 
-    id = Column(String(64), primary_key=True)
-    strategy_id = Column(String, ForeignKey('strategy.id'), nullable=False)
-    started_at = Column(DateTime(timezone=True), nullable=False)
-    finished_at = Column(DateTime(timezone=True), nullable=True)
-    pop_size = Column(Integer, nullable=False)
-    max_generations = Column(Integer, nullable=False)
-    generations_run = Column(Integer, nullable=True)
+    id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    strategy_id: Mapped[str] = mapped_column(
+        String,
+        ForeignKey("strategy.id"),
+        nullable=False,
+    )
+    started_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        nullable=False,
+    )
+    finished_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True),
+        nullable=True,
+    )
+    pop_size: Mapped[int] = mapped_column(Integer, nullable=False)
+    max_generations: Mapped[int] = mapped_column(Integer, nullable=False)
+    generations_run: Mapped[int | None] = mapped_column(Integer, nullable=True)
     # Numeric (Decimal) — float forbidden for monetary / ratio values.
-    best_score = Column(Numeric(18, 8), nullable=True)
-    seed = Column(BigInteger, nullable=False)
-    config_json = Column(
+    best_score: Mapped[Decimal | None] = mapped_column(
+        Numeric(18, 8),
+        nullable=True,
+    )
+    seed: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    config_json: Mapped[dict[str, object]] = mapped_column(
         JSONB,
         nullable=False,
         server_default="'{}'::jsonb",
     )
-    status = Column(
+    status: Mapped[str] = mapped_column(
         String(32),
         nullable=False,
-        server_default='running',
+        server_default="running",
     )
-    eval_pair = Column(String(32), nullable=False)
-    eval_start_date = Column(Date, nullable=False)
-    eval_end_date = Column(Date, nullable=False)
-    eval_timeframe = Column(String(8), nullable=False)
-    notes = Column(Text, nullable=True)
+    eval_pair: Mapped[str] = mapped_column(String(32), nullable=False)
+    eval_start_date: Mapped[date] = mapped_column(Date, nullable=False)
+    eval_end_date: Mapped[date] = mapped_column(Date, nullable=False)
+    eval_timeframe: Mapped[str] = mapped_column(String(8), nullable=False)
+    notes: Mapped[str | None] = mapped_column(Text, nullable=True)
 
     __table_args__ = (
         CheckConstraint(
             "status IN ('running', 'completed', 'aborted')",
-            name='chk_epoch_status',
+            name="chk_epoch_status",
         ),
     )
 
@@ -532,41 +545,64 @@ class GeneRecord(Base):
     index (defined in the migration via raw DDL).
     """
 
-    __tablename__ = 'gene_records'
+    __tablename__ = "gene_records"
 
-    id = Column(_autoincrement_bigint(), primary_key=True, autoincrement=True)
-    strategy_id = Column(String, ForeignKey('strategy.id'), nullable=False)
-    role = Column(String(16), nullable=False)
-    param_pack = Column(JSONB, nullable=False)
-    score_total = Column(Numeric(18, 8), nullable=False)
-    score_breakdown = Column(JSONB, nullable=False)
-    # Positive loss magnitude normalized at the parameter-search boundary.
-    max_drawdown = Column(Numeric(18, 8), nullable=False)
-    generation_index = Column(Integer, nullable=False)
-    candidate_id = Column(String(64), nullable=False)
-    epoch_id = Column(
-        String(64),
-        ForeignKey('evolution_epochs.id'),
+    id: Mapped[int] = mapped_column(
+        _autoincrement_bigint(),
+        primary_key=True,
+        autoincrement=True,
+    )
+    strategy_id: Mapped[str] = mapped_column(
+        String,
+        ForeignKey("strategy.id"),
         nullable=False,
     )
-    created_at = Column(
+    role: Mapped[str] = mapped_column(String(16), nullable=False)
+    param_pack: Mapped[dict[str, object]] = mapped_column(JSONB, nullable=False)
+    score_total: Mapped[Decimal] = mapped_column(
+        Numeric(18, 8),
+        nullable=False,
+    )
+    score_breakdown: Mapped[dict[str, object]] = mapped_column(
+        JSONB,
+        nullable=False,
+    )
+    # Positive loss magnitude normalized at the parameter-search boundary.
+    max_drawdown: Mapped[Decimal] = mapped_column(
+        Numeric(18, 8),
+        nullable=False,
+    )
+    generation_index: Mapped[int] = mapped_column(Integer, nullable=False)
+    candidate_id: Mapped[str] = mapped_column(String(64), nullable=False)
+    epoch_id: Mapped[str] = mapped_column(
+        String(64),
+        ForeignKey("evolution_epochs.id"),
+        nullable=False,
+    )
+    created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True),
         nullable=False,
         server_default=func.now(),
     )
-    activated_at = Column(DateTime(timezone=True), nullable=True)
-    retired_at = Column(DateTime(timezone=True), nullable=True)
-    notes = Column(Text, nullable=True)
+    activated_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True),
+        nullable=True,
+    )
+    retired_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True),
+        nullable=True,
+    )
+    notes: Mapped[str | None] = mapped_column(Text, nullable=True)
 
     __table_args__ = (
         CheckConstraint(
             "role IN ('challenger', 'champion', 'retired')",
-            name='chk_gene_role',
+            name="chk_gene_role",
         ),
         UniqueConstraint(
-            'epoch_id',
-            'generation_index',
-            'candidate_id',
-            name='uq_gene_epoch_generation_candidate',
+            "epoch_id",
+            "generation_index",
+            "candidate_id",
+            name="uq_gene_epoch_generation_candidate",
         ),
     )

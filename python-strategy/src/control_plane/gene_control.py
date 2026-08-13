@@ -70,13 +70,14 @@ class GeneControlService:
                 },
             )
             session.commit()
+            activated_at = target.activated_at
 
             return {
                 "gene_id": target.id,
                 "strategy_id": target.strategy_id,
                 "role": target.role,
-                "activated_at": target.activated_at.isoformat()
-                if target.activated_at is not None
+                "activated_at": activated_at.isoformat()
+                if activated_at is not None
                 else None,
                 "retired_gene_ids": [gene.id for gene in previous_champions],
             }
