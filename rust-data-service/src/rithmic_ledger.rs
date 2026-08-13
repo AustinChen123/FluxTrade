@@ -19,6 +19,9 @@ pub(crate) mod order;
 #[path = "connector/rithmic/order_command.rs"]
 pub(crate) mod order_command;
 
+#[path = "connector/rithmic/order_dispatch.rs"]
+mod order_dispatch;
+
 #[path = "connector/rithmic/order_event.rs"]
 pub(crate) mod order_event;
 

@@ -29,6 +29,8 @@ mod order;
 #[allow(dead_code)]
 mod order_command;
 
+mod order_dispatch;
+
 mod order_event;
 
 mod order_pending;

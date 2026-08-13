@@ -1,11 +1,12 @@
 use super::{
     config,
-    ledger::{self, AccountIdentity, OrderSnapshot, UserType},
+    ledger::{AccountIdentity, OrderSnapshot, UserType},
     ledger_runtime::{discover_order_account_with_login, next_payload, wait_for_heartbeat},
     order::{self, TradeRoute, TradeRouteEvent},
-    order_command::{self, BracketOrder, ExitPosition, NewOrder, OrderAck, ProtectionModification},
+    order_command::{BracketOrder, ExitPosition, NewOrder, OrderAck, ProtectionModification},
+    order_dispatch::{begin_command, reject_command, Command, Reply},
     order_event::{self, OrderEvent},
-    order_pending::{self, fail_pending, pending_expired, Pending, SubmitKind},
+    order_pending::{self, fail_pending, pending_expired, Pending},
     profile_lock::ProfileLease,
     session::Plant,
     transport::{self, ConnectionEvent, RithmicConnection},
@@ -24,9 +25,13 @@ use tokio::sync::mpsc;
 use tracing::warn;
 
 #[cfg(test)]
+use super::order_command;
+#[cfg(test)]
+use super::order_dispatch::select_trade_route;
+#[cfg(test)]
 use super::order_pending::{
     complete_lookup, complete_or_restore_cancel, update_pending_from_event,
-    update_pending_from_snapshot,
+    update_pending_from_snapshot, SubmitKind,
 };
 
 const RESPONSE_TIMEOUT: Duration = Duration::from_secs(10);
@@ -36,56 +41,6 @@ const RECONNECT_INITIAL: Duration = Duration::from_secs(1);
 const RECONNECT_MAX: Duration = Duration::from_secs(30);
 const TRADE_ROUTES_KEY: &str = "fluxtrade-order-routes";
 const SUBSCRIBE_KEY: &str = "fluxtrade-order-subscribe";
-
-type Reply<T> = std_mpsc::SyncSender<Result<T>>;
-
-enum Command {
-    Submit {
-        order: NewOrder,
-        deadline: Instant,
-        reply: Reply<OrderAck>,
-    },
-    SubmitBracket {
-        order: BracketOrder,
-        deadline: Instant,
-        reply: Reply<OrderAck>,
-    },
-    Modify {
-        modification: ProtectionModification,
-        deadline: Instant,
-        reply: Reply<()>,
-    },
-    Cancel {
-        basket_id: String,
-        deadline: Instant,
-        reply: Reply<()>,
-    },
-    ExitPosition {
-        position: ExitPosition,
-        deadline: Instant,
-        reply: Reply<()>,
-    },
-    Lookup {
-        client_order_id: String,
-        exchange: String,
-        symbol: String,
-        deadline: Instant,
-        reply: Reply<Option<OrderSnapshot>>,
-    },
-    Shutdown,
-}
-
-impl Command {
-    fn is_submission(&self) -> bool {
-        matches!(
-            self,
-            Self::Submit { .. }
-                | Self::SubmitBracket { .. }
-                | Self::Modify { .. }
-                | Self::ExitPosition { .. }
-        )
-    }
-}
 
 pub(crate) struct OrderRuntimeHandle {
     commands: mpsc::Sender<Command>,
@@ -484,236 +439,6 @@ async fn run_connected(
     }
 }
 
-async fn begin_command(
-    connection: &mut RithmicConnection,
-    account: &AccountIdentity,
-    user_type: UserType,
-    routes: &[TradeRoute],
-    sequence: &AtomicU64,
-    command: Command,
-) -> Result<Option<Pending>> {
-    match command {
-        Command::Submit {
-            order: new_order,
-            deadline,
-            reply,
-        } => {
-            if Instant::now() >= deadline {
-                let _ = reply.send(Err(anyhow::anyhow!("Rithmic order command expired")));
-                return Ok(None);
-            }
-            let route = match select_trade_route(routes, &new_order.exchange) {
-                Ok(route) => route,
-                Err(error) => {
-                    let _ = reply.send(Err(error));
-                    return Ok(None);
-                }
-            };
-            let request_key = request_key("new", sequence);
-            let payload =
-                match order_command::new_order_request(&request_key, account, route, &new_order) {
-                    Ok(payload) => payload,
-                    Err(error) => {
-                        let _ = reply.send(Err(error));
-                        return Ok(None);
-                    }
-                };
-            let client_order_id = new_order.client_order_id;
-            if let Err(error) = connection.send_payload(payload).await {
-                let _ = reply.send(Err(anyhow::anyhow!(
-                    "Rithmic new-order result is ambiguous: {error}"
-                )));
-                return Err(error);
-            }
-            Ok(Some(Pending::Submit {
-                kind: SubmitKind::Plain,
-                request_key,
-                client_order_id,
-                basket_id: None,
-                deadline,
-                reply,
-            }))
-        }
-        Command::SubmitBracket {
-            order: bracket_order,
-            deadline,
-            reply,
-        } => {
-            if Instant::now() >= deadline {
-                let _ = reply.send(Err(anyhow::anyhow!("Rithmic bracket command expired")));
-                return Ok(None);
-            }
-            let route = match select_trade_route(routes, &bracket_order.entry.exchange) {
-                Ok(route) => route,
-                Err(error) => {
-                    let _ = reply.send(Err(error));
-                    return Ok(None);
-                }
-            };
-            let request_key = request_key("bracket", sequence);
-            let payload = match order_command::bracket_order_request(
-                &request_key,
-                account,
-                user_type,
-                route,
-                &bracket_order,
-            ) {
-                Ok(payload) => payload,
-                Err(error) => {
-                    let _ = reply.send(Err(error));
-                    return Ok(None);
-                }
-            };
-            let client_order_id = bracket_order.entry.client_order_id;
-            if let Err(error) = connection.send_payload(payload).await {
-                let _ = reply.send(Err(anyhow::anyhow!(
-                    "Rithmic bracket-order result is ambiguous: {error}"
-                )));
-                return Err(error);
-            }
-            Ok(Some(Pending::Submit {
-                kind: SubmitKind::Bracket,
-                request_key,
-                client_order_id,
-                basket_id: None,
-                deadline,
-                reply,
-            }))
-        }
-        Command::Modify {
-            modification,
-            deadline,
-            reply,
-        } => {
-            if Instant::now() >= deadline {
-                let _ = reply.send(Err(anyhow::anyhow!("Rithmic modify command expired")));
-                return Ok(None);
-            }
-            let request_key = request_key("modify", sequence);
-            let payload =
-                match order_command::modify_order_request(&request_key, account, &modification) {
-                    Ok(payload) => payload,
-                    Err(error) => {
-                        let _ = reply.send(Err(error));
-                        return Ok(None);
-                    }
-                };
-            if let Err(error) = connection.send_payload(payload).await {
-                let _ = reply.send(Err(anyhow::anyhow!(
-                    "Rithmic modify-order result is ambiguous: {error}"
-                )));
-                return Err(error);
-            }
-            Ok(Some(Pending::Modify {
-                request_key,
-                modification,
-                response_accepted: false,
-                event_seen: false,
-                deadline,
-                reply,
-            }))
-        }
-        Command::Cancel {
-            basket_id,
-            deadline,
-            reply,
-        } => {
-            if Instant::now() >= deadline {
-                let _ = reply.send(Err(anyhow::anyhow!("Rithmic cancel command expired")));
-                return Ok(None);
-            }
-            let request_key = request_key("cancel", sequence);
-            let payload =
-                match order_command::cancel_order_request(&request_key, account, &basket_id) {
-                    Ok(payload) => payload,
-                    Err(error) => {
-                        let _ = reply.send(Err(error));
-                        return Ok(None);
-                    }
-                };
-            if let Err(error) = connection.send_payload(payload).await {
-                let _ = reply.send(Err(anyhow::anyhow!(
-                    "Rithmic cancel result is ambiguous: {error}"
-                )));
-                return Err(error);
-            }
-            Ok(Some(Pending::Cancel {
-                request_key,
-                basket_id,
-                response_accepted: false,
-                terminal_seen: false,
-                deadline,
-                reply,
-            }))
-        }
-        Command::ExitPosition {
-            position,
-            deadline,
-            reply,
-        } => {
-            if Instant::now() >= deadline {
-                let _ = reply.send(Err(anyhow::anyhow!(
-                    "Rithmic exit-position command expired"
-                )));
-                return Ok(None);
-            }
-            let request_key = request_key("exit-position", sequence);
-            let payload =
-                match order_command::exit_position_request(&request_key, account, &position) {
-                    Ok(payload) => payload,
-                    Err(error) => {
-                        let _ = reply.send(Err(error));
-                        return Ok(None);
-                    }
-                };
-            if let Err(error) = connection.send_payload(payload).await {
-                let _ = reply.send(Err(anyhow::anyhow!(
-                    "Rithmic exit-position result is ambiguous: {error}"
-                )));
-                return Err(error);
-            }
-            Ok(Some(Pending::ExitPosition {
-                request_key,
-                position,
-                deadline,
-                reply,
-            }))
-        }
-        Command::Lookup {
-            client_order_id,
-            exchange,
-            symbol,
-            deadline,
-            reply,
-        } => {
-            if Instant::now() >= deadline {
-                let _ = reply.send(Err(anyhow::anyhow!("Rithmic lookup command expired")));
-                return Ok(None);
-            }
-            if let Err(error) = validate_lookup_identity(&client_order_id, &exchange, &symbol) {
-                let _ = reply.send(Err(error));
-                return Ok(None);
-            }
-            let request_key = request_key("lookup", sequence);
-            let payload = ledger::show_orders_request(&request_key, account)?;
-            if let Err(error) = connection.send_payload(payload).await {
-                let _ = reply.send(Err(anyhow::anyhow!("Rithmic order lookup failed: {error}")));
-                return Err(error);
-            }
-            Ok(Some(Pending::Lookup {
-                request_key,
-                client_order_id,
-                exchange,
-                symbol,
-                matches: Vec::new(),
-                deadline,
-                reply,
-            }))
-        }
-        Command::Shutdown => Ok(None),
-    }
-}
-
 fn handle_payload(
     payload: Vec<u8>,
     account: &AccountIdentity,
@@ -734,58 +459,6 @@ fn handle_payload(
     }
     order_pending::handle_response(&payload, template_id, account, pending)
 }
-fn select_trade_route<'a>(routes: &'a [TradeRoute], exchange: &str) -> Result<&'a str> {
-    let matching: Vec<_> = routes
-        .iter()
-        .filter(|route| route.exchange.eq_ignore_ascii_case(exchange))
-        .collect();
-    ensure!(
-        !matching.is_empty(),
-        "no open Rithmic trade route for exchange"
-    );
-    let defaults: Vec<_> = matching.iter().filter(|route| route.is_default).collect();
-    match (defaults.as_slice(), matching.as_slice()) {
-        ([route], _) => Ok(route.route.as_str()),
-        ([], [route]) => Ok(route.route.as_str()),
-        _ => bail!("ambiguous Rithmic trade route for exchange"),
-    }
-}
-
-fn request_key(prefix: &str, sequence: &AtomicU64) -> String {
-    format!(
-        "fluxtrade-order-{prefix}-{}",
-        sequence.fetch_add(1, Ordering::Relaxed)
-    )
-}
-
-fn reject_command(command: Command, message: &str) {
-    match command {
-        Command::Submit { reply, .. } | Command::SubmitBracket { reply, .. } => {
-            let _ = reply.send(Err(anyhow::anyhow!(message.to_string())));
-        }
-        Command::Modify { reply, .. } | Command::Cancel { reply, .. } => {
-            let _ = reply.send(Err(anyhow::anyhow!(message.to_string())));
-        }
-        Command::ExitPosition { reply, .. } => {
-            let _ = reply.send(Err(anyhow::anyhow!(message.to_string())));
-        }
-        Command::Lookup { reply, .. } => {
-            let _ = reply.send(Err(anyhow::anyhow!(message.to_string())));
-        }
-        Command::Shutdown => {}
-    }
-}
-
-fn validate_lookup_identity(client_order_id: &str, exchange: &str, symbol: &str) -> Result<()> {
-    ensure!(
-        ![client_order_id, exchange, symbol]
-            .iter()
-            .any(|value| value.trim().is_empty()),
-        "Rithmic lookup identity must not be empty"
-    );
-    Ok(())
-}
-
 #[cfg(test)]
 mod tests {
     use super::super::ledger::TransactionType;
@@ -1022,11 +695,170 @@ mod tests {
     }
 
     #[test]
+    fn command_dispatch_implementation_has_one_module_owner() {
+        let actor = include_str!("order_runtime.rs")
+            .split_once("#[cfg(test)]\nmod tests {")
+            .unwrap()
+            .0;
+        let owner = include_str!("order_dispatch.rs");
+        for name in [
+            "type Reply",
+            "enum Command",
+            "impl Command",
+            "async fn begin_command(",
+            "fn select_trade_route",
+            "fn request_key(",
+            "fn reject_command(",
+            "fn validate_lookup_identity(",
+            "Command::Shutdown =>",
+        ] {
+            assert!(owner.contains(name), "missing dispatch owner for {name}");
+            assert!(!actor.contains(name), "duplicate runtime owner for {name}");
+        }
+
+        for (variant, deadline, prefix, pending, write_failure) in [
+            (
+                "Command::Submit {",
+                "Rithmic order command expired",
+                "request_key(\"new\", sequence)",
+                "Pending::Submit {",
+                "Rithmic new-order result is ambiguous",
+            ),
+            (
+                "Command::SubmitBracket {",
+                "Rithmic bracket command expired",
+                "request_key(\"bracket\", sequence)",
+                "Pending::Submit {",
+                "Rithmic bracket-order result is ambiguous",
+            ),
+            (
+                "Command::Modify {",
+                "Rithmic modify command expired",
+                "request_key(\"modify\", sequence)",
+                "Pending::Modify {",
+                "Rithmic modify-order result is ambiguous",
+            ),
+            (
+                "Command::Cancel {",
+                "Rithmic cancel command expired",
+                "request_key(\"cancel\", sequence)",
+                "Pending::Cancel {",
+                "Rithmic cancel result is ambiguous",
+            ),
+            (
+                "Command::ExitPosition {",
+                "Rithmic exit-position command expired",
+                "request_key(\"exit-position\", sequence)",
+                "Pending::ExitPosition {",
+                "Rithmic exit-position result is ambiguous",
+            ),
+            (
+                "Command::Lookup {",
+                "Rithmic lookup command expired",
+                "request_key(\"lookup\", sequence)",
+                "Pending::Lookup {",
+                "Rithmic order lookup failed",
+            ),
+        ] {
+            for expected in [variant, deadline, prefix, pending, write_failure] {
+                assert!(
+                    owner.contains(expected),
+                    "missing dispatch ledger: {expected}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn command_rejection_completes_every_reply_with_the_exact_reason() {
+        fn rejected<T>(command: Command, reply: std_mpsc::Receiver<Result<T>>) {
+            reject_command(command, "exact rejection reason");
+            let Err(error) = reply.recv().unwrap() else {
+                panic!("rejected command unexpectedly succeeded");
+            };
+            assert_eq!(error.to_string(), "exact rejection reason");
+        }
+
+        let (reply, receiver) = std_mpsc::sync_channel(1);
+        rejected(
+            Command::Submit {
+                order: test_order(),
+                deadline: Instant::now() + COMMAND_TIMEOUT,
+                reply,
+            },
+            receiver,
+        );
+        let (reply, receiver) = std_mpsc::sync_channel(1);
+        rejected(
+            Command::SubmitBracket {
+                order: BracketOrder {
+                    entry: test_order(),
+                    stop_ticks: Some(8),
+                    target_ticks: Some(12),
+                },
+                deadline: Instant::now() + COMMAND_TIMEOUT,
+                reply,
+            },
+            receiver,
+        );
+        let (reply, receiver) = std_mpsc::sync_channel(1);
+        rejected(
+            Command::Modify {
+                modification: ProtectionModification {
+                    basket_id: "child-1".to_string(),
+                    exchange: "CME".to_string(),
+                    symbol: "NQU6".to_string(),
+                    quantity: dec!(1),
+                    leg: order_command::ProtectionLeg::StopLoss,
+                    price: dec!(19999),
+                },
+                deadline: Instant::now() + COMMAND_TIMEOUT,
+                reply,
+            },
+            receiver,
+        );
+        let (reply, receiver) = std_mpsc::sync_channel(1);
+        rejected(
+            Command::Cancel {
+                basket_id: "basket-1".to_string(),
+                deadline: Instant::now() + COMMAND_TIMEOUT,
+                reply,
+            },
+            receiver,
+        );
+        let (reply, receiver) = std_mpsc::sync_channel(1);
+        rejected(
+            Command::ExitPosition {
+                position: ExitPosition {
+                    exchange: "CME".to_string(),
+                    symbol: "NQU6".to_string(),
+                    window_name: Some("exit-window-1".to_string()),
+                },
+                deadline: Instant::now() + COMMAND_TIMEOUT,
+                reply,
+            },
+            receiver,
+        );
+        let (reply, receiver) = std_mpsc::sync_channel(1);
+        rejected(
+            Command::Lookup {
+                client_order_id: "client-1".to_string(),
+                exchange: "CME".to_string(),
+                symbol: "NQU6".to_string(),
+                deadline: Instant::now() + COMMAND_TIMEOUT,
+                reply,
+            },
+            receiver,
+        );
+    }
+
+    #[test]
     fn reconnect_gate_blocks_only_submit_commands() {
         let (submit_tx, _) = std_mpsc::sync_channel(1);
         let (bracket_tx, _) = std_mpsc::sync_channel(1);
         let (modify_tx, _) = std_mpsc::sync_channel(1);
         let (cancel_tx, _) = std_mpsc::sync_channel(1);
+        let (exit_tx, _) = std_mpsc::sync_channel(1);
         let (lookup_tx, _) = std_mpsc::sync_channel(1);
         let commands = [
             Command::Submit {
@@ -1060,6 +892,15 @@ mod tests {
                 deadline: Instant::now() + COMMAND_TIMEOUT,
                 reply: cancel_tx,
             },
+            Command::ExitPosition {
+                position: ExitPosition {
+                    exchange: "CME".to_string(),
+                    symbol: "NQU6".to_string(),
+                    window_name: Some("exit-window-1".to_string()),
+                },
+                deadline: Instant::now() + COMMAND_TIMEOUT,
+                reply: exit_tx,
+            },
             Command::Lookup {
                 client_order_id: "client-1".to_string(),
                 exchange: "CME".to_string(),
@@ -1072,7 +913,7 @@ mod tests {
 
         assert_eq!(
             commands.map(|command| command.is_submission()),
-            [true, true, true, false, false, false]
+            [true, true, true, false, true, false, false]
         );
     }
 

@@ -199,7 +199,7 @@ mod tests {
             .next()
             .unwrap();
         let command_source = include_str!("order_command.rs");
-        let runtime_source = include_str!("order_runtime.rs");
+        let dispatch_source = include_str!("order_dispatch.rs");
         let pending_source = include_str!("order_pending.rs");
         let emergency_source = include_str!("emergency.rs");
         let binding_source = include_str!("../../binding/rithmic_order.rs");
@@ -263,7 +263,7 @@ mod tests {
             assert!(!command_source.contains(&format!("fn {helper}")));
         }
         assert!(!route_source.contains("order_command"));
-        assert!(runtime_source.contains("order_command::new_order_request"));
+        assert!(dispatch_source.contains("order_command::new_order_request"));
         assert!(pending_source.contains("order_command::decode_new_order_response"));
         assert!(emergency_source.contains("order_command::ExitPosition"));
         assert!(binding_source.contains("order_command::{"));
