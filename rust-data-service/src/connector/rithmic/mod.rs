@@ -26,6 +26,8 @@ pub(crate) mod ledger_runtime;
 #[allow(dead_code)]
 mod order;
 
+mod order_pending;
+
 #[allow(dead_code)]
 pub(crate) mod order_runtime;
 

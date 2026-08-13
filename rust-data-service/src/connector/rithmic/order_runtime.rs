@@ -1,13 +1,14 @@
 use super::{
     config,
-    ledger::{self, AccountIdentity, OrderSnapshot, OrderSnapshotEvent, UserType},
+    ledger::{self, AccountIdentity, OrderSnapshot, UserType},
     ledger_runtime::{discover_order_account_with_login, next_payload, wait_for_heartbeat},
     order::{
         self, BracketOrder, ExitPosition, NewOrder, OrderAck, OrderEvent, ProtectionModification,
         TradeRoute, TradeRouteEvent,
     },
+    order_pending::{self, fail_pending, pending_expired, Pending, SubmitKind},
     profile_lock::ProfileLease,
-    session::{Plant, ResponseDisposition},
+    session::Plant,
     transport::{self, ConnectionEvent, RithmicConnection},
 };
 use anyhow::{bail, ensure, Context, Result};
@@ -22,6 +23,12 @@ use std::{
 };
 use tokio::sync::mpsc;
 use tracing::warn;
+
+#[cfg(test)]
+use super::order_pending::{
+    complete_lookup, complete_or_restore_cancel, update_pending_from_event,
+    update_pending_from_snapshot,
+};
 
 const RESPONSE_TIMEOUT: Duration = Duration::from_secs(10);
 const STARTUP_TIMEOUT: Duration = Duration::from_secs(45);
@@ -79,63 +86,6 @@ impl Command {
                 | Self::ExitPosition { .. }
         )
     }
-}
-
-#[derive(Clone, Copy)]
-enum SubmitKind {
-    Plain,
-    Bracket,
-}
-
-impl SubmitKind {
-    fn is_response(self, template_id: i32) -> bool {
-        match self {
-            Self::Plain => order::is_new_order_response(template_id),
-            Self::Bracket => order::is_bracket_order_response(template_id),
-        }
-    }
-}
-
-enum Pending {
-    Submit {
-        kind: SubmitKind,
-        request_key: String,
-        client_order_id: String,
-        basket_id: Option<String>,
-        deadline: Instant,
-        reply: Reply<OrderAck>,
-    },
-    Cancel {
-        request_key: String,
-        basket_id: String,
-        response_accepted: bool,
-        terminal_seen: bool,
-        deadline: Instant,
-        reply: Reply<()>,
-    },
-    Modify {
-        request_key: String,
-        modification: ProtectionModification,
-        response_accepted: bool,
-        event_seen: bool,
-        deadline: Instant,
-        reply: Reply<()>,
-    },
-    ExitPosition {
-        request_key: String,
-        position: ExitPosition,
-        deadline: Instant,
-        reply: Reply<()>,
-    },
-    Lookup {
-        request_key: String,
-        client_order_id: String,
-        exchange: String,
-        symbol: String,
-        matches: Vec<OrderSnapshot>,
-        deadline: Instant,
-        reply: Reply<Option<OrderSnapshot>>,
-    },
 }
 
 pub(crate) struct OrderRuntimeHandle {
@@ -770,512 +720,17 @@ fn handle_payload(
     let template_id = order::template_id(&payload)?;
     if order::is_order_event(template_id) {
         if order::notification_is_snapshot(&payload)? {
-            return update_pending_from_snapshot(pending, &payload, account);
+            return order_pending::update_pending_from_snapshot(pending, &payload, account);
         }
         let event = order::decode_order_event(&payload, account)?;
-        update_pending_from_event(pending, &event)?;
+        order_pending::update_pending_from_event(pending, &event)?;
         events
             .send(Ok(event))
             .map_err(|_| anyhow::anyhow!("Rithmic order event receiver stopped"))?;
         return Ok(());
     }
-    if ledger::is_order_snapshot_response(template_id) {
-        return complete_lookup(pending, &payload, account);
-    }
-    if order::is_reject(template_id) {
-        let (request_key, code) = order::decode_request_reject(&payload)?;
-        reject_matching_pending(pending, &request_key, &code);
-        return Ok(());
-    }
-    match pending.take() {
-        Some(Pending::Submit {
-            kind,
-            request_key,
-            client_order_id,
-            mut basket_id,
-            deadline,
-            reply,
-        }) if kind.is_response(template_id) => {
-            let response = match kind {
-                SubmitKind::Plain => {
-                    order::decode_new_order_response(&payload, &request_key, &client_order_id)
-                }
-                SubmitKind::Bracket => {
-                    order::decode_bracket_order_response(&payload, &request_key, &client_order_id)
-                }
-            };
-            match response {
-                Ok(response) => {
-                    if let Err(error) = merge_basket_id(&mut basket_id, response.basket_id) {
-                        let _ =
-                            reply.send(Err(error.context("Rithmic new-order result is ambiguous")));
-                        return Ok(());
-                    }
-                    match response.disposition {
-                        ResponseDisposition::Processing => {
-                            *pending = Some(Pending::Submit {
-                                kind,
-                                request_key,
-                                client_order_id,
-                                basket_id,
-                                deadline,
-                                reply,
-                            });
-                        }
-                        ResponseDisposition::Succeeded => {
-                            let result = basket_id
-                                .context("Rithmic new-order response omitted basket ID")
-                                .map(|basket_id| OrderAck {
-                                    client_order_id,
-                                    basket_id,
-                                })
-                                .context("Rithmic new-order result is ambiguous");
-                            let _ = reply.send(result);
-                        }
-                        ResponseDisposition::Failed(codes) => {
-                            let _ = reply.send(Err(anyhow::anyhow!(
-                                "Rithmic new-order response failed: {}",
-                                codes.join(",")
-                            )));
-                        }
-                    }
-                }
-                Err(error) => {
-                    let _ = reply.send(Err(error.context("Rithmic new-order result is ambiguous")));
-                }
-            }
-        }
-        Some(Pending::Cancel {
-            request_key,
-            basket_id,
-            mut response_accepted,
-            terminal_seen,
-            deadline,
-            reply,
-        }) if order::is_cancel_order_response(template_id) => {
-            match order::decode_cancel_order_response(&payload, &request_key, &basket_id) {
-                Ok(response) => match response.disposition {
-                    ResponseDisposition::Processing => {
-                        *pending = Some(Pending::Cancel {
-                            request_key,
-                            basket_id,
-                            response_accepted,
-                            terminal_seen,
-                            deadline,
-                            reply,
-                        });
-                    }
-                    ResponseDisposition::Succeeded => {
-                        response_accepted = true;
-                        complete_or_restore_cancel(
-                            pending,
-                            request_key,
-                            basket_id,
-                            response_accepted,
-                            terminal_seen,
-                            deadline,
-                            reply,
-                        );
-                    }
-                    ResponseDisposition::Failed(codes) => {
-                        let _ = reply.send(Err(anyhow::anyhow!(
-                            "Rithmic cancel-order response failed: {}",
-                            codes.join(",")
-                        )));
-                    }
-                },
-                Err(error) => {
-                    let _ = reply.send(Err(
-                        error.context("Rithmic cancel-order result is ambiguous")
-                    ));
-                }
-            }
-        }
-        Some(Pending::Modify {
-            request_key,
-            modification,
-            mut response_accepted,
-            event_seen,
-            deadline,
-            reply,
-        }) if order::is_modify_order_response(template_id) => {
-            match order::decode_modify_order_response(
-                &payload,
-                &request_key,
-                &modification.basket_id,
-            ) {
-                Ok(response) => match response.disposition {
-                    ResponseDisposition::Processing => {
-                        *pending = Some(Pending::Modify {
-                            request_key,
-                            modification,
-                            response_accepted,
-                            event_seen,
-                            deadline,
-                            reply,
-                        });
-                    }
-                    ResponseDisposition::Succeeded => {
-                        response_accepted = true;
-                        complete_or_restore_modify(
-                            pending,
-                            request_key,
-                            modification,
-                            response_accepted,
-                            event_seen,
-                            deadline,
-                            reply,
-                        );
-                    }
-                    ResponseDisposition::Failed(codes) => {
-                        let message = if event_seen {
-                            format!(
-                                "Rithmic modify-order result is ambiguous: event succeeded but response failed: {}",
-                                codes.join(",")
-                            )
-                        } else {
-                            format!("Rithmic modify-order response failed: {}", codes.join(","))
-                        };
-                        let _ = reply.send(Err(anyhow::anyhow!(message)));
-                    }
-                },
-                Err(error) => {
-                    let _ = reply.send(Err(
-                        error.context("Rithmic modify-order result is ambiguous")
-                    ));
-                }
-            }
-        }
-        Some(Pending::ExitPosition {
-            request_key,
-            position,
-            deadline,
-            reply,
-        }) if order::is_exit_position_response(template_id) => {
-            match order::decode_exit_position_response(&payload, &request_key, &position) {
-                Ok(ResponseDisposition::Processing) => {
-                    *pending = Some(Pending::ExitPosition {
-                        request_key,
-                        position,
-                        deadline,
-                        reply,
-                    });
-                }
-                Ok(ResponseDisposition::Succeeded) => {
-                    let _ = reply.send(Ok(()));
-                }
-                Ok(ResponseDisposition::Failed(codes)) => {
-                    let _ = reply.send(Err(anyhow::anyhow!(
-                        "Rithmic exit-position response failed: {}",
-                        codes.join(",")
-                    )));
-                }
-                Err(error) => {
-                    let _ = reply.send(Err(
-                        error.context("Rithmic exit-position result is ambiguous")
-                    ));
-                }
-            }
-        }
-        current => *pending = current,
-    }
-    Ok(())
+    order_pending::handle_response(&payload, template_id, account, pending)
 }
-
-fn merge_basket_id(current: &mut Option<String>, candidate: Option<String>) -> Result<()> {
-    let Some(candidate) = candidate else {
-        return Ok(());
-    };
-    if let Some(current) = current.as_deref() {
-        ensure!(current == candidate, "Rithmic response basket ID changed");
-    } else {
-        *current = Some(candidate);
-    }
-    Ok(())
-}
-
-fn update_pending_from_snapshot(
-    pending: &mut Option<Pending>,
-    payload: &[u8],
-    account: &AccountIdentity,
-) -> Result<()> {
-    let Some(Pending::Lookup {
-        request_key,
-        client_order_id,
-        exchange,
-        symbol,
-        mut matches,
-        deadline,
-        reply,
-    }) = pending.take()
-    else {
-        bail!("unexpected Rithmic order snapshot notification");
-    };
-    let event = ledger::decode_order_snapshot_event(payload, &request_key, account)?;
-    let OrderSnapshotEvent::Snapshot(snapshot) = event else {
-        bail!("Rithmic order snapshot completed on notification template");
-    };
-    if snapshot.client_order_id.as_deref() == Some(client_order_id.as_str()) {
-        ensure!(
-            snapshot.exchange.eq_ignore_ascii_case(&exchange) && snapshot.symbol == symbol,
-            "Rithmic lookup client ID matched a different instrument"
-        );
-        ensure!(
-            matches.is_empty(),
-            "duplicate Rithmic lookup client order ID"
-        );
-        matches.push(*snapshot);
-    }
-    *pending = Some(Pending::Lookup {
-        request_key,
-        client_order_id,
-        exchange,
-        symbol,
-        matches,
-        deadline,
-        reply,
-    });
-    Ok(())
-}
-
-fn complete_lookup(
-    pending: &mut Option<Pending>,
-    payload: &[u8],
-    account: &AccountIdentity,
-) -> Result<()> {
-    let Some(Pending::Lookup {
-        request_key,
-        mut matches,
-        reply,
-        ..
-    }) = pending.take()
-    else {
-        bail!("unexpected Rithmic order snapshot completion");
-    };
-    ensure!(
-        ledger::decode_order_snapshot_event(payload, &request_key, account)?
-            == OrderSnapshotEvent::RequestCompleted,
-        "Rithmic lookup did not complete"
-    );
-    let _ = reply.send(Ok(matches.pop()));
-    Ok(())
-}
-
-fn update_pending_from_event(pending: &mut Option<Pending>, event: &OrderEvent) -> Result<()> {
-    let Some(current) = pending.take() else {
-        return Ok(());
-    };
-    match current {
-        Pending::Modify {
-            request_key,
-            modification,
-            response_accepted,
-            event_seen,
-            deadline,
-            reply,
-        } => {
-            if event.basket_id != modification.basket_id {
-                *pending = Some(Pending::Modify {
-                    request_key,
-                    modification,
-                    response_accepted,
-                    event_seen,
-                    deadline,
-                    reply,
-                });
-            } else if event.status == "modify_rejected" {
-                let _ = reply.send(Err(anyhow::anyhow!("Rithmic modify was rejected")));
-            } else if event.notification_type == "modify" {
-                match validate_modify_event(event, &modification) {
-                    Ok(()) => complete_or_restore_modify(
-                        pending,
-                        request_key,
-                        modification,
-                        response_accepted,
-                        true,
-                        deadline,
-                        reply,
-                    ),
-                    Err(error) => {
-                        let _ = reply.send(Err(error.context(
-                            "Rithmic modify-order result is ambiguous: conflicting modify event",
-                        )));
-                    }
-                }
-            } else {
-                *pending = Some(Pending::Modify {
-                    request_key,
-                    modification,
-                    response_accepted,
-                    event_seen,
-                    deadline,
-                    reply,
-                });
-            }
-            Ok(())
-        }
-        Pending::Cancel {
-            request_key,
-            basket_id,
-            response_accepted,
-            terminal_seen,
-            deadline,
-            reply,
-        } => {
-            if event.basket_id != basket_id {
-                *pending = Some(Pending::Cancel {
-                    request_key,
-                    basket_id,
-                    response_accepted,
-                    terminal_seen,
-                    deadline,
-                    reply,
-                });
-                return Ok(());
-            }
-            match event.status.as_str() {
-                "cancelled" => complete_or_restore_cancel(
-                    pending,
-                    request_key,
-                    basket_id,
-                    response_accepted,
-                    true,
-                    deadline,
-                    reply,
-                ),
-                "cancel_rejected" => {
-                    let _ = reply.send(Err(anyhow::anyhow!("Rithmic cancel was rejected")));
-                }
-                "filled" | "rejected" => {
-                    let _ = reply.send(Err(anyhow::anyhow!(
-                        "Rithmic order became terminal before cancellation"
-                    )));
-                }
-                _ => {
-                    *pending = Some(Pending::Cancel {
-                        request_key,
-                        basket_id,
-                        response_accepted,
-                        terminal_seen,
-                        deadline,
-                        reply,
-                    });
-                }
-            }
-            Ok(())
-        }
-        other => {
-            *pending = Some(other);
-            Ok(())
-        }
-    }
-}
-
-fn complete_or_restore_modify(
-    pending: &mut Option<Pending>,
-    request_key: String,
-    modification: ProtectionModification,
-    response_accepted: bool,
-    event_seen: bool,
-    deadline: Instant,
-    reply: Reply<()>,
-) {
-    if response_accepted && event_seen {
-        let _ = reply.send(Ok(()));
-    } else {
-        *pending = Some(Pending::Modify {
-            request_key,
-            modification,
-            response_accepted,
-            event_seen,
-            deadline,
-            reply,
-        });
-    }
-}
-
-fn validate_modify_event(event: &OrderEvent, modification: &ProtectionModification) -> Result<()> {
-    ensure!(
-        event.exchange.eq_ignore_ascii_case(&modification.exchange)
-            && event.symbol == modification.symbol,
-        "Rithmic modify event instrument mismatch"
-    );
-    ensure!(
-        event.quantity == Some(modification.quantity),
-        "Rithmic modify event quantity mismatch"
-    );
-    match modification.leg {
-        order::ProtectionLeg::StopLoss => {
-            ensure!(
-                event.price_type.as_deref() == Some("stop_market")
-                    && event.trigger_price == Some(modification.price),
-                "Rithmic stop modification event mismatch"
-            );
-        }
-        order::ProtectionLeg::TakeProfit => {
-            ensure!(
-                event.price_type.as_deref() == Some("limit")
-                    && event.price == Some(modification.price),
-                "Rithmic target modification event mismatch"
-            );
-        }
-    }
-    Ok(())
-}
-
-fn complete_or_restore_cancel(
-    pending: &mut Option<Pending>,
-    request_key: String,
-    basket_id: String,
-    response_accepted: bool,
-    terminal_seen: bool,
-    deadline: Instant,
-    reply: Reply<()>,
-) {
-    if response_accepted && terminal_seen {
-        let _ = reply.send(Ok(()));
-    } else {
-        *pending = Some(Pending::Cancel {
-            request_key,
-            basket_id,
-            response_accepted,
-            terminal_seen,
-            deadline,
-            reply,
-        });
-    }
-}
-
-fn reject_matching_pending(pending: &mut Option<Pending>, request_key: &str, code: &str) {
-    let matches = match pending.as_ref() {
-        Some(Pending::Submit {
-            request_key: expected,
-            ..
-        })
-        | Some(Pending::Cancel {
-            request_key: expected,
-            ..
-        })
-        | Some(Pending::Modify {
-            request_key: expected,
-            ..
-        })
-        | Some(Pending::ExitPosition {
-            request_key: expected,
-            ..
-        })
-        | Some(Pending::Lookup {
-            request_key: expected,
-            ..
-        }) => expected == request_key,
-        None => false,
-    };
-    if matches {
-        let message = format!("Rithmic rejected order request with code {code}");
-        fail_pending(pending, &message);
-    }
-}
-
 fn select_trade_route<'a>(routes: &'a [TradeRoute], exchange: &str) -> Result<&'a str> {
     let matching: Vec<_> = routes
         .iter()
@@ -1300,17 +755,6 @@ fn request_key(prefix: &str, sequence: &AtomicU64) -> String {
     )
 }
 
-fn pending_expired(pending: &Pending) -> bool {
-    let deadline = match pending {
-        Pending::Submit { deadline, .. }
-        | Pending::Cancel { deadline, .. }
-        | Pending::Modify { deadline, .. }
-        | Pending::ExitPosition { deadline, .. }
-        | Pending::Lookup { deadline, .. } => deadline,
-    };
-    Instant::now() >= *deadline
-}
-
 fn reject_command(command: Command, message: &str) {
     match command {
         Command::Submit { reply, .. } | Command::SubmitBracket { reply, .. } => {
@@ -1326,28 +770,6 @@ fn reject_command(command: Command, message: &str) {
             let _ = reply.send(Err(anyhow::anyhow!(message.to_string())));
         }
         Command::Shutdown => {}
-    }
-}
-
-fn fail_pending(pending: &mut Option<Pending>, message: &str) {
-    if let Some(pending) = pending.take() {
-        match pending {
-            Pending::Submit { reply, .. } => {
-                let _ = reply.send(Err(anyhow::anyhow!(message.to_string())));
-            }
-            Pending::Cancel { reply, .. } => {
-                let _ = reply.send(Err(anyhow::anyhow!(message.to_string())));
-            }
-            Pending::Modify { reply, .. } => {
-                let _ = reply.send(Err(anyhow::anyhow!(message.to_string())));
-            }
-            Pending::ExitPosition { reply, .. } => {
-                let _ = reply.send(Err(anyhow::anyhow!(message.to_string())));
-            }
-            Pending::Lookup { reply, .. } => {
-                let _ = reply.send(Err(anyhow::anyhow!(message.to_string())));
-            }
-        }
     }
 }
 
@@ -1459,6 +881,141 @@ mod tests {
         assert_eq!(generation.load(Ordering::Acquire), 2);
         assert!(!connected.load(Ordering::Acquire));
         assert_eq!(unexpected_template, None);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn protocol_validation_stops_runtime_and_fails_pending_without_reconnect() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("ws://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move {
+            let mut socket = serve_order_startup(&listener).await;
+            let command = timeout(Duration::from_secs(2), socket.next())
+                .await
+                .unwrap()
+                .unwrap()
+                .unwrap();
+            assert_template(command, 312);
+            send(
+                &mut socket,
+                codec::encode(&protocol::ExchangeOrderNotification {
+                    template_id: 352,
+                    is_snapshot: Some(false),
+                    fcm_id: Some("FCM".to_string()),
+                    ib_id: Some("IB".to_string()),
+                    account_id: Some("ACCOUNT".to_string()),
+                    basket_id: Some("basket-1".to_string()),
+                    exchange: Some("CME".to_string()),
+                    symbol: Some("NQU6".to_string()),
+                    status: Some("OPEN".to_string()),
+                    transaction_type: Some(
+                        protocol::exchange_order_notification::TransactionType::Buy as i32,
+                    ),
+                    ..Default::default()
+                })
+                .unwrap(),
+            )
+            .await;
+        });
+
+        let login = LoginParameters::new(
+            "test-user".to_string(),
+            "test-password".to_string(),
+            "test-system".to_string(),
+            "FluxTrade".to_string(),
+            "0.1.0".to_string(),
+            Plant::Order,
+        )
+        .unwrap();
+        let (command_tx, command_rx) = mpsc::channel(1);
+        let (event_tx, event_rx) = std_mpsc::channel();
+        let connected = Arc::new(AtomicBool::new(false));
+        let generation = Arc::new(AtomicU64::new(0));
+        let (ready_tx, _ready_rx) = std_mpsc::sync_channel(1);
+        let lease = ProfileLease::acquire("order-protocol-validation-loopback").unwrap();
+        let runtime_generation = Arc::clone(&generation);
+        let runtime = tokio::spawn(run_with_connector(
+            lease,
+            command_rx,
+            event_tx,
+            Arc::clone(&connected),
+            runtime_generation,
+            ready_tx,
+            move || {
+                let runtime = RuntimeConfig {
+                    url: url.clone(),
+                    login: login.clone(),
+                };
+                async move { connect_and_prepare_runtime(runtime, Some("ACCOUNT")).await }
+            },
+        ));
+
+        timeout(Duration::from_secs(3), async {
+            while generation.load(Ordering::Acquire) == 0 {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+        let (submit_tx, submit_rx) = std_mpsc::sync_channel(1);
+        command_tx
+            .send(Command::Submit {
+                order: test_order(),
+                deadline: Instant::now() + COMMAND_TIMEOUT,
+                reply: submit_tx,
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(
+            submit_rx
+                .recv_timeout(Duration::from_secs(2))
+                .unwrap()
+                .unwrap_err()
+                .to_string(),
+            "Rithmic order command result is ambiguous"
+        );
+        let error = event_rx
+            .recv_timeout(Duration::from_secs(2))
+            .unwrap()
+            .unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "Rithmic order stream failed protocol validation"
+        );
+        assert!(format!("{error:#}").contains("missing Rithmic order notify type"));
+        timeout(Duration::from_secs(2), runtime)
+            .await
+            .unwrap()
+            .unwrap();
+        server.await.unwrap();
+        assert_eq!(generation.load(Ordering::Acquire), 1);
+        assert!(!connected.load(Ordering::Acquire));
+    }
+
+    #[test]
+    fn pending_transition_implementation_has_one_module_owner() {
+        let actor = include_str!("order_runtime.rs");
+        let owner = include_str!("order_pending.rs");
+        for name in [
+            "handle_response",
+            "merge_basket_id",
+            "update_pending_from_snapshot",
+            "complete_lookup",
+            "update_pending_from_event",
+            "complete_or_restore_modify",
+            "validate_modify_event",
+            "complete_or_restore_cancel",
+            "reject_matching_pending",
+            "pending_expired",
+            "fail_pending",
+        ] {
+            let signature = format!("fn {name}(");
+            assert!(owner.contains(&signature), "missing owner for {name}");
+            assert!(
+                !actor.contains(&signature),
+                "duplicate actor owner for {name}"
+            );
+        }
     }
 
     #[test]
@@ -1659,6 +1216,130 @@ mod tests {
         assert_eq!(codec::template_id(&payload).unwrap(), expected);
     }
 
+    #[derive(Clone, Copy)]
+    enum PendingActorFailure {
+        Shutdown,
+        Timeout,
+        ConnectionLoss,
+    }
+
+    async fn assert_actor_pending_failure(
+        trigger: PendingActorFailure,
+        expected_reason: &str,
+        expected_generation: u64,
+    ) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("ws://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move {
+            let mut socket = serve_order_startup(&listener).await;
+            let command = timeout(Duration::from_secs(2), socket.next())
+                .await
+                .unwrap()
+                .unwrap()
+                .unwrap();
+            assert_template(command, 312);
+            match trigger {
+                PendingActorFailure::Shutdown => {
+                    let _ = timeout(Duration::from_secs(2), socket.next()).await;
+                    return;
+                }
+                PendingActorFailure::Timeout => {
+                    tokio::time::sleep(Duration::from_millis(300)).await;
+                }
+                PendingActorFailure::ConnectionLoss => {}
+            }
+            drop(socket);
+            let mut socket = serve_order_startup(&listener).await;
+            let _ = timeout(Duration::from_secs(2), socket.next()).await;
+        });
+
+        let login = LoginParameters::new(
+            "test-user".to_string(),
+            "test-password".to_string(),
+            "test-system".to_string(),
+            "FluxTrade".to_string(),
+            "0.1.0".to_string(),
+            Plant::Order,
+        )
+        .unwrap();
+        let (command_tx, command_rx) = mpsc::channel(1);
+        let (event_tx, _event_rx) = std_mpsc::channel();
+        let connected = Arc::new(AtomicBool::new(false));
+        let generation = Arc::new(AtomicU64::new(0));
+        let (ready_tx, _ready_rx) = std_mpsc::sync_channel(1);
+        let profile = match trigger {
+            PendingActorFailure::Shutdown => "order-pending-shutdown-loopback",
+            PendingActorFailure::Timeout => "order-pending-timeout-loopback",
+            PendingActorFailure::ConnectionLoss => "order-pending-loss-loopback",
+        };
+        let lease = ProfileLease::acquire(profile).unwrap();
+        let runtime_generation = Arc::clone(&generation);
+        let runtime = tokio::spawn(run_with_connector(
+            lease,
+            command_rx,
+            event_tx,
+            Arc::clone(&connected),
+            runtime_generation,
+            ready_tx,
+            move || {
+                let runtime = RuntimeConfig {
+                    url: url.clone(),
+                    login: login.clone(),
+                };
+                async move { connect_and_prepare_runtime(runtime, Some("ACCOUNT")).await }
+            },
+        ));
+
+        timeout(Duration::from_secs(3), async {
+            while generation.load(Ordering::Acquire) == 0 {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+        let (submit_tx, submit_rx) = std_mpsc::sync_channel(1);
+        command_tx
+            .send(Command::Submit {
+                order: test_order(),
+                deadline: match trigger {
+                    PendingActorFailure::Timeout => Instant::now() + Duration::from_millis(20),
+                    _ => Instant::now() + COMMAND_TIMEOUT,
+                },
+                reply: submit_tx,
+            })
+            .await
+            .unwrap();
+        if matches!(trigger, PendingActorFailure::Shutdown) {
+            command_tx.send(Command::Shutdown).await.unwrap();
+        }
+        assert_eq!(
+            submit_rx
+                .recv_timeout(Duration::from_secs(2))
+                .unwrap()
+                .unwrap_err()
+                .to_string(),
+            expected_reason
+        );
+
+        if !matches!(trigger, PendingActorFailure::Shutdown) {
+            timeout(Duration::from_secs(4), async {
+                while generation.load(Ordering::Acquire) < expected_generation {
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            })
+            .await
+            .unwrap();
+            command_tx.send(Command::Shutdown).await.unwrap();
+        }
+        timeout(Duration::from_secs(2), runtime)
+            .await
+            .unwrap()
+            .unwrap();
+        server.await.unwrap();
+        assert_eq!(generation.load(Ordering::Acquire), expected_generation);
+        assert!(!connected.load(Ordering::Acquire));
+    }
+
     fn test_order() -> NewOrder {
         NewOrder {
             client_order_id: "client-1".to_string(),
@@ -1709,6 +1390,33 @@ mod tests {
             cumulative_average_price: None,
             timestamp_ms: None,
         }
+    }
+
+    fn live_order_event_payload(
+        notify_type: protocol::exchange_order_notification::NotifyType,
+        basket_id: &str,
+    ) -> Vec<u8> {
+        codec::encode(&protocol::ExchangeOrderNotification {
+            template_id: 352,
+            notify_type: Some(notify_type as i32),
+            is_snapshot: Some(false),
+            user_tag: Some("client-1".to_string()),
+            fcm_id: Some("FCM".to_string()),
+            ib_id: Some("IB".to_string()),
+            account_id: Some("ACCOUNT".to_string()),
+            basket_id: Some(basket_id.to_string()),
+            exchange: Some("CME".to_string()),
+            symbol: Some("NQU6".to_string()),
+            status: Some("OPEN".to_string()),
+            transaction_type: Some(
+                protocol::exchange_order_notification::TransactionType::Buy as i32,
+            ),
+            quantity: Some(1),
+            total_fill_size: Some(0),
+            total_unfilled_size: Some(1),
+            ..Default::default()
+        })
+        .unwrap()
     }
 
     fn pending_cancel() -> (Option<Pending>, std_mpsc::Receiver<Result<()>>) {
@@ -1812,6 +1520,156 @@ mod tests {
             }),
             rx,
         )
+    }
+
+    fn assert_pending_failure<T>(
+        mut pending: Option<Pending>,
+        receiver: std_mpsc::Receiver<Result<T>>,
+        expected: &str,
+    ) {
+        fail_pending(&mut pending, expected);
+        assert!(pending.is_none());
+        let Err(error) = receiver.recv().unwrap() else {
+            panic!("pending command unexpectedly succeeded");
+        };
+        assert_eq!(error.to_string(), expected);
+    }
+
+    #[test]
+    fn actor_transitions_pending_before_reporting_event_receiver_failure() {
+        use protocol::exchange_order_notification::NotifyType;
+
+        let account = event("open", "basket-1").account;
+        let (event_tx, event_rx) = std_mpsc::channel();
+        drop(event_rx);
+
+        let (mut pending, reply_rx) = pending_cancel();
+        if let Some(Pending::Cancel {
+            response_accepted, ..
+        }) = pending.as_mut()
+        {
+            *response_accepted = true;
+        }
+        let error = handle_payload(
+            live_order_event_payload(NotifyType::Cancel, "basket-1"),
+            &account,
+            &mut pending,
+            &event_tx,
+        )
+        .unwrap_err();
+        assert_eq!(error.to_string(), "Rithmic order event receiver stopped");
+        assert!(pending.is_none());
+        assert!(reply_rx.recv().unwrap().is_ok());
+
+        let (mut pending, reply_rx) = pending_cancel();
+        let error = handle_payload(
+            live_order_event_payload(NotifyType::Status, "unrelated-basket"),
+            &account,
+            &mut pending,
+            &event_tx,
+        )
+        .unwrap_err();
+        assert_eq!(error.to_string(), "Rithmic order event receiver stopped");
+        assert!(matches!(pending, Some(Pending::Cancel { .. })));
+        fail_pending(&mut pending, "Rithmic order command result is ambiguous");
+        assert_eq!(
+            reply_rx.recv().unwrap().unwrap_err().to_string(),
+            "Rithmic order command result is ambiguous"
+        );
+    }
+
+    #[test]
+    fn matching_reject_fails_pending_while_foreign_reject_preserves_it() {
+        let reject = |request_key: &str| {
+            codec::encode(&protocol::Reject {
+                template_id: 75,
+                user_msg: vec![request_key.to_string()],
+                rp_code: vec!["ORDER_REJECTED".to_string()],
+            })
+            .unwrap()
+        };
+        let account = event("open", "basket-1").account;
+        let (event_tx, _event_rx) = std_mpsc::channel();
+        let (mut pending, reply_rx) = pending_submit();
+
+        handle_payload(reject("foreign-request"), &account, &mut pending, &event_tx).unwrap();
+        assert!(matches!(pending, Some(Pending::Submit { .. })));
+        assert!(matches!(
+            reply_rx.try_recv(),
+            Err(std_mpsc::TryRecvError::Empty)
+        ));
+
+        handle_payload(reject("new-1"), &account, &mut pending, &event_tx).unwrap();
+        assert!(pending.is_none());
+        assert_eq!(
+            reply_rx.recv().unwrap().unwrap_err().to_string(),
+            "Rithmic rejected order request with code ORDER_REJECTED"
+        );
+    }
+
+    #[test]
+    fn every_pending_variant_preserves_actor_failure_reasons() {
+        for expected in [
+            "Rithmic order runtime stopped",
+            "Rithmic order command timed out; result is ambiguous",
+            "Rithmic order command result is ambiguous",
+        ] {
+            let (pending, receiver) = pending_submit();
+            assert_pending_failure(pending, receiver, expected);
+            let (pending, receiver) = pending_cancel();
+            assert_pending_failure(pending, receiver, expected);
+            let (pending, receiver) = pending_modify();
+            assert_pending_failure(pending, receiver, expected);
+            let (pending, receiver) = pending_exit_position();
+            assert_pending_failure(pending, receiver, expected);
+            let (pending, receiver) = pending_lookup();
+            assert_pending_failure(pending, receiver, expected);
+        }
+    }
+
+    #[test]
+    fn every_pending_variant_uses_its_own_deadline() {
+        fn assert_deadline(mut pending: Option<Pending>) {
+            assert!(!pending_expired(pending.as_ref().unwrap()));
+            match pending.as_mut().unwrap() {
+                Pending::Submit { deadline, .. }
+                | Pending::Cancel { deadline, .. }
+                | Pending::Modify { deadline, .. }
+                | Pending::ExitPosition { deadline, .. }
+                | Pending::Lookup { deadline, .. } => {
+                    *deadline = Instant::now() - Duration::from_millis(1);
+                }
+            }
+            assert!(pending_expired(pending.as_ref().unwrap()));
+        }
+
+        assert_deadline(pending_submit().0);
+        assert_deadline(pending_cancel().0);
+        assert_deadline(pending_modify().0);
+        assert_deadline(pending_exit_position().0);
+        assert_deadline(pending_lookup().0);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn actor_pending_failure_disposition_matrix_is_exact() {
+        assert_actor_pending_failure(
+            PendingActorFailure::Shutdown,
+            "Rithmic order runtime stopped",
+            1,
+        )
+        .await;
+        assert_actor_pending_failure(
+            PendingActorFailure::Timeout,
+            "Rithmic order command timed out; result is ambiguous",
+            2,
+        )
+        .await;
+        assert_actor_pending_failure(
+            PendingActorFailure::ConnectionLoss,
+            "Rithmic order command result is ambiguous",
+            2,
+        )
+        .await;
     }
 
     #[test]
