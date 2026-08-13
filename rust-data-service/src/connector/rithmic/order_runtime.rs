@@ -3,9 +3,10 @@ use super::{
     ledger::{self, AccountIdentity, OrderSnapshot, UserType},
     ledger_runtime::{discover_order_account_with_login, next_payload, wait_for_heartbeat},
     order::{
-        self, BracketOrder, ExitPosition, NewOrder, OrderAck, OrderEvent, ProtectionModification,
-        TradeRoute, TradeRouteEvent,
+        self, BracketOrder, ExitPosition, NewOrder, OrderAck, ProtectionModification, TradeRoute,
+        TradeRouteEvent,
     },
+    order_event::{self, OrderEvent},
     order_pending::{self, fail_pending, pending_expired, Pending, SubmitKind},
     profile_lock::ProfileLease,
     session::Plant,
@@ -718,11 +719,11 @@ fn handle_payload(
     events: &std_mpsc::Sender<Result<OrderEvent>>,
 ) -> Result<()> {
     let template_id = order::template_id(&payload)?;
-    if order::is_order_event(template_id) {
-        if order::notification_is_snapshot(&payload)? {
+    if order_event::is_order_event(template_id) {
+        if order_event::notification_is_snapshot(&payload)? {
             return order_pending::update_pending_from_snapshot(pending, &payload, account);
         }
-        let event = order::decode_order_event(&payload, account)?;
+        let event = order_event::decode_order_event(&payload, account)?;
         order_pending::update_pending_from_event(pending, &event)?;
         events
             .send(Ok(event))

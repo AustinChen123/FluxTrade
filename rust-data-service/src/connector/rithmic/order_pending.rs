@@ -1,6 +1,7 @@
 use super::{
     ledger::{self, AccountIdentity, OrderSnapshot, OrderSnapshotEvent},
-    order::{self, ExitPosition, OrderAck, OrderEvent, ProtectionModification},
+    order::{self, ExitPosition, OrderAck, ProtectionModification},
+    order_event::OrderEvent,
     session::ResponseDisposition,
 };
 use anyhow::{bail, ensure, Context, Result};
