@@ -6,12 +6,127 @@ use async_trait::async_trait;
 use futures_util::SinkExt;
 use rust_decimal::Decimal;
 use serde_json::{json, Value};
+use std::future::Future;
 use tokio::sync::mpsc;
+use tokio::task::AbortHandle;
 use tokio_tungstenite::tungstenite::protocol::Message;
 use tracing::{error, info, warn};
 
+#[derive(Debug)]
+pub(crate) struct BybitTaskFailure {
+    task: &'static str,
+    stable_error_code: &'static str,
+    safe_cause: &'static str,
+    source: Option<anyhow::Error>,
+}
+
+impl BybitTaskFailure {
+    pub(crate) fn task_error(task: &'static str, source: anyhow::Error) -> Self {
+        Self {
+            task,
+            stable_error_code: "bybit_stream_task_failed",
+            safe_cause: "Bybit stream task failed",
+            source: Some(source),
+        }
+    }
+
+    pub(crate) fn unexpected_exit(task: &'static str) -> Self {
+        Self {
+            task,
+            stable_error_code: "bybit_stream_task_exited",
+            safe_cause: "Bybit stream task exited unexpectedly",
+            source: None,
+        }
+    }
+
+    pub(crate) fn panicked(task: &'static str) -> Self {
+        Self {
+            task,
+            stable_error_code: "bybit_stream_task_panicked",
+            safe_cause: "Bybit stream task panicked",
+            source: None,
+        }
+    }
+
+    pub(crate) fn cancelled(task: &'static str) -> Self {
+        Self {
+            task,
+            stable_error_code: "bybit_stream_task_cancelled",
+            safe_cause: "Bybit stream task was cancelled",
+            source: None,
+        }
+    }
+
+    fn join_failed(task: &'static str) -> Self {
+        Self {
+            task,
+            stable_error_code: "bybit_stream_task_join_failed",
+            safe_cause: "Bybit stream task join failed",
+            source: None,
+        }
+    }
+
+    fn monitor_closed() -> Self {
+        Self {
+            task: "task_monitor",
+            stable_error_code: "bybit_task_monitor_closed",
+            safe_cause: "Bybit task monitor closed unexpectedly",
+            source: None,
+        }
+    }
+
+    pub(crate) fn task(&self) -> &'static str {
+        self.task
+    }
+
+    pub(crate) fn stable_error_code(&self) -> &'static str {
+        self.stable_error_code
+    }
+
+    pub(crate) fn safe_cause(&self) -> &'static str {
+        self.safe_cause
+    }
+}
+
+impl std::fmt::Display for BybitTaskFailure {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(self.safe_cause)
+    }
+}
+
+impl std::error::Error for BybitTaskFailure {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        self.source.as_ref().map(|error| error.as_ref())
+    }
+}
+
+pub(crate) async fn run(
+    symbols: Vec<String>,
+    trade_tx: mpsc::Sender<Trade>,
+    candle_tx: mpsc::Sender<Candlestick>,
+) -> Result<()> {
+    let (task_exit_tx, mut task_exit_rx) = mpsc::unbounded_channel();
+    let mut connector = BybitConnector::with_task_exit_tx(task_exit_tx);
+    info!(symbols = ?symbols, "Starting Bybit Connector");
+    connector.subscribe_trades(&symbols, trade_tx).await?;
+    connector
+        .subscribe_candles(&symbols, "1m", candle_tx)
+        .await?;
+    await_task_exit(&mut task_exit_rx).await
+}
+
+async fn await_task_exit(
+    task_exit_rx: &mut mpsc::UnboundedReceiver<BybitTaskFailure>,
+) -> Result<()> {
+    match task_exit_rx.recv().await {
+        Some(failure) => Err(failure.into()),
+        None => Err(BybitTaskFailure::monitor_closed().into()),
+    }
+}
+
 pub struct BybitConnector {
     exchange_id: String,
+    task_exit_tx: Option<mpsc::UnboundedSender<BybitTaskFailure>>,
 }
 
 impl BybitConnector {
@@ -19,7 +134,44 @@ impl BybitConnector {
     pub fn new() -> Self {
         Self {
             exchange_id: "BYBIT".to_string(),
+            task_exit_tx: None,
         }
+    }
+
+    fn with_task_exit_tx(task_exit_tx: mpsc::UnboundedSender<BybitTaskFailure>) -> Self {
+        Self {
+            task_exit_tx: Some(task_exit_tx),
+            ..Self::new()
+        }
+    }
+
+    fn spawn_task<F>(&self, task_name: &'static str, future: F) -> AbortHandle
+    where
+        F: Future<Output = Result<()>> + Send + 'static,
+    {
+        let task = tokio::spawn(future);
+        let abort_handle = task.abort_handle();
+        let task_exit_tx = self.task_exit_tx.clone();
+        tokio::spawn(async move {
+            let failure = match task.await {
+                Ok(Ok(())) => BybitTaskFailure::unexpected_exit(task_name),
+                Ok(Err(error)) => BybitTaskFailure::task_error(task_name, error),
+                Err(error) if error.is_panic() => BybitTaskFailure::panicked(task_name),
+                Err(error) if error.is_cancelled() => BybitTaskFailure::cancelled(task_name),
+                Err(_) => BybitTaskFailure::join_failed(task_name),
+            };
+            if let Some(task_exit_tx) = task_exit_tx {
+                let _ = task_exit_tx.send(failure);
+            } else {
+                error!(
+                    task = failure.task(),
+                    stable_error_code = failure.stable_error_code(),
+                    safe_cause = failure.safe_cause(),
+                    "Bybit connector task failed"
+                );
+            }
+        });
+        abort_handle
     }
 
     #[allow(dead_code)]
@@ -129,8 +281,8 @@ impl ExchangeConnector for BybitConnector {
 
         info!("Subscribing to Bybit trades: {:?}", args);
 
-        tokio::spawn(async move {
-            let res = ws_manager
+        self.spawn_task("trades", async move {
+            ws_manager
                 .connect_with_retry(
                     |mut ws| {
                         let args = args.clone();
@@ -211,11 +363,7 @@ impl ExchangeConnector for BybitConnector {
                         }
                     },
                 )
-                .await;
-
-            if let Err(e) = res {
-                error!("Bybit trades subscription failed: {}", e);
-            }
+                .await
         });
 
         Ok(())
@@ -261,8 +409,8 @@ impl ExchangeConnector for BybitConnector {
 
         info!("Subscribing to Bybit candles: {:?}", args);
 
-        tokio::spawn(async move {
-            let res = ws_manager
+        self.spawn_task("candles", async move {
+            ws_manager
                 .connect_with_retry(
                     |mut ws| {
                         let args = args.clone();
@@ -350,11 +498,7 @@ impl ExchangeConnector for BybitConnector {
                         }
                     },
                 )
-                .await;
-
-            if let Err(e) = res {
-                error!("Bybit candles subscription failed: {}", e);
-            }
+                .await
         });
 
         Ok(())
@@ -419,6 +563,132 @@ impl ExchangeConnector for BybitConnector {
 mod tests {
     use super::*;
     use serde_json::json;
+    use std::time::Duration;
+
+    #[tokio::test]
+    async fn final_internal_task_error_reaches_the_connector_owner() {
+        let (task_exit_tx, mut task_exit_rx) = mpsc::unbounded_channel();
+        let connector = BybitConnector::with_task_exit_tx(task_exit_tx);
+        let _task = connector.spawn_task("trades", async {
+            Err(anyhow::anyhow!("provider error sentinel"))
+        });
+
+        let error =
+            tokio::time::timeout(Duration::from_secs(1), await_task_exit(&mut task_exit_rx))
+                .await
+                .unwrap()
+                .unwrap_err();
+        let failure = error.downcast_ref::<BybitTaskFailure>().unwrap();
+        assert_eq!(failure.task(), "trades");
+        assert_eq!(failure.stable_error_code(), "bybit_stream_task_failed");
+        assert_eq!(failure.safe_cause(), "Bybit stream task failed");
+        assert_eq!(error.to_string(), "Bybit stream task failed");
+        assert!(!error.to_string().contains("provider error sentinel"));
+    }
+
+    #[tokio::test]
+    async fn clean_internal_task_exit_is_not_treated_as_healthy() {
+        let (task_exit_tx, mut task_exit_rx) = mpsc::unbounded_channel();
+        let connector = BybitConnector::with_task_exit_tx(task_exit_tx);
+        let _task = connector.spawn_task("candles", async { Ok(()) });
+
+        let error =
+            tokio::time::timeout(Duration::from_secs(1), await_task_exit(&mut task_exit_rx))
+                .await
+                .unwrap()
+                .unwrap_err();
+        let failure = error.downcast_ref::<BybitTaskFailure>().unwrap();
+        assert_eq!(failure.task(), "candles");
+        assert_eq!(failure.stable_error_code(), "bybit_stream_task_exited");
+        assert_eq!(
+            failure.safe_cause(),
+            "Bybit stream task exited unexpectedly"
+        );
+    }
+
+    #[tokio::test]
+    async fn panic_and_cancellation_have_fixed_safe_errors() {
+        for (kind, expected_code, expected_cause) in [
+            (
+                "panic",
+                "bybit_stream_task_panicked",
+                "Bybit stream task panicked",
+            ),
+            (
+                "cancel",
+                "bybit_stream_task_cancelled",
+                "Bybit stream task was cancelled",
+            ),
+        ] {
+            let (task_exit_tx, mut task_exit_rx) = mpsc::unbounded_channel();
+            let connector = BybitConnector::with_task_exit_tx(task_exit_tx);
+            let task = if kind == "panic" {
+                connector.spawn_task("trades", async {
+                    panic!("provider panic payload sentinel")
+                })
+            } else {
+                connector.spawn_task("trades", async {
+                    std::future::pending::<Result<()>>().await
+                })
+            };
+            if kind == "cancel" {
+                task.abort();
+            }
+
+            let error =
+                tokio::time::timeout(Duration::from_secs(1), await_task_exit(&mut task_exit_rx))
+                    .await
+                    .unwrap()
+                    .unwrap_err();
+            let failure = error.downcast_ref::<BybitTaskFailure>().unwrap();
+            assert_eq!(failure.stable_error_code(), expected_code);
+            assert_eq!(failure.safe_cause(), expected_cause);
+            assert_eq!(error.to_string(), expected_cause);
+            assert!(!error
+                .to_string()
+                .contains("provider panic payload sentinel"));
+        }
+    }
+
+    #[tokio::test]
+    async fn closed_task_monitor_is_not_treated_as_healthy() {
+        let (task_exit_tx, mut task_exit_rx) = mpsc::unbounded_channel();
+        drop(task_exit_tx);
+
+        let error =
+            tokio::time::timeout(Duration::from_secs(1), await_task_exit(&mut task_exit_rx))
+                .await
+                .unwrap()
+                .unwrap_err();
+        let failure = error.downcast_ref::<BybitTaskFailure>().unwrap();
+        assert_eq!(failure.task(), "task_monitor");
+        assert_eq!(failure.stable_error_code(), "bybit_task_monitor_closed");
+        assert_eq!(
+            failure.safe_cause(),
+            "Bybit task monitor closed unexpectedly"
+        );
+    }
+
+    #[test]
+    fn production_owner_does_not_hide_or_double_log_final_task_failures() {
+        let source = include_str!("bybit.rs");
+        let production = source.split_once("#[cfg(test)]").unwrap().0;
+        let main = include_str!("../main.rs");
+        assert_eq!(production.matches("tokio::spawn").count(), 2);
+        assert_eq!(production.matches("self.spawn_task(").count(), 2);
+        for monitored in ["self.spawn_task(\"trades\"", "self.spawn_task(\"candles\""] {
+            assert!(production.contains(monitored), "{monitored}");
+        }
+        for legacy in [
+            "Bybit trades subscription failed:",
+            "Bybit candles subscription failed:",
+        ] {
+            assert!(!production.contains(legacy), "{legacy}");
+        }
+        assert!(main.contains("crate::connector::bybit::run("));
+        assert!(!main.contains("run_bybit_connector"));
+        assert!(!main.contains("BybitConnector::new"));
+    }
 
     #[test]
     fn test_bybit_parse_kline() {

@@ -8,8 +8,6 @@ mod watchdog;
 
 use crate::aggregator::CandleAggregator;
 use crate::connector::backpack::BackpackConnector;
-use crate::connector::bybit::BybitConnector;
-use crate::connector::ExchangeConnector;
 use crate::model::UserStreamEvent;
 use crate::publisher::{
     create_publish_channel, PublishSender, RedisPublisher, DEFAULT_CHANNEL_CAPACITY,
@@ -560,6 +558,23 @@ fn terminal_diagnostic(error: &anyhow::Error) -> TerminalDiagnostic {
             safe_cause: failure.safe_cause(),
         };
     }
+    if let Some(failure) = error
+        .chain()
+        .find_map(|cause| cause.downcast_ref::<crate::connector::bybit::BybitTaskFailure>())
+    {
+        return TerminalDiagnostic {
+            component: "bybit",
+            task,
+            operation: "stream_task",
+            stage: failure.task(),
+            template_id: "unknown".to_string(),
+            payload_len: "unknown".to_string(),
+            stable_error_code: failure.stable_error_code(),
+            disposition: "fatal_service_exit",
+            state_effect: "process_exit",
+            safe_cause: failure.safe_cause(),
+        };
+    }
     #[cfg(feature = "rithmic")]
     if let Some(failure) = error
         .chain()
@@ -891,7 +906,7 @@ async fn run_live_mode(
             }
             "bybit" => {
                 join_set.spawn(async move {
-                    let result = run_bybit_connector(symbols, trade_tx, candle_tx).await;
+                    let result = crate::connector::bybit::run(symbols, trade_tx, candle_tx).await;
                     (TaskId::Connector("bybit".to_string()), result)
                 });
                 info!("Supervised task spawned: connector:bybit");
@@ -1235,23 +1250,6 @@ fn preflight_user_stream_credentials(
     Ok((binance_user_stream, backpack_user_stream))
 }
 
-/// Run the Bybit connector: subscribes to trades and candles.
-async fn run_bybit_connector(
-    symbols: Vec<String>,
-    trade_tx: mpsc::Sender<model::Trade>,
-    candle_tx: mpsc::Sender<model::Candlestick>,
-) -> anyhow::Result<()> {
-    let mut conn = BybitConnector::new();
-    info!("Starting Bybit Connector...");
-
-    conn.subscribe_trades(&symbols, trade_tx).await?;
-
-    conn.subscribe_candles(&symbols, "1m", candle_tx).await?;
-
-    std::future::pending::<()>().await;
-    Ok(())
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1500,6 +1498,55 @@ mod tests {
         }
         for (name, failure, code, cause) in [
             (
+                "BybitTaskError",
+                crate::connector::bybit::BybitTaskFailure::task_error(
+                    "trades",
+                    anyhow::anyhow!("provider-secret"),
+                ),
+                "bybit_stream_task_failed",
+                "Bybit stream task failed",
+            ),
+            (
+                "BybitUnexpectedExit",
+                crate::connector::bybit::BybitTaskFailure::unexpected_exit("trades"),
+                "bybit_stream_task_exited",
+                "Bybit stream task exited unexpectedly",
+            ),
+            (
+                "BybitPanicked",
+                crate::connector::bybit::BybitTaskFailure::panicked("trades"),
+                "bybit_stream_task_panicked",
+                "Bybit stream task panicked",
+            ),
+            (
+                "BybitCancelled",
+                crate::connector::bybit::BybitTaskFailure::cancelled("trades"),
+                "bybit_stream_task_cancelled",
+                "Bybit stream task was cancelled",
+            ),
+        ] {
+            cases.push((
+                name,
+                supervised_task_exit_error(
+                    &TaskId::Connector("bybit".to_string()),
+                    Err(failure.into()),
+                ),
+                TerminalDiagnostic {
+                    component: "bybit",
+                    task: "connector:bybit".to_string(),
+                    operation: "stream_task",
+                    stage: "trades",
+                    template_id: "unknown".to_string(),
+                    payload_len: "unknown".to_string(),
+                    stable_error_code: code,
+                    disposition: "fatal_service_exit",
+                    state_effect: "process_exit",
+                    safe_cause: cause,
+                },
+            ));
+        }
+        for (name, failure, code, cause) in [
+            (
                 "BackpackTaskError",
                 crate::connector::backpack::BackpackTaskFailure::task_error(
                     "trades",
@@ -1704,6 +1751,33 @@ mod tests {
         assert_eq!(fields["disposition"], "fatal_service_exit");
         assert_eq!(fields["state_effect"], "process_exit");
         assert_eq!(fields["safe_cause"], "Backpack stream task failed");
+        assert!(fields
+            .values()
+            .all(|value| !value.contains("provider failure sentinel")));
+    }
+
+    #[test]
+    fn bybit_internal_task_failure_reports_exact_safe_terminal_fields() {
+        let source = anyhow::anyhow!("provider failure sentinel");
+        let failure = crate::connector::bybit::BybitTaskFailure::task_error("candles", source);
+        let error = supervised_task_exit_error(
+            &TaskId::Connector("bybit".to_string()),
+            Err(failure.into()),
+        );
+        let fields = capture_terminal_event(&error);
+
+        assert_eq!(fields.len(), 11);
+        assert_eq!(fields["message"], "FluxTrade terminal failure");
+        assert_eq!(fields["component"], "bybit");
+        assert_eq!(fields["task"], "connector:bybit");
+        assert_eq!(fields["operation"], "stream_task");
+        assert_eq!(fields["stage"], "candles");
+        assert_eq!(fields["template_id"], "unknown");
+        assert_eq!(fields["payload_len"], "unknown");
+        assert_eq!(fields["stable_error_code"], "bybit_stream_task_failed");
+        assert_eq!(fields["disposition"], "fatal_service_exit");
+        assert_eq!(fields["state_effect"], "process_exit");
+        assert_eq!(fields["safe_cause"], "Bybit stream task failed");
         assert!(fields
             .values()
             .all(|value| !value.contains("provider failure sentinel")));
