@@ -1,28 +1,15 @@
 use super::{
     codec,
-    ledger::{AccountIdentity, UserType},
+    ledger::AccountIdentity,
     protocol,
     session::{classify_response_codes, ensure_success, ResponseDisposition},
 };
 use anyhow::{ensure, Context, Result};
-use rust_decimal::{prelude::ToPrimitive, Decimal};
-use std::str::FromStr;
 
 const TRADE_ROUTES_REQUEST: i32 = 310;
 const TRADE_ROUTES_RESPONSE: i32 = 311;
 const SUBSCRIBE_ORDER_UPDATES_REQUEST: i32 = 308;
 const SUBSCRIBE_ORDER_UPDATES_RESPONSE: i32 = 309;
-const NEW_ORDER_REQUEST: i32 = 312;
-const NEW_ORDER_RESPONSE: i32 = 313;
-const BRACKET_ORDER_REQUEST: i32 = 330;
-const BRACKET_ORDER_RESPONSE: i32 = 331;
-const MODIFY_ORDER_REQUEST: i32 = 314;
-const MODIFY_ORDER_RESPONSE: i32 = 315;
-const CANCEL_ORDER_REQUEST: i32 = 316;
-const CANCEL_ORDER_RESPONSE: i32 = 317;
-const EXIT_POSITION_REQUEST: i32 = 3504;
-const EXIT_POSITION_RESPONSE: i32 = 3505;
-const REJECT: i32 = 75;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct TradeRoute {
@@ -35,71 +22,6 @@ pub(crate) struct TradeRoute {
 pub(crate) enum TradeRouteEvent {
     Route(TradeRoute),
     Completed,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum OrderSide {
-    Buy,
-    Sell,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum OrderType {
-    Market,
-    Limit,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) struct NewOrder {
-    pub(crate) client_order_id: String,
-    pub(crate) exchange: String,
-    pub(crate) symbol: String,
-    pub(crate) quantity: Decimal,
-    pub(crate) price: Option<Decimal>,
-    pub(crate) side: OrderSide,
-    pub(crate) order_type: OrderType,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) struct BracketOrder {
-    pub(crate) entry: NewOrder,
-    pub(crate) stop_ticks: Option<i32>,
-    pub(crate) target_ticks: Option<i32>,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum ProtectionLeg {
-    StopLoss,
-    TakeProfit,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) struct ProtectionModification {
-    pub(crate) basket_id: String,
-    pub(crate) exchange: String,
-    pub(crate) symbol: String,
-    pub(crate) quantity: Decimal,
-    pub(crate) leg: ProtectionLeg,
-    pub(crate) price: Decimal,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) struct ExitPosition {
-    pub(crate) exchange: String,
-    pub(crate) symbol: String,
-    pub(crate) window_name: Option<String>,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) struct OrderAck {
-    pub(crate) client_order_id: String,
-    pub(crate) basket_id: String,
-}
-
-#[derive(Debug, PartialEq, Eq)]
-pub(crate) struct MutationResponse {
-    pub(crate) disposition: ResponseDisposition,
-    pub(crate) basket_id: Option<String>,
 }
 
 pub(crate) fn trade_routes_request(request_key: &str) -> Result<Vec<u8>> {
@@ -164,386 +86,11 @@ pub(crate) fn decode_subscribe_order_updates_response(
     ensure_success(&response.rp_code)
 }
 
-pub(crate) fn new_order_request(
-    request_key: &str,
-    account: &AccountIdentity,
-    trade_route: &str,
-    order: &NewOrder,
-) -> Result<Vec<u8>> {
-    validate_request_key(request_key)?;
-    validate_account(account)?;
-    let trade_route = required_text(Some(trade_route.to_string()), "trade route")?;
-    let fields = validate_wire_order(order)?;
-    let transaction_type = match order.side {
-        OrderSide::Buy => protocol::request_new_order::TransactionType::Buy as i32,
-        OrderSide::Sell => protocol::request_new_order::TransactionType::Sell as i32,
-    };
-    let price_type = match order.order_type {
-        OrderType::Market => protocol::request_new_order::PriceType::Market as i32,
-        OrderType::Limit => protocol::request_new_order::PriceType::Limit as i32,
-    };
-    codec::encode(&protocol::RequestNewOrder {
-        template_id: NEW_ORDER_REQUEST,
-        user_msg: vec![request_key.to_string()],
-        user_tag: Some(fields.client_order_id),
-        fcm_id: Some(account.fcm_id.clone()),
-        ib_id: Some(account.ib_id.clone()),
-        account_id: Some(account.account_id.clone()),
-        symbol: Some(fields.symbol),
-        exchange: Some(fields.exchange),
-        quantity: Some(fields.quantity),
-        price: fields.price,
-        transaction_type: Some(transaction_type),
-        duration: Some(protocol::request_new_order::Duration::Day as i32),
-        price_type: Some(price_type),
-        trade_route: Some(trade_route),
-        manual_or_auto: Some(protocol::request_new_order::OrderPlacement::Auto as i32),
-        ..Default::default()
-    })
-}
-
-pub(crate) fn bracket_order_request(
-    request_key: &str,
-    account: &AccountIdentity,
-    user_type: UserType,
-    trade_route: &str,
-    order: &BracketOrder,
-) -> Result<Vec<u8>> {
-    validate_request_key(request_key)?;
-    validate_account(account)?;
-    let trade_route = required_text(Some(trade_route.to_string()), "trade route")?;
-    let fields = validate_wire_order(&order.entry)?;
-    let stop_ticks = positive_ticks(order.stop_ticks, "stop ticks")?;
-    let target_ticks = positive_ticks(order.target_ticks, "target ticks")?;
-    ensure!(
-        stop_ticks.is_some() || target_ticks.is_some(),
-        "Rithmic bracket order requires stop or target ticks"
-    );
-    let bracket_type = match (stop_ticks, target_ticks) {
-        (Some(_), Some(_)) => protocol::request_bracket_order::BracketType::TargetAndStopStatic,
-        (Some(_), None) => protocol::request_bracket_order::BracketType::StopOnlyStatic,
-        (None, Some(_)) => protocol::request_bracket_order::BracketType::TargetOnlyStatic,
-        (None, None) => unreachable!("validated bracket has at least one protective leg"),
-    } as i32;
-    let transaction_type = match order.entry.side {
-        OrderSide::Buy => protocol::request_bracket_order::TransactionType::Buy as i32,
-        OrderSide::Sell => protocol::request_bracket_order::TransactionType::Sell as i32,
-    };
-    let price_type = match order.entry.order_type {
-        OrderType::Market => protocol::request_bracket_order::PriceType::Market as i32,
-        OrderType::Limit => protocol::request_bracket_order::PriceType::Limit as i32,
-    };
-    let user_type = match user_type {
-        UserType::Admin => protocol::request_bracket_order::UserType::Admin as i32,
-        UserType::Fcm => protocol::request_bracket_order::UserType::Fcm as i32,
-        UserType::Ib => protocol::request_bracket_order::UserType::Ib as i32,
-        UserType::Trader => protocol::request_bracket_order::UserType::Trader as i32,
-    };
-
-    codec::encode(&protocol::RequestBracketOrder {
-        template_id: BRACKET_ORDER_REQUEST,
-        user_msg: vec![request_key.to_string()],
-        user_tag: Some(fields.client_order_id),
-        fcm_id: Some(account.fcm_id.clone()),
-        ib_id: Some(account.ib_id.clone()),
-        account_id: Some(account.account_id.clone()),
-        symbol: Some(fields.symbol),
-        exchange: Some(fields.exchange),
-        quantity: Some(fields.quantity),
-        price: fields.price,
-        transaction_type: Some(transaction_type),
-        duration: Some(protocol::request_bracket_order::Duration::Day as i32),
-        price_type: Some(price_type),
-        trade_route: Some(trade_route),
-        manual_or_auto: Some(protocol::request_bracket_order::OrderPlacement::Auto as i32),
-        user_type: Some(user_type),
-        bracket_type: Some(bracket_type),
-        target_quantity: target_ticks.map(|_| fields.quantity).into_iter().collect(),
-        target_ticks: target_ticks.into_iter().collect(),
-        stop_quantity: stop_ticks.map(|_| fields.quantity).into_iter().collect(),
-        stop_ticks: stop_ticks.into_iter().collect(),
-        ..Default::default()
-    })
-}
-
-pub(crate) fn modify_order_request(
-    request_key: &str,
-    account: &AccountIdentity,
-    modification: &ProtectionModification,
-) -> Result<Vec<u8>> {
-    validate_request_key(request_key)?;
-    validate_account(account)?;
-    let basket_id = required_text(Some(modification.basket_id.clone()), "basket ID")?;
-    let exchange = required_text(Some(modification.exchange.clone()), "exchange")?;
-    let symbol = required_text(Some(modification.symbol.clone()), "symbol")?;
-    let quantity = decimal_quantity_to_i32(modification.quantity)?;
-    let price = decimal_price_to_f64(modification.price)?;
-    let (price_type, limit_price, trigger_price) = match modification.leg {
-        ProtectionLeg::StopLoss => (
-            protocol::request_modify_order::PriceType::StopMarket as i32,
-            None,
-            Some(price),
-        ),
-        ProtectionLeg::TakeProfit => (
-            protocol::request_modify_order::PriceType::Limit as i32,
-            Some(price),
-            None,
-        ),
-    };
-    codec::encode(&protocol::RequestModifyOrder {
-        template_id: MODIFY_ORDER_REQUEST,
-        user_msg: vec![request_key.to_string()],
-        fcm_id: Some(account.fcm_id.clone()),
-        ib_id: Some(account.ib_id.clone()),
-        account_id: Some(account.account_id.clone()),
-        basket_id: Some(basket_id),
-        symbol: Some(symbol),
-        exchange: Some(exchange),
-        quantity: Some(quantity),
-        price: limit_price,
-        trigger_price,
-        price_type: Some(price_type),
-        manual_or_auto: Some(protocol::request_modify_order::OrderPlacement::Auto as i32),
-        ..Default::default()
-    })
-}
-
-pub(crate) fn decode_new_order_response(
-    payload: &[u8],
-    request_key: &str,
-    expected_client_order_id: &str,
-) -> Result<MutationResponse> {
-    validate_request_key(request_key)?;
-    ensure_template(payload, NEW_ORDER_RESPONSE)?;
-    let response: protocol::ResponseNewOrder = codec::decode(payload)?;
-    ensure_request_key(&response.user_msg, request_key)?;
-    if let Some(user_tag) = optional_text(response.user_tag) {
-        ensure!(
-            user_tag == expected_client_order_id,
-            "Rithmic new-order client ID mismatch"
-        );
-    }
-    Ok(MutationResponse {
-        disposition: classify_response_codes(&response.rq_handler_rp_code, &response.rp_code)?,
-        basket_id: optional_text(response.basket_id),
-    })
-}
-
-pub(crate) fn decode_bracket_order_response(
-    payload: &[u8],
-    request_key: &str,
-    expected_client_order_id: &str,
-) -> Result<MutationResponse> {
-    validate_request_key(request_key)?;
-    ensure_template(payload, BRACKET_ORDER_RESPONSE)?;
-    let response: protocol::ResponseBracketOrder = codec::decode(payload)?;
-    ensure_request_key(&response.user_msg, request_key)?;
-    if let Some(user_tag) = optional_text(response.user_tag) {
-        ensure!(
-            user_tag == expected_client_order_id,
-            "Rithmic bracket-order client ID mismatch"
-        );
-    }
-    Ok(MutationResponse {
-        disposition: classify_response_codes(&response.rq_handler_rp_code, &response.rp_code)?,
-        basket_id: optional_text(response.basket_id),
-    })
-}
-
-pub(crate) fn decode_modify_order_response(
-    payload: &[u8],
-    request_key: &str,
-    expected_basket_id: &str,
-) -> Result<MutationResponse> {
-    validate_request_key(request_key)?;
-    ensure_template(payload, MODIFY_ORDER_RESPONSE)?;
-    let response: protocol::ResponseModifyOrder = codec::decode(payload)?;
-    ensure_request_key(&response.user_msg, request_key)?;
-    let basket_id = optional_text(response.basket_id);
-    if let Some(basket_id) = basket_id.as_deref() {
-        ensure!(
-            basket_id == expected_basket_id,
-            "Rithmic modify-order basket ID mismatch"
-        );
-    }
-    Ok(MutationResponse {
-        disposition: classify_response_codes(&response.rq_handler_rp_code, &response.rp_code)?,
-        basket_id,
-    })
-}
-
-pub(crate) fn cancel_order_request(
-    request_key: &str,
-    account: &AccountIdentity,
-    basket_id: &str,
-) -> Result<Vec<u8>> {
-    validate_request_key(request_key)?;
-    validate_account(account)?;
-    let basket_id = required_text(Some(basket_id.to_string()), "basket ID")?;
-    codec::encode(&protocol::RequestCancelOrder {
-        template_id: CANCEL_ORDER_REQUEST,
-        user_msg: vec![request_key.to_string()],
-        fcm_id: Some(account.fcm_id.clone()),
-        ib_id: Some(account.ib_id.clone()),
-        account_id: Some(account.account_id.clone()),
-        basket_id: Some(basket_id),
-        manual_or_auto: Some(protocol::request_cancel_order::OrderPlacement::Auto as i32),
-        ..Default::default()
-    })
-}
-
-pub(crate) fn decode_cancel_order_response(
-    payload: &[u8],
-    request_key: &str,
-    expected_basket_id: &str,
-) -> Result<MutationResponse> {
-    validate_request_key(request_key)?;
-    ensure_template(payload, CANCEL_ORDER_RESPONSE)?;
-    let response: protocol::ResponseCancelOrder = codec::decode(payload)?;
-    ensure_request_key(&response.user_msg, request_key)?;
-    let basket_id = optional_text(response.basket_id);
-    if let Some(basket_id) = basket_id.as_deref() {
-        ensure!(
-            basket_id == expected_basket_id,
-            "Rithmic cancel-order basket ID mismatch"
-        );
-    }
-    Ok(MutationResponse {
-        disposition: classify_response_codes(&response.rq_handler_rp_code, &response.rp_code)?,
-        basket_id,
-    })
-}
-
-pub(crate) fn exit_position_request(
-    request_key: &str,
-    account: &AccountIdentity,
-    position: &ExitPosition,
-) -> Result<Vec<u8>> {
-    validate_request_key(request_key)?;
-    validate_account(account)?;
-    let exchange = required_text(Some(position.exchange.clone()), "exchange")?;
-    let symbol = required_text(Some(position.symbol.clone()), "symbol")?;
-    let window_name = position
-        .window_name
-        .clone()
-        .map(|value| required_text(Some(value), "window_name"))
-        .transpose()?;
-    codec::encode(&protocol::RequestExitPosition {
-        template_id: EXIT_POSITION_REQUEST,
-        user_msg: vec![request_key.to_string()],
-        window_name,
-        fcm_id: Some(account.fcm_id.clone()),
-        ib_id: Some(account.ib_id.clone()),
-        account_id: Some(account.account_id.clone()),
-        symbol: Some(symbol),
-        exchange: Some(exchange),
-        manual_or_auto: Some(protocol::request_exit_position::OrderPlacement::Auto as i32),
-        ..Default::default()
-    })
-}
-
-pub(crate) fn decode_exit_position_response(
-    payload: &[u8],
-    request_key: &str,
-    expected: &ExitPosition,
-) -> Result<ResponseDisposition> {
-    validate_request_key(request_key)?;
-    ensure_template(payload, EXIT_POSITION_RESPONSE)?;
-    let response: protocol::ResponseExitPosition = codec::decode(payload)?;
-    ensure_request_key(&response.user_msg, request_key)?;
-    if let Some(exchange) = optional_text(response.exchange) {
-        ensure!(
-            exchange.eq_ignore_ascii_case(&expected.exchange),
-            "Rithmic exit-position exchange mismatch"
-        );
-    }
-    if let Some(symbol) = optional_text(response.symbol) {
-        ensure!(
-            symbol == expected.symbol,
-            "Rithmic exit-position symbol mismatch"
-        );
-    }
-    classify_response_codes(&response.rq_handler_rp_code, &response.rp_code)
-}
-
-pub(crate) fn decode_request_reject(payload: &[u8]) -> Result<(String, String)> {
-    ensure_template(payload, REJECT)?;
-    let response: protocol::Reject = codec::decode(payload)?;
-    let request_key = response
-        .user_msg
-        .first()
-        .cloned()
-        .context("Rithmic reject omitted request key")?;
-    let code = response
-        .rp_code
-        .first()
-        .cloned()
-        .context("Rithmic reject omitted response code")?;
-    Ok((request_key, code))
-}
-
 pub(crate) fn template_id(payload: &[u8]) -> Result<i32> {
     codec::template_id(payload)
 }
 
-pub(crate) fn is_new_order_response(template_id: i32) -> bool {
-    template_id == NEW_ORDER_RESPONSE
-}
-
-pub(crate) fn is_bracket_order_response(template_id: i32) -> bool {
-    template_id == BRACKET_ORDER_RESPONSE
-}
-
-pub(crate) fn is_modify_order_response(template_id: i32) -> bool {
-    template_id == MODIFY_ORDER_RESPONSE
-}
-
-pub(crate) fn is_cancel_order_response(template_id: i32) -> bool {
-    template_id == CANCEL_ORDER_RESPONSE
-}
-
-pub(crate) fn is_exit_position_response(template_id: i32) -> bool {
-    template_id == EXIT_POSITION_RESPONSE
-}
-
-pub(crate) fn is_reject(template_id: i32) -> bool {
-    template_id == REJECT
-}
-
-fn decimal_quantity_to_i32(value: Decimal) -> Result<i32> {
-    ensure!(
-        value > Decimal::ZERO,
-        "Rithmic order quantity must be positive"
-    );
-    ensure!(
-        value.fract().is_zero(),
-        "Rithmic order quantity must be an integer"
-    );
-    value
-        .to_i32()
-        .context("Rithmic order quantity exceeds protocol range")
-}
-
-fn decimal_price_to_f64(value: Decimal) -> Result<f64> {
-    ensure!(
-        value > Decimal::ZERO,
-        "Rithmic order price must be positive"
-    );
-    let wire = value
-        .to_string()
-        .parse::<f64>()
-        .context("Rithmic order price exceeds protocol range")?;
-    ensure!(wire.is_finite(), "Rithmic order price must be finite");
-    let round_trip = Decimal::from_str(&wire.to_string())
-        .context("Rithmic order price cannot round-trip through vendor wire")?;
-    ensure!(
-        round_trip == value.normalize(),
-        "Rithmic order price loses precision at vendor wire boundary"
-    );
-    Ok(wire)
-}
-
-fn validate_request_key(request_key: &str) -> Result<()> {
+pub(super) fn validate_request_key(request_key: &str) -> Result<()> {
     ensure!(
         !request_key.trim().is_empty(),
         "Rithmic order request key must not be empty"
@@ -551,7 +98,7 @@ fn validate_request_key(request_key: &str) -> Result<()> {
     Ok(())
 }
 
-fn ensure_request_key(user_msg: &[String], request_key: &str) -> Result<()> {
+pub(super) fn ensure_request_key(user_msg: &[String], request_key: &str) -> Result<()> {
     ensure!(
         user_msg.first().is_some_and(|value| value == request_key),
         "Rithmic order response request key mismatch"
@@ -559,7 +106,7 @@ fn ensure_request_key(user_msg: &[String], request_key: &str) -> Result<()> {
     Ok(())
 }
 
-fn ensure_template(payload: &[u8], expected: i32) -> Result<()> {
+pub(super) fn ensure_template(payload: &[u8], expected: i32) -> Result<()> {
     ensure!(
         codec::template_id(payload)? == expected,
         "unexpected Rithmic order response template"
@@ -567,68 +114,27 @@ fn ensure_template(payload: &[u8], expected: i32) -> Result<()> {
     Ok(())
 }
 
-fn validate_account(account: &AccountIdentity) -> Result<()> {
+pub(super) fn validate_account(account: &AccountIdentity) -> Result<()> {
     required_text(Some(account.fcm_id.clone()), "fcm ID")?;
     required_text(Some(account.ib_id.clone()), "IB ID")?;
     required_text(Some(account.account_id.clone()), "account ID")?;
     Ok(())
 }
 
-fn required_text(value: Option<String>, field: &str) -> Result<String> {
+pub(super) fn required_text(value: Option<String>, field: &str) -> Result<String> {
     value
         .filter(|value| !value.trim().is_empty())
         .with_context(|| format!("missing Rithmic {field}"))
 }
 
-fn optional_text(value: Option<String>) -> Option<String> {
+pub(super) fn optional_text(value: Option<String>) -> Option<String> {
     value.filter(|value| !value.trim().is_empty())
-}
-
-struct WireOrderFields {
-    client_order_id: String,
-    exchange: String,
-    symbol: String,
-    quantity: i32,
-    price: Option<f64>,
-}
-
-fn validate_wire_order(order: &NewOrder) -> Result<WireOrderFields> {
-    let client_order_id = required_text(Some(order.client_order_id.clone()), "client order ID")?;
-    let exchange = required_text(Some(order.exchange.clone()), "exchange")?;
-    let symbol = required_text(Some(order.symbol.clone()), "symbol")?;
-    let quantity = decimal_quantity_to_i32(order.quantity)?;
-    let price = match order.order_type {
-        OrderType::Market => {
-            ensure!(
-                order.price.is_none(),
-                "Rithmic market order cannot include price"
-            );
-            None
-        }
-        OrderType::Limit => Some(decimal_price_to_f64(
-            order.price.context("Rithmic limit order requires price")?,
-        )?),
-    };
-    Ok(WireOrderFields {
-        client_order_id,
-        exchange,
-        symbol,
-        quantity,
-        price,
-    })
-}
-
-fn positive_ticks(value: Option<i32>, field: &str) -> Result<Option<i32>> {
-    value
-        .map(|value| {
-            ensure!(value > 0, "invalid Rithmic {field}");
-            Ok(value)
-        })
-        .transpose()
 }
 
 #[cfg(test)]
 mod tests {
+    use super::super::ledger::UserType;
+    use super::super::order_command::*;
     use super::super::order_event::decode_order_event;
     use super::*;
     use rust_decimal_macros::dec;
@@ -653,6 +159,10 @@ mod tests {
             side: OrderSide::Buy,
             order_type,
         }
+    }
+
+    fn error_message<T: std::fmt::Debug>(result: Result<T>) -> String {
+        result.unwrap_err().to_string()
     }
 
     #[test]
@@ -680,6 +190,335 @@ mod tests {
         assert!(runtime_source.contains("order_event::notification_is_snapshot"));
         assert!(pending_source.contains("order_event::OrderEvent"));
         assert!(binding_source.contains("order_event::OrderEvent"));
+    }
+
+    #[test]
+    fn order_command_codec_has_one_module_owner() {
+        let route_source = include_str!("order.rs")
+            .split("#[cfg(test)]")
+            .next()
+            .unwrap();
+        let command_source = include_str!("order_command.rs");
+        let runtime_source = include_str!("order_runtime.rs");
+        let pending_source = include_str!("order_pending.rs");
+        let emergency_source = include_str!("emergency.rs");
+        let binding_source = include_str!("../../binding/rithmic_order.rs");
+
+        for symbol in [
+            "enum OrderSide",
+            "enum OrderType",
+            "struct NewOrder",
+            "struct BracketOrder",
+            "enum ProtectionLeg",
+            "struct ProtectionModification",
+            "struct ExitPosition",
+            "struct OrderAck",
+            "struct MutationResponse",
+            "fn new_order_request",
+            "fn bracket_order_request",
+            "fn modify_order_request",
+            "fn decode_new_order_response",
+            "fn decode_bracket_order_response",
+            "fn decode_modify_order_response",
+            "fn cancel_order_request",
+            "fn decode_cancel_order_response",
+            "fn exit_position_request",
+            "fn decode_exit_position_response",
+            "fn decode_request_reject",
+            "fn is_new_order_response",
+            "fn is_bracket_order_response",
+            "fn is_modify_order_response",
+            "fn is_cancel_order_response",
+            "fn is_exit_position_response",
+            "fn is_reject",
+            "fn decimal_quantity_to_i32",
+            "fn decimal_price_to_f64",
+            "struct WireOrderFields",
+            "fn validate_wire_order",
+            "fn positive_ticks",
+            "const NEW_ORDER_REQUEST",
+            "const NEW_ORDER_RESPONSE",
+            "const BRACKET_ORDER_REQUEST",
+            "const BRACKET_ORDER_RESPONSE",
+            "const MODIFY_ORDER_REQUEST",
+            "const MODIFY_ORDER_RESPONSE",
+            "const CANCEL_ORDER_REQUEST",
+            "const CANCEL_ORDER_RESPONSE",
+            "const EXIT_POSITION_REQUEST",
+            "const EXIT_POSITION_RESPONSE",
+            "const REJECT",
+        ] {
+            assert!(!route_source.contains(symbol), "duplicate {symbol}");
+            assert!(command_source.contains(symbol), "missing {symbol}");
+        }
+        for helper in [
+            "validate_request_key",
+            "ensure_request_key",
+            "ensure_template",
+            "validate_account",
+            "required_text",
+            "optional_text",
+        ] {
+            assert!(route_source.contains(&format!("fn {helper}")));
+            assert!(!command_source.contains(&format!("fn {helper}")));
+        }
+        assert!(!route_source.contains("order_command"));
+        assert!(runtime_source.contains("order_command::new_order_request"));
+        assert!(pending_source.contains("order_command::decode_new_order_response"));
+        assert!(emergency_source.contains("order_command::ExitPosition"));
+        assert!(binding_source.contains("order_command::{"));
+    }
+
+    #[test]
+    fn command_request_validation_precedence_is_exact() {
+        let empty_account = AccountIdentity {
+            fcm_id: String::new(),
+            ib_id: String::new(),
+            account_id: String::new(),
+        };
+        let mut invalid_order = order(OrderType::Limit);
+        invalid_order.client_order_id.clear();
+        invalid_order.exchange.clear();
+        invalid_order.symbol.clear();
+        invalid_order.quantity = dec!(0);
+        invalid_order.price = None;
+
+        assert_eq!(
+            error_message(new_order_request("", &empty_account, "", &invalid_order)),
+            "Rithmic order request key must not be empty",
+        );
+        assert_eq!(
+            error_message(new_order_request("key", &empty_account, "", &invalid_order)),
+            "missing Rithmic fcm ID",
+        );
+        let mut partial_account = empty_account.clone();
+        partial_account.fcm_id = "FCM".to_string();
+        assert_eq!(
+            error_message(new_order_request(
+                "key",
+                &partial_account,
+                "",
+                &invalid_order,
+            )),
+            "missing Rithmic IB ID",
+        );
+        partial_account.ib_id = "IB".to_string();
+        assert_eq!(
+            error_message(new_order_request(
+                "key",
+                &partial_account,
+                "",
+                &invalid_order,
+            )),
+            "missing Rithmic account ID",
+        );
+        assert_eq!(
+            error_message(new_order_request("key", &account(), "", &invalid_order)),
+            "missing Rithmic trade route",
+        );
+        assert_eq!(
+            error_message(new_order_request(
+                "key",
+                &account(),
+                "route",
+                &invalid_order
+            )),
+            "missing Rithmic client order ID",
+        );
+        invalid_order.client_order_id = "client".to_string();
+        assert_eq!(
+            error_message(new_order_request(
+                "key",
+                &account(),
+                "route",
+                &invalid_order,
+            )),
+            "missing Rithmic exchange",
+        );
+        invalid_order.exchange = "CME".to_string();
+        assert_eq!(
+            error_message(new_order_request(
+                "key",
+                &account(),
+                "route",
+                &invalid_order,
+            )),
+            "missing Rithmic symbol",
+        );
+        invalid_order.symbol = "NQU6".to_string();
+        assert_eq!(
+            error_message(new_order_request(
+                "key",
+                &account(),
+                "route",
+                &invalid_order,
+            )),
+            "Rithmic order quantity must be positive",
+        );
+        invalid_order.quantity = dec!(1);
+        assert_eq!(
+            error_message(new_order_request(
+                "key",
+                &account(),
+                "route",
+                &invalid_order,
+            )),
+            "Rithmic limit order requires price",
+        );
+        invalid_order.price = Some(dec!(0));
+        assert_eq!(
+            error_message(bracket_order_request(
+                "key",
+                &account(),
+                UserType::Trader,
+                "route",
+                &BracketOrder {
+                    entry: invalid_order,
+                    stop_ticks: Some(0),
+                    target_ticks: None,
+                },
+            )),
+            "Rithmic order price must be positive",
+        );
+
+        let mut modification = ProtectionModification {
+            basket_id: String::new(),
+            exchange: String::new(),
+            symbol: String::new(),
+            quantity: dec!(0),
+            leg: ProtectionLeg::StopLoss,
+            price: dec!(0),
+        };
+        assert_eq!(
+            error_message(modify_order_request("key", &account(), &modification)),
+            "missing Rithmic basket ID",
+        );
+        modification.basket_id = "basket".to_string();
+        assert_eq!(
+            error_message(modify_order_request("key", &account(), &modification)),
+            "missing Rithmic exchange",
+        );
+        modification.exchange = "CME".to_string();
+        assert_eq!(
+            error_message(modify_order_request("key", &account(), &modification)),
+            "missing Rithmic symbol",
+        );
+        modification.symbol = "NQU6".to_string();
+        assert_eq!(
+            error_message(modify_order_request("key", &account(), &modification)),
+            "Rithmic order quantity must be positive",
+        );
+        modification.quantity = dec!(1);
+        assert_eq!(
+            error_message(modify_order_request("key", &account(), &modification)),
+            "Rithmic order price must be positive",
+        );
+
+        assert_eq!(
+            error_message(cancel_order_request("key", &account(), "")),
+            "missing Rithmic basket ID",
+        );
+        let mut position = ExitPosition {
+            exchange: String::new(),
+            symbol: String::new(),
+            window_name: Some(String::new()),
+        };
+        assert_eq!(
+            error_message(exit_position_request("key", &account(), &position)),
+            "missing Rithmic exchange",
+        );
+        position.exchange = "CME".to_string();
+        assert_eq!(
+            error_message(exit_position_request("key", &account(), &position)),
+            "missing Rithmic symbol",
+        );
+        position.symbol = "NQU6".to_string();
+        assert_eq!(
+            error_message(exit_position_request("key", &account(), &position)),
+            "missing Rithmic window_name",
+        );
+    }
+
+    #[test]
+    fn command_response_validation_precedence_is_exact() {
+        let wrong_template = codec::encode(&protocol::ResponseNewOrder {
+            template_id: BRACKET_ORDER_RESPONSE,
+            user_msg: vec!["other".to_string()],
+            user_tag: Some("other-client".to_string()),
+            rp_code: vec!["9".to_string()],
+            ..Default::default()
+        })
+        .unwrap();
+        assert_eq!(
+            error_message(decode_new_order_response(&wrong_template, "", "client-1")),
+            "Rithmic order request key must not be empty",
+        );
+        assert_eq!(
+            error_message(decode_new_order_response(
+                &wrong_template,
+                "new",
+                "client-1"
+            )),
+            "unexpected Rithmic order response template",
+        );
+
+        let response = |request_key: &str, client_order_id: &str| {
+            codec::encode(&protocol::ResponseNewOrder {
+                template_id: NEW_ORDER_RESPONSE,
+                user_msg: vec![request_key.to_string()],
+                user_tag: Some(client_order_id.to_string()),
+                rp_code: vec!["9".to_string()],
+                ..Default::default()
+            })
+            .unwrap()
+        };
+        assert_eq!(
+            error_message(decode_new_order_response(
+                &response("other", "other-client"),
+                "new",
+                "client-1",
+            )),
+            "Rithmic order response request key mismatch",
+        );
+        assert_eq!(
+            error_message(decode_new_order_response(
+                &response("new", "other-client"),
+                "new",
+                "client-1",
+            )),
+            "Rithmic new-order client ID mismatch",
+        );
+        assert_eq!(
+            error_message(decode_trade_route_event(&wrong_template, "")),
+            "Rithmic order request key must not be empty",
+        );
+        assert_eq!(
+            error_message(decode_subscribe_order_updates_response(
+                &wrong_template,
+                "subscribe",
+            )),
+            "unexpected Rithmic order response template",
+        );
+
+        let reject = codec::encode(&protocol::Reject {
+            template_id: REJECT,
+            ..Default::default()
+        })
+        .unwrap();
+        assert_eq!(
+            error_message(decode_request_reject(&reject)),
+            "Rithmic reject omitted request key",
+        );
+        let reject_without_code = codec::encode(&protocol::Reject {
+            template_id: REJECT,
+            user_msg: vec!["request".to_string()],
+            ..Default::default()
+        })
+        .unwrap();
+        assert_eq!(
+            error_message(decode_request_reject(&reject_without_code)),
+            "Rithmic reject omitted response code",
+        );
     }
 
     #[test]
@@ -863,10 +702,10 @@ mod tests {
             assert!(exit_position_request("exit", &account(), &candidate).is_err());
         }
 
-        let response = |exchange: &str, symbol: &str, code: &str| {
+        let response = |request_key: &str, exchange: &str, symbol: &str, code: &str| {
             codec::encode(&protocol::ResponseExitPosition {
                 template_id: EXIT_POSITION_RESPONSE,
-                user_msg: vec!["exit-1".to_string()],
+                user_msg: vec![request_key.to_string()],
                 rp_code: vec![code.to_string()],
                 exchange: Some(exchange.to_string()),
                 symbol: Some(symbol.to_string()),
@@ -875,8 +714,12 @@ mod tests {
             .unwrap()
         };
         assert_eq!(
-            decode_exit_position_response(&response("CME", "NQU6", "0"), "exit-1", &position)
-                .unwrap(),
+            decode_exit_position_response(
+                &response("exit-1", "CME", "NQU6", "0"),
+                "exit-1",
+                &position,
+            )
+            .unwrap(),
             ResponseDisposition::Succeeded
         );
         let response_without_optional_identity = codec::encode(&protocol::ResponseExitPosition {
@@ -895,19 +738,37 @@ mod tests {
             .unwrap(),
             ResponseDisposition::Succeeded
         );
-        assert!(decode_exit_position_response(
-            &response("OTHER", "NQU6", "0"),
-            "exit-1",
-            &position
-        )
-        .is_err());
-        assert!(
-            decode_exit_position_response(&response("CME", "ESU6", "0"), "exit-1", &position)
-                .is_err()
+        assert_eq!(
+            error_message(decode_exit_position_response(
+                &response("other", "OTHER", "ESU6", "9"),
+                "exit-1",
+                &position,
+            )),
+            "Rithmic order response request key mismatch",
         );
         assert_eq!(
-            decode_exit_position_response(&response("CME", "NQU6", "9"), "exit-1", &position)
-                .unwrap(),
+            error_message(decode_exit_position_response(
+                &response("exit-1", "OTHER", "ESU6", "9"),
+                "exit-1",
+                &position,
+            )),
+            "Rithmic exit-position exchange mismatch",
+        );
+        assert_eq!(
+            error_message(decode_exit_position_response(
+                &response("exit-1", "CME", "ESU6", "9"),
+                "exit-1",
+                &position,
+            )),
+            "Rithmic exit-position symbol mismatch",
+        );
+        assert_eq!(
+            decode_exit_position_response(
+                &response("exit-1", "CME", "NQU6", "9"),
+                "exit-1",
+                &position,
+            )
+            .unwrap(),
             ResponseDisposition::Failed(vec!["9".to_string()])
         );
     }
@@ -1090,18 +951,22 @@ mod tests {
             .disposition,
             ResponseDisposition::Succeeded,
         );
-        assert!(decode_bracket_order_response(
-            &response("other", "client-1", &[], &["0"]),
-            "bracket",
-            "client-1",
-        )
-        .is_err());
-        assert!(decode_bracket_order_response(
-            &response("bracket", "other", &[], &["0"]),
-            "bracket",
-            "client-1",
-        )
-        .is_err());
+        assert_eq!(
+            error_message(decode_bracket_order_response(
+                &response("other", "other", &[], &["9"]),
+                "bracket",
+                "client-1",
+            )),
+            "Rithmic order response request key mismatch",
+        );
+        assert_eq!(
+            error_message(decode_bracket_order_response(
+                &response("bracket", "other", &[], &["9"]),
+                "bracket",
+                "client-1",
+            )),
+            "Rithmic bracket-order client ID mismatch",
+        );
     }
 
     #[test]
@@ -1139,36 +1004,41 @@ mod tests {
             .disposition,
             ResponseDisposition::Succeeded,
         );
-        assert!(decode_modify_order_response(
-            &response("other", Some("child-1"), &[], &["0"]),
-            "modify",
-            "child-1",
-        )
-        .is_err());
-        assert!(decode_modify_order_response(
-            &response("modify", Some("other-child"), &[], &["0"]),
-            "modify",
-            "child-1",
-        )
-        .is_err());
+        assert_eq!(
+            error_message(decode_modify_order_response(
+                &response("other", Some("other-child"), &[], &["9"]),
+                "modify",
+                "child-1",
+            )),
+            "Rithmic order response request key mismatch",
+        );
+        assert_eq!(
+            error_message(decode_modify_order_response(
+                &response("modify", Some("other-child"), &[], &["9"]),
+                "modify",
+                "child-1",
+            )),
+            "Rithmic modify-order basket ID mismatch",
+        );
     }
 
     #[test]
     fn cancel_response_phase_and_identity_are_explicit() {
-        let response = |handler: &[&str], terminal: &[&str], basket_id: Option<&str>| {
-            codec::encode(&protocol::ResponseCancelOrder {
-                template_id: CANCEL_ORDER_RESPONSE,
-                user_msg: vec!["cancel".to_string()],
-                basket_id: basket_id.map(str::to_string),
-                rq_handler_rp_code: handler.iter().map(|code| (*code).to_string()).collect(),
-                rp_code: terminal.iter().map(|code| (*code).to_string()).collect(),
-                ..Default::default()
-            })
-            .unwrap()
-        };
+        let response =
+            |request_key: &str, handler: &[&str], terminal: &[&str], basket_id: Option<&str>| {
+                codec::encode(&protocol::ResponseCancelOrder {
+                    template_id: CANCEL_ORDER_RESPONSE,
+                    user_msg: vec![request_key.to_string()],
+                    basket_id: basket_id.map(str::to_string),
+                    rq_handler_rp_code: handler.iter().map(|code| (*code).to_string()).collect(),
+                    rp_code: terminal.iter().map(|code| (*code).to_string()).collect(),
+                    ..Default::default()
+                })
+                .unwrap()
+            };
         assert_eq!(
             decode_cancel_order_response(
-                &response(&["0"], &[], Some("basket-1")),
+                &response("cancel", &["0"], &[], Some("basket-1")),
                 "cancel",
                 "basket-1",
             )
@@ -1177,17 +1047,31 @@ mod tests {
             ResponseDisposition::Processing,
         );
         assert_eq!(
-            decode_cancel_order_response(&response(&[], &["0"], None), "cancel", "basket-1")
-                .unwrap()
-                .disposition,
+            decode_cancel_order_response(
+                &response("cancel", &[], &["0"], None),
+                "cancel",
+                "basket-1",
+            )
+            .unwrap()
+            .disposition,
             ResponseDisposition::Succeeded,
         );
-        assert!(decode_cancel_order_response(
-            &response(&[], &["0"], Some("other")),
-            "cancel",
-            "basket-1",
-        )
-        .is_err());
+        assert_eq!(
+            error_message(decode_cancel_order_response(
+                &response("other", &[], &["9"], Some("other")),
+                "cancel",
+                "basket-1",
+            )),
+            "Rithmic order response request key mismatch",
+        );
+        assert_eq!(
+            error_message(decode_cancel_order_response(
+                &response("cancel", &[], &["9"], Some("other")),
+                "cancel",
+                "basket-1",
+            )),
+            "Rithmic cancel-order basket ID mismatch",
+        );
     }
 
     #[test]

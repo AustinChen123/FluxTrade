@@ -1,6 +1,6 @@
 use super::{
     ledger::{self, AccountIdentity, OrderSnapshot, OrderSnapshotEvent},
-    order::{self, ExitPosition, OrderAck, ProtectionModification},
+    order_command::{self, ExitPosition, OrderAck, ProtectionModification},
     order_event::OrderEvent,
     session::ResponseDisposition,
 };
@@ -16,8 +16,8 @@ pub(super) enum SubmitKind {
 impl SubmitKind {
     fn is_response(self, template_id: i32) -> bool {
         match self {
-            Self::Plain => order::is_new_order_response(template_id),
-            Self::Bracket => order::is_bracket_order_response(template_id),
+            Self::Plain => order_command::is_new_order_response(template_id),
+            Self::Bracket => order_command::is_bracket_order_response(template_id),
         }
     }
 }
@@ -73,8 +73,8 @@ pub(super) fn handle_response(
     if ledger::is_order_snapshot_response(template_id) {
         return complete_lookup(pending, payload, account);
     }
-    if order::is_reject(template_id) {
-        let (request_key, code) = order::decode_request_reject(payload)?;
+    if order_command::is_reject(template_id) {
+        let (request_key, code) = order_command::decode_request_reject(payload)?;
         reject_matching_pending(pending, &request_key, &code);
         return Ok(());
     }
@@ -88,12 +88,16 @@ pub(super) fn handle_response(
             reply,
         }) if kind.is_response(template_id) => {
             let response = match kind {
-                SubmitKind::Plain => {
-                    order::decode_new_order_response(payload, &request_key, &client_order_id)
-                }
-                SubmitKind::Bracket => {
-                    order::decode_bracket_order_response(payload, &request_key, &client_order_id)
-                }
+                SubmitKind::Plain => order_command::decode_new_order_response(
+                    payload,
+                    &request_key,
+                    &client_order_id,
+                ),
+                SubmitKind::Bracket => order_command::decode_bracket_order_response(
+                    payload,
+                    &request_key,
+                    &client_order_id,
+                ),
             };
             match response {
                 Ok(response) => {
@@ -143,8 +147,8 @@ pub(super) fn handle_response(
             terminal_seen,
             deadline,
             reply,
-        }) if order::is_cancel_order_response(template_id) => {
-            match order::decode_cancel_order_response(payload, &request_key, &basket_id) {
+        }) if order_command::is_cancel_order_response(template_id) => {
+            match order_command::decode_cancel_order_response(payload, &request_key, &basket_id) {
                 Ok(response) => match response.disposition {
                     ResponseDisposition::Processing => {
                         *pending = Some(Pending::Cancel {
@@ -189,8 +193,8 @@ pub(super) fn handle_response(
             event_seen,
             deadline,
             reply,
-        }) if order::is_modify_order_response(template_id) => {
-            match order::decode_modify_order_response(
+        }) if order_command::is_modify_order_response(template_id) => {
+            match order_command::decode_modify_order_response(
                 payload,
                 &request_key,
                 &modification.basket_id,
@@ -242,8 +246,8 @@ pub(super) fn handle_response(
             position,
             deadline,
             reply,
-        }) if order::is_exit_position_response(template_id) => {
-            match order::decode_exit_position_response(payload, &request_key, &position) {
+        }) if order_command::is_exit_position_response(template_id) => {
+            match order_command::decode_exit_position_response(payload, &request_key, &position) {
                 Ok(ResponseDisposition::Processing) => {
                     *pending = Some(Pending::ExitPosition {
                         request_key,
@@ -499,14 +503,14 @@ fn validate_modify_event(event: &OrderEvent, modification: &ProtectionModificati
         "Rithmic modify event quantity mismatch"
     );
     match modification.leg {
-        order::ProtectionLeg::StopLoss => {
+        order_command::ProtectionLeg::StopLoss => {
             ensure!(
                 event.price_type.as_deref() == Some("stop_market")
                     && event.trigger_price == Some(modification.price),
                 "Rithmic stop modification event mismatch"
             );
         }
-        order::ProtectionLeg::TakeProfit => {
+        order_command::ProtectionLeg::TakeProfit => {
             ensure!(
                 event.price_type.as_deref() == Some("limit")
                     && event.price == Some(modification.price),

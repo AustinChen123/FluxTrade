@@ -2,10 +2,8 @@ use super::{
     config,
     ledger::{self, AccountIdentity, OrderSnapshot, UserType},
     ledger_runtime::{discover_order_account_with_login, next_payload, wait_for_heartbeat},
-    order::{
-        self, BracketOrder, ExitPosition, NewOrder, OrderAck, ProtectionModification, TradeRoute,
-        TradeRouteEvent,
-    },
+    order::{self, TradeRoute, TradeRouteEvent},
+    order_command::{self, BracketOrder, ExitPosition, NewOrder, OrderAck, ProtectionModification},
     order_event::{self, OrderEvent},
     order_pending::{self, fail_pending, pending_expired, Pending, SubmitKind},
     profile_lock::ProfileLease,
@@ -512,13 +510,14 @@ async fn begin_command(
                 }
             };
             let request_key = request_key("new", sequence);
-            let payload = match order::new_order_request(&request_key, account, route, &new_order) {
-                Ok(payload) => payload,
-                Err(error) => {
-                    let _ = reply.send(Err(error));
-                    return Ok(None);
-                }
-            };
+            let payload =
+                match order_command::new_order_request(&request_key, account, route, &new_order) {
+                    Ok(payload) => payload,
+                    Err(error) => {
+                        let _ = reply.send(Err(error));
+                        return Ok(None);
+                    }
+                };
             let client_order_id = new_order.client_order_id;
             if let Err(error) = connection.send_payload(payload).await {
                 let _ = reply.send(Err(anyhow::anyhow!(
@@ -552,7 +551,7 @@ async fn begin_command(
                 }
             };
             let request_key = request_key("bracket", sequence);
-            let payload = match order::bracket_order_request(
+            let payload = match order_command::bracket_order_request(
                 &request_key,
                 account,
                 user_type,
@@ -591,13 +590,14 @@ async fn begin_command(
                 return Ok(None);
             }
             let request_key = request_key("modify", sequence);
-            let payload = match order::modify_order_request(&request_key, account, &modification) {
-                Ok(payload) => payload,
-                Err(error) => {
-                    let _ = reply.send(Err(error));
-                    return Ok(None);
-                }
-            };
+            let payload =
+                match order_command::modify_order_request(&request_key, account, &modification) {
+                    Ok(payload) => payload,
+                    Err(error) => {
+                        let _ = reply.send(Err(error));
+                        return Ok(None);
+                    }
+                };
             if let Err(error) = connection.send_payload(payload).await {
                 let _ = reply.send(Err(anyhow::anyhow!(
                     "Rithmic modify-order result is ambiguous: {error}"
@@ -623,13 +623,14 @@ async fn begin_command(
                 return Ok(None);
             }
             let request_key = request_key("cancel", sequence);
-            let payload = match order::cancel_order_request(&request_key, account, &basket_id) {
-                Ok(payload) => payload,
-                Err(error) => {
-                    let _ = reply.send(Err(error));
-                    return Ok(None);
-                }
-            };
+            let payload =
+                match order_command::cancel_order_request(&request_key, account, &basket_id) {
+                    Ok(payload) => payload,
+                    Err(error) => {
+                        let _ = reply.send(Err(error));
+                        return Ok(None);
+                    }
+                };
             if let Err(error) = connection.send_payload(payload).await {
                 let _ = reply.send(Err(anyhow::anyhow!(
                     "Rithmic cancel result is ambiguous: {error}"
@@ -657,13 +658,14 @@ async fn begin_command(
                 return Ok(None);
             }
             let request_key = request_key("exit-position", sequence);
-            let payload = match order::exit_position_request(&request_key, account, &position) {
-                Ok(payload) => payload,
-                Err(error) => {
-                    let _ = reply.send(Err(error));
-                    return Ok(None);
-                }
-            };
+            let payload =
+                match order_command::exit_position_request(&request_key, account, &position) {
+                    Ok(payload) => payload,
+                    Err(error) => {
+                        let _ = reply.send(Err(error));
+                        return Ok(None);
+                    }
+                };
             if let Err(error) = connection.send_payload(payload).await {
                 let _ = reply.send(Err(anyhow::anyhow!(
                     "Rithmic exit-position result is ambiguous: {error}"
@@ -1047,7 +1049,7 @@ mod tests {
                     exchange: "CME".to_string(),
                     symbol: "NQU6".to_string(),
                     quantity: dec!(1),
-                    leg: order::ProtectionLeg::StopLoss,
+                    leg: order_command::ProtectionLeg::StopLoss,
                     price: dec!(19999.0),
                 },
                 deadline: Instant::now() + COMMAND_TIMEOUT,
@@ -1348,8 +1350,8 @@ mod tests {
             symbol: "NQU6".to_string(),
             quantity: dec!(1),
             price: Some(dec!(20000.25)),
-            side: order::OrderSide::Buy,
-            order_type: order::OrderType::Limit,
+            side: order_command::OrderSide::Buy,
+            order_type: order_command::OrderType::Limit,
         }
     }
 
@@ -1475,7 +1477,7 @@ mod tests {
                     exchange: "CME".to_string(),
                     symbol: "MNQU6".to_string(),
                     quantity: dec!(1),
-                    leg: order::ProtectionLeg::StopLoss,
+                    leg: order_command::ProtectionLeg::StopLoss,
                     price: dec!(19999),
                 },
                 response_accepted: false,
