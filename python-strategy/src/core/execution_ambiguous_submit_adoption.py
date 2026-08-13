@@ -1,4 +1,4 @@
-"""Classify and adopt orders after an ambiguous submit failure."""
+"""Classify and adopt authoritative exchange order snapshots."""
 
 from collections.abc import Callable
 from typing import Protocol
@@ -14,17 +14,61 @@ from src.core.order_event_sync import exchange_snapshot_to_order_event
 from src.core.order_reconciliation import OrderReconciler
 
 
-class SubmittedOrder(Protocol):
+class AdoptableOrder(Protocol):
+    id: object
     client_order_id: str | None
     product_id: str
     type: str
+
+
+def adopt_pending_conditional_order_before_submit(
+    *,
+    adapter: IExchangeAdapter,
+    process_exchange_order_event: Callable[[ExchangeOrderEvent], dict[str, object]],
+    order: AdoptableOrder,
+) -> dict[str, object] | None:
+    if not order.client_order_id:
+        return None
+    try:
+        snapshot = adapter.get_order_by_client_id(
+            order.client_order_id,
+            order.product_id,
+            order_type=order.type,
+        )
+    except ExchangeOrderLookupUnsupported:
+        return {
+            "order_id": str(order.id),
+            "order_type": order.type,
+            "reason": "verification_blocked_order_lookup_unsupported",
+        }
+    except ExchangeError as error:
+        return {
+            "order_id": str(order.id),
+            "order_type": order.type,
+            "reason": "verification_blocked_order_lookup_failed",
+            "error": str(error),
+        }
+    if snapshot is None:
+        return None
+
+    event_result = process_exchange_order_event(
+        exchange_snapshot_to_order_event(order.product_id, snapshot)
+    )
+    if event_result["action"] == "applied":
+        return None
+    return {
+        "order_id": str(order.id),
+        "order_type": order.type,
+        "reason": str(event_result["action"]),
+        "event_result": event_result,
+    }
 
 
 def adopt_order_after_ambiguous_submit_error(
     *,
     adapter: IExchangeAdapter,
     process_exchange_order_event: Callable[[ExchangeOrderEvent], dict[str, object]],
-    order: SubmittedOrder,
+    order: AdoptableOrder,
     error: ExchangeError,
     submit_attempted: bool,
 ) -> dict[str, object]:

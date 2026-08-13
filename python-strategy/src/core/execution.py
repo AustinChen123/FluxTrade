@@ -25,7 +25,6 @@ from src.core.runtime_capabilities import (
 )
 from src.core.interfaces.exchange import IExchangeAdapter, ExchangeError, NetworkError
 from src.core.interfaces.exchange import ExchangeOrderEvent
-from src.core.interfaces.exchange import ExchangeOrderLookupUnsupported
 from src.core.clock import Clock
 from src.core.interfaces import IOrderRepository
 from src.core.journal import StrategyJournal
@@ -48,6 +47,7 @@ from src.core.execution_conditional_order_creation import (
     create_conditional_orders,
 )
 from src.core.execution_ambiguous_submit_adoption import (
+    adopt_pending_conditional_order_before_submit,
     adopt_order_after_ambiguous_submit_error,
 )
 from src.core.execution_order_cancellation import cancel_known_order
@@ -65,10 +65,7 @@ from src.core import execution_failure_diagnostics
 from src.core import execution_journal
 from src.core import execution_portfolio_exposure
 from src.core import execution_verified_net_reduction
-from src.core.order_event_sync import (
-    OrderEventApplier,
-    exchange_snapshot_to_order_event,
-)
+from src.core.order_event_sync import OrderEventApplier
 from src.core.order_reconciliation import OrderReconciler
 from src.core.portfolio_runtime import PortfolioExposureSnapshot
 from src.core.signal_order_intent import (
@@ -638,13 +635,6 @@ class ExecutionEngine:
 
     def resync_recoverable_order_events(self) -> dict[str, object]:
         return self._order_reconciler.resync_recoverable_order_events()
-
-    @staticmethod
-    def _exchange_snapshot_to_order_event(
-        product_id: str,
-        snapshot,
-    ) -> ExchangeOrderEvent:
-        return exchange_snapshot_to_order_event(product_id, snapshot)
 
     @staticmethod
     def _reconcile_decision(local_status: str, exchange_status: Optional[str]) -> str:
@@ -1800,41 +1790,11 @@ class ExecutionEngine:
         ]
 
     def _adopt_pending_conditional_order_before_submit(self, order) -> dict | None:
-        if not order.client_order_id:
-            return None
-        try:
-            snapshot = self.adapter.get_order_by_client_id(
-                order.client_order_id,
-                order.product_id,
-                order_type=order.type,
-            )
-        except ExchangeOrderLookupUnsupported:
-            return {
-                "order_id": str(order.id),
-                "order_type": order.type,
-                "reason": "verification_blocked_order_lookup_unsupported",
-            }
-        except ExchangeError as e:
-            return {
-                "order_id": str(order.id),
-                "order_type": order.type,
-                "reason": "verification_blocked_order_lookup_failed",
-                "error": str(e),
-            }
-        if snapshot is None:
-            return None
-
-        event_result = self.process_exchange_order_event(
-            self._exchange_snapshot_to_order_event(order.product_id, snapshot)
+        return adopt_pending_conditional_order_before_submit(
+            adapter=self.adapter,
+            process_exchange_order_event=self.process_exchange_order_event,
+            order=order,
         )
-        if event_result["action"] == "applied":
-            return None
-        return {
-            "order_id": str(order.id),
-            "order_type": order.type,
-            "reason": str(event_result["action"]),
-            "event_result": event_result,
-        }
 
     def place_pending_protection_for_filled_entries(self) -> dict[str, object]:
         """Retry NEW pending protective orders whose entry already has fills.

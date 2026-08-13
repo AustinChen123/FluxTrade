@@ -1,11 +1,13 @@
 from types import SimpleNamespace
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
 import pytest
 
 from src.core.execution_ambiguous_submit_adoption import (
+    adopt_pending_conditional_order_before_submit,
     adopt_order_after_ambiguous_submit_error,
 )
+from src.core.execution import ExecutionEngine
 from src.core.interfaces.exchange import (
     ExchangeError,
     ExchangeOrderLookupUnsupported,
@@ -33,6 +35,117 @@ def _adopt(subject, error, *, submit_attempted=True):
         order=subject.order,
         error=error,
         submit_attempted=submit_attempted,
+    )
+
+
+def _adopt_pending(subject):
+    return adopt_pending_conditional_order_before_submit(
+        adapter=subject.adapter,
+        process_exchange_order_event=subject.process_order_event,
+        order=subject.order,
+    )
+
+
+@pytest.mark.parametrize(
+    ("client_order_id", "lookup", "expected"),
+    [
+        (None, None, None),
+        (
+            "client-1",
+            ExchangeOrderLookupUnsupported("unsupported"),
+            {
+                "order_id": "order-1",
+                "order_type": "limit",
+                "reason": "verification_blocked_order_lookup_unsupported",
+            },
+        ),
+        (
+            "client-1",
+            ExchangeError("lookup failed"),
+            {
+                "order_id": "order-1",
+                "order_type": "limit",
+                "reason": "verification_blocked_order_lookup_failed",
+                "error": "lookup failed",
+            },
+        ),
+        ("client-1", None, None),
+    ],
+)
+def test_pending_conditional_pre_submit_lookup_classification_is_exact(
+    client_order_id,
+    lookup,
+    expected,
+):
+    subject = _subject(client_order_id=client_order_id)
+    subject.order.id = "order-1"
+    if isinstance(lookup, Exception):
+        subject.adapter.get_order_by_client_id.side_effect = lookup
+    else:
+        subject.adapter.get_order_by_client_id.return_value = lookup
+
+    assert _adopt_pending(subject) == expected
+
+    if client_order_id is None:
+        subject.adapter.get_order_by_client_id.assert_not_called()
+    else:
+        subject.adapter.get_order_by_client_id.assert_called_once_with(
+            "client-1",
+            "TEST:PRODUCT",
+            order_type="limit",
+        )
+    subject.process_order_event.assert_not_called()
+
+
+@pytest.mark.parametrize("action", ["applied", "unknown_status"])
+def test_pending_conditional_snapshot_is_converted_and_processed_once(action):
+    subject = _subject()
+    subject.order.id = "order-1"
+    snapshot = ExchangeOrderSnapshot(
+        client_order_id="client-1",
+        exchange_order_id="exchange-1",
+        status="open",
+    )
+    event_result = {"action": action, "marker": object()}
+    subject.adapter.get_order_by_client_id.return_value = snapshot
+    subject.process_order_event.return_value = event_result
+
+    result = _adopt_pending(subject)
+
+    if action == "applied":
+        assert result is None
+    else:
+        assert result == {
+            "order_id": "order-1",
+            "order_type": "limit",
+            "reason": "unknown_status",
+            "event_result": event_result,
+        }
+    event = subject.process_order_event.call_args.args[0]
+    assert event.product_id == "TEST:PRODUCT"
+    assert event.client_order_id == "client-1"
+    assert event.exchange_order_id == "exchange-1"
+    assert event.status == "open"
+    subject.process_order_event.assert_called_once()
+
+
+def test_engine_pending_conditional_adoption_facade_delegates_exact_dependencies():
+    engine = ExecutionEngine.__new__(ExecutionEngine)
+    engine.adapter = MagicMock()
+    engine.process_exchange_order_event = MagicMock()
+    order = SimpleNamespace(id="order-1")
+    result = {"marker": object()}
+
+    with patch(
+        "src.core.execution.adopt_pending_conditional_order_before_submit",
+        return_value=result,
+    ) as owner:
+        assert engine._adopt_pending_conditional_order_before_submit(order) is result
+
+    owner.assert_called_once_with(
+        adapter=engine.adapter,
+        process_exchange_order_event=engine.process_exchange_order_event,
+        order=order,
     )
 
 
