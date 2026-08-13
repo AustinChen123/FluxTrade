@@ -522,95 +522,18 @@ fn terminal_diagnostic(error: &anyhow::Error) -> TerminalDiagnostic {
         .chain()
         .find_map(|cause| cause.downcast_ref::<SupervisedFailure>());
     let task = supervisor.map_or_else(|| "unknown".to_string(), |failure| failure.task.clone());
-    if let Some(failure) = error
-        .chain()
-        .find_map(|cause| cause.downcast_ref::<crate::connector::binance::BinanceTaskFailure>())
-    {
+    if let Some(failure) = crate::connector::terminal::classify(error) {
         return TerminalDiagnostic {
-            component: "binance",
+            component: failure.component,
             task,
-            operation: "stream_task",
-            stage: failure.task(),
-            template_id: "unknown".to_string(),
-            payload_len: "unknown".to_string(),
-            stable_error_code: failure.stable_error_code(),
-            disposition: "fatal_service_exit",
-            state_effect: "process_exit",
-            safe_cause: failure.safe_cause(),
-        };
-    }
-    if let Some(failure) = error
-        .chain()
-        .find_map(|cause| cause.downcast_ref::<crate::connector::backpack::BackpackTaskFailure>())
-    {
-        return TerminalDiagnostic {
-            component: "backpack",
-            task,
-            operation: "stream_task",
-            stage: failure.task(),
-            template_id: "unknown".to_string(),
-            payload_len: "unknown".to_string(),
-            stable_error_code: failure.stable_error_code(),
-            disposition: "fatal_service_exit",
-            state_effect: "process_exit",
-            safe_cause: failure.safe_cause(),
-        };
-    }
-    if let Some(failure) = error
-        .chain()
-        .find_map(|cause| cause.downcast_ref::<crate::connector::bybit::BybitTaskFailure>())
-    {
-        return TerminalDiagnostic {
-            component: "bybit",
-            task,
-            operation: "stream_task",
-            stage: failure.task(),
-            template_id: "unknown".to_string(),
-            payload_len: "unknown".to_string(),
-            stable_error_code: failure.stable_error_code(),
-            disposition: "fatal_service_exit",
-            state_effect: "process_exit",
-            safe_cause: failure.safe_cause(),
-        };
-    }
-    #[cfg(feature = "rithmic")]
-    if let Some(failure) = error
-        .chain()
-        .find_map(|cause| cause.downcast_ref::<crate::connector::rithmic::PayloadFailure>())
-    {
-        return TerminalDiagnostic {
-            component: "rithmic",
-            task,
-            operation: failure.operation(),
-            stage: failure.stage(),
-            template_id: failure
-                .template_id()
-                .map_or_else(|| "unknown".to_string(), |value| value.to_string()),
-            payload_len: failure
-                .payload_len()
-                .map_or_else(|| "unknown".to_string(), |value| value.to_string()),
-            stable_error_code: failure.stable_error_code(),
-            disposition: failure.disposition(),
-            state_effect: failure.state_effect(),
-            safe_cause: failure.safe_cause(),
-        };
-    }
-    #[cfg(feature = "rithmic")]
-    if error
-        .chain()
-        .any(crate::connector::rithmic::is_handshake_rejection)
-    {
-        return TerminalDiagnostic {
-            component: "rithmic",
-            task,
-            operation: "handshake",
-            stage: "handshake",
-            template_id: "unknown".to_string(),
-            payload_len: "unknown".to_string(),
-            stable_error_code: "rithmic_handshake_rejected",
-            disposition: "fatal_service_exit",
-            state_effect: "session_failed",
-            safe_cause: "Rithmic handshake rejected",
+            operation: failure.operation,
+            stage: failure.stage,
+            template_id: failure.template_id,
+            payload_len: failure.payload_len,
+            stable_error_code: failure.stable_error_code,
+            disposition: failure.disposition,
+            state_effect: failure.state_effect,
+            safe_cause: failure.safe_cause,
         };
     }
     let (stage, stable_error_code, safe_cause) = supervisor
@@ -1750,6 +1673,28 @@ mod tests {
         assert!(!watchdog_product.contains("crate::connector::rithmic"));
         assert!(owner_source.contains("pub(crate) fn resolve"));
         assert!(owner_source.contains("pub(crate) async fn run"));
+    }
+
+    #[test]
+    fn connector_terminal_diagnostics_are_connector_owned() {
+        let main_source = include_str!("main.rs");
+        let owner_source = include_str!("connector/terminal.rs");
+        let main_product = main_source
+            .rsplit_once("\n#[cfg(test)]\nmod tests {")
+            .unwrap()
+            .0;
+
+        for provider_detail in [
+            "BinanceTaskFailure",
+            "BackpackTaskFailure",
+            "BybitTaskFailure",
+            "PayloadFailure",
+            "is_handshake_rejection",
+        ] {
+            assert!(!main_product.contains(provider_detail));
+            assert!(owner_source.contains(provider_detail));
+        }
+        assert!(owner_source.contains("pub(crate) fn classify"));
     }
 
     #[test]

@@ -6,6 +6,7 @@ pub mod bybit;
 pub(crate) mod emergency;
 #[cfg(feature = "rithmic")]
 pub mod rithmic;
+pub(crate) mod terminal;
 pub mod ws;
 
 use async_trait::async_trait;
