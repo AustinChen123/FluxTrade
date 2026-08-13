@@ -6,8 +6,8 @@ use super::{
     session::Plant,
     transport::{self, ConnectionPreparation, PayloadFailure, PayloadFailureKind, ReconnectPolicy},
 };
+use crate::live_event_pipeline::AggregationSourceEvent;
 use crate::model::validate_product_id;
-use crate::AggregationSourceEvent;
 use anyhow::{ensure, Context, Result};
 use chrono::{Datelike, Utc};
 use std::{
