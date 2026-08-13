@@ -1849,12 +1849,78 @@ class TestExecutionTradingRules:
             == expected_status
         )
         assert engine._reconcile_halt is reconcile_halted
+        assert engine._submissions_in_flight == 0
         if error is NetworkError:
             assert engine._submission_gate_owner.generation == initial_generation + 2
             engine.resume_after_reconcile()
             assert engine._reconcile_halt is True
             engine.resume_after_reconcile()
             assert engine._reconcile_halt is False
+
+    @pytest.mark.parametrize(
+        ("stop_loss", "take_profit"),
+        [
+            (None, None),
+            (Decimal("19999.00"), Decimal("20001.00")),
+        ],
+    )
+    def test_modify_protection_requires_exactly_one_leg_before_submission(
+        self,
+        execution_engine,
+        mock_exchange_adapter,
+        mock_order_repo,
+        stop_loss,
+        take_profit,
+    ):
+        with pytest.raises(
+            ExchangeError,
+            match="^modify_protection_requires_exactly_one_leg$",
+        ):
+            execution_engine.modify_protection(
+                "not-loaded-entry",
+                stop_loss=stop_loss,
+                take_profit=take_profit,
+            )
+
+        assert execution_engine._submissions_in_flight == 0
+        assert mock_order_repo.orders == {}
+        assert mock_exchange_adapter.open_orders == []
+
+    def test_modify_protection_delegates_exact_transaction_dependencies_once(
+        self,
+        execution_engine,
+        mock_exchange_adapter,
+        mock_order_repo,
+        mock_clock,
+    ):
+        expected = {
+            "entry_order_id": "entry-1",
+            "order_id": "protection-1",
+            "leg_type": "stop_loss",
+            "effective_price": "19999.00",
+        }
+        with patch(
+            "src.core.execution.modify_attached_protection",
+            return_value=expected,
+        ) as modify:
+            result = execution_engine.modify_protection(
+                "entry-1",
+                stop_loss=Decimal("19999.00"),
+            )
+
+        assert result is expected
+        modify.assert_called_once_with(
+            repository=mock_order_repo,
+            adapter=mock_exchange_adapter,
+            clock=mock_clock,
+            order_event_lock=execution_engine._order_event_apply_lock,
+            assert_operation_allowed=execution_engine._assert_external_operation_allowed,
+            halt_for_reconcile=execution_engine.halt_for_reconcile,
+            entry_order_id="entry-1",
+            leg_type="stop_loss",
+            price=Decimal("19999.00"),
+        )
+        assert execution_engine._submissions_in_flight == 0
 
     @pytest.mark.parametrize(
         ("kill_halted", "reconcile_halted"),

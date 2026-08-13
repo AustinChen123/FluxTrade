@@ -4,7 +4,7 @@ import time as _time
 from collections.abc import Mapping
 from dataclasses import dataclass
 from decimal import Decimal
-from typing import Callable, ContextManager, Optional
+from typing import Callable, ContextManager, Optional, cast
 from sqlalchemy.orm import Session
 from src.core.models import (
     Signal,
@@ -52,6 +52,11 @@ from src.core.fill_delta import (
     fill_delta_from_cumulative,
 )
 from src.core.execution_submission_gate import ExecutionSubmissionGate
+from src.core.execution_protection_modification import (
+    ProtectionModificationAdapter,
+    ProtectionModificationRepository,
+    modify_attached_protection,
+)
 from src.core import execution_failure_diagnostics
 from src.core import execution_journal
 from src.core import execution_portfolio_exposure
@@ -1027,95 +1032,20 @@ class ExecutionEngine:
             raise ExchangeError("modify_protection_submission_gate_halted")
         try:
             leg_type, price = requested[0]
-            entry = self.order_manager.repo.get_order(str(entry_order_id))
-            if entry is None or entry.type not in {"market", "limit"}:
-                raise ExchangeError("modify_protection_entry_not_found")
-            candidates = [
-                order
-                for order in self.order_manager.repo.list_orders_by_statuses(
-                    {
-                        OrderStatus.SUBMITTED_UNCONFIRMED.value,
-                        OrderStatus.SUBMITTED.value,
-                        OrderStatus.PARTIALLY_FILLED.value,
-                    }
-                )
-                if order.type == leg_type
-                and isinstance(order.intent_payload, dict)
-                and order.intent_payload.get("pending_entry_order_id") == str(entry.id)
-                and order.intent_payload.get("placement_mode") == "attach-at-entry"
-            ]
-            if len(candidates) != 1:
-                raise ExchangeError("modify_protection_leg_identity_ambiguous")
-            order = candidates[0]
-            with self._order_event_apply_lock:
-                payload = dict(order.intent_payload or {})
-                previous_trigger_price = order.trigger_price
-                modifications = list(payload.get("modifications") or [])
-                attempt = {
-                    "previous_effective_price": payload.get("effective_price"),
-                    "requested_price": str(price),
-                    "started_at_ms": int(self.clock.now() * 1000),
-                    "status": "pending",
-                }
-                modifications.append(attempt)
-                payload["modifications"] = modifications
-                order.intent_payload = payload
-                self.order_manager.repo.update_order(order)
-                try:
-                    self._assert_external_operation_allowed()
-                    confirmed = self.adapter.modify_protection(
-                        order,
-                        trigger_price=price,
-                    )
-                except NetworkError:
-                    self.halt_for_reconcile()
-                    attempt["status"] = "ambiguous"
-                    attempt["finished_at_ms"] = int(self.clock.now() * 1000)
-                    order.intent_payload = payload
-                    self.order_manager.repo.update_order(order)
-                    raise
-                except ExchangeError:
-                    attempt["status"] = "rejected"
-                    attempt["finished_at_ms"] = int(self.clock.now() * 1000)
-                    order.intent_payload = payload
-                    self.order_manager.repo.update_order(order)
-                    raise
-                if not confirmed:
-                    attempt["status"] = "rejected"
-                    attempt["finished_at_ms"] = int(self.clock.now() * 1000)
-                    order.intent_payload = payload
-                    self.order_manager.repo.update_order(order)
-                    raise ExchangeError("modify_protection_not_confirmed")
-                confirmed_attempt = {
-                    **attempt,
-                    "status": "confirmed",
-                    "finished_at_ms": int(self.clock.now() * 1000),
-                }
-                confirmed_payload = {
-                    **payload,
-                    "requested_price": str(price),
-                    "expected_effective_price": str(price),
-                    "effective_price": str(price),
-                    "price_drift": "0",
-                    "modification_mode": "absolute",
-                    "protection_confirmation": "confirmed",
-                    "modifications": [*modifications[:-1], confirmed_attempt],
-                }
-                order.trigger_price = price
-                order.intent_payload = confirmed_payload
-                try:
-                    self.order_manager.repo.update_order(order)
-                except Exception:
-                    order.trigger_price = previous_trigger_price
-                    order.intent_payload = payload
-                    self.halt_for_reconcile()
-                    raise
-            return {
-                "entry_order_id": str(entry.id),
-                "order_id": str(order.id),
-                "leg_type": leg_type,
-                "effective_price": str(price),
-            }
+            return modify_attached_protection(
+                repository=cast(
+                    ProtectionModificationRepository,
+                    self.order_manager.repo,
+                ),
+                adapter=cast(ProtectionModificationAdapter, self.adapter),
+                clock=self.clock,
+                order_event_lock=self._order_event_apply_lock,
+                assert_operation_allowed=self._assert_external_operation_allowed,
+                halt_for_reconcile=self.halt_for_reconcile,
+                entry_order_id=entry_order_id,
+                leg_type=leg_type,
+                price=price,
+            )
         except NetworkError:
             self._submission_gate_owner.claim_reconcile_halt()
             raise
