@@ -16,6 +16,32 @@ def intent_signal_price(order: Any) -> str | None:
     return str(price) if price is not None else None
 
 
+def journal_entry(
+    journal: Any,
+    signal: Any,
+    order: Any,
+    side: Any,
+    order_type: Any,
+) -> None:
+    journal.log(
+        "entry",
+        {
+            "order_id": str(order.id),
+            "side": side,
+            "order_type": order_type,
+            "quantity": str(order.quantity),
+            "price": str(order.price) if order.price else "market",
+            "stop_loss": str(signal.stop_loss) if signal.stop_loss else None,
+            "take_profit": str(signal.take_profit) if signal.take_profit else None,
+            "trailing_distance": (
+                str(signal.trailing_distance) if signal.trailing_distance else None
+            ),
+        },
+        timestamp=signal.timestamp,
+        trade_id=str(order.id),
+    )
+
+
 def journal_fill(
     journal: Any,
     order: Any,

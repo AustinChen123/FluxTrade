@@ -47,7 +47,7 @@ from src.core.fill_delta import (
 )
 from src.core.execution_submission_gate import ExecutionSubmissionGate
 from src.core import execution_failure_diagnostics
-from src.core import execution_fill_journal
+from src.core import execution_journal
 from src.core.order_event_sync import (
     OrderEventApplier,
     exchange_snapshot_to_order_event,
@@ -1510,28 +1510,7 @@ class ExecutionEngine:
             return None
 
         # 3. Journal: record entry
-        if self.journal is not None:
-            self.journal.log(
-                "entry",
-                {
-                    "order_id": str(order.id),
-                    "side": side,
-                    "order_type": order_type,
-                    # Post-placement order fields: quantization may have adjusted
-                    # the submitted values away from the pre-validation locals.
-                    "quantity": str(order.quantity),
-                    "price": str(order.price) if order.price else "market",
-                    "stop_loss": str(signal.stop_loss) if signal.stop_loss else None,
-                    "take_profit": str(signal.take_profit)
-                    if signal.take_profit
-                    else None,
-                    "trailing_distance": str(signal.trailing_distance)
-                    if signal.trailing_distance
-                    else None,
-                },
-                timestamp=signal.timestamp,
-                trade_id=str(order.id),
-            )
+        self._journal_entry(signal, order, side, order_type)
 
         # 4. Place conditional orders (SL/TP/Trailing)
         if conditional_orders and not atomic_group:
@@ -1762,28 +1741,7 @@ class ExecutionEngine:
                 outcome_payload={"status": "placed", "exchange_order_id": exchange_id},
             )
 
-        if self.journal is not None:
-            self.journal.log(
-                "entry",
-                {
-                    "order_id": str(order.id),
-                    "side": side,
-                    "order_type": order_type,
-                    # Post-placement order fields: quantization may have adjusted
-                    # the submitted values away from the pre-validation locals.
-                    "quantity": str(order.quantity),
-                    "price": str(order.price) if order.price else "market",
-                    "stop_loss": str(signal.stop_loss) if signal.stop_loss else None,
-                    "take_profit": str(signal.take_profit)
-                    if signal.take_profit
-                    else None,
-                    "trailing_distance": str(signal.trailing_distance)
-                    if signal.trailing_distance
-                    else None,
-                },
-                timestamp=signal.timestamp,
-                trade_id=str(order.id),
-            )
+        self._journal_entry(signal, order, side, order_type)
 
         return order.id
 
@@ -2728,6 +2686,17 @@ class ExecutionEngine:
             failures=failures,
         )
 
+    def _journal_entry(self, signal, order, side, order_type) -> None:
+        if self.journal is None:
+            return
+        execution_journal.journal_entry(
+            self.journal,
+            signal,
+            order,
+            side,
+            order_type,
+        )
+
     def _journal_fill(
         self,
         order,
@@ -2737,7 +2706,7 @@ class ExecutionEngine:
         fill_type: str,
         candle: Optional[Candlestick] = None,
     ) -> None:
-        execution_fill_journal.journal_fill(
+        execution_journal.journal_fill(
             self.journal,
             order,
             price,
@@ -2754,7 +2723,7 @@ class ExecutionEngine:
         fill_price: Decimal,
         fill_quantity: Decimal,
     ) -> None:
-        execution_fill_journal.journal_exchange_order_event_fill(
+        execution_journal.journal_exchange_order_event_fill(
             self.journal,
             self.clock,
             order,

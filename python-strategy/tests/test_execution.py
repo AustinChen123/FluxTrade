@@ -24,14 +24,15 @@ from prometheus_client import REGISTRY
 from src.core.adapters.ccxt_adapter import CcxtExchangeAdapter
 from src.core.adapters.live_binance import LiveBinanceAdapter
 from src.core.adapters.rithmic_adapter import RithmicExchangeAdapter
+from src.core import execution as execution_module
 from src.core.execution import ExecutionEngine, ExitDecision
-from src.core import execution_fill_journal
+from src.core import execution_journal
 from src.core.interfaces.exchange import ExchangeOrderSnapshot
 from src.core.interfaces.exchange import ExchangeOrderEvent
 from src.core.interfaces.exchange import ExchangeError
 from src.core.interfaces.exchange import NetworkError
 from src.core.interfaces.exchange import ExchangeOrderLookupUnsupported
-from src.core.models import OrderStatus, Position, PositionSide, SignalType
+from src.core.models import OrderSide, OrderStatus, Position, PositionSide, SignalType
 from src.core.orm_models import SignalAudit, SystemEvent
 from src.core.client_order_id import generate_client_order_id, parse_client_order_id
 
@@ -1255,6 +1256,140 @@ class TestExecutionTradingRules:
         assert payload["quantity"] == "0.010"
         assert payload["price"] == "50123.40"
 
+    @pytest.mark.parametrize("initial_journal_present", [False, True])
+    @pytest.mark.parametrize("current_journal_present", [False, True])
+    def test_entry_journal_uses_current_dependency_and_projection_function(
+        self,
+        monkeypatch,
+        mock_db_session,
+        mock_clock,
+        mock_exchange_adapter,
+        mock_order_repo,
+        signal_factory,
+        initial_journal_present,
+        current_journal_present,
+    ):
+        initial_journal = MagicMock() if initial_journal_present else None
+        engine = ExecutionEngine(
+            db_session=mock_db_session,
+            clock=mock_clock,
+            adapter=mock_exchange_adapter,
+            order_repository=mock_order_repo,
+            journal=initial_journal,
+        )
+        current_journal = MagicMock() if current_journal_present else None
+        engine.journal = current_journal
+        projection = MagicMock()
+        monkeypatch.setattr(execution_journal, "journal_entry", projection)
+        signal = signal_factory(price=Decimal("42000"), quantity=Decimal("0.25"))
+
+        order_id = engine.execute_signal(signal)
+
+        assert order_id is not None
+        if current_journal is None:
+            projection.assert_not_called()
+        else:
+            projection.assert_called_once_with(
+                current_journal,
+                signal,
+                mock_order_repo.orders[order_id],
+                OrderSide.BUY,
+                "limit",
+            )
+        if initial_journal is not None:
+            initial_journal.log.assert_not_called()
+
+    def test_core_entry_journal_failure_finishes_submission_before_next_admission(
+        self,
+        monkeypatch,
+        mock_db_session,
+        mock_clock,
+        mock_exchange_adapter,
+        mock_order_repo,
+        signal_factory,
+    ):
+        journal = MagicMock()
+        engine = ExecutionEngine(
+            db_session=mock_db_session,
+            clock=mock_clock,
+            adapter=mock_exchange_adapter,
+            order_repository=mock_order_repo,
+            journal=journal,
+        )
+        trace = []
+        original_place_order = mock_exchange_adapter.place_order
+
+        def place_order(order):
+            exchange_order_id = original_place_order(order)
+            trace.append("placement")
+            return exchange_order_id
+
+        monkeypatch.setattr(mock_exchange_adapter, "place_order", place_order)
+        original_ack = engine.order_manager.update_exchange_order_id
+
+        def acknowledge_order(order, exchange_order_id):
+            original_ack(order, exchange_order_id)
+            trace.append("ack")
+
+        monkeypatch.setattr(
+            engine.order_manager,
+            "update_exchange_order_id",
+            acknowledge_order,
+        )
+        placed_metric = MagicMock()
+        placed_metric.labels.return_value.inc.side_effect = lambda: trace.append(
+            "metric"
+        )
+        monkeypatch.setattr(execution_module, "ORDERS_TOTAL", placed_metric)
+        place_conditionals = MagicMock(
+            side_effect=lambda *_args: trace.append("conditional")
+        )
+        monkeypatch.setattr(engine, "_place_conditional_orders", place_conditionals)
+        drained = MagicMock()
+        error = RuntimeError("core entry journal sentinel")
+
+        def fail_projection(*_args):
+            assert len(mock_exchange_adapter.open_orders) == 1
+            assert trace == ["placement", "ack", "metric"]
+            entry_order = next(
+                order
+                for order in mock_order_repo.orders.values()
+                if order.exchange_order_id is not None
+            )
+            assert entry_order.exchange_order_id.startswith("MOCK-")
+            assert entry_order.status == "open"
+            placed_metric.labels.return_value.inc.assert_called_once_with()
+            trace.append("journal")
+            engine.run_when_submissions_drained(drained)
+            raise error
+
+        projection = MagicMock(side_effect=fail_projection)
+        monkeypatch.setattr(execution_journal, "journal_entry", projection)
+
+        with pytest.raises(RuntimeError) as raised:
+            engine.execute_signal(
+                signal_factory(
+                    strategy_id="journal-failure",
+                    price=Decimal("42000"),
+                    stop_loss=Decimal("41000"),
+                )
+            )
+
+        assert raised.value is error
+        assert engine._submissions_in_flight == 0
+        drained.assert_called_once_with()
+        place_conditionals.assert_not_called()
+        projection.assert_called_once()
+        assert trace == ["placement", "ack", "metric", "journal"]
+
+        projection.side_effect = None
+        later_order_id = engine.execute_signal(
+            signal_factory(strategy_id="journal-recovery", price=Decimal("42000"))
+        )
+
+        assert later_order_id is not None
+        assert engine._submissions_in_flight == 0
+
     def test_trailing_stop_validation_rejects_group_before_entry_submit(
         self, mock_db_session, mock_clock, mock_order_repo, signal_factory
     ):
@@ -2238,7 +2373,7 @@ class TestLiveOrderEventSync:
         engine.clock = current_clock
         projection = MagicMock()
         monkeypatch.setattr(
-            execution_fill_journal,
+            execution_journal,
             "journal_exchange_order_event_fill",
             projection,
         )
@@ -2296,7 +2431,7 @@ class TestLiveOrderEventSync:
         error = RuntimeError("exchange journal sentinel")
         projection = MagicMock(side_effect=error)
         monkeypatch.setattr(
-            execution_fill_journal,
+            execution_journal,
             "journal_exchange_order_event_fill",
             projection,
         )
@@ -3363,6 +3498,56 @@ class TestAuditedExecution:
         assert audit.order_id == order.id
         assert audit_session.flush.call_count == 1
         assert audit_session.commit.call_count == 2
+
+    def test_audited_entry_journal_failure_finishes_submission_after_outcome_commit(
+        self,
+        monkeypatch,
+        mock_db_session,
+        mock_clock,
+        mock_exchange_adapter,
+        mock_order_repo,
+        signal_factory,
+    ):
+        journal = MagicMock()
+        engine = ExecutionEngine(
+            db_session=mock_db_session,
+            clock=mock_clock,
+            adapter=mock_exchange_adapter,
+            order_repository=mock_order_repo,
+            journal=journal,
+            db_session_factory=lambda: nullcontext(mock_db_session),
+            audit_external_orders=True,
+        )
+        drained = MagicMock()
+        error = RuntimeError("audited entry journal sentinel")
+
+        def fail_projection(*_args):
+            audit = mock_db_session.add.call_args_list[0].args[0]
+            assert audit.outcome_payload["status"] == "placed"
+            assert mock_db_session.commit.call_count == 2
+            engine.run_when_submissions_drained(drained)
+            raise error
+
+        projection = MagicMock(side_effect=fail_projection)
+        monkeypatch.setattr(execution_journal, "journal_entry", projection)
+
+        with pytest.raises(RuntimeError) as raised:
+            engine.execute_signal(
+                signal_factory(strategy_id="journal-failure", price=Decimal("42000"))
+            )
+
+        assert raised.value is error
+        assert engine._submissions_in_flight == 0
+        drained.assert_called_once_with()
+        projection.assert_called_once()
+
+        projection.side_effect = None
+        later_order_id = engine.execute_signal(
+            signal_factory(strategy_id="journal-recovery", price=Decimal("42000"))
+        )
+
+        assert later_order_id is not None
+        assert engine._submissions_in_flight == 0
 
     def test_invalid_explicit_price_writes_non_submission_audit(
         self,
@@ -7051,7 +7236,7 @@ class TestMarketDataProcessing:
         )
         error = RuntimeError("simulated journal sentinel")
         projection = MagicMock(side_effect=error)
-        monkeypatch.setattr(execution_fill_journal, "journal_fill", projection)
+        monkeypatch.setattr(execution_journal, "journal_fill", projection)
 
         with pytest.raises(RuntimeError) as raised:
             engine.process_market_data(candlestick_factory(close=Decimal("101")))

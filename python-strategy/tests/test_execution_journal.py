@@ -6,9 +6,9 @@ from unittest.mock import MagicMock
 
 import pytest
 
-from src.core import execution_fill_journal as fill_journal
+from src.core import execution_journal as journal_projection
 from src.core.interfaces.exchange import ExchangeOrderEvent
-from src.core.models import Candlestick
+from src.core.models import Candlestick, OrderSide
 
 
 class _DictSubclass(dict):
@@ -32,11 +32,95 @@ class _DictSubclass(dict):
 def test_intent_signal_price_preserves_mapping_shape_compatibility(payload, expected):
     order = SimpleNamespace(intent_payload=payload)
 
-    assert fill_journal.intent_signal_price(order) == expected
+    assert journal_projection.intent_signal_price(order) == expected
 
 
 def test_intent_signal_price_missing_payload_is_none():
-    assert fill_journal.intent_signal_price(object()) is None
+    assert journal_projection.intent_signal_price(object()) is None
+
+
+@pytest.mark.parametrize(
+    (
+        "order_price",
+        "stop_loss",
+        "take_profit",
+        "trailing_distance",
+        "expected",
+    ),
+    [
+        (
+            Decimal("101.250"),
+            Decimal("99.00"),
+            Decimal("105.000"),
+            Decimal("1.50"),
+            {
+                "price": "101.250",
+                "stop_loss": "99.00",
+                "take_profit": "105.000",
+                "trailing_distance": "1.50",
+            },
+        ),
+        (
+            Decimal("0.00"),
+            Decimal("0.00"),
+            Decimal("0.00"),
+            Decimal("0.00"),
+            {
+                "price": "market",
+                "stop_loss": None,
+                "take_profit": None,
+                "trailing_distance": None,
+            },
+        ),
+    ],
+)
+@pytest.mark.parametrize("side", [OrderSide.BUY, OrderSide.SELL])
+@pytest.mark.parametrize("order_type", ["market", "limit"])
+def test_journal_entry_projects_exact_post_placement_payload(
+    order_price,
+    stop_loss,
+    take_profit,
+    trailing_distance,
+    expected,
+    side,
+    order_type,
+):
+    journal = MagicMock()
+    signal = SimpleNamespace(
+        timestamp=1_704_067_200_111,
+        stop_loss=stop_loss,
+        take_profit=take_profit,
+        trailing_distance=trailing_distance,
+    )
+    order = SimpleNamespace(
+        id="order-1",
+        quantity=Decimal("0.0600"),
+        price=order_price,
+    )
+
+    journal_projection.journal_entry(
+        journal,
+        signal,
+        order,
+        side,
+        order_type,
+    )
+
+    journal.log.assert_called_once_with(
+        "entry",
+        {
+            "order_id": "order-1",
+            "side": side,
+            "order_type": order_type,
+            "quantity": "0.0600",
+            **expected,
+        },
+        timestamp=1_704_067_200_111,
+        trade_id="order-1",
+    )
+    projected_side = journal.log.call_args.args[1]["side"]
+    assert projected_side is side
+    assert type(projected_side) is OrderSide
 
 
 @pytest.mark.parametrize(
@@ -70,7 +154,7 @@ def test_journal_fill_projects_exact_tag_payload_and_identity(
         volume=Decimal("10"),
     )
 
-    fill_journal.journal_fill(
+    journal_projection.journal_fill(
         journal,
         order,
         Decimal("101.25"),
@@ -98,7 +182,7 @@ def test_journal_fill_projects_exact_tag_payload_and_identity(
 def test_journal_fill_without_candle_uses_zero_timestamp():
     journal = MagicMock()
 
-    fill_journal.journal_fill(
+    journal_projection.journal_fill(
         journal,
         SimpleNamespace(id="order-1", side="sell"),
         Decimal("100"),
@@ -132,7 +216,7 @@ def test_exchange_event_fill_projects_exact_payload_and_timestamp(event_timestam
         event_timestamp=event_timestamp,
     )
 
-    fill_journal.journal_exchange_order_event_fill(
+    journal_projection.journal_exchange_order_event_fill(
         journal,
         clock,
         order,
@@ -166,7 +250,7 @@ def test_exchange_event_fill_without_submitted_price_uses_market():
     journal = MagicMock()
     order = SimpleNamespace(id="order-1", side="sell", price=None, intent_payload=None)
 
-    fill_journal.journal_exchange_order_event_fill(
+    journal_projection.journal_exchange_order_event_fill(
         journal,
         MagicMock(now=MagicMock(return_value=1)),
         order,
@@ -189,7 +273,7 @@ def test_exchange_event_fill_treats_scaled_zero_submitted_price_as_market():
         intent_payload=None,
     )
 
-    fill_journal.journal_exchange_order_event_fill(
+    journal_projection.journal_exchange_order_event_fill(
         journal,
         MagicMock(now=MagicMock(return_value=1)),
         order,
@@ -205,15 +289,28 @@ def test_exchange_event_fill_treats_scaled_zero_submitted_price_as_market():
     assert journal.log.call_args.args[1]["submitted_price"] == "market"
 
 
-@pytest.mark.parametrize("projection", ["candle", "exchange_event"])
+@pytest.mark.parametrize("projection", ["entry", "candle", "exchange_event"])
 def test_journal_projection_preserves_exception_identity(projection):
     journal = MagicMock()
     error = RuntimeError(f"{projection} journal sentinel")
     journal.log.side_effect = error
 
     with pytest.raises(RuntimeError) as raised:
-        if projection == "candle":
-            fill_journal.journal_fill(
+        if projection == "entry":
+            journal_projection.journal_entry(
+                journal,
+                SimpleNamespace(
+                    timestamp=1,
+                    stop_loss=None,
+                    take_profit=None,
+                    trailing_distance=None,
+                ),
+                SimpleNamespace(id="order-1", quantity=Decimal("1"), price=None),
+                "buy",
+                "market",
+            )
+        elif projection == "candle":
+            journal_projection.journal_fill(
                 journal,
                 SimpleNamespace(id="order-1", side="buy"),
                 Decimal("1"),
@@ -222,7 +319,7 @@ def test_journal_projection_preserves_exception_identity(projection):
                 "MARKET",
             )
         else:
-            fill_journal.journal_exchange_order_event_fill(
+            journal_projection.journal_exchange_order_event_fill(
                 journal,
                 MagicMock(now=MagicMock(return_value=1)),
                 SimpleNamespace(
@@ -238,7 +335,7 @@ def test_journal_projection_preserves_exception_identity(projection):
 
 
 def test_owner_module_has_projection_only_dependencies():
-    source = Path(fill_journal.__file__).read_text(encoding="utf-8")
+    source = Path(journal_projection.__file__).read_text(encoding="utf-8")
     tree = ast.parse(source)
     imports = set()
     for node in ast.walk(tree):
@@ -256,6 +353,7 @@ def test_owner_module_has_projection_only_dependencies():
     }
     assert functions == {
         "intent_signal_price",
+        "journal_entry",
         "journal_fill",
         "journal_exchange_order_event_fill",
     }
@@ -272,6 +370,7 @@ def test_owner_module_has_projection_only_dependencies():
         "commit",
         "rollback",
         "logging",
+        "conditional",
         "rithmic",
         "binance",
         "backpack",
