@@ -16,7 +16,11 @@ from src.core.models import (
 )
 from src.core.orm_models import Strategy
 from src.core.order_manager import OrderManager
-from src.core.runtime_capabilities import OrderAccountIdentityResolver
+from src.core.runtime_capabilities import (
+    OrderAccountIdentityResolver,
+    OrderEventProcessor,
+    process_order_event_without_venue_policy,
+)
 from src.core.interfaces.exchange import IExchangeAdapter, ExchangeError, NetworkError
 from src.core.interfaces.exchange import ExchangeOrderEvent
 from src.core.interfaces.exchange import ExchangeOrderLookupUnsupported
@@ -96,6 +100,7 @@ class ExecutionEngine:
         account_service=None,
         order_account_identity_resolver: OrderAccountIdentityResolver | None = None,
         operation_guard: Callable[[], None] | None = None,
+        order_event_processor: OrderEventProcessor | None = None,
     ):
         self.logger = logging.getLogger("ExecutionEngine")
         self.clock = clock
@@ -103,6 +108,9 @@ class ExecutionEngine:
         self._db_session = db_session
         self.audit_external_orders = audit_external_orders
         self._operation_guard = operation_guard or (lambda: None)
+        self._order_event_processor = (
+            order_event_processor or process_order_event_without_venue_policy
+        )
         self._position_loader = (
             getattr(
                 account_service,
@@ -677,136 +685,14 @@ class ExecutionEngine:
         allow_remote_side_effects: bool = True,
     ) -> dict[str, object]:
         with self._order_event_apply_lock:
-            identity_failure = self._native_protection_identity_failure(event)
-            if identity_failure is not None:
-                return identity_failure
-            result = self._order_event_applier.process_exchange_order_event(
+            return self._order_event_processor(
+                self.order_manager.repo,
                 event,
-                allow_remote_side_effects=allow_remote_side_effects,
+                lambda: self._order_event_applier.process_exchange_order_event(
+                    event,
+                    allow_remote_side_effects=allow_remote_side_effects,
+                ),
             )
-            return self._verify_native_protection_event(event, result)
-
-    def _native_protection_identity_failure(
-        self,
-        event: ExchangeOrderEvent,
-    ) -> dict[str, object] | None:
-        if not event.client_order_id:
-            return None
-        order = self.order_manager.repo.get_order_by_client_order_id(
-            event.client_order_id
-        )
-        payload = dict(getattr(order, "intent_payload", None) or {})
-        if (
-            order is None
-            or order.type not in {"stop_loss", "take_profit"}
-            or payload.get("placement_mode") != "attach-at-entry"
-        ):
-            return None
-        raw = event.raw or {}
-        expected_parent = payload.get("native_parent_basket_id")
-        remote_parent = raw.get("original_basket_id")
-        if (
-            expected_parent
-            and remote_parent is not None
-            and str(remote_parent) != str(expected_parent)
-        ):
-            return {
-                "action": "unresolved_native_protection_parent_mismatch",
-                "order_id": str(order.id),
-                "status": event.status,
-            }
-        if (
-            order.exchange_order_id
-            and event.exchange_order_id
-            and str(order.exchange_order_id) != str(event.exchange_order_id)
-        ):
-            return {
-                "action": "unresolved_native_protection_basket_mismatch",
-                "order_id": str(order.id),
-                "status": event.status,
-            }
-        return None
-
-    def _verify_native_protection_event(
-        self,
-        event: ExchangeOrderEvent,
-        result: dict[str, object],
-    ) -> dict[str, object]:
-        if result.get("action") != "applied" or result.get("state") != "open":
-            return result
-        order_id = result.get("order_id")
-        order = self.order_manager.repo.get_order(str(order_id)) if order_id else None
-        payload = dict(getattr(order, "intent_payload", None) or {})
-        raw = event.raw or {}
-        if (
-            order is None
-            or order.type not in {"stop_loss", "take_profit"}
-            or payload.get("placement_mode") != "attach-at-entry"
-            or not raw.get("original_basket_id")
-        ):
-            return result
-
-        expected_price_type = "stop_market" if order.type == "stop_loss" else "limit"
-        if str(raw.get("price_type") or "").lower() != expected_price_type:
-            return {
-                **result,
-                "action": "unresolved_native_protection_price_type_mismatch",
-            }
-        expected_bracket_type = payload.get("native_bracket_type")
-        remote_bracket_type = raw.get("bracket_type")
-        if remote_bracket_type and remote_bracket_type != expected_bracket_type:
-            return {
-                **result,
-                "action": "unresolved_native_protection_bracket_type_mismatch",
-            }
-        raw_price = (
-            raw.get("trigger_price") if order.type == "stop_loss" else raw.get("price")
-        )
-        try:
-            remote_price = Decimal(str(raw_price))
-        except (InvalidOperation, TypeError, ValueError):
-            remote_price = Decimal("NaN")
-        if not remote_price.is_finite() or remote_price <= 0:
-            return {
-                **result,
-                "action": "unresolved_native_protection_price_missing",
-            }
-
-        payload.update(
-            {
-                "remote_effective_price": str(remote_price),
-                "remote_price_type": expected_price_type,
-                "remote_bracket_type": remote_bracket_type,
-            }
-        )
-        expected_raw = payload.get("expected_effective_price")
-        if expected_raw is None:
-            payload["protection_confirmation"] = "observed_pending_entry_fill"
-        else:
-            try:
-                expected_price = Decimal(str(expected_raw))
-            except (InvalidOperation, TypeError, ValueError):
-                expected_price = Decimal("NaN")
-            if not expected_price.is_finite() or expected_price != remote_price:
-                payload["protection_confirmation"] = "conflict"
-                order.intent_payload = payload
-                self.order_manager.repo.update_order(order)
-                return {
-                    **result,
-                    "action": "unresolved_native_protection_price_mismatch",
-                    "expected_price": str(expected_raw),
-                    "remote_price": str(remote_price),
-                }
-            payload.update(
-                {
-                    "effective_price": str(remote_price),
-                    "protection_confirmation": "confirmed",
-                }
-            )
-            order.trigger_price = remote_price
-        order.intent_payload = payload
-        self.order_manager.repo.update_order(order)
-        return result
 
     def _record_order_ack(
         self,

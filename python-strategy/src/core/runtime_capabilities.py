@@ -5,7 +5,7 @@ import threading
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Callable, Protocol
 
-from src.core.interfaces import IExchangeAdapter
+from src.core.interfaces import IExchangeAdapter, IOrderRepository
 from src.core.interfaces.exchange import ExchangeOrderEvent
 from src.core.models import Candlestick, Signal
 
@@ -14,6 +14,27 @@ if TYPE_CHECKING:
     from src.core.ops_safety import OpsSafetyService
     from src.core.risk_manager import AccountService
     from src.core.runtime_environment import RuntimeEnvironment
+
+
+OrderEventApply = Callable[[], dict[str, object]]
+
+
+class OrderEventProcessor(Protocol):
+    def __call__(
+        self,
+        repository: IOrderRepository,
+        event: ExchangeOrderEvent,
+        apply_event: OrderEventApply,
+    ) -> dict[str, object]: ...
+
+
+def process_order_event_without_venue_policy(
+    repository: IOrderRepository,
+    event: ExchangeOrderEvent,
+    apply_event: OrderEventApply,
+) -> dict[str, object]:
+    """Apply an order event when no venue-specific projection is selected."""
+    return apply_event()
 
 
 class RuntimeBootstrap(Protocol):
@@ -36,6 +57,13 @@ class RuntimeBootstrap(Protocol):
         *,
         is_backtest: bool,
     ) -> OrderAccountIdentity | None: ...
+
+    def process_order_event(
+        self,
+        repository: IOrderRepository,
+        event: ExchangeOrderEvent,
+        apply_event: OrderEventApply,
+    ) -> dict[str, object]: ...
 
 
 @dataclass(frozen=True)
@@ -83,6 +111,18 @@ class DefaultRuntimeBootstrap:
         is_backtest: bool,
     ) -> OrderAccountIdentity | None:
         return None
+
+    def process_order_event(
+        self,
+        repository: IOrderRepository,
+        event: ExchangeOrderEvent,
+        apply_event: OrderEventApply,
+    ) -> dict[str, object]:
+        return process_order_event_without_venue_policy(
+            repository,
+            event,
+            apply_event,
+        )
 
 
 class RuntimeBootstrapFactory(Protocol):

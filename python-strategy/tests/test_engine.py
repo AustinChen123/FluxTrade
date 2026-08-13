@@ -372,6 +372,26 @@ class TestEngineInit:
         assert engine._venue_runtime.emergency_flatten is None
         assert engine._venue_runtime.portfolio_exit_factory is None
 
+    def test_engine_passes_selected_order_event_processor_to_execution(
+        self,
+        engine_factory,
+    ):
+        processor = MagicMock()
+        bootstrap = MagicMock()
+        bootstrap.profile = None
+        bootstrap.account_id = None
+        bootstrap.process_order_event = processor
+        bootstrap.resolve_reconciliation_schedule.return_value = (False, None)
+        capabilities = MagicMock()
+
+        with patch("src.core.engine.ExecutionEngine") as execution_engine:
+            engine_factory(
+                runtime_bootstrap_factory=MagicMock(return_value=bootstrap),
+                runtime_capabilities_factory=MagicMock(return_value=capabilities),
+            )
+
+        assert execution_engine.call_args.kwargs["order_event_processor"] is processor
+
     def test_rithmic_adapter_requires_runtime_capability_factories(
         self,
         engine_factory,

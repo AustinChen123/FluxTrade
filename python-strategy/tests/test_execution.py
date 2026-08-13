@@ -24,6 +24,9 @@ from prometheus_client import REGISTRY
 from src.core.adapters.ccxt_adapter import CcxtExchangeAdapter
 from src.core.adapters.live_binance import LiveBinanceAdapter
 from src.core.adapters.rithmic_adapter import RithmicExchangeAdapter
+from src.core.adapters.rithmic_native_protection_event import (
+    process_native_protection_event,
+)
 from src.core import execution as execution_module
 from src.core.execution import ExecutionEngine, ExitDecision
 from src.core import execution_journal
@@ -1443,6 +1446,7 @@ class TestExecutionTradingRules:
             db_session_factory=lambda: nullcontext(mock_db_session),
             audit_external_orders=True,
             is_backtest=True,
+            order_event_processor=process_native_protection_event,
         )
         signal = signal_factory(
             product_id="RITHMIC:NQ-202609",
@@ -1491,6 +1495,7 @@ class TestExecutionTradingRules:
             db_session_factory=lambda: nullcontext(mock_db_session),
             audit_external_orders=True,
             is_backtest=True,
+            order_event_processor=process_native_protection_event,
         )
 
         order_id = engine.execute_signal(
@@ -1622,6 +1627,7 @@ class TestExecutionTradingRules:
             db_session_factory=lambda: nullcontext(mock_db_session),
             audit_external_orders=True,
             is_backtest=True,
+            order_event_processor=process_native_protection_event,
         )
         order_id = engine.execute_signal(
             signal_factory(
@@ -1707,6 +1713,7 @@ class TestExecutionTradingRules:
             db_session_factory=lambda: nullcontext(mock_db_session),
             audit_external_orders=True,
             is_backtest=True,
+            order_event_processor=process_native_protection_event,
         )
         entry_id = engine.execute_signal(
             signal_factory(
@@ -1799,6 +1806,7 @@ class TestExecutionTradingRules:
             db_session_factory=lambda: nullcontext(mock_db_session),
             audit_external_orders=True,
             is_backtest=True,
+            order_event_processor=process_native_protection_event,
         )
         entry_id = engine.execute_signal(
             signal_factory(

@@ -23,6 +23,9 @@ from src.core.adapters.rithmic_kill_switch_clear import (
 from src.core.adapters.rithmic_ledger_recovery import (
     RithmicLedgerRecoveryService,
 )
+from src.core.adapters.rithmic_native_protection_event import (
+    process_native_protection_event,
+)
 from src.core.adapters.rithmic_order_event_lifecycle import (
     RithmicOrderEventLifecycleGate,
 )
@@ -38,13 +41,15 @@ from src.core.adapters.rithmic_runtime_recovery import (
 )
 from src.core.adapters.rithmic_strategy_exit import RithmicStrategyExitService
 from src.core.execution import ExecutionEngine, ExitDecision
-from src.core.interfaces import IExchangeAdapter
+from src.core.interfaces import IExchangeAdapter, IOrderRepository
+from src.core.interfaces.exchange import ExchangeOrderEvent
 from src.core.models import Candlestick, Signal, SignalType
 from src.core.ops_safety import OpsSafetyService
 from src.core.risk_manager import AccountService
 from src.core.runtime_capabilities import (
     KillSwitchClearPreparation,
     OrderAccountIdentity,
+    OrderEventApply,
     RuntimeCallbacks as RithmicRuntimeCallbacks,
     StartupReconciliationState,
 )
@@ -121,6 +126,17 @@ class RithmicRuntimeBootstrap:
                 "Rithmic live orders require account profile and account ID"
             )
         return self.order_account_identity
+
+    def process_order_event(
+        self,
+        repository: IOrderRepository,
+        event: ExchangeOrderEvent,
+        apply_event: OrderEventApply,
+    ) -> dict[str, object]:
+        """Apply generic events or delegate native protection to Rithmic."""
+        if not self.is_rithmic_runtime:
+            return apply_event()
+        return process_native_protection_event(repository, event, apply_event)
 
 
 def prepare_rithmic_runtime_bootstrap(

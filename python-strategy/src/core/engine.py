@@ -351,6 +351,7 @@ class StrategyEngine:
                 runtime_bootstrap.resolve_order_account_identity
             ),
             operation_guard=self._assert_runtime_leadership,
+            order_event_processor=runtime_bootstrap.process_order_event,
         )
         self._lifecycle_adapter = _EngineLifecycleAdapter(self)
         self._health_monitor = HealthMonitor(self._registry)

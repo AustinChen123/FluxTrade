@@ -37,6 +37,7 @@ from src.core.adapters.rithmic_runtime_recovery import (
 from src.core.adapters.rithmic_strategy_exit import RithmicStrategyExitService
 from src.core.execution import ExecutionEngine, ExitDecision
 from src.core.interfaces import IExchangeAdapter
+from src.core.interfaces.exchange import ExchangeOrderEvent
 from src.core.models import Signal, SignalType
 from src.core.ops_safety import OpsSafetyService
 from src.core.risk_manager import AccountService
@@ -269,6 +270,47 @@ def test_non_rithmic_bootstrap_does_not_parse_or_configure_rithmic_policy(
     assert bootstrap.is_rithmic_runtime is False
     account_service.configure_authoritative_balance.assert_not_called()
     generic_interval.assert_called_once_with()
+
+
+def test_non_rithmic_bootstrap_applies_generic_order_event_once() -> None:
+    bootstrap = prepare_rithmic_runtime_bootstrap(
+        adapter=cast(IExchangeAdapter, MagicMock()),
+        adapter_config={},
+        audit_external_orders=True,
+        account_service=MagicMock(spec=AccountService),
+        runtime_environment=RuntimeEnvironment("test"),
+    )
+    repository = MagicMock()
+    event = ExchangeOrderEvent(status="open", product_id="BINANCE:BTCUSDT-PERP")
+    apply_event = MagicMock(return_value={"action": "applied"})
+
+    assert bootstrap.process_order_event(repository, event, apply_event) == {
+        "action": "applied"
+    }
+    apply_event.assert_called_once_with()
+
+
+def test_rithmic_bootstrap_delegates_order_event_to_provider_owner(monkeypatch) -> None:
+    process_event = MagicMock(return_value={"action": "provider"})
+    monkeypatch.setattr(
+        "src.core.adapters.rithmic_runtime_composition.process_native_protection_event",
+        process_event,
+    )
+    bootstrap = prepare_rithmic_runtime_bootstrap(
+        adapter=_rithmic_adapter(),
+        adapter_config={"rithmic_recovery_account_id": "ACCOUNT"},
+        audit_external_orders=True,
+        account_service=MagicMock(spec=AccountService),
+        runtime_environment=RuntimeEnvironment("test"),
+    )
+    repository = MagicMock()
+    event = ExchangeOrderEvent(status="open", product_id="RITHMIC:NQ-202609")
+    apply_event = MagicMock()
+
+    assert bootstrap.process_order_event(repository, event, apply_event) == {
+        "action": "provider"
+    }
+    process_event.assert_called_once_with(repository, event, apply_event)
 
 
 def _callbacks() -> RithmicRuntimeCallbacks:
