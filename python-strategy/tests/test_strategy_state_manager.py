@@ -52,7 +52,7 @@ class _FakeQuery:
         if state is None:
             return 0
         for key, value in values.items():
-            setattr(state, key, value)
+            setattr(state, key.key, value)
         return 1
 
 

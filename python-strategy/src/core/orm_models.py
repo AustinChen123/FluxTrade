@@ -259,36 +259,48 @@ class Position(Base):
 
 
 class SignalAudit(Base):
+    __tablename__ = "signal_audit"
 
-    __tablename__ = 'signal_audit'
+    id: Mapped[int] = mapped_column(
+        _autoincrement_bigint(),
+        primary_key=True,
+        autoincrement=True,
+    )
 
-    id = Column(_autoincrement_bigint(), primary_key=True, autoincrement=True)
+    timestamp: Mapped[int] = mapped_column(BigInteger, nullable=False)
 
-    timestamp = Column(BigInteger, nullable=False)
+    strategy_id: Mapped[str] = mapped_column(String, nullable=False)
 
-    strategy_id = Column(String, nullable=False)
+    product_id: Mapped[str] = mapped_column(String, nullable=False)
 
-    product_id = Column(String, nullable=False)
+    signal_type: Mapped[str] = mapped_column(String, nullable=False)
 
-    signal_type = Column(String, nullable=False)
+    risk_status: Mapped[str] = mapped_column(String, nullable=False)  # PASS, REJECT
 
-    risk_status = Column(String, nullable=False) # PASS, REJECT
+    risk_message: Mapped[str | None] = mapped_column(Text, nullable=True)
 
-    risk_message = Column(Text, nullable=True)
-
-    order_id = Column(String, nullable=True)
+    order_id: Mapped[str | None] = mapped_column(String, nullable=True)
 
     # Migration 5 — TEXT upgraded to JSONB.
-    details_json = Column(JSONB, nullable=True)
+    details_json: Mapped[dict[str, object] | None] = mapped_column(
+        JSONB,
+        nullable=True,
+    )
 
     # Migration 5 — Path B audit linkage + multi-signal batch correlation.
-    client_order_id = Column(String(128), nullable=True)
+    client_order_id: Mapped[str | None] = mapped_column(String(128), nullable=True)
 
-    intent_payload = Column(JSONB, nullable=True)
+    intent_payload: Mapped[dict[str, object] | None] = mapped_column(
+        JSONB,
+        nullable=True,
+    )
 
-    outcome_payload = Column(JSONB, nullable=True)
+    outcome_payload: Mapped[dict[str, object] | None] = mapped_column(
+        JSONB,
+        nullable=True,
+    )
 
-    signal_batch_id = Column(String(64), nullable=True)
+    signal_batch_id: Mapped[str | None] = mapped_column(String(64), nullable=True)
 
 
 class SystemEvent(Base):
@@ -446,36 +458,47 @@ class DailyNavSnapshot(Base):
     monetary values per FluxTrade Decimal rules.
     """
 
-    __tablename__ = 'daily_nav_snapshots'
+    __tablename__ = "daily_nav_snapshots"
 
-    id = Column(_autoincrement_bigint(), primary_key=True, autoincrement=True)
-    strategy_id = Column(String, ForeignKey('strategy.id'), nullable=False)
-    snapshot_date = Column(Date, nullable=False)
-    nav = Column(Numeric(28, 8), nullable=False)
-    base_currency = Column(String(16), nullable=False)
-    drawdown = Column(Numeric(10, 8), nullable=True)
-    return_pct = Column(Numeric(10, 8), nullable=True)
-    source = Column(
+    id: Mapped[int] = mapped_column(
+        _autoincrement_bigint(),
+        primary_key=True,
+        autoincrement=True,
+    )
+    strategy_id: Mapped[str] = mapped_column(
+        String,
+        ForeignKey("strategy.id"),
+        nullable=False,
+    )
+    snapshot_date: Mapped[date] = mapped_column(Date, nullable=False)
+    nav: Mapped[Decimal] = mapped_column(Numeric(28, 8), nullable=False)
+    base_currency: Mapped[str] = mapped_column(String(16), nullable=False)
+    drawdown: Mapped[Decimal | None] = mapped_column(Numeric(10, 8), nullable=True)
+    return_pct: Mapped[Decimal | None] = mapped_column(
+        Numeric(10, 8),
+        nullable=True,
+    )
+    source: Mapped[str] = mapped_column(
         String(32),
         nullable=False,
-        server_default='eod_snapshot',
+        server_default="eod_snapshot",
     )
-    recorded_at = Column(
+    recorded_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True),
         nullable=False,
         server_default=func.now(),
     )
-    notes = Column(Text, nullable=True)
+    notes: Mapped[str | None] = mapped_column(Text, nullable=True)
 
     __table_args__ = (
         CheckConstraint(
             "source IN ('eod_snapshot','startup_reconcile','manual')",
-            name='chk_nav_source',
+            name="chk_nav_source",
         ),
         UniqueConstraint(
-            'strategy_id',
-            'snapshot_date',
-            name='uq_daily_nav_strategy_date',
+            "strategy_id",
+            "snapshot_date",
+            name="uq_daily_nav_strategy_date",
         ),
     )
 
