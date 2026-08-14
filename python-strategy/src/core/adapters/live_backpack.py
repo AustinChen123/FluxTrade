@@ -66,6 +66,23 @@ class LiveBackpackAdapter(CcxtExchangeAdapter):
                 exchange_client_order_id,
             )
 
+    def _product_id_from_ccxt_symbol(self, symbol: str | None) -> str | None:
+        if type(symbol) is not str or symbol.count("/") != 1:
+            return None
+        if symbol.count(":") > 1:
+            return None
+        pair, separator, settlement = symbol.partition(":")
+        base, quote = pair.split("/", 1)
+        components = (base, quote, settlement) if separator else (base, quote)
+        if any(
+            not component or not component.isascii() or not component.isalnum()
+            for component in components
+        ):
+            return None
+        if separator and settlement != quote:
+            return None
+        return f"BACKPACK:{base}_{quote}-PERP"
+
     def _submission_client_order_id_params(
         self,
         exchange_client_order_id: str,

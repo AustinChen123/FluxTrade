@@ -23,6 +23,7 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
+from src.core.adapters.live_backpack import LiveBackpackAdapter
 from src.core.models import Position, PositionSide
 from src.core.risk_manager import AccountService, RiskManager
 from src.core.runtime_reconcile import PositionAuthorityState, RuntimeReconciliationJob
@@ -517,6 +518,141 @@ class TestPositionAuthorityAdmission:
             }
         ]
         assert "bulk-provider-secret" not in repr(result)
+
+
+class TestBackpackBulkPositionAuthority:
+    @staticmethod
+    def _adapter(rows: list[dict[str, object]]) -> LiveBackpackAdapter:
+        client = MagicMock()
+        client.fetch_positions.side_effect = lambda symbols=None: (
+            rows if symbols is None else []
+        )
+        adapter = object.__new__(LiveBackpackAdapter)
+        adapter.exchange_id = "backpack"
+        adapter.client = client
+        adapter.logger = MagicMock()
+        return adapter
+
+    @staticmethod
+    def _job(
+        account: FakeAccountService,
+        adapter: LiveBackpackAdapter,
+        observations: list[tuple[PositionAuthorityState, str]],
+        *,
+        product_ids: list[str] | None = None,
+    ) -> RuntimeReconciliationJob:
+        return RuntimeReconciliationJob(
+            account_service=account,
+            adapter=adapter,
+            db_session_factory=_make_null_db_factory(),
+            balance_asset=None,
+            on_position_authority_observation=lambda state, stage: observations.append(
+                (state, stage)
+            ),
+            quantity_drift_threshold=THRESHOLD_QTY,
+            balance_drift_threshold=THRESHOLD_BAL,
+            product_ids=product_ids or ["BACKPACK:BTC_USDC-PERP"],
+        )
+
+    @pytest.mark.parametrize("side", [PositionSide.LONG, PositionSide.SHORT])
+    def test_matching_backpack_bulk_position_is_admission_safe(self, side):
+        observations: list[tuple[PositionAuthorityState, str]] = []
+        account = FakeAccountService(
+            positions=[
+                _make_position(
+                    product_id="BACKPACK:BTC_USDC-PERP",
+                    side=side,
+                    quantity=Decimal("2"),
+                )
+            ]
+        )
+        adapter = self._adapter(
+            [
+                {
+                    "symbol": "BTC/USDC:USDC",
+                    "contracts": "2",
+                    "side": side.value.lower(),
+                    "entryPrice": "100",
+                    "unrealizedPnl": "0",
+                }
+            ]
+        )
+
+        result = self._job(account, adapter, observations).run_once()
+
+        assert result["position_drifts"] == []
+        assert observations == [(PositionAuthorityState.SAFE, "verified")]
+
+    def test_backpack_quantity_mismatch_latches_only_on_second_run(self):
+        observations: list[tuple[PositionAuthorityState, str]] = []
+        account = FakeAccountService(
+            positions=[
+                _make_position(
+                    product_id="BACKPACK:BTC_USDC-PERP",
+                    quantity=Decimal("1"),
+                )
+            ]
+        )
+        adapter = self._adapter(
+            [
+                {
+                    "symbol": "BTC/USDC:USDC",
+                    "contracts": "2",
+                    "side": "long",
+                    "entryPrice": "100",
+                    "unrealizedPnl": "0",
+                }
+            ]
+        )
+        job = self._job(account, adapter, observations)
+
+        first = job.run_once()
+        second = job.run_once()
+
+        assert (
+            first["position_drifts"]
+            == second["position_drifts"]
+            == [
+                {
+                    "strategy_id": STRATEGY_ID,
+                    "product_id": "BACKPACK:BTC_USDC-PERP",
+                    "local_quantity": Decimal("1"),
+                    "exchange_quantity": Decimal("2"),
+                }
+            ]
+        )
+        assert observations == [
+            (PositionAuthorityState.UNCONFIRMED, "quantity_drift"),
+            (PositionAuthorityState.LATCHED, "quantity_drift"),
+        ]
+
+    def test_backpack_external_product_remains_visible_and_latches(self):
+        observations: list[tuple[PositionAuthorityState, str]] = []
+        adapter = self._adapter(
+            [
+                {
+                    "symbol": "SOL/USDC:USDC",
+                    "contracts": "3",
+                    "side": "short",
+                    "entryPrice": "150",
+                    "unrealizedPnl": "0",
+                }
+            ]
+        )
+        job = self._job(FakeAccountService(), adapter, observations)
+
+        first = job.run_once()
+        second = job.run_once()
+
+        assert [
+            (drift["product_id"], drift["exchange_quantity"])
+            for drift in first["position_drifts"]
+        ] == [("BACKPACK:SOL_USDC-PERP", Decimal("-3"))]
+        assert second["position_drifts"] == first["position_drifts"]
+        assert observations == [
+            (PositionAuthorityState.UNCONFIRMED, "quantity_drift"),
+            (PositionAuthorityState.LATCHED, "quantity_drift"),
+        ]
 
 
 class TestRunOnceAsymmetricDrift:

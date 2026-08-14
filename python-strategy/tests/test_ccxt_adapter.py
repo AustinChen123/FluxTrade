@@ -1679,6 +1679,99 @@ class TestGetPosition:
             ("BINANCE:XRPUSDT-PERP", "SHORT", Decimal("20")),
         ]
 
+    @pytest.mark.parametrize(
+        ("symbol", "side", "expected_product", "expected_side"),
+        [
+            ("BTC/USDC:USDC", "long", "BACKPACK:BTC_USDC-PERP", "LONG"),
+            ("SOL/USDC:USDC", "short", "BACKPACK:SOL_USDC-PERP", "SHORT"),
+            ("BTC/USDC", "long", "BACKPACK:BTC_USDC-PERP", "LONG"),
+            ("ADA/USDC:USDC", "long", "BACKPACK:ADA_USDC-PERP", "LONG"),
+        ],
+    )
+    def test_backpack_bulk_positions_preserve_canonical_base_quote_identity(
+        self,
+        symbol,
+        side,
+        expected_product,
+        expected_side,
+    ):
+        client = MagicMock()
+        client.fetch_positions.return_value = [
+            {
+                "symbol": symbol,
+                "contracts": "2.5",
+                "side": side,
+                "entryPrice": "101.25",
+                "unrealizedPnl": "3.75",
+            }
+        ]
+        adapter = _backpack_adapter(client)
+
+        positions = adapter.get_all_positions()
+
+        assert len(positions) == 1
+        assert positions[0].product_id == expected_product
+        assert positions[0].side == expected_side
+        assert positions[0].quantity == Decimal("2.5")
+        assert positions[0].entry_price == Decimal("101.25")
+        assert positions[0].unrealized_pnl == Decimal("3.75")
+
+    @pytest.mark.parametrize(
+        "symbol",
+        [
+            "BTCUSDC:USDC",
+            "/USDC:USDC",
+            "BTC/:USDC",
+            "BTC/USDC:",
+            "BTC/USDC:USDT",
+            "BTC/USDC:USDC:EXTRA",
+            "BTC//USDC:USDC",
+            "BTC-USD/USDC:USDC",
+            "BTC/US_D_C:US_D_C",
+        ],
+    )
+    def test_backpack_bulk_positions_reject_malformed_symbols(self, symbol):
+        client = MagicMock()
+        client.fetch_positions.return_value = [
+            {
+                "symbol": symbol,
+                "contracts": "1",
+                "side": "long",
+                "entryPrice": "100",
+                "unrealizedPnl": "0",
+            }
+        ]
+        adapter = _backpack_adapter(client)
+
+        assert adapter.get_all_positions() == []
+
+    def test_backpack_malformed_bulk_row_does_not_hide_later_valid_position(self):
+        client = MagicMock()
+        client.fetch_positions.return_value = [
+            {
+                "symbol": "BTC/USDC:USDT",
+                "contracts": "4",
+                "side": "long",
+                "entryPrice": "100",
+                "unrealizedPnl": "0",
+            },
+            {
+                "symbol": "SOL/USDC:USDC",
+                "contracts": "3",
+                "side": "short",
+                "entryPrice": "150",
+                "unrealizedPnl": "-2",
+            },
+        ]
+        adapter = _backpack_adapter(client)
+
+        positions = adapter.get_all_positions()
+
+        assert [
+            (position.product_id, position.side, position.quantity)
+            for position in positions
+        ] == [("BACKPACK:SOL_USDC-PERP", "SHORT", Decimal("3"))]
+
 
 # ---------------------------------------------------------------------------
 # create_adapter factory
