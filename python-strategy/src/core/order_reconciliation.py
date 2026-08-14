@@ -6,7 +6,12 @@ from typing import Callable, ContextManager, Optional, Protocol, TypedDict, cast
 from sqlalchemy.orm import Session
 
 from src.core.audit_service import write_system_event
-from src.core.fill_delta import FillDeltaState, classify_fill_delta, snapshot_fill_delta
+from src.core.fill_delta import (
+    FillDelta,
+    FillDeltaState,
+    classify_fill_delta,
+    snapshot_fill_delta,
+)
 from src.core.interfaces.exchange import (
     ExchangeError,
     ExchangeOrderEvent,
@@ -548,7 +553,7 @@ class OrderReconciler:
         return None
 
     @staticmethod
-    def _snapshot_fill_delta(order, snapshot) -> Optional[dict[str, Optional[Decimal]]]:
+    def _snapshot_fill_delta(order, snapshot) -> Optional[FillDelta]:
         return snapshot_fill_delta(
             local_filled=order.filled_quantity or Decimal("0"),
             local_average_price=order.filled_price,
@@ -562,7 +567,7 @@ class OrderReconciler:
         cls,
         order,
         snapshot,
-    ) -> tuple[FillDeltaState, Optional[dict[str, Optional[Decimal]]]]:
+    ) -> tuple[FillDeltaState, Optional[FillDelta]]:
         return classify_fill_delta(
             local_filled=order.filled_quantity or Decimal("0"),
             local_average_price=order.filled_price,

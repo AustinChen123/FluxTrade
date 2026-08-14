@@ -47,6 +47,7 @@ from src.core.execution_ambiguous_submit_adoption import (
 )
 from src.core.execution_order_cancellation import cancel_known_order
 from src.core.fill_delta import (
+    FillDelta,
     delta_price_from_cumulative_average,
     fill_delta_from_cumulative,
 )
@@ -727,7 +728,7 @@ class ExecutionEngine:
         local_average_price: Decimal | None,
         cumulative_filled: Decimal,
         cumulative_average_price: Decimal | None,
-    ) -> dict[str, Decimal | None]:
+    ) -> FillDelta:
         return fill_delta_from_cumulative(
             local_filled=local_filled,
             local_average_price=local_average_price,

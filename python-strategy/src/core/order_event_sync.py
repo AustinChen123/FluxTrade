@@ -1,7 +1,7 @@
 from decimal import Decimal
 from typing import Callable, Optional
 
-from src.core.fill_delta import fill_delta_from_cumulative
+from src.core.fill_delta import FillDelta, fill_delta_from_cumulative
 from src.core.interfaces.exchange import ExchangeOrderEvent
 from src.core.models import OrderStatus
 
@@ -11,7 +11,9 @@ class OrderEventApplier:
         self,
         *,
         order_manager,
-        journal_fill: Optional[Callable[[object, ExchangeOrderEvent, Decimal, Decimal], None]],
+        journal_fill: Optional[
+            Callable[[object, ExchangeOrderEvent, Decimal, Decimal], None]
+        ],
         fail_pending_conditionals_for_terminal_entry: Callable[[object], None],
         protective_terminal_without_fill_failure: Callable[[object], dict | None],
         write_conditional_warning: Callable[..., None],
@@ -56,7 +58,10 @@ class OrderEventApplier:
                 "exchange_order_id": event.exchange_order_id,
             }
 
-        if event.exchange_order_id and order.exchange_order_id != event.exchange_order_id:
+        if (
+            event.exchange_order_id
+            and order.exchange_order_id != event.exchange_order_id
+        ):
             self.order_manager.update_exchange_order_id(order, event.exchange_order_id)
 
         event_state = self._classify_exchange_order_event_status(event.status)
@@ -92,9 +97,8 @@ class OrderEventApplier:
                 "order_id": order.id,
                 "status": event.status,
             }
-        if (
-            fill_delta["quantity"] == 0
-            and self._requires_terminal_fill_quantity(order, event, event_state)
+        if fill_delta["quantity"] == 0 and self._requires_terminal_fill_quantity(
+            order, event, event_state
         ):
             return {
                 "action": "unresolved_missing_terminal_fill_quantity",
@@ -120,7 +124,7 @@ class OrderEventApplier:
             # reconciliation will still query the parent authoritatively.
             self.fail_pending_conditionals_for_terminal_entry(order)
 
-        if fill_delta["quantity"] > 0:
+        if fill_delta["quantity"] > 0 and fill_delta["price"] is not None:
             terminal_status = self._status_for_exchange_event_fill(event_state)
             cumulative_quantity = event.cumulative_filled_quantity or (
                 (order.filled_quantity or Decimal("0")) + fill_delta["quantity"]
@@ -318,7 +322,7 @@ class OrderEventApplier:
         self,
         order,
         event: ExchangeOrderEvent,
-    ) -> dict[str, Decimal | None]:
+    ) -> FillDelta:
         local_filled = order.filled_quantity or Decimal("0")
         cumulative = event.cumulative_filled_quantity
         if cumulative is None:
@@ -329,10 +333,7 @@ class OrderEventApplier:
             return {"quantity": delta, "price": None}
 
         price = None
-        if (
-            event.last_fill_price is not None
-            and event.last_fill_quantity == delta
-        ):
+        if event.last_fill_price is not None and event.last_fill_quantity == delta:
             price = event.last_fill_price
         elif event.cumulative_average_price is not None:
             price = fill_delta_from_cumulative(
@@ -359,12 +360,8 @@ class OrderEventApplier:
     ) -> bool:
         if event_state not in {"filled", "liquidated"}:
             return False
-        has_fill_quantity = (
-            event.cumulative_filled_quantity is not None
-            or (
-                event.last_fill_quantity is not None
-                and event.last_fill_quantity > 0
-            )
+        has_fill_quantity = event.cumulative_filled_quantity is not None or (
+            event.last_fill_quantity is not None and event.last_fill_quantity > 0
         )
         if has_fill_quantity:
             return False
@@ -384,7 +381,7 @@ class OrderEventApplier:
         order,
         event: ExchangeOrderEvent,
         event_state: str,
-        fill_delta: dict[str, Decimal | None],
+        fill_delta: FillDelta,
     ) -> bool:
         if event_state not in {"filled", "liquidated"}:
             return False
@@ -432,10 +429,9 @@ class OrderEventApplier:
         order,
         event: ExchangeOrderEvent,
     ) -> bool:
-        return (
-            (order.filled_quantity or Decimal("0")) > 0
-            or (event.cumulative_filled_quantity or Decimal("0")) > 0
-        )
+        return (order.filled_quantity or Decimal("0")) > 0 or (
+            event.cumulative_filled_quantity or Decimal("0")
+        ) > 0
 
 
 def exchange_snapshot_to_order_event(product_id: str, snapshot) -> ExchangeOrderEvent:
