@@ -1,4 +1,5 @@
 """Strategy that replays pre-computed signals from a CSV file."""
+
 import csv
 import hashlib
 import io
@@ -7,6 +8,7 @@ from pathlib import Path
 from typing import Dict, Optional
 from src.strategies.base import BaseStrategy, StrategyRequirements
 from src.core.models import Candlestick, Signal, SignalType
+from src.core.strategy_context import StrategyContext
 
 
 def _parse_decimal(value: str, field_name: str = "") -> Optional[Decimal]:
@@ -114,7 +116,11 @@ class CsvSignalStrategy(BaseStrategy):
             self._source_digest,
         )
 
-    def on_candle(self, candle: Candlestick) -> Signal:
+    def on_candle(
+        self,
+        candle: Candlestick,
+        context: StrategyContext | None = None,
+    ) -> Signal:
         signal = self._signals.get(candle.timestamp)
         if signal is not None:
             return signal
