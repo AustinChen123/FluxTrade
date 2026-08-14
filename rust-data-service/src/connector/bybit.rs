@@ -175,56 +175,6 @@ impl BybitConnector {
     }
 
     #[allow(dead_code)]
-    fn parse_kline(&self, topic: &str, data: &Value) -> Result<Candlestick> {
-        let parts: Vec<&str> = topic.split('.').collect();
-        let timeframe = parts
-            .get(1)
-            .context("Missing timeframe in topic")?
-            .to_string();
-        let symbol = parts.get(2).context("Missing symbol in topic")?;
-
-        Ok(Candlestick {
-            product_id: format!("{}:{}-PERP", self.exchange_id, symbol),
-            timeframe,
-            timestamp: data
-                .get("start")
-                .context("start")?
-                .as_i64()
-                .context("start not i64")?,
-            open: data
-                .get("open")
-                .context("open")?
-                .as_str()
-                .context("open not str")?
-                .parse::<Decimal>()?,
-            high: data
-                .get("high")
-                .context("high")?
-                .as_str()
-                .context("high not str")?
-                .parse::<Decimal>()?,
-            low: data
-                .get("low")
-                .context("low")?
-                .as_str()
-                .context("low not str")?
-                .parse::<Decimal>()?,
-            close: data
-                .get("close")
-                .context("close")?
-                .as_str()
-                .context("close not str")?
-                .parse::<Decimal>()?,
-            volume: data
-                .get("volume")
-                .context("volume")?
-                .as_str()
-                .context("volume not str")?
-                .parse::<Decimal>()?,
-        })
-    }
-
-    #[allow(dead_code)]
     fn parse_trade(&self, data: &Value) -> Result<Trade> {
         let symbol = data.get("s").context("s")?.as_str().context("s not str")?;
 
@@ -257,6 +207,67 @@ impl BybitConnector {
             timestamp: data.get("T").context("T")?.as_i64().context("T not i64")?,
         })
     }
+}
+
+async fn forward_bybit_kline(
+    connector_id: &str,
+    topic: &str,
+    data: &Value,
+    tx: &mpsc::Sender<Candlestick>,
+) -> Result<()> {
+    match data.get("confirm").and_then(Value::as_bool) {
+        Some(false) => return Ok(()),
+        Some(true) => {}
+        None => anyhow::bail!("Bybit kline close flag is missing or invalid"),
+    }
+    let parts: Vec<&str> = topic.split('.').collect();
+    let symbol = parts.get(2).unwrap_or(&"UNKNOWN");
+    let timeframe = parts.get(1).unwrap_or(&"1");
+    let candle = Candlestick {
+        product_id: format!("{}:{}-PERP", connector_id, symbol),
+        timeframe: timeframe.to_string(),
+        timestamp: data
+            .get("start")
+            .context("start")?
+            .as_i64()
+            .context("start")?,
+        open: data
+            .get("open")
+            .context("open")?
+            .as_str()
+            .context("open")?
+            .parse()?,
+        high: data
+            .get("high")
+            .context("high")?
+            .as_str()
+            .context("high")?
+            .parse()?,
+        low: data
+            .get("low")
+            .context("low")?
+            .as_str()
+            .context("low")?
+            .parse()?,
+        close: data
+            .get("close")
+            .context("close")?
+            .as_str()
+            .context("close")?
+            .parse()?,
+        volume: data
+            .get("volume")
+            .context("volume")?
+            .as_str()
+            .context("volume")?
+            .parse()?,
+    };
+    if let Err(error) = candle.validate() {
+        warn!("Invalid Bybit candle: {}", error);
+    } else {
+        tx.send(candle).await.ok();
+    }
+    Ok(())
 }
 
 #[async_trait]
@@ -437,58 +448,14 @@ impl ExchangeConnector for BybitConnector {
                                         if let Some(data_list) =
                                             v.get("data").and_then(|d| d.as_array())
                                         {
-                                            let parts: Vec<&str> = topic.split('.').collect();
-                                            let symbol = parts.get(2).unwrap_or(&"UNKNOWN");
-                                            let tf = parts.get(1).unwrap_or(&"1");
-
                                             for data in data_list {
-                                                let candle = Candlestick {
-                                                    product_id: format!(
-                                                        "{}:{}-PERP",
-                                                        connector_id, symbol
-                                                    ),
-                                                    timeframe: tf.to_string(),
-                                                    timestamp: data
-                                                        .get("start")
-                                                        .context("start")?
-                                                        .as_i64()
-                                                        .context("start")?,
-                                                    open: data
-                                                        .get("open")
-                                                        .context("open")?
-                                                        .as_str()
-                                                        .context("open")?
-                                                        .parse::<Decimal>()?,
-                                                    high: data
-                                                        .get("high")
-                                                        .context("high")?
-                                                        .as_str()
-                                                        .context("high")?
-                                                        .parse::<Decimal>()?,
-                                                    low: data
-                                                        .get("low")
-                                                        .context("low")?
-                                                        .as_str()
-                                                        .context("low")?
-                                                        .parse::<Decimal>()?,
-                                                    close: data
-                                                        .get("close")
-                                                        .context("close")?
-                                                        .as_str()
-                                                        .context("close")?
-                                                        .parse::<Decimal>()?,
-                                                    volume: data
-                                                        .get("volume")
-                                                        .context("volume")?
-                                                        .as_str()
-                                                        .context("volume")?
-                                                        .parse::<Decimal>()?,
-                                                };
-                                                if let Err(e) = candle.validate() {
-                                                    warn!("Invalid Bybit candle: {}", e);
-                                                } else {
-                                                    tx.send(candle).await.ok();
-                                                }
+                                                forward_bybit_kline(
+                                                    &connector_id,
+                                                    topic,
+                                                    data,
+                                                    &tx,
+                                                )
+                                                .await?;
                                             }
                                         }
                                     }
@@ -696,13 +663,14 @@ mod tests {
         assert!(!main.contains("run_bybit_connector"));
         assert!(!main.contains("BybitConnector::new"));
         assert_eq!(runtime.matches("super::bybit::run(").count(), 1);
+        assert_eq!(production.matches("forward_bybit_kline(").count(), 2);
     }
 
-    #[test]
-    fn test_bybit_parse_kline() {
-        let connector = BybitConnector::new();
+    #[tokio::test]
+    async fn bybit_forwards_only_provider_closed_klines() {
+        let (tx, mut rx) = mpsc::channel(4);
         let topic = "kline.1.BTCUSDT";
-        let data = json!({
+        let mut data = json!({
             "start": 1672324800000i64,
             "end": 1672324859999i64,
             "interval": "1",
@@ -715,10 +683,49 @@ mod tests {
             "turnover": "1659.93"
         });
 
-        let candle = connector.parse_kline(topic, &data).unwrap();
+        forward_bybit_kline("BYBIT", topic, &data, &tx)
+            .await
+            .unwrap();
+        forward_bybit_kline("BYBIT", topic, &data, &tx)
+            .await
+            .unwrap();
+        assert!(rx.try_recv().is_err());
+
+        data["confirm"] = json!(true);
+        forward_bybit_kline("BYBIT", topic, &data, &tx)
+            .await
+            .unwrap();
+        let candle = rx.try_recv().unwrap();
         assert_eq!(candle.product_id, "BYBIT:BTCUSDT-PERP");
         assert_eq!(candle.timeframe, "1");
+        assert_eq!(candle.timestamp, 1672324800000i64);
+        assert_eq!(candle.open, "16599.4".parse::<Decimal>().unwrap());
+        assert_eq!(candle.high, "16599.4".parse::<Decimal>().unwrap());
+        assert_eq!(candle.low, "16599.3".parse::<Decimal>().unwrap());
         assert_eq!(candle.close, "16599.3".parse::<Decimal>().unwrap());
+        assert_eq!(candle.volume, "0.1".parse::<Decimal>().unwrap());
+        assert!(rx.try_recv().is_err());
+
+        for invalid in [Value::Null, json!("true")] {
+            data["confirm"] = invalid;
+            let error = forward_bybit_kline("BYBIT", topic, &data, &tx)
+                .await
+                .unwrap_err();
+            assert_eq!(
+                error.to_string(),
+                "Bybit kline close flag is missing or invalid"
+            );
+            assert!(rx.try_recv().is_err());
+        }
+        data.as_object_mut().unwrap().remove("confirm");
+        assert_eq!(
+            forward_bybit_kline("BYBIT", topic, &data, &tx)
+                .await
+                .unwrap_err()
+                .to_string(),
+            "Bybit kline close flag is missing or invalid"
+        );
+        assert!(rx.try_recv().is_err());
     }
 
     #[test]

@@ -422,64 +422,43 @@ impl BinanceConnector {
     }
 
     #[allow(dead_code)]
-    fn parse_kline(&self, v: &Value) -> Result<Candlestick> {
-        let k = v.get("k").context("Missing 'k' field in kline")?;
-        let symbol = v
-            .get("s")
-            .context("Missing 's'")?
-            .as_str()
-            .context("s not string")?;
-
-        Ok(Candlestick {
-            product_id: format!("{}:{}-PERP", self.exchange_id, symbol),
-            timeframe: k
-                .get("i")
-                .context("Missing 'i'")?
-                .as_str()
-                .context("i not string")?
-                .to_string(),
-            timestamp: k
-                .get("t")
-                .context("Missing 't'")?
-                .as_i64()
-                .context("t not i64")?,
-            open: k
-                .get("o")
-                .context("Missing 'o'")?
-                .as_str()
-                .context("o not string")?
-                .parse::<Decimal>()?,
-            high: k
-                .get("h")
-                .context("Missing 'h'")?
-                .as_str()
-                .context("h not string")?
-                .parse::<Decimal>()?,
-            low: k
-                .get("l")
-                .context("Missing 'l'")?
-                .as_str()
-                .context("l not string")?
-                .parse::<Decimal>()?,
-            close: k
-                .get("c")
-                .context("Missing 'c'")?
-                .as_str()
-                .context("c not string")?
-                .parse::<Decimal>()?,
-            volume: k
-                .get("v")
-                .context("Missing 'v'")?
-                .as_str()
-                .context("v not string")?
-                .parse::<Decimal>()?,
-        })
-    }
-
-    #[allow(dead_code)]
     fn parse_trade(&self, v: &Value) -> Result<Trade> {
         parse_trade_from_json(v, &self.exchange_id)
     }
+}
+
+async fn forward_binance_kline(
+    exchange_id: &str,
+    timeframe: &str,
+    data: &Value,
+    tx: &mpsc::Sender<Candlestick>,
+) -> Result<()> {
+    let k = data.get("k").context("k")?;
+    match k.get("x").and_then(Value::as_bool) {
+        Some(false) => return Ok(()),
+        Some(true) => {}
+        None => anyhow::bail!("Binance kline close flag is missing or invalid"),
+    }
+    let candle = Candlestick {
+        product_id: format!(
+            "{}:{}-PERP",
+            exchange_id,
+            data.get("s").context("s")?.as_str().context("s")?
+        ),
+        timeframe: timeframe.to_string(),
+        timestamp: k.get("t").context("t")?.as_i64().context("t")?,
+        open: k.get("o").context("o")?.as_str().context("o")?.parse()?,
+        high: k.get("h").context("h")?.as_str().context("h")?.parse()?,
+        low: k.get("l").context("l")?.as_str().context("l")?.parse()?,
+        close: k.get("c").context("c")?.as_str().context("c")?.parse()?,
+        volume: k.get("v").context("v")?.as_str().context("v")?.parse()?,
+    };
+    if let Err(error) = candle.validate() {
+        warn!("Invalid candle received: {}", error);
+    } else {
+        tx.send(candle).await.ok();
+    }
+    Ok(())
 }
 
 #[async_trait]
@@ -584,58 +563,13 @@ impl ExchangeConnector for BinanceConnector {
                                 let v: Value = serde_json::from_str(&text)?;
                                 if let Some(data) = v.get("data") {
                                     if data.get("e") == Some(&Value::String("kline".to_string())) {
-                                        let k = data.get("k").context("k")?;
-                                        let candle = Candlestick {
-                                            product_id: format!(
-                                                "{}:{}-PERP",
-                                                exchange_id,
-                                                data.get("s")
-                                                    .context("s")?
-                                                    .as_str()
-                                                    .context("s")?
-                                            ),
-                                            timeframe: timeframe_str,
-                                            timestamp: k
-                                                .get("t")
-                                                .context("t")?
-                                                .as_i64()
-                                                .context("t")?,
-                                            open: k
-                                                .get("o")
-                                                .context("o")?
-                                                .as_str()
-                                                .context("o")?
-                                                .parse::<Decimal>()?,
-                                            high: k
-                                                .get("h")
-                                                .context("h")?
-                                                .as_str()
-                                                .context("h")?
-                                                .parse::<Decimal>()?,
-                                            low: k
-                                                .get("l")
-                                                .context("l")?
-                                                .as_str()
-                                                .context("l")?
-                                                .parse::<Decimal>()?,
-                                            close: k
-                                                .get("c")
-                                                .context("c")?
-                                                .as_str()
-                                                .context("c")?
-                                                .parse::<Decimal>()?,
-                                            volume: k
-                                                .get("v")
-                                                .context("v")?
-                                                .as_str()
-                                                .context("v")?
-                                                .parse::<Decimal>()?,
-                                        };
-                                        if let Err(e) = candle.validate() {
-                                            warn!("Invalid candle received: {}", e);
-                                        } else {
-                                            tx.send(candle).await.ok();
-                                        }
+                                        forward_binance_kline(
+                                            &exchange_id,
+                                            &timeframe_str,
+                                            data,
+                                            &tx,
+                                        )
+                                        .await?;
                                     }
                                 }
                             }
@@ -889,12 +823,13 @@ mod tests {
         let source = include_str!("binance.rs");
         let production = source.split_once("#[cfg(test)]").unwrap().0;
         assert!(!production.contains("std::future::pending::<()>().await;"));
+        assert_eq!(production.matches("forward_binance_kline(").count(), 2);
     }
 
-    #[test]
-    fn test_binance_parse_kline() {
-        let connector = BinanceConnector::new();
-        let kline_json = json!({
+    #[tokio::test]
+    async fn binance_forwards_only_provider_closed_klines() {
+        let (tx, mut rx) = mpsc::channel(4);
+        let mut kline = json!({
             "e": "kline",
             "E": 123456789,
             "s": "BTCUSDT",
@@ -919,10 +854,49 @@ mod tests {
             }
         });
 
-        let candle = connector.parse_kline(&kline_json).unwrap();
+        forward_binance_kline("BINANCE", "1m", &kline, &tx)
+            .await
+            .unwrap();
+        forward_binance_kline("BINANCE", "1m", &kline, &tx)
+            .await
+            .unwrap();
+        assert!(rx.try_recv().is_err());
+
+        kline["k"]["x"] = json!(true);
+        forward_binance_kline("BINANCE", "1m", &kline, &tx)
+            .await
+            .unwrap();
+        let candle = rx.try_recv().unwrap();
         assert_eq!(candle.product_id, "BINANCE:BTCUSDT-PERP");
         assert_eq!(candle.timeframe, "1m");
+        assert_eq!(candle.timestamp, 1600000000000i64);
         assert_eq!(candle.open, "50000.00".parse::<Decimal>().unwrap());
+        assert_eq!(candle.high, "51000.00".parse::<Decimal>().unwrap());
+        assert_eq!(candle.low, "49000.00".parse::<Decimal>().unwrap());
+        assert_eq!(candle.close, "50500.00".parse::<Decimal>().unwrap());
+        assert_eq!(candle.volume, "10.5".parse::<Decimal>().unwrap());
+        assert!(rx.try_recv().is_err());
+
+        for invalid in [Value::Null, json!("true")] {
+            kline["k"]["x"] = invalid;
+            let error = forward_binance_kline("BINANCE", "1m", &kline, &tx)
+                .await
+                .unwrap_err();
+            assert_eq!(
+                error.to_string(),
+                "Binance kline close flag is missing or invalid"
+            );
+            assert!(rx.try_recv().is_err());
+        }
+        kline["k"].as_object_mut().unwrap().remove("x");
+        assert_eq!(
+            forward_binance_kline("BINANCE", "1m", &kline, &tx)
+                .await
+                .unwrap_err()
+                .to_string(),
+            "Binance kline close flag is missing or invalid"
+        );
+        assert!(rx.try_recv().is_err());
     }
 
     #[test]

@@ -486,6 +486,39 @@ impl BackpackConnector {
     }
 }
 
+async fn forward_backpack_kline(
+    timeframe: &str,
+    data: &Value,
+    tx: &mpsc::Sender<Candlestick>,
+) -> Result<()> {
+    match data.get("X").and_then(Value::as_bool) {
+        Some(false) => return Ok(()),
+        Some(true) => {}
+        None => anyhow::bail!("Backpack kline close flag is missing or invalid"),
+    }
+    let timestamp = BackpackConnector::parse_iso8601_to_ms(
+        data.get("t").context("t")?.as_str().context("t not str")?,
+    )?;
+    let candle = Candlestick {
+        product_id: product_id_from_market_symbol(
+            data.get("s").context("s")?.as_str().context("s")?,
+        )?,
+        timeframe: timeframe.to_string(),
+        timestamp,
+        open: data.get("o").context("o")?.as_str().context("o")?.parse()?,
+        high: data.get("h").context("h")?.as_str().context("h")?.parse()?,
+        low: data.get("l").context("l")?.as_str().context("l")?.parse()?,
+        close: data.get("c").context("c")?.as_str().context("c")?.parse()?,
+        volume: data.get("v").context("v")?.as_str().context("v")?.parse()?,
+    };
+    if let Err(error) = candle.validate() {
+        warn!("Invalid Backpack candle: {}", error);
+    } else {
+        tx.send(candle).await.ok();
+    }
+    Ok(())
+}
+
 #[async_trait]
 impl ExchangeConnector for BackpackConnector {
     async fn connect(&mut self) -> Result<()> {
@@ -637,59 +670,7 @@ impl ExchangeConnector for BackpackConnector {
                                 let v: Value = serde_json::from_str(&text)?;
                                 if let Some(data) = v.get("data") {
                                     if data.get("e") == Some(&Value::String("kline".to_string())) {
-                                        let ts_str = data
-                                            .get("t")
-                                            .context("t")?
-                                            .as_str()
-                                            .context("t not str")?;
-                                        let timestamp =
-                                            BackpackConnector::parse_iso8601_to_ms(ts_str)?;
-
-                                        let candle = Candlestick {
-                                            product_id: product_id_from_market_symbol(
-                                                data.get("s")
-                                                    .context("s")?
-                                                    .as_str()
-                                                    .context("s")?,
-                                            )?,
-                                            timeframe: timeframe_str, // Use the cloned String
-                                            timestamp,
-                                            open: data
-                                                .get("o")
-                                                .context("o")?
-                                                .as_str()
-                                                .context("o")?
-                                                .parse::<Decimal>()?,
-                                            high: data
-                                                .get("h")
-                                                .context("h")?
-                                                .as_str()
-                                                .context("h")?
-                                                .parse::<Decimal>()?,
-                                            low: data
-                                                .get("l")
-                                                .context("l")?
-                                                .as_str()
-                                                .context("l")?
-                                                .parse::<Decimal>()?,
-                                            close: data
-                                                .get("c")
-                                                .context("c")?
-                                                .as_str()
-                                                .context("c")?
-                                                .parse::<Decimal>()?,
-                                            volume: data
-                                                .get("v")
-                                                .context("v")?
-                                                .as_str()
-                                                .context("v")?
-                                                .parse::<Decimal>()?,
-                                        };
-                                        if let Err(e) = candle.validate() {
-                                            warn!("Invalid Backpack candle: {}", e);
-                                        } else {
-                                            tx.send(candle).await.ok();
-                                        }
+                                        forward_backpack_kline(&timeframe_str, data, &tx).await?;
                                     }
                                 }
                             }
@@ -1023,6 +1004,7 @@ mod tests {
         ] {
             assert!(!production.contains(legacy), "{legacy}");
         }
+        assert_eq!(production.matches("forward_backpack_kline(").count(), 2);
     }
 
     #[test]
@@ -1030,6 +1012,58 @@ mod tests {
         let ts = BackpackConnector::parse_iso8601_to_ms("2026-01-22T21:19:00").unwrap();
         // 2026-01-22 21:19:00 UTC
         assert_eq!(ts, 1769116740000i64);
+    }
+
+    #[tokio::test]
+    async fn backpack_forwards_only_provider_closed_klines() {
+        let (tx, mut rx) = mpsc::channel(4);
+        let mut data = json!({
+            "e": "kline",
+            "s": "SOL_USDC_PERP",
+            "t": "2026-01-22T21:19:00",
+            "o": "128.50",
+            "h": "129.00",
+            "l": "128.25",
+            "c": "128.75",
+            "v": "10.5",
+            "X": false
+        });
+
+        forward_backpack_kline("1m", &data, &tx).await.unwrap();
+        forward_backpack_kline("1m", &data, &tx).await.unwrap();
+        assert!(rx.try_recv().is_err());
+
+        data["X"] = json!(true);
+        forward_backpack_kline("1m", &data, &tx).await.unwrap();
+        let candle = rx.try_recv().unwrap();
+        assert_eq!(candle.product_id, "BACKPACK:SOL_USDC-PERP");
+        assert_eq!(candle.timeframe, "1m");
+        assert_eq!(candle.timestamp, 1769116740000i64);
+        assert_eq!(candle.open, "128.50".parse::<Decimal>().unwrap());
+        assert_eq!(candle.high, "129.00".parse::<Decimal>().unwrap());
+        assert_eq!(candle.low, "128.25".parse::<Decimal>().unwrap());
+        assert_eq!(candle.close, "128.75".parse::<Decimal>().unwrap());
+        assert_eq!(candle.volume, "10.5".parse::<Decimal>().unwrap());
+        assert!(rx.try_recv().is_err());
+
+        for invalid in [Value::Null, json!("true")] {
+            data["X"] = invalid;
+            let error = forward_backpack_kline("1m", &data, &tx).await.unwrap_err();
+            assert_eq!(
+                error.to_string(),
+                "Backpack kline close flag is missing or invalid"
+            );
+            assert!(rx.try_recv().is_err());
+        }
+        data.as_object_mut().unwrap().remove("X");
+        assert_eq!(
+            forward_backpack_kline("1m", &data, &tx)
+                .await
+                .unwrap_err()
+                .to_string(),
+            "Backpack kline close flag is missing or invalid"
+        );
+        assert!(rx.try_recv().is_err());
     }
 
     #[test]
