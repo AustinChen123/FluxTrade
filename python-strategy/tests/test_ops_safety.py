@@ -1402,6 +1402,22 @@ class TestLocalFetchFailureIsolation:
         assert result["flattened_positions"] == 0
         assert not any(c[0] == "flatten_position" for c in engine.calls)
 
+    def test_non_iterable_adapter_positions_are_classified_as_unavailable(self):
+        class InvalidAdapter:
+            def get_all_positions(self) -> int:
+                return 7
+
+        service, _ = _make_service_with_failing_account(adapter=InvalidAdapter())
+
+        result = service.kill_switch(actor="ops")
+
+        assert result["flattened_positions"] == 0
+        assert any(
+            "exchange position enumeration must return an iterable"
+            in failure.get("reason", "")
+            for failure in result["flatten_failures"]
+        )
+
 
 @pytest.mark.parametrize(
     "local_ok, adapter_has_enum, expected_flattened, expect_local_error_entry",

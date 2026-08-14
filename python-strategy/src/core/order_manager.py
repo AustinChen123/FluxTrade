@@ -1,9 +1,9 @@
 import logging
 import uuid
 import os
-import redis
 from decimal import Decimal
 from typing import Optional
+from redis.exceptions import ResponseError
 from src.core.orm_models import Order, Trade
 from src.core.models import Signal, OrderSide, OrderStatus
 from src.core.clock import Clock
@@ -228,7 +228,10 @@ class OrderManager:
         if not self.is_backtest:
             try:
                 account_id = "main"
-                self.update_position_script(
+                update_position_script = self.update_position_script
+                if update_position_script is None:
+                    raise RuntimeError("Redis update position script unavailable")
+                update_position_script(
                     args=[
                         account_id,
                         order.strategy_id,
@@ -242,7 +245,7 @@ class OrderManager:
                     ]
                 )
                 logger.info("Redis: Atomic %s Successful (Trade %s)", log_label, trade_id)
-            except redis.exceptions.ResponseError as e:
+            except ResponseError as e:
                 logger.error("FATAL: Redis Lua Script Error: %s", e)
                 raise RuntimeError(f"Critical State Corruption: {e}")
             except Exception as e:

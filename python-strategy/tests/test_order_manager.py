@@ -574,6 +574,40 @@ class TestOrderManagerLiveMode:
         mock_script.assert_called_once()
         assert order.status == "closed"
 
+    def test_live_fill_requires_registered_lua_script(
+        self,
+        mock_clock,
+        signal_factory,
+        sqlite_order_session_factory,
+    ):
+        from src.core.repositories import LiveOrderRepository
+
+        repo = LiveOrderRepository(db_session_factory=sqlite_order_session_factory)
+        mock_redis = MagicMock()
+        mock_redis.register_script.return_value = MagicMock()
+
+        with (
+            patch(
+                "src.core.order_manager.create_redis_client", return_value=mock_redis
+            ),
+            patch("builtins.open", MagicMock()),
+        ):
+            order_manager = OrderManager(repo, mock_clock, is_backtest=False)
+
+        order_manager.update_position_script = None
+        signal = signal_factory()
+        order = order_manager.create_order(
+            signal,
+            OrderSide.BUY,
+            "market",
+            Decimal("0.1"),
+        )
+
+        with pytest.raises(
+            RuntimeError, match="Redis update position script unavailable"
+        ):
+            order_manager.fill_order(order, Decimal("42000"), Decimal("0.1"))
+
     def test_live_fill_lua_error_raises_runtime(
         self,
         mock_clock,

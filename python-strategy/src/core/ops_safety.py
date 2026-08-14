@@ -15,6 +15,7 @@ Implementation notes for the implementer:
 
 from __future__ import annotations
 
+from collections.abc import Iterable
 from copy import deepcopy
 import logging
 import threading
@@ -518,7 +519,12 @@ class OpsSafetyService:
                 if not callable(method):
                     continue
                 try:
-                    exchange_positions = list(method())
+                    raw_positions = method()
+                    if not isinstance(raw_positions, Iterable):
+                        raise TypeError(
+                            "exchange position enumeration must return an iterable"
+                        )
+                    exchange_positions = list(raw_positions)
                 except Exception as exc:
                     adapter_errors.append(exc)
                     continue

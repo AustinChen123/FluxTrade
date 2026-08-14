@@ -81,6 +81,14 @@ class TestCheckDatabase:
         assert result.status == ComponentStatus.UNHEALTHY
         assert "OperationalError" in result.message
 
+    def test_missing_database_session_is_explicitly_unhealthy(self, healthy_redis):
+        checker = HealthChecker(healthy_redis, None)
+
+        result = checker.check_database()
+
+        assert result.status == ComponentStatus.UNHEALTHY
+        assert result.message == "database session unavailable"
+
 
 class TestCheckExchange:
     def test_healthy_exchange(self, healthy_redis, healthy_db, healthy_adapter):

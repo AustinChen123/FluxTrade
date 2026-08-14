@@ -7,6 +7,7 @@ import re
 import threading
 import time
 from dataclasses import dataclass
+from typing import Callable
 
 
 MAX_CANONICAL_LENGTH = 128
@@ -29,7 +30,7 @@ def generate_client_order_id(
     instance_id: str,
     action: str,
     *,
-    clock_ns: callable | None = None,
+    clock_ns: Callable[[], int] | None = None,
 ) -> str:
     """Generate a canonical client order ID: strategy-instance-action-ts_ns."""
     _validate_component("strategy_id", strategy_id)
@@ -120,7 +121,7 @@ def _validate_component(name: str, value: str) -> None:
         raise ValueError(f"{name} contains unsupported characters")
 
 
-def _next_ts_ns(clock_ns: callable) -> int:
+def _next_ts_ns(clock_ns: Callable[[], int]) -> int:
     global _last_ts_ns
     with _lock:
         ts_ns = int(clock_ns())
