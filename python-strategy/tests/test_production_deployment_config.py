@@ -36,6 +36,7 @@ def _required_env() -> dict[str, str]:
         "GRAFANA_PASSWORD": "grafana-secret",
         "EXCHANGE_ENABLED": "binance",
         "EXCHANGE_ID": "binance",
+        "INSTRUMENT_PRODUCT_IDS": "BINANCE:BTCUSDT-PERP",
         "MARKET_DATA_SYMBOLS": "BTCUSDT",
         "FLUXTRADE_SECRETS_DIR": "/private/tmp/fluxtrade-test-secrets",
         "EXCHANGE_API_KEY": "exchange-key",
@@ -137,6 +138,7 @@ def test_production_compose_requires_sensitive_env_vars():
     assert "${AUDIT_EXTERNAL_ORDERS:?AUDIT_EXTERNAL_ORDERS is required}" in text
     assert "${EXCHANGE_ENABLED:?EXCHANGE_ENABLED is required}" in text
     assert "${EXCHANGE_ID:?EXCHANGE_ID is required}" in text
+    assert "${INSTRUMENT_PRODUCT_IDS:?INSTRUMENT_PRODUCT_IDS is required}" in text
     assert "${MARKET_DATA_SYMBOLS:?MARKET_DATA_SYMBOLS is required}" in text
     assert "${FLUXTRADE_SECRETS_DIR:?FLUXTRADE_SECRETS_DIR is required}" in text
 
@@ -152,6 +154,7 @@ def test_production_compose_requires_sensitive_env_vars():
         "AUDIT_EXTERNAL_ORDERS",
         "EXCHANGE_ENABLED",
         "EXCHANGE_ID",
+        "INSTRUMENT_PRODUCT_IDS",
         "MARKET_DATA_SYMBOLS",
         "FLUXTRADE_SECRETS_DIR",
     ],
@@ -196,7 +199,9 @@ def test_production_compose_passes_required_auth_to_services(tmp_path: Path):
     assert "--requirepass" in redis_command
     assert "redis-cli -a" in redis_healthcheck
     assert services["dashboard"]["environment"]["DASHBOARD_AUTH_REQUIRED"] == "true"
-    assert services["dashboard"]["environment"]["DASHBOARD_PASSWORD"] == "dashboard-secret"
+    assert (
+        services["dashboard"]["environment"]["DASHBOARD_PASSWORD"] == "dashboard-secret"
+    )
     assert (
         services["control-plane"]["environment"]["CONTROL_PLANE_API_KEY"]
         == "control-plane-secret"
@@ -210,9 +215,7 @@ def test_production_compose_passes_required_auth_to_services(tmp_path: Path):
         == "https://fluxtrade.example.ts.net"
     )
     assert (
-        services["control-plane"]["environment"][
-            "CONTROL_PLANE_OPERATOR_CAPABILITY"
-        ]
+        services["control-plane"]["environment"]["CONTROL_PLANE_OPERATOR_CAPABILITY"]
         == "example.com/cap/fluxtrade-operator"
     )
     assert (
@@ -220,10 +223,7 @@ def test_production_compose_passes_required_auth_to_services(tmp_path: Path):
         == "example.com/cap/fluxtrade-step-up"
     )
     assert services["rust-data"]["environment"]["FLUXTRADE_ENVIRONMENT"] == "live"
-    assert (
-        services["python-strategy"]["environment"]["FLUXTRADE_ENVIRONMENT"]
-        == "live"
-    )
+    assert services["python-strategy"]["environment"]["FLUXTRADE_ENVIRONMENT"] == "live"
     assert (
         services["python-strategy"]["environment"]["MARKET_PENDING_CLAIM_IDLE_MS"]
         == "60000"
@@ -245,12 +245,37 @@ def test_production_compose_wires_runtime_configuration_without_demo_overrides(
     assert rust_data["command"] == ["live"]
     assert rust_data["environment"]["EXCHANGE_ENABLED"] == "binance"
     assert rust_data["environment"]["EXCHANGE_ID"] == "binance"
+    assert rust_data["environment"]["INSTRUMENT_PRODUCT_IDS"] == "BINANCE:BTCUSDT-PERP"
     assert rust_data["environment"]["MARKET_DATA_SYMBOLS"] == "BTCUSDT"
     assert strategy["environment"]["ADAPTER_MODE"] == "simulated"
     assert strategy["environment"]["AUDIT_EXTERNAL_ORDERS"] == "false"
     assert strategy["environment"]["EXCHANGE_API_KEY"] == "exchange-key"
     assert strategy["environment"]["EXCHANGE_SECRET"] == "exchange-secret"
+    assert (
+        strategy["environment"]["INSTRUMENT_PRODUCT_IDS"]
+        == rust_data["environment"]["INSTRUMENT_PRODUCT_IDS"]
+    )
     assert "BINANCE_SECRET" not in strategy["environment"]
+
+
+@pytest.mark.integration
+def test_production_compose_passes_backpack_market_symbols_only_to_rust_data(
+    tmp_path: Path,
+):
+    omitted = _compose_config(tmp_path)["services"]
+    assert omitted["rust-data"]["environment"]["BACKPACK_MARKET_DATA_SYMBOLS"] == ""
+
+    configured_env = _required_env()
+    configured_env["BACKPACK_MARKET_DATA_SYMBOLS"] = "BTC_USDC_PERP"
+    configured = _compose_config(tmp_path, configured_env)["services"]
+    assert (
+        configured["rust-data"]["environment"]["BACKPACK_MARKET_DATA_SYMBOLS"]
+        == "BTC_USDC_PERP"
+    )
+    assert (
+        "BACKPACK_MARKET_DATA_SYMBOLS"
+        not in configured["python-strategy"]["environment"]
+    )
 
 
 def test_compose_test_environment_excludes_all_interpolated_shell_values(
@@ -299,10 +324,7 @@ def test_production_compose_runs_persistent_control_plane(tmp_path: Path):
         control_plane["environment"]["CONTROL_PLANE_JOB_DB_PATH"]
         == "/app/data/jobs.sqlite3"
     )
-    assert any(
-        volume["target"] == "/app/data"
-        for volume in control_plane["volumes"]
-    )
+    assert any(volume["target"] == "/app/data" for volume in control_plane["volumes"])
     assert control_plane["healthcheck"]["test"][0:2] == ["CMD", "python"]
 
 
