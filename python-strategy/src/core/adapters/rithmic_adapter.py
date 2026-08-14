@@ -1,7 +1,25 @@
+from __future__ import annotations
+
 import logging
 import threading
 from decimal import Decimal, InvalidOperation
-from typing import Callable
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from src.core.adapters.rithmic_native_types import (
+        RithmicOrderClient,
+        RithmicOrderClientFactory,
+    )
+
+    def _load_rithmic_order_client_factory() -> RithmicOrderClientFactory: ...
+
+else:
+
+    def _load_rithmic_order_client_factory():
+        from fluxtrade_core import RithmicOrderClient
+
+        return RithmicOrderClient
+
 
 from src.core.adapters.rithmic_ledger_position import (
     project_rithmic_ledger_positions,
@@ -54,7 +72,7 @@ class RithmicExchangeAdapter(IExchangeAdapter):
         profile: str,
         account_id: str | None,
         instruments: dict[str, dict],
-        client_factory: Callable | None = None,
+        client_factory: RithmicOrderClientFactory | None = None,
     ):
         if not profile.strip():
             raise ExchangeError("rithmic_profile_required")
@@ -66,7 +84,7 @@ class RithmicExchangeAdapter(IExchangeAdapter):
         self.account_id = account_id.strip()
         self.logger = logging.getLogger("RithmicAdapter")
         self._client_factory = client_factory
-        self._client = None
+        self._client: RithmicOrderClient | None = None
         self._client_lock = threading.Lock()
         self._client_order_ids_lock = threading.Lock()
         self._submitted_client_order_ids: set[str] = set()
@@ -145,9 +163,7 @@ class RithmicExchangeAdapter(IExchangeAdapter):
                 return
             factory = self._client_factory
             if factory is None:
-                from fluxtrade_core import RithmicOrderClient
-
-                factory = RithmicOrderClient
+                factory = _load_rithmic_order_client_factory()
             try:
                 self._client = factory(self.profile, self.account_id)
             except RuntimeError as error:
@@ -479,7 +495,7 @@ class RithmicExchangeAdapter(IExchangeAdapter):
         with self._client_lock:
             return self._require_client().connection_generation()
 
-    def _require_client(self):
+    def _require_client(self) -> RithmicOrderClient:
         if self._client is None:
             raise NetworkError("rithmic_order_stream_not_started")
         return self._client
