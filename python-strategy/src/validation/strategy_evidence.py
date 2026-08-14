@@ -14,8 +14,8 @@ from pathlib import Path
 from typing import IO, Any, Callable, Iterable, Iterator, Protocol
 
 from fluxtrade_core import (
-    CandleAggregator,  # pyright: ignore[reportAttributeAccessIssue]
-    Candlestick as RustCandlestick,  # pyright: ignore[reportAttributeAccessIssue]
+    CandleAggregator,
+    Candlestick as RustCandlestick,
 )
 
 from src.core.models import Candlestick, Signal, SignalType

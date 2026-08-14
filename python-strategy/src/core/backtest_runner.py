@@ -18,8 +18,8 @@ from typing import (
 from decimal import Decimal
 from sqlalchemy.orm import Session
 from fluxtrade_core import (
-    CandleAggregator,  # pyright: ignore[reportAttributeAccessIssue]
-    Candlestick as RustCandlestick,  # pyright: ignore[reportAttributeAccessIssue]
+    CandleAggregator,
+    Candlestick as RustCandlestick,
 )
 from src.core.db import SessionLocal
 from src.core.orm_models import Strategy as StrategyORM, BacktestResultSummary, BacktestTradeLog
