@@ -581,24 +581,16 @@ def test_rithmic_config_never_calls_ccxt_credential_owner(
         rithmic_owner.assert_not_called()
 
 
-@pytest.mark.parametrize(
-    ("exchange", "product_id"),
-    [
-        ("kraken", "KRAKEN:BTCUSDT-PERP"),
-    ],
-)
-def test_non_rithmic_live_config_delegates_to_ccxt_owner_once(
+def test_generic_live_config_fails_closed_before_ccxt_owner(
     monkeypatch,
-    exchange,
-    product_id,
 ) -> None:
     _set_live_ccxt_env(monkeypatch)
-    monkeypatch.setenv("EXCHANGE_ID", exchange)
-    monkeypatch.setenv("INSTRUMENT_PRODUCT_IDS", product_id)
+    monkeypatch.setenv("EXCHANGE_ID", "kraken")
+    monkeypatch.setenv("INSTRUMENT_PRODUCT_IDS", "KRAKEN:BTCUSDT-PERP")
+    product_id = "KRAKEN:BTCUSDT-PERP"
     products = [product_id]
     monkeypatch.setattr(strategy_main, "_env_csv", lambda _name: products)
-    owner_result = {"api_key": object(), "secret": object(), "testnet": object()}
-    owner = MagicMock(return_value=owner_result)
+    owner = MagicMock(side_effect=AssertionError("CCXT owner called"))
     rithmic_owner = MagicMock(side_effect=AssertionError("Rithmic owner called"))
     monkeypatch.setattr(
         "src.core.adapters.ccxt_live_credentials.build_ccxt_live_credentials",
@@ -609,37 +601,42 @@ def test_non_rithmic_live_config_delegates_to_ccxt_owner_once(
         rithmic_owner,
     )
 
-    config = strategy_main._adapter_config_from_env()
+    with pytest.raises(ValueError) as raised:
+        strategy_main._adapter_config_from_env()
 
-    owner.assert_called_once_with(strategy_main.os.environ)
-    assert {name: config[name] for name in owner_result} == owner_result
-    assert config["instrument_product_ids"] is products
-    assert config["account_initialization"]["product_ids"] is products
+    assert raised.value.args == (
+        "unsupported_or_unavailable_live_execution_venue: exchange=kraken",
+    )
+    owner.assert_not_called()
     rithmic_owner.assert_not_called()
 
 
-def test_ccxt_credential_owner_failure_precedes_audit_and_initialization(
+def test_incomplete_live_venue_precedes_audit_and_initialization(
     monkeypatch,
 ) -> None:
     _set_live_ccxt_env(monkeypatch)
     monkeypatch.setenv("EXCHANGE_ID", "kraken")
     monkeypatch.setenv("INSTRUMENT_PRODUCT_IDS", "KRAKEN:BTCUSDT-PERP")
-    sentinel = RuntimeError("ccxt-credential-owner-sentinel")
-    owner = MagicMock(side_effect=sentinel)
+    owner = MagicMock(side_effect=AssertionError("CCXT owner called"))
     audit_reader = MagicMock(side_effect=AssertionError("audit read"))
     initialization = _forbid_runtime_initialization(monkeypatch)
+    adapter_factory = MagicMock(side_effect=AssertionError("adapter created"))
     monkeypatch.setattr(
         "src.core.adapters.ccxt_live_credentials.build_ccxt_live_credentials",
         owner,
     )
     monkeypatch.setattr(strategy_main, "_required_env_flag", audit_reader)
+    monkeypatch.setattr(strategy_main, "create_adapter", adapter_factory)
 
-    with pytest.raises(RuntimeError) as raised:
+    with pytest.raises(ValueError) as raised:
         strategy_main.main()
 
-    assert raised.value is sentinel
-    owner.assert_called_once_with(strategy_main.os.environ)
+    assert raised.value.args == (
+        "unsupported_or_unavailable_live_execution_venue: exchange=kraken",
+    )
+    owner.assert_not_called()
     audit_reader.assert_not_called()
+    adapter_factory.assert_not_called()
     _assert_initialization_not_called(initialization)
 
 
@@ -698,10 +695,11 @@ def test_optional_account_fields_preserve_raw_truthiness(
         assert account[field] == raw
 
 
-def test_generic_main_has_one_ccxt_credential_policy_entrypoint() -> None:
+def test_entrypoint_composition_has_no_generic_credential_fallback() -> None:
     source = inspect.getsource(adapter_runtime_composition.build_live_adapter_config)
 
-    assert source.count("build_ccxt_live_credentials(") == 1
+    assert "build_ccxt_live_credentials(" not in source
+    assert "build_okx_live_adapter_config(" not in source
     assert "EXCHANGE_API_KEY" not in source
     assert "EXCHANGE_SECRET" not in source
     assert "EXCHANGE_TESTNET" not in source
@@ -1173,7 +1171,6 @@ def test_main_injects_rithmic_runtime_composition_factories(monkeypatch) -> None
         ("binance", "BINANCE:BTCUSDT-PERP"),
         ("backpack", "BACKPACK:BTC_USDC-PERP"),
         ("bybit", "BYBIT:BTCUSDT-PERP"),
-        ("okx", "OKX:BTC-USDT-SWAP"),
     ],
 )
 def test_main_does_not_inject_rithmic_factories_for_ccxt_live(

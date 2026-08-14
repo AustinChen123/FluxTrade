@@ -40,6 +40,30 @@ def test_main_import_does_not_eager_load_provider_owners() -> None:
     assert json.loads(result.stdout) == []
 
 
+@pytest.mark.parametrize("exchange", ["okx", "kraken"])
+def test_incomplete_live_venues_fail_before_any_configuration_dependency(
+    monkeypatch,
+    exchange,
+) -> None:
+    balance_parser = MagicMock(side_effect=AssertionError("balance parsed"))
+    websocket_reader = MagicMock(side_effect=AssertionError("websocket read"))
+    monkeypatch.setattr(adapter_runtime_composition, "to_base_quote", balance_parser)
+
+    with pytest.raises(ValueError) as raised:
+        adapter_runtime_composition.build_live_adapter_config(
+            exchange=exchange,
+            product_ids=[f"{exchange.upper()}:BTCUSDT-PERP"],
+            environ={"EXCHANGE_API_KEY": "credential-sentinel"},
+            read_enable_ws=websocket_reader,
+        )
+
+    assert raised.value.args == (
+        f"unsupported_or_unavailable_live_execution_venue: exchange={exchange}",
+    )
+    balance_parser.assert_not_called()
+    websocket_reader.assert_not_called()
+
+
 @pytest.mark.parametrize(
     "config",
     [
@@ -114,6 +138,12 @@ def test_dedicated_venue_owner_precedes_shared_websocket_reader(monkeypatch) -> 
             "BACKPACK:SOLUSDC-PERP",
             "src.core.adapters.backpack_live_config.build_backpack_live_adapter_config",
             "USDC",
+        ),
+        (
+            "bybit",
+            "BYBIT:BTCUSDT-PERP",
+            "src.core.adapters.bybit_live_config.build_bybit_live_adapter_config",
+            "USDT",
         ),
     ],
 )

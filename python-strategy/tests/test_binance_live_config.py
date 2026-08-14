@@ -302,7 +302,6 @@ def test_binance_config_failure_stops_main_before_audit_and_runtime(
     ("exchange", "product_id"),
     [
         ("bybit", "BYBIT:BTCUSDT-PERP"),
-        ("okx", "OKX:BTCUSDT-PERP"),
         ("rithmic", "RITHMIC:NQ-202609"),
         ("backpack", "BACKPACK:BTC_USDC-PERP"),
     ],

@@ -11,6 +11,10 @@ from src.core.runtime_capabilities import (
     RuntimeCapabilitiesFactory,
 )
 
+_SUPPORTED_LIVE_EXECUTION_VENUES = frozenset(
+    {"backpack", "binance", "bybit", "rithmic"}
+)
+
 
 def build_live_adapter_config(
     *,
@@ -20,6 +24,10 @@ def build_live_adapter_config(
     read_enable_ws: Callable[[], bool],
 ) -> dict[str, Any]:
     """Delegate one live adapter config to its existing venue owner."""
+    if exchange not in _SUPPORTED_LIVE_EXECUTION_VENUES:
+        raise ValueError(
+            f"unsupported_or_unavailable_live_execution_venue: exchange={exchange}"
+        )
     balance_asset: str | None = None
     if exchange != "rithmic":
         quote_assets = {to_base_quote(product_id)[1] for product_id in product_ids}
@@ -57,16 +65,6 @@ def build_live_adapter_config(
         )
         config["balance_asset"] = balance_asset
         return config
-    if exchange == "okx":
-        from src.core.adapters.okx_live_config import build_okx_live_adapter_config
-
-        config = build_okx_live_adapter_config(
-            product_ids=product_ids,
-            environ=environ,
-        )
-        config["balance_asset"] = balance_asset
-        return config
-
     account_initialization = {
         "product_ids": product_ids,
         "position_mode": environ.get("ACCOUNT_POSITION_MODE", "one_way"),
@@ -84,15 +82,6 @@ def build_live_adapter_config(
         "instrument_product_ids": product_ids,
         "account_initialization": account_initialization,
     }
-    if exchange != "rithmic":
-        from src.core.adapters.ccxt_live_credentials import (
-            build_ccxt_live_credentials,
-        )
-
-        config.update(build_ccxt_live_credentials(environ))
-        config["balance_asset"] = balance_asset
-        return config
-
     from src.core.adapters.rithmic_live_config import (
         build_rithmic_live_adapter_config,
     )
