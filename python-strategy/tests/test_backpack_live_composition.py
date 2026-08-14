@@ -8,13 +8,14 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 import src.core.adapters as adapters
+from src.core.adapters.live_backpack import LiveBackpackAdapter
 
 
 def _owner():
     return importlib.import_module("src.core.adapters.live_backpack")
 
 
-def test_backpack_owner_constructs_exact_generic_adapter() -> None:
+def test_backpack_owner_constructs_exact_venue_adapter() -> None:
     owner = _owner()
     result = object()
     api_key = object()
@@ -22,7 +23,7 @@ def test_backpack_owner_constructs_exact_generic_adapter() -> None:
     testnet = object()
     extra_config = object()
 
-    with patch.object(owner, "CcxtExchangeAdapter", return_value=result) as constructor:
+    with patch.object(owner, "LiveBackpackAdapter", return_value=result) as constructor:
         actual = owner.create_backpack_live_adapter(
             api_key=api_key,
             secret=secret,
@@ -32,7 +33,6 @@ def test_backpack_owner_constructs_exact_generic_adapter() -> None:
 
     assert actual is result
     constructor.assert_called_once_with(
-        exchange_id="backpack",
         api_key=api_key,
         secret=secret,
         testnet=testnet,
@@ -45,7 +45,7 @@ def test_backpack_owner_preserves_constructor_exception_identity() -> None:
     failure = RuntimeError("backpack-constructor-sentinel")
 
     with (
-        patch.object(owner, "CcxtExchangeAdapter", side_effect=failure),
+        patch.object(owner, "LiveBackpackAdapter", side_effect=failure),
         pytest.raises(RuntimeError) as raised,
     ):
         owner.create_backpack_live_adapter(
@@ -68,7 +68,16 @@ def test_backpack_owner_has_only_shared_ccxt_dependency() -> None:
     ]
 
     assert imports == [
+        "import hashlib",
+        "import threading",
+        "from typing import Any",
+        "import ccxt",
+        "from src.core.adapters.backpack_user_stream import BackpackOrderEventStream",
         "from src.core.adapters.ccxt_adapter import CcxtExchangeAdapter",
+        "from src.core.client_order_id import parse_client_order_id",
+        "from src.core.interfaces.exchange import ExchangeError, ExchangeOrderEvent, ExchangeOrderSnapshot",
+        "from src.core.orm_models import Order",
+        "from src.core.product_registry import to_ccxt_symbol",
     ]
     function = next(
         node
@@ -79,6 +88,23 @@ def test_backpack_owner_has_only_shared_ccxt_dependency() -> None:
     assert not any(
         isinstance(node, ast.Import | ast.ImportFrom) for node in ast.walk(function)
     )
+
+
+def test_live_adapter_delegates_order_event_lifecycle() -> None:
+    adapter = object.__new__(LiveBackpackAdapter)
+    owner = MagicMock()
+    event = object()
+    owner.poll.return_value = event
+    owner.close.return_value = True
+    adapter._user_order_stream = owner
+
+    adapter.start_order_event_stream()
+    assert adapter.poll_order_event() is event
+    adapter.close()
+
+    owner.start.assert_called_once_with()
+    owner.poll.assert_called_once_with()
+    owner.close.assert_called_once_with()
 
 
 @pytest.mark.parametrize(

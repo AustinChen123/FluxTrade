@@ -422,6 +422,15 @@ class CcxtExchangeAdapter(IExchangeAdapter):
                 f"Failed to fetch order with client_order_id {client_order_id}: {e}"
             ) from e
 
+        return self._order_snapshot_from_response(client_order_id, response)
+
+    def _order_snapshot_from_response(
+        self,
+        client_order_id: str,
+        response: dict,
+    ) -> ExchangeOrderSnapshot:
+        """Project one locked-client order response without venue transport policy."""
+
         exchange_order_id = response.get("id")
         status = response.get("status") or "unknown"
         fee = response.get("fee") or {}

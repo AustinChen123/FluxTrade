@@ -15,6 +15,7 @@ from src.core.adapters.ccxt_adapter import (
     CcxtExchangeAdapter,
 )
 from src.core.adapters.live_binance import LiveBinanceAdapter
+from src.core.adapters.live_backpack import LiveBackpackAdapter
 from src.core.adapters.simulated import SimulatedAdapter
 from src.core.interfaces.exchange import (
     ExchangeError,
@@ -144,6 +145,118 @@ class TestCcxtAdapterInit:
 
     def test_valid_exchange_creates_adapter(self, adapter):
         assert adapter.exchange_id == "binance"
+
+
+def _backpack_adapter(client: MagicMock) -> LiveBackpackAdapter:
+    adapter = object.__new__(LiveBackpackAdapter)
+    adapter.exchange_id = "backpack"
+    adapter.client = client
+    adapter.logger = MagicMock()
+    adapter._client_order_aliases = {}
+    adapter._client_order_alias_lock = threading.Lock()
+    return adapter
+
+
+def test_backpack_raw_client_id_operations_are_restart_stable_and_one_of() -> None:
+    canonical_id = CANONICAL_CLIENT_ORDER_ID
+    client = MagicMock()
+    client.market.return_value = {"id": "BTC_USDC_PERP"}
+    client.privateGetApiV1Order.return_value = {"id": "provider-1"}
+    client.parse_order.return_value = {
+        "id": "provider-1",
+        "status": "open",
+        "filled": "0.25",
+        "average": None,
+        "cost": "25.25",
+        "fee": {"cost": "0.0010"},
+    }
+    client.fetch_order.side_effect = AssertionError("unified fetch forbidden")
+    client.cancel_order.side_effect = AssertionError("unified cancel forbidden")
+    first = _backpack_adapter(client)
+    restarted = _backpack_adapter(client)
+
+    create_alias = first._exchange_client_order_id(canonical_id)
+    create_params = first._submission_client_order_id_params(create_alias, "market")
+    snapshot = restarted.get_order_by_client_id(
+        canonical_id,
+        "BACKPACK:BTC_USDC-PERP",
+    )
+    assert restarted.cancel_order_by_client_id(
+        canonical_id,
+        "BACKPACK:BTC_USDC-PERP",
+    )
+
+    assert create_alias == restarted._exchange_client_order_id(canonical_id)
+    assert create_params == {"clientOrderId": int(create_alias)}
+    request = {"symbol": "BTC_USDC_PERP", "clientId": int(create_alias)}
+    client.privateGetApiV1Order.assert_called_once_with(request)
+    client.privateDeleteApiV1Order.assert_called_once_with(request)
+    client.fetch_order.assert_not_called()
+    client.cancel_order.assert_not_called()
+    assert snapshot is not None
+    assert snapshot.client_order_id == canonical_id
+    assert snapshot.exchange_order_id == "provider-1"
+    assert snapshot.filled_quantity == Decimal("0.25")
+    assert snapshot.average_price == Decimal("101")
+    assert snapshot.fee == Decimal("0.0010")
+
+
+def test_backpack_place_registers_alias_before_provider_io(monkeypatch) -> None:
+    client = MagicMock()
+    adapter = _backpack_adapter(client)
+    monkeypatch.setattr(adapter, "_quantize_order", MagicMock())
+    canonical_id = CANONICAL_CLIENT_ORDER_ID
+    order = _make_order(
+        product_id="BACKPACK:BTC_USDC-PERP",
+        client_order_id=canonical_id,
+    )
+
+    def create_order(**kwargs):
+        alias = str(kwargs["params"]["clientOrderId"])
+        assert adapter._canonical_client_order_id(alias) == canonical_id
+        return {"id": "provider-1"}
+
+    client.create_order.side_effect = create_order
+
+    assert adapter.place_order(order) == "provider-1"
+    client.create_order.assert_called_once()
+
+
+def test_backpack_alias_collision_fails_before_provider_io(monkeypatch) -> None:
+    client = MagicMock()
+    adapter = _backpack_adapter(client)
+    quantize = MagicMock(side_effect=AssertionError("quantize forbidden"))
+    monkeypatch.setattr(adapter, "_quantize_order", quantize)
+    monkeypatch.setattr(
+        "src.core.adapters.live_backpack._backpack_client_id",
+        lambda _value: 17,
+    )
+
+    assert (
+        adapter._exchange_client_order_id(
+            "strategy_1-worker_a-entry-1704067200000000000"
+        )
+        == "17"
+    )
+    order = _make_order(
+        product_id="BACKPACK:BTC_USDC-PERP",
+        client_order_id="strategy_2-worker_b-entry-1704067200000000001",
+    )
+    with pytest.raises(ExchangeError, match="^backpack_client_order_id_collision$"):
+        adapter.place_order(order)
+    with pytest.raises(ExchangeError, match="^backpack_client_order_id_collision$"):
+        adapter.get_order_by_client_id(
+            "strategy_2-worker_b-entry-1704067200000000001",
+            "BACKPACK:BTC_USDC-PERP",
+        )
+    with pytest.raises(ExchangeError, match="^backpack_client_order_id_collision$"):
+        adapter.cancel_order_by_client_id(
+            "strategy_2-worker_b-entry-1704067200000000001",
+            "BACKPACK:BTC_USDC-PERP",
+        )
+
+    quantize.assert_not_called()
+    assert client.mock_calls == []
 
 
 class TestPlaceOrder:

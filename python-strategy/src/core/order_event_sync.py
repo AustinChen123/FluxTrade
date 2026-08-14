@@ -1,4 +1,5 @@
-from decimal import Decimal
+from decimal import Context, Decimal, ROUND_HALF_EVEN, localcontext
+from fractions import Fraction
 from typing import Callable, Optional
 
 from src.core.fill_delta import FillDelta, fill_delta_from_cumulative
@@ -129,7 +130,18 @@ class OrderEventApplier:
             cumulative_quantity = event.cumulative_filled_quantity or (
                 (order.filled_quantity or Decimal("0")) + fill_delta["quantity"]
             )
-            cumulative_average = event.cumulative_average_price or fill_delta["price"]
+            cumulative_average = self._cumulative_average_price(
+                order,
+                event,
+                fill_delta,
+                cumulative_quantity,
+            )
+            if cumulative_average is None:
+                return {
+                    "action": "unresolved_missing_fill_price",
+                    "order_id": order.id,
+                    "status": event.status,
+                }
             self.order_manager.record_fill_delta(
                 order,
                 fill_delta["price"],
@@ -345,6 +357,40 @@ class OrderEventApplier:
         return {"quantity": delta, "price": price}
 
     @staticmethod
+    def _cumulative_average_price(
+        order,
+        event: ExchangeOrderEvent,
+        fill_delta: FillDelta,
+        cumulative_quantity: Decimal,
+    ) -> Decimal | None:
+        if event.cumulative_average_price is not None:
+            return event.cumulative_average_price
+        delta_quantity = fill_delta["quantity"]
+        delta_price = fill_delta["price"]
+        local_quantity = order.filled_quantity or Decimal("0")
+        if local_quantity <= 0:
+            return delta_price
+        local_average = order.filled_price
+        if (
+            local_average is None
+            or not local_average.is_finite()
+            or local_average <= 0
+            or not cumulative_quantity.is_finite()
+            or cumulative_quantity <= 0
+            or not delta_quantity.is_finite()
+            or delta_quantity <= 0
+            or delta_price is None
+            or not delta_price.is_finite()
+            or delta_price <= 0
+        ):
+            return None
+        weighted = (
+            Fraction(local_quantity) * Fraction(local_average)
+            + Fraction(delta_quantity) * Fraction(delta_price)
+        ) / Fraction(cumulative_quantity)
+        return _fraction_to_decimal(weighted)
+
+    @staticmethod
     def _has_non_idempotent_last_fill_only(event: ExchangeOrderEvent) -> bool:
         return (
             event.cumulative_filled_quantity is None
@@ -432,6 +478,33 @@ class OrderEventApplier:
         return (order.filled_quantity or Decimal("0")) > 0 or (
             event.cumulative_filled_quantity or Decimal("0")
         ) > 0
+
+
+def _fraction_to_decimal(value: Fraction) -> Decimal:
+    numerator = value.numerator
+    denominator = value.denominator
+    twos = 0
+    fives = 0
+    while denominator % 2 == 0:
+        denominator //= 2
+        twos += 1
+    while denominator % 5 == 0:
+        denominator //= 5
+        fives += 1
+    if denominator == 1:
+        scale = max(twos, fives)
+        coefficient = abs(numerator) * 2 ** (scale - twos) * 5 ** (scale - fives)
+        if coefficient == 0:
+            return Decimal(0)
+        return Decimal(
+            (
+                int(numerator < 0),
+                tuple(map(int, str(coefficient))),
+                -scale,
+            )
+        )
+    with localcontext(Context(prec=28, rounding=ROUND_HALF_EVEN)):
+        return Decimal(value.numerator) / Decimal(value.denominator)
 
 
 def exchange_snapshot_to_order_event(product_id: str, snapshot) -> ExchangeOrderEvent:

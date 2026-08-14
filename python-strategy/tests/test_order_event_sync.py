@@ -1,4 +1,4 @@
-from decimal import Decimal
+from decimal import Context, Decimal, ROUND_DOWN, ROUND_HALF_UP, localcontext
 from unittest.mock import Mock
 
 import pytest
@@ -183,6 +183,108 @@ def test_process_exchange_order_event_recomputes_catch_up_delta_price(
     assert len(mock_order_repo.trades) == 1
     assert mock_order_repo.trades[0].quantity == Decimal("0.06")
     assert mock_order_repo.trades[0].price == Decimal("104")
+
+
+@pytest.mark.parametrize(
+    ("precision", "rounding"),
+    [(6, ROUND_DOWN), (60, ROUND_HALF_UP)],
+)
+def test_order_event_derives_context_independent_cumulative_average_from_deltas(
+    precision,
+    rounding,
+    mock_clock,
+    mock_order_repo,
+    order_factory,
+):
+    order_manager = OrderManager(mock_order_repo, mock_clock, is_backtest=True)
+    applier = _applier(order_manager)
+    order = order_factory(
+        exchange_order_id="EX-weighted-average",
+        status=OrderStatus.SUBMITTED.value,
+        quantity=Decimal("0.10"),
+        filled_quantity=Decimal("0"),
+        filled_price=Decimal("0"),
+    )
+    mock_order_repo.add_order(order)
+
+    with localcontext(Context(prec=precision, rounding=rounding)):
+        partial = applier.process_exchange_order_event(
+            ExchangeOrderEvent(
+                status="partial",
+                product_id=order.product_id,
+                exchange_order_id="EX-weighted-average",
+                cumulative_filled_quantity=Decimal("0.04"),
+                last_fill_quantity=Decimal("0.04"),
+                last_fill_price=Decimal("101"),
+            )
+        )
+        final = applier.process_exchange_order_event(
+            ExchangeOrderEvent(
+                status="filled",
+                product_id=order.product_id,
+                exchange_order_id="EX-weighted-average",
+                cumulative_filled_quantity=Decimal("0.10"),
+                last_fill_quantity=Decimal("0.06"),
+                last_fill_price=Decimal("103"),
+            )
+        )
+
+    assert partial["action"] == "applied"
+    assert final["action"] == "applied"
+    assert order.filled_quantity == Decimal("0.10")
+    assert order.filled_price == Decimal("102.2")
+    assert [trade.price for trade in mock_order_repo.trades] == [
+        Decimal("101"),
+        Decimal("103"),
+    ]
+
+
+@pytest.mark.parametrize(
+    ("precision", "rounding"),
+    [(6, ROUND_DOWN), (60, ROUND_HALF_UP)],
+)
+def test_nonterminating_cumulative_average_uses_fixed_half_even_context(
+    precision,
+    rounding,
+    mock_clock,
+    mock_order_repo,
+    order_factory,
+):
+    order_manager = OrderManager(mock_order_repo, mock_clock, is_backtest=True)
+    applier = _applier(order_manager)
+    order = order_factory(
+        exchange_order_id="EX-repeating-average",
+        status=OrderStatus.SUBMITTED.value,
+        quantity=Decimal("0.03"),
+        filled_quantity=Decimal("0"),
+        filled_price=Decimal("0"),
+    )
+    mock_order_repo.add_order(order)
+
+    with localcontext(Context(prec=precision, rounding=rounding)):
+        applier.process_exchange_order_event(
+            ExchangeOrderEvent(
+                status="partial",
+                product_id=order.product_id,
+                exchange_order_id="EX-repeating-average",
+                cumulative_filled_quantity=Decimal("0.01"),
+                last_fill_quantity=Decimal("0.01"),
+                last_fill_price=Decimal("1"),
+            )
+        )
+        result = applier.process_exchange_order_event(
+            ExchangeOrderEvent(
+                status="filled",
+                product_id=order.product_id,
+                exchange_order_id="EX-repeating-average",
+                cumulative_filled_quantity=Decimal("0.03"),
+                last_fill_quantity=Decimal("0.02"),
+                last_fill_price=Decimal("2"),
+            )
+        )
+
+    assert result["action"] == "applied"
+    assert order.filled_price == Decimal("1.666666666666666666666666667")
 
 
 @pytest.mark.parametrize(
