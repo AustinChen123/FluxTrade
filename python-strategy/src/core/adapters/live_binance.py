@@ -133,6 +133,7 @@ class LiveBinanceAdapter(CcxtExchangeAdapter):
         keepalive_binance_user_stream("binance", self.client, listen_key)
 
     def place_order(self, order: Order) -> str:
+        side = self._ccxt_order_side(order.side)
         intent_payload = getattr(order, "intent_payload", None)
         order_type = cast(str | None, order.type)
         reduce_only = (
@@ -160,7 +161,7 @@ class LiveBinanceAdapter(CcxtExchangeAdapter):
                 try:
                     success = self.ws_connector.place_order(
                         symbol=f"{base}{quote}",
-                        side=cast(str, order.side),
+                        side=side,
                         quantity=str(order.quantity),
                         price=str(order.price) if order.price is not None else None,
                         order_type=order_type,

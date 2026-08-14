@@ -21,6 +21,7 @@ from src.core.interfaces.exchange import (
     InsufficientFundsError,
     NetworkError,
 )
+from src.core.models import PositionSide
 from src.core.orm_models import Order
 from src.core.product_registry import (
     PrecisionMode,
@@ -145,6 +146,17 @@ class TestCcxtAdapterInit:
 
 
 class TestPlaceOrder:
+    def test_invalid_order_side_fails_before_submit(self, adapter, mock_ccxt_client):
+        order = _make_order(side="hold")
+
+        with pytest.raises(
+            ExchangeError,
+            match="order_side_mapping_unsupported: side=hold",
+        ):
+            adapter.place_order(order)
+
+        mock_ccxt_client.create_order.assert_not_called()
+
     def test_market_order(self, adapter, mock_ccxt_client):
         mock_ccxt_client.create_order.return_value = {"id": "EX-123"}
         order = _make_order()
@@ -157,6 +169,8 @@ class TestPlaceOrder:
         assert call_kwargs.kwargs["symbol"] == "BTC/USDT:USDT"
         assert call_kwargs.kwargs["type"] == "market"
         assert call_kwargs.kwargs["side"] == "buy"
+        assert call_kwargs.kwargs["amount"] == "0.01"
+        assert type(call_kwargs.kwargs["amount"]) is str
 
     def test_market_reduce_only_intent_passes_reduce_only_param(
         self, adapter, mock_ccxt_client
@@ -171,6 +185,7 @@ class TestPlaceOrder:
         adapter.place_order(order)
 
         call_kwargs = mock_ccxt_client.create_order.call_args
+        assert call_kwargs.kwargs["side"] == "sell"
         assert call_kwargs.kwargs["params"]["reduceOnly"] is True
 
     def test_limit_order_includes_gtc(self, adapter, mock_ccxt_client):
@@ -1376,7 +1391,7 @@ class TestGetPosition:
             strategy_id="ignored-by-account-net-adapter",
         )
         assert pos is not None
-        assert pos.side == "LONG"
+        assert pos.side is PositionSide.LONG
         assert pos.quantity == Decimal("0.5")
         assert pos.entry_price == Decimal("65000")
 
@@ -1391,7 +1406,7 @@ class TestGetPosition:
         ]
         pos = adapter.get_position("BINANCE:BTCUSDT-PERP")
         assert pos is not None
-        assert pos.side == "SHORT"
+        assert pos.side is PositionSide.SHORT
         assert pos.quantity == Decimal("0.3")
 
     def test_no_position_returns_none(self, adapter, mock_ccxt_client):
@@ -1899,6 +1914,27 @@ class TestLiveBinanceWsInit:
 
 
 class TestLiveBinanceWsOrderPath:
+
+    def test_invalid_side_fails_before_ws_or_rest(
+        self, adapter, mock_ccxt_client
+    ):
+        ws_connector = MagicMock()
+        ws_connector.is_connected.return_value = True
+        adapter.ws_connector = ws_connector
+        order = _make_order(
+            side="hold",
+            client_order_id=CANONICAL_CLIENT_ORDER_ID,
+        )
+
+        with pytest.raises(
+            ExchangeError,
+            match="order_side_mapping_unsupported: side=hold",
+        ):
+            adapter.place_order(order)
+
+        mock_ccxt_client.load_markets.assert_not_called()
+        ws_connector.place_order.assert_not_called()
+        mock_ccxt_client.create_order.assert_not_called()
 
     def test_market_order_via_ws(self):
         """Market order should use WS fast path when connected."""

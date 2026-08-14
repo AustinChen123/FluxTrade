@@ -8,7 +8,7 @@ implement IExchangeAdapter and only wrapped create_order.
 import logging
 import os
 from decimal import Decimal
-from typing import Callable, Optional
+from typing import Callable, Literal, Optional
 
 import ccxt
 
@@ -26,7 +26,7 @@ from src.core.interfaces.exchange import (
     NetworkError,
 )
 from src.core.client_order_id import parse_client_order_id
-from src.core.models import Position
+from src.core.models import Position, PositionSide
 from src.core.orm_models import Order
 from src.core.product_registry import (
     InstrumentSpec,
@@ -96,6 +96,7 @@ class CcxtExchangeAdapter(IExchangeAdapter):
 
     def place_order(self, order: Order) -> str:
         ccxt_symbol = to_ccxt_symbol(order.product_id)
+        side = self._ccxt_order_side(order.side)
         self._quantize_order(order)
         order_type, params = self._ccxt_order_type_and_params(order)
         if order_type == "limit":
@@ -128,7 +129,7 @@ class CcxtExchangeAdapter(IExchangeAdapter):
             response = self.client.create_order(
                 symbol=ccxt_symbol,
                 type=order_type,
-                side=order.side,
+                side=side,
                 amount=str(order.quantity),
                 price=str(order.price) if order.price else None,
                 params=params,
@@ -143,6 +144,14 @@ class CcxtExchangeAdapter(IExchangeAdapter):
             raise ExchangeError(f"Order placement failed: {e}") from e
 
     _SUPPORTED_PLAIN_ORDER_TYPES = frozenset({"market", "limit"})
+
+    @staticmethod
+    def _ccxt_order_side(side: str) -> Literal["buy", "sell"]:
+        if side == "buy":
+            return "buy"
+        if side == "sell":
+            return "sell"
+        raise ExchangeError(f"order_side_mapping_unsupported: side={side}")
 
     def _submission_client_order_id_params(
         self,
@@ -263,6 +272,7 @@ class CcxtExchangeAdapter(IExchangeAdapter):
 
     def _quantize_order(self, order: Order) -> None:
         spec = self.get_instrument_spec(order.product_id)
+        intent_payload = getattr(order, "intent_payload", None)
         try:
             quantized = quantize_order_values(
                 quantity=order.quantity,
@@ -280,8 +290,8 @@ class CcxtExchangeAdapter(IExchangeAdapter):
                 and notional_price is None
                 and reference_price is None
                 and order.type.lower() == "market"
-                and isinstance(getattr(order, "intent_payload", None), dict)
-                and order.intent_payload.get("reduce_only") is True
+                and isinstance(intent_payload, dict)
+                and intent_payload.get("reduce_only") is True
             ):
                 reference_price = self._market_order_reference_price(order)
                 order.min_notional_reference_price = reference_price
@@ -515,7 +525,11 @@ class CcxtExchangeAdapter(IExchangeAdapter):
             return None
 
         side_value = str(raw_position.get("side") or "").lower()
-        side = "SHORT" if side_value == "short" or contracts < 0 else "LONG"
+        side = (
+            PositionSide.SHORT
+            if side_value == "short" or contracts < 0
+            else PositionSide.LONG
+        )
         return Position(
             strategy_id="LIVE",
             product_id=product_id,
