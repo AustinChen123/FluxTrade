@@ -1,6 +1,6 @@
 use crate::environment::RuntimeEnvironment;
 use crate::model::{validate_product_id, AccountUpdate, Candlestick, PositionUpdate, Trade};
-use anyhow::{Context, Result};
+use anyhow::{bail, Context, Result};
 use redis::AsyncCommands;
 use serde::Serialize;
 use tokio::sync::mpsc;
@@ -21,63 +21,38 @@ pub enum PublishMessage {
 #[derive(Clone)]
 pub struct PublishSender {
     tx: mpsc::Sender<PublishMessage>,
+    send_timeout: Duration,
 }
 
 impl PublishSender {
-    /// Send a trade to be published. Returns error if the channel is full or closed.
+    async fn send(&self, message: PublishMessage) -> Result<()> {
+        match timeout(self.send_timeout, self.tx.send(message)).await {
+            Ok(Ok(())) => Ok(()),
+            Ok(Err(_)) => bail!("Publisher channel closed"),
+            Err(_) => bail!("Publisher channel send timed out"),
+        }
+    }
+
+    /// Send a trade to be published. Returns error if the channel stays full or is closed.
     pub async fn publish_trade(&self, trade: &Trade) -> Result<()> {
-        self.tx
-            .try_send(PublishMessage::Trade(trade.clone()))
-            .map_err(|e| match e {
-                mpsc::error::TrySendError::Full(_) => {
-                    anyhow::anyhow!("Publisher channel full, dropping trade message")
-                }
-                mpsc::error::TrySendError::Closed(_) => {
-                    anyhow::anyhow!("Publisher channel closed")
-                }
-            })
+        self.send(PublishMessage::Trade(trade.clone())).await
     }
 
     /// Send a candle to be published.
     pub async fn publish_candle(&self, candle: &Candlestick) -> Result<()> {
-        self.tx
-            .try_send(PublishMessage::Candle(candle.clone()))
-            .map_err(|e| match e {
-                mpsc::error::TrySendError::Full(_) => {
-                    anyhow::anyhow!("Publisher channel full, dropping candle message")
-                }
-                mpsc::error::TrySendError::Closed(_) => {
-                    anyhow::anyhow!("Publisher channel closed")
-                }
-            })
+        self.send(PublishMessage::Candle(candle.clone())).await
     }
 
     /// Send an account update to be published.
     pub async fn publish_account_update(&self, update: &AccountUpdate) -> Result<()> {
-        self.tx
-            .try_send(PublishMessage::AccountUpdate(update.clone()))
-            .map_err(|e| match e {
-                mpsc::error::TrySendError::Full(_) => {
-                    anyhow::anyhow!("Publisher channel full, dropping account update")
-                }
-                mpsc::error::TrySendError::Closed(_) => {
-                    anyhow::anyhow!("Publisher channel closed")
-                }
-            })
+        self.send(PublishMessage::AccountUpdate(update.clone()))
+            .await
     }
 
     /// Send a position update to be published.
     pub async fn publish_position_update(&self, update: &PositionUpdate) -> Result<()> {
-        self.tx
-            .try_send(PublishMessage::PositionUpdate(update.clone()))
-            .map_err(|e| match e {
-                mpsc::error::TrySendError::Full(_) => {
-                    anyhow::anyhow!("Publisher channel full, dropping position update")
-                }
-                mpsc::error::TrySendError::Closed(_) => {
-                    anyhow::anyhow!("Publisher channel closed")
-                }
-            })
+        self.send(PublishMessage::PositionUpdate(update.clone()))
+            .await
     }
 }
 
@@ -171,11 +146,27 @@ fn observe_liveness_result(state: &mut LivenessFailureState, result: Result<()>)
 
 /// Default channel capacity for the publisher task.
 pub const DEFAULT_CHANNEL_CAPACITY: usize = 10_000;
+const PUBLISH_SEND_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Create a publisher channel pair: (sender for connectors, receiver for the publisher task).
 pub fn create_publish_channel(capacity: usize) -> (PublishSender, mpsc::Receiver<PublishMessage>) {
     let (tx, rx) = mpsc::channel(capacity);
-    (PublishSender { tx }, rx)
+    (
+        PublishSender {
+            tx,
+            send_timeout: PUBLISH_SEND_TIMEOUT,
+        },
+        rx,
+    )
+}
+
+#[cfg(test)]
+fn create_publish_channel_with_timeout(
+    capacity: usize,
+    send_timeout: Duration,
+) -> (PublishSender, mpsc::Receiver<PublishMessage>) {
+    let (tx, rx) = mpsc::channel(capacity);
+    (PublishSender { tx, send_timeout }, rx)
 }
 
 impl RedisPublisher {
@@ -736,25 +727,110 @@ mod tests {
         }
     }
 
-    #[tokio::test]
-    async fn test_publish_sender_backpressure() {
-        // Create a channel with capacity 1
-        let (sender, _rx) = create_publish_channel(1);
-        let trade = Trade {
-            id: "1".to_string(),
-            product_id: "BINANCE:BTCUSDT-PERP".to_string(),
-            price: rust_decimal_macros::dec!(50000),
-            quantity: rust_decimal_macros::dec!(0.1),
-            side: "buy".to_string(),
-            timestamp: 1600000000,
-        };
+    #[derive(Clone, Copy)]
+    enum BackpressureCase {
+        Trade,
+        Candle,
+        Account,
+        Position,
+    }
 
-        // First send should succeed
-        sender.publish_trade(&trade).await.unwrap();
-        // Second send should fail (channel full, no one consuming)
-        let result = sender.publish_trade(&trade).await;
-        assert!(result.is_err());
-        assert!(result.unwrap_err().to_string().contains("channel full"));
+    impl BackpressureCase {
+        async fn send(self, sender: &PublishSender, sequence: i64) -> Result<()> {
+            match self {
+                Self::Trade => {
+                    sender
+                        .publish_trade(&Trade {
+                            id: format!("trade-{sequence}"),
+                            product_id: "BINANCE:BTCUSDT-PERP".to_string(),
+                            price: rust_decimal_macros::dec!(50000),
+                            quantity: rust_decimal_macros::dec!(0.1),
+                            side: "buy".to_string(),
+                            timestamp: sequence,
+                        })
+                        .await
+                }
+                Self::Candle => {
+                    sender
+                        .publish_candle(&Candlestick {
+                            product_id: "BINANCE:BTCUSDT-PERP".to_string(),
+                            timeframe: "1m".to_string(),
+                            timestamp: sequence,
+                            open: rust_decimal_macros::dec!(50000),
+                            high: rust_decimal_macros::dec!(51000),
+                            low: rust_decimal_macros::dec!(49000),
+                            close: rust_decimal_macros::dec!(50500),
+                            volume: rust_decimal_macros::dec!(10),
+                        })
+                        .await
+                }
+                Self::Account => {
+                    sender
+                        .publish_account_update(&AccountUpdate {
+                            exchange: "binance".to_string(),
+                            asset: format!("USDT-{sequence}"),
+                            balance: rust_decimal_macros::dec!(1000),
+                            timestamp: sequence,
+                        })
+                        .await
+                }
+                Self::Position => {
+                    sender
+                        .publish_position_update(&PositionUpdate {
+                            exchange: "binance".to_string(),
+                            symbol: format!("BTCUSDT-{sequence}"),
+                            amount: rust_decimal_macros::dec!(1),
+                            entry_price: rust_decimal_macros::dec!(50000),
+                            unrealized_pnl: rust_decimal_macros::dec!(2),
+                            timestamp: sequence,
+                        })
+                        .await
+                }
+            }
+        }
+
+        fn assert_sequence(self, message: PublishMessage, sequence: i64) {
+            match (self, message) {
+                (Self::Trade, PublishMessage::Trade(trade)) => {
+                    assert_eq!(trade.id, format!("trade-{sequence}"));
+                }
+                (Self::Candle, PublishMessage::Candle(candle)) => {
+                    assert_eq!(candle.timestamp, sequence);
+                }
+                (Self::Account, PublishMessage::AccountUpdate(update)) => {
+                    assert_eq!(update.asset, format!("USDT-{sequence}"));
+                }
+                (Self::Position, PublishMessage::PositionUpdate(update)) => {
+                    assert_eq!(update.symbol, format!("BTCUSDT-{sequence}"));
+                }
+                (_, unexpected) => panic!("unexpected publisher message: {unexpected:?}"),
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn publish_sender_applies_fifo_backpressure_for_every_message_family() {
+        for case in [
+            BackpressureCase::Trade,
+            BackpressureCase::Candle,
+            BackpressureCase::Account,
+            BackpressureCase::Position,
+        ] {
+            let (sender, mut rx) = create_publish_channel(1);
+            case.send(&sender, 1).await.unwrap();
+
+            let mut pending = Box::pin(case.send(&sender, 2));
+            assert!(
+                tokio::time::timeout(Duration::from_millis(25), &mut pending)
+                    .await
+                    .is_err(),
+                "second send must wait while the publisher channel is full"
+            );
+
+            case.assert_sequence(rx.recv().await.unwrap(), 1);
+            pending.await.unwrap();
+            case.assert_sequence(rx.recv().await.unwrap(), 2);
+        }
     }
 
     #[tokio::test]
@@ -774,6 +850,24 @@ mod tests {
 
         let result = sender.publish_trade(&trade).await;
         assert!(result.is_err());
-        assert!(result.unwrap_err().to_string().contains("channel closed"));
+        assert_eq!(result.unwrap_err().to_string(), "Publisher channel closed");
+    }
+
+    #[tokio::test]
+    async fn publish_sender_times_out_without_rendering_the_message() {
+        let (sender, _rx) = create_publish_channel_with_timeout(1, Duration::from_millis(25));
+        let trade = Trade {
+            id: "publisher-payload-sentinel".to_string(),
+            product_id: "BINANCE:BTCUSDT-PERP".to_string(),
+            price: rust_decimal_macros::dec!(50000),
+            quantity: rust_decimal_macros::dec!(0.1),
+            side: "buy".to_string(),
+            timestamp: 1600000000,
+        };
+        sender.publish_trade(&trade).await.unwrap();
+
+        let error = sender.publish_trade(&trade).await.unwrap_err();
+        assert_eq!(error.to_string(), "Publisher channel send timed out");
+        assert!(!error.to_string().contains("publisher-payload-sentinel"));
     }
 }

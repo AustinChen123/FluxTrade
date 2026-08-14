@@ -32,9 +32,7 @@ pub(crate) async fn run_event_loop(
             msg = trade_rx.recv(), if trade_open => {
                 match msg {
                     Some(trade) => {
-                        if let Err(e) = pub_sender.publish_trade(&trade).await {
-                            warn!("Failed to send trade to publisher: {}", e);
-                        }
+                        pub_sender.publish_trade(&trade).await?;
                     }
                     None => {
                         info!("Trade channel closed");
@@ -46,7 +44,7 @@ pub(crate) async fn run_event_loop(
             msg = candle_rx.recv(), if candle_open => {
                 match msg {
                     Some(candle) => {
-                        publish_and_aggregate_candle(&mut aggregator, &pub_sender, candle).await;
+                        publish_and_aggregate_candle(&mut aggregator, &pub_sender, candle).await?;
                     }
                     None => {
                         info!("Candle channel closed");
@@ -60,14 +58,10 @@ pub(crate) async fn run_event_loop(
                     Some(event) => {
                         match event {
                             UserStreamEvent::Account(update) => {
-                                if let Err(e) = pub_sender.publish_account_update(&update).await {
-                                    warn!("Failed to send account update to publisher: {}", e);
-                                }
+                                pub_sender.publish_account_update(&update).await?;
                             }
                             UserStreamEvent::Position(update) => {
-                                if let Err(e) = pub_sender.publish_position_update(&update).await {
-                                    warn!("Failed to send position update to publisher: {}", e);
-                                }
+                                pub_sender.publish_position_update(&update).await?;
                             }
                         }
                     }
@@ -81,7 +75,7 @@ pub(crate) async fn run_event_loop(
             event = aggregation_source_rx.recv(), if aggregation_source_open => {
                 match event {
                     Some(AggregationSourceEvent::Candle(candle)) => {
-                        publish_and_aggregate_candle(&mut aggregator, &pub_sender, candle).await;
+                        publish_and_aggregate_candle(&mut aggregator, &pub_sender, candle).await?;
                     }
                     Some(AggregationSourceEvent::ResetProduct(product_id)) => {
                         aggregator.reset_product(&product_id);
@@ -105,10 +99,8 @@ async fn publish_and_aggregate_candle(
     aggregator: &mut CandleAggregator,
     pub_sender: &PublishSender,
     candle: model::Candlestick,
-) {
-    if let Err(e) = pub_sender.publish_candle(&candle).await {
-        warn!("Failed to send candle to publisher: {}", e);
-    }
+) -> anyhow::Result<()> {
+    pub_sender.publish_candle(&candle).await?;
 
     for target_timeframe in ["5m", "15m"] {
         let can_derive = CandleAggregator::can_aggregate(&candle.timeframe, target_timeframe);
@@ -125,12 +117,7 @@ async fn publish_and_aggregate_candle(
         }
         match aggregator.add_candle(&candle, target_timeframe) {
             Ok(Some(completed)) => {
-                if let Err(e) = pub_sender.publish_candle(&completed).await {
-                    warn!(
-                        "Failed to send {} candle to publisher: {}",
-                        target_timeframe, e
-                    );
-                }
+                pub_sender.publish_candle(&completed).await?;
             }
             Ok(None) => {}
             Err(e) => warn!(
@@ -139,6 +126,7 @@ async fn publish_and_aggregate_candle(
             ),
         }
     }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -347,43 +335,141 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn closed_publisher_is_nonfatal_for_live_event_forwarding() {
+    #[derive(Clone, Copy)]
+    enum DirectEventCase {
+        Trade,
+        Candle,
+        Account,
+        Position,
+    }
+
+    async fn run_direct_event_with_closed_publisher(case: DirectEventCase) -> anyhow::Result<()> {
         let (trade_tx, trade_rx) = mpsc::channel(1);
         let (candle_tx, candle_rx) = mpsc::channel(1);
         let (user_tx, user_rx) = mpsc::channel(1);
         let (aggregation_tx, aggregation_rx) = mpsc::channel(1);
         let (pub_sender, pub_rx) = create_publish_channel(1);
         drop(pub_rx);
-        let event_loop = tokio::spawn(run_event_loop(
-            trade_rx,
-            candle_rx,
-            user_rx,
-            aggregation_rx,
-            pub_sender,
-        ));
 
-        trade_tx
-            .send(model::Trade {
-                id: "trade-closed-publisher".to_string(),
-                product_id: "BINANCE:BTCUSDT-PERP".to_string(),
-                price: rust_decimal_macros::dec!(100),
-                quantity: rust_decimal_macros::dec!(1),
-                side: "sell".to_string(),
-                timestamp: 1_800_000_000_000,
-            })
-            .await
-            .unwrap();
+        match case {
+            DirectEventCase::Trade => trade_tx
+                .send(model::Trade {
+                    id: "trade-closed-publisher".to_string(),
+                    product_id: "BINANCE:BTCUSDT-PERP".to_string(),
+                    price: rust_decimal_macros::dec!(100),
+                    quantity: rust_decimal_macros::dec!(1),
+                    side: "sell".to_string(),
+                    timestamp: 1_800_000_000_000,
+                })
+                .await
+                .unwrap(),
+            DirectEventCase::Candle => candle_tx
+                .send(model::Candlestick {
+                    product_id: "BINANCE:BTCUSDT-PERP".to_string(),
+                    timeframe: "5m".to_string(),
+                    timestamp: 1_800_000_000_000,
+                    open: rust_decimal_macros::dec!(100),
+                    high: rust_decimal_macros::dec!(101),
+                    low: rust_decimal_macros::dec!(99),
+                    close: rust_decimal_macros::dec!(100),
+                    volume: rust_decimal_macros::dec!(1),
+                })
+                .await
+                .unwrap(),
+            DirectEventCase::Account => user_tx
+                .send(UserStreamEvent::Account(model::AccountUpdate {
+                    exchange: "binance".to_string(),
+                    asset: "USDT".to_string(),
+                    balance: rust_decimal_macros::dec!(1000),
+                    timestamp: 1_800_000_000_000,
+                }))
+                .await
+                .unwrap(),
+            DirectEventCase::Position => user_tx
+                .send(UserStreamEvent::Position(model::PositionUpdate {
+                    exchange: "binance".to_string(),
+                    symbol: "BTCUSDT".to_string(),
+                    amount: rust_decimal_macros::dec!(1),
+                    entry_price: rust_decimal_macros::dec!(100),
+                    unrealized_pnl: rust_decimal_macros::dec!(2),
+                    timestamp: 1_800_000_000_000,
+                }))
+                .await
+                .unwrap(),
+        }
         drop(trade_tx);
         drop(candle_tx);
         drop(user_tx);
         drop(aggregation_tx);
 
-        assert!(tokio::time::timeout(Duration::from_secs(1), event_loop)
+        run_event_loop(trade_rx, candle_rx, user_rx, aggregation_rx, pub_sender).await
+    }
+
+    #[tokio::test]
+    async fn closed_publisher_is_fatal_for_every_direct_event_family() {
+        for case in [
+            DirectEventCase::Trade,
+            DirectEventCase::Candle,
+            DirectEventCase::Account,
+            DirectEventCase::Position,
+        ] {
+            let error = tokio::time::timeout(
+                Duration::from_secs(1),
+                run_direct_event_with_closed_publisher(case),
+            )
             .await
             .unwrap()
-            .unwrap()
-            .is_ok());
+            .unwrap_err();
+            assert!(error.to_string().contains("channel closed"));
+        }
+    }
+
+    #[tokio::test]
+    async fn derived_candle_publish_failure_escapes_the_event_loop() {
+        let (trade_tx, trade_rx) = mpsc::channel(1);
+        let (candle_tx, candle_rx) = mpsc::channel(4);
+        let (user_tx, user_rx) = mpsc::channel(1);
+        let (aggregation_tx, aggregation_rx) = mpsc::channel(1);
+        let (pub_sender, mut pub_rx) = create_publish_channel(1);
+        drop(trade_tx);
+        drop(user_tx);
+        drop(aggregation_tx);
+
+        for index in 0..4 {
+            candle_tx
+                .send(model::Candlestick {
+                    product_id: "RITHMIC:NQ-202609".to_string(),
+                    timeframe: "5m".to_string(),
+                    timestamp: 1_800_000_000_000 + index * 5 * 60 * 1000,
+                    open: rust_decimal_macros::dec!(100),
+                    high: rust_decimal_macros::dec!(101),
+                    low: rust_decimal_macros::dec!(99),
+                    close: rust_decimal_macros::dec!(100),
+                    volume: rust_decimal_macros::dec!(1),
+                })
+                .await
+                .unwrap();
+        }
+        drop(candle_tx);
+
+        let receiver = tokio::spawn(async move {
+            for _ in 0..4 {
+                assert!(matches!(
+                    pub_rx.recv().await,
+                    Some(PublishMessage::Candle(candle)) if candle.timeframe == "5m"
+                ));
+            }
+        });
+        let result = tokio::time::timeout(
+            Duration::from_secs(1),
+            run_event_loop(trade_rx, candle_rx, user_rx, aggregation_rx, pub_sender),
+        )
+        .await
+        .unwrap();
+        receiver.await.unwrap();
+
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("channel closed"));
     }
 
     #[tokio::test]
