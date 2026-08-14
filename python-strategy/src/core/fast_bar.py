@@ -10,9 +10,10 @@ from __future__ import annotations
 from collections import deque
 from dataclasses import dataclass
 from decimal import Decimal
-from typing import Deque, Iterable, Protocol
+from typing import Deque, Iterable, Protocol, runtime_checkable
 
 import numpy as np
+from numpy.typing import DTypeLike
 
 from src.core.analytics import calculate_metrics
 from src.core.backtest.endpoint_state import build_replay_endpoint_state
@@ -34,6 +35,7 @@ class InvalidFastBarIntent(ValueError):
     """Raised when an intent exceeds the FastBar market-order contract."""
 
 
+@runtime_checkable
 class PreparedStrategy(Protocol):
     """Fast strategy runtime prepared once for a specific replay/live context."""
 
@@ -51,7 +53,14 @@ def prepare_fast_strategy(strategy: BaseStrategy) -> PreparedStrategy:
             f"{type(strategy).__name__} does not support fast-bar execution; "
             "implement prepare_fast() or use ResearchBacktestRunner."
         )
-    return prepare_fast()
+    prepared = prepare_fast()
+    if (
+        not isinstance(prepared, PreparedStrategy)
+        or not isinstance(prepared.strategy_id, str)
+        or not callable(prepared.on_bar)
+    ):
+        raise TypeError("prepare_fast() must return PreparedStrategy")
+    return prepared
 
 
 @dataclass(frozen=True, slots=True)
@@ -128,7 +137,9 @@ class MarketTape:
         if self._length is None:
             self._length = capacity
         if self._length < 0 or self._length > capacity:
-            raise ValueError("MarketTape length must be between zero and array capacity")
+            raise ValueError(
+                "MarketTape length must be between zero and array capacity"
+            )
         self.timestamps = self.timestamps.astype(np.int64, copy=False)
         self.open = self.open.astype(np.float64, copy=False)
         self.high = self.high.astype(np.float64, copy=False)
@@ -428,16 +439,8 @@ class FastBarReplayRunner:
             contract_multiplier=self.contract_multiplier,
         )
         last_index = len(self.tape) - 1
-        final_mark = (
-            None
-            if last_index < 0
-            else Decimal(str(closes[last_index]))
-        )
-        end_timestamp = (
-            None
-            if last_index < 0
-            else int(timestamps[last_index])
-        )
+        final_mark = None if last_index < 0 else Decimal(str(closes[last_index]))
+        end_timestamp = None if last_index < 0 else int(timestamps[last_index])
         endpoint_state = build_replay_endpoint_state(
             positions=engine.positions.values(),
             working_orders=engine.open_orders,
@@ -475,7 +478,8 @@ class FastBarReplayRunner:
             "endpoint_state": endpoint_state,
         }
 
-def _resize_array(array: np.ndarray, capacity: int, dtype: np.dtype) -> np.ndarray:
+
+def _resize_array(array: np.ndarray, capacity: int, dtype: DTypeLike) -> np.ndarray:
     resized = np.empty(capacity, dtype=dtype)
     resized[: len(array)] = array
     return resized
@@ -495,9 +499,7 @@ def _resolve_fast_bar_order_intent(
 
     quantity = intent.quantity
     if quantity is not None and (
-        not isinstance(quantity, Decimal)
-        or not quantity.is_finite()
-        or quantity <= 0
+        not isinstance(quantity, Decimal) or not quantity.is_finite() or quantity <= 0
     ):
         raise InvalidFastBarIntent(
             "invalid_fast_bar_intent: quantity must be a finite Decimal "
