@@ -343,8 +343,11 @@ class RithmicExchangeAdapter(IExchangeAdapter):
             return False
         if snapshot.status in {"filled", "cancelled", "rejected"}:
             return False
+        exchange_order_id = snapshot.exchange_order_id
+        if type(exchange_order_id) is not str or not str.strip(exchange_order_id):
+            raise ExchangeError("rithmic_order_cancel_basket_id_required")
         return self.cancel_order(
-            snapshot.exchange_order_id,
+            exchange_order_id,
             product_id,
             order_type=order_type,
         )

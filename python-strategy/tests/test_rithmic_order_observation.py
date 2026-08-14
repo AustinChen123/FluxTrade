@@ -165,6 +165,18 @@ def test_snapshot_nonpositive_quantity_is_rejected(quantity):
         )
 
 
+@pytest.mark.parametrize("basket_id", [None, "", "   "])
+def test_snapshot_requires_a_usable_basket_identity(basket_id):
+    with pytest.raises(
+        ExchangeError,
+        match="rithmic_order_snapshot_basket_id_required",
+    ):
+        project_rithmic_order_snapshot(
+            snapshot(basket_id=basket_id),
+            account_id=ACCOUNT_ID,
+        )
+
+
 @pytest.mark.parametrize(
     ("notification", "filled", "expected", "message"),
     [

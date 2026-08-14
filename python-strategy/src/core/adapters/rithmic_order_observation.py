@@ -34,14 +34,17 @@ def project_rithmic_order_snapshot(
         quantity,
         notification_type=getattr(remote, "notification_type", None),
     )
+    basket_id = getattr(remote, "basket_id")
+    if type(basket_id) is not str or not str.strip(basket_id):
+        raise ExchangeError("rithmic_order_snapshot_basket_id_required")
     return ExchangeOrderSnapshot(
         client_order_id=str(getattr(remote, "client_order_id")),
-        exchange_order_id=str(getattr(remote, "basket_id")),
+        exchange_order_id=basket_id,
         status=status,
         filled_quantity=filled_quantity,
         average_price=_event_decimal(getattr(remote, "average_fill_price")),
         raw={
-            "basket_id": str(getattr(remote, "basket_id")),
+            "basket_id": basket_id,
             "exchange_order_id": getattr(remote, "exchange_order_id"),
             "quantity": str(getattr(remote, "quantity")),
             "account_id": account_id,

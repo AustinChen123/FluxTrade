@@ -12,7 +12,11 @@ from src.core.adapters.rithmic_adapter import (
     RithmicExchangeAdapter,
     RithmicUnmappedOrderEvent,
 )
-from src.core.interfaces.exchange import ExchangeError, NetworkError
+from src.core.interfaces.exchange import (
+    ExchangeError,
+    ExchangeOrderSnapshot,
+    NetworkError,
+)
 from src.core.models import PositionSide
 from src.core.order_reconciliation import OrderReconciler
 
@@ -1200,6 +1204,67 @@ def test_cancel_by_client_id_uses_lookup_basket_identity(adapter, client):
     assert adapter.cancel_order_by_client_id("client-1", PRODUCT_ID) is True
 
     client.cancel.assert_called_once_with("basket-1")
+
+
+def test_cancel_by_client_id_does_not_cancel_when_lookup_is_missing(adapter, client):
+    adapter.start_order_event_stream()
+    client.lookup.return_value = None
+
+    assert adapter.cancel_order_by_client_id("client-1", PRODUCT_ID) is False
+
+    client.cancel.assert_not_called()
+
+
+def test_cancel_by_client_id_checks_terminal_state_before_basket_identity(
+    adapter,
+    client,
+    monkeypatch,
+):
+    adapter.start_order_event_stream()
+    monkeypatch.setattr(
+        adapter,
+        "get_order_by_client_id",
+        Mock(
+            return_value=ExchangeOrderSnapshot(
+                client_order_id="client-1",
+                exchange_order_id=None,
+                status="filled",
+            )
+        ),
+    )
+
+    assert adapter.cancel_order_by_client_id("client-1", PRODUCT_ID) is False
+
+    client.cancel.assert_not_called()
+
+
+@pytest.mark.parametrize("exchange_order_id", [None, "", "   "])
+def test_cancel_by_client_id_rejects_active_snapshot_without_basket_identity(
+    adapter,
+    client,
+    monkeypatch,
+    exchange_order_id,
+):
+    adapter.start_order_event_stream()
+    monkeypatch.setattr(
+        adapter,
+        "get_order_by_client_id",
+        Mock(
+            return_value=ExchangeOrderSnapshot(
+                client_order_id="client-1",
+                exchange_order_id=exchange_order_id,
+                status="open",
+            )
+        ),
+    )
+
+    with pytest.raises(
+        ExchangeError,
+        match="rithmic_order_cancel_basket_id_required",
+    ):
+        adapter.cancel_order_by_client_id("client-1", PRODUCT_ID)
+
+    client.cancel.assert_not_called()
 
 
 def test_cancel_by_client_id_does_not_cancel_terminal_snapshot(adapter, client):
