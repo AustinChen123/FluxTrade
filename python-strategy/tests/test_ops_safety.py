@@ -22,9 +22,17 @@ import pytest
 from sqlalchemy import create_engine, event, text
 from sqlalchemy.orm import sessionmaker
 
+from src.core.adapters.ccxt_adapter import CcxtExchangeAdapter
 from src.core.execution import ExecutionEngine, FlattenPending
 from src.core.interfaces.exchange import ExchangeError, NetworkError
-from src.core.models import Candlestick, OrderStatus, Position, PositionSide, Signal, SignalType
+from src.core.models import (
+    Candlestick,
+    OrderStatus,
+    Position,
+    PositionSide,
+    Signal,
+    SignalType,
+)
 from src.core.ops_safety import OpsSafetyService
 from src.core.orm_models import Exchange, Order, Product, Strategy
 from src.core.repositories import LiveOrderRepository
@@ -324,6 +332,67 @@ class TestKillSwitchIdempotency:
             "exchange_positions_unavailable" in failure["reason"]
             for failure in result["flatten_failures"]
         )
+
+    def test_scoped_unified_short_places_one_reduce_only_buy_after_bulk_failure(
+        self,
+        mock_clock,
+        mock_db_session,
+        mock_order_repo,
+    ):
+        import ccxt as ccxt_lib
+
+        client = MagicMock()
+        client.load_markets.return_value = {
+            "BTC/USDT:USDT": {
+                "contract": True,
+                "linear": True,
+                "inverse": False,
+                "contractSize": "1",
+            }
+        }
+
+        def fetch_positions(symbols=None):
+            if symbols is None:
+                raise ccxt_lib.ExchangeError("bulk position lookup unavailable")
+            return [
+                {
+                    "symbol": "BTC/USDT:USDT",
+                    "contracts": 2,
+                    "side": "short",
+                    "entryPrice": 70000,
+                    "unrealizedPnl": -50,
+                }
+            ]
+
+        client.fetch_positions.side_effect = fetch_positions
+        client.create_order.return_value = {"id": "EX-FLAT"}
+        with patch("src.core.adapters.ccxt_adapter.ccxt") as mock_ccxt:
+            mock_ccxt.binance = MagicMock(return_value=client)
+            adapter = CcxtExchangeAdapter(
+                exchange_id="binance",
+                api_key="test-key",
+                secret="test-secret",
+            )
+
+        execution_engine = ExecutionEngine(
+            db_session=mock_db_session,
+            clock=mock_clock,
+            adapter=adapter,
+            order_repository=mock_order_repo,
+        )
+        service = OpsSafetyService(
+            execution_engine,
+            FakeAccountService(positions=[_make_position()]),
+            _make_null_db_session_factory(),
+        )
+
+        result = service.kill_switch(actor="ops", reason="degraded_exchange")
+
+        assert result["flattened_positions"] == 1
+        client.create_order.assert_called_once()
+        call_kwargs = client.create_order.call_args.kwargs
+        assert call_kwargs["side"] == "buy"
+        assert call_kwargs["params"]["reduceOnly"] is True
 
     def test_already_flat_audit_event_still_written(self):
         """Audit event must be written even when already flat."""

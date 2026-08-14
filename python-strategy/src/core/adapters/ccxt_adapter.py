@@ -505,7 +505,12 @@ class CcxtExchangeAdapter(IExchangeAdapter):
             if contracts == 0:
                 return None
 
-            side = "LONG" if contracts > 0 else "SHORT"
+            side_value = str(pos.get("side") or "").lower()
+            side = (
+                PositionSide.SHORT
+                if side_value == "short" or contracts < 0
+                else PositionSide.LONG
+            )
             return Position(
                 strategy_id="LIVE",
                 product_id=product_id,

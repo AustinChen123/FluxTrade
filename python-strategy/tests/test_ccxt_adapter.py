@@ -1522,11 +1522,13 @@ class TestGetBalance:
 
 
 class TestGetPosition:
-    def test_long_position(self, adapter, mock_ccxt_client):
+    @pytest.mark.parametrize("unified_side", ["long", None], ids=["unified", "signed"])
+    def test_long_position(self, adapter, mock_ccxt_client, unified_side):
         mock_ccxt_client.fetch_positions.return_value = [
             {
                 "symbol": "BTC/USDT:USDT",
                 "contracts": 0.5,
+                "side": unified_side,
                 "entryPrice": 65000,
                 "unrealizedPnl": 100,
             }
@@ -1554,9 +1556,39 @@ class TestGetPosition:
         assert pos.side is PositionSide.SHORT
         assert pos.quantity == Decimal("0.3")
 
-    def test_no_position_returns_none(self, adapter, mock_ccxt_client):
+    def test_unified_short_position_uses_side_with_positive_contracts(
+        self, adapter, mock_ccxt_client
+    ):
         mock_ccxt_client.fetch_positions.return_value = [
-            {"symbol": "BTC/USDT:USDT", "contracts": 0, "entryPrice": 0, "unrealizedPnl": 0}
+            {
+                "symbol": "BTC/USDT:USDT",
+                "contracts": 2,
+                "side": "short",
+                "entryPrice": 70000,
+                "unrealizedPnl": -50,
+            }
+        ]
+
+        position = adapter.get_position("BINANCE:BTCUSDT-PERP")
+
+        assert position is not None
+        assert position.side is PositionSide.SHORT
+        assert position.quantity == Decimal("2")
+
+    @pytest.mark.parametrize(
+        "unified_side", [None, "long", "short"], ids=["absent", "long", "short"]
+    )
+    def test_no_position_returns_none(
+        self, adapter, mock_ccxt_client, unified_side
+    ):
+        mock_ccxt_client.fetch_positions.return_value = [
+            {
+                "symbol": "BTC/USDT:USDT",
+                "contracts": 0,
+                "side": unified_side,
+                "entryPrice": 0,
+                "unrealizedPnl": 0,
+            }
         ]
         assert adapter.get_position("BINANCE:BTCUSDT-PERP") is None
 
