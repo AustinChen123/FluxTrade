@@ -95,5 +95,109 @@ def test_dedicated_venue_owner_precedes_shared_websocket_reader(monkeypatch) -> 
     )
 
     assert result is owner_result
+    assert result["balance_asset"] == "USDT"
     owner.assert_called_once_with(product_ids=products, environ=environ)
     websocket_reader.assert_not_called()
+
+
+@pytest.mark.parametrize(
+    ("exchange", "product_id", "owner_path", "expected_asset"),
+    [
+        (
+            "binance",
+            "BINANCE:BTCUSDT-PERP",
+            "src.core.adapters.binance_live_config.build_binance_live_adapter_config",
+            "USDT",
+        ),
+        (
+            "backpack",
+            "BACKPACK:SOLUSDC-PERP",
+            "src.core.adapters.backpack_live_config.build_backpack_live_adapter_config",
+            "USDC",
+        ),
+    ],
+)
+def test_live_ccxt_config_derives_exact_balance_asset(
+    monkeypatch,
+    exchange,
+    product_id,
+    owner_path,
+    expected_asset,
+) -> None:
+    owner = MagicMock(return_value={"mode": "live", "exchange": exchange})
+    monkeypatch.setattr(owner_path, owner)
+
+    result = adapter_runtime_composition.build_live_adapter_config(
+        exchange=exchange,
+        product_ids=[product_id],
+        environ={},
+        read_enable_ws=MagicMock(),
+    )
+
+    assert result["balance_asset"] == expected_asset
+    owner.assert_called_once_with(product_ids=[product_id], environ={})
+
+
+@pytest.mark.parametrize(
+    "product_ids",
+    [
+        ["BINANCE:BTCUSDT-PERP", "BINANCE:BTCUSDC-PERP"],
+        ["BINANCE:BTCUSDT-PERP", "BINANCE:ETHUSDT-PERP"],
+    ],
+    ids=["mixed", "missing"],
+)
+def test_invalid_balance_asset_fails_before_venue_owner(
+    monkeypatch,
+    product_ids,
+) -> None:
+    owner = MagicMock(side_effect=AssertionError("venue owner called"))
+    monkeypatch.setattr(
+        "src.core.adapters.binance_live_config.build_binance_live_adapter_config",
+        owner,
+    )
+    if product_ids[1].startswith("BINANCE:ETH"):
+        original = adapter_runtime_composition.to_base_quote
+        monkeypatch.setattr(
+            adapter_runtime_composition,
+            "to_base_quote",
+            lambda product_id: (
+                ("ETH", "")
+                if product_id.startswith("BINANCE:ETH")
+                else original(product_id)
+            ),
+        )
+
+    with pytest.raises(ValueError, match="common balance asset"):
+        adapter_runtime_composition.build_live_adapter_config(
+            exchange="binance",
+            product_ids=product_ids,
+            environ={"EXCHANGE_API_KEY": "credential-sentinel"},
+            read_enable_ws=MagicMock(),
+        )
+
+    owner.assert_not_called()
+
+
+def test_rithmic_config_has_no_generic_balance_asset(monkeypatch) -> None:
+    owner = MagicMock(return_value={"account_id": "ACCOUNT"})
+    monkeypatch.setattr(
+        "src.core.adapters.rithmic_live_config.build_rithmic_live_adapter_config",
+        owner,
+    )
+
+    result = adapter_runtime_composition.build_live_adapter_config(
+        exchange="rithmic",
+        product_ids=["RITHMIC:MNQ-202609"],
+        environ={},
+        read_enable_ws=lambda: False,
+    )
+
+    assert "balance_asset" not in result
+
+
+def test_live_ccxt_runtime_config_requires_composed_balance_asset() -> None:
+    with pytest.raises(ValueError, match="common balance asset"):
+        adapter_runtime_composition.validate_runtime_config(
+            {"mode": "live", "exchange": "binance"},
+            audit_external_orders=True,
+        )

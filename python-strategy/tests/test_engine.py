@@ -239,6 +239,25 @@ def _make_candle(
     )
 
 
+def _live_ccxt_engine(engine_factory):
+    with patch(
+        "src.core.engine.RuntimeEnvironment.from_env",
+        return_value=RuntimeEnvironment("live"),
+    ):
+        engine = engine_factory(
+            adapter_config={
+                "mode": "live",
+                "exchange": "binance",
+                "instrument_product_ids": ["BINANCE:BTCUSDT-PERP"],
+                "balance_asset": "USDT",
+            },
+            runtime_bootstrap_factory=None,
+            runtime_capabilities_factory=None,
+        )
+    engine.account_service.replace_generic_balance = MagicMock()
+    return engine
+
+
 def _rithmic_runtime_factory_kwargs() -> dict[str, Any]:
     return {
         "runtime_bootstrap_factory": prepare_rithmic_runtime_bootstrap,
@@ -3396,6 +3415,252 @@ class TestHeartbeatRecording:
         )
 
         engine.redis_client.get.assert_not_called()
+
+    def test_live_ccxt_engine_installs_balance_entry_admission_handler(
+        self,
+        engine_factory,
+    ):
+        engine = _live_ccxt_engine(engine_factory)
+
+        assert engine._entry_admission_gate is None
+        assert engine._signal_processor.entry_admission_handler == (
+            engine._entry_signal_allowed_for_processor
+        )
+
+    def test_live_ccxt_startup_uses_adapter_and_persists_risk_balance(
+        self,
+        engine_factory,
+    ):
+        engine = _live_ccxt_engine(engine_factory)
+        adapter = engine.execution_engine.adapter
+        adapter.get_balance = MagicMock(return_value=Decimal("50000.2500"))
+        engine.account_service.get_balance = MagicMock(
+            side_effect=AssertionError("stale local balance read")
+        )
+
+        assert engine._reconcile_startup_balance() == Decimal("50000.2500")
+
+        adapter.get_balance.assert_called_once_with("USDT")
+        engine.account_service.get_balance.assert_not_called()
+        engine.account_service.replace_generic_balance.assert_called_once_with(
+            Decimal("50000.2500")
+        )
+        assert engine._startup_balance_entry_admission_safe is True
+
+    @pytest.mark.parametrize(
+        ("failure_stage", "balance"),
+        [
+            ("adapter_read", Decimal("50000")),
+            ("value_validation", Decimal("-1")),
+            ("value_validation", Decimal("NaN")),
+            ("value_validation", Decimal("Infinity")),
+            ("value_validation", "50000"),
+            ("account_persistence", Decimal("50000")),
+        ],
+    )
+    def test_live_ccxt_balance_failure_latches_once_without_secret_leak(
+        self,
+        engine_factory,
+        failure_stage,
+        balance,
+        caplog,
+    ):
+        engine = _live_ccxt_engine(engine_factory)
+        adapter = engine.execution_engine.adapter
+        secret = "provider-secret-sentinel"
+        adapter.get_balance = MagicMock(return_value=balance)
+        if failure_stage == "adapter_read":
+            adapter.get_balance.side_effect = RuntimeError(secret)
+        if failure_stage == "account_persistence":
+            engine.account_service.replace_generic_balance.side_effect = RuntimeError(
+                secret
+            )
+
+        with caplog.at_level(logging.ERROR, logger="src.core.engine"):
+            assert engine._reconcile_startup_balance() is None
+
+        assert engine._startup_balance_entry_admission_safe is False
+        assert engine._startup_balance_failure_latched is True
+        records = [
+            record
+            for record in caplog.records
+            if getattr(record, "event_code", None)
+            == "startup_balance_authority_unavailable"
+        ]
+        assert len(records) == 1
+        record = records[0]
+        assert record.levelname == "ERROR"
+        assert record.getMessage() == (
+            "Live startup balance authority unavailable; entry admission latched"
+        )
+        assert {
+            "component": vars(record)["component"],
+            "stage": vars(record)["stage"],
+            "asset": vars(record)["asset"],
+        } == {
+            "component": "strategy_engine",
+            "stage": failure_stage,
+            "asset": "USDT",
+        }
+
+        def contains_secret_or_exception(value):
+            if isinstance(value, BaseException):
+                return True
+            if type(value) is str:
+                return secret in value
+            if type(value) is dict:
+                return any(
+                    contains_secret_or_exception(item)
+                    for pair in value.items()
+                    for item in pair
+                )
+            if type(value) in (list, tuple, set, frozenset):
+                return any(contains_secret_or_exception(item) for item in value)
+            return False
+
+        assert not contains_secret_or_exception(vars(record))
+
+        adapter.get_balance.side_effect = None
+        adapter.get_balance.return_value = Decimal("50000")
+        engine.account_service.replace_generic_balance.side_effect = None
+        assert engine._reconcile_startup_balance() == Decimal("50000")
+        adapter.get_balance.side_effect = RuntimeError(secret)
+        assert engine._reconcile_startup_balance() is None
+        assert engine._startup_balance_entry_admission_safe is False
+        assert (
+            len(
+                [
+                    record
+                    for record in caplog.records
+                    if getattr(record, "event_code", None)
+                    == "startup_balance_authority_unavailable"
+                ]
+            )
+            == 1
+        )
+
+    def test_live_ccxt_zero_balance_is_safe_then_later_failure_closes(
+        self,
+        engine_factory,
+    ):
+        engine = _live_ccxt_engine(engine_factory)
+        adapter = engine.execution_engine.adapter
+        adapter.get_balance = MagicMock(return_value=Decimal("0"))
+
+        assert engine._reconcile_startup_balance() == Decimal("0")
+        assert engine._startup_balance_entry_admission_safe is True
+
+        adapter.get_balance.side_effect = RuntimeError("later failure")
+        assert engine._reconcile_startup_balance() is None
+        assert engine._startup_balance_entry_admission_safe is False
+        assert engine._startup_balance_failure_latched is True
+
+    def test_live_ccxt_manual_clear_cannot_reopen_balance_latch(
+        self,
+        engine_factory,
+    ):
+        engine = _live_ccxt_engine(engine_factory)
+        engine.execution_engine.adapter.get_balance = MagicMock(
+            side_effect=RuntimeError("balance unavailable")
+        )
+        engine._reconcile_startup_balance()
+        engine._kill_switch_halted = True
+        engine.ops_safety.clear_kill_switch = MagicMock(
+            return_value={"cleared": True, "reason": "cleared"}
+        )
+
+        engine._handle_command({"command": "CLEAR_KILL_SWITCH", "params": {}})
+
+        assert engine._kill_switch_halted is False
+        assert engine._startup_balance_entry_admission_safe is False
+        signal = Signal(
+            strategy_id="test",
+            product_id="BINANCE:BTCUSDT-PERP",
+            timeframe="1m",
+            timestamp=1704067200000,
+            type=SignalType.LONG,
+            value=Decimal("42000"),
+        )
+        engine.risk_manager.check_risk = MagicMock()
+        engine.execution_engine.execute_signal = MagicMock()
+        assert engine.process_signal(signal, _make_candle()) is False
+        engine.risk_manager.check_risk.assert_not_called()
+        engine.execution_engine.execute_signal.assert_not_called()
+
+    def test_live_ccxt_balance_latch_restores_portfolio_entry_and_keeps_exit(
+        self,
+        engine_factory,
+        mock_strategy_class,
+    ):
+        engine = _live_ccxt_engine(engine_factory)
+
+        class StatefulSleeve(mock_strategy_class):
+            def __init__(self, strategy_id, signal_type):
+                super().__init__(strategy_id, "BINANCE:BTCUSDT-PERP")
+                self.signal_type = signal_type
+                self._in_position = False
+                self.restore_calls = 0
+
+            def on_candle(self, candle):
+                if self.signal_type == SignalType.LONG:
+                    self._in_position = True
+                return Signal(
+                    strategy_id=self.strategy_id,
+                    product_id=self.product_id,
+                    timeframe=candle.timeframe,
+                    timestamp=candle.timestamp,
+                    type=self.signal_type,
+                    quantity=Decimal("1"),
+                    value=candle.close,
+                )
+
+            def snapshot_walk_forward_trade_state(self):
+                return self._in_position
+
+            def restore_walk_forward_trade_state(self, state):
+                self.restore_calls += 1
+                self._in_position = state
+
+        entry = StatefulSleeve("portfolio.entry", SignalType.LONG)
+        exit_sleeve = StatefulSleeve("portfolio.exit", SignalType.EXIT_LONG)
+        idle = StatefulSleeve("portfolio.idle", SignalType.NO_SIGNAL)
+        engine._register_portfolio_definition(
+            PortfolioDefinition(
+                portfolio_id="portfolio",
+                product_id=entry.product_id,
+                sleeves=tuple(
+                    PortfolioSleeve(strategy) for strategy in (entry, exit_sleeve, idle)
+                ),
+                max_gross_quantity=Decimal("1"),
+                readiness="LIVE_APPROVED",
+                exclusive_slots=(
+                    PortfolioExclusiveSlot(
+                        slot_id="entry-slot",
+                        strategy_ids=(entry.strategy_id, idle.strategy_id),
+                    ),
+                ),
+            )
+        )
+        engine._signal_processor.exposure_loader = (
+            lambda *_args: PortfolioExposureSnapshot({})
+        )
+        engine._strategy_state_manager.is_running = MagicMock(return_value=True)
+        engine._live_candle_application._environment_identity = lambda: "test"
+        engine._live_candle_application._persist = MagicMock()
+        engine.risk_manager.check_risk = MagicMock(return_value=(True, "PASS"))
+        engine.execution_engine.execute_signal = MagicMock(return_value="exit-order")
+
+        candle = _make_candle()
+        engine.on_market_data(candle)
+
+        assert entry._in_position is False
+        assert entry.restore_calls == 1
+        engine._live_candle_application._persist.assert_called_once_with(candle)
+        engine.execution_engine.execute_signal.assert_called_once()
+        assert (
+            engine.execution_engine.execute_signal.call_args.args[0].type
+            == SignalType.EXIT_LONG
+        )
 
     def test_safe_startup_arms_liveness_before_resume_and_heartbeat(
         self,

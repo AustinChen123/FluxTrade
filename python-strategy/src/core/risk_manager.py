@@ -140,6 +140,17 @@ class AccountService:
         balance = self.redis.hget("state:balance:main", "free")
         return Decimal(balance) if balance else Decimal("0")
 
+    def replace_generic_balance(self, balance: Decimal) -> None:
+        """Replace the generic account balance read by RiskManager."""
+        if not self.redis:
+            raise RuntimeError("generic_balance_cache_unavailable")
+        if type(balance) is not Decimal or not balance.is_finite() or balance < 0:
+            raise ValueError("generic_balance_invalid")
+        self.redis.hset(
+            "state:balance:main",
+            mapping={"free": str(balance)},
+        )
+
     def get_daily_nav_context(self) -> tuple[Decimal, Decimal] | None:
         if getattr(self, "_authoritative_balance_key", None) is None:
             return None

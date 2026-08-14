@@ -5,6 +5,7 @@ from __future__ import annotations
 from collections.abc import Callable, Mapping
 from typing import Any
 
+from src.core.product_registry import to_base_quote
 from src.core.runtime_capabilities import (
     RuntimeBootstrapFactory,
     RuntimeCapabilitiesFactory,
@@ -19,38 +20,52 @@ def build_live_adapter_config(
     read_enable_ws: Callable[[], bool],
 ) -> dict[str, Any]:
     """Delegate one live adapter config to its existing venue owner."""
+    balance_asset: str | None = None
+    if exchange != "rithmic":
+        quote_assets = {to_base_quote(product_id)[1] for product_id in product_ids}
+        if len(quote_assets) != 1 or not all(quote_assets):
+            raise ValueError("live CCXT products require one common balance asset")
+        balance_asset = quote_assets.pop()
     if exchange == "backpack":
         from src.core.adapters.backpack_live_config import (
             build_backpack_live_adapter_config,
         )
 
-        return build_backpack_live_adapter_config(
+        config = build_backpack_live_adapter_config(
             product_ids=product_ids,
             environ=environ,
         )
+        config["balance_asset"] = balance_asset
+        return config
     if exchange == "binance":
         from src.core.adapters.binance_live_config import (
             build_binance_live_adapter_config,
         )
 
-        return build_binance_live_adapter_config(
+        config = build_binance_live_adapter_config(
             product_ids=product_ids,
             environ=environ,
         )
+        config["balance_asset"] = balance_asset
+        return config
     if exchange == "bybit":
         from src.core.adapters.bybit_live_config import build_bybit_live_adapter_config
 
-        return build_bybit_live_adapter_config(
+        config = build_bybit_live_adapter_config(
             product_ids=product_ids,
             environ=environ,
         )
+        config["balance_asset"] = balance_asset
+        return config
     if exchange == "okx":
         from src.core.adapters.okx_live_config import build_okx_live_adapter_config
 
-        return build_okx_live_adapter_config(
+        config = build_okx_live_adapter_config(
             product_ids=product_ids,
             environ=environ,
         )
+        config["balance_asset"] = balance_asset
+        return config
 
     account_initialization = {
         "product_ids": product_ids,
@@ -75,6 +90,7 @@ def build_live_adapter_config(
         )
 
         config.update(build_ccxt_live_credentials(environ))
+        config["balance_asset"] = balance_asset
         return config
 
     from src.core.adapters.rithmic_live_config import (
@@ -106,6 +122,15 @@ def validate_runtime_config(
     )
 
     validate_rithmic_recovery_identity(adapter_config)
+    if (
+        adapter_config.get("mode") == "live"
+        and adapter_config.get("exchange") != "rithmic"
+        and (
+            type(adapter_config.get("balance_asset")) is not str
+            or not adapter_config.get("balance_asset")
+        )
+    ):
+        raise ValueError("live CCXT config requires one common balance asset")
 
 
 def runtime_factories_for_config(

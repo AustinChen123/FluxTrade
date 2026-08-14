@@ -363,6 +363,7 @@ def test_adapter_config_from_env_wires_live_account_initialization(monkeypatch) 
         "testnet": True,
         "enable_ws": False,
         "instrument_product_ids": ["BINANCE:BTCUSDT-PERP"],
+        "balance_asset": "USDT",
         "account_initialization": {
             "product_ids": ["BINANCE:BTCUSDT-PERP"],
             "position_mode": "one_way",
@@ -893,7 +894,7 @@ def test_validate_runtime_config_allows_simulated_without_audit() -> None:
 
 def test_validate_runtime_config_allows_live_with_audit() -> None:
     strategy_main._validate_runtime_config(
-        {"mode": "live"},
+        {"mode": "live", "exchange": "binance", "balance_asset": "USDT"},
         audit_external_orders=True,
     )
 

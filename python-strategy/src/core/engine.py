@@ -278,6 +278,15 @@ class StrategyEngine:
         # Live adapters are composed by the service entrypoint. Keep the local
         # simulated default for library and backtest callers.
         effective_adapter_config = adapter_config or {"mode": "simulated"}
+        configured_balance_asset = effective_adapter_config.get("balance_asset")
+        if configured_balance_asset is not None and (
+            type(configured_balance_asset) is not str or not configured_balance_asset
+        ):
+            raise ValueError("live balance asset must be a non-empty string")
+        self._live_balance_asset = cast(str | None, configured_balance_asset)
+        self._startup_balance_entry_admission_safe = self._live_balance_asset is None
+        self._startup_balance_failure_latched = False
+        self._startup_balance_failure_logged = False
         self._live_product_ids = (
             frozenset(effective_adapter_config.get("instrument_product_ids") or [])
             if effective_adapter_config.get("mode") == "live"
@@ -570,7 +579,10 @@ class StrategyEngine:
                 self.runtime_environment,
                 logger=logger,
             )
-        if self._entry_admission_gate is not None:
+        if (
+            self._entry_admission_gate is not None
+            or self._live_balance_asset is not None
+        ):
             self._signal_processor.entry_admission_handler = (
                 self._entry_signal_allowed_for_processor
             )
@@ -1220,11 +1232,13 @@ class StrategyEngine:
             self._reconcile_balance
         )
 
-    def _reconcile_balance(self) -> None:
+    def _reconcile_balance(self) -> Decimal | None:
         """
         Startup Reconciliation
         Force overwrite Redis balance from actual Exchange API.
         """
+        if self._live_balance_asset is not None:
+            return self._reconcile_live_balance()
         logger.info("💰 Reconciling Balance...")
         try:
             balance = self.account_service.get_balance()
@@ -1234,6 +1248,44 @@ class StrategyEngine:
             logger.warning(
                 "⚠️ Balance Reconciliation Failed: %s. Using DB/Redis state.", e
             )
+        return None
+
+    def _reconcile_live_balance(self) -> Decimal | None:
+        asset = cast(str, self._live_balance_asset)
+        stage = "adapter_read"
+        try:
+            balance = self.execution_engine.adapter.get_balance(asset)
+            stage = "value_validation"
+            if type(balance) is not Decimal or not balance.is_finite() or balance < 0:
+                raise ValueError("live_balance_invalid")
+            stage = "account_persistence"
+            self.account_service.replace_generic_balance(balance)
+        except Exception:
+            self._startup_balance_failure_latched = True
+            self._startup_balance_entry_admission_safe = False
+            if not self._startup_balance_failure_logged:
+                logger.error(
+                    "Live startup balance authority unavailable; entry admission latched",
+                    extra={
+                        "component": "strategy_engine",
+                        "event_code": "startup_balance_authority_unavailable",
+                        "stage": stage,
+                        "asset": asset,
+                    },
+                )
+                self._startup_balance_failure_logged = True
+            return None
+        if not self._startup_balance_failure_latched:
+            self._startup_balance_entry_admission_safe = True
+        logger.info(
+            "Live startup balance reconciled",
+            extra={
+                "component": "strategy_engine",
+                "event_code": "startup_balance_reconciled",
+                "asset": asset,
+            },
+        )
+        return balance
 
     def _check_system_state(self) -> bool:
         """
@@ -1457,6 +1509,22 @@ class StrategyEngine:
 
     def _entry_signal_allowed(self, signal: Signal) -> bool:
         """Apply the venue-owned health gate to new exposure only."""
+        if (
+            signal.type in (SignalType.LONG, SignalType.SHORT)
+            and self._live_balance_asset is not None
+            and not self._startup_balance_entry_admission_safe
+        ):
+            logger.warning(
+                "Entry signal rejected by startup balance authority",
+                extra={
+                    "component": "strategy_engine",
+                    "event_code": "entry_admission_rejected",
+                    "strategy_id": signal.strategy_id,
+                    "product_id": signal.product_id,
+                    "signal_type": signal.type.value,
+                },
+            )
+            return False
         if (
             signal.type in (SignalType.LONG, SignalType.SHORT)
             and self._entry_admission_gate is not None

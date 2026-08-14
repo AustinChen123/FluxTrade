@@ -988,6 +988,25 @@ class TestAccountService:
 
         assert service.get_balance() == Decimal("0")
 
+    def test_replace_generic_balance_persists_exact_risk_owner_field(self):
+        mock_redis = MagicMock()
+        mock_redis.ping.return_value = True
+        mock_redis.hget.return_value = "12345.6700"
+
+        with patch(
+            "src.core.risk_manager.create_redis_client", return_value=mock_redis
+        ):
+            service = AccountService()
+
+        service.replace_generic_balance(Decimal("12345.6700"))
+
+        mock_redis.hset.assert_called_once_with(
+            "state:balance:main",
+            mapping={"free": "12345.6700"},
+        )
+        assert service.get_balance() == Decimal("12345.6700")
+        mock_redis.hget.assert_called_once_with("state:balance:main", "free")
+
     def test_authoritative_balance_uses_account_scoped_fresh_snapshot(self):
         mock_redis = MagicMock()
         mock_redis.ping.return_value = True
