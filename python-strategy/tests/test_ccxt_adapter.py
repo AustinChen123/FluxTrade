@@ -1,7 +1,9 @@
 """Tests for CcxtExchangeAdapter and adapter factory."""
 
-from decimal import Decimal
+from decimal import ROUND_DOWN, ROUND_HALF_UP, Decimal, localcontext
+import inspect
 import threading
+from typing import Literal, get_type_hints
 from unittest.mock import MagicMock, call, patch
 
 import pytest
@@ -13,6 +15,7 @@ from src.core.adapters.ccxt_adapter import (
     AccountInitializationConfig,
     AccountPositionMode,
     CcxtExchangeAdapter,
+    _ExactCreateOrder,
 )
 from src.core.adapters.live_binance import LiveBinanceAdapter
 from src.core.adapters.live_backpack import LiveBackpackAdapter
@@ -260,6 +263,19 @@ def test_backpack_alias_collision_fails_before_provider_io(monkeypatch) -> None:
 
 
 class TestPlaceOrder:
+    def test_create_order_typing_boundary_is_exact_and_narrow(self):
+        assert get_type_hints(_ExactCreateOrder.__call__) == {
+            "symbol": str,
+            "type": str,
+            "side": Literal["buy", "sell"],
+            "amount": str,
+            "price": str | None,
+            "params": dict[str, object],
+            "return": dict[str, object],
+        }
+        source = inspect.getsource(CcxtExchangeAdapter.place_order)
+        assert source.count("cast(_ExactCreateOrder, self.client.create_order)") == 1
+
     def test_invalid_order_side_fails_before_submit(self, adapter, mock_ccxt_client):
         order = _make_order(side="hold")
 
@@ -285,6 +301,31 @@ class TestPlaceOrder:
         assert call_kwargs.kwargs["side"] == "buy"
         assert call_kwargs.kwargs["amount"] == "0.01"
         assert type(call_kwargs.kwargs["amount"]) is str
+
+    @pytest.mark.parametrize(
+        ("precision", "rounding"),
+        [(6, ROUND_DOWN), (60, ROUND_HALF_UP)],
+    )
+    def test_exact_quantity_text_ignores_ambient_decimal_context(
+        self,
+        adapter,
+        mock_ccxt_client,
+        monkeypatch,
+        precision,
+        rounding,
+    ):
+        quantity = Decimal("12345678901234567890.123456789")
+        monkeypatch.setattr(adapter, "_quantize_order", MagicMock())
+        mock_ccxt_client.create_order.return_value = {"id": "EX-EXACT"}
+
+        with localcontext() as context:
+            context.prec = precision
+            context.rounding = rounding
+            adapter.place_order(_make_order(quantity=quantity))
+
+        amount = mock_ccxt_client.create_order.call_args.kwargs["amount"]
+        assert type(amount) is str
+        assert amount == "12345678901234567890.123456789"
 
     def test_market_reduce_only_intent_passes_reduce_only_param(
         self, adapter, mock_ccxt_client

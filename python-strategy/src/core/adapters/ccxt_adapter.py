@@ -8,7 +8,7 @@ implement IExchangeAdapter and only wrapped create_order.
 import logging
 import os
 from decimal import Decimal
-from typing import Callable, Literal, Optional
+from typing import Callable, Literal, Optional, Protocol, cast
 
 import ccxt
 
@@ -38,6 +38,21 @@ from src.core.product_registry import (
 )
 
 logger = logging.getLogger(__name__)
+
+
+class _ExactCreateOrder(Protocol):
+    """Runtime CCXT boundary omitted by its narrower generated annotation."""
+
+    def __call__(
+        self,
+        *,
+        symbol: str,
+        type: str,
+        side: Literal["buy", "sell"],
+        amount: str,
+        price: str | None,
+        params: dict[str, object],
+    ) -> dict[str, object]: ...
 
 
 class CcxtExchangeAdapter(IExchangeAdapter):
@@ -126,7 +141,8 @@ class CcxtExchangeAdapter(IExchangeAdapter):
                 ccxt_symbol,
                 order.price or "market",
             )
-            response = self.client.create_order(
+            create_order = cast(_ExactCreateOrder, self.client.create_order)
+            response = create_order(
                 symbol=ccxt_symbol,
                 type=order_type,
                 side=side,
