@@ -1300,7 +1300,7 @@ class TestGetOrderByClientId:
             "clientOrderId": exchange_client_order_id,
             "filled": "0.25",
             "average": "42000.5",
-            "fee": {"cost": "0.12"},
+            "fee": {"cost": "0.12", "currency": "USDC"},
         }
 
         snapshot = adapter.get_order_by_client_id(
@@ -1315,12 +1315,45 @@ class TestGetOrderByClientId:
         assert snapshot.filled_quantity == Decimal("0.25")
         assert snapshot.average_price == Decimal("42000.5")
         assert snapshot.fee == Decimal("0.12")
+        assert snapshot.fee_asset == "USDC"
         assert snapshot.raw["clientOrderId"] == exchange_client_order_id
         mock_ccxt_client.fetch_order.assert_called_once_with(
             exchange_client_order_id,
             "BTC/USDT:USDT",
             params={"origClientOrderId": exchange_client_order_id},
         )
+
+    @pytest.mark.parametrize(
+        ("fee", "expected_fee", "expected_asset"),
+        [
+            (None, None, None),
+            ({"cost": "0.12"}, Decimal("0.12"), None),
+            ({"currency": "USDC"}, None, "USDC"),
+            ({"cost": "0", "currency": "USDC"}, Decimal("0"), "USDC"),
+            ({"cost": "0.12", "currency": ""}, Decimal("0.12"), None),
+            ({"cost": "0.12", "currency": 7}, Decimal("0.12"), None),
+        ],
+    )
+    def test_order_snapshot_projects_fee_identity_without_guessing(
+        self,
+        adapter,
+        fee,
+        expected_fee,
+        expected_asset,
+    ):
+        snapshot = adapter._order_snapshot_from_response(
+            CANONICAL_CLIENT_ORDER_ID,
+            {
+                "id": "EX-fee",
+                "status": "open",
+                "filled": "0.25",
+                "average": "42000",
+                "fee": fee,
+            },
+        )
+
+        assert snapshot.fee == expected_fee
+        assert snapshot.fee_asset == expected_asset
 
     def test_non_binance_fetches_order_with_client_order_id(self, mock_ccxt_client):
         with patch("src.core.adapters.ccxt_adapter.ccxt") as mock_ccxt:

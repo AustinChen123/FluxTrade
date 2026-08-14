@@ -1205,6 +1205,143 @@ class TestEngineInit:
         engine.execution_engine.reconcile_recoverable_client_orders.assert_called_once_with()
         assert isinstance(engine._venue_runtime, NoopRuntimeCapabilities)
 
+    @pytest.mark.parametrize(
+        ("live_balance_asset", "is_rithmic_runtime", "expected_order"),
+        [
+            ("USDT", False, ["stream", "reconcile"]),
+            (None, False, ["reconcile", "stream"]),
+            (None, True, ["reconcile", "stream"]),
+        ],
+    )
+    def test_live_ccxt_startup_establishes_order_event_coverage_before_reconciliation(
+        self,
+        engine,
+        live_balance_asset,
+        is_rithmic_runtime,
+        expected_order,
+    ):
+        calls: list[str] = []
+        engine._live_balance_asset = live_balance_asset
+        engine._venue_runtime.is_rithmic_runtime = is_rithmic_runtime
+        engine._check_system_state = MagicMock(return_value=False)
+        engine._reconcile_recoverable_orders_on_startup = MagicMock(
+            side_effect=lambda: calls.append("reconcile")
+        )
+        engine._start_exchange_order_event_stream = MagicMock(
+            side_effect=lambda: calls.append("stream")
+        )
+        for name in (
+            "_halt_for_kill_switch",
+            "_start_command_listener",
+            "_reconcile_startup_balance",
+            "_initialize_strategy_state_cache_on_startup",
+            "_start_strategy_state_subscriber_on_startup",
+            "_start_heartbeat",
+            "_start_runtime_reconciliation",
+            "scan_strategies",
+            "_restore_active_strategies_on_startup",
+        ):
+            setattr(engine, name, MagicMock())
+
+        engine.startup()
+
+        assert calls == expected_order
+
+    def test_live_ccxt_unsafe_startup_keeps_queued_fill_protection_path_open(
+        self,
+        engine_factory,
+        signal_factory,
+    ):
+        with patch(
+            "src.core.engine.RuntimeEnvironment.from_env",
+            return_value=RuntimeEnvironment("live"),
+        ):
+            engine = engine_factory(
+                adapter_config={
+                    "mode": "live",
+                    "exchange": "binance",
+                    "instrument_product_ids": ["BINANCE:BTCUSDT-PERP"],
+                    "balance_asset": "USDT",
+                },
+                runtime_bootstrap_factory=None,
+                runtime_capabilities_factory=None,
+                audit_external_orders=True,
+            )
+        engine._venue_runtime = NoopRuntimeCapabilities(
+            startup_reconciliation_required=True
+        )
+        order_id = engine.execution_engine.execute_signal(
+            signal_factory(
+                price=Decimal("42000"),
+                quantity=Decimal("0.50"),
+                stop_loss=Decimal("41000"),
+                take_profit=Decimal("43000"),
+            )
+        )
+        repo = engine.execution_engine.order_manager.repo
+        entry = repo.get_order(order_id)
+        assert entry is not None
+        conditionals = [
+            order
+            for order in repo.orders.values()
+            if order.type in {"stop_loss", "take_profit"}
+        ]
+        assert len(conditionals) == 2
+        assert {order.status for order in conditionals} == {OrderStatus.NEW.value}
+        engine.execution_engine.order_manager.update_position_script = MagicMock()
+
+        def resume_and_report_unlocked() -> bool:
+            engine._resume_after_kill_switch()
+            return False
+
+        engine._check_system_state = MagicMock(side_effect=resume_and_report_unlocked)
+        engine._reconcile_recoverable_orders_on_startup = MagicMock(
+            return_value={"unresolved_count": 1, "verification_blocked_count": 0}
+        )
+        for name in (
+            "_start_command_listener",
+            "_reconcile_startup_balance",
+            "_initialize_strategy_state_cache_on_startup",
+            "_start_strategy_state_subscriber_on_startup",
+            "_start_exchange_order_event_stream",
+            "_start_heartbeat",
+            "_start_runtime_reconciliation",
+            "scan_strategies",
+            "_restore_active_strategies_on_startup",
+        ):
+            setattr(engine, name, MagicMock())
+
+        engine.startup()
+        event_result = engine.execution_engine.process_exchange_order_event(
+            ExchangeOrderEvent(
+                status="open",
+                product_id=entry.product_id,
+                client_order_id=entry.client_order_id,
+                exchange_order_id=entry.exchange_order_id,
+                cumulative_filled_quantity=Decimal("0.25"),
+                cumulative_average_price=Decimal("42000"),
+                fee=Decimal("0.08"),
+                fee_asset="USDC",
+                event_timestamp=1704067200001,
+            )
+        )
+
+        assert event_result["action"] == "applied"
+        assert len(repo.trades) == 1
+        assert repo.trades[0].fee_asset == "USDC"
+        assert {order.status for order in conditionals} == {
+            OrderStatus.SUBMITTED.value
+        }
+        assert engine.execution_engine._submissions_halted is False
+        entry_signal = signal_factory(signal_type=SignalType.LONG)
+        exit_signal = signal_factory(signal_type=SignalType.EXIT_LONG)
+        assert engine._entry_signal_allowed_for_processor(entry_signal) is False
+        assert engine._entry_signal_allowed_for_processor(exit_signal) is True
+
+        engine._resume_after_kill_switch()
+
+        assert engine._entry_signal_allowed_for_processor(entry_signal) is False
+
     def test_startup_reconcile_uses_rithmic_owned_recovery_when_configured(
         self,
         engine_factory,
@@ -3587,12 +3724,44 @@ class TestHeartbeatRecording:
         engine.risk_manager.check_risk.assert_not_called()
         engine.execution_engine.execute_signal.assert_not_called()
 
-    def test_live_ccxt_balance_latch_restores_portfolio_entry_and_keeps_exit(
+    def test_live_ccxt_stream_failure_suppresses_entries_after_manual_clear(
+        self,
+        engine_factory,
+    ):
+        engine = _live_ccxt_engine(engine_factory)
+        engine._startup_balance_entry_admission_safe = True
+        engine.execution_engine.latch_order_event_stream_failure()
+        engine._kill_switch_halted = False
+        entry = Signal(
+            strategy_id="test",
+            product_id="BINANCE:BTCUSDT-PERP",
+            timeframe="1m",
+            timestamp=1704067200000,
+            type=SignalType.LONG,
+            value=Decimal("42000"),
+        )
+        exit_signal = entry.model_copy(update={"type": SignalType.EXIT_LONG})
+
+        assert engine._entry_signal_allowed_for_processor(entry) is False
+        assert engine._entry_signal_allowed_for_processor(exit_signal) is True
+
+    @pytest.mark.parametrize(
+        "failure_owner",
+        ["balance", "order_event_stream", "startup_reconciliation"],
+    )
+    def test_live_ccxt_entry_latches_restore_portfolio_entry_and_keep_exit(
         self,
         engine_factory,
         mock_strategy_class,
+        failure_owner,
     ):
         engine = _live_ccxt_engine(engine_factory)
+        if failure_owner == "order_event_stream":
+            engine._startup_balance_entry_admission_safe = True
+            engine.execution_engine.latch_order_event_stream_failure()
+        elif failure_owner == "startup_reconciliation":
+            engine._startup_balance_entry_admission_safe = True
+            engine._startup_reconciliation_entry_admission_safe = False
 
         class StatefulSleeve(mock_strategy_class):
             def __init__(self, strategy_id, signal_type):

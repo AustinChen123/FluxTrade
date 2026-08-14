@@ -1,3 +1,4 @@
+from decimal import Decimal
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 
@@ -248,6 +249,38 @@ def test_non_applied_event_preserves_result_and_classifies_action(
     assert event.exchange_order_id == "exchange-1"
     assert event.status == "open"
     subject.process_order_event.assert_called_once()
+
+
+def test_ambiguous_submit_snapshot_preserves_incomplete_fee_identity_for_applier():
+    subject = _subject()
+    subject.adapter.get_order_by_client_id.return_value = ExchangeOrderSnapshot(
+        client_order_id="client-1",
+        exchange_order_id="exchange-1",
+        status="open",
+        filled_quantity=Decimal("0.25"),
+        average_price=Decimal("101"),
+        fee=None,
+        fee_asset=None,
+    )
+    event_result = {
+        "action": "unresolved_snapshot_fill_fee_identity_incomplete",
+        "order_id": "order-1",
+        "status": "open",
+    }
+    subject.process_order_event.return_value = event_result
+
+    result = _adopt(subject, NetworkError("timeout"))
+
+    assert result == {
+        "action": "unresolved_snapshot_fill_fee_identity_incomplete",
+        "event_result": event_result,
+        "verification_blocked": False,
+        "unresolved": True,
+    }
+    event = subject.process_order_event.call_args.args[0]
+    assert event.is_snapshot_projection is True
+    assert event.fee is None
+    assert event.fee_asset is None
 
 
 @pytest.mark.parametrize(

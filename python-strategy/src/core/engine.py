@@ -285,6 +285,7 @@ class StrategyEngine:
             raise ValueError("live balance asset must be a non-empty string")
         self._live_balance_asset = cast(str | None, configured_balance_asset)
         self._startup_balance_entry_admission_safe = self._live_balance_asset is None
+        self._startup_reconciliation_entry_admission_safe = True
         self._startup_balance_failure_latched = False
         self._startup_balance_failure_logged = False
         self._live_product_ids = (
@@ -769,8 +770,12 @@ class StrategyEngine:
         run_phase(self._reconcile_startup_balance)
         run_phase(self._initialize_strategy_state_cache_on_startup)
         run_phase(self._start_strategy_state_subscriber_on_startup)
-        reconciliation = run_phase(self._reconcile_recoverable_orders_on_startup)
-        run_phase(self._start_exchange_order_event_stream)
+        if self._live_balance_asset is not None:
+            run_phase(self._start_exchange_order_event_stream)
+            reconciliation = run_phase(self._reconcile_recoverable_orders_on_startup)
+        else:
+            reconciliation = run_phase(self._reconcile_recoverable_orders_on_startup)
+            run_phase(self._start_exchange_order_event_stream)
 
         def apply_reconciliation_result() -> bool:
             lockdown = persisted_lockdown
@@ -786,9 +791,12 @@ class StrategyEngine:
                 reconciliation_state.owner_handled
                 and not reconciliation_state.entry_admission_safe
             ):
-                self._halt_for_kill_switch()
                 self._startup_lock_cause = reconciliation_state.blocking_reason
-                lockdown = True
+                if self._live_balance_asset is not None:
+                    self._startup_reconciliation_entry_admission_safe = False
+                else:
+                    self._halt_for_kill_switch()
+                    lockdown = True
             if lockdown:
                 if self._can_auto_resume_after_startup_recovery(reconciliation):
                     self._resume_after_kill_switch()
@@ -1511,6 +1519,26 @@ class StrategyEngine:
         """Apply the venue-owned health gate to new exposure only."""
         if (
             signal.type in (SignalType.LONG, SignalType.SHORT)
+            and self.execution_engine.order_event_stream_failed
+        ):
+            return False
+        if (
+            signal.type in (SignalType.LONG, SignalType.SHORT)
+            and not self._startup_reconciliation_entry_admission_safe
+        ):
+            logger.warning(
+                "Entry signal rejected by startup order reconciliation",
+                extra={
+                    "component": "strategy_engine",
+                    "event_code": "entry_admission_rejected",
+                    "strategy_id": signal.strategy_id,
+                    "product_id": signal.product_id,
+                    "signal_type": signal.type.value,
+                },
+            )
+            return False
+        if (
+            signal.type in (SignalType.LONG, SignalType.SHORT)
             and self._live_balance_asset is not None
             and not self._startup_balance_entry_admission_safe
         ):
@@ -1545,7 +1573,10 @@ class StrategyEngine:
 
     def _entry_signal_allowed_for_processor(self, signal: Signal) -> bool:
         """Avoid consuming a kill-switch rejection as benign health suppression."""
-        if self._kill_switch_halted:
+        if (
+            self._kill_switch_halted
+            and not self.execution_engine.order_event_stream_failed
+        ):
             return True
         return self._entry_signal_allowed(signal)
 

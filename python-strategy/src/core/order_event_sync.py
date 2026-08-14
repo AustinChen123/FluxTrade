@@ -7,6 +7,23 @@ from src.core.interfaces.exchange import ExchangeOrderEvent
 from src.core.models import OrderStatus
 
 
+def snapshot_fill_fee_rejection(
+    *,
+    local_filled: Decimal,
+    fill_quantity: Decimal,
+    fee: object,
+    fee_asset: object,
+) -> str | None:
+    """Reject snapshot fill deltas whose exact fee delta cannot be proven."""
+    if fill_quantity <= 0:
+        return None
+    if local_filled > 0:
+        return "unresolved_snapshot_cumulative_fee_not_delta"
+    if type(fee) is not Decimal or type(fee_asset) is not str or fee_asset == "":
+        return "unresolved_snapshot_fill_fee_identity_incomplete"
+    return None
+
+
 class OrderEventApplier:
     def __init__(
         self,
@@ -92,6 +109,19 @@ class OrderEventApplier:
                 "order_id": order.id,
                 "status": event.status,
             }
+        if event.is_snapshot_projection:
+            snapshot_fee_rejection = snapshot_fill_fee_rejection(
+                local_filled=order.filled_quantity or Decimal("0"),
+                fill_quantity=fill_delta["quantity"],
+                fee=event.fee,
+                fee_asset=event.fee_asset,
+            )
+            if snapshot_fee_rejection is not None:
+                return {
+                    "action": snapshot_fee_rejection,
+                    "order_id": order.id,
+                    "status": event.status,
+                }
         if self._event_fill_exceeds_order_quantity(order, event):
             return {
                 "action": "unresolved_exchange_fill_exceeds_order_quantity",
@@ -516,5 +546,7 @@ def exchange_snapshot_to_order_event(product_id: str, snapshot) -> ExchangeOrder
         cumulative_filled_quantity=snapshot.filled_quantity,
         cumulative_average_price=snapshot.average_price,
         fee=snapshot.fee,
+        fee_asset=snapshot.fee_asset,
+        is_snapshot_projection=True,
         raw=snapshot.raw,
     )

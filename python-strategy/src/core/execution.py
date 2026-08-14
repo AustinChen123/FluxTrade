@@ -230,6 +230,11 @@ class ExecutionEngine:
         return self._submission_gate_owner.reconcile_halted
 
     @property
+    def order_event_stream_failed(self) -> bool:
+        """Report the permanent stream-failure latch to entry admission."""
+        return self._submission_gate_owner.order_event_stream_failed
+
+    @property
     def _submissions_in_flight(self) -> int:
         return self._submission_gate_owner.in_flight
 
@@ -249,7 +254,8 @@ class ExecutionEngine:
         return self._order_reconciler.record_recoverable_order_scan()
 
     def reconcile_recoverable_client_orders(self) -> dict:
-        return self._order_reconciler.reconcile_recoverable_client_orders()
+        with self._order_event_apply_lock:
+            return self._order_reconciler.reconcile_recoverable_client_orders()
 
     def reconcile_owned_orders(self, *, snapshot_loader=None) -> dict[str, object]:
         return self._order_reconciler.reconcile_owned_orders(

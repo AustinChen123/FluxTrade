@@ -435,6 +435,7 @@ class CcxtExchangeAdapter(IExchangeAdapter):
         status = response.get("status") or "unknown"
         fee = response.get("fee") or {}
         fee_cost = fee.get("cost") if isinstance(fee, dict) else None
+        fee_currency = fee.get("currency") if isinstance(fee, dict) else None
         filled_quantity = response.get("filled")
         average_price = response.get("average")
         cost = response.get("cost")
@@ -459,6 +460,11 @@ class CcxtExchangeAdapter(IExchangeAdapter):
                 else None
             ),
             fee=Decimal(str(fee_cost)) if fee_cost is not None else None,
+            fee_asset=(
+                fee_currency
+                if type(fee_currency) is str and fee_currency != ""
+                else None
+            ),
             raw=response,
         )
 

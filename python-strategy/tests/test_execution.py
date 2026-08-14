@@ -3390,7 +3390,7 @@ class TestLiveOrderEventSync:
         assert result["action"] == "applied"
         assert order.status == OrderStatus.FILLED.value
 
-    def test_resync_recoverable_order_events_applies_snapshot_through_event_sync_idempotently(
+    def test_resync_recoverable_order_events_rejects_cumulative_fee_as_delta(
         self,
         mock_db_session,
         mock_clock,
@@ -3420,6 +3420,7 @@ class TestLiveOrderEventSync:
             filled_quantity=Decimal("0.06"),
             average_price=Decimal("102"),
             fee=Decimal("0.01"),
+            fee_asset="USDC",
         )
         mock_exchange_adapter.get_order_by_client_id = MagicMock(return_value=snapshot)
 
@@ -3427,19 +3428,16 @@ class TestLiveOrderEventSync:
         second_payload = engine.resync_recoverable_order_events()
 
         assert first_payload["recoverable_count"] == 1
-        assert first_payload["applied_count"] == 1
-        assert first_payload["unresolved_count"] == 0
+        assert first_payload["applied_count"] == 0
+        assert first_payload["unresolved_count"] == 1
         assert first_payload["verification_blocked_count"] == 0
         assert second_payload["recoverable_count"] == 1
-        assert second_payload["applied_count"] == 1
-        assert second_payload["unresolved_count"] == 0
+        assert second_payload["applied_count"] == 0
+        assert second_payload["unresolved_count"] == 1
         assert order.status == OrderStatus.PARTIALLY_FILLED.value
-        assert order.filled_quantity == Decimal("0.06")
-        assert order.filled_price == Decimal("102")
-        assert len(mock_order_repo.trades) == 1
-        assert mock_order_repo.trades[0].quantity == Decimal("0.02")
-        assert mock_order_repo.trades[0].price == Decimal("106")
-        assert mock_order_repo.trades[0].fee == Decimal("0.01")
+        assert order.filled_quantity == Decimal("0.04")
+        assert order.filled_price == Decimal("100")
+        assert mock_order_repo.trades == []
 
     @pytest.mark.parametrize(
         ("snapshot", "expected_action"),
@@ -5164,6 +5162,8 @@ class TestAuditedExecution:
                     status="closed",
                     filled_quantity=entry.quantity,
                     average_price=entry.price,
+                    fee=Decimal("0"),
+                    fee_asset="USDC",
                 )
             return None
 
@@ -5741,6 +5741,7 @@ class TestAuditedExecution:
         }
         assert payload["unresolved_count"] == 0
         assert payload["verification_blocked_count"] == 1
+
         assert payload["results"][0] == {
             "order_id": "found-local",
             "client_order_id": "client-found",
@@ -5779,6 +5780,42 @@ class TestAuditedExecution:
         assert event.payload == payload
         mock_db_session.commit.assert_called_once()
         mock_db_session.rollback.assert_not_called()
+
+    def test_reconciliation_holds_order_event_lock_for_the_complete_snapshot(
+        self,
+        mock_db_session,
+        mock_clock,
+        mock_exchange_adapter,
+        mock_order_repo,
+    ):
+        engine = ExecutionEngine(
+            db_session=mock_db_session,
+            clock=mock_clock,
+            adapter=mock_exchange_adapter,
+            order_repository=mock_order_repo,
+        )
+        worker_started = threading.Event()
+        worker_entered = threading.Event()
+        workers: list[threading.Thread] = []
+
+        def observe_lock() -> dict[str, int]:
+            def enter_from_stream_worker() -> None:
+                worker_started.set()
+                with engine._order_event_apply_lock:
+                    worker_entered.set()
+
+            worker = threading.Thread(target=enter_from_stream_worker)
+            workers.append(worker)
+            worker.start()
+            assert worker_started.wait(timeout=1)
+            assert not worker_entered.wait(timeout=0.1)
+            return {"recoverable_count": 0}
+
+        engine._order_reconciler.reconcile_recoverable_client_orders = observe_lock
+
+        assert engine.reconcile_recoverable_client_orders() == {"recoverable_count": 0}
+        workers[0].join(timeout=1)
+        assert worker_entered.is_set()
 
     def test_reconcile_recoverable_client_orders_restores_exchange_open_order(
         self, mock_db_session, mock_clock, mock_exchange_adapter, mock_order_repo, order_factory
@@ -5836,32 +5873,36 @@ class TestAuditedExecution:
             status=OrderStatus.SUBMITTED_UNCONFIRMED.value,
             exchange_order_id=None,
             quantity=Decimal("0.50"),
-            filled_quantity=Decimal("0.10"),
-            filled_price=Decimal("100"),
+            filled_quantity=Decimal("0"),
+            filled_price=None,
         )
         mock_order_repo.add_order(order)
 
-        mock_exchange_adapter.get_order_by_client_id = lambda client_order_id, product_id, *, order_type=None: (
-            ExchangeOrderSnapshot(
-                client_order_id=client_order_id,
-                exchange_order_id="EX-PARTIAL",
-                status="open",
-                filled_quantity=Decimal("0.25"),
-                average_price=Decimal("160"),
-                fee=Decimal("0.08"),
+        mock_exchange_adapter.get_order_by_client_id = (
+            lambda client_order_id, product_id, *, order_type=None: (
+                ExchangeOrderSnapshot(
+                    client_order_id=client_order_id,
+                    exchange_order_id="EX-PARTIAL",
+                    status="open",
+                    filled_quantity=Decimal("0.25"),
+                    average_price=Decimal("160"),
+                    fee=Decimal("0.08"),
+                    fee_asset="USDC",
+                )
             )
         )
 
         payload = engine.reconcile_recoverable_client_orders()
 
-        assert order.status == OrderStatus.SUBMITTED.value
+        assert order.status == OrderStatus.PARTIALLY_FILLED.value
         assert order.exchange_order_id == "EX-PARTIAL"
         assert order.filled_quantity == Decimal("0.25")
         assert order.filled_price == Decimal("160")
         assert len(mock_order_repo.trades) == 1
-        assert mock_order_repo.trades[0].quantity == Decimal("0.15")
-        assert mock_order_repo.trades[0].price == Decimal("200")
-        assert mock_order_repo.trades[0].fee == Decimal("0")
+        assert mock_order_repo.trades[0].quantity == Decimal("0.25")
+        assert mock_order_repo.trades[0].price == Decimal("160")
+        assert mock_order_repo.trades[0].fee == Decimal("0.08")
+        assert mock_order_repo.trades[0].fee_asset == "USDC"
         assert payload["decision_counts"] == {"exchange_open": 1}
         assert payload["results"][0]["local_status"] == OrderStatus.SUBMITTED_UNCONFIRMED.value
         assert payload["results"][0]["local_exchange_order_id"] is None
@@ -5869,6 +5910,213 @@ class TestAuditedExecution:
             payload["results"][0]["repair_action"]
             == "recorded_partial_fill_and_restored_tracking"
         )
+
+    def test_startup_snapshot_and_queued_stream_fill_apply_exactly_once(
+        self,
+        mock_db_session,
+        mock_clock,
+        mock_exchange_adapter,
+        mock_order_repo,
+        signal_factory,
+    ):
+        engine = ExecutionEngine(
+            db_session=mock_db_session,
+            clock=mock_clock,
+            adapter=mock_exchange_adapter,
+            order_repository=mock_order_repo,
+            db_session_factory=lambda: nullcontext(mock_db_session),
+            is_backtest=True,
+            audit_external_orders=True,
+        )
+        order_id = engine.execute_signal(
+            signal_factory(
+                value=Decimal("160"),
+                price=Decimal("160"),
+                quantity=Decimal("0.50"),
+                stop_loss=Decimal("150"),
+                take_profit=Decimal("170"),
+            )
+        )
+        order = mock_order_repo.orders[order_id]
+        conditionals = [
+            candidate
+            for candidate in mock_order_repo.orders.values()
+            if candidate.id != order_id
+        ]
+        assert len(conditionals) == 2
+        assert len(mock_exchange_adapter.open_orders) == 1
+        snapshot_requested = threading.Event()
+        release_snapshot = threading.Event()
+        event_finished = threading.Event()
+        reconciliation_results: list[dict] = []
+        stream_results: list[dict[str, object]] = []
+        original_lookup = mock_exchange_adapter.get_order_by_client_id
+
+        def load_snapshot(client_order_id, product_id, *, order_type=None):
+            if client_order_id != order.client_order_id:
+                return original_lookup(
+                    client_order_id,
+                    product_id,
+                    order_type=order_type,
+                )
+            snapshot_requested.set()
+            assert release_snapshot.wait(timeout=1)
+            return ExchangeOrderSnapshot(
+                client_order_id=order.client_order_id,
+                exchange_order_id=order.exchange_order_id,
+                status="open",
+                filled_quantity=Decimal("0.25"),
+                average_price=Decimal("160"),
+                fee=Decimal("0.08"),
+            )
+
+        mock_exchange_adapter.get_order_by_client_id = load_snapshot
+        stream_event = ExchangeOrderEvent(
+            status="open",
+            product_id=order.product_id,
+            client_order_id=order.client_order_id,
+            exchange_order_id=order.exchange_order_id,
+            cumulative_filled_quantity=Decimal("0.25"),
+            cumulative_average_price=Decimal("160"),
+            fee=Decimal("0.08"),
+            fee_asset="USDC",
+            event_timestamp=1704067200001,
+        )
+
+        reconciliation_worker = threading.Thread(
+            target=lambda: reconciliation_results.append(
+                engine.reconcile_recoverable_client_orders()
+            )
+        )
+
+        def apply_stream_event() -> None:
+            stream_results.append(engine.process_exchange_order_event(stream_event))
+            event_finished.set()
+
+        stream_worker = threading.Thread(target=apply_stream_event)
+        reconciliation_worker.start()
+        assert snapshot_requested.wait(timeout=1)
+        stream_worker.start()
+        assert not event_finished.wait(timeout=0.1)
+        release_snapshot.set()
+        reconciliation_worker.join(timeout=1)
+        stream_worker.join(timeout=1)
+
+        assert not reconciliation_worker.is_alive()
+        assert not stream_worker.is_alive()
+        assert event_finished.is_set()
+        assert reconciliation_results[0]["results"][0]["repair_action"] == (
+            "unresolved_snapshot_fill_fee_identity_incomplete"
+        )
+        assert reconciliation_results[0]["unresolved_count"] == 1
+        assert stream_results == [
+            {
+                "action": "applied",
+                "order_id": order.id,
+                "status": "open",
+                "state": "open",
+                "fill_quantity": Decimal("0.25"),
+                "exchange_order_id": order.exchange_order_id,
+            }
+        ]
+        assert order.status == OrderStatus.PARTIALLY_FILLED.value
+        assert order.filled_quantity == Decimal("0.25")
+        assert order.filled_price == Decimal("160")
+        assert len(mock_order_repo.trades) == 1
+        assert mock_order_repo.trades[0].quantity == Decimal("0.25")
+        assert mock_order_repo.trades[0].price == Decimal("160")
+        assert mock_order_repo.trades[0].fee == Decimal("0.08")
+        assert mock_order_repo.trades[0].fee_asset == "USDC"
+        assert {candidate.status for candidate in conditionals} == {
+            OrderStatus.SUBMITTED.value
+        }
+        assert {candidate.quantity for candidate in conditionals} == {Decimal("0.25")}
+        assert len(mock_exchange_adapter.open_orders) == 3
+
+    def test_stream_fill_before_startup_snapshot_remains_exactly_once(
+        self,
+        mock_db_session,
+        mock_clock,
+        mock_exchange_adapter,
+        mock_order_repo,
+        signal_factory,
+    ):
+        engine = ExecutionEngine(
+            db_session=mock_db_session,
+            clock=mock_clock,
+            adapter=mock_exchange_adapter,
+            order_repository=mock_order_repo,
+            db_session_factory=lambda: nullcontext(mock_db_session),
+            is_backtest=True,
+            audit_external_orders=True,
+        )
+        order_id = engine.execute_signal(
+            signal_factory(
+                value=Decimal("160"),
+                price=Decimal("160"),
+                quantity=Decimal("0.50"),
+                stop_loss=Decimal("150"),
+                take_profit=Decimal("170"),
+            )
+        )
+        order = mock_order_repo.orders[order_id]
+        conditionals = [
+            candidate
+            for candidate in mock_order_repo.orders.values()
+            if candidate.id != order_id
+        ]
+        assert len(conditionals) == 2
+        assert len(mock_exchange_adapter.open_orders) == 1
+        event = ExchangeOrderEvent(
+            status="open",
+            product_id=order.product_id,
+            client_order_id=order.client_order_id,
+            exchange_order_id=order.exchange_order_id,
+            cumulative_filled_quantity=Decimal("0.25"),
+            cumulative_average_price=Decimal("160"),
+            fee=Decimal("0.08"),
+            fee_asset="USDC",
+            event_timestamp=1704067200001,
+        )
+        original_lookup = mock_exchange_adapter.get_order_by_client_id
+
+        def load_snapshot(client_order_id, product_id, *, order_type=None):
+            if client_order_id != order.client_order_id:
+                return original_lookup(
+                    client_order_id,
+                    product_id,
+                    order_type=order_type,
+                )
+            return ExchangeOrderSnapshot(
+                client_order_id=order.client_order_id,
+                exchange_order_id=order.exchange_order_id,
+                status="open",
+                filled_quantity=Decimal("0.25"),
+                average_price=Decimal("160"),
+            )
+
+        mock_exchange_adapter.get_order_by_client_id = load_snapshot
+
+        event_result = engine.process_exchange_order_event(event)
+        reconciliation = engine.reconcile_recoverable_client_orders()
+
+        assert event_result["action"] == "applied"
+        assert event_result["fill_quantity"] == Decimal("0.25")
+        assert reconciliation["results"][0]["repair_action"] == "restored_tracking"
+        assert reconciliation["results"][0]["repair_reason"] is None
+        assert order.status == OrderStatus.PARTIALLY_FILLED.value
+        assert order.filled_quantity == Decimal("0.25")
+        assert order.filled_price == Decimal("160")
+        assert len(mock_order_repo.trades) == 1
+        assert mock_order_repo.trades[0].quantity == Decimal("0.25")
+        assert mock_order_repo.trades[0].price == Decimal("160")
+        assert mock_order_repo.trades[0].fee == Decimal("0.08")
+        assert mock_order_repo.trades[0].fee_asset == "USDC"
+        assert {candidate.status for candidate in conditionals} == {
+            OrderStatus.SUBMITTED.value
+        }
+        assert {candidate.quantity for candidate in conditionals} == {Decimal("0.25")}
+        assert len(mock_exchange_adapter.open_orders) == 3
 
     def test_reconcile_recoverable_client_orders_flags_open_missing_price_partial_unresolved(
         self, mock_db_session, mock_clock, mock_exchange_adapter, mock_order_repo, order_factory
@@ -5905,7 +6153,7 @@ class TestAuditedExecution:
 
         payload = engine.reconcile_recoverable_client_orders()
 
-        assert order.status == OrderStatus.SUBMITTED.value
+        assert order.status == OrderStatus.PARTIALLY_FILLED.value
         assert order.exchange_order_id == "EX-OPEN-MISSING-PRICE"
         assert order.last_reconciled_at is None
         assert mock_order_repo.trades == []
@@ -5955,7 +6203,7 @@ class TestAuditedExecution:
 
         payload = engine.reconcile_recoverable_client_orders()
 
-        assert order.status == OrderStatus.SUBMITTED.value
+        assert order.status == OrderStatus.PARTIALLY_FILLED.value
         assert order.exchange_order_id == "EX-OPEN-LESS-FILLED"
         assert order.last_reconciled_at is None
         assert mock_order_repo.trades == []
@@ -5974,7 +6222,7 @@ class TestAuditedExecution:
     @pytest.mark.parametrize(
         ("fill_state", "snapshot_filled", "snapshot_average", "expected_unresolved"),
         [
-            ("delta_priced", Decimal("0.25"), Decimal("160"), False),
+            ("delta_priced", Decimal("0.25"), Decimal("160"), True),
             ("delta_unpriced", Decimal("0.25"), None, True),
             ("delta_zero", Decimal("0.10"), Decimal("100"), False),
             ("delta_negative", Decimal("0.05"), Decimal("100"), True),
@@ -6015,13 +6263,17 @@ class TestAuditedExecution:
         )
         mock_order_repo.add_order(order)
 
-        mock_exchange_adapter.get_order_by_client_id = lambda client_order_id, product_id, *, order_type=None: (
-            ExchangeOrderSnapshot(
-                client_order_id=client_order_id,
-                exchange_order_id=f"EX-{exchange_status.upper()}-{fill_state.upper()}",
-                status=exchange_status,
-                filled_quantity=snapshot_filled,
-                average_price=snapshot_average,
+        mock_exchange_adapter.get_order_by_client_id = (
+            lambda client_order_id, product_id, *, order_type=None: (
+                ExchangeOrderSnapshot(
+                    client_order_id=client_order_id,
+                    exchange_order_id=f"EX-{exchange_status.upper()}-{fill_state.upper()}",
+                    status=exchange_status,
+                    filled_quantity=snapshot_filled,
+                    average_price=snapshot_average,
+                    fee=Decimal("0.08"),
+                    fee_asset="USDC",
+                )
             )
         )
 
@@ -6128,14 +6380,17 @@ class TestAuditedExecution:
         )
         mock_order_repo.add_order(order)
 
-        mock_exchange_adapter.get_order_by_client_id = lambda client_order_id, product_id, *, order_type=None: (
-            ExchangeOrderSnapshot(
-                client_order_id=client_order_id,
-                exchange_order_id="EX-FILLED",
-                status="closed",
-                filled_quantity=Decimal("0.25"),
-                average_price=Decimal("42010.5"),
-                fee=Decimal("0.11"),
+        mock_exchange_adapter.get_order_by_client_id = (
+            lambda client_order_id, product_id, *, order_type=None: (
+                ExchangeOrderSnapshot(
+                    client_order_id=client_order_id,
+                    exchange_order_id="EX-FILLED",
+                    status="closed",
+                    filled_quantity=Decimal("0.25"),
+                    average_price=Decimal("42010.5"),
+                    fee=Decimal("0.11"),
+                    fee_asset="USDC",
+                )
             )
         )
 
@@ -6146,11 +6401,17 @@ class TestAuditedExecution:
         assert order.filled_price == Decimal("42010.5")
         assert len(mock_order_repo.trades) == 1
         assert mock_order_repo.trades[0].fee == Decimal("0.11")
+        assert mock_order_repo.trades[0].fee_asset == "USDC"
         assert payload["decision_counts"] == {"exchange_closed": 1}
         assert payload["results"][0]["repair_action"] == "filled_from_exchange_snapshot"
 
-    def test_reconcile_recoverable_client_orders_fills_only_terminal_delta(
-        self, mock_db_session, mock_clock, mock_exchange_adapter, mock_order_repo, order_factory
+    def test_reconcile_recoverable_client_orders_rejects_cumulative_terminal_fee(
+        self,
+        mock_db_session,
+        mock_clock,
+        mock_exchange_adapter,
+        mock_order_repo,
+        order_factory,
     ):
         engine = ExecutionEngine(
             db_session=mock_db_session,
@@ -6172,28 +6433,30 @@ class TestAuditedExecution:
         )
         mock_order_repo.add_order(order)
 
-        mock_exchange_adapter.get_order_by_client_id = lambda client_order_id, product_id, *, order_type=None: (
-            ExchangeOrderSnapshot(
-                client_order_id=client_order_id,
-                exchange_order_id="EX-FILLED",
-                status="closed",
-                filled_quantity=Decimal("0.25"),
-                average_price=Decimal("160"),
-                fee=Decimal("0.05"),
+        mock_exchange_adapter.get_order_by_client_id = (
+            lambda client_order_id, product_id, *, order_type=None: (
+                ExchangeOrderSnapshot(
+                    client_order_id=client_order_id,
+                    exchange_order_id="EX-FILLED",
+                    status="closed",
+                    filled_quantity=Decimal("0.25"),
+                    average_price=Decimal("160"),
+                    fee=Decimal("0.05"),
+                    fee_asset="USDC",
+                )
             )
         )
 
         payload = engine.reconcile_recoverable_client_orders()
 
-        assert order.status == OrderStatus.FILLED.value
-        assert order.filled_quantity == Decimal("0.25")
-        assert order.filled_price == Decimal("160")
-        assert len(mock_order_repo.trades) == 1
-        assert mock_order_repo.trades[0].quantity == Decimal("0.15")
-        assert mock_order_repo.trades[0].price == Decimal("200")
-        assert mock_order_repo.trades[0].fee == Decimal("0")
+        assert order.status == OrderStatus.SUBMITTED.value
+        assert order.filled_quantity == Decimal("0.10")
+        assert order.filled_price == Decimal("100")
+        assert mock_order_repo.trades == []
         assert payload["decision_counts"] == {"exchange_closed": 1}
-        assert payload["results"][0]["repair_action"] == "filled_from_exchange_snapshot"
+        assert payload["results"][0]["repair_action"] == (
+            "unresolved_snapshot_cumulative_fee_not_delta"
+        )
 
     def test_reconcile_recoverable_client_orders_marks_closed_without_fake_fill(
         self, mock_db_session, mock_clock, mock_exchange_adapter, mock_order_repo, order_factory
@@ -6271,19 +6534,22 @@ class TestAuditedExecution:
             status=OrderStatus.SUBMITTED.value,
             exchange_order_id="EX-LOCAL",
             quantity=Decimal("0.50"),
-            filled_quantity=Decimal("0.10"),
-            filled_price=Decimal("100"),
+            filled_quantity=Decimal("0"),
+            filled_price=None,
         )
         mock_order_repo.add_order(order)
 
-        mock_exchange_adapter.get_order_by_client_id = lambda client_order_id, product_id, *, order_type=None: (
-            ExchangeOrderSnapshot(
-                client_order_id=client_order_id,
-                exchange_order_id=f"EX-{exchange_status.upper()}",
-                status=exchange_status,
-                filled_quantity=Decimal("0.25"),
-                average_price=Decimal("160"),
-                fee=Decimal("0.08"),
+        mock_exchange_adapter.get_order_by_client_id = (
+            lambda client_order_id, product_id, *, order_type=None: (
+                ExchangeOrderSnapshot(
+                    client_order_id=client_order_id,
+                    exchange_order_id=f"EX-{exchange_status.upper()}",
+                    status=exchange_status,
+                    filled_quantity=Decimal("0.25"),
+                    average_price=Decimal("160"),
+                    fee=Decimal("0.08"),
+                    fee_asset="USDC",
+                )
             )
         )
 
@@ -6293,9 +6559,10 @@ class TestAuditedExecution:
         assert order.filled_quantity == Decimal("0.25")
         assert order.filled_price == Decimal("160")
         assert len(mock_order_repo.trades) == 1
-        assert mock_order_repo.trades[0].quantity == Decimal("0.15")
-        assert mock_order_repo.trades[0].price == Decimal("200")
-        assert mock_order_repo.trades[0].fee == Decimal("0")
+        assert mock_order_repo.trades[0].quantity == Decimal("0.25")
+        assert mock_order_repo.trades[0].price == Decimal("160")
+        assert mock_order_repo.trades[0].fee == Decimal("0.08")
+        assert mock_order_repo.trades[0].fee_asset == "USDC"
         assert payload["decision_counts"] == {"exchange_closed": 1}
         assert payload["unresolved_count"] == 0
         assert payload["results"][0]["repair_action"] == expected_action
@@ -6325,8 +6592,8 @@ class TestAuditedExecution:
             status=OrderStatus.SUBMITTED.value,
             exchange_order_id="EX-LOCAL",
             quantity=Decimal("0.50"),
-            filled_quantity=Decimal("0.10"),
-            filled_price=Decimal("100"),
+            filled_quantity=Decimal("0"),
+            filled_price=None,
         )
         mock_order_repo.add_order(order)
 
@@ -6371,18 +6638,22 @@ class TestAuditedExecution:
             status=OrderStatus.SUBMITTED.value,
             exchange_order_id="EX-LOCAL",
             quantity=Decimal("0.50"),
-            filled_quantity=Decimal("0.10"),
-            filled_price=Decimal("100"),
+            filled_quantity=Decimal("0"),
+            filled_price=None,
         )
         mock_order_repo.add_order(order)
 
-        mock_exchange_adapter.get_order_by_client_id = lambda client_order_id, product_id, *, order_type=None: (
-            ExchangeOrderSnapshot(
-                client_order_id=client_order_id,
-                exchange_order_id="EX-CANCELLED",
-                status="cancelled",
-                filled_quantity=Decimal("0.25"),
-                average_price=Decimal("160"),
+        mock_exchange_adapter.get_order_by_client_id = (
+            lambda client_order_id, product_id, *, order_type=None: (
+                ExchangeOrderSnapshot(
+                    client_order_id=client_order_id,
+                    exchange_order_id="EX-CANCELLED",
+                    status="cancelled",
+                    filled_quantity=Decimal("0.25"),
+                    average_price=Decimal("160"),
+                    fee=Decimal("0"),
+                    fee_asset="USDC",
+                )
             )
         )
 
@@ -6842,6 +7113,8 @@ class TestAuditedExecution:
                     status="filled",
                     filled_quantity=Decimal("0.01"),
                     average_price=Decimal("42000"),
+                    fee=Decimal("0"),
+                    fee_asset="USDC",
                 )
             if order_type == "take_profit":
                 # Pre-submit adoption lookup for TP fails → TP stays NEW,
@@ -6996,6 +7269,8 @@ class TestAuditedExecution:
                     status="filled",
                     filled_quantity=stop_loss.quantity,
                     average_price=stop_loss.trigger_price,
+                    fee=Decimal("0"),
+                    fee_asset="USDC",
                 )
             if client_order_id == take_profit.client_order_id:
                 return ExchangeOrderSnapshot(
@@ -7149,6 +7424,8 @@ class TestAuditedExecution:
                     status="filled",
                     filled_quantity=stop_loss.quantity,
                     average_price=stop_loss.trigger_price,
+                    fee=Decimal("0"),
+                    fee_asset="USDC",
                 )
             if client_order_id == take_profit.client_order_id:
                 return ExchangeOrderSnapshot(

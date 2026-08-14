@@ -3,9 +3,13 @@ from unittest.mock import Mock
 
 import pytest
 
-from src.core.interfaces.exchange import ExchangeOrderEvent
+from src.core.interfaces.exchange import ExchangeOrderEvent, ExchangeOrderSnapshot
 from src.core.models import OrderStatus
-from src.core.order_event_sync import OrderEventApplier
+from src.core.order_event_sync import (
+    OrderEventApplier,
+    exchange_snapshot_to_order_event,
+    snapshot_fill_fee_rejection,
+)
 from src.core.order_manager import OrderManager
 
 
@@ -20,6 +24,163 @@ def _applier(order_manager: OrderManager) -> OrderEventApplier:
         protective_partial_fill_requires_resize=lambda _order, _state: None,
         cancel_linked_conditional_for_protection_fill=lambda _order: None,
     )
+
+
+@pytest.mark.parametrize(
+    (
+        "local_filled",
+        "fill_quantity",
+        "fee",
+        "fee_asset",
+        "expected",
+    ),
+    [
+        (Decimal("0"), Decimal("0"), None, None, None),
+        (Decimal("0.25"), Decimal("0"), None, None, None),
+        (
+            Decimal("0.25"),
+            Decimal("0.25"),
+            Decimal("0.08"),
+            "USDC",
+            "unresolved_snapshot_cumulative_fee_not_delta",
+        ),
+        (
+            Decimal("0"),
+            Decimal("0.25"),
+            None,
+            "USDC",
+            "unresolved_snapshot_fill_fee_identity_incomplete",
+        ),
+        (
+            Decimal("0"),
+            Decimal("0.25"),
+            Decimal("0.08"),
+            None,
+            "unresolved_snapshot_fill_fee_identity_incomplete",
+        ),
+        (
+            Decimal("0"),
+            Decimal("0.25"),
+            Decimal("0.08"),
+            "",
+            "unresolved_snapshot_fill_fee_identity_incomplete",
+        ),
+        (
+            Decimal("0"),
+            Decimal("0.25"),
+            None,
+            None,
+            "unresolved_snapshot_fill_fee_identity_incomplete",
+        ),
+        (Decimal("0"), Decimal("0.25"), Decimal("0"), "USDC", None),
+        (Decimal("0"), Decimal("0.25"), Decimal("0.08"), "USDC", None),
+    ],
+)
+def test_snapshot_fill_fee_classifier_is_exact(
+    local_filled,
+    fill_quantity,
+    fee,
+    fee_asset,
+    expected,
+):
+    assert (
+        snapshot_fill_fee_rejection(
+            local_filled=local_filled,
+            fill_quantity=fill_quantity,
+            fee=fee,
+            fee_asset=fee_asset,
+        )
+        == expected
+    )
+
+
+@pytest.mark.parametrize("status", ["open", "filled"])
+@pytest.mark.parametrize(
+    ("fee", "fee_asset"),
+    [
+        (None, "USDC"),
+        (Decimal("0.08"), None),
+        (None, None),
+        (Decimal("0.08"), ""),
+    ],
+)
+def test_snapshot_delta_with_incomplete_fee_never_mutates_money_state(
+    status,
+    fee,
+    fee_asset,
+    mock_clock,
+    mock_order_repo,
+    order_factory,
+):
+    order_manager = OrderManager(mock_order_repo, mock_clock, is_backtest=True)
+    applier = _applier(order_manager)
+    order = order_factory(
+        client_order_id="client-snapshot-fee",
+        exchange_order_id="EX-snapshot-fee",
+        status=OrderStatus.SUBMITTED.value,
+        quantity=Decimal("0.25") if status == "filled" else Decimal("0.50"),
+        filled_quantity=Decimal("0"),
+    )
+    mock_order_repo.add_order(order)
+    event = exchange_snapshot_to_order_event(
+        order.product_id,
+        ExchangeOrderSnapshot(
+            client_order_id=order.client_order_id,
+            exchange_order_id=order.exchange_order_id,
+            status=status,
+            filled_quantity=Decimal("0.25"),
+            average_price=Decimal("160"),
+            fee=fee,
+            fee_asset=fee_asset,
+        ),
+    )
+
+    result = applier.process_exchange_order_event(event)
+
+    assert result["action"] == "unresolved_snapshot_fill_fee_identity_incomplete"
+    assert order.filled_quantity == Decimal("0")
+    assert mock_order_repo.trades == []
+
+
+@pytest.mark.parametrize("status", ["open", "filled"])
+@pytest.mark.parametrize("fee", [Decimal("0"), Decimal("0.08")])
+def test_snapshot_first_delta_with_complete_fee_records_exact_asset(
+    status,
+    fee,
+    mock_clock,
+    mock_order_repo,
+    order_factory,
+):
+    order_manager = OrderManager(mock_order_repo, mock_clock, is_backtest=True)
+    applier = _applier(order_manager)
+    order = order_factory(
+        client_order_id="client-snapshot-complete",
+        exchange_order_id="EX-snapshot-complete",
+        status=OrderStatus.SUBMITTED.value,
+        quantity=Decimal("0.25") if status == "filled" else Decimal("0.50"),
+        filled_quantity=Decimal("0"),
+    )
+    mock_order_repo.add_order(order)
+
+    result = applier.process_exchange_order_event(
+        exchange_snapshot_to_order_event(
+            order.product_id,
+            ExchangeOrderSnapshot(
+                client_order_id=order.client_order_id,
+                exchange_order_id=order.exchange_order_id,
+                status=status,
+                filled_quantity=Decimal("0.25"),
+                average_price=Decimal("160"),
+                fee=fee,
+                fee_asset="USDC",
+            ),
+        )
+    )
+
+    assert result["action"] == "applied"
+    assert len(mock_order_repo.trades) == 1
+    assert mock_order_repo.trades[0].fee == fee
+    assert mock_order_repo.trades[0].fee_asset == "USDC"
 
 
 @pytest.mark.parametrize(

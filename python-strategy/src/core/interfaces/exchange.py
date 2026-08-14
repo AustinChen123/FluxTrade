@@ -81,6 +81,7 @@ class ExchangeOrderSnapshot:
     filled_quantity: Optional[Decimal] = None
     average_price: Optional[Decimal] = None
     fee: Optional[Decimal] = None
+    fee_asset: Optional[str] = None
     raw: Optional[dict[str, Any]] = None
 
 
@@ -98,6 +99,7 @@ class ExchangeOrderEvent:
     last_fill_price: Optional[Decimal] = None
     fee: Optional[Decimal] = None
     fee_asset: Optional[str] = None
+    is_snapshot_projection: bool = False
     event_timestamp: Optional[int] = None
     reason: Optional[str] = None
     raw: Optional[dict[str, Any]] = None

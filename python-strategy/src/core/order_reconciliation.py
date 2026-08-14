@@ -20,7 +20,10 @@ from src.core.interfaces.exchange import (
     OwnedOrderReconciliationContext,
 )
 from src.core.models import OrderStatus
-from src.core.order_event_sync import exchange_snapshot_to_order_event
+from src.core.order_event_sync import (
+    exchange_snapshot_to_order_event,
+    snapshot_fill_fee_rejection,
+)
 
 
 class _ExchangeOrderEventProcessor(Protocol):
@@ -412,6 +415,9 @@ class OrderReconciler:
                 )
             partial_repair = self._record_open_snapshot_fill_delta(order, snapshot)
             self.order_manager.mark_submitted(order, snapshot.exchange_order_id)
+            if (order.filled_quantity or Decimal("0")) > 0:
+                order.status = OrderStatus.PARTIALLY_FILLED.value
+                self.order_manager.repo.update_order(order)
             if partial_repair["unresolved"]:
                 return partial_repair
             if partial_repair["action"] != "none":
@@ -443,6 +449,18 @@ class OrderReconciler:
 
             if fill_state == FillDeltaState.DELTA_PRICED:
                 priced_fill = cast(_PricedFill, terminal_fill)
+                fee_rejection = snapshot_fill_fee_rejection(
+                    local_filled=order.filled_quantity or Decimal("0"),
+                    fill_quantity=priced_fill["quantity"],
+                    fee=snapshot.fee,
+                    fee_asset=snapshot.fee_asset,
+                )
+                if fee_rejection is not None:
+                    return self._repair_result(
+                        fee_rejection,
+                        reason=fee_rejection.removeprefix("unresolved_"),
+                        unresolved=True,
+                    )
                 self.order_manager.record_fill_delta(
                     order,
                     priced_fill["price"],
@@ -451,6 +469,7 @@ class OrderReconciler:
                     snapshot.average_price,
                     terminal_status=terminal_status,
                     fee=priced_fill["fee"],
+                    fee_asset=snapshot.fee_asset,
                 )
                 cancel_failure = self.cancel_linked_conditional_for_protection_fill(
                     order
@@ -600,6 +619,18 @@ class OrderReconciler:
             )
 
         priced_fill = cast(_PricedFill, fill_delta)
+        fee_rejection = snapshot_fill_fee_rejection(
+            local_filled=order.filled_quantity or Decimal("0"),
+            fill_quantity=priced_fill["quantity"],
+            fee=snapshot.fee,
+            fee_asset=snapshot.fee_asset,
+        )
+        if fee_rejection is not None:
+            return self._repair_result(
+                fee_rejection,
+                reason=fee_rejection.removeprefix("unresolved_"),
+                unresolved=True,
+            )
         self.order_manager.record_partial_fill(
             order,
             priced_fill["price"],
@@ -607,6 +638,7 @@ class OrderReconciler:
             snapshot.filled_quantity,
             snapshot.average_price,
             fee=priced_fill["fee"],
+            fee_asset=snapshot.fee_asset,
         )
         return self._repair_result("recorded_partial_fill_and_restored_tracking")
 
