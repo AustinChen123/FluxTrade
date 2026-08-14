@@ -141,6 +141,7 @@ def test_binance_owner_keeps_existing_module_dependency_boundary():
     assert imports == [
         "import asyncio",
         "import logging",
+        "import threading",
         "from collections.abc import Callable",
         "from typing import cast",
         (
@@ -156,7 +157,7 @@ def test_binance_owner_keeps_existing_module_dependency_boundary():
         ),
         (
             "from src.core.adapters.binance_user_stream import "
-            "create_binance_user_stream_listen_key, "
+            "BinanceOrderEventStream, create_binance_user_stream_listen_key, "
             "keepalive_binance_user_stream"
         ),
         (
@@ -164,7 +165,7 @@ def test_binance_owner_keeps_existing_module_dependency_boundary():
             "BinanceWebSocketOrderConnector, OrderRejected"
         ),
         "from src.core.adapters.ccxt_adapter import CcxtExchangeAdapter",
-        "from src.core.interfaces.exchange import NetworkError",
+        ("from src.core.interfaces.exchange import ExchangeOrderEvent, NetworkError"),
         "from src.core.orm_models import Order",
         "from src.core.product_registry import to_base_quote",
     ]
