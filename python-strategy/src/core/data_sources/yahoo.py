@@ -122,16 +122,19 @@ class YahooFinanceDataSource(IDataSource):
     ) -> Generator[Candlestick, None, None]:
         df = self._download(timeframe, start, end)
 
-        for _, row in df.iterrows():
+        for timestamp, open_, high, low, close, volume in df.itertuples(
+            index=False,
+            name=None,
+        ):
             yield Candlestick(
                 product_id=self._product_id,
                 timeframe=timeframe,
-                timestamp=int(row["timestamp"]),
-                open=Decimal(str(row["open"])),
-                high=Decimal(str(row["high"])),
-                low=Decimal(str(row["low"])),
-                close=Decimal(str(row["close"])),
-                volume=Decimal(str(row["volume"])),
+                timestamp=int(timestamp),
+                open=Decimal(str(open_)),
+                high=Decimal(str(high)),
+                low=Decimal(str(low)),
+                close=Decimal(str(close)),
+                volume=Decimal(str(volume)),
             )
 
     def get_candles_df(

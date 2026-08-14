@@ -560,6 +560,42 @@ class TestYahooFinanceDataSource:
         assert isinstance(result[0], Candlestick)
         assert result[0].product_id == "YAHOO:BTC-PERP"
 
+    def test_get_candles_preserves_int64_timestamp_with_float_ohlcv(self):
+        from src.core.data_sources.yahoo import YahooFinanceDataSource
+
+        timestamp = 9_007_199_254_740_993
+        ds = YahooFinanceDataSource(product_id="YAHOO:BTC-PERP")
+        download_df = pd.DataFrame(
+            {
+                "timestamp": [timestamp],
+                "open": [Decimal("1.1")],
+                "high": [Decimal("2.2")],
+                "low": [Decimal("0.3")],
+                "close": [Decimal("1.4")],
+                "volume": [Decimal("5.5")],
+            }
+        ).astype(
+            {
+                "open": "float64",
+                "high": "float64",
+                "low": "float64",
+                "close": "float64",
+                "volume": "float64",
+            }
+        )
+
+        with patch.object(ds, "_download", return_value=download_df):
+            candle = next(ds.get_candles("YAHOO:BTC-PERP", "1d", 0, timestamp + 1))
+
+        assert candle.timestamp == timestamp
+        assert (candle.open, candle.high, candle.low, candle.close, candle.volume) == (
+            Decimal("1.1"),
+            Decimal("2.2"),
+            Decimal("0.3"),
+            Decimal("1.4"),
+            Decimal("5.5"),
+        )
+
     def test_validate_returns_false_on_error(self):
         """validate() should return False when yfinance fails."""
         from src.core.data_sources.yahoo import YahooFinanceDataSource
