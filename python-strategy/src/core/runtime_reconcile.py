@@ -10,7 +10,7 @@ Implementation notes for the implementer:
   the implementer must add it (returns list[Position]).
 - adapter.get_position(product_id) returns Optional[Position].  If a position
   exists locally but the exchange reports None, treat exchange_quantity as 0.
-- balance comparison uses adapter.get_balance("USDT") vs account_service.get_balance().
+- balance comparison uses the composed balance asset vs account_service.get_balance().
 - quantity_drift_threshold and balance_drift_threshold are both Decimal;
   comparison is abs(local - exchange) > threshold.
 - When both local and exchange have positions, the drift is
@@ -45,6 +45,8 @@ class RuntimeReconciliationJob:
         adapter: Any,
         db_session_factory: Callable[[], ContextManager[Session]],
         *,
+        balance_asset: str | None,
+        on_balance_authority_failure: Callable[[str], None] | None = None,
         quantity_drift_threshold: Decimal,
         balance_drift_threshold: Decimal,
         product_ids: list[str] | tuple[str, ...] | None = None,
@@ -53,6 +55,12 @@ class RuntimeReconciliationJob:
         self._account_service = account_service
         self._adapter = adapter
         self._db_session_factory = db_session_factory
+        if balance_asset is not None and (
+            type(balance_asset) is not str or not balance_asset
+        ):
+            raise ValueError("runtime balance asset must be a non-empty string")
+        self._balance_asset = balance_asset
+        self._on_balance_authority_failure = on_balance_authority_failure
         self._quantity_drift_threshold = quantity_drift_threshold
         self._balance_drift_threshold = balance_drift_threshold
         self._product_ids = tuple(product_ids or ())
@@ -234,20 +242,67 @@ class RuntimeReconciliationJob:
         return "unknown"
 
     def _check_balance(self, result: dict) -> None:
+        if self._balance_asset is None:
+            return
+        local_balance: Decimal | None = None
         try:
             local_balance = self._account_service.get_balance()
-            exchange_balance = self._adapter.get_balance("USDT")
-            if not isinstance(local_balance, Decimal):
-                local_balance = Decimal(str(local_balance))
-            if not isinstance(exchange_balance, Decimal):
-                exchange_balance = Decimal(str(exchange_balance))
-            if abs(local_balance - exchange_balance) > self._balance_drift_threshold:
-                result["balance_drift"] = {
-                    "local": local_balance,
-                    "exchange": exchange_balance,
-                }
-        except Exception as exc:
-            result["errors"].append({"scope": "balance", "reason": str(exc)})
+            if type(local_balance) is not Decimal or not local_balance.is_finite():
+                raise ValueError("local balance invalid")
+        except Exception:
+            local_balance = None
+            self._record_balance_error(result, "local_read", authority_failure=False)
+
+        try:
+            exchange_balance = self._adapter.get_balance(self._balance_asset)
+        except Exception:
+            self._record_balance_error(result, "adapter_read", authority_failure=True)
+            return
+        if (
+            type(exchange_balance) is not Decimal
+            or not exchange_balance.is_finite()
+            or exchange_balance < 0
+        ):
+            self._record_balance_error(
+                result,
+                "value_validation",
+                authority_failure=True,
+            )
+            return
+        try:
+            self._account_service.replace_generic_balance(exchange_balance)
+        except Exception:
+            self._record_balance_error(
+                result,
+                "account_persistence",
+                authority_failure=True,
+            )
+            return
+        if (
+            local_balance is not None
+            and abs(local_balance - exchange_balance) > self._balance_drift_threshold
+        ):
+            result["balance_drift"] = {
+                "local": local_balance,
+                "exchange": exchange_balance,
+            }
+
+    def _record_balance_error(
+        self,
+        result: dict,
+        stage: str,
+        *,
+        authority_failure: bool,
+    ) -> None:
+        result["errors"].append(
+            {
+                "scope": "balance",
+                "reason": "balance_authority_unavailable",
+                "stage": stage,
+            }
+        )
+        if authority_failure and self._on_balance_authority_failure is not None:
+            self._on_balance_authority_failure(stage)
 
     def _emit_events(self, result: dict) -> None:
         if result["position_drifts"] or result["balance_drift"] is not None:

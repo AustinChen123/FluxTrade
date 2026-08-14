@@ -288,6 +288,7 @@ class StrategyEngine:
         self._startup_reconciliation_entry_admission_safe = True
         self._startup_balance_failure_latched = False
         self._startup_balance_failure_logged = False
+        self._runtime_balance_failure_logged = False
         self._live_product_ids = (
             frozenset(effective_adapter_config.get("instrument_product_ids") or [])
             if effective_adapter_config.get("mode") == "live"
@@ -552,6 +553,12 @@ class StrategyEngine:
             account_service=self.account_service,
             adapter=adapter,
             db_session_factory=self._db_session_factory,
+            balance_asset=self._live_balance_asset,
+            on_balance_authority_failure=(
+                self._latch_runtime_balance_authority_failure
+                if self._live_balance_asset is not None
+                else None
+            ),
             quantity_drift_threshold=Decimal(
                 os.getenv("RECONCILE_QTY_DRIFT_THRESHOLD", "0.00000001")
             ),
@@ -1294,6 +1301,22 @@ class StrategyEngine:
             },
         )
         return balance
+
+    def _latch_runtime_balance_authority_failure(self, stage: str) -> None:
+        self._startup_balance_failure_latched = True
+        self._startup_balance_entry_admission_safe = False
+        if self._runtime_balance_failure_logged:
+            return
+        logger.error(
+            "Live runtime balance authority unavailable; entry admission latched",
+            extra={
+                "component": "strategy_engine",
+                "event_code": "runtime_balance_authority_unavailable",
+                "stage": stage,
+                "asset": self._live_balance_asset,
+            },
+        )
+        self._runtime_balance_failure_logged = True
 
     def _check_system_state(self) -> bool:
         """

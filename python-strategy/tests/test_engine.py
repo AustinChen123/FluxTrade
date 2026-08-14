@@ -1342,6 +1342,116 @@ class TestEngineInit:
 
         assert engine._entry_signal_allowed_for_processor(entry_signal) is False
 
+    def test_runtime_balance_failure_preserves_fill_protection_and_exit_path(
+        self,
+        engine_factory,
+        signal_factory,
+    ):
+        engine = _live_ccxt_engine(engine_factory)
+        engine.execution_engine.audit_external_orders = True
+        adapter = engine.execution_engine.adapter
+        entry_signal = signal_factory(
+            price=Decimal("42000"),
+            quantity=Decimal("0.50"),
+            stop_loss=Decimal("41000"),
+            take_profit=Decimal("43000"),
+        )
+        order_id = engine.execution_engine.execute_signal(entry_signal)
+        repo = engine.execution_engine.order_manager.repo
+        entry = repo.get_order(order_id)
+        assert entry is not None
+        conditionals = [
+            order
+            for order in repo.orders.values()
+            if order.type in {"stop_loss", "take_profit"}
+        ]
+        assert len(conditionals) == 2
+        assert {order.status for order in conditionals} == {OrderStatus.NEW.value}
+        engine.execution_engine.order_manager.update_position_script = MagicMock()
+        engine.account_service.get_balance = MagicMock(return_value=Decimal("50000"))
+        adapter.get_balance = MagicMock(
+            side_effect=RuntimeError("provider-balance-secret-sentinel")
+        )
+
+        result = engine.runtime_reconciliation_job.run_once()
+
+        assert result["errors"] == [
+            {
+                "scope": "balance",
+                "reason": "balance_authority_unavailable",
+                "stage": "adapter_read",
+            }
+        ]
+        assert engine._startup_balance_entry_admission_safe is False
+        assert engine.execution_engine._submissions_halted is False
+        event = ExchangeOrderEvent(
+            status="open",
+            product_id=entry.product_id,
+            client_order_id=entry.client_order_id,
+            exchange_order_id=entry.exchange_order_id,
+            cumulative_filled_quantity=Decimal("0.25"),
+            cumulative_average_price=Decimal("42000"),
+            fee=Decimal("0.08"),
+            fee_asset="USDC",
+            event_timestamp=1704067200001,
+        )
+
+        assert (
+            engine.execution_engine.process_exchange_order_event(event)["action"]
+            == "applied"
+        )
+        assert len(repo.trades) == 1
+        assert repo.trades[0].fee == Decimal("0.08")
+        assert repo.trades[0].fee_asset == "USDC"
+        assert {order.status for order in conditionals} == {OrderStatus.SUBMITTED.value}
+        submitted_protection_ids = [
+            order.id
+            for order in adapter.open_orders
+            if order.type in {"stop_loss", "take_profit"}
+        ]
+        for conditional in conditionals:
+            assert submitted_protection_ids.count(conditional.id) == 1
+
+        engine.execution_engine.process_exchange_order_event(event)
+
+        assert len(repo.trades) == 1
+        assert repo.trades[0].fee == Decimal("0.08")
+        assert repo.trades[0].fee_asset == "USDC"
+        replayed_protection_ids = [
+            order.id
+            for order in adapter.open_orders
+            if order.type in {"stop_loss", "take_profit"}
+        ]
+        assert replayed_protection_ids == submitted_protection_ids
+        for conditional in conditionals:
+            assert replayed_protection_ids.count(conditional.id) == 1
+        engine.account_service.set_position(
+            Position(
+                strategy_id=entry.strategy_id,
+                product_id=entry.product_id,
+                side=PositionSide.LONG,
+                quantity=Decimal("0.25"),
+                entry_price=Decimal("42000"),
+                unrealized_pnl=Decimal("0"),
+            )
+        )
+        exit_signal = signal_factory(
+            strategy_id=entry.strategy_id,
+            product_id=entry.product_id,
+            signal_type=SignalType.EXIT_LONG,
+            quantity=None,
+        )
+        orders_before_exit = len(adapter.open_orders)
+
+        assert engine.process_signal(exit_signal, _make_candle()) is True
+        assert len(adapter.open_orders) == orders_before_exit + 1
+
+        engine.risk_manager.check_risk = MagicMock(
+            side_effect=AssertionError("latched entry reached risk")
+        )
+        assert engine.process_signal(entry_signal, _make_candle()) is False
+        engine.risk_manager.check_risk.assert_not_called()
+
     def test_startup_reconcile_uses_rithmic_owned_recovery_when_configured(
         self,
         engine_factory,
@@ -3691,6 +3801,66 @@ class TestHeartbeatRecording:
         assert engine._reconcile_startup_balance() is None
         assert engine._startup_balance_entry_admission_safe is False
         assert engine._startup_balance_failure_latched is True
+
+    def test_live_ccxt_runtime_balance_failure_logs_once_and_never_reopens(
+        self,
+        engine_factory,
+        caplog,
+    ):
+        engine = _live_ccxt_engine(engine_factory)
+        secret = "provider-runtime-balance-secret"
+        engine.execution_engine.adapter.get_balance = MagicMock(
+            side_effect=RuntimeError(secret)
+        )
+
+        with caplog.at_level(logging.ERROR, logger="src.core.engine"):
+            first = engine.runtime_reconciliation_job.run_once()
+            second = engine.runtime_reconciliation_job.run_once()
+
+        assert (
+            first["errors"]
+            == second["errors"]
+            == [
+                {
+                    "scope": "balance",
+                    "reason": "balance_authority_unavailable",
+                    "stage": "adapter_read",
+                }
+            ]
+        )
+        records = [
+            record
+            for record in caplog.records
+            if getattr(record, "event_code", None)
+            == "runtime_balance_authority_unavailable"
+        ]
+        assert len(records) == 1
+        record = records[0]
+        assert record.levelname == "ERROR"
+        assert record.getMessage() == (
+            "Live runtime balance authority unavailable; entry admission latched"
+        )
+        assert {
+            "component": vars(record)["component"],
+            "stage": vars(record)["stage"],
+            "asset": vars(record)["asset"],
+        } == {
+            "component": "strategy_engine",
+            "stage": "adapter_read",
+            "asset": "USDT",
+        }
+        assert secret not in vars(record).values()
+        assert engine._startup_balance_entry_admission_safe is False
+
+        engine.execution_engine.adapter.get_balance.side_effect = None
+        engine.execution_engine.adapter.get_balance.return_value = Decimal("40000")
+        assert engine.runtime_reconciliation_job.run_once()["errors"] == []
+        engine._resume_after_kill_switch()
+
+        assert engine._startup_balance_entry_admission_safe is False
+        engine.account_service.replace_generic_balance.assert_called_once_with(
+            Decimal("40000")
+        )
 
     def test_live_ccxt_manual_clear_cannot_reopen_balance_latch(
         self,

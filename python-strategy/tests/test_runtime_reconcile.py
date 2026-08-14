@@ -21,7 +21,10 @@ import threading
 import time
 from unittest.mock import MagicMock, patch
 
+import pytest
+
 from src.core.models import Position, PositionSide
+from src.core.risk_manager import AccountService, RiskManager
 from src.core.runtime_reconcile import RuntimeReconciliationJob
 
 
@@ -61,12 +64,17 @@ class FakeAccountService:
     ) -> None:
         self._positions = positions or []
         self._balance = balance
+        self.balance_replacements: list[Decimal] = []
 
     def get_all_positions(self) -> list[Position]:
         return list(self._positions)
 
     def get_balance(self) -> Decimal:
         return self._balance
+
+    def replace_generic_balance(self, balance: Decimal) -> None:
+        self.balance_replacements.append(balance)
+        self._balance = balance
 
 
 class BlockingFirstAccountService(FakeAccountService):
@@ -99,6 +107,7 @@ class FakeAdapter:
         self._positions: dict[str, Position | None] = positions or {}
         self._balance = balance
         self._get_position_raises = get_position_raises
+        self.balance_assets: list[str] = []
 
     def get_position(self, product_id: str) -> Position | None:
         if self._get_position_raises is not None:
@@ -106,6 +115,7 @@ class FakeAdapter:
         return self._positions.get(product_id)
 
     def get_balance(self, asset: str) -> Decimal:
+        self.balance_assets.append(asset)
         return self._balance
 
 
@@ -161,6 +171,7 @@ def _make_job(
         account_service=account,
         adapter=adapter,
         db_session_factory=db_factory,
+        balance_asset="USDT",
         quantity_drift_threshold=qty_threshold,
         balance_drift_threshold=bal_threshold,
     )
@@ -189,6 +200,7 @@ class TestRunOnceResultShape:
             account_service=account,
             adapter=FakeAdapter(),
             db_session_factory=_make_null_db_factory(),
+            balance_asset="USDT",
             quantity_drift_threshold=THRESHOLD_QTY,
             balance_drift_threshold=THRESHOLD_BAL,
         )
@@ -380,6 +392,7 @@ class TestRunOnceAsymmetricDrift:
             account_service=account,
             adapter=adapter,
             db_session_factory=_make_null_db_factory(),
+            balance_asset="USDT",
             quantity_drift_threshold=THRESHOLD_QTY,
             balance_drift_threshold=THRESHOLD_BAL,
             product_ids=[PRODUCT_ID],
@@ -406,7 +419,7 @@ class TestRunOnceBalanceDrift:
     def test_balance_drift_above_threshold_reported(self):
         local_bal = Decimal("10000.00")
         exchange_bal = Decimal("9000.00")  # diff = 1000 >> THRESHOLD_BAL
-        job, _, _ = _make_job(
+        job, account, _ = _make_job(
             local_balance=local_bal,
             exchange_balance=exchange_bal,
         )
@@ -423,6 +436,7 @@ class TestRunOnceBalanceDrift:
         assert isinstance(result["balance_drift"]["exchange"], Decimal)
         assert result["balance_drift"]["local"] == local_bal
         assert result["balance_drift"]["exchange"] == exchange_bal
+        assert account.balance_replacements == [exchange_bal]
 
     def test_small_balance_diff_within_threshold_no_drift(self):
         job, _, _ = _make_job(
@@ -436,6 +450,168 @@ class TestRunOnceBalanceDrift:
             mock_write.assert_not_called()
 
         assert result["balance_drift"] is None
+
+
+class TestRunOnceBalanceAuthority:
+    def test_configured_asset_refreshes_exact_balance_below_drift_threshold(self):
+        account = FakeAccountService(balance=Decimal("10000.00"))
+        adapter = FakeAdapter(balance=Decimal("9999.50"))
+        failure = MagicMock()
+        job = RuntimeReconciliationJob(
+            account_service=account,
+            adapter=adapter,
+            db_session_factory=_make_null_db_factory(),
+            balance_asset="USDC",
+            on_balance_authority_failure=failure,
+            quantity_drift_threshold=THRESHOLD_QTY,
+            balance_drift_threshold=Decimal("1.00"),
+        )
+
+        with patch("src.core.runtime_reconcile.write_system_event") as write_event:
+            result = job.run_once()
+
+        assert adapter.balance_assets == ["USDC"]
+        assert account.balance_replacements == [Decimal("9999.50")]
+        assert account.get_balance() == Decimal("9999.50")
+        assert result["balance_drift"] is None
+        assert result["errors"] == []
+        failure.assert_not_called()
+        write_event.assert_not_called()
+
+    def test_real_account_and_risk_manager_read_refreshed_exact_cache_key(self):
+        class BalanceRedis:
+            def __init__(self) -> None:
+                self.values = {("state:balance:main", "free"): "1000"}
+                self.hset_calls: list[tuple[str, dict[str, str]]] = []
+
+            def hget(self, name: str, key: str) -> str | None:
+                return self.values.get((name, key))
+
+            def hset(self, name: str, mapping: dict[str, str]) -> int:
+                self.hset_calls.append((name, mapping))
+                for key, value in mapping.items():
+                    self.values[(name, key)] = value
+                return len(mapping)
+
+            def scan_iter(self, match: str):
+                del match
+                return iter(())
+
+        redis = BalanceRedis()
+        account = AccountService.__new__(AccountService)
+        account.redis = redis
+        account._authoritative_balance_key = None
+        adapter = FakeAdapter(balance=Decimal("250.00"))
+        job = RuntimeReconciliationJob(
+            account_service=account,
+            adapter=adapter,
+            db_session_factory=_make_null_db_factory(),
+            balance_asset="USDC",
+            quantity_drift_threshold=THRESHOLD_QTY,
+            balance_drift_threshold=THRESHOLD_BAL,
+        )
+
+        with patch("src.core.runtime_reconcile.write_system_event"):
+            result = job.run_once()
+
+        assert result["balance_drift"] == {
+            "local": Decimal("1000"),
+            "exchange": Decimal("250.00"),
+        }
+        assert redis.hset_calls == [("state:balance:main", {"free": "250.00"})]
+        risk = RiskManager(account, order_rate_limit_rule=MagicMock())
+        assert risk.calculate_position_size(
+            Decimal("100"),
+            Decimal("90"),
+            Decimal("0.02"),
+        ) == Decimal("0.5000")
+
+    @pytest.mark.parametrize(
+        ("stage", "exchange_balance"),
+        [
+            ("local_read", Decimal("250")),
+            ("adapter_read", Decimal("250")),
+            ("value_validation", "250"),
+            ("value_validation", Decimal("NaN")),
+            ("value_validation", Decimal("Infinity")),
+            ("value_validation", Decimal("-1")),
+            ("account_persistence", Decimal("250")),
+        ],
+    )
+    def test_balance_failure_is_sanitized_before_result_log_and_audit(
+        self,
+        stage,
+        exchange_balance,
+    ):
+        secret = "provider-balance-secret-sentinel"
+        account = FakeAccountService(balance=Decimal("1000"))
+        adapter = FakeAdapter(balance=exchange_balance)
+        if stage == "local_read":
+            account.get_balance = MagicMock(side_effect=RuntimeError(secret))
+        elif stage == "adapter_read":
+            adapter.get_balance = MagicMock(side_effect=RuntimeError(secret))
+        elif stage == "account_persistence":
+            account.replace_generic_balance = MagicMock(
+                side_effect=RuntimeError(secret)
+            )
+        logger = MagicMock()
+        authority_failure = MagicMock()
+        job = RuntimeReconciliationJob(
+            account_service=account,
+            adapter=adapter,
+            db_session_factory=_make_null_db_factory(),
+            balance_asset="USDC",
+            on_balance_authority_failure=authority_failure,
+            quantity_drift_threshold=THRESHOLD_QTY,
+            balance_drift_threshold=THRESHOLD_BAL,
+            logger=logger,
+        )
+
+        with patch("src.core.runtime_reconcile.write_system_event") as write_event:
+            result = job.run_once()
+
+        safe_error = {
+            "scope": "balance",
+            "reason": "balance_authority_unavailable",
+            "stage": stage,
+        }
+        assert result["errors"] == [safe_error]
+        logger.warning.assert_called_once_with(
+            "Runtime reconciliation errors: %s",
+            [safe_error],
+        )
+        assert write_event.call_args.kwargs["event_subtype"] == (
+            "runtime_reconcile_error"
+        )
+        assert write_event.call_args.kwargs["payload"] is result
+
+        def contains_secret_or_exception(value):
+            if isinstance(value, BaseException):
+                return True
+            if type(value) is str:
+                return secret in value
+            if type(value) is dict:
+                return any(
+                    contains_secret_or_exception(item)
+                    for pair in value.items()
+                    for item in pair
+                )
+            if type(value) in (list, tuple):
+                return any(contains_secret_or_exception(item) for item in value)
+            return False
+
+        assert not contains_secret_or_exception(result)
+        assert not contains_secret_or_exception(logger.warning.call_args.args)
+        assert not contains_secret_or_exception(write_event.call_args.kwargs)
+        if stage == "local_read":
+            authority_failure.assert_not_called()
+            assert account.balance_replacements == [Decimal("250")]
+        elif stage == "account_persistence":
+            account.replace_generic_balance.assert_called_once_with(Decimal("250"))
+            authority_failure.assert_called_once_with(stage)
+        else:
+            assert account.balance_replacements == []
+            authority_failure.assert_called_once_with(stage)
 
 
 class TestRunOnceAdapterError:
@@ -496,6 +672,7 @@ class TestRunOnceAdapterError:
             account_service=account,
             adapter=adapter,
             db_session_factory=_make_null_db_factory(),
+            balance_asset="USDT",
             quantity_drift_threshold=THRESHOLD_QTY,
             balance_drift_threshold=THRESHOLD_BAL,
             product_ids=[PRODUCT_ID],
@@ -563,6 +740,7 @@ class TestRunOnceAdapterError:
             account_service=account,
             adapter=PartialFailAdapter(),
             db_session_factory=db_factory,
+            balance_asset="USDT",
             quantity_drift_threshold=THRESHOLD_QTY,
             balance_drift_threshold=THRESHOLD_BAL,
         )
