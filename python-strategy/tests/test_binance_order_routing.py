@@ -311,6 +311,7 @@ def test_quantization_failure_precedes_policy(
     monkeypatch.setattr(adapter, "_ccxt_order_type_and_params", policy)
     order = SimpleNamespace(
         product_id="BYBIT:BTCUSDT-PERP",
+        side="buy",
         type="stop_loss",
         trigger_price=None,
     )
@@ -339,6 +340,7 @@ def test_policy_rejection_follows_successful_quantization(
     monkeypatch.setattr(adapter, "_ccxt_order_type_and_params", policy)
     order = SimpleNamespace(
         product_id="BYBIT:BTCUSDT-PERP",
+        side="buy",
         type="stop_loss",
         trigger_price=None,
     )
