@@ -10,7 +10,8 @@ Usage:
 
 from datetime import datetime, timezone
 from decimal import Decimal
-from typing import Generator, Optional
+from importlib import import_module
+from typing import Generator, Optional, Protocol, runtime_checkable
 
 import pandas as pd
 
@@ -30,6 +31,43 @@ _TF_MAP = {
     "1w": "1wk",
     "1M": "1mo",
 }
+
+_YFINANCE_IMPORT_ERROR = (
+    "yfinance is required for YahooFinanceDataSource. "
+    "Install with: pip install yfinance"
+)
+
+
+class _YFinanceTicker(Protocol):
+    @property
+    def info(self) -> dict[str, object]: ...
+
+
+@runtime_checkable
+class _YFinanceModule(Protocol):
+    def download(
+        self,
+        tickers: str,
+        *,
+        start: datetime,
+        end: datetime,
+        interval: str,
+        auto_adjust: bool,
+        progress: bool,
+    ) -> pd.DataFrame | None: ...
+
+    def Ticker(self, ticker: str) -> _YFinanceTicker: ...
+
+
+def _load_yfinance() -> _YFinanceModule:
+    try:
+        module = import_module("yfinance")
+    except ImportError:
+        raise ImportError(_YFINANCE_IMPORT_ERROR)
+
+    if not isinstance(module, _YFinanceModule):
+        raise ImportError(_YFINANCE_IMPORT_ERROR)
+    return module
 
 
 class YahooFinanceDataSource(IDataSource):
@@ -56,17 +94,9 @@ class YahooFinanceDataSource(IDataSource):
         self._timeframe = timeframe
         self._df: pd.DataFrame | None = None
 
-    def _download(
-        self, timeframe: str, start_ms: int, end_ms: int
-    ) -> pd.DataFrame:
+    def _download(self, timeframe: str, start_ms: int, end_ms: int) -> pd.DataFrame:
         """Download data from Yahoo Finance, with lazy import."""
-        try:
-            import yfinance as yf
-        except ImportError:
-            raise ImportError(
-                "yfinance is required for YahooFinanceDataSource. "
-                "Install with: pip install yfinance"
-            )
+        yf = _load_yfinance()
 
         interval = _TF_MAP.get(timeframe)
         if interval is None:
@@ -87,7 +117,7 @@ class YahooFinanceDataSource(IDataSource):
             progress=False,
         )
 
-        if df.empty:
+        if df is None or df.empty:
             return pd.DataFrame(
                 columns=["timestamp", "open", "high", "low", "close", "volume"]
             )
@@ -96,23 +126,37 @@ class YahooFinanceDataSource(IDataSource):
         if isinstance(df.columns, pd.MultiIndex):
             df.columns = df.columns.get_level_values(0)
 
-        df = df.rename(columns={
-            "Open": "open",
-            "High": "high",
-            "Low": "low",
-            "Close": "close",
-            "Volume": "volume",
-        })
+        df = df.rename(
+            columns={
+                "Open": "open",
+                "High": "high",
+                "Low": "low",
+                "Close": "close",
+                "Volume": "volume",
+            }
+        )
+
+        if not isinstance(df.index, pd.DatetimeIndex):
+            raise TypeError("Yahoo Finance index must be a DatetimeIndex")
 
         # Convert index to UTC ms timestamp
-        df["timestamp"] = (
-            df.index.tz_localize("UTC")
-            if df.index.tz is None
-            else df.index.tz_convert("UTC")
+        datetime_index = df.index
+        utc_index = (
+            datetime_index.tz_localize("UTC")
+            if datetime_index.tz is None
+            else datetime_index.tz_convert("UTC")
         )
-        df["timestamp"] = df["timestamp"].astype("int64") // 10**6
+        df["timestamp"] = utc_index.as_unit("ms").astype("int64")
 
-        df = df[["timestamp", "open", "high", "low", "close", "volume"]]
+        required_columns = [
+            "timestamp",
+            "open",
+            "high",
+            "low",
+            "close",
+            "volume",
+        ]
+        df = pd.DataFrame(df.loc[:, required_columns])
         df = df.reset_index(drop=True)
 
         return df
@@ -158,7 +202,7 @@ class YahooFinanceDataSource(IDataSource):
 
     def validate(self) -> bool:
         try:
-            import yfinance as yf
+            yf = _load_yfinance()
             info = yf.Ticker(self._ticker).info
             return info is not None and "regularMarketPrice" in info
         except Exception:
