@@ -72,6 +72,12 @@ impl LiveRuntime {
             .or_else(|| non_empty_value(lookup("EXCHANGE_ENABLED")))
             .unwrap_or_else(|| "binance,bybit,backpack".into());
         let enabled_exchanges = validate_enabled_exchanges(&enabled_exchanges_raw)?;
+        let execution_venue = non_empty_value(lookup("EXCHANGE_ID"))
+            .ok_or_else(|| anyhow::anyhow!("EXCHANGE_ID must be set explicitly in live"))?
+            .to_ascii_lowercase();
+        if !enabled_exchanges.contains(&execution_venue) {
+            anyhow::bail!("EXCHANGE_ID must be included in EXCHANGE_ENABLED: {execution_venue}");
+        }
         let (binance_user_stream_enabled, backpack_user_stream_enabled) =
             preflight_user_stream_credentials(&enabled_exchanges, &lookup)?;
 
@@ -319,6 +325,132 @@ mod tests {
     }
 
     #[test]
+    fn execution_venue_must_be_covered_before_later_runtime_preparation() {
+        let cases = [
+            (None, "EXCHANGE_ID must be set explicitly in live"),
+            (
+                Some("binance"),
+                "EXCHANGE_ID must be included in EXCHANGE_ENABLED: binance",
+            ),
+        ];
+
+        for (execution_venue, expected) in cases {
+            let lookup_count = std::cell::Cell::new(0);
+            let error = LiveRuntime::prepare_with_lookup(
+                options(Some("bybit".to_string()), Some("btcusdt".to_string())),
+                |name| {
+                    assert_eq!(name, "EXCHANGE_ID");
+                    lookup_count.set(lookup_count.get() + 1);
+                    execution_venue.map(str::to_string)
+                },
+            )
+            .err()
+            .unwrap();
+
+            assert_eq!(error.to_string(), expected);
+            assert_eq!(lookup_count.get(), 1);
+        }
+    }
+
+    #[test]
+    fn execution_venue_coverage_precedes_credentials_and_symbols() {
+        let cases = [
+            (
+                options(Some("binance".to_string()), Some("btcusdt".to_string())),
+                "bybit",
+                "BINANCE_API_KEY",
+            ),
+            (
+                options(Some("bybit".to_string()), None),
+                "binance",
+                "MARKET_DATA_SYMBOLS",
+            ),
+        ];
+
+        for (options, execution_venue, forbidden_lookup) in cases {
+            let error = LiveRuntime::prepare_with_lookup(options, |name| match name {
+                "EXCHANGE_ID" => Some(execution_venue.to_string()),
+                name if name == forbidden_lookup => panic!("later preparation must not run"),
+                _ => None,
+            })
+            .err()
+            .unwrap();
+
+            assert_eq!(
+                error.to_string(),
+                format!("EXCHANGE_ID must be included in EXCHANGE_ENABLED: {execution_venue}")
+            );
+        }
+    }
+
+    #[test]
+    fn enabled_exchange_validation_precedes_execution_membership() {
+        for (enabled, expected) in [
+            ("unknown", "unsupported or unavailable exchange: unknown"),
+            (
+                "binance,BINANCE",
+                "EXCHANGE_ENABLED must not contain duplicate values",
+            ),
+        ] {
+            let error = LiveRuntime::prepare_with_lookup(
+                options(Some(enabled.to_string()), Some("btcusdt".to_string())),
+                |_| panic!("execution venue lookup must not run"),
+            )
+            .err()
+            .unwrap();
+
+            assert_eq!(error.to_string(), expected);
+        }
+    }
+
+    #[test]
+    fn execution_venue_membership_accepts_exact_and_multi_source_market_data() {
+        for (enabled, execution_venue, expected) in [
+            ("bybit", " BYBIT ", vec!["bybit"]),
+            ("binance,bybit", "bybit", vec!["binance", "bybit"]),
+        ] {
+            let runtime = LiveRuntime::prepare_with_lookup(
+                options(Some(enabled.to_string()), Some("btcusdt".to_string())),
+                |name| (name == "EXCHANGE_ID").then(|| execution_venue.to_string()),
+            )
+            .unwrap();
+
+            assert_eq!(runtime.enabled_exchanges, expected);
+        }
+    }
+
+    #[test]
+    fn environment_enabled_list_enforces_mismatch_and_accepts_multi_source_membership() {
+        let mismatch = std::collections::HashMap::from([
+            ("EXCHANGE_ENABLED", "bybit"),
+            ("EXCHANGE_ID", "binance"),
+        ]);
+        let error =
+            LiveRuntime::prepare_with_lookup(options(None, Some("btcusdt".to_string())), |name| {
+                mismatch.get(name).map(|value| (*value).to_string())
+            })
+            .err()
+            .unwrap();
+        assert_eq!(
+            error.to_string(),
+            "EXCHANGE_ID must be included in EXCHANGE_ENABLED: binance"
+        );
+
+        let accepted = std::collections::HashMap::from([
+            ("EXCHANGE_ENABLED", "bybit,backpack"),
+            ("EXCHANGE_ID", "backpack"),
+            ("EXCHANGE_API_KEY", "backpack-key"),
+            ("EXCHANGE_SECRET", "backpack-secret"),
+        ]);
+        let runtime =
+            LiveRuntime::prepare_with_lookup(options(None, Some("btcusdt".to_string())), |name| {
+                accepted.get(name).map(|value| (*value).to_string())
+            })
+            .unwrap();
+        assert_eq!(runtime.enabled_exchanges, vec!["bybit", "backpack"]);
+    }
+
+    #[test]
     fn user_stream_credentials_are_preflighted_for_enabled_exchanges() {
         let enabled = vec!["binance".to_string(), "backpack".to_string()];
         let complete = std::collections::HashMap::from([
@@ -387,6 +519,7 @@ mod tests {
     #[test]
     fn preparation_preserves_venue_order_symbols_and_stream_flags() {
         let values = std::collections::HashMap::from([
+            ("EXCHANGE_ID", " BINANCE "),
             ("BINANCE_API_KEY", "binance-key"),
             ("EXCHANGE_API_KEY", "backpack-key"),
             ("EXCHANGE_SECRET", "backpack-secret"),
@@ -414,7 +547,10 @@ mod tests {
 
     #[test]
     fn credential_failure_precedes_later_symbol_validation() {
-        let values = std::collections::HashMap::from([("EXCHANGE_API_KEY", "backpack-key")]);
+        let values = std::collections::HashMap::from([
+            ("EXCHANGE_ID", "backpack"),
+            ("EXCHANGE_API_KEY", "backpack-key"),
+        ]);
         let error = LiveRuntime::prepare_with_lookup(
             options(Some("backpack".to_string()), Some(" , ".to_string())),
             |name| values.get(name).map(|value| (*value).to_string()),
@@ -464,5 +600,40 @@ mod tests {
         ] {
             assert_eq!(product.matches(operation).count(), 1, "{operation}");
         }
+    }
+
+    #[cfg(feature = "rithmic")]
+    #[test]
+    fn matching_rithmic_execution_venue_reaches_rithmic_configuration() {
+        let error = LiveRuntime::prepare_with_lookup(
+            options(Some("rithmic".to_string()), Some("mnqu6".to_string())),
+            |name| (name == "EXCHANGE_ID").then(|| "RITHMIC".to_string()),
+        )
+        .err()
+        .unwrap();
+
+        assert_eq!(error.to_string(), "--rithmic-profile is required");
+    }
+
+    #[cfg(feature = "rithmic")]
+    #[test]
+    fn rithmic_mismatch_precedes_rithmic_configuration_lookup() {
+        let error = LiveRuntime::prepare_with_lookup(
+            options(Some("rithmic".to_string()), Some("mnqu6".to_string())),
+            |name| match name {
+                "EXCHANGE_ID" => Some("binance".to_string()),
+                name if name.starts_with("RITHMIC_") => {
+                    panic!("Rithmic configuration lookup must not run")
+                }
+                _ => None,
+            },
+        )
+        .err()
+        .unwrap();
+
+        assert_eq!(
+            error.to_string(),
+            "EXCHANGE_ID must be included in EXCHANGE_ENABLED: binance"
+        );
     }
 }
