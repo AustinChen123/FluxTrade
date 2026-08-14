@@ -25,7 +25,7 @@ import pytest
 
 from src.core.models import Position, PositionSide
 from src.core.risk_manager import AccountService, RiskManager
-from src.core.runtime_reconcile import RuntimeReconciliationJob
+from src.core.runtime_reconcile import PositionAuthorityState, RuntimeReconciliationJob
 
 
 # =============================================================================
@@ -35,7 +35,7 @@ from src.core.runtime_reconcile import RuntimeReconciliationJob
 PRODUCT_ID = "BINANCE:BTCUSDT-PERP"
 STRATEGY_ID = "strat_alpha"
 
-SMALL = Decimal("0.001")   # below any threshold used in tests
+SMALL = Decimal("0.001")  # below any threshold used in tests
 THRESHOLD_QTY = Decimal("0.01")
 THRESHOLD_BAL = Decimal("1.00")
 
@@ -158,9 +158,7 @@ def _make_job(
     qty_threshold: Decimal = THRESHOLD_QTY,
     bal_threshold: Decimal = THRESHOLD_BAL,
 ) -> tuple[RuntimeReconciliationJob, FakeAccountService, FakeAdapter]:
-    account = FakeAccountService(
-        positions=local_positions, balance=local_balance
-    )
+    account = FakeAccountService(positions=local_positions, balance=local_balance)
     adapter = FakeAdapter(
         positions=exchange_positions,
         balance=exchange_balance,
@@ -344,6 +342,181 @@ class TestRunOnceQuantityDrift:
 
         assert result["checked_positions"] == 2
         assert result["position_drifts"] == []
+
+
+class TestPositionAuthorityAdmission:
+    @staticmethod
+    def _job(
+        account: FakeAccountService,
+        adapter: object,
+        observations: list[tuple[PositionAuthorityState, str]],
+        *,
+        threshold: Decimal = THRESHOLD_QTY,
+    ) -> RuntimeReconciliationJob:
+        return RuntimeReconciliationJob(
+            account_service=account,
+            adapter=adapter,
+            db_session_factory=_make_null_db_factory(),
+            balance_asset=None,
+            on_position_authority_observation=lambda state, stage: observations.append(
+                (state, stage)
+            ),
+            quantity_drift_threshold=threshold,
+            balance_drift_threshold=THRESHOLD_BAL,
+            product_ids=[PRODUCT_ID],
+        )
+
+    @pytest.mark.parametrize(
+        ("exchange_quantity", "expected"),
+        [
+            (Decimal("1.009"), PositionAuthorityState.SAFE),
+            (Decimal("1.010"), PositionAuthorityState.SAFE),
+            (Decimal("1.011"), PositionAuthorityState.UNCONFIRMED),
+        ],
+    )
+    def test_exact_decimal_threshold_controls_first_observation(
+        self,
+        exchange_quantity,
+        expected,
+    ):
+        observations: list[tuple[PositionAuthorityState, str]] = []
+        account = FakeAccountService(positions=[_make_position(quantity=Decimal("1"))])
+        adapter = FakeAdapter(
+            positions={PRODUCT_ID: _make_position(quantity=exchange_quantity)}
+        )
+
+        self._job(account, adapter, observations).run_once()
+
+        assert observations == [
+            (
+                expected,
+                "verified"
+                if expected is PositionAuthorityState.SAFE
+                else "quantity_drift",
+            )
+        ]
+
+    def test_cross_run_fingerprint_is_replaced_before_latching(self):
+        observations: list[tuple[PositionAuthorityState, str]] = []
+        account = FakeAccountService(positions=[_make_position(quantity=Decimal("1"))])
+        adapter = FakeAdapter(positions={PRODUCT_ID: None})
+        job = self._job(account, adapter, observations)
+
+        first = job.run_once()
+        account._positions = [_make_position(quantity=Decimal("2"))]
+        second = job.run_once()
+        job.run_once()
+
+        assert [
+            first["position_drifts"][0]["local_quantity"],
+            second["position_drifts"][0]["local_quantity"],
+        ] == [
+            Decimal("1"),
+            Decimal("2"),
+        ]
+        assert observations == [
+            (PositionAuthorityState.UNCONFIRMED, "quantity_drift"),
+            (PositionAuthorityState.UNCONFIRMED, "quantity_drift"),
+            (PositionAuthorityState.LATCHED, "quantity_drift"),
+        ]
+
+    @pytest.mark.parametrize(
+        ("initial_local", "initial_exchange"),
+        [(Decimal("1"), Decimal("0")), (Decimal("0"), Decimal("1"))],
+    )
+    def test_transient_cross_snapshot_drift_recovers_on_later_run(
+        self,
+        initial_local,
+        initial_exchange,
+    ):
+        observations: list[tuple[PositionAuthorityState, str]] = []
+        account = FakeAccountService(
+            positions=(
+                [] if initial_local == 0 else [_make_position(quantity=initial_local)]
+            )
+        )
+        adapter = FakeAdapter(
+            positions={
+                PRODUCT_ID: (
+                    None
+                    if initial_exchange == 0
+                    else _make_position(quantity=initial_exchange)
+                )
+            }
+        )
+        job = self._job(account, adapter, observations)
+
+        job.run_once()
+        account._positions = [_make_position(quantity=Decimal("1"))]
+        adapter._positions[PRODUCT_ID] = _make_position(quantity=Decimal("1"))
+        job.run_once()
+
+        assert observations == [
+            (PositionAuthorityState.UNCONFIRMED, "quantity_drift"),
+            (PositionAuthorityState.SAFE, "verified"),
+        ]
+
+    def test_each_run_takes_one_local_and_one_scoped_position_snapshot(self):
+        observations: list[tuple[PositionAuthorityState, str]] = []
+        account = FakeAccountService()
+        account.get_all_positions = MagicMock(return_value=[])
+        adapter = ProductScopedAdapter({PRODUCT_ID: None})
+        job = self._job(account, adapter, observations)
+
+        job.run_once()
+
+        account.get_all_positions.assert_called_once_with()
+        assert adapter.get_position_calls == [PRODUCT_ID]
+
+    def test_local_and_required_scoped_read_failures_latch_with_safe_errors(self):
+        secret = "position-provider-secret"
+        for stage in ("local_read", "adapter_read"):
+            observations: list[tuple[PositionAuthorityState, str]] = []
+            account = FakeAccountService()
+            adapter = ProductScopedAdapter({PRODUCT_ID: None})
+            if stage == "local_read":
+                account.get_all_positions = MagicMock(side_effect=RuntimeError(secret))
+            else:
+                adapter.get_position = MagicMock(side_effect=RuntimeError(secret))
+            job = self._job(account, adapter, observations)
+
+            logger = MagicMock()
+            job._logger = logger
+            with patch("src.core.runtime_reconcile.write_system_event") as write_event:
+                result = job.run_once()
+
+            assert observations == [(PositionAuthorityState.LATCHED, stage)]
+            assert result["errors"] == [
+                {
+                    "scope": "positions",
+                    "reason": "position_authority_unavailable",
+                    "stage": stage,
+                }
+            ]
+            assert secret not in repr(result)
+            assert secret not in repr(logger.warning.call_args)
+            assert secret not in repr(write_event.call_args)
+
+    def test_recovered_bulk_enumeration_is_diagnostic_but_safe(self):
+        class RecoveredBulkAdapter(ProductScopedAdapter):
+            def get_all_positions(self):
+                raise RuntimeError("bulk-provider-secret")
+
+        observations: list[tuple[PositionAuthorityState, str]] = []
+        account = FakeAccountService(positions=[_make_position()])
+        adapter = RecoveredBulkAdapter({PRODUCT_ID: _make_position()})
+        result = self._job(account, adapter, observations).run_once()
+
+        assert observations == [(PositionAuthorityState.SAFE, "verified")]
+        assert result["position_drifts"] == []
+        assert result["errors"] == [
+            {
+                "scope": "positions",
+                "reason": "position_authority_unavailable",
+                "stage": "adapter_enumeration",
+            }
+        ]
+        assert "bulk-provider-secret" not in repr(result)
 
 
 class TestRunOnceAsymmetricDrift:
@@ -650,9 +823,17 @@ class TestRunOnceAdapterError:
                 "exchange_quantity": Decimal("2.0"),
             }
         ]
-        assert result["errors"] == [{"scope": "positions", "reason": "Redis down"}]
+        assert result["errors"] == [
+            {
+                "scope": "positions",
+                "reason": "position_authority_unavailable",
+                "stage": "local_read",
+            }
+        ]
         write_event.assert_called_once()
-        assert write_event.call_args.kwargs["event_subtype"] == "runtime_reconcile_error"
+        assert (
+            write_event.call_args.kwargs["event_subtype"] == "runtime_reconcile_error"
+        )
 
     def test_local_position_error_with_exchange_flat_reports_no_fake_drift(self):
         job, account, _ = _make_job(exchange_positions={PRODUCT_ID: None})
@@ -798,7 +979,9 @@ class TestRunOnceMultipleProducts:
         pos1 = _make_position(strategy_id="s1", product_id=PRODUCT_ID)
         pos2 = _make_position(strategy_id="s2", product_id="BINANCE:ETHUSDT-PERP")
         exchange_pos1 = _make_position(strategy_id="s1", product_id=PRODUCT_ID)
-        exchange_pos2 = _make_position(strategy_id="s2", product_id="BINANCE:ETHUSDT-PERP")
+        exchange_pos2 = _make_position(
+            strategy_id="s2", product_id="BINANCE:ETHUSDT-PERP"
+        )
         job, _, _ = _make_job(
             local_positions=[pos1, pos2],
             exchange_positions={
@@ -826,8 +1009,12 @@ class TestRunOnceDecimalCompliance:
         result = job.run_once()
 
         for drift in result["position_drifts"]:
-            assert isinstance(drift["local_quantity"], Decimal), "local_quantity must be Decimal"
-            assert isinstance(drift["exchange_quantity"], Decimal), "exchange_quantity must be Decimal"
+            assert isinstance(drift["local_quantity"], Decimal), (
+                "local_quantity must be Decimal"
+            )
+            assert isinstance(drift["exchange_quantity"], Decimal), (
+                "exchange_quantity must be Decimal"
+            )
 
     def test_balance_drift_values_are_decimal(self):
         job, _, _ = _make_job(

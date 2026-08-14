@@ -60,7 +60,7 @@ from src.core.live_candle_application import LiveCandleApplicationService
 from src.core.pending_market_replay import PendingMarketReplayService
 from src.core.ops_safety import OpsSafetyService
 from src.core.ops_command_service import OpsCommandService
-from src.core.runtime_reconcile import RuntimeReconciliationJob
+from src.core.runtime_reconcile import PositionAuthorityState, RuntimeReconciliationJob
 from src.core.runtime_artifact_registry import RuntimeArtifactRegistry
 from src.core.signal_processor import SignalProcessor
 from src.core.signal_execution_service import SignalExecutionService
@@ -289,6 +289,12 @@ class StrategyEngine:
         self._startup_balance_failure_latched = False
         self._startup_balance_failure_logged = False
         self._runtime_balance_failure_logged = False
+        self._runtime_position_authority_state = (
+            PositionAuthorityState.UNCONFIRMED
+            if self._live_balance_asset is not None
+            else PositionAuthorityState.SAFE
+        )
+        self._runtime_position_failure_logged = False
         self._live_product_ids = (
             frozenset(effective_adapter_config.get("instrument_product_ids") or [])
             if effective_adapter_config.get("mode") == "live"
@@ -556,6 +562,11 @@ class StrategyEngine:
             balance_asset=self._live_balance_asset,
             on_balance_authority_failure=(
                 self._latch_runtime_balance_authority_failure
+                if self._live_balance_asset is not None
+                else None
+            ),
+            on_position_authority_observation=(
+                self._observe_runtime_position_authority
                 if self._live_balance_asset is not None
                 else None
             ),
@@ -1318,6 +1329,28 @@ class StrategyEngine:
         )
         self._runtime_balance_failure_logged = True
 
+    def _observe_runtime_position_authority(
+        self,
+        state: PositionAuthorityState,
+        stage: str,
+    ) -> None:
+        if self._runtime_position_authority_state is PositionAuthorityState.LATCHED:
+            return
+        self._runtime_position_authority_state = state
+        if state is not PositionAuthorityState.LATCHED:
+            return
+        if self._runtime_position_failure_logged:
+            return
+        logger.error(
+            "Live runtime position authority unavailable; entry admission latched",
+            extra={
+                "component": "strategy_engine",
+                "event_code": "runtime_position_authority_unavailable",
+                "stage": stage,
+            },
+        )
+        self._runtime_position_failure_logged = True
+
     def _check_system_state(self) -> bool:
         """
         Checks 'system:state'. If 'LOCKDOWN', enters a paused loop.
@@ -1567,6 +1600,22 @@ class StrategyEngine:
         ):
             logger.warning(
                 "Entry signal rejected by startup balance authority",
+                extra={
+                    "component": "strategy_engine",
+                    "event_code": "entry_admission_rejected",
+                    "strategy_id": signal.strategy_id,
+                    "product_id": signal.product_id,
+                    "signal_type": signal.type.value,
+                },
+            )
+            return False
+        if (
+            signal.type in (SignalType.LONG, SignalType.SHORT)
+            and self._runtime_position_authority_state
+            is not PositionAuthorityState.SAFE
+        ):
+            logger.warning(
+                "Entry signal rejected by runtime position authority",
                 extra={
                     "component": "strategy_engine",
                     "event_code": "entry_admission_rejected",

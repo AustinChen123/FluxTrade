@@ -110,6 +110,7 @@ from src.core.strategy_state_manager import (
     StrategyStateManager,
 )
 from src.core.runtime_environment import RuntimeEnvironment
+from src.core.runtime_reconcile import PositionAuthorityState
 from src.core.runtime_capabilities import (
     KillSwitchClearPreparation,
     NoopRuntimeCapabilities,
@@ -1329,9 +1330,7 @@ class TestEngineInit:
         assert event_result["action"] == "applied"
         assert len(repo.trades) == 1
         assert repo.trades[0].fee_asset == "USDC"
-        assert {order.status for order in conditionals} == {
-            OrderStatus.SUBMITTED.value
-        }
+        assert {order.status for order in conditionals} == {OrderStatus.SUBMITTED.value}
         assert engine.execution_engine._submissions_halted is False
         entry_signal = signal_factory(signal_type=SignalType.LONG)
         exit_signal = signal_factory(signal_type=SignalType.EXIT_LONG)
@@ -1342,10 +1341,12 @@ class TestEngineInit:
 
         assert engine._entry_signal_allowed_for_processor(entry_signal) is False
 
+    @pytest.mark.parametrize("failure_owner", ["balance", "position"])
     def test_runtime_balance_failure_preserves_fill_protection_and_exit_path(
         self,
         engine_factory,
         signal_factory,
+        failure_owner,
     ):
         engine = _live_ccxt_engine(engine_factory)
         engine.execution_engine.audit_external_orders = True
@@ -1373,16 +1374,26 @@ class TestEngineInit:
             side_effect=RuntimeError("provider-balance-secret-sentinel")
         )
 
-        result = engine.runtime_reconciliation_job.run_once()
-
-        assert result["errors"] == [
-            {
-                "scope": "balance",
-                "reason": "balance_authority_unavailable",
-                "stage": "adapter_read",
-            }
-        ]
-        assert engine._startup_balance_entry_admission_safe is False
+        if failure_owner == "balance":
+            result = engine.runtime_reconciliation_job.run_once()
+            assert result["errors"] == [
+                {
+                    "scope": "balance",
+                    "reason": "balance_authority_unavailable",
+                    "stage": "adapter_read",
+                }
+            ]
+            assert engine._startup_balance_entry_admission_safe is False
+        else:
+            engine._startup_balance_entry_admission_safe = True
+            engine._observe_runtime_position_authority(
+                PositionAuthorityState.LATCHED,
+                "adapter_read",
+            )
+            assert (
+                engine._runtime_position_authority_state
+                is PositionAuthorityState.LATCHED
+            )
         assert engine.execution_engine._submissions_halted is False
         event = ExchangeOrderEvent(
             status="open",
@@ -3614,6 +3625,10 @@ class TestHeartbeatRecording:
             engine._signal_processor.entry_admission_handler
             == engine._entry_signal_allowed_for_processor
         )
+        assert engine._runtime_position_authority_state is PositionAuthorityState.SAFE
+        assert (
+            engine.runtime_reconciliation_job._on_position_authority_observation is None
+        )
         liveness_factory.assert_called_once()
         assert liveness_factory.call_args.args == (engine.runtime_environment,)
         assert liveness_factory.call_args.kwargs["logger"].name == "src.core.engine"
@@ -3862,15 +3877,126 @@ class TestHeartbeatRecording:
             Decimal("40000")
         )
 
+    def test_live_ccxt_position_authority_starts_closed_then_opens_after_safe_run(
+        self,
+        engine_factory,
+        signal_factory,
+    ):
+        engine = _live_ccxt_engine(engine_factory)
+        engine._startup_balance_entry_admission_safe = True
+        entry = signal_factory(signal_type=SignalType.LONG)
+        exit_signal = signal_factory(signal_type=SignalType.EXIT_LONG)
+
+        assert (
+            engine._runtime_position_authority_state
+            is PositionAuthorityState.UNCONFIRMED
+        )
+        entered = threading.Event()
+        release = threading.Event()
+
+        def blocked_positions():
+            entered.set()
+            assert release.wait(timeout=1.0)
+            return []
+
+        engine.account_service.get_all_positions = MagicMock(
+            side_effect=blocked_positions
+        )
+        worker = threading.Thread(
+            target=engine.runtime_reconciliation_job.run_once,
+            daemon=True,
+        )
+        worker.start()
+        assert entered.wait(timeout=1.0)
+        assert engine._entry_signal_allowed_for_processor(entry) is False
+        assert engine._entry_signal_allowed_for_processor(exit_signal) is True
+        release.set()
+        worker.join(timeout=1.0)
+        assert not worker.is_alive()
+
+        assert engine._runtime_position_authority_state is PositionAuthorityState.SAFE
+        assert engine._entry_signal_allowed_for_processor(entry) is True
+
+    def test_live_ccxt_confirmed_position_drift_logs_once_and_never_reopens(
+        self,
+        engine_factory,
+        caplog,
+    ):
+        engine = _live_ccxt_engine(engine_factory)
+        engine._startup_balance_entry_admission_safe = True
+        engine.account_service.get_all_positions = MagicMock(return_value=[])
+        adapter = engine.execution_engine.adapter
+        adapter.positions["BINANCE:BTCUSDT-PERP"] = Position(
+            strategy_id="LIVE",
+            product_id="BINANCE:BTCUSDT-PERP",
+            side=PositionSide.LONG,
+            quantity=Decimal("1"),
+            entry_price=Decimal("42000"),
+            unrealized_pnl=Decimal("0"),
+        )
+
+        with caplog.at_level(logging.ERROR, logger="src.core.engine"):
+            engine.runtime_reconciliation_job.run_once()
+            assert (
+                engine._runtime_position_authority_state
+                is PositionAuthorityState.UNCONFIRMED
+            )
+            adapter.positions["BINANCE:BTCUSDT-PERP"] = Position(
+                strategy_id="LIVE",
+                product_id="BINANCE:BTCUSDT-PERP",
+                side=PositionSide.LONG,
+                quantity=Decimal("2"),
+                entry_price=Decimal("42000"),
+                unrealized_pnl=Decimal("0"),
+            )
+            engine.runtime_reconciliation_job.run_once()
+            assert (
+                engine._runtime_position_authority_state
+                is PositionAuthorityState.UNCONFIRMED
+            )
+            engine.runtime_reconciliation_job.run_once()
+            adapter.positions.clear()
+            engine.runtime_reconciliation_job.run_once()
+
+        assert (
+            engine._runtime_position_authority_state is PositionAuthorityState.LATCHED
+        )
+        records = [
+            record
+            for record in caplog.records
+            if getattr(record, "event_code", None)
+            == "runtime_position_authority_unavailable"
+        ]
+        assert len(records) == 1
+        assert records[0].getMessage() == (
+            "Live runtime position authority unavailable; entry admission latched"
+        )
+        assert {
+            "component": vars(records[0])["component"],
+            "stage": vars(records[0])["stage"],
+        } == {
+            "component": "strategy_engine",
+            "stage": "quantity_drift",
+        }
+
+    @pytest.mark.parametrize("failure_owner", ["balance", "position"])
     def test_live_ccxt_manual_clear_cannot_reopen_balance_latch(
         self,
         engine_factory,
+        failure_owner,
     ):
         engine = _live_ccxt_engine(engine_factory)
-        engine.execution_engine.adapter.get_balance = MagicMock(
-            side_effect=RuntimeError("balance unavailable")
-        )
-        engine._reconcile_startup_balance()
+        if failure_owner == "balance":
+            engine.execution_engine.adapter.get_balance = MagicMock(
+                side_effect=RuntimeError("balance unavailable")
+            )
+            engine._reconcile_startup_balance()
+        else:
+            engine._startup_balance_entry_admission_safe = True
+            engine._observe_runtime_position_authority(
+                PositionAuthorityState.LATCHED,
+                "adapter_read",
+            )
         engine._kill_switch_halted = True
         engine.ops_safety.clear_kill_switch = MagicMock(
             return_value={"cleared": True, "reason": "cleared"}
@@ -3879,7 +4005,13 @@ class TestHeartbeatRecording:
         engine._handle_command({"command": "CLEAR_KILL_SWITCH", "params": {}})
 
         assert engine._kill_switch_halted is False
-        assert engine._startup_balance_entry_admission_safe is False
+        if failure_owner == "balance":
+            assert engine._startup_balance_entry_admission_safe is False
+        else:
+            assert (
+                engine._runtime_position_authority_state
+                is PositionAuthorityState.LATCHED
+            )
         signal = Signal(
             strategy_id="test",
             product_id="BINANCE:BTCUSDT-PERP",
@@ -3917,7 +4049,7 @@ class TestHeartbeatRecording:
 
     @pytest.mark.parametrize(
         "failure_owner",
-        ["balance", "order_event_stream", "startup_reconciliation"],
+        ["balance", "position", "order_event_stream", "startup_reconciliation"],
     )
     def test_live_ccxt_entry_latches_restore_portfolio_entry_and_keep_exit(
         self,
@@ -3926,7 +4058,13 @@ class TestHeartbeatRecording:
         failure_owner,
     ):
         engine = _live_ccxt_engine(engine_factory)
-        if failure_owner == "order_event_stream":
+        if failure_owner == "position":
+            engine._startup_balance_entry_admission_safe = True
+            engine._observe_runtime_position_authority(
+                PositionAuthorityState.LATCHED,
+                "quantity_drift",
+            )
+        elif failure_owner == "order_event_stream":
             engine._startup_balance_entry_admission_safe = True
             engine.execution_engine.latch_order_event_stream_failure()
         elif failure_owner == "startup_reconciliation":
