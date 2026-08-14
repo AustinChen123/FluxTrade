@@ -295,6 +295,13 @@ class RuntimeCapabilitiesFactory(Protocol):
 
 
 class NoopRuntimeCapabilities:
+    def __init__(
+        self,
+        *,
+        startup_reconciliation_required: bool = False,
+    ) -> None:
+        self._startup_reconciliation_required = startup_reconciliation_required
+
     def start_order_event_stream(self) -> bool:
         return False
 
@@ -347,7 +354,33 @@ class NoopRuntimeCapabilities:
         self,
         summary: Any,
     ) -> StartupReconciliationState:
-        return StartupReconciliationState(False, False, None)
+        if not self._startup_reconciliation_required:
+            return StartupReconciliationState(False, False, None)
+        if type(summary) is not dict:
+            return StartupReconciliationState(
+                True,
+                False,
+                "generic_reconciliation_invalid",
+            )
+        unresolved_count = summary.get("unresolved_count")
+        verification_blocked_count = summary.get("verification_blocked_count")
+        if (
+            type(unresolved_count) is not int
+            or unresolved_count < 0
+            or type(verification_blocked_count) is not int
+            or verification_blocked_count < 0
+        ):
+            return StartupReconciliationState(
+                True,
+                False,
+                "generic_reconciliation_invalid",
+            )
+        entry_admission_safe = unresolved_count == 0 and verification_blocked_count == 0
+        return StartupReconciliationState(
+            True,
+            entry_admission_safe,
+            None if entry_admission_safe else "generic_reconciliation_blocked",
+        )
 
     def run_emergency_flatten(
         self,

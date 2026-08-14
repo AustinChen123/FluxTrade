@@ -307,9 +307,7 @@ class _RecordingRiskManager:
 
 class TestEngineInit:
     def test_engine_has_no_concrete_rithmic_bootstrap_policy(self):
-        source = (
-            Path(__file__).parents[1] / "src" / "core" / "engine.py"
-        ).read_text()
+        source = (Path(__file__).parents[1] / "src" / "core" / "engine.py").read_text()
 
         for venue_detail in (
             "RithmicExchangeAdapter",
@@ -1276,6 +1274,186 @@ class TestEngineInit:
         engine._run_ops_kill_switch.assert_not_called()
         engine.ops_safety.persist_kill_switch_state.assert_not_called()
         engine.redis_client.set.assert_not_called()
+
+    @pytest.mark.parametrize(
+        ("summary", "expected"),
+        [
+            (
+                {
+                    "unresolved_count": 0,
+                    "verification_blocked_count": 0,
+                },
+                StartupReconciliationState(True, True, None),
+            ),
+            (
+                {
+                    "unresolved_count": 1,
+                    "verification_blocked_count": 0,
+                },
+                StartupReconciliationState(
+                    True,
+                    False,
+                    "generic_reconciliation_blocked",
+                ),
+            ),
+            (
+                {
+                    "unresolved_count": 0,
+                    "verification_blocked_count": 1,
+                },
+                StartupReconciliationState(
+                    True,
+                    False,
+                    "generic_reconciliation_blocked",
+                ),
+            ),
+        ],
+    )
+    def test_required_generic_startup_reconciliation_is_classified(
+        self,
+        summary,
+        expected,
+    ):
+        capability = NoopRuntimeCapabilities(
+            startup_reconciliation_required=True,
+        )
+
+        assert capability.classify_startup_reconciliation(summary) == expected
+
+    @pytest.mark.parametrize(
+        "summary",
+        [
+            None,
+            [],
+            {},
+            {"unresolved_count": 0},
+            {"verification_blocked_count": 0},
+            {"unresolved_count": False, "verification_blocked_count": 0},
+            {"unresolved_count": 0, "verification_blocked_count": False},
+            {"unresolved_count": -1, "verification_blocked_count": 0},
+            {"unresolved_count": 0, "verification_blocked_count": -1},
+            {"unresolved_count": "0", "verification_blocked_count": 0},
+            {"unresolved_count": 0, "verification_blocked_count": "0"},
+        ],
+    )
+    def test_required_generic_malformed_reconciliation_fails_closed(
+        self,
+        summary,
+    ):
+        capability = NoopRuntimeCapabilities(
+            startup_reconciliation_required=True,
+        )
+
+        assert capability.classify_startup_reconciliation(
+            summary
+        ) == StartupReconciliationState(
+            True,
+            False,
+            "generic_reconciliation_invalid",
+        )
+
+    def test_optional_generic_reconciliation_remains_unhandled(self):
+        capability = NoopRuntimeCapabilities()
+
+        assert capability.classify_startup_reconciliation(
+            {"unresolved_count": 1, "verification_blocked_count": 1}
+        ) == StartupReconciliationState(False, False, None)
+
+    @pytest.mark.parametrize(
+        ("summary", "blocking_reason", "restores"),
+        [
+            (
+                {
+                    "unresolved_count": 0,
+                    "verification_blocked_count": 0,
+                },
+                None,
+                True,
+            ),
+            (
+                {
+                    "unresolved_count": 1,
+                    "verification_blocked_count": 0,
+                },
+                "generic_reconciliation_blocked",
+                False,
+            ),
+            (
+                {
+                    "unresolved_count": 0,
+                    "verification_blocked_count": 1,
+                },
+                "generic_reconciliation_blocked",
+                False,
+            ),
+            (
+                RuntimeError("generic reconciliation failed"),
+                "generic_reconciliation_blocked",
+                False,
+            ),
+            (None, "generic_reconciliation_invalid", False),
+        ],
+    )
+    def test_audited_generic_startup_blocks_only_unsafe_order_state(
+        self,
+        mock_db_session,
+        mock_clock,
+        summary,
+        blocking_reason,
+        restores,
+    ):
+        with patch("src.core.engine.create_redis_client") as redis_factory:
+            redis_factory.return_value = MagicMock()
+            engine = StrategyEngine(
+                db_session=mock_db_session,
+                clock=mock_clock,
+                adapter=MagicMock(),
+                audit_external_orders=True,
+                account_service=MagicMock(),
+            )
+
+        def halt() -> None:
+            engine._kill_switch_halted = True
+
+        def report_clean_boot() -> bool:
+            engine._kill_switch_halted = False
+            return False
+
+        engine._halt_for_kill_switch = MagicMock(side_effect=halt)
+        engine._check_system_state = MagicMock(side_effect=report_clean_boot)
+        if isinstance(summary, Exception):
+            engine.execution_engine.reconcile_recoverable_client_orders = MagicMock(
+                side_effect=summary
+            )
+        else:
+            engine.execution_engine.reconcile_recoverable_client_orders = MagicMock(
+                return_value=summary
+            )
+        engine.ops_safety.persist_kill_switch_state = MagicMock()
+        engine._run_ops_kill_switch = MagicMock()
+        for name in (
+            "_start_command_listener",
+            "_reconcile_startup_balance",
+            "_initialize_strategy_state_cache_on_startup",
+            "_start_strategy_state_subscriber_on_startup",
+            "_start_exchange_order_event_stream",
+            "_start_heartbeat",
+            "_start_runtime_reconciliation",
+            "scan_strategies",
+            "_restore_active_strategies_on_startup",
+        ):
+            setattr(engine, name, MagicMock())
+
+        engine.startup()
+
+        assert isinstance(engine._venue_runtime, NoopRuntimeCapabilities)
+        assert engine._restore_active_strategies_on_startup.called is restores
+        assert engine._startup_lock_cause == blocking_reason
+        assert engine._halt_for_kill_switch.call_count == (1 if restores else 2)
+        engine._start_heartbeat.assert_called_once_with()
+        engine.scan_strategies.assert_called_once_with()
+        engine.ops_safety.persist_kill_switch_state.assert_not_called()
+        engine._run_ops_kill_switch.assert_not_called()
 
     def test_rithmic_missing_startup_owner_aborts_before_later_phases(
         self,
@@ -6214,9 +6392,7 @@ class TestRuntimeReconciliationThread:
         engine.execution_engine.clock.now = MagicMock(return_value=1704067201)
         _attach_rithmic_ledger_recovery(engine)
 
-        engine._publish_authoritative_account_summary(
-            _authoritative_rithmic_summary()
-        )
+        engine._publish_authoritative_account_summary(_authoritative_rithmic_summary())
 
         engine.account_service.replace_authoritative_balance.assert_called_once_with(
             venue="rithmic",
@@ -6290,9 +6466,7 @@ class TestRuntimeReconciliationThread:
 
         engine.execution_engine.halt_for_reconcile.assert_called_once_with(timeout=30.0)
         engine.execution_engine.reconcile_owned_orders.assert_called_once_with()
-        engine._publish_authoritative_account_summary.assert_called_once_with(
-            summary
-        )
+        engine._publish_authoritative_account_summary.assert_called_once_with(summary)
         engine._start_exchange_order_event_stream.assert_called_once_with()
         engine.execution_engine.resume_after_reconcile.assert_called_once_with()
         engine._detect_external_order_drift.assert_not_called()
@@ -6511,9 +6685,7 @@ class TestRuntimeReconciliationThread:
 
         engine._start_exchange_order_event_stream.assert_called_once_with()
         engine.execution_engine.resume_after_reconcile.assert_not_called()
-        engine._detect_external_order_drift.assert_called_once_with(
-            expected_reason
-        )
+        engine._detect_external_order_drift.assert_called_once_with(expected_reason)
 
 
 class TestExchangeOrderEventThread:

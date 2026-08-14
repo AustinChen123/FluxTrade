@@ -501,7 +501,9 @@ class StrategyEngine:
                 logger=logger,
             )
             if runtime_capabilities_factory is not None
-            else NoopRuntimeCapabilities()
+            else NoopRuntimeCapabilities(
+                startup_reconciliation_required=audit_external_orders,
+            )
         )
         self._signal_execution = SignalExecutionService(
             clock=self.clock,
@@ -870,10 +872,7 @@ class StrategyEngine:
                     "verification_blocked_count": 1,
                     "auto_resume_safe": False,
                 }
-            logger.info(
-                "Startup order reconciliation complete: %s recoverable orders",
-                summary["recoverable_count"],
-            )
+            logger.info("Startup order reconciliation returned for classification")
             return summary
 
         return self._venue_runtime.reconcile_startup(reconcile_generic)
