@@ -434,11 +434,16 @@ class StrategyEngine:
             adapter_loader=lambda: self.execution_engine.adapter,
             is_running=lambda: self.running,
             stop_event=lambda: self._order_event_stop,
-            assert_leadership=lambda: self._assert_runtime_leadership(),
+            assert_leadership=lambda: self._assert_runtime_leadership(
+                halt_on_failure=False
+            ),
             process_event=lambda event: (
                 self.execution_engine.process_exchange_order_event(
                     cast(ExchangeOrderEvent, event)
                 )
+            ),
+            latch_stream_failure=lambda: (
+                self.execution_engine.latch_order_event_stream_failure()
             ),
             halt_submissions=lambda: self._halt_for_kill_switch(),
             publish_worker=lambda worker: setattr(
@@ -803,12 +808,13 @@ class StrategyEngine:
         """Load strategy lifecycle state into the manager cache."""
         self._strategy_state_manager.initialize_cache_from_db()
 
-    def _assert_runtime_leadership(self) -> None:
+    def _assert_runtime_leadership(self, *, halt_on_failure: bool = True) -> None:
         """Fence every background side-effect path after lease handoff."""
         try:
             self._leadership_guard()
         except Exception:
-            self._halt_for_kill_switch()
+            if halt_on_failure:
+                self._halt_for_kill_switch()
             self.running = False
             self._order_event_stop.set()
             self._runtime_reconcile_stop.set()

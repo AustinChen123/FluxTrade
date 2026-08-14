@@ -1,5 +1,6 @@
 import logging
 import threading
+from collections.abc import Mapping
 from typing import Callable, Protocol, cast
 
 
@@ -42,6 +43,7 @@ class GenericOrderEventStream:
         stop_event: Callable[[], _StopEvent],
         assert_leadership: Callable[[], None],
         process_event: Callable[[object], object],
+        latch_stream_failure: Callable[[], None],
         halt_submissions: Callable[[], None],
         publish_worker: Callable[[_Worker], None],
         current_worker: Callable[[], _Worker | None],
@@ -53,6 +55,7 @@ class GenericOrderEventStream:
         self._stop_event = stop_event
         self._assert_leadership = assert_leadership
         self._process_event = process_event
+        self._latch_stream_failure = latch_stream_failure
         self._halt_submissions = halt_submissions
         self._publish_worker = publish_worker
         self._current_worker = current_worker
@@ -69,8 +72,12 @@ class GenericOrderEventStream:
         try:
             start()
         except Exception:
+            self._event_logger.error(
+                "Exchange order event stream could not start; submissions remain halted"
+            )
+            self._latch_stream_failure()
             self._halt_submissions()
-            raise
+            return
         self._stop_event().clear()
         poll_event = cast(Callable[[], object | None], poll)
 
@@ -83,12 +90,23 @@ class GenericOrderEventStream:
                         self._stop_event().wait(0.05)
                         continue
                     self._assert_leadership()
-                    self._process_event(event)
+                    result = self._process_event(event)
+                    if not (
+                        isinstance(result, Mapping)
+                        and result.get("action") == "applied"
+                    ):
+                        self._event_logger.error(
+                            "Exchange order event could not be applied; submissions remain halted"
+                        )
+                        self._latch_stream_failure()
+                        self._halt_submissions()
+                        return
                     self._assert_leadership()
                 except Exception:
-                    self._event_logger.exception(
+                    self._event_logger.error(
                         "Exchange order event stream failed; submissions remain halted"
                     )
+                    self._latch_stream_failure()
                     self._halt_submissions()
                     return
 

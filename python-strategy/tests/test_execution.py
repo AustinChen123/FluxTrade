@@ -3316,6 +3316,80 @@ class TestLiveOrderEventSync:
         assert mock_order_repo.orders == {}
         assert mock_order_repo.trades == []
 
+    def test_binance_pre_ack_alias_resolves_canonical_order_before_exchange_id_persists(
+        self,
+        mock_db_session,
+        mock_clock,
+        mock_exchange_adapter,
+        mock_order_repo,
+        order_factory,
+    ) -> None:
+        engine = self._engine(
+            mock_db_session,
+            mock_clock,
+            mock_exchange_adapter,
+            mock_order_repo,
+        )
+        order = order_factory(
+            client_order_id="canonical-client-id",
+            exchange_order_id=None,
+            status=OrderStatus.SUBMITTED_UNCONFIRMED.value,
+            quantity=Decimal("1.25"),
+        )
+        mock_order_repo.add_order(order)
+
+        result = engine.process_exchange_order_event(
+            ExchangeOrderEvent(
+                status="FILLED",
+                product_id=order.product_id,
+                client_order_id="canonical-client-id",
+                exchange_order_id="987654",
+                cumulative_filled_quantity=Decimal("1.25"),
+                cumulative_average_price=Decimal("20001.1250"),
+            )
+        )
+
+        assert result["action"] == "applied"
+        assert order.exchange_order_id == "987654"
+        assert order.status == OrderStatus.FILLED.value
+        assert order.filled_quantity == Decimal("1.25")
+
+    def test_binance_restart_falls_back_to_persisted_exchange_order_id(
+        self,
+        mock_db_session,
+        mock_clock,
+        mock_exchange_adapter,
+        mock_order_repo,
+        order_factory,
+    ) -> None:
+        engine = self._engine(
+            mock_db_session,
+            mock_clock,
+            mock_exchange_adapter,
+            mock_order_repo,
+        )
+        order = order_factory(
+            client_order_id="canonical-client-id",
+            exchange_order_id="987654",
+            status=OrderStatus.SUBMITTED.value,
+            quantity=Decimal("1.25"),
+        )
+        mock_order_repo.add_order(order)
+
+        result = engine.process_exchange_order_event(
+            ExchangeOrderEvent(
+                status="FILLED",
+                product_id=order.product_id,
+                client_order_id="provider-client-id-not-in-memory",
+                exchange_order_id="987654",
+                cumulative_filled_quantity=Decimal("1.25"),
+                cumulative_average_price=Decimal("20001.1250"),
+            )
+        )
+
+        assert result["action"] == "applied"
+        assert order.status == OrderStatus.FILLED.value
+
     def test_resync_recoverable_order_events_applies_snapshot_through_event_sync_idempotently(
         self,
         mock_db_session,
@@ -7601,6 +7675,7 @@ def test_execution_engine_submission_gate_facade_delegates_to_single_owner(
     engine.resume_submissions()
     assert engine.halt_for_reconcile(timeout=3) is False
     engine.resume_after_reconcile()
+    engine.latch_order_event_stream_failure()
 
     gate.try_begin_submission.assert_called_once_with()
     gate.halt_and_drain.assert_called_once_with(timeout=7)
@@ -7608,6 +7683,7 @@ def test_execution_engine_submission_gate_facade_delegates_to_single_owner(
     gate.resume_submissions.assert_called_once_with()
     gate.halt_for_reconcile.assert_called_once_with(timeout=3)
     gate.resume_after_reconcile.assert_called_once_with()
+    gate.latch_order_event_stream_failure.assert_called_once_with()
     assert engine._submissions_halted is True
     assert engine._reconcile_halt is False
     assert engine._submissions_in_flight == 0

@@ -21,22 +21,29 @@ def _gate() -> tuple[ExecutionSubmissionGate, MagicMock]:
 
 
 @pytest.mark.parametrize(
-    ("kill_halted", "reconcile_halted", "expected"),
+    ("kill_halted", "reconcile_halted", "stream_failed", "expected"),
     [
-        (False, False, None),
-        (True, False, "kill_switch_halted"),
-        (False, True, "reconcile_halted"),
-        (True, True, "kill_switch_halted"),
+        (False, False, False, None),
+        (True, False, False, "kill_switch_halted"),
+        (False, True, False, "reconcile_halted"),
+        (True, True, False, "kill_switch_halted"),
+        (False, False, True, "order_event_stream_failed"),
+        (True, False, True, "kill_switch_halted"),
+        (False, True, True, "order_event_stream_failed"),
+        (True, True, True, "kill_switch_halted"),
     ],
 )
 def test_admission_matrix_preserves_independent_halts_and_reason_precedence(
     kill_halted: bool,
     reconcile_halted: bool,
+    stream_failed: bool,
     expected: str | None,
 ) -> None:
     gate, _logger = _gate()
     if reconcile_halted:
         gate.claim_reconcile_halt()
+    if stream_failed:
+        gate.latch_order_event_stream_failure()
     if kill_halted:
         assert gate.halt_and_drain(timeout=0) is True
 
@@ -44,6 +51,7 @@ def test_admission_matrix_preserves_independent_halts_and_reason_precedence(
 
     assert gate.submissions_halted is kill_halted
     assert gate.reconcile_halted is reconcile_halted
+    assert gate.order_event_stream_failed is stream_failed
     assert gate.in_flight == (1 if expected is None else 0)
     if expected is None:
         gate.finish_submission()
@@ -63,6 +71,37 @@ def test_resuming_each_halt_never_clears_the_other() -> None:
     gate.resume_submissions()
     assert gate.reconcile_halted is True
     assert gate.submissions_halted is False
+
+
+def test_order_event_stream_failure_is_process_lifetime_and_blocks_all_money_paths() -> (
+    None
+):
+    gate, _logger = _gate()
+
+    gate.latch_order_event_stream_failure()
+    gate.resume_submissions()
+    gate.resume_after_reconcile()
+
+    assert gate.order_event_stream_failed is True
+    assert gate.try_begin_submission() == "order_event_stream_failed"
+    assert gate.begin_authoritative_exit(timeout=0) is None
+    assert gate.in_flight == 0
+
+
+def test_order_event_stream_failure_latch_is_idempotent_across_threads() -> None:
+    gate, _logger = _gate()
+    threads = [
+        threading.Thread(target=gate.latch_order_event_stream_failure) for _ in range(4)
+    ]
+
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(timeout=1)
+
+    assert all(not thread.is_alive() for thread in threads)
+    assert gate.order_event_stream_failed is True
+    assert gate.try_begin_submission() == "order_event_stream_failed"
 
 
 def test_queued_callbacks_detach_only_on_zero_and_run_fifo_exactly_once() -> None:

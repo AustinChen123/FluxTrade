@@ -985,6 +985,10 @@ class ExecutionEngine:
         """Clear only the reconcile gate; leaves any kill-switch halt untouched."""
         self._submission_gate_owner.resume_after_reconcile()
 
+    def latch_order_event_stream_failure(self) -> None:
+        """Permanently reject money-path operations after stream ownership fails."""
+        self._submission_gate_owner.latch_order_event_stream_failure()
+
     def modify_protection(
         self,
         entry_order_id: str,

@@ -1,6 +1,7 @@
 """Tests for CcxtExchangeAdapter and adapter factory."""
 
 from decimal import Decimal
+import threading
 from unittest.mock import MagicMock, call, patch
 
 import pytest
@@ -1332,9 +1333,7 @@ class TestUserStreamListenKey:
     def test_binance_keepalive_user_stream(self, adapter, mock_ccxt_client):
         adapter.keepalive_user_stream("listen-key-1")
 
-        mock_ccxt_client.fapiPrivatePutListenKey.assert_called_once_with(
-            {"listenKey": "listen-key-1"}
-        )
+        mock_ccxt_client.fapiPrivatePutListenKey.assert_called_once_with()
 
     def test_binance_keepalive_requires_listen_key(self, adapter):
         with pytest.raises(ExchangeError, match="requires_listen_key"):
@@ -1914,6 +1913,56 @@ class TestLiveBinanceWsInit:
 
 
 class TestLiveBinanceWsOrderPath:
+    def test_provider_client_id_alias_is_visible_before_rest_submission(
+        self,
+        adapter,
+        mock_ccxt_client,
+    ) -> None:
+        provider_client_order_id = to_binance_client_order_id(CANONICAL_CLIENT_ORDER_ID)
+
+        def create_order(*_args, **_kwargs):
+            assert (
+                adapter._canonical_client_order_id(provider_client_order_id)
+                == CANONICAL_CLIENT_ORDER_ID
+            )
+            return {"id": "REST-123"}
+
+        mock_ccxt_client.create_order.side_effect = create_order
+        order = _make_order(client_order_id=CANONICAL_CLIENT_ORDER_ID)
+
+        assert adapter.place_order(order) == "REST-123"
+
+        mock_ccxt_client.create_order.assert_called_once()
+
+    def test_provider_client_id_alias_is_published_across_threads(
+        self,
+        adapter,
+    ) -> None:
+        published = threading.Event()
+        observed: list[str] = []
+        provider_id: list[str] = []
+
+        def submitter() -> None:
+            provider_id.append(
+                adapter._exchange_client_order_id(CANONICAL_CLIENT_ORDER_ID)
+            )
+            published.set()
+
+        def consumer() -> None:
+            assert published.wait(timeout=1)
+            observed.append(adapter._canonical_client_order_id(provider_id[0]))
+
+        threads = [
+            threading.Thread(target=submitter),
+            threading.Thread(target=consumer),
+        ]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join(timeout=1)
+
+        assert all(not thread.is_alive() for thread in threads)
+        assert observed == [CANONICAL_CLIENT_ORDER_ID]
 
     def test_invalid_side_fails_before_ws_or_rest(
         self, adapter, mock_ccxt_client
@@ -1960,7 +2009,6 @@ class TestLiveBinanceWsOrderPath:
 
             mock_ws_inst = MagicMock()
             mock_ws_inst.is_connected.return_value = True
-            mock_ws_inst.place_order.return_value = True
 
             async def wait_for_ack(client_order_id):
                 return MagicMock(exchange_order_id="WS-123")
@@ -1969,8 +2017,18 @@ class TestLiveBinanceWsOrderPath:
             MockWS.return_value = mock_ws_inst
 
             adapter = LiveBinanceAdapter(api_key="k", secret="s", enable_ws=True)
-            formatter = MagicMock(return_value="binance-client-order-id")
-            adapter._exchange_client_order_id = formatter
+            exchange_client_order_id = to_binance_client_order_id(
+                CANONICAL_CLIENT_ORDER_ID
+            )
+
+            def place_order(**_kwargs):
+                assert (
+                    adapter._canonical_client_order_id(exchange_client_order_id)
+                    == CANONICAL_CLIENT_ORDER_ID
+                )
+                return True
+
+            mock_ws_inst.place_order.side_effect = place_order
             order = _make_order(
                 type="market",
                 quantity=Decimal("0.0109"),
@@ -1978,9 +2036,7 @@ class TestLiveBinanceWsOrderPath:
             )
             result = adapter.place_order(order)
 
-            exchange_client_order_id = "binance-client-order-id"
             assert result == "WS-123"
-            formatter.assert_called_once_with(CANONICAL_CLIENT_ORDER_ID)
             mock_ws_inst.place_order.assert_called_once()
             assert (
                 mock_ws_inst.place_order.call_args.kwargs["client_order_id"]

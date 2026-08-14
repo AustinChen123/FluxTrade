@@ -4,6 +4,8 @@ import pytest
 
 from src.core.generic_order_event_stream import GenericOrderEventStream
 
+_APPLIED = {"action": "applied"}
+
 
 class _StopEvent:
     def __init__(self, events: list[str]) -> None:
@@ -56,6 +58,7 @@ def _service(
     *,
     adapter: object,
     stop_event: _StopEvent | None = None,
+    process_result: object = _APPLIED,
 ):
     current = {"adapter": adapter, "worker": None}
     event = stop_event or _StopEvent(events)
@@ -68,12 +71,17 @@ def _service(
     def default_thread_factory(**values):
         return _ImmediateThread(events=events, **values)
 
+    def process_event(value: object) -> object:
+        events.append(f"process:{value}")
+        return process_result
+
     service = GenericOrderEventStream(
         adapter_loader=lambda: current["adapter"],
         is_running=lambda: True,
         stop_event=lambda: event,
         assert_leadership=lambda: events.append("fence"),
-        process_event=lambda value: events.append(f"process:{value}"),
+        process_event=process_event,
+        latch_stream_failure=lambda: events.append("latch"),
         halt_submissions=lambda: events.append("halt"),
         publish_worker=publish_worker,
         current_worker=lambda: current["worker"],
@@ -97,9 +105,10 @@ def test_start_preserves_worker_metadata_fences_and_dispatch_order() -> None:
     adapter.poll_order_event.side_effect = poll_once
     service, current, stop_event, _logger = _service(events, adapter=adapter)
 
-    def process_event(value: object) -> None:
+    def process_event(value: object) -> object:
         events.append(f"process:{value}")
         stop_event.set()
+        return _APPLIED
 
     service._process_event = process_event
 
@@ -164,19 +173,44 @@ def test_empty_poll_waits_without_dispatch() -> None:
     assert not any(event.startswith("process:") for event in events)
 
 
-def test_start_failure_halts_and_preserves_exception_identity() -> None:
+def test_start_failure_is_contained_latched_and_keeps_control_plane_alive() -> None:
     events: list[str] = []
     adapter = MagicMock()
     failure = RuntimeError("offline")
     adapter.start_order_event_stream.side_effect = failure
     service, current, _stop_event, _logger = _service(events, adapter=adapter)
 
-    with pytest.raises(RuntimeError) as caught:
-        service.start()
+    assert service.start() is None
 
-    assert caught.value is failure
-    assert events == ["halt"]
+    assert events == ["latch", "halt"]
     assert current["worker"] is None
+    _logger.error.assert_called_once_with(
+        "Exchange order event stream could not start; submissions remain halted"
+    )
+
+
+@pytest.mark.parametrize(
+    "process_result",
+    [None, {}, {"action": "unresolved"}, {"action": "future_action"}],
+)
+def test_non_exact_applied_result_latches_before_halting(
+    process_result: object,
+) -> None:
+    events: list[str] = []
+    adapter = MagicMock()
+    adapter.poll_order_event.return_value = "event-1"
+    service, _current, _stop_event, logger = _service(
+        events,
+        adapter=adapter,
+        process_result=process_result,
+    )
+
+    service.start()
+
+    assert events[-2:] == ["latch", "halt"]
+    logger.error.assert_called_once_with(
+        "Exchange order event could not be applied; submissions remain halted"
+    )
 
 
 @pytest.mark.parametrize("failure_owner", ("leadership", "poll", "process"))
@@ -195,10 +229,10 @@ def test_worker_failure_logs_once_and_halts(failure_owner: str) -> None:
 
     service.start()
 
-    logger.exception.assert_called_once_with(
+    logger.error.assert_called_once_with(
         "Exchange order event stream failed; submissions remain halted"
     )
-    assert events[-1] == "halt"
+    assert events[-2:] == ["latch", "halt"]
 
 
 @pytest.mark.parametrize(

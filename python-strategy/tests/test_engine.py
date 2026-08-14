@@ -6816,7 +6816,9 @@ class TestExchangeOrderEventThread:
         adapter = MagicMock()
         remote_event = MagicMock()
         engine.execution_engine.adapter = adapter
-        engine.execution_engine.process_exchange_order_event = MagicMock()
+        engine.execution_engine.process_exchange_order_event = MagicMock(
+            return_value={"action": "applied"}
+        )
 
         def poll_once():
             engine._order_event_stop.set()
@@ -6858,6 +6860,16 @@ class TestExchangeOrderEventThread:
         engine._leadership_guard = assert_leadership
         engine.execution_engine.adapter = adapter
         engine.execution_engine.process_exchange_order_event = MagicMock()
+        failure_order: list[str] = []
+        engine.execution_engine.latch_order_event_stream_failure = MagicMock(
+            side_effect=lambda: failure_order.append("latch")
+        )
+        engine._halt_for_kill_switch = MagicMock(
+            side_effect=lambda: (
+                failure_order.append("halt"),
+                setattr(engine, "_kill_switch_halted", True),
+            )
+        )
         adapter.poll_order_event.side_effect = poll_then_lose_leadership
 
         class ImmediateThread:
@@ -6871,18 +6883,20 @@ class TestExchangeOrderEventThread:
             engine._start_exchange_order_event_stream()
 
         engine.execution_engine.process_exchange_order_event.assert_not_called()
+        assert failure_order == ["latch", "halt"]
         assert engine.running is False
         assert engine._kill_switch_halted is True
 
-    def test_event_stream_start_failure_halts_before_propagating(self, engine):
+    def test_event_stream_start_failure_latches_and_does_not_propagate(self, engine):
         adapter = MagicMock()
         adapter.start_order_event_stream.side_effect = NetworkError("offline")
         engine.execution_engine.adapter = adapter
         engine._halt_for_kill_switch = MagicMock()
+        engine.execution_engine.latch_order_event_stream_failure = MagicMock()
 
-        with pytest.raises(NetworkError, match="offline"):
-            engine._start_exchange_order_event_stream()
+        assert engine._start_exchange_order_event_stream() is None
 
+        engine.execution_engine.latch_order_event_stream_failure.assert_called_once_with()
         engine._halt_for_kill_switch.assert_called_once_with()
 
     def test_rithmic_event_stream_start_delegates_only_to_venue_owner(self, engine):
@@ -6919,6 +6933,7 @@ class TestExchangeOrderEventThread:
         adapter.poll_order_event.side_effect = ExchangeError("invalid event")
         engine.execution_engine.adapter = adapter
         engine._halt_for_kill_switch = MagicMock()
+        engine.execution_engine.latch_order_event_stream_failure = MagicMock()
 
         class ImmediateThread:
             def __init__(self, *, target, name, daemon):
@@ -6931,6 +6946,37 @@ class TestExchangeOrderEventThread:
             engine._start_exchange_order_event_stream()
 
         engine._halt_for_kill_switch.assert_called_once_with()
+        engine.execution_engine.latch_order_event_stream_failure.assert_called_once_with()
+
+    def test_start_failure_keeps_recovery_surfaces_and_skips_strategy_restore(
+        self,
+        engine,
+    ) -> None:
+        adapter = MagicMock()
+        adapter.start_order_event_stream.side_effect = NetworkError("provider sentinel")
+        engine.execution_engine.adapter = adapter
+        engine.execution_engine.latch_order_event_stream_failure = MagicMock()
+        engine._halt_for_kill_switch = MagicMock(
+            side_effect=lambda: setattr(engine, "_kill_switch_halted", True)
+        )
+        engine._check_system_state = MagicMock(return_value=False)
+        engine._reconcile_startup_balance = MagicMock()
+        engine._initialize_strategy_state_cache_on_startup = MagicMock()
+        engine._start_strategy_state_subscriber_on_startup = MagicMock()
+        engine._reconcile_recoverable_orders_on_startup = MagicMock(return_value=None)
+        engine._start_command_listener = MagicMock()
+        engine._start_heartbeat = MagicMock()
+        engine._start_runtime_reconciliation = MagicMock()
+        engine.scan_strategies = MagicMock()
+        engine._restore_active_strategies_on_startup = MagicMock()
+
+        engine.startup()
+
+        engine._start_command_listener.assert_called_once_with()
+        engine._start_heartbeat.assert_called_once_with()
+        engine.scan_strategies.assert_called_once_with()
+        engine._restore_active_strategies_on_startup.assert_not_called()
+        engine.execution_engine.latch_order_event_stream_failure.assert_called_once_with()
 
     @pytest.mark.parametrize(
         ("action", "requires_reconciliation"),
@@ -7249,6 +7295,24 @@ class TestExchangeOrderEventThread:
         engine.execution_engine.reconcile_owned_orders.assert_not_called()
         engine.execution_engine.halt_for_reconcile.assert_not_called()
         engine.execution_engine.resume_after_reconcile.assert_not_called()
+
+    def test_non_rithmic_clear_cannot_reopen_failed_order_event_stream(
+        self,
+        engine,
+    ) -> None:
+        engine.execution_engine.latch_order_event_stream_failure()
+        engine._kill_switch_halted = True
+        engine.ops_safety.clear_kill_switch = MagicMock(
+            return_value={"cleared": True, "reason": "cleared"}
+        )
+
+        engine._handle_command({"command": "CLEAR_KILL_SWITCH", "params": {}})
+
+        assert engine._kill_switch_halted is False
+        assert (
+            engine.execution_engine._submission_gate_owner.try_begin_submission()
+            == "order_event_stream_failed"
+        )
 
     def test_rithmic_clear_reasserts_lockdown_when_new_drift_is_detected(
         self,

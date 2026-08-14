@@ -14,6 +14,7 @@ class ExecutionSubmissionGate:
         self._condition = threading.Condition()
         self._submissions_halted = False
         self._reconcile_halted = False
+        self._order_event_stream_failed = False
         self._reconcile_generation = 0
         self._reconcile_claim = threading.local()
         self._in_flight = 0
@@ -28,6 +29,11 @@ class ExecutionSubmissionGate:
     def reconcile_halted(self) -> bool:
         with self._condition:
             return self._reconcile_halted
+
+    @property
+    def order_event_stream_failed(self) -> bool:
+        with self._condition:
+            return self._order_event_stream_failed
 
     @property
     def generation(self) -> int:
@@ -48,6 +54,8 @@ class ExecutionSubmissionGate:
         with self._condition:
             if self._submissions_halted:
                 return "kill_switch_halted"
+            if self._order_event_stream_failed:
+                return "order_event_stream_failed"
             if self._reconcile_halted:
                 return "reconcile_halted"
             self._in_flight += 1
@@ -78,6 +86,12 @@ class ExecutionSubmissionGate:
     def resume_submissions(self) -> None:
         with self._condition:
             self._submissions_halted = False
+            self._condition.notify_all()
+
+    def latch_order_event_stream_failure(self) -> None:
+        """Permanently reject money-path operations after stream ownership fails."""
+        with self._condition:
+            self._order_event_stream_failed = True
             self._condition.notify_all()
 
     def halt_for_reconcile(self, timeout: float = 0.0) -> bool:
@@ -111,7 +125,11 @@ class ExecutionSubmissionGate:
 
     def begin_authoritative_exit(self, *, timeout: float) -> int | None:
         with self._condition:
-            if self._submissions_halted or self._reconcile_halted:
+            if (
+                self._submissions_halted
+                or self._order_event_stream_failed
+                or self._reconcile_halted
+            ):
                 return None
             reconcile_generation = self._claim_reconcile_halt_locked()
             if not self._condition.wait_for(
@@ -119,7 +137,7 @@ class ExecutionSubmissionGate:
                 timeout=timeout,
             ):
                 return None
-            if self._submissions_halted:
+            if self._submissions_halted or self._order_event_stream_failed:
                 return None
             self._in_flight += 1
             return reconcile_generation

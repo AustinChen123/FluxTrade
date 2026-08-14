@@ -6,6 +6,7 @@ Falls back to REST (parent class) when WS is unavailable.
 
 import asyncio
 import logging
+import threading
 from collections.abc import Callable
 from typing import cast
 
@@ -17,6 +18,7 @@ from src.core.adapters.binance_order_routing import (
 )
 from src.core.adapters.binance_client_order_id import to_binance_client_order_id
 from src.core.adapters.binance_user_stream import (
+    BinanceOrderEventStream,
     create_binance_user_stream_listen_key,
     keepalive_binance_user_stream,
 )
@@ -25,7 +27,7 @@ from src.core.adapters.binance_ws_order import (
     OrderRejected,
 )
 from src.core.adapters.ccxt_adapter import CcxtExchangeAdapter
-from src.core.interfaces.exchange import NetworkError
+from src.core.interfaces.exchange import ExchangeOrderEvent, NetworkError
 from src.core.orm_models import Order
 from src.core.product_registry import to_base_quote
 
@@ -50,6 +52,13 @@ class LiveBinanceAdapter(CcxtExchangeAdapter):
             extra_config=extra_config,
         )
         self.logger = logging.getLogger("LiveBinanceAdapter")
+        self._client_order_aliases: dict[str, str] = {}
+        self._client_order_alias_lock = threading.Lock()
+        self._user_order_stream = BinanceOrderEventStream(
+            client=self.client,
+            testnet=testnet,
+            resolve_client_order_id=self._canonical_client_order_id,
+        )
 
         # Optional WebSocket fast path
         self.ws_connector: BinanceWebSocketOrderConnector | None = None
@@ -80,8 +89,12 @@ class LiveBinanceAdapter(CcxtExchangeAdapter):
                 raise
 
     def close(self) -> None:
-        if self.ws_connector is not None:
-            self.ws_connector.running = False
+        stream = getattr(self, "_user_order_stream", None)
+        if stream is not None and not stream.close():
+            self.logger.warning("Binance order event stream cleanup failed")
+        ws_connector = getattr(self, "ws_connector", None)
+        if ws_connector is not None:
+            ws_connector.running = False
 
     def _submission_client_order_id_params(
         self,
@@ -98,7 +111,25 @@ class LiveBinanceAdapter(CcxtExchangeAdapter):
         )
 
     def _exchange_client_order_id(self, client_order_id: str) -> str:
-        return to_binance_client_order_id(client_order_id)
+        exchange_client_order_id = to_binance_client_order_id(client_order_id)
+        lock = getattr(self, "_client_order_alias_lock", None)
+        if lock is not None:
+            with lock:
+                self._client_order_aliases[exchange_client_order_id] = client_order_id
+        return exchange_client_order_id
+
+    def _canonical_client_order_id(self, exchange_client_order_id: str) -> str:
+        with self._client_order_alias_lock:
+            return self._client_order_aliases.get(
+                exchange_client_order_id,
+                exchange_client_order_id,
+            )
+
+    def start_order_event_stream(self) -> None:
+        self._user_order_stream.start()
+
+    def poll_order_event(self) -> ExchangeOrderEvent | None:
+        return self._user_order_stream.poll()
 
     def _ccxt_order_type_and_params(self, order: Order) -> tuple[str, dict]:
         conditional = binance_conditional_order_mapping(

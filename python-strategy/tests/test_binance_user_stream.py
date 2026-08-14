@@ -2,6 +2,8 @@
 
 import ast
 import inspect
+import json
+from decimal import Decimal
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 
@@ -14,6 +16,7 @@ from src.core.adapters.live_binance import LiveBinanceAdapter
 from src.core.interfaces.exchange import (
     ExchangeError,
     ExchangeUserStreamUnsupported,
+    NetworkError,
 )
 
 
@@ -24,6 +27,336 @@ def _owner_functions():
     )
 
     return create_binance_user_stream_listen_key, keepalive_binance_user_stream
+
+
+def test_order_event_owner_projects_exact_fill_without_raw_payload() -> None:
+    from src.core.adapters.binance_user_stream import BinanceOrderEventStream
+
+    connection = MagicMock()
+    connection.recv.return_value = json.dumps(
+        {
+            "e": "ORDER_TRADE_UPDATE",
+            "E": 1_700_000_000_123,
+            "o": {
+                "s": "MNQUSDT",
+                "c": "provider-client-id",
+                "i": 987654,
+                "X": "FILLED",
+                "z": "1.2500",
+                "ap": "20001.1250",
+                "l": "0.2500",
+                "L": "20002.5000",
+                "n": "0.0100",
+                "N": "USDT",
+                "er": "0",
+            },
+        }
+    )
+    owner = BinanceOrderEventStream(
+        client=SimpleNamespace(),
+        testnet=True,
+        resolve_client_order_id=lambda value: {
+            "provider-client-id": "canonical-client-id"
+        }.get(value, value),
+        connect=lambda *_args, **_kwargs: connection,
+    )
+    owner._connection = connection
+    owner._listen_key = "listen-key"
+    owner._next_keepalive_at = 1e12
+
+    event = owner.poll()
+
+    assert event is not None
+    assert event.product_id == "BINANCE:MNQUSDT-PERP"
+    assert event.client_order_id == "canonical-client-id"
+    assert event.exchange_order_id == "987654"
+    assert event.status == "FILLED"
+    assert event.cumulative_filled_quantity == Decimal("1.2500")
+    assert event.cumulative_average_price == Decimal("20001.1250")
+    assert event.last_fill_quantity == Decimal("0.2500")
+    assert event.last_fill_price == Decimal("20002.5000")
+    assert event.fee == Decimal("0.0100")
+    assert event.fee_asset == "USDT"
+    assert event.event_timestamp == 1_700_000_000_123
+    assert event.reason == "0"
+    assert event.raw is None
+
+
+@pytest.mark.parametrize(
+    "status",
+    ["NEW", "PARTIALLY_FILLED", "FILLED", "CANCELED", "REJECTED", "EXPIRED"],
+)
+def test_order_event_owner_preserves_supported_provider_statuses(status: str) -> None:
+    from src.core.adapters.binance_user_stream import BinanceOrderEventStream
+
+    connection = MagicMock()
+    connection.recv.return_value = json.dumps(
+        {
+            "e": "ORDER_TRADE_UPDATE",
+            "E": 7,
+            "o": {"s": "BTCUSDT", "c": "client", "i": 8, "X": status},
+        }
+    )
+    owner = BinanceOrderEventStream(
+        client=SimpleNamespace(),
+        testnet=False,
+        resolve_client_order_id=lambda value: value,
+        connect=lambda *_args, **_kwargs: connection,
+        monotonic=lambda: 0,
+    )
+    owner._connection = connection
+    owner._listen_key = "key"
+    owner._next_keepalive_at = 1
+
+    event = owner.poll()
+
+    assert event is not None
+    assert event.status == status
+
+
+@pytest.mark.parametrize(
+    ("testnet", "expected_url"),
+    [
+        (False, "wss://fstream.binance.com/ws/listen-key"),
+        (True, "wss://fstream.binancefuture.com/ws/listen-key"),
+    ],
+)
+def test_order_event_start_uses_exact_endpoint_and_keepalive_boundary(
+    testnet: bool,
+    expected_url: str,
+) -> None:
+    from src.core.adapters.binance_user_stream import BinanceOrderEventStream
+
+    now = [10.0]
+    connection = MagicMock()
+    connection.recv.side_effect = TimeoutError
+    client = SimpleNamespace(
+        fapiPrivatePostListenKey=MagicMock(return_value={"listenKey": "listen-key"}),
+        fapiPrivatePutListenKey=MagicMock(),
+        fapiPrivateDeleteListenKey=MagicMock(),
+    )
+    connector = MagicMock(return_value=connection)
+    owner = BinanceOrderEventStream(
+        client=client,
+        testnet=testnet,
+        resolve_client_order_id=lambda value: value,
+        connect=connector,
+        monotonic=lambda: now[0],
+    )
+
+    owner.start()
+    now[0] += 1_799.999
+    assert owner.poll() is None
+    client.fapiPrivatePutListenKey.assert_not_called()
+    now[0] += 0.001
+    assert owner.poll() is None
+
+    connector.assert_called_once_with(
+        expected_url,
+        open_timeout=10,
+        close_timeout=10,
+    )
+    client.fapiPrivatePutListenKey.assert_called_once_with()
+
+
+def test_duplicate_start_closes_old_connection_and_key_before_replacement() -> None:
+    from src.core.adapters.binance_user_stream import BinanceOrderEventStream
+
+    events: list[str] = []
+    keys = iter(("old-key", "new-key"))
+
+    class Connection:
+        def __init__(self, key: str) -> None:
+            self.key = key
+
+        def recv(self, timeout: float | None = None) -> str:
+            raise AssertionError(timeout)
+
+        def close(self) -> None:
+            events.append(f"local-close:{self.key}")
+
+    client = SimpleNamespace(
+        fapiPrivatePostListenKey=lambda: (
+            events.append("create-key"),
+            {"listenKey": next(keys)},
+        )[1],
+        fapiPrivateDeleteListenKey=lambda: events.append("remote-close"),
+    )
+
+    def connector(url: str, **_kwargs) -> Connection:
+        key = url.rsplit("/", 1)[1]
+        events.append(f"connect:{key}")
+        return Connection(key)
+
+    owner = BinanceOrderEventStream(
+        client=client,
+        testnet=True,
+        resolve_client_order_id=lambda value: value,
+        connect=connector,
+        monotonic=lambda: 0,
+    )
+
+    owner.start()
+    owner.start()
+
+    assert events == [
+        "create-key",
+        "connect:old-key",
+        "local-close:old-key",
+        "remote-close",
+        "create-key",
+        "connect:new-key",
+    ]
+
+
+def test_connect_failure_is_sanitized_and_deletes_created_key() -> None:
+    from src.core.adapters.binance_user_stream import BinanceOrderEventStream
+
+    remote_close = MagicMock()
+    client = SimpleNamespace(
+        fapiPrivatePostListenKey=MagicMock(return_value={"listenKey": "secret-key"}),
+        fapiPrivateDeleteListenKey=remote_close,
+    )
+    owner = BinanceOrderEventStream(
+        client=client,
+        testnet=True,
+        resolve_client_order_id=lambda value: value,
+        connect=MagicMock(side_effect=RuntimeError("provider sentinel")),
+    )
+
+    with pytest.raises(
+        NetworkError,
+        match="^binance_order_event_stream_start_failed$",
+    ) as caught:
+        owner.start()
+
+    assert "sentinel" not in str(caught.value)
+    assert caught.value.__cause__ is None
+    remote_close.assert_called_once_with()
+    assert owner._connection is None
+    assert owner._listen_key is None
+
+
+@pytest.mark.parametrize(
+    ("keepalive_due", "expected"),
+    [
+        (False, "binance_order_event_stream_receive_failed"),
+        (True, "binance_order_event_stream_keepalive_failed"),
+    ],
+)
+def test_poll_failures_are_fixed_and_sanitized(
+    keepalive_due: bool,
+    expected: str,
+) -> None:
+    from src.core.adapters.binance_user_stream import BinanceOrderEventStream
+
+    connection = MagicMock()
+    connection.recv.side_effect = RuntimeError("receive sentinel")
+    keepalive = MagicMock(side_effect=ccxt.ExchangeError("keepalive sentinel"))
+    owner = BinanceOrderEventStream(
+        client=SimpleNamespace(fapiPrivatePutListenKey=keepalive),
+        testnet=True,
+        resolve_client_order_id=lambda value: value,
+        monotonic=lambda: 1,
+    )
+    owner._connection = connection
+    owner._listen_key = "secret-key"
+    owner._next_keepalive_at = 0 if keepalive_due else 2
+
+    with pytest.raises(NetworkError, match=f"^{expected}$") as caught:
+        owner.poll()
+
+    assert "sentinel" not in str(caught.value)
+    assert caught.value.__cause__ is None
+    if keepalive_due:
+        connection.recv.assert_not_called()
+    else:
+        keepalive.assert_not_called()
+
+
+def test_close_is_nonthrowing_and_attempts_remote_cleanup_after_local_failure() -> None:
+    from src.core.adapters.binance_user_stream import BinanceOrderEventStream
+
+    connection = MagicMock()
+    connection.close.side_effect = RuntimeError("local sentinel")
+    remote_close = MagicMock(side_effect=ccxt.ExchangeError("remote sentinel"))
+    owner = BinanceOrderEventStream(
+        client=SimpleNamespace(fapiPrivateDeleteListenKey=remote_close),
+        testnet=True,
+        resolve_client_order_id=lambda value: value,
+    )
+    owner._connection = connection
+    owner._listen_key = "secret-listen-key"
+
+    assert owner.close() is False
+
+    connection.close.assert_called_once_with()
+    remote_close.assert_called_once_with()
+    assert owner._connection is None
+    assert owner._listen_key is None
+
+
+@pytest.mark.parametrize(
+    ("payload", "expected"),
+    [
+        ({"e": "ACCOUNT_UPDATE"}, None),
+        ({"e": "listenKeyExpired"}, "binance_order_event_stream_expired"),
+        ({"e": "ORDER_TRADE_UPDATE", "E": 1, "o": {}}, "payload_invalid"),
+    ],
+)
+def test_poll_classifies_unrelated_expired_and_malformed_events(
+    payload: dict[str, object],
+    expected: str | None,
+) -> None:
+    from src.core.adapters.binance_user_stream import BinanceOrderEventStream
+
+    connection = MagicMock()
+    connection.recv.return_value = json.dumps(payload)
+    owner = BinanceOrderEventStream(
+        client=SimpleNamespace(),
+        testnet=True,
+        resolve_client_order_id=lambda value: value,
+        monotonic=lambda: 0,
+    )
+    owner._connection = connection
+    owner._listen_key = "key"
+    owner._next_keepalive_at = 1
+
+    if expected is None:
+        assert owner.poll() is None
+    elif expected == "payload_invalid":
+        with pytest.raises(
+            ExchangeError,
+            match="^binance_order_event_payload_invalid$",
+        ):
+            owner.poll()
+    else:
+        with pytest.raises(NetworkError, match=f"^{expected}$"):
+            owner.poll()
+
+
+def test_poll_rejects_malformed_json_without_raw_payload_text() -> None:
+    from src.core.adapters.binance_user_stream import BinanceOrderEventStream
+
+    connection = MagicMock()
+    connection.recv.return_value = "provider-payload-sentinel"
+    owner = BinanceOrderEventStream(
+        client=SimpleNamespace(),
+        testnet=True,
+        resolve_client_order_id=lambda value: value,
+        monotonic=lambda: 0,
+    )
+    owner._connection = connection
+    owner._listen_key = "key"
+    owner._next_keepalive_at = 1
+
+    with pytest.raises(
+        ExchangeError,
+        match="^binance_order_event_payload_invalid$",
+    ) as caught:
+        owner.poll()
+
+    assert "sentinel" not in str(caught.value)
 
 
 def _adapter(client: object) -> LiveBinanceAdapter:
@@ -60,6 +393,35 @@ def test_live_adapter_delegates_keepalive_with_exact_identities(monkeypatch) -> 
 
     assert _adapter(client).keepalive_user_stream(listen_key) is None
     owner.assert_called_once_with("binance", client, listen_key)
+
+
+@pytest.mark.parametrize("cleanup_ok", [True, False])
+def test_live_adapter_delegates_order_event_lifecycle_to_one_owner(
+    cleanup_ok: bool,
+) -> None:
+    adapter = object.__new__(LiveBinanceAdapter)
+    owner = MagicMock()
+    event = object()
+    owner.poll.return_value = event
+    owner.close.return_value = cleanup_ok
+    adapter._user_order_stream = owner
+    adapter.ws_connector = MagicMock()
+    adapter.logger = MagicMock()
+
+    adapter.start_order_event_stream()
+    assert adapter.poll_order_event() is event
+    adapter.close()
+
+    owner.start.assert_called_once_with()
+    owner.poll.assert_called_once_with()
+    owner.close.assert_called_once_with()
+    assert adapter.ws_connector.running is False
+    if cleanup_ok:
+        adapter.logger.warning.assert_not_called()
+    else:
+        adapter.logger.warning.assert_called_once_with(
+            "Binance order event stream cleanup failed"
+        )
 
 
 @pytest.mark.parametrize(
@@ -211,7 +573,7 @@ def test_keepalive_validation_precedence_matrix(
         provider.assert_not_called()
     else:
         assert keepalive(exchange_id, client, listen_key) is None
-        provider.assert_called_once_with({"listenKey": listen_key})
+        provider.assert_called_once_with()
 
 
 @pytest.mark.parametrize(
@@ -240,7 +602,7 @@ def test_keepalive_preserves_provider_error_contract(
         with pytest.raises(ExchangeError, match=f"^{expected_message}$") as exc_info:
             keepalive("binance", client, "listen-key")
         assert exc_info.value.__cause__ is provider_error
-    provider.assert_called_once_with({"listenKey": "listen-key"})
+    provider.assert_called_once_with()
 
 
 def test_owner_and_live_adapter_keep_the_dependency_boundary() -> None:
@@ -256,7 +618,16 @@ def test_owner_and_live_adapter_keep_the_dependency_boundary() -> None:
     shared_create = inspect.getsource(CcxtExchangeAdapter.create_user_stream_listen_key)
     shared_keepalive = inspect.getsource(CcxtExchangeAdapter.keepalive_user_stream)
 
-    assert owner_imports == {"typing", "ccxt", "src.core.interfaces.exchange"}
+    assert owner_imports == {
+        "collections.abc",
+        "decimal",
+        "json",
+        "time",
+        "typing",
+        "ccxt",
+        "websockets.sync.client",
+        "src.core.interfaces.exchange",
+    }
     assert "fapiPrivatePostListenKey" not in shared_create
     assert "fapiPrivatePutListenKey" not in shared_keepalive
     assert "listenKey" not in shared_create + shared_keepalive
