@@ -11,6 +11,7 @@ the implementer fills in the stubs.  Do NOT modify these tests.
 
 from __future__ import annotations
 
+from collections.abc import Callable, Mapping
 from contextlib import contextmanager
 from decimal import Decimal
 import inspect
@@ -109,14 +110,16 @@ class RecordingExecutionEngine:
     def __init__(
         self,
         cancel_results: dict[str, bool] | None = None,
-        flatten_results: dict[tuple[str, str], str | None] | None = None,
+        flatten_results: Mapping[tuple[str, str], str | FlattenPending | None]
+        | None = None,
         orders_by_status: dict[str, list[Order]] | None = None,
     ) -> None:
         self.calls: list[tuple] = []
         self._cancel_results = cancel_results or {}
         self._flatten_results = flatten_results or {}
         self.order_manager = _FakeOrderManager(orders_by_status or {})
-        self.adapter = None
+        self.adapter: object | None = None
+        self._submissions_halted = False
         self.flatten_reference_prices: list[Decimal | None] = []
         self.authoritative_exits: list[tuple[str, str]] = []
 
@@ -131,10 +134,13 @@ class RecordingExecutionEngine:
         side: str,
         quantity: Decimal,
         reference_price: Decimal | None = None,
-    ) -> str | None:
+    ) -> str | FlattenPending | None:
         self.calls.append(("flatten_position", strategy_id, product_id))
         self.flatten_reference_prices.append(reference_price)
         return self._flatten_results.get((strategy_id, product_id), "flat-order-id")
+
+    def resume_submissions(self) -> None:
+        self._submissions_halted = False
 
     def exit_authoritative_position(self, product_id: str, *, account_id: str) -> bool:
         self.calls.append(("exit_authoritative_position", product_id))
@@ -197,7 +203,8 @@ def _make_service(
     orders: list[Order] | None = None,
     positions: list[Position] | None = None,
     cancel_results: dict[str, bool] | None = None,
-    flatten_results: dict[tuple[str, str], str | None] | None = None,
+    flatten_results: Mapping[tuple[str, str], str | FlattenPending | None]
+    | None = None,
 ) -> tuple[OpsSafetyService, RecordingExecutionEngine, FakeAccountService]:
     orders_by_status: dict[str, list[Order]] = {}
     for o in orders or []:
@@ -451,8 +458,10 @@ class TestKillSwitchClear:
         engine._submissions_halted = True
         calls = []
         persist = MagicMock(side_effect=lambda: calls.append("persist"))
-        engine.resume_submissions = MagicMock(
-            side_effect=lambda: calls.append("resume")
+        object.__setattr__(
+            engine,
+            "resume_submissions",
+            MagicMock(side_effect=lambda: calls.append("resume")),
         )
 
         result = service.clear_kill_switch(persist_clear=persist)
@@ -586,7 +595,11 @@ class TestKillSwitchCancelScope:
             repository.add_order(new_order)
             repository.add_order(submitted)
         service, engine, _ = _make_service(orders=[])
-        engine.order_manager.repo = repositories["ACCOUNT-A"]
+        object.__setattr__(
+            engine.order_manager,
+            "repo",
+            repositories["ACCOUNT-A"],
+        )
         engine.adapter = SimpleNamespace(exchange_id="binance")
 
         service.kill_switch(actor="ops", reason="account-scope")
@@ -596,13 +609,12 @@ class TestKillSwitchCancelScope:
         ]
         assert ("cancel_order", "submitted-ACCOUNT-A") in engine.calls
         assert ("cancel_order", "submitted-ACCOUNT-B") not in engine.calls
-        assert repositories["ACCOUNT-B"].get_order("new-ACCOUNT-B").status == (
-            OrderStatus.NEW.value
-        )
-        assert (
-            repositories["ACCOUNT-B"].get_order("submitted-ACCOUNT-B").status
-            == OrderStatus.SUBMITTED.value
-        )
+        foreign_new = repositories["ACCOUNT-B"].get_order("new-ACCOUNT-B")
+        assert foreign_new is not None
+        assert foreign_new.status == OrderStatus.NEW.value
+        foreign_submitted = repositories["ACCOUNT-B"].get_order("submitted-ACCOUNT-B")
+        assert foreign_submitted is not None
+        assert foreign_submitted.status == OrderStatus.SUBMITTED.value
 
     def test_filled_orders_not_cancelled(self):
         """FILLED orders are terminal and must be ignored."""
@@ -1245,6 +1257,7 @@ class TestFlattenPosition:
         self,
         tmp_path,
         mock_clock,
+        mock_exchange_adapter,
     ):
         """Exchange-only LIVE positions must persist flatten orders in a real DB."""
         engine = create_engine(f"sqlite:///{tmp_path / 'ops_flatten.db'}")
@@ -1299,15 +1312,11 @@ class TestFlattenPosition:
             )
             session.commit()
 
-        class AcceptingAdapter:
-            def place_order(self, order):
-                return "EX-FLAT"
-
         session_factory = sessionmaker(bind=engine)
         eng = ExecutionEngine(
             db_session=Session(),
             clock=mock_clock,
-            adapter=AcceptingAdapter(),
+            adapter=mock_exchange_adapter,
             order_repository=LiveOrderRepository(db_session_factory=session_factory),
             is_backtest=True,
         )
@@ -1319,6 +1328,7 @@ class TestFlattenPosition:
             strategy = session.get(Strategy, "__ops_kill_switch__")
             assert strategy is not None
             order = session.get(Order, order_id)
+        assert order is not None
         assert order.strategy_id == "__ops_kill_switch__"
 
 
@@ -1759,7 +1769,7 @@ class SequencedDrainEngine(RecordingExecutionEngine):
         self._drain_results = iter(drain_results)
         self._late_order = late_order
         self.drain_calls = 0
-        self.drain_callback = None
+        self.drain_callback: Callable[[], None] | None = None
 
     def halt_and_drain(self, timeout: float) -> bool:
         self.drain_calls += 1
@@ -1776,12 +1786,13 @@ class SequencedDrainEngine(RecordingExecutionEngine):
                 return True
         return False
 
-    def run_when_submissions_drained(self, callback) -> None:
+    def run_when_submissions_drained(self, callback: Callable[[], None]) -> None:
         self.drain_callback = callback
 
     def complete_submission(self) -> None:
         callback = self.drain_callback
         self.drain_callback = None
+        assert callback is not None
         callback()
 
 
@@ -1912,10 +1923,9 @@ class TestSubmissionDrainGate:
         assert not kill_thread.is_alive()
         assert result[0]["drain_timeout"] is False
         assert len(cancelled) == 1
-        assert (
-            eng.order_manager.repo.get_order(cancelled[0]).status
-            == OrderStatus.CANCELLED.value
-        )
+        cancelled_order = eng.order_manager.repo.get_order(cancelled[0])
+        assert cancelled_order is not None
+        assert cancelled_order.status == OrderStatus.CANCELLED.value
 
     def test_execution_engine_runs_callback_only_after_submission_drains(self):
         blocking_adapter = BlockingAdapter()
@@ -2065,10 +2075,12 @@ class TestSubmissionDrainGate:
     def test_drain_callback_registration_failure_stays_pending(self, registration_mode):
         eng = SequencedDrainEngine([False])
         if registration_mode == "missing":
-            eng.run_when_submissions_drained = None
+            object.__setattr__(eng, "run_when_submissions_drained", None)
         else:
-            eng.run_when_submissions_drained = MagicMock(
-                side_effect=RuntimeError("callback registration failed")
+            object.__setattr__(
+                eng,
+                "run_when_submissions_drained",
+                MagicMock(side_effect=RuntimeError("callback registration failed")),
             )
         service = OpsSafetyService(
             eng,
@@ -2148,11 +2160,15 @@ class TestSubmissionDrainGate:
 
     def test_invariant_no_cancellable_orders_after_clean_drain(self):
         """After a kill_switch with a clean drain, no non-ops orders remain in cancellable statuses."""
+        from tests.conftest import MockOrderRepository
+
         repo_eng = _make_drain_engine()
+        repo = repo_eng.order_manager.repo
+        assert isinstance(repo, MockOrderRepository)
 
         # Pre-populate repo with a submitted order as if a previous execute_signal ran.
         submitted_order = _make_order("submitted-001", OrderStatus.SUBMITTED.value)
-        repo_eng.order_manager.repo.orders[submitted_order.id] = submitted_order
+        repo.orders[submitted_order.id] = submitted_order
 
         fake_account = FakeAccountService(positions=[])
         service = OpsSafetyService(
@@ -2164,7 +2180,7 @@ class TestSubmissionDrainGate:
 
         def fake_cancel(order_id: str) -> bool:
             submitted_order.status = OrderStatus.CANCELLED.value
-            repo_eng.order_manager.repo.orders[submitted_order.id] = submitted_order
+            repo.orders[submitted_order.id] = submitted_order
             cancelled.append(order_id)
             return True
 
@@ -2187,7 +2203,7 @@ class TestSubmissionDrainGate:
         ops_strategy = "__ops_kill_switch__"
         remaining = [
             o
-            for o in repo_eng.order_manager.repo.orders.values()
+            for o in repo.orders.values()
             if o.status in cancellable and o.strategy_id != ops_strategy
         ]
         assert not remaining, (
