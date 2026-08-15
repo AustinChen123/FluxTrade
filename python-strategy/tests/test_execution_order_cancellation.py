@@ -7,7 +7,11 @@ from src.core.execution_order_cancellation import cancel_known_order
 from src.core.models import OrderStatus
 
 
-def _subject(*, status=OrderStatus.SUBMITTED.value, client_order_id="client-1"):
+def _subject(
+    *,
+    status=OrderStatus.SUBMITTED.value,
+    client_order_id: str | None = "client-1",
+):
     order = SimpleNamespace(
         id="local-1",
         product_id="TEST:PRODUCT",

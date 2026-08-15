@@ -5,7 +5,7 @@ from unittest.mock import MagicMock, call
 import pytest
 
 from src.core.execution_conditional_orders import create_conditional_orders
-from src.core.models import OrderSide, OrderStatus, SignalType
+from src.core.models import Candlestick, OrderSide, OrderStatus, SignalType
 
 
 @pytest.mark.parametrize(
@@ -44,7 +44,16 @@ def test_materializes_all_intents_with_exact_identity_and_oco_persistence(
 
     manager.create_order.side_effect = create_order
     attach_reference = MagicMock()
-    candle = SimpleNamespace(close=Decimal("100.00"))
+    candle = Candlestick(
+        product_id=signal.product_id,
+        timeframe=signal.timeframe,
+        timestamp=signal.timestamp,
+        open=Decimal("100.00"),
+        high=Decimal("100.00"),
+        low=Decimal("100.00"),
+        close=Decimal("100.00"),
+        volume=Decimal("1"),
+    )
 
     result = create_conditional_orders(
         order_manager=manager,

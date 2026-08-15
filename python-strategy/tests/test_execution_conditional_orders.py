@@ -111,7 +111,7 @@ def test_lifecycle_warning_delegates_exact_event_to_dynamic_audit_port():
     write_warning = MagicMock()
     owner = _owner(write_warning=write_warning)
     order = SimpleNamespace(id="entry-1")
-    failures = [{"reason": "placement-failed"}]
+    failures: list[dict[str, object]] = [{"reason": "placement-failed"}]
 
     owner.write_warning(
         event_subtype="conditional-order-sentinel",
