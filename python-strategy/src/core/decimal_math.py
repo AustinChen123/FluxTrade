@@ -1,6 +1,6 @@
 """Context-independent exact Decimal arithmetic for shared core projections."""
 
-from decimal import Decimal
+from decimal import Context, Decimal, ROUND_HALF_EVEN
 from fractions import Fraction
 
 
@@ -78,3 +78,41 @@ def decimal_from_fraction(value: Fraction, *, places: int) -> Decimal:
 
     digits = tuple(map(int, str(coefficient)))
     return Decimal((int(value < 0), digits, -places))
+
+
+def decimal_from_fraction_significant(
+    value: Fraction,
+    *,
+    precision: int,
+) -> Decimal:
+    """Convert a fraction exactly when terminating, else round to precision."""
+    if type(value) is not Fraction:
+        raise TypeError("value must be an exact Fraction")
+    if type(precision) is not int or precision <= 0:
+        raise ValueError("precision must be a positive exact integer")
+    if value == 0:
+        return Decimal(0)
+
+    denominator = value.denominator
+    twos = fives = 0
+    while denominator % 2 == 0:
+        denominator //= 2
+        twos += 1
+    while denominator % 5 == 0:
+        denominator //= 5
+        fives += 1
+    if denominator == 1:
+        scale = max(twos, fives)
+        coefficient = abs(value.numerator)
+        coefficient *= 2 ** (scale - twos)
+        coefficient *= 5 ** (scale - fives)
+        return Decimal(
+            (
+                int(value < 0),
+                tuple(map(int, str(coefficient))),
+                -scale,
+            )
+        )
+
+    context = Context(prec=precision, rounding=ROUND_HALF_EVEN)
+    return context.divide(Decimal(value.numerator), Decimal(value.denominator))
