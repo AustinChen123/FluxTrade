@@ -1,12 +1,18 @@
 import logging
 from contextlib import nullcontext
+from dataclasses import dataclass, field
 from decimal import Decimal
 from types import SimpleNamespace
+from typing import Iterable
 from unittest.mock import MagicMock, Mock
 
 import pytest
 
 from src.core.adapters.rithmic_recovery import (
+    RithmicRecoveryItem,
+    _LedgerFill,
+    _LedgerOrder,
+    _LedgerPosition,
     build_rithmic_recovery_plan,
     compare_rithmic_positions,
     load_rithmic_recovery_snapshot,
@@ -60,6 +66,84 @@ RAW_SENTINELS = (
     "STATUS_SECRET_123 FCM_ID_SECRET_123 IB_ID_SECRET_123 PROFILE_SECRET_123 "
     "URL_SECRET_123 USER_SECRET_123"
 ).split()
+
+
+@dataclass
+class RecoveryOrderFixture:
+    id: str = "local-1"
+    client_order_id: str | None = "flux-1"
+    exchange_order_id: str | None = "basket-1"
+    exchange_id: str = "rithmic"
+    account_profile: str | None = "test"
+    account_id: str | None = "ACCOUNT"
+    product_id: str = "RITHMIC:NQ-202609"
+    side: str = "buy"
+    quantity: Decimal = Decimal("2")
+    status: str = "SUBMITTED"
+    filled_quantity: Decimal = Decimal("0")
+    filled_price: Decimal = Decimal("0")
+    timestamp: int = 1_700_000_123_000
+    type: str = "market"
+    intent_payload: dict[str, object] | None = None
+
+
+@dataclass
+class LedgerOrderFixture:
+    client_order_id: str | None = "flux-1"
+    exchange_order_id: str | None = "exchange-1"
+    basket_id: str = "basket-1"
+    original_basket_id: str | None = None
+    symbol: str = "NQU6"
+    status: str = "OPEN"
+    notification_type: str | None = "OPEN"
+    transaction_type: str = "BUY"
+    quantity: str = "2"
+    price: str | None = None
+    trigger_price: str | None = None
+    price_type: str | None = None
+    bracket_type: str | None = None
+    filled_quantity: str | None = "0"
+    unfilled_quantity: str | None = "2"
+    average_fill_price: str | None = None
+    timestamp_ms: int | None = 1_700_000_124_000
+    completion_reason: str | None = None
+
+
+@dataclass
+class LedgerFillFixture:
+    basket_id: str = "basket-1"
+    exchange_order_id: str | None = "exchange-1"
+    fill_id: str = "fill-1"
+    exchange: str = "CME"
+    symbol: str = "NQU6"
+    transaction_type: str = "BUY"
+    fill_quantity: str = "1"
+    fill_price: str = "20000.25"
+    timestamp_ms: int | None = 1_700_000_124_000
+
+
+@dataclass
+class LedgerPositionFixture:
+    symbol: str
+    net_quantity: str
+
+
+@dataclass
+class AccountSummaryFixture:
+    account_balance: str = "100000"
+
+
+@dataclass
+class LedgerSnapshotFixture:
+    account_id: str = "ACCOUNT"
+    account_currency: str = "USD"
+    orders: list[_LedgerOrder] = field(default_factory=list)
+    order_history: list[_LedgerOrder] = field(default_factory=list)
+    fills: list[_LedgerFill] = field(default_factory=list)
+    positions: list[_LedgerPosition] = field(default_factory=list)
+    account_summary: AccountSummaryFixture | None = field(
+        default_factory=AccountSummaryFixture
+    )
 
 
 def owned_reconciler(
@@ -136,74 +220,140 @@ def assert_snapshot_diagnostics(result, event_payload, records, expected):
     assert_no_raw_sentinels((result, event_payload, vars(diagnostics[0])))
 
 
-def local_order(**overrides):
-    values = {
-        "id": "local-1",
-        "client_order_id": "flux-1",
-        "exchange_order_id": "basket-1",
-        "exchange_id": "rithmic",
-        "account_profile": "test",
-        "account_id": "ACCOUNT",
-        "product_id": "RITHMIC:NQ-202609",
-        "side": "buy",
-        "quantity": Decimal("2"),
-        "status": "SUBMITTED",
-        "filled_quantity": Decimal("0"),
-        "filled_price": Decimal("0"),
-        "timestamp": 1_700_000_123_000,
-    }
-    values.update(overrides)
-    return SimpleNamespace(**values)
+def recovery_event(item: RithmicRecoveryItem):
+    assert item.event is not None
+    return item.event
 
 
-def remote_order(**overrides):
-    values = {
-        "client_order_id": "flux-1",
-        "exchange_order_id": "exchange-1",
-        "basket_id": "basket-1",
-        "symbol": "NQU6",
-        "status": "OPEN",
-        "notification_type": "OPEN",
-        "transaction_type": "BUY",
-        "quantity": "2",
-        "filled_quantity": "0",
-        "unfilled_quantity": "2",
-        "average_fill_price": None,
-        "timestamp_ms": 1_700_000_124_000,
-        "original_basket_id": None,
-        "price_type": None,
-    }
-    values.update(overrides)
-    return SimpleNamespace(**values)
+def mapping(value: object) -> dict[object, object]:
+    assert isinstance(value, dict)
+    return value
 
 
-def remote_fill(**overrides):
-    values = {
-        "basket_id": "basket-1",
-        "exchange_order_id": "exchange-1",
-        "fill_id": "fill-1",
-        "exchange": "CME",
-        "symbol": "NQU6",
-        "transaction_type": "BUY",
-        "fill_quantity": "1",
-        "fill_price": "20000.25",
-        "timestamp_ms": 1_700_000_124_000,
-    }
-    values.update(overrides)
-    return SimpleNamespace(**values)
+def sequence(value: object) -> list[object]:
+    assert isinstance(value, list)
+    return value
 
 
-def snapshot(*, orders=(), order_history=(), fills=(), positions=(), account_summary=True):
-    return SimpleNamespace(
-        account_id="ACCOUNT",
-        account_currency="USD",
+def local_order(
+    *,
+    id: str = "local-1",
+    client_order_id: str | None = "flux-1",
+    exchange_order_id: str | None = "basket-1",
+    exchange_id: str = "rithmic",
+    account_profile: str | None = "test",
+    account_id: str | None = "ACCOUNT",
+    product_id: str = "RITHMIC:NQ-202609",
+    side: str = "buy",
+    quantity: Decimal = Decimal("2"),
+    status: str = "SUBMITTED",
+    filled_quantity: Decimal = Decimal("0"),
+    filled_price: Decimal = Decimal("0"),
+    timestamp: int = 1_700_000_123_000,
+    type: str = "market",
+    intent_payload: dict[str, object] | None = None,
+) -> RecoveryOrderFixture:
+    return RecoveryOrderFixture(
+        id=id,
+        client_order_id=client_order_id,
+        exchange_order_id=exchange_order_id,
+        exchange_id=exchange_id,
+        account_profile=account_profile,
+        account_id=account_id,
+        product_id=product_id,
+        side=side,
+        quantity=quantity,
+        status=status,
+        filled_quantity=filled_quantity,
+        filled_price=filled_price,
+        timestamp=timestamp,
+        type=type,
+        intent_payload=intent_payload,
+    )
+
+
+def remote_order(
+    *,
+    client_order_id: str | None = "flux-1",
+    exchange_order_id: str | None = "exchange-1",
+    basket_id: str = "basket-1",
+    original_basket_id: str | None = None,
+    symbol: str = "NQU6",
+    status: str = "OPEN",
+    notification_type: str | None = "OPEN",
+    transaction_type: str = "BUY",
+    quantity: str = "2",
+    price: str | None = None,
+    trigger_price: str | None = None,
+    price_type: str | None = None,
+    bracket_type: str | None = None,
+    filled_quantity: str | None = "0",
+    unfilled_quantity: str | None = "2",
+    average_fill_price: str | None = None,
+    timestamp_ms: int | None = 1_700_000_124_000,
+    completion_reason: str | None = None,
+) -> LedgerOrderFixture:
+    return LedgerOrderFixture(
+        client_order_id=client_order_id,
+        exchange_order_id=exchange_order_id,
+        basket_id=basket_id,
+        original_basket_id=original_basket_id,
+        symbol=symbol,
+        status=status,
+        notification_type=notification_type,
+        transaction_type=transaction_type,
+        quantity=quantity,
+        price=price,
+        trigger_price=trigger_price,
+        price_type=price_type,
+        bracket_type=bracket_type,
+        filled_quantity=filled_quantity,
+        unfilled_quantity=unfilled_quantity,
+        average_fill_price=average_fill_price,
+        timestamp_ms=timestamp_ms,
+        completion_reason=completion_reason,
+    )
+
+
+def remote_fill(
+    *,
+    basket_id: str = "basket-1",
+    exchange_order_id: str | None = "exchange-1",
+    fill_id: str = "fill-1",
+    exchange: str = "CME",
+    symbol: str = "NQU6",
+    transaction_type: str = "BUY",
+    fill_quantity: str = "1",
+    fill_price: str = "20000.25",
+    timestamp_ms: int | None = 1_700_000_124_000,
+) -> LedgerFillFixture:
+    return LedgerFillFixture(
+        basket_id=basket_id,
+        exchange_order_id=exchange_order_id,
+        fill_id=fill_id,
+        exchange=exchange,
+        symbol=symbol,
+        transaction_type=transaction_type,
+        fill_quantity=fill_quantity,
+        fill_price=fill_price,
+        timestamp_ms=timestamp_ms,
+    )
+
+
+def snapshot(
+    *,
+    orders: Iterable[_LedgerOrder] = (),
+    order_history: Iterable[_LedgerOrder] = (),
+    fills: Iterable[_LedgerFill] = (),
+    positions: Iterable[_LedgerPosition] = (),
+    account_summary: bool = True,
+) -> LedgerSnapshotFixture:
+    return LedgerSnapshotFixture(
         orders=list(orders),
         order_history=list(order_history),
         fills=list(fills),
         positions=list(positions),
-        account_summary=(
-            SimpleNamespace(account_balance="100000") if account_summary else None
-        ),
+        account_summary=AccountSummaryFixture() if account_summary else None,
     )
 
 
@@ -263,7 +413,11 @@ def test_rithmic_order_working_classifier_is_fail_closed(remote, expected):
     [
         ([remote_order()], [], [], "matched", "open", False),
         (
-            [remote_order(status="OPEN", filled_quantity="1", average_fill_price="20000.25")],
+            [
+                remote_order(
+                    status="OPEN", filled_quantity="1", average_fill_price="20000.25"
+                )
+            ],
             [],
             [],
             "repaired",
@@ -282,7 +436,13 @@ def test_rithmic_order_working_classifier_is_fail_closed(remote, expected):
         ([], [], [remote_fill()], "repaired_partial", "partially_filled", True),
         (
             [],
-            [remote_order(status="COMPLETE", filled_quantity="2", average_fill_price="20000.50")],
+            [
+                remote_order(
+                    status="COMPLETE",
+                    filled_quantity="2",
+                    average_fill_price="20000.50",
+                )
+            ],
             [],
             "repaired",
             "filled",
@@ -335,7 +495,7 @@ def test_owned_order_recovery_state_matrix(
 
     assert external == []
     assert plan[0].classification == classification
-    assert plan[0].event.status == status
+    assert recovery_event(plan[0]).status == status
     assert plan[0].unresolved is unresolved
 
 
@@ -358,33 +518,35 @@ def test_recovery_uses_latest_available_fill_timestamp_when_one_is_missing():
 
 
 def test_recovery_matches_cloned_python_snapshot_rows_by_stable_identity():
-    class CloningSnapshot:
-        account_id = "ACCOUNT"
-        account_currency = "USD"
-        order_history = []
-        fills = []
-        positions = []
-        account_summary = SimpleNamespace(account_balance="100000")
+    class CloningRows(list[_LedgerOrder]):
+        def __init__(self):
+            super().__init__()
+            self.generated: list[_LedgerOrder] = []
 
-        @property
-        def orders(self):
-            return [
-                remote_order(
-                    status="complete",
-                    notification_type="CANCEL",
-                    filled_quantity="0",
-                    unfilled_quantity="2",
-                )
-            ]
+        def __iter__(self):
+            row = remote_order(
+                status="complete",
+                notification_type="CANCEL",
+                filled_quantity="0",
+                unfilled_quantity="2",
+            )
+            self.generated.append(row)
+            return iter([row])
+
+    rows = CloningRows()
+    remote_snapshot = snapshot()
+    remote_snapshot.orders = rows
 
     plan, external = build_rithmic_recovery_plan(
         [local_order()],
-        CloningSnapshot(),
+        remote_snapshot,
     )
 
     assert external == []
     assert plan[0].classification == "repaired"
-    assert plan[0].event.status == "cancelled"
+    assert recovery_event(plan[0]).status == "cancelled"
+    assert len(rows.generated) >= 2
+    assert rows.generated[0] is not rows.generated[1]
 
 
 @pytest.mark.parametrize(
@@ -392,7 +554,9 @@ def test_recovery_matches_cloned_python_snapshot_rows_by_stable_identity():
     [
         (snapshot(), "no_authoritative_remote_evidence"),
         (
-            snapshot(order_history=[remote_order(status="COMPLETE", filled_quantity="1")]),
+            snapshot(
+                order_history=[remote_order(status="COMPLETE", filled_quantity="1")]
+            ),
             "unknown_rithmic_order_status",
         ),
         (
@@ -409,7 +573,9 @@ def test_recovery_matches_cloned_python_snapshot_rows_by_stable_identity():
             "unknown_rithmic_order_status",
         ),
         (
-            snapshot(orders=[remote_order(), remote_order(exchange_order_id="exchange-2")]),
+            snapshot(
+                orders=[remote_order(), remote_order(exchange_order_id="exchange-2")]
+            ),
             "duplicate_remote_identity",
         ),
         (
@@ -417,7 +583,10 @@ def test_recovery_matches_cloned_python_snapshot_rows_by_stable_identity():
             "product_symbol_mismatch",
         ),
         (snapshot(orders=[remote_order(quantity="3")]), "order_quantity_mismatch"),
-        (snapshot(orders=[remote_order(transaction_type="SELL")]), "order_side_mismatch"),
+        (
+            snapshot(orders=[remote_order(transaction_type="SELL")]),
+            "order_side_mismatch",
+        ),
         (
             snapshot(
                 order_history=[
@@ -491,10 +660,10 @@ def test_duplicate_identical_fills_are_idempotent():
     fill = remote_fill()
     plan, _ = build_rithmic_recovery_plan(
         [local_order()],
-        snapshot(fills=[fill, SimpleNamespace(**vars(fill))]),
+        snapshot(fills=[fill, remote_fill()]),
     )
 
-    assert plan[0].event.cumulative_filled_quantity == Decimal("1")
+    assert recovery_event(plan[0]).cumulative_filled_quantity == Decimal("1")
 
 
 def test_duplicate_local_order_identity_fails_closed_before_repair():
@@ -771,8 +940,10 @@ def test_native_child_is_recovered_without_parent_in_local_active_set():
 
     assert external == []
     assert plan[0].classification == "matched"
-    assert plan[0].event.raw["trigger_price"] == "19998.25"
-    assert plan[0].event.raw["price_type"] == "stop_market"
+    event = recovery_event(plan[0])
+    assert event.raw is not None
+    assert event.raw["trigger_price"] == "19998.25"
+    assert event.raw["price_type"] == "stop_market"
 
 
 def test_native_child_with_wrong_parent_is_blocked_and_reported_external():
@@ -845,9 +1016,7 @@ def test_terminal_native_child_history_requires_parent_and_leg_identity(
         status="CANCELLED",
     )
 
-    plan, _ = build_rithmic_recovery_plan(
-        [child], snapshot(order_history=[terminal])
-    )
+    plan, _ = build_rithmic_recovery_plan([child], snapshot(order_history=[terminal]))
 
     assert plan[0].reason == reason
 
@@ -865,7 +1034,9 @@ def test_unexpected_extra_native_leg_is_reported_external():
         },
     )
     remotes = [
-        remote_order(client_order_id=parent_client_id, basket_id="parent-1", quantity="1"),
+        remote_order(
+            client_order_id=parent_client_id, basket_id="parent-1", quantity="1"
+        ),
         remote_order(
             client_order_id=parent_client_id,
             basket_id="child-stop-1",
@@ -908,7 +1079,7 @@ def test_native_children_sharing_parent_user_tag_do_not_duplicate_parent_identit
                     "take_profit": {"client_order_id": "strategy-execution-tp-123"},
                 }
             }
-        }
+        },
     )
     remotes = [
         remote_order(
@@ -956,8 +1127,8 @@ def test_position_comparison_covers_recovered_and_locally_held_products():
             ),
         ],
         [
-            SimpleNamespace(symbol="NQU6", net_quantity="2"),
-            SimpleNamespace(symbol="ESU6", net_quantity="0"),
+            LedgerPositionFixture(symbol="NQU6", net_quantity="2"),
+            LedgerPositionFixture(symbol="ESU6", net_quantity="0"),
         ],
     )
 
@@ -1290,7 +1461,8 @@ def test_reconciler_blocks_untrusted_local_account_identity(
 
     loader.assert_not_called()
     assert result["auto_resume_safe"] is False
-    assert result["results"][0]["reason"] == reason
+    results = sequence(result["results"])
+    assert mapping(results[0])["reason"] == reason
 
 
 @pytest.mark.parametrize(
@@ -1362,7 +1534,8 @@ def test_reconciler_blocks_entire_mixed_account_identity_batch():
     assert result["unresolved_count"] == 2
     assert result["verification_blocked_count"] == 2
     assert result["auto_resume_safe"] is False
-    assert [item["reason"] for item in result["results"]] == [
+    results = [mapping(item) for item in sequence(result["results"])]
+    assert [item["reason"] for item in results] == [
         "account_identity_batch_blocked",
         "local_account_id_mismatch",
     ]
@@ -1387,7 +1560,7 @@ def test_reconciler_checks_remote_exposure_even_without_recoverable_orders():
     )
     loader = Mock(
         return_value=snapshot(
-            positions=[SimpleNamespace(symbol="NQU6", net_quantity="1")]
+            positions=[LedgerPositionFixture(symbol="NQU6", net_quantity="1")]
         )
     )
 
@@ -1399,7 +1572,8 @@ def test_reconciler_checks_remote_exposure_even_without_recoverable_orders():
     processor.assert_not_called()
     assert result["recoverable_count"] == 0
     assert result["unresolved_count"] == 1
-    assert result["ledger_verification"]["position_drifts"] == [
+    ledger_verification = mapping(result["ledger_verification"])
+    assert ledger_verification["position_drifts"] == [
         {
             "product_id": "RITHMIC:NQU6",
             "local_quantity": "0",
@@ -1432,7 +1606,8 @@ def test_reconciler_blocks_account_mismatch_even_without_recoverable_orders():
     )
 
     assert result["unresolved_count"] == 1
-    assert "remote_account_id_mismatch" in result["ledger_verification"]["errors"]
+    ledger_verification = mapping(result["ledger_verification"])
+    assert "remote_account_id_mismatch" in sequence(ledger_verification["errors"])
 
 
 def test_reconciler_blocks_unowned_working_order_without_adopting_it():
@@ -1503,11 +1678,14 @@ def test_reconciler_clean_snapshot_explicitly_allows_auto_resume(caplog):
         (
             snapshot(
                 orders=[remote_order()],
-                positions=[SimpleNamespace(symbol="NQU6", net_quantity="1")],
+                positions=[LedgerPositionFixture(symbol="NQU6", net_quantity="1")],
             ),
             None,
         ),
-        (snapshot(orders=[remote_order()], account_summary=False), "remote_account_summary_missing"),
+        (
+            snapshot(orders=[remote_order()], account_summary=False),
+            "remote_account_summary_missing",
+        ),
     ],
 )
 def test_reconciler_keeps_startup_blocked_on_ledger_verification_failure(
@@ -1537,8 +1715,9 @@ def test_reconciler_keeps_startup_blocked_on_ledger_verification_failure(
 
     assert result["unresolved_count"] == 1
     assert result["verification_blocked_count"] == 1
-    assert result["ledger_verification"]["verification_blocked"] is True
+    ledger_verification = mapping(result["ledger_verification"])
+    assert ledger_verification["verification_blocked"] is True
     if expected_error is None:
-        assert result["ledger_verification"]["position_drifts"]
+        assert ledger_verification["position_drifts"]
     else:
-        assert expected_error in result["ledger_verification"]["errors"]
+        assert expected_error in sequence(ledger_verification["errors"])
