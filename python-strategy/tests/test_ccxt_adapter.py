@@ -17,6 +17,7 @@ from src.core.adapters.ccxt_adapter import (
     CcxtExchangeAdapter,
     _ExactCreateOrder,
 )
+from src.core.adapters.live_bybit import LiveBybitAdapter
 from src.core.adapters.live_binance import LiveBinanceAdapter
 from src.core.adapters.live_backpack import LiveBackpackAdapter
 from src.core.adapters.simulated import SimulatedAdapter
@@ -158,6 +159,116 @@ def _backpack_adapter(client: MagicMock) -> LiveBackpackAdapter:
     adapter._client_order_aliases = {}
     adapter._client_order_alias_lock = threading.Lock()
     return adapter
+
+
+def _cold_alias_adapter(adapter_type):
+    adapter = object.__new__(adapter_type)
+    adapter.exchange_id = {
+        LiveBinanceAdapter: "binance",
+        LiveBackpackAdapter: "backpack",
+        LiveBybitAdapter: "bybit",
+    }[adapter_type]
+    adapter._client_order_aliases = {}
+    adapter._client_order_alias_lock = threading.Lock()
+    return adapter
+
+
+@pytest.mark.parametrize(
+    "adapter_type",
+    (LiveBinanceAdapter, LiveBackpackAdapter, LiveBybitAdapter),
+)
+@pytest.mark.parametrize(
+    "status",
+    ("NEW", "SUBMITTED_UNCONFIRMED", "SUBMITTED", "PARTIALLY_FILLED"),
+)
+def test_ccxt_restore_order_groups_rebuilds_venue_aliases_without_io(
+    adapter_type,
+    status,
+) -> None:
+    canonical_id = CANONICAL_CLIENT_ORDER_ID
+    original = _cold_alias_adapter(adapter_type)
+    restarted = _cold_alias_adapter(adapter_type)
+    provider_id = original._exchange_client_order_id(canonical_id)
+    order = _make_order(
+        client_order_id=canonical_id,
+        exchange_id=restarted.exchange_id.upper(),
+        status=status,
+    )
+
+    restarted.restore_order_groups([order])
+
+    assert restarted._canonical_client_order_id(provider_id) == canonical_id
+
+
+@pytest.mark.parametrize("client_order_id", (None, ""))
+def test_ccxt_restore_order_groups_skips_missing_client_identity(
+    client_order_id,
+) -> None:
+    adapter = _cold_alias_adapter(LiveBackpackAdapter)
+    adapter._exchange_client_order_id = MagicMock(
+        side_effect=AssertionError("alias conversion forbidden")
+    )
+
+    adapter.restore_order_groups(
+        [
+            _make_order(
+                client_order_id=client_order_id,
+                exchange_id="BACKPACK",
+            )
+        ]
+    )
+
+    assert adapter._client_order_aliases == {}
+    adapter._exchange_client_order_id.assert_not_called()
+
+
+def test_ccxt_restore_order_groups_skips_foreign_venue_before_collision(
+    monkeypatch,
+) -> None:
+    adapter = _cold_alias_adapter(LiveBackpackAdapter)
+    monkeypatch.setattr(
+        "src.core.adapters.live_backpack._backpack_client_id",
+        lambda _value: 17,
+    )
+    foreign = _make_order(
+        client_order_id="strategy_1-worker_a-entry-1704067200000000000",
+        exchange_id="BINANCE",
+    )
+    local = _make_order(
+        client_order_id="strategy_2-worker_b-entry-1704067200000000001",
+        exchange_id="BACKPACK",
+    )
+
+    adapter.restore_order_groups([foreign, local])
+
+    assert adapter._client_order_aliases == {"17": local.client_order_id}
+
+
+@pytest.mark.parametrize(
+    ("exchange_id", "accepted"),
+    [
+        ("BACKPACK", True),
+        ("backpack", True),
+        ("BACK", False),
+        ("BACKPACK ", False),
+        ("BINANCE", False),
+        (None, False),
+    ],
+)
+def test_ccxt_restore_order_groups_requires_exact_venue_identity(
+    exchange_id,
+    accepted,
+) -> None:
+    adapter = _cold_alias_adapter(LiveBackpackAdapter)
+    adapter._exchange_client_order_id = MagicMock()
+    order = _make_order(
+        client_order_id=CANONICAL_CLIENT_ORDER_ID,
+        exchange_id=exchange_id,
+    )
+
+    adapter.restore_order_groups([order])
+
+    assert adapter._exchange_client_order_id.call_count == int(accepted)
 
 
 def test_backpack_raw_client_id_operations_are_restart_stable_and_one_of() -> None:

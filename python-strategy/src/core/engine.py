@@ -471,6 +471,9 @@ class StrategyEngine:
             current_worker=lambda: self.order_event_thread,
             event_logger=logger,
             thread_factory=lambda **values: threading.Thread(**values),
+            recoverable_orders_loader=lambda: (
+                self.execution_engine.list_recoverable_client_orders()
+            ),
         )
         runtime_callbacks = RuntimeCallbacks(
             is_running=lambda: self.running,

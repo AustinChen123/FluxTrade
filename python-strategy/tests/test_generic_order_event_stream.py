@@ -59,6 +59,7 @@ def _service(
     adapter: object,
     stop_event: _StopEvent | None = None,
     process_result: object = _APPLIED,
+    recoverable_orders_loader=list,
 ):
     current = {"adapter": adapter, "worker": None}
     event = stop_event or _StopEvent(events)
@@ -87,6 +88,7 @@ def _service(
         current_worker=lambda: current["worker"],
         event_logger=logger,
         thread_factory=default_thread_factory,
+        recoverable_orders_loader=recoverable_orders_loader,
     )
     return service, current, event, logger
 
@@ -130,15 +132,48 @@ def test_start_preserves_worker_metadata_fences_and_dispatch_order() -> None:
     assert current["worker"].daemon is True
 
 
+def test_start_restores_current_orders_before_provider_stream_and_poll() -> None:
+    events: list[str] = []
+    adapter = MagicMock()
+    orders = [object()]
+    adapter.restore_order_groups.side_effect = lambda value: events.append(
+        f"restore:{value is orders}"
+    )
+    adapter.start_order_event_stream.side_effect = lambda: events.append(
+        "adapter-start"
+    )
+    service, _current, stop_event, _logger = _service(
+        events,
+        adapter=adapter,
+        recoverable_orders_loader=lambda: events.append("load") or orders,
+    )
+
+    def poll_once() -> None:
+        events.append("poll")
+        stop_event.set()
+
+    adapter.poll_order_event.side_effect = poll_once
+
+    service.start()
+
+    assert events[:3] == ["load", "restore:True", "adapter-start"]
+
+
 def test_missing_adapter_capability_is_a_noop() -> None:
     events: list[str] = []
     adapter = object()
-    service, current, _stop_event, _logger = _service(events, adapter=adapter)
+    loader = MagicMock(side_effect=AssertionError("loader forbidden"))
+    service, current, _stop_event, _logger = _service(
+        events,
+        adapter=adapter,
+        recoverable_orders_loader=loader,
+    )
 
     service.start()
 
     assert events == []
     assert current["worker"] is None
+    loader.assert_not_called()
 
 
 def test_adapter_is_loaded_at_each_start() -> None:
@@ -153,6 +188,31 @@ def test_adapter_is_loaded_at_each_start() -> None:
 
     new_adapter.start_order_event_stream.assert_called_once_with()
     new_adapter.poll_order_event.assert_called_once_with()
+
+
+def test_orders_and_adapter_are_reloaded_at_each_start() -> None:
+    events: list[str] = []
+    first_adapter = MagicMock()
+    second_adapter = MagicMock()
+    orders = [[object()], [object()]]
+    loader = MagicMock(side_effect=orders)
+    service, current, stop_event, _logger = _service(
+        events,
+        adapter=first_adapter,
+        recoverable_orders_loader=loader,
+    )
+    first_adapter.poll_order_event.side_effect = lambda: stop_event.set()
+    second_adapter.poll_order_event.side_effect = lambda: stop_event.set()
+
+    service.start()
+    current["adapter"] = second_adapter
+    service.start()
+
+    assert loader.call_count == 2
+    first_adapter.restore_order_groups.assert_called_once_with(orders[0])
+    second_adapter.restore_order_groups.assert_called_once_with(orders[1])
+    first_adapter.start_order_event_stream.assert_called_once_with()
+    second_adapter.start_order_event_stream.assert_called_once_with()
 
 
 def test_empty_poll_waits_without_dispatch() -> None:
@@ -187,6 +247,35 @@ def test_start_failure_is_contained_latched_and_keeps_control_plane_alive() -> N
     _logger.error.assert_called_once_with(
         "Exchange order event stream could not start; submissions remain halted"
     )
+
+
+@pytest.mark.parametrize("failure_owner", ("loader", "restore"))
+def test_alias_restore_failure_is_contained_before_provider_start(
+    failure_owner: str,
+) -> None:
+    events: list[str] = []
+    adapter = MagicMock()
+    failure = RuntimeError("provider-secret-sentinel")
+    if failure_owner == "loader":
+        loader = MagicMock(side_effect=failure)
+    else:
+        loader = MagicMock(return_value=[object()])
+        adapter.restore_order_groups.side_effect = failure
+    service, current, _stop_event, logger = _service(
+        events,
+        adapter=adapter,
+        recoverable_orders_loader=loader,
+    )
+
+    assert service.start() is None
+
+    assert events == ["latch", "halt"]
+    assert current["worker"] is None
+    adapter.start_order_event_stream.assert_not_called()
+    logger.error.assert_called_once_with(
+        "Exchange order event stream could not start; submissions remain halted"
+    )
+    assert "provider-secret-sentinel" not in str(logger.mock_calls)
 
 
 @pytest.mark.parametrize(

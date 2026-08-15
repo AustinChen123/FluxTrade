@@ -109,6 +109,18 @@ class CcxtExchangeAdapter(IExchangeAdapter):
         parse_client_order_id(client_order_id)
         return client_order_id
 
+    def restore_order_groups(self, orders: list[Order]) -> None:
+        for order in orders:
+            order_exchange_id = getattr(order, "exchange_id", None)
+            if (
+                type(order_exchange_id) is not str
+                or order_exchange_id.casefold() != self.exchange_id.casefold()
+            ):
+                continue
+            client_order_id = getattr(order, "client_order_id", None)
+            if type(client_order_id) is str and client_order_id:
+                self._exchange_client_order_id(client_order_id)
+
     def place_order(self, order: Order) -> str:
         ccxt_symbol = to_ccxt_symbol(order.product_id)
         side = self._ccxt_order_side(order.side)

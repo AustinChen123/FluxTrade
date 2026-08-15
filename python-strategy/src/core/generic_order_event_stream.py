@@ -49,6 +49,7 @@ class GenericOrderEventStream:
         current_worker: Callable[[], _Worker | None],
         event_logger: logging.Logger,
         thread_factory: _ThreadFactory = threading.Thread,
+        recoverable_orders_loader: Callable[[], list[object]] = list,
     ) -> None:
         self._adapter_loader = adapter_loader
         self._is_running = is_running
@@ -61,6 +62,7 @@ class GenericOrderEventStream:
         self._current_worker = current_worker
         self._event_logger = event_logger
         self._thread_factory = thread_factory
+        self._recoverable_orders_loader = recoverable_orders_loader
 
     def start(self) -> None:
         adapter = self._adapter_loader()
@@ -70,6 +72,9 @@ class GenericOrderEventStream:
             return
 
         try:
+            restore = getattr(adapter, "restore_order_groups", None)
+            if callable(restore):
+                restore(self._recoverable_orders_loader())
             start()
         except Exception:
             self._event_logger.error(

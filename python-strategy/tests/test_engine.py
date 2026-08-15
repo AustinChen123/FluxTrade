@@ -44,6 +44,9 @@ from src.core.strategy_command_dispatch_service import (
 )
 from src.core.daily_nav_snapshot import DailyNavSnapshotService
 from src.core.adapters.ccxt_adapter import CcxtExchangeAdapter
+from src.core.adapters.live_backpack import LiveBackpackAdapter
+from src.core.adapters.live_binance import LiveBinanceAdapter
+from src.core.adapters.live_bybit import LiveBybitAdapter
 from src.core.adapters.rithmic_adapter import (
     RithmicExchangeAdapter,
     RithmicUnmappedOrderEvent,
@@ -1340,6 +1343,138 @@ class TestEngineInit:
         engine._resume_after_kill_switch()
 
         assert engine._entry_signal_allowed_for_processor(entry_signal) is False
+
+    @pytest.mark.parametrize(
+        ("adapter_type", "exchange_id"),
+        (
+            (LiveBinanceAdapter, "binance"),
+            (LiveBackpackAdapter, "backpack"),
+            (LiveBybitAdapter, "bybit"),
+        ),
+    )
+    def test_live_ccxt_stream_restores_alias_before_immediate_fill(
+        self,
+        engine_factory,
+        signal_factory,
+        adapter_type,
+        exchange_id,
+    ):
+        engine = engine_factory(audit_external_orders=True)
+        order_id = engine.execution_engine.execute_signal(
+            signal_factory(
+                price=Decimal("42000"),
+                quantity=Decimal("0.50"),
+                stop_loss=Decimal("41000"),
+                take_profit=Decimal("43000"),
+            )
+        )
+        repo = engine.execution_engine.order_manager.repo
+        entry = repo.get_order(order_id)
+        assert entry is not None
+        entry.exchange_order_id = None
+        entry.exchange_id = exchange_id.upper()
+        entry.status = OrderStatus.SUBMITTED_UNCONFIRMED.value
+        conditionals = [
+            order
+            for order in repo.orders.values()
+            if order.type in {"stop_loss", "take_profit"}
+        ]
+        assert len(conditionals) == 2
+
+        original = object.__new__(adapter_type)
+        original.exchange_id = exchange_id
+        original._client_order_aliases = {}
+        original._client_order_alias_lock = threading.Lock()
+        restarted = object.__new__(adapter_type)
+        restarted.exchange_id = exchange_id
+        restarted._client_order_aliases = {}
+        restarted._client_order_alias_lock = threading.Lock()
+        provider_id = original._exchange_client_order_id(entry.client_order_id)
+        submitted_protection_ids: list[str] = []
+
+        def place_order(order):
+            order.exchange_order_id = f"PROTECTION-{order.id}"
+            submitted_protection_ids.append(order.id)
+            return order.exchange_order_id
+
+        event = ExchangeOrderEvent(
+            status="open",
+            product_id=entry.product_id,
+            client_order_id=provider_id,
+            exchange_order_id="PROVIDER-ENTRY",
+            cumulative_filled_quantity=Decimal("0.25"),
+            cumulative_average_price=Decimal("42000"),
+            fee=Decimal("0.08"),
+            fee_asset="USDC",
+            event_timestamp=1704067200001,
+        )
+        poll_count = 0
+
+        def poll_order_event():
+            nonlocal poll_count
+            poll_count += 1
+            if poll_count == 1:
+                return ExchangeOrderEvent(
+                    **{
+                        **event.__dict__,
+                        "client_order_id": restarted._canonical_client_order_id(
+                            provider_id
+                        ),
+                    }
+                )
+            engine._order_event_stop.set()
+            return None
+
+        restarted.start_order_event_stream = MagicMock()
+        restarted.poll_order_event = MagicMock(side_effect=poll_order_event)
+        restarted.validate_order_group = MagicMock()
+        restarted.supports_atomic_order_group = MagicMock(return_value=False)
+        restarted.get_order_by_client_id = MagicMock(return_value=None)
+        restarted.place_order = MagicMock(side_effect=place_order)
+        engine.execution_engine.adapter = restarted
+        engine.execution_engine._conditional_order_lifecycle._adapter = restarted
+        engine.execution_engine.order_manager.update_position_script = MagicMock()
+        engine.execution_engine.latch_order_event_stream_failure = MagicMock(
+            wraps=engine.execution_engine.latch_order_event_stream_failure
+        )
+        process_errors: list[Exception] = []
+
+        def process_event(value):
+            try:
+                return engine.execution_engine.process_exchange_order_event(value)
+            except Exception as error:
+                process_errors.append(error)
+                raise
+
+        engine._generic_order_event_stream._process_event = process_event
+
+        engine._start_exchange_order_event_stream()
+        assert engine._stop_exchange_order_event_stream(timeout=1.0)
+
+        assert (
+            restarted._canonical_client_order_id(provider_id) == entry.client_order_id
+        )
+        assert process_errors == []
+        assert engine.execution_engine.latch_order_event_stream_failure.call_count == 0
+        assert len(repo.trades) == 1
+        assert repo.trades[0].fee == Decimal("0.08")
+        assert repo.trades[0].fee_asset == "USDC"
+        assert sorted(submitted_protection_ids) == sorted(
+            order.id for order in conditionals
+        )
+
+        replay = ExchangeOrderEvent(
+            **{
+                **event.__dict__,
+                "client_order_id": restarted._canonical_client_order_id(provider_id),
+            }
+        )
+        assert (
+            engine.execution_engine.process_exchange_order_event(replay)["action"]
+            == "applied"
+        )
+        assert len(repo.trades) == 1
+        assert len(submitted_protection_ids) == 2
 
     @pytest.mark.parametrize("failure_owner", ["balance", "position"])
     def test_runtime_balance_failure_preserves_fill_protection_and_exit_path(
