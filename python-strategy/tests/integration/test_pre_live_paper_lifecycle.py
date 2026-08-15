@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from datetime import UTC, datetime, time as wall_time, timedelta
 from decimal import Decimal
+from unittest.mock import MagicMock
 from zoneinfo import ZoneInfo
 
 import pytest
@@ -201,6 +202,19 @@ def test_paper_lifecycle_rejects_non_mnq_instrument_before_creating_workspace(
     assert not workspace.exists()
 
 
+def test_paper_lifecycle_requires_exactly_one_hard_flat_signal(tmp_path) -> None:
+    strategy = HardFlatProbeStrategy(STRATEGY_ID, PRODUCT_ID)
+    object.__setattr__(strategy, "on_candle", MagicMock(return_value=[]))
+
+    with pytest.raises(TypeError, match="must return exactly one Signal"):
+        run_paper_lifecycle(
+            tmp_path,
+            product_id=PRODUCT_ID,
+            strategy_id=STRATEGY_ID,
+            hard_flat_strategy_factory=lambda: strategy,
+        )
+
+
 def test_portfolio_paper_lifecycle_preserves_sleeve_ownership_and_finishes_flat(
     tmp_path,
 ):
@@ -227,9 +241,7 @@ def test_portfolio_paper_lifecycle_preserves_sleeve_ownership_and_finishes_flat(
         assert scenario.final_position_count == 0
         assert scenario.final_working_order_count == 0
         assert scenario.orders
-        assert {
-            order.strategy_id for order in scenario.orders
-        } <= {
+        assert {order.strategy_id for order in scenario.orders} <= {
             "paper_portfolio.sleeve_a",
             "paper_portfolio.sleeve_b",
         }
@@ -245,9 +257,7 @@ def test_portfolio_paper_lifecycle_preserves_sleeve_ownership_and_finishes_flat(
         "paper_portfolio.sleeve_b",
     }
     assert {
-        order.status
-        for order in working_restart.orders
-        if order.order_type == "limit"
+        order.status for order in working_restart.orders if order.order_type == "limit"
     } == {"CANCELLED"}
 
     hard_flat = report.scenarios[-1]

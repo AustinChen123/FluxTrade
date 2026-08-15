@@ -264,6 +264,8 @@ def _run_hard_flat_scenario(
     if not strategy.sync_position_state("LONG"):
         raise AssertionError("hard-flat strategy rejected authoritative LONG state")
     exit_signal = strategy.on_candle(decision_bar)
+    if not isinstance(exit_signal, Signal):
+        raise TypeError("hard-flat strategy must return exactly one Signal")
     if exit_signal.type != SignalType.EXIT_LONG:
         raise AssertionError(
             "strategy did not emit EXIT_LONG at 16:40 ET decision time: "
@@ -330,8 +332,7 @@ def _session_factory(
         if isinstance(strategy_ids, str):
             strategy_ids = (strategy_ids,)
         session.add_all(
-            Strategy(id=strategy_id, name=strategy_id)
-            for strategy_id in strategy_ids
+            Strategy(id=strategy_id, name=strategy_id) for strategy_id in strategy_ids
         )
         session.commit()
     return factory
@@ -455,11 +456,7 @@ def _assert_position(
     quantity: Decimal = Decimal("1"),
 ) -> None:
     position = adapter.get_position(product_id, strategy_id=strategy_id)
-    if (
-        position is None
-        or position.side.value != side
-        or position.quantity != quantity
-    ):
+    if position is None or position.side.value != side or position.quantity != quantity:
         raise AssertionError(f"unexpected paper position: {position}")
 
 
@@ -474,8 +471,7 @@ def _assert_working_protection(
     quantities = {Decimal(str(order.quantity)) for order in orders}
     if types != {"stop_loss", "take_profit"} or quantities != {quantity}:
         raise AssertionError(
-            "paper protection is incomplete: "
-            f"types={types} quantities={quantities}"
+            f"paper protection is incomplete: types={types} quantities={quantities}"
         )
 
 
@@ -516,9 +512,7 @@ def _finalize_report(
             session.scalars(select(Trade).order_by(Trade.timestamp, Trade.id))
         )
     order_types = {str(order.id): str(order.type) for order in orders}
-    order_strategy_ids = {
-        str(order.id): str(order.strategy_id) for order in orders
-    }
+    order_strategy_ids = {str(order.id): str(order.strategy_id) for order in orders}
     order_evidence = tuple(_order_evidence(order) for order in orders)
     fill_evidence = tuple(
         PaperFillEvidence(
@@ -543,9 +537,7 @@ def _finalize_report(
         final_verification_blocked_count=int(
             final_reconcile["verification_blocked_count"]
         ),
-        final_position_count=sum(
-            position is not None for position in positions
-        ),
+        final_position_count=sum(position is not None for position in positions),
         final_working_order_count=len(working),
         order_statuses=tuple((order.type, order.status) for order in orders),
         orders=order_evidence,

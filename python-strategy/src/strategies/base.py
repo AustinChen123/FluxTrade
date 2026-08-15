@@ -6,11 +6,13 @@ from src.core.models import Candlestick, Signal, Trade
 from src.core.journal import StrategyJournal
 from src.core.strategy_context import StrategyContext
 
+
 @dataclass
 class StrategyRequirements:
     product_id: str
     timeframe: str
     lookback_window: int
+
 
 class BaseStrategy(ABC):
     def __init__(self, strategy_id: str, product_id: str):
@@ -27,7 +29,11 @@ class BaseStrategy(ABC):
         pass
 
     @abstractmethod
-    def on_candle(self, candle: Candlestick, context: StrategyContext | None = None) -> Signal:
+    def on_candle(
+        self,
+        candle: Candlestick,
+        context: StrategyContext | None = None,
+    ) -> Signal | list[Signal] | None:
         """
         Process a new candlestick and optionally return a trading signal.
 

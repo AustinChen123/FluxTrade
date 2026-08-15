@@ -7,7 +7,7 @@ from unittest.mock import MagicMock, sentinel
 
 import pytest
 
-from src.core.models import Candlestick, Signal, SignalType, Trade
+from src.core.models import Candlestick, OrderSide, Signal, SignalType, Trade
 from src.core.portfolio_runtime import (
     PortfolioCoordinator,
     PortfolioDecisionRejected,
@@ -17,6 +17,7 @@ from src.core.portfolio_runtime import (
     PortfolioSleeve,
 )
 from src.core.signal_processor import SignalObserverError, SignalProcessor
+from src.core.strategy_context import StrategyContext
 from src.core.strategy_registry import StrategyRegistry
 from src.strategies.base import BaseStrategy, StrategyRequirements
 
@@ -27,10 +28,10 @@ class DummyStrategy(BaseStrategy):
         strategy_id: str,
         product_id: str = "BINANCE:BTCUSDT-PERP",
         timeframe: str = "1m",
-        result=None,
-        trade_result=None,
+        result: Signal | list[Signal] | None = None,
+        trade_result: Signal | None = None,
         should_raise: bool = False,
-    ):
+    ) -> None:
         super().__init__(strategy_id, product_id)
         self._timeframe = timeframe
         self.result = result
@@ -43,13 +44,17 @@ class DummyStrategy(BaseStrategy):
     def requirements(self) -> StrategyRequirements:
         return StrategyRequirements(self.product_id, self._timeframe, 10)
 
-    def on_candle(self, candle: Candlestick):
+    def on_candle(
+        self,
+        candle: Candlestick,
+        context: StrategyContext | None = None,
+    ) -> Signal | list[Signal] | None:
         self.candles_received.append(candle)
         if self.should_raise:
             raise RuntimeError("strategy failed")
         return self.result
 
-    def on_trade(self, trade: Trade):
+    def on_trade(self, trade: Trade) -> Signal | None:
         self.trades_received.append(trade)
         if self.should_raise:
             raise RuntimeError("strategy failed")
@@ -63,12 +68,16 @@ class DummyStrategy(BaseStrategy):
 
 
 class StatefulEntryStrategy(DummyStrategy):
-    def __init__(self, strategy_id: str):
+    def __init__(self, strategy_id: str) -> None:
         super().__init__(strategy_id)
         self._in_position = False
         self.restore_calls = 0
 
-    def on_candle(self, candle: Candlestick):
+    def on_candle(
+        self,
+        candle: Candlestick,
+        context: StrategyContext | None = None,
+    ) -> Signal:
         self.candles_received.append(candle)
         signal_type = SignalType.NO_SIGNAL
         if not self._in_position:
@@ -130,7 +139,7 @@ def make_trade(
         product_id=product_id,
         price=Decimal("42200"),
         quantity=Decimal("0.1"),
-        side="buy",
+        side=OrderSide.BUY,
         timestamp=1704067200000,
     )
 
@@ -720,8 +729,7 @@ def test_portfolio_crash_replay_does_not_double_count_persisted_intent() -> None
     }
     assert handler.call_count == 2
     assert {
-        call.args[0].metadata["client_order_id"]
-        for call in handler.call_args_list
+        call.args[0].metadata["client_order_id"] for call in handler.call_args_list
     } == set(observed_requested_intents)
 
 
@@ -746,8 +754,11 @@ def test_portfolio_trade_signals_fail_before_any_submission(
         )
         for index, signal_type in enumerate(signal_types)
     )
+    on_trade_mocks: list[MagicMock] = []
     for strategy in strategies:
-        strategy.on_trade = MagicMock(return_value=strategy.trade_result)
+        on_trade = MagicMock(return_value=strategy.trade_result)
+        object.__setattr__(strategy, "on_trade", on_trade)
+        on_trade_mocks.append(on_trade)
     registry = StrategyRegistry()
     for strategy in strategies:
         registry.register(strategy)
@@ -756,9 +767,7 @@ def test_portfolio_trade_signals_fail_before_any_submission(
         PortfolioDefinition(
             portfolio_id="portfolio_v1",
             product_id=strategies[0].product_id,
-            sleeves=tuple(
-                PortfolioSleeve(strategy) for strategy in strategies
-            ),
+            sleeves=tuple(PortfolioSleeve(strategy) for strategy in strategies),
             max_gross_quantity=max_gross_quantity,
         )
     )
@@ -779,8 +788,8 @@ def test_portfolio_trade_signals_fail_before_any_submission(
         processor.on_trade(make_trade())
 
     handler.assert_not_called()
-    for strategy in strategies:
-        strategy.on_trade.assert_not_called()
+    for on_trade in on_trade_mocks:
+        on_trade.assert_not_called()
 
 
 def test_warm_up_routes_target_strategy_without_emitting_signals() -> None:
@@ -804,12 +813,16 @@ def test_warm_up_routes_target_strategy_without_emitting_signals() -> None:
 
 def test_warm_up_restores_trade_state_after_dropped_signals() -> None:
     class StatefulStrategy(DummyStrategy):
-        def __init__(self):
+        def __init__(self) -> None:
             super().__init__("s1")
             self.position = 0
             self._in_position = False
 
-        def on_candle(self, candle: Candlestick):
+        def on_candle(
+            self,
+            candle: Candlestick,
+            context: StrategyContext | None = None,
+        ) -> Signal:
             self.candles_received.append(candle)
             self.position = 1
             self._in_position = True
@@ -831,12 +844,16 @@ def test_warm_up_restores_trade_state_after_dropped_signals() -> None:
 
 def test_warm_up_failure_restores_trade_state_and_propagates() -> None:
     class FailingWarmupStrategy(DummyStrategy):
-        def __init__(self):
+        def __init__(self) -> None:
             super().__init__("s1")
             self.position = 0
             self._in_position = False
 
-        def on_candle(self, candle: Candlestick):
+        def on_candle(
+            self,
+            candle: Candlestick,
+            context: StrategyContext | None = None,
+        ) -> Signal:
             self.candles_received.append(candle)
             self.position = 1
             self._in_position = True
@@ -914,7 +931,7 @@ def test_on_candle_syncs_strategy_only_when_authoritative_side_changes() -> None
     registry = StrategyRegistry()
     registry.register(strategy)
     position = MagicMock(side="LONG")
-    current_position = [position]
+    current_position: list[MagicMock | None] = [position]
     processor = SignalProcessor(
         registry,
         MagicMock(),
@@ -948,7 +965,11 @@ class _HookTrueStrategy(BaseStrategy):
     def requirements(self) -> StrategyRequirements:
         return StrategyRequirements(self.product_id, "1m", 1)
 
-    def on_candle(self, candle):
+    def on_candle(
+        self,
+        candle: Candlestick,
+        context: StrategyContext | None = None,
+    ) -> None:
         return None
 
     def sync_position_state(self, position_side: str | None) -> bool:
@@ -966,7 +987,11 @@ class _HookFalseStrategy(BaseStrategy):
     def requirements(self) -> StrategyRequirements:
         return StrategyRequirements(self.product_id, "1m", 1)
 
-    def on_candle(self, candle):
+    def on_candle(
+        self,
+        candle: Candlestick,
+        context: StrategyContext | None = None,
+    ) -> None:
         return None
 
     def sync_position_state(self, position_side: str | None) -> bool:
@@ -980,13 +1005,18 @@ class _HookNoneFullStrategy(BaseStrategy):
         super().__init__("hook_none_full", "BINANCE:BTCUSDT-PERP")
         self.position = 99
         self._in_position = _SENTINEL
+
     # sync_position_state NOT overridden → BaseStrategy.sync_position_state → None
 
     @property
     def requirements(self) -> StrategyRequirements:
         return StrategyRequirements(self.product_id, "1m", 1)
 
-    def on_candle(self, candle):
+    def on_candle(
+        self,
+        candle: Candlestick,
+        context: StrategyContext | None = None,
+    ) -> None:
         return None
 
 
@@ -996,13 +1026,18 @@ class _InPositionOnlyStrategy(BaseStrategy):
     def __init__(self):
         super().__init__("in_pos_only", "BINANCE:BTCUSDT-PERP")
         self._in_position = _SENTINEL
+
     # sync_position_state NOT overridden → None
 
     @property
     def requirements(self) -> StrategyRequirements:
         return StrategyRequirements(self.product_id, "1m", 1)
 
-    def on_candle(self, candle):
+    def on_candle(
+        self,
+        candle: Candlestick,
+        context: StrategyContext | None = None,
+    ) -> None:
         return None
 
 
@@ -1016,7 +1051,11 @@ class _NoAttrsStrategy(BaseStrategy):
     def requirements(self) -> StrategyRequirements:
         return StrategyRequirements(self.product_id, "1m", 1)
 
-    def on_candle(self, candle):
+    def on_candle(
+        self,
+        candle: Candlestick,
+        context: StrategyContext | None = None,
+    ) -> None:
         return None
 
 
@@ -1100,9 +1139,10 @@ def test_set_position_state_decision_matrix(
 
     assert result is expected_result
     for attr, expected_val in checks.items():
-        assert getattr(strategy, attr) is expected_val or getattr(strategy, attr) == expected_val, (
-            f"{attr}: expected {expected_val!r}, got {getattr(strategy, attr)!r}"
-        )
+        assert (
+            getattr(strategy, attr) is expected_val
+            or getattr(strategy, attr) == expected_val
+        ), f"{attr}: expected {expected_val!r}, got {getattr(strategy, attr)!r}"
 
 
 def test_on_candle_skips_timeframe_mismatch() -> None:
@@ -1350,9 +1390,10 @@ def test_market_signal_id_is_stable_when_pending_trade_is_replayed() -> None:
 
     first_signal = signal_handler.call_args_list[0].args[0]
     second_signal = signal_handler.call_args_list[1].args[0]
-    assert first_signal.metadata["client_order_id"] == second_signal.metadata[
-        "client_order_id"
-    ]
+    assert (
+        first_signal.metadata["client_order_id"]
+        == second_signal.metadata["client_order_id"]
+    )
 
 
 @pytest.mark.parametrize(
@@ -1372,9 +1413,7 @@ def test_trade_without_stable_identity_fails_before_strategy_dispatch(
     strategy = DummyStrategy("s1", trade_result=make_signal("s1"))
     registry = StrategyRegistry()
     registry.register(strategy)
-    trade = make_trade().model_copy(
-        update={"id": trade_id, "timestamp": timestamp}
-    )
+    trade = make_trade().model_copy(update={"id": trade_id, "timestamp": timestamp})
 
     with pytest.raises(ValueError, match="stable id and positive timestamp"):
         SignalProcessor(registry, MagicMock()).on_trade(trade)
@@ -1388,9 +1427,16 @@ def test_dispatch_normalizes_none_signal_and_list() -> None:
     single = make_signal()
     multiple = [make_signal("s1"), make_signal("s1", SignalType.SHORT)]
 
-    assert processor._dispatch_to_strategy(DummyStrategy("s1", result=None), candle) == []
-    assert processor._dispatch_to_strategy(DummyStrategy("s1", result=single), candle) == [single]
-    assert processor._dispatch_to_strategy(DummyStrategy("s1", result=multiple), candle) == multiple
+    assert (
+        processor._dispatch_to_strategy(DummyStrategy("s1", result=None), candle) == []
+    )
+    assert processor._dispatch_to_strategy(
+        DummyStrategy("s1", result=single), candle
+    ) == [single]
+    assert (
+        processor._dispatch_to_strategy(DummyStrategy("s1", result=multiple), candle)
+        == multiple
+    )
 
 
 def test_process_signals_skips_no_signal() -> None:
@@ -1418,7 +1464,9 @@ def test_process_signals_executes_multiple_actionable_signals() -> None:
 def test_process_signals_uses_signal_handler_when_provided() -> None:
     execution = MagicMock()
     signal_handler = MagicMock()
-    processor = SignalProcessor(StrategyRegistry(), execution, signal_handler=signal_handler)
+    processor = SignalProcessor(
+        StrategyRegistry(), execution, signal_handler=signal_handler
+    )
     candle = make_candle()
     signal = make_signal("s1", SignalType.LONG)
 
@@ -1682,9 +1730,10 @@ def test_market_signal_id_is_stable_when_pending_candle_is_replayed() -> None:
 
     first_signal = signal_handler.call_args_list[0].args[0]
     second_signal = signal_handler.call_args_list[1].args[0]
-    assert first_signal.metadata["client_order_id"] == second_signal.metadata[
-        "client_order_id"
-    ]
+    assert (
+        first_signal.metadata["client_order_id"]
+        == second_signal.metadata["client_order_id"]
+    )
 
 
 def test_pending_candle_replay_overrides_strategy_client_order_id() -> None:
@@ -1711,13 +1760,11 @@ def test_pending_candle_replay_overrides_strategy_client_order_id() -> None:
         ordinal=0,
     )
 
-    assert first_replay.metadata["client_order_id"] == second_replay.metadata[
-        "client_order_id"
-    ]
-    assert first_replay.metadata["client_order_id"] != "strategy-attempt-1"
-    assert first_replay.metadata["requested_client_order_id"] == (
-        "strategy-attempt-1"
-    )
-    assert second_replay.metadata["requested_client_order_id"] == (
-        "strategy-attempt-2"
-    )
+    first_metadata = first_replay.metadata
+    second_metadata = second_replay.metadata
+    assert first_metadata is not None
+    assert second_metadata is not None
+    assert first_metadata["client_order_id"] == second_metadata["client_order_id"]
+    assert first_metadata["client_order_id"] != "strategy-attempt-1"
+    assert first_metadata["requested_client_order_id"] == "strategy-attempt-1"
+    assert second_metadata["requested_client_order_id"] == "strategy-attempt-2"
