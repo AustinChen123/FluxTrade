@@ -9,6 +9,17 @@ import pytest
 _REPOSITORY_ROOT = Path(__file__).parents[2]
 _PYTHON_ROOT = _REPOSITORY_ROOT / "python-strategy"
 _ADAPTER_PACKAGE = "src.core.adapters"
+_PORT_PACKAGE = "src.core.interfaces"
+_FORBIDDEN_PORT_IMPORT_ROOTS = ("sqlalchemy", "src.core.orm_models")
+_LEGACY_PORT_ORM_IMPORTS = frozenset(
+    {
+        ("src.core.interfaces.exchange", "src.core.orm_models.Order"),
+        ("src.core.interfaces.repository", "sqlalchemy.orm.Session"),
+        ("src.core.interfaces.repository", "src.core.orm_models.Order"),
+        ("src.core.interfaces.repository", "src.core.orm_models.Position"),
+        ("src.core.interfaces.repository", "src.core.orm_models.Trade"),
+    }
+)
 _LEGACY_PROVIDER_IMPORTS = frozenset(
     {
         (
@@ -203,6 +214,43 @@ def _provider_pairs(
     return frozenset(pairs)
 
 
+def _port_orm_pairs(
+    sources: dict[str, str],
+    *,
+    package_modules: frozenset[str] = frozenset(),
+) -> frozenset[tuple[str, str]]:
+    tracked_modules = frozenset(sources)
+    pairs: set[tuple[str, str]] = set()
+    for importer, source in sources.items():
+        if importer != _PORT_PACKAGE and not importer.startswith(f"{_PORT_PACKAGE}."):
+            continue
+        tree = ast.parse(source)
+        imported: set[str] = set()
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Import):
+                imported.update(alias.name for alias in node.names)
+            elif isinstance(node, ast.ImportFrom):
+                base = _resolve_from(importer, node, package_modules)
+                base_is_forbidden = any(
+                    base == root or base.startswith(f"{root}.")
+                    for root in _FORBIDDEN_PORT_IMPORT_ROOTS
+                )
+                for alias in node.names:
+                    target = f"{base}.{alias.name}" if base else alias.name
+                    if target in tracked_modules or base_is_forbidden:
+                        imported.add(target)
+        imported.update(_dynamic_imports(tree))
+        pairs.update(
+            (importer, target)
+            for target in imported
+            if any(
+                target == root or target.startswith(f"{root}.")
+                for root in _FORBIDDEN_PORT_IMPORT_ROOTS
+            )
+        )
+    return frozenset(pairs)
+
+
 def test_tracked_production_provider_imports_match_exact_baseline() -> None:
     sources, packages = _tracked_production_sources()
     assert (
@@ -212,6 +260,59 @@ def test_tracked_production_provider_imports_match_exact_baseline() -> None:
         )
         == _LEGACY_PROVIDER_IMPORTS
     )
+
+
+def test_tracked_production_orm_free_port_imports_match_exact_baseline() -> None:
+    sources, packages = _tracked_production_sources()
+    assert (
+        _port_orm_pairs(sources, package_modules=packages) == _LEGACY_PORT_ORM_IMPORTS
+    )
+
+
+@pytest.mark.parametrize(
+    ("source", "expected"),
+    [
+        ("import sqlalchemy", "sqlalchemy"),
+        ("import sqlalchemy.orm as orm", "sqlalchemy.orm"),
+        ("from sqlalchemy.orm import Session", "sqlalchemy.orm.Session"),
+        (
+            "from src.core.orm_models import StrategyState",
+            "src.core.orm_models.StrategyState",
+        ),
+        ("from src.core import orm_models", "src.core.orm_models"),
+        ("from .. import orm_models", "src.core.orm_models"),
+        (
+            'from importlib import import_module\nimport_module("sqlalchemy.orm")',
+            "sqlalchemy.orm",
+        ),
+        ('__import__("src.core.orm_models")', "src.core.orm_models"),
+    ],
+)
+def test_orm_free_port_import_forms_cannot_bypass_ratchet(
+    source: str,
+    expected: str,
+) -> None:
+    importer = "src.core.interfaces.new_port"
+    sources = {
+        importer: source,
+        "src.core.orm_models": "",
+    }
+    pair = (importer, expected)
+    assert pair in _port_orm_pairs(sources)
+    assert pair not in _LEGACY_PORT_ORM_IMPORTS
+
+
+def test_orm_free_port_package_relative_import_anchors_at_package() -> None:
+    pair = ("src.core.interfaces", "src.core.orm_models")
+    sources = {
+        "src.core.interfaces": "from .. import orm_models",
+        "src.core.orm_models": "",
+    }
+    assert pair in _port_orm_pairs(
+        sources,
+        package_modules=frozenset({"src.core.interfaces"}),
+    )
+    assert pair not in _LEGACY_PORT_ORM_IMPORTS
 
 
 @pytest.mark.parametrize(
