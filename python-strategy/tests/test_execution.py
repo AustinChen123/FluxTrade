@@ -1014,7 +1014,7 @@ def test_portfolio_exposure_snapshot_is_fenced_with_fill_application(
     mock_order_repo,
 ):
     product_id = "BINANCE:BTCUSDT-PERP"
-    state = {"position": None}
+    state: dict[str, Position | None] = {"position": None}
     working_order = SimpleNamespace(
         id="entry",
         strategy_id="sleeve",
@@ -1777,6 +1777,7 @@ class TestExecutionTradingRules:
                 stop_loss=Decimal("19998.25"),
             )
         )
+        assert entry_id is not None
         stop = next(
             order for order in mock_order_repo.orders.values() if order.type == "stop_loss"
         )
@@ -1871,6 +1872,7 @@ class TestExecutionTradingRules:
                 stop_loss=Decimal("19998.25"),
             )
         )
+        assert entry_id is not None
         stop = next(
             order for order in mock_order_repo.orders.values() if order.type == "stop_loss"
         )
@@ -2148,6 +2150,7 @@ class TestExecutionTradingRules:
                 stop_loss=Decimal("19998.25"),
             )
         )
+        assert entry_id is not None
         stop = next(
             order for order in mock_order_repo.orders.values() if order.type == "stop_loss"
         )
@@ -2513,7 +2516,7 @@ class TestLiveOrderEventSync:
             return
 
         assert callback is not None
-        assert callback.__self__ is engine
+        assert getattr(callback, "__self__", None) is engine
         order = SimpleNamespace(id="order-1")
         event = ExchangeOrderEvent(status="filled", product_id="TEST:PRODUCT")
         callback(order, event, Decimal("10"), Decimal("2"))
@@ -3497,12 +3500,16 @@ class TestLiveOrderEventSync:
         mock_exchange_adapter.get_order_by_client_id = MagicMock(return_value=snapshot)
 
         payload = engine.resync_recoverable_order_events()
+        results = payload["results"]
+        assert isinstance(results, list)
+        result = results[0]
+        assert isinstance(result, dict)
 
         assert payload["recoverable_count"] == 1
         assert payload["applied_count"] == 0
         assert payload["unresolved_count"] == 1
         assert payload["verification_blocked_count"] == 0
-        assert payload["results"][0]["action"] == expected_action
+        assert result["action"] == expected_action
         assert order.status == OrderStatus.PARTIALLY_FILLED.value
         assert order.filled_quantity == Decimal("0.04")
         assert mock_order_repo.trades == []
@@ -3536,13 +3543,17 @@ class TestLiveOrderEventSync:
         )
 
         payload = engine.resync_recoverable_order_events()
+        results = payload["results"]
+        assert isinstance(results, list)
+        result = results[0]
+        assert isinstance(result, dict)
 
         assert payload["recoverable_count"] == 1
         assert payload["applied_count"] == 0
         assert payload["unresolved_count"] == 0
         assert payload["verification_blocked_count"] == 1
-        assert payload["results"][0]["action"] == "unknown_status"
-        assert payload["results"][0]["verification_blocked"] is True
+        assert result["action"] == "unknown_status"
+        assert result["verification_blocked"] is True
         assert order.status == OrderStatus.SUBMITTED.value
         assert mock_order_repo.trades == []
 
@@ -3582,12 +3593,16 @@ class TestLiveOrderEventSync:
             mock_exchange_adapter.get_order_by_client_id = MagicMock(return_value=lookup_result)
 
         payload = engine.resync_recoverable_order_events()
+        results = payload["results"]
+        assert isinstance(results, list)
+        result = results[0]
+        assert isinstance(result, dict)
 
         assert payload["recoverable_count"] == 1
         assert payload["applied_count"] == 0
         assert payload["unresolved_count"] == 0
         assert payload["verification_blocked_count"] == 1
-        assert payload["results"][0]["action"] == expected_action
+        assert result["action"] == expected_action
         assert order.status == OrderStatus.SUBMITTED.value
         assert mock_order_repo.trades == []
 
@@ -4464,13 +4479,17 @@ class TestAuditedExecution:
                 cumulative_average_price=entry.price,
             )
         )
+        failures = result["failures"]
+        assert isinstance(failures, list)
+        for failure in failures:
+            assert isinstance(failure, dict)
 
         assert result["action"] == "unresolved_conditional_order_placement_failed"
         assert {
-            failure["reason"] for failure in result["failures"]
+            failure["reason"] for failure in failures
         } == {"conditional_order_resize_required_after_entry_fill"}
         assert {
-            failure["required_quantity"] for failure in result["failures"]
+            failure["required_quantity"] for failure in failures
         } == {"0.10"}
 
     def test_entry_fill_reports_unresolved_when_protective_order_placement_fails(
@@ -4505,6 +4524,10 @@ class TestAuditedExecution:
                 cumulative_average_price=entry.price,
             )
         )
+        failures = result["failures"]
+        assert isinstance(failures, list)
+        failure = failures[0]
+        assert isinstance(failure, dict)
 
         stop_loss = next(
             order for order in mock_order_repo.orders.values() if order.type == "stop_loss"
@@ -4513,7 +4536,7 @@ class TestAuditedExecution:
             order for order in mock_order_repo.orders.values() if order.type == "take_profit"
         )
         assert result["action"] == "unresolved_conditional_order_placement_failed"
-        assert result["failures"][0]["order_id"] == stop_loss.id
+        assert failure["order_id"] == stop_loss.id
         assert stop_loss.status == "failed"
         assert take_profit.status == OrderStatus.SUBMITTED.value
         event = next(
@@ -4790,9 +4813,11 @@ class TestAuditedExecution:
                 cumulative_average_price=stop_loss.trigger_price,
             )
         )
+        failure = result["failure"]
+        assert isinstance(failure, dict)
 
         assert result["action"] == "unresolved_linked_conditional_cancel_failed"
-        assert result["failure"]["order_id"] == take_profit.id
+        assert failure["order_id"] == take_profit.id
         assert take_profit.status == OrderStatus.SUBMITTED.value
         event = next(
             call.args[0]
@@ -5015,9 +5040,13 @@ class TestAuditedExecution:
 
         first = engine.process_exchange_order_event(fill_event)
         replay = engine.process_exchange_order_event(fill_event)
+        failures = first["failures"]
+        assert isinstance(failures, list)
+        failure = failures[0]
+        assert isinstance(failure, dict)
 
         assert first["action"] == "unresolved_conditional_order_placement_failed"
-        assert first["failures"][0]["reason"] == (
+        assert failure["reason"] == (
             "verification_blocked_order_snapshot_missing"
         )
         assert replay["action"] == "applied"
@@ -5077,14 +5106,19 @@ class TestAuditedExecution:
                 cumulative_average_price=entry.price,
             )
         )
+        failures = result["failures"]
+        assert isinstance(failures, list)
+        for failure in failures:
+            assert isinstance(failure, dict)
 
         assert result["action"] == "unresolved_conditional_order_placement_failed"
         assert {
-            failure["reason"] for failure in result["failures"]
+            failure["reason"] for failure in failures
         } == {"conditional_order_resize_required_after_entry_fill"}
-        assert result["failures"][0]["order_id"] == stop_loss.id
-        assert result["failures"][0]["current_quantity"] == "0.01"
-        assert result["failures"][0]["required_quantity"] == "0.02"
+        failure = failures[0]
+        assert failure["order_id"] == stop_loss.id
+        assert failure["current_quantity"] == "0.01"
+        assert failure["required_quantity"] == "0.02"
         assert stop_loss.status == OrderStatus.SUBMITTED.value
         assert take_profit.status == OrderStatus.SUBMITTED.value
         assert take_profit.quantity == Decimal("0.02")
@@ -7538,6 +7572,7 @@ class TestCancelOrder:
                 take_profit=Decimal("43000"),
             )
         )
+        assert order_id is not None
 
         assert engine.cancel_order(order_id) is True
 
@@ -7573,6 +7608,7 @@ class TestCancelOrder:
                 take_profit=Decimal("43000"),
             )
         )
+        assert order_id is not None
         entry = mock_order_repo.orders[order_id]
         entry.status = OrderStatus.CANCELLED.value
         mock_exchange_adapter.cancel_terminal_state_delivered_by_order_events = (
@@ -7613,6 +7649,7 @@ class TestCancelOrder:
                 take_profit=Decimal("43000"),
             )
         )
+        assert order_id is not None
         entry = mock_order_repo.orders[order_id]
         engine.order_manager.update_position_script = MagicMock()
         engine.order_manager.is_backtest = False
@@ -7704,6 +7741,7 @@ class TestCancelOrder:
                 take_profit=Decimal("43000"),
             )
         )
+        assert order_id is not None
         entry = mock_order_repo.orders[order_id]
         engine.order_manager.is_backtest = False
 
