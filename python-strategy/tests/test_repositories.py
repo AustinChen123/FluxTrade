@@ -58,9 +58,7 @@ class TestBacktestOrderRepositoryBasics:
     def test_initialization_custom_balance(self, mock_db_session):
         """Should accept custom initial balance."""
         repo = BacktestOrderRepository(
-            mock_db_session,
-            session_id=1,
-            initial_balance=Decimal("50000")
+            mock_db_session, session_id=1, initial_balance=Decimal("50000")
         )
 
         assert repo.balance == Decimal("50000")
@@ -115,8 +113,14 @@ class TestBacktestPositionDelegation:
         repo = BacktestOrderRepository(mock_db_session, session_id=1)
 
         # Should not raise and should not change balance
-        repo.update_position("test", "BINANCE:BTCUSDT-PERP", "buy",
-                             Decimal("1.0"), Decimal("42000"), "BUY")
+        repo.update_position(
+            "test",
+            "BINANCE:BTCUSDT-PERP",
+            "buy",
+            Decimal("1.0"),
+            Decimal("42000"),
+            "BUY",
+        )
 
         assert repo.balance == Decimal("10000")
         mock_db_session.add.assert_not_called()
@@ -208,10 +212,7 @@ class TestBacktestTradeLogging:
                 )
             )
 
-        persisted = [
-            call.args[0]
-            for call in mock_db_session.add.call_args_list
-        ]
+        persisted = [call.args[0] for call in mock_db_session.add.call_args_list]
         assert [trade.fill_sequence for trade in persisted] == [0, 1]
 
     def test_failed_commit_does_not_consume_fill_sequence(
@@ -241,10 +242,7 @@ class TestBacktestTradeLogging:
             repo.add_trade(trade("failed"))
         repo.add_trade(trade("retry"))
 
-        persisted = [
-            call.args[0]
-            for call in mock_db_session.add.call_args_list
-        ]
+        persisted = [call.args[0] for call in mock_db_session.add.call_args_list]
         assert [item.fill_sequence for item in persisted] == [0, 0]
 
     def test_update_order_exchange_id(self, mock_db_session, order_factory):
@@ -392,6 +390,103 @@ class TestLiveOrderRepositoryBasics:
 
         assert repo.list_client_orders_by_statuses(set()) == []
 
+    @pytest.mark.parametrize(
+        ("exchange_id", "expected_ids"),
+        [
+            ("binance", ["current"]),
+            ("BINANCE", ["current"]),
+            ("bin", []),
+            ("binance ", []),
+            ("", []),
+            (None, ["current", "foreign"]),
+        ],
+    )
+    @pytest.mark.parametrize(
+        "status",
+        ["NEW", "SUBMITTED_UNCONFIRMED", "SUBMITTED", "PARTIALLY_FILLED"],
+    )
+    def test_order_status_queries_apply_exact_optional_venue_scope(
+        self,
+        sqlite_order_session_factory,
+        order_factory,
+        exchange_id,
+        expected_ids,
+        status,
+    ):
+        repo = LiveOrderRepository(db_session_factory=sqlite_order_session_factory)
+        repo.add_order(
+            order_factory(
+                order_id="current",
+                exchange_id="BINANCE",
+                client_order_id="current-client",
+                status=status,
+            )
+        )
+        repo.add_order(
+            order_factory(
+                order_id="foreign",
+                exchange_id="BYBIT",
+                product_id="BYBIT:BTCUSDT-PERP",
+                client_order_id="foreign-client",
+                status=status,
+            )
+        )
+
+        client_orders = repo.list_client_orders_by_statuses(
+            {status},
+            exchange_id=exchange_id,
+        )
+        all_orders = repo.list_orders_by_statuses(
+            {status},
+            exchange_id=exchange_id,
+        )
+
+        assert [order.id for order in client_orders] == expected_ids
+        assert [order.id for order in all_orders] == expected_ids
+
+    @pytest.mark.parametrize(
+        "status",
+        ["NEW", "SUBMITTED_UNCONFIRMED", "SUBMITTED", "PARTIALLY_FILLED"],
+    )
+    def test_in_memory_status_queries_apply_the_same_venue_scope(
+        self,
+        mock_order_repo,
+        order_factory,
+        status,
+    ):
+        mock_order_repo.add_order(
+            order_factory(
+                order_id="current",
+                exchange_id="BINANCE",
+                client_order_id="current-client",
+                status=status,
+            )
+        )
+        mock_order_repo.add_order(
+            order_factory(
+                order_id="foreign",
+                exchange_id="BYBIT",
+                product_id="BYBIT:BTCUSDT-PERP",
+                client_order_id="foreign-client",
+                status=status,
+            )
+        )
+
+        assert [
+            order.id
+            for order in mock_order_repo.list_client_orders_by_statuses(
+                {status},
+                exchange_id="binance",
+            )
+        ] == ["current"]
+        assert [
+            order.id
+            for order in mock_order_repo.list_orders_by_statuses(
+                {status},
+                exchange_id="BINANCE",
+            )
+        ] == ["current"]
+
     def test_add_trade_commits(
         self,
         sqlite_order_session_factory,
@@ -439,7 +534,6 @@ class TestLiveOrderRepositoryBasics:
 
 
 class TestLiveOrderRepositoryPositionUpdate:
-
     def test_buy_creates_new_position(self, sqlite_order_session_factory):
         """Buying when no position exists should create a new position."""
         repo = LiveOrderRepository(db_session_factory=sqlite_order_session_factory)

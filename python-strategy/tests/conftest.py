@@ -210,15 +210,36 @@ class MockOrderRepository(IOrderRepository):
             None,
         )
 
-    def list_client_orders_by_statuses(self, statuses: set[str]) -> list[Order]:
+    def list_client_orders_by_statuses(
+        self,
+        statuses: set[str],
+        exchange_id: str | None = None,
+    ) -> list[Order]:
         return [
             order
             for order in self.orders.values()
-            if order.client_order_id is not None and order.status in statuses
+            if order.client_order_id is not None
+            and order.status in statuses
+            and (
+                exchange_id is None
+                or str(order.exchange_id).casefold() == exchange_id.casefold()
+            )
         ]
 
-    def list_orders_by_statuses(self, statuses: set[str]) -> list[Order]:
-        return [order for order in self.orders.values() if order.status in statuses]
+    def list_orders_by_statuses(
+        self,
+        statuses: set[str],
+        exchange_id: str | None = None,
+    ) -> list[Order]:
+        return [
+            order
+            for order in self.orders.values()
+            if order.status in statuses
+            and (
+                exchange_id is None
+                or str(order.exchange_id).casefold() == exchange_id.casefold()
+            )
+        ]
 
     def add_trade(self, trade: ORMTrade) -> None:
         self.trades.append(trade)

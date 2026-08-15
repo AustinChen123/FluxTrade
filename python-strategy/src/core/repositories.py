@@ -4,6 +4,7 @@ from decimal import Decimal
 from threading import Lock
 from typing import Callable, ContextManager, Iterator, Optional
 
+from sqlalchemy import func
 from sqlalchemy.orm import Session
 
 from src.core.interfaces import IOrderRepository
@@ -64,24 +65,38 @@ class LiveOrderRepository(IOrderRepository):
                 query = query.filter_by(product_id=product_id)
             return query.first()
 
-    def list_client_orders_by_statuses(self, statuses: set[str]) -> list[Order]:
+    def list_client_orders_by_statuses(
+        self,
+        statuses: set[str],
+        exchange_id: str | None = None,
+    ) -> list[Order]:
         if not statuses:
             return []
         with self._db_session_factory() as db:
-            return (
-                db.query(Order)
-                .filter(
-                    Order.status.in_(statuses),
-                    Order.client_order_id.isnot(None),
-                )
-                .all()
+            query = db.query(Order).filter(
+                Order.status.in_(statuses),
+                Order.client_order_id.isnot(None),
             )
+            if exchange_id is not None:
+                query = query.filter(
+                    func.lower(Order.exchange_id) == exchange_id.casefold()
+                )
+            return query.all()
 
-    def list_orders_by_statuses(self, statuses: set[str]) -> list[Order]:
+    def list_orders_by_statuses(
+        self,
+        statuses: set[str],
+        exchange_id: str | None = None,
+    ) -> list[Order]:
         if not statuses:
             return []
         with self._db_session_factory() as db:
-            return db.query(Order).filter(Order.status.in_(statuses)).all()
+            query = db.query(Order).filter(Order.status.in_(statuses))
+            if exchange_id is not None:
+                query = query.filter(
+                    func.lower(Order.exchange_id) == exchange_id.casefold()
+                )
+            return query.all()
 
     def add_trade(self, trade: Trade) -> None:
         with self._db_session_factory() as db:
@@ -89,13 +104,15 @@ class LiveOrderRepository(IOrderRepository):
             db.add(trade)
             db.commit()
 
-    def get_position(self, strategy_id: str, product_id: str, side: str) -> Optional[Position]:
+    def get_position(
+        self, strategy_id: str, product_id: str, side: str
+    ) -> Optional[Position]:
         with self._db_session_factory() as db:
-            return db.query(Position).filter_by(
-                strategy_id=strategy_id,
-                product_id=product_id,
-                side=side
-            ).first()
+            return (
+                db.query(Position)
+                .filter_by(strategy_id=strategy_id, product_id=product_id, side=side)
+                .first()
+            )
 
     def update_position(
         self,
@@ -109,11 +126,14 @@ class LiveOrderRepository(IOrderRepository):
         # Use with_for_update for locking
         with self._db_session_factory() as db:
             ensure_product_registered(db, product_id)
-            position = db.query(Position).with_for_update().filter_by(
-                strategy_id=strategy_id,
-                product_id=product_id,
-                side=position_side
-            ).first()
+            position = (
+                db.query(Position)
+                .with_for_update()
+                .filter_by(
+                    strategy_id=strategy_id, product_id=product_id, side=position_side
+                )
+                .first()
+            )
 
             current_time = int(time.time() * 1000)
 
@@ -126,7 +146,7 @@ class LiveOrderRepository(IOrderRepository):
                         quantity=Decimal("0"),
                         entry_price=Decimal("0"),
                         unrealized_pnl=Decimal("0"),
-                        last_update_timestamp=current_time
+                        last_update_timestamp=current_time,
                     )
                     db.add(position)
                 else:
@@ -134,7 +154,9 @@ class LiveOrderRepository(IOrderRepository):
                     return
 
             if side == OrderSide.BUY:
-                total_cost = (position.quantity * position.entry_price) + (fill_quantity * fill_price)
+                total_cost = (position.quantity * position.entry_price) + (
+                    fill_quantity * fill_price
+                )
                 total_qty = position.quantity + fill_quantity
                 if total_qty > 0:
                     position.entry_price = total_cost / total_qty
@@ -199,10 +221,18 @@ class BacktestOrderRepository(IOrderRepository):
     ) -> Optional[Order]:
         return None
 
-    def list_client_orders_by_statuses(self, statuses: set[str]) -> list[Order]:
+    def list_client_orders_by_statuses(
+        self,
+        statuses: set[str],
+        exchange_id: str | None = None,
+    ) -> list[Order]:
         return []
 
-    def list_orders_by_statuses(self, statuses: set[str]) -> list[Order]:
+    def list_orders_by_statuses(
+        self,
+        statuses: set[str],
+        exchange_id: str | None = None,
+    ) -> list[Order]:
         return []
 
     def add_trade(self, trade: Trade) -> None:
@@ -228,7 +258,15 @@ class BacktestOrderRepository(IOrderRepository):
                 db.commit()
             self._next_fill_sequence += 1
 
-    def update_position(self, strategy_id: str, product_id: str, side: str, fill_quantity: Decimal, fill_price: Decimal, position_side: str) -> None:
+    def update_position(
+        self,
+        strategy_id: str,
+        product_id: str,
+        side: str,
+        fill_quantity: Decimal,
+        fill_price: Decimal,
+        position_side: str,
+    ) -> None:
         # No-op: position and balance are tracked by Rust PyMatchingEngine
         pass
 

@@ -4,6 +4,7 @@ from typing import Callable, ContextManager, Optional
 from sqlalchemy.orm import Session
 from src.core.orm_models import Order, Trade, Position
 
+
 class IOrderRepository(ABC):
     def __init__(
         self,
@@ -19,7 +20,7 @@ class IOrderRepository(ABC):
     @abstractmethod
     def add_order(self, order: Order) -> None:
         pass
-    
+
     @abstractmethod
     def update_order(self, order: Order) -> None:
         pass
@@ -41,7 +42,11 @@ class IOrderRepository(ABC):
         """Return an order by scoped exchange order ID when supported."""
         return None
 
-    def list_client_orders_by_statuses(self, statuses: set[str]) -> list[Order]:
+    def list_client_orders_by_statuses(
+        self,
+        statuses: set[str],
+        exchange_id: str | None = None,
+    ) -> list[Order]:
         """Return client-order-id-backed orders whose status is in ``statuses``.
 
         This is a recovery/reconciliation hook. Implementations that do not
@@ -49,7 +54,11 @@ class IOrderRepository(ABC):
         """
         return []
 
-    def list_orders_by_statuses(self, statuses: set[str]) -> list[Order]:
+    def list_orders_by_statuses(
+        self,
+        statuses: set[str],
+        exchange_id: str | None = None,
+    ) -> list[Order]:
         """Return orders whose status is in ``statuses`` when supported."""
         return []
 
@@ -62,9 +71,19 @@ class IOrderRepository(ABC):
         pass
 
     @abstractmethod
-    def update_position(self, strategy_id: str, product_id: str, side: str, fill_quantity: Decimal, fill_price: Decimal, position_side: str) -> None:
+    def update_position(
+        self,
+        strategy_id: str,
+        product_id: str,
+        side: str,
+        fill_quantity: Decimal,
+        fill_price: Decimal,
+        position_side: str,
+    ) -> None:
         pass
-        
+
     @abstractmethod
-    def get_position(self, strategy_id: str, product_id: str, side: str) -> Optional[Position]:
+    def get_position(
+        self, strategy_id: str, product_id: str, side: str
+    ) -> Optional[Position]:
         pass

@@ -142,6 +142,10 @@ class ConditionalOrderLifecycleOwner:
     ) -> None:
         self._order_manager = order_manager
         self._adapter = adapter
+        adapter_exchange_id = getattr(adapter, "exchange_id", None)
+        self._exchange_id = (
+            adapter_exchange_id if isinstance(adapter_exchange_id, str) else None
+        )
         self._submission_gate = submission_gate
         self._pending_protection_fill_processor = pending_protection_fill_processor
         self._process_exchange_order_event = process_exchange_order_event
@@ -210,7 +214,8 @@ class ConditionalOrderLifecycleOwner:
                         OrderStatus.SUBMITTED_UNCONFIRMED.value,
                         OrderStatus.SUBMITTED.value,
                         OrderStatus.PARTIALLY_FILLED.value,
-                    }
+                    },
+                    exchange_id=self._exchange_id,
                 ),
             )
             if isinstance(order.intent_payload, dict)
@@ -279,7 +284,8 @@ class ConditionalOrderLifecycleOwner:
             for order in cast(
                 list[ConditionalOrder],
                 self._order_manager.repo.list_orders_by_statuses(
-                    {OrderStatus.NEW.value}
+                    {OrderStatus.NEW.value},
+                    exchange_id=self._exchange_id,
                 ),
             )
             if isinstance(order.intent_payload, dict)

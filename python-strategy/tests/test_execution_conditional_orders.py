@@ -166,6 +166,107 @@ def test_partial_fill_resizes_persists_and_places_pending_protection_exactly_onc
     )
 
 
+def test_live_ccxt_conditional_queries_pass_exact_adapter_venue_scope():
+    manager = MagicMock()
+    manager.repo.list_orders_by_statuses.return_value = []
+    adapter = MagicMock()
+    adapter.exchange_id = "binance"
+    owner = _owner(manager=manager, adapter=adapter)
+    entry = SimpleNamespace(
+        id="entry-1",
+        type="market",
+        filled_quantity=Decimal("1"),
+    )
+
+    assert owner.place_pending_for_entry(entry) == []
+    assert owner.recover_pending_protection() == {
+        "pending_count": 0,
+        "entries_attempted": 0,
+        "failures": [],
+    }
+
+    assert manager.repo.list_orders_by_statuses.call_args_list == [
+        call(
+            {
+                OrderStatus.NEW.value,
+                OrderStatus.SUBMITTED_UNCONFIRMED.value,
+                OrderStatus.SUBMITTED.value,
+                OrderStatus.PARTIALLY_FILLED.value,
+            },
+            exchange_id="binance",
+        ),
+        call({OrderStatus.NEW.value}, exchange_id="binance"),
+    ]
+
+
+def test_live_ccxt_recovery_submits_only_current_venue_protection(
+    mock_order_repo,
+    order_factory,
+):
+    current_entry = order_factory(
+        order_id="current-entry",
+        exchange_id="BINANCE",
+        status=OrderStatus.FILLED.value,
+        filled_quantity=Decimal("2"),
+    )
+    current_stop = order_factory(
+        order_id="current-stop",
+        exchange_id="BINANCE",
+        status=OrderStatus.NEW.value,
+        order_type="stop_loss",
+        quantity=Decimal("1"),
+        client_order_id=None,
+    )
+    current_stop.intent_payload = {"pending_entry_order_id": "current-entry"}
+    foreign_entry = order_factory(
+        order_id="foreign-entry",
+        exchange_id="BYBIT",
+        product_id="BYBIT:BTCUSDT-PERP",
+        status=OrderStatus.FILLED.value,
+        filled_quantity=Decimal("3"),
+    )
+    foreign_stop = order_factory(
+        order_id="foreign-stop",
+        exchange_id="BYBIT",
+        product_id="BYBIT:BTCUSDT-PERP",
+        status=OrderStatus.NEW.value,
+        order_type="stop_loss",
+        quantity=Decimal("1"),
+        client_order_id=None,
+    )
+    foreign_stop.intent_payload = {"pending_entry_order_id": "foreign-entry"}
+    for order in (current_entry, current_stop, foreign_entry, foreign_stop):
+        mock_order_repo.add_order(order)
+    manager = MagicMock()
+    manager.repo = mock_order_repo
+    adapter = MagicMock()
+    adapter.exchange_id = "binance"
+    adapter.place_order.return_value = "EX-CURRENT-STOP"
+    record_order_ack = MagicMock()
+    owner = _owner(
+        manager=manager,
+        adapter=adapter,
+        record_order_ack=record_order_ack,
+    )
+
+    result = owner.recover_pending_protection()
+
+    assert result == {
+        "pending_count": 1,
+        "entries_attempted": 1,
+        "failures": [],
+    }
+    adapter.place_order.assert_called_once_with(current_stop)
+    record_order_ack.assert_called_once_with(
+        current_stop,
+        "EX-CURRENT-STOP",
+        order_id="current-stop",
+    )
+    assert current_stop.quantity == Decimal("2")
+    assert foreign_stop.quantity == Decimal("1")
+    assert foreign_stop.status == OrderStatus.NEW.value
+
+
 def test_conditional_submit_failure_always_releases_submission_gate():
     pending = SimpleNamespace(
         id="stop-1",

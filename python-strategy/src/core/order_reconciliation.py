@@ -63,6 +63,10 @@ class OrderReconciler:
         logger: Optional[logging.Logger] = None,
     ) -> None:
         self.adapter = adapter
+        adapter_exchange_id = getattr(adapter, "exchange_id", None)
+        self._exchange_id = (
+            adapter_exchange_id if isinstance(adapter_exchange_id, str) else None
+        )
         self.order_manager = order_manager
         self.clock = clock
         self._db_session_factory = db_session_factory
@@ -107,7 +111,10 @@ class OrderReconciler:
             OrderStatus.SUBMITTED.value,
             OrderStatus.PARTIALLY_FILLED.value,
         }
-        return self.order_manager.repo.list_client_orders_by_statuses(statuses)
+        return self.order_manager.repo.list_client_orders_by_statuses(
+            statuses,
+            exchange_id=self._exchange_id,
+        )
 
     def record_recoverable_order_scan(self) -> dict:
         """Record a startup scan of client orders that still need reconciliation."""

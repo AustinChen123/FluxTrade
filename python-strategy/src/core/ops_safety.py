@@ -123,9 +123,7 @@ class OpsSafetyService:
         with self._kill_switch_lock:
             if self._recovery_pending:
                 if self._recovery_result is None:
-                    raise RuntimeError(
-                        "kill switch recovery state is inconsistent"
-                    )
+                    raise RuntimeError("kill switch recovery state is inconsistent")
                 return deepcopy(self._recovery_result)
             result, recovery_pending = self._run_kill_switch(
                 actor=actor,
@@ -376,7 +374,9 @@ class OpsSafetyService:
             order_id = str(order.id)
             try:
                 if order.status == OrderStatus.NEW.value:
-                    self._execution_engine.order_manager.fail_order(order, "kill_switch")
+                    self._execution_engine.order_manager.fail_order(
+                        order, "kill_switch"
+                    )
                     result["cancelled_orders"] += 1
                     continue
                 if self._execution_engine.cancel_order(order_id):
@@ -386,7 +386,9 @@ class OpsSafetyService:
                         {"order_id": order_id, "reason": "cancel_order_returned_false"}
                     )
             except Exception as exc:
-                self._logger.exception("Kill switch failed to cancel order %s", order_id)
+                self._logger.exception(
+                    "Kill switch failed to cancel order %s", order_id
+                )
                 result["cancel_failures"].append(
                     {"order_id": order_id, "reason": str(exc)}
                 )
@@ -483,8 +485,19 @@ class OpsSafetyService:
             OrderStatus.SUBMITTED.value,
             OrderStatus.PARTIALLY_FILLED.value,
         }
+        adapter_exchange_id = getattr(
+            getattr(self._execution_engine, "adapter", None),
+            "exchange_id",
+            None,
+        )
+        exchange_id = (
+            adapter_exchange_id if isinstance(adapter_exchange_id, str) else None
+        )
         return list(
-            self._execution_engine.order_manager.repo.list_orders_by_statuses(statuses)
+            self._execution_engine.order_manager.repo.list_orders_by_statuses(
+                statuses,
+                exchange_id=exchange_id,
+            )
         )
 
     def _positions(self) -> tuple[list[Any], str | None]:
@@ -606,7 +619,10 @@ class OpsSafetyService:
         resolved = []
         for position in exchange_positions:
             local_matches = local_by_product.get(position.product_id, [])
-            if str(getattr(position, "strategy_id", "")) == "LIVE" and len(local_matches) == 1:
+            if (
+                str(getattr(position, "strategy_id", "")) == "LIVE"
+                and len(local_matches) == 1
+            ):
                 resolved.append(
                     position.model_copy(
                         update={"strategy_id": local_matches[0].strategy_id}

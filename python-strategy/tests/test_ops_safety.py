@@ -16,6 +16,7 @@ from decimal import Decimal
 import inspect
 import threading
 import time
+from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -162,8 +163,20 @@ class _FakeOrderRepo:
     def __init__(self, orders: list[Order]) -> None:
         self._orders = orders
 
-    def list_orders_by_statuses(self, statuses: set[str]) -> list[Order]:
-        return [o for o in self._orders if o.status in statuses]
+    def list_orders_by_statuses(
+        self,
+        statuses: set[str],
+        exchange_id: str | None = None,
+    ) -> list[Order]:
+        return [
+            order
+            for order in self._orders
+            if order.status in statuses
+            and (
+                exchange_id is None
+                or order.exchange_id.casefold() == exchange_id.casefold()
+            )
+        ]
 
 
 def _make_null_db_session_factory():
@@ -438,7 +451,9 @@ class TestKillSwitchClear:
         engine._submissions_halted = True
         calls = []
         persist = MagicMock(side_effect=lambda: calls.append("persist"))
-        engine.resume_submissions = MagicMock(side_effect=lambda: calls.append("resume"))
+        engine.resume_submissions = MagicMock(
+            side_effect=lambda: calls.append("resume")
+        )
 
         result = service.clear_kill_switch(persist_clear=persist)
 
@@ -491,8 +506,54 @@ class TestKillSwitchCancelScope:
 
         service.kill_switch(actor="ops")
 
-        reasons = [reason for o, reason in engine.order_manager.failed_orders if o.id == "o-new2"]
+        reasons = [
+            reason
+            for o, reason in engine.order_manager.failed_orders
+            if o.id == "o-new2"
+        ]
         assert reasons == ["kill_switch"]
+
+    @pytest.mark.parametrize(
+        "submitted_status",
+        [
+            OrderStatus.SUBMITTED_UNCONFIRMED.value,
+            OrderStatus.SUBMITTED.value,
+            OrderStatus.PARTIALLY_FILLED.value,
+        ],
+    )
+    def test_live_ccxt_kill_switch_never_mutates_or_cancels_foreign_orders(
+        self,
+        submitted_status,
+    ):
+        current_new = _make_order("current-new", OrderStatus.NEW.value)
+        current_submitted = _make_order(
+            "current-submitted",
+            submitted_status,
+        )
+        foreign_new = _make_order("foreign-new", OrderStatus.NEW.value)
+        foreign_new.exchange_id = "BYBIT"
+        foreign_submitted = _make_order(
+            "foreign-submitted",
+            submitted_status,
+        )
+        foreign_submitted.exchange_id = "BYBIT"
+        service, engine, _ = _make_service(
+            orders=[
+                current_new,
+                current_submitted,
+                foreign_new,
+                foreign_submitted,
+            ]
+        )
+        engine.adapter = SimpleNamespace(exchange_id="binance")
+
+        service.kill_switch(actor="ops", reason="venue-scope")
+
+        assert engine.order_manager.failed_orders == [(current_new, "kill_switch")]
+        assert ("cancel_order", "current-submitted") in engine.calls
+        assert ("cancel_order", "foreign-submitted") not in engine.calls
+        assert foreign_new.status == OrderStatus.NEW.value
+        assert foreign_submitted.status == submitted_status
 
     def test_filled_orders_not_cancelled(self):
         """FILLED orders are terminal and must be ignored."""
@@ -509,7 +570,11 @@ class TestKillSwitchCancelScope:
 
         service.kill_switch(actor="ops")
 
-        assert all(c[1] != "o-already-cancelled" for c in engine.calls if c[0] == "cancel_order")
+        assert all(
+            c[1] != "o-already-cancelled"
+            for c in engine.calls
+            if c[0] == "cancel_order"
+        )
 
     def test_result_counts_only_successful_cancels(self):
         o1 = _make_order("o-ok", OrderStatus.SUBMITTED.value)
@@ -534,8 +599,12 @@ class TestKillSwitchOrdering:
 
         service.kill_switch(actor="ops")
 
-        cancel_indices = [i for i, c in enumerate(engine.calls) if c[0] == "cancel_order"]
-        flatten_indices = [i for i, c in enumerate(engine.calls) if c[0] == "flatten_position"]
+        cancel_indices = [
+            i for i, c in enumerate(engine.calls) if c[0] == "cancel_order"
+        ]
+        flatten_indices = [
+            i for i, c in enumerate(engine.calls) if c[0] == "flatten_position"
+        ]
 
         assert cancel_indices, "no cancel_order calls recorded"
         assert flatten_indices, "no flatten_position calls recorded"
@@ -582,12 +651,16 @@ class TestKillSwitchCancelFailureIsolation:
 
         # Monkeypatch so cancel raises but flatten is a proper recording
         flatten_calls: list = []
-        engine.flatten_position = lambda sid, pid, side, qty: flatten_calls.append((sid, pid)) or "flat-id"  # type: ignore[assignment]
+        engine.flatten_position = (
+            lambda sid, pid, side, qty: flatten_calls.append((sid, pid)) or "flat-id"
+        )  # type: ignore[assignment]
 
         result = service.kill_switch(actor="ops")
 
         assert len(result["cancel_failures"]) >= 1
-        assert len(flatten_calls) >= 1, "flatten must proceed even after cancel exception"
+        assert len(flatten_calls) >= 1, (
+            "flatten must proceed even after cancel exception"
+        )
 
     def test_cancel_failure_includes_reason(self):
         """cancel_failures entries must include both order_id and reason."""
@@ -598,7 +671,9 @@ class TestKillSwitchCancelFailureIsolation:
 
         result = service.kill_switch(actor="ops")
 
-        entry = next((f for f in result["cancel_failures"] if f["order_id"] == "o-fail"), None)
+        entry = next(
+            (f for f in result["cancel_failures"] if f["order_id"] == "o-fail"), None
+        )
         assert entry is not None
         assert "reason" in entry
 
@@ -635,7 +710,9 @@ class TestKillSwitchFlattenFailureIsolation:
 
         service.kill_switch(actor="ops")
 
-        flatten_calls = [(c[1], c[2]) for c in engine.calls if c[0] == "flatten_position"]
+        flatten_calls = [
+            (c[1], c[2]) for c in engine.calls if c[0] == "flatten_position"
+        ]
         assert ("strat_b", "BINANCE:ETHUSDT-PERP") in flatten_calls
 
     def test_flatten_failure_result_includes_strategy_id_and_product_id(self):
@@ -703,8 +780,13 @@ class TestKillSwitchAuditAlways:
         with patch("src.core.ops_safety.write_system_event") as mock_write:
             service.kill_switch(actor="ops")
             payload = mock_write.call_args.kwargs["payload"]
-            for key in ("cancelled_orders", "cancel_failures", "flattened_positions",
-                        "flatten_failures", "already_flat"):
+            for key in (
+                "cancelled_orders",
+                "cancel_failures",
+                "flattened_positions",
+                "flatten_failures",
+                "already_flat",
+            ):
                 assert key in payload, f"payload missing key: {key}"
 
 
@@ -729,7 +811,9 @@ class TestKillSwitchFlattenPositions:
 
         service.kill_switch(actor="ops")
 
-        flatten_calls = [(c[1], c[2]) for c in engine.calls if c[0] == "flatten_position"]
+        flatten_calls = [
+            (c[1], c[2]) for c in engine.calls if c[0] == "flatten_position"
+        ]
         assert ("s1", PRODUCT_ID) in flatten_calls
         assert ("s2", "BINANCE:ETHUSDT-PERP") in flatten_calls
 
@@ -822,36 +906,44 @@ class TestFlattenPosition:
         self, eng, mock_exchange_adapter, mock_order_repo
     ):
         """LONG position → BUY order on adapter (sell direction), type=market."""
-        result = eng.flatten_position(
-            STRATEGY_ID, PRODUCT_ID, "LONG", Decimal("2.5")
-        )
+        result = eng.flatten_position(STRATEGY_ID, PRODUCT_ID, "LONG", Decimal("2.5"))
 
         # Must return an order id (non-None)
         assert result is not None
 
         # Adapter must have received exactly one order
-        placed = mock_exchange_adapter.filled_orders or mock_exchange_adapter.open_orders
+        placed = (
+            mock_exchange_adapter.filled_orders or mock_exchange_adapter.open_orders
+        )
         assert len(placed) >= 1
 
         # The placed order must be a market SELL (flatten LONG = sell)
-        placed_order = (mock_exchange_adapter.open_orders + mock_exchange_adapter.filled_orders)[-1]
-        order_obj = placed_order if isinstance(placed_order, Order) else placed_order.get("order")
+        placed_order = (
+            mock_exchange_adapter.open_orders + mock_exchange_adapter.filled_orders
+        )[-1]
+        order_obj = (
+            placed_order
+            if isinstance(placed_order, Order)
+            else placed_order.get("order")
+        )
         assert order_obj is not None
         assert order_obj.type == "market"
         # Side convention: flatten LONG → place SELL (buy/sell convention from adapter boundary)
         assert order_obj.side.lower() in ("sell", "short")
 
-    def test_short_position_places_buy_market_order(
-        self, eng, mock_exchange_adapter
-    ):
+    def test_short_position_places_buy_market_order(self, eng, mock_exchange_adapter):
         """SHORT position → market BUY (flatten direction)."""
-        result = eng.flatten_position(
-            STRATEGY_ID, PRODUCT_ID, "SHORT", Decimal("1.0")
-        )
+        result = eng.flatten_position(STRATEGY_ID, PRODUCT_ID, "SHORT", Decimal("1.0"))
 
         assert result is not None
-        placed_order = (mock_exchange_adapter.open_orders + mock_exchange_adapter.filled_orders)[-1]
-        order_obj = placed_order if isinstance(placed_order, Order) else placed_order.get("order")
+        placed_order = (
+            mock_exchange_adapter.open_orders + mock_exchange_adapter.filled_orders
+        )[-1]
+        order_obj = (
+            placed_order
+            if isinstance(placed_order, Order)
+            else placed_order.get("order")
+        )
         assert order_obj is not None
         assert order_obj.type == "market"
         assert order_obj.side.lower() in ("buy", "long")
@@ -876,7 +968,11 @@ class TestFlattenPosition:
         placed_order = (
             mock_exchange_adapter.open_orders + mock_exchange_adapter.filled_orders
         )[-1]
-        order_obj = placed_order if isinstance(placed_order, Order) else placed_order.get("order")
+        order_obj = (
+            placed_order
+            if isinstance(placed_order, Order)
+            else placed_order.get("order")
+        )
         assert order_obj.min_notional_reference_price == Decimal("50000")
 
     def test_authoritative_exit_uses_server_side_adapter_operation(
@@ -1002,7 +1098,11 @@ class TestFlattenPosition:
 
         eng.flatten_position(STRATEGY_ID, PRODUCT_ID, "LONG", Decimal("1.0"))
 
-        terminal_statuses = {OrderStatus.FAILED.value, OrderStatus.CANCELLED.value, "failed"}
+        terminal_statuses = {
+            OrderStatus.FAILED.value,
+            OrderStatus.CANCELLED.value,
+            "failed",
+        }
         orders_in_terminal = [
             o for o in mock_order_repo.orders.values() if o.status in terminal_statuses
         ]
@@ -1021,7 +1121,9 @@ class TestFlattenPosition:
                 self.place_calls += 1
                 raise NetworkError("timeout after submit")
 
-            def get_order_by_client_id(self, client_order_id, product_id, *, order_type=None):
+            def get_order_by_client_id(
+                self, client_order_id, product_id, *, order_type=None
+            ):
                 return None
 
         adapter = TimeoutAdapter()
@@ -1248,14 +1350,19 @@ class TestEngineKillSwitchCommand:
         engine = engine_factory()
         mock_ops_safety = MagicMock()
         mock_ops_safety.kill_switch.return_value = {
-            "cancelled_orders": 0, "cancel_failures": [],
-            "flattened_positions": 0, "flatten_failures": [], "already_flat": True,
+            "cancelled_orders": 0,
+            "cancel_failures": [],
+            "flattened_positions": 0,
+            "flatten_failures": [],
+            "already_flat": True,
         }
         engine.ops_safety = mock_ops_safety
 
         engine._handle_command({"command": "KILL_SWITCH", "params": {}})
 
-        mock_ops_safety.kill_switch.assert_called_once_with(actor="operator", reason=None)
+        mock_ops_safety.kill_switch.assert_called_once_with(
+            actor="operator", reason=None
+        )
 
     def test_kill_switch_stays_halted_when_persistence_fails(self, engine_factory):
         engine = engine_factory()
@@ -1402,7 +1509,9 @@ class TestLocalFetchFailureIsolation:
         assert result["flattened_positions"] == 1
         assert any(c[0] == "flatten_position" for c in engine.calls)
 
-    def test_local_raises_adapter_has_positions_flatten_failures_contains_unavailable_entry(self):
+    def test_local_raises_adapter_has_positions_flatten_failures_contains_unavailable_entry(
+        self,
+    ):
         """flatten_failures must include a local_positions_unavailable entry."""
         exc = RuntimeError("Redis down")
         exchange_pos = _make_position(strategy_id="LIVE", quantity=Decimal("1.5"))
@@ -1414,7 +1523,8 @@ class TestLocalFetchFailureIsolation:
         result = service.kill_switch(actor="ops")
 
         unavailable = [
-            f for f in result["flatten_failures"]
+            f
+            for f in result["flatten_failures"]
             if "local_positions_unavailable" in f.get("reason", "")
         ]
         assert unavailable, (
@@ -1523,12 +1633,16 @@ def test_positions_fetch_matrix(
         account = FakeAccountService(positions=[local_pos])
         fake_engine = RecordingExecutionEngine()
         fake_engine.adapter = adapter
-        service = OpsSafetyService(fake_engine, account, _make_null_db_session_factory())
+        service = OpsSafetyService(
+            fake_engine, account, _make_null_db_session_factory()
+        )
     else:
         fake_engine = RecordingExecutionEngine()
         fake_engine.adapter = adapter
         account = FakeFailingAccountService()
-        service = OpsSafetyService(fake_engine, account, _make_null_db_session_factory())
+        service = OpsSafetyService(
+            fake_engine, account, _make_null_db_session_factory()
+        )
 
     result = service.kill_switch(actor="ops")
 
@@ -1538,13 +1652,17 @@ def test_positions_fetch_matrix(
 
     if expect_local_error_entry:
         unavailable = [
-            f for f in result["flatten_failures"]
+            f
+            for f in result["flatten_failures"]
             if "local_positions_unavailable" in f.get("reason", "")
         ]
-        assert unavailable, "Expected local_positions_unavailable entry in flatten_failures"
+        assert unavailable, (
+            "Expected local_positions_unavailable entry in flatten_failures"
+        )
     else:
         unavailable = [
-            f for f in result["flatten_failures"]
+            f
+            for f in result["flatten_failures"]
             if "local_positions_unavailable" in f.get("reason", "")
         ]
         assert not unavailable, (
@@ -1687,7 +1805,9 @@ class TestSubmissionDrainGate:
         eng.halt_and_drain(timeout=0.01)
 
         signal = _make_signal()
-        with patch.object(eng, "_execute_signal_core", wraps=eng._execute_signal_core) as mock_core:
+        with patch.object(
+            eng, "_execute_signal_core", wraps=eng._execute_signal_core
+        ) as mock_core:
             result = eng.execute_signal(signal)
 
         assert result is None
@@ -1702,9 +1822,13 @@ class TestSubmissionDrainGate:
         )
 
         signal = _make_signal()
-        submit_thread = threading.Thread(target=eng.execute_signal, args=(signal,), daemon=True)
+        submit_thread = threading.Thread(
+            target=eng.execute_signal, args=(signal,), daemon=True
+        )
         submit_thread.start()
-        assert blocking_adapter._placed.wait(timeout=2.0), "place_order was never called"
+        assert blocking_adapter._placed.wait(timeout=2.0), (
+            "place_order was never called"
+        )
 
         cancelled: list[str] = []
 
@@ -1739,7 +1863,10 @@ class TestSubmissionDrainGate:
         assert not kill_thread.is_alive()
         assert result[0]["drain_timeout"] is False
         assert len(cancelled) == 1
-        assert eng.order_manager.repo.get_order(cancelled[0]).status == OrderStatus.CANCELLED.value
+        assert (
+            eng.order_manager.repo.get_order(cancelled[0]).status
+            == OrderStatus.CANCELLED.value
+        )
 
     def test_execution_engine_runs_callback_only_after_submission_drains(self):
         blocking_adapter = BlockingAdapter()
@@ -1886,9 +2013,7 @@ class TestSubmissionDrainGate:
         assert len(flatten_calls) == 1
 
     @pytest.mark.parametrize("registration_mode", ["missing", "raises"])
-    def test_drain_callback_registration_failure_stays_pending(
-        self, registration_mode
-    ):
+    def test_drain_callback_registration_failure_stays_pending(self, registration_mode):
         eng = SequencedDrainEngine([False])
         if registration_mode == "missing":
             eng.run_when_submissions_drained = None
@@ -1998,7 +2123,11 @@ class TestSubmissionDrainGate:
 
         result = service.kill_switch(actor="ops")
 
-        assert result.get("drain_timeout") is False or "drain_timeout" not in result or not result["drain_timeout"]
+        assert (
+            result.get("drain_timeout") is False
+            or "drain_timeout" not in result
+            or not result["drain_timeout"]
+        )
 
         cancellable = {
             OrderStatus.NEW.value,
@@ -2008,7 +2137,8 @@ class TestSubmissionDrainGate:
         }
         ops_strategy = "__ops_kill_switch__"
         remaining = [
-            o for o in repo_eng.order_manager.repo.orders.values()
+            o
+            for o in repo_eng.order_manager.repo.orders.values()
             if o.status in cancellable and o.strategy_id != ops_strategy
         ]
         assert not remaining, (

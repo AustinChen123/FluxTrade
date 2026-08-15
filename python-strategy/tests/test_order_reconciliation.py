@@ -1,8 +1,9 @@
 import inspect
 import logging
+from contextlib import contextmanager
 from decimal import Decimal
 from types import SimpleNamespace
-from unittest.mock import Mock
+from unittest.mock import MagicMock, Mock, patch
 
 import pytest
 
@@ -110,6 +111,90 @@ def test_generic_reconciler_delegates_once_without_venue_identity() -> None:
     capability.reconcile.assert_called_once_with(snapshot_loader=snapshot_loader)
 
 
+def test_live_ccxt_recoverable_scan_passes_exact_adapter_venue_scope() -> None:
+    adapter = _UnsupportedAdapter()
+    adapter.exchange_id = "binance"
+    reconciler = _generic_reconciler(adapter)
+    listing = Mock(return_value=[])
+    reconciler.order_manager.repo.list_client_orders_by_statuses = listing
+
+    assert reconciler.list_recoverable_client_orders() == []
+
+    listing.assert_called_once_with(
+        {
+            OrderStatus.NEW.value,
+            OrderStatus.SUBMITTED_UNCONFIRMED.value,
+            OrderStatus.SUBMITTED.value,
+            OrderStatus.PARTIALLY_FILLED.value,
+        },
+        exchange_id="binance",
+    )
+
+
+def test_live_ccxt_reconciliation_excludes_foreign_venue_from_money_path(
+    mock_order_repo,
+    order_factory,
+) -> None:
+    current = order_factory(
+        order_id="current",
+        exchange_id="BINANCE",
+        client_order_id="current-client",
+        status=OrderStatus.NEW.value,
+    )
+    foreign = order_factory(
+        order_id="foreign",
+        exchange_id="BYBIT",
+        product_id="BYBIT:BTCUSDT-PERP",
+        client_order_id="foreign-client",
+        status=OrderStatus.NEW.value,
+    )
+    mock_order_repo.add_order(current)
+    mock_order_repo.add_order(foreign)
+    order_manager = SimpleNamespace(repo=mock_order_repo, fail_order=Mock())
+    adapter = SimpleNamespace(
+        exchange_id="binance",
+        get_order_by_client_id=Mock(return_value=None),
+    )
+    db = MagicMock()
+
+    @contextmanager
+    def db_session_factory():
+        yield db
+
+    reconciler = OrderReconciler(
+        adapter=adapter,
+        order_manager=order_manager,
+        clock=SimpleNamespace(now=lambda: 1_700_000_000),
+        db_session_factory=db_session_factory,
+        process_exchange_order_event=Mock(),
+        place_pending_protection_for_filled_entries=Mock(return_value={"failures": []}),
+        fail_pending_conditionals_for_terminal_entry=Mock(),
+        protective_terminal_without_fill_failure=Mock(),
+        cancel_protective_order_when_sibling_closed=Mock(),
+        cancel_linked_conditional_for_protection_fill=Mock(),
+    )
+
+    with patch("src.core.order_reconciliation.write_system_event") as write_event:
+        result = reconciler.reconcile_recoverable_client_orders()
+
+    adapter.get_order_by_client_id.assert_called_once_with(
+        "current-client",
+        current.product_id,
+        order_type=current.type,
+    )
+    order_manager.fail_order.assert_called_once_with(
+        current,
+        "startup reconciliation: local order not found on exchange",
+    )
+    assert result["recoverable_count"] == 1
+    assert [row["order_id"] for row in result["results"]] == ["current"]
+    audit_payload = write_event.call_args.kwargs["payload"]
+    assert audit_payload["recoverable_count"] == 1
+    assert [row["order_id"] for row in audit_payload["results"]] == ["current"]
+    assert foreign.status == OrderStatus.NEW.value
+    assert foreign.last_reconciled_at is None
+
+
 @pytest.mark.parametrize(
     ("local_status", "exchange_status", "expected"),
     [
@@ -124,7 +209,9 @@ def test_generic_reconciler_delegates_once_without_venue_identity() -> None:
     ],
 )
 def test_reconcile_decision_categories(local_status, exchange_status, expected):
-    assert OrderReconciler._reconcile_decision(local_status, exchange_status) == expected
+    assert (
+        OrderReconciler._reconcile_decision(local_status, exchange_status) == expected
+    )
 
 
 @pytest.mark.parametrize(
