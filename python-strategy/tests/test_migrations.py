@@ -210,13 +210,17 @@ def _insert_order_identity_prerequisites(
 ) -> None:
     with engine.begin() as conn:
         conn.execute(
-            text("INSERT INTO exchange (id, name) VALUES (:id, :id)"),
+            text(
+                "INSERT INTO exchange (id, name) VALUES (:id, :id) "
+                "ON CONFLICT (id) DO NOTHING"
+            ),
             {"id": exchange_id},
         )
         conn.execute(
             text(
                 "INSERT INTO product (id, exchange_id, base_asset, quote_asset) "
-                "VALUES (:product, :exchange, 'BASE', 'QUOTE')"
+                "VALUES (:product, :exchange, 'BASE', 'QUOTE') "
+                "ON CONFLICT (id) DO NOTHING"
             ),
             {"product": product_id, "exchange": exchange_id},
         )
