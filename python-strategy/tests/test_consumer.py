@@ -15,9 +15,8 @@ from unittest.mock import MagicMock, call, patch
 
 import pytest
 
-import redis as redis_lib
 from redis.exceptions import ConnectionError as RedisConnectionError
-from redis.exceptions import RedisError
+from redis.exceptions import RedisError, ResponseError
 from src.core.consumer import (
     DataConsumer,
     FENCED_EPHEMERAL_GROUP_CLEANUP,
@@ -31,6 +30,11 @@ from src.core.consumer import (
     XAUTOCLAIM_WITH_QUARANTINE,
 )
 from src.core.models import Candlestick, Trade
+
+
+def _install_redis_client(consumer: DataConsumer, client: "_BehaviorRedis") -> None:
+    assert isinstance(client, _BehaviorRedis)
+    object.__setattr__(consumer, "redis_client", client)
 
 
 # =============================================================================
@@ -51,6 +55,7 @@ def mock_redis():
     client.xgroup_destroy.return_value = 1
     client.time.return_value = (1704067200, 0)  # (seconds, microseconds)
     client.xack.return_value = 1
+
     def eval_script(script, *args):
         if script in {RENEW_OWNERSHIP_LEASE, RELEASE_OWNERSHIP_LEASE}:
             return 1
@@ -61,7 +66,7 @@ def mock_redis():
             for index, stream_key in enumerate(stream_keys, start=4):
                 try:
                     summary = client.xpending(stream_key, args[-1])
-                except redis_lib.exceptions.ResponseError as error:
+                except ResponseError as error:
                     if "NOGROUP" in str(error):
                         continue
                     raise
@@ -222,17 +227,17 @@ def test_ephemeral_group_cleanup_is_retry_safe_after_partial_destroy(
         if script == FENCED_EPHEMERAL_GROUP_CLEANUP:
             cleanup_attempts += 1
             if cleanup_attempts == 1:
-                raise redis_lib.exceptions.ConnectionError("lost during cleanup")
+                raise RedisConnectionError("lost during cleanup")
         return original_eval(script, *args)
 
     mock_redis.eval.side_effect = fail_once
-    with pytest.raises(redis_lib.exceptions.ConnectionError):
+    with pytest.raises(RedisConnectionError):
         consumer.cleanup_consumer_group()
     mock_redis.delete.assert_not_called()
 
     def pending(stream_key, _group_name):
         if stream_key == streams[0]:
-            raise redis_lib.exceptions.ResponseError("NOGROUP missing")
+            raise ResponseError("NOGROUP missing")
         return {"pending": 0}
 
     mock_redis.xpending.side_effect = pending
@@ -338,7 +343,6 @@ def test_ephemeral_cleanup_includes_initialized_unregistered_streams(mock_redis)
 
 
 class TestEnsureConsumerGroups:
-
     def test_creates_group_for_each_channel(self, consumer, mock_redis):
         """Should call xgroup_create for each channel."""
         consumer._ensure_consumer_groups()
@@ -346,13 +350,13 @@ class TestEnsureConsumerGroups:
         mock_redis.xgroup_create.assert_called_once_with(
             "stream:market:binance:btcusdt:1m",
             consumer.group_name,
-            id='$',
+            id="$",
             mkstream=True,
         )
 
     def test_busygroup_ignored(self, consumer, mock_redis, caplog):
         """BUSYGROUP error (group already exists) should be silently ignored."""
-        mock_redis.xgroup_create.side_effect = redis_lib.exceptions.ResponseError(
+        mock_redis.xgroup_create.side_effect = ResponseError(
             "BUSYGROUP Consumer Group name already exists"
         )
 
@@ -362,19 +366,19 @@ class TestEnsureConsumerGroups:
         mock_redis.xgroup_create.assert_called_once_with(
             "stream:market:binance:btcusdt:1m",
             consumer.group_name,
-            id='$',
+            id="$",
             mkstream=True,
         )
         assert "Error creating group" not in caplog.text
 
     def test_other_response_error_fails_closed(self, consumer, mock_redis):
         """A missing or invalid group must stop consumption."""
-        mock_redis.xgroup_create.side_effect = redis_lib.exceptions.ResponseError(
+        mock_redis.xgroup_create.side_effect = ResponseError(
             "WRONGTYPE Operation against a key"
         )
 
         with pytest.raises(
-            redis_lib.exceptions.ResponseError,
+            ResponseError,
             match="WRONGTYPE",
         ):
             consumer._ensure_consumer_groups()
@@ -421,7 +425,6 @@ class TestEnsureConsumerGroups:
 
 
 class TestDynamicChannels:
-
     def test_refreshes_channels_from_provider(self, mock_redis):
         provider = MagicMock(return_value=["stream:market:rithmic:nq-202609:1m"])
         with patch("src.core.consumer.create_redis_client", return_value=mock_redis):
@@ -431,9 +434,7 @@ class TestDynamicChannels:
                 channel_provider=provider,
             )
 
-        assert consumer._current_channels() == [
-            "stream:market:rithmic:nq-202609:1m"
-        ]
+        assert consumer._current_channels() == ["stream:market:rithmic:nq-202609:1m"]
 
     def test_empty_channels_idle_until_strategy_becomes_active(self, mock_redis):
         stream = "stream:market:rithmic:nq-202609:1m"
@@ -516,13 +517,9 @@ class _BehaviorRedis:
         batch = self.messages[:count]
         del self.messages[:count]
         self.pending += len(batch)
-        return (
-            [("stream:market:rithmic:mnq-202609:1m", batch)]
-            if batch
-            else []
-        )
+        return [("stream:market:rithmic:mnq-202609:1m", batch)] if batch else []
 
-    def eval(self, script, *args):
+    def eval(self, script, *args) -> list[object] | int:
         if script == FENCED_XACK:
             return [1, self.xack(args[3], args[4], args[5])]
         if script != FENCED_XREADGROUP:
@@ -598,7 +595,7 @@ class _PendingRedis(_BehaviorRedis):
             self.pending = 0
         return ("0-0", claimed, self.deleted_ids)
 
-    def eval(self, script, *args):
+    def eval(self, script, *args) -> list[object] | int:
         if script in {FENCED_XREADGROUP, FENCED_XACK}:
             return super().eval(script, *args)
         assert script == XAUTOCLAIM_WITH_QUARANTINE
@@ -672,7 +669,7 @@ class _LeasePendingRedis(_PendingRedis):
     def get(self, _key):
         return self.owner
 
-    def eval(self, script, *args):
+    def eval(self, script, *args) -> list[object] | int:
         if script == FENCED_XACK:
             token = args[2]
             if self.expire_before_fenced_ack:
@@ -724,18 +721,15 @@ def _candle_payload(timestamp: int, close: str) -> dict[str, str]:
 
 
 class TestDeliverySemantics:
-
     def test_fenced_read_rejects_lease_expiry_before_claim(self):
         stream = "stream:market:rithmic:mnq-202609:1m"
         redis = _LeasePendingRedis(stream)
-        redis.messages = [
-            ("1704067200000-0", _candle_payload(1704067200000, "20000"))
-        ]
+        redis.messages = [("1704067200000-0", _candle_payload(1704067200000, "20000"))]
         consumer = DataConsumer(
             channels=[stream],
             on_message_callback=MagicMock(),
         )
-        consumer.redis_client = redis
+        _install_redis_client(consumer, redis)
         consumer._acquire_ownership()
         redis.expire_before_fenced_read = True
         consumer.running = True
@@ -765,7 +759,7 @@ class TestDeliverySemantics:
             ),
             pending_claim_idle_ms=0,
         )
-        consumer.redis_client = redis
+        _install_redis_client(consumer, redis)
         consumer._acquire_ownership()
 
         with pytest.raises(
@@ -785,7 +779,7 @@ class TestDeliverySemantics:
             channels=[stream],
             on_message_callback=MagicMock(),
         )
-        consumer.redis_client = redis
+        _install_redis_client(consumer, redis)
         consumer._acquire_ownership()
         redis.expire_before_fenced_ack = True
 
@@ -810,7 +804,7 @@ class TestDeliverySemantics:
             pending_replay_callback=MagicMock(),
             pending_claim_idle_ms=0,
         )
-        consumer.redis_client = redis
+        _install_redis_client(consumer, redis)
         consumer._acquire_ownership()
         redis.owner = "successor"
 
@@ -838,17 +832,19 @@ class TestDeliverySemantics:
             on_message_callback=lambda model: old_callbacks.append(model.timestamp),
             pending_claim_idle_ms=0,
         )
+
+        def record_new(model: Candlestick | Trade) -> None:
+            new_callbacks.append(model.timestamp)
+            new.running = False
+
         new = DataConsumer(
             channels=[stream],
-            on_message_callback=lambda model: (
-                new_callbacks.append(model.timestamp),
-                setattr(new, "running", False),
-            ),
+            on_message_callback=record_new,
             pending_replay_callback=lambda model: replayed.append(model.timestamp),
             pending_claim_idle_ms=0,
         )
-        old.redis_client = redis
-        new.redis_client = redis
+        _install_redis_client(old, redis)
+        _install_redis_client(new, redis)
         old._acquire_ownership()
 
         def lose_ownership_after_callback(model):
@@ -898,7 +894,7 @@ class TestDeliverySemantics:
             channels=[stream],
             on_message_callback=record_candle,
         )
-        consumer.redis_client = redis
+        _install_redis_client(consumer, redis)
         consumer.running = True
 
         consumer._consume_loop()
@@ -924,7 +920,7 @@ class TestDeliverySemantics:
                 RuntimeError("strategy failed")
             ),
         )
-        consumer.redis_client = redis
+        _install_redis_client(consumer, redis)
         consumer.running = True
 
         with pytest.raises(MarketStreamPendingError, match="market callback failed"):
@@ -948,7 +944,7 @@ class TestDeliverySemantics:
                 RuntimeError("strategy failed")
             ),
         )
-        consumer.redis_client = redis
+        _install_redis_client(consumer, redis)
         consumer.running = True
 
         with pytest.raises(MarketStreamPendingError, match="market callback failed"):
@@ -974,7 +970,7 @@ class TestDeliverySemantics:
             channel_provider=lambda: [stream_b],
             on_message_callback=lambda _: None,
         )
-        consumer.redis_client = redis
+        _install_redis_client(consumer, redis)
         consumer.running = True
 
         with pytest.raises(MarketStreamPendingError, match="unresolved deliveries"):
@@ -996,7 +992,7 @@ class TestDeliverySemantics:
             channel_provider=lambda: [stream_b],
             on_message_callback=lambda _: None,
         )
-        consumer.redis_client = redis
+        _install_redis_client(consumer, redis)
         consumer.running = True
 
         with pytest.raises(MarketStreamPendingError, match="unresolved deliveries"):
@@ -1009,7 +1005,7 @@ class TestDeliverySemantics:
         stream = "stream:market:rithmic:mnq-202609:1m"
         redis = _BehaviorRedis([])
         consumer = DataConsumer(channels=[stream], on_message_callback=lambda _: None)
-        consumer.redis_client = redis
+        _install_redis_client(consumer, redis)
         consumer.running = True
 
         def stop_after_observing_registry(**_kwargs):
@@ -1029,13 +1025,11 @@ class TestDeliverySemantics:
                 channels=[stream],
                 on_message_callback=MagicMock(),
             )
-        mock_redis.smembers.side_effect = redis_lib.exceptions.ConnectionError(
-            "registry unavailable"
-        )
+        mock_redis.smembers.side_effect = RedisConnectionError("registry unavailable")
         consumer.running = True
 
         with pytest.raises(
-            redis_lib.exceptions.ConnectionError,
+            RedisConnectionError,
             match="registry unavailable",
         ):
             consumer._consume_loop()
@@ -1052,12 +1046,10 @@ class TestDeliverySemantics:
                 channels=[stream],
                 on_message_callback=MagicMock(),
             )
-        mock_redis.xreadgroup.side_effect = redis_lib.exceptions.ConnectionError(
-            "response lost"
-        )
+        mock_redis.xreadgroup.side_effect = RedisConnectionError("response lost")
         consumer.running = True
 
-        with pytest.raises(redis_lib.exceptions.ConnectionError, match="response lost"):
+        with pytest.raises(RedisConnectionError, match="response lost"):
             consumer._consume_loop()
 
         assert consumer._blocked_streams == {stream}
@@ -1073,7 +1065,7 @@ class TestDeliverySemantics:
                 RuntimeError("strategy failed")
             ),
         )
-        consumer.redis_client = redis
+        _install_redis_client(consumer, redis)
         consumer.running = True
 
         with pytest.raises(MarketStreamPendingError, match="market callback failed"):
@@ -1085,7 +1077,7 @@ class TestDeliverySemantics:
         stream = "stream:market:rithmic:mnq-202609:1m"
         redis = _BehaviorRedis([("1704067200000-0", {"invalid": "payload"})])
         consumer = DataConsumer(channels=[stream], on_message_callback=lambda _: None)
-        consumer.redis_client = redis
+        _install_redis_client(consumer, redis)
         consumer.running = True
 
         with pytest.raises(MarketStreamPendingError, match="unparseable"):
@@ -1114,7 +1106,7 @@ class TestDeliverySemantics:
 
         mock_redis.xreadgroup.side_effect = read_then_stop
         mock_redis.xack.side_effect = [
-            redis_lib.exceptions.ConnectionError("redis disconnected"),
+            RedisConnectionError("redis disconnected"),
             1,
         ]
         mock_redis.xpending.side_effect = [
@@ -1139,7 +1131,7 @@ class TestDeliverySemantics:
         stream = "stream:market:rithmic:mnq-202609:1m"
         redis = _BehaviorRedis([], pending=1)
         consumer = DataConsumer(channels=[stream], on_message_callback=lambda _: None)
-        consumer.redis_client = redis
+        _install_redis_client(consumer, redis)
         consumer.running = True
 
         with pytest.raises(MarketStreamPendingError, match="unresolved deliveries"):
@@ -1164,7 +1156,7 @@ class TestDeliverySemantics:
             ),
             pending_claim_idle_ms=0,
         )
-        consumer.redis_client = redis
+        _install_redis_client(consumer, redis)
 
         consumer._ensure_no_abandoned_pending([stream])
 
@@ -1192,7 +1184,7 @@ class TestDeliverySemantics:
             on_message_callback=callback,
             pending_replay_callback=replay,
         )
-        consumer.redis_client = redis
+        _install_redis_client(consumer, redis)
 
         with pytest.raises(
             MarketStreamPendingError,
@@ -1218,7 +1210,7 @@ class TestDeliverySemantics:
             pending_replay_callback=MagicMock(),
             pending_claim_idle_ms=0,
         )
-        consumer.redis_client = redis
+        _install_redis_client(consumer, redis)
 
         with pytest.raises(
             MarketStreamPendingError,
@@ -1292,7 +1284,7 @@ class TestDeliverySemantics:
             ),
             pending_claim_idle_ms=0,
         )
-        consumer.redis_client = redis
+        _install_redis_client(consumer, redis)
 
         with pytest.raises(
             MarketStreamPendingError,
@@ -1317,15 +1309,13 @@ class TestDeliverySemantics:
         )
         consumer = DataConsumer(
             channels=[stream],
-            on_message_callback=MagicMock(
-                side_effect=RuntimeError("strategy failed")
-            ),
+            on_message_callback=MagicMock(side_effect=RuntimeError("strategy failed")),
             pending_replay_callback=MagicMock(
                 side_effect=RuntimeError("strategy failed")
             ),
             pending_claim_idle_ms=0,
         )
-        consumer.redis_client = redis
+        _install_redis_client(consumer, redis)
 
         with pytest.raises(
             MarketStreamPendingError,
@@ -1347,9 +1337,7 @@ class TestDeliverySemantics:
         consumer._initialized_channels.add(consumer.channels[0])
         consumer._consume_loop = MagicMock(
             side_effect=[
-                redis_lib.exceptions.RedisError(
-                    "NOGROUP No such key or consumer group"
-                ),
+                RedisError("NOGROUP No such key or consumer group"),
                 None,
             ]
         )
@@ -1401,19 +1389,20 @@ class TestDeliverySemantics:
 
 
 class TestParseMessage:
-
     def test_parse_json_candlestick(self, consumer):
         """Should parse JSON payload with 'open' key as Candlestick."""
-        payload = json.dumps({
-            "product_id": "BINANCE:BTCUSDT-PERP",
-            "timeframe": "1m",
-            "timestamp": 1704067200000,
-            "open": "42000",
-            "high": "42500",
-            "low": "41500",
-            "close": "42200",
-            "volume": "1000",
-        })
+        payload = json.dumps(
+            {
+                "product_id": "BINANCE:BTCUSDT-PERP",
+                "timeframe": "1m",
+                "timestamp": 1704067200000,
+                "open": "42000",
+                "high": "42500",
+                "low": "41500",
+                "close": "42200",
+                "volume": "1000",
+            }
+        )
         data = {"json": payload}
 
         result = consumer._parse_message("stream:key", data)
@@ -1423,14 +1412,16 @@ class TestParseMessage:
 
     def test_parse_json_trade(self, consumer):
         """Should parse JSON payload without 'open' key as Trade."""
-        payload = json.dumps({
-            "id": "t1",
-            "product_id": "BINANCE:BTCUSDT-PERP",
-            "side": "buy",
-            "price": "42000",
-            "quantity": "0.1",
-            "timestamp": 1704067200000,
-        })
+        payload = json.dumps(
+            {
+                "id": "t1",
+                "product_id": "BINANCE:BTCUSDT-PERP",
+                "side": "buy",
+                "price": "42000",
+                "quantity": "0.1",
+                "timestamp": 1704067200000,
+            }
+        )
         data = {"json": payload}
 
         result = consumer._parse_message("stream:key", data)
@@ -1438,16 +1429,18 @@ class TestParseMessage:
         assert isinstance(result, Trade)
 
     def test_parse_rithmic_dated_future_without_rewriting_product_id(self, consumer):
-        payload = json.dumps({
-            "product_id": "RITHMIC:MNQ-202509",
-            "timeframe": "1m",
-            "timestamp": 1704067200000,
-            "open": "20000.00",
-            "high": "20000.25",
-            "low": "19999.75",
-            "close": "20000.00",
-            "volume": "10",
-        })
+        payload = json.dumps(
+            {
+                "product_id": "RITHMIC:MNQ-202509",
+                "timeframe": "1m",
+                "timestamp": 1704067200000,
+                "open": "20000.00",
+                "high": "20000.25",
+                "low": "19999.75",
+                "close": "20000.00",
+                "volume": "10",
+            }
+        )
 
         result = consumer._parse_message(
             "stream:market:rithmic:mnq-202509:1m",
@@ -1507,7 +1500,6 @@ class TestParseMessage:
 
 
 class TestConsumerStop:
-
     def test_service_ownership_guard_requires_active_lease(self, consumer):
         with pytest.raises(
             MarketStreamOwnershipError,
