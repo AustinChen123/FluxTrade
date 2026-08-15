@@ -324,9 +324,14 @@ def test_recovery_native_key_delegates_to_the_single_leg_classifier(monkeypatch)
         classify,
     )
 
-    assert rithmic_recovery_module._remote_native_key(
-        SimpleNamespace(original_basket_id="parent-1", price_type="provider-token")
-    ) == ("parent-1", "stop_loss")
+    remote = MagicMock(spec=rithmic_recovery_module._LedgerOrder)
+    remote.original_basket_id = "parent-1"
+    remote.price_type = "provider-token"
+
+    assert rithmic_recovery_module._remote_native_key(remote) == (
+        "parent-1",
+        "stop_loss",
+    )
     assert calls == ["provider-token"]
 
 

@@ -171,7 +171,7 @@ def test_adapter_keeps_feature_import_type_only_and_runtime_lazy() -> None:
 
     native_module = ModuleType("fluxtrade_core")
     factory = Mock(return_value=SimpleNamespace())
-    native_module.RithmicOrderClient = factory
+    setattr(native_module, "RithmicOrderClient", factory)
     imports: list[str] = []
     real_import = builtins.__import__
 
