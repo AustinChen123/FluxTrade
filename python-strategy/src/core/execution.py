@@ -16,6 +16,7 @@ from src.core.models import (
 )
 from src.core.orm_models import Strategy
 from src.core.order_manager import OrderManager
+from src.core.order_manager import PositionCachePersistenceError
 from src.core.runtime_capabilities import (
     OrderAccountIdentity,
     OrderAccountIdentityResolver,
@@ -168,6 +169,7 @@ class ExecutionEngine:
         self._submission_gate_owner = ExecutionSubmissionGate(
             self._log_submission_drain_callback_failure
         )
+        self._fill_position_cache_failed = False
         self._conditional_order_lifecycle = ConditionalOrderLifecycleOwner(
             order_manager=self.order_manager,
             adapter=self.adapter,
@@ -203,6 +205,7 @@ class ExecutionEngine:
                 self._cancel_linked_conditional_order_for_protection_fill
             ),
             remote_follow_up_required=self._remote_follow_up_required,
+            on_position_cache_failure=self._latch_fill_position_cache_failure,
         )
         self._order_reconciler = OrderReconciler(
             adapter=self.adapter,
@@ -231,6 +234,7 @@ class ExecutionEngine:
                 else None
             ),
             logger=self.logger,
+            on_position_cache_failure=self._latch_fill_position_cache_failure,
         )
         self.logger.info(
             "ExecutionEngine initialized with adapter: %s", type(adapter).__name__
@@ -270,7 +274,14 @@ class ExecutionEngine:
 
     def reconcile_recoverable_client_orders(self) -> dict:
         with self._order_event_apply_lock:
-            return self._order_reconciler.reconcile_recoverable_client_orders()
+            summary = self._order_reconciler.reconcile_recoverable_client_orders()
+            if any(
+                result.get("repair_action") == "applied_position_cache_failed"
+                for result in summary.get("results", [])
+                if isinstance(result, Mapping)
+            ):
+                self._latch_fill_position_cache_failure()
+            return summary
 
     def reconcile_owned_orders(self, *, snapshot_loader=None) -> dict[str, object]:
         return self._order_reconciler.reconcile_owned_orders(
@@ -687,12 +698,15 @@ class ExecutionEngine:
                     price,
                     fee,
                 )
-                self.order_manager.fill_order(
-                    order=order,
-                    fill_price=price,
-                    fill_quantity=qty,
-                    fee=fee,
-                )
+                try:
+                    self.order_manager.fill_order(
+                        order=order,
+                        fill_price=price,
+                        fill_quantity=qty,
+                        fee=fee,
+                    )
+                except PositionCachePersistenceError:
+                    self._latch_fill_position_cache_failure()
                 if self.audit_external_orders and order.type in {"market", "limit"}:
                     failures = self._place_pending_conditional_orders_for_entry(order)
                     if failures:
@@ -714,7 +728,7 @@ class ExecutionEngine:
         allow_remote_side_effects: bool = True,
     ) -> dict[str, object]:
         with self._order_event_apply_lock:
-            return self._order_event_processor(
+            result = self._order_event_processor(
                 self.order_manager.repo,
                 event,
                 lambda: self._order_event_applier.process_exchange_order_event(
@@ -722,6 +736,27 @@ class ExecutionEngine:
                     allow_remote_side_effects=allow_remote_side_effects,
                 ),
             )
+            if result.get("action") == "applied_position_cache_failed":
+                self._latch_fill_position_cache_failure()
+            return result
+
+    @property
+    def fill_position_cache_failed(self) -> bool:
+        return self._fill_position_cache_failed
+
+    def _latch_fill_position_cache_failure(self) -> None:
+        if self._fill_position_cache_failed:
+            return
+        self._fill_position_cache_failed = True
+        self.logger.error(
+            "Live fill position cache projection failed; new entries remain disabled",
+            extra={
+                "component": "execution_engine",
+                "event_code": "fill_position_cache_failed",
+                "stage": "position_cache_projection",
+                "disposition": "entry_admission_latched",
+            },
+        )
 
     def _record_order_ack(
         self,

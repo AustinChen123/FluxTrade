@@ -908,7 +908,7 @@ def test_native_children_sharing_parent_user_tag_do_not_duplicate_parent_identit
                     "take_profit": {"client_order_id": "strategy-execution-tp-123"},
                 }
             }
-        },
+        }
     )
     remotes = [
         remote_order(
@@ -971,15 +971,22 @@ def test_position_comparison_covers_recovered_and_locally_held_products():
             "product_id": "RITHMIC:NQ-202609",
             "local_quantity": "1",
             "remote_quantity": "2",
-        }
+        },
     ]
 
-def test_reconciler_applies_owned_event_without_remote_side_effects_and_audits():
+
+@pytest.mark.parametrize(
+    "applied_action",
+    ["applied", "applied_position_cache_failed"],
+)
+def test_reconciler_applies_owned_event_without_remote_side_effects_and_audits(
+    applied_action,
+):
     order = local_order(status="SUBMITTED")
     repo = MagicMock()
     repo.list_client_orders_by_statuses.return_value = [order]
     order_manager = SimpleNamespace(repo=repo)
-    processor = Mock(return_value={"action": "applied"})
+    processor = Mock(return_value={"action": applied_action})
     db = MagicMock()
     reconciler = owned_reconciler(
         adapter=MagicMock(),

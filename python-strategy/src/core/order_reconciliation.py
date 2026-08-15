@@ -24,6 +24,7 @@ from src.core.order_event_sync import (
     exchange_snapshot_to_order_event,
     snapshot_fill_fee_rejection,
 )
+from src.core.order_manager import PositionCachePersistenceError
 
 
 class _ExchangeOrderEventProcessor(Protocol):
@@ -61,6 +62,7 @@ class OrderReconciler:
         cancel_linked_conditional_for_protection_fill: Callable[[object], dict | None],
         local_positions_loader: Callable[[], list[object]] | None = None,
         logger: Optional[logging.Logger] = None,
+        on_position_cache_failure: Callable[[], None] | None = None,
     ) -> None:
         self.adapter = adapter
         adapter_exchange_id = getattr(adapter, "exchange_id", None)
@@ -88,6 +90,7 @@ class OrderReconciler:
         )
         self.local_positions_loader = local_positions_loader
         self.logger = logger or logging.getLogger("OrderReconciler")
+        self.on_position_cache_failure = on_position_cache_failure or (lambda: None)
         self._owned_order_reconciler = (
             adapter.create_owned_order_reconciler(
                 OwnedOrderReconciliationContext(
@@ -510,16 +513,21 @@ class OrderReconciler:
                         reason=fee_rejection.removeprefix("unresolved_"),
                         unresolved=True,
                     )
-                self.order_manager.record_fill_delta(
-                    order,
-                    priced_fill["price"],
-                    priced_fill["quantity"],
-                    snapshot.filled_quantity,
-                    snapshot.average_price,
-                    terminal_status=terminal_status,
-                    fee=priced_fill["fee"],
-                    fee_asset=snapshot.fee_asset,
-                )
+                cache_degraded = False
+                try:
+                    self.order_manager.record_fill_delta(
+                        order,
+                        priced_fill["price"],
+                        priced_fill["quantity"],
+                        snapshot.filled_quantity,
+                        snapshot.average_price,
+                        terminal_status=terminal_status,
+                        fee=priced_fill["fee"],
+                        fee_asset=snapshot.fee_asset,
+                    )
+                except PositionCachePersistenceError:
+                    self.on_position_cache_failure()
+                    cache_degraded = True
                 cancel_failure = self.cancel_linked_conditional_for_protection_fill(
                     order
                 )
@@ -531,7 +539,11 @@ class OrderReconciler:
                     )
                 self._mark_reconciled(order)
                 return self._repair_result(
-                    self._filled_terminal_repair_action(terminal_status),
+                    (
+                        "applied_position_cache_failed"
+                        if cache_degraded
+                        else self._filled_terminal_repair_action(terminal_status)
+                    ),
                 )
 
             order.status = terminal_status.value
@@ -680,15 +692,19 @@ class OrderReconciler:
                 reason=fee_rejection.removeprefix("unresolved_"),
                 unresolved=True,
             )
-        self.order_manager.record_partial_fill(
-            order,
-            priced_fill["price"],
-            priced_fill["quantity"],
-            snapshot.filled_quantity,
-            snapshot.average_price,
-            fee=priced_fill["fee"],
-            fee_asset=snapshot.fee_asset,
-        )
+        try:
+            self.order_manager.record_partial_fill(
+                order,
+                priced_fill["price"],
+                priced_fill["quantity"],
+                snapshot.filled_quantity,
+                snapshot.average_price,
+                fee=priced_fill["fee"],
+                fee_asset=snapshot.fee_asset,
+            )
+        except PositionCachePersistenceError:
+            self.on_position_cache_failure()
+            return self._repair_result("applied_position_cache_failed")
         return self._repair_result("recorded_partial_fill_and_restored_tracking")
 
     def _mark_reconciled(self, order) -> None:

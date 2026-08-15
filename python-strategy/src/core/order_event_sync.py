@@ -5,6 +5,7 @@ from typing import Callable, Optional
 from src.core.fill_delta import FillDelta, fill_delta_from_cumulative
 from src.core.interfaces.exchange import ExchangeOrderEvent
 from src.core.models import OrderStatus
+from src.core.order_manager import PositionCachePersistenceError
 
 
 def snapshot_fill_fee_rejection(
@@ -39,6 +40,7 @@ class OrderEventApplier:
         protective_partial_fill_requires_resize: Callable[[object, str], dict | None],
         cancel_linked_conditional_for_protection_fill: Callable[[object], dict | None],
         remote_follow_up_required: Callable[[object, str], bool] | None = None,
+        on_position_cache_failure: Callable[[], None] | None = None,
     ) -> None:
         self.order_manager = order_manager
         self.journal_fill = journal_fill
@@ -59,6 +61,7 @@ class OrderEventApplier:
         self.remote_follow_up_required = remote_follow_up_required or (
             lambda _order, _event_state: True
         )
+        self.on_position_cache_failure = on_position_cache_failure or (lambda: None)
 
     def process_exchange_order_event(
         self,
@@ -172,16 +175,21 @@ class OrderEventApplier:
                     "order_id": order.id,
                     "status": event.status,
                 }
-            self.order_manager.record_fill_delta(
-                order,
-                fill_delta["price"],
-                fill_delta["quantity"],
-                cumulative_filled_quantity=cumulative_quantity,
-                cumulative_average_price=cumulative_average,
-                terminal_status=terminal_status,
-                fee=event.fee,
-                fee_asset=event.fee_asset,
-            )
+            cache_degraded = False
+            try:
+                self.order_manager.record_fill_delta(
+                    order,
+                    fill_delta["price"],
+                    fill_delta["quantity"],
+                    cumulative_filled_quantity=cumulative_quantity,
+                    cumulative_average_price=cumulative_average,
+                    terminal_status=terminal_status,
+                    fee=event.fee,
+                    fee_asset=event.fee_asset,
+                )
+            except PositionCachePersistenceError:
+                self.on_position_cache_failure()
+                cache_degraded = True
             if self.journal_fill is not None:
                 self.journal_fill(
                     order,
@@ -190,6 +198,7 @@ class OrderEventApplier:
                     fill_delta["quantity"],
                 )
         else:
+            cache_degraded = False
             self._apply_exchange_order_event_status(order, event_state, event)
 
         if terminal_failure_state:
@@ -228,7 +237,7 @@ class OrderEventApplier:
                         "exchange_order_id": order.exchange_order_id,
                     }
                 return {
-                    "action": "applied",
+                    "action": self._applied_action(cache_degraded),
                     "order_id": order.id,
                     "status": event.status,
                     "state": event_state,
@@ -288,13 +297,17 @@ class OrderEventApplier:
                 }
 
         return {
-            "action": "applied",
+            "action": self._applied_action(cache_degraded),
             "order_id": order.id,
             "status": event.status,
             "state": event_state,
             "fill_quantity": fill_delta["quantity"],
             "exchange_order_id": order.exchange_order_id,
         }
+
+    @staticmethod
+    def _applied_action(cache_degraded: bool) -> str:
+        return "applied_position_cache_failed" if cache_degraded else "applied"
 
     def _resolve_order_event_order(self, event: ExchangeOrderEvent):
         if event.client_order_id:

@@ -242,7 +242,11 @@ class RithmicOwnedOrderReconciler:
                 )
                 action = str(applied["action"])
                 result["repair_action"] = action
-                if action not in {"applied", "unresolved_remote_actions_suppressed"}:
+                if action not in {
+                    "applied",
+                    "applied_position_cache_failed",
+                    "unresolved_remote_actions_suppressed",
+                }:
                     result["classification"] = "unresolved"
                     result["reason"] = f"event_application_{action}"
                     result["verification_blocked"] = True

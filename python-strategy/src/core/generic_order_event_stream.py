@@ -4,6 +4,9 @@ from collections.abc import Mapping
 from typing import Callable, Protocol, cast
 
 
+_SAFE_ACTIONS = frozenset({"applied", "applied_position_cache_failed"})
+
+
 class _Worker(Protocol):
     def start(self) -> None: ...
 
@@ -98,7 +101,7 @@ class GenericOrderEventStream:
                     result = self._process_event(event)
                     if not (
                         isinstance(result, Mapping)
-                        and result.get("action") == "applied"
+                        and result.get("action") in _SAFE_ACTIONS
                     ):
                         self._event_logger.error(
                             "Exchange order event could not be applied; submissions remain halted"

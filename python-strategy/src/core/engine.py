@@ -1582,6 +1582,26 @@ class StrategyEngine:
         """Apply the venue-owned health gate to new exposure only."""
         if (
             signal.type in (SignalType.LONG, SignalType.SHORT)
+            and getattr(
+                self.execution_engine,
+                "fill_position_cache_failed",
+                False,
+            )
+            is True
+        ):
+            logger.warning(
+                "Entry signal rejected by fill position cache authority",
+                extra={
+                    "component": "strategy_engine",
+                    "event_code": "entry_admission_rejected",
+                    "strategy_id": signal.strategy_id,
+                    "product_id": signal.product_id,
+                    "signal_type": signal.type.value,
+                },
+            )
+            return False
+        if (
+            signal.type in (SignalType.LONG, SignalType.SHORT)
             and self.execution_engine.order_event_stream_failed
         ):
             return False

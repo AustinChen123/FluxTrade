@@ -302,6 +302,29 @@ def test_non_exact_applied_result_latches_before_halting(
     )
 
 
+def test_cache_degraded_result_continues_without_stream_or_submission_latch() -> None:
+    events: list[str] = []
+    adapter = MagicMock()
+    service, _current, stop_event, logger = _service(
+        events,
+        adapter=adapter,
+        process_result={"action": "applied_position_cache_failed"},
+    )
+
+    def poll_once() -> str:
+        stop_event.set()
+        return "event-1"
+
+    adapter.poll_order_event.side_effect = poll_once
+
+    service.start()
+
+    assert "latch" not in events
+    assert "halt" not in events
+    assert "process:event-1" in events
+    logger.error.assert_not_called()
+
+
 @pytest.mark.parametrize("failure_owner", ("leadership", "poll", "process"))
 def test_worker_failure_logs_once_and_halts(failure_owner: str) -> None:
     events: list[str] = []

@@ -1299,6 +1299,8 @@ class TestEngineInit:
         assert len(conditionals) == 2
         assert {order.status for order in conditionals} == {OrderStatus.NEW.value}
         engine.execution_engine.order_manager.update_position_script = MagicMock()
+        engine.execution_engine.order_manager.redis_client = MagicMock()
+        engine.execution_engine.order_manager.redis_client.hgetall.return_value = {}
 
         def resume_and_report_unlocked() -> bool:
             engine._resume_after_kill_switch()
@@ -1510,6 +1512,8 @@ class TestEngineInit:
         assert len(conditionals) == 2
         assert {order.status for order in conditionals} == {OrderStatus.NEW.value}
         engine.execution_engine.order_manager.update_position_script = MagicMock()
+        engine.execution_engine.order_manager.redis_client = MagicMock()
+        engine.execution_engine.order_manager.redis_client.hgetall.return_value = {}
         engine.account_service.get_balance = MagicMock(return_value=Decimal("50000"))
         adapter.get_balance = MagicMock(
             side_effect=RuntimeError("provider-balance-secret-sentinel")
@@ -4620,12 +4624,17 @@ class TestHeartbeatRecording:
             "signal_type": signal_type.value,
         }
 
+    @pytest.mark.parametrize(
+        "admission_failure",
+        ["liveness", "fill_position_cache"],
+    )
     @pytest.mark.parametrize("kill_switch_active", [False, True])
     def test_portfolio_entry_admission_preserves_runtime_dispositions_and_exits(
         self,
         engine,
         mock_strategy_class,
         kill_switch_active,
+        admission_failure,
     ):
         class StatefulSleeve(mock_strategy_class):
             def __init__(self, strategy_id: str):
@@ -4690,8 +4699,11 @@ class TestHeartbeatRecording:
             lambda *_args: PortfolioExposureSnapshot({})
         )
         gate = MagicMock(spec=RithmicPublisherLivenessGate)
-        gate.observe.return_value = False
+        gate.observe.return_value = admission_failure != "liveness"
         engine._entry_admission_gate = gate
+        engine.execution_engine._fill_position_cache_failed = (
+            admission_failure == "fill_position_cache"
+        )
         engine._signal_processor.entry_admission_handler = (
             engine._entry_signal_allowed_for_processor
         )
@@ -4725,7 +4737,10 @@ class TestHeartbeatRecording:
             engine.execution_engine.execute_signal.call_args.args[0].type
             == SignalType.EXIT_LONG
         )
-        gate.observe.assert_called_once_with()
+        if admission_failure == "liveness":
+            gate.observe.assert_called_once_with()
+        else:
+            gate.observe.assert_not_called()
 
     def test_trade_entry_kill_switch_rejection_does_not_read_liveness_gate(
         self,
@@ -7865,6 +7880,7 @@ class TestExchangeOrderEventThread:
         ("action", "requires_reconciliation"),
         [
             ("applied", False),
+            ("applied_position_cache_failed", False),
             ("unknown_order", True),
             ("unknown_status", True),
             ("unresolved_last_fill_without_cumulative_quantity", True),

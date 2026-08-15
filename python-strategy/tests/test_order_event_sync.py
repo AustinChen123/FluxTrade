@@ -2,6 +2,8 @@ from decimal import Context, Decimal, ROUND_DOWN, ROUND_HALF_UP, localcontext
 from unittest.mock import Mock
 
 import pytest
+from redis.exceptions import ConnectionError as RedisConnectionError
+from redis.exceptions import ResponseError
 
 from src.core.interfaces.exchange import ExchangeOrderEvent, ExchangeOrderSnapshot
 from src.core.models import OrderStatus
@@ -498,3 +500,161 @@ def test_recovery_applies_fill_without_executing_remote_follow_up(
     place_protection.assert_not_called()
     resize_protection.assert_not_called()
     cancel_sibling.assert_not_called()
+
+
+@pytest.mark.parametrize("failure_owner", ["read", "write"])
+def test_cache_failure_keeps_trade_journal_and_protection_then_replays_safely(
+    mock_clock,
+    mock_order_repo,
+    order_factory,
+    failure_owner,
+):
+    order_manager = OrderManager(mock_order_repo, mock_clock, is_backtest=True)
+    order_manager.is_backtest = False
+    order_manager.redis_client = Mock()
+    order_manager.update_position_script = Mock()
+    if failure_owner == "read":
+        order_manager.redis_client.hgetall.side_effect = RedisConnectionError(
+            "provider-cache-sentinel"
+        )
+    else:
+        order_manager.redis_client.hgetall.return_value = {}
+        order_manager.update_position_script.side_effect = ResponseError(
+            "provider-cache-sentinel"
+        )
+    journaled: list[str] = []
+    protection_orders: list[str] = []
+
+    def place_protection(order):
+        if not protection_orders:
+            protection_orders.append(str(order.id))
+        return []
+
+    applier = OrderEventApplier(
+        order_manager=order_manager,
+        journal_fill=lambda order, *_args: journaled.append(str(order.id)),
+        fail_pending_conditionals_for_terminal_entry=lambda _order: None,
+        protective_terminal_without_fill_failure=lambda _order: None,
+        write_conditional_warning=lambda **_kwargs: None,
+        place_pending_conditionals_for_entry=place_protection,
+        protective_partial_fill_requires_resize=lambda _order, _state: None,
+        cancel_linked_conditional_for_protection_fill=lambda _order: None,
+    )
+    order = order_factory(
+        exchange_order_id="EX-CACHE-FAIL",
+        status=OrderStatus.SUBMITTED.value,
+        quantity=Decimal("1"),
+    )
+    mock_order_repo.add_order(order)
+    event = ExchangeOrderEvent(
+        status="filled",
+        product_id=order.product_id,
+        exchange_order_id="EX-CACHE-FAIL",
+        cumulative_filled_quantity=Decimal("1"),
+        cumulative_average_price=Decimal("101.25"),
+        fee=Decimal("0.08"),
+        fee_asset="USDC",
+    )
+
+    first = applier.process_exchange_order_event(event)
+    replay = applier.process_exchange_order_event(event)
+
+    assert first["action"] == "applied_position_cache_failed"
+    assert replay["action"] == "applied"
+    assert len(mock_order_repo.trades) == 1
+    assert journaled == [str(order.id)]
+    assert protection_orders == [str(order.id)]
+    if failure_owner == "read":
+        order_manager.update_position_script.assert_not_called()
+    else:
+        order_manager.update_position_script.assert_called_once()
+
+
+def test_cache_failure_does_not_mask_journal_failure(
+    mock_clock,
+    mock_order_repo,
+    order_factory,
+):
+    order_manager = OrderManager(mock_order_repo, mock_clock, is_backtest=True)
+    order_manager.is_backtest = False
+    order_manager.redis_client = Mock()
+    order_manager.redis_client.hgetall.side_effect = RedisConnectionError("cache")
+    order_manager.update_position_script = Mock()
+    place_protection = Mock(return_value=[])
+    applier = OrderEventApplier(
+        order_manager=order_manager,
+        journal_fill=Mock(side_effect=RuntimeError("journal-primary")),
+        fail_pending_conditionals_for_terminal_entry=lambda _order: None,
+        protective_terminal_without_fill_failure=lambda _order: None,
+        write_conditional_warning=lambda **_kwargs: None,
+        place_pending_conditionals_for_entry=place_protection,
+        protective_partial_fill_requires_resize=lambda _order, _state: None,
+        cancel_linked_conditional_for_protection_fill=lambda _order: None,
+    )
+    order = order_factory(
+        exchange_order_id="EX-JOURNAL-FAIL",
+        status=OrderStatus.SUBMITTED.value,
+        quantity=Decimal("1"),
+    )
+    mock_order_repo.add_order(order)
+
+    with pytest.raises(RuntimeError, match="journal-primary"):
+        applier.process_exchange_order_event(
+            ExchangeOrderEvent(
+                status="filled",
+                product_id=order.product_id,
+                exchange_order_id="EX-JOURNAL-FAIL",
+                cumulative_filled_quantity=Decimal("1"),
+                cumulative_average_price=Decimal("101.25"),
+                fee=Decimal("0.08"),
+                fee_asset="USDC",
+            )
+        )
+
+    assert len(mock_order_repo.trades) == 1
+    place_protection.assert_not_called()
+
+
+def test_cache_failure_does_not_mask_protection_failure(
+    mock_clock,
+    mock_order_repo,
+    order_factory,
+):
+    order_manager = OrderManager(mock_order_repo, mock_clock, is_backtest=True)
+    order_manager.is_backtest = False
+    order_manager.redis_client = Mock()
+    order_manager.redis_client.hgetall.side_effect = RedisConnectionError("cache")
+    order_manager.update_position_script = Mock()
+    failure = {"reason": "protection-primary"}
+    applier = OrderEventApplier(
+        order_manager=order_manager,
+        journal_fill=None,
+        fail_pending_conditionals_for_terminal_entry=lambda _order: None,
+        protective_terminal_without_fill_failure=lambda _order: None,
+        write_conditional_warning=lambda **_kwargs: None,
+        place_pending_conditionals_for_entry=Mock(return_value=[failure]),
+        protective_partial_fill_requires_resize=lambda _order, _state: None,
+        cancel_linked_conditional_for_protection_fill=lambda _order: None,
+    )
+    order = order_factory(
+        exchange_order_id="EX-PROTECTION-FAIL",
+        status=OrderStatus.SUBMITTED.value,
+        quantity=Decimal("1"),
+    )
+    mock_order_repo.add_order(order)
+
+    result = applier.process_exchange_order_event(
+        ExchangeOrderEvent(
+            status="filled",
+            product_id=order.product_id,
+            exchange_order_id="EX-PROTECTION-FAIL",
+            cumulative_filled_quantity=Decimal("1"),
+            cumulative_average_price=Decimal("101.25"),
+            fee=Decimal("0.08"),
+            fee_asset="USDC",
+        )
+    )
+
+    assert result["action"] == "unresolved_conditional_order_placement_failed"
+    assert result["failures"] == [failure]
+    assert len(mock_order_repo.trades) == 1

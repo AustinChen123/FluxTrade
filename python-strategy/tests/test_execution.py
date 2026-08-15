@@ -20,6 +20,7 @@ from decimal import Decimal
 from unittest.mock import MagicMock, patch
 
 from prometheus_client import REGISTRY
+from redis.exceptions import ConnectionError as RedisConnectionError
 from sqlalchemy.orm import Session
 
 from src.core.adapters.ccxt_adapter import CcxtExchangeAdapter
@@ -175,6 +176,191 @@ def execution_engine(
         adapter=mock_exchange_adapter,
         order_repository=mock_order_repo,
     )
+
+
+def test_cache_degraded_order_event_latches_entry_only_once(
+    execution_engine,
+    caplog,
+):
+    execution_engine._order_event_processor = MagicMock(
+        return_value={"action": "applied_position_cache_failed"}
+    )
+    event = ExchangeOrderEvent(
+        status="filled",
+        product_id="BINANCE:BTCUSDT-PERP",
+        exchange_order_id="EX-CACHE-DEGRADED",
+    )
+
+    with caplog.at_level("ERROR", logger="ExecutionEngine"):
+        first = execution_engine.process_exchange_order_event(event)
+        second = execution_engine.process_exchange_order_event(event)
+
+    assert first == second == {"action": "applied_position_cache_failed"}
+    assert execution_engine.fill_position_cache_failed is True
+    records = [
+        record
+        for record in caplog.records
+        if getattr(record, "event_code", None) == "fill_position_cache_failed"
+    ]
+    assert len(records) == 1
+    assert {
+        "message": records[0].getMessage(),
+        "component": vars(records[0])["component"],
+        "stage": vars(records[0])["stage"],
+        "disposition": vars(records[0])["disposition"],
+    } == {
+        "message": (
+            "Live fill position cache projection failed; new entries remain disabled"
+        ),
+        "component": "execution_engine",
+        "stage": "position_cache_projection",
+        "disposition": "entry_admission_latched",
+    }
+
+
+def test_startup_cache_degraded_repair_latches_entry_without_relabeling_summary(
+    execution_engine,
+):
+    summary = {
+        "results": [
+            {
+                "repair_action": "applied_position_cache_failed",
+                "unresolved": False,
+                "verification_blocked": False,
+            }
+        ],
+        "unresolved_count": 0,
+        "verification_blocked_count": 0,
+    }
+    execution_engine._order_reconciler.reconcile_recoverable_client_orders = MagicMock(
+        return_value=summary
+    )
+
+    result = execution_engine.reconcile_recoverable_client_orders()
+
+    assert result is summary
+    assert execution_engine.fill_position_cache_failed is True
+    assert result["unresolved_count"] == 0
+
+
+@pytest.mark.parametrize(
+    ("later_failure", "expected_action"),
+    [
+        ("protection", "unresolved_conditional_order_placement_failed"),
+        ("remote_suppressed", "unresolved_remote_actions_suppressed"),
+    ],
+)
+def test_cache_latch_survives_later_order_event_failure(
+    execution_engine,
+    mock_order_repo,
+    order_factory,
+    later_failure,
+    expected_action,
+):
+    execution_engine.order_manager.redis_client = MagicMock()
+    execution_engine.order_manager.redis_client.hgetall.side_effect = (
+        RedisConnectionError("cache")
+    )
+    execution_engine.order_manager.update_position_script = MagicMock()
+    if later_failure == "protection":
+        execution_engine._order_event_applier.place_pending_conditionals_for_entry = (
+            MagicMock(return_value=[{"reason": "protection-primary"}])
+        )
+    else:
+        execution_engine._order_event_applier.remote_follow_up_required = MagicMock(
+            return_value=True
+        )
+    order = order_factory(
+        exchange_order_id="EX-COMBINED-CACHE",
+        status=OrderStatus.SUBMITTED.value,
+        quantity=Decimal("1"),
+    )
+    mock_order_repo.add_order(order)
+
+    result = execution_engine.process_exchange_order_event(
+        ExchangeOrderEvent(
+            status="filled",
+            product_id=order.product_id,
+            exchange_order_id=order.exchange_order_id,
+            cumulative_filled_quantity=Decimal("1"),
+            cumulative_average_price=Decimal("101.25"),
+        ),
+        allow_remote_side_effects=later_failure != "remote_suppressed",
+    )
+
+    assert result["action"] == expected_action
+    assert execution_engine.fill_position_cache_failed is True
+
+
+def test_cache_latch_survives_later_journal_exception(
+    execution_engine,
+    mock_order_repo,
+    order_factory,
+):
+    execution_engine.order_manager.redis_client = MagicMock()
+    execution_engine.order_manager.redis_client.hgetall.side_effect = (
+        RedisConnectionError("cache")
+    )
+    execution_engine.order_manager.update_position_script = MagicMock()
+    execution_engine._order_event_applier.journal_fill = MagicMock(
+        side_effect=RuntimeError("journal-primary")
+    )
+    order = order_factory(
+        exchange_order_id="EX-CACHE-JOURNAL",
+        status=OrderStatus.SUBMITTED.value,
+        quantity=Decimal("1"),
+    )
+    mock_order_repo.add_order(order)
+
+    with pytest.raises(RuntimeError, match="^journal-primary$"):
+        execution_engine.process_exchange_order_event(
+            ExchangeOrderEvent(
+                status="filled",
+                product_id=order.product_id,
+                exchange_order_id=order.exchange_order_id,
+                cumulative_filled_quantity=Decimal("1"),
+                cumulative_average_price=Decimal("101.25"),
+            )
+        )
+
+    assert execution_engine.fill_position_cache_failed is True
+
+
+def test_cache_latch_survives_reconciliation_linked_cancel_failure(
+    execution_engine,
+    mock_order_repo,
+    order_factory,
+):
+    execution_engine.order_manager.redis_client = MagicMock()
+    execution_engine.order_manager.redis_client.hgetall.side_effect = (
+        RedisConnectionError("cache")
+    )
+    execution_engine.order_manager.update_position_script = MagicMock()
+    execution_engine._order_reconciler.cancel_linked_conditional_for_protection_fill = (
+        MagicMock(return_value={"reason": "cancel-primary"})
+    )
+    order = order_factory(
+        status=OrderStatus.SUBMITTED.value,
+        quantity=Decimal("1"),
+    )
+    mock_order_repo.add_order(order)
+
+    result = execution_engine._order_reconciler._repair_reconciled_order(
+        order,
+        "exchange_closed",
+        ExchangeOrderSnapshot(
+            client_order_id=order.client_order_id,
+            exchange_order_id="EX-RECONCILED-CACHE",
+            status="closed",
+            filled_quantity=Decimal("1"),
+            average_price=Decimal("101.25"),
+            fee=Decimal("0.08"),
+            fee_asset="USDC",
+        ),
+    )
+
+    assert result["action"] == "unresolved_linked_conditional_cancel_failed"
+    assert execution_engine.fill_position_cache_failed is True
 
 
 def _binance_btcusdt_market_rules(min_notional: str = "10") -> dict:
@@ -8324,6 +8510,8 @@ class TestCancelOrder:
         assert order_id is not None
         entry = mock_order_repo.orders[order_id]
         engine.order_manager.update_position_script = MagicMock()
+        engine.order_manager.redis_client = MagicMock()
+        engine.order_manager.redis_client.hgetall.return_value = {}
         engine.order_manager.is_backtest = False
         mock_exchange_adapter.cancel_terminal_state_delivered_by_order_events = (
             lambda: True
@@ -8349,6 +8537,8 @@ class TestCancelOrder:
             is_backtest=True,
         )
         restarted.order_manager.update_position_script = MagicMock()
+        restarted.order_manager.redis_client = MagicMock()
+        restarted.order_manager.redis_client.hgetall.return_value = {}
         restarted.order_manager.is_backtest = False
         restart_reconcile = restarted.reconcile_recoverable_client_orders()
         assert restart_reconcile["recoverable_count"] == 3

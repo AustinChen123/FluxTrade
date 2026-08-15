@@ -11,7 +11,7 @@ from src.core.interfaces.exchange import ExchangeOrderEvent
 
 from .rithmic_adapter import RithmicUnmappedOrderEvent
 
-_SAFE_ACTIONS = frozenset({"applied"})
+_SAFE_ACTIONS = frozenset({"applied", "applied_position_cache_failed"})
 
 
 class RithmicOrderEventAdapter(Protocol):
