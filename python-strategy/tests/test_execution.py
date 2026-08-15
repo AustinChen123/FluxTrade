@@ -10,7 +10,7 @@ Covers:
 - Market data processing for simulated fills
 """
 
-from contextlib import nullcontext
+from contextlib import AbstractContextManager, nullcontext
 from copy import copy
 import threading
 from types import SimpleNamespace
@@ -20,6 +20,7 @@ from decimal import Decimal
 from unittest.mock import MagicMock, patch
 
 from prometheus_client import REGISTRY
+from sqlalchemy.orm import Session
 
 from src.core.adapters.ccxt_adapter import CcxtExchangeAdapter
 from src.core.adapters.live_binance import LiveBinanceAdapter
@@ -39,6 +40,10 @@ from src.core.interfaces.exchange import ExchangeOrderLookupUnsupported
 from src.core.models import OrderSide, OrderStatus, Position, PositionSide, SignalType
 from src.core.orm_models import SignalAudit, SystemEvent
 from src.core.client_order_id import generate_client_order_id, parse_client_order_id
+
+
+def _session_context(session: Session) -> AbstractContextManager[Session]:
+    return nullcontext(session)
 
 
 @pytest.fixture
@@ -624,7 +629,7 @@ class TestQuantityHandling:
             clock=mock_clock,
             adapter=mock_exchange_adapter,
             order_repository=mock_order_repo,
-            db_session_factory=lambda: nullcontext(mock_db_session),
+            db_session_factory=lambda: _session_context(mock_db_session),
             audit_external_orders=True,
         )
         signal = signal_factory(
@@ -884,7 +889,7 @@ class TestQuantityHandling:
             clock=mock_clock,
             adapter=mock_exchange_adapter,
             order_repository=mock_order_repo,
-            db_session_factory=lambda: nullcontext(mock_db_session),
+            db_session_factory=lambda: _session_context(mock_db_session),
             audit_external_orders=True,
         )
         sentinel = RuntimeError("intent audit unavailable")
@@ -920,7 +925,7 @@ def test_verified_net_reduction_requires_gate_and_omits_reduce_only(
         clock=mock_clock,
         adapter=mock_exchange_adapter,
         order_repository=mock_order_repo,
-        db_session_factory=lambda: nullcontext(mock_db_session),
+        db_session_factory=lambda: _session_context(mock_db_session),
         audit_external_orders=True,
     )
     signal = signal_factory(
@@ -980,7 +985,7 @@ def test_verified_net_reduction_rejects_entry_signal_before_submission(
         clock=mock_clock,
         adapter=mock_exchange_adapter,
         order_repository=mock_order_repo,
-        db_session_factory=lambda: nullcontext(mock_db_session),
+        db_session_factory=lambda: _session_context(mock_db_session),
         audit_external_orders=True,
     )
     signal = signal_factory(signal_type=SignalType.LONG, quantity=Decimal("1"))
@@ -1488,7 +1493,7 @@ class TestExecutionTradingRules:
             clock=mock_clock,
             adapter=adapter,
             order_repository=mock_order_repo,
-            db_session_factory=lambda: nullcontext(mock_db_session),
+            db_session_factory=lambda: _session_context(mock_db_session),
             audit_external_orders=True,
             is_backtest=True,
             order_event_processor=process_native_protection_event,
@@ -1538,7 +1543,7 @@ class TestExecutionTradingRules:
             clock=mock_clock,
             adapter=adapter,
             order_repository=mock_order_repo,
-            db_session_factory=lambda: nullcontext(mock_db_session),
+            db_session_factory=lambda: _session_context(mock_db_session),
             audit_external_orders=True,
             is_backtest=True,
             order_event_processor=process_native_protection_event,
@@ -1671,7 +1676,7 @@ class TestExecutionTradingRules:
             clock=mock_clock,
             adapter=adapter,
             order_repository=mock_order_repo,
-            db_session_factory=lambda: nullcontext(mock_db_session),
+            db_session_factory=lambda: _session_context(mock_db_session),
             audit_external_orders=True,
             is_backtest=True,
             order_event_processor=process_native_protection_event,
@@ -1758,7 +1763,7 @@ class TestExecutionTradingRules:
             clock=mock_clock,
             adapter=adapter,
             order_repository=mock_order_repo,
-            db_session_factory=lambda: nullcontext(mock_db_session),
+            db_session_factory=lambda: _session_context(mock_db_session),
             audit_external_orders=True,
             is_backtest=True,
             order_event_processor=process_native_protection_event,
@@ -1852,7 +1857,7 @@ class TestExecutionTradingRules:
             clock=mock_clock,
             adapter=adapter,
             order_repository=mock_order_repo,
-            db_session_factory=lambda: nullcontext(mock_db_session),
+            db_session_factory=lambda: _session_context(mock_db_session),
             audit_external_orders=True,
             is_backtest=True,
             order_event_processor=process_native_protection_event,
@@ -2030,7 +2035,7 @@ class TestExecutionTradingRules:
             clock=mock_clock,
             adapter=adapter,
             order_repository=mock_order_repo,
-            db_session_factory=lambda: nullcontext(mock_db_session),
+            db_session_factory=lambda: _session_context(mock_db_session),
             audit_external_orders=True,
             is_backtest=True,
         )
@@ -2077,7 +2082,7 @@ class TestExecutionTradingRules:
             clock=mock_clock,
             adapter=adapter,
             order_repository=mock_order_repo,
-            db_session_factory=lambda: nullcontext(mock_db_session),
+            db_session_factory=lambda: _session_context(mock_db_session),
             audit_external_orders=True,
             is_backtest=True,
         )
@@ -2131,7 +2136,7 @@ class TestExecutionTradingRules:
             clock=mock_clock,
             adapter=adapter,
             order_repository=mock_order_repo,
-            db_session_factory=lambda: nullcontext(mock_db_session),
+            db_session_factory=lambda: _session_context(mock_db_session),
             audit_external_orders=True,
             is_backtest=True,
         )
@@ -2179,7 +2184,7 @@ class TestExecutionTradingRules:
             clock=mock_clock,
             adapter=mock_exchange_adapter,
             order_repository=mock_order_repo,
-            db_session_factory=lambda: nullcontext(mock_db_session),
+            db_session_factory=lambda: _session_context(mock_db_session),
             audit_external_orders=True,
             is_backtest=True,
         )
@@ -2244,7 +2249,7 @@ class TestExecutionTradingRules:
             clock=mock_clock,
             adapter=adapter,
             order_repository=mock_order_repo,
-            db_session_factory=lambda: nullcontext(mock_db_session),
+            db_session_factory=lambda: _session_context(mock_db_session),
             audit_external_orders=True,
         )
         signal = signal_factory(
@@ -2293,7 +2298,7 @@ class TestExecutionTradingRules:
             clock=mock_clock,
             adapter=adapter,
             order_repository=mock_order_repo,
-            db_session_factory=lambda: nullcontext(mock_db_session),
+            db_session_factory=lambda: _session_context(mock_db_session),
             audit_external_orders=True,
         )
         signal = signal_factory(
@@ -2330,7 +2335,7 @@ class TestExecutionTradingRules:
             clock=mock_clock,
             adapter=adapter,
             order_repository=mock_order_repo,
-            db_session_factory=lambda: nullcontext(mock_db_session),
+            db_session_factory=lambda: _session_context(mock_db_session),
             audit_external_orders=True,
         )
         signal = signal_factory(
@@ -2365,7 +2370,7 @@ class TestExecutionTradingRules:
             clock=mock_clock,
             adapter=adapter,
             order_repository=mock_order_repo,
-            db_session_factory=lambda: nullcontext(mock_db_session),
+            db_session_factory=lambda: _session_context(mock_db_session),
             audit_external_orders=True,
         )
         signal = signal_factory(
@@ -2398,7 +2403,7 @@ class TestExecutionTradingRules:
             clock=mock_clock,
             adapter=adapter,
             order_repository=mock_order_repo,
-            db_session_factory=lambda: nullcontext(mock_db_session),
+            db_session_factory=lambda: _session_context(mock_db_session),
             audit_external_orders=True,
         )
         signal = signal_factory(
@@ -2435,7 +2440,7 @@ class TestExecutionTradingRules:
             clock=mock_clock,
             adapter=adapter,
             order_repository=mock_order_repo,
-            db_session_factory=lambda: nullcontext(mock_db_session),
+            db_session_factory=lambda: _session_context(mock_db_session),
             audit_external_orders=True,
         )
         signal = signal_factory(
@@ -3701,7 +3706,7 @@ class TestAuditedExecution:
             clock=mock_clock,
             adapter=mock_exchange_adapter,
             order_repository=mock_order_repo,
-            db_session_factory=lambda: nullcontext(audit_session),
+            db_session_factory=lambda: _session_context(audit_session),
             audit_external_orders=True,
         )
         signal = signal_factory(price=Decimal("42000"), quantity=Decimal("0.25"))
@@ -3743,7 +3748,7 @@ class TestAuditedExecution:
             adapter=mock_exchange_adapter,
             order_repository=mock_order_repo,
             journal=journal,
-            db_session_factory=lambda: nullcontext(mock_db_session),
+            db_session_factory=lambda: _session_context(mock_db_session),
             audit_external_orders=True,
         )
         drained = MagicMock()
@@ -3791,7 +3796,7 @@ class TestAuditedExecution:
             clock=mock_clock,
             adapter=mock_exchange_adapter,
             order_repository=mock_order_repo,
-            db_session_factory=lambda: nullcontext(audit_session),
+            db_session_factory=lambda: _session_context(audit_session),
             audit_external_orders=True,
         )
         signal = signal_factory(price=None, value=None).model_copy(
@@ -3821,7 +3826,7 @@ class TestAuditedExecution:
             clock=mock_clock,
             adapter=mock_exchange_adapter,
             order_repository=mock_order_repo,
-            db_session_factory=lambda: nullcontext(audit_session),
+            db_session_factory=lambda: _session_context(audit_session),
             audit_external_orders=True,
         )
 
@@ -3862,7 +3867,7 @@ class TestAuditedExecution:
             clock=mock_clock,
             adapter=mock_exchange_adapter,
             order_repository=mock_order_repo,
-            db_session_factory=lambda: nullcontext(audit_session),
+            db_session_factory=lambda: _session_context(audit_session),
             audit_external_orders=True,
         )
 
@@ -3907,7 +3912,7 @@ class TestAuditedExecution:
             clock=mock_clock,
             adapter=mock_exchange_adapter,
             order_repository=mock_order_repo,
-            db_session_factory=lambda: nullcontext(audit_session),
+            db_session_factory=lambda: _session_context(audit_session),
             audit_external_orders=True,
         )
 
@@ -3930,7 +3935,7 @@ class TestAuditedExecution:
             clock=mock_clock,
             adapter=mock_exchange_adapter,
             order_repository=mock_order_repo,
-            db_session_factory=lambda: nullcontext(audit_session),
+            db_session_factory=lambda: _session_context(audit_session),
             audit_external_orders=True,
         )
         engine._validate_order_group = MagicMock(
@@ -3965,7 +3970,7 @@ class TestAuditedExecution:
             clock=mock_clock,
             adapter=mock_exchange_adapter,
             order_repository=mock_order_repo,
-            db_session_factory=lambda: nullcontext(audit_session),
+            db_session_factory=lambda: _session_context(audit_session),
             audit_external_orders=True,
         )
 
@@ -3996,7 +4001,7 @@ class TestAuditedExecution:
             clock=mock_clock,
             adapter=mock_exchange_adapter,
             order_repository=mock_order_repo,
-            db_session_factory=lambda: nullcontext(mock_db_session),
+            db_session_factory=lambda: _session_context(mock_db_session),
             audit_external_orders=True,
         )
         error = RuntimeError("rejection projection sentinel")
@@ -4052,7 +4057,7 @@ class TestAuditedExecution:
             clock=mock_clock,
             adapter=mock_exchange_adapter,
             order_repository=mock_order_repo,
-            db_session_factory=lambda: nullcontext(audit_session),
+            db_session_factory=lambda: _session_context(audit_session),
             audit_external_orders=True,
         )
 
@@ -4092,7 +4097,7 @@ class TestAuditedExecution:
             clock=mock_clock,
             adapter=mock_exchange_adapter,
             order_repository=mock_order_repo,
-            db_session_factory=lambda: nullcontext(audit_session),
+            db_session_factory=lambda: _session_context(audit_session),
             audit_external_orders=True,
         )
 
@@ -4131,7 +4136,7 @@ class TestAuditedExecution:
             clock=mock_clock,
             adapter=mock_exchange_adapter,
             order_repository=mock_order_repo,
-            db_session_factory=lambda: nullcontext(audit_session),
+            db_session_factory=lambda: _session_context(audit_session),
             audit_external_orders=True,
         )
 
@@ -4161,7 +4166,7 @@ class TestAuditedExecution:
             clock=mock_clock,
             adapter=mock_exchange_adapter,
             order_repository=mock_order_repo,
-            db_session_factory=lambda: nullcontext(audit_session),
+            db_session_factory=lambda: _session_context(audit_session),
             audit_external_orders=True,
         )
 
@@ -4229,7 +4234,7 @@ class TestAuditedExecution:
             clock=mock_clock,
             adapter=mock_exchange_adapter,
             order_repository=mock_order_repo,
-            db_session_factory=lambda: nullcontext(mock_db_session),
+            db_session_factory=lambda: _session_context(mock_db_session),
             audit_external_orders=True,
         )
         error = RuntimeError("pending warning sentinel")
@@ -4274,7 +4279,7 @@ class TestAuditedExecution:
             clock=mock_clock,
             adapter=mock_exchange_adapter,
             order_repository=mock_order_repo,
-            db_session_factory=lambda: nullcontext(audit_session),
+            db_session_factory=lambda: _session_context(audit_session),
             audit_external_orders=True,
         )
 
@@ -4338,7 +4343,7 @@ class TestAuditedExecution:
             clock=mock_clock,
             adapter=mock_exchange_adapter,
             order_repository=mock_order_repo,
-            db_session_factory=lambda: nullcontext(audit_session),
+            db_session_factory=lambda: _session_context(audit_session),
             audit_external_orders=True,
             is_backtest=True,
         )
@@ -4384,7 +4389,7 @@ class TestAuditedExecution:
             clock=mock_clock,
             adapter=mock_exchange_adapter,
             order_repository=mock_order_repo,
-            db_session_factory=lambda: nullcontext(audit_session),
+            db_session_factory=lambda: _session_context(audit_session),
             audit_external_orders=True,
             is_backtest=True,
         )
@@ -4427,7 +4432,7 @@ class TestAuditedExecution:
             clock=mock_clock,
             adapter=mock_exchange_adapter,
             order_repository=mock_order_repo,
-            db_session_factory=lambda: nullcontext(audit_session),
+            db_session_factory=lambda: _session_context(audit_session),
             audit_external_orders=True,
             is_backtest=True,
         )
@@ -4477,7 +4482,7 @@ class TestAuditedExecution:
             clock=mock_clock,
             adapter=mock_exchange_adapter,
             order_repository=mock_order_repo,
-            db_session_factory=lambda: nullcontext(audit_session),
+            db_session_factory=lambda: _session_context(audit_session),
             audit_external_orders=True,
             is_backtest=True,
         )
@@ -4578,7 +4583,7 @@ class TestAuditedExecution:
             clock=mock_clock,
             adapter=mock_exchange_adapter,
             order_repository=mock_order_repo,
-            db_session_factory=lambda: nullcontext(audit_session),
+            db_session_factory=lambda: _session_context(audit_session),
             audit_external_orders=True,
             is_backtest=True,
         )
@@ -4629,7 +4634,7 @@ class TestAuditedExecution:
             clock=mock_clock,
             adapter=mock_exchange_adapter,
             order_repository=mock_order_repo,
-            db_session_factory=lambda: nullcontext(audit_session),
+            db_session_factory=lambda: _session_context(audit_session),
             audit_external_orders=True,
             is_backtest=True,
         )
@@ -4686,7 +4691,7 @@ class TestAuditedExecution:
             clock=mock_clock,
             adapter=mock_exchange_adapter,
             order_repository=mock_order_repo,
-            db_session_factory=lambda: nullcontext(audit_session),
+            db_session_factory=lambda: _session_context(audit_session),
             audit_external_orders=True,
             is_backtest=True,
         )
@@ -4746,7 +4751,7 @@ class TestAuditedExecution:
             clock=mock_clock,
             adapter=mock_exchange_adapter,
             order_repository=mock_order_repo,
-            db_session_factory=lambda: nullcontext(audit_session),
+            db_session_factory=lambda: _session_context(audit_session),
             audit_external_orders=True,
             is_backtest=True,
         )
@@ -4806,7 +4811,7 @@ class TestAuditedExecution:
             clock=mock_clock,
             adapter=mock_exchange_adapter,
             order_repository=mock_order_repo,
-            db_session_factory=lambda: nullcontext(audit_session),
+            db_session_factory=lambda: _session_context(audit_session),
             audit_external_orders=True,
             is_backtest=True,
         )
@@ -4866,7 +4871,7 @@ class TestAuditedExecution:
             clock=mock_clock,
             adapter=mock_exchange_adapter,
             order_repository=mock_order_repo,
-            db_session_factory=lambda: nullcontext(mock_db_session),
+            db_session_factory=lambda: _session_context(mock_db_session),
             audit_external_orders=True,
             is_backtest=True,
         )
@@ -4907,7 +4912,7 @@ class TestAuditedExecution:
             clock=mock_clock,
             adapter=mock_exchange_adapter,
             order_repository=mock_order_repo,
-            db_session_factory=lambda: nullcontext(mock_db_session),
+            db_session_factory=lambda: _session_context(mock_db_session),
             audit_external_orders=True,
             is_backtest=True,
         )
@@ -4978,7 +4983,7 @@ class TestAuditedExecution:
             clock=mock_clock,
             adapter=mock_exchange_adapter,
             order_repository=mock_order_repo,
-            db_session_factory=lambda: nullcontext(mock_db_session),
+            db_session_factory=lambda: _session_context(mock_db_session),
             audit_external_orders=True,
             is_backtest=True,
         )
@@ -5033,7 +5038,7 @@ class TestAuditedExecution:
             clock=mock_clock,
             adapter=mock_exchange_adapter,
             order_repository=mock_order_repo,
-            db_session_factory=lambda: nullcontext(mock_db_session),
+            db_session_factory=lambda: _session_context(mock_db_session),
             audit_external_orders=True,
             is_backtest=True,
         )
@@ -5093,7 +5098,7 @@ class TestAuditedExecution:
             clock=mock_clock,
             adapter=mock_exchange_adapter,
             order_repository=mock_order_repo,
-            db_session_factory=lambda: nullcontext(audit_session),
+            db_session_factory=lambda: _session_context(audit_session),
             audit_external_orders=True,
             is_backtest=True,
         )
@@ -5134,7 +5139,7 @@ class TestAuditedExecution:
             clock=mock_clock,
             adapter=mock_exchange_adapter,
             order_repository=mock_order_repo,
-            db_session_factory=lambda: nullcontext(audit_session),
+            db_session_factory=lambda: _session_context(audit_session),
             audit_external_orders=True,
             is_backtest=True,
         )
@@ -5190,7 +5195,7 @@ class TestAuditedExecution:
             clock=mock_clock,
             adapter=mock_exchange_adapter,
             order_repository=mock_order_repo,
-            db_session_factory=lambda: nullcontext(audit_session),
+            db_session_factory=lambda: _session_context(audit_session),
             audit_external_orders=True,
             is_backtest=True,
         )
@@ -5225,7 +5230,7 @@ class TestAuditedExecution:
             clock=mock_clock,
             adapter=mock_exchange_adapter,
             order_repository=mock_order_repo,
-            db_session_factory=lambda: nullcontext(audit_session),
+            db_session_factory=lambda: _session_context(audit_session),
             audit_external_orders=True,
             is_backtest=True,
         )
@@ -5284,7 +5289,7 @@ class TestAuditedExecution:
             clock=mock_clock,
             adapter=mock_exchange_adapter,
             order_repository=mock_order_repo,
-            db_session_factory=lambda: nullcontext(audit_session),
+            db_session_factory=lambda: _session_context(audit_session),
             audit_external_orders=True,
             is_backtest=True,
         )
@@ -5325,7 +5330,7 @@ class TestAuditedExecution:
             clock=mock_clock,
             adapter=mock_exchange_adapter,
             order_repository=mock_order_repo,
-            db_session_factory=lambda: nullcontext(audit_session),
+            db_session_factory=lambda: _session_context(audit_session),
             audit_external_orders=True,
             is_backtest=True,
         )
@@ -5365,7 +5370,7 @@ class TestAuditedExecution:
             clock=mock_clock,
             adapter=mock_exchange_adapter,
             order_repository=mock_order_repo,
-            db_session_factory=lambda: nullcontext(audit_session),
+            db_session_factory=lambda: _session_context(audit_session),
             audit_external_orders=True,
             is_backtest=True,
         )
@@ -5416,7 +5421,7 @@ class TestAuditedExecution:
             clock=mock_clock,
             adapter=mock_exchange_adapter,
             order_repository=mock_order_repo,
-            db_session_factory=lambda: nullcontext(audit_session),
+            db_session_factory=lambda: _session_context(audit_session),
             audit_external_orders=True,
             is_backtest=True,
         )
@@ -5460,7 +5465,7 @@ class TestAuditedExecution:
             clock=mock_clock,
             adapter=mock_exchange_adapter,
             order_repository=mock_order_repo,
-            db_session_factory=lambda: nullcontext(mock_db_session),
+            db_session_factory=lambda: _session_context(mock_db_session),
             audit_external_orders=True,
         )
 
@@ -5479,7 +5484,7 @@ class TestAuditedExecution:
             clock=mock_clock,
             adapter=mock_exchange_adapter,
             order_repository=mock_order_repo,
-            db_session_factory=lambda: nullcontext(mock_db_session),
+            db_session_factory=lambda: _session_context(mock_db_session),
             audit_external_orders=True,
         )
 
@@ -5501,7 +5506,7 @@ class TestAuditedExecution:
             clock=mock_clock,
             adapter=mock_exchange_adapter,
             order_repository=mock_order_repo,
-            db_session_factory=lambda: nullcontext(mock_db_session),
+            db_session_factory=lambda: _session_context(mock_db_session),
             audit_external_orders=True,
         )
 
@@ -5537,7 +5542,7 @@ class TestAuditedExecution:
             clock=mock_clock,
             adapter=mock_exchange_adapter,
             order_repository=mock_order_repo,
-            db_session_factory=lambda: nullcontext(mock_db_session),
+            db_session_factory=lambda: _session_context(mock_db_session),
             audit_external_orders=True,
         )
 
@@ -5560,7 +5565,7 @@ class TestAuditedExecution:
             clock=mock_clock,
             adapter=mock_exchange_adapter,
             order_repository=mock_order_repo,
-            db_session_factory=lambda: nullcontext(mock_db_session),
+            db_session_factory=lambda: _session_context(mock_db_session),
             audit_external_orders=True,
         )
 
@@ -5618,7 +5623,7 @@ class TestAuditedExecution:
             clock=mock_clock,
             adapter=mock_exchange_adapter,
             order_repository=mock_order_repo,
-            db_session_factory=lambda: nullcontext(mock_db_session),
+            db_session_factory=lambda: _session_context(mock_db_session),
         )
         new_order = order_factory(
             order_id="new-order",
@@ -5681,7 +5686,7 @@ class TestAuditedExecution:
             clock=mock_clock,
             adapter=mock_exchange_adapter,
             order_repository=mock_order_repo,
-            db_session_factory=lambda: nullcontext(mock_db_session),
+            db_session_factory=lambda: _session_context(mock_db_session),
         )
         mock_order_repo.add_order(
             order_factory(
@@ -5704,7 +5709,7 @@ class TestAuditedExecution:
             clock=mock_clock,
             adapter=mock_exchange_adapter,
             order_repository=mock_order_repo,
-            db_session_factory=lambda: nullcontext(mock_db_session),
+            db_session_factory=lambda: _session_context(mock_db_session),
         )
         found_order = order_factory(
             order_id="found-local",
@@ -5825,7 +5830,7 @@ class TestAuditedExecution:
             clock=mock_clock,
             adapter=mock_exchange_adapter,
             order_repository=mock_order_repo,
-            db_session_factory=lambda: nullcontext(mock_db_session),
+            db_session_factory=lambda: _session_context(mock_db_session),
             is_backtest=True,
             audit_external_orders=True,
         )
@@ -5863,7 +5868,7 @@ class TestAuditedExecution:
             clock=mock_clock,
             adapter=mock_exchange_adapter,
             order_repository=mock_order_repo,
-            db_session_factory=lambda: nullcontext(mock_db_session),
+            db_session_factory=lambda: _session_context(mock_db_session),
             is_backtest=True,
             audit_external_orders=True,
         )
@@ -5924,7 +5929,7 @@ class TestAuditedExecution:
             clock=mock_clock,
             adapter=mock_exchange_adapter,
             order_repository=mock_order_repo,
-            db_session_factory=lambda: nullcontext(mock_db_session),
+            db_session_factory=lambda: _session_context(mock_db_session),
             is_backtest=True,
             audit_external_orders=True,
         )
@@ -6046,7 +6051,7 @@ class TestAuditedExecution:
             clock=mock_clock,
             adapter=mock_exchange_adapter,
             order_repository=mock_order_repo,
-            db_session_factory=lambda: nullcontext(mock_db_session),
+            db_session_factory=lambda: _session_context(mock_db_session),
             is_backtest=True,
             audit_external_orders=True,
         )
@@ -6126,7 +6131,7 @@ class TestAuditedExecution:
             clock=mock_clock,
             adapter=mock_exchange_adapter,
             order_repository=mock_order_repo,
-            db_session_factory=lambda: nullcontext(mock_db_session),
+            db_session_factory=lambda: _session_context(mock_db_session),
             is_backtest=True,
             audit_external_orders=True,
         )
@@ -6176,7 +6181,7 @@ class TestAuditedExecution:
             clock=mock_clock,
             adapter=mock_exchange_adapter,
             order_repository=mock_order_repo,
-            db_session_factory=lambda: nullcontext(mock_db_session),
+            db_session_factory=lambda: _session_context(mock_db_session),
             is_backtest=True,
             audit_external_orders=True,
         )
@@ -6248,7 +6253,7 @@ class TestAuditedExecution:
             clock=mock_clock,
             adapter=mock_exchange_adapter,
             order_repository=mock_order_repo,
-            db_session_factory=lambda: nullcontext(mock_db_session),
+            db_session_factory=lambda: _session_context(mock_db_session),
             is_backtest=True,
             audit_external_orders=True,
         )
@@ -6323,7 +6328,7 @@ class TestAuditedExecution:
             clock=mock_clock,
             adapter=mock_exchange_adapter,
             order_repository=mock_order_repo,
-            db_session_factory=lambda: nullcontext(mock_db_session),
+            db_session_factory=lambda: _session_context(mock_db_session),
             is_backtest=True,
             audit_external_orders=True,
         )
@@ -6345,7 +6350,7 @@ class TestAuditedExecution:
             clock=mock_clock,
             adapter=restarted_adapter,
             order_repository=mock_order_repo,
-            db_session_factory=lambda: nullcontext(mock_db_session),
+            db_session_factory=lambda: _session_context(mock_db_session),
             is_backtest=True,
             audit_external_orders=True,
         )
@@ -6367,7 +6372,7 @@ class TestAuditedExecution:
             clock=mock_clock,
             adapter=mock_exchange_adapter,
             order_repository=mock_order_repo,
-            db_session_factory=lambda: nullcontext(mock_db_session),
+            db_session_factory=lambda: _session_context(mock_db_session),
             is_backtest=True,
             audit_external_orders=True,
         )
@@ -6418,7 +6423,7 @@ class TestAuditedExecution:
             clock=mock_clock,
             adapter=mock_exchange_adapter,
             order_repository=mock_order_repo,
-            db_session_factory=lambda: nullcontext(mock_db_session),
+            db_session_factory=lambda: _session_context(mock_db_session),
             is_backtest=True,
             audit_external_orders=True,
         )
@@ -6466,7 +6471,7 @@ class TestAuditedExecution:
             clock=mock_clock,
             adapter=mock_exchange_adapter,
             order_repository=mock_order_repo,
-            db_session_factory=lambda: nullcontext(mock_db_session),
+            db_session_factory=lambda: _session_context(mock_db_session),
             is_backtest=True,
         )
         order = order_factory(
@@ -6524,7 +6529,7 @@ class TestAuditedExecution:
             clock=mock_clock,
             adapter=mock_exchange_adapter,
             order_repository=mock_order_repo,
-            db_session_factory=lambda: nullcontext(mock_db_session),
+            db_session_factory=lambda: _session_context(mock_db_session),
             is_backtest=True,
             audit_external_orders=True,
         )
@@ -6582,7 +6587,7 @@ class TestAuditedExecution:
             clock=mock_clock,
             adapter=mock_exchange_adapter,
             order_repository=mock_order_repo,
-            db_session_factory=lambda: nullcontext(mock_db_session),
+            db_session_factory=lambda: _session_context(mock_db_session),
             is_backtest=True,
             audit_external_orders=True,
         )
@@ -6628,7 +6633,7 @@ class TestAuditedExecution:
             clock=mock_clock,
             adapter=mock_exchange_adapter,
             order_repository=mock_order_repo,
-            db_session_factory=lambda: nullcontext(mock_db_session),
+            db_session_factory=lambda: _session_context(mock_db_session),
             is_backtest=True,
             audit_external_orders=True,
         )
@@ -6692,7 +6697,7 @@ class TestAuditedExecution:
             clock=mock_clock,
             adapter=mock_exchange_adapter,
             order_repository=mock_order_repo,
-            db_session_factory=lambda: nullcontext(mock_db_session),
+            db_session_factory=lambda: _session_context(mock_db_session),
             is_backtest=True,
             audit_external_orders=True,
         )
@@ -6738,7 +6743,7 @@ class TestAuditedExecution:
             clock=mock_clock,
             adapter=mock_exchange_adapter,
             order_repository=mock_order_repo,
-            db_session_factory=lambda: nullcontext(mock_db_session),
+            db_session_factory=lambda: _session_context(mock_db_session),
         )
         order = order_factory(
             order_id="recoverable",
@@ -6767,7 +6772,7 @@ class TestAuditedExecution:
             clock=mock_clock,
             adapter=mock_exchange_adapter,
             order_repository=mock_order_repo,
-            db_session_factory=lambda: nullcontext(mock_db_session),
+            db_session_factory=lambda: _session_context(mock_db_session),
         )
         order = order_factory(
             order_id="recoverable-weird-status",
@@ -6821,7 +6826,7 @@ class TestAuditedExecution:
             clock=mock_clock,
             adapter=mock_exchange_adapter,
             order_repository=mock_order_repo,
-            db_session_factory=lambda: nullcontext(audit_session),
+            db_session_factory=lambda: _session_context(audit_session),
             audit_external_orders=True,
             is_backtest=True,
         )
@@ -6864,7 +6869,7 @@ class TestAuditedExecution:
             clock=mock_clock,
             adapter=mock_exchange_adapter,
             order_repository=mock_order_repo,
-            db_session_factory=lambda: nullcontext(audit_session),
+            db_session_factory=lambda: _session_context(audit_session),
             audit_external_orders=True,
             is_backtest=True,
         )
@@ -6912,7 +6917,7 @@ class TestAuditedExecution:
             clock=mock_clock,
             adapter=mock_exchange_adapter,
             order_repository=mock_order_repo,
-            db_session_factory=lambda: nullcontext(audit_session),
+            db_session_factory=lambda: _session_context(audit_session),
             audit_external_orders=True,
             is_backtest=True,
         )
@@ -7025,7 +7030,7 @@ class TestAuditedExecution:
             clock=mock_clock,
             adapter=mock_exchange_adapter,
             order_repository=mock_order_repo,
-            db_session_factory=lambda: nullcontext(audit_session),
+            db_session_factory=lambda: _session_context(audit_session),
             audit_external_orders=True,
             is_backtest=True,
         )
@@ -7131,7 +7136,7 @@ class TestAuditedExecution:
             clock=mock_clock,
             adapter=mock_exchange_adapter,
             order_repository=mock_order_repo,
-            db_session_factory=lambda: nullcontext(audit_session),
+            db_session_factory=lambda: _session_context(audit_session),
             audit_external_orders=True,
             is_backtest=True,  # fill recording uses repo.update_position, not Redis
         )
@@ -7180,7 +7185,7 @@ class TestAuditedExecution:
             clock=mock_clock,
             adapter=mock_exchange_adapter,
             order_repository=mock_order_repo,
-            db_session_factory=lambda: nullcontext(audit_session),
+            db_session_factory=lambda: _session_context(audit_session),
             audit_external_orders=True,
         )
 
@@ -7223,7 +7228,7 @@ class TestAuditedExecution:
             clock=mock_clock,
             adapter=mock_exchange_adapter,
             order_repository=mock_order_repo,
-            db_session_factory=lambda: nullcontext(audit_session),
+            db_session_factory=lambda: _session_context(audit_session),
             audit_external_orders=True,
             is_backtest=True,
         )
@@ -7307,7 +7312,7 @@ class TestAuditedExecution:
             clock=mock_clock,
             adapter=mock_exchange_adapter,
             order_repository=mock_order_repo,
-            db_session_factory=lambda: nullcontext(audit_session),
+            db_session_factory=lambda: _session_context(audit_session),
             audit_external_orders=True,
             is_backtest=True,
         )
@@ -7380,7 +7385,7 @@ class TestAuditedExecution:
             clock=mock_clock,
             adapter=mock_exchange_adapter,
             order_repository=mock_order_repo,
-            db_session_factory=lambda: nullcontext(audit_session),
+            db_session_factory=lambda: _session_context(audit_session),
             audit_external_orders=True,
             is_backtest=True,
         )
@@ -7522,7 +7527,7 @@ class TestCancelOrder:
             clock=mock_clock,
             adapter=mock_exchange_adapter,
             order_repository=mock_order_repo,
-            db_session_factory=lambda: nullcontext(mock_db_session),
+            db_session_factory=lambda: _session_context(mock_db_session),
             audit_external_orders=True,
             is_backtest=True,
         )
@@ -7557,7 +7562,7 @@ class TestCancelOrder:
             clock=mock_clock,
             adapter=mock_exchange_adapter,
             order_repository=mock_order_repo,
-            db_session_factory=lambda: nullcontext(mock_db_session),
+            db_session_factory=lambda: _session_context(mock_db_session),
             audit_external_orders=True,
             is_backtest=True,
         )
@@ -7596,7 +7601,7 @@ class TestCancelOrder:
             clock=mock_clock,
             adapter=mock_exchange_adapter,
             order_repository=mock_order_repo,
-            db_session_factory=lambda: nullcontext(mock_db_session),
+            db_session_factory=lambda: _session_context(mock_db_session),
             audit_external_orders=True,
             is_backtest=True,
         )
@@ -7632,7 +7637,7 @@ class TestCancelOrder:
             clock=mock_clock,
             adapter=mock_exchange_adapter,
             order_repository=mock_order_repo,
-            db_session_factory=lambda: nullcontext(mock_db_session),
+            db_session_factory=lambda: _session_context(mock_db_session),
             audit_external_orders=True,
             is_backtest=True,
         )
@@ -7688,7 +7693,7 @@ class TestCancelOrder:
             clock=mock_clock,
             adapter=mock_exchange_adapter,
             order_repository=mock_order_repo,
-            db_session_factory=lambda: nullcontext(mock_db_session),
+            db_session_factory=lambda: _session_context(mock_db_session),
             audit_external_orders=True,
             is_backtest=True,
         )
