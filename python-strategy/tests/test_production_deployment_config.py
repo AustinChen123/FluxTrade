@@ -42,7 +42,9 @@ def _required_env() -> dict[str, str]:
         "EXCHANGE_API_KEY": "exchange-key",
         "EXCHANGE_SECRET": "exchange-secret",
         "BINANCE_API_KEY": "binance-key",
+        "BINANCE_ACCOUNT_ALIAS": "futures-main",
         "BINANCE_SECRET": "binance-secret",
+        "BYBIT_USER_ID": "123456789",
     }
 
 
@@ -251,6 +253,8 @@ def test_production_compose_wires_runtime_configuration_without_demo_overrides(
     assert strategy["environment"]["AUDIT_EXTERNAL_ORDERS"] == "false"
     assert strategy["environment"]["EXCHANGE_API_KEY"] == "exchange-key"
     assert strategy["environment"]["EXCHANGE_SECRET"] == "exchange-secret"
+    assert strategy["environment"]["BINANCE_ACCOUNT_ALIAS"] == "futures-main"
+    assert strategy["environment"]["BYBIT_USER_ID"] == "123456789"
     assert (
         strategy["environment"]["INSTRUMENT_PRODUCT_IDS"]
         == rust_data["environment"]["INSTRUMENT_PRODUCT_IDS"]

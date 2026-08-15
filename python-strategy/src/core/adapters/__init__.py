@@ -6,7 +6,7 @@ Factory function ``create_adapter`` provides config-driven instantiation.
 from collections.abc import Callable
 from typing import TYPE_CHECKING, Any
 
-from src.core.interfaces.exchange import IExchangeAdapter
+from src.core.interfaces.exchange import ExchangeError, IExchangeAdapter
 
 if TYPE_CHECKING:
     from src.core.adapters.ccxt_account_initialization import (
@@ -148,22 +148,19 @@ def create_adapter(
             adapter = create_binance_live_adapter(
                 api_key=api_key,
                 secret=secret,
+                expected_account_id=str(config.get("account_id", "")),
                 testnet=testnet,
                 enable_ws=enable_ws,
                 extra_config=extra_config,
                 operation_guard=guard,
             )
         elif exchange_id == "backpack":
-            adapter = create_backpack_live_adapter(
-                api_key=api_key,
-                secret=secret,
-                testnet=testnet,
-                extra_config=extra_config,
-            )
+            raise ExchangeError("backpack_account_identity_unverifiable")
         elif exchange_id == "bybit":
             adapter = create_bybit_live_adapter(
                 api_key=api_key,
                 secret=secret,
+                expected_account_id=str(config.get("account_id", "")),
                 testnet=testnet,
                 extra_config=extra_config,
             )

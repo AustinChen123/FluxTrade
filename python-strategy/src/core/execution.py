@@ -17,6 +17,7 @@ from src.core.models import (
 from src.core.orm_models import Strategy
 from src.core.order_manager import OrderManager
 from src.core.runtime_capabilities import (
+    OrderAccountIdentity,
     OrderAccountIdentityResolver,
     OrderEventProcessor,
     PendingProtectionFillProcessor,
@@ -103,6 +104,7 @@ class ExecutionEngine:
         audit_external_orders: bool = False,
         account_service=None,
         order_account_identity_resolver: OrderAccountIdentityResolver | None = None,
+        repository_account_identity: OrderAccountIdentity | None = None,
         operation_guard: Callable[[], None] | None = None,
         order_event_processor: OrderEventProcessor | None = None,
         pending_protection_fill_processor: PendingProtectionFillProcessor | None = None,
@@ -140,7 +142,20 @@ class ExecutionEngine:
             from src.core.repositories import LiveOrderRepository
 
             self.order_manager = OrderManager(
-                LiveOrderRepository(db_session, db_session_factory=db_session_factory),
+                LiveOrderRepository(
+                    db_session,
+                    db_session_factory=db_session_factory,
+                    account_profile=(
+                        repository_account_identity.account_profile
+                        if repository_account_identity is not None
+                        else None
+                    ),
+                    account_id=(
+                        repository_account_identity.account_id
+                        if repository_account_identity is not None
+                        else None
+                    ),
+                ),
                 clock,
                 is_backtest=is_backtest,
                 order_account_identity_resolver=order_account_identity_resolver,

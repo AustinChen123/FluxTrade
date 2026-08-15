@@ -798,6 +798,8 @@ def order_factory():
         filled_price: Decimal = Decimal("0"),
         trigger_price: Optional[Decimal] = None,
         client_order_id: Optional[str] = None,
+        account_profile: Optional[str] = None,
+        account_id: Optional[str] = None,
     ) -> Order:
         return Order(
             id=order_id or str(uuid.uuid4()),
@@ -815,6 +817,8 @@ def order_factory():
             filled_quantity=filled_quantity,
             filled_price=filled_price,
             client_order_id=client_order_id,
+            account_profile=account_profile,
+            account_id=account_id,
         )
 
     return _create

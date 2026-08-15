@@ -15,6 +15,7 @@ from src.core.execution import ExecutionEngine
 from src.core.interfaces.exchange import ExchangeError, IExchangeAdapter
 from src.core.models import OrderStatus
 from src.core.order_reconciliation import OrderReconciler
+from src.core.repositories import LiveOrderRepository
 
 
 class _UnsupportedAdapter(IExchangeAdapter):
@@ -131,6 +132,61 @@ def test_live_ccxt_recoverable_scan_passes_exact_adapter_venue_scope() -> None:
     )
 
 
+def test_legacy_account_identity_blocks_reconciliation_before_provider_io() -> None:
+    adapter = _UnsupportedAdapter()
+    adapter.exchange_id = "binance"
+    adapter.get_order_by_client_id = Mock(
+        side_effect=AssertionError("provider I/O forbidden")
+    )
+    legacy = SimpleNamespace(status=OrderStatus.SUBMITTED.value)
+    repository = SimpleNamespace(
+        list_legacy_orders_by_statuses=Mock(return_value=[legacy]),
+        list_client_orders_by_statuses=Mock(
+            side_effect=AssertionError("identified scan forbidden")
+        ),
+    )
+    db = MagicMock()
+
+    @contextmanager
+    def db_session_factory():
+        yield db
+
+    reconciler = OrderReconciler(
+        adapter=adapter,
+        order_manager=SimpleNamespace(repo=repository),
+        clock=SimpleNamespace(now=lambda: 1_700_000_000),
+        db_session_factory=db_session_factory,
+        process_exchange_order_event=Mock(),
+        place_pending_protection_for_filled_entries=Mock(),
+        fail_pending_conditionals_for_terminal_entry=Mock(),
+        protective_terminal_without_fill_failure=Mock(),
+        cancel_protective_order_when_sibling_closed=Mock(),
+        cancel_linked_conditional_for_protection_fill=Mock(),
+    )
+
+    with patch("src.core.order_reconciliation.write_system_event") as write_event:
+        result = reconciler.reconcile_recoverable_client_orders()
+
+        db.reset_mock()
+        write_event.side_effect = RuntimeError("audit-failure")
+        with pytest.raises(RuntimeError, match="^audit-failure$"):
+            reconciler.reconcile_recoverable_client_orders()
+
+    assert result["recoverable_count"] == 1
+    assert result["unresolved_count"] == 1
+    assert result["results"] == [
+        {
+            "action": "unresolved_legacy_account_identity",
+            "verification_blocked": False,
+            "unresolved": True,
+        }
+    ]
+    adapter.get_order_by_client_id.assert_not_called()
+    assert write_event.call_count == 2
+    db.rollback.assert_called_once_with()
+    db.commit.assert_not_called()
+
+
 def test_live_ccxt_reconciliation_excludes_foreign_venue_from_money_path(
     mock_order_repo,
     order_factory,
@@ -193,6 +249,71 @@ def test_live_ccxt_reconciliation_excludes_foreign_venue_from_money_path(
     assert [row["order_id"] for row in audit_payload["results"]] == ["current"]
     assert foreign.status == OrderStatus.NEW.value
     assert foreign.last_reconciled_at is None
+
+
+def test_actual_reconciliation_scopes_same_venue_collision_to_current_account(
+    sqlite_order_session_factory,
+    order_factory,
+) -> None:
+    repositories = {
+        account_id: LiveOrderRepository(
+            db_session_factory=sqlite_order_session_factory,
+            account_profile="ccxt:binance:live",
+            account_id=account_id,
+        )
+        for account_id in ("ACCOUNT-A", "ACCOUNT-B")
+    }
+    for account_id, repository in repositories.items():
+        repository.add_order(
+            order_factory(
+                order_id=f"order-{account_id}",
+                exchange_id="BINANCE",
+                client_order_id="shared-client",
+                exchange_order_id="shared-exchange",
+                status=OrderStatus.SUBMITTED.value,
+            )
+        )
+    order_manager = SimpleNamespace(
+        repo=repositories["ACCOUNT-A"],
+        fail_order=Mock(),
+    )
+    adapter = SimpleNamespace(
+        exchange_id="binance",
+        get_order_by_client_id=Mock(return_value=None),
+    )
+    db = MagicMock()
+
+    @contextmanager
+    def db_session_factory():
+        yield db
+
+    reconciler = OrderReconciler(
+        adapter=adapter,
+        order_manager=order_manager,
+        clock=SimpleNamespace(now=lambda: 1_700_000_000),
+        db_session_factory=db_session_factory,
+        process_exchange_order_event=Mock(),
+        place_pending_protection_for_filled_entries=Mock(return_value={"failures": []}),
+        fail_pending_conditionals_for_terminal_entry=Mock(),
+        protective_terminal_without_fill_failure=Mock(),
+        cancel_protective_order_when_sibling_closed=Mock(),
+        cancel_linked_conditional_for_protection_fill=Mock(),
+    )
+
+    with patch("src.core.order_reconciliation.write_system_event"):
+        result = reconciler.reconcile_recoverable_client_orders()
+
+    adapter.get_order_by_client_id.assert_called_once_with(
+        "shared-client",
+        "BINANCE:BTCUSDT-PERP",
+        order_type="market",
+    )
+    assert result["recoverable_count"] == 1
+    assert result["verification_blocked_count"] == 1
+    order_manager.fail_order.assert_not_called()
+    assert repositories["ACCOUNT-B"].get_order("order-ACCOUNT-B").status == (
+        OrderStatus.SUBMITTED.value
+    )
 
 
 @pytest.mark.parametrize(

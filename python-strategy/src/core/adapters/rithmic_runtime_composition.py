@@ -96,6 +96,10 @@ class RithmicRuntimeBootstrap:
             return None
         return self.order_account_identity.account_id
 
+    @property
+    def repository_account_identity(self) -> OrderAccountIdentity | None:
+        return self.order_account_identity
+
     def resolve_reconciliation_schedule(
         self,
         *,

@@ -5,7 +5,7 @@ from threading import Lock
 from typing import Callable, ContextManager, Iterator, Optional
 
 from sqlalchemy import func
-from sqlalchemy.orm import Session
+from sqlalchemy.orm import Query, Session
 
 from src.core.interfaces import IOrderRepository
 from src.core.models import OrderSide
@@ -25,19 +25,74 @@ class LiveOrderRepository(IOrderRepository):
         self,
         db_session: Session | None = None,
         db_session_factory: Optional[Callable[[], ContextManager[Session]]] = None,
+        account_profile: str | None = None,
+        account_id: str | None = None,
     ):
+        if (account_profile is None) != (account_id is None):
+            raise ValueError("repository account identity must be complete")
+        if account_profile is not None and account_id is not None:
+            account_profile = account_profile.strip()
+            account_id = account_id.strip()
+            if not account_profile or not account_id:
+                raise ValueError("repository account identity must not be blank")
+        self._account_profile = account_profile
+        self._account_id = account_id
         self._db_session_factory = db_session_factory or (
             lambda: _provided_session(db_session)
         )
 
+    def _scope(self, query: Query) -> Query:
+        if self._account_profile is None:
+            return query
+        return query.filter(
+            Order.account_profile == self._account_profile,
+            Order.account_id == self._account_id,
+        )
+
+    def _bind_order(self, order: Order) -> None:
+        if self._account_profile is None:
+            return
+        current = (order.account_profile, order.account_id)
+        if current == (None, None):
+            order.account_profile = self._account_profile
+            order.account_id = self._account_id
+        elif current != (self._account_profile, self._account_id):
+            raise RuntimeError("order_account_identity_mismatch")
+
+    @staticmethod
+    def _reject_legacy_collision(db: Session, order: Order) -> None:
+        query = db.query(Order).filter(
+            Order.account_profile.is_(None),
+            Order.account_id.is_(None),
+        )
+        client_collision = (
+            order.client_order_id is not None
+            and query.filter(Order.client_order_id == order.client_order_id).first()
+            is not None
+        )
+        exchange_collision = (
+            order.exchange_order_id is not None
+            and query.filter(
+                Order.exchange_id == order.exchange_id,
+                Order.exchange_order_id == order.exchange_order_id,
+            ).first()
+            is not None
+        )
+        if client_collision or exchange_collision:
+            raise RuntimeError("order_account_identity_legacy_collision")
+
     def add_order(self, order: Order) -> None:
+        self._bind_order(order)
         with self._db_session_factory() as db:
+            if self._account_profile is not None:
+                self._reject_legacy_collision(db, order)
             ensure_product_registered(db, str(order.product_id))
             db.add(order)
             db.commit()
             db.refresh(order)
 
     def update_order(self, order: Order) -> None:
+        self._bind_order(order)
         with self._db_session_factory() as db:
             db.add(order)
             db.commit()
@@ -45,11 +100,15 @@ class LiveOrderRepository(IOrderRepository):
 
     def get_order(self, order_id: str) -> Optional[Order]:
         with self._db_session_factory() as db:
-            return db.query(Order).filter_by(id=order_id).first()
+            return self._scope(db.query(Order)).filter_by(id=order_id).first()
 
     def get_order_by_client_order_id(self, client_order_id: str) -> Optional[Order]:
         with self._db_session_factory() as db:
-            return db.query(Order).filter_by(client_order_id=client_order_id).first()
+            return (
+                self._scope(db.query(Order))
+                .filter_by(client_order_id=client_order_id)
+                .first()
+            )
 
     def get_order_by_exchange_order_id(
         self,
@@ -58,7 +117,9 @@ class LiveOrderRepository(IOrderRepository):
         product_id: str | None = None,
     ) -> Optional[Order]:
         with self._db_session_factory() as db:
-            query = db.query(Order).filter_by(exchange_order_id=exchange_order_id)
+            query = self._scope(db.query(Order)).filter_by(
+                exchange_order_id=exchange_order_id
+            )
             if exchange_id is not None:
                 query = query.filter_by(exchange_id=exchange_id)
             if product_id is not None:
@@ -77,6 +138,7 @@ class LiveOrderRepository(IOrderRepository):
                 Order.status.in_(statuses),
                 Order.client_order_id.isnot(None),
             )
+            query = self._scope(query)
             if exchange_id is not None:
                 query = query.filter(
                     func.lower(Order.exchange_id) == exchange_id.casefold()
@@ -92,6 +154,27 @@ class LiveOrderRepository(IOrderRepository):
             return []
         with self._db_session_factory() as db:
             query = db.query(Order).filter(Order.status.in_(statuses))
+            query = self._scope(query)
+            if exchange_id is not None:
+                query = query.filter(
+                    func.lower(Order.exchange_id) == exchange_id.casefold()
+                )
+            return query.all()
+
+    def list_legacy_orders_by_statuses(
+        self,
+        statuses: set[str],
+        exchange_id: str | None = None,
+    ) -> list[Order]:
+        if self._account_profile is None or not statuses:
+            return []
+        with self._db_session_factory() as db:
+            query = db.query(Order).filter(
+                Order.status.in_(statuses),
+                Order.client_order_id.isnot(None),
+                Order.account_profile.is_(None),
+                Order.account_id.is_(None),
+            )
             if exchange_id is not None:
                 query = query.filter(
                     func.lower(Order.exchange_id) == exchange_id.casefold()
@@ -168,6 +251,7 @@ class LiveOrderRepository(IOrderRepository):
             db.commit()
 
     def update_order_exchange_id(self, order: Order, exchange_order_id: str) -> None:
+        self._bind_order(order)
         order.exchange_order_id = exchange_order_id
         with self._db_session_factory() as db:
             db.add(order)

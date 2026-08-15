@@ -7,6 +7,7 @@ from src.core.execution_conditional_orders import ConditionalOrderLifecycleOwner
 from src.core.execution_submission_gate import ExecutionSubmissionGate
 from src.core.interfaces.exchange import ExchangeError
 from src.core.models import OrderStatus
+from src.core.repositories import LiveOrderRepository
 
 
 def _owner(*, manager=None, adapter=None, gate=None, **overrides):
@@ -265,6 +266,67 @@ def test_live_ccxt_recovery_submits_only_current_venue_protection(
     assert current_stop.quantity == Decimal("2")
     assert foreign_stop.quantity == Decimal("1")
     assert foreign_stop.status == OrderStatus.NEW.value
+
+
+def test_actual_conditional_recovery_scopes_same_venue_collision_by_account(
+    sqlite_order_session_factory,
+    order_factory,
+) -> None:
+    repositories = {
+        account_id: LiveOrderRepository(
+            db_session_factory=sqlite_order_session_factory,
+            account_profile="ccxt:binance:live",
+            account_id=account_id,
+        )
+        for account_id in ("ACCOUNT-A", "ACCOUNT-B")
+    }
+    for account_id, repository in repositories.items():
+        entry = order_factory(
+            order_id=f"entry-{account_id}",
+            exchange_id="BINANCE",
+            status=OrderStatus.FILLED.value,
+            filled_quantity=Decimal("2"),
+            client_order_id="shared-entry-client",
+            exchange_order_id="shared-entry-exchange",
+        )
+        stop = order_factory(
+            order_id=f"stop-{account_id}",
+            exchange_id="BINANCE",
+            status=OrderStatus.NEW.value,
+            order_type="stop_loss",
+            quantity=Decimal("1"),
+            client_order_id=None,
+            exchange_order_id=None,
+        )
+        stop.intent_payload = {"pending_entry_order_id": entry.id}
+        repository.add_order(entry)
+        repository.add_order(stop)
+    manager = MagicMock()
+    manager.repo = repositories["ACCOUNT-A"]
+    adapter = MagicMock()
+    adapter.exchange_id = "binance"
+    adapter.place_order.return_value = "EX-CURRENT-STOP"
+    record_order_ack = MagicMock()
+    owner = _owner(
+        manager=manager,
+        adapter=adapter,
+        record_order_ack=record_order_ack,
+    )
+
+    result = owner.recover_pending_protection()
+
+    assert result == {
+        "pending_count": 1,
+        "entries_attempted": 1,
+        "failures": [],
+    }
+    submitted = adapter.place_order.call_args.args[0]
+    assert submitted.id == "stop-ACCOUNT-A"
+    assert submitted.quantity == Decimal("2")
+    record_order_ack.assert_called_once()
+    foreign_stop = repositories["ACCOUNT-B"].get_order("stop-ACCOUNT-B")
+    assert foreign_stop.status == OrderStatus.NEW.value
+    assert foreign_stop.quantity == Decimal("1")
 
 
 def test_conditional_submit_failure_always_releases_submission_gate():

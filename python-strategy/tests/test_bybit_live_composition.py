@@ -30,6 +30,7 @@ def test_bybit_owner_constructs_exact_venue_adapter() -> None:
         actual = owner.create_bybit_live_adapter(
             api_key=api_key,
             secret=secret,
+            expected_account_id="123456789",
             testnet=testnet,
             extra_config=extra_config,
         )
@@ -38,6 +39,7 @@ def test_bybit_owner_constructs_exact_venue_adapter() -> None:
     constructor.assert_called_once_with(
         api_key=api_key,
         secret=secret,
+        expected_account_id="123456789",
         testnet=testnet,
         extra_config=extra_config,
     )
@@ -54,11 +56,101 @@ def test_bybit_owner_preserves_constructor_exception_identity() -> None:
         owner.create_bybit_live_adapter(
             api_key=None,
             secret=None,
+            expected_account_id="123456789",
             testnet=False,
             extra_config=None,
         )
 
     assert raised.value is failure
+
+
+def test_bybit_identity_is_verified_before_private_stream_construction() -> None:
+    owner = _owner()
+    client = MagicMock()
+    client.privateGetV5UserQueryApi.return_value = {"result": {"userID": 123456789}}
+    trace: list[str] = []
+
+    def initialize(adapter, **_kwargs):
+        adapter.client = client
+        trace.append("client")
+
+    with (
+        patch.object(
+            CcxtExchangeAdapter, "__init__", autospec=True, side_effect=initialize
+        ),
+        patch.object(
+            owner,
+            "BybitOrderEventStream",
+            side_effect=lambda **_kwargs: trace.append("stream") or MagicMock(),
+        ),
+    ):
+        LiveBybitAdapter(expected_account_id="123456789")
+
+    assert trace == ["client", "stream"]
+    client.privateGetV5UserQueryApi.assert_called_once_with()
+
+
+def test_bybit_identity_mismatch_is_sanitized_before_stream_construction() -> None:
+    owner = _owner()
+    client = MagicMock()
+    client.privateGetV5UserQueryApi.return_value = {"result": {"userID": 987654321}}
+
+    def initialize(adapter, **_kwargs):
+        adapter.client = client
+
+    with (
+        patch.object(
+            CcxtExchangeAdapter, "__init__", autospec=True, side_effect=initialize
+        ),
+        patch.object(owner, "BybitOrderEventStream") as stream,
+        pytest.raises(
+            ExchangeError,
+            match="^bybit_account_identity_verification_failed$",
+        ) as raised,
+    ):
+        LiveBybitAdapter(expected_account_id="123456789")
+
+    assert raised.value.__cause__ is None
+    stream.assert_not_called()
+
+
+@pytest.mark.parametrize(
+    "response",
+    [
+        None,
+        {},
+        {"result": None},
+        {"result": {}},
+        {"result": {"userID": True}},
+        {"result": {"userID": "123"}},
+        {"result": {"userID": 0}},
+    ],
+)
+def test_bybit_identity_rejects_malformed_user_id(response) -> None:
+    adapter = object.__new__(LiveBybitAdapter)
+    adapter.client = MagicMock()
+    adapter.client.privateGetV5UserQueryApi.return_value = response
+
+    with pytest.raises(
+        ExchangeError,
+        match="^bybit_account_identity_verification_failed$",
+    ):
+        adapter._verify_account_identity("123")
+
+
+def test_bybit_identity_provider_error_does_not_escape_source() -> None:
+    adapter = object.__new__(LiveBybitAdapter)
+    adapter.client = MagicMock()
+    adapter.client.privateGetV5UserQueryApi.side_effect = RuntimeError(
+        "provider-account-sentinel"
+    )
+
+    with pytest.raises(ExchangeError) as raised:
+        adapter._verify_account_identity("123")
+
+    assert str(raised.value) == "bybit_account_identity_verification_failed"
+    assert raised.value.__cause__ is None
+    assert "provider-account-sentinel" not in str(raised.value)
 
 
 def test_bybit_owner_has_only_shared_ccxt_dependency() -> None:
@@ -365,6 +457,7 @@ def test_history_zero_or_invalid_rows_keep_strict_lookup_contract(history_rows) 
                 "exchange": "binance",
                 "api_key": "binance-key",
                 "secret": "binance-secret",
+                "account_id": "futures-main",
                 "testnet": False,
                 "enable_ws": True,
             },
@@ -373,19 +466,10 @@ def test_history_zero_or_invalid_rows_keep_strict_lookup_contract(history_rows) 
         (
             {
                 "mode": "live",
-                "exchange": "backpack",
-                "api_key": "backpack-key",
-                "secret": "backpack-secret",
-                "testnet": False,
-            },
-            "backpack",
-        ),
-        (
-            {
-                "mode": "live",
                 "exchange": "bybit",
                 "api_key": "bybit-key",
                 "secret": "bybit-secret",
+                "account_id": "123456789",
                 "testnet": False,
                 "extra_config": {"options": {"defaultType": "swap"}},
             },
@@ -398,7 +482,6 @@ def test_generic_factory_routes_to_exact_construction_owner(config, expected) ->
     rithmic = MagicMock()
     generic = MagicMock()
     binance = MagicMock()
-    backpack = MagicMock()
     bybit = MagicMock()
 
     with (
@@ -414,11 +497,6 @@ def test_generic_factory_routes_to_exact_construction_owner(config, expected) ->
             "create_binance_live_adapter",
             return_value=binance,
         ) as binance_owner,
-        patch.object(
-            adapters,
-            "create_backpack_live_adapter",
-            return_value=backpack,
-        ) as backpack_owner,
         patch.object(
             adapters,
             "create_bybit_live_adapter",
@@ -437,7 +515,6 @@ def test_generic_factory_routes_to_exact_construction_owner(config, expected) ->
         "rithmic": rithmic,
         "generic": generic,
         "binance": binance,
-        "backpack": backpack,
         "bybit": bybit,
     }[expected]
     assert actual is expected_result
@@ -445,12 +522,12 @@ def test_generic_factory_routes_to_exact_construction_owner(config, expected) ->
     assert rithmic_cls.from_config.call_count == (expected == "rithmic")
     assert generic_cls.call_count == (expected == "generic")
     assert binance_owner.call_count == (expected == "binance")
-    assert backpack_owner.call_count == (expected == "backpack")
     assert bybit_owner.call_count == (expected == "bybit")
     if expected == "bybit":
         bybit_owner.assert_called_once_with(
             api_key="bybit-key",
             secret="bybit-secret",
+            expected_account_id="123456789",
             testnet=False,
             extra_config=config["extra_config"],
         )
@@ -501,6 +578,7 @@ def test_generic_factory_preserves_bybit_lifecycle_order() -> None:
                 "exchange": "bybit",
                 "api_key": "key",
                 "secret": "secret",
+                "account_id": "123456789",
                 "testnet": False,
                 "extra_config": extra_config,
                 "instrument_product_ids": product_ids,
@@ -518,6 +596,7 @@ def test_generic_factory_preserves_bybit_lifecycle_order() -> None:
     owner.assert_called_once_with(
         api_key="key",
         secret="secret",
+        expected_account_id="123456789",
         testnet=False,
         extra_config=extra_config,
     )

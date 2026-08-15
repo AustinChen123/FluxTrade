@@ -555,6 +555,55 @@ class TestKillSwitchCancelScope:
         assert foreign_new.status == OrderStatus.NEW.value
         assert foreign_submitted.status == submitted_status
 
+    def test_actual_kill_switch_scopes_same_venue_collision_by_account(
+        self,
+        sqlite_order_session_factory,
+        order_factory,
+    ):
+        repositories = {
+            account_id: LiveOrderRepository(
+                db_session_factory=sqlite_order_session_factory,
+                account_profile="ccxt:binance:live",
+                account_id=account_id,
+            )
+            for account_id in ("ACCOUNT-A", "ACCOUNT-B")
+        }
+        for account_id, repository in repositories.items():
+            new_order = order_factory(
+                order_id=f"new-{account_id}",
+                exchange_id="BINANCE",
+                status=OrderStatus.NEW.value,
+                client_order_id="shared-new-client",
+                exchange_order_id=None,
+            )
+            submitted = order_factory(
+                order_id=f"submitted-{account_id}",
+                exchange_id="BINANCE",
+                status=OrderStatus.SUBMITTED.value,
+                client_order_id="shared-submitted-client",
+                exchange_order_id="shared-exchange",
+            )
+            repository.add_order(new_order)
+            repository.add_order(submitted)
+        service, engine, _ = _make_service(orders=[])
+        engine.order_manager.repo = repositories["ACCOUNT-A"]
+        engine.adapter = SimpleNamespace(exchange_id="binance")
+
+        service.kill_switch(actor="ops", reason="account-scope")
+
+        assert [order.id for order, _reason in engine.order_manager.failed_orders] == [
+            "new-ACCOUNT-A"
+        ]
+        assert ("cancel_order", "submitted-ACCOUNT-A") in engine.calls
+        assert ("cancel_order", "submitted-ACCOUNT-B") not in engine.calls
+        assert repositories["ACCOUNT-B"].get_order("new-ACCOUNT-B").status == (
+            OrderStatus.NEW.value
+        )
+        assert (
+            repositories["ACCOUNT-B"].get_order("submitted-ACCOUNT-B").status
+            == OrderStatus.SUBMITTED.value
+        )
+
     def test_filled_orders_not_cancelled(self):
         """FILLED orders are terminal and must be ignored."""
         order = _make_order("o-filled", OrderStatus.FILLED.value)

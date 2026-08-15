@@ -69,18 +69,28 @@ def test_order_typed_mapping_preserves_database_contract() -> None:
         for foreign_key in column.foreign_keys
     } == {"strategy.id", "product.id", "exchange.id"}
     assert {constraint.name for constraint in Order.__table__.constraints} >= {
-        "uq_order_exchange_id",
         "chk_order_account_identity_complete",
     }
-    unique = next(
-        constraint
-        for constraint in Order.__table__.constraints
-        if constraint.name == "uq_order_exchange_id"
-    )
-    assert [column.name for column in unique.columns] == [
-        "exchange_order_id",
-        "exchange_id",
-    ]
+    assert {index.name for index in Order.__table__.indexes} >= {
+        "uq_order_identified_client_order_id",
+        "uq_order_legacy_client_order_id",
+        "uq_order_identified_exchange_order_id",
+        "uq_order_legacy_exchange_order_id",
+    }
+    indexes = {index.name: index for index in Order.__table__.indexes}
+    assert [
+        column.name for column in indexes["uq_order_identified_client_order_id"].columns
+    ] == ["account_profile", "account_id", "client_order_id"]
+    assert [
+        column.name
+        for column in indexes["uq_order_identified_exchange_order_id"].columns
+    ] == ["exchange_id", "account_profile", "account_id", "exchange_order_id"]
+    assert [
+        column.name for column in indexes["uq_order_legacy_client_order_id"].columns
+    ] == ["client_order_id"]
+    assert [
+        column.name for column in indexes["uq_order_legacy_exchange_order_id"].columns
+    ] == ["exchange_id", "exchange_order_id"]
 
 
 def test_strategy_state_typed_mapping_preserves_sqlite_round_trip() -> None:

@@ -32,6 +32,7 @@ def _owner():
 
 def _valid_environ() -> dict[str, str]:
     return {
+        "BINANCE_ACCOUNT_ALIAS": " futures-main ",
         "EXCHANGE_API_KEY": " key ",
         "EXCHANGE_SECRET": " secret ",
         "EXCHANGE_TESTNET": " true ",
@@ -62,6 +63,8 @@ def test_binance_owner_returns_exact_current_live_config() -> None:
     assert tuple(config) == (
         "mode",
         "exchange",
+        "account_profile",
+        "account_id",
         "enable_ws",
         "instrument_product_ids",
         "account_initialization",
@@ -72,6 +75,8 @@ def test_binance_owner_returns_exact_current_live_config() -> None:
     assert config == {
         "mode": "live",
         "exchange": "binance",
+        "account_profile": "ccxt:binance:testnet",
+        "account_id": "futures-main",
         "enable_ws": False,
         "instrument_product_ids": product_ids,
         "account_initialization": {
@@ -86,6 +91,41 @@ def test_binance_owner_returns_exact_current_live_config() -> None:
     }
     assert config["instrument_product_ids"] is product_ids
     assert config["account_initialization"]["product_ids"] is product_ids
+
+
+@pytest.mark.parametrize(
+    ("testnet", "expected_profile"),
+    [("true", "ccxt:binance:testnet"), ("false", "ccxt:binance:live")],
+)
+def test_binance_account_profile_separates_provider_environment(
+    testnet: str,
+    expected_profile: str,
+) -> None:
+    environ = _valid_environ()
+    environ["EXCHANGE_TESTNET"] = testnet
+
+    config = _owner().build_binance_live_adapter_config(
+        product_ids=["BINANCE:BTCUSDT-PERP"],
+        environ=environ,
+    )
+
+    assert config["account_profile"] == expected_profile
+    assert config["account_id"] == "futures-main"
+
+
+@pytest.mark.parametrize("raw", [None, "", "   "])
+def test_binance_owner_requires_explicit_account_alias(raw: str | None) -> None:
+    environ = _valid_environ()
+    if raw is None:
+        environ.pop("BINANCE_ACCOUNT_ALIAS")
+    else:
+        environ["BINANCE_ACCOUNT_ALIAS"] = raw
+
+    with pytest.raises(ValueError, match="^BINANCE_ACCOUNT_ALIAS is required$"):
+        _owner().build_binance_live_adapter_config(
+            product_ids=["BINANCE:BTCUSDT-PERP"],
+            environ=environ,
+        )
 
 
 @pytest.mark.parametrize(
@@ -340,6 +380,7 @@ def test_other_live_venues_never_call_binance_owner(
         )
     else:
         for name, value in {
+            "BYBIT_USER_ID": "123456789",
             "EXCHANGE_API_KEY": "key",
             "EXCHANGE_SECRET": "secret",
             "EXCHANGE_TESTNET": "false",

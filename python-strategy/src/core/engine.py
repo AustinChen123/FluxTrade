@@ -335,7 +335,10 @@ class StrategyEngine:
                 runtime_environment=self.runtime_environment,
             )
             if runtime_bootstrap_factory is not None
-            else DefaultRuntimeBootstrap()
+            else DefaultRuntimeBootstrap(
+                profile=effective_adapter_config.get("account_profile"),
+                account_id=effective_adapter_config.get("account_id"),
+            )
         )
         self._runtime_profile = runtime_bootstrap.profile
         self._runtime_account_id = runtime_bootstrap.account_id
@@ -367,6 +370,7 @@ class StrategyEngine:
             order_account_identity_resolver=(
                 runtime_bootstrap.resolve_order_account_identity
             ),
+            repository_account_identity=(runtime_bootstrap.repository_account_identity),
             operation_guard=self._assert_runtime_leadership,
             order_event_processor=runtime_bootstrap.process_order_event,
             pending_protection_fill_processor=(

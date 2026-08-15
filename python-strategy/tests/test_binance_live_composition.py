@@ -10,6 +10,8 @@ import pytest
 import src.core.adapters as adapters
 from src.core.adapters import live_binance
 from src.core.adapters import simulated as simulated_owner
+from src.core.adapters.ccxt_adapter import CcxtExchangeAdapter
+from src.core.interfaces.exchange import ExchangeError
 
 
 def test_simulated_owner_preserves_decimal_configuration() -> None:
@@ -47,6 +49,7 @@ def test_binance_owner_routes_truthy_ws_to_live_adapter(enable_ws):
         actual = live_binance.create_binance_live_adapter(
             api_key="key",
             secret="secret",
+            expected_account_id="futures-main",
             testnet=False,
             enable_ws=enable_ws,
             extra_config={"options": {"defaultType": "future"}},
@@ -57,6 +60,7 @@ def test_binance_owner_routes_truthy_ws_to_live_adapter(enable_ws):
     live.assert_called_once_with(
         api_key="key",
         secret="secret",
+        expected_account_id="futures-main",
         testnet=False,
         enable_ws=True,
         extra_config={"options": {"defaultType": "future"}},
@@ -80,6 +84,7 @@ def test_binance_owner_routes_falsey_ws_to_live_adapter(enable_ws):
         actual = live_binance.create_binance_live_adapter(
             api_key="key",
             secret="secret",
+            expected_account_id="futures-main",
             testnet=False,
             enable_ws=enable_ws,
             extra_config=extra_config,
@@ -90,6 +95,7 @@ def test_binance_owner_routes_falsey_ws_to_live_adapter(enable_ws):
     live.assert_called_once_with(
         api_key="key",
         secret="secret",
+        expected_account_id="futures-main",
         testnet=False,
         enable_ws=False,
         extra_config=extra_config,
@@ -112,6 +118,7 @@ def test_binance_owner_preserves_selected_constructor_exception(enable_ws):
         live_binance.create_binance_live_adapter(
             api_key=None,
             secret=None,
+            expected_account_id="futures-main",
             testnet=True,
             enable_ws=enable_ws,
             extra_config=None,
@@ -122,12 +129,98 @@ def test_binance_owner_preserves_selected_constructor_exception(enable_ws):
     live.assert_called_once_with(
         api_key=None,
         secret=None,
+        expected_account_id="futures-main",
         testnet=True,
         enable_ws=enable_ws,
         extra_config=None,
         operation_guard=None,
     )
     generic.assert_not_called()
+
+
+def test_binance_identity_is_verified_before_private_stream_construction() -> None:
+    client = MagicMock()
+    client.fapiPrivateV3GetBalance.return_value = [{"accountAlias": "futures-main"}]
+    trace: list[str] = []
+
+    def initialize(adapter, **_kwargs):
+        adapter.client = client
+        trace.append("client")
+
+    with (
+        patch.object(
+            CcxtExchangeAdapter, "__init__", autospec=True, side_effect=initialize
+        ),
+        patch.object(
+            live_binance,
+            "BinanceOrderEventStream",
+            side_effect=lambda **_kwargs: trace.append("stream") or MagicMock(),
+        ),
+    ):
+        live_binance.LiveBinanceAdapter(
+            expected_account_id="futures-main",
+            enable_ws=False,
+        )
+
+    assert trace == ["client", "stream"]
+    client.fapiPrivateV3GetBalance.assert_called_once_with()
+
+
+def test_binance_identity_mismatch_is_sanitized_before_stream_construction() -> None:
+    client = MagicMock()
+    client.fapiPrivateV3GetBalance.return_value = [{"accountAlias": "other"}]
+
+    def initialize(adapter, **_kwargs):
+        adapter.client = client
+
+    with (
+        patch.object(
+            CcxtExchangeAdapter, "__init__", autospec=True, side_effect=initialize
+        ),
+        patch.object(live_binance, "BinanceOrderEventStream") as stream,
+        pytest.raises(
+            ExchangeError,
+            match="^binance_account_identity_verification_failed$",
+        ) as raised,
+    ):
+        live_binance.LiveBinanceAdapter(
+            expected_account_id="futures-main",
+            enable_ws=False,
+        )
+
+    assert raised.value.__cause__ is None
+    stream.assert_not_called()
+
+
+@pytest.mark.parametrize(
+    "response",
+    [None, {}, [], [{}], [{"accountAlias": 7}], [{"accountAlias": "ok"}, {}]],
+)
+def test_binance_identity_rejects_malformed_account_rows(response) -> None:
+    adapter = object.__new__(live_binance.LiveBinanceAdapter)
+    adapter.client = MagicMock()
+    adapter.client.fapiPrivateV3GetBalance.return_value = response
+
+    with pytest.raises(
+        ExchangeError,
+        match="^binance_account_identity_verification_failed$",
+    ):
+        adapter._verify_account_identity("ok")
+
+
+def test_binance_identity_provider_error_does_not_escape_source() -> None:
+    adapter = object.__new__(live_binance.LiveBinanceAdapter)
+    adapter.client = MagicMock()
+    adapter.client.fapiPrivateV3GetBalance.side_effect = RuntimeError(
+        "provider-account-sentinel"
+    )
+
+    with pytest.raises(ExchangeError) as raised:
+        adapter._verify_account_identity("ok")
+
+    assert str(raised.value) == "binance_account_identity_verification_failed"
+    assert raised.value.__cause__ is None
+    assert "provider-account-sentinel" not in str(raised.value)
 
 
 def test_binance_owner_keeps_existing_module_dependency_boundary():
@@ -143,7 +236,7 @@ def test_binance_owner_keeps_existing_module_dependency_boundary():
         "import logging",
         "import threading",
         "from collections.abc import Callable",
-        "from typing import cast",
+        "from typing import Any, cast",
         (
             "from src.core.adapters.binance_order_routing import "
             "binance_conditional_order_mapping, "
@@ -165,7 +258,10 @@ def test_binance_owner_keeps_existing_module_dependency_boundary():
             "BinanceWebSocketOrderConnector, OrderRejected"
         ),
         "from src.core.adapters.ccxt_adapter import CcxtExchangeAdapter",
-        ("from src.core.interfaces.exchange import ExchangeOrderEvent, NetworkError"),
+        (
+            "from src.core.interfaces.exchange import ExchangeError, "
+            "ExchangeOrderEvent, NetworkError"
+        ),
         "from src.core.orm_models import Order",
         "from src.core.product_registry import to_base_quote",
     ]
@@ -202,6 +298,7 @@ def test_binance_owner_keeps_existing_module_dependency_boundary():
                 "exchange": "binance",
                 "api_key": "binance-key",
                 "secret": "binance-secret",
+                "account_id": "futures-main",
                 "testnet": False,
                 "enable_ws": "enabled",
                 "extra_config": {"recvWindow": 7_000},
@@ -261,15 +358,16 @@ def test_generic_factory_routes_to_exact_venue_owner(config, expected):
             testnet=False,
             extra_config=config["extra_config"],
         )
-    if expected == "binance":
-        binance_owner.assert_called_once_with(
-            api_key="binance-key",
-            secret="binance-secret",
-            testnet=False,
-            enable_ws="enabled",
-            extra_config=config["extra_config"],
-            operation_guard=ANY,
-        )
+        if expected == "binance":
+            binance_owner.assert_called_once_with(
+                api_key="binance-key",
+                secret="binance-secret",
+                expected_account_id="futures-main",
+                testnet=False,
+                enable_ws="enabled",
+                extra_config=config["extra_config"],
+                operation_guard=ANY,
+            )
 
 
 def test_generic_factory_preserves_binance_lifecycle_order_and_arguments():
@@ -309,6 +407,7 @@ def test_generic_factory_preserves_binance_lifecycle_order_and_arguments():
                 "exchange": "binance",
                 "api_key": "key",
                 "secret": "secret",
+                "account_id": "futures-main",
                 "testnet": False,
                 "enable_ws": True,
                 "extra_config": extra_config,
@@ -327,6 +426,7 @@ def test_generic_factory_preserves_binance_lifecycle_order_and_arguments():
     owner.assert_called_once_with(
         api_key="key",
         secret="secret",
+        expected_account_id="futures-main",
         testnet=False,
         enable_ws=True,
         extra_config=extra_config,

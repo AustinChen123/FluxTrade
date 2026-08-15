@@ -22,6 +22,11 @@ def _optional_flag(
 def build_binance_live_adapter_config(
     *, product_ids: list[str], environ: Mapping[str, str]
 ) -> dict[str, object]:
+    enable_ws = _optional_flag(environ, "EXCHANGE_ENABLE_WS")
+    credentials = build_ccxt_live_credentials(environ)
+    account_id = environ.get("BINANCE_ACCOUNT_ALIAS", "").strip()
+    if not account_id:
+        raise ValueError("BINANCE_ACCOUNT_ALIAS is required")
     account_initialization: dict[str, object] = {
         "product_ids": product_ids,
         "position_mode": environ.get("ACCOUNT_POSITION_MODE", "one_way"),
@@ -36,9 +41,13 @@ def build_binance_live_adapter_config(
     config: dict[str, object] = {
         "mode": "live",
         "exchange": "binance",
-        "enable_ws": _optional_flag(environ, "EXCHANGE_ENABLE_WS"),
+        "account_profile": (
+            "ccxt:binance:testnet" if credentials["testnet"] else "ccxt:binance:live"
+        ),
+        "account_id": account_id,
+        "enable_ws": enable_ws,
         "instrument_product_ids": product_ids,
         "account_initialization": account_initialization,
     }
-    config.update(build_ccxt_live_credentials(environ))
+    config.update(credentials)
     return config

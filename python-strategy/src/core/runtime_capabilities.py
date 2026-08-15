@@ -63,6 +63,9 @@ class RuntimeBootstrap(Protocol):
     @property
     def account_id(self) -> str | None: ...
 
+    @property
+    def repository_account_identity(self) -> OrderAccountIdentity | None: ...
+
     def resolve_reconciliation_schedule(
         self,
         *,
@@ -119,6 +122,14 @@ class OrderAccountIdentityResolver(Protocol):
 class DefaultRuntimeBootstrap:
     profile: str | None = None
     account_id: str | None = None
+
+    @property
+    def repository_account_identity(self) -> OrderAccountIdentity | None:
+        if self.profile is None and self.account_id is None:
+            return None
+        if self.profile is None or self.account_id is None:
+            raise ValueError("repository account identity must be complete")
+        return OrderAccountIdentity(self.profile, self.account_id)
 
     def resolve_reconciliation_schedule(
         self,

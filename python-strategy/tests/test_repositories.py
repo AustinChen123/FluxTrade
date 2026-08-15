@@ -345,6 +345,81 @@ class TestLiveOrderRepositoryBasics:
         assert result is not None
         assert result.id == "order-1"
 
+    def test_bound_repository_scopes_same_provider_ids_by_account(
+        self,
+        sqlite_order_session_factory,
+        order_factory,
+    ) -> None:
+        unbound = LiveOrderRepository(db_session_factory=sqlite_order_session_factory)
+        for account_id in ("ACCOUNT-A", "ACCOUNT-B"):
+            unbound.add_order(
+                order_factory(
+                    order_id=f"order-{account_id}",
+                    client_order_id="shared-client",
+                    exchange_order_id="shared-exchange",
+                    account_profile="binance",
+                    account_id=account_id,
+                    status="SUBMITTED",
+                )
+            )
+        current = LiveOrderRepository(
+            db_session_factory=sqlite_order_session_factory,
+            account_profile="binance",
+            account_id="ACCOUNT-A",
+        )
+
+        assert current.get_order("order-ACCOUNT-B") is None
+        assert current.get_order_by_client_order_id("shared-client").id == (
+            "order-ACCOUNT-A"
+        )
+        assert (
+            current.get_order_by_exchange_order_id(
+                "shared-exchange",
+                exchange_id="BINANCE",
+            ).id
+            == "order-ACCOUNT-A"
+        )
+        assert [
+            order.id
+            for order in current.list_client_orders_by_statuses(
+                {"SUBMITTED"}, exchange_id="BINANCE"
+            )
+        ] == ["order-ACCOUNT-A"]
+
+    def test_bound_repository_rejects_legacy_identifier_collision(
+        self,
+        sqlite_order_session_factory,
+        order_factory,
+    ) -> None:
+        unbound = LiveOrderRepository(db_session_factory=sqlite_order_session_factory)
+        unbound.add_order(
+            order_factory(
+                order_id="legacy",
+                client_order_id="shared-client",
+                exchange_order_id="shared-exchange",
+            )
+        )
+        current = LiveOrderRepository(
+            db_session_factory=sqlite_order_session_factory,
+            account_profile="binance",
+            account_id="ACCOUNT-A",
+        )
+
+        with pytest.raises(
+            RuntimeError,
+            match="^order_account_identity_legacy_collision$",
+        ):
+            current.add_order(
+                order_factory(
+                    order_id="identified",
+                    client_order_id="shared-client",
+                    exchange_order_id="shared-exchange",
+                )
+            )
+
+        assert current.list_legacy_orders_by_statuses({"open"})[0].id == "legacy"
+        assert unbound.list_legacy_orders_by_statuses({"open"}) == []
+
     def test_list_client_orders_by_statuses_filters_status_and_client_id(
         self,
         sqlite_order_session_factory,

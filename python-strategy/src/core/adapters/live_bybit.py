@@ -27,6 +27,7 @@ class LiveBybitAdapter(CcxtExchangeAdapter):
         self,
         api_key: str | None = None,
         secret: str | None = None,
+        expected_account_id: str = "",
         testnet: bool = False,
         extra_config: dict | None = None,
     ) -> None:
@@ -37,6 +38,7 @@ class LiveBybitAdapter(CcxtExchangeAdapter):
             testnet=testnet,
             extra_config=extra_config,
         )
+        self._verify_account_identity(expected_account_id)
         self._client_order_aliases: dict[str, str] = {}
         self._client_order_alias_lock = threading.Lock()
         self._user_order_stream = BybitOrderEventStream(
@@ -45,6 +47,21 @@ class LiveBybitAdapter(CcxtExchangeAdapter):
             testnet=testnet,
             resolve_client_order_id=self._canonical_client_order_id,
         )
+
+    def _verify_account_identity(self, expected_account_id: str) -> None:
+        client: Any = self.client
+        try:
+            response = client.privateGetV5UserQueryApi()
+        except Exception:
+            raise ExchangeError("bybit_account_identity_verification_failed") from None
+        result = response.get("result") if type(response) is dict else None
+        user_id = result.get("userID") if type(result) is dict else None
+        if (
+            type(user_id) is not int
+            or user_id <= 0
+            or str(user_id) != expected_account_id
+        ):
+            raise ExchangeError("bybit_account_identity_verification_failed")
 
     def close(self) -> None:
         if not self._user_order_stream.close():
@@ -169,6 +186,7 @@ def create_bybit_live_adapter(
     *,
     api_key: str | None = None,
     secret: str | None = None,
+    expected_account_id: str,
     testnet: bool = False,
     extra_config: dict | None = None,
 ) -> LiveBybitAdapter:
@@ -176,6 +194,7 @@ def create_bybit_live_adapter(
     return LiveBybitAdapter(
         api_key=api_key,
         secret=secret,
+        expected_account_id=expected_account_id,
         testnet=testnet,
         extra_config=extra_config,
     )

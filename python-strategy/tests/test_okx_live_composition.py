@@ -99,7 +99,6 @@ def test_okx_owner_has_only_shared_ccxt_dependency() -> None:
             "generic",
         ),
         ({"mode": "live", "exchange": "binance"}, "binance"),
-        ({"mode": "live", "exchange": "backpack"}, "backpack"),
         ({"mode": "live", "exchange": "bybit"}, "bybit"),
         (
             {
@@ -122,7 +121,6 @@ def test_generic_factory_routes_to_exact_construction_owner(config, expected) ->
             "rithmic",
             "generic",
             "binance",
-            "backpack",
             "bybit",
             "okx",
         )
@@ -145,11 +143,6 @@ def test_generic_factory_routes_to_exact_construction_owner(config, expected) ->
             "create_binance_live_adapter",
             return_value=results["binance"],
         ) as binance_owner,
-        patch.object(
-            adapters,
-            "create_backpack_live_adapter",
-            return_value=results["backpack"],
-        ) as backpack_owner,
         patch.object(
             adapters,
             "create_bybit_live_adapter",
@@ -175,7 +168,6 @@ def test_generic_factory_routes_to_exact_construction_owner(config, expected) ->
     assert rithmic_cls.from_config.call_count == (expected == "rithmic")
     assert generic_cls.call_count == (expected == "generic")
     assert binance_owner.call_count == (expected == "binance")
-    assert backpack_owner.call_count == (expected == "backpack")
     assert bybit_owner.call_count == (expected == "bybit")
     assert okx_owner.call_count == (expected == "okx")
     if expected == "okx":

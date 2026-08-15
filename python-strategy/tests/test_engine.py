@@ -968,6 +968,12 @@ class TestEngineInit:
         resolve_identity = execution_engine.call_args.kwargs[
             "order_account_identity_resolver"
         ]
+        assert execution_engine.call_args.kwargs["repository_account_identity"] == (
+            OrderAccountIdentity(
+                account_profile="recovery",
+                account_id="ACCOUNT",
+            )
+        )
         assert resolve_identity(
             "RITHMIC:NQ-202609",
             is_backtest=False,

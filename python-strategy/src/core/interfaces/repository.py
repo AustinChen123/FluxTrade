@@ -62,6 +62,14 @@ class IOrderRepository(ABC):
         """Return orders whose status is in ``statuses`` when supported."""
         return []
 
+    def list_legacy_orders_by_statuses(
+        self,
+        statuses: set[str],
+        exchange_id: str | None = None,
+    ) -> list[Order]:
+        """Return account-unidentified orders for explicit local recovery only."""
+        return []
+
     @abstractmethod
     def update_order_exchange_id(self, order: Order, exchange_order_id: str) -> None:
         pass

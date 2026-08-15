@@ -8,12 +8,14 @@ from sqlalchemy import (
     Date,
     DateTime,
     ForeignKey,
+    Index,
     Integer,
     Numeric,
     String,
     Text,
     UniqueConstraint,
     func,
+    text,
 )
 from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.orm import Mapped, declarative_base, mapped_column
@@ -27,16 +29,18 @@ def _autoincrement_bigint():
 
 
 class Exchange(Base):
-    __tablename__ = 'exchange'
+    __tablename__ = "exchange"
     id = Column(String, primary_key=True)
     name = Column(String, nullable=False)
 
+
 class Product(Base):
-    __tablename__ = 'product'
+    __tablename__ = "product"
     id = Column(String, primary_key=True)
-    exchange_id = Column(String, ForeignKey('exchange.id'), nullable=False)
+    exchange_id = Column(String, ForeignKey("exchange.id"), nullable=False)
     base_asset = Column(String, nullable=False)
     quote_asset = Column(String, nullable=False)
+
 
 class Candlestick(Base):
     __tablename__ = "candlestick"
@@ -74,12 +78,12 @@ class MarketDataApplication(Base):
 
 
 class ResearchDataset(Base):
-    __tablename__ = 'research_dataset'
+    __tablename__ = "research_dataset"
 
     id: Mapped[str] = mapped_column(String(128), primary_key=True)
     product_id: Mapped[str] = mapped_column(
         String,
-        ForeignKey('product.id'),
+        ForeignKey("product.id"),
         nullable=False,
     )
     timeframe: Mapped[str] = mapped_column(String(32), nullable=False)
@@ -105,33 +109,33 @@ class ResearchDataset(Base):
     )
 
     __table_args__ = (
-        CheckConstraint('row_count > 0', name='chk_research_dataset_nonempty'),
+        CheckConstraint("row_count > 0", name="chk_research_dataset_nonempty"),
         CheckConstraint(
-            'start_time <= end_time',
-            name='chk_research_dataset_time_range',
+            "start_time <= end_time",
+            name="chk_research_dataset_time_range",
         ),
         CheckConstraint(
             "quality_status IN ('validated')",
-            name='chk_research_dataset_quality_status',
+            name="chk_research_dataset_quality_status",
         ),
         CheckConstraint(
             "lifecycle_state IN ('importing', 'sealed')",
-            name='chk_research_dataset_lifecycle_state',
+            name="chk_research_dataset_lifecycle_state",
         ),
         CheckConstraint(
             "(lifecycle_state = 'importing' AND sealed_at IS NULL) OR "
             "(lifecycle_state = 'sealed' AND sealed_at IS NOT NULL)",
-            name='chk_research_dataset_seal_consistency',
+            name="chk_research_dataset_seal_consistency",
         ),
     )
 
 
 class ResearchCandlestick(Base):
-    __tablename__ = 'research_candlestick'
+    __tablename__ = "research_candlestick"
 
     dataset_id: Mapped[str] = mapped_column(
         String(128),
-        ForeignKey('research_dataset.id', ondelete='CASCADE'),
+        ForeignKey("research_dataset.id", ondelete="CASCADE"),
         primary_key=True,
     )
     timestamp: Mapped[int] = mapped_column(BigInteger, primary_key=True)
@@ -144,10 +148,11 @@ class ResearchCandlestick(Base):
 
 
 class Strategy(Base):
-    __tablename__ = 'strategy'
+    __tablename__ = "strategy"
     id = Column(String, primary_key=True)
     name = Column(String, nullable=False)
     configuration_json = Column(Text, nullable=True)
+
 
 class Order(Base):
     __tablename__ = "order"
@@ -204,8 +209,63 @@ class Order(Base):
     )
 
     __table_args__ = (
-        UniqueConstraint(
-            "exchange_order_id", "exchange_id", name="uq_order_exchange_id"
+        Index(
+            "uq_order_identified_client_order_id",
+            "account_profile",
+            "account_id",
+            "client_order_id",
+            unique=True,
+            postgresql_where=text(
+                "account_profile IS NOT NULL AND account_id IS NOT NULL "
+                "AND client_order_id IS NOT NULL"
+            ),
+            sqlite_where=text(
+                "account_profile IS NOT NULL AND account_id IS NOT NULL "
+                "AND client_order_id IS NOT NULL"
+            ),
+        ),
+        Index(
+            "uq_order_legacy_client_order_id",
+            "client_order_id",
+            unique=True,
+            postgresql_where=text(
+                "account_profile IS NULL AND account_id IS NULL "
+                "AND client_order_id IS NOT NULL"
+            ),
+            sqlite_where=text(
+                "account_profile IS NULL AND account_id IS NULL "
+                "AND client_order_id IS NOT NULL"
+            ),
+        ),
+        Index(
+            "uq_order_identified_exchange_order_id",
+            "exchange_id",
+            "account_profile",
+            "account_id",
+            "exchange_order_id",
+            unique=True,
+            postgresql_where=text(
+                "account_profile IS NOT NULL AND account_id IS NOT NULL "
+                "AND exchange_order_id IS NOT NULL"
+            ),
+            sqlite_where=text(
+                "account_profile IS NOT NULL AND account_id IS NOT NULL "
+                "AND exchange_order_id IS NOT NULL"
+            ),
+        ),
+        Index(
+            "uq_order_legacy_exchange_order_id",
+            "exchange_id",
+            "exchange_order_id",
+            unique=True,
+            postgresql_where=text(
+                "account_profile IS NULL AND account_id IS NULL "
+                "AND exchange_order_id IS NOT NULL"
+            ),
+            sqlite_where=text(
+                "account_profile IS NULL AND account_id IS NULL "
+                "AND exchange_order_id IS NOT NULL"
+            ),
         ),
         CheckConstraint(
             "(account_profile IS NULL AND account_id IS NULL) OR "
@@ -312,13 +372,13 @@ class SystemEvent(Base):
     because ``order.id`` itself is a string PK in this codebase.
     """
 
-    __tablename__ = 'system_events'
+    __tablename__ = "system_events"
 
     id = Column(_autoincrement_bigint(), primary_key=True, autoincrement=True)
     event_type = Column(String(64), nullable=False)
     event_subtype = Column(String(64), nullable=True)
-    related_strategy_id = Column(String, ForeignKey('strategy.id'), nullable=True)
-    related_order_id = Column(String, ForeignKey('order.id'), nullable=True)
+    related_strategy_id = Column(String, ForeignKey("strategy.id"), nullable=True)
+    related_order_id = Column(String, ForeignKey("order.id"), nullable=True)
     # No FK — gene_records lands in migration 7.
     related_gene_id = Column(BigInteger, nullable=True)
     payload = Column(JSONB, nullable=False)
@@ -331,7 +391,7 @@ class SystemEvent(Base):
     __table_args__ = (
         CheckConstraint(
             "event_type IN ('reconcile','gene_promote','gene_retire','ops','system_error')",
-            name='chk_system_events_type',
+            name="chk_system_events_type",
         ),
     )
 
@@ -435,10 +495,10 @@ class StrategyStateTransition(Base):
     point-in-time ``strategy_state`` row.
     """
 
-    __tablename__ = 'strategy_state_transitions'
+    __tablename__ = "strategy_state_transitions"
 
     id = Column(_autoincrement_bigint(), primary_key=True, autoincrement=True)
-    strategy_id = Column(String, ForeignKey('strategy.id'), nullable=False)
+    strategy_id = Column(String, ForeignKey("strategy.id"), nullable=False)
     from_status = Column(String(32), nullable=False)
     to_status = Column(String(32), nullable=False)
     transitioned_at = Column(

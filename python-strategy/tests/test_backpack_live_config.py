@@ -245,6 +245,10 @@ def test_other_live_venues_never_call_backpack_owner(monkeypatch, exchange) -> N
         product_id = f"{exchange.upper()}:BTCUSDT-PERP"
         for name, value in _valid_environ().items():
             monkeypatch.setenv(name, value)
+        if exchange == "binance":
+            monkeypatch.setenv("BINANCE_ACCOUNT_ALIAS", "futures-main")
+        else:
+            monkeypatch.setenv("BYBIT_USER_ID", "123456789")
     monkeypatch.setenv("INSTRUMENT_PRODUCT_IDS", product_id)
 
     assert strategy_main._adapter_config_from_env()["exchange"] == exchange

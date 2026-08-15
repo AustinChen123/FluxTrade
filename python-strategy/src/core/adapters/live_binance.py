@@ -8,7 +8,7 @@ import asyncio
 import logging
 import threading
 from collections.abc import Callable
-from typing import cast
+from typing import Any, cast
 
 from src.core.adapters.binance_order_routing import (
     binance_conditional_order_mapping,
@@ -27,7 +27,7 @@ from src.core.adapters.binance_ws_order import (
     OrderRejected,
 )
 from src.core.adapters.ccxt_adapter import CcxtExchangeAdapter
-from src.core.interfaces.exchange import ExchangeOrderEvent, NetworkError
+from src.core.interfaces.exchange import ExchangeError, ExchangeOrderEvent, NetworkError
 from src.core.orm_models import Order
 from src.core.product_registry import to_base_quote
 
@@ -39,6 +39,7 @@ class LiveBinanceAdapter(CcxtExchangeAdapter):
         self,
         api_key: str | None = None,
         secret: str | None = None,
+        expected_account_id: str = "",
         testnet: bool = True,
         enable_ws: bool = True,
         extra_config: dict | None = None,
@@ -51,6 +52,7 @@ class LiveBinanceAdapter(CcxtExchangeAdapter):
             testnet=testnet,
             extra_config=extra_config,
         )
+        self._verify_account_identity(expected_account_id)
         self.logger = logging.getLogger("LiveBinanceAdapter")
         self._client_order_aliases: dict[str, str] = {}
         self._client_order_alias_lock = threading.Lock()
@@ -87,6 +89,22 @@ class LiveBinanceAdapter(CcxtExchangeAdapter):
                 if self.ws_connector is not None:
                     self.ws_connector.running = False
                 raise
+
+    def _verify_account_identity(self, expected_account_id: str) -> None:
+        client = cast(Any, self.client)
+        try:
+            rows = client.fapiPrivateV3GetBalance()
+        except Exception:
+            raise ExchangeError(
+                "binance_account_identity_verification_failed"
+            ) from None
+        if type(rows) is not list or not rows:
+            raise ExchangeError("binance_account_identity_verification_failed")
+        if not all(
+            type(row) is dict and row.get("accountAlias") == expected_account_id
+            for row in rows
+        ):
+            raise ExchangeError("binance_account_identity_verification_failed")
 
     def close(self) -> None:
         stream = getattr(self, "_user_order_stream", None)
@@ -233,6 +251,7 @@ def create_binance_live_adapter(
     *,
     api_key: str | None = None,
     secret: str | None = None,
+    expected_account_id: str,
     testnet: bool = True,
     enable_ws: object = False,
     extra_config: dict | None = None,
@@ -242,6 +261,7 @@ def create_binance_live_adapter(
     return LiveBinanceAdapter(
         api_key=api_key,
         secret=secret,
+        expected_account_id=expected_account_id,
         testnet=testnet,
         enable_ws=bool(enable_ws),
         extra_config=extra_config,

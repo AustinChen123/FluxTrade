@@ -34,6 +34,7 @@ def _set_live_ccxt_env(monkeypatch) -> None:
         "ADAPTER_MODE": "live",
         "EXCHANGE_ID": "binance",
         "INSTRUMENT_PRODUCT_IDS": "BINANCE:BTCUSDT-PERP",
+        "BINANCE_ACCOUNT_ALIAS": "futures-main",
         "EXCHANGE_API_KEY": "key",
         "EXCHANGE_SECRET": "secret",
         "EXCHANGE_TESTNET": "true",
@@ -358,6 +359,8 @@ def test_adapter_config_from_env_wires_live_account_initialization(monkeypatch) 
     assert config == {
         "mode": "live",
         "exchange": "binance",
+        "account_profile": "ccxt:binance:testnet",
+        "account_id": "futures-main",
         "api_key": "key",
         "secret": "secret",
         "testnet": True,
@@ -381,6 +384,7 @@ def test_adapter_config_from_env_wires_live_account_initialization(monkeypatch) 
         "EXCHANGE_API_KEY",
         "EXCHANGE_SECRET",
         "EXCHANGE_TESTNET",
+        "BINANCE_ACCOUNT_ALIAS",
     ],
 )
 def test_live_ccxt_config_requires_explicit_runtime_values(

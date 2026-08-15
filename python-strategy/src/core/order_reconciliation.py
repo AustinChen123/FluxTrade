@@ -173,6 +173,48 @@ class OrderReconciler:
                 "reconcile_recoverable_client_orders requires db_session_factory"
             )
 
+        statuses = {
+            OrderStatus.NEW.value,
+            OrderStatus.SUBMITTED_UNCONFIRMED.value,
+            OrderStatus.SUBMITTED.value,
+            OrderStatus.PARTIALLY_FILLED.value,
+        }
+        legacy_orders = self.order_manager.repo.list_legacy_orders_by_statuses(
+            statuses,
+            exchange_id=self._exchange_id,
+        )
+        if legacy_orders:
+            result = {
+                "action": "unresolved_legacy_account_identity",
+                "verification_blocked": False,
+                "unresolved": True,
+            }
+            payload = {
+                "recoverable_count": len(legacy_orders),
+                "result_counts": {result["action"]: len(legacy_orders)},
+                "decision_counts": {},
+                "unresolved_count": len(legacy_orders),
+                "reconciliation_unresolved_count": len(legacy_orders),
+                "protection_unresolved_count": 0,
+                "verification_blocked_count": 0,
+                "results": [result],
+                "protection_recovery": {"failures": []},
+                "skipped_pending_protection_count": 0,
+            }
+            with self._db_session_factory() as db:
+                try:
+                    write_system_event(
+                        db,
+                        event_type="reconcile",
+                        event_subtype="startup_exchange_reconcile",
+                        payload=payload,
+                    )
+                    db.commit()
+                except Exception:
+                    db.rollback()
+                    raise
+            return payload
+
         orders = self.list_recoverable_client_orders()
         results = []
         result_counts: dict[str, int] = {}

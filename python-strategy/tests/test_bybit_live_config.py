@@ -32,6 +32,7 @@ def _owner():
 
 def _valid_environ() -> dict[str, str]:
     return {
+        "BYBIT_USER_ID": " 123456789 ",
         "EXCHANGE_API_KEY": " key ",
         "EXCHANGE_SECRET": " secret ",
         "EXCHANGE_TESTNET": " false ",
@@ -92,6 +93,8 @@ def test_bybit_owner_returns_exact_current_config_and_key_order() -> None:
     assert config == {
         "mode": "live",
         "exchange": "bybit",
+        "account_profile": "ccxt:bybit:live",
+        "account_id": "123456789",
         "enable_ws": True,
         "instrument_product_ids": products,
         "account_initialization": {
@@ -107,6 +110,8 @@ def test_bybit_owner_returns_exact_current_config_and_key_order() -> None:
     assert list(config) == [
         "mode",
         "exchange",
+        "account_profile",
+        "account_id",
         "enable_ws",
         "instrument_product_ids",
         "account_initialization",
@@ -116,6 +121,41 @@ def test_bybit_owner_returns_exact_current_config_and_key_order() -> None:
     ]
     assert config["instrument_product_ids"] is products
     assert config["account_initialization"]["product_ids"] is products
+
+
+@pytest.mark.parametrize(
+    ("testnet", "expected_profile"),
+    [("true", "ccxt:bybit:testnet"), ("false", "ccxt:bybit:live")],
+)
+def test_bybit_account_profile_separates_provider_environment(
+    testnet: str,
+    expected_profile: str,
+) -> None:
+    environ = _valid_environ()
+    environ["EXCHANGE_TESTNET"] = testnet
+
+    config = _owner().build_bybit_live_adapter_config(
+        product_ids=["BYBIT:BTCUSDT-PERP"],
+        environ=environ,
+    )
+
+    assert config["account_profile"] == expected_profile
+    assert config["account_id"] == "123456789"
+
+
+@pytest.mark.parametrize("raw", [None, "", "0", "01", "-1", "not-a-user"])
+def test_bybit_owner_requires_canonical_positive_user_id(raw: str | None) -> None:
+    environ = _valid_environ()
+    if raw is None:
+        environ.pop("BYBIT_USER_ID")
+    else:
+        environ["BYBIT_USER_ID"] = raw
+
+    with pytest.raises(ValueError, match="^BYBIT_USER_ID must be a positive integer$"):
+        _owner().build_bybit_live_adapter_config(
+            product_ids=["BYBIT:BTCUSDT-PERP"],
+            environ=environ,
+        )
 
 
 @pytest.mark.parametrize(
@@ -380,7 +420,6 @@ def test_bybit_owner_has_fixed_signature_dependencies_and_provider() -> None:
     module_source = ast.unparse(tree).lower()
     assert "exchange_id" not in module_source
     for forbidden in (
-        "account_id",
         "subaccount",
         "account_list",
         "discovery",
