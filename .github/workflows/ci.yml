@@ -160,6 +160,11 @@ jobs:
       - name: Set up Python
         run: uv python install
 
+      - name: Check tracked production types
+        run: >-
+          git ls-files -z -- ':(glob)src/**/*.py' |
+          xargs -0 uv run pyright --warnings
+
       - name: Lint with Ruff
         run: uv run ruff check .
 
