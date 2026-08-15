@@ -18,6 +18,8 @@ def test_order_identity_migration_replaces_global_uniqueness_atomically() -> Non
 
     assert 'revision: str = "4e8c1a2b7d90"' in source
     assert 'down_revision: Union[str, Sequence[str], None] = "9b7e2c4d6f10"' in source
+    assert "DROP CONSTRAINT IF EXISTS uq_order_exchange_id" in source
+    assert 'op.drop_constraint("uq_order_exchange_id"' not in source
     for name in (
         "uq_order_identified_client_order_id",
         "uq_order_legacy_client_order_id",

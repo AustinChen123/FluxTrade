@@ -18,7 +18,7 @@ depends_on: Union[str, Sequence[str], None] = None
 
 def upgrade() -> None:
     op.drop_index("uq_order_client_order_id", table_name="order")
-    op.drop_constraint("uq_order_exchange_id", "order", type_="unique")
+    op.execute('ALTER TABLE "order" DROP CONSTRAINT IF EXISTS uq_order_exchange_id')
     identified = sa.text("account_profile IS NOT NULL AND account_id IS NOT NULL")
     legacy = sa.text("account_profile IS NULL AND account_id IS NULL")
     op.create_index(
