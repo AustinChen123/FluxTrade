@@ -598,6 +598,8 @@ class TestOrderManagerLiveMode:
             return {}
 
         mock_redis.hgetall.side_effect = read_after_trade
+        persist_fill = MagicMock(side_effect=mock_order_repo.persist_fill)
+        mock_order_repo.persist_fill = persist_fill
 
         def project_after_trade(**_kwargs):
             assert len(mock_order_repo.trades) == 1
@@ -628,7 +630,77 @@ class TestOrderManagerLiveMode:
         order_manager.fill_order(order, Decimal("42000"), Decimal("0.1"))
 
         assert len(mock_order_repo.trades) == 1
+        persist_fill.assert_called_once()
         mock_script.assert_called_once()
+
+    def test_trade_flush_failure_rolls_back_the_durable_order_update(
+        self,
+        mock_clock,
+        signal_factory,
+        sqlite_order_session_factory,
+    ):
+        from sqlalchemy import event
+
+        from src.core.orm_models import Order as StoredOrder
+        from src.core.orm_models import Trade as StoredTrade
+        from src.core.repositories import LiveOrderRepository
+
+        repo = LiveOrderRepository(db_session_factory=sqlite_order_session_factory)
+        mock_redis = MagicMock()
+        mock_redis.hgetall.side_effect = AssertionError(
+            "Redis read forbidden before durable fill"
+        )
+        mock_script = MagicMock(
+            side_effect=AssertionError("Redis write forbidden before durable fill")
+        )
+        mock_redis.register_script.return_value = mock_script
+        with (
+            patch(
+                "src.core.order_manager.create_redis_client",
+                return_value=mock_redis,
+            ),
+            patch("builtins.open", MagicMock()),
+        ):
+            order_manager = OrderManager(repo, mock_clock, is_backtest=False)
+
+        order = order_manager.create_order(
+            signal_factory(),
+            OrderSide.BUY,
+            "market",
+            Decimal("1"),
+        )
+        prior_status = order.status
+
+        def fail_trade_flush(session, _flush_context, _instances):
+            if any(isinstance(value, StoredTrade) for value in session.new):
+                raise RuntimeError("trade-primary")
+
+        event.listen(
+            sqlite_order_session_factory.class_,
+            "before_flush",
+            fail_trade_flush,
+        )
+        try:
+            with pytest.raises(RuntimeError, match="^trade-primary$"):
+                order_manager.fill_order(order, Decimal("100"), Decimal("1"))
+        finally:
+            event.remove(
+                sqlite_order_session_factory.class_,
+                "before_flush",
+                fail_trade_flush,
+            )
+
+        with sqlite_order_session_factory() as session:
+            persisted = session.get(StoredOrder, order.id)
+            trade_count = (
+                session.query(StoredTrade).filter_by(order_id=order.id).count()
+            )
+
+        assert persisted is not None
+        assert persisted.status == prior_status
+        assert trade_count == 0
+        mock_redis.hgetall.assert_not_called()
+        mock_script.assert_not_called()
 
     @pytest.mark.parametrize("failure_owner", ["order", "trade"])
     def test_durable_fill_failure_precedes_redis_and_is_not_reclassified(

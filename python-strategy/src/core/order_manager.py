@@ -259,8 +259,6 @@ class OrderManager:
     ) -> None:
         side = self._validated_fill(order.side, fill_price, fill_quantity)
         current_time = int(self.clock.now() * 1000)
-        self.repo.update_order(order)
-
         trade_id = str(uuid.uuid4())
 
         new_trade = Trade(
@@ -275,7 +273,7 @@ class OrderManager:
             fee_asset=fee_asset or "USDT",
             timestamp=current_time,
         )
-        self.repo.add_trade(new_trade)
+        self.repo.persist_fill(order, new_trade)
 
         if not self.is_backtest:
             try:

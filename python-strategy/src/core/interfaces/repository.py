@@ -78,6 +78,11 @@ class IOrderRepository(ABC):
     def add_trade(self, trade: Trade) -> None:
         pass
 
+    def persist_fill(self, order: Order, trade: Trade) -> None:
+        """Persist one filled order and its trade using repository semantics."""
+        self.update_order(order)
+        self.add_trade(trade)
+
     @abstractmethod
     def update_position(
         self,

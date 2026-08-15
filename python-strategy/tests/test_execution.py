@@ -21,6 +21,7 @@ from unittest.mock import MagicMock, patch
 
 from prometheus_client import REGISTRY
 from redis.exceptions import ConnectionError as RedisConnectionError
+from sqlalchemy import event
 from sqlalchemy.orm import Session
 
 from src.core.adapters.ccxt_adapter import CcxtExchangeAdapter
@@ -40,7 +41,7 @@ from src.core.interfaces.exchange import NetworkError
 from src.core.interfaces.exchange import ExchangeOrderLookupUnsupported
 from src.core.models import OrderSide, OrderStatus, Position, PositionSide, SignalType
 from src.core.runtime_capabilities import OrderAccountIdentity
-from src.core.orm_models import SignalAudit, SystemEvent
+from src.core.orm_models import SignalAudit, SystemEvent, Trade as StoredTrade
 from src.core.client_order_id import generate_client_order_id, parse_client_order_id
 from src.core.repositories import LiveOrderRepository
 
@@ -163,6 +164,168 @@ def test_actual_order_event_resolves_only_current_account_collision(
     assert repositories["foreign"].get_order("order-foreign").status == (
         OrderStatus.SUBMITTED.value
     )
+
+
+def _live_execution_with_pending_protection(
+    *,
+    sqlite_order_session_factory,
+    mock_db_session,
+    mock_clock,
+    mock_exchange_adapter,
+    signal_factory,
+):
+    repository = LiveOrderRepository(
+        db_session_factory=sqlite_order_session_factory,
+    )
+    engine = ExecutionEngine(
+        db_session=mock_db_session,
+        clock=mock_clock,
+        adapter=mock_exchange_adapter,
+        order_repository=repository,
+        db_session_factory=lambda: _session_context(mock_db_session),
+        audit_external_orders=True,
+        is_backtest=True,
+    )
+    entry_id = engine.execute_signal(
+        signal_factory(
+            price=Decimal("42000"),
+            stop_loss=Decimal("41000"),
+            take_profit=Decimal("43000"),
+        )
+    )
+    entry = repository.get_order(entry_id)
+    assert entry is not None
+    return engine, repository, entry
+
+
+def _entry_fill_event(entry) -> ExchangeOrderEvent:
+    return ExchangeOrderEvent(
+        status="filled",
+        product_id=entry.product_id,
+        client_order_id=entry.client_order_id,
+        exchange_order_id=entry.exchange_order_id,
+        cumulative_filled_quantity=entry.quantity,
+        cumulative_average_price=entry.price,
+        fee=Decimal("0"),
+        fee_asset="USDT",
+    )
+
+
+def test_atomic_fill_replay_submits_each_pending_protection_once(
+    sqlite_order_session_factory,
+    mock_db_session,
+    mock_clock,
+    mock_exchange_adapter,
+    signal_factory,
+):
+    engine, repository, entry = _live_execution_with_pending_protection(
+        sqlite_order_session_factory=sqlite_order_session_factory,
+        mock_db_session=mock_db_session,
+        mock_clock=mock_clock,
+        mock_exchange_adapter=mock_exchange_adapter,
+        signal_factory=signal_factory,
+    )
+    original_place_order = mock_exchange_adapter.place_order
+    mock_exchange_adapter.place_order = MagicMock(side_effect=original_place_order)
+
+    def fail_trade_flush(session, _flush_context, _instances):
+        if any(isinstance(value, StoredTrade) for value in session.new):
+            raise RuntimeError("trade-primary")
+
+    event.listen(sqlite_order_session_factory.class_, "before_flush", fail_trade_flush)
+    try:
+        with pytest.raises(RuntimeError, match="^trade-primary$"):
+            engine.process_exchange_order_event(_entry_fill_event(entry))
+    finally:
+        event.remove(
+            sqlite_order_session_factory.class_,
+            "before_flush",
+            fail_trade_flush,
+        )
+
+    assert repository.get_order(entry.id).status == OrderStatus.SUBMITTED.value
+    with sqlite_order_session_factory() as session:
+        assert session.query(StoredTrade).filter_by(order_id=entry.id).count() == 0
+    assert mock_exchange_adapter.place_order.call_count == 0
+
+    restarted = ExecutionEngine(
+        db_session=mock_db_session,
+        clock=mock_clock,
+        adapter=mock_exchange_adapter,
+        order_repository=repository,
+        db_session_factory=lambda: _session_context(mock_db_session),
+        audit_external_orders=True,
+        is_backtest=True,
+    )
+    first = restarted.process_exchange_order_event(_entry_fill_event(entry))
+    replay = restarted.process_exchange_order_event(_entry_fill_event(entry))
+
+    assert first["action"] == replay["action"] == "applied"
+    with sqlite_order_session_factory() as session:
+        assert session.query(StoredTrade).filter_by(order_id=entry.id).count() == 1
+    protection_calls = [
+        call
+        for call in mock_exchange_adapter.place_order.call_args_list
+        if call.args[0].type in {"stop_loss", "take_profit"}
+    ]
+    assert len(protection_calls) == 2
+    assert {call.args[0].type for call in protection_calls} == {
+        "stop_loss",
+        "take_profit",
+    }
+
+
+def test_zero_delta_fill_recovers_pending_protection_without_duplicate_trade(
+    sqlite_order_session_factory,
+    mock_db_session,
+    mock_clock,
+    mock_exchange_adapter,
+    signal_factory,
+):
+    engine, repository, entry = _live_execution_with_pending_protection(
+        sqlite_order_session_factory=sqlite_order_session_factory,
+        mock_db_session=mock_db_session,
+        mock_clock=mock_clock,
+        mock_exchange_adapter=mock_exchange_adapter,
+        signal_factory=signal_factory,
+    )
+    entry.status = OrderStatus.FILLED.value
+    entry.filled_quantity = entry.quantity
+    entry.filled_price = entry.price
+    repository.persist_fill(
+        entry,
+        StoredTrade(
+            id="durable-fill",
+            order_id=entry.id,
+            exchange_trade_id="durable-fill",
+            product_id=entry.product_id,
+            side=entry.side,
+            price=entry.price,
+            quantity=entry.quantity,
+            fee=Decimal("0"),
+            fee_asset="USDT",
+            timestamp=entry.timestamp,
+        ),
+    )
+    original_place_order = mock_exchange_adapter.place_order
+    mock_exchange_adapter.place_order = MagicMock(side_effect=original_place_order)
+
+    first = engine.process_exchange_order_event(_entry_fill_event(entry))
+    replay = engine.process_exchange_order_event(_entry_fill_event(entry))
+
+    assert first["fill_quantity"] == replay["fill_quantity"] == Decimal("0")
+    with sqlite_order_session_factory() as session:
+        assert session.query(StoredTrade).filter_by(order_id=entry.id).count() == 1
+    protection_calls = [
+        call
+        for call in mock_exchange_adapter.place_order.call_args_list
+        if call.args[0].type in {"stop_loss", "take_profit"}
+    ]
+    assert len(protection_calls) == 2
+    assert {call.args[0].type for call in protection_calls} == {
+        "stop_loss",
+        "take_profit",
+    }
 
 
 @pytest.fixture

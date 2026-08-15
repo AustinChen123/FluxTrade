@@ -187,6 +187,15 @@ class LiveOrderRepository(IOrderRepository):
             db.add(trade)
             db.commit()
 
+    def persist_fill(self, order: Order, trade: Trade) -> None:
+        self._bind_order(order)
+        with self._db_session_factory() as db:
+            ensure_product_registered(db, str(trade.product_id))
+            db.add(order)
+            db.add(trade)
+            db.commit()
+            db.refresh(order)
+
     def get_position(
         self, strategy_id: str, product_id: str, side: str
     ) -> Optional[Position]:

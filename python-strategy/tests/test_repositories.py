@@ -589,6 +589,43 @@ class TestLiveOrderRepositoryBasics:
         with sqlite_order_session_factory() as session:
             assert session.get(Trade, "t1") is not None
 
+    def test_persist_fill_commits_order_and_trade_together(
+        self,
+        sqlite_order_session_factory,
+        order_factory,
+    ):
+        repo = LiveOrderRepository(db_session_factory=sqlite_order_session_factory)
+        order = order_factory(order_id="atomic-order", status="open")
+        repo.add_order(order)
+        order.status = "closed"
+        order.filled_quantity = Decimal("1")
+        order.filled_price = Decimal("42000")
+        trade = Trade(
+            id="atomic-trade",
+            order_id=order.id,
+            exchange_trade_id="atomic-trade",
+            product_id=order.product_id,
+            side=order.side,
+            price=Decimal("42000"),
+            quantity=Decimal("1"),
+            fee=Decimal("2.52"),
+            fee_asset="USDT",
+            timestamp=1704067200000,
+        )
+        trade_id = trade.id
+
+        repo.persist_fill(order, trade)
+
+        with sqlite_order_session_factory() as session:
+            persisted_order = session.get(Order, order.id)
+            persisted_trade = session.get(Trade, trade_id)
+
+        assert persisted_order is not None
+        assert persisted_order.status == "closed"
+        assert persisted_order.filled_quantity == Decimal("1")
+        assert persisted_trade is not None
+        assert persisted_trade.order_id == order.id
+
     def test_update_order_exchange_id_commits(
         self,
         sqlite_order_session_factory,
