@@ -275,10 +275,6 @@ jobs:
         working-directory: ./python-strategy
         env:
           FLUXTRADE_RUN_POSTGRES_MIGRATION_TESTS: "1"
-          POSTGRES_HOST: localhost
-          POSTGRES_PORT: "5432"
-          POSTGRES_USER: fluxtrade
-          POSTGRES_PASSWORD: fluxtrade
         run: uv run pytest -m "integration or rust" -v
 
   refactor-gate:
