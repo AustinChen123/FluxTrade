@@ -18,6 +18,7 @@ from src.core.interfaces.exchange import (
     NetworkError,
 )
 from src.core.models import PositionSide
+from src.core.orm_models import Order
 from src.core.order_reconciliation import OrderReconciler
 
 
@@ -332,39 +333,57 @@ def test_limit_order_uses_native_contract_and_decimal_strings(adapter, client):
     )
 
 
-def bracket_orders(*, side="buy", entry_type="limit", quantity=Decimal("1")):
+def bracket_orders(
+    *, side="buy", entry_type="limit", quantity=Decimal("1")
+) -> tuple[Order, Order, Order]:
     entry_client_id = "strategy-execution-long-123"
-    entry = order(
+    entry = Order(
         id="entry-1",
+        strategy_id="strategy-1",
         client_order_id=entry_client_id,
+        product_id=PRODUCT_ID,
+        exchange_id="RITHMIC",
         side=side,
         type=entry_type,
         quantity=quantity,
         price=Decimal("20000.25") if entry_type == "limit" else None,
+        trigger_price=None,
+        status="NEW",
+        timestamp=1_700_000_000_000,
         intent_payload={},
-        min_notional_reference_price=Decimal("20000.25"),
     )
+    setattr(entry, "min_notional_reference_price", Decimal("20000.25"))
     close_side = "sell" if side == "buy" else "buy"
     stop_price = Decimal("19998.25") if side == "buy" else Decimal("20002.25")
     target_price = Decimal("20003.25") if side == "buy" else Decimal("19997.25")
-    stop = order(
+    stop = Order(
         id="stop-1",
+        strategy_id="strategy-1",
         client_order_id="strategy-execution-sl-123",
+        product_id=PRODUCT_ID,
+        exchange_id="RITHMIC",
         side=close_side,
         type="stop_loss",
         quantity=quantity,
         price=None,
         trigger_price=stop_price,
+        status="NEW",
+        timestamp=1_700_000_000_000,
         intent_payload={"pending_entry_order_id": "entry-1"},
     )
-    target = order(
+    target = Order(
         id="target-1",
+        strategy_id="strategy-1",
         client_order_id="strategy-execution-tp-123",
+        product_id=PRODUCT_ID,
+        exchange_id="RITHMIC",
         side=close_side,
         type="take_profit",
         quantity=quantity,
         price=None,
         trigger_price=target_price,
+        status="NEW",
+        timestamp=1_700_000_000_000,
         intent_payload={"pending_entry_order_id": "entry-1"},
     )
     return entry, stop, target
@@ -416,12 +435,15 @@ def test_native_bracket_submits_one_atomic_single_contract_request(
         stop_ticks,
         target_ticks,
     )
+    assert entry.intent_payload is not None
     native = entry.intent_payload["native_protection"]
+    assert isinstance(native, dict)
     assert native["reference_price"] == "20000.25"
     assert native["bracket_type"] == bracket_type
     assert set(native["legs"]) == set(leg_types)
     for leg_type in leg_types:
         leg = legs[leg_type]
+        assert leg.intent_payload is not None
         assert leg.intent_payload["placement_mode"] == "attach-at-entry"
         assert (
             leg.intent_payload["native_parent_client_order_id"] == entry.client_order_id
@@ -637,6 +659,7 @@ def test_event_resolution_and_restore_merge_share_the_existing_client_lock(
     with ThreadPoolExecutor(max_workers=2) as executor:
         event_future = executor.submit(adapter.poll_order_event)
         assert resolver_entered.wait(timeout=1)
+        assert stop.intent_payload is not None
         stop.intent_payload["native_parent_basket_id"] = "parent-1"
         restore_future = executor.submit(adapter.restore_order_groups, [stop])
         assert restore_built.wait(timeout=1)
@@ -802,6 +825,7 @@ def test_submit_ack_and_restore_merge_share_client_lock_without_lost_update(
             adapter.place_order_group, [entry, stop, target]
         )
         assert submit_entered.wait(timeout=1)
+        assert stop.intent_payload is not None
         stop.intent_payload["native_parent_basket_id"] = "parent-1"
         restore_future = executor.submit(adapter.restore_order_groups, [stop])
         assert restore_built.wait(timeout=1)
@@ -860,6 +884,7 @@ def test_native_bracket_child_identity_restores_from_persisted_parent(client):
 
     mapped = restored.poll_order_event()
 
+    assert mapped is not None
     assert mapped.client_order_id == target.client_order_id
 
 
@@ -873,6 +898,7 @@ def test_native_bracket_child_identity_restores_without_terminal_parent(client):
     entry, stop, target = bracket_orders()
     original.validate_order_group([entry, stop, target])
     for leg in (stop, target):
+        assert leg.intent_payload is not None
         leg.intent_payload["native_parent_basket_id"] = "parent-1"
     restored = RithmicExchangeAdapter(
         profile="test",
@@ -890,7 +916,10 @@ def test_native_bracket_child_identity_restores_without_terminal_parent(client):
         price_type="stop_market",
     )
 
-    assert restored.poll_order_event().client_order_id == stop.client_order_id
+    mapped = restored.poll_order_event()
+
+    assert mapped is not None
+    assert mapped.client_order_id == stop.client_order_id
 
 
 def test_restored_bracket_parent_tag_cannot_claim_unknown_child(client):
@@ -918,7 +947,10 @@ def test_restored_bracket_parent_tag_cannot_claim_unknown_child(client):
         price_type="stop_market",
     )
 
-    assert restored.poll_order_event().client_order_id is None
+    mapped = restored.poll_order_event()
+
+    assert mapped is not None
+    assert mapped.client_order_id is None
 
 
 def test_native_bracket_restore_merges_parent_with_partial_active_children(client):
@@ -931,6 +963,7 @@ def test_native_bracket_restore_merges_parent_with_partial_active_children(clien
     )
     adapter.validate_order_group([entry, stop, target])
     entry.exchange_order_id = "parent-1"
+    assert stop.intent_payload is not None
     stop.intent_payload["native_parent_basket_id"] = "parent-1"
 
     adapter.restore_order_groups([entry, stop])
@@ -949,6 +982,7 @@ def test_native_bracket_restore_preserves_existing_legs_on_partial_replay(
     adapter.start_order_event_stream()
     entry, stop, target = bracket_orders()
     adapter.place_order_group([entry, stop, target])
+    assert stop.intent_payload is not None
     stop.intent_payload["native_parent_basket_id"] = "parent-1"
 
     adapter.restore_order_groups([stop])
@@ -969,6 +1003,7 @@ def test_native_bracket_restore_conflict_is_atomic(adapter, client):
         for parent_basket_id, group in adapter._native_brackets_by_parent.items()
     }
     before_parent_ids = set(adapter._native_bracket_parent_client_order_ids)
+    assert stop.intent_payload is not None
     stop.intent_payload["native_parent_basket_id"] = "parent-1"
     stop.intent_payload["native_parent_client_order_id"] = "other-parent-client"
 
@@ -984,6 +1019,7 @@ def test_modify_native_protection_uses_known_child_basket(adapter, client):
     entry, stop, target = bracket_orders()
     adapter.validate_order_group([entry, stop, target])
     stop.exchange_order_id = "child-stop-1"
+    assert stop.intent_payload is not None
     stop.intent_payload["actual_entry_fill_price"] = "20000.75"
 
     assert adapter.modify_protection(stop, trigger_price=Decimal("19999.00"))
@@ -1007,6 +1043,7 @@ def test_modify_projection_precedes_the_existing_transport_lock(
     entry, stop, target = bracket_orders()
     adapter.validate_order_group([entry, stop, target])
     stop.exchange_order_id = "child-stop-1"
+    assert stop.intent_payload is not None
     stop.intent_payload["actual_entry_fill_price"] = "20000.75"
     original_build = rithmic_adapter_module.build_native_protection_request
 
