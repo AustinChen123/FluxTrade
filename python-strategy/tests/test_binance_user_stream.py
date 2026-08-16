@@ -13,11 +13,14 @@ import pytest
 import src.core.adapters.live_binance as live_binance_module
 from src.core.adapters.ccxt_adapter import CcxtExchangeAdapter
 from src.core.adapters.live_binance import LiveBinanceAdapter
+from src.core.generic_order_event_stream import GenericOrderEventStream
 from src.core.interfaces.exchange import (
     ExchangeError,
+    ExchangeOrderEvent,
     ExchangeUserStreamUnsupported,
     NetworkError,
 )
+from src.core.order_event_sync import OrderEventApplier
 
 
 def _owner_functions():
@@ -84,7 +87,15 @@ def test_order_event_owner_projects_exact_fill_without_raw_payload() -> None:
 
 @pytest.mark.parametrize(
     "status",
-    ["NEW", "PARTIALLY_FILLED", "FILLED", "CANCELED", "REJECTED", "EXPIRED"],
+    [
+        "NEW",
+        "PARTIALLY_FILLED",
+        "FILLED",
+        "CANCELED",
+        "REJECTED",
+        "EXPIRED",
+        "EXPIRED_IN_MATCH",
+    ],
 )
 def test_order_event_owner_preserves_supported_provider_statuses(status: str) -> None:
     from src.core.adapters.binance_user_stream import BinanceOrderEventStream
@@ -112,6 +123,118 @@ def test_order_event_owner_preserves_supported_provider_statuses(status: str) ->
 
     assert event is not None
     assert event.status == status
+
+
+class _ImmediateWorker:
+    def __init__(self, *, target, **_kwargs) -> None:
+        self._target = target
+
+    def start(self) -> None:
+        self._target()
+
+    def is_alive(self) -> bool:
+        return False
+
+    def join(self, *, timeout: float) -> None:
+        del timeout
+
+
+@pytest.mark.parametrize("known_order", [True, False])
+def test_expired_in_match_routes_through_existing_terminal_disposition(
+    known_order: bool,
+) -> None:
+    from src.core.adapters.binance_user_stream import BinanceOrderEventStream
+
+    connection = MagicMock()
+    connection.recv.return_value = json.dumps(
+        {
+            "e": "ORDER_TRADE_UPDATE",
+            "E": 1_700_000_000_123,
+            "o": {
+                "s": "BTCUSDT",
+                "c": "client",
+                "i": 8,
+                "X": "EXPIRED_IN_MATCH",
+                "z": "0",
+            },
+        }
+    )
+    binance_stream = BinanceOrderEventStream(
+        client=SimpleNamespace(),
+        testnet=False,
+        resolve_client_order_id=lambda value: value,
+        monotonic=lambda: 0,
+    )
+    binance_stream._connection = connection
+    binance_stream._listen_key = "key"
+    binance_stream._next_keepalive_at = 1
+    adapter = SimpleNamespace(
+        start_order_event_stream=MagicMock(),
+        poll_order_event=binance_stream.poll,
+    )
+    order = SimpleNamespace(
+        id="local-order",
+        product_id="BINANCE:BTCUSDT-PERP",
+        exchange_order_id="8",
+        filled_quantity=Decimal("0"),
+        filled_price=None,
+        quantity=Decimal("1"),
+        status="NEW",
+    )
+    manager = MagicMock()
+    manager.repo.get_order_by_client_order_id.return_value = (
+        order if known_order else None
+    )
+    manager.repo.get_order_by_exchange_order_id.return_value = None
+    cleanup = MagicMock()
+    applier = OrderEventApplier(
+        order_manager=manager,
+        journal_fill=MagicMock(),
+        fail_pending_conditionals_for_terminal_entry=cleanup,
+        protective_terminal_without_fill_failure=MagicMock(return_value=None),
+        write_conditional_warning=MagicMock(),
+        place_pending_conditionals_for_entry=MagicMock(return_value=[]),
+        protective_partial_fill_requires_resize=MagicMock(return_value=None),
+        cancel_linked_conditional_for_protection_fill=MagicMock(return_value=None),
+    )
+    stop = MagicMock()
+    stop.is_set.return_value = False
+    latch = MagicMock()
+    halt = MagicMock()
+
+    def process_event(event: object) -> dict[str, object]:
+        assert isinstance(event, ExchangeOrderEvent)
+        result = applier.process_exchange_order_event(event)
+        if known_order:
+            stop.is_set.return_value = True
+        return result
+
+    worker = GenericOrderEventStream(
+        adapter_loader=lambda: adapter,
+        is_running=lambda: True,
+        stop_event=lambda: stop,
+        assert_leadership=lambda: None,
+        process_event=process_event,
+        latch_stream_failure=latch,
+        halt_submissions=halt,
+        publish_worker=lambda _worker: None,
+        current_worker=lambda: None,
+        event_logger=MagicMock(),
+        thread_factory=_ImmediateWorker,
+    )
+
+    worker.start()
+
+    if known_order:
+        cleanup.assert_called_once_with(order)
+        manager.fail_order.assert_called_once_with(order, "exchange_event_expired")
+        latch.assert_not_called()
+        halt.assert_not_called()
+    else:
+        cleanup.assert_not_called()
+        manager.fail_order.assert_not_called()
+        latch.assert_called_once_with()
+        halt.assert_called_once_with()
 
 
 @pytest.mark.parametrize(

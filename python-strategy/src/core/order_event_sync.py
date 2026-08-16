@@ -346,7 +346,7 @@ class OrderEventApplier:
             return "cancelled"
         if normalized in {"rejected"}:
             return "rejected"
-        if normalized in {"expired"}:
+        if normalized in {"expired", "expired_in_match"}:
             return "expired"
         if normalized in {"failed"}:
             return "failed"

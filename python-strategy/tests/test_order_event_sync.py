@@ -194,6 +194,8 @@ def test_snapshot_first_delta_with_complete_fee_records_exact_asset(
         ("cancelled", "cancelled"),
         ("rejected", "rejected"),
         ("expired", "expired"),
+        ("EXPIRED_IN_MATCH", "expired"),
+        ("expired_in_match", "expired"),
         ("failed", "failed"),
         ("modify_rejected", "modify_rejected"),
         ("force_closed", "liquidated"),
