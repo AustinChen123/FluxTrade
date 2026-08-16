@@ -18,8 +18,10 @@ from contextlib import nullcontext
 from decimal import Decimal
 import inspect
 from types import MappingProxyType
+from unittest.mock import MagicMock
 
 import pytest
+from sqlalchemy.orm import Session
 
 from src.core.interfaces.repository import IOrderRepository
 from src.core.models import OrderStatus
@@ -146,12 +148,17 @@ class TestBacktestPositionDelegation:
 class TestBacktestTradeLogging:
     """Tests for trade logging in BacktestOrderRepository."""
 
-    def test_accepts_session_factory(self, mock_db_session):
+    def test_accepts_session_factory(self, monkeypatch: pytest.MonkeyPatch):
         """Backtest trade logging should use an injected session factory."""
+        db_session = Session()
+        add = MagicMock()
+        commit = MagicMock()
+        monkeypatch.setattr(db_session, "add", add)
+        monkeypatch.setattr(db_session, "commit", commit)
         repo = BacktestOrderRepository(
             None,
             session_id=42,
-            db_session_factory=lambda: nullcontext(mock_db_session),
+            db_session_factory=lambda: nullcontext(db_session),
         )
         trade = Trade(
             order_id="order-1",
@@ -167,8 +174,8 @@ class TestBacktestTradeLogging:
 
         repo.add_trade(trade)
 
-        mock_db_session.add.assert_called()
-        mock_db_session.commit.assert_called()
+        add.assert_called_once()
+        commit.assert_called_once()
 
     def test_add_trade_calls_db(self, mock_db_session, order_factory):
         """add_trade should create BacktestTradeLog and commit."""
@@ -389,8 +396,12 @@ class TestLiveOrderRepositoryBasics:
 
         current.mark_order_cancelled("current")
 
-        assert current.get_order("current").status == OrderStatus.CANCELLED.value
-        assert unbound.get_order("foreign").status == OrderStatus.SUBMITTED.value
+        persisted_current = current.get_order("current")
+        persisted_foreign = unbound.get_order("foreign")
+        assert persisted_current is not None
+        assert persisted_foreign is not None
+        assert persisted_current.status == OrderStatus.CANCELLED.value
+        assert persisted_foreign.status == OrderStatus.SUBMITTED.value
         with pytest.raises(RuntimeError, match="^cancellation_order_not_found$"):
             current.mark_order_cancelled("foreign")
 
@@ -436,10 +447,14 @@ class TestLiveOrderRepositoryBasics:
         loaded.intent_payload = {"placement_mode": "place-after-fill"}
         current.persist_conditional_order(loaded)
 
-        assert current.get_order("current-conditional").intent_payload == {
+        persisted_current = current.get_order("current-conditional")
+        persisted_foreign = unbound.get_order("foreign-conditional")
+        assert persisted_current is not None
+        assert persisted_foreign is not None
+        assert persisted_current.intent_payload == {
             "placement_mode": "place-after-fill"
         }
-        assert unbound.get_order("foreign-conditional").intent_payload is None
+        assert persisted_foreign.intent_payload is None
 
     def test_backtest_conditional_port_retains_noop_semantics(
         self,
@@ -523,17 +538,16 @@ class TestLiveOrderRepositoryBasics:
             account_id="ACCOUNT-A",
         )
 
+        current_by_client = current.get_order_by_client_order_id("shared-client")
+        current_by_exchange = current.get_order_by_exchange_order_id(
+            "shared-exchange",
+            exchange_id="BINANCE",
+        )
         assert current.get_order("order-ACCOUNT-B") is None
-        assert current.get_order_by_client_order_id("shared-client").id == (
-            "order-ACCOUNT-A"
-        )
-        assert (
-            current.get_order_by_exchange_order_id(
-                "shared-exchange",
-                exchange_id="BINANCE",
-            ).id
-            == "order-ACCOUNT-A"
-        )
+        assert current_by_client is not None
+        assert current_by_exchange is not None
+        assert current_by_client.id == "order-ACCOUNT-A"
+        assert current_by_exchange.id == "order-ACCOUNT-A"
         assert [
             order.id
             for order in current.list_client_orders_by_statuses(
