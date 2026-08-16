@@ -1,6 +1,6 @@
+from dataclasses import dataclass, field
 from decimal import Decimal
 from pathlib import Path
-from types import SimpleNamespace
 from unittest.mock import MagicMock
 
 import pytest
@@ -18,6 +18,7 @@ from src.core.adapters.rithmic_native_bracket import (
     supports_native_bracket_group,
 )
 from src.core.interfaces.exchange import ExchangeError
+from src.core.interfaces.conditional_orders import ConditionalOrderRecord
 from src.core.product_registry import InstrumentSpec
 
 
@@ -33,42 +34,73 @@ SPEC = InstrumentSpec(
 )
 
 
+@dataclass
+class _ConditionalOrder:
+    id: object = "entry-1"
+    product_id: str = PRODUCT_ID
+    side: str = "buy"
+    type: str = "limit"
+    status: str = "new"
+    quantity: Decimal | None = Decimal("1")
+    filled_quantity: Decimal | None = None
+    filled_price: Decimal | None = None
+    trigger_price: Decimal | None = None
+    client_order_id: str | None = "strategy-execution-long-123"
+    exchange_order_id: str | None = None
+    intent_payload: dict[str, object] | None = field(default_factory=dict)
+    price: Decimal | None = Decimal("20000.25")
+
+
 class _NarrowConditionalRepository:
     def __init__(self) -> None:
-        self.persisted: list[object] = []
+        self.persisted: list[ConditionalOrderRecord] = []
 
-    def get_conditional_order(self, order_id: str) -> object | None:
+    def get_conditional_order(self, order_id: str) -> ConditionalOrderRecord | None:
         return None
 
     def list_conditional_orders_by_statuses(
         self,
         statuses: set[str],
         exchange_id: str | None = None,
-    ) -> list[object]:
+    ) -> list[ConditionalOrderRecord]:
         return []
 
-    def persist_conditional_order(self, order: object) -> None:
+    def persist_conditional_order(self, order: ConditionalOrderRecord) -> None:
         self.persisted.append(order)
 
 
-def _order(**overrides):
-    values = {
-        "product_id": PRODUCT_ID,
-        "client_order_id": "strategy-execution-long-123",
-        "type": "limit",
-        "side": "buy",
-        "quantity": Decimal("1"),
-        "price": Decimal("20000.25"),
-        "id": "entry-1",
-        "trigger_price": None,
-        "intent_payload": {},
-        "exchange_order_id": None,
-    }
-    values.update(overrides)
-    return SimpleNamespace(**values)
+def _client_id(order: _ConditionalOrder) -> str:
+    assert order.client_order_id is not None
+    return order.client_order_id
 
 
-def _bracket_orders():
+def _payload(order: _ConditionalOrder) -> dict[str, object]:
+    assert order.intent_payload is not None
+    return order.intent_payload
+
+
+def _order(
+    *,
+    id: object = "entry-1",
+    type: str = "limit",
+    side: str = "buy",
+    price: Decimal | None = Decimal("20000.25"),
+    trigger_price: Decimal | None = None,
+    client_order_id: str = "strategy-execution-long-123",
+    intent_payload: dict[str, object] | None = None,
+) -> _ConditionalOrder:
+    return _ConditionalOrder(
+        id=id,
+        type=type,
+        side=side,
+        price=price,
+        trigger_price=trigger_price,
+        client_order_id=client_order_id,
+        intent_payload={} if intent_payload is None else intent_payload,
+    )
+
+
+def _bracket_orders() -> tuple[_ConditionalOrder, _ConditionalOrder, _ConditionalOrder]:
     entry = _order()
     stop = _order(
         id="stop-1",
@@ -76,7 +108,7 @@ def _bracket_orders():
         side="sell",
         price=None,
         trigger_price=Decimal("19998.25"),
-        client_order_id=linked_client_order_id(entry.client_order_id, "sl"),
+        client_order_id=linked_client_order_id(_client_id(entry), "sl"),
         intent_payload={"pending_entry_order_id": "entry-1"},
     )
     target = _order(
@@ -85,41 +117,48 @@ def _bracket_orders():
         side="sell",
         price=None,
         trigger_price=Decimal("20003.25"),
-        client_order_id=linked_client_order_id(entry.client_order_id, "tp"),
+        client_order_id=linked_client_order_id(_client_id(entry), "tp"),
         intent_payload={"pending_entry_order_id": "entry-1"},
     )
     return entry, stop, target
 
 
-def _side(order) -> str:
+def _side(order: _ConditionalOrder) -> str:
     return str(order.side).lower()
 
 
-def _filled_entry(**overrides):
-    values = {
-        "id": "entry-1",
-        "type": "market",
-        "side": "buy",
-        "filled_price": Decimal("20000.75"),
-    }
-    values.update(overrides)
-    return SimpleNamespace(**values)
+def _filled_entry(
+    *,
+    side: str = "buy",
+    filled_price: Decimal | None = Decimal("20000.75"),
+) -> _ConditionalOrder:
+    return _ConditionalOrder(
+        type="market",
+        side=side,
+        filled_price=filled_price,
+    )
 
 
-def _native_leg(**overrides):
-    values = {
-        "id": "stop-1",
-        "type": "stop_loss",
-        "trigger_price": Decimal("19998.25"),
-        "intent_payload": {
+def _native_leg(
+    *,
+    id: object = "stop-1",
+    type: str = "stop_loss",
+    trigger_price: Decimal | None = Decimal("19998.25"),
+    intent_payload: dict[str, object] | None = None,
+) -> _ConditionalOrder:
+    return _ConditionalOrder(
+        id=id,
+        type=type,
+        trigger_price=trigger_price,
+        intent_payload=intent_payload
+        if intent_payload is not None
+        else {
             "placement_mode": "attach-at-entry",
             "price_tick": "0.25",
             "ticks": "8",
             "requested_price": "19998.25",
         },
-    }
-    values.update(overrides)
-    return SimpleNamespace(**values)
+    )
 
 
 def test_fill_audit_returns_unhandled_for_deferred_protection():
@@ -189,7 +228,7 @@ def test_fill_audit_rejects_missing_entry_fill_before_leg_mutation():
 def test_fill_audit_rejects_invalid_metadata_without_persistence(field, value):
     repository = MagicMock()
     leg = _native_leg()
-    leg.intent_payload[field] = value
+    _payload(leg)[field] = value
 
     assert audit_native_bracket_fill(
         repository,
@@ -230,9 +269,9 @@ def test_fill_audit_projects_exact_remote_confirmation(
 ):
     repository = _NarrowConditionalRepository()
     leg = _native_leg()
-    original_payload = leg.intent_payload
+    original_payload = _payload(leg)
     if remote_price is not None:
-        leg.intent_payload["remote_effective_price"] = remote_price
+        original_payload["remote_effective_price"] = remote_price
 
     assert (
         audit_native_bracket_fill(
@@ -243,18 +282,19 @@ def test_fill_audit_projects_exact_remote_confirmation(
         == expected_failures
     )
 
-    assert leg.intent_payload["actual_entry_fill_price"] == "20000.75"
-    assert leg.intent_payload["expected_effective_price"] == "19998.75"
-    assert leg.intent_payload["price_drift"] == "0.50"
-    assert leg.intent_payload["protection_confirmation"] == expected_confirmation
+    payload = _payload(leg)
+    assert payload["actual_entry_fill_price"] == "20000.75"
+    assert payload["expected_effective_price"] == "19998.75"
+    assert payload["price_drift"] == "0.50"
+    assert payload["protection_confirmation"] == expected_confirmation
     if expected_confirmation == "confirmed":
         assert leg.trigger_price == Decimal("19998.75")
-        assert leg.intent_payload["effective_price"] == "19998.75"
+        assert payload["effective_price"] == "19998.75"
     else:
         assert leg.trigger_price == Decimal("19998.25")
-        assert "effective_price" not in leg.intent_payload
+        assert "effective_price" not in payload
     assert repository.persisted == [leg]
-    assert leg.intent_payload is not original_payload
+    assert payload is not original_payload
     assert "actual_entry_fill_price" not in original_payload
 
 
@@ -280,8 +320,8 @@ def test_fill_audit_preserves_sell_stop_price_direction():
         == []
     )
     assert leg.trigger_price == Decimal("20002.75")
-    assert leg.intent_payload["expected_effective_price"] == "20002.75"
-    assert leg.intent_payload["price_drift"] == "0.50"
+    assert _payload(leg)["expected_effective_price"] == "20002.75"
+    assert _payload(leg)["price_drift"] == "0.50"
 
 
 def test_generic_execution_has_no_rithmic_native_fill_audit_policy():
@@ -355,9 +395,7 @@ def test_recovery_native_key_delegates_to_the_single_leg_classifier(monkeypatch)
 
 def test_plan_without_persistence_has_exact_ticks_and_no_metadata_mutation():
     entry, stop, target = _bracket_orders()
-    original_payloads = tuple(
-        dict(order.intent_payload) for order in (entry, stop, target)
-    )
+    original_payloads = tuple(dict(_payload(order)) for order in (entry, stop, target))
 
     plan = build_native_bracket_plan(
         [entry, stop, target],
@@ -377,8 +415,7 @@ def test_plan_without_persistence_has_exact_ticks_and_no_metadata_mutation():
         },
     }
     assert (
-        tuple(order.intent_payload for order in (entry, stop, target))
-        == original_payloads
+        tuple(_payload(order) for order in (entry, stop, target)) == original_payloads
     )
 
 
@@ -395,7 +432,7 @@ def test_plan_persists_exact_parent_and_child_metadata_after_validation():
     )
 
     assert validation_trace == [entry]
-    assert entry.intent_payload["native_protection"] == {
+    assert _payload(entry)["native_protection"] == {
         "placement_mode": "attach-at-entry",
         "bracket_type": "target_and_stop_static",
         "reference_price": "20000.25",
@@ -415,8 +452,8 @@ def test_plan_persists_exact_parent_and_child_metadata_after_validation():
             },
         },
     }
-    assert stop.intent_payload["native_leg_type"] == "stop_loss"
-    assert target.intent_payload["native_leg_type"] == "take_profit"
+    assert _payload(stop)["native_leg_type"] == "stop_loss"
+    assert _payload(target)["native_leg_type"] == "take_profit"
 
 
 def test_restore_candidate_and_locked_merge_preserve_current_partial_state():
@@ -428,28 +465,28 @@ def test_restore_candidate_and_locked_merge_preserve_current_partial_state():
         order_side=_side,
         persist=True,
     )
-    stop.intent_payload["native_parent_basket_id"] = "parent-1"
+    _payload(stop)["native_parent_basket_id"] = "parent-1"
     restored = build_restored_native_bracket_groups([stop])
 
     groups, parent_ids = merge_native_bracket_groups(
         {
             "parent-1": {
-                "entry": entry.client_order_id,
-                "take_profit": target.client_order_id,
+                "entry": _client_id(entry),
+                "take_profit": _client_id(target),
             }
         },
-        {entry.client_order_id},
+        {_client_id(entry)},
         restored,
     )
 
     assert groups == {
         "parent-1": {
-            "entry": entry.client_order_id,
-            "stop_loss": stop.client_order_id,
-            "take_profit": target.client_order_id,
+            "entry": _client_id(entry),
+            "stop_loss": _client_id(stop),
+            "take_profit": _client_id(target),
         }
     }
-    assert parent_ids == {entry.client_order_id}
+    assert parent_ids == {_client_id(entry)}
 
 
 def test_restore_conflict_does_not_mutate_current_state():
@@ -505,7 +542,7 @@ def test_event_identity_resolution_uses_exact_parent_state(
 def test_modify_request_projects_exact_provider_arguments_without_io():
     _, stop, _ = _bracket_orders()
     stop.exchange_order_id = "child-stop-1"
-    stop.intent_payload.update(
+    _payload(stop).update(
         {
             "placement_mode": "attach-at-entry",
             "entry_side": "buy",

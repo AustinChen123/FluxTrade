@@ -37,6 +37,7 @@ from src.core.adapters.rithmic_runtime_recovery import (
 from src.core.adapters.rithmic_strategy_exit import RithmicStrategyExitService
 from src.core.execution import ExecutionEngine, ExitDecision
 from src.core.interfaces import IExchangeAdapter
+from src.core.interfaces.conditional_orders import ConditionalOrderRecord
 from src.core.interfaces.exchange import ExchangeOrderEvent
 from src.core.models import Signal, SignalType
 from src.core.ops_safety import OpsSafetyService
@@ -88,6 +89,10 @@ def _rithmic_adapter(*, profile: str = "orders", account_id: str = "ACCOUNT"):
         },
         client_factory=MagicMock(),
     )
+
+
+def _conditional_order_record() -> ConditionalOrderRecord:
+    return MagicMock(spec=ConditionalOrderRecord)
 
 
 @pytest.mark.parametrize(
@@ -293,8 +298,8 @@ def test_non_rithmic_bootstrap_applies_generic_order_event_once() -> None:
     assert (
         bootstrap.audit_pending_protection_fill(
             repository,
-            object(),
-            [object()],
+            _conditional_order_record(),
+            [_conditional_order_record()],
         )
         is None
     )
@@ -306,8 +311,8 @@ def test_default_bootstrap_leaves_pending_protection_unhandled() -> None:
     assert (
         DefaultRuntimeBootstrap().audit_pending_protection_fill(
             repository,
-            object(),
-            [object()],
+            _conditional_order_record(),
+            [_conditional_order_record()],
         )
         is None
     )
@@ -351,8 +356,8 @@ def test_rithmic_bootstrap_delegates_fill_audit_to_provider_owner(monkeypatch) -
         runtime_environment=RuntimeEnvironment("test"),
     )
     repository = MagicMock()
-    entry = object()
-    related = [object()]
+    entry = _conditional_order_record()
+    related = [_conditional_order_record()]
 
     assert bootstrap.audit_pending_protection_fill(
         repository,
