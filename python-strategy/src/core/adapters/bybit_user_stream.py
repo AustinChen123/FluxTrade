@@ -290,7 +290,7 @@ class BybitOrderEventStream:
                     else "PARTIALLY_FILLED"
                 ),
                 product_id=first.product_id,
-                client_order_id=self._resolve_client_order_id(key[1]),
+                client_order_id=self._canonical_client_order_id(key[1]),
                 exchange_order_id=key[0],
                 cumulative_filled_quantity=final_cumulative,
                 cumulative_average_price=None,
@@ -324,7 +324,7 @@ class BybitOrderEventStream:
                 symbol = _required_string(value, "symbol")
                 product_id = _product_id(symbol)
                 order_id = _required_string(value, "orderId")
-                order_link_id = _required_string(value, "orderLinkId")
+                order_link_id = _string_field(value, "orderLinkId")
                 provider_status = _required_string(value, "orderStatus")
                 cumulative = _required_decimal(value, "cumExecQty")
                 timestamp = _required_uint(value, "updatedTime")
@@ -392,7 +392,7 @@ class BybitOrderEventStream:
         return ExchangeOrderEvent(
             status=pending.status,
             product_id=pending.product_id,
-            client_order_id=self._resolve_client_order_id(pending.key[1]),
+            client_order_id=self._canonical_client_order_id(pending.key[1]),
             exchange_order_id=pending.key[0],
             cumulative_filled_quantity=pending.target,
             cumulative_average_price=None,
@@ -404,12 +404,15 @@ class BybitOrderEventStream:
             raw=None,
         )
 
+    def _canonical_client_order_id(self, provider_id: str) -> str | None:
+        return self._resolve_client_order_id(provider_id) if provider_id else None
+
 
 def _trade_row(values: dict[str, object]) -> _TradeRow:
     _require_linear(values)
     symbol = _required_string(values, "symbol")
     order_id = _required_string(values, "orderId")
-    order_link_id = _required_string(values, "orderLinkId")
+    order_link_id = _string_field(values, "orderLinkId")
     order_quantity = _required_decimal(values, "orderQty")
     leaves_quantity = _required_decimal(values, "leavesQty")
     quantity = _required_decimal(values, "execQty")
@@ -446,6 +449,13 @@ def _require_linear(values: dict[str, object]) -> None:
 def _required_string(values: dict[str, object], key: str) -> str:
     value = values.get(key)
     if type(value) is not str or not value:
+        raise ValueError(key)
+    return value
+
+
+def _string_field(values: dict[str, object], key: str) -> str:
+    value = values.get(key)
+    if type(value) is not str:
         raise ValueError(key)
     return value
 
@@ -530,13 +540,17 @@ def _require_success_control(message: str | bytes, operation: str) -> None:
 
 
 def _is_pong_control(payload: dict[str, object]) -> bool:
+    args = payload.get("args")
     return (
-        payload.get("op") == "ping"
-        and payload.get("success") is True
-        and payload.get("ret_msg") == "pong"
+        payload.get("op") == "pong"
+        and type(args) is list
+        and len(args) == 1
+        and type(args[0]) is str
+        and bool(args[0])
         and type(payload.get("conn_id")) is str
         and bool(payload.get("conn_id"))
-        and set(payload).issubset({"op", "success", "ret_msg", "conn_id"})
+        and ("req_id" not in payload or type(payload["req_id"]) is str)
+        and set(payload).issubset({"op", "args", "conn_id", "req_id"})
     )
 
 

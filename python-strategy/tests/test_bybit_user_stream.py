@@ -12,7 +12,7 @@ import pytest
 
 from src.core.adapters.bybit_user_stream import BybitOrderEventStream
 from src.core.generic_order_event_stream import GenericOrderEventStream
-from src.core.interfaces.exchange import ExchangeError, NetworkError
+from src.core.interfaces.exchange import ExchangeError, ExchangeOrderEvent, NetworkError
 from src.core.order_event_sync import OrderEventApplier
 
 
@@ -41,6 +41,17 @@ class _Connection:
 
 def _control(op: str, success: bool = True) -> str:
     return json.dumps({"op": op, "success": success})
+
+
+def _private_pong(req_id: str | None = None) -> str:
+    payload: dict[str, object] = {
+        "op": "pong",
+        "args": ["1675418560633"],
+        "conn_id": "one",
+    }
+    if req_id is not None:
+        payload["req_id"] = req_id
+    return json.dumps(payload)
 
 
 def _trade(
@@ -443,11 +454,12 @@ def test_duplicate_terminal_control_is_suppressed() -> None:
     assert stream.poll() is None
 
 
-def test_heartbeat_runs_at_threshold_and_requires_exact_pong() -> None:
+@pytest.mark.parametrize("req_id", [None, "test", ""])
+def test_heartbeat_runs_at_threshold_and_requires_exact_private_pong(
+    req_id: str | None,
+) -> None:
     now = [0.0]
-    pong = json.dumps(
-        {"op": "ping", "success": True, "ret_msg": "pong", "conn_id": "one"}
-    )
+    pong = _private_pong(req_id)
     connection = _Connection([_control("auth"), _control("subscribe")])
     stream = _stream(connection, monotonic=lambda: now[0])
     stream.start()
@@ -602,7 +614,11 @@ def test_receive_and_close_failures_are_bounded_and_sanitized() -> None:
         ("symbol", "btcusdt"),
         ("symbol", "ＢＴＣ"),
         ("orderId", ""),
-        ("orderLinkId", ""),
+        ("orderLinkId", None),
+        ("orderLinkId", 1),
+        ("orderLinkId", True),
+        ("orderLinkId", {}),
+        ("orderLinkId", []),
         ("execId", ""),
         ("execQty", "0"),
         ("execQty", 1),
@@ -635,7 +651,11 @@ def test_ordinary_invalid_trade_fields_fail_closed(field: str, value: object) ->
         ("category", "spot"),
         ("symbol", "btcusdt"),
         ("orderId", ""),
-        ("orderLinkId", ""),
+        ("orderLinkId", None),
+        ("orderLinkId", 1),
+        ("orderLinkId", True),
+        ("orderLinkId", {}),
+        ("orderLinkId", []),
         ("orderStatus", "Unknown"),
         ("cumExecQty", "NaN"),
         ("updatedTime", True),
@@ -655,6 +675,55 @@ def test_ordinary_invalid_order_fields_fail_closed(field: str, value: object) ->
         match="^bybit_order_event_payload_invalid$",
     ):
         stream.poll()
+
+
+@pytest.mark.parametrize("topic", ["execution", "order"])
+def test_missing_order_link_id_fails_closed(topic: str) -> None:
+    if topic == "execution":
+        row = _trade()
+        del row["orderLinkId"]
+        message = _execution_message(row)
+    else:
+        payload = json.loads(_order_message(order_status="Cancelled", cumulative="0"))
+        del payload["data"][0]["orderLinkId"]
+        message = json.dumps(payload)
+    connection = _Connection([_control("auth"), _control("subscribe"), message])
+    stream = _stream(connection)
+    stream.start()
+
+    with pytest.raises(
+        ExchangeError,
+        match="^bybit_order_event_payload_invalid$",
+    ):
+        stream.poll()
+
+
+def test_empty_order_link_id_execution_projects_none_without_resolver() -> None:
+    resolver = MagicMock(side_effect=AssertionError("resolver forbidden"))
+    connection = _Connection(
+        [
+            _control("auth"),
+            _control("subscribe"),
+            _execution_message(_trade(order_link_id="", order_qty="1", leaves_qty="0")),
+        ]
+    )
+    stream = BybitOrderEventStream(
+        api_key="api-key-sentinel",
+        secret="secret-sentinel",
+        testnet=False,
+        resolve_client_order_id=resolver,
+        connect=lambda *_args, **_kwargs: connection,
+        monotonic=lambda: 0.0,
+        clock_ms=lambda: 1_800_000_000_000,
+    )
+    stream.start()
+
+    event = stream.poll()
+
+    assert event is not None
+    assert event.client_order_id is None
+    assert event.exchange_order_id == "provider-order-1"
+    resolver.assert_not_called()
 
 
 def test_different_order_groups_preserve_first_seen_order() -> None:
@@ -732,6 +801,103 @@ class _ImmediateWorker:
         del timeout
 
 
+@pytest.mark.parametrize("known_order", [True, False])
+def test_empty_order_link_id_routes_by_exchange_id_through_generic_worker(
+    known_order: bool,
+) -> None:
+    resolver = MagicMock(side_effect=AssertionError("resolver forbidden"))
+    connection = _Connection(
+        [
+            _control("auth"),
+            _control("subscribe"),
+            _order_message(
+                order_status="New",
+                cumulative="0",
+                order_link_id="",
+            ),
+        ]
+    )
+    bybit_stream = BybitOrderEventStream(
+        api_key="api-key-sentinel",
+        secret="secret-sentinel",
+        testnet=False,
+        resolve_client_order_id=resolver,
+        connect=lambda *_args, **_kwargs: connection,
+        monotonic=lambda: 0.0,
+        clock_ms=lambda: 1_800_000_000_000,
+    )
+    adapter = SimpleNamespace(
+        start_order_event_stream=bybit_stream.start,
+        poll_order_event=bybit_stream.poll,
+    )
+    order = SimpleNamespace(
+        id="local-order",
+        product_id="BYBIT:BTCUSDT-PERP",
+        exchange_order_id="provider-order-1",
+        filled_quantity=Decimal("0"),
+        filled_price=None,
+        quantity=Decimal("1"),
+        status="NEW",
+    )
+    manager = MagicMock()
+    manager.repo.get_order_by_exchange_order_id.return_value = (
+        order if known_order else None
+    )
+    applier = OrderEventApplier(
+        order_manager=manager,
+        journal_fill=MagicMock(),
+        fail_pending_conditionals_for_terminal_entry=MagicMock(),
+        protective_terminal_without_fill_failure=MagicMock(return_value=None),
+        write_conditional_warning=MagicMock(),
+        place_pending_conditionals_for_entry=MagicMock(return_value=[]),
+        protective_partial_fill_requires_resize=MagicMock(return_value=None),
+        cancel_linked_conditional_for_protection_fill=MagicMock(return_value=None),
+    )
+    stop = MagicMock()
+    stop.is_set.return_value = False
+    latch = MagicMock()
+    halt = MagicMock()
+
+    def process_event(event: object) -> dict[str, object]:
+        assert isinstance(event, ExchangeOrderEvent)
+        result = applier.process_exchange_order_event(event)
+        if known_order:
+            stop.is_set.return_value = True
+        return result
+
+    worker = GenericOrderEventStream(
+        adapter_loader=lambda: adapter,
+        is_running=lambda: True,
+        stop_event=lambda: stop,
+        assert_leadership=lambda: None,
+        process_event=process_event,
+        latch_stream_failure=latch,
+        halt_submissions=halt,
+        publish_worker=lambda _worker: None,
+        current_worker=lambda: None,
+        event_logger=MagicMock(),
+        thread_factory=_ImmediateWorker,
+    )
+
+    worker.start()
+
+    resolver.assert_not_called()
+    manager.repo.get_order_by_client_order_id.assert_not_called()
+    manager.repo.get_order_by_exchange_order_id.assert_called_once_with(
+        "provider-order-1",
+        exchange_id="BYBIT",
+        product_id="BYBIT:BTCUSDT-PERP",
+    )
+    if known_order:
+        manager.mark_submitted.assert_called_once_with(order)
+        latch.assert_not_called()
+        halt.assert_not_called()
+    else:
+        manager.mark_submitted.assert_not_called()
+        latch.assert_called_once_with()
+        halt.assert_called_once_with()
+
+
 def test_unresolved_probe_reaches_existing_generic_latch_once() -> None:
     event = object()
     adapter = MagicMock()
@@ -775,15 +941,33 @@ def test_start_rejects_truthy_or_nonboolean_success_controls(success: object) ->
         stream.start()
 
 
-def test_heartbeat_rejects_nonexact_pong_and_closes() -> None:
+@pytest.mark.parametrize(
+    "payload",
+    [
+        {"op": "ping", "success": True, "ret_msg": "pong", "conn_id": "one"},
+        {"op": "ping", "args": ["1"], "conn_id": "one"},
+        {"op": "pong", "conn_id": "one"},
+        {"op": "pong", "args": [], "conn_id": "one"},
+        {"op": "pong", "args": [""], "conn_id": "one"},
+        {"op": "pong", "args": ["1", "2"], "conn_id": "one"},
+        {"op": "pong", "args": "1", "conn_id": "one"},
+        {"op": "pong", "args": [1], "conn_id": "one"},
+        {"op": "pong", "args": ["1"]},
+        {"op": "pong", "args": ["1"], "conn_id": ""},
+        {"op": "pong", "args": ["1"], "conn_id": 1},
+        {"op": "pong", "args": ["1"], "conn_id": "one", "req_id": 1},
+        {"op": "pong", "args": ["1"], "conn_id": "one", "extra": True},
+    ],
+)
+def test_heartbeat_rejects_nonexact_private_pong_and_closes(
+    payload: dict[str, object],
+) -> None:
     now = [0.0]
     connection = _Connection(
         [
             _control("auth"),
             _control("subscribe"),
-            json.dumps(
-                {"op": "ping", "success": 1, "ret_msg": "pong", "conn_id": "one"}
-            ),
+            json.dumps(payload),
         ]
     )
     stream = _stream(connection, monotonic=lambda: now[0])
@@ -813,9 +997,7 @@ def test_heartbeat_dispatches_data_frames_that_arrive_before_pong(
     expected_status: str,
 ) -> None:
     now = [0.0]
-    pong = json.dumps(
-        {"op": "ping", "success": True, "ret_msg": "pong", "conn_id": "one"}
-    )
+    pong = _private_pong()
     connection = _Connection(
         [_control("auth"), _control("subscribe"), interleaved, pong]
     )
