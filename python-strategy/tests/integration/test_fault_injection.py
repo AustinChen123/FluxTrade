@@ -3,6 +3,10 @@
 Tests: partial fills, adapter failures, invalid data, duplicate signals.
 Uses MockExchangeAdapter / RealisticMockAdapter (no Rust .so required).
 """
+
+import sys
+from typing import TYPE_CHECKING
+
 import pytest
 from decimal import Decimal
 from unittest.mock import MagicMock
@@ -11,13 +15,22 @@ from sqlalchemy.orm import Session
 from src.core.models import Signal, SignalType
 from src.core.execution import ExecutionEngine
 from src.core.journal import StrategyJournal
-from conftest import (
-    MockExchangeAdapter,
-    RealisticMockAdapter,
-    MockOrderRepository,
-    MockClock,
-)
 from integration.conftest import PRODUCT_ID, TIMEFRAME, INITIAL_BALANCE
+
+if TYPE_CHECKING:
+    from tests.conftest import (
+        MockClock,
+        MockExchangeAdapter,
+        MockOrderRepository,
+        RealisticMockAdapter,
+    )
+else:
+    from conftest import (
+        MockClock,
+        MockExchangeAdapter,
+        MockOrderRepository,
+        RealisticMockAdapter,
+    )
 
 
 @pytest.fixture
@@ -46,8 +59,9 @@ def _make_engine(clock, adapter, order_repo, journal):
     )
 
 
-def _make_signal(ts: int = 1_700_000_000_000, sig_type=SignalType.LONG,
-                 qty=Decimal("0.1"), **kwargs):
+def _make_signal(
+    ts: int = 1_700_000_000_000, sig_type=SignalType.LONG, qty=Decimal("0.1"), **kwargs
+):
     return Signal(
         strategy_id="fault-test",
         product_id=PRODUCT_ID,
@@ -60,9 +74,16 @@ def _make_signal(ts: int = 1_700_000_000_000, sig_type=SignalType.LONG,
 
 
 class TestFaultInjection:
-
     def test_partial_fill_order_placed(self, clock, order_repo, journal):
         """With fill_ratio < 1.0, order should still be placed successfully."""
+        assert {
+            MockClock.__module__,
+            MockExchangeAdapter.__module__,
+            MockOrderRepository.__module__,
+            RealisticMockAdapter.__module__,
+        } == {"conftest"}
+        assert "tests.conftest" not in sys.modules
+
         adapter = RealisticMockAdapter(
             initial_balance=INITIAL_BALANCE,
             fill_ratio=0.5,
