@@ -2,6 +2,8 @@ from decimal import Decimal
 from types import SimpleNamespace
 from unittest.mock import MagicMock, call
 
+import pytest
+
 from src.core.execution import ExecutionEngine
 from src.core.execution_conditional_orders import ConditionalOrderLifecycleOwner
 from src.core.execution_submission_gate import ExecutionSubmissionGate
@@ -11,9 +13,16 @@ from src.core.repositories import LiveOrderRepository
 
 
 def _owner(*, manager=None, adapter=None, gate=None, **overrides):
+    manager = manager or MagicMock()
+    adapter = adapter or MagicMock()
     dependencies = {
-        "order_manager": manager or MagicMock(),
-        "adapter": adapter or MagicMock(),
+        "repository": manager.repo,
+        "create_order": manager.create_order,
+        "mark_submitted_unconfirmed": manager.mark_submitted_unconfirmed,
+        "mark_submitted": manager.mark_submitted,
+        "fail_order": manager.fail_order,
+        "adapter": adapter,
+        "place_order": adapter.place_order,
         "submission_gate": gate or ExecutionSubmissionGate(MagicMock()),
         "pending_protection_fill_processor": MagicMock(return_value=None),
         "process_exchange_order_event": MagicMock(),
@@ -84,6 +93,28 @@ def test_engine_facades_delegate_to_one_conditional_lifecycle_owner(
     lifecycle.recover_pending_protection.assert_called_once_with()
 
 
+def test_engine_requires_conditional_repository_capability_before_lifecycle(
+    mock_db_session,
+    mock_clock,
+    mock_exchange_adapter,
+):
+    legacy_repository = SimpleNamespace()
+
+    with pytest.raises(
+        RuntimeError,
+        match="^conditional_order_repository_capability_required$",
+    ):
+        ExecutionEngine(
+            db_session=mock_db_session,
+            clock=mock_clock,
+            adapter=mock_exchange_adapter,
+            order_repository=legacy_repository,
+            is_backtest=True,
+        )
+
+    assert mock_exchange_adapter.open_orders == []
+
+
 def test_submission_gate_rejects_before_repository_or_adapter_mutation():
     manager = MagicMock()
     adapter = MagicMock()
@@ -104,7 +135,7 @@ def test_submission_gate_rejects_before_repository_or_adapter_mutation():
         }
     ]
     assert gate.in_flight == 0
-    manager.repo.list_orders_by_statuses.assert_not_called()
+    manager.repo.list_conditional_orders_by_statuses.assert_not_called()
     adapter.place_order.assert_not_called()
 
 
@@ -127,6 +158,75 @@ def test_lifecycle_warning_delegates_exact_event_to_dynamic_audit_port():
     )
 
 
+def test_native_group_ack_persists_metadata_before_marking_only_uncertain_children():
+    uncertain = SimpleNamespace(
+        id="stop-1",
+        status=OrderStatus.SUBMITTED_UNCONFIRMED.value,
+        intent_payload={"native_leg_type": "stop_loss"},
+    )
+    advanced = SimpleNamespace(
+        id="target-1",
+        status=OrderStatus.FILLED.value,
+        intent_payload={"native_leg_type": "take_profit"},
+    )
+    manager = MagicMock()
+    manager.repo.get_conditional_order.side_effect = [uncertain, advanced]
+    trace = MagicMock()
+    trace.attach_mock(manager.repo.persist_conditional_order, "persist")
+    trace.attach_mock(manager.mark_submitted, "mark_submitted")
+    owner = _owner(manager=manager)
+
+    owner.persist_native_group_ack(
+        entry_order=SimpleNamespace(client_order_id="entry-client"),
+        conditional_orders=[uncertain, advanced],
+        exchange_id="parent-1",
+    )
+
+    assert manager.repo.get_conditional_order.call_args_list == [
+        call("stop-1"),
+        call("target-1"),
+    ]
+    assert trace.mock_calls == [
+        call.persist(uncertain),
+        call.mark_submitted(uncertain),
+        call.persist(advanced),
+    ]
+    for order in (uncertain, advanced):
+        assert order.intent_payload["native_parent_basket_id"] == "parent-1"
+        assert order.intent_payload["native_parent_client_order_id"] == "entry-client"
+
+
+def test_native_group_ack_persistence_failure_stops_before_later_child():
+    first = SimpleNamespace(
+        id="stop-1",
+        status=OrderStatus.SUBMITTED_UNCONFIRMED.value,
+        intent_payload={},
+    )
+    later = SimpleNamespace(
+        id="target-1",
+        status=OrderStatus.SUBMITTED_UNCONFIRMED.value,
+        intent_payload={},
+    )
+    error = RuntimeError("persist sentinel")
+    manager = MagicMock()
+    manager.repo.get_conditional_order.side_effect = [first, later]
+    manager.repo.persist_conditional_order.side_effect = error
+    owner = _owner(manager=manager)
+
+    with pytest.raises(RuntimeError) as raised:
+        owner.persist_native_group_ack(
+            entry_order=SimpleNamespace(client_order_id="entry-client"),
+            conditional_orders=[first, later],
+            exchange_id="parent-1",
+        )
+
+    assert raised.value is error
+    manager.repo.get_conditional_order.assert_called_once_with("stop-1")
+    manager.repo.persist_conditional_order.assert_called_once_with(first)
+    manager.mark_submitted.assert_not_called()
+    assert later.intent_payload == {}
+
+
 def test_partial_fill_resizes_persists_and_places_pending_protection_exactly_once():
     pending = SimpleNamespace(
         id="stop-1",
@@ -143,7 +243,7 @@ def test_partial_fill_resizes_persists_and_places_pending_protection_exactly_onc
         filled_quantity=Decimal("2.125"),
     )
     manager = MagicMock()
-    manager.repo.list_orders_by_statuses.return_value = [pending]
+    manager.repo.list_conditional_orders_by_statuses.return_value = [pending]
     adapter = MagicMock()
     adapter.place_order.return_value = "exchange-stop-1"
     operation_guard = MagicMock()
@@ -157,7 +257,7 @@ def test_partial_fill_resizes_persists_and_places_pending_protection_exactly_onc
 
     assert owner.place_pending_for_entry(entry) == []
     assert pending.quantity == Decimal("2.125")
-    assert manager.repo.update_order.call_args_list == [call(pending)]
+    assert manager.repo.persist_conditional_order.call_args_list == [call(pending)]
     operation_guard.assert_called_once_with()
     adapter.place_order.assert_called_once_with(pending)
     record_order_ack.assert_called_once_with(
@@ -169,7 +269,7 @@ def test_partial_fill_resizes_persists_and_places_pending_protection_exactly_onc
 
 def test_live_ccxt_conditional_queries_pass_exact_adapter_venue_scope():
     manager = MagicMock()
-    manager.repo.list_orders_by_statuses.return_value = []
+    manager.repo.list_conditional_orders_by_statuses.return_value = []
     adapter = MagicMock()
     adapter.exchange_id = "binance"
     owner = _owner(manager=manager, adapter=adapter)
@@ -186,7 +286,7 @@ def test_live_ccxt_conditional_queries_pass_exact_adapter_venue_scope():
         "failures": [],
     }
 
-    assert manager.repo.list_orders_by_statuses.call_args_list == [
+    assert manager.repo.list_conditional_orders_by_statuses.call_args_list == [
         call(
             {
                 OrderStatus.NEW.value,
@@ -329,6 +429,107 @@ def test_actual_conditional_recovery_scopes_same_venue_collision_by_account(
     assert foreign_stop.quantity == Decimal("1")
 
 
+def test_recovery_orders_unique_entries_skips_missing_and_zero_and_reports_failure():
+    pending_entry_ids = [
+        "entry-zeta",
+        "entry-alpha",
+        "entry-missing",
+        "entry-zero",
+        "entry-zeta",
+        "entry-beta",
+    ]
+    pending = [
+        SimpleNamespace(
+            id=f"stop-{index}",
+            intent_payload={"pending_entry_order_id": entry_id},
+        )
+        for index, entry_id in enumerate(pending_entry_ids)
+    ]
+    entries = {
+        "entry-alpha": SimpleNamespace(
+            id="entry-alpha",
+            filled_quantity=Decimal("1"),
+        ),
+        "entry-beta": SimpleNamespace(
+            id="entry-beta",
+            filled_quantity=Decimal("2"),
+        ),
+        "entry-zeta": SimpleNamespace(
+            id="entry-zeta",
+            filled_quantity=Decimal("3"),
+        ),
+        "entry-zero": SimpleNamespace(
+            id="entry-zero",
+            filled_quantity=Decimal("0"),
+        ),
+    }
+    repository = SimpleNamespace(
+        get_conditional_order=MagicMock(side_effect=entries.get),
+        list_conditional_orders_by_statuses=MagicMock(return_value=pending),
+        persist_conditional_order=MagicMock(),
+    )
+    manager = MagicMock()
+    manager.repo = repository
+    warning = MagicMock()
+    logger = MagicMock()
+    owner = _owner(manager=manager, write_warning=warning, logger=logger)
+    alpha_failure = {
+        "order_id": "entry-alpha",
+        "order_type": "market",
+        "reason": "stop placement failed",
+    }
+    beta_failure = {
+        "order_id": "entry-beta",
+        "order_type": "market",
+        "reason": "target placement failed",
+    }
+    owner.place_pending_for_entry = MagicMock(
+        side_effect=lambda entry: {
+            "entry-alpha": [alpha_failure],
+            "entry-beta": [beta_failure],
+        }.get(entry.id, [])
+    )
+
+    result = owner.recover_pending_protection()
+
+    assert repository.list_conditional_orders_by_statuses.call_args_list == [
+        call({OrderStatus.NEW.value}, exchange_id=None)
+    ]
+    assert repository.get_conditional_order.call_args_list == [
+        call("entry-alpha"),
+        call("entry-beta"),
+        call("entry-missing"),
+        call("entry-zero"),
+        call("entry-zeta"),
+    ]
+    assert owner.place_pending_for_entry.call_args_list == [
+        call(entries["entry-alpha"]),
+        call(entries["entry-beta"]),
+        call(entries["entry-zeta"]),
+    ]
+    assert warning.call_args_list == [
+        call(
+            event_subtype="conditional_order_placement_failed_after_entry_fill",
+            order=entries["entry-alpha"],
+            failures=[alpha_failure],
+        ),
+        call(
+            event_subtype="conditional_order_placement_failed_after_entry_fill",
+            order=entries["entry-beta"],
+            failures=[beta_failure],
+        ),
+    ]
+    logger.error.assert_called_once_with(
+        "Pending protection recovery has %s placement failure(s)",
+        2,
+    )
+    assert result == {
+        "pending_count": 6,
+        "entries_attempted": 3,
+        "failures": [alpha_failure, beta_failure],
+    }
+
+
 def test_conditional_submit_failure_always_releases_submission_gate():
     pending = SimpleNamespace(
         id="stop-1",
@@ -345,7 +546,7 @@ def test_conditional_submit_failure_always_releases_submission_gate():
         filled_quantity=Decimal("1"),
     )
     manager = MagicMock()
-    manager.repo.list_orders_by_statuses.return_value = [pending]
+    manager.repo.list_conditional_orders_by_statuses.return_value = [pending]
     adapter = MagicMock()
     adapter.place_order.side_effect = ExchangeError("ordinary placement failure")
     gate = ExecutionSubmissionGate(MagicMock())

@@ -14,7 +14,7 @@ from src.core.models import (
     OrderStatus,
     PositionSide,
 )
-from src.core.orm_models import Strategy
+from src.core.orm_models import Order, Strategy
 from src.core.order_manager import OrderManager
 from src.core.order_manager import PositionCachePersistenceError
 from src.core.runtime_capabilities import (
@@ -32,6 +32,7 @@ from src.core.interfaces import IOrderRepository
 from src.core.interfaces.order_cancellation import (
     OrderCancellationRepository,
 )
+from src.core.interfaces.conditional_orders import ConditionalOrderRepository
 from src.core.journal import StrategyJournal
 from src.core.metrics import ORDERS_TOTAL, EXECUTION_LATENCY
 from src.core.audit_service import (
@@ -165,6 +166,11 @@ class ExecutionEngine:
                 order_account_identity_resolver=order_account_identity_resolver,
             )
 
+        repository = self.order_manager.repo
+        if not isinstance(repository, ConditionalOrderRepository):
+            raise RuntimeError("conditional_order_repository_capability_required")
+        self._conditional_order_repository = repository
+
         self.default_quantity = Decimal("0.01")
         self.adapter = adapter
         self.journal = journal
@@ -174,8 +180,22 @@ class ExecutionEngine:
         )
         self._fill_position_cache_failed = False
         self._conditional_order_lifecycle = ConditionalOrderLifecycleOwner(
-            order_manager=self.order_manager,
+            repository=self._conditional_order_repository,
+            create_order=cast(Callable[..., object], self.order_manager.create_order),
+            mark_submitted_unconfirmed=cast(
+                Callable[[object], None],
+                self.order_manager.mark_submitted_unconfirmed,
+            ),
+            mark_submitted=cast(
+                Callable[[object], None],
+                self.order_manager.mark_submitted,
+            ),
+            fail_order=cast(
+                Callable[[object, str], None],
+                self.order_manager.fail_order,
+            ),
             adapter=self.adapter,
+            place_order=lambda order: self.adapter.place_order(cast(Order, order)),
             submission_gate=self._submission_gate_owner,
             pending_protection_fill_processor=(self._pending_protection_fill_processor),
             process_exchange_order_event=self.process_exchange_order_event,
@@ -1528,26 +1548,11 @@ class ExecutionEngine:
         conditional_orders: list,
         adoption: dict[str, object],
     ) -> None:
-        """Keep pending legs recoverable after an uncertain entry submit.
-
-        Adoption may already have placed some legs; anything not NEW has live
-        or terminal exchange state and must keep its status, exchange id, and
-        payload untouched.
-        """
-        for conditional_order in conditional_orders:
-            if conditional_order.status != OrderStatus.NEW.value:
-                continue
-            payload = dict(conditional_order.intent_payload or {})
-            payload.update(
-                {
-                    "pending_entry_order_id": str(entry_order.id),
-                    "pending_client_order_id": entry_order.client_order_id,
-                    "pending_reason": "entry_submit_outcome_uncertain",
-                    "adoption_action": str(adoption["action"]),
-                }
-            )
-            conditional_order.intent_payload = payload
-            self.order_manager.repo.update_order(conditional_order)
+        self._conditional_order_lifecycle.mark_pending_after_uncertain_submit(
+            entry_order=entry_order,
+            conditional_orders=conditional_orders,
+            adoption=adoption,
+        )
 
     def _place_entry_order(
         self, entry_order, conditional_orders: list
@@ -1570,24 +1575,11 @@ class ExecutionEngine:
                     exchange_id,
                     order_id=str(entry_order.id),
                 )
-                for conditional_order in conditional_orders:
-                    current = (
-                        self.order_manager.repo.get_order(str(conditional_order.id))
-                        or conditional_order
-                    )
-                    payload = dict(current.intent_payload or {})
-                    payload.update(
-                        {
-                            "native_parent_basket_id": str(exchange_id),
-                            "native_parent_client_order_id": str(
-                                entry_order.client_order_id
-                            ),
-                        }
-                    )
-                    current.intent_payload = payload
-                    self.order_manager.repo.update_order(current)
-                    if current.status == OrderStatus.SUBMITTED_UNCONFIRMED.value:
-                        self.order_manager.mark_submitted(current)
+                self._conditional_order_lifecycle.persist_native_group_ack(
+                    entry_order=entry_order,
+                    conditional_orders=conditional_orders,
+                    exchange_id=exchange_id,
+                )
             except Exception:
                 self.halt_for_reconcile()
                 raise

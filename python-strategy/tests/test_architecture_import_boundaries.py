@@ -10,7 +10,13 @@ _REPOSITORY_ROOT = Path(__file__).parents[2]
 _PYTHON_ROOT = _REPOSITORY_ROOT / "python-strategy"
 _ADAPTER_PACKAGE = "src.core.adapters"
 _PORT_PACKAGE = "src.core.interfaces"
-_ORM_FREE_APPLICATION_MODULES = frozenset({"src.core.execution_order_cancellation"})
+_ORM_FREE_APPLICATION_MODULES = frozenset(
+    {
+        "src.core.adapters.rithmic_native_bracket",
+        "src.core.execution_conditional_orders",
+        "src.core.execution_order_cancellation",
+    }
+)
 _FORBIDDEN_APPLICATION_IMPORTS = frozenset(
     {
         "src.core.interfaces.IOrderRepository",

@@ -56,7 +56,8 @@ def test_materializes_all_intents_with_exact_identity_and_oco_persistence(
     )
 
     result = create_conditional_orders(
-        order_manager=manager,
+        repository=manager.repo,
+        create_order=manager.create_order,
         signal=signal,
         entry_order=entry,
         quantity=Decimal("2.00"),
@@ -121,7 +122,7 @@ def test_materializes_all_intents_with_exact_identity_and_oco_persistence(
         call(orders[1], candle),
         call(orders[2], candle),
     ]
-    assert manager.repo.update_order.call_args_list == [
+    assert manager.repo.persist_conditional_order.call_args_list == [
         call(orders[0]),
         call(orders[1]),
         call(orders[2]),
@@ -134,7 +135,8 @@ def test_empty_intents_create_and_persist_nothing(signal_factory):
     attach_reference = MagicMock()
 
     result = create_conditional_orders(
-        order_manager=manager,
+        repository=manager.repo,
+        create_order=manager.create_order,
         signal=signal,
         entry_order=SimpleNamespace(
             id="entry-1",
@@ -148,7 +150,7 @@ def test_empty_intents_create_and_persist_nothing(signal_factory):
 
     assert result == []
     manager.create_order.assert_not_called()
-    manager.repo.update_order.assert_not_called()
+    manager.repo.persist_conditional_order.assert_not_called()
     attach_reference.assert_not_called()
 
 
@@ -168,7 +170,8 @@ def test_missing_entry_client_id_remains_none(signal_factory):
     manager.create_order.return_value = order
 
     create_conditional_orders(
-        order_manager=manager,
+        repository=manager.repo,
+        create_order=manager.create_order,
         signal=signal,
         entry_order=SimpleNamespace(id="entry-1", side="buy", client_order_id=None),
         quantity=Decimal("1"),
@@ -177,3 +180,77 @@ def test_missing_entry_client_id_remains_none(signal_factory):
     )
 
     assert manager.create_order.call_args.kwargs["client_order_id"] is None
+
+
+def test_creation_failure_preserves_partial_rows_without_persistence(signal_factory):
+    signal = signal_factory(
+        signal_type=SignalType.LONG,
+        stop_loss=Decimal("99"),
+        take_profit=Decimal("101"),
+        trailing_distance=Decimal("0.50"),
+    )
+    first = SimpleNamespace(id="stop-1", type="stop_loss")
+    error = RuntimeError("create sentinel")
+    manager = MagicMock()
+    manager.create_order.side_effect = [first, error]
+
+    with pytest.raises(RuntimeError) as raised:
+        create_conditional_orders(
+            repository=manager.repo,
+            create_order=manager.create_order,
+            signal=signal,
+            entry_order=SimpleNamespace(
+                id="entry-1",
+                side="buy",
+                client_order_id="strategy-worker-entry-1704067200000000000",
+            ),
+            quantity=Decimal("1"),
+            candle=None,
+            attach_min_notional_reference_price=MagicMock(),
+        )
+
+    assert raised.value is error
+    assert manager.create_order.call_count == 2
+    manager.repo.persist_conditional_order.assert_not_called()
+    assert not hasattr(first, "intent_payload")
+
+
+def test_persistence_failure_preserves_completed_creates_and_stops(signal_factory):
+    signal = signal_factory(
+        signal_type=SignalType.LONG,
+        stop_loss=Decimal("99"),
+        take_profit=Decimal("101"),
+        trailing_distance=Decimal("0.50"),
+    )
+    orders = [
+        SimpleNamespace(id="stop-1", type="stop_loss"),
+        SimpleNamespace(id="target-1", type="take_profit"),
+        SimpleNamespace(id="trailing-1", type="trailing_stop"),
+    ]
+    error = RuntimeError("persist sentinel")
+    manager = MagicMock()
+    manager.create_order.side_effect = orders
+    manager.repo.persist_conditional_order.side_effect = [None, error]
+
+    with pytest.raises(RuntimeError) as raised:
+        create_conditional_orders(
+            repository=manager.repo,
+            create_order=manager.create_order,
+            signal=signal,
+            entry_order=SimpleNamespace(
+                id="entry-1",
+                side="buy",
+                client_order_id="strategy-worker-entry-1704067200000000000",
+            ),
+            quantity=Decimal("1"),
+            candle=None,
+            attach_min_notional_reference_price=MagicMock(),
+        )
+
+    assert raised.value is error
+    assert manager.create_order.call_count == 3
+    assert manager.repo.persist_conditional_order.call_args_list == [
+        call(orders[0]),
+        call(orders[1]),
+    ]
+    assert not hasattr(orders[2], "status")

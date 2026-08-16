@@ -16,6 +16,10 @@ from src.core.execution_ambiguous_submit_adoption import (
     adopt_pending_conditional_order_before_submit,
 )
 from src.core.execution_submission_gate import ExecutionSubmissionGate
+from src.core.interfaces.conditional_orders import (
+    ConditionalOrderRecord as ConditionalOrder,
+    ConditionalOrderRepository,
+)
 from src.core.interfaces.exchange import (
     ExchangeError,
     ExchangeOrderEvent,
@@ -23,22 +27,20 @@ from src.core.interfaces.exchange import (
 )
 from src.core.metrics import ORDERS_TOTAL
 from src.core.models import Candlestick, OrderSide, OrderStatus, Signal
-from src.core.order_manager import OrderManager
-from src.core.orm_models import Order
 from src.core.runtime_capabilities import PendingProtectionFillProcessor
 
 
-class ConditionalOrder(Protocol):
-    id: object
-    side: str
-    type: str
-    product_id: str
-    status: str
-    quantity: Decimal | None
-    filled_quantity: Decimal | None
-    client_order_id: str | None
-    exchange_order_id: str | None
-    intent_payload: dict[str, object] | None
+class CreateConditionalOrder(Protocol):
+    def __call__(
+        self,
+        *,
+        signal: Signal,
+        side: OrderSide,
+        order_type: str,
+        quantity: Decimal,
+        trigger_price: Decimal | None,
+        client_order_id: str | None,
+    ) -> object: ...
 
 
 class RecordOrderAck(Protocol):
@@ -72,7 +74,8 @@ def _conditional_client_order_id(
 
 def create_conditional_orders(
     *,
-    order_manager: OrderManager,
+    repository: ConditionalOrderRepository,
+    create_order: CreateConditionalOrder,
     signal: Signal,
     entry_order: object,
     quantity: Decimal,
@@ -87,7 +90,7 @@ def create_conditional_orders(
     for intent in intents:
         order = cast(
             ConditionalOrder,
-            order_manager.create_order(
+            create_order(
                 signal=signal,
                 side=close_side,
                 order_type=intent.order_type,
@@ -119,7 +122,7 @@ def create_conditional_orders(
             "linked_order_id": str(linked_order_id) if linked_order_id else None,
             "placement_mode": "place-after-fill",
         }
-        order_manager.repo.update_order(cast(Order, order))
+        repository.persist_conditional_order(order)
 
     return orders
 
@@ -130,8 +133,13 @@ class ConditionalOrderLifecycleOwner:
     def __init__(
         self,
         *,
-        order_manager: OrderManager,
+        repository: ConditionalOrderRepository,
+        create_order: CreateConditionalOrder,
+        mark_submitted_unconfirmed: Callable[[object], None],
+        mark_submitted: Callable[[object], None],
+        fail_order: Callable[[object, str], None],
         adapter: IExchangeAdapter,
+        place_order: Callable[[object], str],
         submission_gate: ExecutionSubmissionGate,
         pending_protection_fill_processor: PendingProtectionFillProcessor,
         process_exchange_order_event: Callable[[ExchangeOrderEvent], dict[str, object]],
@@ -140,8 +148,13 @@ class ConditionalOrderLifecycleOwner:
         write_warning: WriteConditionalWarning,
         logger: Logger,
     ) -> None:
-        self._order_manager = order_manager
+        self._repository = repository
+        self._create_order = create_order
+        self._mark_submitted_unconfirmed = mark_submitted_unconfirmed
+        self._mark_submitted = mark_submitted
+        self._fail_order = fail_order
         self._adapter = adapter
+        self._place_order = place_order
         adapter_exchange_id = getattr(adapter, "exchange_id", None)
         self._exchange_id = (
             adapter_exchange_id if isinstance(adapter_exchange_id, str) else None
@@ -166,7 +179,8 @@ class ConditionalOrderLifecycleOwner:
         ],
     ) -> list[ConditionalOrder]:
         return create_conditional_orders(
-            order_manager=self._order_manager,
+            repository=self._repository,
+            create_order=self._create_order,
             signal=signal,
             entry_order=entry_order,
             quantity=quantity,
@@ -206,24 +220,21 @@ class ConditionalOrderLifecycleOwner:
             return []
         related_orders = [
             order
-            for order in cast(
-                list[ConditionalOrder],
-                self._order_manager.repo.list_orders_by_statuses(
-                    {
-                        OrderStatus.NEW.value,
-                        OrderStatus.SUBMITTED_UNCONFIRMED.value,
-                        OrderStatus.SUBMITTED.value,
-                        OrderStatus.PARTIALLY_FILLED.value,
-                    },
-                    exchange_id=self._exchange_id,
-                ),
+            for order in self._repository.list_conditional_orders_by_statuses(
+                {
+                    OrderStatus.NEW.value,
+                    OrderStatus.SUBMITTED_UNCONFIRMED.value,
+                    OrderStatus.SUBMITTED.value,
+                    OrderStatus.PARTIALLY_FILLED.value,
+                },
+                exchange_id=self._exchange_id,
             )
             if isinstance(order.intent_payload, dict)
             and order.intent_payload.get("pending_entry_order_id")
             == str(entry_order.id)
         ]
         provider_result = self._pending_protection_fill_processor(
-            self._order_manager.repo,
+            self._repository,
             entry_order,
             related_orders,
         )
@@ -241,7 +252,7 @@ class ConditionalOrderLifecycleOwner:
             return failures
         for order in pending:
             order.quantity = protected_quantity
-            self._order_manager.repo.update_order(cast(Order, order))
+            self._repository.persist_conditional_order(order)
         placement_candidates = []
         for order in pending:
             lookup_failure = adopt_pending_conditional_order_before_submit(
@@ -281,12 +292,9 @@ class ConditionalOrderLifecycleOwner:
     def recover_pending_protection(self) -> dict[str, object]:
         pending = [
             order
-            for order in cast(
-                list[ConditionalOrder],
-                self._order_manager.repo.list_orders_by_statuses(
-                    {OrderStatus.NEW.value},
-                    exchange_id=self._exchange_id,
-                ),
+            for order in self._repository.list_conditional_orders_by_statuses(
+                {OrderStatus.NEW.value},
+                exchange_id=self._exchange_id,
             )
             if isinstance(order.intent_payload, dict)
             and order.intent_payload.get("pending_entry_order_id")
@@ -299,10 +307,7 @@ class ConditionalOrderLifecycleOwner:
         attempted = 0
         failures: list[dict[str, object]] = []
         for entry_id in sorted(entry_ids):
-            entry = cast(
-                ConditionalOrder | None,
-                self._order_manager.repo.get_order(entry_id),
-            )
+            entry = self._repository.get_conditional_order(entry_id)
             if entry is None or (entry.filled_quantity or Decimal("0")) <= 0:
                 continue
             attempted += 1
@@ -337,10 +342,10 @@ class ConditionalOrderLifecycleOwner:
             submit_attempted = False
             try:
                 if order.client_order_id:
-                    self._order_manager.mark_submitted_unconfirmed(cast(Order, order))
+                    self._mark_submitted_unconfirmed(order)
                 self._assert_external_operation_allowed()
                 submit_attempted = True
-                exchange_order_id = self._adapter.place_order(cast(Order, order))
+                exchange_order_id = self._place_order(order)
                 self._record_order_ack(
                     order,
                     exchange_order_id,
@@ -385,7 +390,7 @@ class ConditionalOrderLifecycleOwner:
             submit_attempted
             and adoption["action"] == "verification_blocked_missing_client_order_id"
         ):
-            self._order_manager.mark_submitted_unconfirmed(cast(Order, order))
+            self._mark_submitted_unconfirmed(order)
             self._record_failed_metric(
                 order.type,
                 "verification_blocked_missing_client_order_id",
@@ -430,7 +435,7 @@ class ConditionalOrderLifecycleOwner:
                     "adoption": adoption,
                 }
             ]
-        self._order_manager.fail_order(cast(Order, order), str(error))
+        self._fail_order(order, str(error))
         reason = execution_failure_diagnostics.order_rejection_reason(error)
         self._record_failed_metric(order.type, reason)
         return [
@@ -449,6 +454,57 @@ class ConditionalOrderLifecycleOwner:
             status="failed",
             reason=reason,
         ).inc()
+
+    def mark_pending_after_uncertain_submit(
+        self,
+        *,
+        entry_order: object,
+        conditional_orders: list[object],
+        adoption: dict[str, object],
+    ) -> None:
+        """Keep only unsubmitted protection recoverable after uncertain entry submit."""
+        entry = cast(ConditionalOrder, entry_order)
+        for value in conditional_orders:
+            order = cast(ConditionalOrder, value)
+            if order.status != OrderStatus.NEW.value:
+                continue
+            payload = dict(order.intent_payload or {})
+            payload.update(
+                {
+                    "pending_entry_order_id": str(entry.id),
+                    "pending_client_order_id": entry.client_order_id,
+                    "pending_reason": "entry_submit_outcome_uncertain",
+                    "adoption_action": str(adoption["action"]),
+                }
+            )
+            order.intent_payload = payload
+            self._repository.persist_conditional_order(order)
+
+    def persist_native_group_ack(
+        self,
+        *,
+        entry_order: object,
+        conditional_orders: list[object],
+        exchange_id: str,
+    ) -> None:
+        """Persist child identity after an atomic native bracket ACK."""
+        entry = cast(ConditionalOrder, entry_order)
+        for value in conditional_orders:
+            supplied = cast(ConditionalOrder, value)
+            current = (
+                self._repository.get_conditional_order(str(supplied.id)) or supplied
+            )
+            payload = dict(current.intent_payload or {})
+            payload.update(
+                {
+                    "native_parent_basket_id": str(exchange_id),
+                    "native_parent_client_order_id": str(entry.client_order_id),
+                }
+            )
+            current.intent_payload = payload
+            self._repository.persist_conditional_order(current)
+            if current.status == OrderStatus.SUBMITTED_UNCONFIRMED.value:
+                self._mark_submitted(current)
 
     def write_warning(
         self,
