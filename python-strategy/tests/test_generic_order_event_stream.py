@@ -1,3 +1,4 @@
+from collections.abc import Callable
 from unittest.mock import MagicMock
 
 import pytest
@@ -59,7 +60,7 @@ def _service(
     adapter: object,
     stop_event: _StopEvent | None = None,
     process_result: object = _APPLIED,
-    recoverable_orders_loader=list,
+    recoverable_orders_loader: Callable[[], list[object]] = list,
 ):
     current = {"adapter": adapter, "worker": None}
     event = stop_event or _StopEvent(events)
