@@ -5,20 +5,16 @@ SimulatedAdapter, verifying every public API of PyMatchingEngine.
 
 Requires: compiled fluxtrade_core.so in src/
 """
-import pytest
+
 from decimal import Decimal
 
-# Skip entire module if Rust .so is not available
-try:
-    from fluxtrade_core import CandleAggregator, Candlestick, Order, PyMatchingEngine
-    HAS_RUST = True
-except ImportError:
-    HAS_RUST = False
+import pytest
 
-pytestmark = [
-    pytest.mark.rust,
-    pytest.mark.skipif(not HAS_RUST, reason="fluxtrade_core.so not compiled"),
-]
+pytest.importorskip("fluxtrade_core")
+
+from fluxtrade_core import CandleAggregator, Candlestick, Order, PyMatchingEngine
+
+pytestmark = pytest.mark.rust
 
 PRODUCT = "BINANCE:BTCUSDT-PERP"
 
@@ -155,6 +151,7 @@ class TestCandleAggregation:
             "5m",
         )
 
+        assert completed is not None
         assert completed.timestamp == base
         assert completed.timeframe == "5m"
         assert completed.open == "100"
@@ -194,6 +191,7 @@ class TestCandleAggregation:
         next_candle.timeframe = "5m"
         completed = aggregator.add_candle(next_candle, "15m")
 
+        assert completed is not None
         assert completed.timestamp == base
         assert completed.timeframe == "15m"
         assert completed.open == "100"
