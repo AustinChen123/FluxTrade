@@ -8,7 +8,8 @@ from sqlalchemy import func
 from sqlalchemy.orm import Query, Session
 
 from src.core.interfaces import IOrderRepository
-from src.core.models import OrderSide
+from src.core.interfaces.order_cancellation import OrderCancellationSnapshot
+from src.core.models import OrderSide, OrderStatus
 from src.core.orm_models import BacktestTradeLog, Order, Position, Trade
 from src.core.product_master import ensure_product_registered
 
@@ -101,6 +102,31 @@ class LiveOrderRepository(IOrderRepository):
     def get_order(self, order_id: str) -> Optional[Order]:
         with self._db_session_factory() as db:
             return self._scope(db.query(Order)).filter_by(id=order_id).first()
+
+    def get_order_for_cancellation(
+        self,
+        order_id: str,
+    ) -> OrderCancellationSnapshot | None:
+        order = self.get_order(order_id)
+        if order is None:
+            return None
+        return OrderCancellationSnapshot(
+            id=str(order.id),
+            product_id=str(order.product_id),
+            type=str(order.type),
+            status=str(order.status),
+            filled_quantity=order.filled_quantity,
+            client_order_id=order.client_order_id,
+            exchange_order_id=order.exchange_order_id,
+        )
+
+    def mark_order_cancelled(self, order_id: str) -> None:
+        with self._db_session_factory() as db:
+            order = self._scope(db.query(Order)).filter_by(id=order_id).first()
+            if order is None:
+                raise RuntimeError("cancellation_order_not_found")
+            order.status = OrderStatus.CANCELLED.value
+            db.commit()
 
     def get_order_by_client_order_id(self, client_order_id: str) -> Optional[Order]:
         with self._db_session_factory() as db:
@@ -302,6 +328,15 @@ class BacktestOrderRepository(IOrderRepository):
 
     def get_order(self, order_id: str) -> Optional[Order]:
         return None
+
+    def get_order_for_cancellation(
+        self,
+        order_id: str,
+    ) -> OrderCancellationSnapshot | None:
+        return None
+
+    def mark_order_cancelled(self, order_id: str) -> None:
+        raise RuntimeError("cancellation_order_not_found")
 
     def get_order_by_client_order_id(self, client_order_id: str) -> Optional[Order]:
         return None

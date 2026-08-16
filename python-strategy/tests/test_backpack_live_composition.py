@@ -101,6 +101,8 @@ def test_live_adapter_delegates_order_event_lifecycle() -> None:
 
     adapter.start_order_event_stream()
     assert adapter.poll_order_event() is event
+    for order_type in (None, "market", "stop_loss"):
+        assert adapter.cancel_terminal_state_delivered_by_order_events(order_type)
     adapter.close()
 
     owner.start.assert_called_once_with()

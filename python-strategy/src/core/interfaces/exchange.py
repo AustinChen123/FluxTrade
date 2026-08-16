@@ -53,23 +53,33 @@ class OwnedOrderReconciler(Protocol):
 
 class ExchangeError(Exception):
     """Base exception for all exchange related errors."""
+
     pass
+
 
 class InsufficientFundsError(ExchangeError):
     """Raised when the account has insufficient funds for the order."""
+
     pass
+
 
 class NetworkError(ExchangeError):
     """Raised when there is a network connectivity issue with the exchange."""
+
     pass
+
 
 class ExchangeOrderLookupUnsupported(ExchangeError):
     """Raised when an adapter cannot query orders by client order ID."""
+
     pass
+
 
 class ExchangeUserStreamUnsupported(ExchangeError):
     """Raised when an adapter cannot manage exchange user-data streams."""
+
     pass
+
 
 @dataclass(frozen=True)
 class ExchangeOrderSnapshot:
@@ -144,13 +154,13 @@ class IExchangeAdapter(ABC):
     def place_order(self, order: Order) -> str:
         """
         Places an order on the exchange.
-        
+
         Args:
             order: The internal Order object (ORM model) containing all details.
-            
+
         Returns:
             str: The exchange's order ID.
-            
+
         Raises:
             ExchangeError: If the order fails.
         """
@@ -170,7 +180,9 @@ class IExchangeAdapter(ABC):
 
     def place_order_group(self, orders: list[Order]) -> str:
         """Submit a previously validated group as one venue-side operation."""
-        raise ExchangeError(f"{type(self).__name__} does not support atomic order groups")
+        raise ExchangeError(
+            f"{type(self).__name__} does not support atomic order groups"
+        )
 
     def restore_order_groups(self, orders: list[Order]) -> None:
         """Restore adapter-side identity indexes from persisted local orders."""
@@ -178,7 +190,9 @@ class IExchangeAdapter(ABC):
 
     def modify_protection(self, order: Order, *, trigger_price: Decimal) -> bool:
         """Modify one already-live protective leg without cancelling it first."""
-        raise ExchangeError(f"{type(self).__name__} does not support protection modification")
+        raise ExchangeError(
+            f"{type(self).__name__} does not support protection modification"
+        )
 
     @abstractmethod
     def cancel_order(
@@ -219,8 +233,12 @@ class IExchangeAdapter(ABC):
         """
         return self.cancel_order(client_order_id, product_id, order_type=order_type)
 
-    def cancel_terminal_state_delivered_by_order_events(self) -> bool:
+    def cancel_terminal_state_delivered_by_order_events(
+        self,
+        order_type: Optional[str] = None,
+    ) -> bool:
         """Whether a successful cancel still awaits an ordered terminal event."""
+        del order_type
         return False
 
     def get_order_by_client_id(
@@ -251,10 +269,10 @@ class IExchangeAdapter(ABC):
     def get_balance(self, asset: str) -> Decimal:
         """
         Retrieves the available balance for a specific asset.
-        
+
         Args:
             asset: The asset symbol (e.g., USDT, BTC).
-            
+
         Returns:
             Decimal: The available balance.
         """

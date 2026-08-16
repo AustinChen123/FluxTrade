@@ -11,7 +11,9 @@ import src.core.adapters as adapters
 from src.core.adapters import live_binance
 from src.core.adapters import simulated as simulated_owner
 from src.core.adapters.ccxt_adapter import CcxtExchangeAdapter
+from src.core.execution_order_cancellation import cancel_known_order
 from src.core.interfaces.exchange import ExchangeError
+from src.core.interfaces.order_cancellation import OrderCancellationSnapshot
 
 
 def test_simulated_owner_preserves_decimal_configuration() -> None:
@@ -221,6 +223,62 @@ def test_binance_identity_provider_error_does_not_escape_source() -> None:
     assert str(raised.value) == "binance_account_identity_verification_failed"
     assert raised.value.__cause__ is None
     assert "provider-account-sentinel" not in str(raised.value)
+
+
+@pytest.mark.parametrize(
+    ("order_type", "expected_deferred"),
+    [
+        ("market", True),
+        ("limit", True),
+        ("stop_loss", False),
+        ("take_profit", False),
+    ],
+)
+def test_binance_cancellation_terminal_owner_depends_on_order_type(
+    order_type: str,
+    expected_deferred: bool,
+) -> None:
+    adapter = object.__new__(live_binance.LiveBinanceAdapter)
+    adapter.cancel_order_by_client_id = MagicMock(return_value=True)
+    adapter.cancel_order = MagicMock(return_value=True)
+    repository = MagicMock()
+    repository.get_order_for_cancellation.return_value = OrderCancellationSnapshot(
+        id="order-1",
+        product_id="BINANCE:BTCUSDT-PERP",
+        type=order_type,
+        status="SUBMITTED",
+        filled_quantity=Decimal("0"),
+        client_order_id="client-1",
+        exchange_order_id="exchange-1",
+    )
+    guard = MagicMock()
+    cleanup = MagicMock()
+
+    assert (
+        cancel_known_order(
+            repository=repository,
+            adapter=adapter,
+            order_id="order-1",
+            assert_external_operation_allowed=guard,
+            fail_pending_conditional_orders_for_terminal_entry=cleanup,
+        )
+        is True
+    )
+
+    adapter.cancel_order_by_client_id.assert_called_once_with(
+        "client-1",
+        "BINANCE:BTCUSDT-PERP",
+        order_type=order_type,
+    )
+    adapter.cancel_order.assert_not_called()
+    if expected_deferred:
+        repository.mark_order_cancelled.assert_not_called()
+        cleanup.assert_not_called()
+    else:
+        repository.mark_order_cancelled.assert_called_once_with("order-1")
+        cleanup.assert_called_once_with(
+            repository.get_order_for_cancellation.return_value
+        )
 
 
 def test_binance_owner_keeps_existing_module_dependency_boundary():

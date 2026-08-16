@@ -149,6 +149,12 @@ class LiveBinanceAdapter(CcxtExchangeAdapter):
     def poll_order_event(self) -> ExchangeOrderEvent | None:
         return self._user_order_stream.poll()
 
+    def cancel_terminal_state_delivered_by_order_events(
+        self,
+        order_type: str | None = None,
+    ) -> bool:
+        return not uses_binance_algo_order_endpoints("binance", order_type)
+
     def _ccxt_order_type_and_params(self, order: Order) -> tuple[str, dict]:
         conditional = binance_conditional_order_mapping(
             "binance",

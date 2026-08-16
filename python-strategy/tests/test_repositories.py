@@ -21,6 +21,7 @@ import inspect
 import pytest
 
 from src.core.interfaces.repository import IOrderRepository
+from src.core.models import OrderStatus
 from src.core.repositories import BacktestOrderRepository, LiveOrderRepository
 from src.core.orm_models import Order, Position, Trade
 
@@ -329,6 +330,78 @@ class TestLiveOrderRepositoryBasics:
 
         assert result is not None
         assert result.id == "order-1"
+
+    def test_cancellation_snapshot_and_command_are_account_scoped(
+        self,
+        sqlite_order_session_factory,
+        order_factory,
+    ):
+        unbound = LiveOrderRepository(db_session_factory=sqlite_order_session_factory)
+        current_order = order_factory(
+            order_id="current",
+            account_profile="binance",
+            account_id="ACCOUNT-A",
+            product_id="BINANCE:BTCUSDT-PERP",
+            client_order_id="shared-client",
+            exchange_order_id="shared-exchange",
+            status=OrderStatus.SUBMITTED.value,
+            filled_quantity=Decimal("0.25"),
+        )
+        foreign_order = order_factory(
+            order_id="foreign",
+            account_profile="binance",
+            account_id="ACCOUNT-B",
+            product_id="BINANCE:BTCUSDT-PERP",
+            client_order_id="shared-client",
+            exchange_order_id="shared-exchange",
+            status=OrderStatus.SUBMITTED.value,
+        )
+        unbound.add_order(current_order)
+        unbound.add_order(foreign_order)
+        current = LiveOrderRepository(
+            db_session_factory=sqlite_order_session_factory,
+            account_profile="binance",
+            account_id="ACCOUNT-A",
+        )
+
+        snapshot = current.get_order_for_cancellation("current")
+
+        assert snapshot is not None
+        assert (
+            snapshot.id,
+            snapshot.product_id,
+            snapshot.type,
+            snapshot.status,
+            snapshot.filled_quantity,
+            snapshot.client_order_id,
+            snapshot.exchange_order_id,
+        ) == (
+            "current",
+            "BINANCE:BTCUSDT-PERP",
+            current_order.type,
+            OrderStatus.SUBMITTED.value,
+            Decimal("0.25"),
+            "shared-client",
+            "shared-exchange",
+        )
+        assert current.get_order_for_cancellation("foreign") is None
+
+        current.mark_order_cancelled("current")
+
+        assert current.get_order("current").status == OrderStatus.CANCELLED.value
+        assert unbound.get_order("foreign").status == OrderStatus.SUBMITTED.value
+        with pytest.raises(RuntimeError, match="^cancellation_order_not_found$"):
+            current.mark_order_cancelled("foreign")
+
+    def test_backtest_cancellation_port_has_no_persisted_order(
+        self,
+        mock_db_session,
+    ):
+        repository = BacktestOrderRepository(mock_db_session, session_id=1)
+
+        assert repository.get_order_for_cancellation("missing") is None
+        with pytest.raises(RuntimeError, match="^cancellation_order_not_found$"):
+            repository.mark_order_cancelled("missing")
 
     def test_get_order_by_client_order_id(
         self,

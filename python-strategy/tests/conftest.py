@@ -30,6 +30,7 @@ from src.core.models import (
     Candlestick,
     Position,
     PositionSide,
+    OrderStatus,
     Trade,
 )
 from src.core.orm_models import (
@@ -45,6 +46,7 @@ from src.core.orm_models import (
 # Interfaces
 from src.core.interfaces import IOrderRepository, IExchangeAdapter
 from src.core.interfaces.exchange import ExchangeOrderSnapshot
+from src.core.interfaces.order_cancellation import OrderCancellationSnapshot
 
 # Core modules
 from src.core.risk_manager import AccountService
@@ -182,6 +184,29 @@ class MockOrderRepository(IOrderRepository):
 
     def get_order(self, order_id: str) -> Optional[Order]:
         return self.orders.get(order_id)
+
+    def get_order_for_cancellation(
+        self,
+        order_id: str,
+    ) -> OrderCancellationSnapshot | None:
+        order = self.get_order(order_id)
+        if order is None:
+            return None
+        return OrderCancellationSnapshot(
+            id=str(order.id),
+            product_id=str(order.product_id),
+            type=str(order.type),
+            status=str(order.status),
+            filled_quantity=order.filled_quantity,
+            client_order_id=order.client_order_id,
+            exchange_order_id=order.exchange_order_id,
+        )
+
+    def mark_order_cancelled(self, order_id: str) -> None:
+        order = self.orders.get(order_id)
+        if order is None:
+            raise RuntimeError("cancellation_order_not_found")
+        order.status = OrderStatus.CANCELLED.value
 
     def get_order_by_client_order_id(self, client_order_id: str) -> Optional[Order]:
         return next(

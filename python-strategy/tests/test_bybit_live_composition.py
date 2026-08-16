@@ -275,7 +275,8 @@ def test_lookup_and_cancel_use_order_link_id_only() -> None:
     client.privateGetV5OrderRealtime.assert_called_once_with(request)
     client.privatePostV5OrderCancel.assert_called_once_with(request)
     assert "orderId" not in request
-    assert adapter.cancel_terminal_state_delivered_by_order_events() is True
+    for order_type in (None, "limit", "take_profit"):
+        assert adapter.cancel_terminal_state_delivered_by_order_events(order_type)
 
 
 @pytest.mark.parametrize(

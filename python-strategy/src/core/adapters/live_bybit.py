@@ -101,7 +101,11 @@ class LiveBybitAdapter(CcxtExchangeAdapter):
     def poll_order_event(self) -> ExchangeOrderEvent | None:
         return self._user_order_stream.poll()
 
-    def cancel_terminal_state_delivered_by_order_events(self) -> bool:
+    def cancel_terminal_state_delivered_by_order_events(
+        self,
+        order_type: str | None = None,
+    ) -> bool:
+        del order_type
         return True
 
     def get_order_by_client_id(

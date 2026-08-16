@@ -8527,11 +8527,33 @@ class TestCancelOrder:
             assert_external_operation_allowed=(
                 execution_engine._assert_external_operation_allowed
             ),
-            mark_cancelled=execution_engine.order_manager.mark_cancelled,
             fail_pending_conditional_orders_for_terminal_entry=(
                 execution_engine._fail_pending_conditional_orders_for_terminal_entry
             ),
         )
+
+    def test_cancel_order_requires_narrow_repository_before_any_owner_effect(
+        self,
+        execution_engine,
+    ):
+        execution_engine.order_manager.repo = SimpleNamespace()
+        execution_engine.adapter.cancel_order_by_client_id = MagicMock()
+        execution_engine.adapter.cancel_order = MagicMock()
+        execution_engine._assert_external_operation_allowed = MagicMock()
+
+        with (
+            patch.object(execution_module, "cancel_known_order") as owner,
+            pytest.raises(
+                RuntimeError,
+                match="^order_cancellation_repository_capability_required$",
+            ),
+        ):
+            execution_engine.cancel_order("order-1")
+
+        owner.assert_not_called()
+        execution_engine._assert_external_operation_allowed.assert_not_called()
+        execution_engine.adapter.cancel_order_by_client_id.assert_not_called()
+        execution_engine.adapter.cancel_order.assert_not_called()
 
     def test_cancel_order_returns_false_when_order_missing(
         self, execution_engine, mock_exchange_adapter
@@ -8633,7 +8655,7 @@ class TestCancelOrder:
         entry = mock_order_repo.orders[order_id]
         entry.status = OrderStatus.CANCELLED.value
         mock_exchange_adapter.cancel_terminal_state_delivered_by_order_events = (
-            lambda: True
+            lambda _order_type=None: True
         )
 
         assert engine.cancel_order(order_id) is True
@@ -8677,7 +8699,7 @@ class TestCancelOrder:
         engine.order_manager.redis_client.hgetall.return_value = {}
         engine.order_manager.is_backtest = False
         mock_exchange_adapter.cancel_terminal_state_delivered_by_order_events = (
-            lambda: True
+            lambda _order_type=None: True
         )
 
         assert engine.cancel_order(order_id) is True

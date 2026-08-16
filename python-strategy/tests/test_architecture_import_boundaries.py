@@ -10,6 +10,14 @@ _REPOSITORY_ROOT = Path(__file__).parents[2]
 _PYTHON_ROOT = _REPOSITORY_ROOT / "python-strategy"
 _ADAPTER_PACKAGE = "src.core.adapters"
 _PORT_PACKAGE = "src.core.interfaces"
+_ORM_FREE_APPLICATION_MODULES = frozenset({"src.core.execution_order_cancellation"})
+_FORBIDDEN_APPLICATION_IMPORTS = frozenset(
+    {
+        "src.core.interfaces.IOrderRepository",
+        "src.core.interfaces.repository",
+        "src.core.interfaces.repository.IOrderRepository",
+    }
+)
 _FORBIDDEN_PORT_IMPORT_ROOTS = ("sqlalchemy", "src.core.orm_models")
 _LEGACY_PORT_ORM_IMPORTS = frozenset(
     {
@@ -214,7 +222,7 @@ def _provider_pairs(
     return frozenset(pairs)
 
 
-def _port_orm_pairs(
+def _orm_free_pairs(
     sources: dict[str, str],
     *,
     package_modules: frozenset[str] = frozenset(),
@@ -222,7 +230,8 @@ def _port_orm_pairs(
     tracked_modules = frozenset(sources)
     pairs: set[tuple[str, str]] = set()
     for importer, source in sources.items():
-        if importer != _PORT_PACKAGE and not importer.startswith(f"{_PORT_PACKAGE}."):
+        is_port = importer == _PORT_PACKAGE or importer.startswith(f"{_PORT_PACKAGE}.")
+        if not is_port and importer not in _ORM_FREE_APPLICATION_MODULES:
             continue
         tree = ast.parse(source)
         imported: set[str] = set()
@@ -231,24 +240,32 @@ def _port_orm_pairs(
                 imported.update(alias.name for alias in node.names)
             elif isinstance(node, ast.ImportFrom):
                 base = _resolve_from(importer, node, package_modules)
-                base_is_forbidden = any(
-                    base == root or base.startswith(f"{root}.")
-                    for root in _FORBIDDEN_PORT_IMPORT_ROOTS
-                )
                 for alias in node.names:
                     target = f"{base}.{alias.name}" if base else alias.name
-                    if target in tracked_modules or base_is_forbidden:
+                    if target in tracked_modules or _is_forbidden_orm_free_import(
+                        importer,
+                        target,
+                    ):
                         imported.add(target)
         imported.update(_dynamic_imports(tree))
         pairs.update(
             (importer, target)
             for target in imported
-            if any(
-                target == root or target.startswith(f"{root}.")
-                for root in _FORBIDDEN_PORT_IMPORT_ROOTS
-            )
+            if _is_forbidden_orm_free_import(importer, target)
         )
     return frozenset(pairs)
+
+
+def _is_forbidden_orm_free_import(importer: str, target: str) -> bool:
+    if any(
+        target == root or target.startswith(f"{root}.")
+        for root in _FORBIDDEN_PORT_IMPORT_ROOTS
+    ):
+        return True
+    return (
+        importer in _ORM_FREE_APPLICATION_MODULES
+        and target in _FORBIDDEN_APPLICATION_IMPORTS
+    )
 
 
 def test_tracked_production_provider_imports_match_exact_baseline() -> None:
@@ -265,7 +282,7 @@ def test_tracked_production_provider_imports_match_exact_baseline() -> None:
 def test_tracked_production_orm_free_port_imports_match_exact_baseline() -> None:
     sources, packages = _tracked_production_sources()
     assert (
-        _port_orm_pairs(sources, package_modules=packages) == _LEGACY_PORT_ORM_IMPORTS
+        _orm_free_pairs(sources, package_modules=packages) == _LEGACY_PORT_ORM_IMPORTS
     )
 
 
@@ -298,7 +315,7 @@ def test_orm_free_port_import_forms_cannot_bypass_ratchet(
         "src.core.orm_models": "",
     }
     pair = (importer, expected)
-    assert pair in _port_orm_pairs(sources)
+    assert pair in _orm_free_pairs(sources)
     assert pair not in _LEGACY_PORT_ORM_IMPORTS
 
 
@@ -308,10 +325,59 @@ def test_orm_free_port_package_relative_import_anchors_at_package() -> None:
         "src.core.interfaces": "from .. import orm_models",
         "src.core.orm_models": "",
     }
-    assert pair in _port_orm_pairs(
+    assert pair in _orm_free_pairs(
         sources,
         package_modules=frozenset({"src.core.interfaces"}),
     )
+    assert pair not in _LEGACY_PORT_ORM_IMPORTS
+
+
+def test_migrated_cancellation_owner_cannot_reintroduce_orm_imports() -> None:
+    importer = "src.core.execution_order_cancellation"
+    pair = (importer, "src.core.orm_models.Order")
+
+    assert pair in _orm_free_pairs(
+        {
+            importer: "from src.core.orm_models import Order",
+            "src.core.orm_models": "",
+        }
+    )
+    assert pair not in _LEGACY_PORT_ORM_IMPORTS
+
+
+@pytest.mark.parametrize(
+    ("source", "expected"),
+    [
+        (
+            "from src.core.interfaces import IOrderRepository",
+            "src.core.interfaces.IOrderRepository",
+        ),
+        (
+            "from src.core.interfaces.repository import IOrderRepository",
+            "src.core.interfaces.repository.IOrderRepository",
+        ),
+        (
+            "from .interfaces import IOrderRepository",
+            "src.core.interfaces.IOrderRepository",
+        ),
+        (
+            'from importlib import import_module\nimport_module("src.core.interfaces.repository")',
+            "src.core.interfaces.repository",
+        ),
+        (
+            'from importlib import import_module\nimport_module(".interfaces.repository", package="src.core")',
+            "src.core.interfaces.repository",
+        ),
+    ],
+)
+def test_migrated_cancellation_owner_cannot_reintroduce_broad_repository(
+    source: str,
+    expected: str,
+) -> None:
+    importer = "src.core.execution_order_cancellation"
+    pair = (importer, expected)
+
+    assert pair in _orm_free_pairs({importer: source})
     assert pair not in _LEGACY_PORT_ORM_IMPORTS
 
 

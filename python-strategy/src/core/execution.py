@@ -29,6 +29,9 @@ from src.core.interfaces.exchange import IExchangeAdapter, ExchangeError, Networ
 from src.core.interfaces.exchange import ExchangeOrderEvent
 from src.core.clock import Clock
 from src.core.interfaces import IOrderRepository
+from src.core.interfaces.order_cancellation import (
+    OrderCancellationRepository,
+)
 from src.core.journal import StrategyJournal
 from src.core.metrics import ORDERS_TOTAL, EXECUTION_LATENCY
 from src.core.audit_service import (
@@ -816,12 +819,14 @@ class ExecutionEngine:
         acknowledge the request here. Other adapters complete the local
         terminal transition synchronously.
         """
+        repository = self.order_manager.repo
+        if not isinstance(repository, OrderCancellationRepository):
+            raise RuntimeError("order_cancellation_repository_capability_required")
         return cancel_known_order(
-            repository=self.order_manager.repo,
+            repository=repository,
             adapter=self.adapter,
             order_id=order_id,
             assert_external_operation_allowed=self._assert_external_operation_allowed,
-            mark_cancelled=self.order_manager.mark_cancelled,
             fail_pending_conditional_orders_for_terminal_entry=(
                 self._fail_pending_conditional_orders_for_terminal_entry
             ),

@@ -145,8 +145,9 @@ def test_runtime_start_is_explicit_and_idempotent(client):
     factory.assert_called_once_with("test", "ACCOUNT")
 
 
-def test_cancel_terminal_state_is_delivered_by_order_events(adapter):
-    assert adapter.cancel_terminal_state_delivered_by_order_events() is True
+@pytest.mark.parametrize("order_type", [None, "market", "stop_loss"])
+def test_cancel_terminal_state_is_delivered_by_order_events(adapter, order_type):
+    assert adapter.cancel_terminal_state_delivered_by_order_events(order_type) is True
 
 
 def test_exit_position_uses_native_instrument_identity(adapter, client):
