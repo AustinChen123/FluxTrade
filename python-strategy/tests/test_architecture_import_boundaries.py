@@ -15,6 +15,7 @@ _ORM_FREE_APPLICATION_MODULES = frozenset(
         "src.core.adapters.rithmic_native_bracket",
         "src.core.execution_conditional_orders",
         "src.core.execution_order_cancellation",
+        "src.core.execution_verified_net_reduction",
     }
 )
 _FORBIDDEN_APPLICATION_IMPORTS = frozenset(
@@ -338,8 +339,14 @@ def test_orm_free_port_package_relative_import_anchors_at_package() -> None:
     assert pair not in _LEGACY_PORT_ORM_IMPORTS
 
 
-def test_migrated_cancellation_owner_cannot_reintroduce_orm_imports() -> None:
-    importer = "src.core.execution_order_cancellation"
+@pytest.mark.parametrize(
+    "importer",
+    [
+        "src.core.execution_order_cancellation",
+        "src.core.execution_verified_net_reduction",
+    ],
+)
+def test_migrated_owner_cannot_reintroduce_orm_imports(importer: str) -> None:
     pair = (importer, "src.core.orm_models.Order")
 
     assert pair in _orm_free_pairs(
@@ -376,11 +383,18 @@ def test_migrated_cancellation_owner_cannot_reintroduce_orm_imports() -> None:
         ),
     ],
 )
-def test_migrated_cancellation_owner_cannot_reintroduce_broad_repository(
+@pytest.mark.parametrize(
+    "importer",
+    [
+        "src.core.execution_order_cancellation",
+        "src.core.execution_verified_net_reduction",
+    ],
+)
+def test_migrated_owner_cannot_reintroduce_broad_repository(
+    importer: str,
     source: str,
     expected: str,
 ) -> None:
-    importer = "src.core.execution_order_cancellation"
     pair = (importer, expected)
 
     assert pair in _orm_free_pairs({importer: source})

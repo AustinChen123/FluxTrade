@@ -1,19 +1,22 @@
 """Verified net-reduction replay identity and persistence."""
 
+from collections.abc import Mapping
 from decimal import Decimal
 
-from src.core.interfaces import IOrderRepository
+from src.core.interfaces.verified_net_reduction import (
+    VerifiedNetReductionOrderSnapshot,
+    VerifiedNetReductionRepository,
+)
 from src.core.models import OrderSide, OrderStatus, Signal
-from src.core.orm_models import Order
 
 
 def validated_order_payload(
     signal: Signal,
-    order: Order,
+    order: VerifiedNetReductionOrderSnapshot,
     *,
     expected_side: OrderSide | None,
-) -> dict:
-    payload = order.intent_payload if isinstance(order.intent_payload, dict) else {}
+) -> Mapping[str, object]:
+    payload = order.intent_payload if isinstance(order.intent_payload, Mapping) else {}
     signal_payload = payload.get("signal")
     quantity = Decimal(str(order.quantity))
     filled_quantity = Decimal(str(order.filled_quantity or Decimal("0")))
@@ -37,7 +40,7 @@ def validated_order_payload(
 
 def completed_replay(
     signal: Signal,
-    existing_order: Order | None,
+    existing_order: VerifiedNetReductionOrderSnapshot | None,
     *,
     expected_side: OrderSide | None,
 ) -> bool:
@@ -66,9 +69,9 @@ def validate_remaining_remote_quantity(remaining_remote_quantity: Decimal) -> No
 
 
 def record_verification(
-    repository: IOrderRepository,
+    repository: VerifiedNetReductionRepository,
     signal: Signal,
-    order: Order,
+    order: VerifiedNetReductionOrderSnapshot,
     *,
     client_order_id: str,
     expected_side: OrderSide | None,
@@ -91,5 +94,4 @@ def record_verification(
         "product_id": signal.product_id,
         "remaining_remote_quantity": str(remaining_remote_quantity),
     }
-    setattr(order, "intent_payload", payload)
-    repository.update_order(order)
+    repository.persist_verified_net_reduction(order.id, payload)

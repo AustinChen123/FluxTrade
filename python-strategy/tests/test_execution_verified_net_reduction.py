@@ -1,33 +1,55 @@
 from decimal import Decimal
+from dataclasses import replace
 from pathlib import Path
-from types import SimpleNamespace
+from types import MappingProxyType, SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import pytest
 
 from src.core import execution_verified_net_reduction
 from src.core.execution import ExecutionEngine
+from src.core.interfaces.verified_net_reduction import (
+    VerifiedNetReductionOrderSnapshot,
+    VerifiedNetReductionRepository,
+)
 from src.core.models import OrderSide, OrderStatus, SignalType
 
 
 def _order(signal, **changes):
-    values = {
-        "id": "order-1",
-        "client_order_id": "client-1",
-        "strategy_id": signal.strategy_id,
-        "product_id": signal.product_id,
-        "type": "market",
-        "side": "sell",
-        "quantity": Decimal("2.00"),
-        "filled_quantity": Decimal("2.00"),
-        "status": OrderStatus.FILLED.value,
-        "intent_payload": {
+    order = VerifiedNetReductionOrderSnapshot(
+        id="order-1",
+        client_order_id="client-1",
+        strategy_id=signal.strategy_id,
+        product_id=signal.product_id,
+        type="market",
+        side="sell",
+        quantity=Decimal("2.00"),
+        filled_quantity=Decimal("2.00"),
+        status=OrderStatus.FILLED.value,
+        intent_payload={
             "source": "authoritative_net_reduction",
             "signal": {"type": signal.type.value},
         },
+    )
+    return replace(order, **changes)
+
+
+def test_snapshot_detaches_and_freezes_the_source_payload(signal_factory):
+    signal = signal_factory(signal_type=SignalType.EXIT_LONG)
+    source_payload = {
+        "source": "authoritative_net_reduction",
+        "signal": {"type": signal.type.value},
     }
-    values.update(changes)
-    return SimpleNamespace(**values)
+
+    snapshot = _order(signal, intent_payload=source_payload)
+    source_payload["source"] = "mutated"
+    source_payload["extra"] = True
+
+    assert type(snapshot.intent_payload) is MappingProxyType
+    assert snapshot.intent_payload == {
+        "source": "authoritative_net_reduction",
+        "signal": {"type": signal.type.value},
+    }
 
 
 @pytest.mark.parametrize(
@@ -140,11 +162,17 @@ def test_completed_replay_uses_lookup_and_exact_verification(signal_factory):
         is False
     )
 
-    order.intent_payload["authoritative_verification"] = {
-        "status": "verified_portfolio_reduction",
-        "strategy_id": signal.strategy_id,
-        "product_id": signal.product_id,
-    }
+    order = replace(
+        order,
+        intent_payload={
+            **dict(order.intent_payload or {}),
+            "authoritative_verification": {
+                "status": "verified_portfolio_reduction",
+                "strategy_id": signal.strategy_id,
+                "product_id": signal.product_id,
+            },
+        },
+    )
     assert (
         execution_verified_net_reduction.completed_replay(
             signal,
@@ -179,7 +207,13 @@ def test_completed_replay_rejects_missing_or_mismatched_verification(
     signal = signal_factory(signal_type=SignalType.EXIT_LONG)
     order = _order(signal)
     if verification is not None:
-        order.intent_payload["authoritative_verification"] = verification
+        order = replace(
+            order,
+            intent_payload={
+                **dict(order.intent_payload or {}),
+                "authoritative_verification": verification,
+            },
+        )
     with pytest.raises(
         RuntimeError,
         match="authoritative_exit_replay_verification_missing",
@@ -212,7 +246,7 @@ def test_record_verification_rejects_invalid_remaining_before_lookup(
             remaining_remote_quantity=remaining,
         )
 
-    repository.update_order.assert_not_called()
+    repository.persist_verified_net_reduction.assert_not_called()
 
 
 def test_record_verification_requires_client_identity(signal_factory):
@@ -230,15 +264,15 @@ def test_record_verification_requires_client_identity(signal_factory):
             expected_side=OrderSide.SELL,
             remaining_remote_quantity=Decimal("0"),
         )
-    repository.update_order.assert_not_called()
+    repository.persist_verified_net_reduction.assert_not_called()
 
 
 def test_record_verification_copies_payload_and_updates_once(signal_factory):
     signal = signal_factory(signal_type=SignalType.EXIT_LONG)
     order = _order(signal)
     original_payload = order.intent_payload
+    assert original_payload is not None
     repository = MagicMock()
-    repository.get_order.return_value = order
 
     execution_verified_net_reduction.record_verification(
         repository,
@@ -249,15 +283,44 @@ def test_record_verification_copies_payload_and_updates_once(signal_factory):
         remaining_remote_quantity=Decimal("0.00"),
     )
 
-    assert order.intent_payload is not original_payload
+    assert order.intent_payload is original_payload
     assert "authoritative_verification" not in original_payload
-    assert order.intent_payload["authoritative_verification"] == {
+    assert type(original_payload) is MappingProxyType
+    repository.persist_verified_net_reduction.assert_called_once()
+    order_id, persisted_payload = (
+        repository.persist_verified_net_reduction.call_args.args
+    )
+    assert order_id == "order-1"
+    assert persisted_payload is not original_payload
+    assert persisted_payload["authoritative_verification"] == {
         "status": "verified_portfolio_reduction",
         "strategy_id": signal.strategy_id,
         "product_id": signal.product_id,
         "remaining_remote_quantity": "0.00",
     }
-    repository.update_order.assert_called_once_with(order)
+
+
+def test_record_verification_preserves_persistence_failure_identity(signal_factory):
+    signal = signal_factory(signal_type=SignalType.EXIT_LONG)
+    order = _order(signal)
+    original_payload = order.intent_payload
+    repository = MagicMock(spec=VerifiedNetReductionRepository)
+    failure = RuntimeError("persistence-sentinel")
+    repository.persist_verified_net_reduction.side_effect = failure
+
+    with pytest.raises(RuntimeError) as raised:
+        execution_verified_net_reduction.record_verification(
+            repository,
+            signal,
+            order,
+            client_order_id="client-1",
+            expected_side=OrderSide.SELL,
+            remaining_remote_quantity=Decimal("0"),
+        )
+
+    assert raised.value is failure
+    assert order.intent_payload is original_payload
+    repository.persist_verified_net_reduction.assert_called_once()
 
 
 def test_execution_facades_resolve_current_dependencies(
@@ -275,7 +338,7 @@ def test_execution_facades_resolve_current_dependencies(
     )
     signal = signal_factory(signal_type=SignalType.EXIT_LONG)
     order = _order(signal)
-    replacement_repository = MagicMock()
+    replacement_repository = MagicMock(spec=VerifiedNetReductionRepository)
     execution_engine.order_manager.repo = replacement_repository
 
     with (
@@ -299,8 +362,8 @@ def test_execution_facades_resolve_current_dependencies(
             "record_verification",
         ) as record,
     ):
-        replacement_repository.get_order.return_value = order
-        replacement_repository.get_order_by_client_order_id.return_value = order
+        replacement_repository.get_verified_net_reduction_order.return_value = order
+        replacement_repository.get_verified_net_reduction_order_by_client_id.return_value = order
         assert execution_engine._completed_verified_net_reduction_replay(signal)
         execution_engine.record_verified_net_reduction(
             signal,
@@ -315,7 +378,7 @@ def test_execution_facades_resolve_current_dependencies(
         order,
         expected_side=OrderSide.SELL,
     )
-    replacement_repository.get_order_by_client_order_id.assert_called_once_with(
+    replacement_repository.get_verified_net_reduction_order_by_client_id.assert_called_once_with(
         "current-client"
     )
     record.assert_called_once_with(
@@ -350,7 +413,7 @@ def test_execution_record_facade_preserves_error_precedence(
         adapter=mock_exchange_adapter,
         order_repository=mock_order_repo,
     )
-    mock_order_repo.get_order = MagicMock(return_value=None)
+    mock_order_repo.get_verified_net_reduction_order = MagicMock(return_value=None)
     engine._client_order_id_for_signal = MagicMock(
         side_effect=AssertionError("client id resolved too early")
     )
@@ -381,6 +444,9 @@ def test_execution_replay_missing_order_does_not_resolve_side(
     engine._determine_side = MagicMock(
         side_effect=AssertionError("side resolved without an order")
     )
+    mock_order_repo.get_verified_net_reduction_order_by_client_id = MagicMock(
+        return_value=None
+    )
 
     assert (
         engine._completed_verified_net_reduction_replay(
@@ -389,6 +455,97 @@ def test_execution_replay_missing_order_does_not_resolve_side(
         is False
     )
     engine._determine_side.assert_not_called()
+
+
+def test_execution_facades_fail_before_repository_io_without_capability(
+    mock_db_session,
+    mock_clock,
+    mock_exchange_adapter,
+    mock_order_repo,
+    signal_factory,
+):
+    engine = ExecutionEngine(
+        db_session=mock_db_session,
+        clock=mock_clock,
+        adapter=mock_exchange_adapter,
+        order_repository=mock_order_repo,
+    )
+    missing_capability = SimpleNamespace()
+    signal = signal_factory(signal_type=SignalType.EXIT_LONG)
+    engine._determine_side = MagicMock(
+        side_effect=AssertionError("side resolved without repository capability")
+    )
+
+    with patch.object(engine.order_manager, "repo", missing_capability):
+        with pytest.raises(
+            ValueError,
+            match="^verified_net_reduction_remaining_quantity_invalid$",
+        ):
+            engine.record_verified_net_reduction(
+                signal,
+                "order-1",
+                remaining_remote_quantity=Decimal("-1"),
+            )
+        with pytest.raises(
+            RuntimeError,
+            match="^verified_net_reduction_repository_capability_required$",
+        ):
+            engine._completed_verified_net_reduction_replay(signal)
+        with pytest.raises(
+            RuntimeError,
+            match="^verified_net_reduction_repository_capability_required$",
+        ):
+            engine.record_verified_net_reduction(
+                signal,
+                "order-1",
+                remaining_remote_quantity=Decimal("0"),
+            )
+
+    assert vars(missing_capability) == {}
+    engine._determine_side.assert_not_called()
+
+
+def test_execution_facades_preserve_lookup_failure_identity(
+    mock_db_session,
+    mock_clock,
+    mock_exchange_adapter,
+    mock_order_repo,
+    signal_factory,
+):
+    engine = ExecutionEngine(
+        db_session=mock_db_session,
+        clock=mock_clock,
+        adapter=mock_exchange_adapter,
+        order_repository=mock_order_repo,
+    )
+    signal = signal_factory(signal_type=SignalType.EXIT_LONG)
+    failure = RuntimeError("lookup-sentinel")
+    mock_order_repo.get_verified_net_reduction_order_by_client_id = MagicMock(
+        side_effect=failure
+    )
+    engine._determine_side = MagicMock(
+        side_effect=AssertionError("side resolved after lookup failure")
+    )
+
+    with pytest.raises(RuntimeError) as replay_raised:
+        engine._completed_verified_net_reduction_replay(signal)
+
+    assert replay_raised.value is failure
+    engine._determine_side.assert_not_called()
+
+    mock_order_repo.get_verified_net_reduction_order = MagicMock(side_effect=failure)
+    engine._client_order_id_for_signal = MagicMock(
+        side_effect=AssertionError("client id resolved after lookup failure")
+    )
+    with pytest.raises(RuntimeError) as record_raised:
+        engine.record_verified_net_reduction(
+            signal,
+            "order-1",
+            remaining_remote_quantity=Decimal("0"),
+        )
+
+    assert record_raised.value is failure
+    engine._client_order_id_for_signal.assert_not_called()
 
 
 def test_owner_has_no_submission_or_provider_dependencies():

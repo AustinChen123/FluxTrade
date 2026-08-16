@@ -1,4 +1,5 @@
 import time
+from collections.abc import Mapping
 from contextlib import contextmanager
 from decimal import Decimal
 from threading import Lock
@@ -10,6 +11,9 @@ from sqlalchemy.orm import Query, Session
 from src.core.interfaces import IOrderRepository
 from src.core.interfaces.conditional_orders import ConditionalOrderRecord
 from src.core.interfaces.order_cancellation import OrderCancellationSnapshot
+from src.core.interfaces.verified_net_reduction import (
+    VerifiedNetReductionOrderSnapshot,
+)
 from src.core.models import OrderSide, OrderStatus
 from src.core.orm_models import BacktestTradeLog, Order, Position, Trade
 from src.core.product_master import ensure_product_registered
@@ -106,6 +110,54 @@ class LiveOrderRepository(IOrderRepository):
     def get_order(self, order_id: str) -> Optional[Order]:
         with self._db_session_factory() as db:
             return self._scope(db.query(Order)).filter_by(id=order_id).first()
+
+    @staticmethod
+    def _verified_net_reduction_snapshot(
+        order: Order,
+    ) -> VerifiedNetReductionOrderSnapshot:
+        payload = order.intent_payload
+        return VerifiedNetReductionOrderSnapshot(
+            id=str(order.id),
+            client_order_id=order.client_order_id,
+            strategy_id=order.strategy_id,
+            product_id=str(order.product_id),
+            type=str(order.type),
+            side=str(getattr(order.side, "value", order.side)),
+            quantity=order.quantity,
+            filled_quantity=order.filled_quantity,
+            status=str(order.status),
+            intent_payload=payload if isinstance(payload, Mapping) else None,
+        )
+
+    def get_verified_net_reduction_order(
+        self,
+        order_id: str,
+    ) -> VerifiedNetReductionOrderSnapshot | None:
+        order = self.get_order(order_id)
+        return (
+            self._verified_net_reduction_snapshot(order) if order is not None else None
+        )
+
+    def get_verified_net_reduction_order_by_client_id(
+        self,
+        client_order_id: str,
+    ) -> VerifiedNetReductionOrderSnapshot | None:
+        order = self.get_order_by_client_order_id(client_order_id)
+        return (
+            self._verified_net_reduction_snapshot(order) if order is not None else None
+        )
+
+    def persist_verified_net_reduction(
+        self,
+        order_id: str,
+        intent_payload: Mapping[str, object],
+    ) -> None:
+        with self._db_session_factory() as db:
+            order = self._scope(db.query(Order)).filter_by(id=order_id).first()
+            if order is None:
+                raise RuntimeError("verified_net_reduction_order_not_found")
+            order.intent_payload = dict(intent_payload)
+            db.commit()
 
     def get_conditional_order(
         self,
@@ -351,6 +403,25 @@ class BacktestOrderRepository(IOrderRepository):
 
     def get_order(self, order_id: str) -> Optional[Order]:
         return None
+
+    def get_verified_net_reduction_order(
+        self,
+        order_id: str,
+    ) -> VerifiedNetReductionOrderSnapshot | None:
+        return None
+
+    def get_verified_net_reduction_order_by_client_id(
+        self,
+        client_order_id: str,
+    ) -> VerifiedNetReductionOrderSnapshot | None:
+        return None
+
+    def persist_verified_net_reduction(
+        self,
+        order_id: str,
+        intent_payload: Mapping[str, object],
+    ) -> None:
+        raise RuntimeError("verified_net_reduction_order_not_found")
 
     def get_conditional_order(
         self,

@@ -17,6 +17,7 @@ test_adapters_simulated.py for coverage of those behaviours.
 from contextlib import nullcontext
 from decimal import Decimal
 import inspect
+from types import MappingProxyType
 
 import pytest
 
@@ -468,6 +469,22 @@ class TestLiveOrderRepositoryBasics:
         with pytest.raises(RuntimeError, match="^cancellation_order_not_found$"):
             repository.mark_order_cancelled("missing")
 
+    def test_backtest_verified_reduction_port_has_no_persisted_order(
+        self,
+        mock_db_session,
+    ):
+        repository = BacktestOrderRepository(mock_db_session, session_id=1)
+
+        assert repository.get_verified_net_reduction_order("missing") is None
+        assert (
+            repository.get_verified_net_reduction_order_by_client_id("missing") is None
+        )
+        with pytest.raises(
+            RuntimeError,
+            match="^verified_net_reduction_order_not_found$",
+        ):
+            repository.persist_verified_net_reduction("missing", {})
+
     def test_get_order_by_client_order_id(
         self,
         sqlite_order_session_factory,
@@ -523,6 +540,146 @@ class TestLiveOrderRepositoryBasics:
                 {"SUBMITTED"}, exchange_id="BINANCE"
             )
         ] == ["order-ACCOUNT-A"]
+
+    def test_verified_reduction_port_projects_and_persists_only_current_account(
+        self,
+        sqlite_order_session_factory,
+        order_factory,
+    ) -> None:
+        unbound = LiveOrderRepository(db_session_factory=sqlite_order_session_factory)
+        current_order = order_factory(
+            order_id="order-current",
+            client_order_id="shared-client",
+            order_type="market",
+            side="sell",
+            quantity=Decimal("2.00"),
+            filled_quantity=Decimal("2.00"),
+            status=OrderStatus.FILLED.value,
+            account_profile="binance",
+            account_id="ACCOUNT-A",
+        )
+        current_order.intent_payload = {
+            "source": "authoritative_net_reduction",
+            "signal": {"type": "EXIT_LONG"},
+        }
+        foreign_order = order_factory(
+            order_id="order-foreign",
+            client_order_id="shared-client",
+            account_profile="binance",
+            account_id="ACCOUNT-B",
+        )
+        foreign_order.intent_payload = {"source": "foreign"}
+        unbound.add_order(current_order)
+        unbound.add_order(foreign_order)
+        current = LiveOrderRepository(
+            db_session_factory=sqlite_order_session_factory,
+            account_profile="binance",
+            account_id="ACCOUNT-A",
+        )
+
+        snapshot = current.get_verified_net_reduction_order_by_client_id(
+            "shared-client"
+        )
+
+        assert snapshot is not None
+        assert snapshot == current.get_verified_net_reduction_order("order-current")
+        assert (
+            snapshot.id,
+            snapshot.client_order_id,
+            snapshot.strategy_id,
+            snapshot.product_id,
+            snapshot.type,
+            snapshot.side,
+            snapshot.quantity,
+            snapshot.filled_quantity,
+            snapshot.status,
+        ) == (
+            "order-current",
+            "shared-client",
+            "test_strategy",
+            "BINANCE:BTCUSDT-PERP",
+            "market",
+            "sell",
+            Decimal("2.00"),
+            Decimal("2.00"),
+            OrderStatus.FILLED.value,
+        )
+        assert snapshot.intent_payload is not None
+        assert type(snapshot.intent_payload) is MappingProxyType
+
+        persisted_payload = {
+            **dict(snapshot.intent_payload),
+            "authoritative_verification": {"status": "verified"},
+        }
+        current.persist_verified_net_reduction(snapshot.id, persisted_payload)
+
+        persisted_current = unbound.get_order("order-current")
+        persisted_foreign = unbound.get_order("order-foreign")
+        assert persisted_current is not None
+        assert persisted_foreign is not None
+        assert persisted_current.intent_payload == persisted_payload
+        assert (
+            persisted_current.id,
+            persisted_current.client_order_id,
+            persisted_current.strategy_id,
+            persisted_current.product_id,
+            persisted_current.type,
+            persisted_current.side,
+            persisted_current.quantity,
+            persisted_current.filled_quantity,
+            persisted_current.status,
+            persisted_current.account_profile,
+            persisted_current.account_id,
+        ) == (
+            snapshot.id,
+            snapshot.client_order_id,
+            snapshot.strategy_id,
+            snapshot.product_id,
+            snapshot.type,
+            snapshot.side,
+            snapshot.quantity,
+            snapshot.filled_quantity,
+            snapshot.status,
+            "binance",
+            "ACCOUNT-A",
+        )
+        assert persisted_foreign.intent_payload == {"source": "foreign"}
+        with pytest.raises(
+            RuntimeError,
+            match="^verified_net_reduction_order_not_found$",
+        ):
+            current.persist_verified_net_reduction(
+                "order-foreign",
+                {"source": "mutated"},
+            )
+
+    @pytest.mark.parametrize("phase", ["query", "commit"])
+    def test_verified_reduction_persistence_preserves_storage_failure_identity(
+        self,
+        mock_db_session,
+        order_factory,
+        phase,
+    ) -> None:
+        repository = LiveOrderRepository(db_session=mock_db_session)
+        order = order_factory(order_id="order-1")
+        failure = RuntimeError(f"{phase}-sentinel")
+        if phase == "query":
+            mock_db_session.query.side_effect = failure
+        else:
+            mock_db_session.query.return_value.filter_by.return_value.first.return_value = order
+            mock_db_session.commit.side_effect = failure
+
+        with pytest.raises(RuntimeError) as raised:
+            repository.persist_verified_net_reduction(
+                "order-1",
+                {"source": "authoritative_net_reduction"},
+            )
+
+        assert raised.value is failure
+        if phase == "query":
+            mock_db_session.commit.assert_not_called()
+        else:
+            mock_db_session.commit.assert_called_once_with()
 
     def test_bound_repository_rejects_legacy_identifier_collision(
         self,

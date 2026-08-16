@@ -33,6 +33,7 @@ from src.core.interfaces.order_cancellation import (
     OrderCancellationRepository,
 )
 from src.core.interfaces.conditional_orders import ConditionalOrderRepository
+from src.core.interfaces.verified_net_reduction import VerifiedNetReductionRepository
 from src.core.journal import StrategyJournal
 from src.core.metrics import ORDERS_TOTAL, EXECUTION_LATENCY
 from src.core.audit_service import (
@@ -447,7 +448,10 @@ class ExecutionEngine:
 
     def _completed_verified_net_reduction_replay(self, signal: Signal) -> bool:
         client_order_id = self._client_order_id_for_signal(signal)
-        existing_order = self.order_manager.repo.get_order_by_client_order_id(
+        repository = self.order_manager.repo
+        if not isinstance(repository, VerifiedNetReductionRepository):
+            raise RuntimeError("verified_net_reduction_repository_capability_required")
+        existing_order = repository.get_verified_net_reduction_order_by_client_id(
             client_order_id
         )
         if existing_order is None:
@@ -468,12 +472,15 @@ class ExecutionEngine:
         execution_verified_net_reduction.validate_remaining_remote_quantity(
             remaining_remote_quantity
         )
-        order = self.order_manager.repo.get_order(order_id)
+        repository = self.order_manager.repo
+        if not isinstance(repository, VerifiedNetReductionRepository):
+            raise RuntimeError("verified_net_reduction_repository_capability_required")
+        order = repository.get_verified_net_reduction_order(order_id)
         if order is None:
             raise RuntimeError("verified_net_reduction_order_missing")
         client_order_id = self._client_order_id_for_signal(signal)
         execution_verified_net_reduction.record_verification(
-            self.order_manager.repo,
+            repository,
             signal,
             order,
             client_order_id=client_order_id,
