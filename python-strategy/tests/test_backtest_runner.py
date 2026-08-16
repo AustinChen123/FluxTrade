@@ -24,6 +24,7 @@ from src.core.analytics import ClosedTrade
 from src.core.models import Candlestick, PositionSide
 from src.core.portfolio_runtime import PortfolioDefinition, PortfolioSleeve
 from src.core.journal import StrategyJournal
+from src.core.strategy_context import StrategyContext
 from src.strategies.base import BaseStrategy, StrategyRequirements
 
 
@@ -32,8 +33,8 @@ from src.strategies.base import BaseStrategy, StrategyRequirements
 # =============================================================================
 
 
-def _make_closed_trade(**overrides) -> ClosedTrade:
-    defaults = dict(
+def _make_closed_trade() -> ClosedTrade:
+    return ClosedTrade(
         entry_time=1704067200000,
         exit_time=1704067260000,
         side=PositionSide.LONG,
@@ -42,8 +43,6 @@ def _make_closed_trade(**overrides) -> ClosedTrade:
         quantity=Decimal("0.1"),
         pnl=Decimal("50.0"),
     )
-    defaults.update(overrides)
-    return ClosedTrade(**defaults)
 
 
 # =============================================================================
@@ -52,7 +51,6 @@ def _make_closed_trade(**overrides) -> ClosedTrade:
 
 
 class TestWriteCsvTrades:
-
     def test_creates_csv_file(self, tmp_path):
         """Should create a CSV file at the given path."""
         path = tmp_path / "trades.csv"
@@ -68,7 +66,10 @@ class TestWriteCsvTrades:
         _write_csv_trades([_make_closed_trade()], path)
 
         lines = path.read_text().strip().split("\n")
-        assert lines[0] == "entry_time,exit_time,side,entry_price,exit_price,quantity,fee,pnl"
+        assert (
+            lines[0]
+            == "entry_time,exit_time,side,entry_price,exit_price,quantity,fee,pnl"
+        )
 
     def test_csv_data_row(self, tmp_path):
         """CSV should contain trade data."""
@@ -94,7 +95,6 @@ class TestWriteCsvTrades:
 
 
 class TestWriteEquityCurve:
-
     def test_creates_file(self, tmp_path):
         """Should create equity curve CSV."""
         path = tmp_path / "equity.csv"
@@ -119,7 +119,6 @@ class TestWriteEquityCurve:
 
 
 class TestWriteJournal:
-
     def test_creates_jsonl_file(self, tmp_path):
         """Should write journal entries to JSONL file."""
         path = tmp_path / "journal.jsonl"
@@ -140,7 +139,6 @@ class TestWriteJournal:
 
 
 class TestWriteMarkdownReport:
-
     def test_creates_markdown_file(self, tmp_path):
         """Should create a markdown report file."""
         path = tmp_path / "report.md"
@@ -186,20 +184,36 @@ class TestWriteMarkdownReport:
         """Should include monthly returns table when present."""
         path = tmp_path / "report.md"
         metrics = {
-            "total_pnl": 100, "total_trades": 5, "win_rate": 0.5,
-            "profit_factor": 1.0, "max_drawdown": -50, "trade_sharpe": 0.5,
-            "avg_trade": 20, "sortino_ratio": 0.5, "calmar_ratio": 0.5,
-            "max_drawdown_days": 1.0, "avg_hold_time_hours": 1.0,
-            "trade_frequency_per_day": 1.0, "max_consecutive_wins": 2,
-            "max_consecutive_win_amount": 40.0, "max_consecutive_losses": 1,
-            "max_consecutive_loss_amount": -20.0, "gross_profit": 60.0,
+            "total_pnl": 100,
+            "total_trades": 5,
+            "win_rate": 0.5,
+            "profit_factor": 1.0,
+            "max_drawdown": -50,
+            "trade_sharpe": 0.5,
+            "avg_trade": 20,
+            "sortino_ratio": 0.5,
+            "calmar_ratio": 0.5,
+            "max_drawdown_days": 1.0,
+            "avg_hold_time_hours": 1.0,
+            "trade_frequency_per_day": 1.0,
+            "max_consecutive_wins": 2,
+            "max_consecutive_win_amount": 40.0,
+            "max_consecutive_losses": 1,
+            "max_consecutive_loss_amount": -20.0,
+            "gross_profit": 60.0,
             "gross_loss": -40.0,
             "monthly_returns": {"2024-01": 50.0, "2024-02": 50.0},
         }
         _write_markdown_report(
-            metrics, product_id="X:Y-PERP", timeframe="1d",
-            initial_balance=10000.0, start_time=0, end_time=0,
-            fee_config={}, candle_count=0, path=path,
+            metrics,
+            product_id="X:Y-PERP",
+            timeframe="1d",
+            initial_balance=10000.0,
+            start_time=0,
+            end_time=0,
+            fee_config={},
+            candle_count=0,
+            path=path,
         )
 
         content = path.read_text()
@@ -213,7 +227,6 @@ class TestWriteMarkdownReport:
 
 
 class TestBacktestRunnerInit:
-
     @patch("src.core.backtest_runner.SessionLocal")
     def test_default_values(self, mock_session_local):
         """Should initialize with correct defaults."""
@@ -237,8 +250,10 @@ class TestBacktestRunnerInit:
         mock_session_local.return_value = MagicMock()
 
         runner = BacktestRunner(
-            start_time=0, end_time=0,
-            product_id="X:Y-PERP", timeframe="1m",
+            start_time=0,
+            end_time=0,
+            product_id="X:Y-PERP",
+            timeframe="1m",
             fee_config={"maker": 0.001, "taker": 0.002},
         )
 
@@ -250,8 +265,10 @@ class TestBacktestRunnerInit:
         mock_session_local.return_value = MagicMock()
 
         runner = BacktestRunner(
-            start_time=0, end_time=0,
-            product_id="X:Y-PERP", timeframe="1m",
+            start_time=0,
+            end_time=0,
+            product_id="X:Y-PERP",
+            timeframe="1m",
             report_config={"csv_trades": False},
         )
 
@@ -289,7 +306,11 @@ class TestBacktestRunnerInit:
             def requirements(self):
                 return StrategyRequirements(self.product_id, "5m", 1)
 
-            def on_candle(self, candle):
+            def on_candle(
+                self,
+                candle: Candlestick,
+                context: StrategyContext | None = None,
+            ) -> None:
                 return None
 
         definition = PortfolioDefinition(
@@ -316,9 +337,9 @@ class TestBacktestRunnerInit:
 
         assert runner._primary_runtime_id == "portfolio_v1"
         assert runner._portfolios_buffer == [definition]
-        assert [
-            strategy.strategy_id for strategy in runner._strategies_buffer
-        ] == ["portfolio_v1.sleeve_a"]
+        assert [strategy.strategy_id for strategy in runner._strategies_buffer] == [
+            "portfolio_v1.sleeve_a"
+        ]
 
     @patch("src.core.backtest_runner.SessionLocal")
     def test_execution_timeframe_requires_finer_even_divisor(
@@ -391,7 +412,11 @@ def test_add_portfolio_rejects_runner_identity_mismatch():
         def requirements(self):
             return StrategyRequirements(self.product_id, "1m", 1)
 
-        def on_candle(self, candle):
+        def on_candle(
+            self,
+            candle: Candlestick,
+            context: StrategyContext | None = None,
+        ) -> None:
             return None
 
     strategy = OneMinuteStrategy("sleeve", "RITHMIC:MNQ_ROLL-PERP")
@@ -418,15 +443,16 @@ def test_add_portfolio_rejects_runner_identity_mismatch():
 
 
 class TestExportReports:
-
     @patch("src.core.backtest_runner.SessionLocal")
     def test_returns_none_when_all_disabled(self, mock_session_local):
         """Should return None when all report types are disabled."""
         mock_session_local.return_value = MagicMock()
 
         runner = BacktestRunner(
-            start_time=0, end_time=0,
-            product_id="X:Y-PERP", timeframe="1m",
+            start_time=0,
+            end_time=0,
+            product_id="X:Y-PERP",
+            timeframe="1m",
             report_config={
                 "csv_trades": False,
                 "markdown_report": False,
@@ -453,8 +479,10 @@ class TestExportReports:
         output_dir = tmp_path / "test_output"
 
         runner = BacktestRunner(
-            start_time=1704067200000, end_time=1704153600000,
-            product_id="BINANCE:BTCUSDT-PERP", timeframe="1m",
+            start_time=1704067200000,
+            end_time=1704153600000,
+            product_id="BINANCE:BTCUSDT-PERP",
+            timeframe="1m",
             report_config={
                 "csv_trades": False,
                 "markdown_report": True,
@@ -465,14 +493,25 @@ class TestExportReports:
         )
 
         metrics = {
-            "total_pnl": 100, "total_trades": 5, "win_rate": 0.5,
-            "profit_factor": 1.0, "max_drawdown": -50, "trade_sharpe": 0.5,
-            "avg_trade": 20, "sortino_ratio": 0.5, "calmar_ratio": 0.5,
-            "max_drawdown_days": 1.0, "avg_hold_time_hours": 1.0,
-            "trade_frequency_per_day": 1.0, "max_consecutive_wins": 2,
-            "max_consecutive_win_amount": 40.0, "max_consecutive_losses": 1,
-            "max_consecutive_loss_amount": -20.0, "gross_profit": 60.0,
-            "gross_loss": -40.0, "closed_trades": [],
+            "total_pnl": 100,
+            "total_trades": 5,
+            "win_rate": 0.5,
+            "profit_factor": 1.0,
+            "max_drawdown": -50,
+            "trade_sharpe": 0.5,
+            "avg_trade": 20,
+            "sortino_ratio": 0.5,
+            "calmar_ratio": 0.5,
+            "max_drawdown_days": 1.0,
+            "avg_hold_time_hours": 1.0,
+            "trade_frequency_per_day": 1.0,
+            "max_consecutive_wins": 2,
+            "max_consecutive_win_amount": 40.0,
+            "max_consecutive_losses": 1,
+            "max_consecutive_loss_amount": -20.0,
+            "gross_profit": 60.0,
+            "gross_loss": -40.0,
+            "closed_trades": [],
         }
         journal = StrategyJournal("test")
 

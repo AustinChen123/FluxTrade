@@ -1,9 +1,9 @@
 """Tests for analytics.py — basic and advanced metrics."""
 
 import json
+from dataclasses import dataclass
 from decimal import Decimal, ROUND_DOWN, ROUND_HALF_UP, localcontext
 from fractions import Fraction
-from types import SimpleNamespace
 
 import pytest
 
@@ -13,7 +13,7 @@ from src.core.decimal_math import (
     exact_decimal_add,
     exact_decimal_subtract,
 )
-from src.core.models import PositionSide, Trade
+from src.core.models import OrderSide, PositionSide, Trade
 
 
 # ── Helpers ──────────────────────────────────────────────────────
@@ -25,13 +25,25 @@ def _make_trade(side: str, price: float, qty: float, ts: int) -> Trade:
         product_id="BINANCE:BTCUSDT-PERP",
         price=Decimal(str(price)),
         quantity=Decimal(str(qty)),
-        side=side,
+        side=OrderSide(side),
         timestamp=ts,
     )
 
 
-def _make_fill(side: str, price: str, qty: str, fee: str, ts: int):
-    return SimpleNamespace(
+@dataclass
+class _MetricsFill:
+    id: str
+    product_id: str
+    price: Decimal
+    quantity: Decimal
+    side: str
+    timestamp: int
+    fee: Decimal
+    fill_sequence: object = None
+
+
+def _make_fill(side: str, price: str, qty: str, fee: str, ts: int) -> _MetricsFill:
+    return _MetricsFill(
         id=f"fill-{ts}-{side}",
         product_id="BINANCE:BTCUSDT-PERP",
         price=Decimal(price),
