@@ -16,7 +16,11 @@ from sqlalchemy.ext.compiler import compiles
 from sqlalchemy.orm import sessionmaker
 
 from src.control_plane.backtest_jobs import BacktestJobExecutor
-from src.control_plane.models import BacktestJobRequest, JobStatus
+from src.control_plane.models import (
+    BacktestInstrumentConfig,
+    BacktestJobRequest,
+    JobStatus,
+)
 from src.core.orm_models import (
     BacktestResultSummary,
     BacktestTradeLog,
@@ -101,7 +105,9 @@ def _load_rolls(path: Path) -> list[RollBoundary]:
         ]
 
 
-def _split_segments(source: Path, rolls: list[RollBoundary], output: Path) -> list[Segment]:
+def _split_segments(
+    source: Path, rolls: list[RollBoundary], output: Path
+) -> list[Segment]:
     contracts = [rolls[0].from_contract, *(roll.to_contract for roll in rolls)]
     segments = [Segment(contract, output / f"{contract}.csv") for contract in contracts]
     handles = [segment.csv_path.open("w", newline="") for segment in segments]
@@ -118,7 +124,10 @@ def _split_segments(source: Path, rolls: list[RollBoundary], output: Path) -> li
             previous_close: Decimal | None = None
             for row in reader:
                 timestamp = _timestamp_ms(row["timestamp"])
-                if segment_index < len(rolls) and timestamp >= rolls[segment_index].timestamp:
+                if (
+                    segment_index < len(rolls)
+                    and timestamp >= rolls[segment_index].timestamp
+                ):
                     roll = rolls[segment_index]
                     assert segments[segment_index].contract == roll.from_contract
                     assert previous_close == roll.old_close
@@ -208,6 +217,7 @@ def test_split_segments_assigns_roll_timestamp_to_new_contract(tmp_path):
         "RITHMIC:MNQ-202409",
         "RITHMIC:MNQ-202412",
     ]
+    assert segments[0].last_timestamp is not None
     assert segments[0].last_timestamp < roll.timestamp
     assert segments[1].first_timestamp == roll.timestamp
 
@@ -270,17 +280,20 @@ def test_full_mnq_replay_is_flat_at_every_roll_boundary(tmp_path):
                 initial_balance=running_balance,
                 maker_fee=Decimal("0.50"),
                 taker_fee=Decimal("0.50"),
-                instrument={
-                    "multiplier": "2",
-                    "quantity_step": "1",
-                    "price_tick": "0.25",
-                    "fee_model": "per_contract",
-                    "capital_model": "per_contract",
-                    "capital_per_contract": "2500",
-                },
+                instrument=BacktestInstrumentConfig.model_validate(
+                    {
+                        "multiplier": "2",
+                        "quantity_step": "1",
+                        "price_tick": "0.25",
+                        "fee_model": "per_contract",
+                        "capital_model": "per_contract",
+                        "capital_per_contract": "2500",
+                    }
+                ),
             )
         )
         assert job.status == JobStatus.SUCCEEDED, job.error
+        assert job.result is not None
         assert job.result["candle_count"] == segment.count
         assert job.result["total_trades"] == 2
         assert [entry["tag"] for entry in job.result["journal"]].count("entry") == 4
@@ -298,6 +311,7 @@ def test_full_mnq_replay_is_flat_at_every_roll_boundary(tmp_path):
         running_balance - Decimal("100000")
     )
     for index, segment in enumerate(segments):
+        assert segment.last_timestamp is not None
         segment_trades = [
             trade for trade in trades if trade.strategy_id == f"mnq_full_{index}"
         ]
