@@ -2,12 +2,13 @@ import time
 from contextlib import contextmanager
 from decimal import Decimal
 from threading import Lock
-from typing import Callable, ContextManager, Iterator, Optional
+from typing import Callable, ContextManager, Iterator, Optional, cast
 
 from sqlalchemy import func
 from sqlalchemy.orm import Query, Session
 
 from src.core.interfaces import IOrderRepository
+from src.core.interfaces.conditional_orders import ConditionalOrderRecord
 from src.core.interfaces.order_cancellation import OrderCancellationSnapshot
 from src.core.models import OrderSide, OrderStatus
 from src.core.orm_models import BacktestTradeLog, Order, Position, Trade
@@ -99,9 +100,18 @@ class LiveOrderRepository(IOrderRepository):
             db.commit()
             db.refresh(order)
 
+    def persist_conditional_order(self, order: ConditionalOrderRecord) -> None:
+        self.update_order(cast(Order, order))
+
     def get_order(self, order_id: str) -> Optional[Order]:
         with self._db_session_factory() as db:
             return self._scope(db.query(Order)).filter_by(id=order_id).first()
+
+    def get_conditional_order(
+        self,
+        order_id: str,
+    ) -> ConditionalOrderRecord | None:
+        return self.get_order(order_id)
 
     def get_order_for_cancellation(
         self,
@@ -186,6 +196,16 @@ class LiveOrderRepository(IOrderRepository):
                     func.lower(Order.exchange_id) == exchange_id.casefold()
                 )
             return query.all()
+
+    def list_conditional_orders_by_statuses(
+        self,
+        statuses: set[str],
+        exchange_id: str | None = None,
+    ) -> list[ConditionalOrderRecord]:
+        return cast(
+            list[ConditionalOrderRecord],
+            self.list_orders_by_statuses(statuses, exchange_id),
+        )
 
     def list_legacy_orders_by_statuses(
         self,
@@ -326,8 +346,17 @@ class BacktestOrderRepository(IOrderRepository):
     def update_order(self, order: Order) -> None:
         pass
 
+    def persist_conditional_order(self, order: ConditionalOrderRecord) -> None:
+        self.update_order(cast(Order, order))
+
     def get_order(self, order_id: str) -> Optional[Order]:
         return None
+
+    def get_conditional_order(
+        self,
+        order_id: str,
+    ) -> ConditionalOrderRecord | None:
+        return self.get_order(order_id)
 
     def get_order_for_cancellation(
         self,
@@ -362,6 +391,16 @@ class BacktestOrderRepository(IOrderRepository):
         exchange_id: str | None = None,
     ) -> list[Order]:
         return []
+
+    def list_conditional_orders_by_statuses(
+        self,
+        statuses: set[str],
+        exchange_id: str | None = None,
+    ) -> list[ConditionalOrderRecord]:
+        return cast(
+            list[ConditionalOrderRecord],
+            self.list_orders_by_statuses(statuses, exchange_id),
+        )
 
     def add_trade(self, trade: Trade) -> None:
         with self._trade_write_lock:

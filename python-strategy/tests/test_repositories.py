@@ -393,6 +393,71 @@ class TestLiveOrderRepositoryBasics:
         with pytest.raises(RuntimeError, match="^cancellation_order_not_found$"):
             current.mark_order_cancelled("foreign")
 
+    def test_conditional_order_commands_are_account_scoped(
+        self,
+        sqlite_order_session_factory,
+        order_factory,
+    ):
+        unbound = LiveOrderRepository(db_session_factory=sqlite_order_session_factory)
+        current_order = order_factory(
+            order_id="current-conditional",
+            account_profile="binance",
+            account_id="ACCOUNT-A",
+            exchange_id="BINANCE",
+            status=OrderStatus.NEW.value,
+        )
+        foreign_order = order_factory(
+            order_id="foreign-conditional",
+            account_profile="binance",
+            account_id="ACCOUNT-B",
+            exchange_id="BINANCE",
+            status=OrderStatus.NEW.value,
+        )
+        unbound.add_order(current_order)
+        unbound.add_order(foreign_order)
+        current = LiveOrderRepository(
+            db_session_factory=sqlite_order_session_factory,
+            account_profile="binance",
+            account_id="ACCOUNT-A",
+        )
+
+        loaded = current.get_conditional_order("current-conditional")
+        assert loaded is not None
+        assert current.get_conditional_order("foreign-conditional") is None
+        assert [
+            order.id
+            for order in current.list_conditional_orders_by_statuses(
+                {OrderStatus.NEW.value},
+                exchange_id="binance",
+            )
+        ] == ["current-conditional"]
+
+        loaded.intent_payload = {"placement_mode": "place-after-fill"}
+        current.persist_conditional_order(loaded)
+
+        assert current.get_order("current-conditional").intent_payload == {
+            "placement_mode": "place-after-fill"
+        }
+        assert unbound.get_order("foreign-conditional").intent_payload is None
+
+    def test_backtest_conditional_port_retains_noop_semantics(
+        self,
+        mock_db_session,
+        order_factory,
+    ):
+        repository = BacktestOrderRepository(mock_db_session, session_id=1)
+        order = order_factory()
+
+        repository.persist_conditional_order(order)
+
+        assert repository.get_conditional_order(order.id) is None
+        assert (
+            repository.list_conditional_orders_by_statuses({OrderStatus.NEW.value})
+            == []
+        )
+        mock_db_session.add.assert_not_called()
+        mock_db_session.commit.assert_not_called()
+
     def test_backtest_cancellation_port_has_no_persisted_order(
         self,
         mock_db_session,

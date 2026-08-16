@@ -15,7 +15,7 @@ import uuid
 import time
 import random
 from decimal import Decimal
-from typing import Any, Optional, Dict, List
+from typing import Any, Optional, Dict, List, cast
 from unittest.mock import MagicMock
 
 from sqlalchemy import create_engine, event
@@ -47,6 +47,7 @@ from src.core.orm_models import (
 from src.core.interfaces import IOrderRepository, IExchangeAdapter
 from src.core.interfaces.exchange import ExchangeOrderSnapshot
 from src.core.interfaces.order_cancellation import OrderCancellationSnapshot
+from src.core.interfaces.conditional_orders import ConditionalOrderRecord
 
 # Core modules
 from src.core.risk_manager import AccountService
@@ -182,8 +183,17 @@ class MockOrderRepository(IOrderRepository):
     def update_order(self, order: Order) -> None:
         self.orders[order.id] = order
 
+    def persist_conditional_order(self, order: ConditionalOrderRecord) -> None:
+        self.update_order(cast(Order, order))
+
     def get_order(self, order_id: str) -> Optional[Order]:
         return self.orders.get(order_id)
+
+    def get_conditional_order(
+        self,
+        order_id: str,
+    ) -> ConditionalOrderRecord | None:
+        return self.get_order(order_id)
 
     def get_order_for_cancellation(
         self,
@@ -265,6 +275,16 @@ class MockOrderRepository(IOrderRepository):
                 or str(order.exchange_id).casefold() == exchange_id.casefold()
             )
         ]
+
+    def list_conditional_orders_by_statuses(
+        self,
+        statuses: set[str],
+        exchange_id: str | None = None,
+    ) -> list[ConditionalOrderRecord]:
+        return cast(
+            list[ConditionalOrderRecord],
+            self.list_orders_by_statuses(statuses, exchange_id),
+        )
 
     def add_trade(self, trade: ORMTrade) -> None:
         self.trades.append(trade)
