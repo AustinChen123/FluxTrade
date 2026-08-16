@@ -10,7 +10,11 @@ from sqlalchemy.ext.compiler import compiles
 from sqlalchemy.orm import sessionmaker
 
 from src.control_plane.backtest_jobs import BacktestJobExecutor
-from src.control_plane.models import BacktestJobRequest, JobStatus
+from src.control_plane.models import (
+    BacktestInstrumentConfig,
+    BacktestJobRequest,
+    JobStatus,
+)
 from src.core.orm_models import (
     BacktestResultSummary,
     BacktestTradeLog,
@@ -41,8 +45,9 @@ def _compile_jsonb_for_sqlite(type_, compiler, **kw):
     return "JSON"
 
 
-def _session_factory(tmp_path):
+def _session_factory(tmp_path, request: pytest.FixtureRequest):
     engine = create_engine(f"sqlite:///{tmp_path / 'mnq_replay.db'}")
+    request.addfinalizer(engine.dispose)
     for table in [
         Exchange.__table__,
         Product.__table__,
@@ -69,9 +74,11 @@ def _session_factory(tmp_path):
 
 
 @pytest.mark.smoke
-def test_mnq_csv_replay_uses_futures_accounting_and_matcher(tmp_path):
-    session_factory = _session_factory(tmp_path)
-    request = BacktestJobRequest(
+def test_mnq_csv_replay_uses_futures_accounting_and_matcher(
+    tmp_path, request: pytest.FixtureRequest
+):
+    session_factory = _session_factory(tmp_path, request)
+    job_request = BacktestJobRequest(
         strategy_id="mnq_deterministic",
         product_id=PRODUCT_ID,
         timeframe="1m",
@@ -82,22 +89,25 @@ def test_mnq_csv_replay_uses_futures_accounting_and_matcher(tmp_path):
         initial_balance=Decimal("100000"),
         maker_fee=Decimal("0.50"),
         taker_fee=Decimal("0.50"),
-        instrument={
-            "multiplier": "2",
-            "quantity_step": "1",
-            "price_tick": "0.25",
-            "fee_model": "per_contract",
-            "capital_model": "per_contract",
-            "capital_per_contract": "2500",
-        },
+        instrument=BacktestInstrumentConfig.model_validate(
+            {
+                "multiplier": "2",
+                "quantity_step": "1",
+                "price_tick": "0.25",
+                "fee_model": "per_contract",
+                "capital_model": "per_contract",
+                "capital_per_contract": "2500",
+            }
+        ),
     )
 
     job = BacktestJobExecutor(
         db_session_factory=session_factory,
         run_inline=True,
-    ).submit_backtest(request)
+    ).submit_backtest(job_request)
 
     assert job.status == JobStatus.SUCCEEDED
+    assert job.result is not None
     assert job.result["candle_count"] == 6
     assert job.result["total_trades"] == 1
     assert Decimal(job.result["total_pnl"]) == Decimal("-2.00")
@@ -116,8 +126,9 @@ def test_mnq_csv_replay_uses_futures_accounting_and_matcher(tmp_path):
         Decimal("20880.75"),
         Decimal("20880.25"),
     ]
-    assert [Decimal(trade.fee) for trade in trades] == [
+    assert [trade.fee for trade in trades] == [
         Decimal("0.50"),
         Decimal("0.50"),
     ]
+    assert summary.total_pnl is not None
     assert Decimal(summary.total_pnl) == Decimal("-2.00")
