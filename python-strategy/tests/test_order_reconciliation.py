@@ -19,6 +19,8 @@ from src.core.repositories import LiveOrderRepository
 
 
 class _UnsupportedAdapter(IExchangeAdapter):
+    exchange_id: str | None = None
+
     def place_order(self, order):
         raise AssertionError("unsupported adapter must not place orders")
 
@@ -28,7 +30,11 @@ class _UnsupportedAdapter(IExchangeAdapter):
     def get_balance(self, asset):
         return Decimal("0")
 
-    def get_position(self, product_id):
+    def get_position(
+        self,
+        product_id: str,
+        strategy_id: str | None = None,
+    ):
         return None
 
 
@@ -311,9 +317,9 @@ def test_actual_reconciliation_scopes_same_venue_collision_to_current_account(
     assert result["recoverable_count"] == 1
     assert result["verification_blocked_count"] == 1
     order_manager.fail_order.assert_not_called()
-    assert repositories["ACCOUNT-B"].get_order("order-ACCOUNT-B").status == (
-        OrderStatus.SUBMITTED.value
-    )
+    account_b_order = repositories["ACCOUNT-B"].get_order("order-ACCOUNT-B")
+    assert account_b_order is not None
+    assert account_b_order.status == OrderStatus.SUBMITTED.value
 
 
 @pytest.mark.parametrize(
