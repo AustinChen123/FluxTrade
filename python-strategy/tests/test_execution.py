@@ -65,6 +65,7 @@ def test_production_repository_is_bound_to_runtime_account_identity(
     )
 
     repository = engine.order_manager.repo
+    assert isinstance(repository, LiveOrderRepository)
     assert repository._account_profile == "binance"
     assert repository._account_id == "futures-main"
 
@@ -110,6 +111,7 @@ def test_actual_order_event_resolves_only_current_account_collision(
     order_factory,
     mock_db_session,
     mock_clock,
+    mock_exchange_adapter,
     current_profile: str,
     current_account: str,
     foreign_profile: str,
@@ -139,10 +141,14 @@ def test_actual_order_event_resolves_only_current_account_collision(
                 status=OrderStatus.SUBMITTED.value,
             )
         )
+    remote_mutation = MagicMock(side_effect=AssertionError("remote mutation forbidden"))
+    mock_exchange_adapter.place_order = remote_mutation
+    mock_exchange_adapter.cancel_order = remote_mutation
+    mock_exchange_adapter.cancel_order_by_client_id = remote_mutation
     engine = ExecutionEngine(
         db_session=mock_db_session,
         clock=mock_clock,
-        adapter=SimpleNamespace(exchange_id=exchange_id.casefold()),
+        adapter=mock_exchange_adapter,
         order_repository=repositories["current"],
         db_session_factory=sqlite_order_session_factory,
         is_backtest=True,
@@ -158,12 +164,13 @@ def test_actual_order_event_resolves_only_current_account_collision(
     )
 
     assert result["action"] == "applied"
-    assert repositories["current"].get_order("order-current").status == (
-        OrderStatus.CANCELLED.value
-    )
-    assert repositories["foreign"].get_order("order-foreign").status == (
-        OrderStatus.SUBMITTED.value
-    )
+    current_order = repositories["current"].get_order("order-current")
+    foreign_order = repositories["foreign"].get_order("order-foreign")
+    assert current_order is not None
+    assert foreign_order is not None
+    assert current_order.status == OrderStatus.CANCELLED.value
+    assert foreign_order.status == OrderStatus.SUBMITTED.value
+    remote_mutation.assert_not_called()
 
 
 def _live_execution_with_pending_protection(
@@ -193,6 +200,7 @@ def _live_execution_with_pending_protection(
             take_profit=Decimal("43000"),
         )
     )
+    assert entry_id is not None
     entry = repository.get_order(entry_id)
     assert entry is not None
     return engine, repository, entry
@@ -243,7 +251,9 @@ def test_atomic_fill_replay_submits_each_pending_protection_once(
             fail_trade_flush,
         )
 
-    assert repository.get_order(entry.id).status == OrderStatus.SUBMITTED.value
+    persisted_entry = repository.get_order(entry.id)
+    assert persisted_entry is not None
+    assert persisted_entry.status == OrderStatus.SUBMITTED.value
     with sqlite_order_session_factory() as session:
         assert session.query(StoredTrade).filter_by(order_id=entry.id).count() == 0
     assert mock_exchange_adapter.place_order.call_count == 0
