@@ -10,7 +10,7 @@ from unittest.mock import MagicMock
 
 import pytest
 from sqlalchemy import create_engine, select, text
-from sqlalchemy.orm import sessionmaker
+from sqlalchemy.orm import Session, sessionmaker
 
 from src.core.models import StrategyStatus
 from src.core.orm_models import Strategy, StrategyState, StrategyStateTransition
@@ -56,25 +56,30 @@ class _FakeQuery:
         return 1
 
 
-class _FakeSession:
+class _FakeSession(Session):
     def __init__(self, states: list[StrategyState]):
+        super().__init__()
         self.states = {state.strategy_id: state for state in states}
         self.transitions: list[StrategyStateTransition] = []
         self.commit_count = 0
         self.rollback_count = 0
         self.force_stale_update = False
+        object.__setattr__(self, "query", self._fake_query)
+        object.__setattr__(self, "add", self._fake_add)
+        object.__setattr__(self, "commit", self._fake_commit)
+        object.__setattr__(self, "rollback", self._fake_rollback)
 
-    def query(self, model):
+    def _fake_query(self, model):
         return _FakeQuery(model, self)
 
-    def add(self, row):
+    def _fake_add(self, row):
         if isinstance(row, StrategyStateTransition):
             self.transitions.append(row)
 
-    def commit(self):
+    def _fake_commit(self):
         self.commit_count += 1
 
-    def rollback(self):
+    def _fake_rollback(self):
         self.rollback_count += 1
 
 
@@ -120,10 +125,20 @@ def test_transition_to_stopped_updates_db_cache_history_and_pubsub() -> None:
     assert db.states["s1"].version == 1
     assert len(db.transitions) == 1
     transition = db.transitions[0]
-    assert transition.from_status == StrategyStatus.ACTIVE.value
-    assert transition.to_status == StrategyStatus.STOPPED.value
-    assert transition.reason == "maintenance"
-    assert transition.actor == "operator"
+    from_status: object = transition.from_status
+    to_status: object = transition.to_status
+    reason: object = transition.reason
+    actor: object = transition.actor
+    assert isinstance(from_status, str)
+    assert isinstance(to_status, str)
+    assert isinstance(reason, str)
+    assert isinstance(actor, str)
+    assert (from_status, to_status, reason, actor) == (
+        StrategyStatus.ACTIVE.value,
+        StrategyStatus.STOPPED.value,
+        "maintenance",
+        "operator",
+    )
     channel, message = redis_client.publish.call_args.args
     assert channel == STATE_CHANGE_CHANNEL
     payload = json.loads(message)
@@ -174,7 +189,10 @@ def test_system_status_transition_increments_version() -> None:
 
     assert db.states["s1"].status == StrategyStatus.READY.value
     assert db.states["s1"].version == 1
-    assert db.transitions[0].actor == "system"
+    transition = db.transitions[0]
+    actor: object = transition.actor
+    assert isinstance(actor, str)
+    assert (actor,) == ("system",)
     with pytest.raises(StaleStrategyStateVersion):
         manager.transition_to_status(
             "s1",
@@ -203,8 +221,15 @@ def test_force_resume_from_error_records_recovered_at() -> None:
     assert db.states["s1"].status == StrategyStatus.ACTIVE.value
     assert db.states["s1"].recovered_at is not None
     assert manager.is_running("s1") is True
-    assert db.transitions[0].to_status == StrategyStatus.ACTIVE.value
-    assert db.transitions[0].reason == "operator confirmed"
+    transition = db.transitions[0]
+    to_status: object = transition.to_status
+    reason: object = transition.reason
+    assert isinstance(to_status, str)
+    assert isinstance(reason, str)
+    assert (to_status, reason) == (
+        StrategyStatus.ACTIVE.value,
+        "operator confirmed",
+    )
 
 
 def test_stale_version_rolls_back_and_raises() -> None:
@@ -410,8 +435,11 @@ def test_subscriber_ignores_malformed_json_and_continues() -> None:
     assert manager.is_stopped("s1") is True
 
 
-def test_transition_history_persists_append_only_rows_with_sqlite(tmp_path) -> None:
+def test_transition_history_persists_append_only_rows_with_sqlite(
+    tmp_path, request: pytest.FixtureRequest
+) -> None:
     engine = create_engine(f"sqlite:///{tmp_path / 'strategy_state.db'}")
+    request.addfinalizer(engine.dispose)
     for table in [
         Strategy.__table__,
         StrategyState.__table__,
@@ -470,15 +498,25 @@ def test_transition_history_persists_append_only_rows_with_sqlite(tmp_path) -> N
             )
         )
 
+    assert state is not None
     assert state.status == StrategyStatus.ACTIVE.value
     assert state.version == 4
     assert manager.is_running("s1") is True
     assert [
-        (row.from_status, row.to_status, row.reason, row.actor)
-        for row in transitions
+        (row.from_status, row.to_status, row.reason, row.actor) for row in transitions
     ] == [
-        (StrategyStatus.ACTIVE.value, StrategyStatus.STOPPED.value, "pause", "operator"),
-        (StrategyStatus.STOPPED.value, StrategyStatus.ACTIVE.value, "resume", "operator"),
+        (
+            StrategyStatus.ACTIVE.value,
+            StrategyStatus.STOPPED.value,
+            "pause",
+            "operator",
+        ),
+        (
+            StrategyStatus.STOPPED.value,
+            StrategyStatus.ACTIVE.value,
+            "resume",
+            "operator",
+        ),
         (
             StrategyStatus.ACTIVE.value,
             StrategyStatus.ERROR.value,
