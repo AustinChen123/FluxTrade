@@ -210,15 +210,17 @@ def test_control_plane_rejects_invalid_backtest_payload():
 
 def test_backtest_request_rejects_invalid_instrument_metadata():
     with pytest.raises(ValueError, match="multiplier must be positive"):
-        BacktestJobRequest(
-            strategy_id="invalid-instrument",
-            product_id=PRODUCT_ID,
-            timeframe=TIMEFRAME,
-            candles_csv_path="/tmp/candles.csv",
-            signals_csv_path="/tmp/signals.csv",
-            start_time=1,
-            end_time=2,
-            instrument={"multiplier": "0", "fee_model": "per_contract"},
+        BacktestJobRequest.model_validate(
+            {
+                "strategy_id": "invalid-instrument",
+                "product_id": PRODUCT_ID,
+                "timeframe": TIMEFRAME,
+                "candles_csv_path": "/tmp/candles.csv",
+                "signals_csv_path": "/tmp/signals.csv",
+                "start_time": 1,
+                "end_time": 2,
+                "instrument": {"multiplier": "0", "fee_model": "per_contract"},
+            }
         )
 
 
@@ -245,33 +247,38 @@ def test_dated_future_backtest_request_requires_complete_rules(instrument, error
 
 
 def test_dated_future_backtest_request_accepts_complete_rules():
-    request = BacktestJobRequest(
-        strategy_id="mnq",
-        product_id="RITHMIC:MNQ-202509",
-        timeframe="1m",
-        candles_csv_path="/tmp/candles.csv",
-        signals_csv_path="/tmp/signals.csv",
-        start_time=1,
-        end_time=2,
-        instrument={"quantity_step": "1", "price_tick": "0.25"},
+    request = BacktestJobRequest.model_validate(
+        {
+            "strategy_id": "mnq",
+            "product_id": "RITHMIC:MNQ-202509",
+            "timeframe": "1m",
+            "candles_csv_path": "/tmp/candles.csv",
+            "signals_csv_path": "/tmp/signals.csv",
+            "start_time": 1,
+            "end_time": 2,
+            "instrument": {"quantity_step": "1", "price_tick": "0.25"},
+        }
     )
 
+    assert request.instrument is not None
     assert request.instrument.quantity_step == Decimal("1")
     assert request.instrument.price_tick == Decimal("0.25")
 
     with pytest.raises(ValueError, match="capital_per_contract must be positive"):
-        BacktestJobRequest(
-            strategy_id="invalid-capital",
-            product_id=PRODUCT_ID,
-            timeframe=TIMEFRAME,
-            candles_csv_path="/tmp/candles.csv",
-            signals_csv_path="/tmp/signals.csv",
-            start_time=1,
-            end_time=2,
-            instrument={
-                "multiplier": "2",
-                "capital_model": "per_contract",
-            },
+        BacktestJobRequest.model_validate(
+            {
+                "strategy_id": "invalid-capital",
+                "product_id": PRODUCT_ID,
+                "timeframe": TIMEFRAME,
+                "candles_csv_path": "/tmp/candles.csv",
+                "signals_csv_path": "/tmp/signals.csv",
+                "start_time": 1,
+                "end_time": 2,
+                "instrument": {
+                    "multiplier": "2",
+                    "capital_model": "per_contract",
+                },
+            }
         )
 
 
@@ -291,22 +298,24 @@ def test_backtest_executor_propagates_instrument_spec(monkeypatch, tmp_path):
     monkeypatch.setattr(backtest_jobs, "BacktestRunner", RecordingRunner)
     signals_path = tmp_path / "signals.csv"
     signals_path.write_text("timestamp,type,quantity\n1,LONG,1\n")
-    request = BacktestJobRequest(
-        strategy_id="mnq",
-        product_id=PRODUCT_ID,
-        timeframe="1m",
-        candles_csv_path="/tmp/candles.csv",
-        signals_csv_path=str(signals_path),
-        start_time=1,
-        end_time=2,
-        instrument={
-            "multiplier": "2",
-            "quantity_step": "1",
-            "price_tick": "0.25",
-            "fee_model": "per_contract",
-            "capital_model": "per_contract",
-            "capital_per_contract": "2500",
-        },
+    request = BacktestJobRequest.model_validate(
+        {
+            "strategy_id": "mnq",
+            "product_id": PRODUCT_ID,
+            "timeframe": "1m",
+            "candles_csv_path": "/tmp/candles.csv",
+            "signals_csv_path": str(signals_path),
+            "start_time": 1,
+            "end_time": 2,
+            "instrument": {
+                "multiplier": "2",
+                "quantity_step": "1",
+                "price_tick": "0.25",
+                "fee_model": "per_contract",
+                "capital_model": "per_contract",
+                "capital_per_contract": "2500",
+            },
+        }
     )
 
     BacktestJobExecutor(run_inline=True).run_backtest_request(request)
@@ -637,10 +646,16 @@ def test_backtest_executor_marks_persisted_active_jobs_interrupted_on_startup(tm
     )
     restored = SqliteJobStore(db_path)
 
-    assert restored.get(queued.id).status == JobStatus.FAILED
-    assert restored.get(running.id).status == JobStatus.FAILED
-    assert restored.get(queued.id).error == "Job interrupted before control plane startup"
-    assert restored.get(succeeded.id).status == JobStatus.SUCCEEDED
+    restored_queued = restored.get(queued.id)
+    restored_running = restored.get(running.id)
+    restored_succeeded = restored.get(succeeded.id)
+    assert restored_queued is not None
+    assert restored_running is not None
+    assert restored_succeeded is not None
+    assert restored_queued.status == JobStatus.FAILED
+    assert restored_running.status == JobStatus.FAILED
+    assert restored_queued.error == "Job interrupted before control plane startup"
+    assert restored_succeeded.status == JobStatus.SUCCEEDED
 
 
 def test_control_plane_cancels_queued_backtest_job():
@@ -691,7 +706,9 @@ def test_control_plane_rejects_running_job_cancellation():
     executor.shutdown(wait=False)
     assert response.status_code == 409
     assert response.body["error"] == "job_action_rejected"
-    assert store.get(job.id).status == JobStatus.RUNNING
+    stored_job = store.get(job.id)
+    assert stored_job is not None
+    assert stored_job.status == JobStatus.RUNNING
 
 
 def test_backtest_cancel_keeps_a_started_future_visible_to_shutdown():
@@ -738,7 +755,9 @@ def test_backtest_cancel_does_not_overwrite_a_completed_job():
     with pytest.raises(ValueError, match="succeeded jobs cannot be cancelled"):
         executor.cancel_backtest(job.id)
 
-    assert store.get(job.id).status == JobStatus.SUCCEEDED
+    stored_job = store.get(job.id)
+    assert stored_job is not None
+    assert stored_job.status == JobStatus.SUCCEEDED
     assert executor.shutdown(wait=True, timeout=0.5) is True
 
 
@@ -853,7 +872,9 @@ def test_parameter_search_cancel_does_not_overwrite_a_completed_job():
     with pytest.raises(ValueError, match="succeeded jobs cannot be cancelled"):
         executor.cancel_search(job.id)
 
-    assert store.get(job.id).status == JobStatus.SUCCEEDED
+    stored_job = store.get(job.id)
+    assert stored_job is not None
+    assert stored_job.status == JobStatus.SUCCEEDED
     assert executor.shutdown(wait=True, timeout=0.5) is True
 
 
@@ -1130,6 +1151,7 @@ def test_parameter_search_records_evolution_epoch_and_gene_candidates(tmp_path):
             .all()
         )
 
+    assert epoch is not None
     assert epoch.strategy_id == "searchable"
     assert epoch.status == "completed"
     assert epoch.pop_size == 2
@@ -1213,12 +1235,18 @@ def test_control_plane_promotes_gene_and_retires_previous_champion(tmp_path):
         new_champion = session.get(GeneRecord, challenger_id)
         events = session.query(SystemEvent).order_by(SystemEvent.id).all()
 
+    assert old_champion is not None
+    assert new_champion is not None
     assert old_champion.role == "retired"
     assert old_champion.retired_at is not None
     assert new_champion.role == "champion"
     assert new_champion.activated_at is not None
     assert [event.event_type for event in events] == ["gene_retire", "gene_promote"]
-    assert events[-1].payload["reason"] == "best search score"
+    payload: object = events[-1].payload
+    assert isinstance(payload, dict)
+    reason: object = payload.get("reason")
+    assert isinstance(reason, str)
+    assert reason == "best search score"
 
 
 def test_control_plane_lists_and_gets_genes(tmp_path):
@@ -1789,10 +1817,9 @@ def test_csv_signal_walk_forward_fitness_has_required_metrics(tmp_path):
     ).submit_search(request)
 
     assert job.status == JobStatus.SUCCEEDED
+    assert job.result is not None
     assert (
-        job.result["evaluations"][0]["metrics"]["fitness"]["metric_contract"][
-            "version"
-        ]
+        job.result["evaluations"][0]["metrics"]["fitness"]["metric_contract"]["version"]
         == "walk_forward_fitness_v2"
     )
 
@@ -2495,6 +2522,7 @@ def test_production_control_plane_wiring_has_no_missing_dependency_503(tmp_path)
         job_store=InMemoryJobStore(),
         parameter_search_evaluator=parameter_search_evaluator,
     )
+    assert app.readiness_probe is not None
     app.readiness_probe()
     redis.ping.assert_called_once_with()
 
@@ -2638,6 +2666,7 @@ def test_production_control_plane_registers_default_parameter_evaluators(tmp_pat
         db_session_factory=_sqlite_control_plane_session_factory(tmp_path),
         job_store=InMemoryJobStore(),
     )
+    assert app.parameter_search_executor is not None
     registry = app.parameter_search_executor.evaluator
     assert isinstance(registry, ParameterSearchEvaluatorRegistry)
     csv_request = ParameterSearchJobRequest.model_validate(
