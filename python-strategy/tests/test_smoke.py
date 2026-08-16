@@ -161,9 +161,6 @@ class TestTradingPipeline:
         """Adapter failure should be handled gracefully."""
         engine, adapter, _ = self._build_engine(mock_db_session, mock_clock)
 
-        # Force adapter to fail
-        adapter._fail = True
-
         def failing_place(order):
             from src.core.interfaces.exchange import ExchangeError
             raise ExchangeError("Connection timeout")
@@ -223,6 +220,7 @@ class TestSimulatedAdapterPipeline:
             adapter.on_market_data(candlestick_factory(close=Decimal("42000")))
 
         pos = adapter.get_position("BINANCE:BTCUSDT-PERP")
+        assert pos is not None
         assert pos.quantity == Decimal("1.0")
         assert pos.side == "LONG"
 
@@ -232,6 +230,7 @@ class TestSimulatedAdapterPipeline:
         adapter.on_market_data(candlestick_factory(close=Decimal("43000")))
 
         pos = adapter.get_position("BINANCE:BTCUSDT-PERP")
+        assert pos is not None
         assert pos.quantity == Decimal("0.7")
         assert pos.side == "LONG"
 
