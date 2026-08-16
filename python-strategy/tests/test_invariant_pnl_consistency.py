@@ -14,7 +14,6 @@ from src.core.product_registry import FeeModel, InstrumentSpec
 PRODUCT = "BINANCE:BTCUSDT-PERP"
 STRATEGY_ID = "pnl_invariant_strategy"
 TF = "15m"
-SATOSHI = Decimal("0.00000001")
 
 
 def _candle(ts: int, price: Decimal) -> Candlestick:
@@ -66,56 +65,45 @@ def _fill_market(
     return trade, fill["fee"]
 
 
-def test_matcher_balance_delta_matches_closed_trade_pnl_minus_fees(order_factory) -> None:
+def test_matcher_balance_delta_matches_closed_trade_pnl_minus_fees(
+    order_factory,
+) -> None:
     adapter = SimulatedAdapter(Decimal("100000"), taker_fee=Decimal("0.001"))
     initial_balance = adapter.get_balance()
 
-    trades_and_fees = [
-        _fill_market(
-            adapter,
-            order_factory,
-            side="buy",
-            quantity="0.2",
-            price="50000",
-            ts=1,
-        ),
-        _fill_market(
-            adapter,
-            order_factory,
-            side="buy",
-            quantity="0.1",
-            price="51000",
-            ts=2,
-        ),
-        _fill_market(
-            adapter,
-            order_factory,
-            side="sell",
-            quantity="0.15",
-            price="52000",
-            ts=3,
-        ),
-        _fill_market(
-            adapter,
-            order_factory,
-            side="sell",
-            quantity="0.15",
-            price="53000",
-            ts=4,
-        ),
+    trades: list[Trade] = []
+    total_fees = Decimal("0")
+    fills = [
+        ("buy", "0.2", "50000", 1),
+        ("buy", "0.1", "51000", 2),
+        ("sell", "0.15", "52000", 3),
+        ("sell", "0.15", "53000", 4),
     ]
+    expected_net_by_fill = {3: Decimal("227.1"), 4: Decimal("619.15")}
+    for side, quantity, price, timestamp in fills:
+        trade, fee = _fill_market(
+            adapter,
+            order_factory,
+            side=side,
+            quantity=quantity,
+            price=price,
+            ts=timestamp,
+        )
+        trades.append(trade)
+        total_fees += fee
 
-    trades = [trade for trade, _ in trades_and_fees]
-    total_fees = sum(fee for _, fee in trades_and_fees)
-    closed_trades, _, _, recomputed_pnl = _build_closed_trades(trades)
+        expected_net = expected_net_by_fill.get(timestamp)
+        if expected_net is None:
+            continue
+        _, _, _, recomputed_pnl = _build_closed_trades(trades)
+        matcher_balance_delta = adapter.get_balance() - initial_balance
+        analytics_balance_delta = recomputed_pnl - total_fees
+        assert matcher_balance_delta == expected_net
+        assert analytics_balance_delta == expected_net
 
+    closed_trades, _, _, _ = _build_closed_trades(trades)
     assert len(closed_trades) == 2
     assert adapter.get_position(PRODUCT, strategy_id=STRATEGY_ID) is None
-
-    matcher_balance_delta = adapter.get_balance() - initial_balance
-    expected_balance_delta = recomputed_pnl - total_fees
-
-    assert abs(matcher_balance_delta - expected_balance_delta) <= SATOSHI
 
 
 def test_instrument_multiplier_matches_rust_and_python_pnl(order_factory) -> None:

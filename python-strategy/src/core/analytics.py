@@ -7,6 +7,8 @@ import pandas as pd
 import numpy as np
 from src.core.decimal_math import (
     decimal_from_fraction,
+    decimal_from_fraction_significant,
+    exact_decimal_add,
     exact_decimal_subtract,
     exact_decimal_subtract_preserving_zero_scale,
 )
@@ -197,27 +199,33 @@ def _build_closed_trades(
     else:
         trades.sort(key=lambda trade: trade["timestamp"])
 
-    _ZERO = Decimal("0")
-    total_pnl = _ZERO
-    net_qty = _ZERO
-    avg_entry_price = _ZERO
-    open_fee = _ZERO
+    zero = Fraction(0)
+    multiplier = Fraction(contract_multiplier)
+    total_pnl = zero
+    net_qty = zero
+    avg_entry_price = zero
+    avg_entry_price_output = Decimal("0")
+    open_fee = zero
     entry_time = 0
+    lifecycle_pnl = zero
+    lifecycle_fee = zero
+    emitted_lifecycle_pnl = Decimal(0)
+    emitted_lifecycle_fee = Decimal(0)
 
     equity_curve: list[float] = [0.0]
     trade_pnls: list[float] = []
     closed_trades: list[ClosedTrade] = []
 
     for row in trades:
-        qty: Decimal = row["quantity"]
-        price: Decimal = row["price"]
+        qty = Fraction(row["quantity"])
+        price_decimal: Decimal = row["price"]
+        price = Fraction(price_decimal)
         side = row["side"]
-        fee: Decimal = row["fee"]
+        fee = Fraction(row["fee"])
         timestamp = int(row["timestamp"])
 
         signed_qty = qty if side.lower() == "buy" else -qty
-        if fee:
-            total_pnl -= fee
+        total_pnl -= fee
 
         is_reducing = (net_qty > 0 and signed_qty < 0) or (
             net_qty < 0 and signed_qty > 0
@@ -226,38 +234,66 @@ def _build_closed_trades(
         if is_reducing:
             previous_qty = abs(net_qty)
             qty_closing = min(abs(net_qty), abs(signed_qty))
-            entry_fee = (
-                open_fee * qty_closing / previous_qty if previous_qty > _ZERO else _ZERO
-            )
+            entry_fee = open_fee * qty_closing / previous_qty
             exit_fee = fee * qty_closing / abs(signed_qty)
 
             if net_qty > 0:
-                gross_pnl = (
-                    (price - avg_entry_price) * qty_closing * contract_multiplier
-                )
+                gross_pnl = (price - avg_entry_price) * qty_closing * multiplier
                 trade_side = PositionSide.LONG
             else:
-                gross_pnl = (
-                    (avg_entry_price - price) * qty_closing * contract_multiplier
-                )
+                gross_pnl = (avg_entry_price - price) * qty_closing * multiplier
                 trade_side = PositionSide.SHORT
 
             pnl = gross_pnl - entry_fee - exit_fee
             total_pnl += gross_pnl
-            trade_pnls.append(float(pnl))
+            closed_fee = entry_fee + exit_fee
+            lifecycle_pnl += pnl
+            lifecycle_fee += closed_fee
+            pnl_output = decimal_from_fraction_significant(pnl, precision=28)
+            fee_output = decimal_from_fraction_significant(closed_fee, precision=28)
+
+            if qty_closing == previous_qty:
+                pnl_output = exact_decimal_subtract(
+                    decimal_from_fraction_significant(lifecycle_pnl, precision=28),
+                    emitted_lifecycle_pnl,
+                )
+                fee_output = exact_decimal_subtract(
+                    decimal_from_fraction_significant(lifecycle_fee, precision=28),
+                    emitted_lifecycle_fee,
+                )
+
+            trade_pnls.append(float(pnl_output))
 
             closed_trades.append(
                 ClosedTrade(
                     entry_time=entry_time,
                     exit_time=timestamp,
-                    entry_price=avg_entry_price,
-                    exit_price=price,
+                    entry_price=avg_entry_price_output,
+                    exit_price=price_decimal,
                     side=trade_side,
-                    quantity=qty_closing,
-                    pnl=pnl,
-                    fee=entry_fee + exit_fee,
+                    quantity=decimal_from_fraction_significant(
+                        qty_closing,
+                        precision=28,
+                    ),
+                    pnl=pnl_output,
+                    fee=fee_output,
                 )
             )
+
+            if qty_closing == previous_qty:
+                lifecycle_pnl = zero
+                lifecycle_fee = zero
+                emitted_lifecycle_pnl = Decimal(0)
+                emitted_lifecycle_fee = Decimal(0)
+            else:
+                emitted_lifecycle_pnl = exact_decimal_add(
+                    emitted_lifecycle_pnl,
+                    pnl_output,
+                )
+                emitted_lifecycle_fee = exact_decimal_add(
+                    emitted_lifecycle_fee,
+                    fee_output,
+                )
 
             remaining_after_close = abs(signed_qty) - qty_closing
             open_fee -= entry_fee
@@ -272,24 +308,40 @@ def _build_closed_trades(
                     remaining_after_close if signed_qty > 0 else -remaining_after_close
                 )
                 avg_entry_price = price
+                avg_entry_price_output = price_decimal
                 entry_time = timestamp
                 open_fee = fee - exit_fee
         else:
             if net_qty == 0:
                 entry_time = timestamp
-                open_fee = _ZERO
+                open_fee = zero
             total_cost = (abs(net_qty) * avg_entry_price) + (abs(signed_qty) * price)
             new_qty = abs(net_qty) + abs(signed_qty)
 
             if new_qty > 0:
                 avg_entry_price = total_cost / new_qty
+                avg_entry_price_output = (
+                    price_decimal
+                    if net_qty == 0
+                    else decimal_from_fraction_significant(
+                        avg_entry_price,
+                        precision=28,
+                    )
+                )
 
             net_qty += signed_qty
             open_fee += fee
 
-        equity_curve.append(float(total_pnl))
+        equity_curve.append(
+            float(decimal_from_fraction_significant(total_pnl, precision=28))
+        )
 
-    return closed_trades, trade_pnls, equity_curve, total_pnl
+    return (
+        closed_trades,
+        trade_pnls,
+        equity_curve,
+        decimal_from_fraction_significant(total_pnl, precision=28),
+    )
 
 
 def calculate_metrics(
@@ -401,8 +453,9 @@ def calculate_metrics(
     if closed_trades:
         for ct in closed_trades:
             month_key = pd.Timestamp(ct.exit_time, unit="ms").strftime("%Y-%m")
-            monthly_returns[month_key] = (
-                monthly_returns.get(month_key, Decimal("0")) + ct.pnl
+            monthly_returns[month_key] = exact_decimal_add(
+                monthly_returns.get(month_key, Decimal("0")),
+                ct.pnl,
             )
 
     # Max drawdown duration (in days)

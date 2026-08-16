@@ -203,6 +203,168 @@ class TestClosedTrades:
         assert closed[0].side == "SHORT"
         assert closed[0].pnl == Decimal("1.00")
 
+    @pytest.mark.parametrize(
+        ("fills", "expected_closed", "expected_total"),
+        [
+            pytest.param(
+                [
+                    _make_fill("buy", "100.123456789", ".123456789", ".00123456789", 1),
+                    _make_fill("buy", "101.987654321", ".234567891", ".00234567891", 2),
+                    _make_fill(
+                        "sell", "103.111111111", ".111111111", ".00111111111", 3
+                    ),
+                    _make_fill(
+                        "sell", "104.222222222", ".300000001", ".00300000001", 4
+                    ),
+                    _make_fill("buy", "102.5", ".053086432", ".00053086432", 5),
+                ],
+                [
+                    (
+                        1,
+                        3,
+                        Decimal("101.3448275712841850232224214"),
+                        Decimal("103.111111111"),
+                        PositionSide.LONG,
+                        Decimal("0.111111111"),
+                        Decimal("0.1940315042188368263401959552"),
+                        Decimal("0.00222222222"),
+                    ),
+                    (
+                        1,
+                        4,
+                        Decimal("101.3448275712841850232224214"),
+                        Decimal("104.222222222"),
+                        PositionSide.LONG,
+                        Decimal("0.246913569"),
+                        Decimal("0.7055295112497502806598040448"),
+                        Decimal("0.00493827138"),
+                    ),
+                    (
+                        4,
+                        5,
+                        Decimal("104.222222222"),
+                        Decimal("102.5"),
+                        PositionSide.SHORT,
+                        Decimal("0.053086432"),
+                        Decimal("0.090364904237091904"),
+                        Decimal("0.00106172864"),
+                    ),
+                ],
+                Decimal("0.989925919705679011"),
+                id="long-to-short-reversal",
+            ),
+            pytest.param(
+                [
+                    _make_fill(
+                        "sell", "101.987654321", ".123456789", ".00123456789", 1
+                    ),
+                    _make_fill(
+                        "sell", "100.123456789", ".234567891", ".00234567891", 2
+                    ),
+                    _make_fill("buy", "98.999999999", ".111111111", ".00111111111", 3),
+                    _make_fill("buy", "97.888888888", ".300000001", ".00300000001", 4),
+                    _make_fill("sell", "99.5", ".053086432", ".00053086432", 5),
+                ],
+                [
+                    (
+                        1,
+                        3,
+                        Decimal("100.7662835387158149767775786"),
+                        Decimal("98.999999999"),
+                        PositionSide.SHORT,
+                        Decimal("0.111111111"),
+                        Decimal("0.1940315042188368263401959552"),
+                        Decimal("0.00222222222"),
+                    ),
+                    (
+                        1,
+                        4,
+                        Decimal("100.7662835387158149767775786"),
+                        Decimal("97.888888888"),
+                        PositionSide.SHORT,
+                        Decimal("0.246913569"),
+                        Decimal("0.7055295112497502806598040448"),
+                        Decimal("0.00493827138"),
+                    ),
+                    (
+                        4,
+                        5,
+                        Decimal("97.888888888"),
+                        Decimal("99.5"),
+                        PositionSide.LONG,
+                        Decimal("0.053086432"),
+                        Decimal("0.084466411851632384"),
+                        Decimal("0.00106172864"),
+                    ),
+                ],
+                Decimal("0.984027427320219491"),
+                id="short-to-long-reversal",
+            ),
+        ],
+    )
+    def test_weighted_partial_reversal_is_decimal_context_independent(
+        self,
+        fills,
+        expected_closed,
+        expected_total,
+    ):
+        results = []
+        for precision in (6, 60):
+            for rounding in (ROUND_DOWN, ROUND_HALF_UP):
+                with localcontext() as context:
+                    context.prec = precision
+                    context.rounding = rounding
+                    results.append(_build_closed_trades(fills))
+
+        assert all(result == results[0] for result in results[1:])
+        closed, _, _, total = results[0]
+        assert [
+            (
+                trade.entry_time,
+                trade.exit_time,
+                trade.entry_price,
+                trade.exit_price,
+                trade.side,
+                trade.quantity,
+                trade.pnl,
+                trade.fee,
+            )
+            for trade in closed
+        ] == expected_closed
+        assert total == expected_total
+
+    def test_partial_close_projection_conserves_lifecycle_pnl_and_fees(self):
+        fills = [
+            _make_fill("buy", "1", "1", "0.1", 1),
+            _make_fill("buy", "2", "2", "0.1", 2),
+            _make_fill("sell", "3", "1", "0.01", 3),
+            _make_fill("sell", "3", "1", "0.01", 4),
+            _make_fill("sell", "3", "1", "0.01", 5),
+        ]
+
+        results = []
+        for precision in (6, 60):
+            for rounding in (ROUND_DOWN, ROUND_HALF_UP):
+                with localcontext() as context:
+                    context.prec = precision
+                    context.rounding = rounding
+                    closed, _, _, total = _build_closed_trades(fills)
+                    metrics = calculate_metrics(fills)
+                    results.append((closed, total, metrics["monthly_returns"]))
+
+        assert all(result == results[0] for result in results[1:])
+        closed, total, monthly_returns = results[0]
+        emitted_pnl = Decimal(0)
+        emitted_fee = Decimal(0)
+        for trade in closed:
+            emitted_pnl = exact_decimal_add(emitted_pnl, trade.pnl)
+            emitted_fee = exact_decimal_add(emitted_fee, trade.fee)
+
+        assert len(closed) == 3
+        assert emitted_pnl == total == Decimal("3.77")
+        assert emitted_fee == Decimal("0.23")
+        assert monthly_returns == {"1970-01": Decimal("3.77")}
+
     def test_multiple_round_trips(self):
         trades = _round_trip(100.0, 110.0, entry_ts=1000, exit_ts=2000) + _round_trip(
             200.0, 190.0, entry_ts=3000, exit_ts=4000
