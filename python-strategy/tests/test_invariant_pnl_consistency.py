@@ -1,19 +1,28 @@
 """Invariant tests for matcher balance PnL and analytics recomputation."""
 
+from dataclasses import dataclass
 from decimal import Decimal
-from types import SimpleNamespace
 
 import pytest
 
 from src.core.adapters.simulated import SimulatedAdapter
 from src.core.analytics import _build_closed_trades
-from src.core.models import Candlestick, Trade
+from src.core.models import Candlestick, OrderSide, Trade
 from src.core.product_registry import FeeModel, InstrumentSpec
 
 
 PRODUCT = "BINANCE:BTCUSDT-PERP"
 STRATEGY_ID = "pnl_invariant_strategy"
 TF = "15m"
+
+
+@dataclass(frozen=True)
+class _FeeBearingTrade:
+    timestamp: int
+    side: str
+    price: Decimal
+    quantity: Decimal
+    fee: Decimal
 
 
 def _candle(ts: int, price: Decimal) -> Candlestick:
@@ -59,7 +68,7 @@ def _fill_market(
         product_id=PRODUCT,
         price=fill["price"],
         quantity=fill["quantity"],
-        side=side,
+        side=OrderSide(side),
         timestamp=ts,
     )
     return trade, fill["fee"]
@@ -149,6 +158,7 @@ def test_instrument_multiplier_matches_rust_and_python_pnl(order_factory) -> Non
         ts=2,
     )[0]
     trades = [entry_trade, exit_trade]
+    assert spec.multiplier is not None
     closed_trades, _, _, analytics_pnl = _build_closed_trades(
         trades,
         contract_multiplier=spec.multiplier,
@@ -204,10 +214,23 @@ def test_fee_model_matches_rust_balance_and_python_analytics(
         ts=2,
     )
     trades = [
-        SimpleNamespace(**entry.model_dump(), fee=entry_fee),
-        SimpleNamespace(**exit_trade.model_dump(), fee=exit_fee),
+        _FeeBearingTrade(
+            timestamp=entry.timestamp,
+            side=entry.side.value,
+            price=entry.price,
+            quantity=entry.quantity,
+            fee=entry_fee,
+        ),
+        _FeeBearingTrade(
+            timestamp=exit_trade.timestamp,
+            side=exit_trade.side.value,
+            price=exit_trade.price,
+            quantity=exit_trade.quantity,
+            fee=exit_fee,
+        ),
     ]
 
+    assert spec.multiplier is not None
     _, _, _, analytics_pnl = _build_closed_trades(
         trades,
         contract_multiplier=spec.multiplier,
