@@ -19,6 +19,7 @@ from src.core.portfolio_runtime import (
     build_portfolio_artifact,
     portfolio_replay_configuration,
 )
+from src.core.strategy_context import StrategyContext
 from src.strategies.base import BaseStrategy, StrategyRequirements
 
 
@@ -31,7 +32,11 @@ class SleeveStrategy(BaseStrategy):
     def requirements(self) -> StrategyRequirements:
         return StrategyRequirements(self.product_id, "5m", 2)
 
-    def on_candle(self, candle: Candlestick):
+    def on_candle(
+        self,
+        candle: Candlestick,
+        context: StrategyContext | None = None,
+    ):
         return None
 
     def replay_configuration(self) -> object:
@@ -607,7 +612,11 @@ def test_definition_requires_exclusive_slot_trade_state_rollback() -> None:
         def requirements(self) -> StrategyRequirements:
             return StrategyRequirements(self.product_id, "5m", 2)
 
-        def on_candle(self, candle: Candlestick):
+        def on_candle(
+            self,
+            candle: Candlestick,
+            context: StrategyContext | None = None,
+        ):
             return None
 
     with pytest.raises(ValueError, match="trade-state rollback"):

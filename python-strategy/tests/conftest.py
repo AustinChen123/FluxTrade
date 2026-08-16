@@ -1065,6 +1065,7 @@ def mock_strategy_class():
     """Concrete BaseStrategy subclass for engine tests."""
     from src.strategies.base import BaseStrategy, StrategyRequirements
     from src.core.models import Candlestick, Signal, SignalType
+    from src.core.strategy_context import StrategyContext
 
     class StubStrategy(BaseStrategy):
         def __init__(
@@ -1081,7 +1082,11 @@ def mock_strategy_class():
                 lookback_window=50,
             )
 
-        def on_candle(self, candle: Candlestick) -> Signal:
+        def on_candle(
+            self,
+            candle: Candlestick,
+            context: StrategyContext | None = None,
+        ) -> Signal:
             if self._signal:
                 return self._signal
             return Signal(

@@ -7,6 +7,7 @@ from src.core.journal import StrategyJournal, JournalEntry
 from src.strategies.base import BaseStrategy, StrategyRequirements
 from src.core.models import Signal, SignalType, Candlestick
 from src.core.execution import ExecutionEngine
+from src.core.strategy_context import StrategyContext
 
 
 # =============================================================================
@@ -192,7 +193,11 @@ class DummyStrategy(BaseStrategy):
             lookback_window=10,
         )
 
-    def on_candle(self, candle):
+    def on_candle(
+        self,
+        candle,
+        context: StrategyContext | None = None,
+    ):
         self.journal.log("candle_seen", {"close": str(candle.close)}, timestamp=candle.timestamp)
         return None
 

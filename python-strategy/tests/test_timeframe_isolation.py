@@ -12,6 +12,7 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 from src.core.models import Candlestick, Signal, SignalType, Trade
+from src.core.strategy_context import StrategyContext
 from src.strategies.base import BaseStrategy, StrategyRequirements
 
 
@@ -36,7 +37,11 @@ class FakeStrategy(BaseStrategy):
             lookback_window=50,
         )
 
-    def on_candle(self, candle: Candlestick) -> Signal:
+    def on_candle(
+        self,
+        candle: Candlestick,
+        context: StrategyContext | None = None,
+    ) -> Signal:
         self.candles_received.append(candle)
         return Signal(
             strategy_id=self.strategy_id,
