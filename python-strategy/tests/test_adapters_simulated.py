@@ -30,7 +30,7 @@ PRODUCT = "BINANCE:BTCUSDT-PERP"
 TF = "15m"
 
 
-def _candle(ts, o, h, low, c, vol=100, product=PRODUCT):
+def _candle(ts, o, h, low, c, vol: Decimal | str | int = 100, product=PRODUCT):
     return Candlestick(
         product_id=product, timeframe=TF, timestamp=ts,
         open=Decimal(str(o)), high=Decimal(str(h)),
@@ -187,15 +187,15 @@ class TestSimulatedAdapterBasics:
         original_to_rust_order = adapter._to_rust_order
         submitted_values = []
 
-        def capture_to_rust_order(submitted_order):
+        def capture_to_rust_order(order):
             submitted_values.append(
                 (
-                    submitted_order.quantity,
-                    submitted_order.price,
-                    submitted_order.trigger_price,
+                    order.quantity,
+                    order.price,
+                    order.trigger_price,
                 )
             )
-            return original_to_rust_order(submitted_order)
+            return original_to_rust_order(order)
 
         adapter._to_rust_order = capture_to_rust_order
 
@@ -1004,8 +1004,12 @@ class TestPositionTracking:
         adapter.on_market_data(_candle(200, 2000, 2050, 1950, 2020,
                                        product="BINANCE:ETHUSDT-PERP"))
 
-        assert adapter.get_position("BINANCE:BTCUSDT-PERP").side == "LONG"
-        assert adapter.get_position("BINANCE:ETHUSDT-PERP").side == "SHORT"
+        btc_position = adapter.get_position("BINANCE:BTCUSDT-PERP")
+        eth_position = adapter.get_position("BINANCE:ETHUSDT-PERP")
+        assert btc_position is not None
+        assert eth_position is not None
+        assert btc_position.side == "LONG"
+        assert eth_position.side == "SHORT"
 
 
 # =================================================================
