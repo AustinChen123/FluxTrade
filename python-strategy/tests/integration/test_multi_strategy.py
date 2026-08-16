@@ -6,27 +6,28 @@ and correct fill event attribution.
 
 Requires: compiled fluxtrade_core.so in src/
 """
-import pytest
+
 from decimal import Decimal
 from unittest.mock import patch, MagicMock
+
+import pytest
+
+pytest.importorskip("fluxtrade_core")
+
+from fluxtrade_core import Candlestick as RustCandlestick
+from fluxtrade_core import Order as RustOrder
+from fluxtrade_core import PyMatchingEngine
 
 from src.core.models import Signal, SignalType, Candlestick
 from src.core.adapters.simulated import SimulatedAdapter
 from src.core.capital_allocator import CapitalAllocator
+from src.core.strategy_context import StrategyContext
 from src.strategies.base import BaseStrategy, StrategyRequirements
 from integration.conftest import PRODUCT_ID, TIMEFRAME, make_candle_series
-
-# Skip entire module if Rust .so is not available
-try:
-    from fluxtrade_core import PyMatchingEngine, Order as RustOrder, Candlestick as RustCandlestick
-    HAS_RUST = True
-except ImportError:
-    HAS_RUST = False
 
 pytestmark = [
     pytest.mark.integration,
     pytest.mark.rust,
-    pytest.mark.skipif(not HAS_RUST, reason="fluxtrade_core.so not compiled"),
 ]
 
 
@@ -135,7 +136,11 @@ class StrategyA(BaseStrategy):
             lookback_window=3,
         )
 
-    def on_candle(self, candle: Candlestick) -> Signal:
+    def on_candle(
+        self,
+        candle: Candlestick,
+        context: StrategyContext | None = None,
+    ) -> Signal:
         self._count += 1
         if self._count == 5:
             return Signal(
@@ -182,7 +187,11 @@ class StrategyB(BaseStrategy):
             lookback_window=3,
         )
 
-    def on_candle(self, candle: Candlestick) -> Signal:
+    def on_candle(
+        self,
+        candle: Candlestick,
+        context: StrategyContext | None = None,
+    ) -> Signal:
         self._count += 1
         if self._count == 7:
             return Signal(
@@ -633,6 +642,7 @@ class TestBacktestMultiStrategy:
 
         result = runner.run()
 
+        assert result is not None
         journal_entries = result.get("journal", [])
         # With 50 candles: StrategyA enters@5, exits@10; StrategyB enters@7, exits@14
         # That means at least 4 entry events + fill events
