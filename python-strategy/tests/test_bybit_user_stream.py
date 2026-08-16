@@ -141,6 +141,7 @@ def test_start_authenticates_then_subscribes_with_exact_frames() -> None:
 
 def test_same_message_rows_aggregate_by_order_with_context_independent_values() -> None:
     results = []
+    stream: BybitOrderEventStream | None = None
     for precision, rounding in ((6, ROUND_DOWN), (60, ROUND_HALF_UP)):
         connection = _Connection(
             [
@@ -170,6 +171,7 @@ def test_same_message_rows_aggregate_by_order_with_context_independent_values() 
         results.append(event)
 
     first = results[0]
+    assert stream is not None
     assert first.status == "FILLED"
     assert first.product_id == "BYBIT:BTCUSDT-PERP"
     assert first.client_order_id == "canonical:strategy-market-LONG-123"
@@ -681,8 +683,12 @@ def test_different_order_groups_preserve_first_seen_order() -> None:
     stream = _stream(connection)
     stream.start()
 
-    assert stream.poll().exchange_order_id == "provider-b"
-    assert stream.poll().exchange_order_id == "provider-a"
+    first = stream.poll()
+    second = stream.poll()
+    assert first is not None
+    assert second is not None
+    assert first.exchange_order_id == "provider-b"
+    assert second.exchange_order_id == "provider-a"
 
 
 @pytest.mark.parametrize(
