@@ -5,16 +5,15 @@ from __future__ import annotations
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from decimal import Decimal, InvalidOperation
-from typing import TYPE_CHECKING, Generic, TypeVar, TypedDict, cast
+from typing import Generic, TypeVar, TypedDict
 
 from src.core.client_order_id import linked_client_order_id
-from src.core.interfaces import IOrderRepository
+from src.core.interfaces.conditional_orders import (
+    ConditionalOrderRecord,
+    ConditionalOrderRepository,
+)
 from src.core.interfaces.exchange import ExchangeError
 from src.core.product_registry import InstrumentSpec
-
-if TYPE_CHECKING:
-    from src.core.orm_models import Order
-
 
 NativeBracketGroups = dict[str, dict[str, str]]
 OrderT = TypeVar("OrderT")
@@ -37,9 +36,9 @@ class NativeProtectionRequest:
 
 
 def audit_native_bracket_fill(
-    repository: IOrderRepository,
-    entry_order: object,
-    related_orders: Sequence[object],
+    repository: ConditionalOrderRepository,
+    entry_order: ConditionalOrderRecord,
+    related_orders: Sequence[ConditionalOrderRecord],
 ) -> list[dict[str, object]] | None:
     """Audit attach-at-entry protection after its parent entry fills."""
     native_orders = [
@@ -136,7 +135,7 @@ def audit_native_bracket_fill(
             )
             setattr(order, "trigger_price", remote_price)
         setattr(order, "intent_payload", payload)
-        repository.update_order(cast("Order", order))
+        repository.persist_conditional_order(order)
     return failures
 
 

@@ -6,6 +6,10 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Callable, Protocol, Sequence
 
 from src.core.interfaces import IExchangeAdapter, IOrderRepository
+from src.core.interfaces.conditional_orders import (
+    ConditionalOrderRecord,
+    ConditionalOrderRepository,
+)
 from src.core.interfaces.exchange import ExchangeOrderEvent
 from src.core.models import Candlestick, Signal
 
@@ -32,9 +36,9 @@ class OrderEventProcessor(Protocol):
 class PendingProtectionFillProcessor(Protocol):
     def __call__(
         self,
-        repository: IOrderRepository,
-        entry_order: object,
-        related_orders: Sequence[object],
+        repository: ConditionalOrderRepository,
+        entry_order: ConditionalOrderRecord,
+        related_orders: Sequence[ConditionalOrderRecord],
     ) -> PendingProtectionFillResult: ...
 
 
@@ -48,9 +52,9 @@ def process_order_event_without_venue_policy(
 
 
 def audit_pending_protection_without_venue_policy(
-    repository: IOrderRepository,
-    entry_order: object,
-    related_orders: Sequence[object],
+    repository: ConditionalOrderRepository,
+    entry_order: ConditionalOrderRecord,
+    related_orders: Sequence[ConditionalOrderRecord],
 ) -> PendingProtectionFillResult:
     """Leave pending protection to generic placement policy."""
     return None
@@ -89,9 +93,9 @@ class RuntimeBootstrap(Protocol):
 
     def audit_pending_protection_fill(
         self,
-        repository: IOrderRepository,
-        entry_order: object,
-        related_orders: Sequence[object],
+        repository: ConditionalOrderRepository,
+        entry_order: ConditionalOrderRecord,
+        related_orders: Sequence[ConditionalOrderRecord],
     ) -> PendingProtectionFillResult: ...
 
 
@@ -163,9 +167,9 @@ class DefaultRuntimeBootstrap:
 
     def audit_pending_protection_fill(
         self,
-        repository: IOrderRepository,
-        entry_order: object,
-        related_orders: Sequence[object],
+        repository: ConditionalOrderRepository,
+        entry_order: ConditionalOrderRecord,
+        related_orders: Sequence[ConditionalOrderRecord],
     ) -> PendingProtectionFillResult:
         return audit_pending_protection_without_venue_policy(
             repository,

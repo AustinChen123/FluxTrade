@@ -43,6 +43,10 @@ from src.core.adapters.rithmic_runtime_recovery import (
 from src.core.adapters.rithmic_strategy_exit import RithmicStrategyExitService
 from src.core.execution import ExecutionEngine, ExitDecision
 from src.core.interfaces import IExchangeAdapter, IOrderRepository
+from src.core.interfaces.conditional_orders import (
+    ConditionalOrderRecord,
+    ConditionalOrderRepository,
+)
 from src.core.interfaces.exchange import ExchangeOrderEvent
 from src.core.models import Candlestick, Signal, SignalType
 from src.core.ops_safety import OpsSafetyService
@@ -145,9 +149,9 @@ class RithmicRuntimeBootstrap:
 
     def audit_pending_protection_fill(
         self,
-        repository: IOrderRepository,
-        entry_order: object,
-        related_orders: Sequence[object],
+        repository: ConditionalOrderRepository,
+        entry_order: ConditionalOrderRecord,
+        related_orders: Sequence[ConditionalOrderRecord],
     ) -> list[dict[str, object]] | None:
         """Delegate attach-at-entry fill audit to the Rithmic owner."""
         if not self.is_rithmic_runtime:

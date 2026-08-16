@@ -2055,6 +2055,12 @@ class TestExecutionTradingRules:
             order_event_processor=process_native_protection_event,
             pending_protection_fill_processor=audit_native_bracket_fill,
         )
+        mock_order_repo.get_conditional_order = MagicMock(
+            wraps=mock_order_repo.get_conditional_order
+        )
+        mock_order_repo.persist_conditional_order = MagicMock(
+            wraps=mock_order_repo.persist_conditional_order
+        )
 
         order_id = engine.execute_signal(
             signal_factory(
@@ -2076,6 +2082,8 @@ class TestExecutionTradingRules:
         client.submit_bracket.assert_called_once()
         assert entry.exchange_order_id == "parent-1"
         assert all(order.status == OrderStatus.SUBMITTED.value for order in protections)
+        assert mock_order_repo.get_conditional_order.call_count == 2
+        assert mock_order_repo.persist_conditional_order.call_count >= 4
         assert all(
             order.intent_payload["placement_mode"] == "attach-at-entry"
             for order in protections
@@ -2604,16 +2612,17 @@ class TestExecutionTradingRules:
             audit_external_orders=True,
             is_backtest=True,
         )
-        update_order = mock_order_repo.update_order
+        persist_conditional_order = mock_order_repo.persist_conditional_order
+        error = RuntimeError("database unavailable")
 
         def fail_after_remote_ack(order):
             if client.submit_bracket.called and order.type == "stop_loss":
-                raise RuntimeError("database unavailable")
-            update_order(order)
+                raise error
+            persist_conditional_order(order)
 
-        mock_order_repo.update_order = fail_after_remote_ack
+        mock_order_repo.persist_conditional_order = fail_after_remote_ack
 
-        with pytest.raises(RuntimeError, match="database unavailable"):
+        with pytest.raises(RuntimeError, match="database unavailable") as raised:
             engine.execute_signal(
                 signal_factory(
                     product_id="RITHMIC:NQ-202609",
@@ -2623,6 +2632,7 @@ class TestExecutionTradingRules:
                 )
             )
 
+        assert raised.value is error
         client.submit_bracket.assert_called_once()
         assert engine._reconcile_halt is True
 
@@ -8165,6 +8175,38 @@ class TestAuditedExecution:
             audit_external_orders=True,
             is_backtest=True,  # fill recording uses repo.update_position, not Redis
         )
+        narrow_snapshots = []
+        broad_snapshots = []
+        narrow_depth = 0
+        persist_conditional_order = mock_order_repo.persist_conditional_order
+        update_order = mock_order_repo.update_order
+
+        def snapshot(order):
+            return (
+                str(order.id),
+                order.status,
+                order.exchange_order_id,
+                tuple(sorted((order.intent_payload or {}).items())),
+            )
+
+        def persist_with_snapshot(order):
+            nonlocal narrow_depth
+            narrow_snapshots.append(snapshot(order))
+            narrow_depth += 1
+            try:
+                persist_conditional_order(order)
+            finally:
+                narrow_depth -= 1
+
+        def update_with_snapshot(order):
+            if narrow_depth == 0:
+                broad_snapshots.append(snapshot(order))
+            update_order(order)
+
+        mock_order_repo.persist_conditional_order = MagicMock(
+            side_effect=persist_with_snapshot
+        )
+        mock_order_repo.update_order = MagicMock(side_effect=update_with_snapshot)
 
         with pytest.raises(NetworkError, match="Connection timeout"):
             engine.execute_signal(
@@ -8193,6 +8235,24 @@ class TestAuditedExecution:
             tp_order.intent_payload.get("pending_reason")
             == "entry_submit_outcome_uncertain"
         )
+        expected_pending_payload = tuple(sorted(tp_order.intent_payload.items()))
+        assert [
+            value
+            for value in narrow_snapshots
+            if ("pending_reason", "entry_submit_outcome_uncertain") in value[3]
+        ] == [
+            (
+                str(tp_order.id),
+                OrderStatus.NEW.value,
+                None,
+                expected_pending_payload,
+            )
+        ]
+        assert [
+            value
+            for value in broad_snapshots
+            if ("pending_reason", "entry_submit_outcome_uncertain") in value[3]
+        ] == []
 
     def test_uncertain_submit_merges_pending_payload_without_replacing_it(
         self,

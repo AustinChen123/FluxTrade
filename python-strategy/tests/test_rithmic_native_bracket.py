@@ -33,6 +33,24 @@ SPEC = InstrumentSpec(
 )
 
 
+class _NarrowConditionalRepository:
+    def __init__(self) -> None:
+        self.persisted: list[object] = []
+
+    def get_conditional_order(self, order_id: str) -> object | None:
+        return None
+
+    def list_conditional_orders_by_statuses(
+        self,
+        statuses: set[str],
+        exchange_id: str | None = None,
+    ) -> list[object]:
+        return []
+
+    def persist_conditional_order(self, order: object) -> None:
+        self.persisted.append(order)
+
+
 def _order(**overrides):
     values = {
         "product_id": PRODUCT_ID,
@@ -105,11 +123,11 @@ def _native_leg(**overrides):
 
 
 def test_fill_audit_returns_unhandled_for_deferred_protection():
-    repository = MagicMock()
+    repository = _NarrowConditionalRepository()
     deferred = _native_leg(intent_payload={"placement_mode": "place-after-fill"})
 
     assert audit_native_bracket_fill(repository, _filled_entry(), [deferred]) is None
-    repository.update_order.assert_not_called()
+    assert repository.persisted == []
 
 
 def test_fill_audit_rejects_mixed_native_and_deferred_group_before_mutation():
@@ -138,7 +156,7 @@ def test_fill_audit_rejects_mixed_native_and_deferred_group_before_mutation():
         "ticks": "8",
         "requested_price": "19998.25",
     }
-    repository.update_order.assert_not_called()
+    repository.persist_conditional_order.assert_not_called()
 
 
 def test_fill_audit_rejects_missing_entry_fill_before_leg_mutation():
@@ -156,7 +174,7 @@ def test_fill_audit_rejects_missing_entry_fill_before_leg_mutation():
             "reason": "native_bracket_entry_fill_price_missing",
         }
     ]
-    repository.update_order.assert_not_called()
+    repository.persist_conditional_order.assert_not_called()
 
 
 @pytest.mark.parametrize(
@@ -184,7 +202,7 @@ def test_fill_audit_rejects_invalid_metadata_without_persistence(field, value):
             "reason": "native_bracket_audit_metadata_invalid",
         }
     ]
-    repository.update_order.assert_not_called()
+    repository.persist_conditional_order.assert_not_called()
 
 
 @pytest.mark.parametrize(
@@ -210,7 +228,7 @@ def test_fill_audit_projects_exact_remote_confirmation(
     expected_confirmation,
     expected_failures,
 ):
-    repository = MagicMock()
+    repository = _NarrowConditionalRepository()
     leg = _native_leg()
     original_payload = leg.intent_payload
     if remote_price is not None:
@@ -235,7 +253,7 @@ def test_fill_audit_projects_exact_remote_confirmation(
     else:
         assert leg.trigger_price == Decimal("19998.25")
         assert "effective_price" not in leg.intent_payload
-    repository.update_order.assert_called_once_with(leg)
+    assert repository.persisted == [leg]
     assert leg.intent_payload is not original_payload
     assert "actual_entry_fill_price" not in original_payload
 
