@@ -44,8 +44,10 @@ class TestEngineShutdown:
 
     def test_shutdown_closes_redis(self):
         engine = _make_engine()
+        redis_client = MagicMock()
+        engine.redis_client = redis_client
         engine.shutdown()
-        engine.redis_client.close.assert_called_once()
+        redis_client.close.assert_called_once()
 
     def test_shutdown_calls_executor_shutdown(self):
         engine = _make_engine()
@@ -73,6 +75,8 @@ class TestEngineShutdown:
 
     def test_live_command_listener_exits_promptly_without_a_message(self):
         engine = _make_engine()
+        redis_client = MagicMock()
+        engine.redis_client = redis_client
         subscribed = threading.Event()
 
         class IdlePubSub:
@@ -86,15 +90,17 @@ class TestEngineShutdown:
             def close(self):
                 return None
 
-        engine.redis_client.pubsub.return_value = IdlePubSub()
+        redis_client.pubsub.return_value = IdlePubSub()
         engine._start_command_listener()
         assert subscribed.wait(timeout=1.0)
+        command_thread = engine.command_thread
+        assert command_thread is not None
 
         started = time.monotonic()
         engine.shutdown(timeout=1.0)
 
         assert time.monotonic() - started < 0.5
-        assert not engine.command_thread.is_alive()
+        assert not command_thread.is_alive()
 
     def test_shutdown_skips_dead_threads(self):
         engine = _make_engine()
@@ -106,7 +112,9 @@ class TestEngineShutdown:
 
     def test_shutdown_handles_redis_close_error(self):
         engine = _make_engine()
-        engine.redis_client.close.side_effect = Exception("already closed")
+        redis_client = MagicMock()
+        redis_client.close.side_effect = Exception("already closed")
+        engine.redis_client = redis_client
         # Should not raise
         engine.shutdown()
         assert engine.running is False
