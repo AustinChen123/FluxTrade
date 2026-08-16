@@ -195,6 +195,8 @@ def _adapter() -> LiveBybitAdapter:
 
 def test_live_adapter_delegates_order_event_lifecycle() -> None:
     adapter = _adapter()
+    logger = MagicMock()
+    adapter.logger = logger
     owner = MagicMock()
     event = object()
     owner.poll.return_value = event
@@ -208,9 +210,7 @@ def test_live_adapter_delegates_order_event_lifecycle() -> None:
     owner.start.assert_called_once_with()
     owner.poll.assert_called_once_with()
     owner.close.assert_called_once_with()
-    adapter.logger.warning.assert_called_once_with(
-        "Bybit order event stream cleanup failed"
-    )
+    logger.warning.assert_called_once_with("Bybit order event stream cleanup failed")
 
 
 def test_alias_is_stable_bounded_and_registered_before_parent_submission() -> None:
@@ -333,6 +333,8 @@ def test_malformed_or_multiple_lookup_rows_fail_closed(response) -> None:
 
 def test_lookup_and_cancel_provider_failures_keep_fixed_contracts() -> None:
     adapter = _adapter()
+    logger = MagicMock()
+    adapter.logger = logger
     client = MagicMock()
     client.market.return_value = {"id": "BTCUSDT"}
     client.privateGetV5OrderRealtime.side_effect = ccxt.NetworkError(
@@ -348,7 +350,7 @@ def test_lookup_and_cancel_provider_failures_keep_fixed_contracts() -> None:
         adapter.get_order_by_client_id(canonical, "BYBIT:BTCUSDT-PERP")
     assert str(raised.value) == "bybit_client_order_lookup_failed"
     assert adapter.cancel_order_by_client_id(canonical, "BYBIT:BTCUSDT-PERP") is False
-    adapter.logger.error.assert_called_once_with(
+    logger.error.assert_called_once_with(
         "Failed to cancel Bybit order by client identity"
     )
 
