@@ -524,7 +524,7 @@ def test_cache_failure_keeps_trade_journal_and_protection_then_replays_safely(
         order_manager.update_position_script.side_effect = ResponseError(
             "provider-cache-sentinel"
         )
-    journaled: list[str] = []
+    journal_fill = Mock()
     protection_orders: list[str] = []
 
     def place_protection(order):
@@ -534,7 +534,7 @@ def test_cache_failure_keeps_trade_journal_and_protection_then_replays_safely(
 
     applier = OrderEventApplier(
         order_manager=order_manager,
-        journal_fill=lambda order, *_args: journaled.append(str(order.id)),
+        journal_fill=journal_fill,
         fail_pending_conditionals_for_terminal_entry=lambda _order: None,
         protective_terminal_without_fill_failure=lambda _order: None,
         write_conditional_warning=lambda **_kwargs: None,
@@ -564,7 +564,12 @@ def test_cache_failure_keeps_trade_journal_and_protection_then_replays_safely(
     assert first["action"] == "applied_position_cache_failed"
     assert replay["action"] == "applied"
     assert len(mock_order_repo.trades) == 1
-    assert journaled == [str(order.id)]
+    journal_fill.assert_called_once_with(
+        order,
+        event,
+        Decimal("101.25"),
+        Decimal("1"),
+    )
     assert protection_orders == [str(order.id)]
     if failure_owner == "read":
         order_manager.update_position_script.assert_not_called()

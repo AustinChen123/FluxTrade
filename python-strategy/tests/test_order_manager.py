@@ -14,6 +14,8 @@ from decimal import Context, Decimal, ROUND_DOWN, ROUND_HALF_UP, localcontext
 from pathlib import Path
 from unittest.mock import patch, MagicMock
 
+from redis.exceptions import ResponseError
+
 from src.core.runtime_capabilities import OrderAccountIdentity
 from src.core.order_manager import OrderManager, PositionCachePersistenceError
 from src.core.models import OrderSide, OrderStatus, SignalType
@@ -409,6 +411,7 @@ class TestExchangeOrderId:
         signal = signal_factory()
         order = order_manager.create_order(signal, OrderSide.BUY, "market", Decimal("0.1"))
 
+        assert order.exchange_order_id is not None
         assert order.exchange_order_id.startswith("sim_")
 
 
@@ -847,7 +850,6 @@ class TestOrderManagerLiveMode:
         sqlite_order_session_factory,
     ):
         """Lua script ResponseError should raise RuntimeError."""
-        import redis as redis_lib
         from src.core.repositories import LiveOrderRepository
 
         repo = LiveOrderRepository(db_session_factory=sqlite_order_session_factory)
@@ -855,7 +857,7 @@ class TestOrderManagerLiveMode:
         mock_redis = MagicMock()
         mock_redis.hgetall.return_value = {}
         mock_script = MagicMock()
-        mock_script.side_effect = redis_lib.exceptions.ResponseError("script error")
+        mock_script.side_effect = ResponseError("script error")
         mock_redis.register_script.return_value = mock_script
 
         with (

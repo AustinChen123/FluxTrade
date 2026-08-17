@@ -74,7 +74,7 @@ class OrderManager:
     def create_order(
         self,
         signal: Signal,
-        side: OrderSide,
+        side: OrderSide | str,
         order_type: str,
         quantity: Decimal,
         price: Optional[Decimal] = None,
