@@ -134,10 +134,11 @@ def _coordinate(
             else -position.quantity
         )
         exposure[strategy_id] = exposure.get(strategy_id, Decimal("0")) + signed
+    result: list[tuple[str, list[Signal]]] | None = None
     with coordinator.decision_state_transaction() as transaction:
         for sleeve in definition.sleeves:
             transaction.capture(sleeve.strategy)
-        return coordinator.coordinate_candle_decisions(
+        result = coordinator.coordinate_candle_decisions(
             _candle(),
             decisions,
             exposure_loader=lambda _strategy_ids, _product_id, _client_order_ids: (
@@ -146,6 +147,8 @@ def _coordinate(
             default_quantity=Decimal("1"),
             decision_state_transaction=transaction,
         )
+    assert result is not None
+    return result
 
 
 def test_same_direction_sleeves_are_kept_in_definition_order() -> None:
@@ -280,9 +283,7 @@ def test_exclusive_slot_existing_owner_suppresses_other_entry(
         else None
     )
     pending_entries = (
-        {"sleeve_a": Decimal("1")}
-        if existing_kind == "working_entry"
-        else None
+        {"sleeve_a": Decimal("1")} if existing_kind == "working_entry" else None
     )
 
     result = _coordinate(
@@ -518,9 +519,7 @@ def test_inactive_window_suppresses_entry_but_preserves_exit() -> None:
     )
 
     assert entry == [("sleeve_a", [])]
-    assert exit_decision == [
-        ("sleeve_a", [_signal("sleeve_a", SignalType.EXIT_LONG)])
-    ]
+    assert exit_decision == [("sleeve_a", [_signal("sleeve_a", SignalType.EXIT_LONG)])]
 
 
 @pytest.mark.parametrize(
