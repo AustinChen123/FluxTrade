@@ -15,10 +15,12 @@ Contract:
 
 from __future__ import annotations
 
+from collections.abc import Iterator, Mapping
 from contextlib import contextmanager
 from decimal import Decimal
 import threading
 import time
+from typing import Never
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -796,15 +798,28 @@ class TestRunOnceBalanceAuthority:
             def hget(self, name: str, key: str) -> str | None:
                 return self.values.get((name, key))
 
-            def hset(self, name: str, mapping: dict[str, str]) -> int:
-                self.hset_calls.append((name, mapping))
-                for key, value in mapping.items():
+            def hset(self, name: str, mapping: Mapping[str, str]) -> int:
+                values = dict(mapping)
+                self.hset_calls.append((name, values))
+                for key, value in values.items():
                     self.values[(name, key)] = value
-                return len(mapping)
+                return len(values)
 
-            def scan_iter(self, match: str):
+            def scan_iter(self, match: str) -> Iterator[str | bytes]:
                 del match
                 return iter(())
+
+            def ping(self) -> Never:
+                raise AssertionError("unexpected ping")
+
+            def close(self) -> Never:
+                raise AssertionError("unexpected close")
+
+            def hgetall(self, name: str) -> Never:
+                raise AssertionError(f"unexpected hgetall: {name}")
+
+            def pipeline(self, *, transaction: bool) -> Never:
+                raise AssertionError(f"unexpected pipeline: {transaction}")
 
         redis = BalanceRedis()
         account = AccountService.__new__(AccountService)
@@ -855,14 +870,14 @@ class TestRunOnceBalanceAuthority:
         secret = "provider-balance-secret-sentinel"
         account = FakeAccountService(balance=Decimal("1000"))
         adapter = FakeAdapter(balance=exchange_balance)
+        replace_generic_balance: MagicMock | None = None
         if stage == "local_read":
             account.get_balance = MagicMock(side_effect=RuntimeError(secret))
         elif stage == "adapter_read":
             adapter.get_balance = MagicMock(side_effect=RuntimeError(secret))
         elif stage == "account_persistence":
-            account.replace_generic_balance = MagicMock(
-                side_effect=RuntimeError(secret)
-            )
+            replace_generic_balance = MagicMock(side_effect=RuntimeError(secret))
+            account.replace_generic_balance = replace_generic_balance
         logger = MagicMock()
         authority_failure = MagicMock()
         job = RuntimeReconciliationJob(
@@ -916,7 +931,8 @@ class TestRunOnceBalanceAuthority:
             authority_failure.assert_not_called()
             assert account.balance_replacements == [Decimal("250")]
         elif stage == "account_persistence":
-            account.replace_generic_balance.assert_called_once_with(Decimal("250"))
+            assert replace_generic_balance is not None
+            replace_generic_balance.assert_called_once_with(Decimal("250"))
             authority_failure.assert_called_once_with(stage)
         else:
             assert account.balance_replacements == []
