@@ -22,6 +22,7 @@ try:
 
     HAS_RUST = True
 except ImportError:
+    RustCandlestick = None
     HAS_RUST = False
 
 try:
@@ -57,6 +58,7 @@ def test_precision_codec_quantizes_payload_that_current_rust_decimal_boundary_ch
 
     assert codec.decode_price(units) == Decimal("104523.12")
     if HAS_RUST:
+        assert RustCandlestick is not None
         candle = RustCandlestick(
             PRODUCT_ID,
             TIMEFRAME,
@@ -158,7 +160,9 @@ def test_current_rust_decimal_string_boundary_memory_pressure_is_bounded():
 
 @pytest.mark.memory
 @pytest.mark.rust
-@pytest.mark.skipif(not HAS_SCALED_RUST, reason="ScaledCandlestick extension not compiled")
+@pytest.mark.skipif(
+    not HAS_SCALED_RUST, reason="ScaledCandlestick extension not compiled"
+)
 @pytest.mark.skipif(
     os.getenv("FLUXTRADE_BOUNDARY_MEMORY_TEST") != "1",
     reason="set FLUXTRADE_BOUNDARY_MEMORY_TEST=1 to run bounded memory diagnostic",
@@ -240,7 +244,9 @@ def test_scaled_candle_boundary_memory_pressure_against_string_boundary():
 
 @pytest.mark.performance
 @pytest.mark.rust
-@pytest.mark.skipif(not HAS_SCALED_RUST, reason="ScaledCandlestick extension not compiled")
+@pytest.mark.skipif(
+    not HAS_SCALED_RUST, reason="ScaledCandlestick extension not compiled"
+)
 @pytest.mark.skipif(
     os.getenv("FLUXTRADE_BOUNDARY_BENCHMARK") != "1",
     reason="set FLUXTRADE_BOUNDARY_BENCHMARK=1 to run boundary speed diagnostic",
@@ -343,7 +349,9 @@ def test_scaled_candle_boundary_construction_speed_against_string_boundary():
 
 @pytest.mark.performance
 @pytest.mark.rust
-@pytest.mark.skipif(not HAS_SCALED_RUST, reason="ScaledCandlestick extension not compiled")
+@pytest.mark.skipif(
+    not HAS_SCALED_RUST, reason="ScaledCandlestick extension not compiled"
+)
 @pytest.mark.skipif(
     os.getenv("FLUXTRADE_ADAPTER_BENCHMARK") != "1",
     reason="set FLUXTRADE_ADAPTER_BENCHMARK=1 to run adapter speed diagnostic",
@@ -439,7 +447,9 @@ def test_scaled_adapter_market_data_speed_against_decimal_boundary():
 
 @pytest.mark.performance
 @pytest.mark.rust
-@pytest.mark.skipif(not HAS_SCALED_RUST, reason="ScaledCandlestick extension not compiled")
+@pytest.mark.skipif(
+    not HAS_SCALED_RUST, reason="ScaledCandlestick extension not compiled"
+)
 @pytest.mark.skipif(
     os.getenv("FLUXTRADE_PREENCODED_BOUNDARY_BENCHMARK") != "1",
     reason="set FLUXTRADE_PREENCODED_BOUNDARY_BENCHMARK=1 to run pre-encoded speed diagnostic",
