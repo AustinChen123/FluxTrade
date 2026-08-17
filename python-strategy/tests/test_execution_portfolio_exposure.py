@@ -2,13 +2,16 @@ from __future__ import annotations
 
 from contextlib import AbstractContextManager
 from decimal import Decimal
+import threading
 from types import SimpleNamespace
 from typing import Any
+from unittest.mock import MagicMock
 
 import pytest
 
 from src.core import execution_portfolio_exposure
 from src.core.execution import ExecutionEngine
+from src.core.interfaces.repository import IOrderRepository
 from src.core.models import OrderStatus, PositionSide
 from src.core.portfolio_runtime import PortfolioExposureSnapshot
 
@@ -378,9 +381,9 @@ def test_execution_engine_facade_passes_current_dependencies(
         adapter=mock_exchange_adapter,
         order_repository=mock_order_repo,
     )
-    loader = object()
-    repository = object()
-    lock = object()
+    loader = MagicMock()
+    repository = MagicMock(spec=IOrderRepository)
+    lock = threading.RLock()
     expected = PortfolioExposureSnapshot({"long": Decimal("3")})
     captured: dict[str, object] = {}
 

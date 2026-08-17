@@ -31,6 +31,7 @@ from src.core.models import (
     Candlestick,
     Position,
     PositionSide,
+    OrderSide,
     OrderStatus,
     Trade,
 )
@@ -340,7 +341,7 @@ class MockOrderRepository(IOrderRepository):
         self.trades.append(trade)
 
     def get_position(
-        self, strategy_id: str, product_id: str, side: str = None
+        self, strategy_id: str, product_id: str, side: str | None = None
     ) -> Optional[ORMPosition]:
         key = f"{strategy_id}:{product_id}"
         pos = self.positions.get(key)
@@ -475,7 +476,11 @@ class MockExchangeAdapter(IExchangeAdapter):
     def get_balance(self, asset: str) -> Decimal:
         return self.balance.get(asset, Decimal("0"))
 
-    def get_position(self, product_id: str) -> Optional[Position]:
+    def get_position(
+        self,
+        product_id: str,
+        strategy_id: str | None = None,
+    ) -> Optional[Position]:
         return self.positions.get(product_id)
 
     def on_market_data(self, candle: Candlestick) -> List[Dict]:
@@ -878,7 +883,7 @@ def order_factory():
     """Factory to create Orders with custom parameters."""
 
     def _create(
-        order_id: str = None,
+        order_id: str | None = None,
         exchange_order_id: Optional[str] = None,
         strategy_id: str = DEFAULT_STRATEGY_ID,
         product_id: str = DEFAULT_PRODUCT_ID,
@@ -987,7 +992,7 @@ def sample_trade():
         product_id=DEFAULT_PRODUCT_ID,
         price=Decimal("42000.00"),
         quantity=Decimal("0.1"),
-        side="buy",
+        side=OrderSide.BUY,
         timestamp=1704067200000,
     )
 
@@ -997,11 +1002,11 @@ def trade_factory():
     """Factory to create Trades with custom parameters."""
 
     def _create(
-        trade_id: str = None,
+        trade_id: str | None = None,
         product_id: str = DEFAULT_PRODUCT_ID,
         price: Decimal = Decimal("42000.00"),
         quantity: Decimal = Decimal("0.1"),
-        side: str = "buy",
+        side: OrderSide = OrderSide.BUY,
         timestamp: int = 1704067200000,
     ) -> Trade:
         return Trade(

@@ -8,6 +8,7 @@ from src.core.execution import ExecutionEngine
 from src.core.execution_conditional_orders import ConditionalOrderLifecycleOwner
 from src.core.execution_submission_gate import ExecutionSubmissionGate
 from src.core.interfaces.exchange import ExchangeError
+from src.core.interfaces.repository import IOrderRepository
 from src.core.models import OrderStatus
 from src.core.repositories import LiveOrderRepository
 
@@ -98,7 +99,7 @@ def test_engine_requires_conditional_repository_capability_before_lifecycle(
     mock_clock,
     mock_exchange_adapter,
 ):
-    legacy_repository = SimpleNamespace()
+    legacy_repository = MagicMock(spec=IOrderRepository)
 
     with pytest.raises(
         RuntimeError,
@@ -425,6 +426,7 @@ def test_actual_conditional_recovery_scopes_same_venue_collision_by_account(
     assert submitted.quantity == Decimal("2")
     record_order_ack.assert_called_once()
     foreign_stop = repositories["ACCOUNT-B"].get_order("stop-ACCOUNT-B")
+    assert foreign_stop is not None
     assert foreign_stop.status == OrderStatus.NEW.value
     assert foreign_stop.quantity == Decimal("1")
 

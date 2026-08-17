@@ -1853,6 +1853,7 @@ class TestEngineInit:
             )
         engine.ops_safety.persist_kill_switch_state = MagicMock()
         engine._run_ops_kill_switch = MagicMock()
+        phase_mocks: dict[str, MagicMock] = {}
         for name in (
             "_start_command_listener",
             "_reconcile_startup_balance",
@@ -1864,16 +1865,17 @@ class TestEngineInit:
             "scan_strategies",
             "_restore_active_strategies_on_startup",
         ):
-            setattr(engine, name, MagicMock())
+            phase_mocks[name] = MagicMock()
+            setattr(engine, name, phase_mocks[name])
 
         engine.startup()
 
         assert isinstance(engine._venue_runtime, NoopRuntimeCapabilities)
-        assert engine._restore_active_strategies_on_startup.called is restores
+        assert phase_mocks["_restore_active_strategies_on_startup"].called is restores
         assert engine._startup_lock_cause == blocking_reason
         assert engine._halt_for_kill_switch.call_count == (1 if restores else 2)
-        engine._start_heartbeat.assert_called_once_with()
-        engine.scan_strategies.assert_called_once_with()
+        phase_mocks["_start_heartbeat"].assert_called_once_with()
+        phase_mocks["scan_strategies"].assert_called_once_with()
         engine.ops_safety.persist_kill_switch_state.assert_not_called()
         engine._run_ops_kill_switch.assert_not_called()
 
@@ -2407,7 +2409,7 @@ class TestOnMarketData:
             product_id="BINANCE:BTCUSDT-PERP",
             price=Decimal("42000"),
             quantity=Decimal("1"),
-            side="buy",
+            side=OrderSide.BUY,
             timestamp=1704067200000,
         )
 
@@ -10130,9 +10132,9 @@ def test_rithmic_kill_switch_does_not_retry_unreconciled_residual(engine):
 
 
 def test_rithmic_kill_switch_blocks_when_remote_working_order_remains(engine):
-    adapter = _rithmic_adapter_for_reconnect_test()
+    order_client = MagicMock()
+    adapter = _rithmic_adapter_for_reconnect_test(order_client)
     adapter.start_order_event_stream()
-    order_client = adapter._client
     engine.execution_engine.adapter = adapter
     engine._runtime_profile = "test"
     engine._runtime_account_id = "ACCOUNT"
