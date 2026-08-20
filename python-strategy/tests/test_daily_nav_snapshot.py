@@ -5,6 +5,9 @@ from __future__ import annotations
 from contextlib import nullcontext
 from datetime import date
 from decimal import Decimal
+from typing import cast
+
+from sqlalchemy.orm import Session
 
 from src.core.daily_nav_snapshot import DailyNavSnapshotService
 from src.core.orm_models import DailyNavSnapshot
@@ -44,7 +47,7 @@ class _FakeSession:
 
 
 def _service(db: _FakeSession) -> DailyNavSnapshotService:
-    return DailyNavSnapshotService(lambda: nullcontext(db))
+    return DailyNavSnapshotService(lambda: nullcontext(cast(Session, db)))
 
 
 def test_get_start_nav_returns_none_when_missing() -> None:
