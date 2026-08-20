@@ -24,7 +24,7 @@ def test_risk_config_is_frozen() -> None:
     config = RiskConfig()
 
     with pytest.raises(FrozenInstanceError):
-        config.max_orders_per_minute = 20
+        setattr(config, "max_orders_per_minute", 20)
 
 
 def test_risk_config_from_env_loads_all_values(monkeypatch) -> None:
