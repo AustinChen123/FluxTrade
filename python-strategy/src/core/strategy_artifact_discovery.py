@@ -7,7 +7,7 @@ from datetime import UTC, datetime
 from sqlalchemy.orm import Session
 
 from src.core.models import StrategyStatus
-from src.core.orm_models import StrategyState
+from src.core.orm_models import Strategy, StrategyState
 from src.core.portfolio_runtime import PortfolioFactory
 from src.strategies.base import BaseStrategy
 
@@ -35,6 +35,14 @@ def synchronize_strategy_artifacts(
 
     with db_session_factory() as db:
         for strategy_id, result in found.items():
+            if db.get(Strategy, strategy_id) is None:
+                db.add(
+                    Strategy(
+                        id=strategy_id,
+                        name=strategy_id,
+                        configuration_json="{}",
+                    )
+                )
             state = (
                 db.query(StrategyState)
                 .filter(StrategyState.strategy_id == strategy_id)
