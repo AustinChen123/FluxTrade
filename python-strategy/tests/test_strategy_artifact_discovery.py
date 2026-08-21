@@ -1,4 +1,5 @@
 from contextlib import nullcontext
+from typing import cast
 from unittest.mock import MagicMock, call
 
 import pytest
@@ -7,8 +8,12 @@ from sqlalchemy.orm import sessionmaker
 
 from src.core.models import StrategyStatus
 from src.core.orm_models import Base, Strategy, StrategyState
-from src.core.strategy_artifact_discovery import synchronize_strategy_artifacts
+from src.core.strategy_artifact_discovery import (
+    ArtifactLoadResult,
+    synchronize_strategy_artifacts,
+)
 from src.core.strategy_state_manager import StrategyStateManager
+from src.strategies.base import BaseStrategy
 
 
 def _dependencies(found: dict[str, object], states: list[object | None]):
@@ -151,6 +156,10 @@ def test_new_artifact_creates_strategy_parent_before_lifecycle_transition(tmp_pa
     class Artifact:
         pass
 
+    found: dict[str, ArtifactLoadResult] = {
+        "fresh-artifact": cast(type[BaseStrategy], Artifact)
+    }
+
     engine = create_engine(f"sqlite:///{tmp_path / 'artifact-state.db'}")
 
     @event.listens_for(engine, "connect")
@@ -163,7 +172,7 @@ def test_new_artifact_creates_strategy_parent_before_lifecycle_transition(tmp_pa
     session_factory = sessionmaker(bind=engine)
 
     synchronize_strategy_artifacts(
-        artifact_loader=lambda: {"fresh-artifact": Artifact},
+        artifact_loader=lambda: found,
         publish_loaded_classes=lambda _loaded: None,
         db_session_factory=lambda: session_factory(),
         transition_to_error=MagicMock(),
