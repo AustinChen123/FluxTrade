@@ -1,3 +1,5 @@
+#[cfg(unix)]
+use anyhow::Context;
 use std::future::Future;
 use tokio::task::JoinSet;
 use tracing::{error, info, warn, Level};
@@ -56,10 +58,28 @@ fn install_sanitized_panic_hook() {
 }
 
 pub(crate) async fn supervise(join_set: JoinSet<SupervisedTask>) -> anyhow::Result<()> {
-    supervise_until(join_set, async {
+    supervise_until(join_set, shutdown_signal()?).await
+}
+
+#[cfg(unix)]
+fn shutdown_signal() -> anyhow::Result<impl Future<Output = ()>> {
+    use tokio::signal::unix::{signal, SignalKind};
+
+    let mut terminate =
+        signal(SignalKind::terminate()).context("failed to install SIGTERM handler")?;
+    Ok(async move {
+        tokio::select! {
+            _ = tokio::signal::ctrl_c() => {}
+            _ = terminate.recv() => {}
+        }
+    })
+}
+
+#[cfg(not(unix))]
+fn shutdown_signal() -> anyhow::Result<impl Future<Output = ()>> {
+    Ok(async {
         let _ = tokio::signal::ctrl_c().await;
     })
-    .await
 }
 
 async fn supervise_until(
@@ -67,7 +87,7 @@ async fn supervise_until(
     shutdown: impl Future<Output = ()>,
 ) -> anyhow::Result<()> {
     info!(
-        "Supervisor active. Monitoring {} tasks. Press Ctrl+C to shutdown.",
+        "Supervisor active. Monitoring {} tasks. Waiting for a shutdown signal.",
         join_set.len()
     );
     tokio::select! {
@@ -435,12 +455,18 @@ mod tests {
 
     use crate::normalized_optional_value;
     use futures_util::FutureExt;
-    use std::process::Command;
+    use std::process::{Command, Stdio};
 
     static ENV_LOCK: Mutex<()> = Mutex::new(());
     const PANIC_CHILD_ENV: &str = "FLUXTRADE_PANIC_HOOK_SUBPROCESS";
     const PANIC_CHILD_VALUE: &str = "fluxtrade-panic-hook-child-v1";
     const PANIC_SENTINEL: &str = "panic-provider-payload-sentinel";
+    #[cfg(unix)]
+    const SIGTERM_CHILD_ENV: &str = "FLUXTRADE_SIGTERM_SUBPROCESS";
+    #[cfg(unix)]
+    const SIGTERM_CHILD_VALUE: &str = "fluxtrade-sigterm-child-v1";
+    #[cfg(unix)]
+    const SIGTERM_MARKER_ENV: &str = "FLUXTRADE_SIGTERM_READY_PATH";
 
     struct EnvVarGuard {
         name: &'static str,
@@ -567,6 +593,104 @@ mod tests {
             .find(|line| line.contains("FluxTrade terminal failure"))
             .expect("terminal event should be present");
         assert!(terminal.contains(" ERROR "), "wrong severity: {terminal}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn sigterm_subprocess_child() {
+        if std::env::var(SIGTERM_CHILD_ENV).as_deref() != Ok(SIGTERM_CHILD_VALUE) {
+            return;
+        }
+        let marker = std::env::var_os(SIGTERM_MARKER_ENV)
+            .map(std::path::PathBuf::from)
+            .expect("SIGTERM child marker path should be configured");
+
+        initialize_process_diagnostics();
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("child runtime should build")
+            .block_on(async move {
+                let mut join_set = JoinSet::new();
+                join_set.spawn(async move {
+                    std::fs::write(marker, b"ready")
+                        .expect("SIGTERM child should publish readiness");
+                    pending::<SupervisedTask>().await
+                });
+                supervise(join_set)
+                    .await
+                    .expect("SIGTERM should stop the supervisor cleanly");
+            });
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn sigterm_stops_supervised_tasks_with_a_clean_process_exit() {
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("system clock should follow the Unix epoch")
+            .as_nanos();
+        let marker = std::env::temp_dir().join(format!(
+            "fluxtrade-sigterm-{}-{nonce}.ready",
+            std::process::id()
+        ));
+        let mut child =
+            Command::new(std::env::current_exe().expect("test executable should exist"))
+                .args([
+                    "runtime_supervisor::tests::sigterm_subprocess_child",
+                    "--exact",
+                    "--nocapture",
+                ])
+                .env(SIGTERM_CHILD_ENV, SIGTERM_CHILD_VALUE)
+                .env(SIGTERM_MARKER_ENV, &marker)
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .spawn()
+                .expect("SIGTERM child should start");
+
+        for _ in 0..100 {
+            if marker.exists() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        if !marker.exists() {
+            let _ = child.kill();
+            let _ = child.wait();
+            panic!("SIGTERM child did not become ready");
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        let term_sent = Command::new("kill")
+            .args(["-TERM", &child.id().to_string()])
+            .status()
+            .expect("SIGTERM command should run")
+            .success();
+        if !term_sent {
+            let _ = child.kill();
+            let _ = child.wait();
+            let _ = std::fs::remove_file(&marker);
+            panic!("SIGTERM command failed");
+        }
+
+        let mut exit = None;
+        for _ in 0..100 {
+            exit = child
+                .try_wait()
+                .expect("SIGTERM child status should be readable");
+            if exit.is_some() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        if exit.is_none() {
+            let _ = Command::new("kill")
+                .args(["-KILL", &child.id().to_string()])
+                .status();
+            let _ = child.wait();
+        }
+        let _ = std::fs::remove_file(&marker);
+        let exit = exit.expect("SIGTERM child did not stop within two seconds");
+        assert!(exit.success(), "SIGTERM child did not exit cleanly: {exit}");
     }
 
     #[test]
