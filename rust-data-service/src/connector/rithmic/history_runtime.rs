@@ -4,6 +4,7 @@ use super::{
     session::Plant,
     transport::{self, ConnectionEvent},
 };
+use crate::aggregator::CandleAggregator;
 use crate::model::{validate_product_id, Candlestick};
 use anyhow::{ensure, Context, Result};
 use chrono::Utc;
@@ -34,8 +35,12 @@ pub(crate) async fn run(
     symbol: &str,
     start_ms: i64,
     end_ms: i64,
+    derive_timeframe: Option<&str>,
 ) -> Result<usize> {
-    let candles = load_closed(
+    if let Some(target_timeframe) = derive_timeframe {
+        derived_target_millis(target_timeframe)?;
+    }
+    let batch = load_closed(
         profile,
         product_id,
         exchange,
@@ -45,6 +50,10 @@ pub(crate) async fn run(
         Utc::now().timestamp_millis(),
     )
     .await?;
+    let mut candles = batch.candles.clone();
+    if let Some(target_timeframe) = derive_timeframe {
+        candles.extend(derive_closed(&batch, target_timeframe)?);
+    }
     persist_exact(&candles).await
 }
 
@@ -303,6 +312,7 @@ fn validate_closed_batch(
 
 struct ClosedHistoryBatch {
     candles: Vec<Candlestick>,
+    window: ClosedHistoryWindow,
 }
 
 impl ClosedHistoryBatch {
@@ -312,11 +322,68 @@ impl ClosedHistoryBatch {
         window: ClosedHistoryWindow,
     ) -> Result<Self> {
         validate_closed_batch(&candles, product_id, window)?;
-        Ok(Self { candles })
+        Ok(Self { candles, window })
     }
 
     fn len(&self) -> usize {
         self.candles.len()
+    }
+}
+
+fn derive_closed(batch: &ClosedHistoryBatch, target_timeframe: &str) -> Result<Vec<Candlestick>> {
+    let target_ms = derived_target_millis(target_timeframe)?;
+    ensure!(
+        CandleAggregator::can_aggregate("1m", target_timeframe)?,
+        "Rithmic history cannot derive requested timeframe"
+    );
+
+    let mut aggregator = CandleAggregator::new();
+    let mut derived = Vec::new();
+    for candle in &batch.candles {
+        if let Some(completed) = aggregator.add_candle(candle, target_timeframe)? {
+            derived.push(completed);
+        }
+    }
+    derived.extend(aggregator.flush_closed_before(batch.window.end_ms)?);
+
+    let mut previous_timestamp = None;
+    for candle in &derived {
+        candle.validate()?;
+        ensure!(
+            candle.product_id
+                == batch
+                    .candles
+                    .first()
+                    .map_or("", |source| &source.product_id),
+            "Rithmic derived history product mismatch"
+        );
+        ensure!(
+            candle.timeframe == target_timeframe,
+            "Rithmic derived history timeframe mismatch"
+        );
+        ensure!(
+            candle.timestamp >= batch.window.start_ms
+                && candle
+                    .timestamp
+                    .checked_add(target_ms)
+                    .context("Rithmic derived history candle end overflow")?
+                    <= batch.window.end_ms,
+            "Rithmic derived history candle is outside the closed source window"
+        );
+        ensure!(
+            previous_timestamp.is_none_or(|previous| candle.timestamp > previous),
+            "Rithmic derived history candles must be strictly increasing"
+        );
+        previous_timestamp = Some(candle.timestamp);
+    }
+    Ok(derived)
+}
+
+fn derived_target_millis(target_timeframe: &str) -> Result<i64> {
+    match target_timeframe {
+        "5m" => Ok(5 * MINUTE_MS),
+        "15m" => Ok(15 * MINUTE_MS),
+        _ => anyhow::bail!("Rithmic history derived timeframe must be 5m or 15m"),
     }
 }
 
@@ -339,8 +406,7 @@ fn to_candle(product_id: &str, bar: HistoryMinuteBar) -> Result<Candlestick> {
     Ok(candle)
 }
 
-async fn persist_exact(batch: &ClosedHistoryBatch) -> Result<usize> {
-    let candles = &batch.candles;
+async fn persist_exact(candles: &[Candlestick]) -> Result<usize> {
     if candles.is_empty() {
         return Ok(0);
     }
@@ -611,6 +677,125 @@ mod tests {
             assert!(validate_closed_batch(&invalid, "RITHMIC:NQ-202609", window).is_err());
         }
         assert!(validate_closed_batch(&[candle(60_000)], "RITHMIC:ES-202609", window).is_err());
+    }
+
+    #[test]
+    fn derived_history_uses_closed_decimal_aggregation_and_flushes_final_bucket() {
+        let product_id = "RITHMIC:NQ-202609";
+        let window = ClosedHistoryWindow::new(0, 600_000, 600_999).unwrap();
+        let candles = (0..10)
+            .map(|minute| Candlestick {
+                product_id: product_id.to_string(),
+                timeframe: "1m".to_string(),
+                timestamp: minute * MINUTE_MS,
+                open: dec!(100) + rust_decimal::Decimal::from(minute),
+                high: dec!(102) + rust_decimal::Decimal::from(minute),
+                low: dec!(99) + rust_decimal::Decimal::from(minute),
+                close: dec!(101.25) + rust_decimal::Decimal::from(minute),
+                volume: dec!(1.5),
+            })
+            .collect();
+        let batch = ClosedHistoryBatch::new(candles, product_id, window).unwrap();
+
+        let derived = derive_closed(&batch, "5m").unwrap();
+
+        assert_eq!(derived.len(), 2);
+        assert_eq!(derived[0].timestamp, 0);
+        assert_eq!(derived[0].timeframe, "5m");
+        assert_eq!(derived[0].open, dec!(100));
+        assert_eq!(derived[0].high, dec!(106));
+        assert_eq!(derived[0].low, dec!(99));
+        assert_eq!(derived[0].close, dec!(105.25));
+        assert_eq!(derived[0].volume, dec!(7.5));
+        assert_eq!(derived[1].timestamp, 300_000);
+        assert_eq!(derived[1].open, dec!(105));
+        assert_eq!(derived[1].high, dec!(111));
+        assert_eq!(derived[1].low, dec!(104));
+        assert_eq!(derived[1].close, dec!(110.25));
+        assert_eq!(derived[1].volume, dec!(7.5));
+    }
+
+    #[test]
+    fn derived_history_matrix_omits_partial_boundaries_and_rejects_source_identity() {
+        let product_id = "RITHMIC:NQ-202609";
+        let window = ClosedHistoryWindow::new(120_000, 600_000, 600_999).unwrap();
+        let candle = |minute| Candlestick {
+            product_id: product_id.to_string(),
+            timeframe: "1m".to_string(),
+            timestamp: minute * MINUTE_MS,
+            open: dec!(100),
+            high: dec!(101),
+            low: dec!(99),
+            close: dec!(100),
+            volume: dec!(1),
+        };
+        let batch =
+            ClosedHistoryBatch::new((2..10).map(candle).collect(), product_id, window).unwrap();
+
+        let derived = derive_closed(&batch, "5m").unwrap();
+        assert_eq!(derived.len(), 1);
+        assert_eq!(derived[0].timestamp, 300_000);
+        assert_eq!(derived[0].volume, dec!(5));
+        for target in ["", "1m", "2m", "6m", "5x"] {
+            assert!(derive_closed(&batch, target).is_err(), "{target}");
+        }
+
+        let partial_end_window = ClosedHistoryWindow::new(0, 420_000, 420_999).unwrap();
+        let partial_end_batch =
+            ClosedHistoryBatch::new((0..7).map(candle).collect(), product_id, partial_end_window)
+                .unwrap();
+        let partial_end = derive_closed(&partial_end_batch, "5m").unwrap();
+        assert_eq!(partial_end.len(), 1);
+        assert_eq!(partial_end[0].timestamp, 0);
+    }
+
+    #[test]
+    fn derived_history_accepts_the_live_fifteen_minute_target() {
+        let product_id = "RITHMIC:NQ-202609";
+        let window = ClosedHistoryWindow::new(0, 900_000, 900_999).unwrap();
+        let batch = ClosedHistoryBatch::new(
+            (0..15)
+                .map(|minute| Candlestick {
+                    product_id: product_id.to_string(),
+                    timeframe: "1m".to_string(),
+                    timestamp: minute * MINUTE_MS,
+                    open: dec!(100),
+                    high: dec!(101),
+                    low: dec!(99),
+                    close: dec!(100),
+                    volume: dec!(0.25),
+                })
+                .collect(),
+            product_id,
+            window,
+        )
+        .unwrap();
+
+        let derived = derive_closed(&batch, "15m").unwrap();
+        assert_eq!(derived.len(), 1);
+        assert_eq!(derived[0].timestamp, 0);
+        assert_eq!(derived[0].timeframe, "15m");
+        assert_eq!(derived[0].volume, dec!(3.75));
+    }
+
+    #[tokio::test]
+    async fn invalid_derived_timeframe_fails_before_loading_credentials() {
+        let error = run(
+            "",
+            "RITHMIC:NQ-202609",
+            "CME",
+            "NQU6",
+            0,
+            60_000,
+            Some("2m"),
+        )
+        .await
+        .unwrap_err();
+
+        assert_eq!(
+            error.to_string(),
+            "Rithmic history derived timeframe must be 5m or 15m"
+        );
     }
 
     #[test]

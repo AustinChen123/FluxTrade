@@ -113,6 +113,9 @@ enum Commands {
         /// Exclusive UTC epoch milliseconds, aligned to a minute boundary.
         #[arg(long)]
         end_ms: i64,
+        /// Also persist closed candles derived with live aggregation semantics (5m or 15m).
+        #[arg(long)]
+        derive_timeframe: Option<String>,
     },
 
     #[cfg(feature = "rithmic")]
@@ -245,6 +248,7 @@ async fn run_application() -> anyhow::Result<()> {
             symbol,
             start_ms,
             end_ms,
+            derive_timeframe,
         } => {
             let inserted = crate::connector::rithmic::history_runtime::run(
                 &profile,
@@ -253,9 +257,13 @@ async fn run_application() -> anyhow::Result<()> {
                 &symbol,
                 start_ms,
                 end_ms,
+                derive_timeframe.as_deref(),
             )
             .await?;
-            info!(inserted, "Rithmic history backfill completed");
+            info!(
+                inserted,
+                derive_timeframe, "Rithmic history backfill completed"
+            );
         }
 
         #[cfg(feature = "rithmic")]
@@ -485,4 +493,47 @@ fn normalized_optional_value(value: Option<String>) -> Option<String> {
 }
 
 #[cfg(test)]
-mod tests {}
+mod tests {
+    #[cfg(feature = "rithmic")]
+    use super::*;
+
+    #[cfg(feature = "rithmic")]
+    #[test]
+    fn rithmic_history_derived_timeframe_is_explicit_and_optional() {
+        let base = [
+            "rust-data-service",
+            "rithmic-history",
+            "--profile",
+            "paper",
+            "--product-id",
+            "RITHMIC:NQ-202609",
+            "--exchange",
+            "CME",
+            "--symbol",
+            "NQU6",
+            "--start-ms",
+            "0",
+            "--end-ms",
+            "900000",
+        ];
+
+        let without_derived = Cli::try_parse_from(base).unwrap();
+        assert!(matches!(
+            without_derived.command,
+            Some(Commands::RithmicHistory {
+                derive_timeframe: None,
+                ..
+            })
+        ));
+
+        let with_derived =
+            Cli::try_parse_from(base.into_iter().chain(["--derive-timeframe", "5m"])).unwrap();
+        assert!(matches!(
+            with_derived.command,
+            Some(Commands::RithmicHistory {
+                derive_timeframe: Some(ref timeframe),
+                ..
+            }) if timeframe == "5m"
+        ));
+    }
+}
