@@ -407,6 +407,26 @@ def test_python_production_image_contains_migration_runtime_contract():
     } <= dockerignore_entries
 
 
+def test_root_dockerignore_excludes_generated_build_context():
+    dockerignore_entries = set(ROOT_DOCKERIGNORE.read_text().splitlines())
+
+    assert {
+        "rust-data-service/target/",
+        "rust-data-service/tests/",
+        "rust-data-service/.venv/",
+        "python-strategy/.venv/",
+        "python-strategy/tests/",
+        "python-strategy/data/",
+        "frontend/node_modules/",
+        "frontend/dist/",
+        "database/venv/",
+        "**/.DS_Store",
+        "**/__pycache__/",
+        "**/.pytest_cache/",
+        "**/.ruff_cache/",
+    } <= dockerignore_entries
+
+
 def test_python_production_image_owns_immutable_strategy_artifact_root():
     dockerfile = PYTHON_DOCKERFILE.read_text()
 

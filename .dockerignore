@@ -25,3 +25,19 @@ python-strategy/src/fluxtrade_core.so
 !database/alembic/env.py
 !database/alembic/versions/
 !database/alembic/versions/*.py
+
+# Re-including a parent directory also exposes local generated content unless
+# these paths are excluded again after the allowlist entries above.
+rust-data-service/target/
+rust-data-service/tests/
+rust-data-service/.venv/
+python-strategy/.venv/
+python-strategy/tests/
+python-strategy/data/
+frontend/node_modules/
+frontend/dist/
+database/venv/
+**/.DS_Store
+**/__pycache__/
+**/.pytest_cache/
+**/.ruff_cache/
