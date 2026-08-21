@@ -90,6 +90,8 @@ class HealthChecker:
         start = time.monotonic()
         try:
             with self._db_session_factory() as db_session:
+                if db_session is None:
+                    raise RuntimeError("database session unavailable")
                 db_session.execute(text("SELECT 1"))
             latency = (time.monotonic() - start) * 1000
             return CheckResult(

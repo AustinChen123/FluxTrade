@@ -2,9 +2,9 @@ name: CI
 
 on:
   push:
-    branches: [ "main", "develop" ]
+    branches: [ "main", "develop", "refactor/**", "test/**", "fix/**", "feat/**", "cleanup/**" ]
   pull_request:
-    branches: [ "main", "develop" ]
+    branches: [ "main", "develop", "refactor/**" ]
 
 # Cancel in-progress runs on the same branch to save CI minutes
 concurrency:
@@ -22,6 +22,9 @@ jobs:
       - uses: actions/checkout@v6
         with:
           fetch-depth: 0
+
+      - name: Test secret scan range resolver
+        run: bash .github/scripts/test-secret-scan-range.sh
 
       - name: Install Gitleaks
         env:
@@ -41,16 +44,14 @@ jobs:
 
       - name: Scan committed changes for secrets
         env:
+          EVENT_NAME: ${{ github.event_name }}
+          EVENT_CREATED: ${{ github.event.created }}
+          EVENT_REF: ${{ github.ref }}
           BASE_SHA: ${{ github.event.pull_request.base.sha || github.event.before }}
           HEAD_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
         run: |
-          git cat-file -e "${HEAD_SHA}^{commit}"
-          if [[ "${BASE_SHA}" =~ ^0+$ ]]; then
-            scan_range="${HEAD_SHA}"
-          else
-            git cat-file -e "${BASE_SHA}^{commit}"
-            scan_range="${BASE_SHA}..${HEAD_SHA}"
-          fi
+          scan_range=$(bash .github/scripts/resolve-secret-scan-range.sh \
+            "${EVENT_NAME}" "${EVENT_CREATED}" "${EVENT_REF}" "${BASE_SHA}" "${HEAD_SHA}" refs/remotes/origin/develop)
           "${RUNNER_TEMP}/gitleaks/gitleaks" git \
             --config .gitleaks.toml \
             --log-opts="--diff-merges=first-parent ${scan_range}" \
@@ -109,6 +110,14 @@ jobs:
           watchdog::tests::test_timeout_locks_only_test_environment
           -- --ignored --exact
 
+      - name: Run Redis publisher liveness isolation smoke
+        env:
+          DATA_PUBLISHER_TEST_REDIS_URL: redis://127.0.0.1:6379
+        run: >-
+          cargo test --no-default-features
+          publisher::tests::publisher_liveness_renews_recovers_fails_at_threshold_and_expires
+          -- --ignored --exact
+
       # TODO: Add Rust coverage with cargo-llvm-cov
       # Steps needed:
       #   1. Install cargo-llvm-cov: cargo install cargo-llvm-cov
@@ -150,6 +159,16 @@ jobs:
 
       - name: Set up Python
         run: uv python install
+
+      - name: Check tracked production types
+        run: >-
+          git ls-files -z -- ':(glob)src/**/*.py' |
+          xargs -0 uv run pyright --warnings
+
+      - name: Check tracked test types
+        run: >-
+          git ls-files -z -- ':(glob)tests/**/*.py' |
+          xargs -0 uv run pyright --warnings
 
       - name: Lint with Ruff
         run: uv run ruff check .
@@ -202,6 +221,20 @@ jobs:
     name: Integration Tests (Rust + Python)
     runs-on: ubuntu-latest
     needs: [rust-check, python-check]
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: fluxtrade
+          POSTGRES_PASSWORD: fluxtrade
+          POSTGRES_DB: postgres
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U fluxtrade -d postgres"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
     steps:
       - uses: actions/checkout@v6
 
@@ -250,4 +283,106 @@ jobs:
 
       - name: Run integration tests
         working-directory: ./python-strategy
+        env:
+          FLUXTRADE_RUN_POSTGRES_MIGRATION_TESTS: "1"
         run: uv run pytest -m "integration or rust" -v
+
+  refactor-gate:
+    name: Refactor Gate
+    if: always()
+    needs: [integration-check, python-check, rust-check, secret-scan]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Validate workflow and required jobs
+        env:
+          NEEDS_JSON: ${{ toJson(needs) }}
+        run: |
+          ruby <<'RUBY'
+          require "digest"
+          require "json"
+          require "yaml"
+
+          workflow_path = ".github/workflows/ci.yml"
+          manifest_path = ".github/refactor-required-jobs.json"
+
+          fail_closed = lambda do |code, detail, next_action|
+            warn "component=refactor-gate task=validate operation=aggregate stage=failed canonical_error=#{code} detail=#{detail} disposition=FAIL_CLOSED next_action=#{next_action}"
+            exit 1
+          end
+
+          begin
+            manifest = JSON.parse(File.read(manifest_path))
+            workflow_bytes = File.binread(workflow_path)
+            workflow = YAML.safe_load(workflow_bytes, aliases: false)
+          rescue JSON::ParserError, Psych::Exception, Errno::ENOENT => error
+            fail_closed.call("MALFORMED_CONFIGURATION", error.class.name, "repair_workflow_or_manifest")
+          end
+
+          expected_keys = %w[aggregate_job_id excluded_job_ids job_graph_digest required_job_ids schema workflow_path workflow_sha256]
+          unless manifest.is_a?(Hash) && manifest.keys.sort == expected_keys &&
+                 manifest["schema"] == "fluxtrade_refactor_expected_jobs_v1" &&
+                 manifest["workflow_path"] == workflow_path &&
+                 manifest["aggregate_job_id"] == "refactor-gate" &&
+                 manifest["excluded_job_ids"] == []
+            fail_closed.call("MANIFEST_SCHEMA_MISMATCH", "manifest_contract", "repair_manifest")
+          end
+
+          workflow_sha = Digest::SHA256.hexdigest(workflow_bytes)
+          unless workflow_sha == manifest["workflow_sha256"]
+            fail_closed.call("WORKFLOW_DIGEST_MISMATCH", "workflow_sha256=#{workflow_sha}", "update_workflow_and_manifest_atomically")
+          end
+
+          jobs = workflow.is_a?(Hash) ? workflow["jobs"] : nil
+          unless jobs.is_a?(Hash) && jobs.keys.all? { |id| id.is_a?(String) }
+            fail_closed.call("JOB_GRAPH_MISMATCH", "invalid_jobs", "reconcile_manifest_and_workflow")
+          end
+
+          graph = jobs.keys.sort.to_h do |id|
+            job = jobs[id]
+            unless job.is_a?(Hash)
+              fail_closed.call("JOB_GRAPH_MISMATCH", "invalid_job=#{id}", "reconcile_manifest_and_workflow")
+            end
+            raw_needs = job.fetch("needs", [])
+            needs = raw_needs.is_a?(String) ? [raw_needs] : raw_needs
+            unless needs.is_a?(Array) && needs.all? { |need| need.is_a?(String) } && needs.uniq.length == needs.length
+              fail_closed.call("JOB_GRAPH_MISMATCH", "invalid_needs=#{id}", "reconcile_manifest_and_workflow")
+            end
+            [id, needs.sort]
+          end
+          graph_sha = Digest::SHA256.hexdigest(JSON.generate(graph))
+          unless graph_sha == manifest["job_graph_digest"]
+            fail_closed.call("JOB_GRAPH_MISMATCH", "job_graph_digest=#{graph_sha}", "reconcile_manifest_and_workflow")
+          end
+
+          aggregate = manifest["aggregate_job_id"]
+          required = manifest["required_job_ids"]
+          non_aggregate = jobs.keys.reject { |id| id == aggregate }.sort
+          unless required.is_a?(Array) && required == required.sort && required.uniq == required && required == non_aggregate
+            fail_closed.call("JOB_GRAPH_MISMATCH", "required_job_ids", "reconcile_manifest_and_workflow")
+          end
+          unless graph[aggregate] == required
+            fail_closed.call("JOB_GRAPH_MISMATCH", "aggregate_needs", "reconcile_manifest_and_workflow")
+          end
+
+          begin
+            runtime_needs = JSON.parse(ENV.fetch("NEEDS_JSON"))
+          rescue KeyError, JSON::ParserError => error
+            fail_closed.call("MALFORMED_RUNTIME_NEEDS", error.class.name, "rerun_required_jobs")
+          end
+          unless runtime_needs.is_a?(Hash) && runtime_needs.keys.sort == required
+            fail_closed.call("REQUIRED_JOB_MISSING", "runtime_job_set", "rerun_required_jobs")
+          end
+          required.each do |id|
+            entry = runtime_needs[id]
+            unless entry.is_a?(Hash) && entry["result"].is_a?(String)
+              fail_closed.call("MALFORMED_RUNTIME_NEEDS", "job_id=#{id}", "rerun_required_jobs")
+            end
+            unless entry["result"] == "success"
+              fail_closed.call("REQUIRED_JOB_NOT_SUCCESS", "job_id=#{id} result=#{entry["result"]}", "inspect_named_job")
+            end
+          end
+
+          puts "component=refactor-gate task=validate operation=aggregate stage=complete disposition=PASS workflow_sha256=#{workflow_sha} job_graph_digest=#{graph_sha}"
+          RUBY

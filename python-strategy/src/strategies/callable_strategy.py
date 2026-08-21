@@ -1,7 +1,9 @@
 """Strategy wrapper for external callable signal sources (e.g., ML models)."""
+
 from typing import Callable, Optional
 from src.strategies.base import BaseStrategy, StrategyRequirements
 from src.core.models import Candlestick, Signal, SignalType
+from src.core.strategy_context import StrategyContext
 
 
 class CallableStrategy(BaseStrategy):
@@ -75,7 +77,11 @@ class CallableStrategy(BaseStrategy):
             self._replay_config,
         )
 
-    def on_candle(self, candle: Candlestick) -> Signal:
+    def on_candle(
+        self,
+        candle: Candlestick,
+        context: StrategyContext | None = None,
+    ) -> Signal:
         result = self._predict_fn(candle)
         if result is not None:
             result.strategy_id = self.strategy_id

@@ -7,6 +7,7 @@ from src.core.mocks.account_service import BacktestAccountService
 from src.core.models import Candlestick, Signal, SignalType
 from src.core.risk_config import RiskConfig
 from src.core.risk_manager import RiskManager
+from src.core.risk_rules.existing_position_entry import ExistingPositionEntryRule
 
 
 PRODUCT = "BINANCE:BTCUSDT-PERP"
@@ -28,7 +29,9 @@ def _candle(ts: int, price: str) -> Candlestick:
     )
 
 
-def _place_market_order(adapter, order_factory, *, side: str, quantity: str, ts: int) -> None:
+def _place_market_order(
+    adapter, order_factory, *, side: str, quantity: str, ts: int
+) -> None:
     order = order_factory(
         strategy_id=STRATEGY_ID,
         product_id=PRODUCT,
@@ -45,7 +48,9 @@ def _place_market_order(adapter, order_factory, *, side: str, quantity: str, ts:
     assert fills[0]["order"].id == order.id
 
 
-def _assert_account_matches_rust(account: BacktestAccountService, adapter: SimulatedAdapter) -> None:
+def _assert_account_matches_rust(
+    account: BacktestAccountService, adapter: SimulatedAdapter
+) -> None:
     raw_position = adapter._engine.positions.get(f"{STRATEGY_ID}:{PRODUCT}")
     account_position = account.get_position(STRATEGY_ID, PRODUCT)
 
@@ -68,23 +73,31 @@ def test_backtest_account_position_matches_rust_after_each_fill(order_factory) -
 
     _place_market_order(adapter, order_factory, side="buy", quantity="0.1", ts=1)
     _assert_account_matches_rust(account, adapter)
-    assert account.get_position(STRATEGY_ID, PRODUCT).side == "LONG"
-    assert account.get_position(STRATEGY_ID, PRODUCT).quantity == Decimal("0.1")
+    position = account.get_position(STRATEGY_ID, PRODUCT)
+    assert position is not None
+    assert position.side == "LONG"
+    assert position.quantity == Decimal("0.1")
 
     _place_market_order(adapter, order_factory, side="buy", quantity="0.2", ts=2)
     _assert_account_matches_rust(account, adapter)
-    assert account.get_position(STRATEGY_ID, PRODUCT).side == "LONG"
-    assert account.get_position(STRATEGY_ID, PRODUCT).quantity == Decimal("0.3")
+    position = account.get_position(STRATEGY_ID, PRODUCT)
+    assert position is not None
+    assert position.side == "LONG"
+    assert position.quantity == Decimal("0.3")
 
     _place_market_order(adapter, order_factory, side="sell", quantity="0.1", ts=3)
     _assert_account_matches_rust(account, adapter)
-    assert account.get_position(STRATEGY_ID, PRODUCT).side == "LONG"
-    assert account.get_position(STRATEGY_ID, PRODUCT).quantity == Decimal("0.2")
+    position = account.get_position(STRATEGY_ID, PRODUCT)
+    assert position is not None
+    assert position.side == "LONG"
+    assert position.quantity == Decimal("0.2")
 
     _place_market_order(adapter, order_factory, side="sell", quantity="0.3", ts=4)
     _assert_account_matches_rust(account, adapter)
-    assert account.get_position(STRATEGY_ID, PRODUCT).side == "SHORT"
-    assert account.get_position(STRATEGY_ID, PRODUCT).quantity == Decimal("0.1")
+    position = account.get_position(STRATEGY_ID, PRODUCT)
+    assert position is not None
+    assert position.side == "SHORT"
+    assert position.quantity == Decimal("0.1")
 
     _place_market_order(adapter, order_factory, side="buy", quantity="0.1", ts=5)
     _assert_account_matches_rust(account, adapter)
@@ -94,9 +107,11 @@ def test_backtest_account_position_matches_rust_after_each_fill(order_factory) -
 def test_risk_manager_position_limit_uses_matcher_backed_account(order_factory) -> None:
     adapter = SimulatedAdapter(Decimal("100000"))
     account = BacktestAccountService(adapter=adapter)
-    class _PassEntryRule:
+
+    class _PassEntryRule(ExistingPositionEntryRule):
         def evaluate(self, signal, current_position):
             from src.core.risk_rules import RuleStatus
+
             return RuleStatus.PASS, None
 
     risk_manager = RiskManager(
@@ -131,8 +146,7 @@ def test_risk_manager_position_limit_uses_matcher_backed_account(order_factory) 
     )
     assert allowed is False
     assert reason == (
-        "REJECT: Max exposure reached "
-        "(max_position_notional_exceeded: 25000.0 > 20000)"
+        "REJECT: Max exposure reached (max_position_notional_exceeded: 25000.0 > 20000)"
     )
 
 

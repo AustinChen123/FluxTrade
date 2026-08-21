@@ -68,9 +68,22 @@ def test_utc_daily_sharpe_uses_close_to_close_equity_returns():
         start_time=0,
         end_time=2 * day_ms,
     )
-    moments = {
-        name: metrics[name]
-        for name in ("count", "sum", "sum_squares", "sum_cubes", "sum_fourth")
+    count = metrics["count"]
+    sum_ = metrics["sum"]
+    sum_squares = metrics["sum_squares"]
+    sum_cubes = metrics["sum_cubes"]
+    sum_fourth = metrics["sum_fourth"]
+    assert isinstance(count, int)
+    assert isinstance(sum_, Decimal)
+    assert isinstance(sum_squares, Decimal)
+    assert isinstance(sum_cubes, Decimal)
+    assert isinstance(sum_fourth, Decimal)
+    moments: dict[str, Decimal | int] = {
+        "count": count,
+        "sum": sum_,
+        "sum_squares": sum_squares,
+        "sum_cubes": sum_cubes,
+        "sum_fourth": sum_fourth,
     }
 
     assert moments == {
@@ -97,6 +110,7 @@ def test_utc_daily_sharpe_carries_leading_internal_and_trailing_days():
 
     assert metrics["count"] == 5
     assert metrics["sum"] == Decimal("0.01")
+
 
 pytestmark = [
     pytest.mark.rust,
@@ -335,9 +349,7 @@ class OrderIntentParityProbeStrategy(BaseStrategy):
 
         if self.invalid_field is not None and index == 0:
             signal = self._entry_signal(candle)
-            return signal.model_copy(
-                update={self.invalid_field: Decimal("0")}
-            )
+            return signal.model_copy(update={self.invalid_field: Decimal("0")})
 
         entry_index = 1 if self.invalid_field is not None else 0
         if index == entry_index:
@@ -460,11 +472,13 @@ def test_research_backtest_matches_full_runner_core_metrics(
 
     full_result = full_runner.run()
     research_result = research_runner.run()
+    assert full_result is not None
 
     with session_factory() as session:
         summary = session.scalars(select(BacktestResultSummary)).one()
         full_trades = session.scalars(select(BacktestTradeLog)).all()
 
+    assert summary.metrics_json is not None
     metrics = json.loads(summary.metrics_json)
     full_closed_trades = calculate_metrics(
         full_trades,
@@ -547,19 +561,13 @@ def test_full_and_research_runners_share_canonical_endpoint_state(
                 type=entry_type,
                 quantity=Decimal("1"),
                 stop_loss=(
-                    Decimal("90")
-                    if scenario == "pending-protected-entry"
-                    else None
+                    Decimal("90") if scenario == "pending-protected-entry" else None
                 ),
                 take_profit=(
-                    Decimal("110")
-                    if scenario == "pending-protected-entry"
-                    else None
+                    Decimal("110") if scenario == "pending-protected-entry" else None
                 ),
                 trailing_distance=(
-                    Decimal("5")
-                    if scenario == "open-long-trailing"
-                    else None
+                    Decimal("5") if scenario == "open-long-trailing" else None
                 ),
             )
         if index == 1 and scenario == "flat":
@@ -611,7 +619,9 @@ def test_full_and_research_runners_share_canonical_endpoint_state(
         )
     )
 
-    full_endpoint = full_runner.run()["endpoint_state"]
+    full_result = full_runner.run()
+    assert full_result is not None
+    full_endpoint = full_result["endpoint_state"]
     research_endpoint = research_runner.run()["endpoint_state"]
 
     assert full_endpoint.model_dump() == research_endpoint.model_dump()
@@ -638,9 +648,9 @@ def test_full_and_research_runners_share_canonical_endpoint_state(
             "STOP_LOSS",
             "TAKE_PROFIT",
         }
-        assert {
-            order.side for order in full_endpoint.protection_orders
-        } == {OrderSide.SELL}
+        assert {order.side for order in full_endpoint.protection_orders} == {
+            OrderSide.SELL
+        }
     if scenario == "open-long-trailing":
         trailing = full_endpoint.protection_orders[0]
         assert trailing.order_type == "TRAILING_STOP"
@@ -782,6 +792,7 @@ def test_three_runners_share_open_endpoint_and_mark_to_market(
     full_result = full_runner.run()
     research_result = research_runner.run()
     fast_result = fast_runner.run()
+    assert full_result is not None
     endpoints = [
         result["endpoint_state"].model_dump(mode="json")
         for result in (full_result, research_result, fast_result)
@@ -851,6 +862,7 @@ def test_full_and_research_runners_share_order_intent_outcomes(
 
     full_result = full_runner.run()
     research_result = research_runner.run()
+    assert full_result is not None
 
     assert full_result["closed_trade_count"] == 1
     assert research_result["closed_trade_count"] == 1
@@ -860,8 +872,7 @@ def test_full_and_research_runners_share_order_intent_outcomes(
     expected_rejections = 0 if invalid_field is None else 1
     assert research_result["invalid_order_intent_count"] == expected_rejections
     assert (
-        len(research_result["invalid_order_intent_rejections"])
-        == expected_rejections
+        len(research_result["invalid_order_intent_rejections"]) == expected_rejections
     )
 
     with session_factory() as session:
@@ -884,6 +895,7 @@ def test_full_and_research_runners_share_order_intent_outcomes(
     assert len(full_rejections) == expected_rejections
     if invalid_field is not None:
         expected_reason = f"signal.{invalid_field}"
+        assert full_rejections[0].risk_message is not None
         assert expected_reason in full_rejections[0].risk_message
         assert expected_reason in (
             research_result["invalid_order_intent_rejections"][0].reason
@@ -1159,12 +1171,15 @@ def test_research_backtest_matches_full_runner_conditional_orders(
 
     full_result = full_runner.run()
     research_result = research_runner.run()
+    assert full_result is not None
 
     with session_factory() as session:
         full_trades = session.scalars(select(BacktestTradeLog)).all()
     full_closed_trades = calculate_metrics(full_trades)["closed_trades"]
 
-    assert full_result["candle_count"] == research_result["candle_count"] == len(candles)
+    assert (
+        full_result["candle_count"] == research_result["candle_count"] == len(candles)
+    )
     assert full_result["total_trades"] == research_result["total_trades"] == 1
     assert full_result["total_pnl"] == research_result["total_pnl"]
     assert research_result["closed_trades"] == full_closed_trades
@@ -1261,6 +1276,7 @@ def test_conditional_orders_do_not_survive_explicit_exit_or_repeated_entry(
 
     full_result = full_runner.run()
     research_result = research_runner.run()
+    assert full_result is not None
 
     with session_factory() as session:
         full_trades = session.scalars(select(BacktestTradeLog)).all()
@@ -1280,7 +1296,9 @@ def test_conditional_orders_do_not_survive_explicit_exit_or_repeated_entry(
 def test_protective_fill_then_same_bar_exit_does_not_reverse(tmp_path):
     start = 1_700_000_000_000
     candles = [
-        make_candle(start, Decimal("100"), Decimal("101"), Decimal("99"), Decimal("100")),
+        make_candle(
+            start, Decimal("100"), Decimal("101"), Decimal("99"), Decimal("100")
+        ),
         make_candle(
             start + INTERVAL_MS,
             Decimal("100"),
@@ -1373,6 +1391,8 @@ def test_protective_fill_then_same_bar_exit_does_not_reverse(tmp_path):
 
     full_result = full_runner.run()
     research_result = research_runner.run()
+    assert full_result is not None
+    assert full_runner.engine is not None
     full_position = full_runner.engine.execution_engine.adapter.get_position(
         PRODUCT_ID,
         strategy_id="protective_exit_probe",
@@ -1467,6 +1487,8 @@ def test_research_backtest_capital_models_cover_full_lifecycle(spec, expected_us
     result = runner.run()
 
     assert result["raw_trade_count"] == 2
+    assert strategy.contexts[1].capital is not None
+    assert strategy.contexts[2].capital is not None
     assert strategy.contexts[1].capital.used == expected_usage(candles[1])
     assert strategy.contexts[2].capital.used == Decimal("0")
     assert allocator.get_used(strategy.strategy_id) == Decimal("0")
@@ -1633,7 +1655,10 @@ def test_research_backtest_rejects_entry_over_available_capital():
     assert strategy.contexts[0].capital.available == Decimal("100")
     assert strategy.contexts[0].latest_rejections == ()
     assert len(strategy.contexts[1].latest_rejections) == 1
-    assert "capital_allocation_rejected" in strategy.contexts[1].latest_rejections[0].reason
+    assert (
+        "capital_allocation_rejected"
+        in strategy.contexts[1].latest_rejections[0].reason
+    )
     assert allocator.get_used(strategy.strategy_id) == Decimal("0")
 
 
@@ -1687,7 +1712,9 @@ def test_research_backtest_prepared_scaled_path_matches_decimal_path():
     decimal_result = decimal_runner.run()
     scaled_result = scaled_runner.run()
 
-    assert scaled_result["candle_count"] == decimal_result["candle_count"] == len(candles)
+    assert (
+        scaled_result["candle_count"] == decimal_result["candle_count"] == len(candles)
+    )
     assert scaled_result["raw_trade_count"] == decimal_result["raw_trade_count"]
     assert scaled_result["total_trades"] == decimal_result["total_trades"]
     assert scaled_result["total_pnl"] == decimal_result["total_pnl"]
@@ -1887,6 +1914,8 @@ def test_representative_strategy_matches_full_and_prepared_research_paths(tmp_pa
         capital_model=CapitalModel.PER_CONTRACT,
         capital_per_contract=Decimal("100"),
     )
+    assert instrument.price_tick is not None
+    assert instrument.quantity_step is not None
     codec = PrecisionCodec(
         PrecisionSpec(
             price_tick=instrument.price_tick,
@@ -1959,6 +1988,7 @@ def test_representative_strategy_matches_full_and_prepared_research_paths(tmp_pa
     full_result = full_runner.run()
     decimal_research_result = decimal_research_runner.run()
     research_result = research_runner.run()
+    assert full_result is not None
 
     with session_factory() as session:
         full_trades = session.scalars(select(BacktestTradeLog)).all()

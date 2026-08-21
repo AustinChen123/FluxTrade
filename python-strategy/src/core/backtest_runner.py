@@ -1,22 +1,32 @@
 import csv
 import json
 import logging
-from contextlib import contextmanager, nullcontext
+from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Callable, ContextManager, Dict, Iterable, List, Optional, cast
+from typing import (
+    Callable,
+    ContextManager,
+    Dict,
+    Iterable,
+    List,
+    Mapping,
+    Optional,
+    Protocol,
+    cast,
+)
 from decimal import Decimal
 from sqlalchemy.orm import Session
 from fluxtrade_core import (
-    CandleAggregator,  # pyright: ignore[reportAttributeAccessIssue]
-    Candlestick as RustCandlestick,  # pyright: ignore[reportAttributeAccessIssue]
+    CandleAggregator,
+    Candlestick as RustCandlestick,
 )
 from src.core.db import SessionLocal
 from src.core.orm_models import Strategy as StrategyORM, BacktestResultSummary, BacktestTradeLog
 from src.core.engine import StrategyEngine
 from src.core.clock import BacktestClock
 from src.core.data_provider import timeframe_to_ms
-from src.core.models import Candlestick
+from src.core.models import Candlestick, Signal
 from src.strategies.base import BaseStrategy
 from src.core.repositories import BacktestOrderRepository
 from src.core.backtest.loader import get_candles_generator
@@ -24,6 +34,8 @@ from src.core.backtest.endpoint_state import build_replay_endpoint_state
 from src.core.backtest.equity import PortfolioEquityCalculator
 from src.core.analytics import (
     ClosedTrade,
+    InitialBalanceInput,
+    _normalize_initial_balance,
     annualized_sharpe_from_moments,
     calculate_metrics,
     utc_daily_return_metrics,
@@ -58,6 +70,11 @@ class _ReplayProgress:
     final_mark: Decimal | None
     end_timestamp: int | None
     halted_early: bool
+
+
+class _BacktestRiskManager(Protocol):
+    account_service: BacktestAccountService
+    instrument_spec_resolver: Callable[[str], InstrumentSpec | None]
 
 
 @contextmanager
@@ -106,10 +123,10 @@ def _write_markdown_report(
     *,
     product_id: str,
     timeframe: str,
-    initial_balance: float,
+    initial_balance: InitialBalanceInput,
     start_time: int,
     end_time: int,
-    fee_config: Dict,
+    fee_config: Mapping[str, Decimal | float],
     fee_model: FeeModel = FeeModel.PERCENTAGE_NOTIONAL,
     candle_count: int,
     path: Path,
@@ -181,14 +198,15 @@ class BacktestRunner:
         end_time: int,
         product_id: str,
         timeframe: str,
-        initial_balance: float = 10000.0,
+        initial_balance: InitialBalanceInput = Decimal("10000"),
         max_drawdown_limit: Optional[float] = 0.20,
         data_source: Optional[IDataSource] = None,
-        fee_config: Optional[Dict[str, float]] = None,
+        fee_config: Mapping[str, Decimal | float] | None = None,
         report_config: Optional[Dict] = None,
         db_session_factory: Optional[Callable[[], ContextManager[Session]]] = None,
         instrument_spec: InstrumentSpec | None = None,
         execution_timeframe: str | None = None,
+        signal_batch_observer: Callable[[tuple[Signal, ...]], None] | None = None,
     ):
         self.start_time = start_time
         self.end_time = end_time
@@ -206,7 +224,7 @@ class BacktestRunner:
                     "execution_timeframe must evenly divide and be shorter "
                     "than the strategy timeframe"
                 )
-        self.initial_balance = initial_balance
+        self.initial_balance = _normalize_initial_balance(initial_balance)
         self.max_drawdown_limit = max_drawdown_limit
         self.data_source = data_source
         self.fee_config = fee_config or {}
@@ -221,6 +239,7 @@ class BacktestRunner:
         self.instrument_spec = instrument_spec
         self.contract_multiplier = resolve_contract_multiplier(instrument_spec)
         self.fee_model = resolve_fee_model(instrument_spec)
+        self.signal_batch_observer = signal_batch_observer
 
         self.clock = BacktestClock(start_time=start_time / 1000)
         self._strategies_buffer: List[BaseStrategy] = []
@@ -278,8 +297,9 @@ class BacktestRunner:
         mock_account: BacktestAccountService,
         stop_drawdown_amount: Decimal | None,
     ) -> _ReplayProgress:
+        engine = cast(StrategyEngine, self.engine)
         count = 0
-        peak_equity = Decimal(str(self.initial_balance))
+        peak_equity = self.initial_balance
         max_drawdown = Decimal("0")
         equity_samples: list[tuple[int, Decimal]] = []
         final_mark: Decimal | None = None
@@ -310,7 +330,7 @@ class BacktestRunner:
             # Fine-grained source candles drive matching first. Strategies only
             # see completed derived candles, matching the live Rust pipeline.
             if aggregator is None:
-                self.engine.on_market_data(candle)
+                engine.on_market_data(candle)
             else:
                 if candle.timeframe != self.execution_timeframe:
                     raise ValueError(
@@ -345,7 +365,7 @@ class BacktestRunner:
                         volume=Decimal(str(completed.volume)),
                     )
                 )
-                self.engine.on_backtest_market_data(
+                engine.on_backtest_market_data(
                     candle,
                     decision_candle,
                 )
@@ -474,7 +494,7 @@ class BacktestRunner:
 
         # 3. Create Rust-backed adapter with fee config
         adapter = SimulatedAdapter(
-            initial_balance=Decimal(str(self.initial_balance)),
+            initial_balance=self.initial_balance,
             maker_fee=Decimal(str(self.fee_config.get("maker", 0))),
             taker_fee=Decimal(str(self.fee_config.get("taker", 0))),
             instrument_spec=self.instrument_spec,
@@ -497,6 +517,7 @@ class BacktestRunner:
             adapter=adapter,
             journal=journal,
             db_session_factory=self._db_session_factory,
+            signal_batch_observer=self.signal_batch_observer,
         )
 
         # Inject journal and account service into strategies
@@ -507,9 +528,13 @@ class BacktestRunner:
         }
         for strat in self._strategies_buffer:
             strat.journal = journal
-            if hasattr(strat, 'risk_manager'):
-                strat.risk_manager.account_service = mock_account
-                strat.risk_manager.instrument_spec_resolver = self._resolve_instrument_spec
+            if hasattr(strat, "risk_manager"):
+                risk_manager = cast(
+                    _BacktestRiskManager,
+                    getattr(strat, "risk_manager"),
+                )
+                risk_manager.account_service = mock_account
+                risk_manager.instrument_spec_resolver = self._resolve_instrument_spec
             if strat.strategy_id not in portfolio_sleeve_ids:
                 self.engine.add_strategy(strat)
         for portfolio in self._portfolios_buffer:
@@ -520,36 +545,34 @@ class BacktestRunner:
         stop_drawdown_amount = (
             None
             if self.max_drawdown_limit is None
-            else Decimal(str(self.initial_balance))
-            * Decimal(str(self.max_drawdown_limit))
+            else self.initial_balance * Decimal(str(self.max_drawdown_limit))
         )
 
         if self.data_source:
-            candle_context = nullcontext(self.data_source.get_candles(
-                self.product_id,
-                self.execution_timeframe or self.timeframe,
-                self.start_time,
-                self.end_time,
-            ))
+            progress = self._process_candles(
+                self.data_source.get_candles(
+                    self.product_id,
+                    self.execution_timeframe or self.timeframe,
+                    self.start_time,
+                    self.end_time,
+                ),
+                mock_account,
+                stop_drawdown_amount,
+            )
         else:
-            candle_context = self._db_session_factory()
-
-        with candle_context as candle_source:
-            if self.data_source:
-                candle_gen = candle_source
-            else:
+            with self._db_session_factory() as db_session:
                 candle_gen = get_candles_generator(
-                    candle_source,
+                    db_session,
                     self.product_id,
                     self.execution_timeframe or self.timeframe,
                     self.start_time,
                     self.end_time,
                 )
-            progress = self._process_candles(
-                candle_gen,
-                mock_account,
-                stop_drawdown_amount,
-            )
+                progress = self._process_candles(
+                    candle_gen,
+                    mock_account,
+                    stop_drawdown_amount,
+                )
 
         endpoint_state = build_replay_endpoint_state(
             positions=adapter.get_all_positions(),
@@ -561,10 +584,15 @@ class BacktestRunner:
 
         # Calculate Final PnL
         final_balance = mock_account.get_balance()
-        total_pnl = final_balance - Decimal(str(self.initial_balance))
+        total_pnl = final_balance - self.initial_balance
 
         with self._db_session_factory() as db_session:
-            summary = db_session.query(BacktestResultSummary).filter_by(id=summary_id).first()
+            summary = cast(
+                BacktestResultSummary,
+                db_session.query(BacktestResultSummary)
+                .filter_by(id=summary_id)
+                .first(),
+            )
             # Metrics (with advanced calculations)
             trades = (
                 db_session.query(BacktestTradeLog)
@@ -646,7 +674,7 @@ class BacktestRunner:
         }
         daily_return_metrics = utc_daily_return_metrics(
             progress.equity_samples,
-            initial_balance=Decimal(str(self.initial_balance)),
+            initial_balance=self.initial_balance,
             start_time=self.start_time,
             end_time=self.end_time,
         )

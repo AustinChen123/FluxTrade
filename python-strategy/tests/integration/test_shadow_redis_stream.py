@@ -6,6 +6,7 @@ import threading
 import uuid
 from decimal import Decimal
 from typing import cast
+from unittest.mock import MagicMock
 
 import pytest
 import redis
@@ -24,11 +25,12 @@ REDIS_URL = os.getenv("FLUXTRADE_REDIS_INTEGRATION_URL")
 pytestmark = [
     pytest.mark.integration,
     pytest.mark.rust,
-    pytest.mark.skipif(
-        not REDIS_URL,
-        reason="FLUXTRADE_REDIS_INTEGRATION_URL is not configured",
-    ),
 ]
+
+requires_redis = pytest.mark.skipif(
+    not REDIS_URL,
+    reason="FLUXTRADE_REDIS_INTEGRATION_URL is not configured",
+)
 
 PRODUCT_ID = "RITHMIC:MNQ-202609"
 
@@ -54,8 +56,11 @@ class _ObservedRedis:
 
     def xread(self, *args, **kwargs):
         self._reading.set()
-        response = self._client.xread(*args, **kwargs)
-        observed_streams = {stream for stream, _messages in response}
+        response = cast(
+            list[list[str | list[tuple[str, dict[str, str]]]]],
+            self._client.xread(*args, **kwargs),
+        )
+        observed_streams = {cast(str, row[0]) for row in response}
         if (
             self._source_returned is not None
             and self._source_stream_key in observed_streams
@@ -66,6 +71,20 @@ class _ObservedRedis:
                 if not self._source_release.wait(timeout=1):
                     raise TimeoutError("source response was not released")
         return response
+
+
+def test_observed_redis_sync_xread_returns_same_response() -> None:
+    client = MagicMock(spec=redis.Redis)
+    response = [["source", [("1-0", {"json": "{}"})]]]
+    client.xread.return_value = response
+    reading = threading.Event()
+    observed = _ObservedRedis(client, reading)
+
+    result = observed.xread({"source": "0-0"}, block=25)
+
+    assert result is response
+    assert reading.is_set()
+    client.xread.assert_called_once_with({"source": "0-0"}, block=25)
 
 
 def _mark_golden_cross_as_artifact(monkeypatch) -> None:
@@ -95,6 +114,7 @@ def _mark_golden_cross_as_artifact(monkeypatch) -> None:
     )
 
 
+@requires_redis
 def test_redis_stream_reaches_rust_aggregate_and_strategy(monkeypatch) -> None:
     _mark_golden_cross_as_artifact(monkeypatch)
     client = redis.Redis.from_url(str(REDIS_URL), decode_responses=True)
@@ -189,6 +209,7 @@ def test_redis_stream_reaches_rust_aggregate_and_strategy(monkeypatch) -> None:
         client.close()
 
 
+@requires_redis
 def test_shadow_does_not_skip_decision_after_source_wakes_reader(
     monkeypatch,
 ) -> None:

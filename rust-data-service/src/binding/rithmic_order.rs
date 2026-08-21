@@ -1,10 +1,11 @@
 use super::rithmic_ledger::PyLedgerOrder;
 use crate::rithmic_ledger::{
     ledger::TransactionType,
-    order::{
-        BracketOrder, ExitPosition, NewOrder, OrderAck, OrderEvent, OrderSide, OrderType,
-        ProtectionLeg, ProtectionModification,
+    order_command::{
+        BracketOrder, ExitPosition, NewOrder, OrderAck, OrderSide, OrderType, ProtectionLeg,
+        ProtectionModification,
     },
+    order_event::OrderEvent,
     order_runtime::OrderRuntimeHandle,
 };
 use pyo3::{exceptions::PyRuntimeError, exceptions::PyValueError, prelude::*};

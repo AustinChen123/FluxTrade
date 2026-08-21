@@ -36,10 +36,20 @@ except ImportError:  # pragma: no cover - depends on local extension build
     RustScaledCandlestick = None
 
 if TYPE_CHECKING:
+    from fluxtrade_core import ScaledCandlestick as RustScaledCandlestickType
     from src.core.capital_allocator import CapitalAllocator
 
 # Detect if Rust engine supports strategy_id parameter
 _RUST_HAS_STRATEGY_ID = "strategy_id" in str(inspect.signature(RustOrder))
+
+
+def create_simulated_adapter(config: dict) -> "SimulatedAdapter":
+    """Build the local matching adapter without importing live providers."""
+    return SimulatedAdapter(
+        initial_balance=Decimal(str(config.get("balance", 100000))),
+        maker_fee=Decimal(str(config.get("maker_fee", 0))),
+        taker_fee=Decimal(str(config.get("taker_fee", 0))),
+    )
 
 
 class SimulatedAdapter(IExchangeAdapter):
@@ -343,11 +353,12 @@ class SimulatedAdapter(IExchangeAdapter):
             {"order": ORM Order, "price": Decimal, "quantity": Decimal,
              "fee": Decimal, "fill_type": str}
         """
-        rust_candle = self._to_rust_candle(candle)
         if self._precision_codec is not None:
-            rust_fills = self._engine.on_scaled_candle(rust_candle)
+            rust_fills = self._engine.on_scaled_candle(
+                self._to_scaled_rust_candle(candle)
+            )
         else:
-            rust_fills = self._engine.on_candle(rust_candle)
+            rust_fills = self._engine.on_candle(self._to_rust_candle(candle))
 
         return self._fills_from_rust(rust_fills)
 
@@ -448,8 +459,6 @@ class SimulatedAdapter(IExchangeAdapter):
         return RustOrder(**kwargs)
 
     def _to_rust_candle(self, candle: Candlestick) -> RustCandlestick:
-        if self._precision_codec is not None:
-            return self._to_scaled_rust_candle(candle)
         return RustCandlestick(
             product_id=candle.product_id,
             timeframe=candle.timeframe,
@@ -461,7 +470,9 @@ class SimulatedAdapter(IExchangeAdapter):
             volume=str(candle.volume),
         )
 
-    def _to_scaled_rust_candle(self, candle: Candlestick):
+    def _to_scaled_rust_candle(
+        self, candle: Candlestick
+    ) -> "RustScaledCandlestickType":
         if RustScaledCandlestick is None:
             raise RuntimeError("compiled Rust engine does not support scaled candles")
         codec = self._precision_codec

@@ -183,6 +183,7 @@ class TestCallableStrategyIntegration:
             data_source=csv_source,
         )
 
+        assert result is not None
         _assert_journal_invariants(result)
         assert isinstance(result["total_pnl"], Decimal)
 
@@ -221,6 +222,8 @@ class TestCsvSignalIntegration:
         result_callable = _run_backtest(callable_strat, candle_data, mock_sl)
         result_csv = _run_backtest(csv_strat, candle_data, mock_sl)
 
+        assert result_callable is not None
+        assert result_csv is not None
         assert result_callable["journal_count"] > 0, \
             "Both strategies must produce trades for comparison to be meaningful"
         assert result_callable["total_pnl"] == result_csv["total_pnl"], \

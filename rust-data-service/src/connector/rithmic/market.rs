@@ -112,11 +112,7 @@ pub(crate) fn decode_last_trade(payload: &[u8]) -> Result<MarketDataEvent> {
     ensure!(quantity > 0, "invalid Rithmic trade size");
     let ssboe = trade.ssboe.context("missing Rithmic trade ssboe")?;
     let is_snapshot = trade.is_snapshot.unwrap_or(false);
-    let usecs = match trade.usecs {
-        Some(usecs) => usecs,
-        None if is_snapshot => 0,
-        None => anyhow::bail!("missing Rithmic live trade usecs"),
-    };
+    let usecs = trade.usecs.unwrap_or_default();
     ensure!(ssboe >= 0, "invalid Rithmic trade ssboe");
     ensure!(
         (0..1_000_000).contains(&usecs),
@@ -306,7 +302,7 @@ mod tests {
     }
 
     #[test]
-    fn missing_usecs_is_allowed_only_for_database_snapshots() {
+    fn missing_usecs_defaults_to_zero_for_every_snapshot_mode() {
         let trade = protocol::LastTrade {
             usecs: None,
             is_snapshot: Some(true),
@@ -329,7 +325,14 @@ mod tests {
                 ..trade.clone()
             })
             .unwrap();
-            assert!(decode_last_trade(&payload).is_err());
+            assert!(matches!(
+                decode_last_trade(&payload).unwrap(),
+                MarketDataEvent::LastTrade(LastTradeUpdate {
+                    timestamp: 1_784_243_600_000,
+                    is_snapshot: actual_is_snapshot,
+                    ..
+                }) if actual_is_snapshot == is_snapshot.unwrap_or(false)
+            ));
         }
     }
 

@@ -18,27 +18,28 @@ from src.core.journal import StrategyJournal
 
 # ── Helpers ──────────────────────────────────────────────────────
 
+
 def _sample_closed_trades() -> list[ClosedTrade]:
     return [
         ClosedTrade(
             entry_time=1_000_000,
             exit_time=2_000_000,
-            entry_price=100.0,
-            exit_price=110.0,
+            entry_price=Decimal("100.0"),
+            exit_price=Decimal("110.0"),
             side=PositionSide.LONG,
-            quantity=0.5,
-            fee=0.1,
-            pnl=5.0,
+            quantity=Decimal("0.5"),
+            fee=Decimal("0.1"),
+            pnl=Decimal("5.0"),
         ),
         ClosedTrade(
             entry_time=3_000_000,
             exit_time=4_000_000,
-            entry_price=200.0,
-            exit_price=190.0,
+            entry_price=Decimal("200.0"),
+            exit_price=Decimal("190.0"),
             side=PositionSide.SHORT,
-            quantity=0.3,
-            fee=0.2,
-            pnl=3.0,
+            quantity=Decimal("0.3"),
+            fee=Decimal("0.2"),
+            pnl=Decimal("3.0"),
         ),
     ]
 
@@ -70,6 +71,7 @@ def _sample_metrics() -> dict:
 
 # ── CSV trades ───────────────────────────────────────────────────
 
+
 class TestWriteCsvTrades:
     def test_writes_header_and_rows(self, tmp_path):
         path = tmp_path / "trades.csv"
@@ -80,8 +82,14 @@ class TestWriteCsvTrades:
             rows = list(reader)
 
         assert rows[0] == [
-            "entry_time", "exit_time", "side", "entry_price",
-            "exit_price", "quantity", "fee", "pnl",
+            "entry_time",
+            "exit_time",
+            "side",
+            "entry_price",
+            "exit_price",
+            "quantity",
+            "fee",
+            "pnl",
         ]
         assert len(rows) == 3  # header + 2 trades
         assert rows[1][2] == "LONG"
@@ -102,6 +110,7 @@ class TestWriteCsvTrades:
 
 # ── Equity curve ─────────────────────────────────────────────────
 
+
 class TestWriteEquityCurve:
     def test_writes_equity_data(self, tmp_path):
         path = tmp_path / "equity.csv"
@@ -119,6 +128,7 @@ class TestWriteEquityCurve:
 
 
 # ── Journal export ───────────────────────────────────────────────
+
 
 class TestWriteJournal:
     def test_writes_jsonl(self, tmp_path):
@@ -144,6 +154,7 @@ class TestWriteJournal:
 
 
 # ── Markdown report ──────────────────────────────────────────────
+
 
 class TestWriteMarkdownReport:
     def test_contains_all_sections(self, tmp_path):
@@ -226,6 +237,7 @@ class TestWriteMarkdownReport:
 
 
 # ── Default report config ────────────────────────────────────────
+
 
 class TestDefaultReportConfig:
     def test_defaults_are_true(self):

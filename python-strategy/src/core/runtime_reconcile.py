@@ -10,7 +10,7 @@ Implementation notes for the implementer:
   the implementer must add it (returns list[Position]).
 - adapter.get_position(product_id) returns Optional[Position].  If a position
   exists locally but the exchange reports None, treat exchange_quantity as 0.
-- balance comparison uses adapter.get_balance("USDT") vs account_service.get_balance().
+- balance comparison uses the composed balance asset vs account_service.get_balance().
 - quantity_drift_threshold and balance_drift_threshold are both Decimal;
   comparison is abs(local - exchange) > threshold.
 - When both local and exchange have positions, the drift is
@@ -25,11 +25,18 @@ from __future__ import annotations
 import logging
 import threading
 from decimal import Decimal
+from enum import Enum
 from typing import Any, Callable, ContextManager
 
 from sqlalchemy.orm import Session
 
 from src.core.audit_service import write_system_event
+
+
+class PositionAuthorityState(str, Enum):
+    UNCONFIRMED = "unconfirmed"
+    SAFE = "safe"
+    LATCHED = "latched"
 
 
 class RuntimeReconciliationJob:
@@ -45,6 +52,11 @@ class RuntimeReconciliationJob:
         adapter: Any,
         db_session_factory: Callable[[], ContextManager[Session]],
         *,
+        balance_asset: str | None,
+        on_balance_authority_failure: Callable[[str], None] | None = None,
+        on_position_authority_observation: (
+            Callable[[PositionAuthorityState, str], None] | None
+        ) = None,
         quantity_drift_threshold: Decimal,
         balance_drift_threshold: Decimal,
         product_ids: list[str] | tuple[str, ...] | None = None,
@@ -53,11 +65,21 @@ class RuntimeReconciliationJob:
         self._account_service = account_service
         self._adapter = adapter
         self._db_session_factory = db_session_factory
+        if balance_asset is not None and (
+            type(balance_asset) is not str or not balance_asset
+        ):
+            raise ValueError("runtime balance asset must be a non-empty string")
+        self._balance_asset = balance_asset
+        self._on_balance_authority_failure = on_balance_authority_failure
+        self._on_position_authority_observation = on_position_authority_observation
         self._quantity_drift_threshold = quantity_drift_threshold
         self._balance_drift_threshold = balance_drift_threshold
         self._product_ids = tuple(product_ids or ())
         self._logger = logger or logging.getLogger(__name__)
         self._run_lock = threading.Lock()
+        self._pending_position_drift_fingerprint: (
+            tuple[tuple[str, Decimal, Decimal], ...] | None
+        ) = None
 
     def run_once(self) -> dict:
         with self._run_lock:
@@ -113,6 +135,7 @@ class RuntimeReconciliationJob:
         local_positions = self._local_positions(result)
         if local_positions is None:
             self._record_unverified_exchange_positions(result)
+            self._observe_position_authority(result, failure_stage="local_read")
             self._check_balance(result)
             self._emit_events(result)
             return result
@@ -124,6 +147,7 @@ class RuntimeReconciliationJob:
         products.update(local_positions_by_product.keys())
         products.update(self._product_ids)
 
+        scoped_read_failed = False
         for product_id in sorted(products):
             local_product_positions = local_positions_by_product.get(product_id, [])
             exchange_product_positions = exchange_positions.get(product_id)
@@ -133,10 +157,9 @@ class RuntimeReconciliationJob:
                     exchange_product_positions = (
                         [exchange_position] if exchange_position is not None else []
                     )
-                except Exception as exc:
-                    result["errors"].append(
-                        {"scope": "positions", "reason": str(exc)}
-                    )
+                except Exception:
+                    self._record_position_error(result, "adapter_read")
+                    scoped_read_failed = True
                     continue
 
             local_quantity = self._signed_total(local_product_positions)
@@ -154,6 +177,10 @@ class RuntimeReconciliationJob:
                     }
                 )
 
+        self._observe_position_authority(
+            result,
+            failure_stage="adapter_read" if scoped_read_failed else None,
+        )
         self._check_balance(result)
         self._emit_events(result)
         return result
@@ -165,10 +192,8 @@ class RuntimeReconciliationJob:
                 continue
             try:
                 position = self._adapter.get_position(product_id)
-            except Exception as exc:
-                result["errors"].append(
-                    {"scope": "positions", "reason": str(exc)}
-                )
+            except Exception:
+                self._record_position_error(result, "adapter_read")
                 continue
             exchange_positions[product_id] = [position] if position is not None else []
 
@@ -185,8 +210,8 @@ class RuntimeReconciliationJob:
     def _local_positions(self, result: dict) -> list[Any] | None:
         try:
             return list(self._account_service.get_all_positions())
-        except Exception as exc:
-            result["errors"].append({"scope": "positions", "reason": str(exc)})
+        except Exception:
+            self._record_position_error(result, "local_read")
             return None
 
     def _exchange_positions_by_product(self, result: dict) -> dict[str, list[Any]]:
@@ -201,9 +226,51 @@ class RuntimeReconciliationJob:
                     product_id: [position] if position is not None else []
                     for product_id, position in positions.items()
                 }
-        except Exception as exc:
-            result["errors"].append({"scope": "positions", "reason": str(exc)})
+        except Exception:
+            self._record_position_error(result, "adapter_enumeration")
         return {}
+
+    @staticmethod
+    def _record_position_error(result: dict, stage: str) -> None:
+        result["errors"].append(
+            {
+                "scope": "positions",
+                "reason": "position_authority_unavailable",
+                "stage": stage,
+            }
+        )
+
+    def _observe_position_authority(
+        self,
+        result: dict,
+        *,
+        failure_stage: str | None,
+    ) -> None:
+        callback = self._on_position_authority_observation
+        if callback is None:
+            return
+        if failure_stage is not None:
+            callback(PositionAuthorityState.LATCHED, failure_stage)
+            return
+        fingerprint = tuple(
+            (
+                drift["product_id"],
+                drift["local_quantity"],
+                drift["exchange_quantity"],
+            )
+            for drift in result["position_drifts"]
+        )
+        if not fingerprint:
+            self._pending_position_drift_fingerprint = None
+            callback(PositionAuthorityState.SAFE, "verified")
+            return
+        state = (
+            PositionAuthorityState.LATCHED
+            if fingerprint == self._pending_position_drift_fingerprint
+            else PositionAuthorityState.UNCONFIRMED
+        )
+        self._pending_position_drift_fingerprint = fingerprint
+        callback(state, "quantity_drift")
 
     @staticmethod
     def _positions_by_product(positions: list[Any]) -> dict[str, list[Any]]:
@@ -213,18 +280,28 @@ class RuntimeReconciliationJob:
         return grouped
 
     def _signed_total(self, positions: list[Any]) -> Decimal:
-        return sum((self._signed_quantity(position) for position in positions), Decimal("0"))
+        return sum(
+            (self._signed_quantity(position) for position in positions), Decimal("0")
+        )
 
     @staticmethod
     def _signed_quantity(position: Any) -> Decimal:
         quantity = position.quantity
-        decimal_quantity = quantity if isinstance(quantity, Decimal) else Decimal(str(quantity))
+        decimal_quantity = (
+            quantity if isinstance(quantity, Decimal) else Decimal(str(quantity))
+        )
         side = getattr(position, "side", None)
         side_value = getattr(side, "value", side)
-        return -decimal_quantity if str(side_value).upper() == "SHORT" else decimal_quantity
+        return (
+            -decimal_quantity
+            if str(side_value).upper() == "SHORT"
+            else decimal_quantity
+        )
 
     @staticmethod
-    def _drift_strategy_id(local_positions: list[Any], exchange_positions: list[Any]) -> str:
+    def _drift_strategy_id(
+        local_positions: list[Any], exchange_positions: list[Any]
+    ) -> str:
         if len(local_positions) == 1:
             return str(local_positions[0].strategy_id)
         if len(local_positions) > 1:
@@ -234,20 +311,67 @@ class RuntimeReconciliationJob:
         return "unknown"
 
     def _check_balance(self, result: dict) -> None:
+        if self._balance_asset is None:
+            return
+        local_balance: Decimal | None = None
         try:
             local_balance = self._account_service.get_balance()
-            exchange_balance = self._adapter.get_balance("USDT")
-            if not isinstance(local_balance, Decimal):
-                local_balance = Decimal(str(local_balance))
-            if not isinstance(exchange_balance, Decimal):
-                exchange_balance = Decimal(str(exchange_balance))
-            if abs(local_balance - exchange_balance) > self._balance_drift_threshold:
-                result["balance_drift"] = {
-                    "local": local_balance,
-                    "exchange": exchange_balance,
-                }
-        except Exception as exc:
-            result["errors"].append({"scope": "balance", "reason": str(exc)})
+            if type(local_balance) is not Decimal or not local_balance.is_finite():
+                raise ValueError("local balance invalid")
+        except Exception:
+            local_balance = None
+            self._record_balance_error(result, "local_read", authority_failure=False)
+
+        try:
+            exchange_balance = self._adapter.get_balance(self._balance_asset)
+        except Exception:
+            self._record_balance_error(result, "adapter_read", authority_failure=True)
+            return
+        if (
+            type(exchange_balance) is not Decimal
+            or not exchange_balance.is_finite()
+            or exchange_balance < 0
+        ):
+            self._record_balance_error(
+                result,
+                "value_validation",
+                authority_failure=True,
+            )
+            return
+        try:
+            self._account_service.replace_generic_balance(exchange_balance)
+        except Exception:
+            self._record_balance_error(
+                result,
+                "account_persistence",
+                authority_failure=True,
+            )
+            return
+        if (
+            local_balance is not None
+            and abs(local_balance - exchange_balance) > self._balance_drift_threshold
+        ):
+            result["balance_drift"] = {
+                "local": local_balance,
+                "exchange": exchange_balance,
+            }
+
+    def _record_balance_error(
+        self,
+        result: dict,
+        stage: str,
+        *,
+        authority_failure: bool,
+    ) -> None:
+        result["errors"].append(
+            {
+                "scope": "balance",
+                "reason": "balance_authority_unavailable",
+                "stage": stage,
+            }
+        )
+        if authority_failure and self._on_balance_authority_failure is not None:
+            self._on_balance_authority_failure(stage)
 
     def _emit_events(self, result: dict) -> None:
         if result["position_drifts"] or result["balance_drift"] is not None:

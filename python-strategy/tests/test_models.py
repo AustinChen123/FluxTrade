@@ -14,7 +14,13 @@ from decimal import Decimal
 from pydantic import ValidationError
 
 from src.core.models import (
-    SignalType, Candlestick, OrderStatus, Position, Trade
+    Candlestick,
+    OrderSide,
+    OrderStatus,
+    Position,
+    PositionSide,
+    SignalType,
+    Trade,
 )
 
 
@@ -35,8 +41,8 @@ class TestProductIdValidation:
                 product_id=product_id,
                 price=Decimal("100"),
                 quantity=Decimal("1"),
-                side="buy",
-                timestamp=1000
+                side=OrderSide.BUY,
+                timestamp=1000,
             )
             assert trade.product_id == product_id
 
@@ -48,8 +54,8 @@ class TestProductIdValidation:
                 product_id="BTCUSDT-PERP",
                 price=Decimal("100"),
                 quantity=Decimal("1"),
-                side="buy",
-                timestamp=1000
+                side=OrderSide.BUY,
+                timestamp=1000,
             )
         assert "product_id" in str(exc_info.value)
 
@@ -61,8 +67,8 @@ class TestProductIdValidation:
                 product_id="BINANCE:BTCUSDT",
                 price=Decimal("100"),
                 quantity=Decimal("1"),
-                side="buy",
-                timestamp=1000
+                side=OrderSide.BUY,
+                timestamp=1000,
             )
         assert "product_id" in str(exc_info.value)
 
@@ -74,8 +80,8 @@ class TestProductIdValidation:
                 product_id="binance:btcusdt-perp",
                 price=Decimal("100"),
                 quantity=Decimal("1"),
-                side="buy",
-                timestamp=1000
+                side=OrderSide.BUY,
+                timestamp=1000,
             )
         assert "product_id" in str(exc_info.value)
 
@@ -92,7 +98,7 @@ class TestProductIdValidation:
                 product_id=product_id,
                 price=Decimal("20000"),
                 quantity=Decimal("1"),
-                side="buy",
+                side=OrderSide.BUY,
                 timestamp=1000,
             ),
             candlestick_factory(product_id=product_id),
@@ -113,34 +119,38 @@ class TestTradeModel:
             product_id="BINANCE:BTCUSDT-PERP",
             price=Decimal("42000.50"),
             quantity=Decimal("0.001"),
-            side="buy",
-            timestamp=1704067200000
+            side=OrderSide.BUY,
+            timestamp=1704067200000,
         )
         assert trade.price == Decimal("42000.50")
         assert trade.quantity == Decimal("0.001")
 
     def test_trade_creation_with_strings(self):
         """Trade should coerce string values to Decimal."""
-        trade = Trade(
-            id="trade_1",
-            product_id="BINANCE:BTCUSDT-PERP",
-            price="42000.50",
-            quantity="0.001",
-            side="buy",
-            timestamp=1704067200000
+        trade = Trade.model_validate(
+            {
+                "id": "trade_1",
+                "product_id": "BINANCE:BTCUSDT-PERP",
+                "price": "42000.50",
+                "quantity": "0.001",
+                "side": "buy",
+                "timestamp": 1704067200000,
+            }
         )
         assert trade.price == Decimal("42000.50")
         assert trade.quantity == Decimal("0.001")
 
     def test_trade_creation_with_floats(self):
         """Trade should accept float values (coerced to Decimal)."""
-        trade = Trade(
-            id="trade_1",
-            product_id="BINANCE:BTCUSDT-PERP",
-            price=42000.5,
-            quantity=0.001,
-            side="buy",
-            timestamp=1704067200000
+        trade = Trade.model_validate(
+            {
+                "id": "trade_1",
+                "product_id": "BINANCE:BTCUSDT-PERP",
+                "price": 42000.5,
+                "quantity": 0.001,
+                "side": "buy",
+                "timestamp": 1704067200000,
+            }
         )
         assert isinstance(trade.price, Decimal)
         assert isinstance(trade.quantity, Decimal)
@@ -148,7 +158,7 @@ class TestTradeModel:
     def test_trade_required_fields(self):
         """Trade should require all fields."""
         with pytest.raises(ValidationError):
-            Trade(id="1", product_id="BINANCE:BTCUSDT-PERP")
+            Trade.model_validate({"id": "1", "product_id": "BINANCE:BTCUSDT-PERP"})
 
 
 class TestCandlestickModel:
@@ -178,15 +188,17 @@ class TestCandlestickModel:
 
     def test_candlestick_with_string_decimals(self):
         """Candlestick should accept string decimal values."""
-        candle = Candlestick(
-            product_id="BINANCE:BTCUSDT-PERP",
-            timeframe="1h",
-            timestamp=1704067200000,
-            open="42000.00",
-            high="42500.00",
-            low="41500.00",
-            close="42200.00",
-            volume="1000.50"
+        candle = Candlestick.model_validate(
+            {
+                "product_id": "BINANCE:BTCUSDT-PERP",
+                "timeframe": "1h",
+                "timestamp": 1704067200000,
+                "open": "42000.00",
+                "high": "42500.00",
+                "low": "41500.00",
+                "close": "42200.00",
+                "volume": "1000.50",
+            }
         )
         assert candle.open == Decimal("42000.00")
         assert candle.volume == Decimal("1000.50")
@@ -325,10 +337,10 @@ class TestPositionModel:
             Position(
                 strategy_id="test",
                 product_id="invalid",
-                side="LONG",
+                side=PositionSide.LONG,
                 quantity=Decimal("1"),
                 entry_price=Decimal("100"),
-                unrealized_pnl=Decimal("0")
+                unrealized_pnl=Decimal("0"),
             )
 
 
@@ -364,8 +376,8 @@ class TestModelSerialization:
             product_id="BINANCE:BTCUSDT-PERP",
             price=Decimal("42000.50"),
             quantity=Decimal("0.001"),
-            side="buy",
-            timestamp=1704067200000
+            side=OrderSide.BUY,
+            timestamp=1704067200000,
         )
         data = trade.model_dump()
         assert data["id"] == "trade_1"

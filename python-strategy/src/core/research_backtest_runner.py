@@ -13,7 +13,7 @@ import uuid
 import inspect
 from dataclasses import dataclass, replace
 from decimal import Decimal
-from typing import TYPE_CHECKING, Any, Dict, Iterable, Optional, Sequence, cast
+from typing import TYPE_CHECKING, Any, Iterable, Mapping, Optional, Sequence, cast
 
 from src.core.adapters.simulated import SimulatedAdapter
 from src.core.analytics import (
@@ -97,7 +97,7 @@ class ResearchBacktestRunner:
         timeframe: str,
         initial_balance: float = 10000.0,
         data_source: Optional[IDataSource] = None,
-        fee_config: Optional[Dict[str, float]] = None,
+        fee_config: Mapping[str, Decimal | float] | None = None,
         max_drawdown_limit: Optional[float] = None,
         balance_check_interval: int = 0,
         precision_codec: PrecisionCodec | None = None,
@@ -152,12 +152,10 @@ class ResearchBacktestRunner:
         }
         initial_equity = Decimal(str(self.initial_balance))
         peak_equity_by_strategy = {
-            strategy.strategy_id: initial_equity
-            for strategy in self._strategies
+            strategy.strategy_id: initial_equity for strategy in self._strategies
         }
         max_drawdown_by_strategy = {
-            strategy.strategy_id: Decimal("0")
-            for strategy in self._strategies
+            strategy.strategy_id: Decimal("0") for strategy in self._strategies
         }
         portfolio_peak_equity = initial_equity
         portfolio_max_drawdown = Decimal("0")
@@ -218,7 +216,9 @@ class ResearchBacktestRunner:
                 decision_context = None
                 if context_support[strategy.strategy_id]:
                     decision_context = context
-                signals = self._signals_from_strategy(strategy, candle, decision_context)
+                signals = self._signals_from_strategy(
+                    strategy, candle, decision_context
+                )
                 for signal in signals:
                     if signal.type == SignalType.NO_SIGNAL:
                         continue
@@ -335,20 +335,14 @@ class ResearchBacktestRunner:
             "monthly_returns": metrics.get("monthly_returns", {}),
             "daily_return_moments": daily_return_moments,
             "equity_sample_count": daily_return_metrics["equity_sample_count"],
-            "yearly_mark_to_market_returns": daily_return_metrics[
-                "yearly_returns"
-            ],
-            "annualized_sharpe": annualized_sharpe_from_moments(
-                daily_return_moments
-            ),
+            "yearly_mark_to_market_returns": daily_return_metrics["yearly_returns"],
+            "annualized_sharpe": annualized_sharpe_from_moments(daily_return_moments),
             "trade_pnl_quality": metrics.get("trade_sharpe", Decimal("0")),
             "closed_trades": metrics.get("closed_trades", []),
             "raw_trades": trades,
             "raw_trade_count": len(trades),
             "candle_count": candle_count,
-            "invalid_order_intent_count": len(
-                self._invalid_order_intent_rejections
-            ),
+            "invalid_order_intent_count": len(self._invalid_order_intent_rejections),
             "invalid_order_intent_rejections": tuple(
                 self._invalid_order_intent_rejections
             ),
@@ -407,18 +401,28 @@ class ResearchBacktestRunner:
         return [adapter.prepare_scaled_candle(candle) for candle in candles]
 
     @staticmethod
-    def _validate_prepared_scaled_candle(candle: Candlestick, prepared_candle: Any) -> None:
+    def _validate_prepared_scaled_candle(
+        candle: Candlestick, prepared_candle: Any
+    ) -> None:
         if getattr(prepared_candle, "product_id", None) != candle.product_id:
-            raise ValueError("prepared_scaled_candles product_id must match replay candles")
+            raise ValueError(
+                "prepared_scaled_candles product_id must match replay candles"
+            )
         if getattr(prepared_candle, "timeframe", None) != candle.timeframe:
-            raise ValueError("prepared_scaled_candles timeframe must match replay candles")
+            raise ValueError(
+                "prepared_scaled_candles timeframe must match replay candles"
+            )
         if getattr(prepared_candle, "timestamp", None) != candle.timestamp:
-            raise ValueError("prepared_scaled_candles timestamp must match replay candles")
+            raise ValueError(
+                "prepared_scaled_candles timestamp must match replay candles"
+            )
 
     def _stop_drawdown_amount(self) -> Optional[Decimal]:
         if self.max_drawdown_limit is None:
             return None
-        return Decimal(str(self.initial_balance)) * Decimal(str(self.max_drawdown_limit))
+        return Decimal(str(self.initial_balance)) * Decimal(
+            str(self.max_drawdown_limit)
+        )
 
     def _strategy_context(
         self,
@@ -483,7 +487,9 @@ class ResearchBacktestRunner:
                 continue
             used = Decimal("0")
             if adapter.supports_strategy_positions:
-                position = adapter.get_position(candle.product_id, strategy_id=strategy.strategy_id)
+                position = adapter.get_position(
+                    candle.product_id, strategy_id=strategy.strategy_id
+                )
                 if position is not None:
                     used = calculate_required_capital(
                         position.quantity,
@@ -523,7 +529,9 @@ class ResearchBacktestRunner:
         elif isinstance(result, list):
             signals = result
         else:
-            raise TypeError("strategy.on_candle() must return None, Signal, or list[Signal]")
+            raise TypeError(
+                "strategy.on_candle() must return None, Signal, or list[Signal]"
+            )
         return [signal for signal in signals if signal.type != SignalType.NO_SIGNAL]
 
     def _capital_rejects_entry(
@@ -661,7 +669,9 @@ class ResearchBacktestRunner:
             filled_price=Decimal("0"),
         )
 
-    def _quantity_for_signal(self, signal: Signal, adapter: SimulatedAdapter) -> Decimal:
+    def _quantity_for_signal(
+        self, signal: Signal, adapter: SimulatedAdapter
+    ) -> Decimal:
         if signal.type in (SignalType.EXIT_LONG, SignalType.EXIT_SHORT):
             position = self._position_for_exit_signal(signal, adapter)
             if position is not None and position.quantity > 0:
@@ -747,7 +757,9 @@ class ResearchBacktestRunner:
             return resolved_intent.limit_price
         return candle.close
 
-    def _fills_to_trades(self, fills: list[dict], candle: Candlestick) -> list[ResearchTrade]:
+    def _fills_to_trades(
+        self, fills: list[dict], candle: Candlestick
+    ) -> list[ResearchTrade]:
         trades: list[ResearchTrade] = []
         for fill in fills:
             order = fill["order"]

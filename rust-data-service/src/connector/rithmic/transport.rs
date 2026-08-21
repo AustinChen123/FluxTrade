@@ -16,6 +16,121 @@ use tracing::{info, warn};
 
 type RithmicSocket = WebSocketStream<MaybeTlsStream<TcpStream>>;
 
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum PayloadFailureKind {
+    HandlerLockPayload,
+    HandlerLockPreparation,
+    ResetQueue,
+    FrontMonthValidation,
+    RolloverRequired,
+    MarketDecode,
+    MinuteBarInvariant,
+    SubscriptionRejected,
+    CandleQueueFull,
+    CandleQueueClosed,
+}
+
+#[derive(Debug)]
+pub(crate) struct PayloadFailure {
+    kind: PayloadFailureKind,
+    template_id: Option<i32>,
+    payload_len: Option<usize>,
+}
+
+impl PayloadFailure {
+    pub(crate) fn new(kind: PayloadFailureKind) -> Self {
+        Self {
+            kind,
+            template_id: None,
+            payload_len: None,
+        }
+    }
+
+    pub(crate) fn attach_transport(&mut self, template_id: Option<i32>, payload_len: usize) {
+        self.template_id = template_id;
+        self.payload_len = Some(payload_len);
+    }
+
+    pub(crate) fn operation(&self) -> &'static str {
+        use PayloadFailureKind::*;
+        match self.kind {
+            HandlerLockPreparation | ResetQueue => "prepare_connection",
+            _ => "handle_payload",
+        }
+    }
+    pub(crate) fn stage(&self) -> &'static str {
+        use PayloadFailureKind::*;
+        match self.kind {
+            HandlerLockPayload | HandlerLockPreparation => "handler_lock",
+            ResetQueue => "startup_reset",
+            FrontMonthValidation | RolloverRequired => "front_month",
+            MarketDecode => "market_decode",
+            MinuteBarInvariant => "minute_bar",
+            SubscriptionRejected => "subscription",
+            CandleQueueFull | CandleQueueClosed => "candle_handoff",
+        }
+    }
+    pub(crate) fn stable_error_code(&self) -> &'static str {
+        use PayloadFailureKind::*;
+        match self.kind {
+            HandlerLockPayload | HandlerLockPreparation => "handler_lock_poisoned",
+            ResetQueue => "reset_queue_unavailable",
+            FrontMonthValidation => "front_month_validation_failed",
+            RolloverRequired => "rollover_required",
+            MarketDecode => "malformed_market_payload",
+            MinuteBarInvariant => "minute_bar_invariant",
+            SubscriptionRejected => "subscription_rejected",
+            CandleQueueFull => "candle_queue_full",
+            CandleQueueClosed => "candle_queue_closed",
+        }
+    }
+    pub(crate) fn disposition(&self) -> &'static str {
+        use PayloadFailureKind::*;
+        match self.kind {
+            FrontMonthValidation | RolloverRequired | SubscriptionRejected => "controlled_halt",
+            _ => "fatal_service_exit",
+        }
+    }
+    pub(crate) fn state_effect(&self) -> &'static str {
+        use PayloadFailureKind::*;
+        match self.kind {
+            HandlerLockPayload => "mutation_unknown",
+            HandlerLockPreparation => "preparation_state_unknown",
+            ResetQueue => "builder_reset_downstream_not_notified",
+            CandleQueueFull | CandleQueueClosed => "builder_advanced_candle_not_handed_off",
+            _ => "none",
+        }
+    }
+    pub(crate) fn safe_cause(&self) -> &'static str {
+        use PayloadFailureKind::*;
+        match self.kind {
+            HandlerLockPayload | HandlerLockPreparation => "live handler lock unavailable",
+            ResetQueue => "aggregation reset handoff failed",
+            FrontMonthValidation => "front-month validation failed",
+            RolloverRequired => "configured contract is not front month",
+            MarketDecode => "market payload validation failed",
+            MinuteBarInvariant => "minute-bar invariant failed",
+            SubscriptionRejected => "market-data subscription rejected",
+            CandleQueueFull => "candle forwarding queue full",
+            CandleQueueClosed => "candle forwarding queue closed",
+        }
+    }
+    pub(crate) fn template_id(&self) -> Option<i32> {
+        self.template_id
+    }
+    pub(crate) fn payload_len(&self) -> Option<usize> {
+        self.payload_len
+    }
+}
+
+impl std::fmt::Display for PayloadFailure {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(formatter, "component=rithmic task=live_market_data operation={} stage={} template_id={} payload_len={} stable_error_code={} disposition={} state_effect={} safe_cause={}", self.operation(), self.stage(), self.template_id.map_or_else(|| "unknown".to_string(), |value| value.to_string()), self.payload_len.map_or_else(|| "unknown".to_string(), |value| value.to_string()), self.stable_error_code(), self.disposition(), self.state_effect(), self.safe_cause())
+    }
+}
+
+impl std::error::Error for PayloadFailure {}
+
 #[derive(Debug, PartialEq)]
 enum IncomingMessage {
     Payload(Vec<u8>),
@@ -148,14 +263,19 @@ where
 {
     let payload_len = payload.len();
     let template_id = codec::template_id(&payload).ok();
-    handle_payload(payload).with_context(|| match template_id {
-        Some(template_id) => format!(
-            "Rithmic payload handler failed: template_id={template_id} payload_len={payload_len}"
-        ),
-        None => {
-            format!("Rithmic payload handler failed: template_id=unknown payload_len={payload_len}")
+    match handle_payload(payload) {
+        Ok(()) => Ok(()),
+        Err(mut error) => {
+            if let Some(failure) = error.downcast_mut::<PayloadFailure>() {
+                failure.attach_transport(template_id, payload_len);
+                return Err(error);
+            }
+            Err(error.context(format!(
+                "Rithmic payload handler failed: template_id={} payload_len={payload_len}",
+                template_id.map_or_else(|| "unknown".to_string(), |value| value.to_string())
+            )))
         }
-    })
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -697,7 +817,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn active_reject_reaches_handler_and_connection_continues() {
+    async fn handler_failure_is_terminal_and_stops_following_payload() {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let url = format!("ws://{}", listener.local_addr().unwrap());
         let server = tokio::spawn(async move {
@@ -731,49 +851,52 @@ mod tests {
                 vec![],
                 |_| Ok(()),
                 move |payload| {
-                    handler_templates
-                        .lock()
-                        .unwrap()
-                        .push(codec::template_id(&payload)?);
+                    let template_id = codec::template_id(&payload)?;
+                    handler_templates.lock().unwrap().push(template_id);
+                    if template_id == 75 {
+                        return Err(
+                            PayloadFailure::new(PayloadFailureKind::SubscriptionRejected).into(),
+                        );
+                    }
                     Ok(())
                 },
             )
             .await
         });
 
-        timeout(Duration::from_secs(1), async {
-            while templates.lock().unwrap().len() < 2 {
-                tokio::time::sleep(Duration::from_millis(1)).await;
-            }
-        })
-        .await
-        .unwrap();
-        assert_eq!(*templates.lock().unwrap(), [75, 12]);
-
-        supervisor.abort();
+        let error = timeout(Duration::from_secs(1), supervisor)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap_err();
+        assert_eq!(
+            error
+                .downcast_ref::<PayloadFailure>()
+                .unwrap()
+                .template_id(),
+            Some(75)
+        );
+        assert_eq!(*templates.lock().unwrap(), [75]);
         server.await.unwrap();
     }
 
     #[test]
-    fn payload_handler_failure_reports_safe_identity_and_preserves_source_chain() {
+    fn payload_handler_failure_adds_safe_envelope_without_provider_text() {
         let payload = codec::encode(&protocol::Reject {
             template_id: 75,
             user_msg: vec!["do-not-log-this".to_string()],
             rp_code: vec!["also-sensitive".to_string()],
         })
         .unwrap();
-        let mut handler = |_| {
-            Err(anyhow::anyhow!("missing Rithmic trade usecs")
-                .context("failed to decode LastTrade"))
-        };
+        let mut handler = |_| Err(PayloadFailure::new(PayloadFailureKind::MarketDecode).into());
 
         let error = handle_payload_with_diagnostics(payload, &mut handler).unwrap_err();
-        let formatted = format!("{error:#}");
-
-        assert!(formatted.contains("template_id=75"));
-        assert!(formatted.contains("payload_len="));
-        assert!(formatted.contains("failed to decode LastTrade"));
-        assert!(formatted.contains("missing Rithmic trade usecs"));
+        let failure = error.downcast_ref::<PayloadFailure>().unwrap();
+        assert_eq!(failure.template_id(), Some(75));
+        assert!(failure.payload_len().unwrap() > 0);
+        assert_eq!(failure.stage(), "market_decode");
+        assert_eq!(failure.state_effect(), "none");
+        let formatted = failure.to_string();
         assert!(!formatted.contains("do-not-log-this"));
         assert!(!formatted.contains("also-sensitive"));
     }

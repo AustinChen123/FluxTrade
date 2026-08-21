@@ -1,10 +1,37 @@
 from dataclasses import dataclass
 from datetime import UTC, date, datetime, timedelta
-from decimal import Decimal
-from typing import Dict, Iterable, List, Sequence
+from decimal import Decimal, InvalidOperation
+from fractions import Fraction
+from typing import Dict, Iterable, Protocol, Sequence
 import pandas as pd
 import numpy as np
-from src.core.models import Trade, PositionSide
+from src.core.decimal_math import (
+    decimal_from_fraction,
+    decimal_from_fraction_significant,
+    exact_decimal_add,
+    exact_decimal_subtract,
+    exact_decimal_subtract_preserving_zero_scale,
+)
+from src.core.models import PositionSide
+
+
+InitialBalanceInput = Decimal | int | float | str
+_INVALID_INITIAL_BALANCE = "initial_balance must be a positive finite decimal value"
+
+
+def _normalize_initial_balance(value: object) -> Decimal:
+    if type(value) is Decimal:
+        balance = value
+    elif type(value) in (int, float, str):
+        try:
+            balance = Decimal(str(value))
+        except (InvalidOperation, ValueError):
+            raise ValueError(_INVALID_INITIAL_BALANCE) from None
+    else:
+        raise ValueError(_INVALID_INITIAL_BALANCE)
+    if not balance.is_finite() or balance <= 0:
+        raise ValueError(_INVALID_INITIAL_BALANCE)
+    return balance
 
 
 @dataclass(slots=True)
@@ -19,6 +46,20 @@ class ClosedTrade:
     quantity: Decimal
     pnl: Decimal
     fee: Decimal = Decimal("0")
+
+
+class _MetricsTrade(Protocol):
+    @property
+    def timestamp(self) -> int: ...
+
+    @property
+    def side(self) -> str: ...
+
+    @property
+    def price(self) -> Decimal: ...
+
+    @property
+    def quantity(self) -> Decimal: ...
 
 
 def utc_daily_return_metrics(
@@ -69,8 +110,7 @@ def utc_daily_return_metrics(
         **raw_return_moments(returns),
         "equity_sample_count": len(equity_samples),
         "yearly_returns": {
-            year: growth - Decimal("1")
-            for year, growth in yearly_growth.items()
+            year: growth - Decimal("1") for year, growth in yearly_growth.items()
         },
     }
 
@@ -108,21 +148,19 @@ def annualized_sharpe_from_moments(
     total = Decimal(moments["sum"])
     sum_squares = Decimal(moments["sum_squares"])
     mean = total / Decimal(count)
-    sample_variance = (
-        sum_squares - total * total / Decimal(count)
-    ) / Decimal(count - 1)
+    sample_variance = (sum_squares - total * total / Decimal(count)) / Decimal(
+        count - 1
+    )
     if sample_variance <= 0:
         return Decimal("0")
     return mean / sample_variance.sqrt() * Decimal(periods_per_year).sqrt()
 
 
 def _build_closed_trades(
-    trade_history: List[Trade],
+    trade_history: Sequence[_MetricsTrade],
     *,
     contract_multiplier: Decimal = Decimal("1"),
-) -> tuple[
-    list[ClosedTrade], list[float], list[float], Decimal
-]:
+) -> tuple[list[ClosedTrade], list[float], list[float], Decimal]:
     """Pair raw trades into closed round-trips using FIFO netting.
 
     Returns (closed_trades, trade_pnls, equity_curve, total_pnl).
@@ -135,55 +173,59 @@ def _build_closed_trades(
     for t in trade_history:
         fill_sequence = getattr(t, "fill_sequence", None)
         has_fill_sequence.append(fill_sequence is not None)
-        trades.append({
-            "timestamp": t.timestamp,
-            "side": t.side,
-            "price": t.price,
-            "quantity": t.quantity,
-            "fee": getattr(t, "fee", Decimal("0")) or Decimal("0"),
-            "fill_sequence": fill_sequence,
-        })
+        trades.append(
+            {
+                "timestamp": t.timestamp,
+                "side": t.side,
+                "price": t.price,
+                "quantity": t.quantity,
+                "fee": getattr(t, "fee", Decimal("0")) or Decimal("0"),
+                "fill_sequence": fill_sequence,
+            }
+        )
 
     if any(has_fill_sequence) and not all(has_fill_sequence):
         raise ValueError("fill_sequence must be present for every trade or none")
     if all(has_fill_sequence):
         fill_sequences = [trade["fill_sequence"] for trade in trades]
         if any(
-            isinstance(sequence, bool)
-            or not isinstance(sequence, int)
-            or sequence < 0
+            isinstance(sequence, bool) or not isinstance(sequence, int) or sequence < 0
             for sequence in fill_sequences
         ):
             raise ValueError("fill_sequence must be a non-negative integer")
         if len(set(fill_sequences)) != len(fill_sequences):
             raise ValueError("fill_sequence must be unique")
-        trades.sort(
-            key=lambda trade: (trade["timestamp"], trade["fill_sequence"])
-        )
+        trades.sort(key=lambda trade: (trade["timestamp"], trade["fill_sequence"]))
     else:
         trades.sort(key=lambda trade: trade["timestamp"])
 
-    _ZERO = Decimal("0")
-    total_pnl = _ZERO
-    net_qty = _ZERO
-    avg_entry_price = _ZERO
-    open_fee = _ZERO
+    zero = Fraction(0)
+    multiplier = Fraction(contract_multiplier)
+    total_pnl = zero
+    net_qty = zero
+    avg_entry_price = zero
+    avg_entry_price_output = Decimal("0")
+    open_fee = zero
     entry_time = 0
+    lifecycle_pnl = zero
+    lifecycle_fee = zero
+    emitted_lifecycle_pnl = Decimal(0)
+    emitted_lifecycle_fee = Decimal(0)
 
     equity_curve: list[float] = [0.0]
     trade_pnls: list[float] = []
     closed_trades: list[ClosedTrade] = []
 
     for row in trades:
-        qty: Decimal = row["quantity"]
-        price: Decimal = row["price"]
+        qty = Fraction(row["quantity"])
+        price_decimal: Decimal = row["price"]
+        price = Fraction(price_decimal)
         side = row["side"]
-        fee: Decimal = row["fee"]
+        fee = Fraction(row["fee"])
         timestamp = int(row["timestamp"])
 
         signed_qty = qty if side.lower() == "buy" else -qty
-        if fee:
-            total_pnl -= fee
+        total_pnl -= fee
 
         is_reducing = (net_qty > 0 and signed_qty < 0) or (
             net_qty < 0 and signed_qty > 0
@@ -192,34 +234,66 @@ def _build_closed_trades(
         if is_reducing:
             previous_qty = abs(net_qty)
             qty_closing = min(abs(net_qty), abs(signed_qty))
-            entry_fee = (
-                open_fee * qty_closing / previous_qty
-                if previous_qty > _ZERO
-                else _ZERO
-            )
+            entry_fee = open_fee * qty_closing / previous_qty
             exit_fee = fee * qty_closing / abs(signed_qty)
 
             if net_qty > 0:
-                gross_pnl = (price - avg_entry_price) * qty_closing * contract_multiplier
+                gross_pnl = (price - avg_entry_price) * qty_closing * multiplier
                 trade_side = PositionSide.LONG
             else:
-                gross_pnl = (avg_entry_price - price) * qty_closing * contract_multiplier
+                gross_pnl = (avg_entry_price - price) * qty_closing * multiplier
                 trade_side = PositionSide.SHORT
 
             pnl = gross_pnl - entry_fee - exit_fee
             total_pnl += gross_pnl
-            trade_pnls.append(float(pnl))
+            closed_fee = entry_fee + exit_fee
+            lifecycle_pnl += pnl
+            lifecycle_fee += closed_fee
+            pnl_output = decimal_from_fraction_significant(pnl, precision=28)
+            fee_output = decimal_from_fraction_significant(closed_fee, precision=28)
 
-            closed_trades.append(ClosedTrade(
-                entry_time=entry_time,
-                exit_time=timestamp,
-                entry_price=avg_entry_price,
-                exit_price=price,
-                side=trade_side,
-                quantity=qty_closing,
-                pnl=pnl,
-                fee=entry_fee + exit_fee,
-            ))
+            if qty_closing == previous_qty:
+                pnl_output = exact_decimal_subtract(
+                    decimal_from_fraction_significant(lifecycle_pnl, precision=28),
+                    emitted_lifecycle_pnl,
+                )
+                fee_output = exact_decimal_subtract(
+                    decimal_from_fraction_significant(lifecycle_fee, precision=28),
+                    emitted_lifecycle_fee,
+                )
+
+            trade_pnls.append(float(pnl_output))
+
+            closed_trades.append(
+                ClosedTrade(
+                    entry_time=entry_time,
+                    exit_time=timestamp,
+                    entry_price=avg_entry_price_output,
+                    exit_price=price_decimal,
+                    side=trade_side,
+                    quantity=decimal_from_fraction_significant(
+                        qty_closing,
+                        precision=28,
+                    ),
+                    pnl=pnl_output,
+                    fee=fee_output,
+                )
+            )
+
+            if qty_closing == previous_qty:
+                lifecycle_pnl = zero
+                lifecycle_fee = zero
+                emitted_lifecycle_pnl = Decimal(0)
+                emitted_lifecycle_fee = Decimal(0)
+            else:
+                emitted_lifecycle_pnl = exact_decimal_add(
+                    emitted_lifecycle_pnl,
+                    pnl_output,
+                )
+                emitted_lifecycle_fee = exact_decimal_add(
+                    emitted_lifecycle_fee,
+                    fee_output,
+                )
 
             remaining_after_close = abs(signed_qty) - qty_closing
             open_fee -= entry_fee
@@ -234,30 +308,46 @@ def _build_closed_trades(
                     remaining_after_close if signed_qty > 0 else -remaining_after_close
                 )
                 avg_entry_price = price
+                avg_entry_price_output = price_decimal
                 entry_time = timestamp
                 open_fee = fee - exit_fee
         else:
             if net_qty == 0:
                 entry_time = timestamp
-                open_fee = _ZERO
+                open_fee = zero
             total_cost = (abs(net_qty) * avg_entry_price) + (abs(signed_qty) * price)
             new_qty = abs(net_qty) + abs(signed_qty)
 
             if new_qty > 0:
                 avg_entry_price = total_cost / new_qty
+                avg_entry_price_output = (
+                    price_decimal
+                    if net_qty == 0
+                    else decimal_from_fraction_significant(
+                        avg_entry_price,
+                        precision=28,
+                    )
+                )
 
             net_qty += signed_qty
             open_fee += fee
 
-        equity_curve.append(float(total_pnl))
+        equity_curve.append(
+            float(decimal_from_fraction_significant(total_pnl, precision=28))
+        )
 
-    return closed_trades, trade_pnls, equity_curve, total_pnl
+    return (
+        closed_trades,
+        trade_pnls,
+        equity_curve,
+        decimal_from_fraction_significant(total_pnl, precision=28),
+    )
 
 
 def calculate_metrics(
-    trade_history: List[Trade],
+    trade_history: Sequence[_MetricsTrade],
     *,
-    initial_balance: float = 10000.0,
+    initial_balance: InitialBalanceInput = Decimal("10000"),
     risk_free_rate: float = 0.0,
     periods_per_year: int = 365,
     contract_multiplier: Decimal = Decimal("1"),
@@ -276,6 +366,7 @@ def calculate_metrics(
         max_consecutive_losses, max_consecutive_win_amount,
         max_consecutive_loss_amount, gross_profit, gross_loss
     """
+    initial_balance_decimal = _normalize_initial_balance(initial_balance)
     if not trade_history:
         result = {
             "closed_trade_count": 0,
@@ -288,7 +379,7 @@ def calculate_metrics(
             result.update(
                 _mark_to_market_drawdown_metrics(
                     equity_samples,
-                    initial_balance=Decimal(str(initial_balance)),
+                    initial_balance=initial_balance_decimal,
                     periods_per_year=periods_per_year,
                 )
             )
@@ -344,18 +435,28 @@ def calculate_metrics(
     if closed_trades and max_drawdown < 0:
         first_ts = closed_trades[0].entry_time
         last_ts = closed_trades[-1].exit_time
-        duration_days = max((last_ts - first_ts) / (1000 * 86400), 1.0)
-        annualized_return = (float(total_pnl) / initial_balance) * (
-            periods_per_year / duration_days
+        duration_days = max(
+            Decimal(last_ts - first_ts) / Decimal(86_400_000),
+            Decimal("1"),
         )
-        calmar_ratio = float(annualized_return / abs(float(max_drawdown) / initial_balance))
+        annualized_return = (
+            total_pnl
+            / initial_balance_decimal
+            * (Decimal(periods_per_year) / duration_days)
+        )
+        calmar_ratio = annualized_return / (
+            abs(Decimal(str(max_drawdown))) / initial_balance_decimal
+        )
 
     # Monthly returns
     monthly_returns: Dict[str, Decimal] = {}
     if closed_trades:
         for ct in closed_trades:
             month_key = pd.Timestamp(ct.exit_time, unit="ms").strftime("%Y-%m")
-            monthly_returns[month_key] = monthly_returns.get(month_key, Decimal("0")) + ct.pnl
+            monthly_returns[month_key] = exact_decimal_add(
+                monthly_returns.get(month_key, Decimal("0")),
+                ct.pnl,
+            )
 
     # Max drawdown duration (in days)
     max_drawdown_days = 0.0
@@ -437,7 +538,7 @@ def calculate_metrics(
     if equity_samples is not None:
         mark_to_market_metrics = _mark_to_market_drawdown_metrics(
             equity_samples,
-            initial_balance=Decimal(str(initial_balance)),
+            initial_balance=initial_balance_decimal,
             periods_per_year=periods_per_year,
         )
         max_drawdown = mark_to_market_metrics["max_drawdown"]
@@ -448,9 +549,7 @@ def calculate_metrics(
         mark_to_market_pnl = total_pnl
 
     reported_max_drawdown = (
-        max_drawdown
-        if equity_samples is not None
-        else Decimal(f"{max_drawdown:.2f}")
+        max_drawdown if equity_samples is not None else Decimal(f"{max_drawdown:.2f}")
     )
     return {
         # Basic (backward-compatible) - all numeric values as Decimal for precision
@@ -523,7 +622,10 @@ def _mark_to_market_drawdown_metrics(
             peak_timestamp = timestamp
             continue
 
-        max_drawdown = max(max_drawdown, peak_equity - equity)
+        max_drawdown = max(
+            max_drawdown,
+            exact_decimal_subtract(peak_equity, equity),
+        )
         if drawdown_started_at is None:
             drawdown_started_at = (
                 peak_timestamp if peak_timestamp is not None else timestamp
@@ -531,32 +633,33 @@ def _mark_to_market_drawdown_metrics(
 
     first_timestamp = equity_samples[0][0]
     last_timestamp = equity_samples[-1][0]
-    mark_to_market_pnl = equity_samples[-1][1] - initial_balance
+    mark_to_market_pnl = exact_decimal_subtract_preserving_zero_scale(
+        equity_samples[-1][1],
+        initial_balance,
+    )
     if drawdown_started_at is not None:
         longest_drawdown_ms = max(
             longest_drawdown_ms,
             last_timestamp - drawdown_started_at,
         )
 
-    calmar_ratio = Decimal("0")
+    calmar_ratio = Decimal("0.0000")
     if max_drawdown > 0:
-        duration_days = max(
-            Decimal(last_timestamp - first_timestamp) / Decimal(86_400_000),
-            Decimal("1"),
+        duration_ms = max(last_timestamp - first_timestamp, 86_400_000)
+        calmar_ratio = decimal_from_fraction(
+            Fraction(mark_to_market_pnl)
+            * periods_per_year
+            * 86_400_000
+            / (Fraction(max_drawdown) * duration_ms),
+            places=4,
         )
-        annualized_return = (
-            mark_to_market_pnl
-            / initial_balance
-            * Decimal(periods_per_year)
-            / duration_days
-        )
-        calmar_ratio = annualized_return / (max_drawdown / initial_balance)
 
     return {
         "max_drawdown": max_drawdown,
-        "calmar_ratio": calmar_ratio.quantize(Decimal("0.0001")),
-        "max_drawdown_days": (
-            Decimal(longest_drawdown_ms) / Decimal(86_400_000)
-        ).quantize(Decimal("0.01")),
+        "calmar_ratio": calmar_ratio,
+        "max_drawdown_days": decimal_from_fraction(
+            Fraction(longest_drawdown_ms, 86_400_000),
+            places=2,
+        ),
         "mark_to_market_pnl": mark_to_market_pnl,
     }

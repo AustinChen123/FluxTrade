@@ -27,6 +27,17 @@ pub(crate) mod ledger_runtime;
 mod order;
 
 #[allow(dead_code)]
+mod order_command;
+
+mod order_dispatch;
+
+mod order_event;
+
+mod order_pending;
+
+mod order_session;
+
+#[allow(dead_code)]
 pub(crate) mod order_runtime;
 
 mod profile_lock;
@@ -43,9 +54,15 @@ pub(crate) mod protocol {
 
 #[allow(dead_code)]
 mod session;
+#[cfg(test)]
+pub(crate) use session::handshake_rejection_with_contexts;
+pub(crate) use session::is_handshake_rejection;
 
 #[allow(dead_code)]
 mod transport;
+pub(crate) use transport::PayloadFailure;
+#[cfg(test)]
+pub(crate) use transport::PayloadFailureKind;
 
 #[cfg(test)]
 mod tests {

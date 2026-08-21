@@ -63,12 +63,22 @@ def test_build_signal_audit_uses_jsonb_native_payload() -> None:
     assert audit.risk_status == "PASS"
     assert audit.risk_message == "PASS"
     assert audit.order_id == "order-1"
-    assert audit.details_json["candle"]["close"] == "42000.4"
-    assert audit.details_json["signal_metadata"]["threshold"] == "0.75"
-    assert audit.details_json["signal_metadata"]["levels"] == [
-        "41900.1",
-        {"target": "43000.2"},
-    ]
+    assert audit.details_json == {
+        "candle": {
+            "product_id": "BINANCE:BTCUSDT-PERP",
+            "timeframe": "1m",
+            "timestamp": 1704067200000,
+            "open": "41000.1",
+            "high": "43000.2",
+            "low": "40500.3",
+            "close": "42000.4",
+            "volume": "123.45",
+        },
+        "signal_metadata": {
+            "threshold": "0.75",
+            "levels": ["41900.1", {"target": "43000.2"}],
+        },
+    }
 
 
 def test_build_signal_audit_records_reject_without_order() -> None:
@@ -84,7 +94,13 @@ def test_build_signal_audit_records_reject_without_order() -> None:
     assert audit.risk_status == "REJECT"
     assert audit.risk_message == "REJECT: no balance"
     assert audit.order_id is None
-    assert audit.details_json["candle"] is None
+    assert audit.details_json == {
+        "candle": None,
+        "signal_metadata": {
+            "threshold": "0.75",
+            "levels": ["41900.1", {"target": "43000.2"}],
+        },
+    }
 
 
 def test_commit_signal_audit_rolls_back_and_raises_on_failure() -> None:
@@ -115,15 +131,18 @@ def test_write_system_event_adds_decimal_safe_payload() -> None:
         related_gene_id=42,
     )
 
-    assert event.event_type == "reconcile"
-    assert event.event_subtype == "balance"
-    assert event.related_strategy_id == "strat-1"
-    assert event.related_order_id == "order-1"
-    assert event.related_gene_id == 42
-    assert event.payload == {
-        "balance": "1000.25",
-        "positions": [{"size": "0.5"}],
-    }
+    assert (event.event_type == "reconcile") is True
+    assert (event.event_subtype == "balance") is True
+    assert (event.related_strategy_id == "strat-1") is True
+    assert (event.related_order_id == "order-1") is True
+    assert (event.related_gene_id == 42) is True
+    assert (
+        event.payload
+        == {
+            "balance": "1000.25",
+            "positions": [{"size": "0.5"}],
+        }
+    ) is True
     session.add.assert_called_once_with(event)
     session.commit.assert_not_called()
 
@@ -138,9 +157,9 @@ def test_write_system_event_supports_gene_promote() -> None:
         related_gene_id=7,
     )
 
-    assert event.event_type == "gene_promote"
-    assert event.related_gene_id == 7
-    assert event.payload == {"fitness": "1.2345"}
+    assert (event.event_type == "gene_promote") is True
+    assert (event.related_gene_id == 7) is True
+    assert (event.payload == {"fitness": "1.2345"}) is True
     session.add.assert_called_once_with(event)
 
 

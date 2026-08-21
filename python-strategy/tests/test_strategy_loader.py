@@ -16,16 +16,50 @@ import sys
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import contextmanager
+from decimal import Decimal
+from pathlib import Path
+from unittest.mock import patch
 
 import pytest
 
-from src.core.strategy_loader import StrategyLoader
+from src.core.models import Candlestick
 from src.core.portfolio_runtime import (
     PortfolioFactory,
     build_portfolio_artifact,
 )
+from src.core.strategy_loader import LoadResult, StrategyLoader
 from src.strategies.base import BaseStrategy
 from src.validation.strategy_evidence import portfolio_evidence_identity
+
+
+def _expect_load_error(result: LoadResult) -> str:
+    assert isinstance(result, str)
+    return result
+
+
+def _strategy_class(result: LoadResult) -> type[BaseStrategy]:
+    assert isinstance(result, type)
+    assert issubclass(result, BaseStrategy)
+    return result
+
+
+def _portfolio_factory_class(result: LoadResult) -> type[PortfolioFactory]:
+    assert isinstance(result, type)
+    assert issubclass(result, PortfolioFactory)
+    return result
+
+
+_IGNORED_CANDLE = Candlestick(
+    product_id="BINANCE:BTCUSDT-PERP",
+    timeframe="1m",
+    timestamp=0,
+    open=Decimal("1"),
+    high=Decimal("1"),
+    low=Decimal("1"),
+    close=Decimal("1"),
+    volume=Decimal("0"),
+)
 
 STRATEGY_CODE = """
 from src.strategies.base import BaseStrategy, StrategyRequirements
@@ -131,6 +165,178 @@ def _write_catalog(
     return catalog
 
 
+@contextmanager
+def _read_only_tree(root: Path):
+    paths = [root, *root.rglob("*")]
+    for path in reversed(paths):
+        if not path.is_symlink():
+            path.chmod(0o555 if path.is_dir() else 0o444)
+    try:
+        yield
+    finally:
+        for path in paths:
+            if path.exists() and not path.is_symlink():
+                path.chmod(0o755 if path.is_dir() else 0o644)
+
+
+def _load_error(result: dict) -> str:
+    assert set(result) == {f"{StrategyLoader.CATALOG_NAME}::LoadError"}
+    error = result[f"{StrategyLoader.CATALOG_NAME}::LoadError"]
+    assert isinstance(error, str)
+    return error
+
+
+class TestProductionSources:
+    def test_empty_read_only_primary_has_no_legacy_fallback(self, tmp_path):
+        with _read_only_tree(tmp_path):
+            assert StrategyLoader.scan_production_sources(str(tmp_path)) == {}
+
+    def test_missing_primary_fails_closed(self, tmp_path):
+        result = StrategyLoader.scan_production_sources(str(tmp_path / "missing"))
+
+        assert "does not exist" in _load_error(result)
+
+    def test_valid_catalog_loads_after_complete_preflight(self, tmp_path):
+        _write_catalog(tmp_path)
+
+        with _read_only_tree(tmp_path):
+            result = StrategyLoader.scan_production_sources(str(tmp_path))
+
+        assert set(result) == {"stable_strategy_v1"}
+        strategy = result["stable_strategy_v1"]
+        assert isinstance(strategy, type)
+        assert issubclass(strategy, BaseStrategy)
+
+    def test_loose_python_is_rejected_before_import(self, tmp_path):
+        (tmp_path / "strategy.py").write_text(STRATEGY_CODE)
+
+        with (
+            _read_only_tree(tmp_path),
+            patch.object(StrategyLoader, "_load_module") as load_module,
+        ):
+            result = StrategyLoader.scan_production_sources(str(tmp_path))
+
+        assert "catalog-only" in _load_error(result)
+        load_module.assert_not_called()
+
+    @pytest.mark.parametrize("writable_part", ["root", "catalog", "module"])
+    def test_writable_consumed_tree_is_rejected_before_import(
+        self,
+        tmp_path,
+        writable_part,
+    ):
+        _write_catalog(tmp_path)
+        targets = {
+            "root": tmp_path,
+            "catalog": tmp_path / StrategyLoader.CATALOG_NAME,
+            "module": tmp_path / "strategy.py",
+        }
+
+        with _read_only_tree(tmp_path):
+            target = targets[writable_part]
+            target.chmod(0o755 if target.is_dir() else 0o644)
+            with patch.object(StrategyLoader, "_load_module") as load_module:
+                result = StrategyLoader.scan_production_sources(str(tmp_path))
+
+        assert "writable" in _load_error(result)
+        load_module.assert_not_called()
+
+    def test_writable_nested_parent_is_rejected_before_import(self, tmp_path):
+        pack = tmp_path / "pack"
+        pack.mkdir()
+        _write_catalog(pack)
+
+        with _read_only_tree(tmp_path):
+            pack.chmod(0o755)
+            with patch.object(StrategyLoader, "_load_module") as load_module:
+                result = StrategyLoader.scan_production_sources(str(tmp_path))
+
+        assert "writable" in _load_error(result)
+        load_module.assert_not_called()
+
+    @pytest.mark.parametrize("link_name", ["strategy.py", "strategy_catalog.json"])
+    def test_symlink_is_rejected_before_import(self, tmp_path, link_name):
+        source = tmp_path.parent / f"outside-{link_name}"
+        if link_name == "strategy.py":
+            source.write_text(STRATEGY_CODE)
+            module = tmp_path / link_name
+            module.symlink_to(source)
+            catalog = {
+                "schema_version": 1,
+                "files": {link_name: hashlib.sha256(source.read_bytes()).hexdigest()},
+                "strategies": [
+                    {
+                        "id": "stable_strategy_v1",
+                        "module": link_name,
+                        "class": "ManifestStrategy",
+                        "display_name": "Stable Strategy v1",
+                        "artifact_version": "1.0.0",
+                        "readiness": "RESEARCH_VALIDATED",
+                    }
+                ],
+            }
+            (tmp_path / StrategyLoader.CATALOG_NAME).write_text(json.dumps(catalog))
+        else:
+            (tmp_path / "strategy.py").write_text(STRATEGY_CODE)
+            catalog_root = tmp_path.parent / "outside-catalog-root"
+            catalog_root.mkdir()
+            _write_catalog(catalog_root)
+            (tmp_path / link_name).symlink_to(
+                catalog_root / StrategyLoader.CATALOG_NAME
+            )
+
+        with (
+            _read_only_tree(tmp_path),
+            patch.object(StrategyLoader, "_load_module") as load_module,
+        ):
+            result = StrategyLoader.scan_production_sources(str(tmp_path))
+
+        assert "symlink" in _load_error(result)
+        load_module.assert_not_called()
+
+    def test_duplicate_break_glass_id_rejects_complete_combined_result(
+        self,
+        tmp_path,
+    ):
+        primary = tmp_path / "primary"
+        break_glass = tmp_path / "break-glass"
+        primary.mkdir()
+        break_glass.mkdir()
+        _write_catalog(primary)
+        _write_catalog(break_glass)
+
+        with _read_only_tree(tmp_path):
+            result = StrategyLoader.scan_production_sources(
+                str(primary),
+                break_glass_path=str(break_glass),
+            )
+
+        assert "duplicate strategy id" in _load_error(result)
+
+    def test_invalid_break_glass_does_not_publish_primary_partial_result(
+        self,
+        tmp_path,
+    ):
+        primary = tmp_path / "primary"
+        break_glass = tmp_path / "break-glass"
+        primary.mkdir()
+        break_glass.mkdir()
+        _write_catalog(primary)
+        (break_glass / "loose.py").write_text(STRATEGY_CODE)
+
+        with (
+            _read_only_tree(tmp_path),
+            patch.object(StrategyLoader, "_load_module") as load_module,
+        ):
+            result = StrategyLoader.scan_production_sources(
+                str(primary),
+                break_glass_path=str(break_glass),
+            )
+
+        assert "catalog-only" in _load_error(result)
+        load_module.assert_not_called()
+
+
 class TestScanEmptyAndMissing:
     def test_scan_nonexistent_directory(self, tmp_path):
         """Should return empty dict for nonexistent path."""
@@ -174,7 +380,8 @@ class MyStrategy(BaseStrategy):
         result = StrategyLoader.scan_directory(str(tmp_path))
 
         assert "my_strat.py::MyStrategy" in result
-        assert issubclass(result["my_strat.py::MyStrategy"], BaseStrategy)
+        strategy_class = _strategy_class(result["my_strat.py::MyStrategy"])
+        assert issubclass(strategy_class, BaseStrategy)
 
     def test_finds_hash_pinned_portfolio_factory(self, tmp_path):
         module = tmp_path / "portfolio.py"
@@ -206,9 +413,9 @@ class MyStrategy(BaseStrategy):
 
         result = StrategyLoader.scan_directory(str(tmp_path))
 
-        factory = result["portfolio_v1"]
+        factory = _portfolio_factory_class(result["portfolio_v1"])
         assert issubclass(factory, PortfolioFactory)
-        assert factory.__fluxtrade_readiness__ == "RESEARCH_FROZEN"
+        assert getattr(factory, "__fluxtrade_readiness__") == "RESEARCH_FROZEN"
         definition = build_portfolio_artifact(
             factory,
             portfolio_id="portfolio_v1",
@@ -227,10 +434,9 @@ class MyStrategy(BaseStrategy):
         (relocated / StrategyLoader.CATALOG_NAME).write_bytes(
             (tmp_path / StrategyLoader.CATALOG_NAME).read_bytes()
         )
-        relocated_factory = StrategyLoader.scan_directory(str(relocated))[
-            "portfolio_v1"
-        ]
-        assert not isinstance(relocated_factory, str)
+        relocated_factory = _portfolio_factory_class(
+            StrategyLoader.scan_directory(str(relocated))["portfolio_v1"]
+        )
         relocated_definition = build_portfolio_artifact(
             relocated_factory,
             portfolio_id="portfolio_v1",
@@ -345,14 +551,19 @@ class TestCatalogStrategies:
         result = StrategyLoader.scan_directory(str(tmp_path))
 
         assert list(result) == ["stable_strategy_v1"]
-        assert issubclass(result["stable_strategy_v1"], BaseStrategy)
+        strategy_class = _strategy_class(result["stable_strategy_v1"])
+        assert issubclass(strategy_class, BaseStrategy)
 
     def test_catalog_rescan_reuses_unchanged_verified_generation(self, tmp_path):
         _write_catalog(tmp_path)
 
-        first = StrategyLoader.scan_directory(str(tmp_path))["stable_strategy_v1"]
+        first = _strategy_class(
+            StrategyLoader.scan_directory(str(tmp_path))["stable_strategy_v1"]
+        )
         snapshot_count = len(StrategyLoader._catalog_snapshots)
-        second = StrategyLoader.scan_directory(str(tmp_path))["stable_strategy_v1"]
+        second = _strategy_class(
+            StrategyLoader.scan_directory(str(tmp_path))["stable_strategy_v1"]
+        )
 
         assert first.__module__ == second.__module__
         assert len(StrategyLoader._catalog_snapshots) == snapshot_count
@@ -423,8 +634,9 @@ class TestCatalogStrategies:
         result = StrategyLoader.scan_directory(str(tmp_path))
 
         assert set(result) == {f"{StrategyLoader.CATALOG_NAME}::LoadError"}
-        assert "module namespace overlap" in next(iter(result.values()))
-        assert "private_lib" in next(iter(result.values()))
+        error = _expect_load_error(next(iter(result.values())))
+        assert "module namespace overlap" in error
+        assert "private_lib" in error
 
     @pytest.mark.parametrize(
         ("catalog_source", "expected_error"),
@@ -445,7 +657,7 @@ class TestCatalogStrategies:
 
         result = StrategyLoader.scan_directory(str(tmp_path))
 
-        error = result[f"{StrategyLoader.CATALOG_NAME}::LoadError"]
+        error = _expect_load_error(result[f"{StrategyLoader.CATALOG_NAME}::LoadError"])
         assert expected_error in error
 
     def test_catalog_rejects_unpinned_pack_files(self, tmp_path):
@@ -454,7 +666,7 @@ class TestCatalogStrategies:
 
         result = StrategyLoader.scan_directory(str(tmp_path))
 
-        error = result[f"{StrategyLoader.CATALOG_NAME}::LoadError"]
+        error = _expect_load_error(result[f"{StrategyLoader.CATALOG_NAME}::LoadError"])
         assert "file set mismatch" in error
         assert "helper.py" in error
 
@@ -489,13 +701,12 @@ class TestCatalogStrategies:
 
         result = StrategyLoader.scan_directory(str(tmp_path))
 
-        assert result["stable_strategy_v1"].helper_value == 7
+        strategy_class = _strategy_class(result["stable_strategy_v1"])
+        assert getattr(strategy_class, "helper_value") == 7
         assert (
-            result["stable_strategy_v1"].__fluxtrade_readiness__ == "RESEARCH_VALIDATED"
+            getattr(strategy_class, "__fluxtrade_readiness__") == "RESEARCH_VALIDATED"
         )
-        assert (
-            result["stable_strategy_v1"].__fluxtrade_catalog_sha256__ == catalog_digest
-        )
+        assert getattr(strategy_class, "__fluxtrade_catalog_sha256__") == catalog_digest
 
         helper.write_text("VALUE = 8\n")
         catalog["files"]["helper.py"] = hashlib.sha256(helper.read_bytes()).hexdigest()
@@ -504,10 +715,10 @@ class TestCatalogStrategies:
 
         rescanned = StrategyLoader.scan_directory(str(tmp_path))
 
-        assert rescanned["stable_strategy_v1"].helper_value == 8
+        rescanned_class = _strategy_class(rescanned["stable_strategy_v1"])
+        assert getattr(rescanned_class, "helper_value") == 8
         assert (
-            rescanned["stable_strategy_v1"].__fluxtrade_catalog_sha256__
-            == rescanned_digest
+            getattr(rescanned_class, "__fluxtrade_catalog_sha256__") == rescanned_digest
         )
 
     def test_catalog_imports_the_verified_snapshot_when_source_changes(
@@ -554,7 +765,8 @@ class TestCatalogStrategies:
 
         result = StrategyLoader.scan_directory(str(tmp_path))
 
-        assert result["stable_strategy_v1"].helper_value == 7
+        strategy_class = _strategy_class(result["stable_strategy_v1"])
+        assert getattr(strategy_class, "helper_value") == 7
 
     def test_catalog_lazy_import_stays_bound_to_verified_generation(self, tmp_path):
         private_lib_before = sys.modules.get("private_lib")
@@ -597,15 +809,19 @@ class TestCatalogStrategies:
             (tmp_path / StrategyLoader.CATALOG_NAME).write_text(json.dumps(catalog))
 
         write_catalog(7)
-        first_class = StrategyLoader.scan_directory(str(tmp_path))["lazy_strategy_v1"]
+        first_class = _strategy_class(
+            StrategyLoader.scan_directory(str(tmp_path))["lazy_strategy_v1"]
+        )
         helper.write_text("VALUE = 99\n")
-        assert first_class("first", "product").on_candle(None) == 7
+        assert first_class("first", "product").on_candle(_IGNORED_CANDLE) == 7
 
         write_catalog(8)
-        second_class = StrategyLoader.scan_directory(str(tmp_path))["lazy_strategy_v1"]
+        second_class = _strategy_class(
+            StrategyLoader.scan_directory(str(tmp_path))["lazy_strategy_v1"]
+        )
 
-        assert first_class("first", "product").on_candle(None) == 7
-        assert second_class("second", "product").on_candle(None) == 8
+        assert first_class("first", "product").on_candle(_IGNORED_CANDLE) == 7
+        assert second_class("second", "product").on_candle(_IGNORED_CANDLE) == 8
         assert sys.modules.get("private_lib") is private_lib_before
         assert sys.modules.get("private_lib.helper") is private_helper_before
 
@@ -658,7 +874,7 @@ class TestCatalogStrategies:
 
         result = StrategyLoader.scan_directory(str(tmp_path))
 
-        error = result[f"{StrategyLoader.CATALOG_NAME}::LoadError"]
+        error = _expect_load_error(result[f"{StrategyLoader.CATALOG_NAME}::LoadError"])
         assert "internal imports must be relative" in error
         assert "strategy.py:7" in error
 
@@ -711,7 +927,7 @@ class TestCatalogStrategies:
 
         result = StrategyLoader.scan_directory(str(tmp_path))
 
-        error = result[f"{StrategyLoader.CATALOG_NAME}::LoadError"]
+        error = _expect_load_error(result[f"{StrategyLoader.CATALOG_NAME}::LoadError"])
         assert expected_error in error
 
     def test_digest_mismatch_fails_before_import(self, tmp_path):
@@ -719,7 +935,7 @@ class TestCatalogStrategies:
 
         result = StrategyLoader.scan_directory(str(tmp_path))
 
-        error = result[f"{StrategyLoader.CATALOG_NAME}::LoadError"]
+        error = _expect_load_error(result[f"{StrategyLoader.CATALOG_NAME}::LoadError"])
         assert "digest mismatch" in error
 
     def test_catalog_rejects_unpinned_or_external_modules(self, tmp_path):
@@ -729,7 +945,7 @@ class TestCatalogStrategies:
 
         result = StrategyLoader.scan_directory(str(tmp_path))
 
-        error = result[f"{StrategyLoader.CATALOG_NAME}::LoadError"]
+        error = _expect_load_error(result[f"{StrategyLoader.CATALOG_NAME}::LoadError"])
         assert "not integrity-pinned" in error
         assert catalog["files"] == {
             "strategy.py": hashlib.sha256(
@@ -742,14 +958,14 @@ class TestCatalogStrategies:
 
         result = StrategyLoader.scan_directory(str(tmp_path))
 
-        assert "BaseStrategy" in result["stable_strategy_v1"]
+        assert "BaseStrategy" in _expect_load_error(result["stable_strategy_v1"])
 
     def test_catalog_rejects_unknown_readiness(self, tmp_path):
         _write_catalog(tmp_path, readiness="READY_ENOUGH")
 
         result = StrategyLoader.scan_directory(str(tmp_path))
 
-        error = result[f"{StrategyLoader.CATALOG_NAME}::LoadError"]
+        error = _expect_load_error(result[f"{StrategyLoader.CATALOG_NAME}::LoadError"])
         assert "unknown strategy readiness" in error
 
     def test_catalog_accepts_research_frozen_readiness(self, tmp_path):
@@ -757,10 +973,8 @@ class TestCatalogStrategies:
 
         result = StrategyLoader.scan_directory(str(tmp_path))
 
-        assert (
-            result["stable_strategy_v1"].__fluxtrade_readiness__
-            == "RESEARCH_FROZEN"
-        )
+        strategy_class = _strategy_class(result["stable_strategy_v1"])
+        assert getattr(strategy_class, "__fluxtrade_readiness__") == "RESEARCH_FROZEN"
 
 
 class TestIgnoreNonStrategies:
@@ -826,7 +1040,7 @@ class TestErrorHandling:
         result = StrategyLoader.scan_directory(str(tmp_path))
 
         assert "runtime_err.py::LoadError" in result
-        assert "ValueError" in result["runtime_err.py::LoadError"]
+        assert "ValueError" in _expect_load_error(result["runtime_err.py::LoadError"])
 
     def test_mixed_good_and_bad_files(self, tmp_path):
         """Good files should load even when other files have errors."""
@@ -848,5 +1062,6 @@ class GoodStrat(BaseStrategy):
         result = StrategyLoader.scan_directory(str(tmp_path))
 
         assert "good.py::GoodStrat" in result
-        assert issubclass(result["good.py::GoodStrat"], BaseStrategy)
+        strategy_class = _strategy_class(result["good.py::GoodStrat"])
+        assert issubclass(strategy_class, BaseStrategy)
         assert "bad.py::LoadError" in result

@@ -11,13 +11,15 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
-from src.core.models import Candlestick, Signal, SignalType, Trade
+from src.core.models import Candlestick, OrderSide, Signal, SignalType, Trade
+from src.core.strategy_context import StrategyContext
 from src.strategies.base import BaseStrategy, StrategyRequirements
 
 
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
+
 
 class FakeStrategy(BaseStrategy):
     """Minimal strategy with configurable requirements."""
@@ -36,7 +38,11 @@ class FakeStrategy(BaseStrategy):
             lookback_window=50,
         )
 
-    def on_candle(self, candle: Candlestick) -> Signal:
+    def on_candle(
+        self,
+        candle: Candlestick,
+        context: StrategyContext | None = None,
+    ) -> Signal:
         self.candles_received.append(candle)
         return Signal(
             strategy_id=self.strategy_id,
@@ -54,8 +60,10 @@ class FakeStrategy(BaseStrategy):
 @pytest.fixture
 def engine_with_strategy():
     """Create a StrategyEngine with a FakeStrategy, mocking heavy deps."""
-    with patch("src.core.engine.create_redis_client"), \
-         patch("src.core.engine.create_adapter") as mock_create:
+    with (
+        patch("src.core.engine.create_redis_client"),
+        patch("src.core.engine.create_simulated_adapter") as mock_create,
+    ):
         mock_create.return_value = MagicMock()
 
         from src.core.engine import StrategyEngine
@@ -146,8 +154,10 @@ class TestTimeframeGuard:
             product_id="BINANCE:BTCUSDT-PERP",
             timeframe="15m",
             timestamp=1704067200000,
-            open=Decimal("42000"), high=Decimal("42500"),
-            low=Decimal("41500"), close=Decimal("42200"),
+            open=Decimal("42000"),
+            high=Decimal("42500"),
+            low=Decimal("41500"),
+            close=Decimal("42200"),
             volume=Decimal("100"),
         )
         engine.on_market_data(candle)
@@ -162,8 +172,10 @@ class TestTimeframeGuard:
             product_id="BINANCE:BTCUSDT-PERP",
             timeframe="1m",
             timestamp=1704067200000,
-            open=Decimal("42000"), high=Decimal("42500"),
-            low=Decimal("41500"), close=Decimal("42200"),
+            open=Decimal("42000"),
+            high=Decimal("42500"),
+            low=Decimal("41500"),
+            close=Decimal("42200"),
             volume=Decimal("100"),
         )
         engine.on_market_data(candle_1m)
@@ -179,8 +191,10 @@ class TestTimeframeGuard:
             product_id="BINANCE:BTCUSDT-PERP",
             timeframe="5m",
             timestamp=1704067200000,
-            open=Decimal("42000"), high=Decimal("42500"),
-            low=Decimal("41500"), close=Decimal("42200"),
+            open=Decimal("42000"),
+            high=Decimal("42500"),
+            low=Decimal("41500"),
+            close=Decimal("42200"),
             volume=Decimal("100"),
         )
         engine.on_market_data(candle_5m)
@@ -197,7 +211,7 @@ class TestTimeframeGuard:
             product_id="BINANCE:BTCUSDT-PERP",
             price=Decimal("42000"),
             quantity=Decimal("0.1"),
-            side="buy",
+            side=OrderSide.BUY,
             timestamp=1704067200000,
         )
         engine.on_market_data(trade)

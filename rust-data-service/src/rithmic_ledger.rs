@@ -16,8 +16,23 @@ pub(crate) mod last_trade_snapshot;
 #[path = "connector/rithmic/order.rs"]
 pub(crate) mod order;
 
+#[path = "connector/rithmic/order_command.rs"]
+pub(crate) mod order_command;
+
+#[path = "connector/rithmic/order_dispatch.rs"]
+mod order_dispatch;
+
+#[path = "connector/rithmic/order_event.rs"]
+pub(crate) mod order_event;
+
+#[path = "connector/rithmic/order_pending.rs"]
+mod order_pending;
+
 #[path = "connector/rithmic/order_runtime.rs"]
 pub(crate) mod order_runtime;
+
+#[path = "connector/rithmic/order_session.rs"]
+mod order_session;
 
 #[path = "connector/rithmic/market.rs"]
 #[allow(dead_code)]

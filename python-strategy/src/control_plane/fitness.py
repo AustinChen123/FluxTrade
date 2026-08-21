@@ -8,7 +8,7 @@ from decimal import Decimal
 import re
 from statistics import NormalDist
 from types import MappingProxyType
-from typing import Callable, Mapping, Sequence
+from typing import Callable, Mapping, Sequence, TypedDict
 
 
 DEFAULT_WALK_FORWARD_FITNESS = (
@@ -145,6 +145,11 @@ class WalkForwardMetricData:
 FitnessMetricCalculator = Callable[[WalkForwardMetricData], Decimal | None]
 
 
+class _FitnessMetricContract(TypedDict):
+    version: str
+    metrics: dict[str, dict[str, object]]
+
+
 @dataclass(frozen=True, slots=True)
 class FitnessMetricDefinition:
     """One trusted metric calculator and its persisted semantic contract."""
@@ -196,7 +201,7 @@ def calculate_registered_fitness_inputs(
 def fitness_metric_contract(
     *,
     definitions: Sequence[FitnessMetricDefinition] | None = None,
-) -> dict[str, object]:
+) -> _FitnessMetricContract:
     """Return the durable contract for the active trusted metric registry."""
     resolved = _resolve_metric_definitions(definitions)
     return {

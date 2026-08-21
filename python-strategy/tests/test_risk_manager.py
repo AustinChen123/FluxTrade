@@ -16,22 +16,34 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
-from src.core.models import Position, PositionSide, SignalType
+from src.core.models import Position, PositionSide, Signal, SignalType
 from src.core.risk_config import RiskConfig
 from src.core.risk_rules import RuleStatus
 from src.core.risk_rules.existing_position_entry import ExistingPositionEntryRule
+from src.core.risk_rules.order_rate_limit import OrderRateLimitRule
 from src.core.risk_manager import RiskManager, AccountService
 from src.core.product_registry import InstrumentSpec
 from src.core.runtime_environment import RuntimeEnvironment
 
 
-class _FakeOrderRateLimitRule:
-    def __init__(self, status=RuleStatus.PASS, reason=None):
+class _FakeOrderRateLimitRule(OrderRateLimitRule):
+    def __init__(
+        self,
+        status: RuleStatus = RuleStatus.PASS,
+        reason: str | None = None,
+    ) -> None:
         self.status = status
         self.reason = reason
-        self.calls = []
+        self.calls: list[str] = []
 
-    def try_record_order(self, strategy_id):
+    def try_record_order(
+        self,
+        strategy_id: str,
+        *,
+        timestamp_ms: int | None = None,
+        member: str | None = None,
+    ) -> tuple[RuleStatus, str | None]:
+        del timestamp_ms, member
         self.calls.append(strategy_id)
         return self.status, self.reason
 
@@ -46,13 +58,16 @@ class _FakeDailyNavService:
         return self.nav
 
 
-
-class _PassExistingPositionEntryRule:
+class _PassExistingPositionEntryRule(ExistingPositionEntryRule):
     """Permissive stub so exposure tests exercise exposure semantics, not the
     default-on duplicate-entry rule."""
 
-    def evaluate(self, signal, current_position):
-        from src.core.risk_rules import RuleStatus
+    def evaluate(
+        self,
+        signal: Signal,
+        current_position: Position | None,
+    ) -> tuple[RuleStatus, str | None]:
+        del signal, current_position
         return RuleStatus.PASS, None
 
 
@@ -70,7 +85,9 @@ class TestRiskManagerBalanceChecks:
         assert is_allowed is False
         assert "balance" in reason.lower()
 
-    def test_reject_short_entry_on_zero_balance(self, mock_account_service, signal_factory):
+    def test_reject_short_entry_on_zero_balance(
+        self, mock_account_service, signal_factory
+    ):
         """SHORT entry should also be rejected on zero balance."""
         mock_account_service.set_balance(Decimal("0"))
         risk_manager = RiskManager(mock_account_service)
@@ -90,7 +107,9 @@ class TestRiskManagerBalanceChecks:
 
         assert is_allowed is True
 
-    def test_allow_exit_short_on_zero_balance(self, mock_account_service, signal_factory):
+    def test_allow_exit_short_on_zero_balance(
+        self, mock_account_service, signal_factory
+    ):
         """EXIT_SHORT should also be allowed on zero balance."""
         mock_account_service.set_balance(Decimal("0"))
         risk_manager = RiskManager(mock_account_service)
@@ -160,7 +179,9 @@ class TestRiskManagerBalanceChecks:
         with pytest.raises(RuntimeError, match="metadata unavailable"):
             risk_manager.check_risk(signal_factory(signal_type=signal_type))
 
-    def test_allow_entry_with_positive_balance(self, mock_account_service, signal_factory):
+    def test_allow_entry_with_positive_balance(
+        self, mock_account_service, signal_factory
+    ):
         """Entry signals should be allowed with positive balance."""
         mock_account_service.set_balance(Decimal("10000"))
         risk_manager = RiskManager(mock_account_service)
@@ -171,7 +192,9 @@ class TestRiskManagerBalanceChecks:
         assert is_allowed is True
         assert reason == "PASS"
 
-    def test_reject_entry_on_negative_balance(self, mock_account_service, signal_factory):
+    def test_reject_entry_on_negative_balance(
+        self, mock_account_service, signal_factory
+    ):
         """Entry signals should be rejected on negative balance."""
         mock_account_service.set_balance(Decimal("-100"))
         risk_manager = RiskManager(mock_account_service)
@@ -397,7 +420,9 @@ class TestRiskManagerExposureChecks:
             return_value=(Decimal("100000"), Decimal("94990"))
         )
         mock_account_service.get_balance = MagicMock(
-            side_effect=AssertionError("authoritative context already contains current NAV")
+            side_effect=AssertionError(
+                "authoritative context already contains current NAV"
+            )
         )
         risk_manager = RiskManager(mock_account_service)
 
@@ -460,8 +485,7 @@ class TestRiskManagerExposureChecks:
 
         # Set position with high exposure (quantity * current_price > configured max)
         large_position = position_factory(
-            quantity=Decimal("3"),
-            entry_price=Decimal("40000")
+            quantity=Decimal("3"), entry_price=Decimal("40000")
         )
         mock_account_service.set_position(large_position)
 
@@ -472,7 +496,9 @@ class TestRiskManagerExposureChecks:
         signal = signal_factory(signal_type=SignalType.LONG, value=None)
 
         # current_price=40000 -> 3 * 40000 = 120000 > default 100000
-        is_allowed, reason = risk_manager.check_risk(signal, current_price=Decimal("40000"))
+        is_allowed, reason = risk_manager.check_risk(
+            signal, current_price=Decimal("40000")
+        )
 
         assert is_allowed is False
         assert "exposure" in reason.lower()
@@ -498,7 +524,9 @@ class TestRiskManagerExposureChecks:
             quantity=Decimal("0.01"),
         )
 
-        is_allowed, reason = risk_manager.check_risk(signal, current_price=Decimal("40000"))
+        is_allowed, reason = risk_manager.check_risk(
+            signal, current_price=Decimal("40000")
+        )
 
         assert is_allowed is False
         assert "existing_position_entry_duplicate" in reason
@@ -524,7 +552,9 @@ class TestRiskManagerExposureChecks:
             quantity=Decimal("0.01"),
         )
 
-        is_allowed, reason = risk_manager.check_risk(signal, current_price=Decimal("40000"))
+        is_allowed, reason = risk_manager.check_risk(
+            signal, current_price=Decimal("40000")
+        )
 
         assert is_allowed is False
         assert "existing_position_entry_duplicate" in reason
@@ -547,7 +577,9 @@ class TestRiskManagerExposureChecks:
             quantity=Decimal("0.01"),
         )
 
-        is_allowed, reason = risk_manager.check_risk(signal, current_price=Decimal("40000"))
+        is_allowed, reason = risk_manager.check_risk(
+            signal, current_price=Decimal("40000")
+        )
 
         assert is_allowed is False
         assert "existing_position_entry_duplicate" in reason
@@ -567,14 +599,18 @@ class TestRiskManagerExposureChecks:
             side=PositionSide.LONG,
         )
         mock_account_service.set_position(position)
-        risk_manager = RiskManager(mock_account_service)  # no existing_position_entry_rule arg
+        risk_manager = RiskManager(
+            mock_account_service
+        )  # no existing_position_entry_rule arg
         signal = signal_factory(
             signal_type=SignalType.LONG,
             price=Decimal("50000"),
             quantity=Decimal("0.01"),
         )
 
-        is_allowed, reason = risk_manager.check_risk(signal, current_price=Decimal("50000"))
+        is_allowed, reason = risk_manager.check_risk(
+            signal, current_price=Decimal("50000")
+        )
 
         assert is_allowed is False
         assert "existing_position_entry_duplicate" in reason
@@ -587,8 +623,7 @@ class TestRiskManagerExposureChecks:
 
         # Entry at $100, but current price moved; exposure uses current price.
         position = position_factory(
-            quantity=Decimal("1000"),
-            entry_price=Decimal("100")
+            quantity=Decimal("1000"), entry_price=Decimal("100")
         )
         mock_account_service.set_position(position)
 
@@ -599,12 +634,16 @@ class TestRiskManagerExposureChecks:
         signal = signal_factory(signal_type=SignalType.LONG, value=None)
 
         # current 90 -> exposure 90000 < 100000: allowed
-        is_allowed, reason = risk_manager.check_risk(signal, current_price=Decimal("90"))
+        is_allowed, reason = risk_manager.check_risk(
+            signal, current_price=Decimal("90")
+        )
         assert is_allowed is True
         assert reason == "PASS"
 
         # current 120 -> exposure 120000 > 100000: rejected by exposure
-        is_allowed, reason = risk_manager.check_risk(signal, current_price=Decimal("120"))
+        is_allowed, reason = risk_manager.check_risk(
+            signal, current_price=Decimal("120")
+        )
         assert is_allowed is False
         assert "exposure" in reason.lower()
 
@@ -616,7 +655,7 @@ class TestRiskManagerExposureChecks:
 
         large_position = position_factory(
             quantity=Decimal("3"),
-            entry_price=Decimal("40000")  # 3 * 40000 = 120000 > 100000
+            entry_price=Decimal("40000"),  # 3 * 40000 = 120000 > 100000
         )
         mock_account_service.set_position(large_position)
 
@@ -638,15 +677,16 @@ class TestRiskManagerExposureChecks:
         mock_account_service.set_balance(Decimal("100000"))
 
         large_position = position_factory(
-            quantity=Decimal("2.0"),
-            entry_price=Decimal("40000")
+            quantity=Decimal("2.0"), entry_price=Decimal("40000")
         )
         mock_account_service.set_position(large_position)
 
         risk_manager = RiskManager(mock_account_service)
         signal = signal_factory(signal_type=SignalType.EXIT_LONG)
 
-        is_allowed, reason = risk_manager.check_risk(signal, current_price=Decimal("40000"))
+        is_allowed, reason = risk_manager.check_risk(
+            signal, current_price=Decimal("40000")
+        )
 
         assert is_allowed is True
 
@@ -766,7 +806,7 @@ class TestPositionSizeCalculation:
         size = risk_manager.calculate_position_size(
             entry_price=Decimal("42000"),
             stop_loss_price=Decimal("41000"),
-            risk_percent=Decimal("0.02")
+            risk_percent=Decimal("0.02"),
         )
 
         assert size == Decimal("0.2")
@@ -781,7 +821,7 @@ class TestPositionSizeCalculation:
         size = risk_manager.calculate_position_size(
             entry_price=Decimal("42000"),
             stop_loss_price=Decimal("41000"),
-            risk_percent=Decimal("0.01")
+            risk_percent=Decimal("0.01"),
         )
 
         assert size == Decimal("0.1")
@@ -792,8 +832,7 @@ class TestPositionSizeCalculation:
         risk_manager = RiskManager(mock_account_service)
 
         size = risk_manager.calculate_position_size(
-            entry_price=Decimal("42000"),
-            stop_loss_price=Decimal("41000")
+            entry_price=Decimal("42000"), stop_loss_price=Decimal("41000")
         )
 
         assert size == Decimal("0")
@@ -805,7 +844,7 @@ class TestPositionSizeCalculation:
 
         size = risk_manager.calculate_position_size(
             entry_price=Decimal("42000"),
-            stop_loss_price=Decimal("42000")  # Same as entry
+            stop_loss_price=Decimal("42000"),  # Same as entry
         )
 
         assert size == Decimal("0")
@@ -820,7 +859,7 @@ class TestPositionSizeCalculation:
         size = risk_manager.calculate_position_size(
             entry_price=Decimal("42000"),
             stop_loss_price=Decimal("43000"),
-            risk_percent=Decimal("0.02")
+            risk_percent=Decimal("0.02"),
         )
 
         assert size == Decimal("0.2")
@@ -870,7 +909,7 @@ class TestRiskManagerEdgeCases:
         # Position at exactly max exposure (100000)
         position = position_factory(
             quantity=Decimal("2.5"),
-            entry_price=Decimal("40000")  # 2.5 * 40000 = 100000
+            entry_price=Decimal("40000"),  # 2.5 * 40000 = 100000
         )
         mock_account_service.set_position(position)
 
@@ -880,7 +919,9 @@ class TestRiskManagerEdgeCases:
         )
         signal = signal_factory(signal_type=SignalType.LONG, value=None)
 
-        is_allowed, reason = risk_manager.check_risk(signal, current_price=Decimal("40000"))
+        is_allowed, reason = risk_manager.check_risk(
+            signal, current_price=Decimal("40000")
+        )
 
         assert is_allowed is True
 
@@ -946,14 +987,19 @@ class TestAccountService:
         mock_redis = MagicMock()
         mock_redis.ping.return_value = True
 
-        with patch("src.core.risk_manager.create_redis_client", return_value=mock_redis):
+        with patch(
+            "src.core.risk_manager.create_redis_client", return_value=mock_redis
+        ):
             service = AccountService()
 
         assert service.redis is not None
 
     def test_init_redis_failure_sets_none(self):
         """Redis connection failure should set redis to None."""
-        with patch("src.core.risk_manager.create_redis_client", side_effect=Exception("conn fail")):
+        with patch(
+            "src.core.risk_manager.create_redis_client",
+            side_effect=Exception("conn fail"),
+        ):
             service = AccountService()
 
         assert service.redis is None
@@ -964,7 +1010,9 @@ class TestAccountService:
         mock_redis.ping.return_value = True
         mock_redis.hget.return_value = "12345.67"
 
-        with patch("src.core.risk_manager.create_redis_client", return_value=mock_redis):
+        with patch(
+            "src.core.risk_manager.create_redis_client", return_value=mock_redis
+        ):
             service = AccountService()
 
         result = service.get_balance()
@@ -972,7 +1020,9 @@ class TestAccountService:
 
     def test_get_balance_no_redis_returns_zero(self):
         """Without Redis connection, should return zero."""
-        with patch("src.core.risk_manager.create_redis_client", side_effect=Exception("fail")):
+        with patch(
+            "src.core.risk_manager.create_redis_client", side_effect=Exception("fail")
+        ):
             service = AccountService()
 
         assert service.get_balance() == Decimal("0")
@@ -983,10 +1033,31 @@ class TestAccountService:
         mock_redis.ping.return_value = True
         mock_redis.hget.return_value = None
 
-        with patch("src.core.risk_manager.create_redis_client", return_value=mock_redis):
+        with patch(
+            "src.core.risk_manager.create_redis_client", return_value=mock_redis
+        ):
             service = AccountService()
 
         assert service.get_balance() == Decimal("0")
+
+    def test_replace_generic_balance_persists_exact_risk_owner_field(self):
+        mock_redis = MagicMock()
+        mock_redis.ping.return_value = True
+        mock_redis.hget.return_value = "12345.6700"
+
+        with patch(
+            "src.core.risk_manager.create_redis_client", return_value=mock_redis
+        ):
+            service = AccountService()
+
+        service.replace_generic_balance(Decimal("12345.6700"))
+
+        mock_redis.hset.assert_called_once_with(
+            "state:balance:main",
+            mapping={"free": "12345.6700"},
+        )
+        assert service.get_balance() == Decimal("12345.6700")
+        mock_redis.hget.assert_called_once_with("state:balance:main", "free")
 
     def test_authoritative_balance_uses_account_scoped_fresh_snapshot(self):
         mock_redis = MagicMock()
@@ -1002,7 +1073,9 @@ class TestAccountService:
             "source_timestamp_ms": "1704067199000",
         }
 
-        with patch("src.core.risk_manager.create_redis_client", return_value=mock_redis):
+        with patch(
+            "src.core.risk_manager.create_redis_client", return_value=mock_redis
+        ):
             service = AccountService()
         service.configure_authoritative_balance(
             venue="rithmic",
@@ -1030,7 +1103,9 @@ class TestAccountService:
             "observed_at_ms": "1704067200000",
             "source_timestamp_ms": "1704067199000",
         }
-        with patch("src.core.risk_manager.create_redis_client", return_value=mock_redis):
+        with patch(
+            "src.core.risk_manager.create_redis_client", return_value=mock_redis
+        ):
             service = AccountService()
         service.configure_authoritative_balance(
             venue="rithmic",
@@ -1088,7 +1163,9 @@ class TestAccountService:
         mock_redis.ping.return_value = True
         mock_redis.hgetall.return_value = snapshot
 
-        with patch("src.core.risk_manager.create_redis_client", return_value=mock_redis):
+        with patch(
+            "src.core.risk_manager.create_redis_client", return_value=mock_redis
+        ):
             service = AccountService()
         service.configure_authoritative_balance(
             venue="rithmic",
@@ -1104,7 +1181,9 @@ class TestAccountService:
     def test_replace_authoritative_balance_rejects_wrong_account(self):
         mock_redis = MagicMock()
         mock_redis.ping.return_value = True
-        with patch("src.core.risk_manager.create_redis_client", return_value=mock_redis):
+        with patch(
+            "src.core.risk_manager.create_redis_client", return_value=mock_redis
+        ):
             service = AccountService()
         service.configure_authoritative_balance(
             venue="rithmic",
@@ -1131,7 +1210,9 @@ class TestAccountService:
     def test_replace_authoritative_balance_persists_decimal_as_text(self):
         mock_redis = MagicMock()
         mock_redis.ping.return_value = True
-        with patch("src.core.risk_manager.create_redis_client", return_value=mock_redis):
+        with patch(
+            "src.core.risk_manager.create_redis_client", return_value=mock_redis
+        ):
             service = AccountService()
         service.configure_authoritative_balance(
             venue="rithmic",
@@ -1173,7 +1254,9 @@ class TestAccountService:
             "entry_price": "42000",
         }
 
-        with patch("src.core.risk_manager.create_redis_client", return_value=mock_redis):
+        with patch(
+            "src.core.risk_manager.create_redis_client", return_value=mock_redis
+        ):
             service = AccountService()
 
         pos = service.get_position("strat", "BINANCE:BTCUSDT-PERP")
@@ -1191,7 +1274,9 @@ class TestAccountService:
             "entry_price": "42000",
         }
 
-        with patch("src.core.risk_manager.create_redis_client", return_value=mock_redis):
+        with patch(
+            "src.core.risk_manager.create_redis_client", return_value=mock_redis
+        ):
             service = AccountService()
 
         pos = service.get_position("strat", "BINANCE:BTCUSDT-PERP")
@@ -1208,7 +1293,9 @@ class TestAccountService:
             "entry_price": "42000",
         }
 
-        with patch("src.core.risk_manager.create_redis_client", return_value=mock_redis):
+        with patch(
+            "src.core.risk_manager.create_redis_client", return_value=mock_redis
+        ):
             service = AccountService()
 
         assert service.get_position("strat", "BINANCE:BTCUSDT-PERP") is None
@@ -1219,20 +1306,26 @@ class TestAccountService:
         mock_redis.ping.return_value = True
         mock_redis.hgetall.return_value = {}
 
-        with patch("src.core.risk_manager.create_redis_client", return_value=mock_redis):
+        with patch(
+            "src.core.risk_manager.create_redis_client", return_value=mock_redis
+        ):
             service = AccountService()
 
         assert service.get_position("strat", "BINANCE:BTCUSDT-PERP") is None
 
     def test_get_position_no_redis_returns_none(self):
         """Without Redis connection, should return None."""
-        with patch("src.core.risk_manager.create_redis_client", side_effect=Exception("fail")):
+        with patch(
+            "src.core.risk_manager.create_redis_client", side_effect=Exception("fail")
+        ):
             service = AccountService()
 
         assert service.get_position("strat", "BINANCE:BTCUSDT-PERP") is None
 
     def test_exit_position_lookup_fails_when_redis_is_unavailable(self):
-        with patch("src.core.risk_manager.create_redis_client", side_effect=Exception("fail")):
+        with patch(
+            "src.core.risk_manager.create_redis_client", side_effect=Exception("fail")
+        ):
             service = AccountService()
 
         with pytest.raises(RuntimeError, match="position_state_unavailable"):
@@ -1251,7 +1344,9 @@ class TestAccountService:
             {"quantity": "0", "entry_price": "3000"},
         ]
 
-        with patch("src.core.risk_manager.create_redis_client", return_value=mock_redis):
+        with patch(
+            "src.core.risk_manager.create_redis_client", return_value=mock_redis
+        ):
             service = AccountService()
 
         positions = service.get_all_positions()
@@ -1273,7 +1368,9 @@ class TestAccountService:
             "entry_price": "42000",
         }
 
-        with patch("src.core.risk_manager.create_redis_client", return_value=mock_redis):
+        with patch(
+            "src.core.risk_manager.create_redis_client", return_value=mock_redis
+        ):
             service = AccountService()
 
         positions = service.get_all_positions()
@@ -1304,7 +1401,9 @@ class TestAccountService:
         ]
         pipeline = mock_redis.pipeline.return_value
 
-        with patch("src.core.risk_manager.create_redis_client", return_value=mock_redis):
+        with patch(
+            "src.core.risk_manager.create_redis_client", return_value=mock_redis
+        ):
             service = AccountService()
 
         position = Position(
@@ -1358,14 +1457,18 @@ class TestAccountService:
         """close() should close Redis connection."""
         mock_redis = MagicMock()
         mock_redis.ping.return_value = True
-        with patch("src.core.risk_manager.create_redis_client", return_value=mock_redis):
+        with patch(
+            "src.core.risk_manager.create_redis_client", return_value=mock_redis
+        ):
             service = AccountService()
         service.close()
         mock_redis.close.assert_called_once()
 
     def test_close_without_redis(self):
         """close() should not raise when redis is None."""
-        with patch("src.core.risk_manager.create_redis_client", side_effect=Exception("fail")):
+        with patch(
+            "src.core.risk_manager.create_redis_client", side_effect=Exception("fail")
+        ):
             service = AccountService()
         service.close()  # Should not raise
 
@@ -1447,8 +1550,7 @@ class TestRiskManagerWithCapitalAllocator:
         # Set position with exposure below configured max position notional
         # but above per-strategy limit (20000)
         position = position_factory(
-            quantity=Decimal("0.5"),
-            entry_price=Decimal("45000")
+            quantity=Decimal("0.5"), entry_price=Decimal("45000")
         )
         mock_account_service.set_position(position)
 
@@ -1460,14 +1562,14 @@ class TestRiskManagerWithCapitalAllocator:
         )
 
         signal = signal_factory(signal_type=SignalType.LONG, value=None)
-        is_allowed, reason = risk_manager.check_risk(signal, current_price=Decimal("45000"))
+        is_allowed, reason = risk_manager.check_risk(
+            signal, current_price=Decimal("45000")
+        )
 
         assert is_allowed is False
         assert "strategy" in reason.lower()
 
-    def test_backward_compat_no_allocator(
-        self, mock_account_service, signal_factory
-    ):
+    def test_backward_compat_no_allocator(self, mock_account_service, signal_factory):
         """Without CapitalAllocator, RiskManager should behave exactly as before."""
         mock_account_service.set_balance(Decimal("10000"))
         risk_manager = RiskManager(mock_account_service)
@@ -1485,7 +1587,9 @@ class TestRiskManagerWithCapitalAllocator:
 
         allocator = CapitalAllocator(Decimal("100000"))
         allocator.allocate("test_strategy", Decimal("50000"))
-        position = position_factory(quantity=Decimal("0.25"), entry_price=Decimal("40000"))
+        position = position_factory(
+            quantity=Decimal("0.25"), entry_price=Decimal("40000")
+        )
         mock_account_service.set_position(position)
         spec = InstrumentSpec(
             product_id=position.product_id,

@@ -4,7 +4,6 @@ from __future__ import annotations
 
 from collections.abc import Callable
 from decimal import Decimal
-from threading import Event, Thread
 from typing import Any
 
 from src.core.adapters.rithmic_adapter import RithmicExchangeAdapter
@@ -12,8 +11,27 @@ from src.core.adapters.rithmic_recovery import (
     load_rithmic_recovery_snapshot,
     rithmic_order_may_be_working,
 )
+from src.core.adapters.rithmic_order_event_lifecycle import (
+    RithmicOrderEventLifecycleGate,
+)
 from src.core.execution import ExecutionEngine, ExitDecision
 from src.core.models import Candlestick, OrderStatus, Signal, SignalType
+
+
+class _PortfolioExitOperationFailure(Exception):
+    """Carry a failed gated operation to post-gate compensation scheduling."""
+
+    def __init__(
+        self,
+        error: Exception,
+        reason: str,
+        *,
+        compensation_required: bool,
+    ) -> None:
+        super().__init__(reason)
+        self.error = error
+        self.reason = reason
+        self.compensation_required = compensation_required
 
 
 class RithmicPortfolioExitService:
@@ -27,8 +45,8 @@ class RithmicPortfolioExitService:
         account_service: Any,
         profile: str,
         account_id: str,
-        order_event_stop: Event,
-        order_event_thread: Thread | None,
+        operation_gate: RithmicOrderEventLifecycleGate,
+        stop_order_event_stream: Callable[..., bool],
         assert_leadership: Callable[[], None],
         restart_order_stream: Callable[[], None],
         lockdown: Callable[[str], None],
@@ -42,14 +60,13 @@ class RithmicPortfolioExitService:
         self.account_service = account_service
         self.profile = profile
         self.account_id = account_id
-        self.order_event_stop = order_event_stop
-        self.order_event_thread = order_event_thread
+        self.operation_gate = operation_gate
+        self.stop_order_event_stream = stop_order_event_stream
         self.assert_leadership = assert_leadership
         self.restart_order_stream = restart_order_stream
         self.lockdown = lockdown
         self.schedule_emergency_flatten = schedule_emergency_flatten
         self.portfolio_id_for_sleeve = portfolio_id_for_sleeve
-        self._compensation_required = False
 
     def execute(
         self,
@@ -68,11 +85,50 @@ class RithmicPortfolioExitService:
         if exit_quantity is None:
             raise RuntimeError("rithmic_portfolio_exit_quantity_missing")
 
+        def execute_validated() -> dict[str, object]:
+            try:
+                return self._execute_validated(
+                    signal,
+                    decision,
+                    candle,
+                    exit_quantity,
+                )
+            except _PortfolioExitOperationFailure as failure:
+                if failure.compensation_required:
+                    try:
+                        self.schedule_emergency_flatten(failure.reason)
+                    except Exception as compensation_error:
+                        self.lockdown(
+                            "rithmic_portfolio_exit_compensation_schedule_failed:"
+                            f"{type(compensation_error).__name__}"
+                        )
+                        raise RuntimeError(
+                            "rithmic_portfolio_exit_compensation_schedule_failed"
+                        ) from compensation_error
+                raise failure.error
+
+        return self.operation_gate.run(execute_validated)
+
+    def _execute_validated(
+        self,
+        signal: Signal,
+        decision: ExitDecision,
+        candle: Candlestick | None,
+        exit_quantity: Decimal,
+    ) -> dict[str, object]:
         operation_failed = False
+        order_event_stopped = False
+        compensation_required = False
         outcome: dict[str, object] | None = None
-        self.order_event_stop.set()
+
+        def mark_compensation_required() -> None:
+            nonlocal compensation_required
+            compensation_required = True
+
         try:
-            self._join_order_event_thread()
+            if not self.stop_order_event_stream(timeout=30.0):
+                raise RuntimeError("rithmic_portfolio_exit_event_stream_stop_timeout")
+            order_event_stopped = True
             expected_side = (
                 "LONG"
                 if signal.type == SignalType.EXIT_LONG
@@ -88,6 +144,7 @@ class RithmicPortfolioExitService:
             cancelled_orders, cancelled_identities = self._cancel_strategy_orders(
                 signal.strategy_id,
                 signal.product_id,
+                mark_compensation_required=mark_compensation_required,
             )
             _, remote_quantity = self._verified_preflight_position(
                 signal,
@@ -98,7 +155,7 @@ class RithmicPortfolioExitService:
             expected_remaining_quantity = remote_quantity - exit_quantity
             self.assert_leadership()
             self.adapter.start_order_event_stream()
-            self._compensation_required = True
+            compensation_required = True
             order_id = self.execution_engine.submit_verified_net_reduction(
                 signal,
                 decision,
@@ -145,7 +202,7 @@ class RithmicPortfolioExitService:
                     )
                     and local_sleeve_position is None
                 ):
-                    self._compensation_required = False
+                    compensation_required = False
                     self.execution_engine.record_verified_net_reduction(
                         signal,
                         order_id,
@@ -171,35 +228,26 @@ class RithmicPortfolioExitService:
         except Exception as error:
             operation_failed = True
             reason = (
-                "rithmic_portfolio_exit_requires_reconciliation:"
-                f"{type(error).__name__}"
+                f"rithmic_portfolio_exit_requires_reconciliation:{type(error).__name__}"
             )
             self.lockdown(reason)
-            if self._compensation_required:
-                try:
-                    self.schedule_emergency_flatten(reason)
-                except Exception as compensation_error:
-                    self.lockdown(
-                        "rithmic_portfolio_exit_compensation_schedule_failed:"
-                        f"{type(compensation_error).__name__}"
-                    )
-                    raise RuntimeError(
-                        "rithmic_portfolio_exit_compensation_schedule_failed"
-                    ) from compensation_error
-            raise
+            raise _PortfolioExitOperationFailure(
+                error,
+                reason,
+                compensation_required=compensation_required,
+            ) from error
         finally:
-            try:
-                self.assert_leadership()
-                self.restart_order_stream()
-            except Exception:
-                self.adapter.close()
-                self.lockdown(
-                    "rithmic_portfolio_exit_order_stream_restart_failed"
-                )
-                if not operation_failed:
-                    raise RuntimeError(
-                        "rithmic_portfolio_exit_order_stream_restart_failed"
-                    )
+            if order_event_stopped:
+                try:
+                    self.assert_leadership()
+                    self.restart_order_stream()
+                except Exception:
+                    self.adapter.close()
+                    self.lockdown("rithmic_portfolio_exit_order_stream_restart_failed")
+                    if not operation_failed:
+                        raise RuntimeError(
+                            "rithmic_portfolio_exit_order_stream_restart_failed"
+                        )
         return outcome
 
     def _verified_preflight_position(
@@ -278,16 +326,6 @@ class RithmicPortfolioExitService:
         ):
             raise RuntimeError("rithmic_portfolio_exit_local_position_changed")
 
-    def _join_order_event_thread(self) -> None:
-        thread = self.order_event_thread
-        if thread is None or not thread.is_alive():
-            return
-        thread.join(timeout=30.0)
-        if thread.is_alive():
-            raise RuntimeError(
-                "rithmic_portfolio_exit_event_stream_stop_timeout"
-            )
-
     def _load_snapshot(self):
         self.adapter.close()
         recoverable_orders = [
@@ -303,9 +341,7 @@ class RithmicPortfolioExitService:
         )
 
     def _reconcile(self, snapshot) -> dict[str, object]:
-        return self.execution_engine.reconcile_rithmic_owned_orders(
-            self.profile,
-            self.account_id,
+        return self.execution_engine.reconcile_owned_orders(
             snapshot_loader=lambda *_args, **_kwargs: snapshot,
         )
 
@@ -325,6 +361,8 @@ class RithmicPortfolioExitService:
         self,
         strategy_id: str,
         product_id: str,
+        *,
+        mark_compensation_required: Callable[[], None],
     ) -> tuple[int, set[tuple[str | None, str | None]]]:
         active_statuses = {
             OrderStatus.NEW.value,
@@ -388,7 +426,7 @@ class RithmicPortfolioExitService:
                     f"order_id={order.id}"
                 )
             self.assert_leadership()
-            self._compensation_required = True
+            mark_compensation_required()
             if not self.adapter.cancel_order(
                 remote.exchange_order_id,
                 order.product_id,

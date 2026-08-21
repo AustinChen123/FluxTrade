@@ -1,3 +1,5 @@
+from collections.abc import Callable
+from dataclasses import replace
 from decimal import Decimal
 
 import pytest
@@ -55,9 +57,17 @@ def test_precision_codec_supports_explicit_rounding_modes():
         )
     )
 
-    assert codec.encode_price(Decimal("104523.74"), rounding=RoundingMode.DOWN) == 1_045_237
-    assert codec.encode_price(Decimal("104523.71"), rounding=RoundingMode.UP) == 1_045_238
-    assert codec.encode_price(Decimal("104523.75"), rounding=RoundingMode.NEAREST) == 1_045_238
+    assert (
+        codec.encode_price(Decimal("104523.74"), rounding=RoundingMode.DOWN)
+        == 1_045_237
+    )
+    assert (
+        codec.encode_price(Decimal("104523.71"), rounding=RoundingMode.UP) == 1_045_238
+    )
+    assert (
+        codec.encode_price(Decimal("104523.75"), rounding=RoundingMode.NEAREST)
+        == 1_045_238
+    )
 
 
 def test_precision_codec_encodes_fee_rates():
@@ -95,8 +105,10 @@ def test_precision_codec_rejects_float_inputs():
         )
     )
 
+    runtime_encode_price: Callable[..., int] = codec.encode_price
+
     with pytest.raises(TypeError, match="Decimal, str, or int"):
-        codec.encode_price(0.29)
+        runtime_encode_price(0.29)
 
 
 def test_precision_codec_rejects_negative_values():
@@ -120,8 +132,10 @@ def test_precision_spec_rejects_non_positive_steps():
 
 
 def test_precision_spec_requires_decimal_steps():
+    spec = PrecisionSpec(
+        price_tick=Decimal("0.01"),
+        quantity_step=Decimal("0.001"),
+    )
+
     with pytest.raises(TypeError, match="price_tick must be Decimal"):
-        PrecisionSpec(
-            price_tick="0.01",
-            quantity_step=Decimal("0.001"),
-        )
+        replace(spec, price_tick="0.01")

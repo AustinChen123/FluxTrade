@@ -46,6 +46,70 @@ class StrategyLoader:
             return StrategyLoader._scan_directory(path)
 
     @staticmethod
+    def scan_production_sources(
+        primary_path: str,
+        *,
+        break_glass_path: str | None = None,
+    ) -> Dict[str, LoadResult]:
+        """Load preflighted catalog-only production artifact sources."""
+        with StrategyLoader._SCAN_LOCK:
+            try:
+                roots = [Path(primary_path)]
+                if break_glass_path is not None:
+                    roots.append(Path(break_glass_path))
+                for root in roots:
+                    StrategyLoader._validate_production_source(root)
+
+                combined: Dict[str, LoadResult] = {}
+                for root in roots:
+                    source = StrategyLoader._scan_directory(str(root))
+                    failures = [
+                        error for error in source.values() if isinstance(error, str)
+                    ]
+                    if failures:
+                        raise ValueError(failures[0])
+                    duplicate_ids = combined.keys() & source.keys()
+                    if duplicate_ids:
+                        duplicate = min(duplicate_ids)
+                        raise ValueError(f"duplicate strategy id: {duplicate}")
+                    combined.update(source)
+                return combined
+            except Exception:
+                error_trace = traceback.format_exc()
+                logger.error(
+                    "Failed to load production strategy source:\n%s", error_trace
+                )
+                return {f"{StrategyLoader.CATALOG_NAME}::LoadError": error_trace}
+
+    @staticmethod
+    def _validate_production_source(root: Path) -> None:
+        if root.is_symlink():
+            raise ValueError(f"production strategy source contains symlink: {root}")
+        if not root.exists():
+            raise ValueError(f"production strategy source does not exist: {root}")
+        if not root.is_dir():
+            raise ValueError(f"production strategy source is not a directory: {root}")
+
+        paths = [root, *root.rglob("*")]
+        for path in paths:
+            if path.is_symlink():
+                raise ValueError(f"production strategy source contains symlink: {path}")
+            if os.access(path, os.W_OK):
+                raise ValueError(f"production strategy source is writable: {path}")
+
+        children = list(root.iterdir())
+        if not children:
+            return
+        root_catalog = root / StrategyLoader.CATALOG_NAME
+        if root_catalog.is_file():
+            return
+        if any(
+            not child.is_dir() or not (child / StrategyLoader.CATALOG_NAME).is_file()
+            for child in children
+        ):
+            raise ValueError("production strategy source must be catalog-only")
+
+    @staticmethod
     def _scan_directory(path: str) -> Dict[str, LoadResult]:
         strategies: Dict[str, LoadResult] = {}
         if not os.path.exists(path):

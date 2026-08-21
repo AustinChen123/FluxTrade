@@ -17,10 +17,14 @@ test_adapters_simulated.py for coverage of those behaviours.
 from contextlib import nullcontext
 from decimal import Decimal
 import inspect
+from types import MappingProxyType
+from unittest.mock import MagicMock
 
 import pytest
+from sqlalchemy.orm import Session
 
 from src.core.interfaces.repository import IOrderRepository
+from src.core.models import OrderStatus
 from src.core.repositories import BacktestOrderRepository, LiveOrderRepository
 from src.core.orm_models import Order, Position, Trade
 
@@ -58,9 +62,7 @@ class TestBacktestOrderRepositoryBasics:
     def test_initialization_custom_balance(self, mock_db_session):
         """Should accept custom initial balance."""
         repo = BacktestOrderRepository(
-            mock_db_session,
-            session_id=1,
-            initial_balance=Decimal("50000")
+            mock_db_session, session_id=1, initial_balance=Decimal("50000")
         )
 
         assert repo.balance == Decimal("50000")
@@ -115,8 +117,14 @@ class TestBacktestPositionDelegation:
         repo = BacktestOrderRepository(mock_db_session, session_id=1)
 
         # Should not raise and should not change balance
-        repo.update_position("test", "BINANCE:BTCUSDT-PERP", "buy",
-                             Decimal("1.0"), Decimal("42000"), "BUY")
+        repo.update_position(
+            "test",
+            "BINANCE:BTCUSDT-PERP",
+            "buy",
+            Decimal("1.0"),
+            Decimal("42000"),
+            "BUY",
+        )
 
         assert repo.balance == Decimal("10000")
         mock_db_session.add.assert_not_called()
@@ -140,12 +148,17 @@ class TestBacktestPositionDelegation:
 class TestBacktestTradeLogging:
     """Tests for trade logging in BacktestOrderRepository."""
 
-    def test_accepts_session_factory(self, mock_db_session):
+    def test_accepts_session_factory(self, monkeypatch: pytest.MonkeyPatch):
         """Backtest trade logging should use an injected session factory."""
+        db_session = Session()
+        add = MagicMock()
+        commit = MagicMock()
+        monkeypatch.setattr(db_session, "add", add)
+        monkeypatch.setattr(db_session, "commit", commit)
         repo = BacktestOrderRepository(
             None,
             session_id=42,
-            db_session_factory=lambda: nullcontext(mock_db_session),
+            db_session_factory=lambda: nullcontext(db_session),
         )
         trade = Trade(
             order_id="order-1",
@@ -161,8 +174,8 @@ class TestBacktestTradeLogging:
 
         repo.add_trade(trade)
 
-        mock_db_session.add.assert_called()
-        mock_db_session.commit.assert_called()
+        add.assert_called_once()
+        commit.assert_called_once()
 
     def test_add_trade_calls_db(self, mock_db_session, order_factory):
         """add_trade should create BacktestTradeLog and commit."""
@@ -208,10 +221,7 @@ class TestBacktestTradeLogging:
                 )
             )
 
-        persisted = [
-            call.args[0]
-            for call in mock_db_session.add.call_args_list
-        ]
+        persisted = [call.args[0] for call in mock_db_session.add.call_args_list]
         assert [trade.fill_sequence for trade in persisted] == [0, 1]
 
     def test_failed_commit_does_not_consume_fill_sequence(
@@ -241,10 +251,7 @@ class TestBacktestTradeLogging:
             repo.add_trade(trade("failed"))
         repo.add_trade(trade("retry"))
 
-        persisted = [
-            call.args[0]
-            for call in mock_db_session.add.call_args_list
-        ]
+        persisted = [call.args[0] for call in mock_db_session.add.call_args_list]
         assert [item.fill_sequence for item in persisted] == [0, 0]
 
     def test_update_order_exchange_id(self, mock_db_session, order_factory):
@@ -261,7 +268,13 @@ class TestBacktestTradeLogging:
 # LiveOrderRepository
 # =============================================================================
 
+
 class TestLiveOrderRepositoryBasics:
+    def test_missing_session_fails_only_when_database_work_begins(self):
+        repo = LiveOrderRepository()
+
+        with pytest.raises(RuntimeError, match="^database session is required$"):
+            repo.get_order("order-1")
 
     def test_accepts_session_factory(
         self,
@@ -326,6 +339,167 @@ class TestLiveOrderRepositoryBasics:
         assert result is not None
         assert result.id == "order-1"
 
+    def test_cancellation_snapshot_and_command_are_account_scoped(
+        self,
+        sqlite_order_session_factory,
+        order_factory,
+    ):
+        unbound = LiveOrderRepository(db_session_factory=sqlite_order_session_factory)
+        current_order = order_factory(
+            order_id="current",
+            account_profile="binance",
+            account_id="ACCOUNT-A",
+            product_id="BINANCE:BTCUSDT-PERP",
+            client_order_id="shared-client",
+            exchange_order_id="shared-exchange",
+            status=OrderStatus.SUBMITTED.value,
+            filled_quantity=Decimal("0.25"),
+        )
+        foreign_order = order_factory(
+            order_id="foreign",
+            account_profile="binance",
+            account_id="ACCOUNT-B",
+            product_id="BINANCE:BTCUSDT-PERP",
+            client_order_id="shared-client",
+            exchange_order_id="shared-exchange",
+            status=OrderStatus.SUBMITTED.value,
+        )
+        unbound.add_order(current_order)
+        unbound.add_order(foreign_order)
+        current = LiveOrderRepository(
+            db_session_factory=sqlite_order_session_factory,
+            account_profile="binance",
+            account_id="ACCOUNT-A",
+        )
+
+        snapshot = current.get_order_for_cancellation("current")
+
+        assert snapshot is not None
+        assert (
+            snapshot.id,
+            snapshot.product_id,
+            snapshot.type,
+            snapshot.status,
+            snapshot.filled_quantity,
+            snapshot.client_order_id,
+            snapshot.exchange_order_id,
+        ) == (
+            "current",
+            "BINANCE:BTCUSDT-PERP",
+            current_order.type,
+            OrderStatus.SUBMITTED.value,
+            Decimal("0.25"),
+            "shared-client",
+            "shared-exchange",
+        )
+        assert current.get_order_for_cancellation("foreign") is None
+
+        current.mark_order_cancelled("current")
+
+        persisted_current = current.get_order("current")
+        persisted_foreign = unbound.get_order("foreign")
+        assert persisted_current is not None
+        assert persisted_foreign is not None
+        assert persisted_current.status == OrderStatus.CANCELLED.value
+        assert persisted_foreign.status == OrderStatus.SUBMITTED.value
+        with pytest.raises(RuntimeError, match="^cancellation_order_not_found$"):
+            current.mark_order_cancelled("foreign")
+
+    def test_conditional_order_commands_are_account_scoped(
+        self,
+        sqlite_order_session_factory,
+        order_factory,
+    ):
+        unbound = LiveOrderRepository(db_session_factory=sqlite_order_session_factory)
+        current_order = order_factory(
+            order_id="current-conditional",
+            account_profile="binance",
+            account_id="ACCOUNT-A",
+            exchange_id="BINANCE",
+            status=OrderStatus.NEW.value,
+        )
+        foreign_order = order_factory(
+            order_id="foreign-conditional",
+            account_profile="binance",
+            account_id="ACCOUNT-B",
+            exchange_id="BINANCE",
+            status=OrderStatus.NEW.value,
+        )
+        unbound.add_order(current_order)
+        unbound.add_order(foreign_order)
+        current = LiveOrderRepository(
+            db_session_factory=sqlite_order_session_factory,
+            account_profile="binance",
+            account_id="ACCOUNT-A",
+        )
+
+        loaded = current.get_conditional_order("current-conditional")
+        assert loaded is not None
+        assert current.get_conditional_order("foreign-conditional") is None
+        assert [
+            order.id
+            for order in current.list_conditional_orders_by_statuses(
+                {OrderStatus.NEW.value},
+                exchange_id="binance",
+            )
+        ] == ["current-conditional"]
+
+        loaded.intent_payload = {"placement_mode": "place-after-fill"}
+        current.persist_conditional_order(loaded)
+
+        persisted_current = current.get_order("current-conditional")
+        persisted_foreign = unbound.get_order("foreign-conditional")
+        assert persisted_current is not None
+        assert persisted_foreign is not None
+        assert persisted_current.intent_payload == {
+            "placement_mode": "place-after-fill"
+        }
+        assert persisted_foreign.intent_payload is None
+
+    def test_backtest_conditional_port_retains_noop_semantics(
+        self,
+        mock_db_session,
+        order_factory,
+    ):
+        repository = BacktestOrderRepository(mock_db_session, session_id=1)
+        order = order_factory()
+
+        repository.persist_conditional_order(order)
+
+        assert repository.get_conditional_order(order.id) is None
+        assert (
+            repository.list_conditional_orders_by_statuses({OrderStatus.NEW.value})
+            == []
+        )
+        mock_db_session.add.assert_not_called()
+        mock_db_session.commit.assert_not_called()
+
+    def test_backtest_cancellation_port_has_no_persisted_order(
+        self,
+        mock_db_session,
+    ):
+        repository = BacktestOrderRepository(mock_db_session, session_id=1)
+
+        assert repository.get_order_for_cancellation("missing") is None
+        with pytest.raises(RuntimeError, match="^cancellation_order_not_found$"):
+            repository.mark_order_cancelled("missing")
+
+    def test_backtest_verified_reduction_port_has_no_persisted_order(
+        self,
+        mock_db_session,
+    ):
+        repository = BacktestOrderRepository(mock_db_session, session_id=1)
+
+        assert repository.get_verified_net_reduction_order("missing") is None
+        assert (
+            repository.get_verified_net_reduction_order_by_client_id("missing") is None
+        )
+        with pytest.raises(
+            RuntimeError,
+            match="^verified_net_reduction_order_not_found$",
+        ):
+            repository.persist_verified_net_reduction("missing", {})
+
     def test_get_order_by_client_order_id(
         self,
         sqlite_order_session_factory,
@@ -340,6 +514,220 @@ class TestLiveOrderRepositoryBasics:
 
         assert result is not None
         assert result.id == "order-1"
+
+    def test_bound_repository_scopes_same_provider_ids_by_account(
+        self,
+        sqlite_order_session_factory,
+        order_factory,
+    ) -> None:
+        unbound = LiveOrderRepository(db_session_factory=sqlite_order_session_factory)
+        for account_id in ("ACCOUNT-A", "ACCOUNT-B"):
+            unbound.add_order(
+                order_factory(
+                    order_id=f"order-{account_id}",
+                    client_order_id="shared-client",
+                    exchange_order_id="shared-exchange",
+                    account_profile="binance",
+                    account_id=account_id,
+                    status="SUBMITTED",
+                )
+            )
+        current = LiveOrderRepository(
+            db_session_factory=sqlite_order_session_factory,
+            account_profile="binance",
+            account_id="ACCOUNT-A",
+        )
+
+        current_by_client = current.get_order_by_client_order_id("shared-client")
+        current_by_exchange = current.get_order_by_exchange_order_id(
+            "shared-exchange",
+            exchange_id="BINANCE",
+        )
+        assert current.get_order("order-ACCOUNT-B") is None
+        assert current_by_client is not None
+        assert current_by_exchange is not None
+        assert current_by_client.id == "order-ACCOUNT-A"
+        assert current_by_exchange.id == "order-ACCOUNT-A"
+        assert [
+            order.id
+            for order in current.list_client_orders_by_statuses(
+                {"SUBMITTED"}, exchange_id="BINANCE"
+            )
+        ] == ["order-ACCOUNT-A"]
+
+    def test_verified_reduction_port_projects_and_persists_only_current_account(
+        self,
+        sqlite_order_session_factory,
+        order_factory,
+    ) -> None:
+        unbound = LiveOrderRepository(db_session_factory=sqlite_order_session_factory)
+        current_order = order_factory(
+            order_id="order-current",
+            client_order_id="shared-client",
+            order_type="market",
+            side="sell",
+            quantity=Decimal("2.00"),
+            filled_quantity=Decimal("2.00"),
+            status=OrderStatus.FILLED.value,
+            account_profile="binance",
+            account_id="ACCOUNT-A",
+        )
+        current_order.intent_payload = {
+            "source": "authoritative_net_reduction",
+            "signal": {"type": "EXIT_LONG"},
+        }
+        foreign_order = order_factory(
+            order_id="order-foreign",
+            client_order_id="shared-client",
+            account_profile="binance",
+            account_id="ACCOUNT-B",
+        )
+        foreign_order.intent_payload = {"source": "foreign"}
+        unbound.add_order(current_order)
+        unbound.add_order(foreign_order)
+        current = LiveOrderRepository(
+            db_session_factory=sqlite_order_session_factory,
+            account_profile="binance",
+            account_id="ACCOUNT-A",
+        )
+
+        snapshot = current.get_verified_net_reduction_order_by_client_id(
+            "shared-client"
+        )
+
+        assert snapshot is not None
+        assert snapshot == current.get_verified_net_reduction_order("order-current")
+        assert (
+            snapshot.id,
+            snapshot.client_order_id,
+            snapshot.strategy_id,
+            snapshot.product_id,
+            snapshot.type,
+            snapshot.side,
+            snapshot.quantity,
+            snapshot.filled_quantity,
+            snapshot.status,
+        ) == (
+            "order-current",
+            "shared-client",
+            "test_strategy",
+            "BINANCE:BTCUSDT-PERP",
+            "market",
+            "sell",
+            Decimal("2.00"),
+            Decimal("2.00"),
+            OrderStatus.FILLED.value,
+        )
+        assert snapshot.intent_payload is not None
+        assert type(snapshot.intent_payload) is MappingProxyType
+
+        persisted_payload = {
+            **dict(snapshot.intent_payload),
+            "authoritative_verification": {"status": "verified"},
+        }
+        current.persist_verified_net_reduction(snapshot.id, persisted_payload)
+
+        persisted_current = unbound.get_order("order-current")
+        persisted_foreign = unbound.get_order("order-foreign")
+        assert persisted_current is not None
+        assert persisted_foreign is not None
+        assert persisted_current.intent_payload == persisted_payload
+        assert (
+            persisted_current.id,
+            persisted_current.client_order_id,
+            persisted_current.strategy_id,
+            persisted_current.product_id,
+            persisted_current.type,
+            persisted_current.side,
+            persisted_current.quantity,
+            persisted_current.filled_quantity,
+            persisted_current.status,
+            persisted_current.account_profile,
+            persisted_current.account_id,
+        ) == (
+            snapshot.id,
+            snapshot.client_order_id,
+            snapshot.strategy_id,
+            snapshot.product_id,
+            snapshot.type,
+            snapshot.side,
+            snapshot.quantity,
+            snapshot.filled_quantity,
+            snapshot.status,
+            "binance",
+            "ACCOUNT-A",
+        )
+        assert persisted_foreign.intent_payload == {"source": "foreign"}
+        with pytest.raises(
+            RuntimeError,
+            match="^verified_net_reduction_order_not_found$",
+        ):
+            current.persist_verified_net_reduction(
+                "order-foreign",
+                {"source": "mutated"},
+            )
+
+    @pytest.mark.parametrize("phase", ["query", "commit"])
+    def test_verified_reduction_persistence_preserves_storage_failure_identity(
+        self,
+        mock_db_session,
+        order_factory,
+        phase,
+    ) -> None:
+        repository = LiveOrderRepository(db_session=mock_db_session)
+        order = order_factory(order_id="order-1")
+        failure = RuntimeError(f"{phase}-sentinel")
+        if phase == "query":
+            mock_db_session.query.side_effect = failure
+        else:
+            mock_db_session.query.return_value.filter_by.return_value.first.return_value = order
+            mock_db_session.commit.side_effect = failure
+
+        with pytest.raises(RuntimeError) as raised:
+            repository.persist_verified_net_reduction(
+                "order-1",
+                {"source": "authoritative_net_reduction"},
+            )
+
+        assert raised.value is failure
+        if phase == "query":
+            mock_db_session.commit.assert_not_called()
+        else:
+            mock_db_session.commit.assert_called_once_with()
+
+    def test_bound_repository_rejects_legacy_identifier_collision(
+        self,
+        sqlite_order_session_factory,
+        order_factory,
+    ) -> None:
+        unbound = LiveOrderRepository(db_session_factory=sqlite_order_session_factory)
+        unbound.add_order(
+            order_factory(
+                order_id="legacy",
+                client_order_id="shared-client",
+                exchange_order_id="shared-exchange",
+            )
+        )
+        current = LiveOrderRepository(
+            db_session_factory=sqlite_order_session_factory,
+            account_profile="binance",
+            account_id="ACCOUNT-A",
+        )
+
+        with pytest.raises(
+            RuntimeError,
+            match="^order_account_identity_legacy_collision$",
+        ):
+            current.add_order(
+                order_factory(
+                    order_id="identified",
+                    client_order_id="shared-client",
+                    exchange_order_id="shared-exchange",
+                )
+            )
+
+        assert current.list_legacy_orders_by_statuses({"open"})[0].id == "legacy"
+        assert unbound.list_legacy_orders_by_statuses({"open"}) == []
 
     def test_list_client_orders_by_statuses_filters_status_and_client_id(
         self,
@@ -386,6 +774,103 @@ class TestLiveOrderRepositoryBasics:
 
         assert repo.list_client_orders_by_statuses(set()) == []
 
+    @pytest.mark.parametrize(
+        ("exchange_id", "expected_ids"),
+        [
+            ("binance", ["current"]),
+            ("BINANCE", ["current"]),
+            ("bin", []),
+            ("binance ", []),
+            ("", []),
+            (None, ["current", "foreign"]),
+        ],
+    )
+    @pytest.mark.parametrize(
+        "status",
+        ["NEW", "SUBMITTED_UNCONFIRMED", "SUBMITTED", "PARTIALLY_FILLED"],
+    )
+    def test_order_status_queries_apply_exact_optional_venue_scope(
+        self,
+        sqlite_order_session_factory,
+        order_factory,
+        exchange_id,
+        expected_ids,
+        status,
+    ):
+        repo = LiveOrderRepository(db_session_factory=sqlite_order_session_factory)
+        repo.add_order(
+            order_factory(
+                order_id="current",
+                exchange_id="BINANCE",
+                client_order_id="current-client",
+                status=status,
+            )
+        )
+        repo.add_order(
+            order_factory(
+                order_id="foreign",
+                exchange_id="BYBIT",
+                product_id="BYBIT:BTCUSDT-PERP",
+                client_order_id="foreign-client",
+                status=status,
+            )
+        )
+
+        client_orders = repo.list_client_orders_by_statuses(
+            {status},
+            exchange_id=exchange_id,
+        )
+        all_orders = repo.list_orders_by_statuses(
+            {status},
+            exchange_id=exchange_id,
+        )
+
+        assert [order.id for order in client_orders] == expected_ids
+        assert [order.id for order in all_orders] == expected_ids
+
+    @pytest.mark.parametrize(
+        "status",
+        ["NEW", "SUBMITTED_UNCONFIRMED", "SUBMITTED", "PARTIALLY_FILLED"],
+    )
+    def test_in_memory_status_queries_apply_the_same_venue_scope(
+        self,
+        mock_order_repo,
+        order_factory,
+        status,
+    ):
+        mock_order_repo.add_order(
+            order_factory(
+                order_id="current",
+                exchange_id="BINANCE",
+                client_order_id="current-client",
+                status=status,
+            )
+        )
+        mock_order_repo.add_order(
+            order_factory(
+                order_id="foreign",
+                exchange_id="BYBIT",
+                product_id="BYBIT:BTCUSDT-PERP",
+                client_order_id="foreign-client",
+                status=status,
+            )
+        )
+
+        assert [
+            order.id
+            for order in mock_order_repo.list_client_orders_by_statuses(
+                {status},
+                exchange_id="binance",
+            )
+        ] == ["current"]
+        assert [
+            order.id
+            for order in mock_order_repo.list_orders_by_statuses(
+                {status},
+                exchange_id="BINANCE",
+            )
+        ] == ["current"]
+
     def test_add_trade_commits(
         self,
         sqlite_order_session_factory,
@@ -413,6 +898,43 @@ class TestLiveOrderRepositoryBasics:
         with sqlite_order_session_factory() as session:
             assert session.get(Trade, "t1") is not None
 
+    def test_persist_fill_commits_order_and_trade_together(
+        self,
+        sqlite_order_session_factory,
+        order_factory,
+    ):
+        repo = LiveOrderRepository(db_session_factory=sqlite_order_session_factory)
+        order = order_factory(order_id="atomic-order", status="open")
+        repo.add_order(order)
+        order.status = "closed"
+        order.filled_quantity = Decimal("1")
+        order.filled_price = Decimal("42000")
+        trade = Trade(
+            id="atomic-trade",
+            order_id=order.id,
+            exchange_trade_id="atomic-trade",
+            product_id=order.product_id,
+            side=order.side,
+            price=Decimal("42000"),
+            quantity=Decimal("1"),
+            fee=Decimal("2.52"),
+            fee_asset="USDT",
+            timestamp=1704067200000,
+        )
+        trade_id = trade.id
+
+        repo.persist_fill(order, trade)
+
+        with sqlite_order_session_factory() as session:
+            persisted_order = session.get(Order, order.id)
+            persisted_trade = session.get(Trade, trade_id)
+
+        assert persisted_order is not None
+        assert persisted_order.status == "closed"
+        assert persisted_order.filled_quantity == Decimal("1")
+        assert persisted_trade is not None
+        assert persisted_trade.order_id == order.id
+
     def test_update_order_exchange_id_commits(
         self,
         sqlite_order_session_factory,
@@ -433,7 +955,6 @@ class TestLiveOrderRepositoryBasics:
 
 
 class TestLiveOrderRepositoryPositionUpdate:
-
     def test_buy_creates_new_position(self, sqlite_order_session_factory):
         """Buying when no position exists should create a new position."""
         repo = LiveOrderRepository(db_session_factory=sqlite_order_session_factory)

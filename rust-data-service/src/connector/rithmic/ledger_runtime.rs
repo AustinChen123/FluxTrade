@@ -12,6 +12,88 @@ use anyhow::{ensure, Context, Result};
 use std::{collections::HashSet, time::Duration};
 use tracing::warn;
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct LedgerSnapshotFailure(&'static str, &'static str, &'static str);
+
+impl LedgerSnapshotFailure {
+    pub(crate) const REQUEST_VALIDATION: Self = Self::new(
+        "request_validation",
+        "invalid_ledger_snapshot_request",
+        "ledger snapshot request validation failed",
+    );
+    pub(crate) const ORDER_CONFIG: Self =
+        Self::new("order_config", "order_config_failed", "ORDER config failed");
+    pub(crate) const ORDER_CONNECT: Self = Self::new(
+        "order_connect",
+        "order_connect_failed",
+        "ORDER connect failed",
+    );
+    pub(crate) const ORDER_HEARTBEAT: Self = Self::new(
+        "order_heartbeat",
+        "order_heartbeat_failed",
+        "ORDER heartbeat failed",
+    );
+    pub(crate) const ORDER_LOGIN_INFO: Self = Self::new(
+        "order_login_info",
+        "order_login_info_failed",
+        "ORDER login info failed",
+    );
+    pub(crate) const ORDER_ACCOUNT_LIST: Self = Self::new(
+        "order_account_list",
+        "order_account_list_failed",
+        "ORDER account list failed",
+    );
+    pub(crate) const ORDER_SNAPSHOT: Self = Self::new(
+        "order_snapshot",
+        "order_snapshot_failed",
+        "ORDER snapshot failed",
+    );
+    pub(crate) const ORDER_HISTORY: Self = Self::new(
+        "order_history",
+        "order_history_failed",
+        "ORDER history failed",
+    );
+    pub(crate) const FILL_HISTORY: Self =
+        Self::new("fill_history", "fill_history_failed", "fill history failed");
+    pub(crate) const PNL_CONFIG: Self =
+        Self::new("pnl_config", "pnl_config_failed", "PNL config failed");
+    pub(crate) const PNL_CONNECT: Self =
+        Self::new("pnl_connect", "pnl_connect_failed", "PNL connect failed");
+    pub(crate) const PNL_HEARTBEAT: Self = Self::new(
+        "pnl_heartbeat",
+        "pnl_heartbeat_failed",
+        "PNL heartbeat failed",
+    );
+    pub(crate) const PNL_REQUEST: Self =
+        Self::new("pnl_request", "pnl_request_failed", "PNL request failed");
+    pub(crate) const PNL_SNAPSHOT: Self =
+        Self::new("pnl_snapshot", "pnl_snapshot_failed", "PNL snapshot failed");
+
+    pub(crate) const fn new(stage: &'static str, code: &'static str, cause: &'static str) -> Self {
+        Self(stage, code, cause)
+    }
+
+    pub(crate) fn safe_fields(self) -> [&'static str; 3] {
+        [self.0, self.1, self.2]
+    }
+}
+
+impl std::fmt::Display for LedgerSnapshotFailure {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(self.safe_fields()[2])
+    }
+}
+
+trait FlattenTimeout<T> {
+    fn flatten_timeout(self, message: impl std::fmt::Display + Send + Sync + 'static) -> Result<T>;
+}
+
+impl<T> FlattenTimeout<T> for std::result::Result<Result<T>, tokio::time::error::Elapsed> {
+    fn flatten_timeout(self, message: impl std::fmt::Display + Send + Sync + 'static) -> Result<T> {
+        self.context(message).and_then(|inner| inner)
+    }
+}
+
 const RESPONSE_TIMEOUT: Duration = Duration::from_secs(10);
 const SNAPSHOT_TIMEOUT: Duration = Duration::from_secs(30);
 const HISTORY_TIMEOUT: Duration = Duration::from_secs(120);
@@ -54,30 +136,38 @@ pub(crate) async fn run_with_recovery(
     account_id: Option<&str>,
     recovery: Option<RecoveryQuery<'_>>,
 ) -> Result<RemoteLedgerSnapshot> {
-    let account_id = normalize_account_id(account_id)?;
+    let account_id =
+        normalize_account_id(account_id).context(LedgerSnapshotFailure::REQUEST_VALIDATION)?;
     if let Some(recovery) = recovery.as_ref() {
-        validate_recovery_query(recovery)?;
+        validate_recovery_query(recovery).context(LedgerSnapshotFailure::REQUEST_VALIDATION)?;
     }
 
-    let order_runtime = config::load(profile, Plant::Order)?;
+    let order_runtime =
+        config::load(profile, Plant::Order).context(LedgerSnapshotFailure::ORDER_CONFIG)?;
     let mut order_connection =
-        transport::connect(&order_runtime.url, order_runtime.login, RESPONSE_TIMEOUT).await?;
-    wait_for_heartbeat(&mut order_connection, "ORDER").await?;
+        transport::connect(&order_runtime.url, order_runtime.login, RESPONSE_TIMEOUT)
+            .await
+            .context(LedgerSnapshotFailure::ORDER_CONNECT)?;
+    wait_for_heartbeat(&mut order_connection, "ORDER")
+        .await
+        .context(LedgerSnapshotFailure::ORDER_HEARTBEAT)?;
 
     let account = discover_order_account(&mut order_connection, account_id).await?;
 
-    let orders = request_stable_order_snapshot(&mut order_connection, &account.identity).await?;
+    let orders = request_stable_order_snapshot(&mut order_connection, &account.identity)
+        .await
+        .context(LedgerSnapshotFailure::ORDER_SNAPSHOT)?;
     let (order_history, fills) = if let Some(recovery) = recovery {
         let mut order_history = Vec::new();
         for (index, basket_id) in recovery.basket_ids.iter().enumerate() {
             let request_key = format!("fluxtrade-ledger-order-history-{index}");
             order_connection
-                .send_payload(ledger::show_order_history_request(
-                    &request_key,
-                    &account.identity,
-                    basket_id,
-                )?)
-                .await?;
+                .send_payload(
+                    ledger::show_order_history_request(&request_key, &account.identity, basket_id)
+                        .context(LedgerSnapshotFailure::ORDER_HISTORY)?,
+                )
+                .await
+                .context(LedgerSnapshotFailure::ORDER_HISTORY)?;
             let mut history = tokio::time::timeout(
                 HISTORY_TIMEOUT,
                 collect_order_history(
@@ -88,51 +178,68 @@ pub(crate) async fn run_with_recovery(
                 ),
             )
             .await
-            .with_context(|| format!("Rithmic order history timed out for basket {basket_id}"))??;
+            .flatten_timeout(format!(
+                "Rithmic order history timed out for basket {basket_id}"
+            ))
+            .context(LedgerSnapshotFailure::ORDER_HISTORY)?;
             order_history.append(&mut history);
         }
 
         order_connection
-            .send_payload(ledger::show_fill_history_request(
-                FILL_HISTORY_KEY,
-                &account.identity,
-                recovery.fill_start_index,
-                recovery.fill_finish_index,
-                FILL_HISTORY_LIMIT as i32,
-            )?)
-            .await?;
+            .send_payload(
+                ledger::show_fill_history_request(
+                    FILL_HISTORY_KEY,
+                    &account.identity,
+                    recovery.fill_start_index,
+                    recovery.fill_finish_index,
+                    FILL_HISTORY_LIMIT as i32,
+                )
+                .context(LedgerSnapshotFailure::FILL_HISTORY)?,
+            )
+            .await
+            .context(LedgerSnapshotFailure::FILL_HISTORY)?;
         let (fills, fill_record_count) = tokio::time::timeout(
             HISTORY_TIMEOUT,
             collect_fills(&mut order_connection, &account.identity),
         )
         .await
-        .context("Rithmic fill history timed out")??;
-        ensure!(
-            fill_record_count < FILL_HISTORY_LIMIT,
-            "Rithmic fill history reached the record limit"
-        );
+        .flatten_timeout("Rithmic fill history timed out")
+        .context(LedgerSnapshotFailure::FILL_HISTORY)?;
+        if fill_record_count >= FILL_HISTORY_LIMIT {
+            return Err(anyhow::anyhow!(
+                "Rithmic fill history reached the record limit"
+            ))
+            .context(LedgerSnapshotFailure::FILL_HISTORY);
+        }
         (order_history, fills)
     } else {
         (Vec::new(), Vec::new())
     };
     drop(order_connection);
 
-    let pnl_runtime = config::load(profile, Plant::Pnl)?;
+    let pnl_runtime =
+        config::load(profile, Plant::Pnl).context(LedgerSnapshotFailure::PNL_CONFIG)?;
     let mut pnl_connection =
-        transport::connect(&pnl_runtime.url, pnl_runtime.login, RESPONSE_TIMEOUT).await?;
-    wait_for_heartbeat(&mut pnl_connection, "PNL").await?;
+        transport::connect(&pnl_runtime.url, pnl_runtime.login, RESPONSE_TIMEOUT)
+            .await
+            .context(LedgerSnapshotFailure::PNL_CONNECT)?;
+    wait_for_heartbeat(&mut pnl_connection, "PNL")
+        .await
+        .context(LedgerSnapshotFailure::PNL_HEARTBEAT)?;
     pnl_connection
-        .send_payload(ledger::pnl_position_snapshot_request(
-            PNL_SNAPSHOT_KEY,
-            &account.identity,
-        )?)
-        .await?;
+        .send_payload(
+            ledger::pnl_position_snapshot_request(PNL_SNAPSHOT_KEY, &account.identity)
+                .context(LedgerSnapshotFailure::PNL_REQUEST)?,
+        )
+        .await
+        .context(LedgerSnapshotFailure::PNL_REQUEST)?;
     let (positions, account_summary) = tokio::time::timeout(
         SNAPSHOT_TIMEOUT,
         collect_pnl(&mut pnl_connection, &account.identity),
     )
     .await
-    .context("Rithmic PnL snapshot timed out")??;
+    .flatten_timeout("Rithmic PnL snapshot timed out")
+    .context(LedgerSnapshotFailure::PNL_SNAPSHOT)?;
 
     Ok(RemoteLedgerSnapshot {
         account,
@@ -217,24 +324,34 @@ pub(crate) async fn discover_order_account_with_login(
     account_id: Option<&str>,
 ) -> Result<(Account, LoginInfo)> {
     connection
-        .send_payload(ledger::login_info_request(LOGIN_INFO_KEY)?)
-        .await?;
+        .send_payload(
+            ledger::login_info_request(LOGIN_INFO_KEY)
+                .context(LedgerSnapshotFailure::ORDER_LOGIN_INFO)?,
+        )
+        .await
+        .context(LedgerSnapshotFailure::ORDER_LOGIN_INFO)?;
     let login_info = tokio::time::timeout(SNAPSHOT_TIMEOUT, async {
         let payload = next_payload(connection).await?;
         ledger::decode_login_info(&payload, LOGIN_INFO_KEY)
     })
     .await
-    .context("Rithmic login-info snapshot timed out")??;
+    .flatten_timeout("Rithmic login-info snapshot timed out")
+    .context(LedgerSnapshotFailure::ORDER_LOGIN_INFO)?;
 
     connection
-        .send_payload(ledger::account_list_request(ACCOUNT_LIST_KEY, &login_info)?)
-        .await?;
+        .send_payload(
+            ledger::account_list_request(ACCOUNT_LIST_KEY, &login_info)
+                .context(LedgerSnapshotFailure::ORDER_ACCOUNT_LIST)?,
+        )
+        .await
+        .context(LedgerSnapshotFailure::ORDER_ACCOUNT_LIST)?;
     let account = tokio::time::timeout(
         SNAPSHOT_TIMEOUT,
         collect_account(connection, &login_info, account_id),
     )
     .await
-    .context("Rithmic account-list snapshot timed out")??;
+    .flatten_timeout("Rithmic account-list snapshot timed out")
+    .context(LedgerSnapshotFailure::ORDER_ACCOUNT_LIST)?;
     Ok((account, login_info))
 }
 
@@ -292,7 +409,7 @@ async fn request_stable_order_snapshot(
             collect_orders(connection, account, &request_key),
         )
         .await
-        .context("Rithmic order snapshot timed out")??;
+        .flatten_timeout("Rithmic order snapshot timed out")?;
         orders.sort_by(|left, right| left.basket_id.cmp(&right.basket_id));
         if order_snapshot_attempt_is_authoritative(interleaved_notification) {
             return Ok(orders);
@@ -507,6 +624,104 @@ mod tests {
     use super::*;
     use rust_decimal::Decimal;
     use rust_decimal_macros::dec;
+
+    #[test]
+    fn safe_failure_ledger_matches_independent_literals() {
+        const EXPECTED: &str = "request_validation|invalid_ledger_snapshot_request|ledger snapshot request validation failed
+order_config|order_config_failed|ORDER config failed
+order_connect|order_connect_failed|ORDER connect failed
+order_heartbeat|order_heartbeat_failed|ORDER heartbeat failed
+order_login_info|order_login_info_failed|ORDER login info failed
+order_account_list|order_account_list_failed|ORDER account list failed
+order_snapshot|order_snapshot_failed|ORDER snapshot failed
+order_history|order_history_failed|ORDER history failed
+fill_history|fill_history_failed|fill history failed
+pnl_config|pnl_config_failed|PNL config failed
+pnl_connect|pnl_connect_failed|PNL connect failed
+pnl_heartbeat|pnl_heartbeat_failed|PNL heartbeat failed
+pnl_request|pnl_request_failed|PNL request failed
+pnl_snapshot|pnl_snapshot_failed|PNL snapshot failed";
+        let actual = [
+            LedgerSnapshotFailure::REQUEST_VALIDATION,
+            LedgerSnapshotFailure::ORDER_CONFIG,
+            LedgerSnapshotFailure::ORDER_CONNECT,
+            LedgerSnapshotFailure::ORDER_HEARTBEAT,
+            LedgerSnapshotFailure::ORDER_LOGIN_INFO,
+            LedgerSnapshotFailure::ORDER_ACCOUNT_LIST,
+            LedgerSnapshotFailure::ORDER_SNAPSHOT,
+            LedgerSnapshotFailure::ORDER_HISTORY,
+            LedgerSnapshotFailure::FILL_HISTORY,
+            LedgerSnapshotFailure::PNL_CONFIG,
+            LedgerSnapshotFailure::PNL_CONNECT,
+            LedgerSnapshotFailure::PNL_HEARTBEAT,
+            LedgerSnapshotFailure::PNL_REQUEST,
+            LedgerSnapshotFailure::PNL_SNAPSHOT,
+        ];
+        assert_eq!(actual.len(), 14);
+        for (actual, expected) in actual.iter().zip(EXPECTED.lines()) {
+            assert_eq!(actual.safe_fields().join("|"), expected);
+        }
+    }
+
+    #[test]
+    fn production_invocation_sites_keep_exact_stage_and_timeout_owners() {
+        let production = include_str!("ledger_runtime.rs")
+            .split_once("pub(crate) async fn run_with_recovery")
+            .unwrap()
+            .1
+            .split_once("#[cfg(test)]")
+            .unwrap()
+            .0;
+        assert!(production.contains(
+            "config::load(profile, Plant::Order).context(LedgerSnapshotFailure::ORDER_CONFIG)?"
+        ));
+        assert!(production.contains(
+            "config::load(profile, Plant::Pnl).context(LedgerSnapshotFailure::PNL_CONFIG)?"
+        ));
+        assert_eq!(
+            production
+                .matches("LedgerSnapshotFailure::ORDER_LOGIN_INFO")
+                .count(),
+            3
+        );
+        assert_eq!(
+            production
+                .matches("LedgerSnapshotFailure::ORDER_ACCOUNT_LIST")
+                .count(),
+            3
+        );
+        assert_eq!(production.matches(".flatten_timeout(").count(), 6);
+    }
+
+    #[tokio::test]
+    async fn timeout_matrix_keeps_stage_and_original_source() {
+        let outer =
+            tokio::time::timeout(Duration::ZERO, std::future::pending::<Result<()>>()).await;
+        let error = outer
+            .flatten_timeout("outer timeout")
+            .context(LedgerSnapshotFailure::PNL_SNAPSHOT)
+            .unwrap_err();
+        assert_eq!(
+            error.downcast_ref::<LedgerSnapshotFailure>(),
+            Some(&LedgerSnapshotFailure::PNL_SNAPSHOT)
+        );
+        assert!(error
+            .downcast_ref::<tokio::time::error::Elapsed>()
+            .is_some());
+
+        let inner: std::result::Result<Result<()>, tokio::time::error::Elapsed> = Ok(Err(
+            anyhow::Error::new(std::io::Error::other("inner source")),
+        ));
+        let error = inner
+            .flatten_timeout("outer timeout")
+            .context(LedgerSnapshotFailure::PNL_SNAPSHOT)
+            .unwrap_err();
+        assert_eq!(
+            error.downcast_ref::<LedgerSnapshotFailure>(),
+            Some(&LedgerSnapshotFailure::PNL_SNAPSHOT)
+        );
+        assert!(error.downcast_ref::<std::io::Error>().is_some());
+    }
 
     fn login_info() -> LoginInfo {
         LoginInfo {

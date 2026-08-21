@@ -5,6 +5,7 @@ from typing import Deque
 import pandas as pd
 
 from src.core.models import Candlestick, Signal, SignalType
+from src.core.strategy_context import StrategyContext
 from src.strategies.base import BaseStrategy, StrategyRequirements
 from src.core.fast_bar import BarView, RollingMean, SignalIntent
 
@@ -102,7 +103,11 @@ class GoldenCrossStrategy(BaseStrategy):
 
         return df
 
-    def on_candle(self, candle: Candlestick) -> Signal:
+    def on_candle(
+        self,
+        candle: Candlestick,
+        context: StrategyContext | None = None,
+    ) -> Signal:
         """
         Event-driven execution for Golden Cross.
         """
@@ -123,6 +128,9 @@ class GoldenCrossStrategy(BaseStrategy):
 
         if not had_previous_long_window:
             return self._signal(candle, SignalType.NO_SIGNAL)
+
+        assert prev_sma_short is not None
+        assert prev_sma_long is not None
 
         curr_sma_short = self._short_sum / Decimal(self.short_window)
         curr_sma_long = self._long_sum / Decimal(self.long_window)
@@ -228,6 +236,9 @@ class _PreparedGoldenCrossStrategy:
 
         if not had_previous_long_window:
             return None
+
+        assert prev_sma_short is not None
+        assert prev_sma_long is not None
 
         curr_sma_short = self._short_mean.mean
         curr_sma_long = self._long_mean.mean

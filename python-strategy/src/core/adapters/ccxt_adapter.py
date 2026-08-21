@@ -7,13 +7,16 @@ implement IExchangeAdapter and only wrapped create_order.
 
 import logging
 import os
-from dataclasses import dataclass
 from decimal import Decimal
-from enum import Enum
-from typing import Callable, Optional
+from typing import Callable, Literal, Optional, Protocol, cast
 
 import ccxt
 
+from src.core.adapters.ccxt_account_initialization import (
+    AccountInitializationConfig,
+    AccountPositionMode as AccountPositionMode,
+    initialize_ccxt_account,
+)
 from src.core.interfaces.exchange import (
     ExchangeOrderSnapshot,
     ExchangeError,
@@ -22,8 +25,8 @@ from src.core.interfaces.exchange import (
     InsufficientFundsError,
     NetworkError,
 )
-from src.core.client_order_id import to_exchange_format
-from src.core.models import Position
+from src.core.client_order_id import parse_client_order_id
+from src.core.models import Position, PositionSide
 from src.core.orm_models import Order
 from src.core.product_registry import (
     InstrumentSpec,
@@ -37,82 +40,30 @@ from src.core.product_registry import (
 logger = logging.getLogger(__name__)
 
 
-class AccountPositionMode(str, Enum):
-    ONE_WAY = "one_way"
+class _ExactCreateOrder(Protocol):
+    """Runtime CCXT boundary omitted by its narrower generated annotation."""
 
-
-@dataclass(frozen=True)
-class AccountInitializationConfig:
-    """Live account settings that must be applied before trading starts."""
-
-    product_ids: tuple[str, ...]
-    leverage: int | None = None
-    margin_mode: str | None = None
-    position_mode: AccountPositionMode = AccountPositionMode.ONE_WAY
-
-    @classmethod
-    def from_config(
-        cls,
-        raw_config: dict | None,
+    def __call__(
+        self,
         *,
-        default_product_ids: list[str],
-    ) -> "AccountInitializationConfig | None":
-        if not raw_config:
-            return None
-
-        product_ids = tuple(
-            raw_config.get("product_ids")
-            or raw_config.get("instrument_product_ids")
-            or default_product_ids
-        )
-        if not product_ids:
-            raise ExchangeError(
-                "account_initialization_requires_products: "
-                "configure account_initialization.product_ids or instrument_product_ids"
-            )
-
-        position_mode = raw_config.get("position_mode", AccountPositionMode.ONE_WAY.value)
-        if position_mode != AccountPositionMode.ONE_WAY.value:
-            raise ExchangeError(
-                "unsupported_account_position_mode: "
-                f"position_mode={position_mode}"
-            )
-
-        leverage = raw_config.get("leverage")
-        if leverage is not None:
-            try:
-                leverage = int(leverage)
-            except (TypeError, ValueError) as e:
-                raise ExchangeError(
-                    f"invalid_account_leverage: leverage={leverage}"
-                ) from e
-            if leverage < 1:
-                raise ExchangeError(
-                    f"invalid_account_leverage: leverage={leverage}"
-                )
-
-        margin_mode = raw_config.get("margin_mode")
-        if margin_mode is not None:
-            margin_mode = str(margin_mode).lower()
-            if margin_mode not in {"cross", "isolated"}:
-                raise ExchangeError(
-                    f"invalid_account_margin_mode: margin_mode={margin_mode}"
-                )
-
-        return cls(
-            product_ids=product_ids,
-            leverage=leverage,
-            margin_mode=margin_mode,
-            position_mode=AccountPositionMode.ONE_WAY,
-        )
+        symbol: str,
+        type: str,
+        side: Literal["buy", "sell"],
+        amount: str,
+        price: str | None,
+        params: dict[str, object],
+    ) -> dict[str, object]: ...
 
 
 class CcxtExchangeAdapter(IExchangeAdapter):
     """Universal exchange adapter via CCXT.
 
-    Supports any CCXT-compatible exchange (Binance, Bybit, Backpack, etc.)
-    through a single implementation.
+    Supports provider-neutral CCXT transport and account operations. Concrete
+    venue policy belongs to venue-owned subclasses or composition owners.
     """
+
+    def supports_runtime_reconciliation(self) -> bool:
+        return True
 
     def __init__(
         self,
@@ -154,24 +105,44 @@ class CcxtExchangeAdapter(IExchangeAdapter):
 
     # -- IExchangeAdapter ------------------------------------------------
 
+    def _exchange_client_order_id(self, client_order_id: str) -> str:
+        parse_client_order_id(client_order_id)
+        return client_order_id
+
+    def restore_order_groups(self, orders: list[Order]) -> None:
+        for order in orders:
+            order_exchange_id = getattr(order, "exchange_id", None)
+            if (
+                type(order_exchange_id) is not str
+                or order_exchange_id.casefold() != self.exchange_id.casefold()
+            ):
+                continue
+            client_order_id = getattr(order, "client_order_id", None)
+            if type(client_order_id) is str and client_order_id:
+                self._exchange_client_order_id(client_order_id)
+
     def place_order(self, order: Order) -> str:
         ccxt_symbol = to_ccxt_symbol(order.product_id)
+        side = self._ccxt_order_side(order.side)
         self._quantize_order(order)
         order_type, params = self._ccxt_order_type_and_params(order)
         if order_type == "limit":
             params["timeInForce"] = "GTC"
         intent_payload = getattr(order, "intent_payload", None)
-        if isinstance(intent_payload, dict) and intent_payload.get("reduce_only") is True:
+        if (
+            isinstance(intent_payload, dict)
+            and intent_payload.get("reduce_only") is True
+        ):
             params["reduceOnly"] = True
         client_order_id = getattr(order, "client_order_id", None)
         if client_order_id:
-            exchange_client_order_id = to_exchange_format(client_order_id, self.exchange_id)
-            if self._uses_algo_order_endpoints(order.type):
-                params["clientAlgoId"] = exchange_client_order_id
-            elif self.exchange_id == "binance":
-                params["newClientOrderId"] = exchange_client_order_id
-            else:
-                params["clientOrderId"] = exchange_client_order_id
+            exchange_client_order_id = self._exchange_client_order_id(client_order_id)
+            params.update(
+                self._submission_client_order_id_params(
+                    exchange_client_order_id,
+                    getattr(order, "type", None),
+                )
+            )
 
         try:
             self.logger.info(
@@ -182,10 +153,11 @@ class CcxtExchangeAdapter(IExchangeAdapter):
                 ccxt_symbol,
                 order.price or "market",
             )
-            response = self.client.create_order(
+            create_order = cast(_ExactCreateOrder, self.client.create_order)
+            response = create_order(
                 symbol=ccxt_symbol,
                 type=order_type,
-                side=order.side,
+                side=side,
                 amount=str(order.quantity),
                 price=str(order.price) if order.price else None,
                 params=params,
@@ -199,26 +171,26 @@ class CcxtExchangeAdapter(IExchangeAdapter):
         except ccxt.BaseError as e:
             raise ExchangeError(f"Order placement failed: {e}") from e
 
-    _BINANCE_ALGO_ORDER_TYPES = frozenset({"stop_loss", "take_profit"})
     _SUPPORTED_PLAIN_ORDER_TYPES = frozenset({"market", "limit"})
 
-    def _uses_algo_order_endpoints(self, order_type: Optional[str]) -> bool:
-        """Binance USDT-M conditional orders live in the algo order id namespace.
+    @staticmethod
+    def _ccxt_order_side(side: str) -> Literal["buy", "sell"]:
+        if side == "buy":
+            return "buy"
+        if side == "sell":
+            return "sell"
+        raise ExchangeError(f"order_side_mapping_unsupported: side={side}")
 
-        ccxt only routes create/fetch/cancel to the futures algo endpoints when
-        the conditional flag is present (ccxt 4.5 binance.py cancel_order /
-        fetch_order: ``isConditional = safe_bool_n(['stop','trigger','conditional'])``).
-        Without it the algoId/clientAlgoId is sent to the regular order endpoint
-        and the order is reported as not found.
-        """
-        return (
-            self.exchange_id == "binance"
-            and (order_type or "").lower() in self._BINANCE_ALGO_ORDER_TYPES
-        )
+    def _submission_client_order_id_params(
+        self,
+        exchange_client_order_id: str,
+        order_type: Optional[str],
+    ) -> dict:
+        return {"clientOrderId": exchange_client_order_id}
 
     def _ccxt_order_type_and_params(self, order: Order) -> tuple[str, dict]:
-        order_type = (order.type or "").lower()
-        if order_type in {"stop_loss", "take_profit"} and self.exchange_id != "binance":
+        order_type = (getattr(order, "type", None) or "").lower()
+        if order_type in {"stop_loss", "take_profit"}:
             raise ExchangeError(
                 f"conditional_order_mapping_unsupported: exchange={self.exchange_id}"
             )
@@ -226,20 +198,6 @@ class CcxtExchangeAdapter(IExchangeAdapter):
             raise ExchangeError(
                 f"trailing_stop_mapping_unsupported: exchange={self.exchange_id}"
             )
-        if order_type == "stop_loss":
-            if order.trigger_price is None:
-                raise ExchangeError("stop_loss_requires_trigger_price")
-            return "STOP_MARKET", {
-                "stopLossPrice": str(order.trigger_price),
-                "reduceOnly": True,
-            }
-        if order_type == "take_profit":
-            if order.trigger_price is None:
-                raise ExchangeError("take_profit_requires_trigger_price")
-            return "TAKE_PROFIT_MARKET", {
-                "takeProfitPrice": str(order.trigger_price),
-                "reduceOnly": True,
-            }
         if order_type in self._SUPPORTED_PLAIN_ORDER_TYPES:
             return order_type, {}
         raise ExchangeError(f"order_type_mapping_unsupported: order_type={order_type}")
@@ -258,7 +216,9 @@ class CcxtExchangeAdapter(IExchangeAdapter):
         try:
             markets = self.client.load_markets()
         except ccxt.BaseError as e:
-            raise ExchangeError(f"Failed to load market rules for {product_id}: {e}") from e
+            raise ExchangeError(
+                f"Failed to load market rules for {product_id}: {e}"
+            ) from e
         market = markets.get(ccxt_symbol) if isinstance(markets, dict) else None
         if market is None:
             raise ExchangeError(
@@ -330,301 +290,17 @@ class CcxtExchangeAdapter(IExchangeAdapter):
         *,
         operation_guard: Callable[[], None] | None = None,
     ) -> None:
-        """Apply fail-safe account settings before live trading starts.
-
-        CCXT source defines set_position_mode(hedged=False) as one-way mode for
-        Binance and Bybit; fetch_position_mode() returns ``hedged`` for
-        verification on those venues.
-        """
-        guard = operation_guard or (lambda: None)
-        guard()
-        try:
-            self.client.load_markets()
-        except ccxt.BaseError as e:
-            raise ExchangeError(
-                f"account_initialization_load_markets_failed: {e}"
-            ) from e
-        guard()
-
-        for product_id in config.product_ids:
-            symbol = to_ccxt_symbol(product_id)
-            self._ensure_one_way_position_mode(symbol, guard)
-            margin_mode_accepted = False
-            if config.margin_mode is not None:
-                margin_mode_accepted = self._set_margin_mode(
-                    config.margin_mode,
-                    symbol,
-                    config,
-                    guard,
-                )
-            if config.leverage is not None:
-                self._set_leverage(config.leverage, symbol, guard)
-                self._verify_leverage(config.leverage, symbol, guard)
-            if config.margin_mode is not None:
-                self._verify_margin_mode(
-                    config.margin_mode,
-                    symbol,
-                    allow_unsupported=margin_mode_accepted,
-                    operation_guard=guard,
-                )
-
-    def _ensure_one_way_position_mode(
-        self,
-        symbol: str,
-        operation_guard: Callable[[], None],
-    ) -> None:
-        set_position_mode = getattr(self.client, "set_position_mode", None)
-        if not callable(set_position_mode):
-            raise ExchangeError(
-                "account_position_mode_unsupported: "
-                f"exchange={self.exchange_id}"
-            )
-        set_accepted = False
-        operation_guard()
-        try:
-            set_position_mode(False, symbol)
-            set_accepted = True
-        except ccxt.BaseError as e:
-            if not self._is_account_setting_no_change_error(e):
-                raise ExchangeError(
-                    f"account_position_mode_set_failed: symbol={symbol} error={e}"
-                ) from e
-            set_accepted = True
-        operation_guard()
-
-        fetch_position_mode = getattr(self.client, "fetch_position_mode", None)
-        if not callable(fetch_position_mode):
-            if set_accepted:
-                return
-            raise ExchangeError(
-                "account_position_mode_verification_unsupported: "
-                f"exchange={self.exchange_id}"
-            )
-        operation_guard()
-        try:
-            result = fetch_position_mode(symbol)
-        except ccxt.BaseError as e:
-            if set_accepted and self._is_position_mode_verification_unsupported(e):
-                operation_guard()
-                return
-            raise ExchangeError(
-                f"account_position_mode_verify_failed: symbol={symbol} error={e}"
-            ) from e
-        operation_guard()
-
-        hedged = result.get("hedged") if isinstance(result, dict) else None
-        if hedged is not False:
-            raise ExchangeError(
-                "account_position_mode_not_one_way: "
-                f"symbol={symbol} hedged={hedged}"
-            )
-
-    def _set_margin_mode(
-        self,
-        margin_mode: str,
-        symbol: str,
-        config: AccountInitializationConfig,
-        operation_guard: Callable[[], None],
-    ) -> bool:
-        set_margin_mode = getattr(self.client, "set_margin_mode", None)
-        if not callable(set_margin_mode):
-            raise ExchangeError(
-                f"account_margin_mode_unsupported: exchange={self.exchange_id}"
-            )
-        params = {}
-        if config.leverage is not None:
-            params["leverage"] = str(config.leverage)
-        operation_guard()
-        try:
-            set_margin_mode(margin_mode, symbol, params)
-        except ccxt.BaseError as e:
-            if not self._is_account_setting_no_change_error(e):
-                raise ExchangeError(
-                    f"account_margin_mode_set_failed: symbol={symbol} error={e}"
-                ) from e
-        operation_guard()
-        return True
-
-    def _set_leverage(
-        self,
-        leverage: int,
-        symbol: str,
-        operation_guard: Callable[[], None],
-    ) -> None:
-        set_leverage = getattr(self.client, "set_leverage", None)
-        if not callable(set_leverage):
-            raise ExchangeError(
-                f"account_leverage_unsupported: exchange={self.exchange_id}"
-            )
-        operation_guard()
-        try:
-            set_leverage(leverage, symbol)
-        except ccxt.BaseError as e:
-            if not self._is_account_setting_no_change_error(e):
-                raise ExchangeError(
-                    f"account_leverage_set_failed: symbol={symbol} error={e}"
-                ) from e
-        operation_guard()
-
-    def _verify_leverage(
-        self,
-        expected_leverage: int,
-        symbol: str,
-        operation_guard: Callable[[], None],
-    ) -> None:
-        leverage = self._fetch_leverage_value(symbol, operation_guard)
-        if leverage != expected_leverage:
-            raise ExchangeError(
-                "account_leverage_not_configured: "
-                f"symbol={symbol} expected={expected_leverage} actual={leverage}"
-            )
-
-    def _verify_margin_mode(
-        self,
-        expected_margin_mode: str,
-        symbol: str,
-        *,
-        allow_unsupported: bool,
-        operation_guard: Callable[[], None],
-    ) -> None:
-        try:
-            margin_mode = self._fetch_margin_mode_value(
-                symbol,
-                operation_guard,
-            )
-        except ExchangeError as e:
-            if allow_unsupported and str(e).startswith(
-                "account_margin_mode_verification_unsupported"
-            ):
-                self.logger.warning(
-                    "Margin mode verification unsupported for %s on %s after accepted set_margin_mode",
-                    symbol,
-                    self.exchange_id,
-                )
-                return
-            raise
-        if margin_mode != expected_margin_mode:
-            raise ExchangeError(
-                "account_margin_mode_not_configured: "
-                f"symbol={symbol} expected={expected_margin_mode} actual={margin_mode}"
-            )
-
-    def _fetch_leverage_value(
-        self,
-        symbol: str,
-        operation_guard: Callable[[], None],
-    ) -> int | None:
-        fetch_leverage = getattr(self.client, "fetch_leverage", None)
-        if callable(fetch_leverage):
-            operation_guard()
-            try:
-                leverage = self._leverage_value_from_result(fetch_leverage(symbol))
-                if leverage is not None:
-                    operation_guard()
-                    return leverage
-            except ccxt.BaseError:
-                pass
-            operation_guard()
-
-        fetch_leverages = getattr(self.client, "fetch_leverages", None)
-        if callable(fetch_leverages):
-            operation_guard()
-            try:
-                leverages = fetch_leverages([symbol])
-                result = leverages.get(symbol) if isinstance(leverages, dict) else None
-                leverage = self._leverage_value_from_result(result)
-                if leverage is not None:
-                    operation_guard()
-                    return leverage
-            except ccxt.BaseError:
-                pass
-            operation_guard()
-
-        raise ExchangeError(
-            "account_leverage_verification_unsupported: "
-            f"exchange={self.exchange_id}"
-        )
-
-    @staticmethod
-    def _leverage_value_from_result(result) -> int | None:
-        if not isinstance(result, dict):
-            return None
-        long_leverage = result.get("longLeverage")
-        short_leverage = result.get("shortLeverage")
-        if long_leverage is not None and short_leverage is not None:
-            if int(long_leverage) == int(short_leverage):
-                return int(long_leverage)
-            return None
-        leverage = result.get("leverage")
-        return int(leverage) if leverage is not None else None
-
-    def _fetch_margin_mode_value(
-        self,
-        symbol: str,
-        operation_guard: Callable[[], None],
-    ) -> str | None:
-        fetch_margin_mode = getattr(self.client, "fetch_margin_mode", None)
-        if callable(fetch_margin_mode):
-            operation_guard()
-            try:
-                margin_mode = self._margin_mode_from_result(fetch_margin_mode(symbol))
-                if margin_mode is not None:
-                    operation_guard()
-                    return margin_mode
-            except ccxt.BaseError:
-                pass
-            operation_guard()
-
-        fetch_leverage = getattr(self.client, "fetch_leverage", None)
-        if callable(fetch_leverage):
-            operation_guard()
-            try:
-                margin_mode = self._margin_mode_from_result(fetch_leverage(symbol))
-                if margin_mode is not None:
-                    operation_guard()
-                    return margin_mode
-            except ccxt.BaseError:
-                pass
-            operation_guard()
-
-        raise ExchangeError(
-            "account_margin_mode_verification_unsupported: "
-            f"exchange={self.exchange_id}"
-        )
-
-    @staticmethod
-    def _margin_mode_from_result(result) -> str | None:
-        if not isinstance(result, dict):
-            return None
-        margin_mode = result.get("marginMode") or result.get("marginType")
-        return str(margin_mode).lower() if margin_mode is not None else None
-
-    @staticmethod
-    def _is_account_setting_no_change_error(error: ccxt.BaseError) -> bool:
-        message = str(error).lower()
-        return (
-            "no need to change" in message
-            or "not modified" in message
-            or "-4059" in message
-            or "110025" in message
-            or "110026" in message
-            or "110043" in message
-            or "140025" in message
-            or "140026" in message
-            or "140043" in message
-            or "34036" in message
-        )
-
-    @staticmethod
-    def _is_position_mode_verification_unsupported(error: ccxt.BaseError) -> bool:
-        message = str(error).lower()
-        return (
-            "fetchpositionmode" in message
-            and "not supported" in message
+        initialize_ccxt_account(
+            exchange_id=self.exchange_id,
+            client=self.client,
+            logger=self.logger,
+            config=config,
+            operation_guard=operation_guard,
         )
 
     def _quantize_order(self, order: Order) -> None:
         spec = self.get_instrument_spec(order.product_id)
+        intent_payload = getattr(order, "intent_payload", None)
         try:
             quantized = quantize_order_values(
                 quantity=order.quantity,
@@ -642,8 +318,8 @@ class CcxtExchangeAdapter(IExchangeAdapter):
                 and notional_price is None
                 and reference_price is None
                 and order.type.lower() == "market"
-                and isinstance(getattr(order, "intent_payload", None), dict)
-                and order.intent_payload.get("reduce_only") is True
+                and isinstance(intent_payload, dict)
+                and intent_payload.get("reduce_only") is True
             ):
                 reference_price = self._market_order_reference_price(order)
                 order.min_notional_reference_price = reference_price
@@ -674,9 +350,7 @@ class CcxtExchangeAdapter(IExchangeAdapter):
         try:
             ticker = self.client.fetch_ticker(ccxt_symbol)
         except ccxt.BaseError as exc:
-            raise ExchangeError(
-                f"market_reference_price_unavailable: {exc}"
-            ) from exc
+            raise ExchangeError(f"market_reference_price_unavailable: {exc}") from exc
 
         side = order.side.lower()
         if side not in {"buy", "sell"}:
@@ -697,8 +371,9 @@ class CcxtExchangeAdapter(IExchangeAdapter):
     ) -> bool:
         ccxt_symbol = to_ccxt_symbol(product_id)
         try:
-            if self._uses_algo_order_endpoints(order_type):
-                self.client.cancel_order(order_id, ccxt_symbol, params={"trigger": True})
+            params = self._cancel_order_params(order_type)
+            if params is not None:
+                self.client.cancel_order(order_id, ccxt_symbol, params=params)
             else:
                 self.client.cancel_order(order_id, ccxt_symbol)
             return True
@@ -709,6 +384,9 @@ class CcxtExchangeAdapter(IExchangeAdapter):
             self.logger.error("Failed to cancel order %s: %s", order_id, e)
             return False
 
+    def _cancel_order_params(self, order_type: Optional[str]) -> dict | None:
+        return None
+
     def cancel_order_by_client_id(
         self,
         client_order_id: str,
@@ -717,10 +395,12 @@ class CcxtExchangeAdapter(IExchangeAdapter):
         order_type: Optional[str] = None,
     ) -> bool:
         ccxt_symbol = to_ccxt_symbol(product_id)
-        exchange_client_order_id = to_exchange_format(client_order_id, self.exchange_id)
+        exchange_client_order_id = self._exchange_client_order_id(client_order_id)
         params = self._client_order_id_params(exchange_client_order_id, order_type)
         try:
-            self.client.cancel_order(exchange_client_order_id, ccxt_symbol, params=params)
+            self.client.cancel_order(
+                exchange_client_order_id, ccxt_symbol, params=params
+            )
             return True
         except ccxt.OrderNotFound:
             self.logger.warning(
@@ -741,10 +421,6 @@ class CcxtExchangeAdapter(IExchangeAdapter):
         exchange_client_order_id: str,
         order_type: Optional[str],
     ) -> dict:
-        if self._uses_algo_order_endpoints(order_type):
-            return {"clientAlgoId": exchange_client_order_id, "trigger": True}
-        if self.exchange_id == "binance":
-            return {"origClientOrderId": exchange_client_order_id}
         return {"clientOrderId": exchange_client_order_id}
 
     def get_order_by_client_id(
@@ -755,7 +431,7 @@ class CcxtExchangeAdapter(IExchangeAdapter):
         order_type: Optional[str] = None,
     ) -> Optional[ExchangeOrderSnapshot]:
         ccxt_symbol = to_ccxt_symbol(product_id)
-        exchange_client_order_id = to_exchange_format(client_order_id, self.exchange_id)
+        exchange_client_order_id = self._exchange_client_order_id(client_order_id)
         params = self._client_order_id_params(exchange_client_order_id, order_type)
         try:
             response = self.client.fetch_order(
@@ -774,10 +450,20 @@ class CcxtExchangeAdapter(IExchangeAdapter):
                 f"Failed to fetch order with client_order_id {client_order_id}: {e}"
             ) from e
 
+        return self._order_snapshot_from_response(client_order_id, response)
+
+    def _order_snapshot_from_response(
+        self,
+        client_order_id: str,
+        response: dict,
+    ) -> ExchangeOrderSnapshot:
+        """Project one locked-client order response without venue transport policy."""
+
         exchange_order_id = response.get("id")
         status = response.get("status") or "unknown"
         fee = response.get("fee") or {}
         fee_cost = fee.get("cost") if isinstance(fee, dict) else None
+        fee_currency = fee.get("currency") if isinstance(fee, dict) else None
         filled_quantity = response.get("filled")
         average_price = response.get("average")
         cost = response.get("cost")
@@ -787,7 +473,9 @@ class CcxtExchangeAdapter(IExchangeAdapter):
                 average_price = Decimal(str(cost)) / filled_decimal
         return ExchangeOrderSnapshot(
             client_order_id=client_order_id,
-            exchange_order_id=str(exchange_order_id) if exchange_order_id is not None else None,
+            exchange_order_id=str(exchange_order_id)
+            if exchange_order_id is not None
+            else None,
             status=str(status),
             filled_quantity=(
                 Decimal(str(filled_quantity)) if filled_quantity is not None else None
@@ -795,49 +483,28 @@ class CcxtExchangeAdapter(IExchangeAdapter):
             average_price=(
                 average_price
                 if isinstance(average_price, Decimal)
-                else Decimal(str(average_price)) if average_price is not None else None
+                else Decimal(str(average_price))
+                if average_price is not None
+                else None
             ),
             fee=Decimal(str(fee_cost)) if fee_cost is not None else None,
+            fee_asset=(
+                fee_currency
+                if type(fee_currency) is str and fee_currency != ""
+                else None
+            ),
             raw=response,
         )
 
     def create_user_stream_listen_key(self) -> str:
-        """Create a Binance USD-M Futures user-data stream listen key.
-
-        CCXT 4.5.34 exposes Binance USD-M Futures listen-key endpoints as
-        ``fapiPrivatePostListenKey`` / ``fapiPrivatePutListenKey``.
-        """
-        if self.exchange_id != "binance" or not hasattr(
-            self.client,
-            "fapiPrivatePostListenKey",
-        ):
-            raise ExchangeUserStreamUnsupported(
-                f"user_stream_listen_key_unsupported: exchange={self.exchange_id}"
-            )
-        try:
-            response = self.client.fapiPrivatePostListenKey()
-        except ccxt.BaseError as e:
-            raise ExchangeError(f"user_stream_listen_key_create_failed: {e}") from e
-        listen_key = response.get("listenKey") if isinstance(response, dict) else None
-        if not listen_key:
-            raise ExchangeError("user_stream_listen_key_missing")
-        return str(listen_key)
+        raise ExchangeUserStreamUnsupported(
+            f"user_stream_listen_key_unsupported: exchange={self.exchange_id}"
+        )
 
     def keepalive_user_stream(self, listen_key: str) -> None:
-        """Keep a Binance USD-M Futures user-data stream listen key alive."""
-        if self.exchange_id != "binance" or not hasattr(
-            self.client,
-            "fapiPrivatePutListenKey",
-        ):
-            raise ExchangeUserStreamUnsupported(
-                f"user_stream_keepalive_unsupported: exchange={self.exchange_id}"
-            )
-        if not listen_key:
-            raise ExchangeError("user_stream_keepalive_requires_listen_key")
-        try:
-            self.client.fapiPrivatePutListenKey({"listenKey": listen_key})
-        except ccxt.BaseError as e:
-            raise ExchangeError(f"user_stream_keepalive_failed: {e}") from e
+        raise ExchangeUserStreamUnsupported(
+            f"user_stream_keepalive_unsupported: exchange={self.exchange_id}"
+        )
 
     def get_balance(self, asset: str) -> Decimal:
         try:
@@ -847,7 +514,11 @@ class CcxtExchangeAdapter(IExchangeAdapter):
         except ccxt.BaseError as e:
             raise ExchangeError(f"Failed to fetch balance: {e}") from e
 
-    def get_position(self, product_id: str) -> Optional[Position]:
+    def get_position(
+        self,
+        product_id: str,
+        strategy_id: str | None = None,
+    ) -> Optional[Position]:
         ccxt_symbol = to_ccxt_symbol(product_id)
         try:
             positions = self.client.fetch_positions([ccxt_symbol])
@@ -862,7 +533,12 @@ class CcxtExchangeAdapter(IExchangeAdapter):
             if contracts == 0:
                 return None
 
-            side = "LONG" if contracts > 0 else "SHORT"
+            side_value = str(pos.get("side") or "").lower()
+            side = (
+                PositionSide.SHORT
+                if side_value == "short" or contracts < 0
+                else PositionSide.LONG
+            )
             return Position(
                 strategy_id="LIVE",
                 product_id=product_id,
@@ -897,7 +573,11 @@ class CcxtExchangeAdapter(IExchangeAdapter):
             return None
 
         side_value = str(raw_position.get("side") or "").lower()
-        side = "SHORT" if side_value == "short" or contracts < 0 else "LONG"
+        side = (
+            PositionSide.SHORT
+            if side_value == "short" or contracts < 0
+            else PositionSide.LONG
+        )
         return Position(
             strategy_id="LIVE",
             product_id=product_id,

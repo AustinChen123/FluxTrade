@@ -1,28 +1,25 @@
-"""Tests for WebSocketOrderConnector exponential backoff reconnection."""
+"""Tests for Binance WebSocket order-entry reconnection backoff."""
 
 import asyncio
 from unittest.mock import AsyncMock, patch
 
 import pytest
 
-from src.core.ws_connector import (
-    WebSocketOrderConnector,
+from src.core.adapters.binance_ws_order import (
     INITIAL_BACKOFF,
     MAX_BACKOFF,
     MAX_RETRIES,
+    BinanceWebSocketOrderConnector,
 )
 
 
 @pytest.fixture
 def connector():
-    with patch.dict("os.environ", {}, clear=False):
-        c = WebSocketOrderConnector(
-            api_key="test_key",
-            secret="test_secret",
-            exchange_id="binance",
-            testnet=True,
-        )
-        return c
+    return BinanceWebSocketOrderConnector(
+        api_key="test_key",
+        secret="test_secret",
+        testnet=True,
+    )
 
 
 class TestWSReconnectBackoff:
@@ -33,9 +30,14 @@ class TestWSReconnectBackoff:
         connector.running = True
 
         async def run():
-            with patch("src.core.ws_connector.websockets.connect",
-                        side_effect=ConnectionError("refused")):
-                with patch("src.core.ws_connector.asyncio.sleep", new_callable=AsyncMock) as mock_sleep:
+            with patch(
+                "src.core.adapters.binance_ws_order.websockets.connect",
+                side_effect=ConnectionError("refused"),
+            ):
+                with patch(
+                    "src.core.adapters.binance_ws_order.asyncio.sleep",
+                    new_callable=AsyncMock,
+                ) as mock_sleep:
                     await connector._connect_and_listen()
                     return mock_sleep
 
@@ -52,15 +54,20 @@ class TestWSReconnectBackoff:
             sleep_values.append(seconds)
 
         async def run():
-            with patch("src.core.ws_connector.websockets.connect",
-                        side_effect=ConnectionError("refused")):
-                with patch("src.core.ws_connector.asyncio.sleep", side_effect=track_sleep):
+            with patch(
+                "src.core.adapters.binance_ws_order.websockets.connect",
+                side_effect=ConnectionError("refused"),
+            ):
+                with patch(
+                    "src.core.adapters.binance_ws_order.asyncio.sleep",
+                    side_effect=track_sleep,
+                ):
                     await connector._connect_and_listen()
 
         asyncio.run(run())
 
         for i in range(min(len(sleep_values), 5)):
-            expected = min(INITIAL_BACKOFF * (2 ** i), MAX_BACKOFF)
+            expected = min(INITIAL_BACKOFF * (2**i), MAX_BACKOFF)
             assert sleep_values[i] == expected
 
     def test_backoff_caps_at_max(self, connector):
@@ -72,12 +79,17 @@ class TestWSReconnectBackoff:
             sleep_values.append(seconds)
 
         async def run():
-            with patch("src.core.ws_connector.websockets.connect",
-                        side_effect=ConnectionError("refused")):
-                with patch("src.core.ws_connector.asyncio.sleep", side_effect=track_sleep):
+            with patch(
+                "src.core.adapters.binance_ws_order.websockets.connect",
+                side_effect=ConnectionError("refused"),
+            ):
+                with patch(
+                    "src.core.adapters.binance_ws_order.asyncio.sleep",
+                    side_effect=track_sleep,
+                ):
                     await connector._connect_and_listen()
 
         asyncio.run(run())
 
-        for val in sleep_values:
-            assert val <= MAX_BACKOFF
+        for value in sleep_values:
+            assert value <= MAX_BACKOFF

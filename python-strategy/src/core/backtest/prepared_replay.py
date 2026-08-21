@@ -17,9 +17,9 @@ from zipfile import BadZipFile
 import numpy as np
 
 from fluxtrade_core import (
-    CandleAggregator,  # pyright: ignore[reportAttributeAccessIssue]
-    Candlestick as RustCandlestick,  # pyright: ignore[reportAttributeAccessIssue]
-    ScaledCandlestick as RustScaledCandlestick,  # pyright: ignore[reportAttributeAccessIssue]
+    CandleAggregator,
+    Candlestick as RustCandlestick,
+    ScaledCandlestick as RustScaledCandlestick,
 )
 
 from src.core.data_provider import timeframe_to_ms

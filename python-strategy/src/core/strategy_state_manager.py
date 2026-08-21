@@ -301,24 +301,36 @@ class StrategyStateManager:
                     f"{strategy_id} expected version {expected_version}, "
                     f"found {current_version}"
                 )
-            update_values = {
-                "status": to_status.value,
-                "version": current_version + 1,
-            }
-            if to_status == StrategyStatus.ERROR:
-                update_values["last_error_message"] = reason
-                update_values["entered_error_at"] = now
-            elif to_status == StrategyStatus.STOPPED:
-                update_values["stopped_at"] = now
-            elif to_status == StrategyStatus.ACTIVE:
-                if from_status == StrategyStatus.ERROR:
-                    update_values["recovered_at"] = now
-
             updated = (
                 db.query(StrategyState)
                 .filter_by(strategy_id=strategy_id)
                 .filter(StrategyState.version == current_version)
-                .update(update_values, synchronize_session=False)
+                .update(
+                    {
+                        StrategyState.status: to_status.value,
+                        StrategyState.version: current_version + 1,
+                        **(
+                            {
+                                StrategyState.last_error_message: reason,
+                                StrategyState.entered_error_at: now,
+                            }
+                            if to_status == StrategyStatus.ERROR
+                            else {}
+                        ),
+                        **(
+                            {StrategyState.stopped_at: now}
+                            if to_status == StrategyStatus.STOPPED
+                            else {}
+                        ),
+                        **(
+                            {StrategyState.recovered_at: now}
+                            if to_status == StrategyStatus.ACTIVE
+                            and from_status == StrategyStatus.ERROR
+                            else {}
+                        ),
+                    },
+                    synchronize_session=False,
+                )
             )
             if updated != 1:
                 db.rollback()

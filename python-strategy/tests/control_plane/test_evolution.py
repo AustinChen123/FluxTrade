@@ -183,6 +183,9 @@ def _gene_snapshot(factory):
 def test_evolution_converges_to_known_optimum_within_thirty_generations(tmp_path):
     factory = _session_factory(tmp_path, "convergence.db")
     request = _request()
+    assert request.search_space is not None
+    assert request.evolution is not None
+    assert request.seed is not None
     assert all(
         candidate.param_pack["value"] != 7
         for candidate in initial_population(
@@ -200,10 +203,12 @@ def test_evolution_converges_to_known_optimum_within_thirty_generations(tmp_path
     job = executor.submit_search(request)
 
     assert job.status.value == "SUCCEEDED"
+    assert job.result is not None
     assert job.result["generations_run"] == 30
     assert job.result["best_candidate_param_pack"] == {"value": 7}
     with factory() as session:
         epoch = session.get(EvolutionEpoch, job.result["epoch_id"])
+        assert epoch is not None
         assert epoch.status == "completed"
         assert epoch.generations_run == 30
 
@@ -243,6 +248,8 @@ def test_evolution_retry_resumes_without_reevaluating_checkpointed_genes(tmp_pat
     with factory() as session:
         epoch_id = failed.request["evolution"]["epoch_id"]
         epoch = session.get(EvolutionEpoch, epoch_id)
+        assert epoch is not None
+        assert epoch.generations_run is not None
         assert epoch.status == "aborted"
         assert 0 < epoch.generations_run < epoch.max_generations
         checkpointed_values = {
@@ -257,16 +264,20 @@ def test_evolution_retry_resumes_without_reevaluating_checkpointed_genes(tmp_pat
     resumed = executor.retry_search(failed.id)
 
     assert resumed.status.value == "SUCCEEDED"
+    assert resumed.result is not None
     assert resumed.result["epoch_id"] == epoch_id
     for value in checkpointed_values:
+        assert isinstance(value, int)
         assert evaluator.calls[int(value)] == calls_before_resume[int(value)]
 
 
 def test_evolution_resume_accepts_checkpoint_without_optional_strategy_type(tmp_path):
     factory = _session_factory(tmp_path, "pre_strategy_type_checkpoint.db")
-    request = _request().model_copy(
+    base_request = _request()
+    assert base_request.evolution is not None
+    request = base_request.model_copy(
         update={
-            "evolution": _request().evolution.model_copy(
+            "evolution": base_request.evolution.model_copy(
                 update={"epoch_id": "epoch_pre_strategy_type"}
             )
         }
@@ -274,6 +285,7 @@ def test_evolution_resume_accepts_checkpoint_without_optional_strategy_type(tmp_
     _ensure_evolution_epoch(factory, request)
     with factory() as session:
         epoch = session.get(EvolutionEpoch, "epoch_pre_strategy_type")
+        assert epoch is not None
         config = dict(epoch.config_json)
         config.pop("strategy_type", None)
         epoch.config_json = config
@@ -284,10 +296,12 @@ def test_evolution_resume_accepts_checkpoint_without_optional_strategy_type(tmp_
 
 def test_evolution_resume_rejects_changed_strategy_type(tmp_path):
     factory = _session_factory(tmp_path, "strategy_type_mismatch.db")
-    request = _request().model_copy(
+    base_request = _request()
+    assert base_request.evolution is not None
+    request = base_request.model_copy(
         update={
             "strategy_type": "first",
-            "evolution": _request().evolution.model_copy(
+            "evolution": base_request.evolution.model_copy(
                 update={"epoch_id": "epoch_strategy_type"}
             ),
         }
@@ -305,9 +319,11 @@ def test_evolution_resume_survives_durable_job_store_reopen(tmp_path):
     factory = _session_factory(tmp_path, "durable_resume.db")
     jobs_path = tmp_path / "control_plane_jobs.db"
     evaluator = _KnownOptimumEvaluator(fail_after=6)
-    request = _request(seed=31).model_copy(
+    base_request = _request(seed=31)
+    assert base_request.evolution is not None
+    request = base_request.model_copy(
         update={
-            "evolution": _request(seed=31).evolution.model_copy(
+            "evolution": base_request.evolution.model_copy(
                 update={"max_generations": 4}
             )
         }
@@ -322,12 +338,14 @@ def test_evolution_resume_survives_durable_job_store_reopen(tmp_path):
 
     with factory() as session:
         epoch_id = failed.request["evolution"]["epoch_id"]
-        checkpointed_values = {
-            int(record.param_pack["value"])
-            for record in session.query(GeneRecord)
-            .filter(GeneRecord.epoch_id == epoch_id)
-            .all()
-        }
+        records = (
+            session.query(GeneRecord).filter(GeneRecord.epoch_id == epoch_id).all()
+        )
+        checkpointed_values = set()
+        for record in records:
+            value = record.param_pack["value"]
+            assert isinstance(value, int)
+            checkpointed_values.add(value)
 
     resumed_evaluator = _KnownOptimumEvaluator()
     resumed = ParameterSearchJobExecutor(
@@ -338,6 +356,7 @@ def test_evolution_resume_survives_durable_job_store_reopen(tmp_path):
     ).retry_search(failed.id)
 
     assert resumed.status.value == "SUCCEEDED"
+    assert resumed.result is not None
     assert resumed.result["epoch_id"] == epoch_id
     assert checkpointed_values.isdisjoint(resumed_evaluator.calls)
 
@@ -386,6 +405,7 @@ def test_walk_forward_fitness_resume_survives_durable_store_reopen(tmp_path):
     ).retry_search(failed.id)
 
     assert resumed.status.value == "SUCCEEDED"
+    assert resumed.result is not None
     with factory() as session:
         records = (
             session.query(GeneRecord)
@@ -393,42 +413,44 @@ def test_walk_forward_fitness_resume_survives_durable_store_reopen(tmp_path):
             .all()
         )
     assert records
-    assert all(
-        record.score_breakdown["aggregation"]
-        == "registered_walk_forward_fitness"
-        for record in records
-    )
-    assert all(
-        record.score_breakdown["fitness"]["independent_trials"] == 8
-        for record in records
-    )
-    assert all(
-        record.score_breakdown["fitness"]["metric_contract"]["version"]
-        == "walk_forward_fitness_v2"
-        for record in records
-    )
+    for record in records:
+        assert (
+            record.score_breakdown["aggregation"] == "registered_walk_forward_fitness"
+        )
+        fitness = record.score_breakdown["fitness"]
+        assert isinstance(fitness, dict)
+        assert fitness["independent_trials"] == 8
+        metric_contract = fitness["metric_contract"]
+        assert isinstance(metric_contract, dict)
+        assert metric_contract["version"] == "walk_forward_fitness_v2"
     with factory() as session:
         epoch = session.get(EvolutionEpoch, resumed.result["epoch_id"])
-        assert (
-            epoch.config_json["fitness_metric_contract"]["version"]
-            == "walk_forward_fitness_v2"
-        )
-    unique_sharpes = {
-        canonical_param_key(record.param_pack): Decimal(
-            record.score_breakdown["fitness_inputs"]["daily_sharpe"]
-        )
-        for record in records
-    }
+        assert epoch is not None
+        fitness_metric_contract = epoch.config_json["fitness_metric_contract"]
+        assert isinstance(fitness_metric_contract, dict)
+        assert fitness_metric_contract["version"] == "walk_forward_fitness_v2"
+    unique_sharpes = {}
+    for record in records:
+        fitness_inputs = record.score_breakdown["fitness_inputs"]
+        assert isinstance(fitness_inputs, dict)
+        daily_sharpe = fitness_inputs["daily_sharpe"]
+        assert isinstance(daily_sharpe, str)
+        unique_sharpes[canonical_param_key(record.param_pack)] = Decimal(daily_sharpe)
     expected_benchmark = expected_maximum_sharpe(
         list(unique_sharpes.values()),
         independent_trials=8,
     )
     final_generation = max(record.generation_index for record in records)
-    assert {
-        Decimal(record.score_breakdown["fitness"]["benchmark_sharpe"])
-        for record in records
-        if record.generation_index == final_generation
-    } == {expected_benchmark}
+    final_benchmarks = set()
+    for record in records:
+        if record.generation_index != final_generation:
+            continue
+        fitness = record.score_breakdown["fitness"]
+        assert isinstance(fitness, dict)
+        benchmark_sharpe = fitness["benchmark_sharpe"]
+        assert isinstance(benchmark_sharpe, str)
+        final_benchmarks.add(Decimal(benchmark_sharpe))
+    assert final_benchmarks == {expected_benchmark}
 
 
 def test_duplicate_epoch_run_is_rejected_without_aborting_active_run(tmp_path):
@@ -440,6 +462,7 @@ def test_duplicate_epoch_run_is_rejected_without_aborting_active_run(tmp_path):
         db_session_factory=factory,
     )
     base_request = _request(seed=37)
+    assert base_request.evolution is not None
     request = base_request.model_copy(
         update={
             "evolution": base_request.evolution.model_copy(
@@ -460,6 +483,7 @@ def test_duplicate_epoch_run_is_rejected_without_aborting_active_run(tmp_path):
 
         with factory() as session:
             epoch = session.get(EvolutionEpoch, "epoch_active")
+            assert epoch is not None
             assert epoch.status == "running"
             assert epoch.generations_run == 0
 
@@ -468,7 +492,9 @@ def test_duplicate_epoch_run_is_rejected_without_aborting_active_run(tmp_path):
 
     assert result["generations_run"] == 1
     with factory() as session:
-        assert session.get(EvolutionEpoch, "epoch_active").status == "completed"
+        epoch = session.get(EvolutionEpoch, "epoch_active")
+        assert epoch is not None
+        assert epoch.status == "completed"
 
 
 @pytest.mark.parametrize(
@@ -642,6 +668,7 @@ def test_evolution_persists_drawdown_as_positive_loss_magnitude(tmp_path):
 
     factory = _session_factory(tmp_path, "drawdown_sign.db")
     base_request = _request()
+    assert base_request.evolution is not None
     request = base_request.model_copy(
         update={
             "evolution": base_request.evolution.model_copy(
@@ -656,6 +683,7 @@ def test_evolution_persists_drawdown_as_positive_loss_magnitude(tmp_path):
     ).submit_search(request)
 
     assert job.status.value == "SUCCEEDED"
+    assert job.result is not None
     with factory() as session:
         records = (
             session.query(GeneRecord)
@@ -741,14 +769,17 @@ def test_evolution_operators_keep_every_dimension_on_registered_domain():
 
 def test_mismatched_resume_request_does_not_mutate_existing_epoch(tmp_path):
     factory = _session_factory(tmp_path, "mismatch.db")
-    request = _request().model_copy(
+    base_request = _request()
+    assert base_request.evolution is not None
+    request = base_request.model_copy(
         update={
-            "evolution": _request().evolution.model_copy(
+            "evolution": base_request.evolution.model_copy(
                 update={"epoch_id": "epoch_fixed"}
             )
         }
     )
     _ensure_evolution_epoch(factory, request)
+    assert request.evolution is not None
     mismatched = request.model_copy(
         update={
             "evolution": request.evolution.model_copy(
@@ -765,15 +796,18 @@ def test_mismatched_resume_request_does_not_mutate_existing_epoch(tmp_path):
     assert job.status.value == "FAILED"
     with factory() as session:
         epoch = session.get(EvolutionEpoch, "epoch_fixed")
+        assert epoch is not None
         assert epoch.status == "running"
         assert epoch.generations_run == 0
 
 
 def test_resume_rejects_changed_backtest_window(tmp_path):
     factory = _session_factory(tmp_path, "window_mismatch.db")
-    request = _request().model_copy(
+    base_request = _request()
+    assert base_request.evolution is not None
+    request = base_request.model_copy(
         update={
-            "evolution": _request().evolution.model_copy(
+            "evolution": base_request.evolution.model_copy(
                 update={"epoch_id": "epoch_window"}
             )
         }
@@ -786,6 +820,7 @@ def test_resume_rejects_changed_backtest_window(tmp_path):
 
     with factory() as session:
         epoch = session.get(EvolutionEpoch, "epoch_window")
+        assert epoch is not None
         assert epoch.status == "running"
         assert epoch.generations_run == 0
 
@@ -797,15 +832,18 @@ def test_resume_rejects_uneven_generation_checkpoint(tmp_path):
         run_inline=True,
         db_session_factory=factory,
     )
-    request = _request().model_copy(
+    base_request = _request()
+    assert base_request.evolution is not None
+    request = base_request.model_copy(
         update={
-            "evolution": _request().evolution.model_copy(
+            "evolution": base_request.evolution.model_copy(
                 update={"max_generations": 2}
             )
         }
     )
     completed = executor.submit_search(request)
     assert completed.status.value == "SUCCEEDED"
+    assert completed.result is not None
 
     with factory() as session:
         first = (
@@ -816,6 +854,7 @@ def test_resume_rejects_uneven_generation_checkpoint(tmp_path):
             )
             .first()
         )
+        assert first is not None
         first.generation_index = 1
         session.commit()
 
@@ -824,4 +863,5 @@ def test_resume_rejects_uneven_generation_checkpoint(tmp_path):
     )
 
     assert resumed.status.value == "FAILED"
+    assert resumed.error is not None
     assert "incomplete generation" in resumed.error

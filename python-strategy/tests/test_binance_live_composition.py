@@ -1,0 +1,647 @@
+"""Composition boundary tests for Binance live adapters."""
+
+import ast
+import inspect
+from decimal import Decimal
+from unittest.mock import ANY, MagicMock, patch
+
+import pytest
+
+import src.core.adapters as adapters
+from src.core.adapters import live_binance
+from src.core.adapters import simulated as simulated_owner
+from src.core.adapters.ccxt_adapter import CcxtExchangeAdapter
+from src.core.execution_order_cancellation import cancel_known_order
+from src.core.interfaces.exchange import ExchangeError
+from src.core.interfaces.order_cancellation import OrderCancellationSnapshot
+
+
+def test_simulated_owner_preserves_decimal_configuration() -> None:
+    result = object()
+    with patch.object(
+        simulated_owner,
+        "SimulatedAdapter",
+        return_value=result,
+    ) as adapter_cls:
+        actual = simulated_owner.create_simulated_adapter(
+            {
+                "balance": "1234567890.123456789",
+                "maker_fee": "0.000123456789",
+                "taker_fee": Decimal("0.000987654321"),
+            }
+        )
+
+    assert actual is result
+    adapter_cls.assert_called_once_with(
+        initial_balance=Decimal("1234567890.123456789"),
+        maker_fee=Decimal("0.000123456789"),
+        taker_fee=Decimal("0.000987654321"),
+    )
+
+
+@pytest.mark.parametrize("enable_ws", [True, "enabled"])
+def test_binance_owner_routes_truthy_ws_to_live_adapter(enable_ws):
+    result = object()
+    guard = MagicMock()
+
+    with (
+        patch.object(live_binance, "LiveBinanceAdapter", return_value=result) as live,
+        patch.object(live_binance, "CcxtExchangeAdapter") as generic,
+    ):
+        actual = live_binance.create_binance_live_adapter(
+            api_key="key",
+            secret="secret",
+            expected_account_id="futures-main",
+            testnet=False,
+            enable_ws=enable_ws,
+            extra_config={"options": {"defaultType": "future"}},
+            operation_guard=guard,
+        )
+
+    assert actual is result
+    live.assert_called_once_with(
+        api_key="key",
+        secret="secret",
+        expected_account_id="futures-main",
+        testnet=False,
+        enable_ws=True,
+        extra_config={"options": {"defaultType": "future"}},
+        operation_guard=guard,
+    )
+    generic.assert_not_called()
+
+
+@pytest.mark.parametrize("enable_ws", [None, False, 0, ""])
+def test_binance_owner_routes_falsey_ws_to_live_adapter(enable_ws):
+    result = object()
+    extra_config = {"recvWindow": 5_000}
+    guard = MagicMock()
+
+    with (
+        patch.object(live_binance, "LiveBinanceAdapter") as live,
+        patch.object(
+            live_binance, "CcxtExchangeAdapter", return_value=result
+        ) as generic,
+    ):
+        actual = live_binance.create_binance_live_adapter(
+            api_key="key",
+            secret="secret",
+            expected_account_id="futures-main",
+            testnet=False,
+            enable_ws=enable_ws,
+            extra_config=extra_config,
+            operation_guard=guard,
+        )
+
+    assert actual is live.return_value
+    live.assert_called_once_with(
+        api_key="key",
+        secret="secret",
+        expected_account_id="futures-main",
+        testnet=False,
+        enable_ws=False,
+        extra_config=extra_config,
+        operation_guard=guard,
+    )
+    generic.assert_not_called()
+
+
+@pytest.mark.parametrize("enable_ws", [False, True])
+def test_binance_owner_preserves_selected_constructor_exception(enable_ws):
+    failure = RuntimeError("constructor failed")
+    live = MagicMock(side_effect=failure)
+    generic = MagicMock()
+
+    with (
+        patch.object(live_binance, "LiveBinanceAdapter", live),
+        patch.object(live_binance, "CcxtExchangeAdapter", generic),
+        pytest.raises(RuntimeError) as raised,
+    ):
+        live_binance.create_binance_live_adapter(
+            api_key=None,
+            secret=None,
+            expected_account_id="futures-main",
+            testnet=True,
+            enable_ws=enable_ws,
+            extra_config=None,
+            operation_guard=None,
+        )
+
+    assert raised.value is failure
+    live.assert_called_once_with(
+        api_key=None,
+        secret=None,
+        expected_account_id="futures-main",
+        testnet=True,
+        enable_ws=enable_ws,
+        extra_config=None,
+        operation_guard=None,
+    )
+    generic.assert_not_called()
+
+
+def test_binance_identity_is_verified_before_private_stream_construction() -> None:
+    client = MagicMock()
+    client.fapiPrivateV3GetBalance.return_value = [{"accountAlias": "futures-main"}]
+    trace: list[str] = []
+
+    def initialize(adapter, **_kwargs):
+        adapter.client = client
+        trace.append("client")
+
+    with (
+        patch.object(
+            CcxtExchangeAdapter, "__init__", autospec=True, side_effect=initialize
+        ),
+        patch.object(
+            live_binance,
+            "BinanceOrderEventStream",
+            side_effect=lambda **_kwargs: trace.append("stream") or MagicMock(),
+        ),
+    ):
+        live_binance.LiveBinanceAdapter(
+            expected_account_id="futures-main",
+            enable_ws=False,
+        )
+
+    assert trace == ["client", "stream"]
+    client.fapiPrivateV3GetBalance.assert_called_once_with()
+
+
+def test_binance_identity_mismatch_is_sanitized_before_stream_construction() -> None:
+    client = MagicMock()
+    client.fapiPrivateV3GetBalance.return_value = [{"accountAlias": "other"}]
+
+    def initialize(adapter, **_kwargs):
+        adapter.client = client
+
+    with (
+        patch.object(
+            CcxtExchangeAdapter, "__init__", autospec=True, side_effect=initialize
+        ),
+        patch.object(live_binance, "BinanceOrderEventStream") as stream,
+        pytest.raises(
+            ExchangeError,
+            match="^binance_account_identity_verification_failed$",
+        ) as raised,
+    ):
+        live_binance.LiveBinanceAdapter(
+            expected_account_id="futures-main",
+            enable_ws=False,
+        )
+
+    assert raised.value.__cause__ is None
+    stream.assert_not_called()
+
+
+@pytest.mark.parametrize(
+    "response",
+    [None, {}, [], [{}], [{"accountAlias": 7}], [{"accountAlias": "ok"}, {}]],
+)
+def test_binance_identity_rejects_malformed_account_rows(response) -> None:
+    adapter = object.__new__(live_binance.LiveBinanceAdapter)
+    adapter.client = MagicMock()
+    adapter.client.fapiPrivateV3GetBalance.return_value = response
+
+    with pytest.raises(
+        ExchangeError,
+        match="^binance_account_identity_verification_failed$",
+    ):
+        adapter._verify_account_identity("ok")
+
+
+def test_binance_identity_provider_error_does_not_escape_source() -> None:
+    adapter = object.__new__(live_binance.LiveBinanceAdapter)
+    adapter.client = MagicMock()
+    adapter.client.fapiPrivateV3GetBalance.side_effect = RuntimeError(
+        "provider-account-sentinel"
+    )
+
+    with pytest.raises(ExchangeError) as raised:
+        adapter._verify_account_identity("ok")
+
+    assert str(raised.value) == "binance_account_identity_verification_failed"
+    assert raised.value.__cause__ is None
+    assert "provider-account-sentinel" not in str(raised.value)
+
+
+@pytest.mark.parametrize(
+    ("order_type", "expected_deferred"),
+    [
+        ("market", True),
+        ("limit", True),
+        ("stop_loss", False),
+        ("take_profit", False),
+    ],
+)
+def test_binance_cancellation_terminal_owner_depends_on_order_type(
+    order_type: str,
+    expected_deferred: bool,
+) -> None:
+    adapter = object.__new__(live_binance.LiveBinanceAdapter)
+    adapter.cancel_order_by_client_id = MagicMock(return_value=True)
+    adapter.cancel_order = MagicMock(return_value=True)
+    repository = MagicMock()
+    repository.get_order_for_cancellation.return_value = OrderCancellationSnapshot(
+        id="order-1",
+        product_id="BINANCE:BTCUSDT-PERP",
+        type=order_type,
+        status="SUBMITTED",
+        filled_quantity=Decimal("0"),
+        client_order_id="client-1",
+        exchange_order_id="exchange-1",
+    )
+    guard = MagicMock()
+    cleanup = MagicMock()
+
+    assert (
+        cancel_known_order(
+            repository=repository,
+            adapter=adapter,
+            order_id="order-1",
+            assert_external_operation_allowed=guard,
+            fail_pending_conditional_orders_for_terminal_entry=cleanup,
+        )
+        is True
+    )
+
+    adapter.cancel_order_by_client_id.assert_called_once_with(
+        "client-1",
+        "BINANCE:BTCUSDT-PERP",
+        order_type=order_type,
+    )
+    adapter.cancel_order.assert_not_called()
+    if expected_deferred:
+        repository.mark_order_cancelled.assert_not_called()
+        cleanup.assert_not_called()
+    else:
+        repository.mark_order_cancelled.assert_called_once_with("order-1")
+        cleanup.assert_called_once_with(
+            repository.get_order_for_cancellation.return_value
+        )
+
+
+def test_binance_owner_keeps_existing_module_dependency_boundary():
+    tree = ast.parse(inspect.getsource(live_binance))
+    imports = [
+        ast.unparse(node)
+        for node in tree.body
+        if isinstance(node, ast.Import | ast.ImportFrom)
+    ]
+
+    assert imports == [
+        "import asyncio",
+        "import logging",
+        "import threading",
+        "from collections.abc import Callable",
+        "from typing import Any, cast",
+        (
+            "from src.core.adapters.binance_order_routing import "
+            "binance_conditional_order_mapping, "
+            "binance_lookup_client_order_id_params, "
+            "binance_submission_client_order_id_params, "
+            "uses_binance_algo_order_endpoints"
+        ),
+        (
+            "from src.core.adapters.binance_client_order_id import "
+            "to_binance_client_order_id"
+        ),
+        (
+            "from src.core.adapters.binance_user_stream import "
+            "BinanceOrderEventStream, create_binance_user_stream_listen_key, "
+            "keepalive_binance_user_stream"
+        ),
+        (
+            "from src.core.adapters.binance_ws_order import "
+            "BinanceWebSocketOrderConnector, OrderRejected"
+        ),
+        "from src.core.adapters.ccxt_adapter import CcxtExchangeAdapter",
+        (
+            "from src.core.interfaces.exchange import ExchangeError, "
+            "ExchangeOrderEvent, NetworkError"
+        ),
+        "from src.core.orm_models import Order",
+        "from src.core.product_registry import to_base_quote",
+    ]
+    owner = next(
+        node
+        for node in tree.body
+        if isinstance(node, ast.FunctionDef)
+        and node.name == "create_binance_live_adapter"
+    )
+    assert not any(
+        isinstance(node, ast.Import | ast.ImportFrom) for node in ast.walk(owner)
+    )
+
+
+@pytest.mark.parametrize(
+    ("config", "expected"),
+    [
+        ({"mode": "simulated"}, "simulated"),
+        ({"mode": "live", "exchange": "rithmic"}, "rithmic"),
+        (
+            {
+                "mode": "live",
+                "exchange": "kraken",
+                "api_key": "kraken-key",
+                "secret": "kraken-secret",
+                "testnet": False,
+                "extra_config": {"recvWindow": 5_000},
+            },
+            "generic",
+        ),
+        (
+            {
+                "mode": "live",
+                "exchange": "binance",
+                "api_key": "binance-key",
+                "secret": "binance-secret",
+                "account_id": "futures-main",
+                "testnet": False,
+                "enable_ws": "enabled",
+                "extra_config": {"recvWindow": 7_000},
+            },
+            "binance",
+        ),
+    ],
+)
+def test_generic_factory_routes_to_exact_venue_owner(config, expected):
+    simulated = object()
+    rithmic = MagicMock()
+    generic = MagicMock()
+    binance = MagicMock()
+
+    with (
+        patch.object(
+            adapters, "create_simulated_adapter", return_value=simulated
+        ) as simulated_cls,
+        patch.object(adapters, "RithmicExchangeAdapter") as rithmic_cls,
+        patch.object(
+            adapters, "CcxtExchangeAdapter", return_value=generic
+        ) as generic_cls,
+        patch.object(
+            adapters,
+            "create_binance_live_adapter",
+            return_value=binance,
+        ) as binance_owner,
+        patch.object(
+            adapters.AccountInitializationConfig, "from_config", return_value=None
+        ) as parser,
+    ):
+        rithmic_cls.from_config.return_value = rithmic
+        actual = adapters.create_adapter(config)
+
+    expected_result = {
+        "simulated": simulated,
+        "rithmic": rithmic,
+        "generic": generic,
+        "binance": binance,
+    }[expected]
+    assert actual is expected_result
+    assert simulated_cls.call_count == (expected == "simulated")
+    assert rithmic_cls.from_config.call_count == (expected == "rithmic")
+    assert generic_cls.call_count == (expected == "generic")
+    assert binance_owner.call_count == (expected == "binance")
+    if expected in {"simulated", "rithmic"}:
+        parser.assert_not_called()
+    else:
+        parser.assert_called_once_with(None, default_product_ids=[])
+    if expected == "rithmic":
+        rithmic_cls.from_config.assert_called_once_with(config)
+    if expected == "generic":
+        generic_cls.assert_called_once_with(
+            exchange_id="kraken",
+            api_key="kraken-key",
+            secret="kraken-secret",
+            testnet=False,
+            extra_config=config["extra_config"],
+        )
+        if expected == "binance":
+            binance_owner.assert_called_once_with(
+                api_key="binance-key",
+                secret="binance-secret",
+                expected_account_id="futures-main",
+                testnet=False,
+                enable_ws="enabled",
+                extra_config=config["extra_config"],
+                operation_guard=ANY,
+            )
+
+
+def test_generic_factory_preserves_binance_lifecycle_order_and_arguments():
+    trace = []
+    account_config = object()
+    product_ids = ["BINANCE:BTCUSDT-PERP"]
+    extra_config = {"options": {"defaultType": "future"}}
+    adapter = MagicMock()
+
+    def parse(*_args, **_kwargs):
+        trace.append("parse")
+        return account_config
+
+    def guard():
+        trace.append("guard")
+
+    def construct(**_kwargs):
+        trace.append("construct")
+        return adapter
+
+    adapter.initialize_account.side_effect = lambda *_a, **_k: trace.append(
+        "initialize"
+    )
+    adapter.warm_instrument_specs.side_effect = lambda *_a, **_k: trace.append("warm")
+
+    with (
+        patch.object(
+            adapters.AccountInitializationConfig, "from_config", side_effect=parse
+        ) as parser,
+        patch.object(
+            adapters, "create_binance_live_adapter", side_effect=construct
+        ) as owner,
+    ):
+        actual = adapters.create_adapter(
+            {
+                "mode": "live",
+                "exchange": "binance",
+                "api_key": "key",
+                "secret": "secret",
+                "account_id": "futures-main",
+                "testnet": False,
+                "enable_ws": True,
+                "extra_config": extra_config,
+                "instrument_product_ids": product_ids,
+                "account_initialization": {"leverage": 2},
+            },
+            operation_guard=guard,
+        )
+
+    assert actual is adapter
+    assert trace == ["parse", "guard", "construct", "guard", "initialize", "warm"]
+    parser.assert_called_once_with(
+        {"leverage": 2},
+        default_product_ids=product_ids,
+    )
+    owner.assert_called_once_with(
+        api_key="key",
+        secret="secret",
+        expected_account_id="futures-main",
+        testnet=False,
+        enable_ws=True,
+        extra_config=extra_config,
+        operation_guard=guard,
+    )
+    adapter.initialize_account.assert_called_once_with(
+        account_config,
+        operation_guard=guard,
+    )
+    adapter.warm_instrument_specs.assert_called_once_with(
+        product_ids,
+        operation_guard=guard,
+    )
+
+
+@pytest.mark.parametrize("failure_stage", ["parse", "pre_guard", "construct"])
+def test_generic_factory_early_failure_preserves_identity_and_stops(failure_stage):
+    failure = RuntimeError(failure_stage)
+    trace = []
+    adapter = MagicMock()
+
+    def parse(*_args, **_kwargs):
+        trace.append("parse")
+        if failure_stage == "parse":
+            raise failure
+        return object()
+
+    def guard():
+        trace.append("guard")
+        if failure_stage == "pre_guard":
+            raise failure
+
+    def construct(**_kwargs):
+        trace.append("construct")
+        if failure_stage == "construct":
+            raise failure
+        return adapter
+
+    with (
+        patch.object(
+            adapters.AccountInitializationConfig, "from_config", side_effect=parse
+        ),
+        patch.object(adapters, "create_binance_live_adapter", side_effect=construct),
+        pytest.raises(RuntimeError) as raised,
+    ):
+        adapters.create_adapter(
+            {"mode": "live", "exchange": "binance", "account_initialization": {}},
+            operation_guard=guard,
+        )
+
+    assert raised.value is failure
+    assert (
+        trace
+        == {
+            "parse": ["parse"],
+            "pre_guard": ["parse", "guard"],
+            "construct": ["parse", "guard", "construct"],
+        }[failure_stage]
+    )
+    adapter.initialize_account.assert_not_called()
+    adapter.warm_instrument_specs.assert_not_called()
+    adapter.close.assert_not_called()
+
+
+@pytest.mark.parametrize("failure_stage", ["post_guard", "initialize", "warm"])
+@pytest.mark.parametrize("close_mode", ["absent", "success", "failure"])
+def test_generic_factory_downstream_failure_preserves_close_precedence(
+    failure_stage,
+    close_mode,
+):
+    primary = RuntimeError(failure_stage)
+    close_failure = RuntimeError("close")
+    adapter = MagicMock()
+    guard_calls = 0
+    trace = []
+
+    def guard():
+        nonlocal guard_calls
+        guard_calls += 1
+        trace.append("guard")
+        if failure_stage == "post_guard" and guard_calls == 2:
+            raise primary
+
+    def initialize(*_args, **_kwargs):
+        trace.append("initialize")
+        if failure_stage == "initialize":
+            raise primary
+
+    def warm(*_args, **_kwargs):
+        trace.append("warm")
+        if failure_stage == "warm":
+            raise primary
+
+    def close():
+        trace.append("close")
+        if close_mode == "failure":
+            raise close_failure
+
+    adapter.initialize_account.side_effect = initialize
+    adapter.warm_instrument_specs.side_effect = warm
+    if close_mode == "absent":
+        adapter.close = None
+    else:
+        adapter.close.side_effect = close
+
+    def parse(*_args, **_kwargs):
+        trace.append("parse")
+        return object()
+
+    def construct(**_kwargs):
+        trace.append("construct")
+        return adapter
+
+    with (
+        patch.object(
+            adapters.AccountInitializationConfig, "from_config", side_effect=parse
+        ),
+        patch.object(adapters, "create_binance_live_adapter", side_effect=construct),
+        pytest.raises(RuntimeError) as raised,
+    ):
+        adapters.create_adapter(
+            {"mode": "live", "exchange": "binance"},
+            operation_guard=guard,
+        )
+
+    expected = close_failure if close_mode == "failure" else primary
+    assert raised.value is expected
+    if close_mode == "absent":
+        assert adapter.close is None
+    else:
+        adapter.close.assert_called_once_with()
+    if close_mode == "failure":
+        assert close_failure.__context__ is primary
+    lifecycle = {
+        "post_guard": ["parse", "guard", "construct", "guard"],
+        "initialize": ["parse", "guard", "construct", "guard", "initialize"],
+        "warm": [
+            "parse",
+            "guard",
+            "construct",
+            "guard",
+            "initialize",
+            "warm",
+        ],
+    }[failure_stage]
+    if close_mode != "absent":
+        lifecycle = [*lifecycle, "close"]
+    assert trace == lifecycle
+
+
+def test_generic_factory_source_has_only_binance_owner_entrypoint():
+    tree = ast.parse(inspect.getsource(adapters.create_adapter))
+    calls = [
+        node.func.id
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Call) and isinstance(node.func, ast.Name)
+    ]
+
+    assert calls.count("create_binance_live_adapter") == 1
+    assert "LiveBinanceAdapter" not in calls

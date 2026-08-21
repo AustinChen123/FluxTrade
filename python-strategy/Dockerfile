@@ -43,8 +43,8 @@ COPY --from=frontend-builder /build/dist/ ./frontend/
 
 # Create non-root user and writable application data directory
 RUN useradd -m -u 1000 -s /bin/bash trading \
-    && mkdir -p /app/data \
-    && chown -R trading:trading /app
+    && mkdir -p /app/data /app/strategy_artifacts \
+    && chown -R trading:trading /app/data
 USER trading
 
 # Set Python path and add venv to PATH

@@ -10,15 +10,26 @@ from src.core.models import SignalType
 from src.core.risk_config import RiskConfig
 from src.core.risk_manager import RiskManager
 from src.core.risk_rules import RuleStatus
+from src.core.risk_rules.order_rate_limit import OrderRateLimitRule
 
 
-class _RecordingRateLimitRule:
-    def __init__(self, status=RuleStatus.PASS, reason=None):
+class _RecordingRateLimitRule(OrderRateLimitRule):
+    def __init__(
+        self,
+        status: RuleStatus = RuleStatus.PASS,
+        reason: str | None = None,
+    ) -> None:
         self.status = status
         self.reason = reason
-        self.calls = []
+        self.calls: list[str] = []
 
-    def try_record_order(self, strategy_id):
+    def try_record_order(
+        self,
+        strategy_id: str,
+        *,
+        timestamp_ms: int | None = None,
+        member: str | None = None,
+    ) -> tuple[RuleStatus, str | None]:
         self.calls.append(strategy_id)
         return self.status, self.reason
 

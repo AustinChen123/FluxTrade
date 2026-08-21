@@ -1,43 +1,10 @@
-use crate::connector::backpack::BackpackConnector;
+use crate::connector::emergency::EmergencyMitigation;
 use crate::environment::RuntimeEnvironment;
 use anyhow::Context;
 use redis::AsyncCommands;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::time::sleep;
 use tracing::{error, info, warn};
-
-pub(crate) enum EmergencyMitigation {
-    LockdownOnly,
-    Backpack(BackpackConnector),
-    #[cfg(feature = "rithmic")]
-    Rithmic {
-        profile: String,
-        account_id: String,
-    },
-}
-
-impl EmergencyMitigation {
-    async fn run(&self) -> anyhow::Result<()> {
-        match self {
-            Self::LockdownOnly => Ok(()),
-            Self::Backpack(connector) => connector.cancel_all_orders().await,
-            #[cfg(feature = "rithmic")]
-            Self::Rithmic {
-                profile,
-                account_id,
-            } => {
-                let result =
-                    crate::connector::rithmic::emergency::mitigate(profile, account_id).await?;
-                info!(
-                    cancelled_orders = result.cancelled_orders,
-                    exited_positions = result.exited_positions,
-                    "Rithmic emergency mitigation verified flat"
-                );
-                Ok(())
-            }
-        }
-    }
-}
 
 pub struct Watchdog {
     redis_client: redis::Client,

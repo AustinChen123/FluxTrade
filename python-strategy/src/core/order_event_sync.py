@@ -1,9 +1,28 @@
-from decimal import Decimal
+from decimal import Context, Decimal, ROUND_HALF_EVEN, localcontext
+from fractions import Fraction
 from typing import Callable, Optional
 
-from src.core.fill_delta import fill_delta_from_cumulative
+from src.core.fill_delta import FillDelta, fill_delta_from_cumulative
 from src.core.interfaces.exchange import ExchangeOrderEvent
 from src.core.models import OrderStatus
+from src.core.order_manager import PositionCachePersistenceError
+
+
+def snapshot_fill_fee_rejection(
+    *,
+    local_filled: Decimal,
+    fill_quantity: Decimal,
+    fee: object,
+    fee_asset: object,
+) -> str | None:
+    """Reject snapshot fill deltas whose exact fee delta cannot be proven."""
+    if fill_quantity <= 0:
+        return None
+    if local_filled > 0:
+        return "unresolved_snapshot_cumulative_fee_not_delta"
+    if type(fee) is not Decimal or type(fee_asset) is not str or fee_asset == "":
+        return "unresolved_snapshot_fill_fee_identity_incomplete"
+    return None
 
 
 class OrderEventApplier:
@@ -11,7 +30,9 @@ class OrderEventApplier:
         self,
         *,
         order_manager,
-        journal_fill: Optional[Callable[[object, ExchangeOrderEvent, Decimal, Decimal], None]],
+        journal_fill: Optional[
+            Callable[[object, ExchangeOrderEvent, Decimal, Decimal], None]
+        ],
         fail_pending_conditionals_for_terminal_entry: Callable[[object], None],
         protective_terminal_without_fill_failure: Callable[[object], dict | None],
         write_conditional_warning: Callable[..., None],
@@ -19,6 +40,7 @@ class OrderEventApplier:
         protective_partial_fill_requires_resize: Callable[[object, str], dict | None],
         cancel_linked_conditional_for_protection_fill: Callable[[object], dict | None],
         remote_follow_up_required: Callable[[object, str], bool] | None = None,
+        on_position_cache_failure: Callable[[], None] | None = None,
     ) -> None:
         self.order_manager = order_manager
         self.journal_fill = journal_fill
@@ -39,6 +61,7 @@ class OrderEventApplier:
         self.remote_follow_up_required = remote_follow_up_required or (
             lambda _order, _event_state: True
         )
+        self.on_position_cache_failure = on_position_cache_failure or (lambda: None)
 
     def process_exchange_order_event(
         self,
@@ -56,7 +79,10 @@ class OrderEventApplier:
                 "exchange_order_id": event.exchange_order_id,
             }
 
-        if event.exchange_order_id and order.exchange_order_id != event.exchange_order_id:
+        if (
+            event.exchange_order_id
+            and order.exchange_order_id != event.exchange_order_id
+        ):
             self.order_manager.update_exchange_order_id(order, event.exchange_order_id)
 
         event_state = self._classify_exchange_order_event_status(event.status)
@@ -86,15 +112,27 @@ class OrderEventApplier:
                 "order_id": order.id,
                 "status": event.status,
             }
+        if event.is_snapshot_projection:
+            snapshot_fee_rejection = snapshot_fill_fee_rejection(
+                local_filled=order.filled_quantity or Decimal("0"),
+                fill_quantity=fill_delta["quantity"],
+                fee=event.fee,
+                fee_asset=event.fee_asset,
+            )
+            if snapshot_fee_rejection is not None:
+                return {
+                    "action": snapshot_fee_rejection,
+                    "order_id": order.id,
+                    "status": event.status,
+                }
         if self._event_fill_exceeds_order_quantity(order, event):
             return {
                 "action": "unresolved_exchange_fill_exceeds_order_quantity",
                 "order_id": order.id,
                 "status": event.status,
             }
-        if (
-            fill_delta["quantity"] == 0
-            and self._requires_terminal_fill_quantity(order, event, event_state)
+        if fill_delta["quantity"] == 0 and self._requires_terminal_fill_quantity(
+            order, event, event_state
         ):
             return {
                 "action": "unresolved_missing_terminal_fill_quantity",
@@ -120,22 +158,38 @@ class OrderEventApplier:
             # reconciliation will still query the parent authoritatively.
             self.fail_pending_conditionals_for_terminal_entry(order)
 
-        if fill_delta["quantity"] > 0:
+        if fill_delta["quantity"] > 0 and fill_delta["price"] is not None:
             terminal_status = self._status_for_exchange_event_fill(event_state)
             cumulative_quantity = event.cumulative_filled_quantity or (
                 (order.filled_quantity or Decimal("0")) + fill_delta["quantity"]
             )
-            cumulative_average = event.cumulative_average_price or fill_delta["price"]
-            self.order_manager.record_fill_delta(
+            cumulative_average = self._cumulative_average_price(
                 order,
-                fill_delta["price"],
-                fill_delta["quantity"],
-                cumulative_filled_quantity=cumulative_quantity,
-                cumulative_average_price=cumulative_average,
-                terminal_status=terminal_status,
-                fee=event.fee,
-                fee_asset=event.fee_asset,
+                event,
+                fill_delta,
+                cumulative_quantity,
             )
+            if cumulative_average is None:
+                return {
+                    "action": "unresolved_missing_fill_price",
+                    "order_id": order.id,
+                    "status": event.status,
+                }
+            cache_degraded = False
+            try:
+                self.order_manager.record_fill_delta(
+                    order,
+                    fill_delta["price"],
+                    fill_delta["quantity"],
+                    cumulative_filled_quantity=cumulative_quantity,
+                    cumulative_average_price=cumulative_average,
+                    terminal_status=terminal_status,
+                    fee=event.fee,
+                    fee_asset=event.fee_asset,
+                )
+            except PositionCachePersistenceError:
+                self.on_position_cache_failure()
+                cache_degraded = True
             if self.journal_fill is not None:
                 self.journal_fill(
                     order,
@@ -144,6 +198,7 @@ class OrderEventApplier:
                     fill_delta["quantity"],
                 )
         else:
+            cache_degraded = False
             self._apply_exchange_order_event_status(order, event_state, event)
 
         if terminal_failure_state:
@@ -182,7 +237,7 @@ class OrderEventApplier:
                         "exchange_order_id": order.exchange_order_id,
                     }
                 return {
-                    "action": "applied",
+                    "action": self._applied_action(cache_degraded),
                     "order_id": order.id,
                     "status": event.status,
                     "state": event_state,
@@ -242,13 +297,17 @@ class OrderEventApplier:
                 }
 
         return {
-            "action": "applied",
+            "action": self._applied_action(cache_degraded),
             "order_id": order.id,
             "status": event.status,
             "state": event_state,
             "fill_quantity": fill_delta["quantity"],
             "exchange_order_id": order.exchange_order_id,
         }
+
+    @staticmethod
+    def _applied_action(cache_degraded: bool) -> str:
+        return "applied_position_cache_failed" if cache_degraded else "applied"
 
     def _resolve_order_event_order(self, event: ExchangeOrderEvent):
         if event.client_order_id:
@@ -287,7 +346,7 @@ class OrderEventApplier:
             return "cancelled"
         if normalized in {"rejected"}:
             return "rejected"
-        if normalized in {"expired"}:
+        if normalized in {"expired", "expired_in_match"}:
             return "expired"
         if normalized in {"failed"}:
             return "failed"
@@ -318,7 +377,7 @@ class OrderEventApplier:
         self,
         order,
         event: ExchangeOrderEvent,
-    ) -> dict[str, Decimal | None]:
+    ) -> FillDelta:
         local_filled = order.filled_quantity or Decimal("0")
         cumulative = event.cumulative_filled_quantity
         if cumulative is None:
@@ -329,10 +388,7 @@ class OrderEventApplier:
             return {"quantity": delta, "price": None}
 
         price = None
-        if (
-            event.last_fill_price is not None
-            and event.last_fill_quantity == delta
-        ):
+        if event.last_fill_price is not None and event.last_fill_quantity == delta:
             price = event.last_fill_price
         elif event.cumulative_average_price is not None:
             price = fill_delta_from_cumulative(
@@ -342,6 +398,40 @@ class OrderEventApplier:
                 cumulative_average_price=event.cumulative_average_price,
             )["price"]
         return {"quantity": delta, "price": price}
+
+    @staticmethod
+    def _cumulative_average_price(
+        order,
+        event: ExchangeOrderEvent,
+        fill_delta: FillDelta,
+        cumulative_quantity: Decimal,
+    ) -> Decimal | None:
+        if event.cumulative_average_price is not None:
+            return event.cumulative_average_price
+        delta_quantity = fill_delta["quantity"]
+        delta_price = fill_delta["price"]
+        local_quantity = order.filled_quantity or Decimal("0")
+        if local_quantity <= 0:
+            return delta_price
+        local_average = order.filled_price
+        if (
+            local_average is None
+            or not local_average.is_finite()
+            or local_average <= 0
+            or not cumulative_quantity.is_finite()
+            or cumulative_quantity <= 0
+            or not delta_quantity.is_finite()
+            or delta_quantity <= 0
+            or delta_price is None
+            or not delta_price.is_finite()
+            or delta_price <= 0
+        ):
+            return None
+        weighted = (
+            Fraction(local_quantity) * Fraction(local_average)
+            + Fraction(delta_quantity) * Fraction(delta_price)
+        ) / Fraction(cumulative_quantity)
+        return _fraction_to_decimal(weighted)
 
     @staticmethod
     def _has_non_idempotent_last_fill_only(event: ExchangeOrderEvent) -> bool:
@@ -359,12 +449,8 @@ class OrderEventApplier:
     ) -> bool:
         if event_state not in {"filled", "liquidated"}:
             return False
-        has_fill_quantity = (
-            event.cumulative_filled_quantity is not None
-            or (
-                event.last_fill_quantity is not None
-                and event.last_fill_quantity > 0
-            )
+        has_fill_quantity = event.cumulative_filled_quantity is not None or (
+            event.last_fill_quantity is not None and event.last_fill_quantity > 0
         )
         if has_fill_quantity:
             return False
@@ -384,7 +470,7 @@ class OrderEventApplier:
         order,
         event: ExchangeOrderEvent,
         event_state: str,
-        fill_delta: dict[str, Decimal | None],
+        fill_delta: FillDelta,
     ) -> bool:
         if event_state not in {"filled", "liquidated"}:
             return False
@@ -432,10 +518,36 @@ class OrderEventApplier:
         order,
         event: ExchangeOrderEvent,
     ) -> bool:
-        return (
-            (order.filled_quantity or Decimal("0")) > 0
-            or (event.cumulative_filled_quantity or Decimal("0")) > 0
+        return (order.filled_quantity or Decimal("0")) > 0 or (
+            event.cumulative_filled_quantity or Decimal("0")
+        ) > 0
+
+
+def _fraction_to_decimal(value: Fraction) -> Decimal:
+    numerator = value.numerator
+    denominator = value.denominator
+    twos = 0
+    fives = 0
+    while denominator % 2 == 0:
+        denominator //= 2
+        twos += 1
+    while denominator % 5 == 0:
+        denominator //= 5
+        fives += 1
+    if denominator == 1:
+        scale = max(twos, fives)
+        coefficient = abs(numerator) * 2 ** (scale - twos) * 5 ** (scale - fives)
+        if coefficient == 0:
+            return Decimal(0)
+        return Decimal(
+            (
+                int(numerator < 0),
+                tuple(map(int, str(coefficient))),
+                -scale,
+            )
         )
+    with localcontext(Context(prec=28, rounding=ROUND_HALF_EVEN)):
+        return Decimal(value.numerator) / Decimal(value.denominator)
 
 
 def exchange_snapshot_to_order_event(product_id: str, snapshot) -> ExchangeOrderEvent:
@@ -447,5 +559,7 @@ def exchange_snapshot_to_order_event(product_id: str, snapshot) -> ExchangeOrder
         cumulative_filled_quantity=snapshot.filled_quantity,
         cumulative_average_price=snapshot.average_price,
         fee=snapshot.fee,
+        fee_asset=snapshot.fee_asset,
+        is_snapshot_projection=True,
         raw=snapshot.raw,
     )

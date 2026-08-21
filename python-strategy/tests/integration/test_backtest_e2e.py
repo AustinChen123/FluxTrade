@@ -12,6 +12,7 @@ from src.core.data_sources.memory import MemoryDataSource
 from src.core.backtest_runner import BacktestRunner
 from src.strategies.base import BaseStrategy, StrategyRequirements
 from src.core.models import Candlestick, Signal, SignalType
+from src.core.strategy_context import StrategyContext
 from integration.conftest import PRODUCT_ID, TIMEFRAME, make_candle, make_candle_series
 
 # Skip if Rust .so is not available
@@ -45,7 +46,9 @@ class AlwaysLongStrategy(BaseStrategy):
             lookback_window=5,
         )
 
-    def on_candle(self, candle: Candlestick) -> Signal:
+    def on_candle(
+        self, candle: Candlestick, context: StrategyContext | None = None
+    ) -> Signal:
         self._count += 1
         if self._count % 20 == 10:
             return Signal(
@@ -92,7 +95,9 @@ class OneShotLongStrategy(BaseStrategy):
             lookback_window=1,
         )
 
-    def on_candle(self, candle: Candlestick) -> Signal:
+    def on_candle(
+        self, candle: Candlestick, context: StrategyContext | None = None
+    ) -> Signal:
         if self._sent:
             return Signal(
                 strategy_id=self.strategy_id,
@@ -192,11 +197,12 @@ class TestBacktestE2E:
         result = runner.run()
 
         # Journal captures execution events even with mock DB
+        assert result is not None
         assert result["journal_count"] > 0
 
     @patch("src.core.backtest_runner.SessionLocal")
     def test_backtest_fees_reflected(self, mock_session_local, memory_source, candle_data):
-        """PnL should differ between zero-fee and with-fee runs."""
+        """Fees should exactly reduce PnL for identical LIMIT fill economics."""
         mock_session = MagicMock()
         mock_session.query.return_value.filter_by.return_value.all.return_value = []
         mock_session_local.return_value = mock_session
@@ -207,21 +213,62 @@ class TestBacktestE2E:
                 end_time=candle_data[-1].timestamp,
                 product_id=PRODUCT_ID,
                 timeframe=TIMEFRAME,
-                initial_balance=10000.0,
                 data_source=memory_source,
                 fee_config=fee_config,
                 report_config={"csv_trades": False, "equity_curve": False,
                                "markdown_report": False, "journal_export": False},
             )
             runner.add_strategy(AlwaysLongStrategy())
-            return runner.run()
+            result = runner.run()
+            assert result is not None
+            return result
 
-        result_no_fee = run_backtest({"maker": 0, "taker": 0})
-        result_with_fee = run_backtest({"maker": 0.001, "taker": 0.002})
+        maker_fee_rate = Decimal("0.001")
+        result_no_fee = run_backtest({"maker": Decimal("0"), "taker": Decimal("0")})
+        result_with_fee = run_backtest(
+            {"maker": maker_fee_rate, "taker": Decimal("0.002")}
+        )
 
-        # If trades were generated, fee should cause PnL difference
-        if result_no_fee["total_trades"] > 0:
-            assert result_no_fee["total_pnl"] != result_with_fee["total_pnl"]
+        no_fee_fills = [
+            entry["data"] for entry in result_no_fee["journal"]
+            if "fill_type" in entry["data"]
+        ]
+        with_fee_fills = [
+            entry["data"] for entry in result_with_fee["journal"]
+            if "fill_type" in entry["data"]
+        ]
+        assert no_fee_fills
+
+        def normalize(fills):
+            return [
+                (
+                    fill["side"].value,
+                    Decimal(fill["price"]),
+                    Decimal(fill["quantity"]),
+                    fill["fill_type"],
+                )
+                for fill in fills
+            ]
+
+        no_fee_economics = normalize(no_fee_fills)
+        with_fee_economics = normalize(with_fee_fills)
+        assert {side for side, _, _, _ in no_fee_economics} == {"buy", "sell"}
+        assert all(fill_type == "LIMIT" for _, _, _, fill_type in no_fee_economics)
+        assert no_fee_economics == with_fee_economics
+
+        expected_fees = sum(
+            (price * quantity * maker_fee_rate for _, price, quantity, _ in no_fee_economics),
+            Decimal("0"),
+        )
+        reported_fees = sum(
+            (Decimal(fill["fee"]) for fill in with_fee_fills), Decimal("0")
+        )
+        assert reported_fees == expected_fees
+        assert (
+            Decimal(result_no_fee["total_pnl"])
+            - Decimal(result_with_fee["total_pnl"])
+            == expected_fees
+        )
 
     @patch("src.core.backtest_runner.SessionLocal")
     def test_backtest_journal_populated(self, mock_session_local, memory_source, candle_data):
@@ -245,12 +292,27 @@ class TestBacktestE2E:
         runner.add_strategy(AlwaysLongStrategy())
         result = runner.run()
 
-        if result["total_trades"] > 0:
-            assert result["journal_count"] > 0
+        assert result is not None
+        journal = result["journal"]
+        assert result["journal_count"] == len(journal) == 39
+        assert [entry["tag"] for entry in journal] == ["entry", "fill"] * 19 + ["entry"]
+        expected_timestamps = []
+        for signal_index in range(9, len(candle_data), 10):
+            expected_timestamps.append(candle_data[signal_index].timestamp)
+            fill_index = signal_index + 1
+            if fill_index < len(candle_data):
+                expected_timestamps.append(candle_data[fill_index].timestamp)
+        assert [entry["timestamp"] for entry in journal] == expected_timestamps
+        for journal_entry in journal:
+            assert journal_entry["data"]["order_id"] == journal_entry["trade_id"]
+        for entry, fill in zip(journal[::2], journal[1::2]):
+            assert entry["trade_id"] == fill["trade_id"]
 
     @patch("src.core.backtest_runner.SessionLocal")
-    def test_backtest_circuit_breaker(self, mock_session_local, memory_source, candle_data):
-        """Backtest should stop when max drawdown is exceeded."""
+    def test_backtest_below_drawdown_threshold_runs_to_completion(
+        self, mock_session_local, memory_source, candle_data
+    ):
+        """Backtest should complete while drawdown remains below the threshold."""
         mock_session = MagicMock()
         mock_session.query.return_value.filter_by.return_value.all.return_value = []
         mock_session_local.return_value = mock_session
@@ -271,8 +333,15 @@ class TestBacktestE2E:
         runner.add_strategy(AlwaysLongStrategy())
         result = runner.run()
 
-        # Should have stopped early (not processed all 200 candles)
         assert result is not None
+        assert result["candle_count"] == 200
+        max_drawdown = result["max_drawdown"]
+        assert type(max_drawdown) is Decimal
+        assert Decimal("0") <= max_drawdown < Decimal("10.0000")
+        endpoint_state = result["endpoint_state"]
+        assert endpoint_state.halted_early is False
+        assert endpoint_state.final_mark == candle_data[-1].close
+        assert endpoint_state.end_timestamp == candle_data[-1].timestamp
 
     @patch("src.core.backtest_runner.SessionLocal")
     def test_backtest_circuit_breaker_uses_open_position_drawdown(self, mock_session_local):

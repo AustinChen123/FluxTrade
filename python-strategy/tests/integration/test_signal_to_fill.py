@@ -3,21 +3,34 @@
 No external dependencies (no Redis, no Rust .so, no DB).
 Uses MockExchangeAdapter for order execution.
 """
+
+import sys
+from typing import TYPE_CHECKING
+
 import pytest
 from decimal import Decimal
 from unittest.mock import MagicMock
 
-from src.core.models import Signal, SignalType, Candlestick, Position
+from src.core.models import Candlestick, Position, PositionSide, Signal, SignalType
 from src.core.execution import ExecutionEngine
 from src.core.risk_manager import RiskManager
 from src.core.journal import StrategyJournal
-from conftest import (
-    MockExchangeAdapter,
-    MockOrderRepository,
-    MockAccountService,
-    MockClock,
-)
 from integration.conftest import PRODUCT_ID, TIMEFRAME, INITIAL_BALANCE, make_candle
+
+if TYPE_CHECKING:
+    from tests.conftest import (
+        MockAccountService,
+        MockClock,
+        MockExchangeAdapter,
+        MockOrderRepository,
+    )
+else:
+    from conftest import (
+        MockAccountService,
+        MockClock,
+        MockExchangeAdapter,
+        MockOrderRepository,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -109,6 +122,14 @@ class TestSignalToFillPipeline:
 
     def test_long_entry_creates_order(self, execution_engine, adapter):
         """LONG signal → place_order → adapter receives order."""
+        assert {
+            MockAccountService.__module__,
+            MockClock.__module__,
+            MockExchangeAdapter.__module__,
+            MockOrderRepository.__module__,
+        } == {"conftest"}
+        assert "tests.conftest" not in sys.modules
+
         signal = _make_signal(SignalType.LONG)
         order_id = execution_engine.execute_signal(signal)
 
@@ -216,7 +237,7 @@ class TestRiskManagerIntegration:
             Position(
                 strategy_id="test-strategy",
                 product_id=PRODUCT_ID,
-                side="LONG",
+                side=PositionSide.LONG,
                 quantity=Decimal("0.1"),
                 entry_price=Decimal("50000"),
                 unrealized_pnl=Decimal("0"),
@@ -234,7 +255,7 @@ class TestRiskManagerIntegration:
             Position(
                 strategy_id="test-strategy",
                 product_id=PRODUCT_ID,
-                side="LONG",
+                side=PositionSide.LONG,
                 quantity=Decimal("100"),
                 entry_price=Decimal("50000"),
                 unrealized_pnl=Decimal("0"),

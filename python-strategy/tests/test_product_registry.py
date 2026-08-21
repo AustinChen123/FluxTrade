@@ -122,7 +122,9 @@ def test_notional_exposure_ignores_capital_and_fee_models():
         capital_per_contract=Decimal("2500"),
     )
 
-    assert calculate_notional_exposure(Decimal("3"), Decimal("100"), spec) == Decimal("600")
+    assert calculate_notional_exposure(Decimal("3"), Decimal("100"), spec) == Decimal(
+        "600"
+    )
 
 
 class TestToCcxtSymbol:
@@ -145,6 +147,7 @@ class TestToCcxtSymbol:
     def test_no_perp_suffix_raises(self):
         with pytest.raises(ValueError, match="Cannot parse"):
             to_ccxt_symbol("BINANCE:BTCUSDT")
+
 
 def test_dated_future_has_no_ccxt_mapping():
     with pytest.raises(ValueError, match="CCXT symbol mapping is unavailable"):
@@ -198,6 +201,49 @@ def test_product_id_matrix_accepts_canonical_ids(product_id):
 def test_product_id_matrix_rejects_malformed_ids(product_id):
     with pytest.raises(ValueError, match="Cannot parse product_id"):
         validate_product_id(product_id)
+
+
+@pytest.mark.parametrize(
+    ("product_id", "ccxt_symbol", "base", "stream_symbol"),
+    [
+        ("BACKPACK:BTC_USDC-PERP", "BTC/USDC:USDC", "BTC", "btc_usdc"),
+        ("BACKPACK:SOL_USDC-PERP", "SOL/USDC:USDC", "SOL", "sol_usdc"),
+    ],
+)
+def test_backpack_executable_product_identity_matches_rust_publisher(
+    product_id, ccxt_symbol, base, stream_symbol
+):
+    spec = instrument_spec_from_product(product_id)
+
+    assert validate_product_id(product_id) == product_id
+    assert to_exchange_name(product_id) == "backpack"
+    assert to_ccxt_symbol(product_id) == ccxt_symbol
+    assert to_base_quote(product_id) == (base, "USDC")
+    assert to_stream_key(product_id, "1m") == (
+        f"stream:market:backpack:{stream_symbol}:1m"
+    )
+    assert spec.product_id == product_id
+    assert spec.exchange == "backpack"
+    assert spec.symbol == ccxt_symbol
+    assert spec.base == base
+    assert spec.quote == "USDC"
+
+
+def test_known_backpack_products_match_executable_rust_identities():
+    products = set(list_known_products())
+
+    assert "BACKPACK:BTC_USDC-PERP" in products
+    assert "BACKPACK:SOL_USDC-PERP" in products
+    assert "BACKPACK:BTCUSDT-PERP" not in products
+
+
+@pytest.mark.parametrize(
+    "projection",
+    [validate_product_id, to_ccxt_symbol, instrument_spec_from_product],
+)
+def test_stale_backpack_usdt_identity_is_not_executable(projection):
+    with pytest.raises(ValueError, match="unsupported Backpack product_id"):
+        projection("BACKPACK:BTCUSDT-PERP")
 
 
 def test_dated_future_registry_lookup_preserves_canonical_identity():
@@ -438,10 +484,16 @@ class TestToBaseQuote:
 
 class TestToStreamKey:
     def test_basic(self):
-        assert to_stream_key("BINANCE:BTCUSDT-PERP", "15m") == "stream:market:binance:btcusdt:15m"
+        assert (
+            to_stream_key("BINANCE:BTCUSDT-PERP", "15m")
+            == "stream:market:binance:btcusdt:15m"
+        )
 
     def test_different_timeframe(self):
-        assert to_stream_key("BYBIT:ETHUSDT-PERP", "1m") == "stream:market:bybit:ethusdt:1m"
+        assert (
+            to_stream_key("BYBIT:ETHUSDT-PERP", "1m")
+            == "stream:market:bybit:ethusdt:1m"
+        )
 
     def test_rithmic_dated_future(self):
         assert (

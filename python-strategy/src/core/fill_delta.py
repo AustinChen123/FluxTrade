@@ -1,6 +1,12 @@
 from decimal import Decimal
 from enum import Enum
-from typing import Optional
+from typing import NotRequired, Optional, TypedDict
+
+
+class FillDelta(TypedDict):
+    quantity: Decimal
+    price: Decimal | None
+    fee: NotRequired[Decimal | None]
 
 
 class FillDeltaState(str, Enum):
@@ -18,7 +24,7 @@ def snapshot_fill_delta(
     cumulative_filled: Decimal | None,
     cumulative_average_price: Decimal | None,
     cumulative_fee: Decimal | None = None,
-) -> Optional[dict[str, Optional[Decimal]]]:
+) -> Optional[FillDelta]:
     if cumulative_filled is None or cumulative_filled <= 0:
         return None
     fill_delta = fill_delta_from_cumulative(
@@ -38,7 +44,7 @@ def classify_fill_delta(
     cumulative_filled: Decimal | None,
     cumulative_average_price: Decimal | None,
     cumulative_fee: Decimal | None = None,
-) -> tuple[FillDeltaState, Optional[dict[str, Optional[Decimal]]]]:
+) -> tuple[FillDeltaState, Optional[FillDelta]]:
     fill_delta = snapshot_fill_delta(
         local_filled=local_filled,
         local_average_price=local_average_price,
@@ -63,7 +69,7 @@ def fill_delta_from_cumulative(
     local_average_price: Decimal | None,
     cumulative_filled: Decimal,
     cumulative_average_price: Decimal | None,
-) -> dict[str, Decimal | None]:
+) -> FillDelta:
     delta = cumulative_filled - local_filled
     if delta <= 0:
         return {"quantity": delta, "price": cumulative_average_price}

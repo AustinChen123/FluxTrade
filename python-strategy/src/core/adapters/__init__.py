@@ -4,18 +4,21 @@ Factory function ``create_adapter`` provides config-driven instantiation.
 """
 
 from collections.abc import Callable
+from typing import TYPE_CHECKING, Any
 
-from src.core.adapters.ccxt_adapter import (
-    AccountInitializationConfig,
-    CcxtExchangeAdapter,
-)
-from src.core.adapters.live_binance import LiveBinanceAdapter
-from src.core.adapters.rithmic_adapter import (
-    RithmicExchangeAdapter,
-    RithmicUnmappedOrderEvent,
-)
-from src.core.adapters.simulated import SimulatedAdapter
-from src.core.interfaces.exchange import IExchangeAdapter
+from src.core.interfaces.exchange import ExchangeError, IExchangeAdapter
+
+if TYPE_CHECKING:
+    from src.core.adapters.ccxt_account_initialization import (
+        AccountInitializationConfig,
+    )
+    from src.core.adapters.ccxt_adapter import CcxtExchangeAdapter
+    from src.core.adapters.live_binance import LiveBinanceAdapter
+    from src.core.adapters.rithmic_adapter import (
+        RithmicExchangeAdapter,
+        RithmicUnmappedOrderEvent,
+    )
+    from src.core.adapters.simulated import SimulatedAdapter
 
 __all__ = [
     "AccountInitializationConfig",
@@ -26,6 +29,68 @@ __all__ = [
     "SimulatedAdapter",
     "create_adapter",
 ]
+
+
+def __getattr__(name: str) -> Any:
+    """Resolve compatibility exports without loading every venue provider."""
+    if name == "AccountInitializationConfig":
+        from src.core.adapters.ccxt_account_initialization import (
+            AccountInitializationConfig as value,
+        )
+    elif name == "CcxtExchangeAdapter":
+        from src.core.adapters.ccxt_adapter import CcxtExchangeAdapter as value
+    elif name == "LiveBinanceAdapter":
+        from src.core.adapters import live_binance
+
+        value = getattr(live_binance, name)
+    elif name in {"RithmicExchangeAdapter", "RithmicUnmappedOrderEvent"}:
+        from src.core.adapters import rithmic_adapter
+
+        value = getattr(rithmic_adapter, name)
+    elif name == "SimulatedAdapter":
+        from src.core.adapters import simulated
+
+        value = getattr(simulated, name)
+    else:
+        raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+    globals()[name] = value
+    return value
+
+
+def _adapter_dependency(name: str) -> Any:
+    if name in globals():
+        return globals()[name]
+    return __getattr__(name)
+
+
+def create_simulated_adapter(config: dict):
+    from src.core.adapters.simulated import create_simulated_adapter as owner
+
+    return owner(config)
+
+
+def create_binance_live_adapter(**kwargs):
+    from src.core.adapters.live_binance import create_binance_live_adapter as owner
+
+    return owner(**kwargs)
+
+
+def create_backpack_live_adapter(**kwargs):
+    from src.core.adapters.live_backpack import create_backpack_live_adapter as owner
+
+    return owner(**kwargs)
+
+
+def create_bybit_live_adapter(**kwargs):
+    from src.core.adapters.live_bybit import create_bybit_live_adapter as owner
+
+    return owner(**kwargs)
+
+
+def create_okx_live_adapter(**kwargs):
+    from src.core.adapters.live_okx import create_okx_live_adapter as owner
+
+    return owner(**kwargs)
 
 
 def create_adapter(
@@ -46,25 +111,16 @@ def create_adapter(
         extra_config: dict          (extra CCXT config, optional)
         account_initialization: dict (live account settings, optional)
     """
-    from decimal import Decimal
-
     mode = config.get("mode", "simulated")
 
     if mode == "simulated":
-        balance = Decimal(str(config.get("balance", 100000)))
-        maker_fee = Decimal(str(config.get("maker_fee", 0)))
-        taker_fee = Decimal(str(config.get("taker_fee", 0)))
-        return SimulatedAdapter(
-            initial_balance=balance,
-            maker_fee=maker_fee,
-            taker_fee=taker_fee,
-        )
+        return create_simulated_adapter(config)
 
     exchange_id = config.get("exchange", "binance")
     guard = operation_guard or (lambda: None)
     if str(exchange_id).lower() == "rithmic":
         guard()
-        adapter = RithmicExchangeAdapter.from_config(config)
+        adapter = _adapter_dependency("RithmicExchangeAdapter").from_config(config)
         try:
             guard()
         except Exception:
@@ -77,7 +133,9 @@ def create_adapter(
     enable_ws = config.get("enable_ws", False)
     extra_config = config.get("extra_config")
     instrument_product_ids = config.get("instrument_product_ids") or []
-    account_initialization = AccountInitializationConfig.from_config(
+    account_initialization = _adapter_dependency(
+        "AccountInitializationConfig"
+    ).from_config(
         config.get("account_initialization"),
         default_product_ids=instrument_product_ids,
     )
@@ -86,16 +144,35 @@ def create_adapter(
     adapter = None
     try:
         guard()
-        if exchange_id == "binance" and enable_ws:
-            adapter = LiveBinanceAdapter(
+        if exchange_id == "binance":
+            adapter = create_binance_live_adapter(
+                api_key=api_key,
+                secret=secret,
+                expected_account_id=str(config.get("account_id", "")),
+                testnet=testnet,
+                enable_ws=enable_ws,
+                extra_config=extra_config,
+                operation_guard=guard,
+            )
+        elif exchange_id == "backpack":
+            raise ExchangeError("backpack_account_identity_unverifiable")
+        elif exchange_id == "bybit":
+            adapter = create_bybit_live_adapter(
+                api_key=api_key,
+                secret=secret,
+                expected_account_id=str(config.get("account_id", "")),
+                testnet=testnet,
+                extra_config=extra_config,
+            )
+        elif exchange_id == "okx":
+            adapter = create_okx_live_adapter(
                 api_key=api_key,
                 secret=secret,
                 testnet=testnet,
-                enable_ws=True,
-                operation_guard=guard,
+                extra_config=extra_config,
             )
         else:
-            adapter = CcxtExchangeAdapter(
+            adapter = _adapter_dependency("CcxtExchangeAdapter")(
                 exchange_id=exchange_id,
                 api_key=api_key,
                 secret=secret,

@@ -1,7 +1,7 @@
 use super::{
     ledger::{InstrumentPositionSnapshot, OrderSnapshot},
     ledger_runtime,
-    order::ExitPosition,
+    order_command::ExitPosition,
     order_runtime::OrderRuntimeHandle,
 };
 use anyhow::{ensure, Context, Result};

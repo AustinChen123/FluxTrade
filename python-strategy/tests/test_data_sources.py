@@ -39,7 +39,9 @@ def _make_candle(
     )
 
 
-def _make_candles(count: int, start_ts: int = 1704067200000, **kwargs) -> list[Candlestick]:
+def _make_candles(
+    count: int, start_ts: int = 1704067200000, **kwargs
+) -> list[Candlestick]:
     return [_make_candle(start_ts + i * 60000, **kwargs) for i in range(count)]
 
 
@@ -47,8 +49,8 @@ def _make_candles(count: int, start_ts: int = 1704067200000, **kwargs) -> list[C
 # MemoryDataSource
 # =============================================================================
 
-class TestMemoryDataSourceBasics:
 
+class TestMemoryDataSourceBasics:
     def test_empty_source(self):
         ds = MemoryDataSource()
         result = list(ds.get_candles(PRODUCT, TF, 0, 9999999999999))
@@ -104,7 +106,6 @@ class TestMemoryDataSourceBasics:
 
 
 class TestMemoryDataSourceDataFrame:
-
     def test_get_candles_df_returns_dataframe(self):
         candles = _make_candles(5)
         ds = MemoryDataSource(candles)
@@ -134,7 +135,6 @@ class TestMemoryDataSourceDataFrame:
 
 
 class TestMemoryDataSourceRange:
-
     def test_available_range(self):
         candles = _make_candles(10)
         ds = MemoryDataSource(candles)
@@ -148,14 +148,15 @@ class TestMemoryDataSourceRange:
 
     def test_available_range_filters_product(self):
         btc = _make_candles(3, product_id="BINANCE:BTCUSDT-PERP")
-        eth = _make_candles(5, start_ts=1704100000000, product_id="BINANCE:ETHUSDT-PERP")
+        eth = _make_candles(
+            5, start_ts=1704100000000, product_id="BINANCE:ETHUSDT-PERP"
+        )
         ds = MemoryDataSource(btc + eth)
         rng = ds.get_available_range("BINANCE:ETHUSDT-PERP", TF)
         assert rng == (eth[0].timestamp, eth[-1].timestamp)
 
 
 class TestMemoryDataSourceAddCandles:
-
     def test_add_candles_merges_and_sorts(self):
         ds = MemoryDataSource(_make_candles(3, start_ts=1704067200000))
         ds.add_candles(_make_candles(3, start_ts=1704060000000))
@@ -169,8 +170,8 @@ class TestMemoryDataSourceAddCandles:
 # CsvDataSource
 # =============================================================================
 
-class TestCsvDataSourceStandard:
 
+class TestCsvDataSourceStandard:
     @pytest.fixture
     def csv_file(self, tmp_path):
         """Create a standard CSV file for testing."""
@@ -201,7 +202,9 @@ class TestCsvDataSourceStandard:
     def test_get_candles_filters_product_and_timeframe(self, csv_file):
         ds = CsvDataSource(csv_file, product_id=PRODUCT, timeframe=TF)
 
-        wrong_product = list(ds.get_candles("BINANCE:ETHUSDT-PERP", TF, 0, 9999999999999))
+        wrong_product = list(
+            ds.get_candles("BINANCE:ETHUSDT-PERP", TF, 0, 9999999999999)
+        )
         wrong_timeframe = list(ds.get_candles(PRODUCT, "5m", 0, 9999999999999))
 
         assert wrong_product == []
@@ -267,7 +270,6 @@ class TestCsvDataSourceStandard:
 
 
 class TestCsvDataSourceTradingView:
-
     @pytest.fixture
     def tv_csv(self, tmp_path):
         """TradingView-style CSV with 'time' column."""
@@ -287,15 +289,17 @@ class TestCsvDataSourceTradingView:
 
 
 class TestCsvDataSourceYahoo:
-
     @pytest.fixture
     def yahoo_csv(self, tmp_path):
         """Yahoo Finance-style CSV with date strings."""
         path = tmp_path / "yahoo.csv"
         lines = ["Date,Open,High,Low,Close,Adj Close,Volume"]
         dates = [
-            "2024-01-01", "2024-01-02", "2024-01-03",
-            "2024-01-04", "2024-01-05",
+            "2024-01-01",
+            "2024-01-02",
+            "2024-01-03",
+            "2024-01-04",
+            "2024-01-05",
         ]
         for d in dates:
             lines.append(f"{d},42000,42100,41900,42050,42050,1000")
@@ -311,7 +315,6 @@ class TestCsvDataSourceYahoo:
 
 
 class TestCsvDataSourceEpochSeconds:
-
     @pytest.fixture
     def epoch_s_csv(self, tmp_path):
         """CSV with timestamps in epoch seconds (not ms)."""
@@ -333,23 +336,25 @@ class TestCsvDataSourceEpochSeconds:
 
 
 class TestCsvDataSourceMissingColumns:
-
     def test_missing_volume_raises_on_load(self, tmp_path):
         path = tmp_path / "bad.csv"
-        path.write_text("timestamp,open,high,low,close\n1704067200000,42000,42100,41900,42050\n")
+        path.write_text(
+            "timestamp,open,high,low,close\n1704067200000,42000,42100,41900,42050\n"
+        )
         ds = CsvDataSource(str(path), product_id=PRODUCT, timeframe=TF)
         with pytest.raises(ValueError, match="missing required columns"):
             list(ds.get_candles(PRODUCT, TF, 0, 9999999999999))
 
     def test_validate_returns_false_for_bad_csv(self, tmp_path):
         path = tmp_path / "bad.csv"
-        path.write_text("timestamp,open,high,low,close\n1704067200000,42000,42100,41900,42050\n")
+        path.write_text(
+            "timestamp,open,high,low,close\n1704067200000,42000,42100,41900,42050\n"
+        )
         ds = CsvDataSource(str(path))
         assert ds.validate() is False
 
 
 class TestCsvDataSourceLazyLoad:
-
     def test_lazy_load_only_on_access(self, tmp_path):
         path = tmp_path / "lazy.csv"
         lines = ["timestamp,open,high,low,close,volume"]
@@ -366,8 +371,8 @@ class TestCsvDataSourceLazyLoad:
 # DatabaseDataSource
 # =============================================================================
 
-class TestDatabaseDataSource:
 
+class TestDatabaseDataSource:
     def test_get_candles_yields_from_query(self):
         """Should yield Candlestick objects from DB rows."""
         from src.core.data_sources.database import DatabaseDataSource
@@ -384,7 +389,9 @@ class TestDatabaseDataSource:
 
         mock_session = MagicMock()
         mock_query = mock_session.query.return_value
-        mock_query.filter.return_value.order_by.return_value.yield_per.return_value = [mock_row]
+        mock_query.filter.return_value.order_by.return_value.yield_per.return_value = [
+            mock_row
+        ]
 
         ds = DatabaseDataSource(session_factory=lambda: mock_session)
         result = list(ds.get_candles(PRODUCT, TF, 0, 9999999999999))
@@ -420,7 +427,9 @@ class TestDatabaseDataSource:
 
         mock_session = MagicMock()
         mock_query = mock_session.query.return_value
-        mock_query.filter.return_value.order_by.return_value.all.return_value = [mock_row]
+        mock_query.filter.return_value.order_by.return_value.all.return_value = [
+            mock_row
+        ]
 
         ds = DatabaseDataSource(session_factory=lambda: mock_session)
         df = ds.get_candles_df(PRODUCT, TF, 0, 9999999999999)
@@ -464,7 +473,10 @@ class TestDatabaseDataSource:
         from src.core.data_sources.database import DatabaseDataSource
 
         mock_session = MagicMock()
-        mock_session.query.return_value.filter.return_value.scalar.side_effect = [None, None]
+        mock_session.query.return_value.filter.return_value.scalar.side_effect = [
+            None,
+            None,
+        ]
 
         ds = DatabaseDataSource(session_factory=lambda: mock_session)
         result = ds.get_available_range(PRODUCT, TF)
@@ -497,14 +509,16 @@ class TestDatabaseDataSource:
 
 
 class TestYahooFinanceDataSource:
-
     def test_unsupported_timeframe_raises(self):
         """Unsupported timeframe should raise ValueError."""
         from src.core.data_sources.yahoo import YahooFinanceDataSource
 
         ds = YahooFinanceDataSource(ticker="BTC-USD")
+        mock_yf = MagicMock()
+        mock_yf.download = MagicMock()
+        mock_yf.Ticker = MagicMock()
 
-        with patch.dict("sys.modules", {"yfinance": MagicMock()}):
+        with patch.dict("sys.modules", {"yfinance": mock_yf}):
             with pytest.raises(ValueError, match="Unsupported timeframe"):
                 ds._download("3m", 0, 9999999999999)
 
@@ -530,7 +544,8 @@ class TestYahooFinanceDataSource:
         from src.core.data_sources.yahoo import YahooFinanceDataSource
 
         mock_yf = MagicMock()
-        mock_yf.download.return_value = pd.DataFrame()
+        mock_yf.download = MagicMock(return_value=pd.DataFrame())
+        mock_yf.Ticker = MagicMock()
 
         ds = YahooFinanceDataSource()
 
@@ -539,19 +554,163 @@ class TestYahooFinanceDataSource:
 
         assert result.empty
 
+    def test_download_none_returns_exact_empty_df(self):
+        """A provider None result should use the existing empty-frame shape."""
+        from src.core.data_sources.yahoo import YahooFinanceDataSource
+
+        mock_yf = MagicMock()
+        mock_yf.download = MagicMock(return_value=None)
+        mock_yf.Ticker = MagicMock()
+
+        ds = YahooFinanceDataSource()
+
+        with patch.dict("sys.modules", {"yfinance": mock_yf}):
+            result = ds._download("1d", 1704067200000, 1704153600000)
+
+        assert result.empty
+        assert list(result.columns) == [
+            "timestamp",
+            "open",
+            "high",
+            "low",
+            "close",
+            "volume",
+        ]
+
+    @pytest.mark.parametrize(
+        ("index", "expected_timestamp"),
+        [
+            (
+                pd.DatetimeIndex(["2024-01-01 00:00:00"]),
+                1704067200000,
+            ),
+            (
+                pd.DatetimeIndex(["2024-01-01 00:00:00"], tz="America/New_York"),
+                1704085200000,
+            ),
+            (
+                pd.DatetimeIndex(["2024-01-01 00:00:00"]).as_unit("ns"),
+                1704067200000,
+            ),
+        ],
+    )
+    def test_download_preserves_datetime_index_semantics(
+        self,
+        index: pd.DatetimeIndex,
+        expected_timestamp: int,
+    ):
+        from src.core.data_sources.yahoo import YahooFinanceDataSource
+
+        provider_frame = pd.DataFrame(
+            {
+                "Open": [1.0],
+                "High": [2.0],
+                "Low": [0.5],
+                "Close": [1.5],
+                "Volume": [3.0],
+            },
+            index=index,
+        )
+        mock_yf = MagicMock()
+        mock_yf.download = MagicMock(return_value=provider_frame)
+        mock_yf.Ticker = MagicMock()
+
+        with patch.dict("sys.modules", {"yfinance": mock_yf}):
+            result = YahooFinanceDataSource()._download(
+                "1d",
+                1704067200000,
+                1704153600000,
+            )
+
+        assert list(result.columns) == [
+            "timestamp",
+            "open",
+            "high",
+            "low",
+            "close",
+            "volume",
+        ]
+        assert result.to_dict("records") == [
+            {
+                "timestamp": expected_timestamp,
+                "open": 1.0,
+                "high": 2.0,
+                "low": 0.5,
+                "close": 1.5,
+                "volume": 3.0,
+            }
+        ]
+
+    def test_download_rejects_parseable_non_datetime_index(self):
+        from src.core.data_sources.yahoo import YahooFinanceDataSource
+
+        provider_frame = pd.DataFrame(
+            {
+                "Open": [1.0],
+                "High": [2.0],
+                "Low": [0.5],
+                "Close": [1.5],
+                "Volume": [3.0],
+            },
+            index=["2024-01-01 00:00:00"],
+        )
+        mock_yf = MagicMock()
+        mock_yf.download = MagicMock(return_value=provider_frame)
+        mock_yf.Ticker = MagicMock()
+
+        with (
+            patch.dict("sys.modules", {"yfinance": mock_yf}),
+            pytest.raises(
+                TypeError, match="Yahoo Finance index must be a DatetimeIndex"
+            ),
+        ):
+            YahooFinanceDataSource()._download(
+                "1d",
+                1704067200000,
+                1704153600000,
+            )
+
+    def test_download_rejects_missing_required_column(self):
+        from src.core.data_sources.yahoo import YahooFinanceDataSource
+
+        provider_frame = pd.DataFrame(
+            {
+                "Open": [1.0],
+                "High": [2.0],
+                "Low": [0.5],
+                "Close": [1.5],
+            },
+            index=pd.DatetimeIndex(["2024-01-01 00:00:00"]),
+        )
+        mock_yf = MagicMock()
+        mock_yf.download = MagicMock(return_value=provider_frame)
+        mock_yf.Ticker = MagicMock()
+
+        with (
+            patch.dict("sys.modules", {"yfinance": mock_yf}),
+            pytest.raises(KeyError, match="volume"),
+        ):
+            YahooFinanceDataSource()._download(
+                "1d",
+                1704067200000,
+                1704153600000,
+            )
+
     def test_get_candles_yields_candlesticks(self):
         """get_candles should yield Candlestick objects from downloaded data."""
         from src.core.data_sources.yahoo import YahooFinanceDataSource
 
         ds = YahooFinanceDataSource(ticker="BTC-USD", product_id="YAHOO:BTC-PERP")
-        download_df = pd.DataFrame({
-            "timestamp": [1704067200000, 1704153600000],
-            "open": [42000.0, 42100.0],
-            "high": [42500.0, 42600.0],
-            "low": [41500.0, 41600.0],
-            "close": [42200.0, 42300.0],
-            "volume": [1000.0, 1100.0],
-        })
+        download_df = pd.DataFrame(
+            {
+                "timestamp": [1704067200000, 1704153600000],
+                "open": [42000.0, 42100.0],
+                "high": [42500.0, 42600.0],
+                "low": [41500.0, 41600.0],
+                "close": [42200.0, 42300.0],
+                "volume": [1000.0, 1100.0],
+            }
+        )
 
         with patch.object(ds, "_download", return_value=download_df):
             result = list(ds.get_candles("YAHOO:BTC-PERP", "1d", 0, 9999999999999))
@@ -559,6 +718,42 @@ class TestYahooFinanceDataSource:
         assert len(result) == 2
         assert isinstance(result[0], Candlestick)
         assert result[0].product_id == "YAHOO:BTC-PERP"
+
+    def test_get_candles_preserves_int64_timestamp_with_float_ohlcv(self):
+        from src.core.data_sources.yahoo import YahooFinanceDataSource
+
+        timestamp = 9_007_199_254_740_993
+        ds = YahooFinanceDataSource(product_id="YAHOO:BTC-PERP")
+        download_df = pd.DataFrame(
+            {
+                "timestamp": [timestamp],
+                "open": [Decimal("1.1")],
+                "high": [Decimal("2.2")],
+                "low": [Decimal("0.3")],
+                "close": [Decimal("1.4")],
+                "volume": [Decimal("5.5")],
+            }
+        ).astype(
+            {
+                "open": "float64",
+                "high": "float64",
+                "low": "float64",
+                "close": "float64",
+                "volume": "float64",
+            }
+        )
+
+        with patch.object(ds, "_download", return_value=download_df):
+            candle = next(ds.get_candles("YAHOO:BTC-PERP", "1d", 0, timestamp + 1))
+
+        assert candle.timestamp == timestamp
+        assert (candle.open, candle.high, candle.low, candle.close, candle.volume) == (
+            Decimal("1.1"),
+            Decimal("2.2"),
+            Decimal("0.3"),
+            Decimal("1.4"),
+            Decimal("5.5"),
+        )
 
     def test_validate_returns_false_on_error(self):
         """validate() should return False when yfinance fails."""

@@ -28,6 +28,54 @@ impl CandleAggregator {
             .retain(|(buffer_product_id, _, _), _| buffer_product_id != product_id);
     }
 
+    /// Flushes buffered target candles whose full target window ends at or before `cutoff_ms`.
+    ///
+    /// This is intended for bounded, already-closed history windows. Live aggregation continues
+    /// to close a bucket only when a later source candle crosses the target boundary.
+    // `aggregator` is also compiled into the PyO3 library, which does not include the history
+    // runtime. The binary is the production owner of this method.
+    #[allow(dead_code)]
+    pub fn flush_closed_before(&mut self, cutoff_ms: i64) -> Result<Vec<Candlestick>> {
+        if cutoff_ms < 0 {
+            bail!("closed candle cutoff must not be negative");
+        }
+
+        let mut closed_keys = Vec::new();
+        for (key, buffer) in &self.buffers {
+            let target_ms = Self::parse_timeframe_millis(&key.2)?;
+            let bucket_end = buffer
+                .candle
+                .timestamp
+                .checked_add(target_ms)
+                .ok_or_else(|| anyhow::anyhow!("aggregated candle end overflow"))?;
+            if bucket_end <= cutoff_ms {
+                closed_keys.push(key.clone());
+            }
+        }
+
+        let mut completed = Vec::new();
+        for key in closed_keys {
+            let buffer = self
+                .buffers
+                .remove(&key)
+                .ok_or_else(|| anyhow::anyhow!("aggregation buffer disappeared during flush"))?;
+            if key.1 == key.2 {
+                continue;
+            }
+            let target_ms = Self::parse_timeframe_millis(&key.2)?;
+            if let Some(candle) = Self::completed_buffer(buffer, target_ms)? {
+                completed.push(candle);
+            }
+        }
+        completed.sort_by(|left, right| {
+            left.timestamp
+                .cmp(&right.timestamp)
+                .then_with(|| left.product_id.cmp(&right.product_id))
+                .then_with(|| left.timeframe.cmp(&right.timeframe))
+        });
+        Ok(completed)
+    }
+
     /// Adds one source candle and returns a candle only when the target window is closed.
     ///
     /// The source duration must divide the target duration exactly. Equal source and target
@@ -456,6 +504,111 @@ mod tests {
             .expect("a no-trade bucket start must not suppress later observed trades");
         assert_eq!(sparse.timestamp, base_ts + 20 * 60_000);
         assert_eq!(sparse.volume, dec!(2));
+    }
+
+    #[test]
+    fn closed_cutoff_flushes_only_eligible_completed_buckets_once() {
+        let mut aggregator = CandleAggregator::new();
+        let base_ts = 1_800_000_000_000i64;
+        let candle = |minute: i64| Candlestick {
+            product_id: "RITHMIC:MNQ-202609".to_string(),
+            timeframe: "1m".to_string(),
+            timestamp: base_ts + minute * 60_000,
+            open: dec!(100) + rust_decimal::Decimal::from(minute),
+            high: dec!(101) + rust_decimal::Decimal::from(minute),
+            low: dec!(99) + rust_decimal::Decimal::from(minute),
+            close: dec!(100.5) + rust_decimal::Decimal::from(minute),
+            volume: dec!(1),
+        };
+
+        for minute in 0..5 {
+            assert!(aggregator
+                .add_candle(&candle(minute), "5m")
+                .unwrap()
+                .is_none());
+        }
+        assert!(aggregator
+            .flush_closed_before(base_ts + 5 * 60_000 - 1)
+            .unwrap()
+            .is_empty());
+
+        let completed = aggregator
+            .flush_closed_before(base_ts + 5 * 60_000)
+            .unwrap();
+        assert_eq!(completed.len(), 1);
+        assert_eq!(completed[0].timestamp, base_ts);
+        assert_eq!(completed[0].timeframe, "5m");
+        assert_eq!(completed[0].open, dec!(100));
+        assert_eq!(completed[0].high, dec!(105));
+        assert_eq!(completed[0].low, dec!(99));
+        assert_eq!(completed[0].close, dec!(104.5));
+        assert_eq!(completed[0].volume, dec!(5));
+        assert!(aggregator
+            .flush_closed_before(base_ts + 10 * 60_000)
+            .unwrap()
+            .is_empty());
+    }
+
+    #[test]
+    fn closed_cutoff_discards_partial_startup_bucket_then_recovers() {
+        let mut aggregator = CandleAggregator::new();
+        let base_ts = 1_800_000_000_000i64;
+        let candle = |minute: i64| Candlestick {
+            product_id: "RITHMIC:MNQ-202609".to_string(),
+            timeframe: "1m".to_string(),
+            timestamp: base_ts + minute * 60_000,
+            open: dec!(100),
+            high: dec!(101),
+            low: dec!(99),
+            close: dec!(100),
+            volume: dec!(1),
+        };
+
+        for minute in 2..5 {
+            assert!(aggregator
+                .add_candle(&candle(minute), "5m")
+                .unwrap()
+                .is_none());
+        }
+        assert!(aggregator
+            .flush_closed_before(base_ts + 5 * 60_000)
+            .unwrap()
+            .is_empty());
+
+        for minute in 5..10 {
+            assert!(aggregator
+                .add_candle(&candle(minute), "5m")
+                .unwrap()
+                .is_none());
+        }
+        let recovered = aggregator
+            .flush_closed_before(base_ts + 10 * 60_000)
+            .unwrap();
+        assert_eq!(recovered.len(), 1);
+        assert_eq!(recovered[0].timestamp, base_ts + 5 * 60_000);
+        assert_eq!(recovered[0].volume, dec!(5));
+    }
+
+    #[test]
+    fn closed_cutoff_rejects_invalid_values_and_does_not_duplicate_passthrough() {
+        let mut aggregator = CandleAggregator::new();
+        let candle = Candlestick {
+            product_id: "RITHMIC:MNQ-202609".to_string(),
+            timeframe: "5m".to_string(),
+            timestamp: 1_800_000_000_000,
+            open: dec!(100),
+            high: dec!(101),
+            low: dec!(99),
+            close: dec!(100),
+            volume: dec!(1),
+        };
+
+        assert!(aggregator.add_candle(&candle, "5m").unwrap().is_some());
+        assert!(aggregator.flush_closed_before(-1).is_err());
+        assert!(aggregator
+            .flush_closed_before(candle.timestamp + 5 * 60_000)
+            .unwrap()
+            .is_empty());
     }
 
     #[test]

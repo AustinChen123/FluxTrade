@@ -1,12 +1,12 @@
 from decimal import Decimal
-from types import SimpleNamespace
+from pathlib import Path
 
 import pytest
 from pydantic import ValidationError
 from sqlalchemy import create_engine
 from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.ext.compiler import compiles
-from sqlalchemy.orm import sessionmaker
+from sqlalchemy.orm import Session, sessionmaker
 
 from src.control_plane.models import (
     ParameterCandidate,
@@ -22,7 +22,12 @@ from src.control_plane.parameter_search import (
     ResearchBacktestParameterEvaluator,
 )
 from src.core.backtest.endpoint_state import ReplayEndpointState
+from src.core.data_sources.memory import MemoryDataSource
+from src.core.interfaces.data_source import IDataSource
+from src.core.models import Candlestick
 from src.core.orm_models import EvolutionEpoch, GeneRecord, Strategy, SystemEvent
+from src.core.strategy_context import StrategyContext
+from src.strategies.base import BaseStrategy, StrategyRequirements
 
 
 @compiles(JSONB, "sqlite")
@@ -77,25 +82,49 @@ class _NoopEvaluator:
 
 
 class _StaticDataSourceProvider:
-    def __init__(self, source):
+    def __init__(self, source: IDataSource) -> None:
         self.source = source
-        self.requests = []
+        self.requests: list[ParameterSearchJobRequest] = []
 
-    def create(self, request):
+    def create(self, request: ParameterSearchJobRequest) -> IDataSource:
         self.requests.append(request)
         return self.source
 
-    def cache_key(self, request):
+    def cache_key(self, request: ParameterSearchJobRequest) -> tuple[str, str, str]:
         return "static", request.product_id, request.timeframe
 
 
-def _strategy_factory(strategy_id, product_id, timeframe, param_pack):
-    return SimpleNamespace(
-        strategy_id=strategy_id,
-        product_id=product_id,
-        timeframe=timeframe,
-        param_pack=param_pack,
-    )
+class _ResearchStrategy(BaseStrategy):
+    def __init__(
+        self,
+        strategy_id: str,
+        product_id: str,
+        timeframe: str,
+        param_pack: dict[str, object],
+    ) -> None:
+        super().__init__(strategy_id, product_id)
+        self.timeframe = timeframe
+        self.param_pack = param_pack
+
+    @property
+    def requirements(self) -> StrategyRequirements:
+        return StrategyRequirements(self.product_id, self.timeframe, 1)
+
+    def on_candle(
+        self,
+        candle: Candlestick,
+        context: StrategyContext | None = None,
+    ) -> None:
+        return None
+
+
+def _strategy_factory(
+    strategy_id: str,
+    product_id: str,
+    timeframe: str,
+    param_pack: dict[str, object],
+) -> BaseStrategy:
+    return _ResearchStrategy(strategy_id, product_id, timeframe, param_pack)
 
 
 def _request_payload(tmp_path):
@@ -120,11 +149,15 @@ def _request_payload(tmp_path):
     }
 
 
-def _sqlite_gene_registry_session_factory(tmp_path):
+def _sqlite_gene_registry_session_factory(
+    tmp_path: Path,
+    request: pytest.FixtureRequest,
+) -> sessionmaker[Session]:
     engine = create_engine(
         f"sqlite:///{tmp_path / 'research_runner_gene_registry.db'}",
         connect_args={"check_same_thread": False, "timeout": 30},
     )
+    request.addfinalizer(engine.dispose)
     for table in [
         Strategy.__table__,
         SystemEvent.__table__,
@@ -144,7 +177,9 @@ def test_research_parameter_search_creates_isolated_capital_allocators(
     tmp_path,
     monkeypatch,
 ):
-    monkeypatch.setattr(parameter_evaluation, "ResearchBacktestRunner", _RecordingRunner)
+    monkeypatch.setattr(
+        parameter_evaluation, "ResearchBacktestRunner", _RecordingRunner
+    )
     _RecordingRunner.instances = []
     evaluator = ResearchBacktestParameterEvaluator(
         _strategy_factory,
@@ -172,7 +207,9 @@ def test_research_parameter_search_creates_isolated_capital_allocators(
 
 
 def test_research_parameter_search_propagates_instrument_spec(tmp_path, monkeypatch):
-    monkeypatch.setattr(parameter_evaluation, "ResearchBacktestRunner", _RecordingRunner)
+    monkeypatch.setattr(
+        parameter_evaluation, "ResearchBacktestRunner", _RecordingRunner
+    )
     _RecordingRunner.instances = []
     payload = _request_payload(tmp_path)
     payload["backtest"]["instrument"] = {
@@ -199,9 +236,11 @@ def test_research_evaluator_uses_injected_data_source_provider(
     tmp_path,
     monkeypatch,
 ):
-    monkeypatch.setattr(parameter_evaluation, "ResearchBacktestRunner", _RecordingRunner)
+    monkeypatch.setattr(
+        parameter_evaluation, "ResearchBacktestRunner", _RecordingRunner
+    )
     _RecordingRunner.instances = []
-    source = object()
+    source = MemoryDataSource()
     provider = _StaticDataSourceProvider(source)
     payload = _request_payload(tmp_path)
     payload["backtest"].pop("candles_csv_path")
@@ -296,7 +335,7 @@ def test_csv_signal_evaluator_uses_injected_source_and_endpoint_equity(
     payload.pop("research_runner")
     payload["backtest"].pop("candles_csv_path")
     request = ParameterSearchJobRequest.model_validate(payload)
-    source = object()
+    source = MemoryDataSource()
     provider = _StaticDataSourceProvider(source)
     evaluator = CsvSignalBacktestParameterEvaluator(
         data_source_provider=provider,
@@ -350,7 +389,9 @@ def test_research_parameter_search_isolates_capital_allocators_per_dataset(
     tmp_path,
     monkeypatch,
 ):
-    monkeypatch.setattr(parameter_evaluation, "ResearchBacktestRunner", _RecordingRunner)
+    monkeypatch.setattr(
+        parameter_evaluation, "ResearchBacktestRunner", _RecordingRunner
+    )
     _RecordingRunner.instances = []
     evaluator = ResearchBacktestParameterEvaluator(
         _strategy_factory,
@@ -407,7 +448,9 @@ def test_research_evaluator_rejects_allocation_above_initial_balance(
     tmp_path,
     monkeypatch,
 ):
-    monkeypatch.setattr(parameter_evaluation, "ResearchBacktestRunner", _RecordingRunner)
+    monkeypatch.setattr(
+        parameter_evaluation, "ResearchBacktestRunner", _RecordingRunner
+    )
     evaluator = ResearchBacktestParameterEvaluator(
         _strategy_factory,
         preload_candles=False,
@@ -432,19 +475,25 @@ def test_parameter_search_result_includes_research_runner_config(tmp_path):
 
     job = executor.submit_search(request)
 
+    assert job.result is not None
     assert job.result["research_runner"] == {"capital_allocation": "100"}
 
 
-def test_parameter_search_persists_research_runner_config_in_epoch(tmp_path):
-    session_factory = _sqlite_gene_registry_session_factory(tmp_path)
+def test_parameter_search_persists_research_runner_config_in_epoch(
+    tmp_path: Path,
+    request: pytest.FixtureRequest,
+) -> None:
+    session_factory = _sqlite_gene_registry_session_factory(tmp_path, request)
     executor = ParameterSearchJobExecutor(
         _NoopEvaluator(),
         run_inline=True,
         db_session_factory=session_factory,
     )
-    request = ParameterSearchJobRequest.model_validate(_request_payload(tmp_path))
+    search_request = ParameterSearchJobRequest.model_validate(
+        _request_payload(tmp_path)
+    )
 
-    job = executor.submit_search(request)
+    job = executor.submit_search(search_request)
 
     assert job.status.value == "SUCCEEDED"
     assert job.result is not None
@@ -650,8 +699,7 @@ def test_generated_walk_forward_folds_run_through_research_evaluator(tmp_path):
     assert job.status.value == "SUCCEEDED"
     assert job.result is not None
     assert [
-        dataset["dataset_id"]
-        for dataset in job.result["evaluation_set"]["datasets"]
+        dataset["dataset_id"] for dataset in job.result["evaluation_set"]["datasets"]
     ] == ["wf_0000", "wf_0001"]
     evaluation = job.result["evaluations"][0]
     assert evaluation["metrics"]["aggregation"] == "registered_walk_forward_fitness"

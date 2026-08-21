@@ -89,14 +89,13 @@ def _pg_reachable() -> bool:
 
 
 # --------------------------------------------------------------------------- #
-# Module-level skip
+# Explicitly enabled connectivity gate
 # --------------------------------------------------------------------------- #
 
 
-if not _pg_reachable():  # pragma: no cover - skipped when PG unavailable
-    pytest.skip(
-        "PostgreSQL unavailable; skipping migration round-trip integration tests",
-        allow_module_level=True,
+if not _pg_reachable():  # pragma: no cover - environment dependent
+    raise RuntimeError(
+        "PostgreSQL migration test service unavailable after explicit enablement"
     )
 
 
@@ -203,6 +202,70 @@ def _check_constraint_names(engine: Engine, table: str) -> set[str]:
     return {r[0] for r in rows}
 
 
+def _insert_order_identity_prerequisites(
+    engine: Engine,
+    *,
+    exchange_id: str,
+    product_id: str,
+) -> None:
+    with engine.begin() as conn:
+        conn.execute(
+            text(
+                "INSERT INTO exchange (id, name) VALUES (:id, :id) "
+                "ON CONFLICT (id) DO NOTHING"
+            ),
+            {"id": exchange_id},
+        )
+        conn.execute(
+            text(
+                "INSERT INTO product (id, exchange_id, base_asset, quote_asset) "
+                "VALUES (:product, :exchange, 'BASE', 'QUOTE') "
+                "ON CONFLICT (id) DO NOTHING"
+            ),
+            {"product": product_id, "exchange": exchange_id},
+        )
+        conn.execute(
+            text(
+                "INSERT INTO strategy (id, name, configuration_json) "
+                "VALUES ('identity-test', 'Identity Test', '{}')"
+            )
+        )
+
+
+def _insert_scoped_order(
+    engine: Engine,
+    *,
+    order_id: str,
+    exchange_id: str,
+    product_id: str,
+    profile: str | None,
+    account_id: str | None,
+    client_order_id: str,
+    exchange_order_id: str,
+) -> None:
+    with engine.begin() as conn:
+        conn.execute(
+            text(
+                'INSERT INTO "order" '
+                "(id, exchange_order_id, strategy_id, product_id, exchange_id, "
+                "account_profile, account_id, type, side, quantity, status, "
+                "timestamp, client_order_id) VALUES "
+                "(:id, :exchange_order_id, 'identity-test', :product_id, "
+                ":exchange_id, :profile, :account_id, 'market', 'buy', 1, "
+                "'open', 1, :client_order_id)"
+            ),
+            {
+                "id": order_id,
+                "exchange_order_id": exchange_order_id,
+                "product_id": product_id,
+                "exchange_id": exchange_id,
+                "profile": profile,
+                "account_id": account_id,
+                "client_order_id": client_order_id,
+            },
+        )
+
+
 def _schema_fingerprint(engine: Engine) -> tuple:
     """Return a stable snapshot of the public schema for diff comparison."""
     insp = sa.inspect(engine)
@@ -290,9 +353,15 @@ def test_full_upgrade_to_head(fresh_pg_db: str) -> None:
         ):
             assert col in ss_cols, f"strategy_state.{col} missing after upgrade"
 
-        # Partial unique index on order.client_order_id.
+        # Account-scoped and legacy partial unique order indexes.
         order_idx = _index_names(engine, "order")
-        assert "uq_order_client_order_id" in order_idx
+        assert {
+            "uq_order_identified_client_order_id",
+            "uq_order_legacy_client_order_id",
+            "uq_order_identified_exchange_order_id",
+            "uq_order_legacy_exchange_order_id",
+        } <= order_idx
+        assert "uq_order_client_order_id" not in order_idx
         assert "idx_order_client_order_id" in order_idx
         assert "idx_order_strategy_status" in order_idx
 
@@ -307,7 +376,9 @@ def test_full_upgrade_to_head(fresh_pg_db: str) -> None:
         ss_checks = _check_constraint_names(engine, "strategy_state")
         assert "chk_error_state" in ss_checks
         assert "chk_stopped_state" in ss_checks
-        assert "chk_nav_source" in _check_constraint_names(engine, "daily_nav_snapshots")
+        assert "chk_nav_source" in _check_constraint_names(
+            engine, "daily_nav_snapshots"
+        )
         assert "chk_gene_role" in _check_constraint_names(engine, "gene_records")
         assert "chk_epoch_status" in _check_constraint_names(engine, "evolution_epochs")
         assert "chk_order_account_identity_complete" in _check_constraint_names(
@@ -325,9 +396,7 @@ def test_sample_data_insertion_after_upgrade(fresh_pg_db: str) -> None:
         with engine.begin() as conn:
             # FK pre-requisites.
             conn.execute(
-                text(
-                    "INSERT INTO exchange (id, name) VALUES ('binance', 'Binance')"
-                )
+                text("INSERT INTO exchange (id, name) VALUES ('binance', 'Binance')")
             )
             conn.execute(
                 text(
@@ -356,6 +425,34 @@ def test_sample_data_insertion_after_upgrade(fresh_pg_db: str) -> None:
                     ),
                     {"id": order_id, "profile": profile, "account_id": account_id},
                 )
+
+            for order_id, account_id in (
+                ("order-account-a", "ACCOUNT-A"),
+                ("order-account-b", "ACCOUNT-B"),
+            ):
+                conn.execute(
+                    text(
+                        'INSERT INTO "order" '
+                        "(id, exchange_order_id, strategy_id, product_id, exchange_id, "
+                        "account_profile, account_id, type, side, quantity, status, "
+                        "timestamp, client_order_id) VALUES "
+                        "(:id, 'SHARED-EXCHANGE', 'strat-1', 'binance:BTC/USDT', "
+                        "'binance', 'ccxt:binance:live', :account_id, 'market', "
+                        "'buy', 1, 'open', 1, 'shared-client')"
+                    ),
+                    {"id": order_id, "account_id": account_id},
+                )
+
+            conn.execute(
+                text(
+                    'INSERT INTO "order" '
+                    "(id, exchange_order_id, strategy_id, product_id, exchange_id, "
+                    "type, side, quantity, status, timestamp, client_order_id) "
+                    "VALUES ('legacy-unique', 'LEGACY-EXCHANGE', 'strat-1', "
+                    "'binance:BTC/USDT', 'binance', 'market', 'buy', 1, 'open', "
+                    "1, 'legacy-client')"
+                )
+            )
 
             # Positive system_events insert.
             conn.execute(
@@ -400,6 +497,34 @@ def test_sample_data_insertion_after_upgrade(fresh_pg_db: str) -> None:
                             "account_id": account_id,
                         },
                     )
+
+        with pytest.raises(IntegrityError):
+            with engine.begin() as conn:
+                conn.execute(
+                    text(
+                        'INSERT INTO "order" '
+                        "(id, exchange_order_id, strategy_id, product_id, exchange_id, "
+                        "account_profile, account_id, type, side, quantity, status, "
+                        "timestamp, client_order_id) VALUES "
+                        "('duplicate-identified', 'SHARED-EXCHANGE', 'strat-1', "
+                        "'binance:BTC/USDT', 'binance', 'ccxt:binance:live', "
+                        "'ACCOUNT-A', 'market', 'buy', 1, 'open', 1, "
+                        "'shared-client')"
+                    )
+                )
+
+        with pytest.raises(IntegrityError):
+            with engine.begin() as conn:
+                conn.execute(
+                    text(
+                        'INSERT INTO "order" '
+                        "(id, exchange_order_id, strategy_id, product_id, exchange_id, "
+                        "type, side, quantity, status, timestamp, client_order_id) "
+                        "VALUES ('duplicate-legacy', 'LEGACY-EXCHANGE', 'strat-1', "
+                        "'binance:BTC/USDT', 'binance', 'market', 'buy', 1, 'open', "
+                        "1, 'legacy-client')"
+                    )
+                )
 
         # Negative CHECK: daily_nav_snapshots.source must be in whitelist.
         with pytest.raises(IntegrityError):
@@ -569,12 +694,16 @@ def test_ops_events_survive_downgrade_and_reupgrade(fresh_pg_db: str) -> None:
 
         _downgrade(fresh_pg_db, "fb8c6e6098e3")
         with engine.connect() as conn:
-            downgraded = conn.execute(
-                text(
-                    "SELECT id, event_type, event_subtype, payload "
-                    "FROM system_events ORDER BY id"
+            downgraded = (
+                conn.execute(
+                    text(
+                        "SELECT id, event_type, event_subtype, payload "
+                        "FROM system_events ORDER BY id"
+                    )
                 )
-            ).mappings().all()
+                .mappings()
+                .all()
+            )
         assert [row["event_type"] for row in downgraded] == ["system_error"] * 4
         assert all(
             "__migration_4f7a2c9d1e6b_ops_event" in row["payload"]
@@ -587,15 +716,17 @@ def test_ops_events_survive_downgrade_and_reupgrade(fresh_pg_db: str) -> None:
 
         _upgrade(fresh_pg_db, "4f7a2c9d1e6b")
         with engine.connect() as conn:
-            restored = conn.execute(
-                text(
-                    "SELECT id, event_type, event_subtype, payload::text AS payload "
-                    "FROM system_events ORDER BY id"
+            restored = (
+                conn.execute(
+                    text(
+                        "SELECT id, event_type, event_subtype, payload::text AS payload "
+                        "FROM system_events ORDER BY id"
+                    )
                 )
-            ).mappings().all()
-        assert [row["event_type"] for row in restored] == ["ops"] * 3 + [
-            "system_error"
-        ]
+                .mappings()
+                .all()
+            )
+        assert [row["event_type"] for row in restored] == ["ops"] * 3 + ["system_error"]
         assert [json.loads(row["payload"]) for row in restored[:3]] == [
             json.loads(payload) for payload in payloads
         ]
@@ -626,6 +757,120 @@ def test_round_trip_idempotent(fresh_pg_db: str) -> None:
         engine.dispose()
 
     assert fp_first == fp_second, "Schema fingerprint diverged across round-trip"
+
+
+def test_order_identity_compatible_data_survives_downgrade_and_reupgrade(
+    fresh_pg_db: str,
+) -> None:
+    _upgrade(fresh_pg_db, "head")
+    engine = sa.create_engine(_target_url(fresh_pg_db))
+    try:
+        _insert_order_identity_prerequisites(
+            engine,
+            exchange_id="BINANCE",
+            product_id="BINANCE:BTCUSDT-PERP",
+        )
+        _insert_scoped_order(
+            engine,
+            order_id="identified",
+            exchange_id="BINANCE",
+            product_id="BINANCE:BTCUSDT-PERP",
+            profile="ccxt:binance:live",
+            account_id="ACCOUNT-A",
+            client_order_id="identified-client",
+            exchange_order_id="identified-exchange",
+        )
+        _insert_scoped_order(
+            engine,
+            order_id="legacy",
+            exchange_id="BINANCE",
+            product_id="BINANCE:BTCUSDT-PERP",
+            profile=None,
+            account_id=None,
+            client_order_id="legacy-client",
+            exchange_order_id="legacy-exchange",
+        )
+    finally:
+        engine.dispose()
+
+    _downgrade(fresh_pg_db, "9b7e2c4d6f10")
+    _upgrade(fresh_pg_db, "head")
+    engine = sa.create_engine(_target_url(fresh_pg_db))
+    try:
+        with engine.connect() as conn:
+            rows = [
+                tuple(row)
+                for row in conn.execute(
+                    text(
+                        'SELECT id, account_profile, account_id FROM "order" '
+                        "ORDER BY id"
+                    )
+                )
+            ]
+        assert rows == [
+            ("identified", "ccxt:binance:live", "ACCOUNT-A"),
+            ("legacy", None, None),
+        ]
+    finally:
+        engine.dispose()
+
+
+@pytest.mark.parametrize(
+    ("exchange_id", "product_id", "profile"),
+    [
+        ("BINANCE", "BINANCE:BTCUSDT-PERP", "ccxt:binance:live"),
+        ("RITHMIC", "RITHMIC:MNQ-202509", "rithmic:lucid"),
+    ],
+)
+def test_order_identity_incompatible_downgrade_keeps_scoped_indexes(
+    fresh_pg_db: str,
+    exchange_id: str,
+    product_id: str,
+    profile: str,
+) -> None:
+    _upgrade(fresh_pg_db, "head")
+    engine = sa.create_engine(_target_url(fresh_pg_db))
+    try:
+        _insert_order_identity_prerequisites(
+            engine,
+            exchange_id=exchange_id,
+            product_id=product_id,
+        )
+        for suffix in ("A", "B"):
+            _insert_scoped_order(
+                engine,
+                order_id=f"order-{suffix}",
+                exchange_id=exchange_id,
+                product_id=product_id,
+                profile=profile,
+                account_id=f"ACCOUNT-{suffix}",
+                client_order_id="shared-client",
+                exchange_order_id="shared-exchange",
+            )
+    finally:
+        engine.dispose()
+
+    with pytest.raises(RuntimeError, match="^order_identity_downgrade_collision$"):
+        _downgrade(fresh_pg_db, "9b7e2c4d6f10")
+
+    engine = sa.create_engine(_target_url(fresh_pg_db))
+    try:
+        assert {
+            "uq_order_identified_client_order_id",
+            "uq_order_legacy_client_order_id",
+            "uq_order_identified_exchange_order_id",
+            "uq_order_legacy_exchange_order_id",
+        } <= _index_names(engine, "order")
+        with engine.connect() as conn:
+            assert conn.execute(text('SELECT COUNT(*) FROM "order"')).scalar_one() == 2
+            assert (
+                conn.execute(
+                    text("SELECT version_num FROM alembic_version")
+                ).scalar_one()
+                == "4e8c1a2b7d90"
+            )
+    finally:
+        engine.dispose()
 
 
 def _insert_research_prerequisites(engine: Engine) -> None:
@@ -823,11 +1068,7 @@ def test_research_dataset_concurrent_import_has_one_winner(
     class ConcurrentImportSession(Session):
         def get(self, entity, ident, **kwargs):
             result = super().get(entity, ident, **kwargs)
-            if (
-                entity is ResearchDataset
-                and ident == dataset_id
-                and result is None
-            ):
+            if entity is ResearchDataset and ident == dataset_id and result is None:
                 rendezvous.wait(timeout=10)
             return result
 
@@ -866,13 +1107,16 @@ def test_research_dataset_concurrent_import_has_one_winner(
                 ),
                 {"dataset_id": dataset_id},
             ).one() == ("sealed", 1)
-            assert conn.execute(
-                text(
-                    "SELECT COUNT(*) FROM research_candlestick "
-                    "WHERE dataset_id = :dataset_id"
-                ),
-                {"dataset_id": dataset_id},
-            ).scalar_one() == 1
+            assert (
+                conn.execute(
+                    text(
+                        "SELECT COUNT(*) FROM research_candlestick "
+                        "WHERE dataset_id = :dataset_id"
+                    ),
+                    {"dataset_id": dataset_id},
+                ).scalar_one()
+                == 1
+            )
     finally:
         engine.dispose()
 
@@ -884,28 +1128,34 @@ def test_research_dataset_downgrade_removes_guard_objects(
     engine = sa.create_engine(_target_url(fresh_pg_db))
     try:
         with engine.connect() as conn:
-            assert conn.execute(
-                text(
-                    "SELECT COUNT(*) FROM pg_proc "
-                    "WHERE proname IN ("
-                    "'reject_sealed_research_dataset_mutation', "
-                    "'reject_sealed_research_candlestick_mutation', "
-                    "'reject_research_table_truncate')"
-                )
-            ).scalar_one() == 3
+            assert (
+                conn.execute(
+                    text(
+                        "SELECT COUNT(*) FROM pg_proc "
+                        "WHERE proname IN ("
+                        "'reject_sealed_research_dataset_mutation', "
+                        "'reject_sealed_research_candlestick_mutation', "
+                        "'reject_research_table_truncate')"
+                    )
+                ).scalar_one()
+                == 3
+            )
 
         _downgrade(fresh_pg_db, "7a3c9e1b5d2f")
 
         with engine.connect() as conn:
-            assert conn.execute(
-                text(
-                    "SELECT COUNT(*) FROM pg_proc "
-                    "WHERE proname IN ("
-                    "'reject_sealed_research_dataset_mutation', "
-                    "'reject_sealed_research_candlestick_mutation', "
-                    "'reject_research_table_truncate')"
-                )
-            ).scalar_one() == 0
+            assert (
+                conn.execute(
+                    text(
+                        "SELECT COUNT(*) FROM pg_proc "
+                        "WHERE proname IN ("
+                        "'reject_sealed_research_dataset_mutation', "
+                        "'reject_sealed_research_candlestick_mutation', "
+                        "'reject_research_table_truncate')"
+                    )
+                ).scalar_one()
+                == 0
+            )
         assert "research_dataset" not in _table_names(engine)
         assert "research_candlestick" not in _table_names(engine)
     finally:

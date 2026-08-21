@@ -12,6 +12,11 @@ pub(crate) fn is_fatal_session_error(error: &anyhow::Error) -> bool {
     error.downcast_ref::<FatalSessionError>().is_some()
 }
 
+pub(crate) fn is_handshake_rejection(error: &(dyn std::error::Error + 'static)) -> bool {
+    matches!(error.downcast_ref::<FatalSessionError>(), Some(error)
+        if error.0 == "stable_error_code=rithmic_handshake_rejected")
+}
+
 const SYSTEM_INFO_REQUEST: i32 = 16;
 const SYSTEM_INFO_RESPONSE: i32 = 17;
 const LOGIN_REQUEST: i32 = 10;
@@ -264,13 +269,9 @@ impl RithmicSession {
 
     fn accept_handshake_reject(&mut self, frame: &[u8]) -> Result<()> {
         expect_template(frame, REJECT)?;
-        let response: protocol::Reject = codec::decode(frame)?;
+        let _: protocol::Reject = codec::decode(frame)?;
         self.state = SessionState::Failed;
-        Err(FatalSessionError(format!(
-            "Rithmic rejected the session: {}",
-            response.rp_code.join(",")
-        ))
-        .into())
+        Err(FatalSessionError("stable_error_code=rithmic_handshake_rejected".to_string()).into())
     }
 
     fn accept_forced_logout(&mut self, frame: &[u8]) -> Result<()> {
@@ -393,6 +394,38 @@ fn ensure_handshake_success(rp_codes: &[String], phase: &str) -> Result<()> {
 }
 
 #[cfg(test)]
+pub(crate) fn handshake_rejection_with_contexts() -> anyhow::Error {
+    let login = LoginParameters::new(
+        "test-user".to_string(),
+        "test-password".to_string(),
+        "test-system".to_string(),
+        "FluxTrade".to_string(),
+        "0.1.0".to_string(),
+        Plant::Ticker,
+    )
+    .expect("test login parameters should be valid");
+    let mut session = RithmicSession::new(login);
+    session
+        .begin_system_info()
+        .expect("test session should enter the system-info handshake");
+    let reject = codec::encode(&protocol::Reject {
+        template_id: REJECT,
+        user_msg: vec!["provider-user-sentinel".to_string()],
+        rp_code: vec![
+            "provider-code-sentinel".to_string(),
+            "provider-detail-sentinel".to_string(),
+        ],
+    })
+    .expect("test reject should encode");
+
+    session
+        .reject_terminal(&reject)
+        .expect_err("handshake reject should fail the session")
+        .context("outer handshake context")
+        .context("terminal owner context")
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
 
@@ -450,6 +483,21 @@ mod tests {
             .accept_login(&login_response(Some(30.0), "0"))
             .unwrap();
         session
+    }
+
+    fn handshake_sessions() -> [RithmicSession; 2] {
+        let mut discovery = RithmicSession::new(login(Plant::Ticker));
+        discovery.begin_system_info().unwrap();
+
+        let mut login_session = RithmicSession::new(login(Plant::Ticker));
+        login_session.begin_system_info().unwrap();
+        login_session
+            .accept_system_info(&system_info(&["test-system"], "0"))
+            .unwrap();
+        login_session.mark_reconnected().unwrap();
+        login_session.begin_login().unwrap();
+
+        [discovery, login_session]
     }
 
     #[test]
@@ -551,6 +599,7 @@ mod tests {
             .accept_system_info(&system_info(&["test-system"], "9"))
             .unwrap_err();
         assert!(is_fatal_session_error(&error));
+        assert!(!error.chain().any(is_handshake_rejection));
         assert!(error.to_string().contains("system-info"));
         assert_eq!(session.state(), SessionState::Failed);
     }
@@ -574,6 +623,7 @@ mod tests {
         let error = session.accept_login(&response).unwrap_err();
 
         assert!(is_fatal_session_error(&error));
+        assert!(!error.chain().any(is_handshake_rejection));
         assert_eq!(
             error.to_string(),
             "Rithmic login handshake response code 13"
@@ -707,6 +757,7 @@ mod tests {
         let mut terminated = activate(Plant::Ticker);
         let error = terminated.accept_control(&forced_logout).unwrap_err();
         assert!(is_fatal_session_error(&error));
+        assert!(!error.chain().any(is_handshake_rejection));
         assert_eq!(terminated.state(), SessionState::Failed);
     }
 
@@ -742,6 +793,58 @@ mod tests {
             let error = login_session.reject_terminal(&frame).unwrap_err();
             assert!(is_fatal_session_error(&error));
             assert_eq!(login_session.state(), SessionState::Failed);
+        }
+    }
+
+    #[test]
+    fn handshake_reject_error_chain_excludes_provider_controlled_values() {
+        const SAFE_MESSAGE: &str = "stable_error_code=rithmic_handshake_rejected";
+        const SENTINELS: [&str; 3] = [
+            "provider-user-sentinel",
+            "provider-code-sentinel",
+            "provider-detail-sentinel",
+        ];
+
+        for (user_msg, rp_code) in [
+            (
+                vec![SENTINELS[0].to_string()],
+                vec![SENTINELS[1].to_string(), SENTINELS[2].to_string()],
+            ),
+            (vec![String::new()], vec![String::new()]),
+            (vec![], vec![]),
+        ] {
+            let reject = codec::encode(&protocol::Reject {
+                template_id: REJECT,
+                user_msg,
+                rp_code,
+            })
+            .unwrap();
+
+            for mut session in handshake_sessions() {
+                let error = session.reject_terminal(&reject).unwrap_err();
+                let error = error
+                    .context("outer handshake context")
+                    .context("terminal owner");
+                let chain = error.chain().map(ToString::to_string).collect::<Vec<_>>();
+                let alternate = format!("{error:#}");
+
+                assert!(is_fatal_session_error(&error));
+                assert!(error.chain().any(is_handshake_rejection));
+                assert_eq!(session.state(), SessionState::Failed);
+                assert_eq!(error.root_cause().to_string(), SAFE_MESSAGE);
+                assert_eq!(
+                    chain,
+                    ["terminal owner", "outer handshake context", SAFE_MESSAGE]
+                );
+                assert_eq!(
+                    alternate,
+                    format!("terminal owner: outer handshake context: {SAFE_MESSAGE}")
+                );
+                for sentinel in SENTINELS {
+                    assert!(!alternate.contains(sentinel));
+                    assert!(chain.iter().all(|layer| !layer.contains(sentinel)));
+                }
+            }
         }
     }
 

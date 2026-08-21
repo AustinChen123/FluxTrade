@@ -10,10 +10,14 @@ Covers:
 """
 
 import pytest
-from decimal import Decimal
+from decimal import Context, Decimal, ROUND_DOWN, ROUND_HALF_UP, localcontext
+from pathlib import Path
 from unittest.mock import patch, MagicMock
 
-from src.core.order_manager import OrderManager
+from redis.exceptions import ResponseError
+
+from src.core.runtime_capabilities import OrderAccountIdentity
+from src.core.order_manager import OrderManager, PositionCachePersistenceError
 from src.core.models import OrderSide, OrderStatus, SignalType
 
 
@@ -135,22 +139,61 @@ class TestOrderCreation:
             "limits": ["42000.5"],
         }
 
-    def test_rithmic_live_order_persists_account_identity_before_submission(
+    def test_neutral_resolver_is_the_only_order_account_identity_source(
         self,
         mock_order_repo,
         mock_clock,
         signal_factory,
     ):
+        calls: list[tuple[str, bool]] = []
+
+        def resolve_identity(
+            product_id: str,
+            *,
+            is_backtest: bool,
+        ) -> OrderAccountIdentity | None:
+            calls.append((product_id, is_backtest))
+            return OrderAccountIdentity(
+                account_profile="orders",
+                account_id="ACCOUNT",
+            )
+
         order_manager = OrderManager(
             mock_order_repo,
             mock_clock,
             is_backtest=False,
-            rithmic_account_profile=" test ",
-            rithmic_account_id=" ACCOUNT ",
+            order_account_identity_resolver=resolve_identity,
+        )
+        order = order_manager.create_order(
+            signal_factory(product_id="RITHMIC:NQ-202609"),
+            OrderSide.BUY,
+            "market",
+            Decimal("1"),
+        )
+
+        assert calls == [("RITHMIC:NQ-202609", False)]
+        assert order.account_profile == "orders"
+        assert order.account_id == "ACCOUNT"
+
+    def test_live_order_persists_resolved_account_identity_before_submission(
+        self,
+        mock_order_repo,
+        mock_clock,
+        signal_factory,
+    ):
+        identity = OrderAccountIdentity(
+            account_profile=" test ",
+            account_id=" ACCOUNT ",
+        )
+        order_manager = OrderManager(
+            mock_order_repo,
+            mock_clock,
+            is_backtest=False,
+            order_account_identity_resolver=lambda *_args, **_kwargs: identity,
         )
 
         order = order_manager.create_order(
-            signal_factory(product_id="RITHMIC:NQ-202609"),
+            signal_factory(product_id="VENUE:ABC-202609"),
             OrderSide.BUY,
             "limit",
             Decimal("1"),
@@ -162,17 +205,25 @@ class TestOrderCreation:
         assert order.account_id == "ACCOUNT"
         assert mock_order_repo.orders[order.id].account_id == "ACCOUNT"
 
-    def test_rithmic_live_order_rejects_missing_account_identity(
+    def test_order_identity_resolver_failure_precedes_persistence(
         self,
         mock_order_repo,
         mock_clock,
         signal_factory,
     ):
-        order_manager = OrderManager(mock_order_repo, mock_clock, is_backtest=False)
+        def reject_identity(*_args, **_kwargs):
+            raise RuntimeError("order account identity unavailable")
 
-        with pytest.raises(RuntimeError, match="require account profile and account ID"):
+        order_manager = OrderManager(
+            mock_order_repo,
+            mock_clock,
+            is_backtest=False,
+            order_account_identity_resolver=reject_identity,
+        )
+
+        with pytest.raises(RuntimeError, match="order account identity unavailable"):
             order_manager.create_order(
-                signal_factory(product_id="RITHMIC:NQ-202609"),
+                signal_factory(product_id="VENUE:ABC-202609"),
                 OrderSide.BUY,
                 "market",
                 Decimal("1"),
@@ -186,12 +237,21 @@ class TestOrderCreation:
         mock_clock,
         signal_factory,
     ):
+        identity = OrderAccountIdentity(
+            account_profile="test",
+            account_id="ACCOUNT",
+        )
+
+        def resolve_identity(product_id: str, *, is_backtest: bool):
+            if is_backtest or product_id != "VENUE:ABC-202609":
+                return None
+            return identity
+
         live_manager = OrderManager(
             mock_order_repo,
             mock_clock,
             is_backtest=False,
-            rithmic_account_profile="test",
-            rithmic_account_id="ACCOUNT",
+            order_account_identity_resolver=resolve_identity,
         )
         binance_order = live_manager.create_order(
             signal_factory(product_id="BINANCE:BTCUSDT-PERP"),
@@ -203,11 +263,10 @@ class TestOrderCreation:
             mock_order_repo,
             mock_clock,
             is_backtest=True,
-            rithmic_account_profile="test",
-            rithmic_account_id="ACCOUNT",
+            order_account_identity_resolver=resolve_identity,
         )
         rithmic_backtest_order = backtest_manager.create_order(
-            signal_factory(product_id="RITHMIC:NQ-202609"),
+            signal_factory(product_id="VENUE:ABC-202609"),
             OrderSide.BUY,
             "market",
             Decimal("1"),
@@ -217,6 +276,18 @@ class TestOrderCreation:
         assert binance_order.account_id is None
         assert rithmic_backtest_order.account_profile is None
         assert rithmic_backtest_order.account_id is None
+
+
+def test_generic_order_chain_has_no_rithmic_account_policy() -> None:
+    root = Path(__file__).parents[1] / "src" / "core"
+    for path in (root / "engine.py", root / "execution.py", root / "order_manager.py"):
+        source = path.read_text()
+        assert "rithmic_account_profile" not in source
+        assert "rithmic_account_id" not in source
+    assert (
+        'exchange_id.upper() == "RITHMIC"'
+        not in (root / "order_manager.py").read_text()
+    )
 
 
 class TestOrderStatusUpdates:
@@ -340,6 +411,7 @@ class TestExchangeOrderId:
         signal = signal_factory()
         order = order_manager.create_order(signal, OrderSide.BUY, "market", Decimal("0.1"))
 
+        assert order.exchange_order_id is not None
         assert order.exchange_order_id.startswith("sim_")
 
 
@@ -491,6 +563,7 @@ class TestOrderManagerLiveMode:
         )
 
         mock_redis = MagicMock()
+        mock_redis.hgetall.return_value = {}
         mock_script = MagicMock()
         mock_redis.register_script.return_value = mock_script
 
@@ -503,7 +576,272 @@ class TestOrderManagerLiveMode:
         om.fill_order(order, Decimal("42000"), Decimal("0.1"))
 
         mock_script.assert_called_once()
+        args = mock_script.call_args.kwargs["args"]
+        assert args[:5] == [
+            order.strategy_id,
+            order.product_id,
+            "BUY",
+            "0.1",
+            "42000",
+        ]
+        assert args[8:] == ["0.1", "42000"]
+        assert len(args) == 10
         assert order.status == "closed"
+
+    def test_live_fill_persists_trade_before_redis_projection(
+        self,
+        mock_clock,
+        mock_order_repo,
+        signal_factory,
+    ):
+        mock_redis = MagicMock()
+
+        def read_after_trade(_key):
+            assert len(mock_order_repo.trades) == 1
+            return {}
+
+        mock_redis.hgetall.side_effect = read_after_trade
+        persist_fill = MagicMock(side_effect=mock_order_repo.persist_fill)
+        mock_order_repo.persist_fill = persist_fill
+
+        def project_after_trade(**_kwargs):
+            assert len(mock_order_repo.trades) == 1
+            return "OK"
+
+        mock_script = MagicMock(side_effect=project_after_trade)
+        mock_redis.register_script.return_value = mock_script
+        with (
+            patch(
+                "src.core.order_manager.create_redis_client",
+                return_value=mock_redis,
+            ),
+            patch("builtins.open", MagicMock()),
+        ):
+            order_manager = OrderManager(
+                mock_order_repo,
+                mock_clock,
+                is_backtest=False,
+            )
+
+        order = order_manager.create_order(
+            signal_factory(),
+            OrderSide.BUY,
+            "market",
+            Decimal("0.1"),
+        )
+
+        order_manager.fill_order(order, Decimal("42000"), Decimal("0.1"))
+
+        assert len(mock_order_repo.trades) == 1
+        persist_fill.assert_called_once()
+        mock_script.assert_called_once()
+
+    def test_trade_flush_failure_rolls_back_the_durable_order_update(
+        self,
+        mock_clock,
+        signal_factory,
+        sqlite_order_session_factory,
+    ):
+        from sqlalchemy import event
+
+        from src.core.orm_models import Order as StoredOrder
+        from src.core.orm_models import Trade as StoredTrade
+        from src.core.repositories import LiveOrderRepository
+
+        repo = LiveOrderRepository(db_session_factory=sqlite_order_session_factory)
+        mock_redis = MagicMock()
+        mock_redis.hgetall.side_effect = AssertionError(
+            "Redis read forbidden before durable fill"
+        )
+        mock_script = MagicMock(
+            side_effect=AssertionError("Redis write forbidden before durable fill")
+        )
+        mock_redis.register_script.return_value = mock_script
+        with (
+            patch(
+                "src.core.order_manager.create_redis_client",
+                return_value=mock_redis,
+            ),
+            patch("builtins.open", MagicMock()),
+        ):
+            order_manager = OrderManager(repo, mock_clock, is_backtest=False)
+
+        order = order_manager.create_order(
+            signal_factory(),
+            OrderSide.BUY,
+            "market",
+            Decimal("1"),
+        )
+        prior_status = order.status
+
+        def fail_trade_flush(session, _flush_context, _instances):
+            if any(isinstance(value, StoredTrade) for value in session.new):
+                raise RuntimeError("trade-primary")
+
+        event.listen(
+            sqlite_order_session_factory.class_,
+            "before_flush",
+            fail_trade_flush,
+        )
+        try:
+            with pytest.raises(RuntimeError, match="^trade-primary$"):
+                order_manager.fill_order(order, Decimal("100"), Decimal("1"))
+        finally:
+            event.remove(
+                sqlite_order_session_factory.class_,
+                "before_flush",
+                fail_trade_flush,
+            )
+
+        with sqlite_order_session_factory() as session:
+            persisted = session.get(StoredOrder, order.id)
+            trade_count = (
+                session.query(StoredTrade).filter_by(order_id=order.id).count()
+            )
+
+        assert persisted is not None
+        assert persisted.status == prior_status
+        assert trade_count == 0
+        mock_redis.hgetall.assert_not_called()
+        mock_script.assert_not_called()
+
+    @pytest.mark.parametrize("failure_owner", ["order", "trade"])
+    def test_durable_fill_failure_precedes_redis_and_is_not_reclassified(
+        self,
+        mock_clock,
+        mock_order_repo,
+        signal_factory,
+        failure_owner,
+    ):
+        order_manager = OrderManager(mock_order_repo, mock_clock, is_backtest=True)
+        order_manager.is_backtest = False
+        order_manager.redis_client = MagicMock()
+        order_manager.redis_client.hgetall.side_effect = AssertionError(
+            "Redis read forbidden before durable fill"
+        )
+        order_manager.update_position_script = MagicMock(
+            side_effect=AssertionError("Redis write forbidden before durable fill")
+        )
+        order = order_manager.create_order(
+            signal_factory(),
+            OrderSide.BUY,
+            "market",
+            Decimal("1"),
+        )
+        if failure_owner == "order":
+            mock_order_repo.update_order = MagicMock(
+                side_effect=RuntimeError("order-primary")
+            )
+        else:
+            mock_order_repo.add_trade = MagicMock(
+                side_effect=RuntimeError("trade-primary")
+            )
+
+        with pytest.raises(RuntimeError, match=rf"^{failure_owner}-primary$"):
+            order_manager.fill_order(order, Decimal("100"), Decimal("1"))
+
+        order_manager.redis_client.hgetall.assert_not_called()
+        order_manager.update_position_script.assert_not_called()
+
+    def test_unexpected_projection_arithmetic_is_not_cache_reclassified(
+        self,
+        mock_clock,
+        mock_order_repo,
+        signal_factory,
+    ):
+        order_manager = OrderManager(mock_order_repo, mock_clock, is_backtest=True)
+        order_manager.is_backtest = False
+        order_manager.redis_client = MagicMock()
+        order_manager.redis_client.hgetall.return_value = {
+            b"quantity": b"1",
+            b"entry_price": b"100",
+        }
+        order_manager.update_position_script = MagicMock()
+        order = order_manager.create_order(
+            signal_factory(),
+            OrderSide.BUY,
+            "market",
+            Decimal("1"),
+        )
+
+        with (
+            patch(
+                "src.core.order_manager.exact_decimal_add",
+                side_effect=ArithmeticError("arithmetic-primary"),
+            ),
+            pytest.raises(ArithmeticError, match="^arithmetic-primary$"),
+        ):
+            order_manager.fill_order(order, Decimal("100"), Decimal("1"))
+
+        assert len(mock_order_repo.trades) == 1
+        order_manager.update_position_script.assert_not_called()
+
+    @pytest.mark.parametrize(
+        ("price", "quantity"),
+        [
+            (Decimal("0"), Decimal("1")),
+            (Decimal("NaN"), Decimal("1")),
+            (Decimal("100"), Decimal("0")),
+            (Decimal("100"), Decimal("Infinity")),
+        ],
+    )
+    def test_invalid_fill_is_rejected_before_any_durable_mutation(
+        self,
+        mock_clock,
+        mock_order_repo,
+        signal_factory,
+        price,
+        quantity,
+    ):
+        order_manager = OrderManager(mock_order_repo, mock_clock, is_backtest=True)
+        order = order_manager.create_order(
+            signal_factory(),
+            OrderSide.BUY,
+            "market",
+            Decimal("1"),
+        )
+        original = (order.status, order.filled_quantity, order.filled_price)
+
+        with pytest.raises(ValueError, match="finite positive exact Decimal"):
+            order_manager.fill_order(order, price, quantity)
+
+        assert (order.status, order.filled_quantity, order.filled_price) == original
+        assert mock_order_repo.trades == []
+        assert mock_order_repo.positions == {}
+
+    def test_live_fill_requires_registered_lua_script(
+        self,
+        mock_clock,
+        signal_factory,
+        sqlite_order_session_factory,
+    ):
+        from src.core.repositories import LiveOrderRepository
+
+        repo = LiveOrderRepository(
+            db_session_factory=sqlite_order_session_factory
+        )
+        mock_redis = MagicMock()
+        mock_redis.register_script.return_value = MagicMock()
+        mock_redis.hgetall.return_value = {}
+
+        with patch("src.core.order_manager.create_redis_client", return_value=mock_redis), \
+             patch("builtins.open", MagicMock()):
+            order_manager = OrderManager(repo, mock_clock, is_backtest=False)
+
+        order_manager.update_position_script = None
+        signal = signal_factory()
+        order = order_manager.create_order(
+            signal,
+            OrderSide.BUY,
+            "market",
+            Decimal("0.1"),
+        )
+
+        with pytest.raises(
+            PositionCachePersistenceError,
+            match="Live fill position cache projection failed",
+        ):
+            order_manager.fill_order(order, Decimal("42000"), Decimal("0.1"))
 
     def test_live_fill_lua_error_raises_runtime(
         self,
@@ -512,27 +850,241 @@ class TestOrderManagerLiveMode:
         sqlite_order_session_factory,
     ):
         """Lua script ResponseError should raise RuntimeError."""
-        import redis as redis_lib
         from src.core.repositories import LiveOrderRepository
 
-        repo = LiveOrderRepository(
-            db_session_factory=sqlite_order_session_factory
-        )
+        repo = LiveOrderRepository(db_session_factory=sqlite_order_session_factory)
 
         mock_redis = MagicMock()
+        mock_redis.hgetall.return_value = {}
         mock_script = MagicMock()
-        mock_script.side_effect = redis_lib.exceptions.ResponseError("script error")
+        mock_script.side_effect = ResponseError("script error")
         mock_redis.register_script.return_value = mock_script
 
-        with patch("src.core.order_manager.create_redis_client", return_value=mock_redis), \
-             patch("builtins.open", MagicMock()):
+        with (
+            patch(
+                "src.core.order_manager.create_redis_client", return_value=mock_redis
+            ),
+            patch("builtins.open", MagicMock()),
+        ):
             om = OrderManager(repo, mock_clock, is_backtest=False)
 
         signal = signal_factory()
         order = om.create_order(signal, OrderSide.BUY, "market", Decimal("0.1"))
 
-        with pytest.raises(RuntimeError, match="Critical State Corruption"):
+        with pytest.raises(
+            PositionCachePersistenceError,
+            match="Live fill position cache projection failed",
+        ):
             om.fill_order(order, Decimal("42000"), Decimal("0.1"))
+
+    @pytest.mark.parametrize(
+        "raw_position",
+        [
+            {b"quantity": b"bad", b"entry_price": b"100"},
+            {b"quantity": b"1", b"entry_price": b"0"},
+            {b"quantity": b"0", b"entry_price": b"100"},
+            {b"quantity": b"1"},
+        ],
+    )
+    def test_live_fill_cache_read_failure_is_typed_after_trade(
+        self,
+        mock_clock,
+        mock_order_repo,
+        signal_factory,
+        raw_position,
+    ):
+        mock_redis = MagicMock()
+        mock_redis.hgetall.return_value = raw_position
+        mock_script = MagicMock()
+        mock_redis.register_script.return_value = mock_script
+        with (
+            patch(
+                "src.core.order_manager.create_redis_client",
+                return_value=mock_redis,
+            ),
+            patch("builtins.open", MagicMock()),
+        ):
+            order_manager = OrderManager(
+                mock_order_repo,
+                mock_clock,
+                is_backtest=False,
+            )
+        order = order_manager.create_order(
+            signal_factory(),
+            OrderSide.BUY,
+            "market",
+            Decimal("1"),
+        )
+
+        with pytest.raises(PositionCachePersistenceError) as failure:
+            order_manager.fill_order(order, Decimal("100"), Decimal("1"))
+
+        assert str(failure.value) == "Live fill position cache projection failed"
+        assert failure.value.__cause__ is None
+        assert order.status == "closed"
+        assert len(mock_order_repo.trades) == 1
+        mock_script.assert_not_called()
+
+    @pytest.mark.parametrize(
+        ("raw_position", "side", "quantity", "price", "expected"),
+        [
+            ({}, "BUY", "1", "100", ("1", "100")),
+            ({}, "SELL", "2", "101", ("-2", "101")),
+            (
+                {b"quantity": b"2", b"entry_price": b"100"},
+                "BUY",
+                "1",
+                "103",
+                ("3", "101"),
+            ),
+            (
+                {b"quantity": b"-2", b"entry_price": b"100"},
+                "SELL",
+                "1",
+                "103",
+                ("-3", "101"),
+            ),
+            (
+                {b"quantity": b"2", b"entry_price": b"100"},
+                "SELL",
+                "1",
+                "103",
+                ("1", "100"),
+            ),
+            (
+                {b"quantity": b"-2", b"entry_price": b"100"},
+                "BUY",
+                "1",
+                "103",
+                ("-1", "100"),
+            ),
+            (
+                {b"quantity": b"2", b"entry_price": b"100"},
+                "SELL",
+                "2",
+                "103",
+                ("0", "0"),
+            ),
+            (
+                {b"quantity": b"2", b"entry_price": b"100"},
+                "SELL",
+                "3",
+                "103",
+                ("-1", "103"),
+            ),
+            (
+                {b"quantity": b"-2", b"entry_price": b"100"},
+                "BUY",
+                "3",
+                "103",
+                ("1", "103"),
+            ),
+        ],
+    )
+    def test_live_position_projection_signed_state_matrix(
+        self,
+        mock_clock,
+        mock_order_repo,
+        raw_position,
+        side,
+        quantity,
+        price,
+        expected,
+    ):
+        order_manager = OrderManager(mock_order_repo, mock_clock, is_backtest=True)
+        order_manager.redis_client = MagicMock()
+        order_manager.redis_client.hgetall.return_value = raw_position
+
+        projected = order_manager._project_live_position(
+            strategy_id="strategy",
+            product_id="BINANCE:BTCUSDT-PERP",
+            side=side,
+            fill_quantity=Decimal(quantity),
+            fill_price=Decimal(price),
+        )
+
+        assert projected == tuple(Decimal(value) for value in expected)
+
+    @pytest.mark.parametrize("precision", [6, 60])
+    @pytest.mark.parametrize("rounding", [ROUND_DOWN, ROUND_HALF_UP])
+    def test_nonterminating_position_average_ignores_ambient_context(
+        self,
+        mock_clock,
+        mock_order_repo,
+        precision,
+        rounding,
+    ):
+        order_manager = OrderManager(mock_order_repo, mock_clock, is_backtest=True)
+        order_manager.redis_client = MagicMock()
+        order_manager.redis_client.hgetall.return_value = {
+            b"quantity": b"1",
+            b"entry_price": b"1",
+        }
+
+        with localcontext(Context(prec=precision, rounding=rounding)):
+            projected = order_manager._project_live_position(
+                strategy_id="strategy",
+                product_id="BINANCE:BTCUSDT-PERP",
+                side="BUY",
+                fill_quantity=Decimal("2"),
+                fill_price=Decimal("2"),
+            )
+
+        assert projected == (
+            Decimal("3"),
+            Decimal("1.666666666666666666666666667"),
+        )
+
+    @pytest.mark.parametrize("precision", [6, 60])
+    @pytest.mark.parametrize("rounding", [ROUND_DOWN, ROUND_HALF_UP])
+    def test_terminating_position_average_remains_exact_beyond_28_digits(
+        self,
+        mock_clock,
+        mock_order_repo,
+        precision,
+        rounding,
+    ):
+        order_manager = OrderManager(mock_order_repo, mock_clock, is_backtest=True)
+        order_manager.redis_client = MagicMock()
+        order_manager.redis_client.hgetall.return_value = {
+            b"quantity": b"1",
+            b"entry_price": b"1234567890123456789012345678.1",
+        }
+
+        with localcontext(Context(prec=precision, rounding=rounding)):
+            projected = order_manager._project_live_position(
+                strategy_id="strategy",
+                product_id="BINANCE:BTCUSDT-PERP",
+                side="BUY",
+                fill_quantity=Decimal("1"),
+                fill_price=Decimal("1234567890123456789012345678.3"),
+            )
+
+        assert projected == (
+            Decimal("2"),
+            Decimal("1234567890123456789012345678.2"),
+        )
+
+    def test_live_position_script_has_no_balance_or_lua_number_arithmetic(self):
+        script = (
+            Path(__file__).parents[1] / "src" / "lua" / "update_position.lua"
+        ).read_text()
+
+        assert "state:balance" not in script
+        assert "tonumber" not in script
+        assert "HINCRBYFLOAT" not in script
+        assert script.count('redis.call("XADD", "stream:trades"') == 1
+        for field in (
+            "trade_id",
+            "order_id",
+            "strategy_id",
+            "product_id",
+            "side",
+            "price",
+            "quantity",
+            "timestamp",
+        ):
+            assert f'"{field}"' in script
 
     def test_explicit_backtest_flag_overrides_detection(self, mock_order_repo, mock_clock):
         """Explicit is_backtest=True should skip Redis init."""

@@ -1,10 +1,8 @@
 import logging
-import json
 import os
 import signal
 import sys
 from contextlib import contextmanager
-from pathlib import Path
 
 import structlog
 
@@ -17,10 +15,17 @@ from src.core.consumer import (
     DataConsumer,
 )
 from src.core.engine import StrategyEngine
+from src.core.strategy_loader import StrategyLoader
 from src.core.db import SessionLocal
 from src.core.clock import RealtimeClock
 from src.core.metrics import configure_metrics
 from src.core.product_registry import to_exchange_name
+from src.core.adapters import create_adapter
+from src.core.adapter_runtime_composition import (
+    build_live_adapter_config,
+    runtime_factories_for_config,
+    validate_runtime_config as _validate_runtime_config,
+)
 
 
 def _setup_logging() -> None:
@@ -80,6 +85,9 @@ def _setup_logging() -> None:
 _setup_logging()
 logger = logging.getLogger(__name__)
 
+_PRODUCTION_STRATEGY_ARTIFACTS_PATH = "/app/strategy_artifacts"
+_LOCAL_STRATEGIES_PATH = "/app/strategies_hot"
+
 
 def _env_flag(name: str, default: bool = False) -> bool:
     value = os.getenv(name)
@@ -126,15 +134,28 @@ def _required_env_flag(name: str) -> bool:
     return _env_flag(name)
 
 
-def _env_json_object(name: str) -> dict:
-    raw = _required_env(name)
-    try:
-        value = json.loads(raw)
-    except json.JSONDecodeError as exc:
-        raise ValueError(f"{name} must be valid JSON") from exc
-    if not isinstance(value, dict) or not value:
-        raise ValueError(f"{name} must be a non-empty JSON object")
-    return value
+def _strategy_artifact_loader_from_env():
+    if os.getenv("FLUXTRADE_ENVIRONMENT") != "live":
+        path = os.getenv("HOT_STRATEGIES_PATH", _LOCAL_STRATEGIES_PATH)
+        return lambda: StrategyLoader.scan_directory(path)
+
+    configured_path = os.getenv("STRATEGY_ARTIFACTS_PATH")
+    if configured_path not in {None, _PRODUCTION_STRATEGY_ARTIFACTS_PATH}:
+        raise ValueError(
+            "STRATEGY_ARTIFACTS_PATH must be /app/strategy_artifacts in live"
+        )
+    break_glass_path = None
+    if _env_flag("STRATEGY_BREAK_GLASS_ENABLED", False):
+        break_glass_path = (os.getenv("STRATEGY_BREAK_GLASS_PATH") or "").strip()
+        if not break_glass_path:
+            raise ValueError(
+                "STRATEGY_BREAK_GLASS_PATH must be set when break-glass is enabled"
+            )
+        logger.warning("Strategy break-glass artifact source enabled")
+    return lambda: StrategyLoader.scan_production_sources(
+        _PRODUCTION_STRATEGY_ARTIFACTS_PATH,
+        break_glass_path=break_glass_path,
+    )
 
 
 def _adapter_config_from_env() -> dict:
@@ -162,73 +183,12 @@ def _adapter_config_from_env() -> dict:
             f"INSTRUMENT_PRODUCT_IDS must use {exchange.upper()} venue: "
             f"{', '.join(mismatched_products)}"
         )
-    account_initialization = {
-        "product_ids": product_ids,
-        "position_mode": os.getenv("ACCOUNT_POSITION_MODE", "one_way"),
-    }
-    leverage = os.getenv("ACCOUNT_LEVERAGE")
-    if leverage:
-        account_initialization["leverage"] = leverage
-    margin_mode = os.getenv("ACCOUNT_MARGIN_MODE")
-    if margin_mode:
-        account_initialization["margin_mode"] = margin_mode
-
-    config = {
-        "mode": "live",
-        "exchange": exchange,
-        "enable_ws": _env_flag("EXCHANGE_ENABLE_WS", False),
-        "instrument_product_ids": product_ids,
-        "account_initialization": account_initialization,
-    }
-    if exchange != "rithmic":
-        config.update(
-            {
-                "api_key": _required_env("EXCHANGE_API_KEY"),
-                "secret": _required_env("EXCHANGE_SECRET"),
-                "testnet": _required_env_flag("EXCHANGE_TESTNET"),
-            }
-        )
-        return config
-
-    rithmic_profile = _required_env("RITHMIC_PROFILE")
-    account_id = _required_env("RITHMIC_ACCOUNT_ID")
-    instruments = _env_json_object("RITHMIC_INSTRUMENTS_JSON")
-    if set(instruments) != set(product_ids):
-        raise ValueError(
-            "RITHMIC_INSTRUMENTS_JSON keys must match INSTRUMENT_PRODUCT_IDS"
-        )
-    credentials_path = Path(_required_env("FLUXTRADE_CREDENTIALS_PATH"))
-    if not credentials_path.is_file():
-        raise ValueError("FLUXTRADE_CREDENTIALS_PATH must reference a file")
-    recovery_profile = (
-        os.getenv("RITHMIC_RECOVERY_PROFILE") or rithmic_profile
-    ).strip()
-    config.update(
-        {
-            "rithmic_profile": rithmic_profile,
-            "account_id": account_id,
-            "rithmic_instruments": instruments,
-            "rithmic_recovery_profile": recovery_profile,
-            "rithmic_recovery_account_id": account_id,
-        }
+    return build_live_adapter_config(
+        exchange=exchange,
+        product_ids=product_ids,
+        environ=os.environ,
+        read_enable_ws=lambda: _env_flag("EXCHANGE_ENABLE_WS", False),
     )
-    return config
-
-
-def _validate_runtime_config(adapter_config: dict, *, audit_external_orders: bool) -> None:
-    if adapter_config.get("mode") == "live" and not audit_external_orders:
-        raise ValueError(
-            "live_adapter_requires_audit_external_orders: "
-            "set AUDIT_EXTERNAL_ORDERS=true for live trading"
-        )
-    if adapter_config.get("rithmic_recovery_profile") and not adapter_config.get(
-        "rithmic_recovery_account_id"
-    ):
-        raise ValueError("rithmic_recovery_requires_account_id")
-    if adapter_config.get("rithmic_recovery_account_id") and not adapter_config.get(
-        "rithmic_recovery_profile"
-    ):
-        raise ValueError("rithmic_account_id_requires_recovery_profile")
 
 
 @contextmanager
@@ -251,6 +211,10 @@ def main():
     _validate_runtime_config(
         adapter_config,
         audit_external_orders=audit_external_orders,
+    )
+    strategy_artifact_loader = _strategy_artifact_loader_from_env()
+    runtime_bootstrap_factory, runtime_capabilities_factory = (
+        runtime_factories_for_config(adapter_config)
     )
 
     consumer = DataConsumer(
@@ -276,6 +240,7 @@ def main():
 
     db_session = None
     engine = None
+    adapter = None
     clean_exit = False
     try:
         consumer.acquire_service_ownership()
@@ -285,14 +250,42 @@ def main():
 
         db_session = SessionLocal()
         clock = RealtimeClock()
-        engine = StrategyEngine(
-            db_session=db_session,
-            clock=clock,
-            adapter_config=adapter_config,
-            db_session_factory=_session_scope,
-            audit_external_orders=audit_external_orders,
-            leadership_guard=consumer.assert_service_ownership,
-        )
+        try:
+            adapter = create_adapter(
+                adapter_config,
+                operation_guard=consumer.assert_service_ownership,
+            )
+        except Exception as exc:
+            logger.critical(
+                "Failed to init adapter: %s. NOT falling back silently.",
+                exc,
+            )
+            raise
+        try:
+            engine = StrategyEngine(
+                db_session=db_session,
+                clock=clock,
+                adapter_config=adapter_config,
+                adapter=adapter,
+                db_session_factory=_session_scope,
+                audit_external_orders=audit_external_orders,
+                leadership_guard=consumer.assert_service_ownership,
+                runtime_bootstrap_factory=runtime_bootstrap_factory,
+                runtime_capabilities_factory=runtime_capabilities_factory,
+                strategy_artifact_loader=strategy_artifact_loader,
+            )
+        except Exception:
+            close_adapter = getattr(adapter, "close", None)
+            if callable(close_adapter):
+                try:
+                    close_adapter()
+                except Exception as close_error:
+                    logger.warning(
+                        "Failed to close unowned adapter after Engine construction failure: %s",
+                        type(close_error).__name__,
+                    )
+            adapter = None
+            raise
         engine.startup()
         consumer.configure_callbacks(
             on_message_callback=engine.on_market_data,
@@ -305,6 +298,10 @@ def main():
         try:
             if engine is not None:
                 engine.shutdown(clean_exit=clean_exit)
+            elif adapter is not None:
+                close_adapter = getattr(adapter, "close", None)
+                if callable(close_adapter):
+                    close_adapter()
         finally:
             try:
                 if db_session is not None:

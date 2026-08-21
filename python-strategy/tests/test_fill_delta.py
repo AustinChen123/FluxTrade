@@ -133,6 +133,7 @@ def test_snapshot_fill_delta_applies_cumulative_fee_only_to_first_recorded_fill(
     )
 
     assert delta is not None
+    assert "fee" in delta
     assert delta["fee"] == expected_fee
 
 

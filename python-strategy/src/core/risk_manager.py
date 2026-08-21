@@ -1,8 +1,9 @@
 import logging
 import time
+from collections.abc import Iterator, Mapping
 from datetime import date
 from decimal import Decimal
-from typing import TYPE_CHECKING, Optional, Any, Callable
+from typing import TYPE_CHECKING, Any, Callable, Optional, Protocol, cast
 from src.core.models import Signal, SignalType, Position, PositionSide
 from src.core.redis_factory import create_redis_client
 from src.core.risk_config import RiskConfig
@@ -21,20 +22,46 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
+
+class _SyncRedisPipeline(Protocol):
+    def delete(self, *keys: str | bytes) -> object: ...
+
+    def hset(self, name: str, mapping: Mapping[str, str]) -> object: ...
+
+    def execute(self) -> list[object]: ...
+
+
+class _SyncRedis(Protocol):
+    def ping(self) -> bool: ...
+
+    def close(self) -> None: ...
+
+    def hget(self, name: str, key: str) -> str | None: ...
+
+    def hgetall(self, name: str) -> dict[str, str]: ...
+
+    def hset(self, name: str, mapping: Mapping[str, str]) -> int: ...
+
+    def scan_iter(self, match: str) -> Iterator[str | bytes]: ...
+
+    def pipeline(self, *, transaction: bool) -> _SyncRedisPipeline: ...
+
+
 class AccountService:
     """Interface for accessing account data via Redis."""
 
     def __init__(self):
+        self.redis: _SyncRedis | None = None
         self._authoritative_balance_key: str | None = None
         self._authoritative_venue: str | None = None
         self._authoritative_account_id: str | None = None
         self._authoritative_balance_max_age_seconds: float | None = None
         try:
-            self.redis = create_redis_client()
-            self.redis.ping() # Check connection
+            redis_client = cast(_SyncRedis, create_redis_client())
+            redis_client.ping()  # Check connection
+            self.redis = redis_client
         except Exception as e:
             logger.warning("AccountService: Redis connection failed: %s", e)
-            self.redis = None
 
     def close(self):
         if self.redis:
@@ -73,7 +100,8 @@ class AccountService:
     ) -> None:
         if not self.redis or not self._authoritative_balance_key:
             raise RuntimeError("authoritative_balance_cache_unavailable")
-        if venue.strip().lower() != self._authoritative_venue:
+        normalized_venue = venue.strip().lower()
+        if normalized_venue != self._authoritative_venue:
             raise ValueError("authoritative_balance_venue_mismatch")
         if account_id != self._authoritative_account_id:
             raise ValueError("authoritative_balance_account_mismatch")
@@ -87,7 +115,7 @@ class AccountService:
         self.redis.hset(
             self._authoritative_balance_key,
             mapping={
-                "venue": self._authoritative_venue,
+                "venue": normalized_venue,
                 "account_id": account_id,
                 "currency": currency,
                 "balance": str(balance),
@@ -112,6 +140,17 @@ class AccountService:
         balance = self.redis.hget("state:balance:main", "free")
         return Decimal(balance) if balance else Decimal("0")
 
+    def replace_generic_balance(self, balance: Decimal) -> None:
+        """Replace the generic account balance read by RiskManager."""
+        if not self.redis:
+            raise RuntimeError("generic_balance_cache_unavailable")
+        if type(balance) is not Decimal or not balance.is_finite() or balance < 0:
+            raise ValueError("generic_balance_invalid")
+        self.redis.hset(
+            "state:balance:main",
+            mapping={"free": str(balance)},
+        )
+
     def get_daily_nav_context(self) -> tuple[Decimal, Decimal] | None:
         if getattr(self, "_authoritative_balance_key", None) is None:
             return None
@@ -121,7 +160,8 @@ class AccountService:
     def _get_authoritative_balance_snapshot(self) -> dict[str, Decimal]:
         if not self.redis:
             raise RuntimeError("authoritative_balance_cache_unavailable")
-        data = self.redis.hgetall(self._authoritative_balance_key)
+        balance_key = cast(str, self._authoritative_balance_key)
+        data = self.redis.hgetall(balance_key)
         if not data:
             raise RuntimeError("authoritative_balance_snapshot_missing")
         if data.get("venue") != self._authoritative_venue:
@@ -207,11 +247,12 @@ class AccountService:
         return self.get_position(strategy_id, product_id)
 
     def get_all_positions(self) -> list[Position]:
-        if not getattr(self, "redis", None):
+        redis_client = getattr(self, "redis", None)
+        if redis_client is None:
             return []
 
         positions: list[Position] = []
-        for key in self.redis.scan_iter("state:position:*"):
+        for key in redis_client.scan_iter("state:position:*"):
             key_text = key.decode() if isinstance(key, bytes) else str(key)
             prefix = "state:position:"
             if not key_text.startswith(prefix):
@@ -359,7 +400,10 @@ class RiskManager:
                 None,
             )
             if callable(context_loader):
-                nav_context = context_loader()
+                nav_context = cast(
+                    tuple[Decimal, Decimal] | None,
+                    context_loader(),
+                )
                 if nav_context is not None:
                     daily_start_nav, current_nav = nav_context
                     balance = current_nav

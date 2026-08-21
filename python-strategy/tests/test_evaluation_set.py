@@ -1,3 +1,6 @@
+from collections.abc import MutableMapping
+from typing import cast
+
 import pytest
 
 from src.core.evaluation_set import (
@@ -177,8 +180,9 @@ def test_evaluation_dataset_metadata_is_read_only_snapshot():
     raw_metadata["regime"] = "mutated"
 
     assert dataset.metadata["regime"] == "trend"
+    mutable_metadata = cast(MutableMapping[str, object], dataset.metadata)
     with pytest.raises(TypeError):
-        dataset.metadata["regime"] = "sideways"
+        mutable_metadata["regime"] = "sideways"
 
 
 def test_evaluation_set_raises_key_error_for_unknown_dataset():

@@ -50,6 +50,7 @@ def test_golden_cross_strategy_emits_market_entry_and_exit():
     assert signals[3].quantity == Decimal("0.02")
     assert signals[3].value is None
     assert signals[3].price is None
+    assert signals[3].metadata is not None
     assert signals[3].metadata["sma_short"] == "4.5"
     assert signals[5].quantity == Decimal("0.02")
     assert signals[5].value is None

@@ -1,4 +1,4 @@
-from datetime import datetime
+from datetime import date, datetime
 from decimal import Decimal
 
 from sqlalchemy import (
@@ -8,12 +8,14 @@ from sqlalchemy import (
     Date,
     DateTime,
     ForeignKey,
+    Index,
     Integer,
     Numeric,
     String,
     Text,
     UniqueConstraint,
     func,
+    text,
 )
 from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.orm import Mapped, declarative_base, mapped_column
@@ -27,27 +29,33 @@ def _autoincrement_bigint():
 
 
 class Exchange(Base):
-    __tablename__ = 'exchange'
+    __tablename__ = "exchange"
     id = Column(String, primary_key=True)
     name = Column(String, nullable=False)
 
+
 class Product(Base):
-    __tablename__ = 'product'
+    __tablename__ = "product"
     id = Column(String, primary_key=True)
-    exchange_id = Column(String, ForeignKey('exchange.id'), nullable=False)
+    exchange_id = Column(String, ForeignKey("exchange.id"), nullable=False)
     base_asset = Column(String, nullable=False)
     quote_asset = Column(String, nullable=False)
 
+
 class Candlestick(Base):
-    __tablename__ = 'candlestick'
-    product_id = Column(String, ForeignKey('product.id'), primary_key=True)
-    timeframe = Column(String, primary_key=True)
-    timestamp = Column(BigInteger, primary_key=True)
-    open = Column(Numeric, nullable=False)
-    high = Column(Numeric, nullable=False)
-    low = Column(Numeric, nullable=False)
-    close = Column(Numeric, nullable=False)
-    volume = Column(Numeric, nullable=False)
+    __tablename__ = "candlestick"
+    product_id: Mapped[str] = mapped_column(
+        String,
+        ForeignKey("product.id"),
+        primary_key=True,
+    )
+    timeframe: Mapped[str] = mapped_column(String, primary_key=True)
+    timestamp: Mapped[int] = mapped_column(BigInteger, primary_key=True)
+    open: Mapped[Decimal] = mapped_column(Numeric, nullable=False)
+    high: Mapped[Decimal] = mapped_column(Numeric, nullable=False)
+    low: Mapped[Decimal] = mapped_column(Numeric, nullable=False)
+    close: Mapped[Decimal] = mapped_column(Numeric, nullable=False)
+    volume: Mapped[Decimal] = mapped_column(Numeric, nullable=False)
 
 
 class MarketDataApplication(Base):
@@ -70,12 +78,12 @@ class MarketDataApplication(Base):
 
 
 class ResearchDataset(Base):
-    __tablename__ = 'research_dataset'
+    __tablename__ = "research_dataset"
 
     id: Mapped[str] = mapped_column(String(128), primary_key=True)
     product_id: Mapped[str] = mapped_column(
         String,
-        ForeignKey('product.id'),
+        ForeignKey("product.id"),
         nullable=False,
     )
     timeframe: Mapped[str] = mapped_column(String(32), nullable=False)
@@ -101,33 +109,33 @@ class ResearchDataset(Base):
     )
 
     __table_args__ = (
-        CheckConstraint('row_count > 0', name='chk_research_dataset_nonempty'),
+        CheckConstraint("row_count > 0", name="chk_research_dataset_nonempty"),
         CheckConstraint(
-            'start_time <= end_time',
-            name='chk_research_dataset_time_range',
+            "start_time <= end_time",
+            name="chk_research_dataset_time_range",
         ),
         CheckConstraint(
             "quality_status IN ('validated')",
-            name='chk_research_dataset_quality_status',
+            name="chk_research_dataset_quality_status",
         ),
         CheckConstraint(
             "lifecycle_state IN ('importing', 'sealed')",
-            name='chk_research_dataset_lifecycle_state',
+            name="chk_research_dataset_lifecycle_state",
         ),
         CheckConstraint(
             "(lifecycle_state = 'importing' AND sealed_at IS NULL) OR "
             "(lifecycle_state = 'sealed' AND sealed_at IS NOT NULL)",
-            name='chk_research_dataset_seal_consistency',
+            name="chk_research_dataset_seal_consistency",
         ),
     )
 
 
 class ResearchCandlestick(Base):
-    __tablename__ = 'research_candlestick'
+    __tablename__ = "research_candlestick"
 
     dataset_id: Mapped[str] = mapped_column(
         String(128),
-        ForeignKey('research_dataset.id', ondelete='CASCADE'),
+        ForeignKey("research_dataset.id", ondelete="CASCADE"),
         primary_key=True,
     )
     timestamp: Mapped[int] = mapped_column(BigInteger, primary_key=True)
@@ -140,111 +148,219 @@ class ResearchCandlestick(Base):
 
 
 class Strategy(Base):
-    __tablename__ = 'strategy'
+    __tablename__ = "strategy"
     id = Column(String, primary_key=True)
     name = Column(String, nullable=False)
     configuration_json = Column(Text, nullable=True)
 
+
 class Order(Base):
-    __tablename__ = 'order'
-    id = Column(String, primary_key=True)
-    exchange_order_id = Column(String, nullable=True)
-    strategy_id = Column(String, ForeignKey('strategy.id'), nullable=False)
-    product_id = Column(String, ForeignKey('product.id'), nullable=False)
-    exchange_id = Column(String, ForeignKey('exchange.id'), nullable=False)
-    account_profile = Column(String(128), nullable=True)
-    account_id = Column(String(128), nullable=True)
-    type = Column(String, nullable=False)
-    side = Column(String, nullable=False)
-    price = Column(Numeric, nullable=True)
-    trigger_price = Column(Numeric, nullable=True)
-    quantity = Column(Numeric, nullable=False)
-    status = Column(String, nullable=False)
-    timestamp = Column(BigInteger, nullable=False)
-    filled_quantity = Column(Numeric, nullable=True, default=0)
-    filled_price = Column(Numeric, nullable=True)
+    __tablename__ = "order"
+    id: Mapped[str] = mapped_column(String, primary_key=True)
+    exchange_order_id: Mapped[str | None] = mapped_column(String, nullable=True)
+    strategy_id: Mapped[str] = mapped_column(
+        String,
+        ForeignKey("strategy.id"),
+        nullable=False,
+    )
+    product_id: Mapped[str] = mapped_column(
+        String,
+        ForeignKey("product.id"),
+        nullable=False,
+    )
+    exchange_id: Mapped[str] = mapped_column(
+        String,
+        ForeignKey("exchange.id"),
+        nullable=False,
+    )
+    account_profile: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    account_id: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    type: Mapped[str] = mapped_column(String, nullable=False)
+    side: Mapped[str] = mapped_column(String, nullable=False)
+    price: Mapped[Decimal | None] = mapped_column(Numeric, nullable=True)
+    trigger_price: Mapped[Decimal | None] = mapped_column(Numeric, nullable=True)
+    quantity: Mapped[Decimal] = mapped_column(Numeric, nullable=False)
+    status: Mapped[str] = mapped_column(String, nullable=False)
+    timestamp: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    filled_quantity: Mapped[Decimal | None] = mapped_column(
+        Numeric,
+        nullable=True,
+        default=0,
+    )
+    filled_price: Mapped[Decimal | None] = mapped_column(Numeric, nullable=True)
 
     # Migration 5 — idempotency / lifecycle columns.
-    client_order_id = Column(String(128), nullable=True)
-    intent_payload = Column(JSONB, nullable=True)
-    submitted_at = Column(DateTime(timezone=True), nullable=True)
-    acked_at = Column(DateTime(timezone=True), nullable=True)
-    last_reconciled_at = Column(DateTime(timezone=True), nullable=True)
+    client_order_id: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    intent_payload: Mapped[dict[str, object] | None] = mapped_column(
+        JSONB,
+        nullable=True,
+    )
+    submitted_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True),
+        nullable=True,
+    )
+    acked_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True),
+        nullable=True,
+    )
+    last_reconciled_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True),
+        nullable=True,
+    )
 
     __table_args__ = (
-        UniqueConstraint('exchange_order_id', 'exchange_id', name='uq_order_exchange_id'),
+        Index(
+            "uq_order_identified_client_order_id",
+            "account_profile",
+            "account_id",
+            "client_order_id",
+            unique=True,
+            postgresql_where=text(
+                "account_profile IS NOT NULL AND account_id IS NOT NULL "
+                "AND client_order_id IS NOT NULL"
+            ),
+            sqlite_where=text(
+                "account_profile IS NOT NULL AND account_id IS NOT NULL "
+                "AND client_order_id IS NOT NULL"
+            ),
+        ),
+        Index(
+            "uq_order_legacy_client_order_id",
+            "client_order_id",
+            unique=True,
+            postgresql_where=text(
+                "account_profile IS NULL AND account_id IS NULL "
+                "AND client_order_id IS NOT NULL"
+            ),
+            sqlite_where=text(
+                "account_profile IS NULL AND account_id IS NULL "
+                "AND client_order_id IS NOT NULL"
+            ),
+        ),
+        Index(
+            "uq_order_identified_exchange_order_id",
+            "exchange_id",
+            "account_profile",
+            "account_id",
+            "exchange_order_id",
+            unique=True,
+            postgresql_where=text(
+                "account_profile IS NOT NULL AND account_id IS NOT NULL "
+                "AND exchange_order_id IS NOT NULL"
+            ),
+            sqlite_where=text(
+                "account_profile IS NOT NULL AND account_id IS NOT NULL "
+                "AND exchange_order_id IS NOT NULL"
+            ),
+        ),
+        Index(
+            "uq_order_legacy_exchange_order_id",
+            "exchange_id",
+            "exchange_order_id",
+            unique=True,
+            postgresql_where=text(
+                "account_profile IS NULL AND account_id IS NULL "
+                "AND exchange_order_id IS NOT NULL"
+            ),
+            sqlite_where=text(
+                "account_profile IS NULL AND account_id IS NULL "
+                "AND exchange_order_id IS NOT NULL"
+            ),
+        ),
         CheckConstraint(
             "(account_profile IS NULL AND account_id IS NULL) OR "
             "(account_profile IS NOT NULL AND account_id IS NOT NULL AND "
             "TRIM(account_profile) <> '' AND TRIM(account_id) <> '')",
-            name='chk_order_account_identity_complete',
+            name="chk_order_account_identity_complete",
         ),
     )
 
+
 class Trade(Base):
-    __tablename__ = 'trade'
-    id = Column(String, primary_key=True)
-    order_id = Column(String, ForeignKey('order.id'), nullable=False)
-    exchange_trade_id = Column(String, nullable=True)
-    product_id = Column(String, ForeignKey('product.id'), nullable=False)
-    side = Column(String, nullable=False)
-    price = Column(Numeric, nullable=False)
-    quantity = Column(Numeric, nullable=False)
-    fee = Column(Numeric, nullable=True)
-    fee_asset = Column(String, nullable=True)
-    timestamp = Column(BigInteger, nullable=False)
+    __tablename__ = "trade"
+    id: Mapped[str] = mapped_column(String, primary_key=True)
+    order_id: Mapped[str] = mapped_column(
+        String,
+        ForeignKey("order.id"),
+        nullable=False,
+    )
+    exchange_trade_id: Mapped[str | None] = mapped_column(String, nullable=True)
+    product_id: Mapped[str] = mapped_column(
+        String,
+        ForeignKey("product.id"),
+        nullable=False,
+    )
+    side: Mapped[str] = mapped_column(String, nullable=False)
+    price: Mapped[Decimal] = mapped_column(Numeric, nullable=False)
+    quantity: Mapped[Decimal] = mapped_column(Numeric, nullable=False)
+    fee: Mapped[Decimal | None] = mapped_column(Numeric, nullable=True)
+    fee_asset: Mapped[str | None] = mapped_column(String, nullable=True)
+    timestamp: Mapped[int] = mapped_column(BigInteger, nullable=False)
+
 
 class Position(Base):
+    __tablename__ = "position"
 
-    __tablename__ = 'position'
-
-    strategy_id = Column(String, ForeignKey('strategy.id'), primary_key=True)
-
-    product_id = Column(String, ForeignKey('product.id'), primary_key=True)
-
-    side = Column(String, primary_key=True)
-
-    quantity = Column(Numeric, nullable=False)
-
-    entry_price = Column(Numeric, nullable=False)
-
-    unrealized_pnl = Column(Numeric, nullable=False)
-
-    last_update_timestamp = Column(BigInteger, nullable=False)
-
+    strategy_id: Mapped[str] = mapped_column(
+        String,
+        ForeignKey("strategy.id"),
+        primary_key=True,
+    )
+    product_id: Mapped[str] = mapped_column(
+        String,
+        ForeignKey("product.id"),
+        primary_key=True,
+    )
+    side: Mapped[str] = mapped_column(String, primary_key=True)
+    quantity: Mapped[Decimal] = mapped_column(Numeric, nullable=False)
+    entry_price: Mapped[Decimal] = mapped_column(Numeric, nullable=False)
+    unrealized_pnl: Mapped[Decimal] = mapped_column(Numeric, nullable=False)
+    last_update_timestamp: Mapped[int] = mapped_column(BigInteger, nullable=False)
 
 
 class SignalAudit(Base):
+    __tablename__ = "signal_audit"
 
-    __tablename__ = 'signal_audit'
+    id: Mapped[int] = mapped_column(
+        _autoincrement_bigint(),
+        primary_key=True,
+        autoincrement=True,
+    )
 
-    id = Column(_autoincrement_bigint(), primary_key=True, autoincrement=True)
+    timestamp: Mapped[int] = mapped_column(BigInteger, nullable=False)
 
-    timestamp = Column(BigInteger, nullable=False)
+    strategy_id: Mapped[str] = mapped_column(String, nullable=False)
 
-    strategy_id = Column(String, nullable=False)
+    product_id: Mapped[str] = mapped_column(String, nullable=False)
 
-    product_id = Column(String, nullable=False)
+    signal_type: Mapped[str] = mapped_column(String, nullable=False)
 
-    signal_type = Column(String, nullable=False)
+    risk_status: Mapped[str] = mapped_column(String, nullable=False)  # PASS, REJECT
 
-    risk_status = Column(String, nullable=False) # PASS, REJECT
+    risk_message: Mapped[str | None] = mapped_column(Text, nullable=True)
 
-    risk_message = Column(Text, nullable=True)
-
-    order_id = Column(String, nullable=True)
+    order_id: Mapped[str | None] = mapped_column(String, nullable=True)
 
     # Migration 5 — TEXT upgraded to JSONB.
-    details_json = Column(JSONB, nullable=True)
+    details_json: Mapped[dict[str, object] | None] = mapped_column(
+        JSONB,
+        nullable=True,
+    )
 
     # Migration 5 — Path B audit linkage + multi-signal batch correlation.
-    client_order_id = Column(String(128), nullable=True)
+    client_order_id: Mapped[str | None] = mapped_column(String(128), nullable=True)
 
-    intent_payload = Column(JSONB, nullable=True)
+    intent_payload: Mapped[dict[str, object] | None] = mapped_column(
+        JSONB,
+        nullable=True,
+    )
 
-    outcome_payload = Column(JSONB, nullable=True)
+    outcome_payload: Mapped[dict[str, object] | None] = mapped_column(
+        JSONB,
+        nullable=True,
+    )
 
-    signal_batch_id = Column(String(64), nullable=True)
+    signal_batch_id: Mapped[str | None] = mapped_column(String(64), nullable=True)
 
 
 class SystemEvent(Base):
@@ -256,13 +372,13 @@ class SystemEvent(Base):
     because ``order.id`` itself is a string PK in this codebase.
     """
 
-    __tablename__ = 'system_events'
+    __tablename__ = "system_events"
 
     id = Column(_autoincrement_bigint(), primary_key=True, autoincrement=True)
     event_type = Column(String(64), nullable=False)
     event_subtype = Column(String(64), nullable=True)
-    related_strategy_id = Column(String, ForeignKey('strategy.id'), nullable=True)
-    related_order_id = Column(String, ForeignKey('order.id'), nullable=True)
+    related_strategy_id = Column(String, ForeignKey("strategy.id"), nullable=True)
+    related_order_id = Column(String, ForeignKey("order.id"), nullable=True)
     # No FK — gene_records lands in migration 7.
     related_gene_id = Column(BigInteger, nullable=True)
     payload = Column(JSONB, nullable=False)
@@ -275,35 +391,53 @@ class SystemEvent(Base):
     __table_args__ = (
         CheckConstraint(
             "event_type IN ('reconcile','gene_promote','gene_retire','ops','system_error')",
-            name='chk_system_events_type',
+            name="chk_system_events_type",
         ),
     )
 
 
 class BacktestResultSummary(Base):
-    __tablename__ = 'backtest_result_summary'
-    id = Column(_autoincrement_bigint(), primary_key=True, autoincrement=True)
-    strategy_id = Column(String, ForeignKey('strategy.id'), nullable=False)
-    start_time = Column(BigInteger, nullable=False)
-    end_time = Column(BigInteger, nullable=False)
-    total_pnl = Column(Numeric, nullable=False)
-    metrics_json = Column(Text, nullable=True) # Using Text for JSONB compatibility in generic ORM
+    __tablename__ = "backtest_result_summary"
+    id: Mapped[int] = mapped_column(
+        _autoincrement_bigint(),
+        primary_key=True,
+        autoincrement=True,
+    )
+    strategy_id: Mapped[str] = mapped_column(
+        String,
+        ForeignKey("strategy.id"),
+        nullable=False,
+    )
+    start_time: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    end_time: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    total_pnl: Mapped[Decimal] = mapped_column(Numeric, nullable=False)
+    # Text is used for JSONB compatibility in the generic ORM.
+    metrics_json: Mapped[str | None] = mapped_column(Text, nullable=True)
+
 
 class BacktestTradeLog(Base):
-    __tablename__ = 'backtest_trade_log'
-    id = Column(String, primary_key=True)
-    session_id = Column(BigInteger, ForeignKey('backtest_result_summary.id'), nullable=False)
-    strategy_id = Column(String, nullable=True)
-    order_id = Column(String, nullable=False)
-    exchange_trade_id = Column(String, nullable=True)
-    product_id = Column(String, ForeignKey('product.id'), nullable=False)
-    side = Column(String, nullable=False)
-    price = Column(Numeric, nullable=False)
-    quantity = Column(Numeric, nullable=False)
-    fee = Column(Numeric, nullable=True)
-    fee_asset = Column(String, nullable=True)
-    timestamp = Column(BigInteger, nullable=False)
-    fill_sequence = Column(BigInteger, nullable=True)
+    __tablename__ = "backtest_trade_log"
+    id: Mapped[str] = mapped_column(String, primary_key=True)
+    session_id: Mapped[int] = mapped_column(
+        BigInteger,
+        ForeignKey("backtest_result_summary.id"),
+        nullable=False,
+    )
+    strategy_id: Mapped[str | None] = mapped_column(String, nullable=True)
+    order_id: Mapped[str] = mapped_column(String, nullable=False)
+    exchange_trade_id: Mapped[str | None] = mapped_column(String, nullable=True)
+    product_id: Mapped[str] = mapped_column(
+        String,
+        ForeignKey("product.id"),
+        nullable=False,
+    )
+    side: Mapped[str] = mapped_column(String, nullable=False)
+    price: Mapped[Decimal] = mapped_column(Numeric, nullable=False)
+    quantity: Mapped[Decimal] = mapped_column(Numeric, nullable=False)
+    fee: Mapped[Decimal | None] = mapped_column(Numeric, nullable=True)
+    fee_asset: Mapped[str | None] = mapped_column(String, nullable=True)
+    timestamp: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    fill_sequence: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
 
     __table_args__ = (
         UniqueConstraint(
@@ -317,31 +451,38 @@ class BacktestTradeLog(Base):
         ),
     )
 
+
 class StrategyState(Base):
-    __tablename__ = 'strategy_state'
-    strategy_id = Column(String, primary_key=True)
-    status = Column(String, nullable=False)
-    config_json = Column(Text, nullable=True)
-    performance_json = Column(Text, nullable=True)
-    last_heartbeat = Column(BigInteger, nullable=True)
-    uptime_start = Column(BigInteger, nullable=True)
+    __tablename__ = "strategy_state"
+    strategy_id: Mapped[str] = mapped_column(String, primary_key=True)
+    status: Mapped[str] = mapped_column(String, nullable=False)
+    config_json: Mapped[str | None] = mapped_column(Text, nullable=True)
+    performance_json: Mapped[str | None] = mapped_column(Text, nullable=True)
+    last_heartbeat: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
+    uptime_start: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
 
     # Migration 6 — audit / lifecycle metadata + optimistic-lock version.
-    last_error_message = Column(Text, nullable=True)
-    entered_error_at = Column(DateTime(timezone=True), nullable=True)
-    recovered_at = Column(DateTime(timezone=True), nullable=True)
-    stopped_at = Column(DateTime(timezone=True), nullable=True)
-    version = Column(Integer, nullable=False, server_default='0')
+    last_error_message: Mapped[str | None] = mapped_column(Text, nullable=True)
+    entered_error_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    recovered_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    stopped_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    version: Mapped[int] = mapped_column(Integer, nullable=False, server_default="0")
 
     __table_args__ = (
         CheckConstraint(
             "status <> 'ERROR' OR "
             "(entered_error_at IS NOT NULL AND last_error_message IS NOT NULL)",
-            name='chk_error_state',
+            name="chk_error_state",
         ),
         CheckConstraint(
             "status <> 'STOPPED' OR stopped_at IS NOT NULL",
-            name='chk_stopped_state',
+            name="chk_stopped_state",
         ),
     )
 
@@ -354,10 +495,10 @@ class StrategyStateTransition(Base):
     point-in-time ``strategy_state`` row.
     """
 
-    __tablename__ = 'strategy_state_transitions'
+    __tablename__ = "strategy_state_transitions"
 
     id = Column(_autoincrement_bigint(), primary_key=True, autoincrement=True)
-    strategy_id = Column(String, ForeignKey('strategy.id'), nullable=False)
+    strategy_id = Column(String, ForeignKey("strategy.id"), nullable=False)
     from_status = Column(String(32), nullable=False)
     to_status = Column(String(32), nullable=False)
     transitioned_at = Column(
@@ -377,36 +518,47 @@ class DailyNavSnapshot(Base):
     monetary values per FluxTrade Decimal rules.
     """
 
-    __tablename__ = 'daily_nav_snapshots'
+    __tablename__ = "daily_nav_snapshots"
 
-    id = Column(_autoincrement_bigint(), primary_key=True, autoincrement=True)
-    strategy_id = Column(String, ForeignKey('strategy.id'), nullable=False)
-    snapshot_date = Column(Date, nullable=False)
-    nav = Column(Numeric(28, 8), nullable=False)
-    base_currency = Column(String(16), nullable=False)
-    drawdown = Column(Numeric(10, 8), nullable=True)
-    return_pct = Column(Numeric(10, 8), nullable=True)
-    source = Column(
+    id: Mapped[int] = mapped_column(
+        _autoincrement_bigint(),
+        primary_key=True,
+        autoincrement=True,
+    )
+    strategy_id: Mapped[str] = mapped_column(
+        String,
+        ForeignKey("strategy.id"),
+        nullable=False,
+    )
+    snapshot_date: Mapped[date] = mapped_column(Date, nullable=False)
+    nav: Mapped[Decimal] = mapped_column(Numeric(28, 8), nullable=False)
+    base_currency: Mapped[str] = mapped_column(String(16), nullable=False)
+    drawdown: Mapped[Decimal | None] = mapped_column(Numeric(10, 8), nullable=True)
+    return_pct: Mapped[Decimal | None] = mapped_column(
+        Numeric(10, 8),
+        nullable=True,
+    )
+    source: Mapped[str] = mapped_column(
         String(32),
         nullable=False,
-        server_default='eod_snapshot',
+        server_default="eod_snapshot",
     )
-    recorded_at = Column(
+    recorded_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True),
         nullable=False,
         server_default=func.now(),
     )
-    notes = Column(Text, nullable=True)
+    notes: Mapped[str | None] = mapped_column(Text, nullable=True)
 
     __table_args__ = (
         CheckConstraint(
             "source IN ('eod_snapshot','startup_reconcile','manual')",
-            name='chk_nav_source',
+            name="chk_nav_source",
         ),
         UniqueConstraint(
-            'strategy_id',
-            'snapshot_date',
-            name='uq_daily_nav_strategy_date',
+            "strategy_id",
+            "snapshot_date",
+            name="uq_daily_nav_strategy_date",
         ),
     )
 
@@ -419,38 +571,51 @@ class EvolutionEpoch(Base):
     its evaluation context (pair / window / timeframe).
     """
 
-    __tablename__ = 'evolution_epochs'
+    __tablename__ = "evolution_epochs"
 
-    id = Column(String(64), primary_key=True)
-    strategy_id = Column(String, ForeignKey('strategy.id'), nullable=False)
-    started_at = Column(DateTime(timezone=True), nullable=False)
-    finished_at = Column(DateTime(timezone=True), nullable=True)
-    pop_size = Column(Integer, nullable=False)
-    max_generations = Column(Integer, nullable=False)
-    generations_run = Column(Integer, nullable=True)
+    id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    strategy_id: Mapped[str] = mapped_column(
+        String,
+        ForeignKey("strategy.id"),
+        nullable=False,
+    )
+    started_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        nullable=False,
+    )
+    finished_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True),
+        nullable=True,
+    )
+    pop_size: Mapped[int] = mapped_column(Integer, nullable=False)
+    max_generations: Mapped[int] = mapped_column(Integer, nullable=False)
+    generations_run: Mapped[int | None] = mapped_column(Integer, nullable=True)
     # Numeric (Decimal) — float forbidden for monetary / ratio values.
-    best_score = Column(Numeric(18, 8), nullable=True)
-    seed = Column(BigInteger, nullable=False)
-    config_json = Column(
+    best_score: Mapped[Decimal | None] = mapped_column(
+        Numeric(18, 8),
+        nullable=True,
+    )
+    seed: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    config_json: Mapped[dict[str, object]] = mapped_column(
         JSONB,
         nullable=False,
         server_default="'{}'::jsonb",
     )
-    status = Column(
+    status: Mapped[str] = mapped_column(
         String(32),
         nullable=False,
-        server_default='running',
+        server_default="running",
     )
-    eval_pair = Column(String(32), nullable=False)
-    eval_start_date = Column(Date, nullable=False)
-    eval_end_date = Column(Date, nullable=False)
-    eval_timeframe = Column(String(8), nullable=False)
-    notes = Column(Text, nullable=True)
+    eval_pair: Mapped[str] = mapped_column(String(32), nullable=False)
+    eval_start_date: Mapped[date] = mapped_column(Date, nullable=False)
+    eval_end_date: Mapped[date] = mapped_column(Date, nullable=False)
+    eval_timeframe: Mapped[str] = mapped_column(String(8), nullable=False)
+    notes: Mapped[str | None] = mapped_column(Text, nullable=True)
 
     __table_args__ = (
         CheckConstraint(
             "status IN ('running', 'completed', 'aborted')",
-            name='chk_epoch_status',
+            name="chk_epoch_status",
         ),
     )
 
@@ -463,41 +628,64 @@ class GeneRecord(Base):
     index (defined in the migration via raw DDL).
     """
 
-    __tablename__ = 'gene_records'
+    __tablename__ = "gene_records"
 
-    id = Column(_autoincrement_bigint(), primary_key=True, autoincrement=True)
-    strategy_id = Column(String, ForeignKey('strategy.id'), nullable=False)
-    role = Column(String(16), nullable=False)
-    param_pack = Column(JSONB, nullable=False)
-    score_total = Column(Numeric(18, 8), nullable=False)
-    score_breakdown = Column(JSONB, nullable=False)
-    # Positive loss magnitude normalized at the parameter-search boundary.
-    max_drawdown = Column(Numeric(18, 8), nullable=False)
-    generation_index = Column(Integer, nullable=False)
-    candidate_id = Column(String(64), nullable=False)
-    epoch_id = Column(
-        String(64),
-        ForeignKey('evolution_epochs.id'),
+    id: Mapped[int] = mapped_column(
+        _autoincrement_bigint(),
+        primary_key=True,
+        autoincrement=True,
+    )
+    strategy_id: Mapped[str] = mapped_column(
+        String,
+        ForeignKey("strategy.id"),
         nullable=False,
     )
-    created_at = Column(
+    role: Mapped[str] = mapped_column(String(16), nullable=False)
+    param_pack: Mapped[dict[str, object]] = mapped_column(JSONB, nullable=False)
+    score_total: Mapped[Decimal] = mapped_column(
+        Numeric(18, 8),
+        nullable=False,
+    )
+    score_breakdown: Mapped[dict[str, object]] = mapped_column(
+        JSONB,
+        nullable=False,
+    )
+    # Positive loss magnitude normalized at the parameter-search boundary.
+    max_drawdown: Mapped[Decimal] = mapped_column(
+        Numeric(18, 8),
+        nullable=False,
+    )
+    generation_index: Mapped[int] = mapped_column(Integer, nullable=False)
+    candidate_id: Mapped[str] = mapped_column(String(64), nullable=False)
+    epoch_id: Mapped[str] = mapped_column(
+        String(64),
+        ForeignKey("evolution_epochs.id"),
+        nullable=False,
+    )
+    created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True),
         nullable=False,
         server_default=func.now(),
     )
-    activated_at = Column(DateTime(timezone=True), nullable=True)
-    retired_at = Column(DateTime(timezone=True), nullable=True)
-    notes = Column(Text, nullable=True)
+    activated_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True),
+        nullable=True,
+    )
+    retired_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True),
+        nullable=True,
+    )
+    notes: Mapped[str | None] = mapped_column(Text, nullable=True)
 
     __table_args__ = (
         CheckConstraint(
             "role IN ('challenger', 'champion', 'retired')",
-            name='chk_gene_role',
+            name="chk_gene_role",
         ),
         UniqueConstraint(
-            'epoch_id',
-            'generation_index',
-            'candidate_id',
-            name='uq_gene_epoch_generation_candidate',
+            "epoch_id",
+            "generation_index",
+            "candidate_id",
+            name="uq_gene_epoch_generation_candidate",
         ),
     )

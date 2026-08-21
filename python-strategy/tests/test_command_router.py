@@ -7,6 +7,7 @@ from unittest.mock import MagicMock
 from src.core.command_router import CommandResult, CommandRouter
 from src.core.health_monitor import HealthMonitor
 from src.core.models import Candlestick, Signal, SignalType
+from src.core.strategy_context import StrategyContext
 from src.core.strategy_registry import StrategyRegistry
 from src.strategies.base import BaseStrategy, StrategyRequirements
 
@@ -25,7 +26,11 @@ class DummyStrategy(BaseStrategy):
     def requirements(self) -> StrategyRequirements:
         return StrategyRequirements(self.product_id, self._timeframe, 10)
 
-    def on_candle(self, candle: Candlestick) -> Signal:
+    def on_candle(
+        self,
+        candle: Candlestick,
+        context: StrategyContext | None = None,
+    ) -> Signal:
         return Signal(
             strategy_id=self.strategy_id,
             product_id=self.product_id,

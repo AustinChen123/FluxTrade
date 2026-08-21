@@ -1,4 +1,5 @@
 from decimal import Decimal
+from types import SimpleNamespace
 
 import pytest
 
@@ -36,6 +37,15 @@ class _ScriptedFastStrategy:
     def on_bar(self, bar):
         del bar
         return next(self._intents, None)
+
+
+class _FastCapableCallableStrategy(CallableStrategy):
+    def __init__(self, prepared: object) -> None:
+        super().__init__("callable", lambda candle: None, PRODUCT_ID, TIMEFRAME)
+        self._prepared = prepared
+
+    def prepare_fast(self) -> object:
+        return self._prepared
 
 
 def _fast_runner(*intents: SignalIntent | None) -> FastBarReplayRunner:
@@ -125,6 +135,30 @@ def test_prepare_fast_strategy_reports_unsupported_strategy():
 
     with pytest.raises(TypeError, match="does not support fast-bar"):
         prepare_fast_strategy(strategy)
+
+
+@pytest.mark.parametrize(
+    "prepared",
+    [
+        SimpleNamespace(on_bar=lambda bar: None),
+        SimpleNamespace(strategy_id=1, on_bar=lambda bar: None),
+        SimpleNamespace(strategy_id="prepared"),
+        SimpleNamespace(strategy_id="prepared", on_bar=None),
+    ],
+)
+def test_prepare_fast_strategy_rejects_malformed_result(prepared):
+    strategy = _FastCapableCallableStrategy(prepared)
+
+    with pytest.raises(
+        TypeError, match=r"prepare_fast\(\) must return PreparedStrategy"
+    ):
+        prepare_fast_strategy(strategy)
+
+
+def test_prepare_fast_strategy_accepts_valid_structural_result_by_identity():
+    prepared = SimpleNamespace(strategy_id="prepared", on_bar=lambda bar: None)
+
+    assert prepare_fast_strategy(_FastCapableCallableStrategy(prepared)) is prepared
 
 
 @pytest.mark.parametrize(
@@ -566,6 +600,7 @@ def test_fast_bar_uses_instrument_multiplier():
         multiplier=Decimal("2"),
     )
     tape = MarketTape.from_candles(candles, product_id=PRODUCT_ID, timeframe=TIMEFRAME)
+
     def strategy():
         return GoldenCrossStrategy(
             "fast_bar_multiplier",

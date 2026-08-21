@@ -311,7 +311,11 @@ class RejectedEntryThenExitStrategy(BaseStrategy):
     def requirements(self) -> StrategyRequirements:
         return StrategyRequirements(PRODUCT_ID, "15m", 1)
 
-    def on_candle(self, candle: Candlestick) -> Signal | None:
+    def on_candle(
+        self,
+        candle: Candlestick,
+        context: StrategyContext | None = None,
+    ) -> Signal | None:
         self._index += 1
         if self._index == 1:
             signal_type = SignalType.LONG

@@ -2,17 +2,20 @@
 
 from __future__ import annotations
 
+from collections.abc import Iterator
 from contextlib import nullcontext
 from datetime import UTC, datetime
 from decimal import Decimal
+from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 import pytest
 from sqlalchemy import create_engine, select, text
-from sqlalchemy.orm import sessionmaker
+from sqlalchemy.orm import Session, sessionmaker
 
 from src.core.models import (
     Candlestick,
+    OrderSide,
     Position,
     PositionSide,
     Signal,
@@ -31,6 +34,7 @@ from src.core.orm_models import (
     StrategyStateTransition,
 )
 from src.core.runtime_environment import RuntimeEnvironment
+from src.core.strategy_context import StrategyContext
 from src.strategies.base import BaseStrategy, StrategyRequirements
 from src.strategies.golden_cross import GoldenCrossStrategy
 
@@ -56,7 +60,11 @@ class EmittingStrategy(BaseStrategy):
     def replay_configuration(self) -> object:
         return ()
 
-    def on_candle(self, candle: Candlestick) -> Signal:
+    def on_candle(
+        self,
+        candle: Candlestick,
+        context: StrategyContext | None = None,
+    ) -> Signal:
         self.candles_received.append(candle)
         return Signal(
             strategy_id=self.strategy_id,
@@ -78,7 +86,10 @@ class RestartAccountService:
     def get_position(self, strategy_id: str, product_id: str):
         if self.position is None:
             return None
-        if self.position.strategy_id != strategy_id or self.position.product_id != product_id:
+        if (
+            self.position.strategy_id != strategy_id
+            or self.position.product_id != product_id
+        ):
             return None
         return self.position
 
@@ -115,7 +126,10 @@ def make_orm_candles(count: int = 10) -> list[ORMCandlestick]:
     ]
 
 
-def _sqlite_lifecycle_session_factory(tmp_path):
+@pytest.fixture
+def sqlite_lifecycle_session_factory(
+    tmp_path: Path,
+) -> Iterator[sessionmaker[Session]]:
     engine = create_engine(f"sqlite:///{tmp_path / 'engine_lifecycle.db'}")
     for table in [
         ORMCandlestick.__table__,
@@ -160,10 +174,16 @@ def _sqlite_lifecycle_session_factory(tmp_path):
                 """
             )
         )
-    return sessionmaker(bind=engine)
+    try:
+        yield sessionmaker(bind=engine)
+    finally:
+        engine.dispose()
 
 
-def _sqlite_market_session_factory(tmp_path):
+@pytest.fixture
+def sqlite_market_session_factory(
+    tmp_path: Path,
+) -> Iterator[sessionmaker[Session]]:
     engine = create_engine(f"sqlite:///{tmp_path / 'market_recovery.db'}")
     for table in [
         Exchange.__table__,
@@ -172,10 +192,15 @@ def _sqlite_market_session_factory(tmp_path):
         MarketDataApplication.__table__,
     ]:
         table.create(engine, checkfirst=True)
-    return sessionmaker(bind=engine)
+    try:
+        yield sessionmaker(bind=engine)
+    finally:
+        engine.dispose()
 
 
-def test_full_lifecycle_routes_signal_through_wired_components(engine_factory, mock_db_session):
+def test_full_lifecycle_routes_signal_through_wired_components(
+    engine_factory, mock_db_session
+):
     engine = engine_factory()
     strategy = EmittingStrategy("s1")
     candle = make_candle()
@@ -287,9 +312,9 @@ def test_live_static_registration_rejects_replay_factory_returning_self(
 
 def test_pending_replay_rebuilds_strategy_before_ambiguous_candle(
     engine_factory,
-    tmp_path,
+    sqlite_market_session_factory,
 ):
-    session_factory = _sqlite_market_session_factory(tmp_path)
+    session_factory = sqlite_market_session_factory
     rows = make_orm_candles(11)
     row_timestamps = [row.timestamp for row in rows]
     pending = Candlestick(
@@ -338,7 +363,7 @@ def test_pending_trade_replay_fails_without_durable_state_boundary(engine_factor
         product_id="BINANCE:BTCUSDT-PERP",
         price=Decimal("42000"),
         quantity=Decimal("1"),
-        side="buy",
+        side=OrderSide.BUY,
         timestamp=1704067200000,
     )
 
@@ -349,9 +374,29 @@ def test_pending_trade_replay_fails_without_durable_state_boundary(engine_factor
         engine.replay_pending_market_data(trade)
 
 
+def test_pending_candle_replay_holds_engine_market_lock(engine_factory):
+    engine = engine_factory()
+    candle = make_candle()
+    market_lock = MagicMock()
+    engine._market_processing_lock = market_lock
+    engine._pending_market_replay = MagicMock()
+
+    def replay(data, *, apply_new):
+        assert market_lock.__enter__.call_count == 1
+        assert data is candle
+        assert apply_new == engine._apply_unpersisted_candle
+
+    engine._pending_market_replay.replay.side_effect = replay
+
+    engine.replay_pending_market_data(candle)
+
+    market_lock.__exit__.assert_called_once_with(None, None, None)
+    engine._pending_market_replay.replay.assert_called_once()
+
+
 def test_pending_replay_uses_strategy_recovery_factory(
     engine_factory,
-    tmp_path,
+    sqlite_market_session_factory,
 ):
     class ConfiguredStrategy(EmittingStrategy):
         def __init__(self, strategy_id: str, product_id: str, token: str):
@@ -364,12 +409,10 @@ def test_pending_replay_uses_strategy_recovery_factory(
         def replay_configuration(self):
             return (self.token,)
 
-    session_factory = _sqlite_market_session_factory(tmp_path)
+    session_factory = sqlite_market_session_factory
     rows = make_orm_candles(10)
     pending = make_candle()
-    pending = pending.model_copy(
-        update={"timestamp": rows[-1].timestamp + 60_000}
-    )
+    pending = pending.model_copy(update={"timestamp": rows[-1].timestamp + 60_000})
     with session_factory() as session:
         session.add(Exchange(id="BINANCE", name="Binance"))
         session.add(
@@ -398,10 +441,10 @@ def test_pending_replay_uses_strategy_recovery_factory(
 
 def test_pending_replay_preserves_nondefault_golden_cross_configuration(
     engine_factory,
-    tmp_path,
+    sqlite_market_session_factory,
     monkeypatch,
 ):
-    session_factory = _sqlite_market_session_factory(tmp_path)
+    session_factory = sqlite_market_session_factory
     rows = make_orm_candles(4)
     pending = Candlestick(
         product_id=rows[-1].product_id,
@@ -480,7 +523,7 @@ def test_live_candle_fence_holds_postgres_advisory_lock_around_application(
     db.execute.side_effect = execute
     engine._db_session_factory = lambda: nullcontext(db)
 
-    with engine._live_candle_application_fence(make_candle()):
+    with engine._live_candle_application.application_fence(make_candle()):
         events.append("application")
 
     assert events == ["lock", "application", "unlock"]
@@ -499,7 +542,7 @@ def test_live_candle_fence_rejects_non_postgres_production_database(
         RuntimeError,
         match="requires PostgreSQL advisory locks",
     ):
-        with engine._live_candle_application_fence(make_candle()):
+        with engine._live_candle_application.application_fence(make_candle()):
             pytest.fail("application must remain fenced")
 
 
@@ -516,22 +559,22 @@ def test_live_candle_fence_times_out_without_entering_application(
     engine._db_session_factory = lambda: nullcontext(db)
 
     with patch(
-        "src.core.engine.LIVE_CANDLE_FENCE_TIMEOUT_SECONDS",
+        "src.core.live_candle_application.LIVE_CANDLE_FENCE_TIMEOUT_SECONDS",
         0,
     ):
         with pytest.raises(
             RuntimeError,
             match="timed out acquiring live candle application fence",
         ):
-            with engine._live_candle_application_fence(make_candle()):
+            with engine._live_candle_application.application_fence(make_candle()):
                 pytest.fail("application must not run without the fence")
 
 
 def test_live_candle_is_persisted_only_after_successful_application(
     engine_factory,
-    tmp_path,
+    sqlite_market_session_factory,
 ):
-    session_factory = _sqlite_market_session_factory(tmp_path)
+    session_factory = sqlite_market_session_factory
     engine = engine_factory(db_session_factory=session_factory)
     engine.runtime_environment = RuntimeEnvironment("live")
     engine.execution_engine.process_market_data = MagicMock()
@@ -545,7 +588,8 @@ def test_live_candle_is_persisted_only_after_successful_application(
             (candle.product_id, candle.timeframe, candle.timestamp),
         )
         assert persisted is not None
-        assert Decimal(persisted.close) == candle.close
+        assert type(persisted.close) is Decimal
+        assert persisted.close == candle.close
         application = session.get(
             MarketDataApplication,
             (
@@ -566,26 +610,32 @@ def test_live_candle_is_persisted_only_after_successful_application(
         engine.on_market_data(failed)
 
     with session_factory() as session:
-        assert session.get(
-            ORMCandlestick,
-            (failed.product_id, failed.timeframe, failed.timestamp),
-        ) is None
-        assert session.get(
-            MarketDataApplication,
-            (
-                "live",
-                failed.product_id,
-                failed.timeframe,
-                failed.timestamp,
-            ),
-        ) is None
+        assert (
+            session.get(
+                ORMCandlestick,
+                (failed.product_id, failed.timeframe, failed.timestamp),
+            )
+            is None
+        )
+        assert (
+            session.get(
+                MarketDataApplication,
+                (
+                    "live",
+                    failed.product_id,
+                    failed.timeframe,
+                    failed.timestamp,
+                ),
+            )
+            is None
+        )
 
 
 def test_durable_receipt_rebuilds_state_without_duplicate_side_effects(
     engine_factory,
-    tmp_path,
+    sqlite_market_session_factory,
 ):
-    session_factory = _sqlite_market_session_factory(tmp_path)
+    session_factory = sqlite_market_session_factory
     rows = make_orm_candles(11)
     pending = Candlestick(
         product_id=rows[-1].product_id,
@@ -643,9 +693,9 @@ def test_durable_receipt_rebuilds_state_without_duplicate_side_effects(
 
 def test_unreceipted_older_candle_fails_closed_before_replay_or_callback(
     engine_factory,
-    tmp_path,
+    sqlite_market_session_factory,
 ):
-    session_factory = _sqlite_market_session_factory(tmp_path)
+    session_factory = sqlite_market_session_factory
     rows = make_orm_candles(11)
     latest = Candlestick(
         product_id=rows[-1].product_id,
@@ -709,9 +759,9 @@ def test_unreceipted_older_candle_fails_closed_before_replay_or_callback(
 
 def test_conflicting_history_blocks_live_callback_before_side_effect(
     engine_factory,
-    tmp_path,
+    sqlite_market_session_factory,
 ):
-    session_factory = _sqlite_market_session_factory(tmp_path)
+    session_factory = sqlite_market_session_factory
     candle = make_candle()
     with session_factory() as session:
         session.add(Exchange(id="BINANCE", name="Binance"))
@@ -753,10 +803,10 @@ def test_conflicting_history_blocks_live_callback_before_side_effect(
 
 
 def test_commands_update_lifecycle_state_with_real_state_manager(
-    tmp_path,
     engine_factory,
+    sqlite_lifecycle_session_factory,
 ):
-    session_factory = _sqlite_lifecycle_session_factory(tmp_path)
+    session_factory = sqlite_lifecycle_session_factory
     with session_factory() as session:
         session.add(Strategy(id="s1", name="Strategy 1"))
         session.add_all(make_orm_candles())
@@ -776,28 +826,34 @@ def test_commands_update_lifecycle_state_with_real_state_manager(
     engine._handle_command({"command": "START", "params": {"id": "s1"}})
     assert "s1" in engine.strategy_instances
 
-    engine._handle_command({
-        "command": "STOP",
-        "params": {"id": "s1", "reason": "pause"},
-    })
+    engine._handle_command(
+        {
+            "command": "STOP",
+            "params": {"id": "s1", "reason": "pause"},
+        }
+    )
     assert "s1" not in engine.strategy_instances
 
     with session_factory() as session:
         state = session.get(StrategyState, "s1")
+        assert state is not None
         state.status = StrategyStatus.ERROR.value
         state.last_error_message = "manual test error"
         state.entered_error_at = datetime.now(UTC)
         session.commit()
 
-    engine._handle_command({
-        "command": "FORCE_RECOVER",
-        "params": {"strategy_id": "s1", "reason": "operator reset"},
-    })
+    engine._handle_command(
+        {
+            "command": "FORCE_RECOVER",
+            "params": {"strategy_id": "s1", "reason": "operator reset"},
+        }
+    )
     assert "s1" in engine.strategy_instances
     engine.shutdown(timeout=0.1)
 
     with session_factory() as session:
         state = session.get(StrategyState, "s1")
+        assert state is not None
         transitions = list(
             session.scalars(
                 select(StrategyStateTransition).order_by(StrategyStateTransition.id)
@@ -808,11 +864,15 @@ def test_commands_update_lifecycle_state_with_real_state_manager(
     assert state.version == 3
     assert state.recovered_at is not None
     assert [
-        (row.from_status, row.to_status, row.reason, row.actor)
-        for row in transitions
+        (row.from_status, row.to_status, row.reason, row.actor) for row in transitions
     ] == [
         (StrategyStatus.READY.value, StrategyStatus.ACTIVE.value, None, "operator"),
-        (StrategyStatus.ACTIVE.value, StrategyStatus.STOPPED.value, "pause", "operator"),
+        (
+            StrategyStatus.ACTIVE.value,
+            StrategyStatus.STOPPED.value,
+            "pause",
+            "operator",
+        ),
         (
             StrategyStatus.ERROR.value,
             StrategyStatus.ACTIVE.value,
@@ -823,10 +883,10 @@ def test_commands_update_lifecycle_state_with_real_state_manager(
 
 
 def test_restart_restore_warms_and_blocks_duplicate_entry_with_real_session(
-    tmp_path,
     engine_factory,
+    sqlite_lifecycle_session_factory,
 ):
-    session_factory = _sqlite_lifecycle_session_factory(tmp_path)
+    session_factory = sqlite_lifecycle_session_factory
     with session_factory() as session:
         session.add(Strategy(id="s1", name="Strategy 1"))
         session.add_all(make_orm_candles())
@@ -865,4 +925,5 @@ def test_restart_restore_warms_and_blocks_duplicate_entry_with_real_session(
         audits = list(session.scalars(select(SignalAudit)))
     assert len(audits) == 1
     assert audits[0].risk_status == "REJECT"
+    assert audits[0].risk_message is not None
     assert "existing_position_entry_duplicate" in audits[0].risk_message

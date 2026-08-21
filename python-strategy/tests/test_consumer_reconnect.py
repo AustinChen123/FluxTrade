@@ -3,7 +3,7 @@
 from unittest.mock import MagicMock, patch
 
 import pytest
-import redis
+from redis.exceptions import ConnectionError as RedisConnectionError
 
 from src.core.consumer import (
     DataConsumer,
@@ -56,7 +56,9 @@ class TestStopMethod:
         try:
             consumer.stop()
         except AttributeError:
-            pytest.fail("stop() raised AttributeError — still nested inside _parse_message")
+            pytest.fail(
+                "stop() raised AttributeError — still nested inside _parse_message"
+            )
 
 
 class TestReconnectionBackoff:
@@ -74,7 +76,7 @@ class TestReconnectionBackoff:
             nonlocal call_count
             call_count += 1
             if call_count <= 3:
-                raise redis.exceptions.ConnectionError("connection refused")
+                raise RedisConnectionError("connection refused")
             # Stop after 3 failures
             consumer.running = False
 
@@ -101,16 +103,14 @@ class TestReconnectionBackoff:
             backoffs.append(seconds)
 
         consumer._ensure_consumer_groups = MagicMock()
-        consumer._consume_loop = MagicMock(
-            side_effect=redis.exceptions.ConnectionError("refused")
-        )
+        consumer._consume_loop = MagicMock(side_effect=RedisConnectionError("refused"))
 
         with patch.object(
             consumer._stop_requested,
             "wait",
             side_effect=track_sleep,
         ):
-            with pytest.raises(redis.exceptions.ConnectionError):
+            with pytest.raises(RedisConnectionError):
                 consumer.start()
 
         # All backoffs should be <= MAX_BACKOFF
@@ -120,16 +120,14 @@ class TestReconnectionBackoff:
     def test_max_attempts_raises(self, consumer):
         """After MAX_RETRIES, start() should re-raise the exception."""
         consumer._ensure_consumer_groups = MagicMock()
-        consumer._consume_loop = MagicMock(
-            side_effect=redis.exceptions.ConnectionError("refused")
-        )
+        consumer._consume_loop = MagicMock(side_effect=RedisConnectionError("refused"))
 
         with patch.object(
             consumer._stop_requested,
             "wait",
             return_value=False,
         ):
-            with pytest.raises(redis.exceptions.ConnectionError):
+            with pytest.raises(RedisConnectionError):
                 consumer.start()
 
     def test_successful_connection_resets_backoff(self, consumer):
@@ -144,7 +142,7 @@ class TestReconnectionBackoff:
             nonlocal call_count
             call_count += 1
             if call_count == 1:
-                raise redis.exceptions.ConnectionError("refused")
+                raise RedisConnectionError("refused")
             # Second call: succeed then stop
             consumer.running = False
 
@@ -174,6 +172,7 @@ class TestReconnectionBackoff:
 
     def test_consume_loop_clean_exit(self, consumer):
         """When _consume_loop returns normally (running=False), start() should exit."""
+
         def stop_loop():
             consumer.running = False
 

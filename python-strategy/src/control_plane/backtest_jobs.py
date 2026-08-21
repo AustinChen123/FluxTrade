@@ -184,7 +184,7 @@ class BacktestJobExecutor:
             end_time=request.end_time,
             product_id=request.product_id,
             timeframe=request.timeframe,
-            initial_balance=float(request.initial_balance),
+            initial_balance=request.initial_balance,
             max_drawdown_limit=max_drawdown_limit,
             data_source=data_source,
             fee_config={

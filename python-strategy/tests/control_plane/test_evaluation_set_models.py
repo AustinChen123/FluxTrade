@@ -90,9 +90,7 @@ class _WarmupAwareEvaluator(_NoopEvaluator):
         *,
         warmup_start_time,
     ):
-        self.warmups.append(
-            (warmup_start_time, request.start_time, request.end_time)
-        )
+        self.warmups.append((warmup_start_time, request.start_time, request.end_time))
         return self.evaluate(request, candidate)
 
 
@@ -124,9 +122,7 @@ class _WalkForwardFitnessEvaluator:
                 "monthly_returns": {f"{year}-01": score},
                 "total_trades": 100,
                 "trade_pnl_quality": sharpe,
-                "yearly_mark_to_market_returns": {
-                    year: score / Decimal("10000")
-                },
+                "yearly_mark_to_market_returns": {year: score / Decimal("10000")},
             },
         )
 
@@ -193,7 +189,15 @@ class _WarmupRecordingStrategy(BaseStrategy):
         return self._in_position, self.active_trade
 
     def restore_walk_forward_trade_state(self, state):
-        self._in_position, self.active_trade = state
+        if not isinstance(state, tuple) or len(state) != 2:
+            raise TypeError("warm-up trade state must be a two-item tuple")
+        in_position, active_trade = state
+        if not isinstance(in_position, bool) or not (
+            active_trade is None or isinstance(active_trade, dict)
+        ):
+            raise TypeError("warm-up trade state has invalid values")
+        self._in_position = in_position
+        self.active_trade = active_trade
 
 
 class BaseStrategyWithoutWarmupContract(BaseStrategy):
@@ -224,11 +228,15 @@ def _base_search_request() -> dict:
     }
 
 
-def _sqlite_gene_registry_session_factory(tmp_path):
+def _sqlite_gene_registry_session_factory(
+    tmp_path,
+    fixture_request: pytest.FixtureRequest,
+):
     engine = create_engine(
         f"sqlite:///{tmp_path / 'evaluation_set_gene_registry.db'}",
         connect_args={"check_same_thread": False, "timeout": 30},
     )
+    fixture_request.addfinalizer(engine.dispose)
     for table in [
         Strategy.__table__,
         SystemEvent.__table__,
@@ -356,9 +364,10 @@ def test_evaluation_set_config_generates_walk_forward_folds():
     ]
     round_trip = EvaluationSetConfig.model_validate(config.model_dump(mode="json"))
     assert round_trip.datasets == []
-    assert [
-        dataset.dataset_id for dataset in round_trip.resolved_datasets
-    ] == ["fold_0000", "fold_0001"]
+    assert [dataset.dataset_id for dataset in round_trip.resolved_datasets] == [
+        "fold_0000",
+        "fold_0001",
+    ]
 
 
 def test_evaluation_set_config_requires_one_dataset_source():
@@ -419,7 +428,9 @@ def test_evaluation_set_rejects_duplicate_dataset_ids():
 
 
 def test_evaluation_dataset_rejects_invalid_warmup_range():
-    with pytest.raises(ValidationError, match="warmup_start_time must be <= start_time"):
+    with pytest.raises(
+        ValidationError, match="warmup_start_time must be <= start_time"
+    ):
         EvaluationSetConfig.model_validate(
             {
                 "datasets": [
@@ -537,9 +548,7 @@ def test_research_warmup_excludes_scoring_boundary_and_restores_trade_state(tmp_
 def test_research_warmup_rejects_strategy_without_complete_state_contract(tmp_path):
     csv_path = tmp_path / "warmup.csv"
     csv_path.write_text(
-        "timestamp,open,high,low,close,volume\n"
-        "5,1,1,1,1,1\n"
-        "9,1,1,1,1,1\n"
+        "timestamp,open,high,low,close,volume\n5,1,1,1,1,1\n9,1,1,1,1,1\n"
     )
     payload = _base_search_request()
     payload["start_time"] = 10_000
@@ -733,14 +742,11 @@ def test_walk_forward_fitness_prefers_stable_candidate():
     assert job.status.value == "SUCCEEDED"
     assert job.result is not None
     assert job.result["best_candidate"]["candidate_id"] == "stable"
-    evaluations = {
-        item["candidate_id"]: item for item in job.result["evaluations"]
-    }
+    evaluations = {item["candidate_id"]: item for item in job.result["evaluations"]}
     stable_fitness = evaluations["stable"]["metrics"]["fitness"]
     assert stable_fitness["expression"].startswith("deflated_sharpe")
     assert (
-        evaluations["stable"]["metrics"]["fitness_inputs"]
-        == stable_fitness["inputs"]
+        evaluations["stable"]["metrics"]["fitness_inputs"] == stable_fitness["inputs"]
     )
     assert stable_fitness["inputs"]["deflated_sharpe"] != "0"
     assert stable_fitness["inputs"]["return_worst"] == "0.004"
@@ -788,6 +794,7 @@ def test_year_concentration_uses_returns_across_different_fold_balances():
     ).submit_search(ParameterSearchJobRequest.model_validate(payload))
 
     assert job.status.value == "SUCCEEDED"
+    assert job.result is not None
     assert (
         job.result["evaluations"][0]["metrics"]["fitness"]["inputs"][
             "year_concentration"
@@ -880,9 +887,11 @@ def test_dated_future_dataset_merges_shared_and_override_rules():
 
     request = ParameterSearchJobRequest.model_validate(payload)
 
-    assert request.evaluation_set.datasets[0].backtest.instrument.price_tick == Decimal(
-        "0.25"
-    )
+    assert request.evaluation_set is not None
+    dataset_backtest = request.evaluation_set.datasets[0].backtest
+    assert dataset_backtest is not None
+    assert dataset_backtest.instrument is not None
+    assert dataset_backtest.instrument.price_tick == Decimal("0.25")
 
 
 def test_parameter_search_merges_dataset_backtest_overrides_with_shared_settings():
@@ -1192,7 +1201,9 @@ def test_parameter_search_aggregates_candidate_across_evaluation_set():
             resolved_backtest=resolved_backtest,
         ),
     ]
-    assert job.result["evaluations"][0]["metrics"]["evaluation_mode"] == "evaluation_set"
+    assert (
+        job.result["evaluations"][0]["metrics"]["evaluation_mode"] == "evaluation_set"
+    )
     assert job.result["evaluations"][0]["metrics"]["dataset_scores"] == {
         "trend": "2",
         "chop": "3",
@@ -1203,8 +1214,11 @@ def test_parameter_search_aggregates_candidate_across_evaluation_set():
     }
 
 
-def test_parameter_search_persists_evaluation_set_traceability(tmp_path):
-    session_factory = _sqlite_gene_registry_session_factory(tmp_path)
+def test_parameter_search_persists_evaluation_set_traceability(
+    tmp_path,
+    request: pytest.FixtureRequest,
+):
+    session_factory = _sqlite_gene_registry_session_factory(tmp_path, request)
     payload = _base_search_request()
     payload["backtest"] = {
         "candles_csv_path": "data/BTCUSDT_5m.csv",
@@ -1238,14 +1252,14 @@ def test_parameter_search_persists_evaluation_set_traceability(tmp_path):
             },
         ],
     }
-    request = ParameterSearchJobRequest.model_validate(payload)
+    search_request = ParameterSearchJobRequest.model_validate(payload)
     executor = ParameterSearchJobExecutor(
         evaluator=_NoopEvaluator(),
         run_inline=True,
         db_session_factory=session_factory,
     )
 
-    job = executor.submit_search(request)
+    job = executor.submit_search(search_request)
 
     assert job.status.value == "SUCCEEDED"
     assert job.result is not None
@@ -1258,6 +1272,7 @@ def test_parameter_search_persists_evaluation_set_traceability(tmp_path):
             .one()
         )
 
+    assert epoch is not None
     trend_resolved_backtest = {
         "candles_csv_path": "data/BTCUSDT_5m.csv",
         "initial_balance": "25000",
@@ -1274,7 +1289,9 @@ def test_parameter_search_persists_evaluation_set_traceability(tmp_path):
         **trend_resolved_backtest,
         **selloff_backtest_override,
     }
-    assert epoch.config_json["evaluation_set"]["datasets"] == [
+    evaluation_set_config = epoch.config_json["evaluation_set"]
+    assert isinstance(evaluation_set_config, dict)
+    assert evaluation_set_config["datasets"] == [
         _dataset_payload(
             "trend",
             start_time=10,
@@ -1301,7 +1318,11 @@ def test_parameter_search_persists_evaluation_set_traceability(tmp_path):
         "trend": "2",
         "selloff": "5",
     }
-    assert gene.score_breakdown["datasets"]["trend"]["max_drawdown"] == "2"
+    dataset_scores = gene.score_breakdown["datasets"]
+    assert isinstance(dataset_scores, dict)
+    trend_scores = dataset_scores["trend"]
+    assert isinstance(trend_scores, dict)
+    assert trend_scores["max_drawdown"] == "2"
 
 
 def test_parameter_search_uses_worst_positive_drawdown_across_evaluation_set():

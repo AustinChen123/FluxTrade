@@ -1,29 +1,85 @@
+import logging
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from decimal import Decimal
-from typing import Any, Dict, List, Optional
+from typing import (
+    TYPE_CHECKING,
+    Any,
+    Callable,
+    ContextManager,
+    Dict,
+    List,
+    Optional,
+    Protocol,
+)
 from src.core.orm_models import Order
 from src.core.models import Candlestick, Position
 
+if TYPE_CHECKING:
+    from src.core.runtime_environment import RuntimeEnvironment
+
+
+class EntryAdmissionGate(Protocol):
+    """Venue-neutral control for admitting new positions."""
+
+    def arm(self) -> None: ...
+
+    def observe(self) -> bool: ...
+
+    def close(self) -> None: ...
+
+
+@dataclass(frozen=True)
+class OwnedOrderReconciliationContext:
+    """Venue-neutral callbacks required by an owned-order reconciler."""
+
+    list_recoverable_client_orders: Callable[[], list[Any]]
+    process_exchange_order_event: Callable[..., dict[str, object]]
+    now_seconds: Callable[[], float]
+    db_session_factory: Callable[[], ContextManager[Any]] | None
+    local_positions_loader: Callable[[], list[object]] | None
+    logger: logging.Logger
+
+
+class OwnedOrderReconciler(Protocol):
+    """Optional adapter-owned reconciliation capability."""
+
+    def reconcile(
+        self,
+        *,
+        snapshot_loader: Callable[..., Any] | None = None,
+    ) -> dict[str, object]: ...
+
+
 class ExchangeError(Exception):
     """Base exception for all exchange related errors."""
+
     pass
+
 
 class InsufficientFundsError(ExchangeError):
     """Raised when the account has insufficient funds for the order."""
+
     pass
+
 
 class NetworkError(ExchangeError):
     """Raised when there is a network connectivity issue with the exchange."""
+
     pass
+
 
 class ExchangeOrderLookupUnsupported(ExchangeError):
     """Raised when an adapter cannot query orders by client order ID."""
+
     pass
+
 
 class ExchangeUserStreamUnsupported(ExchangeError):
     """Raised when an adapter cannot manage exchange user-data streams."""
+
     pass
+
 
 @dataclass(frozen=True)
 class ExchangeOrderSnapshot:
@@ -35,6 +91,7 @@ class ExchangeOrderSnapshot:
     filled_quantity: Optional[Decimal] = None
     average_price: Optional[Decimal] = None
     fee: Optional[Decimal] = None
+    fee_asset: Optional[str] = None
     raw: Optional[dict[str, Any]] = None
 
 
@@ -52,6 +109,7 @@ class ExchangeOrderEvent:
     last_fill_price: Optional[Decimal] = None
     fee: Optional[Decimal] = None
     fee_asset: Optional[str] = None
+    is_snapshot_projection: bool = False
     event_timestamp: Optional[int] = None
     reason: Optional[str] = None
     raw: Optional[dict[str, Any]] = None
@@ -63,17 +121,46 @@ class IExchangeAdapter(ABC):
     Decouples execution logic from specific exchange implementations.
     """
 
+    def supports_runtime_reconciliation(self) -> bool:
+        """Whether the adapter supports generic periodic reconciliation."""
+        return False
+
+    def create_entry_admission_gate(
+        self,
+        environment: "RuntimeEnvironment",
+        *,
+        logger: logging.Logger,
+    ) -> EntryAdmissionGate | None:
+        """Build a venue-owned runtime gate when this adapter requires one."""
+        return None
+
+    def create_owned_order_reconciler(
+        self,
+        context: OwnedOrderReconciliationContext,
+    ) -> OwnedOrderReconciler | None:
+        """Build a venue-owned order reconciler when supported."""
+        return None
+
+    def exit_authoritative_position(
+        self,
+        product_id: str,
+        *,
+        account_id: str,
+    ) -> bool:
+        """Exit a provider-authoritative position when the adapter supports it."""
+        raise ExchangeError("adapter_authoritative_position_exit_unsupported")
+
     @abstractmethod
     def place_order(self, order: Order) -> str:
         """
         Places an order on the exchange.
-        
+
         Args:
             order: The internal Order object (ORM model) containing all details.
-            
+
         Returns:
             str: The exchange's order ID.
-            
+
         Raises:
             ExchangeError: If the order fails.
         """
@@ -93,7 +180,9 @@ class IExchangeAdapter(ABC):
 
     def place_order_group(self, orders: list[Order]) -> str:
         """Submit a previously validated group as one venue-side operation."""
-        raise ExchangeError(f"{type(self).__name__} does not support atomic order groups")
+        raise ExchangeError(
+            f"{type(self).__name__} does not support atomic order groups"
+        )
 
     def restore_order_groups(self, orders: list[Order]) -> None:
         """Restore adapter-side identity indexes from persisted local orders."""
@@ -101,7 +190,9 @@ class IExchangeAdapter(ABC):
 
     def modify_protection(self, order: Order, *, trigger_price: Decimal) -> bool:
         """Modify one already-live protective leg without cancelling it first."""
-        raise ExchangeError(f"{type(self).__name__} does not support protection modification")
+        raise ExchangeError(
+            f"{type(self).__name__} does not support protection modification"
+        )
 
     @abstractmethod
     def cancel_order(
@@ -142,8 +233,12 @@ class IExchangeAdapter(ABC):
         """
         return self.cancel_order(client_order_id, product_id, order_type=order_type)
 
-    def cancel_terminal_state_delivered_by_order_events(self) -> bool:
+    def cancel_terminal_state_delivered_by_order_events(
+        self,
+        order_type: Optional[str] = None,
+    ) -> bool:
         """Whether a successful cancel still awaits an ordered terminal event."""
+        del order_type
         return False
 
     def get_order_by_client_id(
@@ -174,22 +269,28 @@ class IExchangeAdapter(ABC):
     def get_balance(self, asset: str) -> Decimal:
         """
         Retrieves the available balance for a specific asset.
-        
+
         Args:
             asset: The asset symbol (e.g., USDT, BTC).
-            
+
         Returns:
             Decimal: The available balance.
         """
         pass
 
     @abstractmethod
-    def get_position(self, product_id: str) -> Optional[Position]:
+    def get_position(
+        self,
+        product_id: str,
+        strategy_id: str | None = None,
+    ) -> Optional[Position]:
         """
         Retrieves the current open position for a product.
 
         Args:
             product_id: The product/symbol identifier.
+            strategy_id: Optional strategy identity for adapters that maintain
+                strategy-scoped positions. Account-net live adapters ignore it.
 
         Returns:
             Optional[Position]: The position details (Pydantic model) or None if no position.
