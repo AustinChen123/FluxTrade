@@ -6,10 +6,74 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::time::sleep;
 use tracing::{error, info, warn};
 
+const HEARTBEAT_STALE_AFTER_MS: i64 = 5_000;
+const HEARTBEAT_MISSING_LIMIT: u32 = 5;
+
+#[derive(Debug, Default)]
+struct HeartbeatMonitor {
+    armed: bool,
+    missing_count: u32,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum HeartbeatObservation {
+    WaitingForInitial,
+    Healthy { newly_armed: bool },
+    Missing { count: u32 },
+    Invalid { count: u32 },
+    TriggerMissing { count: u32 },
+    TriggerInvalid { count: u32 },
+    TriggerStale { age_ms: i64 },
+}
+
+impl HeartbeatMonitor {
+    fn observe(&mut self, value: Option<&str>, now_ms: i64) -> HeartbeatObservation {
+        let Some(raw_timestamp) = value else {
+            if !self.armed {
+                self.missing_count = 0;
+                return HeartbeatObservation::WaitingForInitial;
+            }
+            self.missing_count = self.missing_count.saturating_add(1);
+            return if self.missing_count > HEARTBEAT_MISSING_LIMIT {
+                HeartbeatObservation::TriggerMissing {
+                    count: self.missing_count,
+                }
+            } else {
+                HeartbeatObservation::Missing {
+                    count: self.missing_count,
+                }
+            };
+        };
+
+        let Ok(timestamp_ms) = raw_timestamp.parse::<i64>() else {
+            self.missing_count = self.missing_count.saturating_add(1);
+            return if self.missing_count > HEARTBEAT_MISSING_LIMIT {
+                HeartbeatObservation::TriggerInvalid {
+                    count: self.missing_count,
+                }
+            } else {
+                HeartbeatObservation::Invalid {
+                    count: self.missing_count,
+                }
+            };
+        };
+
+        self.missing_count = 0;
+        let age_ms = now_ms.saturating_sub(timestamp_ms);
+        if age_ms > HEARTBEAT_STALE_AFTER_MS {
+            return HeartbeatObservation::TriggerStale { age_ms };
+        }
+
+        let newly_armed = !self.armed;
+        self.armed = true;
+        HeartbeatObservation::Healthy { newly_armed }
+    }
+}
+
 pub struct Watchdog {
     redis_client: redis::Client,
     mitigation: EmergencyMitigation,
-    missing_count: u32,
+    heartbeat_monitor: HeartbeatMonitor,
     environment: RuntimeEnvironment,
 }
 
@@ -23,7 +87,7 @@ impl Watchdog {
         Ok(Self {
             redis_client,
             mitigation,
-            missing_count: 0,
+            heartbeat_monitor: HeartbeatMonitor::default(),
             environment,
         })
     }
@@ -49,43 +113,44 @@ impl Watchdog {
             // We expect the value to be a timestamp (ms) string
             let heartbeat_res: redis::RedisResult<Option<String>> = conn.get(&heartbeat_key).await;
 
-            let mut trigger = false;
-
-            match heartbeat_res {
-                Ok(Some(ts_str)) => {
-                    self.missing_count = 0; // Reset missing count
-                    if let Ok(ts) = ts_str.parse::<i64>() {
-                        let now = SystemTime::now()
-                            .duration_since(UNIX_EPOCH)
-                            .unwrap_or_default()
-                            .as_millis() as i64;
-
-                        if now - ts > 5000 {
-                            warn!("Watchdog: Heartbeat stale (age: {}ms)", now - ts);
-                            trigger = true;
-                        }
-                    } else {
-                        warn!("Watchdog: Invalid heartbeat format: {}", ts_str);
-                        // Don't trigger on format error immediately, but maybe counts as missing?
-                        // Let's treat as missing
-                        self.missing_count += 1;
+            let heartbeat_value =
+                heartbeat_res.context("Watchdog failed to read heartbeat from Redis")?;
+            let now_ms = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_millis() as i64;
+            let observation = self
+                .heartbeat_monitor
+                .observe(heartbeat_value.as_deref(), now_ms);
+            let trigger = match observation {
+                HeartbeatObservation::WaitingForInitial => false,
+                HeartbeatObservation::Healthy { newly_armed } => {
+                    if newly_armed {
+                        info!("Watchdog armed after the first fresh Python heartbeat");
                     }
+                    false
                 }
-                Ok(None) => {
-                    self.missing_count += 1;
-                    warn!(
-                        "Watchdog: Heartbeat missing (count: {})",
-                        self.missing_count
-                    );
+                HeartbeatObservation::Missing { count } => {
+                    warn!("Watchdog: Heartbeat missing (count: {})", count);
+                    false
                 }
-                Err(e) => {
-                    return Err(e).context("Watchdog failed to read heartbeat from Redis");
+                HeartbeatObservation::Invalid { count } => {
+                    warn!("Watchdog: Invalid heartbeat format (count: {})", count);
+                    false
                 }
-            }
-
-            if self.missing_count > 5 {
-                trigger = true;
-            }
+                HeartbeatObservation::TriggerMissing { count } => {
+                    warn!("Watchdog: Heartbeat missing (count: {})", count);
+                    true
+                }
+                HeartbeatObservation::TriggerInvalid { count } => {
+                    warn!("Watchdog: Invalid heartbeat format (count: {})", count);
+                    true
+                }
+                HeartbeatObservation::TriggerStale { age_ms } => {
+                    warn!("Watchdog: Heartbeat stale (age: {}ms)", age_ms);
+                    true
+                }
+            };
 
             if trigger {
                 error!("🚨 WATCHDOG TRIGGERED: Python heartbeat failure!");
@@ -128,9 +193,7 @@ impl Watchdog {
 
                 // Sleep a bit to avoid rapid firing loop
                 sleep(Duration::from_secs(5)).await;
-                // Reset missing count? Or keep triggering until fixed?
-                // If we reset, we re-evaluate.
-                self.missing_count = 0;
+                self.heartbeat_monitor.missing_count = 0;
             }
 
             sleep(Duration::from_secs(1)).await;
@@ -142,6 +205,62 @@ impl Watchdog {
 mod tests {
     use super::*;
     use tokio::time::timeout;
+
+    #[test]
+    fn missing_heartbeat_waits_until_the_first_fresh_observation() {
+        let mut monitor = HeartbeatMonitor::default();
+
+        for _ in 0..12 {
+            assert_eq!(
+                monitor.observe(None, 10_000),
+                HeartbeatObservation::WaitingForInitial
+            );
+        }
+
+        assert!(!monitor.armed);
+        assert_eq!(monitor.missing_count, 0);
+    }
+
+    #[test]
+    fn first_fresh_heartbeat_arms_the_existing_missing_threshold() {
+        let mut monitor = HeartbeatMonitor::default();
+
+        assert_eq!(
+            monitor.observe(Some("10000"), 10_100),
+            HeartbeatObservation::Healthy { newly_armed: true }
+        );
+        for count in 1..=5 {
+            assert_eq!(
+                monitor.observe(None, 10_100 + i64::from(count)),
+                HeartbeatObservation::Missing { count }
+            );
+        }
+        assert_eq!(
+            monitor.observe(None, 10_106),
+            HeartbeatObservation::TriggerMissing { count: 6 }
+        );
+    }
+
+    #[test]
+    fn stale_or_malformed_existing_heartbeat_never_bypasses_safety() {
+        let mut stale = HeartbeatMonitor::default();
+        assert_eq!(
+            stale.observe(Some("1000"), 10_000),
+            HeartbeatObservation::TriggerStale { age_ms: 9_000 }
+        );
+
+        let mut malformed = HeartbeatMonitor::default();
+        for count in 1..=5 {
+            assert_eq!(
+                malformed.observe(Some("invalid"), 10_000),
+                HeartbeatObservation::Invalid { count }
+            );
+        }
+        assert_eq!(
+            malformed.observe(Some("invalid"), 10_000),
+            HeartbeatObservation::TriggerInvalid { count: 6 }
+        );
+    }
 
     #[tokio::test]
     #[ignore = "requires an isolated Redis provided through B3_TEST_REDIS_URL"]
