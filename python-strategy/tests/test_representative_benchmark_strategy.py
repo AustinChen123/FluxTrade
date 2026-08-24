@@ -1,9 +1,12 @@
 from decimal import Decimal
+from enum import StrEnum
+from typing import cast
 
 import pytest
 
 from src.core.models import Candlestick, SignalType
 from src.core.strategy_context import RiskSnapshot, StrategyContext
+from src.strategies.base import StrategyContextCapability, StrategyRequirements
 from src.strategies.representative_benchmark import (
     RepresentativeBenchmarkStrategy,
     representative_strategy_factory,
@@ -78,8 +81,7 @@ def test_delays_swing_confirmation_until_right_hand_bar_arrives():
 def test_emits_long_then_scheduled_exit():
     strategy = _strategy()
     signals = [
-        strategy.on_candle(_candle(index, str(100 + index)))
-        for index in range(5)
+        strategy.on_candle(_candle(index, str(100 + index))) for index in range(5)
     ]
 
     entry = next(signal for signal in signals if signal.type == SignalType.LONG)
@@ -94,8 +96,7 @@ def test_emits_long_then_scheduled_exit():
 def test_emits_short():
     strategy = _strategy()
     signals = [
-        strategy.on_candle(_candle(index, str(105 - index)))
-        for index in range(5)
+        strategy.on_candle(_candle(index, str(105 - index))) for index in range(5)
     ]
 
     entry = next(signal for signal in signals if signal.type == SignalType.SHORT)
@@ -124,6 +125,49 @@ def test_context_risk_gate_blocks_only_new_entries():
 
     assert all(signal.type == SignalType.NO_SIGNAL for signal in signals)
     assert strategy.on_candle(_candle(4, "104")).type == SignalType.LONG
+
+
+def test_declares_exact_entry_risk_context_capability_immutably():
+    requirements = _strategy().requirements
+
+    assert list(StrategyContextCapability) == [StrategyContextCapability.ENTRY_RISK]
+    assert requirements.required_context_capabilities == frozenset(
+        {StrategyContextCapability.ENTRY_RISK}
+    )
+    assert all(
+        type(capability) is StrategyContextCapability
+        for capability in requirements.required_context_capabilities
+    )
+    with pytest.raises(AttributeError):
+        setattr(requirements, "required_context_capabilities", frozenset())
+
+
+class _ForeignCapability(StrEnum):
+    ENTRY_RISK = "ENTRY_RISK"
+
+
+@pytest.mark.parametrize(
+    "capabilities",
+    [
+        frozenset({"ENTRY_RISK"}),
+        frozenset({_ForeignCapability.ENTRY_RISK}),
+        [StrategyContextCapability.ENTRY_RISK],
+        (StrategyContextCapability.ENTRY_RISK,),
+    ],
+)
+def test_requirements_reject_non_exact_context_capability_declarations(
+    capabilities: object,
+):
+    with pytest.raises(
+        TypeError,
+        match="^required context capabilities must use StrategyContextCapability$",
+    ):
+        StrategyRequirements(
+            PRODUCT_ID,
+            TIMEFRAME,
+            1,
+            cast(frozenset[StrategyContextCapability], capabilities),
+        )
 
 
 @pytest.mark.parametrize(

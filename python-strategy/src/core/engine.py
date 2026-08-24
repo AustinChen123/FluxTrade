@@ -26,7 +26,7 @@ from src.core.models import (
     StrategyStatus,
 )
 from src.core.orm_models import StrategyState
-from src.strategies.base import BaseStrategy
+from src.strategies.base import BaseStrategy, StrategyContextCapability
 from src.core.risk_manager import RiskManager, AccountService
 from src.core.execution import ExecutionEngine
 from src.core.clock import Clock
@@ -186,6 +186,9 @@ class StrategyEngine:
         leadership_guard: Callable[[], None] | None = None,
         signal_batch_observer: Callable[[tuple[Signal, ...]], None] | None = None,
         strategy_context_loader: StrategyContextLoader | None = None,
+        available_strategy_context_capabilities: frozenset[
+            StrategyContextCapability
+        ] = frozenset(),
         runtime_bootstrap_factory: RuntimeBootstrapFactory | None = None,
         runtime_capabilities_factory: RuntimeCapabilitiesFactory | None = None,
         strategy_artifact_loader: Callable[
@@ -218,6 +221,22 @@ class StrategyEngine:
         self._boot_id = uuid.uuid4().hex
         self._boot_started = False
         self._strategy_context_loader_enabled = strategy_context_loader is not None
+        self._is_backtest = is_backtest is True
+        self._available_strategy_context_capabilities = frozenset(
+            available_strategy_context_capabilities
+        )
+        if any(
+            type(capability) is not StrategyContextCapability
+            for capability in self._available_strategy_context_capabilities
+        ):
+            raise TypeError(
+                "available context capabilities must use StrategyContextCapability"
+            )
+        if (
+            self._available_strategy_context_capabilities
+            and strategy_context_loader is None
+        ):
+            raise ValueError("strategy context capabilities require a context loader")
         self._pending_backtest_context_fills: list[dict] = []
         self._leadership_guard = leadership_guard or (lambda: None)
         self.runtime_environment = RuntimeEnvironment.from_env()
@@ -429,6 +448,7 @@ class StrategyEngine:
                 self._unregister_runtime_artifact(strategy_id)
             ),
             environment_identity=lambda: self.runtime_environment.identity,
+            assert_context_capabilities=self._assert_strategy_context_capabilities,
             event_logger=logger,
         )
         self._pending_market_replay = PendingMarketReplayService(
@@ -1159,6 +1179,22 @@ class StrategyEngine:
                 f"strategy_live_approval_required: readiness={readiness}"
             )
 
+    def _assert_strategy_context_capabilities(
+        self,
+        strategies: tuple[BaseStrategy, ...],
+    ) -> None:
+        if self._is_backtest or self.runtime_environment.identity != "live":
+            return
+        required = frozenset(
+            capability
+            for strategy in strategies
+            for capability in strategy.requirements.required_context_capabilities
+        )
+        missing = required - self._available_strategy_context_capabilities
+        if missing:
+            names = ",".join(sorted(capability.value for capability in missing))
+            raise RuntimeError(f"strategy_context_capability_missing: {names}")
+
     @staticmethod
     def _build_portfolio_definition(
         factory_cls: type[PortfolioFactory],
@@ -1469,6 +1505,7 @@ class StrategyEngine:
         Legacy support for static registration.
         """
         self._assert_strategy_live_readiness(type(strategy))
+        self._assert_strategy_context_capabilities((strategy,))
         if self.runtime_environment.identity == "live":
             self._strategy_hydration.fresh_instance_for_replay(strategy)
         with self._runtime_registration_lock:
@@ -1507,6 +1544,9 @@ class StrategyEngine:
                 f"portfolio_live_approval_required: readiness={definition.readiness}"
             )
         if self.runtime_environment.identity == "live":
+            self._assert_strategy_context_capabilities(
+                tuple(sleeve.strategy for sleeve in definition.sleeves)
+            )
             for sleeve in definition.sleeves:
                 self._strategy_hydration.fresh_instance_for_replay(sleeve.strategy)
         self._register_portfolio_definition(

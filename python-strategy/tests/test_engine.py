@@ -21,7 +21,7 @@ import subprocess
 import sys
 import threading
 from types import SimpleNamespace
-from typing import Any
+from typing import Any, cast
 from unittest.mock import MagicMock, call, patch, sentinel
 
 import pytest
@@ -123,6 +123,7 @@ from src.core.runtime_capabilities import (
 from src.core.rithmic_publisher_liveness_gate import (
     RithmicPublisherLivenessGate,
 )
+from src.strategies.base import StrategyContextCapability, StrategyRequirements
 
 
 # =============================================================================
@@ -2112,6 +2113,219 @@ class TestEngineInit:
 
 
 class TestAddStrategy:
+    def test_available_context_capability_requires_exact_enum(self, engine_factory):
+        with pytest.raises(
+            TypeError,
+            match="^available context capabilities must use StrategyContextCapability$",
+        ):
+            engine_factory(
+                strategy_context_loader=MagicMock(),
+                available_strategy_context_capabilities=cast(
+                    frozenset[StrategyContextCapability],
+                    frozenset({"ENTRY_RISK"}),
+                ),
+            )
+
+    def test_context_capability_requires_loader_at_construction(self, engine_factory):
+        with pytest.raises(
+            ValueError,
+            match="^strategy context capabilities require a context loader$",
+        ):
+            engine_factory(
+                available_strategy_context_capabilities=frozenset(
+                    {StrategyContextCapability.ENTRY_RISK}
+                )
+            )
+
+    @pytest.mark.parametrize(
+        ("environment", "required", "available", "allowed"),
+        [
+            ("test", False, False, True),
+            ("test", False, True, True),
+            ("test", True, False, True),
+            ("test", True, True, True),
+            ("live", False, False, True),
+            ("live", False, True, True),
+            ("live", True, False, False),
+            ("live", True, True, True),
+        ],
+    )
+    def test_static_context_capability_admission_matrix(
+        self,
+        engine_factory,
+        mock_strategy_class,
+        environment,
+        required,
+        available,
+        allowed,
+    ):
+        capabilities = (
+            frozenset({StrategyContextCapability.ENTRY_RISK})
+            if available
+            else frozenset()
+        )
+        engine = engine_factory(
+            strategy_context_loader=MagicMock() if available else None,
+            available_strategy_context_capabilities=capabilities,
+        )
+        engine.runtime_environment = RuntimeEnvironment(environment)
+        engine._strategy_hydration.fresh_instance_for_replay = MagicMock(
+            side_effect=lambda strategy: strategy
+        )
+
+        class MatrixStrategy(mock_strategy_class):
+            __fluxtrade_readiness__ = "LIVE_APPROVED"
+
+            @property
+            def requirements(self):
+                base = super().requirements
+                return StrategyRequirements(
+                    base.product_id,
+                    base.timeframe,
+                    base.lookback_window,
+                    (
+                        frozenset({StrategyContextCapability.ENTRY_RISK})
+                        if required
+                        else frozenset()
+                    ),
+                )
+
+        strategy = MatrixStrategy("matrix", "BINANCE:BTCUSDT-PERP")
+        if allowed:
+            engine.add_strategy(strategy)
+            assert engine.strategy_instances["matrix"] is strategy
+        else:
+            with pytest.raises(RuntimeError) as exc_info:
+                engine.add_strategy(strategy)
+            assert str(exc_info.value) == (
+                "strategy_context_capability_missing: ENTRY_RISK"
+            )
+            assert "matrix" not in engine.strategy_instances
+            engine._strategy_hydration.fresh_instance_for_replay.assert_not_called()
+
+    def test_static_mixed_portfolio_capability_rejection_is_atomic(
+        self,
+        engine,
+        mock_strategy_class,
+    ):
+        engine.runtime_environment = RuntimeEnvironment("live")
+        engine._strategy_hydration.fresh_instance_for_replay = MagicMock()
+        engine._register_portfolio_definition = MagicMock()
+
+        class RequiredStrategy(mock_strategy_class):
+            @property
+            def requirements(self):
+                base = super().requirements
+                return StrategyRequirements(
+                    base.product_id,
+                    base.timeframe,
+                    base.lookback_window,
+                    frozenset({StrategyContextCapability.ENTRY_RISK}),
+                )
+
+        definition = PortfolioDefinition(
+            portfolio_id="mixed",
+            product_id="BINANCE:BTCUSDT-PERP",
+            sleeves=(
+                PortfolioSleeve(mock_strategy_class("plain", "BINANCE:BTCUSDT-PERP")),
+                PortfolioSleeve(RequiredStrategy("required", "BINANCE:BTCUSDT-PERP")),
+            ),
+            max_gross_quantity=Decimal("2"),
+            readiness="LIVE_APPROVED",
+        )
+
+        with pytest.raises(RuntimeError) as exc_info:
+            engine.add_portfolio(definition)
+
+        assert str(exc_info.value) == "strategy_context_capability_missing: ENTRY_RISK"
+        engine._strategy_hydration.fresh_instance_for_replay.assert_not_called()
+        engine._register_portfolio_definition.assert_not_called()
+
+    def test_backtest_context_loader_does_not_require_live_capability_declaration(
+        self,
+        engine_factory,
+        mock_strategy_class,
+        simulated_adapter,
+    ):
+        engine = engine_factory(
+            is_backtest=True,
+            strategy_context_loader=MagicMock(),
+            adapter=simulated_adapter,
+        )
+        engine.runtime_environment = RuntimeEnvironment("live")
+        engine._strategy_hydration.fresh_instance_for_replay = MagicMock(
+            side_effect=lambda strategy: strategy
+        )
+
+        class BacktestContextStrategy(mock_strategy_class):
+            __fluxtrade_readiness__ = "LIVE_APPROVED"
+
+            @property
+            def requirements(self):
+                base = super().requirements
+                return StrategyRequirements(
+                    base.product_id,
+                    base.timeframe,
+                    base.lookback_window,
+                    frozenset({StrategyContextCapability.ENTRY_RISK}),
+                )
+
+        strategy = BacktestContextStrategy("backtest", "BINANCE:BTCUSDT-PERP")
+
+        engine.add_strategy(strategy)
+
+        assert engine.strategy_instances["backtest"] is strategy
+
+    def test_dynamic_live_context_rejection_precedes_warm_up_and_running(
+        self,
+        engine,
+        mock_strategy_class,
+    ):
+        engine.runtime_environment = RuntimeEnvironment("live")
+
+        class RequiredStrategy(mock_strategy_class):
+            __fluxtrade_readiness__ = "LIVE_APPROVED"
+
+            @property
+            def requirements(self):
+                base = super().requirements
+                return StrategyRequirements(
+                    base.product_id,
+                    base.timeframe,
+                    base.lookback_window,
+                    frozenset({StrategyContextCapability.ENTRY_RISK}),
+                )
+
+        strategy_id = "required"
+        state = MagicMock(
+            status=StrategyStatus.READY,
+            version=1,
+            config_json='{"product_id":"BINANCE:BTCUSDT-PERP"}',
+            performance_json="unchanged",
+        )
+        mock_db = MagicMock()
+        mock_db.query.return_value.filter.return_value.first.return_value = state
+        engine._db_session_factory = lambda: nullcontext(mock_db)
+        engine.loaded_classes[strategy_id] = RequiredStrategy
+        engine._strategy_hydration.warm_up = MagicMock()
+        engine._strategy_hydration.fresh_instance_for_replay = MagicMock()
+        engine._register_strategy_instance = MagicMock()
+        engine._strategy_state_manager.transition_to_running = MagicMock()
+        engine._strategy_state_manager.transition_to_error = MagicMock()
+
+        assert engine.activate_strategy(strategy_id) is False
+
+        engine._strategy_hydration.warm_up.assert_not_called()
+        engine._strategy_hydration.fresh_instance_for_replay.assert_not_called()
+        engine._register_strategy_instance.assert_not_called()
+        engine._strategy_state_manager.transition_to_running.assert_not_called()
+        engine._strategy_state_manager.transition_to_error.assert_called_once_with(
+            strategy_id,
+            "strategy_context_capability_missing: ENTRY_RISK",
+            actor="system",
+            expected_version=None,
+        )
+
     def test_registers_strategy_by_product(self, engine, strategy_instance):
         """Should register strategy in strategies dict keyed by product_id."""
         engine.add_strategy(strategy_instance)

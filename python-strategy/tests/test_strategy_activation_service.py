@@ -74,7 +74,13 @@ class _State:
         object.__setattr__(self, name, value)
 
 
-def _build_service(*, state: object | None, environment: str = "simulated"):
+def _build_service(
+    *,
+    state: object | None,
+    environment: str = "simulated",
+    assert_context_capabilities: Callable[[tuple[BaseStrategy, ...]], None]
+    | None = None,
+):
     events: list[str] = []
     if isinstance(state, _State):
         object.__setattr__(state, "events", events)
@@ -93,6 +99,9 @@ def _build_service(*, state: object | None, environment: str = "simulated"):
         register_portfolio=runtime_artifacts.register_portfolio,
         unregister_runtime_artifact=runtime_artifacts.unregister,
         environment_identity=lambda: environment,
+        assert_context_capabilities=(
+            assert_context_capabilities or (lambda _strategies: None)
+        ),
         event_logger=MagicMock(),
     )
     return service, events, db, state_manager, hydration, runtime_artifacts
@@ -295,6 +304,66 @@ def test_portfolio_publishes_only_after_every_sleeve_is_ready() -> None:
         "commit",
         "running",
     ]
+
+
+def test_standalone_capability_rejection_precedes_warm_up_and_registration() -> None:
+    state = _State([])
+    failure = RuntimeError("strategy_context_capability_missing: ENTRY_RISK")
+    validator = MagicMock(side_effect=failure)
+    service, _events, _db, state_manager, hydration, runtime_artifacts = _build_service(
+        state=state,
+        environment="live",
+        assert_context_capabilities=validator,
+    )
+
+    assert not _activate(service)
+
+    validated = validator.call_args.args[0]
+    assert len(validated) == 1
+    assert validated[0].strategy_id == "strategy"
+    hydration.assert_not_called()
+    runtime_artifacts.register_strategy.assert_not_called()
+    state_manager.transition_to_running.assert_not_called()
+    state_manager.transition_to_error.assert_called_once_with(
+        "strategy",
+        str(failure),
+        actor="system",
+        expected_version=None,
+    )
+
+
+def test_mixed_portfolio_capabilities_are_validated_atomically() -> None:
+    state = _State([])
+    failure = RuntimeError("strategy_context_capability_missing: ENTRY_RISK")
+    validator = MagicMock(side_effect=failure)
+    service, _events, _db, state_manager, hydration, runtime_artifacts = _build_service(
+        state=state,
+        environment="live",
+        assert_context_capabilities=validator,
+    )
+    definition = PortfolioDefinition(
+        portfolio_id="strategy",
+        product_id="PRODUCT",
+        sleeves=tuple(
+            PortfolioSleeve(_Strategy(f"strategy.sleeve_{index}", "PRODUCT"))
+            for index in range(2)
+        ),
+        max_gross_quantity=Decimal("2"),
+    )
+
+    assert not _activate(
+        service,
+        artifact_cls=_Portfolio,
+        resolve_product_id=lambda _config: "PRODUCT",
+        build_portfolio_definition=lambda *_args, **_kwargs: definition,
+    )
+
+    assert validator.call_args.args[0] == tuple(
+        sleeve.strategy for sleeve in definition.sleeves
+    )
+    hydration.assert_not_called()
+    runtime_artifacts.register_portfolio.assert_not_called()
+    state_manager.transition_to_running.assert_not_called()
 
 
 def test_second_sleeve_failure_never_publishes_partial_portfolio() -> None:

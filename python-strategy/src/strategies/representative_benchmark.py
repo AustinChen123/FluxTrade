@@ -12,7 +12,11 @@ from decimal import Decimal
 
 from src.core.models import Candlestick, Signal, SignalType
 from src.core.strategy_context import StrategyContext
-from src.strategies.base import BaseStrategy, StrategyRequirements
+from src.strategies.base import (
+    BaseStrategy,
+    StrategyContextCapability,
+    StrategyRequirements,
+)
 
 
 class RepresentativeBenchmarkStrategy(BaseStrategy):
@@ -90,6 +94,9 @@ class RepresentativeBenchmarkStrategy(BaseStrategy):
                 self.volume_window,
                 2 * self.swing_window + 1,
             ),
+            required_context_capabilities=frozenset(
+                {StrategyContextCapability.ENTRY_RISK}
+            ),
         )
 
     def on_candle(
@@ -97,7 +104,9 @@ class RepresentativeBenchmarkStrategy(BaseStrategy):
         candle: Candlestick,
         context: StrategyContext | None = None,
     ) -> Signal:
-        prior_high = max(self._highs) if len(self._highs) == self.breakout_window else None
+        prior_high = (
+            max(self._highs) if len(self._highs) == self.breakout_window else None
+        )
         prior_low = min(self._lows) if len(self._lows) == self.breakout_window else None
         self._update_features(candle)
 
@@ -157,7 +166,9 @@ class RepresentativeBenchmarkStrategy(BaseStrategy):
         normalized = position_side.upper() if position_side else None
         if normalized not in (None, "LONG", "SHORT"):
             return False
-        self.position = 1 if normalized == "LONG" else -1 if normalized == "SHORT" else 0
+        self.position = (
+            1 if normalized == "LONG" else -1 if normalized == "SHORT" else 0
+        )
         self._bars_held = 0
         return True
 

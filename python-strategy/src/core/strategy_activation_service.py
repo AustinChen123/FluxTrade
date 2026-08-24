@@ -28,6 +28,7 @@ DbSessionFactory = Callable[[], AbstractContextManager[Session]]
 ProductIdResolver = Callable[[dict], str]
 ReadinessValidator = Callable[[ArtifactClass], None]
 PortfolioBuilder = Callable[..., PortfolioDefinition]
+ContextCapabilityValidator = Callable[[tuple[BaseStrategy, ...]], None]
 
 
 class StrategyActivationService:
@@ -44,6 +45,7 @@ class StrategyActivationService:
         register_portfolio: Callable[[PortfolioDefinition], None],
         unregister_runtime_artifact: Callable[[str], bool],
         environment_identity: Callable[[], str],
+        assert_context_capabilities: ContextCapabilityValidator,
         event_logger: logging.Logger,
     ) -> None:
         self._db_session_factory = db_session_factory
@@ -54,6 +56,7 @@ class StrategyActivationService:
         self._register_portfolio = register_portfolio
         self._unregister_runtime_artifact = unregister_runtime_artifact
         self._environment_identity = environment_identity
+        self._assert_context_capabilities = assert_context_capabilities
         self._logger = event_logger
 
     def activate_locked(
@@ -107,6 +110,9 @@ class StrategyActivationService:
                         product_id=product_id,
                         config=config,
                     )
+                    self._assert_context_capabilities(
+                        tuple(sleeve.strategy for sleeve in definition.sleeves)
+                    )
                     warmed_sleeves: list[PortfolioSleeve] = []
                     for sleeve in definition.sleeves:
                         instance = sleeve.strategy
@@ -119,6 +125,7 @@ class StrategyActivationService:
                     )
                 else:
                     instance = artifact_cls(strategy_id, product_id)
+                    self._assert_context_capabilities((instance,))
                     self._hydration.warm_up(db, instance)
                     if self._environment_identity() == "live":
                         self._hydration.fresh_instance_for_replay(instance)

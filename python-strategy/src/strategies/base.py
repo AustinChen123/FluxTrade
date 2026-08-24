@@ -1,5 +1,6 @@
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
+from enum import StrEnum
 from typing import Optional
 import pandas as pd
 from src.core.models import Candlestick, Signal, Trade
@@ -7,11 +8,25 @@ from src.core.journal import StrategyJournal
 from src.core.strategy_context import StrategyContext
 
 
-@dataclass
+class StrategyContextCapability(StrEnum):
+    ENTRY_RISK = "ENTRY_RISK"
+
+
+@dataclass(frozen=True)
 class StrategyRequirements:
     product_id: str
     timeframe: str
     lookback_window: int
+    required_context_capabilities: frozenset[StrategyContextCapability] = frozenset()
+
+    def __post_init__(self) -> None:
+        if type(self.required_context_capabilities) is not frozenset or any(
+            type(capability) is not StrategyContextCapability
+            for capability in self.required_context_capabilities
+        ):
+            raise TypeError(
+                "required context capabilities must use StrategyContextCapability"
+            )
 
 
 class BaseStrategy(ABC):
