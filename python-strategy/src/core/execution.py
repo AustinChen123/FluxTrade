@@ -750,6 +750,7 @@ class ExecutionEngine:
 
                 if self.journal is not None:
                     self._journal_fill(order, price, qty, fee, fill_type, candle)
+        return fills
 
     def process_exchange_order_event(
         self,

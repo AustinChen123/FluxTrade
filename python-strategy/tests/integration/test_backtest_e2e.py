@@ -4,12 +4,16 @@ MemoryDataSource → BacktestRunner → SimulatedAdapter → Rust PyMatchingEngi
 
 Requires: compiled fluxtrade_core.so
 """
+
+import inspect
+
 import pytest
 from decimal import Decimal
 from unittest.mock import patch, MagicMock
 
 from src.core.data_sources.memory import MemoryDataSource
 from src.core.backtest_runner import BacktestRunner
+from src.core.research_backtest_runner import ResearchBacktestRunner
 from src.strategies.base import BaseStrategy, StrategyRequirements
 from src.core.models import Candlestick, Signal, SignalType
 from src.core.strategy_context import StrategyContext
@@ -18,6 +22,7 @@ from integration.conftest import PRODUCT_ID, TIMEFRAME, make_candle, make_candle
 # Skip if Rust .so is not available
 try:
     import fluxtrade_core  # noqa: F401
+
     HAS_RUST = True
 except ImportError:
     HAS_RUST = False
@@ -83,7 +88,9 @@ class AlwaysLongStrategy(BaseStrategy):
 class OneShotLongStrategy(BaseStrategy):
     """Opens one long position and leaves it open."""
 
-    def __init__(self, strategy_id: str = "one-shot-long", product_id: str = PRODUCT_ID):
+    def __init__(
+        self, strategy_id: str = "one-shot-long", product_id: str = PRODUCT_ID
+    ):
         super().__init__(strategy_id, product_id)
         self._sent = False
 
@@ -119,6 +126,45 @@ class OneShotLongStrategy(BaseStrategy):
         )
 
 
+class ContextDrivenRoundTripStrategy(BaseStrategy):
+    """Uses authoritative context, rather than a private position flag, to exit."""
+
+    def __init__(self, strategy_id: str = "context-round-trip"):
+        super().__init__(strategy_id, PRODUCT_ID)
+        self.contexts: list[StrategyContext] = []
+        self._entry_sent = False
+        self._exit_sent = False
+
+    @property
+    def requirements(self) -> StrategyRequirements:
+        return StrategyRequirements(PRODUCT_ID, TIMEFRAME, 1)
+
+    def on_candle(
+        self,
+        candle: Candlestick,
+        context: StrategyContext | None = None,
+    ) -> Signal | None:
+        if context is None:
+            raise AssertionError("decision context is required")
+        self.contexts.append(context)
+        if not self._entry_sent:
+            self._entry_sent = True
+            signal_type = SignalType.LONG
+        elif context.position is not None and not self._exit_sent:
+            self._exit_sent = True
+            signal_type = SignalType.EXIT_LONG
+        else:
+            return None
+        return Signal(
+            strategy_id=self.strategy_id,
+            product_id=self.product_id,
+            timeframe=TIMEFRAME,
+            timestamp=candle.timestamp,
+            type=signal_type,
+            quantity=Decimal("0.01"),
+        )
+
+
 # ---------------------------------------------------------------------------
 # Fixtures
 # ---------------------------------------------------------------------------
@@ -139,9 +185,116 @@ def memory_source(candle_data):
 # Tests
 # ---------------------------------------------------------------------------
 class TestBacktestE2E:
+    @patch("src.core.backtest_runner.SessionLocal")
+    def test_full_and_research_runners_share_context_driven_state_machine(
+        self,
+        mock_session_local,
+    ):
+        mock_session = MagicMock()
+        mock_session.query.return_value.filter_by.return_value.all.return_value = []
+        mock_session_local.return_value = mock_session
+        candles = make_candle_series(count=4)
+        report_config = {
+            "csv_trades": False,
+            "equity_curve": False,
+            "markdown_report": False,
+            "journal_export": False,
+        }
+        full_strategy = ContextDrivenRoundTripStrategy()
+        full_runner = BacktestRunner(
+            start_time=candles[0].timestamp,
+            end_time=candles[-1].timestamp,
+            product_id=PRODUCT_ID,
+            timeframe=TIMEFRAME,
+            initial_balance=Decimal("10000"),
+            data_source=MemoryDataSource(candles),
+            fee_config={"maker": Decimal("0"), "taker": Decimal("0")},
+            report_config=report_config,
+            max_drawdown_limit=None,
+        )
+        full_runner.add_strategy(full_strategy)
+
+        research_strategy = ContextDrivenRoundTripStrategy()
+        research_runner = ResearchBacktestRunner(
+            start_time=candles[0].timestamp,
+            end_time=candles[-1].timestamp,
+            product_id=PRODUCT_ID,
+            timeframe=TIMEFRAME,
+            initial_balance=Decimal("10000"),
+            data_source=MemoryDataSource(candles),
+            fee_config={"maker": Decimal("0"), "taker": Decimal("0")},
+        )
+        research_runner.add_strategy(research_strategy)
+
+        with patch(
+            "src.core.signal_processor.inspect.signature",
+            wraps=inspect.signature,
+        ) as signature_spy:
+            full_result = full_runner.run()
+            assert signature_spy.call_count == 1
+            signature_spy.reset_mock()
+            research_result = research_runner.run()
+            assert signature_spy.call_count == 1
+
+        assert full_result is not None
+        assert len(full_strategy.contexts) == len(research_strategy.contexts) == 4
+
+        def common_context_fields(context: StrategyContext):
+            open_orders = tuple(
+                (
+                    order.product_id,
+                    order.side,
+                    order.order_type,
+                    order.quantity,
+                    order.timestamp,
+                    order.price,
+                    order.status,
+                )
+                for order in context.open_orders
+            )
+            latest_fills = tuple(
+                (
+                    fill.product_id,
+                    fill.side,
+                    fill.price,
+                    fill.quantity,
+                    fill.fee,
+                    fill.timestamp,
+                )
+                for fill in context.latest_fills
+            )
+            return (
+                context.strategy_id,
+                context.product_id,
+                context.timestamp,
+                context.available_cash,
+                context.total_equity,
+                context.realized_pnl,
+                context.unrealized_pnl,
+                context.current_drawdown,
+                context.max_drawdown,
+                context.position,
+                open_orders,
+                latest_fills,
+            )
+
+        assert [
+            common_context_fields(context) for context in full_strategy.contexts
+        ] == [common_context_fields(context) for context in research_strategy.contexts]
+        assert [len(context.latest_fills) for context in full_strategy.contexts] == [
+            0,
+            1,
+            1,
+            0,
+        ]
+        assert full_result["total_pnl"] == research_result["total_pnl"]
+        assert full_result["endpoint_state"] == research_result["endpoint_state"]
+        assert research_result["raw_trade_count"] == 2
 
     @patch("src.core.backtest_runner.SessionLocal")
-    def test_backtest_runs_to_completion(self, mock_session_local, memory_source, candle_data):
+    def test_backtest_runs_to_completion(
+        self, mock_session_local, memory_source, candle_data
+    ):
         """BacktestRunner should complete without error and return result dict."""
         mock_session = MagicMock()
         mock_session.query.return_value.filter_by.return_value.all.return_value = []
@@ -158,8 +311,12 @@ class TestBacktestE2E:
             initial_balance=10000.0,
             data_source=memory_source,
             fee_config={"maker": 0.0002, "taker": 0.0006},
-            report_config={"csv_trades": False, "equity_curve": False,
-                           "markdown_report": False, "journal_export": False},
+            report_config={
+                "csv_trades": False,
+                "equity_curve": False,
+                "markdown_report": False,
+                "journal_export": False,
+            },
         )
 
         strategy = AlwaysLongStrategy()
@@ -171,7 +328,9 @@ class TestBacktestE2E:
         assert "total_trades" in result
 
     @patch("src.core.backtest_runner.SessionLocal")
-    def test_backtest_produces_journal_entries(self, mock_session_local, memory_source, candle_data):
+    def test_backtest_produces_journal_entries(
+        self, mock_session_local, memory_source, candle_data
+    ):
         """With AlwaysLongStrategy, journal should capture signal activity.
         Note: total_trades comes from DB query (mocked → 0), so we verify
         journal events instead as proof of order execution.
@@ -188,8 +347,12 @@ class TestBacktestE2E:
             initial_balance=10000.0,
             data_source=memory_source,
             fee_config={"maker": 0.0002, "taker": 0.0006},
-            report_config={"csv_trades": False, "equity_curve": False,
-                           "markdown_report": False, "journal_export": False},
+            report_config={
+                "csv_trades": False,
+                "equity_curve": False,
+                "markdown_report": False,
+                "journal_export": False,
+            },
         )
 
         strategy = AlwaysLongStrategy()
@@ -201,7 +364,9 @@ class TestBacktestE2E:
         assert result["journal_count"] > 0
 
     @patch("src.core.backtest_runner.SessionLocal")
-    def test_backtest_fees_reflected(self, mock_session_local, memory_source, candle_data):
+    def test_backtest_fees_reflected(
+        self, mock_session_local, memory_source, candle_data
+    ):
         """Fees should exactly reduce PnL for identical LIMIT fill economics."""
         mock_session = MagicMock()
         mock_session.query.return_value.filter_by.return_value.all.return_value = []
@@ -215,8 +380,12 @@ class TestBacktestE2E:
                 timeframe=TIMEFRAME,
                 data_source=memory_source,
                 fee_config=fee_config,
-                report_config={"csv_trades": False, "equity_curve": False,
-                               "markdown_report": False, "journal_export": False},
+                report_config={
+                    "csv_trades": False,
+                    "equity_curve": False,
+                    "markdown_report": False,
+                    "journal_export": False,
+                },
             )
             runner.add_strategy(AlwaysLongStrategy())
             result = runner.run()
@@ -230,11 +399,13 @@ class TestBacktestE2E:
         )
 
         no_fee_fills = [
-            entry["data"] for entry in result_no_fee["journal"]
+            entry["data"]
+            for entry in result_no_fee["journal"]
             if "fill_type" in entry["data"]
         ]
         with_fee_fills = [
-            entry["data"] for entry in result_with_fee["journal"]
+            entry["data"]
+            for entry in result_with_fee["journal"]
             if "fill_type" in entry["data"]
         ]
         assert no_fee_fills
@@ -257,7 +428,10 @@ class TestBacktestE2E:
         assert no_fee_economics == with_fee_economics
 
         expected_fees = sum(
-            (price * quantity * maker_fee_rate for _, price, quantity, _ in no_fee_economics),
+            (
+                price * quantity * maker_fee_rate
+                for _, price, quantity, _ in no_fee_economics
+            ),
             Decimal("0"),
         )
         reported_fees = sum(
@@ -265,13 +439,14 @@ class TestBacktestE2E:
         )
         assert reported_fees == expected_fees
         assert (
-            Decimal(result_no_fee["total_pnl"])
-            - Decimal(result_with_fee["total_pnl"])
+            Decimal(result_no_fee["total_pnl"]) - Decimal(result_with_fee["total_pnl"])
             == expected_fees
         )
 
     @patch("src.core.backtest_runner.SessionLocal")
-    def test_backtest_journal_populated(self, mock_session_local, memory_source, candle_data):
+    def test_backtest_journal_populated(
+        self, mock_session_local, memory_source, candle_data
+    ):
         """Journal should capture events during backtest."""
         mock_session = MagicMock()
         mock_session.query.return_value.filter_by.return_value.all.return_value = []
@@ -285,8 +460,12 @@ class TestBacktestE2E:
             initial_balance=10000.0,
             data_source=memory_source,
             fee_config={"maker": 0.0002, "taker": 0.0006},
-            report_config={"csv_trades": False, "equity_curve": False,
-                           "markdown_report": False, "journal_export": False},
+            report_config={
+                "csv_trades": False,
+                "equity_curve": False,
+                "markdown_report": False,
+                "journal_export": False,
+            },
         )
 
         runner.add_strategy(AlwaysLongStrategy())
@@ -326,8 +505,12 @@ class TestBacktestE2E:
             max_drawdown_limit=0.001,  # Very tight: stop at 0.1% drawdown
             data_source=memory_source,
             fee_config={"maker": 0.001, "taker": 0.002},
-            report_config={"csv_trades": False, "equity_curve": False,
-                           "markdown_report": False, "journal_export": False},
+            report_config={
+                "csv_trades": False,
+                "equity_curve": False,
+                "markdown_report": False,
+                "journal_export": False,
+            },
         )
 
         runner.add_strategy(AlwaysLongStrategy())
@@ -344,7 +527,9 @@ class TestBacktestE2E:
         assert endpoint_state.end_timestamp == candle_data[-1].timestamp
 
     @patch("src.core.backtest_runner.SessionLocal")
-    def test_backtest_circuit_breaker_uses_open_position_drawdown(self, mock_session_local):
+    def test_backtest_circuit_breaker_uses_open_position_drawdown(
+        self, mock_session_local
+    ):
         """Backtest should stop on unrealized drawdown before a trade closes."""
         mock_session = MagicMock()
         mock_session.query.return_value.filter_by.return_value.all.return_value = []
@@ -353,10 +538,30 @@ class TestBacktestE2E:
         base_ts = 1_700_000_000_000
         interval_ms = 15 * 60 * 1000
         candles = [
-            make_candle(base_ts, Decimal("100"), Decimal("100"), Decimal("100"), Decimal("100")),
-            make_candle(base_ts + interval_ms, Decimal("100"), Decimal("100"), Decimal("100"), Decimal("100")),
-            make_candle(base_ts + 2 * interval_ms, Decimal("60"), Decimal("60"), Decimal("60"), Decimal("60")),
-            make_candle(base_ts + 3 * interval_ms, Decimal("105"), Decimal("105"), Decimal("105"), Decimal("105")),
+            make_candle(
+                base_ts, Decimal("100"), Decimal("100"), Decimal("100"), Decimal("100")
+            ),
+            make_candle(
+                base_ts + interval_ms,
+                Decimal("100"),
+                Decimal("100"),
+                Decimal("100"),
+                Decimal("100"),
+            ),
+            make_candle(
+                base_ts + 2 * interval_ms,
+                Decimal("60"),
+                Decimal("60"),
+                Decimal("60"),
+                Decimal("60"),
+            ),
+            make_candle(
+                base_ts + 3 * interval_ms,
+                Decimal("105"),
+                Decimal("105"),
+                Decimal("105"),
+                Decimal("105"),
+            ),
         ]
         data_source = MemoryDataSource(candles)
         runner = BacktestRunner(
@@ -367,8 +572,12 @@ class TestBacktestE2E:
             initial_balance=10000.0,
             max_drawdown_limit=0.004,
             data_source=data_source,
-            report_config={"csv_trades": False, "equity_curve": False,
-                           "markdown_report": False, "journal_export": False},
+            report_config={
+                "csv_trades": False,
+                "equity_curve": False,
+                "markdown_report": False,
+                "journal_export": False,
+            },
         )
 
         runner.add_strategy(OneShotLongStrategy())

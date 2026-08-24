@@ -2,7 +2,7 @@ import csv
 import json
 import logging
 from contextlib import contextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import (
     Callable,
@@ -22,7 +22,11 @@ from fluxtrade_core import (
     Candlestick as RustCandlestick,
 )
 from src.core.db import SessionLocal
-from src.core.orm_models import Strategy as StrategyORM, BacktestResultSummary, BacktestTradeLog
+from src.core.orm_models import (
+    Strategy as StrategyORM,
+    BacktestResultSummary,
+    BacktestTradeLog,
+)
 from src.core.engine import StrategyEngine
 from src.core.clock import BacktestClock
 from src.core.data_provider import timeframe_to_ms
@@ -51,6 +55,7 @@ from src.core.product_registry import (
     resolve_contract_multiplier,
     resolve_fee_model,
 )
+from src.core.strategy_context import StrategyContext
 
 logger = logging.getLogger(__name__)
 
@@ -90,16 +95,31 @@ def _write_csv_trades(closed_trades: List[ClosedTrade], path: Path) -> None:
     """Write closed trades to CSV."""
     with open(path, "w", newline="") as f:
         writer = csv.writer(f)
-        writer.writerow([
-            "entry_time", "exit_time", "side", "entry_price",
-            "exit_price", "quantity", "fee", "pnl",
-        ])
+        writer.writerow(
+            [
+                "entry_time",
+                "exit_time",
+                "side",
+                "entry_price",
+                "exit_price",
+                "quantity",
+                "fee",
+                "pnl",
+            ]
+        )
         for ct in closed_trades:
-            writer.writerow([
-                ct.entry_time, ct.exit_time, ct.side,
-                f"{ct.entry_price:.6f}", f"{ct.exit_price:.6f}",
-                f"{ct.quantity:.6f}", f"{ct.fee:.6f}", f"{ct.pnl:.2f}",
-            ])
+            writer.writerow(
+                [
+                    ct.entry_time,
+                    ct.exit_time,
+                    ct.side,
+                    f"{ct.entry_price:.6f}",
+                    f"{ct.exit_price:.6f}",
+                    f"{ct.quantity:.6f}",
+                    f"{ct.fee:.6f}",
+                    f"{ct.pnl:.2f}",
+                ]
+            )
 
 
 def _write_equity_curve(equity_curve: list, path: Path) -> None:
@@ -170,9 +190,15 @@ def _write_markdown_report(
     lines.append(f"| Calmar Ratio | {metrics.get('calmar_ratio', 0):.4f} |")
     lines.append(f"| Max Drawdown Days | {metrics.get('max_drawdown_days', 0):.1f} |")
     lines.append(f"| Avg Hold Time (h) | {metrics.get('avg_hold_time_hours', 0):.1f} |")
-    lines.append(f"| Trade Freq (/day) | {metrics.get('trade_frequency_per_day', 0):.2f} |")
-    lines.append(f"| Max Consec. Wins | {metrics.get('max_consecutive_wins', 0)} ({metrics.get('max_consecutive_win_amount', 0):.2f}) |")
-    lines.append(f"| Max Consec. Losses | {metrics.get('max_consecutive_losses', 0)} ({metrics.get('max_consecutive_loss_amount', 0):.2f}) |")
+    lines.append(
+        f"| Trade Freq (/day) | {metrics.get('trade_frequency_per_day', 0):.2f} |"
+    )
+    lines.append(
+        f"| Max Consec. Wins | {metrics.get('max_consecutive_wins', 0)} ({metrics.get('max_consecutive_win_amount', 0):.2f}) |"
+    )
+    lines.append(
+        f"| Max Consec. Losses | {metrics.get('max_consecutive_losses', 0)} ({metrics.get('max_consecutive_loss_amount', 0):.2f}) |"
+    )
     lines.append(f"| Gross Profit | {metrics.get('gross_profit', 0):.2f} |")
     lines.append(f"| Gross Loss | {metrics.get('gross_loss', 0):.2f} |")
     lines.append("")
@@ -216,10 +242,7 @@ class BacktestRunner:
         if execution_timeframe is not None:
             execution_ms = timeframe_to_ms(execution_timeframe)
             decision_ms = timeframe_to_ms(timeframe)
-            if (
-                execution_ms >= decision_ms
-                or decision_ms % execution_ms != 0
-            ):
+            if execution_ms >= decision_ms or decision_ms % execution_ms != 0:
                 raise ValueError(
                     "execution_timeframe must evenly divide and be shorter "
                     "than the strategy timeframe"
@@ -254,9 +277,7 @@ class BacktestRunner:
 
     def add_portfolio(self, definition: PortfolioDefinition) -> None:
         """Add a portfolio while retaining strategy-scoped fills and metrics."""
-        decision_timeframe = (
-            definition.sleeves[0].strategy.requirements.timeframe
-        )
+        decision_timeframe = definition.sleeves[0].strategy.requirements.timeframe
         if (
             definition.product_id != self.product_id
             or decision_timeframe != self.timeframe
@@ -267,15 +288,11 @@ class BacktestRunner:
         if self._primary_runtime_id is None:
             self._primary_runtime_id = definition.portfolio_id
         self._portfolios_buffer.append(definition)
-        self._strategies_buffer.extend(
-            sleeve.strategy for sleeve in definition.sleeves
-        )
+        self._strategies_buffer.extend(sleeve.strategy for sleeve in definition.sleeves)
 
     def _ensure_strategies_registered(self, db_session: Session):
         """Register all added strategies in the DB to avoid FK constraints"""
-        runtime_ids = [
-            strategy.strategy_id for strategy in self._strategies_buffer
-        ]
+        runtime_ids = [strategy.strategy_id for strategy in self._strategies_buffer]
         runtime_ids.extend(
             portfolio.portfolio_id for portfolio in self._portfolios_buffer
         )
@@ -286,7 +303,7 @@ class BacktestRunner:
                 new_strat = StrategyORM(
                     id=runtime_id,
                     name=f"Backtest: {runtime_id}",
-                    configuration_json="{}"
+                    configuration_json="{}",
                 )
                 db_session.add(new_strat)
         db_session.commit()
@@ -306,16 +323,13 @@ class BacktestRunner:
         end_timestamp: int | None = None
         halted_early = False
         aggregator = (
-            CandleAggregator()
-            if self.execution_timeframe is not None
-            else None
+            CandleAggregator() if self.execution_timeframe is not None else None
         )
         equity_calculator = (
             PortfolioEquityCalculator(
                 adapter=mock_account.adapter,
                 strategy_ids=[
-                    strategy.strategy_id
-                    for strategy in self._strategies_buffer
+                    strategy.strategy_id for strategy in self._strategies_buffer
                 ],
                 product_id=self.product_id,
                 contract_multiplier=self.contract_multiplier,
@@ -425,7 +439,10 @@ class BacktestRunner:
     ) -> Optional[str]:
         """Write report files to output_dir. Returns output directory path."""
         cfg = self.report_config
-        if not any(cfg.get(k) for k in ("csv_trades", "markdown_report", "equity_curve", "journal_export")):
+        if not any(
+            cfg.get(k)
+            for k in ("csv_trades", "markdown_report", "equity_curve", "journal_export")
+        ):
             return None
 
         output_dir = Path(cfg.get("output_dir", "backtest_output/"))
@@ -481,7 +498,7 @@ class BacktestRunner:
             start_time=self.start_time,
             end_time=self.end_time,
             total_pnl=0,
-            metrics_json="{}"
+            metrics_json="{}",
         )
         with self._db_session_factory() as db_session:
             db_session.add(summary)
@@ -499,6 +516,54 @@ class BacktestRunner:
             taker_fee=Decimal(str(self.fee_config.get("taker", 0))),
             instrument_spec=self.instrument_spec,
         )
+        context_peak_equity = {
+            strategy.strategy_id: self.initial_balance
+            for strategy in self._strategies_buffer
+        }
+        context_max_drawdown = {
+            strategy.strategy_id: Decimal("0") for strategy in self._strategies_buffer
+        }
+
+        def strategy_context_loader(
+            strategy: BaseStrategy,
+            candle: Candlestick,
+            latest_fills: tuple[dict, ...],
+        ) -> StrategyContext:
+            strategy_id = strategy.strategy_id
+            context = adapter.get_strategy_context(
+                strategy_id=strategy_id,
+                product_id=candle.product_id,
+                timestamp=candle.timestamp,
+                initial_balance=self.initial_balance,
+                mark_price=candle.close,
+                peak_equity=context_peak_equity[strategy_id],
+                max_drawdown=context_max_drawdown[strategy_id],
+                latest_fills=list(latest_fills),
+            )
+            peak_equity = max(
+                context_peak_equity[strategy_id],
+                context.total_equity,
+            )
+            current_drawdown = max(
+                peak_equity - context.total_equity,
+                Decimal("0"),
+            )
+            max_drawdown = max(
+                context_max_drawdown[strategy_id],
+                current_drawdown,
+            )
+            context_peak_equity[strategy_id] = peak_equity
+            context_max_drawdown[strategy_id] = max_drawdown
+            if (
+                context.current_drawdown == current_drawdown
+                and context.max_drawdown == max_drawdown
+            ):
+                return context
+            return replace(
+                context,
+                current_drawdown=current_drawdown,
+                max_drawdown=max_drawdown,
+            )
 
         # 4. Setup repo (trade recording only) and account service
         repo = BacktestOrderRepository(
@@ -518,6 +583,8 @@ class BacktestRunner:
             journal=journal,
             db_session_factory=self._db_session_factory,
             signal_batch_observer=self.signal_batch_observer,
+            is_backtest=True,
+            strategy_context_loader=strategy_context_loader,
         )
 
         # Inject journal and account service into strategies
@@ -540,7 +607,12 @@ class BacktestRunner:
         for portfolio in self._portfolios_buffer:
             self.engine.add_portfolio(portfolio)
 
-        logger.info("Starting Backtest for %s [%s - %s]", self.product_id, self.start_time, self.end_time)
+        logger.info(
+            "Starting Backtest for %s [%s - %s]",
+            self.product_id,
+            self.start_time,
+            self.end_time,
+        )
 
         stop_drawdown_amount = (
             None
@@ -689,12 +761,8 @@ class BacktestRunner:
             )
         }
         result["daily_return_moments"] = daily_return_moments
-        result["equity_sample_count"] = daily_return_metrics[
-            "equity_sample_count"
-        ]
-        result["yearly_mark_to_market_returns"] = daily_return_metrics[
-            "yearly_returns"
-        ]
+        result["equity_sample_count"] = daily_return_metrics["equity_sample_count"]
+        result["yearly_mark_to_market_returns"] = daily_return_metrics["yearly_returns"]
         result["annualized_sharpe"] = annualized_sharpe_from_moments(
             daily_return_moments
         )
@@ -702,7 +770,10 @@ class BacktestRunner:
         return result
 
     def _resolve_instrument_spec(self, product_id: str) -> InstrumentSpec | None:
-        if self.instrument_spec is None or self.instrument_spec.product_id != product_id:
+        if (
+            self.instrument_spec is None
+            or self.instrument_spec.product_id != product_id
+        ):
             return None
         return self.instrument_spec
 
@@ -719,7 +790,9 @@ class BacktestRunner:
 
         per_strategy: Dict[str, Dict] = {}
         for sid in strategy_ids:
-            strategy_trades = [t for t in trades if getattr(t, "strategy_id", None) == sid]
+            strategy_trades = [
+                t for t in trades if getattr(t, "strategy_id", None) == sid
+            ]
             if strategy_trades:
                 strategy_metrics = calculate_metrics(
                     strategy_trades,

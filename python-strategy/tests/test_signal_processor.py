@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+import gc
+import weakref
 from decimal import Decimal
-from unittest.mock import MagicMock, sentinel
+from unittest.mock import MagicMock, patch, sentinel
 
 import pytest
 
@@ -16,7 +18,13 @@ from src.core.portfolio_runtime import (
     PortfolioExposureSnapshot,
     PortfolioSleeve,
 )
-from src.core.signal_processor import SignalObserverError, SignalProcessor
+from src.core.signal_processor import (
+    SignalObserverError,
+    SignalProcessor,
+    StrategyContextInvocationMode,
+    invoke_strategy_on_candle,
+    strategy_context_invocation_mode,
+)
 from src.core.strategy_context import StrategyContext
 from src.core.strategy_registry import StrategyRegistry
 from src.strategies.base import BaseStrategy, StrategyRequirements
@@ -1437,6 +1445,249 @@ def test_dispatch_normalizes_none_signal_and_list() -> None:
         processor._dispatch_to_strategy(DummyStrategy("s1", result=multiple), candle)
         == multiple
     )
+
+
+def test_context_capable_strategy_receives_loader_snapshot_on_decision() -> None:
+    class ContextRecordingStrategy(DummyStrategy):
+        def __init__(self) -> None:
+            super().__init__("s1")
+            self.contexts: list[StrategyContext | None] = []
+
+        def on_candle(
+            self,
+            candle: Candlestick,
+            context: StrategyContext | None = None,
+        ) -> None:
+            self.contexts.append(context)
+
+    strategy = ContextRecordingStrategy()
+    registry = StrategyRegistry()
+    registry.register(strategy)
+    context = StrategyContext(
+        strategy_id="s1",
+        product_id=strategy.product_id,
+        timestamp=make_candle().timestamp,
+        available_cash=Decimal("10000"),
+        total_equity=Decimal("10000"),
+        realized_pnl=Decimal("0"),
+        unrealized_pnl=Decimal("0"),
+        current_drawdown=Decimal("0"),
+        max_drawdown=Decimal("0"),
+    )
+    processor = SignalProcessor(
+        registry,
+        MagicMock(),
+        strategy_context_loader=lambda _strategy, _candle, _fills: context,
+    )
+
+    processor.on_candle(make_candle())
+
+    assert strategy.contexts == [context]
+
+
+def test_strategy_context_invocation_classifier_matrix() -> None:
+    observed: list[tuple[str, StrategyContext | None]] = []
+
+    class CandleOnly(DummyStrategy):
+        def on_candle(  # pyright: ignore[reportIncompatibleMethodOverride]
+            self, candle: Candlestick
+        ) -> None:
+            observed.append(("none", None))
+
+    class NamedContext(DummyStrategy):
+        def on_candle(
+            self,
+            candle: Candlestick,
+            context: StrategyContext | None = None,
+        ) -> None:
+            observed.append(("named", context))
+
+    class KeywordContext(DummyStrategy):
+        def on_candle(  # pyright: ignore[reportIncompatibleMethodOverride]
+            self,
+            candle: Candlestick,
+            *,
+            context: StrategyContext | None = None,
+        ) -> None:
+            observed.append(("keyword", context))
+
+    class KeywordCatchall(DummyStrategy):
+        def on_candle(  # pyright: ignore[reportIncompatibleMethodOverride]
+            self, candle: Candlestick, **kwargs
+        ) -> None:
+            observed.append(("kwargs", kwargs.get("context")))
+
+    class MigratingPositional(DummyStrategy):
+        def on_candle(  # pyright: ignore[reportIncompatibleMethodOverride]
+            self,
+            candle: Candlestick,
+            decision_state: StrategyContext | None = None,
+        ) -> None:
+            observed.append(("positional", decision_state))
+
+    strategies = (
+        CandleOnly("none"),
+        NamedContext("named"),
+        KeywordContext("keyword"),
+        KeywordCatchall("kwargs"),
+        MigratingPositional("positional"),
+    )
+    expected_modes = (
+        StrategyContextInvocationMode.NONE,
+        StrategyContextInvocationMode.POSITIONAL,
+        StrategyContextInvocationMode.KEYWORD,
+        StrategyContextInvocationMode.KEYWORD,
+        StrategyContextInvocationMode.POSITIONAL,
+    )
+    context = StrategyContext(
+        strategy_id="named",
+        product_id=make_candle().product_id,
+        timestamp=make_candle().timestamp,
+        available_cash=Decimal("1"),
+        total_equity=Decimal("1"),
+        realized_pnl=Decimal("0"),
+        unrealized_pnl=Decimal("0"),
+        current_drawdown=Decimal("0"),
+        max_drawdown=Decimal("0"),
+    )
+
+    for strategy, expected_mode in zip(strategies, expected_modes):
+        assert strategy_context_invocation_mode(strategy) is expected_mode
+        invoke_strategy_on_candle(strategy, make_candle(), context)
+
+    assert observed == [
+        ("none", None),
+        ("named", context),
+        ("keyword", context),
+        ("kwargs", context),
+        ("positional", context),
+    ]
+
+
+def test_signal_processor_resolves_context_mode_once_per_strategy_object() -> None:
+    strategy = DummyStrategy("same-id")
+    registry = StrategyRegistry()
+    registry.register(strategy)
+    processor = SignalProcessor(
+        registry,
+        MagicMock(),
+        strategy_context_loader=lambda _strategy, _candle, _fills: MagicMock(),
+    )
+
+    with patch(
+        "src.core.signal_processor.strategy_context_invocation_mode",
+        wraps=strategy_context_invocation_mode,
+    ) as resolver:
+        for timestamp in range(1, 6):
+            processor.on_candle(
+                make_candle().model_copy(update={"timestamp": timestamp})
+            )
+        replacement = DummyStrategy("same-id")
+        registry.register(replacement)
+        processor.on_candle(make_candle().model_copy(update={"timestamp": 6}))
+
+    assert resolver.call_count == 2
+    assert [call.args[0] for call in resolver.call_args_list] == [
+        strategy,
+        replacement,
+    ]
+
+
+def test_signal_processor_without_context_loader_never_resolves_mode() -> None:
+    strategy = DummyStrategy("s1")
+    registry = StrategyRegistry()
+    registry.register(strategy)
+    processor = SignalProcessor(registry, MagicMock())
+
+    with patch(
+        "src.core.signal_processor.strategy_context_invocation_mode"
+    ) as resolver:
+        for _ in range(5):
+            processor.on_candle(make_candle())
+
+    resolver.assert_not_called()
+    assert processor._context_invocation_modes == {}
+
+
+def test_context_mode_cache_does_not_retain_unregistered_strategy() -> None:
+    strategy = DummyStrategy("collectible")
+    strategy_reference = weakref.ref(strategy)
+    registry = StrategyRegistry()
+    registry.register(strategy)
+    processor = SignalProcessor(
+        registry,
+        MagicMock(),
+        strategy_context_loader=lambda _strategy, _candle, _fills: MagicMock(),
+    )
+    processor.on_candle(make_candle())
+    assert "collectible" in processor._context_invocation_modes
+
+    registry.unregister("collectible")
+    del strategy
+    gc.collect()
+
+    assert strategy_reference() is None
+    assert "collectible" not in processor._context_invocation_modes
+
+
+def test_strategy_type_error_is_not_retried_without_context() -> None:
+    class TypeErrorStrategy(DummyStrategy):
+        def __init__(self) -> None:
+            super().__init__("s1")
+            self.calls = 0
+
+        def on_candle(
+            self,
+            candle: Candlestick,
+            context: StrategyContext | None = None,
+        ) -> None:
+            self.calls += 1
+            raise TypeError("strategy bug")
+
+    strategy = TypeErrorStrategy()
+
+    with pytest.raises(TypeError, match="strategy bug"):
+        invoke_strategy_on_candle(strategy, make_candle(), MagicMock())
+
+    assert strategy.calls == 1
+
+
+def test_warm_up_never_loads_current_adapter_context() -> None:
+    strategy = DummyStrategy("s1")
+    loader = MagicMock(side_effect=AssertionError("warm-up context leak"))
+    processor = SignalProcessor(
+        StrategyRegistry(),
+        MagicMock(),
+        strategy_context_loader=loader,
+    )
+
+    with patch(
+        "src.core.signal_processor.strategy_context_invocation_mode"
+    ) as resolver:
+        processor.warm_up(strategy, [make_candle()])
+
+    loader.assert_not_called()
+    resolver.assert_not_called()
+    assert processor._context_invocation_modes == {}
+    assert strategy.candles_received == [make_candle()]
+
+
+def test_context_loader_failure_propagates_before_strategy_dispatch() -> None:
+    strategy = DummyStrategy("s1")
+    registry = StrategyRegistry()
+    registry.register(strategy)
+    processor = SignalProcessor(
+        registry,
+        MagicMock(),
+        strategy_context_loader=MagicMock(
+            side_effect=RuntimeError("context authority unavailable")
+        ),
+    )
+
+    with pytest.raises(RuntimeError, match="context authority unavailable"):
+        processor.on_candle(make_candle())
+
+    assert strategy.candles_received == []
 
 
 def test_process_signals_skips_no_signal() -> None:

@@ -151,6 +151,43 @@ def test_strategy_context_reflects_fills_before_next_decision():
 
 @pytest.mark.rust
 @pytest.mark.skipif(not HAS_RUST, reason="fluxtrade_core.so not compiled")
+def test_strategy_context_filters_latest_fills_by_strategy_and_product():
+    adapter = SimulatedAdapter(initial_balance=Decimal("10000"))
+    own_order = _market_order("own", timestamp=1000)
+    other_order = _market_order("other", timestamp=1000)
+    other_order.strategy_id = "other_strategy"
+    fills = [
+        {
+            "order": own_order,
+            "price": Decimal("100"),
+            "quantity": Decimal("0.01"),
+            "fee": Decimal("1"),
+            "timestamp": 1100,
+        },
+        {
+            "order": other_order,
+            "price": Decimal("101"),
+            "quantity": Decimal("0.02"),
+            "fee": Decimal("2"),
+            "timestamp": 1200,
+        },
+    ]
+
+    context = adapter.get_strategy_context(
+        strategy_id="ctx_strategy",
+        product_id=PRODUCT_ID,
+        timestamp=2000,
+        initial_balance=Decimal("10000"),
+        latest_fills=fills,
+    )
+
+    assert [(fill.order_id, fill.timestamp) for fill in context.latest_fills] == [
+        ("own", 1100)
+    ]
+
+
+@pytest.mark.rust
+@pytest.mark.skipif(not HAS_RUST, reason="fluxtrade_core.so not compiled")
 def test_strategy_context_drawdown_is_loss_magnitude():
     candles = make_candle_series(count=1)
     adapter = SimulatedAdapter(initial_balance=Decimal("10000"))
@@ -575,11 +612,37 @@ def test_research_runner_reports_bar_level_drawdown_for_open_positions():
     base_ts = 1_700_000_000_000
     interval_ms = 15 * 60 * 1000
     candles = [
-        make_candle(base_ts, Decimal("100"), Decimal("100"), Decimal("100"), Decimal("100")),
-        make_candle(base_ts + interval_ms, Decimal("100"), Decimal("100"), Decimal("100"), Decimal("100")),
-        make_candle(base_ts + 2 * interval_ms, Decimal("60"), Decimal("60"), Decimal("60"), Decimal("60")),
-        make_candle(base_ts + 3 * interval_ms, Decimal("105"), Decimal("105"), Decimal("105"), Decimal("105")),
-        make_candle(base_ts + 4 * interval_ms, Decimal("105"), Decimal("105"), Decimal("105"), Decimal("105")),
+        make_candle(
+            base_ts, Decimal("100"), Decimal("100"), Decimal("100"), Decimal("100")
+        ),
+        make_candle(
+            base_ts + interval_ms,
+            Decimal("100"),
+            Decimal("100"),
+            Decimal("100"),
+            Decimal("100"),
+        ),
+        make_candle(
+            base_ts + 2 * interval_ms,
+            Decimal("60"),
+            Decimal("60"),
+            Decimal("60"),
+            Decimal("60"),
+        ),
+        make_candle(
+            base_ts + 3 * interval_ms,
+            Decimal("105"),
+            Decimal("105"),
+            Decimal("105"),
+            Decimal("105"),
+        ),
+        make_candle(
+            base_ts + 4 * interval_ms,
+            Decimal("105"),
+            Decimal("105"),
+            Decimal("105"),
+            Decimal("105"),
+        ),
     ]
     strategy = ContextDrawdownRoundTripStrategy()
     runner = ResearchBacktestRunner(
@@ -609,9 +672,23 @@ def test_research_runner_reports_triggered_drawdown_halt_policy(
     base_ts = 1_700_000_000_000
     interval_ms = 15 * 60 * 1000
     candles = [
-        make_candle(base_ts, Decimal("100"), Decimal("100"), Decimal("100"), Decimal("100")),
-        make_candle(base_ts + interval_ms, Decimal("100"), Decimal("100"), Decimal("100"), Decimal("100")),
-        make_candle(base_ts + 2 * interval_ms, Decimal("60"), Decimal("60"), Decimal("60"), Decimal("60")),
+        make_candle(
+            base_ts, Decimal("100"), Decimal("100"), Decimal("100"), Decimal("100")
+        ),
+        make_candle(
+            base_ts + interval_ms,
+            Decimal("100"),
+            Decimal("100"),
+            Decimal("100"),
+            Decimal("100"),
+        ),
+        make_candle(
+            base_ts + 2 * interval_ms,
+            Decimal("60"),
+            Decimal("60"),
+            Decimal("60"),
+            Decimal("60"),
+        ),
     ]
     if include_unprocessed_candle:
         candles.append(
@@ -743,7 +820,10 @@ def test_research_runner_rejects_entry_when_capital_is_insufficient():
     assert strategy.contexts[0].capital.available == Decimal("100")
     assert strategy.contexts[0].latest_rejections == ()
     assert len(strategy.contexts[1].latest_rejections) == 1
-    assert "capital_allocation_rejected" in strategy.contexts[1].latest_rejections[0].reason
+    assert (
+        "capital_allocation_rejected"
+        in strategy.contexts[1].latest_rejections[0].reason
+    )
     assert "required=" in strategy.contexts[1].latest_rejections[0].reason
     assert "available=100" in strategy.contexts[1].latest_rejections[0].reason
     assert strategy.contexts[2].latest_rejections == ()
@@ -794,7 +874,9 @@ def test_research_runner_allows_entry_when_capital_is_sufficient():
     result = runner.run()
 
     assert result["raw_trade_count"] == 1
-    assert allocator.get_used(strategy.strategy_id) == Decimal("0.01") * candles[-1].close
+    assert (
+        allocator.get_used(strategy.strategy_id) == Decimal("0.01") * candles[-1].close
+    )
 
 
 @pytest.mark.rust
@@ -818,9 +900,14 @@ def test_research_runner_reserves_capital_between_same_candle_entries():
     result = runner.run()
 
     assert result["raw_trade_count"] == 1
-    assert allocator.get_used(strategy.strategy_id) == Decimal("0.006") * candles[-1].close
+    assert (
+        allocator.get_used(strategy.strategy_id) == Decimal("0.006") * candles[-1].close
+    )
     assert len(strategy.contexts[1].latest_rejections) == 1
-    assert "capital_allocation_rejected" in strategy.contexts[1].latest_rejections[0].reason
+    assert (
+        "capital_allocation_rejected"
+        in strategy.contexts[1].latest_rejections[0].reason
+    )
 
 
 @pytest.mark.rust
@@ -844,14 +931,19 @@ def test_research_runner_reserves_capital_for_pending_entry_orders():
     result = runner.run()
 
     assert result["raw_trade_count"] == 0
-    assert allocator.get_used(strategy.strategy_id) == Decimal("0.006") * Decimal("49000")
+    assert allocator.get_used(strategy.strategy_id) == Decimal("0.006") * Decimal(
+        "49000"
+    )
     assert strategy.contexts[1].capital is not None
     assert strategy.contexts[1].capital.available == (
         Decimal("500") - Decimal("0.006") * Decimal("49000")
     )
     assert strategy.contexts[1].latest_rejections == ()
     assert len(strategy.contexts[2].latest_rejections) == 1
-    assert "capital_allocation_rejected" in strategy.contexts[2].latest_rejections[0].reason
+    assert (
+        "capital_allocation_rejected"
+        in strategy.contexts[2].latest_rejections[0].reason
+    )
 
 
 @pytest.mark.rust

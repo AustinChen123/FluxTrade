@@ -22,7 +22,7 @@ import sys
 import threading
 from types import SimpleNamespace
 from typing import Any
-from unittest.mock import MagicMock, call, patch
+from unittest.mock import MagicMock, call, patch, sentinel
 
 import pytest
 
@@ -2462,6 +2462,67 @@ class TestOnMarketData:
 
         engine.execution_engine.process_market_data.assert_not_called()
         engine._signal_processor.on_candle.assert_called_once_with(decision_candle)
+
+    def test_split_backtest_accumulates_fills_until_one_decision_and_clears(
+        self,
+        engine,
+    ):
+        engine.runtime_environment = RuntimeEnvironment("test")
+        engine._strategy_context_loader_enabled = True
+        first = _make_candle(timeframe="1m")
+        second = first.model_copy(update={"timestamp": first.timestamp + 60_000})
+        decision = _make_candle(timeframe="5m").model_copy(
+            update={"timestamp": second.timestamp}
+        )
+        first_fill = {"order": sentinel.first_order}
+        second_fill = {"order": sentinel.second_order}
+        engine.execution_engine.process_market_data = MagicMock(
+            side_effect=[[first_fill], [second_fill]]
+        )
+        engine._signal_processor.on_candle = MagicMock()
+
+        engine.on_backtest_market_data(first)
+        engine.on_backtest_market_data(second, decision)
+        engine.on_backtest_decision_candle(
+            decision.model_copy(update={"timestamp": decision.timestamp + 300_000})
+        )
+
+        first_decision_fills = engine._signal_processor.on_candle.call_args_list[
+            0
+        ].kwargs["latest_fills"]
+        assert first_decision_fills == (
+            {"order": sentinel.first_order, "timestamp": first.timestamp},
+            {"order": sentinel.second_order, "timestamp": second.timestamp},
+        )
+        assert (
+            engine._signal_processor.on_candle.call_args_list[1].kwargs["latest_fills"]
+            == ()
+        )
+
+    def test_split_backtest_retains_fills_when_decision_dispatch_fails(self, engine):
+        engine.runtime_environment = RuntimeEnvironment("test")
+        engine._strategy_context_loader_enabled = True
+        execution_candle = _make_candle(timeframe="1m")
+        decision_candle = _make_candle(timeframe="5m")
+        fill = {"order": sentinel.order}
+        engine.execution_engine.process_market_data = MagicMock(return_value=[fill])
+        engine._signal_processor.on_candle = MagicMock(
+            side_effect=RuntimeError("decision failed")
+        )
+
+        with pytest.raises(RuntimeError, match="decision failed"):
+            engine.on_backtest_market_data(execution_candle, decision_candle)
+
+        engine._signal_processor.on_candle = MagicMock()
+        engine.on_backtest_decision_candle(decision_candle)
+
+        engine._signal_processor.on_candle.assert_called_once_with(
+            decision_candle,
+            latest_fills=(
+                {"order": sentinel.order, "timestamp": execution_candle.timestamp},
+            ),
+        )
+        assert engine._pending_backtest_context_fills == []
 
     def test_async_backtest_decision_is_rejected_in_live_runtime(self, engine):
         engine.runtime_environment = RuntimeEnvironment("live")

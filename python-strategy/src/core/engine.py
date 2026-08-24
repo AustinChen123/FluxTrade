@@ -62,7 +62,7 @@ from src.core.ops_safety import OpsSafetyService
 from src.core.ops_command_service import OpsCommandService
 from src.core.runtime_reconcile import PositionAuthorityState, RuntimeReconciliationJob
 from src.core.runtime_artifact_registry import RuntimeArtifactRegistry
-from src.core.signal_processor import SignalProcessor
+from src.core.signal_processor import SignalProcessor, StrategyContextLoader
 from src.core.signal_execution_service import SignalExecutionService
 from src.core.strategy_registry import StrategyRegistry
 from src.core.strategy_artifact_discovery import synchronize_strategy_artifacts
@@ -185,6 +185,7 @@ class StrategyEngine:
         is_backtest: bool | None = None,
         leadership_guard: Callable[[], None] | None = None,
         signal_batch_observer: Callable[[tuple[Signal, ...]], None] | None = None,
+        strategy_context_loader: StrategyContextLoader | None = None,
         runtime_bootstrap_factory: RuntimeBootstrapFactory | None = None,
         runtime_capabilities_factory: RuntimeCapabilitiesFactory | None = None,
         strategy_artifact_loader: Callable[
@@ -216,6 +217,8 @@ class StrategyEngine:
         self._market_processing_lock = threading.Lock()
         self._boot_id = uuid.uuid4().hex
         self._boot_started = False
+        self._strategy_context_loader_enabled = strategy_context_loader is not None
+        self._pending_backtest_context_fills: list[dict] = []
         self._leadership_guard = leadership_guard or (lambda: None)
         self.runtime_environment = RuntimeEnvironment.from_env()
         self._live_candle_application = LiveCandleApplicationService(
@@ -401,6 +404,7 @@ class StrategyEngine:
             exposure_loader=self.execution_engine.portfolio_exposure_snapshot,
             portfolio_coordinator=self._portfolio_coordinator,
             signal_batch_observer=signal_batch_observer,
+            strategy_context_loader=strategy_context_loader,
         )
         self._strategy_hydration = StrategyHydrationService(
             signal_processor=self._signal_processor,
@@ -1192,8 +1196,23 @@ class StrategyEngine:
         return (artifact_cls(strategy_id, product_id),)
 
     def _apply_unpersisted_candle(self, candle: Candlestick) -> None:
-        self.execution_engine.process_market_data(candle)
-        self._signal_processor.on_candle(candle)
+        fills = self.execution_engine.process_market_data(candle)
+        if self._strategy_context_loader_enabled:
+            self._signal_processor.on_candle(
+                candle,
+                latest_fills=self._timestamped_fills(fills, candle.timestamp),
+            )
+        else:
+            self._signal_processor.on_candle(candle)
+
+    @staticmethod
+    def _timestamped_fills(
+        fills: object,
+        timestamp: int,
+    ) -> tuple[dict, ...]:
+        if not isinstance(fills, list):
+            return ()
+        return tuple({**fill, "timestamp": timestamp} for fill in fills)
 
     def replay_pending_market_data(
         self,
@@ -1538,16 +1557,34 @@ class StrategyEngine:
         if self.runtime_environment.identity == "live":
             raise RuntimeError("split market routing is backtest-only")
         with self._market_processing_lock:
-            self.execution_engine.process_market_data(execution_candle)
+            fills = self.execution_engine.process_market_data(execution_candle)
+            if self._strategy_context_loader_enabled:
+                self._pending_backtest_context_fills.extend(
+                    self._timestamped_fills(fills, execution_candle.timestamp)
+                )
             if decision_candle is not None:
-                self._signal_processor.on_candle(decision_candle)
+                if self._strategy_context_loader_enabled:
+                    self._signal_processor.on_candle(
+                        decision_candle,
+                        latest_fills=tuple(self._pending_backtest_context_fills),
+                    )
+                    self._pending_backtest_context_fills.clear()
+                else:
+                    self._signal_processor.on_candle(decision_candle)
 
     def on_backtest_decision_candle(self, decision_candle: Candlestick) -> None:
         """Apply an asynchronously delivered completed decision candle."""
         if self.runtime_environment.identity == "live":
             raise RuntimeError("split market routing is backtest-only")
         with self._market_processing_lock:
-            self._signal_processor.on_candle(decision_candle)
+            if self._strategy_context_loader_enabled:
+                self._signal_processor.on_candle(
+                    decision_candle,
+                    latest_fills=tuple(self._pending_backtest_context_fills),
+                )
+                self._pending_backtest_context_fills.clear()
+            else:
+                self._signal_processor.on_candle(decision_candle)
 
     def process_signal(
         self,

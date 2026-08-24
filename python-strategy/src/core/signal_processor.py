@@ -3,9 +3,12 @@
 from __future__ import annotations
 
 import logging
+import inspect
+import weakref
 from contextlib import nullcontext
 from collections.abc import Callable
 from decimal import Decimal
+from enum import Enum
 from typing import Any, Mapping, Optional
 
 from src.core.client_order_id import market_signal_client_order_id
@@ -16,15 +19,82 @@ from src.core.portfolio_runtime import (
     PortfolioExposureSnapshot,
 )
 from src.core.strategy_registry import StrategyRegistry
+from src.core.strategy_context import StrategyContext
 from src.strategies.base import BaseStrategy
 
 logger = logging.getLogger(__name__)
+
+StrategyContextLoader = Callable[
+    [BaseStrategy, Candlestick, tuple[dict[str, Any], ...]],
+    StrategyContext,
+]
 
 
 class SignalObserverError(RuntimeError):
     """Report a finalized signal observer failure before execution."""
 
     stage = "post_coordination_pre_execution"
+
+
+class StrategyContextInvocationMode(str, Enum):
+    """Deterministic strategy context invocation contract."""
+
+    NONE = "none"
+    POSITIONAL = "positional"
+    KEYWORD = "keyword"
+
+
+def strategy_context_invocation_mode(
+    strategy: BaseStrategy,
+) -> StrategyContextInvocationMode:
+    """Classify one bound on_candle method without invoking strategy code."""
+    signature = inspect.signature(strategy.on_candle)
+    context_parameter = signature.parameters.get("context")
+    if context_parameter is not None:
+        if context_parameter.kind == inspect.Parameter.KEYWORD_ONLY:
+            return StrategyContextInvocationMode.KEYWORD
+        if context_parameter.kind in (
+            inspect.Parameter.POSITIONAL_ONLY,
+            inspect.Parameter.POSITIONAL_OR_KEYWORD,
+        ):
+            return StrategyContextInvocationMode.POSITIONAL
+    parameters = tuple(signature.parameters.values())
+    if any(parameter.kind == inspect.Parameter.VAR_KEYWORD for parameter in parameters):
+        return StrategyContextInvocationMode.KEYWORD
+    if any(
+        parameter.kind == inspect.Parameter.VAR_POSITIONAL for parameter in parameters
+    ):
+        return StrategyContextInvocationMode.POSITIONAL
+    positional = tuple(
+        parameter
+        for parameter in parameters
+        if parameter.kind
+        in (
+            inspect.Parameter.POSITIONAL_ONLY,
+            inspect.Parameter.POSITIONAL_OR_KEYWORD,
+        )
+    )
+    if len(positional) >= 2:
+        return StrategyContextInvocationMode.POSITIONAL
+    return StrategyContextInvocationMode.NONE
+
+
+def invoke_strategy_on_candle(
+    strategy: BaseStrategy,
+    candle: Candlestick,
+    context: StrategyContext | None,
+    mode: StrategyContextInvocationMode | None = None,
+) -> Signal | list[Signal] | None:
+    """Invoke one strategy according to its pre-classified call contract."""
+    if context is None:
+        return strategy.on_candle(candle)
+    if mode is None:
+        mode = strategy_context_invocation_mode(strategy)
+    if mode is StrategyContextInvocationMode.NONE:
+        return strategy.on_candle(candle)
+    if mode is StrategyContextInvocationMode.KEYWORD:
+        return strategy.on_candle(candle, context=context)
+    return strategy.on_candle(candle, context)
 
 
 def apply_strategy_position_state(
@@ -79,6 +149,7 @@ class SignalProcessor:
         portfolio_coordinator: PortfolioCoordinator | None = None,
         signal_batch_observer: Callable[[tuple[Signal, ...]], None] | None = None,
         entry_admission_handler: Callable[[Signal], bool] | None = None,
+        strategy_context_loader: StrategyContextLoader | None = None,
     ) -> None:
         self.registry = registry
         self.execution_engine = execution_engine
@@ -89,7 +160,15 @@ class SignalProcessor:
         self.portfolio_coordinator = portfolio_coordinator
         self.signal_batch_observer = signal_batch_observer
         self.entry_admission_handler = entry_admission_handler
+        self.strategy_context_loader = strategy_context_loader
         self._observed_position_sides: dict[tuple[str, str], str | None] = {}
+        self._context_invocation_modes: dict[
+            str,
+            tuple[
+                weakref.ReferenceType[BaseStrategy],
+                StrategyContextInvocationMode,
+            ],
+        ] = {}
 
     def on_candle(
         self,
@@ -97,6 +176,7 @@ class SignalProcessor:
         *,
         emit_signals: bool = True,
         respect_state: bool = True,
+        latest_fills: tuple[dict[str, Any], ...] = (),
     ) -> None:
         """Route a candle to matching, running strategies.
 
@@ -141,7 +221,22 @@ class SignalProcessor:
                     and self.portfolio_coordinator is not None
                 ):
                     decision_state_transaction.capture(strategy)
-                signals = self._dispatch_to_strategy(strategy, candle)
+                invocation_mode = None
+                context = None
+                if self.strategy_context_loader is not None:
+                    invocation_mode = self._context_invocation_mode(strategy)
+                    if invocation_mode is not StrategyContextInvocationMode.NONE:
+                        context = self.strategy_context_loader(
+                            strategy,
+                            candle,
+                            latest_fills,
+                        )
+                signals = self._dispatch_to_strategy(
+                    strategy,
+                    candle,
+                    context,
+                    invocation_mode=invocation_mode,
+                )
                 decisions.append((strategy.strategy_id, signals))
 
             if emit_signals:
@@ -280,7 +375,9 @@ class SignalProcessor:
                 assert generic_trade_state is not None
                 self._restore_trade_state(strategy, generic_trade_state)
 
-    def set_position_state(self, strategy: BaseStrategy, position_side: str | None) -> bool:
+    def set_position_state(
+        self, strategy: BaseStrategy, position_side: str | None
+    ) -> bool:
         """Align strategy trade-state with the actual account position.
 
         Hook contract: True = synced, False = side unsupported (caller fails
@@ -419,9 +516,7 @@ class SignalProcessor:
             for strategy_id, _signal in decisions
             if (
                 self.portfolio_coordinator is not None
-                and self.portfolio_coordinator.portfolio_id_for_sleeve(
-                    strategy_id
-                )
+                and self.portfolio_coordinator.portfolio_id_for_sleeve(strategy_id)
                 is not None
             )
         ]
@@ -506,13 +601,42 @@ class SignalProcessor:
             return strategy_id
         return self.portfolio_coordinator.lifecycle_id_for_strategy(strategy_id)
 
+    def _context_invocation_mode(
+        self,
+        strategy: BaseStrategy,
+    ) -> StrategyContextInvocationMode:
+        cached = self._context_invocation_modes.get(strategy.strategy_id)
+        if cached is not None and cached[0]() is strategy:
+            return cached[1]
+        mode = strategy_context_invocation_mode(strategy)
+        strategy_id = strategy.strategy_id
+
+        def remove_stale_reference(
+            reference: weakref.ReferenceType[BaseStrategy],
+        ) -> None:
+            current = self._context_invocation_modes.get(strategy_id)
+            if current is not None and current[0] is reference:
+                self._context_invocation_modes.pop(strategy_id, None)
+
+        self._context_invocation_modes[strategy_id] = (
+            weakref.ref(strategy, remove_stale_reference),
+            mode,
+        )
+        return mode
+
     def _dispatch_to_strategy(
         self,
         strategy: BaseStrategy,
         candle: Candlestick,
+        context: StrategyContext | None = None,
+        *,
+        invocation_mode: StrategyContextInvocationMode | None = None,
     ) -> list[Signal]:
         """Call strategy.on_candle() and normalize the result."""
-        result = strategy.on_candle(candle)
+        mode = invocation_mode
+        if context is not None and mode is None:
+            mode = self._context_invocation_mode(strategy)
+        result = invoke_strategy_on_candle(strategy, candle, context, mode)
         if result is None:
             return []
         if isinstance(result, Signal):
@@ -544,14 +668,11 @@ class SignalProcessor:
                 if (
                     submitted is False
                     and self.portfolio_coordinator is not None
-                    and self.portfolio_coordinator.portfolio_id_for_sleeve(
-                        strategy_id
-                    )
+                    and self.portfolio_coordinator.portfolio_id_for_sleeve(strategy_id)
                     is not None
                 ):
                     raise PortfolioDecisionRejected(
-                        "portfolio_submission_rejected:"
-                        f"strategy_id={strategy_id}"
+                        f"portfolio_submission_rejected:strategy_id={strategy_id}"
                     )
             else:
                 self.execution_engine.execute_signal(signal, candle)
@@ -579,8 +700,6 @@ class SignalProcessor:
             requested_client_order_id is not None
             and requested_client_order_id != derived_client_order_id
         ):
-            metadata["requested_client_order_id"] = str(
-                requested_client_order_id
-            )
+            metadata["requested_client_order_id"] = str(requested_client_order_id)
         metadata["client_order_id"] = derived_client_order_id
         return signal.model_copy(update={"metadata": metadata})

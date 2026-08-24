@@ -2,7 +2,11 @@ import inspect
 import uuid
 from decimal import Decimal
 from typing import TYPE_CHECKING, Optional, List, Dict, Sequence
-from src.core.interfaces.exchange import ExchangeError, ExchangeOrderSnapshot, IExchangeAdapter
+from src.core.interfaces.exchange import (
+    ExchangeError,
+    ExchangeOrderSnapshot,
+    IExchangeAdapter,
+)
 from src.core.orm_models import Order
 from src.core.models import OrderSide, Position, Candlestick, PositionSide
 from src.core.precision import PrecisionCodec
@@ -81,8 +85,12 @@ class SimulatedAdapter(IExchangeAdapter):
         self._contract_multiplier = contract_multiplier
         self._precision_codec = precision_codec
         if precision_codec is not None:
-            if RustScaledCandlestick is None or not hasattr(self._engine, "on_scaled_candle"):
-                raise RuntimeError("compiled Rust engine does not support scaled candle matching")
+            if RustScaledCandlestick is None or not hasattr(
+                self._engine, "on_scaled_candle"
+            ):
+                raise RuntimeError(
+                    "compiled Rust engine does not support scaled candle matching"
+                )
             self._engine.set_scaled_precision(
                 str(precision_codec.spec.price_tick),
                 str(precision_codec.spec.quantity_step),
@@ -97,7 +105,10 @@ class SimulatedAdapter(IExchangeAdapter):
         return self._rust_supports_strategy_id
 
     def get_instrument_spec(self, product_id: str) -> InstrumentSpec | None:
-        if self._instrument_spec is None or self._instrument_spec.product_id != product_id:
+        if (
+            self._instrument_spec is None
+            or self._instrument_spec.product_id != product_id
+        ):
             return None
         return self._instrument_spec
 
@@ -188,7 +199,10 @@ class SimulatedAdapter(IExchangeAdapter):
         order_type: Optional[str] = None,
     ) -> Optional[ExchangeOrderSnapshot]:
         for orm_order in self._order_map.values():
-            if orm_order.client_order_id == client_order_id and orm_order.product_id == product_id:
+            if (
+                orm_order.client_order_id == client_order_id
+                and orm_order.product_id == product_id
+            ):
                 return ExchangeOrderSnapshot(
                     client_order_id=client_order_id,
                     exchange_order_id=orm_order.exchange_order_id,
@@ -200,7 +214,9 @@ class SimulatedAdapter(IExchangeAdapter):
     def get_balance(self, asset: str = "USDT") -> Decimal:
         return Decimal(self._engine.balance)
 
-    def get_position(self, product_id: str, strategy_id: Optional[str] = None) -> Optional[Position]:
+    def get_position(
+        self, product_id: str, strategy_id: Optional[str] = None
+    ) -> Optional[Position]:
         rust_positions = self._engine.positions
 
         rust_pos = None
@@ -315,7 +331,9 @@ class SimulatedAdapter(IExchangeAdapter):
             if position
             else None
         )
-        unrealized_pnl = position_snapshot.unrealized_pnl if position_snapshot else Decimal("0")
+        unrealized_pnl = (
+            position_snapshot.unrealized_pnl if position_snapshot else Decimal("0")
+        )
         total_equity = cash + unrealized_pnl
         realized_pnl = total_equity - Decimal(str(initial_balance))
         if peak_equity is None or peak_equity <= 0:
@@ -334,10 +352,16 @@ class SimulatedAdapter(IExchangeAdapter):
             current_drawdown=current_drawdown,
             max_drawdown=max_drawdown,
             position=position_snapshot,
-            open_orders=tuple(_order_snapshot(order) for order in self.get_open_orders(product_id, strategy_id)),
+            open_orders=tuple(
+                _order_snapshot(order)
+                for order in self.get_open_orders(product_id, strategy_id)
+            ),
             latest_fills=tuple(
-                _fill_snapshot(fill, timestamp) for fill in latest_fills or []
+                _fill_snapshot(fill, timestamp)
+                for fill in latest_fills or []
                 if fill.get("order") is not None
+                and fill["order"].strategy_id == strategy_id
+                and fill["order"].product_id == product_id
             ),
             latest_rejections=latest_rejections,
             risk=risk,
@@ -369,7 +393,9 @@ class SimulatedAdapter(IExchangeAdapter):
     def on_prepared_market_data(self, scaled_candle) -> List[Dict]:
         """Process a pre-encoded scaled candle through the Rust matching engine."""
         if self._precision_codec is None:
-            raise RuntimeError("precision codec is required for prepared scaled candles")
+            raise RuntimeError(
+                "precision codec is required for prepared scaled candles"
+            )
         rust_fills = self._engine.on_scaled_candle(scaled_candle)
         return self._fills_from_rust(rust_fills)
 
@@ -379,13 +405,15 @@ class SimulatedAdapter(IExchangeAdapter):
             orm_order = self._order_map.pop(rf.order_id, None)
             if orm_order is None:
                 continue
-            fills.append({
-                "order": orm_order,
-                "price": Decimal(rf.price),
-                "quantity": Decimal(rf.quantity),
-                "fee": Decimal(rf.fee),
-                "fill_type": rf.fill_type,
-            })
+            fills.append(
+                {
+                    "order": orm_order,
+                    "price": Decimal(rf.price),
+                    "quantity": Decimal(rf.quantity),
+                    "fee": Decimal(rf.fee),
+                    "fill_type": rf.fill_type,
+                }
+            )
 
         # Sync _order_map: remove orders cancelled by Rust (e.g. OCO)
         if fills:
@@ -426,14 +454,19 @@ class SimulatedAdapter(IExchangeAdapter):
         # ORM: side="sell" means "sell to close long" → Rust side="LONG"
         # ORM: side="buy" means "buy to close short" → Rust side="SHORT"
         if order_type in ("STOP_LOSS", "TAKE_PROFIT", "TRAILING_STOP"):
-            side = PositionSide.LONG if side == PositionSide.SHORT else PositionSide.SHORT
+            side = (
+                PositionSide.LONG if side == PositionSide.SHORT else PositionSide.SHORT
+            )
 
         trigger_price = None
         if order.trigger_price is not None:
             trigger_price = str(order.trigger_price)
 
         trailing_distance = None
-        if hasattr(order, "_trailing_distance") and order._trailing_distance is not None:
+        if (
+            hasattr(order, "_trailing_distance")
+            and order._trailing_distance is not None
+        ):
             trailing_distance = str(order._trailing_distance)
 
         linked_order_id = None
@@ -534,9 +567,7 @@ def _position_from_rust(
     ):
         return None
     resolved_strategy_id = (
-        strategy_id
-        or getattr(rust_position, "strategy_id", "")
-        or ""
+        strategy_id or getattr(rust_position, "strategy_id", "") or ""
     )
     return Position(
         strategy_id=resolved_strategy_id,
@@ -570,7 +601,7 @@ def _fill_snapshot(fill: Dict, timestamp: int) -> FillSnapshot:
         price=fill["price"],
         quantity=fill["quantity"],
         fee=fill.get("fee") or Decimal("0"),
-        timestamp=timestamp,
+        timestamp=int(fill.get("timestamp", timestamp)),
     )
 
 

@@ -10,13 +10,13 @@ from __future__ import annotations
 
 import logging
 import uuid
-import inspect
 from dataclasses import dataclass, replace
 from decimal import Decimal
 from typing import TYPE_CHECKING, Any, Iterable, Mapping, Optional, Sequence, cast
 
 from src.core.adapters.simulated import SimulatedAdapter
 from src.core.analytics import (
+    InitialBalanceInput,
     annualized_sharpe_from_moments,
     calculate_metrics,
     utc_daily_return_metrics,
@@ -45,7 +45,12 @@ from src.core.signal_order_intent import (
     resolve_signal_order_intent,
 )
 from src.core.strategy_context import RejectionSnapshot, StrategyContext
-from src.core.signal_processor import apply_strategy_position_state
+from src.core.signal_processor import (
+    StrategyContextInvocationMode,
+    apply_strategy_position_state,
+    invoke_strategy_on_candle,
+    strategy_context_invocation_mode,
+)
 from src.strategies.base import BaseStrategy
 
 if TYPE_CHECKING:
@@ -95,7 +100,7 @@ class ResearchBacktestRunner:
         end_time: int,
         product_id: str,
         timeframe: str,
-        initial_balance: float = 10000.0,
+        initial_balance: InitialBalanceInput = Decimal("10000"),
         data_source: Optional[IDataSource] = None,
         fee_config: Mapping[str, Decimal | float] | None = None,
         max_drawdown_limit: Optional[float] = None,
@@ -146,8 +151,8 @@ class ResearchBacktestRunner:
         self._ensure_capital_allocator_supported(adapter)
         trades: list[ResearchTrade] = []
         stop_drawdown_amount = self._stop_drawdown_amount()
-        context_support = {
-            strategy.strategy_id: _strategy_accepts_context(strategy)
+        context_invocation_modes = {
+            id(strategy): strategy_context_invocation_mode(strategy)
             for strategy in self._strategies
         }
         initial_equity = Decimal(str(self.initial_balance))
@@ -213,11 +218,11 @@ class ResearchBacktestRunner:
                     max_drawdown_by_strategy=max_drawdown_by_strategy,
                 )
                 contexts.append(context)
-                decision_context = None
-                if context_support[strategy.strategy_id]:
-                    decision_context = context
                 signals = self._signals_from_strategy(
-                    strategy, candle, decision_context
+                    strategy,
+                    candle,
+                    context,
+                    context_invocation_modes[id(strategy)],
                 )
                 for signal in signals:
                     if signal.type == SignalType.NO_SIGNAL:
@@ -517,11 +522,14 @@ class ResearchBacktestRunner:
         strategy: BaseStrategy,
         candle: Candlestick,
         context: StrategyContext | None = None,
+        invocation_mode: StrategyContextInvocationMode | None = None,
     ) -> list[Signal]:
-        if context is not None:
-            result = strategy.on_candle(candle, context)
-        else:
-            result = strategy.on_candle(candle)
+        result = invoke_strategy_on_candle(
+            strategy,
+            candle,
+            context,
+            invocation_mode,
+        )
         if result is None:
             return []
         if isinstance(result, Signal):
@@ -790,19 +798,3 @@ class ResearchBacktestRunner:
         if signal_type == SignalType.EXIT_SHORT:
             return OrderSide.BUY
         return None
-
-
-def _strategy_accepts_context(strategy: BaseStrategy) -> bool:
-    signature = inspect.signature(strategy.on_candle)
-    parameters = list(signature.parameters.values())
-    if any(parameter.kind == inspect.Parameter.VAR_KEYWORD for parameter in parameters):
-        return True
-    if "context" in signature.parameters:
-        return True
-    positional = [
-        parameter
-        for parameter in parameters
-        if parameter.kind
-        in (inspect.Parameter.POSITIONAL_ONLY, inspect.Parameter.POSITIONAL_OR_KEYWORD)
-    ]
-    return len(positional) >= 2
