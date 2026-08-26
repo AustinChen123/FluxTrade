@@ -1,9 +1,9 @@
 import type { EChartsCoreOption } from "echarts/core";
 
-import { finiteDecimalNumber } from "../../decimal";
-import type { Locale } from "../../i18n";
-import type { Theme } from "../../theme";
-import { parseUtcTimestamp } from "../../utc";
+import { finiteDecimalNumber } from "../../shared/format/decimal";
+import type { Locale } from "../../shared/i18n";
+import type { Theme } from "../../shared/theme";
+import { parseUtcTimestamp } from "../../shared/time/utc";
 import type { BacktestResultSnapshot } from "./resultsModel";
 
 function displayTimestamp(

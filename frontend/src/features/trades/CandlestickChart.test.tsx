@@ -25,7 +25,7 @@ vi.mock("echarts/charts", () => ({
   CandlestickChart: chartModules.CandlestickSeries,
   ScatterChart: chartModules.ScatterChart
 }));
-vi.mock("../../EChartCore", () => ({
+vi.mock("../../shared/charts/EChartCore", () => ({
   EChartCore: (props: { ariaLabel: string }) => {
     renderCore(props);
     return <div role="img" aria-label={props.ariaLabel} />;

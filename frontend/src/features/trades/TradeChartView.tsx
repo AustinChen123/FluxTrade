@@ -1,10 +1,13 @@
 import { lazy, Suspense, useMemo, useState } from "react";
 import { useTranslation } from "react-i18next";
 
-import { finiteDecimalNumber, isDecimalString } from "../../decimal";
-import type { Locale } from "../../i18n";
-import type { Theme } from "../../theme";
-import { parseUtcTimestamp } from "../../utc";
+import {
+  finiteDecimalNumber,
+  isDecimalString
+} from "../../shared/format/decimal";
+import type { Locale } from "../../shared/i18n";
+import type { Theme } from "../../shared/theme";
+import { parseUtcTimestamp } from "../../shared/time/utc";
 import { demoTradeSnapshot } from "./demo";
 import {
   selectedTradeOption,

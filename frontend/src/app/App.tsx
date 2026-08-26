@@ -10,13 +10,13 @@ import {
   ResearchRoute,
   type ResearchSlots
 } from "../features/research/ResearchRoute";
-import type { Locale } from "../i18n";
+import type { Locale } from "../shared/i18n";
 import {
   applyTheme,
   initialTheme,
   saveTheme,
   type Theme
-} from "../theme";
+} from "../shared/theme";
 import {
   parseDemoMode,
   parseNavigation,

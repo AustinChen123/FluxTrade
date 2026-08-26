@@ -9,14 +9,14 @@ import {
 } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
-import i18n from "../../i18n";
+import i18n from "../../shared/i18n";
 import { BacktestResultsView } from "./BacktestResultsView";
 import { demoBacktestSnapshot } from "./demo";
 import type { BacktestResultSnapshot } from "./resultsModel";
 
 const chartState = vi.hoisted(() => ({ option: null as unknown }));
 
-vi.mock("../../EChart", () => ({
+vi.mock("../../shared/charts/EChart", () => ({
   EChart: ({
     ariaLabel,
     option

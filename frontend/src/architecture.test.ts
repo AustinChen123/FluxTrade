@@ -79,9 +79,6 @@ const executableExtensions = new Set([
 let compilerFixtureSequence = 0;
 
 const expectedInventory = [
-  "EChart.test.tsx",
-  "EChart.tsx",
-  "EChartCore.tsx",
   "api.test.ts",
   "api.ts",
   "app/App.test.tsx",
@@ -89,7 +86,6 @@ const expectedInventory = [
   "app/navigation.test.ts",
   "app/navigation.ts",
   "architecture.test.ts",
-  "decimal.ts",
   "features/research/FitnessSurface3D.test.tsx",
   "features/research/FitnessSurface3D.tsx",
   "features/research/ResearchPage.test.tsx",
@@ -134,12 +130,30 @@ const expectedInventory = [
   "features/trades/tradeCharts.ts",
   "features/trades/tradeModel.test.ts",
   "features/trades/tradeModel.ts",
-  "i18n.ts",
   "main.tsx",
+  "shared/charts/EChart.test.tsx",
+  "shared/charts/EChart.tsx",
+  "shared/charts/EChartCore.tsx",
+  "shared/format/decimal.test.ts",
+  "shared/format/decimal.ts",
+  "shared/i18n.test.ts",
+  "shared/i18n.ts",
+  "shared/locales/en.ts",
+  "shared/locales/resources.test.ts",
+  "shared/locales/zh-TW.ts",
+  "shared/theme.test.ts",
+  "shared/theme.ts",
+  "shared/time/utc.test.ts",
+  "shared/time/utc.ts",
   "shared/trading/closedTrade.ts",
-  "styles.css",
-  "theme.ts",
-  "utc.ts",
+  "styles/index.css",
+  "styles/research.css",
+  "styles/responsive.css",
+  "styles/results.css",
+  "styles/shell.css",
+  "styles/strategies.css",
+  "styles/tokens.css",
+  "styles/trades.css",
   "vite-env.d.ts"
 ] as const;
 
@@ -160,15 +174,6 @@ const expectedBareImportLedger = [
   "architecture.test.ts|typescript/unstable/ast|value",
   "architecture.test.ts|typescript/unstable/sync|value",
   "architecture.test.ts|vitest|value",
-  "EChart.test.tsx|@testing-library/react|value",
-  "EChart.test.tsx|vitest|value",
-  "EChart.tsx|echarts/charts|value",
-  "EChart.tsx|echarts/components|value",
-  "EChart.tsx|echarts/core|value",
-  "EChartCore.tsx|echarts/core|type-only",
-  "EChartCore.tsx|echarts/core|value",
-  "EChartCore.tsx|echarts/renderers|value",
-  "EChartCore.tsx|react|value",
   "features/research/demo.test.ts|vitest|value",
   "features/research/FitnessSurface3D.test.tsx|@testing-library/react|value",
   "features/research/FitnessSurface3D.test.tsx|vitest|value",
@@ -226,40 +231,52 @@ const expectedBareImportLedger = [
   "features/trades/TradeChartView.tsx|react-i18next|value",
   "features/trades/TradeChartView.tsx|react|value",
   "features/trades/tradeModel.test.ts|vitest|value",
-  "i18n.ts|i18next|value",
-  "i18n.ts|react-i18next|value",
   "main.tsx|react-dom/client|value",
-  "main.tsx|react|value"
+  "main.tsx|react|value",
+  "shared/charts/EChart.test.tsx|@testing-library/react|value",
+  "shared/charts/EChart.test.tsx|vitest|value",
+  "shared/charts/EChart.tsx|echarts/charts|value",
+  "shared/charts/EChart.tsx|echarts/components|value",
+  "shared/charts/EChart.tsx|echarts/core|value",
+  "shared/charts/EChartCore.tsx|echarts/core|type-only",
+  "shared/charts/EChartCore.tsx|echarts/core|value",
+  "shared/charts/EChartCore.tsx|echarts/renderers|value",
+  "shared/charts/EChartCore.tsx|react|value",
+  "shared/format/decimal.test.ts|vitest|value",
+  "shared/i18n.test.ts|vitest|value",
+  "shared/i18n.ts|i18next|value",
+  "shared/i18n.ts|react-i18next|value",
+  "shared/locales/resources.test.ts|vitest|value",
+  "shared/theme.test.ts|vitest|value",
+  "shared/time/utc.test.ts|vitest|value"
 ] as const;
 
 const expectedRelativeImportLedger = [
   "api.test.ts|./api|value|api.ts",
   "app/App.test.tsx|../api|type-only|api.ts",
   "app/App.test.tsx|../api|type-only|api.ts",
-  "app/App.test.tsx|../i18n|value|i18n.ts",
+  "app/App.test.tsx|../shared/i18n|value|shared/i18n.ts",
   "app/App.test.tsx|./App|value|app/App.tsx",
   "app/App.tsx|../features/research/ResearchRoute|value|features/research/ResearchRoute.tsx",
   "app/App.tsx|../features/results/BacktestResultsView|value|features/results/BacktestResultsView.tsx",
   "app/App.tsx|../features/strategies/StrategyManager|value|features/strategies/StrategyManager.tsx",
   "app/App.tsx|../features/trades/TradeChartView|value|features/trades/TradeChartView.tsx",
-  "app/App.tsx|../i18n|type-only|i18n.ts",
-  "app/App.tsx|../theme|value|theme.ts",
+  "app/App.tsx|../shared/i18n|type-only|shared/i18n.ts",
+  "app/App.tsx|../shared/theme|value|shared/theme.ts",
   "app/App.tsx|./navigation|value|app/navigation.ts",
   "app/navigation.test.ts|./navigation|value|app/navigation.ts",
-  "EChart.test.tsx|./EChart|value|EChart.tsx",
-  "EChart.tsx|./EChartCore|value|EChartCore.tsx",
   "features/research/demo.test.ts|./demo|value|features/research/demo.ts",
   "features/research/demo.ts|../../api|type-only|api.ts",
   "features/research/FitnessSurface3D.test.tsx|./FitnessSurface3D|value|features/research/FitnessSurface3D.tsx",
   "features/research/FitnessSurface3D.test.tsx|./gaDomain|type-only|features/research/gaDomain.ts",
-  "features/research/FitnessSurface3D.tsx|../../theme|type-only|theme.ts",
+  "features/research/FitnessSurface3D.tsx|../../shared/theme|type-only|shared/theme.ts",
   "features/research/FitnessSurface3D.tsx|./gaDomain|type-only|features/research/gaDomain.ts",
   "features/research/gaCharts.test.ts|../../api|type-only|api.ts",
   "features/research/gaCharts.test.ts|./demo|value|features/research/demo.ts",
   "features/research/gaCharts.test.ts|./gaCharts|value|features/research/gaCharts.ts",
   "features/research/gaCharts.test.ts|./gaDomain|value|features/research/gaDomain.ts",
   "features/research/gaCharts.ts|../../api|type-only|api.ts",
-  "features/research/gaCharts.ts|../../theme|type-only|theme.ts",
+  "features/research/gaCharts.ts|../../shared/theme|type-only|shared/theme.ts",
   "features/research/gaCharts.ts|./gaDomain|value|features/research/gaDomain.ts",
   "features/research/gaDomain.test.ts|../../api|type-only|api.ts",
   "features/research/gaDomain.test.ts|./demo|value|features/research/demo.ts",
@@ -271,13 +288,13 @@ const expectedRelativeImportLedger = [
   "features/research/researchModel.ts|../../api|type-only|api.ts",
   "features/research/researchModel.ts|./gaDomain|value|features/research/gaDomain.ts",
   "features/research/ResearchPage.test.tsx|../../api|type-only|api.ts",
-  "features/research/ResearchPage.test.tsx|../../i18n|value|i18n.ts",
+  "features/research/ResearchPage.test.tsx|../../shared/i18n|value|shared/i18n.ts",
   "features/research/ResearchPage.test.tsx|./researchModel|value|features/research/researchModel.ts",
   "features/research/ResearchPage.test.tsx|./ResearchPage|value|features/research/ResearchPage.tsx",
   "features/research/ResearchPage.test.tsx|./useResearchWorkspace|type-only|features/research/useResearchWorkspace.ts",
   "features/research/ResearchPage.tsx|../../api|value|api.ts",
-  "features/research/ResearchPage.tsx|../../EChart|value|EChart.tsx",
-  "features/research/ResearchPage.tsx|../../theme|type-only|theme.ts",
+  "features/research/ResearchPage.tsx|../../shared/charts/EChart|value|shared/charts/EChart.tsx",
+  "features/research/ResearchPage.tsx|../../shared/theme|type-only|shared/theme.ts",
   "features/research/ResearchPage.tsx|./FitnessSurface3D|value|features/research/FitnessSurface3D.tsx",
   "features/research/ResearchPage.tsx|./gaCharts|type-only|features/research/gaCharts.ts",
   "features/research/ResearchPage.tsx|./gaDomain|type-only|features/research/gaDomain.ts",
@@ -285,10 +302,10 @@ const expectedRelativeImportLedger = [
   "features/research/ResearchPage.tsx|./useResearchWorkspace|type-only|features/research/useResearchWorkspace.ts",
   "features/research/ResearchRoute.test.tsx|../../api|type-only|api.ts",
   "features/research/ResearchRoute.test.tsx|../../api|type-only|api.ts",
-  "features/research/ResearchRoute.test.tsx|../../i18n|value|i18n.ts",
+  "features/research/ResearchRoute.test.tsx|../../shared/i18n|value|shared/i18n.ts",
   "features/research/ResearchRoute.test.tsx|./ResearchRoute|value|features/research/ResearchRoute.tsx",
-  "features/research/ResearchRoute.tsx|../../i18n|type-only|i18n.ts",
-  "features/research/ResearchRoute.tsx|../../theme|type-only|theme.ts",
+  "features/research/ResearchRoute.tsx|../../shared/i18n|type-only|shared/i18n.ts",
+  "features/research/ResearchRoute.tsx|../../shared/theme|type-only|shared/theme.ts",
   "features/research/ResearchRoute.tsx|./gaCharts|value|features/research/gaCharts.ts",
   "features/research/ResearchRoute.tsx|./gaDomain|value|features/research/gaDomain.ts",
   "features/research/ResearchRoute.tsx|./ResearchPage|value|features/research/ResearchPage.tsx",
@@ -300,15 +317,15 @@ const expectedRelativeImportLedger = [
   "features/research/useResearchWorkspace.ts|./demo|value|features/research/demo.ts",
   "features/research/useResearchWorkspace.ts|./gaDomain|value|features/research/gaDomain.ts",
   "features/research/useResearchWorkspace.ts|./researchModel|value|features/research/researchModel.ts",
-  "features/results/BacktestResultsView.test.tsx|../../i18n|value|i18n.ts",
+  "features/results/BacktestResultsView.test.tsx|../../shared/i18n|value|shared/i18n.ts",
   "features/results/BacktestResultsView.test.tsx|./BacktestResultsView|value|features/results/BacktestResultsView.tsx",
   "features/results/BacktestResultsView.test.tsx|./demo|value|features/results/demo.ts",
   "features/results/BacktestResultsView.test.tsx|./resultsModel|type-only|features/results/resultsModel.ts",
-  "features/results/BacktestResultsView.tsx|../../decimal|value|decimal.ts",
-  "features/results/BacktestResultsView.tsx|../../EChart|value|EChart.tsx",
-  "features/results/BacktestResultsView.tsx|../../i18n|type-only|i18n.ts",
-  "features/results/BacktestResultsView.tsx|../../theme|type-only|theme.ts",
-  "features/results/BacktestResultsView.tsx|../../utc|value|utc.ts",
+  "features/results/BacktestResultsView.tsx|../../shared/charts/EChart|value|shared/charts/EChart.tsx",
+  "features/results/BacktestResultsView.tsx|../../shared/format/decimal|value|shared/format/decimal.ts",
+  "features/results/BacktestResultsView.tsx|../../shared/i18n|type-only|shared/i18n.ts",
+  "features/results/BacktestResultsView.tsx|../../shared/theme|type-only|shared/theme.ts",
+  "features/results/BacktestResultsView.tsx|../../shared/time/utc|value|shared/time/utc.ts",
   "features/results/BacktestResultsView.tsx|./demo|value|features/results/demo.ts",
   "features/results/BacktestResultsView.tsx|./resultsCharts|value|features/results/resultsCharts.ts",
   "features/results/BacktestResultsView.tsx|./resultsModel|value|features/results/resultsModel.ts",
@@ -318,16 +335,16 @@ const expectedRelativeImportLedger = [
   "features/results/demo.ts|./resultsModel|type-only|features/results/resultsModel.ts",
   "features/results/resultsCharts.test.ts|./demo|value|features/results/demo.ts",
   "features/results/resultsCharts.test.ts|./resultsCharts|value|features/results/resultsCharts.ts",
-  "features/results/resultsCharts.ts|../../decimal|value|decimal.ts",
-  "features/results/resultsCharts.ts|../../i18n|type-only|i18n.ts",
-  "features/results/resultsCharts.ts|../../theme|type-only|theme.ts",
-  "features/results/resultsCharts.ts|../../utc|value|utc.ts",
+  "features/results/resultsCharts.ts|../../shared/format/decimal|value|shared/format/decimal.ts",
+  "features/results/resultsCharts.ts|../../shared/i18n|type-only|shared/i18n.ts",
+  "features/results/resultsCharts.ts|../../shared/theme|type-only|shared/theme.ts",
+  "features/results/resultsCharts.ts|../../shared/time/utc|value|shared/time/utc.ts",
   "features/results/resultsCharts.ts|./resultsModel|type-only|features/results/resultsModel.ts",
   "features/results/resultsModel.test.ts|../../shared/trading/closedTrade|type-only|shared/trading/closedTrade.ts",
   "features/results/resultsModel.test.ts|./resultsModel|value|features/results/resultsModel.ts",
-  "features/results/resultsModel.ts|../../decimal|value|decimal.ts",
+  "features/results/resultsModel.ts|../../shared/format/decimal|value|shared/format/decimal.ts",
+  "features/results/resultsModel.ts|../../shared/time/utc|value|shared/time/utc.ts",
   "features/results/resultsModel.ts|../../shared/trading/closedTrade|type-only|shared/trading/closedTrade.ts",
-  "features/results/resultsModel.ts|../../utc|value|utc.ts",
   "features/results/useTradePagination.test.ts|./demo|value|features/results/demo.ts",
   "features/results/useTradePagination.test.ts|./resultsModel|type-only|features/results/resultsModel.ts",
   "features/results/useTradePagination.test.ts|./useTradePagination|value|features/results/useTradePagination.ts",
@@ -337,51 +354,61 @@ const expectedRelativeImportLedger = [
   "features/strategies/strategyCommandState.ts|../../api|type-only|api.ts",
   "features/strategies/StrategyManager.test.tsx|../../api|type-only|api.ts",
   "features/strategies/StrategyManager.test.tsx|../../api|value|api.ts",
-  "features/strategies/StrategyManager.test.tsx|../../i18n|value|i18n.ts",
+  "features/strategies/StrategyManager.test.tsx|../../shared/i18n|value|shared/i18n.ts",
   "features/strategies/StrategyManager.test.tsx|./StrategyManager|value|features/strategies/StrategyManager.tsx",
-  "features/strategies/StrategyManager.tsx|../../i18n|type-only|i18n.ts",
+  "features/strategies/StrategyManager.tsx|../../shared/i18n|type-only|shared/i18n.ts",
   "features/strategies/StrategyManager.tsx|./StrategyManagerView|value|features/strategies/StrategyManagerView.tsx",
   "features/strategies/StrategyManager.tsx|./useStrategyManager|value|features/strategies/useStrategyManager.ts",
-  "features/strategies/StrategyManagerView.test.tsx|../../i18n|value|i18n.ts",
+  "features/strategies/StrategyManagerView.test.tsx|../../shared/i18n|value|shared/i18n.ts",
   "features/strategies/StrategyManagerView.test.tsx|./strategyCommandState|type-only|features/strategies/strategyCommandState.ts",
   "features/strategies/StrategyManagerView.test.tsx|./StrategyManagerView|value|features/strategies/StrategyManagerView.tsx",
-  "features/strategies/StrategyManagerView.tsx|../../i18n|type-only|i18n.ts",
+  "features/strategies/StrategyManagerView.tsx|../../shared/i18n|type-only|shared/i18n.ts",
   "features/strategies/StrategyManagerView.tsx|./strategyCommandState|type-only|features/strategies/strategyCommandState.ts",
   "features/strategies/useStrategyManager.test.ts|../../api|type-only|api.ts",
   "features/strategies/useStrategyManager.test.ts|../../api|value|api.ts",
-  "features/strategies/useStrategyManager.test.ts|../../i18n|value|i18n.ts",
+  "features/strategies/useStrategyManager.test.ts|../../shared/i18n|value|shared/i18n.ts",
   "features/strategies/useStrategyManager.test.ts|./strategyCommandState|value|features/strategies/strategyCommandState.ts",
   "features/strategies/useStrategyManager.test.ts|./useStrategyManager|value|features/strategies/useStrategyManager.ts",
   "features/strategies/useStrategyManager.ts|../../api|value|api.ts",
   "features/strategies/useStrategyManager.ts|./strategyCommandState|value|features/strategies/strategyCommandState.ts",
   "features/trades/CandlestickChart.test.tsx|./CandlestickChart|value|features/trades/CandlestickChart.tsx",
-  "features/trades/CandlestickChart.tsx|../../EChartCore|value|EChartCore.tsx",
+  "features/trades/CandlestickChart.tsx|../../shared/charts/EChartCore|value|shared/charts/EChartCore.tsx",
   "features/trades/demo.test.ts|./demo|value|features/trades/demo.ts",
   "features/trades/demo.ts|../../shared/trading/closedTrade|type-only|shared/trading/closedTrade.ts",
   "features/trades/demo.ts|./tradeModel|type-only|features/trades/tradeModel.ts",
   "features/trades/tradeCharts.test.ts|./tradeCharts|value|features/trades/tradeCharts.ts",
   "features/trades/tradeCharts.test.ts|./tradeModel|value|features/trades/tradeModel.ts",
-  "features/trades/tradeCharts.ts|../../theme|type-only|theme.ts",
+  "features/trades/tradeCharts.ts|../../shared/theme|type-only|shared/theme.ts",
   "features/trades/tradeCharts.ts|./tradeModel|type-only|features/trades/tradeModel.ts",
-  "features/trades/TradeChartView.test.tsx|../../i18n|value|i18n.ts",
+  "features/trades/TradeChartView.test.tsx|../../shared/i18n|value|shared/i18n.ts",
   "features/trades/TradeChartView.test.tsx|./demo|value|features/trades/demo.ts",
   "features/trades/TradeChartView.test.tsx|./TradeChartView|value|features/trades/TradeChartView.tsx",
-  "features/trades/TradeChartView.tsx|../../decimal|value|decimal.ts",
-  "features/trades/TradeChartView.tsx|../../i18n|type-only|i18n.ts",
-  "features/trades/TradeChartView.tsx|../../theme|type-only|theme.ts",
-  "features/trades/TradeChartView.tsx|../../utc|value|utc.ts",
+  "features/trades/TradeChartView.tsx|../../shared/format/decimal|value|shared/format/decimal.ts",
+  "features/trades/TradeChartView.tsx|../../shared/i18n|type-only|shared/i18n.ts",
+  "features/trades/TradeChartView.tsx|../../shared/theme|type-only|shared/theme.ts",
+  "features/trades/TradeChartView.tsx|../../shared/time/utc|value|shared/time/utc.ts",
   "features/trades/TradeChartView.tsx|./CandlestickChart|value|features/trades/CandlestickChart.tsx",
   "features/trades/TradeChartView.tsx|./demo|value|features/trades/demo.ts",
   "features/trades/TradeChartView.tsx|./tradeCharts|value|features/trades/tradeCharts.ts",
   "features/trades/TradeChartView.tsx|./tradeModel|value|features/trades/tradeModel.ts",
   "features/trades/tradeModel.test.ts|./tradeModel|value|features/trades/tradeModel.ts",
-  "features/trades/tradeModel.ts|../../decimal|value|decimal.ts",
+  "features/trades/tradeModel.ts|../../shared/format/decimal|value|shared/format/decimal.ts",
+  "features/trades/tradeModel.ts|../../shared/time/utc|value|shared/time/utc.ts",
   "features/trades/tradeModel.ts|../../shared/trading/closedTrade|type-only|shared/trading/closedTrade.ts",
-  "features/trades/tradeModel.ts|../../utc|value|utc.ts",
   "main.tsx|./app/App|value|app/App.tsx",
-  "main.tsx|./i18n|value|i18n.ts",
-  "main.tsx|./styles.css|value|styles.css",
-  "main.tsx|./theme|value|theme.ts"
+  "main.tsx|./shared/i18n|value|shared/i18n.ts",
+  "main.tsx|./shared/theme|value|shared/theme.ts",
+  "main.tsx|./styles/index.css|value|styles/index.css",
+  "shared/charts/EChart.test.tsx|./EChart|value|shared/charts/EChart.tsx",
+  "shared/charts/EChart.tsx|./EChartCore|value|shared/charts/EChartCore.tsx",
+  "shared/format/decimal.test.ts|./decimal|value|shared/format/decimal.ts",
+  "shared/i18n.test.ts|./i18n|value|shared/i18n.ts",
+  "shared/i18n.ts|./locales/en|value|shared/locales/en.ts",
+  "shared/i18n.ts|./locales/zh-TW|value|shared/locales/zh-TW.ts",
+  "shared/locales/resources.test.ts|./en|value|shared/locales/en.ts",
+  "shared/locales/resources.test.ts|./zh-TW|value|shared/locales/zh-TW.ts",
+  "shared/theme.test.ts|./theme|value|shared/theme.ts",
+  "shared/time/utc.test.ts|./utc|value|shared/time/utc.ts"
 ] as const;
 
 const expectedPolicyGlobalLedger = [
@@ -397,20 +424,125 @@ const expectedPolicyGlobalLedger = [
   "features/strategies/useStrategyManager.ts|window.sessionStorage.getItem()",
   "features/strategies/useStrategyManager.ts|window.sessionStorage.removeItem()",
   "features/strategies/useStrategyManager.ts|window.sessionStorage.setItem()",
-  "i18n.ts|document.documentElement.lang",
-  "i18n.ts|document.documentElement.lang",
-  "i18n.ts|navigator",
-  "i18n.ts|navigator.language",
-  "i18n.ts|navigator.languages",
-  "i18n.ts|window.localStorage.getItem()",
-  "i18n.ts|window.localStorage.setItem()",
   "main.tsx|document.getElementById()",
-  "theme.ts|document.documentElement.dataset.theme",
-  'theme.ts|document.querySelector("meta[name=\\"theme-color\\"]")',
-  "theme.ts|window.localStorage.getItem()",
-  "theme.ts|window.localStorage.setItem()",
-  "theme.ts|window.matchMedia?.()"
+  "shared/i18n.ts|document.documentElement.lang",
+  "shared/i18n.ts|document.documentElement.lang",
+  "shared/i18n.ts|navigator",
+  "shared/i18n.ts|navigator.language",
+  "shared/i18n.ts|navigator.languages",
+  "shared/i18n.ts|window.localStorage.getItem()",
+  "shared/i18n.ts|window.localStorage.setItem()",
+  "shared/theme.ts|document.documentElement.dataset.theme",
+  'shared/theme.ts|document.querySelector("meta[name=\\"theme-color\\"]")',
+  "shared/theme.ts|window.localStorage.getItem()",
+  "shared/theme.ts|window.localStorage.setItem()",
+  "shared/theme.ts|window.matchMedia?.()"
 ] as const;
+
+const cssPayloadNames = [
+  "tokens.css",
+  "shell.css",
+  "research.css",
+  "results.css",
+  "trades.css",
+  "strategies.css",
+  "responsive.css"
+] as const;
+const cssIndex = `@import "./tokens.css";
+@import "./shell.css";
+@import "./research.css";
+@import "./results.css";
+@import "./trades.css";
+@import "./strategies.css";
+@import "./responsive.css";
+`;
+
+async function sha256(bytes: Uint8Array): Promise<string> {
+  const result = await globalThis.crypto.subtle.digest(
+    "SHA-256",
+    Uint8Array.from(bytes).buffer
+  );
+  return [...new Uint8Array(result)]
+    .map((byte) => byte.toString(16).padStart(2, "0"))
+    .join("");
+}
+
+function assertCompleteCssFragment(bytes: Uint8Array): void {
+  type State = "normal" | "comment" | "single-quoted" | "double-quoted";
+  let state: State = "normal";
+  let escaped = false;
+  let depth = 0;
+  let topLevelPrelude = false;
+
+  for (let index = 0; index < bytes.length; index += 1) {
+    const byte = bytes[index];
+    const next = bytes[index + 1];
+    if (escaped) {
+      escaped = false;
+      continue;
+    }
+    if (state === "comment") {
+      if (byte === 42 && next === 47) {
+        state = "normal";
+        index += 1;
+      }
+      continue;
+    }
+    if (byte === 92) {
+      if (depth === 0) {
+        topLevelPrelude = true;
+      }
+      escaped = true;
+      continue;
+    }
+    if (state === "single-quoted") {
+      if (byte === 39) {
+        state = "normal";
+      }
+      continue;
+    }
+    if (state === "double-quoted") {
+      if (byte === 34) {
+        state = "normal";
+      }
+      continue;
+    }
+    if (byte === 47 && next === 42) {
+      state = "comment";
+      index += 1;
+    } else if (byte === 39) {
+      if (depth === 0) {
+        topLevelPrelude = true;
+      }
+      state = "single-quoted";
+    } else if (byte === 34) {
+      if (depth === 0) {
+        topLevelPrelude = true;
+      }
+      state = "double-quoted";
+    } else if (byte === 123) {
+      if (depth === 0) {
+        topLevelPrelude = false;
+      }
+      depth += 1;
+    } else if (byte === 125) {
+      depth -= 1;
+      if (depth < 0) {
+        throw new Error("CSS fragment closes an unopened block");
+      }
+    } else if (
+      depth === 0 &&
+      ![9, 10, 12, 13, 32].includes(byte)
+    ) {
+      topLevelPrelude = true;
+    }
+  }
+  if (state !== "normal" || escaped || depth !== 0 || topLevelPrelude) {
+    throw new Error(
+      `CSS fragment is incomplete: state=${state} escaped=${escaped} depth=${depth} prelude=${topLevelPrelude}`
+    );
+  }
+}
 
 function walkFiles(root: string): string[] {
   return fs
@@ -816,7 +948,7 @@ describe("frontend architecture ratchet", () => {
         .map((edge) => `${edge.importer}|${edge.specifier}|${edge.kind}`)
     ).toEqual(expectedBareImportLedger);
   });
-  it("freezes the complete Node F source inventory", () => {
+  it("freezes the complete Node G source inventory", () => {
     const inventory = walkFiles(sourceRoot).map((file) =>
       path.relative(sourceRoot, file).replaceAll(path.sep, "/")
     );
@@ -824,6 +956,51 @@ describe("frontend architecture ratchet", () => {
     expect(
       inventory.filter((file) => executableExtensions.has(path.extname(file)))
     ).toEqual(inventory.filter((file) => /\.(?:ts|tsx)$/.test(file)));
+  });
+
+  it("preserves the exact stylesheet payload and import cascade", async () => {
+    const styleRoot = path.join(sourceRoot, "styles");
+    expect(fs.readdirSync(styleRoot).sort()).toEqual(
+      ["index.css", ...cssPayloadNames].sort()
+    );
+    const indexBytes = fs.readFileSync(path.join(styleRoot, "index.css"));
+    expect(indexBytes.toString("utf8")).toBe(cssIndex);
+    await expect(sha256(indexBytes)).resolves.toBe(
+      "0c00067b8144bcd4aaefd82ce00f86e0621ba92d78114e75b757e2064cf00e71"
+    );
+
+    const fragments = cssPayloadNames.map((name) =>
+      fs.readFileSync(path.join(styleRoot, name))
+    );
+    for (const fragment of fragments) {
+      expect(() => assertCompleteCssFragment(fragment)).not.toThrow();
+    }
+    const payload = new Uint8Array(
+      fragments.reduce((length, fragment) => length + fragment.length, 0)
+    );
+    let offset = 0;
+    for (const fragment of fragments) {
+      payload.set(fragment, offset);
+      offset += fragment.length;
+    }
+    expect(new TextDecoder().decode(payload)).not.toMatch(
+      /@charset|@import|url\(/
+    );
+    await expect(sha256(payload)).resolves.toBe(
+      "9171580172458b2ab20e97024f2ef987996990c50e1492f9d51575a9ba61b44d"
+    );
+  });
+
+  it.each([
+    ["selector", ".owner"],
+    ["media", "@media (max-width: 1px) {"],
+    ["keyframes", "@keyframes pulse { from { opacity: 0; }"],
+    ["comment", "/* incomplete"],
+    ["string", '.owner { content: "incomplete']
+  ])("rejects a CSS split inside %s", (_name, fragment) => {
+    expect(() =>
+      assertCompleteCssFragment(new TextEncoder().encode(fragment))
+    ).toThrow("CSS fragment is incomplete");
   });
 
   it("enumerates physical files without ignores or links", () => {
@@ -851,21 +1028,32 @@ describe("frontend architecture ratchet", () => {
     }
   });
 
-  it("freezes every transitional repository-relative owner edge", () => {
+  it("freezes every final shared repository-relative owner edge", () => {
     const edges = collectImports();
+    expect(expectedInventory).not.toEqual(
+      expect.arrayContaining([
+        "EChart.tsx",
+        "EChartCore.tsx",
+        "decimal.ts",
+        "i18n.ts",
+        "styles.css",
+        "theme.ts",
+        "utc.ts"
+      ])
+    );
     expect(directRelativeSpecifiers(edges, "main.tsx")).toEqual([
       "./app/App|value|app/App.tsx",
-      "./i18n|value|i18n.ts",
-      "./styles.css|value|styles.css",
-      "./theme|value|theme.ts"
+      "./shared/i18n|value|shared/i18n.ts",
+      "./shared/theme|value|shared/theme.ts",
+      "./styles/index.css|value|styles/index.css"
     ]);
     expect(directRelativeSpecifiers(edges, "app/App.tsx")).toEqual([
       "../features/research/ResearchRoute|value|features/research/ResearchRoute.tsx",
       "../features/results/BacktestResultsView|value|features/results/BacktestResultsView.tsx",
       "../features/strategies/StrategyManager|value|features/strategies/StrategyManager.tsx",
       "../features/trades/TradeChartView|value|features/trades/TradeChartView.tsx",
-      "../i18n|type-only|i18n.ts",
-      "../theme|value|theme.ts",
+      "../shared/i18n|type-only|shared/i18n.ts",
+      "../shared/theme|value|shared/theme.ts",
       "./navigation|value|app/navigation.ts"
     ]);
     expect(directRelativeSpecifiers(edges, "features/research/gaDomain.ts")).toEqual([
@@ -873,7 +1061,7 @@ describe("frontend architecture ratchet", () => {
     ]);
     expect(directRelativeSpecifiers(edges, "features/research/gaCharts.ts")).toEqual([
       "../../api|type-only|api.ts",
-      "../../theme|type-only|theme.ts",
+      "../../shared/theme|type-only|shared/theme.ts",
       "./gaDomain|value|features/research/gaDomain.ts"
     ]);
     expect(
@@ -884,6 +1072,15 @@ describe("frontend architecture ratchet", () => {
       "./gaDomain|value|features/research/gaDomain.ts",
       "./researchModel|value|features/research/researchModel.ts"
     ]);
+    expect(directRelativeSpecifiers(edges, "shared/i18n.ts")).toEqual([
+      "./locales/en|value|shared/locales/en.ts",
+      "./locales/zh-TW|value|shared/locales/zh-TW.ts"
+    ]);
+    expect(directRelativeSpecifiers(edges, "shared/theme.ts")).toEqual([]);
+    expect(directRelativeSpecifiers(edges, "shared/format/decimal.ts")).toEqual(
+      []
+    );
+    expect(directRelativeSpecifiers(edges, "shared/time/utc.ts")).toEqual([]);
   });
 
   it("detects static, type-only, dynamic, require, and nonliteral edges", () => {
@@ -1171,7 +1368,7 @@ describe("frontend architecture ratchet", () => {
       return [node.arguments[0].text];
     });
     expect(researchDynamicImports).toEqual([
-      "../../EChart",
+      "../../shared/charts/EChart",
       "./FitnessSurface3D"
     ]);
 
@@ -1314,26 +1511,26 @@ describe("frontend architecture ratchet", () => {
     expect(
       directRelativeSpecifiers(edges, "features/trades/tradeModel.ts")
     ).toEqual([
-      "../../decimal|value|decimal.ts",
-      "../../shared/trading/closedTrade|type-only|shared/trading/closedTrade.ts",
-      "../../utc|value|utc.ts"
+      "../../shared/format/decimal|value|shared/format/decimal.ts",
+      "../../shared/time/utc|value|shared/time/utc.ts",
+      "../../shared/trading/closedTrade|type-only|shared/trading/closedTrade.ts"
     ]);
     expect(
       directRelativeSpecifiers(edges, "features/trades/tradeCharts.ts")
     ).toEqual([
-      "../../theme|type-only|theme.ts",
+      "../../shared/theme|type-only|shared/theme.ts",
       "./tradeModel|type-only|features/trades/tradeModel.ts"
     ]);
     expect(
       directRelativeSpecifiers(edges, "features/trades/CandlestickChart.tsx")
-    ).toEqual(["../../EChartCore|value|EChartCore.tsx"]);
+    ).toEqual(["../../shared/charts/EChartCore|value|shared/charts/EChartCore.tsx"]);
     expect(
       directRelativeSpecifiers(edges, "features/trades/TradeChartView.tsx")
     ).toEqual([
-      "../../decimal|value|decimal.ts",
-      "../../i18n|type-only|i18n.ts",
-      "../../theme|type-only|theme.ts",
-      "../../utc|value|utc.ts",
+      "../../shared/format/decimal|value|shared/format/decimal.ts",
+      "../../shared/i18n|type-only|shared/i18n.ts",
+      "../../shared/theme|type-only|shared/theme.ts",
+      "../../shared/time/utc|value|shared/time/utc.ts",
       "./CandlestickChart|value|features/trades/CandlestickChart.tsx",
       "./demo|value|features/trades/demo.ts",
       "./tradeCharts|value|features/trades/tradeCharts.ts",
@@ -1389,7 +1586,7 @@ describe("frontend architecture ratchet", () => {
     expect(
       directRelativeSpecifiers(edges, "features/strategies/StrategyManager.tsx")
     ).toEqual([
-      "../../i18n|type-only|i18n.ts",
+      "../../shared/i18n|type-only|shared/i18n.ts",
       "./StrategyManagerView|value|features/strategies/StrategyManagerView.tsx",
       "./useStrategyManager|value|features/strategies/useStrategyManager.ts"
     ]);
@@ -1414,7 +1611,7 @@ describe("frontend architecture ratchet", () => {
         "features/strategies/StrategyManagerView.tsx"
       )
     ).toEqual([
-      "../../i18n|type-only|i18n.ts",
+      "../../shared/i18n|type-only|shared/i18n.ts",
       "./strategyCommandState|type-only|features/strategies/strategyCommandState.ts"
     ]);
     expect(stateSource.getText()).not.toMatch(

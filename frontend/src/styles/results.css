@@ -1,0 +1,231 @@
+
+.results-console {
+  display: grid;
+  gap: 14px;
+}
+
+.results-intro {
+  display: grid;
+  grid-template-columns: minmax(280px, 0.75fr) minmax(600px, 1.25fr);
+  align-items: end;
+  gap: 30px;
+  padding: 18px;
+  border: 1px solid var(--grid);
+  background: var(--panel);
+}
+
+.results-intro p:last-child {
+  max-width: 680px;
+  margin: 8px 0 0;
+  color: var(--muted);
+}
+
+.results-intro > dl {
+  display: grid;
+  grid-template-columns:
+    minmax(170px, 1.2fr)
+    minmax(170px, 1.4fr)
+    minmax(60px, 0.5fr)
+    minmax(200px, 1.6fr);
+  gap: 1px;
+  margin: 0;
+  background: var(--grid);
+}
+
+.results-intro > dl div {
+  min-width: 0;
+  padding: 10px 12px;
+  background: var(--surface);
+}
+
+.results-intro > dl dd {
+  overflow: hidden;
+  margin-top: 4px;
+  font-family: "SFMono-Regular", "Roboto Mono", monospace;
+  font-size: 0.72rem;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.results-metrics {
+  display: grid;
+  grid-template-columns: 1.35fr repeat(5, minmax(0, 1fr));
+  gap: 1px;
+  border: 1px solid var(--grid);
+  background: var(--grid);
+}
+
+.results-metrics > div {
+  display: grid;
+  min-width: 0;
+  gap: 5px;
+  padding: 14px 16px;
+  background: var(--surface);
+}
+
+.results-metrics span,
+.results-metrics small {
+  color: var(--muted);
+  font-family: "SFMono-Regular", "Roboto Mono", monospace;
+  font-size: 0.64rem;
+  letter-spacing: 0.05em;
+  text-transform: uppercase;
+}
+
+.results-metrics strong {
+  overflow: hidden;
+  font-size: clamp(1rem, 2vw, 1.45rem);
+  text-overflow: ellipsis;
+}
+
+.results-metrics .metric-primary {
+  color: var(--selection-ink);
+  background: var(--selection-bg);
+}
+
+.results-metrics .metric-primary span,
+.results-metrics .metric-primary small {
+  color: var(--selection-muted);
+}
+
+.results-risk-panel {
+  overflow: hidden;
+}
+
+.results-risk-chart {
+  height: 430px;
+}
+
+.results-breakdown {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) minmax(320px, 0.78fr);
+  gap: 14px;
+}
+
+.monthly-grid {
+  display: grid;
+  grid-template-columns: repeat(6, minmax(0, 1fr));
+  gap: 1px;
+  padding: 1px;
+  background: var(--grid);
+}
+
+.monthly-grid > div {
+  display: grid;
+  min-height: 88px;
+  align-content: space-between;
+  gap: 16px;
+  padding: 12px;
+  background: var(--surface);
+}
+
+.monthly-grid > div.is-positive {
+  background: color-mix(
+    in srgb,
+    var(--teal) var(--return-intensity, 0%),
+    var(--surface)
+  );
+}
+
+.monthly-grid > div.is-negative {
+  background: color-mix(
+    in srgb,
+    var(--coral) var(--return-intensity, 0%),
+    var(--surface)
+  );
+}
+
+.monthly-grid span {
+  color: var(--muted);
+  font-size: 0.68rem;
+}
+
+.monthly-grid strong {
+  font-family: "SFMono-Regular", "Roboto Mono", monospace;
+  font-size: 0.82rem;
+}
+
+.distribution-list {
+  display: grid;
+  gap: 11px;
+  margin: 0;
+  padding: 17px;
+  list-style: none;
+}
+
+.distribution-list li {
+  display: grid;
+  grid-template-columns: minmax(90px, 0.7fr) minmax(80px, 1fr) auto;
+  align-items: center;
+  gap: 11px;
+  min-height: 26px;
+}
+
+.distribution-list span,
+.distribution-list strong {
+  font-family: "SFMono-Regular", "Roboto Mono", monospace;
+  font-size: 0.7rem;
+}
+
+.distribution-list span {
+  color: var(--muted);
+}
+
+.distribution-list i {
+  display: block;
+  min-width: 3px;
+  height: 9px;
+  background: var(--indigo);
+}
+
+.results-trades {
+  overflow: hidden;
+}
+
+.results-table-wrap {
+  overflow-x: auto;
+}
+
+.results-trades table {
+  width: 100%;
+  border-collapse: collapse;
+}
+
+.results-trades th,
+.results-trades td {
+  padding: 11px 13px;
+  border-bottom: 1px solid var(--grid);
+  text-align: left;
+  white-space: nowrap;
+}
+
+.results-trades th {
+  color: var(--muted);
+  font-family: "SFMono-Regular", "Roboto Mono", monospace;
+  font-size: 0.64rem;
+  letter-spacing: 0.05em;
+  text-transform: uppercase;
+}
+
+.results-trades td {
+  font-size: 0.74rem;
+}
+
+.results-trades td:first-child,
+.results-trades td:nth-last-child(-n + 3) {
+  font-family: "SFMono-Regular", "Roboto Mono", monospace;
+}
+
+.results-trades td.is-loss {
+  color: var(--danger);
+}
+
+.results-trades td:last-child {
+  text-align: right;
+}
+
+.results-trades button {
+  min-height: 32px;
+  padding: 0 10px;
+  cursor: pointer;
+}

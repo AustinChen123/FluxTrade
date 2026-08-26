@@ -4,7 +4,7 @@ import { act, cleanup, renderHook, waitFor } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import { ApiError, type StrategyState } from "../../api";
-import i18n from "../../i18n";
+import i18n from "../../shared/i18n";
 import { AWAITING_STORAGE_KEY } from "./strategyCommandState";
 import { useStrategyManager } from "./useStrategyManager";
 

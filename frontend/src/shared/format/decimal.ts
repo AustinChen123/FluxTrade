@@ -1,11 +1,11 @@
-export function isDecimalString(value: string | null): value is string {
+export function isDecimalString(value: unknown): value is string {
   return (
-    value !== null &&
+    typeof value === "string" &&
     /^[+-]?(?:\d+(?:\.\d*)?|\.\d+)$/.test(value.trim())
   );
 }
 
-export function finiteDecimalNumber(value: string | null): number | null {
+export function finiteDecimalNumber(value: unknown): number | null {
   if (!isDecimalString(value)) {
     return null;
   }

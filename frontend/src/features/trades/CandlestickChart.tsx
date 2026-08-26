@@ -7,7 +7,10 @@ import {
 import { CandlestickChart as CandlestickSeries, ScatterChart } from "echarts/charts";
 import * as echarts from "echarts/core";
 
-import { EChartCore, type EChartProps } from "../../EChartCore";
+import {
+  EChartCore,
+  type EChartProps
+} from "../../shared/charts/EChartCore";
 
 echarts.use([
   CandlestickSeries,

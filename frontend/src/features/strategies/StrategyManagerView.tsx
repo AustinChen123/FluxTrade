@@ -1,7 +1,7 @@
 import { useMemo } from "react";
 import type { useTranslation } from "react-i18next";
 
-import type { Locale } from "../../i18n";
+import type { Locale } from "../../shared/i18n";
 import type {
   AwaitingStrategies,
   StrategyCommandName,

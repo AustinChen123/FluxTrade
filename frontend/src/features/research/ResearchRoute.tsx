@@ -1,8 +1,8 @@
 import { useMemo, type ReactNode } from "react";
 import { useTranslation } from "react-i18next";
 
-import type { Locale } from "../../i18n";
-import type { Theme } from "../../theme";
+import type { Locale } from "../../shared/i18n";
+import type { Theme } from "../../shared/theme";
 import {
   convergenceOption,
   fitnessSurfaceOption,

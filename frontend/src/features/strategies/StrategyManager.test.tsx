@@ -4,7 +4,7 @@ import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/re
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import { ApiError, type StrategyState, type StrategyStatus } from "../../api";
-import i18n from "../../i18n";
+import i18n from "../../shared/i18n";
 import { StrategyManager } from "./StrategyManager";
 
 const api = vi.hoisted(() => ({

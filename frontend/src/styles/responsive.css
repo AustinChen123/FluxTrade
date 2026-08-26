@@ -1,0 +1,195 @@
+
+@media (max-width: 1120px) {
+  .analysis-grid {
+    grid-template-columns: minmax(0, 1fr) minmax(280px, 0.7fr);
+  }
+
+  .topology-panel {
+    grid-column: 1 / -1;
+    grid-row: 1;
+  }
+}
+
+@media (max-width: 960px) {
+  .results-intro,
+  .trade-intro {
+    grid-template-columns: 1fr;
+  }
+
+  .results-breakdown {
+    grid-template-columns: 1fr;
+  }
+
+  .results-metrics {
+    grid-template-columns: repeat(3, minmax(0, 1fr));
+  }
+
+  .trade-layout {
+    grid-template-columns: 1fr;
+  }
+}
+
+@media (max-width: 760px) {
+  .console-shell {
+    padding: 20px 14px 44px;
+  }
+
+  .topbar,
+  .run-strip,
+  .results-intro,
+  .trade-intro,
+  .strategy-intro {
+    align-items: stretch;
+    flex-direction: column;
+  }
+
+  .toolbar {
+    display: grid;
+    grid-template-columns: minmax(0, 1fr) auto;
+    align-items: end;
+  }
+
+  .epoch-control {
+    grid-column: 1 / -1;
+  }
+
+  .epoch-control,
+  .language-control {
+    min-width: 0;
+  }
+
+  .epoch-control select,
+  .language-control select {
+    width: 100%;
+  }
+
+  .run-strip dl {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+
+  .analysis-grid {
+    grid-template-columns: 1fr;
+  }
+
+  .trade-intro > dl {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+
+  .results-intro > dl,
+  .results-metrics {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+
+  .results-intro > dl dd {
+    white-space: normal;
+    overflow-wrap: anywhere;
+  }
+
+  .monthly-grid {
+    grid-template-columns: repeat(3, minmax(0, 1fr));
+  }
+
+  .results-risk-chart {
+    height: 360px;
+  }
+
+  .trade-chart {
+    height: 420px;
+  }
+
+  .trade-ledger {
+    height: auto;
+    min-height: 0;
+    overflow: visible;
+  }
+
+  .trade-ledger > ol {
+    overflow-y: visible;
+  }
+
+  .topology-panel,
+  .parallel-panel {
+    grid-column: auto;
+    grid-row: auto;
+  }
+
+  .panel-heading {
+    align-items: stretch;
+    flex-direction: column;
+  }
+
+  .axis-controls {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+  }
+
+  .surface-controls {
+    display: grid;
+  }
+
+  .view-control {
+    justify-content: stretch;
+  }
+
+  .view-control button {
+    flex: 1;
+  }
+
+  .axis-controls label {
+    grid-template-columns: auto 1fr;
+  }
+
+  .chart-convergence,
+  .chart-topology {
+    height: 330px;
+  }
+
+  .chart-3d {
+    height: 285px;
+  }
+
+  .chart-parallel {
+    height: 390px;
+  }
+
+  .console-nav button {
+    min-width: 0;
+    padding: 0 8px;
+  }
+
+  .console-nav {
+    display: grid;
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+
+  .strategy-summary {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+
+  .strategy-list > li {
+    grid-template-columns: 1fr;
+    gap: 14px;
+  }
+
+  .strategy-list > li > dl {
+    grid-template-columns: 1fr;
+  }
+
+  .strategy-action {
+    justify-items: stretch;
+  }
+
+  .strategy-action p {
+    text-align: left;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    scroll-behavior: auto !important;
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+  }
+}

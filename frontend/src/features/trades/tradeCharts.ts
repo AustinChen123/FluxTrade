@@ -1,6 +1,6 @@
 import type { EChartsCoreOption } from "echarts/core";
 
-import type { Theme } from "../../theme";
+import type { Theme } from "../../shared/theme";
 import type {
   TradeChartModel,
   TradeEvent,

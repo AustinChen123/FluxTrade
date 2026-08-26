@@ -1,6 +1,6 @@
 import { useTranslation } from "react-i18next";
 
-import type { Locale } from "../../i18n";
+import type { Locale } from "../../shared/i18n";
 import { StrategyManagerView } from "./StrategyManagerView";
 import { useStrategyManager } from "./useStrategyManager";
 

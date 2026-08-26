@@ -1,0 +1,165 @@
+
+* {
+  box-sizing: border-box;
+}
+
+body {
+  margin: 0;
+  min-width: 320px;
+  min-height: 100vh;
+  background:
+    linear-gradient(var(--grid-pattern) 1px, transparent 1px),
+    linear-gradient(90deg, var(--grid-pattern) 1px, transparent 1px),
+    var(--paper);
+  background-size: 28px 28px;
+  transition: background-color 160ms ease, color 160ms ease;
+}
+
+button,
+select {
+  font: inherit;
+}
+
+button,
+select {
+  border: 1px solid var(--grid);
+  color: var(--ink);
+  background: var(--surface);
+}
+
+button:focus-visible,
+select:focus-visible {
+  outline: 3px solid var(--focus);
+  outline-offset: 2px;
+}
+
+.console-shell {
+  width: min(1680px, 100%);
+  min-height: 100vh;
+  margin: 0 auto;
+  padding: 28px 34px 54px;
+}
+
+.topbar {
+  display: flex;
+  align-items: end;
+  justify-content: space-between;
+  gap: 28px;
+  padding: 4px 2px 22px;
+  border-bottom: 2px solid var(--ink);
+}
+
+.console-nav {
+  display: flex;
+  gap: 0;
+  margin-bottom: 18px;
+  border-bottom: 1px solid var(--grid);
+}
+
+.console-nav button {
+  min-height: 42px;
+  padding: 0 18px;
+  border: 0;
+  border-bottom: 3px solid transparent;
+  color: var(--muted);
+  background: transparent;
+  cursor: pointer;
+}
+
+.console-nav button[aria-current="page"] {
+  border-bottom-color: var(--coral);
+  color: var(--ink);
+  font-weight: 700;
+}
+
+.eyebrow,
+.panel-kicker {
+  margin: 0 0 5px;
+  color: var(--teal);
+  font-family: "SFMono-Regular", "Roboto Mono", monospace;
+  font-size: 0.67rem;
+  font-weight: 700;
+  letter-spacing: 0.16em;
+  text-transform: uppercase;
+}
+
+h1,
+h2 {
+  margin: 0;
+  font-weight: 600;
+  letter-spacing: -0.045em;
+}
+
+h1 {
+  font-size: clamp(2.2rem, 4.5vw, 4.6rem);
+  line-height: 0.92;
+}
+
+h2 {
+  font-size: 1.16rem;
+}
+
+.epoch-control,
+.language-control,
+.panel-heading label,
+.axis-controls label {
+  display: grid;
+  gap: 6px;
+  color: var(--muted);
+  font-family: "SFMono-Regular", "Roboto Mono", monospace;
+  font-size: 0.68rem;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+}
+
+.toolbar {
+  display: flex;
+  align-items: end;
+  gap: 10px;
+}
+
+.language-control {
+  min-width: 128px;
+}
+
+.theme-control {
+  display: grid;
+  grid-template-columns: auto auto;
+  align-items: center;
+  gap: 7px;
+  min-height: 38px;
+  padding: 0 11px;
+  border-radius: 3px;
+  cursor: pointer;
+}
+
+.theme-control span {
+  color: var(--coral);
+  font-size: 1rem;
+  line-height: 1;
+}
+
+.theme-control small {
+  color: var(--muted);
+  font-family: "SFMono-Regular", "Roboto Mono", monospace;
+  font-size: 0.63rem;
+  font-weight: 700;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+}
+
+select {
+  min-height: 38px;
+  padding: 0 34px 0 11px;
+  border-radius: 3px;
+}
+
+.demo-notice {
+  margin: 0;
+  padding: 8px 12px;
+  color: #fff;
+  background: var(--indigo);
+  font-family: "SFMono-Regular", "Roboto Mono", monospace;
+  font-size: 0.72rem;
+  text-align: center;
+}

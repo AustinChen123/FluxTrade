@@ -4,12 +4,12 @@ import { cleanup, fireEvent, render, screen } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import type { Epoch, Gene } from "../../api";
-import i18n from "../../i18n";
+import i18n from "../../shared/i18n";
 import { ResearchPage } from "./ResearchPage";
 import { buildResearchModel } from "./researchModel";
 import type { ResearchWorkspace } from "./useResearchWorkspace";
 
-vi.mock("../../EChart", () => ({
+vi.mock("../../shared/charts/EChart", () => ({
   EChart: ({
     ariaLabel,
     onDataClick

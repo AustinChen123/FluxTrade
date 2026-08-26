@@ -10,7 +10,7 @@ import {
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import { App } from "./App";
-import i18n, { resolveLocale } from "../i18n";
+import i18n, { resolveLocale } from "../shared/i18n";
 import type { Epoch, Gene, GenerationSummary } from "../api";
 
 const api = vi.hoisted(() => ({
@@ -30,7 +30,7 @@ vi.mock("../api", async (importOriginal) => ({
   ...api
 }));
 
-vi.mock("../EChart", () => ({
+vi.mock("../shared/charts/EChart", () => ({
   EChart: ({
     ariaLabel,
     onDataClick

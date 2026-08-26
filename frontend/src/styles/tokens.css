@@ -1,0 +1,52 @@
+:root {
+  color: #182128;
+  background: #eef2f1;
+  color-scheme: light;
+  font-family: "Avenir Next", "Noto Sans TC", "PingFang TC", sans-serif;
+  font-synthesis: none;
+  text-rendering: optimizeLegibility;
+  --ink: #182128;
+  --paper: #eef2f1;
+  --surface: #f8faf9;
+  --grid: #cbd5d1;
+  --muted: #66726f;
+  --teal: #0e6b6f;
+  --coral: #d46a4c;
+  --indigo: #454b8c;
+  --warning: #a66b08;
+  --danger: #a73d32;
+  --panel: rgba(248, 250, 249, 0.93);
+  --grid-pattern: rgba(24, 33, 40, 0.035);
+  --panel-shadow: rgba(24, 33, 40, 0.045);
+  --selection-bg: #182128;
+  --selection-ink: #ffffff;
+  --selection-muted: #aebbb7;
+  --focus: rgba(14, 107, 111, 0.28);
+  --teal-soft: rgba(14, 107, 111, 0.08);
+  --loading-shadow: rgba(24, 33, 40, 0.22);
+}
+
+:root[data-theme="dark"] {
+  color: #e5ece9;
+  background: #11191d;
+  color-scheme: dark;
+  --ink: #e5ece9;
+  --paper: #11191d;
+  --surface: #182226;
+  --grid: #3b4949;
+  --muted: #94a29d;
+  --teal: #49b2ae;
+  --coral: #ef8a6b;
+  --indigo: #8c91d9;
+  --warning: #e6ad45;
+  --danger: #f08a78;
+  --panel: rgba(24, 34, 38, 0.94);
+  --grid-pattern: rgba(229, 236, 233, 0.035);
+  --panel-shadow: rgba(0, 0, 0, 0.22);
+  --selection-bg: #0a1013;
+  --selection-ink: #f5f8f7;
+  --selection-muted: #94a29d;
+  --focus: rgba(73, 178, 174, 0.38);
+  --teal-soft: rgba(73, 178, 174, 0.12);
+  --loading-shadow: rgba(0, 0, 0, 0.34);
+}

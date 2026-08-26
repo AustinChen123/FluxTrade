@@ -2,7 +2,7 @@ import type { CustomSeriesRenderItem } from "echarts";
 import type { EChartsCoreOption } from "echarts/core";
 
 import type { Epoch, Gene, GenerationSummary } from "../../api";
-import type { Theme } from "../../theme";
+import type { Theme } from "../../shared/theme";
 import {
   epochObjective,
   finiteNumber,

@@ -10,7 +10,7 @@ import {
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import type { Epoch, Gene, GenerationSummary } from "../../api";
-import i18n from "../../i18n";
+import i18n from "../../shared/i18n";
 import { ResearchRoute } from "./ResearchRoute";
 
 const api = vi.hoisted(() => ({
@@ -24,7 +24,7 @@ vi.mock("../../api", async (importOriginal) => ({
   ...(await importOriginal<typeof import("../../api")>()),
   ...api
 }));
-vi.mock("../../EChart", () => ({
+vi.mock("../../shared/charts/EChart", () => ({
   EChart: ({ ariaLabel }: { ariaLabel: string }) => (
     <div aria-label={ariaLabel} />
   )

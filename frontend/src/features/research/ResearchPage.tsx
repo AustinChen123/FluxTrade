@@ -3,7 +3,7 @@ import type { EChartsCoreOption } from "echarts/core";
 import { useTranslation } from "react-i18next";
 
 import { ApiError } from "../../api";
-import type { Theme } from "../../theme";
+import type { Theme } from "../../shared/theme";
 import type { ChartCopy } from "./gaCharts";
 import type { SurfaceRow } from "./gaDomain";
 import {
@@ -14,7 +14,9 @@ import {
 import type { ResearchWorkspace } from "./useResearchWorkspace";
 
 const EChart = lazy(() =>
-  import("../../EChart").then((module) => ({ default: module.EChart }))
+  import("../../shared/charts/EChart").then((module) => ({
+    default: module.EChart
+  }))
 );
 const FitnessSurface3D = lazy(() =>
   import("./FitnessSurface3D").then((module) => ({

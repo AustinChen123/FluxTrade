@@ -1,6 +1,6 @@
-import { finiteDecimalNumber } from "../../decimal";
+import { finiteDecimalNumber } from "../../shared/format/decimal";
 import type { ClosedTrade } from "../../shared/trading/closedTrade";
-import { parseUtcTimestamp } from "../../utc";
+import { parseUtcTimestamp } from "../../shared/time/utc";
 
 export type TradeSide = "LONG" | "SHORT";
 export type TradeEvent = "entry" | "exit";
