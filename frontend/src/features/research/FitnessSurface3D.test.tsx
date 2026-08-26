@@ -4,7 +4,7 @@ import { cleanup, fireEvent, render, screen } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import { FitnessSurface3D } from "./FitnessSurface3D";
-import type { SurfaceRow } from "./ga";
+import type { SurfaceRow } from "./gaDomain";
 
 const context = {
   arc: vi.fn(),

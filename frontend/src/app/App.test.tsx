@@ -48,7 +48,7 @@ vi.mock("../EChart", () => ({
   )
 }));
 
-vi.mock("../FitnessSurface3D", async () => {
+vi.mock("../features/research/FitnessSurface3D", async () => {
   const { useEffect, useRef } = await import("react");
   return {
     FitnessSurface3D: ({
@@ -267,36 +267,6 @@ describe("GA visualization state", () => {
 
   afterEach(() => {
     cleanup();
-  });
-
-  it("clears the previous epoch while the next epoch is loading", async () => {
-    const epochBSummaries = deferred<GenerationSummary[]>();
-    api.loadGenerationSummaries.mockImplementation((epochId: string) =>
-      epochId === "epoch-a"
-        ? Promise.resolve([summary])
-        : epochBSummaries.promise
-    );
-    api.loadGenerationGenes.mockImplementation((epochId: string) =>
-      Promise.resolve([gene(epochId)])
-    );
-
-    render(<App />);
-    await screen.findAllByText("candidate-epoch-a");
-
-    fireEvent.change(
-      screen.getByRole("combobox", { name: "演化批次" }),
-      {
-        target: { value: "epoch-b" }
-      }
-    );
-
-    expect(screen.queryByText("candidate-epoch-a")).toBeNull();
-    await waitFor(() =>
-      expect(api.loadGenerationSummaries).toHaveBeenCalledWith("epoch-b")
-    );
-
-    epochBSummaries.resolve([summary]);
-    await screen.findAllByText("candidate-epoch-b");
   });
 
   it("uses browser language with a Traditional Chinese fallback", () => {
@@ -613,44 +583,6 @@ describe("GA visualization state", () => {
     expect(toolbarClasses()[0]).toBe("epoch-control");
   });
 
-  it("still reloads research data after a downstream load failure", async () => {
-    api.loadGenerationSummaries
-      .mockRejectedValueOnce(new Error("summary unavailable"))
-      .mockResolvedValueOnce([summary]);
-    api.loadGenerationGenes.mockResolvedValue([gene("epoch-a")]);
-    render(<App />);
-
-    expect(await screen.findByText("研究資料未載入")).toBeTruthy();
-    fireEvent.click(screen.getByRole("button", { name: "重新讀取" }));
-
-    await waitFor(() => {
-      expect(api.loadEpochs).toHaveBeenCalledTimes(1);
-      expect(api.loadGenerationSummaries).toHaveBeenCalledTimes(2);
-      expect(api.loadGenerationGenes).toHaveBeenCalledTimes(1);
-    });
-  });
-
-  it("keeps the two surface axes distinct", async () => {
-    api.loadGenerationSummaries.mockResolvedValue([summary]);
-    api.loadGenerationGenes.mockResolvedValue([gene("epoch-a")]);
-
-    render(<App />);
-    await screen.findAllByText("candidate-epoch-a");
-
-    const xAxis = screen.getByLabelText("X") as HTMLSelectElement;
-    const yAxis = screen.getByLabelText("Y") as HTMLSelectElement;
-    await waitFor(() => {
-      expect(xAxis.value).toBe("fast");
-      expect(yAxis.value).toBe("slow");
-    });
-    expect(
-      Array.from(xAxis.options).find((option) => option.value === "slow")?.disabled
-    ).toBe(true);
-    expect(
-      Array.from(yAxis.options).find((option) => option.value === "fast")?.disabled
-    ).toBe(true);
-  });
-
   it("switches the complete interface language and saves the choice", async () => {
     api.loadGenerationSummaries.mockResolvedValue([summary]);
     api.loadGenerationGenes.mockResolvedValue([gene("epoch-a")]);
@@ -701,50 +633,4 @@ describe("GA visualization state", () => {
     ).toBeTruthy();
   });
 
-  it("switches between 2D and 3D views and selects observed candidates", async () => {
-    api.loadGenerationSummaries.mockResolvedValue([summary]);
-    api.loadGenerationGenes.mockResolvedValue([
-      gene("epoch-a"),
-      gene("epoch-b")
-    ]);
-
-    render(<App />);
-    await screen.findAllByText("candidate-epoch-a");
-
-    fireEvent.click(screen.getByRole("button", { name: "3D 地形" }));
-    const surface3d = await screen.findByRole("button", {
-      name: "兩個策略參數與候選適應度的互動式三維插值地形圖"
-    });
-    expect(surface3d.dataset.observationLabel).toBe("觀測候選");
-    fireEvent.click(surface3d);
-
-    expect(screen.getAllByText("candidate-epoch-b")).toHaveLength(2);
-    fireEvent.click(screen.getByRole("button", { name: "2D 色階" }));
-    expect(
-      screen.getByRole("button", {
-        name: "兩個策略參數與候選適應度的觀測地形圖"
-      })
-    ).toBeTruthy();
-  });
-
-  it("fails closed when an epoch has an unsupported objective", async () => {
-    api.loadEpochs.mockResolvedValue([
-      {
-        ...epoch("epoch-a"),
-        config_json: { objective: "maximize_magic" }
-      }
-    ]);
-    api.loadGenerationSummaries.mockResolvedValue([summary]);
-    api.loadGenerationGenes.mockResolvedValue([gene("epoch-a")]);
-
-    render(<App />);
-
-    expect(
-      await screen.findByText("無法辨識這個批次的最佳化目標，已停止繪製候選地形。")
-    ).toBeTruthy();
-    expect(screen.getByText("不支援的最佳化目標")).toBeTruthy();
-    expect(
-      screen.queryByLabelText("兩個策略參數與候選適應度的觀測地形圖")
-    ).toBeNull();
-  });
 });

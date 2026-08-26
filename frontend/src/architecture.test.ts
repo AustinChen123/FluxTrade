@@ -19,6 +19,7 @@ import {
   isImportDeclaration,
   isImportTypeNode,
   isJsxOpeningElement,
+  isJsxSelfClosingElement,
   isLiteralTypeNode,
   isMetaProperty,
   isNamedImports,
@@ -84,8 +85,6 @@ const expectedInventory = [
   "EChart.test.tsx",
   "EChart.tsx",
   "EChartCore.tsx",
-  "FitnessSurface3D.test.tsx",
-  "FitnessSurface3D.tsx",
   "StrategyManager.test.tsx",
   "StrategyManager.tsx",
   "TradeChartView.test.tsx",
@@ -99,9 +98,22 @@ const expectedInventory = [
   "architecture.test.ts",
   "backtestDemo.ts",
   "decimal.ts",
-  "demo.ts",
-  "ga.test.ts",
-  "ga.ts",
+  "features/research/FitnessSurface3D.test.tsx",
+  "features/research/FitnessSurface3D.tsx",
+  "features/research/ResearchPage.test.tsx",
+  "features/research/ResearchPage.tsx",
+  "features/research/ResearchRoute.test.tsx",
+  "features/research/ResearchRoute.tsx",
+  "features/research/demo.test.ts",
+  "features/research/demo.ts",
+  "features/research/gaCharts.test.ts",
+  "features/research/gaCharts.ts",
+  "features/research/gaDomain.test.ts",
+  "features/research/gaDomain.ts",
+  "features/research/researchModel.test.ts",
+  "features/research/researchModel.ts",
+  "features/research/useResearchWorkspace.test.ts",
+  "features/research/useResearchWorkspace.ts",
   "i18n.ts",
   "main.tsx",
   "styles.css",
@@ -147,12 +159,27 @@ const expectedBareImportLedger = [
   "EChartCore.tsx|echarts/core|value",
   "EChartCore.tsx|echarts/renderers|value",
   "EChartCore.tsx|react|value",
-  "FitnessSurface3D.test.tsx|@testing-library/react|value",
-  "FitnessSurface3D.test.tsx|vitest|value",
-  "FitnessSurface3D.tsx|react|value",
-  "ga.test.ts|vitest|value",
-  "ga.ts|echarts/core|type-only",
-  "ga.ts|echarts|type-only",
+  "features/research/demo.test.ts|vitest|value",
+  "features/research/FitnessSurface3D.test.tsx|@testing-library/react|value",
+  "features/research/FitnessSurface3D.test.tsx|vitest|value",
+  "features/research/FitnessSurface3D.tsx|react|value",
+  "features/research/gaCharts.test.ts|vitest|value",
+  "features/research/gaCharts.ts|echarts/core|type-only",
+  "features/research/gaCharts.ts|echarts|type-only",
+  "features/research/gaDomain.test.ts|vitest|value",
+  "features/research/researchModel.test.ts|vitest|value",
+  "features/research/ResearchPage.test.tsx|@testing-library/react|value",
+  "features/research/ResearchPage.test.tsx|vitest|value",
+  "features/research/ResearchPage.tsx|echarts/core|type-only",
+  "features/research/ResearchPage.tsx|react-i18next|value",
+  "features/research/ResearchPage.tsx|react|value",
+  "features/research/ResearchRoute.test.tsx|@testing-library/react|value",
+  "features/research/ResearchRoute.test.tsx|vitest|value",
+  "features/research/ResearchRoute.tsx|react-i18next|value",
+  "features/research/ResearchRoute.tsx|react|value",
+  "features/research/useResearchWorkspace.test.ts|@testing-library/react|value",
+  "features/research/useResearchWorkspace.test.ts|vitest|value",
+  "features/research/useResearchWorkspace.ts|react|value",
   "i18n.ts|i18next|value",
   "i18n.ts|react-i18next|value",
   "main.tsx|react-dom/client|value",
@@ -175,14 +202,8 @@ const expectedRelativeImportLedger = [
   "app/App.test.tsx|../api|type-only|api.ts",
   "app/App.test.tsx|../i18n|value|i18n.ts",
   "app/App.test.tsx|./App|value|app/App.tsx",
-  "app/App.tsx|../api|value|api.ts",
   "app/App.tsx|../BacktestResultsView|value|BacktestResultsView.tsx",
-  "app/App.tsx|../demo|value|demo.ts",
-  "app/App.tsx|../EChart|type-only|EChart.tsx",
-  "app/App.tsx|../EChart|value|EChart.tsx",
-  "app/App.tsx|../FitnessSurface3D|type-only|FitnessSurface3D.tsx",
-  "app/App.tsx|../FitnessSurface3D|value|FitnessSurface3D.tsx",
-  "app/App.tsx|../ga|value|ga.ts",
+  "app/App.tsx|../features/research/ResearchRoute|value|features/research/ResearchRoute.tsx",
   "app/App.tsx|../i18n|type-only|i18n.ts",
   "app/App.tsx|../StrategyManager|value|StrategyManager.tsx",
   "app/App.tsx|../theme|value|theme.ts",
@@ -203,18 +224,60 @@ const expectedRelativeImportLedger = [
   "BacktestResultsView.tsx|./tradeChart|type-only|tradeChart.ts",
   "BacktestResultsView.tsx|./utc|value|utc.ts",
   "CandlestickChart.tsx|./EChartCore|value|EChartCore.tsx",
-  "demo.ts|./api|type-only|api.ts",
   "EChart.test.tsx|./EChart|value|EChart.tsx",
   "EChart.tsx|./EChartCore|value|EChartCore.tsx",
-  "FitnessSurface3D.test.tsx|./FitnessSurface3D|value|FitnessSurface3D.tsx",
-  "FitnessSurface3D.test.tsx|./ga|type-only|ga.ts",
-  "FitnessSurface3D.tsx|./ga|type-only|ga.ts",
-  "FitnessSurface3D.tsx|./theme|type-only|theme.ts",
-  "ga.test.ts|./api|type-only|api.ts",
-  "ga.test.ts|./demo|value|demo.ts",
-  "ga.test.ts|./ga|value|ga.ts",
-  "ga.ts|./api|type-only|api.ts",
-  "ga.ts|./theme|type-only|theme.ts",
+  "features/research/demo.test.ts|./demo|value|features/research/demo.ts",
+  "features/research/demo.ts|../../api|type-only|api.ts",
+  "features/research/FitnessSurface3D.test.tsx|./FitnessSurface3D|value|features/research/FitnessSurface3D.tsx",
+  "features/research/FitnessSurface3D.test.tsx|./gaDomain|type-only|features/research/gaDomain.ts",
+  "features/research/FitnessSurface3D.tsx|../../theme|type-only|theme.ts",
+  "features/research/FitnessSurface3D.tsx|./gaDomain|type-only|features/research/gaDomain.ts",
+  "features/research/gaCharts.test.ts|../../api|type-only|api.ts",
+  "features/research/gaCharts.test.ts|./demo|value|features/research/demo.ts",
+  "features/research/gaCharts.test.ts|./gaCharts|value|features/research/gaCharts.ts",
+  "features/research/gaCharts.test.ts|./gaDomain|value|features/research/gaDomain.ts",
+  "features/research/gaCharts.ts|../../api|type-only|api.ts",
+  "features/research/gaCharts.ts|../../theme|type-only|theme.ts",
+  "features/research/gaCharts.ts|./gaDomain|value|features/research/gaDomain.ts",
+  "features/research/gaDomain.test.ts|../../api|type-only|api.ts",
+  "features/research/gaDomain.test.ts|./demo|value|features/research/demo.ts",
+  "features/research/gaDomain.test.ts|./gaDomain|value|features/research/gaDomain.ts",
+  "features/research/gaDomain.ts|../../api|type-only|api.ts",
+  "features/research/researchModel.test.ts|../../api|type-only|api.ts",
+  "features/research/researchModel.test.ts|./gaDomain|value|features/research/gaDomain.ts",
+  "features/research/researchModel.test.ts|./researchModel|value|features/research/researchModel.ts",
+  "features/research/researchModel.ts|../../api|type-only|api.ts",
+  "features/research/researchModel.ts|./gaDomain|value|features/research/gaDomain.ts",
+  "features/research/ResearchPage.test.tsx|../../api|type-only|api.ts",
+  "features/research/ResearchPage.test.tsx|../../i18n|value|i18n.ts",
+  "features/research/ResearchPage.test.tsx|./researchModel|value|features/research/researchModel.ts",
+  "features/research/ResearchPage.test.tsx|./ResearchPage|value|features/research/ResearchPage.tsx",
+  "features/research/ResearchPage.test.tsx|./useResearchWorkspace|type-only|features/research/useResearchWorkspace.ts",
+  "features/research/ResearchPage.tsx|../../api|value|api.ts",
+  "features/research/ResearchPage.tsx|../../EChart|value|EChart.tsx",
+  "features/research/ResearchPage.tsx|../../theme|type-only|theme.ts",
+  "features/research/ResearchPage.tsx|./FitnessSurface3D|value|features/research/FitnessSurface3D.tsx",
+  "features/research/ResearchPage.tsx|./gaCharts|type-only|features/research/gaCharts.ts",
+  "features/research/ResearchPage.tsx|./gaDomain|type-only|features/research/gaDomain.ts",
+  "features/research/ResearchPage.tsx|./researchModel|value|features/research/researchModel.ts",
+  "features/research/ResearchPage.tsx|./useResearchWorkspace|type-only|features/research/useResearchWorkspace.ts",
+  "features/research/ResearchRoute.test.tsx|../../api|type-only|api.ts",
+  "features/research/ResearchRoute.test.tsx|../../api|type-only|api.ts",
+  "features/research/ResearchRoute.test.tsx|../../i18n|value|i18n.ts",
+  "features/research/ResearchRoute.test.tsx|./ResearchRoute|value|features/research/ResearchRoute.tsx",
+  "features/research/ResearchRoute.tsx|../../i18n|type-only|i18n.ts",
+  "features/research/ResearchRoute.tsx|../../theme|type-only|theme.ts",
+  "features/research/ResearchRoute.tsx|./gaCharts|value|features/research/gaCharts.ts",
+  "features/research/ResearchRoute.tsx|./gaDomain|value|features/research/gaDomain.ts",
+  "features/research/ResearchRoute.tsx|./ResearchPage|value|features/research/ResearchPage.tsx",
+  "features/research/ResearchRoute.tsx|./useResearchWorkspace|value|features/research/useResearchWorkspace.ts",
+  "features/research/useResearchWorkspace.test.ts|../../api|type-only|api.ts",
+  "features/research/useResearchWorkspace.test.ts|../../api|type-only|api.ts",
+  "features/research/useResearchWorkspace.test.ts|./useResearchWorkspace|value|features/research/useResearchWorkspace.ts",
+  "features/research/useResearchWorkspace.ts|../../api|value|api.ts",
+  "features/research/useResearchWorkspace.ts|./demo|value|features/research/demo.ts",
+  "features/research/useResearchWorkspace.ts|./gaDomain|value|features/research/gaDomain.ts",
+  "features/research/useResearchWorkspace.ts|./researchModel|value|features/research/researchModel.ts",
   "main.tsx|./app/App|value|app/App.tsx",
   "main.tsx|./i18n|value|i18n.ts",
   "main.tsx|./styles.css|value|styles.css",
@@ -249,7 +312,7 @@ const expectedPolicyGlobalLedger = [
   "app/App.tsx|window.location.href",
   "app/App.tsx|window.location.href",
   "app/App.tsx|window.location.search",
-  "FitnessSurface3D.tsx|window.devicePixelRatio",
+  "features/research/FitnessSurface3D.tsx|window.devicePixelRatio",
   "i18n.ts|document.documentElement.lang",
   "i18n.ts|document.documentElement.lang",
   "i18n.ts|navigator",
@@ -674,7 +737,7 @@ describe("frontend architecture ratchet", () => {
         .map((edge) => `${edge.importer}|${edge.specifier}|${edge.kind}`)
     ).toEqual(expectedBareImportLedger);
   });
-  it("freezes the complete Node B source inventory", () => {
+  it("freezes the complete Node C source inventory", () => {
     const inventory = walkFiles(sourceRoot).map((file) =>
       path.relative(sourceRoot, file).replaceAll(path.sep, "/")
     );
@@ -719,29 +782,28 @@ describe("frontend architecture ratchet", () => {
     ]);
     expect(directRelativeSpecifiers(edges, "app/App.tsx")).toEqual([
       "../BacktestResultsView|value|BacktestResultsView.tsx",
-      "../EChart|type-only|EChart.tsx",
-      "../EChart|value|EChart.tsx",
-      "../FitnessSurface3D|type-only|FitnessSurface3D.tsx",
-      "../FitnessSurface3D|value|FitnessSurface3D.tsx",
       "../StrategyManager|value|StrategyManager.tsx",
       "../TradeChartView|value|TradeChartView.tsx",
-      "../api|value|api.ts",
-      "../demo|value|demo.ts",
-      "../ga|value|ga.ts",
+      "../features/research/ResearchRoute|value|features/research/ResearchRoute.tsx",
       "../i18n|type-only|i18n.ts",
       "../theme|value|theme.ts",
       "./navigation|value|app/navigation.ts"
     ]);
-    expect(directRelativeSpecifiers(edges, "ga.ts")).toEqual([
-      "./api|type-only|api.ts",
-      "./theme|type-only|theme.ts"
+    expect(directRelativeSpecifiers(edges, "features/research/gaDomain.ts")).toEqual([
+      "../../api|type-only|api.ts"
     ]);
-    expect(directRelativeSpecifiers(edges, "demo.ts")).toEqual([
-      "./api|type-only|api.ts"
+    expect(directRelativeSpecifiers(edges, "features/research/gaCharts.ts")).toEqual([
+      "../../api|type-only|api.ts",
+      "../../theme|type-only|theme.ts",
+      "./gaDomain|value|features/research/gaDomain.ts"
     ]);
-    expect(directRelativeSpecifiers(edges, "FitnessSurface3D.tsx")).toEqual([
-      "./ga|type-only|ga.ts",
-      "./theme|type-only|theme.ts"
+    expect(
+      directRelativeSpecifiers(edges, "features/research/useResearchWorkspace.ts")
+    ).toEqual([
+      "../../api|value|api.ts",
+      "./demo|value|features/research/demo.ts",
+      "./gaDomain|value|features/research/gaDomain.ts",
+      "./researchModel|value|features/research/researchModel.ts"
     ]);
   });
 
@@ -879,28 +941,31 @@ describe("frontend architecture ratchet", () => {
     ]);
   });
 
-  it("keeps every legacy research declaration inside one private workspace", () => {
-    const appPath = path.join(sourceRoot, "app/App.tsx");
-    const sourceFile = compilerProject!.program.getSourceFile(appPath);
-    if (!sourceFile) {
-      throw new Error("App.tsx is unavailable to the architecture compiler");
-    }
-    const legacyMatches = findNamedFunction(sourceFile, "LegacyResearchWorkspace");
-    const appMatches = findNamedFunction(sourceFile, "App");
-    expect(legacyMatches).toHaveLength(1);
-    expect(appMatches).toHaveLength(1);
-    const legacy = legacyMatches[0];
-    const app = appMatches[0];
-    expect(
-      legacy.modifiers?.some((modifier) =>
-        [SyntaxKind.ExportKeyword, SyntaxKind.DefaultKeyword].includes(
-          modifier.kind
-        )
-      ) ?? false
-    ).toBe(false);
+  it("keeps the final research owner behind one shell facade", () => {
+    const source = (relativePath: string) => {
+      const file = compilerProject!.program.getSourceFile(
+        path.join(sourceRoot, relativePath)
+      );
+      if (!file) {
+        throw new Error(`${relativePath} is unavailable to the architecture compiler`);
+      }
+      return file;
+    };
+    const appSource = source("app/App.tsx");
+    const routeSource = source("features/research/ResearchRoute.tsx");
+    const workspaceSource = source("features/research/useResearchWorkspace.ts");
+    const pageSource = source("features/research/ResearchPage.tsx");
+    const app = findNamedFunction(appSource, "App");
+    const route = findNamedFunction(routeSource, "ResearchRoute");
+    const workspace = findNamedFunction(
+      workspaceSource,
+      "useResearchWorkspace"
+    );
+    expect(app).toHaveLength(1);
+    expect(route).toHaveLength(1);
+    expect(workspace).toHaveLength(1);
 
-    const legacyNames = declaredNames(legacy);
-    const exactStateNames = [
+    const researchStateNames = [
       "epochs",
       "setEpochs",
       "epochId",
@@ -921,17 +986,33 @@ describe("frontend architecture ratchet", () => {
       "setSurfaceMode",
       "loading",
       "setLoading",
-      "error",
-      "setError",
+      "failure",
+      "setFailure",
       "epochsLoaded",
       "setEpochsLoaded",
       "reloadToken",
       "setReloadToken"
     ];
-    for (const name of exactStateNames) {
-      expect(legacyNames.filter((candidate) => candidate === name)).toHaveLength(1);
+    const appNames = declaredNames(app[0]);
+    for (const name of researchStateNames) {
+      expect(appNames).not.toContain(name);
     }
-    const statePairs = descendants(legacy).flatMap((node) => {
+    expect(
+      descendants(app[0]).filter(
+        (node) =>
+          isJsxOpeningElement(node) &&
+          isIdentifier(node.tagName) &&
+          node.tagName.text === "ResearchRoute"
+      )
+    ).toHaveLength(1);
+
+    const workspaceNames = declaredNames(workspace[0]);
+    for (const name of researchStateNames) {
+      expect(workspaceNames.filter((candidate) => candidate === name)).toHaveLength(
+        1
+      );
+    }
+    const statePairs = descendants(workspace[0]).flatMap((node) => {
       if (
         !isVariableDeclaration(node) ||
         !isArrayBindingPattern(node.name) ||
@@ -965,135 +1046,57 @@ describe("frontend architecture ratchet", () => {
       "yParameter/setYParameter",
       "surfaceMode/setSurfaceMode",
       "loading/setLoading",
-      "error/setError",
+      "failure/setFailure",
       "epochsLoaded/setEpochsLoaded",
       "reloadToken/setReloadToken"
     ]);
-    for (const name of [
-      "dimensions",
-      "numericParameters",
-      "rankedGenes",
-      "chartCopy",
-      "convergence",
-      "surfaceRows",
-      "observationRows",
-      "selectedSurfaceRow",
-      "surface",
-      "surfaceSelection",
-      "parallel",
-      "epoch",
-      "selectedGene",
-      "objective",
-      "objectiveText",
-      "dateFormatter",
-      "chooseGeneFromChart",
-      "chooseEpoch"
-    ]) {
-      expect(legacyNames.filter((candidate) => candidate === name)).toHaveLength(1);
-    }
+    const workspaceCalls = descendants(workspace[0]).filter(isCallExpression);
+    expect(
+      workspaceCalls.filter(
+        (node) =>
+          isIdentifier(node.expression) && node.expression.text === "useEffect"
+      )
+    ).toHaveLength(4);
+    expect(
+      workspaceCalls.filter(
+        (node) =>
+          isIdentifier(node.expression) && node.expression.text === "useMemo"
+      )
+    ).toHaveLength(3);
 
-    const legacyNodes = descendants(legacy);
-    const callCount = (hook: string) =>
-      legacyNodes.filter(
+    expect(
+      descendants(route[0]).filter(
         (node) =>
           isCallExpression(node) &&
           isIdentifier(node.expression) &&
-          node.expression.text === hook
-      ).length;
-    expect(callCount("useEffect")).toBe(4);
-    expect(callCount("useMemo")).toBe(11);
-
-    const importRanges = sourceFile.statements
-      .filter(isImportDeclaration)
-      .map((declaration) => [declaration.pos, declaration.end] as const);
-    const researchBindings = new Set([
-      "ApiError",
-      "ChartCopy",
-      "Epoch",
-      "Gene",
-      "GenerationSummary",
-      "buildDemoGenes",
-      "compareGenes",
-      "convergenceOption",
-      "demoEpoch",
-      "demoSummaries",
-      "ensureBrowserSession",
-      "epochObjective",
-      "finiteNumber",
-      "fitnessObservationRows",
-      "fitnessSurfaceOption",
-      "fitnessSurfaceRows",
-      "loadEpochs",
-      "loadGenerationGenes",
-      "loadGenerationSummaries",
-      "parallelOption",
-      "parameterDimensions",
-      "selectBestGene",
-      "selectedSurfaceOption",
-      "surfaceRow"
-    ]);
-    const researchSymbolIds = new Set(
-      descendants(sourceFile).flatMap((node) => {
-        if (
-          !isIdentifier(node) ||
-          !researchBindings.has(node.text) ||
-          !importRanges.some(
-            ([start, end]) => node.pos >= start && node.end <= end
-          )
-        ) {
-          return [];
-        }
-        const symbol = compilerProject!.checker.getSymbolAtLocation(node);
-        return symbol ? [symbol.id] : [];
-      })
-    );
-    expect(researchSymbolIds.size).toBe(researchBindings.size);
-    const leakedResearchReferences = descendants(sourceFile).filter(
-      (node) =>
-        isIdentifier(node) &&
-        (() => {
-          const symbol = compilerProject!.checker.getSymbolAtLocation(node);
-          return symbol !== undefined && researchSymbolIds.has(symbol.id);
-        })() &&
-        !importRanges.some(
-          ([start, end]) => node.pos >= start && node.end <= end
-        ) &&
-        !(node.pos >= legacy.pos && node.end <= legacy.end)
-    );
-    expect(
-      leakedResearchReferences.map((node) =>
-        isIdentifier(node) ? node.text : "unknown"
-      )
-    ).toEqual([]);
-
-    const researchDynamicImports = descendants(sourceFile).filter(
-      (node) =>
-        isCallExpression(node) &&
-        node.expression.kind === SyntaxKind.ImportKeyword &&
-        node.arguments.length === 1 &&
-        isStringLiteral(node.arguments[0]) &&
-        ["../EChart", "../FitnessSurface3D"].includes(node.arguments[0].text)
-    );
-    expect(researchDynamicImports).toHaveLength(2);
-    expect(
-      researchDynamicImports.every(
-        (node) => node.pos >= legacy.pos && node.end <= legacy.end
-      )
-    ).toBe(true);
-
-    const appNames = declaredNames(app);
-    for (const name of exactStateNames) {
-      expect(appNames).not.toContain(name);
-    }
-    expect(
-      descendants(app).filter(
-        (node) =>
-          isJsxOpeningElement(node) &&
-          isIdentifier(node.tagName) &&
-          node.tagName.text === "LegacyResearchWorkspace"
+          node.expression.text === "useResearchWorkspace"
       )
     ).toHaveLength(1);
-    const chooseViewDeclaration = descendants(app).find(
+    expect(
+      descendants(route[0]).filter(
+        (node) =>
+          (isJsxOpeningElement(node) || isJsxSelfClosingElement(node)) &&
+          isIdentifier(node.tagName) &&
+          node.tagName.text === "ResearchPage"
+      )
+    ).toHaveLength(1);
+    const researchDynamicImports = descendants(pageSource).flatMap((node) => {
+      if (
+        !isCallExpression(node) ||
+        node.expression.kind !== SyntaxKind.ImportKeyword ||
+        node.arguments.length !== 1 ||
+        !isStringLiteral(node.arguments[0])
+      ) {
+        return [];
+      }
+      return [node.arguments[0].text];
+    });
+    expect(researchDynamicImports).toEqual([
+      "../../EChart",
+      "./FitnessSurface3D"
+    ]);
+
+    const chooseViewDeclaration = descendants(app[0]).find(
       (node) =>
         isVariableDeclaration(node) &&
         isIdentifier(node.name) &&
@@ -1102,12 +1105,12 @@ describe("frontend architecture ratchet", () => {
     if (!chooseViewDeclaration) {
       throw new Error("App chooseView declaration is missing");
     }
-    const chooseViewSource = chooseViewDeclaration.getText(sourceFile);
+    const chooseViewSource = chooseViewDeclaration.getText(appSource);
     const orderedOperations = [
       "setResearchActivated(true)",
       "serializeNavigation(",
       "setInspectedTradeId(navigation.inspectedTradeId)",
-      "window.history.replaceState(null, \"\", navigation.relativeUrl)",
+      'window.history.replaceState(null, "", navigation.relativeUrl)',
       "setView(nextView)"
     ];
     const indexes = orderedOperations.map((operation) =>

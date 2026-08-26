@@ -1,7 +1,7 @@
 import { useEffect, useId, useRef, useState } from "react";
 
-import type { SurfaceRow } from "./ga";
-import type { Theme } from "./theme";
+import type { Theme } from "../../theme";
+import type { SurfaceRow } from "./gaDomain";
 
 type Props = {
   surfaceRows: SurfaceRow[];

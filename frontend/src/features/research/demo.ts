@@ -1,4 +1,4 @@
-import type { Epoch, Gene, GenerationSummary } from "./api";
+import type { Epoch, Gene, GenerationSummary } from "../../api";
 
 export const demoEpoch: Epoch = {
   id: "epoch_20260728_demo",

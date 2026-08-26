@@ -1,23 +1,37 @@
 import { describe, expect, it } from "vitest";
 
-import type { Epoch, Gene, GenerationSummary } from "./api";
-import { demoEpoch } from "./demo";
+import type { Epoch, Gene, GenerationSummary } from "../../api";
 import {
-  type ChartCopy,
-  compareGenes,
   convergenceOption,
-  epochObjective,
-  finiteNumber,
-  fitnessObservationRows,
   fitnessSurfaceOption,
-  fitnessSurfaceRows,
-  numericParameterNames,
-  parameterDimensions,
+  parallelOption,
   selectedSurfaceOption,
-  selectBestGene,
+  type ChartCopy
+} from "./gaCharts";
+import {
+  fitnessSurfaceRows,
+  parameterDimensions,
   surfaceRow
-} from "./ga";
+} from "./gaDomain";
+import { demoEpoch } from "./demo";
 
+const epoch: Epoch = {
+  id: "epoch",
+  strategy_id: "strategy",
+  started_at: "2026-07-28T00:00:00Z",
+  finished_at: "2026-07-28T01:00:00Z",
+  pop_size: 1,
+  max_generations: 1,
+  generations_run: 1,
+  best_score: "1",
+  seed: 1,
+  config_json: { objective: "maximize_score" },
+  status: "completed",
+  eval_pair: "RITHMIC:MNQ_ROLL-PERP",
+  eval_start_date: "2026-01-01",
+  eval_end_date: "2026-07-28",
+  eval_timeframe: "5m"
+};
 const copy: ChartCopy = {
   locale: "en",
   generation: "Generation",
@@ -36,8 +50,8 @@ const copy: ChartCopy = {
 
 function gene(
   id: number,
-  paramPack: Record<string, unknown>,
-  score = "1.5"
+  score = "1.5",
+  paramPack: Record<string, unknown> = { fast: id, slow: id * 2 }
 ): Gene {
   return {
     id,
@@ -46,28 +60,33 @@ function gene(
     param_pack: paramPack,
     score_total: score,
     score_breakdown: {},
-    max_drawdown: "0.2",
+    max_drawdown: "0.1",
     generation_index: 0,
     candidate_id: `candidate-${id}`,
     epoch_id: "epoch",
-    created_at: "2026-07-28T00:00:00Z"
+    created_at: "2026-07-28T01:00:00Z"
   };
 }
 
 function surfaceOptions(
-  epoch: Epoch,
+  currentEpoch: Epoch,
   genes: Gene[],
   xParameter: string,
   yParameter: string,
   selectedGeneId: number | null = null
 ) {
-  const rows = fitnessSurfaceRows(epoch, genes, xParameter, yParameter);
+  const rows = fitnessSurfaceRows(
+    currentEpoch,
+    genes,
+    xParameter,
+    yParameter
+  );
   const selectedGene =
     genes.find((candidate) => candidate.id === selectedGeneId) ?? null;
   return {
     rows,
     base: fitnessSurfaceOption(
-      epoch,
+      currentEpoch,
       rows,
       xParameter,
       yParameter,
@@ -75,38 +94,84 @@ function surfaceOptions(
       "light"
     ),
     update: selectedSurfaceOption(
-      surfaceRow(epoch, selectedGene, xParameter, yParameter)
+      surfaceRow(currentEpoch, selectedGene, xParameter, yParameter)
     )
   };
 }
 
-describe("GA visualization transforms", () => {
-  it("keeps invalid values out of numeric chart axes", () => {
-    expect(finiteNumber("1.25")).toBe(1.25);
-    expect(finiteNumber("")).toBeNull();
-    expect(finiteNumber("not-a-number")).toBeNull();
-    expect(finiteNumber(null)).toBeNull();
+describe("GA chart projection", () => {
+  it("projects convergence without changing persisted Decimal strings", () => {
+    const summaries: GenerationSummary[] = [
+      {
+        generation_index: 0,
+        candidate_count: 1,
+        score_min: "1.25",
+        score_max: "2.50",
+        drawdown_min: "0.1",
+        drawdown_max: "0.2"
+      }
+    ];
+    const option = convergenceOption(epoch, summaries, copy, "light") as {
+      series: Array<{ data: unknown[] }>;
+    };
+
+    expect(option.series.map((series) => series.data)).toEqual([
+      [[0, 1.25]],
+      [[0, 2.5]]
+    ]);
+    expect(summaries[0].score_max).toBe("2.50");
   });
 
-  it("classifies numeric and categorical parameters once for every chart", () => {
-    const genes = [
-      gene(1, { fast: 5, slow: "20", session: "rth" }),
-      gene(2, { fast: 8, slow: "34", session: "full" })
-    ];
+  it("keeps surface observations and selection in separate series updates", () => {
+    const genes = [gene(1, "1"), gene(2, "2")];
+    const rows = fitnessSurfaceRows(epoch, genes, "fast", "slow");
+    const option = fitnessSurfaceOption(
+      epoch,
+      rows,
+      "fast",
+      "slow",
+      copy,
+      "dark"
+    ) as { series: Array<{ id: string; data: unknown[] }> };
+    const selection = selectedSurfaceOption(rows[1]) as {
+      series: Array<{ id: string; data: unknown[] }>;
+    };
 
-    expect(numericParameterNames(genes)).toEqual(["fast", "slow"]);
-    expect(parameterDimensions(genes)).toEqual([
-      { name: "fast", type: "value" },
-      { name: "session", type: "category", categories: ["full", "rth"] },
-      { name: "slow", type: "value" }
+    expect(option.series[0]).toMatchObject({
+      id: "fitness-surface",
+      data: rows
+    });
+    expect(option.series[1]).toMatchObject({
+      id: "selected-candidate",
+      data: []
+    });
+    expect(selection.series).toEqual([
+      { id: "selected-candidate", data: [rows[1]] }
     ]);
+  });
+
+  it("limits parallel presentation to twelve dimensions", () => {
+    const candidate = gene(1, "1");
+    candidate.param_pack = Object.fromEntries(
+      Array.from({ length: 14 }, (_, index) => [`p${index}`, index])
+    );
+    const option = parallelOption(
+      [candidate],
+      parameterDimensions([candidate]),
+      candidate.id,
+      "light",
+      "en"
+    ) as { parallelAxis: unknown[]; series: Array<{ data: unknown[] }> };
+
+    expect(option.parallelAxis).toHaveLength(12);
+    expect(option.series[0].data).toHaveLength(1);
+    expect(option.series[1].data).toHaveLength(1);
   });
 
   it("builds 10k observed surface rows with progressive rendering", () => {
     const genes = Array.from({ length: 10_000 }, (_, index) =>
-      gene(index, { fast: index, slow: index * 2 }, String(index))
+      gene(index, String(index), { fast: index, slow: index * 2 })
     );
-
     const option = surfaceOptions(
       demoEpoch,
       genes,
@@ -130,7 +195,10 @@ describe("GA visualization transforms", () => {
       demoEpoch,
       [
         {
-          ...gene(1, { "<img src=x onerror=alert(1)>": 5, slow: 20 }),
+          ...gene(1, "1.5", {
+            "<img src=x onerror=alert(1)>": 5,
+            slow: 20
+          }),
           candidate_id: "<script>alert(1)</script>"
         }
       ],
@@ -163,9 +231,9 @@ describe("GA visualization transforms", () => {
     const options = surfaceOptions(
       demoEpoch,
       [
-        gene(1, { fast: 5, slow: 20 }, "1"),
-        gene(2, { fast: 8, slow: 20 }, "2"),
-        gene(3, { fast: 8, slow: 34 }, "3")
+        gene(1, "1", { fast: 5, slow: 20 }),
+        gene(2, "2", { fast: 8, slow: 20 }),
+        gene(3, "3", { fast: 8, slow: 34 })
       ],
       "fast",
       "slow",
@@ -173,13 +241,7 @@ describe("GA visualization transforms", () => {
     );
     const option = options.base as {
       grid: { right: number };
-      visualMap: {
-        orient: string;
-        seriesIndex: number;
-        min: number;
-        max: number;
-        formatter: (value: unknown) => string;
-      };
+      visualMap: { orient: string; seriesIndex: number };
       xAxis: { type: string };
       yAxis: { type: string };
       series: Array<{ type: string; data: unknown[] }>;
@@ -203,7 +265,10 @@ describe("GA visualization transforms", () => {
   it("keeps a constant fitness scale truthful and locale-formatted", () => {
     const option = surfaceOptions(
       demoEpoch,
-      [gene(1, { fast: 5, slow: 20 }), gene(2, { fast: 8, slow: 34 })],
+      [
+        gene(1, "1.5", { fast: 5, slow: 20 }),
+        gene(2, "1.5", { fast: 8, slow: 34 })
+      ],
       "fast",
       "slow"
     ).base as {
@@ -220,7 +285,7 @@ describe("GA visualization transforms", () => {
   });
 
   it("uses drawdown bounds for a minimize-drawdown epoch", () => {
-    const epoch: Epoch = {
+    const minimizeEpoch: Epoch = {
       ...demoEpoch,
       config_json: { objective: "minimize_drawdown" }
     };
@@ -234,10 +299,12 @@ describe("GA visualization transforms", () => {
         drawdown_max: "0.3"
       }
     ] satisfies GenerationSummary[];
-
-    const option = convergenceOption(epoch, summaries, copy, "light") as {
-      series: Array<{ data: unknown[] }>;
-    };
+    const option = convergenceOption(
+      minimizeEpoch,
+      summaries,
+      copy,
+      "light"
+    ) as { series: Array<{ data: unknown[] }> };
 
     expect(option.series[0].data).toEqual([[0, 0.1]]);
     expect(option.series[1].data).toEqual([[0, 0.3]]);
@@ -268,15 +335,21 @@ describe("GA visualization transforms", () => {
   });
 
   it("uses the best observed drawdown for duplicate surface coordinates", () => {
-    const epoch: Epoch = {
+    const minimizeEpoch: Epoch = {
       ...demoEpoch,
       config_json: { objective: "minimize_drawdown" }
     };
     const options = surfaceOptions(
-      epoch,
+      minimizeEpoch,
       [
-        { ...gene(1, { fast: 5, slow: 20 }, "9"), max_drawdown: "0.3" },
-        { ...gene(2, { fast: 5, slow: 20 }, "1"), max_drawdown: "0.1" }
+        {
+          ...gene(1, "9", { fast: 5, slow: 20 }),
+          max_drawdown: "0.3"
+        },
+        {
+          ...gene(2, "1", { fast: 5, slow: 20 }),
+          max_drawdown: "0.1"
+        }
       ],
       "fast",
       "slow"
@@ -294,64 +367,5 @@ describe("GA visualization transforms", () => {
       "Best observed at each X/Y coordinate"
     );
     expect(option.visualMap.inRange.color[0]).toBe("#454b8c");
-  });
-
-  it("matches backend drawdown risk ordering for signed values and score ties", () => {
-    const epoch: Epoch = {
-      ...demoEpoch,
-      config_json: { objective: "minimize_drawdown" }
-    };
-    const genes = [
-      { ...gene(1, { fast: 5, slow: 20 }, "9"), max_drawdown: "-0.3" },
-      { ...gene(2, { fast: 5, slow: 20 }, "1"), max_drawdown: "-0.1" },
-      { ...gene(3, { fast: 5, slow: 20 }, "2"), max_drawdown: "0.1" }
-    ];
-
-    expect(selectBestGene(epoch, genes)?.id).toBe(3);
-    expect([...genes].sort((left, right) => compareGenes(epoch, left, right)))
-      .toEqual([genes[2], genes[1], genes[0]]);
-    expect(fitnessSurfaceRows(epoch, genes, "fast", "slow")).toEqual([
-      [5, 20, 0.1, 3, "candidate-3"]
-    ]);
-  });
-
-  it("preserves Numeric(18,8) ordering beyond JavaScript Number precision", () => {
-    const genes = [
-      gene(1, { fast: 5, slow: 20 }, "9999999999.99999998"),
-      gene(2, { fast: 5, slow: 20 }, "9999999999.99999999")
-    ];
-
-    expect(Number(genes[0].score_total)).toBe(Number(genes[1].score_total));
-    expect(selectBestGene(demoEpoch, genes)?.id).toBe(2);
-    expect(fitnessSurfaceRows(demoEpoch, genes, "fast", "slow")).toEqual([
-      [5, 20, 10_000_000_000, 2, "candidate-2"]
-    ]);
-  });
-
-  it("keeps every valid observation while deduplicating interpolation rows", () => {
-    const genes = [
-      gene(1, { fast: 5, slow: 20 }, "1"),
-      gene(2, { fast: 5, slow: 20 }, "2")
-    ];
-
-    expect(fitnessSurfaceRows(demoEpoch, genes, "fast", "slow")).toHaveLength(1);
-    expect(
-      fitnessObservationRows(demoEpoch, genes, "fast", "slow").map(
-        (row) => row[3]
-      )
-    ).toEqual([1, 2]);
-  });
-
-  it("fails closed for an unsupported optimization objective", () => {
-    const epoch = {
-      ...demoEpoch,
-      config_json: { objective: "maximize_magic" }
-    };
-    const genes = [gene(1, { fast: 5, slow: 20 }, "1")];
-
-    expect(epochObjective(epoch)).toBeNull();
-    expect(selectBestGene(epoch, genes)).toBeNull();
-    expect(fitnessSurfaceRows(epoch, genes, "fast", "slow")).toEqual([]);
-    expect(fitnessObservationRows(epoch, genes, "fast", "slow")).toEqual([]);
   });
 });
