@@ -10,8 +10,8 @@ import {
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import { App } from "./App";
-import i18n, { resolveLocale } from "./i18n";
-import type { Epoch, Gene, GenerationSummary } from "./api";
+import i18n, { resolveLocale } from "../i18n";
+import type { Epoch, Gene, GenerationSummary } from "../api";
 
 const api = vi.hoisted(() => ({
   ensureBrowserSession: vi.fn(),
@@ -19,13 +19,18 @@ const api = vi.hoisted(() => ({
   loadGenerationGenes: vi.fn(),
   loadGenerationSummaries: vi.fn()
 }));
+const lifecycles = vi.hoisted(() => ({
+  results: { mounts: 0, unmounts: 0 },
+  strategies: { mounts: 0, unmounts: 0 },
+  trades: { mounts: 0, unmounts: 0 }
+}));
 
-vi.mock("./api", async (importOriginal) => ({
-  ...(await importOriginal<typeof import("./api")>()),
+vi.mock("../api", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("../api")>()),
   ...api
 }));
 
-vi.mock("./EChart", () => ({
+vi.mock("../EChart", () => ({
   EChart: ({
     ariaLabel,
     onDataClick
@@ -43,7 +48,7 @@ vi.mock("./EChart", () => ({
   )
 }));
 
-vi.mock("./FitnessSurface3D", async () => {
+vi.mock("../FitnessSurface3D", async () => {
   const { useEffect, useRef } = await import("react");
   return {
     FitnessSurface3D: ({
@@ -77,53 +82,113 @@ vi.mock("./FitnessSurface3D", async () => {
   };
 });
 
-vi.mock("./StrategyManager", () => ({
-  StrategyManager: () => <section data-testid="strategy-manager" />
-}));
+vi.mock("../StrategyManager", async () => {
+  const { useEffect, useState } = await import("react");
+  return {
+    StrategyManager: () => {
+      const [state, setState] = useState("initial");
+      useEffect(() => {
+        lifecycles.strategies.mounts += 1;
+        return () => {
+          lifecycles.strategies.unmounts += 1;
+        };
+      }, []);
+      return (
+        <section data-testid="strategy-manager">
+          <button
+            type="button"
+            data-testid="strategies-state"
+            onClick={() => setState("changed")}
+          >
+            strategies:{state}
+          </button>
+        </section>
+      );
+    }
+  };
+});
 
-vi.mock("./TradeChartView", () => ({
-  TradeChartView: ({
-    demoMode,
-    initialTradeId,
-    onSelectTrade
-  }: {
-    demoMode: boolean;
-    initialTradeId?: string | null;
-    onSelectTrade?: (tradeId: string) => void;
-  }) => (
-    <section
-      data-demo={String(demoMode)}
-      data-selected-trade={initialTradeId ?? ""}
-      data-testid="trade-chart-view"
-    >
-      <button
-        type="button"
-        onClick={() => onSelectTrade?.("trade-000184")}
-      >
-        Select mock trade
-      </button>
-    </section>
-  )
-}));
+vi.mock("../TradeChartView", async () => {
+  const { useEffect, useState } = await import("react");
+  return {
+    TradeChartView: ({
+      demoMode,
+      initialTradeId,
+      onSelectTrade
+    }: {
+      demoMode: boolean;
+      initialTradeId?: string | null;
+      onSelectTrade?: (tradeId: string) => void;
+    }) => {
+      const [state, setState] = useState("initial");
+      useEffect(() => {
+        lifecycles.trades.mounts += 1;
+        return () => {
+          lifecycles.trades.unmounts += 1;
+        };
+      }, []);
+      return (
+        <section
+          data-demo={String(demoMode)}
+          data-selected-trade={initialTradeId ?? ""}
+          data-testid="trade-chart-view"
+        >
+          <button
+            type="button"
+            onClick={() => onSelectTrade?.("trade-000184")}
+          >
+            Select mock trade
+          </button>
+          <button
+            type="button"
+            data-testid="trades-state"
+            onClick={() => setState("changed")}
+          >
+            trades:{state}
+          </button>
+        </section>
+      );
+    }
+  };
+});
 
-vi.mock("./BacktestResultsView", () => ({
-  BacktestResultsView: ({
-    demoMode,
-    onInspectTrade
-  }: {
-    demoMode: boolean;
-    onInspectTrade?: (tradeId: string) => void;
-  }) => (
-    <section data-demo={String(demoMode)} data-testid="backtest-results-view">
-      <button
-        type="button"
-        onClick={() => onInspectTrade?.("trade-000184")}
-      >
-        Inspect mock trade
-      </button>
-    </section>
-  )
-}));
+vi.mock("../BacktestResultsView", async () => {
+  const { useEffect, useState } = await import("react");
+  return {
+    BacktestResultsView: ({
+      demoMode,
+      onInspectTrade
+    }: {
+      demoMode: boolean;
+      onInspectTrade?: (tradeId: string) => void;
+    }) => {
+      const [state, setState] = useState("initial");
+      useEffect(() => {
+        lifecycles.results.mounts += 1;
+        return () => {
+          lifecycles.results.unmounts += 1;
+        };
+      }, []);
+      return (
+        <section data-demo={String(demoMode)} data-testid="backtest-results-view">
+          <button
+            type="button"
+            onClick={() => onInspectTrade?.("trade-000184")}
+          >
+            Inspect mock trade
+          </button>
+          <button
+            type="button"
+            data-testid="results-state"
+            onClick={() => setState("changed")}
+          >
+            results:{state}
+          </button>
+        </section>
+      );
+    }
+  };
+});
 
 const epoch = (id: string): Epoch => ({
   id,
@@ -179,6 +244,10 @@ const storage = new Map<string, string>();
 describe("GA visualization state", () => {
   beforeEach(async () => {
     vi.clearAllMocks();
+    for (const lifecycle of Object.values(lifecycles)) {
+      lifecycle.mounts = 0;
+      lifecycle.unmounts = 0;
+    }
     window.history.replaceState({}, "", "/");
     storage.clear();
     delete document.documentElement.dataset.theme;
@@ -387,6 +456,29 @@ describe("GA visualization state", () => {
     expect(new URL(window.location.href).searchParams.has("view")).toBe(false);
   });
 
+  it("replaces the owned query once without navigating the document", async () => {
+    window.history.replaceState(
+      {},
+      "",
+      "/console?view=results&view=trades&trade=old&trade=older&keep=1&keep=2#anchor"
+    );
+    api.loadGenerationSummaries.mockResolvedValue([summary]);
+    api.loadGenerationGenes.mockResolvedValue([gene("epoch-a")]);
+    const replaceState = vi.spyOn(window.history, "replaceState");
+    render(<App />);
+
+    fireEvent.click(screen.getByRole("button", { name: "進出場檢視" }));
+    expect(await screen.findByTestId("trade-chart-view")).toBeTruthy();
+    expect(replaceState).toHaveBeenCalledTimes(1);
+    expect(replaceState).toHaveBeenCalledWith(
+      null,
+      "",
+      "/console?view=trades&keep=1&keep=2#anchor"
+    );
+    expect(window.location.pathname).toBe("/console");
+    expect(window.location.hash).toBe("#anchor");
+  });
+
   it("does not reload research data after visiting trade inspection", async () => {
     api.loadGenerationSummaries.mockResolvedValue([summary]);
     api.loadGenerationGenes.mockResolvedValue([gene("epoch-a")]);
@@ -421,6 +513,104 @@ describe("GA visualization state", () => {
 
     genes.resolve([gene("epoch-a")]);
     await screen.findAllByText("candidate-epoch-a");
+  });
+
+  it("keeps only research mounted and recreates every active-only feature", async () => {
+    api.loadGenerationSummaries.mockResolvedValue([summary]);
+    api.loadGenerationGenes.mockImplementation((epochId: string) =>
+      Promise.resolve([gene(epochId)])
+    );
+    render(<App />);
+    await screen.findAllByText("candidate-epoch-a");
+
+    expect(lifecycles).toEqual({
+      results: { mounts: 0, unmounts: 0 },
+      strategies: { mounts: 0, unmounts: 0 },
+      trades: { mounts: 0, unmounts: 0 }
+    });
+    fireEvent.change(screen.getByRole("combobox", { name: "演化批次" }), {
+      target: { value: "epoch-b" }
+    });
+    await screen.findAllByText("candidate-epoch-b");
+
+    fireEvent.click(screen.getByRole("button", { name: "回測績效" }));
+    fireEvent.click(await screen.findByTestId("results-state"));
+    expect(screen.getByTestId("results-state").textContent).toBe(
+      "results:changed"
+    );
+
+    fireEvent.click(screen.getByRole("button", { name: "策略管理" }));
+    fireEvent.click(await screen.findByTestId("strategies-state"));
+    expect(lifecycles.results).toEqual({ mounts: 1, unmounts: 1 });
+
+    fireEvent.click(screen.getByRole("button", { name: "進出場檢視" }));
+    fireEvent.click(await screen.findByTestId("trades-state"));
+    expect(lifecycles.strategies).toEqual({ mounts: 1, unmounts: 1 });
+
+    fireEvent.click(screen.getByRole("button", { name: "參數研究" }));
+    await screen.findAllByText("candidate-epoch-b");
+    expect(
+      (screen.getByRole("combobox", { name: "演化批次" }) as HTMLSelectElement)
+        .value
+    ).toBe("epoch-b");
+    expect(lifecycles.trades).toEqual({ mounts: 1, unmounts: 1 });
+    expect(api.loadEpochs).toHaveBeenCalledTimes(1);
+
+    fireEvent.click(screen.getByRole("button", { name: "回測績效" }));
+    expect((await screen.findByTestId("results-state")).textContent).toBe(
+      "results:initial"
+    );
+    expect(lifecycles.results).toEqual({ mounts: 2, unmounts: 1 });
+    fireEvent.click(screen.getByRole("button", { name: "策略管理" }));
+    expect((await screen.findByTestId("strategies-state")).textContent).toBe(
+      "strategies:initial"
+    );
+    fireEvent.click(screen.getByRole("button", { name: "進出場檢視" }));
+    expect((await screen.findByTestId("trades-state")).textContent).toBe(
+      "trades:initial"
+    );
+  });
+
+  it("places opaque research slots at the frozen shell positions", async () => {
+    window.history.replaceState({}, "", "/?view=strategies");
+    api.loadGenerationSummaries.mockResolvedValue([summary]);
+    api.loadGenerationGenes.mockResolvedValue([gene("epoch-a")]);
+    const { container } = render(<App />);
+
+    const toolbarClasses = () =>
+      Array.from(container.querySelector(".toolbar")?.children ?? []).map(
+        (element) => element.className
+      );
+    expect(toolbarClasses()).toEqual(["language-control", "theme-control"]);
+    expect(container.querySelector(".epoch-control")).toBeNull();
+
+    fireEvent.click(screen.getByRole("button", { name: "參數研究" }));
+    await screen.findAllByText("candidate-epoch-a");
+    expect(toolbarClasses()).toEqual([
+      "epoch-control",
+      "language-control",
+      "theme-control"
+    ]);
+    expect(container.querySelectorAll(".epoch-control")).toHaveLength(1);
+    const researchMainClasses = Array.from(
+      container.querySelector("main")?.children ?? []
+    ).map((element) => element.className);
+    expect(researchMainClasses.slice(0, 4)).toEqual([
+      "topbar",
+      "console-nav",
+      "run-strip",
+      "analysis-grid"
+    ]);
+
+    fireEvent.click(screen.getByRole("button", { name: "回測績效" }));
+    expect(await screen.findByTestId("backtest-results-view")).toBeTruthy();
+    expect(toolbarClasses()).toEqual(["language-control", "theme-control"]);
+    expect(container.querySelector(".run-strip")).toBeNull();
+
+    fireEvent.click(screen.getByRole("button", { name: "參數研究" }));
+    await screen.findAllByText("candidate-epoch-a");
+    expect(container.querySelectorAll(".epoch-control")).toHaveLength(1);
+    expect(toolbarClasses()[0]).toBe("epoch-control");
   });
 
   it("still reloads research data after a downstream load failure", async () => {

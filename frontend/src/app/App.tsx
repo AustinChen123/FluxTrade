@@ -1,4 +1,12 @@
-import { lazy, Suspense, useEffect, useMemo, useState } from "react";
+import {
+  lazy,
+  Suspense,
+  useEffect,
+  useMemo,
+  useState,
+  type LazyExoticComponent,
+  type ReactNode
+} from "react";
 import { useTranslation } from "react-i18next";
 
 import {
@@ -10,8 +18,8 @@ import {
   type Epoch,
   type Gene,
   type GenerationSummary
-} from "./api";
-import { buildDemoGenes, demoEpoch, demoSummaries } from "./demo";
+} from "../api";
+import { buildDemoGenes, demoEpoch, demoSummaries } from "../demo";
 import {
   compareGenes,
   convergenceOption,
@@ -26,129 +34,121 @@ import {
   selectBestGene,
   surfaceRow,
   type ChartCopy
-} from "./ga";
-import type { Locale } from "./i18n";
+} from "../ga";
+import type { Locale } from "../i18n";
 import {
   applyTheme,
   initialTheme,
   saveTheme,
   type Theme
-} from "./theme";
+} from "../theme";
+import {
+  parseDemoMode,
+  parseNavigation,
+  serializeNavigation,
+  type View
+} from "./navigation";
 
-const EChart = lazy(() =>
-  import("./EChart").then((module) => ({ default: module.EChart }))
-);
-const FitnessSurface3D = lazy(() =>
-  import("./FitnessSurface3D").then((module) => ({
-    default: module.FitnessSurface3D
-  }))
-);
+let legacyEChart: LazyExoticComponent<
+  typeof import("../EChart")["EChart"]
+> | null = null;
+let legacyFitnessSurface3D: LazyExoticComponent<
+  typeof import("../FitnessSurface3D")["FitnessSurface3D"]
+> | null = null;
 const StrategyManager = lazy(() =>
-  import("./StrategyManager").then((module) => ({
+  import("../StrategyManager").then((module) => ({
     default: module.StrategyManager
   }))
 );
 const TradeChartView = lazy(() =>
-  import("./TradeChartView").then((module) => ({
+  import("../TradeChartView").then((module) => ({
     default: module.TradeChartView
   }))
 );
 const BacktestResultsView = lazy(() =>
-  import("./BacktestResultsView").then((module) => ({
+  import("../BacktestResultsView").then((module) => ({
     default: module.BacktestResultsView
   }))
 );
 
-type View = "research" | "results" | "strategies" | "trades";
-
-function validTradeId(value: string | null): value is string {
-  return (
-    value !== null &&
-    value.length > 0 &&
-    value.length <= 256 &&
-    !/[\u0000-\u001F\u007F]/.test(value)
-  );
-}
-
-function initialView(): View {
-  const requested = new URLSearchParams(window.location.search).get("view");
-  return requested === "results" ||
-    requested === "strategies" ||
-    requested === "trades"
-    ? requested
-    : "research";
-}
-
-function initialInspectedTradeId(): string | null {
-  const parameters = new URLSearchParams(window.location.search);
-  const tradeId = parameters.get("trade");
-  return parameters.get("view") === "trades" &&
-    validTradeId(tradeId)
-    ? tradeId
-    : null;
-}
-
-function displayNumber(
-  value: string | number | null,
-  locale: string,
-  digits = 4
-): string {
-  const parsed = finiteNumber(value);
-  return parsed === null
-    ? "—"
-    : new Intl.NumberFormat(locale, {
-        maximumFractionDigits: digits
-      }).format(parsed);
-}
-
-function displayValue(value: unknown, locale: string): string {
-  const parsed = finiteNumber(value);
-  return parsed === null
-    ? String(value)
-    : new Intl.NumberFormat(locale, {
-        maximumFractionDigits: 8
-      }).format(parsed);
-}
-
-function geneIdFromChartData(data: unknown): number | null {
-  if (Array.isArray(data)) {
-    return typeof data[3] === "number" ? data[3] : null;
-  }
-  if (data && typeof data === "object" && "geneId" in data) {
-    const value = (data as { geneId?: unknown }).geneId;
-    return typeof value === "number" ? value : null;
-  }
-  return null;
-}
-
 type Translate = ReturnType<typeof useTranslation>["t"];
 
-function errorMessage(error: unknown, t: Translate): string {
-  if (error instanceof ApiError) {
-    if (error.status === 401 || error.status === 403) {
-      return t("error.unauthorized");
-    }
-    return t("error.service", {
-      status: error.status,
-      message: error.message
-    });
-  }
-  return error instanceof Error
-    ? t("error.unexpected", { message: error.message })
-    : t("error.fallback");
-}
+type ResearchSlots = {
+  readonly toolbar: ReactNode;
+  readonly content: ReactNode;
+};
 
-export function App() {
+type LegacyResearchWorkspaceProps = {
+  readonly visible: boolean;
+  readonly demoMode: boolean;
+  readonly theme: Theme;
+  readonly children: (slots: ResearchSlots) => ReactNode;
+};
+
+function LegacyResearchWorkspace({
+  visible,
+  demoMode,
+  theme,
+  children
+}: LegacyResearchWorkspaceProps) {
   const { t, i18n } = useTranslation();
   const locale: Locale = i18n.resolvedLanguage === "en" ? "en" : "zh-TW";
-  const demoMode =
-    import.meta.env.DEV &&
-    new URLSearchParams(window.location.search).get("demo") === "1";
-  const [view, setView] = useState<View>(initialView);
-  const [researchActivated, setResearchActivated] = useState(
-    view === "research"
-  );
-  const [theme, setTheme] = useState<Theme>(initialTheme);
+  const EChart =
+    legacyEChart ??=
+      lazy(() =>
+        import("../EChart").then((module) => ({ default: module.EChart }))
+      );
+  const FitnessSurface3D =
+    legacyFitnessSurface3D ??=
+      lazy(() =>
+        import("../FitnessSurface3D").then((module) => ({
+          default: module.FitnessSurface3D
+        }))
+      );
+  const displayNumber = (
+    value: string | number | null,
+    displayLocale: string,
+    digits = 4
+  ): string => {
+    const parsed = finiteNumber(value);
+    return parsed === null
+      ? "—"
+      : new Intl.NumberFormat(displayLocale, {
+          maximumFractionDigits: digits
+        }).format(parsed);
+  };
+  const displayValue = (value: unknown, displayLocale: string): string => {
+    const parsed = finiteNumber(value);
+    return parsed === null
+      ? String(value)
+      : new Intl.NumberFormat(displayLocale, {
+          maximumFractionDigits: 8
+        }).format(parsed);
+  };
+  const geneIdFromChartData = (data: unknown): number | null => {
+    if (Array.isArray(data)) {
+      return typeof data[3] === "number" ? data[3] : null;
+    }
+    if (data && typeof data === "object" && "geneId" in data) {
+      const value = (data as { geneId?: unknown }).geneId;
+      return typeof value === "number" ? value : null;
+    }
+    return null;
+  };
+  const errorMessage = (reason: unknown, translate: Translate): string => {
+    if (reason instanceof ApiError) {
+      if (reason.status === 401 || reason.status === 403) {
+        return translate("error.unauthorized");
+      }
+      return translate("error.service", {
+        status: reason.status,
+        message: reason.message
+      });
+    }
+    return reason instanceof Error
+      ? translate("error.unexpected", { message: reason.message })
+      : translate("error.fallback");
+  };
   const [epochs, setEpochs] = useState<Epoch[]>([]);
   const [epochId, setEpochId] = useState("");
   const [summaries, setSummaries] = useState<GenerationSummary[]>([]);
@@ -158,9 +158,6 @@ export function App() {
   const [xParameter, setXParameter] = useState("");
   const [yParameter, setYParameter] = useState("");
   const [surfaceMode, setSurfaceMode] = useState<"2d" | "3d">("2d");
-  const [inspectedTradeId, setInspectedTradeId] = useState<string | null>(
-    initialInspectedTradeId
-  );
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<unknown | null>(null);
   const [epochsLoaded, setEpochsLoaded] = useState(false);
@@ -169,13 +166,6 @@ export function App() {
   const epoch = epochs.find((item) => item.id === epochId) ?? null;
 
   useEffect(() => {
-    applyTheme(theme);
-  }, [theme]);
-
-  useEffect(() => {
-    if (!researchActivated) {
-      return;
-    }
     if (epochsLoaded) {
       return;
     }
@@ -205,7 +195,7 @@ export function App() {
     return () => {
       active = false;
     };
-  }, [demoMode, epochsLoaded, reloadToken, researchActivated]);
+  }, [demoMode, epochsLoaded, reloadToken]);
 
   useEffect(() => {
     if (!epoch) {
@@ -390,196 +380,33 @@ export function App() {
     setSelectedGeneId(null);
     setEpochId(nextEpochId);
   };
-  const chooseView = (nextView: View, requestedTradeId: string | null = null) => {
-    if (nextView === "research") {
-      setResearchActivated(true);
-    }
-    const nextTradeId =
-      nextView === "trades" &&
-      validTradeId(requestedTradeId)
-        ? requestedTradeId
-        : null;
-    setInspectedTradeId(nextTradeId);
-    const url = new URL(window.location.href);
-    if (nextView === "research") {
-      url.searchParams.delete("view");
-    } else {
-      url.searchParams.set("view", nextView);
-    }
-    if (nextTradeId === null) {
-      url.searchParams.delete("trade");
-    } else {
-      url.searchParams.set("trade", nextTradeId);
-    }
-    window.history.replaceState(
-      null,
-      "",
-      `${url.pathname}${url.search}${url.hash}`
-    );
-    setView(nextView);
-  };
   const dateFormatter = new Intl.DateTimeFormat(locale, {
     year: "numeric",
     month: "2-digit",
     day: "2-digit"
   });
 
-  return (
-    <main className="console-shell">
-      <header className="topbar">
-        <div>
-          <p className="eyebrow">{t("app.eyebrow")}</p>
-          <h1>
-            {t(
-              view === "research"
-                ? "app.title"
-                : view === "results"
-                  ? "results.title"
-                : view === "strategies"
-                  ? "strategies.title"
-                  : "trades.title"
-            )}
-          </h1>
-        </div>
-        <div className="toolbar">
-          {view === "research" && (
-            <div className="epoch-control">
-              <label htmlFor="epoch">{t("controls.epoch")}</label>
-              <select
-                id="epoch"
-                value={epochId}
-                onChange={(event) => chooseEpoch(event.target.value)}
-                disabled={!epochs.length}
-              >
-                {epochs.map((item) => (
-                  <option key={item.id} value={item.id}>
-                    {item.strategy_id} ·{" "}
-                    {dateFormatter.format(new Date(item.started_at))}
-                  </option>
-                ))}
-              </select>
-            </div>
-          )}
-          <label className="language-control" htmlFor="language">
-            {t("controls.language")}
-            <select
-              id="language"
-              value={locale}
-              onChange={(event) =>
-                void i18n.changeLanguage(event.target.value as Locale)
-              }
-            >
-              <option value="zh-TW">繁體中文</option>
-              <option value="en">English</option>
-            </select>
-          </label>
-          <button
-            type="button"
-            className="theme-control"
-            aria-label={t(
-              theme === "dark" ? "controls.light" : "controls.dark"
-            )}
-            title={t(theme === "dark" ? "controls.light" : "controls.dark")}
-            onClick={() => {
-              const next = theme === "dark" ? "light" : "dark";
-              applyTheme(next);
-              saveTheme(next);
-              setTheme(next);
-            }}
-          >
-            <span aria-hidden="true">{theme === "dark" ? "☀" : "☾"}</span>
-            <small>{t("controls.theme")}</small>
-          </button>
-        </div>
-      </header>
-
-      <nav className="console-nav" aria-label={t("navigation.aria")}>
-        <button
-          type="button"
-          aria-current={view === "research" ? "page" : undefined}
-          onClick={() => chooseView("research")}
-        >
-          {t("navigation.research")}
-        </button>
-        <button
-          type="button"
-          aria-current={view === "results" ? "page" : undefined}
-          onClick={() => chooseView("results")}
-        >
-          {t("navigation.results")}
-        </button>
-        <button
-          type="button"
-          aria-current={view === "strategies" ? "page" : undefined}
-          onClick={() => chooseView("strategies")}
-        >
-          {t("navigation.strategies")}
-        </button>
-        <button
-          type="button"
-          aria-current={view === "trades" ? "page" : undefined}
-          onClick={() => chooseView("trades")}
-        >
-          {t("navigation.trades")}
-        </button>
-      </nav>
-
-      {view === "strategies" && (
-        <Suspense
-          fallback={
-            <div className="loading-indicator" aria-live="polite">
-              <span />
-              {t("strategies.loading")}
-            </div>
-          }
-        >
-          <StrategyManager />
-        </Suspense>
-      )}
-
-      {(view === "research" || view === "results" || view === "trades") &&
-        demoMode && (
-        <p className="demo-notice">{t("demo")}</p>
-      )}
-
-      {view === "results" && (
-        <Suspense
-          fallback={
-            <div className="loading-indicator" aria-live="polite">
-              <span />
-              {t("results.loading")}
-            </div>
-          }
-        >
-          <BacktestResultsView
-            demoMode={demoMode}
-            theme={theme}
-            onInspectTrade={(tradeId) => {
-              chooseView("trades", tradeId);
-            }}
-          />
-        </Suspense>
-      )}
-
-      {view === "trades" && (
-        <Suspense
-          fallback={
-            <div className="loading-indicator" aria-live="polite">
-              <span />
-              {t("trades.loading")}
-            </div>
-          }
-        >
-          <TradeChartView
-            demoMode={demoMode}
-            theme={theme}
-            initialTradeId={inspectedTradeId}
-            onSelectTrade={(tradeId) => chooseView("trades", tradeId)}
-          />
-        </Suspense>
-      )}
-
-      {view === "research" && error !== null && (
+  const toolbar = visible ? (
+    <div className="epoch-control">
+      <label htmlFor="epoch">{t("controls.epoch")}</label>
+      <select
+        id="epoch"
+        value={epochId}
+        onChange={(event) => chooseEpoch(event.target.value)}
+        disabled={!epochs.length}
+      >
+        {epochs.map((item) => (
+          <option key={item.id} value={item.id}>
+            {item.strategy_id} ·{" "}
+            {dateFormatter.format(new Date(item.started_at))}
+          </option>
+        ))}
+      </select>
+    </div>
+  ) : null;
+  const content = visible ? (
+    <>
+      {error !== null && (
         <section className="error-panel" role="alert">
           <div>
             <strong>{t("error.title")}</strong>
@@ -591,14 +418,14 @@ export function App() {
         </section>
       )}
 
-      {view === "research" && error === null && !loading && !epoch && (
+      {error === null && !loading && !epoch && (
         <section className="empty-panel">
           <strong>{t("empty.title")}</strong>
           <p>{t("empty.body")}</p>
         </section>
       )}
 
-      {view === "research" && epoch && (
+      {epoch && (
         <Suspense
           fallback={
             <div className="loading-indicator" aria-live="polite">
@@ -864,12 +691,204 @@ export function App() {
         </Suspense>
       )}
 
-      {view === "research" && loading && (
+      {loading && (
         <div className="loading-indicator" aria-live="polite">
           <span />
           {t("loading.snapshot")}
         </div>
       )}
+    </>
+  ) : null;
+
+  return children({ toolbar, content });
+}
+
+export function App() {
+  const { t, i18n } = useTranslation();
+  const locale: Locale = i18n.resolvedLanguage === "en" ? "en" : "zh-TW";
+  const demoMode = parseDemoMode(
+    new URL(window.location.href),
+    import.meta.env.DEV
+  );
+  const [initialNavigation] = useState(() =>
+    parseNavigation(window.location.search)
+  );
+  const [view, setView] = useState<View>(initialNavigation.view);
+  const [researchActivated, setResearchActivated] = useState(
+    view === "research"
+  );
+  const [theme, setTheme] = useState<Theme>(initialTheme);
+  const [inspectedTradeId, setInspectedTradeId] = useState<string | null>(
+    initialNavigation.inspectedTradeId
+  );
+
+  useEffect(() => {
+    applyTheme(theme);
+  }, [theme]);
+
+  const chooseView = (nextView: View, requestedTradeId: string | null = null) => {
+    if (nextView === "research") {
+      setResearchActivated(true);
+    }
+    const navigation = serializeNavigation(
+      new URL(window.location.href),
+      nextView,
+      requestedTradeId
+    );
+    setInspectedTradeId(navigation.inspectedTradeId);
+    window.history.replaceState(null, "", navigation.relativeUrl);
+    setView(nextView);
+  };
+
+  const renderShell = ({ toolbar, content }: ResearchSlots) => (
+    <main className="console-shell">
+      <header className="topbar">
+        <div>
+          <p className="eyebrow">{t("app.eyebrow")}</p>
+          <h1>
+            {t(
+              view === "research"
+                ? "app.title"
+                : view === "results"
+                  ? "results.title"
+                  : view === "strategies"
+                    ? "strategies.title"
+                    : "trades.title"
+            )}
+          </h1>
+        </div>
+        <div className="toolbar">
+          {toolbar}
+          <label className="language-control" htmlFor="language">
+            {t("controls.language")}
+            <select
+              id="language"
+              value={locale}
+              onChange={(event) =>
+                void i18n.changeLanguage(event.target.value as Locale)
+              }
+            >
+              <option value="zh-TW">繁體中文</option>
+              <option value="en">English</option>
+            </select>
+          </label>
+          <button
+            type="button"
+            className="theme-control"
+            aria-label={t(
+              theme === "dark" ? "controls.light" : "controls.dark"
+            )}
+            title={t(theme === "dark" ? "controls.light" : "controls.dark")}
+            onClick={() => {
+              const next = theme === "dark" ? "light" : "dark";
+              applyTheme(next);
+              saveTheme(next);
+              setTheme(next);
+            }}
+          >
+            <span aria-hidden="true">{theme === "dark" ? "☀" : "☾"}</span>
+            <small>{t("controls.theme")}</small>
+          </button>
+        </div>
+      </header>
+
+      <nav className="console-nav" aria-label={t("navigation.aria")}>
+        <button
+          type="button"
+          aria-current={view === "research" ? "page" : undefined}
+          onClick={() => chooseView("research")}
+        >
+          {t("navigation.research")}
+        </button>
+        <button
+          type="button"
+          aria-current={view === "results" ? "page" : undefined}
+          onClick={() => chooseView("results")}
+        >
+          {t("navigation.results")}
+        </button>
+        <button
+          type="button"
+          aria-current={view === "strategies" ? "page" : undefined}
+          onClick={() => chooseView("strategies")}
+        >
+          {t("navigation.strategies")}
+        </button>
+        <button
+          type="button"
+          aria-current={view === "trades" ? "page" : undefined}
+          onClick={() => chooseView("trades")}
+        >
+          {t("navigation.trades")}
+        </button>
+      </nav>
+
+      {view === "strategies" && (
+        <Suspense
+          fallback={
+            <div className="loading-indicator" aria-live="polite">
+              <span />
+              {t("strategies.loading")}
+            </div>
+          }
+        >
+          <StrategyManager />
+        </Suspense>
+      )}
+
+      {(view === "research" || view === "results" || view === "trades") &&
+        demoMode && <p className="demo-notice">{t("demo")}</p>}
+
+      {view === "results" && (
+        <Suspense
+          fallback={
+            <div className="loading-indicator" aria-live="polite">
+              <span />
+              {t("results.loading")}
+            </div>
+          }
+        >
+          <BacktestResultsView
+            demoMode={demoMode}
+            theme={theme}
+            onInspectTrade={(tradeId) => {
+              chooseView("trades", tradeId);
+            }}
+          />
+        </Suspense>
+      )}
+
+      {view === "trades" && (
+        <Suspense
+          fallback={
+            <div className="loading-indicator" aria-live="polite">
+              <span />
+              {t("trades.loading")}
+            </div>
+          }
+        >
+          <TradeChartView
+            demoMode={demoMode}
+            theme={theme}
+            initialTradeId={inspectedTradeId}
+            onSelectTrade={(tradeId) => chooseView("trades", tradeId)}
+          />
+        </Suspense>
+      )}
+
+      {content}
     </main>
+  );
+
+  return researchActivated ? (
+    <LegacyResearchWorkspace
+      visible={view === "research"}
+      demoMode={demoMode}
+      theme={theme}
+    >
+      {renderShell}
+    </LegacyResearchWorkspace>
+  ) : (
+    renderShell({ toolbar: null, content: null })
   );
 }
