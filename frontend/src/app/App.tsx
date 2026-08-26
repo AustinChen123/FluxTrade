@@ -30,7 +30,7 @@ const StrategyManager = lazy(() =>
   }))
 );
 const TradeChartView = lazy(() =>
-  import("../TradeChartView").then((module) => ({
+  import("../features/trades/TradeChartView").then((module) => ({
     default: module.TradeChartView
   }))
 );

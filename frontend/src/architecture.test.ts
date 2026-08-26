@@ -79,14 +79,11 @@ const executableExtensions = new Set([
 let compilerFixtureSequence = 0;
 
 const expectedInventory = [
-  "CandlestickChart.tsx",
   "EChart.test.tsx",
   "EChart.tsx",
   "EChartCore.tsx",
   "StrategyManager.test.tsx",
   "StrategyManager.tsx",
-  "TradeChartView.test.tsx",
-  "TradeChartView.tsx",
   "api.test.ts",
   "api.ts",
   "app/App.test.tsx",
@@ -121,14 +118,21 @@ const expectedInventory = [
   "features/results/resultsModel.ts",
   "features/results/useTradePagination.test.ts",
   "features/results/useTradePagination.ts",
+  "features/trades/CandlestickChart.test.tsx",
+  "features/trades/CandlestickChart.tsx",
+  "features/trades/TradeChartView.test.tsx",
+  "features/trades/TradeChartView.tsx",
+  "features/trades/demo.test.ts",
+  "features/trades/demo.ts",
+  "features/trades/tradeCharts.test.ts",
+  "features/trades/tradeCharts.ts",
+  "features/trades/tradeModel.test.ts",
+  "features/trades/tradeModel.ts",
   "i18n.ts",
   "main.tsx",
   "shared/trading/closedTrade.ts",
   "styles.css",
   "theme.ts",
-  "tradeChart.test.ts",
-  "tradeChart.ts",
-  "tradeDemo.ts",
   "utc.ts",
   "vite-env.d.ts"
 ] as const;
@@ -150,9 +154,6 @@ const expectedBareImportLedger = [
   "architecture.test.ts|typescript/unstable/ast|value",
   "architecture.test.ts|typescript/unstable/sync|value",
   "architecture.test.ts|vitest|value",
-  "CandlestickChart.tsx|echarts/charts|value",
-  "CandlestickChart.tsx|echarts/components|value",
-  "CandlestickChart.tsx|echarts/core|value",
   "EChart.test.tsx|@testing-library/react|value",
   "EChart.test.tsx|vitest|value",
   "EChart.tsx|echarts/charts|value",
@@ -194,6 +195,19 @@ const expectedBareImportLedger = [
   "features/results/useTradePagination.test.ts|@testing-library/react|value",
   "features/results/useTradePagination.test.ts|vitest|value",
   "features/results/useTradePagination.ts|react|value",
+  "features/trades/CandlestickChart.test.tsx|@testing-library/react|value",
+  "features/trades/CandlestickChart.test.tsx|vitest|value",
+  "features/trades/CandlestickChart.tsx|echarts/charts|value",
+  "features/trades/CandlestickChart.tsx|echarts/components|value",
+  "features/trades/CandlestickChart.tsx|echarts/core|value",
+  "features/trades/demo.test.ts|vitest|value",
+  "features/trades/tradeCharts.test.ts|vitest|value",
+  "features/trades/tradeCharts.ts|echarts/core|type-only",
+  "features/trades/TradeChartView.test.tsx|@testing-library/react|value",
+  "features/trades/TradeChartView.test.tsx|vitest|value",
+  "features/trades/TradeChartView.tsx|react-i18next|value",
+  "features/trades/TradeChartView.tsx|react|value",
+  "features/trades/tradeModel.test.ts|vitest|value",
   "i18n.ts|i18next|value",
   "i18n.ts|react-i18next|value",
   "main.tsx|react-dom/client|value",
@@ -201,13 +215,7 @@ const expectedBareImportLedger = [
   "StrategyManager.test.tsx|@testing-library/react|value",
   "StrategyManager.test.tsx|vitest|value",
   "StrategyManager.tsx|react-i18next|value",
-  "StrategyManager.tsx|react|value",
-  "tradeChart.test.ts|vitest|value",
-  "tradeChart.ts|echarts/core|type-only",
-  "TradeChartView.test.tsx|@testing-library/react|value",
-  "TradeChartView.test.tsx|vitest|value",
-  "TradeChartView.tsx|react-i18next|value",
-  "TradeChartView.tsx|react|value"
+  "StrategyManager.tsx|react|value"
 ] as const;
 
 const expectedRelativeImportLedger = [
@@ -218,13 +226,12 @@ const expectedRelativeImportLedger = [
   "app/App.test.tsx|./App|value|app/App.tsx",
   "app/App.tsx|../features/research/ResearchRoute|value|features/research/ResearchRoute.tsx",
   "app/App.tsx|../features/results/BacktestResultsView|value|features/results/BacktestResultsView.tsx",
+  "app/App.tsx|../features/trades/TradeChartView|value|features/trades/TradeChartView.tsx",
   "app/App.tsx|../i18n|type-only|i18n.ts",
   "app/App.tsx|../StrategyManager|value|StrategyManager.tsx",
   "app/App.tsx|../theme|value|theme.ts",
-  "app/App.tsx|../TradeChartView|value|TradeChartView.tsx",
   "app/App.tsx|./navigation|value|app/navigation.ts",
   "app/navigation.test.ts|./navigation|value|app/navigation.ts",
-  "CandlestickChart.tsx|./EChartCore|value|EChartCore.tsx",
   "EChart.test.tsx|./EChart|value|EChart.tsx",
   "EChart.tsx|./EChartCore|value|EChartCore.tsx",
   "features/research/demo.test.ts|./demo|value|features/research/demo.ts",
@@ -311,6 +318,30 @@ const expectedRelativeImportLedger = [
   "features/results/useTradePagination.test.ts|./resultsModel|type-only|features/results/resultsModel.ts",
   "features/results/useTradePagination.test.ts|./useTradePagination|value|features/results/useTradePagination.ts",
   "features/results/useTradePagination.ts|./resultsModel|value|features/results/resultsModel.ts",
+  "features/trades/CandlestickChart.test.tsx|./CandlestickChart|value|features/trades/CandlestickChart.tsx",
+  "features/trades/CandlestickChart.tsx|../../EChartCore|value|EChartCore.tsx",
+  "features/trades/demo.test.ts|./demo|value|features/trades/demo.ts",
+  "features/trades/demo.ts|../../shared/trading/closedTrade|type-only|shared/trading/closedTrade.ts",
+  "features/trades/demo.ts|./tradeModel|type-only|features/trades/tradeModel.ts",
+  "features/trades/tradeCharts.test.ts|./tradeCharts|value|features/trades/tradeCharts.ts",
+  "features/trades/tradeCharts.test.ts|./tradeModel|value|features/trades/tradeModel.ts",
+  "features/trades/tradeCharts.ts|../../theme|type-only|theme.ts",
+  "features/trades/tradeCharts.ts|./tradeModel|type-only|features/trades/tradeModel.ts",
+  "features/trades/TradeChartView.test.tsx|../../i18n|value|i18n.ts",
+  "features/trades/TradeChartView.test.tsx|./demo|value|features/trades/demo.ts",
+  "features/trades/TradeChartView.test.tsx|./TradeChartView|value|features/trades/TradeChartView.tsx",
+  "features/trades/TradeChartView.tsx|../../decimal|value|decimal.ts",
+  "features/trades/TradeChartView.tsx|../../i18n|type-only|i18n.ts",
+  "features/trades/TradeChartView.tsx|../../theme|type-only|theme.ts",
+  "features/trades/TradeChartView.tsx|../../utc|value|utc.ts",
+  "features/trades/TradeChartView.tsx|./CandlestickChart|value|features/trades/CandlestickChart.tsx",
+  "features/trades/TradeChartView.tsx|./demo|value|features/trades/demo.ts",
+  "features/trades/TradeChartView.tsx|./tradeCharts|value|features/trades/tradeCharts.ts",
+  "features/trades/TradeChartView.tsx|./tradeModel|value|features/trades/tradeModel.ts",
+  "features/trades/tradeModel.test.ts|./tradeModel|value|features/trades/tradeModel.ts",
+  "features/trades/tradeModel.ts|../../decimal|value|decimal.ts",
+  "features/trades/tradeModel.ts|../../shared/trading/closedTrade|type-only|shared/trading/closedTrade.ts",
+  "features/trades/tradeModel.ts|../../utc|value|utc.ts",
   "main.tsx|./app/App|value|app/App.tsx",
   "main.tsx|./i18n|value|i18n.ts",
   "main.tsx|./styles.css|value|styles.css",
@@ -320,24 +351,7 @@ const expectedRelativeImportLedger = [
   "StrategyManager.test.tsx|./i18n|value|i18n.ts",
   "StrategyManager.test.tsx|./StrategyManager|value|StrategyManager.tsx",
   "StrategyManager.tsx|./api|value|api.ts",
-  "StrategyManager.tsx|./i18n|type-only|i18n.ts",
-  "tradeChart.test.ts|./tradeChart|value|tradeChart.ts",
-  "tradeChart.ts|./decimal|value|decimal.ts",
-  "tradeChart.ts|./shared/trading/closedTrade|type-only|shared/trading/closedTrade.ts",
-  "tradeChart.ts|./theme|type-only|theme.ts",
-  "tradeChart.ts|./utc|value|utc.ts",
-  "TradeChartView.test.tsx|./i18n|value|i18n.ts",
-  "TradeChartView.test.tsx|./TradeChartView|value|TradeChartView.tsx",
-  "TradeChartView.test.tsx|./tradeDemo|value|tradeDemo.ts",
-  "TradeChartView.tsx|./CandlestickChart|value|CandlestickChart.tsx",
-  "TradeChartView.tsx|./decimal|value|decimal.ts",
-  "TradeChartView.tsx|./i18n|type-only|i18n.ts",
-  "TradeChartView.tsx|./theme|type-only|theme.ts",
-  "TradeChartView.tsx|./tradeChart|value|tradeChart.ts",
-  "TradeChartView.tsx|./tradeDemo|value|tradeDemo.ts",
-  "TradeChartView.tsx|./utc|value|utc.ts",
-  "tradeDemo.ts|./shared/trading/closedTrade|type-only|shared/trading/closedTrade.ts",
-  "tradeDemo.ts|./tradeChart|type-only|tradeChart.ts"
+  "StrategyManager.tsx|./i18n|type-only|i18n.ts"
 ] as const;
 
 const expectedPolicyGlobalLedger = [
@@ -772,7 +786,7 @@ describe("frontend architecture ratchet", () => {
         .map((edge) => `${edge.importer}|${edge.specifier}|${edge.kind}`)
     ).toEqual(expectedBareImportLedger);
   });
-  it("freezes the complete Node D source inventory", () => {
+  it("freezes the complete Node E source inventory", () => {
     const inventory = walkFiles(sourceRoot).map((file) =>
       path.relative(sourceRoot, file).replaceAll(path.sep, "/")
     );
@@ -817,9 +831,9 @@ describe("frontend architecture ratchet", () => {
     ]);
     expect(directRelativeSpecifiers(edges, "app/App.tsx")).toEqual([
       "../StrategyManager|value|StrategyManager.tsx",
-      "../TradeChartView|value|TradeChartView.tsx",
       "../features/research/ResearchRoute|value|features/research/ResearchRoute.tsx",
       "../features/results/BacktestResultsView|value|features/results/BacktestResultsView.tsx",
+      "../features/trades/TradeChartView|value|features/trades/TradeChartView.tsx",
       "../i18n|type-only|i18n.ts",
       "../theme|value|theme.ts",
       "./navigation|value|app/navigation.ts"
@@ -1243,6 +1257,77 @@ describe("frontend architecture ratchet", () => {
     expect(chartsSource.getText()).not.toMatch(
       /\b(?:React|fetch|localStorage|sessionStorage)\b/
     );
+  });
+
+  it("keeps the final trades owner behind one shell facade", () => {
+    const source = (relativePath: string) => {
+      const file = compilerProject!.program.getSourceFile(
+        path.join(sourceRoot, relativePath)
+      );
+      if (!file) {
+        throw new Error(
+          `${relativePath} is unavailable to the architecture compiler`
+        );
+      }
+      return file;
+    };
+    const edges = collectImports();
+    const facadeSource = source("features/trades/TradeChartView.tsx");
+    const modelSource = source("features/trades/tradeModel.ts");
+    const chartsSource = source("features/trades/tradeCharts.ts");
+
+    expect(findNamedFunction(facadeSource, "TradeChartView")).toHaveLength(1);
+    expect(findNamedFunction(modelSource, "buildTradeChartModel")).toHaveLength(
+      1
+    );
+    expect(findNamedFunction(chartsSource, "tradeChartOption")).toHaveLength(1);
+    expect(
+      directRelativeSpecifiers(edges, "features/trades/tradeModel.ts")
+    ).toEqual([
+      "../../decimal|value|decimal.ts",
+      "../../shared/trading/closedTrade|type-only|shared/trading/closedTrade.ts",
+      "../../utc|value|utc.ts"
+    ]);
+    expect(
+      directRelativeSpecifiers(edges, "features/trades/tradeCharts.ts")
+    ).toEqual([
+      "../../theme|type-only|theme.ts",
+      "./tradeModel|type-only|features/trades/tradeModel.ts"
+    ]);
+    expect(
+      directRelativeSpecifiers(edges, "features/trades/CandlestickChart.tsx")
+    ).toEqual(["../../EChartCore|value|EChartCore.tsx"]);
+    expect(
+      directRelativeSpecifiers(edges, "features/trades/TradeChartView.tsx")
+    ).toEqual([
+      "../../decimal|value|decimal.ts",
+      "../../i18n|type-only|i18n.ts",
+      "../../theme|type-only|theme.ts",
+      "../../utc|value|utc.ts",
+      "./CandlestickChart|value|features/trades/CandlestickChart.tsx",
+      "./demo|value|features/trades/demo.ts",
+      "./tradeCharts|value|features/trades/tradeCharts.ts",
+      "./tradeModel|value|features/trades/tradeModel.ts"
+    ]);
+
+    expect(modelSource.getText()).not.toMatch(
+      /\b(?:React|ECharts|fetch|localStorage|sessionStorage)\b/
+    );
+    expect(chartsSource.getText()).not.toMatch(
+      /\b(?:React|fetch|localStorage|sessionStorage|ClosedTrade)\b/
+    );
+    const dynamicImports = descendants(facadeSource).flatMap((node) => {
+      if (
+        !isCallExpression(node) ||
+        node.expression.kind !== SyntaxKind.ImportKeyword ||
+        node.arguments.length !== 1 ||
+        !isStringLiteral(node.arguments[0])
+      ) {
+        return [];
+      }
+      return [node.arguments[0].text];
+    });
+    expect(dynamicImports).toEqual(["./CandlestickChart"]);
   });
 
   it("keeps navigation pure", () => {

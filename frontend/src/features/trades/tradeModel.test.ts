@@ -2,11 +2,9 @@ import { describe, expect, it } from "vitest";
 
 import {
   buildTradeChartModel,
-  selectedTradeOption,
-  tradeChartOption,
   tradeIdFromChartData,
   type TradeChartSnapshot
-} from "./tradeChart";
+} from "./tradeModel";
 
 const snapshot = (overrides: Partial<TradeChartSnapshot> = {}): TradeChartSnapshot => ({
   strategyId: "strategy-1",
@@ -136,6 +134,35 @@ describe("trade chart model", () => {
     expect(model.skippedMarkers).toBe(1);
   });
 
+  it("deduplicates equivalent timestamp forms by exact instant", () => {
+    const first = snapshot().candles[0];
+    const model = buildTradeChartModel(
+      snapshot({
+        candles: [
+          first,
+          {
+            ...first,
+            timestamp: "2026-07-28T13:30:00+00:00"
+          }
+        ],
+        trades: []
+      })
+    );
+
+    expect(model.timestamps).toEqual([first.timestamp]);
+    expect(model.skippedCandles).toBe(1);
+  });
+
+  it("rejects a descending candle without changing the accepted order", () => {
+    const candles = snapshot().candles;
+    const model = buildTradeChartModel(
+      snapshot({ candles: [candles[1], candles[0]], trades: [] })
+    );
+
+    expect(model.timestamps).toEqual([candles[1].timestamp]);
+    expect(model.skippedCandles).toBe(1);
+  });
+
   it.each(["0x10", "1e2", "", "Infinity"])(
     "rejects non-decimal candle value %j",
     (open) => {
@@ -151,51 +178,23 @@ describe("trade chart model", () => {
     }
   );
 
-  it("isolates selected markers and ignores non-trade chart data", () => {
+  it("accepts only a non-empty exact trade ID from chart data", () => {
     const model = buildTradeChartModel(snapshot());
-    const option = selectedTradeOption(model, "trade-1") as {
-      series: [{ data: unknown[] }];
-    };
 
-    expect(option.series[0].data).toHaveLength(2);
     expect(tradeIdFromChartData(model.markers[0])).toBe("trade-1");
     expect(tradeIdFromChartData([19850, 19851, 19849, 19852])).toBeNull();
+    expect(tradeIdFromChartData({ tradeId: "" })).toBeNull();
   });
 
-  it("formats chart timestamps in UTC", () => {
-    const option = tradeChartOption(
-      buildTradeChartModel(snapshot()),
-      {
-        price: "Price",
-        entry: "Entry",
-        exit: "Exit",
-        longEntry: "Long entry",
-        longExit: "Long exit",
-        shortEntry: "Short entry",
-        shortExit: "Short exit"
-      },
-      "en",
-      "light"
-    ) as {
-      tooltip: {
-        formatter: (params: {
-          seriesType: string;
-          dataIndex: number;
-        }) => string;
-      };
-      xAxis: {
-        axisLabel: { formatter: (value: string) => string };
-      };
-    };
-
-    expect(
-      option.tooltip.formatter({
-        seriesType: "candlestick",
-        dataIndex: 0
+  it("counts an invalid marker price without moving its other event", () => {
+    const model = buildTradeChartModel(
+      snapshot({
+        trades: [{ ...snapshot().trades[0], entryPrice: "1e2" }]
       })
-    ).toContain("13:30 UTC");
-    expect(
-      option.xAxis.axisLabel.formatter("2026-07-28T13:30:00.000Z")
-    ).toContain("13:30");
+    );
+
+    expect(model.markers.map((marker) => marker.event)).toEqual(["exit"]);
+    expect(model.skippedMarkers).toBe(1);
   });
+
 });

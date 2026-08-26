@@ -1,5 +1,5 @@
-import type { ClosedTrade } from "./shared/trading/closedTrade";
-import type { TradeChartSnapshot } from "./tradeChart";
+import type { ClosedTrade } from "../../shared/trading/closedTrade";
+import type { TradeChartSnapshot } from "./tradeModel";
 
 const START = Date.parse("2026-07-28T13:30:00Z");
 const FIVE_MINUTES = 5 * 60 * 1_000;

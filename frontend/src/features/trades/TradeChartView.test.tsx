@@ -8,8 +8,8 @@ import {
 } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
-import i18n from "./i18n";
-import { demoTradeSnapshot } from "./tradeDemo";
+import i18n from "../../i18n";
+import { demoTradeSnapshot } from "./demo";
 import { TradeChartView } from "./TradeChartView";
 
 vi.mock("./CandlestickChart", () => ({

@@ -1,19 +1,21 @@
 import { lazy, Suspense, useMemo, useState } from "react";
 import { useTranslation } from "react-i18next";
 
-import { demoTradeSnapshot } from "./tradeDemo";
-import { finiteDecimalNumber, isDecimalString } from "./decimal";
+import { finiteDecimalNumber, isDecimalString } from "../../decimal";
+import type { Locale } from "../../i18n";
+import type { Theme } from "../../theme";
+import { parseUtcTimestamp } from "../../utc";
+import { demoTradeSnapshot } from "./demo";
 import {
-  buildTradeChartModel,
   selectedTradeOption,
   tradeChartOption,
+  type TradeChartCopy
+} from "./tradeCharts";
+import {
+  buildTradeChartModel,
   tradeIdFromChartData,
-  type TradeChartCopy,
   type TradeChartSnapshot
-} from "./tradeChart";
-import type { Locale } from "./i18n";
-import type { Theme } from "./theme";
-import { parseUtcTimestamp } from "./utc";
+} from "./tradeModel";
 
 const CandlestickChart = lazy(() =>
   import("./CandlestickChart").then((module) => ({

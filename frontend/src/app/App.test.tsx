@@ -108,7 +108,7 @@ vi.mock("../StrategyManager", async () => {
   };
 });
 
-vi.mock("../TradeChartView", async () => {
+vi.mock("../features/trades/TradeChartView", async () => {
   const { useEffect, useState } = await import("react");
   return {
     TradeChartView: ({
@@ -337,6 +337,36 @@ describe("GA visualization state", () => {
         "data-selected-trade"
       )
     ).toBe("trade-000184");
+  });
+
+  it("recreates trade inspection from the current shell selection", async () => {
+    window.history.replaceState(
+      {},
+      "",
+      "/?view=trades&trade=trade-000185&demo=1"
+    );
+    render(<App />);
+
+    expect(
+      (await screen.findByTestId("trade-chart-view")).getAttribute(
+        "data-selected-trade"
+      )
+    ).toBe("trade-000185");
+    fireEvent.click(screen.getByRole("button", { name: "Select mock trade" }));
+    expect(new URL(window.location.href).searchParams.get("trade")).toBe(
+      "trade-000184"
+    );
+
+    fireEvent.click(screen.getByRole("button", { name: "回測績效" }));
+    expect(await screen.findByTestId("backtest-results-view")).toBeTruthy();
+    fireEvent.click(screen.getByRole("button", { name: "進出場檢視" }));
+
+    expect(
+      (await screen.findByTestId("trade-chart-view")).getAttribute(
+        "data-selected-trade"
+      )
+    ).toBe("");
+    expect(lifecycles.trades).toEqual({ mounts: 2, unmounts: 1 });
   });
 
   it("opens backtest results directly without loading GA data", async () => {
