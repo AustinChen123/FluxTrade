@@ -1,6 +1,7 @@
 import type { EChartsCoreOption } from "echarts/core";
 
 import { finiteDecimalNumber } from "./decimal";
+import type { ClosedTrade } from "./shared/trading/closedTrade";
 import type { Theme } from "./theme";
 import { parseUtcTimestamp } from "./utc";
 
@@ -14,18 +15,6 @@ export type TradeCandle = {
   low: string;
   close: string;
   volume: string;
-};
-
-export type ClosedTrade = {
-  id: string;
-  side: TradeSide;
-  quantity: string;
-  entryTime: string;
-  entryPrice: string;
-  exitTime: string;
-  exitPrice: string;
-  fee: string;
-  pnl: string;
 };
 
 export type TradeChartSnapshot = {

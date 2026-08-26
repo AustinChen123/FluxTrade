@@ -79,8 +79,6 @@ const executableExtensions = new Set([
 let compilerFixtureSequence = 0;
 
 const expectedInventory = [
-  "BacktestResultsView.test.tsx",
-  "BacktestResultsView.tsx",
   "CandlestickChart.tsx",
   "EChart.test.tsx",
   "EChart.tsx",
@@ -96,7 +94,6 @@ const expectedInventory = [
   "app/navigation.test.ts",
   "app/navigation.ts",
   "architecture.test.ts",
-  "backtestDemo.ts",
   "decimal.ts",
   "features/research/FitnessSurface3D.test.tsx",
   "features/research/FitnessSurface3D.tsx",
@@ -114,8 +111,19 @@ const expectedInventory = [
   "features/research/researchModel.ts",
   "features/research/useResearchWorkspace.test.ts",
   "features/research/useResearchWorkspace.ts",
+  "features/results/BacktestResultsView.test.tsx",
+  "features/results/BacktestResultsView.tsx",
+  "features/results/demo.test.ts",
+  "features/results/demo.ts",
+  "features/results/resultsCharts.test.ts",
+  "features/results/resultsCharts.ts",
+  "features/results/resultsModel.test.ts",
+  "features/results/resultsModel.ts",
+  "features/results/useTradePagination.test.ts",
+  "features/results/useTradePagination.ts",
   "i18n.ts",
   "main.tsx",
+  "shared/trading/closedTrade.ts",
   "styles.css",
   "theme.ts",
   "tradeChart.test.ts",
@@ -142,11 +150,6 @@ const expectedBareImportLedger = [
   "architecture.test.ts|typescript/unstable/ast|value",
   "architecture.test.ts|typescript/unstable/sync|value",
   "architecture.test.ts|vitest|value",
-  "BacktestResultsView.test.tsx|@testing-library/react|value",
-  "BacktestResultsView.test.tsx|vitest|value",
-  "BacktestResultsView.tsx|echarts/core|type-only",
-  "BacktestResultsView.tsx|react-i18next|value",
-  "BacktestResultsView.tsx|react|value",
   "CandlestickChart.tsx|echarts/charts|value",
   "CandlestickChart.tsx|echarts/components|value",
   "CandlestickChart.tsx|echarts/core|value",
@@ -180,6 +183,17 @@ const expectedBareImportLedger = [
   "features/research/useResearchWorkspace.test.ts|@testing-library/react|value",
   "features/research/useResearchWorkspace.test.ts|vitest|value",
   "features/research/useResearchWorkspace.ts|react|value",
+  "features/results/BacktestResultsView.test.tsx|@testing-library/react|value",
+  "features/results/BacktestResultsView.test.tsx|vitest|value",
+  "features/results/BacktestResultsView.tsx|react-i18next|value",
+  "features/results/BacktestResultsView.tsx|react|value",
+  "features/results/demo.test.ts|vitest|value",
+  "features/results/resultsCharts.test.ts|vitest|value",
+  "features/results/resultsCharts.ts|echarts/core|type-only",
+  "features/results/resultsModel.test.ts|vitest|value",
+  "features/results/useTradePagination.test.ts|@testing-library/react|value",
+  "features/results/useTradePagination.test.ts|vitest|value",
+  "features/results/useTradePagination.ts|react|value",
   "i18n.ts|i18next|value",
   "i18n.ts|react-i18next|value",
   "main.tsx|react-dom/client|value",
@@ -202,27 +216,14 @@ const expectedRelativeImportLedger = [
   "app/App.test.tsx|../api|type-only|api.ts",
   "app/App.test.tsx|../i18n|value|i18n.ts",
   "app/App.test.tsx|./App|value|app/App.tsx",
-  "app/App.tsx|../BacktestResultsView|value|BacktestResultsView.tsx",
   "app/App.tsx|../features/research/ResearchRoute|value|features/research/ResearchRoute.tsx",
+  "app/App.tsx|../features/results/BacktestResultsView|value|features/results/BacktestResultsView.tsx",
   "app/App.tsx|../i18n|type-only|i18n.ts",
   "app/App.tsx|../StrategyManager|value|StrategyManager.tsx",
   "app/App.tsx|../theme|value|theme.ts",
   "app/App.tsx|../TradeChartView|value|TradeChartView.tsx",
   "app/App.tsx|./navigation|value|app/navigation.ts",
   "app/navigation.test.ts|./navigation|value|app/navigation.ts",
-  "backtestDemo.ts|./BacktestResultsView|type-only|BacktestResultsView.tsx",
-  "backtestDemo.ts|./tradeDemo|value|tradeDemo.ts",
-  "BacktestResultsView.test.tsx|./backtestDemo|value|backtestDemo.ts",
-  "BacktestResultsView.test.tsx|./BacktestResultsView|value|BacktestResultsView.tsx",
-  "BacktestResultsView.test.tsx|./i18n|value|i18n.ts",
-  "BacktestResultsView.test.tsx|./tradeDemo|value|tradeDemo.ts",
-  "BacktestResultsView.tsx|./backtestDemo|value|backtestDemo.ts",
-  "BacktestResultsView.tsx|./decimal|value|decimal.ts",
-  "BacktestResultsView.tsx|./EChart|value|EChart.tsx",
-  "BacktestResultsView.tsx|./i18n|type-only|i18n.ts",
-  "BacktestResultsView.tsx|./theme|type-only|theme.ts",
-  "BacktestResultsView.tsx|./tradeChart|type-only|tradeChart.ts",
-  "BacktestResultsView.tsx|./utc|value|utc.ts",
   "CandlestickChart.tsx|./EChartCore|value|EChartCore.tsx",
   "EChart.test.tsx|./EChart|value|EChart.tsx",
   "EChart.tsx|./EChartCore|value|EChartCore.tsx",
@@ -278,6 +279,38 @@ const expectedRelativeImportLedger = [
   "features/research/useResearchWorkspace.ts|./demo|value|features/research/demo.ts",
   "features/research/useResearchWorkspace.ts|./gaDomain|value|features/research/gaDomain.ts",
   "features/research/useResearchWorkspace.ts|./researchModel|value|features/research/researchModel.ts",
+  "features/results/BacktestResultsView.test.tsx|../../i18n|value|i18n.ts",
+  "features/results/BacktestResultsView.test.tsx|./BacktestResultsView|value|features/results/BacktestResultsView.tsx",
+  "features/results/BacktestResultsView.test.tsx|./demo|value|features/results/demo.ts",
+  "features/results/BacktestResultsView.test.tsx|./resultsModel|type-only|features/results/resultsModel.ts",
+  "features/results/BacktestResultsView.tsx|../../decimal|value|decimal.ts",
+  "features/results/BacktestResultsView.tsx|../../EChart|value|EChart.tsx",
+  "features/results/BacktestResultsView.tsx|../../i18n|type-only|i18n.ts",
+  "features/results/BacktestResultsView.tsx|../../theme|type-only|theme.ts",
+  "features/results/BacktestResultsView.tsx|../../utc|value|utc.ts",
+  "features/results/BacktestResultsView.tsx|./demo|value|features/results/demo.ts",
+  "features/results/BacktestResultsView.tsx|./resultsCharts|value|features/results/resultsCharts.ts",
+  "features/results/BacktestResultsView.tsx|./resultsModel|value|features/results/resultsModel.ts",
+  "features/results/BacktestResultsView.tsx|./useTradePagination|value|features/results/useTradePagination.ts",
+  "features/results/demo.test.ts|./demo|value|features/results/demo.ts",
+  "features/results/demo.ts|../../shared/trading/closedTrade|type-only|shared/trading/closedTrade.ts",
+  "features/results/demo.ts|./resultsModel|type-only|features/results/resultsModel.ts",
+  "features/results/resultsCharts.test.ts|./demo|value|features/results/demo.ts",
+  "features/results/resultsCharts.test.ts|./resultsCharts|value|features/results/resultsCharts.ts",
+  "features/results/resultsCharts.ts|../../decimal|value|decimal.ts",
+  "features/results/resultsCharts.ts|../../i18n|type-only|i18n.ts",
+  "features/results/resultsCharts.ts|../../theme|type-only|theme.ts",
+  "features/results/resultsCharts.ts|../../utc|value|utc.ts",
+  "features/results/resultsCharts.ts|./resultsModel|type-only|features/results/resultsModel.ts",
+  "features/results/resultsModel.test.ts|../../shared/trading/closedTrade|type-only|shared/trading/closedTrade.ts",
+  "features/results/resultsModel.test.ts|./resultsModel|value|features/results/resultsModel.ts",
+  "features/results/resultsModel.ts|../../decimal|value|decimal.ts",
+  "features/results/resultsModel.ts|../../shared/trading/closedTrade|type-only|shared/trading/closedTrade.ts",
+  "features/results/resultsModel.ts|../../utc|value|utc.ts",
+  "features/results/useTradePagination.test.ts|./demo|value|features/results/demo.ts",
+  "features/results/useTradePagination.test.ts|./resultsModel|type-only|features/results/resultsModel.ts",
+  "features/results/useTradePagination.test.ts|./useTradePagination|value|features/results/useTradePagination.ts",
+  "features/results/useTradePagination.ts|./resultsModel|value|features/results/resultsModel.ts",
   "main.tsx|./app/App|value|app/App.tsx",
   "main.tsx|./i18n|value|i18n.ts",
   "main.tsx|./styles.css|value|styles.css",
@@ -290,6 +323,7 @@ const expectedRelativeImportLedger = [
   "StrategyManager.tsx|./i18n|type-only|i18n.ts",
   "tradeChart.test.ts|./tradeChart|value|tradeChart.ts",
   "tradeChart.ts|./decimal|value|decimal.ts",
+  "tradeChart.ts|./shared/trading/closedTrade|type-only|shared/trading/closedTrade.ts",
   "tradeChart.ts|./theme|type-only|theme.ts",
   "tradeChart.ts|./utc|value|utc.ts",
   "TradeChartView.test.tsx|./i18n|value|i18n.ts",
@@ -302,6 +336,7 @@ const expectedRelativeImportLedger = [
   "TradeChartView.tsx|./tradeChart|value|tradeChart.ts",
   "TradeChartView.tsx|./tradeDemo|value|tradeDemo.ts",
   "TradeChartView.tsx|./utc|value|utc.ts",
+  "tradeDemo.ts|./shared/trading/closedTrade|type-only|shared/trading/closedTrade.ts",
   "tradeDemo.ts|./tradeChart|type-only|tradeChart.ts"
 ] as const;
 
@@ -737,7 +772,7 @@ describe("frontend architecture ratchet", () => {
         .map((edge) => `${edge.importer}|${edge.specifier}|${edge.kind}`)
     ).toEqual(expectedBareImportLedger);
   });
-  it("freezes the complete Node C source inventory", () => {
+  it("freezes the complete Node D source inventory", () => {
     const inventory = walkFiles(sourceRoot).map((file) =>
       path.relative(sourceRoot, file).replaceAll(path.sep, "/")
     );
@@ -781,10 +816,10 @@ describe("frontend architecture ratchet", () => {
       "./theme|value|theme.ts"
     ]);
     expect(directRelativeSpecifiers(edges, "app/App.tsx")).toEqual([
-      "../BacktestResultsView|value|BacktestResultsView.tsx",
       "../StrategyManager|value|StrategyManager.tsx",
       "../TradeChartView|value|TradeChartView.tsx",
       "../features/research/ResearchRoute|value|features/research/ResearchRoute.tsx",
+      "../features/results/BacktestResultsView|value|features/results/BacktestResultsView.tsx",
       "../i18n|type-only|i18n.ts",
       "../theme|value|theme.ts",
       "./navigation|value|app/navigation.ts"
@@ -1118,6 +1153,96 @@ describe("frontend architecture ratchet", () => {
     );
     expect(indexes.every((index) => index >= 0)).toBe(true);
     expect(indexes).toEqual([...indexes].sort((left, right) => left - right));
+  });
+
+  it("keeps the final results owner behind one shell facade", () => {
+    const source = (relativePath: string) => {
+      const file = compilerProject!.program.getSourceFile(
+        path.join(sourceRoot, relativePath)
+      );
+      if (!file) {
+        throw new Error(
+          `${relativePath} is unavailable to the architecture compiler`
+        );
+      }
+      return file;
+    };
+    const appSource = source("app/App.tsx");
+    const facadeSource = source("features/results/BacktestResultsView.tsx");
+    const paginationSource = source("features/results/useTradePagination.ts");
+    const modelSource = source("features/results/resultsModel.ts");
+    const chartsSource = source("features/results/resultsCharts.ts");
+    const app = findNamedFunction(appSource, "App");
+    const facade = findNamedFunction(facadeSource, "BacktestResultsView");
+    const pagination = findNamedFunction(
+      paginationSource,
+      "useTradePagination"
+    );
+    expect(app).toHaveLength(1);
+    expect(facade).toHaveLength(1);
+    expect(pagination).toHaveLength(1);
+
+    const resultStateNames = [
+      "tradePage",
+      "setTradePage",
+      "tradePageLoading",
+      "setTradePageLoading",
+      "tradePageError",
+      "setTradePageError",
+      "requestGeneration",
+      "requestInFlight"
+    ];
+    const appNames = declaredNames(app[0]);
+    for (const name of resultStateNames) {
+      expect(appNames).not.toContain(name);
+    }
+    expect(
+      descendants(app[0]).filter(
+        (node) =>
+          (isJsxOpeningElement(node) || isJsxSelfClosingElement(node)) &&
+          isIdentifier(node.tagName) &&
+          node.tagName.text === "BacktestResultsView"
+      )
+    ).toHaveLength(1);
+    expect(
+      descendants(facade[0]).filter(
+        (node) =>
+          isCallExpression(node) &&
+          isIdentifier(node.expression) &&
+          node.expression.text === "useTradePagination"
+      )
+    ).toHaveLength(1);
+
+    const paginationNames = declaredNames(pagination[0]);
+    for (const name of resultStateNames) {
+      expect(
+        paginationNames.filter((candidate) => candidate === name)
+      ).toHaveLength(1);
+    }
+    const paginationCalls = descendants(pagination[0]).filter(isCallExpression);
+    expect(
+      paginationCalls.filter(
+        (node) =>
+          isIdentifier(node.expression) && node.expression.text === "useState"
+      )
+    ).toHaveLength(3);
+    expect(
+      paginationCalls.filter(
+        (node) =>
+          isIdentifier(node.expression) && node.expression.text === "useRef"
+      )
+    ).toHaveLength(2);
+    expect(
+      paginationCalls.filter(
+        (node) =>
+          isIdentifier(node.expression) && node.expression.text === "useEffect"
+      )
+    ).toHaveLength(1);
+
+    expect(modelSource.getText()).not.toMatch(/\b(?:React|ECharts|fetch)\b/);
+    expect(chartsSource.getText()).not.toMatch(
+      /\b(?:React|fetch|localStorage|sessionStorage)\b/
+    );
   });
 
   it("keeps navigation pure", () => {

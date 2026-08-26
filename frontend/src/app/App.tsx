@@ -35,7 +35,7 @@ const TradeChartView = lazy(() =>
   }))
 );
 const BacktestResultsView = lazy(() =>
-  import("../BacktestResultsView").then((module) => ({
+  import("../features/results/BacktestResultsView").then((module) => ({
     default: module.BacktestResultsView
   }))
 );

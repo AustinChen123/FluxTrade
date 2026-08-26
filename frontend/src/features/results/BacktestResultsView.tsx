@@ -1,65 +1,21 @@
-import {
-  useEffect,
-  useMemo,
-  useRef,
-  useState,
-  type CSSProperties
-} from "react";
+import { useMemo, type CSSProperties } from "react";
 import { useTranslation } from "react-i18next";
-import type { EChartsCoreOption } from "echarts/core";
 
-import { EChart } from "./EChart";
-import { demoBacktestSnapshot } from "./backtestDemo";
-import { finiteDecimalNumber, isDecimalString } from "./decimal";
-import type { Locale } from "./i18n";
-import type { Theme } from "./theme";
-import type { ClosedTrade } from "./tradeChart";
-import { parseUtcTimestamp } from "./utc";
-
-type EquitySample = {
-  timestamp: string;
-  equity: string;
-  drawdown: string;
-};
-
-type MonthlyReturn = {
-  month: string;
-  returnPct: string;
-};
-
-type DistributionBucket = {
-  lower: string | null;
-  upper: string | null;
-  count: number;
-};
-
-export type BacktestResultSnapshot = {
-  jobId: string;
-  strategyId: string;
-  productId: string;
-  timeframe: string;
-  startedAt: string;
-  endedAt: string;
-  currency: string;
-  metrics: {
-    netPnl: string | null;
-    returnPct: string | null;
-    maxDrawdown: string | null;
-    sharpe: string | null;
-    sortino: string | null;
-    calmar: string | null;
-  };
-  equity: EquitySample[];
-  monthlyReturns: MonthlyReturn[];
-  pnlDistribution: DistributionBucket[];
-  tradePage: TradePage;
-};
-
-export type TradePage = {
-  items: ClosedTrade[];
-  totalCount: number;
-  nextCursor: string | null;
-};
+import { EChart } from "../../EChart";
+import { finiteDecimalNumber, isDecimalString } from "../../decimal";
+import type { Locale } from "../../i18n";
+import type { Theme } from "../../theme";
+import { parseUtcTimestamp } from "../../utc";
+import { demoBacktestSnapshot } from "./demo";
+import { resultChartOption } from "./resultsCharts";
+import {
+  validDistributionBuckets,
+  validateEquitySamples,
+  type BacktestResultSnapshot,
+  type DistributionBucket,
+  type TradePage
+} from "./resultsModel";
+import { useTradePagination } from "./useTradePagination";
 
 type Props = {
   demoMode: boolean;
@@ -94,146 +50,6 @@ function displayTimestamp(
   return timestamp === null ? "—" : formatter.format(timestamp);
 }
 
-function resultChartOption(
-  snapshot: BacktestResultSnapshot,
-  locale: Locale,
-  theme: Theme,
-  equityLabel: string,
-  drawdownLabel: string,
-  money: Intl.NumberFormat | null
-): EChartsCoreOption {
-  const dark = theme === "dark";
-  const ink = dark ? "#e5ece9" : "#182128";
-  const muted = dark ? "#94a29d" : "#66726f";
-  const grid = dark ? "#3b4949" : "#cbd5d1";
-  const axisTimestamp = new Intl.DateTimeFormat(locale, {
-    month: "short",
-    day: "numeric",
-    hour: "2-digit",
-    minute: "2-digit",
-    hour12: false,
-    timeZone: "UTC"
-  });
-  const tooltipTimestamp = new Intl.DateTimeFormat(locale, {
-    month: "short",
-    day: "numeric",
-    hour: "2-digit",
-    minute: "2-digit",
-    hour12: false,
-    timeZone: "UTC",
-    timeZoneName: "short"
-  });
-  const axisNumber = new Intl.NumberFormat(locale, {
-    maximumFractionDigits: 2,
-    useGrouping: true
-  });
-  const timestamps = snapshot.equity.map((sample) => sample.timestamp);
-
-  return {
-    animation: false,
-    textStyle: { color: ink },
-    tooltip: {
-      trigger: "axis",
-      backgroundColor: dark ? "#182226" : "#f8faf9",
-      borderColor: grid,
-      textStyle: { color: ink },
-      axisPointer: {
-        label: {
-          formatter: ({ value }: { value: unknown }) => {
-            return displayTimestamp(String(value), tooltipTimestamp);
-          }
-        }
-      },
-      valueFormatter: (value: unknown) => {
-        const parsed = typeof value === "number" ? value : Number(value);
-        return Number.isFinite(parsed) && money ? money.format(parsed) : "—";
-      }
-    },
-    legend: {
-      top: 4,
-      right: 12,
-      textStyle: { color: muted },
-      data: [equityLabel, drawdownLabel]
-    },
-    grid: [
-      { left: 76, right: 24, top: 42, height: "52%" },
-      { left: 76, right: 24, top: "72%", height: "17%" }
-    ],
-    xAxis: [
-      {
-        type: "category",
-        data: timestamps,
-        boundaryGap: false,
-        axisLabel: { show: false },
-        axisLine: { lineStyle: { color: grid } },
-        splitLine: { show: false }
-      },
-      {
-        type: "category",
-        gridIndex: 1,
-        data: timestamps,
-        boundaryGap: false,
-        axisLabel: {
-          color: muted,
-          hideOverlap: true,
-          formatter: (value: string) => displayTimestamp(value, axisTimestamp)
-        },
-        axisLine: { lineStyle: { color: grid } }
-      }
-    ],
-    yAxis: [
-      {
-        type: "value",
-        scale: true,
-        axisLabel: {
-          color: muted,
-          formatter: (value: number) => axisNumber.format(value)
-        },
-        splitLine: { lineStyle: { color: grid } }
-      },
-      {
-        type: "value",
-        gridIndex: 1,
-        inverse: true,
-        min: 0,
-        axisLabel: {
-          color: muted,
-          formatter: (value: number) => money?.format(value) ?? "—"
-        },
-        splitLine: { lineStyle: { color: grid } }
-      }
-    ],
-    series: [
-      {
-        id: "equity",
-        name: equityLabel,
-        type: "line",
-        data: snapshot.equity.map((sample) =>
-          finiteDecimalNumber(sample.equity)
-        ),
-        symbol: "none",
-        lineStyle: { color: dark ? "#49b2ae" : "#0e6b6f", width: 2 },
-        itemStyle: { color: dark ? "#49b2ae" : "#0e6b6f" },
-        areaStyle: { color: dark ? "rgba(73,178,174,.12)" : "rgba(14,107,111,.09)" }
-      },
-      {
-        id: "drawdown",
-        name: drawdownLabel,
-        type: "line",
-        xAxisIndex: 1,
-        yAxisIndex: 1,
-        data: snapshot.equity.map((sample) =>
-          finiteDecimalNumber(sample.drawdown)
-        ),
-        symbol: "none",
-        lineStyle: { color: dark ? "#ef8a6b" : "#d46a4c", width: 1.5 },
-        itemStyle: { color: dark ? "#ef8a6b" : "#d46a4c" },
-        areaStyle: { color: dark ? "rgba(239,138,107,.26)" : "rgba(212,106,76,.2)" }
-      }
-    ]
-  };
-}
-
 function monthLabel(value: string, locale: Locale): string {
   const match = /^(\d{4})-(\d{2})$/.exec(value);
   const month = match ? Number(match[2]) : 0;
@@ -254,62 +70,6 @@ function monthlyReturnIntensity(value: number, maximum: number): number {
   return Math.round(8 + (Math.abs(value) / maximum) * 28);
 }
 
-function validTradePage(page: TradePage): boolean {
-  if (
-    !Number.isSafeInteger(page.totalCount) ||
-    page.totalCount < page.items.length ||
-    (page.nextCursor !== null && page.nextCursor.trim() === "")
-  ) {
-    return false;
-  }
-  const ids = new Set<string>();
-  for (const trade of page.items) {
-    if (trade.id.length === 0 || ids.has(trade.id)) {
-      return false;
-    }
-    ids.add(trade.id);
-  }
-  return true;
-}
-
-function validLoadedTradePage(page: TradePage): boolean {
-  return (
-    validTradePage(page) &&
-    (page.nextCursor === null
-      ? page.items.length === page.totalCount
-      : page.items.length < page.totalCount)
-  );
-}
-
-function sameTrade(left: ClosedTrade, right: ClosedTrade): boolean {
-  return (
-    left.id === right.id &&
-    left.side === right.side &&
-    left.quantity === right.quantity &&
-    left.entryTime === right.entryTime &&
-    left.entryPrice === right.entryPrice &&
-    left.exitTime === right.exitTime &&
-    left.exitPrice === right.exitPrice &&
-    left.fee === right.fee &&
-    left.pnl === right.pnl
-  );
-}
-
-function mergeTradeItems(
-  current: ClosedTrade[],
-  incoming: ClosedTrade[]
-): ClosedTrade[] | null {
-  const merged = new Map(current.map((trade) => [trade.id, trade]));
-  for (const trade of incoming) {
-    const existing = merged.get(trade.id);
-    if (existing && !sameTrade(existing, trade)) {
-      return null;
-    }
-    merged.set(trade.id, existing ?? trade);
-  }
-  return [...merged.values()];
-}
-
 export function BacktestResultsView({
   demoMode,
   theme,
@@ -323,42 +83,19 @@ export function BacktestResultsView({
   const locale: Locale = i18n.resolvedLanguage === "en" ? "en" : "zh-TW";
   const data =
     snapshot === undefined ? (demoMode ? demoBacktestSnapshot : null) : snapshot;
-  const [tradePage, setTradePage] = useState<TradePage | null>(
-    data?.tradePage ?? null
-  );
-  const [tradePageLoading, setTradePageLoading] = useState(false);
-  const [tradePageError, setTradePageError] = useState(false);
-  const tradeRequestGeneration = useRef(0);
-  const tradeRequestInFlight = useRef(false);
-  useEffect(() => {
-    tradeRequestGeneration.current += 1;
-    tradeRequestInFlight.current = false;
-    setTradePage(data?.tradePage ?? null);
-    setTradePageLoading(false);
-    setTradePageError(false);
-    return () => {
-      tradeRequestGeneration.current += 1;
-      tradeRequestInFlight.current = false;
-    };
-  }, [data?.jobId, data?.tradePage]);
+  const {
+    tradePage,
+    tradePageLoading,
+    tradePageError,
+    tradePageValid,
+    loadMoreTrades
+  } = useTradePagination({
+    jobId: data?.jobId ?? null,
+    initialPage: data?.tradePage ?? null,
+    onLoadMoreTrades
+  });
   const equity = useMemo(
-    () => {
-      const samples = data?.equity ?? [];
-      let previousTimestamp = Number.NEGATIVE_INFINITY;
-      for (const sample of samples) {
-        const timestamp = parseUtcTimestamp(sample.timestamp);
-        if (
-          timestamp === null ||
-          timestamp <= previousTimestamp ||
-          finiteDecimalNumber(sample.equity) === null ||
-          finiteDecimalNumber(sample.drawdown) === null
-        ) {
-          return null;
-        }
-        previousTimestamp = timestamp;
-      }
-      return samples;
-    },
+    () => validateEquitySamples(data?.equity ?? []),
     [data?.equity]
   );
   const money = useMemo(
@@ -466,9 +203,7 @@ export function BacktestResultsView({
     );
   }
 
-  const distributionValid = data.pnlDistribution.every(
-    (bucket) => Number.isSafeInteger(bucket.count) && bucket.count >= 0
-  );
+  const distributionValid = validDistributionBuckets(data.pnlDistribution);
   const maxBucketCount = distributionValid
     ? Math.max(1, ...data.pnlDistribution.map((bucket) => bucket.count))
     : 1;
@@ -476,60 +211,10 @@ export function BacktestResultsView({
     const value = finiteDecimalNumber(month.returnPct);
     return value === null ? maximum : Math.max(maximum, Math.abs(value));
   }, 0);
-  const tradePageValid = tradePage !== null && validLoadedTradePage(tradePage);
-  const tradeCount = tradePageValid
-    ? tradePage.totalCount.toLocaleString(locale)
+  const displayedTradePage = tradePageValid ? tradePage : null;
+  const tradeCount = displayedTradePage
+    ? displayedTradePage.totalCount.toLocaleString(locale)
     : "—";
-  const loadMoreTrades = async () => {
-    if (
-      !tradePageValid ||
-      tradePage.nextCursor === null ||
-      !onLoadMoreTrades ||
-      tradeRequestInFlight.current
-    ) {
-      return;
-    }
-    tradeRequestInFlight.current = true;
-    const requestedCursor = tradePage.nextCursor;
-    const requestGeneration = tradeRequestGeneration.current;
-    setTradePageLoading(true);
-    setTradePageError(false);
-    try {
-      const nextPage = await onLoadMoreTrades(requestedCursor);
-      if (requestGeneration !== tradeRequestGeneration.current) {
-        return;
-      }
-      const items = validTradePage(nextPage)
-        ? mergeTradeItems(tradePage.items, nextPage.items)
-        : null;
-      const cursorAdvanced =
-        nextPage.nextCursor === null ||
-        nextPage.nextCursor !== requestedCursor;
-      const pageComplete =
-        nextPage.nextCursor === null
-          ? items?.length === nextPage.totalCount
-          : (items?.length ?? 0) < nextPage.totalCount;
-      if (
-        items === null ||
-        items.length === tradePage.items.length ||
-        nextPage.totalCount !== tradePage.totalCount ||
-        !cursorAdvanced ||
-        !pageComplete
-      ) {
-        throw new Error("invalid_trade_page");
-      }
-      setTradePage({ ...nextPage, items });
-    } catch {
-      if (requestGeneration === tradeRequestGeneration.current) {
-        setTradePageError(true);
-      }
-    } finally {
-      if (requestGeneration === tradeRequestGeneration.current) {
-        tradeRequestInFlight.current = false;
-        setTradePageLoading(false);
-      }
-    }
-  };
   const formatBucket = (bucket: DistributionBucket) => {
     if (bucket.lower === null) {
       return `< ${decimal(bucket.upper ?? "")}`;
@@ -702,7 +387,7 @@ export function BacktestResultsView({
           </div>
           <span>{data.jobId}</span>
         </div>
-        {tradePageValid && tradePage.items.length ? (
+        {displayedTradePage && displayedTradePage.items.length ? (
           <div className="results-table-wrap">
             <table>
               <thead>
@@ -717,7 +402,7 @@ export function BacktestResultsView({
                 </tr>
               </thead>
               <tbody>
-                {tradePage.items.map((trade) => (
+                {displayedTradePage.items.map((trade) => (
                   <tr key={trade.id}>
                     <td>{trade.id}</td>
                     <td>
@@ -752,20 +437,20 @@ export function BacktestResultsView({
               </tbody>
             </table>
           </div>
-        ) : tradePageValid ? (
+        ) : displayedTradePage ? (
           <div className="chart-message">{t("results.noTrades")}</div>
         ) : (
           <div className="chart-message">{t("results.invalidTradePage")}</div>
         )}
-        {tradePageValid && (
+        {displayedTradePage && (
           <div className="trade-page-controls">
             <span>
               {t("results.tradeProgress", {
-                loaded: tradePage.items.length.toLocaleString(locale),
-                total: tradePage.totalCount.toLocaleString(locale)
+                loaded: displayedTradePage.items.length.toLocaleString(locale),
+                total: displayedTradePage.totalCount.toLocaleString(locale)
               })}
             </span>
-            {tradePage.nextCursor !== null &&
+            {displayedTradePage.nextCursor !== null &&
               (onLoadMoreTrades ? (
                 <button
                   type="button"

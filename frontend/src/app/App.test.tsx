@@ -152,7 +152,7 @@ vi.mock("../TradeChartView", async () => {
   };
 });
 
-vi.mock("../BacktestResultsView", async () => {
+vi.mock("../features/results/BacktestResultsView", async () => {
   const { useEffect, useState } = await import("react");
   return {
     BacktestResultsView: ({

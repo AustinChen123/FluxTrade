@@ -9,17 +9,14 @@ import {
 } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
-import {
-  BacktestResultsView,
-  type BacktestResultSnapshot
-} from "./BacktestResultsView";
-import { demoBacktestSnapshot } from "./backtestDemo";
-import i18n from "./i18n";
-import { demoTradeSnapshot } from "./tradeDemo";
+import i18n from "../../i18n";
+import { BacktestResultsView } from "./BacktestResultsView";
+import { demoBacktestSnapshot } from "./demo";
+import type { BacktestResultSnapshot } from "./resultsModel";
 
 const chartState = vi.hoisted(() => ({ option: null as unknown }));
 
-vi.mock("./EChart", () => ({
+vi.mock("../../EChart", () => ({
   EChart: ({
     ariaLabel,
     option
@@ -46,6 +43,7 @@ function decimalUnits(value: string | null, scale: number): bigint {
 }
 
 const decimalCents = (value: string | null) => decimalUnits(value, 2);
+const demoTrades = demoBacktestSnapshot.tradePage.items;
 
 function deferred<T>() {
   let resolve!: (value: T) => void;
@@ -127,9 +125,7 @@ describe("BacktestResultsView", () => {
   });
 
   it("uses the same internally consistent trades as candle inspection", () => {
-    expect(demoBacktestSnapshot.tradePage.items).toBe(
-      demoTradeSnapshot.trades
-    );
+    expect(demoBacktestSnapshot.tradePage.items).toBe(demoTrades);
     const tradePnl = demoBacktestSnapshot.tradePage.items.reduce(
       (total, trade) => total + decimalCents(trade.pnl),
       0n
@@ -217,7 +213,7 @@ describe("BacktestResultsView", () => {
       .fn()
       .mockRejectedValueOnce(new Error("temporary"))
       .mockResolvedValueOnce({
-        items: demoTradeSnapshot.trades,
+        items: demoTrades,
         totalCount: 3,
         nextCursor: null
       });
@@ -229,7 +225,7 @@ describe("BacktestResultsView", () => {
         snapshot={{
           ...zeroTradeSnapshot,
           tradePage: {
-            items: [demoTradeSnapshot.trades[0]],
+            items: [demoTrades[0]],
             totalCount: 3,
             nextCursor: "cursor-1"
           }
@@ -267,7 +263,7 @@ describe("BacktestResultsView", () => {
 
   it("rejects a conflicting duplicate trade from the next page", async () => {
     const onLoadMoreTrades = vi.fn().mockResolvedValue({
-      items: [{ ...demoTradeSnapshot.trades[0], pnl: "999.00" }],
+      items: [{ ...demoTrades[0], pnl: "999.00" }],
       totalCount: 2,
       nextCursor: null
     });
@@ -279,7 +275,7 @@ describe("BacktestResultsView", () => {
         snapshot={{
           ...zeroTradeSnapshot,
           tradePage: {
-            items: [demoTradeSnapshot.trades[0]],
+            items: [demoTrades[0]],
             totalCount: 2,
             nextCursor: "cursor-1"
           }
@@ -299,7 +295,7 @@ describe("BacktestResultsView", () => {
 
   it("ignores a stale trade-page response after the job changes", async () => {
     const pending = deferred<{
-      items: typeof demoTradeSnapshot.trades;
+      items: typeof demoTrades;
       totalCount: number;
       nextCursor: null;
     }>();
@@ -313,7 +309,7 @@ describe("BacktestResultsView", () => {
           ...zeroTradeSnapshot,
           jobId: "job-one",
           tradePage: {
-            items: [demoTradeSnapshot.trades[0]],
+            items: [demoTrades[0]],
             totalCount: 3,
             nextCursor: "cursor-1"
           }
@@ -337,7 +333,7 @@ describe("BacktestResultsView", () => {
           ...zeroTradeSnapshot,
           jobId: "job-two",
           tradePage: {
-            items: [demoTradeSnapshot.trades[2]],
+            items: [demoTrades[2]],
             totalCount: 1,
             nextCursor: null
           }
@@ -345,7 +341,7 @@ describe("BacktestResultsView", () => {
       />
     );
     pending.resolve({
-      items: demoTradeSnapshot.trades,
+      items: demoTrades,
       totalCount: 3,
       nextCursor: null
     });
@@ -436,7 +432,7 @@ describe("BacktestResultsView", () => {
           tradePage: {
             items: [
               {
-                ...demoTradeSnapshot.trades[0],
+                ...demoTrades[0],
                 entryTime: "not-a-timestamp",
                 exitTime: "not-a-timestamp"
               }
@@ -559,7 +555,7 @@ describe("BacktestResultsView", () => {
         snapshot={{
           ...zeroTradeSnapshot,
           tradePage: {
-            items: [demoTradeSnapshot.trades[0]],
+            items: [demoTrades[0]],
             totalCount: 2,
             nextCursor: null
           }
@@ -579,7 +575,7 @@ describe("BacktestResultsView", () => {
         snapshot={{
           ...zeroTradeSnapshot,
           tradePage: {
-            items: [demoTradeSnapshot.trades[0]],
+            items: [demoTrades[0]],
             totalCount: 2,
             nextCursor: "cursor-1"
           }
