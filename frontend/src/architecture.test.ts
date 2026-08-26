@@ -82,8 +82,6 @@ const expectedInventory = [
   "EChart.test.tsx",
   "EChart.tsx",
   "EChartCore.tsx",
-  "StrategyManager.test.tsx",
-  "StrategyManager.tsx",
   "api.test.ts",
   "api.ts",
   "app/App.test.tsx",
@@ -118,6 +116,14 @@ const expectedInventory = [
   "features/results/resultsModel.ts",
   "features/results/useTradePagination.test.ts",
   "features/results/useTradePagination.ts",
+  "features/strategies/StrategyManager.test.tsx",
+  "features/strategies/StrategyManager.tsx",
+  "features/strategies/StrategyManagerView.test.tsx",
+  "features/strategies/StrategyManagerView.tsx",
+  "features/strategies/strategyCommandState.test.ts",
+  "features/strategies/strategyCommandState.ts",
+  "features/strategies/useStrategyManager.test.ts",
+  "features/strategies/useStrategyManager.ts",
   "features/trades/CandlestickChart.test.tsx",
   "features/trades/CandlestickChart.tsx",
   "features/trades/TradeChartView.test.tsx",
@@ -195,6 +201,18 @@ const expectedBareImportLedger = [
   "features/results/useTradePagination.test.ts|@testing-library/react|value",
   "features/results/useTradePagination.test.ts|vitest|value",
   "features/results/useTradePagination.ts|react|value",
+  "features/strategies/strategyCommandState.test.ts|vitest|value",
+  "features/strategies/StrategyManager.test.tsx|@testing-library/react|value",
+  "features/strategies/StrategyManager.test.tsx|vitest|value",
+  "features/strategies/StrategyManager.tsx|react-i18next|value",
+  "features/strategies/StrategyManagerView.test.tsx|@testing-library/react|value",
+  "features/strategies/StrategyManagerView.test.tsx|vitest|value",
+  "features/strategies/StrategyManagerView.tsx|react-i18next|type-only",
+  "features/strategies/StrategyManagerView.tsx|react|value",
+  "features/strategies/useStrategyManager.test.ts|@testing-library/react|value",
+  "features/strategies/useStrategyManager.test.ts|vitest|value",
+  "features/strategies/useStrategyManager.ts|react-i18next|type-only",
+  "features/strategies/useStrategyManager.ts|react|value",
   "features/trades/CandlestickChart.test.tsx|@testing-library/react|value",
   "features/trades/CandlestickChart.test.tsx|vitest|value",
   "features/trades/CandlestickChart.tsx|echarts/charts|value",
@@ -211,11 +229,7 @@ const expectedBareImportLedger = [
   "i18n.ts|i18next|value",
   "i18n.ts|react-i18next|value",
   "main.tsx|react-dom/client|value",
-  "main.tsx|react|value",
-  "StrategyManager.test.tsx|@testing-library/react|value",
-  "StrategyManager.test.tsx|vitest|value",
-  "StrategyManager.tsx|react-i18next|value",
-  "StrategyManager.tsx|react|value"
+  "main.tsx|react|value"
 ] as const;
 
 const expectedRelativeImportLedger = [
@@ -226,9 +240,9 @@ const expectedRelativeImportLedger = [
   "app/App.test.tsx|./App|value|app/App.tsx",
   "app/App.tsx|../features/research/ResearchRoute|value|features/research/ResearchRoute.tsx",
   "app/App.tsx|../features/results/BacktestResultsView|value|features/results/BacktestResultsView.tsx",
+  "app/App.tsx|../features/strategies/StrategyManager|value|features/strategies/StrategyManager.tsx",
   "app/App.tsx|../features/trades/TradeChartView|value|features/trades/TradeChartView.tsx",
   "app/App.tsx|../i18n|type-only|i18n.ts",
-  "app/App.tsx|../StrategyManager|value|StrategyManager.tsx",
   "app/App.tsx|../theme|value|theme.ts",
   "app/App.tsx|./navigation|value|app/navigation.ts",
   "app/navigation.test.ts|./navigation|value|app/navigation.ts",
@@ -318,6 +332,28 @@ const expectedRelativeImportLedger = [
   "features/results/useTradePagination.test.ts|./resultsModel|type-only|features/results/resultsModel.ts",
   "features/results/useTradePagination.test.ts|./useTradePagination|value|features/results/useTradePagination.ts",
   "features/results/useTradePagination.ts|./resultsModel|value|features/results/resultsModel.ts",
+  "features/strategies/strategyCommandState.test.ts|../../api|type-only|api.ts",
+  "features/strategies/strategyCommandState.test.ts|./strategyCommandState|value|features/strategies/strategyCommandState.ts",
+  "features/strategies/strategyCommandState.ts|../../api|type-only|api.ts",
+  "features/strategies/StrategyManager.test.tsx|../../api|type-only|api.ts",
+  "features/strategies/StrategyManager.test.tsx|../../api|value|api.ts",
+  "features/strategies/StrategyManager.test.tsx|../../i18n|value|i18n.ts",
+  "features/strategies/StrategyManager.test.tsx|./StrategyManager|value|features/strategies/StrategyManager.tsx",
+  "features/strategies/StrategyManager.tsx|../../i18n|type-only|i18n.ts",
+  "features/strategies/StrategyManager.tsx|./StrategyManagerView|value|features/strategies/StrategyManagerView.tsx",
+  "features/strategies/StrategyManager.tsx|./useStrategyManager|value|features/strategies/useStrategyManager.ts",
+  "features/strategies/StrategyManagerView.test.tsx|../../i18n|value|i18n.ts",
+  "features/strategies/StrategyManagerView.test.tsx|./strategyCommandState|type-only|features/strategies/strategyCommandState.ts",
+  "features/strategies/StrategyManagerView.test.tsx|./StrategyManagerView|value|features/strategies/StrategyManagerView.tsx",
+  "features/strategies/StrategyManagerView.tsx|../../i18n|type-only|i18n.ts",
+  "features/strategies/StrategyManagerView.tsx|./strategyCommandState|type-only|features/strategies/strategyCommandState.ts",
+  "features/strategies/useStrategyManager.test.ts|../../api|type-only|api.ts",
+  "features/strategies/useStrategyManager.test.ts|../../api|value|api.ts",
+  "features/strategies/useStrategyManager.test.ts|../../i18n|value|i18n.ts",
+  "features/strategies/useStrategyManager.test.ts|./strategyCommandState|value|features/strategies/strategyCommandState.ts",
+  "features/strategies/useStrategyManager.test.ts|./useStrategyManager|value|features/strategies/useStrategyManager.ts",
+  "features/strategies/useStrategyManager.ts|../../api|value|api.ts",
+  "features/strategies/useStrategyManager.ts|./strategyCommandState|value|features/strategies/strategyCommandState.ts",
   "features/trades/CandlestickChart.test.tsx|./CandlestickChart|value|features/trades/CandlestickChart.tsx",
   "features/trades/CandlestickChart.tsx|../../EChartCore|value|EChartCore.tsx",
   "features/trades/demo.test.ts|./demo|value|features/trades/demo.ts",
@@ -345,13 +381,7 @@ const expectedRelativeImportLedger = [
   "main.tsx|./app/App|value|app/App.tsx",
   "main.tsx|./i18n|value|i18n.ts",
   "main.tsx|./styles.css|value|styles.css",
-  "main.tsx|./theme|value|theme.ts",
-  "StrategyManager.test.tsx|./api|type-only|api.ts",
-  "StrategyManager.test.tsx|./api|value|api.ts",
-  "StrategyManager.test.tsx|./i18n|value|i18n.ts",
-  "StrategyManager.test.tsx|./StrategyManager|value|StrategyManager.tsx",
-  "StrategyManager.tsx|./api|value|api.ts",
-  "StrategyManager.tsx|./i18n|type-only|i18n.ts"
+  "main.tsx|./theme|value|theme.ts"
 ] as const;
 
 const expectedPolicyGlobalLedger = [
@@ -362,6 +392,11 @@ const expectedPolicyGlobalLedger = [
   "app/App.tsx|window.location.href",
   "app/App.tsx|window.location.search",
   "features/research/FitnessSurface3D.tsx|window.devicePixelRatio",
+  "features/strategies/useStrategyManager.ts|window.confirm()",
+  "features/strategies/useStrategyManager.ts|window.crypto.randomUUID()",
+  "features/strategies/useStrategyManager.ts|window.sessionStorage.getItem()",
+  "features/strategies/useStrategyManager.ts|window.sessionStorage.removeItem()",
+  "features/strategies/useStrategyManager.ts|window.sessionStorage.setItem()",
   "i18n.ts|document.documentElement.lang",
   "i18n.ts|document.documentElement.lang",
   "i18n.ts|navigator",
@@ -370,11 +405,6 @@ const expectedPolicyGlobalLedger = [
   "i18n.ts|window.localStorage.getItem()",
   "i18n.ts|window.localStorage.setItem()",
   "main.tsx|document.getElementById()",
-  "StrategyManager.tsx|window.confirm()",
-  "StrategyManager.tsx|window.crypto.randomUUID()",
-  "StrategyManager.tsx|window.sessionStorage.getItem()",
-  "StrategyManager.tsx|window.sessionStorage.removeItem()",
-  "StrategyManager.tsx|window.sessionStorage.setItem()",
   "theme.ts|document.documentElement.dataset.theme",
   'theme.ts|document.querySelector("meta[name=\\"theme-color\\"]")',
   "theme.ts|window.localStorage.getItem()",
@@ -786,7 +816,7 @@ describe("frontend architecture ratchet", () => {
         .map((edge) => `${edge.importer}|${edge.specifier}|${edge.kind}`)
     ).toEqual(expectedBareImportLedger);
   });
-  it("freezes the complete Node E source inventory", () => {
+  it("freezes the complete Node F source inventory", () => {
     const inventory = walkFiles(sourceRoot).map((file) =>
       path.relative(sourceRoot, file).replaceAll(path.sep, "/")
     );
@@ -830,9 +860,9 @@ describe("frontend architecture ratchet", () => {
       "./theme|value|theme.ts"
     ]);
     expect(directRelativeSpecifiers(edges, "app/App.tsx")).toEqual([
-      "../StrategyManager|value|StrategyManager.tsx",
       "../features/research/ResearchRoute|value|features/research/ResearchRoute.tsx",
       "../features/results/BacktestResultsView|value|features/results/BacktestResultsView.tsx",
+      "../features/strategies/StrategyManager|value|features/strategies/StrategyManager.tsx",
       "../features/trades/TradeChartView|value|features/trades/TradeChartView.tsx",
       "../i18n|type-only|i18n.ts",
       "../theme|value|theme.ts",
@@ -1328,6 +1358,74 @@ describe("frontend architecture ratchet", () => {
       return [node.arguments[0].text];
     });
     expect(dynamicImports).toEqual(["./CandlestickChart"]);
+  });
+
+  it("keeps the final strategy owner behind one pure state and one I/O owner", () => {
+    const source = (relativePath: string) => {
+      const file = compilerProject!.program.getSourceFile(
+        path.join(sourceRoot, relativePath)
+      );
+      if (!file) {
+        throw new Error(
+          `${relativePath} is unavailable to the architecture compiler`
+        );
+      }
+      return file;
+    };
+    const edges = collectImports();
+    const facadeSource = source("features/strategies/StrategyManager.tsx");
+    const hookSource = source("features/strategies/useStrategyManager.ts");
+    const stateSource = source("features/strategies/strategyCommandState.ts");
+    const viewSource = source("features/strategies/StrategyManagerView.tsx");
+
+    expect(findNamedFunction(facadeSource, "StrategyManager")).toHaveLength(1);
+    expect(findNamedFunction(hookSource, "useStrategyManager")).toHaveLength(1);
+    expect(
+      findNamedFunction(stateSource, "transitionStrategyCommandState")
+    ).toHaveLength(1);
+    expect(
+      findNamedFunction(viewSource, "StrategyManagerView")
+    ).toHaveLength(1);
+    expect(
+      directRelativeSpecifiers(edges, "features/strategies/StrategyManager.tsx")
+    ).toEqual([
+      "../../i18n|type-only|i18n.ts",
+      "./StrategyManagerView|value|features/strategies/StrategyManagerView.tsx",
+      "./useStrategyManager|value|features/strategies/useStrategyManager.ts"
+    ]);
+    expect(
+      directRelativeSpecifiers(
+        edges,
+        "features/strategies/useStrategyManager.ts"
+      )
+    ).toEqual([
+      "../../api|value|api.ts",
+      "./strategyCommandState|value|features/strategies/strategyCommandState.ts"
+    ]);
+    expect(
+      directRelativeSpecifiers(
+        edges,
+        "features/strategies/strategyCommandState.ts"
+      )
+    ).toEqual(["../../api|type-only|api.ts"]);
+    expect(
+      directRelativeSpecifiers(
+        edges,
+        "features/strategies/StrategyManagerView.tsx"
+      )
+    ).toEqual([
+      "../../i18n|type-only|i18n.ts",
+      "./strategyCommandState|type-only|features/strategies/strategyCommandState.ts"
+    ]);
+    expect(stateSource.getText()).not.toMatch(
+      /\b(?:React|window|document|fetch|localStorage|sessionStorage|crypto|navigator)\b/
+    );
+    expect(viewSource.getText()).not.toMatch(
+      /\b(?:window|document|fetch|localStorage|sessionStorage|crypto|navigator)\b/
+    );
+    expect(hookSource.getText()).toMatch(/window\.confirm/);
+    expect(hookSource.getText()).toMatch(/window\.crypto\.randomUUID/);
+    expect(hookSource.getText()).toMatch(/window\.sessionStorage/);
   });
 
   it("keeps navigation pure", () => {

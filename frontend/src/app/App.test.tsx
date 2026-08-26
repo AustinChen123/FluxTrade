@@ -82,7 +82,7 @@ vi.mock("../features/research/FitnessSurface3D", async () => {
   };
 });
 
-vi.mock("../StrategyManager", async () => {
+vi.mock("../features/strategies/StrategyManager", async () => {
   const { useEffect, useState } = await import("react");
   return {
     StrategyManager: () => {

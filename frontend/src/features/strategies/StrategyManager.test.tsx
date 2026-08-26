@@ -3,8 +3,8 @@
 import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
-import { ApiError, type StrategyState, type StrategyStatus } from "./api";
-import i18n from "./i18n";
+import { ApiError, type StrategyState, type StrategyStatus } from "../../api";
+import i18n from "../../i18n";
 import { StrategyManager } from "./StrategyManager";
 
 const api = vi.hoisted(() => ({
@@ -13,8 +13,8 @@ const api = vi.hoisted(() => ({
   sendStrategyCommand: vi.fn()
 }));
 
-vi.mock("./api", async (importOriginal) => ({
-  ...(await importOriginal<typeof import("./api")>()),
+vi.mock("../../api", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("../../api")>()),
   ...api
 }));
 
@@ -115,6 +115,21 @@ describe("strategy management", () => {
     fireEvent.click(await screen.findByRole("button", { name: "停止" }));
 
     expect(api.sendStrategyCommand).not.toHaveBeenCalled();
+  });
+
+  it("serializes rapid command interactions before a second confirmation", async () => {
+    const request = deferred();
+    api.sendStrategyCommand.mockReturnValue(request.promise);
+    render(<StrategyManager />);
+    const stop = await screen.findByRole("button", { name: "停止" });
+
+    fireEvent.click(stop);
+    fireEvent.click(stop);
+
+    expect(window.confirm).toHaveBeenCalledTimes(1);
+    expect(api.sendStrategyCommand).toHaveBeenCalledTimes(1);
+    request.resolve();
+    await waitFor(() => expect(api.loadStrategyStates).toHaveBeenCalledTimes(2));
   });
 
   it("sends one CSRF-protected command, locks actions, and refreshes", async () => {
@@ -224,6 +239,8 @@ describe("strategy management", () => {
     expect(
       await screen.findByRole("button", { name: "等待狀態更新" })
     ).toBeTruthy();
+    expect(api.ensureBrowserSession).toHaveBeenCalledTimes(3);
+    expect(api.loadStrategyStates).toHaveBeenCalledTimes(3);
   });
 
   it("treats a server-side timeout as an ambiguous command outcome", async () => {
@@ -293,6 +310,24 @@ describe("strategy management", () => {
     expect(screen.getByRole("button", { name: "等待狀態更新" })).toBeTruthy();
   });
 
+  it("keeps an accepted lock when the refreshed snapshot omits its strategy", async () => {
+    api.loadStrategyStates
+      .mockResolvedValueOnce([strategy("active-strategy", "ACTIVE")])
+      .mockResolvedValueOnce([]);
+    render(<StrategyManager />);
+
+    fireEvent.click(await screen.findByRole("button", { name: "停止" }));
+
+    expect(
+      await screen.findByText("已接受 active-strategy 的「停止」命令。")
+    ).toBeTruthy();
+    await waitFor(() => expect(api.loadStrategyStates).toHaveBeenCalledTimes(2));
+    expect(screen.queryByText("active-strategy")).toBeNull();
+    expect(
+      window.sessionStorage.getItem("fluxtrade.strategy.awaiting")
+    ).toBe('[["active-strategy",{"status":"ACTIVE","version":3}]]');
+  });
+
   it("unlocks the next action after the authoritative state changes", async () => {
     api.loadStrategyStates
       .mockResolvedValueOnce([strategy("active-strategy", "ACTIVE")])
@@ -313,5 +348,25 @@ describe("strategy management", () => {
 
     expect(await screen.findByText("尚無策略狀態")).toBeTruthy();
     expect(screen.getByLabelText("策略狀態摘要").textContent).toContain("0");
+  });
+
+  it("performs one fresh owner setup after active-only unmount and re-entry", async () => {
+    window.sessionStorage.setItem(
+      "fluxtrade.strategy.awaiting",
+      '[["active-strategy",{"status":"ACTIVE","version":3}]]'
+    );
+    const first = render(<StrategyManager />);
+    expect(
+      await screen.findByRole("button", { name: "等待狀態更新" })
+    ).toBeTruthy();
+    first.unmount();
+
+    render(<StrategyManager />);
+
+    expect(
+      await screen.findByRole("button", { name: "等待狀態更新" })
+    ).toBeTruthy();
+    expect(api.ensureBrowserSession).toHaveBeenCalledTimes(2);
+    expect(api.loadStrategyStates).toHaveBeenCalledTimes(2);
   });
 });

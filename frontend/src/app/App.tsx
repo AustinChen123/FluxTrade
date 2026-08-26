@@ -25,7 +25,7 @@ import {
 } from "./navigation";
 
 const StrategyManager = lazy(() =>
-  import("../StrategyManager").then((module) => ({
+  import("../features/strategies/StrategyManager").then((module) => ({
     default: module.StrategyManager
   }))
 );

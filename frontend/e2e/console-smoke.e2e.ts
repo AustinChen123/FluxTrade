@@ -260,7 +260,49 @@ async function waitForStrategy(page: Page): Promise<void> {
 }
 
 function moduleCount(requests: readonly string[], basename: string): number {
-  return requests.filter((url) => url.includes(basename)).length;
+  return requests.filter((url) => moduleRequestMatches(url, basename)).length;
+}
+
+function moduleRequestMatches(url: string, basename: string): boolean {
+  let filename: string;
+  try {
+    filename = new URL(url).pathname.split("/").at(-1) ?? "";
+  } catch {
+    return false;
+  }
+  return (
+    filename === `${basename}.ts` ||
+    filename === `${basename}.tsx` ||
+    (filename.startsWith(`${basename}-`) &&
+      filename.endsWith(".js") &&
+      filename.length > basename.length + 4)
+  );
+}
+
+function assertModuleRequestClassifier(): void {
+  expect(
+    moduleRequestMatches(
+      "http://127.0.0.1:4173/src/features/strategies/StrategyManager.tsx?t=1",
+      "StrategyManager"
+    )
+  ).toBe(true);
+  expect(
+    moduleRequestMatches(
+      "http://127.0.0.1:4173/assets/StrategyManager-AbC_123.js",
+      "StrategyManager"
+    )
+  ).toBe(true);
+  for (const url of [
+    "http://127.0.0.1:4173/src/features/strategies/StrategyManagerView.tsx",
+    "http://127.0.0.1:4173/src/features/strategies/useStrategyManager.ts",
+    "http://127.0.0.1:4173/src/StrategyManager/owner.tsx",
+    "http://127.0.0.1:4173/assets/StrategyManager-.js",
+    "http://127.0.0.1:4173/assets/StrategyManager.css",
+    "http://127.0.0.1:4173/src/owner.tsx?module=StrategyManager.tsx",
+    "not a URL"
+  ]) {
+    expect(moduleRequestMatches(url, "StrategyManager")).toBe(false);
+  }
 }
 
 async function assertSingleModuleActivation(
@@ -427,6 +469,7 @@ async function exerciseScenario(
   }
 
   if (triple.scenario === "lazy-chunk-inventory") {
+    assertModuleRequestClassifier();
     await open(triple.server === "dev" ? "/?demo=1" : "/");
     if (triple.server === "production") {
       await waitForResearch(page);
