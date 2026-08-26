@@ -1,7 +1,9 @@
+import gc
 import json
 import socketserver
 import threading
 import time
+import warnings
 from concurrent.futures import Future
 from datetime import UTC, date, datetime
 from decimal import Decimal
@@ -12,6 +14,7 @@ from sqlalchemy import create_engine, func, select
 from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.ext.compiler import compiles
 from sqlalchemy.orm import sessionmaker
+from sqlalchemy.pool import NullPool
 
 from src.control_plane import (
     BacktestJobExecutor,
@@ -75,6 +78,7 @@ def _sqlite_session_factory(tmp_path):
     engine = create_engine(
         f"sqlite:///{tmp_path / 'control_plane_backtest.db'}",
         connect_args={"check_same_thread": False, "timeout": 30},
+        poolclass=NullPool,
     )
     for table in [
         Exchange.__table__,
@@ -105,6 +109,7 @@ def _sqlite_gene_registry_session_factory(tmp_path):
     engine = create_engine(
         f"sqlite:///{tmp_path / 'control_plane_gene_registry.db'}",
         connect_args={"check_same_thread": False, "timeout": 30},
+        poolclass=NullPool,
     )
     for table in [
         Strategy.__table__,
@@ -125,6 +130,7 @@ def _sqlite_strategy_state_session_factory(tmp_path):
     engine = create_engine(
         f"sqlite:///{tmp_path / 'control_plane_strategy_state.db'}",
         connect_args={"check_same_thread": False, "timeout": 30},
+        poolclass=NullPool,
     )
     for table in [
         Strategy.__table__,
@@ -149,6 +155,7 @@ def _sqlite_control_plane_session_factory(tmp_path):
     engine = create_engine(
         f"sqlite:///{tmp_path / 'control_plane_production_wiring.db'}",
         connect_args={"check_same_thread": False, "timeout": 30},
+        poolclass=NullPool,
     )
     for table in [
         Strategy.__table__,
@@ -619,6 +626,35 @@ def test_sqlite_job_store_persists_job_state_across_instances(tmp_path):
     assert restored.started_at is not None
     assert restored.finished_at is not None
     assert listed[0].id == created.id
+
+
+def test_sqlite_job_store_releases_connections_after_each_operation(tmp_path):
+    db_path = tmp_path / "connection-lifecycle.db"
+    request = BacktestJobRequest(
+        strategy_id="lifecycle",
+        product_id=PRODUCT_ID,
+        timeframe=TIMEFRAME,
+        candles_csv_path="/tmp/candles.csv",
+        signals_csv_path="/tmp/signals.csv",
+        start_time=1,
+        end_time=2,
+    )
+
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always", ResourceWarning)
+        store = SqliteJobStore(db_path)
+        created = store.create(kind=request.kind, request=request)
+        assert store.get(created.id) is not None
+        assert store.list()
+        store.mark_running(created.id)
+        store.mark_succeeded(created.id, {"total_trades": 0})
+        del created
+        del store
+        gc.collect()
+
+    assert not [
+        warning for warning in caught if issubclass(warning.category, ResourceWarning)
+    ]
 
 
 def test_backtest_executor_marks_persisted_active_jobs_interrupted_on_startup(tmp_path):

@@ -152,7 +152,10 @@ def test_loaded_classes_publish_before_database_failure():
     db.commit.assert_not_called()
 
 
-def test_new_artifact_creates_strategy_parent_before_lifecycle_transition(tmp_path):
+def test_new_artifact_creates_strategy_parent_before_lifecycle_transition(
+    tmp_path,
+    request: pytest.FixtureRequest,
+):
     class Artifact:
         pass
 
@@ -161,6 +164,7 @@ def test_new_artifact_creates_strategy_parent_before_lifecycle_transition(tmp_pa
     }
 
     engine = create_engine(f"sqlite:///{tmp_path / 'artifact-state.db'}")
+    request.addfinalizer(engine.dispose)
 
     @event.listens_for(engine, "connect")
     def enable_foreign_keys(dbapi_connection, _connection_record):

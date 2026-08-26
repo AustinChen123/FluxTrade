@@ -177,7 +177,7 @@ jobs:
         run: uv run pytest tests/test_invariant_*.py -v
 
       - name: Run unit tests with coverage
-        run: uv run pytest -m "not integration" --cov=src --cov-report=term-missing --cov-report=xml:coverage.xml --cov-fail-under=77
+        run: uv run pytest -W error -m "not integration" --cov=src --cov-report=term-missing --cov-report=xml:coverage.xml --cov-fail-under=77
 
       - name: Upload coverage report
         if: always()
@@ -285,7 +285,7 @@ jobs:
         working-directory: ./python-strategy
         env:
           FLUXTRADE_RUN_POSTGRES_MIGRATION_TESTS: "1"
-        run: uv run pytest -m "integration or rust" -v
+        run: uv run pytest -W error -m "integration or rust" -v
 
   refactor-gate:
     name: Refactor Gate

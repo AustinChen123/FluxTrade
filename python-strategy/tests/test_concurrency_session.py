@@ -5,6 +5,7 @@ from decimal import Decimal
 
 from sqlalchemy import create_engine, func, select
 from sqlalchemy.orm import sessionmaker
+from sqlalchemy.pool import NullPool
 
 from src.core.models import OrderSide
 from src.core.orm_models import (
@@ -24,6 +25,7 @@ def _sqlite_session_factory(tmp_path):
     engine = create_engine(
         f"sqlite:///{tmp_path / 'session_lifecycle.db'}",
         connect_args={"check_same_thread": False, "timeout": 30},
+        poolclass=NullPool,
     )
     for table in [
         Exchange.__table__,

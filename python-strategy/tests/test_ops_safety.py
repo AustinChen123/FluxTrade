@@ -1256,11 +1256,13 @@ class TestFlattenPosition:
     def test_live_position_uses_reserved_ops_strategy_with_real_fk(
         self,
         tmp_path,
+        request: pytest.FixtureRequest,
         mock_clock,
         mock_exchange_adapter,
     ):
         """Exchange-only LIVE positions must persist flatten orders in a real DB."""
         engine = create_engine(f"sqlite:///{tmp_path / 'ops_flatten.db'}")
+        request.addfinalizer(engine.dispose)
 
         @event.listens_for(engine, "connect")
         def _enable_fk(dbapi_connection, _connection_record):

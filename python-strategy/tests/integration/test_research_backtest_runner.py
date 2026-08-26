@@ -5,8 +5,10 @@ basic fill ordering and fee-aware PnL should stay aligned for simple signal
 strategies. These tests protect that contract without asserting speed.
 """
 
+import gc
 import hashlib
 import json
+import warnings
 from decimal import Decimal
 
 import pytest
@@ -14,6 +16,7 @@ from sqlalchemy import create_engine, select
 from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.ext.compiler import compiles
 from sqlalchemy.orm import sessionmaker
+from sqlalchemy.pool import NullPool
 
 from integration.conftest import PRODUCT_ID, TIMEFRAME, make_candle, make_candle_series
 from src.core.analytics import (
@@ -129,6 +132,7 @@ def _sqlite_backtest_session_factory(tmp_path):
     engine = create_engine(
         f"sqlite:///{tmp_path / 'research_backtest_parity.db'}",
         connect_args={"check_same_thread": False, "timeout": 30},
+        poolclass=NullPool,
     )
     for table in [
         Exchange.__table__,
@@ -154,6 +158,22 @@ def _sqlite_backtest_session_factory(tmp_path):
         session.commit()
 
     return session_factory
+
+
+def test_sqlite_backtest_session_factory_releases_connections(tmp_path):
+    session_factory = _sqlite_backtest_session_factory(tmp_path)
+    with session_factory() as session:
+        assert session.execute(select(Exchange.id)).scalar_one() == "BINANCE"
+
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always", ResourceWarning)
+        del session
+        del session_factory
+        gc.collect()
+
+    assert not [
+        warning for warning in caught if issubclass(warning.category, ResourceWarning)
+    ]
 
 
 def _signal_factory(

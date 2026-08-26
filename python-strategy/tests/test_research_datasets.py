@@ -133,7 +133,10 @@ def session_factory():
         ):
             connection.execute(text(statement))
     factory = sessionmaker(bind=engine)
-    return factory
+    try:
+        yield factory
+    finally:
+        engine.dispose()
 
 
 @pytest.fixture

@@ -73,7 +73,10 @@ def test_control_plane_static_files_reject_path_traversal(static_control_plane):
             timeout=2,
         )
 
-    assert exc_info.value.code == 404
+    try:
+        assert exc_info.value.code == 404
+    finally:
+        exc_info.value.close()
 
 
 def test_serve_closes_server_after_keyboard_interrupt():

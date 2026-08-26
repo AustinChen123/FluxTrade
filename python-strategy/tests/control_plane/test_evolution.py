@@ -9,6 +9,7 @@ from sqlalchemy import create_engine
 from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.ext.compiler import compiles
 from sqlalchemy.orm import sessionmaker
+from sqlalchemy.pool import NullPool
 
 from src.control_plane.jobs import InMemoryJobStore, SqliteJobStore
 from src.control_plane.fitness import expected_maximum_sharpe
@@ -115,6 +116,7 @@ def _session_factory(tmp_path, name: str):
     engine = create_engine(
         f"sqlite:///{tmp_path / name}",
         connect_args={"check_same_thread": False, "timeout": 30},
+        poolclass=NullPool,
     )
     for table in [
         Strategy.__table__,

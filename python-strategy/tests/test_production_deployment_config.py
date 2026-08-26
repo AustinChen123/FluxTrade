@@ -18,6 +18,7 @@ PROD_COMPOSE = REPO_ROOT / "docker-compose.prod.yml"
 PYTHON_DOCKERFILE = REPO_ROOT / "python-strategy" / "Dockerfile"
 PYTHON_PYPROJECT = REPO_ROOT / "python-strategy" / "pyproject.toml"
 ROOT_DOCKERIGNORE = REPO_ROOT / ".dockerignore"
+CI_WORKFLOW = REPO_ROOT / ".github" / "workflows" / "ci.yml"
 
 
 def _required_env() -> dict[str, str]:
@@ -61,6 +62,17 @@ def _compose_base_command() -> list[str]:
     if result.returncode != 0:
         pytest.skip("Docker Compose CLI is required")
     return [docker, "compose"]
+
+
+def test_python_ci_treats_warnings_as_errors():
+    workflow = CI_WORKFLOW.read_text()
+
+    assert (
+        'run: uv run pytest -W error -m "not integration" '
+        "--cov=src --cov-report=term-missing --cov-report=xml:coverage.xml "
+        "--cov-fail-under=77"
+    ) in workflow
+    assert 'run: uv run pytest -W error -m "integration or rust" -v' in workflow
 
 
 def _write_env_file(path: Path, values: dict[str, str]) -> None:

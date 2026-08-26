@@ -11,6 +11,7 @@ from sqlalchemy import create_engine, select
 from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.ext.compiler import compiles
 from sqlalchemy.orm import sessionmaker
+from sqlalchemy.pool import NullPool
 
 from src.core.adapters.simulated import SimulatedAdapter
 from src.core.clock import BacktestClock
@@ -304,7 +305,7 @@ def _session_factory(
         raise FileExistsError(
             f"paper evidence database already exists: {database_path}"
         )
-    engine = create_engine(f"sqlite:///{database_path}")
+    engine = create_engine(f"sqlite:///{database_path}", poolclass=NullPool)
     for table in (
         Exchange.__table__,
         Product.__table__,

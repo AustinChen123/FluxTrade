@@ -8,6 +8,7 @@ from sqlalchemy import create_engine
 from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.ext.compiler import compiles
 from sqlalchemy.orm import sessionmaker
+from sqlalchemy.pool import NullPool
 
 from src.control_plane import (
     InMemoryJobStore,
@@ -47,6 +48,7 @@ def _sqlite_gene_registry_session_factory(tmp_path):
     engine = create_engine(
         f"sqlite:///{tmp_path / 'parameter_search_space_gene_registry.db'}",
         connect_args={"check_same_thread": False, "timeout": 30},
+        poolclass=NullPool,
     )
     for table in [
         Strategy.__table__,

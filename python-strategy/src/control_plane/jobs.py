@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import sqlite3
+from contextlib import closing
 from datetime import UTC, datetime
 from pathlib import Path
 from threading import Lock
@@ -132,7 +133,7 @@ class SqliteJobStore:
 
     def create(self, *, kind: str, request: BaseModel) -> JobRecord:
         job = JobRecord.new(job_id=uuid4().hex, kind=kind, request=request)
-        with self._lock, self._connect() as conn:
+        with self._lock, closing(self._connect()) as conn:
             conn.execute(
                 """
                 INSERT INTO control_plane_jobs (
@@ -147,7 +148,7 @@ class SqliteJobStore:
         return job
 
     def get(self, job_id: str) -> JobRecord | None:
-        with self._lock, self._connect() as conn:
+        with self._lock, closing(self._connect()) as conn:
             row = conn.execute(
                 """
                 SELECT id, kind, status, created_at, updated_at, started_at,
@@ -160,7 +161,7 @@ class SqliteJobStore:
         return None if row is None else self._row_to_record(row)
 
     def list(self) -> list[JobRecord]:
-        with self._lock, self._connect() as conn:
+        with self._lock, closing(self._connect()) as conn:
             rows = conn.execute(
                 """
                 SELECT id, kind, status, created_at, updated_at, started_at,
@@ -212,7 +213,7 @@ class SqliteJobStore:
 
     def mark_interrupted_active_jobs(self, error: str) -> list[JobRecord]:
         now = datetime.now(UTC)
-        with self._lock, self._connect() as conn:
+        with self._lock, closing(self._connect()) as conn:
             rows = conn.execute(
                 """
                 SELECT id, kind, status, created_at, updated_at, started_at,
@@ -256,7 +257,7 @@ class SqliteJobStore:
 
     def _initialize(self) -> None:
         self._db_path.parent.mkdir(parents=True, exist_ok=True)
-        with self._lock, self._connect() as conn:
+        with self._lock, closing(self._connect()) as conn:
             conn.execute(
                 """
                 CREATE TABLE IF NOT EXISTS control_plane_jobs (
@@ -276,7 +277,7 @@ class SqliteJobStore:
             conn.commit()
 
     def _update(self, job_id: str, **changes: Any) -> JobRecord:
-        with self._lock, self._connect() as conn:
+        with self._lock, closing(self._connect()) as conn:
             row = conn.execute(
                 """
                 SELECT id, kind, status, created_at, updated_at, started_at,
