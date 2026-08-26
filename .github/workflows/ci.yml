@@ -2,7 +2,7 @@ name: CI
 
 on:
   push:
-    branches: [ "main", "develop", "refactor/**", "test/**", "fix/**", "feat/**", "cleanup/**" ]
+    branches: [ "main", "develop", "refactor/**", "test/**", "fix/**", "feat/**", "chore/**", "cleanup/**" ]
   pull_request:
     branches: [ "main", "develop", "refactor/**" ]
 
@@ -287,13 +287,66 @@ jobs:
           FLUXTRADE_RUN_POSTGRES_MIGRATION_TESTS: "1"
         run: uv run pytest -W error -m "integration or rust" -v
 
+  frontend-check:
+    name: Frontend Check
+    runs-on: ubuntu-24.04
+    defaults:
+      run:
+        working-directory: ./frontend
+    steps:
+      - name: Checkout
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+
+      - name: Set up Node
+        uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6.5.0
+        with:
+          node-version-file: frontend/.node-version
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+
+      - name: Verify Node version
+        run: test "$(node --version)" = "v22.23.2"
+
+      - name: Verify npm version
+        run: test "$(npm --version)" = "10.9.8"
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Install bundled Chromium
+        run: npm exec playwright install --with-deps chromium
+
+      - name: Audit dependencies
+        run: npm audit --audit-level=high
+
+      - name: Check production types
+        run: npm run lint
+
+      - name: Check Playwright types
+        run: npm exec tsc -- --noEmit -p tsconfig.playwright.json
+
+      - name: Run frontend unit tests
+        run: npm test
+
+      - name: Build frontend
+        run: npm run build
+
+      - name: Run browser contract
+        run: npm run test:browser
+
   refactor-gate:
     name: Refactor Gate
     if: always()
-    needs: [integration-check, python-check, rust-check, secret-scan]
+    needs: [frontend-check, integration-check, python-check, rust-check, secret-scan]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
+
+      - name: Test frontend workflow validator
+        run: ruby .github/scripts/validate-frontend-job.rb --self-test
+
+      - name: Validate frontend workflow contract
+        run: ruby .github/scripts/validate-frontend-job.rb
 
       - name: Validate workflow and required jobs
         env:
