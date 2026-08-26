@@ -47,6 +47,35 @@ const snapshot: TradeChartSnapshot = {
 };
 
 describe("trade chart presentation", () => {
+  it("projects every trade event into exactly one owned series", () => {
+    const option = tradeChartOption(
+      buildTradeChartModel(snapshot),
+      {
+        price: "Price",
+        entry: "Entry",
+        exit: "Exit",
+        longEntry: "Long entry",
+        longExit: "Long exit",
+        shortEntry: "Short entry",
+        shortExit: "Short exit"
+      },
+      "en",
+      "light"
+    ) as {
+      series: { id: string; data: unknown[] }[];
+    };
+
+    expect(
+      option.series.map((series) => [series.id, series.data.length])
+    ).toEqual([
+      ["candles", 2],
+      ["long-entry", 1],
+      ["long-exit", 1],
+      ["short-entry", 0],
+      ["short-exit", 0]
+    ]);
+  });
+
   it.each([
     ["trade-1", 2],
     ["missing", 0],
