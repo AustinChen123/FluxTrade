@@ -1,4 +1,6 @@
-import type { Epoch, Gene } from "../../api";
+import type { Epoch, Gene, GenerationSummary } from "../../api";
+
+export type { Epoch, Gene, GenerationSummary };
 
 export type ParameterDimension = {
   name: string;

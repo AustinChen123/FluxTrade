@@ -185,7 +185,6 @@ const expectedBareImportLedger = [
   "features/research/researchModel.test.ts|vitest|value",
   "features/research/ResearchPage.test.tsx|@testing-library/react|value",
   "features/research/ResearchPage.test.tsx|vitest|value",
-  "features/research/ResearchPage.tsx|echarts/core|type-only",
   "features/research/ResearchPage.tsx|react-i18next|value",
   "features/research/ResearchPage.tsx|react|value",
   "features/research/ResearchRoute.test.tsx|@testing-library/react|value",
@@ -266,7 +265,7 @@ const expectedRelativeImportLedger = [
   "app/App.tsx|./navigation|value|app/navigation.ts",
   "app/navigation.test.ts|./navigation|value|app/navigation.ts",
   "features/research/demo.test.ts|./demo|value|features/research/demo.ts",
-  "features/research/demo.ts|../../api|type-only|api.ts",
+  "features/research/demo.ts|./gaDomain|type-only|features/research/gaDomain.ts",
   "features/research/FitnessSurface3D.test.tsx|./FitnessSurface3D|value|features/research/FitnessSurface3D.tsx",
   "features/research/FitnessSurface3D.test.tsx|./gaDomain|type-only|features/research/gaDomain.ts",
   "features/research/FitnessSurface3D.tsx|../../shared/theme|type-only|shared/theme.ts",
@@ -275,7 +274,6 @@ const expectedRelativeImportLedger = [
   "features/research/gaCharts.test.ts|./demo|value|features/research/demo.ts",
   "features/research/gaCharts.test.ts|./gaCharts|value|features/research/gaCharts.ts",
   "features/research/gaCharts.test.ts|./gaDomain|value|features/research/gaDomain.ts",
-  "features/research/gaCharts.ts|../../api|type-only|api.ts",
   "features/research/gaCharts.ts|../../shared/theme|type-only|shared/theme.ts",
   "features/research/gaCharts.ts|./gaDomain|value|features/research/gaDomain.ts",
   "features/research/gaDomain.test.ts|../../api|type-only|api.ts",
@@ -292,7 +290,6 @@ const expectedRelativeImportLedger = [
   "features/research/ResearchPage.test.tsx|./researchModel|value|features/research/researchModel.ts",
   "features/research/ResearchPage.test.tsx|./ResearchPage|value|features/research/ResearchPage.tsx",
   "features/research/ResearchPage.test.tsx|./useResearchWorkspace|type-only|features/research/useResearchWorkspace.ts",
-  "features/research/ResearchPage.tsx|../../api|value|api.ts",
   "features/research/ResearchPage.tsx|../../shared/charts/EChart|value|shared/charts/EChart.tsx",
   "features/research/ResearchPage.tsx|../../shared/theme|type-only|shared/theme.ts",
   "features/research/ResearchPage.tsx|./FitnessSurface3D|value|features/research/FitnessSurface3D.tsx",
@@ -311,7 +308,7 @@ const expectedRelativeImportLedger = [
   "features/research/ResearchRoute.tsx|./ResearchPage|value|features/research/ResearchPage.tsx",
   "features/research/ResearchRoute.tsx|./useResearchWorkspace|value|features/research/useResearchWorkspace.ts",
   "features/research/useResearchWorkspace.test.ts|../../api|type-only|api.ts",
-  "features/research/useResearchWorkspace.test.ts|../../api|type-only|api.ts",
+  "features/research/useResearchWorkspace.test.ts|../../api|value|api.ts",
   "features/research/useResearchWorkspace.test.ts|./useResearchWorkspace|value|features/research/useResearchWorkspace.ts",
   "features/research/useResearchWorkspace.ts|../../api|value|api.ts",
   "features/research/useResearchWorkspace.ts|./demo|value|features/research/demo.ts",
@@ -1060,7 +1057,6 @@ describe("frontend architecture ratchet", () => {
       "../../api|type-only|api.ts"
     ]);
     expect(directRelativeSpecifiers(edges, "features/research/gaCharts.ts")).toEqual([
-      "../../api|type-only|api.ts",
       "../../shared/theme|type-only|shared/theme.ts",
       "./gaDomain|value|features/research/gaDomain.ts"
     ]);

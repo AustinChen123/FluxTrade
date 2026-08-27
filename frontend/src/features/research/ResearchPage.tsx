@@ -1,17 +1,18 @@
 import { lazy, Suspense } from "react";
-import type { EChartsCoreOption } from "echarts/core";
 import { useTranslation } from "react-i18next";
 
-import { ApiError } from "../../api";
 import type { Theme } from "../../shared/theme";
-import type { ChartCopy } from "./gaCharts";
+import type { ChartCopy, ResearchChartOption } from "./gaCharts";
 import type { SurfaceRow } from "./gaDomain";
 import {
   displayNumber,
   displayValue,
   geneIdFromChartData
 } from "./researchModel";
-import type { ResearchWorkspace } from "./useResearchWorkspace";
+import type {
+  ResearchError,
+  ResearchWorkspace
+} from "./useResearchWorkspace";
 
 const EChart = lazy(() =>
   import("../../shared/charts/EChart").then((module) => ({
@@ -29,29 +30,29 @@ export type ResearchPageProps = {
   readonly locale: string;
   readonly theme: Theme;
   readonly chartCopy: ChartCopy;
-  readonly convergence: EChartsCoreOption;
+  readonly convergence: ResearchChartOption;
   readonly surfaceRows: SurfaceRow[];
   readonly observationRows: SurfaceRow[];
   readonly selectedSurfaceRow: SurfaceRow | null;
-  readonly surface: EChartsCoreOption;
-  readonly surfaceSelection: EChartsCoreOption;
-  readonly parallel: EChartsCoreOption;
+  readonly surface: ResearchChartOption;
+  readonly surfaceSelection: ResearchChartOption;
+  readonly parallel: ResearchChartOption;
 };
 
 type Translate = ReturnType<typeof useTranslation>["t"];
 
-function errorMessage(reason: unknown, translate: Translate): string {
-  if (reason instanceof ApiError) {
-    if (reason.status === 401 || reason.status === 403) {
-      return translate("error.unauthorized");
-    }
+function errorMessage(error: ResearchError, translate: Translate): string {
+  if (error.type === "unauthorized") {
+    return translate("error.unauthorized");
+  }
+  if (error.type === "service") {
     return translate("error.service", {
-      status: reason.status,
-      message: reason.message
+      status: error.status,
+      message: error.message
     });
   }
-  return reason instanceof Error
-    ? translate("error.unexpected", { message: reason.message })
+  return error.type === "unexpected"
+    ? translate("error.unexpected", { message: error.message })
     : translate("error.fallback");
 }
 

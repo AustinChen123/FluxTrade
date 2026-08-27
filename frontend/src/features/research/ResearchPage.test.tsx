@@ -7,7 +7,10 @@ import type { Epoch, Gene } from "../../api";
 import i18n from "../../shared/i18n";
 import { ResearchPage } from "./ResearchPage";
 import { buildResearchModel } from "./researchModel";
-import type { ResearchWorkspace } from "./useResearchWorkspace";
+import type {
+  ResearchError,
+  ResearchWorkspace
+} from "./useResearchWorkspace";
 
 vi.mock("../../shared/charts/EChart", () => ({
   EChart: ({
@@ -149,11 +152,34 @@ describe("ResearchPage", () => {
       epoch: null,
       genes: [],
       selectedGeneId: null,
-      error: new Error("temporary")
+      error: { type: "unexpected", message: "temporary" }
     });
     renderPage(current);
 
     fireEvent.click(screen.getByRole("button", { name: "重新讀取" }));
     expect(current.retry).toHaveBeenCalledTimes(1);
   });
+
+  it.each([
+    [
+      { type: "unauthorized" },
+      "目前工作階段沒有讀取研究結果的權限。請從受信任的 Tailscale 入口重新開啟。"
+    ],
+    [
+      { type: "service", status: 503, message: "service unavailable" },
+      "資料服務回覆 503：service unavailable"
+    ],
+    [
+      { type: "unexpected", message: "unexpected failure" },
+      "無法讀取 GA 資料：unexpected failure"
+    ],
+    [{ type: "fallback" }, "無法讀取 GA 資料"]
+  ] satisfies readonly (readonly [ResearchError, string])[])(
+    "renders the exact research error projection for $expected",
+    (error, expected) => {
+      renderPage(workspace({ error }));
+
+      expect(screen.getByRole("alert").textContent).toContain(expected);
+    }
+  );
 });

@@ -3,8 +3,16 @@
 import { act, renderHook, waitFor } from "@testing-library/react";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
-import type { Epoch, Gene, GenerationSummary } from "../../api";
-import { useResearchWorkspace } from "./useResearchWorkspace";
+import {
+  ApiError,
+  type Epoch,
+  type Gene,
+  type GenerationSummary
+} from "../../api";
+import {
+  classifyResearchError,
+  useResearchWorkspace
+} from "./useResearchWorkspace";
 
 const api = vi.hoisted(() => ({
   ensureBrowserSession: vi.fn(),
@@ -83,6 +91,25 @@ describe("useResearchWorkspace", () => {
       Promise.resolve([gene(epochId)])
     );
   });
+
+  it.each([
+    [new ApiError("unauthorized", 401), { type: "unauthorized" }],
+    [new ApiError("forbidden", 403), { type: "unauthorized" }],
+    [
+      new ApiError("service unavailable", 503),
+      { type: "service", status: 503, message: "service unavailable" }
+    ],
+    [
+      new Error("unexpected failure"),
+      { type: "unexpected", message: "unexpected failure" }
+    ],
+    ["opaque failure", { type: "fallback" }]
+  ])(
+    "projects research failure %s without exposing the API boundary to the view",
+    (reason, expected) => {
+      expect(classifyResearchError(reason)).toEqual(expected);
+    }
+  );
 
   it("loads session, epochs, summaries, and genes in authoritative order", async () => {
     const calls: string[] = [];
@@ -200,7 +227,12 @@ describe("useResearchWorkspace", () => {
       .mockRejectedValueOnce(new Error("temporary"))
       .mockResolvedValueOnce([epoch("a")]);
     const { result } = renderHook(() => useResearchWorkspace(false));
-    await waitFor(() => expect(result.current.error).toBeInstanceOf(Error));
+    await waitFor(() =>
+      expect(result.current.error).toEqual({
+        type: "unexpected",
+        message: "temporary"
+      })
+    );
 
     act(() => result.current.retry());
     await waitFor(() => expect(result.current.genes).toEqual([gene("a")]));
@@ -212,12 +244,30 @@ describe("useResearchWorkspace", () => {
     expect(api.loadEpochs).toHaveBeenCalledTimes(2);
   });
 
+  it("projects an API authorization failure before exposing workspace state", async () => {
+    api.loadEpochs.mockRejectedValueOnce(new ApiError("forbidden", 403));
+
+    const { result } = renderHook(() => useResearchWorkspace(false));
+
+    await waitFor(() =>
+      expect(result.current.error).toEqual({ type: "unauthorized" })
+    );
+    expect(result.current.epochs).toEqual([]);
+    expect(api.loadGenerationSummaries).not.toHaveBeenCalled();
+    expect(api.loadGenerationGenes).not.toHaveBeenCalled();
+  });
+
   it("retries only the failed gene stage without refetching its summary", async () => {
     api.loadGenerationGenes
       .mockRejectedValueOnce(new Error("gene unavailable"))
       .mockResolvedValueOnce([gene("a")]);
     const { result } = renderHook(() => useResearchWorkspace(false));
-    await waitFor(() => expect(result.current.error).toBeInstanceOf(Error));
+    await waitFor(() =>
+      expect(result.current.error).toEqual({
+        type: "unexpected",
+        message: "gene unavailable"
+      })
+    );
 
     act(() => result.current.retry());
     await waitFor(() => expect(result.current.genes).toEqual([gene("a")]));

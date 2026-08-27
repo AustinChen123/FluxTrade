@@ -1,14 +1,18 @@
 import type { CustomSeriesRenderItem } from "echarts";
 import type { EChartsCoreOption } from "echarts/core";
 
-import type { Epoch, Gene, GenerationSummary } from "../../api";
 import type { Theme } from "../../shared/theme";
 import {
   epochObjective,
   finiteNumber,
+  type Epoch,
+  type Gene,
+  type GenerationSummary,
   type ParameterDimension,
   type SurfaceRow
 } from "./gaDomain";
+
+export type ResearchChartOption = EChartsCoreOption;
 
 export type ChartCopy = {
   locale: string;

@@ -1,6 +1,7 @@
 import { useEffect, useMemo, useState } from "react";
 
 import {
+  ApiError,
   ensureBrowserSession,
   loadEpochs,
   loadGenerationGenes,
@@ -21,9 +22,31 @@ export type SurfaceMode = "2d" | "3d";
 type ResearchLoadStage = "epochs" | "summaries" | "genes";
 type ResearchFailure = {
   readonly stage: ResearchLoadStage;
-  readonly reason: unknown;
+  readonly error: ResearchError;
 };
 type ResearchReloadToken = Readonly<Record<ResearchLoadStage, number>>;
+
+export type ResearchError =
+  | Readonly<{ type: "unauthorized" }>
+  | Readonly<{ type: "service"; status: number; message: string }>
+  | Readonly<{ type: "unexpected"; message: string }>
+  | Readonly<{ type: "fallback" }>;
+
+export function classifyResearchError(reason: unknown): ResearchError {
+  if (reason instanceof ApiError) {
+    if (reason.status === 401 || reason.status === 403) {
+      return { type: "unauthorized" };
+    }
+    return {
+      type: "service",
+      status: reason.status,
+      message: reason.message
+    };
+  }
+  return reason instanceof Error
+    ? { type: "unexpected", message: reason.message }
+    : { type: "fallback" };
+}
 
 export type ResearchWorkspace = {
   readonly epochs: Epoch[];
@@ -37,7 +60,7 @@ export type ResearchWorkspace = {
   readonly yParameter: string;
   readonly surfaceMode: SurfaceMode;
   readonly loading: boolean;
-  readonly error: unknown | null;
+  readonly error: ResearchError | null;
   readonly model: ResearchModel;
   readonly chooseEpoch: (epochId: string) => void;
   readonly chooseGeneration: (generationIndex: number) => void;
@@ -97,7 +120,9 @@ export function useResearchWorkspace(demoMode: boolean): ResearchWorkspace {
         );
       })
       .catch(
-        (reason) => active && setFailure({ stage: "epochs", reason })
+        (reason) =>
+          active &&
+          setFailure({ stage: "epochs", error: classifyResearchError(reason) })
       )
       .finally(() => active && setLoading(false));
     return () => {
@@ -130,7 +155,12 @@ export function useResearchWorkspace(demoMode: boolean): ResearchWorkspace {
         setGenerationIndex(items.at(-1)?.generation_index ?? null);
       })
       .catch(
-        (reason) => active && setFailure({ stage: "summaries", reason })
+        (reason) =>
+          active &&
+          setFailure({
+            stage: "summaries",
+            error: classifyResearchError(reason)
+          })
       )
       .finally(() => active && setLoading(false));
     return () => {
@@ -160,7 +190,11 @@ export function useResearchWorkspace(demoMode: boolean): ResearchWorkspace {
         setGenes(items);
         setSelectedGeneId(selectBestGene(epoch, items)?.id ?? null);
       })
-      .catch((reason) => active && setFailure({ stage: "genes", reason }))
+      .catch(
+        (reason) =>
+          active &&
+          setFailure({ stage: "genes", error: classifyResearchError(reason) })
+      )
       .finally(() => active && setLoading(false));
     return () => {
       active = false;
@@ -209,7 +243,7 @@ export function useResearchWorkspace(demoMode: boolean): ResearchWorkspace {
     yParameter,
     surfaceMode,
     loading,
-    error: failure?.reason ?? null,
+    error: failure?.error ?? null,
     model,
     chooseEpoch,
     chooseGeneration: setGenerationIndex,
