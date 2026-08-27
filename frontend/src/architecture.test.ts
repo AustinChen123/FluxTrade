@@ -175,6 +175,8 @@ const expectedInventory = [
   "shared/locales/zh-TW.ts",
   "shared/theme.test.ts",
   "shared/theme.ts",
+  "shared/time/presentation.test.ts",
+  "shared/time/presentation.ts",
   "shared/time/utc.test.ts",
   "shared/time/utc.ts",
   "shared/trading/closedTrade.ts",
@@ -305,6 +307,7 @@ const expectedBareImportLedger = [
   "shared/i18n.ts|react-i18next|value",
   "shared/locales/resources.test.ts|vitest|value",
   "shared/theme.test.ts|vitest|value",
+  "shared/time/presentation.test.ts|vitest|value",
   "shared/time/utc.test.ts|vitest|value"
 ] as const;
 
@@ -463,6 +466,8 @@ const expectedRelativeImportLedger = [
   "shared/locales/resources.test.ts|./en|value|shared/locales/en.ts",
   "shared/locales/resources.test.ts|./zh-TW|value|shared/locales/zh-TW.ts",
   "shared/theme.test.ts|./theme|value|shared/theme.ts",
+  "shared/time/presentation.test.ts|./presentation|value|shared/time/presentation.ts",
+  "shared/time/presentation.ts|./utc|value|shared/time/utc.ts",
   "shared/time/utc.test.ts|./utc|value|shared/time/utc.ts"
 ] as const;
 
