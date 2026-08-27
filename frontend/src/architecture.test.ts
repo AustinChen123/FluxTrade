@@ -422,6 +422,7 @@ const expectedRelativeImportLedger = [
   "features/strategies/StrategyManagerView.test.tsx|./strategyCommandState|type-only|features/strategies/strategyCommandState.ts",
   "features/strategies/StrategyManagerView.test.tsx|./StrategyManagerView|value|features/strategies/StrategyManagerView.tsx",
   "features/strategies/StrategyManagerView.tsx|../../shared/i18n|type-only|shared/i18n.ts",
+  "features/strategies/StrategyManagerView.tsx|../../shared/time/presentation|value|shared/time/presentation.ts",
   "features/strategies/StrategyManagerView.tsx|./strategyCommandState|type-only|features/strategies/strategyCommandState.ts",
   "features/strategies/useStrategyManager.test.ts|../../api|type-only|api.ts",
   "features/strategies/useStrategyManager.test.ts|../../api|value|api.ts",
@@ -438,6 +439,7 @@ const expectedRelativeImportLedger = [
   "features/trades/tradeCharts.test.ts|./tradeCharts|value|features/trades/tradeCharts.ts",
   "features/trades/tradeCharts.test.ts|./tradeModel|value|features/trades/tradeModel.ts",
   "features/trades/tradeCharts.ts|../../shared/theme|type-only|shared/theme.ts",
+  "features/trades/tradeCharts.ts|../../shared/time/presentation|value|shared/time/presentation.ts",
   "features/trades/tradeCharts.ts|./tradeModel|type-only|features/trades/tradeModel.ts",
   "features/trades/TradeChartView.test.tsx|../../shared/i18n|value|shared/i18n.ts",
   "features/trades/TradeChartView.test.tsx|./demo|value|features/trades/demo.ts",
@@ -445,7 +447,7 @@ const expectedRelativeImportLedger = [
   "features/trades/TradeChartView.tsx|../../shared/format/decimal|value|shared/format/decimal.ts",
   "features/trades/TradeChartView.tsx|../../shared/i18n|type-only|shared/i18n.ts",
   "features/trades/TradeChartView.tsx|../../shared/theme|type-only|shared/theme.ts",
-  "features/trades/TradeChartView.tsx|../../shared/time/utc|value|shared/time/utc.ts",
+  "features/trades/TradeChartView.tsx|../../shared/time/presentation|value|shared/time/presentation.ts",
   "features/trades/TradeChartView.tsx|./CandlestickChart|value|features/trades/CandlestickChart.tsx",
   "features/trades/TradeChartView.tsx|./demo|value|features/trades/demo.ts",
   "features/trades/TradeChartView.tsx|./tradeCharts|value|features/trades/tradeCharts.ts",
@@ -3127,6 +3129,7 @@ describe("frontend architecture ratchet", () => {
       directRelativeSpecifiers(edges, "features/trades/tradeCharts.ts")
     ).toEqual([
       "../../shared/theme|type-only|shared/theme.ts",
+      "../../shared/time/presentation|value|shared/time/presentation.ts",
       "./tradeModel|type-only|features/trades/tradeModel.ts"
     ]);
     expect(
@@ -3138,7 +3141,7 @@ describe("frontend architecture ratchet", () => {
       "../../shared/format/decimal|value|shared/format/decimal.ts",
       "../../shared/i18n|type-only|shared/i18n.ts",
       "../../shared/theme|type-only|shared/theme.ts",
-      "../../shared/time/utc|value|shared/time/utc.ts",
+      "../../shared/time/presentation|value|shared/time/presentation.ts",
       "./CandlestickChart|value|features/trades/CandlestickChart.tsx",
       "./demo|value|features/trades/demo.ts",
       "./tradeCharts|value|features/trades/tradeCharts.ts",
@@ -3220,6 +3223,7 @@ describe("frontend architecture ratchet", () => {
       )
     ).toEqual([
       "../../shared/i18n|type-only|shared/i18n.ts",
+      "../../shared/time/presentation|value|shared/time/presentation.ts",
       "./strategyCommandState|type-only|features/strategies/strategyCommandState.ts"
     ]);
     expect(stateSource.getText()).not.toMatch(

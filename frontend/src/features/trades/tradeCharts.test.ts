@@ -89,7 +89,7 @@ describe("trade chart presentation", () => {
     expect(option.series[0].data).toHaveLength(count);
   });
 
-  it("formats chart timestamps in UTC", () => {
+  it("formats accepted chart timestamps in Europe/Berlin", () => {
     const option = tradeChartOption(
       buildTradeChartModel(snapshot),
       {
@@ -120,9 +120,10 @@ describe("trade chart presentation", () => {
         seriesType: "candlestick",
         dataIndex: 0
       })
-    ).toContain("13:30 UTC");
+    ).toContain("07/28, 15:30 GMT+2");
     expect(
       option.xAxis.axisLabel.formatter("2026-07-28T13:30:00.000Z")
-    ).toContain("13:30");
+    ).toBe("07/28, 15:30");
+    expect(option.xAxis.axisLabel.formatter("not-a-timestamp")).toBe("—");
   });
 });

@@ -2,6 +2,10 @@ import { useMemo } from "react";
 import type { useTranslation } from "react-i18next";
 
 import type { Locale } from "../../shared/i18n";
+import {
+  formatPresentationTimestamp,
+  PRESENTATION_TIME_ZONE
+} from "../../shared/time/presentation";
 import type {
   AwaitingStrategies,
   StrategyCommandName,
@@ -47,17 +51,6 @@ function errorMessage(detail: StrategyErrorDetail, t: Translate): string {
   }
 }
 
-function displayDate(
-  value: number | string | null,
-  formatter: Intl.DateTimeFormat
-): string {
-  if (value === null) {
-    return "—";
-  }
-  const date = new Date(typeof value === "number" ? value : value);
-  return Number.isNaN(date.valueOf()) ? "—" : formatter.format(date);
-}
-
 export function StrategyManagerView({
   strategies,
   loading,
@@ -81,7 +74,8 @@ export function StrategyManagerView({
     () =>
       new Intl.DateTimeFormat(locale, {
         dateStyle: "medium",
-        timeStyle: "medium"
+        timeStyle: "medium",
+        timeZone: PRESENTATION_TIME_ZONE
       }),
     [locale]
   );
@@ -170,12 +164,20 @@ export function StrategyManagerView({
                       <div>
                         <dt>{t("strategies.heartbeat")}</dt>
                         <dd>
-                          {displayDate(strategy.last_heartbeat, dateFormatter)}
+                          {formatPresentationTimestamp(
+                            strategy.last_heartbeat,
+                            dateFormatter
+                          )}
                         </dd>
                       </div>
                       <div>
                         <dt>{t("strategies.uptime")}</dt>
-                        <dd>{displayDate(strategy.uptime_start, dateFormatter)}</dd>
+                        <dd>
+                          {formatPresentationTimestamp(
+                            strategy.uptime_start,
+                            dateFormatter
+                          )}
+                        </dd>
                       </div>
                       <div>
                         <dt>{t("strategies.version")}</dt>

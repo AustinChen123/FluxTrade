@@ -55,6 +55,33 @@ describe("StrategyManagerView", () => {
     expect(submit).toHaveBeenCalledWith(active, "STOP");
   });
 
+  it("renders numeric strategy instants in Berlin and malformed strings as an em dash", async () => {
+    await i18n.changeLanguage("en");
+    render(
+      <StrategyManagerView
+        strategies={[
+          {
+            ...active,
+            last_heartbeat: Date.parse("2026-01-15T23:30:00Z"),
+            uptime_start: "not-a-timestamp" as unknown as number
+          }
+        ]}
+        loading={false}
+        error={null}
+        notice=""
+        pendingStrategyId={null}
+        awaitingStrategies={new Map()}
+        locale="en"
+        t={i18n.t}
+        refresh={vi.fn().mockResolvedValue(undefined)}
+        submit={vi.fn().mockResolvedValue(undefined)}
+      />
+    );
+
+    expect(screen.getByText(/Jan 16, 2026/)).toBeTruthy();
+    expect(screen.getByText("—")).toBeTruthy();
+  });
+
   it("renders awaiting and global pending locks without performing browser I/O", async () => {
     await i18n.changeLanguage("zh-TW");
     render(

@@ -1,6 +1,10 @@
 import type { EChartsCoreOption } from "echarts/core";
 
 import type { Theme } from "../../shared/theme";
+import {
+  formatPresentationTimestamp,
+  PRESENTATION_TIME_ZONE
+} from "../../shared/time/presentation";
 import type {
   TradeChartModel,
   TradeEvent,
@@ -63,7 +67,7 @@ export function tradeChartOption(
     hour: "2-digit",
     minute: "2-digit",
     hour12: false,
-    timeZone: "UTC"
+    timeZone: PRESENTATION_TIME_ZONE
   });
   const tooltipDate = new Intl.DateTimeFormat(locale, {
     month: "2-digit",
@@ -71,7 +75,7 @@ export function tradeChartOption(
     hour: "2-digit",
     minute: "2-digit",
     hour12: false,
-    timeZone: "UTC",
+    timeZone: PRESENTATION_TIME_ZONE,
     timeZoneName: "short"
   });
   const number = new Intl.NumberFormat(locale, {
@@ -120,7 +124,7 @@ export function tradeChartOption(
             return "";
           }
           return [
-            tooltipDate.format(new Date(timestamp)),
+            formatPresentationTimestamp(timestamp, tooltipDate),
             `O ${number.format(candle[0])}`,
             `H ${number.format(candle[3])}`,
             `L ${number.format(candle[2])}`,
@@ -136,7 +140,7 @@ export function tradeChartOption(
           `${marker.event === "entry" ? copy.entry : copy.exit} ${number.format(
             marker.value[1]
           )}`,
-          tooltipDate.format(new Date(marker.value[0]))
+          formatPresentationTimestamp(marker.value[0], tooltipDate)
         ].join("\n");
       }
     },
@@ -148,7 +152,8 @@ export function tradeChartOption(
       axisLabel: {
         color: muted,
         hideOverlap: true,
-        formatter: (value: string) => axisDate.format(new Date(value))
+        formatter: (value: string) =>
+          formatPresentationTimestamp(value, axisDate)
       }
     },
     yAxis: {

@@ -88,8 +88,8 @@ describe("TradeChartView", () => {
       name: /trade-000185/
     });
     expect(selectedTrade.getAttribute("aria-pressed")).toBe("true");
-    expect(selectedTrade.textContent).toContain("16:20");
-    expect(selectedTrade.textContent).toContain("UTC");
+    expect(selectedTrade.textContent).toContain("18:20");
+    expect(selectedTrade.textContent).toContain("GMT+2");
     expect(screen.getAllByText("trade-000185")).toHaveLength(2);
   });
 

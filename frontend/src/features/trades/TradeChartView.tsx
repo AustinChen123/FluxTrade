@@ -7,7 +7,10 @@ import {
 } from "../../shared/format/decimal";
 import type { Locale } from "../../shared/i18n";
 import type { Theme } from "../../shared/theme";
-import { parseUtcTimestamp } from "../../shared/time/utc";
+import {
+  formatPresentationTimestamp,
+  PRESENTATION_TIME_ZONE
+} from "../../shared/time/presentation";
 import { demoTradeSnapshot } from "./demo";
 import {
   selectedTradeOption,
@@ -43,14 +46,6 @@ function displayDecimal(
   }
   // ECMA-402 preserves validated decimal strings; the ES2022 type only accepts numbers.
   return formatter.format(value as unknown as number);
-}
-
-function displayTimestamp(
-  value: string,
-  formatter: Intl.DateTimeFormat
-): string {
-  const timestamp = parseUtcTimestamp(value);
-  return timestamp === null ? "—" : formatter.format(timestamp);
 }
 
 export function TradeChartView({
@@ -110,7 +105,7 @@ export function TradeChartView({
         hour: "2-digit",
         minute: "2-digit",
         hour12: false,
-        timeZone: "UTC",
+        timeZone: PRESENTATION_TIME_ZONE,
         timeZoneName: "short"
       }),
     [locale]
@@ -245,7 +240,9 @@ export function TradeChartView({
                     </span>
                     <span>
                       <strong>{trade.id}</strong>
-                      <small>{displayTimestamp(trade.entryTime, date)}</small>
+                      <small>
+                        {formatPresentationTimestamp(trade.entryTime, date)}
+                      </small>
                     </span>
                     <b
                       className={
