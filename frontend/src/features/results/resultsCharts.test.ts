@@ -20,7 +20,10 @@ function chartOption(theme: "light" | "dark" = "light") {
         label: { formatter: (params: { value: unknown }) => string };
       };
     };
-    xAxis: Array<{ data: string[] }>;
+    xAxis: Array<{
+      data: string[];
+      axisLabel?: { formatter: (value: string) => string };
+    }>;
     yAxis: Array<{
       axisLabel: { formatter: (value: number) => string };
     }>;
@@ -53,7 +56,12 @@ describe("resultsCharts", () => {
       option.tooltip.axisPointer.label.formatter({
         value: demoBacktestSnapshot.equity[0].timestamp
       })
-    ).toContain("13:30");
+    ).toBe("7月28日 15:30 [GMT+2]");
+    expect(
+      option.xAxis[1].axisLabel?.formatter(
+        demoBacktestSnapshot.equity[0].timestamp
+      )
+    ).toBe("7月28日 15:30");
   });
 
   it("keeps nearby accepted ticks distinct", () => {
@@ -87,6 +95,20 @@ describe("resultsCharts", () => {
     expect(option.yAxis[0].axisLabel.formatter(100000)).not.toBe(
       option.yAxis[0].axisLabel.formatter(100000.88)
     );
+  });
+
+  it("renders a rejected direct chart formatter input as an em dash", () => {
+    const option = chartOption() as {
+      tooltip: {
+        axisPointer: {
+          label: { formatter: (params: { value: unknown }) => string };
+        };
+      };
+    };
+
+    expect(
+      option.tooltip.axisPointer.label.formatter({ value: "not-a-timestamp" })
+    ).toBe("—");
   });
 
   it("applies the frozen light and dark palettes", () => {

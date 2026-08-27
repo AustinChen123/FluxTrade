@@ -8,7 +8,10 @@ import {
 } from "../../shared/format/decimal";
 import type { Locale } from "../../shared/i18n";
 import type { Theme } from "../../shared/theme";
-import { parseUtcTimestamp } from "../../shared/time/utc";
+import {
+  formatPresentationTimestamp,
+  PRESENTATION_TIME_ZONE
+} from "../../shared/time/presentation";
 import { demoBacktestSnapshot } from "./demo";
 import { resultChartOption } from "./resultsCharts";
 import {
@@ -43,14 +46,6 @@ function currencyFormatter(
   } catch {
     return null;
   }
-}
-
-function displayTimestamp(
-  value: string,
-  formatter: Intl.DateTimeFormat
-): string {
-  const timestamp = parseUtcTimestamp(value);
-  return timestamp === null ? "—" : formatter.format(timestamp);
 }
 
 function monthLabel(value: string, locale: Locale): string {
@@ -119,7 +114,7 @@ export function BacktestResultsView({
         year: "numeric",
         month: "2-digit",
         day: "2-digit",
-        timeZone: "UTC"
+        timeZone: PRESENTATION_TIME_ZONE
       }),
     [locale]
   );
@@ -132,7 +127,7 @@ export function BacktestResultsView({
         hour: "2-digit",
         minute: "2-digit",
         hour12: false,
-        timeZone: "UTC",
+        timeZone: PRESENTATION_TIME_ZONE,
         timeZoneName: "short"
       }),
     [locale]
@@ -252,8 +247,8 @@ export function BacktestResultsView({
           <div>
             <dt>{t("results.period")}</dt>
             <dd>
-              {displayTimestamp(data.startedAt, periodDate)} –{" "}
-              {displayTimestamp(data.endedAt, periodDate)}
+              {formatPresentationTimestamp(data.startedAt, periodDate)} –{" "}
+              {formatPresentationTimestamp(data.endedAt, periodDate)}
             </dd>
           </div>
         </dl>
@@ -415,8 +410,18 @@ export function BacktestResultsView({
                         {trade.side}
                       </span>
                     </td>
-                    <td>{displayTimestamp(trade.entryTime, tradeTimestamp)}</td>
-                    <td>{displayTimestamp(trade.exitTime, tradeTimestamp)}</td>
+                    <td>
+                      {formatPresentationTimestamp(
+                        trade.entryTime,
+                        tradeTimestamp
+                      )}
+                    </td>
+                    <td>
+                      {formatPresentationTimestamp(
+                        trade.exitTime,
+                        tradeTimestamp
+                      )}
+                    </td>
                     <td
                       className={
                         (finiteDecimalNumber(trade.pnl) ?? 0) < 0

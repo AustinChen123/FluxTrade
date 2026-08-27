@@ -3,16 +3,11 @@ import type { EChartsCoreOption } from "echarts/core";
 import { finiteDecimalNumber } from "../../shared/format/decimal";
 import type { Locale } from "../../shared/i18n";
 import type { Theme } from "../../shared/theme";
-import { parseUtcTimestamp } from "../../shared/time/utc";
+import {
+  formatPresentationTimestamp,
+  PRESENTATION_TIME_ZONE
+} from "../../shared/time/presentation";
 import type { BacktestResultSnapshot } from "./resultsModel";
-
-function displayTimestamp(
-  value: string,
-  formatter: Intl.DateTimeFormat
-): string {
-  const timestamp = parseUtcTimestamp(value);
-  return timestamp === null ? "—" : formatter.format(timestamp);
-}
 
 export function resultChartOption(
   snapshot: BacktestResultSnapshot,
@@ -32,7 +27,7 @@ export function resultChartOption(
     hour: "2-digit",
     minute: "2-digit",
     hour12: false,
-    timeZone: "UTC"
+    timeZone: PRESENTATION_TIME_ZONE
   });
   const tooltipTimestamp = new Intl.DateTimeFormat(locale, {
     month: "short",
@@ -40,7 +35,7 @@ export function resultChartOption(
     hour: "2-digit",
     minute: "2-digit",
     hour12: false,
-    timeZone: "UTC",
+    timeZone: PRESENTATION_TIME_ZONE,
     timeZoneName: "short"
   });
   const axisNumber = new Intl.NumberFormat(locale, {
@@ -60,7 +55,7 @@ export function resultChartOption(
       axisPointer: {
         label: {
           formatter: ({ value }: { value: unknown }) =>
-            displayTimestamp(String(value), tooltipTimestamp)
+            formatPresentationTimestamp(value, tooltipTimestamp)
         }
       },
       valueFormatter: (value: unknown) => {
@@ -95,7 +90,8 @@ export function resultChartOption(
         axisLabel: {
           color: muted,
           hideOverlap: true,
-          formatter: (value: string) => displayTimestamp(value, axisTimestamp)
+          formatter: (value: string) =>
+            formatPresentationTimestamp(value, axisTimestamp)
         },
         axisLine: { lineStyle: { color: grid } }
       }

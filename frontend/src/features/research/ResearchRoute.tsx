@@ -4,6 +4,10 @@ import { useTranslation } from "react-i18next";
 import type { Locale } from "../../shared/i18n";
 import type { Theme } from "../../shared/theme";
 import {
+  formatPresentationTimestamp,
+  PRESENTATION_TIME_ZONE
+} from "../../shared/time/presentation";
+import {
   convergenceOption,
   fitnessSurfaceOption,
   parallelOption,
@@ -127,30 +131,38 @@ export function ResearchRoute({
       workspace.yParameter
     ]
   );
+  const surfaceAxes = useMemo(() => {
+    if (
+      !workspace.epoch ||
+      !workspace.xParameter ||
+      !workspace.yParameter
+    ) {
+      return null;
+    }
+    return {
+      epoch: workspace.epoch,
+      xParameter: workspace.xParameter,
+      yParameter: workspace.yParameter
+    };
+  }, [workspace.epoch, workspace.xParameter, workspace.yParameter]);
   const surface = useMemo(
     () =>
-      workspace.epoch && workspace.xParameter && workspace.yParameter
+      surfaceAxes
         ? fitnessSurfaceOption(
-            workspace.epoch,
+            surfaceAxes.epoch,
             surfaceRows,
-            workspace.xParameter,
-            workspace.yParameter,
+            surfaceAxes.xParameter,
+            surfaceAxes.yParameter,
             chartCopy,
             theme
           )
         : {},
-    [
-      chartCopy,
-      surfaceRows,
-      theme,
-      workspace.epoch,
-      workspace.xParameter,
-      workspace.yParameter
-    ]
+    [chartCopy, surfaceAxes, surfaceRows, theme]
   );
   const surfaceSelection = useMemo(
-    () => selectedSurfaceOption(selectedSurfaceRow),
-    [selectedSurfaceRow]
+    () =>
+      surfaceAxes ? selectedSurfaceOption(selectedSurfaceRow) : {},
+    [selectedSurfaceRow, surfaceAxes]
   );
   const parallel = useMemo(
     () =>
@@ -174,7 +186,8 @@ export function ResearchRoute({
       new Intl.DateTimeFormat(locale, {
         year: "numeric",
         month: "2-digit",
-        day: "2-digit"
+        day: "2-digit",
+        timeZone: PRESENTATION_TIME_ZONE
       }),
     [locale]
   );
@@ -190,7 +203,8 @@ export function ResearchRoute({
       >
         {workspace.epochs.map((item) => (
           <option key={item.id} value={item.id}>
-            {item.strategy_id} · {dateFormatter.format(new Date(item.started_at))}
+            {item.strategy_id} ·{" "}
+            {formatPresentationTimestamp(item.started_at, dateFormatter)}
           </option>
         ))}
       </select>

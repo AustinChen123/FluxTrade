@@ -106,7 +106,7 @@ describe("BacktestResultsView", () => {
     expect(screen.getAllByRole("button", { name: "查看 K 線" })).toHaveLength(
       3
     );
-    expect(screen.getAllByText(/14:30/).length).toBeGreaterThan(0);
+    expect(screen.getAllByText(/16:30/).length).toBeGreaterThan(0);
     const tooltipTimestamp = (
       chartState.option as {
         tooltip: {
@@ -118,7 +118,7 @@ describe("BacktestResultsView", () => {
     ).tooltip.axisPointer.label.formatter;
     expect(
       tooltipTimestamp({ value: demoBacktestSnapshot.equity[0].timestamp })
-    ).toContain("13:30");
+    ).toContain("15:30");
 
     fireEvent.click(screen.getAllByRole("button", { name: "查看 K 線" })[0]);
     expect(onInspectTrade).toHaveBeenCalledWith("trade-000184");
@@ -406,6 +406,54 @@ describe("BacktestResultsView", () => {
     expect(months[2].getAttribute("style")).toContain(
       "--return-intensity: 11%"
     );
+  });
+
+  it("keeps monthly identifiers stable while locale changes", async () => {
+    const snapshot = {
+      ...zeroTradeSnapshot,
+      monthlyReturns: [{ month: "2026-07", returnPct: "1" }]
+    };
+    const view = render(
+      <BacktestResultsView
+        demoMode={false}
+        theme="light"
+        snapshot={snapshot}
+      />
+    );
+
+    expect(screen.getByText("2026年7月")).toBeTruthy();
+    await i18n.changeLanguage("en");
+    view.rerender(
+      <BacktestResultsView
+        demoMode={false}
+        theme="light"
+        snapshot={snapshot}
+      />
+    );
+    expect(screen.getByText("Jul 2026")).toBeTruthy();
+    expect(snapshot.monthlyReturns.map(({ month }) => month)).toEqual([
+      "2026-07"
+    ]);
+  });
+
+  it("renders a Berlin midnight rollover in the results period", () => {
+    const view = render(
+      <BacktestResultsView
+        demoMode={false}
+        theme="light"
+        snapshot={{
+          ...zeroTradeSnapshot,
+          startedAt: "2026-01-15T23:30:00Z",
+          endedAt: "2026-01-15T23:59:59Z"
+        }}
+      />
+    );
+
+    expect(
+      view.container.querySelector(
+        ".results-intro dl > div:last-child dd"
+      )?.textContent
+    ).toBe("2026/01/16 – 2026/01/16");
   });
 
   it("fails visibly instead of normalizing malformed snapshot values", () => {

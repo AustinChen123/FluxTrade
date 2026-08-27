@@ -19,15 +19,23 @@ const api = vi.hoisted(() => ({
   loadGenerationGenes: vi.fn(),
   loadGenerationSummaries: vi.fn()
 }));
+const charts = vi.hoisted(() => ({
+  render: vi.fn()
+}));
 
 vi.mock("../../api", async (importOriginal) => ({
   ...(await importOriginal<typeof import("../../api")>()),
   ...api
 }));
 vi.mock("../../shared/charts/EChart", () => ({
-  EChart: ({ ariaLabel }: { ariaLabel: string }) => (
-    <div aria-label={ariaLabel} />
-  )
+  EChart: (props: {
+    ariaLabel: string;
+    option: unknown;
+    updateOption?: unknown;
+  }) => {
+    charts.render(props);
+    return <div aria-label={props.ariaLabel} />;
+  }
 }));
 vi.mock("./FitnessSurface3D", () => ({
   FitnessSurface3D: ({
@@ -158,6 +166,26 @@ describe("ResearchRoute", () => {
     expect(api.loadEpochs).toHaveBeenCalledTimes(1);
   });
 
+  it("renders canonical epoch instants in the Berlin calendar and rejects malformed direct fields", async () => {
+    api.loadEpochs.mockResolvedValue([
+      { ...epoch, id: "winter", started_at: "2026-01-15T23:30:00Z" },
+      { ...epoch, id: "summer", started_at: "2026-07-15T12:34:00Z" },
+      { ...epoch, id: "invalid", started_at: "not-a-timestamp" }
+    ]);
+    render(
+      <ResearchRoute visible demoMode={false} theme="light">
+        {({ toolbar }) => toolbar}
+      </ResearchRoute>
+    );
+
+    const options = await screen.findAllByRole("option");
+    expect(options.map((option) => option.textContent)).toEqual([
+      expect.stringContaining("2026/01/16"),
+      expect.stringContaining("2026/07/15"),
+      "strategy · —"
+    ]);
+  });
+
   it("keeps a pending summary request and its dependent cache across hiding", async () => {
     const summaries = deferred<GenerationSummary[]>();
     api.loadGenerationSummaries.mockReturnValue(summaries.promise);
@@ -242,6 +270,24 @@ describe("ResearchRoute", () => {
     );
     epochBSummaries.resolve([summary]);
     await screen.findAllByText("candidate-b");
+
+    const transitionalSurfaces = charts.render.mock.calls
+      .map(([props]) => props as {
+        ariaLabel: string;
+        option: unknown;
+        updateOption?: unknown;
+      })
+      .filter(
+        ({ ariaLabel, option }) =>
+          ariaLabel === "兩個策略參數與候選適應度的觀測地形圖" &&
+          JSON.stringify(option) === "{}"
+      );
+    expect(transitionalSurfaces.length).toBeGreaterThan(0);
+    expect(
+      transitionalSurfaces.every(
+        ({ updateOption }) => JSON.stringify(updateOption) === "{}"
+      )
+    ).toBe(true);
   });
 
   it("retries downstream data without reloading successful epochs", async () => {
