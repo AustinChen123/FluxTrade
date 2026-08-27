@@ -11,7 +11,8 @@ export const SCENARIO_IDS = [
   "strategy-command",
   "locale-theme-reload",
   "lazy-chunk-inventory",
-  "responsive-overflow"
+  "responsive-overflow",
+  "berlin-presentation-time"
 ] as const;
 
 export type ScenarioId = (typeof SCENARIO_IDS)[number];
@@ -26,7 +27,8 @@ export const CASE_IDS = {
   "strategy-command": ["main"],
   "locale-theme-reload": ["main"],
   "lazy-chunk-inventory": ["main"],
-  "responsive-overflow": ["research", "results", "strategies", "trades"]
+  "responsive-overflow": ["research", "results", "strategies", "trades"],
+  "berlin-presentation-time": ["research-api", "demo-features"]
 } as const satisfies Record<ScenarioId, readonly string[]>;
 
 export const BROWSER_SESSION = {
@@ -193,7 +195,9 @@ export const EXPECTED_REQUEST_COUNTS = {
   "responsive-overflow:production:research": { S: 1, P: 0, E: 1, A: 1, B: 0, a: 1, b: 0, T: 0, C: 0 },
   "responsive-overflow:production:results": { S: 0, P: 0, E: 0, A: 0, B: 0, a: 0, b: 0, T: 0, C: 0 },
   "responsive-overflow:production:strategies": { S: 1, P: 0, E: 0, A: 0, B: 0, a: 0, b: 0, T: 1, C: 0 },
-  "responsive-overflow:production:trades": { S: 0, P: 0, E: 0, A: 0, B: 0, a: 0, b: 0, T: 0, C: 0 }
+  "responsive-overflow:production:trades": { S: 0, P: 0, E: 0, A: 0, B: 0, a: 0, b: 0, T: 0, C: 0 },
+  "berlin-presentation-time:dev:research-api": { S: 2, P: 0, E: 2, A: 1, B: 1, a: 1, b: 1, T: 0, C: 0 },
+  "berlin-presentation-time:dev:demo-features": { S: 2, P: 0, E: 0, A: 0, B: 0, a: 0, b: 0, T: 2, C: 0 }
 } as const satisfies Readonly<Record<string, RouteCounts>>;
 
 export const EXPECTED_DOCUMENT_COUNTS = {
@@ -222,7 +226,9 @@ export const EXPECTED_DOCUMENT_COUNTS = {
   "responsive-overflow:production:research": 1,
   "responsive-overflow:production:results": 1,
   "responsive-overflow:production:strategies": 1,
-  "responsive-overflow:production:trades": 1
+  "responsive-overflow:production:trades": 1,
+  "berlin-presentation-time:dev:research-api": 1,
+  "berlin-presentation-time:dev:demo-features": 1
 } as const satisfies Readonly<
   Record<keyof typeof EXPECTED_REQUEST_COUNTS, number>
 >;

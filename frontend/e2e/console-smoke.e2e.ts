@@ -63,6 +63,81 @@ const BASE_URLS = {
   dev: "http://127.0.0.1:4173",
   production: "http://127.0.0.1:4174"
 } as const;
+type BerlinLocale = "en" | "zh-TW";
+type BerlinFormatterKind =
+  | "date"
+  | "short-axis"
+  | "short-tooltip"
+  | "full-tooltip"
+  | "numeric-axis"
+  | "numeric-tooltip"
+  | "medium";
+type BerlinCase = Readonly<{
+  name: string;
+  input: string;
+  month: string;
+  shortMonth: Readonly<Record<BerlinLocale, string>>;
+  day: string;
+  hour24: string;
+  hour12: string;
+  minute: string;
+  dayPeriod: Readonly<Record<BerlinLocale, string>>;
+  zone: string;
+}>;
+const BERLIN_LOCALES = ["en", "zh-TW"] as const;
+const BERLIN_CASES: readonly BerlinCase[] = [
+  {
+    name: "winter",
+    input: "2026-01-15T12:34:00Z",
+    month: "01",
+    shortMonth: { en: "Jan", "zh-TW": "1" },
+    day: "15",
+    hour24: "13",
+    hour12: "1",
+    minute: "34",
+    dayPeriod: { en: "PM", "zh-TW": "下午" },
+    zone: "GMT+1"
+  },
+  {
+    name: "summer",
+    input: "2026-07-15T12:34:00Z",
+    month: "07",
+    shortMonth: { en: "Jul", "zh-TW": "7" },
+    day: "15",
+    hour24: "14",
+    hour12: "2",
+    minute: "34",
+    dayPeriod: { en: "PM", "zh-TW": "下午" },
+    zone: "GMT+2"
+  },
+  {
+    name: "midnight rollover",
+    input: "2026-01-15T23:30:00Z",
+    month: "01",
+    shortMonth: { en: "Jan", "zh-TW": "1" },
+    day: "16",
+    hour24: "00",
+    hour12: "12",
+    minute: "30",
+    dayPeriod: { en: "AM", "zh-TW": "凌晨" },
+    zone: "GMT+1"
+  }
+];
+const BERLIN_FORMATTER_ROWS = [
+  ["research-epoch", "date", { year: "numeric", month: "2-digit", day: "2-digit" }],
+  ["results-period", "date", { year: "numeric", month: "2-digit", day: "2-digit" }],
+  ["results-equity-axis", "short-axis", { month: "short", day: "numeric", hour: "2-digit", minute: "2-digit", hour12: false }],
+  ["results-equity-tooltip", "short-tooltip", { month: "short", day: "numeric", hour: "2-digit", minute: "2-digit", hour12: false, timeZoneName: "short" }],
+  ["results-trade-entry-exit", "full-tooltip", { year: "numeric", month: "2-digit", day: "2-digit", hour: "2-digit", minute: "2-digit", hour12: false, timeZoneName: "short" }],
+  ["trade-candle-axis", "numeric-axis", { month: "2-digit", day: "2-digit", hour: "2-digit", minute: "2-digit", hour12: false }],
+  ["trade-candle-tooltip-marker", "numeric-tooltip", { month: "2-digit", day: "2-digit", hour: "2-digit", minute: "2-digit", hour12: false, timeZoneName: "short" }],
+  ["trade-detail", "full-tooltip", { year: "numeric", month: "2-digit", day: "2-digit", hour: "2-digit", minute: "2-digit", hour12: false, timeZoneName: "short" }],
+  ["strategy-heartbeat-uptime", "medium", { dateStyle: "medium", timeStyle: "medium" }]
+] as const satisfies readonly (readonly [
+  string,
+  BerlinFormatterKind,
+  Intl.DateTimeFormatOptions
+])[];
 const UUID_V4 = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
 const PROJECTED_HEADERS = new Set([
   "accept",
@@ -74,7 +149,9 @@ const PROJECTED_HEADERS = new Set([
 
 function triplesFor(scenario: ScenarioId): readonly Triple[] {
   const servers: readonly ServerId[] =
-    scenario === "navigation-serialization" || scenario === "demo-dev"
+    scenario === "navigation-serialization" ||
+    scenario === "demo-dev" ||
+    scenario === "berlin-presentation-time"
       ? ["dev"]
       : scenario === "demo-production-denied"
         ? ["production"]
@@ -257,6 +334,77 @@ async function waitForResearch(page: Page): Promise<void> {
 
 async function waitForStrategy(page: Page): Promise<void> {
   await expect(page.getByText("active-strategy", { exact: true })).toBeVisible();
+}
+
+async function assertBerlinPresentationRuntime(page: Page): Promise<void> {
+  const observed = await page.evaluate(
+    ({ cases, locales, rows }) =>
+      locales.flatMap((locale) =>
+        rows.flatMap(([name, _kind, options]) =>
+          cases.map((value) => ({
+            locale,
+            row: name,
+            caseName: value.name,
+            parts: new Intl.DateTimeFormat(locale, {
+              ...options,
+              timeZone: "Europe/Berlin"
+            })
+              .formatToParts(new Date(value.input))
+              .filter((part) => part.type !== "literal")
+              .map(({ type, value: partValue }) => [type, partValue])
+          }))
+        )
+      ),
+    {
+      cases: BERLIN_CASES,
+      locales: BERLIN_LOCALES,
+      rows: BERLIN_FORMATTER_ROWS
+    }
+  );
+  const expected = BERLIN_LOCALES.flatMap((locale) =>
+    BERLIN_FORMATTER_ROWS.flatMap(([name, kind]) =>
+      BERLIN_CASES.map((value) => ({
+        locale,
+        row: name,
+        caseName: value.name,
+        parts: expectedBerlinParts(kind, locale, value)
+      }))
+    )
+  );
+
+  expect(observed).toEqual(expected);
+}
+
+function expectedBerlinParts(
+  kind: BerlinFormatterKind,
+  locale: BerlinLocale,
+  value: BerlinCase
+): string[][] {
+  const date =
+    locale === "en"
+      ? [["month", value.month], ["day", value.day], ["year", "2026"]]
+      : [["year", "2026"], ["month", value.month], ["day", value.day]];
+  const shortDate = [["month", value.shortMonth[locale]], ["day", value.day]];
+  const numericDate = [["month", value.month], ["day", value.day]];
+  const time = [["hour", value.hour24], ["minute", value.minute]];
+  const zone = [["timeZoneName", value.zone]];
+  switch (kind) {
+    case "date": return date;
+    case "short-axis": return [...shortDate, ...time];
+    case "short-tooltip": return [...shortDate, ...time, ...zone];
+    case "full-tooltip": return [...date, ...time, ...zone];
+    case "numeric-axis": return [...numericDate, ...time];
+    case "numeric-tooltip": return [...numericDate, ...time, ...zone];
+    case "medium": {
+      const mediumDate = locale === "en"
+        ? [["month", value.shortMonth.en], ["day", value.day], ["year", "2026"]]
+        : [["year", "2026"], ["month", value.shortMonth["zh-TW"]], ["day", value.day]];
+      const mediumTime = [["hour", value.hour12], ["minute", value.minute], ["second", "00"]];
+      return locale === "en"
+        ? [...mediumDate, ...mediumTime, ["dayPeriod", value.dayPeriod.en]]
+        : [...mediumDate, ["dayPeriod", value.dayPeriod["zh-TW"]], ...mediumTime];
+    }
+  }
 }
 
 function moduleCount(requests: readonly string[], basename: string): number {
@@ -517,6 +665,49 @@ async function exerciseScenario(
     return;
   }
 
+  if (triple.scenario === "berlin-presentation-time") {
+    await assertBerlinPresentationRuntime(page);
+    if (triple.caseId === "research-api") {
+      await open("/");
+      await waitForResearch(page);
+      await page.locator("#language").selectOption("en");
+      await expect(page.locator("#epoch option").nth(0)).toContainText("01/15/2026");
+      await page.locator("#language").selectOption("zh-TW");
+      await expect(page.locator("#epoch option").nth(0)).toContainText("2026/01/15");
+      await page.locator("#epoch").selectOption("epoch-b");
+      await expect(page.getByText("candidate-b", { exact: true }).first()).toBeVisible();
+      await expect(page.locator("#epoch option").nth(1)).toContainText("2026/07/15");
+      await page.locator("#language").selectOption("en");
+      await expect(page.locator("#epoch option").nth(1)).toContainText("07/15/2026");
+      return;
+    }
+
+    await open("/?view=results&demo=1");
+    await page.locator("#language").selectOption("en");
+    await expect(page.getByText(/07\/28\/2026.*16:30.*GMT\+2/).first()).toBeVisible();
+    await expect(page.getByText("Jul 2026", { exact: true })).toBeVisible();
+    await page.locator("#language").selectOption("zh-TW");
+    await expect(page.getByText("2026年7月", { exact: true })).toBeVisible();
+    await page
+      .getByRole("button", { name: /查看 K 線|Inspect candles/ })
+      .first()
+      .click();
+    await expect(page.getByText("trade-000184", { exact: true }).first()).toBeVisible();
+    await expect(page.getByRole("button", { name: /trade-000184/ })).toContainText("16:30");
+    await page.locator("#language").selectOption("en");
+    await expect(page.getByRole("button", { name: /trade-000184/ })).toContainText("GMT+2");
+    await nav(page, 2).click();
+    await waitForStrategy(page);
+    await expect(
+      page.getByText(/Jan 15, 2026.*1:34:00 PM/)
+    ).toBeVisible();
+    await page.locator("#language").selectOption("zh-TW");
+    await expect(
+      page.getByText(/2026年1月15日.*下午1:34:00/)
+    ).toBeVisible();
+    return;
+  }
+
   const responsivePaths = {
     research: "/",
     results: "/?view=results&demo=1",
@@ -572,7 +763,12 @@ async function runTriple(
     );
     const page = await context.newPage();
     page.on("console", (message) => {
-      if (message.type() === "error") failures.push(`console:${message.text()}`);
+      if (message.type() === "error") {
+        const location = message.location();
+        failures.push(
+          `console:${message.text()}:${location.url}:${location.lineNumber}:${location.columnNumber}`
+        );
+      }
     });
     page.on("pageerror", (error) => failures.push(`pageerror:${error.message}`));
     page.on("request", (request) => {

@@ -35,7 +35,8 @@ const EXPECTED_SCENARIOS = [
   "strategy-command",
   "locale-theme-reload",
   "lazy-chunk-inventory",
-  "responsive-overflow"
+  "responsive-overflow",
+  "berlin-presentation-time"
 ];
 const EXPECTED_CASES = {
   "direct-navigation": ["results", "strategies", "trades"],
@@ -46,7 +47,8 @@ const EXPECTED_CASES = {
   "strategy-command": ["main"],
   "locale-theme-reload": ["main"],
   "lazy-chunk-inventory": ["main"],
-  "responsive-overflow": ["research", "results", "strategies", "trades"]
+  "responsive-overflow": ["research", "results", "strategies", "trades"],
+  "berlin-presentation-time": ["research-api", "demo-features"]
 };
 const EXPECTED_NON_ZERO_COUNTS = {
   "direct-navigation:dev:strategies": { S: 2, T: 2 },
@@ -63,7 +65,16 @@ const EXPECTED_NON_ZERO_COUNTS = {
   "responsive-overflow:dev:research": { S: 2, E: 2, A: 1, a: 1 },
   "responsive-overflow:production:research": { S: 1, E: 1, A: 1, a: 1 },
   "responsive-overflow:dev:strategies": { S: 2, T: 2 },
-  "responsive-overflow:production:strategies": { S: 1, T: 1 }
+  "responsive-overflow:production:strategies": { S: 1, T: 1 },
+  "berlin-presentation-time:dev:research-api": {
+    S: 2,
+    E: 2,
+    A: 1,
+    B: 1,
+    a: 1,
+    b: 1
+  },
+  "berlin-presentation-time:dev:demo-features": { S: 2, T: 2 }
 };
 const EXPECTED_SCRIPTS = {
   dev: "vite",
@@ -228,7 +239,9 @@ function exactTripleKeys() {
   const rows = [];
   for (const scenario of EXPECTED_SCENARIOS) {
     const servers =
-      scenario === "navigation-serialization" || scenario === "demo-dev"
+      scenario === "navigation-serialization" ||
+      scenario === "demo-dev" ||
+      scenario === "berlin-presentation-time"
         ? ["dev"]
         : scenario === "demo-production-denied"
           ? ["production"]
