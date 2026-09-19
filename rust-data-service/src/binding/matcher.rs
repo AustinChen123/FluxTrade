@@ -224,6 +224,19 @@ impl PyMatchingEngine {
         Ok(value.to_string())
     }
 
+    fn apply_external_funding(&mut self, asset: &str, amount: String) -> PyResult<String> {
+        let amount = parse_decimal(&amount, "external_funding_amount")?;
+        let ledger = self.spot_ledger.as_mut().ok_or_else(|| {
+            pyo3::exceptions::PyValueError::new_err(
+                "external funding requires cash_spot settlement",
+            )
+        })?;
+        ledger
+            .credit_quote(asset, amount)
+            .map(|balance| balance.to_string())
+            .map_err(pyo3::exceptions::PyValueError::new_err)
+    }
+
     fn cash_spot_account_snapshot(&self, mark_price: String) -> PyResult<HashMap<String, String>> {
         let Some(ledger) = &self.spot_ledger else {
             return Err(pyo3::exceptions::PyValueError::new_err(
@@ -2523,6 +2536,66 @@ mod tests {
         assert!(!engine.cancel_order("first".to_string()));
         assert_eq!(engine.balance(), "100");
         assert!(engine.cancel_order("second".to_string()));
+    }
+
+    #[test]
+    fn cash_spot_external_funding_preserves_existing_reservations() {
+        let mut engine = make_spot_engine(dec!(100), Decimal::ZERO, Decimal::ZERO, "quote");
+        let pending = make_spot_order("pending", "LONG", "LIMIT", dec!(60), dec!(1));
+        engine.submit_order(pending).unwrap();
+
+        let total = engine
+            .apply_external_funding("USDT", "50".to_string())
+            .unwrap();
+
+        assert_eq!(total, "150");
+        assert_eq!(engine.get_asset_balance("USDT", "total").unwrap(), "150");
+        assert_eq!(engine.get_asset_balance("USDT", "reserved").unwrap(), "60");
+        assert_eq!(engine.get_asset_balance("USDT", "available").unwrap(), "90");
+    }
+
+    #[test]
+    fn external_funding_validation_matrix_fails_closed() {
+        let mut spot = make_spot_engine(dec!(100), Decimal::ZERO, Decimal::ZERO, "quote");
+        assert!(spot
+            .apply_external_funding("BTC", "1".to_string())
+            .unwrap_err()
+            .to_string()
+            .contains("supports quote asset USDT only"));
+        assert!(spot
+            .apply_external_funding("USDT", "0".to_string())
+            .unwrap_err()
+            .to_string()
+            .contains("amount must be positive"));
+        assert!(spot
+            .apply_external_funding("USDT", "-1".to_string())
+            .unwrap_err()
+            .to_string()
+            .contains("amount must be positive"));
+        assert!(spot
+            .apply_external_funding("USDT", "not-a-decimal".to_string())
+            .unwrap_err()
+            .to_string()
+            .contains("Invalid decimal for 'external_funding_amount'"));
+        assert_eq!(spot.get_asset_balance("USDT", "total").unwrap(), "100");
+
+        let mut max_balance = make_spot_engine(Decimal::MAX, Decimal::ZERO, Decimal::ZERO, "quote");
+        assert!(max_balance
+            .apply_external_funding("USDT", "1".to_string())
+            .unwrap_err()
+            .to_string()
+            .contains("would overflow quote balance"));
+        assert_eq!(
+            max_balance.get_asset_balance("USDT", "total").unwrap(),
+            Decimal::MAX.to_string()
+        );
+
+        let mut derivatives = make_engine(dec!(100));
+        assert!(derivatives
+            .apply_external_funding("USDT", "1".to_string())
+            .unwrap_err()
+            .to_string()
+            .contains("requires cash_spot settlement"));
     }
 
     #[test]

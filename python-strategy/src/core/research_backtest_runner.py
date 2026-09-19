@@ -23,6 +23,10 @@ from src.core.analytics import (
 )
 from src.core.backtest.endpoint_state import build_replay_endpoint_state
 from src.core.backtest.equity import require_strategy_position_scope
+from src.core.backtest.external_funding import (
+    ExternalFundingEvent,
+    build_external_funding_timeline,
+)
 from src.core.backtest.loader import get_candles_generator
 from src.core.clock import BacktestClock
 from src.core.conditional_order_intents import (
@@ -37,6 +41,7 @@ from src.core.orm_models import Order
 from src.core.precision import PrecisionCodec
 from src.core.product_registry import (
     InstrumentSpec,
+    MarketType,
     calculate_required_capital,
     resolve_contract_multiplier,
 )
@@ -111,6 +116,8 @@ class ResearchBacktestRunner:
         capital_allocator: CapitalAllocator | None = None,
         instrument_spec: InstrumentSpec | None = None,
         spot_fee_asset: str = "quote",
+        external_funding_events: Sequence[ExternalFundingEvent] = (),
+        external_funding_account_id: str | None = None,
     ):
         self.start_time = start_time
         self.end_time = end_time
@@ -126,6 +133,8 @@ class ResearchBacktestRunner:
         self.capital_allocator = capital_allocator
         self.instrument_spec = instrument_spec
         self.spot_fee_asset = spot_fee_asset
+        self.external_funding_events = tuple(external_funding_events)
+        self.external_funding_account_id = external_funding_account_id
         self.contract_multiplier = resolve_contract_multiplier(instrument_spec)
         self._reserved_entry_capital: dict[str, tuple[str, Decimal]] = {}
         self._latest_rejections: dict[str, tuple[RejectionSnapshot, ...]] = {}
@@ -144,6 +153,17 @@ class ResearchBacktestRunner:
         self._reserved_entry_capital = {}
         self._latest_rejections = {}
         self._invalid_order_intent_rejections = []
+        funding_timeline = build_external_funding_timeline(
+            self.external_funding_events,
+            account_id=self.external_funding_account_id,
+            quote_asset=(
+                self.instrument_spec.quote
+                if self.instrument_spec is not None
+                and self.instrument_spec.market_type == MarketType.SPOT
+                else None
+            ),
+            start_time=self.start_time,
+        )
         adapter = SimulatedAdapter(
             initial_balance=Decimal(str(self.initial_balance)),
             maker_fee=Decimal(str(self.fee_config.get("maker", 0))),
@@ -151,6 +171,7 @@ class ResearchBacktestRunner:
             precision_codec=self.precision_codec,
             instrument_spec=self.instrument_spec,
             spot_fee_asset=self.spot_fee_asset,
+            external_funding_timeline=funding_timeline,
         )
         self._ensure_capital_allocator_supported(adapter)
         trades: list[ResearchTrade] = []
@@ -388,6 +409,12 @@ class ResearchBacktestRunner:
             ),
             "report_dir": None,
             "endpoint_state": endpoint_state,
+            "external_funding_applications": (
+                funding_timeline.applications if funding_timeline is not None else ()
+            ),
+            "external_funding_checkpoint": (
+                funding_timeline.checkpoint() if funding_timeline is not None else None
+            ),
         }
 
     def _iter_candles(self) -> Iterable[Candlestick]:

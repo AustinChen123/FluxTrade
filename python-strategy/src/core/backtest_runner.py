@@ -13,6 +13,7 @@ from typing import (
     Mapping,
     Optional,
     Protocol,
+    Sequence,
     cast,
 )
 from decimal import Decimal
@@ -36,6 +37,10 @@ from src.core.repositories import BacktestOrderRepository
 from src.core.backtest.loader import get_candles_generator
 from src.core.backtest.endpoint_state import build_replay_endpoint_state
 from src.core.backtest.equity import PortfolioEquityCalculator
+from src.core.backtest.external_funding import (
+    ExternalFundingEvent,
+    build_external_funding_timeline,
+)
 from src.core.analytics import (
     ClosedTrade,
     InitialBalanceInput,
@@ -52,6 +57,7 @@ from src.core.journal import StrategyJournal
 from src.core.product_registry import (
     FeeModel,
     InstrumentSpec,
+    MarketType,
     resolve_contract_multiplier,
     resolve_fee_model,
 )
@@ -234,6 +240,8 @@ class BacktestRunner:
         execution_timeframe: str | None = None,
         signal_batch_observer: Callable[[tuple[Signal, ...]], None] | None = None,
         spot_fee_asset: str = "quote",
+        external_funding_events: Sequence[ExternalFundingEvent] = (),
+        external_funding_account_id: str | None = None,
     ):
         self.start_time = start_time
         self.end_time = end_time
@@ -262,6 +270,8 @@ class BacktestRunner:
         self._db_session_factory = db_session_factory or _sessionlocal_context
         self.instrument_spec = instrument_spec
         self.spot_fee_asset = spot_fee_asset
+        self.external_funding_events = tuple(external_funding_events)
+        self.external_funding_account_id = external_funding_account_id
         self.contract_multiplier = resolve_contract_multiplier(instrument_spec)
         self.fee_model = resolve_fee_model(instrument_spec)
         self.signal_batch_observer = signal_batch_observer
@@ -512,12 +522,24 @@ class BacktestRunner:
         journal = StrategyJournal(primary_strategy_id)
 
         # 3. Create Rust-backed adapter with fee config
+        funding_timeline = build_external_funding_timeline(
+            self.external_funding_events,
+            account_id=self.external_funding_account_id,
+            quote_asset=(
+                self.instrument_spec.quote
+                if self.instrument_spec is not None
+                and self.instrument_spec.market_type == MarketType.SPOT
+                else None
+            ),
+            start_time=self.start_time,
+        )
         adapter = SimulatedAdapter(
             initial_balance=self.initial_balance,
             maker_fee=Decimal(str(self.fee_config.get("maker", 0))),
             taker_fee=Decimal(str(self.fee_config.get("taker", 0))),
             instrument_spec=self.instrument_spec,
             spot_fee_asset=self.spot_fee_asset,
+            external_funding_timeline=funding_timeline,
         )
         context_peak_equity = {
             strategy.strategy_id: self.initial_balance
@@ -750,6 +772,12 @@ class BacktestRunner:
             "report_dir": report_dir,
             "per_strategy": per_strategy,
             "endpoint_state": endpoint_state,
+            "external_funding_applications": (
+                funding_timeline.applications if funding_timeline is not None else ()
+            ),
+            "external_funding_checkpoint": (
+                funding_timeline.checkpoint() if funding_timeline is not None else None
+            ),
         }
         daily_return_metrics = utc_daily_return_metrics(
             progress.equity_samples,

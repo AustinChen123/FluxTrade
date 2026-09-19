@@ -1222,6 +1222,69 @@ class TestSpotSettlement:
         with pytest.raises(ExchangeError, match="min_notional_not_met"):
             adapter.place_order(order)
 
+    def test_external_funding_preserves_pending_quote_reservation(
+        self, order_factory
+    ):
+        product_id = "BINANCE:BTCUSDT-SPOT"
+        adapter = SimulatedAdapter(
+            Decimal("100"),
+            instrument_spec=_spot_spec(),
+        )
+        pending = order_factory(
+            product_id=product_id,
+            order_type="limit",
+            side="buy",
+            quantity=Decimal("1"),
+            price=Decimal("60"),
+        )
+        adapter.place_order(pending)
+
+        total = adapter.apply_external_funding(
+            asset="USDT", amount=Decimal("50")
+        )
+
+        assert total == Decimal("150")
+        assert adapter.get_asset_balance("USDT", "total") == Decimal("150")
+        assert adapter.get_asset_balance("USDT", "reserved") == Decimal("60")
+        assert adapter.get_asset_balance("USDT", "available") == Decimal("90")
+
+    @pytest.mark.parametrize(
+        ("asset", "amount", "message"),
+        [
+            ("BTC", Decimal("1"), "supports quote asset USDT only"),
+            ("USDT", Decimal("0"), "finite and positive"),
+            ("USDT", Decimal("-1"), "finite and positive"),
+            ("USDT", Decimal("NaN"), "finite and positive"),
+            ("USDT", Decimal("Infinity"), "finite and positive"),
+        ],
+    )
+    def test_external_funding_validation_fails_closed(
+        self, asset, amount, message
+    ):
+        adapter = SimulatedAdapter(
+            Decimal("100"),
+            instrument_spec=_spot_spec(),
+        )
+
+        with pytest.raises(ExchangeError, match=message):
+            adapter.apply_external_funding(asset=asset, amount=amount)
+
+        assert adapter.get_asset_balance("USDT", "total") == Decimal("100")
+
+    def test_external_funding_rejects_non_decimal_and_derivatives(self):
+        spot = SimulatedAdapter(
+            Decimal("100"),
+            instrument_spec=_spot_spec(),
+        )
+        with pytest.raises(TypeError, match="amount must be Decimal"):
+            spot.apply_external_funding(asset="USDT", amount=1)  # type: ignore[arg-type]
+
+        derivatives = SimulatedAdapter(Decimal("100"))
+        with pytest.raises(ExchangeError, match="requires cash_spot settlement"):
+            derivatives.apply_external_funding(
+                asset="USDT", amount=Decimal("1")
+            )
+
     def test_quote_fee_buy_sell_sequence_matches_asset_acceptance_table(
         self, order_factory
     ):

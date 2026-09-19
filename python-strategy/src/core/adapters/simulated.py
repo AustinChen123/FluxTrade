@@ -46,6 +46,7 @@ except ImportError:  # pragma: no cover - depends on local extension build
 
 if TYPE_CHECKING:
     from fluxtrade_core import ScaledCandlestick as RustScaledCandlestickType
+    from src.core.backtest.external_funding import ExternalFundingTimeline
     from src.core.capital_allocator import CapitalAllocator
 
 # Detect if Rust engine supports strategy_id parameter
@@ -95,6 +96,7 @@ class SimulatedAdapter(IExchangeAdapter):
         precision_codec: PrecisionCodec | None = None,
         instrument_spec: InstrumentSpec | None = None,
         spot_fee_asset: str = "quote",
+        external_funding_timeline: "ExternalFundingTimeline | None" = None,
     ):
         contract_multiplier = resolve_contract_multiplier(instrument_spec)
         fee_model = resolve_fee_model(instrument_spec)
@@ -124,6 +126,7 @@ class SimulatedAdapter(IExchangeAdapter):
         )
         self._contract_multiplier = contract_multiplier
         self._precision_codec = precision_codec
+        self._external_funding_timeline = external_funding_timeline
         if precision_codec is not None:
             if RustScaledCandlestick is None or not hasattr(
                 self._engine, "on_scaled_candle"
@@ -314,6 +317,21 @@ class SimulatedAdapter(IExchangeAdapter):
             return self.get_balance(asset)
         try:
             return Decimal(self._engine.get_asset_balance(asset, balance_type))
+        except ValueError as exc:
+            raise ExchangeError(str(exc)) from exc
+
+    def apply_external_funding(self, *, asset: str, amount: Decimal) -> Decimal:
+        """Credit positive quote funding through the authoritative spot ledger."""
+        if not self._is_cash_spot:
+            raise ExchangeError("external funding requires cash_spot settlement")
+        if not isinstance(amount, Decimal):
+            raise TypeError("external funding amount must be Decimal")
+        if not amount.is_finite() or amount <= 0:
+            raise ExchangeError(
+                "external funding amount must be finite and positive"
+            )
+        try:
+            return Decimal(self._engine.apply_external_funding(asset, str(amount)))
         except ValueError as exc:
             raise ExchangeError(str(exc)) from exc
 
@@ -538,6 +556,10 @@ class SimulatedAdapter(IExchangeAdapter):
             rust_fills = self._engine.on_candle(self._to_rust_candle(candle))
 
         self._capture_rejections()
+        self._apply_due_external_funding(
+            timestamp=candle.timestamp,
+            mark_price=candle.close,
+        )
         return self._fills_from_rust(rust_fills)
 
     def prepare_scaled_candle(self, candle: Candlestick):
@@ -552,7 +574,27 @@ class SimulatedAdapter(IExchangeAdapter):
             )
         rust_fills = self._engine.on_scaled_candle(scaled_candle)
         self._capture_rejections()
+        self._apply_due_external_funding(
+            timestamp=scaled_candle.timestamp,
+            mark_price=self._precision_codec.decode_price(
+                scaled_candle.close_units
+            ),
+        )
         return self._fills_from_rust(rust_fills)
+
+    def _apply_due_external_funding(
+        self,
+        *,
+        timestamp: int,
+        mark_price: Decimal,
+    ) -> None:
+        if self._external_funding_timeline is None:
+            return
+        self._external_funding_timeline.apply_due(
+            self,
+            timestamp=timestamp,
+            mark_price=mark_price,
+        )
 
     def drain_order_rejections(self) -> List[Dict]:
         rejections = self._pending_rejections

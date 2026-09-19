@@ -142,6 +142,23 @@ impl CashSpotLedger {
         Ok(None)
     }
 
+    pub(crate) fn credit_quote(&mut self, asset: &str, amount: Decimal) -> Result<Decimal, String> {
+        if asset != self.quote_asset {
+            return Err(format!(
+                "cash_spot external funding supports quote asset {} only",
+                self.quote_asset
+            ));
+        }
+        if amount <= Decimal::ZERO {
+            return Err("cash_spot external funding amount must be positive".to_string());
+        }
+        self.quote_total = self
+            .quote_total
+            .checked_add(amount)
+            .ok_or_else(|| "cash_spot external funding would overflow quote balance".to_string())?;
+        Ok(self.quote_total)
+    }
+
     pub(crate) fn settle(
         &mut self,
         order: &Order,

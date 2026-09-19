@@ -25,6 +25,7 @@ from src.core.analytics import (
     utc_daily_return_metrics,
 )
 from src.core.backtest_runner import BacktestRunner
+from src.core.backtest.external_funding import ExternalFundingEvent
 from src.core.capital_allocator import CapitalAllocator
 from src.core.data_sources.memory import MemoryDataSource
 from src.core.fast_bar import FastBarReplayRunner, MarketTape, SignalIntent
@@ -439,6 +440,25 @@ class SpotSettlementProbeStrategy(BaseStrategy):
         return None
 
 
+class SpotFundingProbeStrategy(BaseStrategy):
+    def __init__(self) -> None:
+        super().__init__("spot_funding_probe", "BINANCE:BTCUSDT-SPOT")
+        self.contexts: list[StrategyContext] = []
+
+    @property
+    def requirements(self) -> StrategyRequirements:
+        return StrategyRequirements("BINANCE:BTCUSDT-SPOT", TIMEFRAME, 1)
+
+    def on_candle(
+        self,
+        candle: Candlestick,
+        context: StrategyContext | None = None,
+    ) -> None:
+        if context is None:
+            raise AssertionError("spot funding probe requires context")
+        self.contexts.append(context)
+
+
 @pytest.mark.parametrize(
     (
         "spot_fee_asset",
@@ -577,6 +597,97 @@ def test_full_and_research_runners_use_same_spot_asset_settlement(
     final_position = research_result["endpoint_state"].positions[0]
     assert final_position.quantity == expected_final_quantity
     assert final_position.side == PositionSide.LONG
+
+
+def test_full_and_research_runners_apply_same_external_funding_contract(tmp_path):
+    product_id = "BINANCE:BTCUSDT-SPOT"
+    candles = [
+        Candlestick(
+            product_id=product_id,
+            timeframe=TIMEFRAME,
+            timestamp=index * INTERVAL_MS,
+            open=Decimal("50000"),
+            high=Decimal("50000"),
+            low=Decimal("50000"),
+            close=Decimal("50000"),
+            volume=Decimal("10"),
+        )
+        for index in range(3)
+    ]
+    spec = InstrumentSpec(
+        product_id=product_id,
+        exchange="binance",
+        symbol="BTC/USDT",
+        base="BTC",
+        quote="USDT",
+        quantity_step=Decimal("0.000001"),
+        price_tick=Decimal("0.01"),
+        min_notional=Decimal("1"),
+    )
+    event = ExternalFundingEvent(
+        event_id="funding-1",
+        account_id="research-account",
+        asset="USDT",
+        amount=Decimal("50"),
+        available_at=INTERVAL_MS,
+        source="test-schedule",
+    )
+    common = {
+        "start_time": 0,
+        "end_time": 2 * INTERVAL_MS,
+        "product_id": product_id,
+        "timeframe": TIMEFRAME,
+        "initial_balance": Decimal("100"),
+        "data_source": MemoryDataSource(candles),
+        "instrument_spec": spec,
+        "external_funding_events": (event,),
+        "external_funding_account_id": "research-account",
+    }
+
+    full_strategy = SpotFundingProbeStrategy()
+    full_runner = BacktestRunner(
+        **common,
+        max_drawdown_limit=None,
+        report_config={
+            "csv_trades": False,
+            "markdown_report": False,
+            "equity_curve": False,
+            "journal_export": False,
+        },
+        db_session_factory=_sqlite_backtest_session_factory(tmp_path, product_id),
+    )
+    full_runner.add_strategy(full_strategy)
+    research_strategy = SpotFundingProbeStrategy()
+    research_runner = ResearchBacktestRunner(**common)
+    research_runner.add_strategy(research_strategy)
+
+    full_result = full_runner.run()
+    research_result = research_runner.run()
+
+    assert full_result is not None
+    assert [context.available_cash for context in full_strategy.contexts] == [
+        Decimal("100"),
+        Decimal("150"),
+        Decimal("150"),
+    ]
+    assert [context.available_cash for context in research_strategy.contexts] == [
+        Decimal("100"),
+        Decimal("150"),
+        Decimal("150"),
+    ]
+    assert (
+        full_result["external_funding_applications"]
+        == research_result["external_funding_applications"]
+    )
+    assert (
+        full_result["external_funding_checkpoint"]
+        == research_result["external_funding_checkpoint"]
+    )
+    assert full_result["external_funding_checkpoint"].applied_event_ids == (
+        "funding-1",
+    )
+    assert full_result["external_funding_checkpoint"].pending_event_ids == ()
+    assert full_result["endpoint_state"] == research_result["endpoint_state"]
 
 
 @pytest.mark.smoke
