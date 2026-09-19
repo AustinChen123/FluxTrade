@@ -750,6 +750,22 @@ class ExecutionEngine:
 
                 if self.journal is not None:
                     self._journal_fill(order, price, qty, fee, fill_type, candle)
+        drain_rejections = cast(
+            Callable[[], list[dict]] | None,
+            getattr(self.adapter, "drain_order_rejections", None),
+        )
+        if callable(drain_rejections):
+            for rejection in drain_rejections():
+                order = rejection["order"]
+                reason = rejection["reason"]
+                self.order_manager.fail_order(order, reason)
+                self._fail_pending_conditional_orders_for_terminal_entry(order)
+                self._record_order_rejection(
+                    order=order,
+                    order_type=order.type,
+                    error=ExchangeError(reason),
+                    phase="simulated_matching",
+                )
         return fills
 
     def process_exchange_order_event(

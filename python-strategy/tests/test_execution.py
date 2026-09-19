@@ -27,6 +27,7 @@ from sqlalchemy.orm import Session
 from src.core.adapters.ccxt_adapter import CcxtExchangeAdapter
 from src.core.adapters.live_binance import LiveBinanceAdapter
 from src.core.adapters.rithmic_adapter import RithmicExchangeAdapter
+from src.core.adapters.simulated import SimulatedAdapter
 from src.core.adapters.rithmic_native_bracket import audit_native_bracket_fill
 from src.core.adapters.rithmic_native_protection_event import (
     process_native_protection_event,
@@ -44,6 +45,7 @@ from src.core.runtime_capabilities import OrderAccountIdentity
 from src.core.orm_models import SignalAudit, SystemEvent, Trade as StoredTrade
 from src.core.client_order_id import generate_client_order_id, parse_client_order_id
 from src.core.repositories import LiveOrderRepository
+from src.core.product_registry import InstrumentSpec
 
 
 def _session_context(session: Session) -> AbstractContextManager[Session]:
@@ -8918,6 +8920,68 @@ class TestMarketDataProcessing:
         candle = candlestick_factory()
         # Should not raise
         execution_engine.process_market_data(candle)
+
+    def test_spot_gap_rejection_marks_order_failed_and_preserves_cash(
+        self,
+        mock_db_session,
+        mock_clock,
+        mock_order_repo,
+        signal_factory,
+        candlestick_factory,
+    ):
+        product_id = "BINANCE:BTCUSDT-SPOT"
+        adapter = SimulatedAdapter(
+            initial_balance=Decimal("100"),
+            taker_fee=Decimal("0.001"),
+            instrument_spec=InstrumentSpec(
+                product_id=product_id,
+                exchange="binance",
+                symbol="BTC/USDT",
+                base="BTC",
+                quote="USDT",
+                quantity_step=Decimal("0.000001"),
+                price_tick=Decimal("0.01"),
+                min_notional=Decimal("1"),
+            ),
+        )
+        engine = ExecutionEngine(
+            db_session=mock_db_session,
+            clock=mock_clock,
+            adapter=adapter,
+            order_repository=mock_order_repo,
+            is_backtest=True,
+        )
+        decision_candle = candlestick_factory(
+            product_id=product_id,
+            close=Decimal("90000"),
+        )
+        order_id = engine.execute_signal(
+            signal_factory(
+                product_id=product_id,
+                price=None,
+                value=None,
+                quantity=Decimal("0.001"),
+            ),
+            decision_candle,
+        )
+        assert order_id is not None
+
+        engine.process_market_data(
+            candlestick_factory(
+                product_id=product_id,
+                open=Decimal("110000"),
+                high=Decimal("110000"),
+                low=Decimal("110000"),
+                close=Decimal("110000"),
+            )
+        )
+
+        assert mock_order_repo.orders[order_id].status == "failed"
+        assert adapter.get_asset_balance("USDT", "total") == Decimal("100")
+        assert adapter.get_asset_balance("USDT", "reserved") == Decimal("0")
+        assert adapter.get_position(product_id) is None
+        assert engine._reconcile_halt is False
+        assert engine._submissions_halted is False
 
     def test_journal_failure_preserves_prior_fill_and_cancel_then_stops_batch(
         self,
