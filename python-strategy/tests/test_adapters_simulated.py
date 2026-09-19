@@ -32,9 +32,13 @@ TF = "15m"
 
 def _candle(ts, o, h, low, c, vol: Decimal | str | int = 100, product=PRODUCT):
     return Candlestick(
-        product_id=product, timeframe=TF, timestamp=ts,
-        open=Decimal(str(o)), high=Decimal(str(h)),
-        low=Decimal(str(low)), close=Decimal(str(c)),
+        product_id=product,
+        timeframe=TF,
+        timestamp=ts,
+        open=Decimal(str(o)),
+        high=Decimal(str(h)),
+        low=Decimal(str(low)),
+        close=Decimal(str(c)),
         volume=Decimal(str(vol)),
     )
 
@@ -48,6 +52,7 @@ def _approx(a, b, tol=0.01):
 # Basics
 # =================================================================
 
+
 class TestSimulatedAdapterBasics:
     def test_initialization_defaults(self):
         adapter = SimulatedAdapter()
@@ -55,7 +60,9 @@ class TestSimulatedAdapterBasics:
         assert adapter.get_position(PRODUCT) is None
 
     def test_initialization_custom(self):
-        adapter = SimulatedAdapter(Decimal("50000"), maker_fee=Decimal("0.001"), taker_fee=Decimal("0.002"))
+        adapter = SimulatedAdapter(
+            Decimal("50000"), maker_fee=Decimal("0.001"), taker_fee=Decimal("0.002")
+        )
         assert adapter.get_balance() == Decimal("50000")
 
     def test_exposes_only_configured_instrument_spec(self):
@@ -271,9 +278,7 @@ class TestSimulatedAdapterBasics:
 
         assert adapter.get_open_orders(product_id) == []
 
-    def test_dated_future_market_order_does_not_require_price_tick(
-        self, order_factory
-    ):
+    def test_dated_future_market_order_does_not_require_price_tick(self, order_factory):
         product_id = "RITHMIC:MNQ-202509"
         spec = InstrumentSpec(
             product_id=product_id,
@@ -339,11 +344,13 @@ class TestSimulatedAdapterBasics:
 # Market orders
 # =================================================================
 
+
 class TestMarketOrders:
     def test_market_buy_fills_at_open(self, order_factory):
         adapter = SimulatedAdapter(Decimal("10000"), taker_fee=Decimal("0.0006"))
-        order = order_factory(order_type="market", side="buy",
-                              product_id=PRODUCT, quantity=Decimal("0.1"))
+        order = order_factory(
+            order_type="market", side="buy", product_id=PRODUCT, quantity=Decimal("0.1")
+        )
         adapter.place_order(order)
 
         fills = adapter.on_market_data(_candle(200, 50000, 50500, 49500, 50200))
@@ -355,8 +362,12 @@ class TestMarketOrders:
 
     def test_market_sell_opens_short(self, order_factory):
         adapter = SimulatedAdapter(Decimal("10000"))
-        order = order_factory(order_type="market", side="sell",
-                              product_id=PRODUCT, quantity=Decimal("0.1"))
+        order = order_factory(
+            order_type="market",
+            side="sell",
+            product_id=PRODUCT,
+            quantity=Decimal("0.1"),
+        )
         adapter.place_order(order)
         adapter.on_market_data(_candle(200, 50000, 50100, 49900, 50050))
 
@@ -367,14 +378,17 @@ class TestMarketOrders:
 
     def test_returns_orm_order_in_fill(self, order_factory):
         adapter = SimulatedAdapter(Decimal("10000"))
-        order = order_factory(order_type="market", side="buy",
-                              product_id=PRODUCT, quantity=Decimal("0.1"))
+        order = order_factory(
+            order_type="market", side="buy", product_id=PRODUCT, quantity=Decimal("0.1")
+        )
         adapter.place_order(order)
 
         fills = adapter.on_market_data(_candle(200, 50000, 50500, 49500, 50200))
         assert fills[0]["order"].id == order.id
 
-    def test_scaled_boundary_matches_decimal_boundary_for_market_fill(self, order_factory):
+    def test_scaled_boundary_matches_decimal_boundary_for_market_fill(
+        self, order_factory
+    ):
         fluxtrade_core = pytest.importorskip("fluxtrade_core")
         if not hasattr(fluxtrade_core.PyMatchingEngine, "on_scaled_candle"):
             pytest.skip("compiled Rust engine does not support scaled candle matching")
@@ -385,7 +399,9 @@ class TestMarketOrders:
                 quantity_step=Decimal("0.001"),
             )
         )
-        decimal_adapter = SimulatedAdapter(Decimal("10000"), taker_fee=Decimal("0.0006"))
+        decimal_adapter = SimulatedAdapter(
+            Decimal("10000"), taker_fee=Decimal("0.0006")
+        )
         scaled_adapter = SimulatedAdapter(
             Decimal("10000"),
             taker_fee=Decimal("0.0006"),
@@ -416,7 +432,9 @@ class TestMarketOrders:
         assert scaled_fills[0]["fee"] == decimal_fills[0]["fee"]
         assert scaled_adapter.get_balance() == decimal_adapter.get_balance()
 
-    def test_prepared_scaled_candle_matches_decimal_boundary_for_market_fill(self, order_factory):
+    def test_prepared_scaled_candle_matches_decimal_boundary_for_market_fill(
+        self, order_factory
+    ):
         fluxtrade_core = pytest.importorskip("fluxtrade_core")
         if not hasattr(fluxtrade_core.PyMatchingEngine, "on_scaled_candle"):
             pytest.skip("compiled Rust engine does not support scaled candle matching")
@@ -427,7 +445,9 @@ class TestMarketOrders:
                 quantity_step=Decimal("0.001"),
             )
         )
-        decimal_adapter = SimulatedAdapter(Decimal("10000"), taker_fee=Decimal("0.0006"))
+        decimal_adapter = SimulatedAdapter(
+            Decimal("10000"), taker_fee=Decimal("0.0006")
+        )
         scaled_adapter = SimulatedAdapter(
             Decimal("10000"),
             taker_fee=Decimal("0.0006"),
@@ -464,12 +484,17 @@ class TestMarketOrders:
 # Limit orders
 # =================================================================
 
+
 class TestLimitOrders:
     def test_limit_buy_fills_when_low_touches(self, order_factory):
         adapter = SimulatedAdapter(Decimal("10000"), maker_fee=Decimal("0.0002"))
-        order = order_factory(order_type="limit", side="buy",
-                              product_id=PRODUCT, price=Decimal("49000"),
-                              quantity=Decimal("0.1"))
+        order = order_factory(
+            order_type="limit",
+            side="buy",
+            product_id=PRODUCT,
+            price=Decimal("49000"),
+            quantity=Decimal("0.1"),
+        )
         adapter.place_order(order)
 
         # low=48900 touches 49000
@@ -481,9 +506,13 @@ class TestLimitOrders:
 
     def test_limit_buy_no_fill_when_above(self, order_factory):
         adapter = SimulatedAdapter(Decimal("10000"))
-        order = order_factory(order_type="limit", side="buy",
-                              product_id=PRODUCT, price=Decimal("40000"),
-                              quantity=Decimal("0.1"))
+        order = order_factory(
+            order_type="limit",
+            side="buy",
+            product_id=PRODUCT,
+            price=Decimal("40000"),
+            quantity=Decimal("0.1"),
+        )
         adapter.place_order(order)
 
         fills = adapter.on_market_data(_candle(200, 50000, 50500, 49500, 50200))
@@ -491,9 +520,13 @@ class TestLimitOrders:
 
     def test_limit_sell_fills_when_high_reaches(self, order_factory):
         adapter = SimulatedAdapter(Decimal("10000"), maker_fee=Decimal("0.0002"))
-        order = order_factory(order_type="limit", side="sell",
-                              product_id=PRODUCT, price=Decimal("51000"),
-                              quantity=Decimal("0.1"))
+        order = order_factory(
+            order_type="limit",
+            side="sell",
+            product_id=PRODUCT,
+            price=Decimal("51000"),
+            quantity=Decimal("0.1"),
+        )
         adapter.place_order(order)
 
         fills = adapter.on_market_data(_candle(200, 50000, 51500, 49500, 51000))
@@ -505,18 +538,24 @@ class TestLimitOrders:
 # Stop Loss / Take Profit
 # =================================================================
 
+
 class TestConditionalOrders:
     """SL/TP orders — side in ORM is the closing direction (sell/buy)."""
 
     def _open_long(self, adapter, order_factory):
-        entry = order_factory(order_type="market", side="buy",
-                              product_id=PRODUCT, quantity=Decimal("0.1"))
+        entry = order_factory(
+            order_type="market", side="buy", product_id=PRODUCT, quantity=Decimal("0.1")
+        )
         adapter.place_order(entry)
         adapter.on_market_data(_candle(200, 50000, 50200, 49900, 50100))
 
     def _open_short(self, adapter, order_factory):
-        entry = order_factory(order_type="market", side="sell",
-                              product_id=PRODUCT, quantity=Decimal("0.1"))
+        entry = order_factory(
+            order_type="market",
+            side="sell",
+            product_id=PRODUCT,
+            quantity=Decimal("0.1"),
+        )
         adapter.place_order(entry)
         adapter.on_market_data(_candle(200, 50000, 50100, 49900, 50050))
 
@@ -526,9 +565,13 @@ class TestConditionalOrders:
         adapter = SimulatedAdapter(Decimal("10000"))
         self._open_long(adapter, order_factory)
 
-        sl = order_factory(order_type="stop_loss", side="sell",
-                           product_id=PRODUCT, quantity=Decimal("0.1"),
-                           trigger_price=Decimal("49000"))
+        sl = order_factory(
+            order_type="stop_loss",
+            side="sell",
+            product_id=PRODUCT,
+            quantity=Decimal("0.1"),
+            trigger_price=Decimal("49000"),
+        )
         adapter.place_order(sl)
 
         # low=48900 <= trigger 49000
@@ -542,9 +585,13 @@ class TestConditionalOrders:
         adapter = SimulatedAdapter(Decimal("10000"))
         self._open_long(adapter, order_factory)
 
-        sl = order_factory(order_type="stop_loss", side="sell",
-                           product_id=PRODUCT, quantity=Decimal("0.1"),
-                           trigger_price=Decimal("49000"))
+        sl = order_factory(
+            order_type="stop_loss",
+            side="sell",
+            product_id=PRODUCT,
+            quantity=Decimal("0.1"),
+            trigger_price=Decimal("49000"),
+        )
         adapter.place_order(sl)
 
         # low=49500 > trigger 49000
@@ -557,9 +604,13 @@ class TestConditionalOrders:
         adapter = SimulatedAdapter(Decimal("10000"))
         self._open_long(adapter, order_factory)
 
-        tp = order_factory(order_type="take_profit", side="sell",
-                           product_id=PRODUCT, quantity=Decimal("0.1"),
-                           trigger_price=Decimal("52000"))
+        tp = order_factory(
+            order_type="take_profit",
+            side="sell",
+            product_id=PRODUCT,
+            quantity=Decimal("0.1"),
+            trigger_price=Decimal("52000"),
+        )
         adapter.place_order(tp)
 
         # high=52500 >= trigger 52000
@@ -574,9 +625,13 @@ class TestConditionalOrders:
         adapter = SimulatedAdapter(Decimal("10000"))
         self._open_short(adapter, order_factory)
 
-        sl = order_factory(order_type="stop_loss", side="buy",
-                           product_id=PRODUCT, quantity=Decimal("0.1"),
-                           trigger_price=Decimal("51000"))
+        sl = order_factory(
+            order_type="stop_loss",
+            side="buy",
+            product_id=PRODUCT,
+            quantity=Decimal("0.1"),
+            trigger_price=Decimal("51000"),
+        )
         adapter.place_order(sl)
 
         # high=51200 >= trigger 51000
@@ -592,9 +647,13 @@ class TestConditionalOrders:
         adapter = SimulatedAdapter(Decimal("10000"))
         self._open_short(adapter, order_factory)
 
-        tp = order_factory(order_type="take_profit", side="buy",
-                           product_id=PRODUCT, quantity=Decimal("0.1"),
-                           trigger_price=Decimal("48000"))
+        tp = order_factory(
+            order_type="take_profit",
+            side="buy",
+            product_id=PRODUCT,
+            quantity=Decimal("0.1"),
+            trigger_price=Decimal("48000"),
+        )
         adapter.place_order(tp)
 
         # low=47800 <= trigger 48000
@@ -608,21 +667,31 @@ class TestConditionalOrders:
 # OCO (one-cancels-other)
 # =================================================================
 
+
 class TestOCO:
     def test_tp_cancels_sl(self, order_factory):
         adapter = SimulatedAdapter(Decimal("10000"))
         # open long
-        entry = order_factory(order_type="market", side="buy",
-                              product_id=PRODUCT, quantity=Decimal("0.1"))
+        entry = order_factory(
+            order_type="market", side="buy", product_id=PRODUCT, quantity=Decimal("0.1")
+        )
         adapter.place_order(entry)
         adapter.on_market_data(_candle(200, 50000, 50200, 49900, 50100))
 
-        sl = order_factory(order_type="stop_loss", side="sell",
-                           product_id=PRODUCT, quantity=Decimal("0.1"),
-                           trigger_price=Decimal("49000"))
-        tp = order_factory(order_type="take_profit", side="sell",
-                           product_id=PRODUCT, quantity=Decimal("0.1"),
-                           trigger_price=Decimal("52000"))
+        sl = order_factory(
+            order_type="stop_loss",
+            side="sell",
+            product_id=PRODUCT,
+            quantity=Decimal("0.1"),
+            trigger_price=Decimal("49000"),
+        )
+        tp = order_factory(
+            order_type="take_profit",
+            side="sell",
+            product_id=PRODUCT,
+            quantity=Decimal("0.1"),
+            trigger_price=Decimal("52000"),
+        )
         sl._linked_order_id = tp.id
         tp._linked_order_id = sl.id
         adapter.place_order(sl)
@@ -639,17 +708,26 @@ class TestOCO:
 
     def test_sl_cancels_tp(self, order_factory):
         adapter = SimulatedAdapter(Decimal("10000"))
-        entry = order_factory(order_type="market", side="buy",
-                              product_id=PRODUCT, quantity=Decimal("0.1"))
+        entry = order_factory(
+            order_type="market", side="buy", product_id=PRODUCT, quantity=Decimal("0.1")
+        )
         adapter.place_order(entry)
         adapter.on_market_data(_candle(200, 50000, 50200, 49900, 50100))
 
-        sl = order_factory(order_type="stop_loss", side="sell",
-                           product_id=PRODUCT, quantity=Decimal("0.1"),
-                           trigger_price=Decimal("49000"))
-        tp = order_factory(order_type="take_profit", side="sell",
-                           product_id=PRODUCT, quantity=Decimal("0.1"),
-                           trigger_price=Decimal("52000"))
+        sl = order_factory(
+            order_type="stop_loss",
+            side="sell",
+            product_id=PRODUCT,
+            quantity=Decimal("0.1"),
+            trigger_price=Decimal("49000"),
+        )
+        tp = order_factory(
+            order_type="take_profit",
+            side="sell",
+            product_id=PRODUCT,
+            quantity=Decimal("0.1"),
+            trigger_price=Decimal("52000"),
+        )
         sl._linked_order_id = tp.id
         tp._linked_order_id = sl.id
         adapter.place_order(sl)
@@ -666,29 +744,33 @@ class TestOCO:
 # Trailing Stop
 # =================================================================
 
+
 class TestTrailingStop:
     def test_trailing_moves_up_and_triggers(self, order_factory):
         adapter = SimulatedAdapter(Decimal("10000"))
         # open long at 50000
-        entry = order_factory(order_type="market", side="buy",
-                              product_id=PRODUCT, quantity=Decimal("0.1"))
+        entry = order_factory(
+            order_type="market", side="buy", product_id=PRODUCT, quantity=Decimal("0.1")
+        )
         adapter.place_order(entry)
         adapter.on_market_data(_candle(200, 50000, 50200, 49900, 50100))
 
-        ts = order_factory(order_type="trailing_stop", side="sell",
-                           product_id=PRODUCT, quantity=Decimal("0.1"),
-                           trigger_price=Decimal("49500"))
+        ts = order_factory(
+            order_type="trailing_stop",
+            side="sell",
+            product_id=PRODUCT,
+            quantity=Decimal("0.1"),
+            trigger_price=Decimal("49500"),
+        )
         ts._trailing_distance = Decimal("500")
         adapter.place_order(ts)
 
         # rally: high=52000, trigger moves to 52000-500=51500
-        fills = adapter.on_market_data(
-            _candle(400, 50500, 52000, 51600, 51900))
+        fills = adapter.on_market_data(_candle(400, 50500, 52000, 51600, 51900))
         assert len(fills) == 0  # low 51600 > 51500
 
         # drop below new trigger
-        fills = adapter.on_market_data(
-            _candle(500, 51800, 51900, 51400, 51500))
+        fills = adapter.on_market_data(_candle(500, 51800, 51900, 51400, 51500))
         assert len(fills) == 1
         assert fills[0]["fill_type"] == "TRAILING_STOP"
         assert _approx(fills[0]["price"], 51500)
@@ -717,9 +799,7 @@ class TestTrailingStop:
         trailing._trailing_distance = Decimal("500")
         adapter.place_order(trailing)
 
-        fills = adapter.on_market_data(
-            _candle(400, 50500, 52000, 51600, 51900)
-        )
+        fills = adapter.on_market_data(_candle(400, 50500, 52000, 51600, 51900))
         endpoint = build_replay_endpoint_state(
             positions=adapter.get_all_positions(),
             working_orders=adapter.get_matching_open_orders(),
@@ -733,51 +813,63 @@ class TestTrailingStop:
 
     def test_trailing_for_short(self, order_factory):
         adapter = SimulatedAdapter(Decimal("10000"))
-        entry = order_factory(order_type="market", side="sell",
-                              product_id=PRODUCT, quantity=Decimal("0.1"))
+        entry = order_factory(
+            order_type="market",
+            side="sell",
+            product_id=PRODUCT,
+            quantity=Decimal("0.1"),
+        )
         adapter.place_order(entry)
         adapter.on_market_data(_candle(200, 50000, 50100, 49900, 50050))
 
-        ts = order_factory(order_type="trailing_stop", side="buy",
-                           product_id=PRODUCT, quantity=Decimal("0.1"),
-                           trigger_price=Decimal("50500"))
+        ts = order_factory(
+            order_type="trailing_stop",
+            side="buy",
+            product_id=PRODUCT,
+            quantity=Decimal("0.1"),
+            trigger_price=Decimal("50500"),
+        )
         ts._trailing_distance = Decimal("500")
         adapter.place_order(ts)
 
         # drop: low=48000, trigger moves to 48000+500=48500
         # high must stay below 48500 to avoid triggering on this candle
-        fills = adapter.on_market_data(
-            _candle(400, 48400, 48400, 48000, 48200))
+        fills = adapter.on_market_data(_candle(400, 48400, 48400, 48000, 48200))
         assert len(fills) == 0
 
         # price rises past new trigger (48500)
-        fills = adapter.on_market_data(
-            _candle(500, 48300, 48600, 48200, 48500))
+        fills = adapter.on_market_data(_candle(500, 48300, 48600, 48200, 48500))
         assert len(fills) == 1
         assert fills[0]["fill_type"] == "TRAILING_STOP"
         assert _approx(fills[0]["price"], 48500)
 
     def test_trailing_short_no_premature_trigger(self, order_factory):
         adapter = SimulatedAdapter(Decimal("10000"))
-        entry = order_factory(order_type="market", side="sell",
-                              product_id=PRODUCT, quantity=Decimal("0.1"))
+        entry = order_factory(
+            order_type="market",
+            side="sell",
+            product_id=PRODUCT,
+            quantity=Decimal("0.1"),
+        )
         adapter.place_order(entry)
         adapter.on_market_data(_candle(200, 50000, 50100, 49900, 50050))
 
-        ts = order_factory(order_type="trailing_stop", side="buy",
-                           product_id=PRODUCT, quantity=Decimal("0.1"),
-                           trigger_price=Decimal("50500"))
+        ts = order_factory(
+            order_type="trailing_stop",
+            side="buy",
+            product_id=PRODUCT,
+            quantity=Decimal("0.1"),
+            trigger_price=Decimal("50500"),
+        )
         ts._trailing_distance = Decimal("500")
         adapter.place_order(ts)
 
         # drop: low=48000, high must stay below new trigger (48500)
-        fills = adapter.on_market_data(
-            _candle(400, 49000, 48400, 48000, 48200))
+        fills = adapter.on_market_data(_candle(400, 49000, 48400, 48000, 48200))
         assert len(fills) == 0
 
         # price rises past trigger
-        fills = adapter.on_market_data(
-            _candle(500, 48300, 48600, 48200, 48500))
+        fills = adapter.on_market_data(_candle(500, 48300, 48600, 48200, 48500))
         assert len(fills) == 1
         assert fills[0]["fill_type"] == "TRAILING_STOP"
         assert _approx(fills[0]["price"], 48500)
@@ -787,11 +879,13 @@ class TestTrailingStop:
 # Balance & PnL accuracy
 # =================================================================
 
+
 class TestBalanceAccuracy:
     def test_market_fee_deducted(self, order_factory):
         adapter = SimulatedAdapter(Decimal("10000"), taker_fee=Decimal("0.0006"))
-        order = order_factory(order_type="market", side="buy",
-                              product_id=PRODUCT, quantity=Decimal("0.1"))
+        order = order_factory(
+            order_type="market", side="buy", product_id=PRODUCT, quantity=Decimal("0.1")
+        )
         adapter.place_order(order)
         adapter.on_market_data(_candle(200, 50000, 50500, 49500, 50200))
 
@@ -801,15 +895,20 @@ class TestBalanceAccuracy:
     def test_pnl_after_tp(self, order_factory):
         adapter = SimulatedAdapter(Decimal("10000"), taker_fee=Decimal("0.0006"))
         # open long at 50000
-        entry = order_factory(order_type="market", side="buy",
-                              product_id=PRODUCT, quantity=Decimal("0.1"))
+        entry = order_factory(
+            order_type="market", side="buy", product_id=PRODUCT, quantity=Decimal("0.1")
+        )
         adapter.place_order(entry)
         adapter.on_market_data(_candle(200, 50000, 50200, 49900, 50100))
 
         # TP at 52000
-        tp = order_factory(order_type="take_profit", side="sell",
-                           product_id=PRODUCT, quantity=Decimal("0.1"),
-                           trigger_price=Decimal("52000"))
+        tp = order_factory(
+            order_type="take_profit",
+            side="sell",
+            product_id=PRODUCT,
+            quantity=Decimal("0.1"),
+            trigger_price=Decimal("52000"),
+        )
         adapter.place_order(tp)
         adapter.on_market_data(_candle(400, 51000, 52500, 50800, 52200))
 
@@ -821,14 +920,19 @@ class TestBalanceAccuracy:
 
     def test_pnl_after_sl_loss(self, order_factory):
         adapter = SimulatedAdapter(Decimal("10000"), taker_fee=Decimal("0.0006"))
-        entry = order_factory(order_type="market", side="buy",
-                              product_id=PRODUCT, quantity=Decimal("0.1"))
+        entry = order_factory(
+            order_type="market", side="buy", product_id=PRODUCT, quantity=Decimal("0.1")
+        )
         adapter.place_order(entry)
         adapter.on_market_data(_candle(200, 50000, 50200, 49900, 50100))
 
-        sl = order_factory(order_type="stop_loss", side="sell",
-                           product_id=PRODUCT, quantity=Decimal("0.1"),
-                           trigger_price=Decimal("49000"))
+        sl = order_factory(
+            order_type="stop_loss",
+            side="sell",
+            product_id=PRODUCT,
+            quantity=Decimal("0.1"),
+            trigger_price=Decimal("49000"),
+        )
         adapter.place_order(sl)
         adapter.on_market_data(_candle(400, 49500, 49800, 48900, 49200))
 
@@ -842,12 +946,17 @@ class TestBalanceAccuracy:
 # Cancellation
 # =================================================================
 
+
 class TestCancellation:
     def test_cancel_by_exchange_id(self, order_factory):
         adapter = SimulatedAdapter(Decimal("10000"))
-        order = order_factory(order_type="limit", side="buy",
-                              product_id=PRODUCT, price=Decimal("40000"),
-                              quantity=Decimal("0.1"))
+        order = order_factory(
+            order_type="limit",
+            side="buy",
+            product_id=PRODUCT,
+            price=Decimal("40000"),
+            quantity=Decimal("0.1"),
+        )
         ex_id = adapter.place_order(order)
 
         assert adapter.cancel_order(ex_id, PRODUCT) is True
@@ -902,12 +1011,17 @@ class TestCancellation:
 # Position tracking
 # =================================================================
 
+
 class TestPositionTracking:
     def test_position_increase(self, order_factory):
         adapter = SimulatedAdapter(Decimal("100000"))
         for _ in range(3):
-            o = order_factory(order_type="market", side="buy",
-                              product_id=PRODUCT, quantity=Decimal("0.1"))
+            o = order_factory(
+                order_type="market",
+                side="buy",
+                product_id=PRODUCT,
+                quantity=Decimal("0.1"),
+            )
             adapter.place_order(o)
             adapter.on_market_data(_candle(200, 50000, 50500, 49500, 50200))
 
@@ -917,13 +1031,18 @@ class TestPositionTracking:
 
     def test_position_close_returns_none(self, order_factory):
         adapter = SimulatedAdapter(Decimal("10000"))
-        buy = order_factory(order_type="market", side="buy",
-                            product_id=PRODUCT, quantity=Decimal("0.1"))
+        buy = order_factory(
+            order_type="market", side="buy", product_id=PRODUCT, quantity=Decimal("0.1")
+        )
         adapter.place_order(buy)
         adapter.on_market_data(_candle(200, 50000, 50500, 49500, 50200))
 
-        sell = order_factory(order_type="market", side="sell",
-                             product_id=PRODUCT, quantity=Decimal("0.1"))
+        sell = order_factory(
+            order_type="market",
+            side="sell",
+            product_id=PRODUCT,
+            quantity=Decimal("0.1"),
+        )
         adapter.place_order(sell)
         adapter.on_market_data(_candle(300, 51000, 51500, 50500, 51200))
 
@@ -941,9 +1060,7 @@ class TestPositionTracking:
                     quantity=Decimal("0.1"),
                 )
             )
-        adapter.on_market_data(
-            _candle(200, 50000, 50500, 49500, 50200)
-        )
+        adapter.on_market_data(_candle(200, 50000, 50500, 49500, 50200))
 
         positions = adapter.get_strategy_positions(
             PRODUCT,
@@ -974,9 +1091,7 @@ class TestPositionTracking:
                     quantity=Decimal("0.1"),
                 )
             )
-        adapter.on_market_data(
-            _candle(200, 50000, 50500, 49500, 50200)
-        )
+        adapter.on_market_data(_candle(200, 50000, 50500, 49500, 50200))
 
         positions = adapter.get_all_positions()
 
@@ -991,18 +1106,26 @@ class TestPositionTracking:
 
     def test_different_products_independent(self, order_factory):
         adapter = SimulatedAdapter(Decimal("100000"))
-        btc = order_factory(order_type="market", side="buy",
-                            product_id="BINANCE:BTCUSDT-PERP",
-                            quantity=Decimal("0.1"))
-        eth = order_factory(order_type="market", side="sell",
-                            product_id="BINANCE:ETHUSDT-PERP",
-                            quantity=Decimal("1.0"))
+        btc = order_factory(
+            order_type="market",
+            side="buy",
+            product_id="BINANCE:BTCUSDT-PERP",
+            quantity=Decimal("0.1"),
+        )
+        eth = order_factory(
+            order_type="market",
+            side="sell",
+            product_id="BINANCE:ETHUSDT-PERP",
+            quantity=Decimal("1.0"),
+        )
         adapter.place_order(btc)
-        adapter.on_market_data(_candle(200, 50000, 50500, 49500, 50200,
-                                       product="BINANCE:BTCUSDT-PERP"))
+        adapter.on_market_data(
+            _candle(200, 50000, 50500, 49500, 50200, product="BINANCE:BTCUSDT-PERP")
+        )
         adapter.place_order(eth)
-        adapter.on_market_data(_candle(200, 2000, 2050, 1950, 2020,
-                                       product="BINANCE:ETHUSDT-PERP"))
+        adapter.on_market_data(
+            _candle(200, 2000, 2050, 1950, 2020, product="BINANCE:ETHUSDT-PERP")
+        )
 
         btc_position = adapter.get_position("BINANCE:BTCUSDT-PERP")
         eth_position = adapter.get_position("BINANCE:ETHUSDT-PERP")
@@ -1016,12 +1139,17 @@ class TestPositionTracking:
 # Edge cases
 # =================================================================
 
+
 class TestEdgeCases:
     def test_fill_multiple_orders_same_candle(self, order_factory):
         adapter = SimulatedAdapter(Decimal("100000"))
         for _ in range(5):
-            o = order_factory(order_type="market", side="buy",
-                              product_id=PRODUCT, quantity=Decimal("0.01"))
+            o = order_factory(
+                order_type="market",
+                side="buy",
+                product_id=PRODUCT,
+                quantity=Decimal("0.01"),
+            )
             adapter.place_order(o)
 
         fills = adapter.on_market_data(_candle(200, 50000, 50500, 49500, 50200))
@@ -1029,11 +1157,293 @@ class TestEdgeCases:
 
     def test_orders_for_different_product_untouched(self, order_factory):
         adapter = SimulatedAdapter(Decimal("10000"))
-        order = order_factory(order_type="market", side="buy",
-                              product_id="BINANCE:ETHUSDT-PERP",
-                              quantity=Decimal("0.1"))
+        order = order_factory(
+            order_type="market",
+            side="buy",
+            product_id="BINANCE:ETHUSDT-PERP",
+            quantity=Decimal("0.1"),
+        )
         adapter.place_order(order)
 
-        fills = adapter.on_market_data(_candle(200, 50000, 50500, 49500, 50200,
-                                               product=PRODUCT))
+        fills = adapter.on_market_data(
+            _candle(200, 50000, 50500, 49500, 50200, product=PRODUCT)
+        )
         assert len(fills) == 0
+
+
+def _spot_spec() -> InstrumentSpec:
+    return InstrumentSpec(
+        product_id="BINANCE:BTCUSDT-SPOT",
+        exchange="binance",
+        symbol="BTC/USDT",
+        base="BTC",
+        quote="USDT",
+        quantity_step=Decimal("0.000001"),
+        price_tick=Decimal("0.01"),
+        min_notional=Decimal("1"),
+    )
+
+
+def _with_market_reference(order, price: str):
+    order.min_notional_reference_price = Decimal(price)
+    return order
+
+
+class TestSpotSettlement:
+    def test_spot_requires_explicit_instrument_spec(self, order_factory):
+        adapter = SimulatedAdapter(Decimal("100"))
+        order = order_factory(
+            product_id="BINANCE:BTCUSDT-SPOT",
+            order_type="market",
+            side="buy",
+            quantity=Decimal("0.001"),
+            price=None,
+        )
+
+        with pytest.raises(ExchangeError, match="instrument_spec_required_for_spot"):
+            adapter.place_order(order)
+
+    def test_spot_min_notional_uses_market_reference(self, order_factory):
+        adapter = SimulatedAdapter(
+            Decimal("100"),
+            instrument_spec=_spot_spec(),
+        )
+        order = _with_market_reference(
+            order_factory(
+                product_id="BINANCE:BTCUSDT-SPOT",
+                order_type="market",
+                side="buy",
+                quantity=Decimal("0.00001"),
+                price=None,
+            ),
+            "50000",
+        )
+
+        with pytest.raises(ExchangeError, match="min_notional_not_met"):
+            adapter.place_order(order)
+
+    def test_quote_fee_buy_sell_sequence_matches_asset_acceptance_table(
+        self, order_factory
+    ):
+        product_id = "BINANCE:BTCUSDT-SPOT"
+        adapter = SimulatedAdapter(
+            Decimal("100"),
+            maker_fee=Decimal("0.001"),
+            taker_fee=Decimal("0.001"),
+            instrument_spec=_spot_spec(),
+        )
+        buy = _with_market_reference(
+            order_factory(
+                product_id=product_id,
+                order_type="market",
+                side="buy",
+                quantity=Decimal("0.001"),
+                price=None,
+            ),
+            "50000",
+        )
+
+        adapter.place_order(buy)
+        assert adapter.get_asset_balance("USDT", "total") == Decimal("100")
+        assert adapter.get_asset_balance("USDT", "reserved") == Decimal("50.05")
+        assert adapter.get_balance() == Decimal("49.95")
+        fills = adapter.on_market_data(
+            _candle(200, 50000, 50000, 50000, 50000, product=product_id)
+        )
+        assert fills[0]["fee"] == Decimal("0.05")
+        assert fills[0]["fee_asset"] == "USDT"
+        assert adapter.get_asset_balance("BTC", "total") == Decimal("0.001")
+
+        sell = _with_market_reference(
+            order_factory(
+                product_id=product_id,
+                order_type="market",
+                side="sell",
+                quantity=Decimal("0.0005"),
+                price=None,
+            ),
+            "60000",
+        )
+        adapter.place_order(sell)
+        fills = adapter.on_market_data(
+            _candle(300, 60000, 60000, 60000, 60000, product=product_id)
+        )
+
+        assert fills[0]["fee"] == Decimal("0.03")
+        snapshot = adapter.get_cash_spot_account_snapshot(Decimal("60000"))
+        assert snapshot.quote_total == Decimal("79.92")
+        assert snapshot.base_total == Decimal("0.0005")
+        assert snapshot.cost_basis == Decimal("25.025")
+        assert snapshot.realized_pnl == Decimal("4.945")
+        assert snapshot.unrealized_pnl == Decimal("4.975")
+        assert snapshot.total_equity == Decimal("109.92")
+
+    def test_market_gap_rejects_whole_order_and_releases_quote(self, order_factory):
+        product_id = "BINANCE:BTCUSDT-SPOT"
+        adapter = SimulatedAdapter(
+            Decimal("100"),
+            taker_fee=Decimal("0.001"),
+            instrument_spec=_spot_spec(),
+        )
+        order = _with_market_reference(
+            order_factory(
+                product_id=product_id,
+                order_type="market",
+                side="buy",
+                quantity=Decimal("0.001"),
+                price=None,
+            ),
+            "90000",
+        )
+        adapter.place_order(order)
+
+        fills = adapter.on_market_data(
+            _candle(200, 110000, 110000, 110000, 110000, product=product_id)
+        )
+
+        assert fills == []
+        assert adapter.get_asset_balance("USDT", "total") == Decimal("100")
+        assert adapter.get_asset_balance("USDT", "reserved") == Decimal("0")
+        assert adapter.get_asset_balance("BTC", "total") == Decimal("0")
+        rejections = adapter.drain_order_rejections()
+        assert len(rejections) == 1
+        assert rejections[0]["order"] is order
+        assert "insufficient available USDT at fill" in rejections[0]["reason"]
+
+    def test_same_candle_fill_does_not_hide_another_order_rejection(
+        self, order_factory
+    ):
+        product_id = "BINANCE:BTCUSDT-SPOT"
+        adapter = SimulatedAdapter(
+            Decimal("100"),
+            instrument_spec=_spot_spec(),
+        )
+        affordable = _with_market_reference(
+            order_factory(
+                product_id=product_id,
+                order_type="market",
+                side="buy",
+                quantity=Decimal("0.001"),
+                price=None,
+            ),
+            "50000",
+        )
+        rejected = _with_market_reference(
+            order_factory(
+                product_id=product_id,
+                order_type="market",
+                side="buy",
+                quantity=Decimal("0.002"),
+                price=None,
+            ),
+            "50000",
+        )
+        adapter.place_order(affordable)
+        adapter.place_order(rejected)
+
+        fills = adapter.on_market_data(
+            _candle(200, 50000, 50000, 50000, 50000, product=product_id)
+        )
+        rejections = adapter.drain_order_rejections()
+
+        assert [fill["order"] for fill in fills] == [affordable]
+        assert len(rejections) == 1
+        assert rejections[0]["order"] is rejected
+        assert "insufficient available USDT at fill" in rejections[0]["reason"]
+        assert adapter.get_asset_balance("USDT", "total") == Decimal("50")
+
+    def test_cash_spot_sell_shortfall_warns_then_rejects_without_short_position(
+        self, order_factory, caplog
+    ):
+        product_id = "BINANCE:BTCUSDT-SPOT"
+        adapter = SimulatedAdapter(
+            Decimal("100"),
+            instrument_spec=_spot_spec(),
+        )
+        naked_sell = _with_market_reference(
+            order_factory(
+                product_id=product_id,
+                order_type="market",
+                side="sell",
+                quantity=Decimal("0.001"),
+                price=None,
+            ),
+            "50000",
+        )
+        adapter.place_order(naked_sell)
+        assert "Cash-spot order accepted with advisory" in caplog.text
+        assert "insufficient_available_at_submission" in caplog.text
+        assert (
+            adapter.on_market_data(
+                _candle(100, 50000, 50000, 50000, 50000, product=product_id)
+            )
+            == []
+        )
+        assert len(adapter.drain_order_rejections()) == 1
+
+        buy = _with_market_reference(
+            order_factory(
+                product_id=product_id,
+                order_type="market",
+                side="buy",
+                quantity=Decimal("0.001"),
+                price=None,
+            ),
+            "50000",
+        )
+        adapter.place_order(buy)
+        adapter.on_market_data(
+            _candle(200, 50000, 50000, 50000, 50000, product=product_id)
+        )
+        oversized_sell = _with_market_reference(
+            order_factory(
+                product_id=product_id,
+                order_type="market",
+                side="sell",
+                quantity=Decimal("0.002"),
+                price=None,
+            ),
+            "50000",
+        )
+        adapter.place_order(oversized_sell)
+        assert (
+            adapter.on_market_data(
+                _candle(300, 50000, 50000, 50000, 50000, product=product_id)
+            )
+            == []
+        )
+        assert len(adapter.drain_order_rejections()) == 1
+
+        position = adapter.get_position(product_id, strategy_id=buy.strategy_id)
+        assert position is not None
+        assert position.side == "LONG"
+        assert position.quantity == Decimal("0.001")
+
+    def test_base_fee_is_reported_in_base_asset(self, order_factory):
+        product_id = "BINANCE:BTCUSDT-SPOT"
+        adapter = SimulatedAdapter(
+            Decimal("100"),
+            taker_fee=Decimal("0.001"),
+            instrument_spec=_spot_spec(),
+            spot_fee_asset="base",
+        )
+        buy = _with_market_reference(
+            order_factory(
+                product_id=product_id,
+                order_type="market",
+                side="buy",
+                quantity=Decimal("0.001"),
+                price=None,
+            ),
+            "50000",
+        )
+        adapter.place_order(buy)
+        fills = adapter.on_market_data(
+            _candle(200, 50000, 50000, 50000, 50000, product=product_id)
+        )
+
+        assert fills[0]["fee"] == Decimal("0.05")
+        assert fills[0]["fee_quantity"] == Decimal("0.000001")
+        assert fills[0]["fee_asset"] == "BTC"
+        assert adapter.get_asset_balance("USDT", "total") == Decimal("50")
+        assert adapter.get_asset_balance("BTC", "total") == Decimal("0.000999")

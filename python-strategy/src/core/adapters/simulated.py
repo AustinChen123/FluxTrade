@@ -1,5 +1,7 @@
 import inspect
+import logging
 import uuid
+from dataclasses import dataclass
 from decimal import Decimal
 from typing import TYPE_CHECKING, Optional, List, Dict, Sequence
 from src.core.interfaces.exchange import (
@@ -12,10 +14,13 @@ from src.core.models import OrderSide, Position, Candlestick, PositionSide
 from src.core.precision import PrecisionCodec
 from src.core.product_registry import (
     InstrumentSpec,
+    MarketType,
     is_dated_future_product_id,
+    is_spot_product_id,
     quantize_order_values,
     resolve_contract_multiplier,
     resolve_fee_model,
+    validate_min_notional,
 )
 from src.core.strategy_context import (
     CapitalSnapshot,
@@ -45,6 +50,24 @@ if TYPE_CHECKING:
 
 # Detect if Rust engine supports strategy_id parameter
 _RUST_HAS_STRATEGY_ID = "strategy_id" in str(inspect.signature(RustOrder))
+logger = logging.getLogger(__name__)
+
+
+@dataclass(frozen=True, slots=True)
+class CashSpotAccountSnapshot:
+    base_asset: str
+    quote_asset: str
+    fee_asset: str
+    base_total: Decimal
+    base_available: Decimal
+    base_reserved: Decimal
+    quote_total: Decimal
+    quote_available: Decimal
+    quote_reserved: Decimal
+    cost_basis: Decimal
+    realized_pnl: Decimal
+    unrealized_pnl: Decimal
+    total_equity: Decimal
 
 
 def create_simulated_adapter(config: dict) -> "SimulatedAdapter":
@@ -71,16 +94,33 @@ class SimulatedAdapter(IExchangeAdapter):
         taker_fee: Decimal = Decimal("0"),
         precision_codec: PrecisionCodec | None = None,
         instrument_spec: InstrumentSpec | None = None,
+        spot_fee_asset: str = "quote",
     ):
         contract_multiplier = resolve_contract_multiplier(instrument_spec)
         fee_model = resolve_fee_model(instrument_spec)
         self._instrument_spec = instrument_spec
+        self._cash_spot_spec = (
+            instrument_spec
+            if (
+                instrument_spec is not None
+                and instrument_spec.market_type == MarketType.SPOT
+            )
+            else None
+        )
+        self._is_cash_spot = self._cash_spot_spec is not None
+        if spot_fee_asset not in {"base", "quote"}:
+            raise ValueError("spot_fee_asset must be base or quote")
+        self._spot_fee_asset = spot_fee_asset
         self._engine = PyMatchingEngine(
             str(initial_balance),
             maker_fee=str(maker_fee),
             taker_fee=str(taker_fee),
             contract_multiplier=str(contract_multiplier),
             fee_model=fee_model.value,
+            settlement_model="cash_spot" if self._is_cash_spot else "derivatives",
+            base_asset=self._cash_spot_spec.base if self._cash_spot_spec else "",
+            quote_asset=self._cash_spot_spec.quote if self._cash_spot_spec else "",
+            spot_fee_asset=spot_fee_asset,
         )
         self._contract_multiplier = contract_multiplier
         self._precision_codec = precision_codec
@@ -97,12 +137,17 @@ class SimulatedAdapter(IExchangeAdapter):
             )
         # Map order ID → ORM Order so we can return it in fills
         self._order_map: Dict[str, Order] = {}
+        self._pending_rejections: List[Dict] = []
         self._rust_supports_strategy_id = _RUST_HAS_STRATEGY_ID
 
     @property
     def supports_strategy_positions(self) -> bool:
         """Whether Rust positions are isolated by strategy_id."""
         return self._rust_supports_strategy_id
+
+    @property
+    def is_cash_spot_settlement(self) -> bool:
+        return self._is_cash_spot
 
     def get_instrument_spec(self, product_id: str) -> InstrumentSpec | None:
         if (
@@ -119,14 +164,36 @@ class SimulatedAdapter(IExchangeAdapter):
         exchange_id = f"SIM-{uuid.uuid4().hex[:8]}"
 
         rust_order = self._to_rust_order(order)
-        self._engine.submit_order(rust_order)
+        try:
+            self._engine.submit_order(rust_order)
+        except ValueError as exc:
+            raise ExchangeError(str(exc)) from exc
         order.exchange_order_id = exchange_id
         self._order_map[order.id] = order
+        for warning in self._engine.drain_warnings():
+            logger.warning(
+                "Cash-spot order accepted with advisory: order_id=%s product_id=%s reason=%s",
+                order.id,
+                order.product_id,
+                warning["reason"],
+                extra={
+                    "component": "simulated_adapter",
+                    "event_code": "cash_spot_order_advisory",
+                    "strategy_id": order.strategy_id,
+                    "product_id": order.product_id,
+                },
+            )
 
         return exchange_id
 
     def validate_order(self, order: Order) -> None:
         if self._instrument_spec is None:
+            if order.product_id.endswith("-SPOT") and is_spot_product_id(
+                order.product_id
+            ):
+                raise ExchangeError(
+                    f"instrument_spec_required_for_spot: product_id={order.product_id}"
+                )
             if is_dated_future_product_id(order.product_id):
                 raise ExchangeError(
                     "instrument_spec_required_for_dated_future: "
@@ -156,6 +223,20 @@ class SimulatedAdapter(IExchangeAdapter):
             order.quantity = quantized.quantity
             order.price = quantized.price
             order.trigger_price = quantized.trigger_price
+        if self._is_cash_spot:
+            try:
+                validate_min_notional(
+                    quantity=quantized.quantity,
+                    price=quantized.price,
+                    reference_price=getattr(
+                        order,
+                        "min_notional_reference_price",
+                        None,
+                    ),
+                    spec=instrument_spec,
+                )
+            except ValueError as exc:
+                raise ExchangeError(str(exc)) from exc
 
     def cancel_order(
         self,
@@ -211,8 +292,72 @@ class SimulatedAdapter(IExchangeAdapter):
                 )
         return None
 
-    def get_balance(self, asset: str = "USDT") -> Decimal:
+    def get_balance(self, asset: str = "") -> Decimal:
+        if self._is_cash_spot:
+            if self._cash_spot_spec is None:
+                raise RuntimeError("spot instrument spec is unavailable")
+            resolved_asset = asset or self._cash_spot_spec.quote
+            try:
+                return Decimal(
+                    self._engine.get_asset_balance(resolved_asset, "available")
+                )
+            except ValueError as exc:
+                raise ExchangeError(str(exc)) from exc
         return Decimal(self._engine.balance)
+
+    def get_asset_balance(self, asset: str, balance_type: str = "available") -> Decimal:
+        if not self._is_cash_spot:
+            if balance_type != "available":
+                raise ExchangeError(
+                    "derivatives adapter exposes only available balance"
+                )
+            return self.get_balance(asset)
+        try:
+            return Decimal(self._engine.get_asset_balance(asset, balance_type))
+        except ValueError as exc:
+            raise ExchangeError(str(exc)) from exc
+
+    def get_cash_spot_account_snapshot(
+        self, mark_price: Decimal
+    ) -> CashSpotAccountSnapshot:
+        if not self._is_cash_spot:
+            raise ExchangeError("cash_spot account snapshot requires spot instrument")
+        try:
+            raw = self._engine.cash_spot_account_snapshot(str(mark_price))
+        except ValueError as exc:
+            raise ExchangeError(str(exc)) from exc
+        return CashSpotAccountSnapshot(
+            base_asset=raw["base_asset"],
+            quote_asset=raw["quote_asset"],
+            fee_asset=raw["fee_asset"],
+            base_total=Decimal(raw["base_total"]),
+            base_available=Decimal(raw["base_available"]),
+            base_reserved=Decimal(raw["base_reserved"]),
+            quote_total=Decimal(raw["quote_total"]),
+            quote_available=Decimal(raw["quote_available"]),
+            quote_reserved=Decimal(raw["quote_reserved"]),
+            cost_basis=Decimal(raw["cost_basis"]),
+            realized_pnl=Decimal(raw["realized_pnl"]),
+            unrealized_pnl=Decimal(raw["unrealized_pnl"]),
+            total_equity=Decimal(raw["total_equity"]),
+        )
+
+    def get_total_equity(self, mark_price: Decimal) -> Decimal:
+        if self._is_cash_spot:
+            return self.get_cash_spot_account_snapshot(mark_price).total_equity
+        positions = self.get_all_positions()
+        unrealized_pnl = sum(
+            (
+                _position_snapshot(
+                    position,
+                    mark_price,
+                    self._contract_multiplier,
+                ).unrealized_pnl
+                for position in positions
+            ),
+            start=Decimal("0"),
+        )
+        return self.get_balance() + unrealized_pnl
 
     def get_position(
         self, product_id: str, strategy_id: Optional[str] = None
@@ -334,8 +479,16 @@ class SimulatedAdapter(IExchangeAdapter):
         unrealized_pnl = (
             position_snapshot.unrealized_pnl if position_snapshot else Decimal("0")
         )
-        total_equity = cash + unrealized_pnl
-        realized_pnl = total_equity - Decimal(str(initial_balance))
+        if self._is_cash_spot:
+            if mark_price is None:
+                raise ValueError("spot StrategyContext requires mark_price")
+            spot_snapshot = self.get_cash_spot_account_snapshot(mark_price)
+            total_equity = spot_snapshot.total_equity
+            realized_pnl = spot_snapshot.realized_pnl
+            unrealized_pnl = spot_snapshot.unrealized_pnl
+        else:
+            total_equity = cash + unrealized_pnl
+            realized_pnl = total_equity - Decimal(str(initial_balance))
         if peak_equity is None or peak_equity <= 0:
             current_drawdown = Decimal("0")
         else:
@@ -384,6 +537,7 @@ class SimulatedAdapter(IExchangeAdapter):
         else:
             rust_fills = self._engine.on_candle(self._to_rust_candle(candle))
 
+        self._capture_rejections()
         return self._fills_from_rust(rust_fills)
 
     def prepare_scaled_candle(self, candle: Candlestick):
@@ -397,7 +551,26 @@ class SimulatedAdapter(IExchangeAdapter):
                 "precision codec is required for prepared scaled candles"
             )
         rust_fills = self._engine.on_scaled_candle(scaled_candle)
+        self._capture_rejections()
         return self._fills_from_rust(rust_fills)
+
+    def drain_order_rejections(self) -> List[Dict]:
+        rejections = self._pending_rejections
+        self._pending_rejections = []
+        return rejections
+
+    def _capture_rejections(self) -> None:
+        for rejection in self._engine.drain_rejections():
+            orm_order = self._order_map.pop(rejection["order_id"], None)
+            if orm_order is None:
+                continue
+            self._pending_rejections.append(
+                {
+                    "order": orm_order,
+                    "reason": rejection["reason"],
+                    "timestamp": int(rejection["timestamp"]),
+                }
+            )
 
     def _fills_from_rust(self, rust_fills) -> List[Dict]:
         fills: List[Dict] = []
@@ -405,12 +578,29 @@ class SimulatedAdapter(IExchangeAdapter):
             orm_order = self._order_map.pop(rf.order_id, None)
             if orm_order is None:
                 continue
+            fill_price = Decimal(rf.price)
+            fee_quantity = Decimal(rf.fee)
+            cash_spot_spec = self._cash_spot_spec
+            fee_asset = (
+                cash_spot_spec.base
+                if cash_spot_spec is not None and self._spot_fee_asset == "base"
+                else cash_spot_spec.quote
+                if cash_spot_spec is not None
+                else None
+            )
+            fee = (
+                fee_quantity * fill_price
+                if self._is_cash_spot and self._spot_fee_asset == "base"
+                else fee_quantity
+            )
             fills.append(
                 {
                     "order": orm_order,
-                    "price": Decimal(rf.price),
+                    "price": fill_price,
                     "quantity": Decimal(rf.quantity),
-                    "fee": Decimal(rf.fee),
+                    "fee": fee,
+                    "fee_quantity": fee_quantity,
+                    "fee_asset": fee_asset,
                     "fill_type": rf.fill_type,
                 }
             )
@@ -478,7 +668,15 @@ class SimulatedAdapter(IExchangeAdapter):
             product_id=order.product_id,
             side=side,
             order_type=order_type,
-            price=str(order.price) if order.price else "0",
+            price=str(
+                order.price
+                or (
+                    getattr(order, "min_notional_reference_price", None)
+                    if order_type == "MARKET"
+                    else None
+                )
+                or "0"
+            ),
             quantity=str(order.quantity),
             timestamp=order.timestamp or 0,
             trigger_price=trigger_price,
