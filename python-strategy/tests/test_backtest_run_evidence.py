@@ -1,5 +1,8 @@
 from dataclasses import replace
 from decimal import Decimal, getcontext, localcontext
+from importlib.machinery import EXTENSION_SUFFIXES
+from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -9,6 +12,7 @@ from src.core.backtest.run_evidence import (
     canonical_decision_snapshot,
     canonical_fill_records,
     configuration_sha256,
+    _native_extension_path,
 )
 from src.core.models import Candlestick, OrderSide
 from src.core.strategy_context import FillSnapshot, StrategyContext
@@ -181,3 +185,19 @@ def test_run_provenance_reports_all_required_hashes_and_matching_contract():
     ):
         assert len(digest) == 64
         int(digest, 16)
+
+
+def test_native_extension_path_accepts_package_and_top_level_layouts(tmp_path):
+    native = SimpleNamespace(
+        __file__=str(tmp_path / f"fluxtrade_core{EXTENSION_SUFFIXES[0]}")
+    )
+    package = SimpleNamespace(
+        __file__=str(tmp_path / "fluxtrade_core/__init__.py"),
+        fluxtrade_core=native,
+    )
+
+    assert _native_extension_path(native) == Path(native.__file__)
+    assert _native_extension_path(package) == Path(native.__file__)
+
+    with pytest.raises(RuntimeError, match="native extension path is unavailable"):
+        _native_extension_path(SimpleNamespace(__file__="fluxtrade_core.py"))

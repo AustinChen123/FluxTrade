@@ -6,10 +6,12 @@ import hashlib
 import importlib
 import inspect
 import json
+import tomllib
 from dataclasses import dataclass, fields, is_dataclass
 from decimal import Decimal
 from enum import Enum
 from functools import lru_cache
+from importlib.machinery import EXTENSION_SUFFIXES
 from importlib.metadata import PackageNotFoundError, version
 from pathlib import Path
 from typing import Iterable, Mapping, Sequence
@@ -386,12 +388,33 @@ def _project_version() -> str:
 
 @lru_cache(maxsize=1)
 def _extension_identity() -> tuple[str, str]:
-    extension = importlib.import_module("fluxtrade_core.fluxtrade_core")
-    source_path = getattr(extension, "__file__", None)
-    if type(source_path) is not str or not source_path:
-        raise RuntimeError("native extension path is unavailable")
+    extension = importlib.import_module("fluxtrade_core")
+    source_path = _native_extension_path(extension)
     try:
         extension_version = version("rust-data-service")
     except PackageNotFoundError:
-        extension_version = "unknown"
-    return extension_version, hashlib.sha256(Path(source_path).read_bytes()).hexdigest()
+        manifest = Path(__file__).resolve().parents[4] / "rust-data-service/Cargo.toml"
+        if not manifest.is_file():
+            extension_version = "unknown"
+        else:
+            with manifest.open("rb") as file:
+                package = tomllib.load(file).get("package", {})
+            raw_version = package.get("version")
+            extension_version = (
+                raw_version
+                if type(raw_version) is str and raw_version.strip()
+                else "unknown"
+            )
+    return extension_version, hashlib.sha256(source_path.read_bytes()).hexdigest()
+
+
+def _native_extension_path(module: object) -> Path:
+    """Resolve both installed-package and CI top-level extension layouts."""
+    candidates = (getattr(module, "fluxtrade_core", None), module)
+    for candidate in candidates:
+        source_path = getattr(candidate, "__file__", None)
+        if type(source_path) is str and any(
+            source_path.endswith(suffix) for suffix in EXTENSION_SUFFIXES
+        ):
+            return Path(source_path)
+    raise RuntimeError("native extension path is unavailable")
