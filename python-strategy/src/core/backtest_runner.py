@@ -233,6 +233,7 @@ class BacktestRunner:
         instrument_spec: InstrumentSpec | None = None,
         execution_timeframe: str | None = None,
         signal_batch_observer: Callable[[tuple[Signal, ...]], None] | None = None,
+        spot_fee_asset: str = "quote",
     ):
         self.start_time = start_time
         self.end_time = end_time
@@ -260,6 +261,7 @@ class BacktestRunner:
         self.report_config = {**DEFAULT_REPORT_CONFIG, **(report_config or {})}
         self._db_session_factory = db_session_factory or _sessionlocal_context
         self.instrument_spec = instrument_spec
+        self.spot_fee_asset = spot_fee_asset
         self.contract_multiplier = resolve_contract_multiplier(instrument_spec)
         self.fee_model = resolve_fee_model(instrument_spec)
         self.signal_batch_observer = signal_batch_observer
@@ -515,6 +517,7 @@ class BacktestRunner:
             maker_fee=Decimal(str(self.fee_config.get("maker", 0))),
             taker_fee=Decimal(str(self.fee_config.get("taker", 0))),
             instrument_spec=self.instrument_spec,
+            spot_fee_asset=self.spot_fee_asset,
         )
         context_peak_equity = {
             strategy.strategy_id: self.initial_balance
@@ -656,7 +659,11 @@ class BacktestRunner:
 
         # Calculate Final PnL
         final_balance = mock_account.get_balance()
-        total_pnl = final_balance - self.initial_balance
+        total_pnl = (
+            adapter.get_total_equity(progress.final_mark) - self.initial_balance
+            if adapter.is_cash_spot_settlement and progress.final_mark is not None
+            else final_balance - self.initial_balance
+        )
 
         with self._db_session_factory() as db_session:
             summary = cast(

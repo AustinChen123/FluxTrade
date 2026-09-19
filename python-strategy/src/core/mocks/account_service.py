@@ -36,7 +36,7 @@ class BacktestAccountService(AccountService):
             if hasattr(repo, "balance"):
                 repo.balance = initial_balance
 
-    def get_balance(self, asset: str = "USDT") -> Decimal:
+    def get_balance(self, asset: str = "") -> Decimal:
         if self.adapter:
             return self.adapter.get_balance(asset)
         if self.repo and hasattr(self.repo, "balance"):

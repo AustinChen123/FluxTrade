@@ -31,6 +31,7 @@ from src.core.conditional_order_intents import (
 )
 from src.core.db import SessionLocal
 from src.core.interfaces.data_source import IDataSource
+from src.core.interfaces.exchange import ExchangeError
 from src.core.models import Candlestick, OrderSide, Signal, SignalType
 from src.core.orm_models import Order
 from src.core.precision import PrecisionCodec
@@ -109,6 +110,7 @@ class ResearchBacktestRunner:
         prepared_scaled_candles: Sequence[Any] | None = None,
         capital_allocator: CapitalAllocator | None = None,
         instrument_spec: InstrumentSpec | None = None,
+        spot_fee_asset: str = "quote",
     ):
         self.start_time = start_time
         self.end_time = end_time
@@ -123,6 +125,7 @@ class ResearchBacktestRunner:
         self.prepared_scaled_candles = prepared_scaled_candles
         self.capital_allocator = capital_allocator
         self.instrument_spec = instrument_spec
+        self.spot_fee_asset = spot_fee_asset
         self.contract_multiplier = resolve_contract_multiplier(instrument_spec)
         self._reserved_entry_capital: dict[str, tuple[str, Decimal]] = {}
         self._latest_rejections: dict[str, tuple[RejectionSnapshot, ...]] = {}
@@ -147,6 +150,7 @@ class ResearchBacktestRunner:
             taker_fee=Decimal(str(self.fee_config.get("taker", 0))),
             precision_codec=self.precision_codec,
             instrument_spec=self.instrument_spec,
+            spot_fee_asset=self.spot_fee_asset,
         )
         self._ensure_capital_allocator_supported(adapter)
         trades: list[ResearchTrade] = []
@@ -179,6 +183,15 @@ class ResearchBacktestRunner:
             else:
                 fills = adapter.on_prepared_market_data(prepared_candle)
             trades.extend(self._fills_to_trades(fills, candle))
+            for rejection in adapter.drain_order_rejections():
+                order = rejection["order"]
+                snapshot = RejectionSnapshot(
+                    reason=rejection["reason"],
+                    timestamp=rejection["timestamp"],
+                    order_id=order.id,
+                )
+                existing = self._latest_rejections.get(order.strategy_id, ())
+                self._latest_rejections[order.strategy_id] = existing + (snapshot,)
             self._sync_capital_usage(adapter, candle)
 
             active_strategies = [
@@ -251,20 +264,37 @@ class ResearchBacktestRunner:
                                 candle,
                             ),
                         ]
-                        for order in orders:
-                            adapter.validate_order(order)
-                        for order in orders:
-                            adapter.place_order(order)
+                        placed_orders: list[Order] = []
+                        try:
+                            for order in orders:
+                                adapter.validate_order(order)
+                            for order in orders:
+                                adapter.place_order(order)
+                                placed_orders.append(order)
+                        except ExchangeError as exc:
+                            for placed_order in placed_orders:
+                                if placed_order.exchange_order_id is not None:
+                                    adapter.cancel_order(
+                                        placed_order.exchange_order_id,
+                                        placed_order.product_id,
+                                        order_type=placed_order.type,
+                                    )
+                            self._record_rejection(signal, candle, str(exc))
+                            continue
                         self._reserve_entry_capital(signal, entry_order, candle)
 
             portfolio_current_equity = (
-                contexts[0].available_cash
-                + sum(
-                    (context.unrealized_pnl for context in contexts),
-                    start=Decimal("0"),
+                adapter.get_total_equity(candle.close)
+                if adapter.is_cash_spot_settlement
+                else (
+                    contexts[0].available_cash
+                    + sum(
+                        (context.unrealized_pnl for context in contexts),
+                        start=Decimal("0"),
+                    )
+                    if contexts
+                    else adapter.get_balance()
                 )
-                if contexts
-                else adapter.get_balance()
             )
             equity_samples.append((candle.timestamp, portfolio_current_equity))
             final_mark = candle.close
@@ -296,7 +326,12 @@ class ResearchBacktestRunner:
             halted_early=halted_early,
         )
         final_balance = adapter.get_balance()
-        total_pnl = final_balance - Decimal(str(self.initial_balance))
+        final_equity = (
+            adapter.get_total_equity(final_mark)
+            if adapter.is_cash_spot_settlement and final_mark is not None
+            else final_balance
+        )
+        total_pnl = final_equity - Decimal(str(self.initial_balance))
         metrics = calculate_metrics(
             trades,
             initial_balance=self.initial_balance,
@@ -660,7 +695,7 @@ class ResearchBacktestRunner:
         resolved_intent = resolve_signal_order_intent(signal)
 
         order_id = str(uuid.uuid4())
-        return Order(
+        order = Order(
             id=order_id,
             exchange_order_id=f"sim_{order_id[:8]}",
             strategy_id=signal.strategy_id,
@@ -676,6 +711,9 @@ class ResearchBacktestRunner:
             filled_quantity=Decimal("0"),
             filled_price=Decimal("0"),
         )
+        if resolved_intent.order_type == "market":
+            order.min_notional_reference_price = candle.close
+        return order
 
     def _quantity_for_signal(
         self, signal: Signal, adapter: SimulatedAdapter

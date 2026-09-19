@@ -128,7 +128,7 @@ def _compile_jsonb_for_sqlite(type_, compiler, **kw):
     return "JSON"
 
 
-def _sqlite_backtest_session_factory(tmp_path):
+def _sqlite_backtest_session_factory(tmp_path, product_id: str = PRODUCT_ID):
     engine = create_engine(
         f"sqlite:///{tmp_path / 'research_backtest_parity.db'}",
         connect_args={"check_same_thread": False, "timeout": 30},
@@ -149,7 +149,7 @@ def _sqlite_backtest_session_factory(tmp_path):
         session.add(Exchange(id="BINANCE", name="Binance"))
         session.add(
             Product(
-                id=PRODUCT_ID,
+                id=product_id,
                 exchange_id="BINANCE",
                 base_asset="BTC",
                 quote_asset="USDT",
@@ -395,6 +395,188 @@ class OrderIntentParityProbeStrategy(BaseStrategy):
             value=Decimal("99"),
             quantity=Decimal("0.01"),
         )
+
+
+class SpotSettlementProbeStrategy(BaseStrategy):
+    def __init__(self) -> None:
+        super().__init__("spot_settlement_probe", "BINANCE:BTCUSDT-SPOT")
+        self.contexts: list[StrategyContext] = []
+        self._entered = False
+        self._exited = False
+
+    @property
+    def requirements(self) -> StrategyRequirements:
+        return StrategyRequirements("BINANCE:BTCUSDT-SPOT", TIMEFRAME, 1)
+
+    def on_candle(
+        self,
+        candle: Candlestick,
+        context: StrategyContext | None = None,
+    ) -> Signal | None:
+        if context is None:
+            raise AssertionError("spot settlement probe requires context")
+        self.contexts.append(context)
+        if not self._entered:
+            self._entered = True
+            return Signal(
+                strategy_id=self.strategy_id,
+                product_id=self.product_id,
+                timeframe=TIMEFRAME,
+                timestamp=candle.timestamp,
+                type=SignalType.LONG,
+                quantity=Decimal("0.001"),
+            )
+        if not self._exited and context.position is not None:
+            self._exited = True
+            return Signal(
+                strategy_id=self.strategy_id,
+                product_id=self.product_id,
+                timeframe=TIMEFRAME,
+                timestamp=candle.timestamp,
+                type=SignalType.EXIT_LONG,
+                quantity=Decimal("0.0005"),
+            )
+        return None
+
+
+@pytest.mark.parametrize(
+    (
+        "spot_fee_asset",
+        "expected_total_pnl",
+        "expected_context_cash",
+        "expected_context_equity",
+        "expected_context_quantity",
+        "expected_final_quantity",
+    ),
+    [
+        (
+            "quote",
+            Decimal("9.92"),
+            Decimal("49.95"),
+            Decimal("109.95"),
+            Decimal("0.001"),
+            Decimal("0.0005"),
+        ),
+        (
+            "base",
+            Decimal("9.91"),
+            Decimal("50"),
+            Decimal("109.94"),
+            Decimal("0.000999"),
+            Decimal("0.0004985"),
+        ),
+    ],
+)
+def test_full_and_research_runners_use_same_spot_asset_settlement(
+    tmp_path,
+    spot_fee_asset,
+    expected_total_pnl,
+    expected_context_cash,
+    expected_context_equity,
+    expected_context_quantity,
+    expected_final_quantity,
+):
+    product_id = "BINANCE:BTCUSDT-SPOT"
+    candle_prices = [
+        (Decimal("50000"), Decimal("50000"), Decimal("50000"), Decimal("50000")),
+        (Decimal("50000"), Decimal("60000"), Decimal("50000"), Decimal("60000")),
+        (Decimal("60000"), Decimal("60000"), Decimal("60000"), Decimal("60000")),
+    ]
+    candles = [
+        Candlestick(
+            product_id=product_id,
+            timeframe=TIMEFRAME,
+            timestamp=index * INTERVAL_MS,
+            open=prices[0],
+            high=prices[1],
+            low=prices[2],
+            close=prices[3],
+            volume=Decimal("10"),
+        )
+        for index, prices in enumerate(candle_prices)
+    ]
+    spec = InstrumentSpec(
+        product_id=product_id,
+        exchange="binance",
+        symbol="BTC/USDT",
+        base="BTC",
+        quote="USDT",
+        quantity_step=Decimal("0.000001"),
+        price_tick=Decimal("0.01"),
+        min_notional=Decimal("1"),
+    )
+    session_factory = _sqlite_backtest_session_factory(tmp_path, product_id)
+    full_strategy = SpotSettlementProbeStrategy()
+    full_runner = BacktestRunner(
+        start_time=0,
+        end_time=2 * INTERVAL_MS,
+        product_id=product_id,
+        timeframe=TIMEFRAME,
+        initial_balance=Decimal("100"),
+        max_drawdown_limit=None,
+        data_source=MemoryDataSource(candles),
+        fee_config={"maker": Decimal("0.001"), "taker": Decimal("0.001")},
+        report_config={
+            "csv_trades": False,
+            "markdown_report": False,
+            "equity_curve": False,
+            "journal_export": False,
+        },
+        db_session_factory=session_factory,
+        instrument_spec=spec,
+        spot_fee_asset=spot_fee_asset,
+    )
+    full_runner.add_strategy(full_strategy)
+
+    research_strategy = SpotSettlementProbeStrategy()
+    research_runner = ResearchBacktestRunner(
+        start_time=0,
+        end_time=2 * INTERVAL_MS,
+        product_id=product_id,
+        timeframe=TIMEFRAME,
+        initial_balance=Decimal("100"),
+        data_source=MemoryDataSource(candles),
+        fee_config={"maker": Decimal("0.001"), "taker": Decimal("0.001")},
+        instrument_spec=spec,
+        spot_fee_asset=spot_fee_asset,
+    )
+    research_runner.add_strategy(research_strategy)
+
+    full_result = full_runner.run()
+    research_result = research_runner.run()
+
+    assert full_result is not None
+    assert research_result["raw_trade_count"] == 2
+    assert (
+        full_result["total_pnl"] == research_result["total_pnl"] == expected_total_pnl
+    )
+    assert (
+        full_result["mark_to_market_pnl"]
+        == research_result["mark_to_market_pnl"]
+        == expected_total_pnl
+    )
+    full_context = full_strategy.contexts[1]
+    research_context = research_strategy.contexts[1]
+    assert full_context.available_cash == research_context.available_cash
+    assert full_context.total_equity == research_context.total_equity
+    assert full_context.realized_pnl == research_context.realized_pnl
+    assert full_context.unrealized_pnl == research_context.unrealized_pnl
+    assert full_context.position == research_context.position
+    assert [
+        (fill.side, fill.price, fill.quantity, fill.fee, fill.timestamp)
+        for fill in full_context.latest_fills
+    ] == [
+        (fill.side, fill.price, fill.quantity, fill.fee, fill.timestamp)
+        for fill in research_context.latest_fills
+    ]
+    assert research_strategy.contexts[1].available_cash == expected_context_cash
+    assert research_strategy.contexts[1].total_equity == expected_context_equity
+    assert research_strategy.contexts[1].position is not None
+    assert research_strategy.contexts[1].position.quantity == expected_context_quantity
+    assert full_result["endpoint_state"] == research_result["endpoint_state"]
+    final_position = research_result["endpoint_state"].positions[0]
+    assert final_position.quantity == expected_final_quantity
+    assert final_position.side == PositionSide.LONG
 
 
 @pytest.mark.smoke

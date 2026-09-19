@@ -40,6 +40,11 @@ class PortfolioEquityCalculator:
         )
 
     def value(self, mark_price: Decimal) -> Decimal:
+        if getattr(self.adapter, "is_cash_spot_settlement", False):
+            total_equity = getattr(self.adapter, "get_total_equity", None)
+            if not callable(total_equity):
+                raise RuntimeError("cash_spot adapter must expose total equity")
+            return cast(Decimal, total_equity(mark_price))
         supports_scoped_positions = self.adapter.supports_strategy_positions
         if supports_scoped_positions:
             batch_loader = getattr(
