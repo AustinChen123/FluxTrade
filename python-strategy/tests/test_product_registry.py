@@ -8,6 +8,7 @@ from src.core.product_registry import (
     CapitalModel,
     InstrumentSpec,
     FeeModel,
+    MarketType,
     to_ccxt_symbol,
     to_rithmic_symbol,
     to_exchange_name,
@@ -20,6 +21,7 @@ from src.core.product_registry import (
     calculate_required_capital,
     calculate_notional_exposure,
     instrument_spec_from_product,
+    is_spot_product_id,
     is_research_only_product_id,
     validate_product_id,
     quantize_order_values,
@@ -128,6 +130,18 @@ def test_notional_exposure_ignores_capital_and_fee_models():
 
 
 class TestToCcxtSymbol:
+    @pytest.mark.parametrize(
+        ("product_id", "expected"),
+        [
+            ("BINANCE:BTCUSDT-SPOT", "BTC/USDT"),
+            ("BACKPACK:BTC_USDC-SPOT", "BTC/USDC"),
+        ],
+    )
+    def test_spot_symbol_has_no_derivatives_settlement_suffix(
+        self, product_id, expected
+    ):
+        assert to_ccxt_symbol(product_id) == expected
+
     def test_known_binance_btc(self):
         assert to_ccxt_symbol("BINANCE:BTCUSDT-PERP") == "BTC/USDT:USDT"
 
@@ -175,6 +189,8 @@ def test_rithmic_symbol_mapping_rejects_other_venues():
 @pytest.mark.parametrize(
     "product_id",
     [
+        "BINANCE:BTCUSDT-SPOT",
+        "BACKPACK:BTC_USDC-SPOT",
         "BINANCE:BTCUSDT-PERP",
         "BACKPACK:SOL_USDC-PERP",
         "RITHMIC:MNQ-202509",
@@ -201,6 +217,78 @@ def test_product_id_matrix_accepts_canonical_ids(product_id):
 def test_product_id_matrix_rejects_malformed_ids(product_id):
     with pytest.raises(ValueError, match="Cannot parse product_id"):
         validate_product_id(product_id)
+
+
+@pytest.mark.parametrize(
+    ("product_id", "expected"),
+    [
+        ("BINANCE:BTCUSDT-SPOT", True),
+        ("BACKPACK:BTC_USDC-SPOT", True),
+        ("BINANCE:BTCUSDT-PERP", False),
+        ("RITHMIC:MNQ-202509", False),
+    ],
+)
+def test_spot_product_identity_is_explicit(product_id, expected):
+    assert is_spot_product_id(product_id) is expected
+
+
+@pytest.mark.parametrize(
+    ("product_id", "market_type", "ccxt_symbol", "base", "quote"),
+    [
+        (
+            "BINANCE:BTCUSDT-SPOT",
+            MarketType.SPOT,
+            "BTC/USDT",
+            "BTC",
+            "USDT",
+        ),
+        (
+            "BINANCE:BTCUSDT-PERP",
+            MarketType.PERPETUAL,
+            "BTC/USDT:USDT",
+            "BTC",
+            "USDT",
+        ),
+        (
+            "BACKPACK:BTC_USDC-SPOT",
+            MarketType.SPOT,
+            "BTC/USDC",
+            "BTC",
+            "USDC",
+        ),
+        (
+            "RITHMIC:MNQ-202509",
+            MarketType.DATED_FUTURE,
+            "MNQ-202509",
+            "MNQ",
+            "USD",
+        ),
+    ],
+)
+def test_instrument_spec_market_type_matrix(
+    product_id, market_type, ccxt_symbol, base, quote
+):
+    spec = instrument_spec_from_product(product_id)
+
+    assert spec.market_type == market_type
+    assert spec.symbol == ccxt_symbol
+    assert spec.base == base
+    assert spec.quote == quote
+
+
+def test_instrument_spec_rejects_market_type_conflicting_with_product_id():
+    with pytest.raises(
+        ValueError,
+        match="market_type conflicts with canonical product identity",
+    ):
+        InstrumentSpec(
+            product_id="BINANCE:BTCUSDT-SPOT",
+            exchange="binance",
+            symbol="BTC/USDT",
+            base="BTC",
+            quote="USDT",
+            market_type=MarketType.PERPETUAL,
+        )
 
 
 @pytest.mark.parametrize(

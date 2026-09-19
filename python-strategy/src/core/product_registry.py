@@ -4,6 +4,7 @@ Replaces ad-hoc _map_symbol() in ExchangeAdapter and PRODUCT_TO_CCXT
 in fetch_real_data.py with a single registry.
 
 Product ID formats:
+  - spot: EXCHANGE:SYMBOL-SPOT (e.g. BINANCE:BTCUSDT-SPOT)
   - perpetual: EXCHANGE:SYMBOL-PERP (e.g. BINANCE:BTCUSDT-PERP)
   - dated future: EXCHANGE:ROOT-YYYYMM (e.g. RITHMIC:MNQ-202509)
 """
@@ -22,29 +23,49 @@ logger = logging.getLogger(__name__)
 # Known product mappings with exchange-specific overrides.
 # Only entries that cannot be derived from generic parsing need to be here.
 _KNOWN_PRODUCTS: dict[str, dict] = {
+    "BINANCE:BTCUSDT-SPOT": {
+        "exchange": "binance",
+        "ccxt": "BTC/USDT",
+        "stream_symbol": "btcusdt",
+        "base": "BTC",
+        "quote": "USDT",
+        "market_type": "spot",
+    },
     "BINANCE:BTCUSDT-PERP": {
         "exchange": "binance",
         "ccxt": "BTC/USDT:USDT",
         "base": "BTC",
         "quote": "USDT",
+        "market_type": "perpetual",
     },
     "BINANCE:ETHUSDT-PERP": {
         "exchange": "binance",
         "ccxt": "ETH/USDT:USDT",
         "base": "ETH",
         "quote": "USDT",
+        "market_type": "perpetual",
     },
     "BYBIT:BTCUSDT-PERP": {
         "exchange": "bybit",
         "ccxt": "BTC/USDT:USDT",
         "base": "BTC",
         "quote": "USDT",
+        "market_type": "perpetual",
     },
     "BYBIT:ETHUSDT-PERP": {
         "exchange": "bybit",
         "ccxt": "ETH/USDT:USDT",
         "base": "ETH",
         "quote": "USDT",
+        "market_type": "perpetual",
+    },
+    "BACKPACK:BTC_USDC-SPOT": {
+        "exchange": "backpack",
+        "ccxt": "BTC/USDC",
+        "stream_symbol": "btc_usdc",
+        "base": "BTC",
+        "quote": "USDC",
+        "market_type": "spot",
     },
     "BACKPACK:BTC_USDC-PERP": {
         "exchange": "backpack",
@@ -52,6 +73,7 @@ _KNOWN_PRODUCTS: dict[str, dict] = {
         "stream_symbol": "btc_usdc",
         "base": "BTC",
         "quote": "USDC",
+        "market_type": "perpetual",
     },
     "BACKPACK:SOL_USDC-PERP": {
         "exchange": "backpack",
@@ -59,11 +81,13 @@ _KNOWN_PRODUCTS: dict[str, dict] = {
         "stream_symbol": "sol_usdc",
         "base": "SOL",
         "quote": "USDC",
+        "market_type": "perpetual",
     },
 }
 
 _REJECTED_PRODUCT_IDS = frozenset({"BACKPACK:BTCUSDT-PERP"})
 
+_SPOT_PRODUCT_ID_PATTERN = re.compile(r"^([A-Z0-9]+):([A-Z0-9_]+)-SPOT$")
 _PERPETUAL_PRODUCT_ID_PATTERN = re.compile(r"^([A-Z0-9]+):([A-Z0-9_]+)-PERP$")
 _DATED_FUTURE_PRODUCT_ID_PATTERN = re.compile(
     r"^([A-Z0-9]+):([A-Z][A-Z0-9]*)-([0-9]{4})([0-9]{2})$"
@@ -71,6 +95,15 @@ _DATED_FUTURE_PRODUCT_ID_PATTERN = re.compile(
 _CONTINUOUS_FUTURE_PRODUCT_ID_PATTERN = re.compile(
     r"^([A-Z0-9]+):([A-Z][A-Z0-9]*)-CONTINUOUS$"
 )
+
+
+class MarketType(str, Enum):
+    """Canonical market identity; symbols never imply this dimension."""
+
+    SPOT = "spot"
+    PERPETUAL = "perpetual"
+    DATED_FUTURE = "dated_future"
+    CONTINUOUS_FUTURE = "continuous_future"
 
 
 @dataclass(frozen=True)
@@ -92,6 +125,20 @@ class InstrumentSpec:
     capital_model: "CapitalModel | None" = None
     capital_per_contract: Decimal | None = None
     session_calendar_id: str | None = None
+    market_type: MarketType | None = None
+
+    def __post_init__(self) -> None:
+        """Derive and cross-check market type for canonical product IDs."""
+        try:
+            parsed = _parse_product_id(self.product_id)
+        except ValueError:
+            return
+        canonical = MarketType(parsed["market_type"])
+        if self.market_type is not None and self.market_type != canonical:
+            raise ValueError(
+                "instrument market_type conflicts with canonical product identity"
+            )
+        object.__setattr__(self, "market_type", canonical)
 
 
 def resolve_contract_multiplier(spec: InstrumentSpec | None) -> Decimal:
@@ -186,6 +233,28 @@ def _parse_product_id(product_id: str) -> dict:
     if product_id in _KNOWN_PRODUCTS:
         return _KNOWN_PRODUCTS[product_id]
 
+    spot = _SPOT_PRODUCT_ID_PATTERN.fullmatch(product_id)
+    if spot:
+        exchange = spot.group(1).lower()
+        symbol = spot.group(2)
+        quote = next(
+            (
+                candidate
+                for candidate in ("USDT", "USDC", "BUSD")
+                if len(symbol) > len(candidate) and symbol.endswith(candidate)
+            ),
+            "",
+        )
+        base = symbol[: -len(quote)].removesuffix("_") if quote else symbol
+        return {
+            "exchange": exchange,
+            "ccxt": f"{base}/{quote}" if quote else None,
+            "stream_symbol": symbol.lower(),
+            "base": base,
+            "quote": quote,
+            "market_type": MarketType.SPOT.value,
+        }
+
     perpetual = _PERPETUAL_PRODUCT_ID_PATTERN.fullmatch(product_id)
     if perpetual:
         exchange = perpetual.group(1).lower()
@@ -208,6 +277,7 @@ def _parse_product_id(product_id: str) -> dict:
             "stream_symbol": symbol.lower(),
             "base": base,
             "quote": quote,
+            "market_type": MarketType.PERPETUAL.value,
         }
 
     dated_future = _DATED_FUTURE_PRODUCT_ID_PATTERN.fullmatch(product_id)
@@ -224,6 +294,7 @@ def _parse_product_id(product_id: str) -> dict:
                 "stream_symbol": contract.lower(),
                 "base": root,
                 "quote": "USD",
+                "market_type": MarketType.DATED_FUTURE.value,
             }
 
     continuous_future = _CONTINUOUS_FUTURE_PRODUCT_ID_PATTERN.fullmatch(product_id)
@@ -235,11 +306,13 @@ def _parse_product_id(product_id: str) -> dict:
             "base": continuous_future.group(2),
             "quote": "USD",
             "research_only": True,
+            "market_type": MarketType.CONTINUOUS_FUTURE.value,
         }
 
     raise ValueError(
         f"Cannot parse product_id: {product_id}. Expected "
-        "EXCHANGE:BASEQUOTE-PERP, EXCHANGE:ROOT-YYYYMM, or "
+        "EXCHANGE:BASEQUOTE-SPOT, EXCHANGE:BASEQUOTE-PERP, "
+        "EXCHANGE:ROOT-YYYYMM, or "
         "EXCHANGE:ROOT-CONTINUOUS"
     )
 
@@ -254,6 +327,12 @@ def is_dated_future_product_id(product_id: str) -> bool:
     """Return whether a canonical product ID identifies an expiring contract."""
     validate_product_id(product_id)
     return _DATED_FUTURE_PRODUCT_ID_PATTERN.fullmatch(product_id) is not None
+
+
+def is_spot_product_id(product_id: str) -> bool:
+    """Return whether a canonical product ID identifies a spot market."""
+    validate_product_id(product_id)
+    return _SPOT_PRODUCT_ID_PATTERN.fullmatch(product_id) is not None
 
 
 def is_research_only_product_id(product_id: str) -> bool:
@@ -374,6 +453,7 @@ def instrument_spec_from_product(
         tick_value=tick_value,
         fee_model=fee_model,
         session_calendar_id=session_calendar_id,
+        market_type=MarketType(info["market_type"]),
     )
 
 
@@ -390,6 +470,7 @@ def instrument_spec_from_ccxt_market(
     multiplier = None
 
     if market is not None:
+        _validate_ccxt_market_type(product_id, market)
         multiplier = _contract_multiplier_from_ccxt_market(market)
         limits = market.get("limits") or {}
         amount_limits = limits.get("amount") or {}
@@ -464,6 +545,17 @@ def instrument_spec_from_ccxt_market(
         min_quantity=min_quantity,
         multiplier=multiplier,
     )
+
+
+def _validate_ccxt_market_type(product_id: str, market: dict[str, Any]) -> None:
+    """Fail closed when provider metadata disagrees with canonical identity."""
+    expected = MarketType(_parse_product_id(product_id)["market_type"])
+    if expected == MarketType.SPOT:
+        if market.get("spot") is not True or market.get("contract") is not False:
+            raise ValueError("CCXT market does not identify an explicit spot market")
+        return
+    if expected == MarketType.PERPETUAL and market.get("contract") is False:
+        raise ValueError("CCXT market does not identify an explicit contract market")
 
 
 def _contract_multiplier_from_ccxt_market(market: dict[str, Any]) -> Decimal | None:

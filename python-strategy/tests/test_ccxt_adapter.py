@@ -30,6 +30,7 @@ from src.core.interfaces.exchange import (
 from src.core.models import PositionSide
 from src.core.orm_models import Order
 from src.core.product_registry import (
+    MarketType,
     PrecisionMode,
     instrument_spec_from_ccxt_market,
     instrument_spec_from_product,
@@ -634,9 +635,37 @@ class TestPlaceOrder:
         assert spec.symbol == "SOL/USDT:USDT"
 
     @pytest.mark.parametrize(
+        ("market", "error"),
+        [
+            ({"spot": True, "contract": False}, None),
+            ({"spot": False, "contract": False}, "explicit spot market"),
+            ({"spot": True, "contract": True}, "explicit spot market"),
+            ({"contract": False}, "explicit spot market"),
+        ],
+    )
+    def test_ccxt_spot_metadata_matrix(self, market, error):
+        if error:
+            with pytest.raises(ValueError, match=error):
+                instrument_spec_from_ccxt_market(
+                    "BINANCE:BTCUSDT-SPOT",
+                    market,
+                    precision_mode=PrecisionMode.TICK_SIZE,
+                )
+            return
+
+        spec = instrument_spec_from_ccxt_market(
+            "BINANCE:BTCUSDT-SPOT",
+            market,
+            precision_mode=PrecisionMode.TICK_SIZE,
+        )
+        assert spec.market_type == MarketType.SPOT
+        assert spec.symbol == "BTC/USDT"
+        assert spec.multiplier is None
+
+    @pytest.mark.parametrize(
         ("market", "expected_multiplier", "error"),
         [
-            ({"contract": False}, None, None),
+            ({"contract": False}, None, "explicit contract market"),
             (_linear_contract_market(contractSize="2"), Decimal("2"), None),
             (
                 {"contract": True, "linear": True, "inverse": False},
