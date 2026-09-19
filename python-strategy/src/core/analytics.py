@@ -160,6 +160,8 @@ def _build_closed_trades(
     trade_history: Sequence[_MetricsTrade],
     *,
     contract_multiplier: Decimal = Decimal("1"),
+    spot_base_asset: str | None = None,
+    spot_quote_asset: str | None = None,
 ) -> tuple[list[ClosedTrade], list[float], list[float], Decimal]:
     """Pair raw trades into closed round-trips using FIFO netting.
 
@@ -168,18 +170,40 @@ def _build_closed_trades(
     """
     if contract_multiplier <= 0:
         raise ValueError("contract_multiplier must be positive")
+    if (spot_base_asset is None) != (spot_quote_asset is None):
+        raise ValueError("spot base and quote assets must be provided together")
     trades = []
     has_fill_sequence = []
     for t in trade_history:
         fill_sequence = getattr(t, "fill_sequence", None)
         has_fill_sequence.append(fill_sequence is not None)
+        price = t.price
+        quantity = t.quantity
+        fee = getattr(t, "fee", Decimal("0")) or Decimal("0")
+        fee_asset = getattr(t, "fee_asset", None)
+        if spot_base_asset is not None and spot_quote_asset is not None:
+            if fee_asset == spot_base_asset:
+                side = t.side.lower()
+                if side == "buy":
+                    if fee > quantity:
+                        raise ValueError("spot base-asset fee exceeds bought quantity")
+                    quantity -= fee
+                elif side == "sell":
+                    quantity += fee
+                else:
+                    raise ValueError(f"unsupported trade side: {t.side}")
+                fee *= price
+            elif fee_asset is None and fee != 0:
+                raise ValueError("spot nonzero fee requires an explicit fee asset")
+            elif fee_asset not in (None, spot_quote_asset):
+                raise ValueError(f"unsupported spot fee asset: {fee_asset}")
         trades.append(
             {
                 "timestamp": t.timestamp,
                 "side": t.side,
-                "price": t.price,
-                "quantity": t.quantity,
-                "fee": getattr(t, "fee", Decimal("0")) or Decimal("0"),
+                "price": price,
+                "quantity": quantity,
+                "fee": fee,
                 "fill_sequence": fill_sequence,
             }
         )
@@ -352,6 +376,8 @@ def calculate_metrics(
     periods_per_year: int = 365,
     contract_multiplier: Decimal = Decimal("1"),
     equity_samples: Sequence[tuple[int, Decimal]] | None = None,
+    spot_base_asset: str | None = None,
+    spot_quote_asset: str | None = None,
 ) -> Dict:
     """Calculate performance metrics from a list of trades.
 
@@ -388,6 +414,8 @@ def calculate_metrics(
     closed_trades, trade_pnls, equity_curve, total_pnl = _build_closed_trades(
         trade_history,
         contract_multiplier=contract_multiplier,
+        spot_base_asset=spot_base_asset,
+        spot_quote_asset=spot_quote_asset,
     )
 
     # --- Basic metrics (backward-compatible) ---

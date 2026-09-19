@@ -77,6 +77,7 @@ from src.core.signal_order_intent import (
     normalize_signal_quantity,
     resolve_signal_order_intent,
 )
+from src.core.strategy_context import RejectionSnapshot
 
 OPS_KILL_SWITCH_STRATEGY_ID = "__ops_kill_switch__"
 
@@ -175,6 +176,9 @@ class ExecutionEngine:
         self.default_quantity = Decimal("0.01")
         self.adapter = adapter
         self.journal = journal
+        self._simulated_matching_rejections: dict[
+            str, tuple[RejectionSnapshot, ...]
+        ] = {}
         self._order_event_apply_lock = threading.RLock()
         self._submission_gate_owner = ExecutionSubmissionGate(
             self._log_submission_drain_callback_failure
@@ -720,6 +724,8 @@ class ExecutionEngine:
                 price = fill["price"]
                 qty = fill["quantity"]
                 fee = fill.get("fee")
+                fee_quantity = fill.get("fee_quantity", fee)
+                fee_asset = fill.get("fee_asset")
                 fill_type = fill.get("fill_type", "MARKET")
 
                 self.logger.info(
@@ -733,7 +739,8 @@ class ExecutionEngine:
                         order=order,
                         fill_price=price,
                         fill_quantity=qty,
-                        fee=fee,
+                        fee=fee_quantity,
+                        fee_asset=fee_asset,
                     )
                 except PositionCachePersistenceError:
                     self._latch_fill_position_cache_failure()
@@ -766,7 +773,25 @@ class ExecutionEngine:
                     error=ExchangeError(reason),
                     phase="simulated_matching",
                 )
+                existing = self._simulated_matching_rejections.get(
+                    order.strategy_id,
+                    (),
+                )
+                self._simulated_matching_rejections[order.strategy_id] = existing + (
+                    RejectionSnapshot(
+                        reason=reason,
+                        timestamp=int(rejection["timestamp"]),
+                        order_id=order.id,
+                    ),
+                )
         return fills
+
+    def pop_simulated_matching_rejections(
+        self,
+        strategy_id: str,
+    ) -> tuple[RejectionSnapshot, ...]:
+        """Return matcher rejections for the next backtest decision snapshot."""
+        return self._simulated_matching_rejections.pop(strategy_id, ())
 
     def process_exchange_order_event(
         self,

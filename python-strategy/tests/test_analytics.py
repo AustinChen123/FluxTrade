@@ -39,6 +39,7 @@ class _MetricsFill:
     side: str
     timestamp: int
     fee: Decimal
+    fee_asset: str | None = None
     fill_sequence: object = None
 
 
@@ -179,6 +180,81 @@ class TestBasicMetrics:
         assert total_pnl == Decimal("0.97")
         assert closed[0].pnl == Decimal("0.97")
         assert closed[0].fee == Decimal("0.03")
+
+    def test_spot_base_asset_fees_adjust_quantity_and_quote_pnl(self):
+        trades = [
+            _MetricsFill(
+                id="buy",
+                product_id="BINANCE:BTCUSDT-SPOT",
+                side="buy",
+                price=Decimal("100"),
+                quantity=Decimal("1"),
+                fee=Decimal("0.01"),
+                fee_asset="BTC",
+                timestamp=1000,
+            ),
+            _MetricsFill(
+                id="sell",
+                product_id="BINANCE:BTCUSDT-SPOT",
+                side="sell",
+                price=Decimal("110"),
+                quantity=Decimal("0.98"),
+                fee=Decimal("0.01"),
+                fee_asset="BTC",
+                timestamp=2000,
+            ),
+        ]
+
+        result = calculate_metrics(
+            trades,
+            spot_base_asset="BTC",
+            spot_quote_asset="USDT",
+        )
+
+        assert result["total_pnl"] == Decimal("7.80")
+        assert result["closed_trades"][0].quantity == Decimal("0.99")
+        assert result["closed_trades"][0].fee == Decimal("2.10")
+        assert result["closed_trades"][0].pnl == Decimal("7.80")
+
+    def test_spot_metrics_reject_unsupported_fee_asset(self):
+        trade = _MetricsFill(
+            id="buy",
+            product_id="BINANCE:BTCUSDT-SPOT",
+            side="buy",
+            price=Decimal("100"),
+            quantity=Decimal("1"),
+            fee=Decimal("0.01"),
+            fee_asset="BNB",
+            timestamp=1000,
+        )
+
+        with pytest.raises(ValueError, match="unsupported spot fee asset: BNB"):
+            calculate_metrics(
+                [trade],
+                spot_base_asset="BTC",
+                spot_quote_asset="USDT",
+            )
+
+    def test_spot_metrics_reject_nonzero_fee_without_asset(self):
+        with pytest.raises(
+            ValueError,
+            match="spot nonzero fee requires an explicit fee asset",
+        ):
+            calculate_metrics(
+                [_make_fill("buy", "100", "1", "0.01", 1000)],
+                spot_base_asset="BTC",
+                spot_quote_asset="USDT",
+            )
+
+    def test_spot_metrics_require_base_and_quote_assets_together(self):
+        with pytest.raises(
+            ValueError,
+            match="spot base and quote assets must be provided together",
+        ):
+            calculate_metrics(
+                [_make_fill("buy", "100", "1", "0", 1000)],
+                spot_base_asset="BTC",
+            )
 
     def test_trade_sharpe(self):
         trades = _round_trip(100.0, 110.0, entry_ts=1000, exit_ts=2000) + _round_trip(

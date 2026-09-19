@@ -25,11 +25,19 @@ from src.core.backtest.endpoint_state import build_replay_endpoint_state
 from src.core.backtest.equity import require_strategy_position_scope
 from src.core.backtest.external_funding import (
     ExternalFundingEvent,
+    ExternalFundingTimeline,
     build_external_funding_timeline,
 )
 from src.core.backtest.flow_neutral_performance import (
     FlowNeutralPerformanceTracker,
     return_metric_inputs,
+)
+from src.core.backtest.run_evidence import (
+    BacktestDatasetEvidence,
+    build_backtest_run_provenance,
+    canonical_decision_snapshot,
+    canonical_fill_records,
+    strategy_configuration_contract,
 )
 from src.core.backtest.loader import get_candles_generator
 from src.core.clock import BacktestClock
@@ -83,6 +91,8 @@ class ResearchTrade:
     fee: Decimal
     timestamp: int
     strategy_id: Optional[str] = None
+    fee_asset: str | None = None
+    fill_sequence: int | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -204,9 +214,52 @@ class ResearchBacktestRunner:
         end_timestamp: int | None = None
         halted_early = False
         recorded_funding_count = 0
+        configuration_contract = {
+            "start_time": self.start_time,
+            "end_time": self.end_time,
+            "product_id": self.product_id,
+            "timeframe": self.timeframe,
+            "initial_balance": Decimal(str(self.initial_balance)),
+            "max_drawdown_limit": self.max_drawdown_limit,
+            "fee_config": self.fee_config,
+            "instrument_spec": self.instrument_spec,
+            "spot_fee_asset": self.spot_fee_asset,
+            "external_funding_events": self.external_funding_events,
+            "external_funding_account_id": self.external_funding_account_id,
+            "strategies": strategy_configuration_contract(self._strategies),
+        }
+        runner_configuration_contract = {
+            **configuration_contract,
+            "runner_kind": "research",
+            "balance_check_interval": self.balance_check_interval,
+            "prepared_scaled_candles": self.prepared_scaled_candles is not None,
+            "precision_codec": self.precision_codec,
+            "capital_allocator": (
+                None
+                if self.capital_allocator is None
+                else {
+                    "total_balance": self.capital_allocator.total_balance,
+                    "allocations": {
+                        strategy.strategy_id: self.capital_allocator.get_allocation(
+                            strategy.strategy_id
+                        )
+                        for strategy in self._strategies
+                    },
+                    "used": {
+                        strategy.strategy_id: self.capital_allocator.get_used(
+                            strategy.strategy_id
+                        )
+                        for strategy in self._strategies
+                    },
+                }
+            ),
+        }
+        dataset_evidence = BacktestDatasetEvidence()
+        decision_snapshots: list[dict[str, object]] = []
 
         candle_count = 0
         for candle, prepared_candle in self._iter_replay_candles(adapter):
+            dataset_evidence.observe(candle)
             self.clock.set_time(candle.timestamp / 1000)
 
             if prepared_candle is None:
@@ -261,6 +314,7 @@ class ResearchBacktestRunner:
                     peak_equity_by_strategy=peak_equity_by_strategy,
                     max_drawdown_by_strategy=max_drawdown_by_strategy,
                 )
+                decision_snapshots.append(canonical_decision_snapshot(context))
                 contexts.append(context)
                 signals = self._signals_from_strategy(
                     strategy,
@@ -379,9 +433,7 @@ class ResearchBacktestRunner:
             halted_early=halted_early,
         )
         flow_neutral_performance = (
-            performance_tracker.report()
-            if performance_tracker is not None
-            else None
+            performance_tracker.report() if performance_tracker is not None else None
         )
         cash_spot_account_snapshot = (
             adapter.get_cash_spot_account_snapshot(final_mark)
@@ -405,7 +457,18 @@ class ResearchBacktestRunner:
             initial_balance=self.initial_balance,
             contract_multiplier=self.contract_multiplier,
             equity_samples=equity_samples,
+            spot_base_asset=(
+                self.instrument_spec.base
+                if adapter.is_cash_spot_settlement and self.instrument_spec is not None
+                else None
+            ),
+            spot_quote_asset=(
+                self.instrument_spec.quote
+                if adapter.is_cash_spot_settlement and self.instrument_spec is not None
+                else None
+            ),
         )
+        fill_records = canonical_fill_records(trades)
         if flow_neutral_performance is not None:
             metrics.update(flow_neutral_performance.metric_fields())
             if flow_neutral_performance.net_pnl is not None:
@@ -482,6 +545,21 @@ class ResearchBacktestRunner:
                 funding_timeline.checkpoint() if funding_timeline is not None else None
             ),
             "yearly_time_weighted_returns": daily_return_metrics["yearly_returns"],
+            "fill_records": fill_records,
+            "decision_snapshots": tuple(decision_snapshots),
+            "provenance": build_backtest_run_provenance(
+                runner_kind="research",
+                dataset=dataset_evidence,
+                configuration=configuration_contract,
+                runner_configuration=runner_configuration_contract,
+                program_components=(
+                    type(self),
+                    SimulatedAdapter,
+                    ExternalFundingTimeline,
+                    FlowNeutralPerformanceTracker,
+                    *(type(strategy) for strategy in self._strategies),
+                ),
+            ),
         }
         if flow_neutral_performance is not None:
             result.update(flow_neutral_performance.metric_fields())
@@ -916,8 +994,9 @@ class ResearchBacktestRunner:
                     side=order.side,
                     price=fill["price"],
                     quantity=fill["quantity"],
-                    fee=fill.get("fee") or Decimal("0"),
+                    fee=fill.get("fee_quantity", fill.get("fee")) or Decimal("0"),
                     timestamp=candle.timestamp,
+                    fee_asset=fill.get("fee_asset"),
                 )
             )
         return trades

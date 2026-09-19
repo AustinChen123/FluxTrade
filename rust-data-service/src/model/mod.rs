@@ -14,7 +14,10 @@ pub fn validate_product_id(product_id: &str) -> anyhow::Result<()> {
         anyhow::bail!("Invalid product_id format: {product_id}");
     }
 
-    if let Some(symbol) = instrument.strip_suffix("-PERP") {
+    if let Some(symbol) = instrument
+        .strip_suffix("-SPOT")
+        .or_else(|| instrument.strip_suffix("-PERP"))
+    {
         if !symbol.is_empty()
             && symbol
                 .chars()
@@ -136,7 +139,9 @@ mod tests {
     fn product_id_validation_matrix() {
         for product_id in [
             "BINANCE:BTCUSDT-PERP",
+            "BINANCE:BTCUSDT-SPOT",
             "BACKPACK:SOL_USDC-PERP",
+            "BACKPACK:BTC_USDC-SPOT",
             "RITHMIC:MNQ-202509",
             "CME:ES-202512",
         ] {
@@ -151,6 +156,8 @@ mod tests {
             "rithmic:MNQ-202509",
             "RITHMIC:mnq-202509",
             "RITHMIC::MNQ-202509",
+            "BINANCE:BTC/USDT-SPOT",
+            "BINANCE:-SPOT",
         ] {
             assert!(validate_product_id(product_id).is_err(), "{product_id}");
         }

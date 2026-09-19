@@ -47,6 +47,14 @@ from src.core.backtest.flow_neutral_performance import (
     FlowNeutralPerformanceTracker,
     return_metric_inputs,
 )
+from src.core.backtest.run_evidence import (
+    BacktestDatasetEvidence,
+    BacktestRunProvenance,
+    build_backtest_run_provenance,
+    canonical_decision_snapshot,
+    canonical_fill_records,
+    strategy_configuration_contract,
+)
 from src.core.analytics import (
     ClosedTrade,
     InitialBalanceInput,
@@ -185,12 +193,38 @@ def _write_markdown_report(
     fee_model: FeeModel = FeeModel.PERCENTAGE_NOTIONAL,
     candle_count: int,
     path: Path,
+    provenance: BacktestRunProvenance | None = None,
 ) -> None:
     """Write a markdown summary report."""
     lines: List[str] = []
 
     lines.append("# Backtest Report")
     lines.append("")
+
+    if provenance is not None:
+        lines.append("## Reproducibility")
+        lines.append("")
+        lines.append("| Identity | Value |")
+        lines.append("|----------|-------|")
+        lines.append(
+            f"| Dataset Identity Version | {provenance.dataset_identity_version} |"
+        )
+        lines.append(f"| Dataset SHA-256 | {provenance.dataset_sha256} |")
+        lines.append(f"| Program Version | {provenance.program_version} |")
+        lines.append(f"| Program SHA-256 | {provenance.program_sha256} |")
+        lines.append(f"| Extension Version | {provenance.extension_version} |")
+        lines.append(f"| Extension SHA-256 | {provenance.extension_sha256} |")
+        lines.append(
+            "| Configuration Identity Version | "
+            f"{provenance.configuration_identity_version} |"
+        )
+        lines.append(f"| Configuration SHA-256 | {provenance.configuration_sha256} |")
+        lines.append(
+            "| Runner Configuration SHA-256 | "
+            f"{provenance.runner_configuration_sha256} |"
+        )
+        lines.append(f"| Matching Model | {provenance.matching_model} |")
+        lines.append("")
     lines.append("## Configuration")
     lines.append("")
     lines.append("| Parameter | Value |")
@@ -379,6 +413,7 @@ class BacktestRunner:
         stop_drawdown_amount: Decimal | None,
         funding_timeline: ExternalFundingTimeline | None = None,
         performance_tracker: FlowNeutralPerformanceTracker | None = None,
+        dataset_evidence: BacktestDatasetEvidence | None = None,
     ) -> _ReplayProgress:
         engine = cast(StrategyEngine, self.engine)
         count = 0
@@ -405,6 +440,8 @@ class BacktestRunner:
             else None
         )
         for candle in candles:
+            if dataset_evidence is not None:
+                dataset_evidence.observe(candle)
             # Update Clock
             self.clock.set_time(candle.timestamp / 1000)
 
@@ -528,6 +565,7 @@ class BacktestRunner:
         candle_count: int,
         equity_samples: list[tuple[int, Decimal]] | None = None,
         flow_neutral_performance: FlowNeutralPerformanceReport | None = None,
+        provenance: BacktestRunProvenance | None = None,
     ) -> Optional[str]:
         """Write report files to output_dir. Returns output directory path."""
         cfg = self.report_config
@@ -572,6 +610,7 @@ class BacktestRunner:
                 fee_config=self.fee_config,
                 fee_model=self.fee_model,
                 candle_count=candle_count,
+                provenance=provenance,
                 path=output_dir / "report.md",
             )
 
@@ -638,6 +677,27 @@ class BacktestRunner:
         context_max_drawdown = {
             strategy.strategy_id: Decimal("0") for strategy in self._strategies_buffer
         }
+        configuration_contract = {
+            "start_time": self.start_time,
+            "end_time": self.end_time,
+            "product_id": self.product_id,
+            "timeframe": self.timeframe,
+            "initial_balance": self.initial_balance,
+            "max_drawdown_limit": self.max_drawdown_limit,
+            "fee_config": self.fee_config,
+            "instrument_spec": self.instrument_spec,
+            "spot_fee_asset": self.spot_fee_asset,
+            "external_funding_events": self.external_funding_events,
+            "external_funding_account_id": self.external_funding_account_id,
+            "strategies": strategy_configuration_contract(self._strategies_buffer),
+        }
+        runner_configuration_contract = {
+            **configuration_contract,
+            "runner_kind": "full",
+            "execution_timeframe": self.execution_timeframe,
+        }
+        dataset_evidence = BacktestDatasetEvidence()
+        decision_snapshots: list[dict[str, object]] = []
 
         def strategy_context_loader(
             strategy: BaseStrategy,
@@ -645,6 +705,7 @@ class BacktestRunner:
             latest_fills: tuple[dict, ...],
         ) -> StrategyContext:
             strategy_id = strategy.strategy_id
+            engine = cast(StrategyEngine, self.engine)
             context = adapter.get_strategy_context(
                 strategy_id=strategy_id,
                 product_id=candle.product_id,
@@ -654,6 +715,11 @@ class BacktestRunner:
                 peak_equity=context_peak_equity[strategy_id],
                 max_drawdown=context_max_drawdown[strategy_id],
                 latest_fills=list(latest_fills),
+                latest_rejections=(
+                    engine.execution_engine.pop_simulated_matching_rejections(
+                        strategy_id
+                    )
+                ),
             )
             peak_equity = max(
                 context_peak_equity[strategy_id],
@@ -673,12 +739,15 @@ class BacktestRunner:
                 context.current_drawdown == current_drawdown
                 and context.max_drawdown == max_drawdown
             ):
-                return context
-            return replace(
-                context,
-                current_drawdown=current_drawdown,
-                max_drawdown=max_drawdown,
-            )
+                decision_context = context
+            else:
+                decision_context = replace(
+                    context,
+                    current_drawdown=current_drawdown,
+                    max_drawdown=max_drawdown,
+                )
+            decision_snapshots.append(canonical_decision_snapshot(decision_context))
+            return decision_context
 
         # 4. Setup repo (trade recording only) and account service
         repo = BacktestOrderRepository(
@@ -747,6 +816,7 @@ class BacktestRunner:
                 stop_drawdown_amount,
                 funding_timeline,
                 performance_tracker,
+                dataset_evidence,
             )
         else:
             with self._db_session_factory() as db_session:
@@ -763,6 +833,7 @@ class BacktestRunner:
                     stop_drawdown_amount,
                     funding_timeline,
                     performance_tracker,
+                    dataset_evidence,
                 )
 
         endpoint_state = build_replay_endpoint_state(
@@ -773,9 +844,7 @@ class BacktestRunner:
             halted_early=progress.halted_early,
         )
         flow_neutral_performance = (
-            performance_tracker.report()
-            if performance_tracker is not None
-            else None
+            performance_tracker.report() if performance_tracker is not None else None
         )
         cash_spot_account_snapshot = (
             adapter.get_cash_spot_account_snapshot(progress.final_mark)
@@ -791,8 +860,7 @@ class BacktestRunner:
             and flow_neutral_performance.net_pnl is not None
             else (
                 adapter.get_total_equity(progress.final_mark) - self.initial_balance
-                if adapter.is_cash_spot_settlement
-                and progress.final_mark is not None
+                if adapter.is_cash_spot_settlement and progress.final_mark is not None
                 else final_balance - self.initial_balance
             )
         )
@@ -820,14 +888,25 @@ class BacktestRunner:
                 initial_balance=self.initial_balance,
                 contract_multiplier=self.contract_multiplier,
                 equity_samples=progress.equity_samples,
+                spot_base_asset=(
+                    self.instrument_spec.base
+                    if adapter.is_cash_spot_settlement
+                    and self.instrument_spec is not None
+                    else None
+                ),
+                spot_quote_asset=(
+                    self.instrument_spec.quote
+                    if adapter.is_cash_spot_settlement
+                    and self.instrument_spec is not None
+                    else None
+                ),
             )
+            fill_records = canonical_fill_records(trades)
             if flow_neutral_performance is not None:
                 metrics.update(flow_neutral_performance.metric_fields())
                 if flow_neutral_performance.net_pnl is not None:
                     metrics["total_pnl"] = flow_neutral_performance.net_pnl
-                    metrics["mark_to_market_pnl"] = (
-                        flow_neutral_performance.net_pnl
-                    )
+                    metrics["mark_to_market_pnl"] = flow_neutral_performance.net_pnl
 
             # Per-strategy metrics
             per_strategy = self._compute_per_strategy_metrics(trades)
@@ -846,6 +925,21 @@ class BacktestRunner:
 
             db_session.commit()
 
+        provenance = build_backtest_run_provenance(
+            runner_kind="full",
+            dataset=dataset_evidence,
+            configuration=configuration_contract,
+            runner_configuration=runner_configuration_contract,
+            program_components=(
+                type(self),
+                StrategyEngine,
+                SimulatedAdapter,
+                ExternalFundingTimeline,
+                FlowNeutralPerformanceTracker,
+                *(type(strategy) for strategy in self._strategies_buffer),
+            ),
+        )
+
         # Export reports
         report_dir = self._export_reports(
             metrics,
@@ -853,6 +947,7 @@ class BacktestRunner:
             candle_count=progress.candle_count,
             equity_samples=progress.equity_samples,
             flow_neutral_performance=flow_neutral_performance,
+            provenance=provenance,
         )
 
         logger.info(
@@ -884,6 +979,7 @@ class BacktestRunner:
             "max_consecutive_wins": int(metrics.get("max_consecutive_wins", 0)),
             "max_consecutive_losses": int(metrics.get("max_consecutive_losses", 0)),
             "monthly_returns": metrics.get("monthly_returns", {}),
+            "closed_trades": metrics.get("closed_trades", []),
             "journal": journal.to_dicts(),
             "journal_count": len(journal),
             "candle_count": progress.candle_count,
@@ -898,6 +994,9 @@ class BacktestRunner:
             "external_funding_checkpoint": (
                 funding_timeline.checkpoint() if funding_timeline is not None else None
             ),
+            "fill_records": fill_records,
+            "decision_snapshots": tuple(decision_snapshots),
+            "provenance": provenance,
         }
         if flow_neutral_performance is not None:
             result.update(flow_neutral_performance.metric_fields())
@@ -968,6 +1067,18 @@ class BacktestRunner:
                     strategy_trades,
                     initial_balance=self.initial_balance,
                     contract_multiplier=self.contract_multiplier,
+                    spot_base_asset=(
+                        self.instrument_spec.base
+                        if self.instrument_spec is not None
+                        and self.instrument_spec.market_type == MarketType.SPOT
+                        else None
+                    ),
+                    spot_quote_asset=(
+                        self.instrument_spec.quote
+                        if self.instrument_spec is not None
+                        and self.instrument_spec.market_type == MarketType.SPOT
+                        else None
+                    ),
                 )
                 strategy_metrics["max_drawdown"] = abs(
                     strategy_metrics.get("max_drawdown", Decimal("0"))

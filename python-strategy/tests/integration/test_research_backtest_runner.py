@@ -26,6 +26,7 @@ from src.core.analytics import (
 )
 from src.core.backtest_runner import BacktestRunner
 from src.core.backtest.external_funding import ExternalFundingEvent
+from src.core.backtest.run_evidence import canonical_decision_snapshot
 from src.core.capital_allocator import CapitalAllocator
 from src.core.data_sources.memory import MemoryDataSource
 from src.core.fast_bar import FastBarReplayRunner, MarketTape, SignalIntent
@@ -566,7 +567,29 @@ def test_full_and_research_runners_use_same_spot_asset_settlement(
     research_result = research_runner.run()
 
     assert full_result is not None
+    assert full_result["decision_snapshots"] == research_result["decision_snapshots"]
+    assert full_result["decision_snapshots"] == tuple(
+        canonical_decision_snapshot(context) for context in full_strategy.contexts
+    )
+    assert research_result["decision_snapshots"] == tuple(
+        canonical_decision_snapshot(context) for context in research_strategy.contexts
+    )
+    assert full_result["fill_records"] == research_result["fill_records"]
+    full_provenance = full_result["provenance"]
+    research_provenance = research_result["provenance"]
+    assert full_provenance.runner_kind == "full"
+    assert research_provenance.runner_kind == "research"
+    assert full_provenance.dataset_sha256 == research_provenance.dataset_sha256
+    assert full_provenance.dataset_candle_count == 3
+    assert full_provenance.configuration_sha256 == (
+        research_provenance.configuration_sha256
+    )
+    assert full_provenance.program_sha256 == research_provenance.program_sha256
+    assert full_provenance.extension_sha256 == research_provenance.extension_sha256
+    assert full_provenance.matching_model == "atomic_whole_order_v1"
+    assert research_provenance.matching_model == "atomic_whole_order_v1"
     assert research_result["raw_trade_count"] == 2
+    assert full_result["closed_trades"] == research_result["closed_trades"]
     assert (
         full_result["total_pnl"] == research_result["total_pnl"] == expected_total_pnl
     )
@@ -609,12 +632,387 @@ def test_full_and_research_runners_use_same_spot_asset_settlement(
     assert full_result["external_contributions"] == Decimal("0")
     assert full_result["total_contributed_capital"] == Decimal("100")
     assert full_result["net_pnl"] == expected_total_pnl
-    assert full_result["ending_nav"] == (
-        Decimal("100") + expected_total_pnl
-    ) / Decimal("100")
+    assert full_result["ending_nav"] == (Decimal("100") + expected_total_pnl) / Decimal(
+        "100"
+    )
     final_position = research_result["endpoint_state"].positions[0]
     assert final_position.quantity == expected_final_quantity
     assert final_position.side == PositionSide.LONG
+
+
+class FinerExecutionSpotProbeStrategy(BaseStrategy):
+    def __init__(self) -> None:
+        super().__init__("finer_execution_spot_probe", "BINANCE:BTCUSDT-SPOT")
+        self.decision_candles: list[Candlestick] = []
+        self.contexts: list[StrategyContext] = []
+
+    @property
+    def requirements(self) -> StrategyRequirements:
+        return StrategyRequirements(self.product_id, "5m", 1)
+
+    def on_candle(
+        self,
+        candle: Candlestick,
+        context: StrategyContext | None = None,
+    ) -> Signal | None:
+        if context is None:
+            raise AssertionError("finer execution probe requires context")
+        self.decision_candles.append(candle)
+        self.contexts.append(context)
+        if len(self.decision_candles) != 1:
+            return None
+        return Signal(
+            strategy_id=self.strategy_id,
+            product_id=self.product_id,
+            timeframe="5m",
+            timestamp=candle.timestamp,
+            type=SignalType.LONG,
+            quantity=Decimal("0.001"),
+        )
+
+
+def test_full_finer_execution_uses_closed_decision_then_later_fill(tmp_path):
+    product_id = "BINANCE:BTCUSDT-SPOT"
+    minute_ms = 60_000
+    candles = [
+        Candlestick(
+            product_id=product_id,
+            timeframe="1m",
+            timestamp=index * minute_ms,
+            open=Decimal("50000") if index < 5 else Decimal("51000"),
+            high=Decimal("50000") if index < 5 else Decimal("51000"),
+            low=Decimal("50000") if index < 5 else Decimal("51000"),
+            close=Decimal("50000") if index < 5 else Decimal("51000"),
+            volume=Decimal("10"),
+        )
+        for index in range(11)
+    ]
+    spec = InstrumentSpec(
+        product_id=product_id,
+        exchange="binance",
+        symbol="BTC/USDT",
+        base="BTC",
+        quote="USDT",
+        quantity_step=Decimal("0.000001"),
+        price_tick=Decimal("0.01"),
+        min_notional=Decimal("1"),
+    )
+    strategy = FinerExecutionSpotProbeStrategy()
+    runner = BacktestRunner(
+        start_time=0,
+        end_time=10 * minute_ms,
+        product_id=product_id,
+        timeframe="5m",
+        execution_timeframe="1m",
+        initial_balance=Decimal("100"),
+        max_drawdown_limit=None,
+        data_source=MemoryDataSource(candles),
+        fee_config={"maker": Decimal("0"), "taker": Decimal("0")},
+        report_config={
+            "csv_trades": False,
+            "markdown_report": True,
+            "equity_curve": False,
+            "journal_export": False,
+            "output_dir": str(tmp_path / "finer-report"),
+        },
+        db_session_factory=_sqlite_backtest_session_factory(tmp_path, product_id),
+        instrument_spec=spec,
+    )
+    runner.add_strategy(strategy)
+
+    result = runner.run()
+
+    assert result is not None
+    assert [candle.timestamp for candle in strategy.decision_candles] == [0, 300_000]
+    assert strategy.decision_candles[0].close == Decimal("50000")
+    assert len(result["fill_records"]) == 1
+    fill = result["fill_records"][0]
+    assert fill.timestamp == 360_000
+    assert fill.price == Decimal("51000")
+    assert fill.timestamp > strategy.decision_candles[0].timestamp
+    assert [len(context.latest_fills) for context in strategy.contexts] == [0, 1]
+    assert len(strategy.contexts[1].latest_fills) == 1
+    assert strategy.contexts[1].latest_fills[0].timestamp == fill.timestamp
+    assert result["decision_snapshots"] == tuple(
+        canonical_decision_snapshot(context) for context in strategy.contexts
+    )
+    assert result["provenance"].dataset_candle_count == 11
+    assert result["provenance"].dataset_first_timestamp == 0
+    assert result["provenance"].dataset_last_timestamp == 10 * minute_ms
+    report = (tmp_path / "finer-report" / "report.md").read_text()
+    for identity in (
+        result["provenance"].dataset_sha256,
+        result["provenance"].program_sha256,
+        result["provenance"].extension_sha256,
+        result["provenance"].configuration_sha256,
+    ):
+        assert identity in report
+
+
+class SpotPendingFundingProbeStrategy(BaseStrategy):
+    def __init__(self) -> None:
+        super().__init__("spot_pending_funding_probe", "BINANCE:BTCUSDT-SPOT")
+        self._submitted = False
+        self.contexts: list[StrategyContext] = []
+
+    @property
+    def requirements(self) -> StrategyRequirements:
+        return StrategyRequirements(self.product_id, TIMEFRAME, 1)
+
+    def on_candle(
+        self,
+        candle: Candlestick,
+        context: StrategyContext | None = None,
+    ) -> Signal | None:
+        if context is None:
+            raise AssertionError("pending funding probe requires context")
+        self.contexts.append(context)
+        if self._submitted:
+            return None
+        self._submitted = True
+        return Signal(
+            strategy_id=self.strategy_id,
+            product_id=self.product_id,
+            timeframe=TIMEFRAME,
+            timestamp=candle.timestamp,
+            type=SignalType.LONG,
+            quantity=Decimal("0.0001"),
+            price=Decimal("40000"),
+        )
+
+
+def test_spot_pending_endpoint_and_fresh_replay_recovery_are_runner_exact(tmp_path):
+    product_id = "BINANCE:BTCUSDT-SPOT"
+    candles = [
+        Candlestick(
+            product_id=product_id,
+            timeframe=TIMEFRAME,
+            timestamp=index * INTERVAL_MS,
+            open=Decimal("50000"),
+            high=Decimal("50000"),
+            low=Decimal("50000"),
+            close=Decimal("50000"),
+            volume=Decimal("10"),
+        )
+        for index in range(3)
+    ]
+    spec = InstrumentSpec(
+        product_id=product_id,
+        exchange="binance",
+        symbol="BTC/USDT",
+        base="BTC",
+        quote="USDT",
+        quantity_step=Decimal("0.000001"),
+        price_tick=Decimal("0.01"),
+        min_notional=Decimal("1"),
+    )
+    event = ExternalFundingEvent(
+        event_id="pending-replay-funding",
+        account_id="research-account",
+        asset="USDT",
+        amount=Decimal("50"),
+        available_at=INTERVAL_MS,
+        source="test-schedule",
+    )
+    common = {
+        "start_time": 0,
+        "end_time": 2 * INTERVAL_MS,
+        "product_id": product_id,
+        "timeframe": TIMEFRAME,
+        "initial_balance": Decimal("100"),
+        "fee_config": {"maker": Decimal("0"), "taker": Decimal("0")},
+        "instrument_spec": spec,
+        "external_funding_events": (event, event),
+        "external_funding_account_id": "research-account",
+    }
+    full_strategy = SpotPendingFundingProbeStrategy()
+    full = BacktestRunner(
+        **common,
+        data_source=MemoryDataSource(candles),
+        max_drawdown_limit=None,
+        report_config={
+            "csv_trades": False,
+            "markdown_report": False,
+            "equity_curve": False,
+            "journal_export": False,
+        },
+        db_session_factory=_sqlite_backtest_session_factory(tmp_path, product_id),
+    )
+    full.add_strategy(full_strategy)
+    research_strategy = SpotPendingFundingProbeStrategy()
+    research = ResearchBacktestRunner(
+        **common,
+        data_source=MemoryDataSource(candles),
+    )
+    research.add_strategy(research_strategy)
+
+    full_result = full.run()
+    research_result = research.run()
+
+    assert full_result is not None
+    assert full_result["fill_records"] == research_result["fill_records"] == ()
+    assert full_result["endpoint_state"] == research_result["endpoint_state"]
+    assert len(full_result["endpoint_state"].working_orders) == 1
+    assert full_result["endpoint_state"].working_orders[0].price == Decimal("40000")
+    assert (
+        full_result["cash_spot_account_snapshot"]
+        == research_result["cash_spot_account_snapshot"]
+    )
+    snapshot = full_result["cash_spot_account_snapshot"]
+    assert snapshot.quote_total == Decimal("150")
+    assert snapshot.quote_reserved == Decimal("4")
+    assert snapshot.quote_available == Decimal("146")
+    assert (
+        full_result["external_funding_checkpoint"]
+        == research_result["external_funding_checkpoint"]
+    )
+    assert full_result["external_funding_checkpoint"].applied_event_ids == (
+        "pending-replay-funding",
+    )
+    assert full_result["decision_snapshots"] == research_result["decision_snapshots"]
+    assert full_result["decision_snapshots"] == tuple(
+        canonical_decision_snapshot(item) for item in full_strategy.contexts
+    )
+
+    replay = ResearchBacktestRunner(
+        **common,
+        data_source=MemoryDataSource(candles),
+    )
+    replay.add_strategy(SpotPendingFundingProbeStrategy())
+    replay_result = replay.run()
+
+    for key in (
+        "fill_records",
+        "endpoint_state",
+        "cash_spot_account_snapshot",
+        "external_funding_applications",
+        "external_funding_checkpoint",
+        "flow_neutral_performance",
+    ):
+        assert replay_result[key] == research_result[key]
+    assert replay_result["provenance"] == research_result["provenance"]
+
+
+class SpotGapRejectionProbeStrategy(BaseStrategy):
+    def __init__(self) -> None:
+        super().__init__("spot_gap_rejection_probe", "BINANCE:BTCUSDT-SPOT")
+        self._submitted = False
+        self.contexts: list[StrategyContext] = []
+
+    @property
+    def requirements(self) -> StrategyRequirements:
+        return StrategyRequirements(self.product_id, TIMEFRAME, 1)
+
+    def on_candle(
+        self,
+        candle: Candlestick,
+        context: StrategyContext | None = None,
+    ) -> Signal | None:
+        if context is None:
+            raise AssertionError("gap rejection probe requires context")
+        self.contexts.append(context)
+        if self._submitted:
+            return None
+        self._submitted = True
+        return Signal(
+            strategy_id=self.strategy_id,
+            product_id=self.product_id,
+            timeframe=TIMEFRAME,
+            timestamp=candle.timestamp,
+            type=SignalType.LONG,
+            quantity=Decimal("0.001"),
+        )
+
+
+def test_spot_gap_rejection_and_same_timestamp_funding_reach_both_contexts(
+    tmp_path,
+):
+    product_id = "BINANCE:BTCUSDT-SPOT"
+    candles = [
+        Candlestick(
+            product_id=product_id,
+            timeframe=TIMEFRAME,
+            timestamp=index * INTERVAL_MS,
+            open=price,
+            high=price,
+            low=price,
+            close=price,
+            volume=Decimal("10"),
+        )
+        for index, price in enumerate(
+            (Decimal("90000"), Decimal("110000"), Decimal("110000"))
+        )
+    ]
+    spec = InstrumentSpec(
+        product_id=product_id,
+        exchange="binance",
+        symbol="BTC/USDT",
+        base="BTC",
+        quote="USDT",
+        quantity_step=Decimal("0.000001"),
+        price_tick=Decimal("0.01"),
+        min_notional=Decimal("1"),
+    )
+    event = ExternalFundingEvent(
+        event_id="gap-rejection-funding",
+        account_id="research-account",
+        asset="USDT",
+        amount=Decimal("50"),
+        available_at=INTERVAL_MS,
+        source="test-schedule",
+    )
+    common = {
+        "start_time": 0,
+        "end_time": 2 * INTERVAL_MS,
+        "product_id": product_id,
+        "timeframe": TIMEFRAME,
+        "initial_balance": Decimal("100"),
+        "fee_config": {"maker": Decimal("0.001"), "taker": Decimal("0.001")},
+        "instrument_spec": spec,
+        "external_funding_events": (event,),
+        "external_funding_account_id": "research-account",
+    }
+    full_strategy = SpotGapRejectionProbeStrategy()
+    full = BacktestRunner(
+        **common,
+        data_source=MemoryDataSource(candles),
+        max_drawdown_limit=None,
+        report_config={
+            "csv_trades": False,
+            "markdown_report": False,
+            "equity_curve": False,
+            "journal_export": False,
+        },
+        db_session_factory=_sqlite_backtest_session_factory(tmp_path, product_id),
+    )
+    full.add_strategy(full_strategy)
+    research_strategy = SpotGapRejectionProbeStrategy()
+    research = ResearchBacktestRunner(
+        **common,
+        data_source=MemoryDataSource(candles),
+    )
+    research.add_strategy(research_strategy)
+
+    full_result = full.run()
+    research_result = research.run()
+
+    assert full_result is not None
+    assert full_result["decision_snapshots"] == research_result["decision_snapshots"]
+    assert [len(item.latest_rejections) for item in full_strategy.contexts] == [0, 1, 0]
+    assert "insufficient available USDT at fill" in (
+        full_strategy.contexts[1].latest_rejections[0].reason
+    )
+    assert full_result["fill_records"] == research_result["fill_records"] == ()
+    assert full_result["endpoint_state"] == research_result["endpoint_state"]
+    assert (
+        full_result["cash_spot_account_snapshot"]
+        == research_result["cash_spot_account_snapshot"]
+    )
+    snapshot = full_result["cash_spot_account_snapshot"]
+    assert snapshot.quote_total == Decimal("150")
+    assert snapshot.quote_available == Decimal("150")
+    assert snapshot.quote_reserved == Decimal("0")
+    assert snapshot.base_total == Decimal("0")
 
 
 def test_full_and_research_runners_apply_same_external_funding_contract(tmp_path):
@@ -738,12 +1136,8 @@ def test_full_and_research_runners_apply_same_external_funding_contract(tmp_path
     assert full_result["ending_nav"] == Decimal("1")
     assert full_result["unitized_max_drawdown"] == Decimal("0")
     assert full_result["duration_milliseconds"] == 2 * INTERVAL_MS
-    assert {
-        key: full_result[key]
-        for key in performance.metric_fields()
-    } == {
-        key: research_result[key]
-        for key in performance.metric_fields()
+    assert {key: full_result[key] for key in performance.metric_fields()} == {
+        key: research_result[key] for key in performance.metric_fields()
     }
     assert (
         full_result["yearly_time_weighted_returns"]

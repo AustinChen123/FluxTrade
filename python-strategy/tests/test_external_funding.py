@@ -43,6 +43,20 @@ def _event(
     )
 
 
+def _flat_candle(timestamp: int, price: str = "50000") -> Candlestick:
+    value = Decimal(price)
+    return Candlestick(
+        product_id="BINANCE:BTCUSDT-SPOT",
+        timeframe="1m",
+        timestamp=timestamp,
+        open=value,
+        high=value,
+        low=value,
+        close=value,
+        volume=Decimal("10"),
+    )
+
+
 @pytest.mark.parametrize(
     ("changes", "error_type", "message"),
     [
@@ -141,11 +155,14 @@ def test_timeline_applies_once_in_canonical_order_and_preserves_reservation(
     )
     adapter.place_order(order)
 
-    assert timeline.apply_due(
-        adapter,
-        timestamp=99,
-        mark_price=Decimal("50"),
-    ) == ()
+    assert (
+        timeline.apply_due(
+            adapter,
+            timestamp=99,
+            mark_price=Decimal("50"),
+        )
+        == ()
+    )
     applications = timeline.apply_due(
         adapter,
         timestamp=200,
@@ -164,11 +181,14 @@ def test_timeline_applies_once_in_canonical_order_and_preserves_reservation(
     assert adapter.get_asset_balance("USDT", "total") == Decimal("150")
     assert adapter.get_asset_balance("USDT", "reserved") == Decimal("60")
     assert adapter.get_asset_balance("USDT", "available") == Decimal("90")
-    assert timeline.apply_due(
-        adapter,
-        timestamp=200,
-        mark_price=Decimal("50"),
-    ) == ()
+    assert (
+        timeline.apply_due(
+            adapter,
+            timestamp=200,
+            mark_price=Decimal("50"),
+        )
+        == ()
+    )
     with pytest.raises(ValueError, match="timestamps must be non-decreasing"):
         timeline.apply_due(
             adapter,
@@ -242,3 +262,125 @@ def test_adapter_matches_existing_order_before_same_timestamp_funding(
     assert adapter.get_asset_balance("BTC", "total") == Decimal("0")
     assert adapter.get_asset_balance("USDT", "total") == Decimal("100")
     assert timeline.checkpoint().applied_event_ids == ("event-1",)
+
+
+@pytest.mark.parametrize("cash_state", ["sufficient", "insufficient"])
+@pytest.mark.parametrize("prior_state", ["none", "pending", "partial"])
+@pytest.mark.parametrize("with_funding", [False, True])
+@pytest.mark.parametrize("terminal_action", ["fill", "reject", "cancel"])
+def test_spot_funding_state_matrix_preserves_matcher_owned_assets(
+    order_factory,
+    cash_state,
+    prior_state,
+    with_funding,
+    terminal_action,
+):
+    """Cover account states without inventing volume-based partial fills.
+
+    ``partial`` is the documented preflight case: a filled buy followed by a
+    smaller filled sell, leaving partially reduced inventory. The simulated
+    matcher remains atomic-whole-order, which is recorded in run provenance.
+    """
+    initial_quote = Decimal("100") if cash_state == "sufficient" else Decimal("20")
+    funding = Decimal("30") if with_funding else Decimal("0")
+    timeline = ExternalFundingTimeline(
+        [_event("matrix-funding", amount="30", available_at=30)]
+        if with_funding
+        else [],
+        account_id="research-account",
+        quote_asset="USDT",
+        start_time=0,
+    )
+    adapter = SimulatedAdapter(initial_quote, instrument_spec=_spot_spec())
+
+    if prior_state == "pending":
+        pending = order_factory(
+            product_id="BINANCE:BTCUSDT-SPOT",
+            order_type="limit",
+            side="buy",
+            quantity=Decimal("0.0002"),
+            price=Decimal("40000"),
+        )
+        adapter.place_order(pending)
+    elif prior_state == "partial":
+        buy = order_factory(
+            product_id="BINANCE:BTCUSDT-SPOT",
+            order_type="market",
+            side="buy",
+            quantity=Decimal("0.0004"),
+            price=None,
+        )
+        buy.min_notional_reference_price = Decimal("50000")
+        adapter.place_order(buy)
+        assert len(adapter.on_market_data(_flat_candle(10))) == 1
+        sell = order_factory(
+            product_id="BINANCE:BTCUSDT-SPOT",
+            order_type="market",
+            side="sell",
+            quantity=Decimal("0.0002"),
+            price=None,
+        )
+        sell.min_notional_reference_price = Decimal("50000")
+        adapter.place_order(sell)
+        assert len(adapter.on_market_data(_flat_candle(20))) == 1
+
+    applications = timeline.apply_due(
+        adapter,
+        timestamp=30,
+        mark_price=Decimal("50000"),
+    )
+    assert len(applications) == int(with_funding)
+
+    if terminal_action == "fill":
+        target = order_factory(
+            product_id="BINANCE:BTCUSDT-SPOT",
+            order_type="market",
+            side="buy",
+            quantity=Decimal("0.0001"),
+            price=None,
+        )
+        target.min_notional_reference_price = Decimal("50000")
+        adapter.place_order(target)
+        assert len(adapter.on_market_data(_flat_candle(40))) == 1
+        assert adapter.drain_order_rejections() == []
+    elif terminal_action == "reject":
+        available_base = adapter.get_asset_balance("BTC", "available")
+        target = order_factory(
+            product_id="BINANCE:BTCUSDT-SPOT",
+            order_type="market",
+            side="sell",
+            quantity=available_base + Decimal("0.0001"),
+            price=None,
+        )
+        target.min_notional_reference_price = Decimal("50000")
+        adapter.place_order(target)
+        assert adapter.on_market_data(_flat_candle(40)) == []
+        assert len(adapter.drain_order_rejections()) == 1
+    else:
+        target = order_factory(
+            product_id="BINANCE:BTCUSDT-SPOT",
+            order_type="limit",
+            side="buy",
+            quantity=Decimal("0.0001"),
+            price=Decimal("40000"),
+        )
+        adapter.place_order(target)
+        assert target.exchange_order_id is not None
+        assert adapter.cancel_order(
+            target.exchange_order_id,
+            target.product_id,
+            order_type=target.type,
+        )
+        assert adapter.drain_order_rejections() == []
+
+    snapshot = adapter.get_cash_spot_account_snapshot(Decimal("50000"))
+    assert snapshot.quote_available + snapshot.quote_reserved == snapshot.quote_total
+    assert snapshot.base_available + snapshot.base_reserved == snapshot.base_total
+    assert snapshot.quote_total + snapshot.base_total * Decimal("50000") == (
+        initial_quote + funding
+    )
+    assert snapshot.quote_available >= 0
+    assert snapshot.base_available >= 0
+    checkpoint = timeline.checkpoint()
+    assert checkpoint.applied_event_ids == (("matrix-funding",) if with_funding else ())
+    assert checkpoint.pending_event_ids == ()

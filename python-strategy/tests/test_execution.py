@@ -8982,6 +8982,50 @@ class TestMarketDataProcessing:
         assert adapter.get_position(product_id) is None
         assert engine._reconcile_halt is False
         assert engine._submissions_halted is False
+        strategy_id = mock_order_repo.orders[order_id].strategy_id
+        rejections = engine.pop_simulated_matching_rejections(strategy_id)
+        assert len(rejections) == 1
+        assert rejections[0].order_id == order_id
+        assert "insufficient available USDT at fill" in rejections[0].reason
+        assert engine.pop_simulated_matching_rejections(strategy_id) == ()
+
+    def test_simulated_base_fee_persists_quantity_in_declared_asset(
+        self,
+        mock_db_session,
+        mock_clock,
+        mock_exchange_adapter,
+        mock_order_repo,
+        order_factory,
+        candlestick_factory,
+    ):
+        engine = ExecutionEngine(
+            db_session=mock_db_session,
+            clock=mock_clock,
+            adapter=mock_exchange_adapter,
+            order_repository=mock_order_repo,
+            is_backtest=True,
+        )
+        order = order_factory(status=OrderStatus.SUBMITTED.value)
+        mock_order_repo.add_order(order)
+        mock_exchange_adapter.on_market_data = MagicMock(
+            return_value=[
+                {
+                    "order": order,
+                    "price": Decimal("50000"),
+                    "quantity": Decimal("0.001"),
+                    "fee": Decimal("0.05"),
+                    "fee_quantity": Decimal("0.000001"),
+                    "fee_asset": "BTC",
+                    "fill_type": "MARKET",
+                }
+            ]
+        )
+
+        engine.process_market_data(candlestick_factory(close=Decimal("50000")))
+
+        assert len(mock_order_repo.trades) == 1
+        assert mock_order_repo.trades[0].fee == Decimal("0.000001")
+        assert mock_order_repo.trades[0].fee_asset == "BTC"
 
     def test_journal_failure_preserves_prior_fill_and_cancel_then_stops_batch(
         self,
