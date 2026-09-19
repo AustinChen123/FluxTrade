@@ -27,6 +27,10 @@ from src.core.backtest.external_funding import (
     ExternalFundingEvent,
     build_external_funding_timeline,
 )
+from src.core.backtest.flow_neutral_performance import (
+    FlowNeutralPerformanceTracker,
+    return_metric_inputs,
+)
 from src.core.backtest.loader import get_candles_generator
 from src.core.clock import BacktestClock
 from src.core.conditional_order_intents import (
@@ -173,6 +177,11 @@ class ResearchBacktestRunner:
             spot_fee_asset=self.spot_fee_asset,
             external_funding_timeline=funding_timeline,
         )
+        performance_tracker = (
+            FlowNeutralPerformanceTracker(Decimal(str(self.initial_balance)))
+            if adapter.is_cash_spot_settlement
+            else None
+        )
         self._ensure_capital_allocator_supported(adapter)
         trades: list[ResearchTrade] = []
         stop_drawdown_amount = self._stop_drawdown_amount()
@@ -194,6 +203,7 @@ class ResearchBacktestRunner:
         final_mark: Decimal | None = None
         end_timestamp: int | None = None
         halted_early = False
+        recorded_funding_count = 0
 
         candle_count = 0
         for candle, prepared_candle in self._iter_replay_candles(adapter):
@@ -317,6 +327,18 @@ class ResearchBacktestRunner:
                     else adapter.get_balance()
                 )
             )
+            if performance_tracker is not None:
+                if funding_timeline is not None:
+                    applications = funding_timeline.applications_since(
+                        recorded_funding_count
+                    )
+                    for application in applications:
+                        performance_tracker.record_funding(application)
+                    recorded_funding_count += len(applications)
+                performance_tracker.observe(
+                    timestamp=candle.timestamp,
+                    equity=portfolio_current_equity,
+                )
             equity_samples.append((candle.timestamp, portfolio_current_equity))
             final_mark = candle.close
             end_timestamp = candle.timestamp
@@ -329,11 +351,21 @@ class ResearchBacktestRunner:
                 portfolio_peak_equity - portfolio_current_equity,
             )
             candle_count += 1
-            if (
-                stop_drawdown_amount is not None
-                and self.balance_check_interval > 0
-                and candle_count % self.balance_check_interval == 0
+            flow_drawdown_reached = (
+                performance_tracker is not None
+                and self.max_drawdown_limit is not None
+                and performance_tracker.unitized_max_drawdown
+                >= Decimal(str(self.max_drawdown_limit))
+            )
+            raw_drawdown_reached = (
+                performance_tracker is None
+                and stop_drawdown_amount is not None
                 and portfolio_max_drawdown >= stop_drawdown_amount
+            )
+            if (
+                self.balance_check_interval > 0
+                and candle_count % self.balance_check_interval == 0
+                and (flow_drawdown_reached or raw_drawdown_reached)
             ):
                 logger.warning("Stopping research backtest at drawdown threshold")
                 halted_early = True
@@ -346,24 +378,56 @@ class ResearchBacktestRunner:
             end_timestamp=end_timestamp,
             halted_early=halted_early,
         )
+        flow_neutral_performance = (
+            performance_tracker.report()
+            if performance_tracker is not None
+            else None
+        )
+        cash_spot_account_snapshot = (
+            adapter.get_cash_spot_account_snapshot(final_mark)
+            if adapter.is_cash_spot_settlement and final_mark is not None
+            else None
+        )
         final_balance = adapter.get_balance()
         final_equity = (
             adapter.get_total_equity(final_mark)
             if adapter.is_cash_spot_settlement and final_mark is not None
             else final_balance
         )
-        total_pnl = final_equity - Decimal(str(self.initial_balance))
+        total_pnl = (
+            flow_neutral_performance.net_pnl
+            if flow_neutral_performance is not None
+            and flow_neutral_performance.net_pnl is not None
+            else final_equity - Decimal(str(self.initial_balance))
+        )
         metrics = calculate_metrics(
             trades,
             initial_balance=self.initial_balance,
             contract_multiplier=self.contract_multiplier,
             equity_samples=equity_samples,
         )
-        daily_return_metrics = utc_daily_return_metrics(
+        if flow_neutral_performance is not None:
+            metrics.update(flow_neutral_performance.metric_fields())
+            if flow_neutral_performance.net_pnl is not None:
+                metrics["total_pnl"] = flow_neutral_performance.net_pnl
+                metrics["mark_to_market_pnl"] = flow_neutral_performance.net_pnl
+        (
+            return_samples,
+            return_initial,
+            return_start_time,
+            return_end_time,
+        ) = return_metric_inputs(
             equity_samples,
-            initial_balance=Decimal(str(self.initial_balance)),
-            start_time=self.start_time,
-            end_time=self.end_time,
+            Decimal(str(self.initial_balance)),
+            self.start_time,
+            self.end_time,
+            flow_neutral_performance,
+        )
+        daily_return_metrics = utc_daily_return_metrics(
+            return_samples,
+            initial_balance=return_initial,
+            start_time=return_start_time,
+            end_time=return_end_time,
         )
         daily_return_moments: dict[str, Decimal | int] = {
             name: cast(Decimal | int, daily_return_metrics[name])
@@ -375,7 +439,7 @@ class ResearchBacktestRunner:
                 "sum_fourth",
             )
         }
-        return {
+        result = {
             "total_pnl": total_pnl,
             "mark_to_market_pnl": metrics.get(
                 "mark_to_market_pnl",
@@ -409,13 +473,19 @@ class ResearchBacktestRunner:
             ),
             "report_dir": None,
             "endpoint_state": endpoint_state,
+            "cash_spot_account_snapshot": cash_spot_account_snapshot,
+            "flow_neutral_performance": flow_neutral_performance,
             "external_funding_applications": (
                 funding_timeline.applications if funding_timeline is not None else ()
             ),
             "external_funding_checkpoint": (
                 funding_timeline.checkpoint() if funding_timeline is not None else None
             ),
+            "yearly_time_weighted_returns": daily_return_metrics["yearly_returns"],
         }
+        if flow_neutral_performance is not None:
+            result.update(flow_neutral_performance.metric_fields())
+        return result
 
     def _iter_candles(self) -> Iterable[Candlestick]:
         if self.data_source:

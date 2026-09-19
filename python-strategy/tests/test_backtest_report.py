@@ -6,9 +6,13 @@ from decimal import Decimal
 from src.core.backtest_runner import (
     _write_csv_trades,
     _write_equity_curve,
+    _write_flow_neutral_curve,
     _write_journal,
     _write_markdown_report,
     DEFAULT_REPORT_CONFIG,
+)
+from src.core.backtest.flow_neutral_performance import (
+    FlowNeutralPerformanceTracker,
 )
 from src.core.product_registry import FeeModel
 from src.core.analytics import ClosedTrade
@@ -126,6 +130,27 @@ class TestWriteEquityCurve:
         assert rows[1] == ["0", "0.00"]
         assert rows[4] == ["3", "6.00"]
 
+    def test_writes_timestamped_flow_neutral_evidence(self, tmp_path):
+        tracker = FlowNeutralPerformanceTracker(Decimal("100"))
+        tracker.observe(timestamp=1000, equity=Decimal("100"))
+        tracker.observe(timestamp=2000, equity=Decimal("90"))
+        path = tmp_path / "flow_neutral_curve.csv"
+
+        _write_flow_neutral_curve(tracker.report(), path)
+
+        with open(path) as f:
+            rows = list(csv.reader(f))
+        assert rows[0] == [
+            "timestamp",
+            "phase",
+            "funding_event_id",
+            "equity",
+            "units",
+            "nav",
+        ]
+        assert rows[1] == ["1000", "valuation", "", "100", "100", "1"]
+        assert rows[2] == ["2000", "valuation", "", "90", "100", "0.9"]
+
 
 # ── Journal export ───────────────────────────────────────────────
 
@@ -200,6 +225,31 @@ class TestWriteMarkdownReport:
         content = path.read_text()
         assert "Maker Fee / Contract | 1.25" in content
         assert "Taker Fee / Contract | 1.75" in content
+
+    def test_contains_flow_neutral_performance_section(self, tmp_path):
+        path = tmp_path / "report.md"
+        tracker = FlowNeutralPerformanceTracker(Decimal("100"))
+        tracker.observe(timestamp=1000, equity=Decimal("100"))
+        metrics = _sample_metrics()
+        metrics.update(tracker.report().metric_fields())
+
+        _write_markdown_report(
+            metrics,
+            product_id="BINANCE:BTCUSDT-SPOT",
+            timeframe="1h",
+            initial_balance=Decimal("100"),
+            start_time=1000,
+            end_time=1000,
+            fee_config={},
+            candle_count=1,
+            path=path,
+        )
+
+        content = path.read_text()
+        assert "## Flow-Neutral Performance" in content
+        assert "| Total Contributed Capital | 100 |" in content
+        assert "| Ending NAV | 1 |" in content
+        assert "| Annualized TWR | None |" in content
 
     def test_no_monthly_section_when_empty(self, tmp_path):
         path = tmp_path / "report.md"

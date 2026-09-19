@@ -594,6 +594,24 @@ def test_full_and_research_runners_use_same_spot_asset_settlement(
     assert research_strategy.contexts[1].position is not None
     assert research_strategy.contexts[1].position.quantity == expected_context_quantity
     assert full_result["endpoint_state"] == research_result["endpoint_state"]
+    assert (
+        full_result["cash_spot_account_snapshot"]
+        == research_result["cash_spot_account_snapshot"]
+    )
+    assert (
+        full_result["cash_spot_account_snapshot"].total_equity
+        == Decimal("100") + expected_total_pnl
+    )
+    assert (
+        full_result["flow_neutral_performance"]
+        == research_result["flow_neutral_performance"]
+    )
+    assert full_result["external_contributions"] == Decimal("0")
+    assert full_result["total_contributed_capital"] == Decimal("100")
+    assert full_result["net_pnl"] == expected_total_pnl
+    assert full_result["ending_nav"] == (
+        Decimal("100") + expected_total_pnl
+    ) / Decimal("100")
     final_position = research_result["endpoint_state"].positions[0]
     assert final_position.quantity == expected_final_quantity
     assert final_position.side == PositionSide.LONG
@@ -688,6 +706,49 @@ def test_full_and_research_runners_apply_same_external_funding_contract(tmp_path
     )
     assert full_result["external_funding_checkpoint"].pending_event_ids == ()
     assert full_result["endpoint_state"] == research_result["endpoint_state"]
+    assert full_result["total_pnl"] == research_result["total_pnl"] == Decimal("0")
+    assert (
+        full_result["mark_to_market_pnl"]
+        == research_result["mark_to_market_pnl"]
+        == Decimal("0")
+    )
+    assert (
+        full_result["cash_spot_account_snapshot"]
+        == research_result["cash_spot_account_snapshot"]
+    )
+    final_account = full_result["cash_spot_account_snapshot"]
+    assert final_account.quote_total == Decimal("150")
+    assert final_account.base_total == Decimal("0")
+    assert final_account.total_equity == Decimal("150")
+    assert (
+        full_result["flow_neutral_performance"]
+        == research_result["flow_neutral_performance"]
+    )
+    performance = full_result["flow_neutral_performance"]
+    assert performance.external_contributions == Decimal("50")
+    assert performance.total_contributed_capital == Decimal("150")
+    assert performance.final_equity == Decimal("150")
+    assert performance.net_pnl == Decimal("0")
+    assert performance.ending_nav == Decimal("1")
+    assert performance.time_weighted_return == Decimal("0")
+    assert performance.unitized_max_drawdown == Decimal("0")
+    assert performance.annualized_time_weighted_return == Decimal("0")
+    assert full_result["external_contributions"] == Decimal("50")
+    assert full_result["net_pnl"] == Decimal("0")
+    assert full_result["ending_nav"] == Decimal("1")
+    assert full_result["unitized_max_drawdown"] == Decimal("0")
+    assert full_result["duration_milliseconds"] == 2 * INTERVAL_MS
+    assert {
+        key: full_result[key]
+        for key in performance.metric_fields()
+    } == {
+        key: research_result[key]
+        for key in performance.metric_fields()
+    }
+    assert (
+        full_result["yearly_time_weighted_returns"]
+        == research_result["yearly_time_weighted_returns"]
+    )
 
 
 @pytest.mark.smoke

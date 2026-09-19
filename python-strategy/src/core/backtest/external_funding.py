@@ -181,6 +181,13 @@ class ExternalFundingTimeline:
     def applications(self) -> tuple[ExternalFundingApplication, ...]:
         return tuple(self._applications)
 
+    def applications_since(
+        self, index: int
+    ) -> tuple[ExternalFundingApplication, ...]:
+        if type(index) is not int or index < 0 or index > len(self._applications):
+            raise ValueError("external funding application index is invalid")
+        return tuple(self._applications[index:])
+
     def apply_due(
         self,
         adapter: _CashSpotFundingAdapter,

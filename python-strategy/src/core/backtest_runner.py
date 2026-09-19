@@ -39,7 +39,13 @@ from src.core.backtest.endpoint_state import build_replay_endpoint_state
 from src.core.backtest.equity import PortfolioEquityCalculator
 from src.core.backtest.external_funding import (
     ExternalFundingEvent,
+    ExternalFundingTimeline,
     build_external_funding_timeline,
+)
+from src.core.backtest.flow_neutral_performance import (
+    FlowNeutralPerformanceReport,
+    FlowNeutralPerformanceTracker,
+    return_metric_inputs,
 )
 from src.core.analytics import (
     ClosedTrade,
@@ -137,6 +143,29 @@ def _write_equity_curve(equity_curve: list, path: Path) -> None:
             writer.writerow([i, f"{eq:.2f}"])
 
 
+def _write_flow_neutral_curve(
+    report: FlowNeutralPerformanceReport,
+    path: Path,
+) -> None:
+    """Write timestamped raw equity and unitized NAV evidence."""
+    with open(path, "w", newline="") as f:
+        writer = csv.writer(f)
+        writer.writerow(
+            ["timestamp", "phase", "funding_event_id", "equity", "units", "nav"]
+        )
+        for sample in report.nav_samples:
+            writer.writerow(
+                [
+                    sample.timestamp,
+                    sample.phase,
+                    sample.funding_event_id or "",
+                    str(sample.equity),
+                    str(sample.units),
+                    str(sample.nav),
+                ]
+            )
+
+
 def _write_journal(journal: StrategyJournal, path: Path) -> None:
     """Write journal to JSONL file."""
     with open(path, "w") as f:
@@ -208,6 +237,29 @@ def _write_markdown_report(
     lines.append(f"| Gross Profit | {metrics.get('gross_profit', 0):.2f} |")
     lines.append(f"| Gross Loss | {metrics.get('gross_loss', 0):.2f} |")
     lines.append("")
+
+    if "initial_capital" in metrics:
+        lines.append("## Flow-Neutral Performance")
+        lines.append("")
+        lines.append("| Metric | Value |")
+        lines.append("|--------|-------|")
+        for label, key in (
+            ("Initial Capital", "initial_capital"),
+            ("External Contributions", "external_contributions"),
+            ("Total Contributed Capital", "total_contributed_capital"),
+            ("Final Equity", "final_equity"),
+            ("Net PnL", "net_pnl"),
+            ("Ending Units", "ending_units"),
+            ("Ending NAV", "ending_nav"),
+            ("Time-Weighted Return", "time_weighted_return"),
+            ("Annualized TWR", "annualized_time_weighted_return"),
+            ("Unitized Max Drawdown", "unitized_max_drawdown"),
+            ("Raw Max Drawdown", "raw_max_drawdown"),
+            ("Annualization Seconds", "annualization_seconds"),
+            ("Observed Duration (ms)", "duration_milliseconds"),
+        ):
+            lines.append(f"| {label} | {metrics.get(key)} |")
+        lines.append("")
 
     monthly = metrics.get("monthly_returns", {})
     if monthly:
@@ -325,6 +377,8 @@ class BacktestRunner:
         candles: Iterable,
         mock_account: BacktestAccountService,
         stop_drawdown_amount: Decimal | None,
+        funding_timeline: ExternalFundingTimeline | None = None,
+        performance_tracker: FlowNeutralPerformanceTracker | None = None,
     ) -> _ReplayProgress:
         engine = cast(StrategyEngine, self.engine)
         count = 0
@@ -334,6 +388,7 @@ class BacktestRunner:
         final_mark: Decimal | None = None
         end_timestamp: int | None = None
         halted_early = False
+        recorded_funding_count = 0
         aggregator = (
             CandleAggregator() if self.execution_timeframe is not None else None
         )
@@ -409,20 +464,44 @@ class BacktestRunner:
                         "backtest portfolio equity calculator is unavailable"
                     )
                 current_equity = equity_calculator.value(candle.close)
+            if performance_tracker is not None:
+                if funding_timeline is not None:
+                    applications = funding_timeline.applications_since(
+                        recorded_funding_count
+                    )
+                    for application in applications:
+                        performance_tracker.record_funding(application)
+                    recorded_funding_count += len(applications)
+                performance_tracker.observe(
+                    timestamp=candle.timestamp,
+                    equity=current_equity,
+                )
             equity_samples.append((candle.timestamp, current_equity))
             final_mark = candle.close
             end_timestamp = candle.timestamp
             peak_equity = max(peak_equity, current_equity)
             max_drawdown = max(max_drawdown, peak_equity - current_equity)
             count += 1
-            if (
-                stop_drawdown_amount is not None
+            flow_drawdown_reached = (
+                performance_tracker is not None
+                and self.max_drawdown_limit is not None
+                and performance_tracker.unitized_max_drawdown
+                >= Decimal(str(self.max_drawdown_limit))
+            )
+            raw_drawdown_reached = (
+                performance_tracker is None
+                and stop_drawdown_amount is not None
                 and max_drawdown >= stop_drawdown_amount
-            ):
+            )
+            if flow_drawdown_reached or raw_drawdown_reached:
                 logger.warning(
-                    "STOPPING BACKTEST: Max Drawdown Reached! Drawdown: %s >= %s",
+                    "STOPPING BACKTEST: Max Drawdown Reached! raw=%s unitized=%s",
                     max_drawdown,
-                    stop_drawdown_amount,
+                    (
+                        performance_tracker.unitized_max_drawdown
+                        if performance_tracker is not None
+                        else None
+                    ),
                 )
                 halted_early = True
                 break
@@ -448,6 +527,7 @@ class BacktestRunner:
         journal: StrategyJournal,
         candle_count: int,
         equity_samples: list[tuple[int, Decimal]] | None = None,
+        flow_neutral_performance: FlowNeutralPerformanceReport | None = None,
     ) -> Optional[str]:
         """Write report files to output_dir. Returns output directory path."""
         cfg = self.report_config
@@ -472,6 +552,11 @@ class BacktestRunner:
                 [equity for _, equity in equity_samples],
                 output_dir / "equity_curve.csv",
             )
+            if flow_neutral_performance is not None:
+                _write_flow_neutral_curve(
+                    flow_neutral_performance,
+                    output_dir / "flow_neutral_curve.csv",
+                )
 
         if cfg.get("journal_export") and len(journal) > 0:
             _write_journal(journal, output_dir / "journal.jsonl")
@@ -540,6 +625,11 @@ class BacktestRunner:
             instrument_spec=self.instrument_spec,
             spot_fee_asset=self.spot_fee_asset,
             external_funding_timeline=funding_timeline,
+        )
+        performance_tracker = (
+            FlowNeutralPerformanceTracker(self.initial_balance)
+            if adapter.is_cash_spot_settlement
+            else None
         )
         context_peak_equity = {
             strategy.strategy_id: self.initial_balance
@@ -655,6 +745,8 @@ class BacktestRunner:
                 ),
                 mock_account,
                 stop_drawdown_amount,
+                funding_timeline,
+                performance_tracker,
             )
         else:
             with self._db_session_factory() as db_session:
@@ -669,6 +761,8 @@ class BacktestRunner:
                     candle_gen,
                     mock_account,
                     stop_drawdown_amount,
+                    funding_timeline,
+                    performance_tracker,
                 )
 
         endpoint_state = build_replay_endpoint_state(
@@ -678,13 +772,29 @@ class BacktestRunner:
             end_timestamp=progress.end_timestamp,
             halted_early=progress.halted_early,
         )
+        flow_neutral_performance = (
+            performance_tracker.report()
+            if performance_tracker is not None
+            else None
+        )
+        cash_spot_account_snapshot = (
+            adapter.get_cash_spot_account_snapshot(progress.final_mark)
+            if adapter.is_cash_spot_settlement and progress.final_mark is not None
+            else None
+        )
 
         # Calculate Final PnL
         final_balance = mock_account.get_balance()
         total_pnl = (
-            adapter.get_total_equity(progress.final_mark) - self.initial_balance
-            if adapter.is_cash_spot_settlement and progress.final_mark is not None
-            else final_balance - self.initial_balance
+            flow_neutral_performance.net_pnl
+            if flow_neutral_performance is not None
+            and flow_neutral_performance.net_pnl is not None
+            else (
+                adapter.get_total_equity(progress.final_mark) - self.initial_balance
+                if adapter.is_cash_spot_settlement
+                and progress.final_mark is not None
+                else final_balance - self.initial_balance
+            )
         )
 
         with self._db_session_factory() as db_session:
@@ -711,6 +821,13 @@ class BacktestRunner:
                 contract_multiplier=self.contract_multiplier,
                 equity_samples=progress.equity_samples,
             )
+            if flow_neutral_performance is not None:
+                metrics.update(flow_neutral_performance.metric_fields())
+                if flow_neutral_performance.net_pnl is not None:
+                    metrics["total_pnl"] = flow_neutral_performance.net_pnl
+                    metrics["mark_to_market_pnl"] = (
+                        flow_neutral_performance.net_pnl
+                    )
 
             # Per-strategy metrics
             per_strategy = self._compute_per_strategy_metrics(trades)
@@ -735,6 +852,7 @@ class BacktestRunner:
             journal,
             candle_count=progress.candle_count,
             equity_samples=progress.equity_samples,
+            flow_neutral_performance=flow_neutral_performance,
         )
 
         logger.info(
@@ -772,6 +890,8 @@ class BacktestRunner:
             "report_dir": report_dir,
             "per_strategy": per_strategy,
             "endpoint_state": endpoint_state,
+            "cash_spot_account_snapshot": cash_spot_account_snapshot,
+            "flow_neutral_performance": flow_neutral_performance,
             "external_funding_applications": (
                 funding_timeline.applications if funding_timeline is not None else ()
             ),
@@ -779,11 +899,25 @@ class BacktestRunner:
                 funding_timeline.checkpoint() if funding_timeline is not None else None
             ),
         }
-        daily_return_metrics = utc_daily_return_metrics(
+        if flow_neutral_performance is not None:
+            result.update(flow_neutral_performance.metric_fields())
+        (
+            return_samples,
+            return_initial,
+            return_start_time,
+            return_end_time,
+        ) = return_metric_inputs(
             progress.equity_samples,
-            initial_balance=self.initial_balance,
-            start_time=self.start_time,
-            end_time=self.end_time,
+            self.initial_balance,
+            self.start_time,
+            self.end_time,
+            flow_neutral_performance,
+        )
+        daily_return_metrics = utc_daily_return_metrics(
+            return_samples,
+            initial_balance=return_initial,
+            start_time=return_start_time,
+            end_time=return_end_time,
         )
         daily_return_moments: dict[str, Decimal | int] = {
             name: cast(Decimal | int, daily_return_metrics[name])
@@ -798,6 +932,7 @@ class BacktestRunner:
         result["daily_return_moments"] = daily_return_moments
         result["equity_sample_count"] = daily_return_metrics["equity_sample_count"]
         result["yearly_mark_to_market_returns"] = daily_return_metrics["yearly_returns"]
+        result["yearly_time_weighted_returns"] = daily_return_metrics["yearly_returns"]
         result["annualized_sharpe"] = annualized_sharpe_from_moments(
             daily_return_moments
         )
