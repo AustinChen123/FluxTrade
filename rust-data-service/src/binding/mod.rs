@@ -8,3 +8,4 @@ pub mod rithmic_market;
 #[cfg(feature = "rithmic")]
 pub mod rithmic_order;
 pub mod scaled;
+pub(crate) mod spot_ledger;

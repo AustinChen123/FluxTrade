@@ -23,6 +23,25 @@ impl FeeModel {
 
 use crate::binding::models::{Candlestick, FillEvent, Order, Position};
 use crate::binding::scaled::ScaledCandlestick;
+use crate::binding::spot_ledger::{CashSpotLedger, CashSpotSettlement, SpotFeeAsset};
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SettlementModel {
+    Derivatives,
+    CashSpot,
+}
+
+impl SettlementModel {
+    fn parse(value: &str) -> PyResult<Self> {
+        match value {
+            "derivatives" => Ok(Self::Derivatives),
+            "cash_spot" => Ok(Self::CashSpot),
+            _ => Err(pyo3::exceptions::PyValueError::new_err(format!(
+                "unsupported settlement_model: {value}"
+            ))),
+        }
+    }
+}
 
 struct ExitCandidate {
     order: Order,
@@ -43,6 +62,12 @@ pub struct PyMatchingEngine {
     taker_fee: Decimal,
     contract_multiplier: Decimal,
     fee_model: FeeModel,
+    settlement_model: SettlementModel,
+    spot_ledger: Option<CashSpotLedger>,
+    spot_cost_basis: Decimal,
+    spot_realized_pnl: Decimal,
+    rejections: Vec<HashMap<String, String>>,
+    warnings: Vec<HashMap<String, String>>,
     scaled_price_tick: Option<Decimal>,
     scaled_volume_step: Option<Decimal>,
 }
@@ -50,28 +75,64 @@ pub struct PyMatchingEngine {
 #[pymethods]
 impl PyMatchingEngine {
     #[new]
-    #[pyo3(signature = (initial_balance, maker_fee="0".to_string(), taker_fee="0".to_string(), contract_multiplier="1".to_string(), fee_model="percentage_notional".to_string()))]
+    #[allow(clippy::too_many_arguments)]
+    #[pyo3(signature = (initial_balance, maker_fee="0".to_string(), taker_fee="0".to_string(), contract_multiplier="1".to_string(), fee_model="percentage_notional".to_string(), settlement_model="derivatives".to_string(), base_asset="".to_string(), quote_asset="".to_string(), spot_fee_asset="quote".to_string()))]
     fn new(
         initial_balance: String,
         maker_fee: String,
         taker_fee: String,
         contract_multiplier: String,
         fee_model: String,
+        settlement_model: String,
+        base_asset: String,
+        quote_asset: String,
+        spot_fee_asset: String,
     ) -> PyResult<Self> {
+        let initial_balance = parse_decimal(&initial_balance, "initial_balance")?;
         let contract_multiplier = parse_decimal(&contract_multiplier, "contract_multiplier")?;
         if contract_multiplier <= Decimal::ZERO {
             return Err(pyo3::exceptions::PyValueError::new_err(
                 "contract_multiplier must be positive",
             ));
         }
+        let fee_model = FeeModel::parse(&fee_model)?;
+        let settlement_model = SettlementModel::parse(&settlement_model)?;
+        if settlement_model == SettlementModel::CashSpot && contract_multiplier != Decimal::ONE {
+            return Err(pyo3::exceptions::PyValueError::new_err(
+                "cash_spot contract_multiplier must equal 1",
+            ));
+        }
+        if settlement_model == SettlementModel::CashSpot
+            && fee_model != FeeModel::PercentageNotional
+        {
+            return Err(pyo3::exceptions::PyValueError::new_err(
+                "cash_spot settlement requires percentage_notional fee_model",
+            ));
+        }
+        let spot_ledger = if settlement_model == SettlementModel::CashSpot {
+            let fee_asset = SpotFeeAsset::parse(&spot_fee_asset)
+                .map_err(pyo3::exceptions::PyValueError::new_err)?;
+            Some(
+                CashSpotLedger::new(initial_balance, base_asset, quote_asset, fee_asset)
+                    .map_err(pyo3::exceptions::PyValueError::new_err)?,
+            )
+        } else {
+            None
+        };
         Ok(PyMatchingEngine {
-            balance: parse_decimal(&initial_balance, "initial_balance")?,
+            balance: initial_balance,
             positions: HashMap::new(),
             open_orders: Vec::new(),
             maker_fee: parse_decimal(&maker_fee, "maker_fee")?,
             taker_fee: parse_decimal(&taker_fee, "taker_fee")?,
             contract_multiplier,
-            fee_model: FeeModel::parse(&fee_model)?,
+            fee_model,
+            settlement_model,
+            spot_ledger,
+            spot_cost_basis: Decimal::ZERO,
+            spot_realized_pnl: Decimal::ZERO,
+            rejections: Vec::new(),
+            warnings: Vec::new(),
             scaled_price_tick: None,
             scaled_volume_step: None,
         })
@@ -79,10 +140,37 @@ impl PyMatchingEngine {
 
     #[getter]
     fn balance(&self) -> String {
-        self.balance.to_string()
+        match &self.spot_ledger {
+            Some(ledger) => ledger.quote_available().to_string(),
+            None => self.balance.to_string(),
+        }
     }
 
     fn submit_order(&mut self, order: Order) -> PyResult<String> {
+        if let Some(ledger) = self.spot_ledger.as_mut() {
+            if matches!(order.order_type.as_str(), "MARKET" | "LIMIT") {
+                let fee_rate = if order.order_type == "MARKET" {
+                    self.taker_fee
+                } else {
+                    self.maker_fee
+                };
+                let warning = ledger
+                    .reserve(&order, order.price, fee_rate)
+                    .map_err(pyo3::exceptions::PyValueError::new_err)?;
+                if let Some(reason) = warning {
+                    self.warnings.push(HashMap::from([
+                        ("order_id".to_string(), order.id.clone()),
+                        ("product_id".to_string(), order.product_id.clone()),
+                        ("strategy_id".to_string(), order.strategy_id.clone()),
+                        ("reason".to_string(), reason),
+                    ]));
+                }
+            } else if order.side == "SHORT" {
+                return Err(pyo3::exceptions::PyValueError::new_err(
+                    "cash_spot conditional order cannot protect a short position",
+                ));
+            }
+        }
         let id = order.id.clone();
         self.open_orders.push(order);
         Ok(id)
@@ -90,6 +178,98 @@ impl PyMatchingEngine {
 
     fn get_positions(&self) -> HashMap<String, Position> {
         self.positions.clone()
+    }
+
+    fn drain_rejections(&mut self) -> Vec<HashMap<String, String>> {
+        std::mem::take(&mut self.rejections)
+    }
+
+    fn drain_warnings(&mut self) -> Vec<HashMap<String, String>> {
+        std::mem::take(&mut self.warnings)
+    }
+
+    fn get_asset_balance(&self, asset: &str, balance_type: &str) -> PyResult<String> {
+        let Some(ledger) = &self.spot_ledger else {
+            return Err(pyo3::exceptions::PyValueError::new_err(
+                "asset balances require cash_spot settlement",
+            ));
+        };
+        let value = if asset == ledger.base_asset {
+            match balance_type {
+                "total" => ledger.base_total(),
+                "available" => ledger.base_available(),
+                "reserved" => ledger.base_reserved(),
+                _ => {
+                    return Err(pyo3::exceptions::PyValueError::new_err(
+                        "balance_type must be total, available, or reserved",
+                    ))
+                }
+            }
+        } else if asset == ledger.quote_asset {
+            match balance_type {
+                "total" => ledger.quote_total(),
+                "available" => ledger.quote_available(),
+                "reserved" => ledger.quote_reserved(),
+                _ => {
+                    return Err(pyo3::exceptions::PyValueError::new_err(
+                        "balance_type must be total, available, or reserved",
+                    ))
+                }
+            }
+        } else {
+            return Err(pyo3::exceptions::PyValueError::new_err(format!(
+                "unsupported cash_spot asset: {asset}"
+            )));
+        };
+        Ok(value.to_string())
+    }
+
+    fn cash_spot_account_snapshot(&self, mark_price: String) -> PyResult<HashMap<String, String>> {
+        let Some(ledger) = &self.spot_ledger else {
+            return Err(pyo3::exceptions::PyValueError::new_err(
+                "cash_spot account snapshot requires cash_spot settlement",
+            ));
+        };
+        let mark_price = parse_decimal(&mark_price, "mark_price")?;
+        if mark_price <= Decimal::ZERO {
+            return Err(pyo3::exceptions::PyValueError::new_err(
+                "cash_spot mark_price must be positive",
+            ));
+        }
+        let unrealized_pnl = ledger.base_total() * mark_price - self.spot_cost_basis;
+        Ok(HashMap::from([
+            ("base_asset".to_string(), ledger.base_asset.clone()),
+            ("quote_asset".to_string(), ledger.quote_asset.clone()),
+            ("fee_asset".to_string(), ledger.fee_asset_name().to_string()),
+            ("base_total".to_string(), ledger.base_total().to_string()),
+            (
+                "base_available".to_string(),
+                ledger.base_available().to_string(),
+            ),
+            (
+                "base_reserved".to_string(),
+                ledger.base_reserved().to_string(),
+            ),
+            ("quote_total".to_string(), ledger.quote_total().to_string()),
+            (
+                "quote_available".to_string(),
+                ledger.quote_available().to_string(),
+            ),
+            (
+                "quote_reserved".to_string(),
+                ledger.quote_reserved().to_string(),
+            ),
+            ("cost_basis".to_string(), self.spot_cost_basis.to_string()),
+            (
+                "realized_pnl".to_string(),
+                self.spot_realized_pnl.to_string(),
+            ),
+            ("unrealized_pnl".to_string(), unrealized_pnl.to_string()),
+            (
+                "total_equity".to_string(),
+                (ledger.quote_total() + ledger.base_total() * mark_price).to_string(),
+            ),
+        ]))
     }
 
     /// Get position for a specific strategy and product.
@@ -150,7 +330,13 @@ impl PyMatchingEngine {
     fn cancel_order(&mut self, order_id: String) -> bool {
         let before = self.open_orders.len();
         self.open_orders.retain(|o| o.id != order_id);
-        self.open_orders.len() < before
+        let cancelled = self.open_orders.len() < before;
+        if cancelled {
+            if let Some(ledger) = self.spot_ledger.as_mut() {
+                ledger.release(&order_id);
+            }
+        }
+        cancelled
     }
 }
 
@@ -188,7 +374,24 @@ impl PyMatchingEngine {
             }
 
             let fill_price = candle.open;
-            let fee = self.calculate_fee(fill_price, order.quantity, true);
+            let fee = if self.settlement_model == SettlementModel::CashSpot {
+                match self.settle_spot_order(&order, fill_price, true) {
+                    Ok(settlement) => {
+                        self.update_spot_position(&order, fill_price, settlement);
+                        settlement.fee
+                    }
+                    Err(reason) => {
+                        self.reject_order(&order, candle.timestamp, reason);
+                        continue;
+                    }
+                }
+            } else {
+                let fee = self.calculate_fee(fill_price, order.quantity, true);
+                self.update_position(&order, fill_price);
+                let charged_fee = std::cmp::min(fee, self.balance);
+                self.balance -= charged_fee;
+                fee
+            };
 
             let fill = FillEvent {
                 order_id: order.id.clone(),
@@ -200,9 +403,6 @@ impl PyMatchingEngine {
                 timestamp: candle.timestamp,
                 fill_type: "MARKET".to_string(),
             };
-            self.update_position(&order, fill_price);
-            let fee = std::cmp::min(fee, self.balance);
-            self.balance -= fee;
             self.cancel_linked(&order, &mut cancelled_ids);
             fills.push(fill);
         }
@@ -324,17 +524,37 @@ impl PyMatchingEngine {
         }
 
         for candidate in selected_exit_candidates {
+            let fee = if self.settlement_model == SettlementModel::CashSpot {
+                match self.settle_spot_order(&candidate.order, candidate.fill_price, true) {
+                    Ok(settlement) => {
+                        self.update_spot_position(
+                            &candidate.order,
+                            candidate.fill_price,
+                            settlement,
+                        );
+                        settlement.fee
+                    }
+                    Err(reason) => {
+                        self.reject_order(&candidate.order, candle.timestamp, reason);
+                        continue;
+                    }
+                }
+            } else {
+                self.update_position(&candidate.order, candidate.fill_price);
+                let charged_fee = std::cmp::min(candidate.fee, self.balance);
+                self.balance -= charged_fee;
+                candidate.fee
+            };
             fills.push(FillEvent {
                 order_id: candidate.order.id.clone(),
                 product_id: candidate.order.product_id.clone(),
                 strategy_id: candidate.order.strategy_id.clone(),
                 price: candidate.fill_price,
                 quantity: candidate.order.quantity,
-                fee: candidate.fee,
+                fee,
                 timestamp: candle.timestamp,
                 fill_type: candidate.order.order_type.clone(),
             });
-            self.update_position(&candidate.order, candidate.fill_price);
             let still_protected_position =
                 self.positions
                     .get(&candidate.position_key)
@@ -345,8 +565,6 @@ impl PyMatchingEngine {
             if !still_protected_position {
                 closed_position_sides.insert(candidate.position_key, candidate.protected_side);
             }
-            let charged_fee = std::cmp::min(candidate.fee, self.balance);
-            self.balance -= charged_fee;
             self.cancel_linked(&candidate.order, &mut cancelled_ids);
         }
 
@@ -378,6 +596,11 @@ impl PyMatchingEngine {
             }
         });
         self.open_orders = remaining_orders;
+        if let Some(ledger) = self.spot_ledger.as_mut() {
+            for cancelled_id in cancelled_ids {
+                ledger.release(&cancelled_id);
+            }
+        }
         Ok(fills)
     }
 
@@ -430,7 +653,24 @@ impl PyMatchingEngine {
             return Some(order);
         }
 
-        let fee = self.calculate_fee(order.price, order.quantity, false);
+        let fee = if self.settlement_model == SettlementModel::CashSpot {
+            match self.settle_spot_order(&order, order.price, false) {
+                Ok(settlement) => {
+                    self.update_spot_position(&order, order.price, settlement);
+                    settlement.fee
+                }
+                Err(reason) => {
+                    self.reject_order(&order, candle.timestamp, reason);
+                    return None;
+                }
+            }
+        } else {
+            let fee = self.calculate_fee(order.price, order.quantity, false);
+            self.update_position(&order, order.price);
+            let charged_fee = std::cmp::min(fee, self.balance);
+            self.balance -= charged_fee;
+            fee
+        };
         fills.push(FillEvent {
             order_id: order.id.clone(),
             product_id: order.product_id.clone(),
@@ -441,9 +681,6 @@ impl PyMatchingEngine {
             timestamp: candle.timestamp,
             fill_type: "LIMIT".to_string(),
         });
-        self.update_position(&order, order.price);
-        let charged_fee = std::cmp::min(fee, self.balance);
-        self.balance -= charged_fee;
         self.cancel_linked(&order, cancelled_ids);
         None
     }
@@ -580,10 +817,124 @@ impl PyMatchingEngine {
         } else {
             self.maker_fee
         };
+        if let Some(ledger) = &self.spot_ledger {
+            return match ledger.fee_asset {
+                SpotFeeAsset::Base => quantity * fee,
+                SpotFeeAsset::Quote => price * quantity * fee,
+            };
+        }
         match self.fee_model {
             FeeModel::PercentageNotional => price * quantity * self.contract_multiplier * fee,
             FeeModel::PerContract => quantity * fee,
         }
+    }
+
+    fn settle_spot_order(
+        &mut self,
+        order: &Order,
+        fill_price: Decimal,
+        is_taker: bool,
+    ) -> Result<CashSpotSettlement, String> {
+        let fee_rate = if is_taker {
+            self.taker_fee
+        } else {
+            self.maker_fee
+        };
+        let mut settlement_order = order.clone();
+        if matches!(
+            order.order_type.as_str(),
+            "STOP_LOSS" | "TAKE_PROFIT" | "TRAILING_STOP"
+        ) {
+            if order.side != "LONG" {
+                return Err("cash_spot conditional order cannot close a short position".to_string());
+            }
+            settlement_order.side = "SHORT".to_string();
+        }
+        if settlement_order.side == "SHORT" {
+            let ledger = self
+                .spot_ledger
+                .as_ref()
+                .ok_or_else(|| "cash_spot ledger is unavailable".to_string())?;
+            let fee = match ledger.fee_asset {
+                SpotFeeAsset::Base => order.quantity * fee_rate,
+                SpotFeeAsset::Quote => fill_price * order.quantity * fee_rate,
+            };
+            let required_position = order.quantity
+                + if ledger.fee_asset == SpotFeeAsset::Base {
+                    fee
+                } else {
+                    Decimal::ZERO
+                };
+            let position_key = Self::position_key(&order.strategy_id, &order.product_id);
+            let available_position = self
+                .positions
+                .get(&position_key)
+                .filter(|position| position.side == "LONG")
+                .map_or(Decimal::ZERO, |position| position.quantity);
+            if required_position > available_position {
+                return Err(format!(
+                    "cash_spot insufficient strategy position at fill: required={required_position} available={available_position}"
+                ));
+            }
+        }
+        self.spot_ledger
+            .as_mut()
+            .ok_or_else(|| "cash_spot ledger is unavailable".to_string())?
+            .settle(&settlement_order, fill_price, fee_rate)
+    }
+
+    fn reject_order(&mut self, order: &Order, timestamp: i64, reason: String) {
+        if let Some(ledger) = self.spot_ledger.as_mut() {
+            ledger.release(&order.id);
+        }
+        self.rejections.push(HashMap::from([
+            ("order_id".to_string(), order.id.clone()),
+            ("product_id".to_string(), order.product_id.clone()),
+            ("strategy_id".to_string(), order.strategy_id.clone()),
+            ("timestamp".to_string(), timestamp.to_string()),
+            ("reason".to_string(), reason),
+        ]));
+    }
+
+    fn update_spot_position(
+        &mut self,
+        order: &Order,
+        fill_price: Decimal,
+        settlement: CashSpotSettlement,
+    ) {
+        let key = Self::position_key(&order.strategy_id, &order.product_id);
+        let mut position = self.positions.remove(&key).unwrap_or(Position {
+            product_id: order.product_id.clone(),
+            strategy_id: order.strategy_id.clone(),
+            side: "FLAT".to_string(),
+            quantity: Decimal::ZERO,
+            entry_price: Decimal::ZERO,
+            unrealized_pnl: Decimal::ZERO,
+        });
+
+        if settlement.base_delta > Decimal::ZERO {
+            let acquired_cost = -settlement.quote_delta;
+            let prior_cost = position.quantity * position.entry_price;
+            let new_quantity = position.quantity + settlement.base_delta;
+            position.side = "LONG".to_string();
+            position.quantity = new_quantity;
+            position.entry_price = (prior_cost + acquired_cost) / new_quantity;
+            self.spot_cost_basis += acquired_cost;
+            self.positions.insert(key, position);
+            return;
+        }
+
+        let reduction = -settlement.base_delta;
+        let removed_cost = position.entry_price * reduction;
+        let proceeds = settlement.quote_delta;
+        self.spot_cost_basis -= removed_cost;
+        self.spot_realized_pnl += proceeds - removed_cost;
+        position.quantity -= reduction;
+        if position.quantity > Decimal::ZERO {
+            self.positions.insert(key, position);
+        }
+
+        debug_assert!(fill_price > Decimal::ZERO);
     }
 
     fn position_key(strategy_id: &str, product_id: &str) -> String {
@@ -710,6 +1061,12 @@ mod tests {
             taker_fee: dec!(0.0006),
             contract_multiplier: Decimal::ONE,
             fee_model: FeeModel::PercentageNotional,
+            settlement_model: SettlementModel::Derivatives,
+            spot_ledger: None,
+            spot_cost_basis: Decimal::ZERO,
+            spot_realized_pnl: Decimal::ZERO,
+            rejections: Vec::new(),
+            warnings: Vec::new(),
             scaled_price_tick: None,
             scaled_volume_step: None,
         }
@@ -894,6 +1251,10 @@ mod tests {
             "0".to_string(),
             "1".to_string(),
             "unknown".to_string(),
+            "derivatives".to_string(),
+            "".to_string(),
+            "".to_string(),
+            "quote".to_string(),
         )
         .err()
         .expect("unknown fee model must fail");
@@ -1806,6 +2167,12 @@ mod tests {
             taker_fee: Decimal::ZERO,
             contract_multiplier: Decimal::ONE,
             fee_model: FeeModel::PercentageNotional,
+            settlement_model: SettlementModel::Derivatives,
+            spot_ledger: None,
+            spot_cost_basis: Decimal::ZERO,
+            spot_realized_pnl: Decimal::ZERO,
+            rejections: Vec::new(),
+            warnings: Vec::new(),
             scaled_price_tick: None,
             scaled_volume_step: None,
         };
@@ -1858,6 +2225,10 @@ mod tests {
                 "0".to_string(),
                 multiplier.to_string(),
                 "percentage_notional".to_string(),
+                "derivatives".to_string(),
+                "".to_string(),
+                "".to_string(),
+                "quote".to_string(),
             )
             .err()
             .expect("non-positive multiplier must fail");
@@ -2031,5 +2402,175 @@ mod tests {
         assert_eq!(positions.len(), 2);
         assert!(positions.contains_key(&format!("alpha:{PRODUCT}")));
         assert!(positions.contains_key(&format!("beta:{PRODUCT}")));
+    }
+
+    fn make_spot_engine(
+        initial_quote: Decimal,
+        maker_fee: Decimal,
+        taker_fee: Decimal,
+        fee_asset: &str,
+    ) -> PyMatchingEngine {
+        PyMatchingEngine::new(
+            initial_quote.to_string(),
+            maker_fee.to_string(),
+            taker_fee.to_string(),
+            "1".to_string(),
+            "percentage_notional".to_string(),
+            "cash_spot".to_string(),
+            "BTC".to_string(),
+            "USDT".to_string(),
+            fee_asset.to_string(),
+        )
+        .unwrap()
+    }
+
+    fn make_spot_order(
+        id: &str,
+        side: &str,
+        order_type: &str,
+        reference_price: Decimal,
+        quantity: Decimal,
+    ) -> Order {
+        let mut order = make_order(id, side, order_type, reference_price, quantity);
+        order.product_id = "BINANCE:BTCUSDT-SPOT".to_string();
+        order
+    }
+
+    fn make_spot_candle(open: Decimal) -> Candlestick {
+        let mut candle = make_candle(open, open, open, open);
+        candle.product_id = "BINANCE:BTCUSDT-SPOT".to_string();
+        candle
+    }
+
+    #[test]
+    fn spot_quote_fee_acceptance_sequence_preserves_assets_and_cost_basis() {
+        let mut engine = make_spot_engine(dec!(100), dec!(0.001), dec!(0.001), "quote");
+        let buy = make_spot_order("buy", "LONG", "MARKET", dec!(50000), dec!(0.001));
+        engine.submit_order(buy).unwrap();
+
+        assert_eq!(engine.get_asset_balance("USDT", "total").unwrap(), "100");
+        assert_eq!(
+            engine.get_asset_balance("USDT", "reserved").unwrap(),
+            "50.050000"
+        );
+        assert_eq!(engine.balance(), "49.950000");
+
+        let fills = engine
+            .process_candle_logic(make_spot_candle(dec!(50000)))
+            .unwrap();
+        assert_eq!(fills.len(), 1);
+        assert_eq!(fills[0].fee, dec!(0.050000));
+        assert_eq!(
+            engine.get_asset_balance("USDT", "total").unwrap(),
+            "49.950000"
+        );
+        assert_eq!(engine.get_asset_balance("BTC", "total").unwrap(), "0.001");
+
+        let sell = make_spot_order("sell", "SHORT", "MARKET", dec!(60000), dec!(0.0005));
+        engine.submit_order(sell).unwrap();
+        let fills = engine
+            .process_candle_logic(make_spot_candle(dec!(60000)))
+            .unwrap();
+        assert_eq!(fills.len(), 1);
+        assert_eq!(fills[0].fee, dec!(0.0300000));
+
+        let snapshot = engine
+            .cash_spot_account_snapshot("60000".to_string())
+            .unwrap();
+        assert_eq!(snapshot["quote_total"], "79.9200000");
+        assert_eq!(snapshot["base_total"], "0.0005");
+        assert_eq!(snapshot["cost_basis"], "25.0250000");
+        assert_eq!(snapshot["realized_pnl"], "4.9450000");
+        assert_eq!(snapshot["total_equity"], "109.9200000");
+    }
+
+    #[test]
+    fn spot_gap_rejection_is_full_and_releases_reservation() {
+        let mut engine = make_spot_engine(dec!(100), Decimal::ZERO, dec!(0.001), "quote");
+        let buy = make_spot_order("gap", "LONG", "MARKET", dec!(90000), dec!(0.001));
+        engine.submit_order(buy).unwrap();
+
+        let fills = engine
+            .process_candle_logic(make_spot_candle(dec!(110000)))
+            .unwrap();
+
+        assert!(fills.is_empty());
+        assert!(engine.positions.is_empty());
+        assert_eq!(engine.get_asset_balance("USDT", "total").unwrap(), "100");
+        assert_eq!(
+            engine.get_asset_balance("USDT", "reserved").unwrap(),
+            "0.000000"
+        );
+        let rejections = engine.drain_rejections();
+        assert_eq!(rejections.len(), 1);
+        assert!(rejections[0]["reason"].contains("insufficient available USDT at fill"));
+    }
+
+    #[test]
+    fn spot_pending_orders_reserve_and_cancel_releases_once() {
+        let mut engine = make_spot_engine(dec!(100), Decimal::ZERO, Decimal::ZERO, "quote");
+        let first = make_spot_order("first", "LONG", "LIMIT", dec!(60), dec!(1));
+        engine.submit_order(first).unwrap();
+        let second = make_spot_order("second", "LONG", "LIMIT", dec!(50), dec!(1));
+
+        engine.submit_order(second).unwrap();
+        let warnings = engine.drain_warnings();
+        assert_eq!(warnings.len(), 1);
+        assert!(warnings[0]["reason"].contains("insufficient_available_at_submission"));
+        assert_eq!(engine.balance(), "40");
+        assert!(engine.cancel_order("first".to_string()));
+        assert_eq!(engine.balance(), "100");
+        assert!(!engine.cancel_order("first".to_string()));
+        assert_eq!(engine.balance(), "100");
+        assert!(engine.cancel_order("second".to_string()));
+    }
+
+    #[test]
+    fn cash_spot_sell_rejects_unfunded_inventory_without_locking() {
+        let mut engine = make_spot_engine(dec!(100), Decimal::ZERO, Decimal::ZERO, "quote");
+        let naked_sell = make_spot_order("naked", "SHORT", "MARKET", dec!(50000), dec!(0.001));
+        engine.submit_order(naked_sell).unwrap();
+        assert_eq!(engine.drain_warnings().len(), 1);
+        assert!(engine
+            .process_candle_logic(make_spot_candle(dec!(50000)))
+            .unwrap()
+            .is_empty());
+        assert_eq!(engine.drain_rejections().len(), 1);
+
+        let buy = make_spot_order("buy", "LONG", "MARKET", dec!(50000), dec!(0.001));
+        engine.submit_order(buy).unwrap();
+        engine
+            .process_candle_logic(make_spot_candle(dec!(50000)))
+            .unwrap();
+        let oversell = make_spot_order("oversell", "SHORT", "MARKET", dec!(50000), dec!(0.002));
+        engine.submit_order(oversell).unwrap();
+        assert_eq!(engine.drain_warnings().len(), 1);
+        assert!(engine
+            .process_candle_logic(make_spot_candle(dec!(50000)))
+            .unwrap()
+            .is_empty());
+        assert_eq!(engine.drain_rejections().len(), 1);
+        assert_eq!(engine.get_asset_balance("BTC", "total").unwrap(), "0.001");
+    }
+
+    #[test]
+    fn spot_base_fee_reduces_received_asset_without_quote_drift() {
+        let mut engine = make_spot_engine(dec!(100), Decimal::ZERO, dec!(0.001), "base");
+        let buy = make_spot_order("buy", "LONG", "MARKET", dec!(50000), dec!(0.001));
+        engine.submit_order(buy).unwrap();
+        let fills = engine
+            .process_candle_logic(make_spot_candle(dec!(50000)))
+            .unwrap();
+
+        assert_eq!(fills[0].fee, dec!(0.000001));
+        assert_eq!(engine.get_asset_balance("USDT", "total").unwrap(), "50.000");
+        assert_eq!(
+            engine.get_asset_balance("BTC", "total").unwrap(),
+            "0.000999"
+        );
+        let position = engine
+            .get_position(STRATEGY, "BINANCE:BTCUSDT-SPOT")
+            .unwrap();
+        assert_eq!(position.quantity, dec!(0.000999));
     }
 }
