@@ -44,6 +44,7 @@ def _service(
     summary: dict[str, object] | None = None,
     reconcile_error: Exception | None = None,
     publish_error: Exception | None = None,
+    maintenance_active: bool = False,
 ) -> tuple[RithmicLedgerRecoveryService, MagicMock, MagicMock]:
     reconcile = MagicMock()
     if reconcile_error is not None:
@@ -58,8 +59,27 @@ def _service(
         now_seconds=lambda: 1704067201,
         publish_authoritative_balance=publish,
         logger=logging.getLogger("src.core.engine"),
+        maintenance_active=lambda: maintenance_active,
     )
     return service, reconcile, publish
+
+
+def test_startup_maintenance_defers_without_provider_io(caplog) -> None:
+    service, reconcile, publish = _service(maintenance_active=True)
+
+    with caplog.at_level(logging.INFO, logger="src.core.engine"):
+        result = service.reconcile_startup()
+
+    assert result == {
+        "recoverable_count": 0,
+        "unresolved_count": 1,
+        "verification_blocked_count": 1,
+        "auto_resume_safe": False,
+        "snapshot_error_code": "provider_maintenance_active",
+    }
+    reconcile.assert_not_called()
+    publish.assert_not_called()
+    assert "deferred during Rithmic maintenance" in caplog.text
 
 
 def test_startup_success_returns_original_summary_and_logs_once(caplog):

@@ -25,8 +25,12 @@ class _OrderRuntime:
 def _service(
     *,
     generation: int = 1,
+    baseline_generation: int = 1,
 ) -> tuple[RithmicOrderReconnectService, SimpleNamespace]:
-    adapter = _OrderRuntime(generation)
+    adapter = _OrderRuntime(baseline_generation)
+    adapter.start_order_event_stream.side_effect = (
+        lambda: setattr(adapter.connection_generation, "return_value", 1)
+    )
     dependencies = SimpleNamespace(
         adapter=adapter,
         audit_external_orders=MagicMock(return_value=True),
@@ -51,6 +55,7 @@ def _service(
         logger=logging.getLogger("test.rithmic_order_reconnect"),
     )
     service.on_runtime_started()
+    adapter.connection_generation.return_value = generation
     return service, dependencies
 
 
@@ -73,7 +78,7 @@ def test_generation_read_failure_reconciles_fail_closed() -> None:
         "binding unavailable"
     )
 
-    assert service.reconcile_if_needed() is True
+    assert service.reconcile_if_needed() is False
 
     dependencies.halt_for_reconcile.assert_called_once_with(timeout=30.0)
     dependencies.reconcile_owned_orders.assert_called_once_with("profile", "ACCOUNT")
@@ -81,8 +86,8 @@ def test_generation_read_failure_reconciles_fail_closed() -> None:
         {"recoverable_count": 2, "auto_resume_safe": True}
     )
     dependencies.adapter.start_order_event_stream.assert_called_once_with()
-    dependencies.resume_after_reconcile.assert_called_once_with()
-    assert service.last_generation == 1
+    dependencies.resume_after_reconcile.assert_not_called()
+    assert service.last_generation == 0
     assert service.pending_generation is None
 
 
@@ -158,6 +163,7 @@ def test_restart_failure_preserves_pending_and_next_tick_can_recover() -> None:
     dependencies.resume_after_reconcile.assert_not_called()
 
     dependencies.adapter.start_order_event_stream.side_effect = None
+    dependencies.adapter.connection_generation.return_value = 1
     assert service.reconcile_if_needed() is True
 
     assert dependencies.reconcile_owned_orders.call_count == 2
@@ -177,6 +183,17 @@ def test_runtime_started_atomically_replaces_stale_generation_state() -> None:
 
     assert service.last_generation == 1
     assert service.pending_generation is None
+
+
+def test_disconnected_runtime_baselines_zero_and_reconciles_first_connection() -> None:
+    service, dependencies = _service(generation=0, baseline_generation=0)
+
+    assert service.last_generation == 0
+    dependencies.adapter.connection_generation.return_value = 1
+    assert service.reconcile_if_needed() is True
+
+    dependencies.reconcile_owned_orders.assert_called_once_with("profile", "ACCOUNT")
+    dependencies.resume_after_reconcile.assert_called_once_with()
 
 
 def test_success_preserves_exact_reconnect_order() -> None:

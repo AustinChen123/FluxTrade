@@ -171,6 +171,17 @@ pub(crate) async fn run(
     config: LiveConfig,
     aggregation_source_tx: mpsc::Sender<AggregationSourceEvent>,
 ) -> Result<()> {
+    run_with_clock(config, aggregation_source_tx, chrono::Utc::now).await
+}
+
+async fn run_with_clock<N>(
+    config: LiveConfig,
+    aggregation_source_tx: mpsc::Sender<AggregationSourceEvent>,
+    maintenance_now: N,
+) -> Result<()>
+where
+    N: Fn() -> chrono::DateTime<chrono::Utc> + Send + Sync + 'static,
+{
     let (forward_tx, forward_rx) = mpsc::channel(FORWARD_QUEUE_CAPACITY);
     let (front_month_gate_tx, front_month_gate_rx) = watch::channel(FrontMonthGateState::Idle);
     let product_id = config.product_id.clone();
@@ -193,13 +204,12 @@ pub(crate) async fn run(
     let transport = transport::run_with_reconnect(
         &config.runtime.url,
         config.runtime.login,
-        RESPONSE_TIMEOUT,
-        config.policy,
         config.startup,
         move |preparation| {
             prepare_live_connection(&lifecycle_handler, &forward_tx, &product_id, preparation)
         },
         move |payload| handle_live_payload(&payload_handler, &payload),
+        transport::ReconnectRuntimeConfig::new(RESPONSE_TIMEOUT, config.policy, maintenance_now),
     );
 
     tokio::select! {
@@ -209,11 +219,19 @@ pub(crate) async fn run(
     }
 }
 
-fn handle_live_payload(handler: &Arc<Mutex<LivePayloadHandler>>, payload: &[u8]) -> Result<()> {
-    handler
+fn handle_live_payload(
+    handler: &Arc<Mutex<LivePayloadHandler>>,
+    payload: &[u8],
+) -> Result<transport::PayloadOutcome> {
+    let mut handler = handler
         .lock()
-        .map_err(|_| payload_failure(PayloadFailureKind::HandlerLockPayload))?
-        .handle(payload)
+        .map_err(|_| payload_failure(PayloadFailureKind::HandlerLockPayload))?;
+    handler.handle(payload)?;
+    Ok(if handler.runtime_verified() {
+        transport::PayloadOutcome::RuntimeVerified
+    } else {
+        transport::PayloadOutcome::Handled
+    })
 }
 
 fn prepare_live_connection(
@@ -284,6 +302,10 @@ struct LivePayloadHandler {
 }
 
 impl LivePayloadHandler {
+    fn runtime_verified(&self) -> bool {
+        self.observed_last_trade && *self.front_month_gate.borrow() == FrontMonthGateState::Verified
+    }
+
     fn suspend(&mut self) {
         self.front_month_gate
             .send_replace(FrontMonthGateState::Idle);
@@ -628,6 +650,21 @@ mod tests {
     }
 
     #[test]
+    fn runtime_verification_requires_front_month_and_valid_last_trade() {
+        let (handler, _candle_rx) = handler();
+        let handler = Arc::new(Mutex::new(handler));
+
+        assert_eq!(
+            handle_live_payload(&handler, &front_month_response("MNQU6")).unwrap(),
+            transport::PayloadOutcome::Handled,
+        );
+        assert_eq!(
+            handle_live_payload(&handler, &last_trade(1_800_000_001)).unwrap(),
+            transport::PayloadOutcome::RuntimeVerified,
+        );
+    }
+
+    #[test]
     fn live_payload_handler_front_month_state_matrix_fails_closed() {
         let (mut unverified, mut unverified_rx) = handler();
         unverified.handle(&last_trade(1_800_000_001)).unwrap();
@@ -889,7 +926,11 @@ mod tests {
             symbol: "MNQU6".to_string(),
         };
         let (event_tx, mut event_rx) = mpsc::channel(4);
-        let connector = tokio::spawn(run(config, event_tx));
+        let connector = tokio::spawn(run_with_clock(config, event_tx, || {
+            chrono::DateTime::parse_from_rfc3339("2026-09-21T12:00:00Z")
+                .unwrap()
+                .with_timezone(&chrono::Utc)
+        }));
 
         let first = timeout(Duration::from_secs(2), event_rx.recv())
             .await
@@ -979,7 +1020,11 @@ mod tests {
             symbol: "MNQU6".to_string(),
         };
         let (event_tx, mut event_rx) = mpsc::channel(4);
-        let connector = tokio::spawn(run(config, event_tx));
+        let connector = tokio::spawn(run_with_clock(config, event_tx, || {
+            chrono::DateTime::parse_from_rfc3339("2026-09-21T12:00:00Z")
+                .unwrap()
+                .with_timezone(&chrono::Utc)
+        }));
 
         let reset = timeout(Duration::from_secs(2), event_rx.recv())
             .await
@@ -1015,7 +1060,11 @@ mod tests {
             .unwrap()
             .unwrap()
             .unwrap_err();
-        let failure = error.downcast_ref::<PayloadFailure>().unwrap();
+        assert!(transport::error_after_stable_connection(&error));
+        let failure = error
+            .chain()
+            .find_map(|source| source.downcast_ref::<PayloadFailure>())
+            .unwrap();
         assert_eq!(failure.stage(), "market_decode");
         assert_eq!(failure.stable_error_code(), "malformed_market_payload");
         assert_eq!(failure.disposition(), "fatal_service_exit");

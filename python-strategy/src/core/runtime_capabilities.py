@@ -194,7 +194,7 @@ class RuntimeBootstrapFactory(Protocol):
 class RuntimeCallbacks:
     is_running: Callable[[], bool]
     publish_worker: Callable[[threading.Thread], None]
-    on_runtime_started: Callable[[], None]
+    on_runtime_started: Callable[[], bool]
     reconcile_if_needed: Callable[[], bool]
     process_event: Callable[[ExchangeOrderEvent], dict[str, Any]]
     lockdown: Callable[[str], None]
@@ -226,7 +226,7 @@ class KillSwitchClearPreparation:
 class RuntimeCapabilities(Protocol):
     def start_order_event_stream(self) -> bool: ...
 
-    def on_order_runtime_started(self) -> None: ...
+    def on_order_runtime_started(self) -> bool: ...
 
     def reconcile_order_reconnect(self) -> bool | None: ...
 
@@ -320,8 +320,8 @@ class NoopRuntimeCapabilities:
     def start_order_event_stream(self) -> bool:
         return False
 
-    def on_order_runtime_started(self) -> None:
-        return None
+    def on_order_runtime_started(self) -> bool:
+        return False
 
     def reconcile_order_reconnect(self) -> bool | None:
         return True

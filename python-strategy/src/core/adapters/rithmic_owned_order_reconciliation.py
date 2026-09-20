@@ -63,20 +63,24 @@ class _RecoveryOrderIdentity(Protocol):
     client_order_id: object
 
 
-def _classify_ledger_snapshot_failure(exc: Exception) -> tuple[str, str, str, str]:
+def _classify_ledger_snapshot_failure(
+    exc: Exception,
+) -> tuple[str, str, str, str, bool]:
     error_type = "RuntimeError" if type(exc) is RuntimeError else "Exception"
     if type(exc) is RuntimeError:
         stage = getattr(exc, "stage", None)
         code = getattr(exc, "stable_error_code", None)
         cause = getattr(exc, "safe_cause", None)
+        retryable = getattr(exc, "retryable", False)
         if (
             type(stage) is str
             and type(code) is str
             and type(cause) is str
+            and type(retryable) is bool
             and (stage, code, cause) in _SAFE_LEDGER_SNAPSHOT_FAILURES
         ):
-            return ("RuntimeError", stage, code, cause)
-    return (error_type, *_LEDGER_SNAPSHOT_FAILURE_FALLBACK[1:])
+            return ("RuntimeError", stage, code, cause, retryable)
+    return (error_type, *_LEDGER_SNAPSHOT_FAILURE_FALLBACK[1:], False)
 
 
 class RithmicOwnedOrderReconciler:
@@ -159,7 +163,7 @@ class RithmicOwnedOrderReconciler:
                 snapshot_loader,
             )
         except Exception as exc:
-            error_type, error_stage, error_code, error_cause = (
+            error_type, error_stage, error_code, error_cause, error_retryable = (
                 _classify_ledger_snapshot_failure(exc)
             )
             snapshot_diagnostics = {
@@ -167,6 +171,7 @@ class RithmicOwnedOrderReconciler:
                 "snapshot_error_stage": error_stage,
                 "snapshot_error_code": error_code,
                 "snapshot_error_cause": error_cause,
+                "snapshot_retryable": error_retryable,
             }
             self.context.logger.error(
                 "Rithmic ledger snapshot acquisition failed",

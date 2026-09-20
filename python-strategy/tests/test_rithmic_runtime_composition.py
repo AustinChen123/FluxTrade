@@ -371,7 +371,7 @@ def _callbacks() -> RithmicRuntimeCallbacks:
     return RithmicRuntimeCallbacks(
         is_running=MagicMock(return_value=True),
         publish_worker=MagicMock(),
-        on_runtime_started=MagicMock(),
+        on_runtime_started=MagicMock(return_value=True),
         reconcile_if_needed=MagicMock(return_value=True),
         process_event=MagicMock(return_value={"action": "applied"}),
         lockdown=MagicMock(),
@@ -573,23 +573,25 @@ def test_runtime_handle_routes_reconnect_lifecycle_to_current_owner() -> None:
         is_rithmic_runtime=True,
     )
 
-    assert owners.on_order_runtime_started() is None
+    assert owners.on_order_runtime_started() is False
     assert owners.reconcile_order_reconnect() is None
 
     first_owner = MagicMock()
+    first_owner.on_runtime_started.return_value = True
     first_owner.reconcile_if_needed.return_value = False
     owners.order_reconnect = first_owner
 
-    assert owners.on_order_runtime_started() is None
+    assert owners.on_order_runtime_started() is True
     assert owners.reconcile_order_reconnect() is False
     first_owner.on_runtime_started.assert_called_once_with()
     first_owner.reconcile_if_needed.assert_called_once_with()
 
     second_owner = MagicMock()
+    second_owner.on_runtime_started.return_value = False
     second_owner.reconcile_if_needed.return_value = True
     owners.order_reconnect = second_owner
 
-    assert owners.on_order_runtime_started() is None
+    assert owners.on_order_runtime_started() is False
     assert owners.reconcile_order_reconnect() is True
     first_owner.on_runtime_started.assert_called_once_with()
     first_owner.reconcile_if_needed.assert_called_once_with()
@@ -1464,6 +1466,45 @@ def test_rithmic_composition_builds_the_complete_shared_owner_graph() -> None:
 
     owners.order_event_stream._on_runtime_started()
     runtime_started.assert_called_once_with()
+
+
+def test_runtime_recovery_restart_failure_does_not_claim_global_halt() -> None:
+    adapter = _rithmic_adapter()
+    execution_engine = _execution_engine()
+    execution_engine.halt_for_reconcile.return_value = True
+    halt_submissions = MagicMock()
+    lockdown = MagicMock()
+    callbacks = replace(
+        _callbacks(),
+        halt_submissions=halt_submissions,
+        lockdown=lockdown,
+    )
+    owners = build_rithmic_runtime_owners(
+        adapter=adapter,
+        profile="test",
+        account_id="ACCOUNT",
+        execution_engine=execution_engine,
+        account_service=MagicMock(spec=AccountService),
+        ops_safety=MagicMock(spec=OpsSafetyService),
+        stop_event=MagicMock(),
+        callbacks=callbacks,
+        logger=MagicMock(),
+    )
+    assert owners.runtime_recovery is not None
+    owners.runtime_recovery._maintenance_active = lambda: False
+    owners.runtime_recovery._reconcile_owned_orders = MagicMock(
+        return_value={"recoverable_count": 0, "auto_resume_safe": True}
+    )
+    owners.runtime_recovery._publish_authoritative_summary = MagicMock()
+    adapter.start_order_event_stream = MagicMock(
+        side_effect=RuntimeError("provider maintenance")
+    )
+
+    assert owners.runtime_recovery.run_once() is False
+
+    halt_submissions.assert_not_called()
+    lockdown.assert_not_called()
+    execution_engine.resume_after_reconcile.assert_not_called()
 
 
 def test_rithmic_composition_owns_external_drift_persistence_actor() -> None:

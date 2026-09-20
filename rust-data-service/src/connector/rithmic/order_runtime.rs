@@ -5,11 +5,15 @@ use super::{
     order_dispatch::{begin_command, reject_command, Command, Reply},
     order_event::{self, OrderEvent},
     order_pending::{self, fail_pending, pending_expired, Pending},
-    order_session::connect_and_prepare,
+    order_session::{connect_and_prepare, is_retryable_order_session_error},
     profile_lock::ProfileLease,
-    transport::{ConnectionEvent, RithmicConnection},
+    transport::{
+        heartbeat_establishes_stability, is_retryable_connection_error, maintenance_active,
+        maintenance_retry_delay, ConnectionEvent, MaintenanceRecoveryBudget, RithmicConnection,
+    },
 };
 use anyhow::{bail, ensure, Context, Result};
+use chrono::Utc;
 use std::{
     future::Future,
     sync::{
@@ -32,7 +36,9 @@ use super::order_pending::{
     update_pending_from_snapshot, SubmitKind,
 };
 #[cfg(test)]
-use super::order_session::{connect_and_prepare_runtime, SUBSCRIBE_KEY, TRADE_ROUTES_KEY};
+use super::order_session::{
+    connect_and_prepare_runtime, retryable_order_session_failure, SUBSCRIBE_KEY, TRADE_ROUTES_KEY,
+};
 
 const STARTUP_TIMEOUT: Duration = Duration::from_secs(45);
 const COMMAND_TIMEOUT: Duration = Duration::from_secs(30);
@@ -225,12 +231,13 @@ async fn run(
             let account_id = account_id.clone();
             async move { connect_and_prepare(&profile, account_id.as_deref()).await }
         },
+        Utc::now,
     )
     .await;
 }
 
 #[allow(clippy::too_many_arguments)]
-async fn run_with_connector<C, F>(
+async fn run_with_connector<C, F, N>(
     _lease: ProfileLease,
     mut commands: mpsc::Receiver<Command>,
     events: std_mpsc::Sender<Result<OrderEvent>>,
@@ -238,6 +245,7 @@ async fn run_with_connector<C, F>(
     generation: Arc<AtomicU64>,
     ready: Reply<()>,
     mut connect: C,
+    maintenance_now: N,
 ) where
     C: FnMut() -> F,
     F: Future<
@@ -248,41 +256,110 @@ async fn run_with_connector<C, F>(
             Vec<TradeRoute>,
         )>,
     >,
+    N: Fn() -> chrono::DateTime<Utc>,
 {
     let mut ready = Some(ready);
     let mut backoff = RECONNECT_INITIAL;
+    let mut maintenance_recovery = MaintenanceRecoveryBudget::default();
     loop {
+        if let Some(delay) = maintenance_retry_delay(maintenance_now()) {
+            maintenance_recovery.observe_maintenance();
+            connected.store(false, Ordering::Release);
+            if let Some(ready) = ready.take() {
+                let _ = ready.send(Ok(()));
+            }
+            tokio::select! {
+                () = tokio::time::sleep(delay) => {}
+                command = commands.recv() => match command {
+                    Some(Command::Shutdown) | None => return,
+                    Some(command) => reject_command(
+                        command,
+                        "Rithmic order runtime is paused for maintenance",
+                    ),
+                }
+            }
+            continue;
+        }
         match connect().await {
             Ok((mut connection, account, user_type, routes)) => {
                 connected.store(true, Ordering::Release);
-                let submissions_allowed = generation.fetch_add(1, Ordering::Release) == 0;
-                backoff = RECONNECT_INITIAL;
+                let ready_pending = ready.is_some();
+                let previous_generation = generation.fetch_add(1, Ordering::Release);
+                let submissions_allowed =
+                    submissions_allowed_for_connection(ready_pending, previous_generation);
                 if let Some(ready) = ready.take() {
                     let _ = ready.send(Ok(()));
                 }
-                if !run_connected(
+                let connected_exit = run_connected(
                     &mut connection,
                     &account,
                     user_type,
                     &routes,
                     &mut commands,
                     &events,
-                    submissions_allowed,
+                    ConnectedPolicy {
+                        submissions_allowed,
+                        maintenance_now: &maintenance_now,
+                    },
                 )
-                .await
-                {
-                    connected.store(false, Ordering::Release);
-                    return;
-                }
+                .await;
                 connected.store(false, Ordering::Release);
+                match connected_exit {
+                    ConnectedExit::Shutdown => {
+                        return;
+                    }
+                    ConnectedExit::Maintenance => {
+                        maintenance_recovery.observe_maintenance();
+                    }
+                    ConnectedExit::Retry { connection_stable } => {
+                        if connection_stable {
+                            backoff = RECONNECT_INITIAL;
+                        }
+                        if post_maintenance_retry_exhausted(
+                            &mut maintenance_recovery,
+                            connection_stable,
+                        ) {
+                            warn!(
+                                runtime_state = "not_ready",
+                                provider_io = "quiescent",
+                                "Rithmic order post-maintenance verification exhausted; provider I/O quiescent until service restart"
+                            );
+                            if let Some(ready) = ready.take() {
+                                let _ = ready.send(Ok(()));
+                            }
+                            wait_for_quiescent_shutdown(&mut commands).await;
+                            return;
+                        }
+                    }
+                }
             }
             Err(error) => {
                 connected.store(false, Ordering::Release);
-                if let Some(ready) = ready.take() {
-                    let _ = ready.send(Err(error));
+                if !is_retryable_order_session_error(&error) {
+                    warn!(%error, "Rithmic order runtime preparation failed fatally; stopping runtime");
+                    if let Some(ready) = ready.take() {
+                        let _ = ready.send(Err(error));
+                    } else {
+                        let _ = events.send(Err(error));
+                    }
                     return;
                 }
                 warn!(%error, "Rithmic order runtime disconnected; reconnecting");
+                if let Some(ready) = ready.take() {
+                    let _ = ready.send(Ok(()));
+                }
+                if post_maintenance_retry_exhausted(&mut maintenance_recovery, false) {
+                    warn!(
+                        runtime_state = "not_ready",
+                        provider_io = "quiescent",
+                        "Rithmic order post-maintenance verification exhausted; provider I/O quiescent until service restart"
+                    );
+                    if let Some(ready) = ready.take() {
+                        let _ = ready.send(Ok(()));
+                    }
+                    wait_for_quiescent_shutdown(&mut commands).await;
+                    return;
+                }
             }
         }
 
@@ -299,26 +376,87 @@ async fn run_with_connector<C, F>(
     }
 }
 
-async fn run_connected(
+fn submissions_allowed_for_connection(ready_pending: bool, previous_generation: u64) -> bool {
+    ready_pending && previous_generation == 0
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ConnectedExit {
+    Shutdown,
+    Retry { connection_stable: bool },
+    Maintenance,
+}
+
+fn retry_exit(heartbeat_confirmations: u32) -> ConnectedExit {
+    ConnectedExit::Retry {
+        connection_stable: heartbeat_establishes_stability(heartbeat_confirmations),
+    }
+}
+
+fn post_maintenance_retry_exhausted(
+    recovery: &mut MaintenanceRecoveryBudget,
+    connection_stable: bool,
+) -> bool {
+    if connection_stable {
+        recovery.connection_stable();
+        return false;
+    }
+    recovery.transport_failure_exhausted()
+}
+
+struct ConnectedPolicy<'a, N> {
+    submissions_allowed: bool,
+    maintenance_now: &'a N,
+}
+
+async fn wait_for_quiescent_shutdown(commands: &mut mpsc::Receiver<Command>) {
+    while let Some(command) = commands.recv().await {
+        if matches!(command, Command::Shutdown) {
+            return;
+        }
+        reject_command(
+            command,
+            "Rithmic order runtime awaits manual restart after maintenance recovery exhaustion",
+        );
+    }
+}
+
+async fn run_connected<N>(
     connection: &mut RithmicConnection,
     account: &AccountIdentity,
     user_type: UserType,
     routes: &[TradeRoute],
     commands: &mut mpsc::Receiver<Command>,
     events: &std_mpsc::Sender<Result<OrderEvent>>,
-    submissions_allowed: bool,
-) -> bool {
+    policy: ConnectedPolicy<'_, N>,
+) -> ConnectedExit
+where
+    N: Fn() -> chrono::DateTime<Utc>,
+{
     let sequence = AtomicU64::new(1);
     let mut pending = None;
+    let mut heartbeat_confirmations = 0_u32;
     loop {
+        if maintenance_active((policy.maintenance_now)()) {
+            fail_pending(&mut pending, "Rithmic order runtime paused for maintenance");
+            return ConnectedExit::Maintenance;
+        }
         tokio::select! {
             command = commands.recv() => match command {
                 Some(Command::Shutdown) | None => {
                     fail_pending(&mut pending, "Rithmic order runtime stopped");
-                    return false;
+                    return ConnectedExit::Shutdown;
                 }
                 Some(command) => {
-                    if !submissions_allowed && command.is_submission() {
+                    if maintenance_active((policy.maintenance_now)()) {
+                        reject_command(command, "Rithmic order runtime entered maintenance");
+                        fail_pending(
+                            &mut pending,
+                            "Rithmic order runtime paused for maintenance",
+                        );
+                        return ConnectedExit::Maintenance;
+                    }
+                    if !policy.submissions_allowed && command.is_submission() {
                         reject_command(
                             command,
                             "Rithmic order submission is blocked until reconciliation",
@@ -341,15 +479,24 @@ async fn run_connected(
                     {
                         Ok(next) => pending = next,
                         Err(error) => {
-                            warn!(%error, "Rithmic order command write failed");
                             fail_pending(&mut pending, "Rithmic order command result is ambiguous");
-                            return true;
+                            if is_retryable_connection_error(&error) {
+                                warn!(%error, "Rithmic order command write failed; reconnecting");
+                                return retry_exit(heartbeat_confirmations);
+                            }
+                            warn!(%error, "Rithmic order command failed fatally; stopping runtime");
+                            let _ = events.send(Err(error.context(
+                                "Rithmic order command failed before provider write",
+                            )));
+                            return ConnectedExit::Shutdown;
                         }
                     }
                 }
             },
-            event = connection.next_event() => match event {
-                Ok(ConnectionEvent::HeartbeatConfirmed) => {}
+            event = connection.next_event_guarded(|| maintenance_active((policy.maintenance_now)())) => match event {
+                Ok(ConnectionEvent::HeartbeatConfirmed) => {
+                    heartbeat_confirmations = heartbeat_confirmations.saturating_add(1);
+                }
                 Ok(ConnectionEvent::Payload(payload)) => {
                     if let Err(error) = handle_payload(payload, account, &mut pending, events) {
                         warn!(%error, "invalid Rithmic order payload; stopping runtime");
@@ -357,19 +504,33 @@ async fn run_connected(
                         let _ = events.send(Err(error.context(
                             "Rithmic order stream failed protocol validation",
                         )));
-                        return false;
+                        return ConnectedExit::Shutdown;
                     }
                 }
                 Err(error) => {
-                    warn!(%error, "Rithmic order connection lost; reconnecting");
+                    if maintenance_active((policy.maintenance_now)()) {
+                        fail_pending(
+                            &mut pending,
+                            "Rithmic order runtime paused for maintenance",
+                        );
+                        return ConnectedExit::Maintenance;
+                    }
                     fail_pending(&mut pending, "Rithmic order command result is ambiguous");
-                    return true;
+                    if is_retryable_connection_error(&error) {
+                        warn!(%error, "Rithmic order connection lost; reconnecting");
+                        return retry_exit(heartbeat_confirmations);
+                    }
+                    warn!(%error, "Rithmic order session failed fatally; stopping runtime");
+                    let _ = events.send(Err(error.context(
+                        "Rithmic order session terminated without reconnect",
+                    )));
+                    return ConnectedExit::Shutdown;
                 }
             },
             () = tokio::time::sleep(Duration::from_millis(100)), if pending.is_some() => {
                 if pending.as_ref().is_some_and(pending_expired) {
                     fail_pending(&mut pending, "Rithmic order command timed out; result is ambiguous");
-                    return true;
+                    return retry_exit(heartbeat_confirmations);
                 }
             },
         }
@@ -411,6 +572,289 @@ mod tests {
     use tokio::net::{TcpListener, TcpStream};
     use tokio::time::timeout;
     use tokio_tungstenite::{accept_async, tungstenite::protocol::Message, WebSocketStream};
+
+    fn outside_maintenance() -> chrono::DateTime<Utc> {
+        chrono::DateTime::parse_from_rfc3339("2026-09-21T12:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc)
+    }
+
+    #[test]
+    fn only_synchronous_first_connection_can_submit_before_reconciliation() {
+        for (ready_pending, previous_generation, expected) in [
+            (true, 0, true),
+            (false, 0, false),
+            (true, 1, false),
+            (false, 1, false),
+        ] {
+            assert_eq!(
+                submissions_allowed_for_connection(ready_pending, previous_generation),
+                expected,
+            );
+        }
+    }
+
+    #[test]
+    fn post_maintenance_order_retries_quiesce_after_three_unstable_connections() {
+        let mut recovery = MaintenanceRecoveryBudget::default();
+        recovery.observe_maintenance();
+
+        for (attempt, exhausted) in [(1, false), (2, false), (3, true)] {
+            let ConnectedExit::Retry { connection_stable } = retry_exit(1) else {
+                panic!("expected retry exit");
+            };
+            assert!(!connection_stable);
+            assert_eq!(
+                post_maintenance_retry_exhausted(&mut recovery, connection_stable,),
+                exhausted,
+                "attempt {attempt}",
+            );
+        }
+    }
+
+    #[test]
+    fn cold_start_order_retries_do_not_consume_post_maintenance_budget() {
+        let mut recovery = MaintenanceRecoveryBudget::default();
+
+        for _ in 0..10 {
+            assert!(!post_maintenance_retry_exhausted(&mut recovery, false));
+        }
+    }
+
+    #[test]
+    fn two_order_heartbeats_clear_post_maintenance_retry_budget() {
+        let mut recovery = MaintenanceRecoveryBudget::default();
+        recovery.observe_maintenance();
+        let ConnectedExit::Retry { connection_stable } = retry_exit(2) else {
+            panic!("expected retry exit");
+        };
+
+        assert!(connection_stable);
+        assert!(!post_maintenance_retry_exhausted(
+            &mut recovery,
+            connection_stable,
+        ));
+        assert!(!post_maintenance_retry_exhausted(&mut recovery, false));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn initial_maintenance_starts_disconnected_without_provider_io() {
+        let (command_tx, command_rx) = mpsc::channel(1);
+        let (event_tx, _event_rx) = std_mpsc::channel();
+        let connected = Arc::new(AtomicBool::new(false));
+        let generation = Arc::new(AtomicU64::new(0));
+        let (ready_tx, ready_rx) = std_mpsc::sync_channel(1);
+        let connect_calls = Arc::new(AtomicU64::new(0));
+        let runtime_calls = Arc::clone(&connect_calls);
+        let lease = ProfileLease::acquire("order-initial-maintenance-loopback").unwrap();
+        let runtime = tokio::spawn(run_with_connector(
+            lease,
+            command_rx,
+            event_tx,
+            Arc::clone(&connected),
+            Arc::clone(&generation),
+            ready_tx,
+            move || {
+                runtime_calls.fetch_add(1, Ordering::SeqCst);
+                async {
+                    Err::<
+                        (
+                            RithmicConnection,
+                            AccountIdentity,
+                            UserType,
+                            Vec<TradeRoute>,
+                        ),
+                        _,
+                    >(anyhow::anyhow!("provider I/O must remain suppressed"))
+                }
+            },
+            || {
+                chrono::DateTime::parse_from_rfc3339("2026-09-19T12:00:00Z")
+                    .unwrap()
+                    .with_timezone(&Utc)
+            },
+        ));
+
+        ready_rx
+            .recv_timeout(Duration::from_secs(1))
+            .unwrap()
+            .unwrap();
+        assert_eq!(connect_calls.load(Ordering::SeqCst), 0);
+        assert!(!connected.load(Ordering::Acquire));
+        assert_eq!(generation.load(Ordering::Acquire), 0);
+
+        command_tx.send(Command::Shutdown).await.unwrap();
+        timeout(Duration::from_secs(1), runtime)
+            .await
+            .unwrap()
+            .unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn initial_connect_failure_keeps_local_runtime_alive_and_disconnected() {
+        let (command_tx, command_rx) = mpsc::channel(1);
+        let (event_tx, _event_rx) = std_mpsc::channel();
+        let connected = Arc::new(AtomicBool::new(false));
+        let generation = Arc::new(AtomicU64::new(0));
+        let (ready_tx, ready_rx) = std_mpsc::sync_channel(1);
+        let connect_calls = Arc::new(AtomicU64::new(0));
+        let runtime_calls = Arc::clone(&connect_calls);
+        let lease = ProfileLease::acquire("order-initial-failure-loopback").unwrap();
+        let runtime = tokio::spawn(run_with_connector(
+            lease,
+            command_rx,
+            event_tx,
+            Arc::clone(&connected),
+            Arc::clone(&generation),
+            ready_tx,
+            move || {
+                runtime_calls.fetch_add(1, Ordering::SeqCst);
+                async {
+                    Err::<
+                        (
+                            RithmicConnection,
+                            AccountIdentity,
+                            UserType,
+                            Vec<TradeRoute>,
+                        ),
+                        _,
+                    >(retryable_order_session_failure(anyhow::anyhow!(
+                        "provider unavailable"
+                    )))
+                }
+            },
+            outside_maintenance,
+        ));
+
+        ready_rx
+            .recv_timeout(Duration::from_secs(1))
+            .unwrap()
+            .unwrap();
+        assert_eq!(connect_calls.load(Ordering::SeqCst), 1);
+        assert!(!connected.load(Ordering::Acquire));
+        assert_eq!(generation.load(Ordering::Acquire), 0);
+        assert!(!runtime.is_finished());
+
+        command_tx.send(Command::Shutdown).await.unwrap();
+        timeout(Duration::from_secs(1), runtime)
+            .await
+            .unwrap()
+            .unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn fatal_initial_connect_failure_stops_after_one_attempt() {
+        let (_command_tx, command_rx) = mpsc::channel(1);
+        let (event_tx, _event_rx) = std_mpsc::channel();
+        let connected = Arc::new(AtomicBool::new(false));
+        let generation = Arc::new(AtomicU64::new(0));
+        let (ready_tx, ready_rx) = std_mpsc::sync_channel(1);
+        let connect_calls = Arc::new(AtomicU64::new(0));
+        let runtime_calls = Arc::clone(&connect_calls);
+        let lease = ProfileLease::acquire("order-fatal-initial-failure-loopback").unwrap();
+        let runtime = tokio::spawn(run_with_connector(
+            lease,
+            command_rx,
+            event_tx,
+            Arc::clone(&connected),
+            Arc::clone(&generation),
+            ready_tx,
+            move || {
+                runtime_calls.fetch_add(1, Ordering::SeqCst);
+                async {
+                    Err::<
+                        (
+                            RithmicConnection,
+                            AccountIdentity,
+                            UserType,
+                            Vec<TradeRoute>,
+                        ),
+                        _,
+                    >(anyhow::anyhow!("permanent order configuration failure"))
+                }
+            },
+            outside_maintenance,
+        ));
+
+        let error = ready_rx
+            .recv_timeout(Duration::from_secs(1))
+            .unwrap()
+            .unwrap_err();
+        assert_eq!(error.to_string(), "permanent order configuration failure");
+        timeout(Duration::from_secs(1), runtime)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(connect_calls.load(Ordering::SeqCst), 1);
+        assert!(!connected.load(Ordering::Acquire));
+        assert_eq!(generation.load(Ordering::Acquire), 0);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn forced_logout_stops_connected_runtime_without_reconnect() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("ws://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move {
+            let mut socket = serve_order_startup(&listener).await;
+            send(
+                &mut socket,
+                codec::encode(&protocol::ForcedLogout { template_id: 77 }).unwrap(),
+            )
+            .await;
+            assert!(timeout(Duration::from_millis(1_500), listener.accept())
+                .await
+                .is_err());
+        });
+
+        let login = LoginParameters::new(
+            "test-user".to_string(),
+            "test-password".to_string(),
+            "test-system".to_string(),
+            "FluxTrade".to_string(),
+            "0.1.0".to_string(),
+            Plant::Order,
+        )
+        .unwrap();
+        let (_command_tx, command_rx) = mpsc::channel(1);
+        let (event_tx, event_rx) = std_mpsc::channel();
+        let connected = Arc::new(AtomicBool::new(false));
+        let generation = Arc::new(AtomicU64::new(0));
+        let (ready_tx, ready_rx) = std_mpsc::sync_channel(1);
+        let lease = ProfileLease::acquire("order-forced-logout-loopback").unwrap();
+        let runtime = tokio::spawn(run_with_connector(
+            lease,
+            command_rx,
+            event_tx,
+            Arc::clone(&connected),
+            Arc::clone(&generation),
+            ready_tx,
+            move || {
+                let runtime = RuntimeConfig {
+                    url: url.clone(),
+                    login: login.clone(),
+                };
+                async move { connect_and_prepare_runtime(runtime, Some("ACCOUNT")).await }
+            },
+            outside_maintenance,
+        ));
+
+        ready_rx
+            .recv_timeout(Duration::from_secs(2))
+            .unwrap()
+            .unwrap();
+        let error = event_rx
+            .recv_timeout(Duration::from_secs(2))
+            .unwrap()
+            .unwrap_err();
+        assert!(error.to_string().contains("terminated without reconnect"));
+        timeout(Duration::from_secs(2), runtime)
+            .await
+            .unwrap()
+            .unwrap();
+        server.await.unwrap();
+        assert_eq!(generation.load(Ordering::Acquire), 1);
+        assert!(!connected.load(Ordering::Acquire));
+    }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn reconnect_increments_generation_after_full_order_startup() {
@@ -461,6 +905,7 @@ mod tests {
                 };
                 async move { connect_and_prepare_runtime(runtime, Some("ACCOUNT")).await }
             },
+            outside_maintenance,
         ));
 
         timeout(Duration::from_secs(4), async {
@@ -565,6 +1010,7 @@ mod tests {
                 };
                 async move { connect_and_prepare_runtime(runtime, Some("ACCOUNT")).await }
             },
+            outside_maintenance,
         ));
 
         timeout(Duration::from_secs(3), async {
@@ -1103,6 +1549,7 @@ mod tests {
                 };
                 async move { connect_and_prepare_runtime(runtime, Some("ACCOUNT")).await }
             },
+            outside_maintenance,
         ));
 
         timeout(Duration::from_secs(3), async {

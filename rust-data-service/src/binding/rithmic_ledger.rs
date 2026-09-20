@@ -3,7 +3,9 @@ use crate::rithmic_ledger::{
         AccountSummarySnapshot, FillSnapshot, InstrumentPositionSnapshot, OrderSnapshot,
         TransactionType,
     },
-    ledger_runtime::{LedgerSnapshotFailure, RecoveryQuery, RemoteLedgerSnapshot},
+    ledger_runtime::{
+        is_retryable_snapshot_error, LedgerSnapshotFailure, RecoveryQuery, RemoteLedgerSnapshot,
+    },
     profile_lock::ProfileLease,
 };
 use anyhow::Context;
@@ -348,15 +350,20 @@ fn runtime_error(py: Python<'_>, error: anyhow::Error) -> PyErr {
         .downcast_ref::<LedgerSnapshotFailure>()
         .copied()
         .unwrap_or(UNCLASSIFIED_FAILURE);
+    let retryable = failure == PROFILE_LEASE_FAILURE || is_retryable_snapshot_error(&error);
     let target = PyRuntimeError::new_err("Rithmic ledger snapshot failed")
         .into_value(py)
         .into_bound(py)
         .into_any();
-    project_runtime_error_target(failure, target)
+    project_runtime_error_target(failure, retryable, target)
 }
 
-fn project_runtime_error_target(failure: LedgerSnapshotFailure, target: Bound<'_, PyAny>) -> PyErr {
-    if set_diagnostic_attributes(&target, failure).is_err() {
+fn project_runtime_error_target(
+    failure: LedgerSnapshotFailure,
+    retryable: bool,
+    target: Bound<'_, PyAny>,
+) -> PyErr {
+    if set_diagnostic_attributes(&target, failure, retryable).is_err() {
         return PyRuntimeError::new_err("Rithmic ledger snapshot failed");
     }
     PyErr::from_value(target)
@@ -365,12 +372,14 @@ fn project_runtime_error_target(failure: LedgerSnapshotFailure, target: Bound<'_
 fn set_diagnostic_attributes(
     target: &Bound<'_, PyAny>,
     failure: LedgerSnapshotFailure,
+    retryable: bool,
 ) -> PyResult<()> {
     let [stage, stable_error_code, safe_cause] = failure.safe_fields();
     target
         .setattr("stage", stage)
         .and_then(|_| target.setattr("stable_error_code", stable_error_code))
         .and_then(|_| target.setattr("safe_cause", safe_cause))
+        .and_then(|_| target.setattr("retryable", retryable))
 }
 
 #[cfg(test)]
@@ -465,6 +474,14 @@ unclassified_internal|unclassified_ledger_snapshot_failure|ledger snapshot faile
                         assert!(!actual.contains(sentinel));
                     }
                 }
+                assert_eq!(
+                    value
+                        .getattr("retryable")
+                        .unwrap()
+                        .extract::<bool>()
+                        .unwrap(),
+                    index == 0
+                );
             }
         });
     }
@@ -473,7 +490,7 @@ unclassified_internal|unclassified_ledger_snapshot_failure|ledger snapshot faile
     fn rejected_diagnostic_target_returns_fixed_runtime_error() {
         Python::with_gil(|py| {
             let error =
-                project_runtime_error_target(PROFILE_LEASE_FAILURE, py.None().into_bound(py));
+                project_runtime_error_target(PROFILE_LEASE_FAILURE, true, py.None().into_bound(py));
             let value = error.value(py);
             assert!(value.is_instance_of::<PyRuntimeError>());
             assert_eq!(value.to_string(), "Rithmic ledger snapshot failed");
@@ -485,6 +502,42 @@ unclassified_internal|unclassified_ledger_snapshot_failure|ledger snapshot faile
                     .unwrap(),
                 ("Rithmic ledger snapshot failed".to_string(),)
             );
+        });
+    }
+
+    #[test]
+    fn identical_stage_code_preserves_explicit_retry_disposition() {
+        Python::with_gil(|py| {
+            for retryable in [false, true] {
+                let source = anyhow::anyhow!("safe test failure");
+                let source = if retryable {
+                    crate::rithmic_ledger::ledger_runtime::mark_test_retryable_snapshot_error(
+                        source,
+                    )
+                } else {
+                    source
+                }
+                .context(LedgerSnapshotFailure::ORDER_CONNECT);
+                let error = runtime_error(py, source);
+                let value = error.value(py);
+
+                assert_eq!(
+                    value
+                        .getattr("stable_error_code")
+                        .unwrap()
+                        .extract::<String>()
+                        .unwrap(),
+                    "order_connect_failed"
+                );
+                assert_eq!(
+                    value
+                        .getattr("retryable")
+                        .unwrap()
+                        .extract::<bool>()
+                        .unwrap(),
+                    retryable
+                );
+            }
         });
     }
 
@@ -521,6 +574,11 @@ unclassified_internal|unclassified_ledger_snapshot_failure|ledger snapshot faile
                 assert_eq!(actual, expected);
                 assert!(!actual.contains(profile));
             }
+            assert!(value
+                .getattr("retryable")
+                .unwrap()
+                .extract::<bool>()
+                .unwrap());
         });
         drop(lease);
     }
@@ -539,7 +597,7 @@ unclassified_internal|unclassified_ledger_snapshot_failure|ledger snapshot faile
         assert!(allow_threads
             .contains(".build()\n            .context(RUNTIME_INITIALIZATION_FAILURE)?"));
         let runtime_error = source.split_once("fn runtime_error").unwrap().1;
-        assert!(runtime_error.contains("project_runtime_error_target(failure, target)"));
+        assert!(runtime_error.contains("project_runtime_error_target(failure, retryable, target)"));
     }
 
     fn account() -> AccountIdentity {

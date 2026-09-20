@@ -1,3 +1,50 @@
+use std::time::Duration;
+
+#[cfg(feature = "rithmic")]
+const RITHMIC_TERMINAL_RESTART_COOLDOWN: Duration = Duration::from_secs(3_600);
+#[cfg(feature = "rithmic")]
+const RITHMIC_CONTROLLED_HALT_COOLDOWN: Duration = Duration::from_secs(14_400);
+
+#[derive(Clone, Copy)]
+pub(crate) struct ConnectorTerminalPolicy {
+    #[cfg(feature = "rithmic")]
+    rithmic_enabled: bool,
+}
+
+impl ConnectorTerminalPolicy {
+    pub(crate) fn new(enabled_exchanges: &[String]) -> Self {
+        #[cfg(not(feature = "rithmic"))]
+        let _ = enabled_exchanges;
+        Self {
+            #[cfg(feature = "rithmic")]
+            rithmic_enabled: enabled_exchanges.iter().any(|value| value == "rithmic"),
+        }
+    }
+
+    pub(crate) fn restart_cooldown(&self, error: &anyhow::Error) -> Option<Duration> {
+        #[cfg(feature = "rithmic")]
+        if self.rithmic_enabled && super::rithmic::is_fatal_session_error(error) {
+            return Some(RITHMIC_TERMINAL_RESTART_COOLDOWN);
+        }
+        #[cfg(feature = "rithmic")]
+        if self.rithmic_enabled && super::rithmic::is_controlled_halt(error) {
+            return Some(RITHMIC_CONTROLLED_HALT_COOLDOWN);
+        }
+        let _ = error;
+        None
+    }
+
+    pub(crate) fn restart_episode_was_stable(&self, error: &anyhow::Error) -> bool {
+        #[cfg(feature = "rithmic")]
+        if self.rithmic_enabled {
+            return super::rithmic::error_after_stable_connection(error);
+        }
+        #[cfg(not(feature = "rithmic"))]
+        let _ = error;
+        false
+    }
+}
+
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) struct ConnectorTerminalDiagnostic {
     pub(crate) component: &'static str,
@@ -109,6 +156,37 @@ mod tests {
     #[test]
     fn non_connector_error_is_not_claimed() {
         assert_eq!(classify(&anyhow::anyhow!("generic failure")), None);
+    }
+
+    #[cfg(feature = "rithmic")]
+    #[test]
+    fn only_enabled_fatal_rithmic_sessions_receive_restart_cooldown() {
+        let fatal = super::super::rithmic::handshake_rejection_with_contexts();
+        let controlled_halt = anyhow::Error::new(super::super::rithmic::PayloadFailure::new(
+            super::super::rithmic::PayloadFailureKind::RolloverRequired,
+        ));
+        let generic = anyhow::anyhow!("generic connector failure");
+        let enabled = ConnectorTerminalPolicy::new(&["rithmic".to_string()]);
+        let disabled = ConnectorTerminalPolicy::new(&["binance".to_string()]);
+
+        assert_eq!(
+            enabled.restart_cooldown(&fatal),
+            Some(Duration::from_secs(3_600))
+        );
+        assert_eq!(disabled.restart_cooldown(&fatal), None);
+        assert_eq!(
+            enabled.restart_cooldown(&controlled_halt),
+            Some(Duration::from_secs(14_400))
+        );
+        assert_eq!(disabled.restart_cooldown(&controlled_halt), None);
+        assert_eq!(enabled.restart_cooldown(&generic), None);
+
+        let stable_fatal = super::super::rithmic::mark_test_stable_connection(
+            super::super::rithmic::handshake_rejection_with_contexts(),
+        );
+        assert!(enabled.restart_episode_was_stable(&stable_fatal));
+        assert!(!disabled.restart_episode_was_stable(&stable_fatal));
+        assert!(!enabled.restart_episode_was_stable(&fatal));
     }
 
     #[test]

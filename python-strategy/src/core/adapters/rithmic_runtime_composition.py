@@ -236,11 +236,11 @@ class RithmicRuntimeOwners:
         self.order_event_stream.start()
         return True
 
-    def on_order_runtime_started(self) -> None:
+    def on_order_runtime_started(self) -> bool:
         """Baseline the current reconnect owner after a successful start."""
         if self.order_reconnect is None:
-            return
-        self.order_reconnect.on_runtime_started()
+            return False
+        return self.order_reconnect.on_runtime_started()
 
     def reconcile_order_reconnect(self) -> bool | None:
         """Run the current venue reconnect policy, or report unavailable."""
@@ -539,6 +539,19 @@ def build_rithmic_runtime_owners(
         if ledger_recovery is not None
         else None
     )
+    order_event_stream = RithmicOrderEventStreamService(
+        adapter=adapter,
+        stop_event=stop_event,
+        is_running=callbacks.is_running,
+        publish_worker=callbacks.publish_worker,
+        reconcile_if_needed=callbacks.reconcile_if_needed,
+        process_event=callbacks.process_event,
+        lockdown=callbacks.lockdown,
+        assert_runtime_leadership=callbacks.assert_runtime_leadership,
+        halt_submissions=callbacks.halt_submissions,
+        on_runtime_started=callbacks.on_runtime_started,
+        logger=logger,
+    )
     runtime_recovery = (
         RithmicRuntimeRecoveryService(
             adapter=adapter,
@@ -555,7 +568,9 @@ def build_rithmic_runtime_owners(
                 ledger_recovery.publish_authoritative_summary
             ),
             assert_runtime_leadership=callbacks.assert_runtime_leadership,
-            start_order_event_stream=callbacks.start_order_event_stream,
+            start_order_event_stream=lambda: order_event_stream.start(
+                halt_on_failure=False
+            ),
             resume_after_reconcile=lambda: (execution_engine.resume_after_reconcile()),
             lockdown=callbacks.lockdown,
             logger=logger,
@@ -586,19 +601,6 @@ def build_rithmic_runtime_owners(
         assert_leadership=callbacks.assert_runtime_leadership,
         restart_order_stream=callbacks.start_order_event_stream,
         lockdown=callbacks.lockdown,
-        logger=logger,
-    )
-    order_event_stream = RithmicOrderEventStreamService(
-        adapter=adapter,
-        stop_event=stop_event,
-        is_running=callbacks.is_running,
-        publish_worker=callbacks.publish_worker,
-        reconcile_if_needed=callbacks.reconcile_if_needed,
-        process_event=callbacks.process_event,
-        lockdown=callbacks.lockdown,
-        assert_runtime_leadership=callbacks.assert_runtime_leadership,
-        halt_submissions=callbacks.halt_submissions,
-        on_runtime_started=callbacks.on_runtime_started,
         logger=logger,
     )
     kill_switch_clear_preparation = RithmicKillSwitchClearPreparationService(

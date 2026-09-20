@@ -60,6 +60,7 @@ SNAPSHOT_DIAGNOSTIC_KEYS = (
     "snapshot_error_stage",
     "snapshot_error_code",
     "snapshot_error_cause",
+    "snapshot_retryable",
 )
 RAW_SENTINELS = (
     "PROVIDER_SECRET_123 ACCOUNT_ID_SECRET_123 BASKET_ID_SECRET_123 "
@@ -1253,12 +1254,14 @@ def test_reconciler_leaves_planned_audit_when_completion_audit_fails():
     db.rollback.assert_called_once()
 
 
+@pytest.mark.parametrize("retryable", (False, True))
 @pytest.mark.parametrize(("stage", "code", "cause"), SAFE_SNAPSHOT_FAILURES)
 def test_reconciler_snapshot_failure_blocks_every_owned_order_without_mutation(
     caplog,
     stage,
     code,
     cause,
+    retryable,
 ):
     order = local_order(status="SUBMITTED")
     repo = MagicMock()
@@ -1279,7 +1282,12 @@ def test_reconciler_snapshot_failure_blocks_every_owned_order_without_mutation(
         local_positions_loader=lambda: [],
     )
 
-    error = snapshot_failure(stage=stage, stable_error_code=code, safe_cause=cause)
+    error = snapshot_failure(
+        stage=stage,
+        stable_error_code=code,
+        safe_cause=cause,
+        retryable=retryable,
+    )
     with caplog.at_level("ERROR", logger="OrderReconciler"):
         result = reconciler.reconcile(
             snapshot_loader=Mock(side_effect=error),
@@ -1306,7 +1314,7 @@ def test_reconciler_snapshot_failure_blocks_every_owned_order_without_mutation(
         result,
         db.add.call_args.args[0].payload,
         caplog.records,
-        ("RuntimeError", stage, code, cause),
+        ("RuntimeError", stage, code, cause, retryable),
     )
     processor.assert_not_called()
 
@@ -1361,6 +1369,7 @@ def test_reconciler_snapshot_failure_logs_once_when_audit_commit_fails(caplog):
         (RuntimeError, "replace", "stage", "x" * 1000),
         (RuntimeError, "replace", "stable_error_code", "x" * 1000),
         (RuntimeError, "replace", "safe_cause", "x" * 1000),
+        (RuntimeError, "replace", "retryable", "yes"),
         (RuntimeError, "replace", "stable_error_code", "pnl_snapshot_failed"),
         (ValueError, "unchanged", "stage", None),
     ],
@@ -1392,6 +1401,7 @@ def test_reconciler_snapshot_failure_falls_back_atomically(
         "stage": "order_snapshot",
         "stable_error_code": "order_snapshot_failed",
         "safe_cause": "ORDER snapshot failed",
+        "retryable": False,
     }
     if mutation == "missing":
         attributes.pop(field)
@@ -1407,6 +1417,7 @@ def test_reconciler_snapshot_failure_falls_back_atomically(
         "unclassified_internal",
         "unclassified_ledger_snapshot_failure",
         "ledger snapshot failed before safe classification",
+        False,
     )
     assert_snapshot_diagnostics(
         result,

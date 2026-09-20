@@ -20,7 +20,7 @@ def _service(adapter, **overrides):
         "lockdown": MagicMock(),
         "assert_runtime_leadership": MagicMock(),
         "halt_submissions": MagicMock(),
-        "on_runtime_started": MagicMock(),
+        "on_runtime_started": MagicMock(return_value=True),
         "logger": MagicMock(),
     }
     dependencies["stop_event"].is_set.return_value = False
@@ -43,6 +43,21 @@ def test_start_failure_halts_and_preserves_original_exception() -> None:
     dependencies["publish_worker"].assert_not_called()
 
 
+def test_recovery_start_failure_preserves_existing_reconcile_gate_only() -> None:
+    error = RuntimeError("provider unavailable")
+    adapter = MagicMock()
+    adapter.start_order_event_stream.side_effect = error
+    owner, dependencies = _service(adapter)
+
+    with pytest.raises(RuntimeError) as raised:
+        owner.start(halt_on_failure=False)
+
+    assert raised.value is error
+    dependencies["halt_submissions"].assert_not_called()
+    dependencies["on_runtime_started"].assert_not_called()
+    dependencies["publish_worker"].assert_not_called()
+
+
 def test_start_publishes_current_worker_before_starting_it() -> None:
     calls: list[str] = []
     adapter = MagicMock()
@@ -61,7 +76,7 @@ def test_start_publishes_current_worker_before_starting_it() -> None:
         adapter,
         stop_event=stop_event,
         on_runtime_started=MagicMock(
-            side_effect=lambda: calls.append("runtime_started")
+            side_effect=lambda: calls.append("runtime_started") or True
         ),
         publish_worker=MagicMock(
             side_effect=lambda worker: calls.append("publish_worker")
@@ -72,7 +87,7 @@ def test_start_publishes_current_worker_before_starting_it() -> None:
         "src.core.adapters.rithmic_order_event_stream.threading.Thread",
         Worker,
     ):
-        owner.start()
+        assert owner.start() is True
 
     assert calls == [
         "adapter_start",

@@ -7,6 +7,8 @@ from decimal import Decimal
 from logging import Logger
 from typing import Any
 
+from .rithmic_runtime_recovery import rithmic_maintenance_active
+
 
 class RithmicLedgerRecoveryService:
     """Own Rithmic startup recovery and verified account publication."""
@@ -20,6 +22,7 @@ class RithmicLedgerRecoveryService:
         now_seconds: Callable[[], float],
         publish_authoritative_balance: Callable[..., None],
         logger: Logger,
+        maintenance_active: Callable[[], bool] = rithmic_maintenance_active,
     ) -> None:
         self._profile = profile
         self._account_id = account_id
@@ -27,9 +30,21 @@ class RithmicLedgerRecoveryService:
         self._now_seconds = now_seconds
         self._publish_authoritative_balance = publish_authoritative_balance
         self._logger = logger
+        self._maintenance_active = maintenance_active
 
     def reconcile_startup(self) -> dict[str, Any]:
         """Return the existing fail-closed startup reconciliation envelope."""
+        if self._maintenance_active():
+            self._logger.info(
+                "Startup order reconciliation deferred during Rithmic maintenance"
+            )
+            return {
+                "recoverable_count": 0,
+                "unresolved_count": 1,
+                "verification_blocked_count": 1,
+                "auto_resume_safe": False,
+                "snapshot_error_code": "provider_maintenance_active",
+            }
         try:
             summary = self._reconcile_owned_orders(
                 self._profile,

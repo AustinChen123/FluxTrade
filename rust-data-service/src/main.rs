@@ -10,7 +10,9 @@ mod watchdog;
 
 use crate::publisher::{create_publish_channel, RedisPublisher, DEFAULT_CHANNEL_CAPACITY};
 use crate::runtime_supervisor::{
-    initialize_process_diagnostics, report_terminal_failure, supervise, TaskId,
+    initialize_process_diagnostics, mark_terminal_restart_cooldown, report_terminal_failure,
+    supervise, terminal_restart_decision, wait_for_shutdown, wait_for_shutdown_or_delay, TaskId,
+    TerminalRestartDecision, WaitOutcome,
 };
 
 use clap::{Parser, Subcommand};
@@ -18,7 +20,7 @@ use dotenvy::dotenv;
 use std::process::ExitCode;
 use tokio::sync::mpsc;
 use tokio::task::JoinSet;
-use tracing::info;
+use tracing::{info, warn};
 
 #[derive(Parser)]
 #[command(author, version, about, long_about = None)]
@@ -175,11 +177,47 @@ async fn main() -> ExitCode {
         .install_default()
         .expect("Failed to install crypto provider");
 
-    match run_application().await {
-        Ok(()) => ExitCode::SUCCESS,
-        Err(error) => {
-            report_terminal_failure(&error);
-            ExitCode::FAILURE
+    let mut provider_restart_attempts = 0_u8;
+    loop {
+        match run_application().await {
+            Ok(()) => return ExitCode::SUCCESS,
+            Err(error) => {
+                report_terminal_failure(&error);
+                match terminal_restart_decision(&error, provider_restart_attempts) {
+                    TerminalRestartDecision::Exit => return ExitCode::FAILURE,
+                    TerminalRestartDecision::Quiescent { attempts } => {
+                        warn!(
+                            attempts,
+                            runtime_state = "not_ready",
+                            provider_io = "quiescent",
+                            "Provider restart verification exhausted; process is quiescent and not ready until manual restart"
+                        );
+                        if wait_for_shutdown().await.is_err() {
+                            warn!("Quiescent provider runtime could not install shutdown handling");
+                            return ExitCode::FAILURE;
+                        }
+                        return ExitCode::SUCCESS;
+                    }
+                    TerminalRestartDecision::Cooldown { attempt, delay } => {
+                        provider_restart_attempts = attempt;
+                        warn!(
+                            attempt = provider_restart_attempts,
+                            cooldown_seconds = delay.as_secs(),
+                            "Provider session failed; all live tasks stopped before bounded restart verification"
+                        );
+                        match wait_for_shutdown_or_delay(delay).await {
+                            Ok(WaitOutcome::DelayElapsed) => {}
+                            Ok(WaitOutcome::Shutdown) => return ExitCode::SUCCESS,
+                            Err(_) => {
+                                warn!(
+                                    "Provider restart cooldown could not install shutdown handling"
+                                );
+                                return ExitCode::FAILURE;
+                            }
+                        }
+                    }
+                }
+            }
         }
     }
 }
@@ -404,6 +442,7 @@ async fn run_live_mode(
             rithmic_symbol,
         ),
     )?;
+    let terminal_policy = live_runtime.terminal_policy();
 
     // --- Supervised task set (Task 1: task supervision) ---
     let mut join_set: JoinSet<(TaskId, anyhow::Result<()>)> = JoinSet::new();
@@ -473,7 +512,17 @@ async fn run_live_mode(
     });
     info!("Supervised task spawned: event-loop");
 
-    supervise(join_set).await?;
+    if let Err(error) = supervise(join_set).await {
+        if let Some(cooldown) = terminal_policy.restart_cooldown(&error) {
+            let reset_attempts = terminal_policy.restart_episode_was_stable(&error);
+            return Err(mark_terminal_restart_cooldown(
+                error,
+                cooldown,
+                reset_attempts,
+            ));
+        }
+        return Err(error);
+    }
 
     // Graceful cleanup
     info!("Closing all connections...");

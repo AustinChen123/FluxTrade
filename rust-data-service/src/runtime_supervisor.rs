@@ -1,6 +1,7 @@
 #[cfg(unix)]
-use anyhow::Context;
+use anyhow::Context as _;
 use std::future::Future;
+use std::time::Duration;
 use tokio::task::JoinSet;
 use tracing::{error, info, warn, Level};
 
@@ -59,6 +60,90 @@ fn install_sanitized_panic_hook() {
 
 pub(crate) async fn supervise(join_set: JoinSet<SupervisedTask>) -> anyhow::Result<()> {
     supervise_until(join_set, shutdown_signal()?).await
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum WaitOutcome {
+    Shutdown,
+    DelayElapsed,
+}
+
+pub(crate) async fn wait_for_shutdown_or_delay(delay: Duration) -> anyhow::Result<WaitOutcome> {
+    Ok(wait_for_shutdown_or_delay_until(delay, shutdown_signal()?).await)
+}
+
+pub(crate) async fn wait_for_shutdown() -> anyhow::Result<()> {
+    shutdown_signal()?.await;
+    Ok(())
+}
+
+#[derive(Debug)]
+struct TerminalRestartCooldown {
+    delay: Duration,
+    reset_attempts: bool,
+}
+
+impl std::fmt::Display for TerminalRestartCooldown {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("terminal restart cooldown required")
+    }
+}
+
+pub(crate) fn mark_terminal_restart_cooldown(
+    error: anyhow::Error,
+    delay: Duration,
+    reset_attempts: bool,
+) -> anyhow::Error {
+    error.context(TerminalRestartCooldown {
+        delay,
+        reset_attempts,
+    })
+}
+
+pub(crate) fn terminal_restart_cooldown(error: &anyhow::Error) -> Option<Duration> {
+    error
+        .downcast_ref::<TerminalRestartCooldown>()
+        .map(|marker| marker.delay)
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum TerminalRestartDecision {
+    Exit,
+    Cooldown { attempt: u8, delay: Duration },
+    Quiescent { attempts: u8 },
+}
+
+pub(crate) fn terminal_restart_decision(
+    error: &anyhow::Error,
+    completed_attempts: u8,
+) -> TerminalRestartDecision {
+    let Some(delay) = terminal_restart_cooldown(error) else {
+        return TerminalRestartDecision::Exit;
+    };
+    let reset_attempts = error
+        .downcast_ref::<TerminalRestartCooldown>()
+        .is_some_and(|marker| marker.reset_attempts);
+    let completed_attempts = if reset_attempts {
+        0
+    } else {
+        completed_attempts
+    };
+    let attempt = completed_attempts.saturating_add(1);
+    if attempt >= 3 {
+        TerminalRestartDecision::Quiescent { attempts: attempt }
+    } else {
+        TerminalRestartDecision::Cooldown { attempt, delay }
+    }
+}
+
+async fn wait_for_shutdown_or_delay_until(
+    delay: Duration,
+    shutdown: impl Future<Output = ()>,
+) -> WaitOutcome {
+    tokio::select! {
+        _ = shutdown => WaitOutcome::Shutdown,
+        _ = tokio::time::sleep(delay) => WaitOutcome::DelayElapsed,
+    }
 }
 
 #[cfg(unix)]
@@ -423,6 +508,52 @@ mod tests {
         assert_sibling_stopped_before_return(&stopped);
     }
 
+    #[cfg(feature = "rithmic")]
+    #[test]
+    fn rithmic_terminal_policy_recognizes_fatal_session_through_supervisor_source() {
+        let source = crate::connector::rithmic::handshake_rejection_with_contexts();
+        let error =
+            supervised_task_exit_error(&TaskId::Connector("rithmic".to_string()), Err(source));
+        let policy =
+            crate::connector::terminal::ConnectorTerminalPolicy::new(&["rithmic".to_string()]);
+
+        let cooldown = policy.restart_cooldown(&error).unwrap();
+        let marked = mark_terminal_restart_cooldown(error, cooldown, false);
+
+        assert_eq!(terminal_restart_cooldown(&marked), Some(cooldown));
+        assert_eq!(terminal_diagnostic(&marked).task, "connector:rithmic");
+        assert!(crate::connector::rithmic::is_fatal_session_error(&marked));
+    }
+
+    #[test]
+    fn terminal_restart_decision_matrix_is_bounded_and_provider_specific() {
+        assert_eq!(
+            terminal_restart_decision(&anyhow::anyhow!("ordinary failure"), 0),
+            TerminalRestartDecision::Exit
+        );
+
+        let delay = Duration::from_secs(17);
+        for (completed, expected) in [
+            (0, TerminalRestartDecision::Cooldown { attempt: 1, delay }),
+            (1, TerminalRestartDecision::Cooldown { attempt: 2, delay }),
+            (2, TerminalRestartDecision::Quiescent { attempts: 3 }),
+        ] {
+            let marked = mark_terminal_restart_cooldown(anyhow::anyhow!("provider"), delay, false);
+            assert_eq!(terminal_restart_decision(&marked, completed), expected);
+        }
+    }
+
+    #[test]
+    fn stable_runtime_starts_a_new_terminal_restart_episode() {
+        let delay = Duration::from_secs(17);
+        let marked = mark_terminal_restart_cooldown(anyhow::anyhow!("provider"), delay, true);
+
+        assert_eq!(
+            terminal_restart_decision(&marked, 2),
+            TerminalRestartDecision::Cooldown { attempt: 1, delay }
+        );
+    }
+
     #[tokio::test]
     async fn panicked_join_is_sanitized_and_cancels_pending_siblings() {
         let mut join_set = JoinSet::new();
@@ -451,6 +582,22 @@ mod tests {
     #[tokio::test]
     async fn empty_task_set_completes_cleanly() {
         assert!(supervise_until(JoinSet::new(), pending()).await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn terminal_restart_delay_completes_when_delay_elapses() {
+        assert_eq!(
+            wait_for_shutdown_or_delay_until(Duration::ZERO, pending()).await,
+            WaitOutcome::DelayElapsed
+        );
+    }
+
+    #[tokio::test]
+    async fn terminal_restart_delay_is_interruptible_by_shutdown() {
+        assert_eq!(
+            wait_for_shutdown_or_delay_until(Duration::from_secs(3_600), async {}).await,
+            WaitOutcome::Shutdown
+        );
     }
 
     use crate::normalized_optional_value;
@@ -1212,10 +1359,7 @@ mod tests {
         let main_product = product_source(include_str!("main.rs"));
         let owner_product = product_source(include_str!("runtime_supervisor.rs"));
 
-        assert_eq!(
-            main_product.matches("supervise(join_set).await?").count(),
-            1
-        );
+        assert_eq!(main_product.matches("supervise(join_set).await").count(), 1);
         assert_eq!(
             main_product
                 .matches("initialize_process_diagnostics();")

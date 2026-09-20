@@ -8,8 +8,23 @@ use super::{codec, protocol};
 #[error("{0}")]
 struct FatalSessionError(String);
 
+#[derive(Debug, thiserror::Error)]
+#[error("{source}")]
+struct RetryableSessionError {
+    #[source]
+    source: anyhow::Error,
+}
+
 pub(crate) fn is_fatal_session_error(error: &anyhow::Error) -> bool {
-    error.downcast_ref::<FatalSessionError>().is_some()
+    error
+        .chain()
+        .any(|source| source.downcast_ref::<FatalSessionError>().is_some())
+}
+
+pub(crate) fn is_retryable_session_error(error: &anyhow::Error) -> bool {
+    error
+        .chain()
+        .any(|source| source.downcast_ref::<RetryableSessionError>().is_some())
 }
 
 pub(crate) fn is_handshake_rejection(error: &(dyn std::error::Error + 'static)) -> bool {
@@ -224,6 +239,7 @@ impl RithmicSession {
             expect_template(frame, HEARTBEAT_RESPONSE)?;
             let response: protocol::ResponseHeartbeat = codec::decode(frame)?;
             ensure_success(&response.rp_code)
+                .map_err(|source| anyhow::Error::new(RetryableSessionError { source }))
         })();
         self.finish_response(result, SessionState::Active)
     }
@@ -641,6 +657,7 @@ mod tests {
             .unwrap_err();
 
         assert!(!is_fatal_session_error(&error));
+        assert!(is_retryable_session_error(&error));
         assert_eq!(session.state(), SessionState::Failed);
     }
 

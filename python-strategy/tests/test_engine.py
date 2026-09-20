@@ -1628,6 +1628,8 @@ class TestEngineInit:
         engine.execution_engine.reconcile_recoverable_client_orders = MagicMock()
         engine.execution_engine.clock.now = MagicMock(return_value=1704067201)
         engine.account_service.replace_authoritative_balance = MagicMock()
+        assert engine._venue_runtime.ledger_recovery is not None
+        engine._venue_runtime.ledger_recovery._maintenance_active = lambda: False
 
         result = engine._reconcile_recoverable_orders_on_startup()
 
@@ -7821,33 +7823,56 @@ class TestRuntimeReconciliationThread:
         engine._halt_for_kill_switch.assert_called_once_with()
 
     @pytest.mark.parametrize(
-        ("summary", "apply_error", "expected_reason"),
+        (
+            "summary",
+            "reconcile_error",
+            "apply_error",
+            "expected_reason",
+            "expects_global_lockdown",
+        ),
         [
             (
                 {"recoverable_count": 1, "auto_resume_safe": False},
                 None,
+                None,
                 "rithmic_runtime_reconciliation_unresolved",
+                True,
             ),
             (
                 _authoritative_rithmic_summary(),
+                None,
                 RuntimeError("bad balance"),
                 "rithmic_runtime_reconciliation_failed",
+                True,
+            ),
+            (
+                _authoritative_rithmic_summary(),
+                RuntimeError("provider maintenance"),
+                None,
+                "rithmic_runtime_reconciliation_failed",
+                False,
             ),
         ],
     )
-    def test_periodic_rithmic_reconciliation_failure_enters_lockdown(
+    def test_periodic_rithmic_failure_uses_exact_containment_boundary(
         self,
         engine,
         summary,
+        reconcile_error,
         apply_error,
         expected_reason,
+        expects_global_lockdown,
+        caplog,
     ):
         adapter = _rithmic_adapter_for_reconnect_test()
         engine.execution_engine.adapter = adapter
         engine._runtime_profile = "test"
         engine._runtime_account_id = "ACCOUNT"
         engine.execution_engine.halt_for_reconcile = MagicMock(return_value=True)
-        engine.execution_engine.reconcile_owned_orders = MagicMock(return_value=summary)
+        engine.execution_engine.reconcile_owned_orders = MagicMock(
+            return_value=summary,
+            side_effect=reconcile_error,
+        )
         engine._publish_authoritative_account_summary = MagicMock(
             side_effect=apply_error
         )
@@ -7860,7 +7885,13 @@ class TestRuntimeReconciliationThread:
 
         engine._start_exchange_order_event_stream.assert_called_once_with()
         engine.execution_engine.resume_after_reconcile.assert_not_called()
-        engine._detect_external_order_drift.assert_called_once_with(expected_reason)
+        if expects_global_lockdown:
+            engine._detect_external_order_drift.assert_called_once_with(expected_reason)
+        else:
+            engine._detect_external_order_drift.assert_not_called()
+        assert (
+            f"Periodic Rithmic recovery remains entry-blocked: reason={expected_reason}"
+        ) in caplog.messages
 
 
 class TestExchangeOrderEventThread:
@@ -8742,7 +8773,17 @@ def _install_rithmic_order_reconnect_service(
         assert_runtime_leadership=engine._assert_runtime_leadership,
         logger=logging.getLogger("test.rithmic_order_reconnect"),
     )
-    service.on_runtime_started()
+    generation_reader = adapter.connection_generation
+    if isinstance(generation_reader, MagicMock):
+        prior_side_effect = generation_reader.side_effect
+        prior_return_value = generation_reader.return_value
+        generation_reader.side_effect = None
+        generation_reader.return_value = 1
+        service.on_runtime_started()
+        generation_reader.side_effect = prior_side_effect
+        generation_reader.return_value = prior_return_value
+    else:
+        service.on_runtime_started()
     runtime.is_rithmic_runtime = True
     runtime.order_reconnect = service
     return service
@@ -8752,6 +8793,10 @@ def _install_venue_runtime_recovery_service(
     engine: StrategyEngine,
     adapter: RithmicExchangeAdapter,
 ) -> RithmicRuntimeRecoveryService:
+    def start_order_event_stream() -> bool:
+        engine._start_exchange_order_event_stream()
+        return True
+
     runtime = _rithmic_runtime_owners(engine)
     service = RithmicRuntimeRecoveryService(
         adapter=adapter,
@@ -8770,12 +8815,13 @@ def _install_venue_runtime_recovery_service(
             engine._publish_authoritative_account_summary(summary)
         ),
         assert_runtime_leadership=engine._assert_runtime_leadership,
-        start_order_event_stream=lambda: engine._start_exchange_order_event_stream(),
+        start_order_event_stream=start_order_event_stream,
         resume_after_reconcile=lambda: (
             engine.execution_engine.resume_after_reconcile()
         ),
         lockdown=lambda reason: engine._detect_external_order_drift(reason),
         logger=logging.getLogger("test.rithmic_runtime_recovery"),
+        maintenance_active=lambda: False,
     )
     runtime.is_rithmic_runtime = True
     runtime.runtime_recovery = service
@@ -10843,10 +10889,10 @@ def test_generation_read_failure_reconciles_fail_closed(engine):
     engine.execution_engine.resume_after_reconcile = MagicMock()
     _install_rithmic_order_reconnect_service(engine, adapter)
 
-    assert engine._reconcile_owned_orders_on_reconnect() is True
+    assert engine._reconcile_owned_orders_on_reconnect() is False
 
     engine.execution_engine.reconcile_owned_orders.assert_called_once_with()
-    engine.execution_engine.resume_after_reconcile.assert_called_once_with()
+    engine.execution_engine.resume_after_reconcile.assert_not_called()
 
 
 @pytest.mark.parametrize(

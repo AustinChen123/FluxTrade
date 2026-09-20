@@ -57,11 +57,20 @@ class RithmicOrderReconnectService:
         with self._generation_lock:
             return self._pending_generation
 
-    def on_runtime_started(self) -> None:
-        """Atomically baseline every successfully started ORDER runtime."""
+    def on_runtime_started(self) -> bool:
+        """Baseline the local runtime, including a disconnected generation zero."""
+        try:
+            generation = max(0, int(self._adapter.connection_generation()))
+        except Exception:
+            self._logger.exception(
+                "Initial order connection generation unavailable; baselining zero"
+            )
+            generation = 0
+        baseline_generation = 0 if generation == 0 else 1
         with self._generation_lock:
-            self._last_generation = 1
+            self._last_generation = baseline_generation
             self._pending_generation = None
+        return generation > 0
 
     def _generation_to_reconcile(self) -> tuple[int, int] | None:
         with self._generation_lock:
@@ -151,7 +160,11 @@ class RithmicOrderReconnectService:
             self._adapter.close()
             raise
 
-        self.on_runtime_started()
+        if not self.on_runtime_started():
+            self._logger.warning(
+                "Restarted order runtime is disconnected; submissions remain gated"
+            )
+            return False
         self._resume_after_reconcile()
         self._logger.info(
             "Reconnect order reconciliation complete: %s recoverable orders",

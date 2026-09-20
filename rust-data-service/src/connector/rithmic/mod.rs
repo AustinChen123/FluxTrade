@@ -56,13 +56,15 @@ pub(crate) mod protocol {
 mod session;
 #[cfg(test)]
 pub(crate) use session::handshake_rejection_with_contexts;
+pub(crate) use session::is_fatal_session_error;
 pub(crate) use session::is_handshake_rejection;
 
 #[allow(dead_code)]
 mod transport;
 pub(crate) use transport::PayloadFailure;
+pub(crate) use transport::{error_after_stable_connection, is_controlled_halt};
 #[cfg(test)]
-pub(crate) use transport::PayloadFailureKind;
+pub(crate) use transport::{mark_test_stable_connection, PayloadFailureKind};
 
 #[cfg(test)]
 mod tests {

@@ -43,7 +43,7 @@ class RithmicOrderEventStreamService:
         lockdown: Callable[[str], None],
         assert_runtime_leadership: Callable[[], None],
         halt_submissions: Callable[[], None],
-        on_runtime_started: Callable[[], None],
+        on_runtime_started: Callable[[], bool],
         logger: Logger,
     ) -> None:
         self._adapter = adapter
@@ -58,13 +58,14 @@ class RithmicOrderEventStreamService:
         self._on_runtime_started = on_runtime_started
         self._logger = logger
 
-    def start(self) -> None:
+    def start(self, *, halt_on_failure: bool = True) -> bool:
         try:
             self._adapter.start_order_event_stream()
         except Exception:
-            self._halt_submissions()
+            if halt_on_failure:
+                self._halt_submissions()
             raise
-        self._on_runtime_started()
+        connected = self._on_runtime_started()
         self._stop_event.clear()
         worker = threading.Thread(
             target=self._run,
@@ -73,6 +74,7 @@ class RithmicOrderEventStreamService:
         )
         self._publish_worker(worker)
         worker.start()
+        return connected
 
     def _run(self) -> None:
         while self._is_running() and not self._stop_event.is_set():

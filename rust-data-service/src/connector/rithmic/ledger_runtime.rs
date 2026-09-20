@@ -6,10 +6,11 @@ use super::{
         OrderSnapshotEvent, PnlSnapshotEvent,
     },
     session::Plant,
-    transport::{self, ConnectionEvent, RithmicConnection},
+    transport::{self, ConnectionEvent, MaintenanceGuard, RithmicConnection},
 };
 use anyhow::{ensure, Context, Result};
-use std::{collections::HashSet, time::Duration};
+use chrono::Utc;
+use std::{collections::HashSet, sync::Arc, time::Duration};
 use tracing::warn;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -84,13 +85,42 @@ impl std::fmt::Display for LedgerSnapshotFailure {
     }
 }
 
+#[derive(Debug, thiserror::Error)]
+#[error("{source}")]
+struct RetryableLedgerFailure {
+    #[source]
+    source: anyhow::Error,
+}
+
+fn mark_retryable_ledger(error: anyhow::Error) -> anyhow::Error {
+    RetryableLedgerFailure { source: error }.into()
+}
+
+pub(crate) fn is_retryable_snapshot_error(error: &anyhow::Error) -> bool {
+    transport::is_retryable_connection_error(error)
+        || error
+            .chain()
+            .any(|source| source.downcast_ref::<RetryableLedgerFailure>().is_some())
+}
+
+#[cfg(test)]
+#[allow(dead_code)]
+pub(crate) fn mark_test_retryable_snapshot_error(error: anyhow::Error) -> anyhow::Error {
+    mark_retryable_ledger(error)
+}
+
 trait FlattenTimeout<T> {
     fn flatten_timeout(self, message: impl std::fmt::Display + Send + Sync + 'static) -> Result<T>;
 }
 
 impl<T> FlattenTimeout<T> for std::result::Result<Result<T>, tokio::time::error::Elapsed> {
     fn flatten_timeout(self, message: impl std::fmt::Display + Send + Sync + 'static) -> Result<T> {
-        self.context(message).and_then(|inner| inner)
+        match self {
+            Ok(inner) => inner,
+            Err(error) => Err(mark_retryable_ledger(
+                anyhow::Error::new(error).context(message),
+            )),
+        }
     }
 }
 
@@ -136,6 +166,21 @@ pub(crate) async fn run_with_recovery(
     account_id: Option<&str>,
     recovery: Option<RecoveryQuery<'_>>,
 ) -> Result<RemoteLedgerSnapshot> {
+    run_with_recovery_guarded(
+        profile,
+        account_id,
+        recovery,
+        Arc::new(|| transport::maintenance_active(Utc::now())),
+    )
+    .await
+}
+
+async fn run_with_recovery_guarded(
+    profile: &str,
+    account_id: Option<&str>,
+    recovery: Option<RecoveryQuery<'_>>,
+    maintenance_active: MaintenanceGuard,
+) -> Result<RemoteLedgerSnapshot> {
     let account_id =
         normalize_account_id(account_id).context(LedgerSnapshotFailure::REQUEST_VALIDATION)?;
     if let Some(recovery) = recovery.as_ref() {
@@ -144,10 +189,14 @@ pub(crate) async fn run_with_recovery(
 
     let order_runtime =
         config::load(profile, Plant::Order).context(LedgerSnapshotFailure::ORDER_CONFIG)?;
-    let mut order_connection =
-        transport::connect(&order_runtime.url, order_runtime.login, RESPONSE_TIMEOUT)
-            .await
-            .context(LedgerSnapshotFailure::ORDER_CONNECT)?;
+    let mut order_connection = transport::connect_with_maintenance_guard(
+        &order_runtime.url,
+        order_runtime.login,
+        RESPONSE_TIMEOUT,
+        Arc::clone(&maintenance_active),
+    )
+    .await
+    .context(LedgerSnapshotFailure::ORDER_CONNECT)?;
     wait_for_heartbeat(&mut order_connection, "ORDER")
         .await
         .context(LedgerSnapshotFailure::ORDER_HEARTBEAT)?;
@@ -219,10 +268,14 @@ pub(crate) async fn run_with_recovery(
 
     let pnl_runtime =
         config::load(profile, Plant::Pnl).context(LedgerSnapshotFailure::PNL_CONFIG)?;
-    let mut pnl_connection =
-        transport::connect(&pnl_runtime.url, pnl_runtime.login, RESPONSE_TIMEOUT)
-            .await
-            .context(LedgerSnapshotFailure::PNL_CONNECT)?;
+    let mut pnl_connection = transport::connect_with_maintenance_guard(
+        &pnl_runtime.url,
+        pnl_runtime.login,
+        RESPONSE_TIMEOUT,
+        maintenance_active,
+    )
+    .await
+    .context(LedgerSnapshotFailure::PNL_CONNECT)?;
     wait_for_heartbeat(&mut pnl_connection, "PNL")
         .await
         .context(LedgerSnapshotFailure::PNL_HEARTBEAT)?;
@@ -291,9 +344,14 @@ pub(crate) async fn wait_for_heartbeat(
     connection: &mut RithmicConnection,
     plant: &str,
 ) -> Result<()> {
-    let event = tokio::time::timeout(RESPONSE_TIMEOUT, connection.next_event())
-        .await
-        .with_context(|| format!("Rithmic {plant} heartbeat timed out"))??;
+    let event = match tokio::time::timeout(RESPONSE_TIMEOUT, connection.next_event()).await {
+        Ok(event) => event?,
+        Err(error) => {
+            return Err(mark_retryable_ledger(
+                anyhow::Error::new(error).context(format!("Rithmic {plant} heartbeat timed out")),
+            ));
+        }
+    };
     ensure!(
         event == ConnectionEvent::HeartbeatConfirmed,
         "Rithmic {plant} payload arrived before heartbeat confirmation"
@@ -705,9 +763,10 @@ pnl_snapshot|pnl_snapshot_failed|PNL snapshot failed";
             error.downcast_ref::<LedgerSnapshotFailure>(),
             Some(&LedgerSnapshotFailure::PNL_SNAPSHOT)
         );
-        assert!(error
+        assert!(error.chain().any(|source| source
             .downcast_ref::<tokio::time::error::Elapsed>()
-            .is_some());
+            .is_some()));
+        assert!(is_retryable_snapshot_error(&error));
 
         let inner: std::result::Result<Result<()>, tokio::time::error::Elapsed> = Ok(Err(
             anyhow::Error::new(std::io::Error::other("inner source")),
@@ -721,6 +780,7 @@ pnl_snapshot|pnl_snapshot_failed|PNL snapshot failed";
             Some(&LedgerSnapshotFailure::PNL_SNAPSHOT)
         );
         assert!(error.downcast_ref::<std::io::Error>().is_some());
+        assert!(!is_retryable_snapshot_error(&error));
     }
 
     fn login_info() -> LoginInfo {

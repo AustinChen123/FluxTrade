@@ -151,6 +151,10 @@ impl LiveRuntime {
         None
     }
 
+    pub(crate) fn terminal_policy(&self) -> super::terminal::ConnectorTerminalPolicy {
+        super::terminal::ConnectorTerminalPolicy::new(&self.enabled_exchanges)
+    }
+
     pub(crate) fn spawn(
         mut self,
         join_set: &mut JoinSet<(TaskId, Result<()>)>,
