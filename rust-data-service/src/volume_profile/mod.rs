@@ -9,6 +9,8 @@
 //! ID syntax, not registry membership or quote-asset semantics.
 pub mod binance_spot;
 pub mod checkpoint;
+#[cfg(unix)]
+pub mod directory;
 mod exact;
 pub mod work_policy;
 
