@@ -1264,6 +1264,7 @@ dependencies = [
  "num-iter",
  "num-traits",
  "rand 0.8.5",
+ "serde",
  "smallvec",
  "zeroize",
 ]
@@ -1997,6 +1998,8 @@ dependencies = [
  "csv",
  "dotenvy",
  "futures-util",
+ "num-bigint-dig",
+ "num-traits",
  "prost",
  "prost-build",
  "protoc-bin-vendored",

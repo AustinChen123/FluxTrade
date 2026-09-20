@@ -65,7 +65,10 @@ from src.core.analytics import (
 )
 from src.core.interfaces.data_source import IDataSource
 from src.core.portfolio_runtime import PortfolioDefinition
-from src.core.adapters.simulated import SimulatedAdapter
+from src.core.adapters.simulated import (
+    SimulatedAdapter,
+    resolve_market_slippage_configuration,
+)
 from src.core.mocks.account_service import BacktestAccountService
 from src.core.journal import StrategyJournal
 from src.core.product_registry import (
@@ -194,6 +197,7 @@ def _write_markdown_report(
     candle_count: int,
     path: Path,
     provenance: BacktestRunProvenance | None = None,
+    market_slippage_bps: Decimal = Decimal("0"),
 ) -> None:
     """Write a markdown summary report."""
     lines: List[str] = []
@@ -235,6 +239,7 @@ def _write_markdown_report(
     lines.append(f"| Start | {start_time} |")
     lines.append(f"| End | {end_time} |")
     lines.append(f"| Candles | {candle_count} |")
+    lines.append(f"| Market Slippage (bps) | {market_slippage_bps} |")
     if fee_config:
         if fee_model == FeeModel.PER_CONTRACT:
             lines.append(f"| Maker Fee / Contract | {fee_config.get('maker', 0)} |")
@@ -328,6 +333,7 @@ class BacktestRunner:
         spot_fee_asset: str = "quote",
         external_funding_events: Sequence[ExternalFundingEvent] = (),
         external_funding_account_id: str | None = None,
+        market_slippage_bps: Decimal = Decimal("0"),
     ):
         self.start_time = start_time
         self.end_time = end_time
@@ -346,6 +352,11 @@ class BacktestRunner:
         self.max_drawdown_limit = max_drawdown_limit
         self.data_source = data_source
         self.fee_config = fee_config or {}
+        self.instrument_spec = instrument_spec
+        self.market_slippage_bps, _ = resolve_market_slippage_configuration(
+            market_slippage_bps,
+            instrument_spec=instrument_spec,
+        )
         unknown_report_keys = set(report_config or {}) - set(DEFAULT_REPORT_CONFIG)
         if unknown_report_keys:
             raise ValueError(
@@ -354,7 +365,6 @@ class BacktestRunner:
             )
         self.report_config = {**DEFAULT_REPORT_CONFIG, **(report_config or {})}
         self._db_session_factory = db_session_factory or _sessionlocal_context
-        self.instrument_spec = instrument_spec
         self.spot_fee_asset = spot_fee_asset
         self.external_funding_events = tuple(external_funding_events)
         self.external_funding_account_id = external_funding_account_id
@@ -611,6 +621,7 @@ class BacktestRunner:
                 fee_model=self.fee_model,
                 candle_count=candle_count,
                 provenance=provenance,
+                market_slippage_bps=self.market_slippage_bps,
                 path=output_dir / "report.md",
             )
 
@@ -664,6 +675,7 @@ class BacktestRunner:
             instrument_spec=self.instrument_spec,
             spot_fee_asset=self.spot_fee_asset,
             external_funding_timeline=funding_timeline,
+            market_slippage_bps=self.market_slippage_bps,
         )
         performance_tracker = (
             FlowNeutralPerformanceTracker(self.initial_balance)
@@ -685,6 +697,7 @@ class BacktestRunner:
             "initial_balance": self.initial_balance,
             "max_drawdown_limit": self.max_drawdown_limit,
             "fee_config": self.fee_config,
+            "market_slippage_bps": self.market_slippage_bps,
             "instrument_spec": self.instrument_spec,
             "spot_fee_asset": self.spot_fee_asset,
             "external_funding_events": self.external_funding_events,

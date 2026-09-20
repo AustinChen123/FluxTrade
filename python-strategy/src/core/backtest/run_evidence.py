@@ -171,7 +171,7 @@ def build_backtest_run_provenance(
         configuration_identity_version=_CONFIGURATION_SCHEMA,
         configuration_sha256=configuration_sha256(configuration),
         runner_configuration_sha256=configuration_sha256(runner_configuration),
-        matching_model="atomic_whole_order_v1",
+        matching_model="atomic_whole_order_fixed_market_slippage_v2",
     )
 
 

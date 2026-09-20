@@ -175,7 +175,7 @@ def test_run_provenance_reports_all_required_hashes_and_matching_contract():
     )
     assert provenance.program_version == "0.1.0"
     assert provenance.extension_version == "0.1.0"
-    assert provenance.matching_model == "atomic_whole_order_v1"
+    assert provenance.matching_model == "atomic_whole_order_fixed_market_slippage_v2"
     for digest in (
         provenance.dataset_sha256,
         provenance.program_sha256,

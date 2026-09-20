@@ -194,6 +194,7 @@ class TestWriteMarkdownReport:
             fee_config={"maker": 0.0002, "taker": 0.0006},
             candle_count=500,
             path=path,
+            market_slippage_bps=Decimal("12.5"),
         )
 
         content = path.read_text()
@@ -206,6 +207,7 @@ class TestWriteMarkdownReport:
         assert "Sortino" in content
         assert "Calmar" in content
         assert "2024-01" in content
+        assert "| Market Slippage (bps) | 12.5 |" in content
 
     def test_labels_per_contract_fees(self, tmp_path):
         path = tmp_path / "report.md"

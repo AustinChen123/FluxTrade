@@ -9,6 +9,7 @@ from src.core.interfaces.exchange import (
     ExchangeOrderSnapshot,
     IExchangeAdapter,
 )
+from src.core.decimal_math import canonical_decimal_text
 from src.core.orm_models import Order
 from src.core.models import OrderSide, Position, Candlestick, PositionSide
 from src.core.precision import PrecisionCodec
@@ -52,6 +53,76 @@ if TYPE_CHECKING:
 # Detect if Rust engine supports strategy_id parameter
 _RUST_HAS_STRATEGY_ID = "strategy_id" in str(inspect.signature(RustOrder))
 logger = logging.getLogger(__name__)
+_INVALID_MARKET_SLIPPAGE_BPS = (
+    "market_slippage_bps must be an exact finite Decimal at least 0"
+)
+_RUST_DECIMAL_MAX_COEFFICIENT = 79_228_162_514_264_337_593_543_950_335
+_RUST_DECIMAL_MAX_SCALE = 28
+
+
+def _rust_decimal_text(value: Decimal, field_name: str) -> str:
+    """Render a Decimal only when rust_decimal can preserve it exactly."""
+    _, digits, exponent = value.as_tuple()
+    assert isinstance(exponent, int)
+    coefficient_text = "".join(str(digit) for digit in digits).lstrip("0") or "0"
+    if coefficient_text == "0":
+        return "0"
+
+    while exponent < 0 and coefficient_text.endswith("0"):
+        coefficient_text = coefficient_text[:-1]
+        exponent += 1
+
+    if exponent < -_RUST_DECIMAL_MAX_SCALE:
+        raise ValueError(f"{field_name} must be exactly representable by Rust Decimal")
+    if exponent >= 0:
+        if len(coefficient_text) + exponent > 29:
+            raise ValueError(
+                f"{field_name} must be exactly representable by Rust Decimal"
+            )
+        coefficient = int(coefficient_text) * 10**exponent
+    else:
+        if len(coefficient_text) > 29:
+            raise ValueError(
+                f"{field_name} must be exactly representable by Rust Decimal"
+            )
+        coefficient = int(coefficient_text)
+    if coefficient > _RUST_DECIMAL_MAX_COEFFICIENT:
+        raise ValueError(f"{field_name} must be exactly representable by Rust Decimal")
+    return canonical_decimal_text(value)
+
+
+def normalize_market_slippage_bps(value: object) -> Decimal:
+    """Validate the exact fixed market-order slippage configuration."""
+    if type(value) is not Decimal or not value.is_finite() or value < 0:
+        raise ValueError(_INVALID_MARKET_SLIPPAGE_BPS)
+    _rust_decimal_text(value, "market_slippage_bps")
+    return value
+
+
+def resolve_market_slippage_configuration(
+    value: object,
+    *,
+    instrument_spec: InstrumentSpec | None,
+    precision_codec: PrecisionCodec | None = None,
+) -> tuple[Decimal, Decimal | None]:
+    """Validate fixed slippage and resolve its authoritative price tick."""
+    market_slippage_bps = normalize_market_slippage_bps(value)
+    if market_slippage_bps == 0:
+        return market_slippage_bps, None
+
+    price_tick = instrument_spec.price_tick if instrument_spec is not None else None
+    if type(price_tick) is not Decimal or not price_tick.is_finite() or price_tick <= 0:
+        raise ValueError(
+            "positive market_slippage_bps requires a positive finite "
+            "InstrumentSpec.price_tick"
+        )
+    _rust_decimal_text(price_tick, "InstrumentSpec.price_tick")
+    if precision_codec is not None and precision_codec.spec.price_tick != price_tick:
+        raise ValueError(
+            "precision price_tick must match InstrumentSpec.price_tick "
+            "when market slippage is enabled"
+        )
+    return market_slippage_bps, price_tick
 
 
 @dataclass(frozen=True, slots=True)
@@ -97,7 +168,16 @@ class SimulatedAdapter(IExchangeAdapter):
         instrument_spec: InstrumentSpec | None = None,
         spot_fee_asset: str = "quote",
         external_funding_timeline: "ExternalFundingTimeline | None" = None,
+        market_slippage_bps: Decimal = Decimal("0"),
     ):
+        (
+            self.market_slippage_bps,
+            market_slippage_price_tick,
+        ) = resolve_market_slippage_configuration(
+            market_slippage_bps,
+            instrument_spec=instrument_spec,
+            precision_codec=precision_codec,
+        )
         contract_multiplier = resolve_contract_multiplier(instrument_spec)
         fee_model = resolve_fee_model(instrument_spec)
         self._instrument_spec = instrument_spec
@@ -123,6 +203,18 @@ class SimulatedAdapter(IExchangeAdapter):
             base_asset=self._cash_spot_spec.base if self._cash_spot_spec else "",
             quote_asset=self._cash_spot_spec.quote if self._cash_spot_spec else "",
             spot_fee_asset=spot_fee_asset,
+            market_slippage_bps=_rust_decimal_text(
+                self.market_slippage_bps,
+                "market_slippage_bps",
+            ),
+            market_slippage_price_tick=(
+                _rust_decimal_text(
+                    market_slippage_price_tick,
+                    "InstrumentSpec.price_tick",
+                )
+                if market_slippage_price_tick is not None
+                else None
+            ),
         )
         self._contract_multiplier = contract_multiplier
         self._precision_codec = precision_codec
@@ -327,9 +419,7 @@ class SimulatedAdapter(IExchangeAdapter):
         if not isinstance(amount, Decimal):
             raise TypeError("external funding amount must be Decimal")
         if not amount.is_finite() or amount <= 0:
-            raise ExchangeError(
-                "external funding amount must be finite and positive"
-            )
+            raise ExchangeError("external funding amount must be finite and positive")
         try:
             return Decimal(self._engine.apply_external_funding(asset, str(amount)))
         except ValueError as exc:
@@ -549,18 +639,24 @@ class SimulatedAdapter(IExchangeAdapter):
              "fee": Decimal, "fill_type": str}
         """
         if self._precision_codec is not None:
-            rust_fills = self._engine.on_scaled_candle(
-                self._to_scaled_rust_candle(candle)
+            scaled_candle = self._to_scaled_rust_candle(candle)
+            rust_fills = self._engine.on_scaled_candle(scaled_candle)
+            market_reference_price = self._precision_codec.decode_price(
+                scaled_candle.open_units
             )
         else:
             rust_fills = self._engine.on_candle(self._to_rust_candle(candle))
+            market_reference_price = candle.open
 
         self._capture_rejections()
         self._apply_due_external_funding(
             timestamp=candle.timestamp,
             mark_price=candle.close,
         )
-        return self._fills_from_rust(rust_fills)
+        return self._fills_from_rust(
+            rust_fills,
+            market_reference_price=market_reference_price,
+        )
 
     def prepare_scaled_candle(self, candle: Candlestick):
         """Convert a Decimal candle to scaled units outside the replay hot loop."""
@@ -576,11 +672,14 @@ class SimulatedAdapter(IExchangeAdapter):
         self._capture_rejections()
         self._apply_due_external_funding(
             timestamp=scaled_candle.timestamp,
-            mark_price=self._precision_codec.decode_price(
-                scaled_candle.close_units
+            mark_price=self._precision_codec.decode_price(scaled_candle.close_units),
+        )
+        return self._fills_from_rust(
+            rust_fills,
+            market_reference_price=self._precision_codec.decode_price(
+                scaled_candle.open_units
             ),
         )
-        return self._fills_from_rust(rust_fills)
 
     def _apply_due_external_funding(
         self,
@@ -614,7 +713,12 @@ class SimulatedAdapter(IExchangeAdapter):
                 }
             )
 
-    def _fills_from_rust(self, rust_fills) -> List[Dict]:
+    def _fills_from_rust(
+        self,
+        rust_fills,
+        *,
+        market_reference_price: Decimal,
+    ) -> List[Dict]:
         fills: List[Dict] = []
         for rf in rust_fills:
             orm_order = self._order_map.pop(rf.order_id, None)
@@ -635,6 +739,13 @@ class SimulatedAdapter(IExchangeAdapter):
                 if self._is_cash_spot and self._spot_fee_asset == "base"
                 else fee_quantity
             )
+            reference_price = (
+                market_reference_price if rf.fill_type == "MARKET" else fill_price
+            )
+            slippage_per_unit = abs(fill_price - reference_price)
+            slippage_cost = (
+                slippage_per_unit * Decimal(rf.quantity) * self._contract_multiplier
+            )
             fills.append(
                 {
                     "order": orm_order,
@@ -644,6 +755,9 @@ class SimulatedAdapter(IExchangeAdapter):
                     "fee_quantity": fee_quantity,
                     "fee_asset": fee_asset,
                     "fill_type": rf.fill_type,
+                    "reference_price": reference_price,
+                    "slippage_per_unit": slippage_per_unit,
+                    "slippage_cost": slippage_cost,
                 }
             )
 

@@ -463,39 +463,57 @@ class SpotFundingProbeStrategy(BaseStrategy):
 @pytest.mark.parametrize(
     (
         "spot_fee_asset",
+        "market_slippage_bps",
         "expected_total_pnl",
         "expected_context_cash",
         "expected_context_equity",
         "expected_context_quantity",
         "expected_final_quantity",
+        "expected_fill_prices",
     ),
     [
         (
             "quote",
+            Decimal("0"),
             Decimal("9.92"),
             Decimal("49.95"),
             Decimal("109.95"),
             Decimal("0.001"),
             Decimal("0.0005"),
+            (Decimal("50000"), Decimal("60000")),
         ),
         (
             "base",
+            Decimal("0"),
             Decimal("9.91"),
             Decimal("50"),
             Decimal("109.94"),
             Decimal("0.000999"),
             Decimal("0.0004985"),
+            (Decimal("50000"), Decimal("60000")),
+        ),
+        (
+            "quote",
+            Decimal("10"),
+            Decimal("9.83998"),
+            Decimal("49.89995"),
+            Decimal("109.89995"),
+            Decimal("0.001"),
+            Decimal("0.0005"),
+            (Decimal("50050"), Decimal("59940")),
         ),
     ],
 )
 def test_full_and_research_runners_use_same_spot_asset_settlement(
     tmp_path,
     spot_fee_asset,
+    market_slippage_bps,
     expected_total_pnl,
     expected_context_cash,
     expected_context_equity,
     expected_context_quantity,
     expected_final_quantity,
+    expected_fill_prices,
 ):
     product_id = "BINANCE:BTCUSDT-SPOT"
     candle_prices = [
@@ -546,6 +564,7 @@ def test_full_and_research_runners_use_same_spot_asset_settlement(
         db_session_factory=session_factory,
         instrument_spec=spec,
         spot_fee_asset=spot_fee_asset,
+        market_slippage_bps=market_slippage_bps,
     )
     full_runner.add_strategy(full_strategy)
 
@@ -560,6 +579,7 @@ def test_full_and_research_runners_use_same_spot_asset_settlement(
         fee_config={"maker": Decimal("0.001"), "taker": Decimal("0.001")},
         instrument_spec=spec,
         spot_fee_asset=spot_fee_asset,
+        market_slippage_bps=market_slippage_bps,
     )
     research_runner.add_strategy(research_strategy)
 
@@ -586,8 +606,16 @@ def test_full_and_research_runners_use_same_spot_asset_settlement(
     )
     assert full_provenance.program_sha256 == research_provenance.program_sha256
     assert full_provenance.extension_sha256 == research_provenance.extension_sha256
-    assert full_provenance.matching_model == "atomic_whole_order_v1"
-    assert research_provenance.matching_model == "atomic_whole_order_v1"
+    assert (
+        full_provenance.matching_model == "atomic_whole_order_fixed_market_slippage_v2"
+    )
+    assert (
+        research_provenance.matching_model
+        == "atomic_whole_order_fixed_market_slippage_v2"
+    )
+    assert tuple(fill.price for fill in full_result["fill_records"]) == (
+        expected_fill_prices
+    )
     assert research_result["raw_trade_count"] == 2
     assert full_result["closed_trades"] == research_result["closed_trades"]
     assert (
@@ -638,6 +666,82 @@ def test_full_and_research_runners_use_same_spot_asset_settlement(
     final_position = research_result["endpoint_state"].positions[0]
     assert final_position.quantity == expected_final_quantity
     assert final_position.side == PositionSide.LONG
+    if market_slippage_bps:
+        research_trades = research_result["raw_trades"]
+        assert tuple(trade.reference_price for trade in research_trades) == (
+            Decimal("50000"),
+            Decimal("60000"),
+        )
+        assert tuple(trade.slippage_per_unit for trade in research_trades) == (
+            Decimal("50"),
+            Decimal("60"),
+        )
+        assert tuple(trade.slippage_cost for trade in research_trades) == (
+            Decimal("0.050"),
+            Decimal("0.0300"),
+        )
+        fill_events = [
+            event for event in full_result["journal"] if event["tag"] == "fill"
+        ]
+        assert tuple(event["data"]["reference_price"] for event in fill_events) == (
+            "50000",
+            "60000",
+        )
+        assert tuple(
+            Decimal(event["data"]["slippage_cost"]) for event in fill_events
+        ) == (
+            Decimal("0.050"),
+            Decimal("0.0300"),
+        )
+
+
+def test_market_slippage_changes_configuration_hash_not_dataset_identity():
+    product_id = "BINANCE:BTCUSDT-SPOT"
+    candles = [
+        Candlestick(
+            product_id=product_id,
+            timeframe=TIMEFRAME,
+            timestamp=index * INTERVAL_MS,
+            open=price,
+            high=price,
+            low=price,
+            close=price,
+            volume=Decimal("10"),
+        )
+        for index, price in enumerate(
+            (Decimal("50000"), Decimal("60000"), Decimal("60000"))
+        )
+    ]
+    spec = InstrumentSpec(
+        product_id=product_id,
+        exchange="binance",
+        symbol="BTC/USDT",
+        base="BTC",
+        quote="USDT",
+        quantity_step=Decimal("0.000001"),
+        price_tick=Decimal("0.01"),
+        min_notional=Decimal("1"),
+    )
+    results = []
+    for market_slippage_bps in (Decimal("0"), Decimal("10")):
+        runner = ResearchBacktestRunner(
+            start_time=0,
+            end_time=2 * INTERVAL_MS,
+            product_id=product_id,
+            timeframe=TIMEFRAME,
+            initial_balance=Decimal("100"),
+            data_source=MemoryDataSource(candles),
+            fee_config={"maker": Decimal("0.001"), "taker": Decimal("0.001")},
+            instrument_spec=spec,
+            market_slippage_bps=market_slippage_bps,
+        )
+        runner.add_strategy(SpotSettlementProbeStrategy())
+        results.append(runner.run()["provenance"])
+
+    baseline, slipped = results
+    assert baseline.dataset_sha256 == slipped.dataset_sha256
+    assert baseline.configuration_sha256 != slipped.configuration_sha256
+    assert baseline.runner_configuration_sha256 != slipped.runner_configuration_sha256
 
 
 class FinerExecutionSpotProbeStrategy(BaseStrategy):
@@ -717,6 +821,7 @@ def test_full_finer_execution_uses_closed_decision_then_later_fill(tmp_path):
         },
         db_session_factory=_sqlite_backtest_session_factory(tmp_path, product_id),
         instrument_spec=spec,
+        market_slippage_bps=Decimal("10"),
     )
     runner.add_strategy(strategy)
 
@@ -728,7 +833,7 @@ def test_full_finer_execution_uses_closed_decision_then_later_fill(tmp_path):
     assert len(result["fill_records"]) == 1
     fill = result["fill_records"][0]
     assert fill.timestamp == 360_000
-    assert fill.price == Decimal("51000")
+    assert fill.price == Decimal("51051")
     assert fill.timestamp > strategy.decision_candles[0].timestamp
     assert [len(context.latest_fills) for context in strategy.contexts] == [0, 1]
     assert len(strategy.contexts[1].latest_fills) == 1
@@ -740,6 +845,7 @@ def test_full_finer_execution_uses_closed_decision_then_later_fill(tmp_path):
     assert result["provenance"].dataset_first_timestamp == 0
     assert result["provenance"].dataset_last_timestamp == 10 * minute_ms
     report = (tmp_path / "finer-report" / "report.md").read_text()
+    assert "| Market Slippage (bps) | 10 |" in report
     for identity in (
         result["provenance"].dataset_sha256,
         result["provenance"].program_sha256,

@@ -14,7 +14,10 @@ from dataclasses import dataclass, replace
 from decimal import Decimal
 from typing import TYPE_CHECKING, Any, Iterable, Mapping, Optional, Sequence, cast
 
-from src.core.adapters.simulated import SimulatedAdapter
+from src.core.adapters.simulated import (
+    SimulatedAdapter,
+    resolve_market_slippage_configuration,
+)
 from src.core.analytics import (
     InitialBalanceInput,
     annualized_sharpe_from_moments,
@@ -93,6 +96,9 @@ class ResearchTrade:
     strategy_id: Optional[str] = None
     fee_asset: str | None = None
     fill_sequence: int | None = None
+    reference_price: Decimal | None = None
+    slippage_per_unit: Decimal | None = None
+    slippage_cost: Decimal | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -132,6 +138,7 @@ class ResearchBacktestRunner:
         spot_fee_asset: str = "quote",
         external_funding_events: Sequence[ExternalFundingEvent] = (),
         external_funding_account_id: str | None = None,
+        market_slippage_bps: Decimal = Decimal("0"),
     ):
         self.start_time = start_time
         self.end_time = end_time
@@ -140,12 +147,17 @@ class ResearchBacktestRunner:
         self.initial_balance = initial_balance
         self.data_source = data_source
         self.fee_config = fee_config or {}
+        self.instrument_spec = instrument_spec
+        self.market_slippage_bps, _ = resolve_market_slippage_configuration(
+            market_slippage_bps,
+            instrument_spec=instrument_spec,
+            precision_codec=precision_codec,
+        )
         self.max_drawdown_limit = max_drawdown_limit
         self.balance_check_interval = balance_check_interval
         self.precision_codec = precision_codec
         self.prepared_scaled_candles = prepared_scaled_candles
         self.capital_allocator = capital_allocator
-        self.instrument_spec = instrument_spec
         self.spot_fee_asset = spot_fee_asset
         self.external_funding_events = tuple(external_funding_events)
         self.external_funding_account_id = external_funding_account_id
@@ -186,6 +198,7 @@ class ResearchBacktestRunner:
             instrument_spec=self.instrument_spec,
             spot_fee_asset=self.spot_fee_asset,
             external_funding_timeline=funding_timeline,
+            market_slippage_bps=self.market_slippage_bps,
         )
         performance_tracker = (
             FlowNeutralPerformanceTracker(Decimal(str(self.initial_balance)))
@@ -222,6 +235,7 @@ class ResearchBacktestRunner:
             "initial_balance": Decimal(str(self.initial_balance)),
             "max_drawdown_limit": self.max_drawdown_limit,
             "fee_config": self.fee_config,
+            "market_slippage_bps": self.market_slippage_bps,
             "instrument_spec": self.instrument_spec,
             "spot_fee_asset": self.spot_fee_asset,
             "external_funding_events": self.external_funding_events,
@@ -997,6 +1011,9 @@ class ResearchBacktestRunner:
                     fee=fill.get("fee_quantity", fill.get("fee")) or Decimal("0"),
                     timestamp=candle.timestamp,
                     fee_asset=fill.get("fee_asset"),
+                    reference_price=fill.get("reference_price"),
+                    slippage_per_unit=fill.get("slippage_per_unit"),
+                    slippage_cost=fill.get("slippage_cost"),
                 )
             )
         return trades

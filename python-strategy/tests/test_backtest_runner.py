@@ -23,6 +23,7 @@ from src.core.backtest_runner import (
 from src.core.analytics import ClosedTrade
 from src.core.models import Candlestick, PositionSide
 from src.core.portfolio_runtime import PortfolioDefinition, PortfolioSleeve
+from src.core.product_registry import InstrumentSpec
 from src.core.journal import StrategyJournal
 from src.core.strategy_context import StrategyContext
 from src.strategies.base import BaseStrategy, StrategyRequirements
@@ -293,6 +294,55 @@ class TestBacktestRunnerInit:
                 timeframe="1m",
                 report_config={"journal": False},
             )
+
+    @pytest.mark.parametrize(
+        ("market_slippage_bps", "price_tick", "message"),
+        [
+            (
+                Decimal("1"),
+                None,
+                "requires a positive finite InstrumentSpec.price_tick",
+            ),
+            (
+                Decimal("1E-29"),
+                Decimal("0.01"),
+                "market_slippage_bps must be exactly representable by Rust Decimal",
+            ),
+            (
+                Decimal("1"),
+                Decimal("1E-29"),
+                "InstrumentSpec.price_tick must be exactly representable by Rust Decimal",
+            ),
+        ],
+    )
+    def test_invalid_market_slippage_configuration_fails_before_session_access(
+        self,
+        market_slippage_bps,
+        price_tick,
+        message,
+    ):
+        session_factory = MagicMock()
+        spec = InstrumentSpec(
+            product_id="BINANCE:BTCUSDT-SPOT",
+            exchange="binance",
+            symbol="BTC/USDT",
+            base="BTC",
+            quote="USDT",
+            price_tick=price_tick,
+        )
+
+        with pytest.raises(ValueError, match=message):
+            BacktestRunner(
+                start_time=0,
+                end_time=0,
+                product_id=spec.product_id,
+                timeframe="1h",
+                instrument_spec=spec,
+                market_slippage_bps=market_slippage_bps,
+                db_session_factory=session_factory,
+            )
+
+        session_factory.assert_not_called()
 
     @patch("src.core.backtest_runner.SessionLocal")
     def test_add_portfolio_uses_parent_as_result_identity(

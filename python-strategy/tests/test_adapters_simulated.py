@@ -65,6 +65,85 @@ class TestSimulatedAdapterBasics:
         )
         assert adapter.get_balance() == Decimal("50000")
 
+    @pytest.mark.parametrize(
+        "value",
+        [
+            -1,
+            0,
+            1,
+            1.0,
+            "1",
+            Decimal("-1"),
+            Decimal("1E-29"),
+            Decimal("NaN"),
+            Decimal("Infinity"),
+        ],
+    )
+    def test_market_slippage_requires_exact_bounded_decimal(self, value):
+        with pytest.raises(ValueError, match="market_slippage_bps must be"):
+            SimulatedAdapter(market_slippage_bps=value)
+
+    def test_positive_market_slippage_requires_instrument_price_tick(self):
+        with pytest.raises(
+            ValueError,
+            match="requires a positive finite InstrumentSpec.price_tick",
+        ):
+            SimulatedAdapter(market_slippage_bps=Decimal("1"))
+
+    @pytest.mark.parametrize(
+        "price_tick",
+        [
+            Decimal("0"),
+            Decimal("-0.01"),
+            Decimal("NaN"),
+            Decimal("Infinity"),
+        ],
+    )
+    def test_positive_market_slippage_rejects_invalid_instrument_tick(
+        self,
+        price_tick,
+    ):
+        spec = InstrumentSpec(
+            product_id=PRODUCT,
+            exchange="binance",
+            symbol="BTCUSDT",
+            base="BTC",
+            quote="USDT",
+            price_tick=price_tick,
+        )
+
+        with pytest.raises(
+            ValueError,
+            match="requires a positive finite InstrumentSpec.price_tick",
+        ):
+            SimulatedAdapter(
+                instrument_spec=spec,
+                market_slippage_bps=Decimal("1"),
+            )
+
+    def test_positive_market_slippage_requires_matching_precision_tick(self):
+        spec = InstrumentSpec(
+            product_id=PRODUCT,
+            exchange="binance",
+            symbol="BTCUSDT",
+            base="BTC",
+            quote="USDT",
+            price_tick=Decimal("0.01"),
+        )
+        codec = PrecisionCodec(
+            PrecisionSpec(
+                price_tick=Decimal("0.05"),
+                quantity_step=Decimal("0.001"),
+            )
+        )
+
+        with pytest.raises(ValueError, match="precision price_tick must match"):
+            SimulatedAdapter(
+                precision_codec=codec,
+                instrument_spec=spec,
+                market_slippage_bps=Decimal("1"),
+            )
+
     def test_exposes_only_configured_instrument_spec(self):
         spec = InstrumentSpec(
             product_id=PRODUCT,
@@ -376,6 +455,129 @@ class TestMarketOrders:
         assert pos.side == "SHORT"
         assert _approx(pos.quantity, 0.1)
 
+    @pytest.mark.parametrize(
+        ("side", "expected_price"),
+        [("buy", Decimal("100.05")), ("sell", Decimal("99.95"))],
+    )
+    def test_market_slippage_is_adverse_tick_rounded_and_reported(
+        self,
+        order_factory,
+        side,
+        expected_price,
+    ):
+        spec = InstrumentSpec(
+            product_id=PRODUCT,
+            exchange="binance",
+            symbol="BTCUSDT",
+            base="BTC",
+            quote="USDT",
+            price_tick=Decimal("0.05"),
+        )
+        adapter = SimulatedAdapter(
+            Decimal("10000"),
+            instrument_spec=spec,
+            market_slippage_bps=Decimal("1"),
+        )
+        order = order_factory(
+            order_type="market",
+            side=side,
+            product_id=PRODUCT,
+            quantity=Decimal("2"),
+        )
+        adapter.place_order(order)
+
+        fill = adapter.on_market_data(_candle(200, 100, 100, 100, 100))[0]
+
+        assert fill["reference_price"] == Decimal("100")
+        assert fill["price"] == expected_price
+        assert fill["slippage_per_unit"] == Decimal("0.05")
+        assert fill["slippage_cost"] == Decimal("0.10")
+
+    def test_market_slippage_accepts_100_percent_without_policy_cap(
+        self,
+        order_factory,
+    ):
+        spec = InstrumentSpec(
+            product_id=PRODUCT,
+            exchange="binance",
+            symbol="BTCUSDT",
+            base="BTC",
+            quote="USDT",
+            price_tick=Decimal("0.01"),
+        )
+        buy_adapter = SimulatedAdapter(
+            Decimal("10000"),
+            instrument_spec=spec,
+            market_slippage_bps=Decimal("1E+4"),
+        )
+        buy_adapter.place_order(
+            order_factory(
+                order_type="market",
+                side="buy",
+                product_id=PRODUCT,
+                quantity=Decimal("1"),
+            )
+        )
+
+        fill = buy_adapter.on_market_data(_candle(200, 100, 100, 100, 100))[0]
+
+        assert fill["price"] == Decimal("200")
+
+        sell_adapter = SimulatedAdapter(
+            Decimal("10000"),
+            instrument_spec=spec,
+            market_slippage_bps=Decimal("10000"),
+        )
+        sell_order = order_factory(
+            order_type="market",
+            side="sell",
+            product_id=PRODUCT,
+            quantity=Decimal("1"),
+        )
+        sell_adapter.place_order(sell_order)
+
+        assert sell_adapter.on_market_data(_candle(200, 100, 100, 100, 100)) == []
+        rejections = sell_adapter.drain_order_rejections()
+        assert len(rejections) == 1
+        assert rejections[0]["order"] is sell_order
+        assert "non-positive fill price" in rejections[0]["reason"]
+
+    @pytest.mark.parametrize(
+        ("side", "expected_price"),
+        [("buy", Decimal("1.01")), ("sell", Decimal("0.99"))],
+    )
+    def test_market_slippage_preserves_smallest_rust_decimal_bps(
+        self,
+        order_factory,
+        side,
+        expected_price,
+    ):
+        spec = InstrumentSpec(
+            product_id=PRODUCT,
+            exchange="binance",
+            symbol="BTCUSDT",
+            base="BTC",
+            quote="USDT",
+            price_tick=Decimal("0.01"),
+        )
+        adapter = SimulatedAdapter(
+            Decimal("10000"),
+            instrument_spec=spec,
+            market_slippage_bps=Decimal("1E-28"),
+        )
+        adapter.place_order(
+            order_factory(
+                order_type="market",
+                side=side,
+                product_id=PRODUCT,
+                quantity=Decimal("1"),
+            )
+        )
+
+        fill = adapter.on_market_data(_candle(200, 1, 1, 1, 1))[0]
+
+        assert fill["price"] == expected_price
+
     def test_returns_orm_order_in_fill(self, order_factory):
         adapter = SimulatedAdapter(Decimal("10000"))
         order = order_factory(
@@ -399,13 +601,26 @@ class TestMarketOrders:
                 quantity_step=Decimal("0.001"),
             )
         )
+        spec = InstrumentSpec(
+            product_id=PRODUCT,
+            exchange="binance",
+            symbol="BTCUSDT",
+            base="BTC",
+            quote="USDT",
+            price_tick=Decimal("0.01"),
+        )
         decimal_adapter = SimulatedAdapter(
-            Decimal("10000"), taker_fee=Decimal("0.0006")
+            Decimal("10000"),
+            taker_fee=Decimal("0.0006"),
+            instrument_spec=spec,
+            market_slippage_bps=Decimal("10"),
         )
         scaled_adapter = SimulatedAdapter(
             Decimal("10000"),
             taker_fee=Decimal("0.0006"),
             precision_codec=codec,
+            instrument_spec=spec,
+            market_slippage_bps=Decimal("10"),
         )
         decimal_order = order_factory(
             order_type="market",
@@ -428,8 +643,11 @@ class TestMarketOrders:
         scaled_fills = scaled_adapter.on_market_data(candle)
 
         assert len(scaled_fills) == len(decimal_fills) == 1
+        assert decimal_fills[0]["price"] == Decimal("50050.13")
         assert scaled_fills[0]["price"] == decimal_fills[0]["price"]
         assert scaled_fills[0]["fee"] == decimal_fills[0]["fee"]
+        assert scaled_fills[0]["reference_price"] == Decimal("50000.12")
+        assert scaled_fills[0]["slippage_cost"] == (decimal_fills[0]["slippage_cost"])
         assert scaled_adapter.get_balance() == decimal_adapter.get_balance()
 
     def test_prepared_scaled_candle_matches_decimal_boundary_for_market_fill(
@@ -445,13 +663,26 @@ class TestMarketOrders:
                 quantity_step=Decimal("0.001"),
             )
         )
+        spec = InstrumentSpec(
+            product_id=PRODUCT,
+            exchange="binance",
+            symbol="BTCUSDT",
+            base="BTC",
+            quote="USDT",
+            price_tick=Decimal("0.01"),
+        )
         decimal_adapter = SimulatedAdapter(
-            Decimal("10000"), taker_fee=Decimal("0.0006")
+            Decimal("10000"),
+            taker_fee=Decimal("0.0006"),
+            instrument_spec=spec,
+            market_slippage_bps=Decimal("10"),
         )
         scaled_adapter = SimulatedAdapter(
             Decimal("10000"),
             taker_fee=Decimal("0.0006"),
             precision_codec=codec,
+            instrument_spec=spec,
+            market_slippage_bps=Decimal("10"),
         )
         decimal_order = order_factory(
             order_type="market",
@@ -475,9 +706,66 @@ class TestMarketOrders:
         scaled_fills = scaled_adapter.on_prepared_market_data(prepared)
 
         assert len(scaled_fills) == len(decimal_fills) == 1
+        assert decimal_fills[0]["price"] == Decimal("50050.13")
         assert scaled_fills[0]["price"] == decimal_fills[0]["price"]
         assert scaled_fills[0]["fee"] == decimal_fills[0]["fee"]
+        assert scaled_fills[0]["reference_price"] == Decimal("50000.12")
+        assert scaled_fills[0]["slippage_cost"] == (decimal_fills[0]["slippage_cost"])
         assert scaled_adapter.get_balance() == decimal_adapter.get_balance()
+
+    def test_scaled_and_prepared_paths_report_same_quantized_reference_price(
+        self,
+        order_factory,
+    ):
+        codec = PrecisionCodec(
+            PrecisionSpec(
+                price_tick=Decimal("0.01"),
+                quantity_step=Decimal("0.001"),
+            )
+        )
+        spec = InstrumentSpec(
+            product_id=PRODUCT,
+            exchange="binance",
+            symbol="BTCUSDT",
+            base="BTC",
+            quote="USDT",
+            price_tick=Decimal("0.01"),
+        )
+        adapters = [
+            SimulatedAdapter(
+                Decimal("10000"),
+                precision_codec=codec,
+                instrument_spec=spec,
+                market_slippage_bps=Decimal("10"),
+            )
+            for _ in range(2)
+        ]
+        for adapter in adapters:
+            adapter.place_order(
+                order_factory(
+                    order_type="market",
+                    side="buy",
+                    product_id=PRODUCT,
+                    quantity=Decimal("0.1"),
+                )
+            )
+        candle = _candle(
+            200,
+            Decimal("50000.124"),
+            Decimal("50000.124"),
+            Decimal("50000.124"),
+            Decimal("50000.124"),
+        )
+
+        direct_fill = adapters[0].on_market_data(candle)[0]
+        prepared_fill = adapters[1].on_prepared_market_data(
+            adapters[1].prepare_scaled_candle(candle)
+        )[0]
+
+        assert direct_fill["reference_price"] == Decimal("50000.12")
+        assert direct_fill["reference_price"] == prepared_fill["reference_price"]
+        assert direct_fill["price"] == prepared_fill["price"]
+        assert direct_fill["slippage_cost"] == prepared_fill["slippage_cost"]
 
 
 # =================================================================
@@ -1222,9 +1510,7 @@ class TestSpotSettlement:
         with pytest.raises(ExchangeError, match="min_notional_not_met"):
             adapter.place_order(order)
 
-    def test_external_funding_preserves_pending_quote_reservation(
-        self, order_factory
-    ):
+    def test_external_funding_preserves_pending_quote_reservation(self, order_factory):
         product_id = "BINANCE:BTCUSDT-SPOT"
         adapter = SimulatedAdapter(
             Decimal("100"),
@@ -1239,9 +1525,7 @@ class TestSpotSettlement:
         )
         adapter.place_order(pending)
 
-        total = adapter.apply_external_funding(
-            asset="USDT", amount=Decimal("50")
-        )
+        total = adapter.apply_external_funding(asset="USDT", amount=Decimal("50"))
 
         assert total == Decimal("150")
         assert adapter.get_asset_balance("USDT", "total") == Decimal("150")
@@ -1258,9 +1542,7 @@ class TestSpotSettlement:
             ("USDT", Decimal("Infinity"), "finite and positive"),
         ],
     )
-    def test_external_funding_validation_fails_closed(
-        self, asset, amount, message
-    ):
+    def test_external_funding_validation_fails_closed(self, asset, amount, message):
         adapter = SimulatedAdapter(
             Decimal("100"),
             instrument_spec=_spot_spec(),
@@ -1281,9 +1563,7 @@ class TestSpotSettlement:
 
         derivatives = SimulatedAdapter(Decimal("100"))
         with pytest.raises(ExchangeError, match="requires cash_spot settlement"):
-            derivatives.apply_external_funding(
-                asset="USDT", amount=Decimal("1")
-            )
+            derivatives.apply_external_funding(asset="USDT", amount=Decimal("1"))
 
     def test_quote_fee_buy_sell_sequence_matches_asset_acceptance_table(
         self, order_factory
@@ -1371,6 +1651,40 @@ class TestSpotSettlement:
         rejections = adapter.drain_order_rejections()
         assert len(rejections) == 1
         assert rejections[0]["order"] is order
+        assert "insufficient available USDT at fill" in rejections[0]["reason"]
+
+    def test_market_slippage_rejects_buy_when_adjusted_cost_exceeds_cash(
+        self, order_factory
+    ):
+        product_id = "BINANCE:BTCUSDT-SPOT"
+        adapter = SimulatedAdapter(
+            Decimal("50.10"),
+            taker_fee=Decimal("0.001"),
+            instrument_spec=_spot_spec(),
+            market_slippage_bps=Decimal("10"),
+        )
+        order = _with_market_reference(
+            order_factory(
+                product_id=product_id,
+                order_type="market",
+                side="buy",
+                quantity=Decimal("0.001"),
+                price=None,
+            ),
+            "50000",
+        )
+        adapter.place_order(order)
+
+        fills = adapter.on_market_data(
+            _candle(200, 50000, 50000, 50000, 50000, product=product_id)
+        )
+
+        assert fills == []
+        assert adapter.get_asset_balance("USDT", "total") == Decimal("50.10")
+        assert adapter.get_asset_balance("USDT", "reserved") == Decimal("0")
+        assert adapter.get_asset_balance("BTC", "total") == Decimal("0")
+        rejections = adapter.drain_order_rejections()
+        assert len(rejections) == 1
         assert "insufficient available USDT at fill" in rejections[0]["reason"]
 
     def test_same_candle_fill_does_not_hide_another_order_rejection(

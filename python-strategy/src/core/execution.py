@@ -756,7 +756,17 @@ class ExecutionEngine:
                     self.order_manager.mark_cancelled(cancelled_order)
 
                 if self.journal is not None:
-                    self._journal_fill(order, price, qty, fee, fill_type, candle)
+                    self._journal_fill(
+                        order,
+                        price,
+                        qty,
+                        fee,
+                        fill_type,
+                        candle,
+                        reference_price=fill.get("reference_price"),
+                        slippage_per_unit=fill.get("slippage_per_unit"),
+                        slippage_cost=fill.get("slippage_cost"),
+                    )
         drain_rejections = cast(
             Callable[[], list[dict]] | None,
             getattr(self.adapter, "drain_order_rejections", None),
@@ -1962,6 +1972,10 @@ class ExecutionEngine:
         fee,
         fill_type: str,
         candle: Optional[Candlestick] = None,
+        *,
+        reference_price: Decimal | None = None,
+        slippage_per_unit: Decimal | None = None,
+        slippage_cost: Decimal | None = None,
     ) -> None:
         execution_journal.journal_fill(
             self.journal,
@@ -1971,6 +1985,9 @@ class ExecutionEngine:
             fee,
             fill_type,
             candle,
+            reference_price=reference_price,
+            slippage_per_unit=slippage_per_unit,
+            slippage_cost=slippage_cost,
         )
 
     def _journal_exchange_order_event_fill(

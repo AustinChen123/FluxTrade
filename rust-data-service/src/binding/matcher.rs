@@ -1,4 +1,6 @@
 use ::pyo3::prelude::*;
+use num_bigint_dig::BigInt;
+use num_traits::{Pow, ToPrimitive};
 use rust_decimal::Decimal;
 use std::collections::{HashMap, HashSet};
 use std::str::FromStr;
@@ -60,6 +62,8 @@ pub struct PyMatchingEngine {
     pub open_orders: Vec<Order>,
     maker_fee: Decimal,
     taker_fee: Decimal,
+    market_slippage_bps: Decimal,
+    market_slippage_price_tick: Option<Decimal>,
     contract_multiplier: Decimal,
     fee_model: FeeModel,
     settlement_model: SettlementModel,
@@ -76,7 +80,7 @@ pub struct PyMatchingEngine {
 impl PyMatchingEngine {
     #[new]
     #[allow(clippy::too_many_arguments)]
-    #[pyo3(signature = (initial_balance, maker_fee="0".to_string(), taker_fee="0".to_string(), contract_multiplier="1".to_string(), fee_model="percentage_notional".to_string(), settlement_model="derivatives".to_string(), base_asset="".to_string(), quote_asset="".to_string(), spot_fee_asset="quote".to_string()))]
+    #[pyo3(signature = (initial_balance, maker_fee="0".to_string(), taker_fee="0".to_string(), contract_multiplier="1".to_string(), fee_model="percentage_notional".to_string(), settlement_model="derivatives".to_string(), base_asset="".to_string(), quote_asset="".to_string(), spot_fee_asset="quote".to_string(), market_slippage_bps="0".to_string(), market_slippage_price_tick=None))]
     fn new(
         initial_balance: String,
         maker_fee: String,
@@ -87,9 +91,27 @@ impl PyMatchingEngine {
         base_asset: String,
         quote_asset: String,
         spot_fee_asset: String,
+        market_slippage_bps: String,
+        market_slippage_price_tick: Option<String>,
     ) -> PyResult<Self> {
         let initial_balance = parse_decimal(&initial_balance, "initial_balance")?;
         let contract_multiplier = parse_decimal(&contract_multiplier, "contract_multiplier")?;
+        let market_slippage_bps = parse_decimal(&market_slippage_bps, "market_slippage_bps")?;
+        if market_slippage_bps < Decimal::ZERO {
+            return Err(pyo3::exceptions::PyValueError::new_err(
+                "market_slippage_bps must be at least 0",
+            ));
+        }
+        let market_slippage_price_tick = market_slippage_price_tick
+            .map(|value| parse_decimal(&value, "market_slippage_price_tick"))
+            .transpose()?;
+        let has_valid_slippage_tick =
+            market_slippage_price_tick.is_some_and(|tick| tick > Decimal::ZERO);
+        if market_slippage_bps > Decimal::ZERO && !has_valid_slippage_tick {
+            return Err(pyo3::exceptions::PyValueError::new_err(
+                "positive market_slippage_bps requires a positive market_slippage_price_tick",
+            ));
+        }
         if contract_multiplier <= Decimal::ZERO {
             return Err(pyo3::exceptions::PyValueError::new_err(
                 "contract_multiplier must be positive",
@@ -125,6 +147,8 @@ impl PyMatchingEngine {
             open_orders: Vec::new(),
             maker_fee: parse_decimal(&maker_fee, "maker_fee")?,
             taker_fee: parse_decimal(&taker_fee, "taker_fee")?,
+            market_slippage_bps,
+            market_slippage_price_tick,
             contract_multiplier,
             fee_model,
             settlement_model,
@@ -354,6 +378,58 @@ impl PyMatchingEngine {
 }
 
 impl PyMatchingEngine {
+    fn market_fill_price(&self, reference_price: Decimal, side: &str) -> Result<Decimal, String> {
+        if self.market_slippage_bps == Decimal::ZERO {
+            return Ok(reference_price);
+        }
+        let price_tick = self.market_slippage_price_tick.ok_or_else(|| {
+            "positive market_slippage_bps requires a positive market_slippage_price_tick"
+                .to_string()
+        })?;
+        let ten = BigInt::from(10_u8);
+        let basis_scale = ten.pow(self.market_slippage_bps.scale());
+        let basis = BigInt::from(10_000_u32) * basis_scale;
+        let bps_mantissa = BigInt::from(self.market_slippage_bps.mantissa());
+        let price_factor = match side {
+            "LONG" => &basis + bps_mantissa,
+            "SHORT" => &basis - bps_mantissa,
+            _ => return Err("market order side must be LONG or SHORT".to_string()),
+        };
+        let numerator =
+            BigInt::from(reference_price.mantissa()) * price_factor * ten.pow(price_tick.scale());
+        if numerator <= BigInt::from(0_u8) {
+            return Err("market slippage produced a non-positive fill price".to_string());
+        }
+        let denominator =
+            ten.pow(reference_price.scale()) * basis * BigInt::from(price_tick.mantissa());
+        let rounded_units = if side == "LONG" {
+            (&numerator + &denominator - BigInt::from(1_u8)) / &denominator
+        } else {
+            &numerator / &denominator
+        };
+        if rounded_units <= BigInt::from(0_u8) {
+            return Err(
+                "market slippage produced a non-positive tick-rounded fill price".to_string(),
+            );
+        }
+        let mut rounded_mantissa = rounded_units * BigInt::from(price_tick.mantissa());
+        let mut rounded_scale = price_tick.scale();
+        while rounded_scale > 0 && (&rounded_mantissa % &ten) == BigInt::from(0_u8) {
+            rounded_mantissa /= &ten;
+            rounded_scale -= 1;
+        }
+        if rounded_mantissa > BigInt::from(Decimal::MAX.mantissa()) {
+            return Err("market slippage arithmetic overflow".to_string());
+        }
+        let rounded_mantissa = rounded_mantissa
+            .to_i128()
+            .ok_or_else(|| "market slippage arithmetic overflow".to_string())?;
+        Ok(Decimal::from_i128_with_scale(
+            rounded_mantissa,
+            rounded_scale,
+        ))
+    }
+
     fn process_candle_logic(&mut self, candle: Candlestick) -> PyResult<Vec<FillEvent>> {
         let mut fills: Vec<FillEvent> = Vec::new();
         let mut remaining_orders: Vec<Order> = Vec::new();
@@ -386,7 +462,13 @@ impl PyMatchingEngine {
                 continue;
             }
 
-            let fill_price = candle.open;
+            let fill_price = match self.market_fill_price(candle.open, &order.side) {
+                Ok(price) => price,
+                Err(reason) => {
+                    self.reject_order(&order, candle.timestamp, reason);
+                    continue;
+                }
+            };
             let fee = if self.settlement_model == SettlementModel::CashSpot {
                 match self.settle_spot_order(&order, fill_price, true) {
                     Ok(settlement) => {
@@ -1072,6 +1154,8 @@ mod tests {
             open_orders: Vec::new(),
             maker_fee: dec!(0.0002),
             taker_fee: dec!(0.0006),
+            market_slippage_bps: Decimal::ZERO,
+            market_slippage_price_tick: None,
             contract_multiplier: Decimal::ONE,
             fee_model: FeeModel::PercentageNotional,
             settlement_model: SettlementModel::Derivatives,
@@ -1156,8 +1240,160 @@ mod tests {
     }
 
     #[test]
+    fn market_slippage_rounds_adversely_without_clamping_to_candle_range() {
+        for (side, expected) in [("LONG", dec!(100.05)), ("SHORT", dec!(99.95))] {
+            let mut engine = make_engine(dec!(100000));
+            engine.market_slippage_bps = dec!(1);
+            engine.market_slippage_price_tick = Some(dec!(0.05));
+            engine.open_orders.push(make_order(
+                "slipped",
+                side,
+                "MARKET",
+                Decimal::ZERO,
+                dec!(1),
+            ));
+
+            let fills = engine
+                .process_candle_logic(make_candle(dec!(100), dec!(100), dec!(100), dec!(100)))
+                .unwrap();
+
+            assert_eq!(fills[0].price, expected);
+        }
+    }
+
+    #[test]
+    fn market_slippage_preserves_smallest_representable_positive_bps() {
+        for (side, expected) in [("LONG", dec!(1.01)), ("SHORT", dec!(0.99))] {
+            let mut engine = make_engine(dec!(100000));
+            engine.market_slippage_bps = dec!(0.0000000000000000000000000001);
+            engine.market_slippage_price_tick = Some(dec!(0.01));
+            engine.open_orders.push(make_order(
+                "smallest-bps",
+                side,
+                "MARKET",
+                Decimal::ZERO,
+                dec!(1),
+            ));
+
+            let fills = engine
+                .process_candle_logic(make_candle(dec!(1), dec!(1), dec!(1), dec!(1)))
+                .unwrap();
+
+            assert_eq!(fills[0].price, expected);
+        }
+    }
+
+    #[test]
+    fn market_slippage_does_not_change_limit_order_price() {
+        let mut engine = make_engine(dec!(100000));
+        engine.market_slippage_bps = dec!(10);
+        engine.market_slippage_price_tick = Some(dec!(0.01));
+        engine
+            .open_orders
+            .push(make_order("limit", "LONG", "LIMIT", dec!(99), dec!(1)));
+
+        let fills = engine
+            .process_candle_logic(make_candle(dec!(100), dec!(101), dec!(98), dec!(100)))
+            .unwrap();
+
+        assert_eq!(fills[0].price, dec!(99));
+    }
+
+    #[test]
+    fn market_slippage_rejects_only_invalid_order_and_preserves_candle_progress() {
+        let mut engine = make_engine(dec!(100000));
+        engine.market_slippage_bps = dec!(1);
+        engine.market_slippage_price_tick = Some(dec!(1));
+        engine.open_orders.push(make_order(
+            "filled-before-rejection",
+            "LONG",
+            "MARKET",
+            Decimal::ZERO,
+            dec!(1),
+        ));
+        engine.open_orders.push(make_order(
+            "invalid-rounded-price",
+            "SHORT",
+            "MARKET",
+            Decimal::ZERO,
+            dec!(1),
+        ));
+        engine.open_orders.push(make_order(
+            "filled-after-rejection",
+            "LONG",
+            "MARKET",
+            Decimal::ZERO,
+            dec!(1),
+        ));
+        let mut other_product =
+            make_order("other-product", "LONG", "MARKET", Decimal::ZERO, dec!(1));
+        other_product.product_id = "OTHER".to_string();
+        engine.open_orders.push(other_product);
+
+        let fills = engine
+            .process_candle_logic(make_candle(dec!(1), dec!(1), dec!(1), dec!(1)))
+            .unwrap();
+
+        assert_eq!(
+            fills
+                .iter()
+                .map(|fill| fill.order_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["filled-before-rejection", "filled-after-rejection"]
+        );
+        assert_eq!(engine.open_orders.len(), 1);
+        assert_eq!(engine.open_orders[0].id, "other-product");
+        let rejections = engine.drain_rejections();
+        assert_eq!(rejections.len(), 1);
+        assert_eq!(rejections[0]["order_id"], "invalid-rounded-price");
+        assert!(rejections[0]["reason"].contains("non-positive tick-rounded fill price"));
+        let position = engine.positions.get(&pos_key(STRATEGY, PRODUCT)).unwrap();
+        assert_eq!(position.side, "LONG");
+        assert_eq!(position.quantity, dec!(2));
+        assert_eq!(position.entry_price, dec!(2));
+    }
+
+    #[test]
+    fn market_slippage_overflow_rejects_orders_without_dropping_other_products() {
+        let mut engine = make_engine(dec!(100000));
+        engine.market_slippage_bps = dec!(1);
+        engine.market_slippage_price_tick = Some(dec!(0.01));
+        engine.open_orders.push(make_order(
+            "overflow",
+            "LONG",
+            "MARKET",
+            Decimal::ZERO,
+            dec!(1),
+        ));
+        let mut other_product =
+            make_order("other-product", "LONG", "MARKET", Decimal::ZERO, dec!(1));
+        other_product.product_id = "OTHER".to_string();
+        engine.open_orders.push(other_product);
+
+        let fills = engine
+            .process_candle_logic(make_candle(
+                Decimal::MAX,
+                Decimal::MAX,
+                Decimal::MAX,
+                Decimal::MAX,
+            ))
+            .unwrap();
+
+        assert!(fills.is_empty());
+        assert_eq!(engine.open_orders.len(), 1);
+        assert_eq!(engine.open_orders[0].id, "other-product");
+        assert!(engine.positions.is_empty());
+        let rejections = engine.drain_rejections();
+        assert_eq!(rejections.len(), 1);
+        assert_eq!(rejections[0]["order_id"], "overflow");
+        assert!(rejections[0]["reason"].contains("arithmetic overflow"));
+    }
+
+    #[test]
     fn test_scaled_candle_market_order_matches_decimal_candle() {
         let mut decimal_engine = make_engine(dec!(100000));
+        decimal_engine.market_slippage_bps = dec!(10);
+        decimal_engine.market_slippage_price_tick = Some(dec!(0.01));
         decimal_engine
             .open_orders
             .push(make_order("m1", "LONG", "MARKET", Decimal::ZERO, dec!(1)));
@@ -1171,6 +1407,8 @@ mod tests {
             .unwrap();
 
         let mut scaled_engine = make_engine(dec!(100000));
+        scaled_engine.market_slippage_bps = dec!(10);
+        scaled_engine.market_slippage_price_tick = Some(dec!(0.01));
         scaled_engine
             .open_orders
             .push(make_order("m1", "LONG", "MARKET", Decimal::ZERO, dec!(1)));
@@ -1190,6 +1428,7 @@ mod tests {
             .unwrap();
 
         assert_eq!(scaled_fills.len(), decimal_fills.len());
+        assert_eq!(decimal_fills[0].price, dec!(50050));
         assert_eq!(scaled_fills[0].price, decimal_fills[0].price);
         assert_eq!(scaled_fills[0].fee, decimal_fills[0].fee);
         assert_eq!(scaled_engine.balance, decimal_engine.balance);
@@ -1268,6 +1507,8 @@ mod tests {
             "".to_string(),
             "".to_string(),
             "quote".to_string(),
+            "0".to_string(),
+            None,
         )
         .err()
         .expect("unknown fee model must fail");
@@ -2178,6 +2419,8 @@ mod tests {
             open_orders: Vec::new(),
             maker_fee: Decimal::ZERO,
             taker_fee: Decimal::ZERO,
+            market_slippage_bps: Decimal::ZERO,
+            market_slippage_price_tick: None,
             contract_multiplier: Decimal::ONE,
             fee_model: FeeModel::PercentageNotional,
             settlement_model: SettlementModel::Derivatives,
@@ -2242,6 +2485,8 @@ mod tests {
                 "".to_string(),
                 "".to_string(),
                 "quote".to_string(),
+                "0".to_string(),
+                None,
             )
             .err()
             .expect("non-positive multiplier must fail");
@@ -2433,6 +2678,8 @@ mod tests {
             "BTC".to_string(),
             "USDT".to_string(),
             fee_asset.to_string(),
+            "0".to_string(),
+            None,
         )
         .unwrap()
     }
@@ -2495,6 +2742,89 @@ mod tests {
         assert_eq!(snapshot["cost_basis"], "25.0250000");
         assert_eq!(snapshot["realized_pnl"], "4.9450000");
         assert_eq!(snapshot["total_equity"], "109.9200000");
+    }
+
+    #[test]
+    fn spot_market_slippage_uses_adjusted_price_for_principal_fee_and_pnl() {
+        let mut engine = make_spot_engine(dec!(100), Decimal::ZERO, dec!(0.001), "quote");
+        engine.market_slippage_bps = dec!(10);
+        engine.market_slippage_price_tick = Some(dec!(0.01));
+        engine
+            .submit_order(make_spot_order(
+                "buy",
+                "LONG",
+                "MARKET",
+                dec!(50000),
+                dec!(0.001),
+            ))
+            .unwrap();
+
+        let buy_fills = engine
+            .process_candle_logic(make_spot_candle(dec!(50000)))
+            .unwrap();
+        assert_eq!(buy_fills[0].price, dec!(50050));
+        assert_eq!(buy_fills[0].fee, dec!(0.05005));
+        assert_eq!(
+            Decimal::from_str(&engine.get_asset_balance("USDT", "total").unwrap()).unwrap(),
+            dec!(49.89995)
+        );
+
+        engine
+            .submit_order(make_spot_order(
+                "sell",
+                "SHORT",
+                "MARKET",
+                dec!(50000),
+                dec!(0.001),
+            ))
+            .unwrap();
+        let sell_fills = engine
+            .process_candle_logic(make_spot_candle(dec!(50000)))
+            .unwrap();
+        assert_eq!(sell_fills[0].price, dec!(49950));
+        assert_eq!(sell_fills[0].fee, dec!(0.04995));
+        assert_eq!(
+            Decimal::from_str(&engine.get_asset_balance("USDT", "total").unwrap()).unwrap(),
+            dec!(99.80000)
+        );
+        assert_eq!(engine.spot_realized_pnl, dec!(-0.20000));
+    }
+
+    #[test]
+    fn spot_market_slippage_rejects_whole_buy_when_adjusted_cost_is_unfunded() {
+        let mut engine = make_spot_engine(dec!(50.10), Decimal::ZERO, dec!(0.001), "quote");
+        engine.market_slippage_bps = dec!(10);
+        engine.market_slippage_price_tick = Some(dec!(0.01));
+        engine
+            .submit_order(make_spot_order(
+                "buy",
+                "LONG",
+                "MARKET",
+                dec!(50000),
+                dec!(0.001),
+            ))
+            .unwrap();
+
+        let fills = engine
+            .process_candle_logic(make_spot_candle(dec!(50000)))
+            .unwrap();
+
+        assert!(fills.is_empty());
+        assert_eq!(
+            Decimal::from_str(&engine.get_asset_balance("USDT", "total").unwrap()).unwrap(),
+            dec!(50.10)
+        );
+        assert_eq!(
+            Decimal::from_str(&engine.get_asset_balance("USDT", "reserved").unwrap()).unwrap(),
+            Decimal::ZERO
+        );
+        assert_eq!(
+            Decimal::from_str(&engine.get_asset_balance("BTC", "total").unwrap()).unwrap(),
+            Decimal::ZERO
+        );
+        let rejections = engine.drain_rejections();
+        assert_eq!(rejections.len(), 1);
+        assert!(rejections[0]["reason"].contains("insufficient available USDT at fill"));
     }
 
     #[test]

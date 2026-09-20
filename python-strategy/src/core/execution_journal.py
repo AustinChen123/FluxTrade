@@ -50,6 +50,10 @@ def journal_fill(
     fee: Decimal | None,
     fill_type: str,
     candle: Candlestick | None = None,
+    *,
+    reference_price: Decimal | None = None,
+    slippage_per_unit: Decimal | None = None,
+    slippage_cost: Decimal | None = None,
 ) -> None:
     tag = {
         "STOP_LOSS": "sl_hit",
@@ -58,16 +62,25 @@ def journal_fill(
         "MARKET": "fill",
         "LIMIT": "fill",
     }.get(fill_type, "fill")
+    payload = {
+        "order_id": str(order.id),
+        "side": order.side,
+        "price": str(price),
+        "quantity": str(quantity),
+        "fee": str(fee) if fee else "0",
+        "fill_type": fill_type,
+    }
+    if reference_price is not None:
+        payload.update(
+            {
+                "reference_price": str(reference_price),
+                "slippage_per_unit": str(slippage_per_unit),
+                "slippage_cost": str(slippage_cost),
+            }
+        )
     journal.log(
         tag,
-        {
-            "order_id": str(order.id),
-            "side": order.side,
-            "price": str(price),
-            "quantity": str(quantity),
-            "fee": str(fee) if fee else "0",
-            "fill_type": fill_type,
-        },
+        payload,
         timestamp=candle.timestamp if candle else 0,
         trade_id=str(order.id),
     )
