@@ -5,6 +5,7 @@ mod binding;
 mod model;
 #[cfg(feature = "rithmic")]
 mod rithmic_ledger;
+pub mod volume_profile;
 
 /// A Python module implemented in Rust.
 #[pymodule]
