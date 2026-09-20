@@ -8,6 +8,7 @@
 //! grid.unit equals the product's quote asset. This module validates canonical
 //! ID syntax, not registry membership or quote-asset semantics.
 pub mod binance_spot;
+pub mod checkpoint;
 mod exact;
 pub mod work_policy;
 
