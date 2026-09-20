@@ -63,7 +63,17 @@ _ENTRY_KEYS = frozenset(
     }
 )
 _JOURNAL_FILL_KEYS = frozenset(
-    {"order_id", "side", "price", "quantity", "fee", "fill_type"}
+    {
+        "order_id",
+        "side",
+        "price",
+        "quantity",
+        "fee",
+        "fill_type",
+        "reference_price",
+        "slippage_per_unit",
+        "slippage_cost",
+    }
 )
 _SIGNAL_SIDES = {
     "LONG": "buy",
@@ -316,6 +326,21 @@ def _build_normal_backtest_trading_outcome(
         journal_fee = _journal_money(
             fill_data["fee"], "fill journal fee", allow_zero=True
         )
+        reference_price = _journal_money(
+            fill_data["reference_price"],
+            "fill journal reference_price",
+            allow_zero=False,
+        )
+        slippage_per_unit = _journal_money(
+            fill_data["slippage_per_unit"],
+            "fill journal slippage_per_unit",
+            allow_zero=True,
+        )
+        slippage_cost = _journal_money(
+            fill_data["slippage_cost"],
+            "fill journal slippage_cost",
+            allow_zero=True,
+        )
         if signal.quantity != entry_quantity or entry_quantity != fill_quantity:
             raise ValueError("signal, entry and fill quantity do not match")
         if journal_quantity != fill_quantity:
@@ -324,6 +349,24 @@ def _build_normal_backtest_trading_outcome(
             raise ValueError("journal and persisted fill price do not match")
         if journal_fee != fill_fee:
             raise ValueError("journal and persisted fill fee do not match")
+        if fill_side == "buy":
+            if journal_price < reference_price:
+                raise ValueError("buy market fill cannot improve under fixed slippage")
+            expected_slippage_per_unit = exact_decimal_subtract(
+                journal_price,
+                reference_price,
+            )
+        else:
+            if journal_price > reference_price:
+                raise ValueError("sell market fill cannot improve under fixed slippage")
+            expected_slippage_per_unit = exact_decimal_subtract(
+                reference_price,
+                journal_price,
+            )
+        if slippage_per_unit != expected_slippage_per_unit:
+            raise ValueError("fill journal slippage_per_unit is inconsistent")
+        if (slippage_per_unit == 0) != (slippage_cost == 0):
+            raise ValueError("fill journal slippage_cost is inconsistent")
 
         logical_id = f"order-{index:06d}"
         shared_order = {
@@ -383,6 +426,15 @@ def _build_normal_backtest_trading_outcome(
                 projected_data["price"] = canonical_decimal_text(fill_price)
                 projected_data["quantity"] = canonical_decimal_text(fill_quantity)
                 projected_data["fee"] = canonical_decimal_text(fill_fee)
+                projected_data["reference_price"] = canonical_decimal_text(
+                    reference_price
+                )
+                projected_data["slippage_per_unit"] = canonical_decimal_text(
+                    slippage_per_unit
+                )
+                projected_data["slippage_cost"] = canonical_decimal_text(
+                    slippage_cost
+                )
             projected_side = projected_data["side"]
             assert type(projected_side) is OrderSide
             projected_data["side"] = projected_side.value

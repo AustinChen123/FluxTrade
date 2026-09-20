@@ -243,6 +243,9 @@ def _outcome_sources(
                 "quantity": "0.5",
                 "fee": "0.25",
                 "fill_type": "MARKET",
+                "reference_price": "101.50",
+                "slippage_per_unit": "0",
+                "slippage_cost": "0",
             },
             "trade_id": raw_order_id,
         },
@@ -375,7 +378,14 @@ def test_build_normal_backtest_outcome_canonicalizes_journal_money_text(
     entry_data["quantity"] = "5E-1"
     rows[0]["data"] = entry_data
     fill_data = dict(rows[1]["data"])
-    fill_data.update(price="1.015E+2", quantity="5E-1", fee="2.5E-1")
+    fill_data.update(
+        price="1.015E+2",
+        quantity="5E-1",
+        fee="2.5E-1",
+        reference_price="1.015E+2",
+        slippage_per_unit="0E-8",
+        slippage_cost="0E-8",
+    )
     rows[1]["data"] = fill_data
     exponent["journal"] = tuple(rows)
 
@@ -393,6 +403,59 @@ def test_build_normal_backtest_outcome_canonicalizes_journal_money_text(
     assert '"price",["string","101.5"]' in fill_json
     assert '"quantity",["string","0.5"]' in fill_json
     assert '"fee",["string","0.25"]' in fill_json
+    assert '"reference_price",["string","101.5"]' in fill_json
+    assert '"slippage_per_unit",["string","0"]' in fill_json
+    assert '"slippage_cost",["string","0"]' in fill_json
+
+
+@pytest.mark.parametrize(
+    ("side", "price", "reference_price", "slippage_per_unit", "slippage_cost"),
+    [
+        (OrderSide.BUY, "101.50", "101.60", "0.10", "0.05"),
+        (OrderSide.SELL, "101.50", "101.40", "0.10", "0.05"),
+        (OrderSide.BUY, "101.50", "101.40", "0.11", "0.05"),
+        (OrderSide.BUY, "101.50", "101.40", "0.10", "0"),
+    ],
+)
+def test_build_normal_backtest_outcome_rejects_inconsistent_slippage_evidence(
+    side: OrderSide,
+    price: str,
+    reference_price: str,
+    slippage_per_unit: str,
+    slippage_cost: str,
+) -> None:
+    sources = _outcome_sources()
+    fills = sources["fills"]
+    journal = sources["journal"]
+    assert type(fills) is tuple and type(journal) is tuple
+    fill = dict(fills[0])
+    fill["side"] = side.value
+    fill["price"] = Decimal(price)
+    sources["fills"] = (fill,)
+    rows = [dict(row) for row in journal]
+    for row in rows:
+        data = dict(row["data"])
+        data["side"] = side
+        row["data"] = data
+    fill_data = rows[1]["data"]
+    assert type(fill_data) is dict
+    fill_data.update(
+        price=price,
+        reference_price=reference_price,
+        slippage_per_unit=slippage_per_unit,
+        slippage_cost=slippage_cost,
+    )
+    sources["journal"] = tuple(rows)
+    signal_type = SignalType.LONG if side is OrderSide.BUY else SignalType.SHORT
+    sources["signals"] = capture_signal_batch(
+        (_signal(signal_type=signal_type, timestamp=100),)
+    )
+
+    with pytest.raises(BacktestOutcomeCaptureError) as caught:
+        build_normal_backtest_trading_outcome(**sources)
+
+    assert type(caught.value.__cause__) is ValueError
+    assert "slippage" in str(caught.value.__cause__)
 
 
 def test_journal_money_mismatch_fails_before_canonical_projection() -> None:

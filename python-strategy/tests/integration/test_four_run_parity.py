@@ -257,7 +257,7 @@ _EXPECTED_JOURNAL = (
         1_800_000_060_000,
         "fill",
         "order-000000",
-        '["map",[["fee",["string","0.101"]],["fill_type",["string","MARKET"]],["order_id",["string","order-000000"]],["price",["string","101"]],["quantity",["string","1"]],["side",["string","buy"]]]]',
+        '["map",[["fee",["string","0.101"]],["fill_type",["string","MARKET"]],["order_id",["string","order-000000"]],["price",["string","101"]],["quantity",["string","1"]],["reference_price",["string","101"]],["side",["string","buy"]],["slippage_cost",["string","0"]],["slippage_per_unit",["string","0"]]]]',
     ),
     (
         "d0b4_four_run",
@@ -271,7 +271,7 @@ _EXPECTED_JOURNAL = (
         1_800_000_180_000,
         "fill",
         "order-000001",
-        '["map",[["fee",["string","0.103"]],["fill_type",["string","MARKET"]],["order_id",["string","order-000001"]],["price",["string","103"]],["quantity",["string","1"]],["side",["string","sell"]]]]',
+        '["map",[["fee",["string","0.103"]],["fill_type",["string","MARKET"]],["order_id",["string","order-000001"]],["price",["string","103"]],["quantity",["string","1"]],["reference_price",["string","103"]],["side",["string","sell"]],["slippage_cost",["string","0"]],["slippage_per_unit",["string","0"]]]]',
     ),
 )
 
@@ -324,7 +324,7 @@ def _assert_exact_outcome(outcome: TradingOutcome) -> None:
     assert outcome.endpoint_state.halted_early is False
     assert (
         outcome.sha256()
-        == "43ea059c075a8986bada3ac884a470ab26b90ee23c90634a8f4cd1419ebbca6a"
+        == "25ca0728fb76745df5adf523fe9424dc76c6f110942b506e31c0f61d7d2d2c72"
     )
 
 
