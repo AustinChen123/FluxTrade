@@ -13,6 +13,9 @@ pub struct Limits {
 }
 
 impl Limits {
+    pub(crate) fn archive_limit(self) -> u64 {
+        self.archive as u64
+    }
     pub fn new(archive: usize, raw: usize) -> Result<Self> {
         ensure!(archive > 0 && raw > 0, "limits must be positive");
         // Keep even worst-case Deflate expansion inside ZIP32 during finalization.

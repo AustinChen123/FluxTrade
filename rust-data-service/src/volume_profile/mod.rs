@@ -13,6 +13,8 @@ pub mod compressed_page;
 #[cfg(unix)]
 pub mod directory;
 mod exact;
+#[cfg(unix)]
+pub mod store;
 pub mod work_policy;
 
 use std::collections::BTreeMap;

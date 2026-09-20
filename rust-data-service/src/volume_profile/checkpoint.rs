@@ -107,6 +107,9 @@ pub struct Manifest {
 }
 
 impl Manifest {
+    pub(crate) fn entries(&self) -> &[PageEntry] {
+        &self.entries
+    }
     pub fn new(identity: Identity, entries: Vec<PageEntry>) -> Self {
         Self { identity, entries }
     }

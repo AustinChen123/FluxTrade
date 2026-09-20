@@ -37,6 +37,9 @@ fn leaf(name: &str) -> bool {
 }
 
 impl Directory {
+    pub(crate) fn sync(&self) -> Result<()> {
+        Ok(fsync(&self.fd)?)
+    }
     pub fn open(root: &impl AsFd, job_id: &str) -> Result<Self> {
         ensure!(
             !job_id.is_empty()
