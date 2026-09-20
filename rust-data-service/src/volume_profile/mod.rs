@@ -9,6 +9,7 @@
 //! ID syntax, not registry membership or quote-asset semantics.
 pub mod binance_spot;
 mod exact;
+pub mod work_policy;
 
 use std::collections::BTreeMap;
 
