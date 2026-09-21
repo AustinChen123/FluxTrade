@@ -392,3 +392,251 @@ fn stored_totals_reject_decimal_count_and_intermediate_overflow_deterministicall
     let valid_order = from_stored([(0, half.clone()), (1, half), (2, almost_max)]).unwrap();
     assert_eq!(valid_order.totals(), &stored(Decimal::MAX, dec!(3), 3));
 }
+
+const DAY: i64 = 86_400_000;
+
+fn merge_daily(profiles: &[VolumeProfile]) -> Result<VolumeProfile> {
+    VolumeProfile::merge_ordered(profiles, grid(dec!(10)))
+}
+
+fn daily(day: i64, bins: impl IntoIterator<Item = (i64, Volume)>) -> VolumeProfile {
+    VolumeProfile::from_bins(
+        SPOT,
+        grid(dec!(10)),
+        Window::new(day * DAY, (day + 1) * DAY).unwrap(),
+        bins,
+    )
+    .unwrap()
+}
+
+#[test]
+fn ordered_merge_counts_empty_days_and_direct_coarse_equivalence() {
+    assert_eq!(merge_daily(&[]), Err(Error::Composition));
+    let too_many: Vec<_> = (0..91).map(|day| daily(day, [])).collect();
+    assert_eq!(merge_daily(&too_many), Err(Error::Composition));
+    for count in [1, 7, 30, 90] {
+        let mut days: Vec<_> = (0..count).map(|day| daily(day, [])).collect();
+        let all_empty = VolumeProfile::merge_ordered(&days, grid(dec!(50))).unwrap();
+        assert_eq!(all_empty.totals(), &Volume::default());
+        assert_eq!(all_empty.poc().unwrap(), None);
+        for (day, value) in days.iter_mut().enumerate().filter(|(day, _)| day % 2 == 0) {
+            for price in [dec!(1), dec!(49), dec!(50), dec!(100), dec!(199), dec!(200)] {
+                value.add(SPOT, day as i64 * DAY, price, dec!(0.1)).unwrap();
+            }
+        }
+        let before = days.clone();
+        for step in [dec!(10), dec!(50), dec!(100), dec!(200)] {
+            let window = Window::new(0, count * DAY).unwrap();
+            let mut direct = VolumeProfile::new(SPOT, grid(step), window).unwrap();
+            for day in (0..count).step_by(2) {
+                for price in [dec!(1), dec!(49), dec!(50), dec!(100), dec!(199), dec!(200)] {
+                    direct.add(SPOT, day * DAY, price, dec!(0.1)).unwrap();
+                }
+            }
+            let merged = VolumeProfile::merge_ordered(&days, grid(step)).unwrap();
+            assert_eq!(merged, direct);
+            assert_eq!(
+                merged,
+                VolumeProfile::merge_ordered(&days, grid(step)).unwrap()
+            );
+            let sum = days
+                .iter()
+                .try_fold(Volume::default(), |v, d| v.add(d.totals()))
+                .unwrap();
+            assert_eq!(merged.totals(), &sum);
+            assert_eq!(days, before);
+        }
+    }
+}
+
+#[test]
+fn ordered_merge_scope_matrix_including_empty_profiles() {
+    let valid = vec![daily(0, []), daily(1, [])];
+    for window in [
+        (DAY + 1, 2 * DAY + 1),
+        (DAY, 3 * DAY),
+        (2 * DAY, 3 * DAY),
+        (0, DAY),
+    ] {
+        let mut days = valid.clone();
+        let offset = window.0 % DAY;
+        days[0].window = Window::new(offset, DAY + offset).unwrap();
+        days[1].window = Window::new(window.0, window.1).unwrap();
+        assert_eq!(merge_daily(&days), Err(Error::Window));
+    }
+    let mut reversed = valid.clone();
+    reversed.reverse();
+    assert_eq!(merge_daily(&reversed), Err(Error::Window));
+    let mut other_product = valid.clone();
+    other_product[1].product_id = PERP.into();
+    assert_eq!(merge_daily(&other_product), Err(Error::Product));
+    for other_grid in [
+        grid(dec!(20)),
+        Grid::new(dec!(1), dec!(10), "USDT").unwrap(),
+        Grid::new(dec!(0), dec!(10), "USD").unwrap(),
+    ] {
+        let mut days = valid.clone();
+        days[1].grid = other_grid;
+        assert_eq!(
+            VolumeProfile::merge_ordered(&days, grid(dec!(50))),
+            Err(Error::Grid)
+        );
+    }
+    for output in [
+        grid(dec!(5)),
+        grid(dec!(15)),
+        Grid::new(dec!(1), dec!(50), "USDT").unwrap(),
+        Grid::new(dec!(0), dec!(50), "USD").unwrap(),
+    ] {
+        assert_eq!(
+            VolumeProfile::merge_ordered(&valid, output),
+            Err(Error::Grid)
+        );
+    }
+}
+
+#[test]
+fn ordered_merge_recomputes_poc_instead_of_combining_daily_pocs() {
+    let days = [
+        daily(
+            0,
+            [
+                (1, stored(dec!(3), dec!(3), 1)),
+                (2, stored(dec!(2), dec!(2), 1)),
+            ],
+        ),
+        daily(
+            1,
+            [
+                (3, stored(dec!(3), dec!(3), 1)),
+                (2, stored(dec!(2), dec!(2), 1)),
+            ],
+        ),
+    ];
+    assert_eq!(days[0].poc().unwrap().unwrap().index, 1);
+    assert_eq!(days[1].poc().unwrap().unwrap().index, 3);
+    let merged = VolumeProfile::merge_ordered(&days, grid(dec!(10))).unwrap();
+    assert_eq!(merged.poc().unwrap().unwrap().index, 2);
+    let tied = [
+        daily(0, [(4, stored(dec!(2), dec!(3), 1))]),
+        daily(1, [(-1, stored(dec!(2), dec!(1), 1))]),
+    ];
+    let merged_tie = VolumeProfile::merge_ordered(&tied, grid(dec!(10))).unwrap();
+    assert_eq!(merged_tie.poc().unwrap().unwrap().index, -1);
+}
+
+#[test]
+fn ordered_merge_negative_floor_and_scale_equivalent_grids() {
+    let fine = Grid::new(dec!(100), dec!(10), "USDT").unwrap();
+    let coarse = Grid::new(dec!(100.00), dec!(50.0), "USDT").unwrap();
+    let mut days = [daily(0, []), daily(1, [])];
+    days[0].grid = fine;
+    days[1].grid = Grid::new(dec!(100.0), dec!(10.00), "USDT").unwrap();
+    let mut direct =
+        VolumeProfile::new(SPOT, coarse.clone(), Window::new(0, 2 * DAY).unwrap()).unwrap();
+    for (day, price) in [
+        (0, dec!(1)),
+        (0, dec!(49)),
+        (1, dec!(50)),
+        (1, dec!(99)),
+        (1, dec!(100)),
+    ] {
+        days[day]
+            .add(SPOT, day as i64 * DAY, price, dec!(1.00))
+            .unwrap();
+        direct.add(SPOT, day as i64 * DAY, price, dec!(1)).unwrap();
+    }
+    let merged = VolumeProfile::merge_ordered(&days, coarse).unwrap();
+    assert_eq!(merged, direct);
+    assert_eq!(merged.bins()[&-2].aggregate_count, 2);
+    assert_eq!(merged.bins()[&-1].aggregate_count, 2);
+}
+
+#[test]
+fn ordered_merge_overflow_is_exact_deterministic_and_nonmutating() {
+    for first in [
+        stored(Decimal::MAX, dec!(1), 1),
+        stored(dec!(1), Decimal::MAX, 1),
+        stored(dec!(1), dec!(1), u64::MAX),
+    ] {
+        for second_index in [0, 1] {
+            let days = [
+                daily(0, [(0, first.clone())]),
+                daily(1, [(second_index, stored(dec!(1), dec!(1), 1))]),
+            ];
+            let before = days.clone();
+            for _ in 0..2 {
+                assert_eq!(
+                    VolumeProfile::merge_ordered(&days, grid(dec!(10))),
+                    Err(Error::Arithmetic)
+                );
+                assert_eq!(days, before);
+            }
+        }
+    }
+    let almost = Decimal::MAX - dec!(1);
+    let half = dec!(0.5);
+    for (indices, amounts, expected) in [
+        ([0, 0, 0], [almost, half, half], Err(Error::Arithmetic)),
+        ([0, 0, 0], [half, half, almost], Ok(Decimal::MAX)),
+        ([2, 0, 1], [almost, half, half], Ok(Decimal::MAX)),
+        ([2, 1, 0], [half, half, almost], Err(Error::Arithmetic)),
+    ] {
+        let days: Vec<_> = indices
+            .into_iter()
+            .zip(amounts)
+            .enumerate()
+            .map(|(day, (index, base))| daily(day as i64, [(index, stored(base, dec!(1), 1))]))
+            .collect();
+        let before = days.clone();
+        for _ in 0..2 {
+            let result = VolumeProfile::merge_ordered(&days, grid(dec!(10)));
+            assert_eq!(result.map(|p| p.totals().base_volume), expected);
+            assert_eq!(days, before);
+        }
+    }
+    let origin = Decimal::MAX - dec!(1);
+    let fine = Grid::new(origin, dec!(1), "USDT").unwrap();
+    assert_eq!(fine.edges(0).unwrap(), (origin, Decimal::MAX));
+    let source = VolumeProfile::from_bins(
+        SPOT,
+        fine,
+        Window::new(0, DAY).unwrap(),
+        [(0, stored(dec!(1), dec!(1), 1))],
+    )
+    .unwrap();
+    let coarse = Grid::new(origin, dec!(2), "USDT").unwrap();
+    let before = source.clone();
+    assert_eq!(
+        VolumeProfile::merge_ordered(std::slice::from_ref(&source), coarse),
+        Err(Error::Arithmetic)
+    );
+    assert_eq!(source, before);
+}
+
+#[test]
+fn ordered_merge_preflights_later_scope_before_earlier_arithmetic() {
+    let hazard = [
+        daily(0, [(0, stored(Decimal::MAX, dec!(1), 1))]),
+        daily(1, [(0, stored(dec!(1), dec!(1), 1))]),
+        daily(2, []),
+    ];
+    for expected in [Error::Product, Error::Grid, Error::Window] {
+        let mut days = hazard.clone();
+        match expected {
+            Error::Product => days[2].product_id = PERP.into(),
+            Error::Grid => days[2].grid = grid(dec!(20)),
+            _ => days[2].window = Window::new(3 * DAY, 4 * DAY).unwrap(),
+        }
+        let before = days.clone();
+        assert_eq!(
+            VolumeProfile::merge_ordered(&days, grid(dec!(10))),
+            Err(expected)
+        );
+        assert_eq!(days, before);
+    }
+    assert_eq!(
+        VolumeProfile::merge_ordered(&hazard, grid(dec!(15))),
+        Err(Error::Grid)
+    );
+}

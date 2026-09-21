@@ -51,6 +51,8 @@ pub enum Error {
     TradeValue,
     #[error("stored bins must be unique with positive volumes and count")]
     BinValue,
+    #[error("profile composition requires one through ninety inputs")]
+    Composition,
     #[error("result cannot be represented exactly")]
     Arithmetic,
 }
@@ -192,6 +194,56 @@ impl VolumeProfile {
             result.totals = result.totals.add(volume)?;
         }
         Ok(result)
+    }
+
+    /// Compose contiguous UTC days, preserving exact checked intermediate sums.
+    /// Scope validation precedes arithmetic, including for empty input days.
+    /// Per-bin sums follow input-day/source-index order; final totals follow output-index order.
+    /// An unrepresentable prefix in either phase returns [`Error::Arithmetic`].
+    pub fn merge_ordered(profiles: &[Self], output_grid: Grid) -> Result<Self> {
+        const DAY_MS: i64 = 86_400_000;
+        if profiles.is_empty() || profiles.len() > 90 {
+            return Err(Error::Composition);
+        }
+        let first = &profiles[0];
+        let mut end = first.window.start_ms;
+        for profile in profiles {
+            if profile.window.start_ms % DAY_MS != 0
+                || profile.window.end_ms - profile.window.start_ms != DAY_MS
+                || profile.window.start_ms != end
+            {
+                return Err(Error::Window);
+            }
+            if profile.product_id != first.product_id {
+                return Err(Error::Product);
+            }
+            if profile.grid != first.grid {
+                return Err(Error::Grid);
+            }
+            end = profile.window.end_ms;
+        }
+        if output_grid.origin != first.grid.origin
+            || output_grid.unit != first.grid.unit
+            || output_grid.step < first.grid.step
+            || !exact::multiple(output_grid.step, first.grid.step)
+        {
+            return Err(Error::Grid);
+        }
+        let mut bins = BTreeMap::<i64, Volume>::new();
+        for profile in profiles {
+            for (&index, volume) in &profile.bins {
+                let (low, _) = profile.grid.edges(index)?;
+                let target = output_grid.index(low)?;
+                let merged = bins.get(&target).cloned().unwrap_or_default().add(volume)?;
+                bins.insert(target, merged);
+            }
+        }
+        Self::from_bins(
+            first.product_id.clone(),
+            output_grid,
+            Window::new(first.window.start_ms, end)?,
+            bins,
+        )
     }
 
     pub fn product_id(&self) -> &str {
