@@ -16,6 +16,28 @@ class ProfileDecisionBasis(StrEnum):
 
 class ProfileDecisionStatus(StrEnum):
     FRESH = "FRESH"
+    MISSING = "MISSING"
+    INVALID = "INVALID"
+
+
+_UNAVAILABLE_REASONS = {
+    ProfileDecisionStatus.MISSING: frozenset(
+        {
+            "PROFILE_NOT_READY",
+            "PROFILE_EXPIRED",
+            "BACKEND_UNAVAILABLE",
+            "CLOCK_UNCERTAIN",
+            "VALIDATION_EXPIRED",
+        }
+    ),
+    ProfileDecisionStatus.INVALID: frozenset(
+        {
+            "SNAPSHOT_REVOKED",
+            "INVALID_PROFILE",
+            "QUERY_TOO_LARGE",
+        }
+    ),
+}
 
 
 def _decimal_json(value: object) -> str:
@@ -45,14 +67,30 @@ class ProfileDecisionContext:
                 or type(self.status) is not ProfileDecisionStatus
             ):
                 raise ValueError
-            if self.reason is not None:
-                raise ValueError
             modeled = self.basis is ProfileDecisionBasis.MODELED
             if self.request.purpose != (
                 "MODELED_RESEARCH" if modeled else "LIVE_QUERY"
             ):
                 raise ValueError
             if modeled and self.request.as_of_ms != self.decision_time_ms:
+                raise ValueError
+            if self.status is not ProfileDecisionStatus.FRESH:
+                if (
+                    type(self.reason) is not str
+                    or self.reason not in _UNAVAILABLE_REASONS[self.status]
+                    or any(
+                        value is not None
+                        for value in (
+                            self.profile,
+                            self.available_at_ms,
+                            self.validation_checked_at_ms,
+                            self.observed_at_ms,
+                        )
+                    )
+                ):
+                    raise ValueError
+                return
+            if self.reason is not None:
                 raise ValueError
             p, r = self.profile, self.request
             if type(p) is not CompositeProfile:

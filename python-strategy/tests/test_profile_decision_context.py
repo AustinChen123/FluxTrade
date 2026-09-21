@@ -190,3 +190,125 @@ def test_request_and_manifest_content_are_digest_inputs():
         ref = replace(FULL.manifest.days[0], **{field: new})
         profile = replace(FULL, manifest=replace(FULL.manifest, days=(ref,)))
         assert replace(value, profile=profile).digest != value.digest
+
+
+MISSING = (
+    "PROFILE_NOT_READY",
+    "PROFILE_EXPIRED",
+    "BACKEND_UNAVAILABLE",
+    "CLOCK_UNCERTAIN",
+    "VALIDATION_EXPIRED",
+)
+INVALID = ("SNAPSHOT_REVOKED", "INVALID_PROFILE", "QUERY_TOO_LARGE")
+
+
+def unavailable(basis=B.LIVE_OBSERVED, status=S.MISSING, reason="PROFILE_NOT_READY"):
+    return C(item(basis).request, DAY + 3, basis, status, reason)
+
+
+@pytest.mark.parametrize("basis", list(B))
+@pytest.mark.parametrize("status", list(S))
+@pytest.mark.parametrize("reason", (None, "", "SECRET", True) + MISSING + INVALID)
+def test_complete_reason_matrix(basis, status, reason):
+    valid = (
+        reason is None
+        if status == S.FRESH
+        else reason in (MISSING if status == S.MISSING else INVALID)
+    )
+
+    def construct():
+        return (
+            replace(item(basis), reason=reason)
+            if status == S.FRESH
+            else unavailable(basis, status, reason)
+        )
+
+    if valid:
+        assert construct().reason == reason
+    else:
+        with pytest.raises(ValueError, match="^PROFILE_DECISION_INVALID$") as error:
+            construct()
+        assert error.value.__cause__ is None
+
+
+@pytest.mark.parametrize("basis", list(B))
+@pytest.mark.parametrize(
+    "status,reason", [(S.MISSING, MISSING[0]), (S.INVALID, INVALID[0])]
+)
+@pytest.mark.parametrize(
+    "field,value",
+    [
+        ("profile", FULL),
+        ("available_at_ms", DAY),
+        ("validation_checked_at_ms", DAY),
+        ("observed_at_ms", DAY),
+    ],
+)
+def test_unavailable_forbids_each_evidence(basis, status, reason, field, value):
+    with pytest.raises(ValueError):
+        replace(unavailable(basis, status, reason), **{field: value})
+
+
+@pytest.mark.parametrize(
+    "status,reason", [(S.MISSING, MISSING[0]), (S.INVALID, INVALID[0])]
+)
+def test_unavailable_request_pairing_and_as_of(status, reason):
+    for basis in B:
+        value = unavailable(basis, status, reason)
+        other = B.MODELED if basis == B.LIVE_OBSERVED else B.LIVE_OBSERVED
+        with pytest.raises(ValueError):
+            replace(value, request=item(other).request)
+        replay = replace(
+            REQUEST,
+            purpose="RECORDED_REPLAY",
+            freshness_policy_id=None,
+            pinned_manifest=FULL.manifest,
+        )
+        with pytest.raises(ValueError):
+            replace(value, request=replay)
+    modeled = unavailable(B.MODELED, status, reason)
+    for stamp in (DAY + 2, DAY + 4):
+        with pytest.raises(ValueError):
+            replace(modeled, request=replace(modeled.request, as_of_ms=stamp))
+
+
+@pytest.mark.parametrize(
+    "field,bad",
+    [
+        ("status", "MISSING"),
+        ("status", "STALE"),
+        ("status", True),
+        ("reason", type("String", (str,), {})(MISSING[0])),
+        ("basis", "LIVE_OBSERVED"),
+        ("decision_time_ms", True),
+        ("decision_time_ms", -1),
+        ("decision_time_ms", 1 << 63),
+    ],
+)
+def test_unavailable_exact_types(field, bad):
+    with pytest.raises(ValueError):
+        replace(unavailable(), **{field: bad})
+
+
+def test_unavailable_canonical_nulls_and_distinct_digests():
+    values = [
+        unavailable(basis, status, reason)
+        for basis in B
+        for status, reasons in ((S.MISSING, MISSING), (S.INVALID, INVALID))
+        for reason in reasons
+    ]
+    assert len({value.digest for value in values}) == len(values)
+    for value in values:
+        payload = json.loads(value.canonical_bytes)
+        assert payload["status"] == value.status.value
+        assert payload["reason"] == value.reason
+        assert payload["basis"] == value.basis.value
+        for field in (
+            "profile",
+            "available_at_ms",
+            "validation_checked_at_ms",
+            "observed_at_ms",
+        ):
+            assert field in payload and payload[field] is None
+        assert value.digest == hashlib.sha256(value.canonical_bytes).hexdigest()
+        assert value.digest != item(value.basis).digest
