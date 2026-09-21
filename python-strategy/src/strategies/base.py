@@ -6,6 +6,7 @@ import pandas as pd
 from src.core.models import Candlestick, Signal, Trade
 from src.core.journal import StrategyJournal
 from src.core.strategy_context import StrategyContext
+from src.core.market_data.profiles.requirements import ProfileRequirement
 
 
 class StrategyContextCapability(StrEnum):
@@ -18,6 +19,7 @@ class StrategyRequirements:
     timeframe: str
     lookback_window: int
     required_context_capabilities: frozenset[StrategyContextCapability] = frozenset()
+    profile_requirements: tuple[ProfileRequirement, ...] = ()
 
     def __post_init__(self) -> None:
         if type(self.required_context_capabilities) is not frozenset or any(
@@ -27,6 +29,18 @@ class StrategyRequirements:
             raise TypeError(
                 "required context capabilities must use StrategyContextCapability"
             )
+        if type(self.profile_requirements) is not tuple or any(
+            type(item) is not ProfileRequirement for item in self.profile_requirements
+        ):
+            raise TypeError("invalid profile requirements")
+        keyed = [(item.canonical_bytes, item) for item in self.profile_requirements]
+        if len({key for key, _ in keyed}) != len(keyed):
+            raise ValueError("duplicate profile requirements")
+        object.__setattr__(
+            self,
+            "profile_requirements",
+            tuple(item for _, item in sorted(keyed, key=lambda pair: pair[0])),
+        )
 
 
 class BaseStrategy(ABC):

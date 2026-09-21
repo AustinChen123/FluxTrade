@@ -19,7 +19,7 @@ from typing import Iterable, Mapping, Sequence
 from src.core.decimal_math import canonical_decimal_text
 from src.core.models import Candlestick, OrderSide
 from src.core.strategy_context import StrategyContext
-from src.strategies.base import BaseStrategy
+from src.strategies.base import BaseStrategy, StrategyRequirements
 
 _DATASET_SCHEMA = "fluxtrade.backtest_dataset.v1"
 _CONFIGURATION_SCHEMA = "fluxtrade.backtest_configuration.v1"
@@ -117,6 +117,21 @@ def configuration_sha256(configuration: object) -> str:
     return _canonical_sha256(_CONFIGURATION_SCHEMA, configuration)
 
 
+def _requirements_projection(requirements: StrategyRequirements) -> dict[str, object]:
+    projection: dict[str, object] = {
+        "product_id": requirements.product_id,
+        "timeframe": requirements.timeframe,
+        "lookback_window": requirements.lookback_window,
+        "required_context_capabilities": requirements.required_context_capabilities,
+    }
+    if requirements.profile_requirements:
+        projection["profile_requirements"] = [
+            json.loads(item.canonical_bytes)
+            for item in requirements.profile_requirements
+        ]
+    return projection
+
+
 def strategy_configuration_contract(
     strategies: Sequence[BaseStrategy],
 ) -> tuple[dict[str, object], ...]:
@@ -134,7 +149,7 @@ def strategy_configuration_contract(
                 "strategy_id": strategy.strategy_id,
                 "class_module": type(strategy).__module__,
                 "class_name": type(strategy).__qualname__,
-                "requirements": strategy.requirements,
+                "requirements": _requirements_projection(strategy.requirements),
                 "replay_configuration_declared": replay_configuration_declared,
                 "replay_configuration": replay_configuration,
             }
