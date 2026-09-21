@@ -1,6 +1,6 @@
 from dataclasses import replace
 from decimal import Decimal
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Callable, cast
 from unittest.mock import Mock, call
 
 import pytest
@@ -10,6 +10,7 @@ from src.core.market_data.profiles.composite_types import CompositeProfile
 from src.core.market_data.profiles.grid import resolve_profile_grid
 from src.core.market_data.profiles.read_results import ProfileCandidate
 from src.core.market_data.profiles.read_types import ProfileQueryRequest
+from src.core.market_data.profiles.read_types import ProfileInvalidation
 from test_profile_composite import reading
 from test_profile_read_results import NOW
 
@@ -128,3 +129,178 @@ def test_second_read_classification(
             query.query_live_profile(provider, request, context)
     compose.assert_not_called()
     provider.list_candidates.assert_called_once()
+
+
+@pytest.mark.parametrize(
+    "reason,expected",
+    [
+        ("REVOKED", "SNAPSHOT_REVOKED"),
+        ("TOO_LARGE", "QUERY_TOO_LARGE"),
+        ("ARITHMETIC", "INVALID_PROFILE"),
+        ("INTEGRITY", "INVALID_PROFILE"),
+        ("NATIVE_UNAVAILABLE", "BACKEND_UNAVAILABLE"),
+        ("NATIVE_FAILURE", "BACKEND_UNAVAILABLE"),
+        ("SECRET", None),
+    ],
+)
+def test_composition_mapping(
+    monkeypatch: pytest.MonkeyPatch, reason: str, expected: str | None
+) -> None:
+    request, provider, compose, context = setup(monkeypatch)
+    compose.side_effect = query.ProfileCompositionError(reason)
+    if expected:
+        assert query.query_live_profile(
+            provider, request, context
+        ) == query.LiveProfileQueryUnavailable(expected)
+    else:
+        with pytest.raises(query.ProfileQueryError, match="^PROFILE_QUERY_INTEGRITY$"):
+            query.query_live_profile(provider, request, context)
+    compose.assert_called_once()
+
+
+@pytest.mark.parametrize("phase", ["list_candidates", "get_manifest"])
+def test_provider_errors_propagate(monkeypatch: pytest.MonkeyPatch, phase: str) -> None:
+    request, provider, compose, context = setup(monkeypatch)
+    error = RuntimeError("SECRET")
+    getattr(provider, phase).side_effect = error
+    with pytest.raises(RuntimeError) as caught:
+        query.query_live_profile(provider, request, context)
+    assert caught.value is error
+    compose.assert_not_called()
+    if phase == "list_candidates":
+        provider.get_manifest.assert_not_called()
+
+
+def test_success_dto_rejects_mismatch(monkeypatch: pytest.MonkeyPatch) -> None:
+    request, provider, compose, context = setup(monkeypatch)
+    result = query.query_live_profile(provider, request, context)
+    assert isinstance(result, query.LiveProfileQueryResult)
+    with pytest.raises(query.ProfileQueryError):
+        query.LiveProfileQueryResult(result.selection, cast(CompositeProfile, True))
+    changed = replace(
+        result.profile.manifest,
+        days=tuple(replace(d, revision=2) for d in result.profile.manifest.days),
+    )
+    with pytest.raises(query.ProfileQueryError):
+        replace(result, profile=replace(result.profile, manifest=changed))
+
+
+def test_explicit_single_revision(monkeypatch: pytest.MonkeyPatch) -> None:
+    request, provider, compose, _ = setup(monkeypatch)
+    read = provider.get_manifest.return_value
+    manifest = replace(read.manifest, days=read.manifest.days[:1])
+    read = replace(read, manifest=manifest, days=read.days[:1])
+    provider.get_manifest.return_value = read
+    provider.list_candidates.return_value = provider.list_candidates.return_value[:1]
+    compose.return_value = replace(compose.return_value, manifest=manifest)
+    request = replace(request, end_ms=86400000, revision=1)
+    result = query.query_live_profile(
+        provider, request, query.LiveSelectionContext(86400000)
+    )
+    assert isinstance(result, query.LiveProfileQueryResult)
+    assert provider.list_candidates.call_args.kwargs["revision"] == 1
+    assert result.selection.manifest == manifest
+    provider.get_manifest.assert_called_once_with(manifest)
+
+
+def test_new_revision_does_not_reselect(monkeypatch: pytest.MonkeyPatch) -> None:
+    request, provider, _, context = setup(monkeypatch)
+    original = provider.get_manifest.return_value
+
+    def race(manifest):
+        assert manifest == original.manifest
+        provider.list_candidates.return_value += tuple(
+            replace(c, ref=replace(c.ref, snapshot_id=f"{i:064x}", revision=2))
+            for i, c in enumerate(provider.list_candidates.return_value)
+        )
+        return original
+
+    provider.get_manifest.side_effect = race
+    result = query.query_live_profile(provider, request, context)
+    assert isinstance(result, query.LiveProfileQueryResult)
+    assert result.selection.manifest == original.manifest
+    assert all(ref.revision == 1 for ref in result.profile.manifest.days)
+    provider.list_candidates.assert_called_once()
+    provider.get_manifest.assert_called_once()
+
+
+def test_revocation_race_uses_real_composer(monkeypatch: pytest.MonkeyPatch) -> None:
+    from src.core.market_data.profiles import composite
+
+    request, provider, _, context = setup(monkeypatch)
+    read = provider.get_manifest.return_value
+    event = ProfileInvalidation(
+        "revoked",
+        read.days[0].ref.snapshot_id,
+        "BAD",
+        NOW.replace(microsecond=0),
+        None,
+        "test",
+    )
+    provider.get_manifest.return_value = replace(
+        read, days=(replace(read.days[0], invalidations=(event,)), read.days[1])
+    )
+    loader = Mock(side_effect=AssertionError("native not allowed"))
+    monkeypatch.setattr(composite, "_load_native", loader)
+    monkeypatch.setattr(query, "compose_profile", composite.compose_profile)
+    assert query.query_live_profile(
+        provider, request, context
+    ) == query.LiveProfileQueryUnavailable("SNAPSHOT_REVOKED")
+    loader.assert_not_called()
+    provider.list_candidates.assert_called_once()
+    provider.get_manifest.assert_called_once()
+
+
+def test_pre_io_validation_matrix(monkeypatch: pytest.MonkeyPatch) -> None:
+    request, provider, compose, context = setup(monkeypatch)
+    invoke = cast(Callable[..., object], query.query_live_profile)
+    recorded = replace(
+        request,
+        purpose="MODELED_RESEARCH",
+        freshness_policy_id=None,
+        availability_policy_id="a",
+        as_of_ms=0,
+    )
+    cases = [(True, context), (request, True), (recorded, context)]
+    for field in (
+        "freshness_policy_id",
+        "base_grid_id",
+        "algorithm_version",
+        "output_grid_id",
+    ):
+        cases.append((replace(request, **{field: "SECRET"}), context))
+    for bad_request, bad_context in cases:
+        with pytest.raises(query.ProfileQueryError) as caught:
+            invoke(provider, bad_request, bad_context)
+        assert (
+            str(caught.value) == "PROFILE_QUERY_INVALID"
+            and caught.value.__cause__ is None
+        )
+        assert provider.mock_calls == [] and compose.call_count == 0
+
+
+def test_dto_exact_contracts(monkeypatch: pytest.MonkeyPatch) -> None:
+    request, provider, _, context = setup(monkeypatch)
+    result = query.query_live_profile(provider, request, context)
+    assert isinstance(result, query.LiveProfileQueryResult)
+    selected = result.selection
+    derived = type("SelectionSubclass", (type(selected),), {})(
+        selected.manifest, selected.decision_time_ms, selected.policy
+    )
+    constructor = cast(Callable[..., object], query.LiveProfileQueryResult)
+    for invalid in (True, derived):
+        with pytest.raises(query.ProfileQueryError):
+            constructor(invalid, result.profile)
+    unavailable = cast(Callable[..., object], query.LiveProfileQueryUnavailable)
+    for invalid in (True, "SECRET", type("Text", (str,), {})("NOT_READY")):
+        with pytest.raises(query.ProfileQueryError):
+            unavailable(invalid)
+    for reason in (
+        "NOT_READY",
+        "PROFILE_EXPIRED",
+        "SNAPSHOT_REVOKED",
+        "QUERY_TOO_LARGE",
+        "INVALID_PROFILE",
+        "BACKEND_UNAVAILABLE",
+    ):
+        assert query.LiveProfileQueryUnavailable(reason).reason == reason
