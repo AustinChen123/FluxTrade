@@ -1,5 +1,48 @@
 from __future__ import annotations
 
+from typing import final
+
+_ProfileBin = tuple[int, str, str, int]
+_ProfileDay = tuple[int, int, list[_ProfileBin] | tuple[_ProfileBin, ...]]
+
+@final
+class VolumeProfileMergeResult:
+    @property
+    def product_id(self) -> str: ...
+    @property
+    def window_start_ms(self) -> int: ...
+    @property
+    def window_end_ms(self) -> int: ...
+    @property
+    def bin_origin(self) -> str: ...
+    @property
+    def bin_step(self) -> str: ...
+    @property
+    def unit(self) -> str: ...
+    @property
+    def bins(self) -> list[tuple[int, str, str, int]]: ...
+    @property
+    def base_volume(self) -> str: ...
+    @property
+    def quote_volume(self) -> str: ...
+    @property
+    def aggregate_count(self) -> int: ...
+    @property
+    def poc_index(self) -> int | None: ...
+    @property
+    def poc_low(self) -> str | None: ...
+    @property
+    def poc_high_exclusive(self) -> str | None: ...
+
+def merge_volume_profiles(
+    product_id: str,
+    bin_origin: str,
+    bin_step: str,
+    unit: str,
+    days: list[_ProfileDay] | tuple[_ProfileDay, ...],
+    output_step: str,
+) -> VolumeProfileMergeResult: ...
+
 class Candlestick:
     product_id: str
     timeframe: str
