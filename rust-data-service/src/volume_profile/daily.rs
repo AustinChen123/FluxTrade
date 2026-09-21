@@ -5,7 +5,6 @@
 use anyhow::{ensure, Result};
 use ring::digest::{digest, SHA256};
 use rust_decimal::Decimal;
-use serde_json::Value;
 
 use super::binance_spot::PRODUCT_ID;
 use super::checkpoint::{CheckpointProgress, Identity, Manifest, Recovered};
@@ -38,43 +37,15 @@ pub fn hourly_staging_job_id(daily_job_id: &str, hour_start_ms: i64) -> Result<S
     Ok(sha(&bytes))
 }
 
-fn nonnegative(value: &Value) -> Result<Decimal> {
-    let text = value
-        .as_str()
-        .ok_or_else(|| anyhow::anyhow!("expected kline decimal text"))?;
-    ensure!(
-        !text.is_empty() && text.bytes().all(|c| c.is_ascii_digit() || c == b'.'),
-        "invalid kline decimal text"
-    );
-    let value = Decimal::from_str_exact(text)?;
-    ensure!(value >= Decimal::ZERO, "negative kline value");
-    Ok(value)
-}
-
 fn official_kline(raw: &[u8], profile: &VolumeProfile) -> Result<Reconciliation> {
-    ensure!(raw.len() <= 65_536, "kline response byte limit");
-    let value: Value = serde_json::from_slice(raw)?;
-    let rows = value
-        .as_array()
-        .ok_or_else(|| anyhow::anyhow!("expected kline rows"))?;
-    ensure!(rows.len() == 1, "expected one official daily kline");
-    let row = rows[0]
-        .as_array()
-        .ok_or_else(|| anyhow::anyhow!("expected kline row"))?;
-    ensure!(
-        row.len() == 12
-            && row[0].as_i64() == Some(profile.window().start_ms())
-            && row[6].as_i64() == Some(profile.window().end_ms() - 1),
-        "kline shape/window mismatch"
-    );
-    let mut numbers = Vec::new();
-    for index in [1, 2, 3, 4, 5, 7, 9, 10, 11] {
-        numbers.push(nonnegative(&row[index])?);
-    }
-    let count = row[8]
-        .as_u64()
-        .ok_or_else(|| anyhow::anyhow!("invalid constituent trade count"))?;
-    Reconciliation::new(profile, sha(raw), numbers[4], numbers[5], count)
+    let kline = super::binance_kline::parse(raw, profile.window())?;
+    Reconciliation::new(
+        profile,
+        kline.response_sha256,
+        kline.base_volume,
+        kline.quote_volume,
+        kline.constituent_trade_count,
+    )
 }
 
 /// Consumes no external state. Errors discard the local accumulator and handoff.

@@ -7,6 +7,7 @@
 //! The caller/ingress must use the existing product registry to verify that
 //! grid.unit equals the product's quote asset. This module validates canonical
 //! ID syntax, not registry membership or quote-asset semantics.
+pub mod binance_kline;
 pub mod binance_spot;
 pub mod checkpoint;
 #[cfg(unix)]

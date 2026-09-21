@@ -13,7 +13,7 @@ use super::{
 };
 
 const FILE: &str = "daily-kline-evidence.json";
-const RAW_LIMIT: usize = 65_536;
+use super::binance_kline::{self, RAW_LIMIT};
 const ARTIFACT_LIMIT: u64 = (RAW_LIMIT * 6 + 4096) as u64;
 const DAY: i64 = 24 * mvp::HOUR;
 
@@ -83,7 +83,10 @@ impl Evidence {
             "invalid observation"
         );
         let raw = std::str::from_utf8(raw)?;
-        serde_json::from_str::<serde_json::Value>(raw)?;
+        binance_kline::parse(
+            raw.as_bytes(),
+            Window::new(identity.start_ms, identity.end_ms)?,
+        )?;
         Ok(Self {
             identity,
             raw: raw.into(),
