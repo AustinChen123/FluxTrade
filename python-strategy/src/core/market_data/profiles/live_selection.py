@@ -5,9 +5,48 @@ from datetime import datetime, timezone
 
 from .read_types import OrderedProfileManifest, ProfileQueryRequest, _integer
 from .selection import ProfileCandidateBatch, ProfileSelectionError
+from .requirements import ProfileRequirement
 
 _DAY = 86400000
 _POLICY = "utc_complete_strict_v1"
+
+
+def plan_live_profile_requests(
+    requirements: tuple[ProfileRequirement, ...], *, selection_time_ms: int
+) -> tuple[ProfileQueryRequest, ...]:
+    """Plan complete-day LIVE windows; no clock reads or provider support checks."""
+    try:
+        _integer(selection_time_ms)
+        if type(requirements) is not tuple or any(
+            type(requirement) is not ProfileRequirement for requirement in requirements
+        ):
+            raise ValueError
+        keyed = [
+            (requirement.canonical_bytes, requirement) for requirement in requirements
+        ]
+        if len({key for key, _ in keyed}) != len(keyed):
+            raise ValueError
+        end = selection_time_ms // _DAY * _DAY
+        requests = []
+        for _, requirement in sorted(keyed, key=lambda pair: pair[0]):
+            start = end - requirement.window_days * _DAY
+            if requirement.freshness_policy_id != _POLICY or start < 0:
+                raise ValueError
+            requests.append(
+                ProfileQueryRequest(
+                    requirement.product_id,
+                    requirement.base_grid_id,
+                    requirement.output_grid_id,
+                    requirement.algorithm_version,
+                    start,
+                    end,
+                    "LIVE_QUERY",
+                    freshness_policy_id=requirement.freshness_policy_id,
+                )
+            )
+        return tuple(requests)
+    except ValueError:
+        raise ProfileSelectionError() from None
 
 
 @dataclass(frozen=True, slots=True)
