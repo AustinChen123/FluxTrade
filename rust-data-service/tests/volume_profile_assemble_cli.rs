@@ -65,24 +65,40 @@ fn actual_executable_replays_source_pair_with_canonical_lf() {
     .to_bytes()
     .unwrap();
     expected.push(b'\n');
+    fluxtrade_core::volume_profile::kline_evidence::persist(
+        &root,
+        fluxtrade_core::volume_profile::kline_evidence::Identity::new(
+            "daily".into(),
+            Window::new(0, end).unwrap(),
+        )
+        .unwrap(),
+        &raw,
+        end,
+    )
+    .unwrap();
     for _ in 0..2 {
         let mut child = Command::new(env!("CARGO_BIN_EXE_volume_profile_assemble"))
             .arg("--staging-root")
             .arg(staging.path())
-            .args([
-                "--job-id",
-                "daily",
-                "--start-ms",
-                "0",
-                "--source-available-at-ms",
-                &end.to_string(),
-            ])
+            .args(["--job-id", "daily", "--start-ms", "0"])
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .spawn()
             .unwrap();
-        child.stdin.take().unwrap().write_all(&raw).unwrap();
+        let mut stdin = child.stdin.take().unwrap();
+        if let Err(error) = stdin.write_all(b"SECRET ignored stdin") {
+            assert_eq!(error.kind(), std::io::ErrorKind::BrokenPipe, "{error}");
+        }
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+        while child.try_wait().unwrap().is_none() && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        if child.try_wait().unwrap().is_none() {
+            child.kill().unwrap();
+            child.wait().unwrap();
+            panic!("assembler consumed stdin or exceeded deadline");
+        }
         let output = child.wait_with_output().unwrap();
         assert!(output.status.success());
         assert!(output.stderr.is_empty());

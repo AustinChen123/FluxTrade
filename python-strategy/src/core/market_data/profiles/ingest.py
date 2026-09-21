@@ -1,15 +1,14 @@
-"""One-job offline publication. Source owner must persist/replay the exact response
-bytes and first-observed timestamp pair. This owner neither fetches nor attests
+"""One-job offline publication. Trusted Rust assembler owns immutable source
+evidence recovery and binding. This owner neither fetches nor attests
 provenance, schedules work, or deletes staging. Requires POSIX pipe selectors.
 """
 
 import os
-import hashlib
 import selectors
 import subprocess
 import time
 from dataclasses import dataclass
-from datetime import datetime, timedelta, timezone
+from datetime import timedelta
 from typing import Literal
 
 from .handoff import parse_handoff
@@ -56,18 +55,17 @@ class IngestResult:
             raise ValueError("invalid ingest result")
 
 
-def _assemble(argv: list[str], raw: bytes, policy: IngestPolicy) -> bytes:
-    """Bound every pipe, including stdin; kill/reap the child on any failure."""
+def _assemble(argv: list[str], policy: IngestPolicy) -> bytes:
+    """DEVNULL stdin and bounded output pipes; kill/reap on any failure."""
     try:
-        with subprocess.Popen(argv, shell=False, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+        with subprocess.Popen(argv, shell=False, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
                               stderr=subprocess.PIPE) as child:
-            assert child.stdin is not None and child.stdout is not None and child.stderr is not None
+            assert child.stdout is not None and child.stderr is not None
             try:
                 deadline = time.monotonic() + policy.timeout_ms / 1000
-                output, errors, sent = bytearray(), 0, 0
+                output, errors = bytearray(), 0
                 with selectors.DefaultSelector() as selector:
-                    for pipe, event in ((child.stdin, selectors.EVENT_WRITE),
-                                        (child.stdout, selectors.EVENT_READ), (child.stderr, selectors.EVENT_READ)):
+                    for pipe, event in ((child.stdout, selectors.EVENT_READ), (child.stderr, selectors.EVENT_READ)):
                         os.set_blocking(pipe.fileno(), False)
                         selector.register(pipe, event)
                     while selector.get_map():
@@ -76,13 +74,6 @@ def _assemble(argv: list[str], raw: bytes, policy: IngestPolicy) -> bytes:
                             raise AssemblyFailure("assembler timeout")
                         for key, _ in selector.select(remaining):
                             pipe = key.fileobj
-                            if pipe is child.stdin:
-                                if sent < len(raw):
-                                    sent += os.write(key.fd, raw[sent:sent + 4096])
-                                if sent == len(raw):
-                                    selector.unregister(pipe)
-                                    child.stdin.close()
-                                continue
                             limit = policy.stdout_bytes - len(output) if pipe is child.stdout else policy.stderr_bytes - errors
                             chunk = os.read(key.fd, min(4096, limit + 1))
                             if len(chunk) > limit:
@@ -115,14 +106,11 @@ class ProfileIngestProcess:
             raise ValueError("invalid ingest policy")
         self._store, self._executable, self._policy = store, executable, policy
 
-    def run(self, spec: JobSpec, staging_root: str, raw: bytes, source_available_at_ms: int,
-            worker_id: str) -> IngestResult:
-        if type(spec) is not JobSpec or type(raw) is not bytes or not 0 < len(raw) <= 65_536:
+    def run(self, spec: JobSpec, staging_root: str, worker_id: str) -> IngestResult:
+        if type(spec) is not JobSpec:
             raise ValueError("invalid ingest input")
         if type(staging_root) is not str or not os.path.isabs(staging_root) or "\x00" in staging_root:
             raise ValueError("invalid staging root")
-        if type(source_available_at_ms) is not int or not spec.window_end_ms <= source_available_at_ms <= 253402300799999:
-            raise ValueError("invalid source observation")
         _safe(worker_id, 128)
         state = self._store.get(spec.id)
         if state is None:
@@ -135,15 +123,11 @@ class ProfileIngestProcess:
         if claim is None and state.status != "DONE":
             return IngestResult("UNAVAILABLE", "BUSY_OR_NOT_DUE")
         argv = [self._executable, "--staging-root", staging_root, "--job-id", spec.id,
-                "--start-ms", str(spec.window_start_ms), "--source-available-at-ms", str(source_available_at_ms)]
+                "--start-ms", str(spec.window_start_ms)]
         try:
-            parsed = parse_handoff(_assemble(argv, raw, self._policy))
+            parsed = parse_handoff(_assemble(argv, self._policy))
             if parsed.spec != spec:
                 raise AssemblyFailure("assembler identity mismatch")
-            observed = datetime(1970, 1, 1, tzinfo=timezone.utc) + timedelta(milliseconds=source_available_at_ms)
-            if (parsed.publication.source_available_at != observed
-                    or parsed.publication.reconciliation.thaw()["response_sha256"] != hashlib.sha256(raw).hexdigest()):
-                raise AssemblyFailure("assembler source mismatch")
         except (AssemblyFailure, ValueError):
             if claim is None:
                 raise AssemblyFailure("completed job assembly failed") from None

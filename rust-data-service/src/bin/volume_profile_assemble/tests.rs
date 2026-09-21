@@ -12,8 +12,6 @@ fn args(root: &std::path::Path) -> Vec<OsString> {
         "daily".into(),
         "--start-ms".into(),
         "0".into(),
-        "--source-available-at-ms".into(),
-        (DAY + 17).to_string().into(),
     ]
 }
 fn kline() -> Vec<u8> {
@@ -59,20 +57,24 @@ fn seed() -> tempfile::TempDir {
             .append(0, b"[]", CheckpointProgress::EmptyPage)
             .unwrap();
     }
+    kline_evidence::persist(
+        &root,
+        kline_evidence::Identity::new("daily".into(), Window::new(0, DAY).unwrap()).unwrap(),
+        &kline(),
+        DAY + 17,
+    )
+    .unwrap();
     directory
 }
-fn invoke(root: &std::path::Path, mut raw: &[u8]) -> (u8, Vec<u8>, Vec<u8>) {
+fn invoke(root: &std::path::Path, now: i64) -> (u8, Vec<u8>, Vec<u8>) {
     let (mut output, mut errors) = (Vec::new(), Vec::new());
-    let code = run(args(root), &mut raw, &mut output, &mut errors, || {
-        Ok(DAY + 17)
-    });
+    let code = run(args(root), &mut output, &mut errors, || Ok(now));
     (code, output, errors)
 }
 
 #[test]
-fn arguments_completed_day_and_safe_error_output() {
-    let root = std::path::Path::new("/SECRET_path_marker");
-    assert!(Args::try_parse_from(args(root)).is_ok());
+fn arguments_day_and_removed_input_flags() {
+    let root = std::path::Path::new("/SECRET_path");
     for flag in [
         "--endpoint",
         "--symbol",
@@ -83,18 +85,18 @@ fn arguments_completed_day_and_safe_error_output() {
         "--rithmic",
         "--config",
         "--end-ms",
+        "--source-available-at-ms",
+        "--input",
+        "--raw-path",
     ] {
         let mut argv = args(root);
-        argv.extend([flag.into(), "SECRET_value_marker".into()]);
+        argv.extend([flag.into(), "SECRET".into()]);
         let (mut output, mut errors) = (Vec::new(), Vec::new());
-        assert_eq!(
-            run(argv, &mut &b"[]"[..], &mut output, &mut errors, || Ok(DAY)),
-            1
-        );
+        assert_eq!(run(argv, &mut output, &mut errors, || Ok(DAY)), 1);
         assert!(output.is_empty());
         assert_eq!(errors, b"volume_profile_assemble: invalid arguments\n");
     }
-    for index in [1, 3, 5, 7] {
+    for index in [1, 3, 5] {
         let mut argv = args(root);
         argv.drain(index..index + 2);
         assert!(Args::try_parse_from(argv).is_err());
@@ -112,18 +114,13 @@ fn arguments_completed_day_and_safe_error_output() {
         assert_eq!(window(&parsed, now).is_ok(), valid);
     }
     parsed.start_ms = 0;
-    parsed.job_id = "../SECRET".into();
+    parsed.job_id = "../bad".into();
     assert!(window(&parsed, DAY).is_err());
-    let (code, output, errors) = invoke(root, b"SECRET_raw");
-    assert_eq!(code, 1);
-    assert!(output.is_empty());
-    assert_eq!(errors, b"volume_profile_assemble: assembly failed\n");
 }
 
 #[test]
-fn real_store_hours_match_direct_assembly_and_observation_is_after_read() {
+fn immutable_evidence_produces_exact_restart_bytes() {
     let directory = seed();
-    let raw = kline();
     let root = File::open(directory.path()).unwrap();
     let hours: Vec<_> = (0..24)
         .map(|i| store(&root, i).recover().unwrap())
@@ -133,131 +130,58 @@ fn real_store_hours_match_direct_assembly_and_observation_is_after_read() {
         Window::new(0, DAY).unwrap(),
         mvp::config_hash(),
         &hours,
-        &raw,
+        &kline(),
         DAY + 17,
     )
     .unwrap()
     .to_bytes()
     .unwrap();
     expected.push(b'\n');
-    let (code, output, errors) = invoke(directory.path(), &raw);
-    assert_eq!(code, 0);
-    assert!(errors.is_empty());
-    assert_eq!(output, expected);
-    assert_eq!(
-        serde_json::from_slice::<Value>(&output).unwrap()["source_available_at_ms"],
-        DAY + 17
-    );
-    struct RecordingReader<'a> {
-        cursor: std::io::Cursor<Vec<u8>>,
-        eof: &'a std::cell::Cell<bool>,
-    }
-    impl Read for RecordingReader<'_> {
-        fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
-            let count = self.cursor.read(buffer)?;
-            if count == 0 && !buffer.is_empty() {
-                self.eof.set(true);
-            }
-            Ok(count)
-        }
-    }
-    let eof = std::cell::Cell::new(false);
-    let mut input = RecordingReader {
-        cursor: std::io::Cursor::new(raw),
-        eof: &eof,
-    };
-    let mut calls = 0;
-    let result = assemble(
-        &Args::try_parse_from(args(directory.path())).unwrap(),
-        &mut input,
-        &mut || {
-            calls += 1;
-            assert!(eof.get(), "wall clock must follow the actual stdin EOF");
-            Ok(DAY + 1000)
-        },
-    )
-    .unwrap();
-    assert_eq!(calls, 1);
-    assert_eq!(result, expected);
-    assert_eq!(input.cursor.position(), input.cursor.get_ref().len() as u64);
-}
-
-#[test]
-fn observation_bounds_and_restart_determinism() {
-    let directory = seed();
-    let raw = kline();
-    let mut outputs = Vec::new();
     for now in [DAY + 17, DAY + 100, DAY * 2] {
-        let (mut output, mut errors) = (Vec::new(), Vec::new());
-        assert_eq!(
-            run(
-                args(directory.path()),
-                &mut raw.as_slice(),
-                &mut output,
-                &mut errors,
-                || Ok(now)
-            ),
-            0
-        );
+        let (code, output, errors) = invoke(directory.path(), now);
+        assert_eq!(code, 0);
         assert!(errors.is_empty());
-        assert!(output.ends_with(b"\n"));
-        outputs.push(output);
-    }
-    assert!(outputs.windows(2).all(|pair| pair[0] == pair[1]));
-    for (observed, now) in [
-        (DAY - 1, DAY + 17),
-        (DAY + 18, DAY + 17),
-        (253_402_300_800_000, i64::MAX),
-    ] {
-        let mut argv = args(directory.path());
-        argv[8] = observed.to_string().into();
-        let (mut output, mut errors) = (Vec::new(), Vec::new());
+        assert_eq!(output, expected);
         assert_eq!(
-            run(argv, &mut raw.as_slice(), &mut output, &mut errors, || Ok(
-                now
-            )),
-            1
+            serde_json::from_slice::<Value>(&output).unwrap()["source_available_at_ms"],
+            DAY + 17
         );
-        assert!(output.is_empty());
-        assert_eq!(errors, b"volume_profile_assemble: assembly failed\n");
-    }
-    for invalid in ["SECRET", "1.5", "9223372036854775808"] {
-        let mut argv = args(directory.path());
-        argv[8] = invalid.into();
-        let (mut output, mut errors) = (Vec::new(), Vec::new());
-        assert_eq!(
-            run(argv, &mut raw.as_slice(), &mut output, &mut errors, || Ok(
-                DAY
-            )),
-            1
-        );
-        assert!(output.is_empty());
-        assert_eq!(errors, b"volume_profile_assemble: invalid arguments\n");
     }
 }
 
 #[test]
-fn missing_corrupt_nonterminal_wrong_identity_and_input_limits_have_no_output() {
+fn bad_evidence_or_hours_never_emit_partial_output() {
     for mode in [
-        "missing",
-        "corrupt",
+        "missing_evidence",
+        "corrupt_evidence",
+        "future_evidence",
+        "wrong_evidence_identity",
+        "missing_hour",
+        "corrupt_hour",
         "nonterminal",
         "identity",
         "oversize",
-        "malformed",
     ] {
         let directory = seed();
+        let evidence = directory.path().join("daily/daily-kline-evidence.json");
         let job = daily::hourly_staging_job_id("daily", 0).unwrap();
         let path = directory.path().join(job).join("manifest.json");
         match mode {
-            "missing" => {
-                std::fs::rename(
-                    path.parent().unwrap(),
-                    directory.path().join("not-the-hour"),
-                )
-                .unwrap();
+            "missing_evidence" => {
+                std::fs::rename(&evidence, evidence.with_extension("saved")).unwrap();
             }
-            "corrupt" => std::fs::write(&path, b"SECRET_bad_manifest").unwrap(),
+            "corrupt_evidence" => std::fs::write(&evidence, b"SECRET_raw").unwrap(),
+            "wrong_evidence_identity" => {
+                let mut value: Value =
+                    serde_json::from_slice(&std::fs::read(&evidence).unwrap()).unwrap();
+                value["identity"]["config_sha256"] = json!("b".repeat(64));
+                std::fs::write(&evidence, serde_json::to_vec(&value).unwrap()).unwrap();
+            }
+            "missing_hour" => {
+                std::fs::rename(path.parent().unwrap(), directory.path().join("saved-hour"))
+                    .unwrap();
+            }
+            "corrupt_hour" => std::fs::write(&path, b"SECRET_bad_manifest").unwrap(),
             "nonterminal" => {
                 let manifest =
                     fluxtrade_core::volume_profile::checkpoint::Manifest::new(identity(0), vec![]);
@@ -269,14 +193,17 @@ fn missing_corrupt_nonterminal_wrong_identity_and_input_limits_have_no_output() 
                 value["identity"]["grid_id"] = json!("wrong");
                 std::fs::write(&path, serde_json::to_vec(&value).unwrap()).unwrap();
             }
+            "oversize" => std::fs::write(&evidence, vec![b' '; 400_000]).unwrap(),
             _ => (),
         }
-        let raw = match mode {
-            "oversize" => vec![b' '; 65_537],
-            "malformed" => b"SECRET_raw_marker".to_vec(),
-            _ => kline(),
-        };
-        let (code, output, errors) = invoke(directory.path(), &raw);
+        let (code, output, errors) = invoke(
+            directory.path(),
+            if mode == "future_evidence" {
+                DAY
+            } else {
+                DAY + 17
+            },
+        );
         assert_eq!(code, 1, "{mode}");
         assert!(output.is_empty());
         assert_eq!(errors, b"volume_profile_assemble: assembly failed\n");
@@ -284,18 +211,40 @@ fn missing_corrupt_nonterminal_wrong_identity_and_input_limits_have_no_output() 
 }
 
 #[test]
-fn symlink_root_and_job_are_rejected() {
-    let directory = seed();
-    let links = tempfile::tempdir().unwrap();
-    let root_link = links.path().join("root");
-    std::os::unix::fs::symlink(directory.path(), &root_link).unwrap();
-    assert_eq!(invoke(&root_link, &kline()).0, 1);
-    let job = daily::hourly_staging_job_id("daily", 0).unwrap();
-    let original = directory.path().join(&job);
-    let renamed = directory.path().join("saved");
-    std::fs::rename(&original, &renamed).unwrap();
-    std::os::unix::fs::symlink(&renamed, &original).unwrap();
-    let (code, output, _) = invoke(directory.path(), &kline());
-    assert_eq!(code, 1);
-    assert!(output.is_empty());
+fn symlink_root_hour_and_evidence_are_rejected() {
+    for mode in ["root", "hour", "evidence"] {
+        let directory = seed();
+        let links = tempfile::tempdir().unwrap();
+        let target = if mode == "root" {
+            links.path().join("root")
+        } else if mode == "hour" {
+            directory
+                .path()
+                .join(daily::hourly_staging_job_id("daily", 0).unwrap())
+        } else {
+            directory.path().join("daily/daily-kline-evidence.json")
+        };
+        if mode != "root" {
+            std::fs::rename(&target, links.path().join("saved")).unwrap();
+        }
+        std::os::unix::fs::symlink(
+            if mode == "root" {
+                directory.path().to_path_buf()
+            } else {
+                links.path().join("saved")
+            },
+            &target,
+        )
+        .unwrap();
+        let (code, output, _) = invoke(
+            if mode == "root" {
+                &target
+            } else {
+                directory.path()
+            },
+            DAY + 17,
+        );
+        assert_eq!(code, 1);
+        assert!(output.is_empty());
+    }
 }

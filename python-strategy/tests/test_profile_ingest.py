@@ -1,6 +1,5 @@
 """Offline process contracts; no PostgreSQL, network or trading integration."""
 import json
-import hashlib
 import subprocess
 import sys
 from dataclasses import replace
@@ -16,10 +15,7 @@ from src.core.market_data.profiles.jobs import JobConflict, JobPublicationResult
 from src.core.market_data.profiles.publication import CanonicalJsonObject
 from src.core.market_data.profiles.repository import PublishedProfile
 
-SOURCE = b"SECRET raw"
 wire = json.loads(json.loads((Path(__file__).parent / "fixtures/profile_handoff_v1.json").read_text())["wire_bytes"])
-wire["reconciliation"]["response_sha256"] = hashlib.sha256(SOURCE).hexdigest()
-wire["source_available_at_ms"] = 86400000
 WIRE = json.dumps(wire).encode()
 PARSED = parse_handoff(WIRE)
 NOW = datetime(2026, 1, 1, tzinfo=timezone.utc)
@@ -46,17 +42,17 @@ def setup(monkeypatch: pytest.MonkeyPatch):
 
 
 def invoke(owner: ingest.ProfileIngestProcess):
-    return owner.run(PARSED.spec, "/trusted/SECRET staging", b"SECRET raw", 86400000, "worker")
+    return owner.run(PARSED.spec, "/trusted/SECRET staging", "worker")
 
 
 def test_exact_command_publication_and_done_restart(monkeypatch: pytest.MonkeyPatch) -> None:
     owner, store, assembler = setup(monkeypatch)
     assert invoke(owner).status == "PUBLISHED"
     store.register.assert_called_once_with(PARSED.spec)
-    argv, raw, policy = assembler.call_args.args
+    argv, policy = assembler.call_args.args
     assert argv == ["/trusted/assembler", "--staging-root", "/trusted/SECRET staging", "--job-id", PARSED.spec.id,
-                    "--start-ms", "0", "--source-available-at-ms", "86400000"]
-    assert raw == b"SECRET raw" and policy == ingest.IngestPolicy()
+                    "--start-ms", "0"]
+    assert policy == ingest.IngestPolicy()
     store.claim.assert_called_once_with(PARSED.spec.id, "worker", policy.lease)
     store.publish_and_complete.assert_called_once_with(store.claim.return_value, PARSED.publication)
     failure = RuntimeError("commit acknowledgment lost")
@@ -117,9 +113,9 @@ def test_failure_retries_only_live_claim_with_sanitized_details(monkeypatch: pyt
 
 def test_input_limits_reject_before_job_or_process(monkeypatch: pytest.MonkeyPatch) -> None:
     owner, store, assembler = setup(monkeypatch)
-    for raw, observed in [(b"x" * 65537, 86400000), (b"", 86400000), (b"[]", True), (b"[]", 86399999)]:
+    for root in ["relative", "/nul\x00root"]:
         with pytest.raises(ValueError):
-            owner.run(PARSED.spec, "/trusted", raw, observed, "worker")
+            owner.run(PARSED.spec, root, "worker")
     store.register.assert_not_called()
     assembler.assert_not_called()
     for changes in ({"timeout_ms": 0}, {"stdout_bytes": 65537}, {"stderr_bytes": True}):
@@ -127,23 +123,12 @@ def test_input_limits_reject_before_job_or_process(monkeypatch: pytest.MonkeyPat
             replace(ingest.IngestPolicy(), **changes)
 
 
-@pytest.mark.parametrize("field", ["timestamp", "hash"])
-def test_source_pair_mismatch_is_independently_rejected(monkeypatch: pytest.MonkeyPatch, field: str) -> None:
+def test_removed_source_arguments_have_no_compatibility_path(monkeypatch: pytest.MonkeyPatch) -> None:
     owner, store, assembler = setup(monkeypatch)
-    changed = json.loads(WIRE)
-    if field == "timestamp":
-        changed["source_available_at_ms"] += 1
-    else:
-        changed["reconciliation"]["response_sha256"] = "a" * 64
-    assembler.return_value = json.dumps(changed).encode()
-    assert invoke(owner).status == "RETRYABLE"
-    store.publish_and_complete.assert_not_called()
-    store.get.return_value = DONE
-    store.reset_mock()
-    with pytest.raises(ingest.AssemblyFailure, match="^completed job assembly failed$"):
-        invoke(owner)
-    for method in (store.register, store.claim, store.retry, store.publish_and_complete, store.recover_completed):
-        method.assert_not_called()
+    with pytest.raises(TypeError):
+        owner.run(PARSED.spec, "/trusted", b"raw", 86400000, "worker")  # type: ignore[call-arg]
+    store.get.assert_not_called()
+    assembler.assert_not_called()
 
 
 def test_existing_spec_conflict_precedes_any_mutation(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -176,16 +161,17 @@ def test_real_pipes_are_bounded_no_shell_and_child_is_reaped(monkeypatch: pytest
 
     def spawn(*args, **kwargs):
         assert kwargs["shell"] is False
+        assert kwargs["stdin"] == subprocess.DEVNULL
         child = real_popen(*args, **kwargs)
         children.append(child)
         return child
 
     monkeypatch.setattr(ingest.subprocess, "Popen", spawn)
     policy = ingest.IngestPolicy(timeout_ms=100, stdout_bytes=8, stderr_bytes=8)
-    assert ingest._assemble([sys.executable, "-c", "import sys;sys.stdout.buffer.write(sys.stdin.buffer.read())"], b"exact", policy) == b"exact"
+    assert ingest._assemble([sys.executable, "-c", "import sys;assert sys.stdin.buffer.read()==b'';sys.stdout.write('exact')"], policy) == b"exact"
     for code in ["import time;time.sleep(5)", "import sys;sys.stdout.write('x'*9)",
                  "import sys;sys.stderr.write('SECRET'*9)", "raise SystemExit(7)"]:
         with pytest.raises(ingest.AssemblyFailure) as caught:
-            ingest._assemble([sys.executable, "-c", code], b"", policy)
+            ingest._assemble([sys.executable, "-c", code], policy)
         assert "SECRET" not in str(caught.value)
         assert children[-1].poll() is not None
