@@ -15,6 +15,7 @@ pub mod directory;
 mod exact;
 #[cfg(unix)]
 pub mod store;
+pub mod transport;
 pub mod work_policy;
 
 use std::collections::BTreeMap;
