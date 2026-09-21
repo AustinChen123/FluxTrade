@@ -41,6 +41,14 @@ impl Directory {
         Ok(fsync(&self.fd)?)
     }
     pub fn open(root: &impl AsFd, job_id: &str) -> Result<Self> {
+        Self::open_mode(root, job_id, true)
+    }
+
+    pub fn open_existing(root: &impl AsFd, job_id: &str) -> Result<Self> {
+        Self::open_mode(root, job_id, false)
+    }
+
+    fn open_mode(root: &impl AsFd, job_id: &str, create: bool) -> Result<Self> {
         ensure!(
             !job_id.is_empty()
                 && job_id.len() <= 64
@@ -49,10 +57,12 @@ impl Directory {
                     .all(|c| c.is_ascii_alphanumeric() || b"-_".contains(&c)),
             "unsafe job ID"
         );
-        match mkdirat(root, job_id, Mode::RWXU) {
-            Ok(()) => (),
-            Err(rustix::io::Errno::EXIST) => (),
-            Err(error) => return Err(error.into()),
+        if create {
+            match mkdirat(root, job_id, Mode::RWXU) {
+                Ok(()) => (),
+                Err(rustix::io::Errno::EXIST) => (),
+                Err(error) => return Err(error.into()),
+            }
         }
         let fd = openat(
             root,
@@ -60,7 +70,9 @@ impl Directory {
             OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
             Mode::empty(),
         )?;
-        fsync(root)?;
+        if create {
+            fsync(root)?;
+        }
         Ok(Self { fd })
     }
 

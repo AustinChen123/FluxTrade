@@ -17,6 +17,8 @@ pub mod daily;
 pub mod directory;
 mod exact;
 pub mod handoff;
+#[cfg(unix)]
+pub mod kline_evidence;
 pub mod mvp;
 #[cfg(unix)]
 pub mod store;
