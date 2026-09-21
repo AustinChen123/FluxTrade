@@ -30,6 +30,15 @@ pub struct Identity {
 }
 
 impl Identity {
+    pub fn job_id(&self) -> &str {
+        &self.job_id
+    }
+    pub fn start_ms(&self) -> i64 {
+        self.start_ms
+    }
+    pub fn end_ms(&self) -> i64 {
+        self.end_ms
+    }
     pub fn new(job_id: String, day: Window) -> Result<Self> {
         daily::hourly_staging_job_id(&job_id, day.start_ms())?;
         ensure!(
@@ -120,6 +129,31 @@ pub fn recover(root: &impl AsFd, expected: &Identity) -> Result<Evidence> {
     let evidence = load(&directory, expected)?;
     directory.sync()?;
     Ok(evidence)
+}
+
+/// Only absent directory/artifact is optional; corruption never means absence.
+pub fn recover_optional(root: &impl AsFd, expected: &Identity) -> Result<Option<Evidence>> {
+    expected.validate()?;
+    let directory = match Directory::open_existing(root, &expected.job_id) {
+        Ok(directory) => directory,
+        Err(error)
+            if error.downcast_ref::<rustix::io::Errno>() == Some(&rustix::io::Errno::NOENT) =>
+        {
+            return Ok(None)
+        }
+        Err(error) => return Err(error),
+    };
+    let evidence = match load(&directory, expected) {
+        Ok(evidence) => evidence,
+        Err(error)
+            if error.downcast_ref::<rustix::io::Errno>() == Some(&rustix::io::Errno::NOENT) =>
+        {
+            return Ok(None)
+        }
+        Err(error) => return Err(error),
+    };
+    directory.sync()?;
+    Ok(Some(evidence))
 }
 
 /// Exact raw replay retains the stored first observation, even if caller retries later.
