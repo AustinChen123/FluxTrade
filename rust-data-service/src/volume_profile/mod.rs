@@ -15,6 +15,7 @@ pub mod compressed_page;
 #[cfg(unix)]
 pub mod directory;
 mod exact;
+pub mod handoff;
 #[cfg(unix)]
 pub mod store;
 pub mod transport;
