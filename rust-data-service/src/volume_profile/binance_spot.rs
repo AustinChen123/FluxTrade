@@ -69,6 +69,9 @@ pub struct Pages {
 }
 
 impl Pages {
+    pub fn is_stopped(&self) -> bool {
+        self.stopped
+    }
     pub fn new(window: Window) -> Self {
         Self {
             window,
