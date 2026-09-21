@@ -2,12 +2,25 @@ from __future__ import annotations
 
 import mimetypes
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from email.message import Message
 from pathlib import Path
 from threading import Event
 from typing import Type
 from urllib.parse import unquote, urlsplit
 
 from src.control_plane.app import ControlPlaneApp
+
+
+def _invalid_profile_body(method: str, path: str, headers: Message) -> bool:
+    if (
+        method != "GET"
+        or urlsplit(path).path.rstrip("/") != "/api/v1/market-data/volume-profiles"
+    ):
+        return False
+    lengths = headers.get_all("Content-Length")
+    return headers.get_all("Transfer-Encoding") is not None or (
+        lengths is not None and lengths != ["0"]
+    )
 
 
 def make_handler(
@@ -28,6 +41,15 @@ def make_handler(
             self._handle()
 
         def _handle(self) -> None:
+            if _invalid_profile_body(self.command, self.path, self.headers):
+                self.close_connection = True
+                encoded = b'{"error":"INVALID_REQUEST"}'
+                self.send_response(400)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(encoded)))
+                self.end_headers()
+                self.wfile.write(encoded)
+                return
             length = int(self.headers.get("Content-Length", "0"))
             body = self.rfile.read(length) if length > 0 else None
             response = app.handle(
@@ -56,10 +78,7 @@ def make_handler(
             else:
                 return False
             candidate = (static_root / relative_path).resolve()
-            if (
-                not candidate.is_relative_to(static_root)
-                or not candidate.is_file()
-            ):
+            if not candidate.is_relative_to(static_root) or not candidate.is_file():
                 self.send_error(404)
                 return True
             content = candidate.read_bytes()
