@@ -43,14 +43,35 @@ class ProfileQueryError(ValueError):
 
 @dataclass(frozen=True, slots=True)
 class LiveProfileQueryResult:
+    request: ProfileQueryRequest
     selection: LiveProfileSelection
     profile: CompositeProfile
 
     def __post_init__(self) -> None:
         if (
-            type(self.selection) is not LiveProfileSelection
+            type(self.request) is not ProfileQueryRequest
+            or type(self.selection) is not LiveProfileSelection
             or type(self.profile) is not CompositeProfile
             or self.selection.manifest != self.profile.manifest
+        ):
+            raise ProfileQueryError("INTEGRITY") from None
+        r, p = self.request, self.profile
+        if (
+            r.purpose != "LIVE_QUERY"
+            or r.freshness_policy_id != self.selection.policy
+            or any(
+                getattr(r, name) != getattr(p, name)
+                for name in ("product_id", "base_grid_id", "algorithm_version")
+            )
+            or r.output_grid_id != p.output_grid.grid_id
+            or (r.start_ms, r.end_ms) != (p.window_start_ms, p.window_end_ms)
+            or (
+                r.revision is not None
+                and (
+                    len(p.manifest.days) != 1
+                    or r.revision != p.manifest.days[0].revision
+                )
+            )
         ):
             raise ProfileQueryError("INTEGRITY") from None
 
@@ -143,4 +164,4 @@ def query_live_profile(
         if reason is None:
             raise ProfileQueryError("INTEGRITY") from None
         return LiveProfileQueryUnavailable(reason)
-    return LiveProfileQueryResult(selection, profile)
+    return LiveProfileQueryResult(request, selection, profile)

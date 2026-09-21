@@ -173,7 +173,7 @@ def test_success_evidence_exact_constructor(monkeypatch: pytest.MonkeyPatch) -> 
     conservative = owner.ValidatedLiveProfileQuery(original, start, start + 1, 2)
     assert conservative.validation_elapsed_ms == 2
     derived = type("QuerySubclass", (owner.LiveProfileQueryResult,), {})(
-        original.selection, original.profile
+        original.request, original.selection, original.profile
     )
     wrong_decision = replace(
         original, selection=replace(original.selection, decision_time_ms=start + 1)

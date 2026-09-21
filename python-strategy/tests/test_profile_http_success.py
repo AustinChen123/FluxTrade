@@ -17,6 +17,7 @@ def evidence(monkeypatch: pytest.MonkeyPatch, *, daily: bool = False):
         manifest = replace(query.profile.manifest, days=query.profile.manifest.days[1:])
         query = replace(
             query,
+            request=replace(query.request, start_ms=manifest.days[0].window_start_ms),
             profile=replace(query.profile, manifest=manifest),
             selection=replace(query.selection, manifest=manifest),
         )

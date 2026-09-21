@@ -1,4 +1,4 @@
-from dataclasses import replace
+from dataclasses import fields, replace
 from decimal import Decimal
 from typing import TYPE_CHECKING, Callable, cast
 from unittest.mock import Mock, call
@@ -19,6 +19,57 @@ if TYPE_CHECKING:
 
     def structural(provider: ProfileReadRepository) -> query.ProfileLiveProvider:
         return provider
+
+
+@pytest.mark.parametrize(
+    "change",
+    [
+        {"product_id": "BINANCE:ETHUSDT-SPOT"},
+        {"base_grid_id": "other"},
+        {"output_grid_id": "other"},
+        {"algorithm_version": "v2"},
+        {"start_ms": 86400000},
+        {"end_ms": 259200000},
+        {"freshness_policy_id": "other"},
+        {
+            "purpose": "MODELED_RESEARCH",
+            "freshness_policy_id": None,
+            "availability_policy_id": "modeled",
+            "as_of_ms": 172800000,
+        },
+    ],
+)
+def test_result_request_identity_binding(monkeypatch, change):
+    request, provider, _, context = setup(monkeypatch)
+    result = query.query_live_profile(provider, request, context)
+    assert isinstance(result, query.LiveProfileQueryResult)
+    assert result.request is request
+    with pytest.raises(query.ProfileQueryError, match="^PROFILE_QUERY_INTEGRITY$"):
+        replace(result, request=replace(request, **change))
+
+
+def test_result_request_exact_and_single_day_revision(monkeypatch):
+    request, provider, _, context = setup(monkeypatch)
+    result = query.query_live_profile(provider, request, context)
+    assert isinstance(result, query.LiveProfileQueryResult)
+    subclass = type("RequestSubclass", (ProfileQueryRequest,), {})
+    child = subclass(**{f.name: getattr(request, f.name) for f in fields(request)})
+    for bad in (None, child, True):
+        with pytest.raises(query.ProfileQueryError, match="^PROFILE_QUERY_INTEGRITY$"):
+            replace(result, request=cast(ProfileQueryRequest, bad))
+    manifest = replace(result.profile.manifest, days=result.profile.manifest.days[:1])
+    profile = replace(result.profile, manifest=manifest)
+    selection = replace(result.selection, manifest=manifest, decision_time_ms=86400000)
+    single = replace(request, end_ms=86400000, revision=manifest.days[0].revision)
+    valid = query.LiveProfileQueryResult(single, selection, profile)
+    assert valid.request is single
+    with pytest.raises(query.ProfileQueryError, match="^PROFILE_QUERY_INTEGRITY$"):
+        replace(
+            valid,
+            request=replace(
+                single, revision=single.revision + 1 if single.revision else 2
+            ),
+        )
 
 
 def setup(monkeypatch: pytest.MonkeyPatch):
@@ -176,7 +227,9 @@ def test_success_dto_rejects_mismatch(monkeypatch: pytest.MonkeyPatch) -> None:
     result = query.query_live_profile(provider, request, context)
     assert isinstance(result, query.LiveProfileQueryResult)
     with pytest.raises(query.ProfileQueryError):
-        query.LiveProfileQueryResult(result.selection, cast(CompositeProfile, True))
+        query.LiveProfileQueryResult(
+            result.request, result.selection, cast(CompositeProfile, True)
+        )
     changed = replace(
         result.profile.manifest,
         days=tuple(replace(d, revision=2) for d in result.profile.manifest.days),
@@ -293,7 +346,7 @@ def test_dto_exact_contracts(monkeypatch: pytest.MonkeyPatch) -> None:
     constructor = cast(Callable[..., object], query.LiveProfileQueryResult)
     for invalid in (True, derived):
         with pytest.raises(query.ProfileQueryError):
-            constructor(invalid, result.profile)
+            constructor(result.request, invalid, result.profile)
     unavailable = cast(Callable[..., object], query.LiveProfileQueryUnavailable)
     for invalid in (True, "SECRET", type("Text", (str,), {})("NOT_READY")):
         with pytest.raises(query.ProfileQueryError):
