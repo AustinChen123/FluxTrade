@@ -1,12 +1,13 @@
 from __future__ import annotations
 
-from typing import final
+from typing import Never, final
 
 _ProfileBin = tuple[int, str, str, int]
 _ProfileDay = tuple[int, int, list[_ProfileBin] | tuple[_ProfileBin, ...]]
 
 @final
 class VolumeProfileMergeResult:
+    def __init__(self, _not_constructible: Never) -> None: ...
     @property
     def product_id(self) -> str: ...
     @property

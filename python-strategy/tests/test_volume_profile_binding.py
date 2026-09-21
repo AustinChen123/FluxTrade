@@ -221,7 +221,7 @@ def test_coarse_profile_and_detached_readonly_result() -> None:
     with pytest.raises(AttributeError):
         setattr(result, "base_volume", "9")
     with pytest.raises(TypeError):
-        fluxtrade_core.VolumeProfileMergeResult()
+        cast(Callable[[], object], fluxtrade_core.VolumeProfileMergeResult)()
     with pytest.raises(TypeError):
         type("Derived", (fluxtrade_core.VolumeProfileMergeResult,), {})
 

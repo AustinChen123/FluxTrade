@@ -81,8 +81,15 @@ def test_profile_merge_stub_contract() -> None:
         "poc_low": "str | None",
         "poc_high_exclusive": "str | None",
     }
-    assert len(result.body) == len(expected)
-    for member in result.body:
+    constructor = result.body[0]
+    assert isinstance(constructor, ast.FunctionDef)
+    assert constructor.name == "__init__" and not constructor.decorator_list
+    assert [arg.arg for arg in constructor.args.args] == ["self", "_not_constructible"]
+    assert _annotation(constructor.args.args[1].annotation) == "Never"
+    assert _annotation(constructor.returns) == "None"
+    assert not constructor.args.defaults and not constructor.args.kwonlyargs
+    assert len(result.body) == len(expected) + 1
+    for member in result.body[1:]:
         assert isinstance(member, ast.FunctionDef)
         assert [ast.unparse(item) for item in member.decorator_list] == ["property"]
         assert [arg.arg for arg in member.args.args] == ["self"]
