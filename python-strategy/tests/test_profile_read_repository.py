@@ -1,8 +1,10 @@
-"""Recording candidate-read SQL contracts; no true-PostgreSQL acceptance claim."""
+"""Recording bounded profile-read SQL contracts; no true-PostgreSQL acceptance claim."""
 import subprocess
 import sys
+import json
 from contextlib import nullcontext
 from datetime import datetime, timezone
+from decimal import Decimal
 from typing import Any
 from unittest.mock import MagicMock
 
@@ -12,6 +14,7 @@ from sqlalchemy.exc import DBAPIError
 
 from src.core.market_data.profiles import read_repository as reader
 from src.core.market_data.profiles.repository import ProfileIntegrityError, TransactionWaitPolicy
+from test_profile_repository import verified_rows
 
 DAY = 86400000
 ARGS: dict[str, Any] = dict(product_id="BINANCE:BTCUSDT-SPOT", base_grid_id="base", algorithm_version="vp-v1", start_ms=0, end_ms=DAY)
@@ -189,3 +192,222 @@ def test_isolated_import_does_not_load_runtime_owners() -> None:
     rejected = subprocess.run([sys.executable, "-c", "import sys;import src.core.db;" + guard],
                               capture_output=True, timeout=10)
     assert rejected.returncode != 0 and b"AssertionError" in rejected.stderr
+
+
+def snapshot_harness():
+    raw, raw_bins = verified_rows()
+    header = dict(raw)
+    payload = dict(id=header["id"], source_manifest="{}", reconciliation="{}")
+    for name in ("computed_at", "published_at", "source_available_at"):
+        header[name + "_valid"] = True
+    for name in ("bin_origin", "bin_step", "base_volume", "quote_volume"):
+        header[name + "_oversized"] = False
+    for name in ("source_manifest", "reconciliation"):
+        header[name + "_oversized"] = False
+        header[name + "_bytes"] = 2
+        del header[name]
+    bins = [dict(b, snapshot_id=header["id"]) for b in raw_bins]
+    event = dict(event_id="event", snapshot_id=header["id"], reason_code="BAD", source="audit",
+                 replacement_snapshot_id=None, recorded_at=NOW.replace(microsecond=123000), recorded_at_valid=True)
+    state: dict[str, Any] = dict(header=header, payload=payload, bins=bins, events=[event],
+                                bin_counts=dict(count=len(bins), oversized=False), event_count=1)
+    store, session, factory = harness()
+    phases: list[tuple[str, Any]] = []
+
+    def execute(query: Any):
+        result = MagicMock()
+        sql = str(query)
+        if sql.startswith("SET") or "set_config" in sql:
+            return result
+        keys = set(query.selected_columns.keys())
+        phase = "header" if "source_manifest_bytes" in keys else "payload" if "source_manifest" in keys else "bin_counts" if "count" in keys else "bins" if "bin_index" in keys else "events"
+        phases.append((phase, query))
+        result.mappings.return_value.one_or_none.return_value = state[phase]
+        result.mappings.return_value.one.return_value = state[phase]
+        result.mappings.return_value.all.return_value = state[phase]
+        return result
+
+    def scalar(query: Any):
+        phases.append(("event_count", query))
+        return state["event_count"]
+
+    session.execute.side_effect, session.scalar.side_effect = execute, scalar
+    return store, session, factory, state, phases, header["id"]
+
+
+def test_single_read_all_phases_exact_scope_order_limits_and_sole_verifier(monkeypatch: pytest.MonkeyPatch) -> None:
+    store, session, _, state, phases, identifier = snapshot_harness()
+    verify = MagicMock(wraps=reader._verify_rows)
+    monkeypatch.setattr(reader, "_verify_rows", verify)
+    result = store.get_verified(identifier)
+    assert result is not None and result.invalidations[0].snapshot_id == identifier
+    assert result.ref.snapshot_id == result.publication.content_sha256
+    assert [name for name, _ in phases] == ["header", "bin_counts", "event_count", "payload", "bins", "events"]
+    assert session.begin.call_count == 1 and verify.call_count == 1
+    for phase, query in phases:
+        compiled = query.compile(dialect=postgresql.dialect())
+        sql, params = str(compiled), compiled.params
+        table = "volume_profile_snapshot" if phase in ("header", "payload") else "volume_profile_bin" if phase in ("bin_counts", "bins") else "market_data_invalidation"
+        key = "id" if table == "volume_profile_snapshot" else "snapshot_id"
+        assert f"WHERE {table}.{key} = %({key}_1)s" in sql and params[key + "_1"] == identifier
+        assert not any(word in sql for word in ("FOR UPDATE", "pg_advisory", "INSERT", "DELETE", "UPDATE"))
+        if phase in ("bin_counts", "bins", "event_count", "events"):
+            assert "LIMIT" in sql
+            assert (100001 if phase in ("bin_counts", "bins") else 1001 if phase == "event_count" else 10001) in params.values()
+        if phase == "bins":
+            assert "ORDER BY volume_profile_bin.snapshot_id, volume_profile_bin.bin_index" in sql
+        if phase == "events":
+            assert "ORDER BY market_data_invalidation.snapshot_id, market_data_invalidation.recorded_at, market_data_invalidation.event_id" in sql
+    header_query = phases[0][1]
+    assert "source_manifest" not in header_query.selected_columns.keys()
+    for name in ("source_manifest", "reconciliation"):
+        assert "octet_length(CAST(" in str(header_query.selected_columns[name + "_bytes"])
+        assert str(header_query.selected_columns[name + "_bytes"]).startswith("CASE WHEN")
+    for name in ("bin_origin", "bin_step", "base_volume", "quote_volume"):
+        assert str(header_query.selected_columns[name]).startswith("CASE WHEN")
+        assert "octet_length(CAST(" in str(header_query.selected_columns[name + "_oversized"])
+        assert 64 in header_query.selected_columns[name].compile().params.values()
+        assert 64 in header_query.selected_columns[name + "_oversized"].compile().params.values()
+    assert 64 in phases[1][1].compile().params.values()
+
+    def literal_sql(expression: Any) -> str:
+        return str(expression.compile(dialect=postgresql.dialect(), compile_kwargs={"literal_binds": True}))
+
+    for name in ("source_manifest", "reconciliation"):
+        length = f"octet_length(CAST(volume_profile_snapshot.{name} AS TEXT))"
+        assert literal_sql(header_query.selected_columns[name + "_bytes"]) == (
+            f"CASE WHEN ({length} <= 131072) THEN {length} ELSE 131073 END")
+    for name in ("bin_origin", "bin_step", "base_volume", "quote_volume"):
+        column = f"volume_profile_snapshot.{name}"
+        length = f"octet_length(CAST({column} AS TEXT))"
+        # SQLAlchemy omits ELSE None; SQL CASE's implicit ELSE is NULL.
+        assert literal_sql(header_query.selected_columns[name]) == f"CASE WHEN ({length} <= 64) THEN {column} END"
+        assert literal_sql(header_query.selected_columns[name + "_oversized"]) == f"{length} > 64"
+    bin_sql = literal_sql(phases[1][1])
+    for name in ("base_volume", "quote_volume"):
+        assert f"octet_length(CAST(volume_profile_bin.{name} AS TEXT)) > 64 AS {name}_oversized" in bin_sql
+    assert "coalesce(bool_or(anon_1.base_volume_oversized OR anon_1.quote_volume_oversized), false) AS oversized" in bin_sql
+    assert "CAST(volume_profile_snapshot.source_manifest AS TEXT)" in str(phases[3][1])
+    assert state["header"]["occupied_bins"] == len(state["bins"])
+
+
+@pytest.mark.parametrize("quality", [None, "PARTIAL", "CONFLICT"])
+def test_missing_or_nonverified_stops_before_payload(quality: str | None) -> None:
+    store, _, _, state, phases, identifier = snapshot_harness()
+    if quality is None:
+        state["header"] = None
+    else:
+        state["header"]["quality"] = quality
+    assert store.get_verified(identifier) is None
+    assert [p for p, _ in phases] == ["header"]
+
+
+@pytest.mark.parametrize("resource", ["metadata", "numeric", "bin_numeric", "bins", "events", "operation"])
+def test_preflight_one_over_never_fetches_payload(resource: str, monkeypatch: pytest.MonkeyPatch) -> None:
+    store, _, _, state, phases, identifier = snapshot_harness()
+    if resource == "metadata":
+        state["header"].update(source_manifest_bytes=131073, source_manifest_oversized=True)
+    elif resource == "numeric":
+        state["header"]["bin_origin_oversized"] = True
+    elif resource == "bin_numeric":
+        state["bin_counts"]["oversized"] = True
+    elif resource == "bins":
+        state["bin_counts"]["count"] = 100001
+    elif resource == "events":
+        state["event_count"] = 1001
+    else:
+        cost = 1024 + 4 + len(state["bins"]) * 256 + 512
+        monkeypatch.setattr(reader, "MAX_OPERATION_BYTES", cost - 1)
+    with pytest.raises(reader.ProfileReadTooLarge):
+        store.get_verified(identifier)
+    assert not {"payload", "bins", "events"} & {p for p, _ in phases}
+
+
+def test_exact_preflight_limits_and_canonical_metadata_bound(monkeypatch: pytest.MonkeyPatch) -> None:
+    for field, maximum in (("bins", 100000), ("events", 1000)):
+        store, _, _, state, phases, identifier = snapshot_harness()
+        if field == "bins":
+            state["bin_counts"]["count"] = maximum
+        else:
+            state["event_count"] = maximum
+        with pytest.raises(ProfileIntegrityError):  # Budget passes; deliberately short payload does not.
+            store.get_verified(identifier)
+        assert [p for p, _ in phases][-3:] == ["payload", "bins", "events"]
+    store, _, _, state, _, identifier = snapshot_harness()
+    cost = 1024 + 4 + len(state["bins"]) * 256 + 512
+    monkeypatch.setattr(reader, "MAX_OPERATION_BYTES", cost)
+    assert store.get_verified(identifier) is not None
+    monkeypatch.setattr(reader, "MAX_OPERATION_BYTES", 33554432)
+    raw = json.dumps({"x": "a" * (131072 - 9)})
+    assert len(raw.encode()) == 131072
+    state["header"]["source_manifest_bytes"] = 131072
+    state["payload"]["source_manifest"] = raw
+    with pytest.raises(ProfileIntegrityError):
+        store.get_verified(identifier)
+
+
+@pytest.mark.parametrize("damage", ["json", "json_list", "header", "numeric", "digest", "totals", "timestamp", "size_flag",
+    "bins_scope", "events_scope", "payload_scope", "bin_count", "event_count", "bin_order", "event", "event_timestamp"])
+def test_payload_and_header_corruption_is_integrity_not_missing(damage: str) -> None:
+    store, _, _, state, _, identifier = snapshot_harness()
+    if damage in ("json", "json_list"):
+        raw = "xx" if damage == "json" else "[]"
+        state["payload"]["source_manifest"] = raw
+    elif damage in ("header", "numeric", "digest", "totals", "timestamp", "size_flag"):
+        key, value = {"header": ("id", "a" * 64), "numeric": ("bin_origin", Decimal("NaN")),
+                      "digest": ("content_sha256", "a" * 64), "totals": ("base_volume", Decimal(99)),
+                      "timestamp": ("computed_at_valid", False), "size_flag": ("bin_origin_oversized", None)}[damage]
+        state["header"][key] = value
+    elif damage.endswith("_scope"):
+        owner = damage.split("_")[0]
+        if owner == "payload":
+            state[owner]["id"] = "d" * 64
+        else:
+            state[owner][0]["snapshot_id"] = "d" * 64
+    elif damage == "bin_count":
+        state["bin_counts"]["count"] += 1
+    elif damage == "event_count":
+        state["event_count"] = 0
+    elif damage == "bin_order":
+        state["bins"].reverse()
+    elif damage == "event":
+        state["events"][0]["source"] = "bad!"
+    else:
+        state["events"][0]["recorded_at_valid"] = False
+    with pytest.raises(ProfileIntegrityError, match="^profile integrity check failed$"):
+        store.get_verified(identifier)
+
+
+def test_single_read_validation_db_failure_and_commit_propagation() -> None:
+    store, _, factory, _, _, _ = snapshot_harness()
+    for identifier in ("A" * 64, "a" * 63, None):
+        with pytest.raises(ValueError):
+            store.get_verified(identifier)  # type: ignore[arg-type]
+    factory.assert_not_called()
+    for commit in (False, True):
+        store, session, factory, _, _, identifier = snapshot_harness()
+        failure = DBAPIError("bounded", None, Exception("injected"))
+        if commit:
+            session.begin.return_value.__exit__.side_effect = failure
+        else:
+            session.execute.side_effect = failure
+        with pytest.raises(DBAPIError) as caught:
+            store.get_verified(identifier)
+        assert caught.value is failure and factory.call_count == 1
+
+
+def test_numeric_boundary_and_independent_operation_event_budget(monkeypatch: pytest.MonkeyPatch) -> None:
+    store, _, _, state, phases, identifier = snapshot_harness()
+    # PostgreSQL may preserve scale; 64-byte text is allowed without changing exact value.
+    for name in ("bin_origin", "bin_step", "base_volume", "quote_volume"):
+        text = format(state["header"][name], "f")
+        text += "." if "." not in text else ""
+        state["header"][name] = Decimal(text + "0" * (64 - len(text)))
+    assert store.get_verified(identifier) is not None
+    monkeypatch.setattr(reader, "MAX_INVALIDATIONS_PER_OPERATION", 1)
+    assert store.get_verified(identifier) is not None
+    phases.clear()
+    state["event_count"] = 2
+    with pytest.raises(reader.ProfileReadTooLarge):
+        store.get_verified(identifier)
+    assert [name for name, _ in phases] == ["header", "bin_counts", "event_count"]
