@@ -8521,6 +8521,26 @@ class TestExchangeOrderEventThread:
             == "order_event_stream_failed"
         )
 
+    def test_successful_clear_rearms_entry_gate_before_releasing_local_halt(
+        self,
+        engine,
+    ) -> None:
+        gate = MagicMock(spec=RithmicPublisherLivenessGate)
+        gate.rearm_after_verified_recovery.side_effect = lambda: (
+            engine._kill_switch_halted is True
+            or pytest.fail("local halt released before admission gate rearm")
+        )
+        engine._entry_admission_gate = gate
+        engine._kill_switch_halted = True
+        engine.ops_safety.clear_kill_switch = MagicMock(
+            return_value={"cleared": True, "reason": None}
+        )
+
+        engine._handle_command({"command": "CLEAR_KILL_SWITCH", "params": {}})
+
+        gate.rearm_after_verified_recovery.assert_called_once_with()
+        assert engine._kill_switch_halted is False
+
     def test_rithmic_clear_reasserts_lockdown_when_new_drift_is_detected(
         self,
         engine_factory,

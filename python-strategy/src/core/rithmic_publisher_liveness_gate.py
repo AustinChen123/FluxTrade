@@ -71,6 +71,12 @@ class RithmicPublisherLivenessGate:
             if self._state is RithmicPublisherLivenessState.UNARMED:
                 self._state = RithmicPublisherLivenessState.UNCONFIRMED
 
+    def rearm_after_verified_recovery(self) -> None:
+        """Require a fresh publisher observation after an approved recovery."""
+        with self._lock:
+            self._state = RithmicPublisherLivenessState.UNCONFIRMED
+            self._unconfirmed_logged = False
+
     def observe(self) -> bool:
         with self._lock:
             if self._state in (

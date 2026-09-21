@@ -747,11 +747,7 @@ class StrategyEngine:
                 self._system_state_key,
                 SYSTEM_STATE_OK,
             ),
-            clear_local_halt=lambda: setattr(
-                self,
-                "_kill_switch_halted",
-                False,
-            ),
+            clear_local_halt=lambda: self._clear_local_kill_switch_halt(),
             finalize_external_drift_clear=lambda **kwargs: (
                 self._venue_runtime.finalize_external_order_drift_clear(**kwargs)
             ),
@@ -1446,6 +1442,8 @@ class StrategyEngine:
         self.execution_engine.halt_and_drain(timeout=0)
 
     def _clear_local_kill_switch_halt(self) -> None:
+        if self._entry_admission_gate is not None:
+            self._entry_admission_gate.rearm_after_verified_recovery()
         self._kill_switch_halted = False
 
     def _resume_after_kill_switch(self) -> None:

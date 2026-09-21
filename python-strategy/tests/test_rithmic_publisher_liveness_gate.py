@@ -243,6 +243,25 @@ def test_confirmed_failure_latches_once_and_never_reads_again(
     assert "wrong" not in serialized
 
 
+def test_verified_recovery_rearms_latched_gate_and_requires_fresh_alive() -> None:
+    reader = _RedisReader("alive")
+    gate = _gate(reader)
+    gate.arm()
+    assert gate.observe() is True
+
+    reader.value = None
+    assert gate.observe() is False
+    assert gate.state is RithmicPublisherLivenessState.LATCHED
+
+    gate.rearm_after_verified_recovery()
+
+    assert gate.state is RithmicPublisherLivenessState.UNCONFIRMED
+    assert gate.observe() is False
+    reader.value = "alive"
+    assert gate.observe() is True
+    assert gate.state is RithmicPublisherLivenessState.CONFIRMED
+
+
 def test_concurrent_failure_observation_has_one_transition_and_one_log() -> None:
     reader = _RedisReader("alive")
     logger = MagicMock(spec=logging.Logger)
