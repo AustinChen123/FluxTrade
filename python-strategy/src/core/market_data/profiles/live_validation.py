@@ -15,6 +15,8 @@ from .live_query import (
 from .live_selection import LiveSelectionContext
 from .read_types import ProfileQueryRequest
 from .decision_context import (
+    StrategyMarketDataContext,
+    _request_bytes,
     ProfileDecisionContext,
     ProfileDecisionBasis,
     ProfileDecisionStatus,
@@ -22,6 +24,47 @@ from .decision_context import (
 
 _MAX = (1 << 63) - 1
 _AGE = 300000
+
+
+def assemble_live_profile_decisions(
+    planned_requests: tuple[ProfileQueryRequest, ...],
+    decisions: tuple[ProfileDecisionContext, ...],
+    *,
+    decision_time_ms: int,
+) -> StrategyMarketDataContext:
+    """Require exact coverage of supplied plans; never synthesize or refresh evidence."""
+    try:
+        _integer(decision_time_ms)
+        if type(planned_requests) is not tuple or type(decisions) is not tuple:
+            raise ValueError
+        if any(
+            type(request) is not ProfileQueryRequest
+            or request.purpose != "LIVE_QUERY"
+            or request.freshness_policy_id != "utc_complete_strict_v1"
+            for request in planned_requests
+        ):
+            raise ValueError
+        if len({_request_bytes(request) for request in planned_requests}) != len(
+            planned_requests
+        ):
+            raise ValueError
+        planned_ids = {id(request) for request in planned_requests}
+        seen = set()
+        for decision in decisions:
+            if (
+                type(decision) is not ProfileDecisionContext
+                or decision.basis is not ProfileDecisionBasis.LIVE_OBSERVED
+                or decision.decision_time_ms != decision_time_ms
+                or id(decision.request) not in planned_ids
+                or id(decision.request) in seen
+            ):
+                raise ValueError
+            seen.add(id(decision.request))
+        if seen != planned_ids:
+            raise ValueError
+        return StrategyMarketDataContext(decision_time_ms, decisions)
+    except ValueError:
+        raise ProfileQueryError("INTEGRITY") from None
 
 
 def _integer(value: int) -> int:

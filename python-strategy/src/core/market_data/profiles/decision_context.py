@@ -46,6 +46,12 @@ def _decimal_json(value: object) -> str:
     raise TypeError("invalid decision projection")
 
 
+def _request_bytes(request: ProfileQueryRequest) -> bytes:
+    return json.dumps(
+        asdict(request), sort_keys=True, separators=(",", ":"), ensure_ascii=False
+    ).encode("utf-8")
+
+
 @dataclass(frozen=True, slots=True)
 class ProfileDecisionContext:
     request: ProfileQueryRequest
@@ -170,12 +176,7 @@ class StrategyMarketDataContext:
                 raise ValueError
             keyed = [
                 (
-                    json.dumps(
-                        asdict(item.request),
-                        sort_keys=True,
-                        separators=(",", ":"),
-                        ensure_ascii=False,
-                    ).encode("utf-8"),
+                    _request_bytes(item.request),
                     item,
                 )
                 for item in self.profiles
