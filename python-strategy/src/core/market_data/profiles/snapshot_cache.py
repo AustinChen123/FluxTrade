@@ -4,12 +4,13 @@ from dataclasses import dataclass
 from threading import Lock
 from typing import Callable, Protocol
 
-from .decision_context import ProfileDecisionContext
+from .decision_context import ProfileDecisionContext, StrategyMarketDataContext
 from .live_query import LiveProfileQueryUnavailable, ProfileQueryError
 from .live_validation import (
     LiveProfileValidationUnavailable,
     ValidatedLiveProfileQuery,
     finalize_live_profile_decision,
+    assemble_live_profile_decisions,
 )
 from .observed_snapshot import ObservedProfileSnapshot
 from .read_types import ProfileQueryRequest
@@ -183,10 +184,70 @@ class ProfileSnapshotCache:
         if (
             type(current_monotonic_ms) is not int
             or not 0 <= current_monotonic_ms <= 2**63 - 1
+            or type(decision_time_ms) is not int
+            or not 0 <= decision_time_ms <= 2**63 - 1
         ):
             raise ProfileQueryError("INTEGRITY") from None
         with self._lock:
-            state = self._entry(request).state
+            entry = self._entry(request)
+            self._entries[request] = entry
+            state = entry.state
+        return self._finalize(request, state, decision_time_ms, current_monotonic_ms)
+
+    def _plan(self, requests: tuple[ProfileQueryRequest, ...]) -> tuple[_Entry, ...]:
+        # Under the lock: validate the entire plan before any fetch or replacement.
+        if type(requests) is not tuple:
+            raise ProfileQueryError("INTEGRITY") from None
+        entries = tuple(self._entry(request) for request in requests)
+        if len(set(requests)) != len(requests) or len({r.end_ms for r in requests}) > 1:
+            raise ProfileQueryError("INTEGRITY") from None
+        return entries
+
+    def refresh_many(
+        self, requests: tuple[ProfileQueryRequest, ...]
+    ) -> tuple[ProfileRefreshResult, ...]:
+        """Sequential fetches outside callbacks; errors propagate, no batch retry.
+
+        Each completed refresh is committed independently; no partial result tuple
+        is returned if a programming error interrupts the batch.
+        """
+        with self._lock:
+            entries = self._plan(requests)
+            for entry in entries:
+                self._entries[entry.request] = entry
+        return tuple(self.refresh(request) for request in requests)
+
+    def decision_many(
+        self,
+        requests: tuple[ProfileQueryRequest, ...],
+        *,
+        decision_time_ms: int,
+        current_monotonic_ms: int,
+    ) -> StrategyMarketDataContext:
+        """Copy one atomic cache view, then assemble exact all-or-error coverage."""
+        for value in (decision_time_ms, current_monotonic_ms):
+            if type(value) is not int or not 0 <= value <= 2**63 - 1:
+                raise ProfileQueryError("INTEGRITY") from None
+        with self._lock:
+            entries = self._plan(requests)
+            for entry in entries:
+                self._entries[entry.request] = entry
+            states = tuple(entry.state for entry in entries)
+        decisions = tuple(
+            self._finalize(request, state, decision_time_ms, current_monotonic_ms)
+            for request, state in zip(requests, states, strict=True)
+        )
+        return assemble_live_profile_decisions(
+            requests, decisions, decision_time_ms=decision_time_ms
+        )
+
+    @staticmethod
+    def _finalize(
+        request: ProfileQueryRequest,
+        state: _State | None,
+        decision_time_ms: int,
+        current_monotonic_ms: int,
+    ) -> ProfileDecisionContext:
         if isinstance(state, ObservedProfileSnapshot):
             return state.finalize(
                 decision_time_ms=decision_time_ms,
