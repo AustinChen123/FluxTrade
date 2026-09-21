@@ -9,6 +9,7 @@ mod app {
         checkpoint::Identity,
         collector::{self, Reason, Report},
         compressed_page,
+        daily::hourly_staging_job_id,
         store::Store,
         transport::Transport,
         work_policy::{Budget, Failure, RetrySchedule},
@@ -29,7 +30,7 @@ mod app {
         #[arg(long)]
         staging_root: PathBuf,
         #[arg(long)]
-        job_id: String,
+        daily_job_id: String,
         #[arg(long)]
         start_ms: i64,
         #[arg(long)]
@@ -56,13 +57,15 @@ mod app {
         requests: u64,
         response_bytes: u64,
         retry_after_seconds: Option<u64>,
-        job_id: &'a str,
+        daily_job_id: &'a str,
+        hourly_job_id: String,
+        elapsed_ms: u64,
         start_ms: i64,
         end_ms: i64,
         product: &'static str,
         config_sha256: String,
     }
-    fn report(args: &Args, value: Report) -> Result<(String, u8)> {
+    fn report(args: &Args, value: Report, elapsed_ms: u64) -> Result<(String, u8)> {
         let (reason, code, status, failure, delay) = match value.reason {
             Reason::Complete => ("complete", 0, None, None, None),
             Reason::Budget => ("budget", 75, None, None, None),
@@ -83,7 +86,9 @@ mod app {
             requests: value.requests,
             response_bytes: value.response_bytes,
             retry_after_seconds: delay,
-            job_id: &args.job_id,
+            daily_job_id: &args.daily_job_id,
+            hourly_job_id: hourly_staging_job_id(&args.daily_job_id, args.start_ms)?,
+            elapsed_ms,
             start_ms: args.start_ms,
             end_ms: args.end_ms,
             product: PRODUCT_ID,
@@ -91,11 +96,18 @@ mod app {
         })?;
         Ok((line, code))
     }
-    async fn collect(args: &Args) -> Result<(String, u8)> {
-        let began = Instant::now();
-        let now = i64::try_from(SystemTime::now().duration_since(UNIX_EPOCH)?.as_millis())?;
+    fn identity(args: &Args, now: i64) -> Result<Identity> {
         let window = window(args.start_ms, args.end_ms, now)?;
-        let identity = Identity::new(args.job_id.clone(), window, GRID.into(), config_hash())?;
+        Identity::new(
+            hourly_staging_job_id(&args.daily_job_id, args.start_ms)?,
+            window,
+            GRID.into(),
+            config_hash(),
+        )
+    }
+    async fn collect(args: &Args, began: Instant) -> Result<(String, u8)> {
+        let now = i64::try_from(SystemTime::now().duration_since(UNIX_EPOCH)?.as_millis())?;
+        let identity = identity(args, now)?;
         let root = rustix::fs::open(
             &args.staging_root,
             rustix::fs::OFlags::RDONLY
@@ -122,23 +134,28 @@ mod app {
             || u64::try_from(began.elapsed().as_millis()).unwrap_or(u64::MAX),
         )
         .await?;
-        report(args, result)
+        report(args, result, u64::try_from(began.elapsed().as_millis())?)
     }
     pub async fn main() -> u8 {
+        let began = Instant::now();
         let args = match Args::try_parse() {
             Ok(args) => args,
             Err(error) => {
-                let _ = error.print();
+                if error.use_stderr() {
+                    eprintln!("volume_profile_collect: invalid arguments");
+                } else {
+                    let _ = error.print();
+                }
                 return u8::from(error.use_stderr());
             }
         };
-        match collect(&args).await {
+        match collect(&args, began).await {
             Ok((line, code)) => {
                 println!("{line}");
                 code
             }
-            Err(error) => {
-                eprintln!("volume_profile_collect: {error}");
+            Err(_) => {
+                eprintln!("volume_profile_collect: operation failed");
                 1
             }
         }
@@ -149,7 +166,7 @@ mod app {
         use super::*;
         use fluxtrade_core::volume_profile::{self, binance_spot, work_policy};
         fn args() -> Vec<&'static str> {
-            "collector --staging-root /unused --job-id job --start-ms 0 --end-ms 3600000"
+            "collector --staging-root /unused --daily-job-id job --start-ms 0 --end-ms 3600000"
                 .split_whitespace()
                 .collect()
         }
@@ -161,8 +178,9 @@ mod app {
                 missing.drain(index..index + 2);
                 assert!(Args::try_parse_from(missing).is_err());
             }
-            for flag in "--endpoint --symbol --api-key --credentials --auth --proxy --rithmic"
-                .split_whitespace()
+            for flag in
+                "--job-id --endpoint --symbol --api-key --credentials --auth --proxy --rithmic"
+                    .split_whitespace()
             {
                 let mut bad = args();
                 bad.extend([flag, "x"]);
@@ -181,6 +199,22 @@ mod app {
             ] {
                 assert_eq!(window(start, end, now).is_ok(), valid);
             }
+        }
+        #[test]
+        fn daily_identity_is_derived_before_store_or_network() {
+            let mut value = Args::try_parse_from(args()).unwrap();
+            assert_eq!(
+                identity(&value, HOUR).unwrap().job_id(),
+                hourly_staging_job_id("job", 0).unwrap()
+            );
+            value.daily_job_id = "SECRET/invalid".into();
+            assert!(identity(&value, HOUR).is_err());
+            value.daily_job_id = "job".into();
+            value.start_ms = 1;
+            assert!(identity(&value, HOUR).is_err());
+            let mut old = args();
+            old[3] = "--job-id";
+            assert!(Args::try_parse_from(old).is_err());
         }
         #[test]
         fn stable_config_and_report_matrix() {
@@ -233,16 +267,18 @@ mod app {
                     requests: 2,
                     response_bytes: 17,
                 };
-                let (line, exit) = report(&args, result).unwrap();
+                let (line, exit) = report(&args, result, 123).unwrap();
                 assert_eq!(exit, code);
                 assert!(!line.contains('\n'));
                 let value: serde_json::Value = serde_json::from_str(&line).unwrap();
                 assert_eq!(
                     value,
                     serde_json::json!({"reason":name,"status":status,"failure":failure,
-                    "requests":2,"response_bytes":17,"retry_after_seconds":delay,"job_id":"job",
+                    "requests":2,"response_bytes":17,"retry_after_seconds":delay,"daily_job_id":"job",
+                    "hourly_job_id":hourly_staging_job_id("job",0).unwrap(),"elapsed_ms":123,
                     "start_ms":0,"end_ms":HOUR,"product":PRODUCT_ID,"config_sha256":config_hex()})
                 );
+                assert!(!line.contains("/unused"));
             }
         }
     }
