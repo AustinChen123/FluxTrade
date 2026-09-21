@@ -143,7 +143,7 @@ def test_selector_unavailable_stops(
         context = query.LiveSelectionContext(0 if mode == "future" else 259200000)
     assert query.query_live_profile(
         provider, request, context
-    ) == query.LiveProfileQueryUnavailable(reason)
+    ) == query.LiveProfileQueryUnavailable(request, reason)
     provider.get_manifest.assert_not_called()
     compose.assert_not_called()
 
@@ -174,7 +174,7 @@ def test_second_read_classification(
     if value is None:
         assert query.query_live_profile(
             provider, request, context
-        ) == query.LiveProfileQueryUnavailable("NOT_READY")
+        ) == query.LiveProfileQueryUnavailable(request, "NOT_READY")
     else:
         with pytest.raises(query.ProfileQueryError, match="^PROFILE_QUERY_INTEGRITY$"):
             query.query_live_profile(provider, request, context)
@@ -202,7 +202,7 @@ def test_composition_mapping(
     if expected:
         assert query.query_live_profile(
             provider, request, context
-        ) == query.LiveProfileQueryUnavailable(expected)
+        ) == query.LiveProfileQueryUnavailable(request, expected)
     else:
         with pytest.raises(query.ProfileQueryError, match="^PROFILE_QUERY_INTEGRITY$"):
             query.query_live_profile(provider, request, context)
@@ -298,7 +298,7 @@ def test_revocation_race_uses_real_composer(monkeypatch: pytest.MonkeyPatch) -> 
     monkeypatch.setattr(query, "compose_profile", composite.compose_profile)
     assert query.query_live_profile(
         provider, request, context
-    ) == query.LiveProfileQueryUnavailable("SNAPSHOT_REVOKED")
+    ) == query.LiveProfileQueryUnavailable(request, "SNAPSHOT_REVOKED")
     loader.assert_not_called()
     provider.list_candidates.assert_called_once()
     provider.get_manifest.assert_called_once()
@@ -350,7 +350,7 @@ def test_dto_exact_contracts(monkeypatch: pytest.MonkeyPatch) -> None:
     unavailable = cast(Callable[..., object], query.LiveProfileQueryUnavailable)
     for invalid in (True, "SECRET", type("Text", (str,), {})("NOT_READY")):
         with pytest.raises(query.ProfileQueryError):
-            unavailable(invalid)
+            unavailable(request, invalid)
     for reason in (
         "NOT_READY",
         "PROFILE_EXPIRED",
@@ -359,4 +359,4 @@ def test_dto_exact_contracts(monkeypatch: pytest.MonkeyPatch) -> None:
         "INVALID_PROFILE",
         "BACKEND_UNAVAILABLE",
     ):
-        assert query.LiveProfileQueryUnavailable(reason).reason == reason
+        assert query.LiveProfileQueryUnavailable(request, reason).reason == reason

@@ -63,7 +63,17 @@ def test_unavailable_no_served_clock(
         else service.LiveProfileQueryUnavailable
     )
     monkeypatch.setattr(
-        service, "validate_live_profile", Mock(return_value=cls(reason))
+        service,
+        "validate_live_profile",
+        Mock(
+            return_value=(
+                cls(service.parse_profile_query(RAW), reason)
+                if cls is service.LiveProfileQueryUnavailable
+                else service.LiveProfileValidationUnavailable(
+                    service.parse_profile_query(RAW), reason
+                )
+            )
+        ),
     )
     clock = Mock(side_effect=AssertionError("served clock forbidden"))
     result = service.ProfileQueryService(

@@ -20,7 +20,7 @@ def test_exact_limit_maps_through_validation_and_http(
     result = live_validation.validate_live_profile(
         provider, request, utc_ms=utc, monotonic_ms=mono
     )
-    assert result == live_query.LiveProfileQueryUnavailable("QUERY_TOO_LARGE")
+    assert result == live_query.LiveProfileQueryUnavailable(request, "QUERY_TOO_LARGE")
     assert isinstance(result, live_query.LiveProfileQueryUnavailable)
     assert profile_http_error(result) == ProfileHttpError(400, "QUERY_TOO_LARGE")
     assert "SECRET" not in repr(result)

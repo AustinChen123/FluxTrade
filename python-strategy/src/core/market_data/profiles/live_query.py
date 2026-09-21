@@ -78,9 +78,16 @@ class LiveProfileQueryResult:
 
 @dataclass(frozen=True, slots=True)
 class LiveProfileQueryUnavailable:
+    request: ProfileQueryRequest
     reason: str
 
     def __post_init__(self) -> None:
+        if (
+            type(self.request) is not ProfileQueryRequest
+            or self.request.purpose != "LIVE_QUERY"
+            or self.request.freshness_policy_id != "utc_complete_strict_v1"
+        ):
+            raise ProfileQueryError("INTEGRITY") from None
         if type(self.reason) is not str or self.reason not in (
             "NOT_READY",
             "PROFILE_EXPIRED",
@@ -137,7 +144,7 @@ def query_live_profile(
     except ProfileReadTooLarge as error:
         if type(error) is not ProfileReadTooLarge:
             raise
-        return LiveProfileQueryUnavailable("QUERY_TOO_LARGE")
+        return LiveProfileQueryUnavailable(request, "QUERY_TOO_LARGE")
     try:
         batch = ProfileCandidateBatch(
             request.product_id, request.base_grid_id, request.algorithm_version, rows
@@ -146,15 +153,15 @@ def query_live_profile(
     except ProfileSelectionError:
         raise ProfileQueryError("INTEGRITY") from None
     if isinstance(selection, LiveProfileSelectionUnavailable):
-        return LiveProfileQueryUnavailable(selection.reason)
+        return LiveProfileQueryUnavailable(request, selection.reason)
     try:
         read = provider.get_manifest(selection.manifest)
     except ProfileReadTooLarge as error:
         if type(error) is not ProfileReadTooLarge:
             raise
-        return LiveProfileQueryUnavailable("QUERY_TOO_LARGE")
+        return LiveProfileQueryUnavailable(request, "QUERY_TOO_LARGE")
     if read is None:
-        return LiveProfileQueryUnavailable("NOT_READY")
+        return LiveProfileQueryUnavailable(request, "NOT_READY")
     if type(read) is not VerifiedManifestRead or read.manifest != selection.manifest:
         raise ProfileQueryError("INTEGRITY") from None
     try:
@@ -163,5 +170,5 @@ def query_live_profile(
         reason = _COMPOSITION.get(error.reason)
         if reason is None:
             raise ProfileQueryError("INTEGRITY") from None
-        return LiveProfileQueryUnavailable(reason)
+        return LiveProfileQueryUnavailable(request, reason)
     return LiveProfileQueryResult(request, selection, profile)

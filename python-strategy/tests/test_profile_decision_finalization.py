@@ -42,7 +42,7 @@ def evidence(monkeypatch, *, start_offset=0):
 )
 def test_unavailable_complete_mapping(monkeypatch, cls, reason, status, expected):
     request, _, start = evidence(monkeypatch)
-    result = cls(reason)
+    result = cls(request, reason)
     decision = owner.finalize_live_profile_decision(
         request, result, observed_at_ms=None, decision_time_ms=start
     )
@@ -148,7 +148,7 @@ def test_exact_request_result_and_unavailable_validation(monkeypatch):
         owner.finalize_live_profile_decision(
             request, result, observed_at_ms=None, decision_time_ms=start
         )
-    unavailable = owner.LiveProfileQueryUnavailable("NOT_READY")
+    unavailable = owner.LiveProfileQueryUnavailable(request, "NOT_READY")
     for bad_request in (
         None,
         replace(request, freshness_policy_id="other"),
@@ -178,8 +178,9 @@ def test_unavailable_subclasses_and_clock_validation(monkeypatch):
         (owner.LiveProfileQueryUnavailable, "NOT_READY"),
         (owner.LiveProfileValidationUnavailable, "CLOCK_UNCERTAIN"),
     ):
-        exact = cls(reason)
-        child = type("UnavailableChild", (cls,), {})(reason)
+        args: tuple[Any, ...] = (request, reason)
+        exact = cls(*args)
+        child = type("UnavailableChild", (cls,), {})(*args)
         for req, value, stamp in (
             (child_request, exact, start),
             (request, child, start),
@@ -191,3 +192,68 @@ def test_unavailable_subclasses_and_clock_validation(monkeypatch):
                 owner.finalize_live_profile_decision(
                     req, value, observed_at_ms=None, decision_time_ms=stamp
                 )
+
+
+@pytest.mark.parametrize(
+    "reason",
+    [
+        "NOT_READY",
+        "PROFILE_EXPIRED",
+        "SNAPSHOT_REVOKED",
+        "QUERY_TOO_LARGE",
+        "BACKEND_UNAVAILABLE",
+        "INVALID_PROFILE",
+        "CLOCK_UNCERTAIN",
+        "VALIDATION_EXPIRED",
+    ],
+)
+def test_unavailable_binds_identical_request(monkeypatch, reason):
+    request, _, start = evidence(monkeypatch)
+    cls = (
+        owner.LiveProfileValidationUnavailable
+        if reason in ("CLOCK_UNCERTAIN", "VALIDATION_EXPIRED")
+        else owner.LiveProfileQueryUnavailable
+    )
+    result = cls(request, reason)
+    assert result.request is request
+    assert (
+        owner.finalize_live_profile_decision(
+            request, result, observed_at_ms=None, decision_time_ms=start
+        ).request
+        is request
+    )
+    for other in (replace(request), replace(request, end_ms=request.end_ms + 86400000)):
+        with pytest.raises(owner.ProfileQueryError, match="^PROFILE_QUERY_INTEGRITY$"):
+            owner.finalize_live_profile_decision(
+                other, result, observed_at_ms=None, decision_time_ms=start
+            )
+
+
+@pytest.mark.parametrize(
+    "cls,reason",
+    [
+        (owner.LiveProfileQueryUnavailable, "NOT_READY"),
+        (owner.LiveProfileValidationUnavailable, "CLOCK_UNCERTAIN"),
+        (owner.LiveProfileValidationUnavailable, "VALIDATION_EXPIRED"),
+    ],
+)
+def test_unavailable_constructor_request_contract(monkeypatch, cls, reason):
+    request, _, start = evidence(monkeypatch)
+    child = type("RequestChild", (type(request),), {})(
+        **{f.name: getattr(request, f.name) for f in fields(request)}
+    )
+    for bad in (
+        None,
+        True,
+        child,
+        replace(request, freshness_policy_id="other"),
+        replace(
+            request,
+            purpose="MODELED_RESEARCH",
+            freshness_policy_id=None,
+            availability_policy_id="modeled",
+            as_of_ms=start,
+        ),
+    ):
+        with pytest.raises(owner.ProfileQueryError, match="^PROFILE_QUERY_INTEGRITY$"):
+            cls(cast(Any, bad), reason)

@@ -32,9 +32,16 @@ def _integer(value: int) -> int:
 
 @dataclass(frozen=True, slots=True)
 class LiveProfileValidationUnavailable:
+    request: ProfileQueryRequest
     reason: str
 
     def __post_init__(self) -> None:
+        if (
+            type(self.request) is not ProfileQueryRequest
+            or self.request.purpose != "LIVE_QUERY"
+            or self.request.freshness_policy_id != "utc_complete_strict_v1"
+        ):
+            raise ProfileQueryError("INTEGRITY") from None
         if type(self.reason) is not str or self.reason not in (
             "CLOCK_UNCERTAIN",
             "VALIDATION_EXPIRED",
@@ -92,7 +99,7 @@ def validate_live_profile(
         if start > _MAX - _AGE:
             raise ValueError
     except Exception:
-        return LiveProfileValidationUnavailable("CLOCK_UNCERTAIN")
+        return LiveProfileValidationUnavailable(request, "CLOCK_UNCERTAIN")
     result = query_live_profile(provider, request, LiveSelectionContext(start))
     if type(result) is LiveProfileQueryUnavailable:
         return result
@@ -105,12 +112,12 @@ def validate_live_profile(
         mono_end = _integer(monotonic_ms())
         end = _integer(utc_ms())
     except Exception:
-        return LiveProfileValidationUnavailable("CLOCK_UNCERTAIN")
+        return LiveProfileValidationUnavailable(request, "CLOCK_UNCERTAIN")
     if end < start or mono_end < mono_start:
-        return LiveProfileValidationUnavailable("CLOCK_UNCERTAIN")
+        return LiveProfileValidationUnavailable(request, "CLOCK_UNCERTAIN")
     elapsed = max(end - start, mono_end - mono_start)
     if elapsed >= _AGE:
-        return LiveProfileValidationUnavailable("VALIDATION_EXPIRED")
+        return LiveProfileValidationUnavailable(request, "VALIDATION_EXPIRED")
     return ValidatedLiveProfileQuery(result, start, end, elapsed)
 
 
@@ -142,7 +149,13 @@ def finalize_live_profile_decision(
             if result.query.request is not request or observed_at_ms is None:
                 raise ValueError
             _integer(observed_at_ms)
-        elif observed_at_ms is not None:
+        elif (
+            observed_at_ms is not None
+            or not isinstance(
+                result, (LiveProfileQueryUnavailable, LiveProfileValidationUnavailable)
+            )
+            or result.request is not request
+        ):
             raise ValueError
     except ValueError:
         raise ProfileQueryError("INTEGRITY") from None

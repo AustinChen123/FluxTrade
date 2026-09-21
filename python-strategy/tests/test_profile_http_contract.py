@@ -211,7 +211,7 @@ def test_integer_and_window_boundary_handoff() -> None:
 )
 def test_unavailable_mapping(reason: str, status: int, code: str) -> None:
     assert contract.profile_http_error(
-        LiveProfileQueryUnavailable(reason)
+        LiveProfileQueryUnavailable(contract.parse_profile_query(RAW), reason)
     ) == contract.ProfileHttpError(status, code)
 
 

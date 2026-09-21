@@ -56,7 +56,11 @@ def test_elapsed_boundary_and_order(
     assert order == ["utc", "mono", "query", "mono", "utc"]
     query.assert_called_once_with(provider, request, owner.LiveSelectionContext(start))
     if max(utc, mono) >= 300000:
-        assert result == owner.LiveProfileValidationUnavailable("VALIDATION_EXPIRED")
+        assert result == owner.LiveProfileValidationUnavailable(
+            request, "VALIDATION_EXPIRED"
+        )
+        assert isinstance(result, owner.LiveProfileValidationUnavailable)
+        assert result.request is request
     else:
         assert isinstance(result, owner.ValidatedLiveProfileQuery)
         assert result.query is original
@@ -101,7 +105,9 @@ def test_clock_failures(
         utc_ms=cast(Callable[[], int], clock),
         monotonic_ms=cast(Callable[[], int], clock),
     )
-    assert result == owner.LiveProfileValidationUnavailable("CLOCK_UNCERTAIN")
+    assert result == owner.LiveProfileValidationUnavailable(request, "CLOCK_UNCERTAIN")
+    assert isinstance(result, owner.LiveProfileValidationUnavailable)
+    assert result.request is request
     assert query.call_count == (0 if position < 2 else 1)
 
 
@@ -116,14 +122,16 @@ def test_backward_clocks(
         utc_ms=Mock(side_effect=[start, utc_end]),
         monotonic_ms=Mock(side_effect=[10, mono_end]),
     )
-    assert result == owner.LiveProfileValidationUnavailable("CLOCK_UNCERTAIN")
+    assert result == owner.LiveProfileValidationUnavailable(request, "CLOCK_UNCERTAIN")
+    assert isinstance(result, owner.LiveProfileValidationUnavailable)
+    assert result.request is request
 
 
 def test_overflow_and_base_exception(monkeypatch: pytest.MonkeyPatch) -> None:
     request, provider, _, query, _ = fixture(monkeypatch)
     assert owner.validate_live_profile(
         provider, request, utc_ms=lambda: (1 << 63) - 1, monotonic_ms=lambda: 0
-    ) == owner.LiveProfileValidationUnavailable("CLOCK_UNCERTAIN")
+    ) == owner.LiveProfileValidationUnavailable(request, "CLOCK_UNCERTAIN")
     query.assert_not_called()
     error = KeyboardInterrupt("SECRET")
     with pytest.raises(KeyboardInterrupt) as caught:
@@ -137,7 +145,7 @@ def test_unavailable_and_provider_exception_no_end_clocks(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     request, provider, _, query, start = fixture(monkeypatch)
-    unavailable = owner.LiveProfileQueryUnavailable("NOT_READY")
+    unavailable = owner.LiveProfileQueryUnavailable(request, "NOT_READY")
     query.return_value = unavailable
     utc, mono = Mock(side_effect=[start]), Mock(side_effect=[0])
     assert (
@@ -199,10 +207,11 @@ def test_success_evidence_exact_constructor(monkeypatch: pytest.MonkeyPatch) -> 
         constructor(original, start, start, 0)
 
 
-def test_unavailable_exact_constructor() -> None:
+def test_unavailable_exact_constructor(monkeypatch) -> None:
+    request, _, _, _, _ = fixture(monkeypatch)
     constructor = cast(Callable[..., object], owner.LiveProfileValidationUnavailable)
     for value in (True, "SECRET", type("Text", (str,), {})("CLOCK_UNCERTAIN")):
         with pytest.raises(ValueError, match="^invalid validation reason$"):
-            constructor(value)
+            constructor(request, value)
     for reason in ("CLOCK_UNCERTAIN", "VALIDATION_EXPIRED"):
-        assert owner.LiveProfileValidationUnavailable(reason).reason == reason
+        assert owner.LiveProfileValidationUnavailable(request, reason).reason == reason
