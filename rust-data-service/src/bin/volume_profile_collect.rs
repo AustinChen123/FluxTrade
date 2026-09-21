@@ -23,7 +23,7 @@ mod app {
     #[derive(Parser)]
     #[command(
         about = "One-shot BTCUSDT spot staging; one completed UTC hour. No scheduler/deployment.",
-        after_help = "Fixed: 3s/attempt, 200 requests, 25MiB body bytes, 5min; 3 retries (250..4000ms); 2MiB raw/manifest, 2112KiB ZIP. Root/job must be trusted and single-worker. Exit 75 requires external rescheduling; never retry Deferred before retry_after_seconds."
+        after_help = "Fixed: 20s/attempt, 200 requests, 25MiB body bytes, 5min; 3 retries (250..4000ms); 2MiB raw/manifest, 2112KiB ZIP. Root/job must be trusted and single-worker. Exit 75 requires external rescheduling; never retry Deferred before retry_after_seconds."
     )]
     pub struct Args {
         #[arg(long)]
@@ -188,7 +188,7 @@ mod app {
             assert!(CONFIG.is_ascii());
             assert_eq!(
                 config_hex(),
-                "5750225c152de5eb92a31bbe325f6b4da1a186371b41bf3b7e00d1fdcb62e10e"
+                "4c354eaa172499d024460f50f9c75cf286aea5fa52044923f7612cbeefbb2746"
             );
             let args = Args::try_parse_from(args()).unwrap();
             for (key, value) in [

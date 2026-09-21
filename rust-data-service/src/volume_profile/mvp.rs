@@ -6,7 +6,7 @@ pub const HOUR: i64 = 3_600_000;
 pub const RAW: usize = 2 * 1024 * 1024;
 pub const ARCHIVE: usize = RAW + 64 * 1024;
 pub const MANIFEST: u64 = RAW as u64;
-pub const TIMEOUT_MS: u64 = 3000;
+pub const TIMEOUT_MS: u64 = 20_000;
 pub const WORK: Limits = Limits {
     requests: 200,
     response_bytes: 25 * 1024 * 1024,
@@ -22,7 +22,7 @@ pub const CONFIG: &str = concat!(
     "format=vp-collector-config-v1\nschema=1\nalgorithm=vp-v1\n",
     "product=BINANCE:BTCUSDT-SPOT\nendpoint=https://data-api.binance.vision/api/v3/aggTrades\n",
     "page_limit=1000\ngrid_id=btc_spot_usdt_10_v1\norigin=0\nstep=10\nunit=USDT\n",
-    "timeout_ms=3000\nrequests=200\nresponse_bytes=26214400\nelapsed_ms=300000\n",
+    "timeout_ms=20000\nrequests=200\nresponse_bytes=26214400\nelapsed_ms=300000\n",
     "max_retries=3\nbase_delay_ms=250\nmax_delay_ms=4000\n",
     "raw_bytes=2097152\narchive_bytes=2162688\nmanifest_bytes=2097152\n"
 );
@@ -47,7 +47,7 @@ mod tests {
         assert!(super::CONFIG.is_ascii());
         assert_eq!(
             super::config_hex(),
-            "5750225c152de5eb92a31bbe325f6b4da1a186371b41bf3b7e00d1fdcb62e10e"
+            "4c354eaa172499d024460f50f9c75cf286aea5fa52044923f7612cbeefbb2746"
         );
     }
 }
