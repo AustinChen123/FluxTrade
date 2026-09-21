@@ -24,6 +24,19 @@ def evidence(monkeypatch: pytest.MonkeyPatch, *, daily: bool = False):
     return encoder.ValidatedLiveProfileQuery(query, start, start + 10, 10)
 
 
+def test_wire_roundtrip(monkeypatch):
+    from src.core.market_data.profiles.wire import decode_live_profile_response
+
+    value = evidence(monkeypatch)
+    served = value.validation_completed_at_ms
+    raw = encoder.encode_profile_success(value, served_at_ms=served)
+    assert type(raw) is bytes
+    decoded = decode_live_profile_response(value.query.request, raw)
+    assert decoded.validated == value
+    assert decoded.validated.query.request is value.query.request
+    assert decoded.served_at_ms == served
+
+
 @pytest.mark.parametrize("daily", [False, True])
 def test_identity_empty_and_deterministic_encoding(
     monkeypatch: pytest.MonkeyPatch, daily: bool
