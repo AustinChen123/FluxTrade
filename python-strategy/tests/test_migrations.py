@@ -1,16 +1,16 @@
 """End-to-end migration round-trip integration test (Task 0.7).
 
-Verifies the full Alembic revision chain (rev 1 → rev 8) on a real PostgreSQL
+Verifies the full Alembic revision chain (base → head) on a real PostgreSQL
 database:
 
 1. ``test_full_upgrade_to_head`` — upgrade ``base`` → ``head`` and assert that
-   every table, column, index and CHECK constraint introduced by P0 revisions
+   the selected HEAD tables, columns, indexes and CHECK constraints
    exists with the expected shape.
 2. ``test_sample_data_insertion_after_upgrade`` — insert representative rows
    into the new tables and verify that CHECK constraints and partial unique
    indexes behave correctly (positive + negative cases).
 3. ``test_full_downgrade_to_base`` — downgrade ``head`` → ``base`` and assert
-   that every P0-introduced object is gone (tables dropped, ALTERed columns
+   that every HEAD schema object is gone (tables dropped, ALTERed columns
    removed).
 4. ``test_round_trip_idempotent`` — upgrade → downgrade → upgrade twice and
    compare the resulting schema fingerprints to confirm idempotency.
@@ -285,9 +285,12 @@ def _schema_fingerprint(engine: Engine) -> tuple:
 # --------------------------------------------------------------------------- #
 
 
-# Tables introduced by P0 revisions 5–7 that must exist at HEAD and be gone
+# Selected non-legacy tables that must exist at HEAD and be gone
 # after a full downgrade to ``base``.
-P0_NEW_TABLES = {
+HEAD_ONLY_TABLES = {
+    "volume_profile_snapshot",
+    "volume_profile_bin",
+    "volume_profile_ingest_job",
     "system_events",
     "strategy_state_transitions",
     "daily_nav_snapshots",
@@ -307,7 +310,7 @@ LEGACY_TABLES = {
 
 
 def test_full_upgrade_to_head(fresh_pg_db: str) -> None:
-    """Upgrade ``base`` → ``head`` and verify P0 schema artifacts."""
+    """Upgrade ``base`` → ``head`` and verify HEAD schema artifacts."""
     _upgrade(fresh_pg_db, "head")
     engine = sa.create_engine(_target_url(fresh_pg_db))
     try:
@@ -315,9 +318,7 @@ def test_full_upgrade_to_head(fresh_pg_db: str) -> None:
         assert LEGACY_TABLES.issubset(tables), (
             f"Legacy tables missing after upgrade: {LEGACY_TABLES - tables}"
         )
-        assert P0_NEW_TABLES.issubset(tables), (
-            f"P0 tables missing after upgrade: {P0_NEW_TABLES - tables}"
-        )
+        assert HEAD_ONLY_TABLES.issubset(tables), "HEAD tables missing after upgrade"
 
         # ``order`` must carry idempotency, audit, and account identity columns.
         order_cols = _column_names(engine, "order")
@@ -634,17 +635,15 @@ def test_sample_data_insertion_after_upgrade(fresh_pg_db: str) -> None:
 
 
 def test_full_downgrade_to_base(fresh_pg_db: str) -> None:
-    """Upgrade then downgrade fully; P0 objects must be removed."""
+    """Upgrade then downgrade fully; HEAD schema objects must be removed."""
     _upgrade(fresh_pg_db, "head")
     _downgrade(fresh_pg_db, "base")
 
     engine = sa.create_engine(_target_url(fresh_pg_db))
     try:
         tables = _table_names(engine)
-        # All P0-introduced tables are gone.
-        assert P0_NEW_TABLES.isdisjoint(tables), (
-            f"P0 tables still present after downgrade: {P0_NEW_TABLES & tables}"
-        )
+        # All selected non-legacy tables are gone.
+        assert HEAD_ONLY_TABLES.isdisjoint(tables), "HEAD tables remain after downgrade"
         # And the original revs 1–4 tables are also gone (full downgrade).
         # alembic_version may or may not remain depending on Alembic version;
         # exclude it from comparison.
@@ -867,7 +866,7 @@ def test_order_identity_incompatible_downgrade_keeps_scoped_indexes(
                 conn.execute(
                     text("SELECT version_num FROM alembic_version")
                 ).scalar_one()
-                == "4e8c1a2b7d90"
+                == "6c2f8a91d4e7"
             )
     finally:
         engine.dispose()
