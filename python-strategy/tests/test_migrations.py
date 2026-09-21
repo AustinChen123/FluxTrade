@@ -29,7 +29,7 @@ from __future__ import annotations
 import json
 import os
 import time
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import replace
 from datetime import datetime, timedelta, timezone
@@ -578,6 +578,102 @@ def test_profile_job_verified_completion_identity_and_integrity(profile_reposito
         assert done.lease_owner is done.lease_expires_at is done.retry_after_at is None
         assert done.last_error_code is done.last_error_detail is None
         assert store.get(spec.id) == done
+
+
+_WAIT_POLICY = profile_repository.TransactionWaitPolicy(100, 500)
+
+
+def _assert_profile_lock_timeout(engine: Engine, action: Callable[[sa.Connection], object]) -> None:
+    """Broad deadline is a hang guard, not a performance assertion."""
+    def worker() -> None:
+        with engine.connect() as conn:
+            settings = text("SELECT current_setting('lock_timeout'), current_setting('statement_timeout')")
+            original = conn.execute(settings).one()
+            conn.execute(text("SET SESSION statement_timeout = '2s'"))
+            guarded = conn.execute(settings).one()
+            conn.commit()
+            observed: list[tuple[str, str]] = []
+
+            def observe(connection: sa.Connection, cursor: Any, statement: str,
+                        parameters: Any, context: Any, executemany: bool) -> None:
+                if "pg_advisory_xact_lock" in statement or "FOR UPDATE" in statement or statement.startswith("INSERT"):
+                    with cursor.connection.cursor() as probe:
+                        probe.execute("SHOW lock_timeout")
+                        lock = probe.fetchone()[0]
+                        probe.execute("SHOW statement_timeout")
+                        observed.append((lock, probe.fetchone()[0]))
+
+            event.listen(conn, "before_cursor_execute", observe)
+            try:
+                started = time.monotonic()
+                with pytest.raises(DBAPIError) as caught:
+                    action(conn)
+                assert time.monotonic() - started < 3
+                assert getattr(caught.value.orig, "pgcode", None) == "55P03"
+                assert observed == [("100ms", "500ms")]
+                assert conn.execute(settings).one() == guarded
+                conn.commit()
+            finally:
+                event.remove(conn, "before_cursor_execute", observe)
+                conn.rollback()
+                conn.execute(text("SELECT set_config('statement_timeout', :value, false)"), {"value": original[1]})
+                conn.commit()
+                assert conn.execute(settings).one() == original
+                conn.rollback()
+
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        pool.submit(worker).result(timeout=5)
+
+
+def test_profile_advisory_lock_timeout_rolls_back_and_release_allows_publish(profile_repository_pg: Engine) -> None:
+    engine, value = profile_repository_pg, _publication_pg()
+    first, second = profile_repository._lock_parts(profile_repository._logical(value.content))
+    with engine.begin() as holder:
+        holder.execute(text("SET LOCAL statement_timeout = '2s'"))
+        holder.execute(text("SELECT pg_advisory_xact_lock(:a, :b)"), {"a": first, "b": second})
+        _assert_profile_lock_timeout(engine, lambda conn: profile_repository.ProfileRepository(
+            sessionmaker(bind=conn), _WAIT_POLICY).publish(value))
+        assert _profile_counts(engine) == (0, 0)
+    result = profile_repository.ProfileRepository(sessionmaker(engine), _WAIT_POLICY).publish(value)
+    assert not result.already_present and _profile_counts(engine) == (1, 2)
+
+
+def test_profile_job_row_lock_timeout_preserves_claim_until_release(profile_repository_pg: Engine) -> None:
+    engine, store = profile_repository_pg, _job_store(profile_repository_pg)
+    store.register(_job_spec())
+    claim = store.claim_next("worker", timedelta(minutes=5))
+    assert claim is not None
+    before = _job_row(engine)
+    with engine.begin() as holder:
+        holder.execute(text("SET LOCAL statement_timeout = '2s'"))
+        holder.execute(text("SELECT id FROM volume_profile_ingest_job WHERE id='job' FOR UPDATE")).one()
+        _assert_profile_lock_timeout(engine, lambda conn: profile_jobs.ProfileIngestJobStore(
+            sessionmaker(bind=conn), _WAIT_POLICY).checkpoint(
+                claim, CanonicalJsonObject({"id": 3}), CanonicalJsonObject({"page": 1}), timedelta(minutes=5)))
+        assert _job_row(engine) == before
+    updated = store.checkpoint(claim, CanonicalJsonObject({"id": 3}), CanonicalJsonObject({"page": 1}), timedelta(minutes=5))
+    assert updated.attempt == claim.attempt and updated.source_cursor.thaw() == {"id": 3}
+
+
+def test_profile_job_uncommitted_unique_conflict_times_out_then_registers(profile_repository_pg: Engine) -> None:
+    engine = profile_repository_pg
+    with engine.connect() as holder:
+        transaction = holder.begin()
+        try:
+            holder.execute(text("SET LOCAL statement_timeout = '2s'"))
+            holder.execute(text("INSERT INTO volume_profile_ingest_job "
+                "(id, product_id, window_start_ms, window_end_ms, grid_id, algorithm_version, "
+                "config_sha256, status, source_cursor, attempt, progress_manifest) VALUES "
+                "('job', 'BINANCE:BTCUSDT-SPOT', 0, 86400000, 'g1', 'vp-v1', :digest, "
+                "'RETRYABLE', '{}'::jsonb, 0, '{}'::jsonb)"), {"digest": "a" * 64})
+            _assert_profile_lock_timeout(engine, lambda conn: profile_jobs.ProfileIngestJobStore(
+                sessionmaker(bind=conn), _WAIT_POLICY).register(_job_spec()))
+            with engine.connect() as observer:
+                assert observer.execute(text("SELECT count(*) FROM volume_profile_ingest_job")).scalar_one() == 0
+        finally:
+            transaction.rollback()
+    registered = profile_jobs.ProfileIngestJobStore(sessionmaker(engine), _WAIT_POLICY).register(_job_spec())
+    assert registered.status == "RETRYABLE" and registered.attempt == 0
 
 
 def _downgrade(db_name: str, target: str = "base") -> None:
