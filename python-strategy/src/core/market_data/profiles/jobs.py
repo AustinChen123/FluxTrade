@@ -3,7 +3,7 @@
 import re
 from collections.abc import Callable, Iterator
 from contextlib import AbstractContextManager, contextmanager
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, replace
 from datetime import datetime, timedelta, timezone
 from typing import cast
 
@@ -223,6 +223,18 @@ def _require_live_claim(state: JobState | None, claim: JobClaim, now: datetime) 
             or state.lease_owner != claim.worker_id or state.attempt != claim.attempt
             or cast(datetime, state.lease_expires_at) <= now):
         raise LeaseLost("job lease lost")
+
+
+@dataclass(frozen=True, slots=True)
+class RawRetentionResult:
+    completion: JobPublicationResult
+    already_deleted: bool
+
+    def __post_init__(self) -> None:
+        if (type(self.completion) is not JobPublicationResult or type(self.already_deleted) is not bool
+                or self.completion.profile.publication.raw_retention_state != "DELETED"
+                or not self.completion.profile.already_present or not self.completion.recovered_after_commit):
+            raise ValueError("invalid raw retention result")
 
 
 class ProfileIngestJobStore:
@@ -466,6 +478,66 @@ class ProfileIngestJobStore:
             if state is None or state.status != "DONE":
                 return None
             return self._recover_completed(session, state, spec, publication)
+
+    def recover_completed_snapshot(self, spec: JobSpec) -> JobPublicationResult | None:
+        """Read exact bound DONE evidence, including confirmed deleted raw retention."""
+        if type(spec) is not JobSpec:
+            raise ValueError("expected exact job spec")
+        with self._transaction(False) as session:
+            row = session.execute(select(_JOB).where(_JOB.c.id == spec.id)).mappings().one_or_none()
+            if row is None or row["status"] != "DONE":
+                return None
+            state = self._retention_state(row)
+            snapshot = session.execute(select(_SNAPSHOT).where(_SNAPSHOT.c.id == state.completed_snapshot_id)).mappings().one_or_none()
+            return self._bound_completion(session, state, spec, snapshot)
+
+    @staticmethod
+    def _retention_state(row: RowMapping) -> JobState:
+        try:
+            return _state(row)
+        except JobIntegrityError:
+            raise JobCompletionError("job retention verification failed") from None
+
+    @staticmethod
+    def _bound_completion(session: Session, state: JobState, spec: JobSpec,
+                          snapshot: RowMapping | None) -> JobPublicationResult:
+        from .handoff import _validate_publication_binding
+
+        if state.status != "DONE" or state.spec != spec or snapshot is None or snapshot["id"] != state.completed_snapshot_id:
+            raise JobCompletionError("job retention verification failed")
+        try:
+            publication = _verify(session, snapshot)
+            _validate_publication_binding(spec, publication, allow_deleted=True)
+        except (ProfileIntegrityError, ValueError):
+            raise JobCompletionError("job retention verification failed") from None
+        return JobPublicationResult(_result(snapshot, publication, True), state, True)
+
+    def mark_raw_deleted(self, spec: JobSpec, snapshot_id: str) -> RawRetentionResult:
+        """Call only after durable cleanup success; this transaction proves no filesystem fact."""
+        if type(spec) is not JobSpec or type(snapshot_id) is not str or not re.fullmatch(r"[0-9a-f]{64}", snapshot_id):
+            raise ValueError("expected exact job spec and snapshot ID")
+        with self._transaction() as session:
+            job = session.execute(select(_JOB).where(_JOB.c.id == spec.id).with_for_update()).mappings().one_or_none()
+            if job is None:
+                raise JobCompletionError("job retention verification failed")
+            state = self._retention_state(job)
+            if state.completed_snapshot_id != snapshot_id or state.status != "DONE" or state.spec != spec:
+                raise JobCompletionError("job retention verification failed")
+            snapshot = session.execute(select(_SNAPSHOT).where(_SNAPSHOT.c.id == snapshot_id).with_for_update()).mappings().one_or_none()
+            before = self._bound_completion(session, state, spec, snapshot)
+            if before.profile.publication.raw_retention_state == "DELETED":
+                return RawRetentionResult(before, True)
+            after = session.execute(update(_SNAPSHOT).where(
+                _SNAPSHOT.c.id == snapshot_id, _SNAPSHOT.c.quality == "VERIFIED",
+                _SNAPSHOT.c.raw_retention_state == "PRESENT",
+            ).values(raw_retention_state="DELETED").returning(_SNAPSHOT)).mappings().one_or_none()
+            result = self._bound_completion(session, state, spec, after)
+            expected = replace(before.profile.publication, raw_retention_state="DELETED")
+            current_job = session.execute(select(_JOB).where(_JOB.c.id == spec.id)).mappings().one_or_none()
+            if (dict(after or {}) != {**dict(snapshot or {}), "raw_retention_state": "DELETED"}
+                    or result.profile.publication != expected or current_job != job):
+                raise JobCompletionError("job retention verification failed")
+            return RawRetentionResult(result, False)
 
     @staticmethod
     def _recover_completed(session: Session, state: JobState, spec: JobSpec,

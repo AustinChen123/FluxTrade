@@ -937,6 +937,206 @@ def test_ingest_process_pg_takeover_before_publish_fences_old_process(
     assert row["lease_owner"] == "new" and row["status"] == "RUNNING"
 
 
+def _retention_publication(engine: Engine):
+    fixture = json.loads((Path(__file__).parent / "fixtures/profile_handoff_v1.json").read_text())
+    parsed = parse_handoff(fixture["wire_bytes"].encode())
+    store = _job_store(engine)
+    store.register(parsed.spec)
+    claim = store.claim(parsed.spec.id, "retention", timedelta(minutes=5))
+    assert claim is not None
+    store.publish_and_complete(claim, parsed.publication)
+    return parsed
+
+
+def _retention_rows(engine: Engine) -> tuple[list[dict[str, Any]], ...]:
+    with engine.connect() as conn:
+        return tuple([dict(row) for row in conn.execute(text(f"SELECT * FROM {table} ORDER BY {order}")).mappings()]
+                     for table, order in (("volume_profile_ingest_job", "id"), ("volume_profile_snapshot", "id"),
+                                          ("volume_profile_bin", "snapshot_id, bin_index")))
+
+
+@pytest.mark.parametrize("ack_unknown", [False, True])
+def test_retention_cas_exact_readback_idempotency_and_commit_recovery(profile_repository_pg: Engine, ack_unknown: bool) -> None:
+    engine = profile_repository_pg
+    parsed = _retention_publication(engine)
+    store = _job_store(engine)
+    before = _retention_rows(engine)
+    present = store.recover_completed_snapshot(parsed.spec)
+    assert present is not None and present.profile.publication == parsed.publication
+    failure = DBAPIError("commit acknowledgment", None, Exception("injected"))
+
+    @contextmanager
+    def lost_ack() -> Iterator[Session]:
+        with Session(engine) as session:
+            yield session
+            raise failure  # Inner transaction already committed.
+
+    if ack_unknown:
+        with pytest.raises(DBAPIError) as caught:
+            profile_jobs.ProfileIngestJobStore(lost_ack).mark_raw_deleted(parsed.spec, parsed.publication.content_sha256)
+        assert caught.value is failure
+    else:
+        assert not store.mark_raw_deleted(parsed.spec, parsed.publication.content_sha256).already_deleted
+    retry = store.mark_raw_deleted(parsed.spec, parsed.publication.content_sha256)
+    assert retry.already_deleted and retry.completion.profile.revision == 1
+    assert retry.completion.profile.publication == replace(parsed.publication, raw_retention_state="DELETED")
+    assert store.recover_completed_snapshot(parsed.spec) == retry.completion
+    with pytest.raises(profile_jobs.JobCompletionError):
+        store.recover_completed(parsed.spec, parsed.publication)
+    after = _retention_rows(engine)
+    assert after[0] == before[0] and after[2] == before[2]
+    assert after[1] == [{**before[1][0], "raw_retention_state": "DELETED"}]
+
+
+@pytest.mark.parametrize("damage", ["spec", "id", "non_done", "non_done_without_snapshot", "done_null_snapshot",
+                                         "done_zero_attempt", "partial", "bin", "not_stored", "job", "config",
+                                         "hours", "recon", "availability", "submillisecond", "beyond_max_ms"])
+def test_retention_rejects_corruption_without_mutating(profile_repository_pg: Engine, damage: str) -> None:
+    engine = profile_repository_pg
+    parsed = _retention_publication(engine)
+    spec, identifier = parsed.spec, parsed.publication.content_sha256
+    if damage == "spec":
+        spec = replace(spec, config_sha256="e" * 64)
+    elif damage == "id":
+        identifier = "e" * 64
+    else:
+        with engine.begin() as conn:
+            if damage in ("non_done", "non_done_without_snapshot"):
+                conn.execute(text("UPDATE volume_profile_ingest_job SET status='RETRYABLE', completed_snapshot_id=NULL"))
+                if damage == "non_done_without_snapshot":
+                    conn.execute(text("DELETE FROM volume_profile_snapshot"))
+            elif damage == "done_null_snapshot":
+                # Schema permits NULL for staged DONE jobs; this recovery requires a published snapshot.
+                conn.execute(text("UPDATE volume_profile_ingest_job SET completed_snapshot_id=NULL"))
+            elif damage == "done_zero_attempt":
+                conn.execute(text("UPDATE volume_profile_ingest_job SET attempt=0"))
+            elif damage in ("submillisecond", "beyond_max_ms"):
+                available = (datetime(1970, 1, 2, microsecond=1, tzinfo=timezone.utc)
+                             if damage == "submillisecond" else datetime.max.replace(tzinfo=timezone.utc))
+                conn.execute(text("UPDATE volume_profile_snapshot SET source_available_at=:v"), {"v": available})
+            elif damage == "partial":
+                conn.execute(text("UPDATE volume_profile_snapshot SET quality='PARTIAL', published_at=NULL"))
+            elif damage == "bin":
+                conn.execute(text("UPDATE volume_profile_bin SET base_volume=base_volume+1"))
+            elif damage == "not_stored":
+                conn.execute(text("UPDATE volume_profile_snapshot SET raw_retention_state='NOT_STORED'"))
+            elif damage == "availability":
+                conn.execute(text("UPDATE volume_profile_snapshot SET availability_basis='MODELED'"))
+            else:
+                manifest = parsed.publication.source_manifest.thaw()
+                recon = parsed.publication.reconciliation.thaw()
+                if damage == "job":
+                    manifest["job_id"] = "other"
+                elif damage == "config":
+                    manifest["config_sha256"] = "e" * 64
+                elif damage == "hours":
+                    manifest["hours"] = []
+                else:
+                    recon["actual_aggregate_trade_count"] = 99
+                conn.execute(text("UPDATE volume_profile_snapshot SET source_manifest=CAST(:m AS jsonb), "
+                                  "reconciliation=CAST(:r AS jsonb)"), {"m": json.dumps(manifest), "r": json.dumps(recon)})
+    before = _retention_rows(engine)
+    store = _job_store(engine)
+    with pytest.raises(profile_jobs.JobCompletionError):
+        store.mark_raw_deleted(spec, identifier)
+    if damage in ("non_done", "non_done_without_snapshot"):
+        assert store.recover_completed_snapshot(spec) is None
+    elif damage != "id":
+        with pytest.raises(profile_jobs.JobCompletionError):
+            store.recover_completed_snapshot(spec)
+    assert _retention_rows(engine) == before
+
+
+def test_retention_two_callers_converge(profile_repository_pg: Engine) -> None:
+    engine = profile_repository_pg
+    parsed = _retention_publication(engine)
+    barrier = Barrier(2)
+
+    def run():
+        barrier.wait(timeout=3)
+        return _job_store(engine).mark_raw_deleted(parsed.spec, parsed.publication.content_sha256)
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        futures = [pool.submit(run) for _ in range(2)]
+        results = [future.result(timeout=5) for future in futures]
+    assert sorted(result.already_deleted for result in results) == [False, True]
+    assert results[0].completion == results[1].completion and _profile_counts(engine) == (1, 2)
+
+
+def test_retention_post_update_verification_failure_rolls_back(profile_repository_pg: Engine,
+                                                               monkeypatch: pytest.MonkeyPatch) -> None:
+    engine = profile_repository_pg
+    parsed = _retention_publication(engine)
+    before = _retention_rows(engine)
+    verify = profile_jobs._verify
+    observed = []
+
+    def reject_deleted(session: Session, row: Any, **kwargs: Any):
+        result = verify(session, row, **kwargs)
+        if row["raw_retention_state"] == "DELETED":
+            observed.append(row["raw_retention_state"])
+            raise profile_repository.ProfileIntegrityError("injected readback failure")
+        return result
+
+    monkeypatch.setattr(profile_jobs, "_verify", reject_deleted)
+    with pytest.raises(profile_jobs.JobCompletionError):
+        _job_store(engine).mark_raw_deleted(parsed.spec, parsed.publication.content_sha256)
+    assert observed == ["DELETED"] and _retention_rows(engine) == before
+
+
+@pytest.mark.parametrize("table", ["volume_profile_ingest_job", "volume_profile_snapshot"])
+def test_retention_lock_timeout_preserves_all_rows(profile_repository_pg: Engine, table: str) -> None:
+    engine = profile_repository_pg
+    parsed = _retention_publication(engine)
+    before = _retention_rows(engine)
+    with engine.begin() as holder:
+        holder.execute(text("SET LOCAL statement_timeout='2s'"))
+        holder.execute(text(f"SELECT id FROM {table} FOR UPDATE")).all()
+        _assert_profile_lock_timeout(engine, lambda conn: profile_jobs.ProfileIngestJobStore(
+            sessionmaker(bind=conn), _WAIT_POLICY).mark_raw_deleted(parsed.spec, parsed.publication.content_sha256))
+    assert _retention_rows(engine) == before
+    assert not _job_store(engine).mark_raw_deleted(parsed.spec, parsed.publication.content_sha256).already_deleted
+
+
+def test_retention_completed_recovery_reads_through_row_locks_without_writes(profile_repository_pg: Engine) -> None:
+    engine = profile_repository_pg
+    parsed = _retention_publication(engine)
+    statements: list[str] = []
+
+    @contextmanager
+    def read_only() -> Iterator[Session]:
+        with engine.connect() as conn:
+            conn.execute(text("SET SESSION default_transaction_read_only=on"))
+            conn.execute(text("SET SESSION statement_timeout='500ms'"))
+            conn.commit()
+
+            def observe(connection: Any, cursor: Any, statement: str, parameters: Any, context: Any, many: bool) -> None:
+                statements.append(statement.upper())
+
+            event.listen(conn, "before_cursor_execute", observe)
+            try:
+                with Session(conn) as session:
+                    yield session
+            finally:
+                event.remove(conn, "before_cursor_execute", observe)
+                conn.rollback()
+                conn.execute(text("RESET default_transaction_read_only"))
+                conn.execute(text("RESET statement_timeout"))
+                conn.commit()
+
+    with engine.begin() as holder:
+        holder.execute(text("SET LOCAL statement_timeout='2s'"))
+        holder.execute(text("SELECT id FROM volume_profile_ingest_job FOR UPDATE")).all()
+        holder.execute(text("SELECT id FROM volume_profile_snapshot FOR UPDATE")).all()
+        with ThreadPoolExecutor(max_workers=1) as pool:
+            result = pool.submit(profile_jobs.ProfileIngestJobStore(read_only).recover_completed_snapshot,
+                                 parsed.spec).result(timeout=3)
+    assert result is not None and result.profile.publication == parsed.publication
+    assert statements and all(sql.startswith("SELECT") and "FOR UPDATE" not in sql and "PG_ADVISORY" not in sql
+                              for sql in statements)
+    assert _job_store(engine).recover_completed_snapshot(replace(parsed.spec, id="absent")) is None
+
+
 def test_atomic_profile_commit_ack_unknown_recovers_exact_committed_result(profile_repository_pg: Engine) -> None:
     engine, value = profile_repository_pg, _publication_pg()
     claim = _atomic_claim(engine)
