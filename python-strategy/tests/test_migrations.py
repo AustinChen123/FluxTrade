@@ -496,6 +496,117 @@ def test_profile_job_skip_locked_uses_second_without_waiting_for_first(profile_r
     assert first is not None and first.spec.id == "first"
 
 
+def test_exact_job_claim_scope_skip_locked_and_due_takeover(profile_repository_pg: Engine) -> None:
+    engine, store, duration = profile_repository_pg, _job_store(profile_repository_pg), timedelta(minutes=5)
+    for name in ("first", "requested", "other"):
+        store.register(_job_spec(name))
+    untouched = {name: _job_row(engine, name) for name in ("first", "other")}
+    policy = profile_repository.TransactionWaitPolicy(100, 500)
+    with engine.begin() as locked:
+        locked.execute(text("SET LOCAL statement_timeout = '2s'"))
+        locked.execute(text("SELECT id FROM volume_profile_ingest_job WHERE id='requested' FOR UPDATE")).one()
+        with ThreadPoolExecutor(max_workers=1) as pool:
+            future = pool.submit(profile_jobs.ProfileIngestJobStore(sessionmaker(engine), policy).claim,
+                                 "requested", "worker", duration)
+            assert future.result(timeout=3) is None
+    first = store.claim("requested", "worker", duration)
+    assert first is not None and first.spec.id == "requested" and first.attempt == 1
+    cursor, manifest = CanonicalJsonObject({"id": 42}), CanonicalJsonObject({"page": 2})
+    first = store.checkpoint(first, cursor, manifest, duration)
+    store.retry(first, timedelta(hours=1), "RETRY", "bounded detail")
+    assert store.claim("requested", "worker", duration) is None
+    with engine.begin() as conn:
+        conn.execute(text("UPDATE volume_profile_ingest_job SET retry_after_at=clock_timestamp()-interval '1 second' WHERE id='requested'"))
+    second = store.claim("requested", "worker", duration)
+    assert second is not None and second.attempt == 2
+    assert store.claim("requested", "new", duration) is None
+    with engine.begin() as conn:
+        conn.execute(text("UPDATE volume_profile_ingest_job SET lease_expires_at=clock_timestamp()-interval '1 second' WHERE id='requested'"))
+    takeover = store.claim("requested", "new", duration)
+    assert takeover is not None and takeover.attempt == 3
+    assert takeover.source_cursor == cursor and takeover.progress_manifest == manifest
+    with engine.begin() as conn:
+        conn.execute(text("UPDATE volume_profile_ingest_job SET attempt=9223372036854775807, lease_expires_at=clock_timestamp()-interval '1 second' WHERE id='requested'"))
+    before = _job_row(engine, "requested")
+    with pytest.raises(profile_jobs.JobIntegrityError, match="job attempt exhausted"):
+        store.claim("requested", "worker", duration)
+    assert _job_row(engine, "requested") == before
+    assert {name: _job_row(engine, name) for name in untouched} == untouched
+
+
+def test_completed_job_restart_recovery_is_read_only_without_row_or_advisory_lock(profile_repository_pg: Engine) -> None:
+    engine, value = profile_repository_pg, _publication_pg()
+    claim = _atomic_claim(engine)
+    published = _job_store(engine).publish_and_complete(claim, value)
+    before = _job_row(engine)
+    statements: list[str] = []
+
+    def observe(conn: sa.Connection, cursor: Any, statement: str,
+                parameters: Any, context: Any, executemany: bool) -> None:
+        statements.append(statement.upper())
+
+    @contextmanager
+    def read_only() -> Iterator[Session]:
+        with engine.connect() as conn:
+            conn.execute(text("SET SESSION default_transaction_read_only = on"))
+            conn.execute(text("SET SESSION statement_timeout = '500ms'"))
+            conn.commit()
+            event.listen(conn, "before_cursor_execute", observe)
+            try:
+                with Session(conn) as session:
+                    yield session
+            finally:
+                event.remove(conn, "before_cursor_execute", observe)
+                conn.rollback()
+                conn.execute(text("RESET default_transaction_read_only"))
+                conn.execute(text("RESET statement_timeout"))
+                conn.commit()
+
+    with engine.begin() as locked:
+        locked.execute(text("SET LOCAL statement_timeout = '2s'"))
+        locked.execute(text("SELECT id FROM volume_profile_ingest_job WHERE id='job' FOR UPDATE")).one()
+        with ThreadPoolExecutor(max_workers=1) as pool:
+            recovered = pool.submit(profile_jobs.ProfileIngestJobStore(read_only).recover_completed,
+                                    claim.spec, value).result(timeout=3)
+    assert recovered is not None and recovered.recovered_after_commit and recovered.profile.already_present
+    assert recovered.profile.publication == value and recovered.job == published.job
+    assert statements and all(s.startswith("SELECT") and "FOR UPDATE" not in s and "PG_ADVISORY" not in s for s in statements)
+    assert _job_row(engine) == before and _profile_counts(engine) == (1, 2)
+
+
+@pytest.mark.parametrize("damage", ["spec", "metadata", "digest", "bin", "missing", "partial"])
+def test_completed_job_restart_recovery_rejects_invalid_evidence(profile_repository_pg: Engine, damage: str) -> None:
+    engine, value = profile_repository_pg, _publication_pg()
+    store, spec = _job_store(engine), _job_spec()
+    assert store.recover_completed(spec, value) is None
+    store.register(spec)
+    assert store.recover_completed(spec, value) is None
+    claim = store.claim(spec.id, "worker", timedelta(minutes=5))
+    assert claim is not None
+    assert store.recover_completed(spec, value) is None
+    store.publish_and_complete(claim, value)
+    if damage == "spec":
+        spec = replace(spec, config_sha256="b" * 64)
+    elif damage == "metadata":
+        value = replace(value, reconciliation=CanonicalJsonObject({"changed": True}))
+    else:
+        with engine.begin() as conn:
+            if damage == "digest":
+                conn.execute(text("UPDATE volume_profile_snapshot SET content_sha256=:digest"), {"digest": "b" * 64})
+            elif damage == "bin":
+                conn.execute(text("UPDATE volume_profile_bin SET base_volume=base_volume+1 WHERE bin_index=-2"))
+            elif damage == "missing":
+                # Schema permits staging-only DONE; publication recovery requires a snapshot.
+                conn.execute(text("UPDATE volume_profile_ingest_job SET completed_snapshot_id=NULL"))
+            else:
+                conn.execute(text("UPDATE volume_profile_snapshot SET quality='PARTIAL', published_at=NULL"))
+    before = _job_row(engine)
+    error = profile_jobs.JobIntegrityError if damage == "missing" else profile_jobs.JobCompletionError
+    with pytest.raises(error):
+        _job_store(engine).recover_completed(spec, value)
+    assert _job_row(engine) == before
+
+
 def test_profile_job_expired_takeover_fences_every_stale_mutation(profile_repository_pg: Engine) -> None:
     engine, store = profile_repository_pg, _job_store(profile_repository_pg)
     store.register(_job_spec())
