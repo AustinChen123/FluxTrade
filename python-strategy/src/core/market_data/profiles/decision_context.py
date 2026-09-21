@@ -143,3 +143,61 @@ class ProfileDecisionContext:
     @property
     def digest(self) -> str:
         return hashlib.sha256(self.canonical_bytes).hexdigest()
+
+
+@dataclass(frozen=True, slots=True)
+class StrategyMarketDataContext:
+    """Canonical decision snapshot only; no provider or execution responsibility."""
+
+    decision_time_ms: int
+    profiles: tuple[ProfileDecisionContext, ...]
+
+    def __post_init__(self) -> None:
+        try:
+            _integer(self.decision_time_ms)
+            if type(self.profiles) is not tuple or any(
+                type(item) is not ProfileDecisionContext for item in self.profiles
+            ):
+                raise ValueError
+            if any(
+                item.decision_time_ms != self.decision_time_ms for item in self.profiles
+            ):
+                raise ValueError
+            keyed = [
+                (
+                    json.dumps(
+                        asdict(item.request),
+                        sort_keys=True,
+                        separators=(",", ":"),
+                        ensure_ascii=False,
+                    ).encode("utf-8"),
+                    item,
+                )
+                for item in self.profiles
+            ]
+            if len({key for key, _ in keyed}) != len(keyed):
+                raise ValueError
+            ordered = tuple(item for _, item in sorted(keyed, key=lambda pair: pair[0]))
+        except ValueError:
+            raise ValueError("PROFILE_DECISION_INVALID") from None
+        object.__setattr__(self, "profiles", ordered)
+
+    @property
+    def canonical_bytes(self) -> bytes:
+        return json.dumps(
+            {
+                "schema_version": 1,
+                "decision_time_ms": self.decision_time_ms,
+                "profiles": [
+                    json.loads(item.canonical_bytes) for item in self.profiles
+                ],
+            },
+            sort_keys=True,
+            separators=(",", ":"),
+            ensure_ascii=False,
+            allow_nan=False,
+        ).encode("utf-8")
+
+    @property
+    def digest(self) -> str:
+        return hashlib.sha256(self.canonical_bytes).hexdigest()

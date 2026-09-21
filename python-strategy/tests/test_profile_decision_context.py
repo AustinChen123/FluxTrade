@@ -1,7 +1,9 @@
-from dataclasses import FrozenInstanceError, fields, replace
+from dataclasses import FrozenInstanceError, asdict, fields, replace
 from decimal import Decimal
 import hashlib
 import json
+from itertools import permutations
+from typing import cast
 
 import pytest
 
@@ -9,6 +11,7 @@ from src.core.market_data.profiles.decision_context import (
     ProfileDecisionBasis as B,
     ProfileDecisionContext as C,
     ProfileDecisionStatus as S,
+    StrategyMarketDataContext as Collection,
 )
 from src.core.market_data.profiles.read_types import ProfileQueryRequest
 from test_profile_composite_types import FULL, POC
@@ -312,3 +315,112 @@ def test_unavailable_canonical_nulls_and_distinct_digests():
             assert field in payload and payload[field] is None
         assert value.digest == hashlib.sha256(value.canonical_bytes).hexdigest()
         assert value.digest != item(value.basis).digest
+
+
+def test_collection_empty_golden_and_frozen():
+    value = Collection(0, ())
+    assert (
+        value.canonical_bytes
+        == b'{"decision_time_ms":0,"profiles":[],"schema_version":1}'
+    )
+    assert value.digest == hashlib.sha256(value.canonical_bytes).hexdigest()
+    assert Collection((1 << 63) - 1, ())
+    assert replace(value, decision_time_ms=1).digest != value.digest
+    with pytest.raises(FrozenInstanceError):
+        setattr(value, "profiles", ())
+    assert not hasattr(value, "__dict__")
+
+
+def test_collection_permutations_use_full_request_bytes():
+    first = item()
+    second = replace(first, request=replace(REQUEST, revision=1))
+    third = item(B.MODELED)
+    entries = (first, second, third)
+
+    def key(value):
+        return json.dumps(
+            asdict(value.request),
+            sort_keys=True,
+            separators=(",", ":"),
+            ensure_ascii=False,
+        ).encode()
+
+    expected = tuple(sorted(entries, key=key))
+    reference = Collection(DAY + 3, entries)
+    for ordering in permutations(entries):
+        value = Collection(DAY + 3, ordering)
+        assert value.profiles == expected
+        assert value.canonical_bytes == reference.canonical_bytes
+        assert value.digest == reference.digest
+        payload = json.loads(value.canonical_bytes)
+        assert payload == {
+            "schema_version": 1,
+            "decision_time_ms": DAY + 3,
+            "profiles": [json.loads(entry.canonical_bytes) for entry in expected],
+        }
+    assert json.loads(key(first))["revision"] is None
+
+
+@pytest.mark.parametrize(
+    "other",
+    [
+        item(),
+        unavailable(),
+        unavailable(status=S.INVALID, reason=INVALID[0]),
+        replace(item(), profile=replace(FULL, base_volume=Decimal(2))),
+    ],
+)
+def test_collection_duplicate_request_never_selects_winner(other):
+    for entries in ((item(), other), (other, item())):
+        with pytest.raises(ValueError, match="^PROFILE_DECISION_INVALID$"):
+            Collection(DAY + 3, cast(tuple[C, ...], entries))
+
+
+@pytest.mark.parametrize("stamp", [True, -1, 1 << 63, 1.0, type("Int", (int,), {})(0)])
+def test_collection_exact_clock(stamp):
+    with pytest.raises(ValueError):
+        Collection(stamp, ())
+
+
+def test_collection_exact_items_container_and_time():
+    subclass = type("Child", (C,), {})
+    child = subclass(**{f.name: getattr(item(), f.name) for f in fields(C)})
+    for entries in (
+        [item()],
+        type("Tuple", (tuple,), {})((item(),)),
+        (None,),
+        (child,),
+    ):
+        with pytest.raises(ValueError):
+            Collection(DAY + 3, cast(tuple[C, ...], entries))
+    with pytest.raises(ValueError):
+        Collection(DAY + 4, (item(),))
+    with pytest.raises(ValueError):
+        Collection(
+            DAY + 3,
+            (
+                item(),
+                replace(
+                    item(B.MODELED),
+                    decision_time_ms=DAY + 4,
+                    request=replace(item(B.MODELED).request, as_of_ms=DAY + 4),
+                ),
+            ),
+        )
+
+
+def test_collection_digest_tracks_valid_nested_changes():
+    first = item()
+    changed = [
+        replace(first, request=replace(REQUEST, freshness_policy_id="other")),
+        replace(first, profile=replace(FULL, quote_volume=Decimal(2))),
+        replace(first, observed_at_ms=DAY + 3),
+        unavailable(),
+        unavailable(reason=MISSING[1]),
+        unavailable(status=S.INVALID, reason=INVALID[0]),
+        item(B.MODELED),
+    ]
+    values = [Collection(DAY + 3, (entry,)) for entry in [first, *changed]]
+    assert len({value.digest for value in values}) == len(values)
+    later = Collection(DAY + 4, (replace(first, decision_time_ms=DAY + 4),))
+    assert later.digest != values[0].digest
