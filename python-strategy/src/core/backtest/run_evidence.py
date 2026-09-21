@@ -237,7 +237,7 @@ def canonical_decision_snapshot(context: StrategyContext) -> dict[str, object]:
     """Project decision semantics while excluding opaque local/provider IDs."""
     if type(context) is not StrategyContext:
         raise TypeError("decision evidence requires an exact StrategyContext")
-    return {
+    projection: dict[str, object] = {
         "strategy_id": context.strategy_id,
         "product_id": context.product_id,
         "timestamp": context.timestamp,
@@ -281,6 +281,9 @@ def canonical_decision_snapshot(context: StrategyContext) -> dict[str, object]:
         "risk": context.risk,
         "capital": context.capital,
     }
+    if context.market_data is not None:
+        projection["market_data"] = json.loads(context.market_data.canonical_bytes)
+    return projection
 
 
 def _canonical_sha256(schema: str, value: object) -> str:

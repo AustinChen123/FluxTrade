@@ -35,6 +35,7 @@ def test_strategy_context_capital_defaults_to_none():
     )
 
     assert context.capital is None
+    assert context.market_data is None
 
 
 def test_capital_snapshot_is_immutable():
@@ -181,6 +182,7 @@ def test_strategy_context_filters_latest_fills_by_strategy_and_product():
         latest_fills=fills,
     )
 
+    assert context.market_data is None
     assert [(fill.order_id, fill.timestamp) for fill in context.latest_fills] == [
         ("own", 1100)
     ]
