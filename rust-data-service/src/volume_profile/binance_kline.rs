@@ -1,4 +1,4 @@
-//! Fixed Binance BTCUSDT spot daily-kline wire validation; no transport or aggregation.
+//! Fixed Binance BTCUSDT spot daily-kline wire and public transport; no retries.
 use anyhow::{ensure, Result};
 use rust_decimal::Decimal;
 use serde_json::Value;
@@ -6,6 +6,60 @@ use serde_json::Value;
 use super::{handoff::sha, mvp, Window};
 
 pub const RAW_LIMIT: usize = 65_536;
+pub const ENDPOINT: &str = "https://data-api.binance.vision/api/v3/klines";
+
+pub struct Transport {
+    client: reqwest::Client,
+    endpoint: reqwest::Url,
+}
+
+impl Transport {
+    pub fn new(timeout: std::time::Duration) -> Result<Self> {
+        ensure!(
+            !timeout.is_zero() && timeout <= std::time::Duration::from_secs(3),
+            "invalid kline timeout"
+        );
+        Ok(Self {
+            client: reqwest::Client::builder()
+                .timeout(timeout)
+                .no_proxy()
+                .redirect(reqwest::redirect::Policy::none())
+                .build()?,
+            endpoint: reqwest::Url::parse(ENDPOINT)?,
+        })
+    }
+
+    /// Caller supplies its current wall-clock sample; this owner has no clock/retry loop.
+    pub async fn fetch(&self, day: Window, now_ms: i64) -> Result<super::transport::Outcome> {
+        validate_day(day)?;
+        ensure!(
+            day.end_ms() <= now_ms && day.end_ms() <= 253_402_300_799_999,
+            "incomplete daily window"
+        );
+        let params = [
+            ("symbol", "BTCUSDT".to_string()),
+            ("interval", "1d".to_string()),
+            ("startTime", day.start_ms().to_string()),
+            ("endTime", (day.end_ms() - 1).to_string()),
+            ("limit", "1".to_string()),
+        ];
+        Ok(super::transport::bounded_request(
+            self.client.get(self.endpoint.clone()).query(&params),
+            RAW_LIMIT,
+        )
+        .await)
+    }
+}
+
+fn validate_day(day: Window) -> Result<()> {
+    let duration = 24 * mvp::HOUR;
+    ensure!(
+        day.start_ms() % duration == 0
+            && day.start_ms().checked_add(duration) == Some(day.end_ms()),
+        "invalid daily window"
+    );
+    Ok(())
+}
 
 pub struct DailyKline {
     pub(crate) response_sha256: String,
@@ -28,12 +82,7 @@ fn nonnegative(value: &Value) -> Result<Decimal> {
 }
 
 pub fn parse(raw: &[u8], day: Window) -> Result<DailyKline> {
-    let duration = 24 * mvp::HOUR;
-    ensure!(
-        day.start_ms() % duration == 0
-            && day.start_ms().checked_add(duration) == Some(day.end_ms()),
-        "invalid daily window"
-    );
+    validate_day(day)?;
     ensure!(raw.len() <= RAW_LIMIT, "kline response byte limit");
     let value: Value = serde_json::from_slice(raw)?;
     let rows = value
@@ -63,3 +112,6 @@ pub fn parse(raw: &[u8], day: Window) -> Result<DailyKline> {
         constituent_trade_count: count,
     })
 }
+
+#[cfg(test)]
+mod tests;

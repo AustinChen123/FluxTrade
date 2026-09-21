@@ -91,59 +91,62 @@ impl Transport {
             }
             Request::Next { from_id } => params.push(("fromId", from_id.to_string())),
         }
-        let mut response = match self
-            .client
-            .get(self.endpoint.clone())
-            .query(&params)
-            .send()
-            .await
-        {
-            Ok(response) => response,
-            Err(error) => return transport_error(error, None, 0),
+        bounded_request(
+            self.client.get(self.endpoint.clone()).query(&params),
+            self.limit,
+        )
+        .await
+    }
+}
+
+/// Shared bounded HTTP mechanics; provider owners retain endpoint/query policy.
+pub(crate) async fn bounded_request(request: reqwest::RequestBuilder, limit: usize) -> Outcome {
+    let mut response = match request.send().await {
+        Ok(response) => response,
+        Err(error) => return transport_error(error, None, 0),
+    };
+    let code = response.status().as_u16();
+    let status = Some(code);
+    let values: Vec<_> = response
+        .headers()
+        .get_all(RETRY_AFTER)
+        .iter()
+        .map(|v| v.to_str().unwrap_or(""))
+        .collect();
+    let disposition = work_policy::http(code, &values);
+    if disposition.action != Action::Success {
+        return Outcome {
+            disposition,
+            failure: None,
+            body: None,
+            response_bytes: 0,
         };
-        let code = response.status().as_u16();
-        let status = Some(code);
-        let values: Vec<_> = response
-            .headers()
-            .get_all(RETRY_AFTER)
-            .iter()
-            .map(|v| v.to_str().unwrap_or(""))
-            .collect();
-        let disposition = work_policy::http(code, &values);
-        if disposition.action != Action::Success {
-            return Outcome {
-                disposition,
-                failure: None,
-                body: None,
-                response_bytes: 0,
-            };
-        }
-        if response
-            .content_length()
-            .is_some_and(|length| length > self.limit as u64)
-        {
-            return failed(Failure::Protocol, status, 0);
-        }
-        let mut body = Vec::new();
-        loop {
-            match response.chunk().await {
-                Ok(Some(chunk)) => {
-                    let total = (body.len() as u64).checked_add(chunk.len() as u64);
-                    match total {
-                        Some(size) if size <= self.limit as u64 => body.extend_from_slice(&chunk),
-                        _ => return failed(Failure::Protocol, status, total.unwrap_or(u64::MAX)),
-                    }
+    }
+    if response
+        .content_length()
+        .is_some_and(|length| length > limit as u64)
+    {
+        return failed(Failure::Protocol, status, 0);
+    }
+    let mut body = Vec::new();
+    loop {
+        match response.chunk().await {
+            Ok(Some(chunk)) => {
+                let total = (body.len() as u64).checked_add(chunk.len() as u64);
+                match total {
+                    Some(size) if size <= limit as u64 => body.extend_from_slice(&chunk),
+                    _ => return failed(Failure::Protocol, status, total.unwrap_or(u64::MAX)),
                 }
-                Ok(None) => {
-                    return Outcome {
-                        disposition,
-                        failure: None,
-                        response_bytes: body.len() as u64,
-                        body: Some(body),
-                    }
-                }
-                Err(error) => return transport_error(error, status, body.len() as u64),
             }
+            Ok(None) => {
+                return Outcome {
+                    disposition,
+                    failure: None,
+                    response_bytes: body.len() as u64,
+                    body: Some(body),
+                }
+            }
+            Err(error) => return transport_error(error, status, body.len() as u64),
         }
     }
 }
