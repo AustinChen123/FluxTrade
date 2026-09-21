@@ -66,6 +66,8 @@ def _canonical(value: dict[str, object]) -> str:
                 emit("]")
             active.remove(id(item))
         elif kind is str or kind is int or kind is bool or item is None:
+            if kind is str and "\x00" in cast(str, item):
+                raise ValueError("JSON text contains forbidden NUL")
             if kind is str and len(cast(str, item)) > MAX_JSON_BYTES:
                 raise ValueError("JSON string limit exceeded")
             if kind is int and not -(1 << 63) <= cast(int, item) < (1 << 64):

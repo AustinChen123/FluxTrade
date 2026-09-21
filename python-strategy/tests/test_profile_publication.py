@@ -24,6 +24,22 @@ def publication() -> VerifiedProfilePublication:
     return VerifiedProfilePublication(profile(), metadata, metadata, None, "OBSERVED", "PRESENT")
 
 
+@pytest.mark.parametrize(
+    "value", [{"\x00": 1}, {"a": "\x00"}, {"a": [{"\x00": 1}]}, {"a": [{"b": "\x00"}]}]
+)
+def test_jsonb_nul_is_rejected_at_construction(value: dict[str, Any]) -> None:
+    with pytest.raises(
+        ValueError, match="^JSON text contains forbidden NUL$"
+    ) as caught:
+        CanonicalJsonObject(value)
+    assert type(caught.value) is ValueError
+
+
+def test_supplementary_unicode_remains_valid() -> None:
+    value: dict[str, object] = {"\U0001f680": [{"value": "\U0001f600"}]}
+    assert CanonicalJsonObject(value).thaw() == value
+
+
 def test_canonical_json_detaches_aliases_and_thaws_fresh_objects() -> None:
     source: dict[str, Any] = {"z": [True, {"é": 2}], "a": None}
     value = CanonicalJsonObject(source)
