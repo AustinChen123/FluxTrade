@@ -21,6 +21,7 @@ from .types import BIGINT_MAX, ProfileBin, VolumeProfileContent, _decimal
 
 _HOUR = 3_600_000
 _U64_MAX = (1 << 64) - 1
+MAX_FRAMED_HANDOFF_BYTES = MAX_JSON_BYTES + 1  # Canonical JSON plus the CLI's single LF.
 _PRODUCT = "BINANCE:BTCUSDT-SPOT"
 _TOP = "schema_version job_id config_sha256 content content_sha256 hours reconciliation source_available_at_ms availability_basis raw_retention_state"
 _CONTENT = "schema_version product_id window_start_ms window_end_ms period timezone grid_id bin_origin bin_step algorithm_version bins"
@@ -133,9 +134,29 @@ class ParsedHandoff:
                      ("product_id", "window_start_ms", "window_end_ms", "grid_id", "algorithm_version")))
 
 
+def encode_handoff(spec: JobSpec, publication: VerifiedProfilePublication) -> bytes:
+    """Encode bound PRESENT DB evidence; never normalize assembler stdout for comparison."""
+    _validate_publication_binding(spec, publication)
+    available = publication.source_available_at
+    assert available is not None  # Binding validator requires an exact UTC integer millisecond.
+    elapsed = available - datetime(1970, 1, 1, tzinfo=timezone.utc)
+    wire = {
+        "schema_version": 1, "job_id": spec.id, "config_sha256": spec.config_sha256,
+        "content": json.loads(publication.content.content_bytes),
+        "content_sha256": publication.content_sha256,
+        "hours": publication.source_manifest.thaw()["hours"],
+        "reconciliation": publication.reconciliation.thaw(),
+        "source_available_at_ms": elapsed.days * 86400000 + elapsed.seconds * 1000 + elapsed.microseconds // 1000,
+        "availability_basis": publication.availability_basis, "raw_retention_state": publication.raw_retention_state,
+    }
+    # Same bounded UTF-8/canonical JSON domain as the wire parser.
+    encoded = CanonicalJsonObject(wire).text.encode("utf-8")
+    return encoded + b"\n"
+
+
 def parse_handoff(raw: bytes) -> ParsedHandoff:
     """Validate bounded wire consistency, never attest source completeness."""
-    _require(type(raw) is bytes and len(raw) <= MAX_JSON_BYTES)
+    _require(type(raw) is bytes and len(raw) <= MAX_FRAMED_HANDOFF_BYTES)
     try:
         wire = _keys(json.loads(raw.decode("utf-8"), object_pairs_hook=_pairs,
                                parse_float=_reject_number, parse_constant=_reject_number), _TOP)

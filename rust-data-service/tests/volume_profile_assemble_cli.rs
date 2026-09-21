@@ -105,6 +105,32 @@ fn actual_executable_replays_source_pair_with_canonical_lf() {
         assert_eq!(output.stdout, expected);
         assert_eq!(output.stdout.iter().filter(|&&b| b == b'\n').count(), 1);
     }
+    // Opt-in cross-language acceptance lane; ordinary Rust CI needs no Python.
+    // Use the project Python environment with SQLAlchemy installed.
+    if let Some(python) = std::env::var_os("FLUXTRADE_PROFILE_PYTHON") {
+        let mut child = Command::new(python)
+            .current_dir(concat!(env!("CARGO_MANIFEST_DIR"), "/../python-strategy"))
+            .args(["-c", "import sys;from src.core.market_data.profiles.handoff import parse_handoff,encode_handoff;p=parse_handoff(sys.stdin.buffer.read());sys.stdout.buffer.write(encode_handoff(p.spec,p.publication))"])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        child.stdin.take().unwrap().write_all(&expected).unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while child.try_wait().unwrap().is_none() && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        if child.try_wait().unwrap().is_none() {
+            child.kill().unwrap();
+            child.wait().unwrap();
+            panic!("Python encoder deadline");
+        }
+        let output = child.wait_with_output().unwrap();
+        assert!(output.status.success(), "Python encoder failed");
+        assert!(output.stderr.is_empty());
+        assert_eq!(output.stdout, expected);
+    }
     let wire: serde_json::Value = serde_json::from_slice(&expected).unwrap();
     let content = wire["content_sha256"].as_str().unwrap();
     let handoff: String = ring::digest::digest(&ring::digest::SHA256, &expected)

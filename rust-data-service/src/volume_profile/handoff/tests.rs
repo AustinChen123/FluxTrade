@@ -66,6 +66,12 @@ fn shared_python_fixture_is_byte_and_digest_identical() {
         fixture["content_bytes"].as_str().unwrap().as_bytes()
     );
     assert_eq!(wire.wire["content_sha256"], fixture["content_sha256"]);
+    let mut stdout = wire.to_bytes().unwrap();
+    stdout.push(b'\n');
+    assert_eq!(
+        sha(&stdout),
+        "f6630bf75baedaa34b750b167eb0fdda296b14b4c945ec00f2e0f36aa2576ca7"
+    );
 }
 
 #[test]
