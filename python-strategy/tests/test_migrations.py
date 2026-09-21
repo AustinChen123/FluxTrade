@@ -48,6 +48,7 @@ from sqlalchemy.exc import DBAPIError, IntegrityError
 from sqlalchemy.orm import Session, sessionmaker
 from src.core.database_url import build_postgres_url
 from src.core.market_data.profiles import jobs as profile_jobs
+from src.core.market_data.profiles import invalidation as profile_invalidation
 from src.core.market_data.profiles import repository as profile_repository
 from src.core.market_data.profiles.handoff import parse_handoff
 from src.core.market_data.profiles.ingest import ProfileIngestProcess
@@ -1408,6 +1409,7 @@ def _schema_fingerprint(engine: Engine) -> tuple:
 # Selected non-legacy tables that must exist at HEAD and be gone
 # after a full downgrade to ``base``.
 HEAD_ONLY_TABLES = {
+    "market_data_invalidation",
     "volume_profile_snapshot",
     "volume_profile_bin",
     "volume_profile_ingest_job",
@@ -1857,20 +1859,244 @@ def test_ops_events_survive_downgrade_and_reupgrade(fresh_pg_db: str) -> None:
         engine.dispose()
 
 
+def _invalidation_seed(engine: Engine):
+    repo = profile_repository.ProfileRepository(sessionmaker(engine))
+    target = repo.publish(_publication_pg())
+    replacement = repo.publish(_publication_pg(True))
+    request = profile_invalidation.ConfirmedInvalidationRequest("event", target.snapshot_id, "BAD_DATA", replacement.snapshot_id, "audit")
+    return profile_invalidation.ProfileInvalidationStore(sessionmaker(engine)), request
+
+
+def _invalidation_rows(engine: Engine) -> list[dict[str, Any]]:
+    with engine.connect() as conn:
+        return [dict(row) for row in conn.execute(text("SELECT * FROM market_data_invalidation ORDER BY recorded_at,event_id")).mappings()]
+
+
+def test_invalidation_constraints_defaults_and_append_only_dml(profile_repository_pg: Engine) -> None:
+    engine = profile_repository_pg
+    store, request = _invalidation_seed(engine)
+    with engine.connect() as conn:
+        lower = conn.execute(text("SELECT date_trunc('milliseconds',clock_timestamp())")).scalar_one()
+    first = store.append_confirmed(request)
+    with engine.connect() as conn:
+        upper = conn.execute(text("SELECT clock_timestamp()")).scalar_one()
+    assert lower <= first.event.recorded_at <= upper
+    assert first.event.recorded_at.utcoffset() == timedelta(0) and first.event.recorded_at.microsecond % 1000 == 0
+    assert store.append_confirmed(request).event == first.event
+    assert store.append_confirmed(request).already_present
+    before = _invalidation_rows(engine), _retention_rows(engine)
+    for statement in ("UPDATE market_data_invalidation SET source='changed'", "UPDATE market_data_invalidation SET source=source",
+                      "UPDATE market_data_invalidation SET source=source WHERE false",
+                      "DELETE FROM market_data_invalidation", "DELETE FROM market_data_invalidation WHERE false", "TRUNCATE market_data_invalidation"):
+        with pytest.raises(DBAPIError) as caught, engine.begin() as conn:
+            conn.execute(text(statement))
+        assert getattr(caught.value.orig, "pgcode", None) == "55000"
+        assert (_invalidation_rows(engine), _retention_rows(engine)) == before
+    for identifier in (request.snapshot_id, request.replacement_snapshot_id):
+        with pytest.raises(IntegrityError), engine.begin() as conn:
+            conn.execute(text("DELETE FROM volume_profile_snapshot WHERE id=:id"), {"id": identifier})
+    timestamp = datetime(2026, 1, 1, tzinfo=timezone.utc)
+    for field, value in (("event_id", "bad!"), ("reason_code", "é"), ("source", ""), ("snapshot_id", "c" * 64),
+                         ("replacement_snapshot_id", request.snapshot_id), ("replacement_snapshot_id", "d" * 64),
+                         ("recorded_at", timestamp.replace(microsecond=1))):
+        params = dict(event_id="other", snapshot_id=request.snapshot_id, reason_code="BAD", source="audit",
+                      replacement_snapshot_id=request.replacement_snapshot_id, recorded_at=timestamp)
+        params[field] = value
+        with pytest.raises(IntegrityError), engine.begin() as conn:
+            conn.execute(text("INSERT INTO market_data_invalidation (event_id,snapshot_id,reason_code,source,replacement_snapshot_id,recorded_at) "
+                              "VALUES (:event_id,:snapshot_id,:reason_code,:source,:replacement_snapshot_id,:recorded_at)"), params)
+    assert (_invalidation_rows(engine), _retention_rows(engine)) == before
+    for stamp in ("-infinity", "infinity", "10000-01-01 00:00:00+00"):
+        with pytest.raises(IntegrityError), engine.begin() as conn:
+            conn.execute(text("INSERT INTO market_data_invalidation(event_id,snapshot_id,reason_code,source,recorded_at) "
+                              "VALUES ('invalid_time',:id,'BAD','audit',CAST(:stamp AS timestamptz))"),
+                         {"id": request.snapshot_id, "stamp": stamp})
+        assert (_invalidation_rows(engine), _retention_rows(engine)) == before
+    for name, stamp in (("minimum_time", datetime(1, 1, 1, tzinfo=timezone.utc)),
+                        ("maximum_time", datetime(9999, 12, 31, 23, 59, 59, 999000, tzinfo=timezone.utc))):
+        with engine.begin() as conn:
+            conn.execute(text("INSERT INTO market_data_invalidation(event_id,snapshot_id,reason_code,source,recorded_at) "
+                              "VALUES (:event,:id,'BAD','audit',:stamp)"),
+                         {"event": name, "id": request.snapshot_id, "stamp": stamp})
+        persisted = store.get(name)
+        assert persisted is not None and persisted.recorded_at == stamp
+    assert len(_invalidation_rows(engine)) == 3 and _retention_rows(engine) == before[1]
+
+
+def test_invalidation_reference_rules_and_corrupt_bins_remain_revocable(profile_repository_pg: Engine) -> None:
+    engine = profile_repository_pg
+    store, request = _invalidation_seed(engine)
+    for changed in (replace(request, snapshot_id="d" * 64), replace(request, replacement_snapshot_id="d" * 64)):
+        with pytest.raises(profile_invalidation.InvalidationReferenceError):
+            store.append_confirmed(changed)
+    with engine.begin() as conn:
+        conn.execute(text("UPDATE volume_profile_snapshot SET grid_id='other' WHERE id=:id"), {"id": request.replacement_snapshot_id})
+    with pytest.raises(profile_invalidation.InvalidationReferenceError):
+        store.append_confirmed(request)
+    with engine.begin() as conn:
+        conn.execute(text("UPDATE volume_profile_snapshot SET grid_id='g1',quality='PARTIAL',published_at=NULL WHERE id=:id"), {"id": request.replacement_snapshot_id})
+    with pytest.raises(profile_invalidation.InvalidationReferenceError):
+        store.append_confirmed(request)
+    with engine.begin() as conn:
+        conn.execute(text("UPDATE volume_profile_bin SET base_volume=base_volume+1 WHERE snapshot_id=:id"), {"id": request.snapshot_id})
+    before = _retention_rows(engine)
+    first = store.append_confirmed(replace(request, replacement_snapshot_id=None))
+    second = store.append_confirmed(replace(request, event_id="other", replacement_snapshot_id=None))
+    assert first.event.snapshot_id == second.event.snapshot_id and len(_invalidation_rows(engine)) == 2
+    assert _retention_rows(engine) == before
+
+
+@pytest.mark.parametrize("mode", ["same", "conflict", "different_ids"])
+def test_invalidation_concurrent_convergence_uses_read_committed(profile_repository_pg: Engine, mode: str) -> None:
+    engine = profile_repository_pg
+    _, request = _invalidation_seed(engine)
+    other = replace(request, source="other") if mode == "conflict" else replace(request, event_id="other") if mode == "different_ids" else request
+    barrier, observed = Barrier(2), []
+
+    def observe(conn: Any, cursor: Any, statement: str, params: Any, context: Any, many: bool) -> None:
+        if "FROM market_data_invalidation" in statement:
+            with cursor.connection.cursor() as probe:
+                probe.execute("SHOW transaction_isolation")
+                observed.append(probe.fetchone()[0])
+
+    def run(value: profile_invalidation.ConfirmedInvalidationRequest):
+        barrier.wait(timeout=3)
+        try:
+            return profile_invalidation.ProfileInvalidationStore(sessionmaker(engine)).append_confirmed(value)
+        except profile_invalidation.InvalidationConflict as error:
+            return error
+
+    event.listen(engine, "before_cursor_execute", observe)
+    try:
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            futures = [pool.submit(run, value) for value in (request, other)]
+            results = [future.result(timeout=5) for future in futures]
+    finally:
+        event.remove(engine, "before_cursor_execute", observe)
+    assert observed and set(observed) == {"read committed"}
+    successes = [r for r in results if isinstance(r, profile_invalidation.InvalidationAppendResult)]
+    assert len(successes) == (1 if mode == "conflict" else 2)
+    assert sum(r.already_present for r in successes) == int(mode == "same")
+    assert len(_invalidation_rows(engine)) == (2 if mode == "different_ids" else 1)
+
+
+def test_invalidation_unique_wait_timeout_then_release_retry(profile_repository_pg: Engine) -> None:
+    engine = profile_repository_pg
+    store, request = _invalidation_seed(engine)
+    before = _retention_rows(engine)
+    with engine.connect() as holder:
+        transaction = holder.begin()
+        try:
+            holder.execute(text("SET LOCAL statement_timeout='2s'"))
+            holder.execute(text("INSERT INTO market_data_invalidation(event_id,snapshot_id,reason_code,source) VALUES ('event',:id,'BAD_DATA','audit')"), {"id": request.snapshot_id})
+            _assert_profile_lock_timeout(engine, lambda conn: profile_invalidation.ProfileInvalidationStore(
+                sessionmaker(bind=conn), _WAIT_POLICY).append_confirmed(request))
+            assert _invalidation_rows(engine) == [] and _retention_rows(engine) == before
+        finally:
+            transaction.rollback()
+    assert not store.append_confirmed(request).already_present
+
+
+@pytest.mark.parametrize("ack_loss", [False, True])
+def test_invalidation_precommit_rollback_and_postcommit_ack_loss(profile_repository_pg: Engine, ack_loss: bool) -> None:
+    engine = profile_repository_pg
+    store, request = _invalidation_seed(engine)
+    failure = DBAPIError("injected transaction failure", None, Exception("bounded"))
+
+    def before_commit(session: Session) -> None:
+        raise failure
+
+    @contextmanager
+    def sessions() -> Iterator[Session]:
+        with Session(engine) as session:
+            if not ack_loss:
+                event.listen(session, "before_commit", before_commit)
+            try:
+                yield session
+                if ack_loss:
+                    raise failure
+            finally:
+                if not ack_loss:
+                    event.remove(session, "before_commit", before_commit)
+
+    before = _retention_rows(engine)
+    with pytest.raises(DBAPIError) as caught:
+        profile_invalidation.ProfileInvalidationStore(sessions).append_confirmed(request)
+    assert caught.value is failure and _retention_rows(engine) == before
+    rows = _invalidation_rows(engine)
+    assert len(rows) == int(ack_loss)
+    result = store.append_confirmed(request)
+    assert result.already_present == ack_loss and len(_invalidation_rows(engine)) == 1
+    if ack_loss:
+        assert result.event.recorded_at == rows[0]["recorded_at"]
+
+
+def test_invalidation_order_limits_read_settings_do_not_leak(profile_repository_pg: Engine) -> None:
+    engine = profile_repository_pg
+    _, request = _invalidation_seed(engine)
+    with engine.begin() as conn:
+        for name in ("a", "Z", "A"):
+            conn.execute(text("INSERT INTO market_data_invalidation(event_id,snapshot_id,reason_code,source,recorded_at) "
+                              "VALUES (:event,:id,'BAD','audit','2026-01-01T00:00:00Z')"), {"event": name, "id": request.snapshot_id})
+    observed = []
+    with engine.connect() as conn:
+        settings = text("SELECT current_setting('transaction_isolation'), current_setting('transaction_read_only'), "
+                        "current_setting('TimeZone'), current_setting('lock_timeout'), current_setting('statement_timeout')")
+        conn.execute(text("SET SESSION TIME ZONE 'Europe/Berlin'"))
+        baseline = conn.execute(settings).one()
+        conn.commit()
+
+        def observe(connection: Any, cursor: Any, statement: str, params: Any, context: Any, many: bool) -> None:
+            if "FROM market_data_invalidation" in statement:
+                with cursor.connection.cursor() as probe:
+                    probe.execute(str(settings))
+                    observed.append(probe.fetchone())
+
+        event.listen(conn, "before_cursor_execute", observe)
+        try:
+            store = profile_invalidation.ProfileInvalidationStore(sessionmaker(bind=conn), _WAIT_POLICY)
+            assert [item.event_id for item in store.list_for_snapshot(request.snapshot_id, limit=3)] == ["A", "Z", "a"]
+            assert store.get("A") is not None
+            with pytest.raises(profile_invalidation.InvalidationReadTooLarge):
+                store.list_for_snapshot(request.snapshot_id, limit=2)
+            assert observed and set(observed) == {("read committed", "on", "UTC", "100ms", "500ms")}
+            assert conn.execute(settings).one() == baseline
+        finally:
+            event.remove(conn, "before_cursor_execute", observe)
+            conn.rollback()
+            conn.execute(text("RESET TIME ZONE"))
+            conn.commit()
+
+
+def _invalidation_artifacts(engine: Engine, present: bool) -> None:
+    with engine.connect() as conn:
+        assert (conn.execute(text("SELECT to_regclass('market_data_invalidation')")).scalar_one() is not None) == present
+        assert (conn.execute(text("SELECT to_regprocedure('reject_market_data_invalidation_mutation()')")).scalar_one() is not None) == present
+        count = conn.execute(text("SELECT count(*) FROM pg_trigger WHERE tgname='market_data_invalidation_append_only' AND NOT tgisinternal")).scalar_one()
+        assert count == int(present)
+
+
 def test_round_trip_idempotent(fresh_pg_db: str) -> None:
     """Upgrade → downgrade → upgrade twice: schema fingerprints must match."""
     _upgrade(fresh_pg_db, "head")
     engine = sa.create_engine(_target_url(fresh_pg_db))
     try:
+        _invalidation_artifacts(engine, True)
         fp_first = _schema_fingerprint(engine)
     finally:
         engine.dispose()
 
     _downgrade(fresh_pg_db, "base")
+    engine = sa.create_engine(_target_url(fresh_pg_db))
+    try:
+        _invalidation_artifacts(engine, False)
+    finally:
+        engine.dispose()
     _upgrade(fresh_pg_db, "head")
 
     engine = sa.create_engine(_target_url(fresh_pg_db))
     try:
+        _invalidation_artifacts(engine, True)
         fp_second = _schema_fingerprint(engine)
     finally:
         engine.dispose()
@@ -1986,7 +2212,7 @@ def test_order_identity_incompatible_downgrade_keeps_scoped_indexes(
                 conn.execute(
                     text("SELECT version_num FROM alembic_version")
                 ).scalar_one()
-                == "6c2f8a91d4e7"
+                == "7d3a9c02e5f8"
             )
     finally:
         engine.dispose()
