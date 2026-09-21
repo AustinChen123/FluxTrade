@@ -13,6 +13,7 @@ from sqlalchemy import (
     Text,
     UniqueConstraint,
     func,
+    text,
 )
 from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.orm import Mapped, mapped_column
@@ -27,6 +28,28 @@ def _finite(table: str, *columns: str) -> tuple[CheckConstraint, ...]:
             name=f"ck_{table}_{column}_finite",
         )
         for column in columns
+    )
+
+
+class MarketDataInvalidation(Base):
+    __tablename__ = "market_data_invalidation"
+    event_id: Mapped[str] = mapped_column(String(128, collation="C"), primary_key=True, nullable=False)
+    snapshot_id: Mapped[str] = mapped_column(String(64), ForeignKey("volume_profile_snapshot.id", ondelete="RESTRICT"), nullable=False)
+    reason_code: Mapped[str] = mapped_column(String(64), nullable=False)
+    recorded_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False,
+        server_default=text("date_trunc('milliseconds', clock_timestamp())"))
+    replacement_snapshot_id: Mapped[str | None] = mapped_column(
+        String(64), ForeignKey("volume_profile_snapshot.id", ondelete="RESTRICT"), nullable=True)
+    source: Mapped[str] = mapped_column(String(64), nullable=False)
+    __table_args__ = (
+        CheckConstraint("event_id COLLATE \"C\" ~ '^[A-Za-z0-9_-]{1,128}$'", name="ck_mdi_event"),
+        CheckConstraint("snapshot_id COLLATE \"C\" ~ '^[0-9a-f]{64}$'", name="ck_mdi_snapshot"),
+        CheckConstraint("reason_code COLLATE \"C\" ~ '^[A-Za-z0-9_-]{1,64}$'", name="ck_mdi_reason"),
+        CheckConstraint("source COLLATE \"C\" ~ '^[A-Za-z0-9_-]{1,64}$'", name="ck_mdi_source"),
+        CheckConstraint("recorded_at >= TIMESTAMPTZ '0001-01-01 00:00:00+00' AND recorded_at < TIMESTAMPTZ '10000-01-01 00:00:00+00' AND recorded_at = date_trunc('milliseconds', recorded_at)", name="ck_mdi_recorded"),
+        CheckConstraint("replacement_snapshot_id IS NULL OR (replacement_snapshot_id COLLATE \"C\" ~ '^[0-9a-f]{64}$' AND replacement_snapshot_id <> snapshot_id)", name="ck_mdi_replacement"),
+        Index("ix_mdi_snapshot_recorded_event", "snapshot_id", "recorded_at", "event_id"),
+        Index("ix_mdi_replacement", "replacement_snapshot_id"),
     )
 
 

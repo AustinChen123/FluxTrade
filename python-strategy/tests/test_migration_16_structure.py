@@ -29,11 +29,10 @@ def migration_sql(direction: str) -> str:
         getattr(module, direction)()
     return " ".join(output.getvalue().split())
 
-def test_revision_chain_has_one_new_head() -> None:
+def test_historical_revision_links_to_its_original_parent() -> None:
     config = Config()
     config.set_main_option("script_location", str(ROOT))
     script = ScriptDirectory.from_config(config)
-    assert script.get_heads() == [REVISION]
     revision = script.get_revision(REVISION)
     assert revision is not None and revision.down_revision == "4e8c1a2b7d90"
     assert re.fullmatch(r"[0-9a-f]{12}", REVISION)

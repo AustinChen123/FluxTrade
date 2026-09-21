@@ -8,15 +8,48 @@ from sqlalchemy.dialects.postgresql import JSONB, dialect
 from sqlalchemy.schema import CreateIndex, DefaultClause
 
 from src.core.market_data.profiles.orm import (
+    MarketDataInvalidation,
     VolumeProfileBin,
     VolumeProfileIngestJob,
     VolumeProfileSnapshot,
 )
 from src.core.orm_models import Base
 from test_migration_16_structure import migration_sql
+from test_migration_17_structure import migration_sql as invalidation_sql
 
 def normalized(value: str) -> str:
     return re.sub(r"\s+", " ", value).replace("( ", "(").replace(" )", ")").strip()
+
+
+def test_invalidation_metadata_exact_migration_parity() -> None:
+    table = cast(Table, MarketDataInvalidation.__table__)
+    sql = normalized(invalidation_sql("upgrade"))
+    body = sql.split("CREATE TABLE market_data_invalidation (", 1)[1].split(";", 1)[0]
+    assert Base.metadata.tables[table.name] is table and not inspect(MarketDataInvalidation).relationships
+    columns = re.findall(r"\b(\w+) (VARCHAR\(\d+\)|TIMESTAMPTZ)", body)
+    assert set(table.c.keys()) == {name for name, _ in columns}
+    for name, kind in columns:
+        column = table.c[name]
+        compiled = str(column.type.compile(dialect=dialect()))
+        expected = 'VARCHAR(128) COLLATE "C"' if name == "event_id" else kind.replace("TIMESTAMPTZ", "TIMESTAMP WITH TIME ZONE")
+        assert compiled == expected
+        assert column.nullable == (name == "replacement_snapshot_id") and column.default is None
+        if name == "recorded_at":
+            assert str(cast(DefaultClause, column.server_default).arg) == "date_trunc('milliseconds', clock_timestamp())"
+        else:
+            assert column.server_default is None
+    expected_pk = re.findall(r'(\w+) VARCHAR\(128\) COLLATE "C" NOT NULL PRIMARY KEY', body)
+    assert list(table.primary_key.columns.keys()) == expected_pk == ["event_id"]
+    expected_fk = set(re.findall(r"(\w+) VARCHAR\(64\)(?: NOT NULL)? REFERENCES (\w+)\((\w+)\) ON DELETE (\w+)", body))
+    assert {(fk.parent.name, *fk.target_fullname.split("."), fk.ondelete) for fk in table.foreign_keys} == expected_fk
+    checks = [c for c in table.constraints if isinstance(c, CheckConstraint)]
+    assert {c.name for c in checks} == set(re.findall(r"CONSTRAINT (\w+) CHECK", body))
+    for constraint in checks:
+        assert f"CONSTRAINT {constraint.name} CHECK ({normalized(str(constraint.sqltext))})" in body
+    assert not any(isinstance(c, UniqueConstraint) for c in table.constraints)
+    assert {i.name for i in table.indexes} == set(re.findall(r"CREATE INDEX (\w+) ON market_data_invalidation", sql))
+    for index in table.indexes:
+        assert normalized(str(CreateIndex(index).compile(dialect=dialect()))) in sql
 
 def test_profile_metadata_matches_committed_postgresql_migration() -> None:
     sql = normalized(migration_sql("upgrade"))
