@@ -32,7 +32,7 @@ import time
 from collections.abc import Iterator
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import replace
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 from threading import Barrier, Event
 from typing import Any
@@ -44,6 +44,7 @@ from sqlalchemy.engine import Engine
 from sqlalchemy.exc import DBAPIError, IntegrityError
 from sqlalchemy.orm import Session, sessionmaker
 from src.core.database_url import build_postgres_url
+from src.core.market_data.profiles import jobs as profile_jobs
 from src.core.market_data.profiles import repository as profile_repository
 from src.core.market_data.profiles.publication import CanonicalJsonObject, VerifiedProfilePublication
 from src.core.market_data.profiles.types import ProfileBin, VolumeProfileContent
@@ -412,6 +413,171 @@ def test_profile_repository_uncommitted_partial_is_invisible(
         published = future.result(timeout=20)
     assert repo.get_verified(published.snapshot_id) == replace(published, already_present=True)
     assert _profile_counts(profile_repository_pg) == (1, 2)
+
+
+def _job_store(engine: Engine) -> profile_jobs.ProfileIngestJobStore:
+    return profile_jobs.ProfileIngestJobStore(sessionmaker(engine))
+
+
+def _job_spec(job_id: str = "job") -> profile_jobs.JobSpec:
+    return profile_jobs.JobSpec(job_id, "BINANCE:BTCUSDT-SPOT", 0, 86400000, "g1", "vp-v1", "a" * 64)
+
+
+def _job_row(engine: Engine, job_id: str = "job") -> dict[str, Any]:
+    with engine.connect() as conn:
+        return dict(conn.execute(text("SELECT * FROM volume_profile_ingest_job WHERE id=:id"),
+                                 {"id": job_id}).mappings().one())
+
+
+def test_profile_job_register_checkpoint_retry_fail_and_isolation(profile_repository_pg: Engine) -> None:
+    engine, duration = profile_repository_pg, timedelta(minutes=5)
+    store, spec = _job_store(engine), _job_spec()
+    observed: list[str] = []
+
+    def observe(conn: sa.Connection, cursor: Any, statement: str,
+                parameters: Any, context: Any, executemany: bool) -> None:
+        if "volume_profile_ingest_job" in statement and (statement.startswith("INSERT") or "FOR UPDATE" in statement):
+            with cursor.connection.cursor() as probe:
+                probe.execute("SHOW transaction_isolation")
+                observed.append(probe.fetchone()[0])
+
+    event.listen(engine, "before_cursor_execute", observe)
+    try:
+        initial = store.register(spec)
+        assert initial.status == "RETRYABLE" and initial.attempt == 0
+        assert store.register(spec) == initial
+        with pytest.raises(profile_jobs.JobConflict):
+            store.register(replace(spec, config_sha256="b" * 64))
+        with engine.connect() as conn:
+            assert conn.get_isolation_level() == "REPEATABLE READ"
+            before = conn.execute(text("SELECT clock_timestamp()")).scalar_one()
+        claim = store.claim_next("worker", duration)
+        assert claim is not None and claim.attempt == 1 and claim.lease_expires_at.tzinfo is timezone.utc
+        assert claim.lease_expires_at >= before + duration
+        cursor, manifest = CanonicalJsonObject({"id": 17}), CanonicalJsonObject({"pages": [{"sha": "x"}]})
+        updated = store.checkpoint(claim, cursor, manifest, duration)
+        assert updated.lease_expires_at >= claim.lease_expires_at
+        assert updated.source_cursor == cursor and updated.progress_manifest == manifest
+        before_register = _job_row(engine)
+        store.register(spec)
+        assert _job_row(engine) == before_register
+        retry = store.retry(updated, timedelta(hours=1), "RETRY", "bounded detail")
+        assert retry.status == "RETRYABLE" and retry.lease_owner is retry.lease_expires_at is None
+        assert store.claim_next("worker", duration) is None
+        with engine.begin() as conn:
+            conn.execute(text("UPDATE volume_profile_ingest_job SET retry_after_at=clock_timestamp()-interval '1 second'"))
+        again = store.claim_next("worker", duration)
+        assert again is not None and again.attempt == 2 and again.source_cursor == cursor
+        assert store.fail(again, "FAILED", "bounded detail").status == "FAILED"
+        assert store.claim_next("worker", duration) is None
+    finally:
+        event.remove(engine, "before_cursor_execute", observe)
+    assert observed and set(observed) == {"read committed"}
+
+
+def test_profile_job_skip_locked_uses_second_without_waiting_for_first(profile_repository_pg: Engine) -> None:
+    engine, store = profile_repository_pg, _job_store(profile_repository_pg)
+    store.register(_job_spec("first"))
+    store.register(_job_spec("second"))
+
+    def worker() -> profile_jobs.JobClaim | None:
+        with engine.connect() as conn:
+            conn.execute(text("SET SESSION statement_timeout = '2s'"))
+            conn.commit()
+            return profile_jobs.ProfileIngestJobStore(sessionmaker(bind=conn)).claim_next("worker", timedelta(minutes=5))
+
+    with engine.begin() as locked:
+        locked.execute(text("SELECT id FROM volume_profile_ingest_job WHERE id='first' FOR UPDATE")).one()
+        with ThreadPoolExecutor(max_workers=1) as pool:
+            claim = pool.submit(worker).result(timeout=5)
+        assert claim is not None and claim.spec.id == "second"
+    first = store.claim_next("worker", timedelta(minutes=5))
+    assert first is not None and first.spec.id == "first"
+
+
+def test_profile_job_expired_takeover_fences_every_stale_mutation(profile_repository_pg: Engine) -> None:
+    engine, store = profile_repository_pg, _job_store(profile_repository_pg)
+    store.register(_job_spec())
+    first = store.claim_next("old", timedelta(minutes=5))
+    assert first is not None
+    cursor, manifest = CanonicalJsonObject({"id": 42}), CanonicalJsonObject({"page": 2})
+    first = store.checkpoint(first, cursor, manifest, timedelta(minutes=5))
+    with engine.begin() as conn:
+        conn.execute(text("UPDATE volume_profile_ingest_job SET lease_expires_at=clock_timestamp()-interval '1 second'"))
+    second = store.claim_next("new", timedelta(minutes=5))
+    assert second is not None and second.attempt == first.attempt + 1
+    assert second.source_cursor == cursor and second.progress_manifest == manifest
+    before = _job_row(engine)
+    for mutate in (
+        lambda: store.checkpoint(first, cursor, manifest, timedelta(minutes=5)),
+        lambda: store.retry(first, timedelta(0), "RETRY", "detail"),
+        lambda: store.fail(first, "FAILED", "detail"),
+        lambda: store.complete(first, "a" * 64),
+    ):
+        with pytest.raises(profile_jobs.LeaseLost):
+            mutate()
+        assert _job_row(engine) == before
+
+
+@pytest.mark.parametrize("phase", ["checkpoint", "fail", "complete"])
+def test_profile_job_post_update_reconstruction_failure_rolls_back(
+    profile_repository_pg: Engine, monkeypatch: pytest.MonkeyPatch, phase: str,
+) -> None:
+    engine, store = profile_repository_pg, _job_store(profile_repository_pg)
+    snapshot = profile_repository.ProfileRepository(sessionmaker(engine)).publish(_publication_pg())
+    store.register(_job_spec())
+    claim = store.claim_next("worker", timedelta(minutes=5))
+    assert claim is not None
+    before, reached = _job_row(engine), []
+    original = profile_jobs._state
+
+    def broken(row: sa.engine.RowMapping) -> profile_jobs.JobState:
+        state = original(row)
+        if row["status"] in ("FAILED", "DONE") or row["source_cursor"] == {"new": 1}:
+            reached.append(True)
+            raise profile_jobs.JobIntegrityError("injected reconstruction failure")
+        return state
+
+    monkeypatch.setattr(profile_jobs, "_state", broken)
+    with pytest.raises(profile_jobs.JobIntegrityError, match="^injected reconstruction failure$"):
+        if phase == "checkpoint":
+            store.checkpoint(claim, CanonicalJsonObject({"new": 1}), CanonicalJsonObject({}), timedelta(minutes=5))
+        elif phase == "fail":
+            store.fail(claim, "FAILED", "detail")
+        else:
+            store.complete(claim, snapshot.snapshot_id)
+    assert reached == [True] and _job_row(engine) == before
+
+
+@pytest.mark.parametrize("case", ["valid", "window", "grid", "product", "algorithm", "partial", "missing", "corrupt"])
+def test_profile_job_verified_completion_identity_and_integrity(profile_repository_pg: Engine, case: str) -> None:
+    engine, store = profile_repository_pg, _job_store(profile_repository_pg)
+    snapshot = profile_repository.ProfileRepository(sessionmaker(engine)).publish(_publication_pg())
+    spec = _job_spec()
+    changes: dict[str, Any] = {
+        "window": {"window_start_ms": 86400000, "window_end_ms": 172800000},
+        "grid": {"grid_id": "other"}, "product": {"product_id": "BINANCE:ETHUSDT-PERP"},
+        "algorithm": {"algorithm_version": "vp-v2"},
+    }.get(case, {})
+    store.register(replace(spec, **changes))
+    claim = store.claim_next("worker", timedelta(minutes=5))
+    assert claim is not None
+    if case in ("partial", "corrupt"):
+        with engine.begin() as conn:
+            sql = ("UPDATE volume_profile_snapshot SET quality='PARTIAL', published_at=NULL" if case == "partial"
+                   else "UPDATE volume_profile_bin SET base_volume=base_volume+1")
+            conn.execute(text(sql))
+    before = _job_row(engine)
+    if case != "valid":
+        with pytest.raises(profile_jobs.JobCompletionError, match="^job completion verification failed$"):
+            store.complete(claim, "f" * 64 if case == "missing" else snapshot.snapshot_id)
+        assert _job_row(engine) == before
+    else:
+        done = store.complete(claim, snapshot.snapshot_id)
+        assert done.status == "DONE" and done.completed_snapshot_id == snapshot.snapshot_id
+        assert done.lease_owner is done.lease_expires_at is done.retry_after_at is None
+        assert done.last_error_code is done.last_error_detail is None
+        assert store.get(spec.id) == done
 
 
 def _downgrade(db_name: str, target: str = "base") -> None:
