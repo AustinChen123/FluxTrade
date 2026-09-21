@@ -44,7 +44,7 @@ import pytest
 import sqlalchemy as sa
 from sqlalchemy import event, text
 from sqlalchemy.engine import Engine, make_url
-from sqlalchemy.exc import DBAPIError, IntegrityError
+from sqlalchemy.exc import DBAPIError, IntegrityError, TimeoutError as PoolTimeoutError
 from sqlalchemy.orm import Session, sessionmaker
 from src.core.database_url import build_postgres_url
 from src.core.market_data.profiles import jobs as profile_jobs
@@ -461,6 +461,92 @@ def test_profile_reader_pg_repeatable_read_excludes_mid_read_invalidation(
         finally:
             event.remove(engine, "after_cursor_execute", after_header)
     assert injected == [True] and settings == [("repeatable read", "on", "UTC")]
+
+
+def test_profile_reader_pg_connection_settings_read_only_and_new_call_recovery(profile_repository_pg: Engine, fresh_pg_db: str) -> None:
+    value = _publication_pg()
+    published = profile_repository.ProfileRepository(sessionmaker(profile_repository_pg)).publish(value)
+    with _profile_reader_pg(fresh_pg_db) as (reader, _):
+        with pytest.raises(DBAPIError) as caught:
+            with reader._transaction() as session:
+                settings = session.execute(text("SELECT current_setting('transaction_isolation'),current_setting('transaction_read_only'),"
+                    "current_setting('TimeZone'),current_setting('lock_timeout'),current_setting('statement_timeout')")).one()
+                assert settings == ("repeatable read", "on", "UTC", "250ms", "1500ms")
+                driver: Any = session.connection().connection.driver_connection
+                # Inspect only the timeout field; never retain or print the complete DSN.
+                assert driver.get_dsn_parameters()["connect_timeout"] == "2"
+                session.execute(text("INSERT INTO market_data_invalidation(event_id,snapshot_id,reason_code,source) "
+                                     "VALUES ('readonly_probe',:id,'BAD_DATA','acceptance')"), {"id": published.snapshot_id})
+        assert getattr(caught.value.orig, "pgcode", None) == "25006"
+        recovered = reader.get_verified(published.snapshot_id)
+        assert recovered is not None and recovered.publication == value and recovered.invalidations == ()
+
+
+def test_profile_reader_pg_pool_saturation_and_fresh_session_recovery(profile_repository_pg: Engine, fresh_pg_db: str) -> None:
+    # The migrated fixture owns the isolated database; the tested pool is independent.
+    assert profile_repository_pg is not None
+    owner = ProfileReadConnection(ProfileReadConnectionConfig(make_url(_target_url(fresh_pg_db))))
+    try:
+        with owner.sessions() as first, owner.sessions() as second:
+            first_pid = first.execute(text("SELECT pg_backend_pid()")).scalar_one()
+            second_pid = second.execute(text("SELECT pg_backend_pid()")).scalar_one()
+            assert type(first_pid) is int and type(second_pid) is int and first_pid != second_pid
+            started = time.monotonic()
+            with pytest.raises(PoolTimeoutError) as caught:
+                with owner.sessions() as third:
+                    third.execute(text("SELECT pg_backend_pid()"))
+            assert type(caught.value) is PoolTimeoutError
+            assert 0.15 <= time.monotonic() - started < 5  # Pool wait only, not an E2E SLA.
+        with owner.sessions() as fresh:
+            assert fresh.execute(text("SELECT pg_backend_pid()")).scalar_one() in (first_pid, second_pid)
+    finally:
+        owner.close()
+
+
+def test_profile_reader_pg_lock_timeout_no_retry_then_new_public_call(profile_repository_pg: Engine, fresh_pg_db: str) -> None:
+    value = _publication_pg()
+    published = profile_repository.ProfileRepository(sessionmaker(profile_repository_pg)).publish(value)
+    blocked = []
+
+    def capture(_conn: Any, _cursor: Any, statement: str, _params: Any, _context: Any, _many: bool) -> None:
+        if "FROM volume_profile_snapshot" in statement and " AS source_manifest_bytes" in statement:
+            blocked.append(True)
+
+    with _profile_reader_pg(fresh_pg_db) as (reader, engine):
+        event.listen(engine, "before_cursor_execute", capture)
+        try:
+            with profile_repository_pg.connect() as holder:
+                try:
+                    holder.execute(text("SET LOCAL statement_timeout='3000ms'"))
+                    holder.execute(text("LOCK TABLE volume_profile_snapshot IN ACCESS EXCLUSIVE MODE"))
+                    started = time.monotonic()
+                    with pytest.raises(DBAPIError) as caught:
+                        reader.get_verified(published.snapshot_id)
+                    assert getattr(caught.value.orig, "pgcode", None) == "55P03"
+                    assert 0.15 <= time.monotonic() - started < 5
+                    assert blocked == [True]
+                finally:
+                    holder.rollback()
+        finally:
+            event.remove(engine, "before_cursor_execute", capture)
+        recovered = reader.get_verified(published.snapshot_id)  # Explicit new call, not automatic retry.
+        assert recovered is not None and recovered.publication == value
+
+
+def test_profile_reader_pg_statement_timeout_then_new_public_call(profile_repository_pg: Engine, fresh_pg_db: str) -> None:
+    value = _publication_pg()
+    published = profile_repository.ProfileRepository(sessionmaker(profile_repository_pg)).publish(value)
+    with _profile_reader_pg(fresh_pg_db) as (reader, _):
+        started: float | None = None  # Duration measurement only; no financial arithmetic.
+        with pytest.raises(DBAPIError) as caught:
+            with reader._transaction() as session:
+                started = time.monotonic()
+                session.execute(text("SELECT pg_sleep(2)"))
+        assert getattr(caught.value.orig, "pgcode", None) == "57014"
+        assert started is not None
+        assert 1.2 <= time.monotonic() - started < 5  # Statement cancellation, not an E2E SLA.
+        recovered = reader.get_verified(published.snapshot_id)
+        assert recovered is not None and recovered.publication == value
 
 
 def test_profile_repository_exact_roundtrip_idempotency_and_revisions(profile_repository_pg: Engine) -> None:
