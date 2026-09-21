@@ -6,6 +6,11 @@ from typing import Literal
 from .publication import VerifiedProfilePublication
 from .read_types import DailyProfileRef, OrderedProfileManifest, ProfileInvalidation
 
+
+class ProfileReadTooLarge(ValueError):
+    """A reader bound was exceeded; no partial result is returned."""
+
+
 MAX_CANDIDATES = 1000
 MAX_MANIFEST_DAYS = 90
 MAX_BINS = 100000

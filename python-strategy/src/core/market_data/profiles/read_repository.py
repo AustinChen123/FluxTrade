@@ -15,6 +15,7 @@ from sqlalchemy.sql import ColumnElement
 from .invalidation import _event
 from .orm import MarketDataInvalidation, VolumeProfileBin, VolumeProfileSnapshot
 from .read_results import CANDIDATE_ACCOUNTING_BYTES, MAX_CANDIDATES, MAX_MANIFEST_DAYS, MAX_OPERATION_BYTES, ProfileCandidate
+from .read_results import ProfileReadTooLarge as ProfileReadTooLarge
 from .read_results import (
     BIN_ACCOUNTING_BYTES, EVENT_ACCOUNTING_BYTES, HEADER_ACCOUNTING_BYTES, MAX_BINS,
     MAX_INVALIDATIONS_PER_OPERATION, MAX_INVALIDATIONS_PER_SNAPSHOT, MAX_METADATA_TEXT_BYTES,
@@ -28,10 +29,6 @@ _INVALIDATION = cast(Table, MarketDataInvalidation.__table__)
 _BIN = cast(Table, VolumeProfileBin.__table__)
 _METADATA = ("source_manifest", "reconciliation")
 _NUMERIC = ("bin_origin", "bin_step", "base_volume", "quote_volume")
-
-
-class ProfileReadTooLarge(ValueError):
-    """A reader bound was exceeded; no partial result is returned."""
 
 
 def _timestamp_projection(name: str, *, nullable: bool = False, table: Table = _SNAPSHOT):

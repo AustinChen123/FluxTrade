@@ -12,7 +12,7 @@ from .live_selection import (
     LiveSelectionContext,
     select_live_profile,
 )
-from .read_results import ProfileCandidate, VerifiedManifestRead
+from .read_results import ProfileCandidate, ProfileReadTooLarge, VerifiedManifestRead
 from .read_types import OrderedProfileManifest, ProfileQueryRequest
 from .selection import ProfileCandidateBatch, ProfileSelectionError
 
@@ -104,14 +104,19 @@ def query_live_profile(
             raise ProfileQueryError("INVALID") from None
     except (InvalidProfileGrid, UnsupportedProfileGrid):
         raise ProfileQueryError("INVALID") from None
-    rows = provider.list_candidates(
-        product_id=request.product_id,
-        base_grid_id=request.base_grid_id,
-        algorithm_version=request.algorithm_version,
-        start_ms=request.start_ms,
-        end_ms=request.end_ms,
-        revision=request.revision,
-    )
+    try:
+        rows = provider.list_candidates(
+            product_id=request.product_id,
+            base_grid_id=request.base_grid_id,
+            algorithm_version=request.algorithm_version,
+            start_ms=request.start_ms,
+            end_ms=request.end_ms,
+            revision=request.revision,
+        )
+    except ProfileReadTooLarge as error:
+        if type(error) is not ProfileReadTooLarge:
+            raise
+        return LiveProfileQueryUnavailable("QUERY_TOO_LARGE")
     try:
         batch = ProfileCandidateBatch(
             request.product_id, request.base_grid_id, request.algorithm_version, rows
@@ -121,7 +126,12 @@ def query_live_profile(
         raise ProfileQueryError("INTEGRITY") from None
     if isinstance(selection, LiveProfileSelectionUnavailable):
         return LiveProfileQueryUnavailable(selection.reason)
-    read = provider.get_manifest(selection.manifest)
+    try:
+        read = provider.get_manifest(selection.manifest)
+    except ProfileReadTooLarge as error:
+        if type(error) is not ProfileReadTooLarge:
+            raise
+        return LiveProfileQueryUnavailable("QUERY_TOO_LARGE")
     if read is None:
         return LiveProfileQueryUnavailable("NOT_READY")
     if type(read) is not VerifiedManifestRead or read.manifest != selection.manifest:
