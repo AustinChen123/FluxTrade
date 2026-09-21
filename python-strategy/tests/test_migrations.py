@@ -43,7 +43,7 @@ from typing import Any
 import pytest
 import sqlalchemy as sa
 from sqlalchemy import event, text
-from sqlalchemy.engine import Engine
+from sqlalchemy.engine import Engine, make_url
 from sqlalchemy.exc import DBAPIError, IntegrityError
 from sqlalchemy.orm import Session, sessionmaker
 from src.core.database_url import build_postgres_url
@@ -53,6 +53,9 @@ from src.core.market_data.profiles import repository as profile_repository
 from src.core.market_data.profiles.handoff import parse_handoff
 from src.core.market_data.profiles.ingest import ProfileIngestProcess
 from src.core.market_data.profiles.publication import CanonicalJsonObject, VerifiedProfilePublication
+from src.core.market_data.profiles.read_connection import ProfileReadConnection, ProfileReadConnectionConfig
+from src.core.market_data.profiles.read_repository import ProfileReadRepository, ProfileReadTooLarge
+from src.core.market_data.profiles.read_types import DailyProfileRef, OrderedProfileManifest
 from src.core.market_data.profiles.types import ProfileBin, VolumeProfileContent
 
 # Alembic is imported lazily inside tests so that import-time failures do not
@@ -302,6 +305,162 @@ def _profile_counts(engine: Engine) -> tuple[int, int]:
     with engine.connect() as conn:
         return (conn.execute(text("SELECT count(*) FROM volume_profile_snapshot")).scalar_one(),
                 conn.execute(text("SELECT count(*) FROM volume_profile_bin")).scalar_one())
+
+
+@contextmanager
+def _profile_reader_pg(db_name: str) -> Iterator[tuple[ProfileReadRepository, Engine]]:
+    """Capture the actual lazy engine through a no-SQL session, not private state."""
+    owner = ProfileReadConnection(ProfileReadConnectionConfig(make_url(_target_url(db_name))))
+    try:
+        with owner.sessions() as session:
+            engine = session.get_bind()
+            assert isinstance(engine, Engine) and not session.in_transaction()
+        yield ProfileReadRepository(owner.sessions), engine
+    finally:
+        owner.close()
+
+
+def _profile_reader_seed(engine: Engine, *, with_events: bool = True):
+    repo = profile_repository.ProfileRepository(sessionmaker(engine))
+    invalidations = profile_invalidation.ProfileInvalidationStore(sessionmaker(engine))
+    original = _publication_pg()
+    values, published, expected_events = [], [], []
+    for day, bins in enumerate((original.content.bins, original.content.bins[:1], ())):
+        value = replace(original, content=replace(original.content, window_start_ms=day * 86400000,
+                                                 window_end_ms=(day + 1) * 86400000, bins=bins))
+        result = repo.publish(value)
+        values.append(value)
+        published.append(result)
+        expected_events.append(tuple(invalidations.append_confirmed(profile_invalidation.ConfirmedInvalidationRequest(
+            f"read_{day}_{number}", result.snapshot_id, "BAD_DATA", None, "acceptance")).event
+            for number in range(len(bins) if with_events else 0)))
+    manifest = OrderedProfileManifest(original.content.product_id, original.content.grid_id, original.content.algorithm_version,
+        tuple(DailyProfileRef(result.snapshot_id, result.revision, result.content_sha256,
+                             value.content.window_start_ms, value.content.window_end_ms)
+              for result, value in zip(published, values)))
+    return values, published, expected_events, manifest
+
+
+def test_profile_reader_pg_exact_daily_batch_content_and_revocations(profile_repository_pg: Engine, fresh_pg_db: str) -> None:
+    values, published, events, manifest = _profile_reader_seed(profile_repository_pg)
+    with _profile_reader_pg(fresh_pg_db) as (reader, _):
+        batch = reader.get_manifest(manifest)
+        assert batch is not None and batch.manifest == manifest
+        assert tuple(day.ref for day in batch.days) == manifest.days
+        assert [len(day.publication.content.bins) for day in batch.days] == [2, 1, 0]
+        assert [len(day.invalidations) for day in batch.days] == [2, 1, 0]
+        for index, day in enumerate(batch.days):
+            assert day.publication == values[index]
+            assert day.invalidations == events[index]
+            assert day.computed_at == published[index].computed_at
+            assert day.published_at == published[index].published_at
+            assert all(event.snapshot_id == day.ref.snapshot_id for event in day.invalidations)
+            assert reader.get_verified(day.ref.snapshot_id) == day
+        assert batch.days[-1].publication.content.base_volume == Decimal("0")
+        assert batch.days[-1].publication.content.quote_volume == Decimal("0")
+
+
+@pytest.mark.parametrize("case", ["missing", "partial", "revision", "digest", "scope"])
+def test_profile_reader_pg_pinned_classification(profile_repository_pg: Engine, fresh_pg_db: str, case: str) -> None:
+    _, published, _, manifest = _profile_reader_seed(profile_repository_pg)
+    if case in ("missing", "revision", "digest"):
+        ref = manifest.days[1]
+        changed = replace(ref, **{"missing": {"snapshot_id": "f" * 64}, "revision": {"revision": 2},
+                                 "digest": {"content_sha256": "e" * 64}}[case])
+        manifest = replace(manifest, days=(manifest.days[0], changed, manifest.days[2]))
+    elif case == "scope":
+        manifest = replace(manifest, base_grid_id="other")
+    else:
+        with profile_repository_pg.begin() as conn:
+            conn.execute(text("UPDATE volume_profile_snapshot SET quality='PARTIAL',published_at=NULL WHERE id=:id"),
+                         {"id": published[1].snapshot_id})
+    with _profile_reader_pg(fresh_pg_db) as (reader, _):
+        if case in ("missing", "partial"):
+            assert reader.get_manifest(manifest) is None
+            assert reader.get_verified(manifest.days[1].snapshot_id) is None
+        else:
+            with pytest.raises(profile_repository.ProfileIntegrityError):
+                reader.get_manifest(manifest)
+
+
+@pytest.mark.parametrize("damage", ["numeric", "metadata", "computed_at", "published_at", "source_available_at"])
+def test_profile_reader_pg_guarded_header_stops_before_payload(profile_repository_pg: Engine, fresh_pg_db: str, damage: str) -> None:
+    result = profile_repository.ProfileRepository(sessionmaker(profile_repository_pg)).publish(_publication_pg())
+    with profile_repository_pg.begin() as conn:
+        if damage == "numeric":
+            conn.execute(text("UPDATE volume_profile_snapshot SET bin_origin=CAST(:value AS numeric) WHERE id=:id"),
+                         {"id": result.snapshot_id, "value": "1" + "0" * 80})
+        elif damage == "metadata":
+            conn.execute(text("UPDATE volume_profile_snapshot SET source_manifest=CAST(:value AS jsonb) WHERE id=:id"),
+                         {"id": result.snapshot_id, "value": json.dumps({"large": "x" * 131072})})
+        else:
+            # Current snapshot schema permits these timestamps; the reader must guard driver conversion.
+            assert damage in ("computed_at", "published_at", "source_available_at")
+            conn.execute(text(f"UPDATE volume_profile_snapshot SET {damage}='10000-01-01 00:00:00+00'::timestamptz WHERE id=:id"),
+                         {"id": result.snapshot_id})
+    statements = []
+
+    def capture(_conn: Any, _cursor: Any, statement: str, _params: Any, _context: Any, _many: bool) -> None:
+        if "FROM volume_profile_" in statement or "FROM market_data_invalidation" in statement:
+            statements.append(statement)
+
+    with _profile_reader_pg(fresh_pg_db) as (reader, engine):
+        event.listen(engine, "before_cursor_execute", capture)
+        try:
+            expected = ProfileReadTooLarge if damage in ("numeric", "metadata") else profile_repository.ProfileIntegrityError
+            with pytest.raises(expected):
+                reader.get_verified(result.snapshot_id)
+        finally:
+            event.remove(engine, "before_cursor_execute", capture)
+    assert len(statements) == 1 and " AS source_manifest_bytes" in statements[0]
+    assert "FROM volume_profile_snapshot" in statements[0]
+    assert "FROM volume_profile_bin" not in statements[0] and "market_data_invalidation" not in statements[0]
+
+
+@pytest.mark.parametrize("batch", [False, True], ids=["single_snapshot", "manifest"])
+def test_profile_reader_pg_repeatable_read_excludes_mid_read_invalidation(
+    profile_repository_pg: Engine, fresh_pg_db: str, batch: bool,
+) -> None:
+    values, published, prior_events, manifest = _profile_reader_seed(profile_repository_pg, with_events=batch)
+    target = published[1].snapshot_id
+    injected, settings = [], []
+
+    def after_header(_conn: Any, cursor: Any, statement: str, _params: Any, _context: Any, _many: bool) -> None:
+        if injected or " AS source_manifest_bytes" not in statement or "FROM volume_profile_snapshot" not in statement:
+            return
+        with cursor.connection.cursor() as probe:
+            probe.execute("SELECT current_setting('transaction_isolation'),current_setting('transaction_read_only'),current_setting('TimeZone')")
+            settings.append(probe.fetchone())
+        # Independent writer commit completes synchronously before the reader fetches its payload.
+        with profile_repository_pg.begin() as writer:
+            writer.execute(text("INSERT INTO market_data_invalidation(event_id,snapshot_id,reason_code,source) "
+                                "VALUES ('mid_read',:id,'BAD_DATA','acceptance')"), {"id": target})
+        injected.append(True)
+
+    with _profile_reader_pg(fresh_pg_db) as (reader, engine):
+        event.listen(engine, "after_cursor_execute", after_header)
+        try:
+            if batch:
+                before = reader.get_manifest(manifest)
+                assert before is not None
+                assert [day.invalidations for day in before.days] == prior_events
+                after = reader.get_manifest(manifest)
+                assert after is not None and tuple(day.ref for day in after.days) == manifest.days
+                assert [day.publication for day in after.days] == values
+                assert [len(day.invalidations) for day in after.days] == [2, 2, 0]
+                assert after.days[0] == before.days[0] and after.days[2] == before.days[2]
+                assert tuple(e for e in after.days[1].invalidations if e.event_id != "mid_read") == prior_events[1]
+                assert sum(e.event_id == "mid_read" and e.snapshot_id == target for e in after.days[1].invalidations) == 1
+            else:
+                before_day = reader.get_verified(target)
+                assert before_day is not None and before_day.invalidations == ()
+                after_day = reader.get_verified(target)
+                assert after_day is not None and after_day.publication == before_day.publication == values[1]
+                assert len(after_day.invalidations) == 1 and after_day.invalidations[0].event_id == "mid_read"
+                assert after_day.invalidations[0].snapshot_id == target
+        finally:
+            event.remove(engine, "after_cursor_execute", after_header)
+    assert injected == [True] and settings == [("repeatable read", "on", "UTC")]
 
 
 def test_profile_repository_exact_roundtrip_idempotency_and_revisions(profile_repository_pg: Engine) -> None:
