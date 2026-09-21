@@ -74,6 +74,7 @@ def _verify(
     quality: str = "VERIFIED",
     expected: VerifiedProfilePublication | None = None,
 ) -> VerifiedProfilePublication:
+    """Package-internal exact readback shared only by profile persistence owners."""
     bins = (
         session.execute(
             select(_BIN)

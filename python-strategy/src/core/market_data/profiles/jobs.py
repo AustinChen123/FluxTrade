@@ -14,11 +14,13 @@ from sqlalchemy.orm import Session
 
 from src.core.product_registry import validate_product_id
 
-from .orm import VolumeProfileIngestJob
+from .orm import VolumeProfileIngestJob, VolumeProfileSnapshot
 from .publication import CanonicalJsonObject
+from .repository import ProfileIntegrityError, _verify
 from .types import BIGINT_MAX, DAY_MS
 
 _JOB = cast(Table, VolumeProfileIngestJob.__table__)
+_SNAPSHOT = cast(Table, VolumeProfileSnapshot.__table__)
 
 
 class JobIntegrityError(ValueError):
@@ -27,6 +29,10 @@ class JobIntegrityError(ValueError):
 
 class JobConflict(ValueError):
     """The immutable specification differs for an existing job ID."""
+
+
+class JobCompletionError(ValueError):
+    """The snapshot cannot complete this job; no persistent mutation is accepted."""
 
 
 class LeaseLost(ValueError):
@@ -381,3 +387,21 @@ class ProfileIngestJobStore:
                 last_error_code=error_code,
                 last_error_detail=detail,
             )
+
+    def complete(self, claim: JobClaim, snapshot_id: str) -> JobState:
+        if type(snapshot_id) is not str or not re.fullmatch(r"[0-9a-f]{64}", snapshot_id):
+            raise ValueError("invalid completed snapshot ID")
+        with self._fenced(claim) as (session, now):
+            row = session.execute(select(_SNAPSHOT).where(_SNAPSHOT.c.id == snapshot_id)).mappings().one_or_none()
+            if row is None:
+                raise JobCompletionError("job completion verification failed")
+            try:
+                content = _verify(session, row).content
+            except ProfileIntegrityError:
+                raise JobCompletionError("job completion verification failed") from None
+            keys = ("product_id", "window_start_ms", "window_end_ms", "grid_id", "algorithm_version")
+            if any(getattr(content, key) != getattr(claim.spec, key) for key in keys):
+                raise JobCompletionError("job completion verification failed")
+            return self._save(session, claim, now, status="DONE", completed_snapshot_id=snapshot_id,
+                              lease_owner=None, lease_expires_at=None, retry_after_at=None,
+                              last_error_code=None, last_error_detail=None)
