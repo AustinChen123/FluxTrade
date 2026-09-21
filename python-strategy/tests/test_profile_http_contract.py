@@ -1,4 +1,4 @@
-from dataclasses import FrozenInstanceError
+from dataclasses import FrozenInstanceError, asdict
 from typing import Callable, cast
 from urllib.parse import urlencode
 
@@ -7,12 +7,13 @@ import pytest
 from src.control_plane import profile_http_contract as contract
 from src.core.market_data.profiles.live_query import (
     LiveProfileQueryUnavailable,
+    ProfileQueryError,
 )
 
 FIELDS = dict(
     product_id="BINANCE:BTCUSDT-SPOT",
     base_grid_id="btc_spot_usdt_10_v1",
-    output_grid_id="btc_spot_usdt_10_v1",
+    output_grid_id="btc_spot_usdt_100_v1",
     algorithm_version="vp-v1",
     start_ms="0",
     end_ms="86400000",
@@ -24,9 +25,32 @@ RAW = urlencode(FIELDS).encode()
 
 def test_valid_query_and_optional_revision() -> None:
     request = contract.parse_profile_query(RAW)
-    assert (request.start_ms, request.end_ms, request.revision) == (0, 86400000, None)
     assert (
-        request.product_id == FIELDS["product_id"] and request.purpose == "LIVE_QUERY"
+        request.product_id,
+        request.base_grid_id,
+        request.output_grid_id,
+        request.algorithm_version,
+        request.start_ms,
+        request.end_ms,
+        request.purpose,
+        request.freshness_policy_id,
+        request.availability_policy_id,
+        request.as_of_ms,
+        request.revision,
+        request.pinned_manifest,
+    ) == (
+        "BINANCE:BTCUSDT-SPOT",
+        "btc_spot_usdt_10_v1",
+        "btc_spot_usdt_100_v1",
+        "vp-v1",
+        0,
+        86400000,
+        "LIVE_QUERY",
+        "utc_complete_strict_v1",
+        None,
+        None,
+        None,
+        None,
     )
     assert contract.parse_profile_query(RAW + b"&revision=1").revision == 1
     assert (
@@ -68,6 +92,23 @@ def test_raw_adversarial(raw: object) -> None:
     assert contract.profile_http_error(caught.value) == contract.ProfileHttpError(
         400, "INVALID_REQUEST"
     )
+
+
+def test_raw_size_limit_precedes_decode(monkeypatch: pytest.MonkeyPatch) -> None:
+    original = contract._decode
+    calls: list[bytes] = []
+
+    def observe(value: bytes) -> str:
+        calls.append(value)
+        return original(value)
+
+    monkeypatch.setattr(contract, "_decode", observe)
+    with pytest.raises(contract.InvalidProfileHttpRequest):
+        contract.parse_profile_query(b"a=" + b"x" * 4095)
+    assert calls == []
+    with pytest.raises(contract.InvalidProfileHttpRequest):
+        contract.parse_profile_query(b"a=" + b"x" * 4094)
+    assert calls
 
 
 @pytest.mark.parametrize("field", list(FIELDS))
@@ -136,6 +177,27 @@ def test_domain_rejections(field: str, value: str) -> None:
         contract.parse_profile_query(urlencode(FIELDS | {field: value}).encode())
 
 
+def test_integer_and_window_boundary_handoff() -> None:
+    assert (
+        contract.parse_profile_query(
+            urlencode(FIELDS | {"revision": str((1 << 63) - 1)}).encode()
+        ).revision
+        == (1 << 63) - 1
+    )
+    assert (
+        contract.parse_profile_query(
+            urlencode(FIELDS | {"end_ms": str(90 * 86400000)}).encode()
+        ).end_ms
+        == 90 * 86400000
+    )
+    for values in (
+        FIELDS | {"end_ms": str(91 * 86400000)},
+        FIELDS | {"end_ms": str(2 * 86400000), "revision": "1"},
+    ):
+        with pytest.raises(contract.InvalidProfileHttpRequest):
+            contract.parse_profile_query(urlencode(values).encode())
+
+
 @pytest.mark.parametrize(
     "reason,status,code",
     [
@@ -151,3 +213,36 @@ def test_unavailable_mapping(reason: str, status: int, code: str) -> None:
     assert contract.profile_http_error(
         LiveProfileQueryUnavailable(reason)
     ) == contract.ProfileHttpError(status, code)
+
+
+@pytest.mark.parametrize(
+    "error,status,code",
+    [
+        (ProfileQueryError("INVALID"), 400, "INVALID_REQUEST"),
+        (ProfileQueryError("INTEGRITY"), 503, "BACKEND_UNAVAILABLE"),
+        (RuntimeError("SECRET SQL/path/url"), 503, "BACKEND_UNAVAILABLE"),
+        (ValueError("SECRET"), 503, "BACKEND_UNAVAILABLE"),
+    ],
+)
+def test_exception_projection(error: Exception, status: int, code: str) -> None:
+    response = contract.profile_http_error(error)
+    assert asdict(response) == {"status": status, "code": code}
+    assert "SECRET" not in repr(response) and not hasattr(response, "__dict__")
+
+
+def test_exact_error_dto() -> None:
+    constructor = cast(Callable[..., object], contract.ProfileHttpError)
+    for status, code in (
+        (True, "INVALID_REQUEST"),
+        (400, "SECRET"),
+        (503, "INVALID_REQUEST"),
+        (400, type("Text", (str,), {})("INVALID_REQUEST")),
+    ):
+        with pytest.raises(ValueError):
+            constructor(status, code)
+    with pytest.raises(FrozenInstanceError):
+        setattr(contract.ProfileHttpError(400, "INVALID_REQUEST"), "code", "SECRET")
+    with pytest.raises(TypeError):
+        cast(Callable[..., object], contract.profile_http_error)(
+            KeyboardInterrupt("SECRET")
+        )
