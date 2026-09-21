@@ -1,12 +1,12 @@
 import os
 from logging.config import fileConfig
 
-from sqlalchemy import create_engine, make_url, pool
+from sqlalchemy import create_engine, pool
 
 from alembic import context
 from dotenv import load_dotenv
 
-from src.core.database_url import build_postgres_url
+from src.core.database_url import select_migration_url
 
 # Load .env file
 load_dotenv(os.path.join(os.path.dirname(__file__), '../../.env'))
@@ -15,21 +15,11 @@ load_dotenv(os.path.join(os.path.dirname(__file__), '../../.env'))
 # access to the values within the .ini file in use.
 config = context.config
 
-configured_url = config.get_main_option('sqlalchemy.url')
-postgres_settings_present = any(
-    os.getenv(name)
-    for name in (
-        "POSTGRES_USER",
-        "POSTGRES_PASSWORD",
-        "POSTGRES_HOST",
-        "POSTGRES_PORT",
-        "POSTGRES_DB",
-    )
+db_url = select_migration_url(
+    config.get_main_option('sqlalchemy.url'),
+    os.environ,
+    config.attributes.get("expected_isolated_database"),
 )
-if postgres_settings_present:
-    db_url = build_postgres_url(os.environ)
-else:
-    db_url = make_url(configured_url)
 
 # Interpret the config file for Python logging.
 # This line sets up loggers basically.

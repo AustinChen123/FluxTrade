@@ -38,6 +38,7 @@ import sqlalchemy as sa
 from sqlalchemy import text
 from sqlalchemy.engine import Engine
 from sqlalchemy.exc import DBAPIError, IntegrityError
+from src.core.database_url import build_postgres_url
 
 # Alembic is imported lazily inside tests so that import-time failures do not
 # break collection on environments where alembic is missing.
@@ -61,20 +62,19 @@ if os.getenv("FLUXTRADE_RUN_POSTGRES_MIGRATION_TESTS") != "1":
 
 
 def _admin_url() -> str:
-    user = os.getenv("POSTGRES_USER", "fluxtrade")
-    password = os.getenv("POSTGRES_PASSWORD", "fluxtrade")
-    host = os.getenv("POSTGRES_HOST", "localhost")
-    port = os.getenv("POSTGRES_PORT", "5432")
     # Connect to the maintenance ``postgres`` database for CREATE/DROP DATABASE.
-    return f"postgresql+psycopg2://{user}:{password}@{host}:{port}/postgres"
+    return _target_url("postgres")
 
 
 def _target_url(db_name: str) -> str:
-    user = os.getenv("POSTGRES_USER", "fluxtrade")
-    password = os.getenv("POSTGRES_PASSWORD", "fluxtrade")
-    host = os.getenv("POSTGRES_HOST", "localhost")
-    port = os.getenv("POSTGRES_PORT", "5432")
-    return f"postgresql+psycopg2://{user}:{password}@{host}:{port}/{db_name}"
+    url = build_postgres_url({
+        "POSTGRES_USER": os.getenv("POSTGRES_USER", "fluxtrade"),
+        "POSTGRES_PASSWORD": os.getenv("POSTGRES_PASSWORD", "fluxtrade"),
+        "POSTGRES_HOST": os.getenv("POSTGRES_HOST", "localhost"),
+        "POSTGRES_PORT": os.getenv("POSTGRES_PORT", "5432"),
+        "POSTGRES_DB": db_name,
+    })
+    return url.set(drivername="postgresql+psycopg2").render_as_string(hide_password=False)
 
 
 def _pg_reachable() -> bool:
@@ -140,7 +140,8 @@ def _alembic_config(db_name: str):
     cfg = Config(ALEMBIC_INI)
     # ``script_location`` in alembic.ini uses %(here)s, which Alembic resolves
     # against the .ini file's directory — no extra fix-up needed.
-    cfg.set_main_option("sqlalchemy.url", _target_url(db_name))
+    cfg.set_main_option("sqlalchemy.url", _target_url(db_name).replace("%", "%%"))
+    cfg.attributes["expected_isolated_database"] = db_name
     return cfg
 
 
