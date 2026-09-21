@@ -159,3 +159,46 @@ def test_wrong_decision_is_integrity(monkeypatch: pytest.MonkeyPatch) -> None:
         owner.validate_live_profile(
             provider, request, utc_ms=lambda: start, monotonic_ms=lambda: 0
         )
+
+
+def test_success_evidence_exact_constructor(monkeypatch: pytest.MonkeyPatch) -> None:
+    _, _, original, _, start = fixture(monkeypatch)
+    constructor = cast(Callable[..., object], owner.ValidatedLiveProfileQuery)
+    exact = owner.ValidatedLiveProfileQuery(original, start, start, 0)
+    assert exact.validation_expires_at_ms == start + 300000
+    conservative = owner.ValidatedLiveProfileQuery(original, start, start + 1, 2)
+    assert conservative.validation_elapsed_ms == 2
+    derived = type("QuerySubclass", (owner.LiveProfileQueryResult,), {})(
+        original.selection, original.profile
+    )
+    wrong_decision = replace(
+        original, selection=replace(original.selection, decision_time_ms=start + 1)
+    )
+    invalid = (
+        (True, start, start, 0),
+        (derived, start, start, 0),
+        (wrong_decision, start, start, 0),
+        (original, True, start, 0),
+        (original, -1, start, 0),
+        (original, start, start - 1, 0),
+        (original, start, start + 2, 1),
+        (original, start, start, 300000),
+        (original, start, start, type("Integer", (int,), {})(0)),
+    )
+    for values in invalid:
+        with pytest.raises(owner.ProfileQueryError, match="^PROFILE_QUERY_INTEGRITY$"):
+            constructor(*values)
+    with pytest.raises(owner.ProfileQueryError, match="^PROFILE_QUERY_INTEGRITY$"):
+        replace(exact, validation_elapsed_ms=300000)
+    monkeypatch.setattr(owner, "_MAX", start + 299999)
+    with pytest.raises(owner.ProfileQueryError, match="^PROFILE_QUERY_INTEGRITY$"):
+        constructor(original, start, start, 0)
+
+
+def test_unavailable_exact_constructor() -> None:
+    constructor = cast(Callable[..., object], owner.LiveProfileValidationUnavailable)
+    for value in (True, "SECRET", type("Text", (str,), {})("CLOCK_UNCERTAIN")):
+        with pytest.raises(ValueError, match="^invalid validation reason$"):
+            constructor(value)
+    for reason in ("CLOCK_UNCERTAIN", "VALIDATION_EXPIRED"):
+        assert owner.LiveProfileValidationUnavailable(reason).reason == reason
