@@ -18,6 +18,11 @@ fn fluxtrade_core(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<binding::models::Position>()?;
     m.add_class::<binding::scaled::ScaledCandlestick>()?;
     m.add_class::<binding::aggregator::PyCandleAggregator>()?;
+    m.add_class::<binding::volume_profile::VolumeProfileMergeResult>()?;
+    m.add_function(wrap_pyfunction!(
+        binding::volume_profile::merge_volume_profiles,
+        m
+    )?)?;
 
     #[cfg(feature = "rithmic")]
     {
@@ -50,10 +55,21 @@ fn fluxtrade_core(m: &Bound<'_, PyModule>) -> PyResult<()> {
     Ok(())
 }
 
-#[cfg(all(test, feature = "rithmic"))]
+#[cfg(test)]
 mod tests {
     use super::*;
 
+    #[test]
+    fn volume_profile_python_surface_is_registered() {
+        Python::with_gil(|py| {
+            let module = PyModule::new(py, "fluxtrade_core").unwrap();
+            fluxtrade_core(&module).unwrap();
+            assert!(module.hasattr("VolumeProfileMergeResult").unwrap());
+            assert!(module.hasattr("merge_volume_profiles").unwrap());
+        });
+    }
+
+    #[cfg(feature = "rithmic")]
     #[test]
     fn rithmic_ledger_python_surface_is_registered() {
         Python::with_gil(|py| {
