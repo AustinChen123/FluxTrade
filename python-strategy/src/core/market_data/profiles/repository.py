@@ -2,7 +2,7 @@
 
 import hashlib
 import json
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from contextlib import AbstractContextManager
 from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
@@ -107,6 +107,17 @@ def _verify(
         .mappings()
         .all()
     )
+    return _verify_rows(row, bins, quality=quality, expected=expected)
+
+
+def _verify_rows(
+    row: RowMapping,
+    bins: Sequence[RowMapping],
+    *,
+    quality: str = "VERIFIED",
+    expected: VerifiedProfilePublication | None = None,
+) -> VerifiedProfilePublication:
+    """Package-internal exact reconstruction; no selection or database access."""
     try:
         content = VolumeProfileContent(
             row["product_id"],

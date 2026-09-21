@@ -1,19 +1,133 @@
 """Recording-session contracts only; PostgreSQL concurrency remains a separate gate."""
 
 from contextlib import nullcontext
-from dataclasses import replace
+import hashlib
+import json
+from dataclasses import asdict, replace
 from datetime import datetime, timezone
-from typing import Any
+from decimal import Decimal
+from typing import Any, cast
 from unittest.mock import MagicMock
 
 import pytest
+from sqlalchemy.dialects import postgresql
+from sqlalchemy.engine import RowMapping
 
+from src.core.market_data.profiles import repository
 from src.core.market_data.profiles.publication import CanonicalJsonObject
 from src.core.market_data.profiles.repository import (
     ProfileIntegrityError,
     ProfileRepository,
 )
 from test_profile_publication import publication
+
+
+def verified_rows() -> tuple[RowMapping, list[RowMapping]]:
+    value = publication()
+    content = value.content
+    now = datetime(2026, 1, 1, tzinfo=timezone.utc)
+    header = dict(**asdict(content), id=content.content_sha256, content_sha256=content.content_sha256,
+                  period="1d", timezone="UTC", revision=1, base_volume=content.base_volume,
+                  quote_volume=content.quote_volume, aggregate_count=content.aggregate_count,
+                  occupied_bins=content.occupied_bins, source_manifest={}, reconciliation={},
+                  source_available_at=None, availability_basis="OBSERVED", raw_retention_state="PRESENT",
+                  quality="VERIFIED", computed_at=now, published_at=now)
+    return cast(RowMapping, header), [cast(RowMapping, asdict(b)) for b in content.bins]
+
+
+def test_verify_queries_once_with_identity_order_and_delegates(monkeypatch: pytest.MonkeyPatch) -> None:
+    row, bins = verified_rows()
+    session = MagicMock()
+    session.execute.return_value.mappings.return_value.all.return_value = bins
+    delegate = MagicMock(return_value=publication())
+    monkeypatch.setattr(repository, "_verify_rows", delegate)
+    assert repository._verify(session, row, "PARTIAL", publication()) == publication()
+    session.execute.assert_called_once()
+    statement = session.execute.call_args.args[0].compile(dialect=postgresql.dialect())
+    assert "WHERE volume_profile_bin.snapshot_id = %(snapshot_id_1)s" in str(statement)
+    assert "ORDER BY volume_profile_bin.bin_index" in str(statement)
+    assert statement.params == {"snapshot_id_1": row["id"]}
+    delegate.assert_called_once_with(row, bins, quality="PARTIAL", expected=publication())
+
+
+@pytest.mark.parametrize("field,value", [
+    ("id", "a" * 64), ("content_sha256", "b" * 64), ("period", "1h"), ("timezone", "other"),
+    ("revision", True), ("revision", 0), ("revision", 1 << 63), ("base_volume", 3),
+    ("quote_volume", 35), ("base_volume", Decimal("4")), ("quote_volume", Decimal("36")),
+    ("aggregate_count", 99), ("occupied_bins", 99), ("quality", "PARTIAL"),
+    ("computed_at", None), ("published_at", None), ("source_available_at", datetime(2026, 1, 1)),
+    ("source_manifest", []), ("reconciliation", {"invalid": Decimal(1)}),
+    ("availability_basis", "other"), ("raw_retention_state", "other"),
+    ("product_id", "invalid"), ("window_end_ms", 1), ("bin_step", Decimal("NaN")),
+])
+def test_row_verifier_matches_session_verifier_for_corruption(field: str, value: Any) -> None:
+    row, bins = verified_rows()
+    cast(dict[str, Any], row)[field] = value
+    session = MagicMock()
+    session.execute.return_value.mappings.return_value.all.return_value = bins
+    for action in (lambda: repository._verify_rows(row, bins), lambda: repository._verify(session, row)):
+        with pytest.raises(ProfileIntegrityError, match="^profile integrity check failed$") as caught:
+            action()
+        assert type(caught.value) is ProfileIntegrityError
+
+
+@pytest.mark.parametrize("damage", ["missing", "reverse", "duplicate", "volume", "count", "metadata", "expected", "partial_published"])
+def test_bin_metadata_expected_and_quality_invariants_share_one_verifier(damage: str) -> None:
+    row, bins = verified_rows()
+    quality, expected = "VERIFIED", publication()
+    if damage == "missing":
+        bins.pop()
+    elif damage == "reverse":
+        bins.reverse()
+    elif damage == "duplicate":
+        bins.append(bins[-1])
+    elif damage in ("volume", "count"):
+        cast(dict[str, Any], bins[0])["base_volume" if damage == "volume" else "aggregate_count"] = 0
+    elif damage == "metadata":
+        cast(dict[str, Any], row)["source_manifest"] = {"changed": True}
+    elif damage == "expected":
+        expected = replace(expected, raw_retention_state="DELETED")
+    else:
+        quality = "PARTIAL"
+        cast(dict[str, Any], row)["quality"] = quality
+    session = MagicMock()
+    session.execute.return_value.mappings.return_value.all.return_value = bins
+    for action in (lambda: repository._verify_rows(row, bins, quality=quality, expected=expected),
+                   lambda: repository._verify(session, row, quality=quality, expected=expected)):
+        with pytest.raises(ProfileIntegrityError, match="^profile integrity check failed$"):
+            action()
+
+
+@pytest.mark.parametrize("quality", ["VERIFIED", "PARTIAL"])
+def test_valid_rows_and_session_verifiers_are_equivalent(quality: str) -> None:
+    row, bins = verified_rows()
+    cast(dict[str, Any], row)["quality"] = quality
+    if quality == "PARTIAL":
+        cast(dict[str, Any], row)["published_at"] = None
+    session = MagicMock()
+    session.execute.return_value.mappings.return_value.all.return_value = bins
+    assert repository._verify_rows(row, bins, quality=quality, expected=publication()) == publication()
+    assert repository._verify(session, row, quality=quality, expected=publication()) == publication()
+
+
+@pytest.mark.parametrize("duplicate", [False, True])
+def test_bin_order_rejection_is_not_masked_by_digest_or_expected_mismatch(duplicate: bool) -> None:
+    row, bins = verified_rows()
+    payload = json.loads(publication().content.content_bytes)
+    if duplicate:
+        cast(dict[str, Any], bins[1])["bin_index"] = bins[0]["bin_index"]
+        payload["bins"][1]["bin_index"] = payload["bins"][0]["bin_index"]
+    else:
+        bins.reverse()
+        payload["bins"].reverse()
+    digest = hashlib.sha256(json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+    cast(dict[str, Any], row).update(id=digest, content_sha256=digest)
+    session = MagicMock()
+    session.execute.return_value.mappings.return_value.all.return_value = bins
+    # Totals/counts and digest match these malformed-order rows; expected is deliberately absent.
+    for action in (lambda: repository._verify_rows(row, bins), lambda: repository._verify(session, row)):
+        with pytest.raises(ProfileIntegrityError):
+            action()
 
 
 def harness(corrupt: bool = False) -> tuple[ProfileRepository, MagicMock, list[str]]:
