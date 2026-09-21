@@ -7,7 +7,7 @@ from sqlalchemy import create_engine, event
 from sqlalchemy.orm import sessionmaker
 
 from src.core.models import StrategyStatus
-from src.core.orm_models import Base, Strategy, StrategyState
+from src.core.orm_models import Base, Strategy, StrategyState, StrategyStateTransition
 from src.core.strategy_artifact_discovery import (
     ArtifactLoadResult,
     synchronize_strategy_artifacts,
@@ -172,7 +172,9 @@ def test_new_artifact_creates_strategy_parent_before_lifecycle_transition(
         cursor.execute("PRAGMA foreign_keys=ON")
         cursor.close()
 
-    Base.metadata.create_all(engine)
+    Base.metadata.create_all(
+        engine, tables=[Strategy.__table__, StrategyState.__table__, StrategyStateTransition.__table__]
+    )
     session_factory = sessionmaker(bind=engine)
 
     synchronize_strategy_artifacts(
