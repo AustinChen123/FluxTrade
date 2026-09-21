@@ -49,6 +49,8 @@ pub enum Error {
     TradeScope,
     #[error("price and quantity must be positive")]
     TradeValue,
+    #[error("stored bins must be unique with positive volumes and count")]
+    BinValue,
     #[error("result cannot be represented exactly")]
     Arithmetic,
 }
@@ -161,6 +163,35 @@ impl VolumeProfile {
             bins: BTreeMap::new(),
             totals: Volume::default(),
         })
+    }
+
+    /// Rebuild exact stored bins in index order, without source-completeness claims.
+    /// Any valid half-open Window is allowed; this constructor is not daily-only.
+    pub fn from_bins(
+        product_id: impl Into<String>,
+        grid: Grid,
+        window: Window,
+        bins: impl IntoIterator<Item = (i64, Volume)>,
+    ) -> Result<Self> {
+        let mut result = Self::new(product_id, grid, window)?;
+        for (index, volume) in bins {
+            if result.bins.insert(index, volume).is_some() {
+                return Err(Error::BinValue);
+            }
+        }
+        for (&index, volume) in &result.bins {
+            if volume.base_volume <= Decimal::ZERO
+                || volume.quote_volume <= Decimal::ZERO
+                || volume.aggregate_count == 0
+            {
+                return Err(Error::BinValue);
+            }
+            result.grid.edges(index)?;
+        }
+        for volume in result.bins.values() {
+            result.totals = result.totals.add(volume)?;
+        }
+        Ok(result)
     }
 
     pub fn product_id(&self) -> &str {

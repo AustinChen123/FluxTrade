@@ -256,3 +256,139 @@ fn representable_edges_survive_out_of_range_intermediate_products() {
     assert_eq!(direct.add(SPOT, 100, high, dec!(1)), Err(Error::Arithmetic));
     assert_eq!(direct, before);
 }
+
+fn stored(base: Decimal, quote: Decimal, count: u64) -> Volume {
+    Volume {
+        base_volume: base,
+        quote_volume: quote,
+        aggregate_count: count,
+    }
+}
+
+fn from_stored(bins: impl IntoIterator<Item = (i64, Volume)>) -> Result<VolumeProfile> {
+    VolumeProfile::from_bins(SPOT, grid(dec!(10)), Window::new(100, 200).unwrap(), bins)
+}
+
+#[test]
+fn stored_bins_rebuild_direct_profile_and_ignore_iterator_order() {
+    let mut direct = profile(dec!(10));
+    for price in [dec!(11), dec!(21), dec!(31), dec!(31)] {
+        direct.add(SPOT, 100, price, dec!(1)).unwrap();
+    }
+    let bins: Vec<_> = direct.bins().iter().map(|(&i, v)| (i, v.clone())).collect();
+    let before = bins.clone();
+    assert_eq!(from_stored(bins.iter().cloned()).unwrap(), direct);
+    assert_eq!(from_stored(bins.iter().rev().cloned()).unwrap(), direct);
+    assert_eq!(bins, before);
+    assert_eq!(direct.poc().unwrap().unwrap().index, 3);
+    let empty = from_stored([]).unwrap();
+    assert_eq!(empty, profile(dec!(10)));
+    assert_eq!(empty.totals(), &Volume::default());
+    assert_eq!(empty.poc().unwrap(), None);
+    let tied = from_stored([
+        (9, stored(dec!(2), dec!(100), 1)),
+        (-1, stored(dec!(2.00), dec!(1), 2)),
+    ])
+    .unwrap();
+    assert_eq!(tied.poc().unwrap().unwrap().index, -1);
+    assert_eq!(tied.totals(), &stored(dec!(4), dec!(101), 3));
+    assert_eq!(
+        from_stored([(0, stored(dec!(1.00), dec!(2.0), 1))]),
+        from_stored([(0, stored(dec!(1), dec!(2), 1))])
+    );
+}
+
+#[test]
+fn stored_bins_reject_duplicate_nonpositive_and_invalid_identity() {
+    let valid = stored(dec!(1), dec!(1), 1);
+    for duplicate in [valid.clone(), stored(dec!(2), dec!(3), 4)] {
+        assert_eq!(
+            from_stored([(0, valid.clone()), (0, duplicate)]),
+            Err(Error::BinValue)
+        );
+    }
+    for invalid in [
+        stored(dec!(0), dec!(1), 1),
+        stored(dec!(-1), dec!(1), 1),
+        stored(dec!(1), dec!(0), 1),
+        stored(dec!(1), dec!(-1), 1),
+        stored(dec!(1), dec!(1), 0),
+        Volume::default(),
+    ] {
+        assert_eq!(from_stored([(0, invalid)]), Err(Error::BinValue));
+    }
+    assert_eq!(
+        VolumeProfile::from_bins(
+            "BINANCE:BTC/USDT-SPOT",
+            grid(dec!(10)),
+            Window::new(100, 200).unwrap(),
+            []
+        ),
+        Err(Error::Product)
+    );
+}
+
+#[test]
+fn stored_bins_validate_both_extreme_edges_without_intermediate_overflow() {
+    let window = Window::new(100, 200).unwrap();
+    let one = stored(dec!(1), dec!(1), 1);
+    for index in [i64::MIN, i64::MAX] {
+        let value =
+            VolumeProfile::from_bins(SPOT, grid(dec!(1)), window, [(index, one.clone())]).unwrap();
+        assert_eq!(value.poc().unwrap().unwrap().index, index);
+    }
+    let cancellation =
+        Grid::new(Decimal::MIN, dec!(47536897508558602556126370201), "USDT").unwrap();
+    assert!(
+        VolumeProfile::from_bins(SPOT, cancellation.clone(), window, [(2, one.clone())]).is_ok()
+    );
+    for (grid, index) in [
+        (cancellation, 3),
+        (Grid::new(Decimal::MAX, dec!(1), "USDT").unwrap(), 0),
+        (Grid::new(Decimal::MIN, dec!(1), "USDT").unwrap(), -1),
+    ] {
+        assert_eq!(
+            VolumeProfile::from_bins(SPOT, grid, window, [(index, one.clone())]),
+            Err(Error::Arithmetic)
+        );
+    }
+}
+
+#[test]
+fn stored_totals_reject_decimal_count_and_intermediate_overflow_deterministically() {
+    assert_eq!(
+        from_stored([(0, stored(Decimal::MAX, Decimal::MAX, u64::MAX))])
+            .unwrap()
+            .totals(),
+        &stored(Decimal::MAX, Decimal::MAX, u64::MAX)
+    );
+    for first in [
+        stored(Decimal::MAX, dec!(1), 1),
+        stored(dec!(1), Decimal::MAX, 1),
+        stored(dec!(1), dec!(1), u64::MAX),
+    ] {
+        let input = vec![(0, first), (1, stored(dec!(1), dec!(1), 1))];
+        let before = input.clone();
+        assert_eq!(from_stored(input.iter().cloned()), Err(Error::Arithmetic));
+        assert_eq!(
+            from_stored(input.iter().rev().cloned()),
+            Err(Error::Arithmetic)
+        );
+        assert_eq!(input, before);
+    }
+    let almost_max = stored(Decimal::MAX - dec!(1), dec!(1), 1);
+    let half = stored(dec!(0.5), dec!(1), 1);
+    // The final mathematical total is MAX, but the index-ordered prefix is unrepresentable.
+    let input = [
+        (0, almost_max.clone()),
+        (1, half.clone()),
+        (2, half.clone()),
+    ];
+    assert_eq!(from_stored(input.iter().cloned()), Err(Error::Arithmetic));
+    assert_eq!(
+        from_stored(input.iter().rev().cloned()),
+        Err(Error::Arithmetic)
+    );
+    let valid_order = from_stored([(0, half.clone()), (1, half), (2, almost_max)]).unwrap();
+    assert_eq!(valid_order.totals(), &stored(Decimal::MAX, dec!(3), 3));
+}
