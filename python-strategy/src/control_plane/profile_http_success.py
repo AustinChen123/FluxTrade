@@ -28,10 +28,11 @@ def encode_profile_success(
     days = profile.manifest.days
     poc = profile.poc
     payload = dict(
-        schema_version=1,
+        schema_version=2,
         data_kind="VOLUME_PROFILE",
         profile_kind="DAILY" if len(days) == 1 else "COMPOSITE",
         validation_basis="SERVER_PINNED_READ",
+        source_available_at_ms=evidence.query.selection.available_at_ms,
         product_id=profile.product_id,
         base_grid_id=profile.base_grid_id,
         output_grid_id=profile.output_grid.grid_id,

@@ -35,7 +35,8 @@ def test_identity_empty_and_deterministic_encoding(
         value, served_at_ms=served
     )
     body = json.loads(raw)
-    assert body["schema_version"] == 1 and body["data_kind"] == "VOLUME_PROFILE"
+    assert body["schema_version"] == 2 and body["data_kind"] == "VOLUME_PROFILE"
+    assert body["source_available_at_ms"] == value.query.selection.available_at_ms
     assert body["validation_basis"] == "SERVER_PINNED_READ" and "status" not in body
     assert body["profile_kind"] == ("DAILY" if daily else "COMPOSITE")
     assert (
@@ -93,6 +94,34 @@ def test_canonical_decimal_and_poc(monkeypatch: pytest.MonkeyPatch) -> None:
         dict(bin_index=-1, base_volume="1.2", quote_volume="12", aggregate_count=1)
     ]
     assert body["poc"] == dict(bin_index=-1, low="-10", high_exclusive="0")
+    assert body["source_available_at_ms"] == value.query.selection.available_at_ms
+
+
+@pytest.mark.parametrize("daily", [False, True])
+def test_source_availability_is_evidence_not_consumer_observation(monkeypatch, daily):
+    value = evidence(monkeypatch, daily=daily)
+    served = value.validation_completed_at_ms
+    changed = replace(
+        value,
+        query=replace(
+            value.query,
+            selection=replace(value.query.selection, available_at_ms=served + 1),
+        ),
+    )
+    assert changed.query.selection.available_at_ms > changed.validation_completed_at_ms
+    before = encoder.encode_profile_success(value, served_at_ms=served)
+    after = encoder.encode_profile_success(changed, served_at_ms=served)
+    assert type(before) is bytes and type(after) is bytes
+    original, updated = json.loads(before), json.loads(after)
+    assert updated.pop("source_available_at_ms") == served + 1
+    assert (
+        original.pop("source_available_at_ms") == value.query.selection.available_at_ms
+    )
+    assert original == updated
+    for invalid_served in (served - 1, value.validation_expires_at_ms):
+        assert encoder.encode_profile_success(
+            changed, served_at_ms=invalid_served
+        ) == encoder.ProfileHttpError(503, "BACKEND_UNAVAILABLE")
 
 
 def test_bin_and_actual_byte_limits(monkeypatch: pytest.MonkeyPatch) -> None:

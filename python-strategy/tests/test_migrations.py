@@ -343,7 +343,8 @@ def test_profile_authenticated_route_pg_native_end_to_end(profile_repository_pg:
         response = app.handle("GET", path, headers={"X-API-Key": "integration-key"})
         assert response.status_code == 200
         body = response.body
-        assert body["schema_version"] == 1 and body["data_kind"] == "VOLUME_PROFILE"
+        assert body["schema_version"] == 2 and body["data_kind"] == "VOLUME_PROFILE"
+        assert body["source_available_at_ms"] == day
         assert body["profile_kind"] == "DAILY" and body["validation_basis"] == "SERVER_PINNED_READ"
         assert (body["snapshot_id"], body["revision"], body["content_sha256"]) == (
             published.snapshot_id, published.revision, content.content_sha256)
