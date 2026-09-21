@@ -178,3 +178,56 @@ def test_import_has_no_external_owners() -> None:
         check=False,
     )
     assert result.returncode == 0, result.stderr
+
+
+@pytest.mark.parametrize("now", [DAY + 1, 2 * DAY - 1])
+def test_intra_day_decision_floors_to_completed_day(now: int) -> None:
+    request, batch, _ = setup()
+    selected = live.select_live_profile(request, batch, live.LiveSelectionContext(now))
+    assert isinstance(selected, live.LiveProfileSelection)
+    assert selected.manifest.days[-1].window_end_ms == DAY
+    assert selected.decision_time_ms == now
+
+
+@pytest.mark.parametrize("null_index", [0, 1])
+@pytest.mark.parametrize("other", ["missing", "revoked"])
+def test_null_integrity_precedes_unavailable(null_index: int, other: str) -> None:
+    request, batch, context = setup(2)
+    rows = [replace(batch.candidates[null_index], source_available_at=None)]
+    if other == "revoked":
+        rows.append(replace(batch.candidates[1 - null_index], revoked=True))
+    batch = replace(
+        batch, candidates=tuple(sorted(rows, key=lambda c: c.ref.window_start_ms))
+    )
+    with pytest.raises(ProfileSelectionError, match="^PROFILE_SELECTION_INVALID$"):
+        live.select_live_profile(request, batch, context)
+
+
+def test_output_hostile_constructor_matrix() -> None:
+    request, batch, context = setup()
+    selected = live.select_live_profile(request, batch, context)
+    assert isinstance(selected, live.LiveProfileSelection)
+    manifest = selected.manifest
+    derived = type("ManifestSubclass", (type(manifest),), {})(
+        manifest.product_id,
+        manifest.base_grid_id,
+        manifest.algorithm_version,
+        manifest.days,
+    )
+    construct = cast(Callable[..., object], live.LiveProfileSelection)
+    for bad in (True, derived):
+        with pytest.raises(ProfileSelectionError):
+            construct(bad, DAY)
+    for now in (DAY - 1, 2 * DAY, True):
+        with pytest.raises(ProfileSelectionError):
+            construct(manifest, now)
+    for policy in (True, "SECRET", type("Text", (str,), {})("utc_complete_strict_v1")):
+        with pytest.raises(ProfileSelectionError):
+            construct(manifest, DAY, policy)
+    assert live.LiveProfileSelection(manifest, DAY) == selected
+    unavailable = cast(Callable[..., object], live.LiveProfileSelectionUnavailable)
+    for bad in (True, "SECRET", type("Text", (str,), {})("NOT_READY")):
+        with pytest.raises(ProfileSelectionError):
+            unavailable(bad)
+    for reason in ("NOT_READY", "PROFILE_EXPIRED", "SNAPSHOT_REVOKED"):
+        assert live.LiveProfileSelectionUnavailable(reason).reason == reason
