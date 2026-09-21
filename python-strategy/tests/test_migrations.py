@@ -31,6 +31,7 @@ import os
 import time
 from collections.abc import Callable, Iterator
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import contextmanager
 from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
@@ -610,7 +611,7 @@ def _assert_profile_lock_timeout(engine: Engine, action: Callable[[sa.Connection
                     action(conn)
                 assert time.monotonic() - started < 3
                 assert getattr(caught.value.orig, "pgcode", None) == "55P03"
-                assert observed == [("100ms", "500ms")]
+                assert observed and set(observed) == {("100ms", "500ms")}
                 assert conn.execute(settings).one() == guarded
                 conn.commit()
             finally:
@@ -674,6 +675,147 @@ def test_profile_job_uncommitted_unique_conflict_times_out_then_registers(profil
             transaction.rollback()
     registered = profile_jobs.ProfileIngestJobStore(sessionmaker(engine), _WAIT_POLICY).register(_job_spec())
     assert registered.status == "RETRYABLE" and registered.attempt == 0
+
+
+def _atomic_claim(engine: Engine, job_id: str = "job") -> profile_jobs.JobClaim:
+    store = _job_store(engine)
+    store.register(_job_spec(job_id))
+    claim = store.claim_next(job_id, timedelta(minutes=5))
+    assert claim is not None and claim.spec.id == job_id
+    return claim
+
+
+def test_atomic_profile_commit_ack_unknown_recovers_exact_committed_result(profile_repository_pg: Engine) -> None:
+    engine, value = profile_repository_pg, _publication_pg()
+    claim = _atomic_claim(engine)
+    failure = DBAPIError("commit acknowledgment", None, Exception("injected ACK loss"))
+
+    @contextmanager
+    def ack_unknown() -> Iterator[Session]:
+        with Session(engine) as session:
+            yield session
+            # The owner's inner session.begin() has already committed successfully.
+            raise failure
+
+    with pytest.raises(DBAPIError) as caught:
+        profile_jobs.ProfileIngestJobStore(ack_unknown).publish_and_complete(claim, value)
+    assert caught.value is failure
+    before = _job_row(engine)
+    assert before["status"] == "DONE" and _profile_counts(engine) == (1, 2)
+    persisted = profile_repository.ProfileRepository(sessionmaker(engine)).get_verified(value.content_sha256)
+    assert persisted is not None and persisted.publication == value and persisted.revision == 1
+    recovered = _job_store(engine).publish_and_complete(claim, value)
+    assert recovered.recovered_after_commit and recovered.profile == persisted
+    assert _job_row(engine) == before and _profile_counts(engine) == (1, 2)
+    changed = replace(value, reconciliation=CanonicalJsonObject({"changed": True}))
+    with pytest.raises(profile_jobs.JobCompletionError):
+        _job_store(engine).publish_and_complete(claim, changed)
+    assert _job_row(engine) == before and _profile_counts(engine) == (1, 2)
+    assert profile_repository.ProfileRepository(sessionmaker(engine)).get_verified(value.content_sha256) == persisted
+
+
+def test_atomic_profile_final_fence_rolls_back_snapshot_and_injected_expiry(profile_repository_pg: Engine) -> None:
+    engine, value = profile_repository_pg, _publication_pg()
+    claim = _atomic_claim(engine)
+    before, reached = _job_row(engine), []
+
+    def expire(connection: sa.Connection, cursor: Any, statement: str,
+               parameters: Any, context: Any, executemany: bool) -> None:
+        if statement.startswith("UPDATE volume_profile_ingest_job"):
+            with cursor.connection.cursor() as injection:
+                injection.execute("SELECT quality FROM volume_profile_snapshot WHERE id=%s", (value.content_sha256,))
+                assert injection.fetchone() == ("VERIFIED",)
+                injection.execute("UPDATE volume_profile_ingest_job SET lease_expires_at="
+                                  "clock_timestamp()-interval '1 second' WHERE id=%s", (claim.spec.id,))
+                reached.append(True)
+
+    event.listen(engine, "before_cursor_execute", expire)
+    try:
+        with pytest.raises(profile_jobs.LeaseLost):
+            _job_store(engine).publish_and_complete(claim, value)
+    finally:
+        event.remove(engine, "before_cursor_execute", expire)
+    assert reached == [True] and _profile_counts(engine) == (0, 0)
+    assert _job_row(engine) == before
+    with engine.begin() as conn:
+        conn.execute(text("UPDATE volume_profile_ingest_job SET lease_expires_at=clock_timestamp()-interval '1 second'"))
+    replacement = _job_store(engine).claim_next("replacement", timedelta(minutes=5))
+    assert replacement is not None and replacement.attempt == claim.attempt + 1
+    result = _job_store(engine).publish_and_complete(replacement, value)
+    assert result.profile.revision == 1 and result.job.status == "DONE"
+
+
+def test_atomic_profile_stale_takeover_cannot_publish(profile_repository_pg: Engine) -> None:
+    engine, value = profile_repository_pg, _publication_pg()
+    old = _atomic_claim(engine)
+    with engine.begin() as conn:
+        conn.execute(text("UPDATE volume_profile_ingest_job SET lease_expires_at=clock_timestamp()-interval '1 second'"))
+    new = _job_store(engine).claim_next("new", timedelta(minutes=5))
+    assert new is not None and new.attempt == old.attempt + 1
+    before = _job_row(engine)
+    with pytest.raises(profile_jobs.LeaseLost):
+        _job_store(engine).publish_and_complete(old, value)
+    assert _profile_counts(engine) == (0, 0) and _job_row(engine) == before
+    assert _job_store(engine).publish_and_complete(new, value).job.status == "DONE"
+
+
+@pytest.mark.parametrize("different", [False, True])
+def test_atomic_profiles_concurrent_jobs_converge_without_duplicate_bins(
+    profile_repository_pg: Engine, different: bool,
+) -> None:
+    engine = profile_repository_pg
+    claims = [_atomic_claim(engine, "first"), _atomic_claim(engine, "second")]
+    values = [_publication_pg(), _publication_pg(different)]
+    barrier = Barrier(2, timeout=10)
+
+    def worker(index: int) -> profile_jobs.JobPublicationResult:
+        barrier.wait()
+        return _job_store(engine).publish_and_complete(claims[index], values[index])
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        futures = [pool.submit(worker, index) for index in range(2)]
+        results = [future.result(timeout=20) for future in futures]
+    assert {r.profile.revision for r in results} == ({1, 2} if different else {1})
+    assert sum(not r.profile.already_present for r in results) == (2 if different else 1)
+    assert _profile_counts(engine) == ((2, 4) if different else (1, 2))
+    for claim, value, result in zip(claims, values, results):
+        assert result.job.status == "DONE" and result.job.completed_snapshot_id == value.content_sha256
+        assert not result.recovered_after_commit and result.profile.publication == value
+        assert _job_store(engine).get(claim.spec.id) == result.job
+        read = profile_repository.ProfileRepository(sessionmaker(engine)).get_verified(value.content_sha256)
+        assert read is not None and read.publication == value
+
+
+def test_atomic_profile_existing_digest_different_metadata_keeps_second_job_running(profile_repository_pg: Engine) -> None:
+    engine, value = profile_repository_pg, _publication_pg()
+    first = _job_store(engine).publish_and_complete(_atomic_claim(engine, "first"), value)
+    second = _atomic_claim(engine, "second")
+    before = _job_row(engine, "second")
+    changed = replace(value, source_manifest=CanonicalJsonObject({"different": True}))
+    with pytest.raises(profile_jobs.JobCompletionError):
+        _job_store(engine).publish_and_complete(second, changed)
+    assert _job_row(engine, "second") == before and _profile_counts(engine) == (1, 2)
+    read = profile_repository.ProfileRepository(sessionmaker(engine)).get_verified(value.content_sha256)
+    assert read is not None and read.publication == value and read.revision == first.profile.revision == 1
+
+
+@pytest.mark.parametrize("lock_kind", ["job", "advisory"])
+def test_atomic_profile_bounded_wait_has_no_partial_mutation(profile_repository_pg: Engine, lock_kind: str) -> None:
+    engine, value = profile_repository_pg, _publication_pg()
+    claim = _atomic_claim(engine)
+    before = _job_row(engine)
+    with engine.begin() as holder:
+        holder.execute(text("SET LOCAL statement_timeout = '2s'"))
+        if lock_kind == "job":
+            holder.execute(text("SELECT id FROM volume_profile_ingest_job WHERE id='job' FOR UPDATE")).one()
+        else:
+            first, second = profile_repository._lock_parts(profile_repository._logical(value.content))
+            holder.execute(text("SELECT pg_advisory_xact_lock(:a, :b)"), {"a": first, "b": second})
+        _assert_profile_lock_timeout(engine, lambda conn: profile_jobs.ProfileIngestJobStore(
+            sessionmaker(bind=conn), _WAIT_POLICY).publish_and_complete(claim, value))
+        assert _job_row(engine) == before and _profile_counts(engine) == (0, 0)
+    result = profile_jobs.ProfileIngestJobStore(sessionmaker(engine), _WAIT_POLICY).publish_and_complete(claim, value)
+    assert result.job.status == "DONE" and result.profile.revision == 1 and _profile_counts(engine) == (1, 2)
 
 
 def _downgrade(db_name: str, target: str = "base") -> None:
