@@ -1,6 +1,7 @@
 """Strict LIVE header window policy only, not content verification or strategy readiness."""
 
 from dataclasses import dataclass
+from datetime import datetime, timezone
 
 from .read_types import OrderedProfileManifest, ProfileQueryRequest, _integer
 from .selection import ProfileCandidateBatch, ProfileSelectionError
@@ -22,18 +23,24 @@ class LiveSelectionContext:
 
 @dataclass(frozen=True, slots=True)
 class LiveProfileSelection:
-    """Header window-policy result; not FRESH, availability or strategy-ready evidence."""
+    """Selected versions' source availability upper bound, not observation or FRESH."""
 
     manifest: OrderedProfileManifest
     decision_time_ms: int
+    available_at_ms: int
     policy: str = _POLICY
 
     def __post_init__(self) -> None:
         LiveSelectionContext(self.decision_time_ms)
+        try:
+            _integer(self.available_at_ms)
+        except ValueError:
+            raise ProfileSelectionError() from None
         if (
             type(self.manifest) is not OrderedProfileManifest
             or type(self.policy) is not str
             or self.policy != _POLICY
+            or self.available_at_ms < self.manifest.days[-1].window_end_ms
             or self.manifest.days[-1].window_end_ms
             != self.decision_time_ms // _DAY * _DAY
         ):
@@ -94,18 +101,34 @@ def select_live_profile(
                 raise ProfileSelectionError() from None
             observed = True
             if not candidate.revoked:
-                eligible.append(ref)
+                eligible.append(candidate)
         if not observed:
             missing = True
         elif not eligible:
             revoked = True
         else:
-            selected.append(max(eligible, key=lambda ref: ref.revision))
+            selected.append(max(eligible, key=lambda candidate: candidate.ref.revision))
     if missing or revoked:
         return LiveProfileSelectionUnavailable(
             "NOT_READY" if missing else "SNAPSHOT_REVOKED"
         )
     manifest = OrderedProfileManifest(
-        batch.product_id, batch.base_grid_id, batch.algorithm_version, tuple(selected)
+        batch.product_id,
+        batch.base_grid_id,
+        batch.algorithm_version,
+        tuple(candidate.ref for candidate in selected),
     )
-    return LiveProfileSelection(manifest, context.decision_time_ms)
+    available = []
+    for candidate in selected:
+        assert candidate.source_available_at is not None
+        delta = candidate.source_available_at - datetime(
+            1970, 1, 1, tzinfo=timezone.utc
+        )
+        micros = (delta.days * 86400 + delta.seconds) * 1_000_000 + delta.microseconds
+        stamp = -(-micros // 1000)
+        try:
+            _integer(stamp)
+        except ValueError:
+            raise ProfileSelectionError() from None
+        available.append(stamp)
+    return LiveProfileSelection(manifest, context.decision_time_ms, max(available))

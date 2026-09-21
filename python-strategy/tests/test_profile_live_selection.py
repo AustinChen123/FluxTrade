@@ -1,4 +1,5 @@
 from dataclasses import FrozenInstanceError, replace
+from datetime import datetime, timedelta, timezone
 from typing import Callable, cast
 import subprocess
 import sys
@@ -217,17 +218,92 @@ def test_output_hostile_constructor_matrix() -> None:
     construct = cast(Callable[..., object], live.LiveProfileSelection)
     for bad in (True, derived):
         with pytest.raises(ProfileSelectionError):
-            construct(bad, DAY)
+            construct(bad, DAY, selected.available_at_ms)
     for now in (DAY - 1, 2 * DAY, True):
         with pytest.raises(ProfileSelectionError):
-            construct(manifest, now)
+            construct(manifest, now, selected.available_at_ms)
     for policy in (True, "SECRET", type("Text", (str,), {})("utc_complete_strict_v1")):
         with pytest.raises(ProfileSelectionError):
-            construct(manifest, DAY, policy)
-    assert live.LiveProfileSelection(manifest, DAY) == selected
+            construct(manifest, DAY, selected.available_at_ms, policy)
+    assert (
+        live.LiveProfileSelection(manifest, DAY, selected.available_at_ms) == selected
+    )
     unavailable = cast(Callable[..., object], live.LiveProfileSelectionUnavailable)
     for bad in (True, "SECRET", type("Text", (str,), {})("NOT_READY")):
         with pytest.raises(ProfileSelectionError):
             unavailable(bad)
     for reason in ("NOT_READY", "PROFILE_EXPIRED", "SNAPSHOT_REVOKED"):
         assert live.LiveProfileSelectionUnavailable(reason).reason == reason
+
+
+@pytest.mark.parametrize(
+    "micros,expected", [(0, 0), (1, 1), (999, 1), (1000, 1), (1001, 2)]
+)
+def test_source_availability_integer_ceil(micros, expected):
+    request, batch, context = setup()
+    stamp = datetime(1970, 1, 2, tzinfo=timezone.utc) + timedelta(microseconds=micros)
+    candidate = replace(batch.candidates[0], source_available_at=stamp)
+    selected = live.select_live_profile(
+        request, replace(batch, candidates=(candidate,)), context
+    )
+    assert isinstance(selected, live.LiveProfileSelection)
+    assert selected.available_at_ms == DAY + expected
+    assert selected.available_at_ms >= selected.decision_time_ms
+
+
+@pytest.mark.parametrize("first_offset,second_offset", [(5, 0), (0, 5)])
+def test_availability_uses_only_selected_versions_across_days(
+    first_offset, second_offset
+):
+    request, batch, context = setup(2)
+    epoch = datetime(1970, 1, 1, tzinfo=timezone.utc)
+    first, second = batch.candidates
+    first = replace(first, source_available_at=epoch + timedelta(days=3))
+    second = replace(
+        second,
+        source_available_at=epoch + timedelta(days=2, milliseconds=second_offset),
+    )
+    extras = tuple(
+        replace(
+            first,
+            ref=replace(first.ref, snapshot_id=char * 64, revision=revision),
+            source_available_at=epoch + timedelta(days=10),
+            **options,
+        )
+        for char, revision, options in (
+            ("c", 2, {}),
+            ("d", 3, {"availability_basis": "MODELED"}),
+            ("e", 4, {"revoked": True}),
+        )
+    )
+    # Revision 2 wins day one; its older revision, modeled and revoked rows cannot inflate max.
+    winner = replace(
+        extras[0],
+        source_available_at=epoch + timedelta(days=2, milliseconds=first_offset),
+    )
+    rows = (first, second, winner, *extras[1:])
+    result = live.select_live_profile(request, replace(batch, candidates=rows), context)
+    assert isinstance(result, live.LiveProfileSelection)
+    assert result.available_at_ms == 2 * DAY + 5
+    assert result.manifest.days == (winner.ref, second.ref)
+
+
+def test_selected_pre_epoch_source_and_constructor_domain():
+    request, batch, context = setup()
+    candidate = replace(
+        batch.candidates[0],
+        source_available_at=datetime(
+            1969, 12, 31, 23, 59, 59, 998000, tzinfo=timezone.utc
+        ),
+    )
+    with pytest.raises(ProfileSelectionError):
+        live.select_live_profile(
+            request, replace(batch, candidates=(candidate,)), context
+        )
+    result = live.select_live_profile(request, batch, context)
+    assert isinstance(result, live.LiveProfileSelection)
+    for bad in (True, -1, DAY - 1, 1 << 63, 1.0, type("Int", (int,), {})(DAY)):
+        with pytest.raises(ProfileSelectionError):
+            replace(result, available_at_ms=bad)
+    assert replace(result, available_at_ms=(1 << 63) - 1)
+    assert replace(result, available_at_ms=DAY)

@@ -285,7 +285,10 @@ def test_dto_exact_contracts(monkeypatch: pytest.MonkeyPatch) -> None:
     assert isinstance(result, query.LiveProfileQueryResult)
     selected = result.selection
     derived = type("SelectionSubclass", (type(selected),), {})(
-        selected.manifest, selected.decision_time_ms, selected.policy
+        selected.manifest,
+        selected.decision_time_ms,
+        selected.available_at_ms,
+        selected.policy,
     )
     constructor = cast(Callable[..., object], query.LiveProfileQueryResult)
     for invalid in (True, derived):
