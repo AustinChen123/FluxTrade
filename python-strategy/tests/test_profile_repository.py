@@ -53,8 +53,9 @@ def test_publish_readback_order_and_idempotency() -> None:
     assert result.revision == 1 and not result.already_present
     assert result.publication == publication()
     assert events[0] == "SET TRANSACTION ISOLATION LEVEL READ COMMITTED"
-    assert "pg_advisory_xact_lock" in events[1]
-    assert events[2].startswith("SELECT volume_profile_snapshot.")
+    assert "set_config" in events[1]
+    assert "pg_advisory_xact_lock" in events[2]
+    assert events[3].startswith("SELECT volume_profile_snapshot.")
     update_index = next(i for i, sql in enumerate(events) if sql.startswith("UPDATE"))
     assert "ORDER BY volume_profile_bin.bin_index" in events[update_index - 1]
     session.flush.assert_called_once()

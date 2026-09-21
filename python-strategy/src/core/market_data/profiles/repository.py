@@ -21,6 +21,29 @@ _SNAPSHOT = cast(Table, VolumeProfileSnapshot.__table__)
 _BIN = cast(Table, VolumeProfileBin.__table__)
 
 
+@dataclass(frozen=True, slots=True)
+class TransactionWaitPolicy:
+    """Bounded PostgreSQL waits, local to one profile persistence transaction."""
+
+    lock_timeout_ms: int = 2000
+    statement_timeout_ms: int = 10000
+
+    def __post_init__(self) -> None:
+        if (type(self.lock_timeout_ms) is not int or type(self.statement_timeout_ms) is not int
+                or not 1 <= self.lock_timeout_ms <= 60000
+                or not self.lock_timeout_ms <= self.statement_timeout_ms <= 300000):
+            raise ValueError("invalid profile transaction wait policy")
+
+
+def _configure_write_transaction(session: Session, policy: TransactionWaitPolicy) -> None:
+    session.execute(text("SET TRANSACTION ISOLATION LEVEL READ COMMITTED"))
+    session.execute(text(
+        "SELECT set_config('lock_timeout', :lock_timeout, true), "
+        "set_config('statement_timeout', :statement_timeout, true)"
+    ).bindparams(lock_timeout=f"{policy.lock_timeout_ms}ms",
+                 statement_timeout=f"{policy.statement_timeout_ms}ms"))
+
+
 class ProfileIntegrityError(ValueError):
     """Stored data does not satisfy the exact publication contract."""
 
@@ -152,8 +175,12 @@ def _result(
 
 
 class ProfileRepository:
-    def __init__(self, sessions: Callable[[], AbstractContextManager[Session]]) -> None:
+    def __init__(self, sessions: Callable[[], AbstractContextManager[Session]],
+                 policy: TransactionWaitPolicy = TransactionWaitPolicy()) -> None:
+        if type(policy) is not TransactionWaitPolicy:
+            raise ValueError("expected exact profile transaction wait policy")
         self._sessions = sessions
+        self._policy = policy
 
     @staticmethod
     def _check_session(session: Session) -> None:
@@ -171,7 +198,7 @@ class ProfileRepository:
         with self._sessions() as session:
             self._check_session(session)
             with session.begin():
-                session.execute(text("SET TRANSACTION ISOLATION LEVEL READ COMMITTED"))
+                _configure_write_transaction(session, self._policy)
                 first, second = _lock_parts(logical)
                 session.execute(
                     text("SELECT pg_advisory_xact_lock(:first, :second)"),

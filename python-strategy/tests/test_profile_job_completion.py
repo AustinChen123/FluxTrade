@@ -60,9 +60,9 @@ def test_complete_reuses_exact_readback_and_second_fence() -> None:
     assert result.status == "DONE" and result.completed_snapshot_id == snapshot["id"]
     assert result.lease_owner is result.lease_expires_at is result.retry_after_at is None
     assert result.last_error_code is result.last_error_detail is None
-    assert "FOR UPDATE" in events[1] and "FROM volume_profile_snapshot" in events[2]
-    assert "ORDER BY volume_profile_bin.bin_index" in events[3]
-    assert all(part in events[4] for part in ("attempt =", "lease_owner =", "lease_expires_at > clock_timestamp()"))
+    assert "FOR UPDATE" in events[2] and "FROM volume_profile_snapshot" in events[3]
+    assert "ORDER BY volume_profile_bin.bin_index" in events[4]
+    assert all(part in events[5] for part in ("attempt =", "lease_owner =", "lease_expires_at > clock_timestamp()"))
     assert session.begin.return_value.__exit__.call_args.args == (None, None, None)
     assert job["status"] == "DONE"
 

@@ -50,7 +50,8 @@ def test_register_is_immutable_and_guards_database_boundary() -> None:
     first = store.register(SPEC)
     assert store.register(SPEC) == first and first.source_cursor.thaw() == {"id": 9}
     assert events[0] == "SET TRANSACTION ISOLATION LEVEL READ COMMITTED"
-    assert "ON CONFLICT (id) DO NOTHING" in events[1]
+    assert "set_config" in events[1]
+    assert "ON CONFLICT (id) DO NOTHING" in events[2]
     with pytest.raises(JobConflict):
         store.register(replace(SPEC, config_sha256="b" * 64))
     for dialect, active in (("sqlite", False), ("postgresql", True)):
@@ -69,7 +70,7 @@ def test_takeover_checkpoint_retry_and_fail_are_fenced() -> None:
     claim = store.claim_next("worker", LEASE)
     assert claim is not None and claim.attempt == 5 and claim.source_cursor.thaw() == {"id": 9}
     assert claim.progress_manifest.thaw() == {"page": 1} and row["last_error_code"] is None
-    candidate = events[1]
+    candidate = events[2]
     assert "FOR UPDATE SKIP LOCKED" in candidate and "retry_after_at <= clock_timestamp()" in candidate
     assert "lease_expires_at <= clock_timestamp()" in candidate and "ORDER BY" in candidate
     cursor, manifest = CanonicalJsonObject({"id": 10}), CanonicalJsonObject({"page": 2})

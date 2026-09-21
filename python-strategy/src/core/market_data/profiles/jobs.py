@@ -7,7 +7,7 @@ from dataclasses import asdict, dataclass
 from datetime import datetime, timedelta, timezone
 from typing import cast
 
-from sqlalchemy import Table, and_, func, or_, select, text, update
+from sqlalchemy import Table, and_, func, or_, select, update
 from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.engine import RowMapping
 from sqlalchemy.orm import Session
@@ -16,7 +16,7 @@ from src.core.product_registry import validate_product_id
 
 from .orm import VolumeProfileIngestJob, VolumeProfileSnapshot
 from .publication import CanonicalJsonObject
-from .repository import ProfileIntegrityError, _verify
+from .repository import ProfileIntegrityError, TransactionWaitPolicy, _configure_write_transaction, _verify
 from .types import BIGINT_MAX, DAY_MS
 
 _JOB = cast(Table, VolumeProfileIngestJob.__table__)
@@ -203,8 +203,12 @@ def _state(row: RowMapping) -> JobState:
 
 
 class ProfileIngestJobStore:
-    def __init__(self, sessions: Callable[[], AbstractContextManager[Session]]) -> None:
+    def __init__(self, sessions: Callable[[], AbstractContextManager[Session]],
+                 policy: TransactionWaitPolicy = TransactionWaitPolicy()) -> None:
+        if type(policy) is not TransactionWaitPolicy:
+            raise ValueError("expected exact profile transaction wait policy")
         self._sessions = sessions
+        self._policy = policy
 
     @contextmanager
     def _transaction(self, write: bool = True) -> Iterator[Session]:
@@ -213,7 +217,7 @@ class ProfileIngestJobStore:
                 raise ValueError("job store requires fresh PostgreSQL transaction")
             with session.begin():
                 if write:
-                    session.execute(text("SET TRANSACTION ISOLATION LEVEL READ COMMITTED"))
+                    _configure_write_transaction(session, self._policy)
                 yield session
 
     def register(self, spec: JobSpec) -> JobState:
