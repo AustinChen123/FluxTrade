@@ -141,7 +141,9 @@ def test_profile_request_identity(change):
 def test_canonical_full_content_and_immutability():
     value = item()
     payload = json.loads(value.canonical_bytes)
-    assert payload["schema_version"] == 1
+    assert payload["schema_version"] == 2
+    assert payload["profile"]["merge_algorithm_version"] == FULL.merge_algorithm_version
+    assert payload["profile"]["composite_id"] == FULL.composite_id
     assert set(payload["request"]) == {f.name for f in fields(REQUEST)}
     assert payload["request"]["pinned_manifest"] is None
     assert payload["profile"]["bins"][0]["base_volume"] == "1"
@@ -303,6 +305,7 @@ def test_unavailable_canonical_nulls_and_distinct_digests():
     assert len({value.digest for value in values}) == len(values)
     for value in values:
         payload = json.loads(value.canonical_bytes)
+        assert payload["schema_version"] == 2
         assert payload["status"] == value.status.value
         assert payload["reason"] == value.reason
         assert payload["basis"] == value.basis.value

@@ -130,7 +130,12 @@ class ProfileDecisionContext:
 
     @property
     def canonical_bytes(self) -> bytes:
-        projection = {"schema_version": 1, **asdict(self)}
+        projection = {"schema_version": 2, **asdict(self)}
+        if self.profile is not None:
+            projection["profile"].update(
+                merge_algorithm_version=self.profile.merge_algorithm_version,
+                composite_id=self.profile.composite_id,
+            )
         return json.dumps(
             projection,
             sort_keys=True,

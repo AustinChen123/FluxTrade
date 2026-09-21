@@ -11,7 +11,36 @@ from src.core.backtest.run_evidence import (
 )
 from src.core.strategy_context import StrategyContext, RiskSnapshot
 from src.core.market_data.profiles.decision_context import StrategyMarketDataContext
+from src.core.market_data.profiles.composite_types import CompositeProfile
 from test_profile_decision_context import item, DAY
+
+
+def test_merge_identity_propagates_without_changing_legacy_evidence(monkeypatch):
+    # Identity propagation only; this does not implement or validate a v2 merge.
+    decision = item()
+    assert decision.profile is not None
+    collection = StrategyMarketDataContext(DAY + 3, (decision,))
+    legacy = context()
+    explicit = replace(legacy, market_data=collection)
+    legacy_projection = canonical_decision_snapshot(legacy)
+    legacy_hash = configuration_sha256(legacy_projection)
+    old_id = decision.profile.composite_id
+    old_item, old_collection = decision.digest, collection.digest
+    old_hash = configuration_sha256(canonical_decision_snapshot(explicit))
+    monkeypatch.setattr(
+        CompositeProfile,
+        "merge_algorithm_version",
+        property(lambda self: "aligned-sum-v2"),
+    )
+    assert decision.profile.composite_id != old_id
+    payload = json.loads(decision.canonical_bytes)
+    assert payload["profile"]["composite_id"] == decision.profile.composite_id
+    assert payload["profile"]["merge_algorithm_version"] == "aligned-sum-v2"
+    assert decision.digest != old_item
+    assert collection.digest != old_collection
+    assert configuration_sha256(canonical_decision_snapshot(explicit)) != old_hash
+    assert canonical_decision_snapshot(legacy) == legacy_projection
+    assert configuration_sha256(canonical_decision_snapshot(legacy)) == legacy_hash
 
 
 def context():
