@@ -1,15 +1,19 @@
 """Recording-session completion contracts; no PostgreSQL acceptance claim."""
 
-from dataclasses import asdict, replace
+from contextlib import nullcontext
+from dataclasses import FrozenInstanceError, asdict, replace
 from typing import Any
 from unittest.mock import MagicMock
 
 import pytest
-from sqlalchemy.exc import DatabaseError
+from sqlalchemy.exc import DatabaseError, DBAPIError
 
-from src.core.market_data.profiles.jobs import JobCompletionError, LeaseLost
+from src.core.market_data.profiles.jobs import JobCompletionError, LeaseLost, ProfileIngestJobStore
+from src.core.market_data.profiles.publication import CanonicalJsonObject
+from src.core.market_data.profiles.repository import ProfileIntegrityError, _publish_in_transaction
 from test_profile_jobs import LEASE, NOW, harness
 from test_profile_publication import publication
+from test_profile_repository import harness as profile_harness
 
 
 def completion():
@@ -173,3 +177,144 @@ def test_completion_commit_failure_never_returns_done_result() -> None:
     assert caught.value is failure
     assert session.begin.return_value.__exit__.call_args.args == (None, None, None)
     # This tests exception propagation only; real rollback needs the PG lane.
+
+
+def atomic():
+    job_store, job_session, job, _ = harness()
+    claim = job_store.claim_next("worker", LEASE)
+    assert claim is not None
+    _, session, _ = profile_harness()
+    profile_execute, job_execute = session.execute.side_effect, job_session.execute.side_effect
+    events: list[str] = []
+
+    def execute(statement: Any, parameters: Any = None) -> MagicMock:
+        events.append(str(statement))
+        if "volume_profile_ingest_job" in str(statement):
+            return job_execute(statement)
+        return profile_execute(statement, parameters)
+
+    session.execute.side_effect = execute
+    session.scalar.side_effect = lambda statement: None if "max(" in str(statement) else NOW
+    store = ProfileIngestJobStore(lambda: nullcontext(session))
+    return store, session, job, events, claim
+
+
+def test_atomic_lock_order_result_and_exact_existing_content() -> None:
+    store, session, job, events, claim = atomic()
+    result = store.publish_and_complete(claim, publication())
+    assert "FOR UPDATE" in events[2] and "pg_advisory_xact_lock" in events[3]
+    assert events[-1].startswith("UPDATE volume_profile_ingest_job")
+    assert all(part in events[-1] for part in ("attempt =", "lease_owner =", "lease_expires_at > clock_timestamp()"))
+    assert result.job.status == "DONE" and result.job.completed_snapshot_id == result.profile.snapshot_id
+    assert not result.recovered_after_commit and not result.profile.already_present
+    assert session.begin.call_count == 1
+    with pytest.raises(FrozenInstanceError):
+        setattr(result, "recovered_after_commit", True)
+    for changes in ({"profile": object()}, {"job": object()}, {"recovered_after_commit": 1}):
+        with pytest.raises(ValueError):
+            replace(result, **changes)
+    # Model a separate RUNNING job state with a preexisting exact snapshot.
+    job.update(status="RUNNING", completed_snapshot_id=None, lease_owner=claim.worker_id,
+               lease_expires_at=claim.lease_expires_at)
+    events.clear()
+    reused = store.publish_and_complete(claim, publication())
+    assert reused.profile.already_present and not reused.recovered_after_commit
+    assert not any(sql.startswith("INSERT") for sql in events)
+
+
+@pytest.mark.parametrize("invalid", ["identity", "attempt", "worker", "expired"])
+def test_invalid_claim_cannot_reach_profile_publication(invalid: str) -> None:
+    store, session, _, events, claim = atomic()
+    if invalid == "identity":
+        claim = replace(claim, spec=replace(claim.spec, grid_id="other"))
+    elif invalid == "attempt":
+        claim = replace(claim, attempt=claim.attempt + 1)
+    elif invalid == "worker":
+        claim = replace(claim, worker_id="other")
+    else:
+        session.scalar.side_effect = lambda _: NOW + LEASE
+    with pytest.raises(JobCompletionError if invalid == "identity" else LeaseLost):
+        store.publish_and_complete(claim, publication())
+    assert not any("pg_advisory_xact_lock" in sql or "volume_profile_snapshot" in sql for sql in events)
+
+
+@pytest.mark.parametrize("failure_phase", ["publication", "final_fence"])
+def test_atomic_failure_exits_owning_transaction_with_exception(failure_phase: str) -> None:
+    store, session, _, events, claim = atomic()
+    execute = session.execute.side_effect
+
+    def fail(statement: Any, parameters: Any = None) -> MagicMock:
+        if failure_phase == "publication" and "FROM volume_profile_bin" in str(statement):
+            raise ProfileIntegrityError("injected readback failure")
+        result = execute(statement, parameters)
+        if failure_phase == "final_fence" and str(statement).startswith("UPDATE volume_profile_ingest_job"):
+            result.mappings.return_value.one_or_none.return_value = None
+        return result
+
+    session.execute.side_effect = fail
+    expected = ProfileIntegrityError if failure_phase == "publication" else LeaseLost
+    with pytest.raises(expected):
+        store.publish_and_complete(claim, publication())
+    assert session.begin.return_value.__exit__.call_args.args[0] is expected
+    if failure_phase == "publication":
+        assert not any(sql.startswith("UPDATE volume_profile_ingest_job") for sql in events)
+
+
+def test_visible_commit_ack_unknown_recovers_exact_result_without_mutation() -> None:
+    store, session, _, events, claim = atomic()
+    failure = DBAPIError("commit", None, Exception("ack unknown"))
+    session.begin.return_value.__exit__.side_effect = failure
+    with pytest.raises(DBAPIError) as caught:
+        store.publish_and_complete(claim, publication())
+    assert caught.value is failure
+    # Model a new session observing the committed rows after an unknown ACK.
+    session.in_transaction.return_value = False
+    session.begin.return_value.__exit__.side_effect = lambda *_: setattr(session.in_transaction, "return_value", False)
+    events.clear()
+    recovered = store.publish_and_complete(replace(claim, worker_id="different"), publication())
+    assert recovered.recovered_after_commit and recovered.profile.already_present
+    assert recovered.profile.publication == publication() and recovered.profile.revision == 1
+    assert not any(sql.startswith(("INSERT", "UPDATE")) or "pg_advisory_xact_lock" in sql for sql in events)
+
+
+@pytest.mark.parametrize("mismatch", ["digest", "metadata", "spec", "attempt"])
+def test_done_recovery_requires_exact_evidence(mismatch: str) -> None:
+    store, _, _, events, claim = atomic()
+    value = publication()
+    store.publish_and_complete(claim, value)
+    if mismatch == "digest":
+        value = replace(value, content=replace(value.content, bins=()))
+    elif mismatch == "metadata":
+        value = replace(value, source_manifest=CanonicalJsonObject({"changed": True}))
+    elif mismatch == "spec":
+        claim = replace(claim, spec=replace(claim.spec, config_sha256="b" * 64))
+    else:
+        claim = replace(claim, attempt=claim.attempt + 1)
+    events.clear()
+    with pytest.raises(JobCompletionError):
+        store.publish_and_complete(claim, value)
+    assert not any(sql.startswith(("INSERT", "UPDATE")) for sql in events)
+
+
+def test_internal_publication_requires_active_transaction() -> None:
+    _, session, _ = profile_harness()
+    with pytest.raises(ValueError, match="active PostgreSQL transaction"):
+        _publish_in_transaction(session, publication())
+    session.execute.assert_not_called()
+
+
+def test_running_job_rejects_existing_digest_with_different_metadata() -> None:
+    store, session, job, events, claim = atomic()
+    original = publication()
+    store.publish_and_complete(claim, original)
+    # Keep the snapshot but model a valid RUNNING job with the same live claim.
+    job.update(status="RUNNING", completed_snapshot_id=None, lease_owner=claim.worker_id,
+               lease_expires_at=claim.lease_expires_at)
+    changed = replace(original, source_manifest=CanonicalJsonObject({"changed": True}),
+                      reconciliation=CanonicalJsonObject({"different": 1}))
+    assert changed.content_sha256 == original.content_sha256
+    events.clear()
+    with pytest.raises(JobCompletionError, match="^job publication metadata mismatch$"):
+        store.publish_and_complete(claim, changed)
+    assert not any(sql.startswith("UPDATE volume_profile_ingest_job") for sql in events)
+    assert session.begin.return_value.__exit__.call_args.args[0] is JobCompletionError

@@ -15,8 +15,11 @@ from sqlalchemy.orm import Session
 from src.core.product_registry import validate_product_id
 
 from .orm import VolumeProfileIngestJob, VolumeProfileSnapshot
-from .publication import CanonicalJsonObject
-from .repository import ProfileIntegrityError, TransactionWaitPolicy, _configure_write_transaction, _verify
+from .publication import CanonicalJsonObject, VerifiedProfilePublication
+from .repository import (
+    ProfileIntegrityError, PublishedProfile, TransactionWaitPolicy, _configure_write_transaction,
+    _logical, _publish_in_transaction, _result, _verify,
+)
 from .types import BIGINT_MAX, DAY_MS
 
 _JOB = cast(Table, VolumeProfileIngestJob.__table__)
@@ -202,6 +205,26 @@ def _state(row: RowMapping) -> JobState:
         raise JobIntegrityError("job integrity check failed") from None
 
 
+@dataclass(frozen=True, slots=True)
+class JobPublicationResult:
+    profile: PublishedProfile
+    job: JobState
+    recovered_after_commit: bool
+
+    def __post_init__(self) -> None:
+        if type(self.profile) is not PublishedProfile or type(self.job) is not JobState or type(self.recovered_after_commit) is not bool:
+            raise ValueError("invalid job publication result")
+        if self.job.status != "DONE" or self.job.completed_snapshot_id != self.profile.snapshot_id:
+            raise ValueError("inconsistent job publication result")
+
+
+def _require_live_claim(state: JobState | None, claim: JobClaim, now: datetime) -> None:
+    if (state is None or state.status != "RUNNING" or state.spec != claim.spec
+            or state.lease_owner != claim.worker_id or state.attempt != claim.attempt
+            or cast(datetime, state.lease_expires_at) <= now):
+        raise LeaseLost("job lease lost")
+
+
 class ProfileIngestJobStore:
     def __init__(self, sessions: Callable[[], AbstractContextManager[Session]],
                  policy: TransactionWaitPolicy = TransactionWaitPolicy()) -> None:
@@ -314,15 +337,7 @@ class ProfileIngestJobStore:
             )
             now = _utc(session.scalar(select(func.clock_timestamp())))
             state = None if row is None else _state(row)
-            if (
-                state is None
-                or state.status != "RUNNING"
-                or state.spec != claim.spec
-                or state.lease_owner != claim.worker_id
-                or state.attempt != claim.attempt
-                or cast(datetime, state.lease_expires_at) <= now
-            ):
-                raise LeaseLost("job lease lost")
+            _require_live_claim(state, claim, now)
             yield session, now
 
     def _save(self, session: Session, claim: JobClaim, now: datetime, **values: object) -> JobState:
@@ -409,3 +424,33 @@ class ProfileIngestJobStore:
             return self._save(session, claim, now, status="DONE", completed_snapshot_id=snapshot_id,
                               lease_owner=None, lease_expires_at=None, retry_after_at=None,
                               last_error_code=None, last_error_detail=None)
+
+    def publish_and_complete(self, claim: JobClaim, publication: VerifiedProfilePublication) -> JobPublicationResult:
+        if type(claim) is not JobClaim or type(publication) is not VerifiedProfilePublication:
+            raise ValueError("expected exact job claim and publication")
+        if any(value != getattr(claim.spec, key) for key, value in _logical(publication.content).items()):
+            raise JobCompletionError("job publication identity mismatch")
+        with self._transaction() as session:
+            row = session.execute(select(_JOB).where(_JOB.c.id == claim.spec.id).with_for_update()).mappings().one_or_none()
+            state = None if row is None else _state(row)
+            if state is not None and state.status == "DONE":
+                # DONE retains attempt/spec, not worker identity. Exact readback is mandatory.
+                if state.spec != claim.spec or state.attempt != claim.attempt:
+                    raise JobCompletionError("job publication recovery mismatch")
+                snapshot = session.execute(select(_SNAPSHOT).where(_SNAPSHOT.c.id == state.completed_snapshot_id)).mappings().one_or_none()
+                if snapshot is None:
+                    raise JobCompletionError("job publication recovery mismatch")
+                try:
+                    verified = _verify(session, snapshot, expected=publication)
+                except ProfileIntegrityError:
+                    raise JobCompletionError("job publication recovery mismatch") from None
+                return JobPublicationResult(_result(snapshot, verified, True), state, True)
+            now = _utc(session.scalar(select(func.clock_timestamp())))
+            _require_live_claim(state, claim, now)
+            profile = _publish_in_transaction(session, publication)
+            if profile.publication != publication:
+                raise JobCompletionError("job publication metadata mismatch")
+            done = self._save(session, claim, now, status="DONE", completed_snapshot_id=profile.snapshot_id,
+                              lease_owner=None, lease_expires_at=None, retry_after_at=None,
+                              last_error_code=None, last_error_detail=None)
+            return JobPublicationResult(profile, done, False)

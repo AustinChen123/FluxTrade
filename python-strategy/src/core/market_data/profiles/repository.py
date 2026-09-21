@@ -174,6 +174,95 @@ def _result(
     )
 
 
+def _publish_in_transaction(session: Session, publication: VerifiedProfilePublication) -> PublishedProfile:
+    """Package-internal: caller owns the configured, active PostgreSQL transaction."""
+    if type(publication) is not VerifiedProfilePublication:
+        raise ValueError("expected exact verified publication")
+    if session.get_bind().dialect.name != "postgresql" or not session.in_transaction():
+        raise ValueError("publication requires an active PostgreSQL transaction")
+    content = publication.content
+    logical = _logical(content)
+    scope = and_(*(_SNAPSHOT.c[key] == value for key, value in logical.items()))
+    first, second = _lock_parts(logical)
+    session.execute(
+        text("SELECT pg_advisory_xact_lock(:first, :second)"),
+        {"first": first, "second": second},
+    )
+    existing = (
+        session.execute(
+            select(_SNAPSHOT).where(
+                scope, _SNAPSHOT.c.content_sha256 == content.content_sha256
+            )
+        )
+        .mappings()
+        .one_or_none()
+    )
+    if existing is not None:
+        return _result(existing, _verify(session, existing), True)
+    prior = session.scalar(
+        select(func.max(_SNAPSHOT.c.revision)).where(scope)
+    )
+    _require(
+        prior is None or (type(prior) is int and 0 < prior < BIGINT_MAX)
+    )
+    revision = 1 if prior is None else prior + 1
+    now = _utc(session.scalar(select(func.clock_timestamp())))
+    snapshot_id = content.content_sha256
+    session.execute(
+        insert(_SNAPSHOT),
+        {
+            **logical,
+            "id": snapshot_id,
+            "period": "1d",
+            "timezone": "UTC",
+            "bin_origin": content.bin_origin,
+            "bin_step": content.bin_step,
+            "revision": revision,
+            "content_sha256": snapshot_id,
+            "source_manifest": publication.source_manifest.thaw(),
+            "reconciliation": publication.reconciliation.thaw(),
+            "base_volume": content.base_volume,
+            "quote_volume": content.quote_volume,
+            "aggregate_count": content.aggregate_count,
+            "occupied_bins": content.occupied_bins,
+            "quality": "PARTIAL",
+            "computed_at": now,
+            "published_at": None,
+            "source_available_at": publication.source_available_at,
+            "availability_basis": publication.availability_basis,
+            "raw_retention_state": publication.raw_retention_state,
+        },
+    )
+    if content.bins:
+        session.execute(
+            insert(_BIN),
+            [
+                {"snapshot_id": snapshot_id, **asdict(b)}
+                for b in content.bins
+            ],
+        )
+    session.flush()
+    row = (
+        session.execute(
+            select(_SNAPSHOT).where(_SNAPSHOT.c.id == snapshot_id)
+        )
+        .mappings()
+        .one()
+    )
+    _verify(session, row, "PARTIAL", publication)
+    row = (
+        session.execute(
+            update(_SNAPSHOT)
+            .where(_SNAPSHOT.c.id == snapshot_id)
+            .values(quality="VERIFIED", published_at=func.clock_timestamp())
+            .returning(*_SNAPSHOT.c)
+        )
+        .mappings()
+        .one()
+    )
+    return _result(row, _verify(session, row, expected=publication), False)
+
+
 class ProfileRepository:
     def __init__(self, sessions: Callable[[], AbstractContextManager[Session]],
                  policy: TransactionWaitPolicy = TransactionWaitPolicy()) -> None:
@@ -192,91 +281,11 @@ class ProfileRepository:
     def publish(self, publication: VerifiedProfilePublication) -> PublishedProfile:
         if type(publication) is not VerifiedProfilePublication:
             raise ValueError("expected exact verified publication")
-        content = publication.content
-        logical = _logical(content)
-        scope = and_(*(_SNAPSHOT.c[key] == value for key, value in logical.items()))
         with self._sessions() as session:
             self._check_session(session)
             with session.begin():
                 _configure_write_transaction(session, self._policy)
-                first, second = _lock_parts(logical)
-                session.execute(
-                    text("SELECT pg_advisory_xact_lock(:first, :second)"),
-                    {"first": first, "second": second},
-                )
-                existing = (
-                    session.execute(
-                        select(_SNAPSHOT).where(
-                            scope, _SNAPSHOT.c.content_sha256 == content.content_sha256
-                        )
-                    )
-                    .mappings()
-                    .one_or_none()
-                )
-                if existing is not None:
-                    return _result(existing, _verify(session, existing), True)
-                prior = session.scalar(
-                    select(func.max(_SNAPSHOT.c.revision)).where(scope)
-                )
-                _require(
-                    prior is None or (type(prior) is int and 0 < prior < BIGINT_MAX)
-                )
-                revision = 1 if prior is None else prior + 1
-                now = _utc(session.scalar(select(func.clock_timestamp())))
-                snapshot_id = content.content_sha256
-                session.execute(
-                    insert(_SNAPSHOT),
-                    {
-                        **logical,
-                        "id": snapshot_id,
-                        "period": "1d",
-                        "timezone": "UTC",
-                        "bin_origin": content.bin_origin,
-                        "bin_step": content.bin_step,
-                        "revision": revision,
-                        "content_sha256": snapshot_id,
-                        "source_manifest": publication.source_manifest.thaw(),
-                        "reconciliation": publication.reconciliation.thaw(),
-                        "base_volume": content.base_volume,
-                        "quote_volume": content.quote_volume,
-                        "aggregate_count": content.aggregate_count,
-                        "occupied_bins": content.occupied_bins,
-                        "quality": "PARTIAL",
-                        "computed_at": now,
-                        "published_at": None,
-                        "source_available_at": publication.source_available_at,
-                        "availability_basis": publication.availability_basis,
-                        "raw_retention_state": publication.raw_retention_state,
-                    },
-                )
-                if content.bins:
-                    session.execute(
-                        insert(_BIN),
-                        [
-                            {"snapshot_id": snapshot_id, **asdict(b)}
-                            for b in content.bins
-                        ],
-                    )
-                session.flush()
-                row = (
-                    session.execute(
-                        select(_SNAPSHOT).where(_SNAPSHOT.c.id == snapshot_id)
-                    )
-                    .mappings()
-                    .one()
-                )
-                _verify(session, row, "PARTIAL", publication)
-                row = (
-                    session.execute(
-                        update(_SNAPSHOT)
-                        .where(_SNAPSHOT.c.id == snapshot_id)
-                        .values(quality="VERIFIED", published_at=func.clock_timestamp())
-                        .returning(*_SNAPSHOT.c)
-                    )
-                    .mappings()
-                    .one()
-                )
-                return _result(row, _verify(session, row, expected=publication), False)
+                return _publish_in_transaction(session, publication)
 
     def get_verified(self, snapshot_id: str) -> PublishedProfile | None:
         with self._sessions() as session:

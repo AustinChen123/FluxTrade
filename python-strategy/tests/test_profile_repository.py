@@ -20,6 +20,8 @@ def harness(corrupt: bool = False) -> tuple[ProfileRepository, MagicMock, list[s
     session = MagicMock()
     session.get_bind.return_value.dialect.name = "postgresql"
     session.in_transaction.return_value = False
+    session.begin.return_value.__enter__.side_effect = lambda: setattr(session.in_transaction, "return_value", True)
+    session.begin.return_value.__exit__.side_effect = lambda *_: setattr(session.in_transaction, "return_value", False)
     now = datetime(2026, 1, 1, tzinfo=timezone.utc)
     session.scalar.side_effect = [None, now]
     header: dict[str, Any] = {}
