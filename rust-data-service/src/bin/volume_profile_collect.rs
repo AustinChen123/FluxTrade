@@ -3,6 +3,7 @@
 mod app {
     use anyhow::{ensure, Result};
     use clap::Parser;
+    use fluxtrade_core::volume_profile::mvp::*;
     use fluxtrade_core::volume_profile::{
         binance_spot::PRODUCT_ID,
         checkpoint::Identity,
@@ -10,40 +11,15 @@ mod app {
         compressed_page,
         store::Store,
         transport::Transport,
-        work_policy::{Budget, Failure, Limits, RetrySchedule},
+        work_policy::{Budget, Failure, RetrySchedule},
         Window,
     };
-    use ring::digest::{digest, SHA256};
     use serde::Serialize;
     use std::{
         path::PathBuf,
         time::{Duration, Instant, SystemTime, UNIX_EPOCH},
     };
 
-    const HOUR: i64 = 3_600_000;
-    const RAW: usize = 2 * 1024 * 1024;
-    const ARCHIVE: usize = RAW + 64 * 1024;
-    const MANIFEST: u64 = RAW as u64;
-    const TIMEOUT_MS: u64 = 3000;
-    const WORK: Limits = Limits {
-        requests: 200,
-        response_bytes: 25 * 1024 * 1024,
-        elapsed_ms: 300_000,
-    };
-    const MAX_RETRIES: u32 = 3;
-    const BASE_DELAY_MS: u64 = 250;
-    const MAX_DELAY_MS: u64 = 4000;
-    const GRID: &str = "btc_spot_usdt_10_v1";
-    // Canonical ASCII bytes, LF terminated, no whitespace normalization. Changing
-    // semantic or runtime configuration changes the job identity SHA-256.
-    const CONFIG: &str = concat!(
-        "format=vp-collector-config-v1\nschema=1\nalgorithm=vp-v1\n",
-        "product=BINANCE:BTCUSDT-SPOT\nendpoint=https://data-api.binance.vision/api/v3/aggTrades\n",
-        "page_limit=1000\ngrid_id=btc_spot_usdt_10_v1\norigin=0\nstep=10\nunit=USDT\n",
-        "timeout_ms=3000\nrequests=200\nresponse_bytes=26214400\nelapsed_ms=300000\n",
-        "max_retries=3\nbase_delay_ms=250\nmax_delay_ms=4000\n",
-        "raw_bytes=2097152\narchive_bytes=2162688\nmanifest_bytes=2097152\n"
-    );
     #[derive(Parser)]
     #[command(
         about = "One-shot BTCUSDT spot staging; one completed UTC hour. No scheduler/deployment.",
@@ -71,19 +47,6 @@ mod app {
         );
         ensure!(end <= now, "hour is not completed");
         Ok(Window::new(start, end)?)
-    }
-    fn config_hash() -> [u8; 32] {
-        digest(&SHA256, CONFIG.as_bytes())
-            .as_ref()
-            .try_into()
-            .unwrap()
-    }
-    fn config_hex() -> String {
-        config_hash()
-            .iter()
-            .flat_map(|byte| [byte >> 4, byte & 15])
-            .map(|n| b"0123456789abcdef"[n as usize] as char)
-            .collect()
     }
     #[derive(Serialize)]
     struct Output<'a> {

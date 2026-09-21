@@ -17,6 +17,7 @@ pub mod daily;
 pub mod directory;
 mod exact;
 pub mod handoff;
+pub mod mvp;
 #[cfg(unix)]
 pub mod store;
 pub mod transport;
