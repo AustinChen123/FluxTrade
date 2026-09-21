@@ -73,6 +73,64 @@ fn success(raw: Vec<u8>) -> Outcome {
 }
 
 #[tokio::test]
+async fn ack_unknown_checkpoint_requires_confirmation_before_round_progress() {
+    use crate::volume_profile::{directory::Phase, store::Target};
+    for terminal in [false, true] {
+        let (_root, store) = setup(4096);
+        store
+            .append(0, &body(0), CheckpointProgress::Next(1))
+            .unwrap();
+        let (raw, progress) = if terminal {
+            (b"[]".to_vec(), CheckpointProgress::EmptyPage)
+        } else {
+            (body(1), CheckpointProgress::Next(2))
+        };
+        let mut confirmations = 0;
+        let result = store.append_with(1, &raw, progress, |target, phase| {
+            if (target, phase) == (Target::Manifest, Phase::Renamed) {
+                store.fail_next_recovery_confirmation();
+                anyhow::bail!("manifest ACK unknown");
+            }
+            if (target, phase) == (Target::Confirmation, Phase::BeforeDirectorySync) {
+                confirmations += 1;
+                anyhow::bail!("confirmation failed");
+            }
+            Ok(())
+        });
+        assert!(result.is_err());
+        assert_eq!(confirmations, 1);
+        let (r, fake, waits) = run(&store, vec![], 9, 9999, 0).await;
+        assert_eq!(
+            r.unwrap_err().to_string(),
+            "recovery confirmation unavailable"
+        );
+        assert!(fake.1.is_empty());
+        assert!(waits.is_empty());
+        let items = if terminal {
+            vec![]
+        } else {
+            vec![success(body(2)), success(b"[]".to_vec())]
+        };
+        let (r, fake, waits) = run(&store, items, 9, 9999, 0).await;
+        let report = r.unwrap();
+        assert_eq!(report.reason, Reason::Complete);
+        assert_eq!(report.requests, if terminal { 0 } else { 2 });
+        let expected = if terminal {
+            vec![]
+        } else {
+            vec![Request::Next { from_id: 2 }, Request::Next { from_id: 3 }]
+        };
+        assert_eq!(fake.1, expected);
+        assert!(waits.is_empty());
+        let trades = store.recover().unwrap().1.trades;
+        assert_eq!(
+            trades.iter().map(|t| t.id).collect::<Vec<_>>(),
+            if terminal { vec![0] } else { vec![0, 1, 2] }
+        );
+    }
+}
+
+#[tokio::test]
 async fn checkpoint_budget_resume_terminal_and_append_failure() {
     for (requests, bytes) in [(1, 9999), (9, 1)] {
         let (_root, store) = setup(4096);

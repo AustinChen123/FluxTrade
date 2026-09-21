@@ -157,3 +157,32 @@ fn corrupt_oversize_and_mismatched_authority_fail_closed() {
             .is_err());
     }
 }
+
+#[test]
+fn public_recovery_requires_job_confirmation() {
+    let (_root, store) = setup();
+    let result = store.append_with(
+        0,
+        &body(&[0]),
+        CheckpointProgress::Next(1),
+        |target, phase| {
+            if (target, phase) == (Target::Manifest, Phase::Renamed)
+                || (target, phase) == (Target::Confirmation, Phase::BeforeDirectorySync)
+            {
+                anyhow::bail!("ACK unknown");
+            }
+            Ok(())
+        },
+    );
+    assert!(result.is_err());
+    store.fail_next_recovery_confirmation();
+    assert_eq!(
+        store.recover().err().unwrap().to_string(),
+        "recovery confirmation unavailable"
+    );
+    assert_eq!(ids(&store), vec![0]);
+    assert_eq!(
+        store.recover().unwrap().1.pages.request().unwrap(),
+        crate::volume_profile::binance_spot::Request::Next { from_id: 1 }
+    );
+}

@@ -19,6 +19,8 @@ pub struct Store {
     identity: Identity,
     limits: Limits,
     manifest_limit: u64,
+    #[cfg(test)]
+    fail_recovery_confirmation: std::cell::Cell<bool>,
 }
 
 impl Store {
@@ -38,10 +40,36 @@ impl Store {
             identity,
             limits,
             manifest_limit,
+            #[cfg(test)]
+            fail_recovery_confirmation: std::cell::Cell::new(false),
         })
     }
 
+    /// Visible metadata is not a durability acknowledgement. Confirm the held
+    /// job directory before allowing a caller to consume any recovered progress.
     pub fn recover(&self) -> Result<(Manifest, Recovered)> {
+        let recovered = self.load_unconfirmed()?;
+        self.confirm(&mut |_, phase| {
+            #[cfg(test)]
+            if phase == Phase::BeforeDirectorySync {
+                ensure!(
+                    !self.fail_recovery_confirmation.replace(false),
+                    "recovery confirmation unavailable"
+                );
+            }
+            let _ = phase;
+            Ok(())
+        })?;
+        Ok(recovered)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn fail_next_recovery_confirmation(&self) {
+        self.fail_recovery_confirmation.set(true);
+    }
+
+    // Only the ACK-unknown comparison may inspect this result without confirming.
+    fn load_unconfirmed(&self) -> Result<(Manifest, Recovered)> {
         let manifest = match self.directory.read(MANIFEST, self.manifest_limit) {
             Ok(bytes) => serde_json::from_slice(&bytes)?,
             Err(error)
@@ -106,7 +134,7 @@ impl Store {
             .directory
             .replace_with(MANIFEST, &bytes, |phase| hook(Target::Manifest, phase))
         {
-            let (observed, _) = self.recover()?;
+            let (observed, _) = self.load_unconfirmed()?;
             ensure!(observed == intended, "manifest commit unconfirmed: {error}");
             self.confirm(&mut hook)?;
         }
