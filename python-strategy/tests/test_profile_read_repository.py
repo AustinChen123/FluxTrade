@@ -3,6 +3,7 @@ import subprocess
 import sys
 import json
 from contextlib import nullcontext
+from dataclasses import replace
 from datetime import datetime, timezone
 from decimal import Decimal
 from typing import Any
@@ -14,7 +15,9 @@ from sqlalchemy.exc import DBAPIError
 
 from src.core.market_data.profiles import read_repository as reader
 from src.core.market_data.profiles.repository import ProfileIntegrityError, TransactionWaitPolicy
+from src.core.market_data.profiles.read_types import DailyProfileRef, OrderedProfileManifest
 from test_profile_repository import verified_rows
+from test_profile_publication import publication
 
 DAY = 86400000
 ARGS: dict[str, Any] = dict(product_id="BINANCE:BTCUSDT-SPOT", base_grid_id="base", algorithm_version="vp-v1", start_ms=0, end_ms=DAY)
@@ -411,3 +414,295 @@ def test_numeric_boundary_and_independent_operation_event_budget(monkeypatch: py
     with pytest.raises(reader.ProfileReadTooLarge):
         store.get_verified(identifier)
     assert [name for name, _ in phases] == ["header", "bin_counts", "event_count"]
+
+
+def manifest_harness(count: int = 2, *, empty: bool = False):
+    data: dict[str, Any] = dict(headers=[], summaries=[], payloads=[], bins=[], events=[])
+    refs = []
+    for day in range(count):
+        _, _, _, state, _, _ = snapshot_harness()
+        content = replace(publication().content, window_start_ms=day * DAY, window_end_ms=(day + 1) * DAY,
+                          bins=() if empty else publication().content.bins)
+        identifier = content.content_sha256
+        state["header"].update(id=identifier, content_sha256=identifier, window_start_ms=day * DAY,
+                               window_end_ms=(day + 1) * DAY, base_volume=content.base_volume, quote_volume=content.quote_volume,
+                               aggregate_count=content.aggregate_count, occupied_bins=content.occupied_bins)
+        data["headers"].append(state["header"])
+        data["payloads"].append(dict(state["payload"], id=identifier))
+        data["bins"].extend(dict(b, snapshot_id=identifier) for b in state["bins"] if not empty)
+        data["events"].extend(dict(e, snapshot_id=identifier, event_id=f"event{day}") for e in state["events"] if not empty)
+        data["summaries"].append(dict(id=identifier, bin_count=0 if empty else len(state["bins"]),
+                                      event_count=0 if empty else 1, oversized=False))
+        refs.append(DailyProfileRef(identifier, 1, identifier, day * DAY, (day + 1) * DAY))
+    data["bins"].sort(key=lambda b: (b["snapshot_id"], b["bin_index"]))
+    data["events"].sort(key=lambda e: (e["snapshot_id"], e["recorded_at"], e["event_id"]))
+    content = publication().content
+    manifest = OrderedProfileManifest(content.product_id, content.grid_id, content.algorithm_version, tuple(refs))
+    store, session, factory = harness()
+    phases: list[tuple[str, Any]] = []
+
+    def execute(query: Any):
+        result = MagicMock()
+        if str(query).startswith("SET") or "set_config" in str(query):
+            return result
+        keys = set(query.selected_columns.keys())
+        phase = "headers" if "source_manifest_bytes" in keys else "summaries" if "bin_count" in keys else "payloads" if "source_manifest" in keys else "bins" if "bin_index" in keys else "events"
+        phases.append((phase, query))
+        if data.get("failure_phase") == phase:
+            raise data["failure"]
+        result.mappings.return_value.all.return_value = data[phase]
+        return result
+
+    session.execute.side_effect = execute
+    return store, session, factory, data, phases, manifest
+
+
+@pytest.mark.parametrize("count,empty", [(1, False), (90, False), (1, True), (90, True)])
+def test_manifest_success_one_transaction_and_manifest_order(count: int, empty: bool, monkeypatch: pytest.MonkeyPatch) -> None:
+    store, session, factory, data, phases, manifest = manifest_harness(count, empty=empty)
+    monkeypatch.setattr(store, "get_verified", MagicMock(side_effect=AssertionError("not per-day")))
+    data["headers"].reverse()
+    data["payloads"].reverse()
+    result = store.get_manifest(manifest)
+    assert result is not None and result.manifest == manifest
+    assert tuple(day.ref for day in result.days) == manifest.days
+    assert all(len(day.invalidations) == (0 if empty else 1) for day in result.days)
+    assert [phase for phase, _ in phases] == ["headers", "summaries", "payloads", "bins", "events"]
+    assert factory.call_count == session.begin.call_count == 1
+    assert str(session.execute.call_args_list[0].args[0]) == "SET TRANSACTION ISOLATION LEVEL REPEATABLE READ, READ ONLY"
+    assert session.execute.call_args_list[1].args[0].compile().params == {"lock_timeout": "250ms", "statement_timeout": "1500ms"}
+    assert session.begin.return_value.__exit__.call_args.args == (None, None, None)
+
+
+def test_manifest_sql_scope_lateral_bounded_probes_and_payload_limits() -> None:
+    store, _, _, data, phases, manifest = manifest_harness()
+    store.get_manifest(manifest)
+    identifiers = [r.snapshot_id for r in manifest.days]
+    for phase, query in phases:
+        compiled = query.compile(dialect=postgresql.dialect())
+        sql = str(compiled)
+        assert not any(word in sql for word in ("FOR UPDATE", "INSERT", "UPDATE", "DELETE", "pg_advisory"))
+        table = "volume_profile_bin" if phase == "bins" else "market_data_invalidation" if phase == "events" else "volume_profile_snapshot"
+        column = "snapshot_id" if phase in ("bins", "events") else "id"
+        assert f"WHERE {table}.{column} IN (__[POSTCOMPILE_{column}_1])" in sql
+        assert compiled.params[column + "_1"] == identifiers
+        assert "LIMIT" in sql
+        if phase in ("headers", "payloads"):
+            assert query._limit_clause.value == 3
+            assert "quality =" not in sql and "product_id =" not in sql
+        elif phase in ("bins", "events"):
+            assert compiled.params["param_1"] == len(data[phase]) + 1
+            suffix = "bin_index" if phase == "bins" else "recorded_at, market_data_invalidation.event_id"
+            assert f"ORDER BY {table}.snapshot_id, {table}.{suffix}" in sql
+    sql = str(phases[1][1].compile(dialect=postgresql.dialect(), compile_kwargs={"literal_binds": True}))
+    assert sql.count("JOIN LATERAL") == 2 and "LIMIT 100001" in sql and "LIMIT 1001" in sql
+    assert "volume_profile_bin.snapshot_id = requested.id" in sql
+    assert "market_data_invalidation.snapshot_id = requested.id" in sql
+    normalized = " ".join(sql.split())
+    # Exact inner FROM excludes a locally materialized requested relation: correlation is required.
+    assert "FROM volume_profile_bin WHERE volume_profile_bin.snapshot_id = requested.id LIMIT 100001" in normalized
+    assert "FROM market_data_invalidation WHERE market_data_invalidation.snapshot_id = requested.id LIMIT 1001" in normalized
+    assert "bool_or(anon_1.base_volume OR anon_1.quote_volume)" in sql
+    for name in ("base_volume", "quote_volume"):
+        assert f"octet_length(CAST(volume_profile_bin.{name} AS TEXT)) > 64 AS {name}" in sql
+    assert "count(*) AS bin_count" in sql and "count(*) AS event_count" in sql
+    # Both APIs must use the exact same guarded header projection (CASE assertions above).
+    assert [str(c) for c in phases[0][1].selected_columns] == [str(c) for c in reader._header_projection()]
+
+
+@pytest.mark.parametrize("damage", ["missing", "partial", "duplicate", "foreign", "revision", "scope", "digest"])
+def test_manifest_header_priority_and_no_payload(damage: str) -> None:
+    store, _, _, data, phases, manifest = manifest_harness()
+    if damage in ("missing", "partial"):
+        data["headers"][0]["computed_at_valid"] = False
+        if damage == "missing":
+            data["headers"].pop()
+        else:
+            data["headers"][1]["quality"] = "PARTIAL"
+        assert store.get_manifest(manifest) is None
+    else:
+        if damage == "duplicate":
+            data["headers"].append(data["headers"][0])
+        elif damage == "foreign":
+            data["headers"][0]["id"] = "a" * 64
+        else:
+            key = {"revision": "revision", "scope": "grid_id", "digest": "content_sha256"}[damage]
+            data["headers"][0][key] = 2 if damage == "revision" else "b" * 64
+        with pytest.raises(ProfileIntegrityError):
+            store.get_manifest(manifest)
+    assert [p for p, _ in phases] == ["headers"]
+
+
+@pytest.mark.parametrize("damage", ["type", "days", "empty", "ref_type", "ref_value", "order", "scope"])
+def test_manifest_revalidates_before_session(damage: str) -> None:
+    store, _, factory, _, _, manifest = manifest_harness()
+    if damage == "type":
+        manifest = None
+    elif damage == "ref_value":
+        object.__setattr__(manifest.days[0], "revision", True)
+    elif damage == "scope":
+        object.__setattr__(manifest, "base_grid_id", "bad!")
+    else:
+        value = {"days": list(manifest.days), "empty": (), "ref_type": (None,), "order": tuple(reversed(manifest.days))}[damage]
+        object.__setattr__(manifest, "days", value)
+    with pytest.raises(ValueError):
+        store.get_manifest(manifest)  # type: ignore[arg-type]
+    factory.assert_not_called()
+
+
+@pytest.mark.parametrize("resource", ["bins", "events", "all_events", "bytes", "numeric", "metadata", "bin_numeric"])
+def test_manifest_preflight_resource_limits_without_payload(resource: str) -> None:
+    store, _, _, data, phases, manifest = manifest_harness(11 if resource == "all_events" else 2)
+    if resource in ("bins", "events"):
+        name, value = {"bins": ("bin_count", 100001), "events": ("event_count", 1001)}[resource]
+        data["summaries"][0][name] = value
+    elif resource == "all_events":
+        for row in data["summaries"]:
+            row["event_count"] = 1000
+    elif resource == "bytes":
+        for row in data["summaries"]:
+            row["bin_count"] = 70000  # Each day fits; combined accounting exceeds 32 MiB.
+    elif resource == "bin_numeric":
+        data["summaries"][0]["oversized"] = True
+    else:
+        key = "bin_origin_oversized" if resource == "numeric" else "source_manifest_oversized"
+        data["headers"][0][key] = True
+    with pytest.raises(reader.ProfileReadTooLarge):
+        store.get_manifest(manifest)
+    assert not {"payloads", "bins", "events"} & {p for p, _ in phases}
+
+
+def test_manifest_exact_resource_boundaries_then_payload_consistency(monkeypatch: pytest.MonkeyPatch) -> None:
+    for field, maximum, count in (("bin_count", 100000, 1), ("event_count", 1000, 1), ("event_count", 1000, 10)):
+        store, _, _, data, phases, manifest = manifest_harness(count)
+        for summary in data["summaries"]:
+            summary[field] = maximum
+        with pytest.raises(ProfileIntegrityError):  # Exact bound passes; short fake payload fails.
+            store.get_manifest(manifest)
+        assert [p for p, _ in phases][-3:] == ["payloads", "bins", "events"]
+    store, _, _, data, _, manifest = manifest_harness()
+    exact = len(manifest.days) * (1024 + 4) + len(data["bins"]) * 256 + len(data["events"]) * 512
+    monkeypatch.setattr(reader, "MAX_OPERATION_BYTES", exact)
+    assert store.get_manifest(manifest) is not None
+    monkeypatch.setattr(reader, "MAX_OPERATION_BYTES", exact - 1)
+    with pytest.raises(reader.ProfileReadTooLarge):
+        store.get_manifest(manifest)
+
+
+@pytest.mark.parametrize("phase", ["payloads", "bins", "events"])
+def test_manifest_payload_one_over_is_too_large(phase: str) -> None:
+    store, _, _, data, _, manifest = manifest_harness()
+    data[phase].append(data[phase][0])
+    with pytest.raises(reader.ProfileReadTooLarge):
+        store.get_manifest(manifest)
+
+
+@pytest.mark.parametrize("phase,damage", [(p, d) for p in ("summaries", "payloads", "bins", "events")
+                                         for d in ("missing", "foreign", "duplicate")] + [("bins", "reverse"), ("events", "reverse"),
+                                         ("payloads", "json"), ("payloads", "size"), ("bins", "numeric"), ("events", "corrupt")])
+def test_manifest_payload_scope_order_count_integrity(phase: str, damage: str) -> None:
+    store, _, _, data, _, manifest = manifest_harness()
+    rows = data[phase]
+    if damage == "missing":
+        rows.pop()
+    elif damage == "foreign":
+        rows[0]["id" if phase in ("summaries", "payloads") else "snapshot_id"] = "a" * 64
+    elif damage == "duplicate":
+        rows[1] = rows[0]
+    elif damage == "reverse":
+        rows.reverse()
+    elif damage in ("json", "size"):
+        rows[0]["source_manifest"] = "xx" if damage == "json" else "{} "
+    elif damage == "numeric":
+        rows[0]["base_volume"] = Decimal("NaN")
+    else:
+        rows[0]["reason_code"] = "bad!"
+    with pytest.raises(ProfileIntegrityError):
+        store.get_manifest(manifest)
+
+
+@pytest.mark.parametrize("phase", ["headers", "summaries", "payloads", "bins", "events", "commit"])
+def test_manifest_database_errors_propagate_once(phase: str) -> None:
+    store, session, factory, data, phases, manifest = manifest_harness()
+    error = DBAPIError("injected", None, Exception("injected"))
+    if phase == "commit":
+        session.begin.return_value.__exit__.side_effect = error
+    else:
+        data.update(failure_phase=phase, failure=error)
+    with pytest.raises(DBAPIError) as caught:
+        store.get_manifest(manifest)
+    assert caught.value is error and factory.call_count == 1
+    if phase == "commit":
+        assert len(phases) == 5
+    else:
+        assert phases[-1][0] == phase
+
+
+def test_manifest_metadata_sql_cap_does_not_relax_canonical_cap() -> None:
+    store, _, _, data, phases, manifest = manifest_harness()
+    raw = json.dumps({"x": "a" * (131072 - 9)})
+    assert len(raw.encode()) == 131072
+    data["headers"][0]["source_manifest_bytes"] = 131072
+    data["payloads"][0]["source_manifest"] = raw
+    with pytest.raises(ProfileIntegrityError):
+        store.get_manifest(manifest)
+    assert [p for p, _ in phases][-3:] == ["payloads", "bins", "events"]
+    phases.clear()
+    data["headers"][0]["source_manifest_bytes"] = -1
+    with pytest.raises(ProfileIntegrityError):
+        store.get_manifest(manifest)
+    assert [p for p, _ in phases] == ["headers"]
+
+
+@pytest.mark.parametrize("field,value", [("bin_count", True), ("bin_count", -1), ("event_count", -1), ("event_count", None), ("oversized", 0)])
+def test_manifest_corrupt_summary_flags_fail_before_payload(field: str, value: object) -> None:
+    store, _, _, data, phases, manifest = manifest_harness()
+    data["summaries"][0][field] = value
+    with pytest.raises(ProfileIntegrityError):
+        store.get_manifest(manifest)
+    assert [p for p, _ in phases] == ["headers", "summaries"]
+
+
+def test_manifest_event_identity_and_per_day_count_cannot_shift() -> None:
+    store, _, _, data, _, manifest = manifest_harness()
+    # IDs remain globally sorted by snapshot; duplicated event ID must still fail.
+    data["events"][1]["event_id"] = data["events"][0]["event_id"]
+    with pytest.raises(ProfileIntegrityError):
+        store.get_manifest(manifest)
+    store, _, _, data, _, manifest = manifest_harness()
+    # Global totals stay equal, but one day's claimed count cannot cover another day.
+    data["summaries"][0]["bin_count"] += 1
+    data["summaries"][1]["bin_count"] -= 1
+    with pytest.raises(ProfileIntegrityError):
+        store.get_manifest(manifest)
+
+
+@pytest.mark.parametrize("reverse", [False, True])
+@pytest.mark.parametrize("oversize", ["header_bytes", "header_numeric", "summary_count"])
+@pytest.mark.parametrize("corrupt", ["identity", "timestamp", "header_flag", "header_size", "summary_count", "summary_flag"])
+def test_manifest_integrity_precedes_any_resource_error(reverse: bool, oversize: str, corrupt: str) -> None:
+    store, _, _, data, phases, manifest = manifest_harness()
+    if oversize == "header_bytes":
+        data["headers"][0].update(source_manifest_bytes=131073, source_manifest_oversized=True)
+    elif oversize == "header_numeric":
+        data["headers"][0]["bin_origin_oversized"] = True
+    else:
+        data["summaries"][0]["bin_count"] = 100001
+    if corrupt == "identity":
+        data["headers"][1]["revision"] = 2
+    elif corrupt == "timestamp":
+        data["headers"][1]["computed_at"] = NOW.replace(tzinfo=None)
+    elif corrupt == "header_flag":
+        data["headers"][1]["quote_volume_oversized"] = 0
+    elif corrupt == "header_size":
+        data["headers"][1]["reconciliation_bytes"] = -1
+    elif corrupt == "summary_count":
+        data["summaries"][1]["event_count"] = -1
+    else:
+        data["summaries"][1]["oversized"] = None
+    if reverse:
+        data["headers"].reverse()
+        data["summaries"].reverse()
+    with pytest.raises(ProfileIntegrityError):
+        store.get_manifest(manifest)
+    assert not {"payloads", "bins", "events"} & {p for p, _ in phases}

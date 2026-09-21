@@ -2,12 +2,12 @@
 
 Transaction waits are bounded; connection/pool and end-to-end deadlines are not.
 """
-from collections.abc import Callable, Iterator
+from collections.abc import Callable, Iterator, Sequence
 from contextlib import AbstractContextManager, contextmanager
 import json
 from typing import Any, cast
 
-from sqlalchemy import Table, Text, and_, case, cast as sql_cast, func, literal_column, select, text
+from sqlalchemy import Table, Text, and_, case, cast as sql_cast, func, literal_column, select, text, true
 from sqlalchemy.engine import RowMapping
 from sqlalchemy.orm import Session
 from sqlalchemy.sql import ColumnElement
@@ -18,14 +18,16 @@ from .read_results import CANDIDATE_ACCOUNTING_BYTES, MAX_CANDIDATES, MAX_MANIFE
 from .read_results import (
     BIN_ACCOUNTING_BYTES, EVENT_ACCOUNTING_BYTES, HEADER_ACCOUNTING_BYTES, MAX_BINS,
     MAX_INVALIDATIONS_PER_OPERATION, MAX_INVALIDATIONS_PER_SNAPSHOT, MAX_METADATA_TEXT_BYTES,
-    MAX_NUMERIC_TEXT_BYTES, VerifiedDailyRead,
+    MAX_NUMERIC_TEXT_BYTES, VerifiedDailyRead, VerifiedManifestRead,
 )
-from .read_types import DailyProfileRef, _hex, _integer, _scope, _window
+from .read_types import DailyProfileRef, OrderedProfileManifest, _hex, _integer, _scope, _window
 from .repository import ProfileIntegrityError, TransactionWaitPolicy, _verify_rows
 
 _SNAPSHOT = cast(Table, VolumeProfileSnapshot.__table__)
 _INVALIDATION = cast(Table, MarketDataInvalidation.__table__)
 _BIN = cast(Table, VolumeProfileBin.__table__)
+_METADATA = ("source_manifest", "reconciliation")
+_NUMERIC = ("bin_origin", "bin_step", "base_volume", "quote_volume")
 
 
 class ProfileReadTooLarge(ValueError):
@@ -41,9 +43,14 @@ def _timestamp_projection(name: str, *, nullable: bool = False, table: Table = _
     return valid.label(name + "_valid"), case((finite, column), else_=None).label(name)
 
 
-def _bounded_count(value: object, maximum: int) -> int:
+def _count_shape(value: object) -> int:
     if type(value) is not int or value < 0:
         raise ProfileIntegrityError("profile integrity check failed")
+    return value
+
+
+def _bounded_count(value: object, maximum: int) -> int:
+    value = _count_shape(value)
     if value > maximum:
         raise ProfileReadTooLarge("profile read exceeds limit")
     return value
@@ -54,6 +61,80 @@ def _size_flag(value: object) -> None:
         raise ProfileIntegrityError("profile integrity check failed")
     if value:
         raise ProfileReadTooLarge("profile read exceeds limit")
+
+
+def _header_projection() -> list[ColumnElement[Any]]:
+    fields = ("id", "revision", "content_sha256", "product_id", "window_start_ms", "window_end_ms", "grid_id",
+              "algorithm_version", "period", "timezone", "quality", "aggregate_count", "occupied_bins",
+              "availability_basis", "raw_retention_state")
+    projection: list[ColumnElement[Any]] = [_SNAPSHOT.c[name] for name in fields]
+    for name in ("computed_at", "published_at", "source_available_at"):
+        projection.extend(_timestamp_projection(name, nullable=name == "source_available_at"))
+    for name in _METADATA:
+        length = func.octet_length(sql_cast(_SNAPSHOT.c[name], Text))
+        projection.extend(((length > MAX_METADATA_TEXT_BYTES).label(name + "_oversized"),
+                           case((length <= MAX_METADATA_TEXT_BYTES, length), else_=MAX_METADATA_TEXT_BYTES + 1).label(name + "_bytes")))
+    for name in _NUMERIC:
+        length = func.octet_length(sql_cast(_SNAPSHOT.c[name], Text))
+        projection.extend(((length > MAX_NUMERIC_TEXT_BYTES).label(name + "_oversized"),
+                           case((length <= MAX_NUMERIC_TEXT_BYTES, _SNAPSHOT.c[name]), else_=None).label(name)))
+    return projection
+
+
+def _header_shape(header: RowMapping, snapshot_id: str) -> list[int]:
+    try:
+        if header["id"] != snapshot_id or any(header[name + "_valid"] is not True
+                for name in ("computed_at", "published_at", "source_available_at")):
+            raise ValueError
+        if any(type(header[name + "_oversized"]) is not bool for name in (*_METADATA, *_NUMERIC)):
+            raise ValueError
+        return [_count_shape(header[name + "_bytes"]) for name in _METADATA]
+    except (ValueError, TypeError, KeyError):
+        raise ProfileIntegrityError("profile integrity check failed") from None
+
+
+def _header_sizes(header: RowMapping, snapshot_id: str) -> list[int]:
+    sizes = _header_shape(header, snapshot_id)
+    for size in sizes:
+        _bounded_count(size, MAX_METADATA_TEXT_BYTES)
+    for name in (*_METADATA, *_NUMERIC):
+        _size_flag(header[name + "_oversized"])
+    return sizes
+
+
+def _daily_read(header: RowMapping, payload: RowMapping | None, bins: Sequence[RowMapping], events: Sequence[RowMapping],
+                sizes: list[int], bin_count: int, event_count: int) -> VerifiedDailyRead:
+    try:
+        snapshot_id = header["id"]
+        if (payload is None or payload["id"] != snapshot_id or len(bins) != bin_count or len(events) != event_count
+                or any(b["snapshot_id"] != snapshot_id for b in bins)
+                or any(e["snapshot_id"] != snapshot_id or e["recorded_at_valid"] is not True for e in events)):
+            raise ValueError
+        decoded = dict(header)
+        for name, size in zip(_METADATA, sizes):
+            raw = payload[name]
+            if type(raw) is not str or len(raw.encode("utf-8")) != size:
+                raise ValueError
+            decoded[name] = json.loads(raw)
+        publication = _verify_rows(cast(RowMapping, decoded), bins)
+        invalidations = tuple(_event(e) for e in events)
+        ref = DailyProfileRef(header["id"], header["revision"], header["content_sha256"], header["window_start_ms"], header["window_end_ms"])
+        return VerifiedDailyRead(ref, header["computed_at"], header["published_at"], publication, invalidations)
+    except (ValueError, TypeError, KeyError, OverflowError, RecursionError):
+        raise ProfileIntegrityError("profile integrity check failed") from None
+
+
+def _indexed(rows: Sequence[RowMapping], ids: tuple[str, ...]) -> dict[str, RowMapping]:
+    try:
+        result = {}
+        for row in rows:
+            identifier = row["id"]
+            if type(identifier) is not str or identifier not in ids or identifier in result:
+                raise ValueError
+            result[identifier] = row
+        return result
+    except (ValueError, TypeError, KeyError):
+        raise ProfileIntegrityError("profile integrity check failed") from None
 
 
 class ProfileReadRepository:
@@ -120,41 +201,12 @@ class ProfileReadRepository:
     def get_verified(self, snapshot_id: str) -> VerifiedDailyRead | None:
         """Read one complete immutable snapshot, including revocation evidence, not policy."""
         _hex(snapshot_id)
-        fields = ("id", "revision", "content_sha256", "product_id", "window_start_ms", "window_end_ms", "grid_id",
-                  "algorithm_version", "period", "timezone", "quality", "aggregate_count", "occupied_bins",
-                  "availability_basis", "raw_retention_state")
-        metadata = ("source_manifest", "reconciliation")
-        numeric = ("bin_origin", "bin_step", "base_volume", "quote_volume")
-        projection: list[ColumnElement[Any]] = [_SNAPSHOT.c[name] for name in fields]
-        for name in ("computed_at", "published_at", "source_available_at"):
-            projection.extend(_timestamp_projection(name, nullable=name == "source_available_at"))
-        for name in metadata:
-            length = func.octet_length(sql_cast(_SNAPSHOT.c[name], Text))
-            projection.extend(((length > MAX_METADATA_TEXT_BYTES).label(name + "_oversized"),
-                               case((length <= MAX_METADATA_TEXT_BYTES, length), else_=MAX_METADATA_TEXT_BYTES + 1).label(name + "_bytes")))
-        for name in numeric:
-            length = func.octet_length(sql_cast(_SNAPSHOT.c[name], Text))
-            projection.extend(((length > MAX_NUMERIC_TEXT_BYTES).label(name + "_oversized"),
-                               case((length <= MAX_NUMERIC_TEXT_BYTES, _SNAPSHOT.c[name]), else_=None).label(name)))
         with self._transaction() as session:
-            header = session.execute(select(*projection).where(_SNAPSHOT.c.id == snapshot_id)).mappings().one_or_none()
+            header = session.execute(select(*_header_projection()).where(_SNAPSHOT.c.id == snapshot_id)).mappings().one_or_none()
             if header is None or header["quality"] != "VERIFIED":
                 return None
             # Queries are outside reconstruction catches: DBAPI errors retain their identity.
-            try:
-                if header["id"] != snapshot_id or any(header[name + "_valid"] is not True
-                        for name in ("computed_at", "published_at", "source_available_at")):
-                    raise ValueError
-                sizes = []
-                for name in metadata:
-                    _size_flag(header[name + "_oversized"])
-                    sizes.append(_bounded_count(header[name + "_bytes"], MAX_METADATA_TEXT_BYTES))
-                for name in numeric:
-                    _size_flag(header[name + "_oversized"])
-            except ProfileReadTooLarge:
-                raise
-            except (ValueError, TypeError, KeyError):
-                raise ProfileIntegrityError("profile integrity check failed") from None
+            sizes = _header_sizes(header, snapshot_id)
             bins_probe = select(*((func.octet_length(sql_cast(_BIN.c[name], Text)) > MAX_NUMERIC_TEXT_BYTES).label(name + "_oversized")
                                   for name in ("base_volume", "quote_volume"))).where(_BIN.c.snapshot_id == snapshot_id).limit(MAX_BINS + 1).subquery()
             bin_counts = session.execute(select(func.count().label("count"),
@@ -167,7 +219,7 @@ class ProfileReadRepository:
             event_count = _bounded_count(session.scalar(select(func.count()).select_from(event_probe)), event_limit)
             if HEADER_ACCOUNTING_BYTES + sum(sizes) + bin_count * BIN_ACCOUNTING_BYTES + event_count * EVENT_ACCOUNTING_BYTES > MAX_OPERATION_BYTES:
                 raise ProfileReadTooLarge("profile read exceeds limit")
-            payload = session.execute(select(_SNAPSHOT.c.id, *(sql_cast(_SNAPSHOT.c[name], Text).label(name) for name in metadata))
+            payload = session.execute(select(_SNAPSHOT.c.id, *(sql_cast(_SNAPSHOT.c[name], Text).label(name) for name in _METADATA))
                                       .where(_SNAPSHOT.c.id == snapshot_id)).mappings().one_or_none()
             bins = session.execute(select(_BIN.c.snapshot_id, _BIN.c.bin_index, _BIN.c.base_volume, _BIN.c.quote_volume, _BIN.c.aggregate_count)
                                    .where(_BIN.c.snapshot_id == snapshot_id).order_by(_BIN.c.snapshot_id, _BIN.c.bin_index).limit(MAX_BINS + 1)).mappings().all()
@@ -178,20 +230,97 @@ class ProfileReadRepository:
                 .limit(MAX_INVALIDATIONS_PER_OPERATION + 1)).mappings().all()
             _bounded_count(len(bins), MAX_BINS)
             _bounded_count(len(events), event_limit)
+            return _daily_read(header, payload, bins, events, sizes, bin_count, event_count)
+
+    def get_manifest(self, manifest: OrderedProfileManifest) -> VerifiedManifestRead | None:
+        """Read every pinned day in one snapshot; never return a partial manifest."""
+        if type(manifest) is not OrderedProfileManifest:
+            raise ValueError("expected exact profile manifest")
+        manifest.__post_init__()
+        for ref in manifest.days:
+            ref.__post_init__()
+        ids = tuple(ref.snapshot_id for ref in manifest.days)
+        with self._transaction() as session:
+            headers = _indexed(session.execute(select(*_header_projection()).where(_SNAPSHOT.c.id.in_(ids))
+                               .limit(len(ids) + 1)).mappings().all(), ids)
+            # Absence/quality precedes other header corruption, but never hides foreign/duplicate IDs.
+            if len(headers) != len(ids) or any(row.get("quality") != "VERIFIED" for row in headers.values()):
+                return None
+            sizes = {identifier: _header_shape(headers[identifier], identifier) for identifier in ids}
             try:
-                if (payload is None or payload["id"] != snapshot_id or len(bins) != bin_count or len(events) != event_count
-                        or any(b["snapshot_id"] != snapshot_id for b in bins)
-                        or any(e["snapshot_id"] != snapshot_id or e["recorded_at_valid"] is not True for e in events)):
-                    raise ValueError
-                decoded = dict(header)
-                for name, size in zip(metadata, sizes):
-                    raw = payload[name]
-                    if type(raw) is not str or len(raw.encode("utf-8")) != size:
+                for ref in manifest.days:
+                    row = headers[ref.snapshot_id]
+                    actual = DailyProfileRef(row["id"], row["revision"], row["content_sha256"], row["window_start_ms"], row["window_end_ms"])
+                    ProfileCandidate(actual, row["computed_at"], row["published_at"], row["source_available_at"], row["availability_basis"], False)
+                    _scope(row["product_id"], row["grid_id"], row["algorithm_version"])
+                    _integer(row["aggregate_count"])
+                    _integer(row["occupied_bins"])
+                    if actual != ref or (row["product_id"], row["grid_id"], row["algorithm_version"]) != (
+                            manifest.product_id, manifest.base_grid_id, manifest.algorithm_version):
                         raise ValueError
-                    decoded[name] = json.loads(raw)
-                publication = _verify_rows(cast(RowMapping, decoded), bins)
-                invalidations = tuple(_event(e) for e in events)
-                ref = DailyProfileRef(header["id"], header["revision"], header["content_sha256"], header["window_start_ms"], header["window_end_ms"])
-                return VerifiedDailyRead(ref, header["computed_at"], header["published_at"], publication, invalidations)
-            except (ValueError, TypeError, KeyError, OverflowError, RecursionError):
+            except (ValueError, TypeError, KeyError):
+                raise ProfileIntegrityError("profile integrity check failed") from None
+            requested = select(_SNAPSHOT.c.id).where(_SNAPSHOT.c.id.in_(ids)).limit(len(ids)).subquery("requested")
+            # Correlated bounded probes materialize only counts/flags, including zero for empty days.
+            probe = select(*((func.octet_length(sql_cast(_BIN.c[name], Text)) > MAX_NUMERIC_TEXT_BYTES).label(name)
+                             for name in ("base_volume", "quote_volume"))).where(_BIN.c.snapshot_id == requested.c.id)
+            probe = probe.correlate(requested).limit(MAX_BINS + 1).subquery()
+            counts = select(func.count().label("bin_count"), func.coalesce(func.bool_or(probe.c.base_volume | probe.c.quote_volume),
+                            False).label("oversized")).select_from(probe).lateral("bin_summary")
+            event_probe = select(_INVALIDATION.c.event_id).where(_INVALIDATION.c.snapshot_id == requested.c.id)
+            event_probe = event_probe.correlate(requested).limit(MAX_INVALIDATIONS_PER_SNAPSHOT + 1).subquery()
+            event_counts = select(func.count().label("event_count")).select_from(event_probe).lateral("event_summary")
+            summaries = _indexed(session.execute(select(requested.c.id, counts.c.bin_count, counts.c.oversized, event_counts.c.event_count)
+                .select_from(requested.join(counts, true()).join(event_counts, true())).limit(len(ids) + 1)).mappings().all(), ids)
+            if len(summaries) != len(ids):
+                raise ProfileIntegrityError("profile integrity check failed")
+            bins_per_day, events_per_day = {}, {}
+            for identifier, summary in summaries.items():
+                bins_per_day[identifier] = _count_shape(summary.get("bin_count"))
+                events_per_day[identifier] = _count_shape(summary.get("event_count"))
+                if type(summary.get("oversized")) is not bool:
+                    raise ProfileIntegrityError("profile integrity check failed")
+            # Whole-batch integrity precedes resource classification, independent of row order.
+            for identifier in ids:
+                _header_sizes(headers[identifier], identifier)
+                _bounded_count(bins_per_day[identifier], MAX_BINS)
+                _bounded_count(events_per_day[identifier], MAX_INVALIDATIONS_PER_SNAPSHOT)
+                summary = summaries[identifier]
+                _size_flag(summary.get("oversized"))
+            total_bins, total_events = sum(bins_per_day.values()), sum(events_per_day.values())
+            _bounded_count(total_events, MAX_INVALIDATIONS_PER_OPERATION)
+            remaining = MAX_OPERATION_BYTES - len(ids) * HEADER_ACCOUNTING_BYTES - sum(map(sum, sizes.values())) - total_events * EVENT_ACCOUNTING_BYTES
+            if remaining < 0 or total_bins * BIN_ACCOUNTING_BYTES > remaining:
+                raise ProfileReadTooLarge("profile read exceeds limit")
+            payload_rows = session.execute(select(_SNAPSHOT.c.id, *(sql_cast(_SNAPSHOT.c[name], Text).label(name) for name in _METADATA))
+                .where(_SNAPSHOT.c.id.in_(ids)).limit(len(ids) + 1)).mappings().all()
+            _bounded_count(len(payload_rows), len(ids))
+            payloads = _indexed(payload_rows, ids)
+            bin_limit = min(total_bins, remaining // BIN_ACCOUNTING_BYTES)
+            bins = session.execute(select(_BIN.c.snapshot_id, _BIN.c.bin_index, _BIN.c.base_volume, _BIN.c.quote_volume, _BIN.c.aggregate_count)
+                .where(_BIN.c.snapshot_id.in_(ids)).order_by(_BIN.c.snapshot_id, _BIN.c.bin_index).limit(bin_limit + 1)).mappings().all()
+            _bounded_count(len(bins), bin_limit)
+            events = session.execute(select(*(_INVALIDATION.c[name] for name in
+                ("event_id", "snapshot_id", "reason_code", "replacement_snapshot_id", "source")),
+                *_timestamp_projection("recorded_at", table=_INVALIDATION)).where(_INVALIDATION.c.snapshot_id.in_(ids))
+                .order_by(_INVALIDATION.c.snapshot_id, _INVALIDATION.c.recorded_at, _INVALIDATION.c.event_id).limit(total_events + 1)).mappings().all()
+            _bounded_count(len(events), total_events)
+            try:
+                if len(payloads) != len(ids) or len(bins) != total_bins or len(events) != total_events:
+                    raise ValueError
+                grouped_bins: dict[str, list[RowMapping]] = {identifier: [] for identifier in ids}
+                grouped_events: dict[str, list[RowMapping]] = {identifier: [] for identifier in ids}
+                for rows, fields, grouped in ((bins, ("snapshot_id", "bin_index"), grouped_bins),
+                                              (events, ("snapshot_id", "recorded_at", "event_id"), grouped_events)):
+                    keys = [tuple(row[name] for name in fields) for row in rows]
+                    if any(a >= b for a, b in zip(keys, keys[1:])):
+                        raise ValueError
+                    for row in rows:
+                        grouped[row["snapshot_id"]].append(row)
+                if len({event["event_id"] for event in events}) != len(events):
+                    raise ValueError
+                days = tuple(_daily_read(headers[i], payloads[i], grouped_bins[i], grouped_events[i], sizes[i],
+                                         bins_per_day[i], events_per_day[i]) for i in ids)
+                return VerifiedManifestRead(manifest, days)
+            except (ValueError, TypeError, KeyError, OverflowError):
                 raise ProfileIntegrityError("profile integrity check failed") from None
