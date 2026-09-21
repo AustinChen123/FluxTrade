@@ -14,6 +14,11 @@ from .live_query import (
 )
 from .live_selection import LiveSelectionContext
 from .read_types import ProfileQueryRequest
+from .decision_context import (
+    ProfileDecisionContext,
+    ProfileDecisionBasis,
+    ProfileDecisionStatus,
+)
 
 _MAX = (1 << 63) - 1
 _AGE = 300000
@@ -107,3 +112,75 @@ def validate_live_profile(
     if elapsed >= _AGE:
         return LiveProfileValidationUnavailable("VALIDATION_EXPIRED")
     return ValidatedLiveProfileQuery(result, start, end, elapsed)
+
+
+def finalize_live_profile_decision(
+    request: ProfileQueryRequest,
+    result: ValidatedLiveProfileQuery
+    | LiveProfileQueryUnavailable
+    | LiveProfileValidationUnavailable,
+    *,
+    observed_at_ms: int | None,
+    decision_time_ms: int,
+) -> ProfileDecisionContext:
+    """Finalize supplied evidence only; never refresh, reselect or read a clock."""
+    try:
+        _integer(decision_time_ms)
+        if (
+            type(request) is not ProfileQueryRequest
+            or request.purpose != "LIVE_QUERY"
+            or request.freshness_policy_id != "utc_complete_strict_v1"
+            or type(result)
+            not in (
+                ValidatedLiveProfileQuery,
+                LiveProfileQueryUnavailable,
+                LiveProfileValidationUnavailable,
+            )
+        ):
+            raise ValueError
+        if type(result) is ValidatedLiveProfileQuery:
+            if result.query.request is not request or observed_at_ms is None:
+                raise ValueError
+            _integer(observed_at_ms)
+        elif observed_at_ms is not None:
+            raise ValueError
+    except ValueError:
+        raise ProfileQueryError("INTEGRITY") from None
+    reason = None
+    if isinstance(result, ValidatedLiveProfileQuery):
+        assert observed_at_ms is not None
+        available = result.query.selection.available_at_ms
+        completed = result.validation_completed_at_ms
+        if not available <= completed <= observed_at_ms <= decision_time_ms:
+            reason = "CLOCK_UNCERTAIN"
+        elif decision_time_ms >= result.validation_expires_at_ms:
+            reason = "VALIDATION_EXPIRED"
+        else:
+            expected_end = decision_time_ms // 86400000 * 86400000
+            if request.end_ms < expected_end:
+                reason = "PROFILE_EXPIRED"
+            elif (
+                request.end_ms > expected_end
+            ):  # Defensive; valid ordered clocks preclude this.
+                reason = "PROFILE_NOT_READY"
+        if reason is None:
+            return ProfileDecisionContext(
+                request,
+                decision_time_ms,
+                ProfileDecisionBasis.LIVE_OBSERVED,
+                ProfileDecisionStatus.FRESH,
+                profile=result.query.profile,
+                available_at_ms=available,
+                validation_checked_at_ms=completed,
+                observed_at_ms=observed_at_ms,
+            )
+    else:
+        reason = "PROFILE_NOT_READY" if result.reason == "NOT_READY" else result.reason
+    status = (
+        ProfileDecisionStatus.INVALID
+        if reason in ("SNAPSHOT_REVOKED", "INVALID_PROFILE", "QUERY_TOO_LARGE")
+        else ProfileDecisionStatus.MISSING
+    )
+    return ProfileDecisionContext(
+        request, decision_time_ms, ProfileDecisionBasis.LIVE_OBSERVED, status, reason
+    )
