@@ -271,6 +271,14 @@ class ProfileIngestJobStore:
             return None if row is None else _state(row)
 
     def claim_next(self, worker_id: str, lease_duration: timedelta) -> JobClaim | None:
+        return self._claim(None, worker_id, lease_duration)
+
+    def claim(self, job_id: str, worker_id: str, lease_duration: timedelta) -> JobClaim | None:
+        """Claim only this due job; a locked or unavailable job returns None."""
+        _safe(job_id)
+        return self._claim(job_id, worker_id, lease_duration)
+
+    def _claim(self, job_id: str | None, worker_id: str, lease_duration: timedelta) -> JobClaim | None:
         _safe(worker_id, 128)
         _duration(lease_duration)
         with self._transaction() as session:
@@ -290,7 +298,7 @@ class ProfileIngestJobStore:
             row = (
                 session.execute(
                     select(_JOB)
-                    .where(due)
+                    .where(due, *([] if job_id is None else [_JOB.c.id == job_id]))
                     .order_by(_JOB.c.window_start_ms, _JOB.c.id)
                     .limit(1)
                     .with_for_update(skip_locked=True)
@@ -437,14 +445,7 @@ class ProfileIngestJobStore:
                 # DONE retains attempt/spec, not worker identity. Exact readback is mandatory.
                 if state.spec != claim.spec or state.attempt != claim.attempt:
                     raise JobCompletionError("job publication recovery mismatch")
-                snapshot = session.execute(select(_SNAPSHOT).where(_SNAPSHOT.c.id == state.completed_snapshot_id)).mappings().one_or_none()
-                if snapshot is None:
-                    raise JobCompletionError("job publication recovery mismatch")
-                try:
-                    verified = _verify(session, snapshot, expected=publication)
-                except ProfileIntegrityError:
-                    raise JobCompletionError("job publication recovery mismatch") from None
-                return JobPublicationResult(_result(snapshot, verified, True), state, True)
+                return self._recover_completed(session, state, claim.spec, publication)
             now = _utc(session.scalar(select(func.clock_timestamp())))
             _require_live_claim(state, claim, now)
             profile = _publish_in_transaction(session, publication)
@@ -454,3 +455,28 @@ class ProfileIngestJobStore:
                               lease_owner=None, lease_expires_at=None, retry_after_at=None,
                               last_error_code=None, last_error_detail=None)
             return JobPublicationResult(profile, done, False)
+
+    def recover_completed(self, spec: JobSpec, publication: VerifiedProfilePublication) -> JobPublicationResult | None:
+        """Read committed completion evidence, without authorizing or mutating work."""
+        if type(spec) is not JobSpec or type(publication) is not VerifiedProfilePublication:
+            raise ValueError("expected exact job spec and publication")
+        with self._transaction(False) as session:
+            row = session.execute(select(_JOB).where(_JOB.c.id == spec.id)).mappings().one_or_none()
+            state = None if row is None else _state(row)
+            if state is None or state.status != "DONE":
+                return None
+            return self._recover_completed(session, state, spec, publication)
+
+    @staticmethod
+    def _recover_completed(session: Session, state: JobState, spec: JobSpec,
+                           publication: VerifiedProfilePublication) -> JobPublicationResult:
+        if state.spec != spec or any(value != getattr(spec, key) for key, value in _logical(publication.content).items()):
+            raise JobCompletionError("job publication recovery mismatch")
+        snapshot = session.execute(select(_SNAPSHOT).where(_SNAPSHOT.c.id == state.completed_snapshot_id)).mappings().one_or_none()
+        if snapshot is None:
+            raise JobCompletionError("job publication recovery mismatch")
+        try:
+            verified = _verify(session, snapshot, expected=publication)
+        except ProfileIntegrityError:
+            raise JobCompletionError("job publication recovery mismatch") from None
+        return JobPublicationResult(_result(snapshot, verified, True), state, True)

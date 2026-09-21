@@ -63,6 +63,47 @@ def test_register_is_immutable_and_guards_database_boundary() -> None:
         session.execute.assert_not_called()
 
 
+def test_exact_claim_shares_due_classifier_and_scopes_locked_candidate() -> None:
+    store, session, row, events = harness()
+    claim = store.claim(SPEC.id, "worker", LEASE)
+    assert claim is not None and claim.spec == SPEC and claim.attempt == 1
+    candidate = session.execute.call_args_list[2].args[0].compile(dialect=postgresql.dialect())
+    assert candidate.params["id_1"] == SPEC.id
+    assert "volume_profile_ingest_job.id =" in str(candidate)
+    assert "FOR UPDATE SKIP LOCKED" in events[2]
+    exact_where = str(candidate).split("WHERE ")[1].split(" ORDER BY")[0]
+    store.claim_next("worker", LEASE)
+    next_where = events[-2].split("WHERE ")[1].split(" ORDER BY")[0]
+    assert exact_where == f"({next_where}) AND volume_profile_ingest_job.id = %(id_1)s"
+    row.update(attempt=4, lease_expires_at=NOW, source_cursor={"id": 8})
+    takeover = store.claim(SPEC.id, "new", LEASE)
+    assert takeover is not None and takeover.attempt == 5 and takeover.source_cursor.thaw() == {"id": 8}
+    from src.core.market_data.profiles.types import BIGINT_MAX
+    row["attempt"] = BIGINT_MAX
+    with pytest.raises(JobIntegrityError, match="job attempt exhausted"):
+        store.claim(SPEC.id, "worker", LEASE)
+    row["attempt"] = True
+    with pytest.raises(JobIntegrityError):
+        store.claim(SPEC.id, "worker", LEASE)
+
+
+def test_exact_claim_unavailable_candidate_never_updates_another_job() -> None:
+    store, session, _, events = harness()
+    execute = session.execute.side_effect
+
+    def unavailable(statement: Any) -> MagicMock:
+        result = execute(statement)
+        if "FOR UPDATE" in str(statement):
+            result.mappings.return_value.one_or_none.return_value = None
+        return result
+
+    session.execute.side_effect = unavailable
+    assert store.claim("different_job", "worker", LEASE) is None
+    assert not any(sql.startswith("UPDATE") for sql in events)
+    assert "retry_after_at <= clock_timestamp()" in events[2]
+    assert "lease_expires_at <= clock_timestamp()" in events[2]
+
+
 def test_takeover_checkpoint_retry_and_fail_are_fenced() -> None:
     store, session, row, events = harness()
     row.update(status="RUNNING", attempt=4, lease_owner="old", lease_expires_at=NOW,

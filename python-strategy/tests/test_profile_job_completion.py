@@ -71,6 +71,63 @@ def test_complete_reuses_exact_readback_and_second_fence() -> None:
     assert job["status"] == "DONE"
 
 
+def test_completed_recovery_is_read_only_and_matches_claim_ack_recovery() -> None:
+    store, session, job, events, claim, snapshot = completion()
+    assert store.recover_completed(claim.spec, publication()) is None
+    store.complete(claim, snapshot["id"])
+    events.clear()
+    result = store.recover_completed(claim.spec, publication())
+    assert result is not None and result.profile.already_present and result.recovered_after_commit
+    assert all(sql.startswith("SELECT") and "FOR UPDATE" not in sql and "pg_advisory" not in sql for sql in events)
+    assert result == store.publish_and_complete(claim, publication())
+    assert job["attempt"] == claim.attempt
+    execute = session.execute.side_effect
+
+    def missing(statement: Any) -> MagicMock:
+        response = execute(statement)
+        if "FROM volume_profile_ingest_job" in str(statement):
+            response.mappings.return_value.one_or_none.return_value = None
+        return response
+
+    session.execute.side_effect = missing
+    assert store.recover_completed(claim.spec, publication()) is None
+
+
+@pytest.mark.parametrize("damage", ["spec", "attempt", "missing", "metadata", "digest", "quality", "bins"])
+def test_completed_recovery_rejects_mismatched_or_corrupt_evidence(damage: str) -> None:
+    from src.core.market_data.profiles.jobs import JobIntegrityError
+    store, session, job, events, claim, snapshot = completion()
+    store.complete(claim, snapshot["id"])
+    value = publication()
+    spec = claim.spec
+    if damage == "spec":
+        spec = replace(spec, config_sha256="b" * 64)
+    elif damage == "attempt":
+        job["attempt"] = 0
+    elif damage == "missing":
+        snapshot.clear()
+    elif damage == "metadata":
+        value = replace(value, source_manifest=CanonicalJsonObject({"changed": True}))
+    elif damage == "digest":
+        snapshot["content_sha256"] = "b" * 64
+    elif damage == "quality":
+        snapshot.update(quality="PARTIAL", published_at=None)
+    else:
+        execute = session.execute.side_effect
+
+        def missing_bins(statement: Any) -> MagicMock:
+            response = execute(statement)
+            if "FROM volume_profile_bin" in str(statement):
+                response.mappings.return_value.all.return_value = []
+            return response
+
+        session.execute.side_effect = missing_bins
+    events.clear()
+    with pytest.raises(JobIntegrityError if damage == "attempt" else JobCompletionError):
+        store.recover_completed(spec, value)
+    assert all(sql.startswith("SELECT") and "FOR UPDATE" not in sql for sql in events)
+
+
 @pytest.mark.parametrize(
     "damage", ["missing", "quality", "published_at", "base_volume", "metadata", "digest", "identity"]
 )
