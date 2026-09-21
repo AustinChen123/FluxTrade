@@ -52,7 +52,10 @@ def test_service_order_and_single_calls(monkeypatch: pytest.MonkeyPatch) -> None
     ],
 )
 def test_unavailable_no_served_clock(
-    monkeypatch: pytest.MonkeyPatch, reason: str, status: int
+    monkeypatch: pytest.MonkeyPatch,
+    reason: str,
+    status: int,
+    caplog: pytest.LogCaptureFixture,
 ) -> None:
     cls = (
         service.LiveProfileValidationUnavailable
@@ -68,10 +71,16 @@ def test_unavailable_no_served_clock(
     ).query(RAW)
     assert isinstance(result, service.ProfileHttpError) and result.status == status
     clock.assert_not_called()
+    assert len(caplog.records) == (1 if status >= 500 else 0)
+    if status >= 500:
+        assert caplog.records[0].getMessage() == (
+            f"profile_backend_failure phase=validate reason={reason}"
+        )
 
 
 def test_service_sanitizes_exception_not_baseexception(
     monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
 ) -> None:
     validate = Mock(side_effect=RuntimeError("SECRET"))
     monkeypatch.setattr(service, "validate_live_profile", validate)
@@ -80,9 +89,44 @@ def test_service_sanitizes_exception_not_baseexception(
     )
     assert owner.query(RAW) == service.ProfileHttpError(503, "BACKEND_UNAVAILABLE")
     validate.assert_called_once()
+    assert [record.getMessage() for record in caplog.records] == [
+        "profile_backend_failure phase=validate exception_type=RuntimeError"
+    ]
+    assert "SECRET" not in caplog.text
+    assert caplog.records[0].exc_info is None
+    caplog.clear()
     validate.side_effect = KeyboardInterrupt("SECRET")
     with pytest.raises(KeyboardInterrupt):
         owner.query(RAW)
+    assert not caplog.records
+
+
+@pytest.mark.parametrize(
+    "status,code", [(503, "BACKEND_UNAVAILABLE"), (400, "QUERY_TOO_LARGE")]
+)
+def test_encoder_failure_logging(monkeypatch, caplog, status, code):
+    _, provider, query, _, start = fixture(monkeypatch)
+    evidence = ValidatedLiveProfileQuery(query, start, start, 0)
+    monkeypatch.setattr(service, "validate_live_profile", Mock(return_value=evidence))
+    error = service.ProfileHttpError(status, code)
+    monkeypatch.setattr(service, "encode_profile_success", Mock(return_value=error))
+    owner = service.ProfileQueryService(
+        provider, utc_ms=lambda: start, monotonic_ms=lambda: 0
+    )
+    assert owner.query(RAW) is error
+    assert [record.getMessage() for record in caplog.records] == (
+        ["profile_backend_failure phase=encode code=BACKEND_UNAVAILABLE"]
+        if status == 503
+        else []
+    )
+
+
+def test_invalid_query_has_no_backend_log(caplog):
+    owner = service.ProfileQueryService(
+        Mock(), utc_ms=lambda: 0, monotonic_ms=lambda: 0
+    )
+    assert owner.query(b"SECRET=%") == service.ProfileHttpError(400, "INVALID_REQUEST")
+    assert not caplog.records
 
 
 def app(owner=None):
