@@ -28,6 +28,7 @@ from __future__ import annotations
 
 import json
 import os
+import sys
 import time
 from collections.abc import Callable, Iterator
 from concurrent.futures import ThreadPoolExecutor
@@ -35,6 +36,7 @@ from contextlib import contextmanager
 from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
+from pathlib import Path
 from threading import Barrier, Event
 from typing import Any
 
@@ -47,6 +49,8 @@ from sqlalchemy.orm import Session, sessionmaker
 from src.core.database_url import build_postgres_url
 from src.core.market_data.profiles import jobs as profile_jobs
 from src.core.market_data.profiles import repository as profile_repository
+from src.core.market_data.profiles.handoff import parse_handoff
+from src.core.market_data.profiles.ingest import ProfileIngestProcess
 from src.core.market_data.profiles.publication import CanonicalJsonObject, VerifiedProfilePublication
 from src.core.market_data.profiles.types import ProfileBin, VolumeProfileContent
 
@@ -794,6 +798,145 @@ def _atomic_claim(engine: Engine, job_id: str = "job") -> profile_jobs.JobClaim:
     claim = store.claim_next(job_id, timedelta(minutes=5))
     assert claim is not None and claim.spec.id == job_id
     return claim
+
+
+@pytest.fixture
+def process_assembler(tmp_path: Path) -> tuple[Path, profile_jobs.JobSpec]:
+    """Real subprocess, strict fixture wire; not a claim of official provenance."""
+    wire = json.loads((Path(__file__).parent / "fixtures/profile_handoff_v1.json").read_text())["wire_bytes"]
+    helper = tmp_path / "assembler"
+    helper.write_text(f"#!{sys.executable}\n" + """import argparse, hashlib, json, pathlib, sys
+p = argparse.ArgumentParser()
+for name in ('staging-root', 'job-id', 'start-ms', 'source-available-at-ms'):
+    p.add_argument('--' + name, required=True)
+a = p.parse_args()
+root = pathlib.Path(a.staging_root)
+(root / 'invoked').write_text('yes')
+raw = sys.stdin.buffer.read(65537)
+mode = (root / 'mode').read_text() if (root / 'mode').exists() else ''
+if mode == 'exit': raise SystemExit(7)
+if mode == 'parse': print('SECRET malformed'); raise SystemExit(0)
+""" + f"wire = json.loads({wire!r})\n" + """wire['job_id'] = a.job_id
+wire['source_available_at_ms'] = int(a.source_available_at_ms)
+wire['reconciliation']['response_sha256'] = hashlib.sha256(raw).hexdigest() if mode != 'hash' else 'a'*64
+print(json.dumps(wire, sort_keys=True, separators=(',', ':')))
+""")
+    helper.chmod(0o700)
+    return helper, parse_handoff(wire.encode()).spec
+
+
+@pytest.mark.parametrize("ack_loss", [False, True])
+def test_ingest_process_pg_publish_and_read_only_restart(
+    profile_repository_pg: Engine, process_assembler: tuple[Path, profile_jobs.JobSpec], ack_loss: bool,
+) -> None:
+    engine, (helper, spec) = profile_repository_pg, process_assembler
+    committed = False
+    failure = DBAPIError("commit acknowledgment", None, Exception("injected ACK loss"))
+
+    def observe(conn: sa.Connection, cursor: Any, statement: str, parameters: Any, context: Any, executemany: bool) -> None:
+        nonlocal committed
+        if statement.startswith("UPDATE volume_profile_ingest_job") and "DONE" in parameters.values():
+            committed = True
+
+    @contextmanager
+    def sessions() -> Iterator[Session]:
+        with Session(engine) as session:
+            yield session
+            if ack_loss and committed:
+                raise failure
+
+    event.listen(engine, "after_cursor_execute", observe)
+    try:
+        owner = ProfileIngestProcess(profile_jobs.ProfileIngestJobStore(sessions), str(helper))
+        if ack_loss:
+            with pytest.raises(DBAPIError) as caught:
+                owner.run(spec, str(helper.parent), b"controlled kline", 86400000, "worker")
+            assert caught.value is failure
+        else:
+            assert owner.run(spec, str(helper.parent), b"controlled kline", 86400000, "worker").status == "PUBLISHED"
+    finally:
+        event.remove(engine, "after_cursor_execute", observe)
+    before = _job_row(engine, spec.id)
+    assert before["status"] == "DONE" and _profile_counts(engine) == (1, 2)
+    sql: list[str] = []
+
+    def record(conn: sa.Connection, cursor: Any, statement: str, parameters: Any, context: Any, executemany: bool) -> None:
+        sql.append(statement.upper())
+
+    event.listen(engine, "before_cursor_execute", record)
+    try:
+        result = ProfileIngestProcess(_job_store(engine), str(helper)).run(spec, str(helper.parent), b"controlled kline", 86400000, "restart")
+    finally:
+        event.remove(engine, "before_cursor_execute", record)
+    assert result.status == "RECOVERED" and result.publication is not None
+    assert result.publication.profile.revision == 1 and result.publication.profile.already_present
+    assert sql and all(s.startswith("SELECT") and "FOR UPDATE" not in s and "PG_ADVISORY" not in s for s in sql)
+    assert result.publication.profile == profile_repository.ProfileRepository(sessionmaker(engine)).get_verified(result.publication.profile.snapshot_id)
+    assert _job_row(engine, spec.id) == before and _profile_counts(engine) == (1, 2)
+
+
+@pytest.mark.parametrize("mode", ["exit", "parse", "hash"])
+def test_ingest_process_pg_failure_retries_only_requested_job(
+    profile_repository_pg: Engine, process_assembler: tuple[Path, profile_jobs.JobSpec], mode: str,
+) -> None:
+    engine, (helper, spec) = profile_repository_pg, process_assembler
+    store = _job_store(engine)
+    store.register(replace(spec, id="other"))
+    before = _job_row(engine, "other")
+    (helper.parent / "mode").write_text(mode)
+    result = ProfileIngestProcess(store, str(helper)).run(spec, str(helper.parent), b"SECRET raw", 86400000, "worker")
+    assert result.status == "RETRYABLE" and _profile_counts(engine) == (0, 0)
+    row = _job_row(engine, spec.id)
+    assert row["status"] == "RETRYABLE" and row["last_error_code"] == "ASSEMBLY_FAILED"
+    assert row["last_error_detail"] == "offline assembly validation failed"
+    assert _job_row(engine, "other") == before
+
+
+def test_ingest_process_pg_busy_locked_and_not_due_never_assemble(
+    profile_repository_pg: Engine, process_assembler: tuple[Path, profile_jobs.JobSpec],
+) -> None:
+    engine, (helper, spec) = profile_repository_pg, process_assembler
+    store = _job_store(engine)
+    store.register(spec)
+    store.register(replace(spec, id="other"))
+    before = _job_row(engine, "other")
+    owner = ProfileIngestProcess(store, str(helper))
+    with engine.begin() as locked:
+        locked.execute(text("SET LOCAL statement_timeout='2s'"))
+        locked.execute(text("SELECT id FROM volume_profile_ingest_job WHERE id=:id FOR UPDATE"), {"id": spec.id}).one()
+        with ThreadPoolExecutor(max_workers=1) as pool:
+            assert pool.submit(owner.run, spec, str(helper.parent), b"raw", 86400000, "worker").result(timeout=3).status == "UNAVAILABLE"
+    claim = store.claim(spec.id, "owner", timedelta(minutes=5))
+    assert claim is not None
+    assert owner.run(spec, str(helper.parent), b"raw", 86400000, "worker").status == "UNAVAILABLE"
+    store.retry(claim, timedelta(hours=1), "RETRY", "bounded")
+    assert owner.run(spec, str(helper.parent), b"raw", 86400000, "worker").status == "UNAVAILABLE"
+    assert not (helper.parent / "invoked").exists() and _job_row(engine, "other") == before
+
+
+def test_ingest_process_pg_takeover_before_publish_fences_old_process(
+    profile_repository_pg: Engine, process_assembler: tuple[Path, profile_jobs.JobSpec], monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from src.core.market_data.profiles import ingest
+    engine, (helper, spec) = profile_repository_pg, process_assembler
+    original = ingest._assemble
+    taken: list[profile_jobs.JobClaim] = []
+
+    def assemble_then_takeover(argv: list[str], raw: bytes, policy: ingest.IngestPolicy) -> bytes:
+        result = original(argv, raw, policy)
+        with engine.begin() as conn:
+            conn.execute(text("UPDATE volume_profile_ingest_job SET lease_expires_at=clock_timestamp()-interval '1 second' WHERE id=:id"), {"id": spec.id})
+        claim = _job_store(engine).claim(spec.id, "new", timedelta(minutes=5))
+        assert claim is not None
+        taken.append(claim)
+        return result
+
+    monkeypatch.setattr(ingest, "_assemble", assemble_then_takeover)
+    with pytest.raises(profile_jobs.LeaseLost):
+        ProfileIngestProcess(_job_store(engine), str(helper)).run(spec, str(helper.parent), b"raw", 86400000, "old")
+    assert taken[0].attempt == 2 and _profile_counts(engine) == (0, 0)
+    row = _job_row(engine, spec.id)
+    assert row["lease_owner"] == "new" and row["status"] == "RUNNING"
 
 
 def test_atomic_profile_commit_ack_unknown_recovers_exact_committed_result(profile_repository_pg: Engine) -> None:
