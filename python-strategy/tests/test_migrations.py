@@ -301,6 +301,72 @@ def _publication_pg(variant: bool = False) -> VerifiedProfilePublication:
                                       datetime(2026, 1, 1, tzinfo=timezone.utc), "OBSERVED", "PRESENT")
 
 
+def test_profile_authenticated_route_pg_native_end_to_end(profile_repository_pg: Engine) -> None:
+    """Real migrated PG -> reader -> native merge -> authenticated app (no socket)."""
+    from unittest.mock import Mock
+    from urllib.parse import urlencode
+    from src.control_plane.app import ControlPlaneApp
+    from src.control_plane.backtest_jobs import BacktestJobExecutor
+    from src.control_plane.profile_http_query import ProfileQueryService
+
+    engine = profile_repository_pg
+    day = 86400000
+    content = VolumeProfileContent(
+        "BINANCE:BTCUSDT-SPOT", 0, day, "btc_spot_usdt_10_v1", Decimal(0), Decimal(10),
+        "vp-v1", (ProfileBin(2, Decimal("1.20"), Decimal("24.00"), 2),),
+    )
+    publication = VerifiedProfilePublication(
+        content, CanonicalJsonObject({"source": "integration"}), CanonicalJsonObject({"exact": True}),
+        datetime(1970, 1, 2, tzinfo=timezone.utc), "OBSERVED", "PRESENT",
+    )
+    sessions = sessionmaker(engine)
+    published = profile_repository.ProfileRepository(sessions).publish(publication)
+    utc, mono = Mock(side_effect=[day, day, day]), Mock(side_effect=[0, 0])
+    service = ProfileQueryService(ProfileReadRepository(sessions), utc_ms=utc, monotonic_ms=mono)
+    app = ControlPlaneApp(BacktestJobExecutor(run_inline=True), api_key="integration-key", profile_query_service=service)
+    statements: list[str] = []
+
+    def capture(connection, cursor, statement, parameters, context, executemany):
+        statements.append(statement)
+
+    event.listen(engine, "before_cursor_execute", capture)
+    try:
+        path = "/api/v1/market-data/volume-profiles?" + urlencode(dict(
+            product_id=content.product_id, base_grid_id=content.grid_id, output_grid_id=content.grid_id,
+            algorithm_version=content.algorithm_version, start_ms=0, end_ms=day,
+            purpose="LIVE_QUERY", freshness_policy_id="utc_complete_strict_v1",
+        ))
+        assert app.handle("GET", path).status_code == 401
+        utc.assert_not_called()
+        mono.assert_not_called()
+        assert statements == []
+        response = app.handle("GET", path, headers={"X-API-Key": "integration-key"})
+        assert response.status_code == 200
+        body = response.body
+        assert body["schema_version"] == 1 and body["data_kind"] == "VOLUME_PROFILE"
+        assert body["profile_kind"] == "DAILY" and body["validation_basis"] == "SERVER_PINNED_READ"
+        assert (body["snapshot_id"], body["revision"], body["content_sha256"]) == (
+            published.snapshot_id, published.revision, content.content_sha256)
+        ref = DailyProfileRef(published.snapshot_id, published.revision, content.content_sha256, 0, day)
+        manifest = OrderedProfileManifest(content.product_id, content.grid_id, content.algorithm_version, (ref,))
+        assert body["manifest"] == json.loads(manifest.canonical_bytes)
+        assert body["manifest_digest"] == manifest.manifest_digest
+        assert body["window"] == {"start_ms": 0, "end_ms": day}
+        assert body["coverage"] == {"expected_days": 1, "complete_days": 1}
+        assert body["grid"] == {"origin": "0", "step": "10", "unit": "USDT"}
+        assert body["bins"] == [{"bin_index": 2, "base_volume": "1.2", "quote_volume": "24", "aggregate_count": 2}]
+        assert (body["base_volume"], body["quote_volume"], body["aggregate_count"]) == ("1.2", "24", 2)
+        assert body["poc"] == {"bin_index": 2, "low": "20", "high_exclusive": "30"}
+        assert body["validation_started_at_ms"] == body["validation_completed_at_ms"] == body["served_at_ms"] == day
+        assert body["validation_expires_at_ms"] == day + 300000
+        assert body["validation_max_age_ms"] == body["validation_remaining_ms"] == 300000
+        assert not {"status", "composite_id", "merge_algorithm_version"} & body.keys()
+        assert utc.call_count == 3 and mono.call_count == 2 and statements
+    finally:
+        event.remove(engine, "before_cursor_execute", capture)
+        assert app.shutdown(1)
+
+
 def _profile_counts(engine: Engine) -> tuple[int, int]:
     with engine.connect() as conn:
         return (conn.execute(text("SELECT count(*) FROM volume_profile_snapshot")).scalar_one(),
