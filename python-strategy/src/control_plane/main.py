@@ -4,6 +4,7 @@ import logging
 import os
 import signal
 import threading
+import time
 from collections.abc import Callable
 
 from sqlalchemy import create_engine, text
@@ -27,12 +28,22 @@ from src.control_plane import (
     StrategyStateQueryService,
 )
 from src.control_plane.jobs import JobStore
+from src.control_plane.profile_http_query import ProfileQueryService
+from src.core.market_data.profiles.read_repository import ProfileReadRepository
 from src.control_plane.server import serve
 from src.core.db import SessionLocal, get_engine
 from src.core.redis_factory import create_redis_client
 
 
 logger = logging.getLogger(__name__)
+
+
+def _utc_ms() -> int:
+    return time.time_ns() // 1_000_000
+
+
+def _monotonic_ms() -> int:
+    return time.monotonic_ns() // 1_000_000
 
 
 def _build_readiness_probe(redis_client, db_session_factory):
@@ -81,16 +92,21 @@ def build_control_plane_app(
     api_key: str | None = None,
     browser_auth: BrowserAuthProvider | None = None,
     readiness_probe: Callable[[], None] | None = None,
+    profile_query_service: ProfileQueryService | None = None,
 ) -> ControlPlaneApp:
     if redis_client is None:
         redis_client = create_redis_client()
     if job_store is None:
         job_db_path = os.getenv("CONTROL_PLANE_JOB_DB_PATH")
-        job_store = (
-            SqliteJobStore(job_db_path) if job_db_path else InMemoryJobStore()
-        )
+        job_store = SqliteJobStore(job_db_path) if job_db_path else InMemoryJobStore()
 
     state_query = StrategyStateQueryService(db_session_factory)
+    if profile_query_service is None:
+        profile_query_service = ProfileQueryService(
+            ProfileReadRepository(db_session_factory),
+            utc_ms=_utc_ms,
+            monotonic_ms=_monotonic_ms,
+        )
     recover_interrupted = isinstance(job_store, SqliteJobStore)
     if parameter_search_evaluator is None:
         parameter_search_evaluator = ParameterSearchEvaluatorRegistry(
@@ -120,6 +136,7 @@ def build_control_plane_app(
         api_key=api_key,
         redis_client=redis_client,
         browser_auth=browser_auth,
+        profile_query_service=profile_query_service,
         readiness_probe=(
             readiness_probe
             if readiness_probe is not None
