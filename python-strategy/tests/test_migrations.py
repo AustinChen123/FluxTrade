@@ -31,15 +31,22 @@ import os
 import time
 from collections.abc import Iterator
 from concurrent.futures import ThreadPoolExecutor
+from dataclasses import replace
+from datetime import datetime, timezone
 from decimal import Decimal
-from threading import Barrier
+from threading import Barrier, Event
+from typing import Any
 
 import pytest
 import sqlalchemy as sa
-from sqlalchemy import text
+from sqlalchemy import event, text
 from sqlalchemy.engine import Engine
 from sqlalchemy.exc import DBAPIError, IntegrityError
+from sqlalchemy.orm import Session, sessionmaker
 from src.core.database_url import build_postgres_url
+from src.core.market_data.profiles import repository as profile_repository
+from src.core.market_data.profiles.publication import CanonicalJsonObject, VerifiedProfilePublication
+from src.core.market_data.profiles.types import ProfileBin, VolumeProfileContent
 
 # Alembic is imported lazily inside tests so that import-time failures do not
 # break collection on environments where alembic is missing.
@@ -257,6 +264,154 @@ def test_volume_profile_logical_uniqueness_and_daily_checks(volume_profile_pg: E
     with volume_profile_pg.connect() as conn:
         assert conn.execute(text("SELECT revision, content_sha256 FROM volume_profile_snapshot "
                                  "ORDER BY revision")).all() == [(1, "a" * 64), (2, "b" * 64)]
+
+
+@pytest.fixture
+def profile_repository_pg(fresh_pg_db: str) -> Iterator[Engine]:
+    """Repository acceptance on isolated PG; intentionally hostile default isolation."""
+    _upgrade(fresh_pg_db)
+    engine = sa.create_engine(_target_url(fresh_pg_db), isolation_level="REPEATABLE READ")
+    try:
+        with engine.begin() as conn:
+            assert conn.execute(text("SELECT id FROM exchange WHERE id = 'BINANCE'")).scalar_one() == "BINANCE"
+            conn.execute(text("INSERT INTO product (id, exchange_id, base_asset, quote_asset) "
+                              "VALUES ('BINANCE:BTCUSDT-SPOT', 'BINANCE', 'BTC', 'USDT')"))
+        yield engine
+    finally:
+        engine.dispose()
+
+
+def _publication_pg(variant: bool = False) -> VerifiedProfilePublication:
+    bins = (ProfileBin(-2, Decimal("1.1234567890123456789012345678"), Decimal("12.34"), 2),
+            ProfileBin(7, Decimal("0.2") if variant else Decimal("0.1"), Decimal("5.67"), 1))
+    content = VolumeProfileContent("BINANCE:BTCUSDT-SPOT", 0, 86400000, "g1",
+                                   Decimal("0"), Decimal("10"), "vp-v1", bins)
+    return VerifiedProfilePublication(content, CanonicalJsonObject({"pages": [{"id": 7}]}),
+                                      CanonicalJsonObject({"checks": {"exact": True}}),
+                                      datetime(2026, 1, 1, tzinfo=timezone.utc), "OBSERVED", "PRESENT")
+
+
+def _profile_counts(engine: Engine) -> tuple[int, int]:
+    with engine.connect() as conn:
+        return (conn.execute(text("SELECT count(*) FROM volume_profile_snapshot")).scalar_one(),
+                conn.execute(text("SELECT count(*) FROM volume_profile_bin")).scalar_one())
+
+
+def test_profile_repository_exact_roundtrip_idempotency_and_revisions(profile_repository_pg: Engine) -> None:
+    engine = profile_repository_pg
+    repo = profile_repository.ProfileRepository(sessionmaker(engine))
+    original = _publication_pg()
+    first = repo.publish(original)
+    assert first.revision == 1 and not first.already_present
+    assert first.snapshot_id == original.content_sha256
+    read = profile_repository.ProfileRepository(sessionmaker(engine)).get_verified(first.snapshot_id)
+    assert read == replace(first, already_present=True)
+    changed = replace(original, source_manifest=CanonicalJsonObject({"changed": True}),
+                      reconciliation=CanonicalJsonObject({}), source_available_at=None,
+                      availability_basis="MODELED", raw_retention_state="DELETED")
+    assert repo.publish(changed) == read
+    assert _profile_counts(engine) == (1, 2)
+    with engine.connect() as conn:
+        row = conn.execute(text("SELECT * FROM volume_profile_snapshot")).mappings().one()
+        assert type(row["base_volume"]) is Decimal and row["base_volume"] == original.content.base_volume
+        assert row["quote_volume"] == original.content.quote_volume
+        assert row["source_manifest"] == original.source_manifest.thaw()
+        assert row["reconciliation"] == original.reconciliation.thaw()
+        assert row["source_available_at"] == original.source_available_at
+        assert row["quality"] == "VERIFIED" and row["published_at"] == first.published_at
+        assert first.computed_at.tzinfo is timezone.utc and first.published_at.tzinfo is timezone.utc
+    second = repo.publish(_publication_pg(True))
+    assert second.revision == 2 and second.snapshot_id != first.snapshot_id
+    assert repo.get_verified(first.snapshot_id) == read
+    assert repo.get_verified(second.snapshot_id) == replace(second, already_present=True)
+    assert _profile_counts(engine) == (2, 4)
+
+
+@pytest.mark.parametrize("different", [False, True])
+def test_profile_repository_isolation_override_and_concurrent_convergence(
+    profile_repository_pg: Engine, different: bool,
+) -> None:
+    engine = profile_repository_pg
+    barrier = Barrier(2, timeout=10)
+    observed: list[str] = []
+
+    def inspect_isolation(conn: sa.Connection, cursor: Any, statement: str,
+                          parameters: Any, context: Any, executemany: bool) -> None:
+        if "pg_advisory_xact_lock" in statement:
+            # Same DBAPI connection and current transaction, before lock execution.
+            with cursor.connection.cursor() as probe:
+                probe.execute("SHOW transaction_isolation")
+                observed.append(probe.fetchone()[0])
+
+    def worker(variant: bool) -> profile_repository.PublishedProfile:
+        with engine.connect() as conn:
+            assert conn.get_isolation_level() == "REPEATABLE READ"
+            barrier.wait()
+            return profile_repository.ProfileRepository(sessionmaker(bind=conn)).publish(_publication_pg(variant))
+
+    event.listen(engine, "before_cursor_execute", inspect_isolation)
+    try:
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            a, b = pool.submit(worker, False), pool.submit(worker, different)
+            results = [a.result(timeout=20), b.result(timeout=20)]
+    finally:
+        event.remove(engine, "before_cursor_execute", inspect_isolation)
+    assert observed == ["read committed", "read committed"]
+    assert {r.revision for r in results} == ({1, 2} if different else {1})
+    assert sum(not r.already_present for r in results) == (2 if different else 1)
+    assert len({r.snapshot_id for r in results}) == (2 if different else 1)
+    assert _profile_counts(engine) == ((2, 4) if different else (1, 2))
+
+
+@pytest.mark.parametrize("phase", ["PARTIAL", "VERIFIED"])
+def test_profile_repository_readback_fault_rolls_back_every_row(
+    profile_repository_pg: Engine, monkeypatch: pytest.MonkeyPatch, phase: str,
+) -> None:
+    original_verify = profile_repository._verify
+    reached: list[str] = []
+
+    def faulty(session: Session, row: sa.engine.RowMapping, quality: str = "VERIFIED",
+               expected: VerifiedProfilePublication | None = None) -> VerifiedProfilePublication:
+        checked = original_verify(session, row, quality, expected)
+        if quality == phase:
+            reached.append(quality)
+            raise profile_repository.ProfileIntegrityError("injected readback failure")
+        return checked
+
+    monkeypatch.setattr(profile_repository, "_verify", faulty)
+    with pytest.raises(profile_repository.ProfileIntegrityError, match="^injected readback failure$"):
+        profile_repository.ProfileRepository(sessionmaker(profile_repository_pg)).publish(_publication_pg())
+    assert reached == [phase]
+    assert _profile_counts(profile_repository_pg) == (0, 0)
+
+
+def test_profile_repository_uncommitted_partial_is_invisible(
+    profile_repository_pg: Engine, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    original_verify = profile_repository._verify
+    reached, release = Event(), Event()
+
+    def blocked(session: Session, row: sa.engine.RowMapping, quality: str = "VERIFIED",
+                expected: VerifiedProfilePublication | None = None) -> VerifiedProfilePublication:
+        checked = original_verify(session, row, quality, expected)
+        if quality == "PARTIAL":
+            reached.set()
+            assert release.wait(10), "publication release timed out"
+        return checked
+
+    monkeypatch.setattr(profile_repository, "_verify", blocked)
+    repo = profile_repository.ProfileRepository(sessionmaker(profile_repository_pg))
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        future = pool.submit(repo.publish, _publication_pg())
+        try:
+            assert reached.wait(10), "partial readback not reached"
+            assert _profile_counts(profile_repository_pg) == (0, 0)
+            assert repo.get_verified(_publication_pg().content_sha256) is None
+        finally:
+            release.set()
+        published = future.result(timeout=20)
+    assert repo.get_verified(published.snapshot_id) == replace(published, already_present=True)
+    assert _profile_counts(profile_repository_pg) == (1, 2)
 
 
 def _downgrade(db_name: str, target: str = "base") -> None:
