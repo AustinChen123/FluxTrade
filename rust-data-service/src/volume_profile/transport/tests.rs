@@ -46,6 +46,7 @@ async fn exact_query_and_no_credentials() {
         let outcome = transport.fetch(&request).await;
         assert_eq!(outcome.body, Some(b"[]".to_vec()));
         assert_eq!(outcome.response_bytes, 2);
+        assert_eq!(outcome.failure, None);
         let wire = server.await.unwrap();
         let target = wire.split_whitespace().nth(1).unwrap();
         let url = Url::parse(&format!("http://127.0.0.1{target}")).unwrap();
@@ -99,6 +100,7 @@ async fn bounded_body_matrix() {
         let outcome = transport.fetch(&Request::Next { from_id: 1 }).await;
         assert_eq!(outcome.disposition.status, Some(200));
         assert_eq!(outcome.body.is_some(), success);
+        assert_eq!(outcome.failure, (!success).then_some(Failure::Protocol));
         assert_eq!(
             outcome.disposition.action,
             if success { Success } else { Stop }
@@ -127,12 +129,14 @@ async fn http_policy_and_all_retry_after_values() {
         let result = transport.fetch(&Request::Next { from_id: 1 }).await;
         assert_eq!(result.disposition.status, Some(status));
         assert_eq!(result.disposition.action, expected);
+        assert_eq!(result.failure, None);
         assert!(result.body.is_none());
         server.await.unwrap();
     }
     let (transport, server) = local(b"HTTP/1.1 429 Test\r\nRetry-After: \xff\r\n\r\n", 0, 2).await;
     let result = transport.fetch(&Request::Next { from_id: 1 }).await;
     assert_eq!(result.disposition.action, Stop);
+    assert_eq!(result.failure, None);
     server.await.unwrap();
 }
 
@@ -156,6 +160,14 @@ async fn header_body_timeout_and_connection_failure_are_not_success() {
         assert_eq!(result.disposition.action, Retry);
         assert!(result.body.is_none());
         assert_eq!(result.response_bytes, bytes);
+        assert_eq!(
+            result.failure,
+            Some(if hold == 0 {
+                Failure::Connection
+            } else {
+                Failure::Timeout
+            })
+        );
         server.await.unwrap();
     }
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -165,6 +177,7 @@ async fn header_body_timeout_and_connection_failure_are_not_success() {
     transport.endpoint = endpoint;
     let result = transport.fetch(&Request::Next { from_id: 1 }).await;
     assert_eq!(result.disposition.status, None);
+    assert_eq!(result.failure, Some(Failure::Connection));
     assert_eq!(result.disposition.action, Retry);
     assert!(result.body.is_none());
 }

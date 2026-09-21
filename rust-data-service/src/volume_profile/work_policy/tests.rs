@@ -1,6 +1,33 @@
 use super::*;
 
 #[test]
+fn retry_schedule_validation_cap_and_overflow() {
+    for (count, base, cap) in [(0, 1, 1), (1, 0, 1), (1, 1, 0), (1, 2, 1)] {
+        assert!(RetrySchedule::new(count, base, cap).is_err());
+    }
+    let schedule = RetrySchedule::new(5, 3, 10).unwrap();
+    assert_eq!(
+        (0..=5).map(|n| schedule.delay_ms(n)).collect::<Vec<_>>(),
+        vec![Some(3), Some(6), Some(10), Some(10), Some(10), None]
+    );
+    assert_eq!(schedule.delay_ms(u32::MAX), None);
+    let fixed = RetrySchedule::new(1, 7, 7).unwrap();
+    assert_eq!(fixed.delay_ms(0), Some(7));
+    assert_eq!(fixed.delay_ms(1), None);
+    for base in [1, u64::MAX / 2 + 1, u64::MAX] {
+        let large = RetrySchedule::new(u32::MAX, base, u64::MAX).unwrap();
+        assert_eq!(large.delay_ms(0), Some(base));
+        assert_eq!(large.delay_ms(64), Some(u64::MAX));
+        assert_eq!(large.delay_ms(u32::MAX - 1), Some(u64::MAX));
+        assert_eq!(large.delay_ms(u32::MAX), None);
+        assert_eq!(
+            std::time::Duration::from_millis(large.delay_ms(64).unwrap()).as_millis(),
+            u128::from(u64::MAX)
+        );
+    }
+}
+
+#[test]
 fn http_status_and_retry_after_matrix() {
     for status in 100..=599 {
         let expected = match status {

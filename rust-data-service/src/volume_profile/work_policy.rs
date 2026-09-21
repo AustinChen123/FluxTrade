@@ -70,6 +70,49 @@ pub struct Limits {
     pub elapsed_ms: u64,
 }
 
+/// Pure retry delays in milliseconds. Ordinal zero is the first retry, not the
+/// initial attempt. No sleeping or wall-clock deadline arithmetic is performed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RetrySchedule {
+    max_retries: u32,
+    base_delay_ms: u64,
+    max_delay_ms: u64,
+}
+
+impl RetrySchedule {
+    pub fn new(max_retries: u32, base_delay_ms: u64, max_delay_ms: u64) -> anyhow::Result<Self> {
+        anyhow::ensure!(
+            max_retries > 0 && base_delay_ms > 0,
+            "positive retry limits required"
+        );
+        anyhow::ensure!(base_delay_ms <= max_delay_ms, "retry base exceeds cap");
+        Ok(Self {
+            max_retries,
+            base_delay_ms,
+            max_delay_ms,
+        })
+    }
+
+    /// Saturate to the configured cap before arithmetic can wrap. At most 64
+    /// doublings are needed even when the caller supplies a very large ordinal.
+    pub fn delay_ms(&self, ordinal: u32) -> Option<u64> {
+        if ordinal >= self.max_retries {
+            return None;
+        }
+        let mut delay = self.base_delay_ms;
+        for _ in 0..ordinal.min(64) {
+            delay = delay
+                .checked_mul(2)
+                .unwrap_or(self.max_delay_ms)
+                .min(self.max_delay_ms);
+            if delay == self.max_delay_ms {
+                break;
+            }
+        }
+        Some(delay)
+    }
+}
+
 impl Default for Limits {
     fn default() -> Self {
         Self {

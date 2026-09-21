@@ -10,6 +10,7 @@ use super::work_policy::{self, Action, Disposition, Failure};
 #[derive(Debug)]
 pub struct Outcome {
     pub disposition: Disposition,
+    pub failure: Option<Failure>,
     pub body: Option<Vec<u8>>,
     /// Body bytes actually yielded by the HTTP client, including an excess chunk.
     pub response_bytes: u64,
@@ -75,6 +76,7 @@ impl Transport {
         if disposition.action != Action::Success {
             return Outcome {
                 disposition,
+                failure: None,
                 body: None,
                 response_bytes: 0,
             };
@@ -98,6 +100,7 @@ impl Transport {
                 Ok(None) => {
                     return Outcome {
                         disposition,
+                        failure: None,
                         response_bytes: body.len() as u64,
                         body: Some(body),
                     }
@@ -111,6 +114,7 @@ impl Transport {
 fn failed(kind: Failure, status: Option<u16>, response_bytes: u64) -> Outcome {
     Outcome {
         disposition: work_policy::failure(kind, status),
+        failure: Some(kind),
         body: None,
         response_bytes,
     }
