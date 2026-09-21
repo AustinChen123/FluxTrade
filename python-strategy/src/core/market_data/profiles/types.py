@@ -92,6 +92,8 @@ class VolumeProfileContent:
             raise ValueError("bins must be an exact tuple of ProfileBin")
         if any(a.bin_index >= b.bin_index for a, b in zip(self.bins, self.bins[1:])):
             raise ValueError("bins must be ascending and unique")
+        _decimal(self.base_volume)
+        _decimal(self.quote_volume)
         _integer(self.aggregate_count, 0)
 
     @property

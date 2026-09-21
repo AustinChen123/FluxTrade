@@ -166,3 +166,31 @@ def test_rust_decimal_domain_and_product_storage_boundaries() -> None:
         for field in ("base_volume", "quote_volume"):
             with pytest.raises(ValueError, match="Rust coefficient/scale domain"):
                 replace(value.bins[0], **{field: Decimal(raw)})
+
+
+@pytest.mark.parametrize("field", ["base_volume", "quote_volume"])
+@pytest.mark.parametrize("precision,traps", [(1, False), (2, True), (28, True), (80, False)])
+@pytest.mark.parametrize("parts,valid", [
+    (("79228162514264337593543950335",), True),
+    (("79228162514264337593543950334", "1"), True),
+    (("79228162514264337593543950335", "1"), False),
+    (("79228162514264337593543950335", "1E-28"), False),
+])
+def test_exact_totals_must_fit_rust_domain_at_construction(
+    field: str, precision: int, traps: bool, parts: tuple[str, ...], valid: bool,
+) -> None:
+    with localcontext() as context:
+        context.prec = precision
+        for signal in context.traps:
+            context.traps[signal] = traps
+        # Every individual bin is valid; only the chosen aggregate can overflow.
+        bins = tuple(replace(ProfileBin(index, Decimal(1), Decimal(1), 1),
+                             **{field: Decimal(raw)}) for index, raw in enumerate(parts))
+        if valid:
+            content = replace(profile(), bins=bins)
+            assert getattr(content, field) == Decimal("79228162514264337593543950335")
+            assert getattr(content, "quote_volume" if field == "base_volume" else "base_volume") == Decimal(len(parts))
+        else:
+            # No content escapes construction for publication or any Session call.
+            with pytest.raises(ValueError, match="Rust coefficient/scale domain"):
+                replace(profile(), bins=bins)
