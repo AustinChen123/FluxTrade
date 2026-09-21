@@ -1,4 +1,5 @@
-//! Offline assembly only. Controlled fetch owner attests stdin provenance;
+//! Offline assembly only. Controlled fetch owner must persist/replay exact raw
+//! response bytes and their first-observed timestamp. We validate bounds, not provenance;
 //! success is not network-source verification, DB publication or cleanup.
 #[cfg(unix)]
 mod app {
@@ -19,7 +20,7 @@ mod app {
     #[derive(Parser)]
     #[command(
         about = "Offline daily profile assembly from 24 completed staging hours and kline JSON on stdin.",
-        after_help = "Official stdin provenance belongs to the controlled fetch owner. Success is not network-source verification, DB publication or cleanup. Root/job directories must be trusted and single-worker. No network request is made."
+        after_help = "Controlled fetch owner must persist/replay exact stdin response bytes and first-observed --source-available-at-ms. This assembler validates bounds, not provenance. Success is not network-source verification, DB publication or cleanup. Root/job directories must be trusted and single-worker. No network request is made."
     )]
     struct Args {
         #[arg(long)]
@@ -28,6 +29,8 @@ mod app {
         job_id: String,
         #[arg(long)]
         start_ms: i64,
+        #[arg(long)]
+        source_available_at_ms: i64,
     }
     fn window(args: &Args, now: i64) -> Result<Window> {
         daily::hourly_staging_job_id(&args.job_id, args.start_ms)?;
@@ -44,11 +47,18 @@ mod app {
         input: &mut impl Read,
         now: &mut impl FnMut() -> Result<i64>,
     ) -> Result<Vec<u8>> {
-        let day = window(args, now()?)?;
         let mut raw = Vec::new();
         input.take(KLINE_LIMIT + 1).read_to_end(&mut raw)?;
         ensure!(raw.len() as u64 <= KLINE_LIMIT, "kline input limit");
-        let observed = now()?; // Sample only after the complete bounded stdin read.
+        let invocation_time = now()?; // Sample only after the complete bounded stdin read.
+        let day = window(args, invocation_time)?;
+        let observed = args.source_available_at_ms;
+        ensure!(
+            observed >= day.end_ms()
+                && observed <= invocation_time
+                && observed <= 253_402_300_799_999,
+            "invalid source observation"
+        );
         let flags = rustix::fs::OFlags::RDONLY
             | rustix::fs::OFlags::DIRECTORY
             | rustix::fs::OFlags::NOFOLLOW

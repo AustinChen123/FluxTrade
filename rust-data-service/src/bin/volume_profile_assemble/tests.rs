@@ -12,6 +12,8 @@ fn args(root: &std::path::Path) -> Vec<OsString> {
         "daily".into(),
         "--start-ms".into(),
         "0".into(),
+        "--source-available-at-ms".into(),
+        (DAY + 17).to_string().into(),
     ]
 }
 fn kline() -> Vec<u8> {
@@ -81,7 +83,6 @@ fn arguments_completed_day_and_safe_error_output() {
         "--rithmic",
         "--config",
         "--end-ms",
-        "--source-available-at-ms",
     ] {
         let mut argv = args(root);
         argv.extend([flag.into(), "SECRET_value_marker".into()]);
@@ -93,7 +94,7 @@ fn arguments_completed_day_and_safe_error_output() {
         assert!(output.is_empty());
         assert_eq!(errors, b"volume_profile_assemble: invalid arguments\n");
     }
-    for index in [1, 3, 5] {
+    for index in [1, 3, 5, 7] {
         let mut argv = args(root);
         argv.drain(index..index + 2);
         assert!(Args::try_parse_from(argv).is_err());
@@ -171,16 +172,68 @@ fn real_store_hours_match_direct_assembly_and_observation_is_after_read() {
         &mut input,
         &mut || {
             calls += 1;
-            if calls == 2 {
-                assert!(eof.get(), "observation must follow the actual stdin EOF");
-            }
-            Ok(if calls == 1 { DAY } else { DAY + 17 })
+            assert!(eof.get(), "wall clock must follow the actual stdin EOF");
+            Ok(DAY + 1000)
         },
     )
     .unwrap();
-    assert_eq!(calls, 2);
+    assert_eq!(calls, 1);
     assert_eq!(result, expected);
     assert_eq!(input.cursor.position(), input.cursor.get_ref().len() as u64);
+}
+
+#[test]
+fn observation_bounds_and_restart_determinism() {
+    let directory = seed();
+    let raw = kline();
+    let mut outputs = Vec::new();
+    for now in [DAY + 17, DAY + 100, DAY * 2] {
+        let (mut output, mut errors) = (Vec::new(), Vec::new());
+        assert_eq!(
+            run(
+                args(directory.path()),
+                &mut raw.as_slice(),
+                &mut output,
+                &mut errors,
+                || Ok(now)
+            ),
+            0
+        );
+        assert!(errors.is_empty());
+        assert!(output.ends_with(b"\n"));
+        outputs.push(output);
+    }
+    assert!(outputs.windows(2).all(|pair| pair[0] == pair[1]));
+    for (observed, now) in [
+        (DAY - 1, DAY + 17),
+        (DAY + 18, DAY + 17),
+        (253_402_300_800_000, i64::MAX),
+    ] {
+        let mut argv = args(directory.path());
+        argv[8] = observed.to_string().into();
+        let (mut output, mut errors) = (Vec::new(), Vec::new());
+        assert_eq!(
+            run(argv, &mut raw.as_slice(), &mut output, &mut errors, || Ok(
+                now
+            )),
+            1
+        );
+        assert!(output.is_empty());
+        assert_eq!(errors, b"volume_profile_assemble: assembly failed\n");
+    }
+    for invalid in ["SECRET", "1.5", "9223372036854775808"] {
+        let mut argv = args(directory.path());
+        argv[8] = invalid.into();
+        let (mut output, mut errors) = (Vec::new(), Vec::new());
+        assert_eq!(
+            run(argv, &mut raw.as_slice(), &mut output, &mut errors, || Ok(
+                DAY
+            )),
+            1
+        );
+        assert!(output.is_empty());
+        assert_eq!(errors, b"volume_profile_assemble: invalid arguments\n");
+    }
 }
 
 #[test]
