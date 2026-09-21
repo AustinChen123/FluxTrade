@@ -160,6 +160,15 @@ jobs:
       - name: Set up Python
         run: uv python install
 
+      - name: Verify profile assembly and cleanup cross-language contract
+        shell: bash
+        run: |
+          set -euo pipefail
+          profile_python="$(uv run python -c 'import os,sys; print(os.path.abspath(sys.executable))')"
+          [[ -n "$profile_python" && "$profile_python" = /* && -x "$profile_python" ]]
+          export FLUXTRADE_PROFILE_PYTHON="$profile_python"
+          uv run --no-sync cargo test --manifest-path ../rust-data-service/Cargo.toml --no-default-features --test volume_profile_assemble_cli actual_executable_replays_source_pair_with_canonical_lf -- --exact
+
       - name: Check tracked production types
         run: >-
           git ls-files -z -- ':(glob)src/**/*.py' |
