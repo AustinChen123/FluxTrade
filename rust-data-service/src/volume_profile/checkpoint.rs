@@ -81,6 +81,15 @@ pub struct PageEntry {
 }
 
 impl PageEntry {
+    pub(crate) fn sequence(&self) -> u64 {
+        self.sequence
+    }
+    pub(crate) fn byte_length(&self) -> u64 {
+        self.byte_length
+    }
+    pub(crate) fn progress(&self) -> &CheckpointProgress {
+        &self.progress
+    }
     pub fn new(sequence: u64, body: &[u8], progress: CheckpointProgress) -> Self {
         Self {
             sequence,
@@ -107,6 +116,9 @@ pub struct Manifest {
 }
 
 impl Manifest {
+    pub(crate) fn identity(&self) -> &Identity {
+        &self.identity
+    }
     pub(crate) fn entries(&self) -> &[PageEntry] {
         &self.entries
     }
@@ -116,8 +128,21 @@ impl Manifest {
 }
 
 pub struct Recovered {
-    pub pages: Pages,
-    pub trades: Vec<AggregateTrade>,
+    pages: Pages,
+    trades: Vec<AggregateTrade>,
+    manifest_sha256: [u8; 32],
+}
+
+impl Recovered {
+    pub fn pages(&self) -> &Pages {
+        &self.pages
+    }
+    pub fn trades(&self) -> &[AggregateTrade] {
+        &self.trades
+    }
+    pub(crate) fn manifest_sha256(&self) -> [u8; 32] {
+        self.manifest_sha256
+    }
 }
 
 /// Caller supplies authoritative expected identity, not one copied from disk.
@@ -156,7 +181,11 @@ pub fn recover(
         );
         trades.extend(accepted);
     }
-    Ok(Recovered { pages, trades })
+    Ok(Recovered {
+        pages,
+        trades,
+        manifest_sha256: hash(&serde_json::to_vec(manifest)?),
+    })
 }
 
 #[cfg(test)]

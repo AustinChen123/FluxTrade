@@ -51,14 +51,15 @@ where
     F: Future<Output = ()>,
 {
     ensure!(budget.is_fresh(), "round requires fresh budget");
-    let (manifest, mut recovered) = store.recover()?;
+    let (manifest, recovered) = store.recover()?;
+    let mut pages = recovered.pages().clone();
     let mut sequence = u64::try_from(manifest.entries().len())?;
     let mut ordinal = 0;
     let reason = loop {
-        if recovered.pages.is_stopped() {
+        if pages.is_stopped() {
             break Reason::Complete;
         }
-        let request = recovered.pages.request()?;
+        let request = pages.request()?;
         match budget.admit(elapsed_ms()) {
             Ok(()) => {}
             Err(BudgetError::Exhausted) => break Reason::Budget,
@@ -75,13 +76,13 @@ where
         match action {
             Action::Success => {
                 let body = outcome.body.unwrap();
-                let (_, progress) = recovered.pages.accept(&body)?;
+                let (_, progress) = pages.accept(&body)?;
                 store.append(sequence, &body, CheckpointProgress::try_from(progress)?)?;
                 sequence = sequence
                     .checked_add(1)
                     .ok_or_else(|| anyhow::anyhow!("sequence overflow"))?;
                 ordinal = 0;
-                if recovered.pages.is_stopped() {
+                if pages.is_stopped() {
                     break Reason::Complete;
                 }
                 if exhausted {

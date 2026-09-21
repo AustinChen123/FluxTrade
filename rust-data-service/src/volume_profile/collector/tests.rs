@@ -122,7 +122,7 @@ async fn ack_unknown_checkpoint_requires_confirmation_before_round_progress() {
         };
         assert_eq!(fake.1, expected);
         assert!(waits.is_empty());
-        let trades = store.recover().unwrap().1.trades;
+        let trades = store.recover().unwrap().1.trades().to_vec();
         assert_eq!(
             trades.iter().map(|t| t.id).collect::<Vec<_>>(),
             if terminal { vec![0] } else { vec![0, 1, 2] }
@@ -146,7 +146,7 @@ async fn checkpoint_budget_resume_terminal_and_append_failure() {
         );
         let (_, recovered) = store.recover().unwrap();
         assert_eq!(
-            recovered.trades.iter().map(|t| t.id).collect::<Vec<_>>(),
+            recovered.trades().iter().map(|t| t.id).collect::<Vec<_>>(),
             vec![0, 1]
         );
         let (r, f, _) = run(&store, vec![], 9, 9999, 0).await;
@@ -159,7 +159,7 @@ async fn checkpoint_budget_resume_terminal_and_append_failure() {
     assert!(f.1.is_empty());
     let (r, _, _) = run(&store, vec![success(b"[]".to_vec())], 1, 1, 0).await;
     assert_eq!(r.unwrap().reason, Reason::Complete);
-    assert!(store.recover().unwrap().1.pages.is_stopped());
+    assert!(store.recover().unwrap().1.pages().is_stopped());
     let (_root, broken) = setup(1);
     assert!(run(&broken, vec![success(body(0))], 9, 9999, 0)
         .await

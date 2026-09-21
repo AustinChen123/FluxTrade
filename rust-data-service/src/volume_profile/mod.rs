@@ -12,6 +12,7 @@ pub mod checkpoint;
 #[cfg(unix)]
 pub mod collector;
 pub mod compressed_page;
+pub mod daily;
 #[cfg(unix)]
 pub mod directory;
 mod exact;

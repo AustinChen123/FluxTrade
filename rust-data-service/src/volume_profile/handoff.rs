@@ -12,7 +12,7 @@ const HOUR: i64 = 3_600_000;
 const DAY: i64 = 24 * HOUR;
 const MAX_EPOCH: i64 = 253_402_300_799_999;
 const MAX_BYTES: usize = 65_536;
-const GRID_ID: &str = "btc_spot_usdt_10_v1";
+pub(crate) const GRID_ID: &str = "btc_spot_usdt_10_v1";
 
 fn safe(value: &str, limit: usize) -> bool {
     !value.is_empty()
@@ -34,7 +34,7 @@ fn decimal(value: Decimal) -> String {
         value.normalize().to_string()
     }
 }
-fn sha(bytes: &[u8]) -> String {
+pub(crate) fn sha(bytes: &[u8]) -> String {
     const HEX: &[u8; 16] = b"0123456789abcdef";
     digest(&SHA256, bytes)
         .as_ref()

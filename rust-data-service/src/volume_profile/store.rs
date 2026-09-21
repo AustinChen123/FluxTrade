@@ -99,7 +99,7 @@ impl Store {
         progress: CheckpointProgress,
         mut hook: impl FnMut(Target, Phase) -> Result<()>,
     ) -> Result<()> {
-        let (current, mut rebuilt) = self.recover()?;
+        let (current, rebuilt) = self.recover()?;
         let entry = PageEntry::new(sequence, raw, progress.clone());
         let count = current.entries().len() as u64;
         ensure!(
@@ -114,7 +114,7 @@ impl Store {
             return self.confirm(&mut hook);
         }
         let archive = compressed_page::encode(raw, self.limits)?;
-        let (_, actual) = rebuilt.pages.accept(raw)?;
+        let (_, actual) = rebuilt.pages().clone().accept(raw)?;
         ensure!(
             CheckpointProgress::try_from(actual)? == progress,
             "page progress mismatch"

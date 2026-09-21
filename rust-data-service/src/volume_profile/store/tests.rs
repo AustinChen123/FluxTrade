@@ -34,7 +34,7 @@ fn ids(store: &Store) -> Vec<u64> {
         .recover()
         .unwrap()
         .1
-        .trades
+        .trades()
         .iter()
         .map(|t| t.id)
         .collect()
@@ -68,7 +68,7 @@ fn recovery_orphans_idempotency_and_conflicts() {
     for raw in [&first, &body(&[1, 2]), &b"[]".to_vec()] {
         live.accept(raw).unwrap();
     }
-    assert_eq!(s.recover().unwrap().1.pages, live);
+    assert_eq!(s.recover().unwrap().1.pages(), &live);
 }
 
 #[test]
@@ -182,7 +182,7 @@ fn public_recovery_requires_job_confirmation() {
     );
     assert_eq!(ids(&store), vec![0]);
     assert_eq!(
-        store.recover().unwrap().1.pages.request().unwrap(),
+        store.recover().unwrap().1.pages().request().unwrap(),
         crate::volume_profile::binance_spot::Request::Next { from_id: 1 }
     );
 }
