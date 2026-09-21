@@ -31,6 +31,7 @@ import os
 import time
 from collections.abc import Iterator
 from concurrent.futures import ThreadPoolExecutor
+from decimal import Decimal
 from threading import Barrier
 
 import pytest
@@ -149,6 +150,113 @@ def _upgrade(db_name: str, target: str = "head") -> None:
     from alembic import command
 
     command.upgrade(_alembic_config(db_name), target)
+
+
+_VP_BASE = Decimal("12345678901234567890.1234567890123456789012345678")
+_VP_QUOTE = Decimal("98765432109876543210.9876543210987654321098765432")
+
+
+def _insert_vp_snapshot(
+    conn: sa.Connection, snapshot_id: str = "vp", revision: int = 1,
+    digest: str = "a" * 64,
+) -> None:
+    conn.execute(text("""
+        INSERT INTO volume_profile_snapshot (
+            id, product_id, window_start_ms, window_end_ms, period, timezone,
+            grid_id, bin_origin, bin_step, algorithm_version, revision, content_sha256,
+            source_manifest, base_volume, quote_volume, aggregate_count, occupied_bins,
+            quality, computed_at, published_at, availability_basis, reconciliation,
+            raw_retention_state)
+        VALUES (:id, 'vp-product', 0, 86400000, '1d', 'UTC', 'grid', -10, 10,
+            'vp-v1', :revision, :digest, CAST(:manifest AS JSONB),
+            :base, :quote, 1, 1, 'VERIFIED', now(), now(), 'OBSERVED',
+            CAST(:manifest AS JSONB), 'NOT_STORED')
+    """), {"id": snapshot_id, "revision": revision, "digest": digest,
+            "base": _VP_BASE, "quote": _VP_QUOTE, "manifest": json.dumps({"fixture": True})})
+
+
+@pytest.fixture
+def volume_profile_pg(fresh_pg_db: str) -> Iterator[Engine]:
+    """Migrated disposable schema only; not repository publication acceptance."""
+    _upgrade(fresh_pg_db)
+    engine = sa.create_engine(_target_url(fresh_pg_db))
+    try:
+        with engine.begin() as conn:
+            conn.execute(text("INSERT INTO exchange (id, name) VALUES ('vp-exchange', 'Fixture')"))
+            conn.execute(text("INSERT INTO product (id, exchange_id, base_asset, quote_asset) "
+                              "VALUES ('vp-product', 'vp-exchange', 'BTC', 'USDT')"))
+            _insert_vp_snapshot(conn)
+            conn.execute(text("INSERT INTO volume_profile_bin VALUES ('vp', -2, :base, :quote, 1)"),
+                         {"base": _VP_BASE, "quote": _VP_QUOTE})
+        yield engine
+    finally:
+        engine.dispose()
+
+
+def test_volume_profile_decimal_json_fk_and_cascade_schema(volume_profile_pg: Engine) -> None:
+    """Exact unconstrained NUMERIC roundtrip and sparse-bin FK, not publication."""
+    engine = volume_profile_pg
+    with engine.connect() as conn:
+        for table in ("volume_profile_snapshot", "volume_profile_bin"):
+            row = conn.execute(text(f"SELECT base_volume, quote_volume FROM {table}")).one()
+            assert row == (_VP_BASE, _VP_QUOTE)
+            assert all(isinstance(value, Decimal) for value in row)
+        row = conn.execute(text("SELECT source_manifest, reconciliation FROM volume_profile_snapshot")).one()
+        assert row == ({"fixture": True}, {"fixture": True})
+        assert conn.execute(text("SELECT bin_index FROM volume_profile_bin")).scalar_one() == -2
+    for statement in (
+        "UPDATE volume_profile_snapshot SET product_id = 'missing'",
+        "INSERT INTO volume_profile_bin VALUES ('missing', 0, 1, 1, 1)",
+    ):
+        with pytest.raises(IntegrityError):
+            with engine.begin() as conn:
+                conn.execute(text(statement))
+    with engine.begin() as conn:
+        conn.execute(text("DELETE FROM volume_profile_snapshot WHERE id = 'vp'"))
+        assert conn.execute(text("SELECT count(*) FROM volume_profile_bin")).scalar_one() == 0
+
+
+def test_volume_profile_all_numeric_columns_reject_special_values(volume_profile_pg: Engine) -> None:
+    """Each failed UPDATE has its own rolled-back transaction and unchanged value."""
+    for table, columns in (
+        ("volume_profile_snapshot", ("bin_origin", "bin_step", "base_volume", "quote_volume")),
+        ("volume_profile_bin", ("base_volume", "quote_volume")),
+    ):
+        for column in columns:
+            with volume_profile_pg.connect() as conn:
+                before = conn.execute(text(f"SELECT {column} FROM {table}")).scalar_one()
+            for special in ("NaN", "Infinity", "-Infinity"):
+                with pytest.raises(IntegrityError):
+                    with volume_profile_pg.begin() as conn:
+                        conn.execute(text(f"UPDATE {table} SET {column} = CAST(:value AS NUMERIC)"),
+                                     {"value": special})
+                with volume_profile_pg.connect() as conn:
+                    assert conn.execute(text(f"SELECT {column} FROM {table}")).scalar_one() == before
+
+
+def test_volume_profile_logical_uniqueness_and_daily_checks(volume_profile_pg: Engine) -> None:
+    for revision, digest in [(1, "b" * 64), (2, "a" * 64)]:
+        with pytest.raises(IntegrityError):
+            with volume_profile_pg.begin() as conn:
+                _insert_vp_snapshot(conn, "duplicate", revision, digest)
+    for assignment in (
+        "window_start_ms = 1, window_end_ms = 86400001", "window_end_ms = 172800000",
+        "window_start_ms = -86400000, window_end_ms = 0",
+        "period = '1h'", "timezone = 'OTHER'", "published_at = NULL", "quality = 'PARTIAL'",
+        "source_manifest = '[]'::jsonb", "reconciliation = 'null'::jsonb",
+    ):
+        with pytest.raises(IntegrityError):
+            with volume_profile_pg.begin() as conn:
+                conn.execute(text(f"UPDATE volume_profile_snapshot SET {assignment}"))
+    with volume_profile_pg.connect() as conn:
+        assert conn.execute(text("SELECT count(*) FROM volume_profile_snapshot")).scalar_one() == 1
+        assert conn.execute(text("SELECT revision, window_start_ms, quality, "
+                                 "published_at IS NOT NULL FROM volume_profile_snapshot")).one() == (1, 0, "VERIFIED", True)
+    with volume_profile_pg.begin() as conn:
+        _insert_vp_snapshot(conn, "vp-revision-2", 2, "b" * 64)
+    with volume_profile_pg.connect() as conn:
+        assert conn.execute(text("SELECT revision, content_sha256 FROM volume_profile_snapshot "
+                                 "ORDER BY revision")).all() == [(1, "a" * 64), (2, "b" * 64)]
 
 
 def _downgrade(db_name: str, target: str = "base") -> None:
