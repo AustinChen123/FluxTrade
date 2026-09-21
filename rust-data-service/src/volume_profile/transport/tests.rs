@@ -6,6 +6,49 @@ use tokio::{
 };
 use Action::{Retry, RetryAfter, Stop, Success};
 
+#[test]
+fn outcome_owner_validation_matrix() {
+    for (status, action, failure, body, bytes, valid) in [
+        (Some(200), Success, None, Some("[]"), 2, true),
+        (Some(204), Success, None, Some(""), 0, true),
+        (Some(451), Stop, None, None, 0, true),
+        (Some(500), Retry, None, None, 4, true),
+        (Some(429), Stop, None, None, 0, true),
+        (Some(429), RetryAfter(0), None, None, 0, true),
+        (Some(429), RetryAfter(u64::MAX), None, None, 0, true),
+        (None, Retry, Some(Failure::Timeout), None, 0, true),
+        (Some(200), Retry, Some(Failure::Connection), None, 1, true),
+        (Some(200), Stop, Some(Failure::Protocol), None, 3, true),
+        (Some(200), Stop, Some(Failure::Decode), None, 3, true),
+        (None, Stop, None, None, 0, false),
+        (None, Success, None, Some("[]"), 2, false),
+        (Some(451), Success, None, Some("[]"), 2, false),
+        (Some(200), Success, None, None, 0, false),
+        (Some(200), Success, None, Some("[]"), 1, false),
+        (Some(200), Success, None, Some("[]"), 3, false),
+        (Some(200), Retry, Some(Failure::Protocol), None, 0, false),
+        (
+            Some(200),
+            Success,
+            Some(Failure::Timeout),
+            Some("[]"),
+            2,
+            false,
+        ),
+        (Some(500), Retry, None, Some("x"), 1, false),
+        (Some(451), RetryAfter(1), None, None, 0, false),
+        (Some(451), Retry, Some(Failure::Connection), None, 0, false),
+    ] {
+        let outcome = Outcome {
+            disposition: Disposition { status, action },
+            failure,
+            body: body.map(|s| s.as_bytes().to_vec()),
+            response_bytes: bytes,
+        };
+        assert_eq!(outcome.validate().is_ok(), valid, "{outcome:?}");
+    }
+}
+
 async fn local(
     response: &[u8],
     hold_ms: u64,
@@ -44,6 +87,7 @@ async fn exact_query_and_no_credentials() {
         let (transport, server) =
             local(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\n[]", 0, 2).await;
         let outcome = transport.fetch(&request).await;
+        outcome.validate().unwrap();
         assert_eq!(outcome.body, Some(b"[]".to_vec()));
         assert_eq!(outcome.response_bytes, 2);
         assert_eq!(outcome.failure, None);
@@ -98,6 +142,7 @@ async fn bounded_body_matrix() {
     ] {
         let (transport, server) = local(wire.as_bytes(), 0, 2).await;
         let outcome = transport.fetch(&Request::Next { from_id: 1 }).await;
+        outcome.validate().unwrap();
         assert_eq!(outcome.disposition.status, Some(200));
         assert_eq!(outcome.body.is_some(), success);
         assert_eq!(outcome.failure, (!success).then_some(Failure::Protocol));
@@ -127,6 +172,7 @@ async fn http_policy_and_all_retry_after_values() {
         let wire = format!("HTTP/1.1 {status} Test\r\n{headers}Content-Length: 99999999\r\n\r\n");
         let (transport, server) = local(wire.as_bytes(), 0, 2).await;
         let result = transport.fetch(&Request::Next { from_id: 1 }).await;
+        result.validate().unwrap();
         assert_eq!(result.disposition.status, Some(status));
         assert_eq!(result.disposition.action, expected);
         assert_eq!(result.failure, None);
@@ -135,6 +181,7 @@ async fn http_policy_and_all_retry_after_values() {
     }
     let (transport, server) = local(b"HTTP/1.1 429 Test\r\nRetry-After: \xff\r\n\r\n", 0, 2).await;
     let result = transport.fetch(&Request::Next { from_id: 1 }).await;
+    result.validate().unwrap();
     assert_eq!(result.disposition.action, Stop);
     assert_eq!(result.failure, None);
     server.await.unwrap();
@@ -156,6 +203,7 @@ async fn header_body_timeout_and_connection_failure_are_not_success() {
         };
         let (transport, server) = local(wire, hold, 2).await;
         let result = transport.fetch(&Request::Next { from_id: 1 }).await;
+        result.validate().unwrap();
         assert_eq!(result.disposition.status, status);
         assert_eq!(result.disposition.action, Retry);
         assert!(result.body.is_none());
@@ -176,6 +224,7 @@ async fn header_body_timeout_and_connection_failure_are_not_success() {
     let mut transport = Transport::new(Duration::from_millis(50), 2).unwrap();
     transport.endpoint = endpoint;
     let result = transport.fetch(&Request::Next { from_id: 1 }).await;
+    result.validate().unwrap();
     assert_eq!(result.disposition.status, None);
     assert_eq!(result.failure, Some(Failure::Connection));
     assert_eq!(result.disposition.action, Retry);

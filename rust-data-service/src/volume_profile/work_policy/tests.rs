@@ -1,6 +1,37 @@
 use super::*;
 
 #[test]
+fn freshness_and_delay_admission_boundaries() {
+    let mut b = budget();
+    assert!(b.is_fresh());
+    for (elapsed, delay) in [(0, 0), (0, 99), (98, 1)] {
+        assert_eq!(b.admit_delay(elapsed, delay), Ok(()));
+        assert!(b.is_fresh());
+        assert_eq!((b.requests(), b.response_bytes()), (0, 0));
+    }
+    b.admit(0).unwrap();
+    assert!(!b.is_fresh());
+    assert_eq!(b.admit_delay(0, 1), Err(BudgetError::InFlight));
+    assert_eq!((b.requests(), b.response_bytes()), (1, 0));
+    b.account(1, 1).unwrap();
+    assert!(!b.is_fresh());
+    b.admit_delay(1, 1).unwrap();
+    assert_eq!((b.requests(), b.response_bytes()), (1, 1));
+    for (elapsed, delay) in [(99, 1), (99, 2), (100, 0), (0, u64::MAX), (1, u64::MAX)] {
+        let mut b = budget();
+        assert_eq!(b.admit_delay(elapsed, delay), Err(BudgetError::Exhausted));
+        assert!(!b.is_fresh());
+        assert_eq!((b.requests(), b.response_bytes()), (0, 0));
+        assert_eq!(b.admit_delay(0, 0), Err(BudgetError::Exhausted));
+        assert_eq!(b.admit(0), Err(BudgetError::Exhausted));
+    }
+    let mut b = budget();
+    assert_eq!(b.admit(100), Err(BudgetError::Exhausted));
+    assert!(!b.is_fresh());
+    assert_eq!(b.admit_delay(0, 0), Err(BudgetError::Exhausted));
+}
+
+#[test]
 fn retry_schedule_validation_cap_and_overflow() {
     for (count, base, cap) in [(0, 1, 1), (1, 0, 1), (1, 1, 0), (1, 2, 1)] {
         assert!(RetrySchedule::new(count, base, cap).is_err());

@@ -16,6 +16,43 @@ pub struct Outcome {
     pub response_bytes: u64,
 }
 
+impl Outcome {
+    /// Verify shape, byte accounting and owner-derived disposition before use.
+    pub fn validate(&self) -> Result<()> {
+        let expected = if let Some(kind) = self.failure {
+            ensure!(self.body.is_none(), "failure outcome contains body");
+            work_policy::failure(kind, self.disposition.status)
+        } else {
+            let status = self
+                .disposition
+                .status
+                .ok_or_else(|| anyhow::anyhow!("HTTP outcome missing status"))?;
+            let expected = match self.disposition.action {
+                Action::RetryAfter(seconds) => work_policy::http(status, &[&seconds.to_string()]),
+                _ => work_policy::http(status, &[]),
+            };
+            if self.disposition.action == Action::Success {
+                let body = self
+                    .body
+                    .as_ref()
+                    .ok_or_else(|| anyhow::anyhow!("success missing body"))?;
+                ensure!(
+                    self.response_bytes == body.len() as u64,
+                    "success byte count mismatch"
+                );
+            } else {
+                ensure!(self.body.is_none(), "non-success contains body");
+            }
+            expected
+        };
+        ensure!(
+            self.disposition == expected,
+            "disposition conflicts with owner policy"
+        );
+        Ok(())
+    }
+}
+
 pub struct Transport {
     client: Client,
     endpoint: Url,

@@ -161,6 +161,27 @@ impl Budget {
         self.bytes
     }
 
+    pub fn is_fresh(&self) -> bool {
+        self.requests == 0 && self.bytes == 0 && !self.in_flight && !self.stopped
+    }
+
+    /// Admit a delay only between attempts and strictly inside the time budget.
+    /// The caller supplies the latest monotonic elapsed time; no attempt is charged.
+    pub fn admit_delay(&mut self, elapsed_ms: u64, delay_ms: u64) -> Result<(), BudgetError> {
+        if self.in_flight {
+            return Err(BudgetError::InFlight);
+        }
+        if self.stopped
+            || elapsed_ms
+                .checked_add(delay_ms)
+                .is_none_or(|end| end >= self.limits.elapsed_ms)
+        {
+            self.stopped = true;
+            return Err(BudgetError::Exhausted);
+        }
+        Ok(())
+    }
+
     /// Charge an attempt before I/O. Never refund failed or cancelled attempts.
     pub fn admit(&mut self, elapsed_ms: u64) -> Result<(), BudgetError> {
         if self.in_flight {
