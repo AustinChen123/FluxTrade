@@ -8,6 +8,31 @@ fn setup() -> (tempfile::TempDir, Directory) {
 }
 
 #[test]
+fn cleanup_leaf_primitives_reject_paths_and_never_follow_links() {
+    let (root, dir) = setup();
+    let outside = root.path().join("outside");
+    std::fs::write(&outside, b"keep").unwrap();
+    for name in ["", ".", "..", "../outside", "/outside", "nested/file"] {
+        assert!(dir.exists(name).is_err());
+        assert!(dir.unlink_if_present(name).is_err());
+    }
+    symlink(&outside, root.path().join("job/link")).unwrap();
+    assert!(dir.exists("link").unwrap());
+    dir.unlink_if_present("link").unwrap();
+    dir.sync().unwrap();
+    assert_eq!(std::fs::read(&outside).unwrap(), b"keep");
+    assert!(!dir.exists("link").unwrap());
+    symlink(root.path().join("absent"), root.path().join("job/dangling")).unwrap();
+    assert!(dir.exists("dangling").unwrap());
+    dir.unlink_if_present("dangling").unwrap();
+    dir.unlink_if_present("missing").unwrap();
+    dir.sync().unwrap();
+    std::fs::create_dir(root.path().join("job/retained-dir")).unwrap();
+    assert!(dir.unlink_if_present("retained-dir").is_err());
+    assert!(root.path().join("job/retained-dir").is_dir());
+}
+
+#[test]
 fn every_failure_boundary_has_old_or_new_final_and_no_partial_file() {
     for phase in [
         Phase::Created,

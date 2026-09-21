@@ -12,7 +12,7 @@ use super::{
     mvp, Window,
 };
 
-const FILE: &str = "daily-kline-evidence.json";
+pub(crate) const FILE: &str = "daily-kline-evidence.json";
 use super::binance_kline::{self, RAW_LIMIT};
 const ARTIFACT_LIMIT: u64 = (RAW_LIMIT * 6 + 4096) as u64;
 const DAY: i64 = 24 * mvp::HOUR;
@@ -122,10 +122,19 @@ fn load(directory: &Directory, expected: &Identity) -> Result<Evidence> {
     Ok(evidence)
 }
 
+fn require_active(directory: &Directory) -> Result<()> {
+    ensure!(
+        !directory.exists(super::cleanup::MARKER)?,
+        "daily source retired"
+    );
+    Ok(())
+}
+
 /// Recovery never creates missing directories/files, and confirms job fsync.
 pub fn recover(root: &impl AsFd, expected: &Identity) -> Result<Evidence> {
     expected.validate()?;
     let directory = Directory::open_existing(root, &expected.job_id)?;
+    require_active(&directory)?;
     let evidence = load(&directory, expected)?;
     directory.sync()?;
     Ok(evidence)
@@ -143,6 +152,7 @@ pub fn recover_optional(root: &impl AsFd, expected: &Identity) -> Result<Option<
         }
         Err(error) => return Err(error),
     };
+    require_active(&directory)?;
     let evidence = match load(&directory, expected) {
         Ok(evidence) => evidence,
         Err(error)
@@ -165,6 +175,7 @@ pub fn persist(
 ) -> Result<Evidence> {
     let evidence = Evidence::new(identity, raw, observed_at_ms)?;
     let directory = Directory::open(root, &evidence.identity.job_id)?;
+    require_active(&directory)?;
     persist_with(&directory, evidence, |_| Ok(()))
 }
 

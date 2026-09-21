@@ -6,7 +6,7 @@ use super::checkpoint::{self, CheckpointProgress, Identity, Manifest, PageEntry,
 use super::compressed_page::{self, Limits};
 use super::directory::{Directory, Phase};
 
-const MANIFEST: &str = "manifest.json";
+pub(crate) const MANIFEST: &str = "manifest.json";
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Target {
     Page,
@@ -35,6 +35,10 @@ impl Store {
             "invalid manifest limit"
         );
         let directory = Directory::open(root, identity.job_id())?;
+        ensure!(
+            !directory.exists(super::cleanup::TOMBSTONE)?,
+            "hour retired"
+        );
         Ok(Self {
             directory,
             identity,
@@ -99,6 +103,10 @@ impl Store {
         progress: CheckpointProgress,
         mut hook: impl FnMut(Target, Phase) -> Result<()>,
     ) -> Result<()> {
+        ensure!(
+            !self.directory.exists(super::cleanup::TOMBSTONE)?,
+            "hour retired"
+        );
         let (current, rebuilt) = self.recover()?;
         let entry = PageEntry::new(sequence, raw, progress.clone());
         let count = current.entries().len() as u64;

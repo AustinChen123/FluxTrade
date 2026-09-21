@@ -9,7 +9,7 @@ use anyhow::{ensure, Result};
 use ring::rand::{SecureRandom, SystemRandom};
 use rustix::fd::{AsFd, OwnedFd};
 use rustix::fs::{
-    fstat, fsync, mkdirat, openat, renameat, unlinkat, AtFlags, FileType, Mode, OFlags,
+    fstat, fsync, mkdirat, openat, renameat, statat, unlinkat, AtFlags, FileType, Mode, OFlags,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -37,6 +37,21 @@ fn leaf(name: &str) -> bool {
 }
 
 impl Directory {
+    pub(crate) fn exists(&self, name: &str) -> Result<bool> {
+        ensure!(leaf(name), "unsafe leaf name");
+        match statat(&self.fd, name, AtFlags::SYMLINK_NOFOLLOW) {
+            Ok(_) => Ok(true),
+            Err(rustix::io::Errno::NOENT) => Ok(false),
+            Err(error) => Err(error.into()),
+        }
+    }
+    pub(crate) fn unlink_if_present(&self, name: &str) -> Result<()> {
+        ensure!(leaf(name), "unsafe leaf name");
+        match unlinkat(&self.fd, name, AtFlags::empty()) {
+            Ok(()) | Err(rustix::io::Errno::NOENT) => Ok(()),
+            Err(error) => Err(error.into()),
+        }
+    }
     pub(crate) fn sync(&self) -> Result<()> {
         Ok(fsync(&self.fd)?)
     }

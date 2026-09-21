@@ -16,17 +16,71 @@ fn identity() -> Identity {
 }
 
 #[tokio::test]
+async fn any_cleanup_marker_blocks_recovery_before_source_or_clocks() {
+    for present in [false, true] {
+        for kind in ["valid", "partial", "directory", "symlink"] {
+            let temp = tempfile::tempdir().unwrap();
+            let root = File::open(temp.path()).unwrap();
+            if present {
+                kline_evidence::persist(&root, identity(), RAW, DAY).unwrap();
+            } else {
+                fs::create_dir(temp.path().join("daily")).unwrap();
+            }
+            let marker = temp
+                .path()
+                .join("daily")
+                .join(super::super::cleanup::MARKER);
+            match kind {
+                "directory" => fs::create_dir(&marker).unwrap(),
+                "symlink" => {
+                    std::os::unix::fs::symlink(temp.path().join("missing"), &marker).unwrap()
+                }
+                "valid" => {
+                    let value = serde_json::json!({"schema":1,"identity":identity(),"content_sha256":"a".repeat(64),"handoff_sha256":"b".repeat(64),
+                        "hours":(0..24).map(|_|serde_json::json!({"manifest_sha256":"c".repeat(64),"page_count":1})).collect::<Vec<_>>()});
+                    fs::write(&marker, serde_json::to_vec(&value).unwrap()).unwrap();
+                }
+                _ => fs::write(&marker, b"partial marker").unwrap(),
+            }
+            let mut source = Fake::new(vec![]);
+            let error = run(
+                &root,
+                &identity(),
+                &mut source,
+                || panic!("retired wall"),
+                || panic!("retired elapsed"),
+                |_| async { panic!("retired wait") },
+            )
+            .await
+            .unwrap_err();
+            assert_eq!(error.to_string(), "daily source retired");
+            assert_eq!(source.calls.load(Ordering::SeqCst), 0);
+            assert!(kline_evidence::recover(&root, &identity()).is_err());
+            assert!(kline_evidence::recover_optional(&root, &identity()).is_err());
+            assert!(kline_evidence::persist(&root, identity(), RAW, DAY).is_err());
+            assert_eq!(
+                temp.path()
+                    .join("daily")
+                    .join(kline_evidence::FILE)
+                    .exists(),
+                present
+            );
+        }
+    }
+}
+
+#[tokio::test]
 async fn ack_unknown_visible_artifact_is_confirmed_without_refetch() {
     use super::super::directory::{Directory, Phase};
     let seed = tempfile::tempdir().unwrap();
     let seed_root = File::open(seed.path()).unwrap();
     kline_evidence::persist(&seed_root, identity(), RAW, DAY).unwrap();
-    let bytes = fs::read(seed.path().join("daily/daily-kline-evidence.json")).unwrap();
+    let bytes = fs::read(seed.path().join("daily").join(kline_evidence::FILE)).unwrap();
     let temp = tempfile::tempdir().unwrap();
     let root = File::open(temp.path()).unwrap();
     let directory = Directory::open(&root, "daily").unwrap();
     assert!(directory
-        .replace_with("daily-kline-evidence.json", &bytes, |phase| {
+        .replace_with(kline_evidence::FILE, &bytes, |phase| {
             anyhow::ensure!(phase != Phase::BeforeDirectorySync, "ACK unknown");
             Ok(())
         })
@@ -313,7 +367,7 @@ async fn clock_integrity_and_filesystem_fail_closed() {
         .unwrap()
         .is_none());
     fs::write(
-        temp.path().join("daily/daily-kline-evidence.json"),
+        temp.path().join("daily").join(kline_evidence::FILE),
         b"corrupt SECRET",
     )
     .unwrap();
@@ -329,7 +383,7 @@ async fn clock_integrity_and_filesystem_fail_closed() {
     .await
     .is_err());
     assert_eq!(source.calls.load(Ordering::SeqCst), 0);
-    let not_directory = File::open(temp.path().join("daily/daily-kline-evidence.json")).unwrap();
+    let not_directory = File::open(temp.path().join("daily").join(kline_evidence::FILE)).unwrap();
     assert!(kline_evidence::recover_optional(&not_directory, &identity()).is_err());
 }
 

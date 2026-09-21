@@ -11,6 +11,8 @@ pub mod binance_kline;
 pub mod binance_spot;
 pub mod checkpoint;
 #[cfg(unix)]
+pub mod cleanup;
+#[cfg(unix)]
 pub mod collector;
 pub mod compressed_page;
 pub mod daily;
