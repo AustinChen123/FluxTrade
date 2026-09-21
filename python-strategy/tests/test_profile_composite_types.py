@@ -1,5 +1,5 @@
-from dataclasses import FrozenInstanceError, replace
-from decimal import Decimal
+from dataclasses import FrozenInstanceError, fields, is_dataclass, replace
+from decimal import Decimal, Inexact, Rounded, localcontext
 import subprocess
 import sys
 
@@ -135,3 +135,130 @@ def test_isolated_import() -> None:
         check=False,
     )
     assert result.returncode == 0, result.stderr
+
+
+def _subclass(value: object) -> object:
+    # Exercise exact-type rejection using valid inherited constructors, not forged state.
+    assert is_dataclass(value)
+    derived = type("Derived", (type(value),), {})
+    return derived(
+        **{field.name: getattr(value, field.name) for field in fields(value)}
+    )
+
+
+def _fixed_error(caught: pytest.ExceptionInfo[InvalidCompositeProfile]) -> None:
+    assert type(caught.value) is InvalidCompositeProfile
+    assert str(caught.value) == "PROFILE_COMPOSITE_INVALID"
+    assert caught.value.__cause__ is None and caught.value.__suppress_context__
+
+
+@pytest.mark.parametrize(
+    "field,value",
+    [
+        ("manifest", True),
+        ("manifest", _subclass(MANIFEST)),
+        ("output_grid", True),
+        ("output_grid", _subclass(GRID)),
+        ("bins", type("TupleSubclass", (tuple,), {})((BIN,))),
+        ("bins", (True,)),
+        ("bins", (_subclass(BIN),)),
+        ("poc", True),
+        ("poc", _subclass(POC)),
+        ("base_volume", True),
+        ("quote_volume", "SECRET"),
+        ("base_volume", type("DecimalSubclass", (Decimal,), {})("1")),
+        ("aggregate_count", True),
+        ("aggregate_count", type("IntSubclass", (int,), {})(1)),
+        ("aggregate_count", -1),
+        ("aggregate_count", 1 << 63),
+    ],
+)
+def test_exact_nested_and_integer_domains(field: str, value: object) -> None:
+    with pytest.raises(InvalidCompositeProfile) as caught:
+        replace(FULL, **{field: value})
+    _fixed_error(caught)
+
+
+@pytest.mark.parametrize("field", ["base_volume", "quote_volume"])
+@pytest.mark.parametrize(
+    "value",
+    [
+        "-1",
+        "NaN",
+        "sNaN",
+        "Infinity",
+        "-Infinity",
+        "79228162514264337593543950336",
+        "1e-29",
+    ],
+)
+def test_summary_decimal_rejections(field: str, value: str) -> None:
+    with pytest.raises(InvalidCompositeProfile) as caught:
+        replace(FULL, **{field: Decimal(value)})
+    _fixed_error(caught)
+
+
+def test_summary_decimal_boundaries_and_context() -> None:
+    for precision in (1, 28):
+        with localcontext() as context:
+            context.prec = precision
+            context.traps[Inexact] = context.traps[Rounded] = True
+            for field in ("base_volume", "quote_volume"):
+                for text in ("79228162514264337593543950335", "1e-28", "1.2300"):
+                    result = replace(FULL, **{field: Decimal(text)})
+                    assert getattr(result, field) == Decimal(text)
+                zero = replace(EMPTY, **{field: Decimal("-0.00")})
+                assert getattr(zero, field).as_tuple() == Decimal(0).as_tuple()
+            assert (
+                replace(FULL, aggregate_count=(1 << 63) - 1).aggregate_count
+                == (1 << 63) - 1
+            )
+            assert EMPTY.aggregate_count == 0
+            with pytest.raises(InvalidCompositeProfile) as caught:
+                replace(FULL, base_volume=Decimal("1e-29"))
+            _fixed_error(caught)
+
+
+@pytest.mark.parametrize(
+    "field,value",
+    [
+        ("index", True),
+        ("index", type("IntSubclass", (int,), {})(0)),
+        ("index", -(1 << 63) - 1),
+        ("index", 1 << 63),
+        ("low", True),
+        ("high_exclusive", "SECRET"),
+        ("low", type("DecimalSubclass", (Decimal,), {})(0)),
+        ("low", Decimal(10)),
+        ("low", Decimal(11)),
+    ],
+)
+def test_poc_exact_types_and_order(field: str, value: object) -> None:
+    with pytest.raises(InvalidCompositeProfile) as caught:
+        replace(POC, **{field: value})
+    _fixed_error(caught)
+
+
+@pytest.mark.parametrize("field", ["low", "high_exclusive"])
+@pytest.mark.parametrize(
+    "text",
+    ["NaN", "sNaN", "Infinity", "-Infinity", "1e-29", "79228162514264337593543950336"],
+)
+def test_poc_decimal_domain(field: str, text: str) -> None:
+    with pytest.raises(InvalidCompositeProfile) as caught:
+        replace(POC, **{field: Decimal(text)})
+    _fixed_error(caught)
+
+
+def test_poc_exact_boundaries_under_traps() -> None:
+    maximum = Decimal("79228162514264337593543950335")
+    for precision in (1, 28):
+        with localcontext() as context:
+            context.prec = precision
+            context.traps[Inexact] = context.traps[Rounded] = True
+            for index in (-(1 << 63), (1 << 63) - 1):
+                result = CompositeProfilePoc(index, maximum.copy_negate(), maximum)
+                assert result.index == index and result.high_exclusive == maximum
+                scaled = CompositeProfilePoc(index, Decimal("-0.00"), Decimal("1e-28"))
+                assert scaled.low.as_tuple() == Decimal(0).as_tuple()
+                assert scaled.high_exclusive == Decimal("1e-28")
