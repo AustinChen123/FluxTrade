@@ -155,3 +155,67 @@ def test_exact_types_and_unavailable_contract() -> None:
             cast(Callable[..., object], owner.ProfileSelectionUnavailable)(reason)
     with pytest.raises(owner.ProfileSelectionError):
         replace(batch, product_id="SECRET")
+
+
+def test_distinct_candidate_capacity() -> None:
+    _, batch = inputs()
+    seed = batch.candidates[0]
+    rows = tuple(
+        replace(
+            seed,
+            ref=replace(
+                seed.ref,
+                snapshot_id=f"{i:064x}",
+                window_start_ms=i * 86400000,
+                window_end_ms=(i + 1) * 86400000,
+            ),
+        )
+        for i in range(1001)
+    )
+    assert len(replace(batch, candidates=rows[:1000]).candidates) == 1000
+    with pytest.raises(owner.ProfileSelectionError):
+        replace(batch, candidates=rows)
+
+
+@pytest.mark.parametrize("missing_index", [0, 1])
+def test_conflict_wins_over_missing_in_either_order(missing_index: int) -> None:
+    request, batch = inputs(2)
+    conflict = batch.candidates[1 - missing_index]
+    conflict = replace(conflict, ref=replace(conflict.ref, content_sha256="f" * 64))
+    with pytest.raises(
+        owner.ProfileSelectionError, match="^PROFILE_SELECTION_INVALID$"
+    ):
+        owner.select_recorded_profile(request, replace(batch, candidates=(conflict,)))
+
+
+def test_selection_constructor_hostile_matrix() -> None:
+    request, _ = inputs(3)
+    manifest = request.pinned_manifest
+    assert manifest is not None
+    ids = tuple(ref.snapshot_id for ref in manifest.days)
+    derived = type("ManifestSubclass", (type(manifest),), {})(
+        manifest.product_id,
+        manifest.base_grid_id,
+        manifest.algorithm_version,
+        manifest.days,
+    )
+    constructor = cast(Callable[..., object], owner.RecordedProfileSelection)
+    for bad_manifest in (True, derived):
+        with pytest.raises(owner.ProfileSelectionError):
+            constructor(bad_manifest, ())
+    for bad_ids in (
+        list(ids),
+        type("TupleSubclass", (tuple,), {})(ids),
+        (True,),
+        (type("Text", (str,), {})(ids[0]),),
+        (ids[0], ids[0]),
+        ("f" * 64,),
+        tuple(reversed(ids)),
+    ):
+        with pytest.raises(owner.ProfileSelectionError):
+            constructor(manifest, bad_ids)
+    for valid in ((), (ids[1],), (ids[0], ids[2]), ids):
+        assert (
+            owner.RecordedProfileSelection(manifest, valid).revoked_snapshot_ids
+            == valid
+        )
