@@ -23,6 +23,7 @@ def fixture(monkeypatch: pytest.MonkeyPatch):
         (0, 0),
         (1, 2),
         (2, 1),
+        (123, 123),
         (299999, 1),
         (1, 299999),
         (300000, 0),
@@ -66,7 +67,10 @@ def test_elapsed_boundary_and_order(
         )
         assert (
             result.validation_max_age_ms == 300000
-            and result.validation_expires_at_ms == start + 300000
+            and result.validation_expires_at_ms == start + utc + 300000 - max(utc, mono)
+            and result.validation_expires_at_ms - result.validation_completed_at_ms
+            == 300000 - max(utc, mono)
+            and result.validation_expires_at_ms <= start + 300000
         )
         assert not hasattr(result, "__dict__")
         with pytest.raises(FrozenInstanceError):

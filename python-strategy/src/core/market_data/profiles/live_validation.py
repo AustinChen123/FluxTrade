@@ -67,7 +67,7 @@ class ValidatedLiveProfileQuery:
 
     @property
     def validation_expires_at_ms(self) -> int:
-        return self.validation_started_at_ms + _AGE
+        return self.validation_completed_at_ms + _AGE - self.validation_elapsed_ms
 
 
 def validate_live_profile(
