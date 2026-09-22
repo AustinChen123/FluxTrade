@@ -5,7 +5,8 @@ from __future__ import annotations
 import logging
 import inspect
 import weakref
-from contextlib import nullcontext
+import sys
+from contextlib import AbstractContextManager, nullcontext
 from collections.abc import Callable
 from decimal import Decimal
 from enum import Enum
@@ -28,6 +29,17 @@ StrategyContextLoader = Callable[
     [BaseStrategy, Candlestick, tuple[dict[str, Any], ...]],
     StrategyContext,
 ]
+StrategyDecisionScope = Callable[
+    [BaseStrategy, Candlestick, StrategyContext | None],
+    AbstractContextManager[StrategyContext | None],
+]
+
+
+class StrategyDecisionSkipped(RuntimeError):
+    """Only scope admission may skip a callback that has not started."""
+
+    def __init__(self) -> None:
+        super().__init__("STRATEGY_DECISION_SKIPPED")
 
 
 class SignalObserverError(RuntimeError):
@@ -177,6 +189,7 @@ class SignalProcessor:
         emit_signals: bool = True,
         respect_state: bool = True,
         latest_fills: tuple[dict[str, Any], ...] = (),
+        decision_scope: StrategyDecisionScope | None = None,
     ) -> None:
         """Route a candle to matching, running strategies.
 
@@ -231,12 +244,29 @@ class SignalProcessor:
                             candle,
                             latest_fills,
                         )
-                signals = self._dispatch_to_strategy(
-                    strategy,
-                    candle,
-                    context,
-                    invocation_mode=invocation_mode,
+                manager = (
+                    nullcontext(context)
+                    if decision_scope is None
+                    else decision_scope(strategy, candle, context)
                 )
+                try:
+                    enriched = manager.__enter__()
+                except StrategyDecisionSkipped:
+                    signals = []
+                else:
+                    try:
+                        signals = self._dispatch_to_strategy(
+                            strategy,
+                            candle,
+                            enriched,
+                            invocation_mode=invocation_mode,
+                        )
+                    except BaseException:
+                        # A scope cannot suppress a started callback failure into success.
+                        manager.__exit__(*sys.exc_info())
+                        raise
+                    else:
+                        manager.__exit__(None, None, None)
                 decisions.append((strategy.strategy_id, signals))
 
             if emit_signals:
