@@ -1890,6 +1890,134 @@ def test_decision_input_upgrade_downgrade_artifacts(fresh_pg_db: str) -> None:
         engine.dispose()
 
 
+def test_decision_input_store_concurrent_pins(profile_repository_pg: Engine) -> None:
+    from sqlalchemy import event
+    from concurrent.futures import ThreadPoolExecutor
+    from threading import Barrier
+    from src.core.market_data.profiles.decision_input_store import DecisionInputStore, DecisionInputConflict
+    from test_profile_decision_input import sample
+
+    engine = profile_repository_pg.execution_options(isolation_level="REPEATABLE READ")
+    value = sample()
+    for conflict in (False, True):
+        first = replace(value, key=replace(value.key, strategy_id=f"concurrent_{conflict}"))
+        second = replace(first, requirements=(), context=replace(first.context, profiles=())) if conflict else first
+        barrier = Barrier(2)
+        isolation = []
+
+        @contextmanager
+        def sessions():
+            with Session(engine) as session:
+                yield session
+
+        def capture(conn, cursor, statement, parameters, context, executemany):
+            if statement.startswith("SELECT market_data_decision_input"):
+                with conn.connection.cursor() as probe:
+                    probe.execute("SHOW transaction_isolation")
+                    isolation.append(probe.fetchone()[0])
+
+        def pin(item):
+            barrier.wait(timeout=5)
+            try:
+                return DecisionInputStore(sessions).pin(item)
+            except DecisionInputConflict:
+                return None
+
+        event.listen(engine, "after_cursor_execute", capture)
+        try:
+            with ThreadPoolExecutor(max_workers=2) as pool:
+                futures = [pool.submit(pin, item) for item in (first, second)]
+                results = [future.result(timeout=10) for future in futures]
+            assert isolation and set(isolation) == {"read committed"}
+            if conflict:
+                assert sum(result is None for result in results) == 1
+            else:
+                assert sorted(result.already_present for result in results if result is not None) == [False, True]
+        finally:
+            event.remove(engine, "after_cursor_execute", capture)
+        with engine.connect() as conn:
+            assert conn.execute(text("SELECT count(*) FROM market_data_decision_input WHERE strategy_id=:strategy"), {"strategy": first.key.strategy_id}).scalar_one() == 1
+
+
+def test_decision_input_store_commit_faults_and_wait(profile_repository_pg: Engine) -> None:
+    from contextlib import nullcontext
+    from sqlalchemy import event
+    from src.core.market_data.profiles.repository import TransactionWaitPolicy
+    from src.core.market_data.profiles.decision_input_store import DecisionInputStore
+    from test_profile_decision_input import sample
+
+    engine = profile_repository_pg
+    value = sample()
+    error = DBAPIError(None, None, RuntimeError("lost ACK"))
+
+    @contextmanager
+    def ack_lost():
+        with Session(engine) as session:
+            yield session
+        raise error
+
+    store = DecisionInputStore(sessionmaker(engine))
+    with pytest.raises(DBAPIError) as caught:
+        DecisionInputStore(ack_lost).pin(value)
+    assert caught.value is error
+    confirmed = store.confirm(value)
+    assert confirmed is not None and confirmed.already_present and confirmed.value == value
+    assert store.confirm(value) == confirmed
+
+    rolled = replace(value, key=replace(value.key, strategy_id="rolled"))
+    def abort(session):
+        raise error
+    with Session(engine) as session:
+        event.listen(session, "before_commit", abort)
+        with pytest.raises(DBAPIError) as caught:
+            DecisionInputStore(lambda: nullcontext(session)).pin(rolled)
+        assert caught.value is error
+    assert store.get(rolled.key) is None
+
+    from src.core.market_data.profiles.decision_input_store import _values
+    from src.core.market_data.profiles.orm import MarketDataDecisionInput as InputRow
+    waiting = replace(value, key=replace(value.key, strategy_id="waiting"))
+    inserts = []
+    def count_insert(conn, cursor, statement, parameters, context, executemany):
+        if statement.startswith("INSERT INTO market_data_decision_input"):
+            inserts.append(statement)
+    with engine.connect() as holder:
+        transaction = holder.begin()
+        try:
+            holder.execute(sa.insert(InputRow).values(**_values(waiting)))
+            short = DecisionInputStore(sessionmaker(engine), TransactionWaitPolicy(25, 1000))
+            event.listen(engine, "before_cursor_execute", count_insert)
+            try:
+                with pytest.raises(DBAPIError) as caught:
+                    short.pin(waiting)
+            finally:
+                event.remove(engine, "before_cursor_execute", count_insert)
+            assert getattr(caught.value.orig, "pgcode", None) == "55P03"
+            assert len(inserts) == 1
+        finally:
+            transaction.rollback()
+    assert store.get(waiting.key) is None
+    assert not store.pin(waiting).already_present
+
+
+@pytest.mark.parametrize("damage", ["payload", "key", "time", "digest"])
+def test_decision_input_store_corruption(profile_repository_pg: Engine, damage: str) -> None:
+    from src.core.market_data.profiles.decision_input_store import DecisionInputStore, DecisionInputIntegrityError, _values
+    from src.core.market_data.profiles.orm import MarketDataDecisionInput as InputRow
+    from test_profile_decision_input import sample
+
+    value = sample()
+    values = _values(value)
+    changes = {"payload": {"canonical_payload": b"{}"}, "key": {"strategy_version": "other"},
+               "time": {"decision_time_ms": value.decision_time_ms + 1}, "digest": {"input_digest": "f" * 64}}
+    with profile_repository_pg.begin() as conn:
+        conn.execute(sa.insert(InputRow).values(**{**values, **changes[damage]}))
+    store = DecisionInputStore(sessionmaker(profile_repository_pg))
+    for action in (lambda: store.get(value.key), lambda: store.confirm(value), lambda: store.pin(value)):
+        with pytest.raises(DecisionInputIntegrityError):
+            action()
+
+
 # Selected non-legacy tables that must exist at HEAD and be gone
 # after a full downgrade to ``base``.
 HEAD_ONLY_TABLES = {
