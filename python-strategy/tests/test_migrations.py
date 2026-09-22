@@ -2018,9 +2018,110 @@ def test_decision_input_store_corruption(profile_repository_pg: Engine, damage: 
             action()
 
 
+def test_terminal_schema_contract_and_guards(profile_repository_pg: Engine) -> None:
+    from dataclasses import asdict
+    from src.core.market_data.profiles.decision_input_store import _values
+    from test_profile_decision_input import sample
+    from test_profile_decision_application import batch, key
+
+    engine = profile_repository_pg
+    metadata = sa.MetaData()
+    receipt, header, outcome, inputs = [sa.Table(name, metadata, autoload_with=engine) for name in (
+        "market_data_application", "market_data_decision_batch", "market_data_decision_outcome", "market_data_decision_input")]
+    empty = batch()
+    receipt_values = dict(environment="live", product_id=empty.product_id, timeframe="1m", timestamp=0,
+                          open=Decimal(1), high=Decimal(1), low=Decimal(1), close=Decimal(1), volume=Decimal(0))
+    base = dict(environment="live", product_id=empty.product_id, timeframe="1m", bar_start_ms=0,
+                execution_scope_id="deployment", contract_version=1, participant_count=0,
+                canonical_payload=empty.canonical_bytes, batch_digest=empty.digest)
+    with engine.begin() as conn:
+        assert conn.execute(receipt.insert().values(**receipt_values).returning(receipt.c.decision_contract_version)).scalar_one() is None
+    with pytest.raises(DBAPIError) as caught, engine.begin() as conn:
+        conn.execute(header.insert().values(**base))
+    assert getattr(caught.value.orig, "pgcode", None) == "23503"
+    with engine.begin() as conn:
+        conn.execute(receipt.update().values(decision_contract_version=1))
+    for field, value in (("participant_count", -1), ("participant_count", 257), ("canonical_payload", b""),
+                         ("canonical_payload", b"x" * 1048577), ("batch_digest", "A" * 64),
+                         ("bar_start_ms", -1), ("execution_scope_id", "bad!"), ("contract_version", 2),
+                         ("recorded_at", sa.cast("infinity", sa.DateTime(timezone=True)))):
+        with pytest.raises(DBAPIError), engine.begin() as conn:
+            conn.execute(header.insert().values(**{**base, field: value}))
+    # SQL resource boundaries are independent of codec completeness: later helper validates payload claims.
+    for changes in ({"participant_count": 256}, {"canonical_payload": empty.canonical_bytes + b" " * (1048576 - len(empty.canonical_bytes))}):
+        with engine.connect() as conn:
+            tx = conn.begin()
+            try:
+                conn.execute(header.insert().values(**{**base, **changes}))
+            finally:
+                tx.rollback()
+    with engine.begin() as conn:
+        recorded = conn.execute(header.insert().values(**base).returning(header.c.recorded_at)).scalar_one()
+        assert recorded.utcoffset() == timedelta(0) and recorded.microsecond % 1000 == 0
+        conn.execute(inputs.insert().values(**_values(sample())))
+    terminal = dict(**asdict(key()), timeframe="1m", bar_start_ms=0, contract_version=1,
+                    disposition="APPLIED", input_id=sample().input_id, input_digest=sample().input_digest,
+                    reason=None, signal_suppressed=False, suppression_reason=None)
+    for changes in ({}, {"signal_suppressed": True, "suppression_reason": "SNAPSHOT_REVOKED"},
+                    {"disposition": "SKIPPED", "reason": "INPUT_STORE_FAILED", "input_id": None, "input_digest": None},
+                    {"disposition": "SKIPPED", "reason": "INPUT_COMMIT_UNCONFIRMED"}):
+        with engine.connect() as conn:
+            tx = conn.begin()
+            try:
+                conn.execute(outcome.insert().values(**{**terminal, **changes}))
+            finally:
+                tx.rollback()
+    for changes in ({"input_id": None, "input_digest": None}, {"input_digest": None}, {"input_id": "f" * 64},
+                    {"input_digest": "BAD"}, {"execution_scope_id": "other"}, {"trigger_id": "1m:1"},
+                    {"disposition": "OTHER"}, {"reason": "INPUT_STORE_FAILED"},
+                    {"disposition": "SKIPPED", "reason": None}, {"disposition": "SKIPPED", "reason": "PROFILE_NOT_READY"},
+                    {"disposition": "SKIPPED", "reason": "INPUT_STORE_FAILED", "signal_suppressed": True, "suppression_reason": "SNAPSHOT_REVOKED"},
+                    {"signal_suppressed": True}, {"suppression_reason": "SNAPSHOT_REVOKED"}):
+        with pytest.raises(DBAPIError), engine.begin() as conn:
+            conn.execute(outcome.insert().values(**{**terminal, **changes}))
+    with engine.begin() as conn:
+        conn.execute(outcome.insert().values(**terminal))
+    for changes in ({}, {"strategy_version": "v2"}):
+        with pytest.raises(DBAPIError) as caught, engine.begin() as conn:
+            conn.execute(outcome.insert().values(**{**terminal, **changes}))
+        assert getattr(caught.value.orig, "pgcode", None) == "23505"
+    for table in (header, outcome):
+        with engine.connect() as conn:
+            before = conn.execute(sa.select(table)).mappings().all()
+        for statement in (f"UPDATE {table.name} SET contract_version=contract_version", f"UPDATE {table.name} SET contract_version=1 WHERE false",
+                          f"DELETE FROM {table.name}", f"DELETE FROM {table.name} WHERE false",
+                          "TRUNCATE market_data_decision_batch, market_data_decision_outcome"):
+            with pytest.raises(DBAPIError) as caught, engine.begin() as conn:
+                conn.execute(text(statement))
+            assert getattr(caught.value.orig, "pgcode", None) == "55000"
+        with engine.connect() as conn:
+            assert conn.execute(sa.select(table)).mappings().all() == before
+
+
+def test_terminal_schema_roundtrip(fresh_pg_db: str) -> None:
+    _upgrade(fresh_pg_db)
+    engine = sa.create_engine(_target_url(fresh_pg_db))
+    try:
+        for index, stage in enumerate((True, False, True)):
+            with engine.connect() as conn:
+                for table in ("market_data_decision_batch", "market_data_decision_outcome"):
+                    assert (conn.execute(text("SELECT to_regclass(:name)"), {"name": table}).scalar_one() is not None) is stage
+                assert (conn.execute(text("SELECT to_regprocedure('reject_market_data_terminal_mutation()')")).scalar_one() is not None) is stage
+                assert conn.execute(text("SELECT count(*) FROM information_schema.columns WHERE table_name='market_data_application' AND column_name='decision_contract_version'")).scalar_one() == int(stage)
+                assert conn.execute(text("SELECT count(*) FROM pg_trigger WHERE tgname IN ('market_data_decision_batch_append_only','market_data_decision_outcome_append_only') AND NOT tgisinternal")).scalar_one() == 2 * int(stage)
+            if index == 0:
+                _downgrade(fresh_pg_db, "8e4b2c91a6d0")
+            elif index == 1:
+                _upgrade(fresh_pg_db)
+    finally:
+        engine.dispose()
+
+
 # Selected non-legacy tables that must exist at HEAD and be gone
 # after a full downgrade to ``base``.
 HEAD_ONLY_TABLES = {
+    "market_data_decision_batch",
+    "market_data_decision_outcome",
     "market_data_invalidation",
     "market_data_decision_input",
     "volume_profile_snapshot",
@@ -2825,7 +2926,7 @@ def test_order_identity_incompatible_downgrade_keeps_scoped_indexes(
                 conn.execute(
                     text("SELECT version_num FROM alembic_version")
                 ).scalar_one()
-                == "8e4b2c91a6d0"
+                == "2f6c8a1e9b04"
             )
     finally:
         engine.dispose()
