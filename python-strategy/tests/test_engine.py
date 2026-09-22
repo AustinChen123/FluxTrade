@@ -4556,7 +4556,7 @@ class TestHeartbeatRecording:
 
         assert entry._in_position is False
         assert entry.restore_calls == 1
-        engine._live_candle_application._persist.assert_called_once_with(candle)
+        engine._live_candle_application._persist.assert_called_once_with(candle, None)
         engine.execution_engine.execute_signal.assert_called_once()
         assert (
             engine.execution_engine.execute_signal.call_args.args[0].type
@@ -5009,7 +5009,9 @@ class TestHeartbeatRecording:
 
         assert active._in_position is False
         assert active.restore_calls == 1
-        engine._live_candle_application._persist.assert_called_once_with(entry_candle)
+        engine._live_candle_application._persist.assert_called_once_with(
+            entry_candle, None
+        )
         engine.risk_manager.check_risk.assert_called_once()
         engine.execution_engine.execute_signal.assert_called_once()
         assert (

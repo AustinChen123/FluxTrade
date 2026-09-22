@@ -5,7 +5,10 @@ from typing import ContextManager
 
 from sqlalchemy.orm import Session
 
-from src.core.live_candle_application import LiveCandleApplicationService
+from src.core.live_candle_application import (
+    LiveCandleApplicationService,
+    PendingCandleCallback,
+)
 from src.core.models import Candlestick, Trade
 from src.core.strategy_hydration_service import StrategyHydrationService
 from src.strategies.base import BaseStrategy
@@ -98,7 +101,7 @@ class PendingMarketReplayService:
         self,
         data: Candlestick | Trade,
         *,
-        apply_new: Callable[[Candlestick], None],
+        apply_new: PendingCandleCallback,
     ) -> None:
         if not isinstance(data, Candlestick):
             raise RuntimeError(

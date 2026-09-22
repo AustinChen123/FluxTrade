@@ -57,6 +57,8 @@ from src.core.engine_runtime_reconciliation_service import (
     EngineRuntimeReconciliationService,
 )
 from src.core.live_candle_application import LiveCandleApplicationService
+from src.core.market_data.profiles.decision_application import MarketDataDecisionBatch
+from src.core.market_data.profiles.decision_owner import MarketDataDecisionOwner
 from src.core.pending_market_replay import PendingMarketReplayService
 from src.core.ops_safety import OpsSafetyService
 from src.core.ops_command_service import OpsCommandService
@@ -186,6 +188,7 @@ class StrategyEngine:
         leadership_guard: Callable[[], None] | None = None,
         signal_batch_observer: Callable[[tuple[Signal, ...]], None] | None = None,
         strategy_context_loader: StrategyContextLoader | None = None,
+        market_data_decision_owner: MarketDataDecisionOwner | None = None,
         available_strategy_context_capabilities: frozenset[
             StrategyContextCapability
         ] = frozenset(),
@@ -221,6 +224,9 @@ class StrategyEngine:
         self._boot_id = uuid.uuid4().hex
         self._boot_started = False
         self._strategy_context_loader_enabled = strategy_context_loader is not None
+        if market_data_decision_owner is not None and strategy_context_loader is None:
+            raise ValueError("market data decisions require a context loader")
+        self._market_data_decision_owner = market_data_decision_owner
         self._is_backtest = is_backtest is True
         self._available_strategy_context_capabilities = frozenset(
             available_strategy_context_capabilities
@@ -1227,15 +1233,31 @@ class StrategyEngine:
             )
         return (artifact_cls(strategy_id, product_id),)
 
-    def _apply_unpersisted_candle(self, candle: Candlestick) -> None:
+    def _apply_unpersisted_candle(
+        self, candle: Candlestick
+    ) -> MarketDataDecisionBatch | None:
         fills = self.execution_engine.process_market_data(candle)
+        decision = (
+            None
+            if self._market_data_decision_owner is None
+            else self._market_data_decision_owner.begin_candle(candle)
+        )
         if self._strategy_context_loader_enabled:
-            self._signal_processor.on_candle(
-                candle,
-                latest_fills=self._timestamped_fills(fills, candle.timestamp),
-            )
+            latest_fills = self._timestamped_fills(fills, candle.timestamp)
+            if decision is None:
+                self._signal_processor.on_candle(
+                    candle,
+                    latest_fills=latest_fills,
+                )
+            else:
+                self._signal_processor.on_candle(
+                    candle,
+                    latest_fills=latest_fills,
+                    decision_scope=decision,
+                )
         else:
             self._signal_processor.on_candle(candle)
+        return None if decision is None else decision.build()
 
     @staticmethod
     def _timestamped_fills(
