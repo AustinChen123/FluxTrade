@@ -8,6 +8,8 @@ from dataclasses import dataclass, fields, is_dataclass
 from enum import Enum
 
 from src.core.backtest.run_evidence import configuration_sha256
+from src.core.portfolio_runtime import PortfolioDefinition
+from src.strategies.base import BaseStrategy
 
 
 _EXECUTION_SCOPE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_-]{0,127}")
@@ -103,3 +105,69 @@ class MarketDataDecisionCompositionIdentity:
             strategy_version=strategy_version,
             config_hash=decision_config_hash(configuration),
         )
+
+
+def _strategy_configuration(strategy: BaseStrategy) -> dict[str, object]:
+    try:
+        replay_configuration = strategy.replay_configuration()
+    except Exception:
+        raise DecisionCompositionError() from None
+    return {
+        "strategy_id": strategy.strategy_id,
+        "product_id": strategy.product_id,
+        "requirements": strategy.requirements,
+        "replay_configuration": replay_configuration,
+    }
+
+
+def strategy_decision_composition(
+    execution_scope_id: str,
+    strategy: BaseStrategy,
+) -> MarketDataDecisionCompositionIdentity:
+    """Bind a catalog-loaded strategy to its effective decision configuration."""
+    if not isinstance(strategy, BaseStrategy):
+        raise DecisionCompositionError()
+    strategy_version = getattr(type(strategy), "__fluxtrade_artifact_version__", None)
+    if type(strategy_version) is not str:
+        raise DecisionCompositionError()
+    return MarketDataDecisionCompositionIdentity.from_configuration(
+        execution_scope_id=execution_scope_id,
+        strategy_version=strategy_version,
+        configuration={
+            "schema_version": 1,
+            "artifact_kind": "strategy",
+            "strategy": _strategy_configuration(strategy),
+        },
+    )
+
+
+def portfolio_decision_composition(
+    execution_scope_id: str,
+    definition: PortfolioDefinition,
+) -> MarketDataDecisionCompositionIdentity:
+    """Bind all portfolio sleeves to one exact factory-owned configuration."""
+    if type(definition) is not PortfolioDefinition:
+        raise DecisionCompositionError()
+    strategy_version = definition.artifact_version
+    if type(strategy_version) is not str:
+        raise DecisionCompositionError()
+    configuration = {
+        "schema_version": 1,
+        "artifact_kind": "portfolio",
+        "portfolio_id": definition.portfolio_id,
+        "product_id": definition.product_id,
+        "max_gross_quantity": definition.max_gross_quantity,
+        "exclusive_slots": definition.exclusive_slots,
+        "sleeves": tuple(
+            {
+                **_strategy_configuration(sleeve.strategy),
+                "activation_windows": sleeve.activation_windows,
+            }
+            for sleeve in definition.sleeves
+        ),
+    }
+    return MarketDataDecisionCompositionIdentity.from_configuration(
+        execution_scope_id=execution_scope_id,
+        strategy_version=strategy_version,
+        configuration=configuration,
+    )
