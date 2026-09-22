@@ -23,7 +23,7 @@ class AssemblyFailure(ValueError):
 class IngestPolicy:
     lease: timedelta = timedelta(minutes=5)
     retry_delay: timedelta = timedelta(minutes=1)
-    timeout_ms: int = 30_000
+    timeout_ms: int = 120_000
     stdout_bytes: int = MAX_FRAMED_HANDOFF_BYTES
     stderr_bytes: int = 4_096
 
@@ -31,7 +31,7 @@ class IngestPolicy:
         for value in (self.lease, self.retry_delay):
             if type(value) is not timedelta or not timedelta(0) < value <= timedelta(days=1):
                 raise ValueError("invalid ingest duration")
-        for value, maximum in ((self.timeout_ms, 60_000), (self.stdout_bytes, MAX_FRAMED_HANDOFF_BYTES),
+        for value, maximum in ((self.timeout_ms, 300_000), (self.stdout_bytes, MAX_FRAMED_HANDOFF_BYTES),
                                (self.stderr_bytes, 65_536)):
             if type(value) is not int or not 1 <= value <= maximum:
                 raise ValueError("invalid ingest limit")

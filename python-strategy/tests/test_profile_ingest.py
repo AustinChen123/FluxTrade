@@ -5,6 +5,7 @@ import sys
 from dataclasses import replace
 from datetime import datetime, timezone
 from pathlib import Path
+from typing import Any, cast
 from unittest.mock import MagicMock
 
 import pytest
@@ -121,6 +122,15 @@ def test_input_limits_reject_before_job_or_process(monkeypatch: pytest.MonkeyPat
     for changes in ({"timeout_ms": 0}, {"stdout_bytes": 2097154}, {"stderr_bytes": True}):
         with pytest.raises(ValueError):
             replace(ingest.IngestPolicy(), **changes)
+
+
+def test_offline_child_timeout_default_and_hard_bound() -> None:
+    assert ingest.IngestPolicy().timeout_ms == 120_000
+    for value in (1, 120_000, 300_000):
+        assert ingest.IngestPolicy(timeout_ms=value).timeout_ms == value
+    for invalid in (0, -1, 300_001, True, 120_000.0):
+        with pytest.raises(ValueError, match="^invalid ingest limit$"):
+            ingest.IngestPolicy(timeout_ms=cast(Any, invalid))
 
 
 def test_removed_source_arguments_have_no_compatibility_path(monkeypatch: pytest.MonkeyPatch) -> None:
