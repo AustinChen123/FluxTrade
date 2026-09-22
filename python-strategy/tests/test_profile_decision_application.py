@@ -231,6 +231,12 @@ def test_key_canonical_identity_and_no_decision_time():
     assert not hasattr(value, "__dict__")
 
 
+def test_key_accepts_exact_catalog_semver():
+    assert replace(key(), strategy_version="1.2.0+profile.1").strategy_version == (
+        "1.2.0+profile.1"
+    )
+
+
 @pytest.mark.parametrize("disposition", ["APPLIED", "SKIPPED", "PARTIAL"])
 @pytest.mark.parametrize(
     "reason",

@@ -10,6 +10,7 @@ import json
 from typing import Any
 
 from src.core.product_registry import validate_product_id
+from .decision_identity import validate_strategy_version
 from .read_types import _hex, _integer, _safe
 from .publication import _canonical
 
@@ -76,9 +77,9 @@ class MarketDataDecisionKey:
                 self.environment,
                 self.execution_scope_id,
                 self.strategy_id,
-                self.strategy_version,
             ):
                 _safe(value, 128)
+            validate_strategy_version(self.strategy_version)
             _hex(self.config_hash)
             _product(self.product_id)
             if (
