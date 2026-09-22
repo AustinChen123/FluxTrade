@@ -8,6 +8,7 @@ from collections.abc import Callable, Iterator
 from contextlib import AbstractContextManager, contextmanager
 from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
+from enum import StrEnum
 from typing import Any, cast
 
 from sqlalchemy import Table, and_, or_, select, text
@@ -33,6 +34,12 @@ class DecisionInputIntegrityError(ValueError):
         super().__init__("DECISION_INPUT_INTEGRITY")
 
 
+class DecisionInputPinStatus(StrEnum):
+    CONFIRMED = "CONFIRMED"
+    FAILED = "FAILED"
+    UNCONFIRMED = "UNCONFIRMED"
+
+
 @dataclass(frozen=True, slots=True)
 class DecisionInputRecord:
     value: MarketDataDecisionInput
@@ -47,6 +54,26 @@ class DecisionInputRecord:
             or type(stamp) is not datetime
             or stamp.tzinfo is not timezone.utc
             or stamp.microsecond % 1000
+        ):
+            raise DecisionInputIntegrityError()
+
+
+@dataclass(frozen=True, slots=True)
+class DecisionInputPinResult:
+    status: DecisionInputPinStatus
+    record: DecisionInputRecord | None = None
+
+    def __post_init__(self) -> None:
+        if (
+            type(self.status) is not DecisionInputPinStatus
+            or (
+                self.status is DecisionInputPinStatus.CONFIRMED
+                and type(self.record) is not DecisionInputRecord
+            )
+            or (
+                self.status is not DecisionInputPinStatus.CONFIRMED
+                and self.record is not None
+            )
         ):
             raise DecisionInputIntegrityError()
 
@@ -191,3 +218,25 @@ class DecisionInputStore:
             if winner is None:
                 raise DecisionInputIntegrityError()
             return self._match(winner, value)
+
+    def pin_confirmed(self, value: MarketDataDecisionInput) -> DecisionInputPinResult:
+        """Pin once and use at most one fresh read to classify an unknown ACK."""
+        try:
+            return DecisionInputPinResult(
+                DecisionInputPinStatus.CONFIRMED, self.pin(value)
+            )
+        except (DecisionInputConflict, DecisionInputIntegrityError):
+            return DecisionInputPinResult(DecisionInputPinStatus.FAILED)
+        except Exception:
+            try:
+                record = self.confirm(value)
+            except (DecisionInputConflict, DecisionInputIntegrityError):
+                return DecisionInputPinResult(DecisionInputPinStatus.FAILED)
+            except Exception:
+                return DecisionInputPinResult(DecisionInputPinStatus.UNCONFIRMED)
+            return DecisionInputPinResult(
+                DecisionInputPinStatus.CONFIRMED
+                if record is not None
+                else DecisionInputPinStatus.FAILED,
+                record,
+            )

@@ -15,6 +15,8 @@ from src.core.market_data.profiles.decision_input_store import (
     DecisionInputRecord,
     DecisionInputConflict,
     DecisionInputIntegrityError,
+    DecisionInputPinResult,
+    DecisionInputPinStatus,
 )
 from src.core.market_data.profiles.repository import TransactionWaitPolicy
 from test_profile_decision_input import sample
@@ -220,3 +222,82 @@ def test_loser_different_valid_content_is_conflict_and_outer_ack_propagates():
     with pytest.raises(DBAPIError) as caught:
         store.pin(value)
     assert caught.value is error
+
+
+@pytest.mark.parametrize(
+    "pin_failure,confirm_failure,confirmed,status,confirm_calls",
+    [
+        (None, None, False, DecisionInputPinStatus.CONFIRMED, 0),
+        (DBAPIError(None, None, RuntimeError()), None, True, DecisionInputPinStatus.CONFIRMED, 1),
+        (DecisionInputConflict(), None, False, DecisionInputPinStatus.FAILED, 0),
+        (DecisionInputIntegrityError(), None, False, DecisionInputPinStatus.FAILED, 0),
+        (DBAPIError(None, None, RuntimeError()), None, False, DecisionInputPinStatus.FAILED, 1),
+        (
+            DBAPIError(None, None, RuntimeError()),
+            DecisionInputConflict(),
+            False,
+            DecisionInputPinStatus.FAILED,
+            1,
+        ),
+        (
+            DBAPIError(None, None, RuntimeError()),
+            DecisionInputIntegrityError(),
+            False,
+            DecisionInputPinStatus.FAILED,
+            1,
+        ),
+        (
+            DBAPIError(None, None, RuntimeError()),
+            DBAPIError(None, None, RuntimeError()),
+            False,
+            DecisionInputPinStatus.UNCONFIRMED,
+            1,
+        ),
+    ],
+)
+def test_pin_confirmed_state_matrix(
+    pin_failure, confirm_failure, confirmed, status, confirm_calls
+):
+    store = cast(Any, DecisionInputStore(MagicMock()))
+    value = sample()
+    expected = DecisionInputRecord(value, NOW, True)
+    store.pin = MagicMock(side_effect=pin_failure, return_value=expected)
+    store.confirm = MagicMock(
+        side_effect=confirm_failure, return_value=expected if confirmed else None
+    )
+    result = DecisionInputStore.pin_confirmed(store, value)
+    assert result == DecisionInputPinResult(
+        status, expected if status is DecisionInputPinStatus.CONFIRMED else None
+    )
+    assert store.pin.call_count == 1 and store.confirm.call_count == confirm_calls
+
+
+def test_pin_result_exact_state_contract():
+    value = DecisionInputRecord(sample(), NOW, False)
+    subclass = type("Record", (DecisionInputRecord,), {})
+    for status, record in (
+        ("CONFIRMED", value),
+        (DecisionInputPinStatus.CONFIRMED, None),
+        (DecisionInputPinStatus.CONFIRMED, subclass(sample(), NOW, False)),
+        (DecisionInputPinStatus.FAILED, value),
+        (DecisionInputPinStatus.FAILED, True),
+        (DecisionInputPinStatus.UNCONFIRMED, value),
+        (DecisionInputPinStatus.UNCONFIRMED, object()),
+    ):
+        with pytest.raises(DecisionInputIntegrityError):
+            DecisionInputPinResult(cast(Any, status), cast(Any, record))
+
+
+@pytest.mark.parametrize("phase", ["pin", "confirm"])
+def test_pin_confirmed_never_catches_base_exception(phase):
+    store = cast(Any, DecisionInputStore(MagicMock()))
+    failure = KeyboardInterrupt()
+    store.pin = MagicMock(
+        side_effect=failure if phase == "pin" else RuntimeError("opaque")
+    )
+    store.confirm = MagicMock(side_effect=failure)
+    with pytest.raises(KeyboardInterrupt) as caught:
+        DecisionInputStore.pin_confirmed(store, sample())
+    assert caught.value is failure
+    assert store.pin.call_count == 1
+    assert store.confirm.call_count == (phase == "confirm")
