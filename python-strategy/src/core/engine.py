@@ -465,6 +465,7 @@ class StrategyEngine:
             publish_replacement=lambda replacement: self._register_strategy_instance(
                 replacement
             ),
+            market_data_decision_owner=market_data_decision_owner,
         )
         self.ops_safety = OpsSafetyService(
             self.execution_engine,

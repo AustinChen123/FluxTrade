@@ -43,6 +43,7 @@ def _service(
     active: list[MagicMock] | None = None,
     publish: MagicMock | None = None,
     events: list[str] | None = None,
+    decision_owner: MagicMock | None = None,
 ) -> tuple[
     PendingMarketReplayService,
     MagicMock,
@@ -76,6 +77,7 @@ def _service(
         strategy_hydration=hydration,
         list_active_strategies=lambda: tuple(active),
         publish_replacement=publish_replacement,
+        market_data_decision_owner=decision_owner,
     )
     return service, application, hydration, publish, db
 
@@ -198,6 +200,40 @@ def test_hydration_failure_publishes_no_partial_replacement() -> None:
     publish.assert_not_called()
 
 
+def test_rewind_profile_strategy_rebuilds_only_from_recorded_scopes() -> None:
+    current = _strategy("a", "BINANCE:BTCUSDT-PERP", "1m")
+    current.requirements.profile_requirements = (MagicMock(),)
+    replacement = _strategy("replacement-a", current.product_id, "1m")
+    replacement.requirements.profile_requirements = (MagicMock(),)
+    hydration = MagicMock()
+    hydration.fresh_instance_for_replay.return_value = replacement
+    decision_owner = MagicMock()
+    scope = MagicMock()
+    decision_owner.replay_candle.return_value = scope
+    service, application, _hydration, publish, db = _service(
+        hydration=hydration,
+        active=[current],
+        decision_owner=decision_owner,
+    )
+    pending = _candle(timestamp=500)
+    recorded = _candle(timestamp=400)
+    batch = MagicMock()
+    application.was_applied.return_value = False
+    application.applied_decision_batch.return_value = batch
+
+    def warm_up(_db, _replacement, **kwargs):
+        assert kwargs["before_timestamp"] == 500
+        assert kwargs["decision_scope_loader"](recorded) is scope
+
+    hydration.warm_up.side_effect = warm_up
+
+    service.rewind_pending((pending,))
+
+    application.applied_decision_batch.assert_called_once_with(recorded, db=db)
+    decision_owner.replay_candle.assert_called_once_with(recorded, batch)
+    publish.assert_called_once_with(replacement)
+
+
 def test_rebuild_requires_receipt_and_replays_through_candle() -> None:
     current = _strategy("a", "BINANCE:BTCUSDT-PERP", "1m")
     replacement = _strategy("replacement-a", current.product_id, "1m")
@@ -233,6 +269,155 @@ def test_rebuild_rejects_unapplied_candle_before_hydration() -> None:
 
     hydration.fresh_instance_for_replay.assert_not_called()
     publish.assert_not_called()
+
+
+def test_rebuild_profile_strategy_replays_each_durable_decision_scope() -> None:
+    current = _strategy("a", "BINANCE:BTCUSDT-PERP", "1m")
+    current.requirements.profile_requirements = (MagicMock(),)
+    replacement = _strategy("replacement-a", current.product_id, "1m")
+    replacement.requirements.profile_requirements = (MagicMock(),)
+    hydration = MagicMock()
+    hydration.fresh_instance_for_replay.return_value = replacement
+    decision_owner = MagicMock()
+    scopes = (MagicMock(), MagicMock())
+    decision_owner.replay_candle.side_effect = scopes
+    service, application, _hydration, publish, db = _service(
+        hydration=hydration,
+        active=[current],
+        decision_owner=decision_owner,
+    )
+    candle = _candle(timestamp=500)
+    historical = (_candle(timestamp=400), candle)
+    batches = (MagicMock(), MagicMock())
+    application.was_applied.return_value = True
+    application.applied_decision_batch.side_effect = batches
+
+    def warm_up(_db, _replacement, **kwargs):
+        loader = kwargs["decision_scope_loader"]
+        assert tuple(loader(item) for item in historical) == scopes
+
+    hydration.warm_up.side_effect = warm_up
+
+    service.rebuild_applied(candle)
+
+    assert application.applied_decision_batch.call_args_list == [
+        call(item, db=db) for item in historical
+    ]
+    assert decision_owner.replay_candle.call_args_list == [
+        call(item, batch) for item, batch in zip(historical, batches, strict=True)
+    ]
+    publish.assert_called_once_with(replacement)
+
+
+def test_rebuild_profile_strategy_rejects_legacy_receipt_without_publication() -> None:
+    current = _strategy("a", "BINANCE:BTCUSDT-PERP", "1m")
+    current.requirements.profile_requirements = (MagicMock(),)
+    replacement = _strategy("replacement-a", current.product_id, "1m")
+    replacement.requirements.profile_requirements = (MagicMock(),)
+    hydration = MagicMock()
+    hydration.fresh_instance_for_replay.return_value = replacement
+    decision_owner = MagicMock()
+    service, application, _hydration, publish, _db = _service(
+        hydration=hydration,
+        active=[current],
+        decision_owner=decision_owner,
+    )
+    candle = _candle(timestamp=500)
+    application.was_applied.return_value = True
+    application.applied_decision_batch.return_value = None
+    hydration.warm_up.side_effect = (
+        lambda _db, _replacement, **kwargs: kwargs["decision_scope_loader"](candle)
+    )
+
+    with pytest.raises(RuntimeError, match="recorded decision evidence is unavailable"):
+        service.rebuild_applied(candle)
+
+    decision_owner.replay_candle.assert_not_called()
+    publish.assert_not_called()
+
+
+def test_late_profile_evidence_failure_publishes_no_earlier_replacement() -> None:
+    active = [
+        _strategy("a", "BINANCE:BTCUSDT-PERP", "1m"),
+        _strategy("b", "BINANCE:BTCUSDT-PERP", "1m"),
+    ]
+    replacements = {
+        item.strategy_id: _strategy(
+            f"replacement-{item.strategy_id}", item.product_id, "1m"
+        )
+        for item in active
+    }
+    for item in (*active, *replacements.values()):
+        item.requirements.profile_requirements = (MagicMock(),)
+    hydration = MagicMock()
+    hydration.fresh_instance_for_replay.side_effect = (
+        lambda current: replacements[current.strategy_id]
+    )
+    decision_owner = MagicMock()
+    scope = MagicMock()
+    decision_owner.replay_candle.return_value = scope
+    service, application, _hydration, publish, db = _service(
+        hydration=hydration,
+        active=active,
+        decision_owner=decision_owner,
+    )
+    candle = _candle(timestamp=500)
+    historical = {
+        "replacement-a": _candle(timestamp=300),
+        "replacement-b": _candle(timestamp=400),
+    }
+    batch = MagicMock()
+    events: list[str] = []
+    application.was_applied.return_value = True
+    application.applied_decision_batch.side_effect = [batch, None]
+
+    def warm_up(_db, replacement, **kwargs):
+        loader = kwargs["decision_scope_loader"]
+        loader(historical[replacement.strategy_id])
+        events.append(replacement.strategy_id)
+
+    hydration.warm_up.side_effect = warm_up
+
+    with pytest.raises(RuntimeError, match="recorded decision evidence is unavailable"):
+        service.rebuild_applied(candle)
+
+    assert events == ["replacement-a"]
+    assert application.applied_decision_batch.call_args_list == [
+        call(historical["replacement-a"], db=db),
+        call(historical["replacement-b"], db=db),
+    ]
+    decision_owner.replay_candle.assert_called_once_with(
+        historical["replacement-a"], batch
+    )
+    publish.assert_not_called()
+
+
+def test_rebuild_non_profile_strategy_preserves_legacy_hydration_path() -> None:
+    current = _strategy("a", "BINANCE:BTCUSDT-PERP", "1m")
+    current.requirements.profile_requirements = ()
+    replacement = _strategy("replacement-a", current.product_id, "1m")
+    replacement.requirements.profile_requirements = ()
+    hydration = MagicMock()
+    hydration.fresh_instance_for_replay.return_value = replacement
+    decision_owner = MagicMock()
+    service, application, _hydration, publish, db = _service(
+        hydration=hydration,
+        active=[current],
+        decision_owner=decision_owner,
+    )
+    candle = _candle(timestamp=500)
+    application.was_applied.return_value = True
+
+    service.rebuild_applied(candle)
+
+    hydration.warm_up.assert_called_once_with(
+        db,
+        replacement,
+        before_timestamp=501,
+    )
+    application.applied_decision_batch.assert_not_called()
+    decision_owner.replay_candle.assert_not_called()
+    publish.assert_called_once_with(replacement)
 
 
 def test_replay_delegates_exact_rewind_apply_and_rebuild_callbacks() -> None:
