@@ -2117,6 +2117,103 @@ def test_terminal_schema_roundtrip(fresh_pg_db: str) -> None:
         engine.dispose()
 
 
+@pytest.mark.parametrize("damage", [None, "missing_outcome", "extra_outcome", "outcome_digest", "input_missing", "input_key", "input_digest", "input_payload"])
+def test_decision_batch_transaction_helper_pg(profile_repository_pg: Engine, damage: str | None) -> None:
+    from src.core.market_data.profiles import decision_application_store as owner
+    from src.core.market_data.profiles.decision_input_store import _values
+    from test_profile_decision_application import batch, applied, key, Outcome
+    from test_profile_decision_input import sample
+
+    engine = profile_repository_pg
+    value = batch((key(),), (replace(applied(), input_digest=sample().input_digest),))
+    identity = owner._identity(value)
+    with Session(engine) as session, session.begin():
+        session.execute(text("SET LOCAL TIME ZONE 'UTC'"))
+        session.execute(text("INSERT INTO market_data_application (environment,product_id,timeframe,timestamp,open,high,low,close,volume,decision_contract_version) VALUES ('live',:product,'1m',0,1,1,1,1,0,1)"), {"product": value.product_id})
+        if damage != "input_missing":
+            input_values = _values(sample())
+            if damage == "input_key":
+                input_values["strategy_version"] = "other"
+            elif damage == "input_digest":
+                input_values["input_digest"] = "f" * 64
+            elif damage == "input_payload":
+                input_values["canonical_payload"] = b"{}"
+            session.execute(owner._INPUT.insert().values(**input_values))
+        if damage in ("missing_outcome", "extra_outcome", "outcome_digest"):
+            session.execute(owner._BATCH.insert().values(**owner._header(value)))
+            if damage != "missing_outcome":
+                rows = owner._outcomes(value)
+                if damage == "outcome_digest":
+                    rows[0]["input_digest"] = "f" * 64
+                else:
+                    other = replace(key(), strategy_id="extra")
+                    rows += owner._outcomes(batch((other,), (Outcome(other, "SKIPPED", None, None, "INPUT_STORE_FAILED"),)))
+                session.execute(owner._OUTCOME.insert(), rows)
+    if damage is not None:
+        with Session(engine) as session, session.begin():
+            session.execute(text("SET LOCAL TIME ZONE 'UTC'"))
+            with pytest.raises(owner.DecisionBatchIntegrityError):
+                owner.append_decision_batch(session, value)
+        return
+    with Session(engine) as session, session.begin():
+        assert owner.read_decision_batch(session, **identity) is None
+        fresh = owner.append_decision_batch(session, value)
+        assert not fresh.already_present and fresh.batch == value
+        assert owner.append_decision_batch(session, value).already_present
+        with pytest.raises(owner.DecisionBatchConflict):
+            owner.append_decision_batch(session, batch())
+    with Session(engine) as session, session.begin():
+        restored = owner.read_decision_batch(session, **identity)
+        assert restored is not None and restored.batch == value and restored.recorded_at == fresh.recorded_at
+
+
+def test_decision_batch_empty_and_rollback_pg(profile_repository_pg: Engine) -> None:
+    from src.core.market_data.profiles import decision_application_store as owner
+    from test_profile_decision_application import batch
+
+    value = batch()
+    with Session(profile_repository_pg) as session:
+        transaction = session.begin()
+        try:
+            session.execute(text("INSERT INTO market_data_application (environment,product_id,timeframe,timestamp,open,high,low,close,volume,decision_contract_version) VALUES ('live',:product,'1m',0,1,1,1,1,0,1)"), {"product": value.product_id})
+            assert owner.append_decision_batch(session, value).batch == value
+            assert owner.read_decision_batch(session, **owner._identity(value)) is not None
+        finally:
+            transaction.rollback()
+    with Session(profile_repository_pg) as session, session.begin():
+        assert owner.read_decision_batch(session, **owner._identity(value)) is None
+        for table in (owner._BATCH, owner._OUTCOME):
+            assert session.execute(sa.select(sa.func.count()).select_from(table)).scalar_one() == 0
+
+
+def test_decision_batch_nonempty_caller_rollback_pg(profile_repository_pg: Engine) -> None:
+    from src.core.market_data.profiles import decision_application_store as owner
+    from src.core.market_data.profiles.decision_input_store import DecisionInputStore
+    from test_profile_decision_application import batch, applied, key
+    from test_profile_decision_input import sample
+
+    engine = profile_repository_pg
+    expected = sample()
+    pinned = DecisionInputStore(sessionmaker(engine)).pin(expected)
+    value = batch((key(),), (replace(applied(), input_digest=expected.input_digest),))
+    failure = RuntimeError("injected caller rollback")
+    with pytest.raises(RuntimeError) as caught:
+        with Session(engine) as session, session.begin():
+            session.execute(text("INSERT INTO market_data_application (environment,product_id,timeframe,timestamp,open,high,low,close,volume,decision_contract_version) VALUES ('live',:product,'1m',0,1,1,1,1,0,1)"), {"product": value.product_id})
+            assert not owner.append_decision_batch(session, value).already_present
+            for table in (owner._BATCH, owner._OUTCOME):
+                assert session.execute(sa.select(sa.func.count()).select_from(table)).scalar_one() == 1
+            assert session.execute(text("SELECT count(*) FROM market_data_application")).scalar_one() == 1
+            raise failure
+    assert caught.value is failure
+    with Session(engine) as session, session.begin():
+        assert owner.read_decision_batch(session, **owner._identity(value)) is None
+        for table in (owner._BATCH, owner._OUTCOME):
+            assert session.execute(sa.select(sa.func.count()).select_from(table)).scalar_one() == 0
+        assert session.execute(text("SELECT count(*) FROM market_data_application")).scalar_one() == 0
+    assert DecisionInputStore(sessionmaker(engine)).confirm(expected) == replace(pinned, already_present=True)
+
+
 # Selected non-legacy tables that must exist at HEAD and be gone
 # after a full downgrade to ``base``.
 HEAD_ONLY_TABLES = {
