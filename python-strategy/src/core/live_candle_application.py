@@ -16,10 +16,17 @@ from src.core.models import Candlestick
 from src.core.orm_models import Candlestick as ORMCandlestick
 from src.core.orm_models import MarketDataApplication
 from src.core.product_master import ensure_product_registered
+from src.core.market_data.profiles.decision_application import MarketDataDecisionBatch
+from src.core.market_data.profiles.decision_application_store import (
+    DecisionBatchIntegrityError,
+    append_decision_batch,
+    read_decision_batch,
+)
 
 
 LIVE_CANDLE_FENCE_TIMEOUT_SECONDS = 5.0
 CandleCallback = Callable[[Candlestick], None]
+PendingCandleCallback = Callable[[Candlestick], MarketDataDecisionBatch | None]
 
 
 class LiveCandleApplicationService:
@@ -102,6 +109,19 @@ class LiveCandleApplicationService:
                 "live application receipt has no matching canonical candle: "
                 f"{candle.product_id}:{candle.timeframe}:{candle.timestamp}"
             )
+        marker = application.decision_contract_version
+        if marker is not None:
+            if type(marker) is not int or marker != 1:
+                raise DecisionBatchIntegrityError()
+            record = read_decision_batch(
+                db,
+                environment=self._environment_identity(),
+                product_id=candle.product_id,
+                timeframe=candle.timeframe,
+                bar_start_ms=candle.timestamp,
+            )
+            if record is None:
+                raise DecisionBatchIntegrityError()
         return True
 
     def assert_newer(
@@ -148,9 +168,22 @@ class LiveCandleApplicationService:
                     f"{candle.product_id}:{candle.timeframe}:{candle.timestamp}"
                 )
 
-    def _persist(self, candle: Candlestick) -> None:
+    def _persist(
+        self, candle: Candlestick, pending: MarketDataDecisionBatch | None = None
+    ) -> None:
         if self._environment_identity() != "live":
             return
+        if pending is not None and (
+            type(pending) is not MarketDataDecisionBatch
+            or (
+                pending.environment,
+                pending.product_id,
+                pending.timeframe,
+                pending.bar_start_ms,
+            )
+            != self._application_identity(candle)
+        ):
+            raise DecisionBatchIntegrityError()
         with self._db_session_factory() as db:
             try:
                 ensure_product_registered(db, candle.product_id)
@@ -196,8 +229,12 @@ class LiveCandleApplicationService:
                         low=candle.low,
                         close=candle.close,
                         volume=candle.volume,
+                        decision_contract_version=1 if pending is not None else None,
                     )
                 )
+                if pending is not None:
+                    db.flush()
+                    append_decision_batch(db, pending)
                 db.commit()
             except Exception:
                 db.rollback()
@@ -252,7 +289,7 @@ class LiveCandleApplicationService:
         self,
         candle: Candlestick,
         *,
-        apply_new: CandleCallback,
+        apply_new: PendingCandleCallback,
         rebuild_applied: CandleCallback,
     ) -> None:
         if self.was_applied(candle):
@@ -260,15 +297,15 @@ class LiveCandleApplicationService:
             return
         self.assert_newer(candle)
         self._assert_compatible(candle)
-        apply_new(candle)
-        self._persist(candle)
+        pending = apply_new(candle)
+        self._persist(candle, pending)
 
     def replay(
         self,
         candle: Candlestick,
         *,
         rewind_pending: CandleCallback,
-        apply_new: CandleCallback,
+        apply_new: PendingCandleCallback,
         rebuild_applied: CandleCallback,
     ) -> None:
         with self.application_fence(candle):

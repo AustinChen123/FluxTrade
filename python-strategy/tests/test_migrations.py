@@ -2214,6 +2214,55 @@ def test_decision_batch_nonempty_caller_rollback_pg(profile_repository_pg: Engin
     assert DecisionInputStore(sessionmaker(engine)).confirm(expected) == replace(pinned, already_present=True)
 
 
+@pytest.mark.parametrize("fail", [False, True])
+def test_live_application_terminal_atomic_pg(profile_repository_pg: Engine, monkeypatch, fail: bool) -> None:
+    from src.core import live_candle_application as application
+    from src.core.market_data.profiles.decision_input_store import DecisionInputStore
+    from src.core.models import Candlestick
+    from test_profile_decision_application import batch, applied, key
+    from test_profile_decision_input import sample
+
+    engine = profile_repository_pg
+    expected = sample()
+    DecisionInputStore(sessionmaker(engine)).pin(expected)
+    pending = batch((key(),), (replace(applied(), input_digest=expected.input_digest),))
+    candle = Candlestick(product_id=pending.product_id, timeframe="1m", timestamp=0,
+                         open=Decimal(1), high=Decimal(1), low=Decimal(1), close=Decimal(1), volume=Decimal(0))
+    service = application.LiveCandleApplicationService(environment_identity=lambda: "live", db_session_factory=sessionmaker(engine))
+    original = application.append_decision_batch
+    failure = RuntimeError("injected before final commit")
+    def append(db, value):
+        result = original(db, value)
+        # A different connection cannot see any member before caller commit.
+        with engine.connect() as probe:
+            for table in ("market_data_application", "market_data_decision_batch", "market_data_decision_outcome"):
+                assert probe.execute(text(f"SELECT count(*) FROM {table}")).scalar_one() == 0
+        if fail:
+            raise failure
+        return result
+    monkeypatch.setattr(application, "append_decision_batch", append)
+    callback_calls = []
+    rebuild_calls = []
+    def callback(received):
+        callback_calls.append(received)
+        return pending
+    if fail:
+        with pytest.raises(RuntimeError) as caught:
+            service.apply(candle, apply_new=callback, rebuild_applied=rebuild_calls.append)
+        assert caught.value is failure
+    else:
+        service.apply(candle, apply_new=callback, rebuild_applied=rebuild_calls.append)
+        assert service.was_applied(candle)
+        service.apply(candle, apply_new=callback, rebuild_applied=rebuild_calls.append)
+        assert rebuild_calls == [candle]
+        with engine.connect() as conn:
+            assert conn.execute(text("SELECT decision_contract_version FROM market_data_application")).scalar_one() == 1
+    assert callback_calls == [candle]
+    with engine.connect() as conn:
+        for table in ("market_data_application", "market_data_decision_batch", "market_data_decision_outcome"):
+            assert conn.execute(text(f"SELECT count(*) FROM {table}")).scalar_one() == int(not fail)
+
+
 # Selected non-legacy tables that must exist at HEAD and be gone
 # after a full downgrade to ``base``.
 HEAD_ONLY_TABLES = {
