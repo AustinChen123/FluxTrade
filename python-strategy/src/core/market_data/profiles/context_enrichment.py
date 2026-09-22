@@ -26,10 +26,19 @@ def enrich_profile_context(
     decision_time_ms: int,
 ) -> StrategyContext:
     """Exact coverage, no callback suppression; account timestamp remains untouched."""
+    if type(context) is not StrategyContext or context.market_data is not None:
+        raise ProfileContextEnrichmentError() from None
+    _validate_coverage(requirements, market_data, decision_time_ms)
+    return replace(context, market_data=market_data) if requirements else context
+
+
+def _validate_coverage(
+    requirements: tuple[ProfileRequirement, ...],
+    market_data: StrategyMarketDataContext,
+    decision_time_ms: int,
+) -> None:
     if (
-        type(context) is not StrategyContext
-        or context.market_data is not None
-        or type(requirements) is not tuple
+        type(requirements) is not tuple
         or any(type(item) is not ProfileRequirement for item in requirements)
         or type(market_data) is not StrategyMarketDataContext
         or type(decision_time_ms) is not int
@@ -38,9 +47,9 @@ def enrich_profile_context(
     ):
         raise ProfileContextEnrichmentError() from None
     if not requirements:
-        if market_data.profiles or context.market_data is not None:
+        if market_data.profiles:
             raise ProfileContextEnrichmentError() from None
-        return context
+        return
     end = decision_time_ms // 86400000 * 86400000
     expected = set()
     for requirement in requirements:
@@ -86,4 +95,3 @@ def enrich_profile_context(
         actual.add(key)
     if len(bases) != 1 or actual != expected:
         raise ProfileContextEnrichmentError() from None
-    return replace(context, market_data=market_data)
